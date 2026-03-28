@@ -9,6 +9,7 @@ pub(crate) mod fuse_cp_async;
 pub(crate) mod fuse_epilogue;
 pub(crate) mod fuse_general;
 pub(crate) mod fuse_real;
+pub(crate) mod intrinsic_rms_norm;
 mod parser;
 pub(crate) mod perimeter;
 pub(crate) mod persistent;
@@ -1605,6 +1606,51 @@ pub fn prologue_identity_flat(input: TokenStream) -> TokenStream {
     // Step 2: Apply perimeter replacement (flat-param) on the prologue result
     let (rewritten, _) = perimeter::replace_perimeter(&after_prologue, &json_source, &entry_name)
         .unwrap_or_else(|e| panic!("perimeter replacement after prologue failed: {e}"));
+
+    let const_name = syn::Ident::new(&const_name_str, proc_macro2::Span::call_site());
+    let rewritten_str = rewritten.as_str();
+    let output = quote! {
+        const #const_name: &str = #rewritten_str;
+    };
+    output.into()
+}
+
+/// Apply rms_norm intrinsic prologue then flat-param perimeter replacement.
+/// Produces a flat-param kernel with rms_norm fused into the GEMM's A-load path.
+///
+/// Extra params: _ferrite_rms_weight (u64), _ferrite_rms_epsilon (f32),
+/// _ferrite_rms_hidden (u32) — prepended before the flat ferrite_params[88].
+///
+/// ```rust,ignore
+/// fuse_rms_norm_gemm_flat!(
+///     "kernels/cutlass.ptx",
+///     "kernels/cutlass.derivations.json",
+///     "fused_norm_gemm",
+///     CONST_NAME
+/// );
+/// ```
+#[proc_macro]
+pub fn fuse_rms_norm_gemm_flat(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let (ptx_path, json_path, entry_name, const_name_str) = parse_perimeter_args(&input_str)
+        .expect("fuse_rms_norm_gemm_flat! expects (\"ptx\", \"json\", \"entry\", CONST_NAME)");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_full = PathBuf::from(&manifest_dir).join(&ptx_path);
+    let json_full = PathBuf::from(&manifest_dir).join(&json_path);
+
+    let ptx_source = std::fs::read_to_string(&ptx_full)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_full.display()));
+    let json_source = std::fs::read_to_string(&json_full)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", json_full.display()));
+
+    // Step 1: Apply rms_norm intrinsic on original CUTLASS PTX
+    let after_rms = intrinsic_rms_norm::build_rms_norm_gemm(&ptx_source, "param_0", &entry_name)
+        .unwrap_or_else(|e| panic!("rms_norm intrinsic failed: {e}"));
+
+    // Step 2: Apply perimeter replacement (flat params) on the result
+    let (rewritten, _) = perimeter::replace_perimeter(&after_rms, &json_source, &entry_name)
+        .unwrap_or_else(|e| panic!("perimeter replacement after rms_norm failed: {e}"));
 
     let const_name = syn::Ident::new(&const_name_str, proc_macro2::Span::call_site());
     let rewritten_str = rewritten.as_str();

@@ -992,3 +992,190 @@ fn prologue_scale2_gpu_correctness() {
     }
     println!("PASS: prologue scale*2 matches 2 * base GEMM");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// rms_norm + GEMM fusion via intrinsic: GPU correctness
+// The fused kernel normalizes the A-matrix inline at each cp.async site.
+// Compare against: rms_norm(input, weight, eps) on CPU, then GEMM(normalized, B).
+// ══════════════════════════════════════════════════════════════════════
+
+ptx_fusion::fuse_rms_norm_gemm_flat!(
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "fused_rms_norm_gemm",
+    FUSED_RMS_NORM_GEMM_PTX
+);
+
+/// CPU rms_norm reference: normalize each row of A by its RMS.
+fn cpu_rms_norm(
+    input: &[half::bf16],
+    weight: &[half::bf16],
+    m: usize,
+    k: usize,
+    eps: f32,
+) -> Vec<half::bf16> {
+    let mut out = vec![half::bf16::ZERO; m * k];
+    for row in 0..m {
+        let mut sum_sq = 0.0f32;
+        for col in 0..k {
+            let v = input[row * k + col].to_f32();
+            sum_sq += v * v;
+        }
+        let inv_rms = (sum_sq / k as f32 + eps).sqrt().recip();
+        for col in 0..k {
+            let v = input[row * k + col].to_f32();
+            let w = weight[col].to_f32();
+            out[row * k + col] = half::bf16::from_f32(v * w * inv_rms);
+        }
+    }
+    out
+}
+
+#[test]
+fn rms_norm_gemm_gpu_correctness() {
+    println!("=== rms_norm + GEMM intrinsic: GPU correctness ===");
+
+    // Verify the fused PTX has rms_norm markers
+    assert!(
+        FUSED_RMS_NORM_GEMM_PTX.contains("FERRITE: rms_norm prologue"),
+        "should have rms_norm prologue marker"
+    );
+    assert!(
+        FUSED_RMS_NORM_GEMM_PTX.contains("ferrite_params[88]"),
+        "should have flat params"
+    );
+
+    // ptxas check first
+    let path = "/tmp/fused_rms_norm_gemm.ptx";
+    std::fs::write(path, FUSED_RMS_NORM_GEMM_PTX).unwrap();
+    let ptxas_out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+    if !ptxas_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ptxas_out.stderr);
+        for line in stderr.lines().take(20) {
+            println!("  ptxas: {line}");
+        }
+        panic!("ptxas FAILED on fused rms_norm+GEMM PTX");
+    }
+    println!("  ptxas: PASS");
+
+    let ctx = ctx();
+    let m = 64u32;
+    let k = 128u32; // hidden_size = K for rms_norm
+    let n = 128u32;
+    let eps = 1e-5f32;
+
+    // Generate test data
+    let h_input: Vec<half::bf16> = (0..(m * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_weight: Vec<half::bf16> = (0..k as usize)
+        .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+        .collect();
+    let h_b: Vec<half::bf16> = (0..(n * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+
+    // Reference: CPU rms_norm then GPU GEMM
+    let h_normed = cpu_rms_norm(&h_input, &h_weight, m as usize, k as usize, eps);
+    let ref_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_normed,
+        &h_b,
+        m,
+        n,
+        k,
+    );
+
+    // Fused: rms_norm + GEMM in one kernel
+    // Params: _ferrite_rms_weight (u64), _ferrite_rms_epsilon (f32),
+    //         _ferrite_rms_hidden (u32), ferrite_params[88]
+    // A_ptr in ferrite_params = input_ptr (raw, not normalized)
+    let stream = ctx.default_stream();
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_weight = stream.clone_htod(&h_weight).unwrap();
+    let d_b = stream.clone_htod(&h_b).unwrap();
+    let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let mut d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+
+    let module = ctx
+        .load_module(Ptx::from_src(FUSED_RMS_NORM_GEMM_PTX))
+        .unwrap();
+    let func = module.load_function("fused_rms_norm_gemm").unwrap();
+
+    let (input_ptr, _) = d_input.device_ptr(&stream);
+    let (weight_ptr, _) = d_weight.device_ptr(&stream);
+    let (b_ptr, _) = d_b.device_ptr(&stream);
+    let (c_ptr, _) = d_c.device_ptr(&stream);
+    let (d_ptr, _) = d_d.device_ptr(&stream);
+
+    let gemm_params = build_flat_params(
+        input_ptr as u64, // A_ptr = raw input (norm happens inline)
+        b_ptr as u64,
+        c_ptr as u64,
+        d_ptr as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+
+    let weight_ptr_val = weight_ptr as u64;
+    let hidden_val = k;
+
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, gz),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864,
+    };
+
+    // 4 separate params: weight_ptr, epsilon, hidden, ferrite_params[88]
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&weight_ptr_val)
+            .arg(&eps)
+            .arg(&hidden_val)
+            .arg(&gemm_params)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let fused_out = stream.clone_dtoh(&d_d).unwrap();
+
+    // Compare
+    let mut max_diff = 0.0f32;
+    for (i, (r, f)) in ref_out.iter().zip(fused_out.iter()).enumerate() {
+        let diff = (r.to_f32() - f.to_f32()).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+        if diff > 0.5 && r.to_f32().abs() > 1e-4 {
+            println!(
+                "  MISMATCH [{i}]: ref={:.4}, fused={:.4}, diff={diff:.2e}",
+                r.to_f32(),
+                f.to_f32()
+            );
+            if i > 10 {
+                break;
+            }
+        }
+    }
+    println!("  M={m}, N={n}, K={k}: max_abs_diff = {max_diff:.2e}");
+    // bf16 rounding in CPU vs GPU rms_norm will differ, allow some tolerance
+    assert!(
+        max_diff < 0.1,
+        "rms_norm+GEMM fused diff too large: {max_diff:.2e}"
+    );
+    println!("PASS: rms_norm + GEMM fused matches reference");
+}

@@ -633,11 +633,18 @@ pub fn replace_perimeter(
             continue;
         }
 
-        // Replace the .param declaration (inside entry header)
+        // Replace the struct .param declaration (inside entry header)
+        // Only replace the .b8 NAME[SIZE] struct param, not scalar params
         if in_entry_header && trimmed.contains(".param") {
-            output.push(format!(
-                "\t.param .align 8 .b8 {FLAT_PARAM_NAME}[{FLAT_PARAM_SIZE}]"
-            ));
+            if trimmed.contains(".b8") && trimmed.contains('[') {
+                // This is the struct param — replace with flat layout
+                output.push(format!(
+                    "\t.param .align 8 .b8 {FLAT_PARAM_NAME}[{FLAT_PARAM_SIZE}]"
+                ));
+            } else {
+                // This is a scalar param (e.g., from rms_norm intrinsic) — pass through
+                output.push(line.to_string());
+            }
             continue;
         }
 
@@ -895,9 +902,12 @@ fn resolve_bracket_offset(
         }
     } else if bracket_content.starts_with('%') {
         base_offsets.get(bracket_content).copied()
-    } else {
-        // Bare param name → offset 0
+    } else if bracket_content.contains(mangled_param) || bracket_content == mangled_param {
+        // Bare struct param name → offset 0
         Some(0)
+    } else {
+        // Unknown param name (e.g., extra named params from fusion) — don't touch
+        None
     }
 }
 

@@ -10,9 +10,12 @@
 
 use anyhow::{Result, bail};
 use cudarc::driver::sys::{self, CUfunction, CUmodule, CUstream};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::tensor::GpuTensor;
+use ptx_fusion::FeriteKernel;
 
 // ── Compile-time: rewrite CUTLASS PTX to flat-param layout ──
 
@@ -274,6 +277,217 @@ unsafe fn launch_kernel(
     let aligned = AlignedParams(*params);
 
     let mut param_size = 88usize;
+    let extra: [*mut std::ffi::c_void; 5] = [
+        sys::CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT as *mut _,
+        aligned.0.as_ptr() as *mut _,
+        sys::CU_LAUNCH_PARAM_BUFFER_SIZE_AS_INT as *mut _,
+        &mut param_size as *mut usize as *mut _,
+        sys::CU_LAUNCH_PARAM_END_AS_INT as *mut _,
+    ];
+
+    let result = sys::cuLaunchKernel(
+        func,
+        grid_x,
+        grid_y,
+        1,
+        block_x,
+        1,
+        1,
+        smem_bytes,
+        stream,
+        std::ptr::null_mut(),
+        extra.as_ptr() as *mut *mut _,
+    );
+    assert_eq!(
+        result,
+        sys::cudaError_enum::CUDA_SUCCESS,
+        "ferrite cuLaunchKernel failed: {result:?}"
+    );
+}
+
+// ── FeriteKernel launch support ──
+
+/// Wrapper to make CUfunction/CUmodule Send+Sync (they're thread-safe GPU handles).
+struct CudaFunc(CUmodule, CUfunction);
+unsafe impl Send for CudaFunc {}
+unsafe impl Sync for CudaFunc {}
+
+/// Global cache of loaded CUDA modules/functions for compile!'d kernels.
+/// Keyed by entry name. Loaded lazily on first launch.
+static KERNEL_CACHE: Mutex<Option<HashMap<&'static str, CudaFunc>>> = Mutex::new(None);
+
+fn get_or_load_kernel(kernel: &FeriteKernel) -> CUfunction {
+    let mut cache = KERNEL_CACHE.lock().unwrap();
+    let cache = cache.get_or_insert_with(HashMap::new);
+
+    if let Some(cf) = cache.get(kernel.entry) {
+        return cf.1;
+    }
+
+    let (module, func) = unsafe {
+        load_flat_module(kernel.ptx, kernel.entry, kernel.smem_bytes)
+            .unwrap_or_else(|e| panic!("ferrite: failed to load kernel '{}': {e}", kernel.entry))
+    };
+    cache.insert(kernel.entry, CudaFunc(module, func));
+    func
+}
+
+/// Launch a compile!'d fused norm+GEMM kernel.
+///
+/// `kernel`: the FeriteKernel from compile!
+/// `input`: [M, K] bf16 — un-normalized A-matrix (read by norm prologue + GEMM)
+/// `weight`: [N, K] bf16 — GEMM B-matrix
+/// `norm_weight`: [K] bf16 — RMS norm weight vector
+/// `epsilon`: RMS norm epsilon
+/// `hidden`: hidden dimension (= K)
+/// `c`: optional [M, N] residual for beta accumulation
+/// `alpha`, `beta`: GEMM scalars
+/// `alloc`: tensor allocator
+/// `stream`: CUDA stream
+///
+/// Returns: [M, N] bf16 output tensor
+pub unsafe fn launch_fused_norm_gemm(
+    kernel: &FeriteKernel,
+    input: GpuTensor,
+    weight: GpuTensor,
+    norm_weight: GpuTensor,
+    epsilon: f32,
+    hidden: u32,
+    c: Option<GpuTensor>,
+    alpha: f32,
+    beta: f32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let func = get_or_load_kernel(kernel);
+
+    let m = input.dim(0) as u32;
+    let k = input.dim(1) as u32;
+    let n = weight.dim(0) as u32;
+
+    let out = alloc.alloc_tensor(&[m as usize, n as usize], input.dtype());
+
+    let grid_m = m.div_ceil(kernel.tile_m);
+    let grid_n = n.div_ceil(kernel.tile_n);
+    let swizzle_log = compute_swizzle_log(grid_n);
+    let tile = 1u32 << swizzle_log;
+    let grid_x = grid_m * tile;
+    let grid_y = grid_n.div_ceil(tile);
+
+    let c_ptr = match c {
+        Some(ct) => ct.raw_ptr() as u64,
+        None => out.as_gpu_tensor().raw_ptr() as u64,
+    };
+    let actual_beta = if c.is_some() { beta } else { 0.0 };
+
+    // Build param buffer: [extra_prefix | flat_gemm_params]
+    // Extra prefix for rms_norm: weight_ptr(u64), eps(f32), hidden(u32), a_ptr(u64), a_stride(u64)
+    let flat = build_flat_params(
+        input.raw_ptr() as u64,
+        weight.raw_ptr() as u64,
+        c_ptr,
+        out.as_gpu_tensor().raw_ptr() as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        alpha,
+        actual_beta,
+    );
+
+    let mut params = [0u8; 120]; // 32 prefix + 88 flat
+    params[0..8].copy_from_slice(&(norm_weight.raw_ptr() as u64).to_le_bytes());
+    params[8..12].copy_from_slice(&epsilon.to_le_bytes());
+    params[12..16].copy_from_slice(&hidden.to_le_bytes());
+    params[16..24].copy_from_slice(&(input.raw_ptr() as u64).to_le_bytes());
+    params[24..32].copy_from_slice(&(k as u64).to_le_bytes()); // a_stride = K
+    params[32..120].copy_from_slice(&flat);
+
+    launch_kernel_raw(
+        func,
+        stream,
+        grid_x,
+        grid_y,
+        kernel.threads,
+        kernel.smem_bytes,
+        &params,
+    );
+
+    out
+}
+
+/// Launch a plain GEMM with compile!'d kernel, accumulating into an existing buffer.
+///
+/// D = alpha * A @ B^T + beta * D (in-place on `d`)
+pub unsafe fn launch_gemm_accumulate(
+    kernel: &FeriteKernel,
+    a: GpuTensor,
+    b: GpuTensor,
+    d: GpuTensor, // both C and D — accumulate in place
+    alpha: f32,
+    beta: f32,
+    stream: CUstream,
+) {
+    let func = get_or_load_kernel(kernel);
+
+    let m = a.dim(0) as u32;
+    let k = a.dim(1) as u32;
+    let n = b.dim(0) as u32;
+
+    let grid_m = m.div_ceil(kernel.tile_m);
+    let grid_n = n.div_ceil(kernel.tile_n);
+    let swizzle_log = compute_swizzle_log(grid_n);
+    let tile = 1u32 << swizzle_log;
+    let grid_x = grid_m * tile;
+    let grid_y = grid_n.div_ceil(tile);
+
+    let params = build_flat_params(
+        a.raw_ptr() as u64,
+        b.raw_ptr() as u64,
+        d.raw_ptr() as u64, // C = D
+        d.raw_ptr() as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        alpha,
+        beta,
+    );
+
+    launch_kernel_raw(
+        func,
+        stream,
+        grid_x,
+        grid_y,
+        kernel.threads,
+        kernel.smem_bytes,
+        &params,
+    );
+}
+
+/// Generic kernel launch with variable-size param buffer.
+unsafe fn launch_kernel_raw(
+    func: CUfunction,
+    stream: CUstream,
+    grid_x: u32,
+    grid_y: u32,
+    block_x: u32,
+    smem_bytes: u32,
+    params: &[u8],
+) {
+    #[repr(align(8))]
+    struct Aligned([u8; 256]);
+    let mut aligned = Aligned([0u8; 256]);
+    let len = params.len().min(256);
+    aligned.0[..len].copy_from_slice(&params[..len]);
+
+    let mut param_size = len;
     let extra: [*mut std::ffi::c_void; 5] = [
         sys::CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT as *mut _,
         aligned.0.as_ptr() as *mut _,

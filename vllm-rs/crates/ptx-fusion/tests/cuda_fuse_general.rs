@@ -999,11 +999,12 @@ fn prologue_scale2_gpu_correctness() {
 // Compare against: rms_norm(input, weight, eps) on CPU, then GEMM(normalized, B).
 // ══════════════════════════════════════════════════════════════════════
 
-ptx_fusion::fuse_rms_norm_gemm_flat!(
-    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
-    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
-    "fused_rms_norm_gemm",
-    FUSED_RMS_NORM_GEMM_PTX
+const FUSED_RMS_NORM_GEMM_PTX: &str = ptx_fusion::fuse!(
+    a = "intrinsic:rms_norm",
+    b = "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    bind = { a.output => b.param_0 },
+    perimeter = "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    name = "fused_rms_norm_gemm",
 );
 
 /// CPU rms_norm reference: normalize each row of A by its RMS.

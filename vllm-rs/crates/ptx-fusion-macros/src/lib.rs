@@ -1257,20 +1257,24 @@ pub fn fuse(input: TokenStream) -> TokenStream {
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 
-    // Read PTX sources
-    let mut kernel_ptx: Vec<(String, String)> = Vec::new(); // (name, ptx_source)
+    // Resolve kernel sources: either read PTX from file or mark as intrinsic
+    // (name, source) where source is either PTX text or "intrinsic:NAME"
+    let mut kernel_sources: Vec<(String, String)> = Vec::new();
     for (name, path) in &parsed.kernels {
-        let full_path = PathBuf::from(&manifest_dir).join(path);
-        let ptx = std::fs::read_to_string(&full_path)
-            .unwrap_or_else(|e| panic!("fuse!: failed to read {}: {e}", full_path.display()));
-        kernel_ptx.push((name.clone(), ptx));
+        if path.starts_with("intrinsic:") {
+            kernel_sources.push((name.clone(), path.clone()));
+        } else {
+            let full_path = PathBuf::from(&manifest_dir).join(path);
+            let ptx = std::fs::read_to_string(&full_path)
+                .unwrap_or_else(|e| panic!("fuse!: failed to read {}: {e}", full_path.display()));
+            kernel_sources.push((name.clone(), ptx));
+        }
     }
 
-    // For now, support exactly 2 kernels with 1 binding
-    if kernel_ptx.len() != 2 {
+    if kernel_sources.len() != 2 {
         panic!(
             "fuse! currently supports exactly 2 kernels, got {}",
-            kernel_ptx.len()
+            kernel_sources.len()
         );
     }
     if parsed.bindings.len() != 1 {
@@ -1281,41 +1285,132 @@ pub fn fuse(input: TokenStream) -> TokenStream {
     }
 
     let binding = &parsed.bindings[0];
-
-    // Find producer and consumer PTX by name
-    let producer_ptx = kernel_ptx
+    let producer = kernel_sources
         .iter()
         .find(|(n, _)| *n == binding.producer)
         .unwrap_or_else(|| panic!("fuse!: no kernel named '{}'", binding.producer));
-    let consumer_ptx = kernel_ptx
+    let consumer = kernel_sources
         .iter()
         .find(|(n, _)| *n == binding.consumer)
         .unwrap_or_else(|| panic!("fuse!: no kernel named '{}'", binding.consumer));
 
-    let result = fuse_general::fuse_two(
-        &producer_ptx.1,
-        &consumer_ptx.1,
-        &binding.producer_port,
-        &binding.consumer_port,
-        &parsed.fused_name,
-    )
-    .unwrap_or_else(|e| panic!("fuse! fusion failed: {e}"));
+    // Dispatch based on whether either kernel is an intrinsic
+    let fused_ptx = if producer.1.starts_with("intrinsic:") {
+        // Intrinsic producer → GEMM consumer (prologue injection)
+        let intrinsic_name = &producer.1["intrinsic:".len()..];
+        let gemm_ptx = &consumer.1;
 
-    let ptx_str = result.ptx.as_str();
-    let const_name = syn::Ident::new(&parsed.const_name, proc_macro2::Span::call_site());
+        // Read perimeter JSON if provided (needed for tile_m and flat-param replacement)
+        let json_source = parsed.perimeter.as_ref().map(|p| {
+            let json_path = PathBuf::from(&manifest_dir).join(p);
+            std::fs::read_to_string(&json_path)
+                .unwrap_or_else(|e| panic!("fuse!: failed to read {}: {e}", json_path.display()))
+        });
 
-    let output = quote! {
-        const #const_name: &str = #ptx_str;
+        // Get tile_m from derivations (if available) or from PTX kernel name
+        let tile_m = if let Some(ref json) = json_source {
+            let probe = perimeter::parse_derivations(json)
+                .unwrap_or_else(|e| panic!("fuse!: failed to parse derivations: {e}"));
+            probe.tile.0 as usize
+        } else {
+            // Try to extract from CUTLASS kernel name
+            extract_tile_m_from_ptx(gemm_ptx).unwrap_or_else(|e| panic!("fuse!: {e}"))
+        };
+
+        // Build the intrinsic computation
+        let computation = match intrinsic_name {
+            "rms_norm" => intrinsic_rms_norm::rms_norm_computation(tile_m, &parsed.fused_name),
+            other => panic!("fuse!: unknown intrinsic '{other}' (available: rms_norm)"),
+        };
+
+        // Inject into GEMM prologue
+        let after_fusion = fuse_general::replace_a_loads_with_inline_fn(
+            gemm_ptx,
+            &binding.consumer_port,
+            &computation,
+        )
+        .unwrap_or_else(|e| panic!("fuse!: intrinsic prologue injection failed: {e}"));
+
+        // Apply perimeter replacement if derivations JSON provided
+        if let Some(ref json) = json_source {
+            let (rewritten, _) =
+                perimeter::replace_perimeter(&after_fusion, json, &parsed.fused_name)
+                    .unwrap_or_else(|e| panic!("fuse!: perimeter replacement failed: {e}"));
+            rewritten
+        } else {
+            after_fusion
+        }
+    } else if consumer.1.starts_with("intrinsic:") {
+        panic!("fuse!: intrinsic as consumer not yet supported (intrinsics are producers)");
+    } else {
+        // Both are PTX files — use general pairwise fusion
+        let result = fuse_general::fuse_two(
+            &producer.1,
+            &consumer.1,
+            &binding.producer_port,
+            &binding.consumer_port,
+            &parsed.fused_name,
+        )
+        .unwrap_or_else(|e| panic!("fuse! fusion failed: {e}"));
+
+        // Apply perimeter replacement if derivations JSON provided
+        if let Some(ref json_path) = parsed.perimeter {
+            let json_full = PathBuf::from(&manifest_dir).join(json_path);
+            let json_source = std::fs::read_to_string(&json_full)
+                .unwrap_or_else(|e| panic!("fuse!: failed to read {}: {e}", json_full.display()));
+            let (rewritten, _) =
+                perimeter::replace_perimeter(&result.ptx, &json_source, &parsed.fused_name)
+                    .unwrap_or_else(|e| panic!("fuse!: perimeter replacement failed: {e}"));
+            rewritten
+        } else {
+            result.ptx
+        }
     };
-    output.into()
+
+    let ptx_str = fused_ptx.as_str();
+
+    // If const name was provided, emit a const declaration (backwards compat).
+    // Otherwise, emit the PTX as a bare expression.
+    if !parsed.const_name.is_empty() {
+        let const_name = syn::Ident::new(&parsed.const_name, proc_macro2::Span::call_site());
+        let output = quote! {
+            const #const_name: &str = #ptx_str;
+        };
+        output.into()
+    } else {
+        let output = quote! { #ptx_str };
+        output.into()
+    }
+}
+
+/// Extract tile_m from a CUTLASS GEMM PTX by parsing the mangled GemmShape in the entry name.
+fn extract_tile_m_from_ptx(ptx: &str) -> Result<usize, String> {
+    for line in ptx.lines() {
+        let t = line.trim();
+        if !t.contains(".entry") {
+            continue;
+        }
+        if let Some(pos) = t.find("GemmShapeILi") {
+            let after = &t[pos + "GemmShapeILi".len()..];
+            if let Some(end) = after.find('E') {
+                if let Ok(m) = after[..end].parse::<usize>() {
+                    return Ok(m);
+                }
+            }
+        }
+    }
+    Err("could not find GemmShape in PTX entry name".into())
 }
 
 /// Parsed arguments from the `fuse!` macro invocation.
 struct GeneralFuseArgs {
-    /// (name, ptx_path) for each kernel
+    /// (name, ptx_path_or_intrinsic) for each kernel.
+    /// Path is either a file path ("kernels/foo.ptx") or an intrinsic ("intrinsic:rms_norm").
     kernels: Vec<(String, String)>,
     /// Bindings: producer.port => consumer.port
     bindings: Vec<fuse_general::ParsedBinding>,
+    /// Optional derivations JSON for CUTLASS perimeter replacement (flat params).
+    perimeter: Option<String>,
     /// Entry name for the fused kernel
     fused_name: String,
     /// Rust const name to emit
@@ -1337,6 +1432,7 @@ fn parse_general_fuse_args(input: &str) -> Result<GeneralFuseArgs, String> {
 
     let mut kernels = Vec::new();
     let mut bindings = Vec::new();
+    let mut perimeter = None;
     let mut fused_name = String::new();
     let mut const_name = String::new();
 
@@ -1389,8 +1485,10 @@ fn parse_general_fuse_args(input: &str) -> Result<GeneralFuseArgs, String> {
                 const_name = val
                     .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
                     .to_string();
+            } else if key == "perimeter" {
+                perimeter = Some(val.trim_matches('"').to_string());
             } else {
-                // Kernel: name = "path.ptx"
+                // Kernel: name = "path.ptx" or name = "intrinsic:rms_norm"
                 let path = val.trim_matches('"').to_string();
                 kernels.push((key.to_string(), path));
             }
@@ -1403,16 +1501,22 @@ fn parse_general_fuse_args(input: &str) -> Result<GeneralFuseArgs, String> {
     if bindings.is_empty() {
         return Err("no bindings specified".into());
     }
+    // Auto-generate entry name from kernel names if not provided
     if fused_name.is_empty() {
-        return Err("no name specified".into());
-    }
-    if const_name.is_empty() {
-        return Err("no const specified".into());
+        fused_name = format!(
+            "fused_{}",
+            kernels
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join("_")
+        );
     }
 
     Ok(GeneralFuseArgs {
         kernels,
         bindings,
+        perimeter,
         fused_name,
         const_name,
     })

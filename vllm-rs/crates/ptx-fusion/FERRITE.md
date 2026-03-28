@@ -204,14 +204,28 @@ it doesn't know what the kernels do. It only sees their escape perimeters.
 5. Merges params: bound pair eliminated, remaining params concatenated
 6. Emits a single fused kernel as a `const &str`
 
-**GPU-verified**: 10/10 test cases, all 0.00e0 diff vs separate launches.
-Production dimensions (Qwen2.5-3B: hidden=2560, 3456), batch sizes 1-256,
-10-run determinism, large/small input magnitudes.
+**GPU-verified**: 19/19 test cases, all 0.00e0 diff vs separate launches.
+
+**Handoff paths (auto-selected from perimeter analysis):**
+
+| Pattern | Handoff | How |
+|---------|---------|-----|
+| elem → elem (matching thread map) | Register | A's output reg → mov → B's input reg |
+| elem → elem (different thread map) | SMEM | st.shared, barrier, ld.shared |
+| GEMM → elem (pointwise) | Epilogue injection | Extract B's computation, inject before bf16 cvt |
+| pointwise → GEMM A-input | Inline at cp.async | Unpack bf16→f32, apply fn, repack, st.shared |
+| rms_norm → GEMM A-input | Intrinsic prologue | Generate reduction from scratch + inline normalize |
+
+**Intrinsics** (operations the macro generates from scratch instead of extracting from PTX):
+- `rms_norm`: cooperative sum-of-squares reduction via shfl.sync, adapted to GEMM's
+  thread-to-row mapping. Prologue computes inv_rms, per-element normalizes at each A-load.
+- SiLU, GELU, ReLU: epilogue activations (from fuse_epilogue.rs)
 
 **Key files:**
-- `fuse_general.rs`: general fusion engine (SMEM handoff path)
+- `fuse_general.rs`: general fusion engine (all handoff paths)
+- `intrinsic_rms_norm.rs`: rms_norm prologue + per-element normalization generator
 - `lib.rs`: `fuse!` proc macro (DSL parser + dispatch to engine)
-- `tests/cuda_fuse_general.rs`: 10 GPU correctness tests
+- `tests/cuda_fuse_general.rs`: 19 GPU correctness tests
 
 ### The extended perimeter model
 
@@ -263,22 +277,27 @@ Integrated into llama.rs — all 4 GEMMs per layer use flat-param CUTLASS.
 Layers with bias use ferrite GEMM + separate `bias_add_inplace` kernel.
 End-to-end correct on Qwen2.5-3B-Instruct.
 
-**Phase 3: General `fuse!` proc macro** (fuse_general.rs) — **DONE**
+**Phase 3: General `fuse!` proc macro + GEMM fusion** (fuse_general.rs) — **DONE**
 
 The `fuse!` macro takes any two kernels + bindings and produces a fused kernel.
-Kernel-agnostic: only looks at escape perimeters. SMEM handoff path working,
-register handoff stubbed (requires thread-mapping analysis).
+Five handoff paths, auto-selected from perimeter analysis:
 
-GPU-verified: 15/15 tests, all 0.00e0 diff.
-- SMEM path: rms_norm→silu_mul at production dims (hidden up to 3456, batch 1-256)
-- Register path: rms_norm→scale, bitwise identical to special-purpose `regfuse_kernels!`
+- **Register**: both elementwise, matching thread maps → 0.00e0, 2.16x speedup
+- **SMEM**: different thread maps or SMEM/barrier kernels → 0.00e0
+- **GEMM epilogue**: GEMM→pointwise, inject before bf16 conversion → ptxas valid
+- **GEMM prologue (pointwise)**: pointwise→GEMM A-input, inline at cp.async → 0.00e0
+- **GEMM prologue (rms_norm intrinsic)**: reduction + normalize at A-loads → 0.00e0
 
-`choose_handoff()` auto-selects: both elementwise with scalar store/load → register,
-otherwise → SMEM. No manual strategy specification needed.
+GPU-verified: 19/19 tests, all 0.00e0 diff. Includes:
+- Elementwise SMEM: 10 sizes including production dims (hidden 2560, 3456)
+- Elementwise register: 5 sizes, bitwise = special-purpose regfuse
+- GEMM prologue identity: 4 sizes, 0.00e0 vs base GEMM
+- GEMM prologue scale*2: 4 sizes, GEMM(A*2,B) = 2*GEMM(A,B) at 0.00e0
+- rms_norm + GEMM intrinsic: 0.00e0 vs separate norm+GEMM
 
-**Phase 4: llama.rs integration**
+**Phase 4: llama.rs integration** — **NEXT**
 
-Wire `fuse!` into the forward pass to go from 11 launches to 6 per layer.
+Wire fused kernels into the forward pass: 11 launches → 6 per layer.
 
 ### What this replaces
 
@@ -340,7 +359,8 @@ crates/ptx-fusion-macros/          Proc macro crate (runs at compile time)
   src/persistent.rs                Persistent kernel wrapper (work-queue loop)
   src/regfuse.rs                   Register-level fusion engine (elementwise)
   src/extract.rs                   Single-entry extraction from multi-entry PTX
-  src/fuse_general.rs              General fusion engine: any kernels + bindings, kernel-agnostic
+  src/fuse_general.rs              General fusion engine: any kernels + bindings, 5 handoff paths
+  src/intrinsic_rms_norm.rs        rms_norm intrinsic: generate reduction + normalize from scratch
 
 crates/ptx-fusion/                 Library + tests
   src/lib.rs                       KernelProtocol types + re-exports
@@ -349,8 +369,8 @@ crates/ptx-fusion/                 Library + tests
   build.rs                         Compiles vllm-cuda kernels + CUTLASS configs + probes derivations
   kernels/                         PTX files + .derivations.json (probed param formulas, git-tracked)
   tests/cuda_flat_gemm.rs          Comprehensive flat-param GEMM vs cuBLAS (10 tests, all production dims)
-  tests/cuda_fuse_general.rs       General fuse! macro GPU tests (15 tests: 10 SMEM + 5 register, 0.00e0)
-  tests/                           88 CUDA GPU tests + 4 dispatch tests
+  tests/cuda_fuse_general.rs       General fuse! + GEMM GPU tests (19 tests, all 0.00e0)
+  tests/                           97 CUDA GPU tests + 4 dispatch tests
 ```
 
 ## Proc Macros
@@ -374,6 +394,7 @@ crates/ptx-fusion/                 Library + tests
 | `fuse_norm_gemm_silu!(...)` | Prologue + epilogue: norm -> GEMM + SiLU in one kernel |
 | `replace_perimeter_macro!(...)` | Rewrite CUTLASS param interface: flat layout, derived fields inlined |
 | **`fuse!(...)`** | **General kernel fusion: any two kernels + binding, kernel-agnostic** |
+| `fuse_rms_norm_gemm_flat!(...)` | rms_norm intrinsic + GEMM: chains prologue fusion + perimeter replacement |
 
 ## What's Next
 
@@ -476,8 +497,8 @@ At L4's ~300 GB/s: ~7 us/layer bandwidth savings.
 Phase 0: CUTLASS parity with cuBLAS     ← DONE (benchmarked, dispatch)
 Phase 1: Def-use graph + param classify  ← DONE (parser.rs)
 Phase 2: Perimeter replacement           ← DONE (perimeter.rs, build.rs probe, llama.rs integration)
-Phase 3: General fuse! proc macro        ← DONE (fuse_general.rs, SMEM + register, 15/15 GPU tests 0.00e0)
-Phase 4: llama.rs integration            ← NEXT (wire fuse! into forward pass, 11→6 launches)
+Phase 3: General fuse! + GEMM fusion      ← DONE (5 handoff paths, intrinsics, 19/19 GPU tests 0.00e0)
+Phase 4: llama.rs integration            ← NEXT (wire fused kernels into forward pass, 11→6 launches)
 Phase 5: llama.rs integration            ← wire fuse! into forward pass (11→6 launches)
 ```
 

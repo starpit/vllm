@@ -49,6 +49,9 @@ pub enum HandoffKind {
     Register,
     /// A writes to SMEM, barrier, B reads from SMEM. Always correct.
     SharedMemory,
+    /// A is a GEMM: inject B's pointwise computation into A's epilogue
+    /// before bf16 conversion. Zero memory traffic for the intermediate.
+    GemmEpilogue,
 }
 
 // ── Thread-mapping analysis ──
@@ -74,6 +77,9 @@ fn choose_handoff(
         proto_a.smem_regions.is_empty() && proto_a.barriers.is_empty() && !proto_a.has_mma;
     let b_elementwise =
         proto_b.smem_regions.is_empty() && proto_b.barriers.is_empty() && !proto_b.has_mma;
+
+    // Note: GEMM -> elementwise (epilogue) is handled early in fuse_two(),
+    // before choose_handoff is called. If we get here, neither side is a GEMM.
 
     if !a_elementwise || !b_elementwise {
         return HandoffKind::SharedMemory;
@@ -138,7 +144,42 @@ pub fn fuse_two(
     let lines_a: Vec<&str> = ptx_a_single.lines().collect();
     let lines_b: Vec<&str> = ptx_b_single.lines().collect();
 
-    // Resolve binding to param names
+    // Early detection: GEMM -> elementwise epilogue injection.
+    // For this path we don't need to trace A's output params (GEMM uses struct params).
+    // We only need B's consumer info.
+    let a_is_gemm = proto_a.has_mma
+        && lines_a
+            .iter()
+            .any(|l| l.trim().starts_with("cvt.rn.bf16x2.f32"));
+    let b_elementwise =
+        proto_b.smem_regions.is_empty() && proto_b.barriers.is_empty() && !proto_b.has_mma;
+
+    if a_is_gemm && b_elementwise {
+        let b_input_param =
+            find_param_by_substring(&proto_b.params, b_input_port).ok_or_else(|| {
+                format!(
+                    "no param matching '{}' in kernel B ({})",
+                    b_input_port, proto_b.name
+                )
+            })?;
+        let reg_to_param_b = PtxParser::trace_param_registers_pub(&lines_b, &proto_b.params);
+        let b_input_addr_regs: Vec<String> = reg_to_param_b
+            .iter()
+            .filter(|(_, p)| **p == b_input_param)
+            .map(|(r, _)| r.clone())
+            .collect();
+
+        return fuse_gemm_epilogue(
+            &ptx_a_single,
+            &ptx_b_single,
+            &proto_b,
+            &b_input_param,
+            &b_input_addr_regs,
+            fused_name,
+        );
+    }
+
+    // Standard path: resolve both sides' param names
     let a_output_param =
         find_param_by_substring(&proto_a.params, a_output_port).ok_or_else(|| {
             format!(
@@ -190,6 +231,7 @@ pub fn fuse_two(
     );
 
     match handoff {
+        HandoffKind::GemmEpilogue => unreachable!("handled in early return above"),
         HandoffKind::Register => fuse_register(
             &ptx_a_single,
             &ptx_b_single,
@@ -218,6 +260,364 @@ pub fn fuse_two(
             &reg_to_param_b,
             fused_name,
         ),
+    }
+}
+
+/// GEMM epilogue injection: extract B's pointwise computation and inject it into
+/// A's epilogue before bf16 conversion.
+///
+/// A is a CUTLASS GEMM with `cvt.rn.bf16x2.f32` sites. B is an elementwise kernel
+/// whose computation is extracted and applied to each f32 accumulator value before
+/// the bf16 conversion. B's non-bound params are appended to the fused kernel.
+fn fuse_gemm_epilogue(
+    ptx_a: &str,
+    ptx_b: &str,
+    proto_b: &KernelProtocol,
+    b_input_param: &str,
+    b_input_addr_regs: &[String],
+    fused_name: &str,
+) -> Result<FusedResult, String> {
+    // Extract B's pointwise computation: instructions between ld.global and st.global
+    let body_b = extract_body_lines(ptx_b)?;
+    let computation =
+        extract_pointwise_computation(&body_b, b_input_addr_regs, proto_b, b_input_param)?;
+
+    // Find all cvt.rn.bf16x2.f32 sites in the GEMM
+    let lines_a: Vec<&str> = ptx_a.lines().collect();
+    let cvt_count = lines_a
+        .iter()
+        .filter(|l| l.trim().starts_with("cvt.rn.bf16x2.f32"))
+        .count();
+    if cvt_count == 0 {
+        return Err("GEMM has no cvt.rn.bf16x2.f32 sites".into());
+    }
+
+    // B's non-bound params to append
+    let extra_params: Vec<_> = proto_b
+        .params
+        .iter()
+        .filter(|p| p.name != b_input_param)
+        .collect();
+
+    // Determine scratch registers needed for the extracted computation
+    let scratch_f32 = computation.scratch_f32_count;
+    let scratch_b32 = computation.scratch_b32_count;
+
+    // Build ld.param instructions for B's extra params, and map their original
+    // register names to the computation's param_reg_map
+    let param_load_instrs: Vec<String> = computation.param_loads.clone();
+
+    // Rewrite the GEMM PTX
+    let mut out = Vec::new();
+    let mut in_entry_header = false;
+    let mut params_closed = false;
+    let mut emitted_scratch = false;
+
+    for line in &lines_a {
+        let trimmed = line.trim();
+
+        // Rewrite entry name
+        if trimmed.contains(".entry") && trimmed.contains('(') {
+            let new_line = if let Some(paren) = trimmed.find('(') {
+                format!(".visible .entry {fused_name}(")
+            } else {
+                trimmed.to_string()
+            };
+            out.push(new_line);
+            in_entry_header = true;
+            continue;
+        }
+
+        // After closing paren of params, append B's extra params
+        if in_entry_header && (trimmed == ")" || trimmed.starts_with(')')) {
+            // Insert extra params before closing paren
+            if !extra_params.is_empty() {
+                // Need to add comma to previous param line
+                if let Some(last) = out.last_mut() {
+                    if !last.trim().ends_with(',') && last.contains(".param") {
+                        *last = format!("{},", last.trim_end());
+                    }
+                }
+                for (i, p) in extra_params.iter().enumerate() {
+                    let comma = if i + 1 < extra_params.len() { "," } else { "" };
+                    out.push(format!("\t.param {} {}{}", p.ptx_type, p.name, comma));
+                }
+            }
+            out.push(trimmed.to_string());
+            in_entry_header = false;
+            params_closed = true;
+            continue;
+        }
+
+        // After register declarations, add scratch registers and param loads
+        if params_closed && !emitted_scratch && trimmed.starts_with(".reg") {
+            out.push(line.to_string());
+            // Check if next non-empty line is NOT a .reg declaration
+            let remaining_lines: Vec<&&str> = lines_a
+                .iter()
+                .skip_while(|l| *l != line)
+                .skip(1)
+                .filter(|l| !l.trim().is_empty())
+                .take(1)
+                .collect();
+            if let Some(next) = remaining_lines.first() {
+                if !next.trim().starts_with(".reg") {
+                    if scratch_f32 > 0 {
+                        out.push(format!("\t.reg .f32 \t%f_epi<{scratch_f32}>;"));
+                    }
+                    if scratch_b32 > 0 {
+                        out.push(format!("\t.reg .b32 \t%r_epi<{scratch_b32}>;"));
+                    }
+                    // Emit ld.param for B's extra params (uses scratch regs)
+                    out.push("\t// FERRITE: load epilogue params".to_string());
+                    for instr in &param_load_instrs {
+                        out.push(format!("\t{instr}"));
+                    }
+                    emitted_scratch = true;
+                }
+            }
+            continue;
+        }
+
+        // Inject computation before each cvt.rn.bf16x2.f32
+        if trimmed.starts_with("cvt.rn.bf16x2.f32") {
+            if let Some((_dest, src_a, src_b)) = parse_bf16_cvt(trimmed) {
+                out.push(
+                    "\t// FERRITE: inject epilogue computation before bf16 conversion".to_string(),
+                );
+                emit_pointwise_inplace(&mut out, &src_a, &computation);
+                emit_pointwise_inplace(&mut out, &src_b, &computation);
+            }
+            out.push(format!("\t{trimmed}"));
+            continue;
+        }
+
+        out.push(line.to_string());
+    }
+
+    Ok(FusedResult {
+        ptx: out.join("\n"),
+        entry_name: fused_name.to_string(),
+    })
+}
+
+/// Extracted pointwise computation from an elementwise kernel.
+struct PointwiseComputation {
+    /// PTX instructions that transform the input value (in a register) to the output.
+    /// Parameterized: `{INPUT}` is the placeholder for the accumulator register.
+    instructions: Vec<String>,
+    /// ld.param instructions for the consumer's non-bound params (using renamed regs).
+    /// These must be emitted once at the top of the fused kernel body.
+    param_loads: Vec<String>,
+    /// Number of scratch .f32 registers needed.
+    scratch_f32_count: usize,
+    /// Number of scratch .b32 registers needed.
+    scratch_b32_count: usize,
+}
+
+/// Extract the pointwise computation from an elementwise kernel.
+///
+/// Finds the path from ld.global (bound input) to st.global (output),
+/// extracts the instructions, and parameterizes them so they can be
+/// injected at each epilogue site.
+fn extract_pointwise_computation(
+    body: &[String],
+    input_addr_regs: &[String],
+    proto: &KernelProtocol,
+    input_param: &str,
+) -> Result<PointwiseComputation, String> {
+    // Find the ld.global for the bound input
+    let mut input_reg = None;
+    let mut load_line_idx = None;
+    for (i, line) in body.iter().enumerate() {
+        let t = line.trim();
+        if t.contains("ld.global") && is_addr_in_set(t, input_addr_regs) {
+            // Extract dest register
+            let parts: Vec<&str> = t
+                .split([',', ' ', '\t'])
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() >= 2 {
+                input_reg = Some(parts[1].trim_end_matches(',').to_string());
+                load_line_idx = Some(i);
+                break;
+            }
+        }
+    }
+    let input_reg = input_reg.ok_or("could not find ld.global for bound input")?;
+    let load_idx = load_line_idx.unwrap();
+
+    // Find the output store's address registers
+    let output_params: Vec<String> = proto
+        .params
+        .iter()
+        .filter(|p| p.is_pointer && p.name != input_param)
+        .map(|p| p.name.clone())
+        .collect();
+
+    // Find st.global that writes the output
+    let mut output_reg = None;
+    let mut store_line_idx = None;
+    for (i, line) in body.iter().enumerate().skip(load_idx) {
+        let t = line.trim();
+        if t.contains("st.global") {
+            // Extract the value register (last token before semicolon)
+            let parts: Vec<&str> = t
+                .split([',', ' ', '\t'])
+                .filter(|s| !s.is_empty())
+                .collect();
+            if let Some(last) = parts.last() {
+                let val = last.trim_end_matches(';').to_string();
+                if val.starts_with('%') {
+                    output_reg = Some(val);
+                    store_line_idx = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    let output_reg = output_reg.ok_or("could not find st.global for output")?;
+    let store_idx = store_line_idx.unwrap();
+
+    // First pass: collect ld.param instructions for B's non-bound params.
+    // These load scalar values (scale_val, etc.) that the computation uses.
+    // We rename their dest registers to %f_epi / %r_epi scratch names.
+    let mut param_reg_map: BTreeMap<String, String> = BTreeMap::new(); // original reg -> scratch name
+    let mut param_loads = Vec::new();
+    let mut used_f32_scratch = 0usize;
+    let mut used_b32_scratch = 0usize;
+
+    for line in body {
+        let t = line.trim();
+        if !t.contains("ld.param") {
+            continue;
+        }
+        // Skip ld.param for the bound input and for pointer params (address setup)
+        if t.contains(input_param) {
+            continue;
+        }
+        // Only keep scalar param loads (.f32, .u32, .s32)
+        if t.contains(".u64") || t.contains(".b64") {
+            continue; // pointer param, skip
+        }
+        let parts: Vec<&str> = t
+            .split([',', ' ', '\t'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() >= 2 {
+            let dest = parts[1].trim_end_matches(',').to_string();
+            let scratch = if dest.starts_with("%f") {
+                let s = format!("%f_epi{}", used_f32_scratch);
+                used_f32_scratch += 1;
+                s
+            } else {
+                let s = format!("%r_epi{}", used_b32_scratch);
+                used_b32_scratch += 1;
+                s
+            };
+            let renamed_instr = t.replace(&dest, &scratch);
+            param_loads.push(renamed_instr);
+            param_reg_map.insert(dest, scratch);
+        }
+    }
+
+    // Second pass: extract computation instructions between ld.global and st.global
+    let mut instructions = Vec::new();
+    let mut intermediate_regs: BTreeMap<String, String> = BTreeMap::new();
+
+    for line in body.iter().take(store_idx).skip(load_idx + 1) {
+        let t = line.trim();
+        // Skip non-computation lines
+        if t.is_empty()
+            || t.ends_with(':')
+            || t.starts_with("//")
+            || t.contains("ld.param")
+            || t.contains("cvta.to.global")
+            || t.contains("add.u64")
+            || t.contains("add.s64")
+            || t.contains("mul.wide")
+        {
+            continue;
+        }
+
+        let mut instr = t.to_string();
+
+        // Map intermediate registers to scratch names (skip param regs already mapped)
+        let parts: Vec<&str> = t
+            .split([',', ' ', '\t', ';'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        for part in &parts {
+            let reg = part.trim_end_matches(',').trim_end_matches(';');
+            if reg == &input_reg || reg == &output_reg {
+                continue;
+            }
+            if param_reg_map.contains_key(reg) {
+                continue; // already mapped via param load
+            }
+            if reg.starts_with("%f") {
+                if !intermediate_regs.contains_key(reg) {
+                    let scratch = format!("%f_epi{}", used_f32_scratch);
+                    intermediate_regs.insert(reg.to_string(), scratch);
+                    used_f32_scratch += 1;
+                }
+            } else if reg.starts_with("%r") && !reg.starts_with("%rd") {
+                if !intermediate_regs.contains_key(reg) {
+                    let scratch = format!("%r_epi{}", used_b32_scratch);
+                    intermediate_regs.insert(reg.to_string(), scratch);
+                    used_b32_scratch += 1;
+                }
+            }
+        }
+
+        // Apply all renames: param regs, intermediate regs, input/output -> {INPUT}
+        for (orig, scratch) in &param_reg_map {
+            instr = instr.replace(orig, scratch);
+        }
+        for (orig, scratch) in &intermediate_regs {
+            instr = instr.replace(orig, scratch);
+        }
+        if output_reg != input_reg {
+            instr = instr.replace(&output_reg, "{INPUT}");
+        }
+        instr = instr.replace(&input_reg, "{INPUT}");
+
+        instructions.push(instr);
+    }
+
+    if instructions.is_empty() {
+        return Err("no computation found between ld.global and st.global".into());
+    }
+
+    Ok(PointwiseComputation {
+        instructions,
+        param_loads,
+        scratch_f32_count: used_f32_scratch,
+        scratch_b32_count: used_b32_scratch,
+    })
+}
+
+/// Emit the extracted pointwise computation in-place on a register.
+fn emit_pointwise_inplace(out: &mut Vec<String>, reg: &str, comp: &PointwiseComputation) {
+    for instr in &comp.instructions {
+        let concrete = instr.replace("{INPUT}", reg);
+        out.push(format!("\t{concrete}"));
+    }
+}
+
+/// Parse `cvt.rn.bf16x2.f32 %rN, %fA, %fB;`
+fn parse_bf16_cvt(instr: &str) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = instr
+        .split([',', ' ', '\t'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() >= 4 {
+        let dest = parts[1].trim_end_matches(',').to_string();
+        let src_a = parts[2].trim_end_matches(',').to_string();
+        let src_b = parts[3].trim_end_matches(';').to_string();
+        Some((dest, src_a, src_b))
+    } else {
+        None
     }
 }
 

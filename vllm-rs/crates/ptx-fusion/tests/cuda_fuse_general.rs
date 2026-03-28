@@ -669,3 +669,70 @@ fn regfuse_matches_special_purpose() {
     );
     println!("PASS");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// GEMM epilogue injection tests: CUTLASS GEMM + pointwise consumer
+// fuse! detects the GEMM from its MMA instructions and injects the
+// consumer's computation into the epilogue before bf16 conversion.
+// ══════════════════════════════════════════════════════════════════════
+
+// Fuse flat-param CUTLASS GEMM + scale via general fuse!
+// The GEMM output (ptr_D / ferrite_params) feeds scale's input.
+// scale.ptx has params: (input, output, n, scale_val)
+// The GEMM's output is traced to the D pointer via st.global.
+//
+// We bind GEMM.param_0 (A ptr traced to output stores) -- wait, the flat-param
+// GEMM's output stores trace to the D pointer at ferrite_params offset 24.
+// But find_param_by_substring matches on param names. The flat-param GEMM has
+// a single param "ferrite_params", so we can't disambiguate A/B/C/D by name.
+//
+// For now, test with the ORIGINAL (non-flat-param) CUTLASS PTX which has named params.
+// TODO: support flat-param GEMM binding by offset.
+
+ptx_fusion::fuse!(
+    a = "kernels/cutlass_gemm_bf16_sm89.ptx",
+    b = "kernels/scale.ptx",
+    bind = { a.param_0 => b.input },
+    name = "gemm_scale_fused",
+    const = GEMM_SCALE_PTX,
+);
+
+#[test]
+fn gemm_epilogue_ptxas_valid() {
+    println!("=== GEMM epilogue injection: ptxas validation ===");
+
+    // Verify the macro chose GemmEpilogue
+    assert!(
+        GEMM_SCALE_PTX.contains("FERRITE: inject epilogue"),
+        "should use epilogue injection for GEMM -> elementwise"
+    );
+
+    let path = "/tmp/gemm_scale_fused.ptx";
+    std::fs::write(path, GEMM_SCALE_PTX).unwrap();
+
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stderr.lines().take(20) {
+            println!("  ptxas: {line}");
+        }
+        // Print first/last 20 lines of fused PTX
+        let ptx_lines: Vec<&str> = GEMM_SCALE_PTX.lines().collect();
+        println!("--- First 20 lines ---");
+        for (i, line) in ptx_lines.iter().enumerate().take(20) {
+            println!("{:4}: {line}", i + 1);
+        }
+        if ptx_lines.len() > 40 {
+            println!("--- Last 20 lines ---");
+            for (i, line) in ptx_lines.iter().enumerate().skip(ptx_lines.len() - 20) {
+                println!("{:4}: {line}", i + 1);
+            }
+        }
+        panic!("ptxas FAILED on GEMM+scale fused PTX");
+    }
+    println!("PASS: GEMM+scale fused PTX passes ptxas");
+}

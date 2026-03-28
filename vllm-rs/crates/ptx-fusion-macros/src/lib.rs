@@ -1612,6 +1612,47 @@ pub fn prologue_identity_flat(input: TokenStream) -> TokenStream {
     output.into()
 }
 
+/// Apply scale-by-2.0 prologue then flat-param perimeter replacement.
+/// Each A-matrix element is multiplied by 2.0 inline at the cp.async site.
+/// For GPU correctness testing: GEMM(A*2, B) should equal 2 * GEMM(A, B).
+#[proc_macro]
+pub fn prologue_scale2_flat(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let (ptx_path, json_path, entry_name, const_name_str) = parse_perimeter_args(&input_str)
+        .expect("prologue_scale2_flat! expects (\"ptx\", \"json\", \"entry\", CONST_NAME)");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_full = PathBuf::from(&manifest_dir).join(&ptx_path);
+    let json_full = PathBuf::from(&manifest_dir).join(&json_path);
+
+    let ptx_source = std::fs::read_to_string(&ptx_full)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_full.display()));
+    let json_source = std::fs::read_to_string(&json_full)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", json_full.display()));
+
+    // Scale by 2.0: mul.f32 {INPUT}, {INPUT}, 0f40000000 (IEEE 754 for 2.0)
+    let scale2 = fuse_general::PointwiseComputation {
+        instructions: vec!["mul.f32 {INPUT}, {INPUT}, 0f40000000;".to_string()],
+        param_loads: vec![],
+        scratch_f32_count: 0,
+        scratch_b32_count: 0,
+    };
+
+    let after_prologue =
+        fuse_general::replace_a_loads_with_inline_fn(&ptx_source, "param_0", &scale2)
+            .unwrap_or_else(|e| panic!("prologue_scale2 failed: {e}"));
+
+    let (rewritten, _) = perimeter::replace_perimeter(&after_prologue, &json_source, &entry_name)
+        .unwrap_or_else(|e| panic!("perimeter replacement after prologue failed: {e}"));
+
+    let const_name = syn::Ident::new(&const_name_str, proc_macro2::Span::call_site());
+    let rewritten_str = rewritten.as_str();
+    let output = quote! {
+        const #const_name: &str = #rewritten_str;
+    };
+    output.into()
+}
+
 /// Apply `replace_a_loads_with_inline_fn` with an identity (passthrough) function.
 /// Used for GPU correctness testing of the prologue injection mechanism.
 ///

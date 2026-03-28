@@ -923,3 +923,72 @@ fn prologue_identity_gpu_correctness() {
     }
     println!("PASS: prologue identity matches base GEMM");
 }
+
+// ── Prologue scale-by-2: GPU correctness ──
+// GEMM(A*2, B) should equal 2 * GEMM(A, B) since GEMM is linear in A.
+
+ptx_fusion::prologue_scale2_flat!(
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "flat_gemm_prologue_s2",
+    FLAT_GEMM_PROLOGUE_S2_PTX
+);
+
+#[test]
+fn prologue_scale2_gpu_correctness() {
+    println!("=== GEMM prologue scale*2: GPU correctness ===");
+
+    let ctx = ctx();
+
+    let cases: &[(u32, u32, u32)] = &[(64, 128, 32), (128, 256, 64), (1, 128, 32), (32, 128, 128)];
+
+    for &(m, n, k) in cases {
+        let h_a: Vec<half::bf16> = (0..(m * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+            .collect();
+        let h_b: Vec<half::bf16> = (0..(n * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+            .collect();
+
+        // Baseline: GEMM(A, B)
+        let out_base = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &h_a,
+            &h_b,
+            m,
+            n,
+            k,
+        );
+        // Prologue scale*2: GEMM(A*2, B)
+        let out_scaled = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_PROLOGUE_S2_PTX,
+            "flat_gemm_prologue_s2",
+            &h_a,
+            &h_b,
+            m,
+            n,
+            k,
+        );
+
+        // Expect: out_scaled[i] ≈ 2 * out_base[i]
+        let mut max_diff = 0.0f32;
+        for (i, (base, scaled)) in out_base.iter().zip(out_scaled.iter()).enumerate() {
+            let expected = base.to_f32() * 2.0;
+            let actual = scaled.to_f32();
+            let diff = (actual - expected).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            if diff > 0.1 && expected.abs() > 1e-6 {
+                panic!(
+                    "M={m} N={n} K={k}: [{i}] expected {expected:.4}, got {actual:.4}, diff={diff:.2e}"
+                );
+            }
+        }
+        println!("  M={m}, N={n}, K={k}: max_abs_diff(scaled - 2*base) = {max_diff:.2e}");
+    }
+    println!("PASS: prologue scale*2 matches 2 * base GEMM");
+}

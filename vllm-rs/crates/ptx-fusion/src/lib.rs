@@ -12,7 +12,8 @@ pub use ptx_fusion_macros::{
     analyze_kernel, analyze_kernel_as, delete_cutlass_a_loads, extract_entry, fuse,
     fuse_3phase_mlp, fuse_kernels, fuse_real_kernels, fuse_rms_norm_cutlass, inject_epilogue,
     inject_silu_epilogue, persistent_fuse_real_kernels, prologue_identity, prologue_identity_flat,
-    regfuse_kernels, replace_cutlass_a_loads, replace_perimeter_macro, rewrite_kernel,
+    prologue_scale2_flat, regfuse_kernels, replace_cutlass_a_loads, replace_perimeter_macro,
+    rewrite_kernel,
 };
 
 #[cfg(feature = "cuda")]

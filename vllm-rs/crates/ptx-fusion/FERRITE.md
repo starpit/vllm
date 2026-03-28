@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **170+ tests** (93 CUDA GPU + 80 unit + doc-ignored), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **180+ tests** (96 CUDA GPU + 80 unit + doc-ignored), all passing.
 
 ### What's Proven
 
@@ -98,6 +98,8 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **170+ tests** (93 CUDA GPU + 80 unit + doc
 | **General `fuse!` macro (ptxas)** | cuda_fuse_general | **kernel-agnostic SMEM stitching, ptxas valid** |
 | **General `fuse!` macro (GPU, SMEM)** | cuda_fuse_general | **rms_norm→silu_mul: 10/10 sizes, 0.00e0 diff, deterministic** |
 | **General `fuse!` macro (GPU, register)** | cuda_fuse_general | **rms_norm→scale: 5/5, 0.00e0, bitwise = special-purpose regfuse** |
+| **GEMM prologue identity (GPU)** | cuda_fuse_general | **cp.async→ld+unpack+repack+st: 4/4 sizes, 0.00e0 vs base GEMM** |
+| **GEMM prologue scale*2 (GPU)** | cuda_fuse_general | **pointwise fn at A-loads: GEMM(A*2,B) = 2*GEMM(A,B), 0.00e0** |
 
 ### Benchmarks
 

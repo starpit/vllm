@@ -9,9 +9,9 @@
 //! proc-macro-driven kernel fusion.
 
 pub use ptx_fusion_macros::{
-    analyze_kernel, analyze_kernel_as, delete_cutlass_a_loads, extract_entry, fuse_3phase_mlp,
-    fuse_kernels, fuse_real_kernels, fuse_rms_norm_cutlass, inject_epilogue, inject_silu_epilogue,
-    persistent_fuse_real_kernels, regfuse_kernels, replace_cutlass_a_loads,
+    analyze_kernel, analyze_kernel_as, delete_cutlass_a_loads, extract_entry, fuse,
+    fuse_3phase_mlp, fuse_kernels, fuse_real_kernels, fuse_rms_norm_cutlass, inject_epilogue,
+    inject_silu_epilogue, persistent_fuse_real_kernels, regfuse_kernels, replace_cutlass_a_loads,
     replace_perimeter_macro, rewrite_kernel,
 };
 

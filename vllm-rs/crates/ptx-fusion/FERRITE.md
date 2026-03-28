@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **150+ tests** (78 CUDA GPU + 72 unit + doc-ignored), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **160+ tests** (88 CUDA GPU + 76 unit + doc-ignored), all passing.
 
 ### What's Proven
 
@@ -95,6 +95,8 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **150+ tests** (78 CUDA GPU + 72 unit + doc
 | Derivation probing (build.rs) | build.rs | 4 CUTLASS configs probed: 64x64, 64x128, 128x128, 128x128x64 |
 | **Flat-param GEMM vs cuBLAS (GPU)** | cuda_flat_gemm | **10/10: all llama dims, partial tiles, batch sweep, 0.00e0** |
 | **End-to-end model inference** | vllm serve | **Qwen2.5-3B-Instruct: correct output ("Four", "Paris")** |
+| **General `fuse!` macro (ptxas)** | cuda_fuse_general | **kernel-agnostic SMEM stitching, ptxas valid** |
+| **General `fuse!` macro (GPU)** | cuda_fuse_general | **rms_norm→silu_mul: 10/10 sizes, 0.00e0 diff, deterministic** |
 
 ### Benchmarks
 
@@ -174,28 +176,37 @@ This required extending the PTX param tracer to propagate through `mov.u64`/`mov
 engine to handle the `mul.wide.s32` address pattern that nvcc generates for GEMM
 kernels (vs the `cvt.s64.s32` pattern used by elementwise kernels).
 
-## The General `ferrite::fuse!` Macro (next major milestone)
-
-The current fusion macros (`fuse_rms_norm_cutlass!`, `fuse_norm_gemm_silu!`) are
-each hardcoded for a specific kernel pair. The CUTLASS params builder is hand-rolled
-with empirically-extracted constants, producing garbage for some configs.
-
-The root cause: reimplementing host-side CUTLASS logic in Rust instead of deriving
-the kernel's contract from the PTX itself.
-
-### The endgame
+## The General `ferrite::fuse!` Macro — **DONE**
 
 ```rust
-let llama_layer = ferrite::fuse!(
-    a = "csrc/rms_norm.ptx",
-    b = "cutlass/gemm_bf16.ptx",
-    c = "csrc/silu_mul.ptx",
-    bind = { a.output => b.input[0], b.output => c.input },
+ptx_fusion::fuse!(
+    a = "kernels/vllm_rms_norm.ptx",
+    b = "kernels/vllm_silu_mul.ptx",
+    bind = { a.param_0 => b.param_1 },
+    name = "fused_norm_silu",
+    const = FUSED_PTX,
 );
-llama_layer.launch(input, weight, epsilon, gemm_weight, ...);
 ```
 
-One macro. Any kernels. No hardcoded param builders.
+One macro. Any kernels. No hardcoded param builders. The macro is **kernel-agnostic**:
+it doesn't know what the kernels do. It only sees their escape perimeters.
+
+**How it works:**
+1. Parses each kernel's PTX via `PtxParser::parse()` (auto-extracts from multi-entry PTX)
+2. Resolves the binding: finds A's output store sites and B's input load sites via param tracing
+3. Analyzes thread-to-element mappings to choose handoff (SMEM or registers)
+4. Rewrites PTX: A's bound stores → `st.shared`, barrier, B's bound loads → `ld.shared`
+5. Merges params: bound pair eliminated, remaining params concatenated
+6. Emits a single fused kernel as a `const &str`
+
+**GPU-verified**: 10/10 test cases, all 0.00e0 diff vs separate launches.
+Production dimensions (Qwen2.5-3B: hidden=2560, 3456), batch sizes 1-256,
+10-run determinism, large/small input magnitudes.
+
+**Key files:**
+- `fuse_general.rs`: general fusion engine (SMEM handoff path)
+- `lib.rs`: `fuse!` proc macro (DSL parser + dispatch to engine)
+- `tests/cuda_fuse_general.rs`: 10 GPU correctness tests
 
 ### The extended perimeter model
 
@@ -247,19 +258,25 @@ Integrated into llama.rs — all 4 GEMMs per layer use flat-param CUTLASS.
 Layers with bias use ferrite GEMM + separate `bias_add_inplace` kernel.
 End-to-end correct on Qwen2.5-3B-Instruct.
 
-**Phase 3: General fusion engine** (new fuse_general.rs)
+**Phase 3: General `fuse!` proc macro** (fuse_general.rs) — **DONE**
 
-Given N kernels with classified perimeters + user bindings:
-1. Match bindings to data ports
-2. Eliminate bound params (A's output ptr = B's input ptr)
-3. Choose handoff (SMEM, register, in-place)
-4. Merge remaining params
-5. Emit fused kernel
+The `fuse!` macro takes any two kernels + bindings and produces a fused kernel.
+Kernel-agnostic: only looks at escape perimeters. SMEM handoff path working,
+register handoff stubbed (requires thread-mapping analysis).
 
-**Phase 4: The `ferrite::fuse!` proc macro**
+GPU-verified: rms_norm→silu_mul, 10/10 tests, 0.00e0 diff at production dims.
 
-Parse the DSL, call the general engine, return a `FusedKernel` value with
-the fused PTX baked in and a `launch()` method.
+**Phase 4: Register handoff optimization**
+
+Analyze thread-to-element mappings from the address computation chains in the
+perimeter. When both kernels are elementwise with identical mappings
+(blockIdx.x * blockDim.x + threadIdx.x), use register handoff instead of SMEM
+for zero memory traffic. The `choose_handoff()` function in `fuse_general.rs`
+currently defaults to SMEM (always correct); this phase makes it smart.
+
+**Phase 5: llama.rs integration**
+
+Wire `fuse!` into the forward pass to go from 11 launches to 6 per layer.
 
 ### What this replaces
 
@@ -321,6 +338,7 @@ crates/ptx-fusion-macros/          Proc macro crate (runs at compile time)
   src/persistent.rs                Persistent kernel wrapper (work-queue loop)
   src/regfuse.rs                   Register-level fusion engine (elementwise)
   src/extract.rs                   Single-entry extraction from multi-entry PTX
+  src/fuse_general.rs              General fusion engine: any kernels + bindings, kernel-agnostic
 
 crates/ptx-fusion/                 Library + tests
   src/lib.rs                       KernelProtocol types + re-exports
@@ -329,7 +347,8 @@ crates/ptx-fusion/                 Library + tests
   build.rs                         Compiles vllm-cuda kernels + CUTLASS configs + probes derivations
   kernels/                         PTX files + .derivations.json (probed param formulas, git-tracked)
   tests/cuda_flat_gemm.rs          Comprehensive flat-param GEMM vs cuBLAS (10 tests, all production dims)
-  tests/                           78 CUDA GPU tests + 4 dispatch tests
+  tests/cuda_fuse_general.rs       General fuse! macro GPU tests (10 tests, production dims, 0.00e0)
+  tests/                           88 CUDA GPU tests + 4 dispatch tests
 ```
 
 ## Proc Macros
@@ -352,6 +371,7 @@ crates/ptx-fusion/                 Library + tests
 | `fuse_rms_norm_cutlass!(...)` | Fuse rms_norm prologue into CUTLASS GEMM (normalize inline) |
 | `fuse_norm_gemm_silu!(...)` | Prologue + epilogue: norm -> GEMM + SiLU in one kernel |
 | `replace_perimeter_macro!(...)` | Rewrite CUTLASS param interface: flat layout, derived fields inlined |
+| **`fuse!(...)`** | **General kernel fusion: any two kernels + binding, kernel-agnostic** |
 
 ## What's Next
 
@@ -454,8 +474,9 @@ At L4's ~300 GB/s: ~7 us/layer bandwidth savings.
 Phase 0: CUTLASS parity with cuBLAS     ← DONE (benchmarked, dispatch)
 Phase 1: Def-use graph + param classify  ← DONE (parser.rs)
 Phase 2: Perimeter replacement           ← DONE (perimeter.rs, build.rs probe, llama.rs integration)
-Phase 3: General fusion engine           ← NEXT (fuse_general.rs)
-Phase 4: ferrite::fuse! proc macro       ← endgame
+Phase 3: General fuse! proc macro        ← DONE (fuse_general.rs, SMEM path, 10/10 GPU tests 0.00e0)
+Phase 4: Register handoff optimization   ← NEXT (thread-mapping analysis for register vs SMEM)
+Phase 5: llama.rs integration            ← wire fuse! into forward pass (11→6 launches)
 ```
 
 ### Current performance (no fusion yet)

@@ -7,6 +7,7 @@ pub(crate) mod extract;
 mod fuse;
 pub(crate) mod fuse_cp_async;
 pub(crate) mod fuse_epilogue;
+pub(crate) mod fuse_general;
 pub(crate) mod fuse_real;
 mod parser;
 pub(crate) mod perimeter;
@@ -1337,6 +1338,228 @@ pub fn replace_perimeter_macro(input: TokenStream) -> TokenStream {
         const #const_name: &str = #rewritten_str;
     };
     output.into()
+}
+
+/// General kernel fusion: fuse two or more PTX kernels via escape perimeter analysis.
+///
+/// The macro is kernel-agnostic — it doesn't know what the kernels do. It only
+/// sees their perimeters (global stores/loads traced to params) and rewires the
+/// plumbing so bound data transits through SMEM (or registers) instead of GMEM.
+///
+/// ```rust,ignore
+/// ptx_fusion::fuse!(
+///     a = "kernels/rms_norm.ptx",
+///     b = "kernels/silu_mul.ptx",
+///     bind = { a.output => b.input },
+///     name = "fused_norm_silu",
+///     const = FUSED_PTX,
+/// );
+/// // expands to:
+/// // const FUSED_PTX: &str = "...fused PTX...";
+/// ```
+#[proc_macro]
+pub fn fuse(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let parsed =
+        parse_general_fuse_args(&input_str).unwrap_or_else(|e| panic!("fuse! parse error: {e}"));
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+
+    // Read PTX sources
+    let mut kernel_ptx: Vec<(String, String)> = Vec::new(); // (name, ptx_source)
+    for (name, path) in &parsed.kernels {
+        let full_path = PathBuf::from(&manifest_dir).join(path);
+        let ptx = std::fs::read_to_string(&full_path)
+            .unwrap_or_else(|e| panic!("fuse!: failed to read {}: {e}", full_path.display()));
+        kernel_ptx.push((name.clone(), ptx));
+    }
+
+    // For now, support exactly 2 kernels with 1 binding
+    if kernel_ptx.len() != 2 {
+        panic!(
+            "fuse! currently supports exactly 2 kernels, got {}",
+            kernel_ptx.len()
+        );
+    }
+    if parsed.bindings.len() != 1 {
+        panic!(
+            "fuse! currently supports exactly 1 binding, got {}",
+            parsed.bindings.len()
+        );
+    }
+
+    let binding = &parsed.bindings[0];
+
+    // Find producer and consumer PTX by name
+    let producer_ptx = kernel_ptx
+        .iter()
+        .find(|(n, _)| *n == binding.producer)
+        .unwrap_or_else(|| panic!("fuse!: no kernel named '{}'", binding.producer));
+    let consumer_ptx = kernel_ptx
+        .iter()
+        .find(|(n, _)| *n == binding.consumer)
+        .unwrap_or_else(|| panic!("fuse!: no kernel named '{}'", binding.consumer));
+
+    let result = fuse_general::fuse_two(
+        &producer_ptx.1,
+        &consumer_ptx.1,
+        &binding.producer_port,
+        &binding.consumer_port,
+        &parsed.fused_name,
+    )
+    .unwrap_or_else(|e| panic!("fuse! fusion failed: {e}"));
+
+    let ptx_str = result.ptx.as_str();
+    let const_name = syn::Ident::new(&parsed.const_name, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #ptx_str;
+    };
+    output.into()
+}
+
+/// Parsed arguments from the `fuse!` macro invocation.
+struct GeneralFuseArgs {
+    /// (name, ptx_path) for each kernel
+    kernels: Vec<(String, String)>,
+    /// Bindings: producer.port => consumer.port
+    bindings: Vec<fuse_general::ParsedBinding>,
+    /// Entry name for the fused kernel
+    fused_name: String,
+    /// Rust const name to emit
+    const_name: String,
+}
+
+/// Parse the fuse! DSL:
+/// ```text
+/// fuse!(
+///     a = "path/to/a.ptx",
+///     b = "path/to/b.ptx",
+///     bind = { a.output => b.input },
+///     name = "fused_kernel",
+///     const = CONST_NAME,
+/// )
+/// ```
+fn parse_general_fuse_args(input: &str) -> Result<GeneralFuseArgs, String> {
+    let input = input.trim();
+
+    let mut kernels = Vec::new();
+    let mut bindings = Vec::new();
+    let mut fused_name = String::new();
+    let mut const_name = String::new();
+
+    // Split by top-level commas (respecting braces and quotes)
+    let items = split_top_level(input);
+
+    for item in &items {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+
+        if item.starts_with("bind") {
+            // bind = { a.output => b.input }
+            let brace_start = item.find('{').ok_or("bind: missing '{'")?;
+            let brace_end = item.rfind('}').ok_or("bind: missing '}'")?;
+            let inner = item[brace_start + 1..brace_end].trim();
+
+            // Parse bindings (comma-separated within braces)
+            for binding_str in inner.split(',') {
+                let binding_str = binding_str.trim();
+                if binding_str.is_empty() {
+                    continue;
+                }
+                let arrow = binding_str.find("=>").ok_or("bind: missing '=>'")?;
+                let lhs = binding_str[..arrow].trim();
+                let rhs = binding_str[arrow + 2..].trim();
+
+                let (prod, prod_port) = lhs
+                    .split_once('.')
+                    .ok_or_else(|| format!("bind: expected 'name.port', got '{lhs}'"))?;
+                let (cons, cons_port) = rhs
+                    .split_once('.')
+                    .ok_or_else(|| format!("bind: expected 'name.port', got '{rhs}'"))?;
+
+                bindings.push(fuse_general::ParsedBinding {
+                    producer: prod.to_string(),
+                    producer_port: prod_port.to_string(),
+                    consumer: cons.to_string(),
+                    consumer_port: cons_port.to_string(),
+                });
+            }
+        } else if let Some(eq_pos) = item.find('=') {
+            let key = item[..eq_pos].trim();
+            let val = item[eq_pos + 1..].trim();
+
+            if key == "name" {
+                fused_name = val.trim_matches('"').to_string();
+            } else if key == "const" {
+                const_name = val
+                    .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                    .to_string();
+            } else {
+                // Kernel: name = "path.ptx"
+                let path = val.trim_matches('"').to_string();
+                kernels.push((key.to_string(), path));
+            }
+        }
+    }
+
+    if kernels.is_empty() {
+        return Err("no kernels specified".into());
+    }
+    if bindings.is_empty() {
+        return Err("no bindings specified".into());
+    }
+    if fused_name.is_empty() {
+        return Err("no name specified".into());
+    }
+    if const_name.is_empty() {
+        return Err("no const specified".into());
+    }
+
+    Ok(GeneralFuseArgs {
+        kernels,
+        bindings,
+        fused_name,
+        const_name,
+    })
+}
+
+/// Split a string by top-level commas (not inside braces or quotes).
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut brace_depth = 0;
+    let mut in_quotes = false;
+
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '{' if !in_quotes => {
+                brace_depth += 1;
+                current.push(ch);
+            }
+            '}' if !in_quotes => {
+                brace_depth -= 1;
+                current.push(ch);
+            }
+            ',' if !in_quotes && brace_depth == 0 => {
+                items.push(current.clone());
+                current.clear();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    if !current.trim().is_empty() {
+        items.push(current);
+    }
+    items
 }
 
 fn parse_perimeter_args(input: &str) -> Result<(String, String, String, String), String> {

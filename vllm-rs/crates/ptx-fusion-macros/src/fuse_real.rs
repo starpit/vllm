@@ -723,6 +723,10 @@ fn emit_body_shared_decls_renamed_dedup(
     }
 }
 
+pub(crate) fn prefix_shared_names_pub(decl: &str, prefix: &str) -> String {
+    prefix_shared_names(decl, prefix)
+}
+
 fn prefix_shared_names(decl: &str, prefix: &str) -> String {
     // Find the symbol name and prefix it
     let parts: Vec<&str> = decl.split_whitespace().collect();
@@ -759,6 +763,10 @@ fn rename_b_shared_refs(line: &str, b_shared_decls: &[String]) -> String {
         }
     }
     result
+}
+
+pub(crate) fn extract_decl_name_pub(decl: &str) -> Option<String> {
+    extract_decl_name(decl)
 }
 
 fn extract_decl_name(decl: &str) -> Option<String> {

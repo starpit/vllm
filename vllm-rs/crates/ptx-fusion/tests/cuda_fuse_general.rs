@@ -736,3 +736,190 @@ fn gemm_epilogue_ptxas_valid() {
     }
     println!("PASS: GEMM+scale fused PTX passes ptxas");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// GEMM prologue GPU correctness: identity fn at A-load sites
+// The identity prologue replaces cp.async with explicit ld->unpack->repack->st.
+// The bf16->f32->bf16 round-trip is lossless for bf16 values, so the output
+// should be identical to the original flat-param GEMM.
+// ══════════════════════════════════════════════════════════════════════
+
+// Baseline: unmodified flat-param CUTLASS GEMM
+ptx_fusion::replace_perimeter_macro!(
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "flat_gemm_base",
+    FLAT_GEMM_BASE_PTX
+);
+
+// Identity prologue + flat-param: chains prologue_identity then replace_perimeter
+ptx_fusion::prologue_identity_flat!(
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "flat_gemm_prologue_id",
+    FLAT_GEMM_PROLOGUE_ID_PTX
+);
+
+fn build_flat_params(
+    a_ptr: u64,
+    b_ptr: u64,
+    c_ptr: u64,
+    d_ptr: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldb: u32,
+    ldc: u32,
+    ldd: u32,
+    alpha: f32,
+    beta: f32,
+) -> [u8; 88] {
+    let mut p = [0u8; 88];
+    p[0..8].copy_from_slice(&a_ptr.to_le_bytes());
+    p[8..16].copy_from_slice(&b_ptr.to_le_bytes());
+    p[16..24].copy_from_slice(&c_ptr.to_le_bytes());
+    p[24..32].copy_from_slice(&d_ptr.to_le_bytes());
+    p[32..40].copy_from_slice(&(lda as u64).to_le_bytes());
+    p[40..48].copy_from_slice(&(ldb as u64).to_le_bytes());
+    p[48..56].copy_from_slice(&(ldc as u64).to_le_bytes());
+    p[56..64].copy_from_slice(&(ldd as u64).to_le_bytes());
+    p[64..68].copy_from_slice(&(m as i32).to_le_bytes());
+    p[68..72].copy_from_slice(&(n as i32).to_le_bytes());
+    p[72..76].copy_from_slice(&(k as i32).to_le_bytes());
+    p[76..80].copy_from_slice(&alpha.to_le_bytes());
+    p[80..84].copy_from_slice(&beta.to_le_bytes());
+    p
+}
+
+fn compute_grid(m: u32, n: u32, tile_m: u32, tile_n: u32) -> (u32, u32, u32) {
+    let grid_m = m.div_ceil(tile_m);
+    let grid_n = n.div_ceil(tile_n);
+    const SWIZZLE_N: i32 = 4;
+    let swizzle_log = if SWIZZLE_N >= 8 && grid_n >= 6 {
+        3
+    } else if SWIZZLE_N >= 4 && grid_n >= 3 {
+        2
+    } else if SWIZZLE_N >= 2 && grid_n >= 2 {
+        1
+    } else {
+        0
+    };
+    let tile = 1u32 << swizzle_log;
+    (grid_m * tile, grid_n.div_ceil(tile), 1)
+}
+
+/// Run a flat-param CUTLASS GEMM and return the output.
+fn run_flat_gemm(
+    ctx: &Arc<CudaContext>,
+    ptx: &str,
+    entry: &str,
+    h_a: &[half::bf16],
+    h_b: &[half::bf16],
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Vec<half::bf16> {
+    let stream = ctx.default_stream();
+    let d_a = stream.clone_htod(h_a).unwrap();
+    let d_b = stream.clone_htod(h_b).unwrap();
+    let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let mut d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+
+    let module = ctx.load_module(Ptx::from_src(ptx)).unwrap();
+    let func = module.load_function(entry).unwrap();
+
+    let (a_ptr, _) = d_a.device_ptr(&stream);
+    let (b_ptr, _) = d_b.device_ptr(&stream);
+    let (c_ptr, _) = d_c.device_ptr(&stream);
+    let (d_ptr, _) = d_d.device_ptr(&stream);
+
+    let params = build_flat_params(
+        a_ptr as u64,
+        b_ptr as u64,
+        c_ptr as u64,
+        d_ptr as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, gz),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864,
+    };
+
+    unsafe { stream.launch_builder(&func).arg(&params).launch(cfg) }.unwrap();
+    stream.synchronize().unwrap();
+    stream.clone_dtoh(&d_d).unwrap()
+}
+
+#[test]
+fn prologue_identity_gpu_correctness() {
+    println!("=== GEMM prologue identity: GPU correctness ===");
+
+    let ctx = ctx();
+
+    // Test at multiple sizes
+    let cases: &[(u32, u32, u32)] = &[
+        (64, 128, 32),  // single tile
+        (128, 256, 64), // multi-tile
+        (1, 128, 32),   // decode bs=1
+        (32, 128, 128), // larger K
+    ];
+
+    for &(m, n, k) in cases {
+        let h_a: Vec<half::bf16> = (0..(m * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+            .collect();
+        let h_b: Vec<half::bf16> = (0..(n * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+            .collect();
+
+        let out_base = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &h_a,
+            &h_b,
+            m,
+            n,
+            k,
+        );
+        let out_prologue = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_PROLOGUE_ID_PTX,
+            "flat_gemm_prologue_id",
+            &h_a,
+            &h_b,
+            m,
+            n,
+            k,
+        );
+
+        let mut max_diff = 0.0f32;
+        for (i, (a, b)) in out_base.iter().zip(out_prologue.iter()).enumerate() {
+            let diff = (a.to_f32() - b.to_f32()).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            if diff > 0.01 {
+                panic!(
+                    "M={m} N={n} K={k}: mismatch at [{i}]: base={}, prologue={}, diff={diff:.2e}",
+                    a.to_f32(),
+                    b.to_f32()
+                );
+            }
+        }
+        println!("  M={m}, N={n}, K={k}: max_abs_diff = {max_diff:.2e}");
+    }
+    println!("PASS: prologue identity matches base GEMM");
+}

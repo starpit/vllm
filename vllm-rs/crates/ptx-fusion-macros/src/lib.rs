@@ -14,6 +14,7 @@ pub(crate) mod intrinsic_rms_norm;
 mod parser;
 pub(crate) mod perimeter;
 pub(crate) mod persistent;
+mod pipeline;
 mod regfuse;
 use parser::{KernelProtocol, PtxParser};
 

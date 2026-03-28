@@ -1367,9 +1367,11 @@ pub enum CarryRole {
 pub fn analyze_carries(lines: &[&str], loop_desc: &LoopDescriptor) -> Vec<CarryRegister> {
     let (start, end) = loop_desc.body_range;
 
-    // Collect all defs and uses within the loop body, plus per-instruction info for role classification
-    let mut defs_in_loop: BTreeSet<String> = BTreeSet::new();
-    let mut uses_in_loop: BTreeSet<String> = BTreeSet::new();
+    // Track first def line and first use line for each register within the loop body.
+    // A register is a carry if it has a use BEFORE its first def (cross-iteration),
+    // OR if it's self-modifying on a single instruction.
+    let mut first_def: BTreeMap<String, usize> = BTreeMap::new();
+    let mut first_use: BTreeMap<String, usize> = BTreeMap::new();
     let mut self_modify: BTreeMap<String, CarryRole> = BTreeMap::new();
 
     for line_idx in start..=end {
@@ -1388,18 +1390,19 @@ pub fn analyze_carries(lines: &[&str], loop_desc: &LoopDescriptor) -> Vec<CarryR
         };
 
         if let Some(node) = DefUseGraph::parse_instruction(work, line_idx) {
+            // Record uses BEFORE defs for this instruction (sources are read before dest is written)
+            for src in &node.sources {
+                first_use.entry(src.clone()).or_insert(line_idx);
+            }
+
             for dest in &node.dests {
-                defs_in_loop.insert(dest.clone());
+                first_def.entry(dest.clone()).or_insert(line_idx);
 
                 // Check for same-instruction self-modification (most precise role signal)
                 if node.sources.contains(dest) {
                     let role = classify_carry_role(&node.opcode, dest);
                     insert_carry_role(&mut self_modify, dest.clone(), role);
                 }
-            }
-
-            for src in &node.sources {
-                uses_in_loop.insert(src.clone());
             }
 
             // MMA accumulators: dest registers of mma.sync instructions
@@ -1411,32 +1414,39 @@ pub fn analyze_carries(lines: &[&str], loop_desc: &LoopDescriptor) -> Vec<CarryR
         }
     }
 
-    // A register is a carry if it's both def'd and used in the loop body
-    let carry_regs: BTreeSet<String> = defs_in_loop.intersection(&uses_in_loop).cloned().collect();
+    let mut result: Vec<CarryRegister> = Vec::new();
 
-    let mut result: Vec<CarryRegister> = carry_regs
-        .into_iter()
-        .filter(|r| r.starts_with('%')) // only real registers
-        .map(|reg| {
-            let role = if let Some(role) = self_modify.get(&reg) {
-                role.clone()
-            } else {
-                // Def'd and used but not self-modifying on any single instruction.
-                // Classify by register type: float = accumulator, rd = pointer, r = induction
-                if reg.starts_with("%f") {
+    // All self-modifying registers are carries
+    for (reg, role) in &self_modify {
+        result.push(CarryRegister {
+            register: reg.clone(),
+            role: role.clone(),
+        });
+    }
+
+    // Registers with use-before-def (cross-iteration carries)
+    for (reg, &use_line) in &first_use {
+        if !reg.starts_with('%') || self_modify.contains_key(reg) {
+            continue;
+        }
+        if let Some(&def_line) = first_def.get(reg) {
+            if use_line < def_line {
+                // Used before defined in loop body → value comes from previous iteration
+                let role = if reg.starts_with("%f") {
                     CarryRole::Accumulator
                 } else if reg.starts_with("%rd") {
                     CarryRole::TilePointer
                 } else {
                     CarryRole::InductionVar
-                }
-            };
-            CarryRegister {
-                register: reg,
-                role,
+                };
+                result.push(CarryRegister {
+                    register: reg.clone(),
+                    role,
+                });
             }
-        })
-        .collect();
+        }
+    }
+
     result.sort_by(|a, b| a.register.cmp(&b.register));
     result
 }

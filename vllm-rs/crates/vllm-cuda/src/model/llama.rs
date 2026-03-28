@@ -1000,6 +1000,7 @@ impl LlamaDecoderLayer {
     ) -> (OwnedTensor, OwnedTensor) {
         // ── Fused norm+QKV path (ferrite, Dense layers only, not first layer) ──
         // First layer falls through to standard path (no residual to add into).
+        // Fused norm+GEMM path (ferrite, Dense layers only, not first layer)
         #[cfg(feature = "ferrite")]
         if residual.is_some()
             && matches!(
@@ -1013,18 +1014,9 @@ impl LlamaDecoderLayer {
                 _ => unreachable!(),
             };
 
-            // residual += hidden_states, then zero hidden_states for reuse as return value
+            // residual += hidden_states
             kernels::add_inplace(*residual, *hidden_states, device.compute_stream);
-            let nbytes = hidden_states.as_gpu_tensor().dim(0)
-                * hidden_states.as_gpu_tensor().dim(1)
-                * hidden_states.as_gpu_tensor().dtype().size_bytes();
-            cudarc::driver::sys::cuMemsetD8Async(
-                hidden_states.as_gpu_tensor().raw_ptr() as u64,
-                0,
-                nbytes,
-                device.compute_stream,
-            );
-            let hidden_states_buf = hidden_states; // zeroed, for return
+            drop(hidden_states);
 
             // Fused norm+QKV: reads residual, normalizes inline, projects
             let hidden = residual.as_gpu_tensor().dim(1) as u32;
@@ -1057,14 +1049,40 @@ impl LlamaDecoderLayer {
                 device,
             );
 
-            // Granite: scale attention output
-            if self.residual_multiplier != 1.0 {
-                kernels::scale_inplace(*attn_output, self.residual_multiplier, &device.cublas);
+            // O proj: accumulate into residual (residual += alpha * attn @ o_weight^T)
+            // This replaces both o_proj GEMM and the residual add.
+            if let crate::layers::LinearLayer::Dense(ref o_linear) = self.self_attn.o_proj {
+                let attn_flat = attn_output
+                    .view()
+                    .reshape(&[attn_output.as_gpu_tensor().dim(0), self.self_attn.q_size]);
+                device.ferrite.gemm_accumulate(
+                    *attn_flat,
+                    o_linear.weight,
+                    *residual,
+                    self.residual_multiplier,
+                    1.0,
+                    device.compute_stream,
+                );
+                drop(attn_output);
+            } else {
+                // Non-dense o_proj: fall back to standard path
+                // (can't reach here if qkv_proj was Dense, but be safe)
+                let attn_flat = attn_output
+                    .view()
+                    .reshape(&[attn_output.as_gpu_tensor().dim(0), self.self_attn.q_size]);
+                let o_out = self.self_attn.o_proj.forward(
+                    attn_flat,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(attn_output);
+                if self.residual_multiplier != 1.0 {
+                    kernels::scale_inplace(*o_out, self.residual_multiplier, &device.cublas);
+                }
+                kernels::add_inplace(*residual, *o_out, device.compute_stream);
+                drop(o_out);
             }
-
-            // Post-attention: residual += attn_output, then fused norm+gate_up
-            kernels::add_inplace(*residual, *attn_output, device.compute_stream);
-            drop(attn_output);
 
             if let crate::layers::LinearLayer::Dense(ref gate_up_linear) = self.mlp.gate_up_proj {
                 let gate_up = crate::ferrite::launch_fused_norm_gemm(
@@ -1089,22 +1107,22 @@ impl LlamaDecoderLayer {
                 );
                 drop(gate_up);
 
-                // down_proj: accumulate into residual (D = A@B^T + residual)
-                if let crate::layers::LinearLayer::Dense(ref down_linear) = self.mlp.down_proj {
-                    device.ferrite.gemm_accumulate(
-                        *activated,
-                        down_linear.weight,
-                        *residual,
-                        self.residual_multiplier, // alpha (1.0 for non-Granite)
-                        1.0,                      // beta
-                        device.compute_stream,
-                    );
-                    drop(activated);
-                    // residual now has everything accumulated.
-                    // Return zeroed hidden_states_buf so next layer's
-                    // add_inplace(residual, hidden_states) is a no-op.
-                    return (hidden_states_buf, residual);
+                // down_proj: regular GEMM, return as hidden_states
+                // (next layer's add_inplace(residual, hidden_states) will add it)
+                let mlp_output = self.mlp.down_proj.forward_ferrite(
+                    activated.view(),
+                    &mut device.cublas,
+                    &device.ferrite,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(activated);
+
+                if self.residual_multiplier != 1.0 {
+                    kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);
                 }
+
+                return (mlp_output, residual);
             }
 
             // Fallback: if gate_up or down isn't Dense, use standard MLP path

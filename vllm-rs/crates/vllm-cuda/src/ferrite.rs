@@ -449,13 +449,15 @@ pub unsafe fn launch_fused_norm_gemm(
         actual_beta,
     );
 
-    let mut params = [0u8; 120]; // 32 prefix + 88 flat
+    let mut params = [0u8; 128]; // 40 prefix + 88 flat
     params[0..8].copy_from_slice(&(norm_weight.raw_ptr() as u64).to_le_bytes());
     params[8..12].copy_from_slice(&epsilon.to_le_bytes());
     params[12..16].copy_from_slice(&hidden.to_le_bytes());
     params[16..24].copy_from_slice(&(input.raw_ptr() as u64).to_le_bytes());
     params[24..32].copy_from_slice(&(k as u64).to_le_bytes()); // a_stride = K
-    params[32..120].copy_from_slice(&flat);
+    params[32..36].copy_from_slice(&(n as i32).to_le_bytes()); // N for swizzle
+    // bytes 36..40: padding (align ferrite_params to 8)
+    params[40..128].copy_from_slice(&flat);
 
     launch_kernel_raw(
         func,

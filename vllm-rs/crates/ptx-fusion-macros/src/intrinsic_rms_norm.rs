@@ -24,9 +24,11 @@
 /// Build a `PointwiseComputation` for rms_norm prologue injection.
 ///
 /// `tile_m`: the M dimension of the GEMM tile (e.g., 64 for 64x128x32).
+/// `tile_n`: the N dimension of the GEMM tile (e.g., 128 for 64x128x32).
 /// `entry_name`: the desired fused kernel name.
 pub fn rms_norm_computation(
     tile_m: usize,
+    tile_n: usize,
     entry_name: &str,
 ) -> crate::fuse_general::PointwiseComputation {
     let tile_m_log2 = match tile_m {
@@ -34,6 +36,7 @@ pub fn rms_norm_computation(
         128 => 7,
         _ => panic!("unsupported tile_m={tile_m}, expected 64 or 128"),
     };
+    let tile_n_val = tile_n as u32;
 
     // ── Extra params (prepended to kernel entry) ──
     let extra_params = vec![
@@ -42,6 +45,7 @@ pub fn rms_norm_computation(
         ".param .u32 _ferrite_rms_hidden,".into(),
         ".param .u64 _ferrite_rms_a_ptr,".into(),
         ".param .u64 _ferrite_rms_a_stride,".into(),
+        ".param .s32 _ferrite_rms_n,".into(), // N dimension for swizzle unswizzle
     ];
 
     // ── Extra register declarations (named, not numbered) ──
@@ -56,10 +60,14 @@ pub fn rms_norm_computation(
         ".reg .b32 %r_rms_k, %r_rms_step, %r_rms_end, %r_rms_hdn;".into(),
         ".reg .b32 %r_rms_d0, %r_rms_d1, %r_rms_d2, %r_rms_d3;".into(),
         ".reg .b32 %r_rms_w0, %r_rms_w1, %r_rms_w2, %r_rms_w3;".into(),
-        ".reg .b32 %r_rms_par;".into(), // load parity
+        ".reg .b32 %r_rms_par;".into(),   // load parity
+        ".reg .b32 %r_rms_swiz;".into(),  // swizzle_log for block ID unswizzle
+        ".reg .b32 %r_rms_gridn;".into(), // grid_n = ceil(N / tile_n)
         ".reg .b64 %rd_rms_wt, %rd_rms_in, %rd_rms_str;".into(),
         ".reg .b64 %rd_rms_rb0, %rd_rms_rb1, %rd_rms_rb;".into(), // row bases + selected
         ".reg .b64 %rd_rms_cur, %rd_rms_wa;".into(),
+        ".reg .b64 %rd_rms_rowbytes;".into(), // stride * 2 (bytes per row)
+        ".reg .b64 %rd_rms_koff;".into(),     // K byte offset within row
         ".reg .b16 %h_rms_a, %h_rms_b;".into(),
         ".reg .pred %p_rms_lp, %p_rms_par;".into(),
     ];
@@ -79,9 +87,32 @@ pub fn rms_norm_computation(
 
     prologue.push("// -- FERRITE: rms_norm prologue (first-class intrinsic) --".into());
 
-    // Thread-to-row mapping from %tid.x and %ctaid.x:
+    // Unswizzle ctaid.x to get the M tile index.
+    // GemmIdentityThreadblockSwizzle<4> maps block IDs as:
+    //   grid_x = grid_m * tile, grid_y = ceil(grid_n / tile)
+    //   m_tile = ctaid.x >> swizzle_log
+    // where swizzle_log depends on grid_n = ceil(N / tile_n).
+    // Read N from _ferrite_rms_n param to compute at runtime.
+    prologue.push("ld.param.s32 \t%r_rms_gridn, [_ferrite_rms_n];".into());
+    prologue.push(format!(
+        "add.s32 \t%r_rms_gridn, %r_rms_gridn, {};",
+        tile_n_val - 1
+    ));
+    prologue.push(format!(
+        "shr.u32 \t%r_rms_gridn, %r_rms_gridn, {};",
+        tile_n.trailing_zeros()
+    )); // grid_n = ceil(N / tile_n)
+    // swizzle_log: 0 if grid_n<2, 1 if grid_n<3, 2 if grid_n>=3 (SWIZZLE_N=4)
+    prologue.push("mov.u32 \t%r_rms_swiz, 0;".into());
+    prologue.push("setp.ge.u32 \t%p_rms_par, %r_rms_gridn, 2;".into());
+    prologue.push("@%p_rms_par mov.u32 \t%r_rms_swiz, 1;".into());
+    prologue.push("setp.ge.u32 \t%p_rms_par, %r_rms_gridn, 3;".into());
+    prologue.push("@%p_rms_par mov.u32 \t%r_rms_swiz, 2;".into());
+
+    // Thread-to-row mapping:
     //   m_rel = (tid.x % 32) / 4 + (tid.x / 32) * 16
-    //   m_abs = ctaid.x * tile_m + m_rel
+    //   m_tile = ctaid.x >> swizzle_log
+    //   m_abs = m_tile * tile_m + m_rel
     prologue.push("mov.u32 \t%r_rms_d0, %tid.x;".into());
     prologue.push("and.b32 \t%r_rms_d1, %r_rms_d0, 31;".into()); // lane = tid.x % 32
     prologue.push("shr.u32 \t%r_rms_d1, %r_rms_d1, 2;".into()); // lane / 4
@@ -89,7 +120,8 @@ pub fn rms_norm_computation(
     prologue.push("shl.b32 \t%r_rms_d2, %r_rms_d2, 4;".into()); // warp * 16
     prologue.push("add.u32 \t%r_rms_d1, %r_rms_d1, %r_rms_d2;".into()); // m_rel
     prologue.push("mov.u32 \t%r_rms_d2, %ctaid.x;".into());
-    prologue.push(format!("shl.b32 \t%r_rms_d2, %r_rms_d2, {tile_m_log2};")); // ctaid.x * tile_m
+    prologue.push("shr.u32 \t%r_rms_d2, %r_rms_d2, %r_rms_swiz;".into()); // m_tile = ctaid.x >> swizzle_log
+    prologue.push(format!("shl.b32 \t%r_rms_d2, %r_rms_d2, {tile_m_log2};")); // m_tile * tile_m
     prologue.push("add.u32 \t%r_rms_d1, %r_rms_d1, %r_rms_d2;".into()); // m_abs (row 0)
 
     // row_base_0 = a_ptr + m_abs * stride * 2 (bf16 = 2 bytes per element)
@@ -194,24 +226,29 @@ pub fn rms_norm_computation(
     prologue.push("add.f32 \t%f_rms_sq1, %f_rms_sq1, %f_rms_eps;".into());
     prologue.push("rsqrt.approx.f32 \t%f_rms_inv1, %f_rms_sq1;".into());
 
+    // Precompute row_bytes = stride * 2 (bytes per row, for per-site K-offset computation)
+    prologue.push("shl.b64 \t%rd_rms_rowbytes, %rd_rms_str, 1;".into());
+
     prologue.push("bar.sync \t15;".into()); // avoid conflict with CUTLASS barrier 0
     prologue.push("// -- FERRITE: rms_norm prologue done --".into());
 
     // ── Per-site: select inv_rms/row_base by parity, load weight, unpack ──
     let mut per_site = Vec::new();
 
-    // Select row_base and inv_rms based on load index parity
-    // {LOAD_INDEX} is substituted as a literal integer by the injection mechanism
+    // Compute K-byte-offset within the row using modular arithmetic.
+    // k_byte_offset = (gmem_src - a_ptr) % row_bytes
+    // This is correct regardless of which row the load accesses.
     per_site.push("// FERRITE: rms_norm per-site (load weight + select inv_rms)".into());
-    per_site.push("mov.u32 \t%r_rms_par, {LOAD_INDEX};".into());
-    per_site.push("and.b32 \t%r_rms_par, %r_rms_par, 1;".into());
-    per_site.push("setp.eq.u32 \t%p_rms_par, %r_rms_par, 0;".into());
-    per_site.push("selp.f32 \t%f_rms_inv, %f_rms_inv0, %f_rms_inv1, %p_rms_par;".into());
-    per_site.push("selp.b64 \t%rd_rms_rb, %rd_rms_rb0, %rd_rms_rb1, %p_rms_par;".into());
+    per_site.push("sub.s64 \t%rd_rms_koff, {GMEM_SRC}, %rd_rms_in;".into()); // byte offset from A start
+    per_site.push("rem.u64 \t%rd_rms_koff, %rd_rms_koff, %rd_rms_rowbytes;".into()); // mod row_bytes
 
-    // Weight address: weight_ptr + (gmem_src - row_base)
-    per_site.push("sub.s64 \t%rd_rms_wa, {GMEM_SRC}, %rd_rms_rb;".into());
-    per_site.push("add.s64 \t%rd_rms_wa, %rd_rms_wt, %rd_rms_wa;".into());
+    // Weight address: weight_ptr + k_byte_offset
+    per_site.push("add.s64 \t%rd_rms_wa, %rd_rms_wt, %rd_rms_koff;".into());
+
+    // Select inv_rms: compare gmem_src against row_base_1 to determine which row
+    // If gmem_src < row_base_1, this is row 0 → inv_rms_0, else row 1 → inv_rms_1
+    per_site.push("setp.lt.u64 \t%p_rms_par, {GMEM_SRC}, %rd_rms_rb1;".into());
+    per_site.push("selp.f32 \t%f_rms_inv, %f_rms_inv0, %f_rms_inv1, %p_rms_par;".into());
 
     // Load weight[k:k+8] (4 b32 = 8 bf16)
     per_site.push(

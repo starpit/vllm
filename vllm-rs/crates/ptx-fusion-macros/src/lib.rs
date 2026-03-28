@@ -1308,19 +1308,23 @@ pub fn fuse(input: TokenStream) -> TokenStream {
                 .unwrap_or_else(|e| panic!("fuse!: failed to read {}: {e}", json_path.display()))
         });
 
-        // Get tile_m from derivations (if available) or from PTX kernel name
-        let tile_m = if let Some(ref json) = json_source {
+        // Get tile dims from derivations (if available) or from PTX kernel name
+        let (tile_m, tile_n) = if let Some(ref json) = json_source {
             let probe = perimeter::parse_derivations(json)
                 .unwrap_or_else(|e| panic!("fuse!: failed to parse derivations: {e}"));
-            probe.tile.0 as usize
+            (probe.tile.0 as usize, probe.tile.1 as usize)
         } else {
             // Try to extract from CUTLASS kernel name
-            extract_tile_m_from_ptx(gemm_ptx).unwrap_or_else(|e| panic!("fuse!: {e}"))
+            let tm = extract_tile_m_from_ptx(gemm_ptx).unwrap_or_else(|e| panic!("fuse!: {e}"));
+            let tn = extract_tile_n_from_ptx(gemm_ptx).unwrap_or_else(|e| panic!("fuse!: {e}"));
+            (tm, tn)
         };
 
         // Build the intrinsic computation
         let computation = match intrinsic_name {
-            "rms_norm" => intrinsic_rms_norm::rms_norm_computation(tile_m, &parsed.fused_name),
+            "rms_norm" => {
+                intrinsic_rms_norm::rms_norm_computation(tile_m, tile_n, &parsed.fused_name)
+            }
             other => panic!("fuse!: unknown intrinsic '{other}' (available: rms_norm)"),
         };
 
@@ -1401,6 +1405,32 @@ fn extract_tile_m_from_ptx(ptx: &str) -> Result<usize, String> {
         }
     }
     Err("could not find GemmShape in PTX entry name".into())
+}
+
+/// Extract tile_n (second value in GemmShapeILiMELiNELiKE) from PTX.
+fn extract_tile_n_from_ptx(ptx: &str) -> Result<usize, String> {
+    for line in ptx.lines() {
+        let t = line.trim();
+        if !t.contains(".entry") {
+            continue;
+        }
+        if let Some(pos) = t.find("GemmShapeILi") {
+            let after = &t[pos + "GemmShapeILi".len()..];
+            // Skip M value: find first 'E', then 'Li', then parse N
+            if let Some(first_e) = after.find('E') {
+                let rest = &after[first_e + 1..];
+                if let Some(li) = rest.find("Li") {
+                    let n_start = &rest[li + 2..];
+                    if let Some(end) = n_start.find('E') {
+                        if let Ok(n) = n_start[..end].parse::<usize>() {
+                            return Ok(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err("could not find tile_n in GemmShape".into())
 }
 
 /// Parsed arguments from the `fuse!` macro invocation.
@@ -1604,11 +1634,14 @@ pub fn compile(input: TokenStream) -> TokenStream {
         let intrinsic_name = &producer.1.source["intrinsic:".len()..];
         let gemm_ptx = &consumer.1.ptx_content;
         let tile_m = consumer.1.tile_m;
+        let tile_n = consumer.1.tile_n;
 
         let computation = match intrinsic_name {
-            "rms_norm" => {
-                intrinsic_rms_norm::rms_norm_computation(tile_m as usize, &parsed.fused_name)
-            }
+            "rms_norm" => intrinsic_rms_norm::rms_norm_computation(
+                tile_m as usize,
+                tile_n as usize,
+                &parsed.fused_name,
+            ),
             other => panic!("compile!: unknown intrinsic '{other}'"),
         };
 
@@ -1751,7 +1784,7 @@ fn parse_compile_args(
                 // rms_norm adds 5 params: weight(u64), eps(f32), hidden(u32), a_ptr(u64), a_stride(u64)
                 // = 8 + 4 + 4 + 8 + 8 = 32 bytes
                 let extra_bytes = match intrinsic_name {
-                    "rms_norm" => 32u32,
+                    "rms_norm" => 40u32, // 8+4+4+8+8+4 = 36, padded to 40 for align 8
                     _ => 0,
                 };
                 extra_param_bytes += extra_bytes;
@@ -1918,9 +1951,10 @@ pub fn fuse_rms_norm_gemm_flat(input: TokenStream) -> TokenStream {
     let probe = perimeter::parse_derivations(&json_source)
         .unwrap_or_else(|e| panic!("failed to parse derivations: {e}"));
     let tile_m = probe.tile.0 as usize;
+    let tile_n = probe.tile.1 as usize;
 
     // Step 1: Build rms_norm computation (first-class intrinsic — no hardcoded registers)
-    let computation = intrinsic_rms_norm::rms_norm_computation(tile_m, &entry_name);
+    let computation = intrinsic_rms_norm::rms_norm_computation(tile_m, tile_n, &entry_name);
 
     // Step 2: Inject rms_norm into GEMM via replace_a_loads_with_inline_fn
     let after_rms =

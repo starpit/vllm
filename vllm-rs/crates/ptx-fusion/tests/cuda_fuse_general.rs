@@ -1166,6 +1166,7 @@ fn rms_norm_gemm_gpu_correctness() {
     let hidden_val = k;
     let a_ptr_val = input_ptr as u64;
     let a_stride_val = k as u64; // stride in elements (= K for row-major A)
+    let n_val = n as i32; // N for swizzle unswizzle
 
     let (gx, gy, gz) = compute_grid(m, n, 64, 128);
     let cfg = LaunchConfig {
@@ -1174,7 +1175,7 @@ fn rms_norm_gemm_gpu_correctness() {
         shared_mem_bytes: 36864,
     };
 
-    // 6 separate params: weight_ptr, epsilon, hidden, a_ptr, a_stride, ferrite_params[88]
+    // 7 separate params: weight_ptr, epsilon, hidden, a_ptr, a_stride, n, ferrite_params[88]
     unsafe {
         stream
             .launch_builder(&func)
@@ -1183,6 +1184,7 @@ fn rms_norm_gemm_gpu_correctness() {
             .arg(&hidden_val)
             .arg(&a_ptr_val)
             .arg(&a_stride_val)
+            .arg(&n_val)
             .arg(&gemm_params)
             .launch(cfg)
     }
@@ -1215,4 +1217,210 @@ fn rms_norm_gemm_gpu_correctness() {
         "rms_norm+GEMM fused diff too large: {max_diff:.2e}"
     );
     println!("PASS: rms_norm + GEMM fused matches reference");
+}
+
+/// Helper: run fused rms_norm+GEMM at given dimensions, compare against CPU norm + GPU GEMM.
+fn run_fused_norm_gemm_test(m: u32, n: u32, k: u32) -> f32 {
+    let eps = 1e-5f32;
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    let h_input: Vec<half::bf16> = (0..(m * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_weight: Vec<half::bf16> = (0..k as usize)
+        .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+        .collect();
+    let h_b: Vec<half::bf16> = (0..(n * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+
+    let h_normed = cpu_rms_norm(&h_input, &h_weight, m as usize, k as usize, eps);
+    let ref_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_normed,
+        &h_b,
+        m,
+        n,
+        k,
+    );
+
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_weight = stream.clone_htod(&h_weight).unwrap();
+    let d_b = stream.clone_htod(&h_b).unwrap();
+    let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let mut d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+
+    let module = ctx
+        .load_module(Ptx::from_src(FUSED_RMS_NORM_GEMM_PTX))
+        .unwrap();
+    let func = module.load_function("fused_rms_norm_gemm").unwrap();
+
+    let (input_ptr, _) = d_input.device_ptr(&stream);
+    let (weight_ptr, _) = d_weight.device_ptr(&stream);
+    let (b_ptr, _) = d_b.device_ptr(&stream);
+    let (c_ptr, _) = d_c.device_ptr(&stream);
+    let (d_ptr, _) = d_d.device_ptr(&stream);
+
+    let gemm_params = build_flat_params(
+        input_ptr as u64,
+        b_ptr as u64,
+        c_ptr as u64,
+        d_ptr as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+
+    let weight_ptr_val = weight_ptr as u64;
+    let hidden_val = k;
+    let a_ptr_val = input_ptr as u64;
+    let a_stride_val = k as u64;
+    let n_val = n as i32;
+
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, gz),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&weight_ptr_val)
+            .arg(&eps)
+            .arg(&hidden_val)
+            .arg(&a_ptr_val)
+            .arg(&a_stride_val)
+            .arg(&n_val)
+            .arg(&gemm_params)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let fused_out = stream.clone_dtoh(&d_d).unwrap();
+
+    let mut max_diff = 0.0f32;
+    let mut worst_i = 0;
+    for (i, (r, f)) in ref_out.iter().zip(fused_out.iter()).enumerate() {
+        let diff = (r.to_f32() - f.to_f32()).abs();
+        if diff > max_diff {
+            max_diff = diff;
+            worst_i = i;
+        }
+    }
+    if max_diff > 0.05 {
+        let r = ref_out[worst_i].to_f32();
+        let f = fused_out[worst_i].to_f32();
+        println!(
+            "  M={m}, N={n}, K={k}: max_abs_diff = {max_diff:.2e} at [{worst_i}] ref={r:.6} fused={f:.6}"
+        );
+    } else {
+        println!("  M={m}, N={n}, K={k}: max_abs_diff = {max_diff:.2e}");
+    }
+    max_diff
+}
+
+#[test]
+fn fused_norm_gemm_multi_tile_n() {
+    // N > tile_n (128) → multiple N-tiles → swizzle kicks in
+    println!("=== fused norm+GEMM: multi-tile N (swizzle test) ===");
+    let diff = run_fused_norm_gemm_test(64, 256, 128);
+    assert!(diff < 0.1, "M=64,N=256,K=128: diff={diff:.2e}");
+    let diff = run_fused_norm_gemm_test(64, 384, 128);
+    assert!(diff < 0.1, "M=64,N=384,K=128: diff={diff:.2e}");
+    let diff = run_fused_norm_gemm_test(64, 512, 128);
+    assert!(diff < 0.1, "M=64,N=512,K=128: diff={diff:.2e}");
+    println!("PASS");
+}
+
+#[test]
+fn fused_norm_gemm_multi_tile_m() {
+    // M > tile_m (64) → multiple M-tiles + swizzle
+    println!("=== fused norm+GEMM: multi-tile M ===");
+    let diff = run_fused_norm_gemm_test(128, 128, 128);
+    assert!(diff < 0.1, "M=128,N=128,K=128: diff={diff:.2e}");
+    let diff = run_fused_norm_gemm_test(256, 128, 128);
+    assert!(diff < 0.1, "M=256,N=128,K=128: diff={diff:.2e}");
+    println!("PASS");
+}
+
+#[test]
+fn fused_norm_gemm_multi_tile_mn() {
+    // Both M and N multi-tile → full swizzle
+    println!("=== fused norm+GEMM: multi-tile M×N ===");
+    let diff = run_fused_norm_gemm_test(128, 256, 128);
+    assert!(diff < 0.1, "M=128,N=256,K=128: diff={diff:.2e}");
+    let diff = run_fused_norm_gemm_test(256, 384, 128);
+    assert!(diff < 0.1, "M=256,N=384,K=128: diff={diff:.2e}");
+    println!("PASS");
+}
+
+#[test]
+fn fused_norm_gemm_large_k() {
+    // K > tile_k (32) → multiple K-loop iterations
+    println!("=== fused norm+GEMM: large K ===");
+    let diff = run_fused_norm_gemm_test(64, 128, 256);
+    assert!(diff < 0.1, "M=64,N=128,K=256: diff={diff:.2e}");
+    let diff = run_fused_norm_gemm_test(64, 128, 512);
+    assert!(diff < 0.1, "M=64,N=128,K=512: diff={diff:.2e}");
+    println!("PASS");
+}
+
+#[test]
+fn fused_norm_gemm_model_dims() {
+    println!("=== fused norm+GEMM: sweep dimensions ===");
+    let mut failures = Vec::new();
+
+    for &(m, n, k) in &[
+        // Single tile (baseline)
+        (64, 128, 32),
+        (64, 128, 64),
+        (64, 128, 128),
+        // Increasing K
+        (64, 128, 256),
+        (64, 128, 512),
+        (64, 128, 1024),
+        (64, 128, 2048),
+        // Multi-tile N with small K
+        (64, 256, 128),
+        (64, 384, 128),
+        (64, 512, 128),
+        (64, 2560, 128),
+        // Multi-tile M
+        (128, 128, 128),
+        (256, 128, 128),
+        // Multi-tile M+N
+        (128, 256, 128),
+        (256, 256, 128),
+        // Real model dims
+        (64, 2560, 2048),
+        (256, 2560, 2048),
+    ] {
+        let diff = run_fused_norm_gemm_test(m, n, k);
+        // Tolerance: bf16 rms_norm vs f32 CPU rms_norm accumulates error proportional
+        // to K (each of K products has bf16 rounding). Allow ~1 ULP per 512 K elements.
+        let tol = 0.1 + (k as f32 / 512.0).ceil();
+        if diff > tol {
+            failures.push((m, n, k, diff));
+        }
+    }
+
+    if !failures.is_empty() {
+        println!("\nFAILURES:");
+        for (m, n, k, diff) in &failures {
+            println!("  M={m}, N={n}, K={k}: diff={diff:.2e}");
+        }
+        panic!("{} dimension(s) failed", failures.len());
+    }
+    println!("PASS: all dimensions");
 }

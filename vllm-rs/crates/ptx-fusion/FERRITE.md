@@ -390,8 +390,6 @@ crates/ptx-fusion/                 Library + tests
 | `fuse_3phase_mlp!(...)` | 3-phase MLP: norm->GEMM+SiLU->GEMM, persistent |
 | `delete_cutlass_a_loads!(...)` | Delete A-matrix cp.async from CUTLASS GEMM (for prologue) |
 | `replace_cutlass_a_loads!(...)` | Replace A-matrix cp.async with explicit ld.global+st.shared |
-| `fuse_rms_norm_cutlass!(...)` | Fuse rms_norm prologue into CUTLASS GEMM (normalize inline) |
-| `fuse_norm_gemm_silu!(...)` | Prologue + epilogue: norm -> GEMM + SiLU in one kernel |
 | `replace_perimeter_macro!(...)` | Rewrite CUTLASS param interface: flat layout, derived fields inlined |
 | **`fuse!(...)`** | **General kernel fusion: any two kernels + binding, kernel-agnostic** |
 | `fuse_rms_norm_gemm_flat!(...)` | rms_norm intrinsic + GEMM: chains prologue fusion + perimeter replacement |
@@ -400,16 +398,17 @@ crates/ptx-fusion/                 Library + tests
 
 ### Done: CUTLASS prologue fusion (rms_norm -> CUTLASS bf16 GEMM)
 
-**Proven end-to-end.** The `fuse_rms_norm_cutlass!` macro fuses rms_norm
-directly into the CUTLASS GEMM. The fused kernel:
+**Proven end-to-end.** The `fuse_rms_norm_gemm_flat!` macro fuses rms_norm
+directly into the CUTLASS GEMM via the first-class intrinsic path. The fused kernel:
 
 1. **Prologue**: 4-thread cooperative reduction computes inv_rms per tile row.
-   Each thread group accumulates sum-of-squares over hidden_dim elements,
-   reduces via `shfl.sync.bfly`, then computes `rsqrt(sum/hidden + eps)`.
+   Thread-to-row computed from `%tid.x` and `%ctaid.x` (no hardcoded CUTLASS
+   registers). A_ptr/stride from named params `_ferrite_rms_a_ptr`/`_ferrite_rms_a_stride`.
 
-2. **Normalized A-loads**: Each A-matrix cp.async is replaced with inline
-   normalization: load input bf16, load weight bf16, unpack → f32,
-   multiply input × weight × inv_rms, pack f32 → bf16, write to CUTLASS SMEM.
+2. **Per-site weight load + normalize**: At each A-matrix cp.async site, the
+   `per_site` code loads weight at the matching K offset (via `{GMEM_SRC}`
+   placeholder), unpacks to 8 named f32 regs. The per-element instructions
+   multiply by the corresponding weight (`{ELEM_IDX}` placeholder) and inv_rms.
 
 3. **GEMM body**: Unchanged. B-loads via cp.async, MMA via tensor cores,
    epilogue stores to GMEM. The GEMM reads the already-normalized A tile
@@ -417,14 +416,16 @@ directly into the CUTLASS GEMM. The fused kernel:
 
 **GPU correctness**: fused kernel vs separate rms_norm + CUTLASS GEMM: **0.00e0 diff**.
 
-**Parameter handling**: The host passes input_ptr in the A_ptr field of the
-CUTLASS params struct (instead of the rms_norm output pointer). Weight, epsilon,
-and hidden_size are prepended as extra params.
+**Architecture**: The rms_norm intrinsic is a first-class `PointwiseComputation`
+factory (`rms_norm_computation(tile_m, entry_name)`) that composes with
+`replace_a_loads_with_inline_fn`. No monolithic PTX patching — the intrinsic
+returns a self-contained computation with `extra_params`, `prologue`, `per_site`,
+and `instructions`, and the injection mechanism handles cp.async replacement,
+register allocation, and entry point modification.
 
 **Key files:**
-- `fuse_cp_async.rs`: `fuse_rms_norm_into_cutlass()`, `emit_inv_rms_prologue()`, `emit_normalized_a_load()`
-- `kernels/cutlass_gemm_bf16_sm89.ptx`: bf16 CUTLASS GEMM (64x64x32, 3 stages, 24KB SMEM)
-- `tests/support/cutlass_prologue_test.cu`: GPU correctness harness (CUTLASS API + driver API)
+- `intrinsic_rms_norm.rs`: `rms_norm_computation()` factory (~240 lines)
+- `fuse_general.rs`: `replace_a_loads_with_inline_fn()` with `{GMEM_SRC}`, `{MASK_PRED}`, `{LOAD_INDEX}`, `{ELEM_IDX}` placeholders
 
 ### Done: CUTLASS GEMM parity with cuBLAS (Phase 0)
 
@@ -437,8 +438,7 @@ All fusion ops needed for the llama.rs forward pass are proven:
 
 | Op | Macro/Technique | Diff | Status |
 |----|----------------|------|--------|
-| norm → GEMM | `fuse_rms_norm_cutlass!` | 0.00e0 | ✓ |
-| norm → GEMM + SiLU | `fuse_norm_gemm_silu!` | 6.25e-2 | ✓ |
+| norm → GEMM | `fuse_rms_norm_gemm_flat!` | 0.00e0 | ✓ |
 | GEMM + residual | `set_epilogue(1.0, 1.0)` | 1.56e-2 | ✓ |
 | SiLU/GELU/ReLU epilogue | `inject_epilogue!` | 0.00e0 | ✓ |
 
@@ -469,11 +469,11 @@ to near-zero (one graph replay). Without graphs, ~5 us per launch = ~55 us/layer
 
 | # | Ferrite kernel | Replaces | Technique |
 |---|---------------|----------|-----------|
-| 1 | fused_norm_qkv | #1 + #2 | `fuse_rms_norm_cutlass!` |
+| 1 | fused_norm_qkv | #1 + #2 | `fuse_rms_norm_gemm_flat!` |
 | 2 | split_qkv + RoPE + KV write | #3 + #4 + #5 | unchanged (tiny kernels) |
 | 3 | flash_attention | #6 | unchanged (FA2 already optimal) |
 | 4 | O proj + residual | #7 | `beta=1.0` |
-| 5 | fused_norm_gate_up_silu | #8 + #9 + #10 | `fuse_norm_gemm_silu!` |
+| 5 | fused_norm_gate_up_silu | #8 + #9 + #10 | `fuse_rms_norm_gemm_flat!` + SiLU epilogue |
 | 6 | down proj + residual | #11 | `beta=1.0` |
 
 **Savings analysis:**

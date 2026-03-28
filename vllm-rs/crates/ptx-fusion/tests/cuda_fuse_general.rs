@@ -1131,6 +1131,8 @@ fn rms_norm_gemm_gpu_correctness() {
 
     let weight_ptr_val = weight_ptr as u64;
     let hidden_val = k;
+    let a_ptr_val = input_ptr as u64;
+    let a_stride_val = k as u64; // stride in elements (= K for row-major A)
 
     let (gx, gy, gz) = compute_grid(m, n, 64, 128);
     let cfg = LaunchConfig {
@@ -1139,13 +1141,15 @@ fn rms_norm_gemm_gpu_correctness() {
         shared_mem_bytes: 36864,
     };
 
-    // 4 separate params: weight_ptr, epsilon, hidden, ferrite_params[88]
+    // 6 separate params: weight_ptr, epsilon, hidden, a_ptr, a_stride, ferrite_params[88]
     unsafe {
         stream
             .launch_builder(&func)
             .arg(&weight_ptr_val)
             .arg(&eps)
             .arg(&hidden_val)
+            .arg(&a_ptr_val)
+            .arg(&a_stride_val)
             .arg(&gemm_params)
             .launch(cfg)
     }

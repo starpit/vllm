@@ -405,6 +405,7 @@ fn fuse_gemm_epilogue(
 pub struct PointwiseComputation {
     /// PTX instructions that transform the input value (in a register) to the output.
     /// Parameterized: `{INPUT}` is the placeholder for the accumulator register.
+    /// Also supports `{ELEM_IDX}` (0..7) for position-dependent data (e.g., weight lookup).
     pub instructions: Vec<String>,
     /// ld.param instructions for the consumer's non-bound params (using renamed regs).
     /// These must be emitted once at the top of the fused kernel body.
@@ -415,6 +416,15 @@ pub struct PointwiseComputation {
     pub prologue: Vec<String>,
     /// Extra register declarations needed by the prologue and/or computation.
     pub extra_reg_decls: Vec<String>,
+    /// Extra .param declarations to prepend to the kernel entry point.
+    /// Each string is a full param line, e.g., ".param .u64 _ferrite_rms_weight,".
+    pub extra_params: Vec<String>,
+    /// Instructions emitted once per cp.async site, after the GMEM load.
+    /// Supports placeholders: `{GMEM_SRC}`, `{MASK_PRED}`, `{LOAD_INDEX}`.
+    /// Use for loading secondary data (e.g., weight vector at same K offset).
+    pub per_site: Vec<String>,
+    /// Optional new entry point name. If Some, the kernel entry is renamed.
+    pub entry_name: Option<String>,
     /// Number of scratch .f32 registers needed.
     pub scratch_f32_count: usize,
     /// Number of scratch .b32 registers needed.
@@ -600,6 +610,9 @@ fn extract_pointwise_computation(
         param_loads,
         prologue: vec![],
         extra_reg_decls: vec![],
+        extra_params: vec![],
+        per_site: vec![],
+        entry_name: None,
         scratch_f32_count: used_f32_scratch,
         scratch_b32_count: used_b32_scratch,
     })
@@ -633,10 +646,23 @@ fn parse_bf16_cvt(instr: &str) -> Option<(String, String, String)> {
 ///
 /// At each A-matrix cp.async site inside the GEMM's main loop:
 /// 1. Load 16 bytes (8 bf16) from GMEM at the cp.async's source address
-/// 2. Unpack each bf16 pair to f32
-/// 3. Apply the pointwise function (parameterized via `PointwiseComputation`)
-/// 4. Pack f32 back to bf16
-/// 5. Write 16 bytes to SMEM at the cp.async's destination address
+/// 2. Emit per_site instructions (secondary loads, e.g., weight vector)
+/// 3. Unpack each bf16 pair to f32
+/// 4. Apply the pointwise function (parameterized via `PointwiseComputation`)
+/// 5. Pack f32 back to bf16
+/// 6. Write 16 bytes to SMEM at the cp.async's destination address
+///
+/// Placeholders in `per_site`:
+///   `{GMEM_SRC}` — GMEM source register for this cp.async site
+///   `{MASK_PRED}` — predicate register (true when mask != 0)
+///   `{LOAD_INDEX}` — literal integer (0, 1, 2, ...) for this A-load site
+///
+/// Placeholders in `instructions`:
+///   `{INPUT}` — the f32 register holding the current element value
+///   `{ELEM_IDX}` — literal element index (0..7) within the 16-byte load
+///
+/// If `extra_params` is non-empty, they are prepended to the kernel's entry declaration.
+/// If `entry_name` is Some, the kernel entry point is renamed.
 ///
 /// B-matrix cp.async loads are preserved. The GEMM body is otherwise unchanged.
 pub fn replace_a_loads_with_inline_fn(
@@ -689,18 +715,43 @@ pub fn replace_a_loads_with_inline_fn(
     let new_pred_count = regs.pred + 1;
     let new_b32_count = regs.b32 + 4 + computation.scratch_b32_count;
     let new_f32_count = regs.f32_ + 2 + computation.scratch_f32_count;
-    // Need b16 registers for bf16 unpacking
-    let need_b16 = true;
 
     let p = format!("%p{p_mask}");
     let r_t = |i: usize| format!("%r{}", r_base + i);
     let f_v = |i: usize| format!("%f{}", f_base + i); // f_v(0), f_v(1) for unpacked values
 
+    // Find the original entry name for renaming
+    let orig_entry = if computation.entry_name.is_some() || !computation.extra_params.is_empty() {
+        find_entry_name_general(&lines)
+    } else {
+        None
+    };
+
     let mut result = Vec::new();
     let mut prologue_emitted = computation.prologue.is_empty(); // skip if no prologue
+    let mut a_load_index: usize = 0;
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
+
+        // Replace entry declaration: rename and/or add extra params
+        if (computation.entry_name.is_some() || !computation.extra_params.is_empty())
+            && trimmed.contains(".entry")
+            && orig_entry
+                .as_ref()
+                .is_some_and(|e| trimmed.contains(e.as_str()))
+        {
+            let name = computation
+                .entry_name
+                .as_deref()
+                .unwrap_or(orig_entry.as_deref().unwrap());
+            result.push(format!(".visible .entry {name}("));
+            // Prepend extra params before the original struct param
+            for ep in &computation.extra_params {
+                result.push(format!("\t{ep}"));
+            }
+            continue;
+        }
 
         // Bump register declarations
         if trimmed.starts_with(".reg .pred") && trimmed.contains(&format!("%p<{}>", regs.pred)) {
@@ -722,9 +773,7 @@ pub fn replace_a_loads_with_inline_fn(
                 &format!("%f<{}>", regs.f32_),
                 &format!("%f<{new_f32_count}>"),
             ));
-            if need_b16 {
-                result.push("\t.reg .b16 \t%h_fn<4>;".to_string());
-            }
+            result.push("\t.reg .b16 \t%h_fn<4>;".to_string());
             // Epilogue scratch registers from the extracted computation
             if computation.scratch_f32_count > 0 {
                 result.push(format!(
@@ -738,11 +787,16 @@ pub fn replace_a_loads_with_inline_fn(
                     computation.scratch_b32_count
                 ));
             }
-            // Extra register declarations from the computation
+            continue;
+        }
+        // After the LAST numbered register declaration (.reg .b64), emit
+        // extra_reg_decls and param_loads. This ensures all .reg lines are
+        // contiguous, which is required by perimeter replacement.
+        if trimmed.starts_with(".reg .b64") && trimmed.contains(&format!("%rd<{}>", regs.b64)) {
+            result.push(line.to_string());
             for decl in &computation.extra_reg_decls {
                 result.push(format!("\t{decl}"));
             }
-            // Emit param loads for the computation
             if !computation.param_loads.is_empty() {
                 result.push("\t// FERRITE: load prologue params".to_string());
                 for instr in &computation.param_loads {
@@ -790,8 +844,20 @@ pub fn replace_a_loads_with_inline_fn(
                     result.push(format!("\t@!{p} mov.b32 \t{}, 0;", r_t(j)));
                 }
 
+                // Emit per-site instructions (secondary loads, etc.)
+                if !computation.per_site.is_empty() {
+                    let load_idx_str = a_load_index.to_string();
+                    for instr in &computation.per_site {
+                        let concrete = instr
+                            .replace("{GMEM_SRC}", &gmem_src)
+                            .replace("{MASK_PRED}", &p)
+                            .replace("{LOAD_INDEX}", &load_idx_str);
+                        result.push(format!("\t{concrete}"));
+                    }
+                }
+
                 // Apply pointwise function on each bf16 pair
-                for j in 0..4 {
+                for j in 0..4usize {
                     // Unpack b32 -> 2 bf16
                     result.push(format!("\tmov.b32 \t{{%h_fn0, %h_fn1}}, {};", r_t(j)));
                     // bf16 -> f32
@@ -799,12 +865,19 @@ pub fn replace_a_loads_with_inline_fn(
                     result.push(format!("\tcvt.f32.bf16 \t{}, %h_fn1;", f_v(1)));
 
                     // Apply extracted computation on each f32 value
+                    // f_v(0) is element j*2 (lo), f_v(1) is element j*2+1 (hi)
+                    let elem_lo = (j * 2).to_string();
+                    let elem_hi = (j * 2 + 1).to_string();
                     for instr in &computation.instructions {
-                        let concrete0 = instr.replace("{INPUT}", &f_v(0));
+                        let concrete0 = instr
+                            .replace("{INPUT}", &f_v(0))
+                            .replace("{ELEM_IDX}", &elem_lo);
                         result.push(format!("\t{concrete0}"));
                     }
                     for instr in &computation.instructions {
-                        let concrete1 = instr.replace("{INPUT}", &f_v(1));
+                        let concrete1 = instr
+                            .replace("{INPUT}", &f_v(1))
+                            .replace("{ELEM_IDX}", &elem_hi);
                         result.push(format!("\t{concrete1}"));
                     }
 
@@ -823,6 +896,8 @@ pub fn replace_a_loads_with_inline_fn(
                     r_t(2),
                     r_t(3)
                 ));
+
+                a_load_index += 1;
                 continue;
             }
         }
@@ -831,6 +906,23 @@ pub fn replace_a_loads_with_inline_fn(
     }
 
     Ok(result.join("\n"))
+}
+
+/// Find the entry point name in PTX (general-purpose, does not require _ZN prefix).
+fn find_entry_name_general(lines: &[&str]) -> Option<String> {
+    for line in lines {
+        let t = line.trim();
+        if t.contains(".entry") && t.contains('(') {
+            // Extract name between ".entry" and "("
+            let after = t.split(".entry").nth(1)?.trim();
+            let end = after.find('(')?;
+            let name = after[..end].trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Register handoff fusion: A's output value stays in a register, B reads it directly.
@@ -1709,6 +1801,9 @@ mod tests {
             param_loads: vec![],
             prologue: vec![],
             extra_reg_decls: vec![],
+            extra_params: vec![],
+            per_site: vec![],
+            entry_name: None,
             scratch_f32_count: 0,
             scratch_b32_count: 0,
         };
@@ -1768,6 +1863,9 @@ mod tests {
             ],
             prologue: vec![],
             extra_reg_decls: vec![],
+            extra_params: vec![],
+            per_site: vec![],
+            entry_name: None,
             scratch_f32_count: 1,
             scratch_b32_count: 0,
         };

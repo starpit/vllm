@@ -8,577 +8,242 @@
 //! The generated code has two parts:
 //! - **Prologue**: cooperative reduction (sum of squares -> inv_rms) for
 //!   each tile row. Runs once before the first A-load in the GEMM's loop.
-//! - **Per-element**: at each A-load site, load input + weight, normalize
-//!   (input * weight * inv_rms), write to SMEM.
+//! - **Per-element**: at each A-load site, multiply input by weight and
+//!   inv_rms (via `{INPUT}` and `{ELEM_IDX}` placeholders).
 //!
 //! Thread-to-row mapping for CUTLASS bf16 GEMM (PitchLinearWarpRakedThreadMap):
 //!   m_row = (tid.x % 32) / 4 + (tid.x / 32) * 16
 //!   Each thread handles 2 rows: m_row and m_row + 8
 //!   4 threads per row cooperate on the K-dimension reduction
+//!
+//! This is a first-class intrinsic: it returns a `PointwiseComputation`
+//! that composes with `replace_a_loads_with_inline_fn`. No hardcoded
+//! CUTLASS registers — thread-to-row is computed from `%tid.x` and
+//! `%ctaid.x`, A_ptr/stride come from named params.
 
-use crate::fuse_cp_async::{
-    CpAsyncClass, classify_cp_async_loads, find_all_reg_counts, identify_a_matrix_param,
-    parse_cp_async,
-};
-use crate::parser::PtxParser;
-
-/// Build a fused rms_norm + GEMM kernel.
+/// Build a `PointwiseComputation` for rms_norm prologue injection.
 ///
-/// Takes the original CUTLASS GEMM PTX and produces a modified kernel that:
-/// 1. Has extra params: weight_ptr (u64), epsilon (f32), hidden_size (u32)
-/// 2. Computes inv_rms per tile row before the main loop
-/// 3. At each A-matrix cp.async site: loads input, loads weight, normalizes, writes to SMEM
-///
-/// The result can then be passed to `replace_perimeter()` to flatten the CUTLASS params.
-pub fn build_rms_norm_gemm(
-    gemm_ptx: &str,
-    a_param_hint: &str,
+/// `tile_m`: the M dimension of the GEMM tile (e.g., 64 for 64x128x32).
+/// `entry_name`: the desired fused kernel name.
+pub fn rms_norm_computation(
+    tile_m: usize,
     entry_name: &str,
-) -> Result<String, String> {
-    let lines: Vec<&str> = gemm_ptx.lines().collect();
-    let proto = PtxParser::parse(gemm_ptx)?;
-    let reg_to_param = PtxParser::trace_param_registers_pub(&lines, &proto.params);
+) -> crate::fuse_general::PointwiseComputation {
+    let tile_m_log2 = match tile_m {
+        64 => 6,
+        128 => 7,
+        _ => panic!("unsupported tile_m={tile_m}, expected 64 or 128"),
+    };
 
-    let a_param_name = identify_a_matrix_param(&lines, &reg_to_param, a_param_hint)?;
-    let a_addr_regs: Vec<String> = reg_to_param
-        .iter()
-        .filter(|(_, p)| **p == a_param_name)
-        .map(|(r, _)| r.clone())
-        .collect();
+    // ── Extra params (prepended to kernel entry) ──
+    let extra_params = vec![
+        ".param .u64 _ferrite_rms_weight,".into(),
+        ".param .f32 _ferrite_rms_epsilon,".into(),
+        ".param .u32 _ferrite_rms_hidden,".into(),
+        ".param .u64 _ferrite_rms_a_ptr,".into(),
+        ".param .u64 _ferrite_rms_a_stride,".into(),
+    ];
 
-    if a_addr_regs.is_empty() {
-        return Err(format!(
-            "no address registers traced to A param '{a_param_name}'"
-        ));
-    }
+    // ── Extra register declarations (named, not numbered) ──
+    let extra_reg_decls = vec![
+        ".reg .f32 %f_rms_inv0, %f_rms_inv1;".into(),
+        ".reg .f32 %f_rms_sq0, %f_rms_sq1;".into(),
+        ".reg .f32 %f_rms_eps, %f_rms_hdnf;".into(),
+        ".reg .f32 %f_rms_t0, %f_rms_t1;".into(),
+        ".reg .f32 %f_rms_wt0, %f_rms_wt1, %f_rms_wt2, %f_rms_wt3;".into(),
+        ".reg .f32 %f_rms_wt4, %f_rms_wt5, %f_rms_wt6, %f_rms_wt7;".into(),
+        ".reg .f32 %f_rms_inv;".into(), // selected inv_rms for current site
+        ".reg .b32 %r_rms_k, %r_rms_step, %r_rms_end, %r_rms_hdn;".into(),
+        ".reg .b32 %r_rms_d0, %r_rms_d1, %r_rms_d2, %r_rms_d3;".into(),
+        ".reg .b32 %r_rms_w0, %r_rms_w1, %r_rms_w2, %r_rms_w3;".into(),
+        ".reg .b32 %r_rms_par;".into(), // load parity
+        ".reg .b64 %rd_rms_wt, %rd_rms_in, %rd_rms_str;".into(),
+        ".reg .b64 %rd_rms_rb0, %rd_rms_rb1, %rd_rms_rb;".into(), // row bases + selected
+        ".reg .b64 %rd_rms_cur, %rd_rms_wa;".into(),
+        ".reg .b16 %h_rms_a, %h_rms_b;".into(),
+        ".reg .pred %p_rms_lp, %p_rms_par;".into(),
+    ];
 
-    let classifications = classify_cp_async_loads(&lines, &a_addr_regs);
-    let a_count = classifications
-        .values()
-        .filter(|c| **c == CpAsyncClass::AMatrix)
-        .count();
-    if a_count == 0 {
-        return Err("no cp.async loads classified as A-matrix".into());
-    }
+    // ── Param loads (emitted once, after register declarations) ──
+    let param_loads = vec![
+        "ld.param.u64 \t%rd_rms_wt, [_ferrite_rms_weight];".into(),
+        "ld.param.f32 \t%f_rms_eps, [_ferrite_rms_epsilon];".into(),
+        "ld.param.u32 \t%r_rms_hdn, [_ferrite_rms_hidden];".into(),
+        "cvt.rn.f32.u32 \t%f_rms_hdnf, %r_rms_hdn;".into(),
+        "ld.param.u64 \t%rd_rms_in, [_ferrite_rms_a_ptr];".into(),
+        "ld.param.u64 \t%rd_rms_str, [_ferrite_rms_a_stride];".into(),
+    ];
 
-    let regs = find_all_reg_counts(&lines);
+    // ── Prologue: compute inv_rms for 2 tile rows ──
+    let mut prologue = Vec::new();
 
-    // Allocate registers for fusion
-    let p_mask = regs.pred;
-    let p_loop = regs.pred + 1;
-    let r_base = regs.b32;
-    let f_base = regs.f32_;
-    let rd_base = regs.b64;
+    prologue.push("// -- FERRITE: rms_norm prologue (first-class intrinsic) --".into());
 
-    // Register naming helpers
-    let r_t = |i: usize| format!("%r{}", r_base + i); // 0..3: input, 4..7: weight, 8..11: scratch
-    let f_tmp = |i: usize| format!("%f{}", f_base + i);
-    let f_inv_rms_0 = format!("%f{}", f_base);
-    let f_inv_rms_1 = format!("%f{}", f_base + 1);
-    let f_sum_sq_0 = format!("%f{}", f_base + 2);
-    let f_sum_sq_1 = format!("%f{}", f_base + 3);
-    let f_epsilon = format!("%f{}", f_base + 4);
-    let f_hidden_f = format!("%f{}", f_base + 5);
-    // f_tmp(6)..f_tmp(9) for unpack/compute scratch
+    // Thread-to-row mapping from %tid.x and %ctaid.x:
+    //   m_rel = (tid.x % 32) / 4 + (tid.x / 32) * 16
+    //   m_abs = ctaid.x * tile_m + m_rel
+    prologue.push("mov.u32 \t%r_rms_d0, %tid.x;".into());
+    prologue.push("and.b32 \t%r_rms_d1, %r_rms_d0, 31;".into()); // lane = tid.x % 32
+    prologue.push("shr.u32 \t%r_rms_d1, %r_rms_d1, 2;".into()); // lane / 4
+    prologue.push("shr.u32 \t%r_rms_d2, %r_rms_d0, 5;".into()); // warp = tid.x / 32
+    prologue.push("shl.b32 \t%r_rms_d2, %r_rms_d2, 4;".into()); // warp * 16
+    prologue.push("add.u32 \t%r_rms_d1, %r_rms_d1, %r_rms_d2;".into()); // m_rel
+    prologue.push("mov.u32 \t%r_rms_d2, %ctaid.x;".into());
+    prologue.push(format!("shl.b32 \t%r_rms_d2, %r_rms_d2, {tile_m_log2};")); // ctaid.x * tile_m
+    prologue.push("add.u32 \t%r_rms_d1, %r_rms_d1, %r_rms_d2;".into()); // m_abs (row 0)
 
-    let rd_weight = format!("%rd{}", rd_base);
-    let rd_input = format!("%rd{}", rd_base + 1);
-    let rd_row_base_0 = format!("%rd{}", rd_base + 2);
-    let rd_row_base_1 = format!("%rd{}", rd_base + 3);
-    let rd_stride = format!("%rd{}", rd_base + 4);
-    let rd_cursor = format!("%rd{}", rd_base + 5);
-    let rd_weight_addr = format!("%rd{}", rd_base + 6);
+    // row_base_0 = a_ptr + m_abs * stride * 2 (bf16 = 2 bytes per element)
+    prologue.push("cvt.s64.s32 \t%rd_rms_rb0, %r_rms_d1;".into());
+    prologue.push("mul.lo.s64 \t%rd_rms_rb0, %rd_rms_str, %rd_rms_rb0;".into());
+    prologue.push("shl.b64 \t%rd_rms_rb0, %rd_rms_rb0, 1;".into());
+    prologue.push("add.s64 \t%rd_rms_rb0, %rd_rms_in, %rd_rms_rb0;".into());
 
-    let new_pred_count = regs.pred + 2;
-    let new_b32_count = regs.b32 + 12;
-    let new_f32_count = regs.f32_ + 10;
-    let new_b64_count = regs.b64 + 7;
-
-    let p_m = format!("%p{}", p_mask);
-    let p_l = format!("%p{}", p_loop);
-
-    // Find the original entry and param names
-    let orig_entry = find_entry_name(&lines)?;
-    let orig_param = find_struct_param_name(&lines)?;
-
-    let mut result = Vec::new();
-    let mut prologue_emitted = false;
-    let mut a_load_index = 0usize;
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-
-        // Replace entry declaration: add rms_norm params
-        if trimmed.contains(".entry") && trimmed.contains(&orig_entry) {
-            result.push(format!(".visible .entry {entry_name}("));
-            result.push("\t.param .u64 _ferrite_rms_weight,".into());
-            result.push("\t.param .f32 _ferrite_rms_epsilon,".into());
-            result.push("\t.param .u32 _ferrite_rms_hidden,".into());
-            // The original CUTLASS struct param follows
-            continue;
-        }
-
-        // Bump register declarations
-        if trimmed.starts_with(".reg .pred") && trimmed.contains(&format!("%p<{}>", regs.pred)) {
-            result.push(line.replace(
-                &format!("%p<{}>", regs.pred),
-                &format!("%p<{new_pred_count}>"),
-            ));
-            continue;
-        }
-        if trimmed.starts_with(".reg .b32") && trimmed.contains(&format!("%r<{}>", regs.b32)) {
-            result.push(line.replace(
-                &format!("%r<{}>", regs.b32),
-                &format!("%r<{new_b32_count}>"),
-            ));
-            continue;
-        }
-        if trimmed.starts_with(".reg .f32") && trimmed.contains(&format!("%f<{}>", regs.f32_)) {
-            result.push(line.replace(
-                &format!("%f<{}>", regs.f32_),
-                &format!("%f<{new_f32_count}>"),
-            ));
-            result.push("\t.reg .b16 \t%h_rms<16>;".to_string());
-            continue;
-        }
-        if trimmed.starts_with(".reg .b64") && trimmed.contains(&format!("%rd<{}>", regs.b64)) {
-            result.push(line.replace(
-                &format!("%rd<{}>", regs.b64),
-                &format!("%rd<{new_b64_count}>"),
-            ));
-            continue;
-        }
-
-        // Replace A-matrix cp.async with inline normalized load
-        if trimmed.contains("cp.async.cg.shared.global")
-            && classifications.get(&i) == Some(&CpAsyncClass::AMatrix)
-        {
-            if let Some((smem_dst, gmem_src, mask)) = parse_cp_async(trimmed) {
-                // Emit prologue once before the first A-load
-                if !prologue_emitted {
-                    emit_rms_prologue(
-                        &mut result,
-                        &rd_input,
-                        &rd_weight,
-                        &rd_stride,
-                        &rd_row_base_0,
-                        &rd_row_base_1,
-                        &rd_cursor,
-                        &f_inv_rms_0,
-                        &f_inv_rms_1,
-                        &f_sum_sq_0,
-                        &f_sum_sq_1,
-                        &f_epsilon,
-                        &f_hidden_f,
-                        &f_tmp,
-                        &r_t,
-                        &p_l,
-                        &orig_param,
-                    );
-                    prologue_emitted = true;
-                }
-
-                // Determine which inv_rms to use: even loads use inv_rms_0,
-                // alternating pattern (A loads alternate between row m0 and m0+8)
-                let inv_rms = if a_load_index % 2 == 0 {
-                    &f_inv_rms_0
-                } else {
-                    &f_inv_rms_1
-                };
-                let row_base = if a_load_index % 2 == 0 {
-                    &rd_row_base_0
-                } else {
-                    &rd_row_base_1
-                };
-
-                emit_normalized_load(
-                    &mut result,
-                    &smem_dst,
-                    &gmem_src,
-                    &mask,
-                    inv_rms,
-                    row_base,
-                    &rd_weight,
-                    &rd_weight_addr,
-                    &r_t,
-                    &f_tmp,
-                    &p_m,
-                );
-
-                a_load_index += 1;
-                continue;
-            }
-        }
-
-        result.push(line.to_string());
-    }
-
-    Ok(result.join("\n"))
-}
-
-// ── Prologue: compute inv_rms for 2 tile rows ──
-
-#[allow(clippy::too_many_arguments)]
-fn emit_rms_prologue(
-    out: &mut Vec<String>,
-    rd_input: &str,
-    rd_weight: &str,
-    rd_stride: &str,
-    rd_row_base_0: &str,
-    rd_row_base_1: &str,
-    rd_cursor: &str,
-    f_inv_rms_0: &str,
-    f_inv_rms_1: &str,
-    f_sum_sq_0: &str,
-    f_sum_sq_1: &str,
-    f_epsilon: &str,
-    f_hidden_f: &str,
-    f_tmp: &dyn Fn(usize) -> String,
-    r_t: &dyn Fn(usize) -> String,
-    p_loop: &str,
-    orig_param: &str,
-) {
-    out.push("\t// -- FERRITE: rms_norm prologue (intrinsic) --".into());
-
-    // Load rms params
-    out.push(format!(
-        "\tld.param.u64 \t{rd_weight}, [_ferrite_rms_weight];"
-    ));
-    out.push(format!(
-        "\tld.param.f32 \t{f_epsilon}, [_ferrite_rms_epsilon];"
-    ));
-    let r_hidden = r_t(8);
-    out.push(format!(
-        "\tld.param.u32 \t{r_hidden}, [_ferrite_rms_hidden];"
-    ));
-    out.push(format!("\tcvt.rn.f32.u32 \t{f_hidden_f}, {r_hidden};"));
-
-    // Load A_ptr and stride from params.
-    // After perimeter replacement, these are in ferrite_params at known offsets.
-    // Before perimeter replacement, they're in the CUTLASS struct via %rd1.
-    // We emit both patterns — perimeter replacement will rewrite the struct version.
-    // The flat-param version: A_ptr at offset 0, lda at offset 32.
-    // But we're running BEFORE perimeter replacement, so use CUTLASS struct offsets.
-    // %rd1 = param base, A_ptr at [%rd1+40], stride at [%rd1+8].
-    out.push(format!("\tld.param.u64 \t{rd_input}, [%rd1+40];"));
-    out.push(format!("\tld.param.u64 \t{rd_stride}, [%rd1+8];"));
-
-    // Thread-to-row mapping (CUTLASS PitchLinearWarpRakedThreadMap):
-    // m_row = (tid.x % 32) / 4 + (tid.x / 32) * 16
-    // Each thread handles row m_row and m_row + 8.
-    // The ABSOLUTE m is already in %r5 (set by CUTLASS code before we get here):
-    //   No — %r5 = tid.x. The absolute M row is computed by CUTLASS as a complex chain.
-    // We recompute from tid.x (%r264 in the PTX, but we use %r5 which is lane_id? No.)
-    // Let me use the known CUTLASS register: %r280 = absolute M row for this thread.
-    // %r280 is set at line 102 of the PTX.
-    //
-    // Actually, %r280 may not be set yet when the prologue runs (prologue runs at line ~290
-    // right before the first cp.async, but %r280 is set at line 102). So it IS available.
-    //
-    // row_base_0 = input_ptr + %r280 * stride * 2 (bf16 = 2 bytes per element)
-    out.push(format!("\tcvt.s64.s32 \t{rd_row_base_0}, %r280;"));
-    out.push(format!(
-        "\tmul.lo.s64 \t{rd_row_base_0}, {rd_stride}, {rd_row_base_0};"
-    ));
-    out.push(format!("\tshl.b64 \t{rd_row_base_0}, {rd_row_base_0}, 1;"));
-    out.push(format!(
-        "\tadd.s64 \t{rd_row_base_0}, {rd_input}, {rd_row_base_0};"
-    ));
-
-    // row_base_1 = row_base_0 + 8 * stride * 2
-    out.push(format!("\tshl.b64 \t{rd_row_base_1}, {rd_stride}, 4;")); // stride * 16 = stride * 8 * 2
-    out.push(format!(
-        "\tadd.s64 \t{rd_row_base_1}, {rd_row_base_0}, {rd_row_base_1};"
-    ));
+    // row_base_1 = row_base_0 + 8 * stride * 2 (the m_rel+8 row)
+    prologue.push("shl.b64 \t%rd_rms_rb1, %rd_rms_str, 4;".into()); // stride * 16 = stride * 8 * 2
+    prologue.push("add.s64 \t%rd_rms_rb1, %rd_rms_rb0, %rd_rms_rb1;".into());
 
     // ── Reduction: sum of squares for row 0 ──
-    let r_k_start = r_t(9);
-    let r_k_step = r_t(10);
-    let r_k_end = r_t(11);
+    prologue.push("mov.f32 \t%f_rms_sq0, 0f00000000;".into());
+    prologue.push("mov.f32 \t%f_rms_sq1, 0f00000000;".into());
 
-    out.push(format!("\tmov.f32 \t{f_sum_sq_0}, 0f00000000;")); // sum0 = 0
-    out.push(format!("\tmov.f32 \t{f_sum_sq_1}, 0f00000000;")); // sum1 = 0
-
-    // Each of 4 threads handles every 4th group of 8 bf16 elements
-    // k_start = (tid.x % 4) * 16 bytes, k_step = 64 bytes
-    out.push(format!("\tand.b32 \t{r_k_start}, %r264, 3;")); // tid.x % 4 (use raw tid.x)
-    out.push(format!("\tshl.b32 \t{r_k_start}, {r_k_start}, 4;")); // * 16 bytes
-    out.push(format!("\tmov.u32 \t{r_k_step}, 64;")); // 4 threads * 16 bytes
-    out.push(format!("\tshl.b32 \t{r_k_end}, {r_hidden}, 1;")); // hidden * 2 bytes
+    // k_start = (tid.x % 4) * 16 bytes (8 bf16 elements), k_step = 64 bytes
+    prologue.push("and.b32 \t%r_rms_k, %r_rms_d0, 3;".into()); // tid.x % 4
+    prologue.push("shl.b32 \t%r_rms_k, %r_rms_k, 4;".into()); // * 16 bytes
+    prologue.push("mov.u32 \t%r_rms_step, 64;".into()); // 4 threads * 16 bytes
+    prologue.push("shl.b32 \t%r_rms_end, %r_rms_hdn, 1;".into()); // hidden * 2 bytes
 
     // Row 0 loop
-    out.push(format!("\tcvt.u64.u32 \t{rd_cursor}, {r_k_start};"));
-    out.push(format!(
-        "\tadd.s64 \t{rd_cursor}, {rd_row_base_0}, {rd_cursor};"
-    ));
+    prologue.push("cvt.u64.u32 \t%rd_rms_cur, %r_rms_k;".into());
+    prologue.push("add.s64 \t%rd_rms_cur, %rd_rms_rb0, %rd_rms_cur;".into());
 
-    out.push("$L_ferrite_rms_r0:".into());
-    out.push(format!("\tsetp.lt.u32 \t{p_loop}, {r_k_start}, {r_k_end};"));
-    out.push(format!("\t@!{p_loop} bra $L_ferrite_rms_r0d;"));
+    prologue.push("$L_ferrite_rms_r0:".into());
+    prologue.push("setp.lt.u32 \t%p_rms_lp, %r_rms_k, %r_rms_end;".into());
+    prologue.push("@!%p_rms_lp bra $L_ferrite_rms_r0d;".into());
 
-    out.push(format!(
-        "\tld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{rd_cursor}];",
-        r_t(0),
-        r_t(1),
-        r_t(2),
-        r_t(3)
-    ));
+    prologue.push(
+        "ld.global.v4.b32 \t{%r_rms_d0, %r_rms_d1, %r_rms_d2, %r_rms_d3}, [%rd_rms_cur];".into(),
+    );
 
+    // Unpack 4 b32 (8 bf16) and accumulate squares
     for j in 0..4 {
-        let h0 = format!("%h_rms{}", j * 2);
-        let h1 = format!("%h_rms{}", j * 2 + 1);
-        out.push(format!("\tmov.b32 \t{{{h0}, {h1}}}, {};", r_t(j)));
-        out.push(format!("\tcvt.f32.bf16 \t{}, {h0};", f_tmp(6)));
-        out.push(format!("\tcvt.f32.bf16 \t{}, {h1};", f_tmp(7)));
-        out.push(format!(
-            "\tfma.rn.f32 \t{f_sum_sq_0}, {}, {}, {f_sum_sq_0};",
-            f_tmp(6),
-            f_tmp(6)
-        ));
-        out.push(format!(
-            "\tfma.rn.f32 \t{f_sum_sq_0}, {}, {}, {f_sum_sq_0};",
-            f_tmp(7),
-            f_tmp(7)
-        ));
+        let r = format!("%r_rms_d{j}");
+        prologue.push(format!("mov.b32 \t{{%h_rms_a, %h_rms_b}}, {r};"));
+        prologue.push("cvt.f32.bf16 \t%f_rms_t0, %h_rms_a;".into());
+        prologue.push("cvt.f32.bf16 \t%f_rms_t1, %h_rms_b;".into());
+        prologue.push("fma.rn.f32 \t%f_rms_sq0, %f_rms_t0, %f_rms_t0, %f_rms_sq0;".into());
+        prologue.push("fma.rn.f32 \t%f_rms_sq0, %f_rms_t1, %f_rms_t1, %f_rms_sq0;".into());
     }
 
-    out.push(format!("\tcvt.u64.u32 \t{rd_input}, {r_k_step};")); // temp
-    out.push(format!("\tadd.s64 \t{rd_cursor}, {rd_cursor}, {rd_input};"));
-    out.push(format!("\tadd.u32 \t{r_k_start}, {r_k_start}, {r_k_step};"));
-    out.push("\tbra $L_ferrite_rms_r0;".into());
-    out.push("$L_ferrite_rms_r0d:".into());
+    // Advance cursor
+    prologue.push("cvt.u64.u32 \t%rd_rms_wa, %r_rms_step;".into()); // temp
+    prologue.push("add.s64 \t%rd_rms_cur, %rd_rms_cur, %rd_rms_wa;".into());
+    prologue.push("add.u32 \t%r_rms_k, %r_rms_k, %r_rms_step;".into());
+    prologue.push("bra $L_ferrite_rms_r0;".into());
+    prologue.push("$L_ferrite_rms_r0d:".into());
 
-    // Row 1 loop
-    out.push(format!("\tand.b32 \t{r_k_start}, %r264, 3;"));
-    out.push(format!("\tshl.b32 \t{r_k_start}, {r_k_start}, 4;"));
-    out.push(format!("\tcvt.u64.u32 \t{rd_cursor}, {r_k_start};"));
-    out.push(format!(
-        "\tadd.s64 \t{rd_cursor}, {rd_row_base_1}, {rd_cursor};"
-    ));
+    // Row 1 loop (same structure, accumulating to sq1)
+    // Reset k_start from tid.x (need to reload since %r_rms_d0 was clobbered)
+    prologue.push("mov.u32 \t%r_rms_d0, %tid.x;".into());
+    prologue.push("and.b32 \t%r_rms_k, %r_rms_d0, 3;".into());
+    prologue.push("shl.b32 \t%r_rms_k, %r_rms_k, 4;".into());
+    prologue.push("cvt.u64.u32 \t%rd_rms_cur, %r_rms_k;".into());
+    prologue.push("add.s64 \t%rd_rms_cur, %rd_rms_rb1, %rd_rms_cur;".into());
 
-    out.push("$L_ferrite_rms_r1:".into());
-    out.push(format!("\tsetp.lt.u32 \t{p_loop}, {r_k_start}, {r_k_end};"));
-    out.push(format!("\t@!{p_loop} bra $L_ferrite_rms_r1d;"));
+    prologue.push("$L_ferrite_rms_r1:".into());
+    prologue.push("setp.lt.u32 \t%p_rms_lp, %r_rms_k, %r_rms_end;".into());
+    prologue.push("@!%p_rms_lp bra $L_ferrite_rms_r1d;".into());
 
-    out.push(format!(
-        "\tld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{rd_cursor}];",
-        r_t(0),
-        r_t(1),
-        r_t(2),
-        r_t(3)
-    ));
+    prologue.push(
+        "ld.global.v4.b32 \t{%r_rms_d0, %r_rms_d1, %r_rms_d2, %r_rms_d3}, [%rd_rms_cur];".into(),
+    );
 
     for j in 0..4 {
-        let h0 = format!("%h_rms{}", j * 2);
-        let h1 = format!("%h_rms{}", j * 2 + 1);
-        out.push(format!("\tmov.b32 \t{{{h0}, {h1}}}, {};", r_t(j)));
-        out.push(format!("\tcvt.f32.bf16 \t{}, {h0};", f_tmp(6)));
-        out.push(format!("\tcvt.f32.bf16 \t{}, {h1};", f_tmp(7)));
-        out.push(format!(
-            "\tfma.rn.f32 \t{f_sum_sq_1}, {}, {}, {f_sum_sq_1};",
-            f_tmp(6),
-            f_tmp(6)
-        ));
-        out.push(format!(
-            "\tfma.rn.f32 \t{f_sum_sq_1}, {}, {}, {f_sum_sq_1};",
-            f_tmp(7),
-            f_tmp(7)
-        ));
+        let r = format!("%r_rms_d{j}");
+        prologue.push(format!("mov.b32 \t{{%h_rms_a, %h_rms_b}}, {r};"));
+        prologue.push("cvt.f32.bf16 \t%f_rms_t0, %h_rms_a;".into());
+        prologue.push("cvt.f32.bf16 \t%f_rms_t1, %h_rms_b;".into());
+        prologue.push("fma.rn.f32 \t%f_rms_sq1, %f_rms_t0, %f_rms_t0, %f_rms_sq1;".into());
+        prologue.push("fma.rn.f32 \t%f_rms_sq1, %f_rms_t1, %f_rms_t1, %f_rms_sq1;".into());
     }
 
-    out.push(format!("\tcvt.u64.u32 \t{rd_input}, {r_k_step};"));
-    out.push(format!("\tadd.s64 \t{rd_cursor}, {rd_cursor}, {rd_input};"));
-    out.push(format!("\tadd.u32 \t{r_k_start}, {r_k_start}, {r_k_step};"));
-    out.push("\tbra $L_ferrite_rms_r1;".into());
-    out.push("$L_ferrite_rms_r1d:".into());
+    prologue.push("mov.u32 \t%r_rms_d0, %tid.x;".into()); // reload before next iter
+    prologue.push("cvt.u64.u32 \t%rd_rms_wa, %r_rms_step;".into());
+    prologue.push("add.s64 \t%rd_rms_cur, %rd_rms_cur, %rd_rms_wa;".into());
+    prologue.push("add.u32 \t%r_rms_k, %r_rms_k, %r_rms_step;".into());
+    prologue.push("bra $L_ferrite_rms_r1;".into());
+    prologue.push("$L_ferrite_rms_r1d:".into());
 
     // Butterfly reduction across 4 threads (shfl.sync.bfly xor 1, then xor 2)
     for xor_mask in [1, 2] {
-        out.push(format!(
-            "\tshfl.sync.bfly.b32 \t{}, {f_sum_sq_0}, {xor_mask}, 31, -1;",
-            f_tmp(6)
+        prologue.push(format!(
+            "shfl.sync.bfly.b32 \t%f_rms_t0, %f_rms_sq0, {xor_mask}, 31, -1;"
         ));
-        out.push(format!(
-            "\tadd.f32 \t{f_sum_sq_0}, {f_sum_sq_0}, {};",
-            f_tmp(6)
+        prologue.push("add.f32 \t%f_rms_sq0, %f_rms_sq0, %f_rms_t0;".into());
+        prologue.push(format!(
+            "shfl.sync.bfly.b32 \t%f_rms_t0, %f_rms_sq1, {xor_mask}, 31, -1;"
         ));
-        out.push(format!(
-            "\tshfl.sync.bfly.b32 \t{}, {f_sum_sq_1}, {xor_mask}, 31, -1;",
-            f_tmp(6)
-        ));
-        out.push(format!(
-            "\tadd.f32 \t{f_sum_sq_1}, {f_sum_sq_1}, {};",
-            f_tmp(6)
-        ));
+        prologue.push("add.f32 \t%f_rms_sq1, %f_rms_sq1, %f_rms_t0;".into());
     }
 
     // inv_rms = rsqrt(sum_sq / hidden + epsilon)
-    out.push(format!(
-        "\tdiv.rn.f32 \t{f_sum_sq_0}, {f_sum_sq_0}, {f_hidden_f};"
-    ));
-    out.push(format!(
-        "\tadd.f32 \t{f_sum_sq_0}, {f_sum_sq_0}, {f_epsilon};"
-    ));
-    out.push(format!("\trsqrt.approx.f32 \t{f_inv_rms_0}, {f_sum_sq_0};"));
+    prologue.push("div.rn.f32 \t%f_rms_sq0, %f_rms_sq0, %f_rms_hdnf;".into());
+    prologue.push("add.f32 \t%f_rms_sq0, %f_rms_sq0, %f_rms_eps;".into());
+    prologue.push("rsqrt.approx.f32 \t%f_rms_inv0, %f_rms_sq0;".into());
 
-    out.push(format!(
-        "\tdiv.rn.f32 \t{f_sum_sq_1}, {f_sum_sq_1}, {f_hidden_f};"
-    ));
-    out.push(format!(
-        "\tadd.f32 \t{f_sum_sq_1}, {f_sum_sq_1}, {f_epsilon};"
-    ));
-    out.push(format!("\trsqrt.approx.f32 \t{f_inv_rms_1}, {f_sum_sq_1};"));
+    prologue.push("div.rn.f32 \t%f_rms_sq1, %f_rms_sq1, %f_rms_hdnf;".into());
+    prologue.push("add.f32 \t%f_rms_sq1, %f_rms_sq1, %f_rms_eps;".into());
+    prologue.push("rsqrt.approx.f32 \t%f_rms_inv1, %f_rms_sq1;".into());
 
-    // Reload input_ptr (clobbered as temp for stride conversion)
-    out.push(format!("\tld.param.u64 \t{rd_input}, [%rd1+40];"));
+    prologue.push("bar.sync \t15;".into()); // avoid conflict with CUTLASS barrier 0
+    prologue.push("// -- FERRITE: rms_norm prologue done --".into());
 
-    out.push("\tbar.sync \t15;".into()); // avoid conflict with CUTLASS barrier 0
-    out.push("\t// -- FERRITE: rms_norm prologue done --".into());
-}
+    // ── Per-site: select inv_rms/row_base by parity, load weight, unpack ──
+    let mut per_site = Vec::new();
 
-// ── Per-element: normalized load at each A-matrix cp.async site ──
-
-#[allow(clippy::too_many_arguments)]
-fn emit_normalized_load(
-    out: &mut Vec<String>,
-    smem_dst: &str,
-    gmem_src: &str,
-    mask: &str,
-    inv_rms: &str,
-    row_base: &str,
-    rd_weight: &str,
-    rd_weight_addr: &str,
-    r_t: &dyn Fn(usize) -> String,
-    f_tmp: &dyn Fn(usize) -> String,
-    p_mask: &str,
-) {
-    out.push("\t// FERRITE: normalized A-load (rms_norm intrinsic)".into());
-    out.push(format!("\tsetp.ne.b32 \t{p_mask}, {mask}, 0;"));
-
-    // Load input[m, k:k+8]
-    out.push(format!(
-        "\t@{p_mask} ld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{gmem_src}];",
-        r_t(0),
-        r_t(1),
-        r_t(2),
-        r_t(3)
-    ));
+    // Select row_base and inv_rms based on load index parity
+    // {LOAD_INDEX} is substituted as a literal integer by the injection mechanism
+    per_site.push("// FERRITE: rms_norm per-site (load weight + select inv_rms)".into());
+    per_site.push("mov.u32 \t%r_rms_par, {LOAD_INDEX};".into());
+    per_site.push("and.b32 \t%r_rms_par, %r_rms_par, 1;".into());
+    per_site.push("setp.eq.u32 \t%p_rms_par, %r_rms_par, 0;".into());
+    per_site.push("selp.f32 \t%f_rms_inv, %f_rms_inv0, %f_rms_inv1, %p_rms_par;".into());
+    per_site.push("selp.b64 \t%rd_rms_rb, %rd_rms_rb0, %rd_rms_rb1, %p_rms_par;".into());
 
     // Weight address: weight_ptr + (gmem_src - row_base)
-    out.push(format!(
-        "\tsub.s64 \t{rd_weight_addr}, {gmem_src}, {row_base};"
-    ));
-    out.push(format!(
-        "\tadd.s64 \t{rd_weight_addr}, {rd_weight}, {rd_weight_addr};"
-    ));
+    per_site.push("sub.s64 \t%rd_rms_wa, {GMEM_SRC}, %rd_rms_rb;".into());
+    per_site.push("add.s64 \t%rd_rms_wa, %rd_rms_wt, %rd_rms_wa;".into());
 
-    // Load weight[k:k+8]
-    out.push(format!(
-        "\t@{p_mask} ld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{rd_weight_addr}];",
-        r_t(4),
-        r_t(5),
-        r_t(6),
-        r_t(7)
-    ));
+    // Load weight[k:k+8] (4 b32 = 8 bf16)
+    per_site.push(
+        "@{MASK_PRED} ld.global.v4.b32 \t{%r_rms_w0, %r_rms_w1, %r_rms_w2, %r_rms_w3}, [%rd_rms_wa];"
+            .into(),
+    );
 
-    // For each b32 pair: unpack, normalize (input * weight * inv_rms), repack
+    // Unpack all 8 weight bf16s into named f32 registers
     for j in 0..4 {
-        let h_in0 = format!("%h_rms{}", 8 + j * 2);
-        let h_in1 = format!("%h_rms{}", 8 + j * 2 + 1);
-        let h_wt0 = format!("%h_rms{}", j * 2);
-        let h_wt1 = format!("%h_rms{}", j * 2 + 1);
-
-        // Unpack input
-        out.push(format!(
-            "\t@{p_mask} mov.b32 \t{{{h_in0}, {h_in1}}}, {};",
-            r_t(j)
-        ));
-        out.push(format!("\t@{p_mask} cvt.f32.bf16 \t{}, {h_in0};", f_tmp(6)));
-        out.push(format!("\t@{p_mask} cvt.f32.bf16 \t{}, {h_in1};", f_tmp(7)));
-
-        // Unpack weight
-        out.push(format!(
-            "\t@{p_mask} mov.b32 \t{{{h_wt0}, {h_wt1}}}, {};",
-            r_t(4 + j)
-        ));
-        out.push(format!("\t@{p_mask} cvt.f32.bf16 \t{}, {h_wt0};", f_tmp(8)));
-        out.push(format!("\t@{p_mask} cvt.f32.bf16 \t{}, {h_wt1};", f_tmp(9)));
-
-        // Normalize: result = input * weight * inv_rms
-        out.push(format!(
-            "\t@{p_mask} mul.f32 \t{}, {}, {};",
-            f_tmp(6),
-            f_tmp(6),
-            f_tmp(8)
-        ));
-        out.push(format!(
-            "\t@{p_mask} mul.f32 \t{}, {}, {inv_rms};",
-            f_tmp(6),
-            f_tmp(6)
-        ));
-        out.push(format!(
-            "\t@{p_mask} mul.f32 \t{}, {}, {};",
-            f_tmp(7),
-            f_tmp(7),
-            f_tmp(9)
-        ));
-        out.push(format!(
-            "\t@{p_mask} mul.f32 \t{}, {}, {inv_rms};",
-            f_tmp(7),
-            f_tmp(7)
-        ));
-
-        // Pack back: cvt.rn.bf16x2.f32 packs (high, low) into one b32
-        out.push(format!(
-            "\t@{p_mask} cvt.rn.bf16x2.f32 \t{}, {}, {};",
-            r_t(j),
-            f_tmp(7),
-            f_tmp(6)
-        ));
+        let r = format!("%r_rms_w{j}");
+        let f_lo = format!("%f_rms_wt{}", j * 2);
+        let f_hi = format!("%f_rms_wt{}", j * 2 + 1);
+        per_site.push(format!("mov.b32 \t{{%h_rms_a, %h_rms_b}}, {r};"));
+        per_site.push(format!("cvt.f32.bf16 \t{f_lo}, %h_rms_a;"));
+        per_site.push(format!("cvt.f32.bf16 \t{f_hi}, %h_rms_b;"));
     }
 
-    // Zero-fill for boundary tiles
-    for j in 0..4 {
-        out.push(format!("\t@!{p_mask} mov.b32 \t{}, 0;", r_t(j)));
+    // ── Per-element instructions: multiply by weight and inv_rms ──
+    let instructions = vec![
+        "mul.f32 {INPUT}, {INPUT}, %f_rms_wt{ELEM_IDX};".into(),
+        "mul.f32 {INPUT}, {INPUT}, %f_rms_inv;".into(),
+    ];
+
+    crate::fuse_general::PointwiseComputation {
+        instructions,
+        param_loads,
+        prologue,
+        extra_reg_decls,
+        extra_params,
+        per_site,
+        entry_name: Some(entry_name.to_string()),
+        scratch_f32_count: 0,
+        scratch_b32_count: 0,
     }
-
-    // Write to CUTLASS SMEM
-    out.push(format!(
-        "\tst.shared.v4.b32 \t[{smem_dst}], {{{}, {}, {}, {}}};",
-        r_t(0),
-        r_t(1),
-        r_t(2),
-        r_t(3)
-    ));
-}
-
-// ── Helpers ──
-
-fn find_entry_name(lines: &[&str]) -> Result<String, String> {
-    for line in lines {
-        let t = line.trim();
-        if t.contains(".entry") && t.contains('(') {
-            let after = t.split(".entry").nth(1).ok_or("malformed .entry")?;
-            let after = after.trim();
-            let end = after.find('(').unwrap_or(after.len());
-            return Ok(after[..end].trim().to_string());
-        }
-    }
-    Err("no .entry found".into())
-}
-
-fn find_struct_param_name(lines: &[&str]) -> Result<String, String> {
-    for line in lines {
-        let t = line.trim();
-        if t.contains(".param") && t.contains(".b8") && t.contains('[') {
-            let parts: Vec<&str> = t.split_whitespace().collect();
-            for part in &parts {
-                if part.contains('[') {
-                    let bracket = part.find('[').unwrap();
-                    return Ok(part[..bracket].to_string());
-                }
-            }
-        }
-    }
-    Err("no struct param found".into())
 }

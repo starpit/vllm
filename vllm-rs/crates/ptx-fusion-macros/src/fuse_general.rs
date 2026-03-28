@@ -402,17 +402,17 @@ fn fuse_gemm_epilogue(
 }
 
 /// Extracted pointwise computation from an elementwise kernel.
-struct PointwiseComputation {
+pub struct PointwiseComputation {
     /// PTX instructions that transform the input value (in a register) to the output.
     /// Parameterized: `{INPUT}` is the placeholder for the accumulator register.
-    instructions: Vec<String>,
+    pub instructions: Vec<String>,
     /// ld.param instructions for the consumer's non-bound params (using renamed regs).
     /// These must be emitted once at the top of the fused kernel body.
-    param_loads: Vec<String>,
+    pub param_loads: Vec<String>,
     /// Number of scratch .f32 registers needed.
-    scratch_f32_count: usize,
+    pub scratch_f32_count: usize,
     /// Number of scratch .b32 registers needed.
-    scratch_b32_count: usize,
+    pub scratch_b32_count: usize,
 }
 
 /// Extract the pointwise computation from an elementwise kernel.
@@ -619,6 +619,192 @@ fn parse_bf16_cvt(instr: &str) -> Option<(String, String, String)> {
     } else {
         None
     }
+}
+
+/// Replace A-matrix cp.async loads with inline pointwise function application.
+///
+/// At each A-matrix cp.async site inside the GEMM's main loop:
+/// 1. Load 16 bytes (8 bf16) from GMEM at the cp.async's source address
+/// 2. Unpack each bf16 pair to f32
+/// 3. Apply the pointwise function (parameterized via `PointwiseComputation`)
+/// 4. Pack f32 back to bf16
+/// 5. Write 16 bytes to SMEM at the cp.async's destination address
+///
+/// B-matrix cp.async loads are preserved. The GEMM body is otherwise unchanged.
+pub fn replace_a_loads_with_inline_fn(
+    gemm_ptx: &str,
+    a_param_hint: &str,
+    computation: &PointwiseComputation,
+) -> Result<String, String> {
+    use crate::fuse_cp_async::{
+        CpAsyncClass, classify_cp_async_loads, find_all_reg_counts, identify_a_matrix_param,
+        parse_cp_async,
+    };
+
+    let lines: Vec<&str> = gemm_ptx.lines().collect();
+    let proto = PtxParser::parse(gemm_ptx)?;
+    let reg_to_param = PtxParser::trace_param_registers_pub(&lines, &proto.params);
+
+    let a_param_name = identify_a_matrix_param(&lines, &reg_to_param, a_param_hint)?;
+    let a_addr_regs: Vec<String> = reg_to_param
+        .iter()
+        .filter(|(_, p)| **p == a_param_name)
+        .map(|(r, _)| r.clone())
+        .collect();
+
+    if a_addr_regs.is_empty() {
+        return Err(format!(
+            "no address registers traced to A param '{a_param_name}'"
+        ));
+    }
+
+    let classifications = classify_cp_async_loads(&lines, &a_addr_regs);
+    let a_count = classifications
+        .values()
+        .filter(|c| **c == CpAsyncClass::AMatrix)
+        .count();
+    if a_count == 0 {
+        return Err("no cp.async loads classified as A-matrix".into());
+    }
+
+    let regs = find_all_reg_counts(&lines);
+
+    // Allocate temp registers:
+    // 1 predicate for mask check
+    // 4 b32 for loading 16 bytes
+    // 2 b16 for bf16 unpacking
+    // 2 f32 for unpacked values + computation scratch from PointwiseComputation
+    let p_mask = regs.pred;
+    let r_base = regs.b32;
+    let f_base = regs.f32_;
+
+    let new_pred_count = regs.pred + 1;
+    let new_b32_count = regs.b32 + 4 + computation.scratch_b32_count;
+    let new_f32_count = regs.f32_ + 2 + computation.scratch_f32_count;
+    // Need b16 registers for bf16 unpacking
+    let need_b16 = true;
+
+    let p = format!("%p{p_mask}");
+    let r_t = |i: usize| format!("%r{}", r_base + i);
+    let f_v = |i: usize| format!("%f{}", f_base + i); // f_v(0), f_v(1) for unpacked values
+
+    let mut result = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        // Bump register declarations
+        if trimmed.starts_with(".reg .pred") && trimmed.contains(&format!("%p<{}>", regs.pred)) {
+            result.push(line.replace(
+                &format!("%p<{}>", regs.pred),
+                &format!("%p<{new_pred_count}>"),
+            ));
+            continue;
+        }
+        if trimmed.starts_with(".reg .b32") && trimmed.contains(&format!("%r<{}>", regs.b32)) {
+            result.push(line.replace(
+                &format!("%r<{}>", regs.b32),
+                &format!("%r<{new_b32_count}>"),
+            ));
+            continue;
+        }
+        if trimmed.starts_with(".reg .f32") && trimmed.contains(&format!("%f<{}>", regs.f32_)) {
+            result.push(line.replace(
+                &format!("%f<{}>", regs.f32_),
+                &format!("%f<{new_f32_count}>"),
+            ));
+            if need_b16 {
+                result.push("\t.reg .b16 \t%h_fn<4>;".to_string());
+            }
+            // Epilogue scratch registers from the extracted computation
+            if computation.scratch_f32_count > 0 {
+                result.push(format!(
+                    "\t.reg .f32 \t%f_epi<{}>;",
+                    computation.scratch_f32_count
+                ));
+            }
+            if computation.scratch_b32_count > 0 {
+                result.push(format!(
+                    "\t.reg .b32 \t%r_epi<{}>;",
+                    computation.scratch_b32_count
+                ));
+            }
+            // Emit param loads for the computation
+            if !computation.param_loads.is_empty() {
+                result.push("\t// FERRITE: load prologue params".to_string());
+                for instr in &computation.param_loads {
+                    result.push(format!("\t{instr}"));
+                }
+            }
+            continue;
+        }
+
+        // Replace A-matrix cp.async with inline load+transform+store
+        if trimmed.contains("cp.async.cg.shared.global")
+            && classifications.get(&i) == Some(&CpAsyncClass::AMatrix)
+        {
+            if let Some((smem_dst, gmem_src, mask)) = parse_cp_async(trimmed) {
+                result.push(
+                    "\t// FERRITE: inline pointwise fn replacing A-matrix cp.async".to_string(),
+                );
+
+                // Check mask
+                result.push(format!("\tsetp.ne.b32 \t{p}, {mask}, 0;"));
+
+                // Load 16 bytes from GMEM (4 x b32 = 8 bf16)
+                result.push(format!(
+                    "\t@{p} ld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{gmem_src}];",
+                    r_t(0),
+                    r_t(1),
+                    r_t(2),
+                    r_t(3)
+                ));
+                // Zero on mask=0
+                for j in 0..4 {
+                    result.push(format!("\t@!{p} mov.b32 \t{}, 0;", r_t(j)));
+                }
+
+                // Apply pointwise function on each bf16 pair
+                for j in 0..4 {
+                    // Unpack b32 -> 2 bf16
+                    result.push(format!("\tmov.b32 \t{{%h_fn0, %h_fn1}}, {};", r_t(j)));
+                    // bf16 -> f32
+                    result.push(format!("\tcvt.f32.bf16 \t{}, %h_fn0;", f_v(0)));
+                    result.push(format!("\tcvt.f32.bf16 \t{}, %h_fn1;", f_v(1)));
+
+                    // Apply extracted computation on each f32 value
+                    for instr in &computation.instructions {
+                        let concrete0 = instr.replace("{INPUT}", &f_v(0));
+                        result.push(format!("\t{concrete0}"));
+                    }
+                    for instr in &computation.instructions {
+                        let concrete1 = instr.replace("{INPUT}", &f_v(1));
+                        result.push(format!("\t{concrete1}"));
+                    }
+
+                    // f32 -> bf16
+                    result.push(format!("\tcvt.rn.bf16.f32 \t%h_fn0, {};", f_v(0)));
+                    result.push(format!("\tcvt.rn.bf16.f32 \t%h_fn1, {};", f_v(1)));
+                    // Pack 2 bf16 -> b32
+                    result.push(format!("\tmov.b32 \t{}, {{%h_fn0, %h_fn1}};", r_t(j)));
+                }
+
+                // Store 16 bytes to SMEM
+                result.push(format!(
+                    "\tst.shared.v4.b32 \t[{smem_dst}], {{{}, {}, {}, {}}};",
+                    r_t(0),
+                    r_t(1),
+                    r_t(2),
+                    r_t(3)
+                ));
+                continue;
+            }
+        }
+
+        result.push(line.to_string());
+    }
+
+    Ok(result.join("\n"))
 }
 
 /// Register handoff fusion: A's output value stays in a register, B reads it directly.
@@ -1485,5 +1671,98 @@ mod tests {
         let addr_regs = vec!["%rd3".to_string()];
         let dest = find_load_dest_register(&body, &addr_regs);
         assert_eq!(dest.as_deref(), Some("%f1"));
+    }
+
+    #[test]
+    fn prologue_identity_replaces_cp_async() {
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+
+        // Identity computation: no instructions (passthrough)
+        let identity = PointwiseComputation {
+            instructions: vec![],
+            param_loads: vec![],
+            scratch_f32_count: 0,
+            scratch_b32_count: 0,
+        };
+
+        let result = replace_a_loads_with_inline_fn(gemm_ptx, "param_0", &identity).unwrap();
+
+        // Should have replaced A-matrix cp.async with inline fn markers
+        assert!(
+            result.contains("FERRITE: inline pointwise fn"),
+            "should have injection markers"
+        );
+        // Should have bf16 conversion (even for identity, we unpack/repack)
+        assert!(
+            result.contains("cvt.f32.bf16"),
+            "should have bf16->f32 unpacking"
+        );
+        assert!(
+            result.contains("cvt.rn.bf16.f32"),
+            "should have f32->bf16 repacking"
+        );
+        // B-matrix cp.async should be preserved
+        assert!(
+            result.contains("cp.async.cg.shared.global"),
+            "B-matrix cp.async should be preserved"
+        );
+        // MMA should be preserved
+        assert!(
+            result.contains("mma.sync"),
+            "MMA instructions should be preserved"
+        );
+
+        // ptxas validation
+        let path = "/tmp/gemm_prologue_identity.ptx";
+        std::fs::write(path, &result).unwrap();
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", path])
+            .output()
+            .expect("ptxas");
+        assert!(
+            out.status.success(),
+            "ptxas failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn prologue_scale_replaces_cp_async() {
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+
+        // Scale by 2.0: multiply each element by a constant
+        // The extracted computation would be: mul.f32 {INPUT}, {INPUT}, %f_epi0
+        // where %f_epi0 holds the scale value loaded from params
+        let scale_comp = PointwiseComputation {
+            instructions: vec!["mul.f32 {INPUT}, {INPUT}, %f_epi0;".to_string()],
+            param_loads: vec![
+                // Load scale_val (would be from an extra param in the real fuse! case)
+                // For this test, just mov a constant
+                "mov.f32 %f_epi0, 0f40000000;".to_string(), // 2.0 in IEEE 754
+            ],
+            scratch_f32_count: 1,
+            scratch_b32_count: 0,
+        };
+
+        let result = replace_a_loads_with_inline_fn(gemm_ptx, "param_0", &scale_comp).unwrap();
+
+        assert!(
+            result.contains("mul.f32"),
+            "should have scale multiplication"
+        );
+        assert!(result.contains("0f40000000"), "should have 2.0 constant");
+
+        // ptxas validation
+        let path = "/tmp/gemm_prologue_scale.ptx";
+        std::fs::write(path, &result).unwrap();
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", path])
+            .output()
+            .expect("ptxas");
+        assert!(
+            out.status.success(),
+            "ptxas failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

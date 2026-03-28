@@ -11,7 +11,7 @@ use crate::parser::PtxParser;
 
 /// Classification of a cp.async instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CpAsyncClass {
+pub(crate) enum CpAsyncClass {
     AMatrix,
     BMatrix,
     Unknown,
@@ -866,11 +866,11 @@ fn emit_normalized_a_load(
 }
 
 /// All register counts from PTX declarations.
-struct RegCounts {
-    pred: usize,
-    b32: usize,
-    f32_: usize,
-    b64: usize,
+pub(crate) struct RegCounts {
+    pub(crate) pred: usize,
+    pub(crate) b32: usize,
+    pub(crate) f32_: usize,
+    pub(crate) b64: usize,
 }
 
 /// Parse register declaration counts from PTX.
@@ -879,7 +879,7 @@ fn find_reg_counts(lines: &[&str]) -> (usize, usize) {
     (c.pred, c.b32)
 }
 
-fn find_all_reg_counts(lines: &[&str]) -> RegCounts {
+pub(crate) fn find_all_reg_counts(lines: &[&str]) -> RegCounts {
     let mut counts = RegCounts {
         pred: 0,
         b32: 0,
@@ -918,7 +918,7 @@ fn parse_reg_decl(line: &str, prefix: &str, reg_prefix: &str) -> Option<usize> {
 
 // ── Internal helpers ──
 
-fn identify_a_matrix_param(
+pub(crate) fn identify_a_matrix_param(
     lines: &[&str],
     reg_to_param: &BTreeMap<String, String>,
     hint: &str,
@@ -951,7 +951,7 @@ fn identify_a_matrix_param(
     Ok(seen_params[0].clone())
 }
 
-fn classify_cp_async_loads(
+pub(crate) fn classify_cp_async_loads(
     lines: &[&str],
     a_addr_regs: &[String],
 ) -> BTreeMap<usize, CpAsyncClass> {
@@ -977,7 +977,7 @@ fn classify_cp_async_loads(
     classifications
 }
 
-fn parse_cp_async(instr: &str) -> Option<(String, String, String)> {
+pub(crate) fn parse_cp_async(instr: &str) -> Option<(String, String, String)> {
     let mut brackets = Vec::new();
     let mut i = 0;
     let bytes = instr.as_bytes();

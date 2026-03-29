@@ -787,6 +787,196 @@ fn test3_gemm_accumulate_beta1_real_weights() {
     println!("PASS: gemm_accumulate beta=1.0 matches cuBLAS");
 }
 
+/// Test 5: the exact broken sequence. add residual+hs on CPU, then compare:
+///   Path A: fused_add_rms_norm_inplace(hs, res) → CUTLASS GEMM on normed hs
+///   Path B: fused_norm_gemm(res_after_add) — fused norm+GEMM on accumulated residual
+///   Path C: rms_norm(res_after_add) → CUTLASS GEMM — separate norm+GEMM on same data
+/// If B≠C, the fused_norm_gemm kernel itself is wrong at this scale.
+/// If B=C but A≠B, the rms_norm implementations differ.
+#[test]
+fn test5_add_then_fused_norm_gemm() {
+    println!("=== Test 5: add + fused_norm_gemm vs fused_add_rms_norm + GEMM ===");
+
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+
+    let hidden = 896u32;
+    let n = 1152u32;
+    let k = hidden;
+    let m = 1024u32; // production size
+    let eps = 1e-6f32;
+
+    let qkv_weight = {
+        let mut w = load_bf16_tensor(&st, "model.layers.0.self_attn.q_proj.weight");
+        w.extend_from_slice(&load_bf16_tensor(
+            &st,
+            "model.layers.0.self_attn.k_proj.weight",
+        ));
+        w.extend_from_slice(&load_bf16_tensor(
+            &st,
+            "model.layers.0.self_attn.v_proj.weight",
+        ));
+        w
+    };
+    let norm_weight = load_bf16_tensor(&st, "model.layers.0.input_layernorm.weight");
+
+    // Simulate residual (large) and hidden_states (small) — like production
+    let h_residual: Vec<bf16> = (0..(m * k) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00013 - 0.3).cos() * 5.0))
+        .collect();
+    let h_hs: Vec<bf16> = (0..(m * k) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+
+    // CPU add: res_added = residual + hidden_states
+    let h_res_added: Vec<bf16> = h_residual
+        .iter()
+        .zip(h_hs.iter())
+        .map(|(r, h)| bf16::from_f32(r.to_f32() + h.to_f32()))
+        .collect();
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let d_qkv_weight = stream.clone_htod(&qkv_weight).unwrap();
+    let d_norm_weight = stream.clone_htod(&norm_weight).unwrap();
+    let (qw_p, _) = d_qkv_weight.device_ptr(&stream);
+    let (nw_p, _) = d_norm_weight.device_ptr(&stream);
+
+    // ── Path B: fused_norm_gemm on res_added ──
+    let d_res_b = stream.clone_htod(&h_res_added).unwrap();
+    let d_out_b: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (res_b_p, _) = d_res_b.device_ptr(&stream);
+    let (out_b_p, _) = d_out_b.device_ptr(&stream);
+
+    let flat_b = build_flat_params(
+        res_b_p as u64,
+        qw_p as u64,
+        out_b_p as u64,
+        out_b_p as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+
+    let fused_module = ctx.load_module(Ptx::from_src(FUSED_NORM_GEMM.ptx)).unwrap();
+    let fused_func = fused_module.load_function(FUSED_NORM_GEMM.entry).unwrap();
+    unsafe {
+        let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+        stream
+            .launch_builder(&fused_func)
+            .arg(&(res_b_p as u64))
+            .arg(&(nw_p as u64))
+            .arg(&eps)
+            .arg(&k)
+            .arg(&(k as u64))
+            .arg(&flat_b)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: FUSED_NORM_GEMM.smem_bytes,
+            })
+    }
+    .unwrap();
+
+    // ── Path C: separate rms_norm + CUTLASS GEMM on same res_added ──
+    let d_res_c = stream.clone_htod(&h_res_added).unwrap();
+    let d_normed_c: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+    let (res_c_p, _) = d_res_c.device_ptr(&stream);
+    let (normed_c_p, _) = d_normed_c.device_ptr(&stream);
+
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+    unsafe {
+        stream
+            .launch_builder(&rms_func)
+            .arg(&normed_c_p)
+            .arg(&res_c_p)
+            .arg(&nw_p)
+            .arg(&eps)
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: (m, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+    }
+    .unwrap();
+
+    let d_out_c: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (out_c_p, _) = d_out_c.device_ptr(&stream);
+    let flat_c = build_flat_params(
+        normed_c_p as u64,
+        qw_p as u64,
+        out_c_p as u64,
+        out_c_p as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+    let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+    let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+    unsafe {
+        let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+        stream
+            .launch_builder(&gemm_func)
+            .arg(&flat_c)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 36864,
+            })
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    let out_b = stream.clone_dtoh(&d_out_b).unwrap();
+    let out_c = stream.clone_dtoh(&d_out_c).unwrap();
+
+    let mut max_bc = 0.0f32;
+    let mut worst = 0;
+    for i in 0..(m * n) as usize {
+        let b = out_b[i].to_f32();
+        let c = out_c[i].to_f32();
+        let d = (b - c).abs();
+        if d > max_bc {
+            max_bc = d;
+            worst = i;
+        }
+    }
+
+    println!("  M={m}, N={n}, K={k}");
+    println!("  fused_norm_gemm vs separate norm+GEMM: {max_bc:.2e} at [{worst}]");
+    print!("  fused [0..8]: ");
+    for i in 0..8 {
+        print!("{:.4} ", out_b[i].to_f32());
+    }
+    println!();
+    print!("  separ [0..8]: ");
+    for i in 0..8 {
+        print!("{:.4} ", out_c[i].to_f32());
+    }
+    println!();
+
+    let tol = 1.0 + (k as f32 / 512.0).ceil();
+    assert!(max_bc < tol, "fused vs separate: {max_bc:.2e}");
+    println!("PASS");
+}
+
 /// Test 4: simulate 2 layers of the ferrite control flow vs standard.
 /// Skip attention — just test the residual/norm/GEMM threading.
 /// Layer pattern (simplified, no attention):

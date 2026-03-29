@@ -215,6 +215,114 @@ pub fn fuse_reduction_into_gemm(
     replace_a_loads_with_inline_fn(&gemm_ptx, "", &computation)
 }
 
+/// Fuse a Pointwise stage (e.g., silu_mul) into a TiledGemm's A-input.
+///
+/// The pointwise operation is computed inline at each A-matrix cp.async site.
+/// For silu_mul: the GEMM's A_ptr points to gate_up_buf with lda=2*intermediate.
+/// At each A-load, the gate value is loaded from the original address and the
+/// up value is loaded from +intermediate_bytes offset. SiLU(gate)*up replaces
+/// the A-matrix element.
+pub fn fuse_pointwise_into_gemm(
+    pointwise: &PipelineStage,
+    gemm: &PipelineStage,
+    fused_name: &str,
+) -> Result<String, String> {
+    match &pointwise.pattern {
+        StagePattern::Pointwise => {}
+        other => return Err(format!("producer is not Pointwise, got {:?}", other)),
+    }
+    match &gemm.pattern {
+        StagePattern::TiledGemm { .. } => {}
+        other => return Err(format!("consumer is not TiledGemm, got {:?}", other)),
+    }
+
+    let computation = build_silu_mul_computation(fused_name)?;
+
+    let gemm_ptx = gemm.source_lines.join("\n");
+    replace_a_loads_with_inline_fn(&gemm_ptx, "", &computation)
+}
+
+/// Build a PointwiseComputation for SiLU+mul fused into GEMM A-loads.
+///
+/// At each A-load site (cp.async), the original load reads gate values
+/// (from gate_up_buf with lda=2*intermediate). The per-site code loads
+/// the corresponding up values at +intermediate_bytes offset. Per-element
+/// instructions apply SiLU(gate) * up.
+fn build_silu_mul_computation(fused_name: &str) -> Result<PointwiseComputation, String> {
+    // Extra params: just the byte offset to the "up" half
+    let extra_params = vec![".param .u64 _ferrite_intermediate_bytes,".into()];
+
+    // Register declarations for up loading + SiLU scratch
+    let extra_reg_decls = vec![
+        // Up value registers (loaded per-site, consumed per-element)
+        ".reg .b32 %r_up0, %r_up1, %r_up2, %r_up3;".into(),
+        ".reg .b16 %h_up_a, %h_up_b;".into(),
+        ".reg .f32 %f_up0, %f_up1, %f_up2, %f_up3, %f_up4, %f_up5, %f_up6, %f_up7;".into(),
+        // SiLU scratch (reuse fuse_epilogue pattern)
+        ".reg .f32 %f_act0, %f_act1, %f_act2, %f_act3;".into(),
+        ".reg .b32 %r_act0;".into(),
+        // Intermediate offset
+        ".reg .b64 %rd_up_off;".into(),
+    ];
+
+    // Param loads: load the intermediate byte offset once
+    let param_loads = vec!["ld.param.u64 \t%rd_up_off, [_ferrite_intermediate_bytes];".into()];
+
+    // Per-site: load 8 bf16 up values from GMEM_SRC + intermediate_bytes
+    let mut per_site = vec!["// FERRITE: load up values at +intermediate offset".into()];
+    // Compute up address = GMEM_SRC + intermediate_bytes
+    per_site.push("add.u64 \t%rd_up_off, {GMEM_SRC}, %rd_up_off;".into());
+    per_site.push("ld.global.v4.b32 \t{%r_up0, %r_up1, %r_up2, %r_up3}, [%rd_up_off];".into());
+    // Restore rd_up_off (it was clobbered by the add)
+    per_site.push("ld.param.u64 \t%rd_up_off, [_ferrite_intermediate_bytes];".into());
+
+    // Unpack 8 bf16 up values to named f32 registers
+    per_site.push("// FERRITE: unpack 8 bf16 up values to f32".into());
+    for w in 0..4u32 {
+        let lo = w * 2;
+        let hi = w * 2 + 1;
+        per_site.push(format!("mov.b32 \t{{%h_up_a, %h_up_b}}, %r_up{w};"));
+        per_site.push(format!("cvt.f32.bf16 \t%f_up{lo}, %h_up_a;"));
+        per_site.push(format!("cvt.f32.bf16 \t%f_up{hi}, %h_up_b;"));
+    }
+
+    // Per-element instructions: SiLU(gate) * up
+    // {INPUT} = gate value (f32, from the original A-load after bf16→f32 conversion)
+    // {ELEM_IDX} = 0..7 index into up registers
+    let instructions = vec![
+        // SiLU(gate) = gate / (1 + exp(-gate))
+        // Uses fast exp via range reduction + ex2.approx (same as fuse_epilogue.rs)
+        "neg.f32 \t%f_act0, {INPUT};".into(),
+        "fma.rn.f32 \t%f_act1, %f_act0, 0f3BBB989D, 0f3F000000;".into(),
+        "cvt.sat.f32.f32 \t%f_act1, %f_act1;".into(),
+        "fma.rm.f32 \t%f_act2, %f_act1, 0f437C0000, 0f4B400001;".into(),
+        "add.f32 \t%f_act3, %f_act2, 0fCB40007F;".into(),
+        "neg.f32 \t%f_act3, %f_act3;".into(),
+        "fma.rn.f32 \t%f_act3, %f_act0, 0f3FB8AA3B, %f_act3;".into(),
+        "fma.rn.f32 \t%f_act3, %f_act0, 0f32A57060, %f_act3;".into(),
+        "mov.b32 \t%r_act0, %f_act2;".into(),
+        "shl.b32 \t%r_act0, %r_act0, 23;".into(),
+        "mov.b32 \t%f_act2, %r_act0;".into(),
+        "ex2.approx.ftz.f32 \t%f_act3, %f_act3;".into(),
+        "fma.rn.f32 \t%f_act3, %f_act3, %f_act2, 0f3F800000;".into(),
+        "div.rn.f32 \t{INPUT}, {INPUT}, %f_act3;".into(),
+        // Multiply by corresponding up value
+        "mul.f32 \t{INPUT}, {INPUT}, %f_up{ELEM_IDX};".into(),
+    ];
+
+    Ok(PointwiseComputation {
+        instructions,
+        param_loads,
+        prologue: vec![], // No prologue needed for pointwise
+        extra_reg_decls,
+        extra_params,
+        per_site,
+        entry_name: Some(fused_name.to_string()),
+        scratch_f32_count: 0,
+        scratch_b32_count: 0,
+    })
+}
+
 /// Build a PointwiseComputation from a decomposed reduction.
 ///
 /// The prologue computes inv_rms for each row in the GEMM tile.
@@ -804,5 +912,77 @@ mod tests {
             panic!("ptxas FAILED on pipeline-compiled fused PTX");
         }
         println!("PASS: pipeline-compiled fused PTX passes ptxas");
+    }
+
+    #[test]
+    fn build_silu_mul_computation_unit() {
+        let comp = build_silu_mul_computation("test_silu_gemm").expect("build computation");
+
+        assert!(
+            !comp.per_site.is_empty(),
+            "should have per-site code for up loading"
+        );
+        assert!(
+            !comp.instructions.is_empty(),
+            "should have per-element SiLU*up instructions"
+        );
+        let instr_text = comp.instructions.join("\n");
+        assert!(
+            instr_text.contains("ex2.approx") && instr_text.contains("div.rn.f32"),
+            "instructions should contain SiLU (ex2 + div)"
+        );
+        assert!(
+            instr_text.contains("%f_up{ELEM_IDX}"),
+            "instructions should reference up values"
+        );
+        assert_eq!(comp.entry_name.as_deref(), Some("test_silu_gemm"));
+    }
+
+    #[test]
+    fn silu_mul_fused_gemm_ptxas_valid() {
+        let silu_ptx = include_str!("../../ptx-fusion/kernels/vllm_silu_mul.ptx");
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
+
+        let silu_stage = PipelineStage::from_ptx("silu_mul", silu_ptx).expect("parse silu_mul");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx).expect("parse gemm");
+
+        let fused_ptx =
+            fuse_pointwise_into_gemm(&silu_stage, &gemm_stage, "fused_silu_gemm").expect("fuse");
+
+        // Apply perimeter replacement
+        let (fused_ptx, _) =
+            crate::perimeter::replace_perimeter(&fused_ptx, deriv_json, "fused_silu_gemm")
+                .expect("perimeter replacement");
+        let fused_ptx = crate::dedup_reg_declarations(&fused_ptx);
+
+        // Verify SiLU markers
+        assert!(
+            fused_ptx.contains("ex2.approx"),
+            "should contain SiLU exp approximation"
+        );
+        assert!(
+            fused_ptx.contains("_ferrite_intermediate_bytes"),
+            "should have intermediate offset param"
+        );
+
+        let path = "/tmp/fused_silu_mul_gemm.ptx";
+        std::fs::write(path, &fused_ptx).unwrap();
+
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", path])
+            .output()
+            .expect("ptxas not found");
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("ptxas stderr:");
+            for line in stderr.lines().take(30) {
+                eprintln!("  {line}");
+            }
+            panic!("ptxas FAILED on SiLU+mul fused GEMM PTX");
+        }
+        println!("PASS: SiLU+mul fused GEMM passes ptxas");
     }
 }

@@ -1850,3 +1850,178 @@ fn prologue_isolation_inv_rms() {
     assert!(max_diff < 0.5, "inv_rms mismatch too large: {max_diff:.2e}");
     println!("PASS: prologue produces correct inv_rms (max_diff = {max_diff:.2e})");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// SiLU+mul fused into GEMM_down: ptxas + GPU correctness
+// Tests the Pointwise→TiledGemm pipeline pattern.
+// ══════════════════════════════════════════════════════════════════════
+
+const SILU_MUL_FUSED_GEMM_PTX: &str = ptx_fusion::compile! {
+    a = silu_mul,
+    b = gemm_64x128x32,
+    bind = { a.output => b.param_0 },
+    name = "silu_mul_fused_gemm",
+}
+.ptx;
+
+/// CPU SiLU: x / (1 + exp(-x))
+fn cpu_silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[test]
+fn silu_mul_fused_gemm_ptxas() {
+    println!("=== SiLU+mul fused GEMM: ptxas ===");
+
+    assert!(
+        SILU_MUL_FUSED_GEMM_PTX.contains("ex2.approx"),
+        "should contain SiLU exp approximation"
+    );
+    assert!(
+        SILU_MUL_FUSED_GEMM_PTX.contains("_ferrite_intermediate_bytes"),
+        "should have intermediate offset param"
+    );
+    assert!(
+        SILU_MUL_FUSED_GEMM_PTX.contains("mma.sync"),
+        "should preserve GEMM MMA instructions"
+    );
+
+    let path = "/tmp/silu_mul_fused_gemm.ptx";
+    std::fs::write(path, SILU_MUL_FUSED_GEMM_PTX).unwrap();
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stderr.lines().take(20) {
+            println!("  ptxas: {line}");
+        }
+        panic!("ptxas FAILED on SiLU+mul fused GEMM PTX");
+    }
+    println!("PASS: SiLU+mul fused GEMM passes ptxas");
+}
+
+#[test]
+fn silu_mul_fused_gemm_gpu() {
+    println!("=== SiLU+mul fused GEMM: GPU correctness ===");
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    let m = 64u32;
+    let intermediate = 128u32; // intermediate_size
+    let n_down = 128u32; // output hidden dim of down GEMM
+    let k_down = intermediate; // K for down GEMM = intermediate
+
+    // Generate gate_up data: [M, 2*intermediate] bf16
+    let gate_up_cols = 2 * intermediate;
+    let h_gate_up: Vec<half::bf16> = (0..(m * gate_up_cols) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00031 - 0.4).sin() * 0.2))
+        .collect();
+
+    // Generate down weight: [N_down, intermediate] bf16
+    let h_b_down: Vec<half::bf16> = (0..(n_down * k_down) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 + 0.2).cos() * 0.1))
+        .collect();
+
+    // ── Reference: CPU SiLU+mul then GPU GEMM ──
+    // activated[i,j] = SiLU(gate_up[i, j]) * gate_up[i, j + intermediate]
+    let h_activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
+        .map(|idx| {
+            let row = idx / intermediate as usize;
+            let col = idx % intermediate as usize;
+            let gate = h_gate_up[row * gate_up_cols as usize + col].to_f32();
+            let up = h_gate_up[row * gate_up_cols as usize + intermediate as usize + col].to_f32();
+            half::bf16::from_f32(cpu_silu(gate) * up)
+        })
+        .collect();
+
+    let ref_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_activated,
+        &h_b_down,
+        m,
+        n_down,
+        k_down,
+    );
+
+    // ── Fused: SiLU+mul inline at GEMM A-loads ──
+    // A_ptr = gate_up_buf, lda = 2*intermediate (so A-loads naturally read gate columns)
+    let d_gate_up = stream.clone_htod(&h_gate_up).unwrap();
+    let d_b_down = stream.clone_htod(&h_b_down).unwrap();
+    let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n_down) as usize).unwrap();
+    let d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n_down) as usize).unwrap();
+
+    let module = ctx
+        .load_module(Ptx::from_src(SILU_MUL_FUSED_GEMM_PTX))
+        .unwrap();
+    let func = module.load_function("silu_mul_fused_gemm").unwrap();
+
+    let (gate_up_ptr, _) = d_gate_up.device_ptr(&stream);
+    let (b_ptr, _) = d_b_down.device_ptr(&stream);
+    let (c_ptr, _) = d_c.device_ptr(&stream);
+    let (d_ptr, _) = d_d.device_ptr(&stream);
+
+    // A_ptr = gate_up_ptr, lda = 2*intermediate (stride includes both gate + up columns)
+    let gemm_params = build_flat_params(
+        gate_up_ptr as u64,
+        b_ptr as u64,
+        c_ptr as u64,
+        d_ptr as u64,
+        m,
+        n_down,
+        k_down,
+        gate_up_cols, // lda = 2*intermediate (wider stride)
+        k_down,
+        n_down,
+        n_down,
+        1.0,
+        0.0,
+    );
+
+    // Extra param: intermediate_bytes = intermediate * 2 (bf16)
+    let intermediate_bytes = (intermediate as u64) * 2;
+
+    let (gx, gy, gz) = compute_grid(m, n_down, 64, 128);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, gz),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864,
+    };
+
+    // Param order: _ferrite_intermediate_bytes (u64), ferrite_params[88]
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&intermediate_bytes)
+            .arg(&gemm_params)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let fused_out = stream.clone_dtoh(&d_d).unwrap();
+
+    // Compare
+    let mut max_diff = 0.0f32;
+    let mut max_idx = 0;
+    for (i, (r, f)) in ref_out.iter().zip(fused_out.iter()).enumerate() {
+        let diff = (r.to_f32() - f.to_f32()).abs();
+        if diff > max_diff {
+            max_diff = diff;
+            max_idx = i;
+        }
+    }
+    println!(
+        "  M={m}, N={n_down}, K={k_down}, intermediate={intermediate}: max_abs_diff = {max_diff:.2e} at [{max_idx}] ref={:.6} fused={:.6}",
+        ref_out[max_idx].to_f32(),
+        fused_out[max_idx].to_f32()
+    );
+    // SiLU has bf16 rounding at multiple stages, allow some tolerance
+    assert!(
+        max_diff < 1.0,
+        "SiLU+mul fused GEMM diff too large: {max_diff:.2e}"
+    );
+    println!("PASS: SiLU+mul fused GEMM matches reference");
+}

@@ -1642,6 +1642,15 @@ pub fn compile(input: TokenStream) -> TokenStream {
                 )
                 .unwrap_or_else(|e| panic!("compile!: pipeline fusion failed: {e}"))
             }
+            (pipeline::StagePattern::Pointwise, pipeline::StagePattern::TiledGemm { .. }) => {
+                // Pipeline compiler: Pointwise → TiledGemm (e.g., silu_mul → GEMM)
+                pipeline_compile::fuse_pointwise_into_gemm(
+                    &producer_stage,
+                    &consumer_stage,
+                    &parsed.fused_name,
+                )
+                .unwrap_or_else(|e| panic!("compile!: pointwise→GEMM fusion failed: {e}"))
+            }
             _ => {
                 // General pairwise fusion
                 let result = fuse_general::fuse_two(

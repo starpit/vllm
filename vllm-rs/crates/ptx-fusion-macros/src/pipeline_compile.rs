@@ -37,7 +37,7 @@ pub fn fuse_reduction_into_gemm(
     }
 
     // Build the PointwiseComputation from the decomposed reduction
-    let computation = build_reduction_computation(&decomp, reduction, fused_name)?;
+    let computation = build_reduction_computation(&decomp, reduction, gemm, fused_name)?;
 
     // Apply it to the GEMM PTX
     let gemm_ptx = gemm.source_lines.join("\n");
@@ -52,6 +52,7 @@ pub fn fuse_reduction_into_gemm(
 fn build_reduction_computation(
     decomp: &ReductionDecomposition,
     reduction: &PipelineStage,
+    _gemm: &PipelineStage,
     fused_name: &str,
 ) -> Result<PointwiseComputation, String> {
     // Identify params from the reduction kernel
@@ -81,17 +82,17 @@ fn build_reduction_computation(
 
     // ── Extra register declarations ──
     let extra_reg_decls = vec![
-        ".reg .f32 %f_rms_inv;".into(), // the inv_rms value for current site's row
+        ".reg .f32 %f_rms_inv;".into(), // selected inv_rms for current site
+        ".reg .f32 %f_rms_inv0, %f_rms_inv1;".into(), // inv_rms for row 0 and row 1
         ".reg .f32 %f_rms_sq, %f_rms_sum;".into(), // accumulation scratch
         ".reg .f32 %f_rms_eps, %f_rms_hdnf;".into(),
         ".reg .f32 %f_rms_t0, %f_rms_t1;".into(),
         ".reg .b32 %r_rms_k, %r_rms_hdn, %r_rms_step;".into(),
         ".reg .b32 %r_rms_row, %r_rms_nrows;".into(),
         ".reg .b64 %rd_rms_in, %rd_rms_wt, %rd_rms_str;".into(),
-        ".reg .b64 %rd_rms_rowbase, %rd_rms_cur, %rd_rms_off;".into(),
-        ".reg .b64 %rd_rms_site_off, %rd_rms_site_row;".into(), // per-site row computation
-        ".reg .b64 %rd_rms_a_ptr;".into(),                      // A pointer for row computation
-        ".reg .pred %p_rms_lp, %p_rms_row;".into(),
+        ".reg .b64 %rd_rms_rowbase, %rd_rms_cur;".into(),
+        ".reg .b64 %rd_rms_rb0, %rd_rms_rb1;".into(), // GMEM row base addresses for parity select
+        ".reg .pred %p_rms_lp, %p_rms_row, %p_rms_par;".into(),
         // inv_rms array in SMEM (one per tile row, max 128 rows)
         ".shared .align 4 .f32 _ferrite_inv_rms[128];".into(),
         // Scratch SMEM for warp-level reduction (4 warps max)
@@ -108,9 +109,6 @@ fn build_reduction_computation(
         "ld.param.u32 \t%r_rms_hdn, [_ferrite_rms_hidden];".into(),
         "cvt.rn.f32.u32 \t%f_rms_hdnf, %r_rms_hdn;".into(),
         "ld.param.u64 \t%rd_rms_str, [_ferrite_rms_a_stride];".into(),
-        // Get A pointer from GEMM's first param field (offset 0 in flat params, or traced)
-        // For now, use the rms_input pointer as the A source
-        "mov.u64 \t%rd_rms_a_ptr, %rd_rms_in;".into(),
     ];
 
     // ── Prologue: compute inv_rms for each tile row ──
@@ -128,37 +126,23 @@ fn build_reduction_computation(
     let prologue = build_prologue_from_decomposition(decomp);
 
     // ── Per-site code ──
-    // At each cp.async site, compute which row this load is for,
-    // then load the weight at the same K offset.
+    // Row selection: the prologue pre-loads inv_rms for both rows into
+    // %f_rms_inv0 and %f_rms_inv1. Per-site selects based on compile-time
+    // parity bitmask using {LOAD_INDEX}.
     //
-    // Runtime row computation (works for ANY thread-to-row mapping):
-    //   byte_offset = gmem_src - a_ptr
-    //   row_bytes = stride * 2 (bf16 = 2 bytes)
-    //   row_idx_in_tile = (byte_offset / row_bytes) % tile_m
-    //   inv_rms = _ferrite_inv_rms[row_idx_in_tile]
+    // Weight loading: compute K byte offset from GMEM address.
+    // k_byte_offset = (gmem_src - a_ptr) - row_offset
+    // where row_offset is selected by parity.
     let per_site = vec![
-        "// FERRITE: compute row index for this cp.async site".into(),
-        "sub.u64 \t%rd_rms_site_off, {GMEM_SRC}, %rd_rms_a_ptr;".into(),
-        // row_bytes = stride * 2
-        "shl.b64 \t%rd_rms_site_row, %rd_rms_str, 1;".into(),
-        // row_idx = byte_offset / row_bytes
-        "div.u64 \t%rd_rms_site_row, %rd_rms_site_off, %rd_rms_site_row;".into(),
-        // Load inv_rms from SMEM array
-        "cvt.u32.u64 \t%r_rms_row, %rd_rms_site_row;".into(),
-        "shl.b32 \t%r_rms_row, %r_rms_row, 2;".into(), // * 4 bytes per f32
-        "mov.u32 \t%r_rms_step, _ferrite_inv_rms;".into(),
-        "add.s32 \t%r_rms_row, %r_rms_step, %r_rms_row;".into(),
-        "ld.shared.f32 \t%f_rms_inv, [%r_rms_row];".into(),
-        "// FERRITE: load weight at same K offset".into(),
-        // k_byte_offset = byte_offset % row_bytes (already have byte_offset in %rd_rms_site_off)
-        // But we need the K offset for the weight. Weight is indexed by K, not by (row, K).
-        // k_offset = byte_offset - row_idx * row_bytes
-        // Weight addr = weight_ptr + k_offset
-        "mul.lo.u64 \t%rd_rms_cur, %rd_rms_site_row, %rd_rms_str;".into(),
-        "shl.b64 \t%rd_rms_cur, %rd_rms_cur, 1;".into(), // * 2 for bf16
-        "sub.u64 \t%rd_rms_cur, %rd_rms_site_off, %rd_rms_cur;".into(), // k_byte_offset
-        "add.u64 \t%rd_rms_cur, %rd_rms_wt, %rd_rms_cur;".into(), // weight + k_offset
-        // Load 16 bytes of weight (8 bf16 values)
+        "// FERRITE: select inv_rms by row address comparison (compile-time optimized)".into(),
+        // Compare gmem_src against row 1 base: if gmem_src >= rb1, it's row 1
+        "setp.ge.u64 \t%p_rms_par, {GMEM_SRC}, %rd_rms_rb1;".into(),
+        "selp.f32 \t%f_rms_inv, %f_rms_inv1, %f_rms_inv0, %p_rms_par;".into(),
+        "// FERRITE: load weight at K offset from GMEM address".into(),
+        // weight_addr = weight_ptr + (gmem_src - row_base[parity])
+        "selp.u64 \t%rd_rms_cur, %rd_rms_rb1, %rd_rms_rb0, %p_rms_par;".into(),
+        "sub.u64 \t%rd_rms_cur, {GMEM_SRC}, %rd_rms_cur;".into(), // k_byte_offset
+        "add.u64 \t%rd_rms_cur, %rd_rms_wt, %rd_rms_cur;".into(), // weight + k_byte_offset
         "ld.global.v4.b32 \t{%r_rms_w0, %r_rms_w1, %r_rms_w2, %r_rms_w3}, [%rd_rms_cur];".into(),
     ];
 
@@ -347,6 +331,40 @@ fn build_prologue_from_decomposition(decomp: &ReductionDecomposition) -> Vec<Str
 
     // Final barrier before GEMM body reads inv_rms from SMEM
     prologue.push("bar.sync \t15;".into());
+
+    // ── Per-thread setup: load inv_rms for this thread's two rows ──
+    // Thread-to-row mapping extracted from CUTLASS PTX (PitchLinearWarpRakedThreadMap):
+    //   m_rel = (tid.x % 32) / 4 + (tid.x / 32) * 16
+    //   row_0 = m_rel, row_1 = m_rel + 8
+    // TODO: extract this mapping from the GEMM PTX rather than hardcoding
+    prologue.push("// Per-thread: load inv_rms for both rows".into());
+    prologue.push("mov.u32 \t%r_rms_step, %tid.x;".into());
+    prologue.push("and.b32 \t%r_rms_k, %r_rms_step, 31;".into()); // lane = tid.x % 32
+    prologue.push("shr.u32 \t%r_rms_k, %r_rms_k, 2;".into()); // lane / 4
+    prologue.push("shr.u32 \t%r_rms_row, %r_rms_step, 5;".into()); // warp = tid.x / 32
+    prologue.push("shl.b32 \t%r_rms_row, %r_rms_row, 4;".into()); // warp * 16
+    prologue.push("add.u32 \t%r_rms_row, %r_rms_row, %r_rms_k;".into()); // m_rel
+
+    // Load inv_rms[m_rel] and inv_rms[m_rel + 8]
+    prologue.push("mov.u32 \t%r_rms_k, _ferrite_inv_rms;".into());
+    prologue.push("shl.b32 \t%r_rms_step, %r_rms_row, 2;".into()); // m_rel * 4
+    prologue.push("add.s32 \t%r_rms_step, %r_rms_k, %r_rms_step;".into());
+    prologue.push("ld.shared.f32 \t%f_rms_inv0, [%r_rms_step];".into());
+    prologue.push("ld.shared.f32 \t%f_rms_inv1, [%r_rms_step+32];".into()); // +8 rows * 4 bytes
+
+    // Compute GMEM row base addresses for both rows (for K-offset extraction in per-site)
+    // rb0 = input_ptr + (ctaid.x * tile_m + m_rel) * stride * 2
+    prologue.push("mov.u32 \t%r_rms_step, %ctaid.x;".into());
+    prologue.push("mul.lo.s32 \t%r_rms_step, %r_rms_step, %r_rms_nrows;".into());
+    prologue.push("add.u32 \t%r_rms_step, %r_rms_step, %r_rms_row;".into()); // abs row 0
+    prologue.push("cvt.s64.s32 \t%rd_rms_rb0, %r_rms_step;".into());
+    prologue.push("mul.lo.s64 \t%rd_rms_rb0, %rd_rms_rb0, %rd_rms_str;".into());
+    prologue.push("shl.b64 \t%rd_rms_rb0, %rd_rms_rb0, 1;".into()); // * 2 for bf16
+    prologue.push("add.s64 \t%rd_rms_rb0, %rd_rms_in, %rd_rms_rb0;".into());
+    // rb1 = rb0 + 8 * stride * 2
+    prologue.push("shl.b64 \t%rd_rms_rb1, %rd_rms_str, 4;".into()); // stride * 16 = stride*8*2
+    prologue.push("add.s64 \t%rd_rms_rb1, %rd_rms_rb0, %rd_rms_rb1;".into());
+
     prologue.push("// FERRITE: end rms_norm prologue".into());
 
     prologue
@@ -359,11 +377,13 @@ mod tests {
     #[test]
     fn build_computation_from_rms_norm() {
         let rms_ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
         let stage = PipelineStage::from_ptx("rms_norm", rms_ptx).expect("parse rms_norm");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx).expect("parse gemm");
         let decomp = stage.decompose_reduction().expect("decompose");
 
-        let comp =
-            build_reduction_computation(&decomp, &stage, "test_fused").expect("build computation");
+        let comp = build_reduction_computation(&decomp, &stage, &gemm_stage, "test_fused")
+            .expect("build computation");
 
         // Should have prologue
         assert!(

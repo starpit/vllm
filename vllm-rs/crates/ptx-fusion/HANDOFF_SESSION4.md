@@ -143,18 +143,50 @@ decode step 0 and diverges at step 1. Possible explanations:
 - CUDA graphs were ruled out by session 3 (`--enforce-eager` still fails), but async
   scheduling was not.
 
-## What to do next
+## TODOs (in order)
 
-1. **Fix the precision**: Extend `compile!` to support `fused_add` in the prologue —
-   two inputs, f32 add, bf16 writeback, f32 norm. Re-run test13c. If tokens match,
-   wire into llama.rs and test with `vllm serve`.
+### 1. Close the first-token gap
+Run test13c with the **real** tokenized prompt for "What is 2+2? Answer in one word."
+(use the Qwen tokenizer to get the actual token IDs). If decode step 0 also diverges,
+the test matches production exactly. If it still matches, the first-token failure in
+production has a separate cause (engine-layer).
 
-2. **Or fall back**: Use `fused_add_rms_norm_inplace` + separate `forward_ferrite` GEMM
-   (current working path). This doesn't achieve norm→GEMM fusion but ships correct output
-   with ferrite CUTLASS GEMMs. Work on the full pipeline fusion separately.
+### 2. Try real tokens across other tests
+Real vs fake tokens is an untested axis that is orthogonal to every other test dimension.
+Any existing test (test11a-d, test12, test13c) could be upgraded to use real tokens.
+This rules out value-distribution-dependent bugs.
 
-3. **Close the first-token gap**: Run test13c with real prompt tokens from "What is 2+2?"
-   to see if decode step 0 also diverges. If it does, the test matches production exactly.
+### 3. Fix the precision in the prologue
+Extend `compile!` / the pipeline compiler to support a **fused_add** pre-operation in
+the GEMM prologue:
+- Prologue accepts TWO input pointers (residual, hidden_states)
+- Computes `sum = f32(residual[i]) + f32(hidden_states[i])` in registers
+- Writes `bf16(sum)` back to the residual buffer (side-effect writeback)
+- Feeds the **f32 sum** (not the bf16 truncation) into the rms_norm reduction
+- Norm output feeds into GEMM A-loads as before
+
+This matches `fused_add_rms_norm_inplace` precision. The key change is in
+`pipeline_compile.rs` — the prologue currently reads one input; it needs to read two
+and fuse the add before the norm.
+
+### 4. Re-run test13c
+After the precision fix, re-run test13c. All decode tokens must match. If they don't,
+there's a second bug.
+
+### 5. Wire into llama.rs
+Replace steps 1+2 in the ferrite forward path with the new fused_add_norm_gemm kernel.
+The `FERRITE_FUSED_NORM` env var approach (attempted and reverted this session) works
+mechanically — just flip it on once the kernel is correct.
+
+### 6. Test with `vllm serve`
+Run `vllm serve` with the fused path enabled. Send "What is 2+2? Answer in one word."
+The model must produce coherent, correct text. This is the milestone.
+
+### Alternative: fall back to standard path
+If the precision fix is too complex for now, ship the current working path:
+`fused_add_rms_norm_inplace` + separate `forward_ferrite` GEMM. This uses ferrite's
+CUTLASS GEMMs (faster than cuBLAS) but doesn't fuse norm→GEMM. Work on the full
+pipeline fusion (including the precision fix) as a separate effort.
 
 ## Rules (non-negotiable)
 

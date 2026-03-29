@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **200+ tests** (100 CUDA GPU + 99 unit + doc-ignored), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **137+ tests** (34 CUDA GPU + 103 unit), all passing.
 
 ### What's Proven
 
@@ -108,6 +108,10 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **200+ tests** (100 CUDA GPU + 99 unit + do
 | **Reduction decomposition** | pipeline unit tests | **rms_norm → accumulate loops + finalize block + emit loops, all from PTX** |
 | **Pipeline compiler (ptxas)** | pipeline_compile unit tests | **fuse_reduction_into_gemm: ptxas valid on fused PTX** |
 | **Pipeline compiler (GPU)** | cuda_fuse_general | **pipeline_fuse! rms_norm→GEMM: 0.00e0 diff, prologue isolation verified** |
+| **SiLU+mul fused into GEMM (GPU)** | cuda_fuse_general | **Pointwise→TiledGemm: SiLU(gate)*up at A-loads, 0.00e0 diff** |
+| **Two-phase persistent kernel** | cuda_fuse_general | **Two CUTLASS GEMMs + global barrier in one kernel, ptxas valid** |
+| **Full MLP pipeline (GPU)** | cuda_fuse_general | **rms_norm→GEMM→barrier→SiLU+mul→GEMM: single launch, 0.00e0 diff** |
+| **MLP pipeline multi-tile** | cuda_fuse_general | **3 dimension configs, all 0.00e0, 2D tile decomposition** |
 
 ### Benchmarks
 
@@ -118,6 +122,7 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **200+ tests** (100 CUDA GPU + 99 unit + do
 | Fused rms_norm -> GEMM | 29.4 us | 24.9 us | **1.18x** |
 | Persistent 2-phase (108 blocks, M=256) | 29.4 us | 31.4 us | 0.94x* |
 | 3-phase MLP (norm->GEMM+SiLU->GEMM) | 34.4 us | 43.7 us | 0.79x* |
+| **Full MLP pipeline** (M=64, hidden=2560, inter=3456) | 736.1 us | 339.2 us | **2.17x** |
 
 \* Persistent overhead is host memcpy to reset tile counter + per-tile atomic/barrier
 costs. With small matrices (M=256, K=128), scheduling overhead dominates. The win

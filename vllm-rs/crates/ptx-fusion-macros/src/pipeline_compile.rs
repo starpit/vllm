@@ -784,6 +784,8 @@ pub fn assemble_two_phase_kernel(
     all_params.push(".param .u32 _ferrite_num_blocks".into());
     all_params.push(".param .u32 _ferrite_total1".into());
     all_params.push(".param .u32 _ferrite_total2".into());
+    all_params.push(".param .u32 _ferrite_grid_x1".into());
+    all_params.push(".param .u32 _ferrite_grid_x2".into());
 
     // Emit params with commas (all except last)
     for (i, p) in all_params.iter().enumerate() {
@@ -815,6 +817,8 @@ pub fn assemble_two_phase_kernel(
     // Persistent loop registers
     out.push("\t// FERRITE: persistent + barrier scratch".into());
     out.push("\t.reg .u32 \t%r_ptile;".into());
+    out.push("\t.reg .u32 \t%r_ptile_x, %r_ptile_y;".into()); // decomposed 2D tile coords
+    out.push("\t.reg .u32 \t%r_pgridx;".into()); // grid_x for decomposition
     out.push("\t.reg .u64 \t%rd_pctr;".into());
     out.push("\t.reg .u32 \t%r_ptotal;".into());
     out.push("\t.reg .pred \t%p_pdone, %p_pt0;".into());
@@ -829,6 +833,7 @@ pub fn assemble_two_phase_kernel(
     out.push("\tld.param.u64 \t%rd_pctr, [_ferrite_counter1];".into());
     out.push("\tcvta.to.global.u64 \t%rd_pctr, %rd_pctr;".into());
     out.push("\tld.param.u32 \t%r_ptotal, [_ferrite_total1];".into());
+    out.push("\tld.param.u32 \t%r_pgridx, [_ferrite_grid_x1];".into());
     out.push(String::new());
     out.push("$L_phase1_loop:".into());
     out.push("\tmov.u32 \t%r_ptile, %tid.x;".into());
@@ -839,13 +844,19 @@ pub fn assemble_two_phase_kernel(
     out.push("\tld.shared.u32 \t%r_ptile, [_ptile_smem];".into());
     out.push("\tsetp.ge.u32 \t%p_pdone, %r_ptile, %r_ptotal;".into());
     out.push("\t@%p_pdone bra \t$L_phase1_done;".into());
+    // Decompose linear tile → (ctaid_x, ctaid_y)
+    out.push("\trem.u32 \t%r_ptile_x, %r_ptile, %r_pgridx;".into());
+    out.push("\tdiv.u32 \t%r_ptile_y, %r_ptile, %r_pgridx;".into());
     out.push(String::new());
 
-    // Phase 1 body (with ctaid.x → %r_ptile)
+    // Phase 1 body (with ctaid.x → %r_ptile_x, ctaid.y → %r_ptile_y)
     for line in &p1.body {
         let mut l = line.clone();
         if l.contains("%ctaid.x") && l.contains("mov.u32") {
-            l = l.replace("%ctaid.x", "%r_ptile");
+            l = l.replace("%ctaid.x", "%r_ptile_x");
+        }
+        if l.contains("%ctaid.y") && l.contains("mov.u32") {
+            l = l.replace("%ctaid.y", "%r_ptile_y");
         }
         out.push(l);
     }
@@ -876,6 +887,7 @@ pub fn assemble_two_phase_kernel(
     out.push("\tld.param.u64 \t%rd_pctr, [_ferrite_counter2];".into());
     out.push("\tcvta.to.global.u64 \t%rd_pctr, %rd_pctr;".into());
     out.push("\tld.param.u32 \t%r_ptotal, [_ferrite_total2];".into());
+    out.push("\tld.param.u32 \t%r_pgridx, [_ferrite_grid_x2];".into());
     out.push(String::new());
     out.push("$L_phase2_loop:".into());
     out.push("\tmov.u32 \t%r_ptile, %tid.x;".into());
@@ -886,13 +898,19 @@ pub fn assemble_two_phase_kernel(
     out.push("\tld.shared.u32 \t%r_ptile, [_ptile_smem];".into());
     out.push("\tsetp.ge.u32 \t%p_pdone, %r_ptile, %r_ptotal;".into());
     out.push("\t@%p_pdone bra \t$L_phase2_done;".into());
+    // Decompose linear tile → (ctaid_x, ctaid_y)
+    out.push("\trem.u32 \t%r_ptile_x, %r_ptile, %r_pgridx;".into());
+    out.push("\tdiv.u32 \t%r_ptile_y, %r_ptile, %r_pgridx;".into());
     out.push(String::new());
 
-    // Phase 2 body (with ctaid.x → %r_ptile)
+    // Phase 2 body (with ctaid.x → %r_ptile_x, ctaid.y → %r_ptile_y)
     for line in &p2_body {
         let mut l = line.clone();
         if l.contains("%ctaid.x") && l.contains("mov.u32") {
-            l = l.replace("%ctaid.x", "%r_ptile");
+            l = l.replace("%ctaid.x", "%r_ptile_x");
+        }
+        if l.contains("%ctaid.y") && l.contains("mov.u32") {
+            l = l.replace("%ctaid.y", "%r_ptile_y");
         }
         out.push(l);
     }

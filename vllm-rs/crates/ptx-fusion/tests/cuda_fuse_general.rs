@@ -2232,6 +2232,8 @@ fn mlp_pipeline_gpu() {
             .arg(&num_blocks)
             .arg(&total1)
             .arg(&total2)
+            .arg(&gx1)
+            .arg(&gx2)
             .launch(cfg)
     }
     .unwrap();
@@ -2258,6 +2260,187 @@ fn mlp_pipeline_gpu() {
         "MLP pipeline diff too large: {max_diff:.2e}"
     );
     println!("PASS: MLP pipeline matches separate launches");
+}
+
+#[test]
+fn mlp_pipeline_multi_tile() {
+    println!("=== MLP pipeline: multi-tile dimensions ===");
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    // Test dimensions that require multiple tiles in both N dimensions
+    for &(m, hidden, intermediate) in &[
+        (64, 256, 256),  // 2 N-tiles each phase
+        (128, 128, 256), // 2 M-tiles, 2 N-tiles
+        (64, 256, 512),  // more tiles
+    ] {
+        let gate_up_n = 2 * intermediate;
+        let eps = 1e-5f32;
+
+        let h_input: Vec<half::bf16> = (0..(m * hidden) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+            .collect();
+        let h_norm_wt: Vec<half::bf16> = (0..hidden as usize)
+            .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+            .collect();
+        let h_gu_wt: Vec<half::bf16> = (0..(gate_up_n * hidden) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 + 0.1).cos() * 0.05))
+            .collect();
+        let h_dn_wt: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.2).sin() * 0.05))
+            .collect();
+
+        // Reference
+        let h_normed = cpu_rms_norm(&h_input, &h_norm_wt, m as usize, hidden as usize, eps);
+        let h_gate_up = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &h_normed,
+            &h_gu_wt,
+            m,
+            gate_up_n,
+            hidden,
+        );
+        let h_act: Vec<half::bf16> = (0..(m * intermediate) as usize)
+            .map(|idx| {
+                let r = idx / intermediate as usize;
+                let c = idx % intermediate as usize;
+                let g = h_gate_up[r * gate_up_n as usize + c].to_f32();
+                let u = h_gate_up[r * gate_up_n as usize + intermediate as usize + c].to_f32();
+                half::bf16::from_f32(cpu_silu(g) * u)
+            })
+            .collect();
+        let ref_out = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &h_act,
+            &h_dn_wt,
+            m,
+            hidden,
+            intermediate,
+        );
+
+        // Fused pipeline
+        let d_input = stream.clone_htod(&h_input).unwrap();
+        let d_norm_wt = stream.clone_htod(&h_norm_wt).unwrap();
+        let d_gu_wt = stream.clone_htod(&h_gu_wt).unwrap();
+        let d_dn_wt = stream.clone_htod(&h_dn_wt).unwrap();
+        let d_gu_buf: CudaSlice<half::bf16> = stream.alloc_zeros((m * gate_up_n) as usize).unwrap();
+        let d_out: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+        let d_c1: CudaSlice<half::bf16> = stream.alloc_zeros((m * gate_up_n) as usize).unwrap();
+        let d_c2: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+        let mut d_ctr1: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+        let mut d_ctr2: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+        let mut d_bar: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+
+        let module = ctx.load_module(Ptx::from_src(MLP_PIPELINE_PTX)).unwrap();
+        let func = module.load_function("mlp_pipeline").unwrap();
+
+        let (inp_p, _) = d_input.device_ptr(&stream);
+        let (nw_p, _) = d_norm_wt.device_ptr(&stream);
+        let (guw_p, _) = d_gu_wt.device_ptr(&stream);
+        let (dnw_p, _) = d_dn_wt.device_ptr(&stream);
+        let (gub_p, _) = d_gu_buf.device_ptr(&stream);
+        let (out_p, _) = d_out.device_ptr(&stream);
+        let (c1_p, _) = d_c1.device_ptr(&stream);
+        let (c2_p, _) = d_c2.device_ptr(&stream);
+        let (ct1_p, _) = d_ctr1.device_ptr(&stream);
+        let (ct2_p, _) = d_ctr2.device_ptr(&stream);
+        let (bar_p, _) = d_bar.device_ptr(&stream);
+
+        let p1 = build_flat_params(
+            inp_p as u64,
+            guw_p as u64,
+            c1_p as u64,
+            gub_p as u64,
+            m,
+            gate_up_n,
+            hidden,
+            hidden,
+            hidden,
+            gate_up_n,
+            gate_up_n,
+            1.0,
+            0.0,
+        );
+        let p2 = build_flat_params(
+            gub_p as u64,
+            dnw_p as u64,
+            c2_p as u64,
+            out_p as u64,
+            m,
+            hidden,
+            intermediate,
+            gate_up_n,
+            intermediate,
+            hidden,
+            hidden,
+            1.0,
+            0.0,
+        );
+
+        let (gx1, gy1, _) = compute_grid(m, gate_up_n, 64, 128);
+        let (gx2, gy2, _) = compute_grid(m, hidden, 64, 128);
+        let total1 = gx1 * gy1;
+        let total2 = gx2 * gy2;
+        let ib = (intermediate as u64) * 2;
+        let nb = 1u32; // single CTA for correctness test
+
+        stream.memcpy_htod(&[0u32], &mut d_ctr1).unwrap();
+        stream.memcpy_htod(&[0u32], &mut d_ctr2).unwrap();
+        stream.memcpy_htod(&[0u32], &mut d_bar).unwrap();
+
+        let cfg = LaunchConfig {
+            grid_dim: (nb, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 36864,
+        };
+
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&(inp_p as u64))
+                .arg(&(nw_p as u64))
+                .arg(&eps)
+                .arg(&hidden)
+                .arg(&(hidden as u64))
+                .arg(&p1)
+                .arg(&ib)
+                .arg(&p2)
+                .arg(&(ct1_p as u64))
+                .arg(&(ct2_p as u64))
+                .arg(&(bar_p as u64))
+                .arg(&nb)
+                .arg(&total1)
+                .arg(&total2)
+                .arg(&gx1)
+                .arg(&gx2)
+                .launch(cfg)
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
+        let fused_out = stream.clone_dtoh(&d_out).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for (r, f) in ref_out.iter().zip(fused_out.iter()) {
+            let d = (r.to_f32() - f.to_f32()).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+        }
+        // Multi-GEMM + SiLU in bf16 — allow larger tolerance proportional to K
+        let tol = 1.0 + (hidden as f32 / 256.0);
+        println!(
+            "  M={m}, hidden={hidden}, intermediate={intermediate}: max_diff={max_diff:.2e} (tol={tol:.1})"
+        );
+        assert!(
+            max_diff < tol,
+            "MLP pipeline multi-tile diff too large: {max_diff:.2e}"
+        );
+    }
+    println!("PASS: MLP pipeline multi-tile correctness");
 }
 
 #[test]
@@ -2449,6 +2632,8 @@ fn mlp_pipeline_benchmark() {
                 .arg(&num_blocks)
                 .arg(&total1)
                 .arg(&total2)
+                .arg(&gx1)
+                .arg(&gx2)
                 .launch(mlp_cfg)
         }
         .unwrap();
@@ -2478,6 +2663,8 @@ fn mlp_pipeline_benchmark() {
                 .arg(&num_blocks)
                 .arg(&total1)
                 .arg(&total2)
+                .arg(&gx1)
+                .arg(&gx2)
                 .launch(mlp_cfg)
         }
         .unwrap();

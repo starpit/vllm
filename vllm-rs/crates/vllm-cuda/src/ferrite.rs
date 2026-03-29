@@ -622,10 +622,14 @@ pub unsafe fn launch_mlp_pipeline(
 
     let gn1 = gate_up_n.div_ceil(tile_n);
     let s1 = 1u32 << compute_swizzle_log(gn1);
-    let total1 = m.div_ceil(tile_m) * s1 * gn1.div_ceil(s1);
+    let grid_x1 = m.div_ceil(tile_m) * s1;
+    let grid_y1 = gn1.div_ceil(s1);
+    let total1 = grid_x1 * grid_y1;
     let gn2 = down_n.div_ceil(tile_n);
     let s2 = 1u32 << compute_swizzle_log(gn2);
-    let total2 = m.div_ceil(tile_m) * s2 * gn2.div_ceil(s2);
+    let grid_x2 = m.div_ceil(tile_m) * s2;
+    let grid_y2 = gn2.div_ceil(s2);
+    let total2 = grid_x2 * grid_y2;
 
     let intermediate_bytes = (intermediate as u64) * 2;
 
@@ -666,6 +670,8 @@ pub unsafe fn launch_mlp_pipeline(
     p32!(num_sm);
     p32!(total1);
     p32!(total2);
+    p32!(grid_x1);
+    p32!(grid_x2);
 
     launch_kernel_raw(func, stream, num_sm, 1, 128, 36864, &params[..o]);
     drop(gate_up_buf);

@@ -1,20 +1,58 @@
 # Handoff — Session 4
 
-## The goal (unchanged)
+## The goal
 
-Fuse `rms_norm → GEMM` into production, then extend to the full MLP pipeline:
+Ferrite fuses CUDA kernels at compile time via escape analysis on PTX. The current
+milestone is fusing `rms_norm` into the CUTLASS GEMM prologue so that normalization
+and matrix multiply happen in a single kernel launch, eliminating the GMEM round-trip.
+
+The full pipeline target (Phase 5G) is:
 ```
 rms_norm → GEMM_gate_up → SiLU+mul → GEMM_down → residual_add
 ```
+All in one launch. The current milestone is the first piece: `rms_norm → GEMM`.
 
-Current milestone: `rms_norm → GEMM` working in production (`vllm serve` correct text on Qwen2.5-0.5B).
+When this works in production (`vllm serve` produces correct text on Qwen2.5-0.5B),
+the architecture extends to the full pipeline.
+
+## What the working path does (llama.rs today)
+
+Per transformer layer (for layers 1-23, layer 0 has no residual):
+```
+1. fused_add_rms_norm_inplace(hidden_states, residual, norm_weight, eps)
+   → residual = residual + hidden_states  (in-place)
+   → hidden_states = rms_norm(residual) * norm_weight  (in-place)
+   NOTE: this kernel computes res+hs in f32 and norms the f32 sum
+2. qkv = forward_ferrite(hidden_states)   // ferrite CUTLASS GEMM
+3. attn_output = attention(qkv, ...)
+4. fused_add_rms_norm_inplace(attn_output, residual, norm_weight2, eps)
+5. gate_up = forward_ferrite(attn_output)  // ferrite CUTLASS GEMM
+6. activated = silu_and_mul(gate_up)
+7. mlp_output = down_proj(activated)
+```
+
+This produces correct text. The ferrite CUTLASS GEMMs match cuBLAS at 0.00e0.
+
+## What the fused path does
+
+Replace steps 1+2 with:
+```
+1. add_inplace(residual, hidden_states)  // residual += hidden_states (bf16 GMEM write)
+2. qkv = launch_fused_norm_gemm(FUSED_NORM_GEMM, residual, ...)
+   // reads residual from GMEM (bf16), norms it, feeds to GEMM → qkv
+```
+
+Same for steps 4+5.
+
+The architectural reason for the split: in the full pipeline, the add lives in the
+previous GEMM's epilogue (beta=1.0) and the norm lives in the next GEMM's prologue
+(pipeline_fuse!). These are different GEMMs — the split is intentional.
 
 ## Where we are
 
-**We have a failing test.** test13c runs the full model (24 layers, real embeddings,
-prefill + autoregressive decode) and compares token output between the standard ferrite
-path and the fused norm+GEMM path. The fused path produces **wrong tokens** starting
-at decode step 1.
+**We have a failing test.** test13c is the first test to reproduce the production failure
+outside `vllm serve`. It runs the full model (24 layers, real embeddings, prefill +
+autoregressive decode) and compares token output (argmax over logits):
 
 ```
 decode 0: std_token=119069 fused_token=119069 MATCH   hidden_diff=9.00e0
@@ -22,103 +60,111 @@ decode 1: std_token=114401 fused_token= 81931 MISMATCH  hidden_diff=1.10e1
 decode 2: std_token= 91457 fused_token=144255 MISMATCH  hidden_diff=1.00e1
 ```
 
-This is the first time the production failure has been reproduced outside `vllm serve`.
+Three prior sessions could not reproduce the failure outside production. This session
+did, by progressively closing the test gap until tokens were compared via argmax.
 
-## What was done
+## The root cause
 
-### Tests written (test_transformer_block.rs)
+The precision difference at the **add→norm boundary**.
 
-| Test | What | Result |
-|------|------|--------|
-| test10 | 1 layer, full block, layer.forward() vs manual fused | Diffs from bf16 precision |
-| test10c | QKV-only, shared weights, various M | 0→1.56e-2 (bf16 expected) |
-| test10d | Norm precision: fused_add_rms_norm vs add+rms_norm | 1.56e-2 (f32 vs bf16) |
-| test10e | 24-layer chain, norm+GEMM only (no attention) | Bounded at ~0.1 |
-| test11a | QKV norm+GEMM step only | 0→1.56e-2 |
-| test11b | + attention | 1.95e-3 |
-| test11c | + MLP gate_up | 3.12e-2 |
-| test11d | Full single layer | 1.56e-2 |
-| test12 | 24 layers with attention, prefill only | Bounded at ~0.4 |
-| test13b | Decode sanity (standard only) | PASS |
-| test13c | **Prefill + decode, token comparison** | **FAIL — token mismatch at step 1** |
+`fused_add_rms_norm_inplace` computes `residual + hidden_states` in **f32 registers**
+and norms the f32 sum — all in one kernel. The fused path writes `bf16(res + hs)` to
+GMEM via `add_inplace`, then reads the bf16 back in `launch_fused_norm_gemm`. The bf16
+truncation changes the norm input by up to **1.56e-2** per step (test10d proves this).
 
-### What was ruled out
+This 1.56e-2 is harmless during prefill (both paths process the same tokens, diffs
+stay bounded at ~0.4 after 24 layers — test12). But during **autoregressive decode**,
+each step feeds the previous step's output back as input. The slightly-wrong hidden
+state produces slightly-different logits, which can flip the argmax token. Once a
+different token is selected, the trajectories diverge completely.
 
-1. **Fused kernel correctness**: 0.00e0 vs separate same-precision path (test9a-k from session 3)
-2. **Precision explosion**: bf16 round-trip doesn't compound to garbage over 24 layers (test10e, test12)
-3. **Single-layer correctness**: all steps match within bf16 tolerance (test11a-d)
-4. **Prefill-only correctness**: 24 layers with attention, bounded diffs (test12)
+The fix: the fused prologue needs to accept **two inputs** (residual and hidden_states),
+add them in f32, write bf16 back to residual, and norm the f32 sum — matching
+`fused_add_rms_norm_inplace` precision.
 
-### The actual failure mode
+## Methodology
 
-The fused path diverges during **autoregressive decode**. Each decode step feeds the
-previous step's output back as input. The per-step bf16 precision difference (~0.1 in
-hidden states, ~9-11 after full model) is large enough to flip the argmax token. Once
-a different token is selected, the trajectories diverge completely.
+Session 3 ended with: kernel tests all pass at 0.00e0, production fails, cause unknown.
+The handoff prescribed: progressively close the test gap between isolated tests and
+production until a test fails.
 
-The precision difference comes from the **add→norm boundary**: `fused_add_rms_norm_inplace`
-keeps the `residual + hidden_states` sum in f32 for the norm, while `add_inplace` +
-`launch_fused_norm_gemm` truncates to bf16 between the two kernels. test10d proves
-this directly: 1.56e-2 norm diff at M=64.
+Session 4 followed this methodology:
 
-### Why it matters for autoregression but not prefill
+1. **test11a-d**: Decompose a single layer into steps (QKV, attention, MLP, full).
+   All pass within bf16 tolerance. Establishes that single-layer behavior is correct.
 
-During prefill, both paths process the same input tokens. The hidden state diffs are
-small but don't feed back into themselves. During decode, each step's slightly-wrong
-hidden state becomes the next step's input. The error compounds multiplicatively
-through the autoregressive loop, not through the layers.
+2. **test12**: Chain 24 layers with attention (prefill only). Both paths stay bounded
+   (final diff ~0.4). No explosion.
 
-### Architecture note: the two-step split is intentional
+3. **test13b**: Sanity check — decode works with the standard path alone.
 
-The add and norm are split because in the full pipeline:
-- The **add** lives in the previous GEMM's **epilogue** (beta=1.0)
-- The **norm** lives in the next GEMM's **prologue** (pipeline_fuse!)
+4. **test13c**: Prefill + autoregressive decode, 24 layers, comparing **argmax tokens**
+   (not just hidden state diffs). **This is the test that fails.**
 
-These are different GEMMs — the bf16 GMEM boundary between them is inherent to the
-two-GEMM-per-block architecture. BUT: the norm prologue could take two inputs
-(residual + hidden_states), add them in f32, and norm the f32 sum. This preserves
-precision without requiring a single kernel for all three operations.
+The key insight that took too long to reach: bounded hidden-state diffs do NOT mean
+correct tokens. A diff of 9-11 in hidden states (which looks "bounded") is large enough
+to flip argmax over a 151936-token vocabulary. Tests must compare tokens, not just norms.
+
+## Gotchas discovered
+
+### GpuWeights drop frees layer memory
+`GpuWeights::from_single_file()` owns the GPU memory for loaded weights via `gpu_allocs`.
+`LlamaDecoderLayer::load()` returns `GpuTensor` pointers into that memory. If you
+`drop(weights)`, the layer's weight pointers become dangling → `CUDA_ERROR_ILLEGAL_ADDRESS`.
+Keep `GpuWeights` alive for the lifetime of the layer.
+
+### Shared CachingAllocator across two paths
+Running two forward paths (standard + fused) through the same `device.caching` causes
+crashes during decode. The interleaved alloc/free patterns corrupt state. test13c fixes
+this by running each path in a **separate GpuDevice** (sequential execution). If you need
+both paths in one process, use separate allocators.
+
+### Tests must use --test-threads=1
+Multiple tests sharing one GPU deadlock at 300% CPU. Always run with `--test-threads=1`.
+
+### Real vs fake tokens is an untested axis
+All tests use synthetic or arbitrary token IDs. Real prompt tokens could produce different
+value distributions that trigger edge cases. This is orthogonal to all other test axes —
+any test could be upgraded to use real tokens.
+
+### llama.rs FERRITE_FUSED_NORM env var (attempted, reverted)
+I added a `FERRITE_FUSED_NORM=1` env var to toggle the fused path in `layer.forward()`.
+Ran `vllm serve` with it → garbage (same as session 3). Reverted llama.rs. The env var
+approach works mechanically; the fix needs to happen at the precision level first.
+
+## Unexplained gap
+
+Production (`vllm serve`) produces garbage at the **first token**. test13c matches at
+decode step 0 and diverges at step 1. Possible explanations:
+- test13c uses fake token IDs (not the real prompt). Real prompt tokens may trigger
+  the divergence earlier.
+- The engine has additional infrastructure (CUDA graphs, async scheduling, `InputBatch`)
+  that the test doesn't exercise.
+- CUDA graphs were ruled out by session 3 (`--enforce-eager` still fails), but async
+  scheduling was not.
 
 ## What to do next
 
-### Option A: Fix the precision (recommended)
+1. **Fix the precision**: Extend `compile!` to support `fused_add` in the prologue —
+   two inputs, f32 add, bf16 writeback, f32 norm. Re-run test13c. If tokens match,
+   wire into llama.rs and test with `vllm serve`.
 
-Extend the fused norm+GEMM prologue to accept TWO inputs (residual and hidden_states),
-add them in f32 registers, write bf16 back to residual, and norm the f32 sum. This
-matches `fused_add_rms_norm_inplace` precision. The `compile!` macro needs to support
-a `fused_add` pre-operation in the prologue.
+2. **Or fall back**: Use `fused_add_rms_norm_inplace` + separate `forward_ferrite` GEMM
+   (current working path). This doesn't achieve norm→GEMM fusion but ships correct output
+   with ferrite CUTLASS GEMMs. Work on the full pipeline fusion separately.
 
-Then re-run test13c — if tokens match, wire into llama.rs.
+3. **Close the first-token gap**: Run test13c with real prompt tokens from "What is 2+2?"
+   to see if decode step 0 also diverges. If it does, the test matches production exactly.
 
-### Option B: Accept the precision loss, fix via temperature
+## Rules (non-negotiable)
 
-The bf16 precision path might produce correct text with the right sampling parameters.
-The hidden diffs are 9-11, which is close to the argmax boundary. Slightly different
-logits might still produce coherent text with temperature > 0. But greedy (argmax)
-will diverge. This is fragile and model-dependent — not recommended.
-
-### Option C: Fall back to standard path
-
-Use `fused_add_rms_norm_inplace` + separate `forward_ferrite` GEMM. This is the current
-working production path. It doesn't achieve norm→GEMM fusion but still uses ferrite's
-CUTLASS GEMMs. No precision issue. Could ship this while working on Option A.
-
-### In production but NOT yet tested
-
-- The first token was correct in test13c but wrong in `vllm serve`. This suggests
-  there may be an additional engine-layer issue beyond precision. The test uses fake
-  token IDs (not the real "What is 2+2?" tokens). Try with real prompt tokens.
-- CUDA graph capture path (not exercised by tests)
-- Async scheduling overlap
-
-## Rules (unchanged)
-
-- **NEVER write PTX by hand** — use extracted code
+- **NEVER write PTX by hand** — use extracted code from PTX analysis
 - **NEVER build special-case macros** — extend `compile!`
 - **NEVER claim "proven"** without `vllm serve` producing correct text
 - **NEVER dismiss divergence** — 1.56e-2 per norm step flips tokens in autoregressive decode
 - **Tests ARE the product** — test13c is the real test: do tokens match?
-- **No shortcuts**
+- **No shortcuts** — every step on the critical path to the full pipeline
+- **Do NOT touch llama.rs** until you have a failing test that you can fix
 
 ## Key files
 
@@ -128,6 +174,7 @@ CUTLASS GEMMs. No precision issue. Could ship this while working on Option A.
 | `test13c` | **THE failing test** — prefill+decode token comparison |
 | `test10d` | Proves the precision difference at the norm level |
 | `HANDOFF_SESSION3.md` | Prior session context |
+| `FERRITE.md` | Architecture, roadmap, all proven capabilities |
 | `ferrite_gemm_real_weights.rs` | Session 3 kernel tests (test9a-k) |
 | `ferrite.rs:375-462` | `launch_fused_norm_gemm` |
 | `llama.rs:31-36` | `FUSED_NORM_GEMM` compile! definition |
@@ -136,12 +183,15 @@ CUTLASS GEMMs. No precision issue. Could ship this while working on Option A.
 ## Running the tests
 
 ```bash
-# The failing test (token comparison)
+# The failing test (token comparison) — THIS IS THE ONE THAT MATTERS
 cargo test -p vllm-cuda --features ferrite --test test_transformer_block test13c -- --nocapture --test-threads=1
 
-# All test11 (single-layer decomposition)
+# Single-layer decomposition (all pass)
 cargo test -p vllm-cuda --features ferrite --test test_transformer_block "test11" -- --nocapture --test-threads=1
 
-# Multi-layer prefill
+# Multi-layer prefill only (passes — failure needs autoregressive decode)
 cargo test -p vllm-cuda --features ferrite --test test_transformer_block test12 -- --nocapture --test-threads=1
+
+# Decode sanity (standard path only, no fused)
+cargo test -p vllm-cuda --features ferrite --test test_transformer_block test13b -- --nocapture --test-threads=1
 ```

@@ -366,3 +366,304 @@ fn test1_ferrite_gemm_vs_cublas_real_weights() {
 
     println!("PASS: ferrite GEMM matches cuBLAS with real weights");
 }
+
+// bf16 rms_norm kernel for reference path
+ptx_fusion::extract_entry!(
+    "../ptx-fusion/kernels/vllm_rms_norm.ptx",
+    "_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi",
+    RMS_NORM_BF16_PTX
+);
+
+// The fused norm+GEMM kernel from compile!
+const FUSED_NORM_GEMM: ptx_fusion::FeriteKernel = ptx_fusion::compile!(
+    a = rms_norm,
+    b = gemm_64x128x32,
+    bind = { a.output => b.param_0 },
+    name = "test_fused_norm_gemm",
+);
+
+/// Test 2: fused norm+GEMM vs separate rms_norm + cuBLAS GEMM.
+/// Uses real model weights and the EXACT production launch mechanism.
+#[test]
+fn test2_fused_norm_gemm_vs_separate_real_weights() {
+    println!("=== Test 2: fused norm+GEMM vs separate, real weights ===");
+
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+
+    let hidden = 896u32;
+    let q_size = 896u32;
+    let kv_size = 128u32;
+    let n = q_size + 2 * kv_size; // 1152
+    let k = hidden;
+    let m = 128u32;
+    let eps = 1e-6f32;
+
+    // Load weights
+    let qkv_weight = {
+        let mut w = load_bf16_tensor(&st, "model.layers.0.self_attn.q_proj.weight");
+        w.extend_from_slice(&load_bf16_tensor(
+            &st,
+            "model.layers.0.self_attn.k_proj.weight",
+        ));
+        w.extend_from_slice(&load_bf16_tensor(
+            &st,
+            "model.layers.0.self_attn.v_proj.weight",
+        ));
+        w
+    };
+    let norm_weight = load_bf16_tensor(&st, "model.layers.0.input_layernorm.weight");
+
+    // Create input
+    let h_input: Vec<bf16> = (0..(m * k) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_qkv_weight = stream.clone_htod(&qkv_weight).unwrap();
+    let d_norm_weight = stream.clone_htod(&norm_weight).unwrap();
+
+    // ── Reference: GPU rms_norm then cuBLAS GEMM ──
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+
+    let d_normed: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+    let (inp_p, _) = d_input.device_ptr(&stream);
+    let (nw_p, _) = d_norm_weight.device_ptr(&stream);
+    let (normed_p, _) = d_normed.device_ptr(&stream);
+
+    unsafe {
+        stream
+            .launch_builder(&rms_func)
+            .arg(&normed_p) // output
+            .arg(&inp_p) // input
+            .arg(&nw_p) // weight
+            .arg(&eps)
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: (m, 1, 1),
+                block_dim: (256.min(k), 1, 1),
+                shared_mem_bytes: 0,
+            })
+    }
+    .unwrap();
+
+    // cuBLAS GEMM on normed data
+    let mut d_ref_out: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    {
+        let blas = CudaBlas::new(stream.clone()).unwrap();
+        let (qw_p, _) = d_qkv_weight.device_ptr(&stream);
+        let cfg = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: bf16::from_f32(1.0),
+            lda: k as i32,
+            ldb: k as i32,
+            beta: bf16::from_f32(0.0),
+            ldc: n as i32,
+        };
+        unsafe {
+            blas.gemm(cfg, &d_qkv_weight, &d_normed, &mut d_ref_out)
+                .unwrap()
+        };
+    }
+    stream.synchronize().unwrap();
+
+    // ── Fused: norm+GEMM via compile! kernel, production launch ──
+    let d_fused_out: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (qw_p, _) = d_qkv_weight.device_ptr(&stream);
+    let (fused_out_p, _) = d_fused_out.device_ptr(&stream);
+
+    // Build flat GEMM params (same as launch_fused_norm_gemm does)
+    let flat = build_flat_params(
+        inp_p as u64,       // A_ptr = input (norm reads from it)
+        qw_p as u64,        // B_ptr = QKV weight
+        fused_out_p as u64, // C_ptr
+        fused_out_p as u64, // D_ptr
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+
+    // Load fused kernel via raw driver API (same as get_or_load_kernel)
+    let ptx_cstr = std::ffi::CString::new(FUSED_NORM_GEMM.ptx).unwrap();
+    let entry_cstr = std::ffi::CString::new(FUSED_NORM_GEMM.entry).unwrap();
+    let mut fmod: cusys::CUmodule = std::ptr::null_mut();
+    let mut ffunc: cusys::CUfunction = std::ptr::null_mut();
+    unsafe {
+        let r = cusys::cuModuleLoadData(&mut fmod, ptx_cstr.as_ptr() as *const _);
+        assert_eq!(
+            r,
+            cusys::cudaError_enum::CUDA_SUCCESS,
+            "load fused module: {r:?}"
+        );
+        let r = cusys::cuModuleGetFunction(&mut ffunc, fmod, entry_cstr.as_ptr());
+        assert_eq!(
+            r,
+            cusys::cudaError_enum::CUDA_SUCCESS,
+            "get fused func: {r:?}"
+        );
+    }
+
+    // Pack params EXACTLY like launch_fused_norm_gemm in ferrite.rs
+    let prefix = FUSED_NORM_GEMM.extra_param_bytes as usize;
+    let total = prefix + 88;
+    let mut params = vec![0u8; total];
+    params[0..8].copy_from_slice(&(inp_p as u64).to_le_bytes());
+    params[8..16].copy_from_slice(&(nw_p as u64).to_le_bytes());
+    params[16..20].copy_from_slice(&eps.to_le_bytes());
+    params[20..24].copy_from_slice(&k.to_le_bytes()); // hidden
+    params[24..32].copy_from_slice(&(k as u64).to_le_bytes()); // a_stride
+    params[prefix..prefix + 88].copy_from_slice(&flat);
+
+    println!("  prefix={prefix}, total={total}");
+
+    let (gx, gy, _) = compute_grid(m, n, 64, 128);
+
+    // Launch via CU_LAUNCH_PARAM_BUFFER_POINTER (production path)
+    unsafe {
+        #[repr(align(8))]
+        struct Aligned([u8; 256]);
+        let mut aligned = Aligned([0u8; 256]);
+        aligned.0[..total].copy_from_slice(&params);
+
+        let mut param_size = total;
+        let extra: [*mut std::ffi::c_void; 5] = [
+            cusys::CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT as *mut _,
+            aligned.0.as_ptr() as *mut _,
+            cusys::CU_LAUNCH_PARAM_BUFFER_SIZE_AS_INT as *mut _,
+            &mut param_size as *mut usize as *mut _,
+            cusys::CU_LAUNCH_PARAM_END_AS_INT as *mut _,
+        ];
+
+        let mut raw_stream: cusys::CUstream = std::ptr::null_mut();
+        cusys::cuStreamCreate(&mut raw_stream, 0);
+
+        let r = cusys::cuLaunchKernel(
+            ffunc,
+            gx,
+            gy,
+            1,
+            128,
+            1,
+            1,
+            FUSED_NORM_GEMM.smem_bytes,
+            raw_stream,
+            std::ptr::null_mut(),
+            extra.as_ptr() as *mut *mut _,
+        );
+        assert_eq!(
+            r,
+            cusys::cudaError_enum::CUDA_SUCCESS,
+            "fused launch: {r:?}"
+        );
+        cusys::cuStreamSynchronize(raw_stream);
+    }
+
+    // Also launch via cudarc per-arg for comparison
+    let d_fused_out2: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (fused_out2_p, _) = d_fused_out2.device_ptr(&stream);
+    let flat2 = build_flat_params(
+        inp_p as u64,
+        qw_p as u64,
+        fused_out2_p as u64,
+        fused_out2_p as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+    let fused_module = ctx.load_module(Ptx::from_src(FUSED_NORM_GEMM.ptx)).unwrap();
+    let fused_func = fused_module.load_function(FUSED_NORM_GEMM.entry).unwrap();
+    unsafe {
+        stream
+            .launch_builder(&fused_func)
+            .arg(&(inp_p as u64))
+            .arg(&(nw_p as u64))
+            .arg(&eps)
+            .arg(&k)
+            .arg(&(k as u64))
+            .arg(&flat2)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: FUSED_NORM_GEMM.smem_bytes,
+            })
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    // Compare
+    let ref_out = stream.clone_dtoh(&d_ref_out).unwrap();
+    let fused_prod = stream.clone_dtoh(&d_fused_out).unwrap();
+    let fused_cudarc = stream.clone_dtoh(&d_fused_out2).unwrap();
+
+    let mut max_prod_vs_ref = 0.0f32;
+    let mut max_cudarc_vs_ref = 0.0f32;
+    let mut max_prod_vs_cudarc = 0.0f32;
+    for i in 0..(m * n) as usize {
+        let r = ref_out[i].to_f32();
+        let p = fused_prod[i].to_f32();
+        let c = fused_cudarc[i].to_f32();
+        max_prod_vs_ref = max_prod_vs_ref.max((p - r).abs());
+        max_cudarc_vs_ref = max_cudarc_vs_ref.max((c - r).abs());
+        max_prod_vs_cudarc = max_prod_vs_cudarc.max((p - c).abs());
+    }
+
+    println!("  M={m}, N={n}, K={k} (real weights, eps={eps})");
+    println!("  fused(cudarc) vs separate:   {max_cudarc_vs_ref:.2e}");
+    println!("  fused(prod)   vs separate:   {max_prod_vs_ref:.2e}");
+    println!("  fused(prod)   vs fused(cudarc): {max_prod_vs_cudarc:.2e}");
+
+    print!("  separate[0..8]: ");
+    for i in 0..8 {
+        print!("{:.4} ", ref_out[i].to_f32());
+    }
+    println!();
+    print!("  fused_cd[0..8]: ");
+    for i in 0..8 {
+        print!("{:.4} ", fused_cudarc[i].to_f32());
+    }
+    println!();
+    print!("  fused_pr[0..8]: ");
+    for i in 0..8 {
+        print!("{:.4} ", fused_prod[i].to_f32());
+    }
+    println!();
+
+    // Allow some tolerance for bf16 rms_norm differences
+    let tol = 1.0 + (k as f32 / 512.0).ceil();
+    assert!(
+        max_cudarc_vs_ref < tol,
+        "fused(cudarc) vs separate too large: {max_cudarc_vs_ref:.2e}"
+    );
+    assert!(
+        max_prod_vs_ref < tol,
+        "fused(prod) vs separate too large: {max_prod_vs_ref:.2e}"
+    );
+    assert!(
+        max_prod_vs_cudarc < 0.01,
+        "prod vs cudarc disagree: {max_prod_vs_cudarc:.2e}"
+    );
+
+    println!("PASS: fused norm+GEMM matches separate with real weights");
+}

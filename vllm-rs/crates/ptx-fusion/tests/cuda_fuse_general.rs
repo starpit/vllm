@@ -2025,3 +2025,237 @@ fn silu_mul_fused_gemm_gpu() {
     );
     println!("PASS: SiLU+mul fused GEMM matches reference");
 }
+
+// ======================================================================
+// Full MLP pipeline: rms_norm + GEMM_gate_up -> barrier -> SiLU+mul + GEMM_down
+// Two-phase persistent kernel, single launch.
+// ======================================================================
+
+const MLP_PIPELINE_PTX: &str = ptx_fusion::mlp_pipeline_fuse!(
+    "kernels/vllm_rms_norm.ptx",
+    "kernels/vllm_silu_mul.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "mlp_pipeline"
+);
+
+#[test]
+fn mlp_pipeline_ptxas() {
+    println!("=== MLP pipeline: ptxas ===");
+    assert!(MLP_PIPELINE_PTX.contains("Phase 1 persistent loop"));
+    assert!(MLP_PIPELINE_PTX.contains("global barrier"));
+    assert!(MLP_PIPELINE_PTX.contains("Phase 2 persistent loop"));
+    assert!(MLP_PIPELINE_PTX.contains("ferrite_params2"));
+
+    let path = "/tmp/mlp_pipeline.ptx";
+    std::fs::write(path, MLP_PIPELINE_PTX).unwrap();
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stderr.lines().take(20) {
+            println!("  ptxas: {line}");
+        }
+        panic!("ptxas FAILED on MLP pipeline PTX");
+    }
+    println!("PASS: MLP pipeline passes ptxas");
+}
+
+#[test]
+fn mlp_pipeline_gpu() {
+    println!("=== MLP pipeline: GPU correctness ===");
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    // Dimensions: small enough for single tile per phase
+    let m = 64u32;
+    let hidden = 128u32; // K for gate_up, N for down
+    let intermediate = 128u32; // N/2 for gate_up, K for down
+    let gate_up_n = 2 * intermediate; // gate_up output columns
+    let eps = 1e-5f32;
+    let num_blocks = 1u32; // Single CTA for this test
+
+    // Generate test data
+    let h_input: Vec<half::bf16> = (0..(m * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_norm_weight: Vec<half::bf16> = (0..hidden as usize)
+        .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+        .collect();
+    let h_gate_up_weight: Vec<half::bf16> = (0..(gate_up_n * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 + 0.1).cos() * 0.05))
+        .collect();
+    let h_down_weight: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.2).sin() * 0.05))
+        .collect();
+
+    // ── Reference: separate launches ──
+    // Step 1: CPU rms_norm
+    let h_normed = cpu_rms_norm(&h_input, &h_norm_weight, m as usize, hidden as usize, eps);
+    // Step 2: GPU GEMM gate_up
+    let h_gate_up = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_normed,
+        &h_gate_up_weight,
+        m,
+        gate_up_n,
+        hidden,
+    );
+    // Step 3: CPU SiLU+mul
+    let h_activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
+        .map(|idx| {
+            let row = idx / intermediate as usize;
+            let col = idx % intermediate as usize;
+            let gate = h_gate_up[row * gate_up_n as usize + col].to_f32();
+            let up = h_gate_up[row * gate_up_n as usize + intermediate as usize + col].to_f32();
+            half::bf16::from_f32(cpu_silu(gate) * up)
+        })
+        .collect();
+    // Step 4: GPU GEMM down
+    let ref_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_activated,
+        &h_down_weight,
+        m,
+        hidden,
+        intermediate,
+    );
+
+    // ── Fused: single MLP pipeline launch ──
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_norm_weight = stream.clone_htod(&h_norm_weight).unwrap();
+    let d_gate_up_weight = stream.clone_htod(&h_gate_up_weight).unwrap();
+    let d_down_weight = stream.clone_htod(&h_down_weight).unwrap();
+    // Intermediate buffer for gate_up output
+    let d_gate_up_buf: CudaSlice<half::bf16> =
+        stream.alloc_zeros((m * gate_up_n) as usize).unwrap();
+    // Output buffer
+    let d_output: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    // C buffers (unused, beta=0)
+    let d_c1: CudaSlice<half::bf16> = stream.alloc_zeros((m * gate_up_n) as usize).unwrap();
+    let d_c2: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    // Counters + barrier (u32 each, must be zero-initialized)
+    let d_counter1: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+    let d_counter2: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+    let d_barrier: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+
+    let module = ctx.load_module(Ptx::from_src(MLP_PIPELINE_PTX)).unwrap();
+    let func = module.load_function("mlp_pipeline").unwrap();
+
+    let (input_ptr, _) = d_input.device_ptr(&stream);
+    let (norm_weight_ptr, _) = d_norm_weight.device_ptr(&stream);
+    let (gate_up_weight_ptr, _) = d_gate_up_weight.device_ptr(&stream);
+    let (gate_up_buf_ptr, _) = d_gate_up_buf.device_ptr(&stream);
+    let (down_weight_ptr, _) = d_down_weight.device_ptr(&stream);
+    let (output_ptr, _) = d_output.device_ptr(&stream);
+    let (c1_ptr, _) = d_c1.device_ptr(&stream);
+    let (c2_ptr, _) = d_c2.device_ptr(&stream);
+    let (counter1_ptr, _) = d_counter1.device_ptr(&stream);
+    let (counter2_ptr, _) = d_counter2.device_ptr(&stream);
+    let (barrier_ptr, _) = d_barrier.device_ptr(&stream);
+
+    // Phase 1 GEMM params: A=normed_input(computed inline), B=gate_up_weight, D=gate_up_buf
+    // A_ptr is the input (rms_norm reads from it), but the GEMM sees it as A_ptr for address computation
+    let phase1_gemm = build_flat_params(
+        input_ptr as u64, // A_ptr (rms_norm reads from it, GEMM uses for address calc)
+        gate_up_weight_ptr as u64, // B_ptr
+        c1_ptr as u64,    // C_ptr (unused)
+        gate_up_buf_ptr as u64, // D_ptr (output)
+        m,
+        gate_up_n,
+        hidden,
+        hidden,    // lda = K
+        hidden,    // ldb = K
+        gate_up_n, // ldc
+        gate_up_n, // ldd
+        1.0,
+        0.0,
+    );
+
+    // Phase 2 GEMM params: A=gate_up_buf(silu+mul inline), B=down_weight, D=output
+    let phase2_gemm = build_flat_params(
+        gate_up_buf_ptr as u64, // A_ptr (SiLU reads gate from here)
+        down_weight_ptr as u64, // B_ptr
+        c2_ptr as u64,          // C_ptr (unused, beta=0)
+        output_ptr as u64,      // D_ptr
+        m,
+        hidden,       // N_down
+        intermediate, // K_down
+        gate_up_n,    // lda = 2*intermediate (gate_up stride)
+        intermediate, // ldb
+        hidden,       // ldc
+        hidden,       // ldd
+        1.0,
+        0.0,
+    );
+
+    // Phase 1 tile count
+    let (gx1, gy1, _) = compute_grid(m, gate_up_n, 64, 128);
+    let total1 = gx1 * gy1;
+    // Phase 2 tile count
+    let (gx2, gy2, _) = compute_grid(m, hidden, 64, 128);
+    let total2 = gx2 * gy2;
+
+    let intermediate_bytes = (intermediate as u64) * 2; // bf16 byte offset to "up" half
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_blocks, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864,
+    };
+
+    // Param order matches assembled kernel:
+    // Phase 1 extras: input_ptr, norm_weight_ptr, eps, hidden, a_stride
+    // ferrite_params[88]: Phase 1 GEMM
+    // Phase 2 extras: intermediate_bytes
+    // ferrite_params2[88]: Phase 2 GEMM
+    // Persistent: counter1, counter2, barrier, num_blocks, total1, total2
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&(input_ptr as u64))
+            .arg(&(norm_weight_ptr as u64))
+            .arg(&eps)
+            .arg(&hidden)
+            .arg(&(hidden as u64)) // a_stride = K
+            .arg(&phase1_gemm)
+            .arg(&intermediate_bytes)
+            .arg(&phase2_gemm)
+            .arg(&(counter1_ptr as u64))
+            .arg(&(counter2_ptr as u64))
+            .arg(&(barrier_ptr as u64))
+            .arg(&num_blocks)
+            .arg(&total1)
+            .arg(&total2)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    let fused_out = stream.clone_dtoh(&d_output).unwrap();
+
+    // Compare
+    let mut max_diff = 0.0f32;
+    let mut max_idx = 0;
+    for (i, (r, f)) in ref_out.iter().zip(fused_out.iter()).enumerate() {
+        let diff = (r.to_f32() - f.to_f32()).abs();
+        if diff > max_diff {
+            max_diff = diff;
+            max_idx = i;
+        }
+    }
+    println!(
+        "  M={m}, hidden={hidden}, intermediate={intermediate}: max_abs_diff = {max_diff:.2e} at [{max_idx}]"
+    );
+    // Two GEMMs + rms_norm + SiLU in bf16 — expect some rounding
+    assert!(
+        max_diff < 2.0,
+        "MLP pipeline diff too large: {max_diff:.2e}"
+    );
+    println!("PASS: MLP pipeline matches separate launches");
+}

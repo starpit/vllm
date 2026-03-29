@@ -422,24 +422,40 @@ pub unsafe fn launch_fused_norm_gemm(
         actual_beta,
     );
 
-    let prefix = kernel.extra_param_bytes as usize;
-    let total = prefix + 88;
-    let mut params = vec![0u8; total];
-    params[0..8].copy_from_slice(&(input.raw_ptr() as u64).to_le_bytes());
-    params[8..16].copy_from_slice(&(norm_weight.raw_ptr() as u64).to_le_bytes());
-    params[16..20].copy_from_slice(&epsilon.to_le_bytes());
-    params[20..24].copy_from_slice(&hidden.to_le_bytes());
-    params[24..32].copy_from_slice(&(k as u64).to_le_bytes());
-    params[prefix..prefix + 88].copy_from_slice(&flat);
+    // Per-arg launch via kernelParams (not CU_LAUNCH_PARAM_BUFFER).
+    // The kernelParams API lets CUDA handle alignment automatically.
+    let mut rms_input = input.raw_ptr() as u64;
+    let mut rms_weight = norm_weight.raw_ptr() as u64;
+    let mut rms_epsilon = epsilon;
+    let mut rms_hidden = hidden;
+    let mut rms_stride = k as u64;
 
-    launch_kernel_raw(
+    let mut kernel_params: [*mut std::ffi::c_void; 6] = [
+        &mut rms_input as *mut u64 as *mut _,
+        &mut rms_weight as *mut u64 as *mut _,
+        &mut rms_epsilon as *mut f32 as *mut _,
+        &mut rms_hidden as *mut u32 as *mut _,
+        &mut rms_stride as *mut u64 as *mut _,
+        flat.as_ptr() as *mut _,
+    ];
+
+    let result = sys::cuLaunchKernel(
         func,
-        stream,
         grid_x,
         grid_y,
+        1,
         kernel.threads,
+        1,
+        1,
         kernel.smem_bytes,
-        &params,
+        stream,
+        kernel_params.as_mut_ptr(),
+        std::ptr::null_mut(),
+    );
+    assert_eq!(
+        result,
+        sys::cudaError_enum::CUDA_SUCCESS,
+        "ferrite launch_fused_norm_gemm failed: {result:?}"
     );
 
     out

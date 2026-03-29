@@ -25,6 +25,11 @@ extract_entry!(
     "act_and_mul_kernelIXadL_Z4silufEEfE",
     SILU_MUL_F32_PTX
 );
+extract_entry!(
+    "kernels/vllm_rms_norm.ptx",
+    "_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi",
+    RMS_NORM_BF16_PTX
+);
 
 // ── The general fuse! macro ──
 // Fuse rms_norm → silu_mul: rms_norm's param_0 (output) feeds silu_mul's param_1 (gate input).
@@ -2024,4 +2029,215 @@ fn silu_mul_fused_gemm_gpu() {
         "SiLU+mul fused GEMM diff too large: {max_diff:.2e}"
     );
     println!("PASS: SiLU+mul fused GEMM matches reference");
+}
+
+/// Debug: compare fused norm+GEMM (compile!) vs GPU rms_norm + GPU GEMM at model dims.
+/// Uses the REAL vllm rms_norm kernel on GPU (not CPU reference) to isolate
+/// whether the problem is the norm fusion or the GEMM param handoff.
+#[test]
+fn debug_norm_gemm_vs_separate_gpu() {
+    println!("=== DEBUG: fused vs separate (both GPU) at model dims ===");
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    let m = 4u32;
+    let k = 2560u32; // hidden
+    let n = 2560u32;
+    let eps = 1e-5f32;
+
+    // Test data
+    let h_input: Vec<half::bf16> = (0..(m * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_norm_wt: Vec<half::bf16> = (0..k as usize)
+        .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+        .collect();
+    let h_b: Vec<half::bf16> = (0..(n * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+
+    // ── Path A: GPU rms_norm (vllm kernel) then GPU GEMM (flat-param CUTLASS) ──
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_norm_wt = stream.clone_htod(&h_norm_wt).unwrap();
+    let d_b = stream.clone_htod(&h_b).unwrap();
+    let mut d_normed: CudaSlice<half::bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+
+    // Run the real vllm rms_norm kernel
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+    let (inp_p, _) = d_input.device_ptr(&stream);
+    let (nw_p, _) = d_norm_wt.device_ptr(&stream);
+    let (normed_p, _) = d_normed.device_ptr(&stream);
+    unsafe {
+        stream.launch_builder(&rms_func)
+            .arg(&normed_p)     // output
+            .arg(&inp_p)        // input
+            .arg(&nw_p)         // weight
+            .arg(&eps)
+            .arg(&(k as i32))   // hidden_size
+            .launch(LaunchConfig {
+                grid_dim: (m, 1, 1),
+                block_dim: (256.min(k), 1, 1),
+                shared_mem_bytes: 0,
+            })
+    }.unwrap();
+
+    // Dump first 8 normed values
+    stream.synchronize().unwrap();
+    let h_normed_gpu = stream.clone_dtoh(&d_normed).unwrap();
+    print!("  GPU rms_norm first 8: ");
+    for i in 0..8.min(h_normed_gpu.len()) {
+        print!("{:.4} ", h_normed_gpu[i].to_f32());
+    }
+    println!();
+
+    // CPU rms_norm for comparison
+    let h_normed_cpu = cpu_rms_norm(&h_input, &h_norm_wt, m as usize, k as usize, eps);
+    print!("  CPU rms_norm first 8: ");
+    for i in 0..8.min(h_normed_cpu.len()) {
+        print!("{:.4} ", h_normed_cpu[i].to_f32());
+    }
+    println!();
+
+    // Run flat-param GEMM on GPU-normed data
+    let ref_out = run_flat_gemm(
+        &ctx, FLAT_GEMM_BASE_PTX, "flat_gemm_base",
+        &h_normed_gpu, &h_b, m, n, k,
+    );
+
+    // ── Path B: fused norm+GEMM via compile! kernel (per-arg launch) ──
+    let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+
+    let module = ctx.load_module(Ptx::from_src(COMPILED_NORM_GEMM.ptx)).unwrap();
+    let func = module.load_function(COMPILED_NORM_GEMM.entry).unwrap();
+
+    let (bp, _) = d_b.device_ptr(&stream);
+    let (cp, _) = d_c.device_ptr(&stream);
+    let (dp, _) = d_d.device_ptr(&stream);
+
+    let gemm_params = build_flat_params(
+        inp_p as u64, bp as u64, cp as u64, dp as u64,
+        m, n, k, k, k, n, n, 1.0, 0.0,
+    );
+
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+    unsafe {
+        stream.launch_builder(&func)
+            .arg(&(inp_p as u64))
+            .arg(&(nw_p as u64))
+            .arg(&eps)
+            .arg(&k)
+            .arg(&(k as u64))
+            .arg(&gemm_params)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: COMPILED_NORM_GEMM.smem_bytes,
+            })
+    }.unwrap();
+    stream.synchronize().unwrap();
+    let fused_out = stream.clone_dtoh(&d_d).unwrap();
+
+    // Compare
+    let mut max_diff = 0.0f32;
+    let mut worst_i = 0;
+    for (i, (r, f)) in ref_out.iter().zip(fused_out.iter()).enumerate() {
+        let d = (r.to_f32() - f.to_f32()).abs();
+        if d > max_diff { max_diff = d; worst_i = i; }
+    }
+    println!("  separate(GPU norm+GEMM) vs fused: max_diff={max_diff:.2e} at [{worst_i}]");
+    print!("  separate first 8: ");
+    for i in 0..8.min(ref_out.len()) { print!("{:.4} ", ref_out[i].to_f32()); }
+    println!();
+    print!("  fused first 8:    ");
+    for i in 0..8.min(fused_out.len()) { print!("{:.4} ", fused_out[i].to_f32()); }
+    println!();
+
+    let tol = 1.0 + (k as f32 / 512.0).ceil();
+    assert!(max_diff < tol, "fused vs separate GPU diff too large: {max_diff:.2e}");
+    println!("PASS");
+}
+
+/// Test compile! kernel (COMPILED_NORM_GEMM) at model-scale dimensions.
+#[test]
+fn norm_gemm_compile_model_dims() {
+    println!("=== compile! norm+GEMM at model dims ===");
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    for &(m, n, k) in &[
+        (4u32, 2560u32, 2560u32),
+        (1, 2560, 2560),
+        (64, 13824, 2560),
+    ] {
+        let eps = 1e-5f32;
+        let h_input: Vec<half::bf16> = (0..(m * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+            .collect();
+        let h_norm_wt: Vec<half::bf16> = (0..k as usize)
+            .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+            .collect();
+        let h_b: Vec<half::bf16> = (0..(n * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+            .collect();
+
+        let h_normed = cpu_rms_norm(&h_input, &h_norm_wt, m as usize, k as usize, eps);
+        let ref_out = run_flat_gemm(
+            &ctx, FLAT_GEMM_BASE_PTX, "flat_gemm_base",
+            &h_normed, &h_b, m, n, k,
+        );
+
+        let d_input = stream.clone_htod(&h_input).unwrap();
+        let d_norm_wt = stream.clone_htod(&h_norm_wt).unwrap();
+        let d_b = stream.clone_htod(&h_b).unwrap();
+        let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+
+        let module = ctx.load_module(Ptx::from_src(COMPILED_NORM_GEMM.ptx)).unwrap();
+        let func = module.load_function(COMPILED_NORM_GEMM.entry).unwrap();
+
+        let (inp, _) = d_input.device_ptr(&stream);
+        let (nw, _) = d_norm_wt.device_ptr(&stream);
+        let (bp, _) = d_b.device_ptr(&stream);
+        let (cp, _) = d_c.device_ptr(&stream);
+        let (dp, _) = d_d.device_ptr(&stream);
+
+        let gemm_params = build_flat_params(
+            inp as u64, bp as u64, cp as u64, dp as u64,
+            m, n, k, k, k, n, n, 1.0, 0.0,
+        );
+
+        let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+        let cfg = LaunchConfig {
+            grid_dim: (gx, gy, gz),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: COMPILED_NORM_GEMM.smem_bytes,
+        };
+
+        unsafe {
+            stream.launch_builder(&func)
+                .arg(&(inp as u64))
+                .arg(&(nw as u64))
+                .arg(&eps)
+                .arg(&k)
+                .arg(&(k as u64))
+                .arg(&gemm_params)
+                .launch(cfg)
+        }.unwrap();
+        stream.synchronize().unwrap();
+        let fused_out = stream.clone_dtoh(&d_d).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for (r, f) in ref_out.iter().zip(fused_out.iter()) {
+            let d = (r.to_f32() - f.to_f32()).abs();
+            if d > max_diff { max_diff = d; }
+        }
+        let tol = 1.0 + (k as f32 / 512.0).ceil();
+        println!("  M={m}, N={n}, K={k}: max_diff={max_diff:.2e} (tol={tol:.1})");
+        assert!(max_diff < tol, "compile! norm+GEMM failed: {max_diff:.2e}");
+    }
+    println!("PASS: compile! norm+GEMM correct at model dims");
 }

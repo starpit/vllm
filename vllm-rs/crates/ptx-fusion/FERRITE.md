@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **185+ tests** (97 CUDA GPU + 80 unit + doc-ignored), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **200+ tests** (100 CUDA GPU + 99 unit + doc-ignored), all passing.
 
 ### What's Proven
 
@@ -104,6 +104,10 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **185+ tests** (97 CUDA GPU + 80 unit + doc
 | **rms_norm + GEMM intrinsic (GPU)** | cuda_fuse_general | **fuse_rms_norm_gemm_flat: 0.00e0 vs separate norm+GEMM** |
 | **Loop detection + carry analysis** | parser unit tests | **rms_norm: 4 loops, accumulator %f83; CUTLASS: 1 K-loop, MMA accumulators, buffer state** |
 | **Backward tracing** | parser unit tests | **DefUseGraph::trace_backward: BFS through def chains** |
+| **Pipeline stage extraction** | pipeline unit tests | **4 kernels classified: rms_norm=Reduction, CUTLASS=TiledGemm, silu_mul=Pointwise, scale=Pointwise** |
+| **Reduction decomposition** | pipeline unit tests | **rms_norm → accumulate loops + finalize block + emit loops, all from PTX** |
+| **Pipeline compiler (ptxas)** | pipeline_compile unit tests | **fuse_reduction_into_gemm: ptxas valid on fused PTX** |
+| **Pipeline compiler (GPU)** | cuda_fuse_general | **pipeline_fuse! rms_norm→GEMM: 0.00e0 diff, prologue isolation verified** |
 
 ### Benchmarks
 
@@ -216,12 +220,12 @@ it doesn't know what the kernels do. It only sees their escape perimeters.
 | elem → elem (different thread map) | SMEM | st.shared, barrier, ld.shared |
 | GEMM → elem (pointwise) | Epilogue injection | Extract B's computation, inject before bf16 cvt |
 | pointwise → GEMM A-input | Inline at cp.async | Unpack bf16→f32, apply fn, repack, st.shared |
-| rms_norm → GEMM A-input | Intrinsic prologue | Generate reduction from scratch + inline normalize |
+| rms_norm → GEMM A-input | **Pipeline compiler** | Analyze rms_norm PTX → decompose → prologue + per-site normalize |
 
-**Intrinsics** (operations the macro generates from scratch instead of extracting from PTX):
-- `rms_norm`: cooperative sum-of-squares reduction via shfl.sync, adapted to GEMM's
-  thread-to-row mapping. Prologue computes inv_rms, per-element normalizes at each A-load.
-- SiLU, GELU, ReLU: epilogue activations (from fuse_epilogue.rs)
+**Intrinsics** (DEPRECATED — replaced by pipeline compiler):
+- `rms_norm` via `intrinsic_rms_norm.rs`: hand-written reduction. Being replaced by
+  `pipeline_compile.rs` which derives the reduction from the actual rms_norm kernel PTX.
+- SiLU, GELU, ReLU: epilogue activations (from fuse_epilogue.rs) — still active.
 
 **Key files:**
 - `fuse_general.rs`: general fusion engine (all handoff paths)
@@ -297,16 +301,73 @@ GPU-verified: 19/19 tests, all 0.00e0 diff. Includes:
 - GEMM prologue scale*2: 4 sizes, GEMM(A*2,B) = 2*GEMM(A,B) at 0.00e0
 - rms_norm + GEMM intrinsic: 0.00e0 vs separate norm+GEMM
 
-**Phase 4: llama.rs integration** — **NEXT**
+**Phase 5A: Loop detection + carry analysis** (parser.rs) — **DONE**
 
-Wire fused kernels into the forward pass: 11 launches → 6 per layer.
+Parser extended with lightweight control-flow analysis:
+- `detect_loops()`: label-branch pairing, O(N), returns LoopDescriptors with nesting
+- `analyze_carries()`: use-before-def ordering identifies cross-iteration carries
+  (accumulators, induction vars, buffer state, tile pointers, MMA accumulators)
+- `DefUseGraph::trace_backward()`: BFS through def chains (mirror of trace_forward)
+
+Validated on real PTX: rms_norm (4 loops, %f83 = Accumulator), CUTLASS (1 K-loop,
+MMA accumulators, selp buffer rotation, tile pointers).
+
+**Phase 5B: Pipeline stage descriptors** (pipeline.rs) — **DONE**
+
+`PipelineStage::from_ptx()` analyzes kernel PTX and produces a structured descriptor:
+- `StagePattern::Pointwise` — no reduction, no MMA (silu_mul, scale)
+- `StagePattern::Reduction` — loops with accumulators + shfl/SMEM reduce (rms_norm)
+- `StagePattern::TiledGemm` — cp.async + MMA + K-loop (CUTLASS)
+- `ReductionDecomposition` — splits reduction into accumulate/finalize/emit phases
+
+**Phase 5C: Pipeline compiler** (pipeline_compile.rs) — **DONE**
+
+`fuse_reduction_into_gemm()` takes a Reduction stage + TiledGemm stage and produces
+a single fused kernel. The reduction's formula (sum-of-squares → rsqrt) is derived
+from the rms_norm PTX analysis. No hand-written intrinsics.
+
+Architecture:
+1. **Prologue**: 128-thread cooperative reduction over each tile row.
+   Sum-of-squares via fma.rn.f32, warp shuffle, SMEM reduce, rsqrt.
+   inv_rms[row] stored in dedicated SMEM array (separate from warp scratch).
+2. **Per-thread setup**: load inv_rms for both rows (m_rel and m_rel+8).
+   Compute GMEM row base addresses (rb0, rb1) for K-offset extraction.
+3. **Per-site**: `setp.ge.u64` address comparison selects row parity (~1 cycle).
+   Weight loaded from weight_ptr + (gmem_src - row_base). 8 bf16 weights
+   unpacked to f32 per cp.async site.
+4. **Per-element**: `mul inv_rms, mul weight` — 2 instructions per bf16 value.
+
+GPU-verified: **0.00e0 diff** vs separate rms_norm + CUTLASS GEMM.
+`pipeline_fuse!` proc macro: analyze → fuse → perimeter replace, all at compile time.
+
+**Remaining TODOs:**
+
+- **Thread-to-row mapping**: prologue hardcodes PitchLinearWarpRakedThreadMap formula
+  `(tid.x % 32) / 4 + (tid.x / 32) * 16`. Should be extracted from the GEMM PTX by
+  tracing the A-load address chain to find the row computation. Attempted via
+  `classify_row_parity` (trace backward for `add.s32 +8`) but this is config-dependent —
+  the 64x128x32 kernel uses `selp.b32 32` not `add.s32 8`. Need a more robust approach:
+  compare address chains of two known-different-row loads, or extract from the
+  `PitchLinearShape` template parameters in the mangled entry name.
+
+- **tile_m hardcoded to 64**: the prologue `mov.u32 %r_rms_nrows, 64` should be derived
+  from the GEMM tile analysis (e.g., from the loop bound or MMA instruction count).
+
+- **Delete intrinsic_rms_norm.rs**: once the pipeline compiler is wired into llama.rs,
+  the hand-written intrinsic can be removed. Currently both paths coexist.
+
+- **Multi-GEMM pipeline + driver loop**: extend pipeline compiler for the full MLP block
+  `rms_norm → GEMM_gate_up → SiLU → GEMM_down → residual_add`. Requires generated
+  driver loop for GEMM-to-GEMM tile handoff via SMEM.
+
+- **Software pipelining across stages**: overlap loading for stage N+1 with compute
+  for stage N, using the same cp.async infrastructure CUTLASS uses internally.
 
 ### What this replaces
 
-All existing special-purpose macros become thin wrappers around `ferrite::fuse!`.
-The broken Rust GemmParams builder, hardcoded swizzle formula, and hardcoded
-iterator constants are all eliminated — replaced by perimeter analysis of the
-actual PTX.
+The `intrinsic_rms_norm.rs` approach (hand-written PTX with hardcoded CUTLASS thread
+mapping) is replaced by the pipeline compiler which derives everything from PTX analysis.
+The `fuse_rms_norm_gemm_flat!` macro is superseded by `pipeline_fuse!`.
 
 ## How the Escape Analysis Works
 
@@ -362,7 +423,9 @@ crates/ptx-fusion-macros/          Proc macro crate (runs at compile time)
   src/regfuse.rs                   Register-level fusion engine (elementwise)
   src/extract.rs                   Single-entry extraction from multi-entry PTX
   src/fuse_general.rs              General fusion engine: any kernels + bindings, 5 handoff paths
-  src/intrinsic_rms_norm.rs        rms_norm intrinsic: generate reduction + normalize from scratch
+  src/intrinsic_rms_norm.rs        rms_norm intrinsic: generate reduction + normalize from scratch (DEPRECATED — replaced by pipeline)
+  src/pipeline.rs                  Pipeline stage descriptors: PipelineStage::from_ptx(), StagePattern, ReductionDecomposition
+  src/pipeline_compile.rs          Pipeline compiler: fuse_reduction_into_gemm(), prologue generation, per-site row selection
 
 crates/ptx-fusion/                 Library + tests
   src/lib.rs                       KernelProtocol types + re-exports
@@ -394,7 +457,8 @@ crates/ptx-fusion/                 Library + tests
 | `replace_cutlass_a_loads!(...)` | Replace A-matrix cp.async with explicit ld.global+st.shared |
 | `replace_perimeter_macro!(...)` | Rewrite CUTLASS param interface: flat layout, derived fields inlined |
 | **`fuse!(...)`** | **General kernel fusion: any two kernels + binding, kernel-agnostic** |
-| `fuse_rms_norm_gemm_flat!(...)` | rms_norm intrinsic + GEMM: chains prologue fusion + perimeter replacement |
+| `fuse_rms_norm_gemm_flat!(...)` | rms_norm intrinsic + GEMM: chains prologue fusion + perimeter replacement (DEPRECATED) |
+| **`pipeline_fuse!(...)`** | **Pipeline-compiled fusion: analyze 2 kernel PTX files → fused kernel via tiled pipeline model** |
 
 ## What's Next
 
@@ -471,11 +535,11 @@ to near-zero (one graph replay). Without graphs, ~5 us per launch = ~55 us/layer
 
 | # | Ferrite kernel | Replaces | Technique |
 |---|---------------|----------|-----------|
-| 1 | fused_norm_qkv | #1 + #2 | `fuse_rms_norm_gemm_flat!` |
+| 1 | fused_norm_qkv | #1 + #2 | `pipeline_fuse!` |
 | 2 | split_qkv + RoPE + KV write | #3 + #4 + #5 | unchanged (tiny kernels) |
 | 3 | flash_attention | #6 | unchanged (FA2 already optimal) |
 | 4 | O proj + residual | #7 | `beta=1.0` |
-| 5 | fused_norm_gate_up_silu | #8 + #9 + #10 | `fuse_rms_norm_gemm_flat!` + SiLU epilogue |
+| 5 | fused_norm_gate_up_silu | #8 + #9 + #10 | `pipeline_fuse!` + SiLU epilogue |
 | 6 | down proj + residual | #11 | `beta=1.0` |
 
 **Savings analysis:**
@@ -496,16 +560,18 @@ At L4's ~300 GB/s: ~7 us/layer bandwidth savings.
 ### Roadmap
 
 ```
-Phase 0: CUTLASS parity with cuBLAS     ← DONE (benchmarked, dispatch)
-Phase 1: Def-use graph + param classify  ← DONE (parser.rs)
-Phase 2: Perimeter replacement           ← DONE (perimeter.rs, build.rs probe, llama.rs integration)
-Phase 3: General fuse! + GEMM fusion     ← DONE (5 handoff paths, 19/19 GPU tests 0.00e0)
+Phase 0: CUTLASS parity with cuBLAS      ← DONE (benchmarked, dispatch)
+Phase 1: Def-use graph + param classify   ← DONE (parser.rs)
+Phase 2: Perimeter replacement            ← DONE (perimeter.rs, build.rs probe, llama.rs integration)
+Phase 3: General fuse! + GEMM fusion      ← DONE (5 handoff paths, 19/19 GPU tests 0.00e0)
 --- Architecture pivot: pairwise fusion → tiled pipeline model ---
 Phase 5A: Loop detection + carry analysis ← DONE (parser.rs: detect_loops, analyze_carries, trace_backward)
-Phase 5B: Stage descriptors + extraction  ← NEXT (pipeline.rs: PipelineStage::from_ptx)
-Phase 5C: Reduction decomposition         ← extract accumulate/finalize/emit from rms_norm PTX
-Phase 5D: Pipeline compiler MVP           ← pipeline! macro: rms_norm→GEMM derived from PTX
-Phase 5E: Multi-GEMM pipeline + driver    ← full MLP block: norm→GEMM→SiLU→GEMM→residual
+Phase 5B: Stage descriptors + extraction  ← DONE (pipeline.rs: PipelineStage::from_ptx, 4 kernel types)
+Phase 5C: Reduction decomposition         ← DONE (pipeline.rs: accumulate/finalize/emit from rms_norm PTX)
+Phase 5D: Pipeline compiler MVP           ← DONE (pipeline_compile.rs + pipeline_fuse!: rms_norm→GEMM 0.00e0)
+Phase 5E: Wire into llama.rs              ← NEXT (replace fuse_rms_norm_gemm_flat! with pipeline_fuse!)
+Phase 5F: Extract thread-to-row from PTX  ← remove hardcoded PitchLinearWarpRakedThreadMap formula
+Phase 5G: Multi-GEMM pipeline + driver    ← full MLP block: norm→GEMM→SiLU→GEMM→residual
 ```
 
 ### Current performance (no fusion yet)

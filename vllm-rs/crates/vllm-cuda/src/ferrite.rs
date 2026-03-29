@@ -108,11 +108,6 @@ impl FerriteCutlass {
     }
 
     /// D = alpha * A @ B^T + beta * C
-    ///
-    /// A: [M, K] bf16 row-major
-    /// B: [N, K] bf16 row-major (weight — CUTLASS treats as col-major KxN)
-    /// C: [M, N] bf16 row-major (residual, or same as D for in-place)
-    /// D: [M, N] bf16 row-major (output)
     pub unsafe fn gemm(
         &self,
         a: GpuTensor,
@@ -145,7 +140,6 @@ impl FerriteCutlass {
         };
         let actual_beta = if c.is_some() { beta } else { 0.0 };
 
-        // Build flat 88-byte params
         let params = build_flat_params(
             a.raw_ptr() as u64,
             b.raw_ptr() as u64,
@@ -154,10 +148,10 @@ impl FerriteCutlass {
             m,
             n,
             k,
-            k, // lda = K (A is row-major MxK)
-            k, // ldb = K (B is col-major NxK)
-            n, // ldc = N
-            n, // ldd = N
+            k,
+            k,
+            n,
+            n,
             alpha,
             actual_beta,
         );
@@ -180,7 +174,7 @@ impl FerriteCutlass {
         &self,
         a: GpuTensor,
         b: GpuTensor,
-        d: GpuTensor, // both C and D
+        d: GpuTensor,
         alpha: f32,
         beta: f32,
         stream: CUstream,
@@ -202,7 +196,7 @@ impl FerriteCutlass {
         let params = build_flat_params(
             a.raw_ptr() as u64,
             b.raw_ptr() as u64,
-            d.raw_ptr() as u64, // C = D
+            d.raw_ptr() as u64,
             d.raw_ptr() as u64,
             m,
             n,
@@ -284,7 +278,6 @@ unsafe fn load_flat_module(
         bail!("cuModuleGetFunction({entry_name}): {result:?}");
     }
 
-    // Opt-in for large dynamic SMEM (L4 supports up to 99KB)
     if smem_bytes > 48 * 1024 {
         let result = sys::cuFuncSetAttribute(
             func,
@@ -299,7 +292,6 @@ unsafe fn load_flat_module(
     Ok((module, func))
 }
 
-/// GemmIdentityThreadblockSwizzle<4>: SWIZZLE_N=4.
 fn compute_swizzle_log(grid_n: u32) -> u32 {
     const SWIZZLE_N: u32 = 4;
     if SWIZZLE_N >= 8 && grid_n >= 6 {
@@ -322,7 +314,6 @@ unsafe fn launch_kernel(
     smem_bytes: u32,
     params: &[u8; 88],
 ) {
-    // Ensure 8-byte alignment for the param buffer (required by .param .align 8)
     #[repr(align(8))]
     struct AlignedParams([u8; 88]);
     let aligned = AlignedParams(*params);
@@ -358,13 +349,10 @@ unsafe fn launch_kernel(
 
 // ── FeriteKernel launch support ──
 
-/// Wrapper to make CUfunction/CUmodule Send+Sync (they're thread-safe GPU handles).
 struct CudaFunc(CUmodule, CUfunction);
 unsafe impl Send for CudaFunc {}
 unsafe impl Sync for CudaFunc {}
 
-/// Global cache of loaded CUDA modules/functions for compile!'d kernels.
-/// Keyed by entry name. Loaded lazily on first launch.
 static KERNEL_CACHE: Mutex<Option<HashMap<&'static str, CudaFunc>>> = Mutex::new(None);
 
 fn get_or_load_kernel(kernel: &FeriteKernel) -> CUfunction {
@@ -384,19 +372,6 @@ fn get_or_load_kernel(kernel: &FeriteKernel) -> CUfunction {
 }
 
 /// Launch a compile!'d fused norm+GEMM kernel.
-///
-/// `kernel`: the FeriteKernel from compile!
-/// `input`: [M, K] bf16 — un-normalized A-matrix (read by norm prologue + GEMM)
-/// `weight`: [N, K] bf16 — GEMM B-matrix
-/// `norm_weight`: [K] bf16 — RMS norm weight vector
-/// `epsilon`: RMS norm epsilon
-/// `hidden`: hidden dimension (= K)
-/// `c`: optional [M, N] residual for beta accumulation
-/// `alpha`, `beta`: GEMM scalars
-/// `alloc`: tensor allocator
-/// `stream`: CUDA stream
-///
-/// Returns: [M, N] bf16 output tensor
 pub unsafe fn launch_fused_norm_gemm(
     kernel: &FeriteKernel,
     input: GpuTensor,
@@ -431,8 +406,6 @@ pub unsafe fn launch_fused_norm_gemm(
     };
     let actual_beta = if c.is_some() { beta } else { 0.0 };
 
-    // Build param buffer: [extra_prefix | flat_gemm_params]
-    // Extra prefix for rms_norm: weight_ptr(u64), eps(f32), hidden(u32), a_ptr(u64), a_stride(u64)
     let flat = build_flat_params(
         input.raw_ptr() as u64,
         weight.raw_ptr() as u64,
@@ -449,13 +422,6 @@ pub unsafe fn launch_fused_norm_gemm(
         actual_beta,
     );
 
-    // Param layout matches pipeline compiler output:
-    // [0..8]   _ferrite_rms_input   (u64) — input pointer
-    // [8..16]  _ferrite_rms_weight  (u64) — norm weight pointer
-    // [16..20] _ferrite_rms_epsilon (f32) — epsilon
-    // [20..24] _ferrite_rms_hidden  (u32) — hidden dim
-    // [24..32] _ferrite_rms_a_stride(u64) — stride
-    // [32..120] ferrite_params[88]        — flat GEMM params
     let prefix = kernel.extra_param_bytes as usize;
     let total = prefix + 88;
     let mut params = vec![0u8; total];
@@ -463,7 +429,7 @@ pub unsafe fn launch_fused_norm_gemm(
     params[8..16].copy_from_slice(&(norm_weight.raw_ptr() as u64).to_le_bytes());
     params[16..20].copy_from_slice(&epsilon.to_le_bytes());
     params[20..24].copy_from_slice(&hidden.to_le_bytes());
-    params[24..32].copy_from_slice(&(k as u64).to_le_bytes()); // a_stride = K
+    params[24..32].copy_from_slice(&(k as u64).to_le_bytes());
     params[prefix..prefix + 88].copy_from_slice(&flat);
 
     launch_kernel_raw(
@@ -480,19 +446,16 @@ pub unsafe fn launch_fused_norm_gemm(
 }
 
 /// Launch a plain GEMM with compile!'d kernel, accumulating into an existing buffer.
-///
-/// D = alpha * A @ B^T + beta * D (in-place on `d`)
 pub unsafe fn launch_gemm_accumulate(
     kernel: &FeriteKernel,
     a: GpuTensor,
     b: GpuTensor,
-    d: GpuTensor, // both C and D — accumulate in place
+    d: GpuTensor,
     alpha: f32,
     beta: f32,
     stream: CUstream,
 ) {
     let func = get_or_load_kernel(kernel);
-
     let m = a.dim(0) as u32;
     let k = a.dim(1) as u32;
     let n = b.dim(0) as u32;
@@ -507,7 +470,7 @@ pub unsafe fn launch_gemm_accumulate(
     let params = build_flat_params(
         a.raw_ptr() as u64,
         b.raw_ptr() as u64,
-        d.raw_ptr() as u64, // C = D
+        d.raw_ptr() as u64,
         d.raw_ptr() as u64,
         m,
         n,
@@ -542,9 +505,9 @@ unsafe fn launch_kernel_raw(
     params: &[u8],
 ) {
     #[repr(align(8))]
-    struct Aligned([u8; 256]);
-    let mut aligned = Aligned([0u8; 256]);
-    let len = params.len().min(256);
+    struct Aligned([u8; 512]);
+    let mut aligned = Aligned([0u8; 512]);
+    let len = params.len().min(512);
     aligned.0[..len].copy_from_slice(&params[..len]);
 
     let mut param_size = len;
@@ -574,4 +537,138 @@ unsafe fn launch_kernel_raw(
         sys::cudaError_enum::CUDA_SUCCESS,
         "ferrite cuLaunchKernel failed: {result:?}"
     );
+}
+
+// ── MLP pipeline kernel ──
+
+static MLP_PIPELINE_FUNC: Mutex<Option<CudaFunc>> = Mutex::new(None);
+
+fn get_or_load_mlp_pipeline(ptx: &str) -> CUfunction {
+    let mut cache = MLP_PIPELINE_FUNC.lock().unwrap();
+    if let Some(ref cf) = *cache {
+        return cf.1;
+    }
+    let (module, func) = unsafe {
+        load_flat_module(ptx, "ferrite_mlp_pipeline", 36864)
+            .unwrap_or_else(|e| panic!("ferrite: failed to load MLP pipeline: {e}"))
+    };
+    *cache = Some(CudaFunc(module, func));
+    func
+}
+
+/// Launch the fused MLP pipeline (single kernel for the entire MLP block).
+///
+/// Phases: rms_norm -> GEMM_gate_up -> barrier -> SiLU+mul -> GEMM_down
+pub unsafe fn launch_mlp_pipeline(
+    ptx: &str,
+    input: GpuTensor,
+    norm_weight: GpuTensor,
+    epsilon: f32,
+    gate_up_weight: GpuTensor,
+    down_weight: GpuTensor,
+    num_sm: u32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let func = get_or_load_mlp_pipeline(ptx);
+
+    let m = input.dim(0) as u32;
+    let hidden = input.dim(1) as u32;
+    let gate_up_n = gate_up_weight.dim(0) as u32;
+    let intermediate = gate_up_n / 2;
+    let down_n = down_weight.dim(0) as u32;
+    let tile_m = 64u32;
+    let tile_n = 128u32;
+
+    let gate_up_buf = alloc.alloc_tensor(&[m as usize, gate_up_n as usize], input.dtype());
+    let output = alloc.alloc_tensor(&[m as usize, down_n as usize], input.dtype());
+
+    // Zero-init persistent counters + barrier (3 x u32 packed into a u32 tensor)
+    let counters = alloc.alloc_tensor(&[4], crate::dtype::DType::I32);
+    let counters_ptr = counters.as_gpu_tensor().raw_ptr() as u64;
+    let r = sys::cuMemsetD32Async(counters_ptr, 0, 4, stream);
+    assert_eq!(r, sys::cudaError_enum::CUDA_SUCCESS);
+
+    let phase1_gemm = build_flat_params(
+        input.raw_ptr() as u64,
+        gate_up_weight.raw_ptr() as u64,
+        gate_up_buf.as_gpu_tensor().raw_ptr() as u64,
+        gate_up_buf.as_gpu_tensor().raw_ptr() as u64,
+        m,
+        gate_up_n,
+        hidden,
+        hidden,
+        hidden,
+        gate_up_n,
+        gate_up_n,
+        1.0,
+        0.0,
+    );
+    let phase2_gemm = build_flat_params(
+        gate_up_buf.as_gpu_tensor().raw_ptr() as u64,
+        down_weight.raw_ptr() as u64,
+        output.as_gpu_tensor().raw_ptr() as u64,
+        output.as_gpu_tensor().raw_ptr() as u64,
+        m,
+        down_n,
+        intermediate,
+        gate_up_n,
+        intermediate,
+        down_n,
+        down_n,
+        1.0,
+        0.0,
+    );
+
+    let gn1 = gate_up_n.div_ceil(tile_n);
+    let s1 = 1u32 << compute_swizzle_log(gn1);
+    let total1 = m.div_ceil(tile_m) * s1 * gn1.div_ceil(s1);
+    let gn2 = down_n.div_ceil(tile_n);
+    let s2 = 1u32 << compute_swizzle_log(gn2);
+    let total2 = m.div_ceil(tile_m) * s2 * gn2.div_ceil(s2);
+
+    let intermediate_bytes = (intermediate as u64) * 2;
+
+    let mut params = vec![0u8; 300];
+    let mut o = 0usize;
+    macro_rules! p64 {
+        ($v:expr) => {
+            params[o..o + 8].copy_from_slice(&($v as u64).to_le_bytes());
+            o += 8;
+        };
+    }
+    macro_rules! p32 {
+        ($v:expr) => {
+            params[o..o + 4].copy_from_slice(&($v as u32).to_le_bytes());
+            o += 4;
+        };
+    }
+    macro_rules! pf32 {
+        ($v:expr) => {
+            params[o..o + 4].copy_from_slice(&($v as f32).to_le_bytes());
+            o += 4;
+        };
+    }
+
+    p64!(input.raw_ptr());
+    p64!(norm_weight.raw_ptr());
+    pf32!(epsilon);
+    p32!(hidden);
+    p64!(hidden as u64);
+    params[o..o + 88].copy_from_slice(&phase1_gemm);
+    o += 88;
+    p64!(intermediate_bytes);
+    params[o..o + 88].copy_from_slice(&phase2_gemm);
+    o += 88;
+    p64!(counters_ptr); // counter1
+    p64!(counters_ptr + 4); // counter2
+    p64!(counters_ptr + 8); // barrier
+    p32!(num_sm);
+    p32!(total1);
+    p32!(total2);
+
+    launch_kernel_raw(func, stream, num_sm, 1, 128, 36864, &params[..o]);
+    drop(gate_up_buf);
+    drop(counters);
+    output
 }

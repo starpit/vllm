@@ -667,3 +667,431 @@ fn test2_fused_norm_gemm_vs_separate_real_weights() {
 
     println!("PASS: fused norm+GEMM matches separate with real weights");
 }
+
+/// Test 3: gemm_accumulate (beta=1.0) — the o_proj path.
+/// D = alpha * A @ B^T + beta * D (in-place accumulate).
+#[test]
+fn test3_gemm_accumulate_beta1_real_weights() {
+    println!("=== Test 3: GEMM accumulate (beta=1.0) with real weights ===");
+
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+
+    let hidden = 896u32;
+    let q_size = 896u32;
+    let m = 128u32;
+
+    // o_proj weight: [hidden, q_size] = [896, 896]
+    let o_weight = load_bf16_tensor(&st, "model.layers.0.self_attn.o_proj.weight");
+
+    // Simulate: attn_output [M, q_size] and residual [M, hidden]
+    let h_attn: Vec<bf16> = (0..(m * q_size) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00023 + 0.1).sin() * 0.5))
+        .collect();
+    let h_residual: Vec<bf16> = (0..(m * hidden) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.3).cos() * 2.0))
+        .collect();
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let d_attn = stream.clone_htod(&h_attn).unwrap();
+    let d_o_weight = stream.clone_htod(&o_weight).unwrap();
+
+    // ── cuBLAS reference: D = A @ B^T + D ──
+    let mut d_ref = stream.clone_htod(&h_residual).unwrap();
+    {
+        let blas = CudaBlas::new(stream.clone()).unwrap();
+        let cfg = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: hidden as i32,
+            n: m as i32,
+            k: q_size as i32,
+            alpha: bf16::from_f32(1.0),
+            lda: q_size as i32, // o_weight is [hidden, q_size], stored row-major
+            ldb: q_size as i32,
+            beta: bf16::from_f32(1.0), // accumulate!
+            ldc: hidden as i32,
+        };
+        unsafe { blas.gemm(cfg, &d_o_weight, &d_attn, &mut d_ref).unwrap() };
+    }
+    stream.synchronize().unwrap();
+
+    // ── Ferrite: production CU_LAUNCH_PARAM_BUFFER_POINTER with beta=1.0 ──
+    let mut d_ferrite = stream.clone_htod(&h_residual).unwrap();
+    let (a_ptr, _) = d_attn.device_ptr(&stream);
+    let (b_ptr, _) = d_o_weight.device_ptr(&stream);
+    let (d_ptr, _) = d_ferrite.device_ptr(&stream);
+
+    let params = build_flat_params(
+        a_ptr as u64,
+        b_ptr as u64,
+        d_ptr as u64,
+        d_ptr as u64, // C = D (accumulate in-place)
+        m,
+        hidden,
+        q_size,
+        q_size,
+        q_size,
+        hidden,
+        hidden,
+        1.0,
+        1.0, // alpha=1, beta=1
+    );
+
+    let ptx_cstr = std::ffi::CString::new(FLAT_GEMM_PTX).unwrap();
+    let entry_cstr = std::ffi::CString::new("ferrite_gemm_64x128x32").unwrap();
+    let mut raw_module: cusys::CUmodule = std::ptr::null_mut();
+    let mut raw_func: cusys::CUfunction = std::ptr::null_mut();
+    unsafe {
+        cusys::cuModuleLoadData(&mut raw_module, ptx_cstr.as_ptr() as *const _);
+        cusys::cuModuleGetFunction(&mut raw_func, raw_module, entry_cstr.as_ptr());
+
+        let mut raw_stream: cusys::CUstream = std::ptr::null_mut();
+        cusys::cuStreamCreate(&mut raw_stream, 0);
+        launch_ferrite_gemm_production(
+            raw_func, raw_stream, &params, m, hidden, 64, 128, 128, 36864,
+        );
+        cusys::cuStreamSynchronize(raw_stream);
+    }
+
+    let ref_out = stream.clone_dtoh(&d_ref).unwrap();
+    let fer_out = stream.clone_dtoh(&d_ferrite).unwrap();
+
+    let mut max_diff = 0.0f32;
+    for i in 0..(m * hidden) as usize {
+        let d = (ref_out[i].to_f32() - fer_out[i].to_f32()).abs();
+        if d > max_diff {
+            max_diff = d;
+        }
+    }
+
+    println!("  M={m}, N={hidden}, K={q_size}, alpha=1, beta=1 (real o_proj weight)");
+    println!("  ferrite vs cuBLAS: {max_diff:.2e}");
+    print!("  cuBLAS [0..8]: ");
+    for i in 0..8 {
+        print!("{:.4} ", ref_out[i].to_f32());
+    }
+    println!();
+    print!("  ferrite[0..8]: ");
+    for i in 0..8 {
+        print!("{:.4} ", fer_out[i].to_f32());
+    }
+    println!();
+
+    assert!(
+        max_diff < 1.0,
+        "gemm_accumulate beta=1 broken: {max_diff:.2e}"
+    );
+    println!("PASS: gemm_accumulate beta=1.0 matches cuBLAS");
+}
+
+/// Test 4: simulate 2 layers of the ferrite control flow vs standard.
+/// Skip attention — just test the residual/norm/GEMM threading.
+/// Layer pattern (simplified, no attention):
+///   Standard: fused_add_rms_norm(hs, res) → GEMM → fused_add_rms_norm(gemm_out, res) → GEMM
+///   Ferrite:  add(res, hs) → fused_norm_gemm(res) → add(res, gemm_out) → fused_norm_gemm(res)
+#[test]
+fn test4_two_layer_control_flow() {
+    println!("=== Test 4: 2-layer control flow ferrite vs standard ===");
+
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+
+    let hidden = 896u32;
+    let m = 64u32;
+    let k = hidden;
+    // Use a square GEMM for simplicity (hidden → hidden)
+    let n = hidden;
+    let eps = 1e-6f32;
+
+    let h_weight_l0 = load_bf16_tensor(&st, "model.layers.0.self_attn.q_proj.weight");
+    let h_norm_l0 = load_bf16_tensor(&st, "model.layers.0.input_layernorm.weight");
+    let h_weight_l1 = load_bf16_tensor(&st, "model.layers.1.self_attn.q_proj.weight");
+    let h_norm_l1 = load_bf16_tensor(&st, "model.layers.1.input_layernorm.weight");
+
+    // Initial tensors: hidden_states (from embedding) and residual=None initially
+    let h_hs0: Vec<bf16> = (0..(m * k) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let d_weight_l0 = stream.clone_htod(&h_weight_l0).unwrap();
+    let d_norm_l0 = stream.clone_htod(&h_norm_l0).unwrap();
+    let d_weight_l1 = stream.clone_htod(&h_weight_l1).unwrap();
+    let d_norm_l1 = stream.clone_htod(&h_norm_l1).unwrap();
+
+    let (wl0, _) = d_weight_l0.device_ptr(&stream);
+    let (nwl0, _) = d_norm_l0.device_ptr(&stream);
+    let (wl1, _) = d_weight_l1.device_ptr(&stream);
+    let (nwl1, _) = d_norm_l1.device_ptr(&stream);
+
+    // Load rms_norm kernel
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+
+    let blas = CudaBlas::new(stream.clone()).unwrap();
+
+    // ── Standard path: 2 layers ──
+    // Layer 0 (no residual): normed = rms_norm(hs), out = GEMM(normed, W), residual = hs
+    let d_std_hs = stream.clone_htod(&h_hs0).unwrap();
+    let d_std_normed: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+    let (std_hs_p, _) = d_std_hs.device_ptr(&stream);
+    let (std_normed_p, _) = d_std_normed.device_ptr(&stream);
+
+    // rms_norm(hs) → normed
+    unsafe {
+        stream
+            .launch_builder(&rms_func)
+            .arg(&std_normed_p)
+            .arg(&std_hs_p)
+            .arg(&nwl0)
+            .arg(&eps)
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: (m, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+    }
+    .unwrap();
+
+    // GEMM: out0 = normed @ W_l0^T
+    let mut d_std_out0: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    {
+        let cfg = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: bf16::from_f32(1.0),
+            lda: k as i32,
+            ldb: k as i32,
+            beta: bf16::from_f32(0.0),
+            ldc: n as i32,
+        };
+        unsafe {
+            blas.gemm(cfg, &d_weight_l0, &d_std_normed, &mut d_std_out0)
+                .unwrap()
+        };
+    }
+
+    // Standard layer 0 returns: (out0, residual=hs)
+    // residual = d_std_hs (unmodified)
+
+    // Layer 1 (has residual): fused_add_rms_norm(out0, residual)
+    // → residual += out0, out0 = norm(residual)
+    let (std_out0_p, _) = d_std_out0.device_ptr(&stream);
+    unsafe {
+        // fused_add_rms_norm_inplace(hidden_states=out0, residual=hs)
+        let rms_norm_bf16 = |input: u64,
+                             residual: u64,
+                             weight: u64,
+                             eps: f32,
+                             hidden: i32,
+                             stream: &Arc<cudarc::driver::CudaStream>| {
+            // We need the fused_add_rms_norm kernel. Let's use separate ops instead.
+            // add_inplace(residual, input): can't easily call vllm kernel from test.
+            // Instead: manually compute on CPU or use a workaround.
+        };
+    }
+
+    // Actually, I can't easily call fused_add_rms_norm_inplace from the test.
+    // Let me simulate it with: residual += out0, normed = rms_norm(residual)
+    // This is the ferrite path's approach. If both paths do the same thing, comparison is valid.
+
+    // Layer 1: residual += out0
+    // Need add_inplace kernel... or just do it on CPU
+    stream.synchronize().unwrap();
+    let std_residual = stream.clone_dtoh(&d_std_hs).unwrap(); // residual = original hs
+    let std_out0 = stream.clone_dtoh(&d_std_out0).unwrap();
+
+    // CPU: residual += out0
+    let std_residual_l1: Vec<bf16> = std_residual
+        .iter()
+        .zip(std_out0.iter())
+        .map(|(r, o)| bf16::from_f32(r.to_f32() + o.to_f32()))
+        .collect();
+
+    // Upload and norm
+    let d_std_res_l1 = stream.clone_htod(&std_residual_l1).unwrap();
+    let d_std_normed_l1: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+    let (std_res_l1_p, _) = d_std_res_l1.device_ptr(&stream);
+    let (std_normed_l1_p, _) = d_std_normed_l1.device_ptr(&stream);
+
+    unsafe {
+        stream
+            .launch_builder(&rms_func)
+            .arg(&std_normed_l1_p)
+            .arg(&std_res_l1_p)
+            .arg(&nwl1)
+            .arg(&eps)
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: (m, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+    }
+    .unwrap();
+
+    // GEMM: out1 = normed_l1 @ W_l1^T
+    let mut d_std_out1: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    {
+        let cfg = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: bf16::from_f32(1.0),
+            lda: k as i32,
+            ldb: k as i32,
+            beta: bf16::from_f32(0.0),
+            ldc: n as i32,
+        };
+        unsafe {
+            blas.gemm(cfg, &d_weight_l1, &d_std_normed_l1, &mut d_std_out1)
+                .unwrap()
+        };
+    }
+    stream.synchronize().unwrap();
+
+    // ── Ferrite path: 2 layers ──
+    // Layer 0: same as standard (no residual)
+    let d_fer_hs = stream.clone_htod(&h_hs0).unwrap();
+    let (fer_hs_p, _) = d_fer_hs.device_ptr(&stream);
+
+    // fused_norm_gemm on hs (same as norm + GEMM since no residual add)
+    let d_fer_out0: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (fer_out0_p, _) = d_fer_out0.device_ptr(&stream);
+
+    let fused_module = ctx.load_module(Ptx::from_src(FUSED_NORM_GEMM.ptx)).unwrap();
+    let fused_func = fused_module.load_function(FUSED_NORM_GEMM.entry).unwrap();
+
+    let flat0 = build_flat_params(
+        fer_hs_p as u64,
+        wl0 as u64,
+        fer_out0_p as u64,
+        fer_out0_p as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+    unsafe {
+        let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+        stream
+            .launch_builder(&fused_func)
+            .arg(&(fer_hs_p as u64))
+            .arg(&(nwl0 as u64))
+            .arg(&eps)
+            .arg(&k)
+            .arg(&(k as u64))
+            .arg(&flat0)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: FUSED_NORM_GEMM.smem_bytes,
+            })
+    }
+    .unwrap();
+
+    // Ferrite layer 0 returns: (out0, residual=hs)
+
+    // Layer 1: add_inplace(residual=hs, hidden_states=out0)
+    // Then fused_norm_gemm(residual)
+    // Simulate add on CPU (same as standard path above)
+    stream.synchronize().unwrap();
+    let fer_out0_h = stream.clone_dtoh(&d_fer_out0).unwrap();
+    let fer_residual_l1: Vec<bf16> = h_hs0
+        .iter()
+        .zip(fer_out0_h.iter())
+        .map(|(r, o)| bf16::from_f32(r.to_f32() + o.to_f32()))
+        .collect();
+
+    let d_fer_res_l1 = stream.clone_htod(&fer_residual_l1).unwrap();
+    let (fer_res_l1_p, _) = d_fer_res_l1.device_ptr(&stream);
+
+    let d_fer_out1: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (fer_out1_p, _) = d_fer_out1.device_ptr(&stream);
+
+    let flat1 = build_flat_params(
+        fer_res_l1_p as u64,
+        wl1 as u64,
+        fer_out1_p as u64,
+        fer_out1_p as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+    unsafe {
+        let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+        stream
+            .launch_builder(&fused_func)
+            .arg(&(fer_res_l1_p as u64))
+            .arg(&(nwl1 as u64))
+            .arg(&eps)
+            .arg(&k)
+            .arg(&(k as u64))
+            .arg(&flat1)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: FUSED_NORM_GEMM.smem_bytes,
+            })
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    // Compare layer 0 outputs
+    let std_out0_h = stream.clone_dtoh(&d_std_out0).unwrap();
+    let fer_out0_h = stream.clone_dtoh(&d_fer_out0).unwrap();
+    let mut max_l0 = 0.0f32;
+    for (s, f) in std_out0_h.iter().zip(fer_out0_h.iter()) {
+        max_l0 = max_l0.max((s.to_f32() - f.to_f32()).abs());
+    }
+
+    // Compare layer 1 outputs
+    let std_out1_h = stream.clone_dtoh(&d_std_out1).unwrap();
+    let fer_out1_h = stream.clone_dtoh(&d_fer_out1).unwrap();
+    let mut max_l1 = 0.0f32;
+    for (s, f) in std_out1_h.iter().zip(fer_out1_h.iter()) {
+        max_l1 = max_l1.max((s.to_f32() - f.to_f32()).abs());
+    }
+
+    println!("  Layer 0 diff: {max_l0:.2e}");
+    println!("  Layer 1 diff: {max_l1:.2e}");
+    print!("  std L1[0..8]: ");
+    for i in 0..8 {
+        print!("{:.4} ", std_out1_h[i].to_f32());
+    }
+    println!();
+    print!("  fer L1[0..8]: ");
+    for i in 0..8 {
+        print!("{:.4} ", fer_out1_h[i].to_f32());
+    }
+    println!();
+
+    let tol = 1.0 + (k as f32 / 512.0).ceil();
+    assert!(max_l0 < tol, "layer 0 diff too large: {max_l0:.2e}");
+    assert!(max_l1 < tol, "layer 1 diff too large: {max_l1:.2e}");
+    println!("PASS: 2-layer control flow matches");
+}

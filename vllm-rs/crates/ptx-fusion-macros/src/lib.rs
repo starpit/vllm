@@ -10,7 +10,6 @@ pub(crate) mod fuse_cp_async;
 pub(crate) mod fuse_epilogue;
 pub(crate) mod fuse_general;
 pub(crate) mod fuse_real;
-pub(crate) mod intrinsic_rms_norm;
 mod parser;
 pub(crate) mod perimeter;
 pub(crate) mod persistent;
@@ -1297,58 +1296,48 @@ pub fn fuse(input: TokenStream) -> TokenStream {
         .find(|(n, _)| *n == binding.consumer)
         .unwrap_or_else(|| panic!("fuse!: no kernel named '{}'", binding.consumer));
 
-    // Dispatch based on whether either kernel is an intrinsic
+    // Dispatch based on PTX analysis of both kernels
     let fused_ptx = if producer.1.starts_with("intrinsic:") {
-        // Intrinsic producer → GEMM consumer (prologue injection)
+        // Legacy intrinsic syntax: resolve to PTX file and use pipeline compiler
         let intrinsic_name = &producer.1["intrinsic:".len()..];
+        let ptx_filename = match intrinsic_name {
+            "rms_norm" => "vllm_rms_norm.ptx",
+            other => panic!("fuse!: unknown intrinsic '{other}'"),
+        };
+        let ptx_path = PathBuf::from(&manifest_dir)
+            .join("kernels")
+            .join(ptx_filename);
+        let producer_ptx = std::fs::read_to_string(&ptx_path)
+            .unwrap_or_else(|e| panic!("fuse!: failed to read {}: {e}", ptx_path.display()));
         let gemm_ptx = &consumer.1;
 
-        // Read perimeter JSON if provided (needed for tile_m and flat-param replacement)
-        let json_source = parsed.perimeter.as_ref().map(|p| {
-            let json_path = PathBuf::from(&manifest_dir).join(p);
-            std::fs::read_to_string(&json_path)
-                .unwrap_or_else(|e| panic!("fuse!: failed to read {}: {e}", json_path.display()))
-        });
+        // Pipeline analysis
+        let producer_stage = pipeline::PipelineStage::from_ptx("producer", &producer_ptx)
+            .unwrap_or_else(|e| panic!("fuse!: producer PTX analysis failed: {e}"));
+        let consumer_stage = pipeline::PipelineStage::from_ptx("consumer", gemm_ptx)
+            .unwrap_or_else(|e| panic!("fuse!: consumer PTX analysis failed: {e}"));
 
-        // Get tile dims from derivations (if available) or from PTX kernel name
-        let (tile_m, tile_n) = if let Some(ref json) = json_source {
-            let probe = perimeter::parse_derivations(json)
-                .unwrap_or_else(|e| panic!("fuse!: failed to parse derivations: {e}"));
-            (probe.tile.0 as usize, probe.tile.1 as usize)
-        } else {
-            // Try to extract from CUTLASS kernel name
-            let tm = extract_tile_m_from_ptx(gemm_ptx).unwrap_or_else(|e| panic!("fuse!: {e}"));
-            let tn = extract_tile_n_from_ptx(gemm_ptx).unwrap_or_else(|e| panic!("fuse!: {e}"));
-            (tm, tn)
-        };
-
-        // Build the intrinsic computation
-        let computation = match intrinsic_name {
-            "rms_norm" => {
-                intrinsic_rms_norm::rms_norm_computation(tile_m, tile_n, &parsed.fused_name)
-            }
-            other => panic!("fuse!: unknown intrinsic '{other}' (available: rms_norm)"),
-        };
-
-        // Inject into GEMM prologue
-        let after_fusion = fuse_general::replace_a_loads_with_inline_fn(
-            gemm_ptx,
-            &binding.consumer_port,
-            &computation,
+        let fused = pipeline_compile::fuse_reduction_into_gemm(
+            &producer_stage,
+            &consumer_stage,
+            &parsed.fused_name,
         )
-        .unwrap_or_else(|e| panic!("fuse!: intrinsic prologue injection failed: {e}"));
+        .unwrap_or_else(|e| panic!("fuse!: pipeline fusion failed: {e}"));
 
         // Apply perimeter replacement if derivations JSON provided
-        if let Some(ref json) = json_source {
+        if let Some(ref json_path) = parsed.perimeter {
+            let json_full = PathBuf::from(&manifest_dir).join(json_path);
+            let json_source = std::fs::read_to_string(&json_full)
+                .unwrap_or_else(|e| panic!("fuse!: failed to read {}: {e}", json_full.display()));
             let (rewritten, _) =
-                perimeter::replace_perimeter(&after_fusion, json, &parsed.fused_name)
+                perimeter::replace_perimeter(&fused, &json_source, &parsed.fused_name)
                     .unwrap_or_else(|e| panic!("fuse!: perimeter replacement failed: {e}"));
-            rewritten
+            dedup_reg_declarations(&rewritten)
         } else {
-            after_fusion
+            fused
         }
     } else if consumer.1.starts_with("intrinsic:") {
-        panic!("fuse!: intrinsic as consumer not yet supported (intrinsics are producers)");
+        panic!("fuse!: intrinsic as consumer not yet supported");
     } else {
         // Both are PTX files — use general pairwise fusion
         let result = fuse_general::fuse_two(
@@ -1675,37 +1664,6 @@ pub fn compile(input: TokenStream) -> TokenStream {
         } else {
             fused
         }
-    } else if producer.1.source.starts_with("intrinsic:") {
-        // Legacy intrinsic path (to be removed)
-        let intrinsic_name = &producer.1.source["intrinsic:".len()..];
-        let gemm_ptx = &consumer.1.ptx_content;
-        let tile_m = consumer.1.tile_m;
-        let tile_n = consumer.1.tile_n;
-
-        let computation = match intrinsic_name {
-            "rms_norm" => intrinsic_rms_norm::rms_norm_computation(
-                tile_m as usize,
-                tile_n as usize,
-                &parsed.fused_name,
-            ),
-            other => panic!("compile!: unknown intrinsic '{other}'"),
-        };
-
-        let after_fusion = fuse_general::replace_a_loads_with_inline_fn(
-            gemm_ptx,
-            &binding.consumer_port,
-            &computation,
-        )
-        .unwrap_or_else(|e| panic!("compile!: intrinsic fusion failed: {e}"));
-
-        if let Some(ref json) = consumer.1.derivations_content {
-            let (rewritten, _) =
-                perimeter::replace_perimeter(&after_fusion, json, &parsed.fused_name)
-                    .unwrap_or_else(|e| panic!("compile!: perimeter replacement failed: {e}"));
-            rewritten
-        } else {
-            after_fusion
-        }
     } else {
         panic!("compile!: at least one kernel must have PTX content");
     };
@@ -1805,29 +1763,29 @@ fn parse_compile_args(
             if key == "name" {
                 fused_name = val.trim_matches('"').to_string();
             } else if val.starts_with("intrinsic(") || val.starts_with("intrinsic (") {
-                // intrinsic(rms_norm)
+                // Legacy syntax: intrinsic(rms_norm) → resolve to manifest kernel
                 let paren_start = val.find('(').unwrap();
                 let paren_end = val.rfind(')').ok_or("intrinsic: missing ')'")?;
-                let intrinsic_name = val[paren_start + 1..paren_end].trim();
+                let kernel_name = val[paren_start + 1..paren_end].trim();
 
-                // rms_norm adds 5 params: weight(u64), eps(f32), hidden(u32), a_ptr(u64), a_stride(u64)
-                // = 8 + 4 + 4 + 8 + 8 = 32 bytes
-                let extra_bytes = match intrinsic_name {
-                    "rms_norm" => 40u32, // 8+4+4+8+8+4 = 36, padded to 40 for align 8
-                    _ => 0,
-                };
-                extra_param_bytes += extra_bytes;
+                let mk = manifest.kernels.get(kernel_name).ok_or_else(|| {
+                    format!("compile!: intrinsic '{kernel_name}' not in ferrite.toml as a kernel")
+                })?;
+
+                let ptx_path = kernel_dir.join(&mk.ptx_path);
+                let ptx_content = std::fs::read_to_string(&ptx_path)
+                    .map_err(|e| format!("compile!: failed to read {}: {e}", ptx_path.display()))?;
 
                 kernels.push((
                     key.to_string(),
                     ResolvedKernel {
-                        source: format!("intrinsic:{intrinsic_name}"),
-                        ptx_content: String::new(),
+                        source: format!("manifest:{kernel_name}"),
+                        ptx_content,
                         derivations_content: None,
-                        tile_m: 0,
-                        tile_n: 0,
-                        threads: 0,
-                        smem_bytes: 0,
+                        tile_m: mk.tile.0,
+                        tile_n: mk.tile.1,
+                        threads: mk.threads,
+                        smem_bytes: mk.smem,
                     },
                 ));
             } else {
@@ -1938,61 +1896,6 @@ pub fn prologue_identity_flat(input: TokenStream) -> TokenStream {
     // Step 2: Apply perimeter replacement (flat-param) on the prologue result
     let (rewritten, _) = perimeter::replace_perimeter(&after_prologue, &json_source, &entry_name)
         .unwrap_or_else(|e| panic!("perimeter replacement after prologue failed: {e}"));
-
-    let const_name = syn::Ident::new(&const_name_str, proc_macro2::Span::call_site());
-    let rewritten_str = rewritten.as_str();
-    let output = quote! {
-        const #const_name: &str = #rewritten_str;
-    };
-    output.into()
-}
-
-/// Apply rms_norm intrinsic prologue then flat-param perimeter replacement.
-/// Produces a flat-param kernel with rms_norm fused into the GEMM's A-load path.
-///
-/// Extra params: _ferrite_rms_weight (u64), _ferrite_rms_epsilon (f32),
-/// _ferrite_rms_hidden (u32) — prepended before the flat ferrite_params[88].
-///
-/// ```rust,ignore
-/// fuse_rms_norm_gemm_flat!(
-///     "kernels/cutlass.ptx",
-///     "kernels/cutlass.derivations.json",
-///     "fused_norm_gemm",
-///     CONST_NAME
-/// );
-/// ```
-#[proc_macro]
-pub fn fuse_rms_norm_gemm_flat(input: TokenStream) -> TokenStream {
-    let input_str = input.to_string();
-    let (ptx_path, json_path, entry_name, const_name_str) = parse_perimeter_args(&input_str)
-        .expect("fuse_rms_norm_gemm_flat! expects (\"ptx\", \"json\", \"entry\", CONST_NAME)");
-
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let ptx_full = PathBuf::from(&manifest_dir).join(&ptx_path);
-    let json_full = PathBuf::from(&manifest_dir).join(&json_path);
-
-    let ptx_source = std::fs::read_to_string(&ptx_full)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_full.display()));
-    let json_source = std::fs::read_to_string(&json_full)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", json_full.display()));
-
-    // Extract tile_m from derivations JSON
-    let probe = perimeter::parse_derivations(&json_source)
-        .unwrap_or_else(|e| panic!("failed to parse derivations: {e}"));
-    let tile_m = probe.tile.0 as usize;
-    let tile_n = probe.tile.1 as usize;
-
-    // Step 1: Build rms_norm computation (first-class intrinsic — no hardcoded registers)
-    let computation = intrinsic_rms_norm::rms_norm_computation(tile_m, tile_n, &entry_name);
-
-    // Step 2: Inject rms_norm into GEMM via replace_a_loads_with_inline_fn
-    let after_rms =
-        fuse_general::replace_a_loads_with_inline_fn(&ptx_source, "param_0", &computation)
-            .unwrap_or_else(|e| panic!("rms_norm prologue injection failed: {e}"));
-
-    // Step 3: Apply perimeter replacement (flat params) on the result
-    let (rewritten, _) = perimeter::replace_perimeter(&after_rms, &json_source, &entry_name)
-        .unwrap_or_else(|e| panic!("perimeter replacement after rms_norm failed: {e}"));
 
     let const_name = syn::Ident::new(&const_name_str, proc_macro2::Span::call_site());
     let rewritten_str = rewritten.as_str();
@@ -2240,7 +2143,7 @@ pub fn pipeline_fuse(input: TokenStream) -> TokenStream {
 /// Remove duplicate `.reg` and `.shared` declaration lines from the kernel's
 /// register declaration block. Only dedup lines BEFORE the first non-declaration
 /// line (to avoid removing inline asm `.reg .pred p;` inside epilogue blocks).
-fn dedup_reg_declarations(ptx: &str) -> String {
+pub(crate) fn dedup_reg_declarations(ptx: &str) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     let mut past_decl_block = false;

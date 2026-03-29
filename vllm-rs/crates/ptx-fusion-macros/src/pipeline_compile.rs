@@ -15,18 +15,30 @@ use crate::fuse_general::{PointwiseComputation, replace_a_loads_with_inline_fn};
 use crate::parser::DefUseGraph;
 use crate::pipeline::{PipelineStage, ReductionDecomposition, StagePattern};
 
-/// Extract the GEMM tile_m dimension from a CUTLASS mangled entry name.
+/// Extract the GEMM tile dimensions from a CUTLASS mangled entry name.
 ///
-/// Parses the `GemmShapeILi{M}ELi{N}ELi{K}E` template parameter from the
-/// mangled C++ symbol. Returns the first integer (M = tile_m).
-fn extract_tile_m_from_entry(name: &str) -> Option<u32> {
-    // Find "GemmShapeILi" followed by the M dimension integer
+/// Parses `GemmShapeILi{M}ELi{N}ELi{K}E` → (M, N, K).
+fn extract_gemm_shape_from_entry(name: &str) -> Option<(u32, u32, u32)> {
     let marker = "GemmShapeILi";
     let idx = name.find(marker)?;
     let rest = &name[idx + marker.len()..];
-    // rest starts with "{M}ELi{N}ELi{K}E..."
-    let end = rest.find('E')?;
-    rest[..end].parse::<u32>().ok()
+    // rest = "{M}ELi{N}ELi{K}E..."
+    let mut dims = Vec::new();
+    let mut cur = rest;
+    for _ in 0..3 {
+        let end = cur.find('E')?;
+        dims.push(cur[..end].parse::<u32>().ok()?);
+        cur = &cur[end + 1..]; // skip 'E'
+        if cur.starts_with("Li") {
+            cur = &cur[2..]; // skip 'Li'
+        }
+    }
+    Some((dims[0], dims[1], dims[2]))
+}
+
+/// Extract just tile_m for backward compatibility.
+fn extract_tile_m_from_entry(name: &str) -> Option<u32> {
+    extract_gemm_shape_from_entry(name).map(|(m, _, _)| m)
 }
 
 /// Thread-to-row mapping parameters extracted from GEMM PTX.
@@ -247,7 +259,7 @@ fn build_reduction_computation(
         ".reg .f32 %f_rms_eps, %f_rms_hdnf;".into(),
         ".reg .f32 %f_rms_t0, %f_rms_t1;".into(),
         ".reg .b32 %r_rms_k, %r_rms_hdn, %r_rms_step;".into(),
-        ".reg .b32 %r_rms_row, %r_rms_nrows;".into(),
+        ".reg .b32 %r_rms_row, %r_rms_nrows, %r_rms_mtile;".into(),
         ".reg .b64 %rd_rms_in, %rd_rms_wt, %rd_rms_str;".into(),
         ".reg .b64 %rd_rms_rowbase, %rd_rms_cur;".into(),
         ".reg .b64 %rd_rms_rb0, %rd_rms_rb1;".into(), // GMEM row base addresses for parity select
@@ -293,15 +305,31 @@ fn build_reduction_computation(
         );
     }
 
-    // Extract tile_m from the GEMM's mangled entry name (GemmShapeILi{M}E...)
-    let tile_m = extract_tile_m_from_entry(&_gemm.protocol.name).ok_or_else(|| {
-        format!(
-            "could not extract tile_m from GEMM entry name: {}",
-            _gemm.protocol.name
-        )
-    })?;
+    // Extract tile dimensions from the GEMM's mangled entry name
+    let (tile_m, tile_n, _tile_k) = extract_gemm_shape_from_entry(&_gemm.protocol.name)
+        .ok_or_else(|| {
+            format!(
+                "could not extract GemmShape from GEMM entry name: {}",
+                _gemm.protocol.name
+            )
+        })?;
 
-    let prologue = build_prologue_from_decomposition(decomp, thread_map.as_ref(), tile_m);
+    // Extract the GEMM's struct param name (for reading N from params)
+    let gemm_struct_param = _gemm
+        .protocol
+        .params
+        .iter()
+        .find(|p| p.ptx_type.contains(".b8"))
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "ferrite_params".to_string());
+
+    let prologue = build_prologue_from_decomposition(
+        decomp,
+        thread_map.as_ref(),
+        tile_m,
+        tile_n,
+        &gemm_struct_param,
+    );
 
     // ── Per-site code ──
     // Row selection: the prologue pre-loads inv_rms for both rows into
@@ -376,6 +404,8 @@ fn build_prologue_from_decomposition(
     decomp: &ReductionDecomposition,
     thread_map: Option<&ThreadRowMap>,
     tile_m: u32,
+    tile_n: u32,
+    _gemm_struct_param: &str,
 ) -> Vec<String> {
     // Use extracted constants or defaults
     let lane_shr = thread_map.map_or(2, |tm| tm.lanes_per_row_log2);
@@ -405,28 +435,39 @@ fn build_prologue_from_decomposition(
     let mut prologue = Vec::new();
     prologue.push("// FERRITE: rms_norm prologue (extracted from PTX analysis)".into());
 
-    // Determine tile_m from SMEM array size (we allocated 128 entries max)
-    // The actual number of rows per tile comes from the GEMM's M tile dim.
-    // For the MVP, we read the row count from a computed value.
-    // We use _ferrite_rms_a_stride as stride and compute row count from
-    // the GEMM's M-tile dimension. For now, hardcode tile_m as a parameter
-    // that the pipeline! macro computes from the GEMM PTX analysis.
-    //
-    // Actually, a simpler approach: the GEMM's A-loads tell us which rows
-    // this CTA handles. The number of distinct rows per CTA = tile_m.
-    // We'll compute this at compile time from the stage descriptor.
-    //
-    // For the MVP, compute row coverage from ctaid.x and tile_m param.
-    // The pipeline! macro passes tile_m as a compile-time constant.
+    // Unswizzle ctaid.x to get the M-tile index.
+    // CUTLASS ThreadblockSwizzle<4> maps grid as:
+    //   grid_x = grid_m * (1 << swizzle_log), grid_y = ceil(grid_n / (1 << swizzle_log))
+    //   m_tile = ctaid.x >> swizzle_log
+    // Read N from flat GEMM params to compute swizzle_log at runtime.
+    // (After perimeter replacement, ferrite_params[68] = N.)
+    let tile_n_shift = tile_n.trailing_zeros();
+    prologue.push("// Compute swizzle_log from N (ThreadblockSwizzle<4>)".into());
+    prologue.push("ld.param.s32 \t%r_rms_step, [ferrite_params+68];".into()); // N
+    prologue.push(format!(
+        "add.s32 \t%r_rms_step, %r_rms_step, {};",
+        tile_n - 1
+    ));
+    prologue.push(format!(
+        "shr.u32 \t%r_rms_step, %r_rms_step, {tile_n_shift};"
+    )); // grid_n = ceil(N/tile_n)
+    // swizzle_log: 0 if grid_n<2, 1 if grid_n<3, 2 if grid_n>=3
+    prologue.push("mov.u32 \t%r_rms_nrows, 0;".into()); // reuse as swizzle_log temp
+    prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_step, 2;".into());
+    prologue.push("@%p_rms_lp mov.u32 \t%r_rms_nrows, 1;".into());
+    prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_step, 3;".into());
+    prologue.push("@%p_rms_lp mov.u32 \t%r_rms_nrows, 2;".into());
+    // m_tile = ctaid.x >> swizzle_log (saved for reuse across row loop iterations)
+    prologue.push("mov.u32 \t%r_rms_mtile, %ctaid.x;".into());
+    prologue.push("shr.u32 \t%r_rms_mtile, %r_rms_mtile, %r_rms_nrows;".into());
 
     // Row loop: for each row in this CTA's tile
     prologue.push(format!("mov.u32 \t%r_rms_nrows, {tile_m};"));
     prologue.push("mov.u32 \t%r_rms_row, 0;".into());
     prologue.push("$L_rms_row_loop:".into());
 
-    // Compute row base address: input + (ctaid.x * tile_m + row) * stride * 2
-    prologue.push("mov.u32 \t%r_rms_step, %ctaid.x;".into());
-    prologue.push("mul.lo.s32 \t%r_rms_step, %r_rms_step, %r_rms_nrows;".into());
+    // Compute row base address: input + (m_tile * tile_m + row) * stride * 2
+    prologue.push("mul.lo.s32 \t%r_rms_step, %r_rms_mtile, %r_rms_nrows;".into());
     prologue.push("add.u32 \t%r_rms_step, %r_rms_step, %r_rms_row;".into());
     prologue.push("cvt.s64.s32 \t%rd_rms_rowbase, %r_rms_step;".into());
     prologue.push("mul.lo.s64 \t%rd_rms_rowbase, %rd_rms_rowbase, %rd_rms_str;".into());
@@ -543,9 +584,8 @@ fn build_prologue_from_decomposition(
     )); // +row_stride rows * 4 bytes
 
     // Compute GMEM row base addresses for both rows (for K-offset extraction in per-site)
-    // rb0 = input_ptr + (ctaid.x * tile_m + m_rel) * stride * 2
-    prologue.push("mov.u32 \t%r_rms_step, %ctaid.x;".into());
-    prologue.push("mul.lo.s32 \t%r_rms_step, %r_rms_step, %r_rms_nrows;".into());
+    // rb0 = input_ptr + (m_tile * tile_m + m_rel) * stride * 2
+    prologue.push("mul.lo.s32 \t%r_rms_step, %r_rms_mtile, %r_rms_nrows;".into());
     prologue.push("add.u32 \t%r_rms_step, %r_rms_step, %r_rms_row;".into()); // abs row 0
     prologue.push("cvt.s64.s32 \t%rd_rms_rb0, %r_rms_step;".into());
     prologue.push("mul.lo.s64 \t%rd_rms_rb0, %rd_rms_rb0, %rd_rms_str;".into());
@@ -715,12 +755,20 @@ mod tests {
     fn fused_norm_gemm_ptxas_valid() {
         let rms_ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
         let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.derivations.json");
 
         let rms_stage = PipelineStage::from_ptx("rms_norm", rms_ptx).expect("parse rms_norm");
         let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx).expect("parse gemm");
 
         let fused_ptx =
             fuse_reduction_into_gemm(&rms_stage, &gemm_stage, "fused_norm_gemm").expect("fuse");
+
+        // Apply perimeter replacement (prologue reads N from flat params)
+        let (fused_ptx, _) =
+            crate::perimeter::replace_perimeter(&fused_ptx, deriv_json, "fused_norm_gemm")
+                .expect("perimeter replacement");
+        let fused_ptx = crate::dedup_reg_declarations(&fused_ptx);
 
         let path = "/tmp/pipeline_fused_norm_gemm.ptx";
         std::fs::write(path, &fused_ptx).unwrap();

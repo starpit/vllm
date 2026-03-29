@@ -709,6 +709,313 @@ fn build_prologue_from_decomposition(
     prologue
 }
 
+/// Assemble a two-phase persistent kernel from two complete GEMM PTX strings.
+///
+/// Phase 1 runs all its tiles (via persistent loop), then a global barrier
+/// ensures all GMEM writes are visible, then Phase 2 runs all its tiles.
+///
+/// Both phases must use the same thread block size. Phase 2's `ferrite_params`
+/// is renamed to `ferrite_params2` to avoid collision.
+///
+/// The assembled kernel has these params (in order):
+/// 1. Phase 1 extra params (e.g., rms_norm: input, weight, eps, hidden, stride)
+/// 2. `ferrite_params[88]` — Phase 1 GEMM flat params
+/// 3. Phase 2 extra params (e.g., silu_mul: intermediate_bytes)
+/// 4. `ferrite_params2[88]` — Phase 2 GEMM flat params
+/// 5. Persistent/barrier params: counter1, counter2, barrier, num_blocks
+pub fn assemble_two_phase_kernel(
+    phase1_ptx: &str,
+    phase2_ptx: &str,
+    name: &str,
+) -> Result<String, String> {
+    // Parse both kernels into sections
+    let p1 = parse_kernel_sections(phase1_ptx)?;
+    let p2 = parse_kernel_sections(phase2_ptx)?;
+
+    // Rename Phase 2's ferrite_params → ferrite_params2
+    let p2_params: Vec<String> = p2
+        .params
+        .iter()
+        .map(|p| p.replace("ferrite_params", "ferrite_params2"))
+        .collect();
+    let p2_body: Vec<String> = p2
+        .body
+        .iter()
+        .map(|l| l.replace("ferrite_params", "ferrite_params2"))
+        .collect();
+
+    // Prefix Phase 2's labels to avoid collision
+    let p2_labels = collect_labels(&p2_body);
+    let mut p2_body = p2_body;
+    for label in &p2_labels {
+        let new_label = format!("$L_p2_{}", &label[1..]); // $L__BB0_1 → $L_p2_L__BB0_1
+        for line in &mut p2_body {
+            // Replace label references (both definitions and branches)
+            *line = line.replace(label, &new_label);
+        }
+    }
+
+    // Build merged kernel
+    let mut out = Vec::new();
+
+    // PTX header (from Phase 1)
+    for line in &p1.header {
+        out.push(line.clone());
+    }
+
+    // Entry point
+    out.push(format!(".visible .entry {name}("));
+
+    // Collect all params, then emit with proper comma handling
+    let mut all_params: Vec<String> = Vec::new();
+    for p in &p1.params {
+        all_params.push(p.trim().trim_end_matches(',').to_string());
+    }
+    for p in &p2_params {
+        let clean = p.trim().trim_end_matches(',').to_string();
+        if !all_params.iter().any(|pp| *pp == clean) {
+            all_params.push(clean);
+        }
+    }
+    // Persistent + barrier params
+    all_params.push(".param .u64 _ferrite_counter1".into());
+    all_params.push(".param .u64 _ferrite_counter2".into());
+    all_params.push(".param .u64 _ferrite_barrier".into());
+    all_params.push(".param .u32 _ferrite_num_blocks".into());
+    all_params.push(".param .u32 _ferrite_total1".into());
+    all_params.push(".param .u32 _ferrite_total2".into());
+
+    // Emit params with commas (all except last)
+    for (i, p) in all_params.iter().enumerate() {
+        if i < all_params.len() - 1 {
+            out.push(format!("\t{p},"));
+        } else {
+            out.push(format!("\t{p}"));
+        }
+    }
+    out.push(")".into());
+    out.push("{".into());
+
+    // Merged register declarations (union of both)
+    let mut seen_decls = std::collections::HashSet::new();
+    for d in p1.reg_decls.iter().chain(p2.reg_decls.iter()) {
+        let key = d.trim().to_string();
+        if seen_decls.insert(key) {
+            out.push(d.clone());
+        }
+    }
+    // Merged shared declarations
+    for d in p1.shared_decls.iter().chain(p2.shared_decls.iter()) {
+        let key = d.trim().to_string();
+        if seen_decls.insert(key) {
+            out.push(d.clone());
+        }
+    }
+
+    // Persistent loop registers
+    out.push("\t// FERRITE: persistent + barrier scratch".into());
+    out.push("\t.reg .u32 \t%r_ptile;".into());
+    out.push("\t.reg .u64 \t%rd_pctr;".into());
+    out.push("\t.reg .u32 \t%r_ptotal;".into());
+    out.push("\t.reg .pred \t%p_pdone, %p_pt0;".into());
+    out.push("\t.reg .u32 \t%r_barrier_arrived;".into());
+    out.push("\t.reg .u64 \t%rd_barrier;".into());
+    out.push("\t.reg .u32 \t%r_nblocks;".into());
+    out.push("\t.shared .align 4 .u32 _ptile_smem[1];".into());
+    out.push(String::new());
+
+    // ── Phase 1 persistent loop ──
+    out.push("\t// === FERRITE: Phase 1 persistent loop ===".into());
+    out.push("\tld.param.u64 \t%rd_pctr, [_ferrite_counter1];".into());
+    out.push("\tcvta.to.global.u64 \t%rd_pctr, %rd_pctr;".into());
+    out.push("\tld.param.u32 \t%r_ptotal, [_ferrite_total1];".into());
+    out.push(String::new());
+    out.push("$L_phase1_loop:".into());
+    out.push("\tmov.u32 \t%r_ptile, %tid.x;".into());
+    out.push("\tsetp.eq.u32 \t%p_pt0, %r_ptile, 0;".into());
+    out.push("\t@%p_pt0 atom.global.add.u32 \t%r_ptile, [%rd_pctr], 1;".into());
+    out.push("\t@%p_pt0 st.shared.u32 \t[_ptile_smem], %r_ptile;".into());
+    out.push("\tbar.sync \t14;".into());
+    out.push("\tld.shared.u32 \t%r_ptile, [_ptile_smem];".into());
+    out.push("\tsetp.ge.u32 \t%p_pdone, %r_ptile, %r_ptotal;".into());
+    out.push("\t@%p_pdone bra \t$L_phase1_done;".into());
+    out.push(String::new());
+
+    // Phase 1 body (with ctaid.x → %r_ptile)
+    for line in &p1.body {
+        let mut l = line.clone();
+        if l.contains("%ctaid.x") && l.contains("mov.u32") {
+            l = l.replace("%ctaid.x", "%r_ptile");
+        }
+        out.push(l);
+    }
+
+    out.push("\tbar.sync \t15;".into());
+    out.push("\tbra \t$L_phase1_loop;".into());
+    out.push("$L_phase1_done:".into());
+    out.push(String::new());
+
+    // ── Global barrier ──
+    out.push("\t// === FERRITE: global barrier (all CTAs synchronize) ===".into());
+    out.push("\tbar.sync \t15;".into());
+    out.push("\tld.param.u64 \t%rd_barrier, [_ferrite_barrier];".into());
+    out.push("\tcvta.to.global.u64 \t%rd_barrier, %rd_barrier;".into());
+    out.push("\tld.param.u32 \t%r_nblocks, [_ferrite_num_blocks];".into());
+    out.push("\tmov.u32 \t%r_barrier_arrived, %tid.x;".into());
+    out.push("\tsetp.eq.u32 \t%p_pt0, %r_barrier_arrived, 0;".into());
+    out.push("\t@%p_pt0 atom.global.add.u32 \t%r_barrier_arrived, [%rd_barrier], 1;".into());
+    out.push("$L_barrier_spin:".into());
+    out.push("\tld.global.u32 \t%r_barrier_arrived, [%rd_barrier];".into());
+    out.push("\tsetp.lt.u32 \t%p_pdone, %r_barrier_arrived, %r_nblocks;".into());
+    out.push("\t@%p_pdone bra \t$L_barrier_spin;".into());
+    out.push("\tbar.sync \t15;".into());
+    out.push(String::new());
+
+    // ── Phase 2 persistent loop ──
+    out.push("\t// === FERRITE: Phase 2 persistent loop ===".into());
+    out.push("\tld.param.u64 \t%rd_pctr, [_ferrite_counter2];".into());
+    out.push("\tcvta.to.global.u64 \t%rd_pctr, %rd_pctr;".into());
+    out.push("\tld.param.u32 \t%r_ptotal, [_ferrite_total2];".into());
+    out.push(String::new());
+    out.push("$L_phase2_loop:".into());
+    out.push("\tmov.u32 \t%r_ptile, %tid.x;".into());
+    out.push("\tsetp.eq.u32 \t%p_pt0, %r_ptile, 0;".into());
+    out.push("\t@%p_pt0 atom.global.add.u32 \t%r_ptile, [%rd_pctr], 1;".into());
+    out.push("\t@%p_pt0 st.shared.u32 \t[_ptile_smem], %r_ptile;".into());
+    out.push("\tbar.sync \t14;".into());
+    out.push("\tld.shared.u32 \t%r_ptile, [_ptile_smem];".into());
+    out.push("\tsetp.ge.u32 \t%p_pdone, %r_ptile, %r_ptotal;".into());
+    out.push("\t@%p_pdone bra \t$L_phase2_done;".into());
+    out.push(String::new());
+
+    // Phase 2 body (with ctaid.x → %r_ptile)
+    for line in &p2_body {
+        let mut l = line.clone();
+        if l.contains("%ctaid.x") && l.contains("mov.u32") {
+            l = l.replace("%ctaid.x", "%r_ptile");
+        }
+        out.push(l);
+    }
+
+    out.push("\tbar.sync \t15;".into());
+    out.push("\tbra \t$L_phase2_loop;".into());
+    out.push("$L_phase2_done:".into());
+    out.push(String::new());
+
+    out.push("\tret;".into());
+    out.push("}".into());
+
+    Ok(out.join("\n"))
+}
+
+/// Parsed sections of a PTX kernel.
+struct KernelSections {
+    /// Lines before .entry (version, target, etc.)
+    header: Vec<String>,
+    /// .param declarations (without .entry line)
+    params: Vec<String>,
+    /// .reg declarations
+    reg_decls: Vec<String>,
+    /// .shared declarations
+    shared_decls: Vec<String>,
+    /// Body instructions (between declarations and ret;)
+    body: Vec<String>,
+}
+
+/// Parse a PTX kernel into sections for assembly.
+fn parse_kernel_sections(ptx: &str) -> Result<KernelSections, String> {
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut header = Vec::new();
+    let mut params = Vec::new();
+    let mut reg_decls = Vec::new();
+    let mut shared_decls = Vec::new();
+    let mut body = Vec::new();
+
+    #[derive(PartialEq)]
+    enum State {
+        Header,
+        Params,
+        Decls,
+        Body,
+    }
+    let mut state = State::Header;
+
+    for line in &lines {
+        let t = line.trim();
+
+        match state {
+            State::Header => {
+                if t.contains(".entry") {
+                    state = State::Params;
+                    // Skip the .entry line itself
+                } else {
+                    header.push(line.to_string());
+                }
+            }
+            State::Params => {
+                if t == "{" || t.ends_with('{') {
+                    state = State::Decls;
+                } else if t == ")" {
+                    // End of params, skip
+                } else if t.starts_with(".param") || t.starts_with(")") {
+                    // Clean up: remove trailing comma for last param
+                    params.push(t.trim_start().to_string());
+                }
+            }
+            State::Decls => {
+                if t.starts_with(".reg") {
+                    reg_decls.push(line.to_string());
+                } else if t.starts_with(".shared") || t.starts_with(".local") {
+                    shared_decls.push(line.to_string());
+                } else if t.is_empty() || t.starts_with("//") {
+                    // Skip comments/blanks in decl block
+                } else {
+                    // First instruction — switch to body
+                    state = State::Body;
+                    if t != "ret;" && t != "}" {
+                        body.push(line.to_string());
+                    }
+                }
+            }
+            State::Body => {
+                // Include everything except the final `ret;`
+                // (closing braces from inline asm must be preserved)
+                if t != "ret;" {
+                    body.push(line.to_string());
+                }
+            }
+        }
+    }
+
+    // Strip the final closing brace (kernel body `}`)
+    while body.last().map_or(false, |l| {
+        let t = l.trim();
+        t == "}" || t.is_empty()
+    }) {
+        body.pop();
+    }
+
+    Ok(KernelSections {
+        header,
+        params,
+        reg_decls,
+        shared_decls,
+        body,
+    })
+}
+
+/// Collect all label definitions from PTX lines.
+fn collect_labels(lines: &[String]) -> Vec<String> {
+    let mut labels = Vec::new();
+    for line in lines {
+        let t = line.trim();
+        if t.starts_with('$') && t.ends_with(':') {
+            labels.push(t.trim_end_matches(':').to_string());
+        }
+    }
+    labels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,5 +1291,93 @@ mod tests {
             panic!("ptxas FAILED on SiLU+mul fused GEMM PTX");
         }
         println!("PASS: SiLU+mul fused GEMM passes ptxas");
+    }
+
+    #[test]
+    fn two_phase_kernel_ptxas_valid() {
+        let rms_ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let silu_ptx = include_str!("../../ptx-fusion/kernels/vllm_silu_mul.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
+
+        // Build Phase 1: rms_norm + GEMM_gate_up
+        let rms_stage = PipelineStage::from_ptx("rms_norm", rms_ptx).expect("parse rms");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx).expect("parse gemm");
+        let phase1_raw =
+            fuse_reduction_into_gemm(&rms_stage, &gemm_stage, "phase1").expect("phase1");
+        let (phase1, _) =
+            crate::perimeter::replace_perimeter(&phase1_raw, deriv_json, "phase1").expect("perim1");
+        let phase1 = crate::dedup_reg_declarations(&phase1);
+
+        // Build Phase 2: SiLU+mul + GEMM_down
+        let silu_stage = PipelineStage::from_ptx("silu_mul", silu_ptx).expect("parse silu");
+        let gemm_stage2 = PipelineStage::from_ptx("gemm2", gemm_ptx).expect("parse gemm2");
+        let phase2_raw =
+            fuse_pointwise_into_gemm(&silu_stage, &gemm_stage2, "phase2").expect("phase2");
+        let (phase2, _) =
+            crate::perimeter::replace_perimeter(&phase2_raw, deriv_json, "phase2").expect("perim2");
+        let phase2 = crate::dedup_reg_declarations(&phase2);
+
+        // Assemble two-phase kernel
+        let assembled =
+            assemble_two_phase_kernel(&phase1, &phase2, "mlp_pipeline").expect("assemble");
+
+        // Verify structure
+        assert!(
+            assembled.contains("Phase 1 persistent loop"),
+            "should have Phase 1 marker"
+        );
+        assert!(
+            assembled.contains("global barrier"),
+            "should have barrier marker"
+        );
+        assert!(
+            assembled.contains("Phase 2 persistent loop"),
+            "should have Phase 2 marker"
+        );
+        assert!(
+            assembled.contains("ferrite_params2"),
+            "should have Phase 2 flat params"
+        );
+        assert!(
+            assembled.contains("mlp_pipeline"),
+            "should have merged entry name"
+        );
+
+        let path = "/tmp/two_phase_mlp_pipeline.ptx";
+        std::fs::write(path, &assembled).unwrap();
+
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", path])
+            .output()
+            .expect("ptxas not found");
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("ptxas stderr:");
+            for line in stderr.lines().take(30) {
+                eprintln!("  {line}");
+            }
+            // Show context around errors
+            let ptx_lines: Vec<&str> = assembled.lines().collect();
+            for line in stderr.lines() {
+                if let Some(lnum) = line
+                    .split('(')
+                    .nth(1)
+                    .and_then(|s| s.split(')').next())
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    let start = lnum.saturating_sub(3);
+                    let end = (lnum + 3).min(ptx_lines.len());
+                    for i in start..end {
+                        let marker = if i + 1 == lnum { ">>>" } else { "   " };
+                        eprintln!("{marker} {:4}: {}", i + 1, ptx_lines[i]);
+                    }
+                }
+            }
+            panic!("ptxas FAILED on two-phase MLP pipeline PTX");
+        }
+        println!("PASS: two-phase MLP pipeline passes ptxas");
     }
 }

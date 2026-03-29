@@ -13,7 +13,28 @@ rms_norm → GEMM_gate_up → SiLU+mul → GEMM_down → residual_add
 All in one launch. The current milestone is the first piece: `rms_norm → GEMM`.
 
 When this works in production (`vllm serve` produces correct text on Qwen2.5-0.5B),
-the architecture extends to the full pipeline.
+the architecture extends to the full pipeline. The `compile!` macro, `PointwiseComputation`,
+and `replace_a_loads_with_inline_fn` infrastructure are all designed for this.
+
+## Model
+
+Qwen2.5-0.5B-Instruct. Weights at:
+```
+~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775/model.safetensors
+```
+
+Config: hidden=896, num_attention_heads=14, num_kv_heads=2, num_hidden_layers=24,
+intermediate_size=4864, head_dim=64, rope_theta=1000000.0, rms_norm_eps=1e-6,
+vocab_size=151936, tie_word_embeddings=true.
+
+## What changed since session 3
+
+- **Tile config**: FerriteCutlass now only has **one** tile config (64x128x32). Session 3
+  had both 64x64x32 and 64x128x32, causing 10-200 diffs when `ferrite.gemm.select(m=1)`
+  chose 64x64x32 but `FUSED_NORM_GEMM` used 64x128x32. That mismatch is gone.
+- **Session 3's three production wiring approaches** all produced identical garbage
+  (`"ereço八大以来..."`). This session's `vllm serve` attempt (via `FERRITE_FUSED_NORM=1`
+  env var) also produced garbage (`"처리 adhesivemonto Dosunnedoneksi..."`). Same pattern.
 
 ## What the working path does (llama.rs today)
 
@@ -168,6 +189,14 @@ the GEMM prologue:
 This matches `fused_add_rms_norm_inplace` precision. The key change is in
 `pipeline_compile.rs` — the prologue currently reads one input; it needs to read two
 and fuse the add before the norm.
+
+Relevant infrastructure (all in the ptx-fusion crate):
+- `pipeline_compile.rs:506-1020`: transplanted prologue builder (this is where the norm
+  code gets injected before GEMM A-loads — extend to also inject the add)
+- `pipeline.rs:114-170`: `from_ptx()` with entry_hint (parses kernel PTX into stages)
+- `compile.rs:21-28`: `ManifestKernel.entry_hint` (kernel metadata)
+- `lib.rs:1627-1630`: `compile!` passes entry_hint (macro interface)
+- `PointwiseComputation`: existing abstraction for element-wise ops in prologues/epilogues
 
 ### 4. Re-run test13c
 After the precision fix, re-run test13c. All decode tokens must match. If they don't,

@@ -1632,7 +1632,51 @@ pub fn compile(input: TokenStream) -> TokenStream {
         .find(|(n, _)| *n == binding.consumer)
         .unwrap();
 
-    let fused_ptx = if producer.1.source.starts_with("intrinsic:") {
+    // Analyze both kernels as pipeline stages to determine fusion strategy
+    let fused_ptx = if !producer.1.ptx_content.is_empty() && !consumer.1.ptx_content.is_empty() {
+        // Both have PTX — analyze patterns from the actual code
+        let producer_stage = pipeline::PipelineStage::from_ptx("producer", &producer.1.ptx_content)
+            .unwrap_or_else(|e| panic!("compile!: producer PTX analysis failed: {e}"));
+        let consumer_stage = pipeline::PipelineStage::from_ptx("consumer", &consumer.1.ptx_content)
+            .unwrap_or_else(|e| panic!("compile!: consumer PTX analysis failed: {e}"));
+
+        let fused = match (&producer_stage.pattern, &consumer_stage.pattern) {
+            (
+                pipeline::StagePattern::Reduction { .. },
+                pipeline::StagePattern::TiledGemm { .. },
+            ) => {
+                // Pipeline compiler: Reduction → TiledGemm
+                pipeline_compile::fuse_reduction_into_gemm(
+                    &producer_stage,
+                    &consumer_stage,
+                    &parsed.fused_name,
+                )
+                .unwrap_or_else(|e| panic!("compile!: pipeline fusion failed: {e}"))
+            }
+            _ => {
+                // General pairwise fusion
+                let result = fuse_general::fuse_two(
+                    &producer.1.ptx_content,
+                    &consumer.1.ptx_content,
+                    &binding.producer_port,
+                    &binding.consumer_port,
+                    &parsed.fused_name,
+                )
+                .unwrap_or_else(|e| panic!("compile!: fusion failed: {e}"));
+                result.ptx
+            }
+        };
+
+        // Apply perimeter replacement if derivations exist
+        if let Some(ref json) = consumer.1.derivations_content {
+            let (rewritten, _) = perimeter::replace_perimeter(&fused, json, &parsed.fused_name)
+                .unwrap_or_else(|e| panic!("compile!: perimeter replacement failed: {e}"));
+            dedup_reg_declarations(&rewritten)
+        } else {
+            fused
+        }
+    } else if producer.1.source.starts_with("intrinsic:") {
+        // Legacy intrinsic path (to be removed)
         let intrinsic_name = &producer.1.source["intrinsic:".len()..];
         let gemm_ptx = &consumer.1.ptx_content;
         let tile_m = consumer.1.tile_m;
@@ -1662,30 +1706,13 @@ pub fn compile(input: TokenStream) -> TokenStream {
         } else {
             after_fusion
         }
-    } else if consumer.1.source.starts_with("intrinsic:") {
-        panic!("compile!: intrinsic as consumer not yet supported");
     } else {
-        let result = fuse_general::fuse_two(
-            &producer.1.ptx_content,
-            &consumer.1.ptx_content,
-            &binding.producer_port,
-            &binding.consumer_port,
-            &parsed.fused_name,
-        )
-        .unwrap_or_else(|e| panic!("compile!: fusion failed: {e}"));
-
-        if let Some(ref json) = consumer.1.derivations_content {
-            let (rewritten, _) =
-                perimeter::replace_perimeter(&result.ptx, json, &parsed.fused_name)
-                    .unwrap_or_else(|e| panic!("compile!: perimeter replacement failed: {e}"));
-            rewritten
-        } else {
-            result.ptx
-        }
+        panic!("compile!: at least one kernel must have PTX content");
     };
 
-    // Compute extra param bytes (prefix before flat GEMM params)
-    let extra_param_bytes = parsed.extra_param_bytes;
+    // Compute extra param bytes by parsing the fused PTX entry declaration.
+    // Count bytes of .param declarations before the flat struct param.
+    let extra_param_bytes = compute_extra_param_bytes(&fused_ptx);
     let tile_m = consumer.1.tile_m;
     let tile_n = consumer.1.tile_n;
     let threads = consumer.1.threads;
@@ -2254,4 +2281,48 @@ fn dedup_reg_declarations(ptx: &str) -> String {
         result.push(line);
     }
     result.join("\n")
+}
+
+/// Count the total bytes of extra `.param` declarations before the flat struct
+/// param (`ferrite_params`) in a fused kernel's PTX entry point.
+///
+/// Extra params are typed (`.param .u64 name`, `.param .f32 name`) while the
+/// flat struct param is `.param .align N .b8 ferrite_params[SIZE]`.
+fn compute_extra_param_bytes(ptx: &str) -> u32 {
+    let mut in_entry = false;
+    let mut bytes = 0u32;
+
+    for line in ptx.lines() {
+        let t = line.trim();
+        if t.contains(".entry") {
+            in_entry = true;
+        }
+        if !in_entry {
+            continue;
+        }
+        // Stop at the flat struct param or closing paren
+        if t.contains("ferrite_params") || (in_entry && (t == ")" || t == "{")) {
+            break;
+        }
+        // Count typed .param declarations with natural alignment
+        if t.starts_with(".param") {
+            let (size, align) = if t.contains(".u64") || t.contains(".b64") {
+                (8u32, 8u32)
+            } else if t.contains(".u32")
+                || t.contains(".b32")
+                || t.contains(".f32")
+                || t.contains(".s32")
+            {
+                (4, 4)
+            } else if t.contains(".u16") || t.contains(".b16") || t.contains(".f16") {
+                (2, 2)
+            } else {
+                continue;
+            };
+            // Align to natural boundary, then add size
+            bytes = ((bytes + align - 1) & !(align - 1)) + size;
+        }
+    }
+    // Align total to 8 for the struct param that follows
+    (bytes + 7) & !7
 }

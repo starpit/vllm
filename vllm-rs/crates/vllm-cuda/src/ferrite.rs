@@ -449,15 +449,22 @@ pub unsafe fn launch_fused_norm_gemm(
         actual_beta,
     );
 
-    let mut params = [0u8; 128]; // 40 prefix + 88 flat
-    params[0..8].copy_from_slice(&(norm_weight.raw_ptr() as u64).to_le_bytes());
-    params[8..12].copy_from_slice(&epsilon.to_le_bytes());
-    params[12..16].copy_from_slice(&hidden.to_le_bytes());
-    params[16..24].copy_from_slice(&(input.raw_ptr() as u64).to_le_bytes());
+    // Param layout matches pipeline compiler output:
+    // [0..8]   _ferrite_rms_input   (u64) — input pointer
+    // [8..16]  _ferrite_rms_weight  (u64) — norm weight pointer
+    // [16..20] _ferrite_rms_epsilon (f32) — epsilon
+    // [20..24] _ferrite_rms_hidden  (u32) — hidden dim
+    // [24..32] _ferrite_rms_a_stride(u64) — stride
+    // [32..120] ferrite_params[88]        — flat GEMM params
+    let prefix = kernel.extra_param_bytes as usize;
+    let total = prefix + 88;
+    let mut params = vec![0u8; total];
+    params[0..8].copy_from_slice(&(input.raw_ptr() as u64).to_le_bytes());
+    params[8..16].copy_from_slice(&(norm_weight.raw_ptr() as u64).to_le_bytes());
+    params[16..20].copy_from_slice(&epsilon.to_le_bytes());
+    params[20..24].copy_from_slice(&hidden.to_le_bytes());
     params[24..32].copy_from_slice(&(k as u64).to_le_bytes()); // a_stride = K
-    params[32..36].copy_from_slice(&(n as i32).to_le_bytes()); // N for swizzle
-    // bytes 36..40: padding (align ferrite_params to 8)
-    params[40..128].copy_from_slice(&flat);
+    params[prefix..prefix + 88].copy_from_slice(&flat);
 
     launch_kernel_raw(
         func,

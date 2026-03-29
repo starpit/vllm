@@ -28,8 +28,13 @@ tile = [128, 128, 64]
 threads = 128
 smem = 98304
 
+[kernels.rms_norm]
+ptx = "vllm_rms_norm.ptx"
+
+[kernels.silu_mul]
+ptx = "vllm_silu_mul.ptx"
+
 [intrinsics]
-rms_norm = true
 silu = true
 gelu = true
 relu = true

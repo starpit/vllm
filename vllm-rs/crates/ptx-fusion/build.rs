@@ -562,8 +562,14 @@ fn write_ferrite_toml(kernel_dir: &std::path::Path, configs: &[CutlassConfig]) {
         toml.push('\n');
     }
 
+    // Non-GEMM kernels (PTX only, no tile/threads/smem)
+    toml.push_str("[kernels.rms_norm]\n");
+    toml.push_str("ptx = \"vllm_rms_norm.ptx\"\n\n");
+
+    toml.push_str("[kernels.silu_mul]\n");
+    toml.push_str("ptx = \"vllm_silu_mul.ptx\"\n\n");
+
     toml.push_str("[intrinsics]\n");
-    toml.push_str("rms_norm = true\n");
     toml.push_str("silu = true\n");
     toml.push_str("gelu = true\n");
     toml.push_str("relu = true\n");

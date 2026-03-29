@@ -29,7 +29,7 @@ use std::sync::Arc;
 // ── Fused norm+GEMM kernels (compile-time PTX fusion) ──
 #[cfg(feature = "ferrite")]
 const FUSED_NORM_GEMM: ptx_fusion::FeriteKernel = ptx_fusion::compile!(
-    a = intrinsic(rms_norm),
+    a = rms_norm,
     b = gemm_64x128x32,
     bind = { a.output => b.param_0 },
     name = "ferrite_fused_norm_gemm",

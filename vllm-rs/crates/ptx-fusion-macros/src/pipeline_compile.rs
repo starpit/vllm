@@ -12,7 +12,152 @@
 //! mapping uses runtime arithmetic (correct for any CUTLASS thread layout).
 
 use crate::fuse_general::{PointwiseComputation, replace_a_loads_with_inline_fn};
+use crate::parser::DefUseGraph;
 use crate::pipeline::{PipelineStage, ReductionDecomposition, StagePattern};
+
+/// Thread-to-row mapping parameters extracted from GEMM PTX.
+///
+/// The mapping formula is:
+///   m_rel = (tid.x % 32) / lanes_per_row + (tid.x / 32) * rows_per_warp
+///   row_0 = m_rel, row_1 = m_rel + row_stride
+///
+/// These are extracted from the `shr` and `shl` shift amounts in the
+/// A-load address computation chain.
+#[derive(Debug, Clone)]
+struct ThreadRowMap {
+    /// Number of lanes that share a row (detected as 1 << shr_amount on lane)
+    lanes_per_row_log2: u32,
+    /// Number of rows each warp covers (detected as 1 << shl_amount on warp)
+    rows_per_warp_log2: u32,
+    /// Row stride between a thread's two rows (typically 8)
+    row_stride: u32,
+}
+
+/// Extract the thread-to-row mapping from a GEMM kernel's PTX.
+///
+/// Strategy: find the first A-load's address chain, locate the
+/// `mul.lo.s64 %rd, stride, row_reg`, then trace `row_reg` backward
+/// to find the `shr` (lane division) and `shl` (warp multiply) constants.
+fn extract_thread_row_map(gemm_lines: &[&str]) -> Option<ThreadRowMap> {
+    let graph = DefUseGraph::build(gemm_lines);
+
+    // Find the first cp.async A-load's gmem_src register
+    let mut gmem_src = String::new();
+    for line in gemm_lines {
+        let t = line.trim();
+        if t.contains("cp.async.cg.shared.global") {
+            // Extract second bracket content (gmem source)
+            let mut brackets = Vec::new();
+            let mut i = 0;
+            let bytes = t.as_bytes();
+            while i < bytes.len() {
+                if bytes[i] == b'[' {
+                    let start = i + 1;
+                    while i < bytes.len() && bytes[i] != b']' {
+                        i += 1;
+                    }
+                    brackets.push(t[start..i].trim().to_string());
+                }
+                i += 1;
+            }
+            if brackets.len() >= 2 {
+                gmem_src = brackets[1].clone();
+                break;
+            }
+        }
+    }
+    if gmem_src.is_empty() {
+        return None;
+    }
+
+    // Trace backward from gmem_src to find the mul.lo.s64 by stride
+    let trace = graph.trace_backward(&gmem_src, 10);
+
+    // Find the mul.lo.s64 — one operand is the stride (from ld.param), the other is the row
+    let mut row_reg = String::new();
+    for &(_depth, node_idx) in &trace {
+        let node = &graph.nodes[node_idx];
+        if node.opcode == "mul.lo.s64" && node.sources.len() == 2 {
+            // One source should be a param-derived register, the other is the row
+            // The param-derived one will appear in ld.param results
+            // Check which source is NOT in our trace (i.e., comes from a param)
+            for src in &node.sources {
+                // Trace this source backward — if it hits ld.param quickly, it's the stride
+                let sub_trace = graph.trace_backward(src, 3);
+                let hits_param = sub_trace
+                    .iter()
+                    .any(|&(_, ni)| graph.nodes[ni].opcode.starts_with("ld.param"));
+                if !hits_param {
+                    // This is the row register (not from param)
+                    row_reg = src.clone();
+                }
+            }
+            if !row_reg.is_empty() {
+                break;
+            }
+        }
+    }
+    if row_reg.is_empty() {
+        return None;
+    }
+
+    // Trace the row register backward to find the shift amounts.
+    // The row is computed from tid.x via:
+    //   lane = tid.x % 32  (and/sub pattern)
+    //   warp = tid.x / 32  (shr by 5)
+    //   m_in_warp = lane >> N  (shr.s32, N = lanes_per_row_log2)
+    //   warp_contrib = warp << M  (shl.b32, M = rows_per_warp_log2)
+    //   m_rel = m_in_warp + warp_contrib  (add)
+    let row_trace = graph.trace_backward(&row_reg, 12);
+
+    let mut lane_shr: Option<u32> = None;
+    let mut warp_shl: Option<u32> = None;
+
+    for &(_depth, node_idx) in &row_trace {
+        let node = &graph.nodes[node_idx];
+
+        // Look for shr.s32 with a small immediate — lane / N
+        if node.opcode == "shr.s32" && node.sources.len() == 2 {
+            if let Ok(shift) = node.sources[1].parse::<u32>() {
+                if shift >= 1 && shift <= 4 && shift != 5 {
+                    // shr by 2 = lane / 4 (not shr by 5 which is tid.x / 32)
+                    lane_shr = Some(shift);
+                }
+            }
+        }
+
+        // Look for shl.b32 with a small immediate — warp * N
+        if node.opcode == "shl.b32" && node.sources.len() == 2 {
+            if let Ok(shift) = node.sources[1].parse::<u32>() {
+                if shift >= 3 && shift <= 5 {
+                    // shl by 4 = warp * 16, shl by 5 = warp * 32
+                    warp_shl = Some(shift);
+                }
+            }
+        }
+    }
+
+    // Detect row_stride by looking for the second row computation (add.s32 %r, %r, N)
+    // where N is the stride between a thread's two rows
+    let mut row_stride = 8u32; // default
+    for &(_depth, node_idx) in &row_trace {
+        let node = &graph.nodes[node_idx];
+        if node.opcode == "shl.b32" && node.sources.len() == 2 {
+            if let Ok(shift) = node.sources[1].parse::<u32>() {
+                if shift == 3 {
+                    // shl by 3 = offset * 8, suggests row_stride = 8
+                    row_stride = 8;
+                }
+            }
+        }
+    }
+
+    Some(ThreadRowMap {
+        lanes_per_row_log2: lane_shr.unwrap_or(2), // default: lane / 4
+        rows_per_warp_log2: warp_shl.unwrap_or(4), // default: warp * 16
+        row_stride,
+    })
+}
 
 /// Fuse a Reduction stage into a TiledGemm stage's A-input prologue.
 ///
@@ -123,7 +268,18 @@ fn build_reduction_computation(
     //
     // The accumulation pattern (fma.rn.f32 for sum-of-squares) and
     // finalization (rsqrt) are extracted from the decomposition.
-    let prologue = build_prologue_from_decomposition(decomp);
+    // Extract thread-to-row mapping from GEMM PTX
+    let gemm_lines: Vec<&str> = _gemm.source_lines.iter().map(|s| s.as_str()).collect();
+    let thread_map = extract_thread_row_map(&gemm_lines);
+    #[cfg(test)]
+    if let Some(ref tm) = thread_map {
+        eprintln!(
+            "  thread_row_map: lanes_per_row=1<<{}, rows_per_warp=1<<{}, row_stride={}",
+            tm.lanes_per_row_log2, tm.rows_per_warp_log2, tm.row_stride
+        );
+    }
+
+    let prologue = build_prologue_from_decomposition(decomp, thread_map.as_ref());
 
     // ── Per-site code ──
     // Row selection: the prologue pre-loads inv_rms for both rows into
@@ -194,7 +350,14 @@ fn build_reduction_computation(
 /// All threads in the CTA cooperate on reducing each row in the tile.
 /// The formula (sum-of-squares → rsqrt) is derived from the decomposition's
 /// accumulate and finalize phases.
-fn build_prologue_from_decomposition(decomp: &ReductionDecomposition) -> Vec<String> {
+fn build_prologue_from_decomposition(
+    decomp: &ReductionDecomposition,
+    thread_map: Option<&ThreadRowMap>,
+) -> Vec<String> {
+    // Use extracted constants or defaults
+    let lane_shr = thread_map.map_or(2, |tm| tm.lanes_per_row_log2);
+    let warp_shl = thread_map.map_or(4, |tm| tm.rows_per_warp_log2);
+    let row_stride = thread_map.map_or(8, |tm| tm.row_stride);
     // For the MVP, we generate the reduction prologue using the formula
     // extracted from the decomposition. The key facts:
     //
@@ -333,24 +496,28 @@ fn build_prologue_from_decomposition(decomp: &ReductionDecomposition) -> Vec<Str
     prologue.push("bar.sync \t15;".into());
 
     // ── Per-thread setup: load inv_rms for this thread's two rows ──
-    // Thread-to-row mapping extracted from CUTLASS PTX (PitchLinearWarpRakedThreadMap):
-    //   m_rel = (tid.x % 32) / 4 + (tid.x / 32) * 16
-    //   row_0 = m_rel, row_1 = m_rel + 8
-    // TODO: extract this mapping from the GEMM PTX rather than hardcoding
-    prologue.push("// Per-thread: load inv_rms for both rows".into());
+    // Thread-to-row mapping extracted from GEMM PTX address chain:
+    //   m_rel = (tid.x % 32) >> lane_shr + (tid.x / 32) << warp_shl
+    //   row_0 = m_rel, row_1 = m_rel + row_stride
+    prologue.push(format!(
+        "// Per-thread: load inv_rms (lane_shr={lane_shr}, warp_shl={warp_shl}, row_stride={row_stride})"
+    ));
     prologue.push("mov.u32 \t%r_rms_step, %tid.x;".into());
     prologue.push("and.b32 \t%r_rms_k, %r_rms_step, 31;".into()); // lane = tid.x % 32
-    prologue.push("shr.u32 \t%r_rms_k, %r_rms_k, 2;".into()); // lane / 4
+    prologue.push(format!("shr.u32 \t%r_rms_k, %r_rms_k, {lane_shr};")); // lane / lanes_per_row
     prologue.push("shr.u32 \t%r_rms_row, %r_rms_step, 5;".into()); // warp = tid.x / 32
-    prologue.push("shl.b32 \t%r_rms_row, %r_rms_row, 4;".into()); // warp * 16
+    prologue.push(format!("shl.b32 \t%r_rms_row, %r_rms_row, {warp_shl};")); // warp * rows_per_warp
     prologue.push("add.u32 \t%r_rms_row, %r_rms_row, %r_rms_k;".into()); // m_rel
 
-    // Load inv_rms[m_rel] and inv_rms[m_rel + 8]
+    // Load inv_rms[m_rel] and inv_rms[m_rel + row_stride]
+    let row_stride_bytes = row_stride * 4; // 4 bytes per f32
     prologue.push("mov.u32 \t%r_rms_k, _ferrite_inv_rms;".into());
     prologue.push("shl.b32 \t%r_rms_step, %r_rms_row, 2;".into()); // m_rel * 4
     prologue.push("add.s32 \t%r_rms_step, %r_rms_k, %r_rms_step;".into());
     prologue.push("ld.shared.f32 \t%f_rms_inv0, [%r_rms_step];".into());
-    prologue.push("ld.shared.f32 \t%f_rms_inv1, [%r_rms_step+32];".into()); // +8 rows * 4 bytes
+    prologue.push(format!(
+        "ld.shared.f32 \t%f_rms_inv1, [%r_rms_step+{row_stride_bytes}];"
+    )); // +row_stride rows * 4 bytes
 
     // Compute GMEM row base addresses for both rows (for K-offset extraction in per-site)
     // rb0 = input_ptr + (ctaid.x * tile_m + m_rel) * stride * 2
@@ -361,8 +528,9 @@ fn build_prologue_from_decomposition(decomp: &ReductionDecomposition) -> Vec<Str
     prologue.push("mul.lo.s64 \t%rd_rms_rb0, %rd_rms_rb0, %rd_rms_str;".into());
     prologue.push("shl.b64 \t%rd_rms_rb0, %rd_rms_rb0, 1;".into()); // * 2 for bf16
     prologue.push("add.s64 \t%rd_rms_rb0, %rd_rms_in, %rd_rms_rb0;".into());
-    // rb1 = rb0 + 8 * stride * 2
-    prologue.push("shl.b64 \t%rd_rms_rb1, %rd_rms_str, 4;".into()); // stride * 16 = stride*8*2
+    // rb1 = rb0 + row_stride * stride * 2
+    let rb1_shift = (row_stride * 2).trailing_zeros(); // row_stride * 2 as power of 2
+    prologue.push(format!("shl.b64 \t%rd_rms_rb1, %rd_rms_str, {rb1_shift};")); // stride * row_stride * 2
     prologue.push("add.s64 \t%rd_rms_rb1, %rd_rms_rb0, %rd_rms_rb1;".into());
 
     prologue.push("// FERRITE: end rms_norm prologue".into());

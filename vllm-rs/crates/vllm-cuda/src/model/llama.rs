@@ -1014,25 +1014,26 @@ impl LlamaDecoderLayer {
                 _ => unreachable!(),
             };
 
-            // residual += hidden_states
-            kernels::add_inplace(*residual, *hidden_states, device.compute_stream);
-            drop(hidden_states);
-
-            // Fused norm+QKV: reads residual, normalizes inline, projects
-            let hidden = residual.as_gpu_tensor().dim(1) as u32;
-            let qkv = crate::ferrite::launch_fused_norm_gemm(
-                &FUSED_NORM_GEMM,
-                *residual,         // input (un-normalized)
-                qkv_linear.weight, // B weight
+            // Use standard fused_add_rms_norm + separate QKV GEMM
+            // (isolating whether the bug is in fused_norm_gemm or tensor flow)
+            let hs_gpu = *hidden_states;
+            let res_gpu = *residual;
+            kernels::fused_add_rms_norm_inplace(
+                hs_gpu,
+                res_gpu,
                 self.input_layernorm.weight,
                 self.input_layernorm.eps,
-                hidden,
-                None,
-                1.0,
-                0.0,
+                device.compute_stream,
+            );
+            // hidden_states now contains normed data, residual is accumulated
+            let hidden = residual.as_gpu_tensor().dim(1) as u32;
+            let qkv = qkv_linear.forward_ferrite(
+                hidden_states.view(),
+                &device.ferrite,
                 &mut device.caching,
                 device.compute_stream,
             );
+            drop(hidden_states);
 
             // Attention from pre-projected QKV
             let attn_output = self.self_attn.forward_from_qkv(
@@ -1053,23 +1054,26 @@ impl LlamaDecoderLayer {
             if self.residual_multiplier != 1.0 {
                 kernels::scale_inplace(*attn_output, self.residual_multiplier, &device.cublas);
             }
-            kernels::add_inplace(*residual, *attn_output, device.compute_stream);
-            drop(attn_output);
+
+            // Use standard fused_add_rms_norm for MLP norm too
+            let res_gpu2 = *residual;
+            kernels::fused_add_rms_norm_inplace(
+                *attn_output,
+                res_gpu2,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+                device.compute_stream,
+            );
+            // attn_output now contains normed data for MLP
 
             if let crate::layers::LinearLayer::Dense(ref gate_up_linear) = self.mlp.gate_up_proj {
-                let gate_up = crate::ferrite::launch_fused_norm_gemm(
-                    &FUSED_NORM_GEMM,
-                    *residual,
-                    gate_up_linear.weight,
-                    self.post_attention_layernorm.weight,
-                    self.post_attention_layernorm.eps,
-                    hidden,
-                    None,
-                    1.0,
-                    0.0,
+                let gate_up = gate_up_linear.forward_ferrite(
+                    attn_output.view(),
+                    &device.ferrite,
                     &mut device.caching,
                     device.compute_stream,
                 );
+                drop(attn_output);
 
                 let activated = kernels::silu_and_mul_fused(
                     gate_up.as_gpu_tensor(),

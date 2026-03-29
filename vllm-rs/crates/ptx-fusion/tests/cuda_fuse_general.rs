@@ -2259,3 +2259,233 @@ fn mlp_pipeline_gpu() {
     );
     println!("PASS: MLP pipeline matches separate launches");
 }
+
+#[test]
+fn mlp_pipeline_benchmark() {
+    println!("=== MLP pipeline: benchmark ===");
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let iters = 100u32;
+
+    // Model-like dimensions
+    let m = 64u32;
+    let hidden = 2560u32;
+    let intermediate = 3456u32;
+    let gate_up_n = 2 * intermediate;
+    let eps = 1e-5f32;
+
+    // Allocate all GPU tensors
+    let d_input: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    let d_norm_wt: CudaSlice<half::bf16> = stream.alloc_zeros(hidden as usize).unwrap();
+    let d_gate_up_wt: CudaSlice<half::bf16> =
+        stream.alloc_zeros((gate_up_n * hidden) as usize).unwrap();
+    let d_down_wt: CudaSlice<half::bf16> = stream
+        .alloc_zeros((hidden * intermediate) as usize)
+        .unwrap();
+    let d_gate_up_buf: CudaSlice<half::bf16> =
+        stream.alloc_zeros((m * gate_up_n) as usize).unwrap();
+    let d_output: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    let d_c1: CudaSlice<half::bf16> = stream.alloc_zeros((m * gate_up_n) as usize).unwrap();
+    let d_c2: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+
+    let (input_ptr, _) = d_input.device_ptr(&stream);
+    let (norm_wt_ptr, _) = d_norm_wt.device_ptr(&stream);
+    let (gate_up_wt_ptr, _) = d_gate_up_wt.device_ptr(&stream);
+    let (down_wt_ptr, _) = d_down_wt.device_ptr(&stream);
+    let (gate_up_buf_ptr, _) = d_gate_up_buf.device_ptr(&stream);
+    let (output_ptr, _) = d_output.device_ptr(&stream);
+    let (c1_ptr, _) = d_c1.device_ptr(&stream);
+    let (c2_ptr, _) = d_c2.device_ptr(&stream);
+
+    // ── Benchmark: partially fused (2 launches) ──
+    // Launch 1: rms_norm + GEMM_gate_up
+    let module1 = ctx
+        .load_module(Ptx::from_src(FUSED_RMS_NORM_GEMM_PTX))
+        .unwrap();
+    let func1 = module1.load_function("fused_rms_norm_gemm").unwrap();
+    let phase1_params = build_flat_params(
+        input_ptr as u64,
+        gate_up_wt_ptr as u64,
+        c1_ptr as u64,
+        gate_up_buf_ptr as u64,
+        m,
+        gate_up_n,
+        hidden,
+        hidden,
+        hidden,
+        gate_up_n,
+        gate_up_n,
+        1.0,
+        0.0,
+    );
+    let (gx1, gy1, _) = compute_grid(m, gate_up_n, 64, 128);
+    let cfg1 = LaunchConfig {
+        grid_dim: (gx1, gy1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864,
+    };
+
+    // Launch 2: SiLU+mul + GEMM_down
+    let module2 = ctx
+        .load_module(Ptx::from_src(SILU_MUL_FUSED_GEMM_PTX))
+        .unwrap();
+    let func2 = module2.load_function("silu_mul_fused_gemm").unwrap();
+    let phase2_params = build_flat_params(
+        gate_up_buf_ptr as u64,
+        down_wt_ptr as u64,
+        c2_ptr as u64,
+        output_ptr as u64,
+        m,
+        hidden,
+        intermediate,
+        gate_up_n,
+        intermediate,
+        hidden,
+        hidden,
+        1.0,
+        0.0,
+    );
+    let intermediate_bytes = (intermediate as u64) * 2;
+    let (gx2, gy2, _) = compute_grid(m, hidden, 64, 128);
+    let cfg2 = LaunchConfig {
+        grid_dim: (gx2, gy2, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864,
+    };
+
+    // Warmup
+    for _ in 0..5 {
+        unsafe {
+            stream
+                .launch_builder(&func1)
+                .arg(&(input_ptr as u64))
+                .arg(&(norm_wt_ptr as u64))
+                .arg(&eps)
+                .arg(&hidden)
+                .arg(&(hidden as u64))
+                .arg(&phase1_params)
+                .launch(cfg1)
+        }
+        .unwrap();
+        unsafe {
+            stream
+                .launch_builder(&func2)
+                .arg(&intermediate_bytes)
+                .arg(&phase2_params)
+                .launch(cfg2)
+        }
+        .unwrap();
+    }
+    stream.synchronize().unwrap();
+
+    // Time 2-launch
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe {
+            stream
+                .launch_builder(&func1)
+                .arg(&(input_ptr as u64))
+                .arg(&(norm_wt_ptr as u64))
+                .arg(&eps)
+                .arg(&hidden)
+                .arg(&(hidden as u64))
+                .arg(&phase1_params)
+                .launch(cfg1)
+        }
+        .unwrap();
+        unsafe {
+            stream
+                .launch_builder(&func2)
+                .arg(&intermediate_bytes)
+                .arg(&phase2_params)
+                .launch(cfg2)
+        }
+        .unwrap();
+    }
+    stream.synchronize().unwrap();
+    let two_launch_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+    // ── Benchmark: single pipeline launch ──
+    let module_mlp = ctx.load_module(Ptx::from_src(MLP_PIPELINE_PTX)).unwrap();
+    let func_mlp = module_mlp.load_function("mlp_pipeline").unwrap();
+
+    let mut d_counter1: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+    let mut d_counter2: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+    let mut d_barrier: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+    let (ctr1_ptr, _) = d_counter1.device_ptr(&stream);
+    let (ctr2_ptr, _) = d_counter2.device_ptr(&stream);
+    let (bar_ptr, _) = d_barrier.device_ptr(&stream);
+
+    let num_blocks = 30u32; // L4 has 30 SMs
+    let total1 = gx1 * gy1;
+    let total2 = gx2 * gy2;
+
+    let mlp_cfg = LaunchConfig {
+        grid_dim: (num_blocks, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864,
+    };
+
+    // Warmup
+    for _ in 0..5 {
+        // Reset counters
+        stream.memcpy_htod(&[0u32], &mut d_counter1).unwrap();
+        stream.memcpy_htod(&[0u32], &mut d_counter2).unwrap();
+        stream.memcpy_htod(&[0u32], &mut d_barrier).unwrap();
+        unsafe {
+            stream
+                .launch_builder(&func_mlp)
+                .arg(&(input_ptr as u64))
+                .arg(&(norm_wt_ptr as u64))
+                .arg(&eps)
+                .arg(&hidden)
+                .arg(&(hidden as u64))
+                .arg(&phase1_params)
+                .arg(&intermediate_bytes)
+                .arg(&phase2_params)
+                .arg(&(ctr1_ptr as u64))
+                .arg(&(ctr2_ptr as u64))
+                .arg(&(bar_ptr as u64))
+                .arg(&num_blocks)
+                .arg(&total1)
+                .arg(&total2)
+                .launch(mlp_cfg)
+        }
+        .unwrap();
+    }
+    stream.synchronize().unwrap();
+
+    // Time pipeline
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        stream.memcpy_htod(&[0u32], &mut d_counter1).unwrap();
+        stream.memcpy_htod(&[0u32], &mut d_counter2).unwrap();
+        stream.memcpy_htod(&[0u32], &mut d_barrier).unwrap();
+        unsafe {
+            stream
+                .launch_builder(&func_mlp)
+                .arg(&(input_ptr as u64))
+                .arg(&(norm_wt_ptr as u64))
+                .arg(&eps)
+                .arg(&hidden)
+                .arg(&(hidden as u64))
+                .arg(&phase1_params)
+                .arg(&intermediate_bytes)
+                .arg(&phase2_params)
+                .arg(&(ctr1_ptr as u64))
+                .arg(&(ctr2_ptr as u64))
+                .arg(&(bar_ptr as u64))
+                .arg(&num_blocks)
+                .arg(&total1)
+                .arg(&total2)
+                .launch(mlp_cfg)
+        }
+        .unwrap();
+    }
+    stream.synchronize().unwrap();
+    let pipeline_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+    println!("  2-launch (rms+GEMM1, SiLU+GEMM2): {two_launch_us:.1} us");
+    println!("  1-launch pipeline:                 {pipeline_us:.1} us");
+    println!("  Speedup: {:.2}x", two_launch_us / pipeline_us);
+}

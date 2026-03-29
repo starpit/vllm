@@ -1107,23 +1107,13 @@ impl LlamaDecoderLayer {
                 );
                 drop(gate_up);
 
-                let mlp_output = if let crate::layers::LinearLayer::Dense(ref down_linear) =
-                    self.mlp.down_proj
-                {
-                    down_linear.forward_ferrite(
-                        activated.view(),
-                        &device.ferrite,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                } else {
-                    self.mlp.down_proj.forward(
-                        activated.view(),
-                        &mut device.cublas,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                };
+                let mlp_output = self.mlp.down_proj.forward_ferrite(
+                    activated.view(),
+                    &mut device.cublas,
+                    &device.ferrite,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
                 drop(activated);
 
                 if self.residual_multiplier != 1.0 {

@@ -2102,3 +2102,156 @@ fn parse_perimeter_args(input: &str) -> Result<(String, String, String, String),
         const_name,
     ))
 }
+
+/// Pipeline-based kernel fusion: analyze two kernel PTX files and produce a
+/// fused kernel via the tiled pipeline model.
+///
+/// Usage:
+/// ```ignore
+/// const FUSED: &str = ptx_fusion_macros::pipeline_fuse!(
+///     "kernels/vllm_rms_norm.ptx",
+///     "kernels/cutlass_bf16_64x64x32_sm89.ptx",
+///     "fused_norm_gemm"
+/// );
+/// ```
+///
+/// Arguments:
+/// 1. Producer kernel PTX path (e.g., rms_norm)
+/// 2. Consumer kernel PTX path (e.g., CUTLASS GEMM)
+/// 3. Fused entry point name
+#[proc_macro]
+pub fn pipeline_fuse(input: TokenStream) -> TokenStream {
+    let args: Vec<_> = input.into_iter().collect();
+
+    // Parse 3 string literal arguments separated by commas
+    let mut strings = Vec::new();
+    for arg in &args {
+        if let proc_macro::TokenTree::Literal(lit) = arg {
+            let s = lit.to_string();
+            if s.starts_with('"') && s.ends_with('"') {
+                strings.push(s[1..s.len() - 1].to_string());
+            }
+        }
+    }
+
+    if strings.len() != 3 {
+        return quote! { compile_error!("pipeline_fuse! expects 3 string arguments: producer_ptx, consumer_ptx, name") }.into();
+    }
+
+    let producer_path = &strings[0];
+    let consumer_path = &strings[1];
+    let fused_name = &strings[2];
+
+    // Resolve paths relative to the ptx-fusion/kernels directory
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let kernel_base = manifest_dir.parent().unwrap().join("ptx-fusion");
+
+    let producer_full = kernel_base.join(producer_path);
+    let consumer_full = kernel_base.join(consumer_path);
+
+    let producer_ptx = match std::fs::read_to_string(&producer_full) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("cannot read {}: {e}", producer_full.display());
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let consumer_ptx = match std::fs::read_to_string(&consumer_full) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("cannot read {}: {e}", consumer_full.display());
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    let producer_stage = match pipeline::PipelineStage::from_ptx("producer", &producer_ptx) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("pipeline_fuse: producer analysis failed: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let consumer_stage = match pipeline::PipelineStage::from_ptx("consumer", &consumer_ptx) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("pipeline_fuse: consumer analysis failed: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    let fused_ptx = match pipeline_compile::fuse_reduction_into_gemm(
+        &producer_stage,
+        &consumer_stage,
+        fused_name,
+    ) {
+        Ok(ptx) => ptx,
+        Err(e) => {
+            let msg = format!("pipeline_fuse: fusion failed: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    // Apply perimeter replacement if derivations exist
+    let deriv_path = consumer_full.with_extension("derivations.json");
+    let final_ptx = if deriv_path.exists() {
+        let deriv_json = std::fs::read_to_string(&deriv_path).unwrap();
+        match perimeter::replace_perimeter(&fused_ptx, &deriv_json, fused_name) {
+            Ok((replaced, _entry)) => {
+                // Dedup register declarations that may have been emitted by both
+                // replace_a_loads_with_inline_fn and replace_perimeter
+                dedup_reg_declarations(&replaced)
+            }
+            Err(_) => fused_ptx,
+        }
+    } else {
+        fused_ptx
+    };
+
+    quote! { #final_ptx }.into()
+}
+
+/// Remove duplicate `.reg` and `.shared` declaration lines from the kernel's
+/// register declaration block. Only dedup lines BEFORE the first non-declaration
+/// line (to avoid removing inline asm `.reg .pred p;` inside epilogue blocks).
+fn dedup_reg_declarations(ptx: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    let mut past_decl_block = false;
+
+    for line in ptx.lines() {
+        let trimmed = line.trim();
+
+        // Track when we leave the register declaration block
+        if !past_decl_block {
+            let is_decl = trimmed.starts_with(".reg ")
+                || trimmed.starts_with(".shared ")
+                || trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("{")
+                || trimmed.starts_with("}")
+                || trimmed.starts_with(".param")
+                || trimmed.starts_with(".visible")
+                || trimmed.starts_with(".entry")
+                || trimmed.starts_with(".version")
+                || trimmed.starts_with(".target")
+                || trimmed.starts_with(".address")
+                || trimmed.starts_with(".global")
+                || trimmed.starts_with(".extern");
+
+            if !is_decl && trimmed.contains('\t') {
+                // First instruction line → we're past the declaration block
+                past_decl_block = true;
+            }
+
+            if !past_decl_block && (trimmed.starts_with(".reg ") || trimmed.starts_with(".shared "))
+            {
+                if !seen.insert(trimmed.to_string()) {
+                    continue; // skip duplicate in decl block only
+                }
+            }
+        }
+
+        result.push(line);
+    }
+    result.join("\n")
+}

@@ -1424,3 +1424,432 @@ fn fused_norm_gemm_model_dims() {
     }
     println!("PASS: all dimensions");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Pipeline-compiled rms_norm + GEMM: ptxas + GPU correctness
+// Uses the new pipeline compiler (not intrinsics) — everything derived
+// from PTX analysis of the real rms_norm and CUTLASS kernels.
+// ══════════════════════════════════════════════════════════════════════
+
+const PIPELINE_FUSED_NORM_GEMM_PTX: &str = ptx_fusion_macros::pipeline_fuse!(
+    "kernels/vllm_rms_norm.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "pipeline_fused_norm_gemm"
+);
+
+#[test]
+fn pipeline_fused_norm_gemm_ptxas() {
+    println!("=== Pipeline-compiled rms_norm+GEMM: ptxas ===");
+
+    // Verify the fused PTX has pipeline markers
+    assert!(
+        PIPELINE_FUSED_NORM_GEMM_PTX.contains("rms_norm prologue"),
+        "should have rms_norm prologue"
+    );
+    assert!(
+        PIPELINE_FUSED_NORM_GEMM_PTX.contains("mma.sync"),
+        "should preserve GEMM MMA"
+    );
+
+    let path = "/tmp/pipeline_fused_norm_gemm.ptx";
+    std::fs::write(path, PIPELINE_FUSED_NORM_GEMM_PTX).unwrap();
+
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stderr.lines().take(20) {
+            println!("  ptxas: {line}");
+        }
+        panic!("ptxas FAILED on pipeline-compiled fused PTX");
+    }
+    println!("PASS: pipeline-compiled fused PTX passes ptxas");
+}
+
+#[test]
+fn pipeline_fused_norm_gemm_gpu() {
+    println!("=== Pipeline-compiled rms_norm+GEMM: GPU correctness ===");
+
+    let ctx = ctx();
+    let m = 64u32;
+    let k = 128u32;
+    let n = 128u32;
+    let eps = 1e-5f32;
+
+    // Generate test data
+    let h_input: Vec<half::bf16> = (0..(m * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_weight: Vec<half::bf16> = (0..k as usize)
+        .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+        .collect();
+    let h_b: Vec<half::bf16> = (0..(n * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+
+    // Reference: CPU rms_norm then GPU GEMM
+    let h_normed = cpu_rms_norm(&h_input, &h_weight, m as usize, k as usize, eps);
+    let ref_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_normed,
+        &h_b,
+        m,
+        n,
+        k,
+    );
+
+    // Fused: pipeline-compiled rms_norm + GEMM
+    let stream = ctx.default_stream();
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_weight = stream.clone_htod(&h_weight).unwrap();
+    let d_b = stream.clone_htod(&h_b).unwrap();
+    let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let mut d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+
+    let module = ctx
+        .load_module(Ptx::from_src(PIPELINE_FUSED_NORM_GEMM_PTX))
+        .unwrap();
+    let func = module.load_function("pipeline_fused_norm_gemm").unwrap();
+
+    let (input_ptr, _) = d_input.device_ptr(&stream);
+    let (weight_ptr, _) = d_weight.device_ptr(&stream);
+    let (b_ptr, _) = d_b.device_ptr(&stream);
+    let (c_ptr, _) = d_c.device_ptr(&stream);
+    let (d_ptr, _) = d_d.device_ptr(&stream);
+
+    // Build flat GEMM params (A_ptr = raw input, norm happens inline)
+    let gemm_params = build_flat_params(
+        input_ptr as u64, // A_ptr
+        b_ptr as u64,
+        c_ptr as u64,
+        d_ptr as u64,
+        m,
+        n,
+        k,
+        k, // lda
+        k, // ldb (column-major B, stride = K)
+        n, // ldc
+        n, // ldd
+        1.0,
+        0.0,
+    );
+
+    let weight_ptr_val = weight_ptr as u64;
+    let hidden_val = k;
+    let a_ptr_val = input_ptr as u64;
+    let a_stride_val = k as u64;
+
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, gz),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864 + 512, // GEMM SMEM + inv_rms array
+    };
+
+    // Params: rms_input(u64), rms_weight(u64), rms_epsilon(f32), rms_hidden(u32),
+    //         rms_a_stride(u64), ferrite_params[88]
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&a_ptr_val) // _ferrite_rms_input
+            .arg(&weight_ptr_val) // _ferrite_rms_weight
+            .arg(&eps) // _ferrite_rms_epsilon
+            .arg(&hidden_val) // _ferrite_rms_hidden
+            .arg(&a_stride_val) // _ferrite_rms_a_stride
+            .arg(&gemm_params) // ferrite_params[88]
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let fused_out = stream.clone_dtoh(&d_d).unwrap();
+
+    // Compare
+    let mut max_diff = 0.0f32;
+    for (i, (r, f)) in ref_out.iter().zip(fused_out.iter()).enumerate() {
+        let diff = (r.to_f32() - f.to_f32()).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+        if diff > 0.5 && i < 10 {
+            println!(
+                "  MISMATCH [{i}]: ref={:.4}, fused={:.4}, diff={diff:.2e}",
+                r.to_f32(),
+                f.to_f32()
+            );
+        }
+    }
+    println!("  M={m}, N={n}, K={k}: max_abs_diff = {max_diff:.2e}");
+    assert!(
+        max_diff < 0.1,
+        "pipeline norm+GEMM diff too large: {max_diff:.2e}"
+    );
+    println!("PASS: pipeline-compiled rms_norm+GEMM matches reference");
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Prologue isolation test: run JUST the rms_norm reduction prologue
+// and verify inv_rms values against CPU reference.
+// ══════════════════════════════════════════════════════════════════════
+
+const PROLOGUE_TEST_PTX: &str = r#"
+.version 8.8
+.target sm_89
+.address_size 64
+
+.visible .entry test_prologue(
+    .param .u64 _ferrite_rms_input,
+    .param .f32 _ferrite_rms_epsilon,
+    .param .u32 _ferrite_rms_hidden,
+    .param .u64 _ferrite_rms_a_stride,
+    .param .u32 _param_nrows,
+    .param .u64 _param_out
+)
+{
+    .reg .f32 %f_rms_inv;
+    .reg .f32 %f_rms_sq, %f_rms_sum;
+    .reg .f32 %f_rms_eps, %f_rms_hdnf;
+    .reg .f32 %f_rms_t0, %f_rms_t1;
+    .reg .b32 %r_rms_k, %r_rms_hdn, %r_rms_step;
+    .reg .b32 %r_rms_row, %r_rms_nrows;
+    .reg .b64 %rd_rms_in, %rd_rms_str;
+    .reg .b64 %rd_rms_rowbase, %rd_rms_cur;
+    .reg .b16 %h_rms_a;
+    .reg .pred %p_rms_lp, %p_rms_row;
+    .reg .b64 %rd_out;
+    .reg .b32 %r_tmp;
+    .shared .align 4 .f32 _ferrite_inv_rms[128];
+    .shared .align 4 .f32 _ferrite_warp_scratch[4];
+
+    ld.param.u64    %rd_rms_in, [_ferrite_rms_input];
+    cvta.to.global.u64  %rd_rms_in, %rd_rms_in;
+    ld.param.f32    %f_rms_eps, [_ferrite_rms_epsilon];
+    ld.param.u32    %r_rms_hdn, [_ferrite_rms_hidden];
+    cvt.rn.f32.u32  %f_rms_hdnf, %r_rms_hdn;
+    ld.param.u64    %rd_rms_str, [_ferrite_rms_a_stride];
+    ld.param.u32    %r_rms_nrows, [_param_nrows];
+    ld.param.u64    %rd_out, [_param_out];
+    cvta.to.global.u64  %rd_out, %rd_out;
+
+    // -- Same prologue as pipeline_compile.rs generates --
+    mov.u32     %r_rms_row, 0;
+$L_rms_row_loop:
+    mov.u32     %r_rms_step, %ctaid.x;
+    mul.lo.s32  %r_rms_step, %r_rms_step, %r_rms_nrows;
+    add.u32     %r_rms_step, %r_rms_step, %r_rms_row;
+    cvt.s64.s32 %rd_rms_rowbase, %r_rms_step;
+    mul.lo.s64  %rd_rms_rowbase, %rd_rms_rowbase, %rd_rms_str;
+    shl.b64     %rd_rms_rowbase, %rd_rms_rowbase, 1;
+    add.s64     %rd_rms_rowbase, %rd_rms_in, %rd_rms_rowbase;
+
+    // K-loop: sum of squares
+    mov.f32     %f_rms_sq, 0f00000000;
+    mov.u32     %r_rms_k, %tid.x;
+$L_rms_k_loop:
+    setp.ge.u32 %p_rms_lp, %r_rms_k, %r_rms_hdn;
+    @%p_rms_lp bra  $L_rms_k_done;
+    cvt.u64.u32 %rd_rms_cur, %r_rms_k;
+    shl.b64     %rd_rms_cur, %rd_rms_cur, 1;
+    add.s64     %rd_rms_cur, %rd_rms_rowbase, %rd_rms_cur;
+    ld.global.nc.b16    %h_rms_a, [%rd_rms_cur];
+    cvt.f32.bf16    %f_rms_t0, %h_rms_a;
+    fma.rn.f32  %f_rms_sq, %f_rms_t0, %f_rms_t0, %f_rms_sq;
+    mov.u32     %r_rms_step, %ntid.x;
+    add.u32     %r_rms_k, %r_rms_k, %r_rms_step;
+    bra     $L_rms_k_loop;
+$L_rms_k_done:
+
+    // Warp shuffle reduction
+    mov.b32     %r_rms_k, %f_rms_sq;
+    shfl.sync.down.b32  %r_rms_step|%p_rms_lp, %r_rms_k, 16, 31, -1;
+    mov.b32     %f_rms_t0, %r_rms_step;
+    mov.b32     %f_rms_t1, %r_rms_k;
+    add.f32     %f_rms_t1, %f_rms_t1, %f_rms_t0;
+    mov.b32     %r_rms_k, %f_rms_t1;
+    shfl.sync.down.b32  %r_rms_step|%p_rms_lp, %r_rms_k, 8, 31, -1;
+    mov.b32     %f_rms_t0, %r_rms_step;
+    mov.b32     %f_rms_t1, %r_rms_k;
+    add.f32     %f_rms_t1, %f_rms_t1, %f_rms_t0;
+    mov.b32     %r_rms_k, %f_rms_t1;
+    shfl.sync.down.b32  %r_rms_step|%p_rms_lp, %r_rms_k, 4, 31, -1;
+    mov.b32     %f_rms_t0, %r_rms_step;
+    mov.b32     %f_rms_t1, %r_rms_k;
+    add.f32     %f_rms_t1, %f_rms_t1, %f_rms_t0;
+    mov.b32     %r_rms_k, %f_rms_t1;
+    shfl.sync.down.b32  %r_rms_step|%p_rms_lp, %r_rms_k, 2, 31, -1;
+    mov.b32     %f_rms_t0, %r_rms_step;
+    mov.b32     %f_rms_t1, %r_rms_k;
+    add.f32     %f_rms_t1, %f_rms_t1, %f_rms_t0;
+    mov.b32     %r_rms_k, %f_rms_t1;
+    shfl.sync.down.b32  %r_rms_step|%p_rms_lp, %r_rms_k, 1, 31, -1;
+    mov.b32     %f_rms_t0, %r_rms_step;
+    mov.b32     %f_rms_t1, %r_rms_k;
+    add.f32     %f_rms_t1, %f_rms_t1, %f_rms_t0;
+    mov.b32     %r_rms_k, %f_rms_t1;
+
+    // SMEM reduce across warps
+    mov.b32     %f_rms_sum, %r_rms_k;
+    mov.u32     %r_rms_step, %tid.x;
+    and.b32     %r_rms_step, %r_rms_step, 31;
+    setp.ne.u32 %p_rms_lp, %r_rms_step, 0;
+    @%p_rms_lp bra  $L_rms_warp_done;
+    mov.u32     %r_rms_step, %tid.x;
+    shr.u32     %r_rms_step, %r_rms_step, 5;
+    shl.b32     %r_rms_step, %r_rms_step, 2;
+    mov.u32     %r_rms_k, _ferrite_warp_scratch;
+    add.s32     %r_rms_step, %r_rms_k, %r_rms_step;
+    st.shared.f32   [%r_rms_step], %f_rms_sum;
+$L_rms_warp_done:
+    bar.sync    15;
+
+    // Thread 0 sums warp contributions and computes inv_rms
+    mov.u32     %r_rms_step, %tid.x;
+    setp.ne.u32 %p_rms_lp, %r_rms_step, 0;
+    @%p_rms_lp bra  $L_rms_reduce_done;
+    mov.u32     %r_rms_k, _ferrite_warp_scratch;
+    ld.shared.f32   %f_rms_sum, [%r_rms_k];
+    ld.shared.f32   %f_rms_t0, [%r_rms_k+4];
+    add.f32     %f_rms_sum, %f_rms_sum, %f_rms_t0;
+    ld.shared.f32   %f_rms_t0, [%r_rms_k+8];
+    add.f32     %f_rms_sum, %f_rms_sum, %f_rms_t0;
+    ld.shared.f32   %f_rms_t0, [%r_rms_k+12];
+    add.f32     %f_rms_sum, %f_rms_sum, %f_rms_t0;
+    div.rn.f32  %f_rms_sum, %f_rms_sum, %f_rms_hdnf;
+    add.f32     %f_rms_sum, %f_rms_sum, %f_rms_eps;
+    rsqrt.approx.f32    %f_rms_sum, %f_rms_sum;
+    mov.u32     %r_rms_k, _ferrite_inv_rms;
+    shl.b32     %r_rms_step, %r_rms_row, 2;
+    add.s32     %r_rms_step, %r_rms_k, %r_rms_step;
+    st.shared.f32   [%r_rms_step], %f_rms_sum;
+$L_rms_reduce_done:
+    bar.sync    15;
+
+    // Advance to next row
+    add.u32     %r_rms_row, %r_rms_row, 1;
+    setp.lt.u32 %p_rms_row, %r_rms_row, %r_rms_nrows;
+    @%p_rms_row bra  $L_rms_row_loop;
+
+    bar.sync    15;
+
+    // -- Write inv_rms array to GMEM (thread 0 only) --
+    mov.u32     %r_rms_step, %tid.x;
+    setp.ne.u32 %p_rms_lp, %r_rms_step, 0;
+    @%p_rms_lp bra  $L_done;
+
+    mov.u32     %r_rms_k, _ferrite_inv_rms;
+    mov.u32     %r_rms_row, 0;
+$L_write_loop:
+    setp.ge.u32 %p_rms_lp, %r_rms_row, %r_rms_nrows;
+    @%p_rms_lp bra  $L_done;
+    shl.b32     %r_rms_step, %r_rms_row, 2;
+    add.s32     %r_tmp, %r_rms_k, %r_rms_step;
+    ld.shared.f32   %f_rms_t0, [%r_tmp];
+    cvt.u64.u32 %rd_rms_cur, %r_rms_step;
+    add.s64     %rd_rms_cur, %rd_out, %rd_rms_cur;
+    st.global.f32   [%rd_rms_cur], %f_rms_t0;
+    add.u32     %r_rms_row, %r_rms_row, 1;
+    bra     $L_write_loop;
+$L_done:
+    ret;
+}
+"#;
+
+#[test]
+fn prologue_isolation_inv_rms() {
+    println!("=== Prologue isolation: verify inv_rms values ===");
+
+    // ptxas check first
+    let path = "/tmp/prologue_isolation.ptx";
+    std::fs::write(path, PROLOGUE_TEST_PTX).unwrap();
+    let ptxas_out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+    if !ptxas_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ptxas_out.stderr);
+        for line in stderr.lines().take(20) {
+            println!("  ptxas: {line}");
+        }
+        panic!("ptxas FAILED on prologue isolation PTX");
+    }
+    println!("  ptxas: PASS");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    let m = 4u32; // small number of rows for quick test
+    let k = 128u32;
+    let eps = 1e-5f32;
+
+    // Generate bf16 input (same pattern as GPU test)
+    let h_input: Vec<half::bf16> = (0..(m * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+
+    // CPU reference: compute inv_rms per row
+    let mut cpu_inv_rms = vec![0.0f32; m as usize];
+    for row in 0..m as usize {
+        let mut sum_sq = 0.0f32;
+        for col in 0..k as usize {
+            let v = h_input[row * k as usize + col].to_f32();
+            sum_sq += v * v;
+        }
+        cpu_inv_rms[row] = (sum_sq / k as f32 + eps).sqrt().recip();
+    }
+
+    // Launch prologue kernel
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_out: CudaSlice<f32> = stream.alloc_zeros(m as usize).unwrap();
+
+    let module = ctx.load_module(Ptx::from_src(PROLOGUE_TEST_PTX)).unwrap();
+    let func = module.load_function("test_prologue").unwrap();
+
+    let (input_ptr, _) = d_input.device_ptr(&stream);
+    let (out_ptr, _) = d_out.device_ptr(&stream);
+    let input_ptr_val = input_ptr as u64;
+    let stride_val = k as u64; // stride in elements
+    let out_ptr_val = out_ptr as u64;
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&input_ptr_val)
+            .arg(&eps)
+            .arg(&k)
+            .arg(&stride_val)
+            .arg(&m)
+            .arg(&out_ptr_val)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let gpu_inv_rms = stream.clone_dtoh(&d_out).unwrap();
+
+    // Compare
+    println!("  Row | CPU inv_rms | GPU inv_rms | diff");
+    let mut max_diff = 0.0f32;
+    for row in 0..m as usize {
+        let diff = (cpu_inv_rms[row] - gpu_inv_rms[row]).abs();
+        let rel_diff = diff / cpu_inv_rms[row].abs().max(1e-10);
+        println!(
+            "  {:3} | {:11.6} | {:11.6} | {:.2e} (rel {:.2e})",
+            row, cpu_inv_rms[row], gpu_inv_rms[row], diff, rel_diff
+        );
+        if diff > max_diff {
+            max_diff = diff;
+        }
+    }
+    // Allow small tolerance for bf16 rounding in sum-of-squares
+    assert!(max_diff < 0.5, "inv_rms mismatch too large: {max_diff:.2e}");
+    println!("PASS: prologue produces correct inv_rms (max_diff = {max_diff:.2e})");
+}

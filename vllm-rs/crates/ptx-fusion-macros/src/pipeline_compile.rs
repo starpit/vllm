@@ -94,6 +94,8 @@ fn build_reduction_computation(
         ".reg .pred %p_rms_lp, %p_rms_row;".into(),
         // inv_rms array in SMEM (one per tile row, max 128 rows)
         ".shared .align 4 .f32 _ferrite_inv_rms[128];".into(),
+        // Scratch SMEM for warp-level reduction (4 warps max)
+        ".shared .align 4 .f32 _ferrite_warp_scratch[4];".into(),
     ];
 
     // ── Param loads ──
@@ -295,19 +297,19 @@ fn build_prologue_from_decomposition(decomp: &ReductionDecomposition) -> Vec<Str
         prologue.push("mov.b32 \t%r_rms_k, %f_rms_t1;".into());
     }
 
-    // SMEM reduce across warps
+    // SMEM reduce across warps (use scratch, not inv_rms array)
     prologue.push("// SMEM reduce across warps".into());
     prologue.push("mov.b32 \t%f_rms_sum, %r_rms_k;".into());
-    // Lane 0 of each warp writes to SMEM
+    // Lane 0 of each warp writes to scratch SMEM
     prologue.push("mov.u32 \t%r_rms_step, %tid.x;".into());
     prologue.push("and.b32 \t%r_rms_step, %r_rms_step, 31;".into());
     prologue.push("setp.ne.u32 \t%p_rms_lp, %r_rms_step, 0;".into());
     prologue.push("@%p_rms_lp bra \t$L_rms_warp_done;".into());
-    // Write to shared[warp_id * 4]
+    // Write to warp_scratch[warp_id * 4]
     prologue.push("mov.u32 \t%r_rms_step, %tid.x;".into());
     prologue.push("shr.u32 \t%r_rms_step, %r_rms_step, 5;".into()); // warp_id
     prologue.push("shl.b32 \t%r_rms_step, %r_rms_step, 2;".into()); // * 4 bytes
-    prologue.push("mov.u32 \t%r_rms_k, _ferrite_inv_rms;".into());
+    prologue.push("mov.u32 \t%r_rms_k, _ferrite_warp_scratch;".into());
     prologue.push("add.s32 \t%r_rms_step, %r_rms_k, %r_rms_step;".into());
     prologue.push("st.shared.f32 \t[%r_rms_step], %f_rms_sum;".into());
     prologue.push("$L_rms_warp_done:".into());
@@ -317,8 +319,8 @@ fn build_prologue_from_decomposition(decomp: &ReductionDecomposition) -> Vec<Str
     prologue.push("mov.u32 \t%r_rms_step, %tid.x;".into());
     prologue.push("setp.ne.u32 \t%p_rms_lp, %r_rms_step, 0;".into());
     prologue.push("@%p_rms_lp bra \t$L_rms_reduce_done;".into());
-    // Sum 4 warp contributions (128 threads / 32 = 4 warps)
-    prologue.push("mov.u32 \t%r_rms_k, _ferrite_inv_rms;".into());
+    // Sum 4 warp contributions from scratch SMEM
+    prologue.push("mov.u32 \t%r_rms_k, _ferrite_warp_scratch;".into());
     prologue.push("ld.shared.f32 \t%f_rms_sum, [%r_rms_k];".into());
     prologue.push("ld.shared.f32 \t%f_rms_t0, [%r_rms_k+4];".into());
     prologue.push("add.f32 \t%f_rms_sum, %f_rms_sum, %f_rms_t0;".into());
@@ -330,7 +332,8 @@ fn build_prologue_from_decomposition(decomp: &ReductionDecomposition) -> Vec<Str
     prologue.push("div.rn.f32 \t%f_rms_sum, %f_rms_sum, %f_rms_hdnf;".into());
     prologue.push("add.f32 \t%f_rms_sum, %f_rms_sum, %f_rms_eps;".into());
     prologue.push("rsqrt.approx.f32 \t%f_rms_sum, %f_rms_sum;".into());
-    // Store inv_rms in SMEM array at row index
+    // Store inv_rms in inv_rms SMEM array at row index (NOT the warp scratch)
+    prologue.push("mov.u32 \t%r_rms_k, _ferrite_inv_rms;".into());
     prologue.push("shl.b32 \t%r_rms_step, %r_rms_row, 2;".into()); // row * 4
     prologue.push("add.s32 \t%r_rms_step, %r_rms_k, %r_rms_step;".into());
     prologue.push("st.shared.f32 \t[%r_rms_step], %f_rms_sum;".into());
@@ -458,10 +461,55 @@ mod tests {
                 );
             }
             Err(e) => {
-                // For the MVP, we may not pass ptxas validation yet,
-                // but the compilation should produce PTX
                 panic!("fuse_reduction_into_gemm failed: {e}");
             }
         }
+    }
+
+    #[test]
+    fn fused_norm_gemm_ptxas_valid() {
+        let rms_ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
+
+        let rms_stage = PipelineStage::from_ptx("rms_norm", rms_ptx).expect("parse rms_norm");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx).expect("parse gemm");
+
+        let fused_ptx =
+            fuse_reduction_into_gemm(&rms_stage, &gemm_stage, "fused_norm_gemm").expect("fuse");
+
+        let path = "/tmp/pipeline_fused_norm_gemm.ptx";
+        std::fs::write(path, &fused_ptx).unwrap();
+
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", path])
+            .output()
+            .expect("ptxas not found");
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("ptxas stderr:");
+            for line in stderr.lines().take(30) {
+                eprintln!("  {line}");
+            }
+            // Print the fused PTX around the error lines
+            for line in stderr.lines() {
+                if let Some(lnum) = line
+                    .split('(')
+                    .nth(1)
+                    .and_then(|s| s.split(')').next())
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    let ptx_lines: Vec<&str> = fused_ptx.lines().collect();
+                    let start = lnum.saturating_sub(3);
+                    let end = (lnum + 3).min(ptx_lines.len());
+                    for i in start..end {
+                        let marker = if i + 1 == lnum { ">>>" } else { "   " };
+                        eprintln!("{marker} {:4}: {}", i + 1, ptx_lines[i]);
+                    }
+                }
+            }
+            panic!("ptxas FAILED on pipeline-compiled fused PTX");
+        }
+        println!("PASS: pipeline-compiled fused PTX passes ptxas");
     }
 }

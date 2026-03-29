@@ -35,16 +35,6 @@ const FUSED_NORM_GEMM: ptx_fusion::FeriteKernel = ptx_fusion::compile!(
     name = "ferrite_fused_norm_gemm",
 );
 
-// Full MLP pipeline: rms_norm + GEMM_gate_up → barrier → SiLU+mul + GEMM_down
-// Single persistent kernel for the entire MLP block.
-#[cfg(feature = "ferrite")]
-const MLP_PIPELINE_PTX: &str = ptx_fusion::mlp_pipeline_fuse!(
-    "kernels/vllm_rms_norm.ptx",
-    "kernels/vllm_silu_mul.ptx",
-    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
-    "ferrite_mlp_pipeline"
-);
-
 // ---------------------------------------------------------------------------
 // ForwardOutput — PP-aware return type
 // ---------------------------------------------------------------------------
@@ -1094,22 +1084,47 @@ impl LlamaDecoderLayer {
                 drop(o_out);
             }
 
-            if let (
-                crate::layers::LinearLayer::Dense(gate_up_linear),
-                crate::layers::LinearLayer::Dense(down_linear),
-            ) = (&self.mlp.gate_up_proj, &self.mlp.down_proj)
-            {
-                let mlp_output = crate::ferrite::launch_mlp_pipeline(
-                    MLP_PIPELINE_PTX,
+            if let crate::layers::LinearLayer::Dense(ref gate_up_linear) = self.mlp.gate_up_proj {
+                let gate_up = crate::ferrite::launch_fused_norm_gemm(
+                    &FUSED_NORM_GEMM,
                     *residual,
+                    gate_up_linear.weight,
                     self.post_attention_layernorm.weight,
                     self.post_attention_layernorm.eps,
-                    gate_up_linear.weight,
-                    down_linear.weight,
-                    device.num_sm as u32,
+                    hidden,
+                    None,
+                    1.0,
+                    0.0,
                     &mut device.caching,
                     device.compute_stream,
                 );
+
+                let activated = kernels::silu_and_mul_fused(
+                    gate_up.as_gpu_tensor(),
+                    self.mlp.intermediate_size,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(gate_up);
+
+                let mlp_output = if let crate::layers::LinearLayer::Dense(ref down_linear) =
+                    self.mlp.down_proj
+                {
+                    down_linear.forward_ferrite(
+                        activated.view(),
+                        &device.ferrite,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                } else {
+                    self.mlp.down_proj.forward(
+                        activated.view(),
+                        &mut device.cublas,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                };
+                drop(activated);
 
                 if self.residual_multiplier != 1.0 {
                     kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);

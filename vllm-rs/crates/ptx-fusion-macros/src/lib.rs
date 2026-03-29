@@ -1312,9 +1312,9 @@ pub fn fuse(input: TokenStream) -> TokenStream {
         let gemm_ptx = &consumer.1;
 
         // Pipeline analysis
-        let producer_stage = pipeline::PipelineStage::from_ptx("producer", &producer_ptx)
+        let producer_stage = pipeline::PipelineStage::from_ptx("producer", &producer_ptx, None)
             .unwrap_or_else(|e| panic!("fuse!: producer PTX analysis failed: {e}"));
-        let consumer_stage = pipeline::PipelineStage::from_ptx("consumer", gemm_ptx)
+        let consumer_stage = pipeline::PipelineStage::from_ptx("consumer", gemm_ptx, None)
             .unwrap_or_else(|e| panic!("fuse!: consumer PTX analysis failed: {e}"));
 
         let fused = pipeline_compile::fuse_reduction_into_gemm(
@@ -1624,10 +1624,18 @@ pub fn compile(input: TokenStream) -> TokenStream {
     // Analyze both kernels as pipeline stages to determine fusion strategy
     let fused_ptx = if !producer.1.ptx_content.is_empty() && !consumer.1.ptx_content.is_empty() {
         // Both have PTX — analyze patterns from the actual code
-        let producer_stage = pipeline::PipelineStage::from_ptx("producer", &producer.1.ptx_content)
-            .unwrap_or_else(|e| panic!("compile!: producer PTX analysis failed: {e}"));
-        let consumer_stage = pipeline::PipelineStage::from_ptx("consumer", &consumer.1.ptx_content)
-            .unwrap_or_else(|e| panic!("compile!: consumer PTX analysis failed: {e}"));
+        let producer_stage = pipeline::PipelineStage::from_ptx(
+            "producer",
+            &producer.1.ptx_content,
+            producer.1.entry_hint.as_deref(),
+        )
+        .unwrap_or_else(|e| panic!("compile!: producer PTX analysis failed: {e}"));
+        let consumer_stage = pipeline::PipelineStage::from_ptx(
+            "consumer",
+            &consumer.1.ptx_content,
+            consumer.1.entry_hint.as_deref(),
+        )
+        .unwrap_or_else(|e| panic!("compile!: consumer PTX analysis failed: {e}"));
 
         let fused = match (&producer_stage.pattern, &consumer_stage.pattern) {
             (
@@ -1706,6 +1714,7 @@ struct ResolvedKernel {
     source: String,      // "intrinsic:rms_norm" or "manifest:gemm_64x128x32"
     ptx_content: String, // actual PTX text (empty for intrinsics)
     derivations_content: Option<String>,
+    entry_hint: Option<String>,
     tile_m: u32,
     tile_n: u32,
     threads: u32,
@@ -1791,6 +1800,11 @@ fn parse_compile_args(
                         source: format!("manifest:{kernel_name}"),
                         ptx_content,
                         derivations_content: None,
+                        entry_hint: if mk.entry_hint.is_empty() {
+                            None
+                        } else {
+                            Some(mk.entry_hint.clone())
+                        },
                         tile_m: mk.tile.0,
                         tile_n: mk.tile.1,
                         threads: mk.threads,
@@ -1823,6 +1837,11 @@ fn parse_compile_args(
                         source: format!("manifest:{kernel_name}"),
                         ptx_content,
                         derivations_content,
+                        entry_hint: if mk.entry_hint.is_empty() {
+                            None
+                        } else {
+                            Some(mk.entry_hint.clone())
+                        },
                         tile_m: mk.tile.0,
                         tile_n: mk.tile.1,
                         threads: mk.threads,
@@ -2073,8 +2092,8 @@ pub fn pipeline_fuse(input: TokenStream) -> TokenStream {
         }
     }
 
-    if strings.len() != 3 {
-        return quote! { compile_error!("pipeline_fuse! expects 3 string arguments: producer_ptx, consumer_ptx, name") }.into();
+    if strings.len() < 3 {
+        return quote! { compile_error!("pipeline_fuse! expects 3-4 string arguments: producer_ptx, consumer_ptx, name[, producer_entry_hint]") }.into();
     }
 
     let producer_path = &strings[0];
@@ -2103,14 +2122,18 @@ pub fn pipeline_fuse(input: TokenStream) -> TokenStream {
         }
     };
 
-    let producer_stage = match pipeline::PipelineStage::from_ptx("producer", &producer_ptx) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("pipeline_fuse: producer analysis failed: {e}");
-            return quote! { compile_error!(#msg) }.into();
-        }
-    };
-    let consumer_stage = match pipeline::PipelineStage::from_ptx("consumer", &consumer_ptx) {
+    // Optional 4th arg: producer entry hint (e.g., "bfloat16")
+    let producer_entry_hint = strings.get(3).map(|s| s.as_str());
+
+    let producer_stage =
+        match pipeline::PipelineStage::from_ptx("producer", &producer_ptx, producer_entry_hint) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("pipeline_fuse: producer analysis failed: {e}");
+                return quote! { compile_error!(#msg) }.into();
+            }
+        };
+    let consumer_stage = match pipeline::PipelineStage::from_ptx("consumer", &consumer_ptx, None) {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("pipeline_fuse: consumer analysis failed: {e}");

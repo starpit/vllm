@@ -111,12 +111,33 @@ impl PipelineStage {
     /// 3. `analyze_carries()` for carry registers per loop
     /// 4. Pattern classification based on the above
     /// 5. Finalization block detection
-    pub fn from_ptx(name: &str, source: &str) -> Result<Self, String> {
-        let protocol = PtxParser::parse(source)?;
+    pub fn from_ptx(name: &str, source: &str, entry_hint: Option<&str>) -> Result<Self, String> {
+        // If an entry hint is provided, extract that specific entry first,
+        // then parse the single-entry result. This ensures we analyze the
+        // correct variant (e.g., bf16 instead of f32 for multi-entry PTX).
+        let pre_extracted;
+        let effective_source = if let Some(hint) = entry_hint {
+            let raw_lines: Vec<&str> = source.lines().collect();
+            let entry_count = raw_lines
+                .iter()
+                .filter(|l| l.contains(".entry") && l.contains('('))
+                .count();
+            if entry_count > 1 {
+                pre_extracted = crate::extract::extract_entry(source, hint)
+                    .map_err(|e| format!("entry hint '{hint}': {e}"))?;
+                &pre_extracted
+            } else {
+                source
+            }
+        } else {
+            source
+        };
 
-        // For multi-entry PTX, extract the first entry so loop/carry analysis
-        // only sees one kernel, not all entries.
-        let raw_lines: Vec<&str> = source.lines().collect();
+        let protocol = PtxParser::parse(effective_source)?;
+
+        // For multi-entry PTX (when no hint was provided), extract the first entry
+        // so loop/carry analysis only sees one kernel.
+        let raw_lines: Vec<&str> = effective_source.lines().collect();
         let entry_count = raw_lines
             .iter()
             .filter(|l| l.contains(".entry") && l.contains('('))
@@ -128,7 +149,7 @@ impl PipelineStage {
             } else {
                 &protocol.name
             };
-            extracted = crate::extract::extract_entry(source, substr)
+            extracted = crate::extract::extract_entry(effective_source, substr)
                 .map_err(|e| format!("multi-entry: {e}"))?;
             extracted.lines().collect()
         } else {
@@ -413,7 +434,7 @@ mod tests {
     #[test]
     fn stage_extract_rms_norm() {
         let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
-        let stage = PipelineStage::from_ptx("rms_norm", ptx).expect("extraction failed");
+        let stage = PipelineStage::from_ptx("rms_norm", ptx, None).expect("extraction failed");
 
         // Should be classified as Reduction
         match &stage.pattern {
@@ -456,7 +477,7 @@ mod tests {
     #[test]
     fn stage_extract_cutlass_gemm() {
         let ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
-        let stage = PipelineStage::from_ptx("gemm", ptx).expect("extraction failed");
+        let stage = PipelineStage::from_ptx("gemm", ptx, None).expect("extraction failed");
 
         match &stage.pattern {
             StagePattern::TiledGemm {
@@ -481,7 +502,7 @@ mod tests {
     #[test]
     fn stage_extract_silu_mul() {
         let ptx = include_str!("../../ptx-fusion/kernels/vllm_silu_mul.ptx");
-        let stage = PipelineStage::from_ptx("silu_mul", ptx).expect("extraction failed");
+        let stage = PipelineStage::from_ptx("silu_mul", ptx, None).expect("extraction failed");
 
         // silu_mul has loops (it's vectorized) but they shouldn't have
         // accumulator carries — the loop just processes elements independently.
@@ -503,7 +524,7 @@ mod tests {
     #[test]
     fn stage_extract_scale() {
         let ptx = include_str!("../../ptx-fusion/kernels/scale.ptx");
-        let stage = PipelineStage::from_ptx("scale", ptx).expect("extraction failed");
+        let stage = PipelineStage::from_ptx("scale", ptx, None).expect("extraction failed");
 
         match &stage.pattern {
             StagePattern::Pointwise => {} // correct
@@ -514,7 +535,7 @@ mod tests {
     #[test]
     fn decompose_rms_norm_reduction() {
         let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
-        let stage = PipelineStage::from_ptx("rms_norm", ptx).expect("extraction failed");
+        let stage = PipelineStage::from_ptx("rms_norm", ptx, None).expect("extraction failed");
 
         let decomp = stage
             .decompose_reduction()
@@ -586,7 +607,7 @@ mod tests {
     #[test]
     fn dump_rms_norm_decomposition() {
         let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
-        let stage = PipelineStage::from_ptx("rms_norm", ptx).expect("extraction failed");
+        let stage = PipelineStage::from_ptx("rms_norm", ptx, None).expect("extraction failed");
         let decomp = stage.decompose_reduction().expect("decompose failed");
 
         eprintln!(
@@ -632,7 +653,7 @@ mod tests {
     #[test]
     fn decompose_pointwise_returns_none() {
         let ptx = include_str!("../../ptx-fusion/kernels/scale.ptx");
-        let stage = PipelineStage::from_ptx("scale", ptx).expect("extraction failed");
+        let stage = PipelineStage::from_ptx("scale", ptx, None).expect("extraction failed");
         assert!(
             stage.decompose_reduction().is_none(),
             "pointwise stage should not decompose as reduction"

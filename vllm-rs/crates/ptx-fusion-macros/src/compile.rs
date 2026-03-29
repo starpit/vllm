@@ -22,6 +22,7 @@ pub(crate) struct ManifestKernel {
     pub name: String,
     pub ptx_path: String,
     pub derivations_path: String,
+    pub entry_hint: String,
     pub tile: (u32, u32, u32),
     pub threads: u32,
     pub smem: u32,
@@ -64,6 +65,7 @@ pub(crate) fn parse_manifest(toml: &str) -> Result<Manifest, String> {
                         name: kernel_name.to_string(),
                         ptx_path: String::new(),
                         derivations_path: String::new(),
+                        entry_hint: String::new(),
                         tile: (0, 0, 0),
                         threads: 0,
                         smem: 0,
@@ -86,6 +88,7 @@ pub(crate) fn parse_manifest(toml: &str) -> Result<Manifest, String> {
                 match key {
                     "ptx" => kernel.ptx_path = val.to_string(),
                     "derivations" => kernel.derivations_path = val.to_string(),
+                    "entry" => kernel.entry_hint = val.to_string(),
                     "threads" => {
                         kernel.threads = val.parse().map_err(|e| format!("bad threads: {e}"))?
                     }

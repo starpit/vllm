@@ -360,35 +360,145 @@ fn build_reduction_computation(
     ];
 
     // ── Extra register declarations ──
-    let extra_reg_decls = vec![
-        ".reg .f32 %f_rms_inv;".into(), // selected inv_rms for current site
-        ".reg .f32 %f_rms_inv0, %f_rms_inv1;".into(), // inv_rms for row 0 and row 1
-        ".reg .f32 %f_rms_sq, %f_rms_sum;".into(), // accumulation scratch
-        ".reg .f32 %f_rms_eps, %f_rms_hdnf;".into(),
-        ".reg .f32 %f_rms_t0, %f_rms_t1;".into(),
-        ".reg .b32 %r_rms_k, %r_rms_hdn, %r_rms_step;".into(),
-        ".reg .b32 %r_rms_row, %r_rms_nrows, %r_rms_mtile;".into(),
-        ".reg .b64 %rd_rms_in, %rd_rms_wt, %rd_rms_str;".into(),
-        ".reg .b64 %rd_rms_rowbase, %rd_rms_cur;".into(),
-        ".reg .b64 %rd_rms_rb0, %rd_rms_rb1;".into(), // GMEM row base addresses for parity select
-        ".reg .pred %p_rms_lp, %p_rms_row, %p_rms_par;".into(),
-        // inv_rms array in SMEM (one per tile row, max 128 rows)
-        ".shared .align 4 .f32 _ferrite_inv_rms[128];".into(),
-        // Scratch SMEM for warp-level reduction (4 warps max)
-        ".shared .align 4 .f32 _ferrite_warp_scratch[4];".into(),
-    ];
+    // Extract register declarations from the reduction kernel's source and rename them.
+    // This ensures the transplanted code has all the registers it needs.
+    // The .reg syntax uses ranges like %f<98> (declares %f0..%f97).
+    // We rename these to %f_rms_<98> (declares %f_rms_0..%f_rms_97).
+    let mut extra_reg_decls: Vec<String> = Vec::new();
+    for line in &reduction.source_lines {
+        let t = line.trim();
+        if t.starts_with(".reg ") {
+            // Rename register range declarations: %f<98> → %f_rms_<98>
+            let mut renamed = t.to_string();
+            let reg_types = ["rd", "rs", "f", "r", "p"];
+            for typ in &reg_types {
+                let pattern = format!("%{typ}<");
+                let replacement = format!("%{typ}_rms_<");
+                renamed = renamed.replace(&pattern, &replacement);
+            }
+            extra_reg_decls.push(renamed);
+        }
+    }
+    // Plumbing registers for the prologue infrastructure (row loop, inv_rms loading)
+    extra_reg_decls.push(".reg .f32 %f_rms_inv;".into());
+    extra_reg_decls.push(".reg .f32 %f_rms_inv0, %f_rms_inv1;".into());
+    extra_reg_decls.push(".reg .b32 %r_rms_k, %r_rms_hdn, %r_rms_step;".into());
+    extra_reg_decls.push(".reg .b32 %r_rms_row, %r_rms_nrows, %r_rms_mtile;".into());
+    extra_reg_decls.push(".reg .b64 %rd_rms_in, %rd_rms_wt, %rd_rms_str;".into());
+    extra_reg_decls.push(".reg .b64 %rd_rms_rb0, %rd_rms_rb1;".into());
+    extra_reg_decls.push(".reg .b64 %rd_rms_cur;".into());
+    extra_reg_decls.push(".reg .pred %p_rms_lp, %p_rms_row, %p_rms_par;".into());
+    // SMEM for inv_rms array and warp reduction scratch
+    extra_reg_decls.push(".shared .align 4 .f32 _ferrite_inv_rms[128];".into());
+    extra_reg_decls.push(".shared .align 4 .f32 _ferrite_warp_scratch[8];".into());
+    extra_reg_decls.push(".shared .align 4 .f32 _ferrite_s_inv_rms;".into());
 
     // ── Param loads ──
-    let param_loads = vec![
-        "ld.param.u64 \t%rd_rms_in, [_ferrite_rms_input];".into(),
-        "cvta.to.global.u64 \t%rd_rms_in, %rd_rms_in;".into(),
-        "ld.param.u64 \t%rd_rms_wt, [_ferrite_rms_weight];".into(),
-        "cvta.to.global.u64 \t%rd_rms_wt, %rd_rms_wt;".into(),
-        "ld.param.f32 \t%f_rms_eps, [_ferrite_rms_epsilon];".into(),
-        "ld.param.u32 \t%r_rms_hdn, [_ferrite_rms_hidden];".into(),
-        "cvt.rn.f32.u32 \t%f_rms_hdnf, %r_rms_hdn;".into(),
-        "ld.param.u64 \t%rd_rms_str, [_ferrite_rms_a_stride];".into(),
+    // Parse the extracted kernel's ld.param and cvta.to.global lines to find
+    // which registers hold which params. Emit ferrite param loads into the
+    // renamed registers, so the transplanted code sees the correct values.
+    let prefix = "rms";
+    let mut param_loads: Vec<String> = Vec::new();
+
+    // Map original param name suffixes to ferrite param names
+    // rms_norm: param_0=output, param_1=input, param_2=weight, param_3=eps, param_4=hidden
+    let ferrite_param_map: &[(&str, Option<&str>)] = &[
+        ("param_0", None),                         // output ptr — not needed
+        ("param_1", Some("_ferrite_rms_input")),   // input ptr
+        ("param_2", Some("_ferrite_rms_weight")),  // weight ptr
+        ("param_3", Some("_ferrite_rms_epsilon")), // epsilon
+        ("param_4", Some("_ferrite_rms_hidden")),  // hidden_size
     ];
+
+    // For each ld.param in the source, emit a renamed version loading from ferrite params
+    for line in &reduction.source_lines {
+        let t = line.trim();
+        if !t.contains("ld.param") {
+            continue;
+        }
+        for &(param_suffix, ferrite_name) in ferrite_param_map {
+            if t.contains(param_suffix) {
+                if let Some(ferrite) = ferrite_name {
+                    let renamed = rename_ptx_regs(t, prefix);
+                    // Replace [original_param_name] with [ferrite_param_name]
+                    if let (Some(bs), Some(be)) = (renamed.find('['), renamed.find(']')) {
+                        let mut new_line = renamed[..bs + 1].to_string();
+                        new_line.push_str(ferrite);
+                        new_line.push_str(&renamed[be..]);
+                        param_loads.push(new_line);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Emit renamed cvta.to.global lines (convert device → global address space)
+    for line in &reduction.source_lines {
+        let t = line.trim();
+        if t.contains("cvta.to.global") {
+            param_loads.push(rename_ptx_regs(t, prefix));
+        }
+    }
+
+    // Stride param (not in original kernel — added by ferrite for non-contiguous tensors)
+    param_loads.push("ld.param.u64 \t%rd_rms_str, [_ferrite_rms_a_stride];".into());
+
+    // Copy renamed global pointers to plumbing registers for per-site/row-loop code.
+    // Find which renamed register is the global input ptr and weight ptr by tracing
+    // the cvta chain: ld.param %rdN, [param_1] → cvta %rdM, %rdN → %rdM = global input
+    for &(param_suffix, ferrite_name) in ferrite_param_map {
+        if ferrite_name.is_none() {
+            continue;
+        }
+        // Find the ld.param dest register for this param
+        let mut ld_dest = String::new();
+        for line in &reduction.source_lines {
+            let t = line.trim();
+            if t.contains("ld.param") && t.contains(param_suffix) {
+                let parts: Vec<&str> = t.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    ld_dest = parts[1].trim_end_matches(',').to_string();
+                }
+                break;
+            }
+        }
+        if ld_dest.is_empty() {
+            continue;
+        }
+        // Find the cvta that uses this register as source
+        for line in &reduction.source_lines {
+            let t = line.trim();
+            if t.contains("cvta.to.global") && t.contains(&ld_dest) {
+                let parts: Vec<&str> = t.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    let cvta_dest = rename_ptx_regs(parts[1].trim_end_matches(','), prefix);
+                    match ferrite_name {
+                        Some("_ferrite_rms_input") => {
+                            param_loads.push(format!("mov.u64 \t%rd_rms_in, {cvta_dest};"));
+                        }
+                        Some("_ferrite_rms_weight") => {
+                            param_loads.push(format!("mov.u64 \t%rd_rms_wt, {cvta_dest};"));
+                        }
+                        _ => {}
+                    }
+                }
+                break;
+            }
+        }
+    }
+    // Also copy hidden_size to plumbing register
+    for line in &reduction.source_lines {
+        let t = line.trim();
+        if t.contains("ld.param") && t.contains("param_4") {
+            let parts: Vec<&str> = t.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let dest = rename_ptx_regs(parts[1].trim_end_matches(','), prefix);
+                param_loads.push(format!("mov.u32 \t%r_rms_hdn, {dest};"));
+            }
+            break;
+        }
+    }
 
     // ── Prologue: compute inv_rms for each tile row ──
     //
@@ -433,6 +543,7 @@ fn build_reduction_computation(
 
     let prologue = build_prologue_from_decomposition(
         decomp,
+        &reduction.source_lines,
         thread_map.as_ref(),
         tile_m,
         tile_n,
@@ -503,163 +614,357 @@ fn build_reduction_computation(
     })
 }
 
-/// Generate the prologue PTX for the reduction.
+/// Rename PTX registers in a line with a prefix.
 ///
-/// All threads in the CTA cooperate on reducing each row in the tile.
-/// The formula (sum-of-squares → rsqrt) is derived from the decomposition's
-/// accumulate and finalize phases.
+/// `%f17` → `%f_<prefix>_17`, `%rd4` → `%rd_<prefix>_4`, etc.
+/// Skips special registers (`%tid`, `%ntid`, `%ctaid`, `%nctaid`, `%laneid`, `%warpid`).
+fn rename_ptx_regs(line: &str, prefix: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len() + 64);
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            // Check for special registers first (must NOT rename these)
+            let rest = &line[i + 1..];
+            if rest.starts_with("tid.")
+                || rest.starts_with("ntid.")
+                || rest.starts_with("ctaid.")
+                || rest.starts_with("nctaid.")
+                || rest.starts_with("laneid")
+                || rest.starts_with("warpid")
+            {
+                result.push(b'%');
+                i += 1;
+                continue;
+            }
+
+            // Try to match register types (longest first: rd, rs before r)
+            let reg_types = ["rd", "rs", "f", "r", "p"];
+            let mut matched = false;
+            for typ in &reg_types {
+                if rest.starts_with(typ) {
+                    let after_type = &rest[typ.len()..];
+                    let digit_count = after_type
+                        .as_bytes()
+                        .iter()
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    if digit_count > 0 {
+                        // Found a register: %<type><digits>
+                        let digits = &after_type[..digit_count];
+                        result.push(b'%');
+                        result.extend_from_slice(typ.as_bytes());
+                        result.push(b'_');
+                        result.extend_from_slice(prefix.as_bytes());
+                        result.push(b'_');
+                        result.extend_from_slice(digits.as_bytes());
+                        i += 1 + typ.len() + digit_count;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if !matched {
+                result.push(bytes[i]);
+                i += 1;
+            }
+        } else if bytes[i] == b'$' && line[i..].starts_with("$L__BB") {
+            // Label: $L__BB<N>_<M> → $L_<prefix>_<N>_<M>
+            let rest = &line[i + 6..]; // after "$L__BB"
+            let d1_count = rest
+                .as_bytes()
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            if d1_count > 0 {
+                let d1 = &rest[..d1_count];
+                let after_d1 = &rest[d1_count..];
+                if after_d1.starts_with('_') {
+                    let d2_start = &after_d1[1..];
+                    let d2_count = d2_start
+                        .as_bytes()
+                        .iter()
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    if d2_count > 0 {
+                        let d2 = &d2_start[..d2_count];
+                        result.extend_from_slice(b"$L_");
+                        result.extend_from_slice(prefix.as_bytes());
+                        result.push(b'_');
+                        result.extend_from_slice(d1.as_bytes());
+                        result.push(b'_');
+                        result.extend_from_slice(d2.as_bytes());
+                        i += 6 + d1_count + 1 + d2_count;
+                        continue;
+                    }
+                }
+            }
+            result.push(bytes[i]);
+            i += 1;
+        } else {
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    String::from_utf8(result).unwrap_or_else(|_| line.to_string())
+}
+
+/// Determine if a source line should be skipped when transplanting into the prologue.
+///
+/// We skip: declarations, param loads, cvta for params, ctaid.x row computation.
+/// These are replaced by ferrite's own param initialization and row loop.
+fn is_transplant_skip(line: &str) -> bool {
+    let t = line.trim();
+    // Skip empty lines and comments
+    if t.is_empty() || t.starts_with("//") {
+        return true;
+    }
+    // Skip entry declaration and its param list
+    if t.starts_with(".entry") || t.starts_with(".visible") || t.starts_with(")") {
+        return true;
+    }
+    // Skip .param declarations (entry signature params, not ld.param)
+    if t.starts_with(".param ") {
+        return true;
+    }
+    // Skip braces (entry body delimiters)
+    if t == "{" || t == "}" {
+        return true;
+    }
+    // Skip register and shared memory declarations
+    if t.starts_with(".reg ") || t.starts_with(".shared ") {
+        return true;
+    }
+    // Skip PTX header directives
+    if t.starts_with(".version") || t.starts_with(".target") || t.starts_with(".address_size") {
+        return true;
+    }
+    // Skip param loads (we provide our own from ferrite params)
+    if t.contains("ld.param") {
+        return true;
+    }
+    // Skip cvta.to.global that set up param pointers
+    if t.contains("cvta.to.global") {
+        return true;
+    }
+    // Skip ctaid.x row offset computation (replaced by m_tile * tile_m + row)
+    if t.contains("%ctaid.x") || t.contains("%ctaid.y") {
+        return true;
+    }
+    // Skip demoted variable comments (nvcc metadata)
+    if t.starts_with("// demoted") {
+        return true;
+    }
+    false
+}
+
+/// Generate the prologue PTX by transplanting extracted code from the reduction kernel.
+///
+/// Every computational instruction (FMA, shuffle, SMEM reduce, rsqrt) comes verbatim
+/// from the actual rms_norm kernel's PTX, with register/label/SMEM renaming.
+/// Only plumbing is new: param initialization, m_tile computation, row loop.
 fn build_prologue_from_decomposition(
     decomp: &ReductionDecomposition,
+    source_lines: &[String],
     thread_map: Option<&ThreadRowMap>,
     tile_m: u32,
     tile_n: u32,
     _gemm_struct_param: &str,
 ) -> Vec<String> {
-    // Use extracted constants or defaults
     let lane_shr = thread_map.map_or(2, |tm| tm.lanes_per_row_log2);
     let warp_shl = thread_map.map_or(4, |tm| tm.rows_per_warp_log2);
     let row_stride = thread_map.map_or(8, |tm| tm.row_stride);
-    // For the MVP, we generate the reduction prologue using the formula
-    // extracted from the decomposition. The key facts:
-    //
-    // 1. Accumulate: sum_sq += x[k]^2  (fma.rn.f32 pattern from PTX)
-    // 2. Finalize: inv_rms = rsqrt(sum_sq / hidden + eps)
-    // 3. Store inv_rms per tile row in SMEM array
-    //
-    // The thread mapping uses the GEMM's %ctaid.x + tile structure.
-    // We don't hardcode the tile size — we iterate over M rows using
-    // a loop where each iteration processes one row with all threads.
-    //
-    // Each thread computes:
-    //   k_start = tid.x
-    //   k_step = ntid.x (128 for CUTLASS)
-    //   for k = k_start; k < hidden; k += k_step:
-    //     val = input[row * stride + k]
-    //     sum_sq += val * val
-    //
-    // Then warp shuffle + SMEM reduce to get per-row sum.
-    // Then rsqrt → inv_rms, stored in SMEM array.
 
+    let prefix = "rms";
+
+    // ── Collect SMEM symbol names for renaming ──
+    let mut smem_renames: Vec<(String, String)> = Vec::new();
+    for line in source_lines {
+        let t = line.trim();
+        if t.contains("block_reduce_sum") || t.contains("block_reduce_") {
+            // Find the mangled symbol name
+            for word in t.split_whitespace() {
+                let w = word.trim_end_matches(';').trim_end_matches(',');
+                if w.contains("block_reduce_") {
+                    if !smem_renames.iter().any(|(old, _)| old == w) {
+                        smem_renames.push((w.to_string(), "_ferrite_warp_scratch".to_string()));
+                    }
+                }
+            }
+        }
+        if t.contains("s_inv_rms") {
+            for word in t.split(&['[', ']', ',', ' ', '\t'][..]) {
+                let w = word.trim_end_matches(';');
+                if w.contains("s_inv_rms") {
+                    if !smem_renames.iter().any(|(old, _)| old == w) {
+                        smem_renames.push((w.to_string(), "_ferrite_s_inv_rms".to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Determine which lines to transplant ──
+    // We need: setup code + accumulate loops + finalize block
+    // We skip: emit loops (replaced by per-element at A-load sites)
+    let first_accum_start = decomp
+        .accumulate_loops
+        .first()
+        .map(|l| l.header_line)
+        .unwrap_or(0);
+    let finalize_end = decomp.finalize_range.1;
+
+    // Find the ctaid.x row offset lines to identify %rd4 equivalent
+    // (the register that holds the row element offset)
+    // Look for: mov.u32 %rN, %ctaid.x → mul → cvt to 64-bit
+    let mut ctaid_result_reg = String::new(); // the s64 result (e.g., %rd4)
+    let mut ctaid_skip_lines: Vec<usize> = Vec::new();
+    for (idx, line) in source_lines.iter().enumerate() {
+        if line.contains("%ctaid.x") {
+            ctaid_skip_lines.push(idx);
+            // The next 2 lines compute the row offset from ctaid.x
+            if idx + 1 < source_lines.len() && source_lines[idx + 1].contains("mul.lo.s32") {
+                ctaid_skip_lines.push(idx + 1);
+            }
+            if idx + 2 < source_lines.len() && source_lines[idx + 2].contains("cvt.s64.s32") {
+                // Extract the destination register (e.g., %rd4)
+                let t = source_lines[idx + 2].trim();
+                let parts: Vec<&str> = t.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let dest = parts[1].trim_end_matches(',');
+                    ctaid_result_reg = dest.to_string();
+                }
+                ctaid_skip_lines.push(idx + 2);
+            }
+        }
+    }
+
+    // Find where the setup code begins (after param loads and ctaid computation)
+    // This is the first line that's not a skip line and is before the first accumulate loop
+    let mut setup_start = 0;
+    for idx in 0..first_accum_start {
+        if !is_transplant_skip(&source_lines[idx]) && !ctaid_skip_lines.contains(&idx) {
+            setup_start = idx;
+            break;
+        }
+    }
+
+    // ── Apply renaming to each transplanted line ──
+    let rename_line = |line: &str| -> String {
+        let mut renamed = rename_ptx_regs(line, prefix);
+        // Replace SMEM symbols
+        for (old, new) in &smem_renames {
+            renamed = renamed.replace(old.as_str(), new.as_str());
+        }
+        // Replace bar.sync 0 with bar.sync 15 to avoid GEMM conflicts
+        if renamed.contains("bar.sync") && renamed.contains("\t0") {
+            renamed = renamed.replace("\t0", "\t15");
+        }
+        renamed
+    };
+
+    // ── Build the prologue ──
     let mut prologue = Vec::new();
-    prologue.push("// FERRITE: rms_norm prologue (extracted from PTX analysis)".into());
+    prologue
+        .push("// FERRITE: rms_norm prologue (transplanted from extracted bf16 kernel PTX)".into());
 
-    // Unswizzle ctaid.x to get the M-tile index.
-    // CUTLASS ThreadblockSwizzle<4> maps grid as:
-    //   grid_x = grid_m * (1 << swizzle_log), grid_y = ceil(grid_n / (1 << swizzle_log))
-    //   m_tile = ctaid.x >> swizzle_log
-    // Read N from flat GEMM params to compute swizzle_log at runtime.
-    // (After perimeter replacement, ferrite_params[68] = N.)
+    // Swizzle computation to get m_tile from ctaid.x (GEMM infrastructure)
     let tile_n_shift = tile_n.trailing_zeros();
     prologue.push("// Compute swizzle_log from N (ThreadblockSwizzle<4>)".into());
-    prologue.push("ld.param.s32 \t%r_rms_step, [ferrite_params+68];".into()); // N
+    prologue.push("ld.param.s32 \t%r_rms_step, [ferrite_params+68];".into());
     prologue.push(format!(
         "add.s32 \t%r_rms_step, %r_rms_step, {};",
         tile_n - 1
     ));
     prologue.push(format!(
         "shr.u32 \t%r_rms_step, %r_rms_step, {tile_n_shift};"
-    )); // grid_n = ceil(N/tile_n)
-    // swizzle_log: 0 if grid_n<2, 1 if grid_n<3, 2 if grid_n>=3
-    prologue.push("mov.u32 \t%r_rms_nrows, 0;".into()); // reuse as swizzle_log temp
+    ));
+    prologue.push("mov.u32 \t%r_rms_nrows, 0;".into());
     prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_step, 2;".into());
     prologue.push("@%p_rms_lp mov.u32 \t%r_rms_nrows, 1;".into());
     prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_step, 3;".into());
     prologue.push("@%p_rms_lp mov.u32 \t%r_rms_nrows, 2;".into());
-    // m_tile = ctaid.x >> swizzle_log (saved for reuse across row loop iterations)
     prologue.push("mov.u32 \t%r_rms_mtile, %ctaid.x;".into());
     prologue.push("shr.u32 \t%r_rms_mtile, %r_rms_mtile, %r_rms_nrows;".into());
 
-    // Row loop: for each row in this CTA's tile
-    prologue.push(format!("mov.u32 \t%r_rms_nrows, {tile_m};"));
+    // Row loop: iterate over min(tile_m, M - m_tile * tile_m) rows
+    // Read M from ferrite_params[64] to handle partial tiles at boundary
+    prologue.push("ld.param.s32 \t%r_rms_step, [ferrite_params+64];".into()); // M
+    prologue.push(format!(
+        "mul.lo.s32 \t%r_rms_nrows, %r_rms_mtile, {tile_m};"
+    ));
+    prologue.push("sub.s32 \t%r_rms_nrows, %r_rms_step, %r_rms_nrows;".into()); // M - m_tile * tile_m
+    prologue.push(format!("min.s32 \t%r_rms_nrows, %r_rms_nrows, {tile_m};")); // min(remaining, tile_m)
     prologue.push("mov.u32 \t%r_rms_row, 0;".into());
     prologue.push("$L_rms_row_loop:".into());
 
-    // Compute row base address: input + (m_tile * tile_m + row) * stride * 2
-    prologue.push("mul.lo.s32 \t%r_rms_step, %r_rms_mtile, %r_rms_nrows;".into());
+    // Compute the row element offset (replaces ctaid.x * hidden_size)
+    // IMPORTANT: use tile_m (not nrows) for the absolute row computation.
+    // nrows is the clamped loop bound for partial tiles, but the starting row
+    // is always m_tile * tile_m regardless of how many rows this tile processes.
+    let rd4_renamed = rename_ptx_regs(&ctaid_result_reg, prefix);
+    prologue.push("// Row offset: (m_tile * tile_m + row) * hidden".into());
+    prologue.push(format!("mul.lo.s32 \t%r_rms_step, %r_rms_mtile, {tile_m};"));
     prologue.push("add.u32 \t%r_rms_step, %r_rms_step, %r_rms_row;".into());
-    prologue.push("cvt.s64.s32 \t%rd_rms_rowbase, %r_rms_step;".into());
-    prologue.push("mul.lo.s64 \t%rd_rms_rowbase, %rd_rms_rowbase, %rd_rms_str;".into());
-    prologue.push("shl.b64 \t%rd_rms_rowbase, %rd_rms_rowbase, 1;".into()); // * 2 for bf16
-    prologue.push("add.s64 \t%rd_rms_rowbase, %rd_rms_in, %rd_rms_rowbase;".into());
+    prologue.push(format!(
+        "mul.lo.s32 \t%r_rms_step, %r_rms_step, %r_rms_hdn;"
+    ));
+    prologue.push(format!("cvt.s64.s32 \t{rd4_renamed}, %r_rms_step;"));
 
-    // K-loop: sum of squares with stride = ntid.x
-    prologue.push("// K-loop: sum of squares".into());
-    prologue.push("mov.f32 \t%f_rms_sq, 0f00000000;".into());
-    prologue.push("mov.u32 \t%r_rms_k, %tid.x;".into());
-    prologue.push("$L_rms_k_loop:".into());
-    prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_k, %r_rms_hdn;".into());
-    prologue.push("@%p_rms_lp bra \t$L_rms_k_done;".into());
-    // Load input[row, k] as bf16, convert to f32
-    prologue.push("cvt.u64.u32 \t%rd_rms_cur, %r_rms_k;".into());
-    prologue.push("shl.b64 \t%rd_rms_cur, %rd_rms_cur, 1;".into()); // * 2 for bf16
-    prologue.push("add.s64 \t%rd_rms_cur, %rd_rms_rowbase, %rd_rms_cur;".into());
-    prologue.push("ld.global.nc.b16 \t%h_rms_a, [%rd_rms_cur];".into());
-    prologue.push("cvt.f32.bf16 \t%f_rms_t0, %h_rms_a;".into());
-    // sum_sq += val * val (fma pattern from PTX analysis)
-    prologue.push("fma.rn.f32 \t%f_rms_sq, %f_rms_t0, %f_rms_t0, %f_rms_sq;".into());
-    // k += ntid.x
-    prologue.push("mov.u32 \t%r_rms_step, %ntid.x;".into());
-    prologue.push("add.u32 \t%r_rms_k, %r_rms_k, %r_rms_step;".into());
-    prologue.push("bra \t$L_rms_k_loop;".into());
-    prologue.push("$L_rms_k_done:".into());
+    // Transplant the setup + accumulate + finalize code from the extracted kernel.
+    // Stop at the second bar.sync in the finalize range (the one before emit loops).
+    // Everything after that is emit-loop setup which we don't need.
+    let mut bar_sync_count = 0;
+    let mut inv_rms_stored = false;
 
-    // Warp shuffle reduction (extracted pattern: 5 rounds of shfl.sync.down + add.f32)
-    prologue.push("// Warp shuffle reduction".into());
-    prologue.push("mov.b32 \t%r_rms_k, %f_rms_sq;".into());
-    for shift in [16, 8, 4, 2, 1] {
-        prologue.push(format!(
-            "shfl.sync.down.b32 \t%r_rms_step|%p_rms_lp, %r_rms_k, {shift}, 31, -1;"
-        ));
-        prologue.push("mov.b32 \t%f_rms_t0, %r_rms_step;".into());
-        prologue.push("mov.b32 \t%f_rms_t1, %r_rms_k;".into());
-        prologue.push("add.f32 \t%f_rms_t1, %f_rms_t1, %f_rms_t0;".into());
-        prologue.push("mov.b32 \t%r_rms_k, %f_rms_t1;".into());
+    prologue.push("// BEGIN transplanted rms_norm code".into());
+    for idx in setup_start..=finalize_end.min(source_lines.len() - 1) {
+        // Skip lines we're replacing
+        if is_transplant_skip(&source_lines[idx]) {
+            continue;
+        }
+        if ctaid_skip_lines.contains(&idx) {
+            continue;
+        }
+        let line = &source_lines[idx];
+        let t = line.trim();
+
+        let renamed = rename_line(line);
+
+        // Track bar.sync occurrences in the finalize range.
+        // After the inv_rms store, the next bar.sync is the last thing we need.
+        if renamed.contains("bar.sync") {
+            bar_sync_count += 1;
+            if inv_rms_stored {
+                // This is the bar.sync after inv_rms store — emit it and stop
+                prologue.push(renamed.trim().to_string());
+                break;
+            }
+        }
+
+        // Detect the inv_rms store to scalar SMEM and redirect to array
+        if renamed.contains("st.shared.f32") && renamed.contains("_ferrite_s_inv_rms") {
+            let parts: Vec<&str> = renamed.split_whitespace().collect();
+            let src_reg = parts
+                .last()
+                .map(|s| s.trim_end_matches(';'))
+                .unwrap_or("%f_rms_55");
+            // Store to _ferrite_inv_rms[row * 4] instead
+            prologue.push("mov.u32 \t%r_rms_step, _ferrite_inv_rms;".into());
+            prologue.push("shl.b32 \t%r_rms_k, %r_rms_row, 2;".into());
+            prologue.push("add.s32 \t%r_rms_step, %r_rms_step, %r_rms_k;".into());
+            prologue.push(format!("st.shared.f32 \t[%r_rms_step], {src_reg};"));
+            inv_rms_stored = true;
+            continue;
+        }
+
+        prologue.push(renamed.trim().to_string());
     }
+    prologue.push("// END transplanted rms_norm code".into());
 
-    // SMEM reduce across warps (use scratch, not inv_rms array)
-    prologue.push("// SMEM reduce across warps".into());
-    prologue.push("mov.b32 \t%f_rms_sum, %r_rms_k;".into());
-    // Lane 0 of each warp writes to scratch SMEM
-    prologue.push("mov.u32 \t%r_rms_step, %tid.x;".into());
-    prologue.push("and.b32 \t%r_rms_step, %r_rms_step, 31;".into());
-    prologue.push("setp.ne.u32 \t%p_rms_lp, %r_rms_step, 0;".into());
-    prologue.push("@%p_rms_lp bra \t$L_rms_warp_done;".into());
-    // Write to warp_scratch[warp_id * 4]
-    prologue.push("mov.u32 \t%r_rms_step, %tid.x;".into());
-    prologue.push("shr.u32 \t%r_rms_step, %r_rms_step, 5;".into()); // warp_id
-    prologue.push("shl.b32 \t%r_rms_step, %r_rms_step, 2;".into()); // * 4 bytes
-    prologue.push("mov.u32 \t%r_rms_k, _ferrite_warp_scratch;".into());
-    prologue.push("add.s32 \t%r_rms_step, %r_rms_k, %r_rms_step;".into());
-    prologue.push("st.shared.f32 \t[%r_rms_step], %f_rms_sum;".into());
-    prologue.push("$L_rms_warp_done:".into());
-    prologue.push("bar.sync \t15;".into());
-
-    // Thread 0 sums warp contributions and computes inv_rms
-    prologue.push("mov.u32 \t%r_rms_step, %tid.x;".into());
-    prologue.push("setp.ne.u32 \t%p_rms_lp, %r_rms_step, 0;".into());
-    prologue.push("@%p_rms_lp bra \t$L_rms_reduce_done;".into());
-    // Sum 4 warp contributions from scratch SMEM
-    prologue.push("mov.u32 \t%r_rms_k, _ferrite_warp_scratch;".into());
-    prologue.push("ld.shared.f32 \t%f_rms_sum, [%r_rms_k];".into());
-    prologue.push("ld.shared.f32 \t%f_rms_t0, [%r_rms_k+4];".into());
-    prologue.push("add.f32 \t%f_rms_sum, %f_rms_sum, %f_rms_t0;".into());
-    prologue.push("ld.shared.f32 \t%f_rms_t0, [%r_rms_k+8];".into());
-    prologue.push("add.f32 \t%f_rms_sum, %f_rms_sum, %f_rms_t0;".into());
-    prologue.push("ld.shared.f32 \t%f_rms_t0, [%r_rms_k+12];".into());
-    prologue.push("add.f32 \t%f_rms_sum, %f_rms_sum, %f_rms_t0;".into());
-    // inv_rms = rsqrt(sum / hidden + eps)
-    prologue.push("div.rn.f32 \t%f_rms_sum, %f_rms_sum, %f_rms_hdnf;".into());
-    prologue.push("add.f32 \t%f_rms_sum, %f_rms_sum, %f_rms_eps;".into());
-    prologue.push("rsqrt.approx.f32 \t%f_rms_sum, %f_rms_sum;".into());
-    // Store inv_rms in inv_rms SMEM array at row index (NOT the warp scratch)
-    prologue.push("mov.u32 \t%r_rms_k, _ferrite_inv_rms;".into());
-    prologue.push("shl.b32 \t%r_rms_step, %r_rms_row, 2;".into()); // row * 4
-    prologue.push("add.s32 \t%r_rms_step, %r_rms_k, %r_rms_step;".into());
-    prologue.push("st.shared.f32 \t[%r_rms_step], %f_rms_sum;".into());
-    prologue.push("$L_rms_reduce_done:".into());
-    prologue.push("bar.sync \t15;".into());
-
-    // Advance to next row
+    // End of row loop
     prologue.push("add.u32 \t%r_rms_row, %r_rms_row, 1;".into());
     prologue.push("setp.lt.u32 \t%p_rms_row, %r_rms_row, %r_rms_nrows;".into());
     prologue.push("@%p_rms_row bra \t$L_rms_row_loop;".into());
@@ -668,40 +973,34 @@ fn build_prologue_from_decomposition(
     prologue.push("bar.sync \t15;".into());
 
     // ── Per-thread setup: load inv_rms for this thread's two rows ──
-    // Thread-to-row mapping extracted from GEMM PTX address chain:
-    //   m_rel = (tid.x % 32) >> lane_shr + (tid.x / 32) << warp_shl
-    //   row_0 = m_rel, row_1 = m_rel + row_stride
     prologue.push(format!(
         "// Per-thread: load inv_rms (lane_shr={lane_shr}, warp_shl={warp_shl}, row_stride={row_stride})"
     ));
     prologue.push("mov.u32 \t%r_rms_step, %tid.x;".into());
-    prologue.push("and.b32 \t%r_rms_k, %r_rms_step, 31;".into()); // lane = tid.x % 32
-    prologue.push(format!("shr.u32 \t%r_rms_k, %r_rms_k, {lane_shr};")); // lane / lanes_per_row
-    prologue.push("shr.u32 \t%r_rms_row, %r_rms_step, 5;".into()); // warp = tid.x / 32
-    prologue.push(format!("shl.b32 \t%r_rms_row, %r_rms_row, {warp_shl};")); // warp * rows_per_warp
-    prologue.push("add.u32 \t%r_rms_row, %r_rms_row, %r_rms_k;".into()); // m_rel
+    prologue.push("and.b32 \t%r_rms_k, %r_rms_step, 31;".into());
+    prologue.push(format!("shr.u32 \t%r_rms_k, %r_rms_k, {lane_shr};"));
+    prologue.push("shr.u32 \t%r_rms_row, %r_rms_step, 5;".into());
+    prologue.push(format!("shl.b32 \t%r_rms_row, %r_rms_row, {warp_shl};"));
+    prologue.push("add.u32 \t%r_rms_row, %r_rms_row, %r_rms_k;".into());
 
-    // Load inv_rms[m_rel] and inv_rms[m_rel + row_stride]
-    let row_stride_bytes = row_stride * 4; // 4 bytes per f32
+    let row_stride_bytes = row_stride * 4;
     prologue.push("mov.u32 \t%r_rms_k, _ferrite_inv_rms;".into());
-    prologue.push("shl.b32 \t%r_rms_step, %r_rms_row, 2;".into()); // m_rel * 4
+    prologue.push("shl.b32 \t%r_rms_step, %r_rms_row, 2;".into());
     prologue.push("add.s32 \t%r_rms_step, %r_rms_k, %r_rms_step;".into());
     prologue.push("ld.shared.f32 \t%f_rms_inv0, [%r_rms_step];".into());
     prologue.push(format!(
         "ld.shared.f32 \t%f_rms_inv1, [%r_rms_step+{row_stride_bytes}];"
-    )); // +row_stride rows * 4 bytes
+    ));
 
-    // Compute GMEM row base addresses for both rows (for K-offset extraction in per-site)
-    // rb0 = input_ptr + (m_tile * tile_m + m_rel) * stride * 2
-    prologue.push("mul.lo.s32 \t%r_rms_step, %r_rms_mtile, %r_rms_nrows;".into());
-    prologue.push("add.u32 \t%r_rms_step, %r_rms_step, %r_rms_row;".into()); // abs row 0
+    // Compute GMEM row base addresses for per-site K-offset extraction
+    prologue.push(format!("mul.lo.s32 \t%r_rms_step, %r_rms_mtile, {tile_m};"));
+    prologue.push("add.u32 \t%r_rms_step, %r_rms_step, %r_rms_row;".into());
     prologue.push("cvt.s64.s32 \t%rd_rms_rb0, %r_rms_step;".into());
     prologue.push("mul.lo.s64 \t%rd_rms_rb0, %rd_rms_rb0, %rd_rms_str;".into());
-    prologue.push("shl.b64 \t%rd_rms_rb0, %rd_rms_rb0, 1;".into()); // * 2 for bf16
+    prologue.push("shl.b64 \t%rd_rms_rb0, %rd_rms_rb0, 1;".into());
     prologue.push("add.s64 \t%rd_rms_rb0, %rd_rms_in, %rd_rms_rb0;".into());
-    // rb1 = rb0 + row_stride * stride * 2
-    let rb1_shift = (row_stride * 2).trailing_zeros(); // row_stride * 2 as power of 2
-    prologue.push(format!("shl.b64 \t%rd_rms_rb1, %rd_rms_str, {rb1_shift};")); // stride * row_stride * 2
+    let rb1_shift = (row_stride * 2).trailing_zeros();
+    prologue.push(format!("shl.b64 \t%rd_rms_rb1, %rd_rms_str, {rb1_shift};"));
     prologue.push("add.s64 \t%rd_rms_rb1, %rd_rms_rb0, %rd_rms_rb1;".into());
 
     prologue.push("// FERRITE: end rms_norm prologue".into());
@@ -751,8 +1050,8 @@ mod tests {
     fn build_computation_from_rms_norm() {
         let rms_ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
         let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
-        let stage = PipelineStage::from_ptx("rms_norm", rms_ptx).expect("parse rms_norm");
-        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx).expect("parse gemm");
+        let stage = PipelineStage::from_ptx("rms_norm", rms_ptx, None).expect("parse rms_norm");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx, None).expect("parse gemm");
         let decomp = stage.decompose_reduction().expect("decompose");
 
         let comp = build_reduction_computation(&decomp, &stage, &gemm_stage, "test_fused")
@@ -814,8 +1113,8 @@ mod tests {
         let rms_ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
         let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
 
-        let rms_stage = PipelineStage::from_ptx("rms_norm", rms_ptx).expect("parse rms_norm");
-        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx).expect("parse gemm");
+        let rms_stage = PipelineStage::from_ptx("rms_norm", rms_ptx, None).expect("parse rms_norm");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx, None).expect("parse gemm");
 
         let fused = fuse_reduction_into_gemm(&rms_stage, &gemm_stage, "fused_norm_gemm");
 
@@ -866,8 +1165,8 @@ mod tests {
         let deriv_json =
             include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.derivations.json");
 
-        let rms_stage = PipelineStage::from_ptx("rms_norm", rms_ptx).expect("parse rms_norm");
-        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx).expect("parse gemm");
+        let rms_stage = PipelineStage::from_ptx("rms_norm", rms_ptx, None).expect("parse rms_norm");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx, None).expect("parse gemm");
 
         let fused_ptx =
             fuse_reduction_into_gemm(&rms_stage, &gemm_stage, "fused_norm_gemm").expect("fuse");
@@ -945,8 +1244,9 @@ mod tests {
         let deriv_json =
             include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
 
-        let silu_stage = PipelineStage::from_ptx("silu_mul", silu_ptx).expect("parse silu_mul");
-        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx).expect("parse gemm");
+        let silu_stage =
+            PipelineStage::from_ptx("silu_mul", silu_ptx, None).expect("parse silu_mul");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx, None).expect("parse gemm");
 
         let fused_ptx =
             fuse_pointwise_into_gemm(&silu_stage, &gemm_stage, "fused_silu_gemm").expect("fuse");

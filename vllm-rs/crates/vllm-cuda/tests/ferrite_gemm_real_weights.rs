@@ -2128,3 +2128,2868 @@ fn test8_full_layer_sim() {
     }
     println!("PASS: full layer simulation matches");
 }
+
+// ============================================================================
+// Test progression: bridge the gap between test8 (passes) and llama.forward (fails)
+//
+// Each test changes ONE element from test8 toward production. When a test fails,
+// that element is the bug.
+// ============================================================================
+
+/// Single fused norm+GEMM call, comparing fused vs separate.
+/// Returns max absolute diff.
+unsafe fn run_fused_vs_separate_single(
+    ctx: &Arc<CudaContext>,
+    m: u32,
+    n: u32,
+    k: u32,
+    eps: f32,
+    input_data: &[bf16],           // [m, k] — the data to normalize
+    gemm_weight: &CudaSlice<bf16>, // [n, k] — GEMM weight
+    norm_weight: &CudaSlice<bf16>, // [k] — norm weight
+) -> f32 {
+    let stream = ctx.default_stream();
+    let (gw_p, _) = gemm_weight.device_ptr(&stream);
+    let (nw_p, _) = norm_weight.device_ptr(&stream);
+
+    // Upload input
+    let d_input = stream.clone_htod(input_data).unwrap();
+    let d_input2 = stream.clone_htod(input_data).unwrap();
+    let (inp_p, _) = d_input.device_ptr(&stream);
+    let (inp2_p, _) = d_input2.device_ptr(&stream);
+
+    // ── Fused path ──
+    let d_fused_out: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (fout_p, _) = d_fused_out.device_ptr(&stream);
+    let flat = build_flat_params(
+        inp_p as u64,
+        gw_p as u64,
+        fout_p as u64,
+        fout_p as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+    let fused_module = ctx.load_module(Ptx::from_src(FUSED_NORM_GEMM.ptx)).unwrap();
+    let fused_func = fused_module.load_function(FUSED_NORM_GEMM.entry).unwrap();
+    stream
+        .launch_builder(&fused_func)
+        .arg(&(inp_p as u64))
+        .arg(&(nw_p as u64))
+        .arg(&eps)
+        .arg(&k)
+        .arg(&(k as u64))
+        .arg(&flat)
+        .launch(LaunchConfig {
+            grid_dim: (gx, gy, gz),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: FUSED_NORM_GEMM.smem_bytes,
+        })
+        .unwrap();
+
+    // ── Separate path ──
+    let d_normed: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+    let d_sep_out: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (normed_p, _) = d_normed.device_ptr(&stream);
+    let (sout_p, _) = d_sep_out.device_ptr(&stream);
+
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+    stream
+        .launch_builder(&rms_func)
+        .arg(&normed_p)
+        .arg(&(inp2_p as u64))
+        .arg(&(nw_p as u64))
+        .arg(&eps)
+        .arg(&(k as i32))
+        .launch(LaunchConfig {
+            grid_dim: (m, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        })
+        .unwrap();
+
+    let flat_sep = build_flat_params(
+        normed_p as u64,
+        gw_p as u64,
+        sout_p as u64,
+        sout_p as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+    let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+    let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+    stream
+        .launch_builder(&gemm_func)
+        .arg(&flat_sep)
+        .launch(LaunchConfig {
+            grid_dim: (gx, gy, gz),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 36864,
+        })
+        .unwrap();
+
+    stream.synchronize().unwrap();
+
+    let fused_out = stream.clone_dtoh(&d_fused_out).unwrap();
+    let sep_out = stream.clone_dtoh(&d_sep_out).unwrap();
+
+    let mut max_diff = 0.0f32;
+    let mut worst = 0;
+    for i in 0..(m * n) as usize {
+        let d = (fused_out[i].to_f32() - sep_out[i].to_f32()).abs();
+        if d > max_diff {
+            max_diff = d;
+            worst = i;
+        }
+    }
+    println!(
+        "  M={m}, N={n}, K={k}: diff={max_diff:.2e} at [{worst}] fused={:.4} sep={:.4}",
+        fused_out[worst].to_f32(),
+        sep_out[worst].to_f32()
+    );
+    max_diff
+}
+
+// ── test9a: M=1 (decode batch size) ──
+// test8 uses M=64 (no partial tiles). Production decode uses M=1.
+#[test]
+fn test9a_m1_decode() {
+    println!("=== test9a: fused norm+GEMM at M=1 (decode) ===");
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let hidden = 896u32;
+    let eps = 1e-6f32;
+    let qkv_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.0.self_attn.q_proj.weight",
+        ))
+        .unwrap();
+    let norm_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.0.input_layernorm.weight",
+        ))
+        .unwrap();
+
+    // Test M=1 (single token decode)
+    for m in [1u32, 2, 3, 7, 15, 32, 63, 64, 65, 128] {
+        let input: Vec<bf16> = (0..(m * hidden) as usize)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+            .collect();
+        let diff = unsafe {
+            run_fused_vs_separate_single(&ctx, m, hidden, hidden, eps, &input, &qkv_w, &norm_w)
+        };
+        assert!(
+            diff < 0.01,
+            "M={m}: fused vs separate diff {diff:.2e} exceeds tolerance"
+        );
+    }
+    println!("PASS");
+}
+
+// ── test9b: rectangular GEMM dims (real QKV and gate_up shapes) ──
+// test8 uses N=896 (square). Production QKV is N=1152, gate_up is N=3072.
+#[test]
+fn test9b_rectangular_dims() {
+    println!("=== test9b: fused norm+GEMM with rectangular dims ===");
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let hidden = 896u32;
+    let eps = 1e-6f32;
+
+    // Real QKV weight: concatenated q_proj + k_proj + v_proj = [1152, 896]
+    let mut qkv_data = load_bf16_tensor(&st, "model.layers.0.self_attn.q_proj.weight");
+    qkv_data.extend_from_slice(&load_bf16_tensor(
+        &st,
+        "model.layers.0.self_attn.k_proj.weight",
+    ));
+    qkv_data.extend_from_slice(&load_bf16_tensor(
+        &st,
+        "model.layers.0.self_attn.v_proj.weight",
+    ));
+    let n_qkv = (qkv_data.len() / hidden as usize) as u32;
+    println!("  QKV weight: [{n_qkv}, {hidden}]");
+    let qkv_w = stream.clone_htod(&qkv_data).unwrap();
+    let norm_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.0.input_layernorm.weight",
+        ))
+        .unwrap();
+
+    // Test at various M with real QKV dims
+    for m in [1u32, 5, 9, 64, 128] {
+        let input: Vec<bf16> = (0..(m * hidden) as usize)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+            .collect();
+        let diff = unsafe {
+            run_fused_vs_separate_single(&ctx, m, n_qkv, hidden, eps, &input, &qkv_w, &norm_w)
+        };
+        assert!(
+            diff < 0.01,
+            "QKV M={m}: fused vs separate diff {diff:.2e} exceeds tolerance"
+        );
+    }
+
+    // Real gate_up weight: concatenated gate_proj + up_proj = [3072, 896]
+    let mut gate_up_data = load_bf16_tensor(&st, "model.layers.0.mlp.gate_proj.weight");
+    gate_up_data.extend_from_slice(&load_bf16_tensor(&st, "model.layers.0.mlp.up_proj.weight"));
+    let n_gate_up = (gate_up_data.len() / hidden as usize) as u32;
+    println!("  gate_up weight: [{n_gate_up}, {hidden}]");
+    let gate_up_w = stream.clone_htod(&gate_up_data).unwrap();
+    let norm2_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.0.post_attention_layernorm.weight",
+        ))
+        .unwrap();
+
+    for m in [1u32, 5, 64] {
+        let input: Vec<bf16> = (0..(m * hidden) as usize)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+            .collect();
+        let diff = unsafe {
+            run_fused_vs_separate_single(
+                &ctx, m, n_gate_up, hidden, eps, &input, &gate_up_w, &norm2_w,
+            )
+        };
+        assert!(
+            diff < 0.01,
+            "gate_up M={m}: fused vs separate diff {diff:.2e} exceeds tolerance"
+        );
+    }
+    println!("PASS");
+}
+
+// ── test9c: launch via launch_fused_norm_gemm (production launch path) ──
+// test8/9a use manual launch_builder. Production uses ferrite::launch_fused_norm_gemm
+// which computes grid, swizzle, and passes params via kernelParams API.
+#[test]
+fn test9c_production_launch() {
+    println!("=== test9c: launch_fused_norm_gemm vs separate ===");
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+
+    use vllm_cuda::{DType, GpuTensor};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let hidden = 896u32;
+    let eps = 1e-6f32;
+
+    let norm_weight_data = load_bf16_tensor(&st, "model.layers.0.input_layernorm.weight");
+    let qkv_weight_data = load_bf16_tensor(&st, "model.layers.0.self_attn.q_proj.weight");
+    let n = (qkv_weight_data.len() / hidden as usize) as u32;
+
+    let d_norm_w = stream.clone_htod(&norm_weight_data).unwrap();
+    let d_qkv_w = stream.clone_htod(&qkv_weight_data).unwrap();
+    let (norm_p, _) = d_norm_w.device_ptr(&stream);
+    let (qkv_p, _) = d_qkv_w.device_ptr(&stream);
+
+    let norm_tensor = unsafe { GpuTensor::new(norm_p as *mut u8, &[hidden as usize], DType::BF16) };
+    let qkv_tensor = unsafe {
+        GpuTensor::new(
+            qkv_p as *mut u8,
+            &[n as usize, hidden as usize],
+            DType::BF16,
+        )
+    };
+
+    let mut alloc = vllm_cuda::alloc::CachingAllocator::new();
+
+    for m in [1u32, 5, 9, 64, 65, 128] {
+        let input_data: Vec<bf16> = (0..(m * hidden) as usize)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+            .collect();
+
+        // ── Production launch ──
+        let d_input = stream.clone_htod(&input_data).unwrap();
+        let (inp_p, _) = d_input.device_ptr(&stream);
+        let input_tensor = unsafe {
+            GpuTensor::new(
+                inp_p as *mut u8,
+                &[m as usize, hidden as usize],
+                DType::BF16,
+            )
+        };
+
+        let fused_out = unsafe {
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                input_tensor,
+                qkv_tensor,
+                norm_tensor,
+                eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut alloc,
+                std::ptr::null_mut(), // default stream
+            )
+        };
+
+        // ── Separate reference ──
+        let d_input2 = stream.clone_htod(&input_data).unwrap();
+        let (inp2_p, _) = d_input2.device_ptr(&stream);
+        let d_normed: CudaSlice<bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+        let d_sep_out: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (normed_p, _) = d_normed.device_ptr(&stream);
+        let (sout_p, _) = d_sep_out.device_ptr(&stream);
+
+        let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+        let rms_func = rms_module
+            .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+            .unwrap();
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&normed_p)
+                .arg(&(inp2_p as u64))
+                .arg(&(norm_p as u64))
+                .arg(&eps)
+                .arg(&(hidden as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+
+        let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+        let flat_sep = build_flat_params(
+            normed_p as u64,
+            qkv_p as u64,
+            sout_p as u64,
+            sout_p as u64,
+            m,
+            n,
+            hidden,
+            hidden,
+            hidden,
+            n,
+            n,
+            1.0,
+            0.0,
+        );
+        let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+        let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat_sep)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+
+        // Synchronize and compare
+        unsafe {
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+        stream.synchronize().unwrap();
+
+        let mut fused_host = vec![bf16::ZERO; (m * n) as usize];
+        unsafe {
+            cusys::cuMemcpyDtoH_v2(
+                fused_host.as_mut_ptr() as *mut std::ffi::c_void,
+                fused_out.as_gpu_tensor().raw_ptr() as u64,
+                (m * n) as usize * 2,
+            );
+        }
+        let sep_host = stream.clone_dtoh(&d_sep_out).unwrap();
+
+        let mut max_diff = 0.0f32;
+        let mut worst = 0;
+        for i in 0..(m * n) as usize {
+            let d = (fused_host[i].to_f32() - sep_host[i].to_f32()).abs();
+            if d > max_diff {
+                max_diff = d;
+                worst = i;
+            }
+        }
+        println!(
+            "  M={m}, N={n}: diff={max_diff:.2e} fused={:.4} sep={:.4}",
+            fused_host[worst].to_f32(),
+            sep_host[worst].to_f32()
+        );
+        assert!(
+            max_diff < 0.01,
+            "M={m}: production launch diff {max_diff:.2e}"
+        );
+    }
+    println!("PASS");
+}
+
+// ── test9d: GPU add_inplace + fused launch (production data flow) ──
+// Production does: add_inplace(residual, hidden_states) then fused_norm_gemm(residual).
+// This tests the exact data flow without touching llama.rs.
+#[test]
+fn test9d_gpu_add_then_fused() {
+    println!("=== test9d: GPU add_inplace + fused norm+GEMM ===");
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+
+    use vllm_cuda::{DType, GpuTensor};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let hidden = 896u32;
+    let n = hidden; // square for simplicity
+    let eps = 1e-6f32;
+
+    let norm_weight_data = load_bf16_tensor(&st, "model.layers.0.input_layernorm.weight");
+    let qkv_weight_data = load_bf16_tensor(&st, "model.layers.0.self_attn.q_proj.weight");
+
+    let d_norm_w = stream.clone_htod(&norm_weight_data).unwrap();
+    let d_qkv_w = stream.clone_htod(&qkv_weight_data).unwrap();
+    let (norm_p, _) = d_norm_w.device_ptr(&stream);
+    let (qkv_p, _) = d_qkv_w.device_ptr(&stream);
+
+    let norm_tensor = unsafe { GpuTensor::new(norm_p as *mut u8, &[hidden as usize], DType::BF16) };
+    let qkv_tensor = unsafe {
+        GpuTensor::new(
+            qkv_p as *mut u8,
+            &[n as usize, hidden as usize],
+            DType::BF16,
+        )
+    };
+
+    let mut alloc = vllm_cuda::alloc::CachingAllocator::new();
+
+    for m in [1u32, 5, 64, 65, 128] {
+        // Create residual and hidden_states
+        let h_res: Vec<bf16> = (0..(m * hidden) as usize)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00013 - 0.3).cos() * 5.0))
+            .collect();
+        let h_hs: Vec<bf16> = (0..(m * hidden) as usize)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+            .collect();
+
+        // CPU reference: add + norm + gemm
+        let h_sum: Vec<bf16> = h_res
+            .iter()
+            .zip(h_hs.iter())
+            .map(|(r, h)| bf16::from_f32(r.to_f32() + h.to_f32()))
+            .collect();
+
+        // ── Fused path: GPU add_inplace + launch_fused_norm_gemm ──
+        let d_res_f = stream.clone_htod(&h_res).unwrap();
+        let d_hs_f = stream.clone_htod(&h_hs).unwrap();
+        let (res_f_p, _) = d_res_f.device_ptr(&stream);
+        let (hs_f_p, _) = d_hs_f.device_ptr(&stream);
+
+        // GPU add: residual += hidden_states
+        let res_tensor = unsafe {
+            GpuTensor::new(
+                res_f_p as *mut u8,
+                &[m as usize, hidden as usize],
+                DType::BF16,
+            )
+        };
+        let hs_tensor = unsafe {
+            GpuTensor::new(
+                hs_f_p as *mut u8,
+                &[m as usize, hidden as usize],
+                DType::BF16,
+            )
+        };
+        unsafe {
+            vllm_cuda::kernels::add_inplace(res_tensor, hs_tensor, std::ptr::null_mut());
+        }
+        // Now d_res_f contains the sum. Launch fused norm+GEMM on it.
+        let input_tensor = unsafe {
+            GpuTensor::new(
+                res_f_p as *mut u8,
+                &[m as usize, hidden as usize],
+                DType::BF16,
+            )
+        };
+        let fused_out = unsafe {
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                input_tensor,
+                qkv_tensor,
+                norm_tensor,
+                eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut alloc,
+                std::ptr::null_mut(),
+            )
+        };
+
+        // ── Separate path: same sum, then separate norm + GEMM ──
+        let d_sum_s = stream.clone_htod(&h_sum).unwrap();
+        let (sum_s_p, _) = d_sum_s.device_ptr(&stream);
+        let d_normed: CudaSlice<bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+        let d_sep_out: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (normed_p, _) = d_normed.device_ptr(&stream);
+        let (sout_p, _) = d_sep_out.device_ptr(&stream);
+
+        let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+        let rms_func = rms_module
+            .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+            .unwrap();
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&normed_p)
+                .arg(&(sum_s_p as u64))
+                .arg(&(norm_p as u64))
+                .arg(&eps)
+                .arg(&(hidden as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+        let flat_sep = build_flat_params(
+            normed_p as u64,
+            qkv_p as u64,
+            sout_p as u64,
+            sout_p as u64,
+            m,
+            n,
+            hidden,
+            hidden,
+            hidden,
+            n,
+            n,
+            1.0,
+            0.0,
+        );
+        let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+        let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat_sep)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+
+        unsafe {
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+        stream.synchronize().unwrap();
+
+        let mut fused_host = vec![bf16::ZERO; (m * n) as usize];
+        unsafe {
+            cusys::cuMemcpyDtoH_v2(
+                fused_host.as_mut_ptr() as *mut std::ffi::c_void,
+                fused_out.as_gpu_tensor().raw_ptr() as u64,
+                (m * n) as usize * 2,
+            );
+        }
+        let sep_host = stream.clone_dtoh(&d_sep_out).unwrap();
+
+        let mut max_diff = 0.0f32;
+        let mut worst = 0;
+        for i in 0..(m * n) as usize {
+            let d = (fused_host[i].to_f32() - sep_host[i].to_f32()).abs();
+            if d > max_diff {
+                max_diff = d;
+                worst = i;
+            }
+        }
+        println!(
+            "  M={m}: diff={max_diff:.2e} fused={:.4} sep={:.4}",
+            fused_host[worst].to_f32(),
+            sep_host[worst].to_f32()
+        );
+        assert!(max_diff < 0.01, "M={m}: gpu_add+fused diff {max_diff:.2e}");
+    }
+    println!("PASS");
+}
+
+// ── test9e: Multi-layer chain with production launch + GPU add ──
+// test8 passes with CPU add + manual launch.
+// test9d passes single-call with GPU add + production launch.
+// test9e chains 24 layers with GPU add + production launch — same as llama.rs would do.
+#[test]
+fn test9e_multilayer_production() {
+    println!("=== test9e: 24-layer chain with production launch + GPU add ===");
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+
+    use vllm_cuda::{DType, GpuTensor};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let hidden = 896u32;
+    let m = 64u32;
+    let k = hidden;
+    let n = hidden; // square GEMMs (same as test8)
+    let eps = 1e-6f32;
+    let num_layers = 24;
+
+    // Load all layer weights
+    let mut qkv_weights = Vec::new();
+    let mut o_weights = Vec::new();
+    let mut gate_weights = Vec::new();
+    let mut norm1_weights = Vec::new();
+    let mut norm2_weights = Vec::new();
+    for layer in 0..num_layers {
+        qkv_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        o_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        gate_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        norm1_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.input_layernorm.weight"),
+                ))
+                .unwrap(),
+        );
+        norm2_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                ))
+                .unwrap(),
+        );
+    }
+
+    let h_init: Vec<bf16> = (0..(m * k) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+
+    // Separate path buffers (uses CPU add + manual launch, same as test8)
+    let mut d_sep_res = stream
+        .clone_htod(&vec![bf16::ZERO; (m * k) as usize])
+        .unwrap();
+    let mut d_sep_hs = stream.clone_htod(&h_init).unwrap();
+
+    // Fused path buffers (uses GPU add + production launch)
+    let mut d_fused_res = stream
+        .clone_htod(&vec![bf16::ZERO; (m * k) as usize])
+        .unwrap();
+    let mut d_fused_hs = stream.clone_htod(&h_init).unwrap();
+
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+    let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+    let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+    let mut alloc = vllm_cuda::alloc::CachingAllocator::new();
+
+    for layer in 0..num_layers {
+        let (qw, _) = qkv_weights[layer].device_ptr(&stream);
+        let (ow, _) = o_weights[layer].device_ptr(&stream);
+        let (gw, _) = gate_weights[layer].device_ptr(&stream);
+        let (nw1, _) = norm1_weights[layer].device_ptr(&stream);
+        let (nw2, _) = norm2_weights[layer].device_ptr(&stream);
+
+        let norm1_tensor =
+            unsafe { GpuTensor::new(nw1 as *mut u8, &[hidden as usize], DType::BF16) };
+        let norm2_tensor =
+            unsafe { GpuTensor::new(nw2 as *mut u8, &[hidden as usize], DType::BF16) };
+        let qkv_tensor =
+            unsafe { GpuTensor::new(qw as *mut u8, &[n as usize, k as usize], DType::BF16) };
+        let o_tensor =
+            unsafe { GpuTensor::new(ow as *mut u8, &[n as usize, k as usize], DType::BF16) };
+        let gate_tensor =
+            unsafe { GpuTensor::new(gw as *mut u8, &[n as usize, k as usize], DType::BF16) };
+
+        // === SEPARATE PATH (GPU add + manual launch) ===
+        // Use GPU add_inplace on BOTH paths so the add is identical.
+        // If layer 23 still diverges, the add is not the cause.
+        let (sr_p, _) = d_sep_res.device_ptr(&stream);
+        let (sh_p, _) = d_sep_hs.device_ptr(&stream);
+        unsafe {
+            let sr_t = GpuTensor::new(sr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            let sh_t = GpuTensor::new(sh_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            vllm_cuda::kernels::add_inplace(sr_t, sh_t, std::ptr::null_mut());
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+        let (sr_p, _) = d_sep_res.device_ptr(&stream);
+
+        // Separate: norm then GEMM for QKV
+        let d_snormed: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+        let d_sqkv: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (sn_p, _) = d_snormed.device_ptr(&stream);
+        let (sqkv_p, _) = d_sqkv.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&sn_p)
+                .arg(&sr_p)
+                .arg(&(nw1 as u64))
+                .arg(&eps)
+                .arg(&(k as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            sn_p as u64,
+            qw as u64,
+            sqkv_p as u64,
+            sqkv_p as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            0.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        // o_proj accumulate: residual += qkv @ o_weight
+        let flat = build_flat_params(
+            sqkv_p as u64,
+            ow as u64,
+            sr_p as u64,
+            sr_p as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            1.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        // MLP: separate norm then GEMM
+        let (sr_p, _) = d_sep_res.device_ptr(&stream);
+        let d_snormed2: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+        let d_smlp: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (sn2_p, _) = d_snormed2.device_ptr(&stream);
+        let (smlp_p, _) = d_smlp.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&sn2_p)
+                .arg(&sr_p)
+                .arg(&(nw2 as u64))
+                .arg(&eps)
+                .arg(&(k as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            sn2_p as u64,
+            gw as u64,
+            smlp_p as u64,
+            smlp_p as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            0.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+
+        // === FUSED PATH (GPU add + production launch) ===
+        let (fr_p, _) = d_fused_res.device_ptr(&stream);
+        let (fh_p, _) = d_fused_hs.device_ptr(&stream);
+
+        // GPU add: residual += hidden_states
+        unsafe {
+            let res_t = GpuTensor::new(fr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            let hs_t = GpuTensor::new(fh_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            vllm_cuda::kernels::add_inplace(res_t, hs_t, std::ptr::null_mut());
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+
+        // Fused QKV: norm+GEMM via production launch
+        let (fr_p, _) = d_fused_res.device_ptr(&stream);
+        let fused_qkv = unsafe {
+            let input_t = GpuTensor::new(fr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                input_t,
+                qkv_tensor,
+                norm1_tensor,
+                eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut alloc,
+                std::ptr::null_mut(),
+            )
+        };
+
+        // o_proj accumulate: residual += fused_qkv @ o_weight
+        let (fr_p, _) = d_fused_res.device_ptr(&stream);
+        let flat = build_flat_params(
+            fused_qkv.as_gpu_tensor().raw_ptr() as u64,
+            ow as u64,
+            fr_p as u64,
+            fr_p as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            1.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        drop(fused_qkv);
+
+        // Sync cudarc stream before fused MLP (o_proj ran on cudarc stream,
+        // fused MLP runs on null stream — must ensure o_proj completes first)
+        stream.synchronize().unwrap();
+
+        // Fused MLP: residual already updated by o_proj accumulate.
+        let (fr_p, _) = d_fused_res.device_ptr(&stream);
+        let fused_mlp = unsafe {
+            let input_t = GpuTensor::new(fr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                input_t,
+                gate_tensor,
+                norm2_tensor,
+                eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut alloc,
+                std::ptr::null_mut(),
+            )
+        };
+
+        // === COMPARE ===
+        unsafe {
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+        stream.synchronize().unwrap();
+
+        let smlp_h = stream.clone_dtoh(&d_smlp).unwrap();
+        let mut fmlp_h = vec![bf16::ZERO; (m * n) as usize];
+        unsafe {
+            cusys::cuMemcpyDtoH_v2(
+                fmlp_h.as_mut_ptr() as *mut std::ffi::c_void,
+                fused_mlp.as_gpu_tensor().raw_ptr() as u64,
+                (m * n) as usize * 2,
+            );
+        }
+
+        let mut max_diff = 0.0f32;
+        let mut worst_idx = 0;
+        for i in 0..(m * n) as usize {
+            let d = (fmlp_h[i].to_f32() - smlp_h[i].to_f32()).abs();
+            if d > max_diff {
+                max_diff = d;
+                worst_idx = i;
+            }
+        }
+        let fmax = fmlp_h
+            .iter()
+            .map(|v| v.to_f32().abs())
+            .fold(0.0f32, f32::max);
+        let smax = smlp_h
+            .iter()
+            .map(|v| v.to_f32().abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "  layer {layer:2}: diff={max_diff:.2e} at [{worst_idx}]  fmax={fmax:.1} smax={smax:.1}"
+        );
+
+        if max_diff > 5.0 {
+            print!("  fused [0..8]: ");
+            for i in 0..8 {
+                print!("{:.4} ", fmlp_h[i].to_f32());
+            }
+            println!();
+            print!("  separ [0..8]: ");
+            for i in 0..8 {
+                print!("{:.4} ", smlp_h[i].to_f32());
+            }
+            println!();
+            panic!("layer {layer} diverged: {max_diff:.2e}");
+        }
+
+        // MLP output → next layer's hidden_states
+        stream.memcpy_htod(&smlp_h, &mut d_sep_hs).unwrap();
+        stream.memcpy_htod(&fmlp_h, &mut d_fused_hs).unwrap();
+    }
+    println!("PASS: 24 layers at M=64 with production primitives");
+}
+
+// ── test9f: Same as test9e but at M=1 (decode batch size) ──
+#[test]
+fn test9f_multilayer_m1() {
+    println!("=== test9f: 24-layer chain at M=1 (decode) with production launch ===");
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+
+    use vllm_cuda::{DType, GpuTensor};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let hidden = 896u32;
+    let m = 1u32;
+    let k = hidden;
+    let n = hidden;
+    let eps = 1e-6f32;
+    let num_layers = 24;
+
+    let mut qkv_weights = Vec::new();
+    let mut o_weights = Vec::new();
+    let mut gate_weights = Vec::new();
+    let mut norm1_weights = Vec::new();
+    let mut norm2_weights = Vec::new();
+    for layer in 0..num_layers {
+        qkv_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        o_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        gate_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        norm1_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.input_layernorm.weight"),
+                ))
+                .unwrap(),
+        );
+        norm2_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                ))
+                .unwrap(),
+        );
+    }
+
+    let h_init: Vec<bf16> = (0..(m * k) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+
+    let mut d_sep_res = stream
+        .clone_htod(&vec![bf16::ZERO; (m * k) as usize])
+        .unwrap();
+    let mut d_sep_hs = stream.clone_htod(&h_init).unwrap();
+    let mut d_fused_res = stream
+        .clone_htod(&vec![bf16::ZERO; (m * k) as usize])
+        .unwrap();
+    let mut d_fused_hs = stream.clone_htod(&h_init).unwrap();
+
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+    let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+    let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+    let mut alloc = vllm_cuda::alloc::CachingAllocator::new();
+
+    for layer in 0..num_layers {
+        let (qw, _) = qkv_weights[layer].device_ptr(&stream);
+        let (ow, _) = o_weights[layer].device_ptr(&stream);
+        let (gw, _) = gate_weights[layer].device_ptr(&stream);
+        let (nw1, _) = norm1_weights[layer].device_ptr(&stream);
+        let (nw2, _) = norm2_weights[layer].device_ptr(&stream);
+
+        let norm1_tensor =
+            unsafe { GpuTensor::new(nw1 as *mut u8, &[hidden as usize], DType::BF16) };
+        let norm2_tensor =
+            unsafe { GpuTensor::new(nw2 as *mut u8, &[hidden as usize], DType::BF16) };
+        let qkv_tensor =
+            unsafe { GpuTensor::new(qw as *mut u8, &[n as usize, k as usize], DType::BF16) };
+        let gate_tensor =
+            unsafe { GpuTensor::new(gw as *mut u8, &[n as usize, k as usize], DType::BF16) };
+
+        // === SEPARATE PATH ===
+        stream.synchronize().unwrap();
+        let mut sr = stream.clone_dtoh(&d_sep_res).unwrap();
+        let sh = stream.clone_dtoh(&d_sep_hs).unwrap();
+        for i in 0..sr.len() {
+            sr[i] = bf16::from_f32(sr[i].to_f32() + sh[i].to_f32());
+        }
+        stream.memcpy_htod(&sr, &mut d_sep_res).unwrap();
+        let (sr_p, _) = d_sep_res.device_ptr(&stream);
+
+        let d_snormed: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+        let d_sqkv: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (sn_p, _) = d_snormed.device_ptr(&stream);
+        let (sqkv_p, _) = d_sqkv.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&sn_p)
+                .arg(&sr_p)
+                .arg(&(nw1 as u64))
+                .arg(&eps)
+                .arg(&(k as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            sn_p as u64,
+            qw as u64,
+            sqkv_p as u64,
+            sqkv_p as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            0.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            sqkv_p as u64,
+            ow as u64,
+            sr_p as u64,
+            sr_p as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            1.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        let (sr_p, _) = d_sep_res.device_ptr(&stream);
+        let d_snormed2: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+        let d_smlp: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (sn2_p, _) = d_snormed2.device_ptr(&stream);
+        let (smlp_p, _) = d_smlp.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&sn2_p)
+                .arg(&sr_p)
+                .arg(&(nw2 as u64))
+                .arg(&eps)
+                .arg(&(k as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            sn2_p as u64,
+            gw as u64,
+            smlp_p as u64,
+            smlp_p as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            0.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+
+        // === FUSED PATH ===
+        let (fr_p, _) = d_fused_res.device_ptr(&stream);
+        let (fh_p, _) = d_fused_hs.device_ptr(&stream);
+        unsafe {
+            let res_t = GpuTensor::new(fr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            let hs_t = GpuTensor::new(fh_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            vllm_cuda::kernels::add_inplace(res_t, hs_t, std::ptr::null_mut());
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+        let (fr_p, _) = d_fused_res.device_ptr(&stream);
+        let fused_qkv = unsafe {
+            let input_t = GpuTensor::new(fr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                input_t,
+                qkv_tensor,
+                norm1_tensor,
+                eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut alloc,
+                std::ptr::null_mut(),
+            )
+        };
+        let (fr_p, _) = d_fused_res.device_ptr(&stream);
+        let flat = build_flat_params(
+            fused_qkv.as_gpu_tensor().raw_ptr() as u64,
+            ow as u64,
+            fr_p as u64,
+            fr_p as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            1.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        drop(fused_qkv);
+        let (fr_p, _) = d_fused_res.device_ptr(&stream);
+        let fused_mlp = unsafe {
+            let input_t = GpuTensor::new(fr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                input_t,
+                gate_tensor,
+                norm2_tensor,
+                eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut alloc,
+                std::ptr::null_mut(),
+            )
+        };
+
+        // === COMPARE ===
+        unsafe {
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+        stream.synchronize().unwrap();
+
+        let smlp_h = stream.clone_dtoh(&d_smlp).unwrap();
+        let mut fmlp_h = vec![bf16::ZERO; (m * n) as usize];
+        unsafe {
+            cusys::cuMemcpyDtoH_v2(
+                fmlp_h.as_mut_ptr() as *mut std::ffi::c_void,
+                fused_mlp.as_gpu_tensor().raw_ptr() as u64,
+                (m * n) as usize * 2,
+            );
+        }
+
+        let mut max_diff = 0.0f32;
+        let mut worst_idx = 0;
+        for i in 0..(m * n) as usize {
+            let d = (fmlp_h[i].to_f32() - smlp_h[i].to_f32()).abs();
+            if d > max_diff {
+                max_diff = d;
+                worst_idx = i;
+            }
+        }
+        println!(
+            "  layer {layer:2}: diff={max_diff:.2e} at [{worst_idx}]  f={:.4} s={:.4}",
+            fmlp_h[worst_idx.min(fmlp_h.len() - 1)].to_f32(),
+            smlp_h[worst_idx.min(smlp_h.len() - 1)].to_f32(),
+        );
+
+        if max_diff > 5.0 {
+            panic!("layer {layer} diverged: {max_diff:.2e}");
+        }
+
+        stream.memcpy_htod(&smlp_h, &mut d_sep_hs).unwrap();
+        stream.memcpy_htod(&fmlp_h, &mut d_fused_hs).unwrap();
+    }
+    println!("PASS: 24 layers at M=1 with production primitives");
+}
+
+#[test]
+fn test_dump_fused_ptx_type() {
+    // Check whether FUSED_NORM_GEMM uses bf16 or f32 rms_norm code
+    let ptx = FUSED_NORM_GEMM.ptx;
+    let has_v4_u32 = ptx.contains("ld.global.nc.v4.u32");
+    let has_v4_f32 = ptx.contains("ld.global.nc.v4.f32");
+    let has_bf16_cvt = ptx.contains("mov.b32 \t{0,");
+    let has_cvt_bf16 = ptx.contains("cvt.f32.bf16");
+    println!("  FUSED_NORM_GEMM PTX check:");
+    println!("    has v4.u32 (bf16 load): {has_v4_u32}");
+    println!("    has v4.f32 (f32 load):  {has_v4_f32}");
+    println!("    has mov.b32 {{0,}} (bf16→f32): {has_bf16_cvt}");
+    println!("    has cvt.f32.bf16: {has_cvt_bf16}");
+
+    // Print the transplanted section
+    for line in ptx.lines() {
+        if line.contains("BEGIN transplanted")
+            || line.contains("END transplanted")
+            || line.contains("ld.global.nc.v4")
+            || line.contains("shr.s32") && line.contains("_rms_1,")
+        {
+            println!("    {}", line.trim());
+        }
+    }
+    assert!(
+        has_v4_u32 || has_bf16_cvt || has_cvt_bf16,
+        "FUSED_NORM_GEMM should contain bf16 code, not f32"
+    );
+}
+
+#[test]
+fn test9g_layer23_diagnostics() {
+    println!("=== test9g: diagnose layer 23 divergence ===");
+    // Run 23 layers with separate path, save the layer 23 input,
+    // then do ONE fused vs separate call on that exact input
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let hidden = 896u32;
+    let m = 64u32;
+    let k = hidden;
+    let n = hidden;
+    let eps = 1e-6f32;
+
+    let mut qkv_weights = Vec::new();
+    let mut o_weights = Vec::new();
+    let mut gate_weights = Vec::new();
+    let mut norm1_weights = Vec::new();
+    let mut norm2_weights = Vec::new();
+    for layer in 0..24 {
+        qkv_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        o_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        gate_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        norm1_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.input_layernorm.weight"),
+                ))
+                .unwrap(),
+        );
+        norm2_weights.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                ))
+                .unwrap(),
+        );
+    }
+
+    let h_init: Vec<bf16> = (0..(m * k) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+
+    // Run 23 layers with SEPARATE path to get the layer 23 input
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+    let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+    let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+
+    let mut d_res = stream
+        .clone_htod(&vec![bf16::ZERO; (m * k) as usize])
+        .unwrap();
+    let mut d_hs = stream.clone_htod(&h_init).unwrap();
+
+    for layer in 0..23 {
+        stream.synchronize().unwrap();
+        let mut r = stream.clone_dtoh(&d_res).unwrap();
+        let h = stream.clone_dtoh(&d_hs).unwrap();
+        for i in 0..r.len() {
+            r[i] = bf16::from_f32(r[i].to_f32() + h[i].to_f32());
+        }
+        stream.memcpy_htod(&r, &mut d_res).unwrap();
+        let (rp, _) = d_res.device_ptr(&stream);
+        let (qw, _) = qkv_weights[layer].device_ptr(&stream);
+        let (ow, _) = o_weights[layer].device_ptr(&stream);
+        let (gw, _) = gate_weights[layer].device_ptr(&stream);
+        let (nw1, _) = norm1_weights[layer].device_ptr(&stream);
+        let (nw2, _) = norm2_weights[layer].device_ptr(&stream);
+
+        let d_n: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+        let d_q: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (np, _) = d_n.device_ptr(&stream);
+        let (qp, _) = d_q.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&np)
+                .arg(&rp)
+                .arg(&(nw1 as u64))
+                .arg(&eps)
+                .arg(&(k as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            np as u64, qw as u64, qp as u64, qp as u64, m, n, k, k, k, n, n, 1.0, 0.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            qp as u64, ow as u64, rp as u64, rp as u64, m, n, k, k, k, n, n, 1.0, 1.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        let (rp, _) = d_res.device_ptr(&stream);
+        let d_n2: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+        let d_mlp: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (n2p, _) = d_n2.device_ptr(&stream);
+        let (mp, _) = d_mlp.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&n2p)
+                .arg(&rp)
+                .arg(&(nw2 as u64))
+                .arg(&eps)
+                .arg(&(k as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            n2p as u64, gw as u64, mp as u64, mp as u64, m, n, k, k, k, n, n, 1.0, 0.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+
+        stream.synchronize().unwrap();
+        let mlp_h = stream.clone_dtoh(&d_mlp).unwrap();
+        stream.memcpy_htod(&mlp_h, &mut d_hs).unwrap();
+    }
+
+    // Now we have the exact layer 23 input in d_res and d_hs
+    stream.synchronize().unwrap();
+    let mut layer23_res = stream.clone_dtoh(&d_res).unwrap();
+    let layer23_hs = stream.clone_dtoh(&d_hs).unwrap();
+    for i in 0..layer23_res.len() {
+        layer23_res[i] = bf16::from_f32(layer23_res[i].to_f32() + layer23_hs[i].to_f32());
+    }
+
+    // Check for NaN/Inf/large values
+    let max_val = layer23_res
+        .iter()
+        .map(|v| v.to_f32().abs())
+        .fold(0.0f32, f32::max);
+    let nan_count = layer23_res.iter().filter(|v| v.to_f32().is_nan()).count();
+    let inf_count = layer23_res
+        .iter()
+        .filter(|v| v.to_f32().is_infinite())
+        .count();
+    println!(
+        "  Layer 23 input: max={max_val:.1}, NaN={nan_count}, Inf={inf_count}, len={}",
+        layer23_res.len()
+    );
+
+    // Now do ONE fused vs separate call on this exact input
+    let diff = unsafe {
+        let (nw1, _) = norm1_weights[23].device_ptr(&stream);
+        let (qw, _) = qkv_weights[23].device_ptr(&stream);
+        run_fused_vs_separate_single(
+            &ctx,
+            m,
+            n,
+            k,
+            eps,
+            &layer23_res,
+            &qkv_weights[23],
+            &norm1_weights[23],
+        )
+    };
+    println!("  Layer 23 QKV fused vs separate: {diff:.2e}");
+    assert!(diff < 1.0, "Layer 23 QKV diverges: {diff:.2e}");
+}
+
+#[test]
+fn test9h_layer23_step_by_step() {
+    println!("=== test9h: layer 23 step-by-step comparison ===");
+    // Run 23 layers with IDENTICAL code (separate path) on both buffers.
+    // Then at layer 23, do fused on one and separate on the other.
+    // Compare after EACH step: add, QKV, o_proj, MLP.
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+    use vllm_cuda::{DType, GpuTensor};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let hidden = 896u32;
+    let m = 64u32;
+    let k = hidden;
+    let n = hidden;
+    let eps = 1e-6f32;
+
+    // Load layer 23 weights
+    let qkv_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.23.self_attn.q_proj.weight",
+        ))
+        .unwrap();
+    let o_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.23.self_attn.o_proj.weight",
+        ))
+        .unwrap();
+    let gate_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.23.self_attn.k_proj.weight",
+        ))
+        .unwrap();
+    let norm1_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.23.input_layernorm.weight",
+        ))
+        .unwrap();
+    let norm2_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.23.post_attention_layernorm.weight",
+        ))
+        .unwrap();
+
+    let (qw, _) = qkv_w.device_ptr(&stream);
+    let (ow, _) = o_w.device_ptr(&stream);
+    let (gw, _) = gate_w.device_ptr(&stream);
+    let (nw1, _) = norm1_w.device_ptr(&stream);
+    let (nw2, _) = norm2_w.device_ptr(&stream);
+    let norm1_t = unsafe { GpuTensor::new(nw1 as *mut u8, &[hidden as usize], DType::BF16) };
+    let norm2_t = unsafe { GpuTensor::new(nw2 as *mut u8, &[hidden as usize], DType::BF16) };
+    let qkv_t = unsafe { GpuTensor::new(qw as *mut u8, &[n as usize, k as usize], DType::BF16) };
+    let gate_t = unsafe { GpuTensor::new(gw as *mut u8, &[n as usize, k as usize], DType::BF16) };
+
+    // Build the layer 23 input by running 23 layers with separate path
+    // (use test9g's approach)
+    let mut all_norm1 = Vec::new();
+    let mut all_norm2 = Vec::new();
+    let mut all_qkv = Vec::new();
+    let mut all_o = Vec::new();
+    let mut all_gate = Vec::new();
+    for layer in 0..23 {
+        all_qkv.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        all_o.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        all_gate.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                ))
+                .unwrap(),
+        );
+        all_norm1.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.input_layernorm.weight"),
+                ))
+                .unwrap(),
+        );
+        all_norm2.push(
+            stream
+                .clone_htod(&load_bf16_tensor(
+                    &st,
+                    &format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                ))
+                .unwrap(),
+        );
+    }
+
+    let h_init: Vec<bf16> = (0..(m * k) as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+    let mut d_res = stream
+        .clone_htod(&vec![bf16::ZERO; (m * k) as usize])
+        .unwrap();
+    let mut d_hs = stream.clone_htod(&h_init).unwrap();
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+    let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+    let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+
+    for layer in 0..23 {
+        let (rp, _) = d_res.device_ptr(&stream);
+        let (hp, _) = d_hs.device_ptr(&stream);
+        unsafe {
+            let rt = GpuTensor::new(rp as *mut u8, &[m as usize, k as usize], DType::BF16);
+            let ht = GpuTensor::new(hp as *mut u8, &[m as usize, k as usize], DType::BF16);
+            vllm_cuda::kernels::add_inplace(rt, ht, std::ptr::null_mut());
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+        let (rp, _) = d_res.device_ptr(&stream);
+        let (lqw, _) = all_qkv[layer].device_ptr(&stream);
+        let (low, _) = all_o[layer].device_ptr(&stream);
+        let (lgw, _) = all_gate[layer].device_ptr(&stream);
+        let (ln1, _) = all_norm1[layer].device_ptr(&stream);
+        let (ln2, _) = all_norm2[layer].device_ptr(&stream);
+
+        let d_n: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+        let d_q: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (np, _) = d_n.device_ptr(&stream);
+        let (qp, _) = d_q.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&np)
+                .arg(&rp)
+                .arg(&(ln1 as u64))
+                .arg(&eps)
+                .arg(&(k as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            np as u64, lqw as u64, qp as u64, qp as u64, m, n, k, k, k, n, n, 1.0, 0.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            qp as u64, low as u64, rp as u64, rp as u64, m, n, k, k, k, n, n, 1.0, 1.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        let (rp, _) = d_res.device_ptr(&stream);
+        let d_n2: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+        let d_mlp: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (n2p, _) = d_n2.device_ptr(&stream);
+        let (mp, _) = d_mlp.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&n2p)
+                .arg(&rp)
+                .arg(&(ln2 as u64))
+                .arg(&eps)
+                .arg(&(k as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let flat = build_flat_params(
+            n2p as u64, lgw as u64, mp as u64, mp as u64, m, n, k, k, k, n, n, 1.0, 0.0,
+        );
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mlp_h = stream.clone_dtoh(&d_mlp).unwrap();
+        stream.memcpy_htod(&mlp_h, &mut d_hs).unwrap();
+    }
+
+    // Now d_res and d_hs contain the layer 23 input. Clone for both paths.
+    stream.synchronize().unwrap();
+    let res_h = stream.clone_dtoh(&d_res).unwrap();
+    let hs_h = stream.clone_dtoh(&d_hs).unwrap();
+    let d_fused_res = stream.clone_htod(&res_h).unwrap();
+    let d_fused_hs = stream.clone_htod(&hs_h).unwrap();
+    let d_sep_res = stream.clone_htod(&res_h).unwrap();
+    let d_sep_hs = stream.clone_htod(&hs_h).unwrap();
+
+    let mut alloc = vllm_cuda::alloc::CachingAllocator::new();
+
+    // Step 1: add. Both use GPU add_inplace.
+    let (fr_p, _) = d_fused_res.device_ptr(&stream);
+    let (fh_p, _) = d_fused_hs.device_ptr(&stream);
+    let (sr_p, _) = d_sep_res.device_ptr(&stream);
+    let (sh_p, _) = d_sep_hs.device_ptr(&stream);
+    unsafe {
+        let frt = GpuTensor::new(fr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+        let fht = GpuTensor::new(fh_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+        vllm_cuda::kernels::add_inplace(frt, fht, std::ptr::null_mut());
+        let srt = GpuTensor::new(sr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+        let sht = GpuTensor::new(sh_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+        vllm_cuda::kernels::add_inplace(srt, sht, std::ptr::null_mut());
+        cusys::cuStreamSynchronize(std::ptr::null_mut());
+    }
+    let fr_h = stream.clone_dtoh(&d_fused_res).unwrap();
+    let sr_h = stream.clone_dtoh(&d_sep_res).unwrap();
+    let add_diff: f32 = fr_h
+        .iter()
+        .zip(sr_h.iter())
+        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    println!("  After add: diff={add_diff:.2e}");
+
+    // Step 2: QKV norm+GEMM
+    let (fr_p, _) = d_fused_res.device_ptr(&stream);
+    let fused_qkv = unsafe {
+        let inp = GpuTensor::new(fr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+        vllm_cuda::ferrite::launch_fused_norm_gemm(
+            &FUSED_NORM_GEMM,
+            inp,
+            qkv_t,
+            norm1_t,
+            eps,
+            hidden,
+            None,
+            1.0,
+            0.0,
+            &mut alloc,
+            std::ptr::null_mut(),
+        )
+    };
+    let (sr_p, _) = d_sep_res.device_ptr(&stream);
+    let d_sn: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+    let d_sq: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (snp, _) = d_sn.device_ptr(&stream);
+    let (sqp, _) = d_sq.device_ptr(&stream);
+    unsafe {
+        stream
+            .launch_builder(&rms_func)
+            .arg(&snp)
+            .arg(&sr_p)
+            .arg(&(nw1 as u64))
+            .arg(&eps)
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: (m, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .unwrap();
+    }
+    let flat = build_flat_params(
+        snp as u64, qw as u64, sqp as u64, sqp as u64, m, n, k, k, k, n, n, 1.0, 0.0,
+    );
+    unsafe {
+        stream
+            .launch_builder(&gemm_func)
+            .arg(&flat)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 36864,
+            })
+            .unwrap();
+    }
+    unsafe {
+        cusys::cuStreamSynchronize(std::ptr::null_mut());
+    }
+    stream.synchronize().unwrap();
+    let mut fqkv_h = vec![bf16::ZERO; (m * n) as usize];
+    unsafe {
+        cusys::cuMemcpyDtoH_v2(
+            fqkv_h.as_mut_ptr() as *mut _,
+            fused_qkv.as_gpu_tensor().raw_ptr() as u64,
+            (m * n) as usize * 2,
+        );
+    }
+    let sqkv_h = stream.clone_dtoh(&d_sq).unwrap();
+    let qkv_diff: f32 = fqkv_h
+        .iter()
+        .zip(sqkv_h.iter())
+        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    println!("  After QKV: diff={qkv_diff:.2e}");
+
+    // Step 3: o_proj accumulate
+    let (fr_p, _) = d_fused_res.device_ptr(&stream);
+    let flat = build_flat_params(
+        fused_qkv.as_gpu_tensor().raw_ptr() as u64,
+        ow as u64,
+        fr_p as u64,
+        fr_p as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        1.0,
+    );
+    unsafe {
+        stream
+            .launch_builder(&gemm_func)
+            .arg(&flat)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 36864,
+            })
+            .unwrap();
+    }
+    let (sr_p, _) = d_sep_res.device_ptr(&stream);
+    let flat = build_flat_params(
+        sqp as u64,
+        ow as u64,
+        sr_p as u64,
+        sr_p as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        1.0,
+    );
+    unsafe {
+        stream
+            .launch_builder(&gemm_func)
+            .arg(&flat)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 36864,
+            })
+            .unwrap();
+    }
+    stream.synchronize().unwrap();
+    let fr_h = stream.clone_dtoh(&d_fused_res).unwrap();
+    let sr_h = stream.clone_dtoh(&d_sep_res).unwrap();
+    let oproj_diff: f32 = fr_h
+        .iter()
+        .zip(sr_h.iter())
+        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    println!("  After o_proj: diff={oproj_diff:.2e}");
+
+    // Step 4: MLP norm+GEMM
+    drop(fused_qkv);
+    let (fr_p, _) = d_fused_res.device_ptr(&stream);
+    let fused_mlp = unsafe {
+        let inp = GpuTensor::new(fr_p as *mut u8, &[m as usize, k as usize], DType::BF16);
+        vllm_cuda::ferrite::launch_fused_norm_gemm(
+            &FUSED_NORM_GEMM,
+            inp,
+            gate_t,
+            norm2_t,
+            eps,
+            hidden,
+            None,
+            1.0,
+            0.0,
+            &mut alloc,
+            std::ptr::null_mut(),
+        )
+    };
+    let (sr_p, _) = d_sep_res.device_ptr(&stream);
+    let d_sn2: CudaSlice<bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+    let d_smlp: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let (sn2p, _) = d_sn2.device_ptr(&stream);
+    let (smp, _) = d_smlp.device_ptr(&stream);
+    unsafe {
+        stream
+            .launch_builder(&rms_func)
+            .arg(&sn2p)
+            .arg(&sr_p)
+            .arg(&(nw2 as u64))
+            .arg(&eps)
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: (m, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .unwrap();
+    }
+    let flat = build_flat_params(
+        sn2p as u64,
+        gw as u64,
+        smp as u64,
+        smp as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+    unsafe {
+        stream
+            .launch_builder(&gemm_func)
+            .arg(&flat)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 36864,
+            })
+            .unwrap();
+    }
+    unsafe {
+        cusys::cuStreamSynchronize(std::ptr::null_mut());
+    }
+    stream.synchronize().unwrap();
+    let mut fmlp_h = vec![bf16::ZERO; (m * n) as usize];
+    unsafe {
+        cusys::cuMemcpyDtoH_v2(
+            fmlp_h.as_mut_ptr() as *mut _,
+            fused_mlp.as_gpu_tensor().raw_ptr() as u64,
+            (m * n) as usize * 2,
+        );
+    }
+    let smlp_h = stream.clone_dtoh(&d_smlp).unwrap();
+    let mlp_diff: f32 = fmlp_h
+        .iter()
+        .zip(smlp_h.iter())
+        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    println!("  After MLP: diff={mlp_diff:.2e}");
+
+    assert!(mlp_diff < 1.0, "Layer 23 MLP diverges: {mlp_diff:.2e}");
+    println!("PASS");
+}
+
+// ── test9i: Use a real non-default CUDA stream (like production) ──
+// All prior tests use null stream. Production uses device.compute_stream.
+#[test]
+fn test9i_nondefault_stream() {
+    println!("=== test9i: fused norm+GEMM on non-default stream ===");
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+    use vllm_cuda::{DType, GpuTensor};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let hidden = 896u32;
+    let eps = 1e-6f32;
+
+    // Create a non-default CUDA stream (like device.compute_stream)
+    let mut cuda_stream: cusys::CUstream = std::ptr::null_mut();
+    unsafe {
+        let r = cusys::cuStreamCreate(&mut cuda_stream, 0);
+        assert_eq!(
+            r,
+            cusys::cudaError_enum::CUDA_SUCCESS,
+            "cuStreamCreate failed"
+        );
+    }
+    assert!(!cuda_stream.is_null(), "stream should be non-null");
+
+    let qkv_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.0.self_attn.q_proj.weight",
+        ))
+        .unwrap();
+    let norm_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.0.input_layernorm.weight",
+        ))
+        .unwrap();
+    let (qw_p, _) = qkv_w.device_ptr(&stream);
+    let (nw_p, _) = norm_w.device_ptr(&stream);
+    let n = 896u32;
+
+    let norm_t = unsafe { GpuTensor::new(nw_p as *mut u8, &[hidden as usize], DType::BF16) };
+    let qkv_t =
+        unsafe { GpuTensor::new(qw_p as *mut u8, &[n as usize, hidden as usize], DType::BF16) };
+
+    let mut alloc = vllm_cuda::alloc::CachingAllocator::new();
+
+    // Test with non-default stream at various M
+    for m in [1u32, 5, 64, 65, 128] {
+        let input_data: Vec<bf16> = (0..(m * hidden) as usize)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+            .collect();
+
+        // Fused on non-default stream
+        let d_input = stream.clone_htod(&input_data).unwrap();
+        let (inp_p, _) = d_input.device_ptr(&stream);
+        // Sync default stream before using non-default stream
+        stream.synchronize().unwrap();
+
+        let fused_out = unsafe {
+            let inp_t = GpuTensor::new(
+                inp_p as *mut u8,
+                &[m as usize, hidden as usize],
+                DType::BF16,
+            );
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                inp_t,
+                qkv_t,
+                norm_t,
+                eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut alloc,
+                cuda_stream,
+            )
+        };
+        unsafe {
+            cusys::cuStreamSynchronize(cuda_stream);
+        }
+
+        // Separate on default stream (reference)
+        let d_input2 = stream.clone_htod(&input_data).unwrap();
+        let (inp2_p, _) = d_input2.device_ptr(&stream);
+        let d_normed: CudaSlice<bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+        let d_sep_out: CudaSlice<bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (normed_p, _) = d_normed.device_ptr(&stream);
+        let (sout_p, _) = d_sep_out.device_ptr(&stream);
+        let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+        let rms_func = rms_module
+            .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+            .unwrap();
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&normed_p)
+                .arg(&(inp2_p as u64))
+                .arg(&(nw_p as u64))
+                .arg(&eps)
+                .arg(&(hidden as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+        let flat = build_flat_params(
+            normed_p as u64,
+            qw_p as u64,
+            sout_p as u64,
+            sout_p as u64,
+            m,
+            n,
+            hidden,
+            hidden,
+            hidden,
+            n,
+            n,
+            1.0,
+            0.0,
+        );
+        let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+        let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+        unsafe {
+            stream
+                .launch_builder(&gemm_func)
+                .arg(&flat)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, gz),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 36864,
+                })
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+
+        let mut fused_host = vec![bf16::ZERO; (m * n) as usize];
+        unsafe {
+            cusys::cuMemcpyDtoH_v2(
+                fused_host.as_mut_ptr() as *mut std::ffi::c_void,
+                fused_out.as_gpu_tensor().raw_ptr() as u64,
+                (m * n) as usize * 2,
+            );
+        }
+        let sep_host = stream.clone_dtoh(&d_sep_out).unwrap();
+
+        let mut max_diff = 0.0f32;
+        let mut worst = 0;
+        for i in 0..(m * n) as usize {
+            let d = (fused_host[i].to_f32() - sep_host[i].to_f32()).abs();
+            if d > max_diff {
+                max_diff = d;
+                worst = i;
+            }
+        }
+        println!("  M={m}: diff={max_diff:.2e}");
+        assert!(
+            max_diff < 0.01,
+            "M={m}: non-default stream diff {max_diff:.2e}"
+        );
+    }
+
+    // Also test: add_inplace on non-default stream then fused on same stream
+    println!("  --- add_inplace + fused on non-default stream ---");
+    for m in [1u32, 5, 64] {
+        let h_res: Vec<bf16> = (0..(m * hidden) as usize)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00013 - 0.3).cos() * 5.0))
+            .collect();
+        let h_hs: Vec<bf16> = (0..(m * hidden) as usize)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+            .collect();
+
+        let d_res = stream.clone_htod(&h_res).unwrap();
+        let d_hs = stream.clone_htod(&h_hs).unwrap();
+        let (res_p, _) = d_res.device_ptr(&stream);
+        let (hs_p, _) = d_hs.device_ptr(&stream);
+        stream.synchronize().unwrap();
+
+        // add_inplace + fused on non-default stream
+        unsafe {
+            let res_t = GpuTensor::new(
+                res_p as *mut u8,
+                &[m as usize, hidden as usize],
+                DType::BF16,
+            );
+            let hs_t = GpuTensor::new(hs_p as *mut u8, &[m as usize, hidden as usize], DType::BF16);
+            vllm_cuda::kernels::add_inplace(res_t, hs_t, cuda_stream);
+        }
+        let fused_out = unsafe {
+            let inp_t = GpuTensor::new(
+                res_p as *mut u8,
+                &[m as usize, hidden as usize],
+                DType::BF16,
+            );
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                inp_t,
+                qkv_t,
+                norm_t,
+                eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut alloc,
+                cuda_stream,
+            )
+        };
+        unsafe {
+            cusys::cuStreamSynchronize(cuda_stream);
+        }
+
+        // Reference: CPU add then separate
+        let h_sum: Vec<bf16> = h_res
+            .iter()
+            .zip(h_hs.iter())
+            .map(|(r, h)| bf16::from_f32(r.to_f32() + h.to_f32()))
+            .collect();
+        let diff = unsafe {
+            run_fused_vs_separate_single(&ctx, m, n, hidden, eps, &h_sum, &qkv_w, &norm_w)
+        };
+        // But we need to compare the non-default-stream result too
+        let mut fused_host = vec![bf16::ZERO; (m * n) as usize];
+        unsafe {
+            cusys::cuMemcpyDtoH_v2(
+                fused_host.as_mut_ptr() as *mut std::ffi::c_void,
+                fused_out.as_gpu_tensor().raw_ptr() as u64,
+                (m * n) as usize * 2,
+            );
+        }
+        // Compare with the single-call fused result (which uses null stream)
+        let d_sum = stream.clone_htod(&h_sum).unwrap();
+        let (sum_p, _) = d_sum.device_ptr(&stream);
+        let null_fused = unsafe {
+            let inp_t = GpuTensor::new(
+                sum_p as *mut u8,
+                &[m as usize, hidden as usize],
+                DType::BF16,
+            );
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                inp_t,
+                qkv_t,
+                norm_t,
+                eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut alloc,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe {
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+        let mut null_host = vec![bf16::ZERO; (m * n) as usize];
+        unsafe {
+            cusys::cuMemcpyDtoH_v2(
+                null_host.as_mut_ptr() as *mut std::ffi::c_void,
+                null_fused.as_gpu_tensor().raw_ptr() as u64,
+                (m * n) as usize * 2,
+            );
+        }
+
+        let mut stream_diff = 0.0f32;
+        for i in 0..(m * n) as usize {
+            let d = (fused_host[i].to_f32() - null_host[i].to_f32()).abs();
+            if d > stream_diff {
+                stream_diff = d;
+            }
+        }
+        println!("  M={m}: add+fused(non-default) vs fused(null): {stream_diff:.2e}");
+        assert!(stream_diff < 0.01, "M={m}: stream diff {stream_diff:.2e}");
+    }
+
+    unsafe {
+        cusys::cuStreamDestroy_v2(cuda_stream);
+    }
+    println!("PASS");
+}
+
+// ── test9j: Fused vs separate with REAL model residual data (not synthetic) ──
+// All prior tests use synthetic sin/cos data. Production uses actual residual
+// values from the model. This test loads the model, runs one layer standard,
+// and uses the resulting residual as input to compare fused vs separate.
+#[test]
+fn test9j_real_residual_data() {
+    println!("=== test9j: fused vs separate with real model residual ===");
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+    use vllm_cuda::{DType, GpuTensor};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let hidden = 896u32;
+    let eps = 1e-6f32;
+
+    // Load embedding and layer 0 weights
+    let embed_w = load_bf16_tensor(&st, "model.embed_tokens.weight");
+    let embed_rows = embed_w.len() / hidden as usize;
+    let d_embed = stream.clone_htod(&embed_w).unwrap();
+    let (embed_p, _) = d_embed.device_ptr(&stream);
+
+    // Simulate embedding lookup for a few token IDs
+    let token_ids: Vec<i32> = vec![791, 6552, 315, 9822, 374]; // "The capital of France is"
+    let m = token_ids.len() as u32;
+    println!("  M={m} (prefill), hidden={hidden}");
+
+    // CPU embedding lookup
+    let mut embed_out = vec![bf16::ZERO; (m * hidden) as usize];
+    for (row, &tid) in token_ids.iter().enumerate() {
+        let src_start = tid as usize * hidden as usize;
+        let dst_start = row * hidden as usize;
+        embed_out[dst_start..dst_start + hidden as usize]
+            .copy_from_slice(&embed_w[src_start..src_start + hidden as usize]);
+    }
+
+    // Load layer 0 + 1 weights
+    let norm0_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.0.input_layernorm.weight",
+        ))
+        .unwrap();
+    let (norm0_p, _) = norm0_w.device_ptr(&stream);
+
+    // Build real QKV weight (concatenated)
+    let mut qkv_data = load_bf16_tensor(&st, "model.layers.1.self_attn.q_proj.weight");
+    qkv_data.extend_from_slice(&load_bf16_tensor(
+        &st,
+        "model.layers.1.self_attn.k_proj.weight",
+    ));
+    qkv_data.extend_from_slice(&load_bf16_tensor(
+        &st,
+        "model.layers.1.self_attn.v_proj.weight",
+    ));
+    let n_qkv = (qkv_data.len() / hidden as usize) as u32;
+    println!("  QKV dims: [{n_qkv}, {hidden}]");
+    let qkv_w = stream.clone_htod(&qkv_data).unwrap();
+    let (qkv_p, _) = qkv_w.device_ptr(&stream);
+
+    let norm1_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.1.input_layernorm.weight",
+        ))
+        .unwrap();
+    let (norm1_p, _) = norm1_w.device_ptr(&stream);
+
+    // Upload embedding output as the "residual" for layer 1
+    // (In real model: layer 0 output feeds as hidden_states to layer 1,
+    //  and residual = embedding + layer 0 output. For simplicity, just use
+    //  the embedding as both residual and hidden_states.)
+    let d_input_f = stream.clone_htod(&embed_out).unwrap();
+    let d_input_s = stream.clone_htod(&embed_out).unwrap();
+    let (inp_f_p, _) = d_input_f.device_ptr(&stream);
+    let (inp_s_p, _) = d_input_s.device_ptr(&stream);
+
+    // Print value stats
+    let max_val = embed_out
+        .iter()
+        .map(|v| v.to_f32().abs())
+        .fold(0.0f32, f32::max);
+    let mean_val = embed_out.iter().map(|v| v.to_f32().abs()).sum::<f32>() / embed_out.len() as f32;
+    println!("  Input stats: max={max_val:.4}, mean_abs={mean_val:.4}");
+
+    // ── Fused path ──
+    let norm1_t = unsafe { GpuTensor::new(norm1_p as *mut u8, &[hidden as usize], DType::BF16) };
+    let qkv_t = unsafe {
+        GpuTensor::new(
+            qkv_p as *mut u8,
+            &[n_qkv as usize, hidden as usize],
+            DType::BF16,
+        )
+    };
+    let mut alloc = vllm_cuda::alloc::CachingAllocator::new();
+
+    let fused_out = unsafe {
+        let inp_t = GpuTensor::new(
+            inp_f_p as *mut u8,
+            &[m as usize, hidden as usize],
+            DType::BF16,
+        );
+        vllm_cuda::ferrite::launch_fused_norm_gemm(
+            &FUSED_NORM_GEMM,
+            inp_t,
+            qkv_t,
+            norm1_t,
+            eps,
+            hidden,
+            None,
+            1.0,
+            0.0,
+            &mut alloc,
+            std::ptr::null_mut(),
+        )
+    };
+
+    // ── Separate path ──
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+    let d_normed: CudaSlice<bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    let d_sep_out: CudaSlice<bf16> = stream.alloc_zeros((m * n_qkv) as usize).unwrap();
+    let (normed_p, _) = d_normed.device_ptr(&stream);
+    let (sout_p, _) = d_sep_out.device_ptr(&stream);
+    unsafe {
+        stream
+            .launch_builder(&rms_func)
+            .arg(&normed_p)
+            .arg(&(inp_s_p as u64))
+            .arg(&(norm1_p as u64))
+            .arg(&eps)
+            .arg(&(hidden as i32))
+            .launch(LaunchConfig {
+                grid_dim: (m, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .unwrap();
+    }
+    let (gx, gy, gz) = compute_grid(m, n_qkv, 64, 128);
+    let flat = build_flat_params(
+        normed_p as u64,
+        qkv_p as u64,
+        sout_p as u64,
+        sout_p as u64,
+        m,
+        n_qkv,
+        hidden,
+        hidden,
+        hidden,
+        n_qkv,
+        n_qkv,
+        1.0,
+        0.0,
+    );
+    let gemm_module = ctx.load_module(Ptx::from_src(FLAT_GEMM_PTX)).unwrap();
+    let gemm_func = gemm_module.load_function("ferrite_gemm_64x128x32").unwrap();
+    unsafe {
+        stream
+            .launch_builder(&gemm_func)
+            .arg(&flat)
+            .launch(LaunchConfig {
+                grid_dim: (gx, gy, gz),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 36864,
+            })
+            .unwrap();
+    }
+
+    unsafe {
+        cusys::cuStreamSynchronize(std::ptr::null_mut());
+    }
+    stream.synchronize().unwrap();
+
+    let mut fused_host = vec![bf16::ZERO; (m * n_qkv) as usize];
+    unsafe {
+        cusys::cuMemcpyDtoH_v2(
+            fused_host.as_mut_ptr() as *mut std::ffi::c_void,
+            fused_out.as_gpu_tensor().raw_ptr() as u64,
+            (m * n_qkv) as usize * 2,
+        );
+    }
+    let sep_host = stream.clone_dtoh(&d_sep_out).unwrap();
+
+    let mut max_diff = 0.0f32;
+    let mut worst = 0;
+    for i in 0..(m * n_qkv) as usize {
+        let d = (fused_host[i].to_f32() - sep_host[i].to_f32()).abs();
+        if d > max_diff {
+            max_diff = d;
+            worst = i;
+        }
+    }
+    println!("  Fused vs separate: max_diff={max_diff:.2e} at [{worst}]");
+    println!(
+        "    fused={:.4} sep={:.4}",
+        fused_host[worst].to_f32(),
+        sep_host[worst].to_f32()
+    );
+
+    // Also test at M=1 (single token)
+    println!("  --- Single token (M=1) ---");
+    let single_input = embed_out[..hidden as usize].to_vec();
+    let d_single_f = stream.clone_htod(&single_input).unwrap();
+    let d_single_s = stream.clone_htod(&single_input).unwrap();
+    let (sf_p, _) = d_single_f.device_ptr(&stream);
+    let (ss_p, _) = d_single_s.device_ptr(&stream);
+
+    let fused_single = unsafe {
+        let inp_t = GpuTensor::new(sf_p as *mut u8, &[1, hidden as usize], DType::BF16);
+        vllm_cuda::ferrite::launch_fused_norm_gemm(
+            &FUSED_NORM_GEMM,
+            inp_t,
+            qkv_t,
+            norm1_t,
+            eps,
+            hidden,
+            None,
+            1.0,
+            0.0,
+            &mut alloc,
+            std::ptr::null_mut(),
+        )
+    };
+    let d_normed1: CudaSlice<bf16> = stream.alloc_zeros(hidden as usize).unwrap();
+    let d_sep1: CudaSlice<bf16> = stream.alloc_zeros(n_qkv as usize).unwrap();
+    let (n1p, _) = d_normed1.device_ptr(&stream);
+    let (s1p, _) = d_sep1.device_ptr(&stream);
+    unsafe {
+        stream
+            .launch_builder(&rms_func)
+            .arg(&n1p)
+            .arg(&(ss_p as u64))
+            .arg(&(norm1_p as u64))
+            .arg(&eps)
+            .arg(&(hidden as i32))
+            .launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .unwrap();
+    }
+    let (gx1, gy1, gz1) = compute_grid(1, n_qkv, 64, 128);
+    let flat1 = build_flat_params(
+        n1p as u64,
+        qkv_p as u64,
+        s1p as u64,
+        s1p as u64,
+        1,
+        n_qkv,
+        hidden,
+        hidden,
+        hidden,
+        n_qkv,
+        n_qkv,
+        1.0,
+        0.0,
+    );
+    unsafe {
+        stream
+            .launch_builder(&gemm_func)
+            .arg(&flat1)
+            .launch(LaunchConfig {
+                grid_dim: (gx1, gy1, gz1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 36864,
+            })
+            .unwrap();
+    }
+    unsafe {
+        cusys::cuStreamSynchronize(std::ptr::null_mut());
+    }
+    stream.synchronize().unwrap();
+
+    let mut fh1 = vec![bf16::ZERO; n_qkv as usize];
+    unsafe {
+        cusys::cuMemcpyDtoH_v2(
+            fh1.as_mut_ptr() as *mut _,
+            fused_single.as_gpu_tensor().raw_ptr() as u64,
+            n_qkv as usize * 2,
+        );
+    }
+    let sh1 = stream.clone_dtoh(&d_sep1).unwrap();
+    let mut max1 = 0.0f32;
+    let mut worst1 = 0;
+    for i in 0..n_qkv as usize {
+        let d = (fh1[i].to_f32() - sh1[i].to_f32()).abs();
+        if d > max1 {
+            max1 = d;
+            worst1 = i;
+        }
+    }
+    println!("  M=1, N={n_qkv}: max_diff={max1:.2e} at [{worst1}]");
+    println!(
+        "    fused={:.4} sep={:.4}",
+        fh1[worst1].to_f32(),
+        sh1[worst1].to_f32()
+    );
+
+    assert!(
+        max_diff < 0.1,
+        "Fused vs separate with real data: {max_diff:.2e}"
+    );
+    assert!(max1 < 0.1, "M=1 with real data: {max1:.2e}");
+    println!("PASS");
+}
+
+// ── test9k: CachingAllocator reuse — detect read-before-write ──
+// Allocate a block, fill with sentinel, free it, then run fused norm+GEMM
+// which allocates output from the same pool. Check if sentinels leak into output.
+#[test]
+fn test9k_allocator_reuse() {
+    println!("=== test9k: CachingAllocator reuse check ===");
+    let data = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&data).expect("parse safetensors");
+    use vllm_cuda::{DType, GpuTensor};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let hidden = 896u32;
+    let eps = 1e-6f32;
+    let m = 1u32;
+    let n = 1152u32;
+
+    let mut qkv_data = load_bf16_tensor(&st, "model.layers.0.self_attn.q_proj.weight");
+    qkv_data.extend_from_slice(&load_bf16_tensor(
+        &st,
+        "model.layers.0.self_attn.k_proj.weight",
+    ));
+    qkv_data.extend_from_slice(&load_bf16_tensor(
+        &st,
+        "model.layers.0.self_attn.v_proj.weight",
+    ));
+    let qkv_w = stream.clone_htod(&qkv_data).unwrap();
+    let norm_w = stream
+        .clone_htod(&load_bf16_tensor(
+            &st,
+            "model.layers.0.input_layernorm.weight",
+        ))
+        .unwrap();
+    let (qkv_p, _) = qkv_w.device_ptr(&stream);
+    let (norm_p, _) = norm_w.device_ptr(&stream);
+    let qkv_t = unsafe {
+        GpuTensor::new(
+            qkv_p as *mut u8,
+            &[n as usize, hidden as usize],
+            DType::BF16,
+        )
+    };
+    let norm_t = unsafe { GpuTensor::new(norm_p as *mut u8, &[hidden as usize], DType::BF16) };
+
+    let mut alloc = vllm_cuda::alloc::CachingAllocator::new();
+
+    // Step 1: Allocate a block from the pool, fill with NaN sentinels, then free it
+    let sentinel = {
+        let t = alloc.alloc_tensor(&[m as usize, n as usize], DType::BF16);
+        let ptr = t.as_gpu_tensor().raw_ptr() as u64;
+        let size = (m * n) as usize * 2;
+        // Fill with NaN pattern (0x7FC0 in bf16 = NaN)
+        let nan_data = vec![0x7FC0u16; (m * n) as usize];
+        unsafe {
+            cusys::cuMemcpyHtoD_v2(ptr, nan_data.as_ptr() as *const _, size);
+            cusys::cuStreamSynchronize(std::ptr::null_mut());
+        }
+        println!("  Sentinel block at ptr={ptr:#x}, size={size}");
+        ptr
+    };
+    // t is dropped here — block goes back to pool
+
+    // Step 2: Run fused norm+GEMM — its output allocation might get the sentinel block
+    let input_data: Vec<bf16> = (0..hidden as usize)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+    let d_input = stream.clone_htod(&input_data).unwrap();
+    let (inp_p, _) = d_input.device_ptr(&stream);
+    stream.synchronize().unwrap();
+
+    let fused_out = unsafe {
+        let inp_t = GpuTensor::new(
+            inp_p as *mut u8,
+            &[m as usize, hidden as usize],
+            DType::BF16,
+        );
+        vllm_cuda::ferrite::launch_fused_norm_gemm(
+            &FUSED_NORM_GEMM,
+            inp_t,
+            qkv_t,
+            norm_t,
+            eps,
+            hidden,
+            None,
+            1.0,
+            0.0,
+            &mut alloc,
+            std::ptr::null_mut(),
+        )
+    };
+    let out_ptr = fused_out.as_gpu_tensor().raw_ptr() as u64;
+    println!("  Output block at ptr={out_ptr:#x}");
+    let reused = out_ptr == sentinel;
+    println!("  Block reused: {reused}");
+
+    unsafe {
+        cusys::cuStreamSynchronize(std::ptr::null_mut());
+    }
+
+    // Step 3: Check for NaN in output
+    let mut out_h = vec![bf16::ZERO; (m * n) as usize];
+    unsafe {
+        cusys::cuMemcpyDtoH_v2(out_h.as_mut_ptr() as *mut _, out_ptr, (m * n) as usize * 2);
+    }
+    let nan_count = out_h.iter().filter(|v| v.to_f32().is_nan()).count();
+    let inf_count = out_h.iter().filter(|v| v.to_f32().is_infinite()).count();
+    let max_val = out_h
+        .iter()
+        .map(|v| v.to_f32().abs())
+        .filter(|v| !v.is_nan())
+        .fold(0.0f32, f32::max);
+    println!(
+        "  Output: NaN={nan_count}/{} Inf={inf_count} max={max_val:.4}",
+        m * n
+    );
+
+    if nan_count > 0 {
+        println!("  FOUND NaN — read-before-write detected!");
+        // Find first NaN
+        let first_nan = out_h.iter().position(|v| v.to_f32().is_nan()).unwrap();
+        println!("  First NaN at index {first_nan}");
+    }
+
+    // Also compare against a fresh allocator run
+    let mut alloc2 = vllm_cuda::alloc::CachingAllocator::new();
+    let d_input2 = stream.clone_htod(&input_data).unwrap();
+    let (inp2_p, _) = d_input2.device_ptr(&stream);
+    stream.synchronize().unwrap();
+    let fresh_out = unsafe {
+        let inp_t = GpuTensor::new(
+            inp2_p as *mut u8,
+            &[m as usize, hidden as usize],
+            DType::BF16,
+        );
+        vllm_cuda::ferrite::launch_fused_norm_gemm(
+            &FUSED_NORM_GEMM,
+            inp_t,
+            qkv_t,
+            norm_t,
+            eps,
+            hidden,
+            None,
+            1.0,
+            0.0,
+            &mut alloc2,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe {
+        cusys::cuStreamSynchronize(std::ptr::null_mut());
+    }
+    let mut fresh_h = vec![bf16::ZERO; (m * n) as usize];
+    unsafe {
+        cusys::cuMemcpyDtoH_v2(
+            fresh_h.as_mut_ptr() as *mut _,
+            fresh_out.as_gpu_tensor().raw_ptr() as u64,
+            (m * n) as usize * 2,
+        );
+    }
+
+    let mut diff = 0.0f32;
+    for i in 0..(m * n) as usize {
+        let d = (out_h[i].to_f32() - fresh_h[i].to_f32()).abs();
+        if d > diff && !d.is_nan() {
+            diff = d;
+        }
+    }
+    println!("  Reused vs fresh allocator: diff={diff:.2e}");
+    assert_eq!(nan_count, 0, "NaN in output — read-before-write bug");
+    assert!(diff < 0.01, "Reused vs fresh diff: {diff:.2e}");
+    println!("PASS");
+}

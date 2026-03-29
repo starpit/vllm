@@ -548,8 +548,11 @@ fn get_or_load_mlp_pipeline(ptx: &str) -> CUfunction {
     if let Some(ref cf) = *cache {
         return cf.1;
     }
+    // The assembled kernel uses only static .shared (no extern .shared).
+    // Opt in for 99KB static SMEM (L4 max) since the two GEMM bodies +
+    // rms_norm extras may exceed the default 48KB limit.
     let (module, func) = unsafe {
-        load_flat_module(ptx, "ferrite_mlp_pipeline", 36864)
+        load_flat_module(ptx, "ferrite_mlp_pipeline", 99 * 1024)
             .unwrap_or_else(|e| panic!("ferrite: failed to load MLP pipeline: {e}"))
     };
     *cache = Some(CudaFunc(module, func));
@@ -673,7 +676,8 @@ pub unsafe fn launch_mlp_pipeline(
     p32!(grid_x1);
     p32!(grid_x2);
 
-    launch_kernel_raw(func, stream, num_sm, 1, 128, 36864, &params[..o]);
+    // Dynamic SMEM = 0 (kernel uses only static .shared declarations)
+    launch_kernel_raw(func, stream, num_sm, 1, 128, 0, &params[..o]);
     drop(gate_up_buf);
     drop(counters);
     output

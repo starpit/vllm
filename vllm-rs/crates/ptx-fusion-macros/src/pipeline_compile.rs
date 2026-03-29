@@ -15,6 +15,20 @@ use crate::fuse_general::{PointwiseComputation, replace_a_loads_with_inline_fn};
 use crate::parser::DefUseGraph;
 use crate::pipeline::{PipelineStage, ReductionDecomposition, StagePattern};
 
+/// Extract the GEMM tile_m dimension from a CUTLASS mangled entry name.
+///
+/// Parses the `GemmShapeILi{M}ELi{N}ELi{K}E` template parameter from the
+/// mangled C++ symbol. Returns the first integer (M = tile_m).
+fn extract_tile_m_from_entry(name: &str) -> Option<u32> {
+    // Find "GemmShapeILi" followed by the M dimension integer
+    let marker = "GemmShapeILi";
+    let idx = name.find(marker)?;
+    let rest = &name[idx + marker.len()..];
+    // rest starts with "{M}ELi{N}ELi{K}E..."
+    let end = rest.find('E')?;
+    rest[..end].parse::<u32>().ok()
+}
+
 /// Thread-to-row mapping parameters extracted from GEMM PTX.
 ///
 /// The mapping formula is:
@@ -279,7 +293,15 @@ fn build_reduction_computation(
         );
     }
 
-    let prologue = build_prologue_from_decomposition(decomp, thread_map.as_ref());
+    // Extract tile_m from the GEMM's mangled entry name (GemmShapeILi{M}E...)
+    let tile_m = extract_tile_m_from_entry(&_gemm.protocol.name).ok_or_else(|| {
+        format!(
+            "could not extract tile_m from GEMM entry name: {}",
+            _gemm.protocol.name
+        )
+    })?;
+
+    let prologue = build_prologue_from_decomposition(decomp, thread_map.as_ref(), tile_m);
 
     // ── Per-site code ──
     // Row selection: the prologue pre-loads inv_rms for both rows into
@@ -353,6 +375,7 @@ fn build_reduction_computation(
 fn build_prologue_from_decomposition(
     decomp: &ReductionDecomposition,
     thread_map: Option<&ThreadRowMap>,
+    tile_m: u32,
 ) -> Vec<String> {
     // Use extracted constants or defaults
     let lane_shr = thread_map.map_or(2, |tm| tm.lanes_per_row_log2);
@@ -397,7 +420,7 @@ fn build_prologue_from_decomposition(
     // The pipeline! macro passes tile_m as a compile-time constant.
 
     // Row loop: for each row in this CTA's tile
-    prologue.push("mov.u32 \t%r_rms_nrows, 64;".into()); // TODO: derive from GEMM tile analysis
+    prologue.push(format!("mov.u32 \t%r_rms_nrows, {tile_m};"));
     prologue.push("mov.u32 \t%r_rms_row, 0;".into());
     prologue.push("$L_rms_row_loop:".into());
 
@@ -541,6 +564,40 @@ fn build_prologue_from_decomposition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_tile_m_from_gemm_entries() {
+        // 64x128x32
+        assert_eq!(
+            extract_tile_m_from_entry(
+                "_ZN7cutlass6KernelINS_4gemm6kernel4GemmINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi64ELi128ELi32EEE"
+            ),
+            Some(64)
+        );
+        // 128x128x32
+        assert_eq!(
+            extract_tile_m_from_entry(
+                "_ZN7cutlass6KernelINS_4gemm6kernel4GemmINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi128ELi32EEE"
+            ),
+            Some(128)
+        );
+        // 128x128x64
+        assert_eq!(
+            extract_tile_m_from_entry(
+                "_ZN7cutlass6KernelINS_4gemm6kernel4GemmINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi128ELi64EEE"
+            ),
+            Some(128)
+        );
+        // 64x64x32
+        assert_eq!(
+            extract_tile_m_from_entry(
+                "_ZN7cutlass6KernelINS_4gemm6kernel4GemmINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi64ELi64ELi32EEE"
+            ),
+            Some(64)
+        );
+        // Non-CUTLASS entry
+        assert_eq!(extract_tile_m_from_entry("vllm_rms_norm_kernel"), None);
+    }
 
     #[test]
     fn build_computation_from_rms_norm() {

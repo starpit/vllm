@@ -342,13 +342,10 @@ GPU-verified: **0.00e0 diff** vs separate rms_norm + CUTLASS GEMM.
 
 **Remaining TODOs:**
 
-- **Thread-to-row mapping**: prologue hardcodes PitchLinearWarpRakedThreadMap formula
-  `(tid.x % 32) / 4 + (tid.x / 32) * 16`. Should be extracted from the GEMM PTX by
-  tracing the A-load address chain to find the row computation. Attempted via
-  `classify_row_parity` (trace backward for `add.s32 +8`) but this is config-dependent —
-  the 64x128x32 kernel uses `selp.b32 32` not `add.s32 8`. Need a more robust approach:
-  compare address chains of two known-different-row loads, or extract from the
-  `PitchLinearShape` template parameters in the mangled entry name.
+- ~~**Thread-to-row mapping**~~: **DONE**. `extract_thread_row_map()` traces the first
+  A-load's address chain backward through the def-use graph. Finds `mul.lo.s64` by
+  stride to isolate the row register, then extracts `shr` (lanes_per_row) and `shl`
+  (rows_per_warp) shift amounts. No CUTLASS-specific assumptions.
 
 - **tile_m hardcoded to 64**: the prologue `mov.u32 %r_rms_nrows, 64` should be derived
   from the GEMM tile analysis (e.g., from the loop bound or MMA instruction count).
@@ -570,7 +567,7 @@ Phase 5B: Stage descriptors + extraction  ← DONE (pipeline.rs: PipelineStage::
 Phase 5C: Reduction decomposition         ← DONE (pipeline.rs: accumulate/finalize/emit from rms_norm PTX)
 Phase 5D: Pipeline compiler MVP           ← DONE (pipeline_compile.rs + pipeline_fuse!: rms_norm→GEMM 0.00e0)
 Phase 5E: Wire into llama.rs              ← NEXT (replace fuse_rms_norm_gemm_flat! with pipeline_fuse!)
-Phase 5F: Extract thread-to-row from PTX  ← remove hardcoded PitchLinearWarpRakedThreadMap formula
+Phase 5F: Extract thread-to-row from PTX  ← DONE (extract_thread_row_map: shr/shl from address chain)
 Phase 5G: Multi-GEMM pipeline + driver    ← full MLP block: norm→GEMM→SiLU→GEMM→residual
 ```
 

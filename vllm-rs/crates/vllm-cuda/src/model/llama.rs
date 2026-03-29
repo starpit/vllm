@@ -1049,40 +1049,12 @@ impl LlamaDecoderLayer {
                 device,
             );
 
-            // O proj: accumulate into residual (residual += alpha * attn @ o_weight^T)
-            // This replaces both o_proj GEMM and the residual add.
-            if let crate::layers::LinearLayer::Dense(ref o_linear) = self.self_attn.o_proj {
-                let attn_flat = attn_output
-                    .view()
-                    .reshape(&[attn_output.as_gpu_tensor().dim(0), self.self_attn.q_size]);
-                device.ferrite.gemm_accumulate(
-                    *attn_flat,
-                    o_linear.weight,
-                    *residual,
-                    self.residual_multiplier,
-                    1.0,
-                    device.compute_stream,
-                );
-                drop(attn_output);
-            } else {
-                // Non-dense o_proj: fall back to standard path
-                // (can't reach here if qkv_proj was Dense, but be safe)
-                let attn_flat = attn_output
-                    .view()
-                    .reshape(&[attn_output.as_gpu_tensor().dim(0), self.self_attn.q_size]);
-                let o_out = self.self_attn.o_proj.forward(
-                    attn_flat,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                drop(attn_output);
-                if self.residual_multiplier != 1.0 {
-                    kernels::scale_inplace(*o_out, self.residual_multiplier, &device.cublas);
-                }
-                kernels::add_inplace(*residual, *o_out, device.compute_stream);
-                drop(o_out);
+            // forward_from_qkv already includes o_proj — just add to residual
+            if self.residual_multiplier != 1.0 {
+                kernels::scale_inplace(*attn_output, self.residual_multiplier, &device.cublas);
             }
+            kernels::add_inplace(*residual, *attn_output, device.compute_stream);
+            drop(attn_output);
 
             if let crate::layers::LinearLayer::Dense(ref gate_up_linear) = self.mlp.gate_up_proj {
                 let gate_up = crate::ferrite::launch_fused_norm_gemm(

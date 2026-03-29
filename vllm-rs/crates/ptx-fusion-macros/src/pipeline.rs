@@ -584,6 +584,52 @@ mod tests {
     }
 
     #[test]
+    fn dump_rms_norm_decomposition() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let stage = PipelineStage::from_ptx("rms_norm", ptx).expect("extraction failed");
+        let decomp = stage.decompose_reduction().expect("decompose failed");
+
+        eprintln!(
+            "=== Accumulate loops: {} ===",
+            decomp.accumulate_loops.len()
+        );
+        for (i, lp) in decomp.accumulate_loops.iter().enumerate() {
+            eprintln!(
+                "  loop {i}: lines {}..{} label={}",
+                lp.header_line, lp.backedge_line, lp.header_label
+            );
+            for line_idx in lp.header_line..=lp.backedge_line {
+                if line_idx < stage.source_lines.len() {
+                    eprintln!(
+                        "    {:4}: {}",
+                        line_idx,
+                        stage.source_lines[line_idx].trim()
+                    );
+                }
+            }
+        }
+
+        eprintln!(
+            "=== Finalize range: {}..{} ===",
+            decomp.finalize_range.0, decomp.finalize_range.1
+        );
+        for i in decomp.finalize_range.0..=decomp.finalize_range.1.min(stage.source_lines.len() - 1)
+        {
+            eprintln!("  {:4}: {}", i, stage.source_lines[i].trim());
+        }
+
+        eprintln!(
+            "=== Finalized value register: {} ===",
+            decomp.finalized_value_reg
+        );
+
+        eprintln!("=== Emit body: {} lines ===", decomp.emit_body_lines.len());
+        for (i, line) in decomp.emit_body_lines.iter().enumerate() {
+            eprintln!("  {i:3}: {line}");
+        }
+    }
+
+    #[test]
     fn decompose_pointwise_returns_none() {
         let ptx = include_str!("../../ptx-fusion/kernels/scale.ptx");
         let stage = PipelineStage::from_ptx("scale", ptx).expect("extraction failed");

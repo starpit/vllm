@@ -1014,24 +1014,24 @@ impl LlamaDecoderLayer {
                 _ => unreachable!(),
             };
 
-            // Ferrite: add_inplace + fused_norm_gemm for QKV
-            kernels::add_inplace(*residual, *hidden_states, device.compute_stream);
-            drop(hidden_states);
-
-            let hidden = residual.as_gpu_tensor().dim(1) as u32;
-            let qkv = crate::ferrite::launch_fused_norm_gemm(
-                &FUSED_NORM_GEMM,
-                *residual,
-                qkv_linear.weight,
+            // Standard fused_add_rms_norm + CUTLASS GEMM for QKV
+            let hs_gpu = *hidden_states;
+            let res_gpu = *residual;
+            kernels::fused_add_rms_norm_inplace(
+                hs_gpu,
+                res_gpu,
                 self.input_layernorm.weight,
                 self.input_layernorm.eps,
-                hidden,
-                None,
-                1.0,
-                0.0,
+                device.compute_stream,
+            );
+            let hidden = residual.as_gpu_tensor().dim(1) as u32;
+            let qkv = qkv_linear.forward_ferrite(
+                hidden_states.view(),
+                &device.ferrite,
                 &mut device.caching,
                 device.compute_stream,
             );
+            drop(hidden_states);
 
             // Attention from pre-projected QKV
             let attn_output = self.self_attn.forward_from_qkv(

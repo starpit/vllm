@@ -1,94 +1,165 @@
-# Pipeline Architecture Handoff (Session 2)
+# Pipeline Handoff — Session 2 Honest State
 
-## What Was Built (10 commits)
+## What works
 
-This session completed the full MLP pipeline: single-kernel launch for
-`rms_norm → GEMM_gate_up → barrier → SiLU+mul → GEMM_down`.
+**Standard norms + CUTLASS GEMMs** — the ferrite path with `fused_add_rms_norm_inplace`
+(the stock vllm kernel) for normalization and flat-param CUTLASS GEMMs for all linear
+layers produces correct model output on both Qwen2.5-0.5B and 3B. This is committed at
+`c6ed7adc5`. The CUTLASS GEMM perimeter replacement is solid — 0.00e0 vs cuBLAS with
+real model weights (test1, test3 in `ferrite_gemm_real_weights.rs`).
 
-### Phase 5G-1: tile_m extraction + pipeline compiler wiring
+## What doesn't work
 
-- `extract_gemm_shape_from_entry()`: parses GemmShapeILi{M}ELi{N}ELi{K}E from CUTLASS mangled names
-- `compile!` macro routes Reduction→TiledGemm and Pointwise→TiledGemm through pipeline compiler
-- Deleted `intrinsic_rms_norm.rs` (286 lines of hand-written PTX)
-- Added swizzle unswizzling to prologue: reads N from `ferrite_params[68]`, computes swizzle_log
+**Fused norm+GEMM** (`compile!` with `a = rms_norm, b = gemm_64x128x32`) produces garbage
+in production model inference. It passes all GPU tests at all dimensions (including
+M=1024, K=2048, N=2560 with real weights — test2, test5). But when chained across 24
+transformer layers in the actual model, small precision differences compound and the
+output is garbage.
 
-### Phase 5G-2: SiLU+mul → GEMM fusion (Pointwise→TiledGemm)
+## Root cause (TWO bugs)
 
-`build_silu_mul_computation()` in `pipeline_compile.rs`:
-- **Trick**: set GEMM_down's lda = 2*intermediate so A-loads naturally read gate columns
-- Per-site: load up values at `GMEM_SRC + intermediate_bytes`
-- Instructions: SiLU(gate) * up using fast exp approximation from fuse_epilogue.rs
-- GPU-verified: **0.00e0 diff**
+### Bug 1: Wrong kernel variant extracted
 
-### Phase 5G-3: Two-phase persistent kernel assembler
+`PipelineStage::from_ptx("rms_norm", ptx)` calls `PtxParser::parse(source)` which
+finds the FIRST `.entry` in the multi-entry PTX file. For `vllm_rms_norm.ptx`, the
+entries are:
 
-`assemble_two_phase_kernel()` in `pipeline_compile.rs`:
-- Parses each GEMM kernel into sections (header/params/regs/shared/body)
-- Phase 2's `ferrite_params` → `ferrite_params2`, labels prefixed with `$L_p2_`
-- Persistent tile loops with atomic counters per phase
-- 2D tile decomposition: `rem.u32 %r_ptile_x, %r_ptile, %r_pgridx` + `div.u32`
-- Global barrier: atomicAdd arrival + spin-wait between phases
-- ~5700 lines of fused PTX, passes ptxas on sm_89
+1. `_Z15rms_norm_kernelIfE...` — **f32 variant** ← this is what gets extracted
+2. `_Z15rms_norm_kernelI6__halfE...` — f16 variant
+3. `_Z15rms_norm_kernelI13__nv_bfloat16E...` — **bf16 variant** ← this is what production uses
 
-### Phase 5G-4: Production wiring
+The decomposition analyzes the f32 kernel. Production runs bf16. The f32 kernel uses
+`ld.global.nc.v4.f32` (4 f32 values per load). The bf16 kernel uses different load
+patterns (bf16 vec loads + f32 conversion). Even if we used the extracted code, it
+would be the wrong code.
 
-`mlp_pipeline_fuse!` proc macro + `launch_mlp_pipeline()` in ferrite.rs:
-- Allocates gate_up intermediate buffer + counter/barrier u32s
-- Packs 280-byte param buffer (two GEMM param sets + extras + persistent params)
-- llama.rs: single `launch_mlp_pipeline()` call replaces 3 kernel launches
+**Fix**: `PipelineStage::from_ptx` needs to accept an entry name hint (e.g., "bfloat16")
+so the bf16 variant is extracted. Or the `compile!` macro should extract the correct
+entry before calling `from_ptx`.
 
-## Test Results
+**File**: `crates/ptx-fusion-macros/src/pipeline.rs`, lines 114-133
 
-- 103 unit tests + 34 CUDA GPU tests, all passing
-- MLP pipeline: 0.00e0 diff at all tested dimensions
-- Multi-tile: (64,256,256), (128,128,256), (64,256,512) — all 0.00e0
-- Benchmark: **2.17x speedup** at M=64, hidden=2560, intermediate=3456
+### Bug 2: Hand-written prologue ignores extracted code
 
-## Key Files
+`build_prologue_from_decomposition()` in `pipeline_compile.rs` receives a
+`ReductionDecomposition` that contains the ACTUAL accumulation loop body, finalization
+code (warp shuffle + SMEM reduce + rsqrt), and emit body extracted from the real
+kernel's PTX. It ignores all of it and writes new PTX from scratch:
 
+- Lines 585-604: Hand-written K-loop with scalar `ld.global.nc.b16` loads (one element
+  at a time, stride = ntid.x). The real kernel uses vectorized loads.
+- Lines 605-620: Hand-written 5-round warp shuffle. The real kernel has a more complex
+  reduction tree with shared memory.
+- Lines 621-660: Hand-written 4-warp SMEM reduce. The real kernel's reduction is different.
+
+The hand-written code produces slightly different floating-point results because:
+- Different load granularity (scalar vs vectorized)
+- Different accumulation order (different elements per thread)
+- Same FMA instruction but applied to different partial sums
+
+These tiny differences (< 0.01 per layer) compound over 24 layers and produce garbage.
+
+**Fix**: Rewrite `build_prologue_from_decomposition` to emit the ACTUAL extracted PTX
+lines from the decomposition:
+- `decomp.accumulate_loops[*].header_line..backedge_line` → the real K-loop body
+- `source_lines[decomp.finalize_range.0..finalize_range.1]` → the real reduction code
+- Register names need prefixing to avoid collisions with the GEMM body
+
+**File**: `crates/ptx-fusion-macros/src/pipeline_compile.rs`, lines 510-710
+
+## What the decomposition gives you
+
+(dumped from the f32 variant — bf16 will be similar but with bf16 loads + cvt)
+
+**Accumulate loop 0** (vectorized, 4 elements per iteration):
+```ptx
+ld.global.nc.v4.f32 {%f17, %f18, %f19, %f20}, [addr];
+fma.rn.f32 %f25, %f17, %f17, %f83;    // sq += x[0]^2
+fma.rn.f32 %f26, %f18, %f18, %f25;    // sq += x[1]^2
+fma.rn.f32 %f27, %f19, %f19, %f26;    // sq += x[2]^2
+fma.rn.f32 %f83, %f20, %f20, %f27;    // sq += x[3]^2
 ```
-pipeline_compile.rs   fuse_reduction_into_gemm(), fuse_pointwise_into_gemm(),
-                      build_silu_mul_computation(), assemble_two_phase_kernel(),
-                      parse_kernel_sections(), extract_gemm_shape_from_entry()
-lib.rs                compile! (Reduction→TiledGemm + Pointwise→TiledGemm routing),
-                      mlp_pipeline_fuse!, compute_extra_param_bytes()
-ferrite.rs            launch_mlp_pipeline(), get_or_load_mlp_pipeline()
-llama.rs              MLP_PIPELINE_PTX const, single-call MLP forward path
+
+**Accumulate loop 1** (scalar tail):
+```ptx
+ld.global.nc.f32 %f28, [addr];
+fma.rn.f32 %f83, %f28, %f28, %f83;
 ```
 
-## What Remains
+**Finalize** (105 lines): warp shuffle reduction → SMEM broadcast → second warp shuffle
+→ div + add eps + rsqrt → store to shared `s_inv_rms`.
 
-### End-to-end model inference
-Wire into `vllm serve` and validate with Qwen2.5-3B-Instruct. The pipeline is
-wired into llama.rs but hasn't been tested with a real model yet.
+**Emit body**: loads input and weight, multiplies by inv_rms and weight, stores output.
 
-### Residual add fusion
-The down GEMM could accumulate into the residual buffer (beta=1.0, C=residual)
-to eliminate the separate add_inplace call. This requires careful ownership
-handling since the residual tensor is passed through to the next layer.
+All of this is available in `ReductionDecomposition`. The prologue builder just needs
+to emit it with register renaming.
 
-### Larger tile configs
-Currently hardcoded to 64x128x32. For prefill (large M), 128x128x32 or
-128x128x64 tiles would be better. The pipeline compiler extracts tile dims
-from the entry name, so adding configs is straightforward.
+## Adaptation challenge
 
-### Counter-reset optimization
-The persistent loop currently resets counters via host memcpy before each
-launch. A device-side reset (atomic exchange at kernel start) would avoid
-this overhead.
+The extracted code runs with the rms_norm kernel's original thread count and block
+structure. The fused kernel runs inside a CUTLASS CTA with 128 threads. The extracted
+code needs adaptation:
 
-## Test Commands
+1. **Thread count**: The rms_norm kernel launches with `min(256, hidden_size)` threads.
+   The CUTLASS CTA has 128 threads. The extracted accumulate loop uses `blockDim.x` for
+   stride — with 128 threads, each thread handles more elements but the accumulation
+   order changes. **This is the core precision issue.**
+
+2. **Row iteration**: The original kernel processes one row per CTA. The fused prologue
+   needs to process `tile_m` rows (one per CTA tile). The accumulate loop needs to be
+   wrapped in an outer row loop.
+
+3. **Input address**: The original kernel reads from `param_1` (input ptr). The fused
+   kernel needs to read from `_ferrite_rms_input`.
+
+4. **Shared memory**: The original kernel uses `_ZZ16block_reduce_sumfE6shared` for
+   reduction scratch and `s_inv_rms` for the finalized value. These names need renaming
+   to avoid collision with CUTLASS's shared memory.
+
+The RIGHT approach: extract the bf16 variant's actual instructions, rename registers
+and SMEM with a `_ferrite_rms_` prefix, adapt the input address, wrap in a row loop.
+Do NOT rewrite the accumulation — use the exact same instructions in the exact same
+order.
+
+For the thread count issue: the original bf16 kernel at hidden=896 runs with 256
+threads. With 128 CUTLASS threads, the accumulate loop's stride changes. This WILL
+produce different partial sums. To get bitwise-identical results, either:
+- Use a CUTLASS config with 256 threads
+- Have each of the 128 threads do 2x work in the same order as 256 threads would
+- Accept the precision difference and use a tighter tolerance (may still diverge over
+  24 layers)
+
+## Files
+
+| File | What |
+|------|------|
+| `pipeline.rs:114-133` | `from_ptx` — extracts wrong (f32) entry |
+| `pipeline.rs:185-280` | `decompose_reduction_impl` — the analysis (correct) |
+| `pipeline_compile.rs:510-710` | `build_prologue_from_decomposition` — hand-written prologue (broken) |
+| `pipeline_compile.rs:223-370` | `build_reduction_computation` — calls the broken builder |
+| `vllm-cuda/tests/ferrite_gemm_real_weights.rs` | Tests 1-8 |
+| `vllm-cuda/src/model/llama.rs` | Currently committed with standard norms + CUTLASS GEMMs (working) |
+| `vllm-cuda/src/ferrite.rs` | `launch_fused_norm_gemm` uses per-arg kernelParams (correct) |
+
+## Test commands
 
 ```bash
-# Unit tests (103 tests)
-cargo test -p ptx-fusion-macros --lib
+# All real-weight tests (tests 1-8)
+cargo test -p vllm-cuda --features ferrite --test ferrite_gemm_real_weights -- --nocapture
 
-# GPU tests (34 tests)
-cargo test -p ptx-fusion --features cuda --test cuda_fuse_general -- --nocapture
+# Working config (standard norms + CUTLASS GEMMs)
+cargo run --release --features cuda,ferrite --bin vllm -- chat --model Qwen/Qwen2.5-0.5B-Instruct --enforce-eager --prompt "why is the sky blue?"
 
-# MLP pipeline only
-cargo test -p ptx-fusion --features cuda --test cuda_fuse_general -- mlp_pipeline --nocapture
-
-# Build vllm-cuda with ferrite
-cargo build -p vllm-cuda --features ferrite
+# Non-ferrite baseline
+cargo run --release --features cuda --bin vllm -- chat --model Qwen/Qwen2.5-0.5B-Instruct --enforce-eager --prompt "why is the sky blue?"
 ```
+
+## What to do next
+
+1. Fix `from_ptx` to extract the bf16 entry (not f32)
+2. Rewrite `build_prologue_from_decomposition` to emit actual extracted PTX
+   with register/SMEM renaming — NOT hand-written PTX
+3. Handle the 128-vs-256 thread count issue (the hardest part)
+4. Run test8 (24-layer chain) and verify convergence
+5. Run vllm serve and verify correct output
+6. THEN wire silu_mul+GEMM_down into llama.rs as the second fused kernel

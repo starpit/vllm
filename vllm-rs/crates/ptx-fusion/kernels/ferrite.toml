@@ -32,6 +32,10 @@ smem = 98304
 ptx = "vllm_rms_norm.ptx"
 entry = "bfloat16"
 
+[kernels.fused_add_rms_norm]
+ptx = "vllm_rms_norm.ptx"
+entry = "fused_add_rms_norm_kernelI13__nv_bfloat16"
+
 [kernels.silu_mul]
 ptx = "vllm_silu_mul.ptx"
 

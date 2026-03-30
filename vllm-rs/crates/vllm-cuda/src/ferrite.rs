@@ -461,6 +461,106 @@ pub unsafe fn launch_fused_norm_gemm(
     out
 }
 
+/// Launch a fused add+norm+GEMM kernel (two-input prologue).
+///
+/// The prologue reads from `residual` and `hs_input`, computes f32(res + hs),
+/// writes bf16(sum) back to `residual`, and computes inv_rms from the f32 sums.
+/// The GEMM body reads from `residual` (now holding bf16 sums), normalizes each
+/// element (mul inv_rms * weight), and feeds into MMA.
+///
+/// This matches `fused_add_rms_norm_inplace` precision: inv_rms is computed from
+/// f32 sums (not bf16-truncated values).
+pub unsafe fn launch_fused_add_norm_gemm(
+    kernel: &FeriteKernel,
+    residual: GpuTensor,
+    hs_input: GpuTensor,
+    weight: GpuTensor,
+    norm_weight: GpuTensor,
+    epsilon: f32,
+    hidden: u32,
+    c: Option<GpuTensor>,
+    alpha: f32,
+    beta: f32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let func = get_or_load_kernel(kernel);
+
+    let m = residual.dim(0) as u32;
+    let k = residual.dim(1) as u32;
+    let n = weight.dim(0) as u32;
+
+    let out = alloc.alloc_tensor(&[m as usize, n as usize], residual.dtype());
+
+    let grid_m = m.div_ceil(kernel.tile_m);
+    let grid_n = n.div_ceil(kernel.tile_n);
+    let swizzle_log = compute_swizzle_log(grid_n);
+    let tile = 1u32 << swizzle_log;
+    let grid_x = grid_m * tile;
+    let grid_y = grid_n.div_ceil(tile);
+
+    let c_ptr = match c {
+        Some(ct) => ct.raw_ptr() as u64,
+        None => out.as_gpu_tensor().raw_ptr() as u64,
+    };
+    let actual_beta = if c.is_some() { beta } else { 0.0 };
+
+    let flat = build_flat_params(
+        residual.raw_ptr() as u64,
+        weight.raw_ptr() as u64,
+        c_ptr,
+        out.as_gpu_tensor().raw_ptr() as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        alpha,
+        actual_beta,
+    );
+
+    // Params: rms_input (residual), rms_hs_input, rms_weight, rms_epsilon, rms_hidden, rms_stride, flat
+    let mut rms_input = residual.raw_ptr() as u64;
+    let mut rms_hs_input = hs_input.raw_ptr() as u64;
+    let mut rms_weight = norm_weight.raw_ptr() as u64;
+    let mut rms_epsilon = epsilon;
+    let mut rms_hidden = hidden;
+    let mut rms_stride = k as u64;
+
+    let mut kernel_params: [*mut std::ffi::c_void; 7] = [
+        &mut rms_input as *mut u64 as *mut _,
+        &mut rms_hs_input as *mut u64 as *mut _,
+        &mut rms_weight as *mut u64 as *mut _,
+        &mut rms_epsilon as *mut f32 as *mut _,
+        &mut rms_hidden as *mut u32 as *mut _,
+        &mut rms_stride as *mut u64 as *mut _,
+        flat.as_ptr() as *mut _,
+    ];
+
+    let result = sys::cuLaunchKernel(
+        func,
+        grid_x,
+        grid_y,
+        1,
+        kernel.threads,
+        1,
+        1,
+        kernel.smem_bytes,
+        stream,
+        kernel_params.as_mut_ptr(),
+        std::ptr::null_mut(),
+    );
+    assert_eq!(
+        result,
+        sys::cudaError_enum::CUDA_SUCCESS,
+        "ferrite launch_fused_add_norm_gemm failed: {result:?}"
+    );
+
+    out
+}
+
 /// Launch a plain GEMM with compile!'d kernel, accumulating into an existing buffer.
 pub unsafe fn launch_gemm_accumulate(
     kernel: &FeriteKernel,

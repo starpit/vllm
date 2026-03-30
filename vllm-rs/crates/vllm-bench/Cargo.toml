@@ -31,3 +31,5 @@ shell-words = "1"
 url = "2"
 csv = "1"
 dirs = "5"
+parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+arrow = { version = "58", default-features = false, features = ["json"] }

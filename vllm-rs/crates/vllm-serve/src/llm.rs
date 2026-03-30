@@ -63,6 +63,10 @@ pub struct RequestOutput {
     pub outputs: Vec<CompletionOutput>,
     /// Whether generation is complete.
     pub finished: bool,
+    /// Time to first token in seconds (measured in generate_impl output loop).
+    pub ttft_s: Option<f64>,
+    /// Average inter-token latency in seconds.
+    pub avg_itl_s: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +638,12 @@ impl LLM {
         let mut total_in_toks: usize = 0;
         let mut total_out_toks: usize = 0;
 
+        // Per-request timing: track first-token time and ITL.
+        let mut first_token_time: Vec<Option<std::time::Instant>> = vec![None; total];
+        let mut last_token_time: Vec<Option<std::time::Instant>> = vec![None; total];
+        let mut itl_sum: Vec<f64> = vec![0.0; total];
+        let mut itl_count: Vec<u32> = vec![0; total];
+
         while self.client.has_unfinished_requests() {
             let (outputs, _) = self
                 .client
@@ -643,6 +653,19 @@ impl LLM {
             let mut newly_finished = 0usize;
             for output in &outputs.outputs {
                 if let Some(idx) = request_ids.iter().position(|id| *id == output.request_id) {
+                    // Track TTFT / ITL timing.
+                    if !output.new_token_ids.is_empty() {
+                        let now = std::time::Instant::now();
+                        if first_token_time[idx].is_none() {
+                            first_token_time[idx] = Some(now);
+                        } else if let Some(last) = last_token_time[idx] {
+                            let itl = now.duration_since(last).as_secs_f64();
+                            itl_sum[idx] += itl;
+                            itl_count[idx] += 1;
+                        }
+                        last_token_time[idx] = Some(now);
+                    }
+
                     generated_tokens[idx].extend_from_slice(&output.new_token_ids);
                     if let Some(ref reason) = output.finish_reason
                         && finish_reasons[idx].is_none()
@@ -713,12 +736,24 @@ impl LLM {
                 Prompt::TokenIds(_) | Prompt::TokenIdsWithAnnotations(_, _) => None,
             };
 
+            // Compute TTFT and avg ITL for the first completion of this prompt.
+            let first_idx = p_idx * n;
+            let ttft_s =
+                first_token_time[first_idx].map(|ft| ft.duration_since(start).as_secs_f64());
+            let avg_itl_s = if itl_count[first_idx] > 0 {
+                Some(itl_sum[first_idx] / itl_count[first_idx] as f64)
+            } else {
+                None
+            };
+
             results.push(RequestOutput {
-                request_id: request_ids[p_idx * n].clone(),
+                request_id: request_ids[first_idx].clone(),
                 prompt: prompt_text,
                 prompt_token_ids: prompt_token_ids[p_idx].clone(),
                 outputs: completion_outputs,
                 finished: true,
+                ttft_s,
+                avg_itl_s,
             });
         }
 
@@ -894,6 +929,8 @@ impl LLM {
                 finish_reason,
             }],
             finished: true,
+            ttft_s: None,
+            avg_itl_s: None,
         })
     }
 }
@@ -1065,6 +1102,8 @@ mod tests {
                 finish_reason: None,
             }],
             finished: true,
+            ttft_s: None,
+            avg_itl_s: None,
         };
         let _ = format!("{output:?}");
     }

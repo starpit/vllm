@@ -3090,3 +3090,234 @@ fn segment_b_gpu() {
     assert!(max_diff < 0.5, "Segment B diff too large: {max_diff:.2e}");
     println!("PASS: Segment B matches separate launches");
 }
+
+#[test]
+fn segment_b_m_sweep() {
+    println!("=== Segment B: M-sweep (multi-tile) ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    let q_dim = 128u32;
+    let hidden = 128u32;
+    let intermediate = 128u32;
+    let gate_up_cols = 2 * intermediate;
+    let eps = 1e-5f32;
+
+    let module = ctx.load_module(Ptx::from_src(SEGMENT_B_PTX)).unwrap();
+    let func = module.load_function("segment_b").unwrap();
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+
+    // Shared weights
+    let h_oproj_w: Vec<half::bf16> = (0..(hidden * q_dim) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+    let h_norm_w: Vec<half::bf16> = (0..hidden as usize)
+        .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+        .collect();
+    let h_gateup_w: Vec<half::bf16> = (0..(gate_up_cols * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+        .collect();
+    let h_down_w: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00013 + 0.1).cos() * 0.12))
+        .collect();
+    let d_oproj_w = stream.clone_htod(&h_oproj_w).unwrap();
+    let d_norm_w = stream.clone_htod(&h_norm_w).unwrap();
+    let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
+    let d_down_w = stream.clone_htod(&h_down_w).unwrap();
+
+    let m_values = [1u32, 8, 32, 64, 65, 128, 256];
+    let mut failures = Vec::new();
+
+    for &m in &m_values {
+        let h_input: Vec<half::bf16> = (0..(m * q_dim) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+            .collect();
+
+        // Reference: separate operations
+        let oproj_out = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &h_input,
+            &h_oproj_w,
+            m,
+            hidden,
+            q_dim,
+        );
+        // GPU norm
+        let d_ref_oproj = stream.clone_htod(&oproj_out).unwrap();
+        let mut d_ref_normed: CudaSlice<half::bf16> =
+            stream.alloc_zeros((m * hidden) as usize).unwrap();
+        let (ref_op, _) = d_ref_oproj.device_ptr(&stream);
+        let (ref_nw, _) = d_norm_w.device_ptr(&stream);
+        let (ref_no, _) = d_ref_normed.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&ref_no)
+                .arg(&ref_op)
+                .arg(&ref_nw)
+                .arg(&eps)
+                .arg(&(hidden as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (hidden.min(1024), 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
+        let normed = stream.clone_dtoh(&d_ref_normed).unwrap();
+        let gateup_out = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &normed,
+            &h_gateup_w,
+            m,
+            gate_up_cols,
+            hidden,
+        );
+        let activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
+            .map(|idx| {
+                let row = idx / intermediate as usize;
+                let col = idx % intermediate as usize;
+                let gate = gateup_out[row * gate_up_cols as usize + col].to_f32();
+                let up =
+                    gateup_out[row * gate_up_cols as usize + intermediate as usize + col].to_f32();
+                half::bf16::from_f32(cpu_silu(gate) * up)
+            })
+            .collect();
+        let ref_output = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &activated,
+            &h_down_w,
+            m,
+            hidden,
+            intermediate,
+        );
+
+        // Fused Segment B
+        let d_input = stream.clone_htod(&h_input).unwrap();
+        let d_oproj_buf: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+        let d_gateup_buf: CudaSlice<half::bf16> =
+            stream.alloc_zeros((m * gate_up_cols) as usize).unwrap();
+        let d_c_scratch: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+        let d_output: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+        let d_barriers: CudaSlice<u32> = stream.alloc_zeros(2).unwrap();
+
+        let (inp_p, _) = d_input.device_ptr(&stream);
+        let (opw_p, _) = d_oproj_w.device_ptr(&stream);
+        let (ob_p, _) = d_oproj_buf.device_ptr(&stream);
+        let (nw_p, _) = d_norm_w.device_ptr(&stream);
+        let (guw_p, _) = d_gateup_w.device_ptr(&stream);
+        let (gub_p, _) = d_gateup_buf.device_ptr(&stream);
+        let (dw_p, _) = d_down_w.device_ptr(&stream);
+        let (cs_p, _) = d_c_scratch.device_ptr(&stream);
+        let (out_p, _) = d_output.device_ptr(&stream);
+        let (bar_p, _) = d_barriers.device_ptr(&stream);
+        let bar_val = bar_p as u64;
+
+        let params_oproj = build_flat_params(
+            inp_p as u64,
+            opw_p as u64,
+            ob_p as u64,
+            ob_p as u64,
+            m,
+            hidden,
+            q_dim,
+            q_dim,
+            q_dim,
+            hidden,
+            hidden,
+            1.0,
+            0.0,
+        );
+        let rms_input_val = ob_p as u64;
+        let rms_weight_val = nw_p as u64;
+        let rms_hidden_val = hidden;
+        let rms_stride_val = hidden as u64;
+        let params_gateup = build_flat_params(
+            ob_p as u64,
+            guw_p as u64,
+            gub_p as u64,
+            gub_p as u64,
+            m,
+            gate_up_cols,
+            hidden,
+            hidden,
+            hidden,
+            gate_up_cols,
+            gate_up_cols,
+            1.0,
+            0.0,
+        );
+        let intermediate_bytes = (intermediate as u64) * 2;
+        let params_down = build_flat_params(
+            gub_p as u64,
+            dw_p as u64,
+            cs_p as u64,
+            out_p as u64,
+            m,
+            hidden,
+            intermediate,
+            gate_up_cols,
+            intermediate,
+            hidden,
+            hidden,
+            1.0,
+            0.0,
+        );
+
+        let (gx, gy, _) = compute_grid(m, gate_up_cols, 64, 128);
+        let cfg = LaunchConfig {
+            grid_dim: (gx, gy, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 36864 + 512,
+        };
+
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&bar_val)
+                .arg(&params_oproj)
+                .arg(&rms_input_val)
+                .arg(&rms_weight_val)
+                .arg(&eps)
+                .arg(&rms_hidden_val)
+                .arg(&rms_stride_val)
+                .arg(&params_gateup)
+                .arg(&intermediate_bytes)
+                .arg(&params_down)
+                .launch(cfg)
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
+        let seg_output = stream.clone_dtoh(&d_output).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for (r, s) in ref_output.iter().zip(seg_output.iter()) {
+            let diff = (r.to_f32() - s.to_f32()).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+        }
+        let status = if max_diff < 0.5 { "PASS" } else { "FAIL" };
+        println!("  M={m:>4} grid=({gx},{gy},1) max_diff={max_diff:.2e} {status}");
+        if max_diff >= 0.5 {
+            failures.push((m, max_diff));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Segment B M-sweep failures: {:?}",
+        failures
+    );
+    println!("PASS: Segment B all M values correct");
+}

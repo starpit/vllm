@@ -359,7 +359,7 @@ fn print_comparison(label: &str, plain: &[QueryResult], spans: &[QueryResult]) {
 pub(crate) fn run_bench_musique(args: BenchMusiqueArgs) -> Result<()> {
     vllm_common::telemetry::init_tracing(&args.log_level);
 
-    let dataset = fetch_dataset(args.num_queries)?;
+    let dataset = fetch_dataset(args.num_queries.unwrap_or(usize::MAX))?;
     let n_queries = dataset.queries.len();
     let n_corpus = dataset.corpus_size;
 

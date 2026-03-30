@@ -1090,8 +1090,8 @@ pub struct BenchMultihopArgs {
     pub dtype: String,
 
     /// Number of queries to evaluate from the dev set.
-    #[arg(short = 'n', long, default_value_t = 100)]
-    pub num_queries: usize,
+    #[arg(short = 'n', long)]
+    pub num_queries: Option<usize>,
 
     /// Max tokens for model response.
     #[arg(long, default_value_t = 64)]
@@ -1177,8 +1177,8 @@ pub struct BenchMusiqueArgs {
     pub dtype: String,
 
     /// Number of queries to evaluate from the validation set.
-    #[arg(short = 'n', long, default_value_t = 100)]
-    pub num_queries: usize,
+    #[arg(short = 'n', long)]
+    pub num_queries: Option<usize>,
 
     /// Max tokens for model response.
     #[arg(long, default_value_t = 64)]
@@ -1265,8 +1265,8 @@ pub struct BenchHotpotqaArgs {
     pub dtype: String,
 
     /// Number of queries to evaluate from the validation set.
-    #[arg(short = 'n', long, default_value_t = 100)]
-    pub num_queries: usize,
+    #[arg(short = 'n', long)]
+    pub num_queries: Option<usize>,
 
     /// Max tokens for model response.
     #[arg(long, default_value_t = 64)]

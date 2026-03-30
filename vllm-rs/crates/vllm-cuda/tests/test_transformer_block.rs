@@ -4938,8 +4938,7 @@ fn test14f_single_layer_fused_add_norm_gemm() {
     drop(raw);
 
     // Embed tokens (real data) — use single token for isolation
-    // Use real embeddings — the bug is data-dependent
-    let prefill_ids: Vec<u32> = vec![1, 3923, 374, 220];
+    let prefill_ids: Vec<u32> = vec![1, 3923, 374, 220, 17, 10, 17, 30];
     let m = prefill_ids.len();
     let ids_gpu = unsafe { upload_u32(&mut device.caching, &prefill_ids, &[m]) };
     let embedded = unsafe {
@@ -4967,6 +4966,11 @@ fn test14f_single_layer_fused_add_norm_gemm() {
     let res_b = unsafe { upload_bf16(&mut device.caching, &vec![bf16::ZERO; m * hidden], &[m, hidden]) };
     unsafe { cusys::cuStreamSynchronize(stream) };
 
+    println!("  POINTERS: res_b={:#x} hs_b={:#x} diff={}",
+        res_b.as_gpu_tensor().raw_ptr() as u64,
+        hs_b.as_gpu_tensor().raw_ptr() as u64,
+        (res_b.as_gpu_tensor().raw_ptr() as i64 - hs_b.as_gpu_tensor().raw_ptr() as i64).abs(),
+    );
     let qkv_b = unsafe {
         vllm_cuda::ferrite::launch_fused_add_norm_gemm(
             &FUSED_ADD_NORM_GEMM,
@@ -5009,46 +5013,134 @@ fn test14f_single_layer_fused_add_norm_gemm() {
     let zero_count = b_h.iter().filter(|v| v.to_f32() == 0.0).count();
     println!("  fused: {nan_count} NaN, {zero_count} zeros out of {}", b_h.len());
 
-    // Also compare against old fused path (add_inplace + FUSED_NORM_GEMM)
-    // which is known to be bit-exact per test14c
-    let hs_c = unsafe { upload_bf16(&mut device.caching, &embed_host, &[m, hidden]) };
-    let res_c = unsafe { upload_bf16(&mut device.caching, &vec![bf16::ZERO; m * hidden], &[m, hidden]) };
-    unsafe { cusys::cuStreamSynchronize(stream) };
-
-    unsafe { vllm_cuda::kernels::add_inplace(*res_c, *hs_c, stream) };
-    drop(hs_c);
-    let qkv_c = unsafe {
-        vllm_cuda::ferrite::launch_fused_norm_gemm(
-            &FUSED_NORM_GEMM, *res_c, *qkv_w, *norm_w, eps, hidden as u32,
-            None, 1.0, 0.0, &mut device.caching, stream,
-        )
-    };
-    unsafe { cusys::cuStreamSynchronize(stream) };
-    let c_h = unsafe { download_bf16(*qkv_c, m * qkv_n) };
-    let (old_fused_diff, _) = max_diff_bf16(&a_h, &c_h);
-    println!("  Old fused (add_inplace+FUSED_NORM_GEMM) diff={old_fused_diff:.2e}");
-
-    let (new_vs_old, worst2) = max_diff_bf16(&b_h, &c_h);
-    println!("  New fused vs old fused diff={new_vs_old:.2e} at [{worst2}]");
-    if new_vs_old > 0.0 {
-        println!("    new={:.4} old={:.4}", b_h[worst2].to_f32(), c_h[worst2].to_f32());
-    }
+    // NOTE: do NOT run a third path (path C) using the same device.caching allocator.
+    // The allocator can reuse memory from path B's tensors (res_b, hs_b) before
+    // we download, causing false divergence. See session 4's "shared CachingAllocator"
+    // gotcha.
 
     // Per-row analysis: which rows diverge?
     for row in 0..m {
         let start = row * qkv_n;
         let end = start + qkv_n;
-        let (row_diff, _) = max_diff_bf16(&b_h[start..end], &c_h[start..end]);
-        let mismatches = b_h[start..end].iter().zip(&c_h[start..end])
-            .filter(|(a, b)| (a.to_f32() - b.to_f32()).abs() > 0.01)
+        let (row_diff, _) = max_diff_bf16(&b_h[start..end], &a_h[start..end]);
+        let mismatches = b_h[start..end].iter().zip(&a_h[start..end])
+            .filter(|(x, y)| (x.to_f32() - y.to_f32()).abs() > 0.01)
             .count();
         if row_diff > 0.01 {
-            println!("  ROW {row}: diff={row_diff:.2e}, mismatches={mismatches}/{qkv_n}");
+            println!("  QKV ROW {row}: diff={row_diff:.2e}, mismatches={mismatches}/{qkv_n}");
         } else {
-            println!("  ROW {row}: diff={row_diff:.2e} OK");
+            println!("  QKV ROW {row}: diff={row_diff:.2e} OK");
+        }
+    }
+
+    // Per-row residual analysis
+    for row in 0..m {
+        let start = row * hidden;
+        let end = start + hidden;
+        let (row_diff, worst_r) = max_diff_bf16(&ra[start..end], &rb[start..end]);
+        if row_diff > 0.001 {
+            println!("  RES ROW {row}: diff={row_diff:.2e} at col {worst_r}  std={:.4} fused={:.4}",
+                ra[start + worst_r].to_f32(), rb[start + worst_r].to_f32());
+            // Print first diverging element
+            println!("    res_a[row3, 0..4]: {:?}", &ra[start..start+4].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+            println!("    res_b[row3, 0..4]: {:?}", &rb[start..start+4].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+            // Print input hs values for this row
+            println!("    embed[row3, 0..4]: {:?}", &embed_host[start..start+4].iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+        } else {
+            println!("  RES ROW {row}: diff={row_diff:.2e} OK");
         }
     }
 
     assert!(qkv_diff < 0.01, "Single-layer QKV diverged: {qkv_diff:.2e}");
     println!("PASS: test14f — single-layer fused add+norm+GEMM matches");
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// test14g: Multi-block prologue race confirmation
+//
+// Theory: multiple GEMM blocks with the same m_tile all run the prologue,
+// racing on the residual writeback. N <= tile_n (128) gives 1 block per
+// m_tile. N > tile_n gives multiple blocks per m_tile.
+//
+// If single-block passes and multi-block fails → confirmed race.
+// ════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test14g_multi_block_prologue_race() {
+    println!("=== test14g: multi-block prologue race test ===");
+
+    let mut device = GpuDevice::new(0).unwrap();
+    let stream = device.compute_stream;
+    let config = qwen_config();
+    let hidden = config.hidden_size; // 896
+    let eps = config.rms_norm_eps;
+
+    let raw = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&raw).expect("parse");
+
+    let embed_data = load_bf16_tensor(&st, "model.embed_tokens.weight");
+    let vocab_size = embed_data.len() / hidden;
+    let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
+
+    let norm_data = load_bf16_tensor(&st, "model.layers.0.input_layernorm.weight");
+    let norm_w = unsafe { upload_bf16(&mut device.caching, &norm_data, &[hidden]) };
+
+    // Embed 8 tokens
+    let prefill_ids: Vec<u32> = vec![1, 3923, 374, 220, 17, 10, 17, 30];
+    let m = prefill_ids.len();
+    let ids_gpu = unsafe { upload_u32(&mut device.caching, &prefill_ids, &[m]) };
+    let embedded = unsafe {
+        vllm_cuda::kernels::embedding_gather(*embed_w, *ids_gpu, &mut device.caching, stream)
+    };
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    let embed_host = unsafe { download_bf16(*embedded, m * hidden) };
+    drop(ids_gpu);
+    drop(embedded);
+    drop(raw);
+
+    // Test with different N values: small N = 1 block, large N = many blocks
+    for &n_out in &[64usize, 128, 256, 512, 1152] {
+        // Create weight [N, K=hidden]
+        let weight_data: Vec<bf16> = (0..n_out * hidden)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00013).sin() * 0.01))
+            .collect();
+        let weight = unsafe { upload_bf16(&mut device.caching, &weight_data, &[n_out, hidden]) };
+
+        // Path A: fused_add_rms_norm_inplace + ferrite.gemm
+        let hs_a = unsafe { upload_bf16(&mut device.caching, &embed_host, &[m, hidden]) };
+        let res_a = unsafe { upload_bf16(&mut device.caching, &vec![bf16::ZERO; m * hidden], &[m, hidden]) };
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *norm_w, eps, stream);
+        }
+        let out_a = unsafe {
+            device.ferrite.gemm(*hs_a, *weight, None, 1.0, 0.0, &mut device.caching, stream)
+        };
+
+        // Path B: launch_fused_add_norm_gemm
+        let hs_b = unsafe { upload_bf16(&mut device.caching, &embed_host, &[m, hidden]) };
+        let res_b = unsafe { upload_bf16(&mut device.caching, &vec![bf16::ZERO; m * hidden], &[m, hidden]) };
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        let out_b = unsafe {
+            vllm_cuda::ferrite::launch_fused_add_norm_gemm(
+                &FUSED_ADD_NORM_GEMM,
+                *res_b, *hs_b, *weight, *norm_w, eps, hidden as u32,
+                None, 1.0, 0.0, &mut device.caching, stream,
+            )
+        };
+
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        let a_h = unsafe { download_bf16(*out_a, m * n_out) };
+        let b_h = unsafe { download_bf16(*out_b, m * n_out) };
+        let (diff, _) = max_diff_bf16(&a_h, &b_h);
+
+        // Check residual writeback
+        let ra = unsafe { download_bf16(*res_a, m * hidden) };
+        let rb = unsafe { download_bf16(*res_b, m * hidden) };
+        let (rdiff, _) = max_diff_bf16(&ra, &rb);
+
+        let grid_n = (n_out as u32).div_ceil(128); // tile_n=128
+        let status = if diff < 0.01 { "PASS" } else { "FAIL" };
+        println!("  N={n_out:5} grid_n={grid_n} diff={diff:.2e} res_diff={rdiff:.2e} {status}");
+    }
 }

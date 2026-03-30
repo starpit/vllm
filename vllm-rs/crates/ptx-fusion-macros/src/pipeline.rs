@@ -722,6 +722,9 @@ mod tests {
         );
         eprintln!("=== Emit loops: {} ===", decomp.emit_loops.len());
         eprintln!("=== Emit body: {} lines ===", decomp.emit_body_lines.len());
+        for (i, line) in decomp.emit_body_lines.iter().enumerate() {
+            eprintln!("  {i:3}: {line}");
+        }
 
         // Accumulation loop should contain st.global (writeback to residual)
         let accum_lp = &decomp.accumulate_loops[0];

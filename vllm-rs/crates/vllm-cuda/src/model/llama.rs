@@ -1064,31 +1064,21 @@ impl LlamaDecoderLayer {
             );
             // attn_output now contains normed data for MLP
 
-            if let crate::layers::LinearLayer::Dense(ref gate_up_linear) = self.mlp.gate_up_proj {
-                let gate_up = gate_up_linear.forward_ferrite(
-                    attn_output.view(),
-                    &device.ferrite,
+            if let (
+                crate::layers::LinearLayer::Dense(gate_up_linear),
+                crate::layers::LinearLayer::Dense(down_linear),
+            ) = (&self.mlp.gate_up_proj, &self.mlp.down_proj)
+            {
+                // Fused MLP block: gate_up → SiLU → down in one kernel launch
+                let mlp_output = device.ferrite.launch_mlp_block(
+                    *attn_output,
+                    gate_up_linear.weight,
+                    down_linear.weight,
+                    self.mlp.intermediate_size as u32,
                     &mut device.caching,
                     device.compute_stream,
                 );
                 drop(attn_output);
-
-                let activated = kernels::silu_and_mul_fused(
-                    gate_up.as_gpu_tensor(),
-                    self.mlp.intermediate_size,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                drop(gate_up);
-
-                let mlp_output = self.mlp.down_proj.forward_ferrite(
-                    activated.view(),
-                    &mut device.cublas,
-                    &device.ferrite,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                drop(activated);
 
                 if self.residual_multiplier != 1.0 {
                     kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);

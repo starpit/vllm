@@ -40,6 +40,17 @@ ptx_fusion::replace_perimeter_macro!(
     FLAT_128X128X64_PTX
 );
 
+// ── MLP block: gate_up GEMM → SiLU+mul → down GEMM in one kernel ──
+
+const MLP_BLOCK_PTX: &str = ptx_fusion::sequence_mlp_block!(
+    "../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "../ptx-fusion/kernels/vllm_silu_mul.ptx",
+    "ferrite_mlp_block"
+);
+
 // ── Tile configuration ──
 
 struct TileConfig {
@@ -56,6 +67,10 @@ struct TileConfig {
 /// Ferrite CUTLASS GEMM dispatcher.
 pub struct FerriteCutlass {
     configs: Vec<TileConfig>,
+    /// Fused MLP block kernel (gate_up → SiLU → down).
+    mlp_block: Option<CudaFunc>,
+    /// Device memory for global barrier counters (reused across launches).
+    barrier_counters: *mut std::ffi::c_void,
 }
 
 impl FerriteCutlass {
@@ -92,7 +107,31 @@ impl FerriteCutlass {
         }
 
         configs.sort_by_key(|c| c.tile_m);
-        Ok(FerriteCutlass { configs })
+
+        // Load the fused MLP block kernel
+        let mlp_block = match load_flat_module(MLP_BLOCK_PTX, "ferrite_mlp_block", 36864 + 512) {
+            Ok((module, func)) => Some(CudaFunc(module, func)),
+            Err(e) => {
+                eprintln!("ferrite: MLP block kernel load failed (non-fatal): {e}");
+                None
+            }
+        };
+
+        // Allocate barrier counters (4 u32s, enough for up to 4 barriers)
+        let mut barrier_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let result = sys::cuMemAlloc_v2(
+            &mut barrier_ptr as *mut *mut _ as *mut u64,
+            16, // 4 × u32
+        );
+        if result != sys::cudaError_enum::CUDA_SUCCESS {
+            bail!("cuMemAlloc for barrier counters: {result:?}");
+        }
+
+        Ok(FerriteCutlass {
+            configs,
+            mlp_block,
+            barrier_counters: barrier_ptr,
+        })
     }
 
     /// Select the best tile config for the given M dimension.
@@ -218,6 +257,122 @@ impl FerriteCutlass {
             config.smem_bytes,
             &params,
         );
+    }
+
+    /// Launch fused MLP block: gate_up GEMM → SiLU+mul → down GEMM.
+    ///
+    /// Replaces 3 separate launches (gate_up GEMM + silu_mul + down GEMM)
+    /// with a single kernel that uses global atomic barriers between phases.
+    ///
+    /// * `normed_input` — [M, hidden] normalized input (from rms_norm)
+    /// * `gate_up_weight` — [2*intermediate, hidden] gate+up projection weights
+    /// * `down_weight` — [hidden, intermediate] down projection weights
+    /// * `intermediate_size` — intermediate dimension (half of gate_up_weight.dim(0))
+    pub unsafe fn launch_mlp_block(
+        &self,
+        normed_input: GpuTensor,
+        gate_up_weight: GpuTensor,
+        down_weight: GpuTensor,
+        intermediate_size: u32,
+        alloc: &mut CachingAllocator,
+        stream: CUstream,
+    ) -> OwnedTensor {
+        let func = match &self.mlp_block {
+            Some(cf) => cf.1,
+            None => panic!("ferrite: MLP block kernel not loaded"),
+        };
+
+        let m = normed_input.dim(0) as u32;
+        let hidden = normed_input.dim(1) as u32;
+        let gate_up_cols = 2 * intermediate_size;
+
+        // Allocate intermediate buffers
+        let gate_up_buf =
+            alloc.alloc_tensor(&[m as usize, gate_up_cols as usize], normed_input.dtype());
+        let output = alloc.alloc_tensor(&[m as usize, hidden as usize], normed_input.dtype());
+
+        // Zero barrier counters (1 barrier between 2 phases)
+        sys::cuMemsetD32_v2(self.barrier_counters as u64, 0, 4);
+
+        // Grid: sized for the larger GEMM (gate_up has more N-tiles)
+        let tile_m = 64u32;
+        let tile_n = 128u32;
+        let grid_m = m.div_ceil(tile_m);
+        let grid_n = gate_up_cols.div_ceil(tile_n);
+        let swizzle_log = compute_swizzle_log(grid_n);
+        let tile = 1u32 << swizzle_log;
+        let grid_x = grid_m * tile;
+        let grid_y = grid_n.div_ceil(tile);
+
+        // Phase 0 params: gate_up GEMM
+        // normed_input[M, hidden] × gate_up_weight[gate_up_cols, hidden]^T → gate_up_buf[M, gate_up_cols]
+        let params_gate_up = build_flat_params(
+            normed_input.raw_ptr() as u64,
+            gate_up_weight.raw_ptr() as u64,
+            gate_up_buf.as_gpu_tensor().raw_ptr() as u64,
+            gate_up_buf.as_gpu_tensor().raw_ptr() as u64,
+            m,
+            gate_up_cols,
+            hidden,
+            hidden,
+            hidden,
+            gate_up_cols,
+            gate_up_cols,
+            1.0,
+            0.0,
+        );
+
+        // Phase 1 params: SiLU-fused down GEMM
+        // gate_up_buf[M, gate_up_cols] → silu+mul → × down_weight[hidden, intermediate]^T → output[M, hidden]
+        let intermediate_bytes = (intermediate_size as u64) * 2; // bf16
+        let params_down = build_flat_params(
+            gate_up_buf.as_gpu_tensor().raw_ptr() as u64,
+            down_weight.raw_ptr() as u64,
+            output.as_gpu_tensor().raw_ptr() as u64,
+            output.as_gpu_tensor().raw_ptr() as u64,
+            m,
+            hidden,
+            intermediate_size,
+            gate_up_cols, // lda = 2*intermediate (stride covers gate + up)
+            intermediate_size,
+            hidden,
+            hidden,
+            1.0,
+            0.0,
+        );
+
+        // Launch with kernelParams API
+        let mut barrier_ptr = self.barrier_counters as u64;
+        let mut inter_bytes = intermediate_bytes;
+
+        let mut kernel_params: [*mut std::ffi::c_void; 4] = [
+            &mut barrier_ptr as *mut u64 as *mut _,
+            params_gate_up.as_ptr() as *mut _,
+            &mut inter_bytes as *mut u64 as *mut _,
+            params_down.as_ptr() as *mut _,
+        ];
+
+        let result = sys::cuLaunchKernel(
+            func,
+            grid_x,
+            grid_y,
+            1,
+            128,
+            1,
+            1,
+            36864 + 512, // SMEM
+            stream,
+            kernel_params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            result,
+            sys::cudaError_enum::CUDA_SUCCESS,
+            "ferrite launch_mlp_block failed: {result:?}"
+        );
+
+        drop(gate_up_buf);
+        output
     }
 }
 

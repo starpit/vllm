@@ -13,6 +13,7 @@ pub use ptx_fusion_macros::{
     fuse_3phase_mlp, fuse_kernels, fuse_real_kernels, inject_epilogue, inject_silu_epilogue,
     persistent_fuse_real_kernels, prologue_identity, prologue_identity_flat, prologue_scale2_flat,
     regfuse_kernels, replace_cutlass_a_loads, replace_perimeter_macro, rewrite_kernel,
+    sequence_gemms, sequence_mlp_block, sequence_segment_b,
 };
 
 #[cfg(feature = "cuda")]

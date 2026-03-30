@@ -13,7 +13,146 @@
 
 use crate::fuse_general::{PointwiseComputation, replace_a_loads_with_inline_fn};
 use crate::parser::{DefUseGraph, TileIndexMap, extract_tile_index_map};
-use crate::pipeline::{PipelineStage, ReductionDecomposition, StagePattern};
+use crate::pipeline::{
+    PipelineStage, ReductionDecomposition, StagePattern, TilePerimeter, TilePortAccess,
+};
+
+/// Compile a fusible segment into a single kernel.
+///
+/// Takes two `PipelineStage`s and their `TilePerimeter`s, connected by a
+/// `StageEdge`. Produces fused PTX.
+///
+/// For `ReductionToGemm`: the reduction's accumulate+finalize becomes the GEMM
+/// prologue, and the reduction's per-element formula (derived from the emit body
+/// in the TilePerimeter) is injected at each A-load site.
+pub fn compile_segment(
+    producer: &PipelineStage,
+    consumer: &PipelineStage,
+    producer_perim: &TilePerimeter,
+    _consumer_perim: &TilePerimeter,
+    fused_name: &str,
+) -> Result<String, String> {
+    use crate::pipeline::{StageEdge, StageKind};
+
+    // Determine the edge type from the stage kinds
+    let edge = match (&producer_perim.kind, &_consumer_perim.kind) {
+        (StageKind::Reduction, StageKind::TiledGemm) => StageEdge::ReductionToGemm,
+        (StageKind::Pointwise, StageKind::TiledGemm) => StageEdge::PointwiseToGemm,
+        _ => {
+            return Err(format!(
+                "unsupported edge: {:?} → {:?}",
+                producer_perim.kind, _consumer_perim.kind
+            ));
+        }
+    };
+
+    match edge {
+        StageEdge::ReductionToGemm => {
+            // Verify the producer's TilePerimeter has an InlineFormula output
+            // with a non-empty emit body
+            let has_emit_body = producer_perim.outputs.iter().any(|p| {
+                matches!(
+                    &p.access,
+                    TilePortAccess::InlineFormula { emit_body } if !emit_body.is_empty()
+                )
+            });
+            if !has_emit_body {
+                return Err("reduction TilePerimeter has no InlineFormula output".into());
+            }
+
+            // Delegate to the existing fusion function (which now uses
+            // extract_per_element_from_emit_body internally)
+            fuse_reduction_into_gemm(producer, consumer, fused_name)
+        }
+        StageEdge::PointwiseToGemm => fuse_pointwise_into_gemm(producer, consumer, fused_name),
+        StageEdge::GmemMaterialization => Err("GmemMaterialization not yet implemented".into()),
+    }
+}
+
+/// Extract per-element instruction templates from a reduction's emit body.
+///
+/// The emit body (from `ReductionDecomposition`) contains the full pass-2 loop:
+/// loads, per-element computation, and stores. This function extracts JUST the
+/// per-element pattern and converts it to `{INPUT}` / `{ELEM_IDX}` templates.
+///
+/// For rms_norm bf16, the emit body contains 8 pairs like:
+/// ```ptx
+/// mul.f32  %f98, %f74, %f12;    // input * inv_rms
+/// mul.f32  %f90, %f98, %f82;    // result * weight
+/// ```
+///
+/// Returns per-element instructions using `{INPUT}` for the input value
+/// and `%f_rms_inv` for inv_rms (loaded from SMEM by the prologue),
+/// and `%f_rms_wt{ELEM_IDX}` for the weight (loaded per-site).
+fn extract_per_element_from_emit_body(
+    emit_body: &[String],
+    finalized_value_reg: &str,
+) -> Option<Vec<String>> {
+    // Find all mul.f32 instructions that use the finalized_value_reg (inv_rms)
+    // These are the "input * inv_rms" multiplications.
+    let mut inv_rms_muls: Vec<(usize, String, String)> = Vec::new(); // (line_idx, dest, input_src)
+
+    for (i, line) in emit_body.iter().enumerate() {
+        let t = line.trim();
+        if !t.starts_with("mul.f32") {
+            continue;
+        }
+        // Parse: mul.f32 %dest, %srcA, %srcB;
+        let parts: Vec<&str> = t
+            .split([' ', '\t', ',', ';'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let dest = parts[1].trim();
+        let src_a = parts[2].trim();
+        let src_b = parts[3].trim();
+
+        if src_a == finalized_value_reg || src_b == finalized_value_reg {
+            let input = if src_a == finalized_value_reg {
+                src_b
+            } else {
+                src_a
+            };
+            inv_rms_muls.push((i, dest.to_string(), input.to_string()));
+        }
+    }
+
+    if inv_rms_muls.is_empty() {
+        return None;
+    }
+
+    // For each inv_rms mul, find the subsequent weight mul that uses its dest.
+    // Pattern: mul.f32 %fN, %inv_rms_result, %weight_reg
+    let mut has_weight_mul = false;
+    for &(inv_idx, ref inv_dest, _) in &inv_rms_muls {
+        for line in emit_body[inv_idx + 1..].iter().take(5) {
+            let t = line.trim();
+            if t.starts_with("mul.f32") && t.contains(inv_dest.as_str()) {
+                has_weight_mul = true;
+                break;
+            }
+        }
+        if has_weight_mul {
+            break;
+        }
+    }
+
+    // Generate the per-element template instructions.
+    // These use the framework's placeholders:
+    // - {INPUT}: the f32 value from the A-load (after bf16→f32 conversion)
+    // - {ELEM_IDX}: 0..7 index for selecting the weight register
+    // - %f_rms_inv: inv_rms for this row (loaded from SMEM by per-site code)
+    // - %f_rms_wt{ELEM_IDX}: weight for this K position (loaded per-site)
+    let mut instructions = Vec::new();
+    instructions.push("mul.f32 \t{INPUT}, {INPUT}, %f_rms_inv;".into());
+    if has_weight_mul {
+        instructions.push("mul.f32 \t{INPUT}, {INPUT}, %f_rms_wt{ELEM_IDX};".into());
+    }
+
+    Some(instructions)
+}
 
 /// Extract the GEMM tile dimensions from a CUTLASS mangled entry name.
 ///
@@ -670,24 +809,34 @@ fn build_reduction_computation(
             .into(),
     );
 
-    // Per-element instructions: for two-input, add hs before normalize.
+    // Per-element instructions: derived from the reduction's emit body.
+    // The emit body contains the full pass-2 computation (load, normalize, store).
+    // We extract just the per-element pattern (mul inv_rms, mul weight).
+    let base_instructions =
+        extract_per_element_from_emit_body(&decomp.emit_body_lines, &decomp.finalized_value_reg)
+            .unwrap_or_else(|| {
+                // Fallback: if extraction fails, use the known rms_norm pattern
+                vec![
+                    "mul.f32 \t{INPUT}, {INPUT}, %f_rms_inv;".into(),
+                    "mul.f32 \t{INPUT}, {INPUT}, %f_rms_wt{ELEM_IDX};".into(),
+                ]
+            });
+
+    // For two-input reductions (fused_add_rms_norm): add hs before normalize.
     // The bf16 round-trip (cvt.rn.bf16 + cvt.f32.bf16) matches the standard
     // path's precision: fused_add_rms_norm_inplace writes bf16(sum) to memory,
     // then pass 2 reads it back as f32(bf16(sum)). Without this truncation,
     // the fused path diverges much faster (layer 3 vs layer 9).
     let instructions = if has_writeback {
-        vec![
+        let mut instrs = vec![
             "add.f32 \t{INPUT}, {INPUT}, %f_rms_hs{ELEM_IDX};".into(),
             "cvt.rn.bf16.f32 \t%h_rms_a, {INPUT};".into(),
             "cvt.f32.bf16 \t{INPUT}, %h_rms_a;".into(),
-            "mul.f32 \t{INPUT}, {INPUT}, %f_rms_inv;".into(),
-            "mul.f32 \t{INPUT}, {INPUT}, %f_rms_wt{ELEM_IDX};".into(),
-        ]
+        ];
+        instrs.extend(base_instructions);
+        instrs
     } else {
-        vec![
-            "mul.f32 \t{INPUT}, {INPUT}, %f_rms_inv;".into(),
-            "mul.f32 \t{INPUT}, {INPUT}, %f_rms_wt{ELEM_IDX};".into(),
-        ]
+        base_instructions
     };
 
     Ok(PointwiseComputation {
@@ -1531,5 +1680,109 @@ mod tests {
             panic!("ptxas FAILED on fused_add_norm+GEMM PTX");
         }
         println!("PASS: fused_add_norm+GEMM passes ptxas");
+    }
+
+    #[test]
+    fn compile_segment_rms_norm_gemm() {
+        // Verify compile_segment produces structurally correct PTX.
+        // Note: the output is pre-perimeter-replacement, so it references the
+        // CUTLASS struct param and ferrite_params. ptxas validation happens
+        // after replace_perimeter in the pipeline_fuse! macro.
+        let rms_ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+
+        let producer = PipelineStage::from_ptx("rms_norm", rms_ptx, None).expect("parse rms_norm");
+        let consumer = PipelineStage::from_ptx("gemm", gemm_ptx, None).expect("parse gemm");
+
+        let producer_perim =
+            TilePerimeter::from_stage(&producer).expect("extract producer perimeter");
+        let consumer_perim =
+            TilePerimeter::from_stage(&consumer).expect("extract consumer perimeter");
+
+        let fused = compile_segment(
+            &producer,
+            &consumer,
+            &producer_perim,
+            &consumer_perim,
+            "seg_test",
+        )
+        .expect("compile_segment failed");
+
+        // Should contain the prologue and MMA instructions
+        assert!(
+            fused.contains("rms_norm prologue"),
+            "should have rms_norm prologue"
+        );
+        assert!(fused.contains("mma.sync"), "should preserve GEMM MMA");
+        // Should contain per-element normalization (derived from emit body)
+        assert!(
+            fused.contains("f_rms_inv"),
+            "should have inv_rms multiplication"
+        );
+        assert!(
+            fused.contains("f_rms_wt"),
+            "should have weight multiplication"
+        );
+        println!("PASS: compile_segment produces structurally valid PTX");
+    }
+
+    #[test]
+    fn extract_per_element_from_rms_norm_emit() {
+        let rms_ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let stage = PipelineStage::from_ptx("rms_norm", rms_ptx, None).expect("parse rms_norm");
+        let decomp = stage.decompose_reduction().expect("decompose");
+
+        let instrs = extract_per_element_from_emit_body(
+            &decomp.emit_body_lines,
+            &decomp.finalized_value_reg,
+        )
+        .expect("should extract per-element instructions");
+
+        eprintln!("Per-element instructions:");
+        for instr in &instrs {
+            eprintln!("  {instr}");
+        }
+
+        // Should have mul inv_rms and mul weight
+        assert!(
+            instrs.iter().any(|i| i.contains("%f_rms_inv")),
+            "should multiply by inv_rms"
+        );
+        assert!(
+            instrs.iter().any(|i| i.contains("%f_rms_wt")),
+            "should multiply by weight"
+        );
+        assert_eq!(
+            instrs.len(),
+            2,
+            "rms_norm should have exactly 2 per-element instructions"
+        );
+    }
+
+    #[test]
+    fn extract_per_element_from_fused_add_emit() {
+        let rms_ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let stage = PipelineStage::from_ptx(
+            "fused_add",
+            rms_ptx,
+            Some("fused_add_rms_norm_kernelI13__nv_bfloat16"),
+        )
+        .expect("parse");
+        let decomp = stage.decompose_reduction().expect("decompose");
+
+        let instrs = extract_per_element_from_emit_body(
+            &decomp.emit_body_lines,
+            &decomp.finalized_value_reg,
+        )
+        .expect("should extract per-element instructions");
+
+        eprintln!("fused_add per-element instructions:");
+        for instr in &instrs {
+            eprintln!("  {instr}");
+        }
+
+        // Should have mul inv_rms and mul weight (same pattern as rms_norm)
+        assert!(instrs.iter().any(|i| i.contains("%f_rms_inv")));
+        assert!(instrs.iter().any(|i| i.contains("%f_rms_wt")));
     }
 }

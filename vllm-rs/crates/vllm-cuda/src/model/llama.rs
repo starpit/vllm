@@ -1069,16 +1069,38 @@ impl LlamaDecoderLayer {
                 crate::layers::LinearLayer::Dense(down_linear),
             ) = (&self.mlp.gate_up_proj, &self.mlp.down_proj)
             {
-                // Fused MLP block: gate_up → SiLU → down in one kernel launch
-                let mlp_output = device.ferrite.launch_mlp_block(
-                    *attn_output,
-                    gate_up_linear.weight,
-                    down_linear.weight,
-                    self.mlp.intermediate_size as u32,
+                // TODO: Fused MLP block (gate_up → SiLU → down) deadlocks at production
+                // dims because the global atomic barrier spin-wait assumes all blocks fit
+                // on the GPU simultaneously. At Qwen 0.5B dims (gate_up_cols=9728), the
+                // grid has 80+ blocks but spinning blocks hold SM resources, preventing
+                // unscheduled blocks from launching → occupancy deadlock.
+                // Fix: cooperative launch (cudaLaunchCooperativeKernel) or persistent
+                // kernel with work-queue dispatch.
+                //
+                // Fallback: separate launches (known to work).
+                let gate_up = gate_up_linear.forward_ferrite(
+                    attn_output.view(),
+                    &device.ferrite,
                     &mut device.caching,
                     device.compute_stream,
                 );
                 drop(attn_output);
+
+                let activated = kernels::silu_and_mul_fused(
+                    gate_up.as_gpu_tensor(),
+                    self.mlp.intermediate_size,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(gate_up);
+
+                let mlp_output = down_linear.forward_ferrite(
+                    activated.view(),
+                    &device.ferrite,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(activated);
 
                 if self.residual_multiplier != 1.0 {
                     kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);

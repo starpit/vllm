@@ -26,6 +26,12 @@ pub enum BenchCommands {
     Throughput(BenchThroughputArgs),
     /// Benchmark relocatable KV cache blocks (spans) for RAG workloads.
     Spans(BenchSpansArgs),
+    /// Needle-in-a-haystack accuracy benchmark.
+    Niah(BenchNiahArgs),
+    /// RULER benchmark (multi-needle NIAH + variable tracking).
+    Ruler(BenchRulerArgs),
+    /// RAG CSV evaluation (accuracy grading from a CSV dataset).
+    Ragcsv(BenchRagcsvArgs),
 }
 
 /// Arguments for `vllm bench latency`.
@@ -731,6 +737,318 @@ impl BenchSpansArgs {
             (Some(tag), _) => Ok(tag.clone()),
             (None, Some(m)) => Ok(m.clone()),
             (None, None) => Err("No model specified. Use positional arg or --model.".into()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NIAH benchmark args
+// ---------------------------------------------------------------------------
+
+/// Arguments for `vllm bench niah`.
+///
+/// Needle-in-a-haystack accuracy benchmark: inserts a known "needle" fact
+/// into a long context of Paul Graham essays and measures whether the model
+/// can retrieve it at various depths and context lengths.
+///
+/// Runs both plain (chat) and span (SPNL query) modes to compare accuracy
+/// and TTFT.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench niah [MODEL] [OPTIONS]")]
+pub struct BenchNiahArgs {
+    /// Model: local path or HuggingFace model ID (positional).
+    pub model_tag: Option<String>,
+
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Number of samples per configuration.
+    #[arg(long, default_value_t = 10)]
+    pub num_samples: usize,
+
+    /// Comma-separated context lengths in tokens.
+    #[arg(long, default_value = "1000,2000,4000,8000", value_delimiter = ',')]
+    pub context_lengths: Vec<usize>,
+
+    /// Comma-separated depth percentages (0-100).
+    #[arg(long, default_value = "0,25,50,75,100", value_delimiter = ',')]
+    pub depth_percentages: Vec<usize>,
+
+    /// Token buffer for system/question/response overhead.
+    #[arg(long, default_value_t = 200)]
+    pub context_length_buffer: usize,
+
+    /// Fraction of GPU memory to use for KV cache (0.0–1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+
+    /// Enable debug output for first sample.
+    #[arg(long)]
+    pub debug: bool,
+}
+
+impl BenchNiahArgs {
+    pub fn resolved_model(&self) -> Result<String, String> {
+        match (&self.model_tag, &self.model) {
+            (Some(tag), _) => Ok(tag.clone()),
+            (None, Some(m)) => Ok(m.clone()),
+            (None, None) => {
+                Err("model is required: provide as positional arg or --model flag".into())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULER benchmark args
+// ---------------------------------------------------------------------------
+
+/// Arguments for `vllm bench ruler`.
+///
+/// RULER benchmark: multi-needle NIAH (multiple keys/values) and variable
+/// tracking tasks at various context lengths. Compares plain vs span modes.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench ruler [MODEL] [OPTIONS]")]
+pub struct BenchRulerArgs {
+    /// Model: local path or HuggingFace model ID (positional).
+    pub model_tag: Option<String>,
+
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Number of samples per configuration.
+    #[arg(long, default_value_t = 10)]
+    pub num_samples: usize,
+
+    /// Comma-separated context lengths in tokens.
+    #[arg(long, default_value = "4000,8000", value_delimiter = ',')]
+    pub context_lengths: Vec<usize>,
+
+    /// Comma-separated tasks to run (niah, variable_tracking).
+    #[arg(long, default_value = "niah")]
+    pub tasks: String,
+
+    /// Token buffer for system/question/response overhead.
+    #[arg(long, default_value_t = 200)]
+    pub context_length_buffer: usize,
+
+    // -- NIAH-specific --
+    /// Number of needles (keys) to insert.
+    #[arg(long, default_value_t = 1)]
+    pub niah_num_needle_k: usize,
+
+    /// Number of values per needle.
+    #[arg(long, default_value_t = 1)]
+    pub niah_num_needle_v: usize,
+
+    /// Number of needles to query.
+    #[arg(long, default_value_t = 1)]
+    pub niah_num_needle_q: usize,
+
+    /// Comma-separated depth percentages for NIAH.
+    #[arg(long, default_value = "50", value_delimiter = ',')]
+    pub niah_depth_percentages: Vec<usize>,
+
+    // -- Variable Tracking-specific --
+    /// Number of variable chains.
+    #[arg(long, default_value_t = 1)]
+    pub vt_num_chains: usize,
+
+    /// Number of hops per chain.
+    #[arg(long, default_value_t = 4)]
+    pub vt_num_hops: usize,
+
+    /// Fraction of GPU memory to use for KV cache (0.0–1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+
+    /// Enable debug output for first sample.
+    #[arg(long)]
+    pub debug: bool,
+}
+
+impl BenchRulerArgs {
+    pub fn resolved_model(&self) -> Result<String, String> {
+        match (&self.model_tag, &self.model) {
+            (Some(tag), _) => Ok(tag.clone()),
+            (None, Some(m)) => Ok(m.clone()),
+            (None, None) => {
+                Err("model is required: provide as positional arg or --model flag".into())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RAGCSV benchmark args
+// ---------------------------------------------------------------------------
+
+/// Arguments for `vllm bench ragcsv`.
+///
+/// RAG CSV evaluation: reads a CSV dataset with questions, document fragments,
+/// and expected answers, runs them through the model, and grades responses
+/// using LLM-judge metrics (accuracy, faithfulness, relevancy) plus string
+/// metrics (token F1, exact match, BLEU-1).
+///
+/// Runs both plain (chat) and span (SPNL query with relocatable document
+/// blocks) modes.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench ragcsv --file <CSV> [MODEL] [OPTIONS]")]
+pub struct BenchRagcsvArgs {
+    /// Model: local path or HuggingFace model ID (positional).
+    pub model_tag: Option<String>,
+
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Path to CSV file.
+    #[arg(short, long)]
+    pub file: String,
+
+    /// Grading model (defaults to primary model).
+    #[arg(long)]
+    pub grading_model: Option<String>,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Limit number of rows to process.
+    #[arg(long)]
+    pub limit: Option<usize>,
+
+    /// Max tokens for primary query.
+    #[arg(long, default_value_t = 512)]
+    pub max_tokens: usize,
+
+    /// Comma-separated LLM-judge metrics: accuracy,faithfulness,relevancy,all.
+    #[arg(long, default_value = "all")]
+    pub metrics: String,
+
+    /// Fraction of GPU memory to use for KV cache (0.0–1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+
+    /// Enable debug output for first row.
+    #[arg(long)]
+    pub debug: bool,
+}
+
+impl BenchRagcsvArgs {
+    pub fn resolved_model(&self) -> Result<String, String> {
+        match (&self.model_tag, &self.model) {
+            (Some(tag), _) => Ok(tag.clone()),
+            (None, Some(m)) => Ok(m.clone()),
+            (None, None) => {
+                Err("model is required: provide as positional arg or --model flag".into())
+            }
         }
     }
 }

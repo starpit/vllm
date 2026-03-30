@@ -9,6 +9,9 @@
 mod args;
 pub(crate) mod datasets;
 mod latency;
+mod niah;
+mod ragcsv;
+mod ruler;
 mod serve;
 mod spans;
 mod startup;
@@ -16,9 +19,9 @@ mod sweep;
 mod throughput;
 
 pub use args::{
-    BenchCommand, BenchCommands, BenchLatencyArgs, BenchServeArgs, BenchSpansArgs,
-    BenchStartupArgs, BenchThroughputArgs, SweepCommand, SweepCommands, SweepServeArgs,
-    SweepStartupArgs,
+    BenchCommand, BenchCommands, BenchLatencyArgs, BenchNiahArgs, BenchRagcsvArgs, BenchRulerArgs,
+    BenchServeArgs, BenchSpansArgs, BenchStartupArgs, BenchThroughputArgs, SweepCommand,
+    SweepCommands, SweepServeArgs, SweepStartupArgs,
 };
 
 /// Format a rate as `it/s` (fast) or `s/it` (slow), matching Python tqdm style.
@@ -57,6 +60,18 @@ pub async fn run_bench(cmd: BenchCommand) -> anyhow::Result<()> {
         }
         BenchCommands::Spans(args) => {
             tokio::task::spawn_blocking(move || spans::run_bench_spans(args)).await??;
+            Ok(())
+        }
+        BenchCommands::Niah(args) => {
+            tokio::task::spawn_blocking(move || niah::run_bench_niah(args)).await??;
+            Ok(())
+        }
+        BenchCommands::Ruler(args) => {
+            tokio::task::spawn_blocking(move || ruler::run_bench_ruler(args)).await??;
+            Ok(())
+        }
+        BenchCommands::Ragcsv(args) => {
+            tokio::task::spawn_blocking(move || ragcsv::run_bench_ragcsv(args)).await??;
             Ok(())
         }
     }

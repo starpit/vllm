@@ -48,7 +48,7 @@ pub(crate) struct ExecuteQueryParams {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct SpanConfig {
-    pub(crate) pad_token: u32,
+    pub(crate) pad_token: Option<u32>,
     pub(crate) block_size: usize,
 }
 
@@ -56,23 +56,34 @@ impl SpanConfig {
     #[allow(dead_code)]
     pub(crate) fn with_pad_token(block_size: usize, pad_token: u32) -> Self {
         Self {
-            pad_token,
+            pad_token: Some(pad_token),
             block_size,
         }
     }
 
     /// Resolve pad token from `VLLM_V1_SPANS_PAD_TOKEN` env var, falling back
     /// to the tokenizer's encoding of `" "` (whitespace), then 0.
+    ///
+    /// Set `VLLM_V1_SPANS_PAD_TOKEN=-1` to disable padding entirely.
     pub(crate) fn from_tokenizer(
         block_size: usize,
-        tokenizer: &crate::tokenizer::Tokenizer,
+        _tokenizer: &crate::tokenizer::Tokenizer,
     ) -> Self {
-        let pad_token = std::env::var("VLLM_V1_SPANS_PAD_TOKEN")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .or_else(|| tokenizer.token_to_id(" "))
-            .unwrap_or(0);
+        // Default: no padding. Padding between Plus children injects tokens
+        // that corrupt text content and destroy model accuracy (verified by
+        // NIAH bench). Set VLLM_V1_SPANS_PAD_TOKEN to a token ID to enable
+        // padding (e.g. for synthetic benchmarks like `bench spans` that use
+        // pre-aligned token sequences).
+        let pad_token =
+            std::env::var("VLLM_V1_SPANS_PAD_TOKEN")
+                .ok()
+                .and_then(|v| match v.parse::<i64>() {
+                    Ok(-1) => None,
+                    Ok(id) if id >= 0 => Some(id as u32),
+                    _ => None,
+                });
 
+        tracing::info!("[SPANS] pad_token={pad_token:?}, block_size={block_size}");
         Self {
             pad_token,
             block_size,
@@ -93,6 +104,10 @@ struct TokenizeState {
     annotations: BTreeMap<usize, BlockKind>,
     /// Whether we're currently inside a relocatable context.
     in_relocatable: bool,
+    /// When true, the next message must NOT be consolidated with the previous
+    /// one, even if they share the same role. Set at structural boundaries
+    /// (e.g. Cross left→right) to preserve message turn structure.
+    break_consolidation: bool,
     /// Messages rendered so far for incremental tokenization.
     /// Each `tokenize_message` call appends to this and re-renders the full
     /// conversation, taking only the delta tokens. This avoids spurious BOS
@@ -109,18 +124,21 @@ impl TokenizeState {
             tokens: Vec::new(),
             annotations: BTreeMap::new(),
             in_relocatable: false,
+            break_consolidation: false,
             rendered_messages: Vec::new(),
             rendered_token_count: 0,
         }
     }
 
-    /// Pad `tokens` to the next block boundary.
+    /// Pad `tokens` to the next block boundary (no-op if pad_token is None).
     fn pad_to_block(&mut self, cfg: &SpanConfig) {
-        let remainder = self.tokens.len() % cfg.block_size;
-        if remainder > 0 && remainder < cfg.block_size {
-            let pad_count = cfg.block_size - remainder;
-            self.tokens
-                .extend(std::iter::repeat_n(cfg.pad_token, pad_count));
+        if let Some(pad_token) = cfg.pad_token {
+            let remainder = self.tokens.len() % cfg.block_size;
+            if remainder > 0 && remainder < cfg.block_size {
+                let pad_count = cfg.block_size - remainder;
+                self.tokens
+                    .extend(std::iter::repeat_n(pad_token, pad_count));
+            }
         }
     }
 
@@ -129,10 +147,6 @@ impl TokenizeState {
         self.pad_to_block(cfg);
         let block_index = self.tokens.len() / cfg.block_size;
         self.annotations.insert(block_index, kind);
-        // Reset incremental render state — new annotation context means
-        // subsequent messages start a fresh conversation.
-        self.rendered_messages.clear();
-        self.rendered_token_count = 0;
     }
 }
 
@@ -150,13 +164,29 @@ fn tokenize_message(
     cfg: &SpanConfig,
     state: &mut TokenizeState,
 ) -> ServeResult<()> {
-    let tmpl_msg = TemplateMessage {
-        role: msg.role().to_string(),
-        content: msg.content().to_string(),
-    };
+    let role = msg.role().to_string();
+    let content = msg.content().to_string();
 
-    // Append to the running conversation and re-render the full sequence.
-    state.rendered_messages.push(tmpl_msg);
+    // Consolidate consecutive messages with the same role — avoids inserting
+    // redundant role header tokens between chunks of the same type (e.g.
+    // multiple user messages from Plus children). Consolidation is suppressed
+    // at structural boundaries (break_consolidation flag).
+    let should_consolidate = !state.break_consolidation
+        && state
+            .rendered_messages
+            .last()
+            .is_some_and(|last| last.role == role);
+    state.break_consolidation = false;
+
+    if should_consolidate {
+        let last = state.rendered_messages.last_mut().unwrap();
+        last.content.push('\n');
+        last.content.push_str(&content);
+    } else {
+        state
+            .rendered_messages
+            .push(TemplateMessage { role, content });
+    }
     let rendered = template.apply_simple(&state.rendered_messages, false)?;
     let all_ids = tokenizer.encode(&rendered, false)?;
 
@@ -204,6 +234,7 @@ fn tokenize_input(
             }
             if !right.is_empty() {
                 state.in_relocatable = false;
+                state.break_consolidation = true;
                 state.annotate_next_block(BlockKind::Prefixed, cfg);
                 for child in right {
                     tokenize_input(child, tokenizer, template, cfg, state)?;

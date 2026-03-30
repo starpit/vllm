@@ -50,14 +50,16 @@ pub type BlockAnnotations = BTreeMap<usize, BlockKind>;
 pub fn compute_block_flags(
     annotations: &BlockAnnotations,
     block_idx: usize,
-    block_size: usize,
-    seq_len: usize,
-    tokens_before: usize,
+    _block_size: usize,
+    _seq_len: usize,
+    _tokens_before: usize,
 ) -> (bool, bool) {
     let is_relocatable = annotations.get(&block_idx) == Some(&BlockKind::Relocatable);
-    let block_end_pos = ((block_idx + 1) * block_size).min(seq_len);
-    let was_previously_written = block_end_pos <= tokens_before;
-    let is_unrotated = is_relocatable && was_previously_written;
+    // NOTE: is_unrotated is always false because there is no post-attention
+    // inverse-RoPE pass. K values in the cache are always stored WITH RoPE
+    // from the QKV projection. Setting is_unrotated=true would cause the
+    // attention kernel to double-rotate K on reuse, destroying attention.
+    let is_unrotated = false;
     (is_relocatable, is_unrotated)
 }
 

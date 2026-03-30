@@ -336,13 +336,20 @@ fn build_reduction_computation(
 ) -> Result<PointwiseComputation, String> {
     // Identify params from the reduction kernel
     let params = &reduction.protocol.params;
-    // rms_norm params: param_0 = output, param_1 = input, param_2 = weight, param_3 = epsilon, param_4 = hidden_size
     if params.len() < 5 {
         return Err(format!(
-            "expected rms_norm to have 5 params (out, in, weight, eps, hidden), got {}",
+            "expected reduction to have >= 5 params, got {}",
             params.len()
         ));
     }
+
+    // Detect two-input reduction (fused_add_rms_norm): accumulation loop has st.global
+    // indicating writeback to one of the inputs.
+    let has_writeback = decomp.accumulate_loops.iter().any(|lp| {
+        (lp.body_range.0..=lp.body_range.1).any(|i| {
+            i < reduction.source_lines.len() && reduction.source_lines[i].contains("st.global")
+        })
+    });
 
     // The finalized value register is inv_rms (loaded from SMEM after reduction)
     if decomp.finalized_value_reg.is_empty() {
@@ -351,13 +358,28 @@ fn build_reduction_computation(
 
     // ── Extra params for the fused kernel ──
     // These get prepended to the GEMM's entry point
-    let extra_params = vec![
+    //
+    // For rms_norm (single input):
+    //   param_0 = output (not needed), param_1 = input, param_2 = weight
+    //   ferrite_rms_input → param_1
+    //
+    // For fused_add_rms_norm (two inputs + writeback):
+    //   param_0 = input/hs (hidden_states), param_1 = residual (writeback target + GEMM A-input)
+    //   param_2 = weight
+    //   ferrite_rms_input → param_1 (residual, also the GEMM's A-pointer)
+    //   ferrite_rms_hs_input → param_0 (hidden_states, second input for add)
+    let mut extra_params = vec![
         ".param .u64 _ferrite_rms_input,".into(),
+    ];
+    if has_writeback {
+        extra_params.push(".param .u64 _ferrite_rms_hs_input,".into());
+    }
+    extra_params.extend([
         ".param .u64 _ferrite_rms_weight,".into(),
         ".param .f32 _ferrite_rms_epsilon,".into(),
         ".param .u32 _ferrite_rms_hidden,".into(),
         ".param .u64 _ferrite_rms_a_stride,".into(),
-    ];
+    ]);
 
     // ── Extra register declarations ──
     // Extract register declarations from the reduction kernel's source and rename them.
@@ -385,6 +407,9 @@ fn build_reduction_computation(
     extra_reg_decls.push(".reg .b32 %r_rms_k, %r_rms_hdn, %r_rms_step;".into());
     extra_reg_decls.push(".reg .b32 %r_rms_row, %r_rms_nrows, %r_rms_mtile;".into());
     extra_reg_decls.push(".reg .b64 %rd_rms_in, %rd_rms_wt, %rd_rms_str;".into());
+    if has_writeback {
+        extra_reg_decls.push(".reg .b64 %rd_rms_hs_in;".into());
+    }
     extra_reg_decls.push(".reg .b64 %rd_rms_rb0, %rd_rms_rb1;".into());
     extra_reg_decls.push(".reg .b64 %rd_rms_cur;".into());
     extra_reg_decls.push(".reg .pred %p_rms_lp, %p_rms_row, %p_rms_par;".into());
@@ -400,15 +425,27 @@ fn build_reduction_computation(
     let prefix = "rms";
     let mut param_loads: Vec<String> = Vec::new();
 
-    // Map original param name suffixes to ferrite param names
-    // rms_norm: param_0=output, param_1=input, param_2=weight, param_3=eps, param_4=hidden
-    let ferrite_param_map: &[(&str, Option<&str>)] = &[
-        ("param_0", None),                         // output ptr — not needed
-        ("param_1", Some("_ferrite_rms_input")),   // input ptr
-        ("param_2", Some("_ferrite_rms_weight")),  // weight ptr
-        ("param_3", Some("_ferrite_rms_epsilon")), // epsilon
-        ("param_4", Some("_ferrite_rms_hidden")),  // hidden_size
-    ];
+    // Map original param name suffixes to ferrite param names.
+    //
+    // rms_norm:            param_0=output(skip), param_1=input, param_2=weight, param_3=eps, param_4=hidden
+    // fused_add_rms_norm:  param_0=hs_input,     param_1=residual(=GEMM A-ptr), param_2=weight, param_3=eps, param_4=hidden
+    let ferrite_param_map: Vec<(&str, Option<&str>)> = if has_writeback {
+        vec![
+            ("param_0", Some("_ferrite_rms_hs_input")),  // hidden_states (second input for add)
+            ("param_1", Some("_ferrite_rms_input")),     // residual (GEMM A-ptr, writeback target)
+            ("param_2", Some("_ferrite_rms_weight")),    // weight ptr
+            ("param_3", Some("_ferrite_rms_epsilon")),   // epsilon
+            ("param_4", Some("_ferrite_rms_hidden")),    // hidden_size
+        ]
+    } else {
+        vec![
+            ("param_0", None),                           // output ptr — not needed
+            ("param_1", Some("_ferrite_rms_input")),     // input ptr
+            ("param_2", Some("_ferrite_rms_weight")),    // weight ptr
+            ("param_3", Some("_ferrite_rms_epsilon")),   // epsilon
+            ("param_4", Some("_ferrite_rms_hidden")),    // hidden_size
+        ]
+    };
 
     // For each ld.param in the source, emit a renamed version loading from ferrite params
     for line in &reduction.source_lines {
@@ -416,7 +453,7 @@ fn build_reduction_computation(
         if !t.contains("ld.param") {
             continue;
         }
-        for &(param_suffix, ferrite_name) in ferrite_param_map {
+        for &(param_suffix, ferrite_name) in &ferrite_param_map {
             if t.contains(param_suffix) {
                 if let Some(ferrite) = ferrite_name {
                     let renamed = rename_ptx_regs(t, prefix);
@@ -447,7 +484,7 @@ fn build_reduction_computation(
     // Copy renamed global pointers to plumbing registers for per-site/row-loop code.
     // Find which renamed register is the global input ptr and weight ptr by tracing
     // the cvta chain: ld.param %rdN, [param_1] → cvta %rdM, %rdN → %rdM = global input
-    for &(param_suffix, ferrite_name) in ferrite_param_map {
+    for &(param_suffix, ferrite_name) in &ferrite_param_map {
         if ferrite_name.is_none() {
             continue;
         }
@@ -476,6 +513,9 @@ fn build_reduction_computation(
                     match ferrite_name {
                         Some("_ferrite_rms_input") => {
                             param_loads.push(format!("mov.u64 \t%rd_rms_in, {cvta_dest};"));
+                        }
+                        Some("_ferrite_rms_hs_input") => {
+                            param_loads.push(format!("mov.u64 \t%rd_rms_hs_in, {cvta_dest};"));
                         }
                         Some("_ferrite_rms_weight") => {
                             param_loads.push(format!("mov.u64 \t%rd_rms_wt, {cvta_dest};"));
@@ -1284,5 +1324,93 @@ mod tests {
             panic!("ptxas FAILED on SiLU+mul fused GEMM PTX");
         }
         println!("PASS: SiLU+mul fused GEMM passes ptxas");
+    }
+
+    #[test]
+    fn fuse_add_rms_norm_into_cutlass_gemm() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+
+        let norm_stage = PipelineStage::from_ptx(
+            "fused_add_rms_norm",
+            ptx,
+            Some("fused_add_rms_norm_kernelI13__nv_bfloat16"),
+        )
+        .expect("parse fused_add_rms_norm");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx, None).expect("parse gemm");
+
+        let fused = fuse_reduction_into_gemm(&norm_stage, &gemm_stage, "fused_add_norm_gemm");
+
+        match fused {
+            Ok(ptx) => {
+                // Should contain add+norm prologue (transplanted from fused_add_rms_norm)
+                assert!(ptx.contains("rms_norm prologue"), "should contain prologue");
+                assert!(ptx.contains("add.f32"), "prologue should contain f32 add (from fused_add_rms_norm)");
+                assert!(ptx.contains("st.global"), "prologue should contain writeback store");
+                assert!(ptx.contains("mma.sync"), "GEMM interior should be preserved");
+                // Should have the extra hs_input param
+                assert!(ptx.contains("_ferrite_rms_hs_input"), "should have hs_input param");
+                eprintln!("PASS: fused_add_rms_norm → GEMM produces valid PTX structure");
+            }
+            Err(e) => panic!("fuse_reduction_into_gemm failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn fused_add_norm_gemm_ptxas_valid() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
+
+        let norm_stage = PipelineStage::from_ptx(
+            "fused_add_rms_norm",
+            ptx,
+            Some("fused_add_rms_norm_kernelI13__nv_bfloat16"),
+        )
+        .expect("parse fused_add_rms_norm");
+        let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx, None).expect("parse gemm");
+
+        let fused_ptx =
+            fuse_reduction_into_gemm(&norm_stage, &gemm_stage, "fused_add_norm_gemm").expect("fuse");
+
+        let (fused_ptx, _) =
+            crate::perimeter::replace_perimeter(&fused_ptx, deriv_json, "fused_add_norm_gemm")
+                .expect("perimeter replacement");
+        let fused_ptx = crate::dedup_reg_declarations(&fused_ptx);
+
+        let path = "/tmp/pipeline_fused_add_norm_gemm.ptx";
+        std::fs::write(path, &fused_ptx).unwrap();
+
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", path])
+            .output()
+            .expect("ptxas not found");
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("ptxas stderr:");
+            for line in stderr.lines().take(30) {
+                eprintln!("  {line}");
+            }
+            let ptx_lines: Vec<&str> = fused_ptx.lines().collect();
+            for line in stderr.lines() {
+                if let Some(lnum) = line
+                    .split('(')
+                    .nth(1)
+                    .and_then(|s| s.split(')').next())
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    let start = lnum.saturating_sub(3);
+                    let end = (lnum + 3).min(ptx_lines.len());
+                    for i in start..end {
+                        let marker = if i + 1 == lnum { ">>>" } else { "   " };
+                        eprintln!("{marker} {:4}: {}", i + 1, ptx_lines[i]);
+                    }
+                }
+            }
+            panic!("ptxas FAILED on fused_add_norm+GEMM PTX");
+        }
+        println!("PASS: fused_add_norm+GEMM passes ptxas");
     }
 }

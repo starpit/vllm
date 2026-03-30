@@ -659,4 +659,87 @@ mod tests {
             "pointwise stage should not decompose as reduction"
         );
     }
+
+    #[test]
+    fn classify_fused_add_rms_norm() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let stage = PipelineStage::from_ptx(
+            "fused_add_rms_norm",
+            ptx,
+            Some("fused_add_rms_norm_kernelI13__nv_bfloat16"),
+        )
+        .expect("extraction failed");
+
+        eprintln!("pattern: {:?}", stage.pattern);
+        eprintln!("params: {} total", stage.protocol.params.len());
+        for (i, p) in stage.protocol.params.iter().enumerate() {
+            eprintln!("  param_{i}: {} ({})", p.name, p.ptx_type);
+        }
+        eprintln!("loops: {}", stage.loops.len());
+        eprintln!("carries: {}", stage.carries.len());
+        for c in &stage.carries {
+            eprintln!("  carry: {} ({:?})", c.register, c.role);
+        }
+
+        match &stage.pattern {
+            StagePattern::Reduction { .. } => {}
+            other => panic!("fused_add_rms_norm should be Reduction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decompose_fused_add_rms_norm() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let stage = PipelineStage::from_ptx(
+            "fused_add_rms_norm",
+            ptx,
+            Some("fused_add_rms_norm_kernelI13__nv_bfloat16"),
+        )
+        .expect("extraction failed");
+
+        let decomp = stage
+            .decompose_reduction()
+            .expect("fused_add_rms_norm should decompose as a reduction");
+
+        eprintln!(
+            "=== Accumulate loops: {} ===",
+            decomp.accumulate_loops.len()
+        );
+        for (i, lp) in decomp.accumulate_loops.iter().enumerate() {
+            eprintln!(
+                "  loop {i}: lines {}..{} label={}",
+                lp.header_line, lp.backedge_line, lp.header_label
+            );
+        }
+
+        eprintln!(
+            "=== Finalize range: {}..{} ===",
+            decomp.finalize_range.0, decomp.finalize_range.1
+        );
+        eprintln!(
+            "=== Finalized value register: {} ===",
+            decomp.finalized_value_reg
+        );
+        eprintln!("=== Emit loops: {} ===", decomp.emit_loops.len());
+        eprintln!("=== Emit body: {} lines ===", decomp.emit_body_lines.len());
+
+        // Accumulation loop should contain st.global (writeback to residual)
+        let accum_lp = &decomp.accumulate_loops[0];
+        let has_store = (accum_lp.body_range.0..=accum_lp.body_range.1)
+            .any(|i| i < stage.source_lines.len() && stage.source_lines[i].contains("st.global"));
+        eprintln!("  accum loop has st.global (writeback): {has_store}");
+
+        assert!(
+            !decomp.accumulate_loops.is_empty(),
+            "should have accumulate loops"
+        );
+        assert!(
+            !decomp.finalized_value_reg.is_empty(),
+            "should detect finalized value register"
+        );
+        assert!(
+            !decomp.emit_loops.is_empty(),
+            "should have emit loops (normalize pass)"
+        );
+    }
 }

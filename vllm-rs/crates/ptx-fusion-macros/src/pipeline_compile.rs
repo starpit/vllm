@@ -29,21 +29,35 @@ use crate::pipeline::{
 /// GEMM_B's labels are renamed ($L__BB0 → $L__BB1).
 ///
 /// Returns the sequenced PTX kernel.
+/// Sequence two GEMM phases into a single kernel (convenience wrapper).
 pub fn sequence_two_gemms(
     gemm_a_ptx: &str,
     gemm_b_ptx: &str,
     name: &str,
 ) -> Result<String, String> {
+    sequence_gemm_phases(&[gemm_a_ptx, gemm_b_ptx], name)
+}
+
+/// Sequence N GEMM phases into a single kernel with barriers between them.
+///
+/// Each phase gets its own param block (ferrite_params, ferrite_params_2, ...),
+/// its own label namespace ($L__BB0, $L__BB1, ...), and offset registers to
+/// avoid collisions. All phases reuse the same SMEM (sequential execution).
+pub fn sequence_gemm_phases(phases: &[&str], name: &str) -> Result<String, String> {
     use crate::fuse_real::{compute_register_offsets, offset_all_registers};
+    use std::collections::{BTreeMap, HashSet};
 
-    let proto_a = crate::parser::PtxParser::parse(gemm_a_ptx)?;
-    let proto_b = crate::parser::PtxParser::parse(gemm_b_ptx)?;
+    if phases.is_empty() {
+        return Err("no phases to sequence".into());
+    }
 
-    let offsets = compute_register_offsets(&proto_a.registers, &proto_b.registers);
+    // Parse all phases
+    let protos: Vec<_> = phases
+        .iter()
+        .map(|ptx| crate::parser::PtxParser::parse(ptx))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Extract body lines: everything from after the entry-level `{` to `ret;`,
-    // skipping register and SMEM declarations. Tracks brace depth to handle
-    // inline asm blocks (CUTLASS uses `{ ... }` for inline asm).
+    // Extract body and params from each phase
     let extract_body = |ptx: &str| -> Vec<String> {
         let lines: Vec<&str> = ptx.lines().collect();
         let mut in_body = false;
@@ -52,14 +66,12 @@ pub fn sequence_two_gemms(
         for line in &lines {
             let t = line.trim();
             if !in_body {
-                // Find the entry-level opening brace
                 if (t == "{" || t.ends_with('{')) && t.contains('{') {
                     in_body = true;
                     depth = 1;
                 }
                 continue;
             }
-            // Track brace depth for inline asm
             for ch in t.chars() {
                 match ch {
                     '{' => depth += 1,
@@ -67,12 +79,7 @@ pub fn sequence_two_gemms(
                     _ => {}
                 }
             }
-            // Stop at the entry-level closing brace
-            if depth <= 0 {
-                break;
-            }
-            // Stop at ret (end of kernel body)
-            if t == "ret;" {
+            if depth <= 0 || t == "ret;" {
                 break;
             }
             if t.starts_with(".reg ") || t.starts_with(".shared ") {
@@ -83,10 +90,6 @@ pub fn sequence_two_gemms(
         body
     };
 
-    let body_a = extract_body(gemm_a_ptx);
-    let body_b = extract_body(gemm_b_ptx);
-
-    // Extract param declarations from both GEMMs' entries
     let extract_params = |ptx: &str| -> Vec<String> {
         let mut params = Vec::new();
         let mut in_entry = false;
@@ -109,52 +112,142 @@ pub fn sequence_two_gemms(
         params
     };
 
-    let params_a = extract_params(gemm_a_ptx);
-    let params_b = extract_params(gemm_b_ptx);
+    let bodies: Vec<Vec<String>> = phases.iter().map(|ptx| extract_body(ptx)).collect();
+    let all_params: Vec<Vec<String>> = phases.iter().map(|ptx| extract_params(ptx)).collect();
 
-    // Rename GEMM_B: offset registers, rename labels, rename params
-    // Collect GEMM_B's extra param names (non-ferrite_params) for renaming in the body
-    let b_extra_param_names: Vec<String> = params_b
-        .iter()
-        .filter_map(|p| {
-            if p.contains("ferrite_params") {
-                return None;
+    // Compute cumulative register offsets: phase 0 gets no offset,
+    // phase 1 gets offset by phase 0's register count, etc.
+    let mut cumulative_offsets: Vec<BTreeMap<String, usize>> = Vec::new();
+    cumulative_offsets.push(BTreeMap::new()); // Phase 0: no offset
+
+    let mut running_regs = protos[0].registers.clone();
+    for proto in &protos[1..] {
+        let offsets = compute_register_offsets(&running_regs, &proto.registers);
+        cumulative_offsets.push(offsets.clone());
+        // Update running totals
+        for (ty, count) in &proto.registers {
+            let offset = offsets.get(ty).copied().unwrap_or(0);
+            let entry = running_regs
+                .iter_mut()
+                .find(|(t, _)| t == ty)
+                .map(|(_, c)| c);
+            if let Some(c) = entry {
+                *c = offset + count;
+            } else {
+                running_regs.push((ty.clone(), offset + count));
             }
-            p.split_whitespace()
-                .last()
-                .map(|s| s.trim_end_matches(',').to_string())
+        }
+    }
+
+    // Rename each phase's body (except phase 0)
+    let renamed_bodies: Vec<Vec<String>> = bodies
+        .iter()
+        .enumerate()
+        .map(|(phase_idx, body)| {
+            if phase_idx == 0 {
+                return body.clone();
+            }
+            let offsets = &cumulative_offsets[phase_idx];
+            let suffix = if phase_idx == 1 {
+                "_2".to_string()
+            } else {
+                format!("_{}", phase_idx + 1)
+            };
+            let param_suffix = suffix.clone();
+
+            // Collect extra param names for this phase
+            let extra_param_names: Vec<String> = all_params[phase_idx]
+                .iter()
+                .filter_map(|p| {
+                    if p.contains("ferrite_params") {
+                        return None;
+                    }
+                    p.split_whitespace()
+                        .last()
+                        .map(|s| s.trim_end_matches(',').to_string())
+                })
+                .collect();
+
+            body.iter()
+                .map(|line| {
+                    let mut renamed = offset_all_registers(line, offsets);
+                    renamed = renamed.replace("$L__BB0", &format!("$L__BB{phase_idx}"));
+                    renamed =
+                        renamed.replace("ferrite_params", &format!("ferrite_params{param_suffix}"));
+                    for pname in &extra_param_names {
+                        if renamed.contains(pname.as_str()) {
+                            renamed = renamed.replace(pname.as_str(), &format!("{pname}{suffix}"));
+                        }
+                    }
+                    renamed
+                })
+                .collect()
         })
         .collect();
 
-    let body_b_renamed: Vec<String> = body_b
+    // Rename each phase's params (except phase 0)
+    let renamed_params: Vec<Vec<String>> = all_params
         .iter()
-        .map(|line| {
-            let mut renamed = offset_all_registers(line, &offsets);
-            renamed = renamed.replace("$L__BB0", "$L__BB1");
-            renamed = renamed.replace("ferrite_params", "ferrite_params_2");
-            // Rename extra params (e.g., _ferrite_intermediate_bytes → _2)
-            for param_name in &b_extra_param_names {
-                if renamed.contains(param_name.as_str()) {
-                    renamed = renamed.replace(param_name.as_str(), &format!("{param_name}_2"));
-                }
+        .enumerate()
+        .map(|(phase_idx, params)| {
+            if phase_idx == 0 {
+                return params.clone();
             }
-            renamed
+            let suffix = if phase_idx == 1 {
+                "_2".to_string()
+            } else {
+                format!("_{}", phase_idx + 1)
+            };
+            params
+                .iter()
+                .map(|p| {
+                    if p.contains("ferrite_params") {
+                        p.replace("ferrite_params", &format!("ferrite_params{suffix}"))
+                    } else if let Some(last_word) = p.split_whitespace().last() {
+                        let clean = last_word.trim_end_matches(',');
+                        p.replace(clean, &format!("{clean}{suffix}"))
+                    } else {
+                        p.clone()
+                    }
+                })
+                .collect()
         })
         .collect();
 
-    // Merged register declarations
-    let merged_regs = crate::fuse_real::compute_merged_reg_decls(
-        &proto_a.registers,
-        &proto_b.registers,
-        &offsets,
-    );
+    // Merged register declarations (total across all phases)
+    let merged_regs = {
+        let type_to_prefix: &[(&str, &str)] = &[
+            (".b32", "%r"),
+            (".b64", "%rd"),
+            (".f32", "%f"),
+            (".f64", "%fd"),
+            (".u32", "%r"),
+            (".u64", "%rd"),
+            (".pred", "%p"),
+            (".b16", "%rs"),
+        ];
+        let mut totals: BTreeMap<String, usize> = BTreeMap::new();
+        for proto in &protos {
+            for (ty, count) in &proto.registers {
+                let entry = totals.entry(ty.clone()).or_insert(0);
+                *entry += count;
+            }
+        }
+        let mut result = Vec::new();
+        for (ty, total) in &totals {
+            if let Some((_, prefix)) = type_to_prefix.iter().find(|(t, _)| *t == ty.as_str()) {
+                result.push((ty.clone(), prefix.to_string(), *total));
+            }
+        }
+        result
+    };
 
     // Build PTX
     let mut out = String::new();
     out.push_str(".version 8.8\n.target sm_89\n.address_size 64\n\n");
 
-    // Top-level declarations (extern shared, etc.) — must be before the entry
-    for line in gemm_a_ptx.lines() {
+    // Top-level .extern .shared declarations (from phase 0)
+    for line in phases[0].lines() {
         let t = line.trim();
         if t.starts_with(".extern") && t.contains(".shared") {
             out.push_str(t);
@@ -163,58 +256,29 @@ pub fn sequence_two_gemms(
     }
     out.push('\n');
 
-    // Rename GEMM_B's params to avoid collisions
-    let params_b_renamed: Vec<String> = params_b
-        .iter()
-        .map(|p| {
-            if p.contains("ferrite_params") {
-                p.replace("ferrite_params", "ferrite_params_2")
-            } else {
-                // Rename other params by adding _2 suffix before the last bracket/comma
-                let mut r = p.clone();
-                // For ".param .u64 _ferrite_intermediate_bytes" → "_ferrite_intermediate_bytes_2"
-                if let Some(last_word) = r.split_whitespace().last() {
-                    let clean = last_word.trim_end_matches(',');
-                    r = r.replace(clean, &format!("{clean}_2"));
-                }
-                r
-            }
-        })
-        .collect();
-
+    // Entry with all phases' params concatenated
     out.push_str(&format!(".visible .entry {name}(\n"));
-    let all_params: Vec<&String> = params_a.iter().chain(params_b_renamed.iter()).collect();
-    for (i, p) in all_params.iter().enumerate() {
-        let comma = if i + 1 < all_params.len() { "," } else { "" };
+    let flat_params: Vec<&String> = renamed_params.iter().flat_map(|p| p.iter()).collect();
+    for (i, p) in flat_params.iter().enumerate() {
+        let comma = if i + 1 < flat_params.len() { "," } else { "" };
         out.push_str(&format!("\t{p}{comma}\n"));
     }
     out.push_str(")\n{\n");
 
-    // Register declarations: merge numeric ranges + copy named registers
+    // Register declarations
     for (reg_type, prefix, total) in &merged_regs {
         if *total > 0 {
             out.push_str(&format!("\t.reg {reg_type} \t{prefix}<{total}>;\n"));
         }
     }
 
-    // Copy ALL non-numeric-range .reg declarations from both GEMMs' bodies.
-    // This includes perimeter replacement's %r_ptmp<N>, CUTLASS inline asm's
-    // bare `.reg .pred p;`, and fusion-injected registers (%r_up0, %h_up_a, etc).
-    // We skip declarations that match the standard "%PREFIX<N>" pattern since
-    // those are already handled by the merged numeric ranges above.
-    let mut seen_decls = std::collections::HashSet::new();
+    // Copy non-standard .reg declarations from all phases
     let is_standard_numeric_range = |t: &str| -> bool {
-        // Matches patterns like `.reg .b32 %r<1226>;` — standard ranges
-        // that are already merged by compute_merged_reg_decls
         let prefixes = ["%r<", "%rd<", "%f<", "%p<", "%rs<", "%fd<"];
-        t.contains('<')
-            && prefixes.iter().any(|p| t.contains(p))
-            && !t.contains("_ptmp")
-            && !t.contains("_up")
-            && !t.contains("_act")
-            && !t.contains("_rms")
+        t.contains('<') && prefixes.iter().any(|p| t.contains(p)) && !t.contains('_')
     };
-    for ptx in [gemm_a_ptx, gemm_b_ptx] {
+    let mut seen_decls = HashSet::new();
+    for ptx in phases {
         let lines: Vec<&str> = ptx.lines().collect();
         let mut in_body = false;
         for line in &lines {
@@ -234,9 +298,9 @@ pub fn sequence_two_gemms(
         }
     }
 
-    // SMEM declarations from GEMM_A body (reused by GEMM_B)
+    // SMEM declarations from phase 0 body (reused by all phases)
     {
-        let lines: Vec<&str> = gemm_a_ptx.lines().collect();
+        let lines: Vec<&str> = phases[0].lines().collect();
         let mut in_body = false;
         for line in &lines {
             let t = line.trim();
@@ -252,24 +316,38 @@ pub fn sequence_two_gemms(
             }
         }
     }
+    // Also copy SMEM from later phases (e.g., norm's _ferrite_inv_rms)
+    let mut seen_smem = HashSet::new();
+    for ptx in &phases[1..] {
+        let lines: Vec<&str> = ptx.lines().collect();
+        let mut in_body = false;
+        for line in &lines {
+            let t = line.trim();
+            if t == "{" || t.ends_with('{') {
+                in_body = true;
+                continue;
+            }
+            if !in_body {
+                continue;
+            }
+            if t.starts_with(".shared") && seen_smem.insert(t.to_string()) {
+                out.push_str(&format!("\t{t}\n"));
+            }
+        }
+    }
     out.push('\n');
 
-    // Phase 1: GEMM_A
-    out.push_str("\t// ====== Phase 1: GEMM_A ======\n");
-    for line in &body_a {
-        out.push_str(line);
-        out.push('\n');
-    }
-
-    // Barrier
-    out.push_str("\n\t// ====== Phase barrier ======\n");
-    out.push_str("\tbar.sync \t0;\n\n");
-
-    // Phase 2: GEMM_B (renamed)
-    out.push_str("\t// ====== Phase 2: GEMM_B ======\n");
-    for line in &body_b_renamed {
-        out.push_str(line);
-        out.push('\n');
+    // Emit phases with barriers between them
+    for (phase_idx, body) in renamed_bodies.iter().enumerate() {
+        out.push_str(&format!("\t// ====== Phase {} ======\n", phase_idx + 1));
+        for line in body {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if phase_idx + 1 < renamed_bodies.len() {
+            out.push_str("\n\t// ====== Phase barrier ======\n");
+            out.push_str("\tbar.sync \t0;\n\n");
+        }
     }
 
     out.push_str("}\n");
@@ -2070,8 +2148,8 @@ mod tests {
         );
 
         // Verify structure
-        assert!(sequenced.contains("Phase 1: GEMM_A"), "should have phase 1");
-        assert!(sequenced.contains("Phase 2: GEMM_B"), "should have phase 2");
+        assert!(sequenced.contains("Phase 1"), "should have phase 1");
+        assert!(sequenced.contains("Phase 2"), "should have phase 2");
         assert!(sequenced.contains("bar.sync"), "should have barrier");
         assert!(
             sequenced.contains("ferrite_params_2"),

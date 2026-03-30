@@ -2799,3 +2799,276 @@ fn mlp_block_gpu() {
     assert!(max_diff < 0.1, "MLP block diff too large: {max_diff:.2e}");
     println!("PASS: MLP block matches separate launches");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Segment B: O_proj → norm → gate_up+SiLU → down in ONE kernel launch
+// This is the full Segment B from the tile pipeline architecture.
+// ══════════════════════════════════════════════════════════════════════
+
+const SEGMENT_B_PTX: &str = ptx_fusion_macros::sequence_segment_b!(
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "kernels/vllm_rms_norm.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "kernels/vllm_silu_mul.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "segment_b"
+);
+
+#[test]
+fn segment_b_gpu() {
+    println!("=== Segment B (O_proj → norm → gate_up+SiLU → down): GPU correctness ===");
+
+    // ptxas pre-check
+    let path = "/tmp/segment_b.ptx";
+    std::fs::write(path, SEGMENT_B_PTX).unwrap();
+    let ptxas_out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+    if !ptxas_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ptxas_out.stderr);
+        eprintln!(
+            "ptxas errors ({} total lines):",
+            SEGMENT_B_PTX.lines().count()
+        );
+        for line in stderr.lines().take(20) {
+            eprintln!("  {line}");
+        }
+        panic!("ptxas FAILED on Segment B PTX");
+    }
+    println!("  ptxas: PASS ({} lines)", SEGMENT_B_PTX.lines().count());
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    // Small dims for testing (all same tile config 64x128x32)
+    let m = 64u32;
+    let q_dim = 128u32; // O_proj K dimension
+    let hidden = 128u32; // hidden dim (O_proj N, norm dim, gate_up K)
+    let intermediate = 128u32; // intermediate (gate_up N/2, down K)
+    let gate_up_cols = 2 * intermediate;
+
+    // Test data
+    let h_attn_out: Vec<half::bf16> = (0..(m * q_dim) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_oproj_w: Vec<half::bf16> = (0..(hidden * q_dim) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+    let h_norm_w: Vec<half::bf16> = (0..hidden as usize)
+        .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+        .collect();
+    let h_gateup_w: Vec<half::bf16> = (0..(gate_up_cols * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+        .collect();
+    let h_down_w: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00013 + 0.1).cos() * 0.12))
+        .collect();
+
+    // Reference: 5 separate operations
+    // 1. O_proj GEMM
+    let oproj_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_attn_out,
+        &h_oproj_w,
+        m,
+        hidden,
+        q_dim,
+    );
+    // 2. rms_norm (GPU)
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+    let d_oproj = stream.clone_htod(&oproj_out).unwrap();
+    let d_norm_w = stream.clone_htod(&h_norm_w).unwrap();
+    let mut d_normed: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    let (oproj_p, _) = d_oproj.device_ptr(&stream);
+    let (nw_p, _) = d_norm_w.device_ptr(&stream);
+    let (normed_p, _) = d_normed.device_ptr(&stream);
+    let eps = 1e-5f32;
+    unsafe {
+        stream
+            .launch_builder(&rms_func)
+            .arg(&normed_p)
+            .arg(&oproj_p)
+            .arg(&nw_p)
+            .arg(&eps)
+            .arg(&(hidden as i32))
+            .launch(LaunchConfig {
+                grid_dim: (m, 1, 1),
+                block_dim: (hidden.min(1024), 1, 1),
+                shared_mem_bytes: 0,
+            })
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let normed = stream.clone_dtoh(&d_normed).unwrap();
+    // 3. gate_up GEMM
+    let gateup_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &normed,
+        &h_gateup_w,
+        m,
+        gate_up_cols,
+        hidden,
+    );
+    // 4. SiLU+mul
+    let activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
+        .map(|idx| {
+            let row = idx / intermediate as usize;
+            let col = idx % intermediate as usize;
+            let gate = gateup_out[row * gate_up_cols as usize + col].to_f32();
+            let up = gateup_out[row * gate_up_cols as usize + intermediate as usize + col].to_f32();
+            half::bf16::from_f32(cpu_silu(gate) * up)
+        })
+        .collect();
+    // 5. down GEMM
+    let ref_output = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &activated,
+        &h_down_w,
+        m,
+        hidden,
+        intermediate,
+    );
+
+    // Fused: single kernel launch (Segment B)
+    let d_attn = stream.clone_htod(&h_attn_out).unwrap();
+    let d_oproj_w = stream.clone_htod(&h_oproj_w).unwrap();
+    let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
+    let d_down_w = stream.clone_htod(&h_down_w).unwrap();
+
+    // Intermediate buffers
+    let d_oproj_buf: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    let d_gateup_buf: CudaSlice<half::bf16> =
+        stream.alloc_zeros((m * gate_up_cols) as usize).unwrap();
+    let d_c_scratch: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    let d_output: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+
+    let module = ctx.load_module(Ptx::from_src(SEGMENT_B_PTX)).unwrap();
+    let func = module.load_function("segment_b").unwrap();
+
+    let (attn_p, _) = d_attn.device_ptr(&stream);
+    let (opw_p, _) = d_oproj_w.device_ptr(&stream);
+    let (ob_p, _) = d_oproj_buf.device_ptr(&stream);
+    let (nw2_p, _) = d_norm_w.device_ptr(&stream);
+    let (guw_p, _) = d_gateup_w.device_ptr(&stream);
+    let (gub_p, _) = d_gateup_buf.device_ptr(&stream);
+    let (dw_p, _) = d_down_w.device_ptr(&stream);
+    let (cs_p, _) = d_c_scratch.device_ptr(&stream);
+    let (out_p, _) = d_output.device_ptr(&stream);
+
+    // Phase 0: O_proj params
+    let params_oproj = build_flat_params(
+        attn_p as u64,
+        opw_p as u64,
+        ob_p as u64,
+        ob_p as u64,
+        m,
+        hidden,
+        q_dim,
+        q_dim,
+        q_dim,
+        hidden,
+        hidden,
+        1.0,
+        0.0,
+    );
+    // Phase 1: norm+gate_up params (extra rms params + ferrite_params)
+    let rms_input = ob_p as u64; // reads O_proj output
+    let rms_weight = nw2_p as u64;
+    let rms_hidden = hidden;
+    let rms_stride = hidden as u64;
+    let params_gateup = build_flat_params(
+        ob_p as u64,
+        guw_p as u64,
+        gub_p as u64,
+        gub_p as u64,
+        m,
+        gate_up_cols,
+        hidden,
+        hidden,
+        hidden,
+        gate_up_cols,
+        gate_up_cols,
+        1.0,
+        0.0,
+    );
+    // Phase 2: SiLU+down params
+    let intermediate_bytes = (intermediate as u64) * 2;
+    let params_down = build_flat_params(
+        gub_p as u64,
+        dw_p as u64,
+        cs_p as u64,
+        out_p as u64,
+        m,
+        hidden,
+        intermediate,
+        gate_up_cols,
+        intermediate,
+        hidden,
+        hidden,
+        1.0,
+        0.0,
+    );
+
+    let (gx, gy, _) = compute_grid(m, gate_up_cols, 64, 128);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864 + 512, // GEMM SMEM + inv_rms array
+    };
+
+    // Param order: phase0(ferrite_params), phase1(rms_input, rms_weight, rms_eps,
+    //   rms_hidden, rms_stride, ferrite_params_2), phase2(intermediate_bytes_3, ferrite_params_3)
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&params_oproj)
+            .arg(&rms_input)
+            .arg(&rms_weight)
+            .arg(&eps)
+            .arg(&rms_hidden)
+            .arg(&rms_stride)
+            .arg(&params_gateup)
+            .arg(&intermediate_bytes)
+            .arg(&params_down)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let seg_output = stream.clone_dtoh(&d_output).unwrap();
+
+    // Compare (note: norm uses 128 threads in fused vs hidden threads in separate,
+    // so FP accumulation differs. We compare against GPU separate which also has
+    // this difference at the norm step. The gate_up+SiLU+down chain amplifies it.)
+    let mut max_diff = 0.0f32;
+    for (i, (r, s)) in ref_output.iter().zip(seg_output.iter()).enumerate() {
+        let diff = (r.to_f32() - s.to_f32()).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+        if diff > 1.0 && i < 10 {
+            println!(
+                "  MISMATCH [{i}]: ref={:.4}, seg={:.4}, diff={diff:.2e}",
+                r.to_f32(),
+                s.to_f32()
+            );
+        }
+    }
+    println!("  M={m}: max_diff={max_diff:.2e}");
+    // Tolerance: norm runs with 128 threads (GEMM block) vs 128 threads (hidden=128),
+    // so accumulation order is the same here. Expect near-zero.
+    assert!(max_diff < 0.5, "Segment B diff too large: {max_diff:.2e}");
+    println!("PASS: Segment B matches separate launches");
+}

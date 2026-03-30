@@ -2425,6 +2425,142 @@ pub fn sequence_mlp_block(input: proc_macro::TokenStream) -> proc_macro::TokenSt
     quote! { #sequenced }.into()
 }
 
+/// Sequence O_proj → norm+gate_up → SiLU+down into a single kernel (Segment B).
+///
+/// Arguments: oproj_ptx, oproj_deriv, norm_ptx, gateup_ptx, gateup_deriv,
+///            silu_ptx, down_ptx, down_deriv, name
+#[proc_macro]
+pub fn sequence_segment_b(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let args: Vec<proc_macro::TokenTree> = input.into_iter().collect();
+    let mut strings = Vec::new();
+    for arg in &args {
+        if let proc_macro::TokenTree::Literal(lit) = arg {
+            let s = lit.to_string();
+            if s.starts_with('"') && s.ends_with('"') {
+                strings.push(s[1..s.len() - 1].to_string());
+            }
+        }
+    }
+    if strings.len() < 9 {
+        return quote! { compile_error!("sequence_segment_b! expects 9 string args") }.into();
+    }
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let kernel_base = manifest_dir.parent().unwrap().join("ptx-fusion");
+    let read = |path: &str| -> Result<String, String> {
+        let full = kernel_base.join(path);
+        std::fs::read_to_string(&full).map_err(|e| format!("cannot read {}: {e}", full.display()))
+    };
+
+    macro_rules! rd {
+        ($idx:expr) => {
+            match read(&strings[$idx]) {
+                Ok(s) => s,
+                Err(e) => return quote! { compile_error!(#e) }.into(),
+            }
+        };
+    }
+    let oproj_ptx = rd!(0);
+    let oproj_deriv = rd!(1);
+    let norm_ptx = rd!(2);
+    let gateup_ptx = rd!(3);
+    let gateup_deriv = rd!(4);
+    let silu_ptx = rd!(5);
+    let down_ptx = rd!(6);
+    let down_deriv = rd!(7);
+    let name = &strings[8];
+
+    // Phase 0: O_proj GEMM
+    let (flat_oproj, _) = match perimeter::replace_perimeter(&oproj_ptx, &oproj_deriv, "oproj") {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("oproj: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    // Phase 1: norm → gate_up GEMM
+    let norm_stage = match pipeline::PipelineStage::from_ptx("norm", &norm_ptx, Some("bfloat16")) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("norm: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let gateup_stage = match pipeline::PipelineStage::from_ptx("gateup", &gateup_ptx, None) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("gateup: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let fused_norm_gateup =
+        match pipeline_compile::fuse_reduction_into_gemm(&norm_stage, &gateup_stage, "norm_gateup")
+        {
+            Ok(ptx) => ptx,
+            Err(e) => {
+                let msg = format!("fuse norm+gateup: {e}");
+                return quote! { compile_error!(#msg) }.into();
+            }
+        };
+    let (flat_norm_gateup, _) =
+        match perimeter::replace_perimeter(&fused_norm_gateup, &gateup_deriv, "norm_gateup") {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("norm_gateup perimeter: {e}");
+                return quote! { compile_error!(#msg) }.into();
+            }
+        };
+    let flat_norm_gateup = dedup_reg_declarations(&flat_norm_gateup);
+
+    // Phase 2: SiLU → down GEMM
+    let silu_stage = match pipeline::PipelineStage::from_ptx("silu", &silu_ptx, None) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("silu: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let down_stage = match pipeline::PipelineStage::from_ptx("down", &down_ptx, None) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("down: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let fused_silu_down =
+        match pipeline_compile::fuse_pointwise_into_gemm(&silu_stage, &down_stage, "silu_down") {
+            Ok(ptx) => ptx,
+            Err(e) => {
+                let msg = format!("fuse silu+down: {e}");
+                return quote! { compile_error!(#msg) }.into();
+            }
+        };
+    let (flat_silu_down, _) =
+        match perimeter::replace_perimeter(&fused_silu_down, &down_deriv, "silu_down") {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("silu_down perimeter: {e}");
+                return quote! { compile_error!(#msg) }.into();
+            }
+        };
+    let flat_silu_down = dedup_reg_declarations(&flat_silu_down);
+
+    // Sequence 3 phases
+    let sequenced = match pipeline_compile::sequence_gemm_phases(
+        &[&flat_oproj, &flat_norm_gateup, &flat_silu_down],
+        name,
+    ) {
+        Ok(ptx) => ptx,
+        Err(e) => {
+            let msg = format!("sequence: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    quote! { #sequenced }.into()
+}
+
 /// Count the total bytes of extra `.param` declarations before the flat struct
 /// param (`ferrite_params`) in a fused kernel's PTX entry point.
 ///

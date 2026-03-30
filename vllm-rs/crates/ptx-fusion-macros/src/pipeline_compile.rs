@@ -17,6 +17,188 @@ use crate::pipeline::{
     PipelineStage, ReductionDecomposition, StagePattern, TilePerimeter, TilePortAccess,
 };
 
+/// Sequence two flat-param CUTLASS GEMMs into a single kernel with a barrier.
+///
+/// Both GEMMs must be perimeter-replaced (using ferrite_params flat layout).
+/// The output kernel has two param blocks: `ferrite_params` for GEMM_A and
+/// `ferrite_params_2` for GEMM_B.
+///
+/// GEMM_A runs first, then `bar.sync 0`, then GEMM_B runs.
+/// Both phases reuse the same SMEM (sequential execution).
+/// GEMM_B's registers are offset to avoid collisions with GEMM_A's.
+/// GEMM_B's labels are renamed ($L__BB0 → $L__BB1).
+///
+/// Returns the sequenced PTX kernel.
+pub fn sequence_two_gemms(
+    gemm_a_ptx: &str,
+    gemm_b_ptx: &str,
+    name: &str,
+) -> Result<String, String> {
+    use crate::fuse_real::{compute_register_offsets, offset_all_registers};
+
+    let proto_a = crate::parser::PtxParser::parse(gemm_a_ptx)?;
+    let proto_b = crate::parser::PtxParser::parse(gemm_b_ptx)?;
+
+    let offsets = compute_register_offsets(&proto_a.registers, &proto_b.registers);
+
+    // Extract body lines: everything from after the entry-level `{` to `ret;`,
+    // skipping register and SMEM declarations. Tracks brace depth to handle
+    // inline asm blocks (CUTLASS uses `{ ... }` for inline asm).
+    let extract_body = |ptx: &str| -> Vec<String> {
+        let lines: Vec<&str> = ptx.lines().collect();
+        let mut in_body = false;
+        let mut depth = 0i32;
+        let mut body = Vec::new();
+        for line in &lines {
+            let t = line.trim();
+            if !in_body {
+                // Find the entry-level opening brace
+                if (t == "{" || t.ends_with('{')) && t.contains('{') {
+                    in_body = true;
+                    depth = 1;
+                }
+                continue;
+            }
+            // Track brace depth for inline asm
+            for ch in t.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            // Stop at the entry-level closing brace
+            if depth <= 0 {
+                break;
+            }
+            // Stop at ret (end of kernel body)
+            if t == "ret;" {
+                break;
+            }
+            if t.starts_with(".reg ") || t.starts_with(".shared ") {
+                continue;
+            }
+            body.push(line.to_string());
+        }
+        body
+    };
+
+    let body_a = extract_body(gemm_a_ptx);
+    let body_b = extract_body(gemm_b_ptx);
+
+    // Rename GEMM_B: offset registers, rename labels, rename param block
+    let body_b_renamed: Vec<String> = body_b
+        .iter()
+        .map(|line| {
+            let mut renamed = offset_all_registers(line, &offsets);
+            renamed = renamed.replace("$L__BB0", "$L__BB1");
+            renamed = renamed.replace("ferrite_params", "ferrite_params_2");
+            renamed
+        })
+        .collect();
+
+    // Merged register declarations
+    let merged_regs = crate::fuse_real::compute_merged_reg_decls(
+        &proto_a.registers,
+        &proto_b.registers,
+        &offsets,
+    );
+
+    // Build PTX
+    let mut out = String::new();
+    out.push_str(".version 8.8\n.target sm_89\n.address_size 64\n\n");
+
+    // Top-level declarations (extern shared, etc.) — must be before the entry
+    for line in gemm_a_ptx.lines() {
+        let t = line.trim();
+        if t.starts_with(".extern") && t.contains(".shared") {
+            out.push_str(t);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+
+    out.push_str(&format!(".visible .entry {name}(\n"));
+    out.push_str("\t.param .align 8 .b8 ferrite_params[88],\n");
+    out.push_str("\t.param .align 8 .b8 ferrite_params_2[88]\n");
+    out.push_str(")\n{\n");
+
+    // Register declarations: merge numeric ranges + copy named registers
+    for (reg_type, prefix, total) in &merged_regs {
+        if *total > 0 {
+            out.push_str(&format!("\t.reg {reg_type} \t{prefix}<{total}>;\n"));
+        }
+    }
+
+    // Copy extra register declarations from both GEMMs' bodies.
+    // Perimeter replacement adds %r_ptmp, %p_ptmp, %rd_ptmp declarations
+    // inside the kernel body. These must be included in the sequenced kernel.
+    let mut seen_decls = std::collections::HashSet::new();
+    for ptx in [gemm_a_ptx, gemm_b_ptx] {
+        let lines: Vec<&str> = ptx.lines().collect();
+        let mut in_body = false;
+        for line in &lines {
+            let t = line.trim();
+            if t == "{" || t.ends_with('{') {
+                in_body = true;
+                continue;
+            }
+            if !in_body {
+                continue;
+            }
+            // Include .reg declarations that are NOT numeric ranges (%r<N>).
+            // This catches perimeter replacement's %r_ptmp<N> and CUTLASS
+            // inline asm's bare `.reg .pred p;`
+            if t.starts_with(".reg ") && (t.contains("_ptmp") || !t.contains('%')) {
+                if seen_decls.insert(t.to_string()) {
+                    out.push_str(&format!("\t{t}\n"));
+                }
+            }
+        }
+    }
+
+    // SMEM declarations from GEMM_A body (reused by GEMM_B)
+    {
+        let lines: Vec<&str> = gemm_a_ptx.lines().collect();
+        let mut in_body = false;
+        for line in &lines {
+            let t = line.trim();
+            if t == "{" || t.ends_with('{') {
+                in_body = true;
+                continue;
+            }
+            if !in_body {
+                continue;
+            }
+            if t.starts_with(".shared") {
+                out.push_str(&format!("\t{t}\n"));
+            }
+        }
+    }
+    out.push('\n');
+
+    // Phase 1: GEMM_A
+    out.push_str("\t// ====== Phase 1: GEMM_A ======\n");
+    for line in &body_a {
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // Barrier
+    out.push_str("\n\t// ====== Phase barrier ======\n");
+    out.push_str("\tbar.sync \t0;\n\n");
+
+    // Phase 2: GEMM_B (renamed)
+    out.push_str("\t// ====== Phase 2: GEMM_B ======\n");
+    for line in &body_b_renamed {
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out.push_str("}\n");
+    Ok(out)
+}
+
 /// Compile a fusible segment into a single kernel.
 ///
 /// Takes two `PipelineStage`s and their `TilePerimeter`s, connected by a
@@ -1784,5 +1966,84 @@ mod tests {
         // Should have mul inv_rms and mul weight (same pattern as rms_norm)
         assert!(instrs.iter().any(|i| i.contains("%f_rms_inv")));
         assert!(instrs.iter().any(|i| i.contains("%f_rms_wt")));
+    }
+
+    #[test]
+    fn sequence_two_gemms_ptxas_valid() {
+        // Sequence two CUTLASS GEMMs (same config) into one kernel.
+        // Both need perimeter replacement first to get flat-param layout.
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
+
+        // Perimeter-replace both copies
+        let (flat_a, _entry_a) =
+            crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "gemm_a")
+                .expect("replace_perimeter A");
+        let (flat_b, _entry_b) =
+            crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "gemm_b")
+                .expect("replace_perimeter B");
+
+        let sequenced =
+            sequence_two_gemms(&flat_a, &flat_b, "two_gemm_test").expect("sequence failed");
+
+        eprintln!(
+            "Sequenced two-GEMM kernel: {} lines",
+            sequenced.lines().count()
+        );
+
+        // Verify structure
+        assert!(sequenced.contains("Phase 1: GEMM_A"), "should have phase 1");
+        assert!(sequenced.contains("Phase 2: GEMM_B"), "should have phase 2");
+        assert!(sequenced.contains("bar.sync"), "should have barrier");
+        assert!(
+            sequenced.contains("ferrite_params_2"),
+            "GEMM_B should use ferrite_params_2"
+        );
+        assert!(
+            sequenced.contains("$L__BB1"),
+            "GEMM_B labels should be renamed"
+        );
+        assert!(
+            sequenced.contains("mma.sync"),
+            "should have MMA instructions"
+        );
+
+        // ptxas validation
+        let path = "/tmp/two_gemm_sequenced.ptx";
+        std::fs::write(path, &sequenced).unwrap();
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", path])
+            .output()
+            .expect("ptxas");
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("ptxas stderr:");
+            for line in stderr.lines().take(20) {
+                eprintln!("  {line}");
+            }
+            // Show context around error lines
+            let ptx_lines: Vec<&str> = sequenced.lines().collect();
+            for line in stderr.lines() {
+                if let Some(lnum) = line
+                    .split('(')
+                    .nth(1)
+                    .and_then(|s| s.split(')').next())
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    let start = lnum.saturating_sub(3);
+                    let end = (lnum + 3).min(ptx_lines.len());
+                    for i in start..end {
+                        let marker = if i + 1 == lnum { ">>>" } else { "   " };
+                        eprintln!("{marker} {:4}: {}", i + 1, ptx_lines[i]);
+                    }
+                }
+            }
+            panic!("ptxas FAILED on sequenced two-GEMM kernel");
+        }
+        println!(
+            "PASS: sequenced two-GEMM passes ptxas ({} lines)",
+            sequenced.lines().count()
+        );
     }
 }

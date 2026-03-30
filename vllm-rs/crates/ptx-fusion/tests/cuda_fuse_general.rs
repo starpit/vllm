@@ -1595,6 +1595,162 @@ fn pipeline_fused_norm_gemm_gpu() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// M-sweep test: pipeline-compiled rms_norm+GEMM at ALL M values.
+// This is the Phase 1 gate — the tile index extraction must produce
+// correct m_tile at every M, including M>128 (multiple m_tiles).
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn pipeline_fused_norm_gemm_m_sweep() {
+    println!("=== Pipeline-compiled rms_norm+GEMM: M-sweep ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let k = 896u32; // Qwen 0.5B hidden dim
+    let n = 128u32;
+    let eps = 1e-5f32;
+
+    // Weight vector (shared across all M values)
+    let h_weight: Vec<half::bf16> = (0..k as usize)
+        .map(|i| half::bf16::from_f32(1.0 + (i as f32) * 0.001))
+        .collect();
+    // B matrix (shared)
+    let h_b: Vec<half::bf16> = (0..(n * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+    let d_weight = stream.clone_htod(&h_weight).unwrap();
+    let d_b = stream.clone_htod(&h_b).unwrap();
+
+    let module = ctx
+        .load_module(Ptx::from_src(PIPELINE_FUSED_NORM_GEMM_PTX))
+        .unwrap();
+    let func = module.load_function("pipeline_fused_norm_gemm").unwrap();
+
+    // Load the separate rms_norm kernel for reference
+    let rms_module = ctx.load_module(Ptx::from_src(RMS_NORM_BF16_PTX)).unwrap();
+    let rms_func = rms_module
+        .load_function("_Z15rms_norm_kernelI13__nv_bfloat16EvPT_PKS1_S4_fi")
+        .unwrap();
+
+    let m_values = [1u32, 2, 4, 8, 16, 32, 64, 65, 128, 256, 512];
+    let mut failures = Vec::new();
+
+    for &m in &m_values {
+        // Generate input for this M
+        let h_input: Vec<half::bf16> = (0..(m * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+            .collect();
+
+        // Reference: GPU rms_norm then GPU GEMM (separate launches)
+        let d_ref_input = stream.clone_htod(&h_input).unwrap();
+        let mut d_normed: CudaSlice<half::bf16> = stream.alloc_zeros((m * k) as usize).unwrap();
+        let (ref_inp_p, _) = d_ref_input.device_ptr(&stream);
+        let (ref_nw_p, _) = d_weight.device_ptr(&stream);
+        let (normed_p, _) = d_normed.device_ptr(&stream);
+        unsafe {
+            stream
+                .launch_builder(&rms_func)
+                .arg(&normed_p) // output
+                .arg(&ref_inp_p) // input
+                .arg(&ref_nw_p) // weight
+                .arg(&eps)
+                .arg(&(k as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (m, 1, 1),
+                    block_dim: (k.min(1024), 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
+        let h_normed = stream.clone_dtoh(&d_normed).unwrap();
+
+        let ref_out = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &h_normed,
+            &h_b,
+            m,
+            n,
+            k,
+        );
+
+        // Fused path
+        let d_input = stream.clone_htod(&h_input).unwrap();
+        let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let mut d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+
+        let (input_ptr, _) = d_input.device_ptr(&stream);
+        let (weight_ptr, _) = d_weight.device_ptr(&stream);
+        let (b_ptr, _) = d_b.device_ptr(&stream);
+        let (c_ptr, _) = d_c.device_ptr(&stream);
+        let (d_ptr, _) = d_d.device_ptr(&stream);
+
+        let gemm_params = build_flat_params(
+            input_ptr as u64,
+            b_ptr as u64,
+            c_ptr as u64,
+            d_ptr as u64,
+            m,
+            n,
+            k,
+            k, // lda
+            k, // ldb
+            n, // ldc
+            n, // ldd
+            1.0,
+            0.0,
+        );
+
+        let weight_ptr_val = weight_ptr as u64;
+        let hidden_val = k;
+        let a_ptr_val = input_ptr as u64;
+        let a_stride_val = k as u64;
+
+        let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+        let cfg = LaunchConfig {
+            grid_dim: (gx, gy, gz),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 36864 + 512,
+        };
+
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&a_ptr_val)
+                .arg(&weight_ptr_val)
+                .arg(&eps)
+                .arg(&hidden_val)
+                .arg(&a_stride_val)
+                .arg(&gemm_params)
+                .launch(cfg)
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
+        let fused_out = stream.clone_dtoh(&d_d).unwrap();
+
+        // Compare
+        let mut max_diff = 0.0f32;
+        for (r, f) in ref_out.iter().zip(fused_out.iter()) {
+            let diff = (r.to_f32() - f.to_f32()).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+        }
+
+        let status = if max_diff < 0.1 { "PASS" } else { "FAIL" };
+        println!("  M={m:>4} grid=({gx},{gy},{gz}) max_diff={max_diff:.2e} {status}");
+        if max_diff >= 0.1 {
+            failures.push((m, max_diff));
+        }
+    }
+
+    assert!(failures.is_empty(), "M-sweep failures: {:?}", failures);
+    println!("PASS: all M values correct");
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Prologue isolation test: run JUST the rms_norm reduction prologue
 // and verify inv_rms values against CPU reference.
 // ══════════════════════════════════════════════════════════════════════

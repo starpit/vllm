@@ -256,8 +256,13 @@ pub fn sequence_gemm_phases(phases: &[&str], name: &str) -> Result<String, Strin
     }
     out.push('\n');
 
-    // Entry with all phases' params concatenated
+    let num_barriers = phases.len().saturating_sub(1);
+
+    // Entry with barrier param + all phases' params
     out.push_str(&format!(".visible .entry {name}(\n"));
+    if num_barriers > 0 {
+        out.push_str("\t.param .u64 _phase_barriers,\n");
+    }
     let flat_params: Vec<&String> = renamed_params.iter().flat_map(|p| p.iter()).collect();
     for (i, p) in flat_params.iter().enumerate() {
         let comma = if i + 1 < flat_params.len() { "," } else { "" };
@@ -335,9 +340,27 @@ pub fn sequence_gemm_phases(phases: &[&str], name: &str) -> Result<String, Strin
             }
         }
     }
+    // Global barrier infrastructure (for inter-block synchronization between phases)
+    if num_barriers > 0 {
+        out.push_str("\t// Global barrier registers\n");
+        out.push_str("\t.reg .u64 \t%rd_gbar_ptr;\n");
+        out.push_str("\t.reg .u32 \t%r_gbar_val, %r_gbar_total, %r_gbar_tid;\n");
+        out.push_str("\t.reg .pred \t%p_gbar_t0, %p_gbar_done;\n");
+        out.push_str("\t.shared .align 4 .u32 _gbar_sense[1];\n");
+    }
     out.push('\n');
 
-    // Emit phases with barriers between them
+    // Compute grid total (gridDim.x * gridDim.y) for barrier target
+    if num_barriers > 0 {
+        out.push_str("\t// Compute grid total for global barrier\n");
+        out.push_str("\tmov.u32 \t%r_gbar_total, %nctaid.x;\n");
+        out.push_str("\tmov.u32 \t%r_gbar_val, %nctaid.y;\n");
+        out.push_str("\tmul.lo.u32 \t%r_gbar_total, %r_gbar_total, %r_gbar_val;\n");
+        out.push_str("\tld.param.u64 \t%rd_gbar_ptr, [_phase_barriers];\n");
+        out.push_str("\tcvta.to.global.u64 \t%rd_gbar_ptr, %rd_gbar_ptr;\n\n");
+    }
+
+    // Emit phases with global barriers between them
     for (phase_idx, body) in renamed_bodies.iter().enumerate() {
         out.push_str(&format!("\t// ====== Phase {} ======\n", phase_idx + 1));
         for line in body {
@@ -345,7 +368,32 @@ pub fn sequence_gemm_phases(phases: &[&str], name: &str) -> Result<String, Strin
             out.push('\n');
         }
         if phase_idx + 1 < renamed_bodies.len() {
-            out.push_str("\n\t// ====== Phase barrier ======\n");
+            // Global atomic barrier: all blocks must arrive before any proceeds
+            let barrier_offset = phase_idx * 4; // each barrier is a u32
+            out.push_str(&format!(
+                "\n\t// ====== Global barrier {} (all blocks sync) ======\n",
+                phase_idx + 1
+            ));
+            // First: block-level barrier to ensure all threads in this block are done
+            out.push_str("\tbar.sync \t0;\n");
+            // Thread 0 atomicAdds the global counter
+            out.push_str("\tmov.u32 \t%r_gbar_tid, %tid.x;\n");
+            out.push_str("\tsetp.eq.u32 \t%p_gbar_t0, %r_gbar_tid, 0;\n");
+            out.push_str(&format!(
+                "\t@%p_gbar_t0 atom.global.add.u32 \t%r_gbar_val, [%rd_gbar_ptr+{barrier_offset}], 1;\n"
+            ));
+            // Thread 0 stores arrival count to SMEM for broadcast
+            out.push_str("\t@%p_gbar_t0 add.u32 \t%r_gbar_val, %r_gbar_val, 1;\n");
+            // Spin until all blocks have arrived
+            out.push_str(&format!("$L_gbar_spin_{phase_idx}:\n"));
+            out.push_str(&format!(
+                "\tld.global.acquire.gpu.u32 \t%r_gbar_val, [%rd_gbar_ptr+{barrier_offset}];\n"
+            ));
+            out.push_str("\tsetp.ge.u32 \t%p_gbar_done, %r_gbar_val, %r_gbar_total;\n");
+            out.push_str(&format!(
+                "\t@!%p_gbar_done bra \t$L_gbar_spin_{phase_idx};\n"
+            ));
+            // Block-level barrier after spinning to sync all threads before next phase
             out.push_str("\tbar.sync \t0;\n\n");
         }
     }

@@ -2562,9 +2562,15 @@ fn sequenced_two_gemm_gpu() {
         shared_mem_bytes: 36864, // CUTLASS SMEM for 64x128x32
     };
 
+    // Global barrier counter (1 barrier between 2 phases)
+    let d_barriers: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+    let (bar_ptr, _) = d_barriers.device_ptr(&stream);
+    let bar_ptr_val = bar_ptr as u64;
+
     unsafe {
         stream
             .launch_builder(&func)
+            .arg(&bar_ptr_val)
             .arg(&params_a)
             .arg(&params_b)
             .launch(cfg)
@@ -2767,10 +2773,16 @@ fn mlp_block_gpu() {
         shared_mem_bytes: 36864,
     };
 
-    // Param order: ferrite_params (gate_up), _ferrite_intermediate_bytes_2 (down extra), ferrite_params_2 (down)
+    // Global barrier counter (1 barrier between 2 phases)
+    let d_barriers: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+    let (mlp_bar_ptr, _) = d_barriers.device_ptr(&stream);
+    let mlp_bar_val = mlp_bar_ptr as u64;
+
+    // Param order: _phase_barriers, ferrite_params (gate_up), _ferrite_intermediate_bytes_2 (down extra), ferrite_params_2 (down)
     unsafe {
         stream
             .launch_builder(&func)
+            .arg(&mlp_bar_val)
             .arg(&params_gate_up)
             .arg(&intermediate_bytes)
             .arg(&params_down)
@@ -3029,11 +3041,17 @@ fn segment_b_gpu() {
         shared_mem_bytes: 36864 + 512, // GEMM SMEM + inv_rms array
     };
 
-    // Param order: phase0(ferrite_params), phase1(rms_input, rms_weight, rms_eps,
+    // Global barrier counters (2 barriers between 3 phases)
+    let d_barriers: CudaSlice<u32> = stream.alloc_zeros(2).unwrap();
+    let (seg_bar_ptr, _) = d_barriers.device_ptr(&stream);
+    let seg_bar_val = seg_bar_ptr as u64;
+
+    // Param order: _phase_barriers, phase0(ferrite_params), phase1(rms_input, rms_weight, rms_eps,
     //   rms_hidden, rms_stride, ferrite_params_2), phase2(intermediate_bytes_3, ferrite_params_3)
     unsafe {
         stream
             .launch_builder(&func)
+            .arg(&seg_bar_val)
             .arg(&params_oproj)
             .arg(&rms_input)
             .arg(&rms_weight)

@@ -574,7 +574,7 @@ fn build_reduction_computation(
     );
 
     // Extract tile dimensions from the GEMM's mangled entry name
-    let (tile_m, _tile_n, _tile_k) = extract_gemm_shape_from_entry(&_gemm.protocol.name)
+    let (tile_m, tile_n, _tile_k) = extract_gemm_shape_from_entry(&_gemm.protocol.name)
         .ok_or_else(|| {
             format!(
                 "could not extract GemmShape from GEMM entry name: {}",
@@ -587,6 +587,7 @@ fn build_reduction_computation(
         &reduction.source_lines,
         thread_map.as_ref(),
         tile_m,
+        tile_n,
         &tile_index,
         has_writeback,
     );
@@ -858,7 +859,8 @@ fn build_prologue_from_decomposition(
     source_lines: &[String],
     thread_map: Option<&ThreadRowMap>,
     tile_m: u32,
-    tile_index: &TileIndexMap,
+    tile_n: u32,
+    _tile_index: &TileIndexMap,
     has_writeback: bool,
 ) -> Vec<String> {
     let lane_shr = thread_map.map_or(2, |tm| tm.lanes_per_row_log2);
@@ -958,19 +960,60 @@ fn build_prologue_from_decomposition(
     prologue
         .push("// FERRITE: rms_norm prologue (transplanted from extracted bf16 kernel PTX)".into());
 
-    // m_tile and n_tile are computed by the GEMM body's entry block (before the
-    // prologue is injected). We read them directly from the GEMM's registers.
-    // This is the extracted tile index — no reimplementation, no swizzle bugs.
-    let m_tile = &tile_index.m_tile_reg;
-    let n_tile = &tile_index.n_tile_reg;
+    // Emit the tile index computation register-renamed into the prologue.
+    // We can't reference the GEMM body's m_tile/n_tile registers directly because
+    // perimeter replacement rewrites the ld.param for swizzle_log, which shifts
+    // which register ends up holding m_tile. Instead, we re-derive m_tile from
+    // %ctaid.x using the extracted PTX lines (register-renamed to %r_rms_* namespace).
+    //
+    // The extracted lines contain an ld.param for swizzle_log from the CUTLASS
+    // struct param. After perimeter replacement, that param is gone. We replace
+    // the ld.param with an inline computation of swizzle_log from N (at ferrite_params+68).
+    prologue.push("// Tile index: extracted from GEMM PTX, register-renamed".into());
 
+    // Emit swizzle_log computation from N (replaces the ld.param for swizzle_log).
+    // swizzle_log = floor(log2(min(ceil(N / tile_n), 4)))
+    // For ThreadblockSwizzle<4>, the values are 0, 1, or 2.
+    let tile_n_shift = tile_n.trailing_zeros();
+
+    // Inline swizzle_log: load N, compute n_tiles = ceil(N/tile_n), then log2
+    prologue.push("ld.param.s32 \t%r_rms_step, [ferrite_params+68];".into()); // N
     prologue.push(format!(
-        "// Tile index from GEMM PTX: m_tile={m_tile}, n_tile={n_tile}"
+        "add.s32 \t%r_rms_step, %r_rms_step, {};",
+        tile_n - 1
     ));
-    prologue.push(format!("mov.u32 \t%r_rms_mtile, {m_tile};"));
+    prologue.push(format!(
+        "shr.u32 \t%r_rms_step, %r_rms_step, {tile_n_shift};"
+    )); // n_tiles = ceil(N/tile_n)
+    // swizzle_log = 0 if n_tiles < 2, 1 if n_tiles < 3, 2 otherwise
+    // (ThreadblockSwizzle<4> uses bits = log2(min(n_tiles, 4)))
+    prologue.push("mov.u32 \t%r_rms_nrows, 0;".into());
+    prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_step, 2;".into());
+    prologue.push("@%p_rms_lp mov.u32 \t%r_rms_nrows, 1;".into());
+    prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_step, 4;".into());
+    prologue.push("@%p_rms_lp mov.u32 \t%r_rms_nrows, 2;".into());
+    // %r_rms_nrows = swizzle_log
 
-    // Writeback guard: only the first N-tile (n_tile == 0) writes back.
-    prologue.push(format!("setp.eq.u32 \t%p_rms_wb, {n_tile}, 0;"));
+    // Now emit the swizzle computation using the same logic as the GEMM body,
+    // but with our own registers. This is the CUTLASS GemmIdentityThreadblockSwizzle<4>:
+    //   m_tile = ctaid.x >> swizzle_log
+    //   mask = (1 << swizzle_log) - 1      [equivalently: ~((-1) << swizzle_log)]
+    //   n_group = ctaid.x & mask
+    //   n_tile = n_group + (ctaid.y << swizzle_log)
+    prologue.push("mov.u32 \t%r_rms_mtile, %ctaid.x;".into());
+    prologue.push("shr.u32 \t%r_rms_step, %r_rms_mtile, %r_rms_nrows;".into());
+    // n_tile for writeback guard:
+    prologue.push("mov.u32 \t%r_rms_k, -1;".into());
+    prologue.push("shl.b32 \t%r_rms_k, %r_rms_k, %r_rms_nrows;".into());
+    prologue.push("not.b32 \t%r_rms_k, %r_rms_k;".into());
+    prologue.push("and.b32 \t%r_rms_k, %r_rms_mtile, %r_rms_k;".into()); // n_group
+    prologue.push("mov.u32 \t%r_rms_mtile, %ctaid.y;".into());
+    prologue.push("shl.b32 \t%r_rms_mtile, %r_rms_mtile, %r_rms_nrows;".into());
+    prologue.push("add.s32 \t%r_rms_k, %r_rms_k, %r_rms_mtile;".into()); // n_tile
+    prologue.push("setp.eq.u32 \t%p_rms_wb, %r_rms_k, 0;".into());
+    // Recover m_tile into %r_rms_mtile
+    prologue.push("mov.u32 \t%r_rms_mtile, %ctaid.x;".into());
+    prologue.push("shr.u32 \t%r_rms_mtile, %r_rms_mtile, %r_rms_nrows;".into());
 
     // Row loop: iterate over min(tile_m, M - m_tile * tile_m) rows
     // Read M from ferrite_params[64] to handle partial tiles at boundary

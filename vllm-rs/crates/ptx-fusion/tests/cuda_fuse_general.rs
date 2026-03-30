@@ -1436,7 +1436,8 @@ fn fused_norm_gemm_model_dims() {
 const PIPELINE_FUSED_NORM_GEMM_PTX: &str = ptx_fusion_macros::pipeline_fuse!(
     "kernels/vllm_rms_norm.ptx",
     "kernels/cutlass_bf16_64x128x32_sm89.ptx",
-    "pipeline_fused_norm_gemm"
+    "pipeline_fused_norm_gemm",
+    "bfloat16"
 );
 
 #[test]

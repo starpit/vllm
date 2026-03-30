@@ -1185,6 +1185,73 @@ mod tests {
     }
 
     #[test]
+    fn tile_perimeter_from_fused_add_rms_norm() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let stage = PipelineStage::from_ptx(
+            "fused_add_rms_norm",
+            ptx,
+            Some("fused_add_rms_norm_kernelI13__nv_bfloat16"),
+        )
+        .expect("parse");
+        let perim = TilePerimeter::from_stage(&stage).expect("extract perimeter");
+
+        assert_eq!(perim.kind, StageKind::Reduction);
+        assert!(perim.tile_index.is_none(), "reduction inherits tile index");
+
+        // Should have sum_sq carry
+        assert!(!perim.carries.is_empty(), "should have sum_sq carry");
+        assert_eq!(perim.carries[0].name, "sum_sq");
+
+        // Should have finalization with rsqrt
+        assert!(perim.finalization.is_some(), "should have finalization");
+        let fin = perim.finalization.as_ref().unwrap();
+        assert!(
+            fin.lines.iter().any(|l| l.contains("rsqrt")),
+            "finalization should contain rsqrt"
+        );
+        assert!(!fin.result_reg.is_empty(), "should have result register");
+
+        // Should have inline formula output with mul.f32 (normalize)
+        let formula_port = perim.outputs.iter().find(|p| p.name == "normalized");
+        assert!(formula_port.is_some(), "should have normalized output");
+        match &formula_port.unwrap().access {
+            TilePortAccess::InlineFormula { emit_body } => {
+                assert!(!emit_body.is_empty(), "emit body should have instructions");
+                // fused_add_rms_norm emit body:
+                // The add (residual + hs) happens in the ACCUMULATE phase (with writeback).
+                // The emit phase reads the already-added result and normalizes:
+                // - ld.global (load the summed residual)
+                // - ld.global.nc (load weight)
+                // - mul.f32 (input * inv_rms, then result * weight)
+                // - cvt.rn.bf16 + st.global (store normalized output)
+                let has_mul = emit_body.iter().any(|l| l.contains("mul.f32"));
+                assert!(has_mul, "emit body should contain mul.f32 (normalize)");
+                let has_store = emit_body.iter().any(|l| l.contains("st.global"));
+                assert!(has_store, "emit body should store normalized output");
+                let has_load = emit_body.iter().any(|l| l.contains("ld.global"));
+                assert!(has_load, "emit body should load from GMEM");
+            }
+            other => panic!("normalized should be InlineFormula, got {:?}", other),
+        }
+
+        eprintln!("fused_add_rms_norm TilePerimeter:");
+        eprintln!(
+            "  carries: {} ({} regs)",
+            perim.carries[0].name,
+            perim.carries[0].registers.len()
+        );
+        eprintln!(
+            "  finalization: {} lines, result={}",
+            fin.lines.len(),
+            fin.result_reg
+        );
+        eprintln!("  params: {}", stage.protocol.params.len());
+        for (i, p) in stage.protocol.params.iter().enumerate() {
+            eprintln!("    param_{i}: {} ({})", p.name, p.ptx_type);
+        }
+    }
+
+    #[test]
     fn tile_perimeter_all_cutlass_configs() {
         let configs = [
             (

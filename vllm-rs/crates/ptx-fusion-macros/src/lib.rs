@@ -2561,6 +2561,71 @@ pub fn sequence_segment_b(input: proc_macro::TokenStream) -> proc_macro::TokenSt
     quote! { #sequenced }.into()
 }
 
+/// Wrap a flat-param CUTLASS GEMM in a persistent work-queue loop.
+///
+/// Usage:
+/// ```ignore
+/// const PTX: &str = ptx_fusion_macros::persistent_gemm!(
+///     "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+///     "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+///     "persistent_gemm"
+/// );
+/// ```
+#[proc_macro]
+pub fn persistent_gemm(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let args: Vec<proc_macro::TokenTree> = input.into_iter().collect();
+    let mut strings = Vec::new();
+    for arg in &args {
+        if let proc_macro::TokenTree::Literal(lit) = arg {
+            let s = lit.to_string();
+            if s.starts_with('"') && s.ends_with('"') {
+                strings.push(s[1..s.len() - 1].to_string());
+            }
+        }
+    }
+    if strings.len() < 3 {
+        return quote! { compile_error!("persistent_gemm! expects 3 args: ptx, derivations, name") }
+            .into();
+    }
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let kernel_base = manifest_dir.parent().unwrap().join("ptx-fusion");
+    let read = |path: &str| -> Result<String, String> {
+        let full = kernel_base.join(path);
+        std::fs::read_to_string(&full).map_err(|e| format!("cannot read {}: {e}", full.display()))
+    };
+
+    let gemm_ptx = match read(&strings[0]) {
+        Ok(s) => s,
+        Err(e) => return quote! { compile_error!(#e) }.into(),
+    };
+    let deriv_json = match read(&strings[1]) {
+        Ok(s) => s,
+        Err(e) => return quote! { compile_error!(#e) }.into(),
+    };
+    let name = &strings[2];
+
+    // Perimeter-replace
+    let (flat_ptx, _) = match perimeter::replace_perimeter(&gemm_ptx, &deriv_json, name) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("persistent_gemm perimeter: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    // Wrap in persistent loop
+    let persistent = match persistent::make_persistent_gemm(&flat_ptx, name) {
+        Ok(ptx) => ptx,
+        Err(e) => {
+            let msg = format!("persistent_gemm wrap: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    quote! { #persistent }.into()
+}
+
 /// Count the total bytes of extra `.param` declarations before the flat struct
 /// param (`ferrite_params`) in a fused kernel's PTX entry point.
 ///

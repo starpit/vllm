@@ -402,6 +402,261 @@ pub fn sequence_gemm_phases(phases: &[&str], name: &str) -> Result<String, Strin
     Ok(out)
 }
 
+/// Wrap a multi-phase sequenced kernel in a persistent work-queue loop.
+///
+/// Transforms the global barrier model (all blocks sync between phases) into
+/// a persistent model where `num_blocks` blocks loop over tiles across all phases.
+///
+/// The work queue is organized as: all Phase 0 tiles, then all Phase 1 tiles, etc.
+/// Per-M-tile atomic counters ensure Phase N+1 tiles don't start until their
+/// M-tile's Phase N tiles are complete.
+///
+/// Params added:
+/// - `_persistent_counter`: u64 ptr to atomic tile counter (u32, init to 0)
+/// - `_persistent_mtile_done`: u64 ptr to per-M-tile completion counters
+///   (array of u32, one per M-tile per barrier, all init to 0)
+/// - `_persistent_total_tiles`: u32 total tiles across all phases
+///
+/// Grid dims for each phase are baked as constants from the phase params
+/// (read M, N from ferrite_params at compile time is not possible, so the
+/// caller passes the tile counts).
+pub fn make_persistent_multiphase(
+    sequenced_ptx: &str,
+    name: &str,
+    num_phases: usize,
+    tiles_per_phase: &[u32], // [total_tiles_phase0, total_tiles_phase1, ...]
+    n_tiles_per_phase: &[u32], // [n_tiles for phase 0, n_tiles for phase 1, ...]
+) -> Result<String, String> {
+    if tiles_per_phase.len() != num_phases || n_tiles_per_phase.len() != num_phases {
+        return Err("tiles_per_phase and n_tiles_per_phase must match num_phases".into());
+    }
+
+    let total_tiles: u32 = tiles_per_phase.iter().sum();
+    let mut cumulative_tiles = vec![0u32]; // cumulative[i] = sum of tiles for phases 0..i-1
+    for &t in tiles_per_phase {
+        cumulative_tiles.push(cumulative_tiles.last().unwrap() + t);
+    }
+
+    let mut lines: Vec<String> = sequenced_ptx.lines().map(|l| l.to_string()).collect();
+
+    // Find and rename entry
+    let entry_idx = lines
+        .iter()
+        .position(|l| l.contains(".visible") && l.contains(".entry"))
+        .ok_or("no .entry found")?;
+    let old_name = {
+        let line = &lines[entry_idx];
+        let pos = line.find(".entry").unwrap();
+        let after = line[pos + 6..].trim();
+        let paren = after.find('(').ok_or("no '(' in entry")?;
+        after[..paren].trim().to_string()
+    };
+    lines[entry_idx] = lines[entry_idx].replace(&old_name, name);
+
+    // Add persistent params before existing params
+    let first_param_idx = lines
+        .iter()
+        .position(|l| l.trim().starts_with(".param"))
+        .ok_or("no .param found")?;
+    let persistent_params = vec![
+        "\t.param .u64 _persistent_counter,".to_string(),
+        "\t.param .u64 _persistent_mtile_done,".to_string(),
+        format!("\t.param .u32 _persistent_total_tiles, // = {total_tiles}"),
+    ];
+    for (j, p) in persistent_params.iter().enumerate().rev() {
+        lines.insert(first_param_idx, p.clone());
+    }
+
+    // Find body start (after '{')
+    let body_start = lines
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t == "{" || t.ends_with('{')
+        })
+        .ok_or("no '{' found")?;
+
+    let mut insert_pos = body_start + 1;
+    // Skip past declarations
+    while insert_pos < lines.len() {
+        let t = lines[insert_pos].trim();
+        if !t.starts_with(".reg")
+            && !t.starts_with(".shared")
+            && !t.starts_with(".local")
+            && !t.starts_with("//")
+            && !t.is_empty()
+        {
+            break;
+        }
+        insert_pos += 1;
+    }
+
+    // Insert persistent declarations
+    let decls = vec![
+        "\t// FERRITE: persistent multi-phase scratch".to_string(),
+        "\t.reg .u32 \t%r_ptile, %r_ptotal, %r_pphase;".to_string(),
+        "\t.reg .u32 \t%r_pm_tile, %r_pn_tile, %r_poffs;".to_string(),
+        "\t.reg .u64 \t%rd_pctr, %rd_pmtdone;".to_string(),
+        "\t.reg .pred \t%p_pdone, %p_pt0, %p_pphase;".to_string(),
+        "\t.shared .align 4 .u32 _ptile_smem[1];".to_string(),
+        String::new(),
+    ];
+    for (j, d) in decls.iter().enumerate() {
+        lines.insert(insert_pos + j, d.clone());
+    }
+    insert_pos += decls.len();
+
+    // Insert persistent loop preamble
+    let preamble = vec![
+        "\t// FERRITE: persistent loop setup".to_string(),
+        "\tld.param.u64 \t%rd_pctr, [_persistent_counter];".to_string(),
+        "\tcvta.to.global.u64 \t%rd_pctr, %rd_pctr;".to_string(),
+        "\tld.param.u64 \t%rd_pmtdone, [_persistent_mtile_done];".to_string(),
+        "\tcvta.to.global.u64 \t%rd_pmtdone, %rd_pmtdone;".to_string(),
+        "\tld.param.u32 \t%r_ptotal, [_persistent_total_tiles];".to_string(),
+        String::new(),
+        "$L_persistent_loop:".to_string(),
+        "\t// Grab next tile".to_string(),
+        "\tmov.u32 \t%r_ptile, %tid.x;".to_string(),
+        "\tsetp.eq.u32 \t%p_pt0, %r_ptile, 0;".to_string(),
+        "\t@%p_pt0 atom.global.add.u32 \t%r_ptile, [%rd_pctr], 1;".to_string(),
+        "\t@%p_pt0 st.shared.u32 \t[_ptile_smem], %r_ptile;".to_string(),
+        "\tbar.sync \t14;".to_string(),
+        "\tld.shared.u32 \t%r_ptile, [_ptile_smem];".to_string(),
+        "\tsetp.ge.u32 \t%p_pdone, %r_ptile, %r_ptotal;".to_string(),
+        "\t@%p_pdone bra \t$L_persistent_exit;".to_string(),
+        String::new(),
+    ];
+    for (j, line) in preamble.iter().enumerate() {
+        lines.insert(insert_pos + j, line.clone());
+    }
+    insert_pos += preamble.len();
+
+    // Insert phase dispatch: determine which phase this tile belongs to
+    // and compute (m_tile, n_tile) within that phase.
+    // Then jump to the appropriate phase label.
+    let mut dispatch = Vec::new();
+    dispatch.push("\t// Phase dispatch: tile_idx → phase + (m_tile, n_tile)".to_string());
+    for phase_idx in 0..num_phases {
+        let cum = cumulative_tiles[phase_idx];
+        let n_tiles = n_tiles_per_phase[phase_idx];
+        let phase_label = format!("$L_phase_{phase_idx}");
+        let next_label = if phase_idx + 1 < num_phases {
+            format!("$L_phase_check_{}", phase_idx + 1)
+        } else {
+            "$L_persistent_loop_back".to_string()
+        };
+
+        if phase_idx == 0 {
+            dispatch.push(format!(
+                "\tsetp.lt.u32 \t%p_pphase, %r_ptile, {};",
+                cumulative_tiles[1]
+            ));
+            dispatch.push(format!("\t@%p_pphase bra \t{phase_label};"));
+        } else {
+            dispatch.push(format!("$L_phase_check_{phase_idx}:"));
+            if phase_idx + 1 < num_phases {
+                dispatch.push(format!(
+                    "\tsetp.lt.u32 \t%p_pphase, %r_ptile, {};",
+                    cumulative_tiles[phase_idx + 1]
+                ));
+                dispatch.push(format!("\t@%p_pphase bra \t{phase_label};"));
+            } else {
+                dispatch.push(format!("\tbra \t{phase_label};"));
+            }
+        }
+    }
+    dispatch.push(String::new());
+
+    // Phase entry points: compute m_tile, n_tile, set %ctaid.x/%ctaid.y equivalents
+    for phase_idx in 0..num_phases {
+        let cum = cumulative_tiles[phase_idx];
+        let n_tiles = n_tiles_per_phase[phase_idx];
+
+        dispatch.push(format!("$L_phase_{phase_idx}:"));
+        // Subtract cumulative offset to get tile index within this phase
+        if cum > 0 {
+            dispatch.push(format!("\tsub.u32 \t%r_poffs, %r_ptile, {cum};"));
+        } else {
+            dispatch.push("\tmov.u32 \t%r_poffs, %r_ptile;".to_string());
+        }
+        // Decode: m_tile = poffs / n_tiles, n_tile = poffs % n_tiles
+        dispatch.push(format!("\tdiv.u32 \t%r_pm_tile, %r_poffs, {n_tiles};"));
+        dispatch.push(format!("\trem.u32 \t%r_pn_tile, %r_poffs, {n_tiles};"));
+
+        // TODO: per-M-tile barrier for phase > 0
+        // For now: phase 0 tiles run immediately, phase 1+ tiles need to wait
+        // until all phase (idx-1) N-tiles for their M-tile are done.
+        if phase_idx > 0 {
+            let prev_n_tiles = n_tiles_per_phase[phase_idx - 1];
+            let barrier_idx = phase_idx - 1;
+            // Spin until mtile_done[m_tile * num_barriers + barrier_idx] >= prev_n_tiles
+            dispatch.push(format!(
+                "\t// Wait for M-tile's Phase {} to complete",
+                phase_idx - 1
+            ));
+            // Compute barrier address: &mtile_done[m_tile * {num_barriers} + {barrier_idx}]
+            let num_barriers = num_phases - 1;
+            dispatch.push(format!(
+                "\tmul.lo.u32 \t%r_poffs, %r_pm_tile, {num_barriers};"
+            ));
+            dispatch.push(format!("\tadd.u32 \t%r_poffs, %r_poffs, {barrier_idx};"));
+            dispatch.push("\tshl.b32 \t%r_poffs, %r_poffs, 2;".to_string()); // * 4 bytes
+            dispatch.push("\tcvt.u64.u32 \t%rd_pctr, %r_poffs;".to_string()); // reuse rd_pctr temporarily
+            dispatch.push("\tadd.u64 \t%rd_pctr, %rd_pmtdone, %rd_pctr;".to_string());
+            dispatch.push(format!("$L_mtile_wait_{phase_idx}:"));
+            dispatch.push("\tld.global.acquire.gpu.u32 \t%r_poffs, [%rd_pctr];".to_string());
+            dispatch.push(format!(
+                "\tsetp.ge.u32 \t%p_pdone, %r_poffs, {prev_n_tiles};"
+            ));
+            dispatch.push(format!("\t@!%p_pdone bra \t$L_mtile_wait_{phase_idx};"));
+            // Restore rd_pctr to the persistent counter
+            dispatch.push("\tld.param.u64 \t%rd_pctr, [_persistent_counter];".to_string());
+            dispatch.push("\tcvta.to.global.u64 \t%rd_pctr, %rd_pctr;".to_string());
+        }
+
+        // Set ctaid.x/y equivalents — the GEMM body reads these
+        // For the swizzle: ctaid.x encodes both m_tile and n_tile
+        // ctaid.x = m_tile * swizzle_tile + (n_tile % swizzle_tile)
+        // ctaid.y = n_tile / swizzle_tile
+        // But the sequenced kernel already has the swizzle computation in each phase.
+        // We just need to set ctaid.x and ctaid.y to the dispatched values.
+        // Problem: we can't SET %ctaid.x — it's a read-only special register.
+        // The existing make_persistent replaces `mov.u32 %rN, %ctaid.x` with
+        // `mov.u32 %rN, %r_ptile`. We need a similar approach but phase-aware.
+        // For now, store the linear tile index and let the swizzle in each phase body
+        // decode it correctly. But each phase has different N dims...
+        //
+        // Actually: set %r_ptile to the SWIZZLED ctaid.x value that the GEMM expects.
+        // ctaid.x = m_tile * tile + (n_tile & (tile-1))
+        // ctaid.y = n_tile >> swizzle_log
+        // But swizzle_log depends on n_tiles which varies per phase.
+        //
+        // Simplest correct approach: compute the swizzled ctaid.x and ctaid.y values
+        // from (m_tile, n_tile) and replace %ctaid.x/%ctaid.y reads.
+        // But we can't replace %ctaid.y reads because the register rename only
+        // handles %ctaid.x in make_persistent...
+        //
+        // For phase 0: jump to the phase 0 body start
+        // For phase 1+: jump to the phase N body start (after the previous barrier)
+        dispatch.push(format!("\tbra \t$L_phase_body_{phase_idx};"));
+        dispatch.push(String::new());
+    }
+
+    // Insert dispatch code
+    for (j, line) in dispatch.iter().enumerate() {
+        lines.insert(insert_pos + j, line.clone());
+    }
+
+    // TODO: Insert phase body labels ($L_phase_body_N) at the start of each phase
+    // TODO: Replace %ctaid.x with the dispatched m/n tile values
+    // TODO: Add per-M-tile completion counter increment at end of each phase
+    // TODO: Replace ret; with loop back
+
+    // For now, return what we have as a structural proof
+    Ok(lines.join("\n"))
+}
+
 /// Compile a fusible segment into a single kernel.
 ///
 /// Takes two `PipelineStage`s and their `TilePerimeter`s, connected by a

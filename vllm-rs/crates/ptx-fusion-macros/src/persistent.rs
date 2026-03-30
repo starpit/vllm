@@ -151,6 +151,138 @@ pub fn make_persistent(
     Ok(lines.join("\n"))
 }
 
+/// Wrap a flat-param CUTLASS GEMM in a persistent work-queue loop.
+///
+/// Unlike `make_persistent` (which only replaces %ctaid.x for 1D grids),
+/// this handles the 2D swizzled grid by replacing BOTH %ctaid.x and %ctaid.y.
+///
+/// The linear tile index from the atomic counter is decomposed:
+///   ctaid_x = tile_idx % grid_x
+///   ctaid_y = tile_idx / grid_x
+///
+/// Added params (prepended):
+///   - `_persistent_counter`: u64 ptr to atomic u32 tile counter (init to 0)
+///   - `_persistent_grid_x`: u32 grid dim X (swizzled)
+///   - `_persistent_total`: u32 total tiles (grid_x * grid_y)
+pub fn make_persistent_gemm(ptx: &str, new_name: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = ptx.lines().map(|l| l.to_string()).collect();
+
+    // Rename entry
+    let entry_idx = lines
+        .iter()
+        .position(|l| l.contains(".visible") && l.contains(".entry"))
+        .ok_or("no .entry found")?;
+    let old_name = extract_entry_name(&lines[entry_idx]).ok_or("could not parse entry name")?;
+    lines[entry_idx] = lines[entry_idx].replace(&old_name, new_name);
+
+    // Insert persistent params before existing params
+    let first_param_idx = lines
+        .iter()
+        .position(|l| l.trim().starts_with(".param"))
+        .ok_or("no .param found")?;
+    for p in [
+        "\t.param .u32 _persistent_total,",
+        "\t.param .u32 _persistent_grid_x,",
+        "\t.param .u64 _persistent_counter,",
+    ] {
+        lines.insert(first_param_idx, p.to_string());
+    }
+
+    // Find body start
+    let body_start = lines
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t == "{" || t.ends_with('{')
+        })
+        .ok_or("no '{' found")?;
+
+    // Find first instruction after declarations
+    let mut insert_pos = body_start + 1;
+    while insert_pos < lines.len() {
+        let t = lines[insert_pos].trim();
+        if !t.starts_with(".reg")
+            && !t.starts_with(".shared")
+            && !t.starts_with(".local")
+            && !t.starts_with("//")
+            && !t.is_empty()
+        {
+            break;
+        }
+        insert_pos += 1;
+    }
+
+    // Insert declarations
+    let decls = [
+        "\t// FERRITE: persistent GEMM scratch",
+        "\t.reg .u32 \t%r_ptile, %r_ptile_x, %r_ptile_y;",
+        "\t.reg .u32 \t%r_pgrid_x, %r_ptotal;",
+        "\t.reg .u64 \t%rd_pctr;",
+        "\t.reg .pred \t%p_pdone, %p_pt0;",
+        "\t.shared .align 4 .u32 _ptile_smem[1];",
+        "",
+    ];
+    for (j, d) in decls.iter().enumerate() {
+        lines.insert(insert_pos + j, d.to_string());
+    }
+    insert_pos += decls.len();
+
+    // Insert persistent loop
+    let preamble = [
+        "\t// FERRITE: persistent loop",
+        "\tld.param.u64 \t%rd_pctr, [_persistent_counter];",
+        "\tcvta.to.global.u64 \t%rd_pctr, %rd_pctr;",
+        "\tld.param.u32 \t%r_ptotal, [_persistent_total];",
+        "\tld.param.u32 \t%r_pgrid_x, [_persistent_grid_x];",
+        "",
+        "$L_persistent_loop:",
+        "\t// Grab next tile (thread 0 atomicAdd, broadcast via SMEM)",
+        "\tmov.u32 \t%r_ptile, %tid.x;",
+        "\tsetp.eq.u32 \t%p_pt0, %r_ptile, 0;",
+        "\t@%p_pt0 atom.global.add.u32 \t%r_ptile, [%rd_pctr], 1;",
+        "\t@%p_pt0 st.shared.u32 \t[_ptile_smem], %r_ptile;",
+        "\tbar.sync \t14;",
+        "\tld.shared.u32 \t%r_ptile, [_ptile_smem];",
+        "\tsetp.ge.u32 \t%p_pdone, %r_ptile, %r_ptotal;",
+        "\t@%p_pdone bra \t$L_persistent_exit;",
+        "",
+        "\t// Decompose linear tile to (ctaid_x, ctaid_y)",
+        "\trem.u32 \t%r_ptile_x, %r_ptile, %r_pgrid_x;",
+        "\tdiv.u32 \t%r_ptile_y, %r_ptile, %r_pgrid_x;",
+        "",
+    ];
+    for (j, line) in preamble.iter().enumerate() {
+        lines.insert(insert_pos + j, line.to_string());
+    }
+
+    // Replace ctaid.x and ctaid.y reads
+    for line in &mut lines {
+        if line.contains("%ctaid.x") && line.contains("mov.u32") {
+            *line = line.replace("%ctaid.x", "%r_ptile_x");
+        }
+        if line.contains("%ctaid.y") && line.contains("mov.u32") {
+            *line = line.replace("%ctaid.y", "%r_ptile_y");
+        }
+    }
+
+    // Replace ret; with loop back + exit
+    let ret_idx = lines
+        .iter()
+        .rposition(|l| l.trim() == "ret;")
+        .ok_or("no ret; found")?;
+
+    lines[ret_idx] = [
+        "\tbar.sync \t15;",
+        "\tbra \t$L_persistent_loop;",
+        "",
+        "$L_persistent_exit:",
+        "\tret;",
+    ]
+    .join("\n");
+
+    Ok(lines.join("\n"))
+}
+
 fn extract_entry_name(line: &str) -> Option<String> {
     // .visible .entry name(
     let entry_pos = line.find(".entry")?;

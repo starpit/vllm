@@ -3321,3 +3321,154 @@ fn segment_b_m_sweep() {
     );
     println!("PASS: Segment B all M values correct");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Persistent GEMM: work-queue loop with 2D ctaid dispatch
+// ══════════════════════════════════════════════════════════════════════
+
+const PERSISTENT_GEMM_PTX: &str = ptx_fusion_macros::persistent_gemm!(
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "persistent_gemm_test"
+);
+
+#[test]
+fn persistent_gemm_gpu() {
+    println!("=== Persistent GEMM: GPU correctness (2D ctaid) ===");
+
+    // ptxas check
+    let path = "/tmp/persistent_gemm.ptx";
+    std::fs::write(path, PERSISTENT_GEMM_PTX).unwrap();
+    let ptxas_out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+    if !ptxas_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ptxas_out.stderr);
+        eprintln!("ptxas errors:");
+        for line in stderr.lines().take(20) {
+            eprintln!("  {line}");
+        }
+        panic!("ptxas FAILED on persistent GEMM");
+    }
+    println!(
+        "  ptxas: PASS ({} lines)",
+        PERSISTENT_GEMM_PTX.lines().count()
+    );
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    let module = ctx.load_module(Ptx::from_src(PERSISTENT_GEMM_PTX)).unwrap();
+    let func = module.load_function("persistent_gemm_test").unwrap();
+
+    let num_sms = 58u32; // L4
+
+    // Test at multiple (M, N) values to exercise both ctaid.x and ctaid.y
+    let k = 128u32;
+    let cases: &[(u32, u32)] = &[
+        (1, 128),   // 1 tile, trivial
+        (64, 128),  // 1 m-tile, 1 n-tile
+        (64, 256),  // 1 m-tile, 2 n-tiles (swizzle_log=1, gy=1)
+        (128, 256), // 2 m-tiles, 2 n-tiles
+        (64, 640),  // 1 m-tile, 5 n-tiles (swizzle_log=2, gy=2 -- exercises ctaid.y!)
+        (256, 640), // 4 m-tiles, 5 n-tiles (gy=2, many tiles)
+    ];
+    let mut failures = Vec::new();
+
+    for &(m, n) in cases {
+        let h_a: Vec<half::bf16> = (0..(m * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+            .collect();
+        let h_b: Vec<half::bf16> = (0..(n * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+            .collect();
+
+        // Reference: standard flat GEMM
+        let ref_out = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &h_a,
+            &h_b,
+            m,
+            n,
+            k,
+        );
+
+        // Persistent GEMM
+        let d_a = stream.clone_htod(&h_a).unwrap();
+        let d_b = stream.clone_htod(&h_b).unwrap();
+        let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let d_counter: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+
+        let (a_ptr, _) = d_a.device_ptr(&stream);
+        let (b_ptr, _) = d_b.device_ptr(&stream);
+        let (c_ptr, _) = d_c.device_ptr(&stream);
+        let (d_ptr, _) = d_d.device_ptr(&stream);
+        let (ctr_ptr, _) = d_counter.device_ptr(&stream);
+
+        let params = build_flat_params(
+            a_ptr as u64,
+            b_ptr as u64,
+            c_ptr as u64,
+            d_ptr as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            0.0,
+        );
+
+        let (gx, gy, _) = compute_grid(m, n, 64, 128);
+        let total_tiles = gx * gy;
+        let num_blocks = total_tiles.min(num_sms);
+        let ctr_val = ctr_ptr as u64;
+
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 36864,
+        };
+
+        // Param order: _persistent_counter, _persistent_grid_x, _persistent_total, ferrite_params
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&ctr_val)
+                .arg(&gx)
+                .arg(&total_tiles)
+                .arg(&params)
+                .launch(cfg)
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
+        let pers_out = stream.clone_dtoh(&d_d).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for (r, p) in ref_out.iter().zip(pers_out.iter()) {
+            let diff = (r.to_f32() - p.to_f32()).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+        }
+        let status = if max_diff < 0.01 { "PASS" } else { "FAIL" };
+        println!(
+            "  M={m:>4} grid=({gx},{gy}) tiles={total_tiles} blocks={num_blocks} max_diff={max_diff:.2e} {status}"
+        );
+        if max_diff >= 0.01 {
+            failures.push((m, max_diff));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Persistent GEMM failures: {:?}",
+        failures
+    );
+    println!("PASS: persistent GEMM matches standard at all M values");
+}

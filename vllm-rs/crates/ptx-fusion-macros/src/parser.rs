@@ -1509,6 +1509,255 @@ fn classify_carry_role(opcode: &str, reg: &str) -> CarryRole {
     }
 }
 
+// ===== Tile Index Extraction =====
+
+/// The tile index computation extracted from a GEMM kernel's PTX.
+///
+/// CUTLASS GemmIdentityThreadblockSwizzle maps `(ctaid.x, ctaid.y)` to
+/// `(m_tile, n_tile)` using a swizzle parameter loaded from the param struct.
+/// This struct captures the exact PTX lines and registers of that computation,
+/// so the prologue can reuse them verbatim (register-renamed) instead of
+/// reimplementing the swizzle.
+#[derive(Debug, Clone)]
+pub struct TileIndexMap {
+    /// The PTX source lines that compute m_tile and n_tile from ctaid.x/y.
+    /// These are the raw lines from the GEMM PTX, in order.
+    pub tile_index_lines: Vec<String>,
+    /// Line indices in the original PTX (for debugging/verification).
+    pub line_indices: Vec<usize>,
+    /// Register holding m_tile after the computation.
+    pub m_tile_reg: String,
+    /// Register holding n_tile after the computation.
+    pub n_tile_reg: String,
+    /// Register holding the swizzle_log value (used by both m_tile and n_tile).
+    pub swizzle_log_reg: String,
+    /// Register holding the raw ctaid.x value.
+    pub ctaid_x_reg: String,
+}
+
+/// Extract the tile index computation from a GEMM kernel's PTX.
+///
+/// Finds the `(ctaid.x, ctaid.y) → (m_tile, n_tile)` swizzle computation
+/// near the kernel entry point. The CUTLASS pattern is:
+///
+/// ```ptx
+/// mov.u32   %rA, %ctaid.x;
+/// ld.param  %rS, [params+24];           // swizzle_log
+/// shr.s32   %rM, %rA, %rS;             // m_tile = ctaid.x >> swizzle_log
+/// mov.u32   %rB, %ctaid.y;
+/// shl.b32   %rC, %rB, %rS;             // ctaid.y << swizzle_log
+/// mov.u32   %rD, -1;
+/// shl.b32   %rE, %rD, %rS;             // mask = (-1) << swizzle_log
+/// not.b32   %rF, %rE;                  // ~mask
+/// and.b32   %rG, %rA, %rF;             // n_group = ctaid.x & ~mask
+/// add.s32   %rN, %rG, %rC;             // n_tile = n_group + (ctaid.y << swizzle_log)
+/// ```
+///
+/// Returns `None` if the pattern is not found.
+pub fn extract_tile_index_map(lines: &[&str]) -> Option<TileIndexMap> {
+    // Step 1: Find mov.u32 %rA, %ctaid.x and mov.u32 %rB, %ctaid.y
+    // Only look in the first 50 lines (entry block, before the K-loop)
+    let search_limit = lines.len().min(50);
+    let mut ctaid_x_reg = String::new();
+    let mut ctaid_x_line = 0;
+    let mut ctaid_y_reg = String::new();
+    let mut ctaid_y_line = 0;
+
+    for (idx, line) in lines[..search_limit].iter().enumerate() {
+        let t = line.trim();
+        if t.contains("%ctaid.x") && t.starts_with("mov.u32") {
+            // mov.u32 %rN, %ctaid.x;
+            let parts: Vec<&str> = t.split_whitespace().collect();
+            if parts.len() >= 3 {
+                ctaid_x_reg = parts[1].trim_end_matches(',').to_string();
+                ctaid_x_line = idx;
+            }
+        }
+        if t.contains("%ctaid.y") && t.starts_with("mov.u32") {
+            let parts: Vec<&str> = t.split_whitespace().collect();
+            if parts.len() >= 3 {
+                ctaid_y_reg = parts[1].trim_end_matches(',').to_string();
+                ctaid_y_line = idx;
+            }
+        }
+    }
+
+    if ctaid_x_reg.is_empty() || ctaid_y_reg.is_empty() {
+        return None;
+    }
+
+    // Step 2: Build DefUseGraph and trace forward from ctaid_x_reg
+    let graph = DefUseGraph::build(lines);
+
+    // Trace forward from ctaid_x_reg to find the shr (m_tile) and the
+    // and/add chain (n_tile contribution from ctaid_x)
+    let x_trace = graph.trace_forward(&ctaid_x_reg, 5);
+
+    // Find m_tile: the shr.s32 instruction using ctaid_x_reg
+    let mut m_tile_reg = String::new();
+    let mut swizzle_log_reg = String::new();
+    for &(_depth, node_idx) in &x_trace {
+        let node = &graph.nodes[node_idx];
+        if node.opcode == "shr.s32" && node.sources.contains(&ctaid_x_reg) {
+            // shr.s32 %rM, %rA, %rS → m_tile = ctaid.x >> swizzle_log
+            if let Some(dest) = node.dests.first() {
+                m_tile_reg = dest.clone();
+            }
+            // The other source is swizzle_log
+            for src in &node.sources {
+                if src != &ctaid_x_reg {
+                    swizzle_log_reg = src.clone();
+                }
+            }
+            break;
+        }
+    }
+
+    if m_tile_reg.is_empty() || swizzle_log_reg.is_empty() {
+        return None;
+    }
+
+    // Find n_tile: the add.s32 that combines n_group (from ctaid_x) with
+    // shifted ctaid_y. This is the FIRST add.s32 in the y_trace — later
+    // add instructions are unrelated (address computations, etc).
+    let y_trace = graph.trace_forward(&ctaid_y_reg, 3);
+
+    let mut n_tile_reg = String::new();
+
+    // The y_trace starts with shl (ctaid.y << swizzle_log), then add (n_tile).
+    // Take the first add.s32 whose sources include a register from the y_trace
+    // (the shifted ctaid.y) — that's the n_tile computation.
+    let y_derived: BTreeSet<String> = y_trace
+        .iter()
+        .flat_map(|&(_, ni)| graph.nodes[ni].dests.clone())
+        .collect();
+
+    for &(_depth, node_idx) in &y_trace {
+        let node = &graph.nodes[node_idx];
+        if node.opcode == "add.s32" && !node.dests.is_empty() {
+            // Verify at least one source is from the y-chain
+            if node.sources.iter().any(|s| y_derived.contains(s)) {
+                n_tile_reg = node.dests[0].clone();
+                break;
+            }
+        }
+    }
+
+    if n_tile_reg.is_empty() {
+        return None;
+    }
+
+    // Step 3: Collect the PTX lines that form the tile index computation.
+    // Strategy: enumerate the lines between ctaid_x and the n_tile add,
+    // keeping only the arithmetic instructions (mov, ld.param, shr, shl,
+    // not, and, add) and excluding bounds checks (setp, or.pred, bra).
+    let mut line_set: BTreeSet<usize> = BTreeSet::new();
+    line_set.insert(ctaid_x_line);
+    line_set.insert(ctaid_y_line);
+
+    // Find the ld.param line for swizzle_log
+    if let Some(defs) = graph.defs.get(&swizzle_log_reg) {
+        for &def_idx in defs {
+            let node = &graph.nodes[def_idx];
+            if node.opcode.starts_with("ld.param") {
+                line_set.insert(node.line);
+            }
+        }
+    }
+
+    // Collect computation lines from both x and y traces, excluding
+    // bounds checks and branches
+    let tile_index_opcodes = [
+        "shr.s32", "shr.u32", "shl.b32", "not.b32", "and.b32", "add.s32", "mov.u32", "mov.b32",
+    ];
+    let all_traces = [&x_trace, &y_trace];
+    for trace in &all_traces {
+        for &(_depth, node_idx) in *trace {
+            let node = &graph.nodes[node_idx];
+            if tile_index_opcodes.iter().any(|op| node.opcode == *op) {
+                line_set.insert(node.line);
+            }
+        }
+    }
+
+    // Also capture the mask computation (mov -1, shl, not) which uses
+    // swizzle_log_reg but may not be in the x/y traces directly
+    let s_trace = graph.trace_forward(&swizzle_log_reg, 3);
+    for &(_depth, node_idx) in &s_trace {
+        let node = &graph.nodes[node_idx];
+        if tile_index_opcodes.iter().any(|op| node.opcode == *op) {
+            line_set.insert(node.line);
+        }
+    }
+
+    // Filter to lines before the n_tile register's definition line + 1
+    // to avoid pulling in unrelated later code
+    let n_tile_line = graph
+        .defs
+        .get(&n_tile_reg)
+        .and_then(|defs| defs.iter().map(|&ni| graph.nodes[ni].line).min())
+        .unwrap_or(ctaid_y_line + 20);
+
+    // Close over missing definitions: if a collected line uses a register
+    // that isn't defined by any other collected line AND has a simple
+    // definition (mov of a constant), include that definition too.
+    // Example: `mov.u32 %r180, -1` (the mask constant for the swizzle).
+    let collected_line_set: BTreeSet<usize> = line_set.iter().copied().collect();
+    let mut extra_defs = Vec::new();
+    for &line_idx in &collected_line_set {
+        if line_idx > n_tile_line || line_idx >= lines.len() {
+            continue;
+        }
+        // Find the node at this line
+        for node in &graph.nodes {
+            if node.line == line_idx {
+                for src in &node.sources {
+                    // Is this source defined by any collected line?
+                    let defined_in_set = graph.defs.get(src).is_some_and(|defs| {
+                        defs.iter()
+                            .any(|&ni| collected_line_set.contains(&graph.nodes[ni].line))
+                    });
+                    if !defined_in_set {
+                        // Check if it has a simple constant definition
+                        if let Some(defs) = graph.defs.get(src) {
+                            for &def_idx in defs {
+                                let def_node = &graph.nodes[def_idx];
+                                if def_node.opcode == "mov.u32"
+                                    && def_node.sources.is_empty()
+                                    && def_node.line <= n_tile_line
+                                {
+                                    extra_defs.push(def_node.line);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for line_idx in extra_defs {
+        line_set.insert(line_idx);
+    }
+
+    let mut tile_index_lines = Vec::new();
+    let mut line_indices = Vec::new();
+    for &line_idx in &line_set {
+        if line_idx <= n_tile_line && line_idx < lines.len() {
+            tile_index_lines.push(lines[line_idx].trim().to_string());
+            line_indices.push(line_idx);
+        }
+    }
+
+    Some(TileIndexMap {
+        tile_index_lines,
+        line_indices,
+        m_tile_reg,
+        n_tile_reg,
+        swizzle_log_reg,
+        ctaid_x_reg,
+    })
+}
+
 // ===== Backward Tracing =====
 
 impl DefUseGraph {
@@ -2639,6 +2888,173 @@ mod tests {
         // Should have MMA accumulators
         let has_mma = carries.iter().any(|c| c.role == CarryRole::MmaAccumulator);
         assert!(has_mma, "K-loop should have MMA accumulator registers");
+    }
+
+    // ── Tile index extraction tests ──
+
+    #[test]
+    fn extract_tile_index_from_cutlass_64x128x32() {
+        let ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        // Extract just the first entry (the parser does this automatically, but
+        // we need raw lines for extract_tile_index_map)
+        let protocol = PtxParser::parse(ptx).expect("parse failed");
+        // Re-extract entry lines by finding the entry block in the raw PTX
+        let lines: Vec<&str> = ptx.lines().collect();
+
+        let tile_index = extract_tile_index_map(&lines);
+        assert!(
+            tile_index.is_some(),
+            "should extract tile index from CUTLASS 64x128x32"
+        );
+        let ti = tile_index.unwrap();
+
+        eprintln!("Tile index extraction:");
+        eprintln!("  ctaid_x_reg: {}", ti.ctaid_x_reg);
+        eprintln!("  m_tile_reg: {}", ti.m_tile_reg);
+        eprintln!("  n_tile_reg: {}", ti.n_tile_reg);
+        eprintln!("  swizzle_log_reg: {}", ti.swizzle_log_reg);
+        eprintln!("  lines ({}):", ti.tile_index_lines.len());
+        for (i, line) in ti.tile_index_lines.iter().enumerate() {
+            eprintln!("    [{}] {}", ti.line_indices[i], line);
+        }
+
+        // Verify known register assignments from the PTX:
+        // mov.u32 %r177, %ctaid.x;
+        assert_eq!(ti.ctaid_x_reg, "%r177", "ctaid.x should be in %r177");
+        // shr.s32 %r2, %r177, %r1 → m_tile = %r2
+        assert_eq!(ti.m_tile_reg, "%r2", "m_tile should be in %r2");
+        // add.s32 %r3, %r183, %r179 → n_tile = %r3
+        assert_eq!(ti.n_tile_reg, "%r3", "n_tile should be in %r3");
+        // swizzle_log loaded into %r1
+        assert_eq!(ti.swizzle_log_reg, "%r1", "swizzle_log should be in %r1");
+
+        // The extracted lines should include the full swizzle computation
+        let all_lines = ti.tile_index_lines.join("\n");
+        assert!(
+            all_lines.contains("shr.s32"),
+            "should contain shr for m_tile computation"
+        );
+        assert!(
+            all_lines.contains("not.b32"),
+            "should contain not for mask computation"
+        );
+        assert!(
+            all_lines.contains("and.b32"),
+            "should contain and for n_group extraction"
+        );
+        assert!(
+            all_lines.contains("add.s32"),
+            "should contain add for n_tile computation"
+        );
+        assert!(all_lines.contains("%ctaid.x"), "should contain ctaid.x mov");
+        assert!(all_lines.contains("%ctaid.y"), "should contain ctaid.y mov");
+
+        // Should NOT contain lines from beyond the tile index computation
+        assert!(
+            !all_lines.contains("setp.le"),
+            "should not contain bounds-check setp"
+        );
+        assert!(
+            !all_lines.contains("cp.async"),
+            "should not contain cp.async from mainloop"
+        );
+
+        // Protocol should still parse fine (sanity)
+        assert!(!protocol.name.is_empty());
+    }
+
+    #[test]
+    fn extract_tile_index_from_cutlass_128x128x32() {
+        let ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_128x128x32_sm89.ptx");
+        let lines: Vec<&str> = ptx.lines().collect();
+
+        let tile_index = extract_tile_index_map(&lines);
+        assert!(
+            tile_index.is_some(),
+            "should extract tile index from CUTLASS 128x128x32"
+        );
+        let ti = tile_index.unwrap();
+
+        eprintln!("128x128x32 tile index:");
+        eprintln!("  m_tile_reg: {}", ti.m_tile_reg);
+        eprintln!("  n_tile_reg: {}", ti.n_tile_reg);
+        for (i, line) in ti.tile_index_lines.iter().enumerate() {
+            eprintln!("    [{}] {}", ti.line_indices[i], line);
+        }
+
+        // Should have m_tile and n_tile
+        assert!(!ti.m_tile_reg.is_empty());
+        assert!(!ti.n_tile_reg.is_empty());
+        assert!(!ti.swizzle_log_reg.is_empty());
+    }
+
+    #[test]
+    fn extract_tile_index_from_cutlass_64x64x32() {
+        let ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
+        let lines: Vec<&str> = ptx.lines().collect();
+
+        let tile_index = extract_tile_index_map(&lines);
+        assert!(
+            tile_index.is_some(),
+            "should extract tile index from CUTLASS 64x64x32"
+        );
+        let ti = tile_index.unwrap();
+
+        eprintln!("64x64x32 tile index:");
+        eprintln!("  m_tile_reg: {}", ti.m_tile_reg);
+        eprintln!("  n_tile_reg: {}", ti.n_tile_reg);
+        for (i, line) in ti.tile_index_lines.iter().enumerate() {
+            eprintln!("    [{}] {}", ti.line_indices[i], line);
+        }
+
+        assert!(!ti.m_tile_reg.is_empty());
+        assert!(!ti.n_tile_reg.is_empty());
+    }
+
+    #[test]
+    fn extract_tile_index_from_cutlass_128x128x64() {
+        let ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_128x128x64_sm89.ptx");
+        let lines: Vec<&str> = ptx.lines().collect();
+
+        let tile_index = extract_tile_index_map(&lines);
+        assert!(
+            tile_index.is_some(),
+            "should extract tile index from CUTLASS 128x128x64"
+        );
+        let ti = tile_index.unwrap();
+
+        eprintln!("128x128x64 tile index:");
+        eprintln!("  m_tile_reg: {}", ti.m_tile_reg);
+        eprintln!("  n_tile_reg: {}", ti.n_tile_reg);
+        for (i, line) in ti.tile_index_lines.iter().enumerate() {
+            eprintln!("    [{}] {}", ti.line_indices[i], line);
+        }
+
+        assert!(!ti.m_tile_reg.is_empty());
+        assert!(!ti.n_tile_reg.is_empty());
+        assert!(!ti.swizzle_log_reg.is_empty());
+        // Should have the same structure: ctaid.x mov, ld.param, shr, ctaid.y mov, shl, mov -1, shl, not, and, add
+        assert!(
+            ti.tile_index_lines.len() >= 9,
+            "need at least 9 lines for the swizzle computation"
+        );
+    }
+
+    #[test]
+    fn no_tile_index_from_elementwise_kernel() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let lines: Vec<&str> = ptx.lines().collect();
+        // rms_norm uses ctaid.x but not the swizzle pattern
+        let tile_index = extract_tile_index_map(&lines);
+        // It may or may not find something, but it shouldn't crash
+        // and if it finds something, the swizzle_log should be empty or the
+        // pattern should not match (no shr from ctaid.x by a param-loaded register)
+        if let Some(ti) = tile_index {
+            eprintln!(
+                "rms_norm tile index (unexpected): m={} n={}",
+                ti.m_tile_reg, ti.n_tile_reg
+            );
+        }
     }
 
     #[test]

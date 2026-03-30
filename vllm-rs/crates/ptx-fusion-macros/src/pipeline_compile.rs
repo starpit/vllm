@@ -12,7 +12,7 @@
 //! mapping uses runtime arithmetic (correct for any CUTLASS thread layout).
 
 use crate::fuse_general::{PointwiseComputation, replace_a_loads_with_inline_fn};
-use crate::parser::DefUseGraph;
+use crate::parser::{DefUseGraph, TileIndexMap, extract_tile_index_map};
 use crate::pipeline::{PipelineStage, ReductionDecomposition, StagePattern};
 
 /// Extract the GEMM tile dimensions from a CUTLASS mangled entry name.
@@ -368,9 +368,7 @@ fn build_reduction_computation(
     //   param_2 = weight
     //   ferrite_rms_input → param_1 (residual, also the GEMM's A-pointer)
     //   ferrite_rms_hs_input → param_0 (hidden_states, second input for add)
-    let mut extra_params = vec![
-        ".param .u64 _ferrite_rms_input,".into(),
-    ];
+    let mut extra_params = vec![".param .u64 _ferrite_rms_input,".into()];
     if has_writeback {
         extra_params.push(".param .u64 _ferrite_rms_hs_input,".into());
     }
@@ -432,19 +430,19 @@ fn build_reduction_computation(
     // fused_add_rms_norm:  param_0=hs_input,     param_1=residual(=GEMM A-ptr), param_2=weight, param_3=eps, param_4=hidden
     let ferrite_param_map: Vec<(&str, Option<&str>)> = if has_writeback {
         vec![
-            ("param_0", Some("_ferrite_rms_hs_input")),  // hidden_states (second input for add)
-            ("param_1", Some("_ferrite_rms_input")),     // residual (GEMM A-ptr, writeback target)
-            ("param_2", Some("_ferrite_rms_weight")),    // weight ptr
-            ("param_3", Some("_ferrite_rms_epsilon")),   // epsilon
-            ("param_4", Some("_ferrite_rms_hidden")),    // hidden_size
+            ("param_0", Some("_ferrite_rms_hs_input")), // hidden_states (second input for add)
+            ("param_1", Some("_ferrite_rms_input")),    // residual (GEMM A-ptr, writeback target)
+            ("param_2", Some("_ferrite_rms_weight")),   // weight ptr
+            ("param_3", Some("_ferrite_rms_epsilon")),  // epsilon
+            ("param_4", Some("_ferrite_rms_hidden")),   // hidden_size
         ]
     } else {
         vec![
-            ("param_0", None),                           // output ptr — not needed
-            ("param_1", Some("_ferrite_rms_input")),     // input ptr
-            ("param_2", Some("_ferrite_rms_weight")),    // weight ptr
-            ("param_3", Some("_ferrite_rms_epsilon")),   // epsilon
-            ("param_4", Some("_ferrite_rms_hidden")),    // hidden_size
+            ("param_0", None),                         // output ptr — not needed
+            ("param_1", Some("_ferrite_rms_input")),   // input ptr
+            ("param_2", Some("_ferrite_rms_weight")),  // weight ptr
+            ("param_3", Some("_ferrite_rms_epsilon")), // epsilon
+            ("param_4", Some("_ferrite_rms_hidden")),  // hidden_size
         ]
     };
 
@@ -564,8 +562,19 @@ fn build_reduction_computation(
         );
     }
 
+    // Extract tile index map from GEMM PTX — the (ctaid.x, ctaid.y) → (m_tile, n_tile)
+    // swizzle computation. This replaces the hand-written swizzle that was buggy at m_tile>=3.
+    let tile_index = extract_tile_index_map(&gemm_lines).ok_or_else(|| {
+        "could not extract tile index map from GEMM PTX (no ctaid.x/y swizzle pattern)".to_string()
+    })?;
+    #[cfg(test)]
+    eprintln!(
+        "  tile_index: m_tile={}, n_tile={}, swizzle_log={}",
+        tile_index.m_tile_reg, tile_index.n_tile_reg, tile_index.swizzle_log_reg
+    );
+
     // Extract tile dimensions from the GEMM's mangled entry name
-    let (tile_m, tile_n, _tile_k) = extract_gemm_shape_from_entry(&_gemm.protocol.name)
+    let (tile_m, _tile_n, _tile_k) = extract_gemm_shape_from_entry(&_gemm.protocol.name)
         .ok_or_else(|| {
             format!(
                 "could not extract GemmShape from GEMM entry name: {}",
@@ -573,22 +582,12 @@ fn build_reduction_computation(
             )
         })?;
 
-    // Extract the GEMM's struct param name (for reading N from params)
-    let gemm_struct_param = _gemm
-        .protocol
-        .params
-        .iter()
-        .find(|p| p.ptx_type.contains(".b8"))
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| "ferrite_params".to_string());
-
     let prologue = build_prologue_from_decomposition(
         decomp,
         &reduction.source_lines,
         thread_map.as_ref(),
         tile_m,
-        tile_n,
-        &gemm_struct_param,
+        &tile_index,
         has_writeback,
     );
 
@@ -644,12 +643,16 @@ fn build_reduction_computation(
     // For two-input reductions: load hs_input at the same K offset and unpack
     if has_writeback {
         per_site.push("// FERRITE: load hs_input at same K offset".into());
-        per_site.push("selp.u64 \t%rd_rms_koff, %rd_rms_hs_rb1, %rd_rms_hs_rb0, %p_rms_par;".into());
+        per_site
+            .push("selp.u64 \t%rd_rms_koff, %rd_rms_hs_rb1, %rd_rms_hs_rb0, %p_rms_par;".into());
         // k_byte_offset = GMEM_SRC - res_row_base (recompute from residual bases)
         per_site.push("selp.u64 \t%rd_rms_cur, %rd_rms_rb1, %rd_rms_rb0, %p_rms_par;".into());
         per_site.push("sub.u64 \t%rd_rms_cur, {GMEM_SRC}, %rd_rms_cur;".into()); // k_byte_offset
         per_site.push("add.u64 \t%rd_rms_koff, %rd_rms_koff, %rd_rms_cur;".into()); // hs_base + k_byte_offset
-        per_site.push("ld.global.v4.b32 \t{%r_rms_hs0, %r_rms_hs1, %r_rms_hs2, %r_rms_hs3}, [%rd_rms_koff];".into());
+        per_site.push(
+            "ld.global.v4.b32 \t{%r_rms_hs0, %r_rms_hs1, %r_rms_hs2, %r_rms_hs3}, [%rd_rms_koff];"
+                .into(),
+        );
         per_site.push("// FERRITE: unpack 8 bf16 hs values to f32".into());
         for w in 0..4u32 {
             let lo = w * 2;
@@ -855,8 +858,7 @@ fn build_prologue_from_decomposition(
     source_lines: &[String],
     thread_map: Option<&ThreadRowMap>,
     tile_m: u32,
-    tile_n: u32,
-    _gemm_struct_param: &str,
+    tile_index: &TileIndexMap,
     has_writeback: bool,
 ) -> Vec<String> {
     let lane_shr = thread_map.map_or(2, |tm| tm.lanes_per_row_log2);
@@ -956,31 +958,19 @@ fn build_prologue_from_decomposition(
     prologue
         .push("// FERRITE: rms_norm prologue (transplanted from extracted bf16 kernel PTX)".into());
 
-    // Swizzle computation to get m_tile from ctaid.x (GEMM infrastructure)
-    let tile_n_shift = tile_n.trailing_zeros();
-    prologue.push("// Compute swizzle_log from N (ThreadblockSwizzle<4>)".into());
-    prologue.push("ld.param.s32 \t%r_rms_step, [ferrite_params+68];".into());
+    // m_tile and n_tile are computed by the GEMM body's entry block (before the
+    // prologue is injected). We read them directly from the GEMM's registers.
+    // This is the extracted tile index — no reimplementation, no swizzle bugs.
+    let m_tile = &tile_index.m_tile_reg;
+    let n_tile = &tile_index.n_tile_reg;
+
     prologue.push(format!(
-        "add.s32 \t%r_rms_step, %r_rms_step, {};",
-        tile_n - 1
+        "// Tile index from GEMM PTX: m_tile={m_tile}, n_tile={n_tile}"
     ));
-    prologue.push(format!(
-        "shr.u32 \t%r_rms_step, %r_rms_step, {tile_n_shift};"
-    ));
-    prologue.push("mov.u32 \t%r_rms_nrows, 0;".into());
-    prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_step, 2;".into());
-    prologue.push("@%p_rms_lp mov.u32 \t%r_rms_nrows, 1;".into());
-    prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_step, 3;".into());
-    prologue.push("@%p_rms_lp mov.u32 \t%r_rms_nrows, 2;".into());
-    prologue.push("mov.u32 \t%r_rms_mtile, %ctaid.x;".into());
-    // Compute N-tile index within m_tile for writeback guard.
-    // Only the first N-tile (n_idx == 0) writes back to avoid racing.
-    prologue.push("mov.u32 \t%r_rms_k, 1;".into());
-    prologue.push("shl.b32 \t%r_rms_k, %r_rms_k, %r_rms_nrows;".into());
-    prologue.push("sub.u32 \t%r_rms_k, %r_rms_k, 1;".into());
-    prologue.push("and.b32 \t%r_rms_k, %r_rms_mtile, %r_rms_k;".into());
-    prologue.push("setp.eq.u32 \t%p_rms_wb, %r_rms_k, 0;".into());
-    prologue.push("shr.u32 \t%r_rms_mtile, %r_rms_mtile, %r_rms_nrows;".into());
+    prologue.push(format!("mov.u32 \t%r_rms_mtile, {m_tile};"));
+
+    // Writeback guard: only the first N-tile (n_tile == 0) writes back.
+    prologue.push(format!("setp.eq.u32 \t%p_rms_wb, {n_tile}, 0;"));
 
     // Row loop: iterate over min(tile_m, M - m_tile * tile_m) rows
     // Read M from ferrite_params[64] to handle partial tiles at boundary
@@ -1109,7 +1099,8 @@ fn build_prologue_from_decomposition(
 
     // For two-input reductions: compute hs_input row bases at the same offsets
     if has_writeback {
-        prologue.push("// FERRITE: hs_input row bases (same row offset, different base ptr)".into());
+        prologue
+            .push("// FERRITE: hs_input row bases (same row offset, different base ptr)".into());
         prologue.push("sub.s64 \t%rd_rms_hs_rb0, %rd_rms_rb0, %rd_rms_in;".into());
         prologue.push("add.s64 \t%rd_rms_hs_rb0, %rd_rms_hs_rb0, %rd_rms_hs_in;".into());
         prologue.push("sub.s64 \t%rd_rms_hs_rb1, %rd_rms_rb1, %rd_rms_in;".into());
@@ -1418,11 +1409,23 @@ mod tests {
             Ok(ptx) => {
                 // Should contain add+norm prologue (transplanted from fused_add_rms_norm)
                 assert!(ptx.contains("rms_norm prologue"), "should contain prologue");
-                assert!(ptx.contains("add.f32"), "prologue should contain f32 add (from fused_add_rms_norm)");
-                assert!(ptx.contains("st.global"), "prologue should contain writeback store");
-                assert!(ptx.contains("mma.sync"), "GEMM interior should be preserved");
+                assert!(
+                    ptx.contains("add.f32"),
+                    "prologue should contain f32 add (from fused_add_rms_norm)"
+                );
+                assert!(
+                    ptx.contains("st.global"),
+                    "prologue should contain writeback store"
+                );
+                assert!(
+                    ptx.contains("mma.sync"),
+                    "GEMM interior should be preserved"
+                );
                 // Should have the extra hs_input param
-                assert!(ptx.contains("_ferrite_rms_hs_input"), "should have hs_input param");
+                assert!(
+                    ptx.contains("_ferrite_rms_hs_input"),
+                    "should have hs_input param"
+                );
                 eprintln!("PASS: fused_add_rms_norm → GEMM produces valid PTX structure");
             }
             Err(e) => panic!("fuse_reduction_into_gemm failed: {e}"),
@@ -1444,8 +1447,8 @@ mod tests {
         .expect("parse fused_add_rms_norm");
         let gemm_stage = PipelineStage::from_ptx("gemm", gemm_ptx, None).expect("parse gemm");
 
-        let fused_ptx =
-            fuse_reduction_into_gemm(&norm_stage, &gemm_stage, "fused_add_norm_gemm").expect("fuse");
+        let fused_ptx = fuse_reduction_into_gemm(&norm_stage, &gemm_stage, "fused_add_norm_gemm")
+            .expect("fuse");
 
         let (fused_ptx, _) =
             crate::perimeter::replace_perimeter(&fused_ptx, deriv_json, "fused_add_norm_gemm")

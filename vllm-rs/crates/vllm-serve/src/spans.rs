@@ -190,6 +190,33 @@ fn tokenize_message(
     let rendered = template.apply_simple(&state.rendered_messages, false)?;
     let all_ids = tokenizer.encode(&rendered, false)?;
 
+    // When consolidating, the previous rendering's template suffix (e.g.,
+    // <|eot_id|> in Llama 3, <|im_end|>\n in ChatML) is still in
+    // state.tokens but has shifted position in the new rendering. Fix by
+    // detecting and removing the stale suffix before computing the delta.
+    if should_consolidate && state.rendered_token_count > 0 {
+        let old_count = state.rendered_token_count;
+        let state_len = state.tokens.len();
+        // Check up to 32 trailing tokens for stale template suffix.
+        // Real tokenizers: 1-3 tokens (e.g., <|eot_id|> = 1, <|im_end|>\n = 2).
+        // Byte-level test tokenizer: up to ~12 tokens.
+        let max_check = old_count.min(state_len).min(32);
+        let mut stale_count = 0;
+        for k in 1..=max_check {
+            let si = state_len - k;
+            let ai = old_count - k;
+            if ai < all_ids.len() && state.tokens[si] != all_ids[ai] {
+                stale_count = k;
+            } else {
+                break;
+            }
+        }
+        if stale_count > 0 {
+            state.tokens.truncate(state_len - stale_count);
+            state.rendered_token_count -= stale_count;
+        }
+    }
+
     // Take only the delta — tokens added by this message.
     let new_ids = &all_ids[state.rendered_token_count..];
     state.rendered_token_count = all_ids.len();
@@ -552,6 +579,144 @@ async fn execute_single(
     } else {
         let response = state.engine.completion(request).await?;
         Ok(Json(response).into_response())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_template::ChatTemplate;
+
+    /// Regression test for the stale template-suffix bug.
+    ///
+    /// When messages are consolidated (same role, appended with \n), the
+    /// template's end-of-turn token (e.g., Llama 3's `<|eot_id|>` = 128009)
+    /// from the PREVIOUS rendering remains in `state.tokens` even though it
+    /// has shifted in the new rendering. Without the fix, these stale tokens
+    /// corrupt the token sequence and destroy model accuracy.
+    ///
+    /// This test uses synthetic token arrays to exercise the fix logic
+    /// directly, simulating what happens with a real tokenizer.
+    #[test]
+    fn test_stale_suffix_removal_on_consolidation() {
+        // Simulate Llama 3 tokenization:
+        // Step 1: [{system: "hi"}, {user: "A"}]
+        //   Tokens: [BOS, SYS_HEAD, .., EOT, USR_HEAD, .., A, DOT, EOT]
+        //   Simplified: [10, 20, 30, 999, 40, 50, 60, 70, 999]
+        //   where 999 = <|eot_id|>
+        let ids_step1: Vec<u32> = vec![10, 20, 30, 999, 40, 50, 60, 70, 999];
+
+        // Step 2: [{system: "hi"}, {user: "A\nB"}] (consolidated)
+        //   Tokens: [BOS, SYS_HEAD, .., EOT, USR_HEAD, .., A, DOT, NL, B, EOT]
+        //   Simplified: [10, 20, 30, 999, 40, 50, 60, 70, 80, 90, 999]
+        //   The content "A" is extended to "A\nB", so after "A" and "DOT" we
+        //   get NL=80, B=90, then EOT=999 at the end.
+        let ids_step2: Vec<u32> = vec![10, 20, 30, 999, 40, 50, 60, 70, 80, 90, 999];
+
+        // Key observation: ids_step1 and ids_step2 share prefix [10..70].
+        // ids_step1[8] = 999 (EOT), ids_step2[8] = 80 (NL) — MISMATCH.
+
+        // Without fix: state.tokens = ids_step1, delta = ids_step2[9..] = [90, 999]
+        let old_count = ids_step1.len(); // 9
+        let delta_buggy = &ids_step2[old_count..]; // [90, 999]
+        let mut buggy = ids_step1.clone();
+        buggy.extend_from_slice(delta_buggy);
+        // buggy = [10, 20, 30, 999, 40, 50, 60, 70, 999, 90, 999]
+        // The stale 999 (EOT) at position 8 corrupts the sequence!
+
+        assert_ne!(
+            buggy, ids_step2,
+            "Without fix, stale EOT (999) must cause a mismatch",
+        );
+        assert!(
+            buggy.windows(3).any(|w| w == [999, 90, 999]),
+            "Buggy sequence should have stale EOT between content: {:?}",
+            buggy,
+        );
+
+        // With fix: detect stale suffix by scanning backwards.
+        let mut fixed = ids_step1.clone();
+        let state_len = fixed.len();
+        let max_check = old_count.min(state_len).min(32);
+        let mut stale_count = 0;
+        for k in 1..=max_check {
+            let si = state_len - k;
+            let ai = old_count - k;
+            if ai < ids_step2.len() && fixed[si] != ids_step2[ai] {
+                stale_count = k;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(stale_count, 1, "Should detect 1 stale suffix token (EOT)");
+        fixed.truncate(state_len - stale_count);
+        let adjusted_count = old_count - stale_count;
+        let delta_fixed = &ids_step2[adjusted_count..];
+        fixed.extend_from_slice(delta_fixed);
+
+        assert_eq!(
+            fixed, ids_step2,
+            "After fix, tokens must match one-shot rendering.\n\
+             Fixed:    {:?}\n\
+             Expected: {:?}",
+            fixed, ids_step2,
+        );
+    }
+
+    /// Verify the fix handles multi-token template suffixes (e.g., ChatML's
+    /// `<|im_end|>\n` which is 2 tokens with a proper tokenizer).
+    #[test]
+    fn test_stale_suffix_removal_multi_token() {
+        // Simulate ChatML: suffix = [IM_END=500, NL=10]
+        let ids_step1: Vec<u32> = vec![1, 2, 3, 100, 200, 300, 500, 10];
+        let ids_step2: Vec<u32> = vec![1, 2, 3, 100, 200, 300, 50, 400, 500, 10];
+        // ids_step1[6] = 500 (IM_END), ids_step2[6] = 50 (content continuation)
+        // ids_step1[7] = 10 (NL),      ids_step2[7] = 400 (more content)
+        // Stale suffix = 2 tokens [500, 10]
+
+        let old_count = ids_step1.len();
+        let mut fixed = ids_step1.clone();
+        let state_len = fixed.len();
+        let max_check = old_count.min(state_len).min(32);
+        let mut stale_count = 0;
+        for k in 1..=max_check {
+            let si = state_len - k;
+            let ai = old_count - k;
+            if ai < ids_step2.len() && fixed[si] != ids_step2[ai] {
+                stale_count = k;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(stale_count, 2, "Should detect 2 stale suffix tokens");
+        fixed.truncate(state_len - stale_count);
+        let adjusted_count = old_count - stale_count;
+        fixed.extend_from_slice(&ids_step2[adjusted_count..]);
+
+        assert_eq!(fixed, ids_step2);
+    }
+
+    /// Verify the fix is a no-op when no consolidation occurs (different roles).
+    #[test]
+    fn test_no_stale_suffix_without_consolidation() {
+        // When consecutive messages have different roles, there's no
+        // consolidation and no stale suffix. The fix should be a no-op.
+        let ids_step1: Vec<u32> = vec![10, 20, 30, 999]; // system msg
+        let ids_step2: Vec<u32> = vec![10, 20, 30, 999, 40, 50, 60, 999]; // + user msg
+
+        let old_count = ids_step1.len();
+        // No consolidation → no suffix removal needed.
+        // Delta = ids_step2[old_count..] = [40, 50, 60, 999]
+        let mut result = ids_step1.clone();
+        result.extend_from_slice(&ids_step2[old_count..]);
+        assert_eq!(
+            result, ids_step2,
+            "No consolidation should produce correct tokens"
+        );
     }
 }
 

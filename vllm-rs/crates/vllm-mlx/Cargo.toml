@@ -29,6 +29,11 @@ libc = { workspace = true }
 
 [build-dependencies]
 cc = "1"
+# build.rs scans for mlx-sys build output to find MLX headers. Must be a
+# build-dep (not just transitive via mlx-rs) so Cargo guarantees it's fully
+# built before build.rs runs. Without this, clean builds race and fail with
+# "mlx/mlx.h not found".
+mlx-sys = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

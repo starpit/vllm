@@ -875,8 +875,18 @@ impl Worker for MlxWorker {
                     self.token_buffers.get(req_id),
                     self.kv_caches.remove(req_id),
                 ) {
-                    if prompt.len() >= self.prefix_block_size {
-                        let h = hash_prefix(prompt, self.prefix_block_size);
+                    // Use only the original prompt tokens for hashing (exclude
+                    // generated tokens appended during decode). The lookup uses
+                    // prompt_ids[..num_computed] which never includes generated
+                    // tokens, so the insertion hash must match.
+                    let prompt_len = self
+                        .prompt_lens
+                        .get(req_id)
+                        .copied()
+                        .unwrap_or(prompt.len());
+                    let prompt_prefix = &prompt[..prompt_len.min(prompt.len())];
+                    if prompt_prefix.len() >= self.prefix_block_size {
+                        let h = hash_prefix(prompt_prefix, self.prefix_block_size);
                         let block_ids = self
                             .request_block_ids
                             .get(req_id)
@@ -971,6 +981,7 @@ impl Worker for MlxWorker {
             }
 
             // Try to reuse a cached KV from the prefix pool.
+            let mut prefix_cache_hit = false;
             let kv_cache = if num_computed > 0 && self.enable_prefix_caching {
                 let prefix = &prompt_ids[..num_computed];
                 let h = hash_prefix(prefix, self.prefix_block_size);
@@ -986,6 +997,7 @@ impl Worker for MlxWorker {
                         "prefix cache hit for req {} ({} computed tokens)",
                         new_req.req_id, num_computed
                     );
+                    prefix_cache_hit = true;
                     kv
                 } else {
                     debug!(
@@ -1078,6 +1090,15 @@ impl Worker for MlxWorker {
                         new_req.req_id,
                         span_k_parts[0].len()
                     );
+                }
+
+                // When span block data is already in the active KV cache (either
+                // from a prefix pool hit or from individual span block assembly),
+                // clear annotation_buffers so decode uses regular forward instead
+                // of forward_with_segments. Otherwise decode would fetch the same
+                // span blocks from the pool again, causing double attention.
+                if prefix_cache_hit || any_span_blocks {
+                    self.annotation_buffers.remove(&new_req.req_id);
                 }
             }
 

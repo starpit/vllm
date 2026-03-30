@@ -2218,6 +2218,91 @@ pub(crate) fn dedup_reg_declarations(ptx: &str) -> String {
     result.join("\n")
 }
 
+/// Sequence two CUTLASS bf16 GEMMs into a single kernel.
+///
+/// Usage:
+/// ```ignore
+/// const SEQ_PTX: &str = ptx_fusion_macros::sequence_gemms!(
+///     "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+///     "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+///     "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+///     "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+///     "sequenced_two_gemm"
+/// );
+/// ```
+///
+/// Arguments: gemm_a_ptx, gemm_a_derivations, gemm_b_ptx, gemm_b_derivations, name
+#[proc_macro]
+pub fn sequence_gemms(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let args: Vec<proc_macro::TokenTree> = input.into_iter().collect();
+    let mut strings = Vec::new();
+    for arg in &args {
+        if let proc_macro::TokenTree::Literal(lit) = arg {
+            let s = lit.to_string();
+            if s.starts_with('"') && s.ends_with('"') {
+                strings.push(s[1..s.len() - 1].to_string());
+            }
+        }
+    }
+
+    if strings.len() < 5 {
+        return quote! { compile_error!("sequence_gemms! expects 5 string arguments: gemm_a_ptx, gemm_a_deriv, gemm_b_ptx, gemm_b_deriv, name") }.into();
+    }
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let kernel_base = manifest_dir.parent().unwrap().join("ptx-fusion");
+
+    let read_file = |path: &str| -> Result<String, String> {
+        let full = kernel_base.join(path);
+        std::fs::read_to_string(&full).map_err(|e| format!("cannot read {}: {e}", full.display()))
+    };
+
+    let gemm_a_ptx = match read_file(&strings[0]) {
+        Ok(s) => s,
+        Err(e) => return quote! { compile_error!(#e) }.into(),
+    };
+    let gemm_a_deriv = match read_file(&strings[1]) {
+        Ok(s) => s,
+        Err(e) => return quote! { compile_error!(#e) }.into(),
+    };
+    let gemm_b_ptx = match read_file(&strings[2]) {
+        Ok(s) => s,
+        Err(e) => return quote! { compile_error!(#e) }.into(),
+    };
+    let gemm_b_deriv = match read_file(&strings[3]) {
+        Ok(s) => s,
+        Err(e) => return quote! { compile_error!(#e) }.into(),
+    };
+    let name = &strings[4];
+
+    // Perimeter-replace both GEMMs
+    let (flat_a, _) = match perimeter::replace_perimeter(&gemm_a_ptx, &gemm_a_deriv, "gemm_a") {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("sequence_gemms: perimeter replace A failed: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let (flat_b, _) = match perimeter::replace_perimeter(&gemm_b_ptx, &gemm_b_deriv, "gemm_b") {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("sequence_gemms: perimeter replace B failed: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    // Sequence them
+    let sequenced = match pipeline_compile::sequence_two_gemms(&flat_a, &flat_b, name) {
+        Ok(ptx) => ptx,
+        Err(e) => {
+            let msg = format!("sequence_gemms: sequencing failed: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    quote! { #sequenced }.into()
+}
+
 /// Count the total bytes of extra `.param` declarations before the flat struct
 /// param (`ferrite_params`) in a fused kernel's PTX entry point.
 ///

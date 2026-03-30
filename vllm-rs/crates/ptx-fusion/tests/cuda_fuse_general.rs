@@ -2438,3 +2438,160 @@ fn norm_gemm_compile_model_dims() {
     }
     println!("PASS: compile! norm+GEMM correct at model dims");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Two-GEMM sequenced kernel: GPU correctness
+// Verifies that two CUTLASS GEMMs in a single kernel produce the same
+// output as running them as separate launches.
+// ══════════════════════════════════════════════════════════════════════
+
+const SEQUENCED_TWO_GEMM_PTX: &str = ptx_fusion_macros::sequence_gemms!(
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "sequenced_two_gemm"
+);
+
+#[test]
+fn sequenced_two_gemm_gpu() {
+    println!("=== Sequenced two-GEMM: GPU correctness ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    // Dimensions: A[M,K] × B1[N,K]^T → intermediate[M,N], then intermediate[M,N] × B2[P,N]^T → output[M,P]
+    // Using same tile config (64x128x32) for both GEMMs.
+    let m = 64u32;
+    let k = 128u32; // K for GEMM_A
+    let n = 128u32; // N for GEMM_A = K for GEMM_B
+    let p = 128u32; // N for GEMM_B (output columns)
+
+    // Test data
+    let h_a: Vec<half::bf16> = (0..(m * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_b1: Vec<half::bf16> = (0..(n * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+    let h_b2: Vec<half::bf16> = (0..(p * n) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.15))
+        .collect();
+
+    // Reference: two separate GEMM launches
+    let intermediate = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_a,
+        &h_b1,
+        m,
+        n,
+        k,
+    );
+    let ref_output = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &intermediate,
+        &h_b2,
+        m,
+        p,
+        n,
+    );
+
+    // Sequenced: both GEMMs in one kernel launch
+    let d_a = stream.clone_htod(&h_a).unwrap();
+    let d_b1 = stream.clone_htod(&h_b1).unwrap();
+    let d_b2 = stream.clone_htod(&h_b2).unwrap();
+    let d_inter: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let d_c2: CudaSlice<half::bf16> = stream.alloc_zeros((m * p) as usize).unwrap();
+    let mut d_out: CudaSlice<half::bf16> = stream.alloc_zeros((m * p) as usize).unwrap();
+
+    let module = ctx
+        .load_module(Ptx::from_src(SEQUENCED_TWO_GEMM_PTX))
+        .unwrap();
+    let func = module.load_function("sequenced_two_gemm").unwrap();
+
+    let (a_ptr, _) = d_a.device_ptr(&stream);
+    let (b1_ptr, _) = d_b1.device_ptr(&stream);
+    let (inter_ptr, _) = d_inter.device_ptr(&stream);
+    let (b2_ptr, _) = d_b2.device_ptr(&stream);
+    let (c2_ptr, _) = d_c2.device_ptr(&stream);
+    let (out_ptr, _) = d_out.device_ptr(&stream);
+
+    // GEMM_A params: A[M,K] × B1[N,K]^T → intermediate[M,N]
+    let params_a = build_flat_params(
+        a_ptr as u64,
+        b1_ptr as u64,
+        inter_ptr as u64, // C (unused, beta=0)
+        inter_ptr as u64, // D (output)
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        1.0,
+        0.0,
+    );
+    // GEMM_B params: intermediate[M,N] × B2[P,N]^T → output[M,P]
+    let params_b = build_flat_params(
+        inter_ptr as u64, // A (reads GEMM_A's output)
+        b2_ptr as u64,
+        c2_ptr as u64,
+        out_ptr as u64,
+        m,
+        p,
+        n,
+        n,
+        n,
+        p,
+        p,
+        1.0,
+        0.0,
+    );
+
+    // Grid must be large enough for both GEMMs.
+    // Both are M=64, N=128 with 64x128 tiles → 1 block each.
+    let (gx, gy, gz) = compute_grid(m, n, 64, 128);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, gz),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864, // CUTLASS SMEM for 64x128x32
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&params_a)
+            .arg(&params_b)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let seq_output = stream.clone_dtoh(&d_out).unwrap();
+
+    // Compare
+    let mut max_diff = 0.0f32;
+    for (i, (r, s)) in ref_output.iter().zip(seq_output.iter()).enumerate() {
+        let diff = (r.to_f32() - s.to_f32()).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+        if diff > 0.5 && i < 10 {
+            println!(
+                "  MISMATCH [{i}]: ref={:.4}, seq={:.4}, diff={diff:.2e}",
+                r.to_f32(),
+                s.to_f32()
+            );
+        }
+    }
+    println!("  M={m}, K={k}, N={n}, P={p}: max_diff={max_diff:.2e}");
+    assert!(
+        max_diff < 0.01,
+        "sequenced two-GEMM diff too large: {max_diff:.2e}"
+    );
+    println!("PASS: sequenced two-GEMM matches separate launches");
+}

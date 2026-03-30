@@ -266,9 +266,21 @@ unsafe fn load_flat_module(
     let ptx_cstr =
         std::ffi::CString::new(ptx).map_err(|e| anyhow::anyhow!("PTX null byte: {e}"))?;
 
-    let result = sys::cuModuleLoadData(&mut module, ptx_cstr.as_ptr() as *const _);
+    // JIT-compile with FTZ=true to match the source kernels' --use_fast_math
+    // compilation. Without this, scalar FP operations (add.f32, fma.rn.f32)
+    // in the fused prologue handle subnormals differently than the original
+    // C kernels, causing ~1 ULP divergence that compounds over layers.
+    let mut options = [sys::CUjit_option::CU_JIT_FTZ];
+    let mut values: [*mut std::ffi::c_void; 1] = [1usize as *mut _]; // 1 = enable FTZ
+    let result = sys::cuModuleLoadDataEx(
+        &mut module,
+        ptx_cstr.as_ptr() as *const _,
+        1,
+        options.as_mut_ptr(),
+        values.as_mut_ptr(),
+    );
     if result != sys::cudaError_enum::CUDA_SUCCESS {
-        bail!("cuModuleLoadData failed: {result:?}");
+        bail!("cuModuleLoadDataEx failed: {result:?}");
     }
 
     let entry_cstr = std::ffi::CString::new(entry_name).unwrap();
@@ -492,9 +504,16 @@ pub unsafe fn launch_fused_add_norm_gemm(
 
     let out = alloc.alloc_tensor(&[m as usize, n as usize], residual.dtype());
 
-    // The prologue's writeback (bf16 sums to residual) is guarded by @%p_rms_wb
-    // so only the first N-tile block per m_tile writes. This avoids the race
-    // where multiple blocks read-modify-write the same residual rows.
+    // The prologue is pure-read: it reads from both residual and hs_input,
+    // adds in f32, computes inv_rms. No GMEM writes — all blocks see identical
+    // original data. The per-site code loads from both buffers and adds at each
+    // A-load site.
+    //
+    // IMPORTANT: This function does NOT update the residual buffer. The caller
+    // must run add_inplace(residual, hs_input) AFTER this call to update the
+    // residual for downstream layers. We don't do it here because the caller
+    // controls tensor lifetimes — if hs_input is dropped before the stream
+    // executes add_inplace, the GPU reads freed memory.
 
     let grid_m = m.div_ceil(kernel.tile_m);
     let grid_n = n.div_ceil(kernel.tile_n);

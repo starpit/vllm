@@ -409,6 +409,7 @@ fn build_reduction_computation(
     extra_reg_decls.push(".reg .b64 %rd_rms_in, %rd_rms_wt, %rd_rms_str;".into());
     if has_writeback {
         extra_reg_decls.push(".reg .b64 %rd_rms_hs_in;".into());
+        extra_reg_decls.push(".reg .b64 %rd_rms_hs_rb0, %rd_rms_hs_rb1;".into());
     }
     extra_reg_decls.push(".reg .b64 %rd_rms_rb0, %rd_rms_rb1;".into());
     extra_reg_decls.push(".reg .b64 %rd_rms_cur;".into());
@@ -588,6 +589,7 @@ fn build_reduction_computation(
         tile_m,
         tile_n,
         &gemm_struct_param,
+        has_writeback,
     );
 
     // ── Per-site code ──
@@ -617,6 +619,16 @@ fn build_reduction_computation(
     extra_reg_decls.push(".reg .b16 %h_rms_a, %h_rms_b;".into());
     extra_reg_decls.push(".reg .f32 %f_rms_wa, %f_rms_wb;".into());
 
+    // For two-input reductions: extra regs for hs_input loading + a temp for k_byte_offset
+    if has_writeback {
+        extra_reg_decls.push(".reg .b32 %r_rms_hs0, %r_rms_hs1, %r_rms_hs2, %r_rms_hs3;".into());
+        extra_reg_decls.push(
+            ".reg .f32 %f_rms_hs0, %f_rms_hs1, %f_rms_hs2, %f_rms_hs3, %f_rms_hs4, %f_rms_hs5, %f_rms_hs6, %f_rms_hs7;"
+                .into(),
+        );
+        extra_reg_decls.push(".reg .b64 %rd_rms_koff;".into());
+    }
+
     // Unpack all 8 weights in per_site code, store in named f32 regs.
     // Per-element instructions then reference %f_rms_wt{ELEM_IDX}.
     let mut per_site = per_site;
@@ -629,17 +641,50 @@ fn build_reduction_computation(
         per_site.push(format!("cvt.f32.bf16 \t%f_rms_wt{hi}, %h_rms_b;"));
     }
 
+    // For two-input reductions: load hs_input at the same K offset and unpack
+    if has_writeback {
+        per_site.push("// FERRITE: load hs_input at same K offset".into());
+        per_site.push("selp.u64 \t%rd_rms_koff, %rd_rms_hs_rb1, %rd_rms_hs_rb0, %p_rms_par;".into());
+        // k_byte_offset = GMEM_SRC - res_row_base (recompute from residual bases)
+        per_site.push("selp.u64 \t%rd_rms_cur, %rd_rms_rb1, %rd_rms_rb0, %p_rms_par;".into());
+        per_site.push("sub.u64 \t%rd_rms_cur, {GMEM_SRC}, %rd_rms_cur;".into()); // k_byte_offset
+        per_site.push("add.u64 \t%rd_rms_koff, %rd_rms_koff, %rd_rms_cur;".into()); // hs_base + k_byte_offset
+        per_site.push("ld.global.v4.b32 \t{%r_rms_hs0, %r_rms_hs1, %r_rms_hs2, %r_rms_hs3}, [%rd_rms_koff];".into());
+        per_site.push("// FERRITE: unpack 8 bf16 hs values to f32".into());
+        for w in 0..4u32 {
+            let lo = w * 2;
+            let hi = w * 2 + 1;
+            per_site.push(format!("mov.b32 \t{{%h_rms_a, %h_rms_b}}, %r_rms_hs{w};"));
+            per_site.push(format!("cvt.f32.bf16 \t%f_rms_hs{lo}, %h_rms_a;"));
+            per_site.push(format!("cvt.f32.bf16 \t%f_rms_hs{hi}, %h_rms_b;"));
+        }
+    }
+
     // Add weight f32 registers
     extra_reg_decls.push(
         ".reg .f32 %f_rms_wt0, %f_rms_wt1, %f_rms_wt2, %f_rms_wt3, %f_rms_wt4, %f_rms_wt5, %f_rms_wt6, %f_rms_wt7;"
             .into(),
     );
 
-    // Simplified per-element instructions: multiply by inv_rms and weight
-    let instructions = vec![
-        "mul.f32 \t{INPUT}, {INPUT}, %f_rms_inv;".into(),
-        "mul.f32 \t{INPUT}, {INPUT}, %f_rms_wt{ELEM_IDX};".into(),
-    ];
+    // Per-element instructions: for two-input, add hs before normalize.
+    // The bf16 round-trip (cvt.rn.bf16 + cvt.f32.bf16) matches the standard
+    // path's precision: fused_add_rms_norm_inplace writes bf16(sum) to memory,
+    // then pass 2 reads it back as f32(bf16(sum)). Without this truncation,
+    // the fused path diverges much faster (layer 3 vs layer 9).
+    let instructions = if has_writeback {
+        vec![
+            "add.f32 \t{INPUT}, {INPUT}, %f_rms_hs{ELEM_IDX};".into(),
+            "cvt.rn.bf16.f32 \t%h_rms_a, {INPUT};".into(),
+            "cvt.f32.bf16 \t{INPUT}, %h_rms_a;".into(),
+            "mul.f32 \t{INPUT}, {INPUT}, %f_rms_inv;".into(),
+            "mul.f32 \t{INPUT}, {INPUT}, %f_rms_wt{ELEM_IDX};".into(),
+        ]
+    } else {
+        vec![
+            "mul.f32 \t{INPUT}, {INPUT}, %f_rms_inv;".into(),
+            "mul.f32 \t{INPUT}, {INPUT}, %f_rms_wt{ELEM_IDX};".into(),
+        ]
+    };
 
     Ok(PointwiseComputation {
         instructions,
@@ -812,6 +857,7 @@ fn build_prologue_from_decomposition(
     tile_m: u32,
     tile_n: u32,
     _gemm_struct_param: &str,
+    has_writeback: bool,
 ) -> Vec<String> {
     let lane_shr = thread_map.map_or(2, |tm| tm.lanes_per_row_log2);
     let warp_shl = thread_map.map_or(4, |tm| tm.rows_per_warp_log2);
@@ -1007,12 +1053,15 @@ fn build_prologue_from_decomposition(
             continue;
         }
 
-        // Guard st.global (writeback stores) with %p_rms_wb predicate.
-        // Only the first N-tile block per m_tile writes back to avoid
-        // racing with other blocks that share the same m_tile.
+        // For two-input reductions (fused_add_rms_norm): skip all st.global
+        // in the prologue. The prologue is pure-read — all blocks see identical
+        // original data → identical inv_rms → no inter-block aliasing.
+        // The caller runs add_inplace() post-kernel for the residual update.
         if renamed.contains("st.global") {
-            let trimmed_store = renamed.trim().to_string();
-            prologue.push(format!("@%p_rms_wb {trimmed_store}"));
+            if has_writeback {
+                continue;
+            }
+            prologue.push(renamed.trim().to_string());
         } else {
             prologue.push(renamed.trim().to_string());
         }
@@ -1057,6 +1106,15 @@ fn build_prologue_from_decomposition(
     let rb1_shift = (row_stride * 2).trailing_zeros();
     prologue.push(format!("shl.b64 \t%rd_rms_rb1, %rd_rms_str, {rb1_shift};"));
     prologue.push("add.s64 \t%rd_rms_rb1, %rd_rms_rb0, %rd_rms_rb1;".into());
+
+    // For two-input reductions: compute hs_input row bases at the same offsets
+    if has_writeback {
+        prologue.push("// FERRITE: hs_input row bases (same row offset, different base ptr)".into());
+        prologue.push("sub.s64 \t%rd_rms_hs_rb0, %rd_rms_rb0, %rd_rms_in;".into());
+        prologue.push("add.s64 \t%rd_rms_hs_rb0, %rd_rms_hs_rb0, %rd_rms_hs_in;".into());
+        prologue.push("sub.s64 \t%rd_rms_hs_rb1, %rd_rms_rb1, %rd_rms_in;".into());
+        prologue.push("add.s64 \t%rd_rms_hs_rb1, %rd_rms_hs_rb1, %rd_rms_hs_in;".into());
+    }
 
     prologue.push("// FERRITE: end rms_norm prologue".into());
 

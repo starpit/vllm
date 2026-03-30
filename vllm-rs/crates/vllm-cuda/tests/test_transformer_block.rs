@@ -4796,11 +4796,15 @@ fn test14e_fused_add_norm_gemm_real_embeddings() {
         drop(act_a);
 
         // Path B (fused): launch_fused_add_norm_gemm (two-input prologue)
+        // The fused kernel is pure-read on residual and hs_input. We must call
+        // add_inplace BEFORE dropping hs_b to avoid GPU use-after-free (the
+        // caching allocator reuses memory immediately on drop, but add_inplace
+        // is still queued on the stream).
         let qkv_b = unsafe {
             vllm_cuda::ferrite::launch_fused_add_norm_gemm(
                 &FUSED_ADD_NORM_GEMM,
-                *res_b,    // residual (GEMM A-ptr, writeback target)
-                *hs_b,     // hidden_states (second input for add)
+                *res_b,    // residual
+                *hs_b,     // hidden_states
                 *lw[i].qkv,
                 *lw[i].norm1,
                 eps,
@@ -4812,6 +4816,7 @@ fn test14e_fused_add_norm_gemm_real_embeddings() {
                 stream,
             )
         };
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *hs_b, stream) };
         drop(hs_b);
         let attn_b = unsafe {
             layers[i].self_attn.forward_from_qkv(
@@ -4835,6 +4840,7 @@ fn test14e_fused_add_norm_gemm_real_embeddings() {
                 stream,
             )
         };
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *attn_b, stream) };
         drop(attn_b);
         let act_b = unsafe {
             vllm_cuda::kernels::silu_and_mul_fused(*gu_b, config.intermediate_size, &mut device.caching, stream)
@@ -5128,6 +5134,8 @@ fn test14g_multi_block_prologue_race() {
                 None, 1.0, 0.0, &mut device.caching, stream,
             )
         };
+        // Residual update: fused kernel is pure-read, caller does add_inplace
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *hs_b, stream) };
 
         unsafe { cusys::cuStreamSynchronize(stream) };
         let a_h = unsafe { download_bf16(*out_a, m * n_out) };
@@ -5142,5 +5150,544 @@ fn test14g_multi_block_prologue_race() {
         let grid_n = (n_out as u32).div_ceil(128); // tile_n=128
         let status = if diff < 0.01 { "PASS" } else { "FAIL" };
         println!("  N={n_out:5} grid_n={grid_n} diff={diff:.2e} res_diff={rdiff:.2e} {status}");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// test14h: Inter-block inv_rms divergence diagnostic
+//
+// If aliasing is the cause of multi-block failure, different GEMM blocks
+// compute different inv_rms values (because they read different data).
+// This test detects that by comparing error ratios across column ranges
+// served by different blocks.
+//
+// For N=256, grid_n=2: block 0 computes cols 0-127, block 1 computes
+// cols 128-255. If both blocks see the same data → same inv_rms →
+// same error ratio across all columns. If aliasing → different inv_rms →
+// error ratio jumps at the block boundary.
+//
+// We also test the same thing by computing element-wise ratio
+// fused[row,col] / baseline[row,col] per row, split by column range.
+// ════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test14h_inter_block_inv_rms_diagnostic() {
+    println!("=== test14h: inter-block inv_rms divergence diagnostic ===");
+
+    let mut device = GpuDevice::new(0).unwrap();
+    let stream = device.compute_stream;
+    let config = qwen_config();
+    let hidden = config.hidden_size; // 896
+    let eps = config.rms_norm_eps;
+
+    let raw = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&raw).expect("parse");
+
+    let embed_data = load_bf16_tensor(&st, "model.embed_tokens.weight");
+    let vocab_size = embed_data.len() / hidden;
+    let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
+
+    let norm_data = load_bf16_tensor(&st, "model.layers.0.input_layernorm.weight");
+    let norm_w = unsafe { upload_bf16(&mut device.caching, &norm_data, &[hidden]) };
+
+    // Embed 8 tokens
+    let prefill_ids: Vec<u32> = vec![1, 3923, 374, 220, 17, 10, 17, 30];
+    let m = prefill_ids.len();
+    let ids_gpu = unsafe { upload_u32(&mut device.caching, &prefill_ids, &[m]) };
+    let embedded = unsafe {
+        vllm_cuda::kernels::embedding_gather(*embed_w, *ids_gpu, &mut device.caching, stream)
+    };
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    let embed_host = unsafe { download_bf16(*embedded, m * hidden) };
+    drop(ids_gpu);
+    drop(embedded);
+    drop(raw);
+
+    // Use N=256 (grid_n=2) — the minimal multi-block case
+    let n_out = 256usize;
+    let tile_n = 128usize;
+
+    // Create weight [N, K=hidden]
+    let weight_data: Vec<bf16> = (0..n_out * hidden)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00013).sin() * 0.01))
+        .collect();
+    let weight = unsafe { upload_bf16(&mut device.caching, &weight_data, &[n_out, hidden]) };
+
+    // Path A: fused_add_rms_norm_inplace + ferrite.gemm (baseline)
+    let hs_a = unsafe { upload_bf16(&mut device.caching, &embed_host, &[m, hidden]) };
+    let res_a = unsafe { upload_bf16(&mut device.caching, &vec![bf16::ZERO; m * hidden], &[m, hidden]) };
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    unsafe {
+        vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *norm_w, eps, stream);
+    }
+    let out_a = unsafe {
+        device.ferrite.gemm(*hs_a, *weight, None, 1.0, 0.0, &mut device.caching, stream)
+    };
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    let a_h = unsafe { download_bf16(*out_a, m * n_out) };
+    drop(out_a);
+
+    // Path B: launch_fused_add_norm_gemm (two-input prologue)
+    let hs_b = unsafe { upload_bf16(&mut device.caching, &embed_host, &[m, hidden]) };
+    let res_b = unsafe { upload_bf16(&mut device.caching, &vec![bf16::ZERO; m * hidden], &[m, hidden]) };
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    let out_b = unsafe {
+        vllm_cuda::ferrite::launch_fused_add_norm_gemm(
+            &FUSED_ADD_NORM_GEMM,
+            *res_b, *hs_b, *weight, *norm_w, eps, hidden as u32,
+            None, 1.0, 0.0, &mut device.caching, stream,
+        )
+    };
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    let b_h = unsafe { download_bf16(*out_b, m * n_out) };
+    drop(out_b);
+
+    // For each row, compute per-block-range error statistics
+    println!("\n  Per-row, per-block-range analysis (N={n_out}, tile_n={tile_n}, grid_n=2):");
+    println!("  {:>3}  {:>12} {:>12}  {:>12} {:>12}  {:>8}",
+        "row", "blk0_maxdiff", "blk0_ratio", "blk1_maxdiff", "blk1_ratio", "ratio_gap");
+
+    for row in 0..m {
+        let row_off = row * n_out;
+
+        // Block 0: columns 0..tile_n
+        let mut blk0_max_diff: f32 = 0.0;
+        let mut blk0_ratio_sum: f64 = 0.0;
+        let mut blk0_ratio_count: usize = 0;
+        for col in 0..tile_n {
+            let a_val = a_h[row_off + col].to_f32();
+            let b_val = b_h[row_off + col].to_f32();
+            let diff = (a_val - b_val).abs();
+            if diff > blk0_max_diff { blk0_max_diff = diff; }
+            if a_val.abs() > 1e-6 {
+                blk0_ratio_sum += (b_val / a_val) as f64;
+                blk0_ratio_count += 1;
+            }
+        }
+        let blk0_ratio = if blk0_ratio_count > 0 { blk0_ratio_sum / blk0_ratio_count as f64 } else { 0.0 };
+
+        // Block 1: columns tile_n..n_out
+        let mut blk1_max_diff: f32 = 0.0;
+        let mut blk1_ratio_sum: f64 = 0.0;
+        let mut blk1_ratio_count: usize = 0;
+        for col in tile_n..n_out {
+            let a_val = a_h[row_off + col].to_f32();
+            let b_val = b_h[row_off + col].to_f32();
+            let diff = (a_val - b_val).abs();
+            if diff > blk1_max_diff { blk1_max_diff = diff; }
+            if a_val.abs() > 1e-6 {
+                blk1_ratio_sum += (b_val / a_val) as f64;
+                blk1_ratio_count += 1;
+            }
+        }
+        let blk1_ratio = if blk1_ratio_count > 0 { blk1_ratio_sum / blk1_ratio_count as f64 } else { 0.0 };
+
+        let ratio_gap = (blk0_ratio - blk1_ratio).abs();
+        println!("  {:>3}  {:>12.4e} {:>12.8}  {:>12.4e} {:>12.8}  {:>8.4e}",
+            row, blk0_max_diff, blk0_ratio, blk1_max_diff, blk1_ratio, ratio_gap);
+    }
+
+    // Also print overall max diff per block range
+    let (diff_all, _) = max_diff_bf16(&a_h, &b_h);
+    // Extract per-block columns (output is [m, n_out] row-major)
+    let mut a_blk0 = Vec::with_capacity(m * tile_n);
+    let mut b_blk0 = Vec::with_capacity(m * tile_n);
+    let mut a_blk1 = Vec::with_capacity(m * tile_n);
+    let mut b_blk1 = Vec::with_capacity(m * tile_n);
+    for row in 0..m {
+        let off = row * n_out;
+        a_blk0.extend_from_slice(&a_h[off..off + tile_n]);
+        b_blk0.extend_from_slice(&b_h[off..off + tile_n]);
+        a_blk1.extend_from_slice(&a_h[off + tile_n..off + n_out]);
+        b_blk1.extend_from_slice(&b_h[off + tile_n..off + n_out]);
+    }
+    let (diff_blk0, _) = max_diff_bf16(&a_blk0, &b_blk0);
+    let (diff_blk1, _) = max_diff_bf16(&a_blk1, &b_blk1);
+
+    println!("\n  Summary: overall={diff_all:.2e}  blk0={diff_blk0:.2e}  blk1={diff_blk1:.2e}");
+    if diff_blk0 < 0.001 && diff_blk1 > 0.01 {
+        println!("  → ALIASING: block 0 correct, block 1 diverged (reads block 0's writes)");
+    } else if diff_blk0 > 0.01 && diff_blk1 > 0.01 {
+        let ratio_similar = (diff_blk0 - diff_blk1).abs() / diff_all < 0.5;
+        if ratio_similar {
+            println!("  → SYSTEMATIC: both blocks diverge similarly (not aliasing)");
+        } else {
+            println!("  → MIXED: both blocks diverge but differently");
+        }
+    } else if diff_blk0 < 0.001 && diff_blk1 < 0.001 {
+        println!("  → PASS: both blocks correct");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// test14i: Per-layer divergence diagnostic
+//
+// Runs the same 24-layer prefill as test14e but checks QKV and residual
+// after EACH layer to find where divergence first appears.
+// ════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test14i_per_layer_divergence() {
+    println!("=== test14i: per-layer divergence diagnostic ===");
+
+    let mut device = GpuDevice::new(0).unwrap();
+    let stream = device.compute_stream;
+    let config = qwen_config();
+    let hidden = config.hidden_size;
+    let eps = config.rms_norm_eps;
+    let num_layers = config.num_hidden_layers;
+
+    let raw = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&raw).expect("parse");
+
+    let embed_data = load_bf16_tensor(&st, "model.embed_tokens.weight");
+    let vocab_size = embed_data.len() / hidden;
+    let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
+
+    struct LW { norm1: OwnedTensor, qkv: OwnedTensor, norm2: OwnedTensor, gate_up: OwnedTensor, down: OwnedTensor }
+    let mut lw: Vec<LW> = Vec::new();
+    for i in 0..num_layers {
+        let n1 = load_bf16_tensor(&st, &format!("model.layers.{i}.input_layernorm.weight"));
+        let mut qkv = load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.q_proj.weight"));
+        qkv.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.k_proj.weight")));
+        qkv.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.v_proj.weight")));
+        let qkv_n = qkv.len() / hidden;
+        let n2 = load_bf16_tensor(&st, &format!("model.layers.{i}.post_attention_layernorm.weight"));
+        let mut gu = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.gate_proj.weight"));
+        gu.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.up_proj.weight")));
+        let gu_n = gu.len() / hidden;
+        let dw = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.down_proj.weight"));
+        let down_k = dw.len() / hidden;
+        lw.push(LW {
+            norm1: unsafe { upload_bf16(&mut device.caching, &n1, &[hidden]) },
+            qkv: unsafe { upload_bf16(&mut device.caching, &qkv, &[qkv_n, hidden]) },
+            norm2: unsafe { upload_bf16(&mut device.caching, &n2, &[hidden]) },
+            gate_up: unsafe { upload_bf16(&mut device.caching, &gu, &[gu_n, hidden]) },
+            down: unsafe { upload_bf16(&mut device.caching, &dw, &[hidden, down_k]) },
+        });
+    }
+
+    let mut gw = GpuWeights::from_single_file(MODEL_PATH, stream).unwrap();
+    let mut layers: Vec<LlamaDecoderLayer> = Vec::new();
+    for i in 0..num_layers {
+        layers.push(LlamaDecoderLayer::load(&mut gw, &format!("model.layers.{i}"), &config, i, stream).unwrap());
+    }
+    drop(raw);
+
+    let kv_a = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
+    let kv_b = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
+    let rotary = unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
+
+    let prefill_ids: Vec<u32> = vec![1, 3923, 374, 220, 17, 10, 17, 30];
+    let m = prefill_ids.len();
+
+    let ids_gpu = unsafe { upload_u32(&mut device.caching, &prefill_ids, &[m]) };
+    let mut hs_a = unsafe {
+        vllm_cuda::kernels::embedding_gather(*embed_w, *ids_gpu, &mut device.caching, stream)
+    };
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    let hs_data = unsafe { download_bf16(*hs_a, m * hidden) };
+    let mut hs_b = unsafe { upload_bf16(&mut device.caching, &hs_data, &[m, hidden]) };
+    drop(ids_gpu);
+
+    let mut res_a = unsafe {
+        upload_bf16(&mut device.caching, &vec![bf16::ZERO; m * hidden], &[m, hidden])
+    };
+    let mut res_b = unsafe {
+        upload_bf16(&mut device.caching, &vec![bf16::ZERO; m * hidden], &[m, hidden])
+    };
+
+    let pos_data: Vec<u32> = (0..m as u32).collect();
+    let slot_data: Vec<i64> = (0..m as i64).collect();
+    let cu_data: Vec<i32> = vec![0, m as i32];
+    let seq_data: Vec<i32> = vec![m as i32];
+    let bt_data: Vec<i32> = vec![0];
+    let pos = unsafe { upload_u32(&mut device.caching, &pos_data, &[m]) };
+    let slot = unsafe { upload_i64(&mut device.caching, &slot_data, &[m]) };
+    let cu = unsafe { upload_i32(&mut device.caching, &cu_data, &[2]) };
+    let seq = unsafe { upload_i32(&mut device.caching, &seq_data, &[1]) };
+    let bt = unsafe { upload_i32(&mut device.caching, &bt_data, &[1, 1]) };
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    println!("  {:>5} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "layer", "qkv_diff", "attn_diff", "mlp_diff", "res_diff", "res@qkv");
+
+    for i in 0..num_layers {
+        // At layer 9, save pre-normalization inputs for CPU verification
+        let saved_inputs = if i == 9 {
+            unsafe { cusys::cuStreamSynchronize(stream) };
+            let res_host = unsafe { download_bf16(*res_a, m * hidden) };
+            let hs_host = unsafe { download_bf16(*hs_a, m * hidden) };
+            Some((res_host, hs_host))
+        } else {
+            None
+        };
+
+        // Path A: QKV (standard)
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *lw[i].norm1, eps, stream);
+        }
+        // At layer 9, save the normalized output before GEMM consumes it
+        let saved_normed = if i == 9 {
+            unsafe { cusys::cuStreamSynchronize(stream) };
+            Some(unsafe { download_bf16(*hs_a, m * hidden) })
+        } else {
+            None
+        };
+        let qkv_a = unsafe {
+            device.ferrite.gemm(*hs_a, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream)
+        };
+        drop(hs_a);
+
+        // Path B: QKV (fused two-input)
+        let qkv_b = unsafe {
+            vllm_cuda::ferrite::launch_fused_add_norm_gemm(
+                &FUSED_ADD_NORM_GEMM,
+                *res_b, *hs_b,
+                *lw[i].qkv, *lw[i].norm1, eps, hidden as u32,
+                None, 1.0, 0.0, &mut device.caching, stream,
+            )
+        };
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *hs_b, stream) };
+        drop(hs_b);
+
+        // Check residual diff immediately after QKV-phase add
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        let ra_qkv = unsafe { download_bf16(*res_a, m * hidden) };
+        let rb_qkv = unsafe { download_bf16(*res_b, m * hidden) };
+        let (res_after_qkv_add, _) = max_diff_bf16(&ra_qkv, &rb_qkv);
+
+        // Download QKV before attention consumes them
+        let qkv_n = lw[i].qkv.as_gpu_tensor().dim(0);
+        let qa = unsafe { download_bf16(*qkv_a, m * qkv_n) };
+        let qb = unsafe { download_bf16(*qkv_b, m * qkv_n) };
+        let (qkv_diff, _) = max_diff_bf16(&qa, &qb);
+
+        // Attention
+        let attn_a = unsafe {
+            layers[i].self_attn.forward_from_qkv(
+                qkv_a, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
+                m, m, &kv_a, &rotary, &mut device,
+            )
+        };
+        let attn_b = unsafe {
+            layers[i].self_attn.forward_from_qkv(
+                qkv_b, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
+                m, m, &kv_b, &rotary, &mut device,
+            )
+        };
+
+        // Check attention diff
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        let aa = unsafe { download_bf16(*attn_a, m * hidden) };
+        let ab = unsafe { download_bf16(*attn_b, m * hidden) };
+        let (attn_diff, _) = max_diff_bf16(&aa, &ab);
+
+        // MLP: path A
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn_a, *res_a, *lw[i].norm2, eps, stream);
+        }
+        let gu_a = unsafe {
+            device.ferrite.gemm(*attn_a, *lw[i].gate_up, None, 1.0, 0.0, &mut device.caching, stream)
+        };
+        drop(attn_a);
+        let act_a = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(*gu_a, config.intermediate_size, &mut device.caching, stream)
+        };
+        drop(gu_a);
+        hs_a = unsafe {
+            device.ferrite.gemm(*act_a, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream)
+        };
+        drop(act_a);
+
+        // MLP: path B (fused two-input)
+        let gu_b = unsafe {
+            vllm_cuda::ferrite::launch_fused_add_norm_gemm(
+                &FUSED_ADD_NORM_GEMM,
+                *res_b, *attn_b,
+                *lw[i].gate_up, *lw[i].norm2, eps, hidden as u32,
+                None, 1.0, 0.0, &mut device.caching, stream,
+            )
+        };
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *attn_b, stream) };
+        drop(attn_b);
+        let act_b = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(*gu_b, config.intermediate_size, &mut device.caching, stream)
+        };
+        drop(gu_b);
+        hs_b = unsafe {
+            device.ferrite.gemm(*act_b, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream)
+        };
+        drop(act_b);
+
+        // Check MLP output and residual diff
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        let ma = unsafe { download_bf16(*hs_a, m * hidden) };
+        let mb = unsafe { download_bf16(*hs_b, m * hidden) };
+        let (mlp_diff, _) = max_diff_bf16(&ma, &mb);
+
+        let ra = unsafe { download_bf16(*res_a, m * hidden) };
+        let rb = unsafe { download_bf16(*res_b, m * hidden) };
+        let (res_diff, _) = max_diff_bf16(&ra, &rb);
+
+        let flag = if qkv_diff > 0.001 || attn_diff > 0.001 || mlp_diff > 0.001 || res_diff > 0.001 { " ←" } else { "" };
+        println!("  {:>5} {:>10.2e} {:>10.2e} {:>10.2e} {:>10.2e} {:>10.2e}{flag}",
+            i, qkv_diff, attn_diff, mlp_diff, res_diff, res_after_qkv_add);
+
+        // At first diverging layer: full CPU-side comparison
+        if i == 9 && qkv_diff > 0.0 {
+            if let (Some((res_host, hs_host)), Some(normed_a)) = (&saved_inputs, &saved_normed) {
+                let norm_data = load_bf16_tensor(
+                    &SafeTensors::deserialize(&std::fs::read(MODEL_PATH).unwrap()).unwrap(),
+                    &format!("model.layers.{i}.input_layernorm.weight"),
+                );
+
+                println!("\n    Layer 9 CPU verification (row 2):");
+                let row = 2;
+                let rs = row * hidden;
+                let re = rs + hidden;
+
+                // Compute inv_rms using f32 sums (matches both prologue and pass 1)
+                let mut ss: f64 = 0.0;
+                for k in 0..hidden {
+                    let sum = res_host[rs + k].to_f32() as f64 + hs_host[rs + k].to_f32() as f64;
+                    ss += sum * sum;
+                }
+                let inv_rms_f64 = 1.0 / (ss / hidden as f64 + eps as f64).sqrt();
+                // Use f32 rsqrt approx to match GPU
+                let ss_f32: f32 = {
+                    let mut s: f32 = 0.0;
+                    for k in 0..hidden {
+                        let sum = res_host[rs + k].to_f32() + hs_host[rs + k].to_f32();
+                        s += sum * sum;
+                    }
+                    s
+                };
+                let inv_rms_f32 = (ss_f32 / hidden as f32 + eps).sqrt().recip();
+                println!("    inv_rms: f64={inv_rms_f64:.10} f32={inv_rms_f32:.10}");
+
+                // Compare GPU normalized output (path A) vs CPU expected for first differing elements
+                // CPU expected: bf16(f32(bf16(sum)) * inv_rms_f32 * f32(bf16(weight)))
+                let mut diff_count = 0;
+                for k in 0..hidden {
+                    let sum_f32 = res_host[rs + k].to_f32() + hs_host[rs + k].to_f32();
+                    let sum_bf16 = bf16::from_f32(sum_f32).to_f32(); // bf16 round-trip
+                    let expected = sum_bf16 * inv_rms_f32 * norm_data[k].to_f32();
+                    let gpu_val = normed_a[rs + k].to_f32();
+                    let d = (expected - gpu_val).abs();
+                    if d > 1e-6 && diff_count < 5 {
+                        println!("    k={k}: cpu_expected={expected:.8} gpu_normed_a={gpu_val:.8} diff={d:.4e}");
+                        println!("           sum_f32={sum_f32:.8} sum_bf16={sum_bf16:.8} wt={:.8}", norm_data[k].to_f32());
+                        diff_count += 1;
+                    }
+                }
+                // The CPU f32 recip(sqrt) doesn't match GPU rsqrt.approx — that's expected.
+                // What matters: does the GPU path A's output match GPU path B's output?
+                // We already know qkv_diff=7.81e-3. So the normalized INPUTS to the GEMM differ.
+                //
+                // Back-compute inv_rms from GPU path A's output:
+                // normed_a[k] = bf16(f32(bf16(sum[k])) * inv_rms_gpu * f32(bf16(weight[k])))
+                // For elements where weight != 0 and sum != 0:
+                // inv_rms_gpu ≈ normed_a[k] / (bf16(sum[k]) * weight[k])
+                let mut inv_rms_estimates: Vec<f64> = Vec::new();
+                for k in 0..hidden {
+                    let sum_bf16_f32 = bf16::from_f32(
+                        res_host[rs + k].to_f32() + hs_host[rs + k].to_f32()
+                    ).to_f32();
+                    let wt = norm_data[k].to_f32();
+                    let gpu = normed_a[rs + k].to_f32();
+                    if wt.abs() > 0.01 && sum_bf16_f32.abs() > 0.01 {
+                        let est = gpu as f64 / (sum_bf16_f32 as f64 * wt as f64);
+                        inv_rms_estimates.push(est);
+                    }
+                }
+                if inv_rms_estimates.len() >= 10 {
+                    let mean: f64 = inv_rms_estimates.iter().sum::<f64>() / inv_rms_estimates.len() as f64;
+                    let min = inv_rms_estimates.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max = inv_rms_estimates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    println!("    GPU inv_rms (back-computed from path A): mean={mean:.10} range=[{min:.10}, {max:.10}]");
+                    println!("    CPU inv_rms: f32={inv_rms_f32:.10} f64={inv_rms_f64:.10}");
+                    println!("    GPU-CPU gap: {:.4e}", (mean - inv_rms_f32 as f64).abs());
+                }
+            }
+        }
+
+        // Early stop if divergence is large
+        if mlp_diff > 1.0 {
+            println!("  STOPPING: divergence too large at layer {i}");
+            break;
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// test15a: Fused add+norm+GEMM at production dimensions (hidden=2048)
+//
+// The fused kernel was only tested at hidden=896 (Qwen 0.5B). Qwen 3B
+// has hidden=2048, which changes the prologue reduction (more elements
+// per thread) and the K-loop iteration count. This test sweeps hidden
+// sizes to find where it breaks.
+// ════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test15a_fused_add_norm_gemm_dimension_sweep() {
+    println!("=== test15a: fused add+norm+GEMM dimension sweep ===");
+
+    let mut device = GpuDevice::new(0).unwrap();
+    let stream = device.compute_stream;
+    let eps: f32 = 1e-6;
+
+    for &hidden in &[896usize, 1024, 1536, 2048, 2560, 3584] {
+        let m = 8usize;
+        let n_out = 256usize; // small N to keep it fast, grid_n=2
+
+        // Random-ish inputs
+        let res_data: Vec<bf16> = (0..m * hidden)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00037).sin() * 0.5))
+            .collect();
+        let hs_data: Vec<bf16> = (0..m * hidden)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00071).cos() * 0.3))
+            .collect();
+        let norm_data: Vec<bf16> = (0..hidden)
+            .map(|i| bf16::from_f32(0.8 + ((i as f32) * 0.001).sin() * 0.2))
+            .collect();
+        let weight_data: Vec<bf16> = (0..n_out * hidden)
+            .map(|i| bf16::from_f32(((i as f32) * 0.00013).sin() * 0.01))
+            .collect();
+
+        let weight = unsafe { upload_bf16(&mut device.caching, &weight_data, &[n_out, hidden]) };
+        let norm_w = unsafe { upload_bf16(&mut device.caching, &norm_data, &[hidden]) };
+
+        // Path A: fused_add_rms_norm_inplace + ferrite.gemm
+        let hs_a = unsafe { upload_bf16(&mut device.caching, &hs_data, &[m, hidden]) };
+        let res_a = unsafe { upload_bf16(&mut device.caching, &res_data, &[m, hidden]) };
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *norm_w, eps, stream);
+        }
+        let out_a = unsafe {
+            device.ferrite.gemm(*hs_a, *weight, None, 1.0, 0.0, &mut device.caching, stream)
+        };
+
+        // Path B: launch_fused_add_norm_gemm
+        let hs_b = unsafe { upload_bf16(&mut device.caching, &hs_data, &[m, hidden]) };
+        let res_b = unsafe { upload_bf16(&mut device.caching, &res_data, &[m, hidden]) };
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        let out_b = unsafe {
+            vllm_cuda::ferrite::launch_fused_add_norm_gemm(
+                &FUSED_ADD_NORM_GEMM,
+                *res_b, *hs_b, *weight, *norm_w, eps, hidden as u32,
+                None, 1.0, 0.0, &mut device.caching, stream,
+            )
+        };
+
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        let a_h = unsafe { download_bf16(*out_a, m * n_out) };
+        let b_h = unsafe { download_bf16(*out_b, m * n_out) };
+        let (diff, worst) = max_diff_bf16(&a_h, &b_h);
+
+        let status = if diff < 0.05 { "PASS" } else { "FAIL" };
+        println!("  hidden={hidden:5} M={m} N={n_out} diff={diff:.2e} worst_idx={worst} {status}");
     }
 }

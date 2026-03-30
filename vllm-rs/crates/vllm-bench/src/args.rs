@@ -34,6 +34,8 @@ pub enum BenchCommands {
     Ragcsv(BenchRagcsvArgs),
     /// 2WikiMultihopQA multi-hop RAG accuracy benchmark.
     Multihop(BenchMultihopArgs),
+    /// MuSiQue multi-hop RAG accuracy benchmark (2-4 hops).
+    Musique(BenchMusiqueArgs),
 }
 
 /// Arguments for `vllm bench latency`.
@@ -1131,6 +1133,93 @@ pub struct BenchMultihopArgs {
 }
 
 impl BenchMultihopArgs {
+    pub fn resolved_model(&self) -> Result<String, String> {
+        match (&self.model_tag, &self.model) {
+            (Some(tag), _) => Ok(tag.clone()),
+            (None, Some(m)) => Ok(m.clone()),
+            (None, None) => {
+                Err("model is required: provide as positional arg or --model flag".into())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MuSiQue benchmark args
+// ---------------------------------------------------------------------------
+
+/// Arguments for `vllm bench musique`.
+///
+/// MuSiQue: downloads the validation set from HuggingFace and evaluates
+/// multi-hop question answering (2-4 hops). Each sample has 20 paragraphs
+/// (supporting + distractors) and requires multi-step reasoning.
+///
+/// Compares plain (chat) vs span (SPNL with relocatable document blocks)
+/// modes, reporting accuracy and TTFT, with per-hop breakdown.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench musique [MODEL] [OPTIONS]")]
+pub struct BenchMusiqueArgs {
+    /// Model: local path or HuggingFace model ID (positional).
+    pub model_tag: Option<String>,
+
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Number of queries to evaluate from the validation set.
+    #[arg(short = 'n', long, default_value_t = 100)]
+    pub num_queries: usize,
+
+    /// Max tokens for model response.
+    #[arg(long, default_value_t = 64)]
+    pub max_tokens: usize,
+
+    /// Fraction of GPU memory to use for KV cache (0.0-1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+
+    /// Enable debug output for first sample.
+    #[arg(long)]
+    pub debug: bool,
+}
+
+impl BenchMusiqueArgs {
     pub fn resolved_model(&self) -> Result<String, String> {
         match (&self.model_tag, &self.model) {
             (Some(tag), _) => Ok(tag.clone()),

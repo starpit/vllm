@@ -117,11 +117,13 @@ impl FerriteCutlass {
             }
         };
 
-        // Allocate barrier counters (4 u32s, enough for up to 4 barriers)
+        // Allocate barrier counters: [tile_counter(u32)] + [mtile_done array(u32 × max_mtiles)]
+        // Max M in practice: 2048 tokens → ceil(2048/64) = 32 M-tiles. Allocate for 64.
+        let barrier_alloc_bytes = 4 + 64 * 4; // 260 bytes
         let mut barrier_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let result = sys::cuMemAlloc_v2(
             &mut barrier_ptr as *mut *mut _ as *mut u64,
-            16, // 4 × u32
+            barrier_alloc_bytes,
         );
         if result != sys::cudaError_enum::CUDA_SUCCESS {
             bail!("cuMemAlloc for barrier counters: {result:?}");

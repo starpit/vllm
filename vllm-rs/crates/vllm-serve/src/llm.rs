@@ -583,6 +583,7 @@ impl LLM {
                 let mut sp = params.clone();
                 sp.seed = sp.seed.map(|s| s.wrapping_add(n_idx as u64));
                 sp.seal = seal;
+                sp.volatile = volatile;
                 self.resolve_max_tokens(&mut sp, prompt_ids.len());
 
                 self.client

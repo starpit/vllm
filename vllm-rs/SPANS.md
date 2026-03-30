@@ -134,8 +134,49 @@ only at projection time. At attention time:
   native SDPA (kernel requires D >= 64).
 
 `forward_with_segments()` on the model accepts external span segments
-(per-layer K/V arrays without RoPE + position offsets) for future
-multi-segment decode when the scheduler provides cached span blocks.
+(per-layer K/V arrays without RoPE + position offsets) and is called by
+the worker when a decode request has Relocatable blocks in the KV cache
+pool.
+
+### MLX Worker Integration
+
+**KV Cache Pool (`MlxKvCachePool`):** Single unified cache storing
+completed request KV caches. Two read patterns:
+
+- **Prefix reuse (hot path):** Lookup by content hash, clone contiguous
+  KV, use native SDPA. Zero overhead — identical to pre-span behavior.
+- **Span block lookup:** Lookup by scheduler block_id, slice K/V at
+  block offset, pass as segments to multi-segment SDPA. Small decode
+  overhead (~5%), but massive prefill savings from cache hits.
+
+**Eviction ordering:** LRU queue. On read, volatile entries move to
+front (evict first), non-volatile entries move to back (evict last).
+Volatile does NOT mean "don't cache" — it only affects eviction priority.
+
+**No capacity cap** (TODO): The pool currently grows without bound. MLX
+manages unified memory but cannot reclaim Arrays held by the pool. A
+future improvement should add byte-based eviction, either proactively
+(query `mlx::get_active_memory()`) or reactively (catch allocation
+failures). The scheduler's `num_gpu_blocks` is not useful here because
+MLX stores contiguous caches, not fixed-size blocks.
+
+**Seal-pad processing:** After EOS, the worker overrides sampled tokens
+to pad (token 0) until the total token count is block-aligned. The
+engine's `check_stop_criteria` defers stopping for sealed requests until
+block-aligned. Applied at all three sampling paths (double-buffer, greedy
+fast path, main path).
+
+**Request flow:**
+
+1. New request with `num_computed_tokens > 0`: prefix cache hit via hash
+   lookup in the pool. If Relocatable blocks exist, their K/V are
+   concatenated into the active cache for prefill.
+2. Decode with Relocatable annotations: blocks sliced from pool, passed
+   as segments to `forward_with_segments`. Non-span requests use the
+   unchanged hot path.
+3. Request completes: KV cache stashed in pool with block_ids and
+   volatile flag. Future requests can reuse by hash (prefix) or by
+   block_id (spans).
 
 ### Performance
 

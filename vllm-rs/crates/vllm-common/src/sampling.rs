@@ -168,6 +168,13 @@ pub struct SamplingParams {
     /// block-aligned, so the final partial block is cacheable via prefix caching.
     #[serde(default)]
     pub seal: bool,
+
+    /// When true, cached KV blocks from this request are deprioritized for
+    /// retention. On read from the KV cache pool, volatile entries move to the
+    /// front of the eviction queue (evict-first). Non-volatile entries move to
+    /// the back (evict-last).
+    #[serde(default)]
+    pub volatile: bool,
 }
 
 impl Default for SamplingParams {
@@ -198,6 +205,7 @@ impl Default for SamplingParams {
             allowed_token_ids: None,
             bad_words_token_ids: None,
             seal: false,
+            volatile: false,
         }
     }
 }

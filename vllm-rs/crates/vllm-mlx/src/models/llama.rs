@@ -1439,6 +1439,28 @@ impl super::MlxModel for MlxLlamaForCausalLM {
         Ok(logits)
     }
 
+    fn forward_with_segments(
+        &mut self,
+        input_ids: &Array,
+        kv_cache: &mut MlxKvCache,
+        rope_offset: i32,
+        per_layer_span_k: &[Vec<&Array>],
+        per_layer_span_v: &[Vec<&Array>],
+        span_position_offsets: &[i32],
+    ) -> mlx_rs::error::Result<Array> {
+        // Delegate to the inherent method which handles cos_sin_cache and
+        // routes through each layer's forward_with_segments.
+        MlxLlamaForCausalLM::forward_with_segments(
+            self,
+            input_ids,
+            kv_cache,
+            rope_offset,
+            per_layer_span_k,
+            per_layer_span_v,
+            span_position_offsets,
+        )
+    }
+
     fn hidden_states(
         &mut self,
         input_ids: &Array,

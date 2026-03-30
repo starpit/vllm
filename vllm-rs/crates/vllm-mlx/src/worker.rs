@@ -23,7 +23,7 @@ use vllm_executor::error::{ExecutorError, ExecutorResult};
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
 
-use crate::cache::{self, BatchMlxLayerKvCache, MlxKvCache};
+use crate::cache::{self, BatchMlxLayerKvCache, MlxKvCache, MlxKvCachePool};
 use crate::models::{MlxModel, MlxModelRegistry};
 
 /// State saved between execute_model calls for double-buffered async_eval.
@@ -94,9 +94,6 @@ impl MlxWorkerConfig {
 // ---------------------------------------------------------------------------
 // MlxWorker
 // ---------------------------------------------------------------------------
-
-/// Maximum number of KV caches retained in the prefix cache pool.
-const PREFIX_CACHE_POOL_MAX: usize = 32;
 
 /// Persistent batched KV caches for decode.
 ///
@@ -170,8 +167,9 @@ pub struct MlxWorker {
     /// Whether the engine is in pooling mode.
     is_pooling: bool,
 
-    /// Cached KV caches for prefix reuse: hash → kv_cache.
-    kv_cache_pool: HashMap<u64, MlxKvCache>,
+    /// Unified KV cache pool: prefix reuse (by hash) + span block lookup (by block_id).
+    /// LRU eviction with volatile-aware ordering.
+    kv_cache_pool: MlxKvCachePool,
     /// Whether prefix caching is enabled.
     enable_prefix_caching: bool,
     /// Block size for prefix hashing (must match scheduler block size).
@@ -180,6 +178,17 @@ pub struct MlxWorker {
     /// Persistent batched KV caches for decode. Persists across steps when
     /// the batch composition is stable. Rebuilt when requests join/leave.
     batched_decode_cache: Option<BatchedDecodeCache>,
+
+    /// Per-request block annotations for span-aware RoPE/caching.
+    annotation_buffers: HashMap<String, vllm_common::BlockAnnotations>,
+    /// Per-request block IDs from scheduler (first KV group).
+    request_block_ids: HashMap<String, Vec<usize>>,
+    /// 🦭 Seal-pad state: request IDs in padding mode (EOS seen, forcing pad tokens).
+    seal_padding: HashSet<String>,
+    /// EOS token IDs from model config (for seal-pad detection).
+    eos_token_ids: Vec<u32>,
+    /// Per-request prompt length (for seal-pad max_tokens detection).
+    prompt_lens: HashMap<String, usize>,
 
     /// Double-buffer state: previous step's unread GPU sampling arrays and
     /// the pre-built ModelRunnerOutput.  On the next execute_model call, we
@@ -222,10 +231,15 @@ impl MlxWorker {
             preloaded_tokenizer: None,
             is_pooling,
             resolved_architecture: None,
-            kv_cache_pool: HashMap::new(),
+            kv_cache_pool: MlxKvCachePool::new(prefix_block_size),
             enable_prefix_caching,
             prefix_block_size,
             batched_decode_cache: None,
+            annotation_buffers: HashMap::new(),
+            request_block_ids: HashMap::new(),
+            seal_padding: HashSet::new(),
+            eos_token_ids: Vec::new(),
+            prompt_lens: HashMap::new(),
             pending_step: None,
             step_count: 0,
             prefill_count: 0,
@@ -281,6 +295,54 @@ impl MlxWorker {
         } else {
             self.total_decode_ms / self.decode_count as f64
         }
+    }
+
+    /// 🦭 Apply seal-pad override to a sampled token.
+    ///
+    /// If the request is sealed and has entered padding mode (EOS already seen),
+    /// overrides the token to pad (0). If the request is sealed and the token is
+    /// EOS (or output_count >= max_tokens), enters padding mode for future tokens.
+    ///
+    /// Returns the (possibly overridden) token ID.
+    fn seal_pad_override(&mut self, req_id: &str, token_id: u32) -> u32 {
+        // Already in padding mode: force pad token.
+        if self.seal_padding.contains(req_id) {
+            return 0;
+        }
+
+        // Check if this request has seal=true.
+        let is_sealed = self.sampling_params_map.get(req_id).is_some_and(|p| p.seal);
+        if !is_sealed {
+            return token_id;
+        }
+
+        // Check if this token triggers padding mode.
+        let is_eos = self.eos_token_ids.contains(&token_id);
+        let at_max_tokens = self
+            .sampling_params_map
+            .get(req_id)
+            .and_then(|p| {
+                let max_tokens = p.max_tokens? as usize;
+                let prompt_len = self.prompt_lens.get(req_id).copied().unwrap_or(0);
+                let total_buf = self.token_buffers.get(req_id).map(|b| b.len()).unwrap_or(0);
+                // output_count = total_tokens_generated so far (buf includes prompt + outputs,
+                // and this token hasn't been added yet)
+                let output_count = total_buf.saturating_sub(prompt_len);
+                if output_count + 1 >= max_tokens {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .is_some();
+
+        if is_eos || at_max_tokens {
+            self.seal_padding.insert(req_id.to_string());
+            // The current token (EOS or the max_tokens token) is kept as-is.
+            // Padding starts from the NEXT token.
+        }
+
+        token_id
     }
 
     /// Resolve the pooling strategy from config or auto-detect.
@@ -642,6 +704,26 @@ impl Worker for MlxWorker {
                 adapter.name, adapter.config.r, adapter.config.target_modules
             );
         }
+
+        // Extract EOS token IDs from model config (for seal-pad detection).
+        if let Some(ref hf_config) = self.hf_config {
+            self.eos_token_ids = hf_config
+                .extra
+                .get("eos_token_id")
+                .map(|v| {
+                    if let Some(arr) = v.as_array() {
+                        arr.iter()
+                            .filter_map(|x| x.as_u64().map(|n| n as u32))
+                            .collect()
+                    } else if let Some(n) = v.as_u64() {
+                        vec![n as u32]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .unwrap_or_default();
+        }
+
         // Resolve pooling strategy for embeddings.
         self.resolve_pooling_strategy();
 
@@ -705,7 +787,7 @@ impl Worker for MlxWorker {
             if let Some(ref greedy_result) = pending.greedy_result {
                 let flat = greedy_result.as_slice::<u32>();
                 for (req_id, batch_pos) in &pending.greedy_mapping {
-                    let token_id = flat[*batch_pos];
+                    let token_id = self.seal_pad_override(req_id, flat[*batch_pos]);
                     token_map.insert(req_id.clone(), vec![token_id]);
                     if let Some(buf) = self.token_buffers.get_mut(req_id) {
                         buf.push(token_id);
@@ -719,7 +801,7 @@ impl Worker for MlxWorker {
             for (mapping, arr) in &pending.temp_results {
                 let flat = arr.as_slice::<u32>();
                 for (req_id, batch_pos) in mapping {
-                    let token_id = flat[*batch_pos];
+                    let token_id = self.seal_pad_override(req_id, flat[*batch_pos]);
                     token_map.insert(req_id.clone(), vec![token_id]);
                     if let Some(buf) = self.token_buffers.get_mut(req_id) {
                         buf.push(token_id);
@@ -787,6 +869,7 @@ impl Worker for MlxWorker {
         }
 
         for req_id in &scheduler_output.finished_req_ids {
+            // Stash completed KV cache in the unified pool for prefix + span reuse.
             if self.enable_prefix_caching {
                 if let (Some(prompt), Some(kv_cache)) = (
                     self.token_buffers.get(req_id),
@@ -794,15 +877,16 @@ impl Worker for MlxWorker {
                 ) {
                     if prompt.len() >= self.prefix_block_size {
                         let h = hash_prefix(prompt, self.prefix_block_size);
-                        if !self.kv_cache_pool.contains_key(&h) {
-                            // FIFO eviction when pool is full.
-                            if self.kv_cache_pool.len() >= PREFIX_CACHE_POOL_MAX
-                                && let Some(&oldest) = self.kv_cache_pool.keys().next()
-                            {
-                                self.kv_cache_pool.remove(&oldest);
-                            }
-                            self.kv_cache_pool.insert(h, kv_cache);
-                        }
+                        let block_ids = self
+                            .request_block_ids
+                            .get(req_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        let volatile = self
+                            .sampling_params_map
+                            .get(req_id)
+                            .is_some_and(|p| p.volatile);
+                        self.kv_cache_pool.insert(h, kv_cache, block_ids, volatile);
                     }
                 } else {
                     self.kv_caches.remove(req_id);
@@ -816,6 +900,11 @@ impl Worker for MlxWorker {
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
             self.mm_data_map.remove(req_id);
+            // Clean up span-related state.
+            self.annotation_buffers.remove(req_id);
+            self.request_block_ids.remove(req_id);
+            self.seal_padding.remove(req_id);
+            self.prompt_lens.remove(req_id);
         }
 
         // Collect requests.
@@ -885,7 +974,7 @@ impl Worker for MlxWorker {
             let kv_cache = if num_computed > 0 && self.enable_prefix_caching {
                 let prefix = &prompt_ids[..num_computed];
                 let h = hash_prefix(prefix, self.prefix_block_size);
-                if let Some(cached) = self.kv_cache_pool.get(&h) {
+                if let Some(cached) = self.kv_cache_pool.get_by_hash(&h) {
                     // Clone (MLX copy-on-write) and truncate to the matched prefix length.
                     let mut kv = cached.clone();
                     for layer in kv.iter_mut().flatten() {
@@ -918,6 +1007,78 @@ impl Worker for MlxWorker {
             // Store multimodal data for VLM models (consumed during forward).
             if let Some(mm_data) = new_req.mm_data.clone() {
                 self.mm_data_map.insert(new_req.req_id.clone(), mm_data);
+            }
+
+            // Store block annotations and block IDs for span support.
+            if let Some(ref ann) = new_req.block_annotations {
+                self.annotation_buffers
+                    .insert(new_req.req_id.clone(), ann.clone());
+            }
+            if !new_req.block_ids.is_empty() {
+                self.request_block_ids
+                    .insert(new_req.req_id.clone(), new_req.block_ids[0].clone());
+            }
+
+            // Track prompt length for seal-pad max_tokens detection.
+            self.prompt_lens
+                .insert(new_req.req_id.clone(), prompt_ids.len());
+
+            // For prefill with span prefix: if there are Relocatable blocks in the
+            // block pool, concatenate their K/V into the active KV cache. The normal
+            // prefill path will apply RoPE to ALL K (including span blocks) at the
+            // correct new positions via apply_rope_to_cached_k.
+            if num_computed > 0
+                && let Some(ref ann) = new_req.block_annotations
+                && !new_req.block_ids.is_empty()
+            {
+                let block_ids = &new_req.block_ids[0];
+                let mut span_k_parts: Vec<Vec<Array>> = vec![Vec::new(); num_layers];
+                let mut span_v_parts: Vec<Vec<Array>> = vec![Vec::new(); num_layers];
+                let mut any_span_blocks = false;
+
+                for (block_idx, &block_id) in block_ids.iter().enumerate() {
+                    let is_relocatable =
+                        ann.get(&block_idx) == Some(&vllm_common::BlockKind::Relocatable);
+                    if is_relocatable
+                        && let Some(per_layer) = self.kv_cache_pool.get_span_block(block_id)
+                    {
+                        for (layer_idx, (k, v)) in per_layer.iter().enumerate() {
+                            span_k_parts[layer_idx].push(k.clone());
+                            span_v_parts[layer_idx].push(v.clone());
+                        }
+                        any_span_blocks = true;
+                    }
+                }
+
+                // If we found span blocks, concatenate them into the active cache
+                // as prefix so prefill attention covers them.
+                if any_span_blocks && let Some(kv_cache) = self.kv_caches.get_mut(&new_req.req_id) {
+                    for layer_idx in 0..num_layers {
+                        if !span_k_parts[layer_idx].is_empty() {
+                            let k_refs: Vec<&Array> = span_k_parts[layer_idx].iter().collect();
+                            let v_refs: Vec<&Array> = span_v_parts[layer_idx].iter().collect();
+                            if let (Ok(k_cat), Ok(v_cat)) = (
+                                mlx_rs::ops::concatenate_axis(&k_refs, 2),
+                                mlx_rs::ops::concatenate_axis(&v_refs, 2),
+                            ) {
+                                // Build or extend the layer cache with span prefix.
+                                let layer_cache = &mut kv_cache[layer_idx];
+                                if layer_cache.is_none() {
+                                    *layer_cache =
+                                        cache::MlxLayerKvCache::from_kv(&k_cat, &v_cat).ok();
+                                }
+                                // If cache already exists (from prefix pool), the
+                                // span blocks are already incorporated via
+                                // num_computed_tokens. No double-add needed.
+                            }
+                        }
+                    }
+                    debug!(
+                        "assembled span prefix for req {} ({} span blocks)",
+                        new_req.req_id,
+                        span_k_parts[0].len()
+                    );
+                }
             }
 
             req_inputs.push(ReqInput {
@@ -1140,7 +1301,14 @@ impl Worker for MlxWorker {
         let mut batch_indices: Vec<usize> = Vec::new();
         let mut fallback_indices: Vec<usize> = Vec::new();
         for (idx, ri) in req_inputs.iter().enumerate() {
-            let needs_fallback = has_recurrent || self.mm_data_map.contains_key(&ri.req_id);
+            // Requests with span segments must go through per-request forward_with_segments.
+            let has_spans = !ri.is_prefill
+                && self.annotation_buffers.get(&ri.req_id).is_some_and(|ann| {
+                    ann.values()
+                        .any(|k| *k == vllm_common::BlockKind::Relocatable)
+                });
+            let needs_fallback =
+                has_recurrent || self.mm_data_map.contains_key(&ri.req_id) || has_spans;
             if needs_fallback {
                 fallback_indices.push(idx);
             } else {
@@ -1218,17 +1386,22 @@ impl Worker for MlxWorker {
                     .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
 
                 let flat = token_ids_arr.as_slice::<u32>();
-                token_map.insert(req_id.clone(), flat.to_vec());
+                // 🦭 Apply seal-pad override if needed.
+                let mut tokens: Vec<u32> = flat.to_vec();
+                for t in &mut tokens {
+                    *t = self.seal_pad_override(req_id, *t);
+                }
+                token_map.insert(req_id.clone(), tokens.clone());
 
                 // Update token buffer.
                 if let Some(buf) = self.token_buffers.get_mut(req_id) {
-                    buf.extend_from_slice(flat);
+                    buf.extend_from_slice(&tokens);
                 }
 
                 // Advance grammar state (none in this fast path, but be consistent).
                 #[cfg(feature = "guided-decoding")]
                 if let Some(guide) = self.grammar_states.get_mut(req_id)
-                    && let Some(&token_id) = flat.first()
+                    && let Some(&token_id) = tokens.first()
                 {
                     guide.advance(token_id);
                 }
@@ -1562,11 +1735,74 @@ impl Worker for MlxWorker {
 
             let rope_offset = req_input.positions.iter().copied().min();
 
-            let logits = model
-                .forward(&input_ids, &positions, kv_cache, rope_offset)
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
-                })?;
+            // Check if this request has span segments for forward_with_segments.
+            let has_spans = !req_input.is_prefill
+                && self
+                    .annotation_buffers
+                    .get(&req_input.req_id)
+                    .is_some_and(|ann| {
+                        ann.values()
+                            .any(|k| *k == vllm_common::BlockKind::Relocatable)
+                    });
+
+            let logits = if has_spans {
+                // Build per-layer span K/V segments from the block pool.
+                let ann = self.annotation_buffers.get(&req_input.req_id).unwrap();
+                let block_ids = self
+                    .request_block_ids
+                    .get(&req_input.req_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let mut per_layer_span_k: Vec<Vec<Array>> = vec![Vec::new(); num_layers];
+                let mut per_layer_span_v: Vec<Vec<Array>> = vec![Vec::new(); num_layers];
+                let mut span_position_offsets: Vec<i32> = Vec::new();
+
+                for (block_idx, &block_id) in block_ids.iter().enumerate() {
+                    let is_relocatable =
+                        ann.get(&block_idx) == Some(&vllm_common::BlockKind::Relocatable);
+                    if is_relocatable
+                        && let Some(per_layer) = self.kv_cache_pool.get_span_block(block_id)
+                    {
+                        for (layer_idx, (k, v)) in per_layer.iter().enumerate() {
+                            per_layer_span_k[layer_idx].push(k.clone());
+                            per_layer_span_v[layer_idx].push(v.clone());
+                        }
+                        // RoPE offset for this span segment: block_idx * block_size.
+                        span_position_offsets.push((block_idx * self.prefix_block_size) as i32);
+                    }
+                }
+
+                // Build reference slices for the trait method.
+                let per_layer_k_refs: Vec<Vec<&Array>> = per_layer_span_k
+                    .iter()
+                    .map(|v| v.iter().collect())
+                    .collect();
+                let per_layer_v_refs: Vec<Vec<&Array>> = per_layer_span_v
+                    .iter()
+                    .map(|v| v.iter().collect())
+                    .collect();
+
+                let offset = rope_offset.unwrap_or(0);
+                model
+                    .forward_with_segments(
+                        &input_ids,
+                        kv_cache,
+                        offset,
+                        &per_layer_k_refs,
+                        &per_layer_v_refs,
+                        &span_position_offsets,
+                    )
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("forward_with_segments failed: {e}"))
+                    })?
+            } else {
+                model
+                    .forward(&input_ids, &positions, kv_cache, rope_offset)
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
+                    })?
+            };
 
             if model.num_recurrent_layers() > 0 {
                 self.recurrent_states
@@ -1990,8 +2226,15 @@ impl Worker for MlxWorker {
             token_map.insert(req_input.req_id.clone(), sampled);
         }
 
-        // --- Post-sampling: update grammar states and token buffers ---
+        // --- Post-sampling: seal-pad override, grammar advance, token buffer update ---
         for (req_idx, req_input) in req_inputs.iter().enumerate() {
+            // 🦭 Apply seal-pad override to sampled tokens.
+            if let Some(sampled) = token_map.get_mut(&req_input.req_id) {
+                for t in sampled.iter_mut() {
+                    *t = self.seal_pad_override(&req_input.req_id, *t);
+                }
+            }
+
             let sampled = token_map.get(&req_input.req_id).unwrap();
 
             // Advance grammar state with the sampled token.

@@ -8,6 +8,8 @@
 //! MLX can perform slice_update in-place when the buffer has a single owner
 //! (refcount=1), avoiding allocation and data movement entirely.
 
+use std::collections::HashMap;
+
 use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::TryIndexMutOp;
@@ -411,6 +413,207 @@ pub fn kv_cache_update(
             *cache = Some(entry);
             Ok((k_view, v_view))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KV cache pool with LRU eviction and volatile-aware ordering
+// ---------------------------------------------------------------------------
+
+/// A cached KV entry in the pool.
+struct KvCacheEntry {
+    hash: u64,
+    kv_cache: MlxKvCache,
+    /// Scheduler block IDs covering this entry's contiguous KV region.
+    block_ids: Vec<usize>,
+    /// If true, on read this entry moves to the evict-first end.
+    volatile: bool,
+}
+
+/// Unified KV cache pool with two read patterns:
+///
+/// 1. **Prefix reuse (hot path):** lookup by content hash, clone contiguous KV.
+/// 2. **Span block lookup:** lookup by scheduler block_id, slice K/V at block offset.
+///
+/// Eviction ordering: entries form an LRU queue. Front = evict first, back = evict last.
+/// On read, volatile entries move to front; non-volatile entries move to back.
+/// No capacity cap — grows freely on UMA; MLX reclaims memory when Arrays are dropped.
+pub struct MlxKvCachePool {
+    /// Eviction-ordered entries. Front = evict first, back = evict last.
+    entries: Vec<KvCacheEntry>,
+    /// Eviction order: indices into `entries`. Front = evict first.
+    eviction_order: std::collections::VecDeque<usize>,
+    /// hash → index into `entries` for O(1) prefix lookup.
+    hash_index: HashMap<u64, usize>,
+    /// block_id → (entry_index, block_offset) for O(1) span block lookup.
+    block_index: HashMap<usize, (usize, usize)>,
+    /// Block size in tokens (must match scheduler).
+    block_size: usize,
+    /// Recycled entry slots (tombstones).
+    free_slots: Vec<usize>,
+}
+
+impl MlxKvCachePool {
+    /// Create an empty pool.
+    pub fn new(block_size: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            eviction_order: std::collections::VecDeque::new(),
+            hash_index: HashMap::new(),
+            block_index: HashMap::new(),
+            block_size,
+            free_slots: Vec::new(),
+        }
+    }
+
+    /// Insert a completed request's KV cache into the pool.
+    ///
+    /// `hash` is the content hash of the prompt prefix.
+    /// `block_ids` are the scheduler-assigned block IDs for this request.
+    /// `volatile` controls eviction priority on read.
+    pub fn insert(
+        &mut self,
+        hash: u64,
+        kv_cache: MlxKvCache,
+        block_ids: Vec<usize>,
+        volatile: bool,
+    ) {
+        if self.hash_index.contains_key(&hash) {
+            return; // Already cached
+        }
+
+        let idx = if let Some(slot) = self.free_slots.pop() {
+            self.entries[slot] = KvCacheEntry {
+                hash,
+                kv_cache,
+                block_ids: block_ids.clone(),
+                volatile,
+            };
+            slot
+        } else {
+            let slot = self.entries.len();
+            self.entries.push(KvCacheEntry {
+                hash,
+                kv_cache,
+                block_ids: block_ids.clone(),
+                volatile,
+            });
+            slot
+        };
+
+        self.hash_index.insert(hash, idx);
+        // Register block_id → (entry_index, block_offset) for each full block.
+        for (offset, &bid) in block_ids.iter().enumerate() {
+            self.block_index.insert(bid, (idx, offset));
+        }
+        // New entries go to the back (least likely to evict).
+        self.eviction_order.push_back(idx);
+    }
+
+    /// Look up a cached KV by content hash (prefix reuse).
+    ///
+    /// Returns a reference to the contiguous KV cache. Moves the entry in the
+    /// eviction queue: volatile → front (evict first), non-volatile → back.
+    pub fn get_by_hash(&mut self, hash: &u64) -> Option<&MlxKvCache> {
+        let &idx = self.hash_index.get(hash)?;
+        self.touch(idx);
+        Some(&self.entries[idx].kv_cache)
+    }
+
+    /// Look up a cached KV by content hash without modifying eviction order.
+    ///
+    /// Used when you need to check existence or read without side effects.
+    pub fn peek_by_hash(&self, hash: &u64) -> Option<&MlxKvCache> {
+        let &idx = self.hash_index.get(hash)?;
+        Some(&self.entries[idx].kv_cache)
+    }
+
+    /// Look up a span block by scheduler block_id.
+    ///
+    /// Returns per-layer (K, V) slices of `[1, heads, block_size, dim]`.
+    /// Moves the parent entry in the eviction queue based on volatile flag.
+    pub fn get_span_block(&mut self, block_id: usize) -> Option<Vec<(Array, Array)>> {
+        let &(entry_idx, block_offset) = self.block_index.get(&block_id)?;
+        let entry = &self.entries[entry_idx];
+        let start = (block_offset * self.block_size) as i32;
+        let end = start + self.block_size as i32;
+
+        let mut per_layer = Vec::with_capacity(entry.kv_cache.len());
+        for layer_cache in &entry.kv_cache {
+            let cache = layer_cache.as_ref()?;
+            if end as usize > cache.seq_len() {
+                return None; // Partial block
+            }
+            let k = cache.k_slice(start, end).ok()?;
+            let v = cache.v_slice(start, end).ok()?;
+            per_layer.push((k, v));
+        }
+
+        self.touch(entry_idx);
+        Some(per_layer)
+    }
+
+    /// Check if a block_id is in the pool.
+    pub fn contains_block(&self, block_id: usize) -> bool {
+        self.block_index.contains_key(&block_id)
+    }
+
+    /// Check if a hash is in the pool.
+    pub fn contains_hash(&self, hash: &u64) -> bool {
+        self.hash_index.contains_key(hash)
+    }
+
+    /// Number of entries in the pool.
+    pub fn len(&self) -> usize {
+        self.hash_index.len()
+    }
+
+    /// Whether the pool is empty.
+    pub fn is_empty(&self) -> bool {
+        self.hash_index.is_empty()
+    }
+
+    /// Move entry in the eviction queue based on volatile flag.
+    /// Volatile → front (evict first). Non-volatile → back (evict last).
+    fn touch(&mut self, idx: usize) {
+        // Remove from current position (O(n) but pool is small).
+        if let Some(pos) = self.eviction_order.iter().position(|&i| i == idx) {
+            self.eviction_order.remove(pos);
+        }
+        if self.entries[idx].volatile {
+            self.eviction_order.push_front(idx);
+        } else {
+            self.eviction_order.push_back(idx);
+        }
+    }
+
+    /// Evict the front entry (highest eviction priority).
+    /// Returns true if an entry was evicted.
+    pub fn evict_one(&mut self) -> bool {
+        while let Some(idx) = self.eviction_order.pop_front() {
+            // Skip tombstones.
+            if !self.hash_index.values().any(|&i| i == idx) {
+                continue;
+            }
+            let entry = &self.entries[idx];
+            let hash = entry.hash;
+            let block_ids = entry.block_ids.clone();
+
+            self.hash_index.remove(&hash);
+            for bid in &block_ids {
+                self.block_index.remove(bid);
+            }
+            // Clear the entry to drop Arrays (MLX reclaims memory).
+            self.entries[idx] = KvCacheEntry {
+                hash: 0,
+                kv_cache: Vec::new(),
+                block_ids: Vec::new(),
+                volatile: false,
+            };
+            self.free_slots.push(idx);
+            return true;
+        }
+        false
     }
 }
 

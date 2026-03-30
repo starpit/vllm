@@ -195,6 +195,29 @@ pub trait MlxModel: Send {
         ))
     }
 
+    /// Run a single-token decode with span KV segments (position-independent reuse).
+    ///
+    /// * `input_ids` — single decode token, shape `[1]`
+    /// * `kv_cache` — per-layer active KV cache for this request
+    /// * `rope_offset` — RoPE position of the decode token
+    /// * `per_layer_span_k` — per-layer K segments from the block pool (K without RoPE)
+    /// * `per_layer_span_v` — per-layer V segments from the block pool
+    /// * `span_position_offsets` — RoPE position offset per span segment
+    ///
+    /// Default: ignores segments, falls back to normal `forward()`.
+    fn forward_with_segments(
+        &mut self,
+        input_ids: &Array,
+        kv_cache: &mut MlxKvCache,
+        rope_offset: i32,
+        _per_layer_span_k: &[Vec<&Array>],
+        _per_layer_span_v: &[Vec<&Array>],
+        _span_position_offsets: &[i32],
+    ) -> mlx_rs::error::Result<Array> {
+        let positions = Array::from_slice(&[rope_offset], &[1]);
+        self.forward(input_ids, &positions, kv_cache, Some(rope_offset))
+    }
+
     /// Run the model backbone and return hidden states (before lm_head).
     ///
     /// Used for embedding: a single prefill pass with no KV cache, returning

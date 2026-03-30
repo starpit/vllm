@@ -312,19 +312,38 @@ pub fn make_persistent_two_phase(sequenced_ptx: &str, new_name: &str) -> Result<
     // Extract phase bodies (instructions only, no declarations)
     let phase0_body: Vec<&str> = lines[phase1_start + 1..barrier_start]
         .iter()
-        .copied()
+        .map(|s| s.as_str())
         .collect();
-    let phase1_body: Vec<&str> = lines[phase2_start + 1..]
-        .iter()
-        .take_while(|l| l.trim() != "}")
-        .copied()
-        .collect();
+    // Extract phase 1 body with brace-depth tracking (inline asm uses { })
+    let phase1_body: Vec<&str> = {
+        let mut body = Vec::new();
+        let mut depth = 0i32;
+        for l in &lines[phase2_start + 1..] {
+            let t = l.trim();
+            for ch in t.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            // The kernel's closing } brings depth to -1 (we started inside the body)
+            if depth < 0 {
+                break;
+            }
+            if t == "ret;" {
+                break;
+            }
+            body.push(l.as_str());
+        }
+        body
+    };
 
     // Extract header (version/target/extern shared)
     let header: Vec<&str> = lines
         .iter()
         .take_while(|l| !l.contains(".entry"))
-        .copied()
+        .map(|s| s.as_str())
         .collect();
 
     // Extract existing params (between .entry and {)
@@ -357,7 +376,7 @@ pub fn make_persistent_two_phase(sequenced_ptx: &str, new_name: &str) -> Result<
         let t = l.trim();
         if t.starts_with(".reg") || t.starts_with(".shared") || t.is_empty() || t.starts_with("//")
         {
-            decl_lines.push(*l);
+            decl_lines.push(l.as_str());
         }
     }
 
@@ -413,9 +432,9 @@ pub fn make_persistent_two_phase(sequenced_ptx: &str, new_name: &str) -> Result<
     out.push_str("\t.reg .u32 \t%r_ptile, %r_ptile_x, %r_ptile_y;\n");
     out.push_str("\t.reg .u32 \t%r_ptotal, %r_pgx0, %r_pgx1;\n");
     out.push_str("\t.reg .u32 \t%r_pp0tiles, %r_plocal, %r_pmtile;\n");
-    out.push_str("\t.reg .u32 \t%r_pntpm0, %r_pbarval;\n");
+    out.push_str("\t.reg .u32 \t%r_pntpm0, %r_pbarval, %r_pswiz;\n");
     out.push_str("\t.reg .u64 \t%rd_pctr, %rd_pmtdone, %rd_pbar;\n");
-    out.push_str("\t.reg .pred \t%p_pdone, %p_pt0, %p_pphase;\n");
+    out.push_str("\t.reg .pred \t%p_pdone, %p_pt0, %p_pphase, %p_pswiz;\n");
     out.push_str("\t.shared .align 4 .u32 _ptile_smem[1];\n\n");
 
     // Persistent loop setup
@@ -477,10 +496,7 @@ pub fn make_persistent_two_phase(sequenced_ptx: &str, new_name: &str) -> Result<
     out.push_str("\tld.param.s32 \t%r_pbarval, [ferrite_params_2+68];\n"); // N for phase 1
     out.push_str("\tadd.s32 \t%r_pbarval, %r_pbarval, 127;\n");
     out.push_str("\tshr.u32 \t%r_pbarval, %r_pbarval, 7;\n"); // ceil(N/128) = grid_n
-    // swizzle_log
-    out.push_str("\t.reg .u32 \t%r_pswiz;\n");
     out.push_str("\tmov.u32 \t%r_pswiz, 0;\n");
-    out.push_str("\t.reg .pred \t%p_pswiz;\n");
     out.push_str("\tsetp.ge.u32 \t%p_pswiz, %r_pbarval, 2;\n");
     out.push_str("\t@%p_pswiz mov.u32 \t%r_pswiz, 1;\n");
     out.push_str("\tsetp.ge.u32 \t%p_pswiz, %r_pbarval, 4;\n");

@@ -87,7 +87,7 @@
     {"offset": 328, "base_value": 0, "check_value": 0},
     {"offset": 332, "base_value": 0, "check_value": 0},
     {"offset": 336, "base_value": 128, "check_value": 2048, "depends_on": {"K": 64}},
-    {"offset": 340, "base_value": 0, "check_value": 0, "base_f32": 0.000000, "beta_f32": 0.000000, "depends_on": {"K": 23853, "M": 23853, "N": 23853, "lda": 23853, "ldb": 23853, "ldc": 23853, "ldd": 23853}},
+    {"offset": 340, "base_value": 1851881061, "check_value": 0, "base_f32": 17444314353882984134964412416.000000, "alpha_f32": 0.000000, "beta_f32": 0.000000, "depends_on": {"K": -1851858972, "M": -1851858972, "N": -1851858972, "lda": -1851858972, "ldb": -1851858972, "ldc": -1851858972, "ldd": -1851858972}},
     {"offset": 344, "base_value": 0, "check_value": 0},
     {"offset": 348, "base_value": 0, "check_value": 0},
     {"offset": 352, "base_value": 0, "check_value": 0},

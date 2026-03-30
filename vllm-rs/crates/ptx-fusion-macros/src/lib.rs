@@ -2626,6 +2626,111 @@ pub fn persistent_gemm(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
     quote! { #persistent }.into()
 }
 
+/// Persistent MLP block: gate_up + SiLU + down with per-M-tile barriers.
+///
+/// Same args as sequence_mlp_block! — generates the sequenced kernel then
+/// wraps it in a persistent work-queue loop.
+#[proc_macro]
+pub fn persistent_mlp_block(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let args: Vec<proc_macro::TokenTree> = input.into_iter().collect();
+    let mut strings = Vec::new();
+    for arg in &args {
+        if let proc_macro::TokenTree::Literal(lit) = arg {
+            let s = lit.to_string();
+            if s.starts_with('"') && s.ends_with('"') {
+                strings.push(s[1..s.len() - 1].to_string());
+            }
+        }
+    }
+    if strings.len() < 6 {
+        return quote! { compile_error!("persistent_mlp_block! expects 6 args") }.into();
+    }
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let kernel_base = manifest_dir.parent().unwrap().join("ptx-fusion");
+    let read = |path: &str| -> Result<String, String> {
+        let full = kernel_base.join(path);
+        std::fs::read_to_string(&full).map_err(|e| format!("cannot read {}: {e}", full.display()))
+    };
+
+    macro_rules! rd {
+        ($idx:expr) => {
+            match read(&strings[$idx]) {
+                Ok(s) => s,
+                Err(e) => return quote! { compile_error!(#e) }.into(),
+            }
+        };
+    }
+    let gate_up_ptx = rd!(0);
+    let gate_up_deriv = rd!(1);
+    let down_ptx = rd!(2);
+    let down_deriv = rd!(3);
+    let silu_ptx = rd!(4);
+    let name = &strings[5];
+
+    // Step 1: Build sequenced MLP block (same as sequence_mlp_block)
+    let (flat_gate_up, _) =
+        match perimeter::replace_perimeter(&gate_up_ptx, &gate_up_deriv, "gate_up") {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("gate_up: {e}");
+                return quote! { compile_error!(#msg) }.into();
+            }
+        };
+
+    let silu_stage = match pipeline::PipelineStage::from_ptx("silu", &silu_ptx, None) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("silu: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let down_stage = match pipeline::PipelineStage::from_ptx("down", &down_ptx, None) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("down: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let fused_down =
+        match pipeline_compile::fuse_pointwise_into_gemm(&silu_stage, &down_stage, "down_silu") {
+            Ok(ptx) => ptx,
+            Err(e) => {
+                let msg = format!("fuse silu+down: {e}");
+                return quote! { compile_error!(#msg) }.into();
+            }
+        };
+    let (flat_down, _) = match perimeter::replace_perimeter(&fused_down, &down_deriv, "down_silu") {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("down perimeter: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let flat_down = dedup_reg_declarations(&flat_down);
+
+    // Step 2: Sequence into two-phase kernel
+    let sequenced = match pipeline_compile::sequence_gemm_phases(&[&flat_gate_up, &flat_down], name)
+    {
+        Ok(ptx) => ptx,
+        Err(e) => {
+            let msg = format!("sequence: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    // Step 3: Wrap in persistent loop with per-M-tile barriers
+    let persistent = match persistent::make_persistent_two_phase(&sequenced, name) {
+        Ok(ptx) => ptx,
+        Err(e) => {
+            let msg = format!("persistent wrap: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    quote! { #persistent }.into()
+}
+
 /// Count the total bytes of extra `.param` declarations before the flat struct
 /// param (`ferrite_params`) in a fused kernel's PTX entry point.
 ///

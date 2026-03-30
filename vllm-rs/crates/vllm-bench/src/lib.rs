@@ -8,6 +8,7 @@
 
 mod args;
 pub(crate) mod datasets;
+mod hotpotqa;
 mod latency;
 mod multihop;
 mod musique;
@@ -21,10 +22,10 @@ mod sweep;
 mod throughput;
 
 pub use args::{
-    BenchCommand, BenchCommands, BenchLatencyArgs, BenchMultihopArgs, BenchMusiqueArgs,
-    BenchNiahArgs, BenchRagcsvArgs, BenchRulerArgs, BenchServeArgs, BenchSpansArgs,
-    BenchStartupArgs, BenchThroughputArgs, SweepCommand, SweepCommands, SweepServeArgs,
-    SweepStartupArgs,
+    BenchCommand, BenchCommands, BenchHotpotqaArgs, BenchLatencyArgs, BenchMultihopArgs,
+    BenchMusiqueArgs, BenchNiahArgs, BenchRagcsvArgs, BenchRulerArgs, BenchServeArgs,
+    BenchSpansArgs, BenchStartupArgs, BenchThroughputArgs, SweepCommand, SweepCommands,
+    SweepServeArgs, SweepStartupArgs,
 };
 
 /// Format a rate as `it/s` (fast) or `s/it` (slow), matching Python tqdm style.
@@ -83,6 +84,10 @@ pub async fn run_bench(cmd: BenchCommand) -> anyhow::Result<()> {
         }
         BenchCommands::Musique(args) => {
             tokio::task::spawn_blocking(move || musique::run_bench_musique(args)).await??;
+            Ok(())
+        }
+        BenchCommands::Hotpotqa(args) => {
+            tokio::task::spawn_blocking(move || hotpotqa::run_bench_hotpotqa(args)).await??;
             Ok(())
         }
     }

@@ -1,13 +1,16 @@
-//! Pipeline stage descriptors extracted from PTX.
+//! Pipeline stage descriptors and tile perimeters extracted from PTX.
 //!
 //! Each kernel is analyzed into a `PipelineStage` that captures its tiled
 //! structure: loops, carry registers, pattern classification, and finalization.
-//! The pipeline compiler (future) composes N stages into a single fused kernel.
+//!
+//! The `TilePerimeter` describes what flows in and out of each **tile iteration**
+//! within a kernel's mainloop. This is the execution interface for the tile
+//! pipeline: the compiler steps tiles through stages, passing carries forward.
 
 use crate::fuse_cp_async::{CpAsyncClass, classify_cp_async_loads, identify_a_matrix_param};
 use crate::parser::{
     AsyncCopyPort, CarryRegister, CarryRole, KernelProtocol, LoopDescriptor, PtxParser,
-    analyze_carries, detect_loops,
+    TileIndexMap, analyze_carries, detect_loops, extract_tile_index_map,
 };
 
 /// How a reduction is performed within the kernel.
@@ -83,6 +86,146 @@ pub struct ReductionDecomposition {
     pub emit_body_lines: Vec<String>,
 }
 
+// ===== Tile Perimeter =====
+
+/// What kind of stage this is in the tile pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageKind {
+    /// Reduction along a dimension (e.g., rms_norm along H).
+    /// Produces a scalar per row, consumed by downstream stages.
+    Reduction,
+    /// Tiled GEMM (CUTLASS). The K-loop iterates over tiles,
+    /// loading A and B via cp.async, computing MMA, accumulating.
+    TiledGemm,
+    /// Pointwise operation (e.g., SiLU+mul). No accumulation,
+    /// applied inline at the downstream GEMM's A-load sites.
+    Pointwise,
+}
+
+/// The tile shape of a stage (M-tile, N-tile, K-tile dimensions).
+#[derive(Debug, Clone)]
+pub struct TileShape {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub tile_k: u32,
+}
+
+/// A data port in the tile perimeter: one input or output per tile iteration.
+#[derive(Debug, Clone)]
+pub struct TilePort {
+    /// Human-readable name (e.g., "A_tile", "B_tile", "inv_rms").
+    pub name: String,
+    /// Element type (e.g., "bf16", "f32").
+    pub elem_type: String,
+    /// How the data is accessed.
+    pub access: TilePortAccess,
+}
+
+/// How a tile port's data is accessed.
+#[derive(Debug, Clone)]
+pub enum TilePortAccess {
+    /// Loaded from GMEM via cp.async (CUTLASS A/B loads).
+    CpAsync { sites: Vec<AsyncCopyPort> },
+    /// Loaded from GMEM via explicit ld.global (norm input, weight).
+    GlobalLoad,
+    /// Scalar broadcast from SMEM (e.g., inv_rms per row).
+    SmemScalar,
+    /// Per-element formula applied inline (not materialized).
+    /// The formula is the emit body from a reduction decomposition.
+    InlineFormula { emit_body: Vec<String> },
+    /// Written to GMEM (epilogue stores).
+    GlobalStore,
+}
+
+/// State carried across tile iterations (or across rows within one stage).
+#[derive(Debug, Clone)]
+pub struct TileCarry {
+    /// Human-readable name (e.g., "sum_sq", "mma_accum").
+    pub name: String,
+    /// The PTX registers holding this carry.
+    pub registers: Vec<String>,
+    /// Where the carry lives.
+    pub storage: CarryStorage,
+}
+
+/// Where carry state is stored.
+#[derive(Debug, Clone)]
+pub enum CarryStorage {
+    /// In registers (MMA accumulators, induction vars).
+    Registers,
+    /// In shared memory (reduction partial sums, inv_rms array).
+    Smem,
+}
+
+/// Post-iteration finalization (runs after all K-tiles or all H-elements).
+#[derive(Debug, Clone)]
+pub struct TileFinalization {
+    /// The PTX lines of the finalization code (extracted, not hand-written).
+    pub lines: Vec<String>,
+    /// Line range in the original PTX source.
+    pub line_range: (usize, usize),
+    /// Register holding the finalized value (e.g., inv_rms).
+    pub result_reg: String,
+}
+
+/// The tile-level perimeter of a pipeline stage.
+///
+/// Describes what flows in and out of each tile iteration within a kernel's
+/// mainloop. This is the execution interface — the pipeline compiler steps
+/// tiles through stages, and the TilePerimeter defines the contract at each
+/// stage boundary.
+///
+/// For a GEMM: one tile iteration = one K-step of the mainloop.
+/// For a reduction: one tile iteration = the full reduction for one M-tile.
+/// For pointwise: one tile iteration = one element (or vector of elements).
+#[derive(Debug, Clone)]
+pub struct TilePerimeter {
+    /// Stage name (from PipelineStage).
+    pub name: String,
+    /// What kind of computation this stage performs.
+    pub kind: StageKind,
+    /// The tile dimensions.
+    pub tile_shape: TileShape,
+    /// How (ctaid.x, ctaid.y) map to (m_tile, n_tile).
+    /// Extracted from the GEMM's PTX. `None` for non-GEMM stages
+    /// (they inherit the tile index from their downstream GEMM).
+    pub tile_index: Option<TileIndexMap>,
+    /// Data flowing into each tile iteration.
+    pub inputs: Vec<TilePort>,
+    /// Data flowing out of each tile iteration.
+    pub outputs: Vec<TilePort>,
+    /// State carried across iterations (accumulators, pointers, etc.).
+    pub carries: Vec<TileCarry>,
+    /// Post-iteration finalization code.
+    pub finalization: Option<TileFinalization>,
+}
+
+/// An edge connecting two stages in a fusible segment.
+#[derive(Debug, Clone)]
+pub enum StageEdge {
+    /// Reduction output consumed at next GEMM's A-loads.
+    /// The reduction's inv_rms goes to SMEM, and its per-element formula
+    /// inlines at the GEMM's A-load sites.
+    ReductionToGemm,
+    /// GEMM output materialized to GMEM, next stage reads from GMEM.
+    /// Required when dimensions change (e.g., gate_up → down).
+    GmemMaterialization,
+    /// Pointwise formula injected at next GEMM's A-loads.
+    /// The formula is applied inline, no materialization.
+    PointwiseToGemm,
+}
+
+/// A fusible segment: a chain of stages connected by edges.
+///
+/// Compiles into a single kernel launch. The tile executor steps tiles
+/// through the stages, using carries to pass state and edges to define
+/// how stages connect.
+#[derive(Debug, Clone)]
+pub struct FusibleSegment {
+    pub stages: Vec<TilePerimeter>,
+    pub edges: Vec<StageEdge>,
+}
+
 /// A single stage in a fused pipeline, extracted entirely from PTX analysis.
 #[derive(Debug, Clone)]
 pub struct PipelineStage {
@@ -100,6 +243,265 @@ pub struct PipelineStage {
     pub protocol: KernelProtocol,
     /// The raw PTX source lines.
     pub source_lines: Vec<String>,
+}
+
+impl TilePerimeter {
+    /// Extract a TilePerimeter from a PipelineStage.
+    ///
+    /// Dispatches to the appropriate extractor based on the stage pattern.
+    pub fn from_stage(stage: &PipelineStage) -> Result<Self, String> {
+        match &stage.pattern {
+            StagePattern::TiledGemm {
+                a_loads,
+                b_loads,
+                mma_accumulators,
+                pipeline_depth,
+            } => Self::from_gemm(stage, a_loads, b_loads, mma_accumulators, *pipeline_depth),
+            StagePattern::Reduction {
+                accumulators,
+                reduce_method,
+            } => Self::from_reduction(stage, accumulators, reduce_method),
+            StagePattern::Pointwise => Self::from_pointwise(stage),
+        }
+    }
+
+    /// Extract TilePerimeter from a TiledGemm stage (CUTLASS).
+    fn from_gemm(
+        stage: &PipelineStage,
+        a_loads: &[AsyncCopyPort],
+        b_loads: &[AsyncCopyPort],
+        mma_accumulators: &[String],
+        pipeline_depth: usize,
+    ) -> Result<Self, String> {
+        // Extract tile shape from the GEMM's mangled entry name
+        let (tile_m, tile_n, tile_k) = extract_gemm_shape(&stage.protocol.name)?;
+
+        // Extract tile index from PTX
+        let lines: Vec<&str> = stage.source_lines.iter().map(|s| s.as_str()).collect();
+        let tile_index = extract_tile_index_map(&lines);
+
+        // Inputs: A-tile and B-tile via cp.async
+        let inputs = vec![
+            TilePort {
+                name: "A_tile".into(),
+                elem_type: "bf16".into(),
+                access: TilePortAccess::CpAsync {
+                    sites: a_loads.to_vec(),
+                },
+            },
+            TilePort {
+                name: "B_tile".into(),
+                elem_type: "bf16".into(),
+                access: TilePortAccess::CpAsync {
+                    sites: b_loads.to_vec(),
+                },
+            },
+        ];
+
+        // Outputs: epilogue stores to GMEM
+        let outputs = vec![TilePort {
+            name: "D_tile".into(),
+            elem_type: "bf16".into(),
+            access: TilePortAccess::GlobalStore,
+        }];
+
+        // Carries: MMA accumulators + pipeline buffer state
+        let mut carries = vec![TileCarry {
+            name: "mma_accum".into(),
+            registers: mma_accumulators.to_vec(),
+            storage: CarryStorage::Registers,
+        }];
+
+        // Add induction vars and tile pointers from the stage's carries
+        let k_pointers: Vec<String> = stage
+            .carries
+            .iter()
+            .filter(|c| c.role == CarryRole::TilePointer)
+            .map(|c| c.register.clone())
+            .collect();
+        if !k_pointers.is_empty() {
+            carries.push(TileCarry {
+                name: "k_pointer".into(),
+                registers: k_pointers,
+                storage: CarryStorage::Registers,
+            });
+        }
+
+        let buffer_regs: Vec<String> = stage
+            .carries
+            .iter()
+            .filter(|c| c.role == CarryRole::BufferState)
+            .map(|c| c.register.clone())
+            .collect();
+        if !buffer_regs.is_empty() {
+            carries.push(TileCarry {
+                name: format!("buffer_state_{}stage", pipeline_depth),
+                registers: buffer_regs,
+                storage: CarryStorage::Registers,
+            });
+        }
+
+        Ok(TilePerimeter {
+            name: stage.name.clone(),
+            kind: StageKind::TiledGemm,
+            tile_shape: TileShape {
+                tile_m,
+                tile_n,
+                tile_k,
+            },
+            tile_index,
+            inputs,
+            outputs,
+            carries,
+            finalization: None, // GEMM epilogue is handled separately
+        })
+    }
+
+    /// Extract TilePerimeter from a Reduction stage (rms_norm).
+    fn from_reduction(
+        stage: &PipelineStage,
+        accumulators: &[String],
+        _reduce_method: &ReduceMethod,
+    ) -> Result<Self, String> {
+        let decomp = stage
+            .decompose_reduction()
+            .ok_or("reduction stage does not decompose")?;
+
+        // For a reduction, tile_shape is (tile_m, 1, H) — reduces full hidden dim
+        // tile_m is inherited from the downstream GEMM, so we use 0 as placeholder
+        let tile_shape = TileShape {
+            tile_m: 0, // inherited from downstream GEMM
+            tile_n: 1,
+            tile_k: 0, // full hidden dimension (runtime)
+        };
+
+        // Inputs: the tensors being reduced
+        let inputs = vec![
+            TilePort {
+                name: "input".into(),
+                elem_type: "bf16".into(),
+                access: TilePortAccess::GlobalLoad,
+            },
+            TilePort {
+                name: "weight".into(),
+                elem_type: "bf16".into(),
+                access: TilePortAccess::GlobalLoad,
+            },
+        ];
+
+        // Outputs: inv_rms scalar (to SMEM) + per-element formula (inline)
+        let outputs = vec![
+            TilePort {
+                name: "inv_rms".into(),
+                elem_type: "f32".into(),
+                access: TilePortAccess::SmemScalar,
+            },
+            TilePort {
+                name: "normalized".into(),
+                elem_type: "bf16".into(),
+                access: TilePortAccess::InlineFormula {
+                    emit_body: decomp.emit_body_lines.clone(),
+                },
+            },
+        ];
+
+        // Carries: sum_sq accumulator
+        let carries = vec![TileCarry {
+            name: "sum_sq".into(),
+            registers: accumulators.to_vec(),
+            storage: CarryStorage::Registers,
+        }];
+
+        // Finalization: the warp shuffle + SMEM reduce + rsqrt → inv_rms
+        let finalization = if !decomp.finalized_value_reg.is_empty() {
+            Some(TileFinalization {
+                lines: stage.source_lines[decomp.finalize_range.0
+                    ..=decomp.finalize_range.1.min(stage.source_lines.len() - 1)]
+                    .iter()
+                    .map(|l| l.trim().to_string())
+                    .collect(),
+                line_range: decomp.finalize_range,
+                result_reg: decomp.finalized_value_reg.clone(),
+            })
+        } else {
+            None
+        };
+
+        Ok(TilePerimeter {
+            name: stage.name.clone(),
+            kind: StageKind::Reduction,
+            tile_shape,
+            tile_index: None, // inherited from downstream GEMM
+            inputs,
+            outputs,
+            carries,
+            finalization,
+        })
+    }
+
+    /// Extract TilePerimeter from a Pointwise stage (SiLU+mul).
+    fn from_pointwise(stage: &PipelineStage) -> Result<Self, String> {
+        // Pointwise: no accumulation, no carries, tile shape inherited
+        let tile_shape = TileShape {
+            tile_m: 0, // inherited
+            tile_n: 0,
+            tile_k: 0,
+        };
+
+        // Inputs from GMEM
+        let inputs = vec![TilePort {
+            name: "input".into(),
+            elem_type: "bf16".into(),
+            access: TilePortAccess::GlobalLoad,
+        }];
+
+        // Output is an inline formula (applied at downstream GEMM's A-loads)
+        let outputs = vec![TilePort {
+            name: "activated".into(),
+            elem_type: "bf16".into(),
+            access: TilePortAccess::InlineFormula {
+                emit_body: vec![], // filled in when composing with GEMM
+            },
+        }];
+
+        Ok(TilePerimeter {
+            name: stage.name.clone(),
+            kind: StageKind::Pointwise,
+            tile_shape,
+            tile_index: None,
+            inputs,
+            outputs,
+            carries: vec![],
+            finalization: None,
+        })
+    }
+}
+
+/// Extract (tile_m, tile_n, tile_k) from a CUTLASS mangled entry name.
+fn extract_gemm_shape(name: &str) -> Result<(u32, u32, u32), String> {
+    let marker = "GemmShapeILi";
+    let idx = name.find(marker).ok_or_else(|| {
+        format!(
+            "no GemmShapeILi in entry name: {}",
+            &name[..name.len().min(80)]
+        )
+    })?;
+    let rest = &name[idx + marker.len()..];
+    let mut dims = Vec::new();
+    let mut cur = rest;
+    for _ in 0..3 {
+        let end = cur.find('E').ok_or("malformed GemmShape")?;
+        dims.push(
+            cur[..end]
+                .parse::<u32>()
+                .map_err(|e| format!("bad dim: {e}"))?,
+        );
+        cur = &cur[end + 1..];
+        if cur.starts_with("Li") {
+            cur = &cur[2..];
+        }
+    }
+    Ok((dims[0], dims[1], dims[2]))
 }
 
 impl PipelineStage {
@@ -647,6 +1049,196 @@ mod tests {
         eprintln!("=== Emit body: {} lines ===", decomp.emit_body_lines.len());
         for (i, line) in decomp.emit_body_lines.iter().enumerate() {
             eprintln!("  {i:3}: {line}");
+        }
+    }
+
+    // ── TilePerimeter extraction tests ──
+
+    #[test]
+    fn tile_perimeter_from_cutlass_gemm() {
+        let ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let stage = PipelineStage::from_ptx("gemm", ptx, None).expect("parse");
+        let perim = TilePerimeter::from_stage(&stage).expect("extract perimeter");
+
+        assert_eq!(perim.kind, StageKind::TiledGemm);
+        assert_eq!(perim.tile_shape.tile_m, 64);
+        assert_eq!(perim.tile_shape.tile_n, 128);
+        assert_eq!(perim.tile_shape.tile_k, 32);
+
+        // Should have tile index extracted
+        assert!(perim.tile_index.is_some(), "GEMM should have tile index");
+        let ti = perim.tile_index.as_ref().unwrap();
+        assert!(!ti.m_tile_reg.is_empty());
+        assert!(!ti.n_tile_reg.is_empty());
+
+        // Should have A and B inputs
+        assert_eq!(perim.inputs.len(), 2);
+        assert_eq!(perim.inputs[0].name, "A_tile");
+        assert_eq!(perim.inputs[1].name, "B_tile");
+        match &perim.inputs[0].access {
+            TilePortAccess::CpAsync { sites } => {
+                assert!(!sites.is_empty(), "should have A-load cp.async sites");
+            }
+            other => panic!("A_tile should be CpAsync, got {:?}", other),
+        }
+
+        // Should have output
+        assert_eq!(perim.outputs.len(), 1);
+        assert_eq!(perim.outputs[0].name, "D_tile");
+
+        // Should have MMA accumulators as carries
+        assert!(!perim.carries.is_empty());
+        let mma_carry = perim.carries.iter().find(|c| c.name == "mma_accum");
+        assert!(mma_carry.is_some(), "should have MMA accumulator carry");
+        assert!(
+            !mma_carry.unwrap().registers.is_empty(),
+            "MMA carry should have registers"
+        );
+
+        eprintln!("GEMM TilePerimeter:");
+        eprintln!(
+            "  tile: {}x{}x{}",
+            perim.tile_shape.tile_m, perim.tile_shape.tile_n, perim.tile_shape.tile_k
+        );
+        eprintln!("  inputs: {}", perim.inputs.len());
+        eprintln!("  outputs: {}", perim.outputs.len());
+        eprintln!("  carries: {}", perim.carries.len());
+        for c in &perim.carries {
+            eprintln!("    {}: {} regs", c.name, c.registers.len());
+        }
+    }
+
+    #[test]
+    fn tile_perimeter_from_rms_norm() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let stage = PipelineStage::from_ptx("rms_norm", ptx, None).expect("parse");
+        let perim = TilePerimeter::from_stage(&stage).expect("extract perimeter");
+
+        assert_eq!(perim.kind, StageKind::Reduction);
+        assert!(perim.tile_index.is_none(), "reduction inherits tile index");
+
+        // Should have input and weight ports
+        assert!(perim.inputs.len() >= 2, "need input + weight");
+
+        // Should have inv_rms scalar output and inline formula output
+        assert_eq!(perim.outputs.len(), 2);
+        let inv_rms_port = perim.outputs.iter().find(|p| p.name == "inv_rms");
+        assert!(inv_rms_port.is_some(), "should have inv_rms output");
+        let formula_port = perim.outputs.iter().find(|p| p.name == "normalized");
+        assert!(formula_port.is_some(), "should have normalized output");
+        match &formula_port.unwrap().access {
+            TilePortAccess::InlineFormula { emit_body } => {
+                assert!(!emit_body.is_empty(), "emit body should have instructions");
+                let has_mul = emit_body.iter().any(|l| l.contains("mul.f32"));
+                assert!(has_mul, "emit body should contain mul.f32");
+            }
+            other => panic!("normalized should be InlineFormula, got {:?}", other),
+        }
+
+        // Should have sum_sq carry
+        assert!(!perim.carries.is_empty());
+        assert_eq!(perim.carries[0].name, "sum_sq");
+
+        // Should have finalization (warp shuffle → rsqrt)
+        assert!(perim.finalization.is_some(), "should have finalization");
+        let fin = perim.finalization.as_ref().unwrap();
+        assert!(!fin.result_reg.is_empty(), "should have result register");
+        let fin_text = fin.lines.join("\n");
+        assert!(
+            fin_text.contains("rsqrt"),
+            "finalization should contain rsqrt"
+        );
+
+        eprintln!("Reduction TilePerimeter:");
+        eprintln!(
+            "  carries: {} ({} regs)",
+            perim.carries[0].name,
+            perim.carries[0].registers.len()
+        );
+        eprintln!(
+            "  finalization: {} lines, result={}",
+            fin.lines.len(),
+            fin.result_reg
+        );
+        eprintln!(
+            "  emit body: {} lines",
+            match &formula_port.unwrap().access {
+                TilePortAccess::InlineFormula { emit_body } => emit_body.len(),
+                _ => 0,
+            }
+        );
+    }
+
+    #[test]
+    fn tile_perimeter_from_silu_mul() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_silu_mul.ptx");
+        let stage = PipelineStage::from_ptx("silu_mul", ptx, None).expect("parse");
+        let perim = TilePerimeter::from_stage(&stage).expect("extract perimeter");
+
+        assert_eq!(perim.kind, StageKind::Pointwise);
+        assert!(perim.tile_index.is_none());
+        assert!(perim.carries.is_empty(), "pointwise has no carries");
+        assert!(
+            perim.finalization.is_none(),
+            "pointwise has no finalization"
+        );
+    }
+
+    #[test]
+    fn tile_perimeter_all_cutlass_configs() {
+        let configs = [
+            (
+                "64x64x32",
+                include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx"),
+                64,
+                64,
+                32,
+            ),
+            (
+                "64x128x32",
+                include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx"),
+                64,
+                128,
+                32,
+            ),
+            (
+                "128x128x32",
+                include_str!("../../ptx-fusion/kernels/cutlass_bf16_128x128x32_sm89.ptx"),
+                128,
+                128,
+                32,
+            ),
+            (
+                "128x128x64",
+                include_str!("../../ptx-fusion/kernels/cutlass_bf16_128x128x64_sm89.ptx"),
+                128,
+                128,
+                64,
+            ),
+        ];
+        for (label, ptx, exp_m, exp_n, exp_k) in configs {
+            let stage = PipelineStage::from_ptx(label, ptx, None)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let perim =
+                TilePerimeter::from_stage(&stage).unwrap_or_else(|e| panic!("{label}: {e}"));
+
+            assert_eq!(perim.tile_shape.tile_m, exp_m, "{label} tile_m");
+            assert_eq!(perim.tile_shape.tile_n, exp_n, "{label} tile_n");
+            assert_eq!(perim.tile_shape.tile_k, exp_k, "{label} tile_k");
+            assert!(perim.tile_index.is_some(), "{label} should have tile index");
+            assert!(!perim.carries.is_empty(), "{label} should have carries");
+
+            eprintln!(
+                "{label}: {}x{}x{}, {} carries, {} A-loads",
+                perim.tile_shape.tile_m,
+                perim.tile_shape.tile_n,
+                perim.tile_shape.tile_k,
+                perim.carries.len(),
+                match &perim.inputs[0].access {
+                    TilePortAccess::CpAsync { sites } => sites.len(),
+                    _ => 0,
+                }
+            );
         }
     }
 

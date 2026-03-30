@@ -492,6 +492,10 @@ pub unsafe fn launch_fused_add_norm_gemm(
 
     let out = alloc.alloc_tensor(&[m as usize, n as usize], residual.dtype());
 
+    // The prologue's writeback (bf16 sums to residual) is guarded by @%p_rms_wb
+    // so only the first N-tile block per m_tile writes. This avoids the race
+    // where multiple blocks read-modify-write the same residual rows.
+
     let grid_m = m.div_ceil(kernel.tile_m);
     let grid_n = n.div_ceil(kernel.tile_n);
     let swizzle_log = compute_swizzle_log(grid_n);
@@ -521,7 +525,6 @@ pub unsafe fn launch_fused_add_norm_gemm(
         actual_beta,
     );
 
-    // Params: rms_input (residual), rms_hs_input, rms_weight, rms_epsilon, rms_hidden, rms_stride, flat
     let mut rms_input = residual.raw_ptr() as u64;
     let mut rms_hs_input = hs_input.raw_ptr() as u64;
     let mut rms_weight = norm_weight.raw_ptr() as u64;

@@ -412,7 +412,7 @@ fn build_reduction_computation(
     }
     extra_reg_decls.push(".reg .b64 %rd_rms_rb0, %rd_rms_rb1;".into());
     extra_reg_decls.push(".reg .b64 %rd_rms_cur;".into());
-    extra_reg_decls.push(".reg .pred %p_rms_lp, %p_rms_row, %p_rms_par;".into());
+    extra_reg_decls.push(".reg .pred %p_rms_lp, %p_rms_row, %p_rms_par, %p_rms_wb;".into());
     // SMEM for inv_rms array and warp reduction scratch
     extra_reg_decls.push(".shared .align 4 .f32 _ferrite_inv_rms[128];".into());
     extra_reg_decls.push(".shared .align 4 .f32 _ferrite_warp_scratch[8];".into());
@@ -927,6 +927,13 @@ fn build_prologue_from_decomposition(
     prologue.push("setp.ge.u32 \t%p_rms_lp, %r_rms_step, 3;".into());
     prologue.push("@%p_rms_lp mov.u32 \t%r_rms_nrows, 2;".into());
     prologue.push("mov.u32 \t%r_rms_mtile, %ctaid.x;".into());
+    // Compute N-tile index within m_tile for writeback guard.
+    // Only the first N-tile (n_idx == 0) writes back to avoid racing.
+    prologue.push("mov.u32 \t%r_rms_k, 1;".into());
+    prologue.push("shl.b32 \t%r_rms_k, %r_rms_k, %r_rms_nrows;".into());
+    prologue.push("sub.u32 \t%r_rms_k, %r_rms_k, 1;".into());
+    prologue.push("and.b32 \t%r_rms_k, %r_rms_mtile, %r_rms_k;".into());
+    prologue.push("setp.eq.u32 \t%p_rms_wb, %r_rms_k, 0;".into());
     prologue.push("shr.u32 \t%r_rms_mtile, %r_rms_mtile, %r_rms_nrows;".into());
 
     // Row loop: iterate over min(tile_m, M - m_tile * tile_m) rows
@@ -1000,7 +1007,15 @@ fn build_prologue_from_decomposition(
             continue;
         }
 
-        prologue.push(renamed.trim().to_string());
+        // Guard st.global (writeback stores) with %p_rms_wb predicate.
+        // Only the first N-tile block per m_tile writes back to avoid
+        // racing with other blocks that share the same m_tile.
+        if renamed.contains("st.global") {
+            let trimmed_store = renamed.trim().to_string();
+            prologue.push(format!("@%p_rms_wb {trimmed_store}"));
+        } else {
+            prologue.push(renamed.trim().to_string());
+        }
     }
     prologue.push("// END transplanted rms_norm code".into());
 

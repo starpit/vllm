@@ -14,8 +14,7 @@ use half::bf16;
 use safetensors::SafeTensors;
 use vllm_cuda::model::llama::{LlamaConfig, LlamaDecoderLayer, RotaryCache};
 use vllm_cuda::{
-    CachingAllocator, DType, GpuDevice, GpuTensor, GpuWeights, KvCachePool, OwnedTensor,
-    TensorView,
+    CachingAllocator, DType, GpuDevice, GpuTensor, GpuWeights, KvCachePool, OwnedTensor, TensorView,
 };
 
 const MODEL_PATH: &str = concat!(
@@ -69,11 +68,7 @@ fn load_bf16_tensor(st: &SafeTensors, name: &str) -> Vec<bf16> {
 
 // ── Upload / download helpers ──
 
-unsafe fn upload_bf16(
-    alloc: &mut CachingAllocator,
-    data: &[bf16],
-    shape: &[usize],
-) -> OwnedTensor {
+unsafe fn upload_bf16(alloc: &mut CachingAllocator, data: &[bf16], shape: &[usize]) -> OwnedTensor {
     let t = alloc.alloc_tensor(shape, DType::BF16);
     cusys::cuMemcpyHtoD_v2(
         t.as_gpu_tensor().raw_ptr() as u64,
@@ -115,11 +110,7 @@ unsafe fn upload_i64(alloc: &mut CachingAllocator, data: &[i64], shape: &[usize]
 
 unsafe fn download_bf16(t: GpuTensor, count: usize) -> Vec<bf16> {
     let mut v = vec![bf16::ZERO; count];
-    cusys::cuMemcpyDtoH_v2(
-        v.as_mut_ptr() as *mut _,
-        t.raw_ptr() as u64,
-        count * 2,
-    );
+    cusys::cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut _, t.raw_ptr() as u64, count * 2);
     v
 }
 
@@ -189,8 +180,7 @@ fn test10_transformer_block_fused_vs_standard() {
     let st = SafeTensors::deserialize(&raw_data).expect("parse safetensors");
 
     // QKV weight: q + k + v concatenated vertically → [1152, 896]
-    let mut qkv_data =
-        load_bf16_tensor(&st, "model.layers.1.self_attn.q_proj.weight"); // [896, 896]
+    let mut qkv_data = load_bf16_tensor(&st, "model.layers.1.self_attn.q_proj.weight"); // [896, 896]
     qkv_data.extend_from_slice(&load_bf16_tensor(
         &st,
         "model.layers.1.self_attn.k_proj.weight",
@@ -200,22 +190,13 @@ fn test10_transformer_block_fused_vs_standard() {
         "model.layers.1.self_attn.v_proj.weight",
     )); // [128, 896]
     let qkv_n = qkv_data.len() / config.hidden_size; // 1152
-    let qkv_w = unsafe {
-        upload_weight(
-            &mut device.caching,
-            &qkv_data,
-            &[qkv_n, config.hidden_size],
-        )
-    };
+    let qkv_w =
+        unsafe { upload_weight(&mut device.caching, &qkv_data, &[qkv_n, config.hidden_size]) };
     println!("  QKV weight: [{qkv_n}, {}]", config.hidden_size);
 
     // gate_up weight: gate + up concatenated → [9728, 896]
-    let mut gate_up_data =
-        load_bf16_tensor(&st, "model.layers.1.mlp.gate_proj.weight"); // [4864, 896]
-    gate_up_data.extend_from_slice(&load_bf16_tensor(
-        &st,
-        "model.layers.1.mlp.up_proj.weight",
-    )); // [4864, 896]
+    let mut gate_up_data = load_bf16_tensor(&st, "model.layers.1.mlp.gate_proj.weight"); // [4864, 896]
+    gate_up_data.extend_from_slice(&load_bf16_tensor(&st, "model.layers.1.mlp.up_proj.weight")); // [4864, 896]
     let gate_up_n = gate_up_data.len() / config.hidden_size; // 9728
     let gate_up_w = unsafe {
         upload_weight(
@@ -244,9 +225,8 @@ fn test10_transformer_block_fused_vs_standard() {
     let kv_fused = unsafe { KvCachePool::new(24, 16, 16, 2, 64, DType::BF16).unwrap() };
 
     // ── 5. Rotary embeddings ──
-    let rotary = unsafe {
-        RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap()
-    };
+    let rotary =
+        unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
 
     let num_tokens = 4usize;
     let hidden = config.hidden_size; // 896
@@ -421,10 +401,7 @@ fn test10_transformer_block_fused_vs_standard() {
         mlp_diff < 1.0,
         "MLP output diverged: max_diff={mlp_diff:.2e}"
     );
-    assert!(
-        res_diff < 1.0,
-        "Residual diverged: max_diff={res_diff:.2e}"
-    );
+    assert!(res_diff < 1.0, "Residual diverged: max_diff={res_diff:.2e}");
 
     if mlp_diff < 0.01 && res_diff < 0.01 {
         println!("PASS: fused matches standard (mlp={mlp_diff:.2e}, res={res_diff:.2e})");
@@ -466,19 +443,11 @@ fn test10b_transformer_block_m1_decode() {
         "model.layers.1.self_attn.v_proj.weight",
     ));
     let qkv_n = qkv_data.len() / config.hidden_size;
-    let qkv_w = unsafe {
-        upload_bf16(
-            &mut device.caching,
-            &qkv_data,
-            &[qkv_n, config.hidden_size],
-        )
-    };
+    let qkv_w =
+        unsafe { upload_bf16(&mut device.caching, &qkv_data, &[qkv_n, config.hidden_size]) };
 
     let mut gate_up_data = load_bf16_tensor(&st, "model.layers.1.mlp.gate_proj.weight");
-    gate_up_data.extend_from_slice(&load_bf16_tensor(
-        &st,
-        "model.layers.1.mlp.up_proj.weight",
-    ));
+    gate_up_data.extend_from_slice(&load_bf16_tensor(&st, "model.layers.1.mlp.up_proj.weight"));
     let gate_up_n = gate_up_data.len() / config.hidden_size;
     let gate_up_w = unsafe {
         upload_bf16(
@@ -502,9 +471,8 @@ fn test10b_transformer_block_m1_decode() {
 
     let kv_std = unsafe { KvCachePool::new(24, 16, 16, 2, 64, DType::BF16).unwrap() };
     let kv_fused = unsafe { KvCachePool::new(24, 16, 16, 2, 64, DType::BF16).unwrap() };
-    let rotary = unsafe {
-        RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap()
-    };
+    let rotary =
+        unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
 
     let num_tokens = 1usize;
     let hidden = config.hidden_size;
@@ -650,10 +618,7 @@ fn test10b_transformer_block_m1_decode() {
     let (mlp_diff, _) = max_diff_bf16(&std_mlp_h, &fused_mlp_h);
     let (res_diff, _) = max_diff_bf16(&std_res_h, &fused_res_h);
 
-    assert!(
-        mlp_diff < 1.0,
-        "M=1 MLP diverged: max_diff={mlp_diff:.2e}"
-    );
+    assert!(mlp_diff < 1.0, "M=1 MLP diverged: max_diff={mlp_diff:.2e}");
     assert!(
         res_diff < 1.0,
         "M=1 Residual diverged: max_diff={res_diff:.2e}"
@@ -696,10 +661,14 @@ fn test10c_qkv_only_shared_weights() {
     let eps = config.rms_norm_eps;
 
     let mut qkv_data = load_bf16_tensor(&st, "model.layers.1.self_attn.q_proj.weight");
-    qkv_data
-        .extend_from_slice(&load_bf16_tensor(&st, "model.layers.1.self_attn.k_proj.weight"));
-    qkv_data
-        .extend_from_slice(&load_bf16_tensor(&st, "model.layers.1.self_attn.v_proj.weight"));
+    qkv_data.extend_from_slice(&load_bf16_tensor(
+        &st,
+        "model.layers.1.self_attn.k_proj.weight",
+    ));
+    qkv_data.extend_from_slice(&load_bf16_tensor(
+        &st,
+        "model.layers.1.self_attn.v_proj.weight",
+    ));
     let qkv_n = qkv_data.len() / hidden;
     let qkv_w = unsafe { upload_bf16(&mut device.caching, &qkv_data, &[qkv_n, hidden]) };
 
@@ -726,14 +695,12 @@ fn test10c_qkv_only_shared_weights() {
 
         // ── Standard: fused_add_rms_norm_inplace + ferrite.gemm ──
         unsafe {
-            vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                *hs_std, *res_std, *norm_w, eps, stream,
-            );
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_std, *res_std, *norm_w, eps, stream);
         }
         let qkv_std = unsafe {
-            device.ferrite.gemm(
-                *hs_std, *qkv_w, None, 1.0, 0.0, &mut device.caching, stream,
-            )
+            device
+                .ferrite
+                .gemm(*hs_std, *qkv_w, None, 1.0, 0.0, &mut device.caching, stream)
         };
 
         // ── Fused: add_inplace + launch_fused_norm_gemm ──
@@ -770,18 +737,10 @@ fn test10c_qkv_only_shared_weights() {
         let (qkv_diff, qkv_worst) = max_diff_bf16(&std_h, &fused_h);
         let (res_diff, _) = max_diff_bf16(&std_res_h, &fused_res_h);
 
-        println!(
-            "  M={m}: QKV diff={qkv_diff:.2e} at [{qkv_worst}], residual diff={res_diff:.2e}"
-        );
+        println!("  M={m}: QKV diff={qkv_diff:.2e} at [{qkv_worst}], residual diff={res_diff:.2e}");
 
-        assert!(
-            qkv_diff < 0.01,
-            "M={m}: QKV diverged: {qkv_diff:.2e}"
-        );
-        assert!(
-            res_diff < 0.01,
-            "M={m}: residual diverged: {res_diff:.2e}"
-        );
+        assert!(qkv_diff < 0.01, "M={m}: QKV diverged: {qkv_diff:.2e}");
+        assert!(res_diff < 0.01, "M={m}: residual diverged: {res_diff:.2e}");
     }
 
     println!("PASS: QKV matches at all M with shared weights");
@@ -910,14 +869,8 @@ fn test10e_24_layer_chain_precision() {
         let b_h = unsafe { download_bf16(*hs_b, m * hidden) };
 
         let (diff, _) = max_diff_bf16(&a_h, &b_h);
-        let a_max = a_h
-            .iter()
-            .map(|v| v.to_f32().abs())
-            .fold(0.0f32, f32::max);
-        let b_max = b_h
-            .iter()
-            .map(|v| v.to_f32().abs())
-            .fold(0.0f32, f32::max);
+        let a_max = a_h.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+        let b_max = b_h.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
         let a_nan = a_h.iter().filter(|v| v.to_f32().is_nan()).count();
         let b_nan = b_h.iter().filter(|v| v.to_f32().is_nan()).count();
 
@@ -1011,9 +964,7 @@ fn test10d_norm_precision_fused_add_vs_separate() {
 
         // A: fused_add_rms_norm_inplace → hs_a gets normed, res_a gets sum
         unsafe {
-            vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                *hs_a, *res_a, *norm_w, eps, stream,
-            );
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *norm_w, eps, stream);
         }
 
         // B: add_inplace → res_b gets sum, then standalone rms_norm
@@ -1096,8 +1047,7 @@ impl Test11Setup {
 
         // Load layer for attention
         let mut gw = GpuWeights::from_single_file(MODEL_PATH, stream).unwrap();
-        let layer = LlamaDecoderLayer::load(&mut gw, "model.layers.1", &config, 1, stream)
-            .unwrap();
+        let layer = LlamaDecoderLayer::load(&mut gw, "model.layers.1", &config, 1, stream).unwrap();
 
         // Load raw weights for manual paths
         let raw = std::fs::read(MODEL_PATH).expect("read model");
@@ -1107,8 +1057,14 @@ impl Test11Setup {
         let norm1_w = unsafe { upload_bf16(&mut device.caching, &n1, &[hidden]) };
 
         let mut qkv = load_bf16_tensor(&st, "model.layers.1.self_attn.q_proj.weight");
-        qkv.extend_from_slice(&load_bf16_tensor(&st, "model.layers.1.self_attn.k_proj.weight"));
-        qkv.extend_from_slice(&load_bf16_tensor(&st, "model.layers.1.self_attn.v_proj.weight"));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            "model.layers.1.self_attn.k_proj.weight",
+        ));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            "model.layers.1.self_attn.v_proj.weight",
+        ));
         let qkv_n = qkv.len() / hidden;
         let qkv_w = unsafe { upload_bf16(&mut device.caching, &qkv, &[qkv_n, hidden]) };
 
@@ -1128,9 +1084,8 @@ impl Test11Setup {
 
         let kv_a = unsafe { KvCachePool::new(24, 16, 16, 2, 64, DType::BF16).unwrap() };
         let kv_b = unsafe { KvCachePool::new(24, 16, 16, 2, 64, DType::BF16).unwrap() };
-        let rotary = unsafe {
-            RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap()
-        };
+        let rotary =
+            unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
 
         Test11Setup {
             device,
@@ -1166,7 +1121,13 @@ impl Test11Setup {
     fn make_attn_meta(
         &mut self,
         m: usize,
-    ) -> (OwnedTensor, OwnedTensor, OwnedTensor, OwnedTensor, OwnedTensor) {
+    ) -> (
+        OwnedTensor,
+        OwnedTensor,
+        OwnedTensor,
+        OwnedTensor,
+        OwnedTensor,
+    ) {
         let pos: Vec<u32> = (0..m as u32).collect();
         let slot: Vec<i64> = (0..m as i64).collect();
         let cu: Vec<i32> = vec![0, m as i32];
@@ -1200,14 +1161,18 @@ fn test11a_qkv_norm_gemm() {
 
         // Standard: fused_add_rms_norm_inplace + ferrite.gemm
         unsafe {
-            vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                *hs_a, *res_a, *s.norm1_w, eps, stream,
-            );
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *s.norm1_w, eps, stream);
         }
         let qkv_a = unsafe {
-            s.device
-                .ferrite
-                .gemm(*hs_a, *s.qkv_w, None, 1.0, 0.0, &mut s.device.caching, stream)
+            s.device.ferrite.gemm(
+                *hs_a,
+                *s.qkv_w,
+                None,
+                1.0,
+                0.0,
+                &mut s.device.caching,
+                stream,
+            )
         };
 
         // Fused: add_inplace + launch_fused_norm_gemm
@@ -1260,16 +1225,30 @@ fn test11b_qkv_plus_attention() {
         vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *s.norm1_w, eps, stream);
     }
     let qkv_a = unsafe {
-        s.device
-            .ferrite
-            .gemm(*hs_a, *s.qkv_w, None, 1.0, 0.0, &mut s.device.caching, stream)
+        s.device.ferrite.gemm(
+            *hs_a,
+            *s.qkv_w,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
+        )
     };
     // Standard: attention
     let attn_a = unsafe {
         s.layer.self_attn.forward_from_qkv(
             qkv_a,
-            pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-            m, m, &s.kv_a, &s.rotary, &mut s.device,
+            pos.view(),
+            slot.view(),
+            cu.view(),
+            seq.view(),
+            bt.view(),
+            m,
+            m,
+            &s.kv_a,
+            &s.rotary,
+            &mut s.device,
         )
     };
 
@@ -1279,16 +1258,33 @@ fn test11b_qkv_plus_attention() {
     }
     let qkv_b = unsafe {
         vllm_cuda::ferrite::launch_fused_norm_gemm(
-            &FUSED_NORM_GEMM, *res_b, *s.qkv_w, *s.norm1_w, eps, hidden as u32,
-            None, 1.0, 0.0, &mut s.device.caching, stream,
+            &FUSED_NORM_GEMM,
+            *res_b,
+            *s.qkv_w,
+            *s.norm1_w,
+            eps,
+            hidden as u32,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
         )
     };
     // Fused: attention (same function, different KV cache)
     let attn_b = unsafe {
         s.layer.self_attn.forward_from_qkv(
             qkv_b,
-            pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-            m, m, &s.kv_b, &s.rotary, &mut s.device,
+            pos.view(),
+            slot.view(),
+            cu.view(),
+            seq.view(),
+            bt.view(),
+            m,
+            m,
+            &s.kv_b,
+            &s.rotary,
+            &mut s.device,
         )
     };
 
@@ -1329,13 +1325,30 @@ fn test11c_plus_mlp_norm_gemm() {
         vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *s.norm1_w, eps, stream);
     }
     let qkv_a = unsafe {
-        s.device.ferrite.gemm(*hs_a, *s.qkv_w, None, 1.0, 0.0, &mut s.device.caching, stream)
+        s.device.ferrite.gemm(
+            *hs_a,
+            *s.qkv_w,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
+        )
     };
     drop(hs_a);
     let attn_a = unsafe {
         s.layer.self_attn.forward_from_qkv(
-            qkv_a, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-            m, m, &s.kv_a, &s.rotary, &mut s.device,
+            qkv_a,
+            pos.view(),
+            slot.view(),
+            cu.view(),
+            seq.view(),
+            bt.view(),
+            m,
+            m,
+            &s.kv_a,
+            &s.rotary,
+            &mut s.device,
         )
     };
     // Standard: MLP add+norm+GEMM
@@ -1343,7 +1356,15 @@ fn test11c_plus_mlp_norm_gemm() {
         vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn_a, *res_a, *s.norm2_w, eps, stream);
     }
     let gate_up_a = unsafe {
-        s.device.ferrite.gemm(*attn_a, *s.gate_up_w, None, 1.0, 0.0, &mut s.device.caching, stream)
+        s.device.ferrite.gemm(
+            *attn_a,
+            *s.gate_up_w,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
+        )
     };
 
     // ── Fused path through QKV + attention ──
@@ -1353,14 +1374,32 @@ fn test11c_plus_mlp_norm_gemm() {
     drop(hs_b);
     let qkv_b = unsafe {
         vllm_cuda::ferrite::launch_fused_norm_gemm(
-            &FUSED_NORM_GEMM, *res_b, *s.qkv_w, *s.norm1_w, eps, hidden as u32,
-            None, 1.0, 0.0, &mut s.device.caching, stream,
+            &FUSED_NORM_GEMM,
+            *res_b,
+            *s.qkv_w,
+            *s.norm1_w,
+            eps,
+            hidden as u32,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
         )
     };
     let attn_b = unsafe {
         s.layer.self_attn.forward_from_qkv(
-            qkv_b, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-            m, m, &s.kv_b, &s.rotary, &mut s.device,
+            qkv_b,
+            pos.view(),
+            slot.view(),
+            cu.view(),
+            seq.view(),
+            bt.view(),
+            m,
+            m,
+            &s.kv_b,
+            &s.rotary,
+            &mut s.device,
         )
     };
     // Fused: MLP add+norm+GEMM
@@ -1370,8 +1409,17 @@ fn test11c_plus_mlp_norm_gemm() {
     drop(attn_b);
     let gate_up_b = unsafe {
         vllm_cuda::ferrite::launch_fused_norm_gemm(
-            &FUSED_NORM_GEMM, *res_b, *s.gate_up_w, *s.norm2_w, eps, hidden as u32,
-            None, 1.0, 0.0, &mut s.device.caching, stream,
+            &FUSED_NORM_GEMM,
+            *res_b,
+            *s.gate_up_w,
+            *s.norm2_w,
+            eps,
+            hidden as u32,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
         )
     };
 
@@ -1405,30 +1453,66 @@ fn test11d_full_layer() {
         vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *s.norm1_w, eps, stream);
     }
     let qkv_a = unsafe {
-        s.device.ferrite.gemm(*hs_a, *s.qkv_w, None, 1.0, 0.0, &mut s.device.caching, stream)
+        s.device.ferrite.gemm(
+            *hs_a,
+            *s.qkv_w,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
+        )
     };
     drop(hs_a);
     let attn_a = unsafe {
         s.layer.self_attn.forward_from_qkv(
-            qkv_a, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-            m, m, &s.kv_a, &s.rotary, &mut s.device,
+            qkv_a,
+            pos.view(),
+            slot.view(),
+            cu.view(),
+            seq.view(),
+            bt.view(),
+            m,
+            m,
+            &s.kv_a,
+            &s.rotary,
+            &mut s.device,
         )
     };
     unsafe {
         vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn_a, *res_a, *s.norm2_w, eps, stream);
     }
     let gate_up_a = unsafe {
-        s.device.ferrite.gemm(*attn_a, *s.gate_up_w, None, 1.0, 0.0, &mut s.device.caching, stream)
+        s.device.ferrite.gemm(
+            *attn_a,
+            *s.gate_up_w,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
+        )
     };
     drop(attn_a);
     let activated_a = unsafe {
         vllm_cuda::kernels::silu_and_mul_fused(
-            *gate_up_a, s.config.intermediate_size, &mut s.device.caching, stream,
+            *gate_up_a,
+            s.config.intermediate_size,
+            &mut s.device.caching,
+            stream,
         )
     };
     drop(gate_up_a);
     let mlp_a = unsafe {
-        s.device.ferrite.gemm(*activated_a, *s.down_w, None, 1.0, 0.0, &mut s.device.caching, stream)
+        s.device.ferrite.gemm(
+            *activated_a,
+            *s.down_w,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
+        )
     };
     drop(activated_a);
 
@@ -1439,14 +1523,32 @@ fn test11d_full_layer() {
     drop(hs_b);
     let qkv_b = unsafe {
         vllm_cuda::ferrite::launch_fused_norm_gemm(
-            &FUSED_NORM_GEMM, *res_b, *s.qkv_w, *s.norm1_w, eps, hidden as u32,
-            None, 1.0, 0.0, &mut s.device.caching, stream,
+            &FUSED_NORM_GEMM,
+            *res_b,
+            *s.qkv_w,
+            *s.norm1_w,
+            eps,
+            hidden as u32,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
         )
     };
     let attn_b = unsafe {
         s.layer.self_attn.forward_from_qkv(
-            qkv_b, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-            m, m, &s.kv_b, &s.rotary, &mut s.device,
+            qkv_b,
+            pos.view(),
+            slot.view(),
+            cu.view(),
+            seq.view(),
+            bt.view(),
+            m,
+            m,
+            &s.kv_b,
+            &s.rotary,
+            &mut s.device,
         )
     };
     unsafe {
@@ -1455,18 +1557,38 @@ fn test11d_full_layer() {
     drop(attn_b);
     let gate_up_b = unsafe {
         vllm_cuda::ferrite::launch_fused_norm_gemm(
-            &FUSED_NORM_GEMM, *res_b, *s.gate_up_w, *s.norm2_w, eps, hidden as u32,
-            None, 1.0, 0.0, &mut s.device.caching, stream,
+            &FUSED_NORM_GEMM,
+            *res_b,
+            *s.gate_up_w,
+            *s.norm2_w,
+            eps,
+            hidden as u32,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
         )
     };
     let activated_b = unsafe {
         vllm_cuda::kernels::silu_and_mul_fused(
-            *gate_up_b, s.config.intermediate_size, &mut s.device.caching, stream,
+            *gate_up_b,
+            s.config.intermediate_size,
+            &mut s.device.caching,
+            stream,
         )
     };
     drop(gate_up_b);
     let mlp_b = unsafe {
-        s.device.ferrite.gemm(*activated_b, *s.down_w, None, 1.0, 0.0, &mut s.device.caching, stream)
+        s.device.ferrite.gemm(
+            *activated_b,
+            *s.down_w,
+            None,
+            1.0,
+            0.0,
+            &mut s.device.caching,
+            stream,
+        )
     };
     drop(activated_b);
 
@@ -1571,9 +1693,8 @@ fn test12_multi_layer_with_attention() {
     // KV caches — separate for each path
     let kv_a = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
     let kv_b = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
-    let rotary = unsafe {
-        RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap()
-    };
+    let rotary =
+        unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
 
     let m = 4usize; // prefill 4 tokens
 
@@ -1622,9 +1743,7 @@ fn test12_multi_layer_with_attention() {
         // Skip layer 0 norm+add (no residual for first layer in real model)
         // But we're testing with synthetic residual=0, so it's fine to add.
         unsafe {
-            vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                *hs_a, *res_a, *lw.norm1, eps, stream,
-            );
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *lw.norm1, eps, stream);
         }
         let qkv_a = unsafe {
             device
@@ -1635,31 +1754,52 @@ fn test12_multi_layer_with_attention() {
         let attn_a = unsafe {
             layers[i].self_attn.forward_from_qkv(
                 qkv_a,
-                pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-                m, m, &kv_a, &rotary, &mut device,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                m,
+                m,
+                &kv_a,
+                &rotary,
+                &mut device,
             )
         };
         unsafe {
-            vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                *attn_a, *res_a, *lw.norm2, eps, stream,
-            );
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn_a, *res_a, *lw.norm2, eps, stream);
         }
         let gu_a = unsafe {
-            device
-                .ferrite
-                .gemm(*attn_a, *lw.gate_up, None, 1.0, 0.0, &mut device.caching, stream)
+            device.ferrite.gemm(
+                *attn_a,
+                *lw.gate_up,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
         };
         drop(attn_a);
         let act_a = unsafe {
             vllm_cuda::kernels::silu_and_mul_fused(
-                *gu_a, config.intermediate_size, &mut device.caching, stream,
+                *gu_a,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
             )
         };
         drop(gu_a);
         hs_a = unsafe {
-            device
-                .ferrite
-                .gemm(*act_a, *lw.down, None, 1.0, 0.0, &mut device.caching, stream)
+            device.ferrite.gemm(
+                *act_a,
+                *lw.down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
         };
         drop(act_a);
 
@@ -1670,15 +1810,32 @@ fn test12_multi_layer_with_attention() {
         drop(hs_b);
         let qkv_b = unsafe {
             vllm_cuda::ferrite::launch_fused_norm_gemm(
-                &FUSED_NORM_GEMM, *res_b, *lw.qkv, *lw.norm1, eps, hidden as u32,
-                None, 1.0, 0.0, &mut device.caching, stream,
+                &FUSED_NORM_GEMM,
+                *res_b,
+                *lw.qkv,
+                *lw.norm1,
+                eps,
+                hidden as u32,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
             )
         };
         let attn_b = unsafe {
             layers[i].self_attn.forward_from_qkv(
                 qkv_b,
-                pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-                m, m, &kv_b, &rotary, &mut device,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                m,
+                m,
+                &kv_b,
+                &rotary,
+                &mut device,
             )
         };
         unsafe {
@@ -1687,20 +1844,38 @@ fn test12_multi_layer_with_attention() {
         drop(attn_b);
         let gu_b = unsafe {
             vllm_cuda::ferrite::launch_fused_norm_gemm(
-                &FUSED_NORM_GEMM, *res_b, *lw.gate_up, *lw.norm2, eps, hidden as u32,
-                None, 1.0, 0.0, &mut device.caching, stream,
+                &FUSED_NORM_GEMM,
+                *res_b,
+                *lw.gate_up,
+                *lw.norm2,
+                eps,
+                hidden as u32,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
             )
         };
         let act_b = unsafe {
             vllm_cuda::kernels::silu_and_mul_fused(
-                *gu_b, config.intermediate_size, &mut device.caching, stream,
+                *gu_b,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
             )
         };
         drop(gu_b);
         hs_b = unsafe {
-            device
-                .ferrite
-                .gemm(*act_b, *lw.down, None, 1.0, 0.0, &mut device.caching, stream)
+            device.ferrite.gemm(
+                *act_b,
+                *lw.down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
         };
         drop(act_b);
 
@@ -1787,9 +1962,7 @@ fn test13_prefill_then_decode() {
     // Embedding weight
     let embed_data = load_bf16_tensor(&st, "model.embed_tokens.weight");
     let vocab_size = embed_data.len() / hidden;
-    let embed_w = unsafe {
-        upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden])
-    };
+    let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
 
     // Per-layer weights
     struct LW {
@@ -1803,12 +1976,24 @@ fn test13_prefill_then_decode() {
     for i in 0..num_layers {
         let n1 = load_bf16_tensor(&st, &format!("model.layers.{i}.input_layernorm.weight"));
         let mut qkv = load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.q_proj.weight"));
-        qkv.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.k_proj.weight")));
-        qkv.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.v_proj.weight")));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.k_proj.weight"),
+        ));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.v_proj.weight"),
+        ));
         let qkv_n = qkv.len() / hidden;
-        let n2 = load_bf16_tensor(&st, &format!("model.layers.{i}.post_attention_layernorm.weight"));
+        let n2 = load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.post_attention_layernorm.weight"),
+        );
         let mut gu = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.gate_proj.weight"));
-        gu.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.up_proj.weight")));
+        gu.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.mlp.up_proj.weight"),
+        ));
         let gu_n = gu.len() / hidden;
         let dw = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.down_proj.weight"));
         let down_k = dw.len() / hidden;
@@ -1837,9 +2022,8 @@ fn test13_prefill_then_decode() {
     let num_blocks = 32;
     let kv_a = unsafe { KvCachePool::new(24, num_blocks, block_size, 2, 64, DType::BF16).unwrap() };
     let kv_b = unsafe { KvCachePool::new(24, num_blocks, block_size, 2, 64, DType::BF16).unwrap() };
-    let rotary = unsafe {
-        RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap()
-    };
+    let rotary =
+        unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
 
     // Real token IDs: "What is 2+2?" → use some plausible Qwen token IDs
     // (exact IDs don't matter for correctness testing, just need valid indices)
@@ -1872,9 +2056,23 @@ fn test13_prefill_then_decode() {
             // Skip add+norm for layer 0 (no residual yet)
             if i == 0 {
                 // Just norm hidden_states directly (no residual add)
-                let normed = vllm_cuda::kernels::rms_norm(*hs, *lw[i].norm1, eps, &mut device.caching, stream);
+                let normed = vllm_cuda::kernels::rms_norm(
+                    *hs,
+                    *lw[i].norm1,
+                    eps,
+                    &mut device.caching,
+                    stream,
+                );
                 drop(hs);
-                let qkv = device.ferrite.gemm(*normed, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream);
+                let qkv = device.ferrite.gemm(
+                    *normed,
+                    *lw[i].qkv,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    stream,
+                );
                 // For layer 0, residual = original hidden_states. But we dropped it.
                 // Actually in the real model, layer 0 gets residual=None and uses the non-add path.
                 // Let's just use fused_add_rms_norm with zero residual.
@@ -1919,10 +2117,18 @@ fn test13_prefill_then_decode() {
     drop(ids_a);
     drop(ids_b);
     let mut res_a = unsafe {
-        upload_bf16(&mut device.caching, &vec![bf16::ZERO; prefill_len * hidden], &[prefill_len, hidden])
+        upload_bf16(
+            &mut device.caching,
+            &vec![bf16::ZERO; prefill_len * hidden],
+            &[prefill_len, hidden],
+        )
     };
     let mut res_b = unsafe {
-        upload_bf16(&mut device.caching, &vec![bf16::ZERO; prefill_len * hidden], &[prefill_len, hidden])
+        upload_bf16(
+            &mut device.caching,
+            &vec![bf16::ZERO; prefill_len * hidden],
+            &[prefill_len, hidden],
+        )
     };
 
     // Prefill attention metadata
@@ -1943,31 +2149,81 @@ fn test13_prefill_then_decode() {
     for i in 0..num_layers {
         // Path A (standard)
         unsafe {
-            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *lw[i].norm1, eps, stream);
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                *hs_a,
+                *res_a,
+                *lw[i].norm1,
+                eps,
+                stream,
+            );
         }
         let qkv_a = unsafe {
-            device.ferrite.gemm(*hs_a, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream)
+            device.ferrite.gemm(
+                *hs_a,
+                *lw[i].qkv,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
         };
         drop(hs_a);
         let attn_a = unsafe {
             layers[i].self_attn.forward_from_qkv(
-                qkv_a, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-                prefill_len, prefill_len, &kv_a, &rotary, &mut device,
+                qkv_a,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                prefill_len,
+                prefill_len,
+                &kv_a,
+                &rotary,
+                &mut device,
             )
         };
         unsafe {
-            vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn_a, *res_a, *lw[i].norm2, eps, stream);
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                *attn_a,
+                *res_a,
+                *lw[i].norm2,
+                eps,
+                stream,
+            );
         }
         let gu_a = unsafe {
-            device.ferrite.gemm(*attn_a, *lw[i].gate_up, None, 1.0, 0.0, &mut device.caching, stream)
+            device.ferrite.gemm(
+                *attn_a,
+                *lw[i].gate_up,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
         };
         drop(attn_a);
         let act_a = unsafe {
-            vllm_cuda::kernels::silu_and_mul_fused(*gu_a, config.intermediate_size, &mut device.caching, stream)
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu_a,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
         };
         drop(gu_a);
         hs_a = unsafe {
-            device.ferrite.gemm(*act_a, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream)
+            device.ferrite.gemm(
+                *act_a,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
         };
         drop(act_a);
 
@@ -1976,30 +2232,70 @@ fn test13_prefill_then_decode() {
         drop(hs_b);
         let qkv_b = unsafe {
             vllm_cuda::ferrite::launch_fused_norm_gemm(
-                &FUSED_NORM_GEMM, *res_b, *lw[i].qkv, *lw[i].norm1, eps, hidden as u32,
-                None, 1.0, 0.0, &mut device.caching, stream,
+                &FUSED_NORM_GEMM,
+                *res_b,
+                *lw[i].qkv,
+                *lw[i].norm1,
+                eps,
+                hidden as u32,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
             )
         };
         let attn_b = unsafe {
             layers[i].self_attn.forward_from_qkv(
-                qkv_b, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-                prefill_len, prefill_len, &kv_b, &rotary, &mut device,
+                qkv_b,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                prefill_len,
+                prefill_len,
+                &kv_b,
+                &rotary,
+                &mut device,
             )
         };
         unsafe { vllm_cuda::kernels::add_inplace(*res_b, *attn_b, stream) };
         drop(attn_b);
         let gu_b = unsafe {
             vllm_cuda::ferrite::launch_fused_norm_gemm(
-                &FUSED_NORM_GEMM, *res_b, *lw[i].gate_up, *lw[i].norm2, eps, hidden as u32,
-                None, 1.0, 0.0, &mut device.caching, stream,
+                &FUSED_NORM_GEMM,
+                *res_b,
+                *lw[i].gate_up,
+                *lw[i].norm2,
+                eps,
+                hidden as u32,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
             )
         };
         let act_b = unsafe {
-            vllm_cuda::kernels::silu_and_mul_fused(*gu_b, config.intermediate_size, &mut device.caching, stream)
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu_b,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
         };
         drop(gu_b);
         hs_b = unsafe {
-            device.ferrite.gemm(*act_b, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream)
+            device.ferrite.gemm(
+                *act_b,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
         };
         drop(act_b);
     }
@@ -2044,31 +2340,81 @@ fn test13_prefill_then_decode() {
         for i in 0..num_layers {
             // Path A
             unsafe {
-                vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *lw[i].norm1, eps, stream);
+                vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                    *hs_a,
+                    *res_a,
+                    *lw[i].norm1,
+                    eps,
+                    stream,
+                );
             }
             let qkv_a = unsafe {
-                device.ferrite.gemm(*hs_a, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream)
+                device.ferrite.gemm(
+                    *hs_a,
+                    *lw[i].qkv,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    stream,
+                )
             };
             drop(hs_a);
             let attn_a = unsafe {
                 layers[i].self_attn.forward_from_qkv(
-                    qkv_a, d_pos.view(), d_slot.view(), d_cu.view(), d_seq.view(), d_bt.view(),
-                    1, total_seq_len, &kv_a, &rotary, &mut device,
+                    qkv_a,
+                    d_pos.view(),
+                    d_slot.view(),
+                    d_cu.view(),
+                    d_seq.view(),
+                    d_bt.view(),
+                    1,
+                    total_seq_len,
+                    &kv_a,
+                    &rotary,
+                    &mut device,
                 )
             };
             unsafe {
-                vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn_a, *res_a, *lw[i].norm2, eps, stream);
+                vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                    *attn_a,
+                    *res_a,
+                    *lw[i].norm2,
+                    eps,
+                    stream,
+                );
             }
             let gu_a = unsafe {
-                device.ferrite.gemm(*attn_a, *lw[i].gate_up, None, 1.0, 0.0, &mut device.caching, stream)
+                device.ferrite.gemm(
+                    *attn_a,
+                    *lw[i].gate_up,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    stream,
+                )
             };
             drop(attn_a);
             let act_a = unsafe {
-                vllm_cuda::kernels::silu_and_mul_fused(*gu_a, config.intermediate_size, &mut device.caching, stream)
+                vllm_cuda::kernels::silu_and_mul_fused(
+                    *gu_a,
+                    config.intermediate_size,
+                    &mut device.caching,
+                    stream,
+                )
             };
             drop(gu_a);
             hs_a = unsafe {
-                device.ferrite.gemm(*act_a, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream)
+                device.ferrite.gemm(
+                    *act_a,
+                    *lw[i].down,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    stream,
+                )
             };
             drop(act_a);
 
@@ -2077,30 +2423,70 @@ fn test13_prefill_then_decode() {
             drop(hs_b);
             let qkv_b = unsafe {
                 vllm_cuda::ferrite::launch_fused_norm_gemm(
-                    &FUSED_NORM_GEMM, *res_b, *lw[i].qkv, *lw[i].norm1, eps, hidden as u32,
-                    None, 1.0, 0.0, &mut device.caching, stream,
+                    &FUSED_NORM_GEMM,
+                    *res_b,
+                    *lw[i].qkv,
+                    *lw[i].norm1,
+                    eps,
+                    hidden as u32,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    stream,
                 )
             };
             let attn_b = unsafe {
                 layers[i].self_attn.forward_from_qkv(
-                    qkv_b, d_pos.view(), d_slot.view(), d_cu.view(), d_seq.view(), d_bt.view(),
-                    1, total_seq_len, &kv_b, &rotary, &mut device,
+                    qkv_b,
+                    d_pos.view(),
+                    d_slot.view(),
+                    d_cu.view(),
+                    d_seq.view(),
+                    d_bt.view(),
+                    1,
+                    total_seq_len,
+                    &kv_b,
+                    &rotary,
+                    &mut device,
                 )
             };
             unsafe { vllm_cuda::kernels::add_inplace(*res_b, *attn_b, stream) };
             drop(attn_b);
             let gu_b = unsafe {
                 vllm_cuda::ferrite::launch_fused_norm_gemm(
-                    &FUSED_NORM_GEMM, *res_b, *lw[i].gate_up, *lw[i].norm2, eps, hidden as u32,
-                    None, 1.0, 0.0, &mut device.caching, stream,
+                    &FUSED_NORM_GEMM,
+                    *res_b,
+                    *lw[i].gate_up,
+                    *lw[i].norm2,
+                    eps,
+                    hidden as u32,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    stream,
                 )
             };
             let act_b = unsafe {
-                vllm_cuda::kernels::silu_and_mul_fused(*gu_b, config.intermediate_size, &mut device.caching, stream)
+                vllm_cuda::kernels::silu_and_mul_fused(
+                    *gu_b,
+                    config.intermediate_size,
+                    &mut device.caching,
+                    stream,
+                )
             };
             drop(gu_b);
             hs_b = unsafe {
-                device.ferrite.gemm(*act_b, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream)
+                device.ferrite.gemm(
+                    *act_b,
+                    *lw[i].down,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    stream,
+                )
             };
             drop(act_b);
         }
@@ -2167,19 +2553,39 @@ fn test13c_sequential_prefill_decode() {
 
         let embed_data = load_bf16_tensor(&st, "model.embed_tokens.weight");
         let vocab_size = embed_data.len() / hidden;
-        let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
+        let embed_w =
+            unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
 
-        struct LW { norm1: OwnedTensor, qkv: OwnedTensor, norm2: OwnedTensor, gate_up: OwnedTensor, down: OwnedTensor }
+        struct LW {
+            norm1: OwnedTensor,
+            qkv: OwnedTensor,
+            norm2: OwnedTensor,
+            gate_up: OwnedTensor,
+            down: OwnedTensor,
+        }
         let mut lw: Vec<LW> = Vec::new();
         for i in 0..num_layers {
             let n1 = load_bf16_tensor(&st, &format!("model.layers.{i}.input_layernorm.weight"));
-            let mut qkv = load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.q_proj.weight"));
-            qkv.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.k_proj.weight")));
-            qkv.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.v_proj.weight")));
+            let mut qkv =
+                load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.q_proj.weight"));
+            qkv.extend_from_slice(&load_bf16_tensor(
+                &st,
+                &format!("model.layers.{i}.self_attn.k_proj.weight"),
+            ));
+            qkv.extend_from_slice(&load_bf16_tensor(
+                &st,
+                &format!("model.layers.{i}.self_attn.v_proj.weight"),
+            ));
             let qkv_n = qkv.len() / hidden;
-            let n2 = load_bf16_tensor(&st, &format!("model.layers.{i}.post_attention_layernorm.weight"));
+            let n2 = load_bf16_tensor(
+                &st,
+                &format!("model.layers.{i}.post_attention_layernorm.weight"),
+            );
             let mut gu = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.gate_proj.weight"));
-            gu.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.up_proj.weight")));
+            gu.extend_from_slice(&load_bf16_tensor(
+                &st,
+                &format!("model.layers.{i}.mlp.up_proj.weight"),
+            ));
             let gu_n = gu.len() / hidden;
             let dw = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.down_proj.weight"));
             let down_k = dw.len() / hidden;
@@ -2199,23 +2605,45 @@ fn test13c_sequential_prefill_decode() {
         let mut gw = GpuWeights::from_single_file(MODEL_PATH, stream).unwrap();
         let mut layers: Vec<LlamaDecoderLayer> = Vec::new();
         for i in 0..num_layers {
-            layers.push(LlamaDecoderLayer::load(&mut gw, &format!("model.layers.{i}"), &config, i, stream).unwrap());
+            layers.push(
+                LlamaDecoderLayer::load(&mut gw, &format!("model.layers.{i}"), &config, i, stream)
+                    .unwrap(),
+            );
         }
         drop(raw);
 
         let kv = unsafe { KvCachePool::new(24, 32, block_size, 2, 64, DType::BF16).unwrap() };
-        let rotary = unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
+        let rotary =
+            unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
 
         // Embed
         let ids = unsafe { upload_u32(&mut device.caching, prefill_ids, &[prefill_len]) };
-        let mut hs = unsafe { vllm_cuda::kernels::embedding_gather(*embed_w, *ids, &mut device.caching, stream) };
+        let mut hs = unsafe {
+            vllm_cuda::kernels::embedding_gather(*embed_w, *ids, &mut device.caching, stream)
+        };
         drop(ids);
         let mut res = unsafe {
-            upload_bf16(&mut device.caching, &vec![bf16::ZERO; prefill_len * hidden], &[prefill_len, hidden])
+            upload_bf16(
+                &mut device.caching,
+                &vec![bf16::ZERO; prefill_len * hidden],
+                &[prefill_len, hidden],
+            )
         };
 
-        let pos = unsafe { upload_u32(&mut device.caching, &(0..prefill_len as u32).collect::<Vec<_>>(), &[prefill_len]) };
-        let slot = unsafe { upload_i64(&mut device.caching, &(0..prefill_len as i64).collect::<Vec<_>>(), &[prefill_len]) };
+        let pos = unsafe {
+            upload_u32(
+                &mut device.caching,
+                &(0..prefill_len as u32).collect::<Vec<_>>(),
+                &[prefill_len],
+            )
+        };
+        let slot = unsafe {
+            upload_i64(
+                &mut device.caching,
+                &(0..prefill_len as i64).collect::<Vec<_>>(),
+                &[prefill_len],
+            )
+        };
         let cu = unsafe { upload_i32(&mut device.caching, &[0, prefill_len as i32], &[2]) };
         let seq = unsafe { upload_i32(&mut device.caching, &[prefill_len as i32], &[1]) };
         let bt = unsafe { upload_i32(&mut device.caching, &[0], &[1, 1]) };
@@ -2229,44 +2657,150 @@ fn test13c_sequential_prefill_decode() {
                 drop(hs);
                 let qkv = unsafe {
                     vllm_cuda::ferrite::launch_fused_norm_gemm(
-                        &FUSED_NORM_GEMM, *res, *lw[i].qkv, *lw[i].norm1, eps, hidden as u32,
-                        None, 1.0, 0.0, &mut device.caching, stream,
+                        &FUSED_NORM_GEMM,
+                        *res,
+                        *lw[i].qkv,
+                        *lw[i].norm1,
+                        eps,
+                        hidden as u32,
+                        None,
+                        1.0,
+                        0.0,
+                        &mut device.caching,
+                        stream,
                     )
                 };
                 let attn = unsafe {
                     layers[i].self_attn.forward_from_qkv(
-                        qkv, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-                        prefill_len, prefill_len, &kv, &rotary, &mut device,
+                        qkv,
+                        pos.view(),
+                        slot.view(),
+                        cu.view(),
+                        seq.view(),
+                        bt.view(),
+                        prefill_len,
+                        prefill_len,
+                        &kv,
+                        &rotary,
+                        &mut device,
                     )
                 };
                 unsafe { vllm_cuda::kernels::add_inplace(*res, *attn, stream) };
                 drop(attn);
                 let gu = unsafe {
                     vllm_cuda::ferrite::launch_fused_norm_gemm(
-                        &FUSED_NORM_GEMM, *res, *lw[i].gate_up, *lw[i].norm2, eps, hidden as u32,
-                        None, 1.0, 0.0, &mut device.caching, stream,
+                        &FUSED_NORM_GEMM,
+                        *res,
+                        *lw[i].gate_up,
+                        *lw[i].norm2,
+                        eps,
+                        hidden as u32,
+                        None,
+                        1.0,
+                        0.0,
+                        &mut device.caching,
+                        stream,
                     )
                 };
-                let act = unsafe { vllm_cuda::kernels::silu_and_mul_fused(*gu, config.intermediate_size, &mut device.caching, stream) };
+                let act = unsafe {
+                    vllm_cuda::kernels::silu_and_mul_fused(
+                        *gu,
+                        config.intermediate_size,
+                        &mut device.caching,
+                        stream,
+                    )
+                };
                 drop(gu);
-                hs = unsafe { device.ferrite.gemm(*act, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream) };
+                hs = unsafe {
+                    device.ferrite.gemm(
+                        *act,
+                        *lw[i].down,
+                        None,
+                        1.0,
+                        0.0,
+                        &mut device.caching,
+                        stream,
+                    )
+                };
                 drop(act);
             } else {
-                unsafe { vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs, *res, *lw[i].norm1, eps, stream) };
-                let qkv = unsafe { device.ferrite.gemm(*hs, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream) };
+                unsafe {
+                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                        *hs,
+                        *res,
+                        *lw[i].norm1,
+                        eps,
+                        stream,
+                    )
+                };
+                let qkv = unsafe {
+                    device.ferrite.gemm(
+                        *hs,
+                        *lw[i].qkv,
+                        None,
+                        1.0,
+                        0.0,
+                        &mut device.caching,
+                        stream,
+                    )
+                };
                 drop(hs);
                 let attn = unsafe {
                     layers[i].self_attn.forward_from_qkv(
-                        qkv, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-                        prefill_len, prefill_len, &kv, &rotary, &mut device,
+                        qkv,
+                        pos.view(),
+                        slot.view(),
+                        cu.view(),
+                        seq.view(),
+                        bt.view(),
+                        prefill_len,
+                        prefill_len,
+                        &kv,
+                        &rotary,
+                        &mut device,
                     )
                 };
-                unsafe { vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn, *res, *lw[i].norm2, eps, stream) };
-                let gu = unsafe { device.ferrite.gemm(*attn, *lw[i].gate_up, None, 1.0, 0.0, &mut device.caching, stream) };
+                unsafe {
+                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                        *attn,
+                        *res,
+                        *lw[i].norm2,
+                        eps,
+                        stream,
+                    )
+                };
+                let gu = unsafe {
+                    device.ferrite.gemm(
+                        *attn,
+                        *lw[i].gate_up,
+                        None,
+                        1.0,
+                        0.0,
+                        &mut device.caching,
+                        stream,
+                    )
+                };
                 drop(attn);
-                let act = unsafe { vllm_cuda::kernels::silu_and_mul_fused(*gu, config.intermediate_size, &mut device.caching, stream) };
+                let act = unsafe {
+                    vllm_cuda::kernels::silu_and_mul_fused(
+                        *gu,
+                        config.intermediate_size,
+                        &mut device.caching,
+                        stream,
+                    )
+                };
                 drop(gu);
-                hs = unsafe { device.ferrite.gemm(*act, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream) };
+                hs = unsafe {
+                    device.ferrite.gemm(
+                        *act,
+                        *lw[i].down,
+                        None,
+                        1.0,
+                        0.0,
+                        &mut device.caching,
+                        stream,
+                    )
+                };
                 drop(act);
             }
         }
@@ -2288,11 +2822,26 @@ fn test13c_sequential_prefill_decode() {
             let d_slot = unsafe { upload_i64(&mut device.caching, &[slot_idx], &[1]) };
             let d_cu = unsafe { upload_i32(&mut device.caching, &[0i32, 1], &[2]) };
             let d_seq = unsafe { upload_i32(&mut device.caching, &[total_seq as i32], &[1]) };
-            let d_bt = unsafe { upload_i32(&mut device.caching, &(0..n_blocks as i32).collect::<Vec<_>>(), &[1, n_blocks]) };
+            let d_bt = unsafe {
+                upload_i32(
+                    &mut device.caching,
+                    &(0..n_blocks as i32).collect::<Vec<_>>(),
+                    &[1, n_blocks],
+                )
+            };
 
             // Feed last row as decode input
             unsafe { cusys::cuStreamSynchronize(stream) };
-            let last_hs = unsafe { download_bf16(*hs, if step == 0 { prefill_len * hidden } else { hidden }) };
+            let last_hs = unsafe {
+                download_bf16(
+                    *hs,
+                    if step == 0 {
+                        prefill_len * hidden
+                    } else {
+                        hidden
+                    },
+                )
+            };
             let row = if step == 0 {
                 last_hs[(prefill_len - 1) * hidden..].to_vec()
             } else {
@@ -2300,7 +2849,16 @@ fn test13c_sequential_prefill_decode() {
             };
             hs = unsafe { upload_bf16(&mut device.caching, &row, &[1, hidden]) };
 
-            let last_res = unsafe { download_bf16(*res, if step == 0 { prefill_len * hidden } else { hidden }) };
+            let last_res = unsafe {
+                download_bf16(
+                    *res,
+                    if step == 0 {
+                        prefill_len * hidden
+                    } else {
+                        hidden
+                    },
+                )
+            };
             let res_row = if step == 0 {
                 last_res[(prefill_len - 1) * hidden..].to_vec()
             } else {
@@ -2316,44 +2874,150 @@ fn test13c_sequential_prefill_decode() {
                     drop(hs);
                     let qkv = unsafe {
                         vllm_cuda::ferrite::launch_fused_norm_gemm(
-                            &FUSED_NORM_GEMM, *res, *lw[i].qkv, *lw[i].norm1, eps, hidden as u32,
-                            None, 1.0, 0.0, &mut device.caching, stream,
+                            &FUSED_NORM_GEMM,
+                            *res,
+                            *lw[i].qkv,
+                            *lw[i].norm1,
+                            eps,
+                            hidden as u32,
+                            None,
+                            1.0,
+                            0.0,
+                            &mut device.caching,
+                            stream,
                         )
                     };
                     let attn = unsafe {
                         layers[i].self_attn.forward_from_qkv(
-                            qkv, d_pos.view(), d_slot.view(), d_cu.view(), d_seq.view(), d_bt.view(),
-                            1, total_seq, &kv, &rotary, &mut device,
+                            qkv,
+                            d_pos.view(),
+                            d_slot.view(),
+                            d_cu.view(),
+                            d_seq.view(),
+                            d_bt.view(),
+                            1,
+                            total_seq,
+                            &kv,
+                            &rotary,
+                            &mut device,
                         )
                     };
                     unsafe { vllm_cuda::kernels::add_inplace(*res, *attn, stream) };
                     drop(attn);
                     let gu = unsafe {
                         vllm_cuda::ferrite::launch_fused_norm_gemm(
-                            &FUSED_NORM_GEMM, *res, *lw[i].gate_up, *lw[i].norm2, eps, hidden as u32,
-                            None, 1.0, 0.0, &mut device.caching, stream,
+                            &FUSED_NORM_GEMM,
+                            *res,
+                            *lw[i].gate_up,
+                            *lw[i].norm2,
+                            eps,
+                            hidden as u32,
+                            None,
+                            1.0,
+                            0.0,
+                            &mut device.caching,
+                            stream,
                         )
                     };
-                    let act = unsafe { vllm_cuda::kernels::silu_and_mul_fused(*gu, config.intermediate_size, &mut device.caching, stream) };
+                    let act = unsafe {
+                        vllm_cuda::kernels::silu_and_mul_fused(
+                            *gu,
+                            config.intermediate_size,
+                            &mut device.caching,
+                            stream,
+                        )
+                    };
                     drop(gu);
-                    hs = unsafe { device.ferrite.gemm(*act, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream) };
+                    hs = unsafe {
+                        device.ferrite.gemm(
+                            *act,
+                            *lw[i].down,
+                            None,
+                            1.0,
+                            0.0,
+                            &mut device.caching,
+                            stream,
+                        )
+                    };
                     drop(act);
                 } else {
-                    unsafe { vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs, *res, *lw[i].norm1, eps, stream) };
-                    let qkv = unsafe { device.ferrite.gemm(*hs, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream) };
+                    unsafe {
+                        vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                            *hs,
+                            *res,
+                            *lw[i].norm1,
+                            eps,
+                            stream,
+                        )
+                    };
+                    let qkv = unsafe {
+                        device.ferrite.gemm(
+                            *hs,
+                            *lw[i].qkv,
+                            None,
+                            1.0,
+                            0.0,
+                            &mut device.caching,
+                            stream,
+                        )
+                    };
                     drop(hs);
                     let attn = unsafe {
                         layers[i].self_attn.forward_from_qkv(
-                            qkv, d_pos.view(), d_slot.view(), d_cu.view(), d_seq.view(), d_bt.view(),
-                            1, total_seq, &kv, &rotary, &mut device,
+                            qkv,
+                            d_pos.view(),
+                            d_slot.view(),
+                            d_cu.view(),
+                            d_seq.view(),
+                            d_bt.view(),
+                            1,
+                            total_seq,
+                            &kv,
+                            &rotary,
+                            &mut device,
                         )
                     };
-                    unsafe { vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn, *res, *lw[i].norm2, eps, stream) };
-                    let gu = unsafe { device.ferrite.gemm(*attn, *lw[i].gate_up, None, 1.0, 0.0, &mut device.caching, stream) };
+                    unsafe {
+                        vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                            *attn,
+                            *res,
+                            *lw[i].norm2,
+                            eps,
+                            stream,
+                        )
+                    };
+                    let gu = unsafe {
+                        device.ferrite.gemm(
+                            *attn,
+                            *lw[i].gate_up,
+                            None,
+                            1.0,
+                            0.0,
+                            &mut device.caching,
+                            stream,
+                        )
+                    };
                     drop(attn);
-                    let act = unsafe { vllm_cuda::kernels::silu_and_mul_fused(*gu, config.intermediate_size, &mut device.caching, stream) };
+                    let act = unsafe {
+                        vllm_cuda::kernels::silu_and_mul_fused(
+                            *gu,
+                            config.intermediate_size,
+                            &mut device.caching,
+                            stream,
+                        )
+                    };
                     drop(gu);
-                    hs = unsafe { device.ferrite.gemm(*act, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream) };
+                    hs = unsafe {
+                        device.ferrite.gemm(
+                            *act,
+                            *lw[i].down,
+                            None,
+                            1.0,
+                            0.0,
+                            &mut device.caching,
+                            stream,
+                        )
+                    };
                     drop(act);
                 }
             }
@@ -2365,7 +3029,11 @@ fn test13c_sequential_prefill_decode() {
             // For both paths, use the standard final norm (it's not part of the fused experiment)
             unsafe {
                 vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                    *hs, *res, *final_norm_w, eps, stream,
+                    *hs,
+                    *res,
+                    *final_norm_w,
+                    eps,
+                    stream,
                 );
             }
             // lm_head = embed_w (tied). logits = hs @ embed_w^T
@@ -2373,9 +3041,9 @@ fn test13c_sequential_prefill_decode() {
             // ferrite.gemm does A @ B where A=[M,K] B=[N,K] → C=[M,N]
             // So: A=hs [1, hidden], B=embed_w [vocab, hidden] → C=[1, vocab]
             let logits = unsafe {
-                device.ferrite.gemm(
-                    *hs, *embed_w, None, 1.0, 0.0, &mut device.caching, stream,
-                )
+                device
+                    .ferrite
+                    .gemm(*hs, *embed_w, None, 1.0, 0.0, &mut device.caching, stream)
             };
 
             unsafe { cusys::cuStreamSynchronize(stream) };
@@ -2413,7 +3081,11 @@ fn test13c_sequential_prefill_decode() {
             "  decode {step}: std_token={:6} fused_token={:6} {}  hidden_diff={diff:.2e}",
             std_tokens[step],
             fused_tokens[step],
-            if tok_match { "MATCH" } else { "MISMATCH ←←←" },
+            if tok_match {
+                "MATCH"
+            } else {
+                "MISMATCH ←←←"
+            },
         );
     }
 
@@ -2446,17 +3118,35 @@ fn test13b_decode_sanity() {
     let vocab_size = embed_data.len() / hidden;
     let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
 
-    struct LW { norm1: OwnedTensor, qkv: OwnedTensor, norm2: OwnedTensor, gate_up: OwnedTensor, down: OwnedTensor }
+    struct LW {
+        norm1: OwnedTensor,
+        qkv: OwnedTensor,
+        norm2: OwnedTensor,
+        gate_up: OwnedTensor,
+        down: OwnedTensor,
+    }
     let mut lw: Vec<LW> = Vec::new();
     for i in 0..num_layers {
         let n1 = load_bf16_tensor(&st, &format!("model.layers.{i}.input_layernorm.weight"));
         let mut qkv = load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.q_proj.weight"));
-        qkv.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.k_proj.weight")));
-        qkv.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.v_proj.weight")));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.k_proj.weight"),
+        ));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.v_proj.weight"),
+        ));
         let qkv_n = qkv.len() / hidden;
-        let n2 = load_bf16_tensor(&st, &format!("model.layers.{i}.post_attention_layernorm.weight"));
+        let n2 = load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.post_attention_layernorm.weight"),
+        );
         let mut gu = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.gate_proj.weight"));
-        gu.extend_from_slice(&load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.up_proj.weight")));
+        gu.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.mlp.up_proj.weight"),
+        ));
         let gu_n = gu.len() / hidden;
         let dw = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.down_proj.weight"));
         let down_k = dw.len() / hidden;
@@ -2472,27 +3162,49 @@ fn test13b_decode_sanity() {
     let mut gw = GpuWeights::from_single_file(MODEL_PATH, stream).unwrap();
     let mut layers: Vec<LlamaDecoderLayer> = Vec::new();
     for i in 0..num_layers {
-        layers.push(LlamaDecoderLayer::load(&mut gw, &format!("model.layers.{i}"), &config, i, stream).unwrap());
+        layers.push(
+            LlamaDecoderLayer::load(&mut gw, &format!("model.layers.{i}"), &config, i, stream)
+                .unwrap(),
+        );
     }
     drop(raw);
 
     let kv = unsafe { KvCachePool::new(24, 32, block_size, 2, 64, DType::BF16).unwrap() };
-    let rotary = unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
+    let rotary =
+        unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
 
     let prefill_ids: Vec<u32> = vec![1, 3923, 374, 220, 17, 10, 17, 30];
     let prefill_len = prefill_ids.len();
 
     // Embed
     let ids = unsafe { upload_u32(&mut device.caching, &prefill_ids, &[prefill_len]) };
-    let mut hs = unsafe { vllm_cuda::kernels::embedding_gather(*embed_w, *ids, &mut device.caching, stream) };
+    let mut hs = unsafe {
+        vllm_cuda::kernels::embedding_gather(*embed_w, *ids, &mut device.caching, stream)
+    };
     drop(ids);
     let mut res = unsafe {
-        upload_bf16(&mut device.caching, &vec![bf16::ZERO; prefill_len * hidden], &[prefill_len, hidden])
+        upload_bf16(
+            &mut device.caching,
+            &vec![bf16::ZERO; prefill_len * hidden],
+            &[prefill_len, hidden],
+        )
     };
 
     // Prefill metadata
-    let pos = unsafe { upload_u32(&mut device.caching, &(0..prefill_len as u32).collect::<Vec<_>>(), &[prefill_len]) };
-    let slot = unsafe { upload_i64(&mut device.caching, &(0..prefill_len as i64).collect::<Vec<_>>(), &[prefill_len]) };
+    let pos = unsafe {
+        upload_u32(
+            &mut device.caching,
+            &(0..prefill_len as u32).collect::<Vec<_>>(),
+            &[prefill_len],
+        )
+    };
+    let slot = unsafe {
+        upload_i64(
+            &mut device.caching,
+            &(0..prefill_len as i64).collect::<Vec<_>>(),
+            &[prefill_len],
+        )
+    };
     let cu = unsafe { upload_i32(&mut device.caching, &[0, prefill_len as i32], &[2]) };
     let seq = unsafe { upload_i32(&mut device.caching, &[prefill_len as i32], &[1]) };
     let bt = unsafe { upload_i32(&mut device.caching, &[0], &[1, 1]) };
@@ -2502,21 +3214,65 @@ fn test13b_decode_sanity() {
     // Prefill
     println!("  Prefill {prefill_len} tokens (standard only)...");
     for i in 0..num_layers {
-        unsafe { vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs, *res, *lw[i].norm1, eps, stream) };
-        let qkv = unsafe { device.ferrite.gemm(*hs, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream) };
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs, *res, *lw[i].norm1, eps, stream)
+        };
+        let qkv = unsafe {
+            device
+                .ferrite
+                .gemm(*hs, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream)
+        };
         drop(hs);
         let attn = unsafe {
             layers[i].self_attn.forward_from_qkv(
-                qkv, pos.view(), slot.view(), cu.view(), seq.view(), bt.view(),
-                prefill_len, prefill_len, &kv, &rotary, &mut device,
+                qkv,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                prefill_len,
+                prefill_len,
+                &kv,
+                &rotary,
+                &mut device,
             )
         };
-        unsafe { vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn, *res, *lw[i].norm2, eps, stream) };
-        let gu = unsafe { device.ferrite.gemm(*attn, *lw[i].gate_up, None, 1.0, 0.0, &mut device.caching, stream) };
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn, *res, *lw[i].norm2, eps, stream)
+        };
+        let gu = unsafe {
+            device.ferrite.gemm(
+                *attn,
+                *lw[i].gate_up,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
         drop(attn);
-        let act = unsafe { vllm_cuda::kernels::silu_and_mul_fused(*gu, config.intermediate_size, &mut device.caching, stream) };
+        let act = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
+        };
         drop(gu);
-        hs = unsafe { device.ferrite.gemm(*act, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream) };
+        hs = unsafe {
+            device.ferrite.gemm(
+                *act,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
         drop(act);
     }
     println!("  Prefill done.");
@@ -2532,7 +3288,13 @@ fn test13b_decode_sanity() {
     let d_slot = unsafe { upload_i64(&mut device.caching, &[slot_idx], &[1]) };
     let d_cu = unsafe { upload_i32(&mut device.caching, &[0i32, 1], &[2]) };
     let d_seq = unsafe { upload_i32(&mut device.caching, &[total_seq as i32], &[1]) };
-    let d_bt = unsafe { upload_i32(&mut device.caching, &(0..num_blocks as i32).collect::<Vec<_>>(), &[1, num_blocks]) };
+    let d_bt = unsafe {
+        upload_i32(
+            &mut device.caching,
+            &(0..num_blocks as i32).collect::<Vec<_>>(),
+            &[1, num_blocks],
+        )
+    };
 
     // Feed last hidden state as decode input
     unsafe { cusys::cuStreamSynchronize(stream) };
@@ -2547,21 +3309,65 @@ fn test13b_decode_sanity() {
     unsafe { cusys::cuStreamSynchronize(stream) };
 
     for i in 0..num_layers {
-        unsafe { vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs, *res, *lw[i].norm1, eps, stream) };
-        let qkv = unsafe { device.ferrite.gemm(*hs, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream) };
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs, *res, *lw[i].norm1, eps, stream)
+        };
+        let qkv = unsafe {
+            device
+                .ferrite
+                .gemm(*hs, *lw[i].qkv, None, 1.0, 0.0, &mut device.caching, stream)
+        };
         drop(hs);
         let attn = unsafe {
             layers[i].self_attn.forward_from_qkv(
-                qkv, d_pos.view(), d_slot.view(), d_cu.view(), d_seq.view(), d_bt.view(),
-                1, total_seq, &kv, &rotary, &mut device,
+                qkv,
+                d_pos.view(),
+                d_slot.view(),
+                d_cu.view(),
+                d_seq.view(),
+                d_bt.view(),
+                1,
+                total_seq,
+                &kv,
+                &rotary,
+                &mut device,
             )
         };
-        unsafe { vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn, *res, *lw[i].norm2, eps, stream) };
-        let gu = unsafe { device.ferrite.gemm(*attn, *lw[i].gate_up, None, 1.0, 0.0, &mut device.caching, stream) };
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*attn, *res, *lw[i].norm2, eps, stream)
+        };
+        let gu = unsafe {
+            device.ferrite.gemm(
+                *attn,
+                *lw[i].gate_up,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
         drop(attn);
-        let act = unsafe { vllm_cuda::kernels::silu_and_mul_fused(*gu, config.intermediate_size, &mut device.caching, stream) };
+        let act = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
+        };
         drop(gu);
-        hs = unsafe { device.ferrite.gemm(*act, *lw[i].down, None, 1.0, 0.0, &mut device.caching, stream) };
+        hs = unsafe {
+            device.ferrite.gemm(
+                *act,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
         drop(act);
     }
 
@@ -2572,4 +3378,1277 @@ fn test13b_decode_sanity() {
     println!("  Decode done: max={out_max:.2}, nan={nan}");
     assert_eq!(nan, 0, "Decode produced NaN");
     println!("PASS: test13b — standard decode works");
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// test14a: test12 + argmax token comparison
+//
+// Same as test12 (24-layer prefill, synthetic data, both paths) but
+// adds final_norm + lm_head + argmax at the end. One variable changed
+// vs test12: does the "bounded" hidden state diff flip tokens?
+//
+// If this passes: prefill token agreement is fine, problem is in decode.
+// If this fails: we don't even need decode to see the bug.
+// ════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test14a_prefill_argmax_synthetic() {
+    println!("=== test14a: test12 + argmax — does prefill diff flip tokens? ===");
+
+    let mut device = GpuDevice::new(0).unwrap();
+    let stream = device.compute_stream;
+    let config = qwen_config();
+    let hidden = config.hidden_size;
+    let eps = config.rms_norm_eps;
+    let num_layers = config.num_hidden_layers;
+
+    let raw = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&raw).expect("parse");
+
+    // Embedding weight (for lm_head — tied)
+    let embed_data = load_bf16_tensor(&st, "model.embed_tokens.weight");
+    let vocab_size = embed_data.len() / hidden;
+    let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
+
+    // Final norm
+    let final_norm_data = load_bf16_tensor(&st, "model.norm.weight");
+    let final_norm_w = unsafe { upload_bf16(&mut device.caching, &final_norm_data, &[hidden]) };
+
+    // Per-layer weights
+    struct LW {
+        norm1: OwnedTensor,
+        qkv: OwnedTensor,
+        norm2: OwnedTensor,
+        gate_up: OwnedTensor,
+        down: OwnedTensor,
+    }
+    let mut lw: Vec<LW> = Vec::new();
+    for i in 0..num_layers {
+        let n1 = load_bf16_tensor(&st, &format!("model.layers.{i}.input_layernorm.weight"));
+        let mut qkv = load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.q_proj.weight"));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.k_proj.weight"),
+        ));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.v_proj.weight"),
+        ));
+        let qkv_n = qkv.len() / hidden;
+        let n2 = load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.post_attention_layernorm.weight"),
+        );
+        let mut gu = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.gate_proj.weight"));
+        gu.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.mlp.up_proj.weight"),
+        ));
+        let gu_n = gu.len() / hidden;
+        let dw = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.down_proj.weight"));
+        let down_k = dw.len() / hidden;
+        lw.push(LW {
+            norm1: unsafe { upload_bf16(&mut device.caching, &n1, &[hidden]) },
+            qkv: unsafe { upload_bf16(&mut device.caching, &qkv, &[qkv_n, hidden]) },
+            norm2: unsafe { upload_bf16(&mut device.caching, &n2, &[hidden]) },
+            gate_up: unsafe { upload_bf16(&mut device.caching, &gu, &[gu_n, hidden]) },
+            down: unsafe { upload_bf16(&mut device.caching, &dw, &[hidden, down_k]) },
+        });
+    }
+
+    let mut gw = GpuWeights::from_single_file(MODEL_PATH, stream).unwrap();
+    let mut layers: Vec<LlamaDecoderLayer> = Vec::new();
+    for i in 0..num_layers {
+        layers.push(
+            LlamaDecoderLayer::load(&mut gw, &format!("model.layers.{i}"), &config, i, stream)
+                .unwrap(),
+        );
+    }
+    drop(raw);
+
+    let kv_a = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
+    let kv_b = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
+    let rotary =
+        unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
+
+    // Same synthetic data as test12
+    let m = 4usize;
+    let pos_data: Vec<u32> = (0..m as u32).collect();
+    let slot_data: Vec<i64> = (0..m as i64).collect();
+    let cu_data: Vec<i32> = vec![0, m as i32];
+    let seq_data: Vec<i32> = vec![m as i32];
+    let bt_data: Vec<i32> = vec![0];
+    let pos = unsafe { upload_u32(&mut device.caching, &pos_data, &[m]) };
+    let slot = unsafe { upload_i64(&mut device.caching, &slot_data, &[m]) };
+    let cu = unsafe { upload_i32(&mut device.caching, &cu_data, &[2]) };
+    let seq = unsafe { upload_i32(&mut device.caching, &seq_data, &[1]) };
+    let bt = unsafe { upload_i32(&mut device.caching, &bt_data, &[1, 1]) };
+
+    let hs_data: Vec<bf16> = (0..m * hidden)
+        .map(|i| bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+    let mut hs_a = unsafe { upload_bf16(&mut device.caching, &hs_data, &[m, hidden]) };
+    let mut hs_b = unsafe { upload_bf16(&mut device.caching, &hs_data, &[m, hidden]) };
+    let mut res_a = unsafe {
+        upload_bf16(
+            &mut device.caching,
+            &vec![bf16::ZERO; m * hidden],
+            &[m, hidden],
+        )
+    };
+    let mut res_b = unsafe {
+        upload_bf16(
+            &mut device.caching,
+            &vec![bf16::ZERO; m * hidden],
+            &[m, hidden],
+        )
+    };
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    // ── 24-layer prefill (identical to test12) ──
+    for i in 0..num_layers {
+        // Path A (standard)
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                *hs_a,
+                *res_a,
+                *lw[i].norm1,
+                eps,
+                stream,
+            );
+        }
+        let qkv_a = unsafe {
+            device.ferrite.gemm(
+                *hs_a,
+                *lw[i].qkv,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(hs_a);
+        let attn_a = unsafe {
+            layers[i].self_attn.forward_from_qkv(
+                qkv_a,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                m,
+                m,
+                &kv_a,
+                &rotary,
+                &mut device,
+            )
+        };
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                *attn_a,
+                *res_a,
+                *lw[i].norm2,
+                eps,
+                stream,
+            );
+        }
+        let gu_a = unsafe {
+            device.ferrite.gemm(
+                *attn_a,
+                *lw[i].gate_up,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(attn_a);
+        let act_a = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu_a,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(gu_a);
+        hs_a = unsafe {
+            device.ferrite.gemm(
+                *act_a,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(act_a);
+
+        // Path B (fused)
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *hs_b, stream) };
+        drop(hs_b);
+        let qkv_b = unsafe {
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                *res_b,
+                *lw[i].qkv,
+                *lw[i].norm1,
+                eps,
+                hidden as u32,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        let attn_b = unsafe {
+            layers[i].self_attn.forward_from_qkv(
+                qkv_b,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                m,
+                m,
+                &kv_b,
+                &rotary,
+                &mut device,
+            )
+        };
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *attn_b, stream) };
+        drop(attn_b);
+        let gu_b = unsafe {
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                *res_b,
+                *lw[i].gate_up,
+                *lw[i].norm2,
+                eps,
+                hidden as u32,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        let act_b = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu_b,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(gu_b);
+        hs_b = unsafe {
+            device.ferrite.gemm(
+                *act_b,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(act_b);
+    }
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    // ── NEW: final norm + lm_head + argmax per token ──
+    // Apply final norm to both paths (standard norm, not part of fused experiment)
+    // Need copies since fused_add_rms_norm_inplace is in-place
+    let hs_a_copy = unsafe {
+        let data = download_bf16(*hs_a, m * hidden);
+        upload_bf16(&mut device.caching, &data, &[m, hidden])
+    };
+    let hs_b_copy = unsafe {
+        let data = download_bf16(*hs_b, m * hidden);
+        upload_bf16(&mut device.caching, &data, &[m, hidden])
+    };
+    // Use standalone rms_norm (not fused_add) to avoid needing a residual
+    let normed_a = unsafe {
+        vllm_cuda::kernels::rms_norm(*hs_a_copy, *final_norm_w, eps, &mut device.caching, stream)
+    };
+    let normed_b = unsafe {
+        vllm_cuda::kernels::rms_norm(*hs_b_copy, *final_norm_w, eps, &mut device.caching, stream)
+    };
+
+    // lm_head (tied weights): logits = normed @ embed_w^T
+    // For each of the m tokens
+    let logits_a = unsafe {
+        device.ferrite.gemm(
+            *normed_a,
+            *embed_w,
+            None,
+            1.0,
+            0.0,
+            &mut device.caching,
+            stream,
+        )
+    };
+    let logits_b = unsafe {
+        device.ferrite.gemm(
+            *normed_b,
+            *embed_w,
+            None,
+            1.0,
+            0.0,
+            &mut device.caching,
+            stream,
+        )
+    };
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    let la = unsafe { download_bf16(*logits_a, m * vocab_size) };
+    let lb = unsafe { download_bf16(*logits_b, m * vocab_size) };
+
+    let mut all_match = true;
+    for tok in 0..m {
+        let row_a = &la[tok * vocab_size..(tok + 1) * vocab_size];
+        let row_b = &lb[tok * vocab_size..(tok + 1) * vocab_size];
+
+        let (tok_a, _) = row_a
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.to_f32().partial_cmp(&b.to_f32()).unwrap())
+            .unwrap();
+        let (tok_b, _) = row_b
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.to_f32().partial_cmp(&b.to_f32()).unwrap())
+            .unwrap();
+
+        let (hs_diff, _) = {
+            let ha = unsafe { download_bf16(*hs_a, m * hidden) };
+            let hb = unsafe { download_bf16(*hs_b, m * hidden) };
+            max_diff_bf16(
+                &ha[tok * hidden..(tok + 1) * hidden],
+                &hb[tok * hidden..(tok + 1) * hidden],
+            )
+        };
+
+        let match_str = if tok_a == tok_b {
+            "MATCH"
+        } else {
+            all_match = false;
+            "MISMATCH ←←←"
+        };
+        println!(
+            "  token {tok}: std={tok_a:6} fused={tok_b:6} {match_str}  hidden_diff={hs_diff:.2e}"
+        );
+    }
+
+    if all_match {
+        println!("PASS: test14a — prefill argmax tokens match (synthetic data)");
+    } else {
+        println!("FAIL: test14a — prefill argmax mismatch with synthetic data!");
+        panic!("Prefill token mismatch — no decode needed to see divergence");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// test14b: test14a but with real embeddings (embedding_gather)
+//
+// Same as test14a (24-layer prefill + argmax) but input comes from
+// embedding_gather with token IDs instead of synthetic sin/cos.
+// One variable changed vs test14a: input data source.
+//
+// If this passes: real embeddings don't matter for prefill tokens.
+// If this fails: the fused kernel breaks specifically with real embedding values.
+// ════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test14b_prefill_argmax_real_embeddings() {
+    println!("=== test14b: prefill + argmax with real embeddings ===");
+
+    let mut device = GpuDevice::new(0).unwrap();
+    let stream = device.compute_stream;
+    let config = qwen_config();
+    let hidden = config.hidden_size;
+    let eps = config.rms_norm_eps;
+    let num_layers = config.num_hidden_layers;
+
+    let raw = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&raw).expect("parse");
+
+    let embed_data = load_bf16_tensor(&st, "model.embed_tokens.weight");
+    let vocab_size = embed_data.len() / hidden;
+    let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
+
+    let final_norm_data = load_bf16_tensor(&st, "model.norm.weight");
+    let final_norm_w = unsafe { upload_bf16(&mut device.caching, &final_norm_data, &[hidden]) };
+
+    struct LW {
+        norm1: OwnedTensor,
+        qkv: OwnedTensor,
+        norm2: OwnedTensor,
+        gate_up: OwnedTensor,
+        down: OwnedTensor,
+    }
+    let mut lw: Vec<LW> = Vec::new();
+    for i in 0..num_layers {
+        let n1 = load_bf16_tensor(&st, &format!("model.layers.{i}.input_layernorm.weight"));
+        let mut qkv = load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.q_proj.weight"));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.k_proj.weight"),
+        ));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.v_proj.weight"),
+        ));
+        let qkv_n = qkv.len() / hidden;
+        let n2 = load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.post_attention_layernorm.weight"),
+        );
+        let mut gu = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.gate_proj.weight"));
+        gu.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.mlp.up_proj.weight"),
+        ));
+        let gu_n = gu.len() / hidden;
+        let dw = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.down_proj.weight"));
+        let down_k = dw.len() / hidden;
+        lw.push(LW {
+            norm1: unsafe { upload_bf16(&mut device.caching, &n1, &[hidden]) },
+            qkv: unsafe { upload_bf16(&mut device.caching, &qkv, &[qkv_n, hidden]) },
+            norm2: unsafe { upload_bf16(&mut device.caching, &n2, &[hidden]) },
+            gate_up: unsafe { upload_bf16(&mut device.caching, &gu, &[gu_n, hidden]) },
+            down: unsafe { upload_bf16(&mut device.caching, &dw, &[hidden, down_k]) },
+        });
+    }
+
+    let mut gw = GpuWeights::from_single_file(MODEL_PATH, stream).unwrap();
+    let mut layers: Vec<LlamaDecoderLayer> = Vec::new();
+    for i in 0..num_layers {
+        layers.push(
+            LlamaDecoderLayer::load(&mut gw, &format!("model.layers.{i}"), &config, i, stream)
+                .unwrap(),
+        );
+    }
+    drop(raw);
+
+    let kv_a = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
+    let kv_b = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
+    let rotary =
+        unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
+
+    // Real token IDs (same as test13c)
+    let prefill_ids: Vec<u32> = vec![1, 3923, 374, 220, 17, 10, 17, 30];
+    let m = prefill_ids.len();
+
+    // Embed tokens (real embeddings)
+    let ids_gpu = unsafe { upload_u32(&mut device.caching, &prefill_ids, &[m]) };
+    let mut hs_a = unsafe {
+        vllm_cuda::kernels::embedding_gather(*embed_w, *ids_gpu, &mut device.caching, stream)
+    };
+    // Need a second copy for path B
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    let hs_data = unsafe { download_bf16(*hs_a, m * hidden) };
+    let mut hs_b = unsafe { upload_bf16(&mut device.caching, &hs_data, &[m, hidden]) };
+    drop(ids_gpu);
+
+    let mut res_a = unsafe {
+        upload_bf16(
+            &mut device.caching,
+            &vec![bf16::ZERO; m * hidden],
+            &[m, hidden],
+        )
+    };
+    let mut res_b = unsafe {
+        upload_bf16(
+            &mut device.caching,
+            &vec![bf16::ZERO; m * hidden],
+            &[m, hidden],
+        )
+    };
+
+    let pos_data: Vec<u32> = (0..m as u32).collect();
+    let slot_data: Vec<i64> = (0..m as i64).collect();
+    let cu_data: Vec<i32> = vec![0, m as i32];
+    let seq_data: Vec<i32> = vec![m as i32];
+    let bt_data: Vec<i32> = vec![0];
+    let pos = unsafe { upload_u32(&mut device.caching, &pos_data, &[m]) };
+    let slot = unsafe { upload_i64(&mut device.caching, &slot_data, &[m]) };
+    let cu = unsafe { upload_i32(&mut device.caching, &cu_data, &[2]) };
+    let seq = unsafe { upload_i32(&mut device.caching, &seq_data, &[1]) };
+    let bt = unsafe { upload_i32(&mut device.caching, &bt_data, &[1, 1]) };
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    // ── 24-layer prefill ──
+    for i in 0..num_layers {
+        // Path A (standard)
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                *hs_a,
+                *res_a,
+                *lw[i].norm1,
+                eps,
+                stream,
+            );
+        }
+        let qkv_a = unsafe {
+            device.ferrite.gemm(
+                *hs_a,
+                *lw[i].qkv,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(hs_a);
+        let attn_a = unsafe {
+            layers[i].self_attn.forward_from_qkv(
+                qkv_a,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                m,
+                m,
+                &kv_a,
+                &rotary,
+                &mut device,
+            )
+        };
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                *attn_a,
+                *res_a,
+                *lw[i].norm2,
+                eps,
+                stream,
+            );
+        }
+        let gu_a = unsafe {
+            device.ferrite.gemm(
+                *attn_a,
+                *lw[i].gate_up,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(attn_a);
+        let act_a = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu_a,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(gu_a);
+        hs_a = unsafe {
+            device.ferrite.gemm(
+                *act_a,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(act_a);
+
+        // Path B (fused)
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *hs_b, stream) };
+        drop(hs_b);
+        let qkv_b = unsafe {
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                *res_b,
+                *lw[i].qkv,
+                *lw[i].norm1,
+                eps,
+                hidden as u32,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        let attn_b = unsafe {
+            layers[i].self_attn.forward_from_qkv(
+                qkv_b,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                m,
+                m,
+                &kv_b,
+                &rotary,
+                &mut device,
+            )
+        };
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *attn_b, stream) };
+        drop(attn_b);
+        let gu_b = unsafe {
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                *res_b,
+                *lw[i].gate_up,
+                *lw[i].norm2,
+                eps,
+                hidden as u32,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        let act_b = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu_b,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(gu_b);
+        hs_b = unsafe {
+            device.ferrite.gemm(
+                *act_b,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(act_b);
+    }
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    // ── Final norm + lm_head + argmax ──
+    let normed_a = unsafe {
+        vllm_cuda::kernels::rms_norm(*hs_a, *final_norm_w, eps, &mut device.caching, stream)
+    };
+    let normed_b = unsafe {
+        vllm_cuda::kernels::rms_norm(*hs_b, *final_norm_w, eps, &mut device.caching, stream)
+    };
+    let logits_a = unsafe {
+        device.ferrite.gemm(
+            *normed_a,
+            *embed_w,
+            None,
+            1.0,
+            0.0,
+            &mut device.caching,
+            stream,
+        )
+    };
+    let logits_b = unsafe {
+        device.ferrite.gemm(
+            *normed_b,
+            *embed_w,
+            None,
+            1.0,
+            0.0,
+            &mut device.caching,
+            stream,
+        )
+    };
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    let la = unsafe { download_bf16(*logits_a, m * vocab_size) };
+    let lb = unsafe { download_bf16(*logits_b, m * vocab_size) };
+    let ha = unsafe { download_bf16(*hs_a, m * hidden) };
+    let hb = unsafe { download_bf16(*hs_b, m * hidden) };
+
+    let mut all_match = true;
+    for tok in 0..m {
+        let row_a = &la[tok * vocab_size..(tok + 1) * vocab_size];
+        let row_b = &lb[tok * vocab_size..(tok + 1) * vocab_size];
+
+        let (tok_a, _) = row_a
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.to_f32().partial_cmp(&b.to_f32()).unwrap())
+            .unwrap();
+        let (tok_b, _) = row_b
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.to_f32().partial_cmp(&b.to_f32()).unwrap())
+            .unwrap();
+
+        let (hs_diff, _) = max_diff_bf16(
+            &ha[tok * hidden..(tok + 1) * hidden],
+            &hb[tok * hidden..(tok + 1) * hidden],
+        );
+
+        // Top-2 logit gap for path A
+        let mut sorted_a: Vec<(usize, f32)> = row_a
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, v.to_f32()))
+            .collect();
+        sorted_a.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let gap_a = sorted_a[0].1 - sorted_a[1].1;
+
+        let mut sorted_b: Vec<(usize, f32)> = row_b
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, v.to_f32()))
+            .collect();
+        sorted_b.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let gap_b = sorted_b[0].1 - sorted_b[1].1;
+
+        let match_str = if tok_a == tok_b {
+            "MATCH"
+        } else {
+            all_match = false;
+            "MISMATCH ←←←"
+        };
+        println!(
+            "  token {tok}: std={tok_a:6} fused={tok_b:6} {match_str}  hidden_diff={hs_diff:.2e}  gap_a={gap_a:.3} gap_b={gap_b:.3}"
+        );
+        if tok_a != tok_b {
+            // Print where path B's winner ranks in path A
+            let rank_in_a = sorted_a.iter().position(|(id, _)| *id == tok_b).unwrap();
+            let rank_in_b = sorted_b.iter().position(|(id, _)| *id == tok_a).unwrap();
+            println!(
+                "    fused_winner={tok_b} is rank {rank_in_a} in std (logit={:.3})",
+                row_a[tok_b].to_f32()
+            );
+            println!(
+                "    std_winner={tok_a} is rank {rank_in_b} in fused (logit={:.3})",
+                row_b[tok_a].to_f32()
+            );
+        }
+    }
+
+    if all_match {
+        println!("PASS: test14b — prefill argmax tokens match (real embeddings)");
+    } else {
+        println!("FAIL: test14b — prefill argmax mismatch with real embeddings!");
+        panic!("Prefill token mismatch with real embeddings");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// test14c: Single-layer QKV with real embeddings
+//
+// Same as test10c (QKV-only, shared weights) but with real embedding
+// inputs instead of synthetic sin/cos. Tests one layer at a time.
+//
+// If diffs are same magnitude as test10c: single-layer is fine, error accumulates.
+// If diffs are larger: fused kernel is wrong on real embedding distributions.
+// ════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test14c_single_layer_qkv_real_embeddings() {
+    println!("=== test14c: single-layer QKV, real embeddings ===");
+
+    let mut device = GpuDevice::new(0).unwrap();
+    let stream = device.compute_stream;
+    let config = qwen_config();
+    let hidden = config.hidden_size;
+    let eps = config.rms_norm_eps;
+
+    let raw = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&raw).expect("parse");
+
+    let embed_data = load_bf16_tensor(&st, "model.embed_tokens.weight");
+    let vocab_size = embed_data.len() / hidden;
+    let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
+
+    // Test with multiple layers to see if some layers are worse
+    let prefill_ids: Vec<u32> = vec![1, 3923, 374, 220, 17, 10, 17, 30];
+    let m = prefill_ids.len();
+
+    // Embed tokens once
+    let ids_gpu = unsafe { upload_u32(&mut device.caching, &prefill_ids, &[m]) };
+    let embedded = unsafe {
+        vllm_cuda::kernels::embedding_gather(*embed_w, *ids_gpu, &mut device.caching, stream)
+    };
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    let embed_host = unsafe { download_bf16(*embedded, m * hidden) };
+    drop(ids_gpu);
+    drop(embedded);
+
+    println!("  Embedded {m} tokens. Testing each layer individually...");
+    println!("  layer | qkv_diff  | res_diff  | notes");
+    println!("  ------|-----------|-----------|------");
+
+    for layer_idx in 0..config.num_hidden_layers {
+        let norm_data = load_bf16_tensor(
+            &st,
+            &format!("model.layers.{layer_idx}.input_layernorm.weight"),
+        );
+        let norm_w = unsafe { upload_bf16(&mut device.caching, &norm_data, &[hidden]) };
+
+        let mut qkv_data = load_bf16_tensor(
+            &st,
+            &format!("model.layers.{layer_idx}.self_attn.q_proj.weight"),
+        );
+        qkv_data.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{layer_idx}.self_attn.k_proj.weight"),
+        ));
+        qkv_data.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{layer_idx}.self_attn.v_proj.weight"),
+        ));
+        let qkv_n = qkv_data.len() / hidden;
+        let qkv_w = unsafe { upload_bf16(&mut device.caching, &qkv_data, &[qkv_n, hidden]) };
+
+        // Input: use embeddings as hs, zeros as residual (simulates layer 0)
+        let hs_a = unsafe { upload_bf16(&mut device.caching, &embed_host, &[m, hidden]) };
+        let hs_b = unsafe { upload_bf16(&mut device.caching, &embed_host, &[m, hidden]) };
+        let res_a = unsafe {
+            upload_bf16(
+                &mut device.caching,
+                &vec![bf16::ZERO; m * hidden],
+                &[m, hidden],
+            )
+        };
+        let res_b = unsafe {
+            upload_bf16(
+                &mut device.caching,
+                &vec![bf16::ZERO; m * hidden],
+                &[m, hidden],
+            )
+        };
+
+        unsafe { cusys::cuStreamSynchronize(stream) };
+
+        // Standard: fused_add_rms_norm_inplace + ferrite.gemm
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(*hs_a, *res_a, *norm_w, eps, stream);
+        }
+        let qkv_a = unsafe {
+            device
+                .ferrite
+                .gemm(*hs_a, *qkv_w, None, 1.0, 0.0, &mut device.caching, stream)
+        };
+
+        // Fused: add_inplace + launch_fused_norm_gemm
+        unsafe {
+            vllm_cuda::kernels::add_inplace(*res_b, *hs_b, stream);
+        }
+        let qkv_b = unsafe {
+            vllm_cuda::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                *res_b,
+                *qkv_w,
+                *norm_w,
+                eps,
+                hidden as u32,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+
+        unsafe { cusys::cuStreamSynchronize(stream) };
+        let a_h = unsafe { download_bf16(*qkv_a, m * qkv_n) };
+        let b_h = unsafe { download_bf16(*qkv_b, m * qkv_n) };
+        let ra_h = unsafe { download_bf16(*res_a, m * hidden) };
+        let rb_h = unsafe { download_bf16(*res_b, m * hidden) };
+
+        let (qkv_diff, _) = max_diff_bf16(&a_h, &b_h);
+        let (res_diff, _) = max_diff_bf16(&ra_h, &rb_h);
+
+        let notes = if qkv_diff > 0.1 { "HIGH" } else { "" };
+        println!(
+            "  {:5} | {:9.2e} | {:9.2e} | {notes}",
+            layer_idx, qkv_diff, res_diff
+        );
+    }
+    println!("DONE: test14c");
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// test14d: Isolate bf16 precision loss from fused GEMM
+//
+// 24-layer prefill with real embeddings, argmax comparison.
+// Path A: fused_add_rms_norm_inplace + ferrite.gemm (standard — correct)
+// Path B: add_inplace + rms_norm (separate) + ferrite.gemm (same GEMM, different norm path)
+//
+// NO fused norm+GEMM kernel at all. If this fails, the problem is purely
+// the bf16 truncation at the add→norm boundary. If it passes, the fused
+// GEMM kernel has a bug that only appears in multi-layer accumulation.
+// ════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test14d_precision_only_no_fused_kernel() {
+    println!("=== test14d: bf16 precision isolation — no fused kernel ===");
+
+    let mut device = GpuDevice::new(0).unwrap();
+    let stream = device.compute_stream;
+    let config = qwen_config();
+    let hidden = config.hidden_size;
+    let eps = config.rms_norm_eps;
+    let num_layers = config.num_hidden_layers;
+
+    let raw = std::fs::read(MODEL_PATH).expect("read model");
+    let st = SafeTensors::deserialize(&raw).expect("parse");
+
+    let embed_data = load_bf16_tensor(&st, "model.embed_tokens.weight");
+    let vocab_size = embed_data.len() / hidden;
+    let embed_w = unsafe { upload_bf16(&mut device.caching, &embed_data, &[vocab_size, hidden]) };
+
+    let final_norm_data = load_bf16_tensor(&st, "model.norm.weight");
+    let final_norm_w = unsafe { upload_bf16(&mut device.caching, &final_norm_data, &[hidden]) };
+
+    struct LW {
+        norm1: OwnedTensor,
+        qkv: OwnedTensor,
+        norm2: OwnedTensor,
+        gate_up: OwnedTensor,
+        down: OwnedTensor,
+    }
+    let mut lw: Vec<LW> = Vec::new();
+    for i in 0..num_layers {
+        let n1 = load_bf16_tensor(&st, &format!("model.layers.{i}.input_layernorm.weight"));
+        let mut qkv = load_bf16_tensor(&st, &format!("model.layers.{i}.self_attn.q_proj.weight"));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.k_proj.weight"),
+        ));
+        qkv.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.self_attn.v_proj.weight"),
+        ));
+        let qkv_n = qkv.len() / hidden;
+        let n2 = load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.post_attention_layernorm.weight"),
+        );
+        let mut gu = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.gate_proj.weight"));
+        gu.extend_from_slice(&load_bf16_tensor(
+            &st,
+            &format!("model.layers.{i}.mlp.up_proj.weight"),
+        ));
+        let gu_n = gu.len() / hidden;
+        let dw = load_bf16_tensor(&st, &format!("model.layers.{i}.mlp.down_proj.weight"));
+        let down_k = dw.len() / hidden;
+        lw.push(LW {
+            norm1: unsafe { upload_bf16(&mut device.caching, &n1, &[hidden]) },
+            qkv: unsafe { upload_bf16(&mut device.caching, &qkv, &[qkv_n, hidden]) },
+            norm2: unsafe { upload_bf16(&mut device.caching, &n2, &[hidden]) },
+            gate_up: unsafe { upload_bf16(&mut device.caching, &gu, &[gu_n, hidden]) },
+            down: unsafe { upload_bf16(&mut device.caching, &dw, &[hidden, down_k]) },
+        });
+    }
+
+    let mut gw = GpuWeights::from_single_file(MODEL_PATH, stream).unwrap();
+    let mut layers: Vec<LlamaDecoderLayer> = Vec::new();
+    for i in 0..num_layers {
+        layers.push(
+            LlamaDecoderLayer::load(&mut gw, &format!("model.layers.{i}"), &config, i, stream)
+                .unwrap(),
+        );
+    }
+    drop(raw);
+
+    let kv_a = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
+    let kv_b = unsafe { KvCachePool::new(24, 32, 16, 2, 64, DType::BF16).unwrap() };
+    let rotary =
+        unsafe { RotaryCache::new(64, 32768, 1000000.0, None, DType::BF16, &device).unwrap() };
+
+    let prefill_ids: Vec<u32> = vec![1, 3923, 374, 220, 17, 10, 17, 30];
+    let m = prefill_ids.len();
+
+    let ids_gpu = unsafe { upload_u32(&mut device.caching, &prefill_ids, &[m]) };
+    let mut hs_a = unsafe {
+        vllm_cuda::kernels::embedding_gather(*embed_w, *ids_gpu, &mut device.caching, stream)
+    };
+    unsafe { cusys::cuStreamSynchronize(stream) };
+    let hs_data = unsafe { download_bf16(*hs_a, m * hidden) };
+    let mut hs_b = unsafe { upload_bf16(&mut device.caching, &hs_data, &[m, hidden]) };
+    drop(ids_gpu);
+
+    let mut res_a = unsafe {
+        upload_bf16(
+            &mut device.caching,
+            &vec![bf16::ZERO; m * hidden],
+            &[m, hidden],
+        )
+    };
+    let mut res_b = unsafe {
+        upload_bf16(
+            &mut device.caching,
+            &vec![bf16::ZERO; m * hidden],
+            &[m, hidden],
+        )
+    };
+
+    let pos_data: Vec<u32> = (0..m as u32).collect();
+    let slot_data: Vec<i64> = (0..m as i64).collect();
+    let cu_data: Vec<i32> = vec![0, m as i32];
+    let seq_data: Vec<i32> = vec![m as i32];
+    let bt_data: Vec<i32> = vec![0];
+    let pos = unsafe { upload_u32(&mut device.caching, &pos_data, &[m]) };
+    let slot = unsafe { upload_i64(&mut device.caching, &slot_data, &[m]) };
+    let cu = unsafe { upload_i32(&mut device.caching, &cu_data, &[2]) };
+    let seq = unsafe { upload_i32(&mut device.caching, &seq_data, &[1]) };
+    let bt = unsafe { upload_i32(&mut device.caching, &bt_data, &[1, 1]) };
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    // ── 24-layer prefill ──
+    for i in 0..num_layers {
+        // Path A: fused_add_rms_norm_inplace + ferrite.gemm
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                *hs_a,
+                *res_a,
+                *lw[i].norm1,
+                eps,
+                stream,
+            );
+        }
+        let qkv_a = unsafe {
+            device.ferrite.gemm(
+                *hs_a,
+                *lw[i].qkv,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(hs_a);
+        let attn_a = unsafe {
+            layers[i].self_attn.forward_from_qkv(
+                qkv_a,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                m,
+                m,
+                &kv_a,
+                &rotary,
+                &mut device,
+            )
+        };
+        unsafe {
+            vllm_cuda::kernels::fused_add_rms_norm_inplace(
+                *attn_a,
+                *res_a,
+                *lw[i].norm2,
+                eps,
+                stream,
+            );
+        }
+        let gu_a = unsafe {
+            device.ferrite.gemm(
+                *attn_a,
+                *lw[i].gate_up,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(attn_a);
+        let act_a = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu_a,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(gu_a);
+        hs_a = unsafe {
+            device.ferrite.gemm(
+                *act_a,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(act_a);
+
+        // Path B: add_inplace + rms_norm (separate) + ferrite.gemm
+        // NO fused norm+GEMM kernel — same GEMM as path A
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *hs_b, stream) };
+        drop(hs_b);
+        let normed_b = unsafe {
+            vllm_cuda::kernels::rms_norm(*res_b, *lw[i].norm1, eps, &mut device.caching, stream)
+        };
+        let qkv_b = unsafe {
+            device.ferrite.gemm(
+                *normed_b,
+                *lw[i].qkv,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(normed_b);
+        let attn_b = unsafe {
+            layers[i].self_attn.forward_from_qkv(
+                qkv_b,
+                pos.view(),
+                slot.view(),
+                cu.view(),
+                seq.view(),
+                bt.view(),
+                m,
+                m,
+                &kv_b,
+                &rotary,
+                &mut device,
+            )
+        };
+        unsafe { vllm_cuda::kernels::add_inplace(*res_b, *attn_b, stream) };
+        drop(attn_b);
+        let normed_b2 = unsafe {
+            vllm_cuda::kernels::rms_norm(*res_b, *lw[i].norm2, eps, &mut device.caching, stream)
+        };
+        let gu_b = unsafe {
+            device.ferrite.gemm(
+                *normed_b2,
+                *lw[i].gate_up,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(normed_b2);
+        let act_b = unsafe {
+            vllm_cuda::kernels::silu_and_mul_fused(
+                *gu_b,
+                config.intermediate_size,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(gu_b);
+        hs_b = unsafe {
+            device.ferrite.gemm(
+                *act_b,
+                *lw[i].down,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                stream,
+            )
+        };
+        drop(act_b);
+    }
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    // ── Final norm + lm_head + argmax ──
+    let normed_a = unsafe {
+        vllm_cuda::kernels::rms_norm(*hs_a, *final_norm_w, eps, &mut device.caching, stream)
+    };
+    let normed_b = unsafe {
+        vllm_cuda::kernels::rms_norm(*hs_b, *final_norm_w, eps, &mut device.caching, stream)
+    };
+    let logits_a = unsafe {
+        device.ferrite.gemm(
+            *normed_a,
+            *embed_w,
+            None,
+            1.0,
+            0.0,
+            &mut device.caching,
+            stream,
+        )
+    };
+    let logits_b = unsafe {
+        device.ferrite.gemm(
+            *normed_b,
+            *embed_w,
+            None,
+            1.0,
+            0.0,
+            &mut device.caching,
+            stream,
+        )
+    };
+
+    unsafe { cusys::cuStreamSynchronize(stream) };
+
+    let la = unsafe { download_bf16(*logits_a, m * vocab_size) };
+    let lb = unsafe { download_bf16(*logits_b, m * vocab_size) };
+    let ha = unsafe { download_bf16(*hs_a, m * hidden) };
+    let hb = unsafe { download_bf16(*hs_b, m * hidden) };
+
+    let mut all_match = true;
+    for tok in 0..m {
+        let row_a = &la[tok * vocab_size..(tok + 1) * vocab_size];
+        let row_b = &lb[tok * vocab_size..(tok + 1) * vocab_size];
+
+        let (tok_a, _) = row_a
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.to_f32().partial_cmp(&b.to_f32()).unwrap())
+            .unwrap();
+        let (tok_b, _) = row_b
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.to_f32().partial_cmp(&b.to_f32()).unwrap())
+            .unwrap();
+
+        let (hs_diff, _) = max_diff_bf16(
+            &ha[tok * hidden..(tok + 1) * hidden],
+            &hb[tok * hidden..(tok + 1) * hidden],
+        );
+
+        let match_str = if tok_a == tok_b {
+            "MATCH"
+        } else {
+            all_match = false;
+            "MISMATCH ←←←"
+        };
+        println!(
+            "  token {tok}: std={tok_a:6} fused={tok_b:6} {match_str}  hidden_diff={hs_diff:.2e}"
+        );
+    }
+
+    if all_match {
+        println!("PASS: test14d — precision-only path matches (no fused kernel)");
+        println!("  → bf16 precision loss alone does NOT flip tokens");
+        println!("  → The fused GEMM kernel has a multi-layer accumulation bug");
+    } else {
+        println!("FAIL: test14d — even without fused kernel, bf16 precision flips tokens!");
+        println!("  → The problem IS the bf16 truncation at add→norm, not the fused kernel");
+        panic!("bf16 precision loss alone flips tokens");
+    }
 }

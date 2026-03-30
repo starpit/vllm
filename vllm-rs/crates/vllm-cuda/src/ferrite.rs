@@ -42,7 +42,7 @@ ptx_fusion::replace_perimeter_macro!(
 
 // ── MLP block: gate_up GEMM → SiLU+mul → down GEMM in one kernel ──
 
-const MLP_BLOCK_PTX: &str = ptx_fusion::sequence_mlp_block!(
+const MLP_BLOCK_PTX: &str = ptx_fusion::persistent_mlp_block!(
     "../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx",
     "../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
     "../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx",
@@ -259,15 +259,10 @@ impl FerriteCutlass {
         );
     }
 
-    /// Launch fused MLP block: gate_up GEMM → SiLU+mul → down GEMM.
+    /// Launch persistent fused MLP block: gate_up GEMM → SiLU+mul → down GEMM.
     ///
-    /// Replaces 3 separate launches (gate_up GEMM + silu_mul + down GEMM)
-    /// with a single kernel that uses global atomic barriers between phases.
-    ///
-    /// * `normed_input` — [M, hidden] normalized input (from rms_norm)
-    /// * `gate_up_weight` — [2*intermediate, hidden] gate+up projection weights
-    /// * `down_weight` — [hidden, intermediate] down projection weights
-    /// * `intermediate_size` — intermediate dimension (half of gate_up_weight.dim(0))
+    /// Uses a persistent work-queue loop with per-M-tile barriers.
+    /// Replaces 3 separate launches with a single kernel launch.
     pub unsafe fn launch_mlp_block(
         &self,
         normed_input: GpuTensor,
@@ -286,26 +281,51 @@ impl FerriteCutlass {
         let hidden = normed_input.dim(1) as u32;
         let gate_up_cols = 2 * intermediate_size;
 
-        // Allocate intermediate buffers
         let gate_up_buf =
             alloc.alloc_tensor(&[m as usize, gate_up_cols as usize], normed_input.dtype());
         let output = alloc.alloc_tensor(&[m as usize, hidden as usize], normed_input.dtype());
 
-        // Zero barrier counters (1 barrier between 2 phases)
-        sys::cuMemsetD32_v2(self.barrier_counters as u64, 0, 4);
-
-        // Grid: sized for the larger GEMM (gate_up has more N-tiles)
+        // Compute grid dims for each phase
         let tile_m = 64u32;
         let tile_n = 128u32;
-        let grid_m = m.div_ceil(tile_m);
-        let grid_n = gate_up_cols.div_ceil(tile_n);
-        let swizzle_log = compute_swizzle_log(grid_n);
-        let tile = 1u32 << swizzle_log;
-        let grid_x = grid_m * tile;
-        let grid_y = grid_n.div_ceil(tile);
 
-        // Phase 0 params: gate_up GEMM
-        // normed_input[M, hidden] × gate_up_weight[gate_up_cols, hidden]^T → gate_up_buf[M, gate_up_cols]
+        let grid_m = m.div_ceil(tile_m);
+
+        let grid_n_0 = gate_up_cols.div_ceil(tile_n);
+        let sw0 = compute_swizzle_log(grid_n_0);
+        let tile_0 = 1u32 << sw0;
+        let gx0 = grid_m * tile_0;
+        let gy0 = grid_n_0.div_ceil(tile_0);
+        let phase0_tiles = gx0 * gy0;
+
+        let grid_n_1 = hidden.div_ceil(tile_n);
+        let sw1 = compute_swizzle_log(grid_n_1);
+        let tile_1 = 1u32 << sw1;
+        let gx1 = grid_m * tile_1;
+        let gy1 = grid_n_1.div_ceil(tile_1);
+        let phase1_tiles = gx1 * gy1;
+
+        let total_tiles = phase0_tiles + phase1_tiles;
+        let num_sms = 58u32; // L4
+        let num_blocks = total_tiles.min(num_sms);
+
+        // N-tiles per M-tile for phase 0 barrier
+        let ntiles_per_m_0 = tile_0 * gy0;
+
+        // Zero persistent counter + M-tile done counters
+        // barrier_counters layout: [0] = tile counter, [1..] = mtile_done array
+        let max_mtiles = grid_m;
+        let counter_bytes = 4 + max_mtiles * 4; // u32 counter + u32 per m-tile
+        sys::cuMemsetD32_v2(
+            self.barrier_counters as u64,
+            0,
+            (counter_bytes / 4) as usize,
+        );
+
+        let counter_ptr = self.barrier_counters as u64;
+        let mtile_done_ptr = counter_ptr + 4; // right after the tile counter
+
+        // Phase 0 params
         let params_gate_up = build_flat_params(
             normed_input.raw_ptr() as u64,
             gate_up_weight.raw_ptr() as u64,
@@ -322,9 +342,8 @@ impl FerriteCutlass {
             0.0,
         );
 
-        // Phase 1 params: SiLU-fused down GEMM
-        // gate_up_buf[M, gate_up_cols] → silu+mul → × down_weight[hidden, intermediate]^T → output[M, hidden]
-        let intermediate_bytes = (intermediate_size as u64) * 2; // bf16
+        // Phase 1 params
+        let intermediate_bytes = (intermediate_size as u64) * 2;
         let params_down = build_flat_params(
             gate_up_buf.as_gpu_tensor().raw_ptr() as u64,
             down_weight.raw_ptr() as u64,
@@ -333,7 +352,7 @@ impl FerriteCutlass {
             m,
             hidden,
             intermediate_size,
-            gate_up_cols, // lda = 2*intermediate (stride covers gate + up)
+            gate_up_cols,
             intermediate_size,
             hidden,
             hidden,
@@ -341,26 +360,38 @@ impl FerriteCutlass {
             0.0,
         );
 
-        // Launch with kernelParams API
-        let mut barrier_ptr = self.barrier_counters as u64;
-        let mut inter_bytes = intermediate_bytes;
+        // Persistent params + phase params
+        let mut p_counter = counter_ptr;
+        let mut p_total = total_tiles;
+        let mut p_gx0 = gx0;
+        let mut p_phase0_tiles = phase0_tiles;
+        let mut p_gx1 = gx1;
+        let mut p_ntpm0 = ntiles_per_m_0;
+        let mut p_mtile_done = mtile_done_ptr;
+        let mut p_inter_bytes = intermediate_bytes;
 
-        let mut kernel_params: [*mut std::ffi::c_void; 4] = [
-            &mut barrier_ptr as *mut u64 as *mut _,
+        let mut kernel_params: [*mut std::ffi::c_void; 10] = [
+            &mut p_counter as *mut u64 as *mut _,
+            &mut p_total as *mut u32 as *mut _,
+            &mut p_gx0 as *mut u32 as *mut _,
+            &mut p_phase0_tiles as *mut u32 as *mut _,
+            &mut p_gx1 as *mut u32 as *mut _,
+            &mut p_ntpm0 as *mut u32 as *mut _,
+            &mut p_mtile_done as *mut u64 as *mut _,
             params_gate_up.as_ptr() as *mut _,
-            &mut inter_bytes as *mut u64 as *mut _,
+            &mut p_inter_bytes as *mut u64 as *mut _,
             params_down.as_ptr() as *mut _,
         ];
 
         let result = sys::cuLaunchKernel(
             func,
-            grid_x,
-            grid_y,
+            num_blocks,
+            1,
             1,
             128,
             1,
             1,
-            36864 + 512, // SMEM
+            36864 + 512,
             stream,
             kernel_params.as_mut_ptr(),
             std::ptr::null_mut(),

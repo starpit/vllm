@@ -2595,3 +2595,207 @@ fn sequenced_two_gemm_gpu() {
     );
     println!("PASS: sequenced two-GEMM matches separate launches");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// MLP block: gate_up GEMM → SiLU+mul → down GEMM in one kernel
+// This is the core of Segment B — the first multi-op CUTLASS bf16 fusion.
+// ══════════════════════════════════════════════════════════════════════
+
+const MLP_BLOCK_PTX: &str = ptx_fusion_macros::sequence_mlp_block!(
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "kernels/cutlass_bf16_64x128x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
+    "kernels/vllm_silu_mul.ptx",
+    "mlp_fused"
+);
+
+#[test]
+fn mlp_block_gpu() {
+    println!("=== MLP block (gate_up → SiLU → down): GPU correctness ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+
+    let m = 64u32;
+    let hidden = 128u32; // input hidden dim
+    let intermediate = 128u32; // intermediate size
+    let gate_up_cols = 2 * intermediate; // gate_up output has gate + up halves
+
+    // Test data: input[M, hidden], gate_up_weight[gate_up_cols, hidden], down_weight[hidden, intermediate]
+    let h_input: Vec<half::bf16> = (0..(m * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_gate_up_w: Vec<half::bf16> = (0..(gate_up_cols * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+    let h_down_w: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.15))
+        .collect();
+
+    // Reference: 3 separate launches
+    // 1. gate_up GEMM: input[M,hidden] × gate_up_w[gate_up_cols,hidden]^T → gate_up_out[M,gate_up_cols]
+    let gate_up_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_input,
+        &h_gate_up_w,
+        m,
+        gate_up_cols,
+        hidden,
+    );
+
+    // 2. CPU SiLU+mul: activated[i,j] = silu(gate_up_out[i,j]) * gate_up_out[i, j+intermediate]
+    let h_activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
+        .map(|idx| {
+            let row = idx / intermediate as usize;
+            let col = idx % intermediate as usize;
+            let gate = gate_up_out[row * gate_up_cols as usize + col].to_f32();
+            let up =
+                gate_up_out[row * gate_up_cols as usize + intermediate as usize + col].to_f32();
+            half::bf16::from_f32(cpu_silu(gate) * up)
+        })
+        .collect();
+
+    // 3. down GEMM: activated[M,intermediate] × down_w[hidden,intermediate]^T → output[M,hidden]
+    let ref_output = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_activated,
+        &h_down_w,
+        m,
+        hidden,
+        intermediate,
+    );
+
+    // ptxas pre-check
+    let mlp_path = "/tmp/mlp_block_fused.ptx";
+    std::fs::write(mlp_path, MLP_BLOCK_PTX).unwrap();
+    let ptxas_out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", mlp_path])
+        .output()
+        .expect("ptxas");
+    if !ptxas_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ptxas_out.stderr);
+        eprintln!("ptxas errors:");
+        for line in stderr.lines().take(20) {
+            eprintln!("  {line}");
+        }
+        let ptx_lines: Vec<&str> = MLP_BLOCK_PTX.lines().collect();
+        for line in stderr.lines() {
+            if let Some(lnum) = line
+                .split('(')
+                .nth(1)
+                .and_then(|s| s.split(')').next())
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                let start = lnum.saturating_sub(2);
+                let end = (lnum + 2).min(ptx_lines.len());
+                for i in start..end {
+                    let marker = if i + 1 == lnum { ">>>" } else { "   " };
+                    eprintln!("{marker} {:4}: {}", i + 1, ptx_lines[i]);
+                }
+                eprintln!();
+            }
+        }
+        panic!("ptxas FAILED on MLP block PTX");
+    }
+    println!("  ptxas: PASS ({} lines)", MLP_BLOCK_PTX.lines().count());
+
+    // Fused: single kernel launch
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_gate_up_w = stream.clone_htod(&h_gate_up_w).unwrap();
+    let d_down_w = stream.clone_htod(&h_down_w).unwrap();
+    let d_gate_up_out: CudaSlice<half::bf16> =
+        stream.alloc_zeros((m * gate_up_cols) as usize).unwrap();
+    let d_c_down: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    let d_output: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+
+    let module = ctx.load_module(Ptx::from_src(MLP_BLOCK_PTX)).unwrap();
+    let func = module.load_function("mlp_fused").unwrap();
+
+    let (inp_ptr, _) = d_input.device_ptr(&stream);
+    let (guw_ptr, _) = d_gate_up_w.device_ptr(&stream);
+    let (guo_ptr, _) = d_gate_up_out.device_ptr(&stream);
+    let (dw_ptr, _) = d_down_w.device_ptr(&stream);
+    let (cd_ptr, _) = d_c_down.device_ptr(&stream);
+    let (out_ptr, _) = d_output.device_ptr(&stream);
+
+    // gate_up GEMM params: input[M,hidden] × gate_up_w[gate_up_cols,hidden]^T → gate_up_out[M,gate_up_cols]
+    let params_gate_up = build_flat_params(
+        inp_ptr as u64,
+        guw_ptr as u64,
+        guo_ptr as u64,
+        guo_ptr as u64,
+        m,
+        gate_up_cols,
+        hidden,
+        hidden,
+        hidden,
+        gate_up_cols,
+        gate_up_cols,
+        1.0,
+        0.0,
+    );
+
+    // down GEMM params (SiLU-fused): reads gate_up_out with lda=2*intermediate
+    let params_down = build_flat_params(
+        guo_ptr as u64, // A_ptr = gate_up_out (SiLU reads gate half, per-site loads up half)
+        dw_ptr as u64,
+        cd_ptr as u64,
+        out_ptr as u64,
+        m,
+        hidden,
+        intermediate,
+        gate_up_cols, // lda = 2*intermediate (stride covers both gate + up)
+        intermediate,
+        hidden,
+        hidden,
+        1.0,
+        0.0,
+    );
+
+    // Extra param for down GEMM: intermediate_bytes
+    let intermediate_bytes = (intermediate as u64) * 2; // bf16
+
+    let (gx, gy, _gz) = compute_grid(m, gate_up_cols, 64, 128);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 36864,
+    };
+
+    // Param order: ferrite_params (gate_up), _ferrite_intermediate_bytes_2 (down extra), ferrite_params_2 (down)
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&params_gate_up)
+            .arg(&intermediate_bytes)
+            .arg(&params_down)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let fused_output = stream.clone_dtoh(&d_output).unwrap();
+
+    // Compare
+    let mut max_diff = 0.0f32;
+    for (i, (r, f)) in ref_output.iter().zip(fused_output.iter()).enumerate() {
+        let diff = (r.to_f32() - f.to_f32()).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+        if diff > 0.5 && i < 10 {
+            println!(
+                "  MISMATCH [{i}]: ref={:.4}, fused={:.4}, diff={diff:.2e}",
+                r.to_f32(),
+                f.to_f32()
+            );
+        }
+    }
+    println!("  M={m}, hidden={hidden}, intermediate={intermediate}: max_diff={max_diff:.2e}");
+    assert!(max_diff < 0.1, "MLP block diff too large: {max_diff:.2e}");
+    println!("PASS: MLP block matches separate launches");
+}

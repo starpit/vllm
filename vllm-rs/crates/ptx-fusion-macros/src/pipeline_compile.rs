@@ -86,13 +86,58 @@ pub fn sequence_two_gemms(
     let body_a = extract_body(gemm_a_ptx);
     let body_b = extract_body(gemm_b_ptx);
 
-    // Rename GEMM_B: offset registers, rename labels, rename param block
+    // Extract param declarations from both GEMMs' entries
+    let extract_params = |ptx: &str| -> Vec<String> {
+        let mut params = Vec::new();
+        let mut in_entry = false;
+        for line in ptx.lines() {
+            let t = line.trim();
+            if t.contains(".entry") {
+                in_entry = true;
+                continue;
+            }
+            if !in_entry {
+                continue;
+            }
+            if t.starts_with(".param") {
+                params.push(t.trim_end_matches(',').to_string());
+            }
+            if t == ")" || t == "{" || t.ends_with('{') {
+                break;
+            }
+        }
+        params
+    };
+
+    let params_a = extract_params(gemm_a_ptx);
+    let params_b = extract_params(gemm_b_ptx);
+
+    // Rename GEMM_B: offset registers, rename labels, rename params
+    // Collect GEMM_B's extra param names (non-ferrite_params) for renaming in the body
+    let b_extra_param_names: Vec<String> = params_b
+        .iter()
+        .filter_map(|p| {
+            if p.contains("ferrite_params") {
+                return None;
+            }
+            p.split_whitespace()
+                .last()
+                .map(|s| s.trim_end_matches(',').to_string())
+        })
+        .collect();
+
     let body_b_renamed: Vec<String> = body_b
         .iter()
         .map(|line| {
             let mut renamed = offset_all_registers(line, &offsets);
             renamed = renamed.replace("$L__BB0", "$L__BB1");
             renamed = renamed.replace("ferrite_params", "ferrite_params_2");
+            // Rename extra params (e.g., _ferrite_intermediate_bytes → _2)
+            for param_name in &b_extra_param_names {
+                if renamed.contains(param_name.as_str()) {
+                    renamed = renamed.replace(param_name.as_str(), &format!("{param_name}_2"));
+                }
+            }
             renamed
         })
         .collect();
@@ -118,9 +163,31 @@ pub fn sequence_two_gemms(
     }
     out.push('\n');
 
+    // Rename GEMM_B's params to avoid collisions
+    let params_b_renamed: Vec<String> = params_b
+        .iter()
+        .map(|p| {
+            if p.contains("ferrite_params") {
+                p.replace("ferrite_params", "ferrite_params_2")
+            } else {
+                // Rename other params by adding _2 suffix before the last bracket/comma
+                let mut r = p.clone();
+                // For ".param .u64 _ferrite_intermediate_bytes" → "_ferrite_intermediate_bytes_2"
+                if let Some(last_word) = r.split_whitespace().last() {
+                    let clean = last_word.trim_end_matches(',');
+                    r = r.replace(clean, &format!("{clean}_2"));
+                }
+                r
+            }
+        })
+        .collect();
+
     out.push_str(&format!(".visible .entry {name}(\n"));
-    out.push_str("\t.param .align 8 .b8 ferrite_params[88],\n");
-    out.push_str("\t.param .align 8 .b8 ferrite_params_2[88]\n");
+    let all_params: Vec<&String> = params_a.iter().chain(params_b_renamed.iter()).collect();
+    for (i, p) in all_params.iter().enumerate() {
+        let comma = if i + 1 < all_params.len() { "," } else { "" };
+        out.push_str(&format!("\t{p}{comma}\n"));
+    }
     out.push_str(")\n{\n");
 
     // Register declarations: merge numeric ranges + copy named registers
@@ -130,10 +197,23 @@ pub fn sequence_two_gemms(
         }
     }
 
-    // Copy extra register declarations from both GEMMs' bodies.
-    // Perimeter replacement adds %r_ptmp, %p_ptmp, %rd_ptmp declarations
-    // inside the kernel body. These must be included in the sequenced kernel.
+    // Copy ALL non-numeric-range .reg declarations from both GEMMs' bodies.
+    // This includes perimeter replacement's %r_ptmp<N>, CUTLASS inline asm's
+    // bare `.reg .pred p;`, and fusion-injected registers (%r_up0, %h_up_a, etc).
+    // We skip declarations that match the standard "%PREFIX<N>" pattern since
+    // those are already handled by the merged numeric ranges above.
     let mut seen_decls = std::collections::HashSet::new();
+    let is_standard_numeric_range = |t: &str| -> bool {
+        // Matches patterns like `.reg .b32 %r<1226>;` — standard ranges
+        // that are already merged by compute_merged_reg_decls
+        let prefixes = ["%r<", "%rd<", "%f<", "%p<", "%rs<", "%fd<"];
+        t.contains('<')
+            && prefixes.iter().any(|p| t.contains(p))
+            && !t.contains("_ptmp")
+            && !t.contains("_up")
+            && !t.contains("_act")
+            && !t.contains("_rms")
+    };
     for ptx in [gemm_a_ptx, gemm_b_ptx] {
         let lines: Vec<&str> = ptx.lines().collect();
         let mut in_body = false;
@@ -146,10 +226,7 @@ pub fn sequence_two_gemms(
             if !in_body {
                 continue;
             }
-            // Include .reg declarations that are NOT numeric ranges (%r<N>).
-            // This catches perimeter replacement's %r_ptmp<N> and CUTLASS
-            // inline asm's bare `.reg .pred p;`
-            if t.starts_with(".reg ") && (t.contains("_ptmp") || !t.contains('%')) {
+            if t.starts_with(".reg ") && !is_standard_numeric_range(t) {
                 if seen_decls.insert(t.to_string()) {
                     out.push_str(&format!("\t{t}\n"));
                 }

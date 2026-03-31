@@ -2750,13 +2750,14 @@ pub fn register_transfer_mlp(input: proc_macro::TokenStream) -> proc_macro::Toke
     let name = &strings[5];
 
     // Step 1: Perimeter-replace both GEMMs
-    let (prod_flat, _) = match perimeter::replace_perimeter(&gate_up_ptx, &gate_up_deriv, "producer") {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = format!("producer perimeter: {e}");
-            return quote! { compile_error!(#msg) }.into();
-        }
-    };
+    let (prod_flat, _) =
+        match perimeter::replace_perimeter(&gate_up_ptx, &gate_up_deriv, "producer") {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("producer perimeter: {e}");
+                return quote! { compile_error!(#msg) }.into();
+            }
+        };
     let (cons_flat, _) = match perimeter::replace_perimeter(&down_ptx, &down_deriv, "consumer") {
         Ok(r) => r,
         Err(e) => {

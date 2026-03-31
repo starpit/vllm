@@ -3095,7 +3095,10 @@ mod tests {
             .iter()
             .find(|l| l.depth == 0 && l.backedge_line - l.header_line > 100)
             .expect("should find main K-loop");
-        eprintln!("\nMain K-loop: {} lines {}-{}", main_loop.header_label, main_loop.header_line, main_loop.backedge_line);
+        eprintln!(
+            "\nMain K-loop: {} lines {}-{}",
+            main_loop.header_label, main_loop.header_line, main_loop.backedge_line
+        );
 
         let carries = analyze_carries(&lines, main_loop);
         let mma_accums: Vec<&str> = carries

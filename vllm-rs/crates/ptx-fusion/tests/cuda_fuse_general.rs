@@ -3725,8 +3725,14 @@ fn register_transfer_mlp_gpu() {
     for line in stderr.lines() {
         eprintln!("  {line}");
     }
-    assert!(ptxas_out.status.success(), "ptxas FAILED on register transfer MLP");
-    println!("  ptxas: PASS ({} lines)", REGTRANSFER_MLP_PTX.lines().count());
+    assert!(
+        ptxas_out.status.success(),
+        "ptxas FAILED on register transfer MLP"
+    );
+    println!(
+        "  ptxas: PASS ({} lines)",
+        REGTRANSFER_MLP_PTX.lines().count()
+    );
 
     let ctx = ctx();
     let stream = ctx.default_stream();
@@ -3742,9 +3748,9 @@ fn register_transfer_mlp_gpu() {
     // NOTE: intermediate must equal tile_n (64) for single driver iteration
     // until consumer K-loop splitting across driver iterations is implemented.
     let configs: &[(u32, u32, &[u32])] = &[
-        (64, 64, &[64]),               // minimal single-tile: PASS
-        (64, 64, &[128]),             // multi M-tile, single N-tile
-        (128, 64, &[64]),              // multi consumer N-tiles, 1 driver iter
+        (64, 64, &[64]),  // minimal single-tile: PASS
+        (64, 64, &[128]), // multi M-tile, single N-tile
+        (128, 64, &[64]), // multi consumer N-tiles, 1 driver iter
     ];
     let mut failures = Vec::new();
 
@@ -3818,27 +3824,27 @@ fn register_transfer_mlp_gpu() {
                 m,
                 gate_up_cols,
                 hidden,
-                hidden,         // lda
-                hidden,         // ldb (row-major weight)
-                gate_up_cols,   // ldc (unused)
-                gate_up_cols,   // ldd (unused)
+                hidden,       // lda
+                hidden,       // ldb (row-major weight)
+                gate_up_cols, // ldc (unused)
+                gate_up_cols, // ldd (unused)
                 1.0,
                 0.0,
             );
 
             // Consumer (down) params
             let params_down = build_flat_params(
-                0u64,           // A ptr = 0: gmem_src encodes row-major tile offset
+                0u64, // A ptr = 0: gmem_src encodes row-major tile offset
                 dw_p as u64,
                 out_p as u64,
                 out_p as u64,
                 m,
-                hidden,         // N
-                intermediate,   // K
-                tile_n as u32,  // lda = tile_n so gmem_src maps to scratch layout
-                intermediate,   // ldb
-                hidden,         // ldc
-                hidden,         // ldd
+                hidden,        // N
+                intermediate,  // K
+                tile_n as u32, // lda = tile_n so gmem_src maps to scratch layout
+                intermediate,  // ldb
+                hidden,        // ldc
+                hidden,        // ldd
                 1.0,
                 0.0,
             );
@@ -3884,29 +3890,41 @@ fn register_transfer_mlp_gpu() {
                 // Show first row and first element of each tile
                 eprintln!("  Row 0 (first 8 elements):");
                 for i in 0..8.min(ref_output.len()) {
-                    eprintln!("    [{i:3}] ref={:.4e} fused={:.4e}",
-                        ref_output[i].to_f32(), fused_output[i].to_f32());
+                    eprintln!(
+                        "    [{i:3}] ref={:.4e} fused={:.4e}",
+                        ref_output[i].to_f32(),
+                        fused_output[i].to_f32()
+                    );
                 }
                 // Show first element of each M-tile boundary
-                for mtile in 0..(m/tile_m) {
+                for mtile in 0..(m / tile_m) {
                     let idx = (mtile * tile_m * hidden) as usize;
                     if idx < ref_output.len() {
-                        eprintln!("  M-tile {mtile}, first elem [{idx}]: ref={:.4e} fused={:.4e}",
-                            ref_output[idx].to_f32(), fused_output[idx].to_f32());
+                        eprintln!(
+                            "  M-tile {mtile}, first elem [{idx}]: ref={:.4e} fused={:.4e}",
+                            ref_output[idx].to_f32(),
+                            fused_output[idx].to_f32()
+                        );
                     }
                 }
                 // Show first element of each N-tile boundary
-                for ntile in 0..(hidden/tile_n) {
+                for ntile in 0..(hidden / tile_n) {
                     let idx = (ntile * tile_n) as usize;
                     if idx < ref_output.len() {
-                        eprintln!("  N-tile {ntile}, first elem [{idx}]: ref={:.4e} fused={:.4e}",
-                            ref_output[idx].to_f32(), fused_output[idx].to_f32());
+                        eprintln!(
+                            "  N-tile {ntile}, first elem [{idx}]: ref={:.4e} fused={:.4e}",
+                            ref_output[idx].to_f32(),
+                            fused_output[idx].to_f32()
+                        );
                     }
                 }
                 let row = max_diff_idx / hidden as usize;
                 let col = max_diff_idx % hidden as usize;
-                eprintln!("  max_diff at idx={max_diff_idx} (row={row}, col={col}): ref={:.4e} fused={:.4e}",
-                    ref_output[max_diff_idx].to_f32(), fused_output[max_diff_idx].to_f32());
+                eprintln!(
+                    "  max_diff at idx={max_diff_idx} (row={row}, col={col}): ref={:.4e} fused={:.4e}",
+                    ref_output[max_diff_idx].to_f32(),
+                    fused_output[max_diff_idx].to_f32()
+                );
             }
             let status = if max_diff < 0.1 { "PASS" } else { "FAIL" };
             println!(
@@ -3923,6 +3941,872 @@ fn register_transfer_mlp_gpu() {
         failures
     );
     println!("PASS: register transfer MLP matches separate launches");
+}
+
+// ── Isolation test: base 64x64x32 GEMM for multi-block ──
+
+// 64x64x32 flat-param GEMM (same config as register transfer consumer)
+ptx_fusion::replace_perimeter_macro!(
+    "kernels/cutlass_bf16_64x64x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x64x32_sm89.derivations.json",
+    "flat_gemm_64x64",
+    FLAT_GEMM_64X64_PTX
+);
+
+/// Test that the base 64x64x32 flat-param GEMM works correctly for
+/// multiple blocks (different M-tiles and N-tiles). This isolates
+/// whether multi-block failure is in the base GEMM or in the fusion.
+#[test]
+fn base_gemm_64x64_multiblock() {
+    println!("=== Base 64x64x32 GEMM: multi-block correctness ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(FLAT_GEMM_64X64_PTX)).unwrap();
+    let func = module.load_function("flat_gemm_64x64").unwrap();
+
+    let tile_m = 64u32;
+    let tile_n = 64u32;
+
+    // Test configs: (M, N, K) — designed to exercise multiple blocks
+    let configs: &[(u32, u32, u32)] = &[
+        (64, 64, 64),   // 1x1 blocks (baseline)
+        (128, 64, 64),  // 2x1 blocks (multi M-tile)
+        (64, 128, 64),  // 1x2 blocks (multi N-tile)
+        (128, 128, 64), // 2x2 blocks (both)
+    ];
+    let mut failures = Vec::new();
+
+    for &(m, n, k) in configs {
+        let h_a: Vec<half::bf16> = (0..(m * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+            .collect();
+        let h_b: Vec<half::bf16> = (0..(k * n) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+            .collect();
+
+        // Reference: use the 64x128 GEMM (known good)
+        let ref_output = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &h_a,
+            &h_b,
+            m,
+            n,
+            k,
+        );
+
+        // Test: 64x64x32 GEMM
+        let d_a = stream.clone_htod(&h_a).unwrap();
+        let d_b = stream.clone_htod(&h_b).unwrap();
+        let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * n) as usize).unwrap();
+        let (a_ptr, _) = d_a.device_ptr(&stream);
+        let (b_ptr, _) = d_b.device_ptr(&stream);
+        let (c_ptr, _) = d_c.device_ptr(&stream);
+        let (d_ptr, _) = d_d.device_ptr(&stream);
+
+        let params = build_flat_params(
+            a_ptr as u64,
+            b_ptr as u64,
+            c_ptr as u64,
+            d_ptr as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            1.0,
+            0.0,
+        );
+
+        let (gx, gy, gz) = compute_grid(m, n, tile_m, tile_n);
+        let cfg = LaunchConfig {
+            grid_dim: (gx, gy, gz),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 24576,
+        };
+        unsafe { stream.launch_builder(&func).arg(&params).launch(cfg) }.unwrap();
+        stream.synchronize().unwrap();
+        let output = stream.clone_dtoh(&d_d).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for (r, f) in ref_output.iter().zip(output.iter()) {
+            let diff = (r.to_f32() - f.to_f32()).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+        }
+
+        let grid_m = m.div_ceil(tile_m);
+        let grid_n = n.div_ceil(tile_n);
+        let status = if max_diff < 0.1 { "PASS" } else { "FAIL" };
+        println!(
+            "  M={m:>4} N={n:>4} K={k:>4} grid=({grid_m}x{grid_n}) max_diff={max_diff:.2e} {status}"
+        );
+        if max_diff >= 0.1 {
+            failures.push((m, n, k, max_diff));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Base GEMM 64x64 multi-block failures: {:?}",
+        failures
+    );
+    println!("PASS: base 64x64x32 GEMM works for all multi-block configs");
+}
+
+/// Test the fused MLP kernel with only 1 block but different M values
+/// to check if the producer fills scratch correctly for each m_tile.
+/// If single-block passes for M=128 (m_tile=0 forced), the bug is in
+/// multi-block tile indexing, not in the fusion logic.
+#[test]
+fn register_transfer_mlp_single_block_sweep() {
+    println!("=== Register transfer MLP: single-block M sweep ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(REGTRANSFER_MLP_PTX)).unwrap();
+    let func = module.load_function("regtransfer_mlp").unwrap();
+
+    let tile_m = 64u32;
+    let tile_n = 64u32;
+
+    // All configs use hidden=64, intermediate=64 (single driver iteration)
+    // We test M values that require multiple M-tiles BUT only launch 1 block.
+    // This tells us: does the fusion produce correct results for the FIRST
+    // tile when the GMEM data is larger than 1 tile?
+    let hidden = 64u32;
+    let intermediate = 64u32;
+    let gate_up_cols = 2 * intermediate;
+
+    // Also test with 1 N-tile but larger hidden (forces multi-N consumer tiles)
+    // by launching grid=(1x1) and checking only the first tile's output.
+    let configs: &[(u32, u32, &str)] = &[
+        (64, 64, "1-tile baseline"),
+        (128, 64, "M=128, only m_tile=0"),
+        (64, 128, "hidden=128, only n_tile=0"),
+    ];
+    let mut failures = Vec::new();
+
+    for &(m, h, label) in configs {
+        let gu_cols = 2 * intermediate;
+        let h_input: Vec<half::bf16> = (0..(m * h) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+            .collect();
+        let h_gateup_w: Vec<half::bf16> = (0..(gu_cols * h) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+            .collect();
+        let h_down_w: Vec<half::bf16> = (0..(h * intermediate) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00013 + 0.1).cos() * 0.12))
+            .collect();
+
+        // Reference: separate launches for first tile only
+        // Use m_eff = min(m, tile_m) to limit to 1 tile of M
+        let m_eff = m.min(tile_m);
+        let h_eff = h.min(tile_n);
+        // For the reference, we use the first m_eff rows and first h_eff output columns
+        let gate_up_out = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &h_input[..(m_eff * h) as usize],
+            &h_gateup_w,
+            m_eff,
+            gu_cols,
+            h,
+        );
+        let activated: Vec<half::bf16> = (0..(m_eff * intermediate) as usize)
+            .map(|idx| {
+                let row = idx / intermediate as usize;
+                let col = idx % intermediate as usize;
+                let gate = gate_up_out[row * gu_cols as usize + col].to_f32();
+                let up = gate_up_out[row * gu_cols as usize + intermediate as usize + col].to_f32();
+                half::bf16::from_f32(cpu_silu(gate) * up)
+            })
+            .collect();
+        let ref_output = run_flat_gemm(
+            &ctx,
+            FLAT_GEMM_BASE_PTX,
+            "flat_gemm_base",
+            &activated,
+            &h_down_w[..(h_eff * intermediate) as usize],
+            m_eff,
+            h_eff,
+            intermediate,
+        );
+
+        // Fused kernel: 1 block only
+        let d_input = stream.clone_htod(&h_input).unwrap();
+        let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
+        let d_down_w = stream.clone_htod(&h_down_w).unwrap();
+        let sentinel = vec![half::bf16::from_f32(42.0); (m * h) as usize];
+        let d_output = stream.clone_htod(&sentinel).unwrap();
+
+        let (inp_p, _) = d_input.device_ptr(&stream);
+        let (guw_p, _) = d_gateup_w.device_ptr(&stream);
+        let (dw_p, _) = d_down_w.device_ptr(&stream);
+        let (out_p, _) = d_output.device_ptr(&stream);
+
+        let params_gate_up = build_flat_params(
+            inp_p as u64,
+            guw_p as u64,
+            0,
+            0,
+            m,
+            gu_cols,
+            h,
+            h,
+            h,
+            gu_cols,
+            gu_cols,
+            1.0,
+            0.0,
+        );
+        let params_down = build_flat_params(
+            0,
+            dw_p as u64,
+            out_p as u64,
+            out_p as u64,
+            m,
+            h,
+            intermediate,
+            tile_n as u32,
+            intermediate,
+            h,
+            h,
+            1.0,
+            0.0,
+        );
+
+        let num_producer_n_tiles = intermediate.div_ceil(tile_n);
+        let intermediate_n_offset = intermediate / tile_n;
+
+        // Force 1 block: grid=(1,1,1)
+        let smem_bytes = 40960u32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: smem_bytes,
+        };
+
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&params_gate_up)
+                .arg(&params_down)
+                .arg(&num_producer_n_tiles)
+                .arg(&intermediate_n_offset)
+                .launch(cfg)
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
+        let fused_output = stream.clone_dtoh(&d_output).unwrap();
+
+        // Compare first tile (m_eff × h_eff) of fused output with reference
+        let mut max_diff = 0.0f32;
+        for row in 0..m_eff as usize {
+            for col in 0..h_eff as usize {
+                let ref_val = ref_output[row * h_eff as usize + col].to_f32();
+                let fused_val = fused_output[row * h as usize + col].to_f32();
+                let diff = (ref_val - fused_val).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+            }
+        }
+
+        let status = if max_diff < 0.1 { "PASS" } else { "FAIL" };
+        println!("  {label}: max_diff={max_diff:.2e} {status}");
+        if max_diff >= 0.1 {
+            failures.push((label, max_diff));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Single-block sweep failures: {:?}",
+        failures
+    );
+}
+
+/// Diagnose multi-block failure: 2 M-tiles, check each tile's output independently.
+/// Also checks whether block 1 writes zeros or leaves sentinel values (42.0).
+#[test]
+fn register_transfer_mlp_multiblock_diagnosis() {
+    println!("=== Multi-block diagnosis ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(REGTRANSFER_MLP_PTX)).unwrap();
+    let func = module.load_function("regtransfer_mlp").unwrap();
+
+    let tile_m = 64u32;
+    let tile_n = 64u32;
+    let m = 128u32;
+    let hidden = 64u32;
+    let intermediate = 64u32;
+    let gate_up_cols = 2 * intermediate;
+
+    let h_input: Vec<half::bf16> = (0..(m * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_gateup_w: Vec<half::bf16> = (0..(gate_up_cols * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+        .collect();
+    let h_down_w: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00013 + 0.1).cos() * 0.12))
+        .collect();
+
+    // Reference (separate launches)
+    let gate_up_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_input,
+        &h_gateup_w,
+        m,
+        gate_up_cols,
+        hidden,
+    );
+    let activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
+        .map(|idx| {
+            let row = idx / intermediate as usize;
+            let col = idx % intermediate as usize;
+            let gate = gate_up_out[row * gate_up_cols as usize + col].to_f32();
+            let up =
+                gate_up_out[row * gate_up_cols as usize + intermediate as usize + col].to_f32();
+            half::bf16::from_f32(cpu_silu(gate) * up)
+        })
+        .collect();
+    let ref_output = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &activated,
+        &h_down_w,
+        m,
+        hidden,
+        intermediate,
+    );
+
+    // Fused: 2 M-tile blocks
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
+    let d_down_w = stream.clone_htod(&h_down_w).unwrap();
+    let sentinel = vec![half::bf16::from_f32(42.0); (m * hidden) as usize];
+    let d_output = stream.clone_htod(&sentinel).unwrap();
+
+    let (inp_p, _) = d_input.device_ptr(&stream);
+    let (guw_p, _) = d_gateup_w.device_ptr(&stream);
+    let (dw_p, _) = d_down_w.device_ptr(&stream);
+    let (out_p, _) = d_output.device_ptr(&stream);
+
+    let params_gate_up = build_flat_params(
+        inp_p as u64,
+        guw_p as u64,
+        0,
+        0,
+        m,
+        gate_up_cols,
+        hidden,
+        hidden,
+        hidden,
+        gate_up_cols,
+        gate_up_cols,
+        1.0,
+        0.0,
+    );
+    let params_down = build_flat_params(
+        0,
+        dw_p as u64,
+        out_p as u64,
+        out_p as u64,
+        m,
+        hidden,
+        intermediate,
+        tile_n as u32,
+        intermediate,
+        hidden,
+        hidden,
+        1.0,
+        0.0,
+    );
+
+    let num_producer_n_tiles = intermediate.div_ceil(tile_n);
+    let intermediate_n_offset = intermediate / tile_n;
+    let grid_m = m.div_ceil(tile_m);
+    let grid_n = hidden.div_ceil(tile_n);
+
+    let cfg = LaunchConfig {
+        grid_dim: (grid_m * grid_n, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 40960,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&params_gate_up)
+            .arg(&params_down)
+            .arg(&num_producer_n_tiles)
+            .arg(&intermediate_n_offset)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let fused_output = stream.clone_dtoh(&d_output).unwrap();
+
+    // Analyze EACH M-tile separately
+    for mtile in 0..grid_m {
+        let row_start = (mtile * tile_m) as usize;
+        let row_end = ((mtile + 1) * tile_m).min(m) as usize;
+        let mut max_diff = 0.0f32;
+        let mut zero_count = 0usize;
+        let mut sentinel_count = 0usize;
+        let mut total = 0usize;
+
+        for row in row_start..row_end {
+            for col in 0..hidden as usize {
+                let idx = row * hidden as usize + col;
+                let fv = fused_output[idx].to_f32();
+                let rv = ref_output[idx].to_f32();
+                let diff = (rv - fv).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+                if fv == 0.0 {
+                    zero_count += 1;
+                }
+                if (fv - 42.0).abs() < 0.01 {
+                    sentinel_count += 1;
+                }
+                total += 1;
+            }
+        }
+
+        println!(
+            "  M-tile {mtile} (rows {row_start}..{row_end}): max_diff={max_diff:.2e} zeros={zero_count}/{total} sentinels={sentinel_count}/{total}"
+        );
+
+        // Show first few elements
+        for col in 0..4.min(hidden as usize) {
+            let idx = row_start * hidden as usize + col;
+            eprintln!(
+                "    [{idx}] ref={:.4e} fused={:.4e}",
+                ref_output[idx].to_f32(),
+                fused_output[idx].to_f32()
+            );
+        }
+
+        // Show which rows have zeros and which have large diffs
+        if zero_count > 0 || max_diff > 0.01 {
+            for row in row_start..row_end {
+                let row_zeros: usize = (0..hidden as usize)
+                    .filter(|&col| fused_output[row * hidden as usize + col].to_f32() == 0.0)
+                    .count();
+                let row_max_diff: f32 = (0..hidden as usize)
+                    .map(|col| {
+                        let idx = row * hidden as usize + col;
+                        (ref_output[idx].to_f32() - fused_output[idx].to_f32()).abs()
+                    })
+                    .fold(0.0f32, f32::max);
+                if row_zeros > 0 || row_max_diff > 0.01 {
+                    eprintln!("    Row {row}: zeros={row_zeros} max_diff={row_max_diff:.4e}");
+                }
+            }
+        }
+    }
+}
+
+/// Same diagnosis but for multi N-tile (hidden=128, M=64)
+#[test]
+fn register_transfer_mlp_multiblock_ntile_diagnosis() {
+    println!("=== Multi-block N-tile diagnosis ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(REGTRANSFER_MLP_PTX)).unwrap();
+    let func = module.load_function("regtransfer_mlp").unwrap();
+
+    let tile_m = 64u32;
+    let tile_n = 64u32;
+    let m = 64u32;
+    let hidden = 128u32;
+    let intermediate = 64u32;
+    let gate_up_cols = 2 * intermediate;
+
+    let h_input: Vec<half::bf16> = (0..(m * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_gateup_w: Vec<half::bf16> = (0..(gate_up_cols * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+        .collect();
+    let h_down_w: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00013 + 0.1).cos() * 0.12))
+        .collect();
+
+    let gate_up_out = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_input,
+        &h_gateup_w,
+        m,
+        gate_up_cols,
+        hidden,
+    );
+    let activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
+        .map(|idx| {
+            let row = idx / intermediate as usize;
+            let col = idx % intermediate as usize;
+            let gate = gate_up_out[row * gate_up_cols as usize + col].to_f32();
+            let up =
+                gate_up_out[row * gate_up_cols as usize + intermediate as usize + col].to_f32();
+            half::bf16::from_f32(cpu_silu(gate) * up)
+        })
+        .collect();
+    let ref_output = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &activated,
+        &h_down_w,
+        m,
+        hidden,
+        intermediate,
+    );
+
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
+    let d_down_w = stream.clone_htod(&h_down_w).unwrap();
+    let sentinel = vec![half::bf16::from_f32(42.0); (m * hidden) as usize];
+    let d_output = stream.clone_htod(&sentinel).unwrap();
+
+    let (inp_p, _) = d_input.device_ptr(&stream);
+    let (guw_p, _) = d_gateup_w.device_ptr(&stream);
+    let (dw_p, _) = d_down_w.device_ptr(&stream);
+    let (out_p, _) = d_output.device_ptr(&stream);
+
+    let params_gate_up = build_flat_params(
+        inp_p as u64,
+        guw_p as u64,
+        0,
+        0,
+        m,
+        gate_up_cols,
+        hidden,
+        hidden,
+        hidden,
+        gate_up_cols,
+        gate_up_cols,
+        1.0,
+        0.0,
+    );
+    let params_down = build_flat_params(
+        0,
+        dw_p as u64,
+        out_p as u64,
+        out_p as u64,
+        m,
+        hidden,
+        intermediate,
+        tile_n as u32,
+        intermediate,
+        hidden,
+        hidden,
+        1.0,
+        0.0,
+    );
+
+    let num_producer_n_tiles = intermediate.div_ceil(tile_n);
+    let intermediate_n_offset = intermediate / tile_n;
+    let grid_m = m.div_ceil(tile_m);
+    let grid_n = hidden.div_ceil(tile_n);
+
+    let cfg = LaunchConfig {
+        grid_dim: (grid_m * grid_n, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 40960,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&params_gate_up)
+            .arg(&params_down)
+            .arg(&num_producer_n_tiles)
+            .arg(&intermediate_n_offset)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let fused_output = stream.clone_dtoh(&d_output).unwrap();
+
+    // Analyze EACH N-tile separately
+    for ntile in 0..grid_n {
+        let col_start = (ntile * tile_n) as usize;
+        let col_end = ((ntile + 1) * tile_n).min(hidden) as usize;
+        let mut max_diff = 0.0f32;
+        let mut zero_count = 0usize;
+        let mut total = 0usize;
+
+        for row in 0..m as usize {
+            for col in col_start..col_end {
+                let idx = row * hidden as usize + col;
+                let fv = fused_output[idx].to_f32();
+                let rv = ref_output[idx].to_f32();
+                let diff = (rv - fv).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+                if fv == 0.0 {
+                    zero_count += 1;
+                }
+                total += 1;
+            }
+        }
+
+        println!(
+            "  N-tile {ntile} (cols {col_start}..{col_end}): max_diff={max_diff:.2e} zeros={zero_count}/{total}"
+        );
+
+        if zero_count > 0 {
+            for row in 0..m as usize {
+                let row_zeros: usize = (col_start..col_end)
+                    .filter(|&col| fused_output[row * hidden as usize + col].to_f32() == 0.0)
+                    .count();
+                if row_zeros > 0 {
+                    eprintln!(
+                        "    Row {row}: {row_zeros} zeros (first at col {})",
+                        (col_start..col_end)
+                            .find(|&col| fused_output[row * hidden as usize + col].to_f32() == 0.0)
+                            .unwrap()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Test the base 64x64 GEMM with consumer-style params: A_ptr=0, lda=tile_n.
+/// This checks if the CUTLASS GEMM works with the scratch-addressing params.
+#[test]
+fn base_gemm_64x64_consumer_params() {
+    println!("=== Base 64x64 GEMM with consumer params (A_ptr=0, lda=64) ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(FLAT_GEMM_64X64_PTX)).unwrap();
+    let func = module.load_function("flat_gemm_64x64").unwrap();
+
+    let tile_m = 64u32;
+    let tile_n = 64u32;
+    let m = 64u32;
+    let hidden = 128u32; // 2 N-tiles
+    let k = 64u32;
+
+    // A data at address 0 won't work on GPU. Instead, test with normal params
+    // and multi-N-tile to verify the base GEMM handles n_tile>0 correctly.
+    let h_a: Vec<half::bf16> = (0..(m * k) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+        .collect();
+    let h_b: Vec<half::bf16> = (0..(k * hidden) as usize)
+        .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+        .collect();
+
+    // Reference
+    let ref_output = run_flat_gemm(
+        &ctx,
+        FLAT_GEMM_BASE_PTX,
+        "flat_gemm_base",
+        &h_a,
+        &h_b,
+        m,
+        hidden,
+        k,
+    );
+
+    // 64x64 GEMM
+    let d_a = stream.clone_htod(&h_a).unwrap();
+    let d_b = stream.clone_htod(&h_b).unwrap();
+    let d_c: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    let d_d: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
+    let (a_ptr, _) = d_a.device_ptr(&stream);
+    let (b_ptr, _) = d_b.device_ptr(&stream);
+    let (c_ptr, _) = d_c.device_ptr(&stream);
+    let (d_ptr, _) = d_d.device_ptr(&stream);
+
+    let params = build_flat_params(
+        a_ptr as u64,
+        b_ptr as u64,
+        c_ptr as u64,
+        d_ptr as u64,
+        m,
+        hidden,
+        k,
+        k,
+        k,
+        hidden,
+        hidden,
+        1.0,
+        0.0,
+    );
+
+    let (gx, gy, gz) = compute_grid(m, hidden, tile_m, tile_n);
+    let cfg = LaunchConfig {
+        grid_dim: (gx, gy, gz),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 24576,
+    };
+    unsafe { stream.launch_builder(&func).arg(&params).launch(cfg) }.unwrap();
+    stream.synchronize().unwrap();
+    let output = stream.clone_dtoh(&d_d).unwrap();
+
+    // Check per N-tile
+    let grid_n = hidden.div_ceil(tile_n);
+    for ntile in 0..grid_n {
+        let col_start = (ntile * tile_n) as usize;
+        let col_end = ((ntile + 1) * tile_n).min(hidden) as usize;
+        let mut max_diff = 0.0f32;
+        let mut zero_count = 0usize;
+        for row in 0..m as usize {
+            for col in col_start..col_end {
+                let idx = row * hidden as usize + col;
+                let diff = (ref_output[idx].to_f32() - output[idx].to_f32()).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+                if output[idx].to_f32() == 0.0 {
+                    zero_count += 1;
+                }
+            }
+        }
+        let total = (m as usize) * (col_end - col_start);
+        println!("  N-tile {ntile}: max_diff={max_diff:.2e} zeros={zero_count}/{total}");
+    }
+    println!("PASS");
+}
+
+/// Check if the bug is in the consumer epilogue by running with 0 driver iterations.
+/// This runs ONLY the setup + accum init + epilogue, no producer or K-loop.
+/// If row 0 is zero here too, the bug is in the epilogue's ctaid handling.
+#[test]
+fn register_transfer_mlp_epilogue_only() {
+    println!("=== Epilogue-only test (0 driver iterations) ===");
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(REGTRANSFER_MLP_PTX)).unwrap();
+    let func = module.load_function("regtransfer_mlp").unwrap();
+
+    let tile_m = 64u32;
+    let tile_n = 64u32;
+    let m = 64u32;
+    let hidden = 128u32;
+    let intermediate = 64u32;
+    let gate_up_cols = 2 * intermediate;
+
+    // Dummy data (won't be used since driver loop runs 0 times)
+    let h_input = vec![half::bf16::from_f32(0.0); (m * hidden) as usize];
+    let h_gateup_w = vec![half::bf16::from_f32(0.0); (gate_up_cols * hidden) as usize];
+    let h_down_w = vec![half::bf16::from_f32(0.0); (hidden * intermediate) as usize];
+
+    let d_input = stream.clone_htod(&h_input).unwrap();
+    let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
+    let d_down_w = stream.clone_htod(&h_down_w).unwrap();
+    let sentinel = vec![half::bf16::from_f32(42.0); (m * hidden) as usize];
+    let d_output = stream.clone_htod(&sentinel).unwrap();
+
+    let (inp_p, _) = d_input.device_ptr(&stream);
+    let (guw_p, _) = d_gateup_w.device_ptr(&stream);
+    let (dw_p, _) = d_down_w.device_ptr(&stream);
+    let (out_p, _) = d_output.device_ptr(&stream);
+
+    let params_gate_up = build_flat_params(
+        inp_p as u64,
+        guw_p as u64,
+        0,
+        0,
+        m,
+        gate_up_cols,
+        hidden,
+        hidden,
+        hidden,
+        gate_up_cols,
+        gate_up_cols,
+        1.0,
+        0.0,
+    );
+    let params_down = build_flat_params(
+        0,
+        dw_p as u64,
+        out_p as u64,
+        out_p as u64,
+        m,
+        hidden,
+        intermediate,
+        tile_n as u32,
+        intermediate,
+        hidden,
+        hidden,
+        1.0,
+        0.0,
+    );
+
+    // KEY: 0 driver iterations — skip producer entirely
+    let num_producer_n_tiles = 0u32;
+    let intermediate_n_offset = 0u32;
+
+    let grid_m = m.div_ceil(tile_m);
+    let grid_n = hidden.div_ceil(tile_n);
+
+    let cfg = LaunchConfig {
+        grid_dim: (grid_m * grid_n, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 40960,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&params_gate_up)
+            .arg(&params_down)
+            .arg(&num_producer_n_tiles)
+            .arg(&intermediate_n_offset)
+            .launch(cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let fused_output = stream.clone_dtoh(&d_output).unwrap();
+
+    // With 0 iterations and zero-initialized accumulators, output should be all 0.0
+    // (alpha * 0 + beta * C = 0). Check if the pattern is the same for both blocks.
+    for ntile in 0..grid_n {
+        let col_start = (ntile * tile_n) as usize;
+        let col_end = ((ntile + 1) * tile_n).min(hidden) as usize;
+        let mut zero_count = 0usize;
+        let mut sentinel_count = 0usize;
+        let total = (m as usize) * (col_end - col_start);
+
+        for row in 0..m as usize {
+            for col in col_start..col_end {
+                let idx = row * hidden as usize + col;
+                let fv = fused_output[idx].to_f32();
+                if fv == 0.0 {
+                    zero_count += 1;
+                }
+                if (fv - 42.0).abs() < 0.01 {
+                    sentinel_count += 1;
+                }
+            }
+        }
+        println!("  N-tile {ntile}: zeros={zero_count}/{total} sentinels={sentinel_count}/{total}");
+    }
 }
 
 fn compute_swizzle_log(grid_n: u32) -> u32 {

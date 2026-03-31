@@ -863,17 +863,21 @@ pub fn replace_a_loads_with_inline_fn(
                     ALoadSource::Gmem => {
                         result.push(format!(
                             "\t@{p} ld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{gmem_src}];",
-                            r_t(0), r_t(1), r_t(2), r_t(3)
+                            r_t(0),
+                            r_t(1),
+                            r_t(2),
+                            r_t(3)
                         ));
                     }
-                    ALoadSource::Smem { smem_base_reg, tile_mask } => {
+                    ALoadSource::Smem {
+                        smem_base_reg,
+                        tile_mask,
+                    } => {
                         // Compute scratch offset from GMEM source address.
                         // With A_ptr=0 and lda=tile_n, gmem_src encodes the row-major
                         // byte offset within the tile (modulo tile_bytes).
                         // Mask to extract within-tile offset, add scratch base.
-                        result.push(format!(
-                            "\tcvt.u32.u64 \t%r_fn_smoff, {gmem_src};"
-                        ));
+                        result.push(format!("\tcvt.u32.u64 \t%r_fn_smoff, {gmem_src};"));
                         result.push(format!(
                             "\tand.b32 \t%r_fn_smoff, %r_fn_smoff, {tile_mask};"
                         ));
@@ -882,7 +886,10 @@ pub fn replace_a_loads_with_inline_fn(
                         ));
                         result.push(format!(
                             "\t@{p} ld.shared.v4.b32 \t{{{}, {}, {}, {}}}, [%r_fn_smoff];",
-                            r_t(0), r_t(1), r_t(2), r_t(3)
+                            r_t(0),
+                            r_t(1),
+                            r_t(2),
+                            r_t(3)
                         ));
                     }
                 }

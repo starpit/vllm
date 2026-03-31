@@ -12,10 +12,9 @@ pub use ptx_fusion_macros::{
     analyze_kernel, analyze_kernel_as, compile, delete_cutlass_a_loads, extract_entry, fuse,
     fuse_3phase_mlp, fuse_kernels, fuse_real_kernels, inject_epilogue, inject_silu_epilogue,
     persistent_fuse_real_kernels, persistent_gemm, persistent_mlp_block, prologue_identity,
-    register_transfer_mlp,
-    prologue_identity_flat, prologue_scale2_flat, regfuse_kernels, replace_cutlass_a_loads,
-    replace_perimeter_macro, rewrite_kernel, sequence_gemms, sequence_mlp_block,
-    sequence_segment_b,
+    prologue_identity_flat, prologue_scale2_flat, regfuse_kernels, register_transfer_mlp,
+    replace_cutlass_a_loads, replace_perimeter_macro, rewrite_kernel, sequence_gemms,
+    sequence_mlp_block, sequence_segment_b,
 };
 
 #[cfg(feature = "cuda")]

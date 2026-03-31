@@ -5492,9 +5492,15 @@ impl Worker for CudaWorker {
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("model not loaded".into()))?;
 
-        // Run dummy forward with max_num_batched_tokens to measure peak activations.
-        let prefill_tokens = self.config.max_num_batched_tokens;
-        info!("Profiling activation memory with dummy forward ({prefill_tokens} tokens)...");
+        // Run dummy forward to measure peak activations.  Cap at 1024 tokens:
+        // large-vocab models (e.g. Qwen 151K vocab) can OOM on the lm_head GEMM
+        // at high token counts.  Activation memory scales linearly with M, so we
+        // measure at the capped value and extrapolate.
+        let target_prefill = self.config.max_num_batched_tokens;
+        let prefill_tokens = target_prefill.min(256);
+        info!(
+            "Profiling activation memory with dummy forward ({prefill_tokens} tokens, target {target_prefill})..."
+        );
 
         // Allocate dummy inputs for the profiling forward pass.
         //
@@ -5570,8 +5576,14 @@ impl Worker for CudaWorker {
 
         // Capture peak active bytes from caching allocator — mirrors Python's
         // `allocated_bytes.all.peak` (peak ACTIVE allocations, freed blocks not
-        // counted).
-        let torch_peak = device.caching.peak_active_bytes();
+        // counted).  Scale proportionally if we profiled at fewer tokens.
+        let measured_peak = device.caching.peak_active_bytes();
+        let torch_peak = if prefill_tokens < target_prefill {
+            let scale = target_prefill as f64 / prefill_tokens as f64;
+            (measured_peak as f64 * scale) as usize
+        } else {
+            measured_peak
+        };
 
         // Free the dummy KV cache and all cached allocator blocks, then trim to
         // return segments to the driver so cuMemGetInfo reflects only permanent

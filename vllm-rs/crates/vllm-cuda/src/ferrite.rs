@@ -164,9 +164,14 @@ impl FerriteCutlass {
         let n = b.dim(0) as u32;
         debug_assert_eq!(b.dim(1) as u32, k, "K dimension mismatch");
 
-        let out = alloc.alloc_tensor(&[m as usize, n as usize], a.dtype());
-
         let config = self.select(m);
+
+        // CUTLASS reads full [tile_m × K] A-tiles via cp.async even past M.
+        // Pad output to tile_m boundary so downstream consumers (which may be
+        // inputs to the next GEMM) have enough backing memory.
+        let padded_m = (m.div_ceil(config.tile_m) * config.tile_m) as usize;
+        let mut out = alloc.alloc_tensor(&[padded_m, n as usize], a.dtype());
+        unsafe { out.reshape(&[m as usize, n as usize], a.dtype()) };
 
         let grid_m = m.div_ceil(config.tile_m);
         let grid_n = n.div_ceil(config.tile_n);
@@ -283,13 +288,24 @@ impl FerriteCutlass {
         let hidden = normed_input.dim(1) as u32;
         let gate_up_cols = 2 * intermediate_size;
 
-        let gate_up_buf =
-            alloc.alloc_tensor(&[m as usize, gate_up_cols as usize], normed_input.dtype());
-        let output = alloc.alloc_tensor(&[m as usize, hidden as usize], normed_input.dtype());
-
         // Compute grid dims for each phase
         let tile_m = 64u32;
         let tile_n = 128u32;
+
+        // CUTLASS accesses full [tile_m × tile_n] tiles via cp.async even past
+        // the logical M boundary.  Pad intermediate + output buffers to the tile
+        // boundary.  The input (normed_input) is already padded because it came
+        // from a ferrite GEMM output which is also padded.
+        let padded_m = m.div_ceil(tile_m) * tile_m;
+
+        let mut gate_up_buf = alloc.alloc_tensor(
+            &[padded_m as usize, gate_up_cols as usize],
+            normed_input.dtype(),
+        );
+        unsafe { gate_up_buf.reshape(&[m as usize, gate_up_cols as usize], normed_input.dtype()) };
+        let mut output =
+            alloc.alloc_tensor(&[padded_m as usize, hidden as usize], normed_input.dtype());
+        unsafe { output.reshape(&[m as usize, hidden as usize], normed_input.dtype()) };
 
         let grid_m = m.div_ceil(tile_m);
 

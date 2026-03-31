@@ -3521,6 +3521,7 @@ fn persistent_mlp_block_gpu() {
         (128, 128, &[1, 64, 128]),      // small dims (known working)
         (128, 256, &[1, 64]),           // larger intermediate (more N-tiles in phase 0)
         (896, 4864, &[1, 8, 64, 1024]), // Qwen 0.5B production dims incl prefill
+        (2048, 11008, &[1, 8, 64]),     // Qwen 3B dims
     ];
     let mut failures = Vec::new();
 

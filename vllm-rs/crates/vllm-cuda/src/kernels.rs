@@ -3586,12 +3586,10 @@ pub unsafe fn flash_attn_paged_ext(
         // When per-block flags are provided, they override this — set to 0
         // since K is stored rotated by default. When flags are null (no span
         // machinery), fall back to old behavior based on cos_sin_cache_ptr.
-        if !block_unrotated_flags.is_null() {
-            0
-        } else if cos_sin_cache_ptr.is_null() || rotary_dim == 0 {
-            0
-        } else {
+        if block_unrotated_flags.is_null() && !cos_sin_cache_ptr.is_null() && rotary_dim != 0 {
             1
+        } else {
+            0
         }, // rotate_cached_k
         if is_rotary_interleaved { 1 } else { 0 }, // is_rotary_interleaved
         block_unrotated_flags,

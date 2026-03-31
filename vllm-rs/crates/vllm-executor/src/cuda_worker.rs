@@ -1505,6 +1505,7 @@ pub struct CudaWorker {
 
     /// Optional progress callback for startup initialization.
     /// Used to report layer-by-layer loading progress to the UI.
+    #[allow(clippy::type_complexity)]
     progress_callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 

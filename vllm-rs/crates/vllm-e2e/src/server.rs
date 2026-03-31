@@ -374,7 +374,7 @@ impl TestServerBuilder {
             init_timeout,
             tokio::task::spawn_blocking(move || {
                 eprintln!("[E2E] spawn_blocking: calling initialize_stack");
-                let result = vllm_serve::init::initialize_stack(&config);
+                let result = vllm_serve::init::initialize_stack(&config, None);
                 eprintln!("[E2E] initialize_stack returned: {}", result.is_ok());
                 result
             }),

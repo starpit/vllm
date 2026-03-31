@@ -546,24 +546,50 @@ void sample_batched_bf16(
 //   <==>  sample = argmax_i(logit_i/T + Gumbel_i)
 // where Gumbel_i = -log(-log(U_i)), U_i ~ Uniform(0,1).
 //
-// Per-element randomness is generated via a counter-based hash (murmurhash3
-// finalizer), seeded from the per-request uniform_random value.
+// Per-element randomness is generated via Philox4x32-10, a counter-based
+// PRNG with provably good statistical properties. This matches Python
+// vLLM's Triton kernel which uses tl.rand (also Philox).
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ uint32_t murmurhash3_finalize(uint32_t h) {
-    h ^= h >> 16;
-    h *= 0x85ebca6bu;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35u;
-    h ^= h >> 16;
-    return h;
+// Philox4x32-10 constants (same as cuRAND / Triton).
+#define PHILOX_M0 0xD2511F53u
+#define PHILOX_M1 0xCD9E8D57u
+#define PHILOX_W0 0x9E3779B9u
+#define PHILOX_W1 0xBB67AE85u
+
+__device__ __forceinline__ void philox4x32_round(uint32_t* c, uint32_t* k) {
+    uint64_t p0 = (uint64_t)PHILOX_M0 * c[0];
+    uint64_t p1 = (uint64_t)PHILOX_M1 * c[2];
+    uint32_t hi0 = (uint32_t)(p0 >> 32);
+    uint32_t lo0 = (uint32_t)p0;
+    uint32_t hi1 = (uint32_t)(p1 >> 32);
+    uint32_t lo1 = (uint32_t)p1;
+    c[0] = hi1 ^ c[1] ^ k[0];
+    c[1] = lo1;
+    c[2] = hi0 ^ c[3] ^ k[1];
+    c[3] = lo0;
 }
 
-__device__ __forceinline__ float hash_to_uniform(uint32_t seed, uint32_t idx) {
-    // Combine seed and index, then hash to get a uniform float in (0, 1).
-    uint32_t h = murmurhash3_finalize(seed ^ (idx * 2654435761u));
-    // Map to (0, 1) — exclude 0 to avoid log(0).
-    return (float)(h >> 8) * (1.0f / 16777216.0f) + (0.5f / 16777216.0f);
+// Generate a uniform float in [0, 1) from Philox4x32-10.
+// key = (seed, 0), counter = (idx, 0, 0, 0).
+// Matches Triton's tl.rand: Philox RNG + upper-23-bit float conversion.
+__device__ __forceinline__ float philox_uniform(uint32_t seed, uint32_t idx) {
+    uint32_t c[4] = { idx, 0, 0, 0 };
+    uint32_t k[2] = { seed, 0 };
+
+    #pragma unroll
+    for (int round = 0; round < 10; round++) {
+        philox4x32_round(c, k);
+        k[0] += PHILOX_W0;
+        k[1] += PHILOX_W1;
+    }
+
+    // Convert to float in [0, 1): set exponent to 127, use upper 23 bits as
+    // mantissa, subtract 1.0. Same conversion as Triton's tl.rand.
+    uint32_t bits = (c[0] >> 9) | 0x3F800000u;
+    float f;
+    memcpy(&f, &bits, sizeof(float));
+    return f - 1.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +614,7 @@ __global__ void sample_gumbel_phase1_kernel(
     int vocab_size,
     int num_blocks,
     const float* __restrict__ temperatures,
-    const float* __restrict__ uniform_randoms)
+    const uint32_t* __restrict__ seeds)
 {
     int req_idx = blockIdx.x;
     int blk_idx = blockIdx.y;
@@ -597,14 +623,15 @@ __global__ void sample_gumbel_phase1_kernel(
 
     const T* row = logits + req_idx * vocab_size;
     float inv_temp = 1.0f / temperatures[req_idx];
-    uint32_t seed = __float_as_uint(uniform_randoms[req_idx]);
+    uint32_t seed = seeds[req_idx];
 
     // Each thread handles one element (or none if out of bounds).
     float my_val = -INFINITY;
     int my_idx = 0;
     if (base < vocab_size) {
         float logit = to_float(row[base]) * inv_temp;
-        float u = hash_to_uniform(seed, (uint32_t)base);
+        float u = philox_uniform(seed, (uint32_t)base);
+        u = fmaxf(u, 1e-7f);  // Match Python: avoid log(0)
         float gumbel = -logf(-logf(u));
         my_val = logit + gumbel;
         my_idx = base;
@@ -720,7 +747,7 @@ extern "C" {
 
 void sample_gumbel_batched_f32(
     uint32_t* output, const float* logits, int vocab_size, int batch_size,
-    const float* temperatures, const float* uniform_randoms,
+    const float* temperatures, const uint32_t* seeds,
     float* scratch_vals, int* scratch_indices,
     cudaStream_t stream) {
     if (batch_size <= 0) return;
@@ -728,14 +755,14 @@ void sample_gumbel_batched_f32(
     dim3 grid(batch_size, num_blocks);
     sample_gumbel_phase1_kernel<float><<<grid, GUMBEL_BLOCK, 0, stream>>>(
         scratch_vals, scratch_indices, logits, vocab_size, num_blocks,
-        temperatures, uniform_randoms);
+        temperatures, seeds);
     sample_gumbel_phase2_kernel<<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
         output, scratch_vals, scratch_indices, num_blocks);
 }
 
 void sample_gumbel_batched_f16(
     uint32_t* output, const uint16_t* logits, int vocab_size, int batch_size,
-    const float* temperatures, const float* uniform_randoms,
+    const float* temperatures, const uint32_t* seeds,
     float* scratch_vals, int* scratch_indices,
     cudaStream_t stream) {
     if (batch_size <= 0) return;
@@ -744,14 +771,14 @@ void sample_gumbel_batched_f16(
     sample_gumbel_phase1_kernel<__half><<<grid, GUMBEL_BLOCK, 0, stream>>>(
         scratch_vals, scratch_indices,
         reinterpret_cast<const __half*>(logits), vocab_size, num_blocks,
-        temperatures, uniform_randoms);
+        temperatures, seeds);
     sample_gumbel_phase2_kernel<<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
         output, scratch_vals, scratch_indices, num_blocks);
 }
 
 void sample_gumbel_batched_bf16(
     uint32_t* output, const uint16_t* logits, int vocab_size, int batch_size,
-    const float* temperatures, const float* uniform_randoms,
+    const float* temperatures, const uint32_t* seeds,
     float* scratch_vals, int* scratch_indices,
     cudaStream_t stream) {
     if (batch_size <= 0) return;
@@ -760,7 +787,7 @@ void sample_gumbel_batched_bf16(
     sample_gumbel_phase1_kernel<__nv_bfloat16><<<grid, GUMBEL_BLOCK, 0, stream>>>(
         scratch_vals, scratch_indices,
         reinterpret_cast<const __nv_bfloat16*>(logits), vocab_size, num_blocks,
-        temperatures, uniform_randoms);
+        temperatures, seeds);
     sample_gumbel_phase2_kernel<<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
         output, scratch_vals, scratch_indices, num_blocks);
 }

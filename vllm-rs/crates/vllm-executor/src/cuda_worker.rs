@@ -2696,21 +2696,21 @@ impl CudaWorker {
             );
         }
 
-        // Helper: get a per-request random seed for GPU sampling kernels.
+        // Helper: get a per-request random seed (u32) for GPU sampling kernels.
         //
         // For requests with an explicit seed: use the per-request seeded RNG.
         // For unseeded requests: derive from hash(req_id, position) — this is
         // stateless and identical on all TP ranks, unlike a stateful RNG which
-        // can desync if ranks call gen_random different numbers of times during
+        // can desync if ranks call gen_seed different numbers of times during
         // prefill chunking.
         //
-        // The GPU Gumbel kernel uses this as a seed for hash_to_uniform(seed, idx)
-        // to generate per-element randomness, so we just need one unique f32/step.
+        // The GPU Gumbel kernel uses this as a Philox RNG seed to generate
+        // per-element randomness (matching Python vLLM's tl.rand approach).
         let positions = &prepared.flat_positions;
         let mut req_offset = 0usize;
-        let mut gen_random = |req_id: &str| -> f32 {
+        let mut gen_seed = |req_id: &str| -> u32 {
             if let Some(rng) = seeded_rngs.get_mut(req_id) {
-                rng.r#gen::<f32>()
+                rng.r#gen::<u32>()
             } else {
                 // Stateless hash: combine req_id bytes with position (step
                 // counter). Must be deterministic across TP ranks — we use a
@@ -2727,8 +2727,8 @@ impl CudaWorker {
                     h ^= b as u64;
                     h = h.wrapping_mul(0x100000001b3);
                 }
-                // Map to (0, 1).
-                (h >> 40) as f32 / 16777216.0
+                // Use upper 32 bits for maximum entropy.
+                (h >> 32) as u32
             }
         };
 
@@ -2778,17 +2778,18 @@ impl CudaWorker {
             });
 
             let token_ids_owned = if all_no_filter {
+                // Pack [temps: f32, seeds: u32] — both 4 bytes, same stride.
                 let stride = num_reqs * 4;
                 let total_bytes = stride * 2;
                 let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
                 let temps_ptr = packed_ptr as *mut f32;
-                let randoms_ptr = unsafe { packed_ptr.add(stride) as *mut f32 };
+                let seeds_ptr = unsafe { packed_ptr.add(stride) as *mut u32 };
                 for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
                     let params = sampling_params_map.get(&req_slice.req_id);
                     let t = params.map_or(1.0f32, |p| p.temperature.max(1e-7) as f32);
                     unsafe {
                         *temps_ptr.add(i) = t;
-                        *randoms_ptr.add(i) = gen_random(&req_slice.req_id);
+                        *seeds_ptr.add(i) = gen_seed(&req_slice.req_id);
                     }
                 }
                 let gpu_packed_owned = device
@@ -2806,13 +2807,13 @@ impl CudaWorker {
                 .map_err(|e| ExecutorError::WorkerExecution(format!("H2D sampling: {e}")))?;
                 let base = gpu_packed.raw_ptr();
                 let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
-                let gpu_randoms =
-                    unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::F32) };
+                let gpu_seeds =
+                    unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::U32) };
                 unsafe {
                     vllm_cuda::kernels::sample_gumbel_batched(
                         logits,
                         gpu_temps,
-                        gpu_randoms,
+                        gpu_seeds,
                         &mut device.caching,
                         device.compute_stream,
                     )
@@ -2841,7 +2842,8 @@ impl CudaWorker {
                         *top_ks_ptr.add(i) = k;
                         *top_ps_ptr.add(i) = p;
                         *min_ps_ptr.add(i) = mp;
-                        *randoms_ptr.add(i) = gen_random(&req_slice.req_id);
+                        *randoms_ptr.add(i) =
+                            f32::from_bits((gen_seed(&req_slice.req_id) >> 9) | 0x3F800000) - 1.0;
                     }
                 }
                 let gpu_packed_owned = device
@@ -3006,7 +3008,8 @@ impl CudaWorker {
                     *top_ks_ptr.add(i) = k;
                     *top_ps_ptr.add(i) = p;
                     *min_ps_ptr.add(i) = mp;
-                    *randoms_ptr.add(i) = gen_random(&req_slice.req_id);
+                    *randoms_ptr.add(i) =
+                        f32::from_bits((gen_seed(&req_slice.req_id) >> 9) | 0x3F800000) - 1.0;
                 }
             }
             let gpu_packed_owned = device

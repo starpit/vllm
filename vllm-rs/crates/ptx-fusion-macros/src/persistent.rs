@@ -893,19 +893,20 @@ pub fn make_single_body_persistent_mlp(
             continue;
         }
 
-        // Conditional SiLU at A-load cp.async sites
+        // Replace A-load cp.async with explicit ld.global + optional SiLU + st.shared.
+        // CRITICAL: we NEVER keep the cp.async for A-loads. Using both cp.async and
+        // ld.global+st.shared in the same kernel (even in different branches) causes
+        // ptxas to allocate 16 hardware barriers (one set per code path), killing
+        // occupancy to 1 block/SM. By always using ld.global for A-loads, ptxas only
+        // sees one async pipeline (B-loads via cp.async) and allocates ~1-2 barriers.
         if trimmed.contains("cp.async.cg.shared.global")
             && classifications.get(&i) == Some(&CpAsyncClass::AMatrix)
         {
             if let Some((smem_dst, gmem_src, mask)) = parse_cp_async(trimmed) {
                 let label_n = a_load_index;
-                // Branch: if not SiLU phase, do normal cp.async
-                out.push_str(&format!("\t@!%p_silu bra \t$L_normal_aload_{label_n};\n"));
 
-                // ── SiLU path ──
-                // Mask check
+                // Always load via ld.global (predicated on mask)
                 out.push_str(&format!("\tsetp.ne.b32 \t{p_mask}, {mask}, 0;\n"));
-                // Load gate values (16 bytes = 8 bf16)
                 out.push_str(&format!(
                     "\t@{p_mask} ld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{gmem_src}];\n",
                     r_t(0),
@@ -916,6 +917,9 @@ pub fn make_single_body_persistent_mlp(
                 for j in 0..4 {
                     out.push_str(&format!("\t@!{p_mask} mov.b32 \t{}, 0;\n", r_t(j)));
                 }
+
+                // SiLU path: only when %p_silu is set (phase 1)
+                out.push_str(&format!("\t@!%p_silu bra \t$L_after_silu_{label_n};\n"));
 
                 // Per-site instructions (load up values)
                 if !silu_computation.per_site.is_empty() {
@@ -955,7 +959,9 @@ pub fn make_single_body_persistent_mlp(
                     out.push_str(&format!("\tmov.b32 \t{}, {{%h_fn0, %h_fn1}};\n", r_t(j)));
                 }
 
-                // Store to SMEM
+                out.push_str(&format!("$L_after_silu_{label_n}:\n"));
+
+                // Store to SMEM (always, both phases)
                 out.push_str(&format!(
                     "\tst.shared.v4.b32 \t[{smem_dst}], {{{}, {}, {}, {}}};\n",
                     r_t(0),
@@ -963,18 +969,15 @@ pub fn make_single_body_persistent_mlp(
                     r_t(2),
                     r_t(3)
                 ));
-                out.push_str(&format!("\tbra \t$L_after_aload_{label_n};\n"));
 
-                // ── Normal path (cp.async unchanged) ──
-                out.push_str(&format!("$L_normal_aload_{label_n}:\n"));
-                out.push_str(line);
-                out.push('\n');
-
-                out.push_str(&format!("$L_after_aload_{label_n}:\n"));
                 a_load_index += 1;
                 continue;
             }
         }
+
+        // NOTE: B-load cp.async are preserved as-is. Replacing them with
+        // ld.global+st.shared breaks CUTLASS's software pipeline (cp.async.commit_group /
+        // wait_group synchronization). The 16-barrier issue remains unsolved — see handoff.
 
         // Default: emit line unchanged
         out.push_str(line);

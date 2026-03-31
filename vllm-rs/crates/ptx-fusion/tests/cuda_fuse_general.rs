@@ -3710,3 +3710,118 @@ fn compute_swizzle_log(grid_n: u32) -> u32 {
         0
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Ferrite gemv: bf16 matrix-vector multiply for decode (M=1)
+// ══════════════════════════════════════════════════════════════════════
+
+const FERRITE_GEMV_PTX: &str = include_str!("../kernels/ferrite_gemv_bf16.ptx");
+
+#[test]
+fn ferrite_gemv_gpu() {
+    println!("=== Ferrite gemv bf16: GPU correctness ===");
+
+    // ptxas check
+    let path = "/tmp/ferrite_gemv_test.ptx";
+    std::fs::write(path, FERRITE_GEMV_PTX).unwrap();
+    let ptxas_out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+    if !ptxas_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ptxas_out.stderr);
+        panic!("ptxas FAILED: {}", stderr);
+    }
+    println!("  ptxas: PASS ({} lines)", FERRITE_GEMV_PTX.lines().count());
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(FERRITE_GEMV_PTX)).unwrap();
+    let func = module.load_function("ferrite_gemv_bf16").unwrap();
+
+    // Test at multiple (N, K) configs
+    let configs: &[(u32, u32)] = &[
+        (128, 128),    // small
+        (256, 256),    // medium
+        (2560, 2048),  // Qwen 3B QKV
+        (22016, 2048), // Qwen 3B gate_up
+        (2048, 11008), // Qwen 3B down
+        (1536, 896),   // Qwen 0.5B QKV
+        (9728, 896),   // Qwen 0.5B gate_up
+    ];
+
+    for &(n, k) in configs {
+        // Generate test data
+        let h_w: Vec<half::bf16> = (0..(n * k) as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+            .collect();
+        let h_x: Vec<half::bf16> = (0..k as usize)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+            .collect();
+
+        // CPU reference: y[n] = sum_k(W[n,k] * x[k])
+        let ref_y: Vec<half::bf16> = (0..n as usize)
+            .map(|nn| {
+                let mut acc = 0.0f32;
+                for kk in 0..k as usize {
+                    acc += h_w[nn * k as usize + kk].to_f32() * h_x[kk].to_f32();
+                }
+                half::bf16::from_f32(acc)
+            })
+            .collect();
+
+        // GPU
+        let d_w = stream.clone_htod(&h_w).unwrap();
+        let d_x = stream.clone_htod(&h_x).unwrap();
+        let d_y: CudaSlice<half::bf16> = stream.alloc_zeros(n as usize).unwrap();
+
+        let (w_p, _) = d_w.device_ptr(&stream);
+        let (x_p, _) = d_x.device_ptr(&stream);
+        let (y_p, _) = d_y.device_ptr(&stream);
+
+        let w_ptr = w_p as u64;
+        let x_ptr = x_p as u64;
+        let y_ptr = y_p as u64;
+        let stride_w = k;
+
+        // v2 kernel: 256 threads, 32 output columns per block
+        let grid_x = n.div_ceil(32);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&w_ptr)
+                .arg(&x_ptr)
+                .arg(&y_ptr)
+                .arg(&n)
+                .arg(&k)
+                .arg(&stride_w)
+                .launch(cfg)
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        let h_y: Vec<half::bf16> = stream.clone_dtoh(&d_y).unwrap();
+
+        // Compare
+        let mut max_diff: f32 = 0.0;
+        for i in 0..n as usize {
+            let diff = (h_y[i].to_f32() - ref_y[i].to_f32()).abs();
+            max_diff = max_diff.max(diff);
+        }
+
+        // Tolerance: bf16 accumulation over K elements. Allow ~1 ULP per 64 K elements.
+        let tol = 0.1 + (k as f32 / 64.0).ceil() * 0.05;
+        let status = if max_diff <= tol { "PASS" } else { "FAIL" };
+        println!("  N={n:>5} K={k:>5} max_diff={max_diff:.2e} tol={tol:.2} {status}");
+        assert!(
+            max_diff <= tol,
+            "gemv FAILED at N={n} K={k}: max_diff={max_diff:.2e} > tol={tol:.2}"
+        );
+    }
+}

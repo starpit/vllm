@@ -47,6 +47,10 @@ ptx_fusion::replace_perimeter_macro!(
     FLAT_128X128X64_PTX
 );
 
+// ── Gemv kernel for M=1 decode ──
+
+const GEMV_PTX: &str = include_str!("../../ptx-fusion/kernels/ferrite_gemv_bf16.ptx");
+
 // ── MLP block: gate_up GEMM → SiLU+mul → down GEMM in one kernel ──
 
 const MLP_BLOCK_PTX: &str = ptx_fusion::persistent_mlp_block!(
@@ -74,6 +78,8 @@ struct TileConfig {
 /// Ferrite CUTLASS GEMM dispatcher.
 pub struct FerriteCutlass {
     configs: Vec<TileConfig>,
+    /// bf16 gemv kernel for M=1 decode (hand-written, coalesced).
+    gemv: Option<CudaFunc>,
     /// Fused MLP block kernel (gate_up → SiLU → down).
     mlp_block: Option<CudaFunc>,
     /// Device memory for global barrier counters (reused across launches).
@@ -125,6 +131,15 @@ impl FerriteCutlass {
 
         configs.sort_by_key(|c| c.tile_m);
 
+        // Load gemv kernel for M=1 decode (1024 bytes SMEM for reduction)
+        let gemv = match load_flat_module(GEMV_PTX, "ferrite_gemv_bf16", 1024) {
+            Ok((module, func)) => Some(CudaFunc(module, func)),
+            Err(e) => {
+                eprintln!("ferrite: gemv kernel load failed (non-fatal): {e}");
+                None
+            }
+        };
+
         // Load the fused MLP block kernel
         let mlp_block = match load_flat_module(MLP_BLOCK_PTX, "ferrite_mlp_block", 36864 + 512) {
             Ok((module, func)) => Some(CudaFunc(module, func)),
@@ -148,6 +163,7 @@ impl FerriteCutlass {
 
         Ok(FerriteCutlass {
             configs,
+            gemv,
             mlp_block,
             barrier_counters: barrier_ptr,
         })
@@ -180,6 +196,13 @@ impl FerriteCutlass {
         let k = a.dim(1) as u32;
         let n = b.dim(0) as u32;
         debug_assert_eq!(b.dim(1) as u32, k, "K dimension mismatch");
+
+        // Use gemv for M=1 (decode): 6x faster than tiled GEMM
+        if m == 1 && c.is_none() && alpha == 1.0 && beta == 0.0 {
+            if let Some(ref gemv) = self.gemv {
+                return self.launch_gemv(gemv.1, a, b, n, k, alloc, stream);
+            }
+        }
 
         let config = self.select(m);
 
@@ -432,6 +455,57 @@ impl FerriteCutlass {
         );
 
         (output, gate_up_buf)
+    }
+
+    /// Launch the gemv kernel: y[1,N] = x[1,K] @ W[N,K]^T
+    unsafe fn launch_gemv(
+        &self,
+        func: CUfunction,
+        a: GpuTensor, // x [1, K]
+        b: GpuTensor, // W [N, K]
+        n: u32,
+        k: u32,
+        alloc: &mut CachingAllocator,
+        stream: CUstream,
+    ) -> OwnedTensor {
+        let out = alloc.alloc_tensor(&[1, n as usize], a.dtype());
+
+        let w_ptr = b.raw_ptr() as u64;
+        let x_ptr = a.raw_ptr() as u64;
+        let y_ptr = out.as_gpu_tensor().raw_ptr() as u64;
+        let stride_w = k;
+
+        let grid_x = n.div_ceil(32); // 32 output columns per block
+
+        let mut kp: [*mut std::ffi::c_void; 6] = [
+            &w_ptr as *const u64 as *mut _,
+            &x_ptr as *const u64 as *mut _,
+            &y_ptr as *const u64 as *mut _,
+            &n as *const u32 as *mut _,
+            &k as *const u32 as *mut _,
+            &stride_w as *const u32 as *mut _,
+        ];
+
+        let result = sys::cuLaunchKernel(
+            func,
+            grid_x,
+            1,
+            1,
+            256, // 256 threads per block
+            1,
+            1,
+            1024, // shared memory for reduction (256 * 4 bytes)
+            stream,
+            kp.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            result,
+            sys::cudaError_enum::CUDA_SUCCESS,
+            "ferrite launch_gemv failed: {result:?}"
+        );
+
+        out
     }
 }
 

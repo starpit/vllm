@@ -1069,8 +1069,8 @@ impl LlamaDecoderLayer {
                 crate::layers::LinearLayer::Dense(down_linear),
             ) = (&self.mlp.gate_up_proj, &self.mlp.down_proj)
             {
-                // Persistent fused MLP block: gate_up → SiLU → down in one launch
-                let mlp_output = device.ferrite.launch_mlp_block(
+                // Fused MLP block: gate_up → SiLU → down in one persistent launch
+                let (mlp_output, _gate_up_buf) = device.ferrite.launch_mlp_block(
                     *attn_output,
                     gate_up_linear.weight,
                     down_linear.weight,
@@ -1078,7 +1078,8 @@ impl LlamaDecoderLayer {
                     &mut device.caching,
                     device.compute_stream,
                 );
-                drop(attn_output);
+                // _gate_up_buf + attn_output kept alive until scope exit —
+                // the async kernel reads from both during execution.
 
                 if self.residual_multiplier != 1.0 {
                     kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);

@@ -273,7 +273,7 @@ impl FerriteCutlass {
         intermediate_size: u32,
         alloc: &mut CachingAllocator,
         stream: CUstream,
-    ) -> OwnedTensor {
+    ) -> (OwnedTensor, OwnedTensor) {
         let func = match &self.mlp_block {
             Some(cf) => cf.1,
             None => panic!("ferrite: MLP block kernel not loaded"),
@@ -282,10 +282,6 @@ impl FerriteCutlass {
         let m = normed_input.dim(0) as u32;
         let hidden = normed_input.dim(1) as u32;
         let gate_up_cols = 2 * intermediate_size;
-
-        eprintln!(
-            "ferrite MLP: M={m} hidden={hidden} intermediate={intermediate_size} gate_up_cols={gate_up_cols}"
-        );
 
         let gate_up_buf =
             alloc.alloc_tensor(&[m as usize, gate_up_cols as usize], normed_input.dtype());
@@ -322,10 +318,12 @@ impl FerriteCutlass {
         // barrier_counters layout: [0] = tile counter, [1..] = mtile_done array
         let max_mtiles = grid_m;
         let counter_bytes = 4 + max_mtiles * 4; // u32 counter + u32 per m-tile
-        sys::cuMemsetD32_v2(
+        // Use stream-ordered memset so zeroing completes before the kernel
+        sys::cuMemsetD32Async(
             self.barrier_counters as u64,
             0,
             (counter_bytes / 4) as usize,
+            stream,
         );
 
         let counter_ptr = self.barrier_counters as u64;
@@ -366,42 +364,19 @@ impl FerriteCutlass {
             0.0,
         );
 
-        // Pack all params into contiguous buffer (CU_LAUNCH_PARAM_BUFFER API).
-        let mut buf = Vec::with_capacity(256);
-        let align = |buf: &mut Vec<u8>, a: usize| {
-            while buf.len() % a != 0 {
-                buf.push(0);
-            }
-        };
-        align(&mut buf, 8);
-        buf.extend_from_slice(&counter_ptr.to_le_bytes()); // u64
-        align(&mut buf, 4);
-        buf.extend_from_slice(&total_tiles.to_le_bytes()); // u32
-        align(&mut buf, 4);
-        buf.extend_from_slice(&gx0.to_le_bytes()); // u32
-        align(&mut buf, 4);
-        buf.extend_from_slice(&phase0_tiles.to_le_bytes()); // u32
-        align(&mut buf, 4);
-        buf.extend_from_slice(&gx1.to_le_bytes()); // u32
-        align(&mut buf, 4);
-        buf.extend_from_slice(&ntiles_per_m_0.to_le_bytes()); // u32
-        align(&mut buf, 8);
-        buf.extend_from_slice(&mtile_done_ptr.to_le_bytes()); // u64
-        align(&mut buf, 8);
-        buf.extend_from_slice(&params_gate_up); // [88]
-        align(&mut buf, 8);
-        buf.extend_from_slice(&intermediate_bytes.to_le_bytes()); // u64
-        align(&mut buf, 8);
-        buf.extend_from_slice(&params_down); // [88]
-        align(&mut buf, 8);
-
-        let mut param_size = buf.len();
-        let extra: [*mut std::ffi::c_void; 5] = [
-            sys::CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT as *mut _,
-            buf.as_ptr() as *mut _,
-            sys::CU_LAUNCH_PARAM_BUFFER_SIZE_AS_INT as *mut _,
-            &mut param_size as *mut usize as *mut _,
-            sys::CU_LAUNCH_PARAM_END_AS_INT as *mut _,
+        // Use kernelParams API (same as cudarc::launch_builder).
+        // Each entry is a pointer to the parameter value.
+        let mut kp: [*mut std::ffi::c_void; 10] = [
+            &counter_ptr as *const u64 as *mut _,
+            &total_tiles as *const u32 as *mut _,
+            &gx0 as *const u32 as *mut _,
+            &phase0_tiles as *const u32 as *mut _,
+            &gx1 as *const u32 as *mut _,
+            &ntiles_per_m_0 as *const u32 as *mut _,
+            &mtile_done_ptr as *const u64 as *mut _,
+            &params_gate_up as *const [u8; 88] as *mut _,
+            &intermediate_bytes as *const u64 as *mut _,
+            &params_down as *const [u8; 88] as *mut _,
         ];
 
         let result = sys::cuLaunchKernel(
@@ -414,8 +389,8 @@ impl FerriteCutlass {
             1,
             36864 + 512,
             stream,
+            kp.as_mut_ptr(),
             std::ptr::null_mut(),
-            extra.as_ptr() as *mut *mut _,
         );
         assert_eq!(
             result,
@@ -423,8 +398,7 @@ impl FerriteCutlass {
             "ferrite launch_mlp_block failed: {result:?}"
         );
 
-        drop(gate_up_buf);
-        output
+        (output, gate_up_buf)
     }
 }
 

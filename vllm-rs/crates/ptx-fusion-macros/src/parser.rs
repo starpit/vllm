@@ -726,7 +726,7 @@ impl DefUseGraph {
         Self { nodes, defs, uses }
     }
 
-    fn parse_instruction(line: &str, line_num: usize) -> Option<InstrNode> {
+    pub(crate) fn parse_instruction(line: &str, line_num: usize) -> Option<InstrNode> {
         let mut work = line;
         let mut extra_sources = Vec::new();
 
@@ -3074,5 +3074,57 @@ mod tests {
             trace_d3.len() > trace_d1.len(),
             "deeper trace should find more nodes"
         );
+    }
+
+    #[test]
+    fn cutlass_64x128x32_carry_analysis() {
+        let ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let lines: Vec<&str> = ptx.lines().collect();
+        let loops = detect_loops(&lines);
+
+        eprintln!("Loops found: {}", loops.len());
+        for l in &loops {
+            eprintln!(
+                "  {} lines {}-{} depth={} pred={}",
+                l.header_label, l.header_line, l.backedge_line, l.depth, l.backedge_predicate
+            );
+        }
+
+        let main_loop = loops
+            .iter()
+            .find(|l| l.depth == 0 && l.backedge_line - l.header_line > 100)
+            .expect("should find main K-loop");
+        eprintln!("\nMain K-loop: {} lines {}-{}", main_loop.header_label, main_loop.header_line, main_loop.backedge_line);
+
+        let carries = analyze_carries(&lines, main_loop);
+        let mma_accums: Vec<&str> = carries
+            .iter()
+            .filter(|c| c.role == CarryRole::MmaAccumulator)
+            .map(|c| c.register.as_str())
+            .collect();
+        let tile_ptrs: Vec<&str> = carries
+            .iter()
+            .filter(|c| c.role == CarryRole::TilePointer)
+            .map(|c| c.register.as_str())
+            .collect();
+        let induction: Vec<&str> = carries
+            .iter()
+            .filter(|c| c.role == CarryRole::InductionVar)
+            .map(|c| c.register.as_str())
+            .collect();
+        let buffer_state: Vec<&str> = carries
+            .iter()
+            .filter(|c| c.role == CarryRole::BufferState)
+            .map(|c| c.register.as_str())
+            .collect();
+
+        eprintln!("\nMMA accumulators ({}):", mma_accums.len());
+        eprintln!("  {:?}", mma_accums);
+        eprintln!("Tile pointers ({}):", tile_ptrs.len());
+        eprintln!("  {:?}", tile_ptrs);
+        eprintln!("Induction vars ({}):", induction.len());
+        eprintln!("  {:?}", induction);
+        eprintln!("Buffer state ({}):", buffer_state.len());
+        eprintln!("  {:?}", buffer_state);
     }
 }

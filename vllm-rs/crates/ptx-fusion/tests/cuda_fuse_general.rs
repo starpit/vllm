@@ -3698,6 +3698,200 @@ fn persistent_mlp_block_gpu() {
     println!("PASS: persistent MLP block matches separate launches");
 }
 
+// ── Register transfer MLP (non-persistent, SMEM scratch) ──
+
+const REGTRANSFER_MLP_PTX: &str = ptx_fusion_macros::register_transfer_mlp!(
+    "kernels/cutlass_bf16_64x64x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x64x32_sm89.derivations.json",
+    "kernels/cutlass_bf16_64x64x32_sm89.ptx",
+    "kernels/cutlass_bf16_64x64x32_sm89.derivations.json",
+    "kernels/vllm_silu_mul.ptx",
+    "regtransfer_mlp"
+);
+
+#[test]
+fn register_transfer_mlp_gpu() {
+    println!("=== Register transfer MLP: GPU correctness ===");
+
+    // ptxas validation
+    let path = "/tmp/regtransfer_mlp.ptx";
+    std::fs::write(path, REGTRANSFER_MLP_PTX).unwrap();
+    let ptxas_out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", "-v", path])
+        .output()
+        .expect("ptxas");
+    let stderr = String::from_utf8_lossy(&ptxas_out.stderr);
+    eprintln!("ptxas -v output:");
+    for line in stderr.lines() {
+        eprintln!("  {line}");
+    }
+    assert!(ptxas_out.status.success(), "ptxas FAILED on register transfer MLP");
+    println!("  ptxas: PASS ({} lines)", REGTRANSFER_MLP_PTX.lines().count());
+
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(REGTRANSFER_MLP_PTX)).unwrap();
+    let func = module.load_function("regtransfer_mlp").unwrap();
+
+    // 64x64x32 tile config: tile_m=64, tile_n=64
+    let tile_m = 64u32;
+    let tile_n = 64u32;
+
+    // Test configs: (hidden, intermediate, M values)
+    // Using dims compatible with 64x64 tiles
+    let configs: &[(u32, u32, &[u32])] = &[
+        (128, 128, &[64]),              // minimal: 1 tile each
+        (128, 256, &[64]),              // larger intermediate
+        (256, 256, &[64, 128]),         // multi-M-tile
+    ];
+    let mut failures = Vec::new();
+
+    for &(hidden, intermediate, m_values) in configs {
+        let gate_up_cols = 2 * intermediate;
+        println!("  hidden={hidden}, intermediate={intermediate}");
+
+        for &m in m_values {
+            // Generate test data
+            let h_input: Vec<half::bf16> = (0..(m * hidden) as usize)
+                .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+                .collect();
+            let h_gateup_w: Vec<half::bf16> = (0..(gate_up_cols * hidden) as usize)
+                .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+                .collect();
+            let h_down_w: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
+                .map(|i| half::bf16::from_f32(((i as f32) * 0.00013 + 0.1).cos() * 0.12))
+                .collect();
+
+            // Reference: separate launches via CPU SiLU
+            let gate_up_out = run_flat_gemm(
+                &ctx,
+                FLAT_GEMM_BASE_PTX,
+                "flat_gemm_base",
+                &h_input,
+                &h_gateup_w,
+                m,
+                gate_up_cols,
+                hidden,
+            );
+            let activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
+                .map(|idx| {
+                    let row = idx / intermediate as usize;
+                    let col = idx % intermediate as usize;
+                    let gate = gate_up_out[row * gate_up_cols as usize + col].to_f32();
+                    let up = gate_up_out[row * gate_up_cols as usize + intermediate as usize + col]
+                        .to_f32();
+                    half::bf16::from_f32(cpu_silu(gate) * up)
+                })
+                .collect();
+            let ref_output = run_flat_gemm(
+                &ctx,
+                FLAT_GEMM_BASE_PTX,
+                "flat_gemm_base",
+                &activated,
+                &h_down_w,
+                m,
+                hidden,
+                intermediate,
+            );
+
+            // Fused register transfer kernel
+            let d_input = stream.clone_htod(&h_input).unwrap();
+            let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
+            let d_down_w = stream.clone_htod(&h_down_w).unwrap();
+            let d_output: CudaSlice<half::bf16> =
+                stream.alloc_zeros((m * hidden) as usize).unwrap();
+
+            let (inp_p, _) = d_input.device_ptr(&stream);
+            let (guw_p, _) = d_gateup_w.device_ptr(&stream);
+            let (dw_p, _) = d_down_w.device_ptr(&stream);
+            let (out_p, _) = d_output.device_ptr(&stream);
+
+            // Producer (gate_up) params
+            let params_gate_up = build_flat_params(
+                inp_p as u64,
+                guw_p as u64,
+                0u64, // C ptr unused (epilogue redirected to SMEM)
+                0u64, // D ptr unused
+                m,
+                gate_up_cols,
+                hidden,
+                hidden,         // lda
+                hidden,         // ldb (row-major weight)
+                gate_up_cols,   // ldc (unused)
+                gate_up_cols,   // ldd (unused)
+                1.0,
+                0.0,
+            );
+
+            // Consumer (down) params
+            let params_down = build_flat_params(
+                0u64,           // A ptr unused (reads from SMEM scratch)
+                dw_p as u64,
+                out_p as u64,
+                out_p as u64,
+                m,
+                hidden,         // N
+                intermediate,   // K
+                gate_up_cols,   // lda (unused — reads from SMEM)
+                intermediate,   // ldb
+                hidden,         // ldc
+                hidden,         // ldd
+                1.0,
+                0.0,
+            );
+
+            let num_producer_n_tiles = intermediate.div_ceil(tile_n);
+            let intermediate_n_offset = intermediate / tile_n; // tiles to skip for "up" half
+
+            // Grid: one block per consumer output tile
+            let grid_m = m.div_ceil(tile_m);
+            let grid_n = hidden.div_ceil(tile_n);
+
+            // SMEM: 24KB CUTLASS + 8KB gate scratch + 8KB up scratch = 40KB
+            let smem_bytes = 40960u32;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_m * grid_n, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: smem_bytes,
+            };
+
+            unsafe {
+                stream
+                    .launch_builder(&func)
+                    .arg(&params_gate_up)
+                    .arg(&params_down)
+                    .arg(&num_producer_n_tiles)
+                    .arg(&intermediate_n_offset)
+                    .launch(cfg)
+            }
+            .unwrap();
+            stream.synchronize().unwrap();
+            let fused_output = stream.clone_dtoh(&d_output).unwrap();
+
+            let mut max_diff = 0.0f32;
+            for (r, f) in ref_output.iter().zip(fused_output.iter()) {
+                let diff = (r.to_f32() - f.to_f32()).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+            }
+            let status = if max_diff < 0.1 { "PASS" } else { "FAIL" };
+            println!(
+                "    M={m:>4} grid=({grid_m}x{grid_n}) n_tiles={num_producer_n_tiles} max_diff={max_diff:.2e} {status}"
+            );
+            if max_diff >= 0.1 {
+                failures.push((hidden, intermediate, m, max_diff));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Register transfer MLP failures: {:?}",
+        failures
+    );
+    println!("PASS: register transfer MLP matches separate launches");
+}
+
 fn compute_swizzle_log(grid_n: u32) -> u32 {
     const SWIZZLE_N: u32 = 4;
     if SWIZZLE_N >= 8 && grid_n >= 6 {

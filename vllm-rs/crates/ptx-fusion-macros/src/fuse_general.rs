@@ -401,6 +401,22 @@ fn fuse_gemm_epilogue(
     })
 }
 
+/// Where the primary A-load data comes from.
+#[derive(Debug, Clone, Default)]
+pub enum ALoadSource {
+    /// Load from GMEM via ld.global (standard — data at the cp.async GMEM address).
+    #[default]
+    Gmem,
+    /// Load from SMEM via ld.shared (register transfer — data written by a prior epilogue).
+    /// The SMEM address is computed as: smem_base + same_relative_offset_as_gmem.
+    /// `smem_base_reg` holds the precomputed base (set by the caller in prologue).
+    Smem {
+        /// Register holding the 32-bit SMEM base address for this A-load source.
+        /// Must be set by the caller before the K-loop.
+        smem_base_reg: String,
+    },
+}
+
 /// Extracted pointwise computation from an elementwise kernel.
 pub struct PointwiseComputation {
     /// PTX instructions that transform the input value (in a register) to the output.
@@ -419,7 +435,7 @@ pub struct PointwiseComputation {
     /// Extra .param declarations to prepend to the kernel entry point.
     /// Each string is a full param line, e.g., ".param .u64 _ferrite_rms_weight,".
     pub extra_params: Vec<String>,
-    /// Instructions emitted once per cp.async site, after the GMEM load.
+    /// Instructions emitted once per cp.async site, after the primary A-load.
     /// Supports placeholders: `{GMEM_SRC}`, `{MASK_PRED}`, `{LOAD_INDEX}`.
     /// Use for loading secondary data (e.g., weight vector at same K offset).
     pub per_site: Vec<String>,
@@ -429,6 +445,8 @@ pub struct PointwiseComputation {
     pub scratch_f32_count: usize,
     /// Number of scratch .b32 registers needed.
     pub scratch_b32_count: usize,
+    /// Where the primary A-load data comes from. Default: GMEM.
+    pub source: ALoadSource,
 }
 
 /// Extract the pointwise computation from an elementwise kernel.
@@ -615,6 +633,7 @@ fn extract_pointwise_computation(
         entry_name: None,
         scratch_f32_count: used_f32_scratch,
         scratch_b32_count: used_b32_scratch,
+        source: ALoadSource::Gmem,
     })
 }
 
@@ -831,14 +850,27 @@ pub fn replace_a_loads_with_inline_fn(
                 // Check mask
                 result.push(format!("\tsetp.ne.b32 \t{p}, {mask}, 0;"));
 
-                // Load 16 bytes from GMEM (4 x b32 = 8 bf16)
-                result.push(format!(
-                    "\t@{p} ld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{gmem_src}];",
-                    r_t(0),
-                    r_t(1),
-                    r_t(2),
-                    r_t(3)
-                ));
+                // Load 16 bytes (4 x b32 = 8 bf16) from GMEM or SMEM
+                match &computation.source {
+                    ALoadSource::Gmem => {
+                        result.push(format!(
+                            "\t@{p} ld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{gmem_src}];",
+                            r_t(0), r_t(1), r_t(2), r_t(3)
+                        ));
+                    }
+                    ALoadSource::Smem { smem_base_reg } => {
+                        // Compute SMEM offset from the GMEM address:
+                        // The cp.async site's gmem_src encodes a specific K-column offset.
+                        // For SMEM scratch in linear layout, we use a pre-computed base
+                        // register that tracks the current position.
+                        // The A-load index * 16 bytes gives the offset within the tile row.
+                        let smem_offset = a_load_index * 16;
+                        result.push(format!(
+                            "\t@{p} ld.shared.v4.b32 \t{{{}, {}, {}, {}}}, [{smem_base_reg}+{smem_offset}];",
+                            r_t(0), r_t(1), r_t(2), r_t(3)
+                        ));
+                    }
+                }
                 // Zero on mask=0
                 for j in 0..4 {
                     result.push(format!("\t@!{p} mov.b32 \t{}, 0;", r_t(j)));
@@ -847,10 +879,12 @@ pub fn replace_a_loads_with_inline_fn(
                 // Emit per-site instructions (secondary loads, etc.)
                 if !computation.per_site.is_empty() {
                     let load_idx_str = a_load_index.to_string();
+                    let load_idx_x16 = (a_load_index * 16).to_string();
                     for instr in &computation.per_site {
                         let concrete = instr
                             .replace("{GMEM_SRC}", &gmem_src)
                             .replace("{MASK_PRED}", &p)
+                            .replace("{LOAD_INDEX_X16}", &load_idx_x16)
                             .replace("{LOAD_INDEX}", &load_idx_str);
                         result.push(format!("\t{concrete}"));
                     }
@@ -1806,6 +1840,7 @@ mod tests {
             entry_name: None,
             scratch_f32_count: 0,
             scratch_b32_count: 0,
+            source: ALoadSource::Gmem,
         };
 
         let result = replace_a_loads_with_inline_fn(gemm_ptx, "param_0", &identity).unwrap();
@@ -1868,6 +1903,7 @@ mod tests {
             entry_name: None,
             scratch_f32_count: 1,
             scratch_b32_count: 0,
+            source: ALoadSource::Gmem,
         };
 
         let result = replace_a_loads_with_inline_fn(gemm_ptx, "param_0", &scale_comp).unwrap();

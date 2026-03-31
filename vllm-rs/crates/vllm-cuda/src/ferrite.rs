@@ -62,6 +62,15 @@ const MLP_BLOCK_PTX: &str = ptx_fusion::persistent_mlp_block!(
     "ferrite_mlp_block"
 );
 
+const MLP_REGTRANSFER_PTX: &str = ptx_fusion::register_transfer_mlp!(
+    "../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx",
+    "../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.derivations.json",
+    "../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx",
+    "../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.derivations.json",
+    "../ptx-fusion/kernels/vllm_silu_mul.ptx",
+    "ferrite_mlp_regtransfer"
+);
+
 // ── Tile configuration ──
 
 struct TileConfig {
@@ -80,8 +89,10 @@ pub struct FerriteCutlass {
     configs: Vec<TileConfig>,
     /// bf16 gemv kernel for M=1 decode (hand-written, coalesced).
     gemv: Option<CudaFunc>,
-    /// Fused MLP block kernel (gate_up → SiLU → down).
+    /// Fused MLP block kernel (gate_up → SiLU → down), persistent version.
     mlp_block: Option<CudaFunc>,
+    /// Register transfer MLP kernel (gate_up → SiLU → down), non-persistent.
+    mlp_regtransfer: Option<CudaFunc>,
     /// Device memory for global barrier counters (reused across launches).
     barrier_counters: *mut std::ffi::c_void,
 }
@@ -149,6 +160,15 @@ impl FerriteCutlass {
             }
         };
 
+        // Load register transfer MLP kernel (40KB SMEM: 24KB CUTLASS + 8KB gate + 8KB up)
+        let mlp_regtransfer = match load_flat_module(MLP_REGTRANSFER_PTX, "ferrite_mlp_regtransfer", 40960) {
+            Ok((module, func)) => Some(CudaFunc(module, func)),
+            Err(e) => {
+                eprintln!("ferrite: register transfer MLP kernel load failed (non-fatal): {e}");
+                None
+            }
+        };
+
         // Allocate barrier counters: [tile_counter(u32)] + [mtile_done array(u32 × max_mtiles)]
         // Max M in practice: 2048 tokens → ceil(2048/64) = 32 M-tiles. Allocate for 64.
         let barrier_alloc_bytes = 4 + 64 * 4; // 260 bytes
@@ -165,6 +185,7 @@ impl FerriteCutlass {
             configs,
             gemv,
             mlp_block,
+            mlp_regtransfer,
             barrier_counters: barrier_ptr,
         })
     }

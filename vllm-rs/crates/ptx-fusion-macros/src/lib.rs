@@ -1916,6 +1916,7 @@ pub fn prologue_identity_flat(input: TokenStream) -> TokenStream {
         entry_name: None,
         scratch_f32_count: 0,
         scratch_b32_count: 0,
+        source: fuse_general::ALoadSource::Gmem,
     };
     let after_prologue =
         fuse_general::replace_a_loads_with_inline_fn(&ptx_source, "param_0", &identity)
@@ -1962,6 +1963,7 @@ pub fn prologue_scale2_flat(input: TokenStream) -> TokenStream {
         entry_name: None,
         scratch_f32_count: 0,
         scratch_b32_count: 0,
+        source: fuse_general::ALoadSource::Gmem,
     };
 
     let after_prologue =
@@ -2006,6 +2008,7 @@ pub fn prologue_identity(input: TokenStream) -> TokenStream {
         entry_name: None,
         scratch_f32_count: 0,
         scratch_b32_count: 0,
+        source: fuse_general::ALoadSource::Gmem,
     };
 
     let mut result = fuse_general::replace_a_loads_with_inline_fn(&ptx_source, &hint, &identity)
@@ -2697,6 +2700,100 @@ pub fn persistent_mlp_block(input: proc_macro::TokenStream) -> proc_macro::Token
         };
 
     quote! { #persistent }.into()
+}
+
+/// Register transfer MLP block: gate_up → SiLU → down as a single non-persistent kernel.
+///
+/// Uses `fuse_gemm_pointwise_gemm` to fuse the gate_up and down GEMMs with SiLU+mul
+/// applied between them. The intermediate data stays in SMEM scratch — no GMEM round-trip.
+/// Non-persistent (1 barrier, full occupancy) vs the persistent approach (16 barriers).
+///
+/// Args: gate_up_ptx, gate_up_deriv, down_ptx, down_deriv, silu_ptx, name
+///
+/// Both GEMMs should be the 64×64×32 config (for SMEM budget at 2 blocks/SM).
+#[proc_macro]
+pub fn register_transfer_mlp(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let args: Vec<proc_macro::TokenTree> = input.into_iter().collect();
+    let mut strings = Vec::new();
+    for arg in &args {
+        if let proc_macro::TokenTree::Literal(lit) = arg {
+            let s = lit.to_string();
+            if s.starts_with('"') && s.ends_with('"') {
+                strings.push(s[1..s.len() - 1].to_string());
+            }
+        }
+    }
+    if strings.len() < 6 {
+        return quote! { compile_error!("register_transfer_mlp! expects 6 args: gate_up_ptx, gate_up_deriv, down_ptx, down_deriv, silu_ptx, name") }.into();
+    }
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let kernel_base = manifest_dir.parent().unwrap().join("ptx-fusion");
+    let read = |path: &str| -> Result<String, String> {
+        let full = kernel_base.join(path);
+        std::fs::read_to_string(&full).map_err(|e| format!("cannot read {}: {e}", full.display()))
+    };
+
+    macro_rules! rd {
+        ($idx:expr) => {
+            match read(&strings[$idx]) {
+                Ok(s) => s,
+                Err(e) => return quote! { compile_error!(#e) }.into(),
+            }
+        };
+    }
+    let gate_up_ptx = rd!(0);
+    let gate_up_deriv = rd!(1);
+    let down_ptx = rd!(2);
+    let down_deriv = rd!(3);
+    let _silu_ptx = rd!(4);
+    let name = &strings[5];
+
+    // Step 1: Perimeter-replace both GEMMs
+    let (prod_flat, _) = match perimeter::replace_perimeter(&gate_up_ptx, &gate_up_deriv, "producer") {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("producer perimeter: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+    let (cons_flat, _) = match perimeter::replace_perimeter(&down_ptx, &down_deriv, "consumer") {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("consumer perimeter: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    // Step 2: Build SiLU computation with SMEM sources
+    let computation = match pipeline_compile::build_silu_mul_computation_smem(
+        name,
+        "%r_gate_scratch",
+        "%r_up_scratch",
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("silu smem computation: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    // Step 3: Fuse via register transfer
+    let fused = match pipeline_compile::fuse_gemm_pointwise_gemm(
+        &prod_flat,
+        &cons_flat,
+        &computation,
+        &pipeline_compile::ProducerOutput::Paired { n_offset_tiles: 0 }, // set at runtime
+        name,
+    ) {
+        Ok(ptx) => ptx,
+        Err(e) => {
+            let msg = format!("fuse_gemm_pointwise_gemm: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    quote! { #fused }.into()
 }
 
 /// Count the total bytes of extra `.param` declarations before the flat struct

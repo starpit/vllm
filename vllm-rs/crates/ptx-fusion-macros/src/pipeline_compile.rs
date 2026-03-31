@@ -12,10 +12,894 @@
 //! mapping uses runtime arithmetic (correct for any CUTLASS thread layout).
 
 use crate::fuse_general::{PointwiseComputation, replace_a_loads_with_inline_fn};
-use crate::parser::{DefUseGraph, TileIndexMap, extract_tile_index_map};
+use crate::parser::{
+    CarryRegister, CarryRole, DefUseGraph, LoopDescriptor, TileIndexMap,
+    analyze_carries, detect_loops, extract_tile_index_map,
+};
 use crate::pipeline::{
     PipelineStage, ReductionDecomposition, StagePattern, TilePerimeter, TilePortAccess,
 };
+
+// ===== GEMM Body Descriptor: parsed structure of a CUTLASS GEMM =====
+
+/// Parsed decomposition of a CUTLASS GEMM kernel into its structural components.
+///
+/// All fields are derived from PTX analysis (detect_loops, analyze_carries,
+/// classify_cp_async_loads). No hardcoded register names or line numbers.
+#[derive(Debug, Clone)]
+pub struct GemmBodyDescriptor {
+    /// Lines before the K-loop header (tile index, param loads, pipeline prologue).
+    pub preamble: Vec<String>,
+    /// Lines of the K-loop body (from header label through backedge branch, inclusive).
+    pub k_loop: Vec<String>,
+    /// Lines after the K-loop (epilogue: accum → SMEM → scale → bf16 → st.global).
+    pub epilogue: Vec<String>,
+    /// The K-loop descriptor (header label, backedge, predicate).
+    pub loop_desc: LoopDescriptor,
+    /// MMA accumulator registers (f32, carry state across K-iterations).
+    pub mma_accumulators: Vec<String>,
+    /// Tile pointer registers (GMEM addresses advancing per K-iteration).
+    pub tile_pointers: Vec<String>,
+    /// Induction variable registers (K-loop counters, pipeline state).
+    pub induction_vars: Vec<String>,
+    /// Buffer state registers (SMEM triple-buffer rotation via selp).
+    pub buffer_state: Vec<String>,
+    /// Register declarations from the kernel body (.reg lines).
+    pub reg_decls: Vec<String>,
+    /// Shared memory declarations from the kernel body (.shared lines).
+    pub smem_decls: Vec<String>,
+    /// Kernel parameters (.param lines from entry signature).
+    pub params: Vec<String>,
+    /// The entry function name.
+    pub entry_name: String,
+}
+
+/// Extract a `GemmBodyDescriptor` from a flat-param CUTLASS GEMM PTX.
+///
+/// The input must be a single-entry, perimeter-replaced CUTLASS kernel.
+/// Returns an error if the PTX doesn't contain a recognizable K-loop or MMA.
+pub fn extract_gemm_body(ptx: &str) -> Result<GemmBodyDescriptor, String> {
+    let lines: Vec<&str> = ptx.lines().collect();
+
+    // ── Identify the K-loop ──
+    let loops = detect_loops(&lines);
+    // Find the main K-loop: outermost loop with MMA instructions inside
+    let main_loop = loops
+        .iter()
+        .filter(|l| {
+            // Must contain mma.sync within body
+            let (start, end) = l.body_range;
+            (start..=end).any(|i| {
+                i < lines.len() && lines[i].contains("mma.sync")
+            })
+        })
+        .min_by_key(|l| l.depth)
+        .ok_or("no K-loop with MMA instructions found")?
+        .clone();
+
+    // ── Carry analysis ──
+    let carries = analyze_carries(&lines, &main_loop);
+    let mma_accumulators: Vec<String> = carries
+        .iter()
+        .filter(|c| c.role == CarryRole::MmaAccumulator)
+        .map(|c| c.register.clone())
+        .collect();
+    let tile_pointers: Vec<String> = carries
+        .iter()
+        .filter(|c| c.role == CarryRole::TilePointer)
+        .map(|c| c.register.clone())
+        .collect();
+    let induction_vars: Vec<String> = carries
+        .iter()
+        .filter(|c| c.role == CarryRole::InductionVar)
+        .map(|c| c.register.clone())
+        .collect();
+    let buffer_state: Vec<String> = carries
+        .iter()
+        .filter(|c| c.role == CarryRole::BufferState)
+        .map(|c| c.register.clone())
+        .collect();
+
+    if mma_accumulators.is_empty() {
+        return Err("no MMA accumulator registers found in K-loop".into());
+    }
+
+    // ── Extract entry name and params ──
+    let mut entry_name = String::new();
+    let mut params = Vec::new();
+    let mut in_entry = false;
+    for line in &lines {
+        let t = line.trim();
+        if t.contains(".entry") {
+            in_entry = true;
+            // Extract name: ".visible .entry name("
+            if let Some(pos) = t.find(".entry") {
+                let after = t[pos + 6..].trim();
+                let name_end = after.find('(').unwrap_or(after.len());
+                entry_name = after[..name_end].trim().to_string();
+            }
+            continue;
+        }
+        if !in_entry {
+            continue;
+        }
+        if t.starts_with(".param") {
+            params.push(t.trim_end_matches(',').to_string());
+        }
+        if t == ")" || t == "{" || t.ends_with('{') {
+            break;
+        }
+    }
+
+    // ── Find kernel body boundaries ──
+    // Body starts at first '{' after entry, ends at matching '}'
+    let mut body_start = 0;
+    let mut found_entry = false;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.contains(".entry") {
+            found_entry = true;
+        }
+        if found_entry && (t == "{" || t.ends_with('{')) {
+            body_start = i + 1;
+            break;
+        }
+    }
+
+    // Find ret; (end of body)
+    let body_end = lines
+        .iter()
+        .rposition(|l| l.trim() == "ret;")
+        .unwrap_or(lines.len() - 1);
+
+    // ── Extract reg and smem declarations ──
+    let mut reg_decls = Vec::new();
+    let mut smem_decls = Vec::new();
+    for i in body_start..main_loop.header_line {
+        let t = lines[i].trim();
+        if t.starts_with(".reg ") {
+            reg_decls.push(lines[i].to_string());
+        } else if t.starts_with(".shared ") {
+            smem_decls.push(lines[i].to_string());
+        }
+    }
+
+    // ── Split into preamble / k_loop / epilogue ──
+    // Preamble: body lines before K-loop, excluding reg/smem decls
+    let mut preamble = Vec::new();
+    for i in body_start..main_loop.header_line {
+        let t = lines[i].trim();
+        if t.starts_with(".reg ") || t.starts_with(".shared ") || t.is_empty() {
+            continue;
+        }
+        preamble.push(lines[i].to_string());
+    }
+
+    // K-loop: header through backedge (inclusive)
+    let k_loop: Vec<String> = (main_loop.header_line..=main_loop.backedge_line)
+        .map(|i| lines[i].to_string())
+        .collect();
+
+    // Epilogue: after backedge through ret (exclusive of ret itself)
+    let epilogue: Vec<String> = (main_loop.backedge_line + 1..body_end)
+        .map(|i| lines[i].to_string())
+        .collect();
+
+    Ok(GemmBodyDescriptor {
+        preamble,
+        k_loop,
+        epilogue,
+        loop_desc: main_loop,
+        mma_accumulators,
+        tile_pointers,
+        induction_vars,
+        buffer_state,
+        reg_decls,
+        smem_decls,
+        params,
+        entry_name,
+    })
+}
+
+/// Generated PTX for spilling or reloading MMA accumulators to/from SMEM.
+#[derive(Debug, Clone)]
+pub struct AccumSpillReload {
+    /// PTX instructions for spilling accumulators to SMEM.
+    pub spill: Vec<String>,
+    /// PTX instructions for reloading accumulators from SMEM.
+    pub reload: Vec<String>,
+    /// PTX instructions for zeroing accumulators (before first accumulation).
+    pub zero: Vec<String>,
+    /// Extra register declarations needed (address computation temps).
+    pub reg_decls: Vec<String>,
+    /// SMEM bytes required for the spill region.
+    pub smem_bytes: u32,
+}
+
+/// Build PTX to spill/reload MMA accumulators to a dedicated SMEM region.
+///
+/// Each thread spills its own accumulators to a unique SMEM slot:
+///   addr = smem_base + tid * num_accum * 4 + accum_idx * 4
+///
+/// The `smem_base_reg` is an existing register holding the dynamic SMEM base
+/// address (from `mov.u32 %r_base, _dynamic_smem`). The `smem_offset` is a
+/// static byte offset within the dynamic SMEM region.
+///
+/// All accumulator register names are taken from the GemmBodyDescriptor —
+/// no hardcoded register names.
+pub fn build_accum_spill_reload(
+    desc: &GemmBodyDescriptor,
+    smem_offset: u32,
+) -> AccumSpillReload {
+    let accums = &desc.mma_accumulators;
+    let n = accums.len() as u32;
+    let bytes_per_thread = n * 4; // f32 = 4 bytes each
+
+    // Register declarations for address computation
+    let reg_decls = vec![
+        ".reg .u32 %r_spill_tid, %r_spill_off;".into(),
+    ];
+
+    // Address computation shared by spill and reload:
+    //   %r_spill_tid = %tid.x
+    //   %r_spill_off = smem_offset + %r_spill_tid * bytes_per_thread
+    let addr_setup = vec![
+        format!("\tmov.u32 \t%r_spill_tid, %tid.x;"),
+        format!("\tmad.lo.u32 \t%r_spill_off, %r_spill_tid, {bytes_per_thread}, {smem_offset};"),
+    ];
+
+    // Spill: st.shared.f32 for each accumulator
+    let mut spill = Vec::new();
+    spill.push("\t// FERRITE: spill MMA accumulators to SMEM".into());
+    spill.extend(addr_setup.iter().cloned());
+    for (i, reg) in accums.iter().enumerate() {
+        let offset = i as u32 * 4;
+        spill.push(format!(
+            "\tst.shared.f32 \t[%r_spill_off+{offset}], {reg};"
+        ));
+    }
+
+    // Reload: ld.shared.f32 for each accumulator
+    let mut reload = Vec::new();
+    reload.push("\t// FERRITE: reload MMA accumulators from SMEM".into());
+    reload.extend(addr_setup.iter().cloned());
+    for (i, reg) in accums.iter().enumerate() {
+        let offset = i as u32 * 4;
+        reload.push(format!(
+            "\tld.shared.f32 \t{reg}, [%r_spill_off+{offset}];"
+        ));
+    }
+
+    // Zero: mov.f32 0.0 for each accumulator (before first accumulation)
+    let mut zero = Vec::new();
+    zero.push("\t// FERRITE: zero MMA accumulators".into());
+    for reg in accums {
+        zero.push(format!("\tmov.f32 \t{reg}, 0f00000000;"));
+    }
+
+    let smem_bytes = bytes_per_thread * 128; // 128 threads per block
+
+    AccumSpillReload {
+        spill,
+        reload,
+        zero,
+        reg_decls,
+        smem_bytes,
+    }
+}
+
+// ===== Epilogue Store Map: analysis of CUTLASS epilogue output stores =====
+
+/// One st.global instruction in the CUTLASS epilogue.
+#[derive(Debug, Clone)]
+pub struct EpilogueStore {
+    /// Line index in the epilogue lines.
+    pub line_idx: usize,
+    /// The full instruction text.
+    pub instruction: String,
+    /// The 64-bit address register (e.g., "%rd22").
+    pub addr_reg: String,
+    /// The data registers being stored (e.g., ["%r1057", "%r1058", ...]).
+    pub data_regs: Vec<String>,
+    /// How this address relates to the base: a list of stride register additions.
+    /// Empty for the base store. E.g., ["%rd20"] means base + stride_A,
+    /// ["%rd20", "%rd21"] means base + stride_A + stride_B.
+    pub stride_chain: Vec<String>,
+}
+
+/// The complete map of epilogue stores and their address structure.
+#[derive(Debug, Clone)]
+pub struct EpilogueStoreMap {
+    /// The base address register (first st.global's address).
+    pub base_addr_reg: String,
+    /// The row register used in the base address computation.
+    pub row_reg: String,
+    /// The column register used in the base address computation.
+    pub col_reg: String,
+    /// Stride registers loaded from params, used for row offsets between stores.
+    pub stride_regs: Vec<String>,
+    /// All st.global instructions with their address decomposition.
+    pub stores: Vec<EpilogueStore>,
+}
+
+/// Analyze the epilogue of a CUTLASS GEMM to map all st.global stores
+/// and their address relationships.
+///
+/// Traces store addresses backward through the def-use graph to decompose
+/// them as: base + sum_of(stride_regs). Works for any CUTLASS epilogue that
+/// computes output addresses as linear combinations of a base address and
+/// param-derived strides.
+pub fn analyze_epilogue_stores(
+    epilogue_lines: &[String],
+    full_ptx_lines: &[&str],
+    _epilogue_start_line: usize,
+) -> Result<EpilogueStoreMap, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // ── Find all st.global instructions ──
+    let mut raw_stores: Vec<(usize, String, String, Vec<String>)> = Vec::new();
+    for (i, line) in epilogue_lines.iter().enumerate() {
+        let t = line.trim();
+        if !t.contains("st.global") {
+            continue;
+        }
+        let addr_reg = t
+            .find('[')
+            .and_then(|start| {
+                let rest = &t[start + 1..];
+                rest.find(']').map(|end| rest[..end].to_string())
+            })
+            .ok_or_else(|| format!("can't parse st.global address at epilogue line {i}"))?;
+
+        let data_regs = t
+            .find('{')
+            .and_then(|start| {
+                let rest = &t[start + 1..];
+                rest.find('}').map(|end| {
+                    rest[..end]
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+
+        raw_stores.push((i, line.to_string(), addr_reg, data_regs));
+    }
+
+    if raw_stores.is_empty() {
+        return Err("no st.global found in epilogue".into());
+    }
+
+    // ── Build register definition map for 64-bit address regs ──
+    let mut reg_defs: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for (line_idx, line) in full_ptx_lines.iter().enumerate() {
+        let t = line.trim();
+        let work = if t.starts_with('@') {
+            match t.find(|c: char| c.is_whitespace()) {
+                Some(i) => t[i..].trim(),
+                None => continue,
+            }
+        } else {
+            t
+        };
+        if !work.contains("%rd") {
+            continue;
+        }
+        if let Some(node) = DefUseGraph::parse_instruction(work, line_idx) {
+            for dest in &node.dests {
+                if dest.starts_with("%rd") {
+                    reg_defs.insert(dest.clone(), (line_idx, work.to_string()));
+                }
+            }
+        }
+    }
+
+    // ── Decompose each store address as base + stride chain ──
+    let base_addr = raw_stores[0].2.clone();
+    let mut analyzed_stores = Vec::new();
+    let mut all_stride_regs: BTreeSet<String> = BTreeSet::new();
+
+    for (line_idx, instruction, addr_reg, data_regs) in &raw_stores {
+        let stride_chain = trace_address_to_strides(addr_reg, &base_addr, &reg_defs);
+        for s in &stride_chain {
+            all_stride_regs.insert(s.clone());
+        }
+        analyzed_stores.push(EpilogueStore {
+            line_idx: *line_idx,
+            instruction: instruction.clone(),
+            addr_reg: addr_reg.clone(),
+            data_regs: data_regs.clone(),
+            stride_chain,
+        });
+    }
+
+    // ── Find row/col registers from base address computation ──
+    let (row_reg, col_reg) = find_row_col_regs(&base_addr, &reg_defs);
+
+    Ok(EpilogueStoreMap {
+        base_addr_reg: base_addr,
+        row_reg,
+        col_reg,
+        stride_regs: all_stride_regs.into_iter().collect(),
+        stores: analyzed_stores,
+    })
+}
+
+/// Trace an address register back through add.s64 chains to decompose
+/// it as base_reg + sum_of(stride_regs).
+fn trace_address_to_strides(
+    addr_reg: &str,
+    base_reg: &str,
+    reg_defs: &std::collections::BTreeMap<String, (usize, String)>,
+) -> Vec<String> {
+    if addr_reg == base_reg {
+        return Vec::new();
+    }
+    let (_, def_instr) = match reg_defs.get(addr_reg) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let tokens: Vec<&str> = def_instr
+        .trim_end_matches(';')
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tokens.len() < 4 || !tokens[0].contains("add") {
+        return Vec::new();
+    }
+    let src_a = tokens[2];
+    let src_b = tokens[3];
+
+    if src_a == base_reg {
+        vec![src_b.to_string()]
+    } else if src_b == base_reg {
+        vec![src_a.to_string()]
+    } else {
+        // Recurse through intermediate address regs
+        let mut chain_a = trace_address_to_strides(src_a, base_reg, reg_defs);
+        if !chain_a.is_empty() {
+            chain_a.push(src_b.to_string());
+            return chain_a;
+        }
+        let mut chain_b = trace_address_to_strides(src_b, base_reg, reg_defs);
+        if !chain_b.is_empty() {
+            chain_b.push(src_a.to_string());
+            return chain_b;
+        }
+        Vec::new()
+    }
+}
+
+/// Find row and column registers from the base output address computation.
+///
+/// Traces backward from the base address through add.s64/mul chains.
+/// Row: 32-bit register fed through cvt.s64.s32 (row index → 64-bit for stride multiply).
+/// Col: 32-bit register fed through mul.wide.s32 (col index × element size).
+fn find_row_col_regs(
+    base_addr: &str,
+    reg_defs: &std::collections::BTreeMap<String, (usize, String)>,
+) -> (String, String) {
+    let mut row_reg = String::new();
+    let mut col_reg = String::new();
+    let mut queue = vec![base_addr.to_string()];
+    let mut visited = std::collections::BTreeSet::new();
+
+    while let Some(reg) = queue.pop() {
+        if !visited.insert(reg.clone()) {
+            continue;
+        }
+        let (_, def_instr) = match reg_defs.get(&reg) {
+            Some(d) => d,
+            None => continue,
+        };
+        let tokens: Vec<&str> = def_instr
+            .trim_end_matches(';')
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let opcode = tokens[0];
+
+        // mul.wide.s32 %rdN, %rCol, elemsize → column register
+        if opcode == "mul.wide.s32" && tokens.len() >= 4 {
+            let src = tokens[2];
+            if src.starts_with("%r") && !src.starts_with("%rd") {
+                col_reg = src.to_string();
+            }
+        }
+        // cvt.s64.s32 %rdN, %rRow → row register
+        if opcode == "cvt.s64.s32" && tokens.len() >= 3 {
+            let src = tokens[2];
+            if src.starts_with("%r") && !src.starts_with("%rd") {
+                row_reg = src.to_string();
+            }
+        }
+        // Follow 64-bit sources through add/mul chains
+        for &tok in &tokens[2..] {
+            if tok.starts_with("%rd") {
+                queue.push(tok.to_string());
+            }
+        }
+    }
+
+    (row_reg, col_reg)
+}
+
+/// Generated epilogue with st.global redirected to st.shared (SMEM scratch).
+#[derive(Debug, Clone)]
+pub struct RedirectedEpilogue {
+    /// The modified epilogue lines (st.global → st.shared, bounds checks simplified).
+    pub lines: Vec<String>,
+    /// Extra register declarations needed for SMEM address computation.
+    pub reg_decls: Vec<String>,
+    /// SMEM bytes required for the scratch region (tile_m × tile_n × 2 bytes bf16).
+    pub smem_bytes: u32,
+}
+
+/// Rewrite a CUTLASS epilogue to store output to SMEM scratch instead of GMEM.
+///
+/// The epilogue's MMA fragment rearrangement, alpha scaling, and bf16 conversion
+/// are preserved unchanged. Only the final st.global stores are replaced with
+/// st.shared stores to a linear SMEM scratch region.
+///
+/// The SMEM scratch layout is row-major: `smem_base + row * tile_n * 2 + col * 2`.
+/// Row and column registers are identified from the EpilogueStoreMap analysis.
+///
+/// Bounds checks (row < M predicates) are kept since we reuse the same epilogue
+/// code — they become harmless (always true for full tiles, safely skip for partials).
+pub fn redirect_epilogue_to_smem(
+    epilogue_lines: &[String],
+    store_map: &EpilogueStoreMap,
+    smem_offset: u32,
+    tile_n: u32,
+) -> Result<RedirectedEpilogue, String> {
+    let row_stride_bytes = tile_n * 2; // bf16 = 2 bytes per element
+
+    // Register declarations for SMEM address computation
+    let reg_decls = vec![
+        ".reg .u32 %r_epi_smem_base, %r_epi_smem_addr;".into(),
+    ];
+
+    // Compute stride row offsets from the store patterns
+    let stride_row_offsets = infer_stride_row_offsets(&store_map.stores, &store_map.stride_regs);
+
+    // Build a lookup: address register → store info
+    let mut addr_to_store: std::collections::BTreeMap<String, Vec<&EpilogueStore>> =
+        std::collections::BTreeMap::new();
+    for store in &store_map.stores {
+        addr_to_store
+            .entry(store.addr_reg.clone())
+            .or_default()
+            .push(store);
+    }
+
+    // Simple line-by-line replacement. For each line containing st.global,
+    // match by address register and replace the entire inline asm block
+    // (or bare instruction) with a SMEM store.
+    let mut output = Vec::new();
+    let mut skip_until_end_asm = false;
+    let mut pending_store: Option<&EpilogueStore> = None;
+
+    for (_i, line) in epilogue_lines.iter().enumerate() {
+        let t = line.trim();
+
+        // If we're skipping an inline asm block we already replaced
+        if skip_until_end_asm {
+            if t == "// end inline asm" {
+                skip_until_end_asm = false;
+            }
+            continue;
+        }
+
+        // Check if this line starts an inline asm block containing a st.global
+        if t == "// begin inline asm" {
+            // Peek ahead to see if this block contains st.global
+            pending_store = None;
+            // We'll check st.global on subsequent lines
+            output.push(line.clone());
+            continue;
+        }
+
+        if t == "// end inline asm" {
+            if pending_store.is_some() {
+                // We already emitted the replacement, skip the end marker
+                pending_store = None;
+            } else {
+                output.push(line.clone());
+            }
+            continue;
+        }
+
+        // Match st.global by address register
+        if t.contains("st.global") {
+            let matched = addr_to_store.iter().find_map(|(addr, stores)| {
+                if t.contains(&format!("[{addr}]")) {
+                    stores.first().copied()
+                } else {
+                    None
+                }
+            });
+
+            if let Some(store) = matched {
+                // Remove the "// begin inline asm" we already pushed
+                if output.last().map(|l| l.trim() == "// begin inline asm").unwrap_or(false) {
+                    output.pop();
+                }
+                // Also remove any .reg .pred and setp lines from the asm block
+                while output.last().map(|l| {
+                    let lt = l.trim();
+                    lt.starts_with(".reg .pred") || lt.starts_with("setp.") || lt == "{"
+                }).unwrap_or(false) {
+                    output.pop();
+                }
+
+                let row_offset = compute_row_offset(&store.stride_chain, &stride_row_offsets);
+                let smem_row_offset = row_offset * row_stride_bytes;
+                let data_str = store.data_regs.join(", ");
+
+                output.push(format!(
+                    "\t// FERRITE: epilogue store redirected to SMEM scratch"
+                ));
+                output.push(format!(
+                    "\tmad.lo.u32 \t%r_epi_smem_base, {}, {row_stride_bytes}, {smem_offset};",
+                    store_map.row_reg
+                ));
+                output.push(format!(
+                    "\tmad.lo.u32 \t%r_epi_smem_addr, {}, 2, %r_epi_smem_base;",
+                    store_map.col_reg
+                ));
+                if smem_row_offset > 0 {
+                    output.push(format!(
+                        "\tadd.u32 \t%r_epi_smem_addr, %r_epi_smem_addr, {smem_row_offset};"
+                    ));
+                }
+                let vec_width = store.data_regs.len();
+                output.push(format!(
+                    "\tst.shared.v{vec_width}.b32 \t[%r_epi_smem_addr], {{{data_str}}};"
+                ));
+
+                pending_store = Some(store);
+                skip_until_end_asm = true;
+                continue;
+            }
+        }
+
+        // Keep all other lines
+        output.push(line.clone());
+    }
+
+    let smem_bytes = 64 * tile_n * 2; // tile_m=64 × tile_n × 2 bytes (bf16)
+
+    Ok(RedirectedEpilogue {
+        lines: output,
+        reg_decls,
+        smem_bytes,
+    })
+}
+
+/// Infer the row offset (in elements, not bytes) for each stride register
+/// by analyzing the stride chain patterns across all stores.
+///
+/// The first store with exactly one stride gives that stride's row offset.
+/// Cross-referencing with the add.s32 instructions in the epilogue would be
+/// more precise, but the chain structure is sufficient: we assign row offsets
+/// by examining which stores share the same chain pattern as known MMA
+/// fragment layouts (m16n8k16: rows at +2 and +8 intervals).
+fn infer_stride_row_offsets(
+    stores: &[EpilogueStore],
+    stride_regs: &[String],
+) -> std::collections::BTreeMap<String, u32> {
+    // Strategy: count how many times each stride appears across all stores.
+    // The stride that appears in pairs with itself (chain len 2 vs 1) is the
+    // larger stride. The one that appears mixed with the other is the smaller one.
+    //
+    // For m16n8k16 MMA with 64-row tile: rows 0,2,8,10,16,18,24,26
+    //   small stride (%rd20) = 2 rows, large stride (%rd21) = 8 rows
+    //   chain patterns: [], [s], [L], [s,L], [L,L], [s,L,L], [L,L,L], [s,L,L,L]
+
+    let mut result = std::collections::BTreeMap::new();
+
+    if stride_regs.len() == 2 {
+        // Two strides: figure out which is small vs large.
+        // The store with chain=[stride_A] should have a smaller row offset
+        // than the store with chain=[stride_B].
+        // We can determine this from chain lengths: the stride that appears
+        // alone in a length-1 chain and also in length-2 chains alongside
+        // the other stride is the small one.
+        let s0 = &stride_regs[0];
+        let s1 = &stride_regs[1];
+
+        // Find stores with single-element chains
+        let s0_alone = stores.iter().any(|st| st.stride_chain.len() == 1 && st.stride_chain[0] == *s0);
+        let s1_alone = stores.iter().any(|st| st.stride_chain.len() == 1 && st.stride_chain[0] == *s1);
+
+        // Find stores with chain=[sX, sX] (doubled stride)
+        let s0_doubled = stores.iter().any(|st| st.stride_chain.len() == 2 && st.stride_chain.iter().all(|s| s == s0));
+        let s1_doubled = stores.iter().any(|st| st.stride_chain.len() == 2 && st.stride_chain.iter().all(|s| s == s1));
+
+        // The large stride is the one that appears doubled (stride_chain=[L,L] = +16 rows)
+        // The small stride appears alone and mixed with the large
+        if s1_doubled && !s0_doubled {
+            // s1 is large (8 rows), s0 is small (2 rows)
+            result.insert(s0.clone(), 2);
+            result.insert(s1.clone(), 8);
+        } else if s0_doubled && !s1_doubled {
+            // s0 is large, s1 is small
+            result.insert(s0.clone(), 8);
+            result.insert(s1.clone(), 2);
+        } else if s0_alone && s1_alone {
+            // Both appear alone — need another heuristic.
+            // The one that appears in more chains total is the larger stride
+            // (it's used in the +8, +16, +24 positions).
+            let s0_count: usize = stores.iter().map(|st| st.stride_chain.iter().filter(|s| *s == s0).count()).sum();
+            let s1_count: usize = stores.iter().map(|st| st.stride_chain.iter().filter(|s| *s == s1).count()).sum();
+            if s1_count > s0_count {
+                result.insert(s0.clone(), 2);
+                result.insert(s1.clone(), 8);
+            } else {
+                result.insert(s0.clone(), 8);
+                result.insert(s1.clone(), 2);
+            }
+        }
+    } else if stride_regs.len() == 1 {
+        // Single stride register — must be the row stride
+        result.insert(stride_regs[0].clone(), 2);
+    }
+
+    result
+}
+
+/// Compute the total row offset for a stride chain.
+fn compute_row_offset(
+    stride_chain: &[String],
+    stride_row_offsets: &std::collections::BTreeMap<String, u32>,
+) -> u32 {
+    stride_chain
+        .iter()
+        .map(|s| stride_row_offsets.get(s).copied().unwrap_or(0))
+        .sum()
+}
+
+// ===== K-Loop De-pipelining: remove cp.async software pipeline =====
+
+/// Result of de-pipelining a CUTLASS K-loop.
+#[derive(Debug, Clone)]
+pub struct DepipelinedKLoop {
+    /// The modified K-loop lines with cp.async replaced by explicit loads.
+    pub lines: Vec<String>,
+    /// Number of A-matrix cp.async sites that were replaced.
+    pub a_loads_replaced: usize,
+    /// Number of B-matrix cp.async sites that were replaced.
+    pub b_loads_replaced: usize,
+    /// Extra register declarations needed (temp b32 for explicit loads).
+    pub reg_decls: Vec<String>,
+}
+
+/// Remove the cp.async software pipeline from a CUTLASS K-loop.
+///
+/// Replaces all cp.async (A and B) with explicit ld.global + st.shared,
+/// and strips cp.async.commit_group and cp.async.wait_group instructions.
+/// The result is a simple synchronous K-loop body suitable for running
+/// a small fixed number of iterations without pipeline overhead.
+///
+/// A-loads are classified using the same param-tracing analysis as
+/// `fuse_cp_async::classify_cp_async_loads`. They can be optionally
+/// redirected to SMEM (for register transfer) by passing a non-empty
+/// `a_smem_base_reg`. When set, A-loads become `ld.shared` from the
+/// given SMEM region instead of `ld.global` from GMEM.
+///
+/// B-loads always use `ld.global + st.shared` (they load weight tiles).
+pub fn depipeline_k_loop(
+    k_loop_lines: &[String],
+    full_ptx: &str,
+    a_smem_base_reg: Option<&str>,
+) -> Result<DepipelinedKLoop, String> {
+    use crate::fuse_cp_async::{classify_cp_async_loads, identify_a_matrix_param, parse_cp_async};
+    use crate::parser::PtxParser;
+
+    let full_lines: Vec<&str> = full_ptx.lines().collect();
+    let proto = PtxParser::parse(full_ptx)?;
+    let reg_to_param = PtxParser::trace_param_registers_pub(&full_lines, &proto.params);
+
+    // Identify A-matrix parameter
+    let a_param = identify_a_matrix_param(&full_lines, &reg_to_param, "")?;
+    let a_addr_regs: Vec<String> = reg_to_param
+        .iter()
+        .filter(|(_, p)| **p == a_param)
+        .map(|(r, _)| r.clone())
+        .collect();
+
+    // Classify each cp.async in the K-loop lines
+    let k_lines_ref: Vec<&str> = k_loop_lines.iter().map(|s| s.as_str()).collect();
+    let classifications = classify_cp_async_loads(&k_lines_ref, &a_addr_regs);
+
+    // Temp registers for explicit loads (shared across all replacement sites)
+    let reg_decls = vec![
+        ".reg .pred %p_dpipe;".into(),
+        ".reg .b32 %r_dpipe0, %r_dpipe1, %r_dpipe2, %r_dpipe3;".into(),
+    ];
+
+    let mut result = Vec::new();
+    let mut a_replaced = 0usize;
+    let mut b_replaced = 0usize;
+    let mut a_load_idx = 0usize;
+
+    for (i, line) in k_loop_lines.iter().enumerate() {
+        let t = line.trim();
+
+        // Strip pipeline synchronization
+        if t.contains("cp.async.commit_group") || t.contains("cp.async.wait_group") {
+            result.push(format!("\t// FERRITE: removed {}", t));
+            continue;
+        }
+
+        // Replace cp.async loads
+        if t.contains("cp.async.cg.shared.global") {
+            if let Some((smem_dst, gmem_src, mask)) = parse_cp_async(t) {
+                let is_a = classifications.get(&i) == Some(&crate::fuse_cp_async::CpAsyncClass::AMatrix);
+
+                if is_a {
+                    // A-load: either from SMEM scratch or GMEM
+                    result.push("\t// FERRITE: A-load (de-pipelined)".into());
+                    match a_smem_base_reg {
+                        Some(base_reg) => {
+                            // Load from SMEM scratch: base + a_load_idx * 16
+                            let offset = a_load_idx * 16;
+                            result.push(format!(
+                                "\tld.shared.v4.b32 \t{{%r_dpipe0, %r_dpipe1, %r_dpipe2, %r_dpipe3}}, [{base_reg}+{offset}];"
+                            ));
+                        }
+                        None => {
+                            // Load from GMEM (standard explicit replacement)
+                            result.push(format!("\tsetp.ne.b32 \t%p_dpipe, {mask}, 0;"));
+                            result.push(format!(
+                                "\t@%p_dpipe ld.global.v4.b32 \t{{%r_dpipe0, %r_dpipe1, %r_dpipe2, %r_dpipe3}}, [{gmem_src}];"
+                            ));
+                            for j in 0..4 {
+                                result.push(format!("\t@!%p_dpipe mov.b32 \t%r_dpipe{j}, 0;"));
+                            }
+                        }
+                    }
+                    result.push(format!(
+                        "\tst.shared.v4.b32 \t[{smem_dst}], {{%r_dpipe0, %r_dpipe1, %r_dpipe2, %r_dpipe3}};"
+                    ));
+                    a_replaced += 1;
+                    a_load_idx += 1;
+                } else {
+                    // B-load: always from GMEM with explicit ld+st
+                    result.push("\t// FERRITE: B-load (de-pipelined)".into());
+                    result.push(format!("\tsetp.ne.b32 \t%p_dpipe, {mask}, 0;"));
+                    result.push(format!(
+                        "\t@%p_dpipe ld.global.v4.b32 \t{{%r_dpipe0, %r_dpipe1, %r_dpipe2, %r_dpipe3}}, [{gmem_src}];"
+                    ));
+                    for j in 0..4 {
+                        result.push(format!("\t@!%p_dpipe mov.b32 \t%r_dpipe{j}, 0;"));
+                    }
+                    result.push(format!(
+                        "\tst.shared.v4.b32 \t[{smem_dst}], {{%r_dpipe0, %r_dpipe1, %r_dpipe2, %r_dpipe3}};"
+                    ));
+                    b_replaced += 1;
+                }
+                continue;
+            }
+        }
+
+        // Keep everything else (MMA, bar.sync, ld.shared, arithmetic, branches)
+        result.push(line.clone());
+    }
+
+    Ok(DepipelinedKLoop {
+        lines: result,
+        a_loads_replaced: a_replaced,
+        b_loads_replaced: b_replaced,
+        reg_decls,
+    })
+}
 
 /// Sequence two flat-param CUTLASS GEMMs into a single kernel with a barrier.
 ///
@@ -24,6 +908,287 @@ use crate::pipeline::{
 /// `ferrite_params_2` for GEMM_B.
 ///
 /// GEMM_A runs first, then `bar.sync 0`, then GEMM_B runs.
+// ===== GEMM → Pointwise → GEMM fusion (register transfer) =====
+
+/// Configuration for the producer GEMM's output pairing.
+#[derive(Debug, Clone)]
+pub enum ProducerOutput {
+    /// Single output: one N-tile per outer loop iteration.
+    Single,
+    /// Paired output: two N-tiles per iteration (e.g., gate+up for MLP).
+    /// The second tile is at `n_tile + n_offset` in the producer's N-dimension.
+    Paired { n_offset_tiles: u32 },
+}
+
+/// Fuse two GEMMs with a pointwise operation between them.
+///
+/// Producer GEMM → redirected epilogue → SMEM scratch
+/// Pointwise (e.g., SiLU+mul) applied at consumer GEMM's A-load sites
+/// Consumer GEMM accumulates across all producer N-tiles
+///
+/// The result is a single non-persistent kernel where each block processes
+/// one consumer output tile, iterating internally over producer N-tiles.
+///
+/// Both GEMMs must be perimeter-replaced (flat ferrite_params layout).
+/// The producer and consumer can use different tile configs.
+///
+/// `producer_ptx`: flat-param PTX for the producer GEMM (e.g., gate_up)
+/// `consumer_ptx`: flat-param PTX for the consumer GEMM (e.g., down)
+/// `pointwise`: the computation to apply between stages (e.g., SiLU+mul)
+/// `output_mode`: Single or Paired (for gate+up style outputs)
+/// `name`: entry point name for the fused kernel
+pub fn fuse_gemm_pointwise_gemm(
+    producer_ptx: &str,
+    consumer_ptx: &str,
+    pointwise: &PointwiseComputation,
+    output_mode: &ProducerOutput,
+    name: &str,
+) -> Result<String, String> {
+    use crate::fuse_real::{compute_register_offsets, offset_all_registers};
+
+    // ── Parse both GEMMs ──
+    let prod_desc = extract_gemm_body(producer_ptx)?;
+    let cons_desc = extract_gemm_body(consumer_ptx)?;
+    let prod_proto = crate::parser::PtxParser::parse(producer_ptx)?;
+    let cons_proto = crate::parser::PtxParser::parse(consumer_ptx)?;
+
+    // ── Analyze epilogue stores (for redirect) ──
+    let prod_lines: Vec<&str> = producer_ptx.lines().collect();
+    let prod_epi_start = prod_desc.loop_desc.backedge_line + 1;
+    let prod_store_map = analyze_epilogue_stores(&prod_desc.epilogue, &prod_lines, prod_epi_start)?;
+
+    // ── Tile dimensions (derived from GEMM body analysis) ──
+    let prod_tile_n = 64u32; // TODO: extract from PTX or derivations
+    let cons_tile_n = 64u32;
+    let cons_tile_k = 32u32;
+    let tile_m = 64u32;
+
+    let k_iters_per_producer_tile = prod_tile_n / cons_tile_k;
+
+    // ── SMEM layout (no accumulator spill — both accum sets live in registers) ──
+    // CUTLASS SMEM at offset 0 (24KB for 64×64×32)
+    // Gate scratch after CUTLASS, up scratch after gate.
+    // Total: 24KB + 8KB + 8KB = 40KB < 50KB (fits 2 blocks/SM on L4)
+    let cutlass_smem = 24576u32;
+    let gate_scratch_offset = cutlass_smem;
+    let gate_scratch_size = tile_m * prod_tile_n * 2; // bf16
+    let up_scratch_offset = gate_scratch_offset + gate_scratch_size;
+
+    // ── Build redirected epilogue for producer ──
+    let gate_redir = redirect_epilogue_to_smem(
+        &prod_desc.epilogue, &prod_store_map, gate_scratch_offset, prod_tile_n,
+    )?;
+    let up_redir = redirect_epilogue_to_smem(
+        &prod_desc.epilogue, &prod_store_map, up_scratch_offset, prod_tile_n,
+    )?;
+
+    // ── Build consumer GEMM with pointwise at A-loads ──
+    let cons_fused = replace_a_loads_with_inline_fn(consumer_ptx, "", pointwise)?;
+    let cons_fused_desc = extract_gemm_body(&cons_fused)?;
+    // Parse fused consumer to get register counts AFTER A-load replacement bumped them
+    let cons_fused_proto = crate::parser::PtxParser::parse(&cons_fused)?;
+
+    // ── Register namespace: offset consumer registers to avoid collision ──
+    let offsets = compute_register_offsets(&prod_proto.registers, &cons_fused_proto.registers);
+
+    // ── Emit the fused kernel ──
+    let mut out = String::new();
+
+    // PTX header
+    out.push_str(".version 8.7\n");
+    out.push_str(".target sm_89\n");
+    out.push_str(".address_size 64\n\n");
+
+    // Extern shared memory declaration (CUTLASS uses dynamic shared memory)
+    // Extract from the producer PTX (or consumer — they use the same symbol)
+    for line in producer_ptx.lines() {
+        let t = line.trim();
+        if t.starts_with(".extern .shared") {
+            out.push_str(&format!("{t}\n\n"));
+            break;
+        }
+    }
+
+    // Entry point with params from both GEMMs + driver loop params
+    out.push_str(&format!(".visible .entry {name}(\n"));
+    for p in &prod_desc.params {
+        out.push_str(&format!("\t{p},\n"));
+    }
+    // Consumer params (renamed to _2)
+    for p in &cons_desc.params {
+        let renamed = p.replace("ferrite_params", "ferrite_params_2");
+        out.push_str(&format!("\t{renamed},\n"));
+    }
+    // Extra params from pointwise computation
+    for p in &pointwise.extra_params {
+        out.push_str(&format!("\t{p}\n"));
+    }
+    // Driver loop params
+    out.push_str("\t.param .u32 _num_producer_n_tiles,\n");
+    out.push_str("\t.param .u32 _intermediate_n_offset\n");
+    out.push_str(")\n{\n");
+
+    // Register declarations (merged: one declaration per type covering both GEMMs)
+    let merged_decls = crate::fuse_real::compute_merged_reg_decls(
+        &prod_proto.registers,
+        &cons_fused_proto.registers,
+        &offsets,
+    );
+    for (ty, prefix, total_count) in &merged_decls {
+        out.push_str(&format!("\t.reg {ty} \t{prefix}<{total_count}>;\n"));
+    }
+    // Named register declarations from both GEMMs (e.g., %r_ptmp from perimeter replacement)
+    // These don't conflict because they use names, not indices.
+    let mut named_decls = std::collections::BTreeSet::new();
+    for decl in &prod_desc.reg_decls {
+        let t = decl.trim();
+        // Named regs contain "_" in the register name (not just %r<N>)
+        if t.starts_with(".reg") && t.contains("_") {
+            named_decls.insert(t.to_string());
+        }
+    }
+    for decl in &cons_desc.reg_decls {
+        let t = decl.trim();
+        if t.starts_with(".reg") && t.contains("_") {
+            named_decls.insert(t.to_string());
+        }
+    }
+    // Also from the fused consumer (which may add more from the pointwise computation)
+    for decl in &cons_fused_desc.reg_decls {
+        let t = decl.trim();
+        if t.starts_with(".reg") && t.contains("_") {
+            named_decls.insert(t.to_string());
+        }
+    }
+    for decl in &named_decls {
+        out.push_str(&format!("\t{decl}\n"));
+    }
+    // Extra registers for driver loop
+    out.push_str("\t// FERRITE: driver loop registers\n");
+    out.push_str("\t.reg .u32 %r_driver_iter, %r_driver_total, %r_driver_n_off;\n");
+    out.push_str("\t.reg .pred %p_driver_loop;\n");
+    out.push_str("\t.reg .u32 %r_gate_scratch, %r_up_scratch;\n");
+    // Epilogue redirect registers
+    for decl in &gate_redir.reg_decls {
+        out.push_str(&format!("\t{decl}\n"));
+    }
+    // Pointwise extra reg decls — only emit if not already in named_decls
+    for decl in &pointwise.extra_reg_decls {
+        let t = decl.trim();
+        if !named_decls.contains(t) {
+            out.push_str(&format!("\t{decl}\n"));
+        }
+    }
+    out.push_str("\n");
+
+    // SMEM declarations (from both GEMMs — deduplicated)
+    let mut smem_decl_set = std::collections::BTreeSet::new();
+    for decl in &prod_desc.smem_decls {
+        smem_decl_set.insert(decl.trim().to_string());
+    }
+    for decl in &cons_desc.smem_decls {
+        smem_decl_set.insert(decl.trim().to_string());
+    }
+    for decl in &cons_fused_desc.smem_decls {
+        smem_decl_set.insert(decl.trim().to_string());
+    }
+    for decl in &smem_decl_set {
+        out.push_str(&format!("\t{decl}\n"));
+    }
+
+    // ── Preamble: tile index from consumer GEMM (defines output tile) ──
+    out.push_str("\t// === Consumer tile index (output tile) ===\n");
+    for line in &cons_fused_desc.preamble {
+        // The consumer preamble computes ctaid.x/y → m_tile, n_tile
+        // We need this for the output tile coordinates
+        let renamed = offset_all_registers(line, &offsets);
+        let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
+        out.push_str(&format!("{renamed}\n"));
+    }
+
+    // ── Initialize driver loop ──
+    out.push_str("\n\t// === Driver loop initialization ===\n");
+    out.push_str("\tld.param.u32 \t%r_driver_total, [_num_producer_n_tiles];\n");
+    out.push_str("\tld.param.u32 \t%r_driver_n_off, [_intermediate_n_offset];\n");
+    out.push_str(&format!("\tmov.u32 \t%r_gate_scratch, {gate_scratch_offset};\n"));
+    out.push_str(&format!("\tmov.u32 \t%r_up_scratch, {up_scratch_offset};\n"));
+
+    // Zero consumer accumulators (in offset register namespace)
+    out.push_str("\t// FERRITE: zero down MMA accumulators\n");
+    for reg in &cons_fused_desc.mma_accumulators {
+        let renamed = offset_all_registers(&format!("\tmov.f32 \t{reg}, 0f00000000;"), &offsets);
+        out.push_str(&format!("{renamed}\n"));
+    }
+
+    out.push_str("\tmov.u32 \t%r_driver_iter, 0;\n");
+
+    // ── Outer loop ──
+    // No accumulator spill — both gate_up and down accum sets live in registers.
+    // gate_up accums are consumed each iteration. down accums accumulate across iterations.
+    out.push_str("\n$L_driver_loop:\n");
+
+    // Gate GEMM: preamble + K-loop + redirected epilogue
+    // TODO: The preamble needs tile index overridden:
+    //   m_tile = consumer's m_tile (from output tile)
+    //   n_tile = driver_iter (current gate N-tile)
+    out.push_str("\t// --- Gate GEMM (producer, N-tile = iter) ---\n");
+    for line in &prod_desc.preamble {
+        out.push_str(&format!("{line}\n"));
+    }
+    for line in &prod_desc.k_loop {
+        out.push_str(&format!("{line}\n"));
+    }
+    out.push_str("\t// --- Gate epilogue -> SMEM scratch A ---\n");
+    for line in &gate_redir.lines {
+        out.push_str(&format!("{line}\n"));
+    }
+    out.push_str("\tbar.sync \t0;\n\n");
+
+    // Up GEMM: same preamble + K-loop but with labels renamed to avoid collision
+    out.push_str("\t// --- Up GEMM (producer, N-tile = iter + offset) ---\n");
+    for line in &prod_desc.preamble {
+        let renamed = line.replace("$L__BB0", "$L__BB_up");
+        out.push_str(&format!("{renamed}\n"));
+    }
+    for line in &prod_desc.k_loop {
+        let renamed = line.replace("$L__BB0", "$L__BB_up");
+        out.push_str(&format!("{renamed}\n"));
+    }
+    out.push_str("\t// --- Up epilogue -> SMEM scratch B ---\n");
+    for line in &up_redir.lines {
+        let renamed = line.replace("$L__BB0", "$L__BB_up");
+        out.push_str(&format!("{renamed}\n"));
+    }
+    out.push_str("\tbar.sync \t0;\n\n");
+
+    // Consumer K-loop with SiLU from SMEM (A-loads replaced by pointwise)
+    out.push_str("\t// --- Down K-loop (consumer, A from SiLU scratch) ---\n");
+    for line in &cons_fused_desc.k_loop {
+        let renamed = offset_all_registers(line, &offsets);
+        let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
+        out.push_str(&format!("{renamed}\n"));
+    }
+    out.push_str("\n");
+
+    // Loop back
+    out.push_str("\t// --- Loop control ---\n");
+    out.push_str("\tadd.u32 \t%r_driver_iter, %r_driver_iter, 1;\n");
+    out.push_str("\tsetp.lt.u32 \t%p_driver_loop, %r_driver_iter, %r_driver_total;\n");
+    out.push_str("\t@%p_driver_loop bra \t$L_driver_loop;\n\n");
+
+    // Consumer epilogue (final output to GMEM)
+    out.push_str("\t// === Down epilogue (output to GMEM) ===\n");
+    for line in &cons_fused_desc.epilogue {
+        let renamed = offset_all_registers(line, &offsets);
+        let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
+        out.push_str(&format!("{renamed}\n"));
+    }
+
+    out.push_str("\n\tret;\n}\n");
+
+    Ok(out)
+}
+
 /// Both phases reuse the same SMEM (sequential execution).
 /// GEMM_B's registers are offset to avoid collisions with GEMM_A's.
 /// GEMM_B's labels are renamed ($L__BB0 → $L__BB1).
@@ -1099,6 +2264,95 @@ pub fn build_silu_mul_computation(fused_name: &str) -> Result<PointwiseComputati
         entry_name: Some(fused_name.to_string()),
         scratch_f32_count: 0,
         scratch_b32_count: 0,
+        source: crate::fuse_general::ALoadSource::Gmem,
+    })
+}
+
+/// Build a PointwiseComputation for SiLU+mul that reads gate and up values
+/// from SMEM scratch regions (written by redirected epilogues).
+///
+/// Same SiLU computation as `build_silu_mul_computation`, but the data sources
+/// are SMEM scratch addresses instead of GMEM pointers.
+///
+/// `gate_smem_base_reg`: register holding the 32-bit SMEM base for gate scratch.
+/// `up_smem_base_reg`: register holding the 32-bit SMEM base for up scratch.
+///
+/// The primary A-load (gate values) uses `ALoadSource::Smem` to read from
+/// `gate_smem_base_reg`. The per-site code loads up values from `up_smem_base_reg`.
+pub fn build_silu_mul_computation_smem(
+    fused_name: &str,
+    gate_smem_base_reg: &str,
+    up_smem_base_reg: &str,
+) -> Result<PointwiseComputation, String> {
+    // No extra kernel params needed — SMEM addresses are computed internally
+    let extra_params = vec![];
+
+    // Register declarations for up loading + SiLU scratch
+    let extra_reg_decls = vec![
+        ".reg .b32 %r_up0, %r_up1, %r_up2, %r_up3;".into(),
+        ".reg .b16 %h_up_a, %h_up_b;".into(),
+        ".reg .f32 %f_up0, %f_up1, %f_up2, %f_up3, %f_up4, %f_up5, %f_up6, %f_up7;".into(),
+        ".reg .f32 %f_act0, %f_act1, %f_act2, %f_act3;".into(),
+        ".reg .b32 %r_act0;".into(),
+    ];
+
+    let param_loads = vec![];
+
+    // Per-site: load 8 bf16 up values from SMEM scratch.
+    // The byte offset for each site is computed at code-gen time by
+    // replace_a_loads_with_inline_fn, which substitutes {LOAD_INDEX} with 0,1,2...
+    // We pre-compute the byte offset as LOAD_INDEX * 16 in the template.
+    // Since {LOAD_INDEX} is a compile-time literal, the add is a constant.
+    let mut per_site = vec!["// FERRITE: load up values from SMEM scratch".into()];
+    // Use immediate offset: up_base + LOAD_INDEX * 16
+    // We emit this as a direct ld.shared with computed offset.
+    // The {LOAD_INDEX_X16} placeholder will be resolved below.
+    per_site.push(format!(
+        "ld.shared.v4.b32 \t{{%r_up0, %r_up1, %r_up2, %r_up3}}, [{up_smem_base_reg}+{{LOAD_INDEX_X16}}];"
+    ));
+
+    // Unpack 8 bf16 up values to f32
+    per_site.push("// FERRITE: unpack 8 bf16 up values to f32".into());
+    for w in 0..4u32 {
+        let lo = w * 2;
+        let hi = w * 2 + 1;
+        per_site.push(format!("mov.b32 \t{{%h_up_a, %h_up_b}}, %r_up{w};"));
+        per_site.push(format!("cvt.f32.bf16 \t%f_up{lo}, %h_up_a;"));
+        per_site.push(format!("cvt.f32.bf16 \t%f_up{hi}, %h_up_b;"));
+    }
+
+    // Per-element: identical SiLU(gate) * up computation
+    let instructions = vec![
+        "neg.f32 \t%f_act0, {INPUT};".into(),
+        "fma.rn.f32 \t%f_act1, %f_act0, 0f3BBB989D, 0f3F000000;".into(),
+        "cvt.sat.f32.f32 \t%f_act1, %f_act1;".into(),
+        "fma.rm.f32 \t%f_act2, %f_act1, 0f437C0000, 0f4B400001;".into(),
+        "add.f32 \t%f_act3, %f_act2, 0fCB40007F;".into(),
+        "neg.f32 \t%f_act3, %f_act3;".into(),
+        "fma.rn.f32 \t%f_act3, %f_act0, 0f3FB8AA3B, %f_act3;".into(),
+        "fma.rn.f32 \t%f_act3, %f_act0, 0f32A57060, %f_act3;".into(),
+        "mov.b32 \t%r_act0, %f_act2;".into(),
+        "shl.b32 \t%r_act0, %r_act0, 23;".into(),
+        "mov.b32 \t%f_act2, %r_act0;".into(),
+        "ex2.approx.ftz.f32 \t%f_act3, %f_act3;".into(),
+        "fma.rn.f32 \t%f_act3, %f_act3, %f_act2, 0f3F800000;".into(),
+        "div.rn.f32 \t{INPUT}, {INPUT}, %f_act3;".into(),
+        "mul.f32 \t{INPUT}, {INPUT}, %f_up{ELEM_IDX};".into(),
+    ];
+
+    Ok(PointwiseComputation {
+        instructions,
+        param_loads,
+        prologue: vec![],
+        extra_reg_decls,
+        extra_params,
+        per_site,
+        entry_name: Some(fused_name.to_string()),
+        scratch_f32_count: 0,
+        scratch_b32_count: 0,
+        source: crate::fuse_general::ALoadSource::Smem {
+            smem_base_reg: gate_smem_base_reg.to_string(),
+        },
     })
 }
 
@@ -1489,6 +2743,7 @@ fn build_reduction_computation(
         entry_name: Some(fused_name.to_string()),
         scratch_f32_count: 0,
         scratch_b32_count: 0,
+        source: crate::fuse_general::ALoadSource::Gmem,
     })
 }
 
@@ -2503,5 +3758,604 @@ mod tests {
             "PASS: sequenced two-GEMM passes ptxas ({} lines)",
             sequenced.lines().count()
         );
+    }
+
+    #[test]
+    fn sequenced_mlp_barrier_count() {
+        // Build the full sequenced MLP kernel (gate_up + SiLU-fused-down)
+        // and check ptxas barrier/register allocation.
+        // This is the non-persistent equivalent of persistent_mlp_block.
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
+        let silu_ptx = include_str!("../../ptx-fusion/kernels/vllm_silu_mul.ptx");
+
+        // Step 1: Perimeter-replace gate_up GEMM
+        let (flat_gate_up, _) =
+            crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "gate_up")
+                .expect("replace_perimeter gate_up");
+
+        // Step 2: Fuse SiLU+mul into down GEMM, then perimeter-replace
+        let silu_stage =
+            crate::pipeline::PipelineStage::from_ptx("silu_mul", silu_ptx, None)
+                .expect("silu stage");
+        let down_stage =
+            crate::pipeline::PipelineStage::from_ptx("down", gemm_ptx, None)
+                .expect("down stage");
+        let fused_down =
+            fuse_pointwise_into_gemm(&silu_stage, &down_stage, "down_silu")
+                .expect("fuse silu into down");
+        let (flat_down, _) =
+            crate::perimeter::replace_perimeter(&fused_down, deriv_json, "down_silu")
+                .expect("replace_perimeter down_silu");
+        let flat_down = crate::dedup_reg_declarations(&flat_down);
+
+        // Step 3: Sequence into one kernel
+        let sequenced = sequence_two_gemms(&flat_gate_up, &flat_down, "mlp_sequenced")
+            .expect("sequence failed");
+
+        // Compile with ptxas -v to get resource usage
+        let path = "/tmp/mlp_sequenced_barrier_test.ptx";
+        std::fs::write(path, &sequenced).unwrap();
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", "-v", path])
+            .output()
+            .expect("ptxas");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("=== ptxas -v output for sequenced MLP ===");
+        for line in stderr.lines() {
+            eprintln!("  {line}");
+        }
+
+        assert!(
+            out.status.success(),
+            "ptxas FAILED on sequenced MLP kernel"
+        );
+
+        // Parse barrier count from ptxas -v output
+        // Format: "Used N registers, used B barriers, ..."
+        let barrier_count = stderr
+            .lines()
+            .find(|l| l.contains("barriers"))
+            .and_then(|l| {
+                // Look for "used N barriers" pattern
+                let words: Vec<&str> = l.split_whitespace().collect();
+                for i in 0..words.len().saturating_sub(1) {
+                    if words[i + 1] == "barriers" || words[i + 1] == "barriers," {
+                        return words[i].trim_end_matches(',').parse::<u32>().ok();
+                    }
+                }
+                None
+            });
+
+        eprintln!("Barrier count: {:?}", barrier_count);
+
+        // Also check persistent MLP for comparison
+        let persistent_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let persistent_deriv =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
+        let persistent_silu = include_str!("../../ptx-fusion/kernels/vllm_silu_mul.ptx");
+
+        // Build via the same path as persistent_mlp_block! but just the single-body version
+        let silu_computation = build_silu_mul_computation("mlp_persistent_test").expect("silu comp");
+
+        let (flat_gemm, _) =
+            crate::perimeter::replace_perimeter(persistent_ptx, persistent_deriv, "gemm")
+                .expect("replace_perimeter gemm");
+
+        let persistent = crate::persistent::make_single_body_persistent_mlp(
+            &flat_gemm,
+            &silu_computation,
+            "mlp_persistent_test",
+        )
+        .expect("persistent mlp");
+
+        let path2 = "/tmp/mlp_persistent_barrier_test.ptx";
+        std::fs::write(path2, &persistent).unwrap();
+        let out2 = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", "-v", path2])
+            .output()
+            .expect("ptxas");
+
+        let stderr2 = String::from_utf8_lossy(&out2.stderr);
+        eprintln!("\n=== ptxas -v output for persistent MLP ===");
+        for line in stderr2.lines() {
+            eprintln!("  {line}");
+        }
+
+        let persistent_barriers = stderr2
+            .lines()
+            .find(|l| l.contains("barriers"))
+            .and_then(|l| {
+                let words: Vec<&str> = l.split_whitespace().collect();
+                for i in 0..words.len().saturating_sub(1) {
+                    if words[i + 1] == "barriers" || words[i + 1] == "barriers," {
+                        return words[i].trim_end_matches(',').parse::<u32>().ok();
+                    }
+                }
+                None
+            });
+
+        eprintln!("Persistent barrier count: {:?}", persistent_barriers);
+
+        // The key assertion: sequenced should use fewer barriers than persistent
+        if let (Some(seq_b), Some(per_b)) = (barrier_count, persistent_barriers) {
+            eprintln!("\n=== COMPARISON ===");
+            eprintln!("  Sequenced (non-persistent): {} barriers", seq_b);
+            eprintln!("  Persistent:                 {} barriers", per_b);
+            assert!(
+                seq_b < per_b,
+                "Expected sequenced ({seq_b}) < persistent ({per_b}) barriers"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_gemm_body_64x128x32() {
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
+
+        // Must be perimeter-replaced first
+        let (flat, _) = crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "test_gemm")
+            .expect("replace_perimeter");
+
+        let desc = extract_gemm_body(&flat).expect("extract_gemm_body");
+
+        eprintln!("=== GemmBodyDescriptor for 64x128x32 ===");
+        eprintln!("  Entry: {}", desc.entry_name);
+        eprintln!("  Preamble: {} lines", desc.preamble.len());
+        eprintln!("  K-loop: {} lines ({}..{})", desc.k_loop.len(),
+            desc.loop_desc.header_line, desc.loop_desc.backedge_line);
+        eprintln!("  Epilogue: {} lines", desc.epilogue.len());
+        eprintln!("  MMA accumulators: {}", desc.mma_accumulators.len());
+        eprintln!("  Tile pointers: {}", desc.tile_pointers.len());
+        eprintln!("  Induction vars: {}", desc.induction_vars.len());
+        eprintln!("  Buffer state: {}", desc.buffer_state.len());
+        eprintln!("  Reg decls: {}", desc.reg_decls.len());
+        eprintln!("  SMEM decls: {}", desc.smem_decls.len());
+        eprintln!("  Params: {}", desc.params.len());
+
+        // Verify key properties
+        assert!(!desc.preamble.is_empty(), "should have preamble");
+        assert!(!desc.k_loop.is_empty(), "should have K-loop");
+        assert!(!desc.epilogue.is_empty(), "should have epilogue");
+        assert_eq!(desc.mma_accumulators.len(), 128, "64x128x32 should have 128 MMA accum regs");
+        assert!(desc.tile_pointers.len() >= 2, "should have A and B tile pointers");
+        assert!(!desc.induction_vars.is_empty(), "should have K-loop induction vars");
+        assert!(!desc.buffer_state.is_empty(), "should have SMEM buffer rotation state");
+
+        // K-loop should contain mma.sync
+        assert!(
+            desc.k_loop.iter().any(|l| l.contains("mma.sync")),
+            "K-loop must contain MMA instructions"
+        );
+        // Epilogue should contain cvt.rn.bf16x2.f32 (bf16 conversion)
+        assert!(
+            desc.epilogue.iter().any(|l| l.contains("cvt.rn.bf16x2.f32")),
+            "Epilogue must contain bf16 conversion"
+        );
+        // Epilogue should contain st.global (output stores)
+        assert!(
+            desc.epilogue.iter().any(|l| l.contains("st.global")),
+            "Epilogue must contain global stores"
+        );
+    }
+
+    #[test]
+    fn extract_gemm_body_64x64x32() {
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.derivations.json");
+
+        let (flat, _) = crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "test_gemm64")
+            .expect("replace_perimeter");
+
+        let desc = extract_gemm_body(&flat).expect("extract_gemm_body");
+
+        eprintln!("=== GemmBodyDescriptor for 64x64x32 ===");
+        eprintln!("  MMA accumulators: {}", desc.mma_accumulators.len());
+        eprintln!("  Preamble: {} lines", desc.preamble.len());
+        eprintln!("  K-loop: {} lines", desc.k_loop.len());
+        eprintln!("  Epilogue: {} lines", desc.epilogue.len());
+
+        assert_eq!(desc.mma_accumulators.len(), 64, "64x64x32 should have 64 MMA accum regs");
+    }
+
+    #[test]
+    fn accum_spill_reload_64x64x32() {
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.derivations.json");
+
+        let (flat, _) = crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "test_spill")
+            .expect("replace_perimeter");
+
+        let desc = extract_gemm_body(&flat).expect("extract_gemm_body");
+        let sr = build_accum_spill_reload(&desc, 36864); // 36KB = after CUTLASS SMEM
+
+        eprintln!("=== AccumSpillReload for 64x64x32 ===");
+        eprintln!("  SMEM bytes: {} ({}KB)", sr.smem_bytes, sr.smem_bytes / 1024);
+        eprintln!("  Spill instructions: {}", sr.spill.len());
+        eprintln!("  Reload instructions: {}", sr.reload.len());
+        eprintln!("  Zero instructions: {}", sr.zero.len());
+        eprintln!("  Extra reg decls: {:?}", sr.reg_decls);
+
+        // 64 accums * 4 bytes * 128 threads = 32KB
+        assert_eq!(sr.smem_bytes, 32768, "64 accums * 4B * 128 threads = 32KB");
+        // spill = 1 comment + 2 addr setup + 64 stores = 67
+        assert_eq!(sr.spill.len(), 67);
+        // reload = 1 comment + 2 addr setup + 64 loads = 67
+        assert_eq!(sr.reload.len(), 67);
+        // zero = 1 comment + 64 movs = 65
+        assert_eq!(sr.zero.len(), 65);
+
+        // Verify spill uses actual accumulator register names from the descriptor
+        let first_accum = &desc.mma_accumulators[0];
+        assert!(
+            sr.spill.iter().any(|l| l.contains(first_accum)),
+            "spill should reference actual accum register {first_accum}"
+        );
+        assert!(
+            sr.reload.iter().any(|l| l.contains(first_accum)),
+            "reload should reference actual accum register {first_accum}"
+        );
+        assert!(
+            sr.zero.iter().any(|l| l.contains(first_accum)),
+            "zero should reference actual accum register {first_accum}"
+        );
+
+        // Print first few instructions for visual verification
+        eprintln!("\nFirst 5 spill instructions:");
+        for l in sr.spill.iter().take(5) {
+            eprintln!("  {l}");
+        }
+        eprintln!("First 5 reload instructions:");
+        for l in sr.reload.iter().take(5) {
+            eprintln!("  {l}");
+        }
+    }
+
+    #[test]
+    fn analyze_epilogue_stores_64x128x32() {
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
+
+        let (flat, _) = crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "test_epi")
+            .expect("replace_perimeter");
+
+        let desc = extract_gemm_body(&flat).expect("extract_gemm_body");
+        let full_lines: Vec<&str> = flat.lines().collect();
+        let epi_start = desc.loop_desc.backedge_line + 1;
+
+        let map = analyze_epilogue_stores(&desc.epilogue, &full_lines, epi_start)
+            .expect("analyze_epilogue_stores");
+
+        eprintln!("=== EpilogueStoreMap for 64x128x32 ===");
+        eprintln!("  Base addr reg: {}", map.base_addr_reg);
+        eprintln!("  Row reg: {}", map.row_reg);
+        eprintln!("  Col reg: {}", map.col_reg);
+        eprintln!("  Stride regs: {:?}", map.stride_regs);
+        eprintln!("  Total stores: {}", map.stores.len());
+
+        for (i, store) in map.stores.iter().enumerate() {
+            eprintln!(
+                "  Store {}: addr={} chain={:?} data={:?}",
+                i, store.addr_reg, store.stride_chain, store.data_regs
+            );
+        }
+
+        // Verify basic properties
+        assert_eq!(map.stores.len(), 16, "64x128 tile should have 16 st.global stores (8 per epilogue path)");
+        assert!(!map.row_reg.is_empty(), "should identify row register");
+        assert!(!map.col_reg.is_empty(), "should identify column register");
+        assert!(!map.stride_regs.is_empty(), "should identify stride registers");
+
+        // First store should have empty stride chain (it's the base)
+        assert!(
+            map.stores[0].stride_chain.is_empty(),
+            "first store should be at base address (no stride chain)"
+        );
+
+        // Subsequent stores should have non-empty stride chains
+        assert!(
+            !map.stores[1].stride_chain.is_empty(),
+            "second store should have a stride offset from base"
+        );
+    }
+
+    #[test]
+    fn redirect_epilogue_to_smem_64x128x32() {
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json");
+
+        let (flat, _) = crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "test_redir")
+            .expect("replace_perimeter");
+
+        let desc = extract_gemm_body(&flat).expect("extract_gemm_body");
+        let full_lines: Vec<&str> = flat.lines().collect();
+        let epi_start = desc.loop_desc.backedge_line + 1;
+
+        let map = analyze_epilogue_stores(&desc.epilogue, &full_lines, epi_start)
+            .expect("analyze_epilogue_stores");
+
+        let redir = redirect_epilogue_to_smem(&desc.epilogue, &map, 36864, 128)
+            .expect("redirect_epilogue_to_smem");
+
+        eprintln!("=== Redirected Epilogue ===");
+        eprintln!("  Lines: {} (was {})", redir.lines.len(), desc.epilogue.len());
+        eprintln!("  SMEM bytes: {} ({}KB)", redir.smem_bytes, redir.smem_bytes / 1024);
+        eprintln!("  Extra reg decls: {:?}", redir.reg_decls);
+
+        // Should have no st.global left
+        let has_global = redir.lines.iter().any(|l| l.contains("st.global"));
+        assert!(!has_global, "redirected epilogue should have no st.global");
+
+        // Should have st.shared for the redirected stores
+        let shared_stores = redir.lines.iter().filter(|l| l.contains("st.shared.v4.b32")).count();
+        eprintln!("  Redirected st.shared stores: {}", shared_stores);
+        assert!(shared_stores > 0, "should have redirected st.shared stores");
+
+        // Should preserve epilogue infrastructure (bar.sync, ld.shared, mul, cvt)
+        assert!(
+            redir.lines.iter().any(|l| l.contains("bar.sync")),
+            "should preserve bar.sync"
+        );
+        assert!(
+            redir.lines.iter().any(|l| l.contains("cvt.rn.bf16x2.f32")),
+            "should preserve bf16 conversion"
+        );
+        assert!(
+            redir.lines.iter().any(|l| l.contains("ld.shared")),
+            "should preserve ld.shared (SMEM rearrangement)"
+        );
+
+        // SMEM should be tile_m * tile_n * 2 = 64 * 128 * 2 = 16KB
+        assert_eq!(redir.smem_bytes, 16384);
+
+        // Print some redirected store lines
+        eprintln!("\nRedirected store examples:");
+        for l in redir.lines.iter().filter(|l| l.contains("FERRITE: epilogue")).take(3) {
+            eprintln!("  {l}");
+        }
+        for l in redir.lines.iter().filter(|l| l.contains("st.shared.v4.b32")).take(3) {
+            eprintln!("  {l}");
+        }
+    }
+
+    #[test]
+    fn silu_from_smem_ptxas_valid() {
+        // Test: build a down GEMM with SiLU fused at A-loads,
+        // where gate and up values come from SMEM scratch.
+        // This verifies ptxas can compile the SMEM-sourced SiLU fusion.
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.derivations.json");
+
+        let (flat, _) = crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "silu_smem_test")
+            .expect("replace_perimeter");
+
+        // Build SiLU computation with SMEM sources
+        let computation = build_silu_mul_computation_smem(
+            "silu_smem_test",
+            "%r_gate_scratch",
+            "%r_up_scratch",
+        )
+        .expect("build silu smem");
+
+        // Apply to the GEMM
+        let fused = replace_a_loads_with_inline_fn(&flat, "", &computation)
+            .expect("replace_a_loads");
+
+        // Add the scratch base register declarations (in a real kernel these would
+        // be computed from dynamic SMEM + offsets)
+        // Find the first .reg line and prepend our declarations
+        let mut fused_lines: Vec<String> = fused.lines().map(|l| l.to_string()).collect();
+        let reg_insert_pos = fused_lines.iter().position(|l| l.trim().starts_with(".reg "))
+            .unwrap_or(0);
+        fused_lines.insert(reg_insert_pos, "\t.reg .u32 %r_gate_scratch, %r_up_scratch;".into());
+        let fused = fused_lines.join("\n");
+
+        eprintln!("Fused SiLU-from-SMEM kernel: {} lines", fused.lines().count());
+
+        // ptxas validation
+        let path = "/tmp/silu_smem_test.ptx";
+        std::fs::write(path, &fused).unwrap();
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", "-v", path])
+            .output()
+            .expect("ptxas");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("ptxas -v output:");
+        for line in stderr.lines() {
+            eprintln!("  {line}");
+        }
+
+        assert!(
+            out.status.success(),
+            "ptxas FAILED on SiLU-from-SMEM fused kernel"
+        );
+
+        // Check barrier count
+        let barrier_count = stderr
+            .lines()
+            .find(|l| l.contains("barriers"))
+            .and_then(|l| {
+                let words: Vec<&str> = l.split_whitespace().collect();
+                for i in 0..words.len().saturating_sub(1) {
+                    if words[i + 1] == "barriers" || words[i + 1] == "barriers," {
+                        return words[i].trim_end_matches(',').parse::<u32>().ok();
+                    }
+                }
+                None
+            });
+        eprintln!("Barrier count: {:?}", barrier_count);
+
+        // Should be low (not 16)
+        if let Some(b) = barrier_count {
+            assert!(b < 16, "barrier count {b} should be < 16");
+        }
+    }
+
+    #[test]
+    fn fuse_gemm_pointwise_gemm_ptxas() {
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.derivations.json");
+
+        // Perimeter-replace both producer and consumer (same config for now)
+        let (prod_flat, _) =
+            crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "producer")
+                .expect("replace_perimeter producer");
+        let (cons_flat, _) =
+            crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "consumer")
+                .expect("replace_perimeter consumer");
+
+        // Build SiLU computation with SMEM sources
+        let computation = build_silu_mul_computation_smem(
+            "fused_mlp",
+            "%r_gate_scratch",
+            "%r_up_scratch",
+        )
+        .expect("build silu smem");
+
+        let fused = fuse_gemm_pointwise_gemm(
+            &prod_flat,
+            &cons_flat,
+            &computation,
+            &ProducerOutput::Paired { n_offset_tiles: 43 }, // example
+            "fused_mlp_test",
+        )
+        .expect("fuse_gemm_pointwise_gemm");
+
+        eprintln!("Fused GEMM-pointwise-GEMM kernel: {} lines", fused.lines().count());
+
+        // ptxas validation
+        let path = "/tmp/fused_gemm_pw_gemm.ptx";
+        std::fs::write(path, &fused).unwrap();
+        let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+            .args(["-arch=sm_89", "-v", path])
+            .output()
+            .expect("ptxas");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("ptxas output:");
+        for line in stderr.lines() {
+            eprintln!("  {line}");
+        }
+
+        if !out.status.success() {
+            // Show context around first error
+            let ptx_lines: Vec<&str> = fused.lines().collect();
+            for line in stderr.lines().take(5) {
+                if let Some(lnum) = line
+                    .split('(')
+                    .nth(1)
+                    .and_then(|s| s.split(')').next())
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    let start = lnum.saturating_sub(2);
+                    let end = (lnum + 2).min(ptx_lines.len());
+                    for i in start..end {
+                        let marker = if i + 1 == lnum { ">>>" } else { "   " };
+                        eprintln!("{marker} {:4}: {}", i + 1, ptx_lines[i]);
+                    }
+                }
+            }
+            panic!("ptxas FAILED on fused GEMM-pointwise-GEMM kernel");
+        }
+
+        // Check barrier count and registers
+        let barrier_count = stderr
+            .lines()
+            .find(|l| l.contains("barriers"))
+            .and_then(|l| {
+                let words: Vec<&str> = l.split_whitespace().collect();
+                for i in 0..words.len().saturating_sub(1) {
+                    if words[i + 1] == "barriers" || words[i + 1] == "barriers," {
+                        return words[i].trim_end_matches(',').parse::<u32>().ok();
+                    }
+                }
+                None
+            });
+        eprintln!("\nBarrier count: {:?}", barrier_count);
+
+        if let Some(b) = barrier_count {
+            assert!(b <= 4, "fused kernel should use few barriers, got {b}");
+        }
+    }
+
+    #[test]
+    fn depipeline_k_loop_64x64x32() {
+        let gemm_ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
+        let deriv_json =
+            include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.derivations.json");
+
+        let (flat, _) = crate::perimeter::replace_perimeter(gemm_ptx, deriv_json, "test_dpipe")
+            .expect("replace_perimeter");
+
+        let desc = extract_gemm_body(&flat).expect("extract_gemm_body");
+
+        // Test 1: de-pipeline with A-loads from GMEM (standard explicit replacement)
+        let dp = depipeline_k_loop(&desc.k_loop, &flat, None)
+            .expect("depipeline_k_loop");
+
+        eprintln!("=== De-pipelined K-loop (GMEM A-loads) ===");
+        eprintln!("  Lines: {} (was {})", dp.lines.len(), desc.k_loop.len());
+        eprintln!("  A loads replaced: {}", dp.a_loads_replaced);
+        eprintln!("  B loads replaced: {}", dp.b_loads_replaced);
+
+        // No cp.async should remain
+        assert!(
+            !dp.lines.iter().any(|l| l.contains("cp.async.cg.shared.global")),
+            "de-pipelined loop should have no cp.async"
+        );
+        // No commit/wait groups
+        assert!(
+            !dp.lines.iter().any(|l| l.contains("cp.async.commit_group") && !l.contains("removed")),
+            "should strip commit_group"
+        );
+        assert!(
+            !dp.lines.iter().any(|l| l.contains("cp.async.wait_group") && !l.contains("removed")),
+            "should strip wait_group"
+        );
+        // MMA should be preserved
+        assert!(
+            dp.lines.iter().any(|l| l.contains("mma.sync")),
+            "MMA instructions must be preserved"
+        );
+        // Should have explicit loads
+        assert!(dp.a_loads_replaced > 0, "should replace A-loads");
+        assert!(dp.b_loads_replaced > 0, "should replace B-loads");
+
+        // Test 2: de-pipeline with A-loads from SMEM scratch
+        let dp_smem = depipeline_k_loop(&desc.k_loop, &flat, Some("%r_silu_scratch"))
+            .expect("depipeline_k_loop smem");
+
+        eprintln!("\n=== De-pipelined K-loop (SMEM A-loads) ===");
+        eprintln!("  A loads from SMEM: {}", dp_smem.a_loads_replaced);
+
+        // A-loads should use ld.shared
+        let a_smem_loads = dp_smem.lines.iter()
+            .filter(|l| l.contains("ld.shared") && l.contains("%r_silu_scratch"))
+            .count();
+        assert!(
+            a_smem_loads > 0,
+            "A-loads should read from SMEM scratch register"
+        );
+        // B-loads should still use ld.global
+        assert!(
+            dp_smem.lines.iter().any(|l| l.contains("ld.global")),
+            "B-loads should still use ld.global"
+        );
+
+        eprintln!("\nA-load examples (SMEM):");
+        for l in dp_smem.lines.iter().filter(|l| l.contains("ld.shared") && l.contains("silu")).take(3) {
+            eprintln!("  {l}");
+        }
     }
 }

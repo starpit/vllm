@@ -132,6 +132,7 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     // to the full remaining context window, letting the model emit EOS naturally.
     let params = Some(vllm_serve::llm::SamplingParams {
         max_tokens: args.max_tokens,
+        temperature: args.temperature.unwrap_or(1.0),
         ..Default::default()
     });
 

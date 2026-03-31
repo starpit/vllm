@@ -268,6 +268,7 @@ fn build_llm(args: &BenchMusiqueArgs) -> Result<LLM> {
         .gpu_memory_utilization(args.gpu_memory_utilization)
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
+        .tensor_parallel_size(args.tensor_parallel_size)
         .enforce_eager(args.enforce_eager)
         .enable_prefix_caching(true);
 

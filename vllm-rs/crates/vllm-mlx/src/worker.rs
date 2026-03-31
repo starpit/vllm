@@ -40,6 +40,9 @@ struct PendingStep {
     greedy_mapping: Vec<(String, usize)>, // (req_id, batch_pos)
     /// GPU temperature result arrays (unread), one per temperature group.
     temp_results: Vec<(Vec<(String, usize)>, Array)>, // ([(req_id, batch_pos)], array)
+    /// Request IDs whose sampled tokens should be discarded (intermediate
+    /// prefill chunks — the request hasn't finished prefilling yet).
+    discard_req_ids: HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +790,9 @@ impl Worker for MlxWorker {
             if let Some(ref greedy_result) = pending.greedy_result {
                 let flat = greedy_result.as_slice::<u32>();
                 for (req_id, batch_pos) in &pending.greedy_mapping {
+                    if pending.discard_req_ids.contains(req_id) {
+                        continue; // intermediate prefill chunk — discard
+                    }
                     let token_id = self.seal_pad_override(req_id, flat[*batch_pos]);
                     token_map.insert(req_id.clone(), vec![token_id]);
                     if let Some(buf) = self.token_buffers.get_mut(req_id) {
@@ -801,6 +807,9 @@ impl Worker for MlxWorker {
             for (mapping, arr) in &pending.temp_results {
                 let flat = arr.as_slice::<u32>();
                 for (req_id, batch_pos) in mapping {
+                    if pending.discard_req_ids.contains(req_id) {
+                        continue; // intermediate prefill chunk — discard
+                    }
                     let token_id = self.seal_pad_override(req_id, flat[*batch_pos]);
                     token_map.insert(req_id.clone(), vec![token_id]);
                     if let Some(buf) = self.token_buffers.get_mut(req_id) {
@@ -1118,7 +1127,12 @@ impl Worker for MlxWorker {
             .map(|r| r.req_id.as_str())
             .collect();
 
-        for req_id in scheduler_output.scheduled_cached_reqs.req_ids.iter() {
+        for (cached_idx, req_id) in scheduler_output
+            .scheduled_cached_reqs
+            .req_ids
+            .iter()
+            .enumerate()
+        {
             if new_req_ids.contains(req_id.as_str()) {
                 continue;
             }
@@ -1132,6 +1146,31 @@ impl Worker for MlxWorker {
             }
 
             if let Some(buf) = self.token_buffers.get(req_id) {
+                // Chunked prefill continuation: num_tokens > 1 means the
+                // scheduler is sending another chunk of prompt tokens.
+                // Emit the chunk slice as a prefill instead of a single decode token.
+                if num_tokens > 1 {
+                    let num_computed = scheduler_output
+                        .scheduled_cached_reqs
+                        .num_computed_tokens
+                        .get(cached_idx)
+                        .copied()
+                        .unwrap_or(0) as usize;
+                    let start = num_computed;
+                    let end = (start + num_tokens).min(buf.len());
+                    let chunk_tokens: Vec<u32> = buf[start..end].to_vec();
+                    let positions: Vec<i32> =
+                        (num_computed as i32..(num_computed + chunk_tokens.len()) as i32).collect();
+                    req_inputs.push(ReqInput {
+                        req_id: req_id.clone(),
+                        token_ids: chunk_tokens,
+                        positions,
+                        is_prefill: true,
+                        spec_token_ids: Vec::new(),
+                    });
+                    continue;
+                }
+
                 let last_token = *buf.last().unwrap_or(&0);
                 let position = (buf.len() - 1) as i32;
 
@@ -2054,10 +2093,26 @@ impl Worker for MlxWorker {
                 })
                 .collect();
 
+            // Collect request IDs for intermediate prefill chunks whose
+            // sampled tokens should be discarded (they haven't finished prefill).
+            let discard_req_ids: HashSet<String> = req_inputs
+                .iter()
+                .filter(|r| {
+                    r.is_prefill && {
+                        let prompt_len = self.prompt_lens.get(&r.req_id).copied().unwrap_or(0);
+                        let seq_len_after =
+                            r.positions.last().map(|&p| p as usize + 1).unwrap_or(0);
+                        seq_len_after < prompt_len
+                    }
+                })
+                .map(|r| r.req_id.clone())
+                .collect();
+
             self.pending_step = Some(PendingStep {
                 greedy_result: gpu_greedy_result,
                 greedy_mapping,
                 temp_results: temp_pending,
+                discard_req_ids,
             });
 
             // Timing.
@@ -2249,6 +2304,28 @@ impl Worker for MlxWorker {
 
         // --- Post-sampling: seal-pad override, grammar advance, token buffer update ---
         for (req_idx, req_input) in req_inputs.iter().enumerate() {
+            // Discard sampled tokens for intermediate prefill chunks.
+            // Like Python's discard_request_mask: if the request hasn't finished
+            // prefill (seq_len after this step < total prompt tokens), the sampled
+            // token is spurious and must not be appended or returned.
+            if req_input.is_prefill {
+                let prompt_len = self
+                    .prompt_lens
+                    .get(&req_input.req_id)
+                    .copied()
+                    .unwrap_or(0);
+                let seq_len_after = req_input
+                    .positions
+                    .last()
+                    .map(|&p| p as usize + 1)
+                    .unwrap_or(0);
+                if seq_len_after < prompt_len {
+                    // Intermediate chunk — discard the sampled token.
+                    token_map.remove(&req_input.req_id);
+                    continue;
+                }
+            }
+
             // 🦭 Apply seal-pad override to sampled tokens.
             if let Some(sampled) = token_map.get_mut(&req_input.req_id) {
                 for t in sampled.iter_mut() {

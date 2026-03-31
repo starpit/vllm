@@ -27,8 +27,8 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::tensor::GpuTensor;
 
-/// Maximum number of blocks per sequence in the block table.
-const MAX_BLOCKS_PER_SEQ: usize = 512;
+/// Fallback maximum blocks per sequence when max_model_len is unknown.
+const DEFAULT_MAX_BLOCKS_PER_SEQ: usize = 2048;
 
 /// A single captured CUDA graph for a specific batch size.
 struct CapturedGraph {
@@ -52,6 +52,7 @@ pub struct CudaGraphRunner {
     /// Shared output buffer for argmax token IDs — `[max_batch]` in U32.
     shared_argmax: RawGpuMem,
     max_batch: usize,
+    max_blocks_per_seq: usize,
     dtype: DType,
     vocab_size: usize,
 
@@ -80,7 +81,16 @@ pub struct CudaGraphRunner {
 unsafe impl Send for CudaGraphRunner {}
 
 impl CudaGraphRunner {
-    pub unsafe fn new(max_batch: usize, vocab_size: usize, dtype: DType) -> Result<Self> {
+    /// Create a new CUDA graph runner.
+    ///
+    /// `max_blocks_per_seq`: maximum blocks any single sequence can use,
+    /// computed as `cdiv(max_model_len, block_size)` by the caller.
+    pub unsafe fn new(
+        max_batch: usize,
+        vocab_size: usize,
+        dtype: DType,
+        max_blocks_per_seq: usize,
+    ) -> Result<Self> {
         let input_ids = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
         let positions = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
         let slot_mapping = RawGpuMem::new(driver::mem_alloc(max_batch * 8)?, max_batch * 8);
@@ -88,8 +98,8 @@ impl CudaGraphRunner {
             RawGpuMem::new(driver::mem_alloc((max_batch + 1) * 4)?, (max_batch + 1) * 4);
         let seqused_k = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
         let block_table = RawGpuMem::new(
-            driver::mem_alloc(max_batch * MAX_BLOCKS_PER_SEQ * 4)?,
-            max_batch * MAX_BLOCKS_PER_SEQ * 4,
+            driver::mem_alloc(max_batch * max_blocks_per_seq * 4)?,
+            max_batch * max_blocks_per_seq * 4,
         );
         let shared_logits_size = max_batch * vocab_size * dtype.size_bytes();
         let shared_logits =
@@ -107,6 +117,7 @@ impl CudaGraphRunner {
             shared_logits,
             shared_argmax,
             max_batch,
+            max_blocks_per_seq,
             dtype,
             vocab_size,
             fp8_k_buf: None,
@@ -266,7 +277,7 @@ impl CudaGraphRunner {
                 seqused_k: GpuTensor::new(self.seqused_k.ptr(), &[batch_size], DType::I32),
                 block_table: GpuTensor::new(
                     self.block_table.ptr(),
-                    &[batch_size, MAX_BLOCKS_PER_SEQ],
+                    &[batch_size, self.max_blocks_per_seq],
                     DType::I32,
                 ),
             }
@@ -408,7 +419,7 @@ impl CudaGraphRunner {
         driver::memcpy_htod_async(
             self.block_table.ptr(),
             block_table.as_ptr() as *const u8,
-            batch_size * MAX_BLOCKS_PER_SEQ * 4,
+            batch_size * self.max_blocks_per_seq * 4,
             xfer,
         )?;
 
@@ -486,7 +497,7 @@ impl CudaGraphRunner {
             self.block_table.ptr() as *const u8,
             batch_size,
             block_size,
-            MAX_BLOCKS_PER_SEQ,
+            self.max_blocks_per_seq,
             stream,
         );
 
@@ -545,7 +556,7 @@ impl CudaGraphRunner {
         driver::memset_d8(
             self.block_table.ptr(),
             0,
-            batch_size * MAX_BLOCKS_PER_SEQ * 4,
+            batch_size * self.max_blocks_per_seq * 4,
             stream,
         )?;
 
@@ -598,8 +609,15 @@ pub struct InputTensors {
     pub block_table: GpuTensor,
 }
 
-/// The maximum number of blocks per sequence used in graph capture.
-pub const GRAPH_MAX_BLOCKS_PER_SEQ: usize = MAX_BLOCKS_PER_SEQ;
+/// Default maximum blocks per sequence, used when the caller doesn't
+/// provide a model-specific value. Matches Python's
+/// `cdiv(max_model_len, block_size)` for 32K context with block_size=16.
+pub const GRAPH_MAX_BLOCKS_PER_SEQ: usize = DEFAULT_MAX_BLOCKS_PER_SEQ;
+
+/// Compute the proper max blocks per sequence from model config.
+pub fn max_blocks_for_model(max_model_len: usize, block_size: usize) -> usize {
+    (max_model_len + block_size - 1) / block_size
+}
 
 // ---------------------------------------------------------------------------
 // Prefill graph runner
@@ -625,6 +643,7 @@ pub struct PrefillGraphRunner {
     /// Shared output buffer for argmax — `[1]` in U32.
     shared_argmax: RawGpuMem,
     max_tokens: usize,
+    max_blocks_per_seq: usize,
     dtype: DType,
     vocab_size: usize,
 }
@@ -646,15 +665,20 @@ pub struct PrefillInputTensors {
 }
 
 impl PrefillGraphRunner {
-    pub unsafe fn new(max_tokens: usize, vocab_size: usize, dtype: DType) -> Result<Self> {
+    pub unsafe fn new(
+        max_tokens: usize,
+        vocab_size: usize,
+        dtype: DType,
+        max_blocks_per_seq: usize,
+    ) -> Result<Self> {
         let input_ids = RawGpuMem::new(driver::mem_alloc(max_tokens * 4)?, max_tokens * 4);
         let positions = RawGpuMem::new(driver::mem_alloc(max_tokens * 4)?, max_tokens * 4);
         let slot_mapping = RawGpuMem::new(driver::mem_alloc(max_tokens * 8)?, max_tokens * 8);
         let cu_seqlens_q = RawGpuMem::new(driver::mem_alloc(2 * 4)?, 2 * 4);
         let seqused_k = RawGpuMem::new(driver::mem_alloc(4)?, 4);
         let block_table = RawGpuMem::new(
-            driver::mem_alloc(MAX_BLOCKS_PER_SEQ * 4)?,
-            MAX_BLOCKS_PER_SEQ * 4,
+            driver::mem_alloc(max_blocks_per_seq * 4)?,
+            max_blocks_per_seq * 4,
         );
         let last_token_indices = RawGpuMem::new(driver::mem_alloc(4)?, 4);
         // Prefill extracts 1 token's logits, so shared buffer is [1, vocab_size].
@@ -675,6 +699,7 @@ impl PrefillGraphRunner {
             shared_logits,
             shared_argmax,
             max_tokens,
+            max_blocks_per_seq,
             dtype,
             vocab_size,
         })
@@ -698,7 +723,7 @@ impl PrefillGraphRunner {
                 seqused_k: GpuTensor::new(self.seqused_k.ptr(), &[1], DType::I32),
                 block_table: GpuTensor::new(
                     self.block_table.ptr(),
-                    &[1, MAX_BLOCKS_PER_SEQ],
+                    &[1, self.max_blocks_per_seq],
                     DType::I32,
                 ),
                 last_token_indices: GpuTensor::new(self.last_token_indices.ptr(), &[1], DType::U32),
@@ -835,7 +860,7 @@ impl PrefillGraphRunner {
         driver::memcpy_htod_async(
             self.block_table.ptr(),
             block_table.as_ptr() as *const u8,
-            block_table.len().min(MAX_BLOCKS_PER_SEQ) * 4,
+            block_table.len().min(self.max_blocks_per_seq) * 4,
             xfer,
         )?;
 
@@ -885,7 +910,12 @@ impl PrefillGraphRunner {
             4,
             stream,
         )?;
-        driver::memset_d8(self.block_table.ptr(), 0, MAX_BLOCKS_PER_SEQ * 4, stream)?;
+        driver::memset_d8(
+            self.block_table.ptr(),
+            0,
+            self.max_blocks_per_seq * 4,
+            stream,
+        )?;
         let last_idx = (num_tokens - 1) as u32;
         driver::memcpy_htod_async(
             self.last_token_indices.ptr(),

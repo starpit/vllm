@@ -19,7 +19,7 @@ use vllm_cuda::cpu_gpu_buf::PinnedBuf;
 use vllm_cuda::device::GpuDevice;
 use vllm_cuda::driver;
 use vllm_cuda::dtype::DType as GpuDType;
-use vllm_cuda::graph::{CudaGraphRunner, GRAPH_MAX_BLOCKS_PER_SEQ, PrefillGraphRunner};
+use vllm_cuda::graph::{CudaGraphRunner, PrefillGraphRunner, max_blocks_for_model};
 use vllm_cuda::graph_piece::{GraphPieceType, PiecewiseGraphRunner};
 use vllm_cuda::kv_cache::KvCachePool;
 use vllm_cuda::logits_processor::{
@@ -60,6 +60,8 @@ pub struct CudaWorkerConfig {
     pub cuda_graph_mode: CudaGraphMode,
     /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
     pub max_num_batched_tokens: usize,
+    /// Maximum model context length in tokens (for CUDA graph block table sizing).
+    pub max_model_len: usize,
     /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
     pub cuda_graph_sizes: Vec<usize>,
     /// Run cublasLt algorithm benchmarking during warmup (--cublas-autotune).
@@ -1315,8 +1317,10 @@ struct HostStaging {
     cu_seqlens_q: PinnedBuf,
     /// `[max_batch]` i32 — per-sequence K lengths for paged FA2.
     seqused_k: PinnedBuf,
-    /// `[max_batch * GRAPH_MAX_BLOCKS_PER_SEQ]` i32 — page table.
+    /// `[max_batch * max_blocks_per_seq]` i32 — page table.
     block_table: PinnedBuf,
+    /// Maximum blocks per sequence (computed from max_model_len / block_size).
+    max_blocks_per_seq: usize,
     /// `[max_batch]` u32 — D2H token IDs from graph argmax (double-buffered).
     ///
     /// Two pinned buffers alternate per step so that the GPU can write to one
@@ -1333,14 +1337,15 @@ impl HostStaging {
     ///
     /// # Safety
     /// Requires active CUDA context.
-    unsafe fn new(max_batch: usize) -> anyhow::Result<Self> {
+    unsafe fn new(max_batch: usize, max_blocks_per_seq: usize) -> anyhow::Result<Self> {
         Ok(Self {
             input_ids: unsafe { PinnedBuf::new(max_batch * 4)? },
             positions: unsafe { PinnedBuf::new(max_batch * 4)? },
             slot_mapping: unsafe { PinnedBuf::new(max_batch * 8)? },
             cu_seqlens_q: unsafe { PinnedBuf::new((max_batch + 1) * 4)? },
             seqused_k: unsafe { PinnedBuf::new(max_batch * 4)? },
-            block_table: unsafe { PinnedBuf::new(max_batch * GRAPH_MAX_BLOCKS_PER_SEQ * 4)? },
+            block_table: unsafe { PinnedBuf::new(max_batch * max_blocks_per_seq * 4)? },
+            max_blocks_per_seq,
             host_token_ids: [unsafe { PinnedBuf::new(max_batch * 4)? }, unsafe {
                 PinnedBuf::new(max_batch * 4)?
             }],
@@ -1350,19 +1355,20 @@ impl HostStaging {
     }
 
     /// Fill block_table pinned buffer from attention metadata block_ids.
-    /// Returns a slice of the pinned buffer with `graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ` elements.
+    /// Returns a slice of the pinned buffer with `graph_bs * max_blocks_per_seq` elements.
     unsafe fn fill_block_table<'a>(
         &'a self,
         block_ids: &[Vec<usize>],
         graph_bs: usize,
     ) -> &'a [i32] {
-        let n = graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ;
+        let mbps = self.max_blocks_per_seq;
+        let n = graph_bs * mbps;
         let bt = unsafe { self.block_table.slice_mut::<i32>(n) };
         bt.fill(0);
         for (i, blocks) in block_ids.iter().enumerate() {
             for (j, &bid) in blocks.iter().enumerate() {
-                if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                    bt[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as i32;
+                if j < mbps {
+                    bt[i * mbps + j] = bid as i32;
                 }
             }
         }
@@ -1409,6 +1415,9 @@ pub struct CudaWorker {
     piecewise_graph_runner: Option<PiecewiseGraphRunner>,
     /// CUDA graph runner for single-sequence prefill batches.
     prefill_graph_runner: Option<PrefillGraphRunner>,
+    /// Maximum blocks per sequence for graph block tables.
+    /// Computed as cdiv(max_model_len, block_size).
+    graph_max_blocks_per_seq: usize,
     /// Batch size of the last graph replay. When the batch composition is
     /// unchanged, we can skip the input_ids H2D copy because the graph's
     /// D2D scatter already placed argmax results into the persistent buffer.
@@ -1428,6 +1437,8 @@ pub struct CudaWorker {
 
     // Per-request state.
     token_buffers: HashMap<String, Vec<u32>>,
+    /// Per-request prompt length (for discard_request_mask on intermediate prefill chunks).
+    prompt_lengths: HashMap<String, usize>,
     /// Per-request block annotations for span-aware RoPE.
     annotation_buffers: HashMap<String, vllm_common::BlockAnnotations>,
     sampling_params_map: HashMap<String, SamplingParams>,
@@ -1549,11 +1560,13 @@ impl CudaWorker {
             graph_runner: None,
             piecewise_graph_runner: None,
             prefill_graph_runner: None,
+            graph_max_blocks_per_seq: max_blocks_for_model(config.max_model_len, config.block_size),
             last_graph_batch_size: None,
             graph_metadata_valid: false,
             uses_ggml: false,
             host_staging: None,
             token_buffers: HashMap::new(),
+            prompt_lengths: HashMap::new(),
             annotation_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
@@ -2668,6 +2681,7 @@ impl CudaWorker {
         host_staging: &Option<HostStaging>,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
+        prompt_lengths: &HashMap<String, usize>,
         logits: GpuTensor,
         prepared: PreparedInputs,
         device: &mut GpuDevice,
@@ -2677,6 +2691,7 @@ impl CudaWorker {
         use rand::Rng;
         let num_reqs = prepared.req_inputs.len();
         let total_tokens = prepared.flat_token_ids.len();
+
         let any_spec_decode = prepared
             .req_inputs
             .iter()
@@ -2768,6 +2783,7 @@ impl CudaWorker {
                     0,
                     input_batch,
                     token_buffers,
+                    prompt_lengths,
                 );
             }
 
@@ -2893,6 +2909,7 @@ impl CudaWorker {
                 0,
                 input_batch,
                 token_buffers,
+                prompt_lengths,
             );
         }
 
@@ -3152,13 +3169,28 @@ impl CudaWorker {
         let host_ids =
             Self::d2h_token_ids_sync(host_staging.as_ref(), 0, &token_ids_gpu, num_reqs, device)?;
 
+        // Build discard mask for intermediate prefill chunks.
+        let mut discard = vec![false; num_reqs];
+        for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+            if req_slice.token_count > 1 {
+                let prompt_len = prompt_lengths.get(&req_slice.req_id).copied().unwrap_or(0);
+                let tokens_in_pool = input_batch.tokens_in_pool_for(&req_slice.req_id);
+                let seq_len_after = tokens_in_pool + req_slice.token_count;
+                if seq_len_after < prompt_len {
+                    discard[req_idx] = true;
+                }
+            }
+        }
+
         for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
             let tok = host_ids[req_idx];
 
             // Grammar advance on CPU (Python also does FSM state on CPU).
             #[cfg(feature = "guided-decoding")]
-            if let Some(g) = grammar_states.get_mut(&req_slice.req_id) {
-                g.advance(tok);
+            if !discard[req_idx] {
+                if let Some(g) = grammar_states.get_mut(&req_slice.req_id) {
+                    g.advance(tok);
+                }
             }
 
             input_batch.commit_step(
@@ -3167,8 +3199,10 @@ impl CudaWorker {
                 req_slice.token_count,
                 !req_slice.spec_token_ids.is_empty(),
             );
-            if let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
-                buf.push(tok);
+            if !discard[req_idx] {
+                if let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
+                    buf.push(tok);
+                }
             }
         }
 
@@ -3179,6 +3213,13 @@ impl CudaWorker {
             .collect();
         input_batch.reclaim_buffers(prepared);
         let mut output = ModelRunnerOutput::from_ordered(req_ids, host_ids);
+
+        // Clear sampled tokens for discarded (intermediate prefill) requests.
+        for (idx, d) in discard.iter().enumerate() {
+            if *d {
+                output.sampled_token_ids[idx].clear();
+            }
+        }
 
         if let Some(mut logprobs_map) = logprobs_output {
             let logprobs_vec: Vec<Option<Vec<vllm_common::LogprobsOutput>>> = output
@@ -3321,6 +3362,7 @@ impl CudaWorker {
         buf_idx: usize,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
+        prompt_lengths: &HashMap<String, usize>,
     ) -> ExecutorResult<ModelRunnerOutput> {
         let host_ids = Self::d2h_token_ids_sync(
             host_staging.as_ref(),
@@ -3329,6 +3371,22 @@ impl CudaWorker {
             num_reqs,
             device,
         )?;
+        // Build discard mask: intermediate prefill chunks (seq_len after
+        // this step < prompt_len) should not have their sampled tokens
+        // appended to token_buffers. Matches Python's discard_request_mask.
+        let mut discard = vec![false; num_reqs];
+        for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+            if req_slice.token_count > 1 {
+                // This is a prefill request. Check if it finishes the prompt.
+                let prompt_len = prompt_lengths.get(&req_slice.req_id).copied().unwrap_or(0);
+                let tokens_in_pool = input_batch.tokens_in_pool_for(&req_slice.req_id);
+                let seq_len_after = tokens_in_pool + req_slice.token_count;
+                if seq_len_after < prompt_len {
+                    discard[req_idx] = true;
+                }
+            }
+        }
+
         for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
             let tok = host_ids[req_idx];
             input_batch.commit_step(
@@ -3337,17 +3395,27 @@ impl CudaWorker {
                 req_slice.token_count,
                 !req_slice.spec_token_ids.is_empty(),
             );
-            if let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
-                buf.push(tok);
+            if !discard[req_idx] {
+                if let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
+                    buf.push(tok);
+                }
             }
         }
+
+        // Build output, clearing tokens for discarded (intermediate prefill) requests.
         let req_ids: Vec<String> = prepared
             .req_inputs
             .iter()
             .map(|r| r.req_id.clone())
             .collect();
         input_batch.reclaim_buffers(prepared);
-        Ok(ModelRunnerOutput::from_ordered(req_ids, host_ids))
+        let mut output = ModelRunnerOutput::from_ordered(req_ids, host_ids);
+        for (idx, d) in discard.iter().enumerate() {
+            if *d {
+                output.sampled_token_ids[idx].clear();
+            }
+        }
+        Ok(output)
     }
     // -----------------------------------------------------------------------
     // Piecewise CUDA Graph Execution
@@ -5893,8 +5961,12 @@ impl Worker for CudaWorker {
         if !should_capture_monolithic {
             // Skip to prefill graphs / cublas autotune.
         } else {
-            let mut runner = unsafe { CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype) }
-                .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
+            let graph_max_blocks =
+                max_blocks_for_model(self.config.max_model_len, self.config.block_size);
+            let mut runner = unsafe {
+                CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype, graph_max_blocks)
+            }
+            .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
 
             // FP8 KV cache: allocate persistent dequant buffers and cache scales.
             if self.kv_cache_is_fp8 {
@@ -5982,7 +6054,7 @@ impl Worker for CudaWorker {
                 );
                 // Allocate pinned host staging buffers sized for the largest captured graph.
                 let staging_max_bs = *runner.captured_sizes().last().unwrap();
-                match unsafe { HostStaging::new(staging_max_bs) } {
+                match unsafe { HostStaging::new(staging_max_bs, graph_max_blocks) } {
                     Ok(staging) => {
                         info!(
                             "Pinned host staging allocated for max_batch={}",
@@ -6018,7 +6090,9 @@ impl Worker for CudaWorker {
 
         if !prefill_sizes.is_empty() && !monolithic_failed {
             let max_prefill = *prefill_sizes.last().unwrap();
-            match unsafe { PrefillGraphRunner::new(max_prefill, vocab_size, self.model_dtype) } {
+            match unsafe {
+                PrefillGraphRunner::new(max_prefill, vocab_size, self.model_dtype, graph_max_blocks)
+            } {
                 Ok(mut prefill_runner) => {
                     // Capture largest first (matching Python vLLM).
                     for &num_tokens in prefill_sizes.iter().rev() {
@@ -6127,6 +6201,7 @@ impl Worker for CudaWorker {
 
         // Clear per-request state.
         self.token_buffers.clear();
+        self.prompt_lengths.clear();
         self.annotation_buffers.clear();
         self.sampling_params_map.clear();
         self.input_batch = InputBatch::new();
@@ -6328,6 +6403,7 @@ impl CudaWorker {
         }
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
+            self.prompt_lengths.remove(req_id);
             self.annotation_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.seeded_rngs.remove(req_id);
@@ -6377,6 +6453,8 @@ impl CudaWorker {
 
             self.token_buffers
                 .insert(new_req.req_id.clone(), prompt_ids.to_vec());
+            self.prompt_lengths
+                .insert(new_req.req_id.clone(), prompt_ids.len());
             if let Some(ref ann) = new_req.block_annotations {
                 self.annotation_buffers
                     .insert(new_req.req_id.clone(), ann.clone());
@@ -6457,13 +6535,37 @@ impl CudaWorker {
         }
 
         // ---------------------------------------------------------------
+        // Chunked prefill re-arm: detect cached requests that need
+        // more than 1 token (prefill continuation). Must happen before
+        // the super fast graph path, which would otherwise replay a
+        // decode graph instead of running the prefill eagerly.
+        // ---------------------------------------------------------------
+        let has_chunked_prefill =
+            scheduler_output
+                .scheduled_cached_reqs
+                .req_ids
+                .iter()
+                .any(|req_id| {
+                    let is_resumed = scheduler_output
+                        .scheduled_cached_reqs
+                        .resumed_req_ids
+                        .contains(req_id);
+                    let num_scheduled = scheduler_output
+                        .num_scheduled_tokens
+                        .get(req_id)
+                        .copied()
+                        .unwrap_or(0);
+                    is_resumed || num_scheduled > 1
+                });
+
+        // ---------------------------------------------------------------
         // Super fast path: skip prepare_inputs entirely when the graph
         // has valid metadata from the previous step. This avoids ~50μs
         // of CPU work and, critically, lets us defer commit_step(N-1)
         // to AFTER the graph launch so it overlaps with GPU execution.
         // ---------------------------------------------------------------
         let num_active = self.input_batch.num_active();
-        let fast_graph_bs = if self.graph_metadata_valid {
+        let fast_graph_bs = if self.graph_metadata_valid && !has_chunked_prefill {
             self.graph_runner
                 .as_ref()
                 .and_then(|r| r.nearest_graph_size(num_active))
@@ -6628,14 +6730,24 @@ impl CudaWorker {
             .iter()
             .enumerate()
         {
-            if !scheduler_output
+            let is_resumed = scheduler_output
                 .scheduled_cached_reqs
                 .resumed_req_ids
-                .contains(req_id)
-            {
+                .contains(req_id);
+            // Chunked prefill continuation: cached request with num_scheduled > 1
+            // means the scheduler is sending another chunk of prompt tokens.
+            // We must re-arm the InputBatch slot as prefill (remove + add_request)
+            // so prepare_inputs emits the full chunk instead of a single decode token.
+            let num_scheduled_for_req = scheduler_output
+                .num_scheduled_tokens
+                .get(req_id)
+                .copied()
+                .unwrap_or(0);
+            let is_chunked_prefill_continuation = !is_resumed && num_scheduled_for_req > 1;
+            if !is_resumed && !is_chunked_prefill_continuation {
                 continue;
             }
-            // Re-add the resumed request as a fresh prefill.
+            // Re-add the resumed/chunked-prefill request as a fresh prefill.
             let new_block_ids: Vec<usize> = scheduler_output
                 .scheduled_cached_reqs
                 .new_block_ids
@@ -6669,10 +6781,23 @@ impl CudaWorker {
                     buf[start..end].to_vec()
                 })
                 .unwrap_or_default();
+            // For both resumed and chunked prefill, the scheduler's
+            // allocate_slots returns ALL block IDs (not a delta).
+            // For chunked prefill, update_blocks already set the full
+            // block table on the input_batch slot — grab it before remove.
+            let all_block_ids = if is_chunked_prefill_continuation {
+                // update_blocks (line ~6359) already set the full block table
+                self.input_batch
+                    .block_table(req_id)
+                    .map(|b| b.to_vec())
+                    .unwrap_or(new_block_ids)
+            } else {
+                new_block_ids
+            };
             // Remove the old (zombie) slot first, then re-add as prefill.
             self.input_batch.remove_request(req_id);
             self.input_batch
-                .add_request(req_id.clone(), &tokens, new_block_ids, num_computed);
+                .add_request(req_id.clone(), &tokens, all_block_ids, num_computed);
         }
 
         // Prepare flat inputs from InputBatch.
@@ -6951,7 +7076,7 @@ impl CudaWorker {
                 let mut slot_mapping: Vec<i64> = Vec::with_capacity(decode_graph_bs);
                 let mut cu_seqlens_q: Vec<i32> = Vec::with_capacity(decode_graph_bs + 1);
                 let mut seqused_k: Vec<i32> = Vec::with_capacity(decode_graph_bs);
-                let mut block_table = vec![0i32; decode_graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+                let mut block_table = vec![0i32; decode_graph_bs * graph_max_blocks_per_seq];
 
                 cu_seqlens_q.push(0);
                 for (out_idx, &orig_idx) in decode_indices.iter().enumerate() {
@@ -6975,8 +7100,8 @@ impl CudaWorker {
 
                     // Block table row.
                     for (j, &bid) in block_ids.iter().enumerate() {
-                        if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                            block_table[out_idx * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as i32;
+                        if j < graph_max_blocks_per_seq {
+                            block_table[out_idx * graph_max_blocks_per_seq + j] = bid as i32;
                         }
                     }
                 }
@@ -7177,6 +7302,7 @@ impl CudaWorker {
                 &self.host_staging,
                 &mut self.input_batch,
                 &mut self.token_buffers,
+                &self.prompt_lengths,
                 logits,
                 prepared,
                 device,
@@ -7429,11 +7555,11 @@ impl CudaWorker {
                 }
                 slot_mapping.resize(graph_bs, -1i64);
 
-                let mut block_table = vec![0i32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+                let mut block_table = vec![0i32; graph_bs * graph_max_blocks_per_seq];
                 for (i, blocks) in meta.block_ids.iter().enumerate() {
                     for (j, &bid) in blocks.iter().enumerate() {
-                        if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                            block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as i32;
+                        if j < graph_max_blocks_per_seq {
+                            block_table[i * graph_max_blocks_per_seq + j] = bid as i32;
                         }
                     }
                 }
@@ -7522,6 +7648,7 @@ impl CudaWorker {
                 0,
                 &mut self.input_batch,
                 &mut self.token_buffers,
+                &self.prompt_lengths,
             );
         }
 
@@ -7665,11 +7792,11 @@ impl CudaWorker {
                 }
                 slot_mapping.resize(graph_bs, -1i64);
 
-                let mut block_table = vec![0i32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+                let mut block_table = vec![0i32; graph_bs * graph_max_blocks_per_seq];
                 for (i, blocks) in meta.block_ids.iter().enumerate() {
                     for (j, &bid) in blocks.iter().enumerate() {
-                        if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                            block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as i32;
+                        if j < graph_max_blocks_per_seq {
+                            block_table[i * graph_max_blocks_per_seq + j] = bid as i32;
                         }
                     }
                 }
@@ -7728,9 +7855,9 @@ impl CudaWorker {
                     .unwrap();
 
                 // Build block_table padded to MAX_BLOCKS_PER_SEQ.
-                let mut block_table = vec![0i32; GRAPH_MAX_BLOCKS_PER_SEQ];
+                let mut block_table = vec![0i32; graph_max_blocks_per_seq];
                 for (j, &bid) in meta.block_ids[0].iter().enumerate() {
-                    if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                    if j < graph_max_blocks_per_seq {
                         block_table[j] = bid as i32;
                     }
                 }
@@ -7981,6 +8108,7 @@ impl CudaWorker {
             &self.host_staging,
             &mut self.input_batch,
             &mut self.token_buffers,
+            &self.prompt_lengths,
             logits,
             prepared,
             device,

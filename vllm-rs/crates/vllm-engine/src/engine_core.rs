@@ -609,6 +609,13 @@ impl EngineCore {
                 result
             });
 
+            // Skip output for intermediate prefill chunks (no sampled tokens).
+            // Matches Python: EngineCore only emits output when new_token_ids
+            // is non-empty or request is stopped/pooling.
+            if new_token_ids_slice.is_empty() && finish_reason.is_none() {
+                continue;
+            }
+
             // Build the output for this request.
             let output = EngineCoreOutput {
                 request_id: req_id.clone(),

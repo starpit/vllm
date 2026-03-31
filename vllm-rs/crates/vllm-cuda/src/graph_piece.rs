@@ -18,7 +18,7 @@ use crate::dtype::DType;
 use crate::tensor::GpuTensor;
 
 /// Maximum number of blocks per sequence in the block table.
-const MAX_BLOCKS_PER_SEQ: usize = 512;
+const MAX_BLOCKS_PER_SEQ: usize = 2048;
 
 /// Type of graph piece in the piecewise execution flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

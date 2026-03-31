@@ -408,12 +408,16 @@ pub enum ALoadSource {
     #[default]
     Gmem,
     /// Load from SMEM via ld.shared (register transfer — data written by a prior epilogue).
-    /// The SMEM address is computed as: smem_base + same_relative_offset_as_gmem.
-    /// `smem_base_reg` holds the precomputed base (set by the caller in prologue).
+    /// The scratch address is computed from the cp.async GMEM source address:
+    ///   offset = (u32)(gmem_src) & tile_mask
+    ///   scratch_addr = smem_base_reg + offset
+    /// This works when consumer A_ptr=0 and lda=tile_n, so gmem_src encodes
+    /// the row-major byte offset within the tile.
     Smem {
         /// Register holding the 32-bit SMEM base address for this A-load source.
-        /// Must be set by the caller before the K-loop.
         smem_base_reg: String,
+        /// Bitmask for within-tile offset: tile_m * tile_n * 2 - 1 (e.g., 8191 for 64x64 bf16).
+        tile_mask: u32,
     },
 }
 
@@ -793,6 +797,10 @@ pub fn replace_a_loads_with_inline_fn(
                 &format!("%f<{new_f32_count}>"),
             ));
             result.push("\t.reg .b16 \t%h_fn<4>;".to_string());
+            // Scratch offset register for SMEM-based A-loads
+            if matches!(computation.source, ALoadSource::Smem { .. }) {
+                result.push("\t.reg .u32 \t%r_fn_smoff;".to_string());
+            }
             // Epilogue scratch registers from the extracted computation
             if computation.scratch_f32_count > 0 {
                 result.push(format!(
@@ -858,15 +866,22 @@ pub fn replace_a_loads_with_inline_fn(
                             r_t(0), r_t(1), r_t(2), r_t(3)
                         ));
                     }
-                    ALoadSource::Smem { smem_base_reg } => {
-                        // Compute SMEM offset from the GMEM address:
-                        // The cp.async site's gmem_src encodes a specific K-column offset.
-                        // For SMEM scratch in linear layout, we use a pre-computed base
-                        // register that tracks the current position.
-                        // The A-load index * 16 bytes gives the offset within the tile row.
-                        let smem_offset = a_load_index * 16;
+                    ALoadSource::Smem { smem_base_reg, tile_mask } => {
+                        // Compute scratch offset from GMEM source address.
+                        // With A_ptr=0 and lda=tile_n, gmem_src encodes the row-major
+                        // byte offset within the tile (modulo tile_bytes).
+                        // Mask to extract within-tile offset, add scratch base.
                         result.push(format!(
-                            "\t@{p} ld.shared.v4.b32 \t{{{}, {}, {}, {}}}, [{smem_base_reg}+{smem_offset}];",
+                            "\tcvt.u32.u64 \t%r_fn_smoff, {gmem_src};"
+                        ));
+                        result.push(format!(
+                            "\tand.b32 \t%r_fn_smoff, %r_fn_smoff, {tile_mask};"
+                        ));
+                        result.push(format!(
+                            "\tadd.u32 \t%r_fn_smoff, {smem_base_reg}, %r_fn_smoff;"
+                        ));
+                        result.push(format!(
+                            "\t@{p} ld.shared.v4.b32 \t{{{}, {}, {}, {}}}, [%r_fn_smoff];",
                             r_t(0), r_t(1), r_t(2), r_t(3)
                         ));
                     }

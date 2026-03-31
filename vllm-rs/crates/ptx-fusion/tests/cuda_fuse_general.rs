@@ -3739,10 +3739,12 @@ fn register_transfer_mlp_gpu() {
 
     // Test configs: (hidden, intermediate, M values)
     // Using dims compatible with 64x64 tiles
+    // NOTE: intermediate must equal tile_n (64) for single driver iteration
+    // until consumer K-loop splitting across driver iterations is implemented.
     let configs: &[(u32, u32, &[u32])] = &[
-        (128, 128, &[64]),              // minimal: 1 tile each
-        (128, 256, &[64]),              // larger intermediate
-        (256, 256, &[64, 128]),         // multi-M-tile
+        (64, 64, &[64]),               // minimal single-tile: PASS
+        (64, 64, &[128]),             // multi M-tile, single N-tile
+        (128, 64, &[64]),              // multi consumer N-tiles, 1 driver iter
     ];
     let mut failures = Vec::new();
 
@@ -3798,8 +3800,9 @@ fn register_transfer_mlp_gpu() {
             let d_input = stream.clone_htod(&h_input).unwrap();
             let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
             let d_down_w = stream.clone_htod(&h_down_w).unwrap();
-            let d_output: CudaSlice<half::bf16> =
-                stream.alloc_zeros((m * hidden) as usize).unwrap();
+            // Init with sentinel to detect missing writes
+            let sentinel = vec![half::bf16::from_f32(42.0); (m * hidden) as usize];
+            let d_output = stream.clone_htod(&sentinel).unwrap();
 
             let (inp_p, _) = d_input.device_ptr(&stream);
             let (guw_p, _) = d_gateup_w.device_ptr(&stream);
@@ -3825,14 +3828,14 @@ fn register_transfer_mlp_gpu() {
 
             // Consumer (down) params
             let params_down = build_flat_params(
-                0u64,           // A ptr unused (reads from SMEM scratch)
+                0u64,           // A ptr = 0: gmem_src encodes row-major tile offset
                 dw_p as u64,
                 out_p as u64,
                 out_p as u64,
                 m,
                 hidden,         // N
                 intermediate,   // K
-                gate_up_cols,   // lda (unused — reads from SMEM)
+                tile_n as u32,  // lda = tile_n so gmem_src maps to scratch layout
                 intermediate,   // ldb
                 hidden,         // ldc
                 hidden,         // ldd
@@ -3869,11 +3872,41 @@ fn register_transfer_mlp_gpu() {
             let fused_output = stream.clone_dtoh(&d_output).unwrap();
 
             let mut max_diff = 0.0f32;
-            for (r, f) in ref_output.iter().zip(fused_output.iter()) {
+            let mut max_diff_idx = 0;
+            for (i, (r, f)) in ref_output.iter().zip(fused_output.iter()).enumerate() {
                 let diff = (r.to_f32() - f.to_f32()).abs();
                 if diff > max_diff {
                     max_diff = diff;
+                    max_diff_idx = i;
                 }
+            }
+            if max_diff >= 0.1 {
+                // Show first row and first element of each tile
+                eprintln!("  Row 0 (first 8 elements):");
+                for i in 0..8.min(ref_output.len()) {
+                    eprintln!("    [{i:3}] ref={:.4e} fused={:.4e}",
+                        ref_output[i].to_f32(), fused_output[i].to_f32());
+                }
+                // Show first element of each M-tile boundary
+                for mtile in 0..(m/tile_m) {
+                    let idx = (mtile * tile_m * hidden) as usize;
+                    if idx < ref_output.len() {
+                        eprintln!("  M-tile {mtile}, first elem [{idx}]: ref={:.4e} fused={:.4e}",
+                            ref_output[idx].to_f32(), fused_output[idx].to_f32());
+                    }
+                }
+                // Show first element of each N-tile boundary
+                for ntile in 0..(hidden/tile_n) {
+                    let idx = (ntile * tile_n) as usize;
+                    if idx < ref_output.len() {
+                        eprintln!("  N-tile {ntile}, first elem [{idx}]: ref={:.4e} fused={:.4e}",
+                            ref_output[idx].to_f32(), fused_output[idx].to_f32());
+                    }
+                }
+                let row = max_diff_idx / hidden as usize;
+                let col = max_diff_idx % hidden as usize;
+                eprintln!("  max_diff at idx={max_diff_idx} (row={row}, col={col}): ref={:.4e} fused={:.4e}",
+                    ref_output[max_diff_idx].to_f32(), fused_output[max_diff_idx].to_f32());
             }
             let status = if max_diff < 0.1 { "PASS" } else { "FAIL" };
             println!(

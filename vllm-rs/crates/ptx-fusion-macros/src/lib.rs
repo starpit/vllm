@@ -2766,10 +2766,12 @@ pub fn register_transfer_mlp(input: proc_macro::TokenStream) -> proc_macro::Toke
     };
 
     // Step 2: Build SiLU computation with SMEM sources
+    // tile_mask = tile_m * tile_n * 2 - 1 (64*64*2-1 = 8191 for 64x64 bf16 tiles)
     let computation = match pipeline_compile::build_silu_mul_computation_smem(
         name,
         "%r_gate_scratch",
         "%r_up_scratch",
+        8191,
     ) {
         Ok(c) => c,
         Err(e) => {

@@ -954,6 +954,11 @@ pub fn fuse_gemm_pointwise_gemm(
 
     // ── Analyze epilogue stores (for redirect) ──
     let prod_lines: Vec<&str> = producer_ptx.lines().collect();
+
+    // ── Extract consumer tile index map (need consumer's m_tile register) ──
+    let cons_lines: Vec<&str> = consumer_ptx.lines().collect();
+    let cons_tile_map = crate::parser::extract_tile_index_map(&cons_lines)
+        .ok_or("Failed to extract consumer tile index map")?;
     let prod_epi_start = prod_desc.loop_desc.backedge_line + 1;
     let prod_store_map = analyze_epilogue_stores(&prod_desc.epilogue, &prod_lines, prod_epi_start)?;
 
@@ -1068,6 +1073,8 @@ pub fn fuse_gemm_pointwise_gemm(
     out.push_str("\t.reg .u32 %r_driver_iter, %r_driver_total, %r_driver_n_off;\n");
     out.push_str("\t.reg .pred %p_driver_loop;\n");
     out.push_str("\t.reg .u32 %r_gate_scratch, %r_up_scratch;\n");
+    // Registers for producer tile index override (inverse swizzle)
+    out.push_str("\t.reg .u32 %r_prod_swiz, %r_prod_mask, %r_prod_ctaid_x, %r_prod_ctaid_y, %r_prod_n_tile;\n");
     // Epilogue redirect registers
     for decl in &gate_redir.reg_decls {
         out.push_str(&format!("\t{decl}\n"));
@@ -1096,15 +1103,30 @@ pub fn fuse_gemm_pointwise_gemm(
         out.push_str(&format!("\t{decl}\n"));
     }
 
-    // ── Preamble: tile index from consumer GEMM (defines output tile) ──
-    out.push_str("\t// === Consumer tile index (output tile) ===\n");
-    for line in &cons_fused_desc.preamble {
-        // The consumer preamble computes ctaid.x/y → m_tile, n_tile
-        // We need this for the output tile coordinates
-        let renamed = offset_all_registers(line, &offsets);
-        let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
-        out.push_str(&format!("{renamed}\n"));
-    }
+    // Compute consumer tile index (m_tile, n_tile) BEFORE the loop.
+    // Producer needs cons_m_tile for its tile index override.
+    // We compute swizzle_log from consumer's N (ferrite_params_2+68),
+    // then apply the CUTLASS swizzle to ctaid.x/y.
+    let cons_m_tile_reg = offset_all_registers(&cons_tile_map.m_tile_reg, &offsets);
+    let cons_ctaid_x_reg = offset_all_registers(&cons_tile_map.ctaid_x_reg, &offsets);
+    out.push_str("\t// === Consumer tile index (pre-loop) ===\n");
+    // Load consumer swizzle_log
+    out.push_str("\t.reg .u32 %r_cons_swiz;\n");
+    out.push_str("\tld.param.s32 \t%r_cons_swiz, [ferrite_params_2+68];\n");
+    out.push_str(&format!("\tadd.s32 \t%r_cons_swiz, %r_cons_swiz, {};\n", cons_tile_n - 1));
+    out.push_str(&format!("\tshr.u32 \t%r_cons_swiz, %r_cons_swiz, {};\n",
+        cons_tile_n.trailing_zeros()));
+    // swizzle_log = (grid_n >= 3) ? 2 : (grid_n >= 2) ? 1 : 0 (CUTLASS SwizzleN=4)
+    out.push_str("\t.reg .u32 %r_cons_swiz_tmp;\n");
+    out.push_str("\t.reg .pred %p_cons_swiz;\n");
+    out.push_str("\tmov.u32 \t%r_cons_swiz_tmp, 0;\n");
+    out.push_str("\tsetp.ge.u32 \t%p_cons_swiz, %r_cons_swiz, 2;\n");
+    out.push_str("\t@%p_cons_swiz mov.u32 \t%r_cons_swiz_tmp, 1;\n");
+    out.push_str("\tsetp.ge.u32 \t%p_cons_swiz, %r_cons_swiz, 3;\n");
+    out.push_str("\t@%p_cons_swiz mov.u32 \t%r_cons_swiz_tmp, 2;\n");
+    // Compute m_tile = ctaid.x >> swizzle_log
+    out.push_str(&format!("\tmov.u32 \t{cons_ctaid_x_reg}, %ctaid.x;\n"));
+    out.push_str(&format!("\tshr.s32 \t{cons_m_tile_reg}, {cons_ctaid_x_reg}, %r_cons_swiz_tmp;\n"));
 
     // ── Initialize driver loop ──
     out.push_str("\n\t// === Driver loop initialization ===\n");
@@ -1112,6 +1134,26 @@ pub fn fuse_gemm_pointwise_gemm(
     out.push_str("\tld.param.u32 \t%r_driver_n_off, [_intermediate_n_offset];\n");
     out.push_str(&format!("\tmov.u32 \t%r_gate_scratch, {gate_scratch_offset};\n"));
     out.push_str(&format!("\tmov.u32 \t%r_up_scratch, {up_scratch_offset};\n"));
+    // Compute producer swizzle_log from N (ferrite_params+68 = producer's N dim)
+    // Same approach as persistent kernel: grid_n = ceil(N/tile_n), swizzle_log from grid_n
+    out.push_str("\t// FERRITE: compute producer swizzle_log for inverse tile index\n");
+    out.push_str("\tld.param.s32 \t%r_prod_swiz, [ferrite_params+68];\n");
+    out.push_str(&format!("\tadd.s32 \t%r_prod_swiz, %r_prod_swiz, {};\n", prod_tile_n - 1));
+    out.push_str(&format!("\tshr.u32 \t%r_prod_swiz, %r_prod_swiz, {};\n",
+        prod_tile_n.trailing_zeros()));
+    // swizzle_log = (grid_n >= 4) ? 2 : (grid_n >= 2) ? 1 : 0
+    out.push_str("\tmov.u32 \t%r_prod_mask, 0;\n"); // temp: swizzle_log
+    out.push_str("\tsetp.ge.u32 \t%p_driver_loop, %r_prod_swiz, 2;\n");
+    out.push_str("\t@%p_driver_loop mov.u32 \t%r_prod_mask, 1;\n");
+    out.push_str("\tsetp.ge.u32 \t%p_driver_loop, %r_prod_swiz, 4;\n");
+    out.push_str("\t@%p_driver_loop mov.u32 \t%r_prod_mask, 2;\n");
+    out.push_str("\tmov.u32 \t%r_prod_swiz, %r_prod_mask;\n");
+    // Compute inverse-swizzle mask: ~((-1) << swizzle_log)
+    out.push_str("\tmov.u32 \t%r_prod_mask, -1;\n");
+    out.push_str("\tshl.b32 \t%r_prod_mask, %r_prod_mask, %r_prod_swiz;\n");
+    out.push_str("\tnot.b32 \t%r_prod_mask, %r_prod_mask;\n");
+    // Consumer m_tile register (in offset namespace) — same M rows for producer
+    let cons_m_tile_offset = offset_all_registers(&cons_tile_map.m_tile_reg, &offsets);
 
     // Zero consumer accumulators (in offset register namespace)
     out.push_str("\t// FERRITE: zero down MMA accumulators\n");
@@ -1127,13 +1169,22 @@ pub fn fuse_gemm_pointwise_gemm(
     // gate_up accums are consumed each iteration. down accums accumulate across iterations.
     out.push_str("\n$L_driver_loop:\n");
 
-    // Gate GEMM: preamble + K-loop + redirected epilogue
-    // TODO: The preamble needs tile index overridden:
-    //   m_tile = consumer's m_tile (from output tile)
-    //   n_tile = driver_iter (current gate N-tile)
+    // Gate GEMM: compute fake ctaid, preamble + K-loop + redirected epilogue
     out.push_str("\t// --- Gate GEMM (producer, N-tile = iter) ---\n");
+    // Inverse swizzle: ctaid_x = (m_tile << swiz) | (n_tile & mask), ctaid_y = n_tile >> swiz
+    out.push_str(&format!("\tshl.b32 \t%r_prod_ctaid_x, {cons_m_tile_offset}, %r_prod_swiz;\n"));
+    out.push_str("\tand.b32 \t%r_prod_n_tile, %r_driver_iter, %r_prod_mask;\n");
+    out.push_str("\tor.b32 \t%r_prod_ctaid_x, %r_prod_ctaid_x, %r_prod_n_tile;\n");
+    out.push_str("\tshr.u32 \t%r_prod_ctaid_y, %r_driver_iter, %r_prod_swiz;\n");
     for line in &prod_desc.preamble {
-        out.push_str(&format!("{line}\n"));
+        let mut l = line.to_string();
+        if l.contains("%ctaid.x") && l.contains("mov.u32") {
+            l = l.replace("%ctaid.x", "%r_prod_ctaid_x");
+        }
+        if l.contains("%ctaid.y") && l.contains("mov.u32") {
+            l = l.replace("%ctaid.y", "%r_prod_ctaid_y");
+        }
+        out.push_str(&format!("{l}\n"));
     }
     for line in &prod_desc.k_loop {
         out.push_str(&format!("{line}\n"));
@@ -1144,11 +1195,22 @@ pub fn fuse_gemm_pointwise_gemm(
     }
     out.push_str("\tbar.sync \t0;\n\n");
 
-    // Up GEMM: same preamble + K-loop but with labels renamed to avoid collision
+    // Up GEMM: same but n_tile = driver_iter + n_off, labels renamed
     out.push_str("\t// --- Up GEMM (producer, N-tile = iter + offset) ---\n");
+    out.push_str("\tadd.u32 \t%r_prod_n_tile, %r_driver_iter, %r_driver_n_off;\n");
+    out.push_str(&format!("\tshl.b32 \t%r_prod_ctaid_x, {cons_m_tile_offset}, %r_prod_swiz;\n"));
+    out.push_str("\tand.b32 \t%r_prod_ctaid_y, %r_prod_n_tile, %r_prod_mask;\n");
+    out.push_str("\tor.b32 \t%r_prod_ctaid_x, %r_prod_ctaid_x, %r_prod_ctaid_y;\n");
+    out.push_str("\tshr.u32 \t%r_prod_ctaid_y, %r_prod_n_tile, %r_prod_swiz;\n");
     for line in &prod_desc.preamble {
-        let renamed = line.replace("$L__BB0", "$L__BB_up");
-        out.push_str(&format!("{renamed}\n"));
+        let mut l = line.replace("$L__BB0", "$L__BB_up");
+        if l.contains("%ctaid.x") && l.contains("mov.u32") {
+            l = l.replace("%ctaid.x", "%r_prod_ctaid_x");
+        }
+        if l.contains("%ctaid.y") && l.contains("mov.u32") {
+            l = l.replace("%ctaid.y", "%r_prod_ctaid_y");
+        }
+        out.push_str(&format!("{l}\n"));
     }
     for line in &prod_desc.k_loop {
         let renamed = line.replace("$L__BB0", "$L__BB_up");
@@ -1161,11 +1223,45 @@ pub fn fuse_gemm_pointwise_gemm(
     }
     out.push_str("\tbar.sync \t0;\n\n");
 
+    // Consumer preamble inside the driver loop. The pipeline prologue fills
+    // mainloop SMEM from scratch (which the producer just wrote).
+    // CRITICAL: skip MMA accumulator zeroing — accumulators must persist
+    // across driver iterations. The CUTLASS preamble zeros them for a fresh
+    // GEMM, but we zero them once before the loop and accumulate across iterations.
+    let cons_accum_set: std::collections::HashSet<String> = cons_fused_desc
+        .mma_accumulators.iter()
+        .map(|r| offset_all_registers(r, &offsets))
+        .collect();
+    out.push_str("\t// === Consumer preamble (in-loop, accum-zeroing skipped) ===\n");
+    for line in &cons_fused_desc.preamble {
+        let renamed = offset_all_registers(line, &offsets);
+        let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
+        let renamed = renamed.replace("ferrite_params", "ferrite_params_2");
+        // Skip accumulator zeroing: mov.f32 <accum>, 0f00000000
+        // and mov.f32 <accum>, <other_accum> (spreading zero)
+        let trimmed = renamed.trim();
+        if trimmed.starts_with("mov.f32") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let dest = parts[1].trim_end_matches(',');
+                if cons_accum_set.contains(dest) {
+                    let src = parts[2].trim_end_matches(';');
+                    if src == "0f00000000" || cons_accum_set.contains(src) {
+                        out.push_str(&format!("\t// [ferrite] skipped accum zero: {trimmed}\n"));
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push_str(&format!("{renamed}\n"));
+    }
+
     // Consumer K-loop with SiLU from SMEM (A-loads replaced by pointwise)
     out.push_str("\t// --- Down K-loop (consumer, A from SiLU scratch) ---\n");
     for line in &cons_fused_desc.k_loop {
         let renamed = offset_all_registers(line, &offsets);
         let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
+        let renamed = renamed.replace("ferrite_params", "ferrite_params_2");
         out.push_str(&format!("{renamed}\n"));
     }
     out.push_str("\n");
@@ -1181,6 +1277,7 @@ pub fn fuse_gemm_pointwise_gemm(
     for line in &cons_fused_desc.epilogue {
         let renamed = offset_all_registers(line, &offsets);
         let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
+        let renamed = renamed.replace("ferrite_params", "ferrite_params_2");
         out.push_str(&format!("{renamed}\n"));
     }
 
@@ -2283,6 +2380,7 @@ pub fn build_silu_mul_computation_smem(
     fused_name: &str,
     gate_smem_base_reg: &str,
     up_smem_base_reg: &str,
+    tile_mask: u32,
 ) -> Result<PointwiseComputation, String> {
     // No extra kernel params needed — SMEM addresses are computed internally
     let extra_params = vec![];
@@ -2299,17 +2397,23 @@ pub fn build_silu_mul_computation_smem(
     let param_loads = vec![];
 
     // Per-site: load 8 bf16 up values from SMEM scratch.
-    // The byte offset for each site is computed at code-gen time by
-    // replace_a_loads_with_inline_fn, which substitutes {LOAD_INDEX} with 0,1,2...
-    // We pre-compute the byte offset as LOAD_INDEX * 16 in the template.
-    // Since {LOAD_INDEX} is a compile-time literal, the add is a constant.
-    let mut per_site = vec!["// FERRITE: load up values from SMEM scratch".into()];
-    // Use immediate offset: up_base + LOAD_INDEX * 16
-    // We emit this as a direct ld.shared with computed offset.
-    // The {LOAD_INDEX_X16} placeholder will be resolved below.
+    // Use gmem_src-based addressing: the GMEM source register encodes the
+    // row-major byte offset within the tile (when A_ptr=0 and lda=tile_n).
+    // %r_fn_smoff is computed by the main A-load handler.
+    let mut per_site = vec!["// FERRITE: load up values from SMEM scratch (gmem_src-based)".into()];
+    // Recompute scratch address for up: same tile offset, different base
     per_site.push(format!(
-        "ld.shared.v4.b32 \t{{%r_up0, %r_up1, %r_up2, %r_up3}}, [{up_smem_base_reg}+{{LOAD_INDEX_X16}}];"
+        "cvt.u32.u64 \t%r_fn_smoff, {{GMEM_SRC}};"
     ));
+    per_site.push(format!(
+        "and.b32 \t%r_fn_smoff, %r_fn_smoff, {tile_mask};"
+    ));
+    per_site.push(format!(
+        "add.u32 \t%r_fn_smoff, {up_smem_base_reg}, %r_fn_smoff;"
+    ));
+    per_site.push(
+        "ld.shared.v4.b32 \t{%r_up0, %r_up1, %r_up2, %r_up3}, [%r_fn_smoff];".into()
+    );
 
     // Unpack 8 bf16 up values to f32
     per_site.push("// FERRITE: unpack 8 bf16 up values to f32".into());
@@ -2352,6 +2456,7 @@ pub fn build_silu_mul_computation_smem(
         scratch_b32_count: 0,
         source: crate::fuse_general::ALoadSource::Smem {
             smem_base_reg: gate_smem_base_reg.to_string(),
+            tile_mask,
         },
     })
 }
@@ -4143,6 +4248,7 @@ mod tests {
             "silu_smem_test",
             "%r_gate_scratch",
             "%r_up_scratch",
+            8191,
         )
         .expect("build silu smem");
 
@@ -4220,6 +4326,7 @@ mod tests {
             "fused_mlp",
             "%r_gate_scratch",
             "%r_up_scratch",
+            8191,
         )
         .expect("build silu smem");
 

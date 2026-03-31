@@ -1556,8 +1556,9 @@ pub struct TileIndexMap {
 /// Returns `None` if the pattern is not found.
 pub fn extract_tile_index_map(lines: &[&str]) -> Option<TileIndexMap> {
     // Step 1: Find mov.u32 %rA, %ctaid.x and mov.u32 %rB, %ctaid.y
-    // Only look in the first 50 lines (entry block, before the K-loop)
-    let search_limit = lines.len().min(50);
+    // Search up to 100 lines — perimeter replacement can insert extra lines
+    // that push ctaid.y past 50.
+    let search_limit = lines.len().min(100);
     let mut ctaid_x_reg = String::new();
     let mut ctaid_x_line = 0;
     let mut ctaid_y_reg = String::new();

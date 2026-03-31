@@ -585,3 +585,431 @@ fn extract_entry_name(line: &str) -> Option<String> {
     let paren = after.find('(')?;
     Some(after[..paren].trim().to_string())
 }
+
+/// Build a single-body persistent MLP block kernel.
+///
+/// Instead of duplicating the GEMM body for each phase (gate_up and SiLU-fused-down),
+/// this uses ONE GEMM body with:
+/// - Params read from shared memory (copied from the active phase's param block at dispatch)
+/// - Conditional SiLU at A-load sites (branched on a phase predicate)
+///
+/// This keeps the instruction footprint ~40KB (fits in 32KB L0 I-cache with minimal misses)
+/// and uses ~4 hardware barriers (vs 16 for the two-body approach), allowing 2+ blocks/SM.
+///
+/// The `silu_computation` contains the per-site and per-element instructions for
+/// SiLU+mul fusion (from `build_silu_mul_computation`).
+pub fn make_single_body_persistent_mlp(
+    flat_gemm_ptx: &str,
+    silu_computation: &crate::fuse_general::PointwiseComputation,
+    new_name: &str,
+) -> Result<String, String> {
+    use crate::fuse_cp_async::{
+        CpAsyncClass, classify_cp_async_loads, find_all_reg_counts, identify_a_matrix_param,
+        parse_cp_async,
+    };
+    use crate::parser::PtxParser;
+
+    let lines: Vec<&str> = flat_gemm_ptx.lines().collect();
+    let proto = PtxParser::parse(flat_gemm_ptx)?;
+    let reg_to_param = PtxParser::trace_param_registers_pub(&lines, &proto.params);
+
+    // Classify cp.async loads as A or B matrix
+    let a_param_name = identify_a_matrix_param(&lines, &reg_to_param, "ferrite_params")?;
+    let a_addr_regs: Vec<String> = reg_to_param
+        .iter()
+        .filter(|(_, p)| **p == a_param_name)
+        .map(|(r, _)| r.clone())
+        .collect();
+    let classifications = classify_cp_async_loads(&lines, &a_addr_regs);
+
+    let regs = find_all_reg_counts(&lines);
+
+    // Allocate temp registers for the SiLU path (same as replace_a_loads_with_inline_fn)
+    let p_mask_idx = regs.pred;
+    let r_base = regs.b32;
+    let f_base = regs.f32_;
+
+    let new_pred_count = regs.pred + 2; // +1 for mask, +1 for %p_silu
+    let new_b32_count = regs.b32 + 4 + silu_computation.scratch_b32_count;
+    let new_f32_count = regs.f32_ + 2 + silu_computation.scratch_f32_count;
+
+    let p_mask = format!("%p{p_mask_idx}");
+    let r_t = |i: usize| format!("%r{}", r_base + i);
+    let f_v = |i: usize| format!("%f{}", f_base + i);
+
+    // ── Extract header, declarations, and body from the flat GEMM ──
+
+    // Header: everything before .entry
+    let entry_idx = lines
+        .iter()
+        .position(|l| l.contains(".visible") && l.contains(".entry"))
+        .ok_or("no .entry found")?;
+    let header: Vec<&str> = lines[..entry_idx].iter().copied().collect();
+
+    // Body start: first '{'
+    let body_start = lines
+        .iter()
+        .position(|l| l.trim() == "{" || l.trim().ends_with('{'))
+        .ok_or("no '{' found")?;
+
+    // Declarations: from body_start+1 to first non-declaration line
+    let mut decl_end = body_start + 1;
+    while decl_end < lines.len() {
+        let t = lines[decl_end].trim();
+        if !t.starts_with(".reg")
+            && !t.starts_with(".shared")
+            && !t.starts_with(".local")
+            && !t.starts_with("//")
+            && !t.is_empty()
+        {
+            break;
+        }
+        decl_end += 1;
+    }
+
+    // Body instructions: from decl_end to ret;
+    let ret_idx = lines
+        .iter()
+        .rposition(|l| l.trim() == "ret;")
+        .ok_or("no ret; found")?;
+
+    // ── Build the output PTX ──
+    let mut out = String::new();
+
+    // Header (version, target, extern shared)
+    for l in &header {
+        out.push_str(l);
+        out.push('\n');
+    }
+
+    // Entry point with persistent + original + SiLU params
+    out.push_str(&format!(".visible .entry {new_name}(\n"));
+    let persistent_params = [
+        ".param .u64 _persistent_counter",
+        ".param .u32 _persistent_total",
+        ".param .u32 _persistent_grid_x_0",
+        ".param .u32 _persistent_phase0_tiles",
+        ".param .u32 _persistent_grid_x_1",
+        ".param .u32 _persistent_ntiles_per_m_0",
+        ".param .u64 _persistent_mtile_done",
+    ];
+    for p in &persistent_params {
+        out.push_str(&format!("\t{p},\n"));
+    }
+    // Phase 0 params
+    out.push_str("\t.param .align 1 .b8 ferrite_params[88],\n");
+    // SiLU intermediate offset
+    out.push_str("\t.param .u64 _ferrite_intermediate_bytes,\n");
+    // Phase 1 params
+    out.push_str("\t.param .align 1 .b8 ferrite_params_2[88]\n");
+    out.push_str(")\n{\n");
+
+    // Original declarations with bumped register counts
+    for i in (body_start + 1)..decl_end {
+        let t = lines[i].trim();
+        if t.starts_with(".reg .pred") && t.contains(&format!("%p<{}>", regs.pred)) {
+            out.push_str(&lines[i].replace(
+                &format!("%p<{}>", regs.pred),
+                &format!("%p<{new_pred_count}>"),
+            ));
+            out.push('\n');
+        } else if t.starts_with(".reg .b32") && t.contains(&format!("%r<{}>", regs.b32)) {
+            out.push_str(&lines[i].replace(
+                &format!("%r<{}>", regs.b32),
+                &format!("%r<{new_b32_count}>"),
+            ));
+            out.push('\n');
+        } else if t.starts_with(".reg .f32") && t.contains(&format!("%f<{}>", regs.f32_)) {
+            out.push_str(&lines[i].replace(
+                &format!("%f<{}>", regs.f32_),
+                &format!("%f<{new_f32_count}>"),
+            ));
+            out.push('\n');
+            // Add bf16 unpacking regs and SiLU scratch
+            out.push_str("\t.reg .b16 \t%h_fn<4>;\n");
+            if silu_computation.scratch_f32_count > 0 {
+                out.push_str(&format!(
+                    "\t.reg .f32 \t%f_epi<{}>;\n",
+                    silu_computation.scratch_f32_count
+                ));
+            }
+            if silu_computation.scratch_b32_count > 0 {
+                out.push_str(&format!(
+                    "\t.reg .b32 \t%r_epi<{}>;\n",
+                    silu_computation.scratch_b32_count
+                ));
+            }
+            // SiLU-specific named registers
+            for decl in &silu_computation.extra_reg_decls {
+                out.push_str(&format!("\t{decl}\n"));
+            }
+        } else {
+            out.push_str(lines[i]);
+            out.push('\n');
+        }
+    }
+
+    // Persistent + param-switching scratch registers
+    out.push_str("\t// FERRITE: persistent single-body scratch\n");
+    out.push_str("\t.reg .u32 \t%r_ptile, %r_ptile_x, %r_ptile_y;\n");
+    out.push_str("\t.reg .u32 \t%r_ptotal, %r_pgx0, %r_pgx1;\n");
+    out.push_str("\t.reg .u32 \t%r_pp0tiles, %r_plocal, %r_pmtile;\n");
+    out.push_str("\t.reg .u32 \t%r_pntpm0, %r_pbarval, %r_pswiz;\n");
+    out.push_str("\t.reg .u64 \t%rd_pctr, %rd_pmtdone, %rd_pbar;\n");
+    out.push_str("\t.reg .u64 \t%rd_ptmp;\n");
+    out.push_str("\t.reg .pred \t%p_pdone, %p_pt0, %p_pphase, %p_pswiz;\n");
+    out.push_str("\t.reg .pred \t%p_silu;\n");
+    out.push_str("\t.shared .align 4 .u32 _ptile_smem[1];\n");
+    out.push_str("\t.shared .align 8 .b8 _active_params[88];\n\n");
+
+    // ── Persistent loop setup ──
+    out.push_str("\t// FERRITE: persistent loop setup\n");
+    out.push_str("\tld.param.u64 \t%rd_pctr, [_persistent_counter];\n");
+    out.push_str("\tcvta.to.global.u64 \t%rd_pctr, %rd_pctr;\n");
+    out.push_str("\tld.param.u32 \t%r_ptotal, [_persistent_total];\n");
+    out.push_str("\tld.param.u32 \t%r_pgx0, [_persistent_grid_x_0];\n");
+    out.push_str("\tld.param.u32 \t%r_pgx1, [_persistent_grid_x_1];\n");
+    out.push_str("\tld.param.u32 \t%r_pp0tiles, [_persistent_phase0_tiles];\n");
+    out.push_str("\tld.param.u32 \t%r_pntpm0, [_persistent_ntiles_per_m_0];\n");
+    out.push_str("\tld.param.u64 \t%rd_pmtdone, [_persistent_mtile_done];\n");
+    out.push_str("\tcvta.to.global.u64 \t%rd_pmtdone, %rd_pmtdone;\n\n");
+
+    // ── Persistent loop ──
+    out.push_str("$L_persistent_loop:\n");
+    out.push_str("\t// Grab next tile\n");
+    out.push_str("\tmov.u32 \t%r_ptile, %tid.x;\n");
+    out.push_str("\tsetp.eq.u32 \t%p_pt0, %r_ptile, 0;\n");
+    out.push_str("\t@%p_pt0 atom.global.add.u32 \t%r_ptile, [%rd_pctr], 1;\n");
+    out.push_str("\t@%p_pt0 st.shared.u32 \t[_ptile_smem], %r_ptile;\n");
+    out.push_str("\tbar.sync \t14;\n");
+    out.push_str("\tld.shared.u32 \t%r_ptile, [_ptile_smem];\n");
+    out.push_str("\tsetp.ge.u32 \t%p_pdone, %r_ptile, %r_ptotal;\n");
+    out.push_str("\t@%p_pdone bra \t$L_persistent_exit;\n\n");
+
+    // Phase dispatch
+    out.push_str("\t// Phase dispatch\n");
+    out.push_str("\tsetp.lt.u32 \t%p_pphase, %r_ptile, %r_pp0tiles;\n");
+    out.push_str("\t@%p_pphase bra \t$L_dispatch_phase0;\n");
+    out.push_str("\tbra \t$L_dispatch_phase1;\n\n");
+
+    // ── Phase 0 dispatch: copy ferrite_params to _active_params, set %p_silu=false ──
+    out.push_str("$L_dispatch_phase0:\n");
+    out.push_str("\t// Compute ctaid_x/y\n");
+    out.push_str("\tmov.u32 \t%r_plocal, %r_ptile;\n");
+    out.push_str("\trem.u32 \t%r_ptile_x, %r_plocal, %r_pgx0;\n");
+    out.push_str("\tdiv.u32 \t%r_ptile_y, %r_plocal, %r_pgx0;\n");
+    // Copy 88 bytes: ferrite_params → _active_params (thread 0 only)
+    out.push_str("\t// Copy phase 0 params to shared memory (thread 0 only)\n");
+    out.push_str("\tmov.u32 \t%r_pbarval, %tid.x;\n");
+    out.push_str("\tsetp.eq.u32 \t%p_pt0, %r_pbarval, 0;\n");
+    for offset in (0..88).step_by(8) {
+        out.push_str(&format!(
+            "\t@%p_pt0 ld.param.u64 \t%rd_ptmp, [ferrite_params+{offset}];\n"
+        ));
+        out.push_str(&format!(
+            "\t@%p_pt0 st.shared.u64 \t[_active_params+{offset}], %rd_ptmp;\n"
+        ));
+    }
+    out.push_str("\tmov.pred \t%p_silu, 0;\n");
+    out.push_str("\tbra \t$L_gemm_body;\n\n");
+
+    // ── Phase 1 dispatch: wait for M-tile barrier, copy ferrite_params_2, set %p_silu=true ──
+    out.push_str("$L_dispatch_phase1:\n");
+    out.push_str("\tsub.u32 \t%r_plocal, %r_ptile, %r_pp0tiles;\n");
+    out.push_str("\trem.u32 \t%r_ptile_x, %r_plocal, %r_pgx1;\n");
+    out.push_str("\tdiv.u32 \t%r_ptile_y, %r_plocal, %r_pgx1;\n");
+
+    // Compute m_tile for barrier check (same logic as make_persistent_two_phase)
+    out.push_str("\t// Compute m_tile for barrier\n");
+    out.push_str("\tld.param.s32 \t%r_pbarval, [ferrite_params_2+68];\n"); // N
+    out.push_str("\tadd.s32 \t%r_pbarval, %r_pbarval, 127;\n");
+    out.push_str("\tshr.u32 \t%r_pbarval, %r_pbarval, 7;\n"); // ceil(N/128)
+    out.push_str("\tmov.u32 \t%r_pswiz, 0;\n");
+    out.push_str("\tsetp.ge.u32 \t%p_pswiz, %r_pbarval, 2;\n");
+    out.push_str("\t@%p_pswiz mov.u32 \t%r_pswiz, 1;\n");
+    out.push_str("\tsetp.ge.u32 \t%p_pswiz, %r_pbarval, 4;\n");
+    out.push_str("\t@%p_pswiz mov.u32 \t%r_pswiz, 2;\n");
+    out.push_str("\tshr.u32 \t%r_pmtile, %r_ptile_x, %r_pswiz;\n\n");
+
+    // Per-M-tile barrier: spin until mtile_done[m_tile] >= ntiles_per_m_0
+    out.push_str("\t// Per-M-tile barrier\n");
+    out.push_str("\tshl.b32 \t%r_pbarval, %r_pmtile, 2;\n");
+    out.push_str("\tcvt.u64.u32 \t%rd_pbar, %r_pbarval;\n");
+    out.push_str("\tadd.u64 \t%rd_pbar, %rd_pmtdone, %rd_pbar;\n");
+    out.push_str("$L_mtile_wait:\n");
+    out.push_str("\tld.global.acquire.gpu.u32 \t%r_pbarval, [%rd_pbar];\n");
+    out.push_str("\tsetp.ge.u32 \t%p_pdone, %r_pbarval, %r_pntpm0;\n");
+    out.push_str("\t@!%p_pdone bra \t$L_mtile_wait;\n\n");
+
+    // Copy phase 1 params to shared memory
+    out.push_str("\t// Copy phase 1 params to shared memory (thread 0 only)\n");
+    out.push_str("\tmov.u32 \t%r_pbarval, %tid.x;\n");
+    out.push_str("\tsetp.eq.u32 \t%p_pt0, %r_pbarval, 0;\n");
+    for offset in (0..88).step_by(8) {
+        out.push_str(&format!(
+            "\t@%p_pt0 ld.param.u64 \t%rd_ptmp, [ferrite_params_2+{offset}];\n"
+        ));
+        out.push_str(&format!(
+            "\t@%p_pt0 st.shared.u64 \t[_active_params+{offset}], %rd_ptmp;\n"
+        ));
+    }
+    // Load intermediate_bytes for SiLU
+    out.push_str("\tld.param.u64 \t%rd_up_off, [_ferrite_intermediate_bytes];\n");
+    out.push_str("\tmov.pred \t%p_silu, 1;\n");
+    out.push_str("\tbra \t$L_gemm_body;\n\n");
+
+    // ── GEMM body ──
+    out.push_str("$L_gemm_body:\n");
+    out.push_str("\tbar.sync \t13;\n"); // ensure param copy visible
+
+    // Emit the GEMM body with modifications:
+    // 1. Replace ld.param [ferrite_params+N] → ld.shared [_active_params+N]
+    // 2. Replace %ctaid.x/y with persistent tile registers
+    // 3. At A-load cp.async sites: add conditional SiLU
+    let mut a_load_index: usize = 0;
+    for i in decl_end..ret_idx {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // Replace ctaid.x/y
+        if trimmed.contains("%ctaid.x") && trimmed.contains("mov.u32") {
+            out.push_str(&line.replace("%ctaid.x", "%r_ptile_x"));
+            out.push('\n');
+            continue;
+        }
+        if trimmed.contains("%ctaid.y") && trimmed.contains("mov.u32") {
+            out.push_str(&line.replace("%ctaid.y", "%r_ptile_y"));
+            out.push('\n');
+            continue;
+        }
+
+        // Replace ld.param [ferrite_params+N] → ld.shared [_active_params+N]
+        if trimmed.contains("ld.param") && trimmed.contains("ferrite_params") {
+            let modified = line
+                .replace("ld.param", "ld.shared")
+                .replace("ferrite_params", "_active_params");
+            out.push_str(&modified);
+            out.push('\n');
+            continue;
+        }
+
+        // Conditional SiLU at A-load cp.async sites
+        if trimmed.contains("cp.async.cg.shared.global")
+            && classifications.get(&i) == Some(&CpAsyncClass::AMatrix)
+        {
+            if let Some((smem_dst, gmem_src, mask)) = parse_cp_async(trimmed) {
+                let label_n = a_load_index;
+                // Branch: if not SiLU phase, do normal cp.async
+                out.push_str(&format!("\t@!%p_silu bra \t$L_normal_aload_{label_n};\n"));
+
+                // ── SiLU path ──
+                // Mask check
+                out.push_str(&format!("\tsetp.ne.b32 \t{p_mask}, {mask}, 0;\n"));
+                // Load gate values (16 bytes = 8 bf16)
+                out.push_str(&format!(
+                    "\t@{p_mask} ld.global.v4.b32 \t{{{}, {}, {}, {}}}, [{gmem_src}];\n",
+                    r_t(0),
+                    r_t(1),
+                    r_t(2),
+                    r_t(3)
+                ));
+                for j in 0..4 {
+                    out.push_str(&format!("\t@!{p_mask} mov.b32 \t{}, 0;\n", r_t(j)));
+                }
+
+                // Per-site instructions (load up values)
+                if !silu_computation.per_site.is_empty() {
+                    let idx_str = a_load_index.to_string();
+                    for instr in &silu_computation.per_site {
+                        let concrete = instr
+                            .replace("{GMEM_SRC}", &gmem_src)
+                            .replace("{MASK_PRED}", &p_mask)
+                            .replace("{LOAD_INDEX}", &idx_str);
+                        out.push_str(&format!("\t{concrete}\n"));
+                    }
+                }
+
+                // Apply SiLU+mul per bf16 pair
+                for j in 0..4usize {
+                    out.push_str(&format!("\tmov.b32 \t{{%h_fn0, %h_fn1}}, {};\n", r_t(j)));
+                    out.push_str(&format!("\tcvt.f32.bf16 \t{}, %h_fn0;\n", f_v(0)));
+                    out.push_str(&format!("\tcvt.f32.bf16 \t{}, %h_fn1;\n", f_v(1)));
+
+                    let elem_lo = (j * 2).to_string();
+                    let elem_hi = (j * 2 + 1).to_string();
+                    for instr in &silu_computation.instructions {
+                        let c = instr
+                            .replace("{INPUT}", &f_v(0))
+                            .replace("{ELEM_IDX}", &elem_lo);
+                        out.push_str(&format!("\t{c}\n"));
+                    }
+                    for instr in &silu_computation.instructions {
+                        let c = instr
+                            .replace("{INPUT}", &f_v(1))
+                            .replace("{ELEM_IDX}", &elem_hi);
+                        out.push_str(&format!("\t{c}\n"));
+                    }
+
+                    out.push_str(&format!("\tcvt.rn.bf16.f32 \t%h_fn0, {};\n", f_v(0)));
+                    out.push_str(&format!("\tcvt.rn.bf16.f32 \t%h_fn1, {};\n", f_v(1)));
+                    out.push_str(&format!("\tmov.b32 \t{}, {{%h_fn0, %h_fn1}};\n", r_t(j)));
+                }
+
+                // Store to SMEM
+                out.push_str(&format!(
+                    "\tst.shared.v4.b32 \t[{smem_dst}], {{{}, {}, {}, {}}};\n",
+                    r_t(0),
+                    r_t(1),
+                    r_t(2),
+                    r_t(3)
+                ));
+                out.push_str(&format!("\tbra \t$L_after_aload_{label_n};\n"));
+
+                // ── Normal path (cp.async unchanged) ──
+                out.push_str(&format!("$L_normal_aload_{label_n}:\n"));
+                out.push_str(line);
+                out.push('\n');
+
+                out.push_str(&format!("$L_after_aload_{label_n}:\n"));
+                a_load_index += 1;
+                continue;
+            }
+        }
+
+        // Default: emit line unchanged
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // ── Post-body: phase 0 signals M-tile barrier ──
+    out.push_str("\n\t// Post-body: phase 0 increments M-tile done\n");
+    out.push_str("\t@%p_silu bra \t$L_persistent_loop_back;\n"); // phase 1 skips
+    out.push_str("\tbar.sync \t0;\n");
+    out.push_str("\tmov.u32 \t%r_pbarval, %tid.x;\n");
+    out.push_str("\tsetp.eq.u32 \t%p_pt0, %r_pbarval, 0;\n");
+    // Compute m_tile from phase 0's ctaid_x
+    out.push_str("\tld.shared.s32 \t%r_pbarval, [_active_params+68];\n"); // N from active params
+    out.push_str("\tadd.s32 \t%r_pbarval, %r_pbarval, 127;\n");
+    out.push_str("\tshr.u32 \t%r_pbarval, %r_pbarval, 7;\n");
+    out.push_str("\tmov.u32 \t%r_pmtile, 0;\n");
+    out.push_str("\tsetp.ge.u32 \t%p_pswiz, %r_pbarval, 2;\n");
+    out.push_str("\t@%p_pswiz mov.u32 \t%r_pmtile, 1;\n");
+    out.push_str("\tsetp.ge.u32 \t%p_pswiz, %r_pbarval, 4;\n");
+    out.push_str("\t@%p_pswiz mov.u32 \t%r_pmtile, 2;\n");
+    out.push_str("\tshr.u32 \t%r_pmtile, %r_ptile_x, %r_pmtile;\n");
+    // atomicAdd mtile_done[m_tile]
+    out.push_str("\tshl.b32 \t%r_pbarval, %r_pmtile, 2;\n");
+    out.push_str("\tcvt.u64.u32 \t%rd_pbar, %r_pbarval;\n");
+    out.push_str("\tadd.u64 \t%rd_pbar, %rd_pmtdone, %rd_pbar;\n");
+    out.push_str("\t@%p_pt0 atom.global.add.u32 \t%r_pbarval, [%rd_pbar], 1;\n");
+
+    // Loop back
+    out.push_str("$L_persistent_loop_back:\n");
+    out.push_str("\tbar.sync \t15;\n");
+    out.push_str("\tbra \t$L_persistent_loop;\n\n");
+    out.push_str("$L_persistent_exit:\n");
+    out.push_str("\tret;\n");
+    out.push_str("}\n");
+
+    Ok(out)
+}

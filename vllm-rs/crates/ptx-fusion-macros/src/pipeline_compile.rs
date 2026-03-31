@@ -1027,7 +1027,7 @@ pub fn fuse_pointwise_into_gemm(
 /// (from gate_up_buf with lda=2*intermediate). The per-site code loads
 /// the corresponding up values at +intermediate_bytes offset. Per-element
 /// instructions apply SiLU(gate) * up.
-fn build_silu_mul_computation(fused_name: &str) -> Result<PointwiseComputation, String> {
+pub fn build_silu_mul_computation(fused_name: &str) -> Result<PointwiseComputation, String> {
     // Extra params: just the byte offset to the "up" half
     let extra_params = vec![".param .u64 _ferrite_intermediate_bytes,".into()];
 

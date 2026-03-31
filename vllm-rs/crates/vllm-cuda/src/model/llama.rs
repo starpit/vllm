@@ -1069,10 +1069,14 @@ impl LlamaDecoderLayer {
                 crate::layers::LinearLayer::Dense(down_linear),
             ) = (&self.mlp.gate_up_proj, &self.mlp.down_proj)
             {
-                // Toggle: fused vs separate MLP
-                const FUSED_MLP: bool = true;
+                // Use fused MLP only when M is large enough for the persistent
+                // kernel's pipelining to outweigh its overhead (atomic tile grab,
+                // barrier spin per M-tile).  At small M (decode), the separate
+                // path with 3 launches is faster.
+                let m = attn_output.as_gpu_tensor().dim(0);
+                let use_fused_mlp = m >= 64;
 
-                if !FUSED_MLP {
+                if !use_fused_mlp {
                     let gate_up = gate_up_linear.forward_ferrite(
                         attn_output.view(),
                         &device.ferrite,

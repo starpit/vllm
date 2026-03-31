@@ -2668,65 +2668,33 @@ pub fn persistent_mlp_block(input: proc_macro::TokenStream) -> proc_macro::Token
     let silu_ptx = rd!(4);
     let name = &strings[5];
 
-    // Step 1: Build sequenced MLP block (same as sequence_mlp_block)
-    let (flat_gate_up, _) =
-        match perimeter::replace_perimeter(&gate_up_ptx, &gate_up_deriv, "gate_up") {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = format!("gate_up: {e}");
-                return quote! { compile_error!(#msg) }.into();
-            }
-        };
-
-    let silu_stage = match pipeline::PipelineStage::from_ptx("silu", &silu_ptx, None) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("silu: {e}");
-            return quote! { compile_error!(#msg) }.into();
-        }
-    };
-    let down_stage = match pipeline::PipelineStage::from_ptx("down", &down_ptx, None) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("down: {e}");
-            return quote! { compile_error!(#msg) }.into();
-        }
-    };
-    let fused_down =
-        match pipeline_compile::fuse_pointwise_into_gemm(&silu_stage, &down_stage, "down_silu") {
-            Ok(ptx) => ptx,
-            Err(e) => {
-                let msg = format!("fuse silu+down: {e}");
-                return quote! { compile_error!(#msg) }.into();
-            }
-        };
-    let (flat_down, _) = match perimeter::replace_perimeter(&fused_down, &down_deriv, "down_silu") {
+    // Step 1: Perimeter-replace the base GEMM (just once — single body for both phases)
+    let (flat_gemm, _) = match perimeter::replace_perimeter(&gate_up_ptx, &gate_up_deriv, "base") {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("down perimeter: {e}");
-            return quote! { compile_error!(#msg) }.into();
-        }
-    };
-    let flat_down = dedup_reg_declarations(&flat_down);
-
-    // Step 2: Sequence into two-phase kernel
-    let sequenced = match pipeline_compile::sequence_gemm_phases(&[&flat_gate_up, &flat_down], name)
-    {
-        Ok(ptx) => ptx,
-        Err(e) => {
-            let msg = format!("sequence: {e}");
+            let msg = format!("base GEMM: {e}");
             return quote! { compile_error!(#msg) }.into();
         }
     };
 
-    // Step 3: Wrap in persistent loop with per-M-tile barriers
-    let persistent = match persistent::make_persistent_two_phase(&sequenced, name) {
-        Ok(ptx) => ptx,
+    // Step 2: Build SiLU+mul computation for conditional A-load injection
+    let silu_computation = match pipeline_compile::build_silu_mul_computation(name) {
+        Ok(c) => c,
         Err(e) => {
-            let msg = format!("persistent wrap: {e}");
+            let msg = format!("silu computation: {e}");
             return quote! { compile_error!(#msg) }.into();
         }
     };
+
+    // Step 3: Build single-body persistent kernel
+    let persistent =
+        match persistent::make_single_body_persistent_mlp(&flat_gemm, &silu_computation, name) {
+            Ok(ptx) => ptx,
+            Err(e) => {
+                let msg = format!("persistent single-body: {e}");
+                return quote! { compile_error!(#msg) }.into();
+            }
+        };
 
     quote! { #persistent }.into()
 }

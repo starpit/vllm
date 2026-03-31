@@ -40,6 +40,8 @@ pub enum BenchCommands {
     Hotpotqa(BenchHotpotqaArgs),
     /// MS MARCO passage QA accuracy benchmark.
     Msmarco(BenchMsmarcoArgs),
+    /// LongBench v2 long-context accuracy benchmark.
+    Longbench(BenchLongbenchArgs),
 }
 
 /// Arguments for `vllm bench latency`.
@@ -1115,6 +1117,10 @@ pub struct BenchMultihopArgs {
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
 
+    /// Number of GPUs for tensor parallelism.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
     /// HuggingFace token.
     #[arg(long, env = "HF_TOKEN")]
     pub hf_token: Option<String>,
@@ -1201,6 +1207,10 @@ pub struct BenchMusiqueArgs {
     /// KV cache block size in tokens.
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
+
+    /// Number of GPUs for tensor parallelism.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
 
     /// HuggingFace token.
     #[arg(long, env = "HF_TOKEN")]
@@ -1290,6 +1300,10 @@ pub struct BenchHotpotqaArgs {
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
 
+    /// Number of GPUs for tensor parallelism.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
     /// HuggingFace token.
     #[arg(long, env = "HF_TOKEN")]
     pub hf_token: Option<String>,
@@ -1377,6 +1391,10 @@ pub struct BenchMsmarcoArgs {
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
 
+    /// Number of GPUs for tensor parallelism.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
     /// HuggingFace token.
     #[arg(long, env = "HF_TOKEN")]
     pub hf_token: Option<String>,
@@ -1399,6 +1417,106 @@ pub struct BenchMsmarcoArgs {
 }
 
 impl BenchMsmarcoArgs {
+    pub fn resolved_model(&self) -> Result<String, String> {
+        match (&self.model_tag, &self.model) {
+            (Some(tag), _) => Ok(tag.clone()),
+            (None, Some(m)) => Ok(m.clone()),
+            (None, None) => {
+                Err("model is required: provide as positional arg or --model flag".into())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LongBench v2 benchmark args
+// ---------------------------------------------------------------------------
+
+/// Arguments for `vllm bench longbench`.
+///
+/// LongBench v2: downloads the dataset from HuggingFace and evaluates
+/// long-context understanding across diverse tasks. Multiple-choice format
+/// (A/B/C/D) with very long contexts (median ~100K tokens).
+///
+/// Compares plain (chat) vs span (SPNL) modes, reporting accuracy by
+/// domain, difficulty, and context length category.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench longbench [MODEL] [OPTIONS]")]
+pub struct BenchLongbenchArgs {
+    /// Model: local path or HuggingFace model ID (positional).
+    pub model_tag: Option<String>,
+
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Number of queries to evaluate.
+    #[arg(short = 'n', long)]
+    pub num_queries: Option<usize>,
+
+    /// Max tokens for model response (official LongBench v2 uses 128).
+    #[arg(long, default_value_t = 128)]
+    pub max_tokens: usize,
+
+    /// Maximum context length in characters. Skips queries with longer contexts.
+    /// Useful for limiting to contexts that fit in the model's max sequence length.
+    #[arg(long)]
+    pub max_context_chars: Option<usize>,
+
+    /// Fraction of GPU memory to use for KV cache (0.0-1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// Number of GPUs for tensor parallelism.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Disable prefix caching (for debugging).
+    #[arg(long)]
+    pub no_prefix_caching: bool,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+
+    /// Enable debug output for first sample.
+    #[arg(long)]
+    pub debug: bool,
+}
+
+impl BenchLongbenchArgs {
     pub fn resolved_model(&self) -> Result<String, String> {
         match (&self.model_tag, &self.model) {
             (Some(tag), _) => Ok(tag.clone()),

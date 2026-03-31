@@ -272,7 +272,6 @@ fn create_worker(
             // Benchmarked: 1024 → 21.8 req/s vs 8192 → 12.1 req/s on Qwen2.5-3B.
             // See PREFILL_DECODE_SPLIT.md for the full analysis.
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-            max_model_len: config.max_model_len.unwrap_or(32768),
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()

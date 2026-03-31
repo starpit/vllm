@@ -19,7 +19,7 @@ use vllm_cuda::cpu_gpu_buf::PinnedBuf;
 use vllm_cuda::device::GpuDevice;
 use vllm_cuda::driver;
 use vllm_cuda::dtype::DType as GpuDType;
-use vllm_cuda::graph::{CudaGraphRunner, PrefillGraphRunner, max_blocks_for_model};
+use vllm_cuda::graph::{CudaGraphRunner, PrefillGraphRunner};
 use vllm_cuda::graph_piece::{GraphPieceType, PiecewiseGraphRunner};
 use vllm_cuda::kv_cache::KvCachePool;
 use vllm_cuda::logits_processor::{
@@ -60,8 +60,6 @@ pub struct CudaWorkerConfig {
     pub cuda_graph_mode: CudaGraphMode,
     /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
     pub max_num_batched_tokens: usize,
-    /// Maximum model context length in tokens (for CUDA graph block table sizing).
-    pub max_model_len: usize,
     /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
     pub cuda_graph_sizes: Vec<usize>,
     /// Run cublasLt algorithm benchmarking during warmup (--cublas-autotune).
@@ -1415,9 +1413,6 @@ pub struct CudaWorker {
     piecewise_graph_runner: Option<PiecewiseGraphRunner>,
     /// CUDA graph runner for single-sequence prefill batches.
     prefill_graph_runner: Option<PrefillGraphRunner>,
-    /// Maximum blocks per sequence for graph block tables.
-    /// Computed as cdiv(max_model_len, block_size).
-    graph_max_blocks_per_seq: usize,
     /// Batch size of the last graph replay. When the batch composition is
     /// unchanged, we can skip the input_ids H2D copy because the graph's
     /// D2D scatter already placed argmax results into the persistent buffer.
@@ -1560,7 +1555,6 @@ impl CudaWorker {
             graph_runner: None,
             piecewise_graph_runner: None,
             prefill_graph_runner: None,
-            graph_max_blocks_per_seq: max_blocks_for_model(config.max_model_len, config.block_size),
             last_graph_batch_size: None,
             graph_metadata_valid: false,
             uses_ggml: false,
@@ -1891,6 +1885,17 @@ impl CudaWorker {
     /// Expose the HF config after load_model.
     pub fn hf_config(&self) -> Option<&HfModelConfig> {
         self.hf_config.as_ref()
+    }
+
+    /// Maximum blocks per sequence: cdiv(max_model_len, block_size).
+    /// Matches Python's `BlockTables.__init__` computation.
+    fn max_blocks_per_seq(&self) -> usize {
+        let max_model_len = self
+            .hf_config
+            .as_ref()
+            .and_then(|c| c.max_position_embeddings)
+            .unwrap_or(131072);
+        (max_model_len + self.config.block_size - 1) / self.config.block_size
     }
 
     /// Expose the model directory after load_model.
@@ -5843,6 +5848,8 @@ impl Worker for CudaWorker {
             return Ok(());
         }
 
+        let max_blocks_per_seq = self.max_blocks_per_seq();
+
         let (mut model, mut kv_cache, mut device) =
             match (&self.model, &self.kv_cache, &mut self.device) {
                 (Some(m), Some(kv), Some(d)) => (m, kv, d),
@@ -5961,10 +5968,8 @@ impl Worker for CudaWorker {
         if !should_capture_monolithic {
             // Skip to prefill graphs / cublas autotune.
         } else {
-            let graph_max_blocks =
-                max_blocks_for_model(self.config.max_model_len, self.config.block_size);
             let mut runner = unsafe {
-                CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype, graph_max_blocks)
+                CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype, max_blocks_per_seq)
             }
             .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
 
@@ -6054,7 +6059,7 @@ impl Worker for CudaWorker {
                 );
                 // Allocate pinned host staging buffers sized for the largest captured graph.
                 let staging_max_bs = *runner.captured_sizes().last().unwrap();
-                match unsafe { HostStaging::new(staging_max_bs, graph_max_blocks) } {
+                match unsafe { HostStaging::new(staging_max_bs, max_blocks_per_seq) } {
                     Ok(staging) => {
                         info!(
                             "Pinned host staging allocated for max_batch={}",
@@ -6091,7 +6096,12 @@ impl Worker for CudaWorker {
         if !prefill_sizes.is_empty() && !monolithic_failed {
             let max_prefill = *prefill_sizes.last().unwrap();
             match unsafe {
-                PrefillGraphRunner::new(max_prefill, vocab_size, self.model_dtype, graph_max_blocks)
+                PrefillGraphRunner::new(
+                    max_prefill,
+                    vocab_size,
+                    self.model_dtype,
+                    max_blocks_per_seq,
+                )
             } {
                 Ok(mut prefill_runner) => {
                     // Capture largest first (matching Python vLLM).
@@ -6907,6 +6917,9 @@ impl CudaWorker {
             }
         }
 
+        // Compute once before the split borrow below (self is borrowed mutably for device).
+        let max_blocks_per_seq = self.max_blocks_per_seq();
+
         // Split borrows: model + kv_cache (shared) vs device (mutable).
         // Use direct field access so the borrow checker sees disjoint borrows.
         // Note: gdn_pool_ref is deferred until after the piecewise path to avoid
@@ -7076,7 +7089,7 @@ impl CudaWorker {
                 let mut slot_mapping: Vec<i64> = Vec::with_capacity(decode_graph_bs);
                 let mut cu_seqlens_q: Vec<i32> = Vec::with_capacity(decode_graph_bs + 1);
                 let mut seqused_k: Vec<i32> = Vec::with_capacity(decode_graph_bs);
-                let mut block_table = vec![0i32; decode_graph_bs * graph_max_blocks_per_seq];
+                let mut block_table = vec![0i32; decode_graph_bs * max_blocks_per_seq];
 
                 cu_seqlens_q.push(0);
                 for (out_idx, &orig_idx) in decode_indices.iter().enumerate() {
@@ -7100,8 +7113,8 @@ impl CudaWorker {
 
                     // Block table row.
                     for (j, &bid) in block_ids.iter().enumerate() {
-                        if j < graph_max_blocks_per_seq {
-                            block_table[out_idx * graph_max_blocks_per_seq + j] = bid as i32;
+                        if j < max_blocks_per_seq {
+                            block_table[out_idx * max_blocks_per_seq + j] = bid as i32;
                         }
                     }
                 }
@@ -7555,11 +7568,11 @@ impl CudaWorker {
                 }
                 slot_mapping.resize(graph_bs, -1i64);
 
-                let mut block_table = vec![0i32; graph_bs * graph_max_blocks_per_seq];
+                let mut block_table = vec![0i32; graph_bs * max_blocks_per_seq];
                 for (i, blocks) in meta.block_ids.iter().enumerate() {
                     for (j, &bid) in blocks.iter().enumerate() {
-                        if j < graph_max_blocks_per_seq {
-                            block_table[i * graph_max_blocks_per_seq + j] = bid as i32;
+                        if j < max_blocks_per_seq {
+                            block_table[i * max_blocks_per_seq + j] = bid as i32;
                         }
                     }
                 }
@@ -7792,11 +7805,11 @@ impl CudaWorker {
                 }
                 slot_mapping.resize(graph_bs, -1i64);
 
-                let mut block_table = vec![0i32; graph_bs * graph_max_blocks_per_seq];
+                let mut block_table = vec![0i32; graph_bs * max_blocks_per_seq];
                 for (i, blocks) in meta.block_ids.iter().enumerate() {
                     for (j, &bid) in blocks.iter().enumerate() {
-                        if j < graph_max_blocks_per_seq {
-                            block_table[i * graph_max_blocks_per_seq + j] = bid as i32;
+                        if j < max_blocks_per_seq {
+                            block_table[i * max_blocks_per_seq + j] = bid as i32;
                         }
                     }
                 }
@@ -7855,9 +7868,9 @@ impl CudaWorker {
                     .unwrap();
 
                 // Build block_table padded to MAX_BLOCKS_PER_SEQ.
-                let mut block_table = vec![0i32; graph_max_blocks_per_seq];
+                let mut block_table = vec![0i32; max_blocks_per_seq];
                 for (j, &bid) in meta.block_ids[0].iter().enumerate() {
-                    if j < graph_max_blocks_per_seq {
+                    if j < max_blocks_per_seq {
                         block_table[j] = bid as i32;
                     }
                 }

@@ -27,9 +27,6 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::tensor::GpuTensor;
 
-/// Fallback maximum blocks per sequence when max_model_len is unknown.
-const DEFAULT_MAX_BLOCKS_PER_SEQ: usize = 2048;
-
 /// A single captured CUDA graph for a specific batch size.
 struct CapturedGraph {
     exec: CUgraphExec,
@@ -607,16 +604,6 @@ pub struct InputTensors {
     pub cu_seqlens_q: GpuTensor,
     pub seqused_k: GpuTensor,
     pub block_table: GpuTensor,
-}
-
-/// Default maximum blocks per sequence, used when the caller doesn't
-/// provide a model-specific value. Matches Python's
-/// `cdiv(max_model_len, block_size)` for 32K context with block_size=16.
-pub const GRAPH_MAX_BLOCKS_PER_SEQ: usize = DEFAULT_MAX_BLOCKS_PER_SEQ;
-
-/// Compute the proper max blocks per sequence from model config.
-pub fn max_blocks_for_model(max_model_len: usize, block_size: usize) -> usize {
-    (max_model_len + block_size - 1) / block_size
 }
 
 // ---------------------------------------------------------------------------

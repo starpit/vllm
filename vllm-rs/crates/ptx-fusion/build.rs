@@ -23,6 +23,17 @@ struct CutlassConfig {
 
 const CUTLASS_CONFIGS: &[CutlassConfig] = &[
     CutlassConfig {
+        name: "cutlass_bf16_16x128x32_sm89",
+        tb_shape: (16, 128, 32),
+        warp_shape: (16, 64, 32),
+        epilogue_vec: 8,
+        stages: 3,
+        align_a: 8,
+        align_b: 8,
+        threads: 64,
+        smem_bytes: 27648, // (16*32 + 128*32) * 2 * 3 stages
+    },
+    CutlassConfig {
         name: "cutlass_bf16_64x64x32_sm89",
         tb_shape: (64, 64, 32),
         warp_shape: (32, 32, 32),

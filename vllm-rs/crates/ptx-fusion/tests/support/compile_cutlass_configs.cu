@@ -62,7 +62,24 @@ using GemmC = cutlass::gemm::device::Gemm<
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<4>,
     3, 8, 8>;
 
+// Config D: 16x128x32, 3 stages (12KB SMEM) — best for decode (M ≤ 16)
+// Minimal tile_m avoids wasted compute when M=1..16.
+using GemmD = cutlass::gemm::device::Gemm<
+    bf16, cutlass::layout::RowMajor,
+    bf16, cutlass::layout::ColumnMajor,
+    bf16, cutlass::layout::RowMajor,
+    float,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<16, 128, 32>,
+    cutlass::gemm::GemmShape<16, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<bf16, 8, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<4>,
+    3, 8, 8>;
+
 // Force template instantiation — nvcc will emit .entry for each
 template __global__ void cutlass::Kernel<GemmA::GemmKernel>(GemmA::GemmKernel::Params);
 template __global__ void cutlass::Kernel<GemmB::GemmKernel>(GemmB::GemmKernel::Params);
 template __global__ void cutlass::Kernel<GemmC::GemmKernel>(GemmC::GemmKernel::Params);
+template __global__ void cutlass::Kernel<GemmD::GemmKernel>(GemmD::GemmKernel::Params);

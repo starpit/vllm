@@ -20,6 +20,13 @@ use ptx_fusion::FeriteKernel;
 // ── Compile-time: rewrite CUTLASS PTX to flat-param layout ──
 
 ptx_fusion::replace_perimeter_macro!(
+    "../ptx-fusion/kernels/cutlass_bf16_16x128x32_sm89.ptx",
+    "../ptx-fusion/kernels/cutlass_bf16_16x128x32_sm89.derivations.json",
+    "ferrite_gemm_16x128x32",
+    FLAT_16X128X32_PTX
+);
+
+ptx_fusion::replace_perimeter_macro!(
     "../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.ptx",
     "../ptx-fusion/kernels/cutlass_bf16_64x128x32_sm89.derivations.json",
     "ferrite_gemm_64x128x32",
@@ -76,16 +83,26 @@ pub struct FerriteCutlass {
 impl FerriteCutlass {
     /// Initialize: load flat-param PTX modules and resolve entry points.
     pub unsafe fn new() -> Result<Self> {
-        // Only 64x128x32 for now — larger configs need investigation
-        let specs: &[(&str, &str, &str, u32, u32, u32, u32)] = &[(
-            "64x128x32",
-            "ferrite_gemm_64x128x32",
-            FLAT_64X128X32_PTX,
-            64,
-            128,
-            128,
-            36864,
-        )];
+        let specs: &[(&str, &str, &str, u32, u32, u32, u32)] = &[
+            (
+                "16x128x32",
+                "ferrite_gemm_16x128x32",
+                FLAT_16X128X32_PTX,
+                16,
+                128,
+                64,
+                27648,
+            ),
+            (
+                "64x128x32",
+                "ferrite_gemm_64x128x32",
+                FLAT_64X128X32_PTX,
+                64,
+                128,
+                128,
+                36864,
+            ),
+        ];
 
         let mut configs = Vec::new();
         for &(name, entry, ptx, tm, tn, threads, smem) in specs {

@@ -1,5 +1,10 @@
 # Handoff — Session 10
 
+**READ FIRST**: `crates/ptx-fusion/FERRITE.md` — the master plan for the entire
+ferrite project. It defines the architecture (escape analysis on PTX), the target
+forward pass (6 launches/layer), the roadmap (Phases 0-5G), and the proven
+capabilities. Everything in this session implements Phase 5G.
+
 ## The goal
 
 Implement register transfer for the persistent MLP kernel to eliminate the
@@ -202,26 +207,97 @@ This is the same problem `make_persistent_two_phase` solves by replacing
 
 ### Fix producer tile index override
 
-The producer GEMM's preamble computes m_tile and n_tile from `%ctaid.x` and
-`%ctaid.y`. In the fused kernel:
-- `%ctaid.x` and `%ctaid.y` are the CONSUMER's grid coordinates
-- The producer needs:
-  - m_tile = consumer's m_tile (same M rows)
-  - n_tile = driver_iter (current outer loop iteration) for gate
-  - n_tile = driver_iter + intermediate_n_offset for up
+**The bug**: The producer GEMM's preamble reads `%ctaid.x` and `%ctaid.y` (hardware
+special registers) to compute its tile coordinates. In the fused kernel, the grid
+is sized for the CONSUMER's tile decomposition, so `%ctaid.x`/`%ctaid.y` give
+the consumer's tile, not the producer's. The producer produces garbage output.
 
-The fix: in `fuse_gemm_pointwise_gemm`, after emitting the consumer's preamble
-(which computes m_tile and n_tile into known registers), override the producer's
-preamble to use:
-1. The consumer's m_tile register for the producer's m_tile
-2. A register set from the driver loop counter for the producer's n_tile
+**The kernel param layout** (as emitted by `fuse_gemm_pointwise_gemm`):
+```
+.entry fused_mlp(
+    .param .align 8 .b8 ferrite_params[88],      // producer (gate_up) GEMM flat params
+    .param .align 8 .b8 ferrite_params_2[88],     // consumer (down) GEMM flat params
+    .param .u32 _num_producer_n_tiles,             // outer loop count = ceil(intermediate/64)
+    .param .u32 _intermediate_n_offset             // N-tile offset for "up" half
+)
+```
 
-The existing `extract_tile_index_map()` in `parser.rs` already extracts
-`ctaid_x_reg`, `m_tile_reg`, `n_tile_reg` from CUTLASS PTX. Use this to identify
-which registers to override.
+**The driver loop registers**:
+- `%r_driver_iter` — current outer loop iteration (0, 1, 2, ...)
+- `%r_driver_total` — loaded from `_num_producer_n_tiles`
+- `%r_driver_n_off` — loaded from `_intermediate_n_offset`
+- `%p_driver_loop` — loop predicate
+- `%r_gate_scratch` — constant 24576 (gate scratch SMEM offset)
+- `%r_up_scratch` — constant 32768 (up scratch SMEM offset)
 
-Alternatively, replace the entire producer preamble with a custom tile index
-computation that reads from the driver loop state, then jump to the K-loop.
+**The consumer preamble** runs first (with `$L__BB_cons` label prefix, registers
+offset by producer's register count). It computes the output tile coordinates from
+`%ctaid.x` and `%ctaid.y` using the CUTLASS swizzle. After it runs, certain
+consumer registers hold m_tile and n_tile. These can be identified by running
+`extract_tile_index_map()` on the consumer PTX.
+
+`extract_tile_index_map()` (parser.rs) returns a `TileIndexMap` with:
+- `ctaid_x_reg` — register holding `%ctaid.x` (e.g., `%r177` → after offset: `%r941`)
+- `m_tile_reg` — register holding the M-tile index (e.g., `%r2` → `%r766`)
+- `n_tile_reg` — register holding the N-tile index (e.g., `%r3` → `%r767`)
+- `swizzle_log_reg` — register holding the swizzle parameter
+- `tile_index_lines` — the PTX lines that compute the tile index
+
+**The fix** — two approaches:
+
+**Approach A (simpler)**: Replace `mov.u32 %rN, %ctaid.x` in the producer preamble
+with `mov.u32 %rN, <computed_value>`. The CUTLASS preamble starts with
+`mov.u32 %r<ctaid_x_reg>, %ctaid.x` and `mov.u32 %r<ctaid_y_reg>, %ctaid.y`.
+For the producer:
+- Compute the swizzled ctaid_x from (m_tile, driver_iter) using the same swizzle
+  formula CUTLASS uses: `ctaid_x = m_tile * swizzle_tile + (n_tile & (swizzle_tile - 1))`
+- Compute ctaid_y: `ctaid_y = n_tile >> swizzle_log`
+- Replace the `mov.u32 %rN, %ctaid.x` with `mov.u32 %rN, %r_computed_ctaid_x`
+- Same for ctaid_y.
+- The m_tile comes from the consumer's tile index (same M rows).
+- The n_tile comes from `%r_driver_iter` (gate) or `%r_driver_iter + %r_driver_n_off` (up).
+
+**Approach B (cleaner)**: Skip the producer preamble entirely. Emit custom tile
+index computation using `%r_driver_iter` and the consumer's m_tile, then jump
+directly to the producer's K-loop. The preamble's main job is tile index + param
+loads + pipeline prologue. The param loads happen via `_active_params` or
+`ferrite_params` which is already correct. The pipeline prologue (initial cp.async
+fills) is essential and must be preserved.
+
+Approach A is simpler because it preserves the entire preamble structure. The
+only change is two `mov` instructions. Use `extract_tile_index_map()` to find
+which register receives `%ctaid.x` and `%ctaid.y`, then replace those lines.
+
+**For the up GEMM copy**: Same fix but n_tile = `%r_driver_iter + %r_driver_n_off`.
+The up copy already has labels renamed to `$L__BB_up`.
+
+**Where to make the change**: In `fuse_gemm_pointwise_gemm()` in `pipeline_compile.rs`,
+around lines 1132-1149 (gate GEMM emission) and 1152-1166 (up GEMM emission).
+Currently these just emit the producer preamble verbatim. Need to scan for
+`%ctaid.x` and `%ctaid.y` references and replace them.
+
+### The gate/up scratch SMEM layout
+
+The redirected epilogue writes bf16 output to SMEM scratch in **row-major linear layout**:
+`scratch_base + row * tile_n * 2 + col * 2`, where row and col are the same
+registers the CUTLASS epilogue computed for its GMEM output addresses.
+
+The SiLU computation at the consumer's A-load sites reads from this scratch via
+`ld.shared.v4.b32 [%r_gate_scratch + LOAD_INDEX * 16]`. Each A-load site reads
+16 bytes (8 bf16 = 4 b32). The LOAD_INDEX is 0, 1, 2, ... for successive A-load
+sites within the K-loop.
+
+**Potential issue**: The A-load sites' sequential indexing (0, 1, 2...) may not
+map to the correct positions in the linear scratch layout. The cp.async A-loads
+read from specific (row, K-column) positions that may not be sequential. This
+mapping needs verification — if wrong, the SiLU gets the wrong gate/up values
+for each element, producing numerically wrong (but structurally valid) output.
+
+If the sequential mapping is wrong, the fix is to compute the SMEM scratch address
+from the same row/K-column expression that the cp.async GMEM source uses, but
+with the SMEM stride instead of the GMEM stride. The `EpilogueStoreMap.row_reg`
+and `EpilogueStoreMap.col_reg` provide the row/col registers; the scratch stride
+is `tile_n * 2` (compile-time constant).
 
 ### After tile index fix
 

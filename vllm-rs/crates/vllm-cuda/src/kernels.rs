@@ -4500,7 +4500,7 @@ unsafe extern "C" {
         vocab_size: c_int,
         batch_size: c_int,
         temperatures: *const f32,
-        uniform_randoms: *const f32,
+        seeds: *const u32,
         scratch_vals: *mut f32,
         scratch_indices: *mut c_int,
         stream: CUstream,
@@ -4511,7 +4511,7 @@ unsafe extern "C" {
         vocab_size: c_int,
         batch_size: c_int,
         temperatures: *const f32,
-        uniform_randoms: *const f32,
+        seeds: *const u32,
         scratch_vals: *mut f32,
         scratch_indices: *mut c_int,
         stream: CUstream,
@@ -4522,7 +4522,7 @@ unsafe extern "C" {
         vocab_size: c_int,
         batch_size: c_int,
         temperatures: *const f32,
-        uniform_randoms: *const f32,
+        seeds: *const u32,
         scratch_vals: *mut f32,
         scratch_indices: *mut c_int,
         stream: CUstream,
@@ -4610,17 +4610,18 @@ pub unsafe fn argmax_batched(
 ///
 /// Matches Python vLLM's Triton implementation: 2D grid with 1024 threads per
 /// block, ceil(vocab/1024) blocks per request. Phase 1 computes per-block
-/// local argmax, phase 2 reduces across blocks.
+/// local argmax, phase 2 reduces across blocks. Uses Philox4x32-10 RNG for
+/// per-element noise (matching Triton's `tl.rand`).
 ///
 /// * `logits`: `[batch_size, vocab_size]`
 /// * `temperatures`: `[batch_size]` (F32, on GPU)
-/// * `uniform_randoms`: `[batch_size]` (F32, on GPU) — seeds for per-element noise
+/// * `seeds`: `[batch_size]` (U32, on GPU) — Philox RNG seeds per request
 ///
 /// Returns `[batch_size]` u32 tensor of sampled token IDs, allocated from arena.
 pub unsafe fn sample_gumbel_batched(
     logits: GpuTensor,
     temperatures: GpuTensor,
-    uniform_randoms: GpuTensor,
+    seeds: GpuTensor,
     alloc: &mut CachingAllocator,
     stream: CUstream,
 ) -> OwnedTensor {
@@ -4641,7 +4642,7 @@ pub unsafe fn sample_gumbel_batched(
             vocab_size,
             batch_size,
             temperatures.as_ptr(),
-            uniform_randoms.as_ptr(),
+            seeds.as_ptr() as *const u32,
             scratch_vals.as_mut_ptr() as *mut f32,
             scratch_indices.as_mut_ptr() as *mut c_int,
             stream,
@@ -4652,7 +4653,7 @@ pub unsafe fn sample_gumbel_batched(
             vocab_size,
             batch_size,
             temperatures.as_ptr(),
-            uniform_randoms.as_ptr(),
+            seeds.as_ptr() as *const u32,
             scratch_vals.as_mut_ptr() as *mut f32,
             scratch_indices.as_mut_ptr() as *mut c_int,
             stream,
@@ -4663,7 +4664,7 @@ pub unsafe fn sample_gumbel_batched(
             vocab_size,
             batch_size,
             temperatures.as_ptr(),
-            uniform_randoms.as_ptr(),
+            seeds.as_ptr() as *const u32,
             scratch_vals.as_mut_ptr() as *mut f32,
             scratch_indices.as_mut_ptr() as *mut c_int,
             stream,

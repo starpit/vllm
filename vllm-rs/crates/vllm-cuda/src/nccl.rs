@@ -5,6 +5,7 @@
 //! type. One `NcclGroup` per GPU rank — created during TP init, stored in model
 //! layers for all-reduce/all-gather calls in the forward pass.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 
@@ -15,6 +16,47 @@ use cudarc::nccl::{result as nccl_result, sys as nccl_sys};
 use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;
+
+// ---------------------------------------------------------------------------
+// Piecewise graph capture: suppress NCCL collectives
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// When true, NCCL collectives (all-reduce, all-gather) become no-ops.
+    /// Set during piecewise CUDA graph capture/replay so NCCL operations are
+    /// NOT baked into graphs — they run eagerly between graph pieces instead.
+    static SUPPRESS_NCCL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that suppresses NCCL collectives for the duration of its lifetime.
+/// Used by piecewise graph capture and replay.
+pub struct SuppressNcclGuard {
+    prev: bool,
+}
+
+impl Default for SuppressNcclGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SuppressNcclGuard {
+    pub fn new() -> Self {
+        let prev = SUPPRESS_NCCL.with(|c| c.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for SuppressNcclGuard {
+    fn drop(&mut self) {
+        SUPPRESS_NCCL.with(|c| c.set(self.prev));
+    }
+}
+
+/// Returns true if NCCL collectives should be suppressed (during piecewise graph capture/replay).
+pub fn is_nccl_suppressed() -> bool {
+    SUPPRESS_NCCL.with(|c| c.get())
+}
 
 // ---------------------------------------------------------------------------
 // NcclId — wrapper around ncclUniqueId
@@ -100,6 +142,11 @@ impl NcclGroup {
     /// The tensor is modified in place. All ranks must call with tensors of
     /// the same shape and dtype. Non-blocking on the host.
     pub unsafe fn all_reduce_inplace(&self, tensor: GpuTensor) -> Result<()> {
+        // During piecewise graph capture/replay, skip NCCL — it runs eagerly
+        // between graph pieces instead.
+        if is_nccl_suppressed() {
+            return Ok(());
+        }
         let numel = tensor.numel();
         let nccl_dtype = gpu_dtype_to_nccl(tensor.dtype())?;
         let ptr = tensor.raw_ptr() as *mut c_void;
@@ -205,17 +252,20 @@ impl NcclGroup {
         out_shape[0] *= self.world_size;
 
         let out = alloc.alloc_tensor(&out_shape, tensor.dtype());
-        let out_gpu = out.as_gpu_tensor();
 
-        nccl_result::all_gather(
-            tensor.raw_ptr() as *const c_void,
-            out_gpu.raw_ptr() as *mut c_void,
-            numel,
-            nccl_dtype,
-            self.comm,
-            self.stream as nccl_sys::cudaStream_t,
-        )
-        .expect("ncclAllGather failed");
+        // During piecewise graph capture/replay, skip the NCCL call.
+        if !is_nccl_suppressed() {
+            let out_gpu = out.as_gpu_tensor();
+            nccl_result::all_gather(
+                tensor.raw_ptr() as *const c_void,
+                out_gpu.raw_ptr() as *mut c_void,
+                numel,
+                nccl_dtype,
+                self.comm,
+                self.stream as nccl_sys::cudaStream_t,
+            )
+            .expect("ncclAllGather failed");
+        }
 
         out
     }

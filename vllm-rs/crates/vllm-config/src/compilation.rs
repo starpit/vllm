@@ -29,13 +29,17 @@ impl std::str::FromStr for CudaGraphMode {
 }
 
 impl CudaGraphMode {
-    /// Resolve Auto based on SM version. Non-Auto variants pass through unchanged.
+    /// Resolve Auto based on SM version and TP world size.
     ///
     /// SM >= 90 (Hopper+): FullAndPiecewise (piecewise fallback for mixed batches).
-    /// SM < 90 (Ampere, Ada Lovelace, etc.): Full (monolithic only — piecewise
-    /// capture overhead not worth it on older architectures).
-    pub fn resolve(self, sm_version: u32) -> CudaGraphMode {
-        match self {
+    /// SM < 90 (Ampere, Ada Lovelace, etc.): Full (monolithic only).
+    ///
+    /// When TP > 1, Full is downgraded to Piecewise because NCCL collectives
+    /// (all-reduce, all-gather) cannot be captured in monolithic CUDA graphs.
+    /// Python vLLM handles this the same way: piecewise capture excludes NCCL
+    /// ops, running them eagerly between graph pieces.
+    pub fn resolve(self, sm_version: u32, tp_world_size: usize) -> CudaGraphMode {
+        let resolved = match self {
             CudaGraphMode::Auto => {
                 if sm_version >= 90 {
                     CudaGraphMode::FullAndPiecewise
@@ -44,6 +48,17 @@ impl CudaGraphMode {
                 }
             }
             other => other,
+        };
+        if tp_world_size > 1 {
+            // Downgrade any Full component to Piecewise for TP.
+            match resolved {
+                CudaGraphMode::Full => CudaGraphMode::Piecewise,
+                CudaGraphMode::FullAndPiecewise => CudaGraphMode::Piecewise,
+                CudaGraphMode::FullDecodeOnly => CudaGraphMode::Piecewise,
+                other => other,
+            }
+        } else {
+            resolved
         }
     }
 
@@ -180,25 +195,38 @@ mod tests {
 
     #[test]
     fn test_auto_resolve() {
-        // SM < 90 → Full
-        assert_eq!(CudaGraphMode::Auto.resolve(80), CudaGraphMode::Full);
-        assert_eq!(CudaGraphMode::Auto.resolve(89), CudaGraphMode::Full);
-        // SM >= 90 → FullAndPiecewise
+        // SM < 90, TP=1 → Full
+        assert_eq!(CudaGraphMode::Auto.resolve(80, 1), CudaGraphMode::Full);
+        assert_eq!(CudaGraphMode::Auto.resolve(89, 1), CudaGraphMode::Full);
+        // SM >= 90, TP=1 → FullAndPiecewise
         assert_eq!(
-            CudaGraphMode::Auto.resolve(90),
+            CudaGraphMode::Auto.resolve(90, 1),
             CudaGraphMode::FullAndPiecewise
         );
         assert_eq!(
-            CudaGraphMode::Auto.resolve(100),
+            CudaGraphMode::Auto.resolve(100, 1),
             CudaGraphMode::FullAndPiecewise
         );
-        // Non-Auto passes through unchanged
-        assert_eq!(CudaGraphMode::Full.resolve(80), CudaGraphMode::Full);
-        assert_eq!(CudaGraphMode::Full.resolve(90), CudaGraphMode::Full);
+        // Non-Auto, TP=1 passes through unchanged
+        assert_eq!(CudaGraphMode::Full.resolve(80, 1), CudaGraphMode::Full);
+        assert_eq!(CudaGraphMode::Full.resolve(90, 1), CudaGraphMode::Full);
         assert_eq!(
-            CudaGraphMode::Piecewise.resolve(90),
+            CudaGraphMode::Piecewise.resolve(90, 1),
             CudaGraphMode::Piecewise
         );
+        // TP > 1: Full downgrades to Piecewise
+        assert_eq!(CudaGraphMode::Auto.resolve(89, 2), CudaGraphMode::Piecewise);
+        assert_eq!(CudaGraphMode::Full.resolve(89, 2), CudaGraphMode::Piecewise);
+        assert_eq!(
+            CudaGraphMode::FullAndPiecewise.resolve(90, 2),
+            CudaGraphMode::Piecewise
+        );
+        // TP > 1: Piecewise and None unchanged
+        assert_eq!(
+            CudaGraphMode::Piecewise.resolve(89, 2),
+            CudaGraphMode::Piecewise
+        );
+        assert_eq!(CudaGraphMode::None.resolve(89, 2), CudaGraphMode::None);
     }
 
     #[test]

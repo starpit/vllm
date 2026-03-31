@@ -3984,6 +3984,10 @@ impl CudaWorker {
                         break;
                     }
                     let result = unsafe {
+                        // Suppress NCCL during capture so collectives are NOT
+                        // baked into graphs. They run eagerly during replay.
+                        #[cfg(feature = "nccl")]
+                        let _nccl_guard = vllm_cuda::nccl::SuppressNcclGuard::new();
                         piecewise_runner.capture_all_pieces(bs, dev, |piece_type, buffers, d| {
                             (*self_ptr)
                                 .execute_graph_piece(piece_type, buffers, d)
@@ -4498,10 +4502,13 @@ impl CudaWorker {
             }
 
             // Replay post-attention piece (residual add + MLP → next hidden buffer).
+            // NCCL all-reduce is suppressed inside the graph; run it eagerly after.
             {
                 let device = self.device.as_mut().unwrap();
                 let runner = self.piecewise_graph_runner.as_ref().unwrap();
                 unsafe {
+                    #[cfg(feature = "nccl")]
+                    let _nccl_guard = vllm_cuda::nccl::SuppressNcclGuard::new();
                     runner
                         .replay_piece(batch_size, GraphPieceType::LayerPostAttn(layer_idx), device)
                         .map_err(|e| {
@@ -4512,6 +4519,36 @@ impl CudaWorker {
                         })?;
                 }
             }
+
+            // Eager MLP all-reduce (TP): the PostAttn graph wrote the down_proj
+            // output (before all-reduce) into the next hidden buffer.
+            #[cfg(feature = "nccl")]
+            {
+                let use_buffer_a = (layer_idx + 1).is_multiple_of(2);
+                let runner = self.piecewise_graph_runner.as_ref().unwrap();
+                let hidden_buf = unsafe { runner.buffers.hidden_tensor(batch_size, use_buffer_a) };
+                match &self.model {
+                    Some(CudaModel::Llama(m)) => {
+                        if let Some(ref group) = m.model.layers[layer_idx].mlp.tp_group {
+                            unsafe {
+                                group
+                                    .all_reduce_inplace(hidden_buf)
+                                    .expect("piecewise MLP all_reduce failed");
+                            }
+                        }
+                    }
+                    Some(CudaModel::Qwen2(m)) => {
+                        if let Some(ref group) = m.0.model.layers[layer_idx].mlp.tp_group {
+                            unsafe {
+                                group
+                                    .all_reduce_inplace(hidden_buf)
+                                    .expect("piecewise MLP all_reduce failed");
+                            }
+                        }
+                    }
+                    _ => {} // Other models: no TP all-reduce needed
+                }
+            }
         }
 
         // ---- Replay LM head piece ----
@@ -4519,9 +4556,43 @@ impl CudaWorker {
             let device = self.device.as_mut().unwrap();
             let runner = self.piecewise_graph_runner.as_ref().unwrap();
             unsafe {
+                #[cfg(feature = "nccl")]
+                let _nccl_guard = vllm_cuda::nccl::SuppressNcclGuard::new();
                 runner
                     .replay_piece(batch_size, GraphPieceType::LmHead, device)
                     .map_err(|e| ExecutorError::WorkerExecution(format!("LM head replay: {e}")))?;
+            }
+        }
+
+        // Eager all-gather logits (TP): the LmHead graph produced a vocab shard.
+        // Rearrange into full vocab logits in the persistent logits buffer.
+        #[cfg(feature = "nccl")]
+        {
+            let tp_group = match &self.model {
+                Some(CudaModel::Llama(m)) => m.tp_group.as_ref(),
+                Some(CudaModel::Qwen2(m)) => m.0.tp_group.as_ref(),
+                _ => None,
+            };
+            if let Some(group) = tp_group {
+                let runner = self.piecewise_graph_runner.as_ref().unwrap();
+                let device = self.device.as_mut().unwrap();
+                let logits_shard = unsafe { runner.buffers.logits_tensor(batch_size) };
+                let gathered =
+                    unsafe { group.all_gather_last_dim(logits_shard, &mut device.caching) };
+                // Copy gathered logits back into the persistent logits buffer.
+                let gathered_bytes = gathered.as_gpu_tensor().numel()
+                    * gathered.as_gpu_tensor().dtype().size_bytes();
+                unsafe {
+                    vllm_cuda::driver::memcpy_dtod_async(
+                        runner.buffers.logits.ptr(),
+                        gathered.as_gpu_tensor().raw_ptr() as *const u8,
+                        gathered_bytes,
+                        device.compute_stream,
+                    )
+                }
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("logits all-gather copy: {e}"))
+                })?;
             }
         }
 
@@ -5709,12 +5780,15 @@ impl Worker for CudaWorker {
                 _ => return Ok(()), // Not fully initialized yet.
             };
 
-        // Resolve Auto mode now that we know the SM version.
-        if matches!(self.config.cuda_graph_mode, CudaGraphMode::Auto) {
-            let resolved = self.config.cuda_graph_mode.resolve(device.sm_version);
+        // Resolve Auto mode now that we know the SM version and TP config.
+        {
+            let resolved = self
+                .config
+                .cuda_graph_mode
+                .resolve(device.sm_version, self.config.tp_world_size);
             info!(
-                "CudaWorker: resolved cuda_graph_mode Auto → {:?} (SM{})",
-                resolved, device.sm_version
+                "CudaWorker: resolved cuda_graph_mode {:?} → {:?} (SM{}, TP={})",
+                self.config.cuda_graph_mode, resolved, device.sm_version, self.config.tp_world_size
             );
             self.config.cuda_graph_mode = resolved;
         }

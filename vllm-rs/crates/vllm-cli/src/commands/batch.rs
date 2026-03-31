@@ -83,7 +83,7 @@ pub async fn run_batch_from_config(
     }
 
     // 2. Initialize the engine stack.
-    let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))
+    let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config, None))
         .await
         .expect("initialize_stack panicked")?;
 

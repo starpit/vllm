@@ -197,7 +197,11 @@ type WorkerCreationResult = (
 ///
 /// Returns `(worker, hf_config, model_dir, dtype)`.
 #[allow(unused_variables)]
-fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreationResult> {
+fn create_worker(
+    config: &VllmConfig,
+    model_path: String,
+    progress: Option<&Arc<crate::progress::StartupProgress>>,
+) -> Result<WorkerCreationResult> {
     let is_pooling = config.runner == "pooling";
 
     // Try MLX backend first when metal feature is enabled.
@@ -293,6 +297,18 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             .init_device()
             .context("failed to initialize CUDA device")?;
 
+        // Store progress reference in worker for layer-by-layer updates
+        if let Some(pb) = progress {
+            let pb_clone = pb.clone();
+            worker.set_progress_callback(std::sync::Arc::new(move |msg: &str| {
+                // For now, just log the message. Layer-by-layer progress
+                // would require deeper integration into model loading.
+                if msg.contains("layer") {
+                    // Could parse layer number and update sub-progress here
+                }
+            }));
+        }
+
         worker.load_model().context("failed to load CUDA model")?;
 
         let hf_config = worker
@@ -387,7 +403,10 @@ struct InitializedCore {
 /// Handles both single-GPU (TP=1) and multi-GPU (TP>1) transparently.
 /// Shared by [`initialize_stack`] (async server path) and
 /// [`initialize_stack_sync`] (sync LLM path).
-fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
+fn initialize_core(
+    config: &VllmConfig,
+    progress: Option<&Arc<crate::progress::StartupProgress>>,
+) -> Result<InitializedCore> {
     let tp_size = config.tensor_parallel_size;
 
     // TP > 1: multi-GPU path with NCCL.
@@ -398,7 +417,11 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
     let model_path = config.model.clone();
     let model_name = extract_model_name(&model_path).into_owned();
 
-    let (mut worker, hf_config, model_dir, model_dtype) = create_worker(config, model_path)?;
+    if let Some(pb) = progress {
+        pb.set_stage("Loading model");
+    }
+    let (mut worker, hf_config, model_dir, model_dtype) =
+        create_worker(config, model_path, progress)?;
 
     if let Some(arch) = worker.architecture() {
         info!("Resolved model architecture: {}", arch);
@@ -417,6 +440,9 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
         model_name, max_model_len, num_layers
     );
 
+    if let Some(pb) = progress {
+        pb.set_stage("Initializing KV cache");
+    }
     let (mut worker, available_memory, num_gpu_blocks, effective_utilization) = init_cache(
         worker,
         config.block_size,
@@ -448,6 +474,9 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
         m.gpu_cache_blocks_total.set(num_gpu_blocks as i64);
     }
 
+    if let Some(pb) = progress {
+        pb.set_stage("Warming up model");
+    }
     worker
         .compile_or_warm_up_model()
         .context("failed to compile or warm up model")?;
@@ -806,7 +835,15 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
 /// caller drives directly with `add_request()` + `get_output()`.
 pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack> {
     let init_start = Instant::now();
-    let core = initialize_core(config)?;
+
+    // Create progress bar if logging is below INFO level
+    let progress = {
+        let show_progress = !tracing::enabled!(tracing::Level::INFO);
+        Arc::new(crate::progress::StartupProgress::new(show_progress))
+    };
+
+    let core = initialize_core(config, Some(&progress))?;
+    progress.finish();
     info!(
         "init engine (load model, create kv cache) took {:.2} seconds",
         init_start.elapsed().as_secs_f64()
@@ -822,8 +859,18 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
     })
 }
 
-pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
+pub fn initialize_stack(
+    config: &VllmConfig,
+    progress: Option<Arc<crate::progress::StartupProgress>>,
+) -> Result<InitializedStack> {
     let init_start = Instant::now();
+
+    // Create progress bar if not provided and logging is below INFO level
+    let progress = progress.unwrap_or_else(|| {
+        // Check if tracing is enabled at INFO level or higher
+        let show_progress = !tracing::enabled!(tracing::Level::INFO);
+        Arc::new(crate::progress::StartupProgress::new(show_progress))
+    });
 
     let tp_size = config.tensor_parallel_size;
     let model_name = extract_model_name(&config.model).into_owned();
@@ -855,7 +902,10 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     }
 
     // TP=1: single-GPU path.
-    let core = initialize_core(config)?;
+    progress.set_stage("Initializing backend");
+    let core = initialize_core(config, Some(&progress))?;
+
+    progress.set_stage("Creating engine");
 
     let client = Box::new(core.client);
 
@@ -964,7 +1014,9 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         init_start.elapsed().as_secs_f64()
     );
 
-    // 11. Return the stack.
+    // 11. Finish progress bar and return the stack.
+    progress.finish();
+
     Ok(InitializedStack {
         engine: Arc::new(engine),
         model_name,

@@ -1502,6 +1502,10 @@ pub struct CudaWorker {
     /// Sync at start of next execute_model to ensure send completed.
     #[allow(dead_code)]
     pp_send_pending: bool,
+
+    /// Optional progress callback for startup initialization.
+    /// Used to report layer-by-layer loading progress to the UI.
+    progress_callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 // Safety: CudaWorker contains raw GPU pointers (via GpuDevice, model weights,
@@ -1582,7 +1586,16 @@ impl CudaWorker {
             pp_recv_hs_buf: None,
             pp_recv_res_buf: None,
             pp_send_pending: false,
+            progress_callback: None,
         }
+    }
+
+    /// Set progress callback for reporting model loading progress.
+    pub fn set_progress_callback<F>(&mut self, callback: std::sync::Arc<F>)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.progress_callback = Some(callback);
     }
 
     /// Expose the GpuDevice (for NCCL stream access during TP init).

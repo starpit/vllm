@@ -3515,172 +3515,180 @@ fn persistent_mlp_block_gpu() {
     let func = module.load_function("persistent_mlp").unwrap();
 
     let num_sms = 58u32;
-    let hidden = 128u32;
-    let intermediate = 128u32;
-    let gate_up_cols = 2 * intermediate;
 
-    let m_values = [1u32, 8, 64, 128, 256];
+    // Test at multiple dimension configs: (hidden, intermediate, M values)
+    let configs: &[(u32, u32, &[u32])] = &[
+        (128, 128, &[1, 64, 128]),      // small dims (known working)
+        (128, 256, &[1, 64]),           // larger intermediate (more N-tiles in phase 0)
+        (896, 4864, &[1, 8, 64, 1024]), // Qwen 0.5B production dims incl prefill
+    ];
     let mut failures = Vec::new();
 
-    for &m in &m_values {
-        let h_input: Vec<half::bf16> = (0..(m * hidden) as usize)
-            .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
-            .collect();
-        let h_gateup_w: Vec<half::bf16> = (0..(gate_up_cols * hidden) as usize)
-            .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
-            .collect();
-        let h_down_w: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
-            .map(|i| half::bf16::from_f32(((i as f32) * 0.00013 + 0.1).cos() * 0.12))
-            .collect();
+    for &(hidden, intermediate, m_values) in configs {
+        let gate_up_cols = 2 * intermediate;
+        println!("  hidden={hidden}, intermediate={intermediate}, gate_up_cols={gate_up_cols}");
 
-        // Reference: 3 separate launches
-        let gate_up_out = run_flat_gemm(
-            &ctx,
-            FLAT_GEMM_BASE_PTX,
-            "flat_gemm_base",
-            &h_input,
-            &h_gateup_w,
-            m,
-            gate_up_cols,
-            hidden,
-        );
-        let activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
-            .map(|idx| {
-                let row = idx / intermediate as usize;
-                let col = idx % intermediate as usize;
-                let gate = gate_up_out[row * gate_up_cols as usize + col].to_f32();
-                let up =
-                    gate_up_out[row * gate_up_cols as usize + intermediate as usize + col].to_f32();
-                half::bf16::from_f32(cpu_silu(gate) * up)
-            })
-            .collect();
-        let ref_output = run_flat_gemm(
-            &ctx,
-            FLAT_GEMM_BASE_PTX,
-            "flat_gemm_base",
-            &activated,
-            &h_down_w,
-            m,
-            hidden,
-            intermediate,
-        );
+        for &m in m_values {
+            let h_input: Vec<half::bf16> = (0..(m * hidden) as usize)
+                .map(|i| half::bf16::from_f32(((i as f32) * 0.00037 - 0.5).sin() * 0.3))
+                .collect();
+            let h_gateup_w: Vec<half::bf16> = (0..(gate_up_cols * hidden) as usize)
+                .map(|i| half::bf16::from_f32(((i as f32) * 0.00019 - 0.2).sin() * 0.08))
+                .collect();
+            let h_down_w: Vec<half::bf16> = (0..(hidden * intermediate) as usize)
+                .map(|i| half::bf16::from_f32(((i as f32) * 0.00013 + 0.1).cos() * 0.12))
+                .collect();
 
-        // Persistent fused MLP
-        let d_input = stream.clone_htod(&h_input).unwrap();
-        let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
-        let d_down_w = stream.clone_htod(&h_down_w).unwrap();
-        let d_gateup_buf: CudaSlice<half::bf16> =
-            stream.alloc_zeros((m * gate_up_cols) as usize).unwrap();
-        let d_output: CudaSlice<half::bf16> = stream.alloc_zeros((m * hidden) as usize).unwrap();
-        let d_counter: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
-        // M-tile completion counters (one per M-tile)
-        let max_mtiles = m.div_ceil(64);
-        let d_mtile_done: CudaSlice<u32> = stream.alloc_zeros(max_mtiles as usize).unwrap();
+            // Reference: 3 separate launches
+            let gate_up_out = run_flat_gemm(
+                &ctx,
+                FLAT_GEMM_BASE_PTX,
+                "flat_gemm_base",
+                &h_input,
+                &h_gateup_w,
+                m,
+                gate_up_cols,
+                hidden,
+            );
+            let activated: Vec<half::bf16> = (0..(m * intermediate) as usize)
+                .map(|idx| {
+                    let row = idx / intermediate as usize;
+                    let col = idx % intermediate as usize;
+                    let gate = gate_up_out[row * gate_up_cols as usize + col].to_f32();
+                    let up = gate_up_out[row * gate_up_cols as usize + intermediate as usize + col]
+                        .to_f32();
+                    half::bf16::from_f32(cpu_silu(gate) * up)
+                })
+                .collect();
+            let ref_output = run_flat_gemm(
+                &ctx,
+                FLAT_GEMM_BASE_PTX,
+                "flat_gemm_base",
+                &activated,
+                &h_down_w,
+                m,
+                hidden,
+                intermediate,
+            );
 
-        let (inp_p, _) = d_input.device_ptr(&stream);
-        let (guw_p, _) = d_gateup_w.device_ptr(&stream);
-        let (gub_p, _) = d_gateup_buf.device_ptr(&stream);
-        let (dw_p, _) = d_down_w.device_ptr(&stream);
-        let (out_p, _) = d_output.device_ptr(&stream);
-        let (ctr_p, _) = d_counter.device_ptr(&stream);
-        let (mtd_p, _) = d_mtile_done.device_ptr(&stream);
+            // Persistent fused MLP
+            let d_input = stream.clone_htod(&h_input).unwrap();
+            let d_gateup_w = stream.clone_htod(&h_gateup_w).unwrap();
+            let d_down_w = stream.clone_htod(&h_down_w).unwrap();
+            let d_gateup_buf: CudaSlice<half::bf16> =
+                stream.alloc_zeros((m * gate_up_cols) as usize).unwrap();
+            let d_output: CudaSlice<half::bf16> =
+                stream.alloc_zeros((m * hidden) as usize).unwrap();
+            let d_counter: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+            // M-tile completion counters (one per M-tile)
+            let max_mtiles = m.div_ceil(64);
+            let d_mtile_done: CudaSlice<u32> = stream.alloc_zeros(max_mtiles as usize).unwrap();
 
-        // Phase 0: gate_up params
-        let params_gate_up = build_flat_params(
-            inp_p as u64,
-            guw_p as u64,
-            gub_p as u64,
-            gub_p as u64,
-            m,
-            gate_up_cols,
-            hidden,
-            hidden,
-            hidden,
-            gate_up_cols,
-            gate_up_cols,
-            1.0,
-            0.0,
-        );
-        // Phase 1: SiLU-fused down params
-        let intermediate_bytes = (intermediate as u64) * 2;
-        let params_down = build_flat_params(
-            gub_p as u64,
-            dw_p as u64,
-            out_p as u64,
-            out_p as u64,
-            m,
-            hidden,
-            intermediate,
-            gate_up_cols,
-            intermediate,
-            hidden,
-            hidden,
-            1.0,
-            0.0,
-        );
+            let (inp_p, _) = d_input.device_ptr(&stream);
+            let (guw_p, _) = d_gateup_w.device_ptr(&stream);
+            let (gub_p, _) = d_gateup_buf.device_ptr(&stream);
+            let (dw_p, _) = d_down_w.device_ptr(&stream);
+            let (out_p, _) = d_output.device_ptr(&stream);
+            let (ctr_p, _) = d_counter.device_ptr(&stream);
+            let (mtd_p, _) = d_mtile_done.device_ptr(&stream);
 
-        // Grid dims for each phase
-        let (gx0, gy0, _) = compute_grid(m, gate_up_cols, 64, 128);
-        let (gx1, gy1, _) = compute_grid(m, hidden, 64, 128);
-        let total_phase0 = gx0 * gy0;
-        let total_phase1 = gx1 * gy1;
-        let total_tiles = total_phase0 + total_phase1;
-        let num_blocks = total_tiles.min(num_sms);
+            // Phase 0: gate_up params
+            let params_gate_up = build_flat_params(
+                inp_p as u64,
+                guw_p as u64,
+                gub_p as u64,
+                gub_p as u64,
+                m,
+                gate_up_cols,
+                hidden,
+                hidden,
+                hidden,
+                gate_up_cols,
+                gate_up_cols,
+                1.0,
+                0.0,
+            );
+            // Phase 1: SiLU-fused down params
+            let intermediate_bytes = (intermediate as u64) * 2;
+            let params_down = build_flat_params(
+                gub_p as u64,
+                dw_p as u64,
+                out_p as u64,
+                out_p as u64,
+                m,
+                hidden,
+                intermediate,
+                gate_up_cols,
+                intermediate,
+                hidden,
+                hidden,
+                1.0,
+                0.0,
+            );
 
-        // N-tiles per M-tile for phase 0 barrier
-        let grid_n_0 = gate_up_cols.div_ceil(128);
-        let swizzle_log_0 = compute_swizzle_log(grid_n_0);
-        let swizzle_tile_0 = 1u32 << swizzle_log_0;
-        let ntiles_per_m_0 = swizzle_tile_0 * gy0; // tiles in one M-tile's column strip
+            // Grid dims for each phase
+            let (gx0, gy0, _) = compute_grid(m, gate_up_cols, 64, 128);
+            let (gx1, gy1, _) = compute_grid(m, hidden, 64, 128);
+            let total_phase0 = gx0 * gy0;
+            let total_phase1 = gx1 * gy1;
+            let total_tiles = total_phase0 + total_phase1;
+            let num_blocks = total_tiles.min(num_sms);
 
-        let ctr_val = ctr_p as u64;
-        let mtd_val = mtd_p as u64;
+            // N-tiles per M-tile for phase 0 barrier
+            let grid_n_0 = gate_up_cols.div_ceil(128);
+            let swizzle_log_0 = compute_swizzle_log(grid_n_0);
+            let swizzle_tile_0 = 1u32 << swizzle_log_0;
+            let ntiles_per_m_0 = swizzle_tile_0 * gy0; // tiles in one M-tile's column strip
 
-        let cfg = LaunchConfig {
-            grid_dim: (num_blocks, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 36864 + 512,
-        };
+            let ctr_val = ctr_p as u64;
+            let mtd_val = mtd_p as u64;
 
-        // Param order: persistent params, then phase params
-        // _persistent_counter, _persistent_total, _persistent_grid_x_0,
-        // _persistent_phase0_tiles, _persistent_grid_x_1,
-        // _persistent_ntiles_per_m_0, _persistent_mtile_done,
-        // ferrite_params (gate_up), _ferrite_intermediate_bytes_2, ferrite_params_2 (down)
-        unsafe {
-            stream
-                .launch_builder(&func)
-                .arg(&ctr_val)
-                .arg(&total_tiles)
-                .arg(&gx0)
-                .arg(&total_phase0)
-                .arg(&gx1)
-                .arg(&ntiles_per_m_0)
-                .arg(&mtd_val)
-                .arg(&params_gate_up)
-                .arg(&intermediate_bytes)
-                .arg(&params_down)
-                .launch(cfg)
-        }
-        .unwrap();
-        stream.synchronize().unwrap();
-        let pers_output = stream.clone_dtoh(&d_output).unwrap();
+            let cfg = LaunchConfig {
+                grid_dim: (num_blocks, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 36864 + 512,
+            };
 
-        let mut max_diff = 0.0f32;
-        for (r, p) in ref_output.iter().zip(pers_output.iter()) {
-            let diff = (r.to_f32() - p.to_f32()).abs();
-            if diff > max_diff {
-                max_diff = diff;
+            // Param order: persistent params, then phase params
+            // _persistent_counter, _persistent_total, _persistent_grid_x_0,
+            // _persistent_phase0_tiles, _persistent_grid_x_1,
+            // _persistent_ntiles_per_m_0, _persistent_mtile_done,
+            // ferrite_params (gate_up), _ferrite_intermediate_bytes_2, ferrite_params_2 (down)
+            unsafe {
+                stream
+                    .launch_builder(&func)
+                    .arg(&ctr_val)
+                    .arg(&total_tiles)
+                    .arg(&gx0)
+                    .arg(&total_phase0)
+                    .arg(&gx1)
+                    .arg(&ntiles_per_m_0)
+                    .arg(&mtd_val)
+                    .arg(&params_gate_up)
+                    .arg(&intermediate_bytes)
+                    .arg(&params_down)
+                    .launch(cfg)
             }
-        }
-        let status = if max_diff < 0.1 { "PASS" } else { "FAIL" };
-        println!(
-            "  M={m:>4} tiles=({total_phase0}+{total_phase1}={total_tiles}) blocks={num_blocks} max_diff={max_diff:.2e} {status}"
-        );
-        if max_diff >= 0.1 {
-            failures.push((m, max_diff));
-        }
-    }
+            .unwrap();
+            stream.synchronize().unwrap();
+            let pers_output = stream.clone_dtoh(&d_output).unwrap();
+
+            let mut max_diff = 0.0f32;
+            for (r, p) in ref_output.iter().zip(pers_output.iter()) {
+                let diff = (r.to_f32() - p.to_f32()).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+            }
+            let status = if max_diff < 0.1 { "PASS" } else { "FAIL" };
+            println!(
+                "  M={m:>4} tiles=({total_phase0}+{total_phase1}={total_tiles}) blocks={num_blocks} max_diff={max_diff:.2e} {status}"
+            );
+            if max_diff >= 0.1 {
+                failures.push((m, max_diff));
+            }
+        } // end for m
+    } // end for configs
     assert!(
         failures.is_empty(),
         "Persistent MLP failures: {:?}",

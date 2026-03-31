@@ -1069,7 +1069,41 @@ impl LlamaDecoderLayer {
                 crate::layers::LinearLayer::Dense(down_linear),
             ) = (&self.mlp.gate_up_proj, &self.mlp.down_proj)
             {
-                // Fused MLP block: gate_up → SiLU → down in one persistent launch
+                // Toggle: fused vs separate MLP
+                const FUSED_MLP: bool = true;
+
+                if !FUSED_MLP {
+                    let gate_up = gate_up_linear.forward_ferrite(
+                        attn_output.view(),
+                        &device.ferrite,
+                        &mut device.caching,
+                        device.compute_stream,
+                    );
+                    drop(attn_output);
+                    let activated = kernels::silu_and_mul_fused(
+                        gate_up.as_gpu_tensor(),
+                        self.mlp.intermediate_size,
+                        &mut device.caching,
+                        device.compute_stream,
+                    );
+                    drop(gate_up);
+                    let mlp_output = down_linear.forward_ferrite(
+                        activated.view(),
+                        &device.ferrite,
+                        &mut device.caching,
+                        device.compute_stream,
+                    );
+                    drop(activated);
+                    if self.residual_multiplier != 1.0 {
+                        kernels::scale_inplace(
+                            *mlp_output,
+                            self.residual_multiplier,
+                            &device.cublas,
+                        );
+                    }
+                    return (mlp_output, residual);
+                }
+
                 let (mlp_output, _gate_up_buf) = device.ferrite.launch_mlp_block(
                     *attn_output,
                     gate_up_linear.weight,

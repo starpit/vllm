@@ -1150,7 +1150,7 @@ impl LlamaForCausalLM {
         // TP: all-gather logits (column parallel lm_head).
         #[cfg(feature = "nccl")]
         if let Some(ref group) = self.tp_group {
-            let gathered = group.all_gather(logits.as_gpu_tensor(), &mut device.caching);
+            let gathered = group.all_gather_last_dim(logits.as_gpu_tensor(), &mut device.caching);
             drop(logits);
             logits = gathered;
         }
@@ -3898,7 +3898,8 @@ impl LlamaForCausalLM {
                 // TP: all-gather logits.
                 #[cfg(feature = "nccl")]
                 if let Some(ref group) = self.tp_group {
-                    let gathered = group.all_gather(logits.as_gpu_tensor(), &mut device.caching);
+                    let gathered =
+                        group.all_gather_last_dim(logits.as_gpu_tensor(), &mut device.caching);
                     drop(logits);
                     logits = gathered;
                 }

@@ -2696,13 +2696,39 @@ impl CudaWorker {
             );
         }
 
-        // Helper: get random value using per-request seeded RNG if available.
-        let mut thread_rng = rand::thread_rng();
+        // Helper: get a per-request random seed for GPU sampling kernels.
+        //
+        // For requests with an explicit seed: use the per-request seeded RNG.
+        // For unseeded requests: derive from hash(req_id, position) — this is
+        // stateless and identical on all TP ranks, unlike a stateful RNG which
+        // can desync if ranks call gen_random different numbers of times during
+        // prefill chunking.
+        //
+        // The GPU Gumbel kernel uses this as a seed for hash_to_uniform(seed, idx)
+        // to generate per-element randomness, so we just need one unique f32/step.
+        let positions = &prepared.flat_positions;
+        let mut req_offset = 0usize;
         let mut gen_random = |req_id: &str| -> f32 {
             if let Some(rng) = seeded_rngs.get_mut(req_id) {
                 rng.r#gen::<f32>()
             } else {
-                thread_rng.r#gen::<f32>()
+                // Stateless hash: combine req_id bytes with position (step
+                // counter). Must be deterministic across TP ranks — we use a
+                // simple FNV-1a hash with a fixed seed (NOT DefaultHasher which
+                // uses a random per-process seed for DOS protection).
+                let pos = positions.get(req_offset).copied().unwrap_or(0);
+                req_offset += 1;
+                let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
+                for b in req_id.as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(0x100000001b3); // FNV prime
+                }
+                for b in pos.to_le_bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                // Map to (0, 1).
+                (h >> 40) as f32 / 16777216.0
             }
         };
 

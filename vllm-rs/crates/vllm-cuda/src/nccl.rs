@@ -219,6 +219,81 @@ impl NcclGroup {
 
         out
     }
+
+    /// All-gather along the last dimension of a 2D tensor.
+    ///
+    /// Input `[N, S]` per rank → output `[N, world_size * S]`.
+    ///
+    /// NCCL only supports contiguous (dim=0) gather, so this does:
+    /// 1. NCCL all-gather → `[world_size * N, S]` (temp buffer)
+    /// 2. Rearrange to `[N, world_size * S]` via a copy kernel
+    ///
+    /// Matches Python vLLM's `tensor_model_parallel_all_gather(logits)`
+    /// which gathers along dim=-1 using movedim + contiguous.
+    pub unsafe fn all_gather_last_dim(
+        &self,
+        tensor: GpuTensor,
+        alloc: &mut CachingAllocator,
+    ) -> OwnedTensor {
+        if tensor.ndim() != 2 {
+            panic!(
+                "all_gather_last_dim requires 2D tensor, got {}D",
+                tensor.ndim()
+            );
+        }
+        let n = tensor.dim(0); // num_reqs
+        let s = tensor.dim(1); // vocab_shard = vocab / world_size
+
+        // Step 1: NCCL all-gather along dim=0 into temp buffer.
+        let temp = self.all_gather(tensor, alloc);
+
+        // Step 2: Rearrange [world_size * N, S] → [N, world_size * S].
+        let vocab = self.world_size * s;
+        let out = alloc.alloc_tensor(&[n, vocab], temp.as_gpu_tensor().dtype());
+
+        let elem_bytes = temp.as_gpu_tensor().dtype().size_bytes();
+        match elem_bytes {
+            2 => gather_last_dim_f16(
+                temp.as_gpu_tensor().raw_ptr(),
+                out.as_gpu_tensor().raw_ptr() as *mut u8,
+                n as i32,
+                s as i32,
+                self.world_size as i32,
+                self.stream,
+            ),
+            4 => gather_last_dim_f32(
+                temp.as_gpu_tensor().raw_ptr(),
+                out.as_gpu_tensor().raw_ptr() as *mut u8,
+                n as i32,
+                s as i32,
+                self.world_size as i32,
+                self.stream,
+            ),
+            _ => panic!("all_gather_last_dim: unsupported dtype size {elem_bytes}"),
+        }
+
+        out
+    }
+}
+
+// FFI for gather_last_dim rearrangement kernel.
+unsafe extern "C" {
+    fn gather_last_dim_f16(
+        src: *const u8,
+        dst: *mut u8,
+        n: i32,
+        s: i32,
+        world_size: i32,
+        stream: CUstream,
+    );
+    fn gather_last_dim_f32(
+        src: *const u8,
+        dst: *mut u8,
+        n: i32,
+        s: i32,
+        world_size: i32,
+        stream: CUstream,
+    );
 }
 
 impl Drop for NcclGroup {

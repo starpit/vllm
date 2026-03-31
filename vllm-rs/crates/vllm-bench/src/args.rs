@@ -38,6 +38,8 @@ pub enum BenchCommands {
     Musique(BenchMusiqueArgs),
     /// HotpotQA multi-hop RAG accuracy benchmark.
     Hotpotqa(BenchHotpotqaArgs),
+    /// MS MARCO passage QA accuracy benchmark.
+    Msmarco(BenchMsmarcoArgs),
 }
 
 /// Arguments for `vllm bench latency`.
@@ -1310,6 +1312,93 @@ pub struct BenchHotpotqaArgs {
 }
 
 impl BenchHotpotqaArgs {
+    pub fn resolved_model(&self) -> Result<String, String> {
+        match (&self.model_tag, &self.model) {
+            (Some(tag), _) => Ok(tag.clone()),
+            (None, Some(m)) => Ok(m.clone()),
+            (None, None) => {
+                Err("model is required: provide as positional arg or --model flag".into())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MS MARCO benchmark args
+// ---------------------------------------------------------------------------
+
+/// Arguments for `vllm bench msmarco`.
+///
+/// MS MARCO v2.1: downloads the validation set from HuggingFace and evaluates
+/// single-hop passage QA. Each sample has ~10 Bing search result passages.
+/// Only answerable queries (55K of 101K) are evaluated.
+///
+/// Compares plain (chat) vs span (SPNL with relocatable passage blocks)
+/// modes, reporting accuracy and TTFT, with per-query-type breakdown.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench msmarco [MODEL] [OPTIONS]")]
+pub struct BenchMsmarcoArgs {
+    /// Model: local path or HuggingFace model ID (positional).
+    pub model_tag: Option<String>,
+
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Number of queries to evaluate from the validation set.
+    #[arg(short = 'n', long)]
+    pub num_queries: Option<usize>,
+
+    /// Max tokens for model response.
+    #[arg(long, default_value_t = 64)]
+    pub max_tokens: usize,
+
+    /// Fraction of GPU memory to use for KV cache (0.0-1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+
+    /// Enable debug output for first sample.
+    #[arg(long)]
+    pub debug: bool,
+}
+
+impl BenchMsmarcoArgs {
     pub fn resolved_model(&self) -> Result<String, String> {
         match (&self.model_tag, &self.model) {
             (Some(tag), _) => Ok(tag.clone()),

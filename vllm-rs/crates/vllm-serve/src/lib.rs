@@ -21,6 +21,7 @@ pub mod llm;
 pub mod metrics;
 #[cfg(feature = "metrics")]
 pub mod orca;
+pub mod progress;
 pub mod protocol;
 pub mod reasoning_parser;
 pub mod responses;

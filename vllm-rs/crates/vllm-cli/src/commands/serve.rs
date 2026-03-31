@@ -177,7 +177,8 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     // Keep a clone for /server_info (before we move config into the blocking task).
     let vllm_config_snapshot = config.clone();
 
-    let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))
+    // Initialize the stack (progress bar is created automatically inside initialize_stack)
+    let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config, None))
         .await
         .expect("initialize_stack panicked")?;
 

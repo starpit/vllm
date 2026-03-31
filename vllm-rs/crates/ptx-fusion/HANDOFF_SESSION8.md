@@ -279,6 +279,75 @@ cargo build --bin vllm --features cuda,ferrite --release
 ./target/release/vllm chat --model Qwen/Qwen2.5-0.5B-Instruct --enforce-eager --prompt "What is the capital of France?"
 ```
 
+## Known shortcuts and technical debt
+
+These are places where I took shortcuts to get to production. They work but
+violate the tile pipeline's principles. The next session should fix them.
+
+### 1. Hand-written fused_add per-element PTX (pipeline_compile.rs:1472-1474)
+
+The `fused_add_rms_norm` variant prepends hand-written instructions to the
+derived per-element code:
+```ptx
+add.f32    {INPUT}, {INPUT}, %f_rms_hs{ELEM_IDX};   // residual + hidden_states
+cvt.rn.bf16.f32  %h_rms_a, {INPUT};                  // bf16 round-trip
+cvt.f32.bf16     {INPUT}, %h_rms_a;                   // (matches standard path precision)
+```
+These are NOT derived from the emit body — they're hand-written. The add+truncate
+is specific to the two-input reduction variant. The emit body for fused_add_rms_norm
+DOES contain this logic (in the accumulate loop, not the emit loop), but the pipeline
+compiler doesn't extract it from there. For now, the hand-written version is correct
+(session 6 proved the bf16 round-trip matches the standard path), but it should be
+derived from the kernel PTX.
+
+### 2. Hardcoded tile_n=128 in persistent barrier (persistent.rs:497-498, 540-541)
+
+The per-M-tile barrier in `make_persistent_two_phase` computes swizzle_log from N
+using `add 127, shr 7` which is `ceil(N/128)`. This assumes tile_n=128. If a
+different tile config is used (e.g., 64x64x32 with tile_n=64), the swizzle
+computation will be wrong and the barrier will deadlock or skip tiles.
+
+Fix: read tile_n from the GEMM's entry name (GemmShapeILi) or pass it as a param.
+
+### 3. Hardcoded num_sms=58 (ferrite.rs:311)
+
+The persistent MLP block hardcodes `num_sms = 58` (L4 GPU). Should query
+`cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)` at init time.
+
+### 4. Hardcoded tile config 64x128x32 for MLP block (ferrite.rs:291-292)
+
+The fused MLP block uses only the 64x128x32 tile config. The standalone GEMM
+path has runtime tile selection. The MLP block PTX is compiled for one config at
+compile time. Supporting multiple configs requires either:
+- Multiple compiled MLP block variants with runtime dispatch, or
+- JIT compilation of the fused kernel at model load time
+
+### 5. Per-site weight loading is still hand-written (pipeline_compile.rs:~810-870)
+
+The per-site code (loading weights at each A-load, row selection via address
+comparison) is hand-written plumbing, not derived from the TilePerimeter. The
+TilePerimeter has the weight loading info in the emit body, but the pipeline
+compiler doesn't use it — it generates its own address computation.
+
+### 6. Prologue accumulation loop is still transplanted, not generated (pipeline_compile.rs:~1350-1400)
+
+The accumulation loop (sum-of-squares) in the prologue is transplanted from the
+rms_norm kernel PTX with register renaming. The TilePerimeter has the
+finalization info, but the prologue generation still works from `PipelineStage`
+source_lines directly, not from `TilePerimeter::finalization`.
+
+### 7. The `make_persistent_multiphase` function in pipeline_compile.rs:~555 is dead code
+
+The incomplete N-phase persistent wrapper was started but never finished (the
+working version is `make_persistent_two_phase` in persistent.rs). The dead code
+has TODO comments. Should be removed or replaced when 3-phase persistent is needed.
+
+### 8. The 6 failing GPU tests are from the old split architecture
+
+Tests `fused_norm_gemm_*` and `rms_norm_gemm_gpu_correctness` fail because they
+use the intrinsic path (not pipeline) without the bf16 entry hint. They should
+either be fixed (add entry hint) or removed (they test the deprecated path).
+
 ## Rules (non-negotiable, carried forward)
 
 - **NEVER write PTX by hand** — transplant from compiled kernel PTX or derive from emit body

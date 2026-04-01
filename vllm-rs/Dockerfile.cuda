@@ -56,13 +56,14 @@ RUN cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --b
 # =============================================================================
 FROM builder AS kernel-builder
 WORKDIR /build
-# vllm-kernels-cuda has its own [workspace] so cargo doesn't need the rest of the repo.
 COPY crates/vllm-kernels-cuda/ crates/vllm-kernels-cuda/
 COPY crates/vllm-cuda/csrc/ crates/vllm-cuda/csrc/
 COPY third_party/ third_party/
+# Synthetic workspace root — just enough for cargo to build vllm-kernels-cuda standalone.
+RUN printf '[workspace]\nmembers = ["crates/vllm-kernels-cuda"]\nresolver = "2"\n\n[workspace.package]\nversion = "0.1.0"\nedition = "2021"\nlicense = "Apache-2.0"\n' > Cargo.toml
 ARG CUDA_COMPUTE_CAP=89
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
-RUN cargo build --manifest-path crates/vllm-kernels-cuda/Cargo.toml --features cuda --release
+RUN cargo build -p vllm-kernels-cuda --features cuda --release
 
 # =============================================================================
 # Stage 5: Binary compilation

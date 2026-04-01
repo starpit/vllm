@@ -1,10 +1,8 @@
-[workspace]
-
 [package]
 name = "vllm-kernels-cuda"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "CUDA kernel compilation for vllm-rs (fused ops, Marlin, FlashAttention-2)"
 
 [features]

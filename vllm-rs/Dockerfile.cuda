@@ -50,6 +50,8 @@ WORKDIR /build
 COPY --from=planner /build/recipe.json recipe.json
 # Path dependencies must be present for cargo chef cook
 COPY third_party/ third_party/
+ARG CUDA_COMPUTE_CAP=89
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 RUN cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --bin vllm
 
 # =============================================================================
@@ -63,6 +65,12 @@ COPY . .
 # Reuse pre-built deps from cooker
 COPY --from=cooker /build/target target
 COPY --from=cooker /root/.cargo /root/.cargo
+
+# Target a specific GPU architecture to avoid compiling kernels for every SM.
+# Common values: 80 (A100), 86 (A10/A30), 89 (L40S/RTX 4090), 90 (H100).
+# Defaults to the current machine's GPU if unset (may not work in CI — set explicitly).
+ARG CUDA_COMPUTE_CAP=89
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
 RUN cargo build --release --features cuda,nccl -p vllm-cli
 

@@ -164,5 +164,10 @@ web-sys = "0.3"
 js-sys = "0.3"
 serde-wasm-bindgen = "0.6"
 
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [patch.crates-io]
 cudaforge = { path = "third_party/cudaforge" }

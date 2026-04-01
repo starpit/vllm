@@ -85,17 +85,18 @@ RUN echo "=== Dynamic deps ===" && ldd target/release/vllm && \
 # =============================================================================
 FROM debian:12-slim
 
-# Add NVIDIA apt repo for libcublas12 and libnccl2
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg \
-    && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/3bf863cc.pub \
-    | gpg --dearmor -o /usr/share/keyrings/nvidia-cuda.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/nvidia-cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64 /" \
-    > /etc/apt/sources.list.d/nvidia-cuda.list \
-    && apt-get update && apt-get install -y --no-install-recommends \
-    libcublas-12-9 \
-    libnccl2 \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy cublas/cublasLt .so files directly from the builder — no apt repo needed.
+# The .so.12 symlink is what the dynamic linker resolves at runtime.
+COPY --from=compiler /usr/local/cuda/lib64/libcublas.so.12 /usr/local/cuda/lib64/
+COPY --from=compiler /usr/local/cuda/lib64/libcublasLt.so.12 /usr/local/cuda/lib64/
+COPY --from=compiler /usr/lib/x86_64-linux-gnu/libnccl.so.2 /usr/lib/x86_64-linux-gnu/
+
+# Tell the dynamic linker where to find the CUDA libs
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
 
 COPY --from=compiler /build/target/release/vllm /usr/local/bin/vllm
 

@@ -1,26 +1,102 @@
-# Multi-stage build for vLLM Rust (CUDA)
-# Usage: docker build -f Dockerfile.cuda -t vllm-rs:cuda .
+# syntax=docker/dockerfile:1.7
+#
+# Builds a minimal CUDA runtime image for vllm-rs.
+# No GPU required on the build machine — nvcc compiles device code ahead of time.
+#
+# Build (from repo root):
+#   docker buildx build --platform linux/amd64 \
+#     -t vllm-rs:cuda -f vllm-rs/Dockerfile.cuda .
+#
+# Runtime deps in the final image:
+#   libnccl.so.2  — bundled (~120MB); build with --features cuda (no nccl) to drop it
+#   libcuda.so.1  — NOT in image; injected at container start by nvidia-container-toolkit
+#
+# Final image size: ~200MB with NCCL, ~80MB without.
 
-# --- Builder stage ---
-FROM nvidia/cuda:12.9.0-devel-ubuntu24.04 AS builder
+# =============================================================================
+# Stage 1: Builder base — full CUDA toolkit, no GPU needed at build time
+# =============================================================================
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS builder
 
-RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    # Provides libcublas_static.a + libcublaslt_static.a; baked into binary, absent at runtime
+    libcublas-dev \
+    # Static libstdc++
+    libstdc++-12-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+RUN cargo install cargo-chef --locked
+
+# =============================================================================
+# Stage 2: Dependency plan — reruns only when Cargo.toml / Cargo.lock changes
+# =============================================================================
+FROM builder AS planner
 WORKDIR /build
-COPY . .
+COPY vllm-rs/ .
+RUN cargo chef prepare --recipe-path recipe.json --bin vllm-cli
 
-RUN cargo build --release -p vllm-cli --features cuda
+# =============================================================================
+# Stage 3: Dependency compilation — cached layer
+# =============================================================================
+FROM builder AS cooker
+WORKDIR /build
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --bin vllm-cli
 
-# --- Runtime stage ---
-FROM nvidia/cuda:12.9.0-runtime-ubuntu24.04
+# =============================================================================
+# Stage 4: Binary compilation
+# =============================================================================
+FROM builder AS compiler
+WORKDIR /build
 
-RUN apt-get update && apt-get install -y ca-certificates libssl3t64 && rm -rf /var/lib/apt/lists/*
+COPY vllm-rs/ .
+COPY third_party/ ../third_party/
 
-COPY --from=builder /build/target/release/vllm /usr/local/bin/vllm
+# Reuse pre-built deps from cooker
+COPY --from=cooker /build/target target
+COPY --from=cooker /root/.cargo /root/.cargo
+
+# Statically link libstdc++ and libgcc — no C++ runtime dep in the final image
+ENV RUSTFLAGS="-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
+
+RUN cargo build --release --features cuda,nccl -p vllm-cli
+
+# Sanity check: only libcuda, libnccl, and fundamental Linux syscall libs may be dynamic.
+# Fail the build if anything else (libcublas, libcudart, libstdc++, etc.) sneaks in.
+RUN echo "=== Dynamic deps ===" && ldd target/release/vllm && \
+    ldd target/release/vllm \
+    | grep -vE 'libcuda\.so|libnccl\.so|linux-vdso|libdl\.so|librt\.so|libpthread\.so|ld-linux|libm\.so|libc\.so' \
+    | { grep -q ' => ' && echo "UNEXPECTED DYNAMIC DEPS — static linking failed" && exit 1 || true; }
+
+# =============================================================================
+# Stage 5: Minimal runtime image
+# =============================================================================
+FROM debian:12-slim
+
+# libnccl2 for multi-GPU tensor parallelism.
+# For single-GPU: rebuild --features cuda (drop nccl) and remove libnccl2 here.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnccl2 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=compiler /build/target/release/vllm /usr/local/bin/vllm
+
+# nvidia-container-toolkit mounts libcuda.so.1 from the host driver at container
+# start when NVIDIA_VISIBLE_DEVICES is set — no CUDA libs needed in the image.
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 EXPOSE 8000
 
-ENTRYPOINT ["vllm"]
+ENTRYPOINT ["/usr/local/bin/vllm"]
 CMD ["serve", "--help"]

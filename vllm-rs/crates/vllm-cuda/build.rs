@@ -323,6 +323,8 @@ fn build_flash_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .expect("Failed to build flash attention");
 
     println!("cargo:rustc-link-lib=static=vllm_flash_attn");
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=rt");
+    println!("cargo:rustc-link-lib=dylib=dl");
+    println!("cargo:rustc-link-lib=static=stdc++");
 }

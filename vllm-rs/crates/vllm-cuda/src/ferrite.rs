@@ -161,13 +161,14 @@ impl FerriteCutlass {
         };
 
         // Load register transfer MLP kernel (40KB SMEM: 24KB CUTLASS + 8KB gate + 8KB up)
-        let mlp_regtransfer = match load_flat_module(MLP_REGTRANSFER_PTX, "ferrite_mlp_regtransfer", 40960) {
-            Ok((module, func)) => Some(CudaFunc(module, func)),
-            Err(e) => {
-                eprintln!("ferrite: register transfer MLP kernel load failed (non-fatal): {e}");
-                None
-            }
-        };
+        let mlp_regtransfer =
+            match load_flat_module(MLP_REGTRANSFER_PTX, "ferrite_mlp_regtransfer", 40960) {
+                Ok((module, func)) => Some(CudaFunc(module, func)),
+                Err(e) => {
+                    eprintln!("ferrite: register transfer MLP kernel load failed (non-fatal): {e}");
+                    None
+                }
+            };
 
         // Allocate barrier counters: [tile_counter(u32)] + [mtile_done array(u32 × max_mtiles)]
         // Max M in practice: 2048 tokens → ceil(2048/64) = 32 M-tiles. Allocate for 64.
@@ -476,6 +477,115 @@ impl FerriteCutlass {
         );
 
         (output, gate_up_buf)
+    }
+
+    /// Launch register transfer MLP: gate_up GEMM → SiLU+mul → down GEMM.
+    ///
+    /// Non-persistent: one block per consumer output tile, driver loop inside kernel.
+    /// Uses 64x64x32 tiles with SMEM scratch for register transfer.
+    pub unsafe fn launch_mlp_regtransfer(
+        &self,
+        normed_input: GpuTensor,
+        gate_up_weight: GpuTensor,
+        down_weight: GpuTensor,
+        intermediate_size: u32,
+        alloc: &mut CachingAllocator,
+        stream: CUstream,
+    ) -> OwnedTensor {
+        let func = match &self.mlp_regtransfer {
+            Some(cf) => cf.1,
+            None => panic!("ferrite: MLP regtransfer kernel not loaded"),
+        };
+
+        let m = normed_input.dim(0) as u32;
+        let hidden = normed_input.dim(1) as u32;
+        let gate_up_cols = 2 * intermediate_size;
+
+        let tile_m = 64u32;
+        let tile_n = 64u32; // register transfer uses 64x64 tiles
+
+        // Pad output to tile boundary (CUTLASS reads full tiles via cp.async)
+        let padded_m = m.div_ceil(tile_m) * tile_m;
+        let mut output =
+            alloc.alloc_tensor(&[padded_m as usize, hidden as usize], normed_input.dtype());
+        unsafe { output.reshape(&[m as usize, hidden as usize], normed_input.dtype()) };
+
+        // Producer (gate_up) params: input × gate_up_weight → SMEM scratch
+        let params_gate_up = build_flat_params(
+            normed_input.raw_ptr() as u64,
+            gate_up_weight.raw_ptr() as u64,
+            0, // C unused (epilogue redirected to SMEM)
+            0, // D unused
+            m,
+            gate_up_cols,
+            hidden,
+            hidden,       // lda
+            hidden,       // ldb
+            gate_up_cols, // ldc (unused)
+            gate_up_cols, // ldd (unused)
+            1.0,
+            0.0,
+        );
+
+        // Consumer (down) params: SiLU(scratch) × down_weight → output
+        // K = tile_n (64): consumer processes one K-slice per driver iteration.
+        let cons_k = tile_n;
+        let params_down = build_flat_params(
+            0, // A_ptr = 0: gmem_src-based scratch addressing
+            down_weight.raw_ptr() as u64,
+            output.as_gpu_tensor().raw_ptr() as u64,
+            output.as_gpu_tensor().raw_ptr() as u64,
+            m,
+            hidden,            // N
+            cons_k,            // K per iteration
+            cons_k,            // lda = tile_n (scratch layout)
+            intermediate_size, // ldb (full weight column stride)
+            hidden,            // ldc
+            hidden,            // ldd
+            1.0,
+            0.0,
+        );
+
+        let num_producer_n_tiles = intermediate_size.div_ceil(tile_n);
+        let intermediate_n_offset = intermediate_size / tile_n; // tiles to skip for "up" half
+
+        // Grid: one block per consumer output tile (CUTLASS swizzled 2D grid)
+        let grid_m = m.div_ceil(tile_m);
+        let grid_n = hidden.div_ceil(tile_n);
+        let sw = compute_swizzle_log(grid_n);
+        let swizzle_tile = 1u32 << sw;
+        let grid_x = grid_m * swizzle_tile;
+        let grid_y = grid_n.div_ceil(swizzle_tile);
+
+        let smem_bytes = 40960u32; // 24KB CUTLASS + 8KB gate scratch + 8KB up scratch
+
+        let mut kp: [*mut std::ffi::c_void; 4] = [
+            &params_gate_up as *const [u8; 88] as *mut _,
+            &params_down as *const [u8; 88] as *mut _,
+            &num_producer_n_tiles as *const u32 as *mut _,
+            &intermediate_n_offset as *const u32 as *mut _,
+        ];
+
+        let result = sys::cuLaunchKernel(
+            func,
+            grid_x,
+            grid_y,
+            1,
+            128, // threads per block
+            1,
+            1,
+            smem_bytes,
+            stream,
+            kp.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            result,
+            sys::cudaError_enum::CUDA_SUCCESS,
+            "ferrite launch_mlp_regtransfer failed: {result:?}"
+        );
+
+        output
     }
 
     /// Launch the gemv kernel: y[1,N] = x[1,K] @ W[N,K]^T

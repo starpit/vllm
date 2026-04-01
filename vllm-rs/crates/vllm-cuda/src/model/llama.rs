@@ -1108,7 +1108,7 @@ impl LlamaDecoderLayer {
                     return (mlp_output, residual);
                 }
 
-                let (mlp_output, _gate_up_buf) = device.ferrite.launch_mlp_block(
+                let mlp_output = device.ferrite.launch_mlp_regtransfer(
                     *attn_output,
                     gate_up_linear.weight,
                     down_linear.weight,
@@ -1116,8 +1116,6 @@ impl LlamaDecoderLayer {
                     &mut device.caching,
                     device.compute_stream,
                 );
-                // _gate_up_buf + attn_output kept alive until scope exit —
-                // the async kernel reads from both during execution.
 
                 if self.residual_multiplier != 1.0 {
                     kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);

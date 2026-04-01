@@ -798,9 +798,12 @@ fn compute_row_offset(
 /// or register names.
 #[derive(Debug, Clone)]
 pub struct PreambleDecomposition {
-    /// Setup lines: tile index computation, bounds checks, address setup.
-    /// These depend on params and ctaid — safe to run once before the driver loop.
-    pub setup: Vec<String>,
+    /// Tile index + bounds check lines: ctaid → m_tile/n_tile, early exit if OOB.
+    /// Run once before the driver loop.
+    pub tile_index: Vec<String>,
+    /// Address setup lines: compute A/B base addresses from params + tile index.
+    /// Must run each driver iteration (B addresses change with K-offset).
+    pub address_setup: Vec<String>,
     /// Pipeline prologue lines: fill pipeline stages from SMEM scratch / GMEM.
     /// Must run each driver iteration after the producer fills scratch.
     pub pipeline_prologue: Vec<String>,
@@ -912,23 +915,40 @@ pub fn decompose_preamble(
         }
     }
 
-    // ── Build the three sections ──
-    let mut setup = Vec::new();
+    // ── Find the tile_index / address_setup boundary within the setup section ──
+    // The last `bra` instruction before prologue_start is the bounds check early exit.
+    // Everything up to and including that branch = tile_index.
+    // Everything after (but before prologue_start) = address_setup.
+    let last_bra_in_setup = (0..prologue_start).rev().find(|&i| {
+        let t = preamble[i].trim();
+        t.contains("bra") && t.contains('$')
+    });
+    let address_setup_start = match last_bra_in_setup {
+        Some(bra_line) => bra_line + 1,
+        None => prologue_start, // no bounds check branch — all setup is tile_index
+    };
+
+    // ── Build the four sections ──
+    let mut tile_index = Vec::new();
+    let mut address_setup = Vec::new();
     let mut pipeline_prologue = Vec::new();
     let mut accumulator_init = Vec::new();
 
     for (i, line) in preamble.iter().enumerate() {
         if is_accum_init[i] {
             accumulator_init.push(line.clone());
+        } else if i < address_setup_start {
+            tile_index.push(line.clone());
         } else if i < prologue_start {
-            setup.push(line.clone());
+            address_setup.push(line.clone());
         } else {
             pipeline_prologue.push(line.clone());
         }
     }
 
     PreambleDecomposition {
-        setup,
+        tile_index,
+        address_setup,
         pipeline_prologue,
         accumulator_init,
     }
@@ -1253,6 +1273,8 @@ pub fn fuse_gemm_pointwise_gemm(
     out.push_str("\t.reg .u32 %r_gate_scratch, %r_up_scratch;\n");
     // Registers for producer tile index override (inverse swizzle)
     out.push_str("\t.reg .u32 %r_prod_swiz, %r_prod_mask, %r_prod_ctaid_x, %r_prod_ctaid_y, %r_prod_n_tile;\n");
+    // Consumer B K-offset for multi-iteration: B_ptr advances by prod_tile_n per iter
+    out.push_str("\t.reg .u64 %rd_cons_b_base, %rd_cons_b_koff;\n");
     // Epilogue redirect registers
     for decl in &gate_redir.reg_decls {
         out.push_str(&format!("\t{decl}\n"));
@@ -1284,9 +1306,9 @@ pub fn fuse_gemm_pointwise_gemm(
     // ── Decompose consumer preamble into logical sections ──
     let decomp = decompose_preamble(&cons_fused_desc.preamble, &cons_fused_desc.mma_accumulators);
 
-    // Emit consumer setup (tile index, bounds check, address setup) BEFORE the loop.
-    out.push_str("\t// === Consumer setup (pre-loop: tile index, bounds, addresses) ===\n");
-    for line in &decomp.setup {
+    // Emit consumer tile index + bounds check BEFORE the loop (never changes).
+    out.push_str("\t// === Consumer tile index + bounds (pre-loop) ===\n");
+    for line in &decomp.tile_index {
         let renamed = offset_all_registers(line, &offsets);
         let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
         let renamed = renamed.replace("ferrite_params", "ferrite_params_2");
@@ -1299,6 +1321,11 @@ pub fn fuse_gemm_pointwise_gemm(
         let renamed = offset_all_registers(&format!("\tmov.f32 \t{reg}, 0f00000000;"), &offsets);
         out.push_str(&format!("{renamed}\n"));
     }
+
+    // Load consumer B_ptr (offset 8 in ferrite_params_2) for multi-iteration K-offset.
+    // Each driver iteration advances B_ptr by prod_tile_n elements in the K dimension.
+    out.push_str("\t// FERRITE: load consumer B_ptr for multi-iteration K-offset\n");
+    out.push_str("\tld.param.u64 \t%rd_cons_b_base, [ferrite_params_2+8];\n");
 
     // ── Initialize driver loop ──
     out.push_str("\n\t// === Driver loop initialization ===\n");
@@ -1401,21 +1428,58 @@ pub fn fuse_gemm_pointwise_gemm(
     }
     out.push_str("\tbar.sync \t0;\n\n");
 
+    // Helper: replace consumer B_ptr param loads with the K-offset'd register.
+    // The consumer's B_ptr is at flat param offset 8 (ferrite_params_2+8 after rename).
+    let replace_b_ptr_load = |line: &str| -> String {
+        if line.contains("[ferrite_params_2+8]") && line.contains("ld.param") {
+            if let Some(dest_start) = line.find('%') {
+                let rest = &line[dest_start..];
+                if let Some(end) = rest.find(|c: char| c == ',' || c == ';') {
+                    let dest_reg = &rest[..end];
+                    return format!("\tmov.b64 \t{dest_reg}, %rd_cons_b_koff;");
+                }
+            }
+        }
+        line.to_string()
+    };
+
+    // Compute B K-offset for this driver iteration.
+    // B_ptr_iter = B_ptr + driver_iter * prod_tile_n * sizeof(bf16)
+    let b_k_stride_bytes = prod_tile_n * 2; // bf16 = 2 bytes per element
+    out.push_str("\t// FERRITE: advance consumer B_ptr by K-offset for this iteration\n");
+    out.push_str(&format!(
+        "\tmul.wide.u32 \t%rd_cons_b_koff, %r_driver_iter, {b_k_stride_bytes};\n"
+    ));
+    out.push_str("\tadd.u64 \t%rd_cons_b_koff, %rd_cons_b_base, %rd_cons_b_koff;\n");
+
+    // Consumer address setup INSIDE the loop (B addresses advance with K-offset).
+    out.push_str("\t// === Consumer address setup (in-loop: B_ptr offset per iteration) ===\n");
+    for line in &decomp.address_setup {
+        let renamed = offset_all_registers(line, &offsets);
+        let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
+        let renamed = renamed.replace("ferrite_params", "ferrite_params_2");
+        let renamed = replace_b_ptr_load(&renamed);
+        out.push_str(&format!("{renamed}\n"));
+    }
+
     // Consumer pipeline prologue INSIDE the loop (fills mainloop SMEM from scratch).
     out.push_str("\t// === Consumer pipeline prologue (in-loop: fill from scratch) ===\n");
     for line in &decomp.pipeline_prologue {
         let renamed = offset_all_registers(line, &offsets);
         let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
         let renamed = renamed.replace("ferrite_params", "ferrite_params_2");
+        let renamed = replace_b_ptr_load(&renamed);
         out.push_str(&format!("{renamed}\n"));
     }
 
     // Consumer K-loop with SiLU from SMEM (A-loads replaced by pointwise)
+    // B_ptr param loads also replaced with K-offset'd register.
     out.push_str("\t// --- Down K-loop (consumer, A from SiLU scratch) ---\n");
     for line in &cons_fused_desc.k_loop {
         let renamed = offset_all_registers(line, &offsets);
         let renamed = renamed.replace("$L__BB0", "$L__BB_cons");
         let renamed = renamed.replace("ferrite_params", "ferrite_params_2");
+        let renamed = replace_b_ptr_load(&renamed);
         out.push_str(&format!("{renamed}\n"));
     }
     out.push_str("\n");
@@ -4649,8 +4713,9 @@ mod tests {
         let decomp_check =
             decompose_preamble(&cons_fused_body.preamble, &cons_fused_body.mma_accumulators);
         eprintln!(
-            "Consumer preamble decomposition: setup={} prologue={} accum_init={}",
-            decomp_check.setup.len(),
+            "Consumer preamble decomposition: tile_index={} addr_setup={} prologue={} accum_init={}",
+            decomp_check.tile_index.len(),
+            decomp_check.address_setup.len(),
             decomp_check.pipeline_prologue.len(),
             decomp_check.accumulator_init.len(),
         );
@@ -4929,7 +4994,7 @@ mod tests {
 
         eprintln!("=== Raw preamble decomposition ===");
         eprintln!("  Total preamble lines: {}", desc.preamble.len());
-        eprintln!("  Setup lines: {}", decomp.setup.len());
+        eprintln!("  Setup lines: {}", decomp.tile_index.len());
         eprintln!(
             "  Pipeline prologue lines: {}",
             decomp.pipeline_prologue.len()
@@ -4941,7 +5006,7 @@ mod tests {
         eprintln!("  MMA accumulators: {}", desc.mma_accumulators.len());
 
         // Setup must be non-empty (tile index, bounds, addresses)
-        assert!(!decomp.setup.is_empty(), "setup must be non-empty");
+        assert!(!decomp.tile_index.is_empty(), "setup must be non-empty");
 
         // Pipeline prologue must be non-empty (cp.async fills)
         assert!(
@@ -4956,8 +5021,10 @@ mod tests {
         );
 
         // All sections must sum to the original preamble
-        let total =
-            decomp.setup.len() + decomp.pipeline_prologue.len() + decomp.accumulator_init.len();
+        let total = decomp.tile_index.len()
+            + decomp.address_setup.len()
+            + decomp.pipeline_prologue.len()
+            + decomp.accumulator_init.len();
         assert_eq!(
             total,
             desc.preamble.len(),
@@ -4966,7 +5033,7 @@ mod tests {
         );
 
         // Setup must NOT contain cp.async or %r_fn_smoff
-        for line in &decomp.setup {
+        for line in &decomp.tile_index {
             assert!(
                 !line.contains("cp.async"),
                 "setup must not contain cp.async: {line}"
@@ -5008,7 +5075,7 @@ mod tests {
 
         eprintln!("\n=== Fused preamble decomposition ===");
         eprintln!("  Total preamble lines: {}", fused_desc.preamble.len());
-        eprintln!("  Setup lines: {}", fused_decomp.setup.len());
+        eprintln!("  Setup lines: {}", fused_decomp.tile_index.len());
         eprintln!(
             "  Pipeline prologue lines: {}",
             fused_decomp.pipeline_prologue.len()
@@ -5021,7 +5088,7 @@ mod tests {
 
         // Same structural assertions
         assert!(
-            !fused_decomp.setup.is_empty(),
+            !fused_decomp.tile_index.is_empty(),
             "fused setup must be non-empty"
         );
         assert!(
@@ -5033,7 +5100,8 @@ mod tests {
             "fused accum init must be non-empty"
         );
 
-        let fused_total = fused_decomp.setup.len()
+        let fused_total = fused_decomp.tile_index.len()
+            + fused_decomp.address_setup.len()
             + fused_decomp.pipeline_prologue.len()
             + fused_decomp.accumulator_init.len();
         assert_eq!(
@@ -5052,7 +5120,7 @@ mod tests {
         );
 
         // Fused setup must NOT contain %r_fn_smoff
-        for line in &fused_decomp.setup {
+        for line in &fused_decomp.tile_index {
             assert!(
                 !line.contains("%r_fn_smoff"),
                 "fused setup must not contain %r_fn_smoff: {line}"

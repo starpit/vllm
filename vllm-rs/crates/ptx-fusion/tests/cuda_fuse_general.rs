@@ -3745,12 +3745,14 @@ fn register_transfer_mlp_gpu() {
 
     // Test configs: (hidden, intermediate, M values)
     // Using dims compatible with 64x64 tiles
-    // NOTE: intermediate must equal tile_n (64) for single driver iteration
-    // until consumer K-loop splitting across driver iterations is implemented.
     let configs: &[(u32, u32, &[u32])] = &[
-        (64, 64, &[64]),  // minimal single-tile: PASS
-        (64, 64, &[128]), // multi M-tile, single N-tile
+        (64, 64, &[64]),  // minimal single-tile: 1 driver iter
+        (64, 64, &[128]), // multi M-tile, single N-tile, 1 driver iter
         (128, 64, &[64]), // multi consumer N-tiles, 1 driver iter
+        // Multi-iteration configs (intermediate > 64):
+        (64, 128, &[64]),  // 2 driver iters, single tile
+        (64, 256, &[64]),  // 4 driver iters
+        (128, 128, &[64]), // multi N-tile + 2 driver iters
     ];
     let mut failures = Vec::new();
 
@@ -3833,18 +3835,22 @@ fn register_transfer_mlp_gpu() {
             );
 
             // Consumer (down) params
+            // K = tile_n (64): consumer processes one K-slice per driver iteration.
+            // B_ptr points to the full down weight; the kernel advances by K-offset
+            // each iteration internally. ldb = intermediate (full column stride).
+            let cons_k = tile_n; // K per iteration, NOT intermediate_dim
             let params_down = build_flat_params(
                 0u64, // A ptr = 0: gmem_src encodes row-major tile offset
                 dw_p as u64,
                 out_p as u64,
                 out_p as u64,
                 m,
-                hidden,        // N
-                intermediate,  // K
-                tile_n as u32, // lda = tile_n so gmem_src maps to scratch layout
-                intermediate,  // ldb
-                hidden,        // ldc
-                hidden,        // ldd
+                hidden,       // N
+                cons_k,       // K = tile_n (per-iteration K-slice)
+                cons_k,       // lda = tile_n (scratch layout)
+                intermediate, // ldb = intermediate (full weight column stride)
+                hidden,       // ldc
+                hidden,       // ldd
                 1.0,
                 0.0,
             );

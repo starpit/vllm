@@ -537,6 +537,17 @@ impl EngineCore {
                 continue;
             }
 
+            // Skip requests that finished in a previous pipeline stage.
+            // With 2-batch lookahead, a request may have been finished in the
+            // last finalize_step but its next batch is still being drained.
+            if self
+                .scheduler
+                .get_request(req_id)
+                .is_some_and(|r| r.status.is_finished())
+            {
+                continue;
+            }
+
             // Generation request: normal token-based processing.
             let new_token_ids_slice: &[u32] = model_output.get_tokens(req_id).unwrap_or_default();
 

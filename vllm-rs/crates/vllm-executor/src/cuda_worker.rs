@@ -6599,21 +6599,22 @@ impl CudaWorker {
                     .get(rid)
                     .is_none_or(|p| p.temperature < 1e-6)
             });
-            let any_needs_full = out_req_ids.iter().any(|rid| {
-                self.sampling_params_map
-                    .get(rid)
-                    .is_some_and(|p| p.logprobs.is_some() || p.seal)
-                    || {
-                        #[cfg(feature = "guided-decoding")]
-                        {
-                            self.grammar_states.contains_key(rid)
+            let any_needs_full = self.seal_pad_processor.is_active()
+                || out_req_ids.iter().any(|rid| {
+                    self.sampling_params_map
+                        .get(rid)
+                        .is_some_and(|p| p.logprobs.is_some())
+                        || {
+                            #[cfg(feature = "guided-decoding")]
+                            {
+                                self.grammar_states.contains_key(rid)
+                            }
+                            #[cfg(not(feature = "guided-decoding"))]
+                            {
+                                false
+                            }
                         }
-                        #[cfg(not(feature = "guided-decoding"))]
-                        {
-                            false
-                        }
-                    }
-            });
+                });
 
             if all_greedy_fast && !any_needs_full {
                 let block_size = self.config.block_size;

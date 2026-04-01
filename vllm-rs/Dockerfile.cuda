@@ -18,7 +18,7 @@
 # =============================================================================
 # Stage 1: Builder base — full CUDA toolkit, no GPU needed at build time
 # =============================================================================
-FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.9.1-devel-ubuntu22.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -26,9 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     ca-certificates \
-    # cublas headers + shared libs needed at link time (dynamic linking)
-    libcublas-dev \
     && rm -rf /var/lib/apt/lists/*
+# cublas headers + shared libs are already present in the -devel image
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal

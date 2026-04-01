@@ -57,6 +57,27 @@ RUN cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --b
 FROM builder AS kernel-builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+# Cargo requires all workspace member Cargo.toml files to be present.
+# Copy stub crates (Cargo.toml only, no src/) for every member except vllm-kernels-cuda.
+COPY crates/vllm-common/Cargo.toml crates/vllm-common/Cargo.toml
+COPY crates/vllm-config/Cargo.toml crates/vllm-config/Cargo.toml
+COPY crates/vllm-core/Cargo.toml crates/vllm-core/Cargo.toml
+COPY crates/vllm-engine/Cargo.toml crates/vllm-engine/Cargo.toml
+COPY crates/vllm-serve/Cargo.toml crates/vllm-serve/Cargo.toml
+COPY crates/vllm-executor/Cargo.toml crates/vllm-executor/Cargo.toml
+COPY crates/vllm-model/Cargo.toml crates/vllm-model/Cargo.toml
+COPY crates/vllm-protocol/Cargo.toml crates/vllm-protocol/Cargo.toml
+COPY crates/vllm-pyo3/Cargo.toml crates/vllm-pyo3/Cargo.toml
+COPY crates/vllm-bench/Cargo.toml crates/vllm-bench/Cargo.toml
+COPY crates/vllm-cli/Cargo.toml crates/vllm-cli/Cargo.toml
+COPY crates/vllm-mlx/Cargo.toml crates/vllm-mlx/Cargo.toml
+COPY crates/vllm-e2e/Cargo.toml crates/vllm-e2e/Cargo.toml
+COPY crates/vllm-wgpu/Cargo.toml crates/vllm-wgpu/Cargo.toml
+COPY crates/vllm-cuda/Cargo.toml crates/vllm-cuda/Cargo.toml
+COPY crates/vllm-examples/Cargo.toml crates/vllm-examples/Cargo.toml
+COPY crates/vllm-parity/Cargo.toml crates/vllm-parity/Cargo.toml
+COPY crates/vllm-gce/Cargo.toml crates/vllm-gce/Cargo.toml
+# The real crate — full source
 COPY crates/vllm-kernels-cuda/ crates/vllm-kernels-cuda/
 COPY crates/vllm-cuda/csrc/ crates/vllm-cuda/csrc/
 COPY third_party/ third_party/

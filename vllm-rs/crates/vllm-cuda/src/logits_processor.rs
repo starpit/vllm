@@ -935,8 +935,12 @@ impl SealPadProcessor {
             // Track prompt length on first observation.
             let prompt_len = *self.prompt_lens.entry(req_id.clone()).or_insert(buf.len());
 
-            // Check EOS/stop tokens.
-            let has_eos = buf.iter().any(|&tok| {
+            // Check EOS/stop tokens in OUTPUT only (not prompt).
+            // Prompt tokens often contain EOS-like tokens from the chat
+            // template (e.g. <|eot_id|>, <|im_end|>). Scanning the full
+            // buffer would trigger padding from step 1, preventing the
+            // model from ever generating a real EOS.
+            let has_eos = buf[prompt_len..].iter().any(|&tok| {
                 self.eos_token_ids.contains(&tok) || params.stop_token_ids.contains(&tok)
             });
 
@@ -1208,16 +1212,22 @@ mod tests {
 
     #[test]
     fn test_seal_pad_detects_eos() {
-        // Sealed request with EOS in buffer → seen_eos tracked, padding needed.
+        // Sealed request with EOS in output → seen_eos tracked, padding needed.
+        // Two-step flow: first call establishes prompt_len, second detects EOS.
         let mut p = SealPadProcessor::new(vec![2], 0, 4);
         let params: HashMap<String, SamplingParams> =
             [("r1".into(), sealed_params())].into_iter().collect();
-        // 3 tokens including EOS — not block-aligned (block_size=4).
-        let bufs: HashMap<String, Vec<u32>> =
-            [("r1".into(), vec![10, 20, 2])].into_iter().collect();
         let ids = vec!["r1".into()];
 
-        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        // Step 1: prompt only (establishes prompt_len = 2).
+        let bufs1: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 20])].into_iter().collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs1, &ids);
+        assert!(padding.is_empty(), "no output yet");
+
+        // Step 2: prompt + EOS output — 3 tokens, not block-aligned (block_size=4).
+        let bufs2: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 20, 2])].into_iter().collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs2, &ids);
         assert_eq!(padding, vec![0], "r1 at batch index 0 should need padding");
         assert!(p.seen_eos.contains_key("r1"));
     }
@@ -1228,12 +1238,16 @@ mod tests {
         let mut p = SealPadProcessor::new(vec![2], 0, 4);
         let params: HashMap<String, SamplingParams> =
             [("r1".into(), sealed_params())].into_iter().collect();
-        // 4 tokens = block-aligned.
-        let bufs: HashMap<String, Vec<u32>> =
-            [("r1".into(), vec![10, 20, 2, 0])].into_iter().collect();
         let ids = vec!["r1".into()];
 
-        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        // Step 1: prompt (2 tokens).
+        let bufs1: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 20])].into_iter().collect();
+        p.compute_padding_requests(None, &params, &bufs1, &ids);
+
+        // Step 2: prompt + EOS + pad = 4 tokens = block-aligned.
+        let bufs2: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 20, 2, 0])].into_iter().collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs2, &ids);
         assert!(padding.is_empty(), "block-aligned should not need padding");
         assert!(p.seen_eos.contains_key("r1"), "EOS should still be tracked");
     }
@@ -1260,12 +1274,16 @@ mod tests {
         let mut sp = sealed_params();
         sp.stop_token_ids = vec![99]; // custom stop token
         let params: HashMap<String, SamplingParams> = [("r1".into(), sp)].into_iter().collect();
-        // Buffer has stop token 99 (not EOS 2).
-        let bufs: HashMap<String, Vec<u32>> =
-            [("r1".into(), vec![10, 20, 99])].into_iter().collect();
         let ids = vec!["r1".into()];
 
-        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        // Step 1: prompt only.
+        let bufs1: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 20])].into_iter().collect();
+        p.compute_padding_requests(None, &params, &bufs1, &ids);
+
+        // Step 2: prompt + stop token 99 (not EOS 2).
+        let bufs2: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 20, 99])].into_iter().collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs2, &ids);
         assert_eq!(padding, vec![0]);
     }
 
@@ -1280,16 +1298,27 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let bufs: HashMap<String, Vec<u32>> = [
-            ("sealed_eos".into(), vec![10, 20, 2]),     // EOS, not aligned
-            ("sealed_no_eos".into(), vec![10, 20, 30]), // no EOS
-            ("normal".into(), vec![10, 20, 2]),         // EOS but not sealed
+        let ids = vec!["sealed_eos".into(), "sealed_no_eos".into(), "normal".into()];
+
+        // Step 1: all prompts (establish prompt_len for each).
+        let bufs1: HashMap<String, Vec<u32>> = [
+            ("sealed_eos".into(), vec![10, 20]),
+            ("sealed_no_eos".into(), vec![10, 20]),
+            ("normal".into(), vec![10, 20]),
         ]
         .into_iter()
         .collect();
-        let ids = vec!["sealed_eos".into(), "sealed_no_eos".into(), "normal".into()];
+        p.compute_padding_requests(None, &params, &bufs1, &ids);
 
-        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        // Step 2: sealed_eos gets EOS output, others get normal output.
+        let bufs2: HashMap<String, Vec<u32>> = [
+            ("sealed_eos".into(), vec![10, 20, 2]), // EOS output, not aligned
+            ("sealed_no_eos".into(), vec![10, 20, 30]), // no EOS output
+            ("normal".into(), vec![10, 20, 2]),     // EOS output but not sealed
+        ]
+        .into_iter()
+        .collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs2, &ids);
         // Only sealed_eos (batch index 0) needs padding.
         assert_eq!(padding, vec![0]);
     }
@@ -1301,6 +1330,12 @@ mod tests {
         let params: HashMap<String, SamplingParams> =
             [("r1".into(), sealed_params())].into_iter().collect();
         let ids = vec!["r1".into()];
+
+        // Step 0: prompt (4 tokens, block-aligned). Establishes prompt_len=4.
+        let bufs0: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 20, 30, 40])].into_iter().collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs0, &ids);
+        assert!(padding.is_empty(), "prompt only, no output");
 
         // Step 1: 5 tokens, EOS at position 4 → needs 3 pads to reach 8.
         let bufs1: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 20, 30, 40, 2])]
@@ -1337,21 +1372,25 @@ mod tests {
         let mut p = SealPadProcessor::new(vec![2], 0, 4);
         let params: HashMap<String, SamplingParams> =
             [("r1".into(), sealed_params())].into_iter().collect();
-        let bufs: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 2])].into_iter().collect();
-
-        // Step 1: r1 sees EOS.
         let ids = vec!["r1".into()];
-        p.compute_padding_requests(None, &params, &bufs, &ids);
+
+        // Step 1: prompt only.
+        let bufs1: HashMap<String, Vec<u32>> = [("r1".into(), vec![10])].into_iter().collect();
+        p.compute_padding_requests(None, &params, &bufs1, &ids);
+
+        // Step 2: r1 sees EOS in output.
+        let bufs2: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 2])].into_iter().collect();
+        p.compute_padding_requests(None, &params, &bufs2, &ids);
         assert!(p.seen_eos.contains_key("r1"));
 
-        // Step 2: r1 leaves the batch (batch_update signals change).
+        // Step 3: r1 leaves the batch (batch_update signals change).
         let update = BatchUpdate {
             batch_size: 0,
             added: vec![],
             removed: vec![0],
         };
         let empty_ids: Vec<String> = vec![];
-        p.compute_padding_requests(Some(&update), &params, &bufs, &empty_ids);
+        p.compute_padding_requests(Some(&update), &params, &bufs2, &empty_ids);
         assert!(!p.seen_eos.contains_key("r1"), "should be cleaned up");
     }
 
@@ -1363,16 +1402,54 @@ mod tests {
             [("r1".into(), sealed_params())].into_iter().collect();
         let ids = vec!["r1".into()];
 
-        // Step 1: EOS detected.
+        // Step 1: prompt only.
+        let bufs0: HashMap<String, Vec<u32>> = [("r1".into(), vec![10])].into_iter().collect();
+        p.compute_padding_requests(None, &params, &bufs0, &ids);
+
+        // Step 2: EOS detected in output.
         let bufs1: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 2])].into_iter().collect();
         p.compute_padding_requests(None, &params, &bufs1, &ids);
         assert!(p.seen_eos.contains_key("r1"));
 
-        // Step 2: No batch_update, buffer grows but no new EOS scan needed.
+        // Step 3: No batch_update, buffer grows but no new EOS scan needed.
         let bufs2: HashMap<String, Vec<u32>> =
             [("r1".into(), vec![10, 2, 0])].into_iter().collect();
         let padding = p.compute_padding_requests(None, &params, &bufs2, &ids);
         assert_eq!(padding, vec![0], "should still need padding");
         assert!(p.seen_eos.contains_key("r1"), "should persist");
+    }
+
+    #[test]
+    fn test_seal_pad_eos_in_prompt_ignored() {
+        // EOS tokens in the PROMPT should NOT trigger padding.
+        // This is the core bug fix: chat templates include EOS-like tokens
+        // (e.g. <|eot_id|>, <|im_end|>) between turns, and scanning the
+        // entire buffer would wrongly activate padding from step 1.
+        let mut p = SealPadProcessor::new(vec![2], 0, 4);
+        let params: HashMap<String, SamplingParams> =
+            [("r1".into(), sealed_params())].into_iter().collect();
+        let ids = vec!["r1".into()];
+
+        // Step 1: prompt contains EOS token (id=2) from chat template.
+        // prompt_len is established as 3.
+        let bufs1: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 2, 20])].into_iter().collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs1, &ids);
+        assert!(padding.is_empty(), "EOS in prompt must not trigger padding");
+        assert!(!p.seen_eos.contains_key("r1"), "must not mark seen_eos");
+
+        // Step 2: model generates a normal (non-EOS) token — still no padding.
+        let bufs2: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 2, 20, 50])].into_iter().collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs2, &ids);
+        assert!(padding.is_empty(), "no EOS in output");
+
+        // Step 3: model generates actual EOS — NOW padding should trigger.
+        let bufs3: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 2, 20, 50, 2])]
+            .into_iter()
+            .collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs3, &ids);
+        assert_eq!(padding, vec![0], "real EOS in output triggers padding");
+        assert!(p.seen_eos.contains_key("r1"));
     }
 }

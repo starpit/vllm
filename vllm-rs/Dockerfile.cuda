@@ -50,8 +50,7 @@ COPY --from=planner /build/recipe.json recipe.json
 COPY third_party/ third_party/
 ARG CUDA_COMPUTE_CAP=89
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
-RUN --mount=type=cache,target=/root/.cache/cudaforge,id=vllm-cuda-kernels \
-    cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --bin vllm
+RUN cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --bin vllm
 
 # =============================================================================
 # Stage 4: Binary compilation
@@ -61,9 +60,10 @@ WORKDIR /build
 
 COPY . .
 
-# Reuse pre-built deps from cooker
+# Reuse pre-built deps and compiled CUDA kernels from cooker
 COPY --from=cooker /build/target target
 COPY --from=cooker /root/.cargo /root/.cargo
+COPY --from=cooker /root/.cache/cudaforge /root/.cache/cudaforge
 
 # Target a specific GPU architecture to avoid compiling kernels for every SM.
 # Common values: 80 (A100), 86 (A10/A30), 89 (L40S/RTX 4090), 90 (H100).
@@ -71,8 +71,7 @@ COPY --from=cooker /root/.cargo /root/.cargo
 ARG CUDA_COMPUTE_CAP=89
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
-RUN --mount=type=cache,target=/root/.cache/cudaforge,id=vllm-cuda-kernels \
-    cargo build --release --features cuda,nccl -p vllm-cli
+RUN cargo build --release --features cuda,nccl -p vllm-cli
 
 # Sanity check: libcudart must NOT appear (statically linked).
 # libcublas/libcublasLt are expected dynamic deps.

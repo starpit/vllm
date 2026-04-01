@@ -517,91 +517,67 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
     // =====================================================================
     // Spans: execute_query with seal + relocatable annotations
     // =====================================================================
+    // Spans: single nested execute_query call.
+    // execute_spnl_query_sync runs inners with seal+volatile, builds the
+    // Relocatable-annotated outer prompt, runs the outer, and returns
+    // QueryOutput with per-step timing for inner and outer separately.
+    // =====================================================================
     eprintln!();
-    eprintln!("{BOLD}--- Spans (execute_query, sealed) ---{RST}");
+    eprintln!("{BOLD}--- Spans (execute_query, nested) ---{RST}");
 
-    let spans_inner_start = Instant::now();
-    // Collect raw token IDs from each inner generate (prompt + output).
-    let mut inner_all_tokens: Vec<Vec<u32>> = Vec::with_capacity(num_inner);
+    let mut seq_children: Vec<serde_json::Value> = prompts
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "g": {
+                    "model": model,
+                    "max_tokens": inner_tokens,
+                    "temperature": 0.0,
+                    "input": { "plus": [{ "user": p }] }
+                }
+            })
+        })
+        .collect();
+    seq_children.push(serde_json::json!({ "user": "Summarize all documents." }));
+    let nested_query = serde_json::json!({
+        "g": {
+            "model": model,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "input": { "seq": seq_children }
+        }
+    });
+
+    let result = llm.execute_query(
+        &nested_query.to_string(),
+        Some(outer_sampling.clone()),
+        false, // seal
+        false, // volatile
+    )?;
+
+    let mut spans_inner_ms = 0.0f64;
     let mut expected_cached_tokens: usize = 0;
-    for (i, prompt) in prompts.iter().enumerate() {
-        let query = serde_json::json!({
-            "g": {
-                "model": model,
-                "max_tokens": inner_tokens,
-                "temperature": 0.0,
-                "input": { "plus": [{ "user": *prompt }] }
-            }
-        });
-
-        let start = Instant::now();
-        let results = llm.execute_query(
-            &query.to_string(),
-            Some(inner_sampling.clone()),
-            true, // seal
-            true, // volatile
-        )?;
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        let prompt_toks = results[0].prompt_token_ids.len();
-        let output_toks = results[0].outputs[0].token_ids.len();
-        let total_inner = prompt_toks + output_toks;
-        let sealed_toks = total_inner / block_size * block_size;
-        expected_cached_tokens += sealed_toks;
+    for step in result.inner_steps() {
+        let prompt_toks = step.output.prompt_token_ids.len();
+        let output_toks = step.output.outputs.first().map_or(0, |o| o.token_ids.len());
+        let total = prompt_toks + output_toks;
+        let sealed = total / block_size * block_size;
+        expected_cached_tokens += sealed;
+        spans_inner_ms += step.elapsed_ms;
         eprintln!(
-            "    inner[{i}]  {BOLD}{ms:>8.1}ms{RST}  {DIM}{prompt_toks} prompt + {output_toks} output = {total_inner} ({sealed_toks} sealed){RST}",
+            "    {}  {BOLD}{:>8.1}ms{RST}  {DIM}{prompt_toks} prompt + {output_toks} output = {total} ({sealed} sealed){RST}",
+            step.label, step.elapsed_ms,
         );
-        // Collect the full token sequence: prompt + output (includes EOS + pads).
-        let mut all_toks = results[0].prompt_token_ids.clone();
-        all_toks.extend_from_slice(&results[0].outputs[0].token_ids);
-        inner_all_tokens.push(all_toks);
     }
-    let spans_inner_ms = spans_inner_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!("    expected cached in outer: {BOLD}{expected_cached_tokens}{RST} tokens");
 
-    // Build outer prompt from raw inner token IDs (no text re-tokenization).
-    // Layout: [Relocatable inner_0] [Relocatable inner_1] ... [Prefixed query]
-    // Each inner section is padded to block boundary. The query section is
-    // tokenized normally via the chat template.
-    let mut outer_tokens: Vec<u32> = Vec::new();
-    let mut annotations = std::collections::BTreeMap::new();
-
-    for inner_toks in &inner_all_tokens {
-        // Relocatable boundary at the start of each inner section.
-        let block_idx = outer_tokens.len() / block_size;
-        annotations.insert(block_idx, vllm_common::BlockKind::Relocatable);
-        outer_tokens.extend_from_slice(inner_toks);
-        // Pad to block boundary (inner should already be block-aligned from
-        // SealPadProcessor, but handle the case where it isn't).
-        let remainder = outer_tokens.len() % block_size;
-        if remainder != 0 {
-            let pad_count = block_size - remainder;
-            outer_tokens.extend(std::iter::repeat_n(0u32, pad_count));
-        }
-    }
-
-    // Prefixed boundary for the outer query section.
-    let query_block_idx = outer_tokens.len() / block_size;
-    annotations.insert(query_block_idx, vllm_common::BlockKind::Prefixed);
-
-    // Tokenize the outer query section. This doesn't need cache hits — it's
-    // the unique query part. Just encode through the tokenizer.
-    let tokenizer = llm
-        .tokenizer()
-        .ok_or_else(|| anyhow::anyhow!("nested bench requires a tokenizer"))?;
-    let query_ids = tokenizer.encode("Summarize all documents.", false)?;
-    outer_tokens.extend_from_slice(&query_ids);
-
-    let outer_prompt = Prompt::TokenIdsWithAnnotations(outer_tokens.clone(), annotations);
+    let outer_step = result.outer_step();
+    let outer_prompt_toks = outer_step.output.prompt_token_ids.len();
+    let spans_outer_ms = outer_step.elapsed_ms;
     eprintln!(
-        "    outer prompt: {DIM}{} tokens, {} blocks{RST}",
-        outer_tokens.len(),
-        outer_tokens.len().div_ceil(block_size),
+        "    outer     {BOLD}{spans_outer_ms:>8.1}ms{RST}  {DIM}outer prompt: {outer_prompt_toks} tokens, {} blocks — span cache hit{RST}",
+        outer_prompt_toks.div_ceil(block_size),
     );
-
-    let start = Instant::now();
-    llm.generate(&[outer_prompt], Some(outer_sampling.clone()))?;
-    let spans_outer_ms = start.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("    outer     {BOLD}{spans_outer_ms:>8.1}ms{RST}  {DIM}span cache hit{RST}");
 
     drop(llm);
 
@@ -609,7 +585,7 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
     // Summary
     // =====================================================================
     let baseline_total = baseline_inner_ms + baseline_outer_ms;
-    let spans_total = spans_inner_ms + spans_outer_ms;
+    let spans_total_ms = spans_inner_ms + spans_outer_ms;
 
     eprintln!();
     println!("{BOLD}=== Nested Spans Results ==={RST}");
@@ -618,7 +594,7 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
         "  Baseline:  inner {BOLD}{baseline_inner_ms:>8.1}ms{RST}  outer {BOLD}{baseline_outer_ms:>8.1}ms{RST}  total {BOLD}{baseline_total:>8.1}ms{RST}"
     );
     println!(
-        "  Spans:     inner {BOLD}{spans_inner_ms:>8.1}ms{RST}  outer {BOLD}{spans_outer_ms:>8.1}ms{RST}  total {BOLD}{spans_total:>8.1}ms{RST}"
+        "  Spans:     inner {BOLD}{spans_inner_ms:>8.1}ms{RST}  outer {BOLD}{spans_outer_ms:>8.1}ms{RST}  total {BOLD}{spans_total_ms:>8.1}ms{RST}"
     );
     println!();
     println!(
@@ -627,7 +603,7 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
     );
     println!(
         "  Total speedup: {BOLD}{:.1}x{RST}",
-        baseline_total / spans_total
+        baseline_total / spans_total_ms
     );
     println!();
 

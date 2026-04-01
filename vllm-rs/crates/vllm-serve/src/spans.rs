@@ -21,7 +21,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info};
 
-use spnl_core::ir::Message;
+use spnl_core::ir::{Generate, Message, Query as SpnlQuery};
 use spnl_core::optimizer::llo::llir::{
     Bulk, NonGenerateInput, Repeat, SingleGenerate, SingleGenerateQuery,
 };
@@ -527,6 +527,13 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
 
     let cfg = SpanConfig::from_tokenizer(block_size, tokenizer);
 
+    // Try to parse as a full SpnlQuery first (supports nested generates).
+    // Fall back to SingleGenerateQuery for backward compatibility.
+    if let Ok(query) = serde_json::from_str::<SpnlQuery>(body) {
+        return dispatch_spnl_query(state, &query, stream, tokenizer, template, &cfg, block_size)
+            .await;
+    }
+
     let query: SingleGenerateQuery = serde_json::from_str(body)
         .map_err(|e| ServeError::Validation(format!("Invalid span query: {e}")))?;
 
@@ -543,6 +550,130 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
     }
 }
 
+/// Dispatch a full `SpnlQuery` to the appropriate execution path.
+async fn dispatch_spnl_query(
+    state: &AppState,
+    query: &SpnlQuery,
+    stream: bool,
+    tokenizer: &Arc<Tokenizer>,
+    template: &crate::chat_template::ChatTemplate,
+    cfg: &SpanConfig,
+    block_size: usize,
+) -> ServeResult<Response> {
+    match query {
+        // Nested generate: outer Generate whose input contains inner Generate nodes.
+        SpnlQuery::Generate(g) if has_nested_generates(&g.input) => {
+            execute_nested_generate(state, g, stream, tokenizer, template, cfg, block_size).await
+        }
+
+        // Flat generate: no nested generates — convert to SingleGenerate and use existing path.
+        SpnlQuery::Generate(g) => {
+            let spec = outer_generate_to_single(g);
+            execute_single(state, &spec, 1, stream, tokenizer, template, cfg).await
+        }
+
+        // Seq: execute each generate in sequence, collect all results.
+        SpnlQuery::Seq(children) => {
+            execute_seq_query(
+                state, children, stream, tokenizer, template, cfg, block_size,
+            )
+            .await
+        }
+
+        // Bulk variants at the top level.
+        SpnlQuery::Bulk(spnl_core::ir::Bulk::Repeat(r)) => {
+            let spec = outer_generate_to_single(&r.generate);
+            execute_single(state, &spec, r.n, stream, tokenizer, template, cfg).await
+        }
+        SpnlQuery::Bulk(spnl_core::ir::Bulk::Map(map)) => {
+            execute_map(state, map, stream, tokenizer, template, cfg).await
+        }
+
+        other => Err(ServeError::Validation(format!(
+            "Unsupported top-level query variant: {}",
+            query_variant_name(other)
+        ))),
+    }
+}
+
+/// Execute a `Seq` of queries, collecting all generate results.
+async fn execute_seq_query(
+    state: &AppState,
+    children: &[SpnlQuery],
+    stream: bool,
+    tokenizer: &Arc<Tokenizer>,
+    template: &crate::chat_template::ChatTemplate,
+    cfg: &SpanConfig,
+    block_size: usize,
+) -> ServeResult<Response> {
+    let mut steps: Vec<QueryStep> = Vec::new();
+    for (i, child) in children.iter().enumerate() {
+        match child {
+            SpnlQuery::Generate(g) if has_nested_generates(&g.input) => {
+                // Nested generate inside a Seq: execute it fully.
+                // We can't stream intermediate results, so always use non-streaming here.
+                let resp =
+                    execute_nested_generate(state, g, false, tokenizer, template, cfg, block_size)
+                        .await?;
+                // Extract nested steps from the response body.
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .map_err(|e| ServeError::Internal(format!("body read: {e}")))?;
+                let nested: NestedQueryResponse = serde_json::from_slice(&body)
+                    .map_err(|e| ServeError::Internal(format!("nested parse: {e}")))?;
+                steps.extend(nested.steps);
+            }
+            SpnlQuery::Generate(g) => {
+                let spec = outer_generate_to_single(g);
+                let resp = execute_single(state, &spec, 1, false, tokenizer, template, cfg).await?;
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .map_err(|e| ServeError::Internal(format!("body read: {e}")))?;
+                let completion: protocol::CompletionResponse = serde_json::from_slice(&body)
+                    .map_err(|e| ServeError::Internal(format!("completion parse: {e}")))?;
+                steps.push(QueryStep {
+                    label: format!("step[{i}]"),
+                    response: completion,
+                });
+            }
+            _ => {
+                return Err(ServeError::Validation(format!(
+                    "Seq child at index {i} is not a Generate — only Generate nodes are \
+                     supported inside a top-level Seq query"
+                )));
+            }
+        }
+    }
+
+    if stream {
+        // Return steps as a single SSE event (streaming not meaningful for Seq).
+        let json = serde_json::to_string(&NestedQueryResponse { steps })
+            .map_err(|e| ServeError::Internal(format!("serialize: {e}")))?;
+        let event_stream = tokio_stream::once(Ok::<Event, Infallible>(Event::default().data(json)));
+        let done_stream = tokio_stream::once(Ok(Event::default().data("[DONE]")));
+        Ok(Sse::new(event_stream.chain(done_stream))
+            .keep_alive(KeepAlive::default())
+            .into_response())
+    } else {
+        Ok(Json(NestedQueryResponse { steps }).into_response())
+    }
+}
+
+/// Return a short name for a query variant (for error messages).
+fn query_variant_name(query: &SpnlQuery) -> &'static str {
+    match query {
+        SpnlQuery::Generate(_) => "Generate",
+        SpnlQuery::Seq(_) => "Seq",
+        SpnlQuery::Par(_) => "Par",
+        SpnlQuery::Cross(_) => "Cross",
+        SpnlQuery::Plus(_) => "Plus",
+        SpnlQuery::Monad(_) => "Monad",
+        SpnlQuery::Bulk(_) => "Bulk",
+        SpnlQuery::Message(_) => "Message",
+        SpnlQuery::Zip(_) => "Zip",
+    }
+}
+
 /// Execute a single (possibly n>1) generation from a tokenized span query.
 async fn execute_single(
     state: &AppState,
@@ -550,7 +681,7 @@ async fn execute_single(
     n: u8,
     stream: bool,
     tokenizer: &Arc<Tokenizer>,
-    template: &Arc<crate::chat_template::ChatTemplate>,
+    template: &crate::chat_template::ChatTemplate,
     cfg: &SpanConfig,
 ) -> ServeResult<Response> {
     let span_tok = tokenize_span_query(spec, tokenizer, template, cfg)?;
@@ -720,13 +851,573 @@ mod tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Nested query execution
+// ---------------------------------------------------------------------------
+
+/// One generate step in a nested query result.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct QueryStep {
+    /// Human-readable label, e.g. "inner[0]", "outer".
+    pub label: String,
+    /// The completion response for this step.
+    #[serde(flatten)]
+    pub response: protocol::CompletionResponse,
+}
+
+/// Response from `/v1/query/execute` for a nested (multi-generate) query.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NestedQueryResponse {
+    pub steps: Vec<QueryStep>,
+}
+
+/// Returns true if the query contains any nested `Generate` nodes.
+fn has_nested_generates(query: &SpnlQuery) -> bool {
+    match query {
+        SpnlQuery::Generate(_) => true,
+        SpnlQuery::Seq(v) | SpnlQuery::Par(v) | SpnlQuery::Cross(v) | SpnlQuery::Plus(v) => {
+            v.iter().any(has_nested_generates)
+        }
+        SpnlQuery::Monad(inner) => has_nested_generates(inner),
+        _ => false,
+    }
+}
+
+/// Collect all `Generate` nodes from a query tree in DFS order.
+fn collect_generates<'a>(query: &'a SpnlQuery, out: &mut Vec<&'a Generate>) {
+    match query {
+        SpnlQuery::Generate(g) => out.push(g),
+        SpnlQuery::Seq(v) | SpnlQuery::Par(v) | SpnlQuery::Cross(v) | SpnlQuery::Plus(v) => {
+            for child in v {
+                collect_generates(child, out);
+            }
+        }
+        SpnlQuery::Monad(inner) => collect_generates(inner, out),
+        _ => {}
+    }
+}
+
+/// Strip `Generate` nodes from a `SpnlQuery` tree, replacing each with an
+/// empty `Seq`. Used to extract the non-generate message content of an outer
+/// generate's input for tokenization.
+fn strip_generates(query: &SpnlQuery) -> NonGenerateInput {
+    match query {
+        SpnlQuery::Generate(_) => NonGenerateInput::Seq(vec![]),
+        SpnlQuery::Message(msg) => NonGenerateInput::Message(msg.clone()),
+        SpnlQuery::Seq(v) => NonGenerateInput::Seq(v.iter().map(strip_generates).collect()),
+        SpnlQuery::Par(v) => NonGenerateInput::Par(v.iter().map(strip_generates).collect()),
+        SpnlQuery::Plus(v) => NonGenerateInput::Plus(v.iter().map(strip_generates).collect()),
+        SpnlQuery::Cross(v) => NonGenerateInput::Cross(v.iter().map(strip_generates).collect()),
+        SpnlQuery::Monad(inner) => strip_generates(inner),
+        _ => NonGenerateInput::Seq(vec![]),
+    }
+}
+
+/// Returns true if a `NonGenerateInput` tree has any leaf `Message` nodes.
+fn non_generate_input_has_messages(input: &NonGenerateInput) -> bool {
+    match input {
+        NonGenerateInput::Message(_) => true,
+        NonGenerateInput::Seq(v)
+        | NonGenerateInput::Par(v)
+        | NonGenerateInput::Plus(v)
+        | NonGenerateInput::Cross(v) => v.iter().any(non_generate_input_has_messages),
+    }
+}
+
+/// Convert a `SpnlQuery::Generate` (whose `input: Box<SpnlQuery>` may contain
+/// nested `Generate` nodes) into a `SingleGenerate` by stripping inner
+/// generates from the input tree.  The resulting `SingleGenerate` covers only
+/// the non-generate message content of the outer input.
+fn outer_generate_to_single(g: &Generate) -> SingleGenerate {
+    SingleGenerate {
+        metadata: g.metadata.clone(),
+        input: strip_generates(&g.input),
+    }
+}
+
+/// Synchronous nested query execution — used by `LLM::execute_query`.
+///
+/// Parses `spnl_json` as a full `SpnlQuery` and executes it, supporting nested
+/// generates.  The `generate` closure wraps the caller's synchronous generate
+/// path (e.g. `LLM::generate_impl`); it receives `(prompts, sampling_params,
+/// seal, volatile)` and returns `Vec<RequestOutput>`.
+///
+/// Returns the outputs of the final (outermost) generate step.
+/// Wrap a timed `generate` call into a single-step `QueryOutput`.
+fn timed_generate(
+    label: &str,
+    prompts: &[crate::llm::Prompt],
+    sp: Option<vllm_common::SamplingParams>,
+    seal: bool,
+    volatile: bool,
+    generate: &mut impl FnMut(
+        &[crate::llm::Prompt],
+        Option<vllm_common::SamplingParams>,
+        bool,
+        bool,
+    ) -> anyhow::Result<Vec<crate::llm::RequestOutput>>,
+) -> anyhow::Result<crate::llm::QueryOutput> {
+    let t0 = std::time::Instant::now();
+    let outputs = generate(prompts, sp, seal, volatile)?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let steps = outputs
+        .into_iter()
+        .enumerate()
+        .map(|(i, output)| {
+            let lbl = if i == 0 {
+                label.to_string()
+            } else {
+                format!("{label}[{i}]")
+            };
+            crate::llm::GenerateStep { label: lbl, output, elapsed_ms }
+        })
+        .collect();
+    Ok(crate::llm::QueryOutput { steps })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_spnl_query_sync(
+    spnl_json: &str,
+    params: Option<vllm_common::SamplingParams>,
+    seal: bool,
+    volatile: bool,
+    tokenizer: &Arc<Tokenizer>,
+    template: &crate::chat_template::ChatTemplate,
+    cfg: &SpanConfig,
+    block_size: usize,
+    mut generate: impl FnMut(
+        &[crate::llm::Prompt],
+        Option<vllm_common::SamplingParams>,
+        bool,
+        bool,
+    ) -> anyhow::Result<Vec<crate::llm::RequestOutput>>,
+) -> anyhow::Result<crate::llm::QueryOutput> {
+    use spnl_core::optimizer::llo::llir::{Bulk, Repeat, SingleGenerateQuery};
+
+    // Try full SpnlQuery first (supports nested generates).
+    if let Ok(query) = serde_json::from_str::<SpnlQuery>(spnl_json) {
+        return dispatch_spnl_query_sync(
+            &query,
+            params,
+            seal,
+            volatile,
+            tokenizer,
+            template,
+            cfg,
+            block_size,
+            &mut generate,
+        );
+    }
+
+    // Fallback: parse as SingleGenerateQuery for backward compatibility.
+    let query: SingleGenerateQuery =
+        serde_json::from_str(spnl_json).map_err(|e| anyhow::anyhow!("invalid SPNL query: {e}"))?;
+
+    match query {
+        SingleGenerateQuery::SingleGenerate(spec) => {
+            let span_tok = tokenize_span_query(&spec, tokenizer, template, cfg)
+                .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+            let mut sp = merge_spnl_params_sync(&spec.metadata, params);
+            resolve_max_tokens_sync(&mut sp, span_tok.tokens.len(), block_size);
+            let prompt = span_tok_to_prompt(span_tok);
+            timed_generate("outer", &[prompt], Some(sp), seal, volatile, &mut generate)
+        }
+        SingleGenerateQuery::Bulk(Bulk::Repeat(Repeat { n, generate: spec })) => {
+            let span_tok = tokenize_span_query(&spec, tokenizer, template, cfg)
+                .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+            let mut sp = merge_spnl_params_sync(&spec.metadata, params);
+            sp.n = n as u32;
+            resolve_max_tokens_sync(&mut sp, span_tok.tokens.len(), block_size);
+            let prompt = span_tok_to_prompt(span_tok);
+            timed_generate("outer", &[prompt], Some(sp), seal, volatile, &mut generate)
+        }
+        SingleGenerateQuery::Bulk(Bulk::Map(map)) => {
+            let mut prompts = Vec::with_capacity(map.inputs.len());
+            for input_text in &map.inputs {
+                let span_tok = tokenize_map_input(input_text, tokenizer, template, cfg)
+                    .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+                prompts.push(span_tok_to_prompt(span_tok));
+            }
+            let mut sp = merge_spnl_params_sync(&map.metadata, params);
+            if let Some(first) = prompts.first() {
+                let len = match first {
+                    crate::llm::Prompt::TokenIds(ids) => ids.len(),
+                    crate::llm::Prompt::TokenIdsWithAnnotations(ids, _) => ids.len(),
+                    crate::llm::Prompt::Text(_) => 0,
+                };
+                resolve_max_tokens_sync(&mut sp, len, block_size);
+            }
+            timed_generate("outer", &prompts, Some(sp), seal, volatile, &mut generate)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_spnl_query_sync(
+    query: &SpnlQuery,
+    params: Option<vllm_common::SamplingParams>,
+    seal: bool,
+    volatile: bool,
+    tokenizer: &Arc<Tokenizer>,
+    template: &crate::chat_template::ChatTemplate,
+    cfg: &SpanConfig,
+    block_size: usize,
+    generate: &mut impl FnMut(
+        &[crate::llm::Prompt],
+        Option<vllm_common::SamplingParams>,
+        bool,
+        bool,
+    ) -> anyhow::Result<Vec<crate::llm::RequestOutput>>,
+) -> anyhow::Result<crate::llm::QueryOutput> {
+    match query {
+        SpnlQuery::Generate(g) if has_nested_generates(&g.input) => execute_nested_generate_sync(
+            g, params, seal, volatile, tokenizer, template, cfg, block_size, generate,
+        ),
+        SpnlQuery::Generate(g) => {
+            let spec = outer_generate_to_single(g);
+            let span_tok = tokenize_span_query(&spec, tokenizer, template, cfg)
+                .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+            let mut sp = merge_spnl_params_sync(&spec.metadata, params);
+            resolve_max_tokens_sync(&mut sp, span_tok.tokens.len(), block_size);
+            let prompt = span_tok_to_prompt(span_tok);
+            timed_generate("outer", &[prompt], Some(sp), seal, volatile, generate)
+        }
+        SpnlQuery::Seq(children) => {
+            let mut last = crate::llm::QueryOutput { steps: Vec::new() };
+            for child in children {
+                last = dispatch_spnl_query_sync(
+                    child, None, seal, volatile, tokenizer, template, cfg, block_size, generate,
+                )?;
+            }
+            Ok(last)
+        }
+        SpnlQuery::Bulk(spnl_core::ir::Bulk::Repeat(r)) => {
+            let spec = outer_generate_to_single(&r.generate);
+            let span_tok = tokenize_span_query(&spec, tokenizer, template, cfg)
+                .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+            let mut sp = merge_spnl_params_sync(&spec.metadata, params);
+            sp.n = r.n as u32;
+            resolve_max_tokens_sync(&mut sp, span_tok.tokens.len(), block_size);
+            let prompt = span_tok_to_prompt(span_tok);
+            timed_generate("outer", &[prompt], Some(sp), seal, volatile, generate)
+        }
+        SpnlQuery::Bulk(spnl_core::ir::Bulk::Map(map)) => {
+            let mut prompts = Vec::with_capacity(map.inputs.len());
+            for input_text in &map.inputs {
+                let span_tok = tokenize_map_input(input_text, tokenizer, template, cfg)
+                    .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+                prompts.push(span_tok_to_prompt(span_tok));
+            }
+            let mut sp = merge_spnl_params_sync(&map.metadata, params);
+            if let Some(first) = prompts.first() {
+                let len = match first {
+                    crate::llm::Prompt::TokenIds(ids) => ids.len(),
+                    crate::llm::Prompt::TokenIdsWithAnnotations(ids, _) => ids.len(),
+                    crate::llm::Prompt::Text(_) => 0,
+                };
+                resolve_max_tokens_sync(&mut sp, len, block_size);
+            }
+            timed_generate("outer", &prompts, Some(sp), seal, volatile, generate)
+        }
+        other => Err(anyhow::anyhow!(
+            "unsupported top-level query variant: {}",
+            query_variant_name(other)
+        )),
+    }
+}
+
+/// Sync nested generate: execute inner generates, build outer prompt, execute outer.
+/// Uses raw token IDs from `RequestOutput` directly — no text round-tripping needed.
+#[allow(clippy::too_many_arguments)]
+fn execute_nested_generate_sync(
+    outer_g: &Generate,
+    params: Option<vllm_common::SamplingParams>,
+    seal: bool,
+    volatile: bool,
+    tokenizer: &Arc<Tokenizer>,
+    template: &crate::chat_template::ChatTemplate,
+    cfg: &SpanConfig,
+    block_size: usize,
+    generate: &mut impl FnMut(
+        &[crate::llm::Prompt],
+        Option<vllm_common::SamplingParams>,
+        bool,
+        bool,
+    ) -> anyhow::Result<Vec<crate::llm::RequestOutput>>,
+) -> anyhow::Result<crate::llm::QueryOutput> {
+    let mut inner_gens: Vec<&Generate> = Vec::new();
+    collect_generates(&outer_g.input, &mut inner_gens);
+
+    let mut outer_tokens: Vec<u32> = Vec::new();
+    let mut outer_annotations: BTreeMap<usize, BlockKind> = BTreeMap::new();
+    let mut steps: Vec<crate::llm::GenerateStep> = Vec::new();
+
+    // Execute each inner generate with seal=true, volatile=true.
+    for (i, inner_g) in inner_gens.iter().enumerate() {
+        let inner_input = strip_generates(&inner_g.input);
+        let inner_spec = SingleGenerate {
+            metadata: inner_g.metadata.clone(),
+            input: inner_input,
+        };
+        let inner_tok = tokenize_span_query(&inner_spec, tokenizer, template, cfg)
+            .map_err(|e| anyhow::anyhow!("inner span tokenization failed: {e}"))?;
+        let inner_prompt_tokens = inner_tok.tokens.clone();
+
+        let mut sp = merge_spnl_params_sync(&inner_g.metadata, None);
+        resolve_max_tokens_sync(&mut sp, inner_tok.tokens.len(), block_size);
+        let prompt = span_tok_to_prompt(inner_tok);
+
+        let t0 = std::time::Instant::now();
+        let results = generate(&[prompt], Some(sp), true, true)?;
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // Build inner block: prompt_token_ids + output_token_ids (includes EOS + pads).
+        let block_idx = outer_tokens.len() / block_size;
+        outer_annotations.insert(block_idx, BlockKind::Relocatable);
+        outer_tokens.extend_from_slice(&inner_prompt_tokens);
+        if let Some(result) = results.first() {
+            if let Some(output) = result.outputs.first() {
+                outer_tokens.extend_from_slice(&output.token_ids);
+            }
+            steps.push(crate::llm::GenerateStep {
+                label: format!("inner[{i}]"),
+                output: result.clone(),
+                elapsed_ms,
+            });
+        }
+    }
+
+    // Tokenize non-generate messages from outer input as Prefixed.
+    let outer_spec = outer_generate_to_single(outer_g);
+    if non_generate_input_has_messages(&outer_spec.input) {
+        let msg_start_block = outer_tokens.len() / block_size;
+        outer_annotations.insert(msg_start_block, BlockKind::Prefixed);
+        let msg_tok = tokenize_span_query(&outer_spec, tokenizer, template, cfg)
+            .map_err(|e| anyhow::anyhow!("outer span tokenization failed: {e}"))?;
+        if let Some(ann) = msg_tok.annotations {
+            for (k, v) in ann {
+                outer_annotations.insert(msg_start_block + k, v);
+            }
+        }
+        outer_tokens.extend_from_slice(&msg_tok.tokens);
+    }
+
+    let mut sp = merge_spnl_params_sync(&outer_g.metadata, params);
+    resolve_max_tokens_sync(&mut sp, outer_tokens.len(), block_size);
+    let outer_prompt = crate::llm::Prompt::TokenIdsWithAnnotations(outer_tokens, outer_annotations);
+
+    let t0 = std::time::Instant::now();
+    let results = generate(&[outer_prompt], Some(sp), seal, volatile)?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if let Some(result) = results.into_iter().next() {
+        steps.push(crate::llm::GenerateStep {
+            label: "outer".to_string(),
+            output: result,
+            elapsed_ms,
+        });
+    }
+    Ok(crate::llm::QueryOutput { steps })
+}
+
+/// Merge SPNL metadata with optional caller params (caller takes precedence).
+///
+/// When `caller` is `None` the metadata values are used directly, bypassing
+/// `SamplingParams::default()` so that defaults like `max_tokens: Some(16)`
+/// don't silently override metadata-specified values.
+fn merge_spnl_params_sync(
+    metadata: &spnl_core::ir::GenerateMetadata,
+    caller: Option<vllm_common::SamplingParams>,
+) -> vllm_common::SamplingParams {
+    match caller {
+        Some(mut sp) => {
+            // Caller params take precedence; fill in only what caller left unset.
+            if sp.max_tokens.is_none() {
+                sp.max_tokens = metadata.max_tokens.filter(|&t| t > 0).map(|t| t as u32);
+            }
+            if sp.temperature == 0.0
+                && let Some(t) = metadata.temperature
+            {
+                sp.temperature = t as f64;
+            }
+            sp
+        }
+        None => {
+            // No caller — build from metadata, then apply defaults for the rest.
+            vllm_common::SamplingParams {
+                max_tokens: metadata.max_tokens.filter(|&t| t > 0).map(|t| t as u32),
+                temperature: metadata.temperature.map(|t| t as f64).unwrap_or(0.0),
+                ..vllm_common::SamplingParams::default()
+            }
+        }
+    }
+}
+
+/// Resolve max_tokens against model context length (no-op placeholder; mirrors LLM::resolve_max_tokens).
+fn resolve_max_tokens_sync(
+    sp: &mut vllm_common::SamplingParams,
+    _prompt_len: usize,
+    _block_size: usize,
+) {
+    if sp.max_tokens.is_none() {
+        sp.max_tokens = Some(2048);
+    }
+}
+
+/// Convert `SpanTokenized` to a `Prompt`.
+fn span_tok_to_prompt(span_tok: SpanTokenized) -> crate::llm::Prompt {
+    match span_tok.annotations {
+        Some(ann) if !ann.is_empty() => {
+            crate::llm::Prompt::TokenIdsWithAnnotations(span_tok.tokens, ann)
+        }
+        _ => crate::llm::Prompt::TokenIds(span_tok.tokens),
+    }
+}
+
+/// Execute a `SpnlQuery::Generate` that contains nested inner generates.
+///
+/// Algorithm (mirrors `bench spans --nested`):
+/// 1. Collect all inner `Generate` nodes from `outer_g.input` (DFS order).
+/// 2. Execute each inner generate with seal=true, volatile=true.
+/// 3. Build the outer prompt:
+///    - For each inner: [inner_prompt_tokens] + [re-tokenized output] + [EOS if stop]
+///      as a Relocatable block.
+///    - If the outer input has non-generate messages: tokenize them as Prefixed.
+/// 4. Execute the outer generate.
+/// 5. Return a `NestedQueryResponse` with all steps.
+async fn execute_nested_generate(
+    state: &AppState,
+    outer_g: &Generate,
+    stream: bool,
+    tokenizer: &Arc<Tokenizer>,
+    template: &crate::chat_template::ChatTemplate,
+    cfg: &SpanConfig,
+    block_size: usize,
+) -> ServeResult<Response> {
+    // 1. Collect inner generates.
+    let mut inner_gens: Vec<&Generate> = Vec::new();
+    collect_generates(&outer_g.input, &mut inner_gens);
+
+    let mut steps: Vec<QueryStep> = Vec::new();
+    let mut outer_tokens: Vec<u32> = Vec::new();
+    let mut outer_annotations: BTreeMap<usize, BlockKind> = BTreeMap::new();
+
+    let eos_token_id = tokenizer.eos_token_id();
+
+    // 2. Execute each inner generate.
+    for (i, inner_g) in inner_gens.iter().enumerate() {
+        // Convert inner Generate's input (Box<SpnlQuery>) to NonGenerateInput.
+        // Inner generates must not themselves contain nested generates.
+        let inner_input = strip_generates(&inner_g.input);
+        let inner_spec = SingleGenerate {
+            metadata: inner_g.metadata.clone(),
+            input: inner_input,
+        };
+
+        // Tokenize the inner generate's prompt (includes generation prompt prefix).
+        let inner_tok = tokenize_span_query(&inner_spec, tokenizer, template, cfg)?;
+        let inner_prompt_tokens = inner_tok.tokens.clone();
+
+        let max_tokens = inner_g
+            .metadata
+            .max_tokens
+            .filter(|&t| t > 0)
+            .map(|t| t as u32)
+            .unwrap_or(2048);
+        let temperature = inner_g.metadata.temperature.unwrap_or(0.0);
+
+        // Execute inner generate: seal=true so output is block-aligned in KV cache.
+        let mut request = build_completion_request(
+            &inner_g.metadata.model,
+            protocol::CompletionPrompt::TokenIds(inner_tok.tokens),
+            inner_tok.annotations,
+            1,
+            max_tokens,
+            temperature,
+            false, // never stream inner generates
+        );
+        request.seal = true;
+        request.volatile = true;
+        // skip_special_tokens=true (default) so choices[0].text has no EOS/pads.
+
+        let inner_response = state.engine.completion(request).await?;
+
+        // 3a. Reconstruct inner token sequence for the outer prompt.
+        //     inner_prompt_tokens + re_tokenize(output_text) + [EOS if stop]
+        //     Seal guarantees this is block-aligned.
+        let block_idx = outer_tokens.len() / block_size;
+        outer_annotations.insert(block_idx, BlockKind::Relocatable);
+        outer_tokens.extend_from_slice(&inner_prompt_tokens);
+
+        if let Some(choice) = inner_response.choices.first() {
+            // Re-tokenize the decoded output (round-trips correctly for BPE).
+            let content_ids = tokenizer.encode(&choice.text, false)?;
+            outer_tokens.extend_from_slice(&content_ids);
+
+            // Append EOS if generation stopped naturally (not max_tokens).
+            if choice.finish_reason.as_deref() == Some("stop")
+                && let Some(eos) = eos_token_id
+            {
+                outer_tokens.push(eos);
+            }
+        }
+
+        steps.push(QueryStep {
+            label: format!("inner[{i}]"),
+            response: inner_response,
+        });
+    }
+
+    // 3b. Tokenize non-generate messages from the outer input (Prefixed).
+    let outer_input_stripped = outer_generate_to_single(outer_g);
+    if non_generate_input_has_messages(&outer_input_stripped.input) {
+        let msg_start_block = outer_tokens.len() / block_size;
+        outer_annotations.insert(msg_start_block, BlockKind::Prefixed);
+
+        let msg_tok = tokenize_span_query(&outer_input_stripped, tokenizer, template, cfg)?;
+        outer_tokens.extend_from_slice(&msg_tok.tokens);
+        // Merge any annotations from msg_tok (offset by msg_start_block).
+        if let Some(ann) = msg_tok.annotations {
+            for (k, v) in ann {
+                outer_annotations.insert(msg_start_block + k, v);
+            }
+        }
+    }
+
+    // 4. Execute the outer generate.
+    let outer_max_tokens = outer_g
+        .metadata
+        .max_tokens
+        .filter(|&t| t > 0)
+        .map(|t| t as u32)
+        .unwrap_or(2048);
+    let outer_temperature = outer_g.metadata.temperature.unwrap_or(0.0);
+
+    let outer_request = build_completion_request(
+        &outer_g.metadata.model,
+        protocol::CompletionPrompt::TokenIds(outer_tokens),
+        Some(outer_annotations),
+        1,
+        outer_max_tokens,
+        outer_temperature,
+        stream,
+    );
+
+    // Nested queries always return a NestedQueryResponse (no streaming support for inner steps).
+    let outer_response = state.engine.completion(outer_request).await?;
+    steps.push(QueryStep {
+        label: "outer".to_string(),
+        response: outer_response,
+    });
+    Ok(Json(NestedQueryResponse { steps }).into_response())
+}
+
 /// Execute a map (bulk) completion: one output per input string.
 async fn execute_map(
     state: &AppState,
     map: &spnl_core::ir::Map,
     stream: bool,
     tokenizer: &Arc<Tokenizer>,
-    template: &Arc<crate::chat_template::ChatTemplate>,
+    template: &crate::chat_template::ChatTemplate,
     cfg: &SpanConfig,
 ) -> ServeResult<Response> {
     let mut all_ids: Vec<Vec<u32>> = Vec::with_capacity(map.inputs.len());

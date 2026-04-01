@@ -4,7 +4,7 @@
 # No GPU required on the build machine — nvcc compiles device code ahead of time.
 #
 # Build (from vllm-rs/):
-#   docker buildx build --platform linux/amd64 -t vllm-rs:cuda .
+#   docker build -t vllm-rs:cuda .
 #
 # Runtime deps in the final image:
 #   libcublas.so.12 + libcublasLt.so.12  — ~500MB; dynamic to avoid 1.1GB binary

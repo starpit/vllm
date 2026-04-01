@@ -3,9 +3,8 @@
 # Builds a minimal CUDA runtime image for vllm-rs.
 # No GPU required on the build machine — nvcc compiles device code ahead of time.
 #
-# Build (from repo root):
-#   docker buildx build --platform linux/amd64 \
-#     -t vllm-rs:cuda -f vllm-rs/Dockerfile.cuda .
+# Build (from vllm-rs/):
+#   docker buildx build --platform linux/amd64 -t vllm-rs:cuda .
 #
 # Runtime deps in the final image:
 #   libcublas.so.12 + libcublasLt.so.12  — ~500MB; dynamic to avoid 1.1GB binary
@@ -40,7 +39,7 @@ RUN cargo install cargo-chef --locked
 # =============================================================================
 FROM builder AS planner
 WORKDIR /build
-COPY vllm-rs/ .
+COPY . .
 RUN cargo chef prepare --recipe-path recipe.json --bin vllm-cli
 
 # =============================================================================
@@ -57,8 +56,7 @@ RUN cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --b
 FROM builder AS compiler
 WORKDIR /build
 
-COPY vllm-rs/ .
-COPY third_party/ ../third_party/
+COPY . .
 
 # Reuse pre-built deps from cooker
 COPY --from=cooker /build/target target

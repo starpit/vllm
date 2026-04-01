@@ -1895,7 +1895,7 @@ impl CudaWorker {
             .as_ref()
             .and_then(|c| c.max_position_embeddings)
             .unwrap_or(131072);
-        (max_model_len + self.config.block_size - 1) / self.config.block_size
+        max_model_len.div_ceil(self.config.block_size)
     }
 
     /// Expose the model directory after load_model.
@@ -3204,10 +3204,9 @@ impl CudaWorker {
                 req_slice.token_count,
                 !req_slice.spec_token_ids.is_empty(),
             );
-            if !discard[req_idx] {
-                if let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
-                    buf.push(tok);
-                }
+            if !discard[req_idx]
+                && let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
+                buf.push(tok);
             }
         }
 
@@ -3400,10 +3399,9 @@ impl CudaWorker {
                 req_slice.token_count,
                 !req_slice.spec_token_ids.is_empty(),
             );
-            if !discard[req_idx] {
-                if let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
-                    buf.push(tok);
-                }
+            if !discard[req_idx]
+                && let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
+                buf.push(tok);
             }
         }
 

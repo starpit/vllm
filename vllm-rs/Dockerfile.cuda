@@ -4,18 +4,24 @@
 # No GPU required on the build machine — nvcc compiles device code ahead of time.
 #
 # Prerequisites:
-#   docker build -t vllm-rs-base:cuda12.9 -f Dockerfile.cuda-base .
+#   docker build -t quay.io/starpit/vllmrs:base-cuda12.9.1 -f Dockerfile.cuda-base .
 #
 # Build (from vllm-rs/):
-#   docker build -t vllm-rs:sm89 --build-arg CUDA_COMPUTE_CAP=89 .
+#   docker build -t quay.io/starpit/vllmrs:cuda12.9.1-sm89 --build-arg CUDA_COMPUTE_CAP=89 -f Dockerfile.cuda .
+#   docker build -t quay.io/starpit/vllmrs:cuda12.6.3-sm80 --build-arg CUDA_VERSION=12.6.3 --build-arg CUDA_COMPUTE_CAP=80 -f Dockerfile.cuda .
 #
-# The binary layer is ~262MB on top of the shared vllm-rs-base (~1.4GB).
+# The binary layer is ~262MB on top of the shared base (~1.4GB).
 # Different SM builds share the same base layer in the registry.
+
+ARG REGISTRY=quay.io
+ARG ORG=starpit
+ARG REPO=vllmrs
+ARG CUDA_VERSION=12.9.1
 
 # =============================================================================
 # Stage 1: Builder base — full CUDA toolkit, no GPU needed at build time
 # =============================================================================
-FROM nvidia/cuda:12.9.1-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -47,7 +53,7 @@ FROM builder AS cooker
 WORKDIR /build
 COPY --from=planner /build/recipe.json recipe.json
 COPY third_party/ third_party/
-RUN cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --bin vllm
+RUN cargo chef cook --release --features cuda,nccl,bench --recipe-path recipe.json --bin vllm
 
 # =============================================================================
 # Stage 4: CUDA kernel compilation
@@ -84,7 +90,7 @@ COPY --from=kernel-builder /root/.cache/cudaforge /root/.cache/cudaforge
 ARG CUDA_COMPUTE_CAP=89
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
-RUN cargo build --release --features cuda,nccl -p vllm-cli
+RUN cargo build --release --features cuda,nccl,bench -p vllm-cli
 
 # Sanity check: libcudart must NOT appear (statically linked).
 # libcublas/libcublasLt are expected dynamic deps.
@@ -95,7 +101,11 @@ RUN echo "=== Dynamic deps ===" && ldd target/release/vllm && \
 # =============================================================================
 # Stage 6: Runtime image — thin layer on top of shared base
 # =============================================================================
-FROM vllm-rs-base:cuda12.9
+ARG REGISTRY=quay.io
+ARG ORG=starpit
+ARG REPO=vllmrs
+ARG CUDA_VERSION=12.9.1
+FROM ${REGISTRY}/${ORG}/${REPO}:base-cuda${CUDA_VERSION}
 
 COPY --from=compiler /build/target/release/vllm /usr/local/bin/vllm
 

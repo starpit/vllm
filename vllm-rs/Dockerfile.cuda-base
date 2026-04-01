@@ -5,14 +5,16 @@
 # Rebuild only when upgrading CUDA or NCCL versions.
 #
 # Build (from vllm-rs/):
-#   docker build -t vllm-rs-base:cuda12.9 -f Dockerfile.cuda-base .
+#   docker build -t quay.io/starpit/vllmrs:base-cuda12.9.1 -f Dockerfile.cuda-base .
+#   docker build -t quay.io/starpit/vllmrs:base-cuda12.6.3 --build-arg CUDA_VERSION=12.6.3 -f Dockerfile.cuda-base .
 #
 # Contents:
 #   libcublas.so.12 + libcublasLt.so.12  (~1.2GB)
 #   libnccl.so.2                          (~120MB)
 #   libcuda.so.1  — NOT included; injected at runtime by nvidia-container-toolkit
 
-FROM nvidia/cuda:12.9.1-devel-ubuntu22.04 AS extract
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS extract
 
 FROM debian:12-slim
 

@@ -16,6 +16,7 @@ members = [
     "crates/vllm-e2e",
     "crates/vllm-wgpu",
     "crates/vllm-cuda",
+    "crates/vllm-kernels-cuda",
     "crates/vllm-examples",
     "crates/vllm-parity",
     "crates/vllm-gce",

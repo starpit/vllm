@@ -1,0 +1,17 @@
+[package]
+name = "vllm-kernels-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CUDA kernel compilation for vllm-rs (fused ops, Marlin, FlashAttention-2)"
+
+[features]
+default = []
+cuda = ["cudaforge"]
+
+[dependencies]
+# No runtime deps — this crate exists solely to compile CUDA kernels via build.rs.
+
+[build-dependencies]
+cudaforge = { path = "../../third_party/cudaforge", optional = true }
+dirs = "6"

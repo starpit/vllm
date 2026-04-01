@@ -46,24 +46,36 @@ RUN cargo chef prepare --recipe-path recipe.json --bin vllm
 FROM builder AS cooker
 WORKDIR /build
 COPY --from=planner /build/recipe.json recipe.json
-# Path dependencies must be present for cargo chef cook
 COPY third_party/ third_party/
-ARG CUDA_COMPUTE_CAP=89
-ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 RUN cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --bin vllm
 
 # =============================================================================
-# Stage 4: Binary compilation
+# Stage 4: CUDA kernel compilation
+# Only invalidates when .cu sources, third_party/, or build.rs change.
+# Independent of all Rust source changes.
+# =============================================================================
+FROM builder AS kernel-builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/vllm-kernels-cuda/ crates/vllm-kernels-cuda/
+COPY crates/vllm-cuda/csrc/ crates/vllm-cuda/csrc/
+COPY third_party/ third_party/
+ARG CUDA_COMPUTE_CAP=89
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+RUN cargo build -p vllm-kernels-cuda --features cuda --release
+
+# =============================================================================
+# Stage 5: Binary compilation
 # =============================================================================
 FROM builder AS compiler
 WORKDIR /build
 
 COPY . .
 
-# Reuse pre-built deps and compiled CUDA kernels from cooker
+# Reuse pre-built deps from cooker and pre-compiled kernels from kernel-builder
 COPY --from=cooker /build/target target
 COPY --from=cooker /root/.cargo /root/.cargo
-COPY --from=cooker /root/.cache/cudaforge /root/.cache/cudaforge
+COPY --from=kernel-builder /root/.cache/cudaforge /root/.cache/cudaforge
 
 # Target a specific GPU architecture to avoid compiling kernels for every SM.
 # Common values: 80 (A100), 86 (A10/A30), 89 (L40S/RTX 4090), 90 (H100).
@@ -80,7 +92,7 @@ RUN echo "=== Dynamic deps ===" && ldd target/release/vllm && \
     && echo "FAIL: libcudart is dynamic — static link broke" && exit 1 || true
 
 # =============================================================================
-# Stage 5: Runtime image — thin layer on top of shared base
+# Stage 6: Runtime image — thin layer on top of shared base
 # =============================================================================
 FROM vllm-rs-base:cuda12.9
 

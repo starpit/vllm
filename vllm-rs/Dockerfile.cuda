@@ -48,6 +48,8 @@ RUN cargo chef prepare --recipe-path recipe.json --bin vllm-cli
 FROM builder AS cooker
 WORKDIR /build
 COPY --from=planner /build/recipe.json recipe.json
+# Path dependencies must be present for cargo chef cook
+COPY third_party/ third_party/
 RUN cargo chef cook --release --features cuda,nccl --recipe-path recipe.json --bin vllm-cli
 
 # =============================================================================

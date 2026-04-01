@@ -1,18 +1,16 @@
 # syntax=docker/dockerfile:1.7
 #
-# Builds a minimal CUDA runtime image for vllm-rs.
+# Builds a vllm-rs CUDA runtime image on top of vllm-rs-base.
 # No GPU required on the build machine — nvcc compiles device code ahead of time.
 #
+# Prerequisites:
+#   docker build -t vllm-rs-base:cuda12.9 -f Dockerfile.cuda-base .
+#
 # Build (from vllm-rs/):
-#   docker build -t vllm-rs:cuda .
+#   docker build -t vllm-rs:sm89 --build-arg CUDA_COMPUTE_CAP=89 .
 #
-# Runtime deps in the final image:
-#   libcublas.so.12 + libcublasLt.so.12  — ~500MB; dynamic to avoid 1.1GB binary
-#   libnccl.so.2                          — ~120MB; drop with --features cuda (no nccl)
-#   libcuda.so.1                          — NOT in image; injected by nvidia-container-toolkit
-#   libcudart.so                          — NOT in image; statically linked into binary
-#
-# Final image size: ~650MB with NCCL, ~550MB without.
+# The binary layer is ~262MB on top of the shared vllm-rs-base (~1.4GB).
+# Different SM builds share the same base layer in the registry.
 
 # =============================================================================
 # Stage 1: Builder base — full CUDA toolkit, no GPU needed at build time
@@ -81,29 +79,11 @@ RUN echo "=== Dynamic deps ===" && ldd target/release/vllm && \
     && echo "FAIL: libcudart is dynamic — static link broke" && exit 1 || true
 
 # =============================================================================
-# Stage 5: Minimal runtime image
+# Stage 5: Runtime image — thin layer on top of shared base
 # =============================================================================
-FROM debian:12-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy cublas/cublasLt .so files directly from the builder — no apt repo needed.
-# The .so.12 symlink is what the dynamic linker resolves at runtime.
-COPY --from=compiler /usr/local/cuda/lib64/libcublas.so.12 /usr/local/cuda/lib64/
-COPY --from=compiler /usr/local/cuda/lib64/libcublasLt.so.12 /usr/local/cuda/lib64/
-COPY --from=compiler /usr/lib/x86_64-linux-gnu/libnccl.so.2 /usr/lib/x86_64-linux-gnu/
-
-# Tell the dynamic linker where to find the CUDA libs
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+FROM vllm-rs-base:cuda12.9
 
 COPY --from=compiler /build/target/release/vllm /usr/local/bin/vllm
-
-# nvidia-container-toolkit mounts libcuda.so.1 from the host driver at container
-# start when NVIDIA_VISIBLE_DEVICES is set — no CUDA libs needed in the image.
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 EXPOSE 8000
 

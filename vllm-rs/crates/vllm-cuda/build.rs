@@ -17,25 +17,6 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn cuda_build() {
-    // cudarc's static-linking feature emits `rustc-link-lib=static:+whole-archive=stdc++`
-    // but doesn't add the GCC-versioned lib directory to the search path. Detect it here
-    // so the linker can find libstdc++.a regardless of GCC version or distro layout.
-    // cudarc's static-linking feature emits `rustc-link-lib=static:+whole-archive=stdc++`
-    // but doesn't add the GCC versioned lib directory. Use rustc-flags (not
-    // rustc-link-search) so the -L propagates to all crates including cudarc itself.
-    if let Ok(output) = std::process::Command::new("gcc")
-        .arg("-print-file-name=libstdc++.a")
-        .output()
-    {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        // gcc echoes the input unchanged when the file isn't found
-        if path != "libstdc++.a" {
-            if let Some(dir) = std::path::Path::new(&path).parent() {
-                println!("cargo:rustc-flags=-L {}", dir.display());
-            }
-        }
-    }
-
     // Track all source/header files for cargo:rerun-if-changed.
     // Without these directives, cargo re-runs build.rs on EVERY build,
     // marking vllm-cuda dirty and forcing recompilation of all downstream crates.
@@ -342,7 +323,10 @@ fn build_flash_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .expect("Failed to build flash attention");
 
     println!("cargo:rustc-link-lib=static=vllm_flash_attn");
-    // rt + dl are required by cudart_static (pulled in transitively by cublas_static).
+    // Static cudart: eliminates libcudart.so at runtime. Requires rt + dl.
+    // cublas/cublasLt remain dynamic (static versions bloat binary by ~600MB).
+    println!("cargo:rustc-link-lib=static=cudart_static");
     println!("cargo:rustc-link-lib=dylib=rt");
     println!("cargo:rustc-link-lib=dylib=dl");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 }

@@ -166,8 +166,11 @@ js-sys = "0.3"
 serde-wasm-bindgen = "0.6"
 
 [profile.release]
+
+[profile.release-dist]
+inherits = "release"
 strip = true
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 
 [patch.crates-io]

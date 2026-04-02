@@ -38,6 +38,9 @@ pub enum Commands {
     /// Manage GCE GPU VM instances.
     #[cfg(feature = "gce")]
     Gce(GceCommand),
+    /// Deploy to Kubernetes with GPU support.
+    #[cfg(feature = "k8s")]
+    K8s(K8sCommand),
     /// Generate text completions via the running API server.
     Complete(CompleteArgs),
     /// Convert model weights between formats (stub).
@@ -765,6 +768,127 @@ pub struct GceDownArgs {
     /// Force deletion (treat not-found as success, skip confirmation).
     #[arg(short = 'f', long)]
     pub force: bool,
+}
+
+// ---------------------------------------------------------------------------
+// K8s subcommands
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "k8s")]
+/// Top-level `vllm k8s` command.
+#[derive(Parser, Debug)]
+pub struct K8sCommand {
+    #[command(subcommand)]
+    pub command: K8sSubcommand,
+}
+
+#[cfg(feature = "k8s")]
+#[derive(Subcommand, Debug)]
+pub enum K8sSubcommand {
+    /// Deploy vLLM to a Kubernetes cluster.
+    Up(Box<K8sUpArgs>),
+    /// Tear down a vLLM Kubernetes deployment.
+    Down(K8sDownArgs),
+    /// Preload models into a PVC for fast startup.
+    Preload(K8sPreloadArgs),
+}
+
+#[cfg(feature = "k8s")]
+/// Arguments for `vllm k8s up`.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm k8s up <NAME> [OPTIONS]")]
+pub struct K8sUpArgs {
+    /// Resource name (used for Deployment/StatefulSet and teardown).
+    pub name: String,
+
+    /// Number of nodes (>1 for multi-node tensor parallelism).
+    #[arg(short = 'n', long, default_value_t = 1)]
+    pub nodes: u32,
+
+    /// Number of GPUs per node.
+    #[arg(short = 'c', long, default_value_t = 1)]
+    pub gpu_count: u32,
+
+    /// Container image.
+    #[arg(long, default_value = vllm_k8s::up::DEFAULT_IMAGE)]
+    pub image: String,
+
+    /// Model to serve: HuggingFace model ID or path.
+    #[arg(short = 'm', long)]
+    pub model: String,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Local port for port forwarding.
+    #[arg(short = 'p', long, default_value_t = 8000)]
+    pub local_port: u16,
+
+    /// Kubernetes namespace.
+    #[arg(long)]
+    pub namespace: Option<String>,
+
+    /// Shared memory size for /dev/shm (NCCL).
+    #[arg(long, default_value = "16Gi")]
+    pub shm_size: String,
+
+    /// PVC with preloaded models (mounted read-only at ~/.cache/huggingface).
+    #[arg(short = 'P', long)]
+    pub preload: Option<String>,
+
+    /// Extra arguments passed to `vllm serve` on the pod (after `--`).
+    #[arg(last = true)]
+    pub serve_args: Vec<String>,
+}
+
+#[cfg(feature = "k8s")]
+/// Arguments for `vllm k8s down`.
+#[derive(Parser, Debug)]
+pub struct K8sDownArgs {
+    /// Resource name to delete.
+    pub name: String,
+
+    /// Kubernetes namespace.
+    #[arg(long)]
+    pub namespace: Option<String>,
+
+    /// Force deletion (treat not-found as success).
+    #[arg(short = 'f', long)]
+    pub force: bool,
+}
+
+#[cfg(feature = "k8s")]
+/// Arguments for `vllm k8s preload`.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm k8s preload <PVC_NAME> <MODEL>...")]
+pub struct K8sPreloadArgs {
+    /// PVC name to create/reuse for model storage.
+    pub pvc_name: String,
+
+    /// Models to download (HuggingFace model IDs).
+    #[arg(required = true)]
+    pub models: Vec<String>,
+
+    /// Kubernetes namespace.
+    #[arg(long)]
+    pub namespace: Option<String>,
+
+    /// PVC storage size.
+    #[arg(long, default_value = "100Gi")]
+    pub size: String,
+
+    /// Storage class (uses cluster default if omitted).
+    #[arg(long)]
+    pub storage_class: Option<String>,
+
+    /// Container image for the download Job.
+    #[arg(long, default_value = vllm_k8s::up::DEFAULT_IMAGE)]
+    pub image: String,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
 }
 
 /// Arguments for the `top` subcommand.

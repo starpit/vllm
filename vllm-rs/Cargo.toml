@@ -20,6 +20,7 @@ members = [
     "crates/vllm-examples",
     "crates/vllm-parity",
     "crates/vllm-gce",
+    "crates/vllm-k8s",
 ]
 exclude = []
 
@@ -156,6 +157,7 @@ vllm-wgpu = { path = "crates/vllm-wgpu" }
 vllm-cuda = { path = "crates/vllm-cuda" }
 vllm-examples = { path = "crates/vllm-examples" }
 vllm-gce = { path = "crates/vllm-gce" }
+vllm-k8s = { path = "crates/vllm-k8s" }
 
 # WebGPU
 wgpu = { version = "28", features = ["wgsl"] }

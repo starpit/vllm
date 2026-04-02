@@ -11,6 +11,8 @@ pub mod collect_env;
 pub mod convert;
 #[cfg(feature = "gce")]
 pub mod gce;
+#[cfg(feature = "k8s")]
+pub mod k8s;
 pub mod model;
 pub mod pull;
 pub mod serve;

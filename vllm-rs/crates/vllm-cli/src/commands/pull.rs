@@ -53,7 +53,7 @@ fn download_model(
 ) -> anyhow::Result<PathBuf> {
     info!("Downloading model from HuggingFace Hub: {model_id}");
 
-    let mut builder = hf_hub::api::sync::ApiBuilder::new();
+    let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
     if let Some(token) = hf_token {
         builder = builder.with_token(Some(token.to_string()));
     }

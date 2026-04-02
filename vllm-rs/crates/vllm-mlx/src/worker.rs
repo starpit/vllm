@@ -412,7 +412,7 @@ impl MlxWorker {
 
     /// Build an HF Hub API client from config.
     fn build_hf_api(&self) -> ExecutorResult<hf_hub::api::sync::Api> {
-        let mut builder = hf_hub::api::sync::ApiBuilder::new();
+        let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
         if let Some(token) = &self.config.hf_token {
             builder = builder.with_token(Some(token.clone()));
         }

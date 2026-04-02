@@ -48,6 +48,15 @@ async fn main() -> anyhow::Result<()> {
                 },
             }
         }
+        #[cfg(feature = "k8s")]
+        Commands::K8s(cmd) => {
+            use crate::args::K8sSubcommand;
+            match cmd.command {
+                K8sSubcommand::Up(args) => commands::k8s::run_up(*args).await,
+                K8sSubcommand::Down(args) => commands::k8s::run_down(args).await,
+                K8sSubcommand::Preload(args) => commands::k8s::run_preload(args).await,
+            }
+        }
         #[cfg(feature = "top")]
         Commands::Top(args) => commands::top::run_top(args).await,
     }

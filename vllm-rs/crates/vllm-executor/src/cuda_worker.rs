@@ -2119,7 +2119,7 @@ impl CudaWorker {
             "Downloading model from HuggingFace Hub: {}",
             self.config.model_path
         );
-        let mut builder = hf_hub::api::sync::ApiBuilder::new();
+        let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
         if let Some(ref token) = self.config.hf_token {
             builder = builder.with_token(Some(token.clone()));
         }
@@ -2244,7 +2244,7 @@ impl CudaWorker {
 
         // Download from HuggingFace Hub.
         info!("Downloading LoRA adapter from HuggingFace Hub: {adapter_path}");
-        let mut builder = hf_hub::api::sync::ApiBuilder::new();
+        let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
         if let Some(ref token) = self.config.hf_token {
             builder = builder.with_token(Some(token.clone()));
         }
@@ -3205,7 +3205,8 @@ impl CudaWorker {
                 !req_slice.spec_token_ids.is_empty(),
             );
             if !discard[req_idx]
-                && let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
+                && let Some(buf) = token_buffers.get_mut(&req_slice.req_id)
+            {
                 buf.push(tok);
             }
         }
@@ -3400,7 +3401,8 @@ impl CudaWorker {
                 !req_slice.spec_token_ids.is_empty(),
             );
             if !discard[req_idx]
-                && let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
+                && let Some(buf) = token_buffers.get_mut(&req_slice.req_id)
+            {
                 buf.push(tok);
             }
         }

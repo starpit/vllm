@@ -6979,7 +6979,6 @@ name = "vllm-cuda"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cudaforge",
  "cudarc",
  "dirs 6.0.0",
  "half",
@@ -6995,6 +6994,7 @@ dependencies = [
  "tracing",
  "vllm-common",
  "vllm-config",
+ "vllm-kernels-cuda",
  "vllm-model",
 ]
 
@@ -7097,6 +7097,14 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "vllm-kernels-cuda"
+version = "0.1.0"
+dependencies = [
+ "cudaforge",
+ "dirs 6.0.0",
 ]
 
 [[package]]

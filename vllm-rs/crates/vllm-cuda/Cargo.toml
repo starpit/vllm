@@ -8,7 +8,7 @@ description = "Purpose-built CUDA tensor runtime for LLM inference — replaces 
 [features]
 default = []
 # Enable CUDA runtime. Requires CUDA toolkit + nvcc.
-cuda = ["dep:cudarc", "cudaforge"]
+cuda = ["dep:cudarc", "dep:vllm-kernels-cuda", "vllm-kernels-cuda/cuda"]
 # Enable NCCL multi-GPU collective communication (requires libnccl).
 nccl = ["cuda", "cudarc/nccl"]
 # Enable NVTX profiling annotations for nsys/Nsight traces.
@@ -16,6 +16,7 @@ profiling = ["cuda", "cudarc/nvtx"]
 
 [dependencies]
 cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+vllm-kernels-cuda = { path = "../vllm-kernels-cuda", optional = true }
 half = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }
@@ -30,7 +31,6 @@ vllm-model = { path = "../vllm-model" }
 libc = { workspace = true }
 
 [build-dependencies]
-cudaforge = { version = "=0.1.4", optional = true }
 dirs = "6"
 
 [dev-dependencies]

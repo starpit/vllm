@@ -42,7 +42,10 @@ pub struct CudaGraphRunner {
     slot_mapping: RawGpuMem,
     cu_seqlens_q: RawGpuMem,
     seqused_k: RawGpuMem,
-    block_table: RawGpuMem,
+    /// External block table pointer (owned by `GpuBlockTable.input`).
+    /// The graph captures with this pointer baked in, so GPU-side gather
+    /// updates are visible during replay without any H2D copy.
+    block_table_ptr: *mut u8,
     /// Shared output buffer for logits — `[max_batch, vocab_size]` in model dtype.
     /// All captured graphs copy their logits here, so we only keep one allocation.
     shared_logits: RawGpuMem,
@@ -80,13 +83,16 @@ unsafe impl Send for CudaGraphRunner {}
 impl CudaGraphRunner {
     /// Create a new CUDA graph runner.
     ///
-    /// `max_blocks_per_seq`: maximum blocks any single sequence can use,
-    /// computed as `cdiv(max_model_len, block_size)` by the caller.
+    /// `max_blocks_per_seq`: maximum blocks any single sequence can use.
+    /// `block_table_ptr`: pointer to the `GpuBlockTable.input` buffer —
+    ///   the graph captures with this pointer baked in, so GPU-side gather
+    ///   updates are visible during replay.
     pub unsafe fn new(
         max_batch: usize,
         vocab_size: usize,
         dtype: DType,
         max_blocks_per_seq: usize,
+        block_table_ptr: *mut u8,
     ) -> Result<Self> {
         let input_ids = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
         let positions = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
@@ -94,10 +100,6 @@ impl CudaGraphRunner {
         let cu_seqlens_q =
             RawGpuMem::new(driver::mem_alloc((max_batch + 1) * 4)?, (max_batch + 1) * 4);
         let seqused_k = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
-        let block_table = RawGpuMem::new(
-            driver::mem_alloc(max_batch * max_blocks_per_seq * 4)?,
-            max_batch * max_blocks_per_seq * 4,
-        );
         let shared_logits_size = max_batch * vocab_size * dtype.size_bytes();
         let shared_logits =
             RawGpuMem::new(driver::mem_alloc(shared_logits_size)?, shared_logits_size);
@@ -110,7 +112,7 @@ impl CudaGraphRunner {
             slot_mapping,
             cu_seqlens_q,
             seqused_k,
-            block_table,
+            block_table_ptr,
             shared_logits,
             shared_argmax,
             max_batch,
@@ -273,7 +275,7 @@ impl CudaGraphRunner {
                 ),
                 seqused_k: GpuTensor::new(self.seqused_k.ptr(), &[batch_size], DType::I32),
                 block_table: GpuTensor::new(
-                    self.block_table.ptr(),
+                    self.block_table_ptr,
                     &[batch_size, self.max_blocks_per_seq],
                     DType::I32,
                 ),
@@ -362,6 +364,10 @@ impl CudaGraphRunner {
     }
 
     /// Replay a captured CUDA graph.
+    ///
+    /// Block table is NOT passed here — it's managed by `GpuBlockTable` and
+    /// the graph reads directly from the persistent input buffer via baked-in
+    /// pointers. The caller must call `GpuBlockTable::gather()` before this.
     pub unsafe fn replay(
         &self,
         batch_size: usize,
@@ -370,7 +376,6 @@ impl CudaGraphRunner {
         slot_mapping: &[i64],
         cu_seqlens_q: &[i32],
         seqused_k: &[i32],
-        block_table: &[i32],
         device: &mut GpuDevice,
         skip_input_ids_h2d: bool,
     ) -> Result<ReplayOutput> {
@@ -413,12 +418,7 @@ impl CudaGraphRunner {
             batch_size * 4,
             xfer,
         )?;
-        driver::memcpy_htod_async(
-            self.block_table.ptr(),
-            block_table.as_ptr() as *const u8,
-            batch_size * self.max_blocks_per_seq * 4,
-            xfer,
-        )?;
+        // Block table: already populated by GpuBlockTable::gather() — no H2D needed.
 
         // FP8: compute cu_seqlens_k from seqused_k (CPU prefix sum) and upload.
         if let Some(ref cu_k) = self.fp8_cu_seqlens_k {
@@ -450,11 +450,13 @@ impl CudaGraphRunner {
     }
 
     /// Fast replay for steady-state decode: update metadata on GPU.
+    ///
+    /// Block table is read from `GpuBlockTable.input` (baked-in pointer).
+    /// The caller must call `GpuBlockTable::gather()` before this if blocks changed.
     pub unsafe fn replay_decode_fast(
         &self,
         batch_size: usize,
         input_ids: Option<&[u32]>,
-        new_block_table: Option<&[i32]>,
         block_size: usize,
         device: &mut GpuDevice,
     ) -> Result<ReplayOutput> {
@@ -472,18 +474,6 @@ impl CudaGraphRunner {
                 batch_size * 4,
                 device.transfer_stream,
             )?;
-        }
-
-        if let Some(bt) = new_block_table {
-            driver::memcpy_htod_async(
-                self.block_table.ptr(),
-                bt.as_ptr() as *const u8,
-                bt.len() * 4,
-                device.transfer_stream,
-            )?;
-        }
-
-        if input_ids.is_some() || new_block_table.is_some() {
             device.sync_transfer_to_compute()?;
         }
 
@@ -491,7 +481,7 @@ impl CudaGraphRunner {
             self.positions.ptr(),
             self.slot_mapping.ptr(),
             self.seqused_k.ptr(),
-            self.block_table.ptr() as *const u8,
+            self.block_table_ptr as *const u8,
             batch_size,
             block_size,
             self.max_blocks_per_seq,
@@ -551,7 +541,7 @@ impl CudaGraphRunner {
             stream,
         )?;
         driver::memset_d8(
-            self.block_table.ptr(),
+            self.block_table_ptr,
             0,
             batch_size * self.max_blocks_per_seq * 4,
             stream,

@@ -19,6 +19,7 @@ use vllm_cuda::cpu_gpu_buf::PinnedBuf;
 use vllm_cuda::device::GpuDevice;
 use vllm_cuda::driver;
 use vllm_cuda::dtype::DType as GpuDType;
+use vllm_cuda::block_table::GpuBlockTable;
 use vllm_cuda::graph::{CudaGraphRunner, PrefillGraphRunner};
 use vllm_cuda::graph_piece::{GraphPieceType, PiecewiseGraphRunner};
 use vllm_cuda::kv_cache::KvCachePool;
@@ -1315,10 +1316,6 @@ struct HostStaging {
     cu_seqlens_q: PinnedBuf,
     /// `[max_batch]` i32 — per-sequence K lengths for paged FA2.
     seqused_k: PinnedBuf,
-    /// `[max_batch * max_blocks_per_seq]` i32 — page table.
-    block_table: PinnedBuf,
-    /// Maximum blocks per sequence (computed from max_model_len / block_size).
-    max_blocks_per_seq: usize,
     /// `[max_batch]` u32 — D2H token IDs from graph argmax (double-buffered).
     ///
     /// Two pinned buffers alternate per step so that the GPU can write to one
@@ -1335,15 +1332,13 @@ impl HostStaging {
     ///
     /// # Safety
     /// Requires active CUDA context.
-    unsafe fn new(max_batch: usize, max_blocks_per_seq: usize) -> anyhow::Result<Self> {
+    unsafe fn new(max_batch: usize) -> anyhow::Result<Self> {
         Ok(Self {
             input_ids: unsafe { PinnedBuf::new(max_batch * 4)? },
             positions: unsafe { PinnedBuf::new(max_batch * 4)? },
             slot_mapping: unsafe { PinnedBuf::new(max_batch * 8)? },
             cu_seqlens_q: unsafe { PinnedBuf::new((max_batch + 1) * 4)? },
             seqused_k: unsafe { PinnedBuf::new(max_batch * 4)? },
-            block_table: unsafe { PinnedBuf::new(max_batch * max_blocks_per_seq * 4)? },
-            max_blocks_per_seq,
             host_token_ids: [unsafe { PinnedBuf::new(max_batch * 4)? }, unsafe {
                 PinnedBuf::new(max_batch * 4)?
             }],
@@ -1352,26 +1347,6 @@ impl HostStaging {
         })
     }
 
-    /// Fill block_table pinned buffer from attention metadata block_ids.
-    /// Returns a slice of the pinned buffer with `graph_bs * max_blocks_per_seq` elements.
-    unsafe fn fill_block_table<'a>(
-        &'a self,
-        block_ids: &[Vec<usize>],
-        graph_bs: usize,
-    ) -> &'a [i32] {
-        let mbps = self.max_blocks_per_seq;
-        let n = graph_bs * mbps;
-        let bt = unsafe { self.block_table.slice_mut::<i32>(n) };
-        bt.fill(0);
-        for (i, blocks) in block_ids.iter().enumerate() {
-            for (j, &bid) in blocks.iter().enumerate() {
-                if j < mbps {
-                    bt[i * mbps + j] = bid as i32;
-                }
-            }
-        }
-        &bt[..n]
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1429,6 +1404,14 @@ pub struct CudaWorker {
     /// Pre-allocated pinned host staging buffers for graph replay.
     /// Initialized after graph capture in `compile_or_warm_up_model`.
     host_staging: Option<HostStaging>,
+
+    /// Persistent GPU block table with incremental updates and GPU-side gather.
+    /// Replaces per-step full block table H2D copies.
+    gpu_block_table: Option<GpuBlockTable>,
+    /// Stable req_id → req_idx mapping for the persistent GPU block table.
+    req_idx_map: HashMap<String, usize>,
+    /// Free list of req_idx slots for reuse.
+    free_req_indices: Vec<usize>,
 
     // Per-request state.
     token_buffers: HashMap<String, Vec<u32>>,
@@ -1559,6 +1542,9 @@ impl CudaWorker {
             graph_metadata_valid: false,
             uses_ggml: false,
             host_staging: None,
+            gpu_block_table: None,
+            req_idx_map: HashMap::new(),
+            free_req_indices: Vec::new(),
             token_buffers: HashMap::new(),
             prompt_lengths: HashMap::new(),
             annotation_buffers: HashMap::new(),
@@ -5965,11 +5951,22 @@ impl Worker for CudaWorker {
             );
         }
 
+        // Create persistent GPU block table for incremental updates.
+        // max_num_reqs = max_bs (graph decode only); max_graph_bs = max_bs.
+        if self.gpu_block_table.is_none() {
+            let gbt = unsafe { GpuBlockTable::new(max_bs, max_blocks_per_seq, max_bs) }
+                .map_err(|e| ExecutorError::WorkerInit(format!("GpuBlockTable::new: {e}")))?;
+            // Initialize free list: indices 0..max_bs.
+            self.free_req_indices = (0..max_bs).rev().collect();
+            self.gpu_block_table = Some(gbt);
+        }
+
         if !should_capture_monolithic {
             // Skip to prefill graphs / cublas autotune.
         } else {
+            let block_table_ptr = self.gpu_block_table.as_ref().unwrap().input_ptr();
             let mut runner = unsafe {
-                CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype, max_blocks_per_seq)
+                CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype, max_blocks_per_seq, block_table_ptr)
             }
             .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
 
@@ -6059,7 +6056,7 @@ impl Worker for CudaWorker {
                 );
                 // Allocate pinned host staging buffers sized for the largest captured graph.
                 let staging_max_bs = *runner.captured_sizes().last().unwrap();
-                match unsafe { HostStaging::new(staging_max_bs, max_blocks_per_seq) } {
+                match unsafe { HostStaging::new(staging_max_bs) } {
                     Ok(staging) => {
                         info!(
                             "Pinned host staging allocated for max_batch={}",
@@ -6419,6 +6416,13 @@ impl CudaWorker {
             self.seeded_rngs.remove(req_id);
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
+            // Free persistent GPU block table slot.
+            if let Some(req_idx) = self.req_idx_map.remove(req_id) {
+                if let Some(ref mut gbt) = self.gpu_block_table {
+                    gbt.clear_req(req_idx);
+                }
+                self.free_req_indices.push(req_idx);
+            }
         }
         self.input_batch
             .remove_finished(&scheduler_output.finished_req_ids);
@@ -6499,6 +6503,21 @@ impl CudaWorker {
             }
 
             let block_ids = new_req.block_ids.first().cloned().unwrap_or_default();
+
+            // Populate persistent GPU block table for this new request.
+            if let Some(ref mut gbt) = self.gpu_block_table {
+                if let Some(req_idx) = self.free_req_indices.pop() {
+                    let block_ids_i32: Vec<i32> =
+                        block_ids.iter().map(|&b| b as i32).collect();
+                    let stream = self.device.as_ref().unwrap().compute_stream;
+                    unsafe {
+                        let _ = gbt.set_blocks(req_idx, &block_ids_i32, stream);
+                    }
+                    self.req_idx_map
+                        .insert(new_req.req_id.clone(), req_idx);
+                }
+            }
+
             self.input_batch.add_request(
                 new_req.req_id.clone(),
                 tokens_to_use,
@@ -6521,6 +6540,20 @@ impl CudaWorker {
             {
                 if !group0.is_empty() {
                     blocks_changed = true;
+                    // Incrementally append only new blocks to persistent GPU table.
+                    if let Some(ref mut gbt) = self.gpu_block_table
+                        && let Some(&req_idx) = self.req_idx_map.get(req_id)
+                    {
+                        let old_count = gbt.num_blocks(req_idx);
+                        if group0.len() > old_count {
+                            let new_blocks_i32: Vec<i32> =
+                                group0[old_count..].iter().map(|&b| b as i32).collect();
+                            let stream = self.device.as_ref().unwrap().compute_stream;
+                            unsafe {
+                                let _ = gbt.append_blocks(req_idx, &new_blocks_i32, stream);
+                            }
+                        }
+                    }
                 }
                 self.input_batch.update_blocks(req_id, group0.clone());
             }
@@ -6589,7 +6622,7 @@ impl CudaWorker {
             && let Some(ref mut device) = self.device
         {
             // Collect info from InputBatch upfront (immutable borrow ends here).
-            let (req_ids, block_tables, _tokens_in_pool) = self.input_batch.fast_path_info();
+            let (req_ids, _block_tables, _tokens_in_pool) = self.input_batch.fast_path_info();
             let out_req_ids: Vec<String> = req_ids.to_vec();
             let token_counts = self.input_batch.fast_path_token_counts();
 
@@ -6619,18 +6652,26 @@ impl CudaWorker {
             if all_greedy_fast && !any_needs_full {
                 let block_size = self.config.block_size;
 
-                // Block table update for the graph (only if blocks changed).
-                let new_bt = if blocks_changed {
-                    let bt = unsafe { stg.fill_block_table(block_tables, graph_bs) };
-                    Some(bt)
-                } else {
-                    None
-                };
+                // GPU-side gather: update input block table from persistent table.
+                if blocks_changed {
+                    if let Some(ref gbt) = self.gpu_block_table {
+                        let batch_req_indices: Vec<usize> = out_req_ids
+                            .iter()
+                            .map(|rid| self.req_idx_map.get(rid).copied().unwrap_or(0))
+                            .collect();
+                        unsafe {
+                            gbt.gather(&batch_req_indices, graph_bs, device.compute_stream)
+                        }
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("block table gather: {e}"))
+                        })?;
+                    }
+                }
 
                 // Graph launch — GPU self-updates positions, slot_mapping, seqused_k.
                 let runner = self.graph_runner.as_ref().unwrap();
                 let replay_out = unsafe {
-                    runner.replay_decode_fast(graph_bs, None, new_bt, block_size, device)
+                    runner.replay_decode_fast(graph_bs, None, block_size, device)
                 }
                 .map_err(|e| {
                     ExecutorError::WorkerExecution(format!("super fast replay_decode_fast: {e}"))
@@ -6818,6 +6859,17 @@ impl CudaWorker {
             } else {
                 new_block_ids
             };
+            // Update persistent GPU block table for resumed/chunked prefill.
+            if let Some(ref mut gbt) = self.gpu_block_table
+                && let Some(&req_idx) = self.req_idx_map.get(req_id)
+            {
+                let block_ids_i32: Vec<i32> =
+                    all_block_ids.iter().map(|&b| b as i32).collect();
+                let stream = self.device.as_ref().unwrap().compute_stream;
+                unsafe {
+                    let _ = gbt.set_blocks(req_idx, &block_ids_i32, stream);
+                }
+            }
             // Remove the old (zombie) slot first, then re-add as prefill.
             self.input_batch.remove_request(req_id);
             self.input_batch
@@ -7103,8 +7155,6 @@ impl CudaWorker {
                 let mut slot_mapping: Vec<i64> = Vec::with_capacity(decode_graph_bs);
                 let mut cu_seqlens_q: Vec<i32> = Vec::with_capacity(decode_graph_bs + 1);
                 let mut seqused_k: Vec<i32> = Vec::with_capacity(decode_graph_bs);
-                let mut block_table = vec![0i32; decode_graph_bs * max_blocks_per_seq];
-
                 cu_seqlens_q.push(0);
                 for (out_idx, &orig_idx) in decode_indices.iter().enumerate() {
                     // Each decode request has exactly 1 token.
@@ -7124,13 +7174,23 @@ impl CudaWorker {
                     } else {
                         slot_mapping.push(-1i64);
                     }
+                }
 
-                    // Block table row.
-                    for (j, &bid) in block_ids.iter().enumerate() {
-                        if j < max_blocks_per_seq {
-                            block_table[out_idx * max_blocks_per_seq + j] = bid as i32;
-                        }
+                // GPU-side gather for decode block table.
+                if let Some(ref gbt) = self.gpu_block_table {
+                    let batch_req_indices: Vec<usize> = decode_indices
+                        .iter()
+                        .map(|&orig_idx| {
+                            let rid = &prepared.attn_meta.req_ids[orig_idx];
+                            self.req_idx_map.get(rid).copied().unwrap_or(0)
+                        })
+                        .collect();
+                    unsafe {
+                        gbt.gather(&batch_req_indices, decode_graph_bs, device.compute_stream)
                     }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("mixed decode gather: {e}"))
+                    })?;
                 }
 
                 // Pad to graph batch size.
@@ -7151,7 +7211,6 @@ impl CudaWorker {
                         &slot_mapping,
                         &cu_seqlens_q,
                         &seqused_k,
-                        &block_table,
                         device,
                         false,
                     )
@@ -7469,22 +7528,29 @@ impl CudaWorker {
                 && self.last_graph_batch_size == Some(graph_bs)
             {
                 // GPU-side metadata update: positions, slot_mapping, seqused_k
-                // are incremented on GPU in a single kernel. Only block_table is
-                // H2D-copied when blocks changed. input_ids were scattered by the
-                // previous graph replay's in-graph argmax.
-                let new_bt = if blocks_changed {
-                    let bt =
-                        unsafe { staging.unwrap().fill_block_table(&meta.block_ids, graph_bs) };
-                    Some(bt)
-                } else {
-                    None
-                };
+                // are incremented on GPU in a single kernel. Block table is
+                // updated via GPU-side gather from persistent table.
+                if blocks_changed {
+                    if let Some(ref gbt) = self.gpu_block_table {
+                        let batch_req_indices: Vec<usize> = meta
+                            .req_ids
+                            .iter()
+                            .map(|rid| self.req_idx_map.get(rid).copied().unwrap_or(0))
+                            .collect();
+                        unsafe {
+                            gbt.gather(&batch_req_indices, graph_bs, device.compute_stream)
+                        }
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("block table gather: {e}"))
+                        })?;
+                    }
+                }
 
                 let runner = self.graph_runner.as_ref().unwrap();
                 unsafe {
                     runner.replay_decode_fast(
                         graph_bs, None, // input_ids already scattered by previous graph
-                        new_bt, block_size, device,
+                        block_size, device,
                     )
                 }
                 .map_err(|e| {
@@ -7532,7 +7598,18 @@ impl CudaWorker {
                     }
                     sm[num_reqs..].fill(-1i64);
 
-                    let bt = stg.fill_block_table(&meta.block_ids, graph_bs);
+                    // GPU-side gather for block table.
+                    if let Some(ref gbt) = self.gpu_block_table {
+                        let batch_req_indices: Vec<usize> = meta
+                            .req_ids
+                            .iter()
+                            .map(|rid| self.req_idx_map.get(rid).copied().unwrap_or(0))
+                            .collect();
+                        gbt.gather(&batch_req_indices, graph_bs, device.compute_stream)
+                            .map_err(|e| {
+                                ExecutorError::WorkerExecution(format!("block table gather: {e}"))
+                            })?;
+                    }
 
                     let skip_input_ids =
                         self.last_graph_batch_size == Some(graph_bs) && num_reqs == graph_bs;
@@ -7545,7 +7622,6 @@ impl CudaWorker {
                         stg.slot_mapping.slice::<i64>(graph_bs),
                         stg.cu_seqlens_q.slice::<i32>(graph_bs + 1),
                         stg.seqused_k.slice::<i32>(graph_bs),
-                        bt,
                         device,
                         skip_input_ids,
                     )
@@ -7582,13 +7658,19 @@ impl CudaWorker {
                 }
                 slot_mapping.resize(graph_bs, -1i64);
 
-                let mut block_table = vec![0i32; graph_bs * max_blocks_per_seq];
-                for (i, blocks) in meta.block_ids.iter().enumerate() {
-                    for (j, &bid) in blocks.iter().enumerate() {
-                        if j < max_blocks_per_seq {
-                            block_table[i * max_blocks_per_seq + j] = bid as i32;
-                        }
+                // GPU-side gather for block table.
+                if let Some(ref gbt) = self.gpu_block_table {
+                    let batch_req_indices: Vec<usize> = meta
+                        .req_ids
+                        .iter()
+                        .map(|rid| self.req_idx_map.get(rid).copied().unwrap_or(0))
+                        .collect();
+                    unsafe {
+                        gbt.gather(&batch_req_indices, graph_bs, device.compute_stream)
                     }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("block table gather: {e}"))
+                    })?;
                 }
 
                 let skip_input_ids =
@@ -7603,7 +7685,6 @@ impl CudaWorker {
                         &slot_mapping,
                         &cu_seqlens_q,
                         &seqused_k,
-                        &block_table,
                         device,
                         skip_input_ids,
                     )
@@ -7697,13 +7778,21 @@ impl CudaWorker {
             {
                 // Fast path: GPU-side metadata update (same as greedy).
                 // Only input_ids must be H2D'd (no in-graph argmax scatter for non-greedy).
-                let new_bt = if blocks_changed {
-                    let bt =
-                        unsafe { staging.unwrap().fill_block_table(&meta.block_ids, graph_bs) };
-                    Some(bt)
-                } else {
-                    None
-                };
+                if blocks_changed {
+                    if let Some(ref gbt) = self.gpu_block_table {
+                        let batch_req_indices: Vec<usize> = meta
+                            .req_ids
+                            .iter()
+                            .map(|rid| self.req_idx_map.get(rid).copied().unwrap_or(0))
+                            .collect();
+                        unsafe {
+                            gbt.gather(&batch_req_indices, graph_bs, device.compute_stream)
+                        }
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("block table gather: {e}"))
+                        })?;
+                    }
+                }
 
                 // Must H2D input_ids since non-greedy doesn't use in-graph argmax scatter.
                 let input_ids_slice = if let Some(stg) = staging {
@@ -7724,7 +7813,6 @@ impl CudaWorker {
                     runner.replay_decode_fast(
                         graph_bs,
                         Some(input_ids_slice),
-                        new_bt,
                         block_size,
                         device,
                     )
@@ -7772,7 +7860,18 @@ impl CudaWorker {
                     }
                     sm[num_reqs..].fill(-1i64);
 
-                    let bt = stg.fill_block_table(&meta.block_ids, graph_bs);
+                    // GPU-side gather for block table.
+                    if let Some(ref gbt) = self.gpu_block_table {
+                        let batch_req_indices: Vec<usize> = meta
+                            .req_ids
+                            .iter()
+                            .map(|rid| self.req_idx_map.get(rid).copied().unwrap_or(0))
+                            .collect();
+                        gbt.gather(&batch_req_indices, graph_bs, device.compute_stream)
+                            .map_err(|e| {
+                                ExecutorError::WorkerExecution(format!("block table gather: {e}"))
+                            })?;
+                    }
 
                     let runner = self.graph_runner.as_ref().unwrap();
                     runner.replay(
@@ -7782,7 +7881,6 @@ impl CudaWorker {
                         stg.slot_mapping.slice::<i64>(graph_bs),
                         stg.cu_seqlens_q.slice::<i32>(graph_bs + 1),
                         stg.seqused_k.slice::<i32>(graph_bs),
-                        bt,
                         device,
                         false,
                     )
@@ -7819,13 +7917,19 @@ impl CudaWorker {
                 }
                 slot_mapping.resize(graph_bs, -1i64);
 
-                let mut block_table = vec![0i32; graph_bs * max_blocks_per_seq];
-                for (i, blocks) in meta.block_ids.iter().enumerate() {
-                    for (j, &bid) in blocks.iter().enumerate() {
-                        if j < max_blocks_per_seq {
-                            block_table[i * max_blocks_per_seq + j] = bid as i32;
-                        }
+                // GPU-side gather for block table.
+                if let Some(ref gbt) = self.gpu_block_table {
+                    let batch_req_indices: Vec<usize> = meta
+                        .req_ids
+                        .iter()
+                        .map(|rid| self.req_idx_map.get(rid).copied().unwrap_or(0))
+                        .collect();
+                    unsafe {
+                        gbt.gather(&batch_req_indices, graph_bs, device.compute_stream)
                     }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("block table gather: {e}"))
+                    })?;
                 }
 
                 let runner = self.graph_runner.as_ref().unwrap();
@@ -7837,7 +7941,6 @@ impl CudaWorker {
                         &slot_mapping,
                         &cu_seqlens_q,
                         &seqused_k,
-                        &block_table,
                         device,
                         false,
                     )

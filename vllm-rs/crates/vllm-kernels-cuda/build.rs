@@ -56,6 +56,7 @@ fn cuda_build() {
         "../../crates/vllm-cuda/csrc/fp8_block_dequant_kernels.cu",
         "../../crates/vllm-cuda/csrc/fp8_post_scale_kernels.cu",
         "../../crates/vllm-cuda/csrc/gather_last_dim_kernel.cu",
+        "../../crates/vllm-cuda/csrc/block_table_kernels.cu",
     ];
     let vllm_watch = [
         "../../crates/vllm-cuda/csrc/vec_utils.cuh",

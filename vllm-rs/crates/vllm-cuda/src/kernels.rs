@@ -2147,6 +2147,52 @@ pub unsafe fn compute_cu_seqlens_k_gpu(
 }
 
 // ---------------------------------------------------------------------------
+// Block table gather (GPU-side reorder from persistent to input table)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn gather_block_table(
+        src: *const i32,
+        dst: *mut i32,
+        num_blocks: *const i32,
+        req_indices: *const i32,
+        src_stride: c_int,
+        dst_stride: c_int,
+        batch_size: c_int,
+        stream: CUstream,
+    );
+}
+
+/// GPU-side gather from persistent block table to input block table.
+///
+/// Copies only `num_blocks[req_idx]` entries per row, reordering from
+/// req_idx order to batch order via `req_indices` mapping.
+///
+/// # Safety
+/// All pointers must be valid GPU memory. CUDA context must be current.
+pub unsafe fn gather_block_table_gpu(
+    src: *const u8,
+    dst: *mut u8,
+    num_blocks: *const u8,
+    req_indices: *const u8,
+    src_stride: usize,
+    dst_stride: usize,
+    batch_size: usize,
+    stream: CUstream,
+) {
+    gather_block_table(
+        src as *const i32,
+        dst as *mut i32,
+        num_blocks as *const i32,
+        req_indices as *const i32,
+        src_stride as c_int,
+        dst_stride as c_int,
+        batch_size as c_int,
+        stream,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Reshape and Cache (write new K/V tokens into paged KV cache)
 // ---------------------------------------------------------------------------
 

@@ -33,6 +33,8 @@ pub use tensor::{GpuTensor, TensorView};
 #[cfg(feature = "cuda")]
 pub mod alloc;
 #[cfg(feature = "cuda")]
+pub mod block_table;
+#[cfg(feature = "cuda")]
 pub mod arena; // kept for backwards compat; not used in forward path
 #[cfg(feature = "cuda")]
 pub mod cpu_gpu_buf;

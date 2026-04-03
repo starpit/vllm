@@ -706,6 +706,42 @@ impl RmsNorm {
     // from vllm-kernels to accept GpuTensor raw pointers.
 }
 
+/// Standard LayerNorm with weight and optional bias.
+///
+/// Computes: `(x - mean) / sqrt(var + eps) * weight + bias`
+pub struct LayerNorm {
+    pub weight: GpuTensor,       // [hidden_size]
+    pub bias: Option<GpuTensor>, // [hidden_size] or None
+    pub eps: f32,
+}
+
+impl LayerNorm {
+    pub fn new(weight: GpuTensor, bias: Option<GpuTensor>, eps: f32) -> Self {
+        debug_assert_eq!(weight.ndim(), 1);
+        if let Some(ref b) = bias {
+            debug_assert_eq!(b.ndim(), 1);
+            debug_assert_eq!(b.dim(0), weight.dim(0));
+        }
+        Self { weight, bias, eps }
+    }
+
+    /// Load from `GpuWeights` by prefix. Loads bias if present.
+    pub fn load(weights: &mut GpuWeights, prefix: &str, eps: f32) -> Result<Self> {
+        let weight = weights.take(&format!("{prefix}.weight"))?;
+        let bias_name = format!("{prefix}.bias");
+        let bias = if weights.contains(&bias_name) {
+            Some(weights.take(&bias_name)?)
+        } else {
+            None
+        };
+        Ok(Self::new(weight, bias, eps))
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.weight.dim(0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tensor-parallel layer wrappers
 // ---------------------------------------------------------------------------

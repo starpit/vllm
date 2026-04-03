@@ -203,6 +203,10 @@ impl TestModels {
     // Tier 4: ~8 GB BF16 SafeTensors — Gemma3ForConditionalGeneration (Candle path)
     pub const GEMMA3_4B_IT: &str = "google/gemma-3-4b-it";
 
+    // ModernBERT — encoder-only (bidirectional attention, RoPE, GeGLU)
+    // ~430 MB safetensors, hidden_size=768, 22 layers
+    pub const MODERNBERT_BASE: &str = "answerdotai/ModernBERT-base";
+
     // Qwen2-VL multimodal (vision-language) models
     // Tier 3: ~3.8 GB BF16 SafeTensors — Candle path
     pub const QWEN2_VL_2B_INSTRUCT: &str = "unsloth/Qwen2-VL-2B-Instruct";

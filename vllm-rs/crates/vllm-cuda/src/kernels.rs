@@ -134,6 +134,70 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // LayerNorm with bias (standard nn.LayerNorm)
+    fn layer_norm_bias_f16(
+        out: *mut u16,
+        input: *const u16,
+        weight: *const u16,
+        bias: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn layer_norm_bias_bf16(
+        out: *mut u16,
+        input: *const u16,
+        weight: *const u16,
+        bias: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn layer_norm_bias_f32(
+        out: *mut f32,
+        input: *const f32,
+        weight: *const f32,
+        bias: *const f32,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+
+    // Fused add + LayerNorm with bias (in-place)
+    fn fused_add_layer_norm_bias_f16(
+        input: *mut u16,
+        residual: *mut u16,
+        weight: *const u16,
+        bias: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn fused_add_layer_norm_bias_bf16(
+        input: *mut u16,
+        residual: *mut u16,
+        weight: *const u16,
+        bias: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn fused_add_layer_norm_bias_f32(
+        input: *mut f32,
+        residual: *mut f32,
+        weight: *const f32,
+        bias: *const f32,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+
     // Fused QKV split + interleaved RoPE (Cohere convention: pairs at 2i, 2i+1)
     fn fused_qkv_interleaved_rope_f16(
         q: *mut u16,
@@ -1376,6 +1440,118 @@ pub unsafe fn fused_add_cohere_layer_norm_inplace(
         ),
         _ => panic!(
             "fused_add_cohere_layer_norm: unsupported dtype {:?}",
+            input.dtype()
+        ),
+    }
+
+    (input, residual)
+}
+
+// ---------------------------------------------------------------------------
+// LayerNorm with bias
+// ---------------------------------------------------------------------------
+
+/// Full LayerNorm with mean subtraction, weight and optional bias.
+///
+/// * `input`: `[num_tokens, hidden_size]`
+/// * `weight`: `[hidden_size]`
+/// * `bias`: `[hidden_size]`
+/// * Returns: `[num_tokens, hidden_size]` allocated from arena.
+pub unsafe fn layer_norm_bias(
+    input: GpuTensor,
+    weight: GpuTensor,
+    bias: GpuTensor,
+    eps: f32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let num_tokens = input.dim(0) as i32;
+    let hidden_size = input.dim(1) as i32;
+    let out = alloc.alloc_tensor(&[num_tokens as usize, hidden_size as usize], input.dtype());
+
+    match input.dtype() {
+        DType::F16 => layer_norm_bias_f16(
+            out.as_mut_ptr(),
+            input.as_ptr(),
+            weight.as_ptr(),
+            bias.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::BF16 => layer_norm_bias_bf16(
+            out.as_mut_ptr(),
+            input.as_ptr(),
+            weight.as_ptr(),
+            bias.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::F32 => layer_norm_bias_f32(
+            out.as_mut_ptr() as *mut f32,
+            input.as_ptr() as *const f32,
+            weight.as_ptr() as *const f32,
+            bias.as_ptr() as *const f32,
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        _ => panic!("layer_norm_bias: unsupported dtype {:?}", input.dtype()),
+    }
+    out
+}
+
+/// Fused add + LayerNorm with bias: `residual += input; normed = layernorm(residual) * weight + bias`
+///
+/// Mutates both `input` (becomes normed output) and `residual` (updated in-place).
+pub unsafe fn fused_add_layer_norm_bias_inplace(
+    input: GpuTensor,
+    residual: GpuTensor,
+    weight: GpuTensor,
+    bias: GpuTensor,
+    eps: f32,
+    stream: CUstream,
+) -> (GpuTensor, GpuTensor) {
+    let num_tokens = input.dim(0) as i32;
+    let hidden_size = input.dim(1) as i32;
+
+    match input.dtype() {
+        DType::F16 => fused_add_layer_norm_bias_f16(
+            input.as_mut_ptr(),
+            residual.as_mut_ptr(),
+            weight.as_ptr(),
+            bias.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::BF16 => fused_add_layer_norm_bias_bf16(
+            input.as_mut_ptr(),
+            residual.as_mut_ptr(),
+            weight.as_ptr(),
+            bias.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::F32 => fused_add_layer_norm_bias_f32(
+            input.as_mut_ptr() as *mut f32,
+            residual.as_mut_ptr() as *mut f32,
+            weight.as_ptr() as *const f32,
+            bias.as_ptr() as *const f32,
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        _ => panic!(
+            "fused_add_layer_norm_bias: unsupported dtype {:?}",
             input.dtype()
         ),
     }
@@ -11028,6 +11204,203 @@ mod tests_fused_qkv_rope_cache {
                     fused_vc[i]
                 );
             }
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LayerNorm bias kernel tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "cuda"))]
+mod layer_norm_bias_tests {
+    use super::*;
+    use crate::driver;
+
+    unsafe fn test_init() -> (CachingAllocator, CUstream) {
+        driver::init().expect("init");
+        let dev = driver::device_get(0).expect("dev");
+        let ctx = driver::ctx_create(dev).expect("ctx");
+        let stream = driver::stream_create().expect("stream");
+        let _ = ctx;
+        let alloc = CachingAllocator::new();
+        (alloc, stream)
+    }
+
+    unsafe fn upload_f32(data: &[f32], stream: CUstream) -> *mut u8 {
+        let nbytes = data.len() * 4;
+        let ptr = driver::mem_alloc(nbytes).expect("alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, nbytes, stream).expect("htod");
+        ptr
+    }
+
+    unsafe fn download_f32(ptr: *mut u8, count: usize, stream: CUstream) -> Vec<f32> {
+        let mut host = vec![0.0f32; count];
+        driver::memcpy_dtoh_async(host.as_mut_ptr() as *mut u8, ptr, count * 4, stream)
+            .expect("dtoh");
+        driver::stream_synchronize(stream).expect("sync");
+        host
+    }
+
+    /// Test layer_norm_bias: y = (x - mean) / sqrt(var + eps) * weight + bias
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_layer_norm_bias_f32() {
+        unsafe {
+            let (mut alloc, stream) = test_init();
+
+            // 2 tokens, hidden_size=4
+            let input_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let weight_data = [1.0f32, 1.0, 1.0, 1.0];
+            let bias_data = [0.1f32, 0.2, 0.3, 0.4];
+            let eps = 1e-5f32;
+
+            let input_ptr = upload_f32(&input_data, stream);
+            let weight_ptr = upload_f32(&weight_data, stream);
+            let bias_ptr = upload_f32(&bias_data, stream);
+            driver::stream_synchronize(stream).expect("sync");
+
+            let input = GpuTensor::new(input_ptr, &[2, 4], DType::F32);
+            let weight = GpuTensor::new(weight_ptr, &[4], DType::F32);
+            let bias = GpuTensor::new(bias_ptr, &[4], DType::F32);
+
+            let out = layer_norm_bias(input, weight, bias, eps, &mut alloc, stream);
+
+            let result = download_f32(out.raw_ptr(), 8, stream);
+
+            // Row 0: [1,2,3,4], mean=2.5, var=1.25, std=sqrt(1.25+eps)
+            let mean0 = 2.5f32;
+            let var0 = ((1.0 - mean0).powi(2) + (2.0 - mean0).powi(2)
+                + (3.0 - mean0).powi(2) + (4.0 - mean0).powi(2))
+                / 4.0;
+            let std0 = (var0 + eps).sqrt();
+            for i in 0..4 {
+                let expected = (input_data[i] - mean0) / std0 * weight_data[i] + bias_data[i];
+                assert!(
+                    (result[i] - expected).abs() < 1e-4,
+                    "row 0 elem {i}: got {}, expected {expected}",
+                    result[i]
+                );
+            }
+
+            // Row 1: [5,6,7,8], mean=6.5
+            let mean1 = 6.5f32;
+            let var1 = ((5.0 - mean1).powi(2) + (6.0 - mean1).powi(2)
+                + (7.0 - mean1).powi(2) + (8.0 - mean1).powi(2))
+                / 4.0;
+            let std1 = (var1 + eps).sqrt();
+            for i in 0..4 {
+                let expected =
+                    (input_data[4 + i] - mean1) / std1 * weight_data[i] + bias_data[i];
+                assert!(
+                    (result[4 + i] - expected).abs() < 1e-4,
+                    "row 1 elem {i}: got {}, expected {expected}",
+                    result[4 + i]
+                );
+            }
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+
+    /// Test fused_add_layer_norm_bias: residual += input; normed = LN(residual) * w + b
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_fused_add_layer_norm_bias_f32() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+
+            // 1 token, hidden_size=4
+            let input_data = [1.0f32, 2.0, 3.0, 4.0];
+            let residual_data = [0.5f32, 0.5, 0.5, 0.5];
+            let weight_data = [2.0f32, 2.0, 2.0, 2.0];
+            let bias_data = [0.1f32, 0.2, 0.3, 0.4];
+            let eps = 1e-5f32;
+
+            let input_ptr = upload_f32(&input_data, stream);
+            let residual_ptr = upload_f32(&residual_data, stream);
+            let weight_ptr = upload_f32(&weight_data, stream);
+            let bias_ptr = upload_f32(&bias_data, stream);
+            driver::stream_synchronize(stream).expect("sync");
+
+            let input = GpuTensor::new(input_ptr, &[1, 4], DType::F32);
+            let residual = GpuTensor::new(residual_ptr, &[1, 4], DType::F32);
+            let weight = GpuTensor::new(weight_ptr, &[4], DType::F32);
+            let bias = GpuTensor::new(bias_ptr, &[4], DType::F32);
+
+            let (normed, updated_res) =
+                fused_add_layer_norm_bias_inplace(input, residual, weight, bias, eps, stream);
+
+            // residual should be [1.5, 2.5, 3.5, 4.5]
+            let res_result = download_f32(updated_res.raw_ptr(), 4, stream);
+            for i in 0..4 {
+                let expected = input_data[i] + residual_data[i];
+                assert!(
+                    (res_result[i] - expected).abs() < 1e-5,
+                    "residual {i}: got {}, expected {expected}",
+                    res_result[i]
+                );
+            }
+
+            // normed should be LN([1.5, 2.5, 3.5, 4.5]) * 2.0 + bias
+            let mean: f32 = (1.5 + 2.5 + 3.5 + 4.5) / 4.0;
+            let var: f32 = ((1.5_f32 - mean).powi(2)
+                + (2.5_f32 - mean).powi(2)
+                + (3.5_f32 - mean).powi(2)
+                + (4.5_f32 - mean).powi(2))
+                / 4.0;
+            let std = (var + eps).sqrt();
+            let normed_result = download_f32(normed.raw_ptr(), 4, stream);
+            let res_vals = [1.5f32, 2.5, 3.5, 4.5];
+            for i in 0..4 {
+                let expected = (res_vals[i] - mean) / std * weight_data[i] + bias_data[i];
+                assert!(
+                    (normed_result[i] - expected).abs() < 1e-4,
+                    "normed {i}: got {}, expected {expected}",
+                    normed_result[i]
+                );
+            }
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+
+    /// Test layer_norm_bias with zero bias gives pure LN (zero-mean, unit-variance).
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_layer_norm_bias_zero_bias() {
+        unsafe {
+            let (mut alloc, stream) = test_init();
+
+            let input_data: Vec<f32> = (0..8).map(|i| (i as f32) * 0.5 + 1.0).collect();
+            let weight_data = vec![1.0f32; 8];
+            let bias_data = vec![0.0f32; 8];
+
+            let input_ptr = upload_f32(&input_data, stream);
+            let weight_ptr = upload_f32(&weight_data, stream);
+            let bias_ptr = upload_f32(&bias_data, stream);
+            driver::stream_synchronize(stream).expect("sync");
+
+            let input = GpuTensor::new(input_ptr, &[1, 8], DType::F32);
+            let weight = GpuTensor::new(weight_ptr, &[8], DType::F32);
+            let bias = GpuTensor::new(bias_ptr, &[8], DType::F32);
+
+            let out = layer_norm_bias(input, weight, bias, 1e-5, &mut alloc, stream);
+            let result = download_f32(out.raw_ptr(), 8, stream);
+
+            let mean: f32 = result.iter().sum::<f32>() / 8.0;
+            assert!(
+                mean.abs() < 1e-5,
+                "LN with zero bias should have ~zero mean, got {mean}"
+            );
+
+            let var: f32 = result.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / 8.0;
+            assert!(
+                (var - 1.0).abs() < 0.01,
+                "LN output variance should be ~1.0, got {var}"
+            );
 
             driver::stream_destroy(stream).expect("destroy");
         }

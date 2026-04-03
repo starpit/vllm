@@ -11,4 +11,5 @@ pub mod mixtral;
 pub mod qwen2;
 pub mod qwen2_moe;
 pub mod qwen3_moe;
+pub mod modernbert;
 pub mod qwen3_next;

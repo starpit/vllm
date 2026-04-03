@@ -14,6 +14,7 @@ pub mod gemma3;
 pub mod gemma3_mm;
 pub mod granite;
 pub mod llama;
+pub mod modernbert;
 pub mod mixtral;
 pub mod phi3;
 pub mod quantized_llama;
@@ -313,6 +314,9 @@ impl MlxModelRegistry {
             "Gemma3ForConditionalGeneration",
             gemma3_mm::create_mlx_quantized_gemma3_mm,
         );
+        // ModernBERT — encoder-only (bidirectional attention, RoPE, GeGLU, no KV cache)
+        registry.register("ModernBertModel", modernbert::create_mlx_modernbert);
+        registry.register("ModernBertForMaskedLM", modernbert::create_mlx_modernbert);
         // Granite (IBM) — LLaMA with embedding/residual/attention/logit multipliers
         registry.register_quantized("GraniteForCausalLM", granite::create_mlx_quantized_granite);
         // Phi-3 (fused qkv_proj + gate_up_proj)

@@ -79,3 +79,6 @@ version = "2.5.0"
 
 [dependencies.which]
 version = "7.0.0"
+
+[lints.clippy]
+all = "allow"

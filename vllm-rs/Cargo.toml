@@ -118,6 +118,10 @@ mlx-rs = { version = "0.25", features = ["metal", "accelerate", "safetensors"] }
 # Span query language
 spnl-core = { version = "0.22", default-features = false }
 
+# RAG / vector search
+leann-core = { version = "0.1", default-features = false }
+ndarray = "0.17"
+
 # HuggingFace Hub
 hf-hub = "0.4"
 indicatif = "0.17"

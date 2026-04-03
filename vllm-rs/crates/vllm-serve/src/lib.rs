@@ -10,6 +10,8 @@
 //! Port of: `vllm/entrypoints/openai/` (subset)
 
 pub mod anthropic;
+#[cfg(feature = "rag")]
+pub mod augment;
 pub mod chat_template;
 pub mod detokenizer;
 pub mod engine;

@@ -22,6 +22,7 @@ tls = ["vllm-serve/tls"]
 metrics = ["vllm-serve/metrics"]
 multiproc = ["vllm-serve/multiproc"]
 top = ["ratatui", "crossterm", "tokio-stream", "vllm-serve/top"]
+rag = ["vllm-serve/rag"]
 
 [[bin]]
 name = "vllm"

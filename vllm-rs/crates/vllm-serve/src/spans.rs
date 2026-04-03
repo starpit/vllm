@@ -530,6 +530,17 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
     // Try to parse as a full SpnlQuery first (supports nested generates).
     // Fall back to SingleGenerateQuery for backward compatibility.
     if let Ok(query) = serde_json::from_str::<SpnlQuery>(body) {
+        // RAG: index any Augment nodes, then rewrite them to retrieved fragments.
+        #[cfg(feature = "rag")]
+        let query = {
+            let aug_options = crate::augment::AugmentOptions::default();
+            crate::augment::index(&query, &aug_options)
+                .await
+                .map_err(|e| ServeError::Validation(format!("RAG indexing failed: {e}")))?;
+            optimize_augments(&query, &aug_options)
+                .await
+                .map_err(|e| ServeError::Validation(format!("RAG retrieval failed: {e}")))?
+        };
         return dispatch_spnl_query(state, &query, stream, tokenizer, template, &cfg, block_size)
             .await;
     }
@@ -671,7 +682,60 @@ fn query_variant_name(query: &SpnlQuery) -> &'static str {
         SpnlQuery::Bulk(_) => "Bulk",
         SpnlQuery::Message(_) => "Message",
         SpnlQuery::Zip(_) => "Zip",
+        #[cfg(feature = "rag")]
+        SpnlQuery::Augment(_) => "Augment",
     }
+}
+
+/// Recursively rewrite `Augment` nodes into `Plus(Message(...))` fragments
+/// by retrieving from the pre-built LEANN index.
+#[cfg(feature = "rag")]
+fn optimize_augments<'a>(
+    query: &'a SpnlQuery,
+    options: &'a crate::augment::AugmentOptions,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpnlQuery>> + Send + 'a>> {
+    Box::pin(async move {
+        match query {
+            SpnlQuery::Augment(a) => {
+                let fragments =
+                    crate::augment::retrieve(&a.embedding_model, &a.body, &a.doc, options).await?;
+                let fragment_nodes: Vec<SpnlQuery> = fragments
+                    .into_iter()
+                    .map(|s| SpnlQuery::Message(Message::User(s)))
+                    .collect();
+                Ok(SpnlQuery::Plus(fragment_nodes))
+            }
+            SpnlQuery::Generate(g) => {
+                let optimized_input = Box::new(optimize_augments(&g.input, options).await?);
+                Ok(SpnlQuery::Generate(Generate {
+                    metadata: g.metadata.clone(),
+                    input: optimized_input,
+                }))
+            }
+            SpnlQuery::Seq(v) => {
+                let mut out = Vec::with_capacity(v.len());
+                for child in v {
+                    out.push(optimize_augments(child, options).await?);
+                }
+                Ok(SpnlQuery::Seq(out))
+            }
+            SpnlQuery::Plus(v) => {
+                let mut out = Vec::with_capacity(v.len());
+                for child in v {
+                    out.push(optimize_augments(child, options).await?);
+                }
+                Ok(SpnlQuery::Plus(out))
+            }
+            SpnlQuery::Cross(v) => {
+                let mut out = Vec::with_capacity(v.len());
+                for child in v {
+                    out.push(optimize_augments(child, options).await?);
+                }
+                Ok(SpnlQuery::Cross(out))
+            }
+            other => Ok(other.clone()),
+        }
+    })
 }
 
 /// Execute a single (possibly n>1) generation from a tokenized span query.
@@ -969,7 +1033,11 @@ fn timed_generate(
             } else {
                 format!("{label}[{i}]")
             };
-            crate::llm::GenerateStep { label: lbl, output, elapsed_ms }
+            crate::llm::GenerateStep {
+                label: lbl,
+                output,
+                elapsed_ms,
+            }
         })
         .collect();
     Ok(crate::llm::QueryOutput { steps })
@@ -996,6 +1064,14 @@ pub(crate) fn execute_spnl_query_sync(
 
     // Try full SpnlQuery first (supports nested generates).
     if let Ok(query) = serde_json::from_str::<SpnlQuery>(spnl_json) {
+        #[cfg(feature = "rag")]
+        let query = {
+            let aug_options = crate::augment::AugmentOptions::default();
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(crate::augment::index(&query, &aug_options))
+                .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
+            rt.block_on(optimize_augments(&query, &aug_options))?
+        };
         return dispatch_spnl_query_sync(
             &query,
             params,

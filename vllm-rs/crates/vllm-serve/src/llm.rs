@@ -97,7 +97,11 @@ impl std::ops::Index<usize> for QueryOutput {
 impl QueryOutput {
     /// The final (outer) generate output.
     pub fn output(&self) -> &RequestOutput {
-        &self.steps.last().expect("QueryOutput must have at least one step").output
+        &self
+            .steps
+            .last()
+            .expect("QueryOutput must have at least one step")
+            .output
     }
     /// Inner generate steps (all but the last).
     pub fn inner_steps(&self) -> &[GenerateStep] {
@@ -106,7 +110,9 @@ impl QueryOutput {
     }
     /// The outer (final) step.
     pub fn outer_step(&self) -> &GenerateStep {
-        self.steps.last().expect("QueryOutput must have at least one step")
+        self.steps
+            .last()
+            .expect("QueryOutput must have at least one step")
     }
 }
 
@@ -456,6 +462,45 @@ impl LLM {
         volatile: bool,
     ) -> Result<Vec<RequestOutput>> {
         self.generate_impl(prompts, params, false, seal, volatile)
+    }
+
+    // -----------------------------------------------------------------------
+    // embed()
+    // -----------------------------------------------------------------------
+
+    /// Generate embedding vectors for one or more prompts.
+    ///
+    /// Accepts both text and pre-tokenized prompts via [`Prompt`], mirroring
+    /// Python vLLM's `LLM.embed()`. The model must support embeddings
+    /// (pooling mode).
+    ///
+    /// Returns one embedding vector per prompt.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use vllm_serve::llm::LLM;
+    /// # let mut llm = LLM::new("nomic-embed-text")?;
+    /// let embeddings = llm.embed(&["Hello world", "Another sentence"])?;
+    /// assert_eq!(embeddings.len(), 2);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn embed<P: Into<Prompt> + Clone>(&mut self, prompts: &[P]) -> Result<Vec<Vec<f32>>> {
+        let token_id_seqs: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| {
+                let prompt: Prompt = p.clone().into();
+                match prompt {
+                    Prompt::Text(text) => self.tokenize_text(&text),
+                    Prompt::TokenIds(ids) => Ok(ids),
+                    Prompt::TokenIdsWithAnnotations(ids, _) => Ok(ids),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.client
+            .embed(token_id_seqs)
+            .map_err(|e| anyhow::anyhow!("embed failed: {e}"))
     }
 
     /// Execute a SPNL span query (JSON string), using the same tokenization

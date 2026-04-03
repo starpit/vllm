@@ -141,8 +141,8 @@ pub struct InprocClient {
 
 /// Background executor thread state for pipelined execution.
 struct PipelineState {
-    sched_tx: std::sync::mpsc::SyncSender<SchedulerOutput>,
-    result_rx: std::sync::mpsc::Receiver<(SchedulerOutput, EngineResult<ModelRunnerOutput>)>,
+    sched_tx: std::sync::mpsc::SyncSender<PipelineMsg>,
+    result_rx: std::sync::mpsc::Receiver<PipelineResult>,
     /// Deferred (sched, model_output) from the previous step, to be finalized
     /// at the start of the next `get_output()` call.
     deferred: Option<(SchedulerOutput, ModelRunnerOutput)>,
@@ -151,17 +151,40 @@ struct PipelineState {
     _thread: std::thread::JoinHandle<()>,
 }
 
+/// Messages sent to the background executor thread.
+enum PipelineMsg {
+    /// Execute a model step.
+    Step(Box<SchedulerOutput>),
+    /// Compute embeddings (bypasses scheduler).
+    Embed(
+        Vec<Vec<u32>>,
+        std::sync::mpsc::SyncSender<EngineResult<Vec<Vec<f32>>>>,
+    ),
+}
+
+/// Results from the background executor thread.
+enum PipelineResult {
+    Step(Box<SchedulerOutput>, EngineResult<ModelRunnerOutput>),
+}
+
 /// Background executor thread loop: receives scheduler outputs, runs
 /// `execute_model`, and sends back results.
 fn executor_bg_loop(
     mut executor: Box<dyn Executor>,
-    rx: std::sync::mpsc::Receiver<SchedulerOutput>,
-    tx: std::sync::mpsc::SyncSender<(SchedulerOutput, EngineResult<ModelRunnerOutput>)>,
+    rx: std::sync::mpsc::Receiver<PipelineMsg>,
+    tx: std::sync::mpsc::SyncSender<PipelineResult>,
 ) {
-    while let Ok(sched) = rx.recv() {
-        let result = executor.execute_model(&sched);
-        if tx.send((sched, result)).is_err() {
-            break; // Main thread dropped its receiver.
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            PipelineMsg::Step(sched) => {
+                let result = executor.execute_model(&sched);
+                if tx.send(PipelineResult::Step(sched, result)).is_err() {
+                    break;
+                }
+            }
+            PipelineMsg::Embed(token_id_seqs, reply) => {
+                let _ = reply.send(executor.embed(token_id_seqs));
+            }
         }
     }
     executor.shutdown();
@@ -191,7 +214,7 @@ impl InprocClient {
         }
         if let Some(executor) = self.engine.take_executor() {
             info!("InprocClient: spawning background executor thread for pipelined execution");
-            let (sched_tx, sched_rx) = std::sync::mpsc::sync_channel::<SchedulerOutput>(2);
+            let (sched_tx, sched_rx) = std::sync::mpsc::sync_channel::<PipelineMsg>(2);
             let (result_tx, result_rx) = std::sync::mpsc::sync_channel(2);
             let thread = std::thread::Builder::new()
                 .name("vllm-executor".into())
@@ -276,7 +299,11 @@ impl InprocClient {
         // 2. Pre-schedule: fill pipeline up to 2 in-flight batches.
         while pipeline.gpu_in_flight < 2 {
             if let Some(sched) = engine.schedule_next() {
-                if pipeline.sched_tx.send(sched).is_err() {
+                if pipeline
+                    .sched_tx
+                    .send(PipelineMsg::Step(Box::new(sched)))
+                    .is_err()
+                {
                     return Err(EngineError::Executor("executor thread exited".into()));
                 }
                 pipeline.gpu_in_flight += 1;
@@ -287,10 +314,11 @@ impl InprocClient {
 
         // 3. Block on oldest GPU result.
         if pipeline.gpu_in_flight > 0 {
-            let (sched, result) = pipeline
+            let PipelineResult::Step(sched_box, result) = pipeline
                 .result_rx
                 .recv()
                 .map_err(|_| EngineError::Executor("executor thread exited".into()))?;
+            let sched = *sched_box;
             let model_output = result?;
             pipeline.deferred = Some((sched, model_output));
             pipeline.gpu_in_flight -= 1;
@@ -373,7 +401,19 @@ impl EngineCoreClient for InprocClient {
     }
 
     fn embed(&mut self, token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {
-        self.engine.embed(token_id_seqs)
+        if let Some(ref pipeline) = self.pipeline {
+            // Route through the background executor thread.
+            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+            pipeline
+                .sched_tx
+                .send(PipelineMsg::Embed(token_id_seqs, reply_tx))
+                .map_err(|_| EngineError::Executor("executor thread exited".into()))?;
+            reply_rx
+                .recv()
+                .map_err(|_| EngineError::Executor("executor thread exited".into()))?
+        } else {
+            self.engine.embed(token_id_seqs)
+        }
     }
 
     fn take_executor(&mut self) -> Option<Box<dyn Executor>> {

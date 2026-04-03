@@ -359,8 +359,12 @@ impl KernelBuilder {
             let content_hash = crate::hash::hash_file(kernel_file).unwrap_or_default();
 
             // Generate unique object file name (encodes content + args + arch)
-            let obj_file =
-                self.object_file_path(kernel_file, &content_hash, &args_hash, &gpu_arch.to_nvcc_arch());
+            let obj_file = self.object_file_path(
+                kernel_file,
+                &content_hash,
+                &args_hash,
+                &gpu_arch.to_nvcc_arch(),
+            );
             all_obj_files.push(obj_file.clone());
 
             // obj path encodes (content, args, arch) — if it exists, it's valid.

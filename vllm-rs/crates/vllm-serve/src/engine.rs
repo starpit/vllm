@@ -437,6 +437,23 @@ impl AsyncEngine {
         &self.model_name
     }
 
+    /// Compute embeddings synchronously by sending through the embed channel
+    /// and blocking on the reply. Panics if called outside a tokio runtime.
+    pub fn embed_sync(&self, token_id_seqs: Vec<Vec<u32>>) -> anyhow::Result<Vec<Vec<f32>>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.embed_tx
+            .send(EmbedRequest {
+                token_id_seqs,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("embed channel closed"))?;
+        // block_on the oneshot — we're inside spawn_blocking so this is fine
+        tokio::runtime::Handle::current()
+            .block_on(reply_rx)
+            .map_err(|_| anyhow::anyhow!("embed reply channel closed"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     /// Get the maximum model length.
     pub fn max_model_len(&self) -> usize {
         self.max_model_len

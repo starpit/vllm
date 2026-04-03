@@ -538,11 +538,27 @@ impl LLM {
         // during this call.
         let template = unsafe { &*template_ptr };
 
+        #[cfg(feature = "rag")]
+        let aug_options = {
+            let embedder: Option<std::sync::Arc<dyn crate::augment::embed::TokenEmbedder>> = self
+                .client
+                .embed_sender()
+                .map(|s| std::sync::Arc::new(s) as _);
+            crate::augment::AugmentOptions {
+                current_model: Some(self.model_name.clone()),
+                embedder,
+                tokenizer: self.tokenizer.clone(),
+                ..Default::default()
+            }
+        };
+
         crate::spans::execute_spnl_query_sync(
             spnl_json,
             params,
             seal,
             volatile,
+            #[cfg(feature = "rag")]
+            &aug_options,
             &tokenizer,
             template,
             &cfg,

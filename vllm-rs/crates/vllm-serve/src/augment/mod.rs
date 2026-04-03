@@ -1,4 +1,4 @@
-mod embed;
+pub(crate) mod embed;
 mod index;
 mod options;
 mod retrieve;

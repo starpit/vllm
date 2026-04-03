@@ -1,6 +1,41 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use ndarray::Array2;
 use spnl_core::ir::{Message, Query};
+
+use crate::tokenizer::Tokenizer;
+
+/// Trait for computing embeddings from token IDs — abstracts over
+/// pipeline-based (sync LLM) and channel-based (async server) paths.
+pub trait TokenEmbedder: Send + Sync {
+    fn embed_tokens(&self, token_id_seqs: Vec<Vec<u32>>) -> Result<Vec<Vec<f32>>>;
+}
+
+/// Pipeline-based embedder for the sync LLM path.
+impl TokenEmbedder for vllm_engine::core_client::EmbedSender {
+    fn embed_tokens(&self, token_id_seqs: Vec<Vec<u32>>) -> Result<Vec<Vec<f32>>> {
+        self.embed(token_id_seqs)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+/// Async engine embedder for the server path.
+pub struct AsyncEngineEmbedder {
+    engine: Arc<crate::engine::AsyncEngine>,
+}
+
+impl AsyncEngineEmbedder {
+    pub fn new(engine: Arc<crate::engine::AsyncEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+impl TokenEmbedder for AsyncEngineEmbedder {
+    fn embed_tokens(&self, token_id_seqs: Vec<Vec<u32>>) -> Result<Vec<Vec<f32>>> {
+        self.engine.embed_sync(token_id_seqs)
+    }
+}
 
 /// Extract text content from a Query tree for embedding.
 pub fn contentify(input: &Query) -> Vec<String> {
@@ -76,6 +111,78 @@ impl HttpEmbeddingProvider {
                     })
             })
             .collect()
+    }
+}
+
+/// An embedding provider that routes through the in-process vllm-rs engine.
+/// Used when the current engine serves the embedding model.
+pub struct InProcessEmbeddingProvider {
+    pub model: String,
+    pub dimensions: usize,
+    embedder: Arc<dyn TokenEmbedder>,
+    tokenizer: Arc<Tokenizer>,
+}
+
+impl InProcessEmbeddingProvider {
+    pub fn new(
+        model: String,
+        dimensions: usize,
+        embedder: Arc<dyn TokenEmbedder>,
+        tokenizer: Arc<Tokenizer>,
+    ) -> Self {
+        Self {
+            model,
+            dimensions,
+            embedder,
+            tokenizer,
+        }
+    }
+
+    /// Probe the in-process engine to detect embedding dimensions.
+    pub fn probe_dimensions(embedder: &dyn TokenEmbedder, tokenizer: &Tokenizer) -> Result<usize> {
+        let token_ids = tokenizer.encode("probe", false)?;
+        let vecs = embedder.embed_tokens(vec![token_ids])?;
+        vecs.first()
+            .map(|v| v.len())
+            .ok_or_else(|| anyhow::anyhow!("probe returned no embeddings"))
+    }
+}
+
+impl leann_core::embedding::EmbeddingProvider for InProcessEmbeddingProvider {
+    fn compute_embeddings(&self, chunks: &[String]) -> Result<Array2<f32>> {
+        // Tokenize each chunk
+        let token_id_seqs: Vec<Vec<u32>> = chunks
+            .iter()
+            .map(|text| {
+                self.tokenizer
+                    .encode(text, false)
+                    .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Embed via the in-process engine
+        let vecs = self.embedder.embed_tokens(token_id_seqs)?;
+
+        let nrows = vecs.len();
+        let ncols = self.dimensions;
+        let mut data = Vec::with_capacity(nrows * ncols);
+        for v in &vecs {
+            if v.len() < ncols {
+                data.extend_from_slice(v);
+                data.resize(data.len() + ncols - v.len(), 0.0);
+            } else {
+                data.extend_from_slice(&v[..ncols]);
+            }
+        }
+        Ok(Array2::from_shape_vec((nrows, ncols), data)?)
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    fn name(&self) -> &str {
+        &self.model
     }
 }
 

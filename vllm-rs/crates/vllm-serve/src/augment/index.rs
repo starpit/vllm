@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use spnl_core::ir::{Augment, Document, Generate, GenerateMetadata, Query};
 use tracing::info;
 
-use super::embed::HttpEmbeddingProvider;
+use super::embed::{HttpEmbeddingProvider, InProcessEmbeddingProvider};
 use super::options::AugmentOptions;
 
 /// Sanitize a name for use as a filesystem path component.
@@ -79,20 +79,30 @@ async fn process_document(
         "Indexing document for RAG augmentation"
     );
 
-    // Detect embedding dimensions
-    let dimensions = tokio::task::spawn_blocking({
-        let model = a.embedding_model.clone();
-        move || HttpEmbeddingProvider::probe_dimensions(&model)
-    })
-    .await??;
-
     let file_base_name = std::path::Path::new(filename)
         .file_name()
         .ok_or(anyhow!("Could not determine base name"))?
         .to_string_lossy()
         .to_string();
 
-    // Build LEANN index
+    // Build LEANN index — choose in-process or HTTP provider
+    let use_inprocess = options.can_embed_in_process(&a.embedding_model);
+
+    let dimensions = if use_inprocess {
+        let embedder = options.embedder.clone().unwrap();
+        let tokenizer = options.tokenizer.clone().unwrap();
+        tokio::task::spawn_blocking(move || {
+            InProcessEmbeddingProvider::probe_dimensions(&*embedder, &tokenizer)
+        })
+        .await??
+    } else {
+        tokio::task::spawn_blocking({
+            let model = a.embedding_model.clone();
+            move || HttpEmbeddingProvider::probe_dimensions(&model)
+        })
+        .await??
+    };
+
     let mut builder = leann_core::LeannBuilder::new(&a.embedding_model, Some(dimensions), "spnl")
         .with_recompute(false)
         .with_compact(false);
@@ -110,11 +120,23 @@ async fn process_document(
 
     let embedding_model = a.embedding_model.clone();
     let index_path_clone = index_path.clone();
-    tokio::task::spawn_blocking(move || {
-        let provider = HttpEmbeddingProvider::new(&embedding_model, dimensions);
-        builder.build_index(&index_path_clone, &provider)
-    })
-    .await??;
+
+    if use_inprocess {
+        let embedder = options.embedder.clone().unwrap();
+        let tokenizer = options.tokenizer.clone().unwrap();
+        tokio::task::spawn_blocking(move || {
+            let provider =
+                InProcessEmbeddingProvider::new(embedding_model, dimensions, embedder, tokenizer);
+            builder.build_index(&index_path_clone, &provider)
+        })
+        .await??;
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let provider = HttpEmbeddingProvider::new(&embedding_model, dimensions);
+            builder.build_index(&index_path_clone, &provider)
+        })
+        .await??;
+    }
 
     // Mark as done
     std::fs::OpenOptions::new()

@@ -151,6 +151,27 @@ struct PipelineState {
     _thread: std::thread::JoinHandle<()>,
 }
 
+/// A cloneable, Send+Sync handle for computing embeddings via the
+/// background executor pipeline. Obtained from [`InprocClient::embed_sender`].
+#[derive(Clone)]
+pub struct EmbedSender {
+    tx: std::sync::mpsc::SyncSender<PipelineMsg>,
+}
+
+impl EmbedSender {
+    /// Compute embeddings for the given token ID sequences.
+    /// Blocks until the executor thread returns the result.
+    pub fn embed(&self, token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .send(PipelineMsg::Embed(token_id_seqs, reply_tx))
+            .map_err(|_| EngineError::Executor("executor thread exited".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| EngineError::Executor("executor thread exited".into()))?
+    }
+}
+
 /// Messages sent to the background executor thread.
 enum PipelineMsg {
     /// Execute a model step.
@@ -228,6 +249,14 @@ impl InprocClient {
                 _thread: thread,
             });
         }
+    }
+
+    /// Get an [`EmbedSender`] for computing embeddings via the pipeline.
+    /// Returns `None` if the pipeline has not been started.
+    pub fn embed_sender(&self) -> Option<EmbedSender> {
+        self.pipeline.as_ref().map(|p| EmbedSender {
+            tx: p.sched_tx.clone(),
+        })
     }
 
     /// Get a reference to the inner engine core.

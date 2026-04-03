@@ -65,14 +65,28 @@ pub async fn retrieve(
     let passages = PassageManager::load(&[passage_source], None)?;
     let id_map = load_id_map(&paths.id_map_path())?;
 
-    // Embed the query body
+    // Embed the query body — in-process if model matches, otherwise HTTP
     let body_texts = contentify(body);
-    let embedding_model_owned = embedding_model.to_string();
-    let body_vectors: Vec<Vec<f32>> = tokio::task::spawn_blocking(move || {
-        let provider = HttpEmbeddingProvider::new(&embedding_model_owned, 0);
-        provider.call_api(&body_texts)
-    })
-    .await??;
+    let body_vectors: Vec<Vec<f32>> = if options.can_embed_in_process(embedding_model) {
+        let embedder = options.embedder.clone().unwrap();
+        let tokenizer = options.tokenizer.clone().unwrap();
+        tokio::task::spawn_blocking(move || {
+            let token_id_seqs: Vec<Vec<u32>> = body_texts
+                .iter()
+                .map(|text| tokenizer.encode(text, false))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+            embedder.embed_tokens(token_id_seqs)
+        })
+        .await??
+    } else {
+        let embedding_model_owned = embedding_model.to_string();
+        tokio::task::spawn_blocking(move || {
+            let provider = HttpEmbeddingProvider::new(&embedding_model_owned, 0);
+            provider.call_api(&body_texts)
+        })
+        .await??
+    };
 
     // Search for each query vector
     let params = SearchParams::default();

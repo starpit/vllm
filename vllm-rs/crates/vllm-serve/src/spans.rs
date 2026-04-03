@@ -533,7 +533,14 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
         // RAG: index any Augment nodes, then rewrite them to retrieved fragments.
         #[cfg(feature = "rag")]
         let query = {
-            let aug_options = crate::augment::AugmentOptions::default();
+            let aug_options = crate::augment::AugmentOptions {
+                current_model: Some(state.engine.model_name().to_string()),
+                embedder: Some(std::sync::Arc::new(
+                    crate::augment::embed::AsyncEngineEmbedder::new(state.engine.clone()),
+                )),
+                tokenizer: state.engine.tokenizer().cloned(),
+                ..Default::default()
+            };
             crate::augment::index(&query, &aug_options)
                 .await
                 .map_err(|e| ServeError::Validation(format!("RAG indexing failed: {e}")))?;
@@ -1049,6 +1056,7 @@ pub(crate) fn execute_spnl_query_sync(
     params: Option<vllm_common::SamplingParams>,
     seal: bool,
     volatile: bool,
+    #[cfg(feature = "rag")] aug_options: &crate::augment::AugmentOptions,
     tokenizer: &Arc<Tokenizer>,
     template: &crate::chat_template::ChatTemplate,
     cfg: &SpanConfig,
@@ -1066,11 +1074,10 @@ pub(crate) fn execute_spnl_query_sync(
     if let Ok(query) = serde_json::from_str::<SpnlQuery>(spnl_json) {
         #[cfg(feature = "rag")]
         let query = {
-            let aug_options = crate::augment::AugmentOptions::default();
             let rt = tokio::runtime::Handle::current();
-            rt.block_on(crate::augment::index(&query, &aug_options))
+            rt.block_on(crate::augment::index(&query, aug_options))
                 .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
-            rt.block_on(optimize_augments(&query, &aug_options))?
+            rt.block_on(optimize_augments(&query, aug_options))?
         };
         return dispatch_spnl_query_sync(
             &query,

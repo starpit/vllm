@@ -1,10 +1,10 @@
 # vLLM Feature Parity: Python vs Rust
 
-> Last updated: 2026-03-14
+> Last updated: 2026-04-03
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ 🟦 | Implemented | 160 |
+| ✅ 🟦 | Implemented | 162 |
 | ⚠️ 🟨 | Partial | 11 |
 | ❌ 🟥 | Not implemented | 100 |
 | 🚫 | Won't fix | 4 |
@@ -23,7 +23,7 @@
 | [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 10 | 0 | 3 |
 | [Other API Protocols](#other-api-protocols) | 🟦🟦🟥🟥🟥🟥🟥 | 2 | 0 | 5 |
 | [Model Architectures — Decoder-Only LLMs](#model-architectures--decoder-only-llms) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 13 | 2 | 9 |
-| [Model Architectures — Encoder / Embedding](#model-architectures--encoder--embedding) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
+| [Model Architectures — Encoder / Embedding](#model-architectures--encoder--embedding) | 🟦🟥🟥🟥🟥 | 1 | 0 | 4 |
 | [Model Architectures — Vision-Language / Multimodal](#model-architectures--vision-language--multimodal) | 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 0 | 0 | 11 |
 | [Model Architectures — Audio / Speech](#model-architectures--audio--speech) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
 | [Model Architectures — Speculative Decoding Draft Models](#model-architectures--speculative-decoding-draft-models) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
@@ -37,13 +37,13 @@
 | [LoRA & Adapters](#lora--adapters) | 🟦🟦🟥🟥🟥🟥 | 2 | 0 | 4 |
 | [Speculative Decoding](#speculative-decoding) | 🟦🟥🟥🟥🟥🟥 | 1 | 0 | 5 |
 | [Multimodal Input](#multimodal-input) | 🟥🟥🟥🟥🟥 | 0 | 0 | 5 |
-| [Embeddings & Pooling](#embeddings--pooling) | 🟦🟦🟦🟦🟥🟥🟥 | 4 | 0 | 3 |
+| [Embeddings & Pooling](#embeddings--pooling) | 🟦🟦🟦🟦🟦🟥🟥🟥 | 5 | 0 | 3 |
 | [Serving Features](#serving-features) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 10 | 0 | 3 |
 | [Performance Optimizations](#performance-optimizations) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥 | 9 | 1 | 3 |
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥 | 22 | 1 | 3 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟦 | 8 | 0 | 0 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **160** | **11** | **100** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **162** | **11** | **100** |
 
 ---
 
@@ -147,7 +147,7 @@
 | Phi-3 / Phi-4 | ✅ | ✅ | ✅ | LLaMA alias in CudaWorker; LongRoPE for Phi-4 |
 | Gemma 2 | ✅ | ✅ | ✅ |  |
 | Gemma 3 (text-only) | ✅ | ✅ | ✅ | CUDA graphs supported; Gemma3ForConditionalGeneration resolved as text-only via text_config |
-| DeepSeek V2 / V3 (MLA + MoE) | ✅ | ⚠️ | ✅ | V2/V2-Lite at parity (non-absorbed MLA + 6 CUDA kernels + YaRN RoPE); V3 gaps: grouped top-k routing + sigmoid scoring + e_score_correction_bias + noaux_tc routing |
+| DeepSeek V2 / V3 (MLA + MoE) | ✅ | ⚠️ | ✅ | V2/V2-Lite at parity (non-absorbed MLA + 6 CUDA kernels + YaRN RoPE); FP8 MoE (expert weights as FP8 E4M3 via Fp8FusedMoELayer; attention projections remain BF16 Linear — no FP8 MLA yet); GGUF quantized MoE (expert weights stay compressed via indexed_moe_forward kernels; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q6K); V3 gaps: grouped top-k routing + sigmoid scoring + e_score_correction_bias + noaux_tc routing; FP8 gaps: FP8 attention projections (MLA q_a/q_b/kv_a/kv_b/o_proj use plain Linear not Fp8Linear); FP8 dense MLP layers (first_k_dense_replace layers use load_fused not load_fp8) |
 | Command R (Cohere) | ✅ | ✅ | ✅ | BNB 4-bit verified on L40S |
 | Qwen2 MoE | ✅ | ✅ | ✅ | MoE + shared expert (gated) |
 | Qwen3 MoE | ✅ | ✅ | ✅ | MoE + shared expert + QK-norm |
@@ -174,7 +174,8 @@
 | BERT | ✅ | ❌ |  |
 | ModernBERT | ✅ | ❌ |  |
 | RoBERTa | ✅ | ❌ |  |
-| ColBERT / ColQwen3 | ✅ | ❌ | Late-interaction rerankers |
+| ColBERT (BERT-based) | ✅ | ❌ | Requires BERT encoder arch |
+| ColQwen3 | ✅ | ✅ | Qwen2 arch + AllTokens pooling |
 
 ---
 
@@ -222,14 +223,14 @@
 
 | Method | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| GGUF (all k-quant variants) | ✅ | ✅ | llama.cpp-derived dequant kernels; BS=1 fused dequant-matvec + BS>1 Q8_1 dot products; archs: LLaMA/Qwen2/Qwen3; E2E: Qwen2.5-0.5B + Qwen3-0.6B GGUF; CUDA graphs disabled (incompatible with dynamic allocs) |
+| GGUF (all k-quant variants) | ✅ | ✅ | llama.cpp-derived dequant kernels; BS=1 fused dequant-matvec + BS>1 Q8_1 dot products; archs: LLaMA/Qwen2/Qwen3/DeepSeekV2; quantized MoE via indexed_moe_forward kernels (expert weights stay compressed); E2E: Qwen2.5-0.5B + Qwen3-0.6B + DeepSeek-V2-Lite GGUF; CUDA graphs disabled (incompatible with dynamic allocs) |
 | GGUF IQ quants (importance-matrix) | ✅ | ⚠️ | IQ4_NL + IQ4_XS done (Phase 1); remaining: IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S; llama.cpp-derived lookup-table dequant kernels |
 | GPTQ | ✅ | ✅ | Marlin W4A16 on SM80+; symmetric + desc_act (activation ordering); fused QKV/gate_up at load; post-GEMM bias_add_inplace for linear bias; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; note: asymmetric zero-points not passed (uint4b8 bakes in zp like Python vLLM) |
 | AWQ | ✅ | ✅ | Marlin W4A16 on SM80+; fused QKV/gate_up at load; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; E2E verified Qwen2.5-0.5B |
 | BitsAndBytes NF4 (4-bit) | ✅ | ✅ | Dequant-then-cuBLAS GEMM; double quantization supported; per-shard matmuls for QKV and gate/up; archs: LLaMA/Qwen2/Gemma2 (+ aliases Mistral/Qwen3/Phi-3/Granite); E2E verified unsloth/Qwen3-0.6B-bnb-4bit |
-| Quantized MoE (FP8/INT8/INT4 experts) | ✅ | ⚠️ | INT4 MoE: Marlin MoE W4A16 kernel (AWQ/GPTQ) for Qwen3MoE/Qwen2MoE/Mixtral with dynamic moe_block_size [8/16]; FP8 MoE: fused_moe_fp8_gemm kernel with per-token activation scales + per-expert weight scales (dequant-to-BF16 compute path for SM80+; FP8 storage → 2x bandwidth savings); Fp8FusedMoELayer + Fp8SharedFusedMoELayer wired into Mixtral/Qwen2MoE/Qwen3MoE/DeepSeekV2; load_fp8_moe_experts with scale merging (max gate/up per expert); E2E verified fxmarty/Mixtral-8x7B-FP8-2-layers. TODO: native SM89+ FP8 tensor core mma.m16n8k32 PTX (parked — 0.5x output bug in fragment layout; would give 2x compute on top of 2x bandwidth); block-quantized FP8 MoE (DeepSeek-V3 per-block weight_block_size scales); INT8 W8A8 MoE experts (Marlin INT8 MoE kernel); per-channel FP8 MoE scales (w_scale shape [E x N] instead of [E]); moe_block_size 32/48/64 for large-batch prefill; FP8 MoE + CUDA graphs (needs pre-allocated FP8 activation/scale buffers) |
+| Quantized MoE (FP8/INT8/INT4 experts) | ✅ | ⚠️ | INT4 MoE: Marlin MoE W4A16 kernel (AWQ/GPTQ) for Qwen3MoE/Qwen2MoE/Mixtral with dynamic moe_block_size [8/16]; FP8 MoE (per-tensor): fused_moe_fp8_gemm kernel with per-token activation scales + per-expert weight scales (dequant-to-BF16 compute path for SM80+; FP8 storage → 2x bandwidth savings); Fp8FusedMoELayer + Fp8SharedFusedMoELayer wired into Mixtral/Qwen2MoE/Qwen3MoE/DeepSeekV2; load_fp8_moe_experts with scale merging (max gate/up per expert); FP8 MoE (block-quantized): fused_moe_fp8_block_dequant_wmma kernel applies per-block weight scales [E ceil(N/bn) ceil(K/bk)] during FP8→BF16 dequant in shared memory; Fp8BlockFusedMoELayer with 3D block scale tensors; load_fp8_block_moe_experts stacks expert weights + scales with TP sharding; TP support: attention/MLP via load_fp8_block_tp (QKV dim=0 + O dim=1 sharding of weights and block scales); verified Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 with TP=2; CUDA graphs supported; E2E verified fxmarty/Mixtral-8x7B-FP8-2-layers. TODO: native SM89+ FP8 tensor core mma.m16n8k32 PTX (parked — 0.5x output bug in fragment layout; would give 2x compute on top of 2x bandwidth); INT8 W8A8 MoE experts (Marlin INT8 MoE kernel); per-channel FP8 MoE scales (w_scale shape [E x N] instead of [E]) |
 | MLX 4-bit quantized | N/A | ✅ | Rust-only; mlx-community models |
-| FP8 (W8A8 / W8A16) | ✅ | ⚠️ | SM89 W8A8 per-tensor + per-channel via fused CUTLASS cutlass_scaled_mm (c2x EVT epilogue with per-row scale_a / per-tensor scale_b); dynamic activation quantization (scaled_fp8_quant kernel); static activation quantization (pre-calibrated input_scale); compressed-tensors float8 config detection; E2E verified: Qwen2.5-0.5B-FP8 + LLaMA-3.1-8B-FP8. TODO: SM90+ Hopper CUTLASS 3.x c3x kernels (CollectiveMainloop/CollectiveEpilogue — completely different API from c2x); SM100/SM120 Blackwell kernels (scaled_mm_c3x_sm100); block-quantized FP8 GEMM (DeepSeek-V3 weight_block_size — currently dequant-to-BF16 fallback); FP8 + CUDA graphs (needs pre-allocated FP8 activation/scale buffers during graph capture); FP8 W8A16 weight-only (no activation quantization); online FP8 weight quantization (BF16→FP8 at load time for non-serialized checkpoints); Marlin FP8 fallback for SM<89; FP8 E5M2 dtype (only E4M3 implemented); bias epilogue fusion (ScaledEpilogueBias variants); AZP asymmetric zero-point epilogue (ScaledEpilogueAZP for INT8) |
+| FP8 (W8A8 / W8A16) | ✅ | ⚠️ | SM89 W8A8 per-tensor + per-channel via fused CUTLASS cutlass_scaled_mm (c2x EVT epilogue with per-row scale_a / per-tensor scale_b); dynamic activation quantization (scaled_fp8_quant kernel); static activation quantization (pre-calibrated input_scale); compressed-tensors float8 config detection; block-quantized FP8 (weight_block_size=[128 128]): Fp8BlockLinear with 2D block scale (weight_scale_inv or weight_scale fallback) dequant-to-BF16 + cuBLAS GEMM; fused QKV/gate_up block loading + TP sharding (load_fused_fp8_block_linear_tp); per-tensor FP8 + TP: load_fused_fp8_linear_tp (column-parallel QKV/gate_up with max-scale merge + re-quantize) and load_fp8_linear_tp (row-parallel O/down); TP wired for Llama/Mistral/Qwen3/Phi3/Qwen2/Granite/Gemma2 (both per-tensor and block FP8); CUDA graphs supported (cudaMallocAsync workspace allocation); E2E verified: Qwen2.5-0.5B-FP8 + LLaMA-3.1-8B-Instruct-FP8 (per-tensor + TP=2) + Llama-3.3-70B-Instruct-FP8-Dynamic (per-tensor + TP=2) + Llama-3.3-70B-Instruct-FP8-Block (block + TP=2) + Qwen3-Coder-30B-A3B-Instruct-FP8 (block FP8 + TP=2). TODO: SM90+ Hopper CUTLASS 3.x c3x kernels (CollectiveMainloop/CollectiveEpilogue — completely different API from c2x); SM100/SM120 Blackwell kernels (scaled_mm_c3x_sm100); native block-scaled FP8 GEMM kernel (cutlass_block_fp8 / deep_gemm — currently dequant-to-BF16 fallback for dense layers); FP8 + TP for remaining archs (Mixtral-MoE Qwen2Moe CommandR); FP8 W8A16 weight-only (no activation quantization); online FP8 weight quantization (BF16→FP8 at load time for non-serialized checkpoints); Marlin FP8 fallback for SM<89; FP8 E5M2 dtype (only E4M3 implemented); bias epilogue fusion (ScaledEpilogueBias variants); AZP asymmetric zero-point epilogue (ScaledEpilogueAZP for INT8) |
 | Marlin kernels (AWQ/GPTQ) | ✅ | ✅ | W4A16 dense + MoE; auto-converts at load on SM80+; use_fp32_reduce matches Python default; MoE: Marlin MoE WNA16 kernel with fused expert routing + topk weight multiply |
 | Compressed-tensors (Neural Magic) | ✅ | ⚠️ | FP8 float8 subset only: config detection (config_groups parsing) + weight/scale loading for RedHatAI/neuralmagic models with per-channel BF16→f32 scale conversion. TODO: INT8 W8A8 quantized weights; INT4/W4A16 quantized weights; mixed-precision compressed-tensors (different groups with different quant configs); sparse compressed-tensors (2:4 sparsity); activation quantization strategies beyond dynamic/static; group quantization (per-group scales); compressed-tensors with actorder |
 | TorchAO (int4/int8/fp8) | ✅ | ❌ |  |
@@ -247,7 +248,7 @@
 | ~~Scaled dot-product (CPU)~~ | ✅ | ❌ | 🚫 Won't fix — Removed with CandleWorker |
 | FlashAttention-2 (single sequence) | ✅ | ✅ | CudaWorker: direct FFI |
 | FlashAttention-2 varlen (batched prefill) | ✅ | ❌ | Removed with CandleWorker |
-| Paged FlashAttention-2 (all batches) | ✅ | ✅ | CudaWorker: direct FFI to vllm-flash-attn fork; prefill + decode + mixed |
+| Paged FlashAttention-2 (all batches) | ✅ | ✅ | CudaWorker: direct FFI to vllm-flash-attn fork; prefill + decode + mixed; Q buffer padded +128 rows for splitkv unconditional vectorized loads (PyTorch over-allocates so Python never needs this); seqlenq_ngroups_swapped disabled (requires per-batch Q/output padding to seqlen_q_rounded — TODO) |
 | FlashAttention-3 | ✅ | ❌ |  |
 | FlashInfer | ✅ | ❌ |  |
 | Triton attention | ✅ | ❌ |  |
@@ -410,6 +411,7 @@
 | Pooling: last token | ✅ | ✅ |  |
 | Pooling: CLS token | ✅ | ✅ |  |
 | Pooling: mean | ✅ | ✅ |  |
+| Pooling: all tokens (ColBERT) | ✅ | ✅ | Per-token embeddings for late-interaction models |
 | Cross-encoder scoring | ✅ | ❌ |  |
 | Reranking | ✅ | ❌ |  |
 | Classification head | ✅ | ❌ |  |
@@ -441,7 +443,7 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| CUDA graphs (decode) | ✅ | ✅ | CudaWorker: BS=[1-32] with batch padding + in-graph argmax; MoE compatible; FP8 KV cache compatible (pre-allocated dequant buffers) |
+| CUDA graphs (decode) | ✅ | ✅ | CudaWorker: BS=[1-32] with batch padding + in-graph argmax; MoE compatible; FP8 KV cache compatible (pre-allocated dequant buffers); FP8 weights compatible (cudaMallocAsync workspace) |
 | Fused RMS norm + residual add | ✅ | ✅ | CUDA kernel; vectorized 128-bit loads |
 | Fused rotary embeddings | ✅ | ✅ | CUDA kernel |
 | Fused MoE gating (top-k) | ✅ | ✅ | TRT-LLM topk_softmax kernel with GpuTensor FFI |
@@ -470,9 +472,10 @@
 | Paged attention v1/v2 (PagedAttention) | ✅ | ❌ |  |
 | `silu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |
 | `gelu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |
-| Fused MoE GEMM | ✅ | ✅ | WMMA tensor-core kernel (128/128/32); BF16/F16 + FP8 E4M3 (dequant-to-BF16 compute with per-token a_scale × per-expert w_scale epilogue); perf gaps vs Triton: fixed tile sizes (2-3x some shapes) + WMMA vs native mma PTX (10-30%) + no GROUP_SIZE_M L2 grouping + no chunked processing (OOM risk large batches); FP8 gap: SM89 native mma.m16n8k32.e4m3 PTX parked (0.5x output bug) |
+| Fused MoE GEMM | ✅ | ✅ | WMMA tensor-core kernel; BF16/F16/FP8-dequant: variable BLOCK_M (16/32/64/128) selected per-batch via tokens-per-expert heuristic (matches Python vLLM get_default_config) with warp redistribution across M×N to keep all 8 warps active; GROUP_SIZE_M=8 L2 locality swizzle (matches Python vLLM); FP8 per-tensor: dequant-to-BF16 compute with per-token a_scale × per-expert w_scale epilogue; FP8 block-quantized: fused_moe_fp8_block_dequant_wmma applies 3D per-block weight scales [E ceil(N/bn) ceil(K/bk)] during B-tile FP8→BF16 dequant in shared memory (w_scale folded into dequant; epilogue only applies a_scale); perf gaps vs Triton: WMMA vs native mma PTX (10-30%) + no chunked processing (OOM risk large batches); FP8 gap: SM89 native mma.m16n8k32.e4m3 PTX parked (0.5x output bug) |
 | Marlin (INT4 GEMM) | ✅ | ✅ | W4A16 fused dequant+GEMM; 270 kernel instantiations (FP16/BF16 × GPTQ/AWQ); use_fp32_reduce=true |
 | GGUF dequant kernels (k-quants) | ✅ | ✅ | llama.cpp-derived; BS=1 fused dequant-matvec + BS>1 Q8_1 dot products; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q8K |
+| GGUF quantized MoE (indexed_moe_forward) | ❌ | ✅ | Expert routing via index array (blockIdx.y=batch blockIdx.z=topk); Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q6K × Q8_1 input; avoids dequantizing expert weights to dense |
 | BitsAndBytes NF4 dequant | ✅ | ✅ | Dequant-then-cuBLAS; double quantization supported; shared dequant scratch buffer |
 | Embedding gather | ❌ | ✅ | Vectorized CUDA kernel |
 | Split QKV | ❌ | ✅ | Separates fused QKV tensor on GPU |
@@ -491,7 +494,7 @@
 | Fused recurrent GDN kernel | ❌ | ✅ | Qwen3-Next gated delta rule (fused_recurrent_gated_delta_rule) |
 | QKVZ grouped-head split | ❌ | ✅ | Eliminates 8 CPU round-trips per GDN layer |
 | Conv output split | ❌ | ✅ | Eliminates 3 CPU round-trips per GDN layer |
-| FP8 GEMM | ✅ | ⚠️ | SM89 fused CUTLASS 2.x cutlass_scaled_mm with Epilogue Visitor Tree (ScaledEpilogue: VisitorColOrScalarBroadcast for per-row/per-tensor scale_a + VisitorRowOrScalarBroadcast for per-tensor scale_b); 18 tile configs (M16/M32/M64/M128/M256/default × N-range sub-dispatch) matching Python exactly; cublasLt FP8 GEMM fallback; dynamic per-token scaled_fp8_quant kernel. TODO: SM90+ Hopper CUTLASS 3.x c3x kernels (scaled_mm_c3x.cu — CollectiveMainloop/CollectiveEpilogue with TMA; completely different codegen from c2x); SM100/SM120 Blackwell kernels (scaled_mm_c3x_sm100.cu); block-scaled FP8 GEMM kernel (cutlass_block_fp8 / deep_gemm for DeepSeek-V3 weight_block_size); ScaledEpilogueBias variants (bias fused into CUTLASS epilogue); ScaledEpilogueAZP variants (asymmetric zero-point for INT8); INT8 data type support in cutlass_scaled_mm; FP8 E5M2 data type |
+| FP8 GEMM | ✅ | ⚠️ | SM89 fused CUTLASS 2.x cutlass_scaled_mm with Epilogue Visitor Tree (ScaledEpilogue: VisitorColOrScalarBroadcast for per-row/per-tensor scale_a + VisitorRowOrScalarBroadcast for per-tensor scale_b); 18 tile configs (M16/M32/M64/M128/M256/default × N-range sub-dispatch) matching Python exactly; cublasLt FP8 GEMM fallback; dynamic per-token scaled_fp8_quant kernel; CUDA graphs supported (cudaMallocAsync workspace allocation). TODO: SM90+ Hopper CUTLASS 3.x c3x kernels (scaled_mm_c3x.cu — CollectiveMainloop/CollectiveEpilogue with TMA; completely different codegen from c2x); SM100/SM120 Blackwell kernels (scaled_mm_c3x_sm100.cu); block-scaled FP8 GEMM kernel (cutlass_block_fp8 / deep_gemm for DeepSeek-V3 weight_block_size); ScaledEpilogueBias variants (bias fused into CUTLASS epilogue); ScaledEpilogueAZP variants (asymmetric zero-point for INT8); INT8 data type support in cutlass_scaled_mm; FP8 E5M2 data type |
 | Prefix caching hash kernel | ✅ | ❌ |  |
 | Custom all-reduce | ✅ | ❌ |  |
 

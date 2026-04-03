@@ -24,8 +24,8 @@ pub mod telemetry;
 // instead of `use vllm_common::sampling::SamplingParams;`.
 
 pub use engine_io::{
-    EngineCoreEvent, EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
-    FinishReason, SchedulerStats, SpecDecodingStats, StopReason,
+    EmbeddingData, EngineCoreEvent, EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs,
+    EngineCoreRequest, FinishReason, SchedulerStats, SpecDecodingStats, StopReason,
 };
 pub use error::{VllmError, VllmResult};
 pub use multimodal::MultimodalData;

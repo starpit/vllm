@@ -906,6 +906,7 @@ mod tests {
     use super::*;
     use crate::executor::NoopExecutor;
     use vllm_common::SamplingParams;
+    use vllm_common::engine_io::EmbeddingData;
     use vllm_config::SchedulerPolicy;
 
     fn make_test_config() -> EngineCoreConfig {
@@ -1616,7 +1617,7 @@ mod tests {
         let scheduler_output = engine.scheduler.schedule();
 
         // Simulate a model output with pooler_output.
-        let embedding = vec![0.1, 0.2, 0.3, 0.4];
+        let embedding = EmbeddingData::Single(vec![0.1, 0.2, 0.3, 0.4]);
         let mut pooler_output = HashMap::new();
         pooler_output.insert("pool-1".to_string(), embedding.clone());
 
@@ -1647,6 +1648,55 @@ mod tests {
         assert!(req_out.new_token_ids.is_empty());
         // Should have the embedding vector.
         assert_eq!(req_out.pooler_output, Some(embedding));
+    }
+
+    #[test]
+    fn test_pooling_request_multi_vector_embedding() {
+        // Multi-vector (ColBERT AllTokens) pooler output should flow through.
+        let mut config = make_test_config();
+        config.is_pooling = true;
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        let params = SamplingParams {
+            max_tokens: Some(1),
+            ..Default::default()
+        };
+        let mut req = Request::new("mv-1".to_string(), vec![1, 2, 3], params, 0.0, 0, 0, None);
+        req.is_pooling = true;
+        engine.add_request(req);
+
+        let scheduler_output = engine.scheduler.schedule();
+
+        let multi_emb = EmbeddingData::Multi(vec![
+            vec![0.1, 0.2, 0.3],
+            vec![0.4, 0.5, 0.6],
+            vec![0.7, 0.8, 0.9],
+        ]);
+        let mut pooler_output = HashMap::new();
+        pooler_output.insert("mv-1".to_string(), multi_emb.clone());
+
+        let model_output = ModelRunnerOutput {
+            req_ids: vec!["mv-1".to_string()],
+            req_id_to_index: [("mv-1".to_string(), 0)].into_iter().collect(),
+            sampled_token_ids: vec![vec![]],
+            logprobs: None,
+            prompt_logprobs_dict: HashMap::new(),
+            draft_token_ids: None,
+            pooler_output: Some(pooler_output),
+            d2h_resolver: None,
+        };
+
+        let outputs = engine.update_from_output(&scheduler_output, &model_output);
+        let client_out = outputs.get(&0).unwrap();
+        let req_out = client_out
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "mv-1")
+            .unwrap();
+
+        assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(req_out.pooler_output, Some(multi_emb));
     }
 
     #[test]

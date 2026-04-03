@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::info;
 use vllm_common::SamplingParams;
+use vllm_common::engine_io::EmbeddingData;
 use vllm_config::CudaGraphMode;
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_cuda::OwnedTensor;
@@ -2489,10 +2490,29 @@ impl CudaWorker {
         num_tokens: usize,
         strategy: vllm_model::embedding::PoolingStrategy,
         device: &mut GpuDevice,
-    ) -> ExecutorResult<Vec<f32>> {
+    ) -> ExecutorResult<EmbeddingData> {
         use vllm_model::embedding::PoolingStrategy;
 
         let hidden_size = hidden_states.dim(1);
+
+        // AllTokens: D2H all rows, L2-normalize each, return as Multi.
+        if strategy == PoolingStrategy::AllTokens {
+            let all_f32 = Self::logits_to_cpu(hidden_states, device)?;
+            let mut rows = Vec::with_capacity(num_tokens);
+            for row in 0..num_tokens {
+                let start = row * hidden_size;
+                let end = start + hidden_size;
+                let mut vec: Vec<f32> = all_f32[start..end].to_vec();
+                let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    for v in &mut vec {
+                        *v /= norm;
+                    }
+                }
+                rows.push(vec);
+            }
+            return Ok(EmbeddingData::Multi(rows));
+        }
 
         // 1. GPU-side pooling: extract [hidden_size] from [num_tokens, hidden_size].
         let pooled_gpu = match strategy {
@@ -2553,9 +2573,10 @@ impl CudaWorker {
                             *v /= norm;
                         }
                     }
-                    return Ok(mean);
+                    return Ok(EmbeddingData::Single(mean));
                 }
             }
+            PoolingStrategy::AllTokens => unreachable!("handled by early return"),
         };
 
         // 2. D2H the small [hidden_size] vector.
@@ -2600,9 +2621,11 @@ impl CudaWorker {
         // 4. L2 normalize on CPU (tiny vector, ~4096 floats = 16KB).
         let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
-            Ok(f32_vec.into_iter().map(|x| x / norm).collect())
+            Ok(EmbeddingData::Single(
+                f32_vec.into_iter().map(|x| x / norm).collect(),
+            ))
         } else {
-            Ok(f32_vec)
+            Ok(EmbeddingData::Single(f32_vec))
         }
     }
 
@@ -6317,6 +6340,7 @@ impl Worker for CudaWorker {
                 let hidden_size = model.hidden_size();
                 results.push(vec![0.0f32; hidden_size]);
                 continue;
+
             }
 
             // Build positions [0, 1, 2, ...].
@@ -6366,7 +6390,15 @@ impl Worker for CudaWorker {
 
             // Pool + normalize. Dereference OwnedTensor → GpuTensor (Copy).
             let embedding = Self::pool_and_normalize(*hidden_states, num_tokens, strategy, device)?;
-            results.push(embedding);
+            // Side-channel embed always uses single-vector pooling (Last/Cls/Mean).
+            match embedding {
+                EmbeddingData::Single(v) => results.push(v),
+                EmbeddingData::Multi(_) => {
+                    return Err(ExecutorError::WorkerExecution(
+                        "AllTokens pooling requires --runner pooling mode".into(),
+                    ));
+                }
+            }
             // OwnedTensor dropped here — memory returns to caching allocator.
         }
 
@@ -6986,7 +7018,7 @@ impl CudaWorker {
             // Pool each request's hidden states slice.
             let strategy = self.pooling_strategy;
             let meta = &prepared.attn_meta;
-            let mut pooler_map: HashMap<String, Vec<f32>> = HashMap::new();
+            let mut pooler_map: HashMap<String, EmbeddingData> = HashMap::new();
 
             for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
                 let q_start = meta.query_start_loc[req_idx];

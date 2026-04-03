@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 
+use vllm_common::engine_io::EmbeddingData;
+
 use vllm_common::LogprobsOutput;
 #[cfg(test)]
 use vllm_common::TokenLogprob;
@@ -62,11 +64,11 @@ pub struct ModelRunnerOutput {
     /// Maps request ID to draft token sequences.
     pub draft_token_ids: Option<HashMap<String, Vec<u32>>>,
 
-    /// Pooling output (embedding vectors) for requests in pooling mode.
+    /// Pooling output (embedding data) for requests in pooling mode.
     ///
-    /// Maps request ID to the L2-normalized embedding vector.
+    /// Maps request ID to the embedding data (single or multi-vector).
     /// `None` when the engine is not in pooling mode.
-    pub pooler_output: Option<HashMap<String, Vec<f32>>>,
+    pub pooler_output: Option<HashMap<String, EmbeddingData>>,
 
     /// Deferred D2H resolver. When present, `sampled_token_ids` contains
     /// placeholders. Call `resolve()` to synchronize the D2H transfer and

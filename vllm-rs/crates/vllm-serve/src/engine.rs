@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::{debug, error, info};
 use uuid::Uuid;
+use vllm_common::engine_io::EmbeddingData;
 #[cfg(feature = "multimodal")]
 use vllm_common::multimodal::{ImageData, MultimodalData};
 use vllm_common::sampling::GuidedGrammar;
@@ -145,8 +146,8 @@ struct RequestState {
     /// Forced function name from `tool_choice: {function: {name}}` (for filtering).
     forced_function_name: Option<String>,
 
-    /// Pooling output (embedding vector), set when the engine is in pooling mode.
-    pooler_output: Option<Vec<f32>>,
+    /// Pooling output (embedding data), set when the engine is in pooling mode.
+    pooler_output: Option<EmbeddingData>,
 }
 
 /// A delta sent to a streaming response.
@@ -1243,7 +1244,7 @@ impl AsyncEngine {
         let token_id_seqs = self.tokenize_embedding_inputs(&request)?;
         let total_prompt_tokens: u32 = token_id_seqs.iter().map(|s| s.len() as u32).sum();
 
-        let embeddings: Vec<Vec<f32>> = if self.is_pooling {
+        let embeddings: Vec<EmbeddingData> = if self.is_pooling {
             // Pooling mode: route each input through the scheduler as a pooling request.
             let mut results = Vec::with_capacity(token_id_seqs.len());
             for token_ids in &token_id_seqs {
@@ -1289,7 +1290,7 @@ impl AsyncEngine {
                 // Wait for the request to complete.
                 let state = self.poll_until_done(&request_id).await?;
 
-                // Extract the embedding vector from the pooler output.
+                // Extract the embedding data from the pooler output.
                 let emb = state.pooler_output.ok_or_else(|| {
                     ServeError::Internal("pooling request completed without embedding".into())
                 })?;
@@ -1298,6 +1299,7 @@ impl AsyncEngine {
             results
         } else {
             // Default mode: send to step loop via embed channel (bypasses scheduler).
+            // Side-channel always returns single-vector embeddings.
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             self.embed_tx
                 .send(EmbedRequest {
@@ -1306,32 +1308,53 @@ impl AsyncEngine {
                 })
                 .map_err(|_| ServeError::Internal("embed channel closed".into()))?;
 
-            reply_rx
+            let vecs = reply_rx
                 .await
-                .map_err(|_| ServeError::Internal("embed reply channel closed".into()))??
+                .map_err(|_| ServeError::Internal("embed reply channel closed".into()))??;
+            vecs.into_iter().map(EmbeddingData::Single).collect()
         };
 
-        // Apply optional dimension truncation and re-normalize.
+        // Build response objects, applying optional dimension truncation.
         let data: Vec<protocol::EmbeddingObject> = embeddings
             .into_iter()
             .enumerate()
-            .map(|(i, mut emb)| {
-                if let Some(dims) = request.dimensions
-                    && dims < emb.len()
-                {
-                    emb.truncate(dims);
-                    // Re-normalize after truncation.
-                    let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if norm > 0.0 {
-                        for x in &mut emb {
-                            *x /= norm;
+            .map(|(i, emb_data)| {
+                let embedding = match emb_data {
+                    EmbeddingData::Single(mut emb) => {
+                        if let Some(dims) = request.dimensions
+                            && dims < emb.len()
+                        {
+                            emb.truncate(dims);
+                            let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            if norm > 0.0 {
+                                for x in &mut emb {
+                                    *x /= norm;
+                                }
+                            }
                         }
+                        serde_json::json!(emb)
                     }
-                }
+                    EmbeddingData::Multi(mut rows) => {
+                        if let Some(dims) = request.dimensions {
+                            for row in &mut rows {
+                                if dims < row.len() {
+                                    row.truncate(dims);
+                                    let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                                    if norm > 0.0 {
+                                        for x in row.iter_mut() {
+                                            *x /= norm;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        serde_json::json!(rows)
+                    }
+                };
                 protocol::EmbeddingObject {
                     index: i,
                     object: "embedding".to_string(),
-                    embedding: emb,
+                    embedding,
                 }
             })
             .collect();
@@ -4697,7 +4720,7 @@ mod tests {
         let mut requests = HashMap::new();
         requests.insert("pool-1".to_string(), make_test_request_state(None));
 
-        let embedding = vec![0.1, 0.2, 0.3];
+        let embedding = EmbeddingData::Single(vec![0.1, 0.2, 0.3]);
         AsyncEngine::process_output(
             &mut requests,
             EngineCoreOutput {

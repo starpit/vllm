@@ -5,7 +5,7 @@
 //! converted into embedding vectors. The actual pooling/normalization is
 //! performed by each backend (MLX, CUDA) using native tensor ops.
 
-/// Pooling strategy for extracting a single vector from hidden states.
+/// Pooling strategy for extracting embeddings from hidden states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolingStrategy {
     /// Use the last token's hidden state (default for decoder models).
@@ -14,6 +14,8 @@ pub enum PoolingStrategy {
     Cls,
     /// Average all token hidden states.
     Mean,
+    /// Return all token hidden states (ColBERT multi-vector).
+    AllTokens,
 }
 
 impl std::str::FromStr for PoolingStrategy {
@@ -27,6 +29,7 @@ impl std::str::FromStr for PoolingStrategy {
             "last" => Ok(Self::Last),
             "cls" => Ok(Self::Cls),
             "mean" => Ok(Self::Mean),
+            "all" | "all_tokens" => Ok(Self::AllTokens),
             other => Err(format!("unknown pooling strategy: {other}")),
         }
     }
@@ -94,6 +97,18 @@ mod tests {
         assert_eq!(
             "MEAN".parse::<PoolingStrategy>().unwrap(),
             PoolingStrategy::Mean
+        );
+        assert_eq!(
+            "all".parse::<PoolingStrategy>().unwrap(),
+            PoolingStrategy::AllTokens
+        );
+        assert_eq!(
+            "all_tokens".parse::<PoolingStrategy>().unwrap(),
+            PoolingStrategy::AllTokens
+        );
+        assert_eq!(
+            "ALL".parse::<PoolingStrategy>().unwrap(),
+            PoolingStrategy::AllTokens
         );
         assert!("unknown".parse::<PoolingStrategy>().is_err());
     }

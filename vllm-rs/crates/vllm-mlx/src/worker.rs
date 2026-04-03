@@ -1243,10 +1243,11 @@ impl Worker for MlxWorker {
 
         // --- Pooling mode: run hidden_states + pool + normalize ---
         if self.is_pooling {
+            use vllm_common::engine_io::EmbeddingData;
             use vllm_model::embedding::PoolingStrategy;
             let strategy = self.pooling_strategy;
 
-            let mut pooler_map: HashMap<String, Vec<f32>> = HashMap::new();
+            let mut pooler_map: HashMap<String, EmbeddingData> = HashMap::new();
 
             for ri in &req_inputs {
                 let token_ids = match self.token_buffers.get(&ri.req_id) {
@@ -1267,6 +1268,33 @@ impl Worker for MlxWorker {
                     .hidden_states(&input_ids, &positions)
                     .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
 
+                // AllTokens: return all rows, each L2-normalized.
+                if strategy == PoolingStrategy::AllTokens {
+                    let num_tokens = token_ids.len();
+                    let hidden_f32 = hidden
+                        .as_dtype(Dtype::Float32)
+                        .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                    hidden_f32
+                        .eval()
+                        .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                    let hidden_size = hidden_f32.dim(-1) as usize;
+                    let flat: &[f32] = hidden_f32.as_slice();
+                    let mut rows = Vec::with_capacity(num_tokens);
+                    for row in 0..num_tokens {
+                        let start = row * hidden_size;
+                        let mut vec: Vec<f32> = flat[start..start + hidden_size].to_vec();
+                        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        if norm > 0.0 {
+                            for v in &mut vec {
+                                *v /= norm;
+                            }
+                        }
+                        rows.push(vec);
+                    }
+                    pooler_map.insert(ri.req_id.clone(), EmbeddingData::Multi(rows));
+                    continue;
+                }
+
                 // Pool according to strategy.
                 let num_tokens = token_ids.len() as i32;
                 let pooled = match strategy {
@@ -1279,6 +1307,7 @@ impl Worker for MlxWorker {
                         sum.divide(Array::from(num_tokens as f32))
                             .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?
                     }
+                    PoolingStrategy::AllTokens => unreachable!("handled above"),
                 };
 
                 // L2 normalize.
@@ -1303,7 +1332,7 @@ impl Worker for MlxWorker {
                     .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
                 let vec: Vec<f32> = normalized_f32.as_slice().to_vec();
 
-                pooler_map.insert(ri.req_id.clone(), vec);
+                pooler_map.insert(ri.req_id.clone(), EmbeddingData::Single(vec));
             }
 
             let req_ids: Vec<String> = pooler_map.keys().cloned().collect();
@@ -2418,6 +2447,11 @@ impl Worker for MlxWorker {
                         .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
                     sum.divide(Array::from(num_tokens as f32))
                         .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?
+                }
+                PoolingStrategy::AllTokens => {
+                    return Err(ExecutorError::WorkerExecution(
+                        "AllTokens pooling requires --runner pooling mode".into(),
+                    ));
                 }
             };
 

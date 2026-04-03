@@ -162,6 +162,15 @@ pub struct EngineCoreRequest {
 
 /// Per-request output emitted by the engine core after each scheduler step.
 ///
+/// Embedding data: single vector (standard pooling) or multi-vector (ColBERT).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbeddingData {
+    /// Single embedding vector (Last/Cls/Mean pooling).
+    Single(Vec<f32>),
+    /// Per-token embedding vectors (AllTokens / ColBERT).
+    Multi(Vec<Vec<f32>>),
+}
+
 /// Mirrors the Python `EngineCoreOutput` msgspec struct. Fields that depend
 /// on tensor types (logprobs, pooling output, routed experts) are omitted
 /// in this initial port.
@@ -199,11 +208,11 @@ pub struct EngineCoreOutput {
     #[serde(skip)]
     pub new_prompt_logprobs: Option<Vec<Option<LogprobsOutput>>>,
 
-    /// Pooling output (embedding vector) for this request.
+    /// Pooling output (embedding) for this request.
     /// Only populated when the engine is in pooling mode.
     /// Skipped during serialization (only used in-process).
     #[serde(skip)]
-    pub pooler_output: Option<Vec<f32>>,
+    pub pooler_output: Option<EmbeddingData>,
 }
 
 impl EngineCoreOutput {
@@ -586,5 +595,37 @@ mod tests {
         assert_eq!(outs2.outputs.len(), 1);
         assert_eq!(outs2.outputs[0].new_token_ids, vec![7, 8, 9]);
         assert_eq!(outs2.timestamp, 42.0);
+    }
+
+    // -- EmbeddingData tests --
+
+    #[test]
+    fn test_embedding_data_single() {
+        let data = EmbeddingData::Single(vec![0.1, 0.2, 0.3]);
+        match &data {
+            EmbeddingData::Single(v) => assert_eq!(v.len(), 3),
+            EmbeddingData::Multi(_) => panic!("expected Single"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_data_multi() {
+        let data = EmbeddingData::Multi(vec![vec![0.1, 0.2], vec![0.3, 0.4], vec![0.5, 0.6]]);
+        match &data {
+            EmbeddingData::Multi(rows) => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0], vec![0.1, 0.2]);
+            }
+            EmbeddingData::Single(_) => panic!("expected Multi"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_data_equality() {
+        let a = EmbeddingData::Single(vec![1.0, 2.0]);
+        let b = EmbeddingData::Single(vec![1.0, 2.0]);
+        let c = EmbeddingData::Multi(vec![vec![1.0, 2.0]]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

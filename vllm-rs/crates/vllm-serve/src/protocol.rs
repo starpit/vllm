@@ -1051,11 +1051,14 @@ pub struct EmbeddingRequest {
 }
 
 /// A single embedding object in the response.
+///
+/// `embedding` is `serde_json::Value` to support both single-vector (`[f32; D]`)
+/// and multi-vector ColBERT output (`[[f32; D]; T]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingObject {
     pub index: usize,
     pub object: String,
-    pub embedding: Vec<f32>,
+    pub embedding: serde_json::Value,
 }
 
 /// Usage information for embedding requests.
@@ -1576,7 +1579,7 @@ mod tests {
             vec![EmbeddingObject {
                 index: 0,
                 object: "embedding".to_string(),
-                embedding: vec![0.1, 0.2, 0.3],
+                embedding: serde_json::json!([0.1, 0.2, 0.3]),
             }],
             EmbeddingUsage {
                 prompt_tokens: 3,
@@ -1591,6 +1594,33 @@ mod tests {
             serde_json::json!([0.1, 0.2, 0.3])
         );
         assert_eq!(parsed["usage"]["prompt_tokens"], 3);
+    }
+
+    #[test]
+    fn test_embedding_response_multi_vector_serde() {
+        // ColBERT multi-vector: embedding is a 2D array [[f32; D]; T].
+        let resp = EmbeddingResponse::new(
+            "colbert-model".to_string(),
+            vec![EmbeddingObject {
+                index: 0,
+                object: "embedding".to_string(),
+                embedding: serde_json::json!([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]),
+            }],
+            EmbeddingUsage {
+                prompt_tokens: 3,
+                total_tokens: 3,
+            },
+        );
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["object"], "list");
+        let emb = &parsed["data"][0]["embedding"];
+        assert!(emb.is_array());
+        assert_eq!(emb.as_array().unwrap().len(), 3);
+        // Each element is itself an array (2D).
+        assert!(emb[0].is_array());
+        assert_eq!(emb[0], serde_json::json!([0.1, 0.2]));
+        assert_eq!(emb[2], serde_json::json!([0.5, 0.6]));
     }
 
     #[test]

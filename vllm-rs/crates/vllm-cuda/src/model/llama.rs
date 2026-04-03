@@ -2563,7 +2563,8 @@ impl LlamaForCausalLM {
         };
 
         let lm_head = if config.tie_word_embeddings {
-            LinearLayer::Dense(Linear::new(model.embed_tokens.weight, None))
+            let shard = unsafe { shard_tied_lm_head(model.embed_tokens.weight, tp) };
+            LinearLayer::Dense(Linear::new(shard, None))
         } else {
             let lm_w = weights.take_shard("lm_head.weight", 0, tp.rank, tp.world_size)?;
             LinearLayer::Dense(Linear::new(lm_w, None))
@@ -2631,7 +2632,8 @@ impl LlamaForCausalLM {
         };
 
         let lm_head = if config.tie_word_embeddings {
-            LinearLayer::Dense(Linear::new(model.embed_tokens.weight, None))
+            let shard = unsafe { shard_tied_lm_head(model.embed_tokens.weight, tp) };
+            LinearLayer::Dense(Linear::new(shard, None))
         } else {
             let lm_w = weights.take_shard("lm_head.weight", 0, tp.rank, tp.world_size)?;
             LinearLayer::Dense(Linear::new(lm_w, None))
@@ -2989,6 +2991,25 @@ impl LlamaModel {
     }
 }
 
+/// Shard a full embedding weight into a TP lm_head shard (column-parallel).
+///
+/// With tied embeddings + TP, each rank needs only its vocab shard
+/// (`[vocab/world_size, hidden]`) for the lm_head matmul. The all-gather
+/// in `LlamaForCausalLM::forward` reconstructs full logits.
+pub(crate) unsafe fn shard_tied_lm_head(full_weight: GpuTensor, tp: TpConfig) -> GpuTensor {
+    let vocab = full_weight.dim(0);
+    let hidden = full_weight.dim(1);
+    let shard_size = vocab / tp.world_size;
+    let offset = tp.rank * shard_size;
+    GpuTensor::new(
+        full_weight
+            .raw_ptr()
+            .add(offset * hidden * full_weight.dtype().size_bytes()),
+        &[shard_size, hidden],
+        full_weight.dtype(),
+    )
+}
+
 impl LlamaForCausalLM {
     /// Load the full model with TP sharding.
     pub fn load_tp(
@@ -3002,8 +3023,8 @@ impl LlamaForCausalLM {
 
         // lm_head: column-parallel (shard output dim).
         let lm_head = if config.tie_word_embeddings {
-            // Tied embeddings — use full weight (all-gather at inference time).
-            LinearLayer::Dense(Linear::new(model.embed_tokens.weight, None))
+            let shard = unsafe { shard_tied_lm_head(model.embed_tokens.weight, tp) };
+            LinearLayer::Dense(Linear::new(shard, None))
         } else {
             let lm_w = weights.take_shard("lm_head.weight", 0, tp.rank, tp.world_size)?;
             LinearLayer::Dense(Linear::new(lm_w, None))
@@ -3799,7 +3820,8 @@ impl LlamaForCausalLM {
 
         let lm_head = if pp.is_last_stage() {
             if config.tie_word_embeddings {
-                LinearLayer::Dense(Linear::new(model.embed_tokens.weight, None))
+                let shard = unsafe { shard_tied_lm_head(model.embed_tokens.weight, tp) };
+                LinearLayer::Dense(Linear::new(shard, None))
             } else {
                 let lm_w = weights.take_shard("lm_head.weight", 0, tp.rank, tp.world_size)?;
                 LinearLayer::Dense(Linear::new(lm_w, None))

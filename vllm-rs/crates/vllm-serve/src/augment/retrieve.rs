@@ -80,9 +80,11 @@ pub async fn retrieve(
         })
         .await??
     } else {
+        let base_url = resolve_embedding_base_url(embedding_model, options)?;
         let embedding_model_owned = embedding_model.to_string();
         tokio::task::spawn_blocking(move || {
-            let provider = HttpEmbeddingProvider::new(&embedding_model_owned, 0);
+            let provider =
+                HttpEmbeddingProvider::with_base_url(&embedding_model_owned, 0, base_url);
             provider.call_api(&body_texts)
         })
         .await??
@@ -114,4 +116,16 @@ pub async fn retrieve(
         .collect();
 
     Ok(fragments)
+}
+
+/// Resolve the base URL for an embedding model: use a sidecar if available,
+/// otherwise fall back to the env-var default.
+fn resolve_embedding_base_url(model: &str, options: &AugmentOptions) -> Result<String> {
+    if let Some(mgr) = &options.sidecar_manager {
+        let sidecar = mgr.get_or_spawn(model)?;
+        Ok(sidecar.base_url.clone())
+    } else {
+        Ok(std::env::var("VLLM_EMBEDDING_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:11434/v1".to_string()))
+    }
 }

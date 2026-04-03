@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::tokenizer::Tokenizer;
 
 use super::embed::TokenEmbedder;
+use super::sidecar::SidecarManager;
 
 /// Options controlling RAG augmentation behavior.
 #[derive(Clone)]
@@ -21,6 +22,9 @@ pub struct AugmentOptions {
     pub embedder: Option<Arc<dyn TokenEmbedder>>,
     /// Tokenizer for in-process embedding.
     pub tokenizer: Option<Arc<Tokenizer>>,
+    /// Sidecar manager — spawns vllm-rs embedding processes on demand when
+    /// the current model cannot serve embeddings in-process.
+    pub sidecar_manager: Option<Arc<SidecarManager>>,
 }
 
 impl Default for AugmentOptions {
@@ -33,6 +37,7 @@ impl Default for AugmentOptions {
             current_model: None,
             embedder: None,
             tokenizer: None,
+            sidecar_manager: None,
         }
     }
 }

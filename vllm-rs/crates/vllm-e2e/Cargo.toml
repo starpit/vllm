@@ -12,6 +12,7 @@ otel = ["vllm-serve/otel", "vllm-common/otel"]
 cuda = ["vllm-serve/cuda"]
 nccl = ["cuda"]
 metal = ["vllm-serve/metal"]
+rag = ["vllm-serve/rag", "dep:spnl-core"]
 guided-decoding = ["vllm-serve/guided-decoding"]
 multimodal = ["vllm-serve/multimodal"]
 tls = ["vllm-serve/tls"]
@@ -41,6 +42,7 @@ tracing = { workspace = true }
 # Server stack (in-process startup)
 vllm-common = { workspace = true }
 vllm-serve = { workspace = true }
+spnl-core = { workspace = true, optional = true, features = ["rag"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

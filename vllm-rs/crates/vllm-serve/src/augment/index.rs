@@ -96,9 +96,16 @@ async fn process_document(
         })
         .await??
     } else {
+        let base_url = resolve_embedding_base_url(&a.embedding_model, options)?;
         tokio::task::spawn_blocking({
             let model = a.embedding_model.clone();
-            move || HttpEmbeddingProvider::probe_dimensions(&model)
+            move || {
+                let provider = HttpEmbeddingProvider::with_base_url(&model, 0, base_url);
+                let resp = provider.call_api(&["probe".to_string()])?;
+                resp.first()
+                    .map(|v| v.len())
+                    .ok_or_else(|| anyhow!("probe returned no embeddings"))
+            }
         })
         .await??
     };
@@ -131,8 +138,10 @@ async fn process_document(
         })
         .await??;
     } else {
+        let base_url = resolve_embedding_base_url(&embedding_model, options)?;
         tokio::task::spawn_blocking(move || {
-            let provider = HttpEmbeddingProvider::new(&embedding_model, dimensions);
+            let provider =
+                HttpEmbeddingProvider::with_base_url(&embedding_model, dimensions, base_url);
             builder.build_index(&index_path_clone, &provider)
         })
         .await??;
@@ -146,4 +155,16 @@ async fn process_document(
         .open(&done_file)?;
 
     Ok(())
+}
+
+/// Resolve the base URL for an embedding model: use a sidecar if available,
+/// otherwise fall back to the env-var default.
+fn resolve_embedding_base_url(model: &str, options: &AugmentOptions) -> Result<String> {
+    if let Some(mgr) = &options.sidecar_manager {
+        let sidecar = mgr.get_or_spawn(model)?;
+        Ok(sidecar.base_url.clone())
+    } else {
+        Ok(std::env::var("VLLM_EMBEDDING_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:11434/v1".to_string()))
+    }
 }

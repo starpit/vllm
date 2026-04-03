@@ -539,6 +539,7 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
                     crate::augment::embed::AsyncEngineEmbedder::new(state.engine.clone()),
                 )),
                 tokenizer: state.engine.tokenizer().cloned(),
+                sidecar_manager: Some(std::sync::Arc::new(crate::augment::SidecarManager::new())),
                 ..Default::default()
             };
             crate::augment::index(&query, &aug_options)
@@ -1074,7 +1075,18 @@ pub(crate) fn execute_spnl_query_sync(
     if let Ok(query) = serde_json::from_str::<SpnlQuery>(spnl_json) {
         #[cfg(feature = "rag")]
         let query = {
-            let rt = tokio::runtime::Handle::current();
+            // Use existing tokio runtime if available, otherwise create a temporary one.
+            // The runtime must be multi-threaded because augment uses spawn_blocking.
+            let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+                // Leak a runtime so it is never dropped inside a blocking context.
+                // This only happens when LLM::execute_query is called outside a
+                // tokio context (e.g. tests, CLI). The leak is bounded: at most
+                // one runtime per process.
+                let rt = Box::leak(Box::new(
+                    tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
+                ));
+                rt.handle().clone()
+            });
             rt.block_on(crate::augment::index(&query, aug_options))
                 .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
             rt.block_on(optimize_augments(&query, aug_options))?

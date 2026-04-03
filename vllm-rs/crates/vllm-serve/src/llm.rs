@@ -548,6 +548,7 @@ impl LLM {
                 current_model: Some(self.model_name.clone()),
                 embedder,
                 tokenizer: self.tokenizer.clone(),
+                sidecar_manager: Some(std::sync::Arc::new(crate::augment::SidecarManager::new())),
                 ..Default::default()
             }
         };

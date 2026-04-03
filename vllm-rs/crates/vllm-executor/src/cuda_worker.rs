@@ -6754,7 +6754,20 @@ impl CudaWorker {
                 .get(req_id)
                 .copied()
                 .unwrap_or(0);
-            let is_chunked_prefill_continuation = !is_resumed && num_scheduled_for_req > 1;
+            // Only treat as chunked prefill if the request still has prompt tokens
+            // remaining. A cached request with num_scheduled > 1 that has already
+            // completed its prefill is just a normal decode (e.g. spec decode or
+            // scheduler batching artifact) and must NOT be re-armed.
+            let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
+            let num_computed_here = scheduler_output
+                .scheduled_cached_reqs
+                .num_computed_tokens
+                .get(i)
+                .copied()
+                .unwrap_or(0) as usize;
+            let is_chunked_prefill_continuation = !is_resumed
+                && num_scheduled_for_req > 1
+                && num_computed_here + num_scheduled_for_req < prompt_len;
             if !is_resumed && !is_chunked_prefill_continuation {
                 continue;
             }

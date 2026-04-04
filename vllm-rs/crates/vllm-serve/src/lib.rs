@@ -29,5 +29,7 @@ pub mod reasoning_parser;
 pub mod responses;
 pub mod server;
 pub mod spans;
+#[cfg(feature = "tk")]
+pub mod tk_worker;
 pub mod tokenizer;
 pub mod tool_parser;

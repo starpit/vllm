@@ -16,6 +16,8 @@
 #[cfg(feature = "cuda")]
 pub mod cuda_worker;
 pub mod error;
+#[cfg(feature = "cuda")]
+pub mod gpu_worker_base;
 pub mod input_batch;
 #[cfg(feature = "nccl")]
 pub mod multinode;

@@ -9,6 +9,7 @@ description = "HTTP (axum) and gRPC (tonic) serving layer for vLLM Rust port"
 default = []
 otel = ["vllm-common/otel"]
 cuda = ["vllm-executor/cuda", "dep:vllm-cuda"]
+tk = ["cuda", "dep:vllm-tk", "vllm-tk/cuda"]
 nccl = ["cuda", "vllm-cuda/nccl", "vllm-executor/nccl"]
 metal = ["vllm-mlx"]
 wgpu = ["vllm-wgpu"]
@@ -30,6 +31,7 @@ vllm-model = { workspace = true }
 vllm-mlx = { workspace = true, optional = true }
 vllm-wgpu = { workspace = true, optional = true, features = ["worker"] }
 vllm-cuda = { path = "../vllm-cuda", optional = true }
+vllm-tk = { path = "../vllm-tk", optional = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true, optional = true }

@@ -107,6 +107,10 @@ pub struct VllmConfig {
     /// "external_launcher" reads RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT
     /// from env and uses TCP-based NCCL init for inter-process TP.
     pub distributed_executor_backend: String,
+    /// Inference backend: "auto", "cuda", or "tk".
+    /// "tk" selects the ThunderKittens KVM megakernel (sm89, LLaMA only).
+    #[cfg(feature = "tk")]
+    pub backend: String,
 }
 
 impl Default for VllmConfig {
@@ -144,6 +148,8 @@ impl Default for VllmConfig {
             kv_cache_dtype: "auto".to_string(),
             calculate_kv_scales: false,
             distributed_executor_backend: "auto".to_string(),
+            #[cfg(feature = "tk")]
+            backend: "auto".to_string(),
         }
     }
 }
@@ -203,6 +209,43 @@ fn create_worker(
     progress: Option<&Arc<crate::progress::StartupProgress>>,
 ) -> Result<WorkerCreationResult> {
     let is_pooling = config.runner == "pooling";
+
+    // Try the TK KVM megakernel backend when --backend tk is specified.
+    #[cfg(feature = "tk")]
+    if config.backend == "tk" {
+        use crate::tk_worker::{TkWorkerAdapter, TkWorkerAdapterConfig};
+
+        let device_id = if config.device.starts_with("cuda:") {
+            config.device[5..].parse::<i32>().unwrap_or(0)
+        } else {
+            0
+        };
+
+        info!("Using TK KVM megakernel backend (device={})", device_id);
+        let tk_config = TkWorkerAdapterConfig {
+            model_path: model_path.clone(),
+            dtype: config.dtype.clone(),
+            hf_token: config.hf_token.clone(),
+            device_id,
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(256),
+            gpu_memory_utilization: config.gpu_memory_utilization,
+        };
+
+        let mut worker = TkWorkerAdapter::new(tk_config);
+        worker
+            .init_device()
+            .context("failed to initialize TK device")?;
+        worker.load_model().context("failed to load TK model")?;
+
+        let hf_config = worker
+            .hf_config()
+            .context("model config not available after TK load")?
+            .clone();
+        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
+        let dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
+
+        return Ok((Box::new(worker), hf_config, model_dir, dtype_elem_bytes));
+    }
 
     // Try MLX backend first when metal feature is enabled.
     #[cfg(feature = "metal")]
@@ -443,9 +486,20 @@ fn initialize_core(
     if let Some(pb) = progress {
         pb.set_stage("Initializing KV cache");
     }
+    // TK backend uses KV_PAGE_SIZE=64 as its physical page size.
+    // Override block_size so compute_num_blocks and scheduler agree.
+    #[cfg(feature = "tk")]
+    let block_size = if config.backend == "tk" {
+        64
+    } else {
+        config.block_size
+    };
+    #[cfg(not(feature = "tk"))]
+    let block_size = config.block_size;
+
     let (mut worker, available_memory, num_gpu_blocks, effective_utilization) = init_cache(
         worker,
-        config.block_size,
+        block_size,
         &hf_config,
         model_dtype,
         config.gpu_memory_utilization,
@@ -460,7 +514,7 @@ fn initialize_core(
         num_gpu_blocks
     );
 
-    let kv_cache_tokens = num_gpu_blocks * config.block_size;
+    let kv_cache_tokens = num_gpu_blocks * block_size;
     info!("KV cache size: {} tokens", kv_cache_tokens);
     info!(
         "Maximum concurrency for {} tokens per request: {:.2}x",
@@ -523,7 +577,7 @@ fn initialize_core(
         },
         max_model_len,
         num_gpu_blocks,
-        block_size: config.block_size,
+        block_size,
         engine_index: 0,
         async_scheduling: use_async_scheduling,
         use_spec_decode: config.speculative_model.is_some(),

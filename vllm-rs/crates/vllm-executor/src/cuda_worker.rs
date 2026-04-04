@@ -215,8 +215,8 @@ impl CudaModel {
             Self::Mixtral(m) => m.set_tp_group(group),
             Self::Qwen2Moe(m) => m.set_tp_group(group),
             Self::Qwen3Moe(m) => m.set_tp_group(group),
-            Self::CommandR(_) => {}    // TP not yet supported
-            Self::Qwen3Next(_) => {}  // TP not yet supported
+            Self::CommandR(_) => {}  // TP not yet supported
+            Self::Qwen3Next(_) => {} // TP not yet supported
             Self::DeepSeekV2(m) => m.set_tp_group(group),
             Self::ModernBert(_) => {} // Encoder: TP not yet supported
         }
@@ -545,7 +545,9 @@ impl CudaModel {
                 )
             },
             Self::ModernBert(_) => {
-                panic!("ModernBert: encoder model does not support logit generation; use hidden_states()");
+                panic!(
+                    "ModernBert: encoder model does not support logit generation; use hidden_states()"
+                );
             }
         }
     }
@@ -3296,10 +3298,10 @@ impl CudaWorker {
 
             // Grammar advance on CPU (Python also does FSM state on CPU).
             #[cfg(feature = "guided-decoding")]
-            if !discard[req_idx] {
-                if let Some(g) = grammar_states.get_mut(&req_slice.req_id) {
-                    g.advance(tok);
-                }
+            if !discard[req_idx]
+                && let Some(g) = grammar_states.get_mut(&req_slice.req_id)
+            {
+                g.advance(tok);
             }
 
             input_batch.commit_step(
@@ -5728,8 +5730,7 @@ impl Worker for CudaWorker {
             .model
             .as_ref()
             .is_some_and(|m| matches!(m, CudaModel::ModernBert(_)));
-        if self.uses_ggml || self.qwen3_next_config.is_some() || pp_active || is_moe || is_encoder
-        {
+        if self.uses_ggml || self.qwen3_next_config.is_some() || pp_active || is_moe || is_encoder {
             let tag = if self.uses_ggml {
                 "GGML"
             } else if pp_active {
@@ -6452,7 +6453,6 @@ impl Worker for CudaWorker {
                 let hidden_size = model.hidden_size();
                 results.push(vec![0.0f32; hidden_size]);
                 continue;
-
             }
 
             // Build positions [0, 1, 2, ...].

@@ -1,0 +1,20 @@
+/**
+ * @file
+ * @brief An aggregate header of group memory operations on tiles.
+ */
+
+#include "shared_to_register.cuh"
+#include "global_to_register.cuh"
+#include "global_to_shared.cuh"
+#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#include "pgl_to_register.cuh"
+#include "pgl_to_shared.cuh"
+#endif
+#ifdef KITTENS_BLACKWELL
+#include "tensor_to_register.cuh"
+#endif
+
+#include "complex/complex_shared_to_register.cuh"
+#include "complex/complex_global_to_register.cuh"
+#include "complex/complex_global_to_shared.cuh"
+

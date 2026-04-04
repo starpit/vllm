@@ -1,0 +1,17 @@
+[package]
+name = "vllm-tk-static"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+cuda = ["dep:cudaforge", "dep:dirs", "dep:cudarc"]
+
+[dependencies]
+vllm-tk-macros = { path = "../vllm-tk-macros" }
+cudarc = { workspace = true, optional = true, features = ["dynamic-linking", "cuda-version-from-build-system"] }
+
+[build-dependencies]
+vllm-tk-macros-core = { path = "../vllm-tk-macros-core" }
+cudaforge = { path = "../../third_party/cudaforge", optional = true }
+dirs = { version = "6", optional = true }

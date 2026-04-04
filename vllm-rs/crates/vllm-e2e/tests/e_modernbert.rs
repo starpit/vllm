@@ -43,10 +43,7 @@ fn embedding_len(value: &serde_json::Value) -> usize {
 
 /// Check if the embedding JSON array is non-empty.
 fn embedding_is_nonempty(value: &serde_json::Value) -> bool {
-    value
-        .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false)
+    value.as_array().map(|a| !a.is_empty()).unwrap_or(false)
 }
 
 // ===========================================================================
@@ -238,6 +235,100 @@ async fn test_modernbert_rejects_chat_completions() {
         400,
         "Chat completions should return 400 in pooling mode, got {}",
         resp.status()
+    );
+}
+
+// ===========================================================================
+// ColBERT + ModernBERT — AllTokens with 128-dim projection
+// ===========================================================================
+
+/// Helper: extract inner dimension of a 2D embedding (array of arrays).
+fn multi_embedding_inner_dim(value: &serde_json::Value) -> usize {
+    value
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.as_array())
+        .map(|v| v.len())
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_colbert_modernbert_all_tokens_embedding() {
+    // Auto-detects ColBERT from 1_Dense/model.safetensors.
+    let server = TestServer::builder(TestModels::COLBERT_MODERNBERT)
+        .with_runner("pooling")
+        .with_pooling_strategy("all")
+        .start()
+        .await
+        .expect("ColBERT+ModernBERT pooling server should start");
+
+    let client = Client::new(server.base_url());
+
+    let request = embed_request(EmbeddingInput::Single("Hello world".to_string()));
+    let response = client.embedding(&request).await.unwrap();
+
+    assert_eq!(response.data.len(), 1);
+    assert!(embedding_is_nonempty(&response.data[0].embedding));
+
+    // Projection should reduce 768 → 128 dimensions.
+    let inner_dim = multi_embedding_inner_dim(&response.data[0].embedding);
+    assert_eq!(
+        inner_dim, 128,
+        "ColBERT projection should produce 128-dim per-token embeddings, got {inner_dim}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_colbert_modernbert_multiple_inputs() {
+    let server = TestServer::builder(TestModels::COLBERT_MODERNBERT)
+        .with_runner("pooling")
+        .with_pooling_strategy("all")
+        .start()
+        .await
+        .expect("ColBERT+ModernBERT pooling server should start");
+
+    let client = Client::new(server.base_url());
+
+    let request = embed_request(EmbeddingInput::Multiple(vec![
+        vllm_serve::protocol::EmbeddingInputItem::Text("Hello".to_string()),
+        vllm_serve::protocol::EmbeddingInputItem::Text("World".to_string()),
+    ]));
+    let response = client.embedding(&request).await.unwrap();
+
+    assert_eq!(response.data.len(), 2);
+    for d in &response.data {
+        assert_eq!(multi_embedding_inner_dim(&d.embedding), 128);
+    }
+}
+
+// ===========================================================================
+// CUDA backend — ColBERT + ModernBERT
+// ===========================================================================
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_colbert_modernbert_all_tokens_embedding() {
+    let server = TestServer::builder(TestModels::COLBERT_MODERNBERT)
+        .with_runner("pooling")
+        .with_pooling_strategy("all")
+        .start()
+        .await
+        .expect("ColBERT+ModernBERT CUDA pooling server should start");
+
+    let client = Client::new(server.base_url());
+
+    let request = embed_request(EmbeddingInput::Single("Hello world".to_string()));
+    let response = client.embedding(&request).await.unwrap();
+
+    assert_eq!(response.data.len(), 1);
+    assert!(embedding_is_nonempty(&response.data[0].embedding));
+    assert_eq!(
+        multi_embedding_inner_dim(&response.data[0].embedding),
+        128,
+        "ColBERT projection should produce 128-dim per-token embeddings"
     );
 }
 

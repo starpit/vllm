@@ -207,6 +207,10 @@ impl TestModels {
     // ~430 MB safetensors, hidden_size=768, 22 layers
     pub const MODERNBERT_BASE: &str = "answerdotai/ModernBERT-base";
 
+    // ColBERT + ModernBERT backbone — projects 768→128 via 1_Dense linear
+    // ~430 MB safetensors + 1_Dense/model.safetensors projection
+    pub const COLBERT_MODERNBERT: &str = "lightonai/GTE-ModernColBERT-v1";
+
     // Qwen2-VL multimodal (vision-language) models
     // Tier 3: ~3.8 GB BF16 SafeTensors — Candle path
     pub const QWEN2_VL_2B_INSTRUCT: &str = "unsloth/Qwen2-VL-2B-Instruct";

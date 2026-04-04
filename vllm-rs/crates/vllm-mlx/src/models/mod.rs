@@ -14,8 +14,8 @@ pub mod gemma3;
 pub mod gemma3_mm;
 pub mod granite;
 pub mod llama;
-pub mod modernbert;
 pub mod mixtral;
+pub mod modernbert;
 pub mod phi3;
 pub mod quantized_llama;
 pub mod qwen2_vl;
@@ -317,6 +317,11 @@ impl MlxModelRegistry {
         // ModernBERT — encoder-only (bidirectional attention, RoPE, GeGLU, no KV cache)
         registry.register("ModernBertModel", modernbert::create_mlx_modernbert);
         registry.register("ModernBertForMaskedLM", modernbert::create_mlx_modernbert);
+        // ColBERT + ModernBERT backbone — adds linear projection for per-token embeddings
+        registry.register(
+            "ColBERTModernBertModel",
+            modernbert::create_mlx_colbert_modernbert,
+        );
         // Granite (IBM) — LLaMA with embedding/residual/attention/logit multipliers
         registry.register_quantized("GraniteForCausalLM", granite::create_mlx_quantized_granite);
         // Phi-3 (fused qkv_proj + gate_up_proj)

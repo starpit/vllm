@@ -480,6 +480,10 @@ impl MlxWorker {
         // Download weights.
         if repo.get("model.safetensors").is_ok() {
             info!("Downloaded single safetensors file");
+            // Best-effort: download sentence-transformers projection layer if present.
+            let _ = repo.get("1_Dense/model.safetensors");
+            let _ = repo.get("1_Dense/config.json");
+            let _ = repo.get("1_Pooling/config.json");
             return Ok(model_dir);
         }
 
@@ -627,14 +631,21 @@ impl Worker for MlxWorker {
 
         let is_bnb = !is_gptq && !is_awq && quant_method.as_deref() == Some("bitsandbytes");
 
-        // Look up architecture in the MLX registry.
-        let arch = hf_config
+        // Look up architecture in the MLX registry — auto-detect ColBERT if
+        // 1_Dense projection exists.
+        let mut arch = hf_config
             .architectures
             .first()
             .ok_or_else(|| {
                 ExecutorError::WorkerInit("config.json has no architectures field".to_string())
             })?
             .clone();
+        if matches!(arch.as_str(), "ModernBertModel" | "ModernBertForMaskedLM")
+            && model_dir.join("1_Dense").join("model.safetensors").exists()
+        {
+            info!("MlxWorker: detected 1_Dense projection — upgrading to ColBERTModernBertModel");
+            arch = "ColBERTModernBertModel".to_string();
+        }
         let registry = MlxModelRegistry::default_registry();
 
         let factory = if is_gptq {

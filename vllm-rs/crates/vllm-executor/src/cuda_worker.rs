@@ -108,6 +108,7 @@ enum CudaModel {
     Qwen3Next(vllm_cuda::model::qwen3_next::Qwen3NextForCausalLM),
     DeepSeekV2(vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM),
     ModernBert(vllm_cuda::model::modernbert::ModernBertModel),
+    ColBERTModernBert(vllm_cuda::model::modernbert::ColBERTModernBertModel),
 }
 
 impl CudaModel {
@@ -125,7 +126,7 @@ impl CudaModel {
             Self::Qwen3Next(m) => m.num_kv_layers(),
             Self::DeepSeekV2(m) => m.model.layers.len(),
             // Encoder: no KV cache, but we need at least 1 "layer" for pool allocation.
-            Self::ModernBert(_) => 0,
+            Self::ModernBert(_) | Self::ColBERTModernBert(_) => 0,
         }
     }
 
@@ -141,7 +142,7 @@ impl CudaModel {
             Self::CommandR(m) => m.model.layers[0].self_attn.inner.num_kv_heads,
             Self::Qwen3Next(m) => m.num_kv_heads(),
             Self::DeepSeekV2(m) => m.model.layers[0].self_attn.num_heads,
-            Self::ModernBert(_) => 0, // Encoder: no KV cache heads.
+            Self::ModernBert(_) | Self::ColBERTModernBert(_) => 0, // Encoder: no KV cache heads.
         }
     }
 
@@ -158,6 +159,7 @@ impl CudaModel {
             Self::Qwen3Next(m) => m.head_dim(),
             Self::DeepSeekV2(m) => m.model.layers[0].self_attn.qk_head_dim,
             Self::ModernBert(m) => m.layers[0].attn.head_dim,
+            Self::ColBERTModernBert(m) => m.inner.layers[0].attn.head_dim,
         }
     }
 
@@ -174,6 +176,7 @@ impl CudaModel {
             Self::Qwen3Next(m) => m.lm_head.out_features(),
             Self::DeepSeekV2(m) => m.lm_head.out_features(),
             Self::ModernBert(m) => m.embeddings.tok_embeddings.vocab_size(),
+            Self::ColBERTModernBert(m) => m.inner.embeddings.tok_embeddings.vocab_size(),
         }
     }
 
@@ -201,6 +204,7 @@ impl CudaModel {
             Self::Qwen3Next(m) => m.lm_head.in_features(),
             Self::DeepSeekV2(m) => m.lm_head.in_features(),
             Self::ModernBert(m) => m.hidden_size,
+            Self::ColBERTModernBert(m) => m.projection.out_features(),
         }
     }
 
@@ -215,10 +219,10 @@ impl CudaModel {
             Self::Mixtral(m) => m.set_tp_group(group),
             Self::Qwen2Moe(m) => m.set_tp_group(group),
             Self::Qwen3Moe(m) => m.set_tp_group(group),
-            Self::CommandR(_) => {}    // TP not yet supported
-            Self::Qwen3Next(_) => {}  // TP not yet supported
+            Self::CommandR(_) => {}  // TP not yet supported
+            Self::Qwen3Next(_) => {} // TP not yet supported
             Self::DeepSeekV2(m) => m.set_tp_group(group),
-            Self::ModernBert(_) => {} // Encoder: TP not yet supported
+            Self::ModernBert(_) | Self::ColBERTModernBert(_) => {} // Encoder: TP not yet supported
         }
     }
 
@@ -372,6 +376,20 @@ impl CudaModel {
                 )
             },
             Self::ModernBert(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
+            Self::ColBERTModernBert(m) => unsafe {
                 m.forward(
                     input_ids,
                     positions,
@@ -544,8 +562,8 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
-            Self::ModernBert(_) => {
-                panic!("ModernBert: encoder model does not support logit generation; use hidden_states()");
+            Self::ModernBert(_) | Self::ColBERTModernBert(_) => {
+                panic!("Encoder model does not support logit generation; use hidden_states()");
             }
         }
     }
@@ -2257,6 +2275,11 @@ impl CudaWorker {
 
         // Download weight files.
         if repo.get("model.safetensors").is_ok() {
+            // Best-effort: download sentence-transformers projection layer if present.
+            let _ = repo.get("1_Dense/model.safetensors");
+            let _ = repo.get("1_Dense/config.json");
+            // Best-effort: download pooling config.
+            let _ = repo.get("1_Pooling/config.json");
             return Ok(model_dir);
         }
         if let Ok(index_path) = repo.get("model.safetensors.index.json") {
@@ -3296,10 +3319,10 @@ impl CudaWorker {
 
             // Grammar advance on CPU (Python also does FSM state on CPU).
             #[cfg(feature = "guided-decoding")]
-            if !discard[req_idx] {
-                if let Some(g) = grammar_states.get_mut(&req_slice.req_id) {
-                    g.advance(tok);
-                }
+            if !discard[req_idx]
+                && let Some(g) = grammar_states.get_mut(&req_slice.req_id)
+            {
+                g.advance(tok);
             }
 
             input_batch.commit_step(
@@ -4866,8 +4889,14 @@ impl Worker for CudaWorker {
         };
         info!("CudaWorker: using dtype {:?}", dtype);
 
-        // 4. Look up architecture.
-        let arch = hf_config.architectures.first().cloned().unwrap_or_default();
+        // 4. Look up architecture — auto-detect ColBERT if 1_Dense projection exists.
+        let mut arch = hf_config.architectures.first().cloned().unwrap_or_default();
+        if matches!(arch.as_str(), "ModernBertModel" | "ModernBertForMaskedLM")
+            && model_dir.join("1_Dense").join("model.safetensors").exists()
+        {
+            info!("CudaWorker: detected 1_Dense projection — upgrading to ColBERTModernBertModel");
+            arch = "ColBERTModernBertModel".to_string();
+        }
         info!("CudaWorker: architecture = {arch}");
 
         // 5. Parse weight files (CPU mmap — no GPU allocation yet).
@@ -5574,6 +5603,18 @@ impl Worker for CudaWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("ModernBert load: {e}")))?;
                 CudaModel::ModernBert(m)
             }
+            "ColBERTModernBertModel" => {
+                let config = modernbert_config_from_hf(&hf_config)?;
+                let m = vllm_cuda::model::modernbert::ColBERTModernBertModel::load(
+                    &mut weights,
+                    &model_dir,
+                    &config,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("ColBERTModernBert load: {e}")))?;
+                CudaModel::ColBERTModernBert(m)
+            }
             _ => {
                 return Err(ExecutorError::WorkerInit(format!(
                     "unsupported architecture for cuda-backend: {arch}. \
@@ -5582,7 +5623,7 @@ impl Worker for CudaWorker {
                      Gemma3ForConditionalGeneration, GraniteForCausalLM, MixtralForCausalLM, \
                      Qwen2MoeForCausalLM, Qwen3MoeForCausalLM, CohereForCausalLM, \
                      Qwen3NextForCausalLM, DeepseekV2ForCausalLM, DeepSeekV3ForCausalLM, \
-                     ModernBertModel"
+                     ModernBertModel, ColBERTModernBertModel"
                 )));
             }
         };
@@ -5607,6 +5648,7 @@ impl Worker for CudaWorker {
             "last" => vllm_model::embedding::PoolingStrategy::Last,
             "cls" => vllm_model::embedding::PoolingStrategy::Cls,
             "mean" => vllm_model::embedding::PoolingStrategy::Mean,
+            "all" | "all_tokens" => vllm_model::embedding::PoolingStrategy::AllTokens,
             _ => {
                 // "auto": detect from 1_Pooling/config.json, default to Last.
                 vllm_model::embedding::detect_pooling_strategy(&model_dir)
@@ -5724,12 +5766,13 @@ impl Worker for CudaWorker {
         //   max_num_batched_tokens can still OOM on the attention side
         let pp_active = self.pp_config.is_some_and(|pp| pp.pp_size > 1);
         let is_moe = self.model.as_ref().is_some_and(|m| m.is_moe());
-        let is_encoder = self
-            .model
-            .as_ref()
-            .is_some_and(|m| matches!(m, CudaModel::ModernBert(_)));
-        if self.uses_ggml || self.qwen3_next_config.is_some() || pp_active || is_moe || is_encoder
-        {
+        let is_encoder = self.model.as_ref().is_some_and(|m| {
+            matches!(
+                m,
+                CudaModel::ModernBert(_) | CudaModel::ColBERTModernBert(_)
+            )
+        });
+        if self.uses_ggml || self.qwen3_next_config.is_some() || pp_active || is_moe || is_encoder {
             let tag = if self.uses_ggml {
                 "GGML"
             } else if pp_active {
@@ -5993,7 +6036,10 @@ impl Worker for CudaWorker {
         }
 
         // Encoder models don't support CUDA graph capture (no decode loop).
-        if matches!(model, CudaModel::ModernBert(_)) {
+        if matches!(
+            model,
+            CudaModel::ModernBert(_) | CudaModel::ColBERTModernBert(_)
+        ) {
             self.config.cuda_graph_mode = CudaGraphMode::None;
             info!("CudaWorker: encoder model — disabling CUDA graphs");
         }
@@ -6452,7 +6498,6 @@ impl Worker for CudaWorker {
                 let hidden_size = model.hidden_size();
                 results.push(vec![0.0f32; hidden_size]);
                 continue;
-
             }
 
             // Build positions [0, 1, 2, ...].

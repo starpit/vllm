@@ -63,12 +63,7 @@ impl ModernBertConfig {
             .extra
             .get("norm_eps")
             .and_then(|v| v.as_f64())
-            .or_else(|| {
-                config
-                    .extra
-                    .get("layer_norm_eps")
-                    .and_then(|v| v.as_f64())
-            })
+            .or_else(|| config.extra.get("layer_norm_eps").and_then(|v| v.as_f64()))
             .unwrap_or(1e-5) as f32;
 
         let attention_bias = config
@@ -200,9 +195,7 @@ impl ModernBertAttention {
 
         // Per-layer RoPE theta: global vs local layers.
         let rope_theta = if !layer_id.is_multiple_of(config.global_attn_every_n_layers) {
-            config
-                .local_rope_theta
-                .unwrap_or(config.global_rope_theta)
+            config.local_rope_theta.unwrap_or(config.global_rope_theta)
         } else {
             config.global_rope_theta
         };
@@ -230,11 +223,7 @@ impl ModernBertAttention {
         load_linear_weights(&mut self.wo, weights, &format!("{prefix}.Wo"));
     }
 
-    fn forward(
-        &mut self,
-        hidden_states: &Array,
-        _positions: &Array,
-    ) -> Result<Array, Exception> {
+    fn forward(&mut self, hidden_states: &Array, _positions: &Array) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
         let num_heads = self.num_heads as i32;
         let head_dim = self.head_dim as i32;
@@ -265,8 +254,7 @@ impl ModernBertAttention {
         let k = self.rope.forward((&k, 0))?;
 
         // Bidirectional attention (no causal mask).
-        let attn_output =
-            mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None)?;
+        let attn_output = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None)?;
 
         // Reshape back: [1, num_heads, seq, head_dim] → [seq, hidden]
         let attn_output = attn_output
@@ -355,18 +343,12 @@ impl ModernBertLayer {
         if let Some(ref mut norm) = self.attn_norm {
             load_layernorm_weights(norm, weights, &format!("{prefix}.attn_norm"));
         }
-        self.attn
-            .load_weights(weights, &format!("{prefix}.attn"));
+        self.attn.load_weights(weights, &format!("{prefix}.attn"));
         load_layernorm_weights(&mut self.mlp_norm, weights, &format!("{prefix}.mlp_norm"));
-        self.mlp
-            .load_weights(weights, &format!("{prefix}.mlp"));
+        self.mlp.load_weights(weights, &format!("{prefix}.mlp"));
     }
 
-    fn forward(
-        &mut self,
-        hidden_states: &Array,
-        positions: &Array,
-    ) -> Result<Array, Exception> {
+    fn forward(&mut self, hidden_states: &Array, positions: &Array) -> Result<Array, Exception> {
         // Pre-norm attention.
         let normed = if let Some(ref mut norm) = self.attn_norm {
             norm.forward(hidden_states)?
@@ -425,7 +407,21 @@ impl MlxModernBertModel {
         _dtype: mlx_rs::Dtype,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut model = Self::new(config)?;
-        let weights = load_safetensors_weights(model_dir)?;
+        let raw_weights = load_safetensors_weights(model_dir)?;
+        // Some checkpoints (e.g. answerdotai/ModernBERT-base) have "model." prefix,
+        // others (e.g. lightonai/GTE-ModernColBERT-v1) do not. Strip if present.
+        let weights: HashMap<String, Array> =
+            if raw_weights.contains_key("model.embeddings.tok_embeddings.weight") {
+                raw_weights
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let stripped = k.strip_prefix("model.").unwrap_or(&k).to_string();
+                        (stripped, v)
+                    })
+                    .collect()
+            } else {
+                raw_weights
+            };
         model.load_weights(&weights);
         // Eval all loaded weights to materialize them.
         mlx_rs::transforms::eval(weights.values())?;
@@ -464,8 +460,101 @@ impl MlxModel for MlxModernBertModel {
 }
 
 // ---------------------------------------------------------------------------
+// ColBERTModernBertModel — ModernBERT + linear projection for ColBERT
+// ---------------------------------------------------------------------------
+
+pub struct MlxColBERTModernBertModel {
+    inner: MlxModernBertModel,
+    /// Linear projection: [hidden_size, colbert_dim] (no bias, no activation).
+    projection: nn::Linear,
+    num_layers: usize,
+}
+
+impl MlxColBERTModernBertModel {
+    pub fn load(
+        model_dir: &Path,
+        config: &ModernBertConfig,
+        _dtype: mlx_rs::Dtype,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Load backbone.
+        let mut inner = MlxModernBertModel::new(config)?;
+        let weights = load_safetensors_weights(model_dir)?;
+        inner.load_weights(&weights);
+        mlx_rs::transforms::eval(weights.values())?;
+
+        // Load projection from 1_Dense/model.safetensors.
+        let dense_path = model_dir.join("1_Dense").join("model.safetensors");
+        let projection = if dense_path.exists() {
+            let dense_weights = Array::load_safetensors(&dense_path)?;
+            // Key is "linear.weight" with shape [colbert_dim, hidden_size].
+            let proj_weight = dense_weights
+                .get("linear.weight")
+                .ok_or("1_Dense/model.safetensors missing 'linear.weight'")?;
+            let colbert_dim = proj_weight.shape()[0];
+            let mut linear = nn::LinearBuilder::new(config.hidden_size as i32, colbert_dim)
+                .bias(false)
+                .build()?;
+            assign_weight(&mut linear.weight, &dense_weights, "linear.weight");
+            mlx_rs::transforms::eval(dense_weights.values())?;
+            linear
+        } else {
+            return Err(format!(
+                "ColBERTModernBertModel requires 1_Dense/model.safetensors in {model_dir:?}"
+            )
+            .into());
+        };
+
+        let num_layers = config.num_hidden_layers;
+        Ok(Self {
+            inner,
+            projection,
+            num_layers,
+        })
+    }
+}
+
+impl MlxModel for MlxColBERTModernBertModel {
+    fn forward(
+        &mut self,
+        _input_ids: &Array,
+        _positions: &Array,
+        _kv_cache: &mut MlxKvCache,
+        _rope_offset: Option<i32>,
+    ) -> mlx_rs::error::Result<Array> {
+        Err(Exception::custom(
+            "ColBERTModernBERT is an encoder-only model — use hidden_states() instead",
+        ))
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    fn hidden_states(
+        &mut self,
+        input_ids: &Array,
+        positions: &Array,
+    ) -> mlx_rs::error::Result<Array> {
+        let hidden = self.inner.hidden_states(input_ids, positions)?;
+        // Project: [num_tokens, hidden_size] → [num_tokens, colbert_dim]
+        self.projection.forward(&hidden)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
+
+pub fn create_mlx_colbert_modernbert(
+    model_dir: &Path,
+    config: &HfModelConfig,
+    dtype: mlx_rs::Dtype,
+) -> Result<Box<dyn MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
+    let mb_config = ModernBertConfig::from_hf_config(config)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let model = MlxColBERTModernBertModel::load(model_dir, &mb_config, dtype)?;
+    Ok(Box::new(model))
+}
 
 pub fn create_mlx_modernbert(
     model_dir: &Path,
@@ -574,9 +663,11 @@ mod tests {
         let input_ids = Array::from_slice(&[1i32], &[1]);
         let positions = Array::from_slice(&[0i32], &[1]);
         let mut kv_cache: MlxKvCache = vec![];
-        assert!(model
-            .forward(&input_ids, &positions, &mut kv_cache, None)
-            .is_err());
+        assert!(
+            model
+                .forward(&input_ids, &positions, &mut kv_cache, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -594,6 +685,55 @@ mod tests {
     }
 
     #[test]
+    fn test_colbert_wrapper_output_shape() {
+        // ColBERT wrapper: hidden_states should produce [N, colbert_dim] not [N, hidden_size].
+        let config = test_config(); // hidden_size=64
+        let colbert_dim = 16;
+        let inner = MlxModernBertModel::new(&config).unwrap();
+
+        // Build projection: Linear(64 → 16, no bias).
+        let projection = nn::LinearBuilder::new(config.hidden_size as i32, colbert_dim)
+            .bias(false)
+            .build()
+            .unwrap();
+
+        let mut colbert = MlxColBERTModernBertModel {
+            inner,
+            projection,
+            num_layers: config.num_hidden_layers,
+        };
+
+        let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[4]);
+        let positions = Array::from_slice(&[0i32, 1, 2, 3], &[4]);
+        let out = colbert.hidden_states(&input_ids, &positions).unwrap();
+        mlx_rs::transforms::eval([&out]).unwrap();
+        // Output should be [4, 16] (projected), not [4, 64] (backbone).
+        assert_eq!(out.shape(), &[4, colbert_dim]);
+    }
+
+    #[test]
+    fn test_colbert_forward_returns_error() {
+        let config = test_config();
+        let projection = nn::LinearBuilder::new(config.hidden_size as i32, 16)
+            .bias(false)
+            .build()
+            .unwrap();
+        let mut colbert = MlxColBERTModernBertModel {
+            inner: MlxModernBertModel::new(&config).unwrap(),
+            projection,
+            num_layers: config.num_hidden_layers,
+        };
+        let input_ids = Array::from_slice(&[1i32], &[1]);
+        let positions = Array::from_slice(&[0i32], &[1]);
+        let mut kv_cache: MlxKvCache = vec![];
+        assert!(
+            colbert
+                .forward(&input_ids, &positions, &mut kv_cache, None)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_config_from_hf() {
         let mut hf = HfModelConfig::default();
         hf.hidden_size = Some(768);
@@ -602,10 +742,8 @@ mod tests {
         hf.intermediate_size = Some(1152);
         hf.vocab_size = Some(50368);
         hf.max_position_embeddings = Some(8192);
-        hf.extra.insert(
-            "norm_eps".to_string(),
-            serde_json::Value::from(1e-5),
-        );
+        hf.extra
+            .insert("norm_eps".to_string(), serde_json::Value::from(1e-5));
         hf.extra.insert(
             "global_rope_theta".to_string(),
             serde_json::Value::from(160000.0),

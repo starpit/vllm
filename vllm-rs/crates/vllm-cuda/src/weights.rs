@@ -941,6 +941,17 @@ impl GpuWeights {
         self.tensors = stripped;
     }
 
+    /// Add a prefix to all tensor names (e.g. "model." for checkpoints
+    /// that omit the outer module prefix).
+    pub fn add_prefix(&mut self, prefix: &str) {
+        let prefixed: HashMap<String, CpuTensorRef> = self
+            .tensors
+            .drain()
+            .map(|(name, tensor)| (format!("{prefix}{name}"), tensor))
+            .collect();
+        self.tensors = prefixed;
+    }
+
     /// Get the stream used for H2D copies.
     pub fn stream(&self) -> CUstream {
         self.stream

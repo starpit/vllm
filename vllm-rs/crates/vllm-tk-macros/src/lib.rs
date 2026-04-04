@@ -112,65 +112,96 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
     let qkv_dim = (nah + 2 * nkh) * hdm;
 
     let expanded = quote! {
-        // ── Const-generic tensor wrapper types ──
-        // Shapes are part of the type — mismatches are compile errors.
+        // ── Typed GPU buffer handles ──
+        // Each category is a distinct type with const-generic dims.
+        // NonNull enforces non-null at construction. Const generics enforce
+        // dimension matching at compile time.
 
-        /// GPU activation buffer: dynamic batch dim, static feature dim D.
+        /// GPU activation buffer: [batch, D]. Batch is runtime, D is compile-time.
         #[repr(transparent)]
-        pub struct Activation<const D: usize>(*mut u8);
+        pub struct GpuActivation<const D: usize>(core::ptr::NonNull<u8>);
 
-        /// 2D weight matrix [ROWS, COLS]. Both dims compile-time known.
+        /// GPU activation buffer with intermediate_dim: [batch, D].
         #[repr(transparent)]
-        pub struct Weight<const ROWS: usize, const COLS: usize>(*const u8);
+        pub struct GpuActivationBig<const D: usize>(core::ptr::NonNull<u8>);
 
-        /// 1D weight vector [D] (e.g., RMSNorm weights).
+        /// GPU logits buffer: [batch, VS]. VS is compile-time.
         #[repr(transparent)]
-        pub struct Weight1D<const D: usize>(*const u8);
+        pub struct GpuLogits<const VS: usize>(core::ptr::NonNull<u8>);
 
-        /// Opaque paged KV cache.
+        /// GPU weight matrix: [ROWS, COLS] (both compile-time).
+        /// Used for qkv, o_proj, up, gate, lm_head weights.
         #[repr(transparent)]
-        pub struct KvCache(*mut u8);
+        pub struct GpuWeight<const ROWS: usize, const COLS: usize>(core::ptr::NonNull<u8>);
 
-        /// Opaque metadata (positions, block tables).
+        /// GPU weight matrix with swapped convention (hidden→intermediate):
+        /// [ROWS, COLS] where COLS is intermediate_dim.
         #[repr(transparent)]
-        pub struct Metadata(*const u8);
+        pub struct GpuWeightBig<const ROWS: usize, const COLS: usize>(core::ptr::NonNull<u8>);
 
-        impl<const D: usize> Activation<D> {
-            /// # Safety
-            /// The pointer must point to a valid GPU buffer with last dim == D.
-            pub unsafe fn from_ptr(ptr: *mut u8) -> Self { Self(ptr) }
-            pub fn as_ptr(&self) -> *mut u8 { self.0 }
+        /// GPU 1D norm weight: [NL, D] or [1, D].
+        #[repr(transparent)]
+        pub struct GpuNormWeight<const D: usize>(core::ptr::NonNull<u8>);
+
+        /// GPU paged KV cache (opaque — dims are runtime).
+        #[repr(transparent)]
+        pub struct GpuKvCache(core::ptr::NonNull<u8>);
+
+        /// GPU RoPE table: [max_pos, HDM].
+        #[repr(transparent)]
+        pub struct GpuRopeTable<const HDM: usize>(core::ptr::NonNull<u8>);
+
+        /// GPU i32 metadata vector (runtime-length CSR arrays, position IDs, etc).
+        #[repr(transparent)]
+        pub struct GpuMetaVec(core::ptr::NonNull<u8>);
+
+        /// GPU barrier tensor (runtime dims, opaque).
+        #[repr(transparent)]
+        pub struct GpuBarrier(core::ptr::NonNull<u8>);
+
+        /// GPU instruction/timing layout (runtime dims, opaque).
+        #[repr(transparent)]
+        pub struct GpuVmLayout(core::ptr::NonNull<u8>);
+
+        // Implement construction + pointer extraction for each handle type.
+        macro_rules! impl_gpu_handle {
+            ($ty:ident $(< $(const $g:ident : usize),+ >)?) => {
+                impl$(<$(const $g: usize),+>)? $ty$(<$($g),+>)? {
+                    /// Create from a raw GPU pointer.
+                    ///
+                    /// # Safety
+                    /// `ptr` must point to valid, correctly-sized GPU memory.
+                    pub unsafe fn from_raw(ptr: *mut u8) -> Self {
+                        Self(core::ptr::NonNull::new(ptr)
+                            .expect(concat!(stringify!($ty), ": null GPU pointer")))
+                    }
+                    /// Raw pointer (for FFI).
+                    pub fn as_ptr(&self) -> *mut u8 { self.0.as_ptr() }
+                    /// Pointer as u64 (for TkTensorArg).
+                    pub fn ptr_u64(&self) -> u64 { self.0.as_ptr() as u64 }
+                }
+            }
         }
 
-        impl<const ROWS: usize, const COLS: usize> Weight<ROWS, COLS> {
-            /// # Safety
-            /// The pointer must point to a valid GPU buffer of shape [ROWS, COLS].
-            pub unsafe fn from_ptr(ptr: *const u8) -> Self { Self(ptr) }
-            pub fn as_ptr(&self) -> *const u8 { self.0 }
-        }
-
-        impl<const D: usize> Weight1D<D> {
-            /// # Safety
-            /// The pointer must point to a valid GPU buffer of shape [D].
-            pub unsafe fn from_ptr(ptr: *const u8) -> Self { Self(ptr) }
-            pub fn as_ptr(&self) -> *const u8 { self.0 }
-        }
-
-        impl KvCache {
-            pub unsafe fn from_ptr(ptr: *mut u8) -> Self { Self(ptr) }
-            pub fn as_ptr(&self) -> *mut u8 { self.0 }
-        }
-
-        impl Metadata {
-            pub unsafe fn from_ptr(ptr: *const u8) -> Self { Self(ptr) }
-            pub fn as_ptr(&self) -> *const u8 { self.0 }
-        }
+        impl_gpu_handle!(GpuActivation<const D: usize>);
+        impl_gpu_handle!(GpuActivationBig<const D: usize>);
+        impl_gpu_handle!(GpuLogits<const VS: usize>);
+        impl_gpu_handle!(GpuWeight<const ROWS: usize, const COLS: usize>);
+        impl_gpu_handle!(GpuWeightBig<const ROWS: usize, const COLS: usize>);
+        impl_gpu_handle!(GpuNormWeight<const D: usize>);
+        impl_gpu_handle!(GpuKvCache);
+        impl_gpu_handle!(GpuRopeTable<const HDM: usize>);
+        impl_gpu_handle!(GpuMetaVec);
+        impl_gpu_handle!(GpuBarrier);
+        impl_gpu_handle!(GpuVmLayout);
 
         /// Auto-generated megakernel. All safety properties verified at compile time.
         /// Buffer shapes are enforced via const generics in the launch signature.
         pub struct #struct_name;
 
         /// Flat tensor descriptor for FFI. Matches the C-side TkTensorArg.
+        /// This is an internal type — users construct typed handles, and
+        /// launch methods convert to TkTensorArg automatically.
         #[repr(C)]
         #[derive(Clone, Copy, Debug)]
         pub struct TkTensorArg {
@@ -197,62 +228,59 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
 
         /// All buffers needed to launch the static megakernel.
         ///
-        /// Weight shapes are enforced at compile time via const generics.
-        /// Activation shapes use the static feature dim; batch dim is runtime.
-        /// Opaque buffers (KV cache, metadata) are runtime-only.
+        /// Every field uses a typed handle with compile-time dimension checks.
+        /// Constructing this struct requires correctly-typed GPU buffers —
+        /// shape mismatches and null pointers are compile/runtime errors.
         ///
-        /// This struct is the compile-time safety boundary: constructing it
-        /// requires providing correctly-typed tensors. Once built, the FFI
-        /// call is a flat memcpy of pointers — all shape invariants are
-        /// guaranteed by the type system.
+        /// The launch methods convert these typed handles to flat FFI args
+        /// with shapes baked in by the proc-macro.
         pub struct LaunchArgs {
-            // ── Barrier (cross-SM synchronization) ──
-            pub barrier: TkTensorArg,
-            // ── Instructions + timings (dummy for static kernel, used by globals) ──
-            pub instructions: TkTensorArg,
-            pub timings: TkTensorArg,
+            // ── VM state ──
+            pub barrier: GpuBarrier,
+            pub instructions: GpuVmLayout,
+            pub timings: GpuVmLayout,
 
-            // ── Weights (shapes enforced by typed setters) ──
-            pub qkv_weights: TkTensorArg,
-            pub attn_norm: TkTensorArg,
-            pub o_proj: TkTensorArg,
-            pub mlp_norm: TkTensorArg,
-            pub up_weights: TkTensorArg,
-            pub gate_weights: TkTensorArg,
-            pub down_proj: TkTensorArg,
-            pub lm_head_norm: TkTensorArg,
-            pub lm_head: TkTensorArg,
+            // ── Weights (const-generic dims enforce model architecture match) ──
+            pub qkv_weights: GpuWeight<{#qkv_dim}, {#hd}>,
+            pub attn_norm: GpuNormWeight<{#hd}>,
+            pub o_proj: GpuWeight<{#hd}, {#hd}>,
+            pub mlp_norm: GpuNormWeight<{#hd}>,
+            pub up_weights: GpuWeight<{#id}, {#hd}>,
+            pub gate_weights: GpuWeight<{#id}, {#hd}>,
+            pub down_proj: GpuWeightBig<{#hd}, {#id}>,
+            pub lm_head_norm: GpuNormWeight<{#hd}>,
+            pub lm_head: GpuWeight<{#vs}, {#hd}>,
 
             // ── KV cache ──
-            pub k_cache: TkTensorArg,
-            pub v_cache: TkTensorArg,
+            pub k_cache: GpuKvCache,
+            pub v_cache: GpuKvCache,
 
             // ── RoPE tables ──
-            pub rope_cos: TkTensorArg,
-            pub rope_sin: TkTensorArg,
+            pub rope_cos: GpuRopeTable<{#hdm}>,
+            pub rope_sin: GpuRopeTable<{#hdm}>,
 
-            // ── Activation buffers ──
-            pub hidden_states: TkTensorArg,
-            pub rms_rope: TkTensorArg,
-            pub rms_gate: TkTensorArg,
-            pub q_post_rope: TkTensorArg,
-            pub attn_out: TkTensorArg,
-            pub silu_out: TkTensorArg,
-            pub rms_lm: TkTensorArg,
-            pub logits: TkTensorArg,
+            // ── Activation buffers (feature dim is compile-time) ──
+            pub hidden_states: GpuActivation<{#hd}>,
+            pub rms_rope: GpuActivation<{#hd}>,
+            pub rms_gate: GpuActivation<{#hd}>,
+            pub q_post_rope: GpuActivation<{#hd}>,
+            pub attn_out: GpuActivation<{#hd}>,
+            pub silu_out: GpuActivationBig<{#id}>,
+            pub rms_lm: GpuActivation<{#hd}>,
+            pub logits: GpuLogits<{#vs}>,
 
             // ── Paged KV metadata (decode) ──
-            pub position_ids: TkTensorArg,
-            pub kv_indptr: TkTensorArg,
-            pub kv_indices: TkTensorArg,
-            pub kv_last_page: TkTensorArg,
-            pub kv_append: TkTensorArg,
+            pub position_ids: GpuMetaVec,
+            pub kv_indptr: GpuMetaVec,
+            pub kv_indices: GpuMetaVec,
+            pub kv_last_page: GpuMetaVec,
+            pub kv_append: GpuMetaVec,
 
             // ── Paged KV metadata (prefill) ──
-            pub prefill_qo_indptr: TkTensorArg,
-            pub prefill_kv_indptr: TkTensorArg,
-            pub prefill_kv_indices: TkTensorArg,
-            pub prefill_kv_last_page_len: TkTensorArg,
+            pub prefill_qo_indptr: GpuMetaVec,
+            pub prefill_kv_indptr: GpuMetaVec,
+            pub prefill_kv_indices: GpuMetaVec,
+            pub prefill_kv_last_page_len: GpuMetaVec,
 
             // ── Scalars ──
             pub attn_scale: f32,
@@ -276,11 +304,68 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
             pub const PIPELINE_DIAGRAM: &str = #diagram_str;
             pub const CUDA_SOURCE: &str = #cuda_source;
 
+            /// Convert typed LaunchArgs to flat TkTensorArg FFI args.
+            ///
+            /// Shapes are baked in from the proc-macro — no hand-written shape arrays.
+            /// The `batch_rows` param sets the runtime row dim for activations/metadata.
+            /// The `barrier_shape`, `inst_shape`, and `timing_shape` params set VM state tensor shapes.
+            #[allow(clippy::possible_missing_comma)]
+            fn args_to_ffi(
+                args: &LaunchArgs,
+                batch_rows: usize,
+                barrier_shape: [usize; 4],
+                inst_shape: [usize; 4],
+                timing_shape: [usize; 4],
+            ) -> [TkTensorArg; 33] {
+                [
+                    // VM state
+                    TkTensorArg::new(args.barrier.ptr_u64(), &barrier_shape),
+                    TkTensorArg::new(args.instructions.ptr_u64(), &inst_shape),
+                    TkTensorArg::new(args.timings.ptr_u64(), &timing_shape),
+                    // Weights — shapes baked from model dims
+                    TkTensorArg::new(args.qkv_weights.ptr_u64(), &[#nl * #qkv_dim, #hd]),
+                    TkTensorArg::new(args.attn_norm.ptr_u64(), &[#nl, #hd]),
+                    TkTensorArg::new(args.o_proj.ptr_u64(), &[#nl * #hd, #hd]),
+                    TkTensorArg::new(args.mlp_norm.ptr_u64(), &[#nl, #hd]),
+                    TkTensorArg::new(args.up_weights.ptr_u64(), &[#nl * #id, #hd]),
+                    TkTensorArg::new(args.gate_weights.ptr_u64(), &[#nl * #id, #hd]),
+                    TkTensorArg::new(args.down_proj.ptr_u64(), &[#nl * #hd, #id]),
+                    TkTensorArg::new(args.lm_head_norm.ptr_u64(), &[1, #hd]),
+                    TkTensorArg::new(args.lm_head.ptr_u64(), &[#vs, #hd]),
+                    // KV cache
+                    TkTensorArg::new(args.k_cache.ptr_u64(), &[args.num_pages as usize, 1, #nkh, #hdm]),
+                    TkTensorArg::new(args.v_cache.ptr_u64(), &[args.num_pages as usize, 1, #nkh, #hdm]),
+                    // RoPE
+                    TkTensorArg::new(args.rope_cos.ptr_u64(), &[4096, #hdm]),
+                    TkTensorArg::new(args.rope_sin.ptr_u64(), &[4096, #hdm]),
+                    // Activations — batch dim is runtime
+                    TkTensorArg::new(args.hidden_states.ptr_u64(), &[1, 1, batch_rows, #hd]),
+                    TkTensorArg::new(args.rms_rope.ptr_u64(), &[1, 1, batch_rows, #hd]),
+                    TkTensorArg::new(args.rms_gate.ptr_u64(), &[1, 1, batch_rows, #hd]),
+                    TkTensorArg::new(args.q_post_rope.ptr_u64(), &[1, 1, batch_rows, #hd]),
+                    TkTensorArg::new(args.attn_out.ptr_u64(), &[1, 1, batch_rows, #hd]),
+                    TkTensorArg::new(args.silu_out.ptr_u64(), &[1, 1, batch_rows, #id]),
+                    TkTensorArg::new(args.rms_lm.ptr_u64(), &[1, 1, batch_rows, #hd]),
+                    TkTensorArg::new(args.logits.ptr_u64(), &[1, 1, batch_rows, #vs]),
+                    // Decode KV metadata
+                    TkTensorArg::new(args.position_ids.ptr_u64(), &[batch_rows]),
+                    TkTensorArg::new(args.kv_indptr.ptr_u64(), &[batch_rows + 1]),
+                    TkTensorArg::new(args.kv_indices.ptr_u64(), &[args.num_pages as usize]),
+                    TkTensorArg::new(args.kv_last_page.ptr_u64(), &[batch_rows]),
+                    TkTensorArg::new(args.kv_append.ptr_u64(), &[batch_rows]),
+                    // Prefill KV metadata
+                    TkTensorArg::new(args.prefill_qo_indptr.ptr_u64(), &[1]),
+                    TkTensorArg::new(args.prefill_kv_indptr.ptr_u64(), &[1]),
+                    TkTensorArg::new(args.prefill_kv_indices.ptr_u64(), &[1]),
+                    TkTensorArg::new(args.prefill_kv_last_page_len.ptr_u64(), &[1]),
+                ]
+            }
+
             /// Launch the decode megakernel (1 token per sequence).
             ///
             /// All weight shapes are verified at compile time through the
-            /// const-generic typed setters used to construct `LaunchArgs`.
-            /// Only `batch_size` is runtime-checked (dynamic dimension).
+            /// typed handles in `LaunchArgs`. Only `batch_size` and VM state
+            /// shapes are runtime.
             ///
             /// # Safety
             /// All pointers in `args` must point to valid GPU memory.
@@ -289,27 +374,29 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 args: &LaunchArgs,
                 batch_size: i32,
                 num_prefill_tokens: i32,
+                barrier_shape: [usize; 4],
+                inst_shape: [usize; 4],
+                timing_shape: [usize; 4],
                 stream: u64,
             ) -> i32 {
                 debug_assert!(batch_size > 0, "batch_size must be > 0");
                 debug_assert!(batch_size <= 128, "batch_size must be <= 128 (decode)");
 
+                let batch_rows = (batch_size as usize).next_multiple_of(128);
+                let ffi = Self::args_to_ffi(args, batch_rows, barrier_shape, inst_shape, timing_shape);
+
                 #[cfg(feature = "cuda")]
                 {
                     crate::ffi::llama_sm89_decode_static_launch(
-                        args.barrier, args.instructions, args.timings,
-                        args.qkv_weights, args.attn_norm, args.o_proj,
-                        args.mlp_norm, args.up_weights, args.gate_weights,
-                        args.down_proj, args.lm_head_norm, args.lm_head,
-                        args.k_cache, args.v_cache,
-                        args.rope_cos, args.rope_sin,
-                        args.hidden_states, args.rms_rope, args.rms_gate,
-                        args.q_post_rope, args.attn_out, args.silu_out,
-                        args.rms_lm, args.logits,
-                        args.position_ids, args.kv_indptr, args.kv_indices,
-                        args.kv_last_page, args.kv_append,
-                        args.prefill_qo_indptr, args.prefill_kv_indptr,
-                        args.prefill_kv_indices, args.prefill_kv_last_page_len,
+                        ffi[0], ffi[1], ffi[2],
+                        ffi[3], ffi[4], ffi[5], ffi[6], ffi[7], ffi[8],
+                        ffi[9], ffi[10], ffi[11],
+                        ffi[12], ffi[13],
+                        ffi[14], ffi[15],
+                        ffi[16], ffi[17], ffi[18], ffi[19], ffi[20], ffi[21],
+                        ffi[22], ffi[23],
+                        ffi[24], ffi[25], ffi[26], ffi[27], ffi[28],
+                        ffi[29], ffi[30], ffi[31], ffi[32],
                         args.attn_scale, args.rms_norm_eps,
                         args.num_pages, batch_size, num_prefill_tokens,
                         stream,
@@ -317,7 +404,7 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    let _ = (args, batch_size, num_prefill_tokens, stream);
+                    let _ = (args, batch_size, num_prefill_tokens, barrier_shape, inst_shape, timing_shape, stream, ffi);
                     panic!("launch_decode requires --features cuda");
                 }
             }
@@ -330,26 +417,28 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 args: &LaunchArgs,
                 batch_size: i32,
                 num_prefill_tokens: i32,
+                barrier_shape: [usize; 4],
+                inst_shape: [usize; 4],
+                timing_shape: [usize; 4],
                 stream: u64,
             ) -> i32 {
                 debug_assert!(num_prefill_tokens > 0, "num_prefill_tokens must be > 0");
 
+                let batch_rows = (num_prefill_tokens as usize).next_multiple_of(128);
+                let ffi = Self::args_to_ffi(args, batch_rows, barrier_shape, inst_shape, timing_shape);
+
                 #[cfg(feature = "cuda")]
                 {
                     crate::ffi::llama_sm89_prefill_static_launch(
-                        args.barrier, args.instructions, args.timings,
-                        args.qkv_weights, args.attn_norm, args.o_proj,
-                        args.mlp_norm, args.up_weights, args.gate_weights,
-                        args.down_proj, args.lm_head_norm, args.lm_head,
-                        args.k_cache, args.v_cache,
-                        args.rope_cos, args.rope_sin,
-                        args.hidden_states, args.rms_rope, args.rms_gate,
-                        args.q_post_rope, args.attn_out, args.silu_out,
-                        args.rms_lm, args.logits,
-                        args.position_ids, args.kv_indptr, args.kv_indices,
-                        args.kv_last_page, args.kv_append,
-                        args.prefill_qo_indptr, args.prefill_kv_indptr,
-                        args.prefill_kv_indices, args.prefill_kv_last_page_len,
+                        ffi[0], ffi[1], ffi[2],
+                        ffi[3], ffi[4], ffi[5], ffi[6], ffi[7], ffi[8],
+                        ffi[9], ffi[10], ffi[11],
+                        ffi[12], ffi[13],
+                        ffi[14], ffi[15],
+                        ffi[16], ffi[17], ffi[18], ffi[19], ffi[20], ffi[21],
+                        ffi[22], ffi[23],
+                        ffi[24], ffi[25], ffi[26], ffi[27], ffi[28],
+                        ffi[29], ffi[30], ffi[31], ffi[32],
                         args.attn_scale, args.rms_norm_eps,
                         args.num_pages, batch_size, num_prefill_tokens,
                         stream,
@@ -357,7 +446,7 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    let _ = (args, batch_size, num_prefill_tokens, stream);
+                    let _ = (args, batch_size, num_prefill_tokens, barrier_shape, inst_shape, timing_shape, stream, ffi);
                     panic!("launch_prefill requires --features cuda");
                 }
             }

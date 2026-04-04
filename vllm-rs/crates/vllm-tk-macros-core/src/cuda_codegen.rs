@@ -1158,6 +1158,36 @@ const LAUNCH_PARAMS: &str = "\
     // CUDA stream
     uint64_t stream";
 
+/// Emit host-side assertions for dynamic dims that `make_gl` doesn't check (the -1 dims).
+/// These fire before cudaLaunchKernel, catching mismatched runtime shapes cheaply.
+fn emit_dynamic_dim_assertions(out: &mut String, dag: &ModelDag, indent: &str, is_prefill: bool) {
+    let nl = dag.params["NL"];
+
+    // Barrier must cover all pipeline stages (layers)
+    writeln!(
+        out,
+        "{indent}// ── Dynamic dim assertions (catch -1 dims that make_gl skips) ──"
+    )
+    .unwrap();
+    writeln!(out, "{indent}if (bar.b < {nl}) {{ fprintf(stderr, \"ASSERT: barrier batch %d < NL={nl}\\n\", bar.b); fflush(stderr); return -100; }}").unwrap();
+
+    // Activations: rows must cover batch
+    writeln!(out, "{indent}if (hidden.r < batch_size) {{ fprintf(stderr, \"ASSERT: hidden rows %d < batch_size %d\\n\", hidden.r, batch_size); fflush(stderr); return -101; }}").unwrap();
+
+    // Scalars must be sane
+    writeln!(out, "{indent}if (batch_size <= 0) {{ fprintf(stderr, \"ASSERT: batch_size %d <= 0\\n\", batch_size); fflush(stderr); return -106; }}").unwrap();
+    writeln!(out, "{indent}if (num_pages <= 0) {{ fprintf(stderr, \"ASSERT: num_pages %d <= 0\\n\", num_pages); fflush(stderr); return -107; }}").unwrap();
+
+    // KV metadata must be non-empty
+    writeln!(out, "{indent}if (kv_indices.c < 1) {{ fprintf(stderr, \"ASSERT: kv_indices empty\\n\"); fflush(stderr); return -108; }}").unwrap();
+
+    if is_prefill {
+        writeln!(out, "{indent}if (num_prefill_tokens <= 0) {{ fprintf(stderr, \"ASSERT: num_prefill_tokens %d <= 0\\n\", num_prefill_tokens); fflush(stderr); return -109; }}").unwrap();
+    }
+
+    writeln!(out).unwrap();
+}
+
 fn emit_decode_launch_wrapper(out: &mut String, dag: &ModelDag) {
     writeln!(out, "// ── C launch wrapper (decode) ──").unwrap();
     writeln!(
@@ -1176,6 +1206,7 @@ fn emit_decode_launch_wrapper(out: &mut String, dag: &ModelDag) {
     writeln!(out, "  try {{").unwrap();
     emit_globals_construction(out, "    ");
     writeln!(out).unwrap();
+    emit_dynamic_dim_assertions(out, dag, "    ", false);
     writeln!(out, "    int shmem = g.dynamic_shared_memory();").unwrap();
     writeln!(
         out,
@@ -1225,6 +1256,7 @@ fn emit_prefill_launch_wrapper(out: &mut String, dag: &ModelDag) {
     writeln!(out, "  try {{").unwrap();
     emit_globals_construction(out, "    ");
     writeln!(out).unwrap();
+    emit_dynamic_dim_assertions(out, dag, "    ", true);
     writeln!(out, "    int shmem = g.dynamic_shared_memory();").unwrap();
     writeln!(
         out,

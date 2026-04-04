@@ -68,61 +68,72 @@ mod tests {
     }
 
     #[test]
-    fn typed_wrappers_exist() {
-        // Verify the const-generic types compile with correct dimensions
-        let _: fn(&Activation<2048>) = |_| {};
-        let _: fn(&Weight<3072, 2048>) = |_| {};
-        let _: fn(&Weight1D<2048>) = |_| {};
-        let _: fn(&KvCache) = |_| {};
-        let _: fn(&Metadata) = |_| {};
+    fn typed_handles_exist() {
+        // Verify typed GPU handle types compile with correct dimensions.
+        // These are function type checks — if the type doesn't exist, it won't compile.
+        let _: fn(&GpuActivation<2048>) = |_| {};
+        let _: fn(&GpuActivationBig<8192>) = |_| {};
+        let _: fn(&GpuWeight<3072, 2048>) = |_| {};
+        let _: fn(&GpuWeightBig<2048, 8192>) = |_| {};
+        let _: fn(&GpuNormWeight<2048>) = |_| {};
+        let _: fn(&GpuLogits<128256>) = |_| {};
+        let _: fn(&GpuKvCache) = |_| {};
+        let _: fn(&GpuRopeTable<64>) = |_| {};
+        let _: fn(&GpuMetaVec) = |_| {};
+        let _: fn(&GpuBarrier) = |_| {};
+        let _: fn(&GpuVmLayout) = |_| {};
     }
 
     #[test]
-    fn launch_args_struct_exists() {
-        // Verify LaunchArgs has expected fields with correct types.
-        let args = LaunchArgs {
-            barrier: TkTensorArg::null(),
-            instructions: TkTensorArg::null(),
-            timings: TkTensorArg::null(),
-            qkv_weights: TkTensorArg::null(),
-            attn_norm: TkTensorArg::null(),
-            o_proj: TkTensorArg::null(),
-            mlp_norm: TkTensorArg::null(),
-            up_weights: TkTensorArg::null(),
-            gate_weights: TkTensorArg::null(),
-            down_proj: TkTensorArg::null(),
-            lm_head_norm: TkTensorArg::null(),
-            lm_head: TkTensorArg::null(),
-            k_cache: TkTensorArg::null(),
-            v_cache: TkTensorArg::null(),
-            rope_cos: TkTensorArg::null(),
-            rope_sin: TkTensorArg::null(),
-            hidden_states: TkTensorArg::null(),
-            rms_rope: TkTensorArg::null(),
-            rms_gate: TkTensorArg::null(),
-            q_post_rope: TkTensorArg::null(),
-            attn_out: TkTensorArg::null(),
-            silu_out: TkTensorArg::null(),
-            rms_lm: TkTensorArg::null(),
-            logits: TkTensorArg::null(),
-            position_ids: TkTensorArg::null(),
-            kv_indptr: TkTensorArg::null(),
-            kv_indices: TkTensorArg::null(),
-            kv_last_page: TkTensorArg::null(),
-            kv_append: TkTensorArg::null(),
-            prefill_qo_indptr: TkTensorArg::null(),
-            prefill_kv_indptr: TkTensorArg::null(),
-            prefill_kv_indices: TkTensorArg::null(),
-            prefill_kv_last_page_len: TkTensorArg::null(),
-            attn_scale: 0.125,
-            rms_norm_eps: 1e-5,
-            num_pages: 0,
+    fn launch_args_typed_fields() {
+        // Verify LaunchArgs has typed fields that enforce model dimensions.
+        // Use a dummy non-null pointer (0x1000) — we never dereference it.
+        let dummy = 0x1000usize as *mut u8;
+        let args = unsafe {
+            LaunchArgs {
+                barrier: GpuBarrier::from_raw(dummy),
+                instructions: GpuVmLayout::from_raw(dummy),
+                timings: GpuVmLayout::from_raw(dummy),
+                qkv_weights: GpuWeight::from_raw(dummy),
+                attn_norm: GpuNormWeight::from_raw(dummy),
+                o_proj: GpuWeight::from_raw(dummy),
+                mlp_norm: GpuNormWeight::from_raw(dummy),
+                up_weights: GpuWeight::from_raw(dummy),
+                gate_weights: GpuWeight::from_raw(dummy),
+                down_proj: GpuWeightBig::from_raw(dummy),
+                lm_head_norm: GpuNormWeight::from_raw(dummy),
+                lm_head: GpuWeight::from_raw(dummy),
+                k_cache: GpuKvCache::from_raw(dummy),
+                v_cache: GpuKvCache::from_raw(dummy),
+                rope_cos: GpuRopeTable::from_raw(dummy),
+                rope_sin: GpuRopeTable::from_raw(dummy),
+                hidden_states: GpuActivation::from_raw(dummy),
+                rms_rope: GpuActivation::from_raw(dummy),
+                rms_gate: GpuActivation::from_raw(dummy),
+                q_post_rope: GpuActivation::from_raw(dummy),
+                attn_out: GpuActivation::from_raw(dummy),
+                silu_out: GpuActivationBig::from_raw(dummy),
+                rms_lm: GpuActivation::from_raw(dummy),
+                logits: GpuLogits::from_raw(dummy),
+                position_ids: GpuMetaVec::from_raw(dummy),
+                kv_indptr: GpuMetaVec::from_raw(dummy),
+                kv_indices: GpuMetaVec::from_raw(dummy),
+                kv_last_page: GpuMetaVec::from_raw(dummy),
+                kv_append: GpuMetaVec::from_raw(dummy),
+                prefill_qo_indptr: GpuMetaVec::from_raw(dummy),
+                prefill_kv_indptr: GpuMetaVec::from_raw(dummy),
+                prefill_kv_indices: GpuMetaVec::from_raw(dummy),
+                prefill_kv_last_page_len: GpuMetaVec::from_raw(dummy),
+                attn_scale: 0.125,
+                rms_norm_eps: 1e-5,
+                num_pages: 0,
+            }
         };
-        // Verify the struct is constructible and fields have expected values
-        assert_eq!(args.barrier.ptr, 0);
         assert_eq!(args.attn_scale, 0.125);
         assert_eq!(args.rms_norm_eps, 1e-5);
         assert_eq!(args.num_pages, 0);
+        // Typed handles preserve pointer
+        assert_eq!(args.qkv_weights.ptr_u64(), 0x1000);
     }
 
     #[test]
@@ -150,15 +161,23 @@ mod tests {
     #[test]
     fn const_generic_type_safety() {
         // These compile: shapes match model dimensions
-        let _hd: Activation<2048> = unsafe { Activation::from_ptr(std::ptr::null_mut()) };
-        let _id: Activation<8192> = unsafe { Activation::from_ptr(std::ptr::null_mut()) };
-        let _w: Weight<8192, 2048> = unsafe { Weight::from_ptr(std::ptr::null()) };
-        let _n: Weight1D<2048> = unsafe { Weight1D::from_ptr(std::ptr::null()) };
+        let dummy = 0x1000usize as *mut u8;
+        let _hd: GpuActivation<2048> = unsafe { GpuActivation::from_raw(dummy) };
+        let _id: GpuActivationBig<8192> = unsafe { GpuActivationBig::from_raw(dummy) };
+        let _w: GpuWeight<8192, 2048> = unsafe { GpuWeight::from_raw(dummy) };
+        let _n: GpuNormWeight<2048> = unsafe { GpuNormWeight::from_raw(dummy) };
 
         // Verify round-trip through pointer extraction
-        assert!(_hd.as_ptr().is_null());
-        assert!(_w.as_ptr().is_null());
-        assert!(_n.as_ptr().is_null());
+        assert_eq!(_hd.as_ptr(), dummy);
+        assert_eq!(_w.as_ptr(), dummy);
+        assert_eq!(_n.as_ptr(), dummy);
+    }
+
+    #[test]
+    #[should_panic(expected = "null GPU pointer")]
+    fn null_handle_panics() {
+        // NonNull enforces non-null at construction time
+        unsafe { GpuActivation::<2048>::from_raw(std::ptr::null_mut()) };
     }
 
     #[test]

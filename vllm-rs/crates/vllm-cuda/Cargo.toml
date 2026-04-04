@@ -8,7 +8,7 @@ description = "Purpose-built CUDA tensor runtime for LLM inference — replaces 
 [features]
 default = []
 # Enable CUDA runtime. Requires CUDA toolkit + nvcc.
-cuda = ["dep:cudarc", "dep:vllm-kernels-cuda", "vllm-kernels-cuda/cuda"]
+cuda = ["dep:cudarc", "dep:vllm-kernels-cuda", "vllm-kernels-cuda/cuda", "dep:hf-hub"]
 # Enable NCCL multi-GPU collective communication (requires libnccl).
 nccl = ["cuda", "cudarc/nccl"]
 # Enable NVTX profiling annotations for nsys/Nsight traces.
@@ -29,6 +29,7 @@ vllm-common = { path = "../vllm-common" }
 vllm-config = { path = "../vllm-config" }
 vllm-model = { path = "../vllm-model" }
 libc = { workspace = true }
+hf-hub = { version = "0.4", optional = true }
 
 [build-dependencies]
 dirs = "6"
@@ -37,3 +38,8 @@ dirs = "6"
 rand = { workspace = true }
 tempfile = { workspace = true }
 portpicker = "0.1"
+hf-hub = "0.4"
+
+[[bin]]
+name = "gen_golden"
+required-features = ["cuda"]

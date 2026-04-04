@@ -183,8 +183,9 @@ struct sm89_globals_t {
     using norm_weights_t    = gl<bf16, 1, 1, -1, hidden_dim, sv_bf<hidden_dim>>;
     using rope_table_t      = gl<float, 1, 1, -1, head_dim,  sv_fl<head_dim>>;
 
-    // KV cache: paged layout [num_layers * num_pages, page_size / kv_block_size, num_kv_heads, head_dim]
-    // Indexed as: cache[{num_pages * layer + page_idx, iter_in_page, kv_head, 0}]
+    // KV cache: paged layout [num_layers * num_pages, kv_page_size, num_kv_heads, head_dim]
+    // Tile loads use axis=1: warp::load_async<1,false>(st, cache, {page, iter_block, kv_head, 0})
+    //   iter_block maps to depth positions iter_block*kv_block_size .. +kv_block_size-1
     using kv_cache_t        = gl<bf16, -1, -1, num_kv_heads, head_dim,
                                  st_bf<kv_block_size, head_dim>>;
 

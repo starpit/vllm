@@ -101,5 +101,8 @@ unsafe extern "C" {
         batch_size: i32,
         num_prefill_tokens: i32,
         stream: u64,
+        // Prefill per-sequence metadata
+        seq_chunk_lens: *const i32,
+        seq_extend_offsets: *const i32,
     ) -> i32;
 }

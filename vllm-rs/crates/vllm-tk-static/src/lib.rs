@@ -127,6 +127,8 @@ mod tests {
                 attn_scale: 0.125,
                 rms_norm_eps: 1e-5,
                 num_pages: 0,
+                prefill_num_seqs: 0,
+                prefill_num_kv_pages: 0,
             }
         };
         assert_eq!(args.attn_scale, 0.125);

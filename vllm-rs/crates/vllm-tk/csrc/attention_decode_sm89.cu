@@ -205,10 +205,6 @@ struct attention_decode {
         static __device__ void run(const Globals &g, state<Config> &s) {
             parsed_instruction inst{s};
             int lid = warp::laneid();
-            if (inst.layer_idx == 0 && inst.kv_head_idx == 0 && lid == 0)
-                printf("ATTN_DECODE LOADER: SM=%d layer=%d bb=%d kv_head=%d\n",
-                    blockIdx.x, inst.layer_idx, inst.batch_block_idx, inst.kv_head_idx);
-
             // Each batch item in the attention block has its own paged KV sequence.
             // For simplicity in the loader, we process batch items sequentially,
             // loading K and V tiles for each item's page table.
@@ -229,9 +225,11 @@ struct attention_decode {
             int first_batch_idx = inst.batch_block_idx * ATTN_BATCH_BLOCK_SIZE;
 
             // We need the maximum total_attn_blocks across all items in this block.
+            // Guard: batch may be smaller than ATTN_BATCH_BLOCK_SIZE.
             int max_total_blocks = 0;
             for (int b = 0; b < ATTN_BATCH_BLOCK_SIZE; b++) {
                 int seq_idx = first_batch_idx + b;
+                if (seq_idx >= g.batch_size) break;
                 int indptr_start = g.decode_kv_indptr[{seq_idx}];
                 int indptr_end   = g.decode_kv_indptr[{seq_idx + 1}];
                 int np = indptr_end - indptr_start;
@@ -244,26 +242,15 @@ struct attention_decode {
             int used_stages = min(max_total_blocks, NUM_STAGES);
             int first_unused_page = used_stages * PAGES_PER_STAGE;
 
-            if (inst.layer_idx == 0 && inst.kv_head_idx == 0 && lid == 0)
-                printf("ATTN_DECODE LOADER detail: max_blocks=%d used_stages=%d first_unused=%d NUM_PAGES=%d PAGES_PER_STAGE=%d\n",
-                    max_total_blocks, used_stages, first_unused_page, (int)Config::NUM_PAGES, PAGES_PER_STAGE);
-
             // Release unused pages first (lane 0 only).
             if (lid == 0) {
                 for (int p = first_unused_page; p < (int)Config::NUM_PAGES; p++) {
                     int unused = s.pid(p);
-                    if (inst.layer_idx == 0 && inst.kv_head_idx == 0)
-                        printf("ATTN_DECODE: releasing unused page p=%d pid=%d\n", p, unused);
                     s.wait_page_ready(unused);
-                    if (inst.layer_idx == 0 && inst.kv_head_idx == 0)
-                        printf("ATTN_DECODE: page %d ready, finishing\n", p);
                     s.finish_page(unused, Config::NUM_CONSUMER_WARPS);
                 }
             }
             __syncwarp();
-
-            if (inst.layer_idx == 0 && inst.kv_head_idx == 0 && lid == 0)
-                printf("ATTN_DECODE: unused pages released, entering main loop\n");
 
             int batch_block_idx = (inst.batch_block_idx * ATTN_BATCH_BLOCK_SIZE)
                                 / Globals::matmul_batch_block_size;
@@ -305,6 +292,7 @@ struct attention_decode {
                 // but for ATTN_BATCH_BLOCK_SIZE <= 8 the overhead is minimal.
                 for (int b = 0; b < ATTN_BATCH_BLOCK_SIZE; b++) {
                     int seq_idx = first_batch_idx + b;
+                    if (seq_idx >= g.batch_size) break;
                     int indptr_start_b = g.decode_kv_indptr[{seq_idx}];
                     int indptr_end_b   = g.decode_kv_indptr[{seq_idx + 1}];
                     int np_b = indptr_end_b - indptr_start_b;
@@ -314,9 +302,9 @@ struct attention_decode {
                     if (i < total_b) {
                         int kv_page_index = g.decode_kv_indices[{indptr_start_b + (i / iters_per_page)}];
                         int iter_in_page = i % iters_per_page;
+                        int page_batch = (int)g.num_pages * inst.layer_idx + kv_page_index;
                         warp::load_async<1, false>(get_K_smem(s, stage, b), g.k_cache,
-                                         {(int)g.num_pages * inst.layer_idx + kv_page_index,
-                                          iter_in_page, inst.kv_head_idx, 0});
+                                         {page_batch, iter_in_page, inst.kv_head_idx, 0});
                     }
                     // If i >= total_b, this item has no more KV blocks — smem stays zero/stale
                     // but the consumer will mask it out via seq_len.
@@ -345,6 +333,7 @@ struct attention_decode {
                 // Load V from paged KV cache for each batch item.
                 for (int b = 0; b < ATTN_BATCH_BLOCK_SIZE; b++) {
                     int seq_idx = first_batch_idx + b;
+                    if (seq_idx >= g.batch_size) break;
                     int indptr_start_b = g.decode_kv_indptr[{seq_idx}];
                     int indptr_end_b   = g.decode_kv_indptr[{seq_idx + 1}];
                     int np_b = indptr_end_b - indptr_start_b;
@@ -354,9 +343,9 @@ struct attention_decode {
                     if (i < total_b) {
                         int kv_page_index = g.decode_kv_indices[{indptr_start_b + (i / iters_per_page)}];
                         int iter_in_page = i % iters_per_page;
+                        int page_batch_v = (int)g.num_pages * inst.layer_idx + kv_page_index;
                         warp::load_async<1, false>(get_V_smem(s, stage, b), g.v_cache,
-                                         {(int)g.num_pages * inst.layer_idx + kv_page_index,
-                                          iter_in_page, inst.kv_head_idx, 0});
+                                         {page_batch_v, iter_in_page, inst.kv_head_idx, 0});
                     }
                 }
 
@@ -398,21 +387,23 @@ struct attention_decode {
 
                 // Check if this is a padding warp (no real KV data).
                 int seq_idx = inst.batch_block_idx * ATTN_BATCH_BLOCK_SIZE + wid;
-                int indptr_start = g.decode_kv_indptr[{seq_idx}];
-                int indptr_end   = g.decode_kv_indptr[{seq_idx + 1}];
+                bool padding_warp = (seq_idx >= g.batch_size);
+                int indptr_start = padding_warp ? 0 : (int)g.decode_kv_indptr[{seq_idx}];
+                int indptr_end   = padding_warp ? 0 : (int)g.decode_kv_indptr[{seq_idx + 1}];
                 int num_kv_pages = indptr_end - indptr_start;
-                int last_page_len = g.decode_kv_last_page_len[{seq_idx}];
+                int last_page_len = padding_warp ? 0 : (int)g.decode_kv_last_page_len[{seq_idx}];
                 int seq_len    = (num_kv_pages - 1) * Globals::kv_page_size + last_page_len;
                 int total_blks = ((num_kv_pages - 1) * iters_per_page) +
                                  (last_page_len + kv_block_size - 1) / kv_block_size;
 
-                if (num_kv_pages <= 0) {
+                if (padding_warp || num_kv_pages <= 0) {
                     // Padding warp: no real sequence. Release pages and signal O_arrived.
                     // Compute max_total_blocks to know which stages the loader used.
                     int first_batch_idx_for_max = inst.batch_block_idx * ATTN_BATCH_BLOCK_SIZE;
                     int max_total_blocks = 0;
                     for (int b2 = 0; b2 < ATTN_BATCH_BLOCK_SIZE; b2++) {
                         int si2 = first_batch_idx_for_max + b2;
+                        if (si2 >= g.batch_size) break;
                         int is2 = g.decode_kv_indptr[{si2}];
                         int ie2 = g.decode_kv_indptr[{si2 + 1}];
                         int np2 = ie2 - is2;

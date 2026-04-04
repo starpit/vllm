@@ -87,10 +87,6 @@ struct rms_op_sm89 {
 
         static __device__ void run(const Globals &g, state<Config> &s) {
             parsed_instruction inst{s};
-            if (inst.layer_idx == 0 && inst.batch_idx == 0 && laneid() == 0)
-                printf("RMS_NORM LOADER: SM=%d opcode=%d layer=%d batch=%d\n",
-                    blockIdx.x, opcode, inst.layer_idx, inst.batch_idx);
-
             // Clear scratch partial-sum slots.
             ((uint64_t *)s.scratch())[laneid()] = 0;
             warp::sync();
@@ -114,9 +110,6 @@ struct rms_op_sm89 {
 
             // ── gmem barrier: wait for previous op (lane 0 spins) ────────────
             if (laneid() == 0) gmem_waiter::gmem_wait(g, s, inst);
-            if (inst.layer_idx == 0 && inst.batch_idx == 0 && laneid() == 0)
-                printf("RMS_NORM PAST BARRIER: SM=%d opcode=%d layer=%d batch=%d\n",
-                    blockIdx.x, opcode, inst.layer_idx, inst.batch_idx);
             warp::sync(); // all lanes wait for gmem_wait to complete
 
             // ── cp.async: load activations (ALL lanes participate) ───────────

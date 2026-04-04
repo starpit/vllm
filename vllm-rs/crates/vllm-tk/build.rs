@@ -2,6 +2,22 @@
 // Compiles the ThunderKittens KVM LLaMA sm89 megakernel into a static lib.
 // Uses cudaforge for incremental builds (content-hashed, only recompiles on change).
 
+#[cfg(feature = "cuda")]
+fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(walkdir(&path));
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
 fn main() {
     #[cfg(feature = "cuda")]
     cuda_build();
@@ -41,12 +57,22 @@ fn cuda_build() {
     for f in &watch_files {
         println!("cargo:rerun-if-changed={}", f);
     }
+    // Watch all TK headers so transitive include changes trigger rebuilds.
+    for entry in walkdir(std::path::Path::new(tk_include)) {
+        println!("cargo:rerun-if-changed={}", entry.display());
+    }
     println!("cargo:rerun-if-changed=build.rs");
 
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)
         .source_files(vec![source.to_string()])
-        .watch(watch_files.iter().map(|s| s.to_string()))
+        .watch(
+            watch_files.iter().map(|s| s.to_string()).chain(
+                walkdir(std::path::Path::new(tk_include))
+                    .iter()
+                    .map(|p| p.display().to_string()),
+            ),
+        )
         .include_path(tk_include)
         .include_path(tk_prototype)
         .include_path("csrc") // for llama_sm89.cuh and op .cu files

@@ -30,11 +30,12 @@ using up_matmul_op     = up_matmul    <llama_sm89_config, llama_sm89_globals>;
 using downproj_op      = downproj     <llama_sm89_config, llama_sm89_globals>;
 using lm_head_norm_op  = lm_head_norm <llama_sm89_config, llama_sm89_globals>;
 using lm_head_op       = lm_head      <llama_sm89_config, llama_sm89_globals>;
+using noop_op          = NoOp<llama_sm89_config>;
 
 // The kernel function pointer (needed for cudaFuncSetAttribute).
 static auto kvm_kernel = kvm<llama_sm89_config,
     llama_sm89_globals,
-    attn_norm_op, qkv_op, attn_prefill_op, attn_op, o_proj_op, mlp_norm_op,
+    noop_op, attn_norm_op, qkv_op, attn_prefill_op, attn_op, o_proj_op, mlp_norm_op,
     gate_silu_op, up_matmul_op, downproj_op, lm_head_norm_op, lm_head_op>;
 
 // Flat tensor descriptor passed from Rust via FFI.

@@ -20,9 +20,9 @@ mod inner {
     use vllm_cuda::{OwnedTensor, RawGpuMem};
 
     use super::build_csr_metadata;
-    use crate::ffi::TkTensorArg;
     use crate::scheduler::{self, DecodeInstructions, PrefillSeq, TkModelConfig};
     use crate::weights::TkWeights;
+    use vllm_tk_static::*;
 
     // TK kernel constants (must match llama_sm89.cuh)
     const KV_PAGE_SIZE: usize = 64;
@@ -114,7 +114,7 @@ mod inner {
 
     /// TK KV cache: single flat tensors (not per-layer).
     ///
-    /// Layout: `[num_layers * num_pages, page_size / kv_block_size, num_kv_heads, head_dim]`
+    /// Layout: `[num_layers * num_pages, kv_page_size, num_kv_heads, head_dim]`
     pub struct TkKvCache {
         k_cache: GpuTensor,
         v_cache: GpuTensor,
@@ -133,9 +133,12 @@ mod inner {
             head_dim: usize,
             stream: CUstream,
         ) -> Result<Self> {
-            let pages_per_kv_block = KV_PAGE_SIZE / KV_BLOCK_SIZE;
+            // Depth = kv_page_size (token positions per page).
+            // The kernel's warp::load_async<1, false> uses axis=1, so tile rows
+            // map to the depth dimension. Each tile row = one token position.
+            // st_bf<kv_block_size, head_dim> loads 16 consecutive depth positions.
             let b = num_layers * num_blocks;
-            let d = pages_per_kv_block;
+            let d = KV_PAGE_SIZE;
             let dtype = DType::BF16;
             let total_bytes = b * d * num_kv_heads * head_dim * dtype.size_bytes();
 
@@ -493,8 +496,8 @@ mod inner {
 
                 for _t in 0..seq.chunk_len {
                     // Each token points to the same page list.
-                    for p in 0..num_pages {
-                        self.host_kv_indices.push(blocks[p] as i32);
+                    for &b in &blocks[..num_pages] {
+                        self.host_kv_indices.push(b as i32);
                     }
                     page_offset += num_pages as i32;
                     self.host_kv_indptr.push(page_offset);
@@ -680,185 +683,112 @@ mod inner {
                 }
             }
 
-            let inst_arg = TkTensorArg::new(
-                inst.as_ptr::<u8>() as u64,
-                &[
-                    1,
-                    decode_info.sm_count,
-                    decode_info.max_per_sm,
-                    scheduler::INSTRUCTION_WIDTH,
-                ],
-            );
-            let timing_arg = TkTensorArg::new(
-                timing.as_ptr::<u8>() as u64,
-                &[
-                    1,
-                    decode_info.sm_count,
-                    decode_info.max_per_sm,
-                    scheduler::TIMING_WIDTH,
-                ],
-            );
             let n_batch_blocks = decode_info.n_batch_blocks;
             let max_barrier_cols = decode_info.max_barrier_cols;
+            let sm_count = decode_info.sm_count;
+            let max_per_sm = decode_info.max_per_sm;
+            // Extract raw pointers before mutable borrows below.
+            let inst_ptr = inst.as_ptr::<u8>() as *mut u8;
+            let timing_ptr = timing.as_ptr::<u8>() as *mut u8;
 
             // 3. Zero barrier, then pad for incomplete last batch block.
             self.ensure_and_zero_barrier(n_batch_blocks, max_barrier_cols);
             self.pad_prefill_barriers(batch_size, n_batch_blocks, max_barrier_cols);
-            let bar = self.barrier.as_ref().unwrap();
+            let bar_ptr = self.barrier.as_ref().unwrap().as_ptr::<u8>() as *mut u8;
             let nl = config.num_hidden_layers;
 
-            // Dump barrier pre-pad values for layer 0
-            {
-                let bar_size = nl * scheduler::NUM_OPS * n_batch_blocks * max_barrier_cols;
-                let mut host_bar = vec![0u32; bar_size];
-                unsafe {
-                    driver::memcpy_dtoh_async(
-                        host_bar.as_mut_ptr() as *mut u8,
-                        bar.as_ptr::<u8>(),
-                        bar_size * 4,
-                        stream,
-                    )
-                    .ok();
-                    driver::stream_synchronize(stream).ok();
-                }
-                // Print barrier[layer=0, op_slot, bb=0, col=0] for all op slots
-                for op in 0..scheduler::NUM_OPS {
-                    let idx = (0 * scheduler::NUM_OPS + op) * n_batch_blocks * max_barrier_cols;
-                    let val = host_bar[idx];
-                    if val != 0 {
-                        tracing::info!("  barrier[layer=0, op_slot={}, bb=0, col=0] = {}", op, val);
-                    }
-                }
-            }
-            let bar_arg = TkTensorArg::new(
-                bar.as_ptr::<u8>() as u64,
-                &[nl, scheduler::NUM_OPS, n_batch_blocks, max_barrier_cols],
-            );
-
-            // 4. Build FFI args.
+            // 4. Build typed LaunchArgs and launch via static megakernel.
             let weights = self.weights.as_ref().unwrap();
             let kv = self.kv_cache.as_ref().unwrap();
             let kv_meta = self.kv_meta.as_ref().unwrap();
             let act = self.activations.as_ref().unwrap();
             let num_pages = kv.num_blocks;
-            let total_kv_indices = self.host_kv_indices.len();
-            let vs = config.vocab_size;
-            let id = config.intermediate_size;
 
             let attn_scale = 1.0 / (config.head_dim as f32).sqrt();
-            // Activation gl r dimension must cover the full batch block extent (not just
-            // batch_size) because the matmul pipeline loads 128-row tiles. The backing
-            // allocation is max_bs rows, so this is safe. Using batch_size=1 would make
-            // the gl report rows()=1, and while TK's bounds check should zero-fill OOB
-            // rows, passing the full extent avoids any predicated-load codegen issues.
-            let act_rows = n_batch_blocks * 128; // matmul_batch_block_size
             tracing::info!(
-                "launch_decode: FFI call, num_pages={}, total_kv_indices={}, attn_scale={}, act_rows={}",
+                "launch_decode: num_pages={}, attn_scale={}, batch_size={}",
                 num_pages,
-                total_kv_indices,
                 attn_scale,
-                act_rows
+                batch_size
             );
-            tracing::info!(
-                "  hidden_states={:#x}, rms_rope={:#x}, rms_gate={:#x}, q_post={:#x}",
-                act.hidden_states.as_ptr::<u8>() as u64,
-                act.rms_rope.as_ptr::<u8>() as u64,
-                act.rms_gate.as_ptr::<u8>() as u64,
-                act.q_post_rope.as_ptr::<u8>() as u64
-            );
-            tracing::info!(
-                "  attn_out={:#x}, silu_out={:#x}, rms_lm={:#x}, logits={:#x}",
-                act.attn_out.as_ptr::<u8>() as u64,
-                act.silu_out.as_ptr::<u8>() as u64,
-                act.rms_lm.as_ptr::<u8>() as u64,
-                act.logits.as_ptr::<u8>() as u64
-            );
-            {
-                let w = weights;
-                tracing::info!(
-                    "  qkv_w={:#x}, attn_norm={:#x}, o_w={:#x}, mlp_norm={:#x}",
-                    w.qkv_proj.as_ptr::<u8>() as u64,
-                    w.attn_norm.as_ptr::<u8>() as u64,
-                    w.o_proj.as_ptr::<u8>() as u64,
-                    w.mlp_norm.as_ptr::<u8>() as u64
-                );
-                tracing::info!(
-                    "  up_w={:#x}, gate_w={:#x}, down_w={:#x}, lm_norm={:#x}, lm_w={:#x}",
-                    w.up_proj.as_ptr::<u8>() as u64,
-                    w.gate_proj.as_ptr::<u8>() as u64,
-                    w.down_proj.as_ptr::<u8>() as u64,
-                    w.lm_head_norm.as_ptr::<u8>() as u64,
-                    w.lm_head.as_ptr::<u8>() as u64
-                );
-                tracing::info!(
-                    "  k_cache={:#x}, v_cache={:#x}, rope_cos={:#x}, rope_sin={:#x}",
-                    kv.k_cache.as_ptr::<u8>() as u64,
-                    kv.v_cache.as_ptr::<u8>() as u64,
-                    w.rope_cos.as_ptr::<u8>() as u64,
-                    w.rope_sin.as_ptr::<u8>() as u64
-                );
-            }
 
-            unsafe {
-                crate::ffi::tk_llama_1b_launch(
-                    bar_arg,
-                    inst_arg,
-                    timing_arg,
-                    // Weights
-                    TkTensorArg::from_gpu_tensor(weights.qkv_proj),
-                    TkTensorArg::from_gpu_tensor(weights.attn_norm),
-                    TkTensorArg::from_gpu_tensor(weights.o_proj),
-                    TkTensorArg::from_gpu_tensor(weights.mlp_norm),
-                    TkTensorArg::from_gpu_tensor(weights.up_proj),
-                    TkTensorArg::from_gpu_tensor(weights.gate_proj),
-                    TkTensorArg::from_gpu_tensor(weights.down_proj),
-                    TkTensorArg::from_gpu_tensor(weights.lm_head_norm),
-                    TkTensorArg::from_gpu_tensor(weights.lm_head),
-                    // KV cache
-                    TkTensorArg::from_gpu_tensor(kv.k_cache),
-                    TkTensorArg::from_gpu_tensor(kv.v_cache),
-                    // RoPE
-                    TkTensorArg::from_gpu_tensor(weights.rope_cos),
-                    TkTensorArg::from_gpu_tensor(weights.rope_sin),
-                    // Activations — use act_rows (padded to mbb) so gl.rows() covers
-                    // the full extent the matmul pipeline will access.
-                    TkTensorArg::new(
-                        act.hidden_states.as_ptr::<u8>() as u64,
-                        &[1, 1, act_rows, hd],
+            let args = unsafe {
+                LaunchArgs {
+                    barrier: GpuBarrier::from_raw(bar_ptr),
+                    instructions: GpuVmLayout::from_raw(inst_ptr),
+                    timings: GpuVmLayout::from_raw(timing_ptr),
+                    qkv_weights: GpuWeight::from_raw(weights.qkv_proj.as_ptr::<u8>() as *mut u8),
+                    attn_norm: GpuNormWeight::from_raw(weights.attn_norm.as_ptr::<u8>() as *mut u8),
+                    o_proj: GpuWeight::from_raw(weights.o_proj.as_ptr::<u8>() as *mut u8),
+                    mlp_norm: GpuNormWeight::from_raw(weights.mlp_norm.as_ptr::<u8>() as *mut u8),
+                    up_weights: GpuWeight::from_raw(weights.up_proj.as_ptr::<u8>() as *mut u8),
+                    gate_weights: GpuWeight::from_raw(weights.gate_proj.as_ptr::<u8>() as *mut u8),
+                    down_proj: GpuWeightBig::from_raw(weights.down_proj.as_ptr::<u8>() as *mut u8),
+                    lm_head_norm: GpuNormWeight::from_raw(
+                        weights.lm_head_norm.as_ptr::<u8>() as *mut u8
                     ),
-                    TkTensorArg::new(act.rms_rope.as_ptr::<u8>() as u64, &[1, 1, act_rows, hd]),
-                    TkTensorArg::new(act.rms_gate.as_ptr::<u8>() as u64, &[1, 1, act_rows, hd]),
-                    TkTensorArg::new(act.q_post_rope.as_ptr::<u8>() as u64, &[1, 1, act_rows, hd]),
-                    TkTensorArg::new(act.attn_out.as_ptr::<u8>() as u64, &[1, 1, act_rows, hd]),
-                    TkTensorArg::new(act.silu_out.as_ptr::<u8>() as u64, &[1, 1, act_rows, id]),
-                    TkTensorArg::new(act.rms_lm.as_ptr::<u8>() as u64, &[1, 1, act_rows, hd]),
-                    TkTensorArg::new(act.logits.as_ptr::<u8>() as u64, &[1, 1, act_rows, vs]),
-                    // Paged KV metadata
-                    TkTensorArg::new(kv_meta.position_ids.as_ptr::<u8>() as u64, &[batch_size]),
-                    TkTensorArg::new(kv_meta.kv_indptr.as_ptr::<u8>() as u64, &[batch_size + 1]),
-                    TkTensorArg::new(
-                        kv_meta.kv_indices.as_ptr::<u8>() as u64,
-                        &[total_kv_indices],
+                    lm_head: GpuWeight::from_raw(weights.lm_head.as_ptr::<u8>() as *mut u8),
+                    k_cache: GpuKvCache::from_raw(kv.k_cache.as_ptr::<u8>() as *mut u8),
+                    v_cache: GpuKvCache::from_raw(kv.v_cache.as_ptr::<u8>() as *mut u8),
+                    rope_cos: GpuRopeTable::from_raw(weights.rope_cos.as_ptr::<u8>() as *mut u8),
+                    rope_sin: GpuRopeTable::from_raw(weights.rope_sin.as_ptr::<u8>() as *mut u8),
+                    hidden_states: GpuActivation::from_raw(
+                        act.hidden_states.as_ptr::<u8>() as *mut u8
                     ),
-                    TkTensorArg::new(kv_meta.kv_last_page.as_ptr::<u8>() as u64, &[batch_size]),
-                    TkTensorArg::new(kv_meta.kv_append.as_ptr::<u8>() as u64, &[batch_size]),
-                    // Prefill KV metadata (dummy for decode-only, must pass valid
-                    // dims to satisfy make_gl dimension checks in TK).
-                    // int32_vector_t = gl<int, 1, 1, 1, -1>, so b=1,d=1,r=1,c=1.
-                    // Reuse kv_last_page buffer as dummy pointer (data not accessed).
-                    TkTensorArg::new(kv_meta.kv_last_page.as_ptr::<u8>() as u64, &[1]),
-                    TkTensorArg::new(kv_meta.kv_last_page.as_ptr::<u8>() as u64, &[1]),
-                    TkTensorArg::new(kv_meta.kv_last_page.as_ptr::<u8>() as u64, &[1]),
-                    TkTensorArg::new(kv_meta.kv_last_page.as_ptr::<u8>() as u64, &[1]),
-                    // Scalars
+                    rms_rope: GpuActivation::from_raw(act.rms_rope.as_ptr::<u8>() as *mut u8),
+                    rms_gate: GpuActivation::from_raw(act.rms_gate.as_ptr::<u8>() as *mut u8),
+                    q_post_rope: GpuActivation::from_raw(act.q_post_rope.as_ptr::<u8>() as *mut u8),
+                    attn_out: GpuActivation::from_raw(act.attn_out.as_ptr::<u8>() as *mut u8),
+                    silu_out: GpuActivationBig::from_raw(act.silu_out.as_ptr::<u8>() as *mut u8),
+                    rms_lm: GpuActivation::from_raw(act.rms_lm.as_ptr::<u8>() as *mut u8),
+                    logits: GpuLogits::from_raw(act.logits.as_ptr::<u8>() as *mut u8),
+                    position_ids: GpuMetaVec::from_raw(
+                        kv_meta.position_ids.as_ptr::<u8>() as *mut u8
+                    ),
+                    kv_indptr: GpuMetaVec::from_raw(kv_meta.kv_indptr.as_ptr::<u8>() as *mut u8),
+                    kv_indices: GpuMetaVec::from_raw(kv_meta.kv_indices.as_ptr::<u8>() as *mut u8),
+                    kv_last_page: GpuMetaVec::from_raw(
+                        kv_meta.kv_last_page.as_ptr::<u8>() as *mut u8
+                    ),
+                    kv_append: GpuMetaVec::from_raw(kv_meta.kv_append.as_ptr::<u8>() as *mut u8),
+                    // Dummy prefill metadata for decode — reuse kv_last_page as valid non-null ptr
+                    prefill_qo_indptr: GpuMetaVec::from_raw(
+                        kv_meta.kv_last_page.as_ptr::<u8>() as *mut u8
+                    ),
+                    prefill_kv_indptr: GpuMetaVec::from_raw(
+                        kv_meta.kv_last_page.as_ptr::<u8>() as *mut u8
+                    ),
+                    prefill_kv_indices: GpuMetaVec::from_raw(
+                        kv_meta.kv_last_page.as_ptr::<u8>() as *mut u8
+                    ),
+                    prefill_kv_last_page_len: GpuMetaVec::from_raw(
+                        kv_meta.kv_last_page.as_ptr::<u8>() as *mut u8,
+                    ),
                     attn_scale,
-                    config.rms_norm_eps,
-                    num_pages as i32,
-                    batch_size as i32,
-                    0, // num_prefill_tokens
-                    // Stream
+                    rms_norm_eps: config.rms_norm_eps,
+                    num_pages: num_pages as i32,
+                    prefill_num_seqs: 0,
+                    prefill_num_kv_pages: 0,
+                }
+            };
+
+            let barrier_shape = [nl, scheduler::NUM_OPS, n_batch_blocks, max_barrier_cols];
+            let inst_shape = [1, sm_count, max_per_sm, scheduler::INSTRUCTION_WIDTH];
+            let timing_shape = [1, sm_count, max_per_sm, scheduler::TIMING_WIDTH];
+
+            let rc = unsafe {
+                MegakernelLlamaSm89::launch_decode(
+                    &args,
+                    DecodeBatchSize(batch_size as i32),
+                    NumTokens(0), // num_prefill_tokens
+                    barrier_shape,
+                    inst_shape,
+                    timing_shape,
                     stream as u64,
-                );
+                )
+            };
+            if rc != 0 {
+                panic!("launch_decode failed: rc={rc}");
             }
             unsafe {
                 driver::stream_synchronize(stream).expect("decode stream sync");
@@ -941,10 +871,6 @@ mod inner {
                 .expect("zero timings");
             }
 
-            let inst_arg = TkTensorArg::new(inst_tensor.as_ptr::<u8>() as u64, &[1, sm, mps, iw]);
-            let timing_arg =
-                TkTensorArg::new(timing_tensor.as_ptr::<u8>() as u64, &[1, sm, mps, tw]);
-
             // 3. Zero barrier, then pad partial last batch block.
             self.ensure_and_zero_barrier(
                 prefill_info.n_batch_blocks,
@@ -955,17 +881,8 @@ mod inner {
                 prefill_info.n_batch_blocks,
                 prefill_info.max_barrier_cols,
             );
-            let bar = self.barrier.as_ref().unwrap();
+            let bar_ptr = self.barrier.as_ref().unwrap().as_ptr::<u8>() as *mut u8;
             let nl = config.num_hidden_layers;
-            let bar_arg = TkTensorArg::new(
-                bar.as_ptr::<u8>() as u64,
-                &[
-                    nl,
-                    scheduler::NUM_OPS,
-                    prefill_info.n_batch_blocks,
-                    prefill_info.max_barrier_cols,
-                ],
-            );
 
             // 4. Upload per-token KV metadata for QKV_RopeAppend.
             // Unlike decode (1 token per seq), prefill has multiple tokens per seq.
@@ -1003,8 +920,8 @@ mod inner {
                 let total_seq_len = seq.extend_offset + seq.chunk_len;
                 let num_kv_pages = total_seq_len.div_ceil(KV_PAGE_SIZE);
                 let blocks = block_tables[i];
-                for p in 0..num_kv_pages {
-                    self.host_prefill_kv_indices.push(blocks[p] as i32);
+                for &b in &blocks[..num_kv_pages] {
+                    self.host_prefill_kv_indices.push(b as i32);
                 }
                 kv_offset += num_kv_pages as i32;
                 self.host_prefill_kv_indptr.push(kv_offset);
@@ -1054,103 +971,136 @@ mod inner {
                 .expect("upload prefill_kv_last_page_len");
             }
 
-            // 6. Build FFI args and launch.
+            // 6. Upload per-sequence chunk_lens and extend_offsets for prefill attention.
+            let alloc = self.alloc.as_mut().unwrap();
+            let host_chunk_lens: Vec<i32> =
+                prefill_seqs.iter().map(|s| s.chunk_len as i32).collect();
+            let host_extend_offsets: Vec<i32> = prefill_seqs
+                .iter()
+                .map(|s| s.extend_offset as i32)
+                .collect();
+            let chunk_lens_gpu = alloc.alloc_tensor(&[num_prefill_seqs], DType::I32);
+            let extend_offsets_gpu = alloc.alloc_tensor(&[num_prefill_seqs], DType::I32);
+            unsafe {
+                driver::memcpy_htod_async(
+                    chunk_lens_gpu.as_ptr::<u8>() as *mut u8,
+                    host_chunk_lens.as_ptr() as *const u8,
+                    num_prefill_seqs * 4,
+                    stream,
+                )
+                .expect("upload seq_chunk_lens");
+                driver::memcpy_htod_async(
+                    extend_offsets_gpu.as_ptr::<u8>() as *mut u8,
+                    host_extend_offsets.as_ptr() as *const u8,
+                    num_prefill_seqs * 4,
+                    stream,
+                )
+                .expect("upload seq_extend_offsets");
+            }
+            let seq_chunk_lens =
+                unsafe { GpuMetaVec::from_raw(chunk_lens_gpu.as_ptr::<u8>() as *mut u8) };
+            let seq_extend_offsets =
+                unsafe { GpuMetaVec::from_raw(extend_offsets_gpu.as_ptr::<u8>() as *mut u8) };
+
+            // 7. Build typed LaunchArgs and launch via static megakernel.
             let weights = self.weights.as_ref().unwrap();
             let kv = self.kv_cache.as_ref().unwrap();
             let act = self.activations.as_ref().unwrap();
             let num_pages = kv.num_blocks;
-            let total_kv_indices = self.host_kv_indices.len();
-            let vs = config.vocab_size;
-            let id = config.intermediate_size;
             let attn_scale = 1.0 / (config.head_dim as f32).sqrt();
 
             tracing::info!(
-                "TK prefill launch: total_tokens={}, n_batch_blocks={}, max_barrier_cols={}, sm={}, mps={}, num_instructions={}",
+                "TK prefill launch: total_tokens={}, n_batch_blocks={}, sm={}, mps={}",
                 total_tokens,
                 prefill_info.n_batch_blocks,
-                prefill_info.max_barrier_cols,
                 sm,
                 mps,
-                prefill_info.instructions.len() / iw,
             );
-            // Pad activation/metadata gl shapes to cover full batch blocks.
-            let padded = total_tokens.next_multiple_of(128);
+
+            let args = unsafe {
+                LaunchArgs {
+                    barrier: GpuBarrier::from_raw(bar_ptr),
+                    instructions: GpuVmLayout::from_raw(inst_tensor.as_ptr::<u8>() as *mut u8),
+                    timings: GpuVmLayout::from_raw(timing_tensor.as_ptr::<u8>() as *mut u8),
+                    qkv_weights: GpuWeight::from_raw(weights.qkv_proj.as_ptr::<u8>() as *mut u8),
+                    attn_norm: GpuNormWeight::from_raw(weights.attn_norm.as_ptr::<u8>() as *mut u8),
+                    o_proj: GpuWeight::from_raw(weights.o_proj.as_ptr::<u8>() as *mut u8),
+                    mlp_norm: GpuNormWeight::from_raw(weights.mlp_norm.as_ptr::<u8>() as *mut u8),
+                    up_weights: GpuWeight::from_raw(weights.up_proj.as_ptr::<u8>() as *mut u8),
+                    gate_weights: GpuWeight::from_raw(weights.gate_proj.as_ptr::<u8>() as *mut u8),
+                    down_proj: GpuWeightBig::from_raw(weights.down_proj.as_ptr::<u8>() as *mut u8),
+                    lm_head_norm: GpuNormWeight::from_raw(
+                        weights.lm_head_norm.as_ptr::<u8>() as *mut u8
+                    ),
+                    lm_head: GpuWeight::from_raw(weights.lm_head.as_ptr::<u8>() as *mut u8),
+                    k_cache: GpuKvCache::from_raw(kv.k_cache.as_ptr::<u8>() as *mut u8),
+                    v_cache: GpuKvCache::from_raw(kv.v_cache.as_ptr::<u8>() as *mut u8),
+                    rope_cos: GpuRopeTable::from_raw(weights.rope_cos.as_ptr::<u8>() as *mut u8),
+                    rope_sin: GpuRopeTable::from_raw(weights.rope_sin.as_ptr::<u8>() as *mut u8),
+                    hidden_states: GpuActivation::from_raw(
+                        act.hidden_states.as_ptr::<u8>() as *mut u8
+                    ),
+                    rms_rope: GpuActivation::from_raw(act.rms_rope.as_ptr::<u8>() as *mut u8),
+                    rms_gate: GpuActivation::from_raw(act.rms_gate.as_ptr::<u8>() as *mut u8),
+                    q_post_rope: GpuActivation::from_raw(act.q_post_rope.as_ptr::<u8>() as *mut u8),
+                    attn_out: GpuActivation::from_raw(act.attn_out.as_ptr::<u8>() as *mut u8),
+                    silu_out: GpuActivationBig::from_raw(act.silu_out.as_ptr::<u8>() as *mut u8),
+                    rms_lm: GpuActivation::from_raw(act.rms_lm.as_ptr::<u8>() as *mut u8),
+                    logits: GpuLogits::from_raw(act.logits.as_ptr::<u8>() as *mut u8),
+                    position_ids: GpuMetaVec::from_raw(
+                        kv_meta.position_ids.as_ptr::<u8>() as *mut u8
+                    ),
+                    kv_indptr: GpuMetaVec::from_raw(kv_meta.kv_indptr.as_ptr::<u8>() as *mut u8),
+                    kv_indices: GpuMetaVec::from_raw(kv_meta.kv_indices.as_ptr::<u8>() as *mut u8),
+                    kv_last_page: GpuMetaVec::from_raw(
+                        kv_meta.kv_last_page.as_ptr::<u8>() as *mut u8
+                    ),
+                    kv_append: GpuMetaVec::from_raw(kv_meta.kv_append.as_ptr::<u8>() as *mut u8),
+                    prefill_qo_indptr: GpuMetaVec::from_raw(
+                        kv_meta.prefill_qo_indptr.as_ptr::<u8>() as *mut u8,
+                    ),
+                    prefill_kv_indptr: GpuMetaVec::from_raw(
+                        kv_meta.prefill_kv_indptr.as_ptr::<u8>() as *mut u8,
+                    ),
+                    prefill_kv_indices: GpuMetaVec::from_raw(
+                        kv_meta.prefill_kv_indices.as_ptr::<u8>() as *mut u8,
+                    ),
+                    prefill_kv_last_page_len: GpuMetaVec::from_raw(
+                        kv_meta.prefill_kv_last_page_len.as_ptr::<u8>() as *mut u8,
+                    ),
+                    attn_scale,
+                    rms_norm_eps: config.rms_norm_eps,
+                    num_pages: num_pages as i32,
+                    prefill_num_seqs: num_prefill_seqs,
+                    prefill_num_kv_pages: total_prefill_kv_pages,
+                }
+            };
+
+            let barrier_shape = [
+                nl,
+                scheduler::NUM_OPS,
+                prefill_info.n_batch_blocks,
+                prefill_info.max_barrier_cols,
+            ];
+            let inst_shape = [1, sm, mps, iw];
+            let timing_shape = [1, sm, mps, tw];
+
             unsafe {
                 driver::stream_synchronize(stream).expect("pre-launch sync");
                 tracing::info!("TK prefill: all uploads complete, launching kernel");
-                crate::ffi::tk_llama_1b_launch(
-                    bar_arg,
-                    inst_arg,
-                    timing_arg,
-                    // Weights
-                    TkTensorArg::from_gpu_tensor(weights.qkv_proj),
-                    TkTensorArg::from_gpu_tensor(weights.attn_norm),
-                    TkTensorArg::from_gpu_tensor(weights.o_proj),
-                    TkTensorArg::from_gpu_tensor(weights.mlp_norm),
-                    TkTensorArg::from_gpu_tensor(weights.up_proj),
-                    TkTensorArg::from_gpu_tensor(weights.gate_proj),
-                    TkTensorArg::from_gpu_tensor(weights.down_proj),
-                    TkTensorArg::from_gpu_tensor(weights.lm_head_norm),
-                    TkTensorArg::from_gpu_tensor(weights.lm_head),
-                    // KV cache
-                    TkTensorArg::from_gpu_tensor(kv.k_cache),
-                    TkTensorArg::from_gpu_tensor(kv.v_cache),
-                    // RoPE
-                    TkTensorArg::from_gpu_tensor(weights.rope_cos),
-                    TkTensorArg::from_gpu_tensor(weights.rope_sin),
-                    // Activations: gl shape must cover full batch block (128 rows min)
-                    // since QKV/attention ops process 16-row tiles.
-                    TkTensorArg::new(act.hidden_states.as_ptr::<u8>() as u64, &[1, 1, padded, hd]),
-                    TkTensorArg::new(act.rms_rope.as_ptr::<u8>() as u64, &[1, 1, padded, hd]),
-                    TkTensorArg::new(act.rms_gate.as_ptr::<u8>() as u64, &[1, 1, padded, hd]),
-                    TkTensorArg::new(act.q_post_rope.as_ptr::<u8>() as u64, &[1, 1, padded, hd]),
-                    TkTensorArg::new(act.attn_out.as_ptr::<u8>() as u64, &[1, 1, padded, hd]),
-                    TkTensorArg::new(act.silu_out.as_ptr::<u8>() as u64, &[1, 1, padded, id]),
-                    TkTensorArg::new(act.rms_lm.as_ptr::<u8>() as u64, &[1, 1, padded, hd]),
-                    TkTensorArg::new(act.logits.as_ptr::<u8>() as u64, &[1, 1, padded, vs]),
-                    // Decode KV metadata (also padded for QKV tile access)
-                    TkTensorArg::new(kv_meta.position_ids.as_ptr::<u8>() as u64, &[padded]),
-                    TkTensorArg::new(kv_meta.kv_indptr.as_ptr::<u8>() as u64, &[padded + 1]),
-                    TkTensorArg::new(
-                        kv_meta.kv_indices.as_ptr::<u8>() as u64,
-                        &[total_kv_indices],
-                    ),
-                    TkTensorArg::new(kv_meta.kv_last_page.as_ptr::<u8>() as u64, &[padded]),
-                    TkTensorArg::new(kv_meta.kv_append.as_ptr::<u8>() as u64, &[padded]),
-                    // Prefill KV metadata
-                    TkTensorArg::new(
-                        kv_meta.prefill_qo_indptr.as_ptr::<u8>() as u64,
-                        &[num_prefill_seqs + 1],
-                    ),
-                    TkTensorArg::new(
-                        kv_meta.prefill_kv_indptr.as_ptr::<u8>() as u64,
-                        &[num_prefill_seqs + 1],
-                    ),
-                    TkTensorArg::new(
-                        kv_meta.prefill_kv_indices.as_ptr::<u8>() as u64,
-                        &[total_prefill_kv_pages],
-                    ),
-                    TkTensorArg::new(
-                        kv_meta.prefill_kv_last_page_len.as_ptr::<u8>() as u64,
-                        &[num_prefill_seqs],
-                    ),
-                    // Scalars
-                    attn_scale,
-                    config.rms_norm_eps,
-                    num_pages as i32,
-                    total_tokens as i32,
-                    total_tokens as i32, // num_prefill_tokens
-                    // Stream
+                let rc = MegakernelLlamaSm89::launch_prefill(
+                    &args,
+                    NumSeqs(num_prefill_seqs as i32),
+                    NumTokens(total_tokens as i32),
+                    &seq_chunk_lens,
+                    &seq_extend_offsets,
+                    barrier_shape,
+                    inst_shape,
+                    timing_shape,
                     stream as u64,
                 );
-                // Dump first few instructions per SM for debugging
-                for sm_idx in 0..3.min(sm) {
-                    let base = sm_idx * mps * iw;
-                    for ins_idx in 0..5.min(mps) {
-                        let off = base + ins_idx * iw;
-                        let slice = &prefill_info.instructions[off..off + 6.min(iw)];
-                        tracing::info!("  SM[{}] inst[{}]: {:?}", sm_idx, ins_idx, slice);
-                    }
+                if rc != 0 {
+                    panic!("launch_prefill failed: rc={rc}");
                 }
                 tracing::info!("TK prefill: kernel launched, syncing...");
                 driver::stream_synchronize(stream).expect("post-launch sync");

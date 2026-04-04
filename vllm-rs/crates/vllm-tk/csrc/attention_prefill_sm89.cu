@@ -295,6 +295,9 @@ struct attention_prefill {
                     uint32_t k_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&K_tile.data[0]));
                     uint32_t v_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&V_tile.data[0]));
 
+                    // Total cache elements for bounds checking
+                    long cache_elems = (long)g.k_cache.batch() * g.k_cache.depth()
+                                     * nkh * hd;
                     for (int ri = 0; ri < (kv_page_size + rows_per_iter - 1) / rows_per_iter; ri++) {
                         int row = ri * rows_per_iter + lid / lanes_per_row;
                         int col = (lid % lanes_per_row) * elem_per_cp;
@@ -302,14 +305,18 @@ struct attention_prefill {
                             // Token row within page → flat cache offset
                             long src_off = ((long)page_batch * ipp + row) * nkh * hd
                                          + (long)pi.kv_head_idx * hd + col;
-                            asm volatile(
-                                "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
-                                "r"(K_tile.idx(k_smem, {row, col})),
-                                "l"(&k_base[src_off]) : "memory");
-                            asm volatile(
-                                "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
-                                "r"(V_tile.idx(v_smem, {row, col})),
-                                "l"(&v_base[src_off]) : "memory");
+                            if (src_off < 0 || src_off + elem_per_cp > cache_elems) {
+                                // OOB — skip cp.async to avoid crash
+                            } else {
+                                asm volatile(
+                                    "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
+                                    "r"(K_tile.idx(k_smem, {row, col})),
+                                    "l"(&k_base[src_off]) : "memory");
+                                asm volatile(
+                                    "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
+                                    "r"(V_tile.idx(v_smem, {row, col})),
+                                    "l"(&v_base[src_off]) : "memory");
+                            }
                         }
                     }
                 }

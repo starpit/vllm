@@ -51,40 +51,8 @@ __device__ static inline void store_kv_paged(
     auto &cache = is_k ? g.k_cache : g.v_cache;
     __nv_bfloat16 *cache_ptr = (__nv_bfloat16 *)cache.raw_ptr;
 
-    // Compute strides: [D0, D1, num_kv_heads, head_dim]
-    // D1 = depth dim = page_size / kv_block_size (but for raw-ptr store we use page_size directly)
-    // Actually, cache gl is [num_layers*num_pages, kv_page_size, num_kv_heads, head_dim] (depth=-1, rows=nkh, cols=hdm)
-    // With gl<bf16, -1, -1, num_kv_heads, head_dim>, stride per batch = depth * rows * cols
-    long stride_d0 = (long)cache.depth() * Globals::num_kv_heads * Globals::head_dim;
-    long stride_d1 = (long)Globals::num_kv_heads * Globals::head_dim;
-    long stride_kv_head = (long)Globals::head_dim;
-
-    long base_lo_addr = (long)((int)g.num_pages * layer + page_idx_lo) * stride_d0
-                      + (long)offset_lo * stride_kv_head  // Wait — offset is within the page
-                      + (long)kv_head_idx * stride_kv_head;
-    // Actually let me reconsider the cache layout.
-    // gl<bf16, -1, -1, num_kv_heads, head_dim> means dims are [B, D, R, C]
-    // where B = num_layers * num_pages, D = page_size / kv_block_size (iters_per_page),
-    //       R = num_kv_heads, C = head_dim
-    // But for paged append, offset_in_page is in units of TOKENS, not kv_blocks.
-    // The throughput branch stores with: {num_pages * layer + page_idx, offset_in_page, kv_head, 0}
-    // where offset_in_page = append_idx % kv_page_size
-    // So each "depth" slot in the gl is one token position within the page.
-    // That means D = kv_page_size (not kv_page_size / kv_block_size).
-    // But for DECODE reads, D = kv_page_size / kv_block_size (iters_per_page) and each
-    // "depth" slot is a kv_block_size chunk...
-    // The throughput branch uses kv_page_size for stores but iters_per_page for loads.
-    // The kv_st for loads is st_bf<kv_block_size, head_dim>, so each load gets kv_block_size rows.
-    // For stores, it's one token at a time (sv_bf<head_dim>).
-    //
-    // Let me just use the gl indexing directly via store to be safe.
-    // Unfortunately we have rt_bf<16, head_dim> which is 16 rows, but each row is a different token.
-    // We need per-token stores. Convert to sv_bf<head_dim> and use warp::store per row.
-    // That's expensive but correct. For sm89 without TMA this is the only option.
-
-    // Actually — let's just do raw pointer math. The cache is row-major:
-    // element at [b, d, r, c] is at offset b*(D*R*C) + d*(R*C) + r*C + c
-    // where D = cache.depth(), R = num_kv_heads, C = head_dim
+    // Raw pointer store into [B, D, R, C] = [num_layers*num_pages, kv_page_size, num_kv_heads, head_dim].
+    // Element at [b, d, r, c] = raw[b*(D*R*C) + d*(R*C) + r*C + c].
     long D = cache.depth();
     long R = Globals::num_kv_heads;
     long C = Globals::head_dim;

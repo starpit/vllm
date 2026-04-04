@@ -61,10 +61,22 @@ fn build_cuda() {
     let tk_include = tk_csrc.join("include");
     let tk_prototype = tk_csrc.join("prototype");
 
+    // Collect all TK headers for content-hash tracking
+    let header_files: Vec<String> = walkdir(&tk_include)
+        .iter()
+        .chain(walkdir(&tk_csrc).iter())
+        .filter(|p| {
+            let s = p.display().to_string();
+            s.ends_with(".cuh") || s.ends_with(".cu") || s.ends_with(".h")
+        })
+        .map(|p| p.display().to_string())
+        .collect();
+
     // Build with cudaforge
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)
         .source_files(vec![cu_path.display().to_string()])
+        .watch(header_files)
         .include_path(tk_include.display().to_string())
         .include_path(tk_prototype.display().to_string())
         .include_path(tk_csrc.display().to_string())
@@ -99,6 +111,31 @@ fn build_cuda() {
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=cuda");
 
-    // Rerun if DSL or TK sources change
+    // Rerun if DSL or TK sources change (including transitive headers like gl.cuh)
     println!("cargo:rerun-if-changed=build.rs");
+    for entry in walkdir(&tk_include) {
+        println!("cargo:rerun-if-changed={}", entry.display());
+    }
+    for entry in walkdir(&tk_csrc) {
+        let path_str = entry.display().to_string();
+        if path_str.ends_with(".cu") || path_str.ends_with(".cuh") {
+            println!("cargo:rerun-if-changed={}", path_str);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(walkdir(&path));
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
 }

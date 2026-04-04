@@ -112,6 +112,21 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
     let qkv_dim = (nah + 2 * nkh) * hdm;
 
     let expanded = quote! {
+        // ── Newtype wrappers for launch parameters ──
+        // Prevent mixing up num_seqs / num_tokens / batch_size (all i32).
+
+        /// Number of sequences (prefill). NOT total tokens.
+        #[derive(Debug, Clone, Copy)]
+        pub struct NumSeqs(pub i32);
+
+        /// Total number of tokens across all sequences.
+        #[derive(Debug, Clone, Copy)]
+        pub struct NumTokens(pub i32);
+
+        /// Decode batch size (number of single-token sequences).
+        #[derive(Debug, Clone, Copy)]
+        pub struct DecodeBatchSize(pub i32);
+
         // ── Typed GPU buffer handles ──
         // Each category is a distinct type with const-generic dims.
         // NonNull enforces non-null at construction. Const generics enforce
@@ -286,6 +301,10 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
             pub attn_scale: f32,
             pub rms_norm_eps: f32,
             pub num_pages: i32,
+
+            // ── Prefill metadata sizes (set to 0 for decode-only) ──
+            pub prefill_num_seqs: usize,
+            pub prefill_num_kv_pages: usize,
         }
 
         impl #struct_name {
@@ -353,11 +372,11 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                     TkTensorArg::new(args.kv_indices.ptr_u64(), &[args.num_pages as usize]),
                     TkTensorArg::new(args.kv_last_page.ptr_u64(), &[batch_rows]),
                     TkTensorArg::new(args.kv_append.ptr_u64(), &[batch_rows]),
-                    // Prefill KV metadata
-                    TkTensorArg::new(args.prefill_qo_indptr.ptr_u64(), &[1]),
-                    TkTensorArg::new(args.prefill_kv_indptr.ptr_u64(), &[1]),
-                    TkTensorArg::new(args.prefill_kv_indices.ptr_u64(), &[1]),
-                    TkTensorArg::new(args.prefill_kv_last_page_len.ptr_u64(), &[1]),
+                    // Prefill KV metadata — sizes from LaunchArgs (1 for decode dummy)
+                    TkTensorArg::new(args.prefill_qo_indptr.ptr_u64(), &[if args.prefill_num_seqs > 0 { args.prefill_num_seqs + 1 } else { 1 }]),
+                    TkTensorArg::new(args.prefill_kv_indptr.ptr_u64(), &[if args.prefill_num_seqs > 0 { args.prefill_num_seqs + 1 } else { 1 }]),
+                    TkTensorArg::new(args.prefill_kv_indices.ptr_u64(), &[if args.prefill_num_kv_pages > 0 { args.prefill_num_kv_pages } else { 1 }]),
+                    TkTensorArg::new(args.prefill_kv_last_page_len.ptr_u64(), &[if args.prefill_num_seqs > 0 { args.prefill_num_seqs } else { 1 }]),
                 ]
             }
 
@@ -370,19 +389,22 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
             /// # Safety
             /// All pointers in `args` must point to valid GPU memory.
             /// `batch_size` must be in [1, 128].
+            #[allow(clippy::too_many_arguments)]
             pub unsafe fn launch_decode(
                 args: &LaunchArgs,
-                batch_size: i32,
-                num_prefill_tokens: i32,
+                batch_size: DecodeBatchSize,
+                num_prefill_tokens: NumTokens,
                 barrier_shape: [usize; 4],
                 inst_shape: [usize; 4],
                 timing_shape: [usize; 4],
                 stream: u64,
             ) -> i32 {
-                debug_assert!(batch_size > 0, "batch_size must be > 0");
-                debug_assert!(batch_size <= 128, "batch_size must be <= 128 (decode)");
+                let bs = batch_size.0;
+                let npt = num_prefill_tokens.0;
+                debug_assert!(bs > 0, "batch_size must be > 0");
+                debug_assert!(bs <= 128, "batch_size must be <= 128 (decode)");
 
-                let batch_rows = (batch_size as usize).next_multiple_of(128);
+                let batch_rows = (bs as usize).next_multiple_of(128);
                 let ffi = Self::args_to_ffi(args, batch_rows, barrier_shape, inst_shape, timing_shape);
 
                 #[cfg(feature = "cuda")]
@@ -398,33 +420,50 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                         ffi[24], ffi[25], ffi[26], ffi[27], ffi[28],
                         ffi[29], ffi[30], ffi[31], ffi[32],
                         args.attn_scale, args.rms_norm_eps,
-                        args.num_pages, batch_size, num_prefill_tokens,
+                        args.num_pages, bs, npt,
                         stream,
                     )
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    let _ = (args, batch_size, num_prefill_tokens, barrier_shape, inst_shape, timing_shape, stream, ffi);
+                    let _ = (args, bs, npt, barrier_shape, inst_shape, timing_shape, stream, ffi);
                     panic!("launch_decode requires --features cuda");
                 }
             }
 
-            /// Launch the prefill megakernel (variable-length sequences).
+            /// Launch the prefill static megakernel.
+            ///
+            /// `num_seqs`: number of prefill sequences (NOT total tokens).
+            /// `num_prefill_tokens`: total number of tokens across all sequences.
+            /// These are distinct: num_seqs <= num_prefill_tokens.
             ///
             /// # Safety
             /// All pointers in `args` must point to valid GPU memory.
+            /// `seq_chunk_lens` and `seq_extend_offsets` must have at least
+            /// `num_seqs` elements.
+            #[allow(clippy::too_many_arguments)]
             pub unsafe fn launch_prefill(
                 args: &LaunchArgs,
-                batch_size: i32,
-                num_prefill_tokens: i32,
+                num_seqs: NumSeqs,
+                num_prefill_tokens: NumTokens,
+                seq_chunk_lens: &GpuMetaVec,
+                seq_extend_offsets: &GpuMetaVec,
                 barrier_shape: [usize; 4],
                 inst_shape: [usize; 4],
                 timing_shape: [usize; 4],
                 stream: u64,
             ) -> i32 {
-                debug_assert!(num_prefill_tokens > 0, "num_prefill_tokens must be > 0");
+                let ns = num_seqs.0;
+                let npt = num_prefill_tokens.0;
+                assert!(npt > 0, "num_prefill_tokens must be > 0");
+                assert!(ns > 0, "num_seqs must be > 0");
+                assert!(
+                    ns <= npt,
+                    "num_seqs ({ns}) > num_prefill_tokens ({npt}) — \
+                     did you pass total_tokens for both?"
+                );
 
-                let batch_rows = (num_prefill_tokens as usize).next_multiple_of(128);
+                let batch_rows = (npt as usize).next_multiple_of(128);
                 let ffi = Self::args_to_ffi(args, batch_rows, barrier_shape, inst_shape, timing_shape);
 
                 #[cfg(feature = "cuda")]
@@ -440,13 +479,15 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                         ffi[24], ffi[25], ffi[26], ffi[27], ffi[28],
                         ffi[29], ffi[30], ffi[31], ffi[32],
                         args.attn_scale, args.rms_norm_eps,
-                        args.num_pages, batch_size, num_prefill_tokens,
+                        args.num_pages, ns, npt,
                         stream,
+                        seq_chunk_lens.as_ptr() as *const i32,
+                        seq_extend_offsets.as_ptr() as *const i32,
                     )
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    let _ = (args, batch_size, num_prefill_tokens, barrier_shape, inst_shape, timing_shape, stream, ffi);
+                    let _ = (args, ns, npt, seq_chunk_lens, seq_extend_offsets, barrier_shape, inst_shape, timing_shape, stream, ffi);
                     panic!("launch_prefill requires --features cuda");
                 }
             }

@@ -285,16 +285,23 @@ fn emit_run_op_template(out: &mut String) {
     writeln!(out, "template<typename Op>").unwrap();
     writeln!(out, "__device__ void run_op_ext(").unwrap();
     writeln!(out, "    const globals &g, state<config> &kvms,").unwrap();
-    writeln!(out, "    int opcode, int layer, int row, int col,").unwrap();
-    writeln!(out, "    int extend_offset, int chunk_len)").unwrap();
+    writeln!(
+        out,
+        "    int opcode, int layer, int seq_idx, int prefill_block_idx,"
+    )
+    .unwrap();
+    writeln!(out, "    int kv_head_idx, int extend_offset)").unwrap();
     writeln!(out, "{{").unwrap();
+    // Validate: run_op_ext has 7 fields (opcode + 6 data fields matching prefill_instruction).
+    // prefill_instruction reads: [1]=layer, [2]=seq_idx, [3]=prefill_block_idx,
+    //   [4]=prefill_token_offset, [5]=kv_head_idx
     writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
     writeln!(out, "        kvms.instruction()[0] = opcode;").unwrap();
     writeln!(out, "        kvms.instruction()[1] = layer;").unwrap();
-    writeln!(out, "        kvms.instruction()[2] = row;").unwrap();
-    writeln!(out, "        kvms.instruction()[3] = col;").unwrap();
+    writeln!(out, "        kvms.instruction()[2] = seq_idx;").unwrap();
+    writeln!(out, "        kvms.instruction()[3] = prefill_block_idx;").unwrap();
     writeln!(out, "        kvms.instruction()[4] = extend_offset;").unwrap();
-    writeln!(out, "        kvms.instruction()[5] = chunk_len;").unwrap();
+    writeln!(out, "        kvms.instruction()[5] = kv_head_idx;").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "        for (int i = 0; i < config::NUM_PAGES; i++)").unwrap();
     writeln!(out, "            kvms.pid_order()[i] = i;").unwrap();
@@ -807,15 +814,11 @@ fn emit_prefill_kernel(out: &mut String, dag: &ModelDag, nl: usize, nbh: usize, 
         .unwrap();
         writeln!(
             out,
-            "                run_op_ext<{}>(g, kvms, {}, layer,",
+            "                run_op_ext<{}>(g, kvms, {}, layer, seq,",
             m.cpp_type, m.opcode
         )
         .unwrap();
-        writeln!(
-            out,
-            "                    t / NKH, t % NKH, extend_offset, chunk_len);"
-        )
-        .unwrap();
+        writeln!(out, "                    t / NKH, t % NKH, extend_offset);").unwrap();
         writeln!(out, "            }}").unwrap();
         writeln!(out, "        }}").unwrap();
     }
@@ -1183,6 +1186,28 @@ fn emit_dynamic_dim_assertions(out: &mut String, dag: &ModelDag, indent: &str, i
 
     if is_prefill {
         writeln!(out, "{indent}if (num_prefill_tokens <= 0) {{ fprintf(stderr, \"ASSERT: num_prefill_tokens %d <= 0\\n\", num_prefill_tokens); fflush(stderr); return -109; }}").unwrap();
+        writeln!(out, "{indent}if (seq_chunk_lens == nullptr) {{ fprintf(stderr, \"ASSERT: seq_chunk_lens is null\\n\"); fflush(stderr); return -110; }}").unwrap();
+        writeln!(out, "{indent}if (seq_extend_offsets == nullptr) {{ fprintf(stderr, \"ASSERT: seq_extend_offsets is null\\n\"); fflush(stderr); return -111; }}").unwrap();
+        // batch_size is num_seqs for prefill — must be <= num_prefill_tokens
+        writeln!(out, "{indent}if (batch_size > num_prefill_tokens) {{ fprintf(stderr, \"ASSERT: batch_size(num_seqs) %d > num_prefill_tokens %d — did you pass total_tokens for both?\\n\", batch_size, num_prefill_tokens); fflush(stderr); return -112; }}").unwrap();
+        // Validate sum(seq_chunk_lens) == num_prefill_tokens (host-side, seq_chunk_lens is device ptr so we read via cudaMemcpy)
+        writeln!(
+            out,
+            "{indent}{{ int *h_chunks = (int*)alloca(batch_size * sizeof(int));"
+        )
+        .unwrap();
+        writeln!(out, "{indent}  cudaMemcpyAsync(h_chunks, seq_chunk_lens, batch_size * sizeof(int), cudaMemcpyDeviceToHost, (cudaStream_t)stream);").unwrap();
+        writeln!(
+            out,
+            "{indent}  cudaStreamSynchronize((cudaStream_t)stream);"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "{indent}  int sum = 0; for (int i = 0; i < batch_size; i++) sum += h_chunks[i];"
+        )
+        .unwrap();
+        writeln!(out, "{indent}  if (sum != num_prefill_tokens) {{ fprintf(stderr, \"ASSERT: sum(seq_chunk_lens)=%d != num_prefill_tokens=%d\\n\", sum, num_prefill_tokens); fflush(stderr); return -113; }} }}").unwrap();
     }
 
     writeln!(out).unwrap();
@@ -1251,7 +1276,13 @@ fn emit_decode_launch_wrapper(out: &mut String, dag: &ModelDag) {
 fn emit_prefill_launch_wrapper(out: &mut String, dag: &ModelDag) {
     writeln!(out, "// ── C launch wrapper (prefill) ──").unwrap();
     writeln!(out, "extern \"C\" int {}_prefill_static_launch(", dag.name).unwrap();
-    writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
+    writeln!(out, "{},", LAUNCH_PARAMS).unwrap();
+    writeln!(out, "    // Prefill per-sequence metadata").unwrap();
+    writeln!(
+        out,
+        "    const int *seq_chunk_lens, const int *seq_extend_offsets"
+    )
+    .unwrap();
     writeln!(out, ") {{").unwrap();
     writeln!(out, "  try {{").unwrap();
     emit_globals_construction(out, "    ");
@@ -1278,7 +1309,7 @@ fn emit_prefill_launch_wrapper(out: &mut String, dag: &ModelDag) {
     .unwrap();
     writeln!(
         out,
-        "        g, num_prefill_tokens, batch_size, nullptr, nullptr);"
+        "        g, num_prefill_tokens, batch_size, seq_chunk_lens, seq_extend_offsets);"
     )
     .unwrap();
     writeln!(out, "    err = cudaGetLastError();").unwrap();

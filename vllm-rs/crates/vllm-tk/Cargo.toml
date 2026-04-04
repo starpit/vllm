@@ -9,10 +9,11 @@ description = "ThunderKittens KVM megakernel for sm89 — compiles and exposes t
 default = []
 # Actually compile and link the TK CUDA kernel. Without this feature,
 # the crate is a no-op stub (for CI/non-CUDA builds).
-cuda = ["dep:cudaforge", "dep:dirs", "dep:vllm-cuda", "dep:cudarc"]
+cuda = ["dep:cudaforge", "dep:dirs", "dep:vllm-cuda", "dep:cudarc", "dep:vllm-tk-static"]
 
 [dependencies]
 vllm-cuda = { path = "../vllm-cuda", features = ["cuda"], optional = true }
+vllm-tk-static = { path = "../vllm-tk-static", features = ["cuda"], optional = true }
 cudarc = { workspace = true, optional = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -7881,6 +7881,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vllm-tk-test-harness"
+version = "0.1.0"
+dependencies = [
+ "cudaforge",
+ "cudarc",
+ "dirs 6.0.0",
+ "half",
+ "vllm-tk-macros-core",
+]
+
+[[package]]
 name = "vllm-wgpu"
 version = "0.1.0"
 dependencies = [

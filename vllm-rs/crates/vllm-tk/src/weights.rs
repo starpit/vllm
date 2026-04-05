@@ -277,7 +277,11 @@ mod inner {
                 })
                 .collect();
 
-            // Build CPU tables: cos[pos, i] = cos[pos, i+half] = cos(pos * inv_freq[i])
+            // Build CPU tables: half-dim duplicated format.
+            // cos[pos, i] = cos[pos, i+half] = cos(pos * inv_freq[i])
+            // The kernel indexes by freq_col (always < half) so only the first
+            // half of each row is actually read, but we fill both halves for
+            // consistency with the reference Python code.
             let n = max_pos * hdm;
             let mut cos_buf = vec![0f32; n];
             let mut sin_buf = vec![0f32; n];

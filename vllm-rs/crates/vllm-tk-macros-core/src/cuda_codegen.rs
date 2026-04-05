@@ -263,7 +263,11 @@ fn emit_run_op_template(out: &mut String) {
     writeln!(out).unwrap();
     writeln!(out, "        Op::controller::init_semaphores(g, kvms);").unwrap();
     writeln!(out, "    }}").unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
+    // Memory fence ensures semaphore init values are visible to all threads.
+    // Use barrier 15 with explicit thread count to avoid collision with
+    // group<NUM_CONSUMER_WARPS>::sync(0) inside ops (barrier 0, different thread count).
+    writeln!(out, "    asm volatile(\"membar.cta;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    group<config::NUM_WARPS>::sync(15);").unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,
@@ -288,7 +292,11 @@ fn emit_run_op_template(out: &mut String) {
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(
+        out,
+        "    group<config::NUM_WARPS>::sync(15);  // post-op: all warps done"
+    )
+    .unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
 
@@ -324,7 +332,9 @@ fn emit_run_op_template(out: &mut String) {
     writeln!(out).unwrap();
     writeln!(out, "        Op::controller::init_semaphores(g, kvms);").unwrap();
     writeln!(out, "    }}").unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
+    // Memory fence + barrier 15 with explicit thread count (avoids barrier 0 collision).
+    writeln!(out, "    asm volatile(\"membar.cta;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    group<config::NUM_WARPS>::sync(15);").unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,
@@ -349,7 +359,11 @@ fn emit_run_op_template(out: &mut String) {
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(
+        out,
+        "    group<config::NUM_WARPS>::sync(15);  // post-op: all warps done"
+    )
+    .unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
 }
@@ -506,7 +520,13 @@ fn emit_state_setup(out: &mut String) {
     writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
     writeln!(out, "        init_semaphore(semaphores_ready, 1);").unwrap();
     writeln!(out, "    }}").unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+    // Memory fence + barrier 15 — matches kvm_internal in vm.cuh.
+    // membar.cta ensures semaphore init values are visible before any thread proceeds.
+    // Uses group<NUM_WARPS>::sync(15) (barrier 15 with explicit thread count) to avoid
+    // collision with group<NUM_CONSUMER_WARPS>::sync(0) inside ops.
+    writeln!(out, "    asm volatile(\"membar.cta;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    group<config::NUM_WARPS>::sync(15);").unwrap();
     writeln!(out).unwrap();
 
     writeln!(out, "    uint64_t start_time = 0;").unwrap();
@@ -1314,8 +1334,10 @@ fn emit_prefill_launch_wrapper(out: &mut String, dag: &ModelDag) {
     .unwrap();
     writeln!(out, ") {{").unwrap();
     writeln!(out, "  try {{").unwrap();
+    writeln!(out, "    fprintf(stderr, \"prefill launch: batch_size=%d num_layers=%d num_prefill_tokens=%d\\n\", batch_size, num_layers, num_prefill_tokens); fflush(stderr);").unwrap();
     emit_globals_construction(out, "    ");
     writeln!(out).unwrap();
+    writeln!(out, "    fprintf(stderr, \"prefill: globals constructed, shmem=%d\\n\", g.dynamic_shared_memory()); fflush(stderr);").unwrap();
     emit_dynamic_dim_assertions(out, dag, "    ", true);
     writeln!(out, "    int shmem = g.dynamic_shared_memory();").unwrap();
     writeln!(
@@ -1343,8 +1365,326 @@ fn emit_prefill_launch_wrapper(out: &mut String, dag: &ModelDag) {
     .unwrap();
     writeln!(out, "    err = cudaGetLastError();").unwrap();
     writeln!(out, "    return (int)err;").unwrap();
-    writeln!(out, "  }} catch (...) {{ return -1; }}").unwrap();
+    writeln!(out, "  }} catch (const std::exception &e) {{").unwrap();
+    writeln!(
+        out,
+        "    fprintf(stderr, \"prefill launch C++ exception: %s\\n\", e.what()); fflush(stderr);"
+    )
+    .unwrap();
+    writeln!(out, "    return -2;").unwrap();
+    writeln!(out, "  }} catch (...) {{").unwrap();
+    writeln!(
+        out,
+        "    fprintf(stderr, \"prefill launch unknown C++ exception\\n\"); fflush(stderr);"
+    )
+    .unwrap();
+    writeln!(out, "    return -1;").unwrap();
+    writeln!(out, "  }}").unwrap();
     writeln!(out, "}}").unwrap();
+}
+
+/// Generate a debug variant of the static megakernel that syncs and writes
+/// to a debug buffer after each op. This allows identifying which op crashes.
+///
+/// The debug buffer is an int array of size NUM_OPS_PER_LAYER * num_layers + 2.
+/// Each entry is set to 1 after the corresponding op completes successfully.
+/// If the kernel crashes, the last 0 entry indicates the crashing op.
+pub fn generate_debug_kernel(dag: &ModelDag) -> String {
+    let mut out = String::new();
+
+    emit_preamble(&mut out, dag);
+    emit_run_op_template(&mut out);
+    let (nl, _hd, _id, _hdm, _nah, nkh, _vs) = emit_model_constants(&mut out, dag);
+    let nbh = _nah + 2 * nkh;
+    let gqa_ratio = _nah / nkh;
+    emit_optimal_out_block(&mut out);
+
+    // Debug decode kernel
+    writeln!(out, "__global__ __launch_bounds__(config::NUM_THREADS, 1)").unwrap();
+    writeln!(
+        out,
+        "void {}_decode_debug(const globals g, int batch_size, int num_layers, int *debug_buf) {{",
+        dag.name
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    if (batch_size <= 0 || batch_size > 128) return;").unwrap();
+    writeln!(out, "    const int sm = blockIdx.x;").unwrap();
+    writeln!(out, "    const int sm_count = gridDim.x;").unwrap();
+    writeln!(out).unwrap();
+    emit_tile_count_vars(&mut out, "batch_size");
+    emit_state_setup(&mut out);
+
+    let mappings = op_mappings();
+    let layer_ops: Vec<(&str, &str, &str, &str)> = vec![
+        ("attn_norm", "batch_size", "t", "0"),
+        ("qkv_rope_append", "NBH", "0", "t"),
+        (
+            "attention_decode",
+            "(n_attn_bb * NKH)",
+            "t / NKH",
+            "t % NKH",
+        ),
+        ("o_proj_residual", "n_cols_hd", "0", "t"),
+        ("mlp_norm", "batch_size", "t", "0"),
+        ("gate_silu", "n_cols_id", "0", "t"),
+        ("up_matmul", "n_cols_id", "0", "t"),
+        ("down_proj_residual", "n_cols_hd", "0", "t"),
+    ];
+
+    writeln!(
+        out,
+        "    for (int layer = 0; layer < num_layers; layer++) {{"
+    )
+    .unwrap();
+
+    for (op_idx, (op_name, tile_count, row_expr, col_expr)) in layer_ops.iter().enumerate() {
+        if let Some(mapping) = mappings.get(op_name) {
+            writeln!(out).unwrap();
+            emit_op_tile_loop(
+                &mut out, "        ", mapping, tile_count, row_expr, col_expr,
+            );
+            // Debug sync + marker
+            writeln!(out, "        __syncthreads();").unwrap();
+            writeln!(
+                out,
+                "        if (threadIdx.x == 0 && blockIdx.x == 0) debug_buf[layer * 8 + {op_idx}] = 1;"
+            )
+            .unwrap();
+            writeln!(out, "        __syncthreads();").unwrap();
+        }
+    }
+
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Post-loop: lm_head_norm + lm_head with debug markers
+    let post_ops = [
+        ("lm_head_norm", "batch_size"),
+        ("lm_head", "batch_size * n_cols_vs"),
+    ];
+    for (post_idx, (op_name, tile_count)) in post_ops.iter().enumerate() {
+        if let Some(mapping) = mappings.get(op_name) {
+            let (row_expr, col_expr) = if *op_name == "lm_head_norm" {
+                ("t", "0")
+            } else {
+                ("t / n_cols_vs", "t % n_cols_vs")
+            };
+            emit_op_tile_loop(&mut out, "    ", mapping, tile_count, row_expr, col_expr);
+            writeln!(out, "    __syncthreads();").unwrap();
+            writeln!(
+                out,
+                "    if (threadIdx.x == 0 && blockIdx.x == 0) debug_buf[num_layers * 8 + {post_idx}] = 1;"
+            )
+            .unwrap();
+            writeln!(out, "    __syncthreads();").unwrap();
+        }
+    }
+
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Launch wrapper
+    emit_tensor_arg_and_globals_helper(&mut out);
+    writeln!(out, "extern \"C\" int {}_decode_debug_launch(", dag.name).unwrap();
+    writeln!(out, "{},", LAUNCH_PARAMS).unwrap();
+    writeln!(out, "    int *debug_buf").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "  try {{").unwrap();
+    emit_globals_construction(&mut out, "    ");
+    writeln!(out).unwrap();
+    writeln!(out, "    int shmem = g.dynamic_shared_memory();").unwrap();
+    writeln!(
+        out,
+        "    auto err = cudaFuncSetAttribute({}_decode_debug,",
+        dag.name
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);"
+    )
+    .unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
+    writeln!(
+        out,
+        "    {}_decode_debug<<<g.grid(), g.block(), shmem, (cudaStream_t)stream>>>(",
+        dag.name
+    )
+    .unwrap();
+    writeln!(out, "        g, batch_size, num_layers, debug_buf);").unwrap();
+    writeln!(out, "    err = cudaGetLastError();").unwrap();
+    writeln!(out, "    return (int)err;").unwrap();
+    writeln!(out, "  }} catch (const std::exception &e) {{").unwrap();
+    writeln!(
+        out,
+        "    fprintf(stderr, \"debug launch exception: %s\\n\", e.what()); fflush(stderr);"
+    )
+    .unwrap();
+    writeln!(out, "    return -2;").unwrap();
+    writeln!(out, "  }} catch (...) {{ return -3; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    let _ = (nl, nbh, gqa_ratio);
+    out
+}
+
+/// Generate a standalone CUDA test kernel for a single TK op.
+///
+/// The generated file contains:
+/// 1. Full preamble + includes (same as static megakernel)
+/// 2. `run_op` template
+/// 3. Model constants
+/// 4. A `__global__ void test_{op_name}(globals g, int batch_size, int num_layers)`
+///    kernel that sets up state and runs ONE op for all tiles in layer 0
+/// 5. A C launch wrapper `extern "C" int test_{op_name}_launch(...)`
+///
+/// This enables testing each op in isolation on the GPU.
+pub fn generate_single_op_kernel(dag: &ModelDag, op_name: &str) -> Result<String, String> {
+    let mappings = op_mappings();
+    let mapping = mappings
+        .get(op_name)
+        .ok_or_else(|| format!("unknown op: {op_name}"))?;
+
+    let mut out = String::new();
+
+    // ── Preamble (same includes as full megakernel) ──
+    emit_preamble(&mut out, dag);
+    emit_run_op_template(&mut out);
+    let (_nl, _hd, _id, _hdm, _nah, _nkh, _vs) = emit_model_constants(&mut out, dag);
+    emit_optimal_out_block(&mut out);
+
+    // ── Test kernel: runs ONE op across all tiles for layer 0 ──
+    writeln!(
+        out,
+        "__global__ void __launch_bounds__(config::NUM_THREADS, 1)"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "test_{op_name}(const globals g, int batch_size, int num_layers) {{"
+    )
+    .unwrap();
+    writeln!(out, "    const int sm = blockIdx.x;").unwrap();
+    writeln!(out, "    const int sm_count = gridDim.x;").unwrap();
+    writeln!(out).unwrap();
+
+    emit_tile_count_vars(&mut out, "batch_size");
+    emit_state_setup(&mut out);
+
+    // Determine tile count and row/col expressions based on op type
+    let (tile_count, row_expr, col_expr) = match op_name {
+        "attn_norm" | "mlp_norm" | "lm_head_norm" => ("batch_size".to_string(), "t", "0"),
+        "qkv_rope_append" => ("batch_size * NBH".to_string(), "t / NBH", "t % NBH"),
+        "attention_decode" => ("n_attn_bb".to_string(), "t", "0"),
+        "o_proj_residual" => (
+            "batch_size * n_cols_hd".to_string(),
+            "t / n_cols_hd",
+            "t % n_cols_hd",
+        ),
+        "gate_silu" | "up_matmul" | "down_proj_residual" => (
+            "batch_size * n_cols_id".to_string(),
+            "t / n_cols_id",
+            "t % n_cols_id",
+        ),
+        "lm_head" => (
+            "batch_size * n_cols_vs".to_string(),
+            "t / n_cols_vs",
+            "t % n_cols_vs",
+        ),
+        "attention_prefill" => {
+            // Prefill uses run_op_ext, not run_op — handled separately below
+            ("0".to_string(), "0", "0")
+        }
+        _ => return Err(format!("unsupported op for single-op test: {op_name}")),
+    };
+
+    if op_name == "attention_prefill" {
+        // Prefill attention uses run_op_ext with different instruction layout.
+        // For single-op testing, we run it with seq_idx=0, prefill_block_idx=t, etc.
+        writeln!(
+            out,
+            "    // attention_prefill: simplified single-sequence test"
+        )
+        .unwrap();
+        writeln!(out, "    const int total = NKH;  // one tile per KV head").unwrap();
+        writeln!(out, "    const int my_start = sm * total / sm_count;").unwrap();
+        writeln!(out, "    const int my_end = (sm + 1) * total / sm_count;").unwrap();
+        writeln!(out, "    for (int t = my_start; t < my_end; t++) {{").unwrap();
+        writeln!(
+            out,
+            "        run_op_ext<{}>(\n            g, kvms, {}, 0, 0, 0, t, 0);",
+            mapping.cpp_type, mapping.opcode
+        )
+        .unwrap();
+        writeln!(out, "    }}").unwrap();
+    } else {
+        writeln!(out, "    const int layer = 0;").unwrap();
+        emit_op_tile_loop(&mut out, "    ", mapping, &tile_count, row_expr, col_expr);
+    }
+
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // ── C launch wrapper ──
+    emit_tensor_arg_and_globals_helper(&mut out);
+    writeln!(out, "extern \"C\" int test_{op_name}_launch(").unwrap();
+    writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "  try {{").unwrap();
+    emit_globals_construction(&mut out, "    ");
+    writeln!(out).unwrap();
+    writeln!(out, "    int shmem = g.dynamic_shared_memory();").unwrap();
+    writeln!(out, "    auto err = cudaFuncSetAttribute(test_{op_name},").unwrap();
+    writeln!(
+        out,
+        "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);"
+    )
+    .unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
+    writeln!(
+        out,
+        "    test_{op_name}<<<g.grid(), g.block(), shmem, (cudaStream_t)stream>>>("
+    )
+    .unwrap();
+    writeln!(out, "        g, batch_size, num_layers);").unwrap();
+    writeln!(out, "    err = cudaGetLastError();").unwrap();
+    writeln!(out, "    return (int)err;").unwrap();
+    writeln!(out, "  }} catch (const std::exception &e) {{").unwrap();
+    writeln!(
+        out,
+        "    fprintf(stderr, \"test_{op_name} C++ exception: %s\\n\", e.what()); fflush(stderr);"
+    )
+    .unwrap();
+    writeln!(out, "    return -2;").unwrap();
+    writeln!(out, "  }} catch (...) {{").unwrap();
+    writeln!(
+        out,
+        "    fprintf(stderr, \"test_{op_name} unknown C++ exception\\n\"); fflush(stderr);"
+    )
+    .unwrap();
+    writeln!(out, "    return -3;").unwrap();
+    writeln!(out, "  }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    Ok(out)
+}
+
+/// List all op names that can be used with `generate_single_op_kernel`.
+pub fn available_op_names() -> Vec<&'static str> {
+    vec![
+        "attn_norm",
+        "qkv_rope_append",
+        "attention_decode",
+        "o_proj_residual",
+        "mlp_norm",
+        "gate_silu",
+        "up_matmul",
+        "down_proj_residual",
+        "lm_head_norm",
+        "lm_head",
+        "attention_prefill",
+    ]
 }
 
 #[cfg(test)]
@@ -1433,5 +1773,66 @@ mod tests {
 
         // Print for inspection
         eprintln!("{cuda}");
+    }
+
+    #[test]
+    fn generates_single_op_kernels() {
+        let input: proc_macro2::TokenStream = quote::quote! {
+            kernel llama_sm89<NL=16, HD=2048, ID=5632, HDM=64, NAH=32, NKH=8, VS=128256> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                    let qkv = gemm(normed, qkv_weights[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                    let gate = silu(gemm(normed2, gate_weights[layer]));
+                    let up = gemm(normed2, up_weights[layer]);
+                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                }
+                let normed = rmsnorm(hidden_states, lm_head_norm);
+                logits = gemm(normed, lm_head);
+            }
+        };
+        let def: crate::parse::MegakernelDef = syn::parse2(input).unwrap();
+        let dag = crate::parse::build_dag(&def).unwrap();
+
+        // Test each op generates valid CUDA
+        for op_name in available_op_names() {
+            let cuda = generate_single_op_kernel(&dag, op_name)
+                .unwrap_or_else(|e| panic!("failed for {op_name}: {e}"));
+
+            // Must have preamble
+            assert!(
+                cuda.contains("GENERATED by megakernel!"),
+                "preamble missing for {op_name}"
+            );
+            // Must have test kernel
+            assert!(
+                cuda.contains(&format!("test_{op_name}(")),
+                "test kernel missing for {op_name}"
+            );
+            // Must have launch wrapper
+            assert!(
+                cuda.contains(&format!("test_{op_name}_launch(")),
+                "launch wrapper missing for {op_name}"
+            );
+            // Must have run_op or run_op_ext
+            assert!(
+                cuda.contains("run_op<") || cuda.contains("run_op_ext<"),
+                "run_op missing for {op_name}"
+            );
+        }
+
+        // Verify attn_norm specifically
+        let norm_cuda = generate_single_op_kernel(&dag, "attn_norm").unwrap();
+        assert!(norm_cuda.contains("OPCODE_AttnNorm"));
+        assert!(norm_cuda.contains("attn_norm<config, globals>"));
+
+        // Verify attention_prefill uses run_op_ext
+        let prefill_cuda = generate_single_op_kernel(&dag, "attention_prefill").unwrap();
+        assert!(prefill_cuda.contains("run_op_ext<"));
+        assert!(prefill_cuda.contains("OPCODE_GQA_AttentionPrefill"));
     }
 }

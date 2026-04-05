@@ -339,37 +339,44 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 barrier_shape: [usize; 4],
                 inst_shape: [usize; 4],
                 timing_shape: [usize; 4],
+                dims: crate::KernelDims,
             ) -> [TkTensorArg; 33] {
+                let hd = dims.hd;
+                let id = dims.id;
+                let hdm = dims.hdm;
+                let nkh = dims.nkh;
+                let vs = dims.vs;
+                let qkv_dim = dims.qkv_dim();
                 [
                     // VM state
                     TkTensorArg::new(args.barrier.ptr_u64(), &barrier_shape),
                     TkTensorArg::new(args.instructions.ptr_u64(), &inst_shape),
                     TkTensorArg::new(args.timings.ptr_u64(), &timing_shape),
-                    // Weights — shapes use runtime num_layers
-                    TkTensorArg::new(args.qkv_weights.ptr_u64(), &[num_layers * #qkv_dim, #hd]),
-                    TkTensorArg::new(args.attn_norm.ptr_u64(), &[num_layers, #hd]),
-                    TkTensorArg::new(args.o_proj.ptr_u64(), &[num_layers * #hd, #hd]),
-                    TkTensorArg::new(args.mlp_norm.ptr_u64(), &[num_layers, #hd]),
-                    TkTensorArg::new(args.up_weights.ptr_u64(), &[num_layers * #id, #hd]),
-                    TkTensorArg::new(args.gate_weights.ptr_u64(), &[num_layers * #id, #hd]),
-                    TkTensorArg::new(args.down_proj.ptr_u64(), &[num_layers * #hd, #id]),
-                    TkTensorArg::new(args.lm_head_norm.ptr_u64(), &[1, #hd]),
-                    TkTensorArg::new(args.lm_head.ptr_u64(), &[#vs, #hd]),
+                    // Weights — shapes use runtime dims from variant
+                    TkTensorArg::new(args.qkv_weights.ptr_u64(), &[num_layers * qkv_dim, hd]),
+                    TkTensorArg::new(args.attn_norm.ptr_u64(), &[num_layers, hd]),
+                    TkTensorArg::new(args.o_proj.ptr_u64(), &[num_layers * hd, hd]),
+                    TkTensorArg::new(args.mlp_norm.ptr_u64(), &[num_layers, hd]),
+                    TkTensorArg::new(args.up_weights.ptr_u64(), &[num_layers * id, hd]),
+                    TkTensorArg::new(args.gate_weights.ptr_u64(), &[num_layers * id, hd]),
+                    TkTensorArg::new(args.down_proj.ptr_u64(), &[num_layers * hd, id]),
+                    TkTensorArg::new(args.lm_head_norm.ptr_u64(), &[1, hd]),
+                    TkTensorArg::new(args.lm_head.ptr_u64(), &[vs, hd]),
                     // KV cache
-                    TkTensorArg::new(args.k_cache.ptr_u64(), &[args.num_pages as usize, 1, #nkh, #hdm]),
-                    TkTensorArg::new(args.v_cache.ptr_u64(), &[args.num_pages as usize, 1, #nkh, #hdm]),
+                    TkTensorArg::new(args.k_cache.ptr_u64(), &[args.num_pages as usize, 1, nkh, hdm]),
+                    TkTensorArg::new(args.v_cache.ptr_u64(), &[args.num_pages as usize, 1, nkh, hdm]),
                     // RoPE
-                    TkTensorArg::new(args.rope_cos.ptr_u64(), &[4096, #hdm]),
-                    TkTensorArg::new(args.rope_sin.ptr_u64(), &[4096, #hdm]),
+                    TkTensorArg::new(args.rope_cos.ptr_u64(), &[4096, hdm]),
+                    TkTensorArg::new(args.rope_sin.ptr_u64(), &[4096, hdm]),
                     // Activations — batch dim is runtime
-                    TkTensorArg::new(args.hidden_states.ptr_u64(), &[1, 1, batch_rows, #hd]),
-                    TkTensorArg::new(args.rms_rope.ptr_u64(), &[1, 1, batch_rows, #hd]),
-                    TkTensorArg::new(args.rms_gate.ptr_u64(), &[1, 1, batch_rows, #hd]),
-                    TkTensorArg::new(args.q_post_rope.ptr_u64(), &[1, 1, batch_rows, #hd]),
-                    TkTensorArg::new(args.attn_out.ptr_u64(), &[1, 1, batch_rows, #hd]),
-                    TkTensorArg::new(args.silu_out.ptr_u64(), &[1, 1, batch_rows, #id]),
-                    TkTensorArg::new(args.rms_lm.ptr_u64(), &[1, 1, batch_rows, #hd]),
-                    TkTensorArg::new(args.logits.ptr_u64(), &[1, 1, batch_rows, #vs]),
+                    TkTensorArg::new(args.hidden_states.ptr_u64(), &[1, 1, batch_rows, hd]),
+                    TkTensorArg::new(args.rms_rope.ptr_u64(), &[1, 1, batch_rows, hd]),
+                    TkTensorArg::new(args.rms_gate.ptr_u64(), &[1, 1, batch_rows, hd]),
+                    TkTensorArg::new(args.q_post_rope.ptr_u64(), &[1, 1, batch_rows, hd]),
+                    TkTensorArg::new(args.attn_out.ptr_u64(), &[1, 1, batch_rows, hd]),
+                    TkTensorArg::new(args.silu_out.ptr_u64(), &[1, 1, batch_rows, id]),
+                    TkTensorArg::new(args.rms_lm.ptr_u64(), &[1, 1, batch_rows, hd]),
+                    TkTensorArg::new(args.logits.ptr_u64(), &[1, 1, batch_rows, vs]),
                     // Decode KV metadata
                     TkTensorArg::new(args.position_ids.ptr_u64(), &[batch_rows]),
                     TkTensorArg::new(args.kv_indptr.ptr_u64(), &[batch_rows + 1]),
@@ -411,7 +418,8 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
 
                 let batch_rows = (bs as usize).next_multiple_of(128);
                 let nl = args.num_layers;
-                let ffi = Self::args_to_ffi(args, batch_rows, nl, barrier_shape, inst_shape, timing_shape);
+                let dims = variant.dims();
+                let ffi = Self::args_to_ffi(args, batch_rows, nl, barrier_shape, inst_shape, timing_shape, dims);
 
                 #[cfg(feature = "cuda")]
                 {
@@ -424,7 +432,7 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    let _ = (args, variant, bs, npt, barrier_shape, inst_shape, timing_shape, stream, ffi, nl);
+                    let _ = (args, variant, bs, npt, barrier_shape, inst_shape, timing_shape, stream, ffi, nl, dims);
                     panic!("launch_decode requires --features cuda");
                 }
             }
@@ -464,7 +472,8 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
 
                 let batch_rows = (npt as usize).next_multiple_of(128);
                 let nl = args.num_layers;
-                let ffi = Self::args_to_ffi(args, batch_rows, nl, barrier_shape, inst_shape, timing_shape);
+                let dims = variant.dims();
+                let ffi = Self::args_to_ffi(args, batch_rows, nl, barrier_shape, inst_shape, timing_shape, dims);
 
                 #[cfg(feature = "cuda")]
                 {
@@ -479,7 +488,7 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    let _ = (args, variant, ns, npt, seq_chunk_lens, seq_extend_offsets, barrier_shape, inst_shape, timing_shape, stream, ffi, nl);
+                    let _ = (args, variant, ns, npt, seq_chunk_lens, seq_extend_offsets, barrier_shape, inst_shape, timing_shape, stream, ffi, nl, dims);
                     panic!("launch_prefill requires --features cuda");
                 }
             }
@@ -507,11 +516,20 @@ fn generate_variant_code(
     def: &parse::MegakernelDef,
     kernel_name: &str,
 ) -> proc_macro2::TokenStream {
+    // Default VS from the kernel header params (shared across all LLaMA variants)
+    let default_vs = def
+        .params
+        .iter()
+        .find(|(k, _)| *k == "VS")
+        .map(|(_, v)| *v)
+        .unwrap_or(128256);
+
     let mut enum_variants = Vec::new();
     let mut from_dims_arms = Vec::new();
     let mut supported_entries = Vec::new();
     let mut decode_fn_arms = Vec::new();
     let mut prefill_fn_arms = Vec::new();
+    let mut dims_arms = Vec::new();
     let mut ffi_externs = Vec::new();
 
     for v in &def.variants {
@@ -529,7 +547,8 @@ fn generate_variant_code(
         let nkh = params.get("NKH").copied().unwrap_or(8);
 
         // Build FFI symbol names: {kernel_name}_{variant_suffix}_decode_static_launch
-        let variant_suffix = variant_ident.to_string().to_lowercase();
+        // Convert CamelCase (Hd4096Hdm128) to snake_case (hd4096_hdm128)
+        let variant_suffix = to_snake_case(&variant_ident.to_string());
         let decode_sym = syn::Ident::new(
             &format!("{kernel_name}_{variant_suffix}_decode_static_launch"),
             variant_ident.span(),
@@ -564,6 +583,13 @@ fn generate_variant_code(
         });
         prefill_fn_arms.push(quote! {
             Self::#variant_ident => #prefill_sym
+        });
+
+        let vs_val = default_vs;
+        dims_arms.push(quote! {
+            Self::#variant_ident => KernelDims {
+                hd: #hd, id: #id, hdm: #hdm, nah: #nah, nkh: #nkh, vs: #vs_val,
+            }
         });
 
         // FFI extern declarations
@@ -610,6 +636,24 @@ fn generate_variant_code(
     }
 
     quote! {
+        /// Model dimensions for a kernel variant.
+        #[derive(Debug, Clone, Copy)]
+        pub struct KernelDims {
+            pub hd: usize,
+            pub id: usize,
+            pub hdm: usize,
+            pub nah: usize,
+            pub nkh: usize,
+            pub vs: usize,
+        }
+
+        impl KernelDims {
+            /// QKV fused projection dimension: (NAH + 2*NKH) * HDM
+            pub fn qkv_dim(&self) -> usize {
+                (self.nah + 2 * self.nkh) * self.hdm
+            }
+        }
+
         /// Common launch signature type (decode). All variants share this signature.
         #[cfg(feature = "cuda")]
         type DecodeLaunchFn = unsafe extern "C" fn(
@@ -659,6 +703,13 @@ fn generate_variant_code(
         }
 
         impl KernelVariant {
+            /// Return the model dimensions for this compiled variant.
+            pub fn dims(&self) -> KernelDims {
+                match self {
+                    #(#dims_arms,)*
+                }
+            }
+
             /// Select the compiled kernel variant matching the given model dimensions.
             pub fn from_dims(
                 hidden_dim: usize,
@@ -782,4 +833,21 @@ fn to_pascal_case(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Convert CamelCase to snake_case: "Hd4096Hdm128" → "hd4096_hdm128"
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            // Insert underscore before uppercase letter, but not between consecutive
+            // uppercase letters that start a word (e.g., "HDM" → "hdm" not "h_d_m")
+            let prev = s.chars().nth(i - 1).unwrap();
+            if prev.is_lowercase() || prev.is_ascii_digit() {
+                result.push('_');
+            }
+        }
+        result.push(ch.to_lowercase().next().unwrap());
+    }
+    result
 }

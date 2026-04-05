@@ -51,8 +51,40 @@ __device__ static inline void store_kv_paged(
     auto &cache = is_k ? g.k_cache : g.v_cache;
     __nv_bfloat16 *cache_ptr = (__nv_bfloat16 *)cache.raw_ptr;
 
-    // Raw pointer store into [B, D, R, C] = [num_layers*num_pages, kv_page_size, num_kv_heads, head_dim].
-    // Element at [b, d, r, c] = raw[b*(D*R*C) + d*(R*C) + r*C + c].
+    // Compute strides: [D0, D1, num_kv_heads, head_dim]
+    // D1 = depth dim = page_size / kv_block_size (but for raw-ptr store we use page_size directly)
+    // Actually, cache gl is [num_layers*num_pages, kv_page_size, num_kv_heads, head_dim] (depth=-1, rows=nkh, cols=hdm)
+    // With gl<bf16, -1, -1, num_kv_heads, head_dim>, stride per batch = depth * rows * cols
+    long stride_d0 = (long)cache.depth() * Globals::num_kv_heads * Globals::head_dim;
+    long stride_d1 = (long)Globals::num_kv_heads * Globals::head_dim;
+    long stride_kv_head = (long)Globals::head_dim;
+
+    long base_lo_addr = (long)((int)g.num_pages * layer + page_idx_lo) * stride_d0
+                      + (long)offset_lo * stride_kv_head  // Wait — offset is within the page
+                      + (long)kv_head_idx * stride_kv_head;
+    // Actually let me reconsider the cache layout.
+    // gl<bf16, -1, -1, num_kv_heads, head_dim> means dims are [B, D, R, C]
+    // where B = num_layers * num_pages, D = page_size / kv_block_size (iters_per_page),
+    //       R = num_kv_heads, C = head_dim
+    // But for paged append, offset_in_page is in units of TOKENS, not kv_blocks.
+    // The throughput branch stores with: {num_pages * layer + page_idx, offset_in_page, kv_head, 0}
+    // where offset_in_page = append_idx % kv_page_size
+    // So each "depth" slot in the gl is one token position within the page.
+    // That means D = kv_page_size (not kv_page_size / kv_block_size).
+    // But for DECODE reads, D = kv_page_size / kv_block_size (iters_per_page) and each
+    // "depth" slot is a kv_block_size chunk...
+    // The throughput branch uses kv_page_size for stores but iters_per_page for loads.
+    // The kv_st for loads is st_bf<kv_block_size, head_dim>, so each load gets kv_block_size rows.
+    // For stores, it's one token at a time (sv_bf<head_dim>).
+    //
+    // Let me just use the gl indexing directly via store to be safe.
+    // Unfortunately we have rt_bf<16, head_dim> which is 16 rows, but each row is a different token.
+    // We need per-token stores. Convert to sv_bf<head_dim> and use warp::store per row.
+    // That's expensive but correct. For sm89 without TMA this is the only option.
+
+    // Actually — let's just do raw pointer math. The cache is row-major:
+    // element at [b, d, r, c] is at offset b*(D*R*C) + d*(R*C) + r*C + c
+    // where D = cache.depth(), R = num_kv_heads, C = head_dim
     long D = cache.depth();
     long R = Globals::num_kv_heads;
     long C = Globals::head_dim;
@@ -199,6 +231,16 @@ struct qkv_rope_append {
             bool is_v_block = (inst.col >= V_BLOCK_START);
             bool needs_rope = is_q_block || is_k_block;
 
+            // Round matmul result to bf16 before applying RoPE, matching HF/cuBLAS
+            // precision order. Without this, RoPE operates on fp32 accumulator values
+            // that differ from bf16-rounded cuBLAS outputs, causing 0.125 max error
+            // per element that compounds across layers (86 max error at 16 layers).
+            if (needs_rope) {
+                rt_bf<16, OUT_BLOCK> temp_bf;
+                warp::copy(temp_bf, acc);
+                warp::copy(acc, temp_bf);
+            }
+
             // Apply RoPE if needed.
             // For paged KV, each row in the warp's 16-row tile is a different token
             // with its own position_id. We apply rope per-row.
@@ -233,69 +275,53 @@ struct qkv_rope_append {
                 int pos_lo = g.position_ids[{token_lo}];
                 int pos_hi = g.position_ids[{token_hi}];
 
+                // HF LLaMA uses "halved" RoPE: dim i pairs with dim i+half.
+                // For head_dim=64, half=32: subtile c=0 (cols 0-15) pairs with c=2 (cols 32-47),
+                // and c=1 (cols 16-31) pairs with c=3 (cols 48-63).
+                // Same data[] slot in paired subtiles holds the rotation pair.
+                constexpr int half_dim = Globals::head_dim / 2;
+                constexpr int half_subtiles = half_dim / 16;  // =2 for head_dim=64
+                float *cos_ptr = (float *)g.rope_cos.raw_ptr;
+                float *sin_ptr = (float *)g.rope_sin.raw_ptr;
+                int hdm = Globals::head_dim;
+
                 #pragma unroll
-                for (int c = 0; c < acc_rt::width; c++) {
-                    int col_in_head = (c * 16) % Globals::head_dim;
-                    int col_base = col_in_head + 2 * (lane % 4);
-                    int col_base8 = col_base + 8;
+                for (int c = 0; c < half_subtiles; c++) {
+                    int c_lo = c;                  // first-half subtile
+                    int c_hi = c + half_subtiles;  // second-half subtile
 
-                    // Load cos/sin for both rows at the relevant columns.
-                    float *cos_ptr = (float *)g.rope_cos.raw_ptr;
-                    float *sin_ptr = (float *)g.rope_sin.raw_ptr;
-                    int hdm = Globals::head_dim;
+                    int col_lo_base = (c_lo * 16) % hdm + 2 * (lane % 4);
+                    int col_lo_base8 = col_lo_base + 8;
 
-                    // data[0] = (r_lo, col_base:col_base+1)
-                    // data[2] = (r_lo, col_base8:col_base8+1)
-                    // data[1] = (r_hi, col_base:col_base+1)
-                    // data[3] = (r_hi, col_base8:col_base8+1)
+                    // For each data slot k, the first-half value is at col_lo
+                    // and the paired second-half value is at col_lo + half_dim
+                    // (which lives in the c_hi subtile at the same data slot).
+                    // cos/sin are indexed by the first-half column.
+                    #pragma unroll
+                    for (int k = 0; k < 4; k++) {
+                        // k=0: (r_lo, col_lo_base), k=1: (r_hi, col_lo_base)
+                        // k=2: (r_lo, col_lo_base8), k=3: (r_hi, col_lo_base8)
+                        int col = (k < 2) ? col_lo_base : col_lo_base8;
+                        int pos = (k & 1) ? pos_hi : pos_lo;
 
-                    float cos_lo_0 = cos_ptr[pos_lo * hdm + col_base];
-                    float cos_lo_1 = cos_ptr[pos_lo * hdm + col_base + 1];
-                    float sin_lo_0 = sin_ptr[pos_lo * hdm + col_base];
-                    float sin_lo_1 = sin_ptr[pos_lo * hdm + col_base + 1];
+                        auto &lo_val = acc.tiles[0][c_lo].data[k];
+                        auto &hi_val = acc.tiles[0][c_hi].data[k];
 
-                    float cos_lo_8 = cos_ptr[pos_lo * hdm + col_base8];
-                    float cos_lo_9 = cos_ptr[pos_lo * hdm + col_base8 + 1];
-                    float sin_lo_8 = sin_ptr[pos_lo * hdm + col_base8];
-                    float sin_lo_9 = sin_ptr[pos_lo * hdm + col_base8 + 1];
+                        float cos_0 = cos_ptr[pos * hdm + col];
+                        float cos_1 = cos_ptr[pos * hdm + col + 1];
+                        float sin_0 = sin_ptr[pos * hdm + col];
+                        float sin_1 = sin_ptr[pos * hdm + col + 1];
 
-                    float cos_hi_0 = cos_ptr[pos_hi * hdm + col_base];
-                    float cos_hi_1 = cos_ptr[pos_hi * hdm + col_base + 1];
-                    float sin_hi_0 = sin_ptr[pos_hi * hdm + col_base];
-                    float sin_hi_1 = sin_ptr[pos_hi * hdm + col_base + 1];
+                        // x'[i] = x[i]*cos[i] - x[i+half]*sin[i]
+                        // x'[i+half] = x[i]*sin[i] + x[i+half]*cos[i]
+                        float x0 = lo_val.x, y0 = hi_val.x;
+                        float x1 = lo_val.y, y1 = hi_val.y;
 
-                    float cos_hi_8 = cos_ptr[pos_hi * hdm + col_base8];
-                    float cos_hi_9 = cos_ptr[pos_hi * hdm + col_base8 + 1];
-                    float sin_hi_8 = sin_ptr[pos_hi * hdm + col_base8];
-                    float sin_hi_9 = sin_ptr[pos_hi * hdm + col_base8 + 1];
-
-                    // Apply interleaved RoPE: x' = x*cos - y*sin, y' = x*sin + y*cos
-                    auto &d0 = acc.tiles[0][c].data[0]; // (r_lo, col_base:col_base+1)
-                    auto &d2 = acc.tiles[0][c].data[2]; // (r_lo, col_base8:col_base8+1)
-                    auto &d1 = acc.tiles[0][c].data[1]; // (r_hi, col_base:col_base+1)
-                    auto &d3 = acc.tiles[0][c].data[3]; // (r_hi, col_base8:col_base8+1)
-
-                    float x0, y0, x1, y1;
-
-                    // d0: r_lo, (col_base, col_base+1)
-                    x0 = d0.x; y0 = d0.y;
-                    d0.x = x0 * cos_lo_0 - y0 * sin_lo_0;
-                    d0.y = x0 * sin_lo_1 + y0 * cos_lo_1;
-
-                    // d2: r_lo, (col_base8, col_base8+1)
-                    x0 = d2.x; y0 = d2.y;
-                    d2.x = x0 * cos_lo_8 - y0 * sin_lo_8;
-                    d2.y = x0 * sin_lo_9 + y0 * cos_lo_9;
-
-                    // d1: r_hi, (col_base, col_base+1)
-                    x1 = d1.x; y1 = d1.y;
-                    d1.x = x1 * cos_hi_0 - y1 * sin_hi_0;
-                    d1.y = x1 * sin_hi_1 + y1 * cos_hi_1;
-
-                    // d3: r_hi, (col_base8, col_base8+1)
-                    x1 = d3.x; y1 = d3.y;
-                    d3.x = x1 * cos_hi_8 - y1 * sin_hi_8;
-                    d3.y = x1 * sin_hi_9 + y1 * cos_hi_9;
+                        lo_val.x = x0 * cos_0 - y0 * sin_0;
+                        hi_val.x = x0 * sin_0 + y0 * cos_0;
+                        lo_val.y = x1 * cos_1 - y1 * sin_1;
+                        hi_val.y = x1 * sin_1 + y1 * cos_1;
+                    }
                 }
             }
 
@@ -350,18 +376,9 @@ struct qkv_rope_append {
 struct qkv_gmem_waiter_sm89 {
     template <typename Cfg, typename G, typename Inst>
     static __device__ inline void gmem_wait(const G &g, state<Cfg> &s, Inst &inst) {
-        int _w = 0;
         while (*(volatile int *)&g.Bar[{inst.layer, OPCODE_AttnNorm - 1, inst.row, 0}]
-               < (int)G::matmul_batch_block_size) {
+               < (int)G::matmul_batch_block_size)
             __nanosleep(20);
-            if (++_w > 50000000 && inst.col == 0 && warp::laneid() == 0) {
-                printf("QKV HANG: waiting AttnNorm barrier, layer=%d row=%d val=%d need=%d\n",
-                    inst.layer, inst.row,
-                    *(volatile int *)&g.Bar[{inst.layer, OPCODE_AttnNorm - 1, inst.row, 0}],
-                    (int)G::matmul_batch_block_size);
-                break;
-            }
-        }
     }
 };
 

@@ -15,18 +15,9 @@ using config  = llama_sm89_config;
 struct gate_silu_gmem_waiter {
     template <typename Cfg, typename G, typename Inst>
     static __device__ inline void gmem_wait(const G &g, state<Cfg> &s, Inst &inst) {
-        int _w = 0;
         while (*(volatile int *)&g.Bar[{inst.layer, OPCODE_MlpNorm - 1, inst.row, 0}]
-               < G::matmul_batch_block_size) {
+               < G::matmul_batch_block_size)
             __nanosleep(20);
-            if (++_w > 50000000 && warp::laneid() == 0) {
-                printf("GATE_SILU HANG: layer=%d row=%d col=%d val=%d need=%d\n",
-                    inst.layer, inst.row, inst.col,
-                    *(volatile int *)&g.Bar[{inst.layer, OPCODE_MlpNorm - 1, inst.row, 0}],
-                    (int)G::matmul_batch_block_size);
-                break;
-            }
-        }
     }
 };
 
@@ -71,21 +62,27 @@ struct gate_silu {
             acc_rt acc;
             pipeline::consumer_loop(s, g, acc, inst.layer);
 
+            // Round matmul result to bf16 before applying SiLU, matching HF/cuBLAS
+            // precision order. Without this, SiLU operates on fp32 values that differ
+            // from bf16-rounded cuBLAS outputs, causing amplified error through the
+            // nonlinear activation (0.63 max error at layer 0 that compounds across layers).
+            {
+                rt_bf<16, OUT_BLOCK> temp_bf;
+                warp::copy(temp_bf, acc);
+                warp::copy(acc, temp_bf);
+            }
+
             // Apply SiLU in-register: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-            // TK stores fp32 rt tiles; operate element-by-element.
-            // SiLU is applied to each accumulator element.
+            // Each thread holds packed_per_thread float2 values per subtile.
             #pragma unroll
             for (int r = 0; r < acc_rt::height; r++) {
                 #pragma unroll
                 for (int c = 0; c < acc_rt::width; c++) {
                     #pragma unroll
-                    for (int rr = 0; rr < acc_rt::tile_size_row; rr++) {
-                        #pragma unroll
-                        for (int cc = 0; cc < acc_rt::tile_size_col / 2; cc++) {
-                            float2 &v = acc.tiles[r][c].data[rr * (acc_rt::tile_size_col / 2) + cc];
-                            v.x = v.x * (1.f / (1.f + expf(-v.x)));
-                            v.y = v.y * (1.f / (1.f + expf(-v.y)));
-                        }
+                    for (int k = 0; k < acc.tiles[0][0].packed_per_thread; k++) {
+                        float2 &v = acc.tiles[r][c].data[k];
+                        v.x = v.x * (1.f / (1.f + expf(-v.x)));
+                        v.y = v.y * (1.f / (1.f + expf(-v.y)));
                     }
                 }
             }

@@ -29,9 +29,18 @@ fn build_cuda() {
     // NAH, NKH, VS are also baked in per variant since they feed into constexpr
     // tile count calculations (optimal_out_block) in the globals struct.
     //
-    // To add a new variant: add an entry here, add FFI declarations in ffi.rs,
-    // and add a match arm in KernelVariant::from_dims() in lib.rs.
-    type Variant = (&'static str, usize, usize, usize, usize, usize, usize, usize);
+    // To add a new variant: add an entry here AND in the megakernel! variants
+    // block in lib.rs. The proc-macro generates FFI declarations and dispatch.
+    type Variant = (
+        &'static str,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    );
     let variants: &[Variant] = &[
         // Llama 1B (hidden=2048, head_dim=64)
         ("llama_sm89_hd2048_hdm64", 16, 2048, 8192, 64, 32, 8, 128256),

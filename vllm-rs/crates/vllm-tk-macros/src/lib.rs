@@ -486,7 +486,290 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
         }
     };
 
-    expanded.into()
+    // Phase 7: Generate variant dispatch if variants are defined
+    let variant_code = if !def.variants.is_empty() {
+        generate_variant_code(&def, &kernel_name.to_string())
+    } else {
+        quote! {}
+    };
+
+    let combined = quote! {
+        #expanded
+        #variant_code
+    };
+
+    combined.into()
+}
+
+/// Generate KernelVariant enum, FFI declarations, from_dims(), and dispatch methods
+/// from the `variants { ... }` block in the megakernel! macro.
+fn generate_variant_code(
+    def: &parse::MegakernelDef,
+    kernel_name: &str,
+) -> proc_macro2::TokenStream {
+    let mut enum_variants = Vec::new();
+    let mut from_dims_arms = Vec::new();
+    let mut supported_entries = Vec::new();
+    let mut decode_fn_arms = Vec::new();
+    let mut prefill_fn_arms = Vec::new();
+    let mut ffi_externs = Vec::new();
+
+    for v in &def.variants {
+        let variant_ident = &v.name;
+        let params: std::collections::HashMap<&str, usize> = v
+            .params
+            .iter()
+            .map(|(k, v)| (k.to_string().leak() as &str, *v))
+            .collect();
+
+        let hd = params.get("HD").copied().unwrap_or(2048);
+        let id = params.get("ID").copied().unwrap_or(8192);
+        let hdm = params.get("HDM").copied().unwrap_or(64);
+        let nah = params.get("NAH").copied().unwrap_or(32);
+        let nkh = params.get("NKH").copied().unwrap_or(8);
+
+        // Build FFI symbol names: {kernel_name}_{variant_suffix}_decode_static_launch
+        let variant_suffix = variant_ident.to_string().to_lowercase();
+        let decode_sym = syn::Ident::new(
+            &format!("{kernel_name}_{variant_suffix}_decode_static_launch"),
+            variant_ident.span(),
+        );
+        let prefill_sym = syn::Ident::new(
+            &format!("{kernel_name}_{variant_suffix}_prefill_static_launch"),
+            variant_ident.span(),
+        );
+
+        // Enum variant
+        enum_variants.push(quote! { #variant_ident });
+
+        // from_dims match arm
+        let hd_lit = proc_macro2::Literal::usize_unsuffixed(hd);
+        let id_lit = proc_macro2::Literal::usize_unsuffixed(id);
+        let hdm_lit = proc_macro2::Literal::usize_unsuffixed(hdm);
+        let nah_lit = proc_macro2::Literal::usize_unsuffixed(nah);
+        let nkh_lit = proc_macro2::Literal::usize_unsuffixed(nkh);
+        from_dims_arms.push(quote! {
+            (#hd_lit, #id_lit, #hdm_lit, #nah_lit, #nkh_lit) => Ok(Self::#variant_ident)
+        });
+
+        // Supported variants entry for error message
+        let desc = variant_ident.to_string();
+        supported_entries.push(quote! {
+            (#hd, #id, #hdm, #nah, #nkh, #desc)
+        });
+
+        // decode_fn / prefill_fn match arms
+        decode_fn_arms.push(quote! {
+            Self::#variant_ident => #decode_sym
+        });
+        prefill_fn_arms.push(quote! {
+            Self::#variant_ident => #prefill_sym
+        });
+
+        // FFI extern declarations
+        ffi_externs.push(quote! {
+            fn #decode_sym(
+                bar: TkTensorArg, instructions: TkTensorArg, timings: TkTensorArg,
+                qkv_w: TkTensorArg, attn_norm_w: TkTensorArg, o_w: TkTensorArg,
+                mlp_norm_w: TkTensorArg, up_w: TkTensorArg, gate_w: TkTensorArg,
+                down_w: TkTensorArg, lm_norm_w: TkTensorArg, lm_w: TkTensorArg,
+                k_cache: TkTensorArg, v_cache: TkTensorArg,
+                rope_cos: TkTensorArg, rope_sin: TkTensorArg,
+                hidden: TkTensorArg, rms_rope: TkTensorArg, rms_gate: TkTensorArg,
+                q_post: TkTensorArg, attn_out: TkTensorArg, silu: TkTensorArg,
+                rms_lm: TkTensorArg, logits: TkTensorArg,
+                pos_ids: TkTensorArg, kv_indptr: TkTensorArg, kv_indices: TkTensorArg,
+                kv_last_page: TkTensorArg, kv_append: TkTensorArg,
+                pfx_qo_indptr: TkTensorArg, pfx_kv_indptr: TkTensorArg,
+                pfx_kv_indices: TkTensorArg, pfx_kv_last_page_len: TkTensorArg,
+                attn_scale: f32, rms_norm_eps: f32,
+                num_pages: i32, batch_size: i32, num_prefill_tokens: i32, num_layers: i32,
+                stream: u64,
+            ) -> i32;
+
+            fn #prefill_sym(
+                bar: TkTensorArg, instructions: TkTensorArg, timings: TkTensorArg,
+                qkv_w: TkTensorArg, attn_norm_w: TkTensorArg, o_w: TkTensorArg,
+                mlp_norm_w: TkTensorArg, up_w: TkTensorArg, gate_w: TkTensorArg,
+                down_w: TkTensorArg, lm_norm_w: TkTensorArg, lm_w: TkTensorArg,
+                k_cache: TkTensorArg, v_cache: TkTensorArg,
+                rope_cos: TkTensorArg, rope_sin: TkTensorArg,
+                hidden: TkTensorArg, rms_rope: TkTensorArg, rms_gate: TkTensorArg,
+                q_post: TkTensorArg, attn_out: TkTensorArg, silu: TkTensorArg,
+                rms_lm: TkTensorArg, logits: TkTensorArg,
+                pos_ids: TkTensorArg, kv_indptr: TkTensorArg, kv_indices: TkTensorArg,
+                kv_last_page: TkTensorArg, kv_append: TkTensorArg,
+                pfx_qo_indptr: TkTensorArg, pfx_kv_indptr: TkTensorArg,
+                pfx_kv_indices: TkTensorArg, pfx_kv_last_page_len: TkTensorArg,
+                attn_scale: f32, rms_norm_eps: f32,
+                num_pages: i32, batch_size: i32, num_prefill_tokens: i32, num_layers: i32,
+                stream: u64,
+                seq_chunk_lens: *const i32, seq_extend_offsets: *const i32,
+            ) -> i32;
+        });
+    }
+
+    quote! {
+        /// Common launch signature type (decode). All variants share this signature.
+        #[cfg(feature = "cuda")]
+        type DecodeLaunchFn = unsafe extern "C" fn(
+            TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            f32, f32,
+            i32, i32, i32, i32,
+            u64,
+        ) -> i32;
+
+        /// Common launch signature type (prefill). Same as decode + seq metadata.
+        #[cfg(feature = "cuda")]
+        type PrefillLaunchFn = unsafe extern "C" fn(
+            TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            TkTensorArg, TkTensorArg, TkTensorArg, TkTensorArg,
+            f32, f32,
+            i32, i32, i32, i32,
+            u64,
+            *const i32, *const i32,
+        ) -> i32;
+
+        #[cfg(feature = "cuda")]
+        unsafe extern "C" {
+            #(#ffi_externs)*
+        }
+
+        /// A compiled kernel variant selected at runtime based on model dimensions.
+        #[derive(Debug, Clone, Copy)]
+        pub enum KernelVariant {
+            #(#enum_variants,)*
+        }
+
+        impl KernelVariant {
+            /// Select the compiled kernel variant matching the given model dimensions.
+            pub fn from_dims(
+                hidden_dim: usize,
+                intermediate_dim: usize,
+                head_dim: usize,
+                num_attention_heads: usize,
+                num_kv_heads: usize,
+            ) -> Result<Self, String> {
+                match (hidden_dim, intermediate_dim, head_dim, num_attention_heads, num_kv_heads) {
+                    #(#from_dims_arms,)*
+                    _ => {
+                        let supported: &[(usize, usize, usize, usize, usize, &str)] = &[
+                            #(#supported_entries,)*
+                        ];
+                        let mut msg = format!(
+                            "no compiled TK kernel variant for dims (HD={hidden_dim}, ID={intermediate_dim}, \
+                             HDM={head_dim}, NAH={num_attention_heads}, NKH={num_kv_heads}). \
+                             Supported variants:\n"
+                        );
+                        for &(hd, id, hdm, nah, nkh, desc) in supported {
+                            msg.push_str(&format!(
+                                "  - HD={hd}, ID={id}, HDM={hdm}, NAH={nah}, NKH={nkh} ({desc})\n"
+                            ));
+                        }
+                        Err(msg)
+                    }
+                }
+            }
+
+            /// Launch the decode kernel for this variant.
+            ///
+            /// # Safety
+            /// All TkTensorArg pointers must point to valid GPU memory with correct shapes.
+            #[cfg(feature = "cuda")]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe fn launch_decode(
+                &self,
+                ffi_args: &[TkTensorArg; 33],
+                attn_scale: f32,
+                rms_norm_eps: f32,
+                num_pages: i32,
+                batch_size: i32,
+                num_prefill_tokens: i32,
+                num_layers: i32,
+                stream: u64,
+            ) -> i32 {
+                let f: DecodeLaunchFn = match self {
+                    #(#decode_fn_arms,)*
+                };
+                unsafe {
+                    f(
+                        ffi_args[0], ffi_args[1], ffi_args[2],
+                        ffi_args[3], ffi_args[4], ffi_args[5], ffi_args[6],
+                        ffi_args[7], ffi_args[8], ffi_args[9],
+                        ffi_args[10], ffi_args[11],
+                        ffi_args[12], ffi_args[13],
+                        ffi_args[14], ffi_args[15],
+                        ffi_args[16], ffi_args[17], ffi_args[18], ffi_args[19],
+                        ffi_args[20], ffi_args[21], ffi_args[22], ffi_args[23],
+                        ffi_args[24], ffi_args[25], ffi_args[26], ffi_args[27], ffi_args[28],
+                        ffi_args[29], ffi_args[30], ffi_args[31], ffi_args[32],
+                        attn_scale, rms_norm_eps,
+                        num_pages, batch_size, num_prefill_tokens, num_layers,
+                        stream,
+                    )
+                }
+            }
+
+            /// Launch the prefill kernel for this variant.
+            ///
+            /// # Safety
+            /// All TkTensorArg pointers must point to valid GPU memory with correct shapes.
+            #[cfg(feature = "cuda")]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe fn launch_prefill(
+                &self,
+                ffi_args: &[TkTensorArg; 33],
+                attn_scale: f32,
+                rms_norm_eps: f32,
+                num_pages: i32,
+                batch_size: i32,
+                num_prefill_tokens: i32,
+                num_layers: i32,
+                stream: u64,
+                seq_chunk_lens: *const i32,
+                seq_extend_offsets: *const i32,
+            ) -> i32 {
+                let f: PrefillLaunchFn = match self {
+                    #(#prefill_fn_arms,)*
+                };
+                unsafe {
+                    f(
+                        ffi_args[0], ffi_args[1], ffi_args[2],
+                        ffi_args[3], ffi_args[4], ffi_args[5], ffi_args[6],
+                        ffi_args[7], ffi_args[8], ffi_args[9],
+                        ffi_args[10], ffi_args[11],
+                        ffi_args[12], ffi_args[13],
+                        ffi_args[14], ffi_args[15],
+                        ffi_args[16], ffi_args[17], ffi_args[18], ffi_args[19],
+                        ffi_args[20], ffi_args[21], ffi_args[22], ffi_args[23],
+                        ffi_args[24], ffi_args[25], ffi_args[26], ffi_args[27], ffi_args[28],
+                        ffi_args[29], ffi_args[30], ffi_args[31], ffi_args[32],
+                        attn_scale, rms_norm_eps,
+                        num_pages, batch_size, num_prefill_tokens, num_layers,
+                        stream,
+                        seq_chunk_lens, seq_extend_offsets,
+                    )
+                }
+            }
+        }
+    }
 }
 
 fn to_pascal_case(s: &str) -> String {

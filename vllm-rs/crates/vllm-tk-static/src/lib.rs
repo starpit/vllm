@@ -8,11 +8,9 @@
 //! NL (num_layers) is a runtime parameter — models with different layer counts
 //! but the same dimension tuple share a kernel variant.
 
-#[cfg(feature = "cuda")]
-mod ffi;
-
-// The megakernel! proc-macro generates typed handles, TkTensorArg, newtypes,
-// and LaunchArgs (baked to 1B dims for compile-time verification in tests).
+// The megakernel! proc-macro generates:
+// - Typed handles, TkTensorArg, newtypes, LaunchArgs (from default dims)
+// - KernelVariant enum, FFI declarations, from_dims(), dispatch (from variants block)
 vllm_tk_macros::megakernel! {
     kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
         for layer in 0..NL {
@@ -30,219 +28,14 @@ vllm_tk_macros::megakernel! {
         let normed = rmsnorm(hidden_states, lm_head_norm);
         logits = gemm(normed, lm_head);
     }
-}
-
-/// A compiled kernel variant selected at runtime based on model dimensions.
-///
-/// Each variant is specialized on (HD, ID, HDM) — dimensions that appear in
-/// TK's GL type parameters (shared memory tile shapes). NL (num_layers) is
-/// runtime. Other dims (NAH, NKH, VS) are baked per variant since they feed
-/// into constexpr tile count calculations.
-///
-/// The specialization key is (HD, HDM) since intermediate_dim, NAH, NKH are
-/// determined by the architecture for a given (HD, HDM) pair.
-#[derive(Debug, Clone, Copy)]
-pub enum KernelVariant {
-    /// Llama 1B: HD=2048, HDM=64
-    Hd2048Hdm64,
-    /// Llama 8B: HD=4096, HDM=128
-    Hd4096Hdm128,
-    // NOTE: Llama 3B (GQA_RATIO=3) not supported by attention kernel (needs 4 or 8).
-    // NOTE: 70B/405B exceed sm89 shared memory budget.
-}
-
-/// Supported variant configs: (HD, ID, HDM, NAH, NKH, description).
-const SUPPORTED_VARIANTS: &[(usize, usize, usize, usize, usize, &str)] = &[
-    (2048, 8192, 64, 32, 8, "Llama 1B"),
-    (4096, 14336, 128, 32, 8, "Llama 8B"),
-];
-
-impl KernelVariant {
-    /// Select the compiled kernel variant matching the given model dimensions.
-    ///
-    /// Matches on the full (HD, ID, HDM, NAH, NKH) tuple to ensure correctness.
-    /// Returns an error listing supported configurations if no match exists.
-    pub fn from_dims(
-        hidden_dim: usize,
-        intermediate_dim: usize,
-        head_dim: usize,
-        num_attention_heads: usize,
-        num_kv_heads: usize,
-    ) -> Result<Self, String> {
-        match (
-            hidden_dim,
-            intermediate_dim,
-            head_dim,
-            num_attention_heads,
-            num_kv_heads,
-        ) {
-            (2048, 8192, 64, 32, 8) => Ok(Self::Hd2048Hdm64),
-            (4096, 14336, 128, 32, 8) => Ok(Self::Hd4096Hdm128),
-            _ => {
-                let mut msg = format!(
-                    "no compiled TK kernel variant for dims (HD={hidden_dim}, ID={intermediate_dim}, \
-                     HDM={head_dim}, NAH={num_attention_heads}, NKH={num_kv_heads}). \
-                     Supported variants:\n"
-                );
-                for &(hd, id, hdm, nah, nkh, desc) in SUPPORTED_VARIANTS {
-                    msg.push_str(&format!(
-                        "  - HD={hd}, ID={id}, HDM={hdm}, NAH={nah}, NKH={nkh} ({desc})\n"
-                    ));
-                }
-                msg.push_str("To add support, add a new entry to the variant table in vllm-tk-static/build.rs");
-                Err(msg)
-            }
-        }
-    }
-
-    /// Launch the decode kernel for this variant.
-    ///
-    /// # Safety
-    /// All TkTensorArg pointers must point to valid GPU memory with correct shapes.
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch_decode(
-        &self,
-        ffi_args: &[TkTensorArg; 33],
-        attn_scale: f32,
-        rms_norm_eps: f32,
-        num_pages: i32,
-        batch_size: i32,
-        num_prefill_tokens: i32,
-        num_layers: i32,
-        stream: u64,
-    ) -> i32 {
-        let f = self.decode_fn();
-        unsafe {
-            f(
-                ffi_args[0],
-                ffi_args[1],
-                ffi_args[2],
-                ffi_args[3],
-                ffi_args[4],
-                ffi_args[5],
-                ffi_args[6],
-                ffi_args[7],
-                ffi_args[8],
-                ffi_args[9],
-                ffi_args[10],
-                ffi_args[11],
-                ffi_args[12],
-                ffi_args[13],
-                ffi_args[14],
-                ffi_args[15],
-                ffi_args[16],
-                ffi_args[17],
-                ffi_args[18],
-                ffi_args[19],
-                ffi_args[20],
-                ffi_args[21],
-                ffi_args[22],
-                ffi_args[23],
-                ffi_args[24],
-                ffi_args[25],
-                ffi_args[26],
-                ffi_args[27],
-                ffi_args[28],
-                ffi_args[29],
-                ffi_args[30],
-                ffi_args[31],
-                ffi_args[32],
-                attn_scale,
-                rms_norm_eps,
-                num_pages,
-                batch_size,
-                num_prefill_tokens,
-                num_layers,
-                stream,
-            )
-        }
-    }
-
-    /// Launch the prefill kernel for this variant.
-    ///
-    /// # Safety
-    /// All TkTensorArg pointers must point to valid GPU memory with correct shapes.
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch_prefill(
-        &self,
-        ffi_args: &[TkTensorArg; 33],
-        attn_scale: f32,
-        rms_norm_eps: f32,
-        num_pages: i32,
-        batch_size: i32,
-        num_prefill_tokens: i32,
-        num_layers: i32,
-        stream: u64,
-        seq_chunk_lens: *const i32,
-        seq_extend_offsets: *const i32,
-    ) -> i32 {
-        let f = self.prefill_fn();
-        unsafe {
-            f(
-                ffi_args[0],
-                ffi_args[1],
-                ffi_args[2],
-                ffi_args[3],
-                ffi_args[4],
-                ffi_args[5],
-                ffi_args[6],
-                ffi_args[7],
-                ffi_args[8],
-                ffi_args[9],
-                ffi_args[10],
-                ffi_args[11],
-                ffi_args[12],
-                ffi_args[13],
-                ffi_args[14],
-                ffi_args[15],
-                ffi_args[16],
-                ffi_args[17],
-                ffi_args[18],
-                ffi_args[19],
-                ffi_args[20],
-                ffi_args[21],
-                ffi_args[22],
-                ffi_args[23],
-                ffi_args[24],
-                ffi_args[25],
-                ffi_args[26],
-                ffi_args[27],
-                ffi_args[28],
-                ffi_args[29],
-                ffi_args[30],
-                ffi_args[31],
-                ffi_args[32],
-                attn_scale,
-                rms_norm_eps,
-                num_pages,
-                batch_size,
-                num_prefill_tokens,
-                num_layers,
-                stream,
-                seq_chunk_lens,
-                seq_extend_offsets,
-            )
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    fn decode_fn(&self) -> ffi::DecodeLaunchFn {
-        match self {
-            Self::Hd2048Hdm64 => ffi::llama_sm89_hd2048_hdm64_decode_static_launch,
-            Self::Hd4096Hdm128 => ffi::llama_sm89_hd4096_hdm128_decode_static_launch,
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    fn prefill_fn(&self) -> ffi::PrefillLaunchFn {
-        match self {
-            Self::Hd2048Hdm64 => ffi::llama_sm89_hd2048_hdm64_prefill_static_launch,
-            Self::Hd4096Hdm128 => ffi::llama_sm89_hd4096_hdm128_prefill_static_launch,
-        }
+    variants {
+        Hd2048Hdm64:  { HD=2048, ID=8192,  HDM=64,  NAH=32, NKH=8 },
+        Hd4096Hdm128: { HD=4096, ID=14336, HDM=128, NAH=32, NKH=8 },
     }
 }
+
+// KernelVariant enum, FFI declarations, from_dims(), and dispatch methods
+// are all generated by the megakernel! macro's `variants` block above.
 
 #[cfg(test)]
 mod tests {

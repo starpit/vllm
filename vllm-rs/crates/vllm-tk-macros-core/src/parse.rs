@@ -22,11 +22,18 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Ident, LitInt, Result, Token, braced, token};
 
-/// Top-level: `kernel name<params> { body }`
+/// A compiled kernel variant with its own dimension overrides.
+pub struct VariantDef {
+    pub name: Ident,
+    pub params: Vec<(Ident, usize)>,
+}
+
+/// Top-level: `kernel name<params> { body }` with optional `variants { ... }`.
 pub struct MegakernelDef {
     pub name: Ident,
     pub params: Vec<(Ident, usize)>,
     pub body: Vec<Stmt>,
+    pub variants: Vec<VariantDef>,
 }
 
 /// A statement in the kernel body.
@@ -113,7 +120,55 @@ impl Parse for MegakernelDef {
         braced!(content in input);
         let body = parse_stmts(&content)?;
 
-        Ok(MegakernelDef { name, params, body })
+        // Optional: `variants { Name: { PARAM=val, ... }, ... }`
+        let variants = if input.peek(Ident) {
+            let kw: Ident = input.parse()?;
+            if kw != "variants" {
+                return Err(syn::Error::new(
+                    kw.span(),
+                    "expected `variants` or end of input",
+                ));
+            }
+            let vcontent;
+            braced!(vcontent in input);
+            let mut variants = Vec::new();
+            while !vcontent.is_empty() {
+                let vname: Ident = vcontent.parse()?;
+                vcontent.parse::<Token![:]>()?;
+                let pcontent;
+                braced!(pcontent in vcontent);
+                let mut vparams = Vec::new();
+                loop {
+                    if pcontent.is_empty() {
+                        break;
+                    }
+                    let pname: Ident = pcontent.parse()?;
+                    pcontent.parse::<Token![=]>()?;
+                    let pval: LitInt = pcontent.parse()?;
+                    vparams.push((pname, pval.base10_parse::<usize>()?));
+                    if pcontent.peek(Token![,]) {
+                        pcontent.parse::<Token![,]>()?;
+                    }
+                }
+                variants.push(VariantDef {
+                    name: vname,
+                    params: vparams,
+                });
+                if vcontent.peek(Token![,]) {
+                    vcontent.parse::<Token![,]>()?;
+                }
+            }
+            variants
+        } else {
+            Vec::new()
+        };
+
+        Ok(MegakernelDef {
+            name,
+            params,
+            body,
+            variants,
+        })
     }
 }
 

@@ -246,6 +246,42 @@ fn emit_run_op_template(out: &mut String) {
         "// This replaces the controller's instruction fetch + opcode switch."
     )
     .unwrap();
+    // Compile-time barrier safety checks.
+    // Ops use group<NUM_CONSUMER_WARPS>::sync(0) (barrier 0) internally.
+    // Inter-op sync uses group<NUM_WARPS>::sync(15) (barrier 15).
+    // These must not collide: barrier IDs differ (0 vs 15) and thread counts differ.
+    writeln!(
+        out,
+        "static_assert(config::NUM_WARPS == config::NUM_CONSUMER_WARPS + 4,"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    \"NUM_WARPS must be NUM_CONSUMER_WARPS + 4 (loader+storer+launcher+controller)\");"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "static_assert(config::NUM_THREADS == config::NUM_WARPS * 32,"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    \"NUM_THREADS must equal NUM_WARPS * WARP_SIZE\");"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "static_assert(config::NUM_CONSUMER_WARPS > 0 && config::NUM_CONSUMER_WARPS <= 12,"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    \"NUM_CONSUMER_WARPS must be between 1 and 12 (sm89 has 16 barriers max)\");"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+
     writeln!(out, "template<typename Op>").unwrap();
     writeln!(out, "__device__ void run_op(").unwrap();
     writeln!(out, "    const globals &g, state<config> &kvms,").unwrap();

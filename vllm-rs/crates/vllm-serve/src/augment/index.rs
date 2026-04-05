@@ -73,11 +73,22 @@ async fn process_document(
         return Err(anyhow!("No chunks produced from document: {filename}"));
     }
 
+    let n_chunks = chunks.len();
     info!(
         filename,
-        chunks = chunks.len(),
+        chunks = n_chunks,
         "Indexing document for RAG augmentation"
     );
+
+    // Show a spinner so the user knows indexing is in progress.
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .template("  {spinner:.green} Indexing {msg}")
+            .unwrap(),
+    );
+    pb.set_message(format!("{filename} ({n_chunks} chunks)"));
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     let file_base_name = std::path::Path::new(filename)
         .file_name()
@@ -146,6 +157,8 @@ async fn process_document(
         })
         .await??;
     }
+
+    pb.finish_and_clear();
 
     // Mark as done
     std::fs::OpenOptions::new()

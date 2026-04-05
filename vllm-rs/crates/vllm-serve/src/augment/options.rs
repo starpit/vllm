@@ -31,7 +31,7 @@ impl Default for AugmentOptions {
     fn default() -> Self {
         Self {
             max_aug: 10,
-            index_dir: "data/spnl".to_string(),
+            index_dir: "data/leann".to_string(),
             chunk_size: 512,
             chunk_overlap: 50,
             current_model: None,

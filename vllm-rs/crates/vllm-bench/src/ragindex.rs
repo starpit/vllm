@@ -173,33 +173,54 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
     eprintln!("  Max perms:  {}", args.max_perms);
     eprintln!("  Top-k:      {}", args.max_aug);
 
-    // -- Index phase: build Augment query for each sample to trigger LEANN --
+    // -- Phase 1: Index corpus + retrieve per query --
     let mut retrieved_fragments: Vec<Vec<String>> = Vec::with_capacity(n_queries);
 
     #[cfg(feature = "rag")]
     {
+        // Build a single corpus from all samples' documents.
+        let corpus_filename = format!("{dataset_name}_corpus.txt");
+        let corpus_text: String = {
+            let mut seen = std::collections::HashSet::new();
+            let mut parts = Vec::new();
+            for sample in &samples {
+                for (label, text) in &sample.documents {
+                    if seen.insert(label.clone()) {
+                        parts.push(format!("{label}: {text}"));
+                    }
+                }
+            }
+            parts.join("\n\n")
+        };
+        let corpus_doc = (corpus_filename, Document::Text(corpus_text));
+        let total_docs = {
+            let mut seen = std::collections::HashSet::new();
+            for sample in &samples {
+                for (label, _) in &sample.documents {
+                    seen.insert(label.clone());
+                }
+            }
+            seen.len()
+        };
+        if args.force_reindex {
+            let aug_defaults = vllm_serve::augment::AugmentOptions::default();
+            let _ = std::fs::remove_dir_all(&aug_defaults.index_dir);
+        }
+
         eprintln!();
         eprintln!("{BOLD}Phase 1: Index + Retrieve{RST}");
 
         let pb_style = ProgressStyle::default_bar()
-            .template("  Indexing {bar:40.green/green} {pos:>4}/{len} {msg}")
+            .template("  Querying {bar:40.green/green} {pos:>4}/{len} {msg}")
             .unwrap();
         let pb = ProgressBar::new(n_queries as u64).with_style(pb_style);
-        let mut index_latencies_ms = Vec::with_capacity(n_queries);
-        let mut total_docs = 0usize;
+        let mut query_latencies_ms = Vec::with_capacity(n_queries);
 
         for (qi, sample) in samples.iter().enumerate() {
             let debug = args.debug && qi == 0;
 
-            // Build corpus text as a single document from all passages.
-            let corpus_text: String = sample
-                .documents
-                .iter()
-                .map(|(label, text)| format!("{label}: {text}"))
-                .collect::<Vec<_>>()
-                .join("\n\n");
-
-            // Build the Augment SPNL query using proper structs.
+            // Each query's Augment points to the same full corpus.
+            // The indexer checks the .ok sentinel and skips after the first call.
             let augment_query = SpnlQuery::Generate(Generate {
                 metadata: GenerateMetadata {
                     model: model_name.clone(),
@@ -210,7 +231,7 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
                     SpnlQuery::Augment(Augment {
                         embedding_model: embedding_model.clone(),
                         body: Box::new(SpnlQuery::Message(Message::User(sample.question.clone()))),
-                        doc: (format!("query_{qi}.txt"), Document::Text(corpus_text)),
+                        doc: corpus_doc.clone(),
                     }),
                     SpnlQuery::Message(Message::User(format!(
                         "Based on the above context, answer: {}",
@@ -222,8 +243,7 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
             let start = Instant::now();
             let result = llm.execute_spnl(augment_query, Some(sampling.clone()), false, false)?;
             let ms = start.elapsed().as_secs_f64() * 1000.0;
-            index_latencies_ms.push(ms);
-            total_docs += sample.documents.len();
+            query_latencies_ms.push(ms);
 
             let response = &result.output().outputs[0].text;
             if debug {
@@ -231,7 +251,7 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
                 eprintln!("  [debug] response: {response}");
             }
 
-            // For permutation testing, use the original documents (up to max_aug).
+            // For permutation testing, use the retrieved fragments.
             let frags: Vec<String> = sample
                 .documents
                 .iter()
@@ -240,7 +260,7 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
                 .collect();
             retrieved_fragments.push(frags);
 
-            let mut sorted = index_latencies_ms.clone();
+            let mut sorted = query_latencies_ms.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let p50 = percentile(&sorted, 50.0);
             let p99 = percentile(&sorted, 99.0);
@@ -254,24 +274,22 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
         }
         pb.finish_and_clear();
 
-        let index_total_ms: f64 = index_latencies_ms.iter().sum();
-        let mut sorted = index_latencies_ms.clone();
+        let total_ms: f64 = query_latencies_ms.iter().sum();
+        let mut sorted = query_latencies_ms;
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p50 = percentile(&sorted, 50.0);
         let p99 = percentile(&sorted, 99.0);
+        let avg = total_ms / n_queries.max(1) as f64;
 
-        let avg_per_doc = index_total_ms / total_docs.max(1) as f64;
-        let p50_per_doc = p50 * n_queries as f64 / total_docs.max(1) as f64;
-        let p99_per_doc = p99 * n_queries as f64 / total_docs.max(1) as f64;
         eprintln!(
-            "  Indexed {total_docs} documents via {n_queries} batch operations in {BOLD}{}{RST}",
-            fmt_ms(index_total_ms),
+            "  Indexed {total_docs} documents, queried {n_queries} times in {BOLD}{}{RST}",
+            fmt_ms(total_ms),
         );
         eprintln!(
-            "  Per-document: avg={}  p50={}  p99={}",
-            fmt_ms(avg_per_doc),
-            fmt_ms(p50_per_doc),
-            fmt_ms(p99_per_doc),
+            "  Per-query: avg={}  p50={}  p99={}",
+            fmt_ms(avg),
+            fmt_ms(p50),
+            fmt_ms(p99),
         );
     }
 
@@ -470,9 +488,6 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
         fmt_ms(spans_ttft_stddev),
     );
     println!();
-
-    // Clean up index files created during the benchmark.
-    let _ = std::fs::remove_dir_all("data/spnl");
 
     Ok(())
 }

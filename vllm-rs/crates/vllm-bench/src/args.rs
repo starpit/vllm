@@ -1618,6 +1618,10 @@ pub struct BenchRagindexArgs {
     #[arg(long)]
     pub enforce_eager: bool,
 
+    /// Force re-indexing of all documents (clear cached LEANN indexes).
+    #[arg(short = 'f', long)]
+    pub force_reindex: bool,
+
     /// Log level.
     #[arg(long, default_value = "warn")]
     pub log_level: String,

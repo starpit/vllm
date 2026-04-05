@@ -200,6 +200,9 @@ mod inner {
         host_prefill_kv_last_page_len: Vec<i32>,
 
         ctx_set_on_thread: bool,
+
+        /// Compiled kernel variant selected at model load time.
+        kernel_variant: Option<vllm_tk_static::KernelVariant>,
     }
 
     impl TkWorker {
@@ -226,6 +229,7 @@ mod inner {
                 host_prefill_kv_indices: Vec::new(),
                 host_prefill_kv_last_page_len: Vec::new(),
                 ctx_set_on_thread: false,
+                kernel_variant: None,
             }
         }
 
@@ -767,6 +771,7 @@ mod inner {
                     attn_scale,
                     rms_norm_eps: config.rms_norm_eps,
                     num_pages: num_pages as i32,
+                    num_layers: nl,
                     prefill_num_seqs: 0,
                     prefill_num_kv_pages: 0,
                 }
@@ -776,9 +781,14 @@ mod inner {
             let inst_shape = [1, sm_count, max_per_sm, scheduler::INSTRUCTION_WIDTH];
             let timing_shape = [1, sm_count, max_per_sm, scheduler::TIMING_WIDTH];
 
+            let variant = self
+                .kernel_variant
+                .as_ref()
+                .expect("kernel variant not set");
             let rc = unsafe {
                 MegakernelLlamaSm89::launch_decode(
                     &args,
+                    variant,
                     DecodeBatchSize(batch_size as i32),
                     NumTokens(0), // num_prefill_tokens
                     barrier_shape,
@@ -1071,6 +1081,7 @@ mod inner {
                     attn_scale,
                     rms_norm_eps: config.rms_norm_eps,
                     num_pages: num_pages as i32,
+                    num_layers: nl,
                     prefill_num_seqs: num_prefill_seqs,
                     prefill_num_kv_pages: total_prefill_kv_pages,
                 }
@@ -1088,8 +1099,13 @@ mod inner {
             unsafe {
                 driver::stream_synchronize(stream).expect("pre-launch sync");
                 tracing::info!("TK prefill: all uploads complete, launching kernel");
+                let variant = self
+                    .kernel_variant
+                    .as_ref()
+                    .expect("kernel variant not set");
                 let rc = MegakernelLlamaSm89::launch_prefill(
                     &args,
+                    variant,
                     NumSeqs(num_prefill_seqs as i32),
                     NumTokens(total_tokens as i32),
                     &seq_chunk_lens,
@@ -1177,9 +1193,20 @@ mod inner {
                 attn_batch_block_size: gqa_ratio,
             };
 
+            let variant = vllm_tk_static::KernelVariant::from_dims(
+                llama_config.hidden_size,
+                llama_config.intermediate_size,
+                llama_config.head_dim,
+                llama_config.num_attention_heads,
+                llama_config.num_kv_heads,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            tracing::info!("TkWorker: selected kernel variant {:?}", variant);
+
             self.weights = Some(weights);
             self.llama_config = Some(llama_config);
             self.tk_model_config = Some(tk_model_config);
+            self.kernel_variant = Some(variant);
             Ok(())
         }
 

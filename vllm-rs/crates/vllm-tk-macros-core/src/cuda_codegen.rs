@@ -199,6 +199,22 @@ fn emit_preamble(out: &mut String, dag: &ModelDag) {
     writeln!(out, "// Ops: {}", dag.ops.len()).unwrap();
     writeln!(out).unwrap();
 
+    // Override model dimension macros before the header defines its defaults.
+    // This parameterizes llama_sm89_globals (and all op files that use it)
+    // with the variant's specific dimensions.
+    let nl = dag.params.get("NL").copied().unwrap_or(16);
+    let hd = dag.params.get("HD").copied().unwrap_or(2048);
+    let id = dag.params.get("ID").copied().unwrap_or(8192);
+    let hdm = dag.params.get("HDM").copied().unwrap_or(64);
+    let nah = dag.params.get("NAH").copied().unwrap_or(32);
+    let nkh = dag.params.get("NKH").copied().unwrap_or(8);
+    writeln!(out, "#define SM89_NUM_LAYERS             {nl}").unwrap();
+    writeln!(out, "#define SM89_HIDDEN_DIM             {hd}").unwrap();
+    writeln!(out, "#define SM89_INTERMEDIATE_DIM       {id}").unwrap();
+    writeln!(out, "#define SM89_HEAD_DIM               {hdm}").unwrap();
+    writeln!(out, "#define SM89_NUM_ATTENTION_HEADS    {nah}").unwrap();
+    writeln!(out, "#define SM89_NUM_KV_HEADS           {nkh}").unwrap();
+    writeln!(out).unwrap();
     writeln!(out, "#include \"llama_sm89.cuh\"").unwrap();
     writeln!(out, "#include \"rms_norm_sm89.cu\"").unwrap();
     writeln!(out, "#include \"qkv_rope_append_sm89.cu\"").unwrap();
@@ -354,7 +370,9 @@ fn emit_model_constants(
     let gqa_ratio = nah / nkh;
 
     writeln!(out, "// ── Model constants ──").unwrap();
-    writeln!(out, "static constexpr int NL = {};", nl).unwrap();
+    // All model dimensions except NL are compile-time constants, used in GL type
+    // parameters (tile shapes, shared memory vector sizes). These define the kernel
+    // specialization variant. NL (num_layers) is runtime — passed via launch wrapper.
     writeln!(out, "static constexpr int HD = {};", hd).unwrap();
     writeln!(out, "static constexpr int ID = {};", id).unwrap();
     writeln!(out, "static constexpr int HDM = {};", hdm).unwrap();
@@ -610,7 +628,7 @@ fn emit_decode_kernel(out: &mut String, dag: &ModelDag, nl: usize, nbh: usize, g
     writeln!(out, "__global__ __launch_bounds__(config::NUM_THREADS, 1)").unwrap();
     writeln!(
         out,
-        "void {}_decode_static(const globals g, int batch_size) {{",
+        "void {}_decode_static(const globals g, int batch_size, int num_layers) {{",
         dag.name
     )
     .unwrap();
@@ -644,7 +662,11 @@ fn emit_decode_kernel(out: &mut String, dag: &ModelDag, nl: usize, nbh: usize, g
     ];
 
     writeln!(out, "    // ── Layer loop ──").unwrap();
-    writeln!(out, "    for (int layer = 0; layer < NL; layer++) {{").unwrap();
+    writeln!(
+        out,
+        "    for (int layer = 0; layer < num_layers; layer++) {{"
+    )
+    .unwrap();
 
     for (op_name, tile_count, row_expr, col_expr) in &layer_op_tiles {
         if let Some(mapping) = mappings.get(op_name) {
@@ -694,6 +716,7 @@ fn emit_prefill_kernel(out: &mut String, dag: &ModelDag, nl: usize, nbh: usize, 
     writeln!(out, "    const globals g,").unwrap();
     writeln!(out, "    int total_tokens,").unwrap();
     writeln!(out, "    int num_seqs,").unwrap();
+    writeln!(out, "    int num_layers,").unwrap();
     writeln!(out, "    const int *__restrict__ seq_chunk_lens,").unwrap();
     writeln!(out, "    const int *__restrict__ seq_extend_offsets)").unwrap();
     writeln!(out, "{{").unwrap();
@@ -728,7 +751,11 @@ fn emit_prefill_kernel(out: &mut String, dag: &ModelDag, nl: usize, nbh: usize, 
     // 2. Matmul ops tile as (n_matmul_blocks * n_cols_X) with row=t/n_cols, col=t%n_cols
     // 3. Attention uses attention_prefill with per-sequence iteration
     writeln!(out, "    // ── Layer loop ──").unwrap();
-    writeln!(out, "    for (int layer = 0; layer < NL; layer++) {{").unwrap();
+    writeln!(
+        out,
+        "    for (int layer = 0; layer < num_layers; layer++) {{"
+    )
+    .unwrap();
     writeln!(out).unwrap();
 
     // attn_norm: 1 tile per token
@@ -1057,7 +1084,10 @@ fn emit_tensor_arg_and_globals_helper(out: &mut String) {
 /// Emit the globals construction code (shared between decode and prefill launch wrappers).
 /// Identical to tk_launch.cu's globals construction.
 fn emit_globals_construction(out: &mut String, indent: &str) {
-    writeln!(out, "{indent}using G = llama_sm89_globals;").unwrap();
+    // Use `globals` type alias (= llama_sm89_globals from the header).
+    // NL in the template is the header's macro value — only used for weight shape
+    // metadata, not the runtime loop bound (which uses num_layers param).
+    writeln!(out, "{indent}using G = globals;").unwrap();
     writeln!(out, "{indent}G g {{").unwrap();
     writeln!(out, "{indent}    // VM state").unwrap();
     writeln!(out, "{indent}    make_arg<G::barriers>(bar),").unwrap();
@@ -1157,22 +1187,21 @@ const LAUNCH_PARAMS: &str = "\
     TkTensorArg prefill_kv_indices, TkTensorArg prefill_kv_last_page_len,
     // Scalars
     float attn_scale, float rms_norm_eps,
-    int num_pages, int batch_size, int num_prefill_tokens,
+    int num_pages, int batch_size, int num_prefill_tokens, int num_layers,
     // CUDA stream
     uint64_t stream";
 
 /// Emit host-side assertions for dynamic dims that `make_gl` doesn't check (the -1 dims).
 /// These fire before cudaLaunchKernel, catching mismatched runtime shapes cheaply.
-fn emit_dynamic_dim_assertions(out: &mut String, dag: &ModelDag, indent: &str, is_prefill: bool) {
-    let nl = dag.params["NL"];
-
+fn emit_dynamic_dim_assertions(out: &mut String, _dag: &ModelDag, indent: &str, is_prefill: bool) {
     // Barrier must cover all pipeline stages (layers)
     writeln!(
         out,
         "{indent}// ── Dynamic dim assertions (catch -1 dims that make_gl skips) ──"
     )
     .unwrap();
-    writeln!(out, "{indent}if (bar.b < {nl}) {{ fprintf(stderr, \"ASSERT: barrier batch %d < NL={nl}\\n\", bar.b); fflush(stderr); return -100; }}").unwrap();
+    writeln!(out, "{indent}if (num_layers <= 0) {{ fprintf(stderr, \"ASSERT: num_layers %d <= 0\\n\", num_layers); fflush(stderr); return -100; }}").unwrap();
+    writeln!(out, "{indent}if (bar.b < num_layers) {{ fprintf(stderr, \"ASSERT: barrier batch %d < num_layers %d\\n\", bar.b, num_layers); fflush(stderr); return -100; }}").unwrap();
 
     // Activations: rows must cover batch
     writeln!(out, "{indent}if (hidden.r < batch_size) {{ fprintf(stderr, \"ASSERT: hidden rows %d < batch_size %d\\n\", hidden.r, batch_size); fflush(stderr); return -101; }}").unwrap();
@@ -1251,7 +1280,7 @@ fn emit_decode_launch_wrapper(out: &mut String, dag: &ModelDag) {
         dag.name
     )
     .unwrap();
-    writeln!(out, "        g, batch_size);").unwrap();
+    writeln!(out, "        g, batch_size, num_layers);").unwrap();
     writeln!(out, "    err = cudaGetLastError();").unwrap();
     writeln!(out, "    return (int)err;").unwrap();
     writeln!(out, "  }} catch (const std::exception &e) {{").unwrap();
@@ -1309,7 +1338,7 @@ fn emit_prefill_launch_wrapper(out: &mut String, dag: &ModelDag) {
     .unwrap();
     writeln!(
         out,
-        "        g, num_prefill_tokens, batch_size, seq_chunk_lens, seq_extend_offsets);"
+        "        g, num_prefill_tokens, batch_size, num_layers, seq_chunk_lens, seq_extend_offsets);"
     )
     .unwrap();
     writeln!(out, "    err = cudaGetLastError();").unwrap();
@@ -1355,13 +1384,15 @@ mod tests {
         assert!(cuda.contains("Op::loader::run(g, kvms)"));
         assert!(cuda.contains("Identity page mapping"));
 
-        // Model constants
-        assert!(cuda.contains("static constexpr int NL = 16;"));
+        // Model constants (NL is runtime, not emitted as constexpr)
+        assert!(!cuda.contains("static constexpr int NL"));
         assert!(cuda.contains("static constexpr int HD = 2048;"));
         assert!(cuda.contains("static constexpr int NBH = 48;"));
 
         // ── Decode kernel ──
-        assert!(cuda.contains("void llama_sm89_decode_static(const globals g, int batch_size)"));
+        assert!(cuda.contains(
+            "void llama_sm89_decode_static(const globals g, int batch_size, int num_layers)"
+        ));
         assert!(cuda.contains("OPCODE_GQA_AttentionDecode"));
         assert!(cuda.contains("t / NKH, t % NKH"));
 
@@ -1378,7 +1409,7 @@ mod tests {
         // Both kernels have layer loop
         // (appears twice — once in decode, once in prefill)
         assert_eq!(
-            cuda.matches("for (int layer = 0; layer < NL; layer++)")
+            cuda.matches("for (int layer = 0; layer < num_layers; layer++)")
                 .count(),
             2
         );

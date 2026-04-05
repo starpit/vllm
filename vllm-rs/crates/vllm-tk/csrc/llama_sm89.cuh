@@ -25,22 +25,33 @@
 #define OPCODE_LM_HeadNorm          10
 #define OPCODE_LM_Head              11
 
-// Model size selection — default to 1B for easier sm89 testing.
-// Override with -DUSE_LLAMA_SM89_8B.
-#if defined(USE_LLAMA_SM89_8B)
+// Model dimension macros — can be overridden by #define before including this header.
+// Default: 1B for easier sm89 testing. Override with -DUSE_LLAMA_SM89_8B or per-macro.
+#if defined(USE_LLAMA_SM89_8B) && !defined(SM89_HIDDEN_DIM)
 #  define SM89_NUM_LAYERS              32
 #  define SM89_HIDDEN_DIM            4096
 #  define SM89_INTERMEDIATE_DIM     14336
 #  define SM89_HEAD_DIM               128
 #  define SM89_NUM_ATTENTION_HEADS     32
 #  define SM89_NUM_KV_HEADS             8
-#else
-// LLaMA 1B defaults
+#endif
+// LLaMA 1B defaults (only if not already defined)
+#ifndef SM89_NUM_LAYERS
 #  define SM89_NUM_LAYERS              16
+#endif
+#ifndef SM89_HIDDEN_DIM
 #  define SM89_HIDDEN_DIM            2048
+#endif
+#ifndef SM89_INTERMEDIATE_DIM
 #  define SM89_INTERMEDIATE_DIM      8192
+#endif
+#ifndef SM89_HEAD_DIM
 #  define SM89_HEAD_DIM                64
+#endif
+#ifndef SM89_NUM_ATTENTION_HEADS
 #  define SM89_NUM_ATTENTION_HEADS     32
+#endif
+#ifndef SM89_NUM_KV_HEADS
 #  define SM89_NUM_KV_HEADS             8
 #endif
 

@@ -146,6 +146,7 @@ fn test_cuda_static_decode_smoke() {
             attn_scale: 1.0 / (hdm as f32).sqrt(),
             rms_norm_eps: 1e-5,
             num_pages: num_pages as i32,
+            num_layers: nl,
             prefill_num_seqs: 0,
             prefill_num_kv_pages: 0,
         }
@@ -158,10 +159,16 @@ fn test_cuda_static_decode_smoke() {
     // Use default stream (0)
     let stream: u64 = 0;
 
+    // Select kernel variant for the default (1B) dims
+    let nah = MegakernelLlamaSm89::NAH;
+    let variant =
+        KernelVariant::from_dims(hd, id, hdm, nah, nkh).expect("no variant for default dims");
+
     // Launch!
     let rc = unsafe {
         MegakernelLlamaSm89::launch_decode(
             &args,
+            &variant,
             DecodeBatchSize(batch_size as i32),
             NumTokens(0), // num_prefill_tokens
             barrier_shape,

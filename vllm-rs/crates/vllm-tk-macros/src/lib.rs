@@ -302,6 +302,9 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
             pub rms_norm_eps: f32,
             pub num_pages: i32,
 
+            // ── Runtime model dimension ──
+            pub num_layers: usize,
+
             // ── Prefill metadata sizes (set to 0 for decode-only) ──
             pub prefill_num_seqs: usize,
             pub prefill_num_kv_pages: usize,
@@ -332,6 +335,7 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
             fn args_to_ffi(
                 args: &LaunchArgs,
                 batch_rows: usize,
+                num_layers: usize,
                 barrier_shape: [usize; 4],
                 inst_shape: [usize; 4],
                 timing_shape: [usize; 4],
@@ -341,14 +345,14 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                     TkTensorArg::new(args.barrier.ptr_u64(), &barrier_shape),
                     TkTensorArg::new(args.instructions.ptr_u64(), &inst_shape),
                     TkTensorArg::new(args.timings.ptr_u64(), &timing_shape),
-                    // Weights — shapes baked from model dims
-                    TkTensorArg::new(args.qkv_weights.ptr_u64(), &[#nl * #qkv_dim, #hd]),
-                    TkTensorArg::new(args.attn_norm.ptr_u64(), &[#nl, #hd]),
-                    TkTensorArg::new(args.o_proj.ptr_u64(), &[#nl * #hd, #hd]),
-                    TkTensorArg::new(args.mlp_norm.ptr_u64(), &[#nl, #hd]),
-                    TkTensorArg::new(args.up_weights.ptr_u64(), &[#nl * #id, #hd]),
-                    TkTensorArg::new(args.gate_weights.ptr_u64(), &[#nl * #id, #hd]),
-                    TkTensorArg::new(args.down_proj.ptr_u64(), &[#nl * #hd, #id]),
+                    // Weights — shapes use runtime num_layers
+                    TkTensorArg::new(args.qkv_weights.ptr_u64(), &[num_layers * #qkv_dim, #hd]),
+                    TkTensorArg::new(args.attn_norm.ptr_u64(), &[num_layers, #hd]),
+                    TkTensorArg::new(args.o_proj.ptr_u64(), &[num_layers * #hd, #hd]),
+                    TkTensorArg::new(args.mlp_norm.ptr_u64(), &[num_layers, #hd]),
+                    TkTensorArg::new(args.up_weights.ptr_u64(), &[num_layers * #id, #hd]),
+                    TkTensorArg::new(args.gate_weights.ptr_u64(), &[num_layers * #id, #hd]),
+                    TkTensorArg::new(args.down_proj.ptr_u64(), &[num_layers * #hd, #id]),
                     TkTensorArg::new(args.lm_head_norm.ptr_u64(), &[1, #hd]),
                     TkTensorArg::new(args.lm_head.ptr_u64(), &[#vs, #hd]),
                     // KV cache
@@ -392,6 +396,7 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
             #[allow(clippy::too_many_arguments)]
             pub unsafe fn launch_decode(
                 args: &LaunchArgs,
+                variant: &crate::KernelVariant,
                 batch_size: DecodeBatchSize,
                 num_prefill_tokens: NumTokens,
                 barrier_shape: [usize; 4],
@@ -405,28 +410,21 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 debug_assert!(bs <= 128, "batch_size must be <= 128 (decode)");
 
                 let batch_rows = (bs as usize).next_multiple_of(128);
-                let ffi = Self::args_to_ffi(args, batch_rows, barrier_shape, inst_shape, timing_shape);
+                let nl = args.num_layers;
+                let ffi = Self::args_to_ffi(args, batch_rows, nl, barrier_shape, inst_shape, timing_shape);
 
                 #[cfg(feature = "cuda")]
                 {
-                    crate::ffi::llama_sm89_decode_static_launch(
-                        ffi[0], ffi[1], ffi[2],
-                        ffi[3], ffi[4], ffi[5], ffi[6], ffi[7], ffi[8],
-                        ffi[9], ffi[10], ffi[11],
-                        ffi[12], ffi[13],
-                        ffi[14], ffi[15],
-                        ffi[16], ffi[17], ffi[18], ffi[19], ffi[20], ffi[21],
-                        ffi[22], ffi[23],
-                        ffi[24], ffi[25], ffi[26], ffi[27], ffi[28],
-                        ffi[29], ffi[30], ffi[31], ffi[32],
+                    variant.launch_decode(
+                        &ffi,
                         args.attn_scale, args.rms_norm_eps,
-                        args.num_pages, bs, npt,
+                        args.num_pages, bs, npt, nl as i32,
                         stream,
                     )
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    let _ = (args, bs, npt, barrier_shape, inst_shape, timing_shape, stream, ffi);
+                    let _ = (args, variant, bs, npt, barrier_shape, inst_shape, timing_shape, stream, ffi, nl);
                     panic!("launch_decode requires --features cuda");
                 }
             }
@@ -444,6 +442,7 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
             #[allow(clippy::too_many_arguments)]
             pub unsafe fn launch_prefill(
                 args: &LaunchArgs,
+                variant: &crate::KernelVariant,
                 num_seqs: NumSeqs,
                 num_prefill_tokens: NumTokens,
                 seq_chunk_lens: &GpuMetaVec,
@@ -464,22 +463,15 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 );
 
                 let batch_rows = (npt as usize).next_multiple_of(128);
-                let ffi = Self::args_to_ffi(args, batch_rows, barrier_shape, inst_shape, timing_shape);
+                let nl = args.num_layers;
+                let ffi = Self::args_to_ffi(args, batch_rows, nl, barrier_shape, inst_shape, timing_shape);
 
                 #[cfg(feature = "cuda")]
                 {
-                    crate::ffi::llama_sm89_prefill_static_launch(
-                        ffi[0], ffi[1], ffi[2],
-                        ffi[3], ffi[4], ffi[5], ffi[6], ffi[7], ffi[8],
-                        ffi[9], ffi[10], ffi[11],
-                        ffi[12], ffi[13],
-                        ffi[14], ffi[15],
-                        ffi[16], ffi[17], ffi[18], ffi[19], ffi[20], ffi[21],
-                        ffi[22], ffi[23],
-                        ffi[24], ffi[25], ffi[26], ffi[27], ffi[28],
-                        ffi[29], ffi[30], ffi[31], ffi[32],
+                    variant.launch_prefill(
+                        &ffi,
                         args.attn_scale, args.rms_norm_eps,
-                        args.num_pages, ns, npt,
+                        args.num_pages, ns, npt, nl as i32,
                         stream,
                         seq_chunk_lens.as_ptr() as *const i32,
                         seq_extend_offsets.as_ptr() as *const i32,
@@ -487,7 +479,7 @@ pub fn megakernel(input: TokenStream) -> TokenStream {
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    let _ = (args, ns, npt, seq_chunk_lens, seq_extend_offsets, barrier_shape, inst_shape, timing_shape, stream, ffi);
+                    let _ = (args, variant, ns, npt, seq_chunk_lens, seq_extend_offsets, barrier_shape, inst_shape, timing_shape, stream, ffi, nl);
                     panic!("launch_prefill requires --features cuda");
                 }
             }

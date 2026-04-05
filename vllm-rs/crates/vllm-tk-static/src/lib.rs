@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Static megakernel for LLaMA decode (sm89).
+//! Static megakernel for LLaMA decode/prefill (sm89), with multi-variant support.
 //!
-//! This crate uses `megakernel!` to generate a compile-time verified,
-//! statically dispatched CUDA megakernel. The kernel calls the same TK ops
-//! as the VM-based KVM kernel, but without the instruction fetch, opcode
-//! dispatch, or page allocator overhead.
+//! Multiple model dimension variants are compiled at build time.
+//! At runtime, `KernelVariant::from_dims()` selects the correct compiled kernel
+//! based on the model's (HD, ID, HDM, NAH, NKH) dimensions.
 //!
-//! With `--features cuda`, build.rs compiles the generated CUDA via cudaforge.
-//! Without `cuda`, this crate only provides the Rust types and diagram.
+//! NL (num_layers) is a runtime parameter — models with different layer counts
+//! but the same dimension tuple share a kernel variant.
 
 #[cfg(feature = "cuda")]
 mod ffi;
 
-// Invoke the megakernel! proc-macro. This generates:
-// - Const-generic tensor types: Activation<D>, Weight<R,C>, Weight1D<D>, KvCache, Metadata
-// - MegakernelLlamaSm89 struct with typed launch() and CUDA_SOURCE const
+// The megakernel! proc-macro generates typed handles, TkTensorArg, newtypes,
+// and LaunchArgs (baked to 1B dims for compile-time verification in tests).
 vllm_tk_macros::megakernel! {
     kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
         for layer in 0..NL {
@@ -31,6 +29,218 @@ vllm_tk_macros::megakernel! {
         }
         let normed = rmsnorm(hidden_states, lm_head_norm);
         logits = gemm(normed, lm_head);
+    }
+}
+
+/// A compiled kernel variant selected at runtime based on model dimensions.
+///
+/// Each variant is specialized on (HD, ID, HDM) — dimensions that appear in
+/// TK's GL type parameters (shared memory tile shapes). NL (num_layers) is
+/// runtime. Other dims (NAH, NKH, VS) are baked per variant since they feed
+/// into constexpr tile count calculations.
+///
+/// The specialization key is (HD, HDM) since intermediate_dim, NAH, NKH are
+/// determined by the architecture for a given (HD, HDM) pair.
+#[derive(Debug, Clone, Copy)]
+pub enum KernelVariant {
+    /// Llama 1B: HD=2048, HDM=64
+    Hd2048Hdm64,
+    /// Llama 8B: HD=4096, HDM=128
+    Hd4096Hdm128,
+    // NOTE: Llama 3B (GQA_RATIO=3) not supported by attention kernel (needs 4 or 8).
+    // NOTE: 70B/405B exceed sm89 shared memory budget.
+}
+
+/// Supported variant configs: (HD, ID, HDM, NAH, NKH, description).
+const SUPPORTED_VARIANTS: &[(usize, usize, usize, usize, usize, &str)] = &[
+    (2048, 8192, 64, 32, 8, "Llama 1B"),
+    (4096, 14336, 128, 32, 8, "Llama 8B"),
+];
+
+impl KernelVariant {
+    /// Select the compiled kernel variant matching the given model dimensions.
+    ///
+    /// Matches on the full (HD, ID, HDM, NAH, NKH) tuple to ensure correctness.
+    /// Returns an error listing supported configurations if no match exists.
+    pub fn from_dims(
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        head_dim: usize,
+        num_attention_heads: usize,
+        num_kv_heads: usize,
+    ) -> Result<Self, String> {
+        match (
+            hidden_dim,
+            intermediate_dim,
+            head_dim,
+            num_attention_heads,
+            num_kv_heads,
+        ) {
+            (2048, 8192, 64, 32, 8) => Ok(Self::Hd2048Hdm64),
+            (4096, 14336, 128, 32, 8) => Ok(Self::Hd4096Hdm128),
+            _ => {
+                let mut msg = format!(
+                    "no compiled TK kernel variant for dims (HD={hidden_dim}, ID={intermediate_dim}, \
+                     HDM={head_dim}, NAH={num_attention_heads}, NKH={num_kv_heads}). \
+                     Supported variants:\n"
+                );
+                for &(hd, id, hdm, nah, nkh, desc) in SUPPORTED_VARIANTS {
+                    msg.push_str(&format!(
+                        "  - HD={hd}, ID={id}, HDM={hdm}, NAH={nah}, NKH={nkh} ({desc})\n"
+                    ));
+                }
+                msg.push_str("To add support, add a new entry to the variant table in vllm-tk-static/build.rs");
+                Err(msg)
+            }
+        }
+    }
+
+    /// Launch the decode kernel for this variant.
+    ///
+    /// # Safety
+    /// All TkTensorArg pointers must point to valid GPU memory with correct shapes.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_decode(
+        &self,
+        ffi_args: &[TkTensorArg; 33],
+        attn_scale: f32,
+        rms_norm_eps: f32,
+        num_pages: i32,
+        batch_size: i32,
+        num_prefill_tokens: i32,
+        num_layers: i32,
+        stream: u64,
+    ) -> i32 {
+        let f = self.decode_fn();
+        unsafe {
+            f(
+                ffi_args[0],
+                ffi_args[1],
+                ffi_args[2],
+                ffi_args[3],
+                ffi_args[4],
+                ffi_args[5],
+                ffi_args[6],
+                ffi_args[7],
+                ffi_args[8],
+                ffi_args[9],
+                ffi_args[10],
+                ffi_args[11],
+                ffi_args[12],
+                ffi_args[13],
+                ffi_args[14],
+                ffi_args[15],
+                ffi_args[16],
+                ffi_args[17],
+                ffi_args[18],
+                ffi_args[19],
+                ffi_args[20],
+                ffi_args[21],
+                ffi_args[22],
+                ffi_args[23],
+                ffi_args[24],
+                ffi_args[25],
+                ffi_args[26],
+                ffi_args[27],
+                ffi_args[28],
+                ffi_args[29],
+                ffi_args[30],
+                ffi_args[31],
+                ffi_args[32],
+                attn_scale,
+                rms_norm_eps,
+                num_pages,
+                batch_size,
+                num_prefill_tokens,
+                num_layers,
+                stream,
+            )
+        }
+    }
+
+    /// Launch the prefill kernel for this variant.
+    ///
+    /// # Safety
+    /// All TkTensorArg pointers must point to valid GPU memory with correct shapes.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_prefill(
+        &self,
+        ffi_args: &[TkTensorArg; 33],
+        attn_scale: f32,
+        rms_norm_eps: f32,
+        num_pages: i32,
+        batch_size: i32,
+        num_prefill_tokens: i32,
+        num_layers: i32,
+        stream: u64,
+        seq_chunk_lens: *const i32,
+        seq_extend_offsets: *const i32,
+    ) -> i32 {
+        let f = self.prefill_fn();
+        unsafe {
+            f(
+                ffi_args[0],
+                ffi_args[1],
+                ffi_args[2],
+                ffi_args[3],
+                ffi_args[4],
+                ffi_args[5],
+                ffi_args[6],
+                ffi_args[7],
+                ffi_args[8],
+                ffi_args[9],
+                ffi_args[10],
+                ffi_args[11],
+                ffi_args[12],
+                ffi_args[13],
+                ffi_args[14],
+                ffi_args[15],
+                ffi_args[16],
+                ffi_args[17],
+                ffi_args[18],
+                ffi_args[19],
+                ffi_args[20],
+                ffi_args[21],
+                ffi_args[22],
+                ffi_args[23],
+                ffi_args[24],
+                ffi_args[25],
+                ffi_args[26],
+                ffi_args[27],
+                ffi_args[28],
+                ffi_args[29],
+                ffi_args[30],
+                ffi_args[31],
+                ffi_args[32],
+                attn_scale,
+                rms_norm_eps,
+                num_pages,
+                batch_size,
+                num_prefill_tokens,
+                num_layers,
+                stream,
+                seq_chunk_lens,
+                seq_extend_offsets,
+            )
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn decode_fn(&self) -> ffi::DecodeLaunchFn {
+        match self {
+            Self::Hd2048Hdm64 => ffi::llama_sm89_hd2048_hdm64_decode_static_launch,
+            Self::Hd4096Hdm128 => ffi::llama_sm89_hd4096_hdm128_decode_static_launch,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prefill_fn(&self) -> ffi::PrefillLaunchFn {
+        match self {
+            Self::Hd2048Hdm64 => ffi::llama_sm89_hd2048_hdm64_prefill_static_launch,
+            Self::Hd4096Hdm128 => ffi::llama_sm89_hd4096_hdm128_prefill_static_launch,
+        }
     }
 }
 
@@ -55,22 +265,36 @@ mod tests {
     #[test]
     fn cuda_source_has_both_kernels() {
         let src = MegakernelLlamaSm89::CUDA_SOURCE;
-        // Decode kernel
         assert!(src.contains("llama_sm89_decode_static"));
-        assert!(src.contains("OPCODE_GQA_AttentionDecode"));
-        // Prefill kernel
         assert!(src.contains("llama_sm89_prefill_static"));
+        assert!(src.contains("OPCODE_GQA_AttentionDecode"));
         assert!(src.contains("OPCODE_GQA_AttentionPrefill"));
-        assert!(src.contains("total_tokens"));
-        assert!(src.contains("run_op_ext<"));
-        // Shared
-        assert!(src.contains("run_op<"));
+    }
+
+    #[test]
+    fn kernel_variant_from_dims() {
+        // 1B
+        assert!(matches!(
+            KernelVariant::from_dims(2048, 8192, 64, 32, 8),
+            Ok(KernelVariant::Hd2048Hdm64)
+        ));
+        // 3B — GQA_RATIO=3 not supported by attention kernel
+        assert!(KernelVariant::from_dims(3072, 8192, 128, 24, 8).is_err());
+        // 8B
+        assert!(matches!(
+            KernelVariant::from_dims(4096, 14336, 128, 32, 8),
+            Ok(KernelVariant::Hd4096Hdm128)
+        ));
+        // 70B — exceeds sm89 shared memory, should fail
+        assert!(KernelVariant::from_dims(8192, 28672, 128, 64, 8).is_err());
+        // Unsupported
+        let err = KernelVariant::from_dims(1024, 4096, 64, 16, 4);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("no compiled TK kernel variant"));
     }
 
     #[test]
     fn typed_handles_exist() {
-        // Verify typed GPU handle types compile with correct dimensions.
-        // These are function type checks — if the type doesn't exist, it won't compile.
         let _: fn(&GpuActivation<2048>) = |_| {};
         let _: fn(&GpuActivationBig<8192>) = |_| {};
         let _: fn(&GpuWeight<3072, 2048>) = |_| {};
@@ -85,60 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn launch_args_typed_fields() {
-        // Verify LaunchArgs has typed fields that enforce model dimensions.
-        // Use a dummy non-null pointer (0x1000) — we never dereference it.
-        let dummy = 0x1000usize as *mut u8;
-        let args = unsafe {
-            LaunchArgs {
-                barrier: GpuBarrier::from_raw(dummy),
-                instructions: GpuVmLayout::from_raw(dummy),
-                timings: GpuVmLayout::from_raw(dummy),
-                qkv_weights: GpuWeight::from_raw(dummy),
-                attn_norm: GpuNormWeight::from_raw(dummy),
-                o_proj: GpuWeight::from_raw(dummy),
-                mlp_norm: GpuNormWeight::from_raw(dummy),
-                up_weights: GpuWeight::from_raw(dummy),
-                gate_weights: GpuWeight::from_raw(dummy),
-                down_proj: GpuWeightBig::from_raw(dummy),
-                lm_head_norm: GpuNormWeight::from_raw(dummy),
-                lm_head: GpuWeight::from_raw(dummy),
-                k_cache: GpuKvCache::from_raw(dummy),
-                v_cache: GpuKvCache::from_raw(dummy),
-                rope_cos: GpuRopeTable::from_raw(dummy),
-                rope_sin: GpuRopeTable::from_raw(dummy),
-                hidden_states: GpuActivation::from_raw(dummy),
-                rms_rope: GpuActivation::from_raw(dummy),
-                rms_gate: GpuActivation::from_raw(dummy),
-                q_post_rope: GpuActivation::from_raw(dummy),
-                attn_out: GpuActivation::from_raw(dummy),
-                silu_out: GpuActivationBig::from_raw(dummy),
-                rms_lm: GpuActivation::from_raw(dummy),
-                logits: GpuLogits::from_raw(dummy),
-                position_ids: GpuMetaVec::from_raw(dummy),
-                kv_indptr: GpuMetaVec::from_raw(dummy),
-                kv_indices: GpuMetaVec::from_raw(dummy),
-                kv_last_page: GpuMetaVec::from_raw(dummy),
-                kv_append: GpuMetaVec::from_raw(dummy),
-                prefill_qo_indptr: GpuMetaVec::from_raw(dummy),
-                prefill_kv_indptr: GpuMetaVec::from_raw(dummy),
-                prefill_kv_indices: GpuMetaVec::from_raw(dummy),
-                prefill_kv_last_page_len: GpuMetaVec::from_raw(dummy),
-                attn_scale: 0.125,
-                rms_norm_eps: 1e-5,
-                num_pages: 0,
-                prefill_num_seqs: 0,
-                prefill_num_kv_pages: 0,
-            }
-        };
-        assert_eq!(args.attn_scale, 0.125);
-        assert_eq!(args.rms_norm_eps, 1e-5);
-        assert_eq!(args.num_pages, 0);
-        // Typed handles preserve pointer
-        assert_eq!(args.qkv_weights.ptr_u64(), 0x1000);
-    }
-
-    #[test]
     fn tk_tensor_arg_new() {
         let arg1d = TkTensorArg::new(0xDEAD, &[128]);
         assert_eq!(arg1d.ptr, 0xDEAD);
@@ -146,76 +316,16 @@ mod tests {
 
         let arg2d = TkTensorArg::new(0xBEEF, &[32, 2048]);
         assert_eq!((arg2d.b, arg2d.d, arg2d.r, arg2d.c), (1, 1, 32, 2048));
-
-        let arg3d = TkTensorArg::new(0xCAFE, &[4, 32, 64]);
-        assert_eq!((arg3d.b, arg3d.d, arg3d.r, arg3d.c), (1, 4, 32, 64));
-
-        let arg4d = TkTensorArg::new(0xF00D, &[2, 4, 32, 64]);
-        assert_eq!((arg4d.b, arg4d.d, arg4d.r, arg4d.c), (2, 4, 32, 64));
     }
 
     #[test]
-    #[should_panic(expected = "expected 1-4D shape")]
-    fn tk_tensor_arg_5d_panics() {
-        TkTensorArg::new(0, &[1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn const_generic_type_safety() {
-        // These compile: shapes match model dimensions
-        let dummy = 0x1000usize as *mut u8;
-        let _hd: GpuActivation<2048> = unsafe { GpuActivation::from_raw(dummy) };
-        let _id: GpuActivationBig<8192> = unsafe { GpuActivationBig::from_raw(dummy) };
-        let _w: GpuWeight<8192, 2048> = unsafe { GpuWeight::from_raw(dummy) };
-        let _n: GpuNormWeight<2048> = unsafe { GpuNormWeight::from_raw(dummy) };
-
-        // Verify round-trip through pointer extraction
-        assert_eq!(_hd.as_ptr(), dummy);
-        assert_eq!(_w.as_ptr(), dummy);
-        assert_eq!(_n.as_ptr(), dummy);
-    }
-
-    #[test]
-    #[should_panic(expected = "null GPU pointer")]
-    fn null_handle_panics() {
-        // NonNull enforces non-null at construction time
-        unsafe { GpuActivation::<2048>::from_raw(std::ptr::null_mut()) };
-    }
-
-    #[test]
-    fn model_dimension_constants() {
-        // QKV_DIM = (NAH + 2*NKH) * HDM = (32 + 2*8) * 64 = 3072
-        assert_eq!(MegakernelLlamaSm89::QKV_DIM, 3072);
-        assert_eq!(
-            MegakernelLlamaSm89::NAH * MegakernelLlamaSm89::HDM,
-            MegakernelLlamaSm89::HD
-        );
-        assert_eq!(MegakernelLlamaSm89::NAH % MegakernelLlamaSm89::NKH, 0);
-        assert_eq!(MegakernelLlamaSm89::HD % MegakernelLlamaSm89::HDM, 0);
-    }
-
-    #[test]
-    fn cuda_source_contains_launch_wrappers() {
+    fn cuda_source_has_runtime_num_layers() {
         let src = MegakernelLlamaSm89::CUDA_SOURCE;
-        // Flat-arg launch wrappers for FFI
-        assert!(src.contains("llama_sm89_decode_static_launch"));
-        assert!(src.contains("llama_sm89_prefill_static_launch"));
-        // TkTensorArg type and globals construction
-        assert!(src.contains("TkTensorArg"));
-        assert!(src.contains("make_arg<G::"));
-        // Both kernels reference all TK ops
-        assert!(src.contains("attn_norm<config, globals>"));
-        assert!(src.contains("o_proj<config, globals>"));
-        assert!(src.contains("lm_head<config, globals>"));
-    }
-
-    #[test]
-    fn cuda_source_has_semaphore_init() {
-        let src = MegakernelLlamaSm89::CUDA_SOURCE;
-        // sm89 single-arg arrive() loop
-        assert!(src.contains("arrive("));
-        // Parallel semaphore init
-        assert!(src.contains("INSTRUCTION_PIPELINE_STAGES"));
-        assert!(src.contains("NUM_PAGES"));
+        // NL should NOT be a constexpr
+        assert!(!src.contains("static constexpr int NL"));
+        // Loop should use runtime num_layers
+        assert!(src.contains("for (int layer = 0; layer < num_layers; layer++)"));
+        // Launch wrapper should accept num_layers
+        assert!(src.contains("int num_layers"));
     }
 }

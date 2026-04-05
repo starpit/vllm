@@ -2,10 +2,13 @@
 //! Build script for the static megakernel.
 //!
 //! With `--features cuda`:
-//! 1. Generates CUDA source from the megakernel DSL (via vllm-tk-macros-core)
-//! 2. Writes it to $OUT_DIR/llama_sm89_static.cu
-//! 3. Compiles via cudaforge with the same flags as vllm-tk
+//! 1. Generates CUDA source for each model variant from the megakernel DSL
+//! 2. Writes them to $OUT_DIR/{name}_static.cu
+//! 3. Compiles ALL variants via cudaforge into a single .a
 //! 4. Links the resulting .a
+//!
+//! NL (num_layers) is a runtime parameter — models with different layer counts
+//! but the same (HD, ID, HDM, NAH, NKH) share a variant.
 
 fn main() {
     #[cfg(feature = "cuda")]
@@ -16,9 +19,42 @@ fn main() {
 fn build_cuda() {
     use std::path::PathBuf;
 
-    // Generate the CUDA source using the same DSL the proc-macro parses
-    let dsl = r#"
-        kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+    // ── Variant table ──
+    // Each entry: (name, NL_dummy, HD, ID, HDM, NAH, NKH, VS)
+    // NL is a dummy value for compile-time verification only — the kernel accepts
+    // num_layers at runtime, so models with different layer counts share a variant.
+    //
+    // Specialization key: (HD, ID, HDM). These dimensions appear in GL type
+    // parameters (shared memory tile shapes) and must be compile-time constants.
+    // NAH, NKH, VS are also baked in per variant since they feed into constexpr
+    // tile count calculations (optimal_out_block) in the globals struct.
+    //
+    // To add a new variant: add an entry here, add FFI declarations in ffi.rs,
+    // and add a match arm in KernelVariant::from_dims() in lib.rs.
+    type Variant = (&'static str, usize, usize, usize, usize, usize, usize, usize);
+    let variants: &[Variant] = &[
+        // Llama 1B (hidden=2048, head_dim=64)
+        ("llama_sm89_hd2048_hdm64", 16, 2048, 8192, 64, 32, 8, 128256),
+        // NOTE: Llama 3B (HD=3072, NAH=24, NKH=8) has GQA_RATIO=3.
+        // The attention_prefill kernel requires GQA_RATIO ∈ {4, 8}.
+        // Llama 8B (hidden=4096, head_dim=128)
+        (
+            "llama_sm89_hd4096_hdm128",
+            32,
+            4096,
+            14336,
+            128,
+            32,
+            8,
+            128256,
+        ),
+        // NOTE: Llama 70B (HD=8192) and 405B (HD=16384) exceed sm89 shared memory
+        // budget (99328 bytes). These models require tensor parallelism to reduce
+        // per-GPU hidden_dim, or a tiled kernel strategy. Add variants here when
+        // the kernel supports larger dims.
+    ];
+
+    let dsl_body = r#"
             for layer in 0..NL {
                 let normed = rmsnorm(hidden_states, attn_norm[layer]);
                 let qkv = gemm(normed, qkv_weights[layer]);
@@ -33,16 +69,9 @@ fn build_cuda() {
             }
             let normed = rmsnorm(hidden_states, lm_head_norm);
             logits = gemm(normed, lm_head);
-        }
     "#;
 
-    let cuda_source = vllm_tk_macros_core::generate_cuda_from_dsl(dsl)
-        .expect("megakernel DSL generation failed in build.rs");
-
-    // Write generated CUDA to OUT_DIR
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let cu_path = out_dir.join("llama_sm89_static.cu");
-    std::fs::write(&cu_path, &cuda_source).expect("failed to write generated .cu");
 
     // Set up cudaforge cache directory
     let cache_dir = dirs::cache_dir()
@@ -55,8 +84,6 @@ fn build_cuda() {
     // Find TK include paths (relative to workspace root)
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
-
-    // TK headers are in the vllm-tk crate's csrc/
     let tk_csrc = workspace_root.join("crates/vllm-tk/csrc");
     let tk_include = tk_csrc.join("include");
     let tk_prototype = tk_csrc.join("prototype");
@@ -72,10 +99,26 @@ fn build_cuda() {
         .map(|p| p.display().to_string())
         .collect();
 
-    // Build with cudaforge
+    // Generate CUDA source for each variant
+    let mut cu_files = Vec::new();
+    for &(name, nl, hd, id, hdm, nah, nkh, vs) in variants {
+        let dsl = format!(
+            "kernel {name}<NL={nl}, HD={hd}, ID={id}, HDM={hdm}, NAH={nah}, NKH={nkh}, VS={vs}> {{\n{dsl_body}\n        }}"
+        );
+
+        let cuda_source = vllm_tk_macros_core::generate_cuda_from_dsl(&dsl)
+            .unwrap_or_else(|e| panic!("DSL generation failed for variant {name}: {e}"));
+
+        let cu_path = out_dir.join(format!("{name}_static.cu"));
+        std::fs::write(&cu_path, &cuda_source)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", cu_path.display()));
+        cu_files.push(cu_path.display().to_string());
+    }
+
+    // Build ALL variants into one static library
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)
-        .source_files(vec![cu_path.display().to_string()])
+        .source_files(cu_files)
         .watch(header_files)
         .include_path(tk_include.display().to_string())
         .include_path(tk_prototype.display().to_string())

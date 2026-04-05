@@ -20,6 +20,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
+#[cfg(feature = "rag")]
 use indicatif::{ProgressBar, ProgressStyle};
 #[cfg(feature = "rag")]
 use spnl_core::ir::{Augment, Document};
@@ -33,6 +34,52 @@ use crate::datasets::{best_token_f1, evaluate_accuracy, fetch_rag_dataset, permu
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RST: &str = "\x1b[0m";
+const BLOCK: char = '\u{2588}'; // █
+
+// ANSI 256-color palette for up to 12 distinct fragments.
+const FRAG_COLORS: &[&str] = &[
+    "\x1b[38;5;196m", // red
+    "\x1b[38;5;46m",  // green
+    "\x1b[38;5;33m",  // blue
+    "\x1b[38;5;226m", // yellow
+    "\x1b[38;5;201m", // magenta
+    "\x1b[38;5;51m",  // cyan
+    "\x1b[38;5;208m", // orange
+    "\x1b[38;5;129m", // purple
+    "\x1b[38;5;82m",  // lime
+    "\x1b[38;5;197m", // pink
+    "\x1b[38;5;39m",  // sky blue
+    "\x1b[38;5;214m", // gold
+];
+
+/// Render a permutation as color-coded block characters.
+fn render_perm(perm: &[usize]) -> String {
+    let mut s = String::new();
+    for &idx in perm {
+        s.push_str(FRAG_COLORS[idx % FRAG_COLORS.len()]);
+        s.push(BLOCK);
+        s.push(BLOCK);
+    }
+    s.push_str(RST);
+    s
+}
+
+/// Render the fragment legend.
+fn render_legend(n_frags: usize) -> String {
+    let mut s = String::new();
+    for i in 0..n_frags {
+        if i > 0 {
+            s.push_str("  ");
+        }
+        s.push_str(&format!(
+            "Frag {i}={}{}{}",
+            FRAG_COLORS[i % FRAG_COLORS.len()],
+            BLOCK,
+            RST
+        ));
+    }
+    s
+}
 
 // ---------------------------------------------------------------------------
 // LLM construction
@@ -224,15 +271,24 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
     let mut all_plain: Vec<Vec<PermResult>> = Vec::with_capacity(n_queries);
     let mut all_spans: Vec<Vec<PermResult>> = Vec::with_capacity(n_queries);
 
-    let query_style = ProgressStyle::default_bar()
-        .template("  {msg} {bar:40} {pos:>4}/{len}")
-        .unwrap();
-    let pb = ProgressBar::new(n_queries as u64).with_style(query_style);
-
     for (qi, sample) in samples.iter().enumerate() {
         let frags = &retrieved_fragments[qi];
         let n_frags = frags.len();
         let perms = permutations(n_frags, args.max_perms);
+
+        // Truncate long questions for display.
+        let q_display: String = if sample.question.len() > 60 {
+            format!("{}...", &sample.question[..57])
+        } else {
+            sample.question.clone()
+        };
+
+        eprintln!();
+        eprintln!(
+            "  {BOLD}Query {}/{n_queries}{RST}: {DIM}\"{q_display}\"{RST}",
+            qi + 1
+        );
+        eprintln!("  {}", render_legend(n_frags));
 
         let mut plain_results = Vec::with_capacity(perms.len());
         let mut spans_results = Vec::with_capacity(perms.len());
@@ -253,28 +309,46 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
             let ttft_ms = result.ttft_s.map(|s| s * 1000.0).unwrap_or(0.0);
             let response = &result.outputs[0].text;
 
-            plain_results.push(PermResult {
+            let pr = PermResult {
                 acc: evaluate_accuracy(response, &sample.answers),
                 f1: best_token_f1(&sample.answers, response),
                 ttft_ms,
                 total_ms,
-            });
+            };
+
+            eprintln!(
+                "    plain  {}  {BOLD}{:>7.1}ms{RST}  acc={:.0}  F1={:.3}",
+                render_perm(perm),
+                pr.ttft_ms,
+                pr.acc,
+                pr.f1,
+            );
+
+            plain_results.push(pr);
         }
 
-        // --- Spans: execute_query with cross + plus, relocatable ---
+        // --- Spans: execute_spnl with cross + plus, relocatable ---
         llm.reset_prefix_cache()?;
 
         // First, populate the cache with canonical order.
         {
+            let canonical: Vec<usize> = (0..n_frags).collect();
             let span_query = build_span_query(
                 &model_name,
                 args.max_tokens as i32,
                 system_prompt,
                 frags,
-                &(0..n_frags).collect::<Vec<_>>(),
+                &canonical,
                 &sample.question,
             );
+            let start = Instant::now();
             llm.execute_spnl(span_query, Some(sampling.clone()), false, false)?;
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "    {DIM}cache  {}  {:>7.1}ms  populate{RST}",
+                render_perm(&canonical),
+                ms,
+            );
         }
 
         // Now measure each permutation (should benefit from span cache reuse).
@@ -294,37 +368,27 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
             let ttft_ms = results[0].ttft_s.map(|s| s * 1000.0).unwrap_or(0.0);
             let response = &results[0].outputs[0].text;
 
-            spans_results.push(PermResult {
+            let pr = PermResult {
                 acc: evaluate_accuracy(response, &sample.answers),
                 f1: best_token_f1(&sample.answers, response),
                 ttft_ms,
                 total_ms,
-            });
+            };
+
+            eprintln!(
+                "    spans  {}  {BOLD}{:>7.1}ms{RST}  acc={:.0}  F1={:.3}",
+                render_perm(perm),
+                pr.ttft_ms,
+                pr.acc,
+                pr.f1,
+            );
+
+            spans_results.push(pr);
         }
 
         all_plain.push(plain_results);
         all_spans.push(spans_results);
-
-        let pa = all_plain
-            .iter()
-            .flat_map(|v| v.iter())
-            .map(|r| r.acc)
-            .sum::<f64>()
-            / all_plain.iter().map(|v| v.len()).sum::<usize>().max(1) as f64;
-        let sa = all_spans
-            .iter()
-            .flat_map(|v| v.iter())
-            .map(|r| r.acc)
-            .sum::<f64>()
-            / all_spans.iter().map(|v| v.len()).sum::<usize>().max(1) as f64;
-        pb.set_message(format!(
-            "plain={:.0}%  spans={:.0}%",
-            pa * 100.0,
-            sa * 100.0,
-        ));
-        pb.inc(1);
     }
-    pb.finish();
 
     // -- Summary --
     let flat_plain: Vec<&PermResult> = all_plain.iter().flat_map(|v| v.iter()).collect();

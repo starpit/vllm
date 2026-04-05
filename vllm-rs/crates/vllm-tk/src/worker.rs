@@ -1837,13 +1837,14 @@ mod cuda_tests {
         // BS=128: n_batch_blocks=1, max_barrier_cols=128
         worker.ensure_and_zero_barrier(1, 128);
         let bar = worker.barrier.as_ref().unwrap();
-        // size = 16 * 10 * 1 * 128 = 20480
-        assert_eq!(bar.numel(), 20480);
+        // size = NL * NUM_OPS * n_batch_blocks * max_barrier_cols
+        //      = 16 * 11 * 1 * 128 = 22528
+        assert_eq!(bar.numel(), 16 * 11 * 1 * 128);
 
         // BS=256: n_batch_blocks=2, max_barrier_cols=128 → bigger
         worker.ensure_and_zero_barrier(2, 128);
         let bar = worker.barrier.as_ref().unwrap();
-        // size = 16 * 10 * 2 * 128 = 40960
-        assert_eq!(bar.numel(), 40960);
+        // size = 16 * 11 * 2 * 128 = 45056
+        assert_eq!(bar.numel(), 16 * 11 * 2 * 128);
     }
 }

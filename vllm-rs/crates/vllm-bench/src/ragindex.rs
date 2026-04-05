@@ -182,10 +182,11 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
         eprintln!("{BOLD}Phase 1: Index + Retrieve{RST}");
 
         let pb_style = ProgressStyle::default_bar()
-            .template("  index {bar:40.green/green} {pos:>4}/{len} {msg}")
+            .template("  Indexing {bar:40.green/green} {pos:>4}/{len} {msg}")
             .unwrap();
         let pb = ProgressBar::new(n_queries as u64).with_style(pb_style);
-        let mut index_total_ms = 0.0f64;
+        let mut index_latencies_ms = Vec::with_capacity(n_queries);
+        let mut total_docs = 0usize;
 
         for (qi, sample) in samples.iter().enumerate() {
             let debug = args.debug && qi == 0;
@@ -221,7 +222,8 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
             let start = Instant::now();
             let result = llm.execute_spnl(augment_query, Some(sampling.clone()), false, false)?;
             let ms = start.elapsed().as_secs_f64() * 1000.0;
-            index_total_ms += ms;
+            index_latencies_ms.push(ms);
+            total_docs += sample.documents.len();
 
             let response = &result.output().outputs[0].text;
             if debug {
@@ -238,14 +240,38 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
                 .collect();
             retrieved_fragments.push(frags);
 
-            pb.set_message(format!("{ms:.0}ms"));
+            let mut sorted = index_latencies_ms.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p50 = percentile(&sorted, 50.0);
+            let p99 = percentile(&sorted, 99.0);
+            pb.set_message(format!(
+                "{}  p50={}  p99={}",
+                fmt_ms(ms),
+                fmt_ms(p50),
+                fmt_ms(p99)
+            ));
             pb.inc(1);
         }
-        pb.finish();
+        pb.finish_and_clear();
 
+        let index_total_ms: f64 = index_latencies_ms.iter().sum();
+        let mut sorted = index_latencies_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = percentile(&sorted, 50.0);
+        let p99 = percentile(&sorted, 99.0);
+
+        let avg_per_doc = index_total_ms / total_docs.max(1) as f64;
+        let p50_per_doc = p50 * n_queries as f64 / total_docs.max(1) as f64;
+        let p99_per_doc = p99 * n_queries as f64 / total_docs.max(1) as f64;
         eprintln!(
-            "  Total index+generate time: {BOLD}{index_total_ms:.0}ms{RST} ({:.0}ms/query)",
-            index_total_ms / n_queries as f64,
+            "  Indexed {total_docs} documents via {n_queries} batch operations in {BOLD}{}{RST}",
+            fmt_ms(index_total_ms),
+        );
+        eprintln!(
+            "  Per-document: avg={}  p50={}  p99={}",
+            fmt_ms(avg_per_doc),
+            fmt_ms(p50_per_doc),
+            fmt_ms(p99_per_doc),
         );
     }
 
@@ -276,9 +302,14 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
         let n_frags = frags.len();
         let perms = permutations(n_frags, args.max_perms);
 
-        // Truncate long questions for display.
-        let q_display: String = if sample.question.len() > 60 {
-            format!("{}...", &sample.question[..57])
+        // Truncate long questions for display (char-boundary safe).
+        let q_display: String = if sample.question.chars().count() > 60 {
+            let end = sample
+                .question
+                .char_indices()
+                .nth(57)
+                .map_or(sample.question.len(), |(i, _)| i);
+            format!("{}...", &sample.question[..end])
         } else {
             sample.question.clone()
         };
@@ -317,9 +348,9 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
             };
 
             eprintln!(
-                "    plain  {}  {BOLD}{:>7.1}ms{RST}  acc={:.0}  F1={:.3}",
+                "    plain  {}  {BOLD}{:>8}{RST}  acc={:.0}  F1={:.3}",
                 render_perm(perm),
-                pr.ttft_ms,
+                fmt_ms(pr.ttft_ms),
                 pr.acc,
                 pr.f1,
             );
@@ -345,9 +376,9 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
             llm.execute_spnl(span_query, Some(sampling.clone()), false, false)?;
             let ms = start.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
-                "    {DIM}cache  {}  {:>7.1}ms  populate{RST}",
+                "    {DIM}cache  {}  {:>8}  populate{RST}",
                 render_perm(&canonical),
-                ms,
+                fmt_ms(ms),
             );
         }
 
@@ -376,9 +407,9 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
             };
 
             eprintln!(
-                "    spans  {}  {BOLD}{:>7.1}ms{RST}  acc={:.0}  F1={:.3}",
+                "    spans  {}  {BOLD}{:>8}{RST}  acc={:.0}  F1={:.3}",
                 render_perm(perm),
-                pr.ttft_ms,
+                fmt_ms(pr.ttft_ms),
                 pr.acc,
                 pr.f1,
             );
@@ -413,20 +444,20 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
     println!("  Dataset: {dataset_name}, {n_queries} queries, {n_total} total permutations");
     println!();
     println!(
-        "  {BOLD}Plain{RST}:  acc={:.1}%  F1={:.3}  ttft={:.0}ms \u{00b1}{:.0}ms  total={:.0}ms",
+        "  {BOLD}Plain{RST}:  acc={:.1}%  F1={:.3}  ttft={} \u{00b1}{}  total={}",
         plain_acc * 100.0,
         plain_f1,
-        plain_ttft,
-        plain_ttft_stddev,
-        plain_total,
+        fmt_ms(plain_ttft),
+        fmt_ms(plain_ttft_stddev),
+        fmt_ms(plain_total),
     );
     println!(
-        "  {BOLD}Spans{RST}:  acc={:.1}%  F1={:.3}  ttft={:.0}ms \u{00b1}{:.0}ms  total={:.0}ms",
+        "  {BOLD}Spans{RST}:  acc={:.1}%  F1={:.3}  ttft={} \u{00b1}{}  total={}",
         spans_acc * 100.0,
         spans_f1,
-        spans_ttft,
-        spans_ttft_stddev,
-        spans_total,
+        fmt_ms(spans_ttft),
+        fmt_ms(spans_ttft_stddev),
+        fmt_ms(spans_total),
     );
     println!();
     println!(
@@ -434,8 +465,9 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
         plain_ttft / spans_ttft.max(0.001),
     );
     println!(
-        "  Latency stability: plain \u{00b1}{:.0}ms vs spans \u{00b1}{:.0}ms",
-        plain_ttft_stddev, spans_ttft_stddev,
+        "  Latency stability: plain \u{00b1}{} vs spans \u{00b1}{}",
+        fmt_ms(plain_ttft_stddev),
+        fmt_ms(spans_ttft_stddev),
     );
     println!();
 
@@ -443,6 +475,32 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
     let _ = std::fs::remove_dir_all("data/spnl");
 
     Ok(())
+}
+
+/// Format milliseconds as a human-readable duration (e.g. "7.4s", "238ms").
+fn fmt_ms(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{:.1}s", ms / 1000.0)
+    } else {
+        format!("{:.0}ms", ms)
+    }
+}
+
+/// Compute the p-th percentile from a pre-sorted slice.
+#[cfg(feature = "rag")]
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (p / 100.0) * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let frac = rank - lo as f64;
+        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    }
 }
 
 /// Build a span query using SPNL structs (cross + plus pattern).

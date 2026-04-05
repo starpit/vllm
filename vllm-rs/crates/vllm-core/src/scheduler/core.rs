@@ -565,7 +565,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     }
 
     fn get_computed_blocks(&self, request: &Request) -> (u32, Vec<Vec<usize>>) {
-        if !self.enable_caching {
+        if !self.enable_caching || request.is_pooling {
             return (0, vec![Vec::new()]);
         }
 

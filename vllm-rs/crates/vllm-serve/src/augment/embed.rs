@@ -81,7 +81,10 @@ impl HttpEmbeddingProvider {
             dimensions,
             base_url,
             api_key,
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new()),
         }
     }
 
@@ -102,7 +105,23 @@ impl HttpEmbeddingProvider {
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
-        let resp: serde_json::Value = req.send()?.error_for_status()?.json()?;
+        let resp: serde_json::Value = req
+            .send()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "embedding request failed (url={url}, inputs={}): {e}",
+                    inputs.len()
+                )
+            })?
+            .error_for_status()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "embedding server error (url={url}, inputs={}): {e}",
+                    inputs.len()
+                )
+            })?
+            .json()
+            .map_err(|e| anyhow::anyhow!("embedding response parse failed: {e}"))?;
         let data = resp["data"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("missing 'data' in embedding response"))?;
@@ -195,7 +214,19 @@ impl leann_core::embedding::EmbeddingProvider for InProcessEmbeddingProvider {
 
 impl leann_core::embedding::EmbeddingProvider for HttpEmbeddingProvider {
     fn compute_embeddings(&self, chunks: &[String]) -> Result<Array2<f32>> {
-        let vecs = self.call_api(chunks)?;
+        // Batch to avoid overwhelming the sidecar with huge payloads.
+        const BATCH_SIZE: usize = 32;
+        let n_batches = (chunks.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+        let mut vecs = Vec::with_capacity(chunks.len());
+        for (i, batch) in chunks.chunks(BATCH_SIZE).enumerate() {
+            tracing::debug!(
+                "Embedding batch {}/{} ({} chunks)",
+                i + 1,
+                n_batches,
+                batch.len()
+            );
+            vecs.extend(self.call_api(batch)?);
+        }
         let nrows = vecs.len();
         let ncols = self.dimensions;
         let mut data = Vec::with_capacity(nrows * ncols);

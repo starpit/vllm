@@ -443,7 +443,7 @@ fn initialize_core(
     if let Some(pb) = progress {
         pb.set_stage("Initializing KV cache");
     }
-    let (mut worker, available_memory, num_gpu_blocks, effective_utilization) = init_cache(
+    let (mut worker, available_memory, mut num_gpu_blocks, effective_utilization) = init_cache(
         worker,
         config.block_size,
         &hf_config,
@@ -452,6 +452,15 @@ fn initialize_core(
         &config.device,
         &config.kv_cache_dtype,
     )?;
+
+    // Encoder/pooling models typically have 0 KV cache layers — blocks consume
+    // no memory. Use a large virtual block count so the scheduler never runs
+    // out of tracking slots. Matches Python which returns num_blocks=1 for
+    // attention-free models (but we need more since our scheduler still
+    // allocates block slots per request).
+    if config.runner == "pooling" {
+        num_gpu_blocks = num_gpu_blocks.max(65536);
+    }
 
     info!(
         "Available memory: {:.1} GB, memory_utilization={}, num_gpu_blocks={}",

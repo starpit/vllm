@@ -10,7 +10,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A child vllm-rs process serving an embedding model.
 pub struct EmbeddingSidecar {
-    child: std::process::Child,
+    child: Mutex<std::process::Child>,
     pub port: u16,
     pub base_url: String,
 }
@@ -52,13 +52,18 @@ impl EmbeddingSidecar {
         // which would panic if dropped inside a spawn_blocking context.
         let start = Instant::now();
 
+        let child_mtx = Mutex::new(child);
         loop {
-            if let Some(status) = child.try_wait().context("failed to check sidecar status")? {
-                bail!("Embedding sidecar exited before becoming healthy ({status})");
+            {
+                let mut c = child_mtx.lock().unwrap();
+                if let Some(status) = c.try_wait().context("failed to check sidecar status")? {
+                    bail!("Embedding sidecar exited before becoming healthy ({status})");
+                }
             }
             if start.elapsed() > STARTUP_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
+                let mut c = child_mtx.lock().unwrap();
+                let _ = c.kill();
+                let _ = c.wait();
                 bail!(
                     "Embedding sidecar for {model} did not become healthy within {}s",
                     STARTUP_TIMEOUT.as_secs()
@@ -73,7 +78,7 @@ impl EmbeddingSidecar {
         info!(model, port, "Embedding sidecar healthy");
 
         Ok(Self {
-            child,
+            child: child_mtx,
             port,
             base_url,
         })
@@ -82,8 +87,9 @@ impl EmbeddingSidecar {
 
 impl Drop for EmbeddingSidecar {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut child = self.child.lock().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -100,10 +106,24 @@ impl SidecarManager {
     }
 
     /// Return an existing sidecar for `model`, or spawn a new one.
+    /// If an existing sidecar has exited, it is respawned.
     pub fn get_or_spawn(&self, model: &str) -> Result<Arc<EmbeddingSidecar>> {
         let mut map = self.sidecars.lock().unwrap();
         if let Some(existing) = map.get(model) {
-            return Ok(Arc::clone(existing));
+            // Check if the sidecar is still alive.
+            let mut child_guard = existing.child.lock().unwrap();
+            match child_guard.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::warn!(
+                        model,
+                        ?status,
+                        "Embedding sidecar exited unexpectedly, respawning"
+                    );
+                    drop(child_guard);
+                    // Fall through to respawn.
+                }
+                _ => return Ok(Arc::clone(existing)),
+            }
         }
         let sidecar = Arc::new(EmbeddingSidecar::spawn(model)?);
         map.insert(model.to_string(), Arc::clone(&sidecar));

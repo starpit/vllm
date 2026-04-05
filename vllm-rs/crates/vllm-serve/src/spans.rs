@@ -1051,6 +1051,48 @@ fn timed_generate(
     Ok(crate::llm::QueryOutput { steps })
 }
 
+/// Execute a pre-parsed `SpnlQuery` synchronously (no JSON round-trip).
+///
+/// This is the primary entry point for callers that already have a typed query.
+/// Handles RAG augmentation (when enabled) and dispatches to the appropriate
+/// generate path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_spnl_struct_sync(
+    query: SpnlQuery,
+    params: Option<vllm_common::SamplingParams>,
+    seal: bool,
+    volatile: bool,
+    #[cfg(feature = "rag")] aug_options: &crate::augment::AugmentOptions,
+    tokenizer: &Arc<Tokenizer>,
+    template: &crate::chat_template::ChatTemplate,
+    cfg: &SpanConfig,
+    block_size: usize,
+    generate: &mut impl FnMut(
+        &[crate::llm::Prompt],
+        Option<vllm_common::SamplingParams>,
+        bool,
+        bool,
+    ) -> anyhow::Result<Vec<crate::llm::RequestOutput>>,
+) -> anyhow::Result<crate::llm::QueryOutput> {
+    #[cfg(feature = "rag")]
+    let query = {
+        let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            let rt = Box::leak(Box::new(
+                tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
+            ));
+            rt.handle().clone()
+        });
+        rt.block_on(crate::augment::index(&query, aug_options))
+            .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
+        rt.block_on(optimize_augments(&query, aug_options))?
+    };
+    dispatch_spnl_query_sync(
+        &query, params, seal, volatile, tokenizer, template, cfg, block_size, generate,
+    )
+}
+
+/// Execute a SPNL query from a JSON string. Parses as `SpnlQuery` first,
+/// falls back to `SingleGenerateQuery` for backward compatibility.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_spnl_query_sync(
     spnl_json: &str,
@@ -1073,29 +1115,13 @@ pub(crate) fn execute_spnl_query_sync(
 
     // Try full SpnlQuery first (supports nested generates).
     if let Ok(query) = serde_json::from_str::<SpnlQuery>(spnl_json) {
-        #[cfg(feature = "rag")]
-        let query = {
-            // Use existing tokio runtime if available, otherwise create a temporary one.
-            // The runtime must be multi-threaded because augment uses spawn_blocking.
-            let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-                // Leak a runtime so it is never dropped inside a blocking context.
-                // This only happens when LLM::execute_query is called outside a
-                // tokio context (e.g. tests, CLI). The leak is bounded: at most
-                // one runtime per process.
-                let rt = Box::leak(Box::new(
-                    tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
-                ));
-                rt.handle().clone()
-            });
-            rt.block_on(crate::augment::index(&query, aug_options))
-                .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
-            rt.block_on(optimize_augments(&query, aug_options))?
-        };
-        return dispatch_spnl_query_sync(
-            &query,
+        return execute_spnl_struct_sync(
+            query,
             params,
             seal,
             volatile,
+            #[cfg(feature = "rag")]
+            aug_options,
             tokenizer,
             template,
             cfg,

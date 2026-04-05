@@ -5,6 +5,8 @@
 
 use clap::{Parser, Subcommand};
 
+use crate::datasets::RagDataset;
+
 /// Container for `bench` subcommands.
 #[derive(Parser, Debug)]
 pub struct BenchCommand {
@@ -42,6 +44,8 @@ pub enum BenchCommands {
     Msmarco(BenchMsmarcoArgs),
     /// LongBench v2 long-context accuracy benchmark.
     Longbench(BenchLongbenchArgs),
+    /// RAG index benchmark: LEANN retrieval + span query permutation testing.
+    Ragindex(BenchRagindexArgs),
 }
 
 /// Arguments for `vllm bench latency`.
@@ -1525,5 +1529,116 @@ impl BenchLongbenchArgs {
                 Err("model is required: provide as positional arg or --model flag".into())
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RAG index benchmark args
+// ---------------------------------------------------------------------------
+
+/// Arguments for `vllm bench ragindex`.
+///
+/// Benchmarks the LEANN indexing + retrieval pipeline with span query
+/// permutation testing. For each query, documents are indexed via the
+/// Augment SPNL node, retrieved fragments are permuted, and both plain
+/// (chat) and span (execute_query) modes are compared for latency and
+/// accuracy.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench ragindex --dataset <DATASET> [MODEL] [OPTIONS]")]
+pub struct BenchRagindexArgs {
+    /// Model: local path or HuggingFace model ID (positional).
+    pub model_tag: Option<String>,
+
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Embedding model for RAG indexing (launched as a sidecar in pooling mode).
+    /// Defaults to answerdotai/ModernBERT-base.
+    #[arg(long, default_value = "answerdotai/ModernBERT-base")]
+    pub embedding_model: String,
+
+    /// RAG dataset to use.
+    #[arg(long, value_enum)]
+    pub dataset: RagDataset,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Number of queries to evaluate.
+    #[arg(short = 'n', long, default_value_t = 20)]
+    pub num_queries: usize,
+
+    /// Max permutations of fragment order per query.
+    #[arg(long, default_value_t = 6)]
+    pub max_perms: usize,
+
+    /// Max tokens for model response.
+    #[arg(long, default_value_t = 64)]
+    pub max_tokens: usize,
+
+    /// Top-k retrieved fragments per query.
+    #[arg(long, default_value_t = 5)]
+    pub max_aug: usize,
+
+    /// Fraction of GPU memory to use for KV cache (0.0-1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// Number of GPUs for tensor parallelism.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+
+    /// Enable debug output for first sample.
+    #[arg(long)]
+    pub debug: bool,
+}
+
+impl BenchRagindexArgs {
+    pub fn resolved_model(&self) -> Result<String, String> {
+        match (&self.model_tag, &self.model) {
+            (Some(tag), _) => Ok(tag.clone()),
+            (None, Some(m)) => Ok(m.clone()),
+            (None, None) => {
+                Err("model is required: provide as positional arg or --model flag".into())
+            }
+        }
+    }
+
+    pub fn resolved_embedding_model(&self) -> String {
+        self.embedding_model.clone()
     }
 }

@@ -348,6 +348,8 @@ pub struct LLM {
     model_name: String,
     max_model_len: usize,
     block_size: usize,
+    #[cfg(feature = "rag")]
+    sidecar_manager: std::sync::Arc<crate::augment::SidecarManager>,
 }
 
 impl LLM {
@@ -377,6 +379,8 @@ impl LLM {
             model_name: stack.model_name,
             max_model_len: stack.max_model_len,
             block_size: stack.block_size,
+            #[cfg(feature = "rag")]
+            sidecar_manager: std::sync::Arc::new(crate::augment::SidecarManager::new()),
         })
     }
 
@@ -503,15 +507,42 @@ impl LLM {
             .map_err(|e| anyhow::anyhow!("embed failed: {e}"))
     }
 
-    /// Execute a SPNL span query (JSON string), using the same tokenization
-    /// and annotation logic as the server's `/v1/query/execute` endpoint.
+    /// Execute a pre-parsed SPNL query directly (no JSON serialization needed).
     ///
-    /// `seal` and `volatile` control KV cache lifecycle:
-    /// - `seal=true`: seal generated blocks so they persist for reuse
-    /// - `volatile=true`: mark the request as volatile (output evictable)
+    /// This is the preferred entry point when you already have a typed `SpnlQuery`.
+    /// `seal` and `volatile` control KV cache lifecycle.
+    pub fn execute_spnl(
+        &mut self,
+        query: spnl_core::ir::Query,
+        params: Option<SamplingParams>,
+        seal: bool,
+        volatile: bool,
+    ) -> Result<QueryOutput> {
+        let (tokenizer, template_ptr, cfg, block_size) = self.query_setup()?;
+        #[cfg(feature = "rag")]
+        let aug_options = self.aug_options();
+        // SAFETY: template_ptr points into self.chat_template, not mutated during this call.
+        let template = unsafe { &*template_ptr };
+
+        crate::spans::execute_spnl_struct_sync(
+            query,
+            params,
+            seal,
+            volatile,
+            #[cfg(feature = "rag")]
+            &aug_options,
+            &tokenizer,
+            template,
+            &cfg,
+            block_size,
+            &mut |prompts, sp, s, v| self.generate_impl(prompts, sp, false, s, v),
+        )
+    }
+
+    /// Execute a SPNL span query from a JSON string.
     ///
-    /// If `params` is provided, its `max_tokens` and `temperature` override
-    /// the values in the SPNL query metadata.
+    /// Prefer [`execute_spnl`](Self::execute_spnl) when you already have a
+    /// typed `SpnlQuery` to avoid a redundant serialize/deserialize round-trip.
     pub fn execute_query(
         &mut self,
         spnl_json: &str,
@@ -519,39 +550,11 @@ impl LLM {
         seal: bool,
         volatile: bool,
     ) -> Result<QueryOutput> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("execute_query requires a tokenizer"))?
-            .clone();
-        // Safety: template ref is valid for the duration of this call; we need
-        // a raw pointer to avoid the borrow conflict with the `self` closure below.
-        let template_ptr: *const crate::chat_template::ChatTemplate =
-            self.chat_template
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("execute_query requires a chat template"))?;
-
-        let cfg = crate::spans::SpanConfig::from_tokenizer(self.block_size, &tokenizer);
-        let block_size = self.block_size;
-
-        // SAFETY: template_ptr points into self.chat_template which is not mutated
-        // during this call.
-        let template = unsafe { &*template_ptr };
-
+        let (tokenizer, template_ptr, cfg, block_size) = self.query_setup()?;
         #[cfg(feature = "rag")]
-        let aug_options = {
-            let embedder: Option<std::sync::Arc<dyn crate::augment::embed::TokenEmbedder>> = self
-                .client
-                .embed_sender()
-                .map(|s| std::sync::Arc::new(s) as _);
-            crate::augment::AugmentOptions {
-                current_model: Some(self.model_name.clone()),
-                embedder,
-                tokenizer: self.tokenizer.clone(),
-                sidecar_manager: Some(std::sync::Arc::new(crate::augment::SidecarManager::new())),
-                ..Default::default()
-            }
-        };
+        let aug_options = self.aug_options();
+        // SAFETY: template_ptr points into self.chat_template, not mutated during this call.
+        let template = unsafe { &*template_ptr };
 
         crate::spans::execute_spnl_query_sync(
             spnl_json,
@@ -566,6 +569,48 @@ impl LLM {
             block_size,
             |prompts, sp, s, v| self.generate_impl(prompts, sp, false, s, v),
         )
+    }
+
+    /// Shared setup for execute_query / execute_spnl.
+    ///
+    /// Returns owned/cloned values plus a raw pointer to the chat template to
+    /// avoid borrowing `self` (the caller needs `&mut self` for the generate
+    /// closure). SAFETY: the returned pointer is valid for the duration of
+    /// the calling method — `self.chat_template` is not mutated.
+    fn query_setup(
+        &self,
+    ) -> Result<(
+        std::sync::Arc<crate::tokenizer::Tokenizer>,
+        *const crate::chat_template::ChatTemplate,
+        crate::spans::SpanConfig,
+        usize,
+    )> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("execute_query requires a tokenizer"))?
+            .clone();
+        let template_ptr: *const crate::chat_template::ChatTemplate =
+            self.chat_template
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("execute_query requires a chat template"))?;
+        let cfg = crate::spans::SpanConfig::from_tokenizer(self.block_size, &tokenizer);
+        Ok((tokenizer, template_ptr, cfg, self.block_size))
+    }
+
+    #[cfg(feature = "rag")]
+    fn aug_options(&self) -> crate::augment::AugmentOptions {
+        let embedder: Option<std::sync::Arc<dyn crate::augment::embed::TokenEmbedder>> = self
+            .client
+            .embed_sender()
+            .map(|s| std::sync::Arc::new(s) as _);
+        crate::augment::AugmentOptions {
+            current_model: Some(self.model_name.clone()),
+            embedder,
+            tokenizer: self.tokenizer.clone(),
+            sidecar_manager: Some(std::sync::Arc::clone(&self.sidecar_manager)),
+            ..Default::default()
+        }
     }
 
     /// Reset the prefix cache, evicting all cached KV blocks.

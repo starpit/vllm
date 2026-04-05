@@ -1,17 +1,477 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! Dataset loading for `vllm bench` — supports ShareGPT and random prompt generation.
-//!
-//! Matches Python vLLM's `ShareGPTDataset.sample()` and `RandomDataset.sample()` methodology.
+//! Dataset loading for `vllm bench` — supports ShareGPT, random prompt generation,
+//! and RAG datasets (HotpotQA, 2WikiMultihopQA, MuSiQue, MS MARCO).
 
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokenizers::Tokenizer;
 use tokenizers::tokenizer::PostProcessor;
+
+// ---------------------------------------------------------------------------
+// RAG dataset abstraction
+// ---------------------------------------------------------------------------
+
+/// A single RAG sample: question + acceptable answers + document fragments.
+#[derive(Debug, Clone)]
+pub struct RagSample {
+    /// The question to answer.
+    pub question: String,
+    /// All acceptable answers (for accuracy scoring).
+    pub answers: Vec<String>,
+    /// Document fragments as (label, text) pairs.
+    pub documents: Vec<(String, String)>,
+}
+
+/// Available RAG datasets for `vllm bench ragindex`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RagDataset {
+    /// HotpotQA distractor validation set (10 Wikipedia paragraphs per query).
+    Hotpotqa,
+    /// 2WikiMultihopQA dev set (multi-hop reasoning over Wikipedia).
+    Multihop,
+    /// MuSiQue validation set (2-4 hop multi-hop QA, 20 paragraphs per query).
+    Musique,
+    /// MS MARCO v2.1 validation set (~10 Bing search passages per query).
+    Msmarco,
+}
+
+impl std::fmt::Display for RagDataset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hotpotqa => write!(f, "hotpotqa"),
+            Self::Multihop => write!(f, "multihop"),
+            Self::Musique => write!(f, "musique"),
+            Self::Msmarco => write!(f, "msmarco"),
+        }
+    }
+}
+
+/// Fetch a RAG dataset and convert to the common `RagSample` format.
+pub fn fetch_rag_dataset(which: RagDataset, num_queries: usize) -> Result<Vec<RagSample>> {
+    match which {
+        RagDataset::Hotpotqa => fetch_hotpotqa(num_queries),
+        RagDataset::Multihop => fetch_multihop(num_queries),
+        RagDataset::Musique => fetch_musique(num_queries),
+        RagDataset::Msmarco => fetch_msmarco(num_queries),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn download_parquet_as_json(
+    cache_dir_name: &str,
+    cache_filename: &str,
+    parquet_filename: &str,
+    url: &str,
+    label: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let cache_dir = dirs::cache_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine cache directory"))?
+        .join("vllm-bench")
+        .join(cache_dir_name);
+    std::fs::create_dir_all(&cache_dir)?;
+    let cache_file = cache_dir.join(cache_filename);
+
+    if cache_file.exists() {
+        let data = std::fs::read_to_string(&cache_file)?;
+        return Ok(serde_json::from_str(&data)?);
+    }
+
+    eprintln!("Downloading {label}...");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    let parquet_path = cache_dir.join(parquet_filename);
+    let response = client.get(url).header("User-Agent", "vllm-bench").send()?;
+    let bytes = response.bytes()?;
+    std::fs::write(&parquet_path, &bytes)?;
+
+    let records = parquet_to_json_records(&parquet_path)?;
+    eprintln!("Caching {} records as JSON...", records.len());
+    let json_str = serde_json::to_string(&records)?;
+    std::fs::write(&cache_file, json_str.as_bytes())?;
+    Ok(records)
+}
+
+/// Read a parquet file and return rows as JSON values.
+fn parquet_to_json_records(parquet_path: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+    use arrow::json::writer::{JsonArray, Writer};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    eprintln!("Reading parquet...");
+    let file = std::fs::File::open(parquet_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let batches: Vec<_> = reader.collect::<std::result::Result<Vec<_>, _>>()?;
+    let batch_refs: Vec<&_> = batches.iter().collect();
+
+    let mut buf = Vec::new();
+    let mut writer = Writer::<_, JsonArray>::new(&mut buf);
+    writer.write_batches(&batch_refs)?;
+    writer.finish()?;
+    drop(writer);
+
+    let records: Vec<serde_json::Value> = serde_json::from_slice(&buf)?;
+    eprintln!("Read {} records.", records.len());
+    Ok(records)
+}
+
+// ---------------------------------------------------------------------------
+// HotpotQA
+// ---------------------------------------------------------------------------
+
+fn fetch_hotpotqa(num_queries: usize) -> Result<Vec<RagSample>> {
+    let raw = download_parquet_as_json(
+        "hotpotqa",
+        "validation.json",
+        "validation.parquet",
+        "https://huggingface.co/datasets/hotpotqa/hotpot_qa/resolve/main/distractor/validation-00000-of-00001.parquet",
+        "HotpotQA distractor validation set",
+    )?;
+
+    let mut samples = Vec::new();
+    for record in raw.iter().take(num_queries) {
+        let question = record["question"].as_str().unwrap_or("").to_string();
+        let answer = record["answer"].as_str().unwrap_or("").to_string();
+
+        let context = &record["context"];
+        let titles = context["title"].as_array().cloned().unwrap_or_default();
+        let sentences = context["sentences"].as_array().cloned().unwrap_or_default();
+
+        if question.is_empty() || answer.is_empty() || titles.is_empty() {
+            continue;
+        }
+
+        let documents: Vec<(String, String)> = titles
+            .iter()
+            .zip(sentences.iter())
+            .map(|(title_val, sents_val)| {
+                let title = title_val.as_str().unwrap_or("").to_string();
+                let text = sents_val
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                (title, text)
+            })
+            .collect();
+
+        samples.push(RagSample {
+            question,
+            answers: vec![answer],
+            documents,
+        });
+    }
+    Ok(samples)
+}
+
+// ---------------------------------------------------------------------------
+// 2WikiMultihopQA
+// ---------------------------------------------------------------------------
+
+fn fetch_multihop(num_queries: usize) -> Result<Vec<RagSample>> {
+    let raw = download_parquet_as_json(
+        "multihop",
+        "dev.json",
+        "dev.parquet",
+        "https://huggingface.co/datasets/xanhho/2WikiMultihopQA/resolve/main/dev.parquet",
+        "2WikiMultihopQA dev set",
+    )?;
+
+    let mut samples = Vec::new();
+    for record in raw.iter().take(num_queries) {
+        let question = record["question"].as_str().unwrap_or("").to_string();
+        let answer = record["answer"].as_str().unwrap_or("").to_string();
+
+        let context_str = record["context"].as_str().unwrap_or("[]");
+        let context: Vec<(String, Vec<String>)> =
+            serde_json::from_str(context_str).unwrap_or_default();
+
+        if question.is_empty() || answer.is_empty() || context.is_empty() {
+            continue;
+        }
+
+        let documents: Vec<(String, String)> = context
+            .into_iter()
+            .map(|(title, sents)| (title, sents.join(" ")))
+            .collect();
+
+        samples.push(RagSample {
+            question,
+            answers: vec![answer],
+            documents,
+        });
+    }
+    Ok(samples)
+}
+
+// ---------------------------------------------------------------------------
+// MuSiQue
+// ---------------------------------------------------------------------------
+
+fn fetch_musique(num_queries: usize) -> Result<Vec<RagSample>> {
+    let cache_dir = dirs::cache_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine cache directory"))?
+        .join("vllm-bench")
+        .join("musique");
+    std::fs::create_dir_all(&cache_dir)?;
+    let cache_file = cache_dir.join("validation.jsonl");
+
+    if !cache_file.exists() {
+        eprintln!("Downloading MuSiQue validation set...");
+        let url = "https://huggingface.co/datasets/dgslibisey/MuSiQue/resolve/main/musique_ans_v1.0_dev.jsonl";
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()?;
+        let response = client.get(url).header("User-Agent", "vllm-bench").send()?;
+        let bytes = response.bytes()?;
+        std::fs::write(&cache_file, &bytes)?;
+    }
+
+    let file = std::fs::File::open(&cache_file)?;
+    let reader = std::io::BufReader::new(file);
+    let mut samples = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: serde_json::Value = serde_json::from_str(&line)?;
+
+        let question = record["question"].as_str().unwrap_or("").to_string();
+        let answer = record["answer"].as_str().unwrap_or("").to_string();
+
+        let answer_aliases: Vec<String> = record["answer_aliases"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let paragraphs_raw = record["paragraphs"].as_array().cloned().unwrap_or_default();
+        if question.is_empty() || answer.is_empty() || paragraphs_raw.is_empty() {
+            continue;
+        }
+
+        let documents: Vec<(String, String)> = paragraphs_raw
+            .into_iter()
+            .map(|p| {
+                let title = p["title"].as_str().unwrap_or("").to_string();
+                let text = p["paragraph_text"].as_str().unwrap_or("").to_string();
+                (title, text)
+            })
+            .collect();
+
+        let mut answers = vec![answer];
+        answers.extend(answer_aliases);
+
+        samples.push(RagSample {
+            question,
+            answers,
+            documents,
+        });
+
+        if samples.len() >= num_queries {
+            break;
+        }
+    }
+    Ok(samples)
+}
+
+// ---------------------------------------------------------------------------
+// MS MARCO
+// ---------------------------------------------------------------------------
+
+fn fetch_msmarco(num_queries: usize) -> Result<Vec<RagSample>> {
+    let raw = download_parquet_as_json(
+        "msmarco",
+        "validation.json",
+        "validation.parquet",
+        "https://huggingface.co/datasets/microsoft/ms_marco/resolve/main/v2.1/validation-00000-of-00001.parquet",
+        "MS MARCO v2.1 validation set",
+    )?;
+
+    let mut samples = Vec::new();
+    for record in &raw {
+        let question = record["query"].as_str().unwrap_or("").to_string();
+
+        let mut answers: Vec<String> = Vec::new();
+        if let Some(arr) = record["answers"].as_array() {
+            for a in arr {
+                if let Some(s) = a
+                    .as_str()
+                    .filter(|s| !s.is_empty() && *s != "No Answer Present.")
+                {
+                    answers.push(s.to_string());
+                }
+            }
+        }
+        if let Some(arr) = record["wellFormedAnswers"].as_array() {
+            for a in arr {
+                if let Some(s) = a.as_str().filter(|s| !s.is_empty() && *s != "[]") {
+                    answers.push(s.to_string());
+                }
+            }
+        }
+
+        if question.is_empty() || answers.is_empty() {
+            continue;
+        }
+
+        let passages_obj = &record["passages"];
+        let texts = passages_obj["passage_text"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let urls = passages_obj["url"].as_array().cloned().unwrap_or_default();
+
+        if texts.is_empty() {
+            continue;
+        }
+
+        let documents: Vec<(String, String)> = urls
+            .iter()
+            .zip(texts.iter())
+            .map(|(url_val, text_val)| {
+                let url = url_val.as_str().unwrap_or("").to_string();
+                let text = text_val.as_str().unwrap_or("").to_string();
+                (url, text)
+            })
+            .collect();
+
+        samples.push(RagSample {
+            question,
+            answers,
+            documents,
+        });
+
+        if samples.len() >= num_queries {
+            break;
+        }
+    }
+    Ok(samples)
+}
+
+// ---------------------------------------------------------------------------
+// Permutation generation (reusable)
+// ---------------------------------------------------------------------------
+
+/// Generate permutations of `0..n`, up to `max_perms`.
+/// Uses Heap's algorithm for small n, random sampling for large.
+pub fn permutations(n: usize, max_perms: usize) -> Vec<Vec<usize>> {
+    if n <= 1 {
+        return vec![(0..n).collect()];
+    }
+    let total: usize = (1..=n).product();
+    if total <= max_perms {
+        let mut result = Vec::with_capacity(total);
+        let mut a: Vec<usize> = (0..n).collect();
+        let mut c = vec![0usize; n];
+        result.push(a.clone());
+        let mut i = 0;
+        while i < n {
+            if c[i] < i {
+                if i % 2 == 0 {
+                    a.swap(0, i);
+                } else {
+                    a.swap(c[i], i);
+                }
+                result.push(a.clone());
+                c[i] += 1;
+                i = 0;
+            } else {
+                c[i] = 0;
+                i += 1;
+            }
+        }
+        result
+    } else {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        let mut result = Vec::with_capacity(max_perms);
+        result.push((0..n).collect());
+        result.push((0..n).rev().collect());
+        while result.len() < max_perms {
+            let mut perm: Vec<usize> = (0..n).collect();
+            perm.shuffle(&mut rng);
+            if !result.contains(&perm) {
+                result.push(perm);
+            }
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accuracy evaluation (reusable)
+// ---------------------------------------------------------------------------
+
+/// Evaluate response against any acceptable answer.
+/// Returns 1.0 if any answer is a substring match or token F1 >= 0.5.
+pub fn evaluate_accuracy(response: &str, answers: &[String]) -> f64 {
+    let resp_lower = response.to_lowercase();
+    for ans in answers {
+        let ans_lower = ans.to_lowercase();
+        if resp_lower.contains(&ans_lower) {
+            return 1.0;
+        }
+        let f1 = compute_token_f1(&ans_lower, &resp_lower);
+        if f1 >= 0.5 {
+            return 1.0;
+        }
+    }
+    0.0
+}
+
+/// Compute best token F1 across all acceptable answers.
+pub fn best_token_f1(answers: &[String], actual: &str) -> f64 {
+    answers
+        .iter()
+        .map(|ans| compute_token_f1(&ans.to_lowercase(), &actual.to_lowercase()))
+        .fold(0.0_f64, f64::max)
+}
+
+fn normalize_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn compute_token_f1(expected: &str, actual: &str) -> f64 {
+    let et = normalize_tokens(expected);
+    let at = normalize_tokens(actual);
+    if et.is_empty() && at.is_empty() {
+        return 1.0;
+    }
+    if et.is_empty() || at.is_empty() {
+        return 0.0;
+    }
+    let common: usize = et.iter().filter(|t| at.contains(t)).count();
+    if common == 0 {
+        return 0.0;
+    }
+    let p = common as f64 / at.len() as f64;
+    let r = common as f64 / et.len() as f64;
+    2.0 * p * r / (p + r)
+}
 
 /// A single benchmark request with pre-computed token lengths.
 #[derive(Debug, Clone)]

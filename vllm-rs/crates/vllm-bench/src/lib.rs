@@ -16,6 +16,7 @@ mod multihop;
 mod musique;
 mod niah;
 mod ragcsv;
+mod ragindex;
 mod ruler;
 mod serve;
 mod spans;
@@ -26,8 +27,8 @@ mod throughput;
 pub use args::{
     BenchCommand, BenchCommands, BenchHotpotqaArgs, BenchLatencyArgs, BenchLongbenchArgs,
     BenchMsmarcoArgs, BenchMultihopArgs, BenchMusiqueArgs, BenchNiahArgs, BenchRagcsvArgs,
-    BenchRulerArgs, BenchServeArgs, BenchSpansArgs, BenchStartupArgs, BenchThroughputArgs,
-    SweepCommand, SweepCommands, SweepServeArgs, SweepStartupArgs,
+    BenchRagindexArgs, BenchRulerArgs, BenchServeArgs, BenchSpansArgs, BenchStartupArgs,
+    BenchThroughputArgs, SweepCommand, SweepCommands, SweepServeArgs, SweepStartupArgs,
 };
 
 /// Format a rate as `it/s` (fast) or `s/it` (slow), matching Python tqdm style.
@@ -98,6 +99,10 @@ pub async fn run_bench(cmd: BenchCommand) -> anyhow::Result<()> {
         }
         BenchCommands::Longbench(args) => {
             tokio::task::spawn_blocking(move || longbench::run_bench_longbench(args)).await??;
+            Ok(())
+        }
+        BenchCommands::Ragindex(args) => {
+            tokio::task::spawn_blocking(move || ragindex::run_bench_ragindex(args)).await??;
             Ok(())
         }
     }

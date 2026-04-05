@@ -7410,6 +7410,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shell-words",
+ "spnl-core",
  "tokenizers 0.22.2",
  "tokio",
  "url",

@@ -36,7 +36,9 @@ impl EmbeddingSidecar {
             .arg("--runner")
             .arg("pooling")
             .arg("--enforce-eager")
-            .stdout(std::process::Stdio::piped())
+            .arg("--log-level")
+            .arg(current_log_level())
+            .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit());
 
         info!(model, port, "Spawning embedding sidecar");
@@ -106,6 +108,18 @@ impl SidecarManager {
         let sidecar = Arc::new(EmbeddingSidecar::spawn(model)?);
         map.insert(model.to_string(), Arc::clone(&sidecar));
         Ok(sidecar)
+    }
+}
+
+/// Map the current tracing max level to a CLI `--log-level` string.
+fn current_log_level() -> &'static str {
+    match tracing::level_filters::LevelFilter::current().into_level() {
+        Some(l) if l <= tracing::Level::ERROR => "error",
+        Some(l) if l <= tracing::Level::WARN => "warn",
+        Some(l) if l <= tracing::Level::INFO => "info",
+        Some(l) if l <= tracing::Level::DEBUG => "debug",
+        Some(_) => "trace",
+        None => "warn", // OFF → default to warn
     }
 }
 

@@ -9,6 +9,7 @@ description = "Benchmarking tools for vLLM Rust inference engine"
 default = []
 cuda = ["vllm-serve/cuda"]
 metal = ["vllm-serve/metal"]
+rag = ["vllm-serve/rag", "spnl-core/rag"]
 
 [dependencies]
 vllm-common = { workspace = true }
@@ -31,5 +32,6 @@ shell-words = "1"
 url = "2"
 csv = "1"
 dirs = "5"
+spnl-core = { workspace = true }
 parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
 arrow = { version = "58", default-features = false, features = ["json"] }

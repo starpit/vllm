@@ -175,7 +175,11 @@ impl InProcessEmbeddingProvider {
 }
 
 impl leann_core::embedding::EmbeddingProvider for InProcessEmbeddingProvider {
-    fn compute_embeddings(&self, chunks: &[String]) -> Result<Array2<f32>> {
+    fn compute_embeddings(
+        &self,
+        chunks: &[String],
+        _progress: Option<&dyn leann_core::hnsw::IndexProgress>,
+    ) -> Result<Array2<f32>> {
         // Tokenize each chunk
         let token_id_seqs: Vec<Vec<u32>> = chunks
             .iter()
@@ -213,7 +217,11 @@ impl leann_core::embedding::EmbeddingProvider for InProcessEmbeddingProvider {
 }
 
 impl leann_core::embedding::EmbeddingProvider for HttpEmbeddingProvider {
-    fn compute_embeddings(&self, chunks: &[String]) -> Result<Array2<f32>> {
+    fn compute_embeddings(
+        &self,
+        chunks: &[String],
+        progress: Option<&dyn leann_core::hnsw::IndexProgress>,
+    ) -> Result<Array2<f32>> {
         // Batch to avoid overwhelming the sidecar with huge payloads.
         const BATCH_SIZE: usize = 32;
         let n_batches = (chunks.len() + BATCH_SIZE - 1) / BATCH_SIZE;
@@ -226,6 +234,9 @@ impl leann_core::embedding::EmbeddingProvider for HttpEmbeddingProvider {
                 batch.len()
             );
             vecs.extend(self.call_api(batch)?);
+            if let Some(p) = progress {
+                p.progress((i + 1) * BATCH_SIZE.min(chunks.len()));
+            }
         }
         let nrows = vecs.len();
         let ncols = self.dimensions;

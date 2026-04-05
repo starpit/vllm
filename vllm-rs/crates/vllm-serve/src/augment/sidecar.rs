@@ -43,7 +43,7 @@ impl EmbeddingSidecar {
 
         info!(model, port, "Spawning embedding sidecar");
 
-        let mut child = cmd.spawn().with_context(|| {
+        let child = cmd.spawn().with_context(|| {
             format!("failed to spawn embedding sidecar at {}", binary.display())
         })?;
 

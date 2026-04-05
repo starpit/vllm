@@ -2,11 +2,53 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
+use indicatif::{ProgressBar, ProgressStyle};
+use leann_core::hnsw::IndexProgress;
 use spnl_core::ir::{Augment, Document, Generate, GenerateMetadata, Query};
 use tracing::info;
 
 use super::embed::{HttpEmbeddingProvider, InProcessEmbeddingProvider};
 use super::options::AugmentOptions;
+
+/// Adapts an indicatif `ProgressBar` to the `BuildProgress` trait.
+///
+/// The bar starts as a spinner (during embedding computation) and switches
+/// to a determinate progress bar once the HNSW build begins.
+struct IndicatifProgress {
+    pb: ProgressBar,
+    filename: String,
+}
+
+impl IndexProgress for IndicatifProgress {
+    fn phase(&self, name: &str, total: usize) {
+        if total > 0 {
+            self.pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("  {spinner:.green} {msg} [{bar:30.cyan/blue}] {pos}/{len}")
+                    .unwrap()
+                    .progress_chars("█▉▊▋▌▍▎▏ "),
+            );
+            self.pb.set_length(total as u64);
+            self.pb.set_position(0);
+        } else {
+            self.pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("  {spinner:.green} {msg}")
+                    .unwrap(),
+            );
+        }
+        let label = match name {
+            "embedding" => "Embedding",
+            "building" => "Building index for",
+            _ => name,
+        };
+        self.pb.set_message(format!("{label} {}", self.filename));
+    }
+
+    fn progress(&self, completed: usize) {
+        self.pb.set_position(completed as u64);
+    }
+}
 
 /// Sanitize a name for use as a filesystem path component.
 fn sanitize_name(name: &str) -> String {
@@ -80,15 +122,20 @@ async fn process_document(
         "Indexing document for RAG augmentation"
     );
 
-    // Show a spinner so the user knows indexing is in progress.
-    let pb = indicatif::ProgressBar::new_spinner();
+    // Start as a spinner during embedding computation; switches to a
+    // progress bar once the HNSW build begins (via BuildProgress::started).
+    let pb = ProgressBar::new_spinner();
     pb.set_style(
-        indicatif::ProgressStyle::default_spinner()
+        ProgressStyle::default_spinner()
             .template("  {spinner:.green} Indexing {msg}")
             .unwrap(),
     );
     pb.set_message(format!("{filename} ({n_chunks} chunks)"));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    let progress = std::sync::Arc::new(IndicatifProgress {
+        pb: pb.clone(),
+        filename: filename.clone(),
+    });
 
     let file_base_name = std::path::Path::new(filename)
         .file_name()
@@ -123,7 +170,8 @@ async fn process_document(
 
     let mut builder = leann_core::LeannBuilder::new(&a.embedding_model, Some(dimensions), "spnl")
         .with_recompute(false)
-        .with_compact(false);
+        .with_compact(false)
+        .with_progress(progress);
 
     for (idx, chunk) in chunks.iter().enumerate() {
         let mut metadata = HashMap::new();

@@ -3454,9 +3454,9 @@ dependencies = [
 
 [[package]]
 name = "leann-core"
-version = "0.1.8"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae224c984a4a8d76dbff0c617949f9dceabc1f72afcd49aaec1d05b7dfe48540"
+checksum = "c0b5f6f55ca2b235d5f580d02a5d496f686f399eb544c603c47da6ab626b0776"
 dependencies = [
  "anyhow",
  "libc",

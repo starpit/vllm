@@ -10,8 +10,10 @@
 
 use cudarc::driver::result;
 use half::bf16;
-use vllm_tk_test_harness::TkTensorArg;
-use vllm_tk_test_harness::ffi;
+use vllm_tk_test_harness::{
+    TkTensorArg, WeightArg, NormWeightArg, ActivationArg, LogitsArg,
+    KvCacheArg, RopeArg, IntVecArg, BarrierArg, ffi,
+};
 
 /// Model dims for 1B LLaMA (matches the DSL in build.rs)
 const HD: usize = 2048;
@@ -149,45 +151,45 @@ macro_rules! call_launch {
         unsafe {
             $fn(
                 // VM state
-                TkTensorArg::barrier($b.bar, NL, NUM_OPS, N_BATCH_BLOCKS, MAX_BARRIER_COLS),
-                TkTensorArg::new($b.instr, &[SM_COUNT, MAX_PER_SM, INSTRUCTION_WIDTH]),
-                TkTensorArg::new($b.timings, &[SM_COUNT, MAX_PER_SM, TIMING_WIDTH]),
-                // Weights (typed: GL shape encoded in constructor)
-                TkTensorArg::weight($b.qkv_w, NL, QKV_DIM, HD),
-                TkTensorArg::norm_weight($b.attn_norm_w, NL, HD),
-                TkTensorArg::weight($b.o_w, NL, HD, HD),
-                TkTensorArg::norm_weight($b.mlp_norm_w, NL, HD),
-                TkTensorArg::weight($b.up_w, NL, ID, HD),
-                TkTensorArg::weight($b.gate_w, NL, ID, HD),
-                TkTensorArg::weight($b.down_w, NL, HD, ID),  // weights_big_t but same shape
-                TkTensorArg::norm_weight($b.lm_norm_w, 1, HD),
-                TkTensorArg::weight($b.lm_w, 1, VS, HD),
+                BarrierArg::new($b.bar, NL, NUM_OPS, N_BATCH_BLOCKS, MAX_BARRIER_COLS),
+                TkTensorArg::raw($b.instr, &[SM_COUNT, MAX_PER_SM, INSTRUCTION_WIDTH]),
+                TkTensorArg::raw($b.timings, &[SM_COUNT, MAX_PER_SM, TIMING_WIDTH]),
+                // Weights (compiler enforces correct GL type per slot)
+                WeightArg::new($b.qkv_w, NL, QKV_DIM, HD),
+                NormWeightArg::new($b.attn_norm_w, NL, HD),
+                WeightArg::new($b.o_w, NL, HD, HD),
+                NormWeightArg::new($b.mlp_norm_w, NL, HD),
+                WeightArg::new($b.up_w, NL, ID, HD),
+                WeightArg::new($b.gate_w, NL, ID, HD),
+                WeightArg::new($b.down_w, NL, HD, ID),
+                NormWeightArg::new($b.lm_norm_w, 1, HD),
+                WeightArg::new($b.lm_w, 1, VS, HD),
                 // KV cache
-                TkTensorArg::kv_cache($b.k_cache, $kv_pages, KV_PAGE_SIZE, NKH, HDM),
-                TkTensorArg::kv_cache($b.v_cache, $kv_pages, KV_PAGE_SIZE, NKH, HDM),
+                KvCacheArg::new($b.k_cache, $kv_pages, KV_PAGE_SIZE, NKH, HDM),
+                KvCacheArg::new($b.v_cache, $kv_pages, KV_PAGE_SIZE, NKH, HDM),
                 // RoPE tables
-                TkTensorArg::rope($b.rope_cos, 4096, HDM),
-                TkTensorArg::rope($b.rope_sin, 4096, HDM),
+                RopeArg::new($b.rope_cos, 4096, HDM),
+                RopeArg::new($b.rope_sin, 4096, HDM),
                 // Activations
-                TkTensorArg::activation($b.hidden, ACT_ROWS, HD),
-                TkTensorArg::activation($b.rms_rope, ACT_ROWS, HD),
-                TkTensorArg::activation($b.rms_gate, ACT_ROWS, HD),
-                TkTensorArg::activation($b.q_post, ACT_ROWS, HD),
-                TkTensorArg::activation($b.attn_out, ACT_ROWS, HD),
-                TkTensorArg::activation($b.silu_buf, ACT_ROWS, ID),
-                TkTensorArg::activation($b.rms_lm, ACT_ROWS, HD),
-                TkTensorArg::logits($b.logits, ACT_ROWS, VS),
+                ActivationArg::new($b.hidden, ACT_ROWS, HD),
+                ActivationArg::new($b.rms_rope, ACT_ROWS, HD),
+                ActivationArg::new($b.rms_gate, ACT_ROWS, HD),
+                ActivationArg::new($b.q_post, ACT_ROWS, HD),
+                ActivationArg::new($b.attn_out, ACT_ROWS, HD),
+                ActivationArg::new($b.silu_buf, ACT_ROWS, ID),
+                ActivationArg::new($b.rms_lm, ACT_ROWS, HD),
+                LogitsArg::new($b.logits, ACT_ROWS, VS),
                 // Decode KV metadata
-                TkTensorArg::int_vec($b.pos_ids, ACT_ROWS),
-                TkTensorArg::int_vec($b.kv_indptr, ACT_ROWS + 1),
-                TkTensorArg::int_vec($b.kv_indices, NUM_PAGES),
-                TkTensorArg::int_vec($b.kv_last_page, ACT_ROWS),
-                TkTensorArg::int_vec($b.kv_append, ACT_ROWS),
+                IntVecArg::new($b.pos_ids, ACT_ROWS),
+                IntVecArg::new($b.kv_indptr, ACT_ROWS + 1),
+                IntVecArg::new($b.kv_indices, NUM_PAGES),
+                IntVecArg::new($b.kv_last_page, ACT_ROWS),
+                IntVecArg::new($b.kv_append, ACT_ROWS),
                 // Prefill KV metadata (dummy)
-                TkTensorArg::int_vec($b.dummy_meta, 1),
-                TkTensorArg::int_vec($b.dummy_meta, 1),
-                TkTensorArg::int_vec($b.dummy_meta, 1),
-                TkTensorArg::int_vec($b.dummy_meta, 1),
+                IntVecArg::new($b.dummy_meta, 1),
+                IntVecArg::new($b.dummy_meta, 1),
+                IntVecArg::new($b.dummy_meta, 1),
+                IntVecArg::new($b.dummy_meta, 1),
                 // Scalars
                 1.0 / (HDM as f32).sqrt(), // attn_scale
                 1e-5_f32,                  // rms_norm_eps

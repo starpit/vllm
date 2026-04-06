@@ -5250,7 +5250,7 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
 
     // 8 phases per layer:
     // 0=attn_norm, 1=qkv_gemm, 2=attention, 3=o_proj, 4=mlp_norm, 5=gate, 6=up, 7=down
-    let num_phases = 8;
+    let num_phases = 10; // 0=rmsnorm, 1=qkv_splitk, 2=qkv_done, 3=attn, 4=oproj_splitk, 5=oproj_done, 6=mlpnorm, 7=gate, 8=up, 9=down_splitk
 
     // ── Preamble ──
     writeln!(
@@ -5589,6 +5589,236 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
         writeln!(out, "    }}").unwrap();
     }
 
+    /// Emit a split-K GEMM phase: all CTAs compute partials, barrier, then
+    /// `num_tiles` CTAs reduce + apply `reduce_epilogue`.
+    ///
+    /// `split_k_const` / `k_per_split_const`: CUDA constexpr names (e.g. "MSM_HD_SPLIT_K").
+    /// `tiles_const`: CUDA constexpr for output tile count (e.g. "MSM_HD_TILES").
+    /// `barrier_idx`: which msm_bar phase index to use for the split-K barrier.
+    /// `reduce_epilogue`: code executed per-tile after reducing all splits.
+    ///   Available variables: `col` (tile index), `sum_acc` (reduced f32 accumulator).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_msm_splitk_gemm(
+        out: &mut String,
+        input_global: &str,
+        weight_global: &str,
+        split_k_const: &str,
+        k_per_split_const: &str,
+        tiles_const: &str,
+        barrier_idx: usize,
+        reduce_epilogue: &str,
+        scratch_slice: ScratchSliceElems,
+        scratch_row: ScratchRowElems,
+        a_size: usize,
+        stage_size: usize,
+    ) {
+        // Phase A: all CTAs compute partial sums
+        writeln!(out, "    {{").unwrap();
+        writeln!(out, "    const int splitk_col = bid / {split_k_const};").unwrap();
+        writeln!(out, "    const int k_split = bid % {split_k_const};").unwrap();
+        writeln!(
+            out,
+            "    const int k_start = k_split * {k_per_split_const};"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    const int k_end   = k_start + {k_per_split_const};"
+        )
+        .unwrap();
+        writeln!(out, "    {{").unwrap();
+        writeln!(
+            out,
+            "    msm_a_st &a_s0 = *reinterpret_cast<msm_a_st*>(__shm);"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    msm_b_st &b_s0 = *reinterpret_cast<msm_b_st*>(__shm + {a_size});"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    msm_a_st &a_s1 = *reinterpret_cast<msm_a_st*>(__shm + {stage_size});"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    msm_b_st &b_s1 = *reinterpret_cast<msm_b_st*>(__shm + {stage_size} + {a_size});"
+        )
+        .unwrap();
+        writeln!(out, "    msm_a_st *a_stages[2] = {{&a_s0, &a_s1}};").unwrap();
+        writeln!(out, "    msm_b_st *b_stages[2] = {{&b_s0, &b_s1}};").unwrap();
+        writeln!(out, "    msm_acc_rt acc;").unwrap();
+        writeln!(out, "    warp::zero(acc);").unwrap();
+        writeln!(out, "    for (int iter = k_start; iter < k_end; iter++) {{").unwrap();
+        writeln!(out, "        int stage = (iter - k_start) % 2;").unwrap();
+        writeln!(out, "        msm_a_st &a_smem = *a_stages[stage];").unwrap();
+        writeln!(out, "        msm_b_st &b_smem = *b_stages[stage];").unwrap();
+        writeln!(
+            out,
+            "        group<MSM_NUM_WARPS>::load_async(a_smem, {input_global}, {{row, iter}});"
+        )
+        .unwrap();
+        writeln!(out, "        group<MSM_NUM_WARPS>::load_async(b_smem, {weight_global}, {{layer, splitk_col, iter}});").unwrap();
+        writeln!(
+            out,
+            "        asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");"
+        )
+        .unwrap();
+        writeln!(out, "        group<MSM_NUM_WARPS>::sync(14);").unwrap();
+        writeln!(out, "        rt_bf<16, MSM_K_DIM> a_reg;").unwrap();
+        writeln!(out, "        {{ const msm_a_slice_st &a_warp = reinterpret_cast<const msm_a_slice_st*>(&a_smem)[wid];").unwrap();
+        writeln!(out, "           warp::load(a_reg, a_warp); }}").unwrap();
+        writeln!(
+            out,
+            "        msm_b_slice_st *b_slices = reinterpret_cast<msm_b_slice_st*>(&b_smem);"
+        )
+        .unwrap();
+        writeln!(out, "        #pragma unroll").unwrap();
+        writeln!(out, "        for (int n = 0; n < MSM_N_TILES; n++) {{").unwrap();
+        writeln!(
+            out,
+            "            rt_bf<16, MSM_K_DIM> b_n; msm_load_b_slice(b_n, b_slices[n]);"
+        )
+        .unwrap();
+        writeln!(out, "            warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][0], b_n.tiles[0][0], acc.tiles[0][n]);").unwrap();
+        writeln!(out, "            #pragma unroll").unwrap();
+        writeln!(out, "            for (int k = 1; k < a_reg.width; k++)").unwrap();
+        writeln!(out, "                warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "        group<MSM_NUM_WARPS>::sync(14);").unwrap();
+        writeln!(out, "    }}").unwrap();
+
+        // Store partial: acc → shmem → global scratch
+        writeln!(out, "    {{  rt_bf<16, MSM_OUT_BLOCK> partial_bf;").unwrap();
+        writeln!(out, "        warp::copy(partial_bf, acc);").unwrap();
+        writeln!(out, "        using scratch_st = st_bf<16, MSM_OUT_BLOCK>;").unwrap();
+        writeln!(
+            out,
+            "        scratch_st &stile = reinterpret_cast<scratch_st&>(*a_stages[0]);"
+        )
+        .unwrap();
+        writeln!(out, "        warp::store(stile, partial_bf);").unwrap();
+        writeln!(out, "        group<MSM_NUM_WARPS>::sync(15);").unwrap();
+        writeln!(
+            out,
+            "        const int gr = row * MSM_BATCH_BLOCK + wid * 16;"
+        )
+        .unwrap();
+        writeln!(out, "        const int gc = splitk_col * MSM_OUT_BLOCK;").unwrap();
+        writeln!(
+            out,
+            "        bf16 *dst = splitk_scratch + k_split * {scratch_slice} + gr * {scratch_row} + gc;"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "        const bf16 *src = reinterpret_cast<const bf16*>(&stile);"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "        for (int i = lid; i < 16 * MSM_OUT_BLOCK; i += 32) {{"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            int sr = i / MSM_OUT_BLOCK, sc = i % MSM_OUT_BLOCK;"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            dst[sr * {scratch_row} + sc] = src[sr * MSM_OUT_BLOCK + sc];"
+        )
+        .unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out).unwrap();
+
+        // Barrier: all CTAs done with partials
+        writeln!(out, "    __threadfence();").unwrap();
+        writeln!(out, "    msm_signal(msm_bar, layer, {barrier_idx});").unwrap();
+        writeln!(
+            out,
+            "    msm_wait(msm_bar, layer, {barrier_idx}, MSM_GRID_SIZE);"
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+
+        // Phase B: reduce partials (first num_tiles CTAs)
+        writeln!(out, "    if (bid < {tiles_const}) {{").unwrap();
+        writeln!(out, "    const int col = bid;").unwrap();
+        writeln!(out, "    msm_acc_rt sum_acc;").unwrap();
+        writeln!(out, "    warp::zero(sum_acc);").unwrap();
+        writeln!(out, "    using scratch_st = st_bf<16, MSM_OUT_BLOCK>;").unwrap();
+        writeln!(out, "    scratch_st &stile = reinterpret_cast<scratch_st&>(*reinterpret_cast<msm_a_st*>(__shm));").unwrap();
+        writeln!(out, "    for (int s = 0; s < {split_k_const}; s++) {{").unwrap();
+        writeln!(
+            out,
+            "        const int gr = row * MSM_BATCH_BLOCK + wid * 16;"
+        )
+        .unwrap();
+        writeln!(out, "        const int gc = col * MSM_OUT_BLOCK;").unwrap();
+        writeln!(
+            out,
+            "        const bf16 *src = splitk_scratch + s * {scratch_slice} + gr * {scratch_row} + gc;"
+        )
+        .unwrap();
+        writeln!(out, "        bf16 *dst = reinterpret_cast<bf16*>(&stile);").unwrap();
+        writeln!(
+            out,
+            "        for (int i = lid; i < 16 * MSM_OUT_BLOCK; i += 32) {{"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            int sr = i / MSM_OUT_BLOCK, sc = i % MSM_OUT_BLOCK;"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            dst[sr * MSM_OUT_BLOCK + sc] = src[sr * {scratch_row} + sc];"
+        )
+        .unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "        __syncwarp();").unwrap();
+        writeln!(out, "        rt_bf<16, MSM_OUT_BLOCK> partial_bf;").unwrap();
+        writeln!(out, "        warp::load(partial_bf, stile);").unwrap();
+        // Accumulate in f32
+        writeln!(out, "        #pragma unroll").unwrap();
+        writeln!(out, "        for (int i = 0; i < sum_acc.height; i++)").unwrap();
+        writeln!(out, "            #pragma unroll").unwrap();
+        writeln!(out, "            for (int j = 0; j < sum_acc.width; j++)").unwrap();
+        writeln!(out, "                #pragma unroll").unwrap();
+        writeln!(
+            out,
+            "                for (int d = 0; d < sum_acc.tiles[i][j].num_elements; d++) {{"
+        )
+        .unwrap();
+        writeln!(out, "                    float2 pf;").unwrap();
+        writeln!(out, "                    pf.x = __bfloat162float(__low2bfloat16(partial_bf.tiles[i][j].data[d]));").unwrap();
+        writeln!(out, "                    pf.y = __bfloat162float(__high2bfloat16(partial_bf.tiles[i][j].data[d]));").unwrap();
+        writeln!(
+            out,
+            "                    sum_acc.tiles[i][j].data[d].x += pf.x;"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "                    sum_acc.tiles[i][j].data[d].y += pf.y;"
+        )
+        .unwrap();
+        writeln!(out, "                }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+
+        // Apply reduce epilogue
+        writeln!(out, "{reduce_epilogue}").unwrap();
+        writeln!(out, "    }}").unwrap();
+    }
+
     // ── RMSNorm helper (only CTA 0) ──
     fn emit_msm_rmsnorm(
         out: &mut String,
@@ -5687,19 +5917,25 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
 
     // ── Compile-time grid size = max tile count across all GEMM phases ──
     let grid_size = *[hd_col_tiles, id_col_tiles].iter().max().unwrap();
+    // Split-K factors: all HD-output GEMMs share the same factor
+    let hd_split_k = grid_size / hd_col_tiles; // 128 / 32 = 4
+    let hd_k_per_split = hd_k_iters / hd_split_k; // 32 / 4 = 8
     let down_split_k = grid_size / hd_col_tiles; // 128 / 32 = 4
     let down_k_per_split = id_k_iters / down_split_k; // 128 / 4 = 32
     writeln!(out, "constexpr int MSM_GRID_SIZE = {grid_size};").unwrap();
     writeln!(out, "constexpr int MSM_QKV_TILES = {hd_col_tiles};").unwrap();
     writeln!(out, "constexpr int MSM_HD_TILES  = {hd_col_tiles};").unwrap();
     writeln!(out, "constexpr int MSM_ID_TILES  = {id_col_tiles};").unwrap();
+    writeln!(out, "constexpr int MSM_HD_SPLIT_K = {hd_split_k};").unwrap();
+    writeln!(out, "constexpr int MSM_HD_K_PER_SPLIT = {hd_k_per_split};").unwrap();
     writeln!(out, "constexpr int MSM_DOWN_SPLIT_K = {down_split_k};").unwrap();
     writeln!(
         out,
         "constexpr int MSM_DOWN_K_PER_SPLIT = {down_k_per_split};"
     )
     .unwrap();
-    // Scratch buffer layout: splitk_scratch[split][batch_block][HD] as bf16
+    // Scratch buffer: shared by QKV, o_proj, and down (sequential, never overlapping)
+    // Layout: [SPLIT_K][BATCH_BLOCK][HD] — sized for max(HD, HD, HD) = HD
     let scratch_slice = ScratchSliceElems(batch_block * hd);
     let scratch_row = ScratchRowElems(hd);
     writeln!(
@@ -5751,36 +5987,37 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
     writeln!(out, "    msm_wait(msm_bar, layer, 0, 1);").unwrap();
     writeln!(out).unwrap();
 
-    // Phase 1: QKV GEMM — only CTAs 0..QKV_TILES-1 participate
+    // Phase 1: QKV GEMM with split-K — ALL CTAs participate
     writeln!(out, "    MSM_CLOCK(2);").unwrap();
     writeln!(
         out,
-        "    // ════ Phase 1: QKV GEMM ({hd_col_tiles} tiles, 1 per CTA) ════"
+        "    // ════ Phase 1: QKV GEMM split-K ({hd_col_tiles} tiles × {hd_split_k} splits) ════"
     )
     .unwrap();
-    writeln!(out, "    if (bid < MSM_QKV_TILES) {{").unwrap();
-    emit_msm_gemm_loop(
+    emit_msm_splitk_gemm(
         &mut out,
         "g.rms_rope_intermediates",
         "g.qkv_weights",
-        &hd_k_iters.to_string(),
-        "bid",
-        "(bid + 1)",
-        "        {   rt_bf<16, MSM_OUT_BLOCK> out_bf;
-            warp::copy(out_bf, acc);
+        "MSM_HD_SPLIT_K",
+        "MSM_HD_K_PER_SPLIT",
+        "MSM_QKV_TILES",
+        1, // barrier index
+        "    {   rt_bf<16, MSM_OUT_BLOCK> out_bf;
+            warp::copy(out_bf, sum_acc);
             warp::store(g.q_post_rope, out_bf, {row * (MSM_BATCH_BLOCK / 16) + wid, col});
         }",
+        scratch_slice,
+        scratch_row,
         a_size,
         stage_size,
     );
-    writeln!(out, "    }}").unwrap();
     writeln!(out, "    MSM_CLOCK(3);").unwrap();
     writeln!(
         out,
-        "    if (bid < MSM_QKV_TILES) msm_signal(msm_bar, layer, 1);"
+        "    if (bid < MSM_QKV_TILES) msm_signal(msm_bar, layer, 2);"
     )
     .unwrap();
-    writeln!(out, "    msm_wait(msm_bar, layer, 1, MSM_QKV_TILES);").unwrap();
+    writeln!(out, "    msm_wait(msm_bar, layer, 2, MSM_QKV_TILES);").unwrap();
     writeln!(out).unwrap();
 
     // Phase 2: attention_decode (CTA 0 only, wait for 1)
@@ -6017,27 +6254,27 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
     writeln!(out, "    }} // end attention").unwrap();
     writeln!(out, "    }} // end if bid==0 for attention").unwrap();
     writeln!(out, "    MSM_CLOCK(5);").unwrap();
-    writeln!(out, "    if (bid == 0) msm_signal(msm_bar, layer, 2);").unwrap();
-    writeln!(out, "    msm_wait(msm_bar, layer, 2, 1);").unwrap();
+    writeln!(out, "    if (bid == 0) msm_signal(msm_bar, layer, 3);").unwrap();
+    writeln!(out, "    msm_wait(msm_bar, layer, 3, 1);").unwrap();
     writeln!(out).unwrap();
 
-    // Phase 3: o_proj GEMM + residual — only CTAs 0..HD_TILES-1
+    // Phase 3: o_proj GEMM + residual with split-K — ALL CTAs participate
     writeln!(out, "    MSM_CLOCK(6);").unwrap();
     writeln!(
         out,
-        "    // ════ Phase 3: o_proj GEMM + residual ({hd_col_tiles} tiles) ════"
+        "    // ════ Phase 3: o_proj GEMM + residual split-K ({hd_col_tiles} tiles × {hd_split_k} splits) ════"
     )
     .unwrap();
-    writeln!(out, "    if (bid < MSM_HD_TILES) {{").unwrap();
-    emit_msm_gemm_loop(
+    emit_msm_splitk_gemm(
         &mut out,
         "g.attn_out",
         "g.o_weights",
-        &hd_k_iters.to_string(),
-        "bid",
-        "(bid + 1)",
-        "        {   rt_bf<16, MSM_OUT_BLOCK> acc_bf;
-            warp::copy(acc_bf, acc);
+        "MSM_HD_SPLIT_K",
+        "MSM_HD_K_PER_SPLIT",
+        "MSM_HD_TILES",
+        4, // barrier index for split-K internal sync
+        "    {   rt_bf<16, MSM_OUT_BLOCK> acc_bf;
+            warp::copy(acc_bf, sum_acc);
             rt_bf<16, MSM_OUT_BLOCK> res_bf;
             warp::load(res_bf, g.hidden_states, {row * (MSM_BATCH_BLOCK / 16) + wid, col});
             #pragma unroll
@@ -6056,17 +6293,18 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
                     }
             warp::store(g.hidden_states, acc_bf, {row * (MSM_BATCH_BLOCK / 16) + wid, col});
         }",
+        scratch_slice,
+        scratch_row,
         a_size,
         stage_size,
     );
-    writeln!(out, "    }}").unwrap();
     writeln!(out, "    MSM_CLOCK(7);").unwrap();
     writeln!(
         out,
-        "    if (bid < MSM_HD_TILES) msm_signal(msm_bar, layer, 3);"
+        "    if (bid < MSM_HD_TILES) msm_signal(msm_bar, layer, 5);"
     )
     .unwrap();
-    writeln!(out, "    msm_wait(msm_bar, layer, 3, MSM_HD_TILES);").unwrap();
+    writeln!(out, "    msm_wait(msm_bar, layer, 5, MSM_HD_TILES);").unwrap();
     writeln!(out).unwrap();
 
     // Phase 4: mlp_norm (CTA 0 only, wait for 1)
@@ -6082,8 +6320,8 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
     );
     writeln!(out, "    }}").unwrap();
     writeln!(out, "    MSM_CLOCK(9);").unwrap();
-    writeln!(out, "    if (bid == 0) msm_signal(msm_bar, layer, 4);").unwrap();
-    writeln!(out, "    msm_wait(msm_bar, layer, 4, 1);").unwrap();
+    writeln!(out, "    if (bid == 0) msm_signal(msm_bar, layer, 6);").unwrap();
+    writeln!(out, "    msm_wait(msm_bar, layer, 6, 1);").unwrap();
     writeln!(out).unwrap();
 
     // Phase 5: gate GEMM + SiLU — all CTAs (ID_TILES = GRID_SIZE)
@@ -6120,7 +6358,7 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
     );
     writeln!(out, "    }}").unwrap();
     writeln!(out, "    MSM_CLOCK(11);").unwrap();
-    writeln!(out, "    msm_signal(msm_bar, layer, 5);").unwrap();
+    writeln!(out, "    msm_signal(msm_bar, layer, 7);").unwrap();
     writeln!(out).unwrap();
 
     // Phase 6: up GEMM × gate — all CTAs (ID_TILES = GRID_SIZE)
@@ -6130,7 +6368,7 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
         "    // ════ Phase 6: up GEMM × gate ({id_col_tiles} tiles, all CTAs) ════"
     )
     .unwrap();
-    writeln!(out, "    msm_wait(msm_bar, layer, 5, MSM_ID_TILES);").unwrap();
+    writeln!(out, "    msm_wait(msm_bar, layer, 7, MSM_ID_TILES);").unwrap();
     writeln!(out, "    {{").unwrap();
     emit_msm_gemm_loop(
         &mut out,
@@ -6164,8 +6402,8 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
     );
     writeln!(out, "    }}").unwrap();
     writeln!(out, "    MSM_CLOCK(13);").unwrap();
-    writeln!(out, "    msm_signal(msm_bar, layer, 6);").unwrap();
-    writeln!(out, "    msm_wait(msm_bar, layer, 6, MSM_ID_TILES);").unwrap();
+    writeln!(out, "    msm_signal(msm_bar, layer, 8);").unwrap();
+    writeln!(out, "    msm_wait(msm_bar, layer, 8, MSM_ID_TILES);").unwrap();
     writeln!(out).unwrap();
 
     // Phase 7: down GEMM with split-K — ALL CTAs participate
@@ -6304,8 +6542,8 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
 
     // Barrier: all CTAs done with partial sums
     writeln!(out, "    __threadfence();").unwrap();
-    writeln!(out, "    msm_signal(msm_bar, layer, 7);").unwrap();
-    writeln!(out, "    msm_wait(msm_bar, layer, 7, MSM_GRID_SIZE);").unwrap();
+    writeln!(out, "    msm_signal(msm_bar, layer, 9);").unwrap();
+    writeln!(out, "    msm_wait(msm_bar, layer, 9, MSM_GRID_SIZE);").unwrap();
     writeln!(out).unwrap();
 
     // Phase 7b: reduce partials + add residual (CTAs 0..HD_TILES-1)
@@ -6522,7 +6760,8 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
 
     // ── Profiled launch wrapper ──
     // 17 clock samples per layer: before/after each of 8 phases + 1 end-of-layer
-    let clocks_per_layer = 17;
+    // Must match MSM_NUM_PHASES * 2 + 1 (the kernel writes at stride NUM_PHASES*2+1)
+    let clocks_per_layer = num_phases * 2 + 1;
     writeln!(out, "extern \"C\" int fused_multi_sm_profile_launch(").unwrap();
     writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
     writeln!(out, ") {{").unwrap();

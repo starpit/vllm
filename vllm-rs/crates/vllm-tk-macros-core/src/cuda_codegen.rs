@@ -1921,6 +1921,187 @@ pub fn generate_inline_rmsnorm_kernel(dag: &ModelDag) -> String {
     out
 }
 
+/// Generate an inline GEMM test kernel (no KVM protocol).
+///
+/// Computes hidden_states @ qkv_weights^T for a single output tile (col=0, layer=0).
+/// All 8 warps cooperate on load + MMA with double-buffered K-loop.
+/// Output written to rms_rope buffer for readback.
+pub fn generate_inline_gemm_kernel(dag: &ModelDag) -> String {
+    let mut out = String::new();
+
+    let hd = dag.params.get("HD").copied().unwrap_or(2048);
+    let nl = dag.params.get("NL").copied().unwrap_or(16);
+    let nah = dag.params.get("NAH").copied().unwrap_or(32);
+    let nkh = dag.params.get("NKH").copied().unwrap_or(8);
+    let hdm = dag.params.get("HDM").copied().unwrap_or(64);
+    let id = dag.params.get("ID").copied().unwrap_or(8192);
+
+    let k_dim = 64;
+    let num_iters = hd / k_dim;
+    let batch_block = 128;
+    let out_block = 64; // small for testing — matches optimal_out_block for qkv
+    let num_warps = 8;
+    let num_threads = num_warps * 32;
+
+    // Shmem: 2 stages × (A tile + B tile)
+    let a_size = batch_block * k_dim * 2; // st_bf<128, 64> = 16KB
+    let b_size = out_block * k_dim * 2;   // st_bf<64, 64> = 8KB
+    let stage_size = a_size + b_size;
+    let total_shmem = 2 * stage_size;
+
+    writeln!(out, "// GENERATED: Inline GEMM kernel (no KVM protocol)").unwrap();
+    writeln!(out, "// Double-buffered K-loop, 8 cooperative warps.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#define SM89_NUM_LAYERS             {nl}").unwrap();
+    writeln!(out, "#define SM89_HIDDEN_DIM             {hd}").unwrap();
+    writeln!(out, "#define SM89_INTERMEDIATE_DIM       {id}").unwrap();
+    writeln!(out, "#define SM89_HEAD_DIM               {hdm}").unwrap();
+    writeln!(out, "#define SM89_NUM_ATTENTION_HEADS    {nah}").unwrap();
+    writeln!(out, "#define SM89_NUM_KV_HEADS           {nkh}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#include \"llama_sm89.cuh\"").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "using namespace kittens;").unwrap();
+    writeln!(out, "using namespace kittens::prototype::vm;").unwrap();
+    writeln!(out, "using globals = llama_sm89_globals;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "constexpr int GEMM_K_DIM = {k_dim};").unwrap();
+    writeln!(out, "constexpr int GEMM_NUM_ITERS = {num_iters};").unwrap();
+    writeln!(out, "constexpr int GEMM_BATCH_BLOCK = {batch_block};").unwrap();
+    writeln!(out, "constexpr int GEMM_OUT_BLOCK = {out_block};").unwrap();
+    writeln!(out, "constexpr int GEMM_NUM_WARPS = {num_warps};").unwrap();
+    writeln!(out, "constexpr int GEMM_SHMEM = {total_shmem};").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "using a_st = st_bf<GEMM_BATCH_BLOCK, GEMM_K_DIM>;").unwrap();
+    writeln!(out, "using b_st = st_bf<GEMM_OUT_BLOCK, GEMM_K_DIM>;").unwrap();
+    writeln!(out, "using acc_rt = rt_fl<16, GEMM_OUT_BLOCK>;").unwrap();
+    writeln!(out).unwrap();
+
+    // load_b_slice helper (same as matmul_pipeline_sm89.cuh)
+    writeln!(out, "// Load a 16-row B slice from shmem via LDSM4").unwrap();
+    writeln!(out, "__device__ static inline void inline_load_b_slice(").unwrap();
+    writeln!(out, "    rt_bf<16, GEMM_K_DIM> &dst, const st_bf<16, GEMM_K_DIM> &src) {{").unwrap();
+    writeln!(out, "    uint32_t saddr = static_cast<uint32_t>(__cvta_generic_to_shared(&src.data[0]));").unwrap();
+    writeln!(out, "    int lane = kittens::laneid();").unwrap();
+    writeln!(out, "    int row = lane % 16;").unwrap();
+    writeln!(out, "    bf16_2 tmp[4];").unwrap();
+    writeln!(out, "    #pragma unroll").unwrap();
+    writeln!(out, "    for (int j = 0; j < GEMM_K_DIM / 16; j++) {{").unwrap();
+    writeln!(out, "        int col = j * 16 + (lane / 16) * 8;").unwrap();
+    writeln!(out, "        move<bf16_2>::ldsm4(tmp[0], tmp[1], tmp[2], tmp[3], src.idx(saddr, {{row, col}}));").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[0] = tmp[0];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[1] = tmp[1];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[2] = tmp[2];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[3] = tmp[3];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // The kernel
+    writeln!(out, "__global__ void __launch_bounds__({num_threads}, 1)").unwrap();
+    writeln!(out, "inline_gemm(const globals g, int batch_size, int num_layers) {{").unwrap();
+    writeln!(out, "    const int wid = kittens::warpid();").unwrap();
+    writeln!(out).unwrap();
+
+    // Shmem: two stages of A + B tiles
+    writeln!(out, "    extern __shared__ char __shm[];").unwrap();
+    writeln!(out, "    a_st &a_s0 = *reinterpret_cast<a_st*>(__shm);").unwrap();
+    writeln!(out, "    b_st &b_s0 = *reinterpret_cast<b_st*>(__shm + {a_size});").unwrap();
+    writeln!(out, "    a_st &a_s1 = *reinterpret_cast<a_st*>(__shm + {stage_size});").unwrap();
+    writeln!(out, "    b_st &b_s1 = *reinterpret_cast<b_st*>(__shm + {} + {a_size});", stage_size).unwrap();
+    writeln!(out, "    a_st *a_stages[2] = {{&a_s0, &a_s1}};").unwrap();
+    writeln!(out, "    b_st *b_stages[2] = {{&b_s0, &b_s1}};").unwrap();
+    writeln!(out).unwrap();
+
+    // Fixed test parameters: layer=0, col=0, row=0
+    writeln!(out, "    const int layer = 0;").unwrap();
+    writeln!(out, "    const int col = 0;").unwrap();
+    writeln!(out, "    const int row = 0;  // batch block 0").unwrap();
+    writeln!(out).unwrap();
+
+    // Initialize accumulator
+    writeln!(out, "    acc_rt acc;").unwrap();
+    writeln!(out, "    warp::zero(acc);").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    using b_slice_st = st_bf<16, GEMM_K_DIM>;").unwrap();
+    writeln!(out, "    constexpr int N_TILES = GEMM_OUT_BLOCK / 16;").unwrap();
+    writeln!(out).unwrap();
+
+    // Double-buffered K-loop
+    writeln!(out, "    // ── Double-buffered GEMM K-loop ──").unwrap();
+    writeln!(out, "    for (int iter = 0; iter < GEMM_NUM_ITERS; iter++) {{").unwrap();
+    writeln!(out, "        int stage = iter % 2;").unwrap();
+    writeln!(out, "        a_st &a_smem = *a_stages[stage];").unwrap();
+    writeln!(out, "        b_st &b_smem = *b_stages[stage];").unwrap();
+    writeln!(out).unwrap();
+
+    // Cooperative load from gmem
+    writeln!(out, "        // All 8 warps cooperatively load A and B tiles").unwrap();
+    writeln!(out, "        group<GEMM_NUM_WARPS>::load_async(a_smem, g.hidden_states, {{row, iter}});").unwrap();
+    writeln!(out, "        group<GEMM_NUM_WARPS>::load_async(b_smem, g.qkv_weights, {{layer, col, iter}});").unwrap();
+    writeln!(out, "        asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "        group<GEMM_NUM_WARPS>::sync(14);").unwrap();
+    writeln!(out).unwrap();
+
+    // Per-warp MMA
+    writeln!(out, "        // Per-warp MMA: each warp handles 16 rows of A").unwrap();
+    writeln!(out, "        rt_bf<16, GEMM_K_DIM> a_reg;").unwrap();
+    writeln!(out, "        {{").unwrap();
+    writeln!(out, "            using a_slice_st = st_bf<16, GEMM_K_DIM>;").unwrap();
+    writeln!(out, "            const a_slice_st &a_warp = reinterpret_cast<const a_slice_st*>(&a_smem)[wid];").unwrap();
+    writeln!(out, "            warp::load(a_reg, a_warp);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        b_slice_st *b_slices = reinterpret_cast<b_slice_st*>(&b_smem);").unwrap();
+    writeln!(out, "        #pragma unroll").unwrap();
+    writeln!(out, "        for (int n = 0; n < N_TILES; n++) {{").unwrap();
+    writeln!(out, "            rt_bf<16, GEMM_K_DIM> b_n; inline_load_b_slice(b_n, b_slices[n]);").unwrap();
+    writeln!(out, "            warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][0], b_n.tiles[0][0], acc.tiles[0][n]);").unwrap();
+    writeln!(out, "            #pragma unroll").unwrap();
+    writeln!(out, "            for (int k = 1; k < a_reg.width; k++)").unwrap();
+    writeln!(out, "                warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        group<GEMM_NUM_WARPS>::sync(14);  // ensure shmem can be reused").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Store result to gmem (using rms_rope as output buffer)
+    // Each warp has acc = rt_fl<16, OUT_BLOCK> — cast to bf16 and store
+    writeln!(out, "    // Store: cast fp32 accumulator to bf16 and write to rms_rope").unwrap();
+    writeln!(out, "    rt_bf<16, GEMM_OUT_BLOCK> out_bf;").unwrap();
+    writeln!(out, "    warp::copy(out_bf, acc);").unwrap();
+    writeln!(out, "    // Write warp's 16-row slice. Row = row * (BATCH_BLOCK/16) + wid.").unwrap();
+    writeln!(out, "    warp::store(g.rms_rope_intermediates, out_bf, {{row * (GEMM_BATCH_BLOCK / 16) + wid, col}});").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Launch wrapper
+    emit_tensor_arg_and_globals_helper(&mut out);
+    writeln!(out, "extern \"C\" int inline_gemm_launch(").unwrap();
+    writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "  try {{").unwrap();
+    emit_globals_construction(&mut out, "    ");
+    writeln!(out).unwrap();
+    writeln!(out, "    int shmem = GEMM_SHMEM;").unwrap();
+    writeln!(out, "    auto err = cudaFuncSetAttribute(inline_gemm,").unwrap();
+    writeln!(out, "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);").unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
+    // Single block — one tile
+    writeln!(out, "    inline_gemm<<<1, {num_threads}, shmem, (cudaStream_t)stream>>>(").unwrap();
+    writeln!(out, "        g, batch_size, num_layers);").unwrap();
+    writeln!(out, "    err = cudaGetLastError();").unwrap();
+    writeln!(out, "    return (int)err;").unwrap();
+    writeln!(out, "  }} catch (...) {{ return -2; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    out
+}
+
 /// List all op names that can be used with `generate_single_op_kernel`.
 pub fn available_op_names() -> Vec<&'static str> {
     vec![
@@ -2135,6 +2316,56 @@ mod tests {
         assert!(cuda.contains("__launch_bounds__(256, 1)"));
 
         // Print for inspection
+        eprintln!("{cuda}");
+    }
+
+    #[test]
+    fn generates_inline_gemm() {
+        let input: proc_macro2::TokenStream = quote::quote! {
+            kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                    let qkv = gemm(normed, qkv_weights[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                    let gate = silu(gemm(normed2, gate_weights[layer]));
+                    let up = gemm(normed2, up_weights[layer]);
+                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                }
+                let normed = rmsnorm(hidden_states, lm_head_norm);
+                logits = gemm(normed, lm_head);
+            }
+        };
+        let def: crate::parse::MegakernelDef = syn::parse2(input).unwrap();
+        let dag = crate::parse::build_dag(&def).unwrap();
+
+        let cuda = generate_inline_gemm_kernel(&dag);
+
+        // No KVM protocol
+        assert!(!cuda.contains("run_op"), "should not use run_op");
+        assert!(!cuda.contains("state<config>"), "should not use KVM state");
+        assert!(!cuda.contains("init_semaphore"), "should not use semaphores");
+
+        // Has inline kernel + launch wrapper
+        assert!(cuda.contains("inline_gemm("));
+        assert!(cuda.contains("inline_gemm_launch("));
+
+        // Uses TK tile primitives
+        assert!(cuda.contains("group<"));
+        assert!(cuda.contains("warp::mma_ABt_base"));
+        assert!(cuda.contains("warp::zero"));
+        assert!(cuda.contains("warp::store"));
+
+        // Double-buffered
+        assert!(cuda.contains("a_stages[2]"));
+        assert!(cuda.contains("b_stages[2]"));
+
+        // 8 warps
+        assert!(cuda.contains("__launch_bounds__(256, 1)"));
+
         eprintln!("{cuda}");
     }
 }

@@ -525,3 +525,76 @@ fn test_inline_rmsnorm_golden() {
 
     assert_close(gpu_row0, &expected, 5e-2, 5e-2, "inline_rmsnorm_golden");
 }
+
+#[test]
+#[ignore] // Requires GPU
+fn test_inline_gemm_golden() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+
+    const OUT_BLOCK: usize = 64;
+
+    // Input: [ACT_ROWS, HD] — random data in all rows (GEMM processes all 128)
+    let input_f32_raw: Vec<f32> = {
+        let mut rng = 42u64;
+        (0..ACT_ROWS * HD)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * 0.1
+            })
+            .collect()
+    };
+    let input_f32 = bf16_roundtrip(&input_f32_raw);
+
+    // Weight: [QKV_DIM, HD] for layer 0 — we only test the first OUT_BLOCK rows
+    let weight_f32_raw: Vec<f32> = {
+        let mut rng = 123u64;
+        (0..QKV_DIM * HD)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * 0.01
+            })
+            .collect()
+    };
+    let weight_f32 = bf16_roundtrip(&weight_f32_raw);
+
+    let mut b = TestBuffers::new();
+
+    // Upload input to hidden_states
+    b.hidden = gpu_upload_bf16(&input_f32);
+
+    // Upload weight to qkv_w: need [NL, QKV_DIM, HD], replicate for all layers
+    let weight_full: Vec<f32> = weight_f32.iter().copied().cycle().take(NL * QKV_DIM * HD).collect();
+    b.qkv_w = gpu_upload_bf16(&weight_full);
+
+    let rc = call_launch!(ffi::inline_gemm_launch, b);
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "inline_gemm_launch returned error {rc}");
+
+    // Read back output from rms_rope: [ACT_ROWS, HD] but only first OUT_BLOCK cols used
+    let gpu_out = gpu_download_bf16(b.rms_rope, ACT_ROWS * HD);
+
+    // CPU golden: output[ACT_ROWS, OUT_BLOCK] = input[ACT_ROWS, HD] @ weight[OUT_BLOCK, HD]^T
+    let weight_slice = &weight_f32[..OUT_BLOCK * HD]; // first 64 rows
+    let mut expected = vec![0.0_f32; ACT_ROWS * OUT_BLOCK];
+    cpu_golden::gemm(&input_f32, weight_slice, &mut expected, ACT_ROWS, HD, OUT_BLOCK);
+
+    // The GPU output is stored in rms_rope which is [ACT_ROWS, HD].
+    // The kernel writes 64 columns starting at col offset 0 in each row's tile.
+    // rms_rope store uses {row * (BATCH_BLOCK/16) + wid, col} — each warp stores
+    // a 16×64 tile. In the rms_rope [ACT_ROWS, HD] layout, each 16-row tile at
+    // col offset 0 writes 64 bf16 values = columns [0..64) of that row group.
+    // So row i's output is at gpu_out[i * HD .. i * HD + OUT_BLOCK].
+    for row in 0..ACT_ROWS {
+        let gpu_row = &gpu_out[row * HD..row * HD + OUT_BLOCK];
+        let exp_row = &expected[row * OUT_BLOCK..(row + 1) * OUT_BLOCK];
+        assert_close(
+            gpu_row,
+            exp_row,
+            5e-2,
+            5e-2,
+            &format!("inline_gemm_golden row {row}"),
+        );
+    }
+}

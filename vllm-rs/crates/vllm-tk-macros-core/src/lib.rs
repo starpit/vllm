@@ -78,6 +78,20 @@ pub fn generate_inline_rmsnorm_kernel(dsl: &str) -> Result<String, String> {
     Ok(cuda_codegen::generate_inline_rmsnorm_kernel(&dag))
 }
 
+/// Generate an inline GEMM kernel (no KVM protocol).
+///
+/// Double-buffered K-loop with 8 cooperative warps using TK tile primitives.
+pub fn generate_inline_gemm_kernel(dsl: &str) -> Result<String, String> {
+    let tokens: proc_macro2::TokenStream = dsl
+        .parse()
+        .map_err(|e| format!("failed to tokenize DSL: {e}"))?;
+
+    let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("parse error: {e}"))?;
+    let dag = parse::build_dag(&def)?;
+
+    Ok(cuda_codegen::generate_inline_gemm_kernel(&dag))
+}
+
 /// Generate a debug variant of the decode kernel that syncs and writes a
 /// marker to a debug buffer after each op. Useful for identifying which op
 /// crashes in the full megakernel.

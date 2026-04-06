@@ -144,4 +144,5 @@ pub mod ffi {
 
     // Inline kernels (no KVM protocol — static tile pipeline)
     declare_test_launch!(inline_rmsnorm_launch);
+    declare_test_launch!(inline_gemm_launch);
 }

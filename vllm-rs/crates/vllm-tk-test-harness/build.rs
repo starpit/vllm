@@ -73,13 +73,20 @@ fn build_cuda() {
         cu_files.push(cu_path.display().to_string());
     }
 
-    // Generate inline kernel (no KVM protocol)
+    // Generate inline kernels (no KVM protocol)
     let inline_rmsnorm_source = vllm_tk_macros_core::generate_inline_rmsnorm_kernel(dsl)
         .unwrap_or_else(|e| panic!("inline rmsnorm codegen failed: {e}"));
     let inline_rmsnorm_path = out_dir.join("inline_rmsnorm.cu");
     std::fs::write(&inline_rmsnorm_path, &inline_rmsnorm_source)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", inline_rmsnorm_path.display()));
     cu_files.push(inline_rmsnorm_path.display().to_string());
+
+    let inline_gemm_source = vllm_tk_macros_core::generate_inline_gemm_kernel(dsl)
+        .unwrap_or_else(|e| panic!("inline gemm codegen failed: {e}"));
+    let inline_gemm_path = out_dir.join("inline_gemm.cu");
+    std::fs::write(&inline_gemm_path, &inline_gemm_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", inline_gemm_path.display()));
+    cu_files.push(inline_gemm_path.display().to_string());
 
     // Build all test kernels into one static library
     cudaforge::KernelBuilder::new()

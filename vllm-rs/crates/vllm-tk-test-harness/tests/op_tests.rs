@@ -1611,3 +1611,178 @@ fn test_fused_multi_sm_profile() {
     let rc = call_launch!(ffi::fused_multi_sm_profile_launch, b, NL * NUM_PAGES);
     assert_eq!(rc, 0, "fused_multi_sm_profile_launch returned error {rc}");
 }
+
+/// Prefill attention golden test: compare GPU FlashAttention-2 prefill against
+/// `cpu_golden::attention_prefill`. Single sequence, 48 tokens, layer 0.
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_fused_prefill_attention_golden() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    // Test setup: 1 sequence, 48 tokens (partial page of 64)
+    let seq_len: usize = 48;
+    let num_pages_used = (seq_len + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE; // 1
+    let attn_scale = 1.0 / (HDM as f32).sqrt();
+
+    // Q: [seq_len, NAH, HDM] — prefill has Q for all tokens
+    // In the q_post layout: [seq_len, NAH * HDM] = [seq_len, HD]
+    let q_data = bf16_roundtrip(&make_random(seq_len * NAH * HDM, 500, 0.3));
+
+    // K/V: [seq_len, NKH, HDM] for CPU golden
+    let k_cache_flat = bf16_roundtrip(&make_random(seq_len * NKH * HDM, 600, 0.3));
+    let v_cache_flat = bf16_roundtrip(&make_random(seq_len * NKH * HDM, 700, 0.3));
+
+    // ── CPU golden ──
+    let seq_starts = vec![0_usize, seq_len];
+    let mut expected = vec![0.0_f32; seq_len * NAH * HDM];
+    cpu_golden::attention_prefill(
+        &q_data,
+        &k_cache_flat,
+        &v_cache_flat,
+        &mut expected,
+        &seq_starts,
+        NAH,
+        NKH,
+        HDM,
+        attn_scale,
+    );
+
+    // ── GPU setup ──
+    let mut b = TestBuffers::new();
+
+    // Upload Q to q_post: [ACT_ROWS, HD] — fill first seq_len rows
+    let mut q_full = vec![0.0_f32; ACT_ROWS * HD];
+    for tok in 0..seq_len {
+        q_full[tok * HD..tok * HD + NAH * HDM]
+            .copy_from_slice(&q_data[tok * NAH * HDM..(tok + 1) * NAH * HDM]);
+    }
+    b.q_post = gpu_upload_bf16(&q_full);
+
+    // Upload KV cache in paged layout: [NL * NUM_PAGES, KV_PAGE_SIZE, NKH, HDM]
+    let total_kv_cache_size = NL * NUM_PAGES * KV_PAGE_SIZE * NKH * HDM;
+    let mut k_paged = vec![0.0_f32; total_kv_cache_size];
+    let mut v_paged = vec![0.0_f32; total_kv_cache_size];
+
+    // Copy seq_len tokens into page 0, layer 0
+    let page_index = 0_usize;
+    let page_batch = NUM_PAGES * 0 + page_index; // layer 0
+    for tok in 0..seq_len {
+        for kv_h in 0..NKH {
+            for d in 0..HDM {
+                let flat_idx = tok * NKH * HDM + kv_h * HDM + d;
+                let paged_idx =
+                    page_batch * KV_PAGE_SIZE * NKH * HDM + tok * NKH * HDM + kv_h * HDM + d;
+                k_paged[paged_idx] = k_cache_flat[flat_idx];
+                v_paged[paged_idx] = v_cache_flat[flat_idx];
+            }
+        }
+    }
+    b.k_cache = gpu_upload_bf16(&k_paged);
+    b.v_cache = gpu_upload_bf16(&v_paged);
+
+    // attn_out: zero buffer
+    b.attn_out = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+
+    // Prefill metadata
+    // prefill_qo_indptr: [0, seq_len] — 1 sequence
+    let prefill_qo_indptr = gpu_upload_i32(&[0_i32, seq_len as i32]);
+    // prefill_kv_indptr: [0, num_pages_used] — page range for seq 0
+    let prefill_kv_indptr = gpu_upload_i32(&[0_i32, num_pages_used as i32]);
+    // prefill_kv_indices: [0] — page 0
+    let prefill_kv_indices = gpu_upload_i32(&[page_index as i32]);
+    // prefill_kv_last_page_len: not used by our kernel (it computes seq_len from Q)
+    let prefill_kv_last_page_len = gpu_upload_i32(&[seq_len as i32]);
+
+    // Call fused_prefill_attn_launch directly (can't use call_launch! macro
+    // because it hardcodes dummy prefill metadata)
+    let kv_pages = NL * NUM_PAGES;
+    let rc = unsafe {
+        ffi::fused_prefill_attn_launch(
+            // VM state
+            BarrierArg::new(b.bar, NL, NUM_OPS, N_BATCH_BLOCKS, MAX_BARRIER_COLS),
+            TkTensorArg::raw(b.instr, &[SM_COUNT, MAX_PER_SM, INSTRUCTION_WIDTH]),
+            TkTensorArg::raw(b.timings, &[SM_COUNT, MAX_PER_SM, TIMING_WIDTH]),
+            // Weights
+            WeightArg::new(b.qkv_w, NL, QKV_DIM, HD),
+            NormWeightArg::new(b.attn_norm_w, NL, HD),
+            WeightArg::new(b.o_w, NL, HD, HD),
+            NormWeightArg::new(b.mlp_norm_w, NL, HD),
+            WeightArg::new(b.up_w, NL, ID, HD),
+            WeightArg::new(b.gate_w, NL, ID, HD),
+            WeightArg::new(b.down_w, NL, HD, ID),
+            NormWeightArg::new(b.lm_norm_w, 1, HD),
+            WeightArg::new(b.lm_w, 1, VS, HD),
+            // KV cache
+            KvCacheArg::new(b.k_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+            KvCacheArg::new(b.v_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+            // RoPE
+            RopeArg::new(b.rope_cos, 4096, HDM),
+            RopeArg::new(b.rope_sin, 4096, HDM),
+            // Activations
+            ActivationArg::new(b.hidden, ACT_ROWS, HD),
+            ActivationArg::new(b.rms_rope, ACT_ROWS, HD),
+            ActivationArg::new(b.rms_gate, ACT_ROWS, HD),
+            ActivationArg::new(b.q_post, ACT_ROWS, HD),
+            ActivationArg::new(b.attn_out, ACT_ROWS, HD),
+            ActivationArg::new(b.silu_buf, ACT_ROWS, ID),
+            ActivationArg::new(b.rms_lm, ACT_ROWS, HD),
+            LogitsArg::new(b.logits, ACT_ROWS, VS),
+            // Decode KV metadata (not used by prefill)
+            IntVecArg::new(b.pos_ids, ACT_ROWS),
+            IntVecArg::new(b.kv_indptr, ACT_ROWS + 1),
+            IntVecArg::new(b.kv_indices, NUM_PAGES),
+            IntVecArg::new(b.kv_last_page, ACT_ROWS),
+            IntVecArg::new(b.kv_append, ACT_ROWS),
+            // Prefill KV metadata
+            IntVecArg::new(prefill_qo_indptr, 2),
+            IntVecArg::new(prefill_kv_indptr, 2),
+            IntVecArg::new(prefill_kv_indices, num_pages_used),
+            IntVecArg::new(prefill_kv_last_page_len, 1),
+            // Scalars
+            attn_scale,
+            1e-5_f32,
+            NUM_PAGES as i32,
+            BS as i32,
+            seq_len as i32, // num_prefill_tokens
+            NL as i32,
+            0_u64,
+        )
+    };
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "fused_prefill_attn_launch returned error {rc}");
+
+    // Read back attn_out
+    let gpu_out = gpu_download_bf16(b.attn_out, ACT_ROWS * HD);
+
+    // Compare each token's attention output
+    for tok in 0..seq_len {
+        let gpu_row = &gpu_out[tok * HD..tok * HD + NAH * HDM];
+        let cpu_row = &expected[tok * NAH * HDM..(tok + 1) * NAH * HDM];
+
+        if tok == 0 || tok == seq_len - 1 {
+            eprintln!("PrefillAttn tok={tok} GPU[0..4]: {:?}", &gpu_row[..4]);
+            eprintln!("PrefillAttn tok={tok} CPU[0..4]: {:?}", &cpu_row[..4]);
+        }
+
+        assert_close(
+            gpu_row,
+            cpu_row,
+            2.0,
+            0.2,
+            &format!("prefill_attention_golden tok={tok}"),
+        );
+    }
+}

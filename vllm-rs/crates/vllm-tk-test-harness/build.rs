@@ -130,6 +130,13 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_multi_sm_path.display()));
     cu_files.push(fused_multi_sm_path.display().to_string());
 
+    let fused_prefill_source = vllm_tk_macros_core::generate_fused_prefill_kernel(dsl)
+        .unwrap_or_else(|e| panic!("fused prefill codegen failed: {e}"));
+    let fused_prefill_path = out_dir.join("fused_prefill.cu");
+    std::fs::write(&fused_prefill_path, &fused_prefill_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_prefill_path.display()));
+    cu_files.push(fused_prefill_path.display().to_string());
+
     let fused_layer_source = vllm_tk_macros_core::generate_fused_layer_kernel(dsl)
         .unwrap_or_else(|e| panic!("fused layer codegen failed: {e}"));
     let fused_layer_path = out_dir.join("fused_layer.cu");

@@ -6919,6 +6919,638 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
     out
 }
 
+/// Generate a fused prefill attention kernel (no KVM protocol).
+///
+/// Phase 1: attention-only. Q read from `q_post`, paged KV cache, output to `attn_out`.
+/// Grid = `ceil(num_prefill_tokens / 16) * num_kv_heads` CTAs.
+/// Each CTA handles one 16-token Q block for one KV head, with GQA_RATIO consumer warps.
+/// FlashAttention-2 online softmax with causal masking.
+pub fn generate_fused_prefill_kernel(dag: &ModelDag) -> String {
+    let mut out = String::new();
+
+    let hd = dag.params.get("HD").copied().unwrap_or(2048);
+    let nl = dag.params.get("NL").copied().unwrap_or(16);
+    let nah = dag.params.get("NAH").copied().unwrap_or(32);
+    let nkh = dag.params.get("NKH").copied().unwrap_or(8);
+    let hdm = dag.params.get("HDM").copied().unwrap_or(64);
+    let id = dag.params.get("ID").copied().unwrap_or(8192);
+
+    let gqa_ratio = nah / nkh;
+    let kv_page_size = 64;
+    let iters_per_page = kv_page_size / 16; // 16-row KV blocks within a page
+    let num_warps = 8;
+    let num_threads = num_warps * 32;
+
+    // Shmem: 2-stage double-buffered KV (K + V per stage) in shmem.
+    // KV tile: st_bf<kv_page_size, head_dim> = 64 * hdm * 2 bytes.
+    let kv_tile_bytes = kv_page_size * hdm * 2;
+    let stage_bytes = kv_tile_bytes * 2; // K + V per stage
+    let total_shmem = stage_bytes * 2; // 2 stages
+
+    // Preamble
+    writeln!(
+        out,
+        "// GENERATED: Fused prefill attention kernel (no KVM protocol)"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "// Grid: ceil(num_prefill_tokens/16) * NKH CTAs, GQA_RATIO={gqa_ratio} warps per CTA"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#define SM89_NUM_LAYERS             {nl}").unwrap();
+    writeln!(out, "#define SM89_HIDDEN_DIM             {hd}").unwrap();
+    writeln!(out, "#define SM89_INTERMEDIATE_DIM       {id}").unwrap();
+    writeln!(out, "#define SM89_HEAD_DIM               {hdm}").unwrap();
+    writeln!(out, "#define SM89_NUM_ATTENTION_HEADS    {nah}").unwrap();
+    writeln!(out, "#define SM89_NUM_KV_HEADS           {nkh}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#include \"llama_sm89.cuh\"").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "using namespace kittens;").unwrap();
+    writeln!(out, "using namespace kittens::prototype::vm;").unwrap();
+    writeln!(out, "using globals = llama_sm89_globals;").unwrap();
+    writeln!(out).unwrap();
+
+    // Constants
+    writeln!(out, "constexpr int PF_NUM_WARPS = {num_warps};").unwrap();
+    writeln!(out, "constexpr int PF_GQA_RATIO = {gqa_ratio};").unwrap();
+    writeln!(out, "constexpr int PF_KV_PAGE_SIZE = {kv_page_size};").unwrap();
+    writeln!(out, "constexpr int PF_ITERS_PER_PAGE = {iters_per_page};").unwrap();
+    writeln!(out, "constexpr int PF_HEAD_DIM = {hdm};").unwrap();
+    writeln!(out, "constexpr int PF_SHMEM = {total_shmem};").unwrap();
+    writeln!(out, "constexpr int PF_KV_TILE_BYTES = {kv_tile_bytes};").unwrap();
+    writeln!(out, "constexpr int PF_Q_ROWS = 16;  // Q tokens per CTA").unwrap();
+    writeln!(out).unwrap();
+
+    // TK tile types for prefill attention
+    writeln!(out, "using pf_q_st  = st_bf<PF_Q_ROWS, PF_HEAD_DIM>;").unwrap();
+    writeln!(out, "using pf_kv_st = st_bf<PF_KV_PAGE_SIZE, PF_HEAD_DIM>;").unwrap();
+    writeln!(out, "using pf_q_rt  = rt_bf<PF_Q_ROWS, PF_HEAD_DIM>;").unwrap();
+    writeln!(out, "using pf_k_rt  = rt_bf<PF_KV_PAGE_SIZE, PF_HEAD_DIM>;").unwrap();
+    writeln!(
+        out,
+        "using pf_v_rt  = rt_bf<PF_KV_PAGE_SIZE, PF_HEAD_DIM, col_l>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "using pf_score_fl = rt_fl<PF_Q_ROWS, PF_KV_PAGE_SIZE>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "using pf_score_bf = rt_bf<PF_Q_ROWS, PF_KV_PAGE_SIZE>;"
+    )
+    .unwrap();
+    writeln!(out, "using pf_o_rt  = rt_fl<PF_Q_ROWS, PF_HEAD_DIM>;").unwrap();
+    writeln!(out, "using pf_o_bf  = rt_bf<PF_Q_ROWS, PF_HEAD_DIM>;").unwrap();
+    writeln!(
+        out,
+        "using pf_max_rv = col_vec<rt_fl<PF_Q_ROWS, PF_HEAD_DIM>>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "using pf_norm_rv = col_vec<rt_fl<PF_Q_ROWS, PF_HEAD_DIM>>;"
+    )
+    .unwrap();
+    writeln!(out, "using pf_o_sv  = sv_bf<PF_HEAD_DIM>;").unwrap();
+    writeln!(out).unwrap();
+
+    // cp.async helper
+    writeln!(
+        out,
+        "__device__ static inline void pf_cp_async_wait_all() {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    asm volatile(\"cp.async.wait_all;\\n\"     ::: \"memory\");"
+    )
+    .unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // ── The kernel ──
+    writeln!(out, "__global__ void __launch_bounds__({num_threads}, 1)").unwrap();
+    writeln!(
+        out,
+        "fused_prefill_attn(const globals g, int batch_size, int num_layers) {{"
+    )
+    .unwrap();
+    writeln!(out, "    const int wid = kittens::warpid();").unwrap();
+    writeln!(out, "    const int lid = kittens::laneid();").unwrap();
+    writeln!(out, "    extern __shared__ char __shm[];").unwrap();
+    writeln!(out, "    const int layer = 0;  // Phase 1: single layer").unwrap();
+    writeln!(out).unwrap();
+
+    // Grid mapping: blockIdx.x = q_block * NKH + kv_head
+    writeln!(out, "    const int kv_head = blockIdx.x % {nkh};").unwrap();
+    writeln!(out, "    const int q_block_idx = blockIdx.x / {nkh};").unwrap();
+    writeln!(out).unwrap();
+
+    // Only GQA_RATIO warps are active
+    writeln!(out, "    if (wid >= PF_GQA_RATIO) return;").unwrap();
+    writeln!(out, "    const int q_head = kv_head * PF_GQA_RATIO + wid;").unwrap();
+    writeln!(out).unwrap();
+
+    // Prefill metadata: find sequence info
+    // For Phase 1, assume single sequence (seq_idx=0)
+    writeln!(out, "    // Prefill metadata — single sequence for now").unwrap();
+    writeln!(out, "    const int seq_idx = 0;").unwrap();
+    writeln!(
+        out,
+        "    const int q_start = g.prefill_qo_indptr[{{seq_idx}}];"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    const int q_end = g.prefill_qo_indptr[{{seq_idx + 1}}];"
+    )
+    .unwrap();
+    writeln!(out, "    const int q_size = q_end - q_start;").unwrap();
+    writeln!(out).unwrap();
+
+    // This CTA's Q rows
+    writeln!(out, "    const int rel_q_row = PF_Q_ROWS * q_block_idx;").unwrap();
+    writeln!(
+        out,
+        "    const int rel_q_row_last = min(rel_q_row + PF_Q_ROWS - 1, q_size - 1);"
+    )
+    .unwrap();
+    writeln!(out, "    if (rel_q_row >= q_size) return;  // CTA past end").unwrap();
+    writeln!(out, "    const int abs_q_row = rel_q_row + q_start;").unwrap();
+    writeln!(out).unwrap();
+
+    // KV paging info
+    writeln!(
+        out,
+        "    const int kv_indptr_start = g.prefill_kv_indptr[{{seq_idx}}];"
+    )
+    .unwrap();
+    // sequence_length = total number of KV tokens up to and including last Q row in this block
+    // For causal attention: the last Q row in the block can attend to positions 0..rel_q_row_last
+    writeln!(
+        out,
+        "    const int sequence_length = rel_q_row_last + 1;  // causal: attend up to last Q pos"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    const int attn_pages = (sequence_length + PF_KV_PAGE_SIZE - 1) / PF_KV_PAGE_SIZE;"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+
+    // Shmem layout: 2-stage double-buffered K + V
+    writeln!(out, "    // 2-stage double-buffered KV in shmem").unwrap();
+    writeln!(
+        out,
+        "    pf_kv_st &K_s0 = *reinterpret_cast<pf_kv_st*>(__shm);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    pf_kv_st &V_s0 = *reinterpret_cast<pf_kv_st*>(__shm + PF_KV_TILE_BYTES);"
+    )
+    .unwrap();
+    let stage_sz = kv_tile_bytes * 2;
+    writeln!(
+        out,
+        "    pf_kv_st &K_s1 = *reinterpret_cast<pf_kv_st*>(__shm + {stage_sz});"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    pf_kv_st &V_s1 = *reinterpret_cast<pf_kv_st*>(__shm + {stage_sz} + PF_KV_TILE_BYTES);"
+    )
+    .unwrap();
+    writeln!(out, "    pf_kv_st *K_stages[2] = {{&K_s0, &K_s1}};").unwrap();
+    writeln!(out, "    pf_kv_st *V_stages[2] = {{&V_s0, &V_s1}};").unwrap();
+    writeln!(out).unwrap();
+
+    // Load Q from q_post into registers
+    // Q layout: q_post[abs_q_row + local_row, q_head * head_dim ... (q_head+1) * head_dim]
+    // Each warp loads 16 rows for its own Q head using cp.async
+    writeln!(out, "    // ── Load Q via cp.async ──").unwrap();
+    writeln!(out, "    pf_q_st &Q_smem = *reinterpret_cast<pf_q_st*>(__shm);  // reuse stage 0 K area temporarily").unwrap();
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "        using T = bf16;").unwrap();
+    writeln!(
+        out,
+        "        constexpr int elem_per_cp = sizeof(float4) / sizeof(T);  // 8"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        constexpr int lanes_per_row = PF_HEAD_DIM / elem_per_cp;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        constexpr int rows_per_iter = 32 / lanes_per_row;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        auto *src_ptr = (T*)&g.q_post_rope[coord<>{{abs_q_row, q_head * PF_HEAD_DIM}}];"
+    )
+    .unwrap();
+    writeln!(out, "        uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&Q_smem.data[0]));").unwrap();
+    writeln!(
+        out,
+        "        for (int ri = 0; ri < (PF_Q_ROWS + rows_per_iter - 1) / rows_per_iter; ri++) {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            int row = ri * rows_per_iter + lid / lanes_per_row;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            int col = (lid % lanes_per_row) * elem_per_cp;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            if (row < PF_Q_ROWS && (abs_q_row + row) <= (q_start + rel_q_row_last)) {{"
+    )
+    .unwrap();
+    // Q stride: num_attention_heads * head_dim = hidden_dim per row
+    writeln!(
+        out,
+        "                asm volatile(\"cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\\n\" ::"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                    \"r\"(Q_smem.idx(dst_ptr, {{row, col}})),"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                    \"l\"(&src_ptr[row * {nah} * PF_HEAD_DIM + col]) : \"memory\");"
+    )
+    .unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(
+        out,
+        "        asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+
+    // Load Q into registers
+    writeln!(out, "    pf_q_rt Q_reg;").unwrap();
+    writeln!(out, "    warp::load(Q_reg, Q_smem);").unwrap();
+    writeln!(
+        out,
+        "    __syncthreads();  // safe to reuse shmem for KV now"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+
+    // Flash attention state
+    writeln!(out, "    // ── Flash attention state ──").unwrap();
+    writeln!(out, "    pf_o_rt O_reg;").unwrap();
+    writeln!(
+        out,
+        "    pf_max_rv max_vec, scaled_max, last_scaled_max, diff_scaled_max;"
+    )
+    .unwrap();
+    writeln!(out, "    pf_norm_rv norm_vec;").unwrap();
+    writeln!(out, "    warp::neg_infty(max_vec);").unwrap();
+    writeln!(out, "    warp::zero(last_scaled_max);").unwrap();
+    writeln!(out, "    warp::zero(norm_vec);").unwrap();
+    writeln!(out, "    warp::zero(O_reg);").unwrap();
+    writeln!(
+        out,
+        "    float softmax_temp = g.attn_scale * 1.44269504089f;"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+
+    // KV page loop with 2-stage double-buffering
+    writeln!(out, "    // ── KV page loop (FlashAttention-2) ──").unwrap();
+    writeln!(out, "    for (int page = 0; page < attn_pages; page++) {{").unwrap();
+    writeln!(out, "        int stage = page % 2;").unwrap();
+    writeln!(out, "        pf_kv_st &K_smem = *K_stages[stage];").unwrap();
+    writeln!(out, "        pf_kv_st &V_smem = *V_stages[stage];").unwrap();
+    writeln!(out).unwrap();
+
+    // Load K and V from paged cache via raw cp.async
+    // Cache layout: [nl*np, ipp, nkh, hd] — same as decode
+    writeln!(out, "        // Load K/V from paged cache via cp.async").unwrap();
+    writeln!(
+        out,
+        "        int kv_page_index = g.prefill_kv_indices[{{kv_indptr_start + page}}];"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        int page_batch = (int)g.num_pages * layer + kv_page_index;"
+    )
+    .unwrap();
+    writeln!(out, "        {{").unwrap();
+    writeln!(out, "            using T = bf16;").unwrap();
+    writeln!(out, "            constexpr int nkh = {nkh};").unwrap();
+    writeln!(out, "            constexpr int hd = PF_HEAD_DIM;").unwrap();
+    writeln!(out, "            constexpr int ipp = PF_ITERS_PER_PAGE;").unwrap();
+    writeln!(
+        out,
+        "            constexpr int elem_per_cp = sizeof(float4) / sizeof(T);  // 8"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            constexpr int lanes_per_row = hd / elem_per_cp;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            constexpr int rows_per_iter = 32 / lanes_per_row;"
+    )
+    .unwrap();
+    writeln!(out, "            T *k_base = (T*)g.k_cache.raw_ptr;").unwrap();
+    writeln!(out, "            T *v_base = (T*)g.v_cache.raw_ptr;").unwrap();
+    writeln!(out, "            uint32_t k_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&K_smem.data[0]));").unwrap();
+    writeln!(out, "            uint32_t v_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&V_smem.data[0]));").unwrap();
+    writeln!(
+        out,
+        "            for (int ri = 0; ri < (PF_KV_PAGE_SIZE + rows_per_iter - 1) / rows_per_iter; ri++) {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                int row = ri * rows_per_iter + lid / lanes_per_row;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                int col = (lid % lanes_per_row) * elem_per_cp;"
+    )
+    .unwrap();
+    writeln!(out, "                if (row < PF_KV_PAGE_SIZE) {{").unwrap();
+    writeln!(
+        out,
+        "                    long src_off = ((long)page_batch * ipp + row) * nkh * hd + (long)kv_head * hd + col;"
+    )
+    .unwrap();
+    writeln!(out, "                    asm volatile(").unwrap();
+    writeln!(
+        out,
+        "                        \"cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\\n\" ::"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                        \"r\"(K_smem.idx(k_smem, {{row, col}})),"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                        \"l\"(&k_base[src_off]) : \"memory\");"
+    )
+    .unwrap();
+    writeln!(out, "                    asm volatile(").unwrap();
+    writeln!(
+        out,
+        "                        \"cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\\n\" ::"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                        \"r\"(V_smem.idx(v_smem, {{row, col}})),"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                        \"l\"(&v_base[src_off]) : \"memory\");"
+    )
+    .unwrap();
+    writeln!(out, "                }}").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        pf_cp_async_wait_all();").unwrap();
+    writeln!(out, "        __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+
+    // Q @ K^T
+    writeln!(out, "        pf_k_rt K_reg;").unwrap();
+    writeln!(out, "        warp::load(K_reg, K_smem);").unwrap();
+    writeln!(out, "        pf_score_fl attn_fl;").unwrap();
+    writeln!(out, "        warp::zero(attn_fl);").unwrap();
+    writeln!(
+        out,
+        "        warp::mma_ABt(attn_fl, Q_reg, K_reg, attn_fl);"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+
+    // Causal masking — position-dependent for prefill
+    // For each Q row r (rel_q_row + r), mask KV positions > (rel_q_row + r)
+    // KV positions for this page start at page * kv_page_size
+    writeln!(out, "        // Causal masking").unwrap();
+    writeln!(out, "        int kv_pos_start = page * PF_KV_PAGE_SIZE;").unwrap();
+    writeln!(
+        out,
+        "        int kv_pos_end = (page + 1) * PF_KV_PAGE_SIZE;"
+    )
+    .unwrap();
+    writeln!(out, "        {{").unwrap();
+    writeln!(
+        out,
+        "            int q_pos_base = rel_q_row;  // first Q position in this block"
+    )
+    .unwrap();
+    writeln!(out, "            warp::apply(attn_fl, attn_fl,").unwrap();
+    writeln!(
+        out,
+        "                [kv_pos_start, q_pos_base] __device__(int row, int col, float val) {{"
+    )
+    .unwrap();
+    writeln!(out, "                    int kv_pos = kv_pos_start + col;").unwrap();
+    writeln!(out, "                    int q_pos = q_pos_base + row;").unwrap();
+    writeln!(
+        out,
+        "                    return (kv_pos > q_pos) ? -999999999999.f : val;"
+    )
+    .unwrap();
+    writeln!(out, "                }});").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Also mask out-of-bounds KV positions on last page
+    writeln!(out, "        if (page == attn_pages - 1) {{").unwrap();
+    writeln!(
+        out,
+        "            int valid_kv = sequence_length - page * PF_KV_PAGE_SIZE;"
+    )
+    .unwrap();
+    writeln!(out, "            if (valid_kv < PF_KV_PAGE_SIZE) {{").unwrap();
+    writeln!(out, "                warp::apply(attn_fl, attn_fl,").unwrap();
+    writeln!(
+        out,
+        "                    [valid_kv] __device__(int row, int col, float val) {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                        return (col >= valid_kv) ? -999999999999.f : val;"
+    )
+    .unwrap();
+    writeln!(out, "                    }});").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Online softmax
+    writeln!(out, "        // Online softmax").unwrap();
+    writeln!(out, "        warp::row_max(max_vec, attn_fl, max_vec);").unwrap();
+    writeln!(out, "        warp::mul(attn_fl, attn_fl, softmax_temp);").unwrap();
+    writeln!(out, "        warp::mul(scaled_max, max_vec, softmax_temp);").unwrap();
+    writeln!(out, "        warp::sub_row(attn_fl, attn_fl, scaled_max);").unwrap();
+    writeln!(out, "        warp::exp2(attn_fl, attn_fl);").unwrap();
+    writeln!(
+        out,
+        "        warp::sub(diff_scaled_max, last_scaled_max, scaled_max);"
+    )
+    .unwrap();
+    writeln!(out, "        warp::exp2(diff_scaled_max, diff_scaled_max);").unwrap();
+    writeln!(out, "        warp::mul_row(O_reg, O_reg, diff_scaled_max);").unwrap();
+    writeln!(out).unwrap();
+
+    // Load V and accumulate
+    writeln!(out, "        pf_v_rt V_reg;").unwrap();
+    writeln!(out, "        warp::load(V_reg, V_smem);").unwrap();
+    writeln!(out, "        pf_score_bf attn_bf;").unwrap();
+    writeln!(out, "        warp::copy(attn_bf, attn_fl);").unwrap();
+    writeln!(out, "        warp::mma_AB(O_reg, attn_bf, V_reg, O_reg);").unwrap();
+    writeln!(out).unwrap();
+
+    // Update norm
+    writeln!(
+        out,
+        "        warp::mul(norm_vec, norm_vec, diff_scaled_max);"
+    )
+    .unwrap();
+    writeln!(out, "        warp::row_sum(norm_vec, attn_fl, norm_vec);").unwrap();
+    writeln!(out, "        warp::copy(last_scaled_max, scaled_max);").unwrap();
+    writeln!(out, "    }}  // end KV page loop").unwrap();
+    writeln!(out).unwrap();
+
+    // Normalize output
+    writeln!(out, "    // ── Normalize and store ──").unwrap();
+    writeln!(out, "    warp::add(norm_vec, norm_vec, 1e-16f);").unwrap();
+    writeln!(out, "    warp::div_row(O_reg, O_reg, norm_vec);").unwrap();
+    writeln!(out).unwrap();
+
+    // Store output: register → shmem (warp::store) → global (raw copy)
+    writeln!(out, "    pf_o_bf O_bf;").unwrap();
+    writeln!(out, "    warp::copy(O_bf, O_reg);").unwrap();
+    writeln!(
+        out,
+        "    pf_q_st &O_st = *reinterpret_cast<pf_q_st*>(__shm);"
+    )
+    .unwrap();
+    writeln!(out, "    warp::store(O_st, O_bf);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out).unwrap();
+
+    // Copy 16 rows from shmem st_bf to global attn_out
+    writeln!(out, "    {{").unwrap();
+    writeln!(
+        out,
+        "        uint32_t src_base = static_cast<uint32_t>(__cvta_generic_to_shared(&O_st.data[0]));"
+    )
+    .unwrap();
+    writeln!(out, "        for (int row = 0; row < PF_Q_ROWS; row++) {{").unwrap();
+    writeln!(
+        out,
+        "            if (abs_q_row + row > q_start + rel_q_row_last) break;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            auto *dst = (bf16*)&g.attn_out[coord<>{{abs_q_row + row, q_head * PF_HEAD_DIM}}];"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            for (int i = lid; i < PF_HEAD_DIM; i += 32) {{"
+    )
+    .unwrap();
+    // st_bf::idx returns a byte offset from the base shared pointer
+    writeln!(
+        out,
+        "                bf16 val; move<bf16>::lds(val, O_st.idx(src_base, {{row, i}}));"
+    )
+    .unwrap();
+    writeln!(out, "                dst[i] = val;").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}  // end fused_prefill_attn").unwrap();
+    writeln!(out).unwrap();
+
+    // ── Launch wrapper ──
+    emit_tensor_arg_and_globals_helper(&mut out);
+    writeln!(out, "extern \"C\" int fused_prefill_attn_launch(").unwrap();
+    writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "  try {{").unwrap();
+    emit_globals_construction(&mut out, "    ");
+    writeln!(out).unwrap();
+    writeln!(out, "    int shmem = PF_SHMEM;").unwrap();
+    writeln!(
+        out,
+        "    auto err = cudaFuncSetAttribute(fused_prefill_attn,"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);"
+    )
+    .unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
+    writeln!(out).unwrap();
+    // Grid: ceil(num_prefill_tokens / 16) * NKH
+    writeln!(
+        out,
+        "    int q_blocks = (num_prefill_tokens + PF_Q_ROWS - 1) / PF_Q_ROWS;"
+    )
+    .unwrap();
+    writeln!(out, "    int grid = q_blocks * {nkh};").unwrap();
+    writeln!(
+        out,
+        "    fused_prefill_attn<<<grid, {num_threads}, shmem, (cudaStream_t)stream>>>("
+    )
+    .unwrap();
+    writeln!(out, "        g, batch_size, num_layers);").unwrap();
+    writeln!(out, "    err = cudaGetLastError();").unwrap();
+    writeln!(out, "    return (int)err;").unwrap();
+    writeln!(out, "  }} catch (...) {{ return -2; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    out
+}
+
 /// List all op names that can be used with `generate_single_op_kernel`.
 pub fn available_op_names() -> Vec<&'static str> {
     vec![
@@ -7380,6 +8012,52 @@ mod tests {
         assert!(
             cuda.contains("blockIdx.x") || cuda.contains("bid"),
             "missing tile partitioning"
+        );
+    }
+
+    #[test]
+    fn generates_fused_prefill() {
+        let input: proc_macro2::TokenStream = quote::quote! {
+            kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                    let qkv = gemm(normed, qkv_weights[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                    let gate = silu(gemm(normed2, gate_weights[layer]));
+                    let up = gemm(normed2, up_weights[layer]);
+                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                }
+                let normed = rmsnorm(hidden_states, lm_head_norm);
+                logits = gemm(normed, lm_head);
+            }
+        };
+        let def: crate::parse::MegakernelDef = syn::parse2(input).expect("parse");
+        let dag = crate::parse::build_dag(&def).expect("dag");
+        let cuda = generate_fused_prefill_kernel(&dag);
+
+        // Has kernel and launch wrapper
+        assert!(
+            cuda.contains("fused_prefill_attn("),
+            "missing kernel function"
+        );
+        assert!(
+            cuda.contains("fused_prefill_attn_launch("),
+            "missing launch wrapper"
+        );
+        // Has FlashAttention-2 components
+        assert!(cuda.contains("pf_score_fl"), "missing score tile type");
+        assert!(cuda.contains("warp::mma_ABt"), "missing Q@K^T");
+        assert!(cuda.contains("warp::mma_AB"), "missing attn@V");
+        assert!(cuda.contains("warp::exp2"), "missing softmax exp2");
+        // Has causal masking
+        assert!(cuda.contains("kv_pos > q_pos"), "missing causal mask");
+        // Has paged KV loading
+        assert!(
+            cuda.contains("prefill_kv_indices"),
+            "missing paged KV metadata"
         );
     }
 }

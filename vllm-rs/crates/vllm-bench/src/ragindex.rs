@@ -1,85 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! `vllm bench ragindex` — LEANN retrieval + span query permutation benchmark.
+//! `vllm bench ragindex` — end-to-end LEANN RAG benchmark.
 //!
-//! Exercises the full RAG pipeline: document indexing via LEANN, vector
-//! retrieval, and span-based KV cache reuse. For each query from a
-//! selectable dataset (hotpotqa, multihop, musique, msmarco), documents are
-//! indexed, top-k fragments retrieved, then permuted across orderings.
-//!
-//! Two modes are compared:
-//! 1. **Plain** — `llm.chat()`, fragments inlined in order, full prefill
-//!    each time (cache reset per permutation).
-//! 2. **Spans** — `llm.execute_query()` with `cross` + `plus`, fragments
-//!    as relocatable blocks. KV cache reuse across permutations.
-//!
-//! Reports accuracy (should be identical across orderings) and latency
-//! (spans should be flat, plain varies).
+//! Exercises the full RAG pipeline: corpus indexing via LEANN, vector
+//! retrieval, and LLM generation via SPNL span queries. For each query
+//! from a selectable dataset (hotpotqa, multihop, musique, msmarco), an
+//! `Augment` SPNL node indexes the corpus (once), retrieves top-k fragments,
+//! and generates an answer. Reports running and final accuracy, F1, and
+//! latency statistics.
 
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 use anyhow::Result;
-#[cfg(feature = "rag")]
 use indicatif::{ProgressBar, ProgressStyle};
 #[cfg(feature = "rag")]
 use spnl_core::ir::{Augment, Document};
 use spnl_core::ir::{Generate, GenerateMetadata, Message, Query as SpnlQuery};
 use vllm_config::{CudaGraphConfig, CudaGraphMode};
-use vllm_serve::llm::{ChatMessage, LLM, LLMBuilder, SamplingParams};
+use vllm_serve::llm::{LLM, LLMBuilder, SamplingParams};
 
 use crate::args::BenchRagindexArgs;
-use crate::datasets::{best_token_f1, evaluate_accuracy, fetch_rag_dataset, permutations};
+use crate::datasets::{QueryMode, best_token_f1, evaluate_accuracy, fetch_rag_dataset};
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RST: &str = "\x1b[0m";
-const BLOCK: char = '\u{2588}'; // █
-
-// ANSI 256-color palette for up to 12 distinct fragments.
-const FRAG_COLORS: &[&str] = &[
-    "\x1b[38;5;196m", // red
-    "\x1b[38;5;46m",  // green
-    "\x1b[38;5;33m",  // blue
-    "\x1b[38;5;226m", // yellow
-    "\x1b[38;5;201m", // magenta
-    "\x1b[38;5;51m",  // cyan
-    "\x1b[38;5;208m", // orange
-    "\x1b[38;5;129m", // purple
-    "\x1b[38;5;82m",  // lime
-    "\x1b[38;5;197m", // pink
-    "\x1b[38;5;39m",  // sky blue
-    "\x1b[38;5;214m", // gold
-];
-
-/// Render a permutation as color-coded block characters.
-fn render_perm(perm: &[usize]) -> String {
-    let mut s = String::new();
-    for &idx in perm {
-        s.push_str(FRAG_COLORS[idx % FRAG_COLORS.len()]);
-        s.push(BLOCK);
-        s.push(BLOCK);
-    }
-    s.push_str(RST);
-    s
-}
-
-/// Render the fragment legend.
-fn render_legend(n_frags: usize) -> String {
-    let mut s = String::new();
-    for i in 0..n_frags {
-        if i > 0 {
-            s.push_str("  ");
-        }
-        s.push_str(&format!(
-            "Frag {i}={}{}{}",
-            FRAG_COLORS[i % FRAG_COLORS.len()],
-            BLOCK,
-            RST
-        ));
-    }
-    s
-}
 
 // ---------------------------------------------------------------------------
 // LLM construction
@@ -123,15 +71,150 @@ fn build_llm(args: &BenchRagindexArgs) -> Result<LLM> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-query results
+// Running statistics
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct PermResult {
-    acc: f64,
-    f1: f64,
-    ttft_ms: f64,
-    total_ms: f64,
+struct RunningStats {
+    accs: Vec<f64>,
+    f1s: Vec<f64>,
+    latencies_ms: Vec<f64>,
+    total_prompt_tokens: u64,
+    total_cached_tokens: u64,
+}
+
+impl RunningStats {
+    fn new(capacity: usize) -> Self {
+        Self {
+            accs: Vec::with_capacity(capacity),
+            f1s: Vec::with_capacity(capacity),
+            latencies_ms: Vec::with_capacity(capacity),
+            total_prompt_tokens: 0,
+            total_cached_tokens: 0,
+        }
+    }
+
+    fn push(&mut self, acc: f64, f1: f64, ms: f64, prompt_tokens: u32, cached_tokens: u32) {
+        self.accs.push(acc);
+        self.f1s.push(f1);
+        self.latencies_ms.push(ms);
+        self.total_prompt_tokens += prompt_tokens as u64;
+        self.total_cached_tokens += cached_tokens as u64;
+    }
+
+    fn cache_pct(&self) -> f64 {
+        if self.total_prompt_tokens == 0 {
+            0.0
+        } else {
+            self.total_cached_tokens as f64 / self.total_prompt_tokens as f64 * 100.0
+        }
+    }
+
+    fn n(&self) -> usize {
+        self.accs.len()
+    }
+
+    fn avg_acc(&self) -> f64 {
+        self.accs.iter().sum::<f64>() / self.n().max(1) as f64
+    }
+
+    fn avg_f1(&self) -> f64 {
+        self.f1s.iter().sum::<f64>() / self.n().max(1) as f64
+    }
+
+    fn avg_ms(&self) -> f64 {
+        self.latencies_ms.iter().sum::<f64>() / self.n().max(1) as f64
+    }
+
+    fn p50_ms(&self) -> f64 {
+        percentile_of(&self.latencies_ms, 50.0)
+    }
+
+    fn p99_ms(&self) -> f64 {
+        percentile_of(&self.latencies_ms, 99.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block overlap tracker — measures potential KV cache reuse
+// ---------------------------------------------------------------------------
+
+/// Tracks token-block hashes across queries to measure how many blocks
+/// *could* be reused if the cache worked perfectly. Hashes each block's
+/// tokens with a fixed parent (like relocatable blocks), so any two queries
+/// sharing the same token block will match.
+struct BlockOverlapTracker {
+    block_size: usize,
+    seen: HashSet<u64>,
+    total_blocks: u64,
+    reusable_blocks: u64,
+}
+
+impl BlockOverlapTracker {
+    fn new(block_size: usize) -> Self {
+        Self {
+            block_size,
+            seen: HashSet::new(),
+            total_blocks: 0,
+            reusable_blocks: 0,
+        }
+    }
+
+    /// Record blocks from a query's prompt tokens. Returns the number of
+    /// blocks that were seen in a previous query (potential reuse).
+    fn record(&mut self, prompt_tokens: &[u32]) -> u64 {
+        let mut reused = 0u64;
+        for chunk in prompt_tokens.chunks(self.block_size) {
+            if chunk.len() < self.block_size {
+                break; // skip partial trailing block
+            }
+            self.total_blocks += 1;
+            let hash = hash_block(chunk);
+            if !self.seen.insert(hash) {
+                // Already seen in a previous query
+                reused += 1;
+                self.reusable_blocks += 1;
+            }
+        }
+        reused
+    }
+
+    fn potential_pct(&self) -> f64 {
+        if self.total_blocks == 0 {
+            0.0
+        } else {
+            self.reusable_blocks as f64 / self.total_blocks as f64 * 100.0
+        }
+    }
+
+    fn unique_blocks(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+/// Hash a block's tokens the same way the scheduler does for relocatable
+/// blocks (parent = NONE_HASH = 0).
+fn hash_block(tokens: &[u32]) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    0u64.hash(&mut hasher); // NONE_HASH parent
+    tokens.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn percentile_of(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let rank = (p / 100.0) * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let frac = rank - lo as f64;
+        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,336 +243,170 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    let system_prompt = "You are a helpful assistant. Answer the question based only on \
-        the provided context. Be concise — answer with just the entity, date, number, \
-        or fact requested.";
-
     eprintln!();
     eprintln!("{BOLD}vLLM Rust \u{2014} RAG index benchmark{RST}");
     eprintln!("  Dataset:    {dataset_name}");
     eprintln!("  Model:      {model_name}");
     eprintln!("  Embedding:  {embedding_model}");
     eprintln!("  Queries:    {n_queries}");
-    eprintln!("  Max perms:  {}", args.max_perms);
     eprintln!("  Top-k:      {}", args.max_aug);
+    eprintln!("  Mode:       {:?}", args.query_mode);
 
-    // -- Phase 1: Index corpus + retrieve per query --
-    let mut retrieved_fragments: Vec<Vec<String>> = Vec::with_capacity(n_queries);
+    #[cfg(not(feature = "rag"))]
+    {
+        eprintln!();
+        eprintln!("{BOLD}Skipped{RST} (build with --features rag for LEANN indexing)");
+        return Ok(());
+    }
 
     #[cfg(feature = "rag")]
     {
-        // Build a single corpus from all samples' documents.
-        let corpus_filename = format!("{dataset_name}_corpus.txt");
-        let corpus_text: String = {
-            let mut seen = std::collections::HashSet::new();
-            let mut parts = Vec::new();
-            for sample in &samples {
-                for (label, text) in &sample.documents {
-                    if seen.insert(label.clone()) {
-                        parts.push(format!("{label}: {text}"));
-                    }
-                }
-            }
-            parts.join("\n\n")
-        };
-        let corpus_doc = (corpus_filename, Document::Text(corpus_text));
-        let total_docs = {
-            let mut seen = std::collections::HashSet::new();
-            for sample in &samples {
-                for (label, _) in &sample.documents {
-                    seen.insert(label.clone());
-                }
-            }
-            seen.len()
-        };
         if args.force_reindex {
             let aug_defaults = vllm_serve::augment::AugmentOptions::default();
             let _ = std::fs::remove_dir_all(&aug_defaults.index_dir);
         }
 
-        eprintln!();
-        eprintln!("{BOLD}Phase 1: Index + Retrieve{RST}");
+        // Build corpus for LEANN indexing.
+        // Include a content hash in the filename so different -n values
+        // produce different indexes (avoids stale index reuse).
+        let mut doc_labels = std::collections::BTreeSet::new();
+        let mut corpus_parts = Vec::new();
+        for sample in &samples {
+            for (label, text) in &sample.documents {
+                if doc_labels.insert(label.clone()) {
+                    corpus_parts.push(format!("{label}: {text}"));
+                }
+            }
+        }
+        let total_docs = doc_labels.len();
+        let corpus_text = corpus_parts.join("\n\n");
 
-        let pb_style = ProgressStyle::default_bar()
-            .template("  Querying {bar:40.green/green} {pos:>4}/{len} {msg}")
-            .unwrap();
-        let pb = ProgressBar::new(n_queries as u64).with_style(pb_style);
-        let mut query_latencies_ms = Vec::with_capacity(n_queries);
+        let mut hasher = std::hash::DefaultHasher::new();
+        total_docs.hash(&mut hasher);
+        for label in &doc_labels {
+            label.hash(&mut hasher);
+        }
+        let corpus_hash = hasher.finish();
+        let corpus_filename = format!("{dataset_name}_{corpus_hash:016x}_corpus.txt");
+        eprintln!("  Corpus:     {total_docs} documents");
+
+        let corpus_doc = (corpus_filename, Document::Text(corpus_text));
+        let use_spans = args.query_mode == QueryMode::Spans;
+
+        eprintln!();
+        let mut stats = RunningStats::new(n_queries);
+        let mut overlap = BlockOverlapTracker::new(args.block_size);
+        let pb = make_progress_bar(n_queries);
 
         for (qi, sample) in samples.iter().enumerate() {
-            let debug = args.debug && qi == 0;
+            // Both modes use LEANN retrieval via Augment. The difference:
+            // - spans: Plus wraps fragments as relocatable blocks (cache reuse)
+            // - plain: Seq treats fragments as plain sequential tokens (no reuse)
+            let augment = SpnlQuery::Augment(Augment {
+                embedding_model: embedding_model.clone(),
+                body: Box::new(SpnlQuery::Message(Message::User(sample.question.clone()))),
+                doc: corpus_doc.clone(),
+            });
+            let question = SpnlQuery::Message(Message::User(format!(
+                "Based on the above context, answer: {}",
+                sample.question
+            )));
+            let children = vec![augment, question];
 
-            // Each query's Augment points to the same full corpus.
-            // The indexer checks the .ok sentinel and skips after the first call.
-            let augment_query = SpnlQuery::Generate(Generate {
+            let query = SpnlQuery::Generate(Generate {
                 metadata: GenerateMetadata {
                     model: model_name.clone(),
                     max_tokens: Some(args.max_tokens as i32),
                     temperature: Some(0.0),
                 },
-                input: Box::new(SpnlQuery::Plus(vec![
-                    SpnlQuery::Augment(Augment {
-                        embedding_model: embedding_model.clone(),
-                        body: Box::new(SpnlQuery::Message(Message::User(sample.question.clone()))),
-                        doc: corpus_doc.clone(),
-                    }),
-                    SpnlQuery::Message(Message::User(format!(
-                        "Based on the above context, answer: {}",
-                        sample.question
-                    ))),
-                ])),
+                input: Box::new(if use_spans {
+                    SpnlQuery::Plus(children)
+                } else {
+                    SpnlQuery::Seq(children)
+                }),
             });
 
             let start = Instant::now();
-            let result = llm.execute_spnl(augment_query, Some(sampling.clone()), false, false)?;
+            let result = llm.execute_spnl(query, Some(sampling.clone()), false, false)?;
             let ms = start.elapsed().as_secs_f64() * 1000.0;
-            query_latencies_ms.push(ms);
 
-            let response = &result.output().outputs[0].text;
-            if debug {
-                eprintln!("  [debug] query: {}", sample.question);
-                eprintln!("  [debug] response: {response}");
+            let output = result.output();
+            let response = &output.outputs[0].text;
+            let acc = evaluate_accuracy(response, &sample.answers);
+            let f1 = best_token_f1(&sample.answers, response);
+            let prompt_tokens = output.prompt_token_ids.len() as u32;
+            let cached_tokens = output.num_cached_tokens;
+            let reused_blocks = overlap.record(&output.prompt_token_ids);
+            stats.push(acc, f1, ms, prompt_tokens, cached_tokens);
+
+            if args.debug && qi < 3 {
+                pb.suspend(|| {
+                    eprintln!("  {DIM}Q: {}{RST}", sample.question);
+                    eprintln!("  {DIM}A: {response}{RST}");
+                    eprintln!("  {DIM}Expected: {}{RST}", sample.answers.join(" | "));
+                    eprintln!(
+                        "  {DIM}acc={acc:.0} F1={f1:.3} {} reusable_blocks={reused_blocks}{RST}",
+                        fmt_ms(ms)
+                    );
+                });
             }
 
-            // For permutation testing, use the retrieved fragments.
-            let frags: Vec<String> = sample
-                .documents
-                .iter()
-                .take(args.max_aug)
-                .map(|(label, text)| format!("{label}: {text}"))
-                .collect();
-            retrieved_fragments.push(frags);
-
-            let mut sorted = query_latencies_ms.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let p50 = percentile(&sorted, 50.0);
-            let p99 = percentile(&sorted, 99.0);
-            pb.set_message(format!(
-                "{}  p50={}  p99={}",
-                fmt_ms(ms),
-                fmt_ms(p50),
-                fmt_ms(p99)
-            ));
-            pb.inc(1);
+            update_progress(&pb, &stats, &overlap);
         }
         pb.finish_and_clear();
 
-        let total_ms: f64 = query_latencies_ms.iter().sum();
-        let mut sorted = query_latencies_ms;
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p50 = percentile(&sorted, 50.0);
-        let p99 = percentile(&sorted, 99.0);
-        let avg = total_ms / n_queries.max(1) as f64;
-
-        eprintln!(
-            "  Indexed {total_docs} documents, queried {n_queries} times in {BOLD}{}{RST}",
-            fmt_ms(total_ms),
-        );
-        eprintln!(
-            "  Per-query: avg={}  p50={}  p99={}",
-            fmt_ms(avg),
-            fmt_ms(p50),
-            fmt_ms(p99),
-        );
-    }
-
-    #[cfg(not(feature = "rag"))]
-    {
+        // -- Summary --
         eprintln!();
-        eprintln!("{BOLD}Phase 1: Skipped (build with --features rag for LEANN indexing){RST}");
-        for sample in &samples {
-            let frags: Vec<String> = sample
-                .documents
-                .iter()
-                .take(args.max_aug)
-                .map(|(label, text)| format!("{label}: {text}"))
-                .collect();
-            retrieved_fragments.push(frags);
-        }
-    }
-
-    // -- Permutation phase: compare plain vs spans --
-    eprintln!();
-    eprintln!("{BOLD}Phase 2: Permutation comparison{RST}");
-
-    let mut all_plain: Vec<Vec<PermResult>> = Vec::with_capacity(n_queries);
-    let mut all_spans: Vec<Vec<PermResult>> = Vec::with_capacity(n_queries);
-
-    for (qi, sample) in samples.iter().enumerate() {
-        let frags = &retrieved_fragments[qi];
-        let n_frags = frags.len();
-        let perms = permutations(n_frags, args.max_perms);
-
-        // Truncate long questions for display (char-boundary safe).
-        let q_display: String = if sample.question.chars().count() > 60 {
-            let end = sample
-                .question
-                .char_indices()
-                .nth(57)
-                .map_or(sample.question.len(), |(i, _)| i);
-            format!("{}...", &sample.question[..end])
-        } else {
-            sample.question.clone()
-        };
-
-        eprintln!();
-        eprintln!(
-            "  {BOLD}Query {}/{n_queries}{RST}: {DIM}\"{q_display}\"{RST}",
-            qi + 1
+        let mode_label = if use_spans { "Spans" } else { "Plain" };
+        println!("{BOLD}=== RAG Index Benchmark Results ({mode_label}) ==={RST}");
+        println!("  Dataset:  {dataset_name}");
+        println!("  Queries:  {n_queries}");
+        println!(
+            "  Blocks:   {} unique, {:.0}% potential reuse",
+            overlap.unique_blocks(),
+            overlap.potential_pct(),
         );
-        eprintln!("  {}", render_legend(n_frags));
-
-        let mut plain_results = Vec::with_capacity(perms.len());
-        let mut spans_results = Vec::with_capacity(perms.len());
-
-        // --- Plain: chat() with fragments in permuted order ---
-        for perm in &perms {
-            llm.reset_prefix_cache()?;
-
-            let mut msgs = vec![ChatMessage::system(system_prompt)];
-            for &idx in perm {
-                msgs.push(ChatMessage::user(&frags[idx]));
-            }
-            msgs.push(ChatMessage::user(&sample.question));
-
-            let start = Instant::now();
-            let result = llm.chat(&msgs, Some(sampling.clone()))?;
-            let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let ttft_ms = result.ttft_s.map(|s| s * 1000.0).unwrap_or(0.0);
-            let response = &result.outputs[0].text;
-
-            let pr = PermResult {
-                acc: evaluate_accuracy(response, &sample.answers),
-                f1: best_token_f1(&sample.answers, response),
-                ttft_ms,
-                total_ms,
-            };
-
-            eprintln!(
-                "    plain  {}  {BOLD}{:>8}{RST}  acc={:.0}  F1={:.3}",
-                render_perm(perm),
-                fmt_ms(pr.ttft_ms),
-                pr.acc,
-                pr.f1,
-            );
-
-            plain_results.push(pr);
-        }
-
-        // --- Spans: execute_spnl with cross + plus, relocatable ---
-        llm.reset_prefix_cache()?;
-
-        // First, populate the cache with canonical order.
-        {
-            let canonical: Vec<usize> = (0..n_frags).collect();
-            let span_query = build_span_query(
-                &model_name,
-                args.max_tokens as i32,
-                system_prompt,
-                frags,
-                &canonical,
-                &sample.question,
-            );
-            let start = Instant::now();
-            llm.execute_spnl(span_query, Some(sampling.clone()), false, false)?;
-            let ms = start.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
-                "    {DIM}cache  {}  {:>8}  populate{RST}",
-                render_perm(&canonical),
-                fmt_ms(ms),
-            );
-        }
-
-        // Now measure each permutation (should benefit from span cache reuse).
-        for perm in &perms {
-            let span_query = build_span_query(
-                &model_name,
-                args.max_tokens as i32,
-                system_prompt,
-                frags,
-                perm,
-                &sample.question,
-            );
-
-            let start = Instant::now();
-            let results = llm.execute_spnl(span_query, Some(sampling.clone()), false, false)?;
-            let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let ttft_ms = results[0].ttft_s.map(|s| s * 1000.0).unwrap_or(0.0);
-            let response = &results[0].outputs[0].text;
-
-            let pr = PermResult {
-                acc: evaluate_accuracy(response, &sample.answers),
-                f1: best_token_f1(&sample.answers, response),
-                ttft_ms,
-                total_ms,
-            };
-
-            eprintln!(
-                "    spans  {}  {BOLD}{:>8}{RST}  acc={:.0}  F1={:.3}",
-                render_perm(perm),
-                fmt_ms(pr.ttft_ms),
-                pr.acc,
-                pr.f1,
-            );
-
-            spans_results.push(pr);
-        }
-
-        all_plain.push(plain_results);
-        all_spans.push(spans_results);
+        println!();
+        print_stats(mode_label, &stats, &overlap);
+        println!();
     }
-
-    // -- Summary --
-    let flat_plain: Vec<&PermResult> = all_plain.iter().flat_map(|v| v.iter()).collect();
-    let flat_spans: Vec<&PermResult> = all_spans.iter().flat_map(|v| v.iter()).collect();
-
-    let n_total = flat_plain.len();
-    let plain_acc = flat_plain.iter().map(|r| r.acc).sum::<f64>() / n_total as f64;
-    let spans_acc = flat_spans.iter().map(|r| r.acc).sum::<f64>() / n_total as f64;
-    let plain_f1 = flat_plain.iter().map(|r| r.f1).sum::<f64>() / n_total as f64;
-    let spans_f1 = flat_spans.iter().map(|r| r.f1).sum::<f64>() / n_total as f64;
-    let plain_ttft = flat_plain.iter().map(|r| r.ttft_ms).sum::<f64>() / n_total as f64;
-    let spans_ttft = flat_spans.iter().map(|r| r.ttft_ms).sum::<f64>() / n_total as f64;
-    let plain_total = flat_plain.iter().map(|r| r.total_ms).sum::<f64>() / n_total as f64;
-    let spans_total = flat_spans.iter().map(|r| r.total_ms).sum::<f64>() / n_total as f64;
-
-    // Per-query latency variance (to show spans is more stable across perms).
-    let plain_ttft_stddev = per_query_stddev(&all_plain, |r| r.ttft_ms);
-    let spans_ttft_stddev = per_query_stddev(&all_spans, |r| r.ttft_ms);
-
-    eprintln!();
-    println!("{BOLD}=== RAG Index Benchmark Results ==={RST}");
-    println!("  Dataset: {dataset_name}, {n_queries} queries, {n_total} total permutations");
-    println!();
-    println!(
-        "  {BOLD}Plain{RST}:  acc={:.1}%  F1={:.3}  ttft={} \u{00b1}{}  total={}",
-        plain_acc * 100.0,
-        plain_f1,
-        fmt_ms(plain_ttft),
-        fmt_ms(plain_ttft_stddev),
-        fmt_ms(plain_total),
-    );
-    println!(
-        "  {BOLD}Spans{RST}:  acc={:.1}%  F1={:.3}  ttft={} \u{00b1}{}  total={}",
-        spans_acc * 100.0,
-        spans_f1,
-        fmt_ms(spans_ttft),
-        fmt_ms(spans_ttft_stddev),
-        fmt_ms(spans_total),
-    );
-    println!();
-    println!(
-        "  TTFT speedup: {BOLD}{:.2}x{RST}  {DIM}(plain/spans){RST}",
-        plain_ttft / spans_ttft.max(0.001),
-    );
-    println!(
-        "  Latency stability: plain \u{00b1}{} vs spans \u{00b1}{}",
-        fmt_ms(plain_ttft_stddev),
-        fmt_ms(spans_ttft_stddev),
-    );
-    println!();
 
     Ok(())
+}
+
+fn make_progress_bar(n: usize) -> ProgressBar {
+    ProgressBar::new(n as u64).with_style(
+        ProgressStyle::default_bar()
+            .template("  {bar:30.green/green} {pos:>4}/{len}  {msg}")
+            .unwrap(),
+    )
+}
+
+fn update_progress(pb: &ProgressBar, stats: &RunningStats, overlap: &BlockOverlapTracker) {
+    pb.set_message(format!(
+        "acc={:.1}%  F1={:.3}  cache={:.0}%  potential={:.0}%  avg={}  p50={}  p99={}",
+        stats.avg_acc() * 100.0,
+        stats.avg_f1(),
+        stats.cache_pct(),
+        overlap.potential_pct(),
+        fmt_ms(stats.avg_ms()),
+        fmt_ms(stats.p50_ms()),
+        fmt_ms(stats.p99_ms()),
+    ));
+    pb.inc(1);
+}
+
+fn print_stats(label: &str, s: &RunningStats, overlap: &BlockOverlapTracker) {
+    println!(
+        "  {BOLD}{label}{RST}:  acc={BOLD}{:.1}%{RST}  F1={BOLD}{:.3}{RST}  cache={BOLD}{:.0}%{RST}  potential={BOLD}{:.0}%{RST}  avg={}  p50={}  p99={}",
+        s.avg_acc() * 100.0,
+        s.avg_f1(),
+        s.cache_pct(),
+        overlap.potential_pct(),
+        fmt_ms(s.avg_ms()),
+        fmt_ms(s.p50_ms()),
+        fmt_ms(s.p99_ms()),
+    );
 }
 
 /// Format milliseconds as a human-readable duration (e.g. "7.4s", "238ms").
@@ -501,146 +418,15 @@ fn fmt_ms(ms: f64) -> String {
     }
 }
 
-/// Compute the p-th percentile from a pre-sorted slice.
-#[cfg(feature = "rag")]
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let rank = (p / 100.0) * (sorted.len() - 1) as f64;
-    let lo = rank.floor() as usize;
-    let hi = rank.ceil() as usize;
-    if lo == hi {
-        sorted[lo]
-    } else {
-        let frac = rank - lo as f64;
-        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
-    }
-}
-
-/// Build a span query using SPNL structs (cross + plus pattern).
-fn build_span_query(
-    model: &str,
-    max_tokens: i32,
-    system_prompt: &str,
-    frags: &[String],
-    order: &[usize],
-    question: &str,
-) -> SpnlQuery {
-    let passage_nodes: Vec<SpnlQuery> = order
-        .iter()
-        .map(|&idx| SpnlQuery::Message(Message::User(frags[idx].clone())))
-        .collect();
-
-    SpnlQuery::Generate(Generate {
-        metadata: GenerateMetadata {
-            model: model.to_string(),
-            max_tokens: Some(max_tokens),
-            temperature: Some(0.0),
-        },
-        input: Box::new(SpnlQuery::Cross(vec![
-            SpnlQuery::Message(Message::System(system_prompt.to_string())),
-            SpnlQuery::Plus(passage_nodes),
-            SpnlQuery::Message(Message::User(question.to_string())),
-        ])),
-    })
-}
-
-/// Average per-query standard deviation of a metric across permutations.
-fn per_query_stddev(results: &[Vec<PermResult>], f: fn(&PermResult) -> f64) -> f64 {
-    if results.is_empty() {
-        return 0.0;
-    }
-    let mut total_stddev = 0.0;
-    let mut count = 0;
-    for query_results in results {
-        let n = query_results.len() as f64;
-        if n < 2.0 {
-            continue;
-        }
-        let mean = query_results.iter().map(&f).sum::<f64>() / n;
-        let var = query_results
-            .iter()
-            .map(|r| (f(r) - mean).powi(2))
-            .sum::<f64>()
-            / (n - 1.0);
-        total_stddev += var.sqrt();
-        count += 1;
-    }
-    if count > 0 {
-        total_stddev / count as f64
-    } else {
-        0.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn span_query_structure() {
-        let query = build_span_query(
-            "test-model",
-            64,
-            "You are helpful.",
-            &[
-                "Frag A".to_string(),
-                "Frag B".to_string(),
-                "Frag C".to_string(),
-            ],
-            &[2, 0, 1],
-            "What is X?",
-        );
-
-        // Top-level must be Generate.
-        match &query {
-            SpnlQuery::Generate(g) => {
-                assert_eq!(g.metadata.model, "test-model");
-                assert_eq!(g.metadata.max_tokens, Some(64));
-                // Input must be Cross with 3 children.
-                match g.input.as_ref() {
-                    SpnlQuery::Cross(children) => {
-                        assert_eq!(children.len(), 3);
-                        assert!(matches!(
-                            &children[0],
-                            SpnlQuery::Message(Message::System(_))
-                        ));
-                        match &children[1] {
-                            SpnlQuery::Plus(frags) => {
-                                assert_eq!(frags.len(), 3);
-                                // Permuted order: [2, 0, 1] -> ["Frag C", "Frag A", "Frag B"]
-                                assert!(
-                                    matches!(&frags[0], SpnlQuery::Message(Message::User(s)) if s == "Frag C")
-                                );
-                                assert!(
-                                    matches!(&frags[1], SpnlQuery::Message(Message::User(s)) if s == "Frag A")
-                                );
-                                assert!(
-                                    matches!(&frags[2], SpnlQuery::Message(Message::User(s)) if s == "Frag B")
-                                );
-                            }
-                            other => panic!("expected Plus, got {other:?}"),
-                        }
-                        assert!(
-                            matches!(&children[2], SpnlQuery::Message(Message::User(s)) if s == "What is X?")
-                        );
-                    }
-                    other => panic!("expected Cross, got {other:?}"),
-                }
-            }
-            other => panic!("expected Generate, got {other:?}"),
-        }
-
-        // Must also round-trip through serde.
-        let json = serde_json::to_string(&query).unwrap();
-        let parsed: SpnlQuery = serde_json::from_str(&json).expect("should round-trip");
-        assert!(matches!(parsed, SpnlQuery::Generate(_)));
-    }
-
     #[cfg(feature = "rag")]
     #[test]
     fn augment_query_structure() {
+        use spnl_core::ir::{Augment, Document};
+
         let query = SpnlQuery::Generate(Generate {
             metadata: GenerateMetadata {
                 model: "test-model".to_string(),
@@ -674,30 +460,9 @@ mod tests {
             other => panic!("expected Generate, got {other:?}"),
         }
 
-        // Must round-trip through serde.
         let json = serde_json::to_string(&query).unwrap();
         let parsed: SpnlQuery = serde_json::from_str(&json).expect("should round-trip");
         assert!(matches!(parsed, SpnlQuery::Generate(_)));
-    }
-
-    #[test]
-    fn permutations_small() {
-        let perms = permutations(3, 100);
-        assert_eq!(perms.len(), 6); // 3! = 6
-        // All permutations should be unique.
-        let mut sorted = perms.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 6);
-    }
-
-    #[test]
-    fn permutations_sampled() {
-        let perms = permutations(10, 5);
-        assert_eq!(perms.len(), 5);
-        // First should be canonical, second reversed.
-        assert_eq!(perms[0], (0..10).collect::<Vec<_>>());
-        assert_eq!(perms[1], (0..10).rev().collect::<Vec<_>>());
     }
 
     #[test]

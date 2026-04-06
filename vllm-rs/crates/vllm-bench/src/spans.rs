@@ -260,8 +260,6 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    let canonical: Vec<usize> = (0..num_docs).collect();
-
     let spinner_style = ProgressStyle::with_template("  {spinner:.cyan} {msg}")
         .unwrap()
         .tick_strings(&[
@@ -283,8 +281,9 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // Helper: run a sequence of permutations and return per-perm latencies.
-    // First request (canonical) populates cache; remaining are measured.
+    // Helper: run a sequence of permutations from a cold cache and return
+    // per-perm latencies.  No artificial "populate" step — the first query
+    // fills the cache organically, just as real workloads do.
     // -----------------------------------------------------------------------
     let run_perms = |llm: &mut LLM,
                      docs: &[Vec<u32>],
@@ -292,35 +291,13 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
                      query_base_start: u32,
                      label: &str,
                      with_annotations: bool|
-     -> Result<(f64, Vec<f64>)> {
-        // Populate cache with canonical order.
+     -> Result<Vec<f64>> {
         llm.reset_prefix_cache()?;
-        let perm_str = render_perm(&canonical, doc_blocks);
-        let pb = ProgressBar::new_spinner()
-            .with_style(spinner_style.clone())
-            .with_message(format!("{perm_str}  {DIM}populate ({label})...{RST}"));
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        let populate_prompt = build_prompt(
-            docs,
-            &canonical,
-            query_base_start,
-            query_len,
-            block_size,
-            with_annotations,
-        );
-        let pop_start = Instant::now();
-        llm.generate(&[populate_prompt], Some(sampling.clone()))?;
-        let populate_ms = pop_start.elapsed().as_secs_f64() * 1000.0;
-
-        pb.finish_and_clear();
-        eprintln!("    {perm_str}  {BOLD}{populate_ms:>8.1}ms{RST}  {DIM}populate ({label}){RST}");
-
-        // Run each permutation and measure.
         let mut latencies = Vec::with_capacity(perms.len());
         for (pi, perm) in perms.iter().enumerate() {
             let perm_str = render_perm(perm, doc_blocks);
-            let query_base = query_base_start + 1000 + (pi as u32) * 1000;
+            let query_base = query_base_start + (pi as u32) * 1000;
 
             let pb = ProgressBar::new_spinner()
                 .with_style(spinner_style.clone())
@@ -347,7 +324,7 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
             eprintln!("    {perm_str}  {BOLD}{ms:>8.1}ms{RST}  {DIM}{label}{RST}");
             latencies.push(ms);
         }
-        Ok((populate_ms, latencies))
+        Ok(latencies)
     };
 
     // -----------------------------------------------------------------------
@@ -359,11 +336,7 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     eprintln!("{BOLD}Without spans{RST} {DIM}(prefix caching, order-dependent){RST}");
 
     let mut llm = build_llm(&args, true)?;
-    // Skip perms[0] (canonical order) — it's the populate step and would
-    // always cache-hit even without spans, biasing results.
-    let test_perms: Vec<Vec<usize>> = perms.iter().filter(|p| *p != &canonical).cloned().collect();
-    let (no_spans_populate, no_spans_latencies) =
-        run_perms(&mut llm, &docs, &test_perms, 50000, "no spans", false)?;
+    let no_spans_latencies = run_perms(&mut llm, &docs, &perms, 50000, "no spans", false)?;
 
     // -----------------------------------------------------------------------
     // With spans: documents have Relocatable block annotations.
@@ -373,8 +346,7 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     eprintln!();
     eprintln!("{BOLD}With spans{RST} {DIM}(prefix caching, order-independent){RST}");
 
-    let (spans_populate, spans_latencies) =
-        run_perms(&mut llm, &docs, &test_perms, 60000, "spans", true)?;
+    let spans_latencies = run_perms(&mut llm, &docs, &perms, 60000, "spans", true)?;
 
     drop(llm);
 
@@ -382,6 +354,7 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     // Summary
     // -----------------------------------------------------------------------
     // Compute per-permutation speedups: no_spans[i] / spans[i]
+    // First permutation is a cold start for both, so include it — fair comparison.
     let mut speedups: Vec<f64> = no_spans_latencies
         .iter()
         .zip(spans_latencies.iter())
@@ -402,16 +375,10 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     let spans_avg = spans_latencies.iter().sum::<f64>() / spans_latencies.len() as f64;
 
     eprintln!();
-    println!("{BOLD}=== Results ({} perms) ==={RST}", test_perms.len());
+    println!("{BOLD}=== Results ({} perms) ==={RST}", perms.len());
     println!();
-    println!(
-        "  Without spans:  avg {no_spans_avg:>7.1}ms  {DIM}({:.1}x vs populate){RST}",
-        no_spans_populate / no_spans_avg
-    );
-    println!(
-        "  With spans:     avg {spans_avg:>7.1}ms  {DIM}({:.1}x vs populate){RST}",
-        spans_populate / spans_avg
-    );
+    println!("  Without spans:  avg {no_spans_avg:>7.1}ms");
+    println!("  With spans:     avg {spans_avg:>7.1}ms");
     println!();
     println!(
         "  {BOLD}Spans speedup{RST}  min {BOLD}{:.1}x{RST}  p50 {BOLD}{:.1}x{RST}  max {BOLD}{:.1}x{RST}",

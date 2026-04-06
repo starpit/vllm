@@ -224,7 +224,7 @@ impl leann_core::embedding::EmbeddingProvider for HttpEmbeddingProvider {
     ) -> Result<Array2<f32>> {
         // Batch to avoid overwhelming the sidecar with huge payloads.
         const BATCH_SIZE: usize = 32;
-        let n_batches = (chunks.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+        let n_batches = chunks.len().div_ceil(BATCH_SIZE);
         let mut vecs = Vec::with_capacity(chunks.len());
         for (i, batch) in chunks.chunks(BATCH_SIZE).enumerate() {
             tracing::debug!(

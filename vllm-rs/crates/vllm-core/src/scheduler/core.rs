@@ -64,9 +64,10 @@ pub trait KVCacheManagerOps: Send {
     /// Get the number of computed tokens from prefix cache for a new
     /// request.
     ///
-    /// Returns `(num_computed_tokens, block_ids)` where `block_ids` are
-    /// the cached blocks.
-    fn get_computed_blocks(&self, request: &Request) -> (u32, Vec<Vec<usize>>);
+    /// Returns `(num_computed_tokens, total_cached_tokens, block_ids)`.
+    /// `num_computed_tokens` is the contiguous prefix (used to skip prefill).
+    /// `total_cached_tokens` includes non-contiguous relocatable block hits.
+    fn get_computed_blocks(&self, request: &Request) -> (u32, u32, Vec<Vec<usize>>);
 
     /// Notify the KV cache manager that a new scheduling step is starting.
     fn new_step_starts(&mut self);
@@ -261,13 +262,34 @@ impl SimpleBlockTracker {
         let num_full_blocks = all_tokens.len() / self.block_size;
         let mut hashes = Vec::with_capacity(num_full_blocks);
         let mut parent_hash = Self::NONE_HASH;
+        let mut in_relocatable = false;
         for i in 0..num_full_blocks {
             let start = i * self.block_size;
             let end = start + self.block_size;
             let block_tokens = &all_tokens[start..end];
             let tokens_before = &all_tokens[..start];
             let kind = annotations.and_then(|a| a.get(&i).copied());
-            let hash = self.hash_block_with_parent(parent_hash, block_tokens, tokens_before, kind);
+
+            // A Relocatable annotation starts a new relocatable range.
+            // Any other annotation (or the next annotated block) ends it.
+            if kind == Some(BlockKind::Relocatable) {
+                in_relocatable = true;
+            } else if kind.is_some() {
+                in_relocatable = false;
+            }
+
+            let effective_kind = if in_relocatable {
+                Some(BlockKind::Relocatable)
+            } else {
+                kind
+            };
+
+            let hash = self.hash_block_with_parent(
+                parent_hash,
+                block_tokens,
+                tokens_before,
+                effective_kind,
+            );
             parent_hash = hash;
             hashes.push(hash);
         }
@@ -564,9 +586,9 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             .unwrap_or_else(|| vec![Vec::new()])
     }
 
-    fn get_computed_blocks(&self, request: &Request) -> (u32, Vec<Vec<usize>>) {
+    fn get_computed_blocks(&self, request: &Request) -> (u32, u32, Vec<Vec<usize>>) {
         if !self.enable_caching || request.is_pooling {
-            return (0, vec![Vec::new()]);
+            return (0, 0, vec![Vec::new()]);
         }
 
         let all_tokens = &request.all_token_ids;
@@ -595,7 +617,11 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                 hashes.len(),
                 num_matched_tokens,
             );
-            return (num_matched_tokens, vec![matched_block_ids]);
+            return (
+                num_matched_tokens,
+                num_matched_tokens,
+                vec![matched_block_ids],
+            );
         }
 
         // Span-aware path: relocatable blocks can be cached independently,
@@ -624,17 +650,13 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         let contiguous_hits = is_hit.iter().take_while(|&&hit| hit).count();
         let total_hits = is_hit.iter().filter(|&&h| h).count();
         let contiguous_tokens = (contiguous_hits * self.block_size) as u32;
+        let total_cached_tokens = (total_hits * self.block_size) as u32;
 
-        tracing::info!(
-            "[CACHE] req={} spans: {}/{} blocks hit (contiguous: {}), {} computed tokens",
-            request.request_id,
-            total_hits,
-            hashes.len(),
-            contiguous_hits,
+        (
             contiguous_tokens,
-        );
-
-        (contiguous_tokens, vec![matched_block_ids])
+            total_cached_tokens,
+            vec![matched_block_ids],
+        )
     }
 
     fn new_step_starts(&mut self) {
@@ -1280,7 +1302,7 @@ impl SchedulerInterface for Scheduler {
                 let request_id = request.request_id.clone();
 
                 // Get computed blocks from prefix cache.
-                let (num_cached_tokens, _cached_blocks) =
+                let (num_cached_tokens, total_cached_tokens, _cached_blocks) =
                     self.kv_cache.get_computed_blocks(&request);
 
                 // How many tokens need to be scheduled.
@@ -1354,7 +1376,7 @@ impl SchedulerInterface for Scheduler {
                         request.status = RequestStatus::Running;
                         request.num_computed_tokens = num_computed_tokens;
                         if request.num_cached_tokens < 0 {
-                            request.num_cached_tokens = num_computed_tokens as i32;
+                            request.num_cached_tokens = total_cached_tokens as i32;
                         }
 
                         // One clone goes to scheduled list, original goes to running.
@@ -2380,7 +2402,7 @@ mod tests {
         );
 
         // First request: no cache hits.
-        let (cached, _) = tracker.get_computed_blocks(&r1);
+        let (cached, _, _) = tracker.get_computed_blocks(&r1);
         assert_eq!(cached, 0);
 
         // Allocate for r1.
@@ -2411,7 +2433,7 @@ mod tests {
         );
 
         // Should get 32 cached tokens.
-        let (cached2, cached_blocks2) = tracker.get_computed_blocks(&r2);
+        let (cached2, _, cached_blocks2) = tracker.get_computed_blocks(&r2);
         assert_eq!(cached2, 32);
         assert_eq!(cached_blocks2[0].len(), 2);
         assert_eq!(cached_blocks2[0][0], block0);
@@ -2456,7 +2478,7 @@ mod tests {
             0,
             None,
         );
-        let (cached, _) = tracker.get_computed_blocks(&r2);
+        let (cached, _, _) = tracker.get_computed_blocks(&r2);
         assert_eq!(cached, 32, "first 2 blocks should match");
     }
 
@@ -2496,7 +2518,7 @@ mod tests {
             0,
             None,
         );
-        let (cached, _) = tracker.get_computed_blocks(&r2);
+        let (cached, _, _) = tracker.get_computed_blocks(&r2);
         assert_eq!(cached, 0);
     }
 
@@ -2587,7 +2609,7 @@ mod tests {
             0,
             None,
         );
-        let (cached, _) = tracker.get_computed_blocks(&r2);
+        let (cached, _, _) = tracker.get_computed_blocks(&r2);
         assert_eq!(cached, 0);
     }
 
@@ -2633,7 +2655,7 @@ mod tests {
         );
         // Simulate what the scheduler does: get_computed_blocks, then set
         // num_computed_tokens, then allocate.
-        let (cached, _) = tracker.get_computed_blocks(&r2);
+        let (cached, _, _) = tracker.get_computed_blocks(&r2);
         assert_eq!(cached, 32);
         r2.num_computed_tokens = cached;
 
@@ -3257,7 +3279,7 @@ mod tests {
         assert_eq!(tracker.num_cached_blocks(), 4);
 
         // Re-admission: get_computed_blocks should find all 4 cached blocks.
-        let (cached_tokens, cached_blocks) = tracker.get_computed_blocks(&r1);
+        let (cached_tokens, _, cached_blocks) = tracker.get_computed_blocks(&r1);
         assert_eq!(cached_tokens, 64);
         assert_eq!(cached_blocks[0].len(), 4);
         assert_eq!(cached_blocks[0], original_block_ids);
@@ -3576,7 +3598,7 @@ mod tests {
         req2.block_annotations = Some(ann2);
 
         // doc_a's block should be a cache hit (relocatable, same content).
-        let (num_computed, cached_ids) = tracker.get_computed_blocks(&req2);
+        let (num_computed, _, cached_ids) = tracker.get_computed_blocks(&req2);
         assert_eq!(num_computed, 4); // one full block of size 4
         assert!(!cached_ids[0].is_empty());
     }
@@ -3697,7 +3719,7 @@ mod tests {
             None,
         );
 
-        let (num_computed, cached_blocks) = tracker.get_computed_blocks(&outer);
+        let (num_computed, _, cached_blocks) = tracker.get_computed_blocks(&outer);
         assert_eq!(num_computed, 8, "all 8 tokens should be cached");
         assert_eq!(
             cached_blocks[0].len(),
@@ -3802,7 +3824,7 @@ mod tests {
             0,
             None,
         );
-        let (num_computed, cached_ids) = tracker.get_computed_blocks(&req2);
+        let (num_computed, _, cached_ids) = tracker.get_computed_blocks(&req2);
         assert_eq!(num_computed, 4);
         assert!(!cached_ids[0].is_empty());
     }
@@ -3898,7 +3920,7 @@ mod tests {
             None,
         );
 
-        let (num_computed, cached_blocks) = tracker.get_computed_blocks(&outer);
+        let (num_computed, _, cached_blocks) = tracker.get_computed_blocks(&outer);
         assert_eq!(num_computed, 12, "all 12 inner tokens should be cached");
         assert_eq!(
             cached_blocks[0].len(),
@@ -3951,7 +3973,7 @@ mod tests {
             0,
             None,
         );
-        let (num_computed, _) = tracker.get_computed_blocks(&req2);
+        let (num_computed, _, _) = tracker.get_computed_blocks(&req2);
         assert_eq!(num_computed, 4, "only block 0 (full) cached");
     }
 

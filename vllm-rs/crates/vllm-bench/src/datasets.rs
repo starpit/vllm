@@ -42,6 +42,15 @@ pub enum RagDataset {
     Msmarco,
 }
 
+/// Query execution mode for `vllm bench ragindex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum QueryMode {
+    /// Plain chat with gold documents inlined.
+    Plain,
+    /// SPNL span query with LEANN retrieval.
+    Spans,
+}
+
 impl std::fmt::Display for RagDataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -372,52 +381,6 @@ fn fetch_msmarco(num_queries: usize) -> Result<Vec<RagSample>> {
 // ---------------------------------------------------------------------------
 // Permutation generation (reusable)
 // ---------------------------------------------------------------------------
-
-/// Generate permutations of `0..n`, up to `max_perms`.
-/// Uses Heap's algorithm for small n, random sampling for large.
-pub fn permutations(n: usize, max_perms: usize) -> Vec<Vec<usize>> {
-    if n <= 1 {
-        return vec![(0..n).collect()];
-    }
-    let total: usize = (1..=n).product();
-    if total <= max_perms {
-        let mut result = Vec::with_capacity(total);
-        let mut a: Vec<usize> = (0..n).collect();
-        let mut c = vec![0usize; n];
-        result.push(a.clone());
-        let mut i = 0;
-        while i < n {
-            if c[i] < i {
-                if i % 2 == 0 {
-                    a.swap(0, i);
-                } else {
-                    a.swap(c[i], i);
-                }
-                result.push(a.clone());
-                c[i] += 1;
-                i = 0;
-            } else {
-                c[i] = 0;
-                i += 1;
-            }
-        }
-        result
-    } else {
-        use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
-        let mut result = Vec::with_capacity(max_perms);
-        result.push((0..n).collect());
-        result.push((0..n).rev().collect());
-        while result.len() < max_perms {
-            let mut perm: Vec<usize> = (0..n).collect();
-            perm.shuffle(&mut rng);
-            if !result.contains(&perm) {
-                result.push(perm);
-            }
-        }
-        result
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Accuracy evaluation (reusable)

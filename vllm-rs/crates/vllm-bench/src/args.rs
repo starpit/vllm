@@ -5,7 +5,7 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::datasets::RagDataset;
+use crate::datasets::{QueryMode, RagDataset};
 
 /// Container for `bench` subcommands.
 #[derive(Parser, Debug)]
@@ -1574,9 +1574,10 @@ pub struct BenchRagindexArgs {
     #[arg(short = 'n', long, default_value_t = 20)]
     pub num_queries: usize,
 
-    /// Max permutations of fragment order per query.
-    #[arg(long, default_value_t = 6)]
-    pub max_perms: usize,
+    /// Query mode: "plain" (chat with gold documents) or "spans" (SPNL with
+    /// LEANN retrieval).
+    #[arg(long, value_enum, default_value_t = QueryMode::Spans)]
+    pub query_mode: QueryMode,
 
     /// Max tokens for model response.
     #[arg(long, default_value_t = 64)]

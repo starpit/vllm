@@ -21,7 +21,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info};
 
-use spnl_core::ir::{Generate, Message, Query as SpnlQuery};
+use spnl_core::ir::{Generate, GenerateMetadata, Message, Query as SpnlQuery};
 use spnl_core::optimizer::llo::llir::{
     Bulk, NonGenerateInput, Repeat, SingleGenerate, SingleGenerateQuery,
 };
@@ -130,21 +130,31 @@ impl TokenizeState {
         }
     }
 
-    /// Pad `tokens` to the next block boundary (no-op if pad_token is None).
-    fn pad_to_block(&mut self, cfg: &SpanConfig) {
+    /// Align `tokens` to the next block boundary.
+    ///
+    /// If a pad token is configured, pads forward. Otherwise, truncates
+    /// backward to the current block boundary (dropping partial-block tail
+    /// tokens). Truncation is safe for Relocatable fragments because the
+    /// dropped tokens belong to the *previous* fragment's tail — losing a
+    /// few tokens at the seam is far better than destroying all cache reuse.
+    fn align_to_block(&mut self, cfg: &SpanConfig) {
+        let remainder = self.tokens.len() % cfg.block_size;
+        if remainder == 0 {
+            return;
+        }
         if let Some(pad_token) = cfg.pad_token {
-            let remainder = self.tokens.len() % cfg.block_size;
-            if remainder > 0 && remainder < cfg.block_size {
-                let pad_count = cfg.block_size - remainder;
-                self.tokens
-                    .extend(std::iter::repeat_n(pad_token, pad_count));
-            }
+            let pad_count = cfg.block_size - remainder;
+            self.tokens
+                .extend(std::iter::repeat_n(pad_token, pad_count));
+        } else {
+            // Truncate to current block boundary.
+            self.tokens.truncate(self.tokens.len() - remainder);
         }
     }
 
-    /// Pad to block boundary and record an annotation for the next block.
+    /// Align to block boundary and record an annotation for the next block.
     fn annotate_next_block(&mut self, kind: BlockKind, cfg: &SpanConfig) {
-        self.pad_to_block(cfg);
+        self.align_to_block(cfg);
         let block_index = self.tokens.len() / cfg.block_size;
         self.annotations.insert(block_index, kind);
     }
@@ -272,6 +282,7 @@ fn tokenize_input(
         NonGenerateInput::Plus(v) => {
             let prev_in_relocatable = state.in_relocatable;
             for child in v {
+                state.break_consolidation = true;
                 state.annotate_next_block(BlockKind::Relocatable, cfg);
                 state.in_relocatable = true;
                 tokenize_input(child, tokenizer, template, cfg, state)?;
@@ -373,7 +384,7 @@ pub(crate) fn tokenize_map_input(
         cfg,
         &mut state,
     )?;
-    state.pad_to_block(cfg);
+    state.align_to_block(cfg);
     let annotations = if state.annotations.is_empty() {
         None
     } else {
@@ -549,6 +560,8 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
                 .await
                 .map_err(|e| ServeError::Validation(format!("RAG retrieval failed: {e}")))?
         };
+        // HLO: insert prepare completions for Plus children.
+        let query = hlo_insert_prepares(&query);
         return dispatch_spnl_query(state, &query, stream, tokenizer, template, &cfg, block_size)
             .await;
     }
@@ -566,6 +579,82 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
         SingleGenerateQuery::Bulk(Bulk::Map(map)) => {
             execute_map(state, &map, stream, tokenizer, template, &cfg).await
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HLO — copied from spnl-run/src/optimizer/hlo.rs
+// ---------------------------------------------------------------------------
+
+/// Wrap a 1-token inner generate around a fragment (hlo.rs:48-70)
+fn prepare_fragment(m: &SpnlQuery, parent_generate: &Generate) -> SpnlQuery {
+    SpnlQuery::Generate(Generate {
+        metadata: GenerateMetadata {
+            model: parent_generate.metadata.model.clone(),
+            max_tokens: Some(1),
+            temperature: Some(0.0),
+        },
+        input: Box::new(m.clone()),
+    })
+}
+
+/// Wrap a list of queries into a monad (hlo.rs:72-80)
+fn prepare_monad(prepares: Vec<SpnlQuery>) -> Option<SpnlQuery> {
+    if !prepares.is_empty() {
+        Some(SpnlQuery::Monad(SpnlQuery::Plus(prepares).into()))
+    } else {
+        None
+    }
+}
+
+/// Rewrite a Generate's input: find Plus nodes and insert prepares before them.
+/// Non-recursive on the result — each Plus is transformed exactly once.
+fn hlo_rewrite_generate_input(input: &SpnlQuery, g: &Generate) -> SpnlQuery {
+    match input {
+        SpnlQuery::Seq(v) => {
+            let mut out = Vec::new();
+            for child in v {
+                if let SpnlQuery::Plus(fragments) = child {
+                    // Insert Monad(Plus([prepare(f) for f])) before the Plus.
+                    let prepares: Vec<_> = fragments
+                        .iter()
+                        .map(|m| prepare_fragment(m, g))
+                        .collect();
+                    if let Some(monad) = prepare_monad(prepares) {
+                        out.push(monad);
+                    }
+                    out.push(child.clone());
+                } else {
+                    out.push(child.clone());
+                }
+            }
+            SpnlQuery::Seq(out)
+        }
+        SpnlQuery::Plus(fragments) => {
+            // Plus directly as input (not in a Seq): wrap in Seq with prepares.
+            let prepares: Vec<_> = fragments
+                .iter()
+                .map(|m| prepare_fragment(m, g))
+                .collect();
+            SpnlQuery::Seq(
+                [prepare_monad(prepares), Some(input.clone())]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            )
+        }
+        _ => input.clone(),
+    }
+}
+
+/// Top-level HLO: for a Generate with Plus in its input, insert prepares.
+fn hlo_insert_prepares(query: &SpnlQuery) -> SpnlQuery {
+    match query {
+        SpnlQuery::Generate(g) => SpnlQuery::Generate(Generate {
+            metadata: g.metadata.clone(),
+            input: Box::new(hlo_rewrite_generate_input(&g.input, g)),
+        }),
+        _ => query.clone(),
     }
 }
 
@@ -606,6 +695,26 @@ async fn dispatch_spnl_query(
         }
         SpnlQuery::Bulk(spnl_core::ir::Bulk::Map(map)) => {
             execute_map(state, map, stream, tokenizer, template, cfg).await
+        }
+
+        // Monad: execute for side-effect (cache warming), discard output.
+        SpnlQuery::Monad(inner) => {
+            Box::pin(dispatch_spnl_query(
+                state, inner, false, tokenizer, template, cfg, block_size,
+            ))
+            .await?;
+            Ok(Json(serde_json::json!({"monad": true})).into_response())
+        }
+
+        // Plus at top level: execute each child (used by Monad for prepare batches).
+        SpnlQuery::Plus(children) => {
+            for child in children {
+                Box::pin(dispatch_spnl_query(
+                    state, child, false, tokenizer, template, cfg, block_size,
+                ))
+                .await?;
+            }
+            Ok(Json(serde_json::json!({"plus": true})).into_response())
         }
 
         other => Err(ServeError::Validation(format!(
@@ -1086,6 +1195,8 @@ pub(crate) fn execute_spnl_struct_sync(
             .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
         rt.block_on(optimize_augments(&query, aug_options))?
     };
+    // HLO: insert prepare completions for Plus children.
+    let query = hlo_insert_prepares(&query);
     dispatch_spnl_query_sync(
         &query, params, seal, volatile, tokenizer, template, cfg, block_size, generate,
     )
@@ -1240,6 +1351,36 @@ fn dispatch_spnl_query_sync(
             }
             timed_generate("outer", &prompts, Some(sp), seal, volatile, generate)
         }
+        // Monad: execute for side-effect (cache warming), discard output.
+        SpnlQuery::Monad(inner) => {
+            dispatch_spnl_query_sync(
+                inner, None, seal, volatile, tokenizer, template, cfg, block_size, generate,
+            )?;
+            Ok(crate::llm::QueryOutput { steps: Vec::new() })
+        }
+
+        // Plus at top level: batch all Generate children as a single call.
+        SpnlQuery::Plus(children) => {
+            let mut prompts = Vec::new();
+            let sp = vllm_common::SamplingParams {
+                max_tokens: Some(1),
+                temperature: 0.0,
+                ..Default::default()
+            };
+            for child in children {
+                if let SpnlQuery::Generate(g) = child {
+                    let spec = outer_generate_to_single(g);
+                    let span_tok = tokenize_span_query(&spec, tokenizer, template, cfg)
+                        .map_err(|e| anyhow::anyhow!("prepare tokenization failed: {e}"))?;
+                    prompts.push(span_tok_to_prompt(span_tok));
+                }
+            }
+            if !prompts.is_empty() {
+                let _ = generate(&prompts, Some(sp), false, false)?;
+            }
+            Ok(crate::llm::QueryOutput { steps: Vec::new() })
+        }
+
         other => Err(anyhow::anyhow!(
             "unsupported top-level query variant: {}",
             query_variant_name(other)

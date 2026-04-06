@@ -1026,11 +1026,13 @@ impl AsyncEngine {
         // Poll all children and build choices.
         let mut choices = Vec::with_capacity(total);
         let mut total_completion_tokens = 0u32;
+        let mut total_cached_tokens = 0u32;
 
         for (child_id, choice_index) in &child_ids {
             let state = self.poll_until_done(child_id).await?;
             let completion_tokens = state.generated_token_ids.len() as u32;
             total_completion_tokens += completion_tokens;
+            total_cached_tokens += state.num_cached_tokens;
 
             let finish_reason_str = state
                 .finish_reason
@@ -1082,7 +1084,13 @@ impl AsyncEngine {
             prompt_tokens: total_prompt_tokens,
             completion_tokens: Some(total_completion_tokens),
             total_tokens: total_prompt_tokens + total_completion_tokens,
-            prompt_tokens_details: None,
+            prompt_tokens_details: if total_cached_tokens > 0 {
+                Some(protocol::PromptTokenUsageInfo {
+                    cached_tokens: Some(total_cached_tokens),
+                })
+            } else {
+                None
+            },
         };
 
         Ok(protocol::CompletionResponse::new(model, choices, usage))

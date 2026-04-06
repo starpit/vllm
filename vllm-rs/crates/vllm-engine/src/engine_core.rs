@@ -627,13 +627,20 @@ impl EngineCore {
                 continue;
             }
 
+            // Read cached tokens from the scheduler's request state.
+            let num_cached_tokens = self
+                .scheduler
+                .get_request(req_id)
+                .map(|r| r.num_cached_tokens.max(0) as u32)
+                .unwrap_or(0);
+
             // Build the output for this request.
             let output = EngineCoreOutput {
                 request_id: req_id.clone(),
                 new_token_ids: new_token_ids_slice.to_vec(),
                 finish_reason,
                 stop_reason,
-                num_cached_tokens: 0,
+                num_cached_tokens,
                 events: None,
                 new_logprobs,
                 new_prompt_logprobs,

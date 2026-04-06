@@ -67,6 +67,8 @@ pub struct RequestOutput {
     pub ttft_s: Option<f64>,
     /// Average inter-token latency in seconds.
     pub avg_itl_s: Option<f64>,
+    /// Number of prompt tokens served from prefix cache.
+    pub num_cached_tokens: u32,
 }
 
 /// One generate step returned by [`LLM::execute_query`].
@@ -732,6 +734,7 @@ impl LLM {
         let mut last_token_time: Vec<Option<std::time::Instant>> = vec![None; total];
         let mut itl_sum: Vec<f64> = vec![0.0; total];
         let mut itl_count: Vec<u32> = vec![0; total];
+        let mut cached_tokens: Vec<u32> = vec![0; total];
 
         while self.client.has_unfinished_requests() {
             let (outputs, _) = self
@@ -756,6 +759,9 @@ impl LLM {
                     }
 
                     generated_tokens[idx].extend_from_slice(&output.new_token_ids);
+                    if output.num_cached_tokens > 0 {
+                        cached_tokens[idx] = output.num_cached_tokens;
+                    }
                     if let Some(ref reason) = output.finish_reason
                         && finish_reasons[idx].is_none()
                     {
@@ -843,6 +849,7 @@ impl LLM {
                 finished: true,
                 ttft_s,
                 avg_itl_s,
+                num_cached_tokens: cached_tokens[first_idx],
             });
         }
 
@@ -1020,6 +1027,7 @@ impl LLM {
             finished: true,
             ttft_s: None,
             avg_itl_s: None,
+            num_cached_tokens: 0,
         })
     }
 }
@@ -1193,6 +1201,7 @@ mod tests {
             finished: true,
             ttft_s: None,
             avg_itl_s: None,
+            num_cached_tokens: 0,
         };
         let _ = format!("{output:?}");
     }

@@ -1344,3 +1344,114 @@ fn test_fused_multi_layer_timing() {
         sys::cuEventDestroy_v2(stop);
     }
 }
+
+/// Timing test: multi-SM fused kernel distributing GEMM tiles across CTAs.
+/// Compare against single-SM fused_multi_layer (261ms) and baselines.
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_fused_multi_sm_timing() {
+    use cudarc::driver::sys;
+
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    let seq_len: usize = 48;
+    let num_pages_used = (seq_len + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE;
+    let last_page_len = seq_len - (num_pages_used - 1) * KV_PAGE_SIZE;
+
+    let mut b = TestBuffers::new();
+    let input_f32 = bf16_roundtrip(&gen_input(HD));
+    let mut input_full = vec![0.0_f32; ACT_ROWS * HD];
+    input_full[..HD].copy_from_slice(&input_f32);
+    b.hidden = gpu_upload_bf16(&input_full);
+
+    // Weights
+    b.attn_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 10, 0.1)));
+    b.qkv_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * QKV_DIM * HD, 100, 0.01)));
+    b.o_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * HD, 150, 0.01)));
+    b.mlp_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 20, 0.1)));
+    b.gate_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * ID * HD, 200, 0.01)));
+    b.up_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * ID * HD, 300, 0.01)));
+    b.down_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * ID, 400, 0.01)));
+
+    // KV cache
+    let total_kv = NL * NUM_PAGES * KV_PAGE_SIZE * NKH * HDM;
+    b.k_cache = gpu_upload_bf16(&bf16_roundtrip(&make_random(total_kv, 600, 0.5)));
+    b.v_cache = gpu_upload_bf16(&bf16_roundtrip(&make_random(total_kv, 700, 0.5)));
+
+    // KV metadata
+    let mut indptr_full = vec![0_i32; ACT_ROWS + 1];
+    indptr_full[0] = 0;
+    indptr_full[1] = num_pages_used as i32;
+    b.kv_indptr = gpu_upload_i32(&indptr_full);
+    let mut indices_full = vec![0_i32; NUM_PAGES];
+    indices_full[0] = 0;
+    b.kv_indices = gpu_upload_i32(&indices_full);
+    let mut last_page_full = vec![0_i32; ACT_ROWS];
+    last_page_full[0] = last_page_len as i32;
+    b.kv_last_page = gpu_upload_i32(&last_page_full);
+
+    // Single launch + sync to check for errors
+    {
+        let rc = call_launch!(ffi::fused_multi_sm_launch, b, NL * NUM_PAGES);
+        assert_eq!(rc, 0, "fused_multi_sm_launch returned error {rc}");
+        eprintln!("multi-SM kernel launched, syncing...");
+        unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+        eprintln!("multi-SM kernel sync OK");
+    }
+
+    // Warmup
+    for _ in 0..4 {
+        let rc = call_launch!(ffi::fused_multi_sm_launch, b, NL * NUM_PAGES);
+        assert_eq!(rc, 0, "fused_multi_sm_launch returned error {rc}");
+    }
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+
+    // Timing with CUDA events
+    let num_iters = 100;
+    let mut start: sys::CUevent = std::ptr::null_mut();
+    let mut stop: sys::CUevent = std::ptr::null_mut();
+    unsafe {
+        sys::cuEventCreate(&mut start, 0);
+        sys::cuEventCreate(&mut stop, 0);
+        sys::cuEventRecord(start, std::ptr::null_mut());
+    }
+
+    for _ in 0..num_iters {
+        let rc = call_launch!(ffi::fused_multi_sm_launch, b, NL * NUM_PAGES);
+        assert_eq!(rc, 0);
+    }
+
+    unsafe {
+        sys::cuEventRecord(stop, std::ptr::null_mut());
+        sys::cuEventSynchronize(stop);
+        let mut elapsed_ms: f32 = 0.0;
+        sys::cuEventElapsedTime(&mut elapsed_ms, start, stop);
+        let avg_ms = elapsed_ms / num_iters as f32;
+        eprintln!();
+        eprintln!("╔══════════════════════════════════════════════════╗");
+        eprintln!("║  Fused Multi-SM Kernel Timing ({NL} layers)       ║");
+        eprintln!("╠══════════════════════════════════════════════════╣");
+        eprintln!("║  Total ({num_iters} iters): {elapsed_ms:8.2}ms                   ║");
+        eprintln!("║  Average:        {avg_ms:8.4}ms                   ║");
+        eprintln!("║                                                  ║");
+        eprintln!("║  Baselines (1B LLaMA, L40S):                     ║");
+        eprintln!("║    Single-SM fused:  261ms                       ║");
+        eprintln!("║    KVM megakernel:    5.8ms                      ║");
+        eprintln!("║    CUDA graphs:       4.6ms                      ║");
+        eprintln!("╚══════════════════════════════════════════════════╝");
+        eprintln!();
+        sys::cuEventDestroy_v2(start);
+        sys::cuEventDestroy_v2(stop);
+    }
+}

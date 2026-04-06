@@ -158,6 +158,19 @@ pub fn generate_fused_multi_layer_kernel(dsl: &str) -> Result<String, String> {
     Ok(cuda_codegen::generate_fused_multi_layer_kernel(&dag))
 }
 
+/// Generate a fused multi-SM kernel that distributes GEMM tiles across CTAs.
+///
+/// Uses cross-CTA barriers (atomicAdd + spin) for synchronization between phases.
+/// RMSNorm and attention run on CTA 0; GEMMs are partitioned across all CTAs.
+pub fn generate_fused_multi_sm_kernel(dsl: &str) -> Result<String, String> {
+    let tokens: proc_macro2::TokenStream = dsl
+        .parse()
+        .map_err(|e| format!("failed to tokenize DSL: {e}"))?;
+    let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("parse error: {e}"))?;
+    let dag = parse::build_dag(&def)?;
+    Ok(cuda_codegen::generate_fused_multi_sm_kernel(&dag))
+}
+
 /// Generate a debug variant of the decode kernel that syncs and writes a
 /// marker to a debug buffer after each op. Useful for identifying which op
 /// crashes in the full megakernel.

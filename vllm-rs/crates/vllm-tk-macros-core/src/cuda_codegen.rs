@@ -5915,9 +5915,10 @@ pub fn generate_fused_multi_sm_kernel(dag: &ModelDag) -> String {
         writeln!(out, "    }}").unwrap();
     }
 
-    // ── Compile-time grid size = max tile count across all GEMM phases ──
-    let grid_size = *[hd_col_tiles, id_col_tiles].iter().max().unwrap();
-    // Split-K factors: all HD-output GEMMs share the same factor
+    // ── Compile-time grid size ──
+    // Capped at max tile count (128 for gate/up). Cannot exceed SM count (142 on L40S)
+    // because spin-wait barriers deadlock when CTAs aren't all co-resident.
+    let grid_size = *[hd_col_tiles, id_col_tiles].iter().max().unwrap(); // 128
     let hd_split_k = grid_size / hd_col_tiles; // 128 / 32 = 4
     let hd_k_per_split = hd_k_iters / hd_split_k; // 32 / 4 = 8
     let down_split_k = grid_size / hd_col_tiles; // 128 / 32 = 4

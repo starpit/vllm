@@ -11,8 +11,8 @@
 use cudarc::driver::result;
 use half::bf16;
 use vllm_tk_test_harness::{
-    TkTensorArg, WeightArg, NormWeightArg, ActivationArg, LogitsArg,
-    KvCacheArg, RopeArg, IntVecArg, BarrierArg, ffi,
+    ActivationArg, BarrierArg, IntVecArg, KvCacheArg, LogitsArg, NormWeightArg, RopeArg,
+    TkTensorArg, WeightArg, ffi,
 };
 
 /// Model dims for 1B LLaMA (matches the DSL in build.rs)
@@ -38,7 +38,7 @@ const MAX_PER_SM: usize = 1;
 const INSTRUCTION_WIDTH: usize = 32;
 const TIMING_WIDTH: usize = 128;
 const NUM_PAGES: usize = 16;
-const KV_PAGE_SIZE: usize = 64;  // tokens per page (SM89_KV_PAGE_SIZE in llama_sm89.cuh)
+const KV_PAGE_SIZE: usize = 64; // tokens per page (SM89_KV_PAGE_SIZE in llama_sm89.cuh)
 const KV_BLOCK_SIZE: usize = 16; // tile rows per KV block (SM89_KV_BLOCK_SIZE)
 
 /// Allocate `bytes` of zeroed GPU memory.
@@ -572,7 +572,12 @@ fn test_inline_gemm_golden() {
     b.hidden = gpu_upload_bf16(&input_f32);
 
     // Upload weight to qkv_w: need [NL, QKV_DIM, HD], replicate for all layers
-    let weight_full: Vec<f32> = weight_f32.iter().copied().cycle().take(NL * QKV_DIM * HD).collect();
+    let weight_full: Vec<f32> = weight_f32
+        .iter()
+        .copied()
+        .cycle()
+        .take(NL * QKV_DIM * HD)
+        .collect();
     b.qkv_w = gpu_upload_bf16(&weight_full);
 
     let rc = call_launch!(ffi::inline_gemm_launch, b);
@@ -585,7 +590,14 @@ fn test_inline_gemm_golden() {
     // CPU golden: output[ACT_ROWS, OUT_BLOCK] = input[ACT_ROWS, HD] @ weight[OUT_BLOCK, HD]^T
     let weight_slice = &weight_f32[..OUT_BLOCK * HD]; // first 64 rows
     let mut expected = vec![0.0_f32; ACT_ROWS * OUT_BLOCK];
-    cpu_golden::gemm(&input_f32, weight_slice, &mut expected, ACT_ROWS, HD, OUT_BLOCK);
+    cpu_golden::gemm(
+        &input_f32,
+        weight_slice,
+        &mut expected,
+        ACT_ROWS,
+        HD,
+        OUT_BLOCK,
+    );
 
     // The GPU output is stored in rms_rope which is [ACT_ROWS, HD].
     // The kernel writes 64 columns starting at col offset 0 in each row's tile.
@@ -638,11 +650,21 @@ fn test_fused_rmsnorm_gemm_golden() {
     b.hidden = gpu_upload_bf16(&input_full);
 
     // Upload norm weights: [NL, HD]
-    let norm_full: Vec<f32> = norm_weight_f32.iter().copied().cycle().take(NL * HD).collect();
+    let norm_full: Vec<f32> = norm_weight_f32
+        .iter()
+        .copied()
+        .cycle()
+        .take(NL * HD)
+        .collect();
     b.attn_norm_w = gpu_upload_bf16(&norm_full);
 
     // Upload QKV weights: [NL, QKV_DIM, HD]
-    let qkv_full: Vec<f32> = qkv_weight_f32.iter().copied().cycle().take(NL * QKV_DIM * HD).collect();
+    let qkv_full: Vec<f32> = qkv_weight_f32
+        .iter()
+        .copied()
+        .cycle()
+        .take(NL * QKV_DIM * HD)
+        .collect();
     b.qkv_w = gpu_upload_bf16(&qkv_full);
 
     let rc = call_launch!(ffi::fused_rmsnorm_gemm_launch, b);
@@ -690,7 +712,12 @@ fn test_two_step_rmsnorm_then_gemm() {
     b.hidden = gpu_upload_bf16(&input_full);
 
     // Upload norm weights
-    let norm_full: Vec<f32> = norm_weight_f32.iter().copied().cycle().take(NL * HD).collect();
+    let norm_full: Vec<f32> = norm_weight_f32
+        .iter()
+        .copied()
+        .cycle()
+        .take(NL * HD)
+        .collect();
     b.attn_norm_w = gpu_upload_bf16(&norm_full);
 
     // Step 1: Run inline_rmsnorm → writes to rms_rope
@@ -705,7 +732,11 @@ fn test_two_step_rmsnorm_then_gemm() {
     // Verify rmsnorm matches CPU
     let mut normed = vec![0.0_f32; HD];
     cpu_golden::rmsnorm(&input_f32, &norm_weight_f32, &mut normed, 1e-5);
-    eprintln!("RMSNorm row0[0..4]: GPU={:?}, CPU={:?}", &rmsnorm_row0[..4], &normed[..4]);
+    eprintln!(
+        "RMSNorm row0[0..4]: GPU={:?}, CPU={:?}",
+        &rmsnorm_row0[..4],
+        &normed[..4]
+    );
 
     // Step 2: Copy rmsnorm output to hidden_states (inline_gemm reads from hidden_states)
     b.hidden = gpu_upload_bf16(&rmsnorm_out);
@@ -720,7 +751,12 @@ fn test_two_step_rmsnorm_then_gemm() {
             })
             .collect::<Vec<f32>>()
     });
-    let qkv_full: Vec<f32> = qkv_weight_f32.iter().copied().cycle().take(NL * QKV_DIM * HD).collect();
+    let qkv_full: Vec<f32> = qkv_weight_f32
+        .iter()
+        .copied()
+        .cycle()
+        .take(NL * QKV_DIM * HD)
+        .collect();
     b.qkv_w = gpu_upload_bf16(&qkv_full);
 
     // Run inline_gemm → writes to rms_rope
@@ -734,11 +770,22 @@ fn test_two_step_rmsnorm_then_gemm() {
     // CPU golden: GEMM on row 0 only (inline_gemm computes all 128 rows)
     let weight_slice = &qkv_weight_f32[..OUT_BLOCK * HD];
     let mut expected_full = vec![0.0_f32; ACT_ROWS * OUT_BLOCK];
-    cpu_golden::gemm(&rmsnorm_out, weight_slice, &mut expected_full, ACT_ROWS, HD, OUT_BLOCK);
+    cpu_golden::gemm(
+        &rmsnorm_out,
+        weight_slice,
+        &mut expected_full,
+        ACT_ROWS,
+        HD,
+        OUT_BLOCK,
+    );
 
     let gpu_row0 = &gpu_out[..OUT_BLOCK];
     let exp_row0 = &expected_full[..OUT_BLOCK];
-    eprintln!("GEMM row0[0..4]: GPU={:?}, CPU={:?}", &gpu_row0[..4], &exp_row0[..4]);
+    eprintln!(
+        "GEMM row0[0..4]: GPU={:?}, CPU={:?}",
+        &gpu_row0[..4],
+        &exp_row0[..4]
+    );
 
     assert_close(gpu_row0, exp_row0, 5e-2, 5e-2, "two_step_rmsnorm_gemm");
 }
@@ -919,7 +966,15 @@ fn test_fused_layer_golden() {
 
     // 4. o_proj + residual: attn_out[1,HD] × o_w[HD,HD]^T + hidden → hidden
     let mut hidden_after_attn = vec![0.0_f32; HD];
-    cpu_golden::gemm_add(&attn_out_data, &o_w, &input_f32, &mut hidden_after_attn, 1, HD, HD);
+    cpu_golden::gemm_add(
+        &attn_out_data,
+        &o_w,
+        &input_f32,
+        &mut hidden_after_attn,
+        1,
+        HD,
+        HD,
+    );
     let hidden_after_attn = bf16_roundtrip(&hidden_after_attn);
 
     // 5. mlp_norm
@@ -945,7 +1000,15 @@ fn test_fused_layer_golden() {
 
     // 8. down GEMM + residual
     let mut expected = vec![0.0_f32; HD];
-    cpu_golden::gemm_add(&mlp_inter, &down_w, &hidden_after_attn, &mut expected, 1, ID, HD);
+    cpu_golden::gemm_add(
+        &mlp_inter,
+        &down_w,
+        &hidden_after_attn,
+        &mut expected,
+        1,
+        ID,
+        HD,
+    );
 
     eprintln!("Layer GPU[0..4]: {:?}", &gpu_row0[..4]);
     eprintln!("Layer CPU[0..4]: {:?}", &expected[..4]);
@@ -1032,8 +1095,8 @@ fn test_inline_attention_decode_golden() {
         for kv_h in 0..NKH {
             for d in 0..HDM {
                 let flat_idx = tok * NKH * HDM + kv_h * HDM + d;
-                let paged_idx = page_batch * KV_PAGE_SIZE * NKH * HDM
-                    + tok * NKH * HDM + kv_h * HDM + d;
+                let paged_idx =
+                    page_batch * KV_PAGE_SIZE * NKH * HDM + tok * NKH * HDM + kv_h * HDM + d;
                 k_paged[paged_idx] = k_cache_flat[flat_idx];
                 v_paged[paged_idx] = v_cache_flat[flat_idx];
             }
@@ -1075,7 +1138,13 @@ fn test_inline_attention_decode_golden() {
 
     // Flash attention with bf16 MMA accumulates error across seq_len blocks
     // Tolerance is higher than GEMM due to softmax numerical sensitivity
-    assert_close(gpu_row0, &expected, 2.0, 0.2, "inline_attention_decode_golden");
+    assert_close(
+        gpu_row0,
+        &expected,
+        2.0,
+        0.2,
+        "inline_attention_decode_golden",
+    );
 }
 
 #[test]
@@ -1133,14 +1202,29 @@ fn test_fused_full_layer_golden() {
     // 3. Attention decode: Q from qkv GEMM, K/V from pre-filled cache
     let mut attn_out = vec![0.0_f32; NAH * HDM];
     cpu_golden::attention_decode(
-        &q_out, &k_cache_flat, &v_cache_flat,
-        &mut attn_out, seq_len, NAH, NKH, HDM, attn_scale,
+        &q_out,
+        &k_cache_flat,
+        &v_cache_flat,
+        &mut attn_out,
+        seq_len,
+        NAH,
+        NKH,
+        HDM,
+        attn_scale,
     );
     let attn_out_cpu = bf16_roundtrip(&attn_out);
 
     // 4. o_proj + residual
     let mut hidden_after_attn = vec![0.0_f32; HD];
-    cpu_golden::gemm_add(&attn_out_cpu, &o_w, &input_f32, &mut hidden_after_attn, 1, HD, HD);
+    cpu_golden::gemm_add(
+        &attn_out_cpu,
+        &o_w,
+        &input_f32,
+        &mut hidden_after_attn,
+        1,
+        HD,
+        HD,
+    );
     let hidden_after_attn = bf16_roundtrip(&hidden_after_attn);
 
     // 5. mlp_norm
@@ -1162,7 +1246,15 @@ fn test_fused_full_layer_golden() {
     cpu_golden::mul(&gate_silu, &up_out, &mut mlp_inter);
     let mlp_inter = bf16_roundtrip(&mlp_inter);
     let mut expected = vec![0.0_f32; HD];
-    cpu_golden::gemm_add(&mlp_inter, &down_w, &hidden_after_attn, &mut expected, 1, ID, HD);
+    cpu_golden::gemm_add(
+        &mlp_inter,
+        &down_w,
+        &hidden_after_attn,
+        &mut expected,
+        1,
+        ID,
+        HD,
+    );
 
     // ── GPU setup ──
     let mut b = TestBuffers::new();
@@ -1198,8 +1290,8 @@ fn test_fused_full_layer_golden() {
         for kv_h in 0..NKH {
             for d in 0..HDM {
                 let flat_idx = tok * NKH * HDM + kv_h * HDM + d;
-                let paged_idx = page_batch * KV_PAGE_SIZE * NKH * HDM
-                    + tok * NKH * HDM + kv_h * HDM + d;
+                let paged_idx =
+                    page_batch * KV_PAGE_SIZE * NKH * HDM + tok * NKH * HDM + kv_h * HDM + d;
                 k_paged[paged_idx] = k_cache_flat[flat_idx];
                 v_paged[paged_idx] = v_cache_flat[flat_idx];
             }
@@ -1454,4 +1546,68 @@ fn test_fused_multi_sm_timing() {
         sys::cuEventDestroy_v2(start);
         sys::cuEventDestroy_v2(stop);
     }
+}
+
+/// Profile test: run the multi-SM kernel once with clock64() instrumentation
+/// to get per-phase compute and barrier times.
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_fused_multi_sm_profile() {
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    let seq_len: usize = 48;
+    let num_pages_used = (seq_len + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE;
+    let last_page_len = seq_len - (num_pages_used - 1) * KV_PAGE_SIZE;
+
+    let mut b = TestBuffers::new();
+    let input_f32 = bf16_roundtrip(&gen_input(HD));
+    let mut input_full = vec![0.0_f32; ACT_ROWS * HD];
+    input_full[..HD].copy_from_slice(&input_f32);
+    b.hidden = gpu_upload_bf16(&input_full);
+
+    b.attn_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 10, 0.1)));
+    b.qkv_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * QKV_DIM * HD, 100, 0.01)));
+    b.o_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * HD, 150, 0.01)));
+    b.mlp_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 20, 0.1)));
+    b.gate_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * ID * HD, 200, 0.01)));
+    b.up_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * ID * HD, 300, 0.01)));
+    b.down_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * ID, 400, 0.01)));
+
+    let total_kv = NL * NUM_PAGES * KV_PAGE_SIZE * NKH * HDM;
+    b.k_cache = gpu_upload_bf16(&bf16_roundtrip(&make_random(total_kv, 600, 0.5)));
+    b.v_cache = gpu_upload_bf16(&bf16_roundtrip(&make_random(total_kv, 700, 0.5)));
+
+    let mut indptr_full = vec![0_i32; ACT_ROWS + 1];
+    indptr_full[0] = 0;
+    indptr_full[1] = num_pages_used as i32;
+    b.kv_indptr = gpu_upload_i32(&indptr_full);
+    let mut indices_full = vec![0_i32; NUM_PAGES];
+    indices_full[0] = 0;
+    b.kv_indices = gpu_upload_i32(&indices_full);
+    let mut last_page_full = vec![0_i32; ACT_ROWS];
+    last_page_full[0] = last_page_len as i32;
+    b.kv_last_page = gpu_upload_i32(&last_page_full);
+
+    // Warmup
+    {
+        let rc = call_launch!(ffi::fused_multi_sm_launch, b, NL * NUM_PAGES);
+        assert_eq!(rc, 0, "warmup launch failed with error {rc}");
+        unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    }
+
+    // Profile run (prints breakdown via printf in the C wrapper)
+    eprintln!("Running profiled multi-SM kernel...");
+    let rc = call_launch!(ffi::fused_multi_sm_profile_launch, b, NL * NUM_PAGES);
+    assert_eq!(rc, 0, "fused_multi_sm_profile_launch returned error {rc}");
 }

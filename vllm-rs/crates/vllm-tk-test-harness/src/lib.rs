@@ -85,7 +85,8 @@ impl WeightArg {
     /// Create from `[1, num_layers, output_dim, input_dim]`.
     pub fn new(ptr: u64, num_layers: usize, output_dim: usize, input_dim: usize) -> Self {
         Self(TkTensorArg {
-            ptr, b: 1,
+            ptr,
+            b: 1,
             d: num_layers as i32,
             r: output_dim as i32,
             c: input_dim as i32,
@@ -101,7 +102,9 @@ impl NormWeightArg {
     /// Create from `[1, 1, num_layers, hidden_dim]`.
     pub fn new(ptr: u64, num_layers: usize, hidden_dim: usize) -> Self {
         Self(TkTensorArg {
-            ptr, b: 1, d: 1,
+            ptr,
+            b: 1,
+            d: 1,
             r: num_layers as i32,
             c: hidden_dim as i32,
         })
@@ -117,7 +120,9 @@ impl ActivationArg {
     /// Create from `[1, 1, batch, dim]`.
     pub fn new(ptr: u64, batch: usize, dim: usize) -> Self {
         Self(TkTensorArg {
-            ptr, b: 1, d: 1,
+            ptr,
+            b: 1,
+            d: 1,
             r: batch as i32,
             c: dim as i32,
         })
@@ -132,7 +137,9 @@ impl LogitsArg {
     /// Create from `[1, 1, batch, vocab_size]`.
     pub fn new(ptr: u64, batch: usize, vocab_size: usize) -> Self {
         Self(TkTensorArg {
-            ptr, b: 1, d: 1,
+            ptr,
+            b: 1,
+            d: 1,
             r: batch as i32,
             c: vocab_size as i32,
         })
@@ -146,8 +153,11 @@ typed_tensor_arg!(
 impl KvCacheArg {
     /// Create from `[total_pages, page_size, num_kv_heads, head_dim]`.
     pub fn new(
-        ptr: u64, total_pages: usize, page_size: usize,
-        num_kv_heads: usize, head_dim: usize,
+        ptr: u64,
+        total_pages: usize,
+        page_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
     ) -> Self {
         Self(TkTensorArg {
             ptr,
@@ -167,7 +177,9 @@ impl RopeArg {
     /// Create from `[1, 1, max_positions, head_dim]`.
     pub fn new(ptr: u64, max_positions: usize, head_dim: usize) -> Self {
         Self(TkTensorArg {
-            ptr, b: 1, d: 1,
+            ptr,
+            b: 1,
+            d: 1,
             r: max_positions as i32,
             c: head_dim as i32,
         })
@@ -182,7 +194,10 @@ impl IntVecArg {
     /// Create from `[1, 1, 1, len]`.
     pub fn new(ptr: u64, len: usize) -> Self {
         Self(TkTensorArg {
-            ptr, b: 1, d: 1, r: 1,
+            ptr,
+            b: 1,
+            d: 1,
+            r: 1,
             c: len as i32,
         })
     }
@@ -195,8 +210,11 @@ typed_tensor_arg!(
 impl BarrierArg {
     /// Create from `[num_layers, num_ops, batch_blocks, cols]`.
     pub fn new(
-        ptr: u64, num_layers: usize, num_ops: usize,
-        batch_blocks: usize, cols: usize,
+        ptr: u64,
+        num_layers: usize,
+        num_ops: usize,
+        batch_blocks: usize,
+        cols: usize,
     ) -> Self {
         Self(TkTensorArg {
             ptr,
@@ -236,7 +254,7 @@ pub mod ffi {
                     // VM state (3 tensors)
                     bar: BarrierArg,
                     instructions: TkTensorArg, // no standard GL type
-                    timings: TkTensorArg,       // no standard GL type
+                    timings: TkTensorArg,      // no standard GL type
                     // Weights (9 tensors)
                     qkv_w: WeightArg,
                     attn_norm_w: NormWeightArg,
@@ -309,4 +327,5 @@ pub mod ffi {
     declare_test_launch!(fused_multi_layer_launch);
     declare_test_launch!(inline_attention_decode_launch);
     declare_test_launch!(fused_multi_sm_launch);
+    declare_test_launch!(fused_multi_sm_profile_launch);
 }

@@ -598,3 +598,140 @@ fn test_inline_gemm_golden() {
         );
     }
 }
+
+#[test]
+#[ignore] // Requires GPU
+fn test_fused_rmsnorm_gemm_golden() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+
+    const OUT_BLOCK: usize = 64;
+
+    // Input: single token [1, HD]
+    let input_f32 = bf16_roundtrip(&gen_input(HD));
+    // Norm weights: [NL, HD] — layer 0 used
+    let norm_weight_f32 = bf16_roundtrip(&gen_weight(HD));
+    // QKV weights: [QKV_DIM, HD] — first OUT_BLOCK rows used
+    let qkv_weight_f32: Vec<f32> = bf16_roundtrip(&{
+        let mut rng = 123u64;
+        (0..QKV_DIM * HD)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * 0.01
+            })
+            .collect::<Vec<f32>>()
+    });
+
+    let mut b = TestBuffers::new();
+
+    // Upload input to hidden_states: [ACT_ROWS, HD], row 0 has data
+    let mut input_full = vec![0.0_f32; ACT_ROWS * HD];
+    input_full[..HD].copy_from_slice(&input_f32);
+    b.hidden = gpu_upload_bf16(&input_full);
+
+    // Upload norm weights: [NL, HD]
+    let norm_full: Vec<f32> = norm_weight_f32.iter().copied().cycle().take(NL * HD).collect();
+    b.attn_norm_w = gpu_upload_bf16(&norm_full);
+
+    // Upload QKV weights: [NL, QKV_DIM, HD]
+    let qkv_full: Vec<f32> = qkv_weight_f32.iter().copied().cycle().take(NL * QKV_DIM * HD).collect();
+    b.qkv_w = gpu_upload_bf16(&qkv_full);
+
+    let rc = call_launch!(ffi::fused_rmsnorm_gemm_launch, b);
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "fused_rmsnorm_gemm_launch returned error {rc}");
+
+    // Read back output from rms_rope (fused kernel writes GEMM output there)
+    let gpu_out = gpu_download_bf16(b.rms_rope, ACT_ROWS * HD);
+
+    // CPU golden: rmsnorm then gemm
+    let mut normed = vec![0.0_f32; HD];
+    cpu_golden::rmsnorm(&input_f32, &norm_weight_f32, &mut normed, 1e-5);
+
+    // GEMM: normed[1, HD] @ qkv_weight[OUT_BLOCK, HD]^T → [1, OUT_BLOCK]
+    let weight_slice = &qkv_weight_f32[..OUT_BLOCK * HD];
+    let mut expected = vec![0.0_f32; OUT_BLOCK];
+    cpu_golden::gemm(&normed, weight_slice, &mut expected, 1, HD, OUT_BLOCK);
+
+    // GPU output: GEMM writes 128×64 to rms_rope (same as standalone GEMM).
+    // Only row 0 has real input data; check row 0 cols [0..OUT_BLOCK).
+    let gpu_row0 = &gpu_out[..OUT_BLOCK];
+    assert_close(gpu_row0, &expected, 5e-2, 5e-2, "fused_rmsnorm_gemm_golden");
+}
+
+/// Two-step test: run inline_rmsnorm then inline_gemm separately.
+/// Verifies that RMSNorm's gmem output is correctly readable by GEMM.
+#[test]
+#[ignore] // Requires GPU
+fn test_two_step_rmsnorm_then_gemm() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+
+    const OUT_BLOCK: usize = 64;
+
+    // Same inputs as standalone rmsnorm test
+    let input_f32 = bf16_roundtrip(&gen_input(HD));
+    let norm_weight_f32 = bf16_roundtrip(&gen_weight(HD));
+
+    let mut b = TestBuffers::new();
+
+    // Upload hidden_states
+    let mut input_full = vec![0.0_f32; ACT_ROWS * HD];
+    input_full[..HD].copy_from_slice(&input_f32);
+    b.hidden = gpu_upload_bf16(&input_full);
+
+    // Upload norm weights
+    let norm_full: Vec<f32> = norm_weight_f32.iter().copied().cycle().take(NL * HD).collect();
+    b.attn_norm_w = gpu_upload_bf16(&norm_full);
+
+    // Step 1: Run inline_rmsnorm → writes to rms_rope
+    let rc = call_launch!(ffi::inline_rmsnorm_launch, b);
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "inline_rmsnorm_launch returned error {rc}");
+
+    // Read back rmsnorm output
+    let rmsnorm_out = gpu_download_bf16(b.rms_rope, ACT_ROWS * HD);
+    let rmsnorm_row0 = &rmsnorm_out[..HD];
+
+    // Verify rmsnorm matches CPU
+    let mut normed = vec![0.0_f32; HD];
+    cpu_golden::rmsnorm(&input_f32, &norm_weight_f32, &mut normed, 1e-5);
+    eprintln!("RMSNorm row0[0..4]: GPU={:?}, CPU={:?}", &rmsnorm_row0[..4], &normed[..4]);
+
+    // Step 2: Copy rmsnorm output to hidden_states (inline_gemm reads from hidden_states)
+    b.hidden = gpu_upload_bf16(&rmsnorm_out);
+
+    // Set up QKV weights
+    let qkv_weight_f32: Vec<f32> = bf16_roundtrip(&{
+        let mut rng = 123u64;
+        (0..QKV_DIM * HD)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * 0.01
+            })
+            .collect::<Vec<f32>>()
+    });
+    let qkv_full: Vec<f32> = qkv_weight_f32.iter().copied().cycle().take(NL * QKV_DIM * HD).collect();
+    b.qkv_w = gpu_upload_bf16(&qkv_full);
+
+    // Run inline_gemm → writes to rms_rope
+    let rc = call_launch!(ffi::inline_gemm_launch, b);
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "inline_gemm_launch returned error {rc}");
+
+    // Read back GEMM output
+    let gpu_out = gpu_download_bf16(b.rms_rope, ACT_ROWS * HD);
+
+    // CPU golden: GEMM on row 0 only (inline_gemm computes all 128 rows)
+    let weight_slice = &qkv_weight_f32[..OUT_BLOCK * HD];
+    let mut expected_full = vec![0.0_f32; ACT_ROWS * OUT_BLOCK];
+    cpu_golden::gemm(&rmsnorm_out, weight_slice, &mut expected_full, ACT_ROWS, HD, OUT_BLOCK);
+
+    let gpu_row0 = &gpu_out[..OUT_BLOCK];
+    let exp_row0 = &expected_full[..OUT_BLOCK];
+    eprintln!("GEMM row0[0..4]: GPU={:?}, CPU={:?}", &gpu_row0[..4], &exp_row0[..4]);
+
+    assert_close(gpu_row0, exp_row0, 5e-2, 5e-2, "two_step_rmsnorm_gemm");
+}

@@ -2102,6 +2102,280 @@ pub fn generate_inline_gemm_kernel(dag: &ModelDag) -> String {
     out
 }
 
+/// Generate a fused RMSNorm → GEMM kernel (no KVM protocol).
+///
+/// RMSNorm normalizes hidden_states, writes result to shmem inter-op region.
+/// GEMM reads first K-iteration A-matrix from shmem (no gmem round-trip),
+/// remaining K-iterations from gmem. Single block, BS=1 decode scenario.
+pub fn generate_fused_rmsnorm_gemm_kernel(dag: &ModelDag) -> String {
+    let mut out = String::new();
+
+    let hd = dag.params.get("HD").copied().unwrap_or(2048);
+    let nl = dag.params.get("NL").copied().unwrap_or(16);
+    let nah = dag.params.get("NAH").copied().unwrap_or(32);
+    let nkh = dag.params.get("NKH").copied().unwrap_or(8);
+    let hdm = dag.params.get("HDM").copied().unwrap_or(64);
+    let id = dag.params.get("ID").copied().unwrap_or(8192);
+
+    let k_dim = 64;
+    let num_iters = hd / k_dim; // 32
+    let out_block = 64;
+    let num_warps = 8;
+    let num_threads = num_warps * 32;
+    let rdpw = hd / num_warps; // 256 elements per warp for RMSNorm
+
+    // Shmem layout:
+    // Phase 1 (RMSNorm):
+    //   [0 .. HD*2): activations (bf16, one token)
+    //   [HD*2 .. HD*4): weights (bf16)
+    //   [HD*4 .. HD*4 + 32): scratch for partial sums
+    // Phase 2 (GEMM) — reuses shmem after RMSNorm is done:
+    //   [0 .. 2 * (A_SIZE + B_SIZE)): double-buffered A + B tiles
+    // Inter-op region (survives across phases):
+    //   [INTEROP_OFFSET .. INTEROP_OFFSET + HD*2): normalized output (bf16, one token)
+    //
+    // For BS=1, A tile is st_bf<16, 64> = 2KB (only first row used).
+    // B tile is st_bf<64, 64> = 8KB.
+    // 2 stages × (2KB + 8KB) = 20KB for GEMM.
+    // Interop: HD*2 = 4KB for one token's worth of bf16 data.
+    // RMSNorm phase: HD*2 (act) + HD*2 (wgt) + 32 (scratch) ≈ 8.2KB.
+    // Total peak: max(RMSNorm phase, GEMM + interop) = max(8.2KB, 24KB) = 24KB. Easy.
+
+    let batch_block = 128; // same as standalone GEMM
+    let a_size = batch_block * k_dim * 2; // st_bf<128, 64> = 16KB
+    let b_size = out_block * k_dim * 2; // st_bf<64, 64> = 8KB
+    let stage_size = a_size + b_size;
+    let gemm_shmem = 2 * stage_size; // 48KB
+
+    // RMSNorm needs: act (HD*2) + wgt (HD*2) + scratch (32) = 8.2KB
+    // This fits within the GEMM shmem region (48KB), so we overlay.
+    let rmsnorm_act_offset = 0;
+    let rmsnorm_wgt_offset = hd * 2;
+    let rmsnorm_scratch_offset = hd * 4;
+    let rmsnorm_shmem = rmsnorm_scratch_offset + num_warps * 4;
+
+    let total_shmem = std::cmp::max(gemm_shmem, rmsnorm_shmem);
+
+    writeln!(out, "// GENERATED: Fused RMSNorm → GEMM kernel (no KVM protocol)").unwrap();
+    writeln!(out, "// Phase 1: RMSNorm normalizes hidden_states, writes to interop shmem.").unwrap();
+    writeln!(out, "// Phase 2: GEMM reads first K-iter A from interop shmem (no gmem round-trip).").unwrap();
+    writeln!(out, "// Single block, single token (BS=1 decode).").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#define SM89_NUM_LAYERS             {nl}").unwrap();
+    writeln!(out, "#define SM89_HIDDEN_DIM             {hd}").unwrap();
+    writeln!(out, "#define SM89_INTERMEDIATE_DIM       {id}").unwrap();
+    writeln!(out, "#define SM89_HEAD_DIM               {hdm}").unwrap();
+    writeln!(out, "#define SM89_NUM_ATTENTION_HEADS    {nah}").unwrap();
+    writeln!(out, "#define SM89_NUM_KV_HEADS           {nkh}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#include \"llama_sm89.cuh\"").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "using namespace kittens;").unwrap();
+    writeln!(out, "using namespace kittens::prototype::vm;").unwrap();
+    writeln!(out, "using globals = llama_sm89_globals;").unwrap();
+    writeln!(out).unwrap();
+
+    // cp.async helper
+    writeln!(out, "__device__ static inline void fused_cp_async_wait_all() {{").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.wait_all;\\n\"     ::: \"memory\");").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // LDSM4 B-tile loader (same as inline GEMM)
+    writeln!(out, "__device__ static inline void fused_load_b_slice(").unwrap();
+    writeln!(out, "    rt_bf<16, {k_dim}> &dst, const st_bf<16, {k_dim}> &src) {{").unwrap();
+    writeln!(out, "    uint32_t saddr = static_cast<uint32_t>(__cvta_generic_to_shared(&src.data[0]));").unwrap();
+    writeln!(out, "    int lane = kittens::laneid();").unwrap();
+    writeln!(out, "    int row = lane % 16;").unwrap();
+    writeln!(out, "    bf16_2 tmp[4];").unwrap();
+    writeln!(out, "    #pragma unroll").unwrap();
+    writeln!(out, "    for (int j = 0; j < {k_dim} / 16; j++) {{").unwrap();
+    writeln!(out, "        int col = j * 16 + (lane / 16) * 8;").unwrap();
+    writeln!(out, "        move<bf16_2>::ldsm4(tmp[0], tmp[1], tmp[2], tmp[3], src.idx(saddr, {{row, col}}));").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[0] = tmp[0];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[1] = tmp[1];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[2] = tmp[2];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[3] = tmp[3];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Constants
+    writeln!(out, "constexpr int FUSED_K_DIM = {k_dim};").unwrap();
+    writeln!(out, "constexpr int FUSED_NUM_ITERS = {num_iters};").unwrap();
+    writeln!(out, "constexpr int FUSED_OUT_BLOCK = {out_block};").unwrap();
+    writeln!(out, "constexpr int FUSED_NUM_WARPS = {num_warps};").unwrap();
+    writeln!(out, "constexpr int FUSED_BATCH_BLOCK = {batch_block};").unwrap();
+    writeln!(out, "constexpr int FUSED_SHMEM = {total_shmem};  // max(GEMM={gemm_shmem}, RMSNorm={rmsnorm_shmem})").unwrap();
+    writeln!(out, "constexpr int FUSED_RDPW = {rdpw};").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "using fused_a_st = st_bf<{batch_block}, {k_dim}>;").unwrap();
+    writeln!(out, "using fused_b_st = st_bf<{out_block}, {k_dim}>;").unwrap();
+    writeln!(out, "using fused_acc_rt = rt_fl<16, {out_block}>;  // per-warp accumulator").unwrap();
+    writeln!(out).unwrap();
+
+    // ── The kernel ──
+    writeln!(out, "__global__ void __launch_bounds__({num_threads}, 1)").unwrap();
+    writeln!(out, "fused_rmsnorm_gemm(const globals g, int batch_size, int num_layers) {{").unwrap();
+    writeln!(out, "    const int wid = kittens::warpid();").unwrap();
+    writeln!(out, "    const int lid = kittens::laneid();").unwrap();
+    writeln!(out, "    extern __shared__ char __shm[];").unwrap();
+    writeln!(out).unwrap();
+
+    // ── Phase 1: RMSNorm ──
+    writeln!(out, "    // ════ Phase 1: RMSNorm ════").unwrap();
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "    bf16 *act_smem = reinterpret_cast<bf16*>(__shm + {rmsnorm_act_offset});").unwrap();
+    writeln!(out, "    bf16 *wgt_smem = reinterpret_cast<bf16*>(__shm + {rmsnorm_wgt_offset});").unwrap();
+    writeln!(out, "    float *scratch = reinterpret_cast<float*>(__shm + {rmsnorm_scratch_offset});").unwrap();
+    writeln!(out, "    sv_bf<FUSED_RDPW> *act_tiles = reinterpret_cast<sv_bf<FUSED_RDPW>*>(act_smem);").unwrap();
+    writeln!(out, "    sv_bf<FUSED_RDPW> *wgt_tiles = reinterpret_cast<sv_bf<FUSED_RDPW>*>(wgt_smem);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const int layer = 0;").unwrap();
+    writeln!(out, "    const int batch_idx = 0;  // BS=1").unwrap();
+    writeln!(out).unwrap();
+
+    // Load weights + activations
+    writeln!(out, "    {{ sv_bf<globals::hidden_dim> &wgt_vec = *reinterpret_cast<sv_bf<globals::hidden_dim>*>(wgt_smem);").unwrap();
+    writeln!(out, "       warp::load_async(wgt_vec, g.attn_norm_weights, {{layer, 0}}); }}").unwrap();
+    writeln!(out, "    {{ sv_bf<globals::hidden_dim> &act_vec = *reinterpret_cast<sv_bf<globals::hidden_dim>*>(act_smem);").unwrap();
+    writeln!(out, "       warp::load_async(act_vec, g.hidden_states, {{batch_idx, 0}}); }}").unwrap();
+    writeln!(out, "    fused_cp_async_wait_all();").unwrap();
+    writeln!(out, "    group<FUSED_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Compute RMSNorm
+    writeln!(out, "    rv_fl<FUSED_RDPW> act_vec, copy_vec, scale_vec;").unwrap();
+    writeln!(out, "    warp::load(act_vec, act_tiles[wid]);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::copy(copy_vec, act_vec);").unwrap();
+    writeln!(out, "    warp::mul(copy_vec, copy_vec, copy_vec);").unwrap();
+    writeln!(out, "    float partial_sum = warp::sum(copy_vec);").unwrap();
+    writeln!(out, "    if (lid == 0) scratch[wid] = partial_sum;").unwrap();
+    writeln!(out, "    group<FUSED_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    float full_sum = 0.f;").unwrap();
+    writeln!(out, "    for (int i = 0; i < FUSED_NUM_WARPS; i++) full_sum += scratch[i];").unwrap();
+    writeln!(out, "    float rms = rsqrtf(full_sum / (float)globals::hidden_dim + g.rms_norm_eps);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::copy(copy_vec, act_vec);").unwrap();
+    writeln!(out, "    warp::mul(copy_vec, copy_vec, rms);").unwrap();
+    writeln!(out, "    warp::copy(act_vec, copy_vec);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::load(scale_vec, wgt_tiles[wid]);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out, "    warp::mul(act_vec, act_vec, scale_vec);").unwrap();
+    writeln!(out).unwrap();
+
+    // Store normalized result to interop shmem AND gmem
+    writeln!(out, "    // Store normalized result to shmem (act region) and interop region").unwrap();
+    writeln!(out, "    warp::store(act_tiles[wid], act_vec);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out, "    group<FUSED_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+    // Write to gmem so Phase 2 GEMM can load it
+    writeln!(out, "    // Write normalized output to gmem").unwrap();
+    writeln!(out, "    if (wid == 0) {{").unwrap();
+    writeln!(out, "        sv_bf<globals::hidden_dim> &result = *reinterpret_cast<sv_bf<globals::hidden_dim>*>(act_smem);").unwrap();
+    writeln!(out, "        warp::store(g.rms_rope_intermediates, result, {{batch_idx, 0}});").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __threadfence();  // ensure gmem write visible to cp.async loads").unwrap();
+    writeln!(out, "    group<FUSED_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out, "    }} // end Phase 1").unwrap();
+    writeln!(out).unwrap();
+
+    // ── Phase 2: GEMM (same structure as standalone inline_gemm) ──
+    writeln!(out, "    // ════ Phase 2: GEMM ════").unwrap();
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "    fused_a_st &a_s0 = *reinterpret_cast<fused_a_st*>(__shm);").unwrap();
+    writeln!(out, "    fused_b_st &b_s0 = *reinterpret_cast<fused_b_st*>(__shm + {a_size});").unwrap();
+    writeln!(out, "    fused_a_st &a_s1 = *reinterpret_cast<fused_a_st*>(__shm + {stage_size});").unwrap();
+    writeln!(out, "    fused_b_st &b_s1 = *reinterpret_cast<fused_b_st*>(__shm + {} + {a_size});", stage_size).unwrap();
+    writeln!(out, "    fused_a_st *a_stages[2] = {{&a_s0, &a_s1}};").unwrap();
+    writeln!(out, "    fused_b_st *b_stages[2] = {{&b_s0, &b_s1}};").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const int layer = 0;").unwrap();
+    writeln!(out, "    const int col = 0;").unwrap();
+    writeln!(out, "    const int row = 0;").unwrap();
+    writeln!(out).unwrap();
+
+    // All 8 warps participate in MMA (same as standalone)
+    writeln!(out, "    fused_acc_rt acc;").unwrap();
+    writeln!(out, "    warp::zero(acc);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    using fused_b_slice_st = st_bf<16, {k_dim}>;").unwrap();
+    writeln!(out, "    using fused_a_slice_st = st_bf<16, {k_dim}>;").unwrap();
+    writeln!(out, "    constexpr int N_TILES = FUSED_OUT_BLOCK / 16;").unwrap();
+    writeln!(out).unwrap();
+
+    // Double-buffered K-loop
+    writeln!(out, "    for (int iter = 0; iter < FUSED_NUM_ITERS; iter++) {{").unwrap();
+    writeln!(out, "        int stage = iter % 2;").unwrap();
+    writeln!(out, "        fused_a_st &a_smem = *a_stages[stage];").unwrap();
+    writeln!(out, "        fused_b_st &b_smem = *b_stages[stage];").unwrap();
+    writeln!(out).unwrap();
+
+    // All warps cooperatively load A and B
+    writeln!(out, "        group<FUSED_NUM_WARPS>::load_async(a_smem, g.rms_rope_intermediates, {{row, iter}});").unwrap();
+    writeln!(out, "        group<FUSED_NUM_WARPS>::load_async(b_smem, g.qkv_weights, {{layer, col, iter}});").unwrap();
+    writeln!(out, "        asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "        group<FUSED_NUM_WARPS>::sync(14);").unwrap();
+    writeln!(out).unwrap();
+
+    // Per-warp MMA: each warp handles 16 rows of the 128-row A tile
+    writeln!(out, "        rt_bf<16, {k_dim}> a_reg;").unwrap();
+    writeln!(out, "        {{").unwrap();
+    writeln!(out, "            const fused_a_slice_st &a_warp = reinterpret_cast<const fused_a_slice_st*>(&a_smem)[wid];").unwrap();
+    writeln!(out, "            warp::load(a_reg, a_warp);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        fused_b_slice_st *b_slices = reinterpret_cast<fused_b_slice_st*>(&b_smem);").unwrap();
+    writeln!(out, "        #pragma unroll").unwrap();
+    writeln!(out, "        for (int n = 0; n < N_TILES; n++) {{").unwrap();
+    writeln!(out, "            rt_bf<16, {k_dim}> b_n; fused_load_b_slice(b_n, b_slices[n]);").unwrap();
+    writeln!(out, "            warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][0], b_n.tiles[0][0], acc.tiles[0][n]);").unwrap();
+    writeln!(out, "            #pragma unroll").unwrap();
+    writeln!(out, "            for (int k = 1; k < a_reg.width; k++)").unwrap();
+    writeln!(out, "                warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        group<FUSED_NUM_WARPS>::sync(14);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Store: each warp stores its 16-row output slice
+    writeln!(out, "    rt_bf<16, FUSED_OUT_BLOCK> out_bf;").unwrap();
+    writeln!(out, "    warp::copy(out_bf, acc);").unwrap();
+    writeln!(out, "    warp::store(g.rms_rope_intermediates, out_bf, {{row * (FUSED_BATCH_BLOCK / 16) + wid, col}});").unwrap();
+    writeln!(out, "    }} // end Phase 2").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Launch wrapper
+    emit_tensor_arg_and_globals_helper(&mut out);
+    writeln!(out, "extern \"C\" int fused_rmsnorm_gemm_launch(").unwrap();
+    writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "  try {{").unwrap();
+    emit_globals_construction(&mut out, "    ");
+    writeln!(out).unwrap();
+    writeln!(out, "    int shmem = FUSED_SHMEM;").unwrap();
+    writeln!(out, "    auto err = cudaFuncSetAttribute(fused_rmsnorm_gemm,").unwrap();
+    writeln!(out, "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);").unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
+    writeln!(out, "    fused_rmsnorm_gemm<<<1, {num_threads}, shmem, (cudaStream_t)stream>>>(").unwrap();
+    writeln!(out, "        g, batch_size, num_layers);").unwrap();
+    writeln!(out, "    err = cudaGetLastError();").unwrap();
+    writeln!(out, "    return (int)err;").unwrap();
+    writeln!(out, "  }} catch (...) {{ return -2; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    out
+}
+
 /// List all op names that can be used with `generate_single_op_kernel`.
 pub fn available_op_names() -> Vec<&'static str> {
     vec![

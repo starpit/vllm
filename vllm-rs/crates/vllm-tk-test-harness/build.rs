@@ -88,6 +88,13 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", inline_gemm_path.display()));
     cu_files.push(inline_gemm_path.display().to_string());
 
+    let fused_rmsnorm_gemm_source = vllm_tk_macros_core::generate_fused_rmsnorm_gemm_kernel(dsl)
+        .unwrap_or_else(|e| panic!("fused rmsnorm_gemm codegen failed: {e}"));
+    let fused_rmsnorm_gemm_path = out_dir.join("fused_rmsnorm_gemm.cu");
+    std::fs::write(&fused_rmsnorm_gemm_path, &fused_rmsnorm_gemm_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_rmsnorm_gemm_path.display()));
+    cu_files.push(fused_rmsnorm_gemm_path.display().to_string());
+
     // Build all test kernels into one static library
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)

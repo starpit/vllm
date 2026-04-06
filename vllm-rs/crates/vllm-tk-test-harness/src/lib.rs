@@ -146,4 +146,5 @@ pub mod ffi {
     declare_test_launch!(inline_rmsnorm_launch);
     declare_test_launch!(inline_gemm_launch);
     declare_test_launch!(fused_rmsnorm_gemm_launch);
+    declare_test_launch!(fused_mlp_launch);
 }

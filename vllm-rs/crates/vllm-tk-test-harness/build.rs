@@ -95,6 +95,13 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_rmsnorm_gemm_path.display()));
     cu_files.push(fused_rmsnorm_gemm_path.display().to_string());
 
+    let fused_mlp_source = vllm_tk_macros_core::generate_fused_mlp_kernel(dsl)
+        .unwrap_or_else(|e| panic!("fused mlp codegen failed: {e}"));
+    let fused_mlp_path = out_dir.join("fused_mlp.cu");
+    std::fs::write(&fused_mlp_path, &fused_mlp_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_mlp_path.display()));
+    cu_files.push(fused_mlp_path.display().to_string());
+
     // Build all test kernels into one static library
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)

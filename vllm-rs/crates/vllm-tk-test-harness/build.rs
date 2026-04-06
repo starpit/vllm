@@ -102,6 +102,13 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_mlp_path.display()));
     cu_files.push(fused_mlp_path.display().to_string());
 
+    let inline_attn_source = vllm_tk_macros_core::generate_inline_attention_decode_kernel(dsl)
+        .unwrap_or_else(|e| panic!("inline attention decode codegen failed: {e}"));
+    let inline_attn_path = out_dir.join("inline_attention_decode.cu");
+    std::fs::write(&inline_attn_path, &inline_attn_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", inline_attn_path.display()));
+    cu_files.push(inline_attn_path.display().to_string());
+
     let fused_layer_source = vllm_tk_macros_core::generate_fused_layer_kernel(dsl)
         .unwrap_or_else(|e| panic!("fused layer codegen failed: {e}"));
     let fused_layer_path = out_dir.join("fused_layer.cu");

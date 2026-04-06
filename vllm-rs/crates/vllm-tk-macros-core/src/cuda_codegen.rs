@@ -2670,6 +2670,307 @@ pub fn generate_fused_mlp_kernel(dag: &ModelDag) -> String {
     out
 }
 
+/// Generate an inline attention decode kernel (no KVM protocol).
+///
+/// Each of the 8 warps independently handles one KV head, computing flash attention
+/// over the paged KV cache for GQA_RATIO query heads. No loader/storer/semaphores.
+/// Single block, BS=1 decode.
+pub fn generate_inline_attention_decode_kernel(dag: &ModelDag) -> String {
+    let mut out = String::new();
+
+    let hd = dag.params.get("HD").copied().unwrap_or(2048);
+    let nl = dag.params.get("NL").copied().unwrap_or(16);
+    let nah = dag.params.get("NAH").copied().unwrap_or(32);
+    let nkh = dag.params.get("NKH").copied().unwrap_or(8);
+    let hdm = dag.params.get("HDM").copied().unwrap_or(64);
+    let id = dag.params.get("ID").copied().unwrap_or(8192);
+
+    let gqa_ratio = nah / nkh;
+    let kv_block_size = 16;
+    let kv_page_size = 64;
+    let iters_per_page = kv_page_size / kv_block_size;
+    let num_warps = 8;
+    let num_threads = num_warps * 32;
+
+    // Shmem per warp: Q tile + K tile + V tile (each st_bf<16, hdm>)
+    let tile_bytes = kv_block_size * hdm * 2; // st_bf<16, hdm> = 16 * hdm * 2 bytes
+    let q_tile_bytes = 16 * hdm * 2; // st_bf<16, hdm> — 16 rows for GQA_RATIO heads
+    let warp_shmem = q_tile_bytes + tile_bytes + tile_bytes; // Q + K + V
+    let total_shmem = warp_shmem * num_warps;
+
+    // Preamble
+    writeln!(out, "// GENERATED: Inline attention decode kernel (no KVM protocol)").unwrap();
+    writeln!(out, "// 8 warps, each handles 1 KV head with GQA_RATIO={gqa_ratio} query heads").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#define SM89_NUM_LAYERS             {nl}").unwrap();
+    writeln!(out, "#define SM89_HIDDEN_DIM             {hd}").unwrap();
+    writeln!(out, "#define SM89_INTERMEDIATE_DIM       {id}").unwrap();
+    writeln!(out, "#define SM89_HEAD_DIM               {hdm}").unwrap();
+    writeln!(out, "#define SM89_NUM_ATTENTION_HEADS    {nah}").unwrap();
+    writeln!(out, "#define SM89_NUM_KV_HEADS           {nkh}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#include \"llama_sm89.cuh\"").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "using namespace kittens;").unwrap();
+    writeln!(out, "using namespace kittens::prototype::vm;").unwrap();
+    writeln!(out, "using globals = llama_sm89_globals;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "constexpr int ATTN_NUM_WARPS = {num_warps};").unwrap();
+    writeln!(out, "constexpr int ATTN_GQA_RATIO = {gqa_ratio};").unwrap();
+    writeln!(out, "constexpr int ATTN_KV_BLOCK_SIZE = {kv_block_size};").unwrap();
+    writeln!(out, "constexpr int ATTN_KV_PAGE_SIZE = {kv_page_size};").unwrap();
+    writeln!(out, "constexpr int ATTN_ITERS_PER_PAGE = {iters_per_page};").unwrap();
+    writeln!(out, "constexpr int ATTN_HEAD_DIM = {hdm};").unwrap();
+    writeln!(out, "constexpr int ATTN_SHMEM = {total_shmem};").unwrap();
+    writeln!(out, "constexpr int ATTN_WARP_SHMEM = {warp_shmem};").unwrap();
+    writeln!(out, "constexpr int ATTN_Q_TILE_BYTES = {q_tile_bytes};").unwrap();
+    writeln!(out, "constexpr int ATTN_KV_TILE_BYTES = {tile_bytes};").unwrap();
+    writeln!(out).unwrap();
+
+    // TK tile types for attention
+    writeln!(out, "using attn_q_st  = st_bf<16, ATTN_HEAD_DIM>;").unwrap();
+    writeln!(out, "using attn_kv_st = st_bf<ATTN_KV_BLOCK_SIZE, ATTN_HEAD_DIM>;").unwrap();
+    writeln!(out, "using attn_q_rt  = rt_bf<16, ATTN_HEAD_DIM>;").unwrap();
+    writeln!(out, "using attn_k_rt  = rt_bf<ATTN_KV_BLOCK_SIZE, ATTN_HEAD_DIM>;").unwrap();
+    writeln!(out, "using attn_v_rt  = rt_bf<ATTN_KV_BLOCK_SIZE, ATTN_HEAD_DIM, col_l>;").unwrap();
+    writeln!(out, "using attn_score_fl = rt_fl<16, ATTN_KV_BLOCK_SIZE>;").unwrap();
+    writeln!(out, "using attn_score_bf = rt_bf<16, ATTN_KV_BLOCK_SIZE>;").unwrap();
+    writeln!(out, "using attn_o_rt  = rt_fl<16, ATTN_HEAD_DIM>;").unwrap();
+    writeln!(out, "using attn_o_bf  = rt_bf<16, ATTN_HEAD_DIM>;").unwrap();
+    writeln!(out, "using attn_max_rv = col_vec<rt_fl<16, ATTN_HEAD_DIM>>;").unwrap();
+    writeln!(out, "using attn_norm_rv = col_vec<rt_fl<16, ATTN_HEAD_DIM>>;").unwrap();
+    writeln!(out, "using attn_o_sv  = sv_bf<ATTN_HEAD_DIM>;").unwrap();
+    writeln!(out).unwrap();
+
+    // right_fill helper for causal masking on last block
+    writeln!(out, "template <ducks::rt::row_layout RT>").unwrap();
+    writeln!(out, "__device__ static inline void attn_right_fill(RT &dst, const RT &src, int col_idx,").unwrap();
+    writeln!(out, "    typename base_types::packing<typename RT::dtype>::unpacked_type val = 0) {{").unwrap();
+    writeln!(out, "    if (col_idx >= dst.cols) return;").unwrap();
+    writeln!(out, "    for (int i = 0; i < dst.height; i++)").unwrap();
+    writeln!(out, "        for (int j = 0; j < dst.width; j++)").unwrap();
+    writeln!(out, "            for (int k = 0; k < dst.packed_per_tile; k++) {{").unwrap();
+    writeln!(out, "                auto &d = dst.tiles[i][j].data[k];").unwrap();
+    writeln!(out, "                auto &sv = src.tiles[i][j].data[k];").unwrap();
+    writeln!(out, "                int cx = (j * dst.tile_size_col) + ((k / 2) * 8) + ((warp::laneid() % 4) * 2);").unwrap();
+    writeln!(out, "                int cy = cx + 1;").unwrap();
+    writeln!(out, "                d.x = (cx >= col_idx) ? val : sv.x;").unwrap();
+    writeln!(out, "                d.y = (cy >= col_idx) ? val : sv.y;").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // store_4_rows helper (same as KVM version — extract 4 heads from 16-row tile)
+    writeln!(out, "template <ducks::sv::all SV, ducks::rt::all RT>").unwrap();
+    writeln!(out, "__device__ static inline void attn_store_4_rows(SV (&dst)[4], const RT &src) {{").unwrap();
+    writeln!(out, "    static_assert(RT::rows == 16);").unwrap();
+    writeln!(out, "    static_assert(SV::length == src.cols);").unwrap();
+    writeln!(out, "    using T2 = typename RT::dtype;").unwrap();
+    writeln!(out, "    using U  = typename SV::dtype;").unwrap();
+    writeln!(out, "    using U2 = typename base_types::packing<U>::packed_type;").unwrap();
+    writeln!(out, "    uint32_t dst_ptr[4];").unwrap();
+    writeln!(out, "    for (int i = 0; i < 4; ++i)").unwrap();
+    writeln!(out, "        dst_ptr[i] = static_cast<uint32_t>(__cvta_generic_to_shared(&dst[i].data[0]));").unwrap();
+    writeln!(out, "    int lid = kittens::laneid();").unwrap();
+    writeln!(out, "    if (lid < 16) {{").unwrap();
+    writeln!(out, "        int lr = lid / 4, lc = lid % 4;").unwrap();
+    writeln!(out, "        for (int j = 0; j < src.width; j++) {{").unwrap();
+    writeln!(out, "            U2 tmp[2];").unwrap();
+    writeln!(out, "            tmp[0] = base_types::convertor<U2, T2>::convert(src.tiles[0][j].data[0]);").unwrap();
+    writeln!(out, "            tmp[1] = base_types::convertor<U2, T2>::convert(src.tiles[0][j].data[2]);").unwrap();
+    writeln!(out, "            int ci = lc * 2 + j * 16;").unwrap();
+    writeln!(out, "            move<U2>::sts(dst_ptr[lr] + sizeof(U) * ci,     tmp[0]);").unwrap();
+    writeln!(out, "            move<U2>::sts(dst_ptr[lr] + sizeof(U) * (ci+8), tmp[1]);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // cp.async helper
+    writeln!(out, "__device__ static inline void attn_cp_async_wait_all() {{").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.wait_all;\\n\"     ::: \"memory\");").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // ── The kernel ──
+    writeln!(out, "__global__ void __launch_bounds__({num_threads}, 1)").unwrap();
+    writeln!(out, "inline_attention_decode(const globals g, int batch_size, int num_layers) {{").unwrap();
+    writeln!(out, "    const int wid = kittens::warpid();").unwrap();
+    writeln!(out, "    const int lid = kittens::laneid();").unwrap();
+    writeln!(out, "    extern __shared__ char __shm[];").unwrap();
+    writeln!(out, "    const int layer = 0;").unwrap();
+    writeln!(out, "    const int batch_idx = 0;  // BS=1").unwrap();
+    writeln!(out).unwrap();
+
+    // Each warp gets its own shmem region for Q, K, V tiles
+    writeln!(out, "    // Per-warp shmem: Q tile + K tile + V tile").unwrap();
+    writeln!(out, "    char *warp_shm = __shm + wid * ATTN_WARP_SHMEM;").unwrap();
+    writeln!(out, "    attn_q_st  &Q_smem = *reinterpret_cast<attn_q_st*>(warp_shm);").unwrap();
+    writeln!(out, "    attn_kv_st &K_smem = *reinterpret_cast<attn_kv_st*>(warp_shm + ATTN_Q_TILE_BYTES);").unwrap();
+    writeln!(out, "    attn_kv_st &V_smem = *reinterpret_cast<attn_kv_st*>(warp_shm + ATTN_Q_TILE_BYTES + ATTN_KV_TILE_BYTES);").unwrap();
+    writeln!(out).unwrap();
+
+    // This warp handles KV head = wid
+    writeln!(out, "    const int kv_head = wid;  // 8 warps = 8 KV heads").unwrap();
+    writeln!(out, "    const int q_head_start = kv_head * ATTN_GQA_RATIO;").unwrap();
+    writeln!(out).unwrap();
+
+    // Read paged KV metadata
+    writeln!(out, "    int indptr_start = g.decode_kv_indptr[{{batch_idx}}];").unwrap();
+    writeln!(out, "    int indptr_end   = g.decode_kv_indptr[{{batch_idx + 1}}];").unwrap();
+    writeln!(out, "    int num_kv_pages = indptr_end - indptr_start;").unwrap();
+    writeln!(out, "    int last_page_len = g.decode_kv_last_page_len[{{batch_idx}}];").unwrap();
+    writeln!(out, "    int seq_len = (num_kv_pages - 1) * ATTN_KV_PAGE_SIZE + last_page_len;").unwrap();
+    writeln!(out, "    int total_blks = ((num_kv_pages - 1) * ATTN_ITERS_PER_PAGE) +").unwrap();
+    writeln!(out, "                     (last_page_len + ATTN_KV_BLOCK_SIZE - 1) / ATTN_KV_BLOCK_SIZE;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load Q from q_post_rope into shmem, then into registers
+    // Q layout in q_post_rope: [batch_idx, q_head_start * head_dim]
+    // Using cp.async for Q load (same pattern as KVM load_Q_async)
+    writeln!(out, "    // ── Load Q ──").unwrap();
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "        using T = typename attn_q_st::dtype;").unwrap();
+    writeln!(out, "        constexpr int elem_per_memcpy = sizeof(float4) / sizeof(T);  // 8").unwrap();
+    writeln!(out, "        constexpr int memcpy_per_row = ATTN_HEAD_DIM / elem_per_memcpy;").unwrap();
+    writeln!(out, "        auto *src_ptr = (bf16*)&g.q_post_rope[coord<>{{batch_idx, q_head_start * ATTN_HEAD_DIM}}];").unwrap();
+    writeln!(out, "        uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&Q_smem.data[0]));").unwrap();
+    writeln!(out, "        int col = (lid % memcpy_per_row) * elem_per_memcpy;").unwrap();
+    writeln!(out, "        int base_row = (lid < memcpy_per_row) ? 0 : 1;").unwrap();
+    writeln!(out, "        for (int i = 0; i < (ATTN_GQA_RATIO / 2); i++) {{").unwrap();
+    writeln!(out, "            int row = base_row + i * 2;").unwrap();
+    writeln!(out, "            asm volatile(").unwrap();
+    writeln!(out, "                \"cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\\n\" ::").unwrap();
+    writeln!(out, "                \"r\"(Q_smem.idx(dst_ptr, {{row, col}})),").unwrap();
+    writeln!(out, "                \"l\"(&src_ptr[row * ATTN_HEAD_DIM + col]) : \"memory\");").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "        asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Load Q from shmem into registers
+    writeln!(out, "    attn_q_rt Q_reg;").unwrap();
+    writeln!(out, "    warp::load(Q_reg, Q_smem);").unwrap();
+    writeln!(out).unwrap();
+
+    // Initialize flash attention state
+    writeln!(out, "    // ── Flash attention state ──").unwrap();
+    writeln!(out, "    attn_o_rt O_reg;").unwrap();
+    writeln!(out, "    attn_max_rv max_vec, scaled_max, last_scaled_max, diff_scaled_max;").unwrap();
+    writeln!(out, "    attn_norm_rv norm_vec;").unwrap();
+    writeln!(out, "    warp::neg_infty(max_vec);").unwrap();
+    writeln!(out, "    warp::zero(last_scaled_max);").unwrap();
+    writeln!(out, "    warp::zero(norm_vec);").unwrap();
+    writeln!(out, "    warp::zero(O_reg);").unwrap();
+    writeln!(out, "    float softmax_temp = g.attn_scale * 1.44269504089f;").unwrap();
+    writeln!(out).unwrap();
+
+    // Flash attention loop over KV blocks
+    writeln!(out, "    // ── KV block loop (flash attention) ──").unwrap();
+    writeln!(out, "    for (int i = 0; i < total_blks; i++) {{").unwrap();
+    writeln!(out).unwrap();
+
+    // Load K from paged KV cache
+    writeln!(out, "        int kv_page_index = g.decode_kv_indices[{{indptr_start + (i / ATTN_ITERS_PER_PAGE)}}];").unwrap();
+    writeln!(out, "        int iter_in_page = i % ATTN_ITERS_PER_PAGE;").unwrap();
+    writeln!(out, "        int page_batch = (int)g.num_pages * layer + kv_page_index;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        warp::load_async<1, false>(K_smem, g.k_cache, {{page_batch, iter_in_page, kv_head, 0}});").unwrap();
+    writeln!(out, "        attn_cp_async_wait_all();").unwrap();
+    writeln!(out).unwrap();
+
+    // Q @ K^T
+    writeln!(out, "        attn_k_rt K_reg;").unwrap();
+    writeln!(out, "        warp::load(K_reg, K_smem);").unwrap();
+    writeln!(out, "        attn_score_fl attn_fl;").unwrap();
+    writeln!(out, "        warp::zero(attn_fl);").unwrap();
+    writeln!(out, "        warp::mma_ABt(attn_fl, Q_reg, K_reg, attn_fl);").unwrap();
+    writeln!(out).unwrap();
+
+    // Causal mask on last block
+    writeln!(out, "        if ((i + 1) * ATTN_KV_BLOCK_SIZE > seq_len)").unwrap();
+    writeln!(out, "            attn_right_fill(attn_fl, attn_fl, seq_len % ATTN_KV_BLOCK_SIZE, -999999999999.f);").unwrap();
+    writeln!(out).unwrap();
+
+    // Online softmax update
+    writeln!(out, "        warp::row_max(max_vec, attn_fl, max_vec);").unwrap();
+    writeln!(out, "        warp::mul(attn_fl, attn_fl, softmax_temp);").unwrap();
+    writeln!(out, "        warp::mul(scaled_max, max_vec, softmax_temp);").unwrap();
+    writeln!(out, "        warp::sub_row(attn_fl, attn_fl, scaled_max);").unwrap();
+    writeln!(out, "        warp::exp2(attn_fl, attn_fl);").unwrap();
+    writeln!(out, "        warp::sub(diff_scaled_max, last_scaled_max, scaled_max);").unwrap();
+    writeln!(out, "        warp::exp2(diff_scaled_max, diff_scaled_max);").unwrap();
+    writeln!(out, "        warp::mul_row(O_reg, O_reg, diff_scaled_max);").unwrap();
+    writeln!(out).unwrap();
+
+    // Load V and accumulate
+    writeln!(out, "        warp::load_async<1, false>(V_smem, g.v_cache, {{page_batch, iter_in_page, kv_head, 0}});").unwrap();
+    writeln!(out, "        attn_cp_async_wait_all();").unwrap();
+    writeln!(out, "        attn_v_rt V_reg;").unwrap();
+    writeln!(out, "        warp::load(V_reg, V_smem);").unwrap();
+    writeln!(out, "        attn_score_bf attn_bf;").unwrap();
+    writeln!(out, "        warp::copy(attn_bf, attn_fl);").unwrap();
+    writeln!(out, "        warp::mma_AB(O_reg, attn_bf, V_reg, O_reg);").unwrap();
+    writeln!(out).unwrap();
+
+    // Update norm
+    writeln!(out, "        warp::mul(norm_vec, norm_vec, diff_scaled_max);").unwrap();
+    writeln!(out, "        warp::row_sum(norm_vec, attn_fl, norm_vec);").unwrap();
+    writeln!(out, "        warp::copy(last_scaled_max, scaled_max);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Normalize and store output
+    writeln!(out, "    // ── Normalize and store ──").unwrap();
+    writeln!(out, "    warp::div_row(O_reg, O_reg, norm_vec);").unwrap();
+    writeln!(out, "    attn_o_bf O_bf;").unwrap();
+    writeln!(out, "    warp::copy(O_bf, O_reg);").unwrap();
+    writeln!(out).unwrap();
+
+    // Store output to attn_out using store_4_rows → shmem → gmem
+    // Reuse Q_smem area as O staging (Q is no longer needed)
+    writeln!(out, "    // Store via shmem: 4 sv_bf<head_dim> per warp in Q_smem area").unwrap();
+    writeln!(out, "    attn_o_sv (&O_smem)[4] = *reinterpret_cast<attn_o_sv(*)[4]>(warp_shm);").unwrap();
+    writeln!(out, "    attn_store_4_rows(O_smem, O_bf);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out).unwrap();
+
+    // Copy from shmem to global attn_out
+    writeln!(out, "    for (int head_in_group = 0; head_in_group < ATTN_GQA_RATIO; head_in_group++) {{").unwrap();
+    writeln!(out, "        int out_head = q_head_start + head_in_group;").unwrap();
+    writeln!(out, "        auto *dst = (bf16*)&g.attn_out[coord<>{{batch_idx, out_head * ATTN_HEAD_DIM}}];").unwrap();
+    writeln!(out, "        auto *src = (bf16*)&O_smem[head_in_group].data[0];").unwrap();
+    writeln!(out, "        for (int i = lid; i < ATTN_HEAD_DIM; i += 32)").unwrap();
+    writeln!(out, "            dst[i] = src[i];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Launch wrapper
+    emit_tensor_arg_and_globals_helper(&mut out);
+    writeln!(out, "extern \"C\" int inline_attention_decode_launch(").unwrap();
+    writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "  try {{").unwrap();
+    emit_globals_construction(&mut out, "    ");
+    writeln!(out).unwrap();
+    writeln!(out, "    int shmem = ATTN_SHMEM;").unwrap();
+    writeln!(out, "    auto err = cudaFuncSetAttribute(inline_attention_decode,").unwrap();
+    writeln!(out, "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);").unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
+    writeln!(out, "    inline_attention_decode<<<1, {num_threads}, shmem, (cudaStream_t)stream>>>(").unwrap();
+    writeln!(out, "        g, batch_size, num_layers);").unwrap();
+    writeln!(out, "    err = cudaGetLastError();").unwrap();
+    writeln!(out, "    return (int)err;").unwrap();
+    writeln!(out, "  }} catch (...) {{ return -2; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    out
+}
+
 /// Generate a fused single-layer kernel (no KVM protocol).
 ///
 /// Chains all non-attention ops for one transformer layer:
@@ -3345,5 +3646,38 @@ mod tests {
         assert!(cuda.contains("Phase 8: down GEMM"));
         assert!(cuda.contains("fused_layer("));
         assert!(cuda.contains("fused_layer_launch("));
+    }
+
+    #[test]
+    fn generates_inline_attention_decode() {
+        let input: proc_macro2::TokenStream = quote::quote! {
+            kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                    let qkv = gemm(normed, qkv_weights[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                    let gate = silu(gemm(normed2, gate_weights[layer]));
+                    let up = gemm(normed2, up_weights[layer]);
+                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                }
+                let normed = rmsnorm(hidden_states, lm_head_norm);
+                logits = gemm(normed, lm_head);
+            }
+        };
+        let def: crate::parse::MegakernelDef = syn::parse2(input).expect("parse");
+        let dag = crate::parse::build_dag(&def).expect("dag");
+        let cuda = generate_inline_attention_decode_kernel(&dag);
+
+        assert!(cuda.contains("inline_attention_decode("));
+        assert!(cuda.contains("inline_attention_decode_launch("));
+        assert!(cuda.contains("warp::mma_ABt")); // Q @ K^T
+        assert!(cuda.contains("warp::mma_AB"));  // attn @ V
+        assert!(cuda.contains("warp::exp2"));     // softmax
+        assert!(cuda.contains("warp::div_row"));  // normalization
+        assert!(cuda.contains("decode_kv_indptr")); // paged KV
+        assert!(!cuda.contains("init_semaphore")); // no KVM
     }
 }

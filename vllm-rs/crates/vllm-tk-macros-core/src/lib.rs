@@ -114,6 +114,18 @@ pub fn generate_fused_rmsnorm_gemm_kernel(dsl: &str) -> Result<String, String> {
     Ok(cuda_codegen::generate_fused_rmsnorm_gemm_kernel(&dag))
 }
 
+/// Generate an inline attention decode kernel (no KVM protocol).
+///
+/// Each of 8 warps handles 1 KV head with GQA_RATIO query heads.
+pub fn generate_inline_attention_decode_kernel(dsl: &str) -> Result<String, String> {
+    let tokens: proc_macro2::TokenStream = dsl
+        .parse()
+        .map_err(|e| format!("failed to tokenize DSL: {e}"))?;
+    let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("parse error: {e}"))?;
+    let dag = parse::build_dag(&def)?;
+    Ok(cuda_codegen::generate_inline_attention_decode_kernel(&dag))
+}
+
 /// Generate a fused single-layer kernel (no KVM protocol).
 ///
 /// Chains: attn_norm → QKV GEMM → [skip attention] → o_proj+residual → MLP block.

@@ -945,3 +945,128 @@ fn test_fused_layer_golden() {
 
     assert_close(gpu_row0, &expected, 1.5, 0.15, "fused_layer_golden");
 }
+
+/// Upload i32 data to GPU.
+fn gpu_upload_i32(data: &[i32]) -> u64 {
+    unsafe {
+        let bytes = data.len() * 4;
+        let dptr = result::malloc_sync(bytes).expect("cuMemAlloc failed");
+        result::memcpy_htod_sync(dptr, data).expect("cuMemcpyHtoD failed");
+        dptr as u64
+    }
+}
+
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_inline_attention_decode_golden() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    // Test setup: 1 sequence, 48 tokens (spans 1 page of 64 tokens, partial last page)
+    let seq_len: usize = 48;
+    let num_pages_used = (seq_len + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE; // 1
+    let last_page_len = seq_len - (num_pages_used - 1) * KV_PAGE_SIZE; // 48
+    let attn_scale = 1.0 / (HDM as f32).sqrt();
+
+    // Q: [NAH * HDM] = [32 * 64] = 2048 (full hidden dim, laid out as NAH heads of HDM each)
+    let q_data = bf16_roundtrip(&make_random(NAH * HDM, 500, 0.5));
+
+    // KV cache: [seq_len, NKH, HDM] for CPU golden
+    let k_cache_flat = bf16_roundtrip(&make_random(seq_len * NKH * HDM, 600, 0.5));
+    let v_cache_flat = bf16_roundtrip(&make_random(seq_len * NKH * HDM, 700, 0.5));
+
+    // ── CPU golden ──
+    let mut expected = vec![0.0_f32; NAH * HDM];
+    cpu_golden::attention_decode(
+        &q_data,
+        &k_cache_flat,
+        &v_cache_flat,
+        &mut expected,
+        seq_len,
+        NAH,
+        NKH,
+        HDM,
+        attn_scale,
+    );
+
+    // ── GPU setup ──
+    let mut b = TestBuffers::new();
+
+    // Upload Q to q_post (activations layout: [ACT_ROWS, HD])
+    let mut q_full = vec![0.0_f32; ACT_ROWS * HD];
+    q_full[..NAH * HDM].copy_from_slice(&q_data);
+    b.q_post = gpu_upload_bf16(&q_full);
+
+    // Upload KV cache in paged layout: [num_layers * NUM_PAGES, KV_PAGE_SIZE, NKH, HDM]
+    // For our test: 1 page (page_id=0), layer=0
+    // CPU golden layout: [seq_len, NKH, HDM] — need to rearrange to paged format
+    let total_kv_cache_size = NL * NUM_PAGES * KV_PAGE_SIZE * NKH * HDM;
+    let mut k_paged = vec![0.0_f32; total_kv_cache_size];
+    let mut v_paged = vec![0.0_f32; total_kv_cache_size];
+
+    // Copy seq_len tokens into page 0 (layer 0)
+    // Paged layout: page_batch = num_pages * layer + page_index
+    // Within page: [KV_PAGE_SIZE, NKH, HDM]
+    let page_index = 0_usize;
+    let page_batch = NUM_PAGES * 0 + page_index; // layer 0
+    for tok in 0..seq_len {
+        for kv_h in 0..NKH {
+            for d in 0..HDM {
+                let flat_idx = tok * NKH * HDM + kv_h * HDM + d;
+                let paged_idx = page_batch * KV_PAGE_SIZE * NKH * HDM
+                    + tok * NKH * HDM + kv_h * HDM + d;
+                k_paged[paged_idx] = k_cache_flat[flat_idx];
+                v_paged[paged_idx] = v_cache_flat[flat_idx];
+            }
+        }
+    }
+    b.k_cache = gpu_upload_bf16(&k_paged);
+    b.v_cache = gpu_upload_bf16(&v_paged);
+
+    // Paged KV metadata for 1 sequence, 1 page
+    // indptr: [0, 1] — 1 page for sequence 0
+    let kv_indptr = vec![0_i32, num_pages_used as i32];
+    let mut indptr_full = vec![0_i32; ACT_ROWS + 1];
+    indptr_full[..kv_indptr.len()].copy_from_slice(&kv_indptr);
+    b.kv_indptr = gpu_upload_i32(&indptr_full);
+
+    // indices: [0] — page 0
+    let mut indices_full = vec![0_i32; NUM_PAGES];
+    indices_full[0] = page_index as i32;
+    b.kv_indices = gpu_upload_i32(&indices_full);
+
+    // last_page_len: [48]
+    let mut last_page_full = vec![0_i32; ACT_ROWS];
+    last_page_full[0] = last_page_len as i32;
+    b.kv_last_page = gpu_upload_i32(&last_page_full);
+
+    // attn_out: zero buffer
+    b.attn_out = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+
+    let rc = call_launch!(ffi::inline_attention_decode_launch, b);
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "inline_attention_decode_launch returned error {rc}");
+
+    // Read back attn_out
+    let gpu_out = gpu_download_bf16(b.attn_out, ACT_ROWS * HD);
+    let gpu_row0 = &gpu_out[..NAH * HDM];
+
+    eprintln!("AttnDecode GPU[0..4]: {:?}", &gpu_row0[..4]);
+    eprintln!("AttnDecode CPU[0..4]: {:?}", &expected[..4]);
+
+    // Flash attention with bf16 MMA accumulates error across seq_len blocks
+    // Tolerance is higher than GEMM due to softmax numerical sensitivity
+    assert_close(gpu_row0, &expected, 2.0, 0.2, "inline_attention_decode_golden");
+}

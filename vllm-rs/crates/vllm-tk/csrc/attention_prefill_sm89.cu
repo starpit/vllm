@@ -112,12 +112,15 @@ struct attention_prefill {
         return *reinterpret_cast<kv_st *>(s.pages[s.pid(stage * PAGES_PER_STAGE + K_PAGES)].data);
     }
 
-    // Q and O use scratch. Each warp gets sizeof(q_st) bytes (non-overlapping).
-    // For head_dim=64: q_st = st_bf<16,64> = 2048 bytes. 4 warps × 2048 = 8KB = scratch size.
-    // After Q is loaded to registers, the same region is reused for O output.
+    // Q and O use scratch (same as decode). Scratch is 8KB, fits st_bf<16, 64> for head_dim=64.
+    // For head_dim=128, Q would need 16KB > 8KB scratch — would need a page. Currently 1B only.
     __device__ static inline q_st &get_Q_smem(state<Config> &s, int wid) {
         return *reinterpret_cast<q_st *>(
-            reinterpret_cast<char *>(s.scratch()) + sizeof(q_st) * wid);
+            reinterpret_cast<char *>(s.scratch()) + sizeof(o_sv) * wid * 4);
+    }
+    __device__ static inline o_sv (&get_O_smem(state<Config> &s, int wid))[4] {
+        return *reinterpret_cast<o_sv(*)[4]>(
+            reinterpret_cast<char *>(s.scratch()) + sizeof(o_sv) * wid * 4);
     }
 
     // Load Q for one consumer warp (16 tokens) using cp.async — same helper as decode.
@@ -128,26 +131,14 @@ struct attention_prefill {
         constexpr int elem_per_memcpy = sizeof(float4) / sizeof(T);
         constexpr int memcpy_per_row  = head_dim / elem_per_memcpy;
 
+        // src_ptr points to [batch_idx, q_head_start_idx * head_dim] already.
+        // Each row stride is num_attention_heads * head_dim (= hidden_size).
         auto *src_ptr = (typename Globals::activations_t::dtype *)&src[coord<>{batch_idx, q_head_start_idx * head_dim}];
         uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&dst.data[0]));
         int lid = warp::laneid();
-        int col = (lid % memcpy_per_row) * elem_per_memcpy;
-        int base_row = (lid < memcpy_per_row) ? 0 : 1;
 
-        // For GQA_RATIO heads packed into 16 rows: load GQA_RATIO/2 rows per lane pair.
-        // But for prefill, Q is organized differently: rows are tokens (not heads).
-        // Each consumer warp handles 1 head. Load 16 rows × head_dim.
-        // Actually, in prefill each instruction covers 16 tokens for one kv_head group.
-        // The consumer warp handles one of the GQA_RATIO Q heads within that kv_head.
-        // Q in q_post_rope is [total_tokens, num_attn_heads * head_dim].
-        // For warp wid, it handles head (kv_head_idx * GQA_RATIO + wid).
-        // We need to load 16 contiguous rows but only the columns for this head.
-
-        // Simpler approach: load row by row, 1 row = head_dim bf16 = head_dim*2 bytes.
-        // For head_dim=64: 128 bytes = 1 cp.async per row. 16 rows, 32 lanes.
-        // Each lane loads 16 rows / 32 lanes? No — cp.async.cg.shared.global is 16 bytes per lane.
-        // For head_dim=64: 128 bytes/row. Need 128/16 = 8 lanes per row. 32 lanes → 4 rows per iteration.
-        // 16 rows total → 4 iterations.
+        // Load 16 rows × head_dim via cp.async. Each cp.async copies 16 bytes.
+        // For head_dim=64: 128 bytes/row, 8 lanes per row, 4 rows per iteration.
         for (int iter = 0; iter < (16 + 3) / 4; iter++) {
             int row = iter * 4 + lid / (head_dim / elem_per_memcpy);
             int c = (lid % (head_dim / elem_per_memcpy)) * elem_per_memcpy;
@@ -210,14 +201,13 @@ struct attention_prefill {
         static __device__ void run(const Globals &g, state<Config> &s) {
             int lid = warp::laneid();
             prefill_instruction pi(g, s);
-            // sm89: no instruction_fetch_ready (that's a Hopper/Blackwell feature)
 
-            // Release pages not used by any stage. Consumers handle all stage pages
-            // (both used and unused stages) via finish_page with FINISH_COUNT.
-            // Loader only releases pages beyond all stage slots.
-            constexpr int STAGE_PAGES = NUM_STAGES * PAGES_PER_STAGE;
+            int used_stages = min(pi.attn_blocks, NUM_STAGES);
+            int first_unused_page = used_stages * PAGES_PER_STAGE;
+
+            // Release unused pages.
             if (lid == 0) {
-                for (int p = STAGE_PAGES; p < (int)Config::NUM_PAGES; p++) {
+                for (int p = first_unused_page; p < (int)Config::NUM_PAGES; p++) {
                     int unused = s.pid(p);
                     s.wait_page_ready(unused);
                     s.finish_page(unused, Config::NUM_CONSUMER_WARPS);
@@ -225,18 +215,22 @@ struct attention_prefill {
             }
             __syncwarp();
 
-            // Wait for Q + K to be ready in q_post_rope / KV cache.
-            // QKV storer signals Bar[{layer, QKV-1, bb, col}] += 1 per head column.
-            // Q heads for kv_head h are columns [h*GQA_RATIO .. h*GQA_RATIO + GQA_RATIO-1].
-            // K head h is at column num_attention_heads + h.
-            // Wait for the last Q column for this kv_head (implies all earlier cols done).
+            // Wait for Q to be ready in q_post_rope (barrier from QKV_RopeAppend).
+            // QKV storer signals Bar[{layer, QKV-1, bb, head}] += 1 per tile.
+            // We need Q written for the batch block(s) containing our 16-token chunk.
+            // Wait for column 0 to have at least 1 signal (meaning the first Q tile completed).
             int batch_block_idx = pi.abs_q_row / mbb;
-            int last_q_col = pi.kv_head_idx * GQA_RATIO + (GQA_RATIO - 1);
-            int k_col = Globals::num_attention_heads + pi.kv_head_idx;
+            int batch_block_idx_last = pi.abs_q_row_last / mbb;
             if (lid == 0) {
-                while (*(volatile int *)&g.Bar[{pi.layer_idx, OPCODE_QKV_RopeAppend - 1, batch_block_idx, last_q_col}] < 1)
+                while (*(volatile int *)&g.Bar[{pi.layer_idx, OPCODE_QKV_RopeAppend - 1, batch_block_idx, 0}] < 1)
                     __nanosleep(20);
-                while (*(volatile int *)&g.Bar[{pi.layer_idx, OPCODE_QKV_RopeAppend - 1, batch_block_idx, k_col}] < 1)
+                if (batch_block_idx_last != batch_block_idx) {
+                    while (*(volatile int *)&g.Bar[{pi.layer_idx, OPCODE_QKV_RopeAppend - 1, batch_block_idx_last, 0}] < 1)
+                        __nanosleep(20);
+                }
+                // Also wait for KV cache writes (K heads start at num_attention_heads).
+                while (*(volatile int *)&g.Bar[{pi.layer_idx, OPCODE_QKV_RopeAppend - 1,
+                       batch_block_idx, (int)Globals::num_attention_heads + pi.kv_head_idx}] < 1)
                     __nanosleep(20);
             }
             __syncwarp();
@@ -244,12 +238,22 @@ struct attention_prefill {
             // Signal Q arrived so consumers can start loading Q from q_post_rope.
             if (lid == 0) arrive(Q_arrived(s));
 
-            // Determine which KV iteration needs the barrier wait for KV cache writes.
-            int stage_idx_for_barriers = pi.prefill_token_offset / kv_page_size;
-
             // Pipeline KV loads.
+            if (lid == 0) {
+                printf("PREFILL_LOADER: SM=%d layer=%d seq=%d blk=%d kv_head=%d attn_blocks=%d "
+                       "kv_indptr_start=%d abs_q_row=%d seq_len=%d k_ptr=%p num_pages=%d\n",
+                    blockIdx.x, pi.layer_idx, pi.seq_idx, pi.prefill_block_idx,
+                    pi.kv_head_idx, pi.attn_blocks, pi.kv_indptr_start,
+                    pi.abs_q_row, pi.sequence_length,
+                    (void*)g.k_cache.raw_ptr, (int)g.num_pages);
+            }
             for (int i = 0; i < pi.attn_blocks; ++i) {
                 int kv_page_index = g.prefill_kv_indices[{pi.kv_indptr_start + i}];
+                if (lid == 0) {
+                    printf("PREFILL_KV_LOAD: SM=%d i=%d kv_page_index=%d page_batch=%d\n",
+                        blockIdx.x, i, kv_page_index,
+                        (int)g.num_pages * pi.layer_idx + kv_page_index);
+                }
                 int stage = i % NUM_STAGES;
 
                 // Wait for stage availability.
@@ -264,32 +268,87 @@ struct attention_prefill {
                 }
                 __syncwarp();
 
-                // Wait for KV cache writes if this is the relevant iteration.
-                if (i == stage_idx_for_barriers && lid == 0) {
-                    int q_start = g.prefill_qo_indptr[{pi.seq_idx}];
-                    int q_end   = g.prefill_qo_indptr[{pi.seq_idx + 1}];
-                    // Wait for all batch blocks that contain this sequence's tokens
-                    // to have their KV cache writes complete.
-                    for (int j = q_start; j < q_end; j += mbb) {
-                        int check_row = j / mbb;
-                        while (*(volatile int *)&g.Bar[{pi.layer_idx, OPCODE_QKV_RopeAppend - 1,
-                               check_row, (int)Globals::num_attention_heads + pi.kv_head_idx}] < 1)
-                            __nanosleep(20);
+                // Load K/V from paged cache using raw cp.async to bypass gl bounds check.
+                // Cache layout: [nl*np, ipp, nkh, hd] row-major.
+                // We need kv_page_size contiguous rows for one kv_head, but the cache
+                // stores each kv_block_size chunk interleaved across kv_heads.
+                // Token t within a page at kv_head h is at:
+                //   flat_offset = page_batch * (ipp * nkh * hd) + (t / kbs) * (nkh * hd) + h * hd
+                //   where within that kv_block, the row is t % kbs, so:
+                //   flat_offset = page_batch * (ipp * nkh * hd) + t * nkh * hd + h * hd
+                //   Wait, no: [B,D,R,C] = [b, d, r, c] → flat = b*(D*R*C) + d*(R*C) + r*C + c
+                //   For token t in page: d = t/kbs, then the token's "r" index within the
+                //   kv_block is (t%kbs) mapped into the R=nkh dimension. But store_kv_paged uses
+                //   raw offsets: (b*D + offset_in_page) * R * C + h * C. So offset_in_page = t
+                //   and it just uses t as if D were kv_page_size (not ipp).
+                //   This means store treats it as [nl*np, kv_page_size, nkh, hd] even though
+                //   the gl declares D=ipp. The raw pointer math works because the total size
+                //   is the same: ipp * nkh * hd = (kv_page_size/kbs) * nkh * hd.
+                //   Actually: store uses (b*D + t) where D = cache.depth() = ipp.
+                //   With ipp=4 and t up to 63, b*4+63 goes past the next page batch boundary.
+                //   So the cache is effectively flat: [nl*np*ipp*nkh*hd] with some striding.
+                //   For loading: token t at kv_head h has flat index:
+                //     (page_batch * ipp + t) * nkh * hd + h * hd + col
+                //   This is equivalent to treating the cache as [nl*np*ipp, nkh, hd].
+                {
+                    using bf16 = __nv_bfloat16;
+                    constexpr int nkh = Globals::num_kv_heads;
+                    constexpr int hd = head_dim;
+                    constexpr int ipp = Globals::iters_per_page;
+                    constexpr int elem_per_cp = sizeof(float4) / sizeof(bf16); // 8
+                    constexpr int lanes_per_row = hd / elem_per_cp; // 8
+                    constexpr int rows_per_iter = 32 / lanes_per_row; // 4
+
+                    bf16 *k_base = (bf16*)g.k_cache.raw_ptr;
+                    bf16 *v_base = (bf16*)g.v_cache.raw_ptr;
+                    int page_batch = (int)g.num_pages * pi.layer_idx + kv_page_index;
+                    int ri_debug_once = 0;
+
+                    kv_st &K_tile = K(s, stage);
+                    kv_st &V_tile = V(s, stage);
+                    uint32_t k_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&K_tile.data[0]));
+                    uint32_t v_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&V_tile.data[0]));
+
+                    // Total cache elements for bounds checking
+                    long cache_elems = (long)g.k_cache.batch() * g.k_cache.depth()
+                                     * nkh * hd;
+                    if (lid == 0 && ri_debug_once == 0) {
+                        printf("PREFILL_KV_ADDR: SM=%d k_base=%p v_base=%p cache_elems=%ld "
+                               "page_batch=%d ipp=%d nkh=%d hd=%d kv_head=%d batch=%d depth=%d\n",
+                            blockIdx.x, k_base, v_base, cache_elems,
+                            page_batch, ipp, nkh, hd, pi.kv_head_idx,
+                            (int)g.k_cache.batch(), (int)g.k_cache.depth());
+                        ri_debug_once = 1;
+                    }
+                    for (int ri = 0; ri < (kv_page_size + rows_per_iter - 1) / rows_per_iter; ri++) {
+                        int row = ri * rows_per_iter + lid / lanes_per_row;
+                        int col = (lid % lanes_per_row) * elem_per_cp;
+                        if (row < kv_page_size) {
+                            // Token row within page → flat cache offset
+                            long src_off = ((long)page_batch * ipp + row) * nkh * hd
+                                         + (long)pi.kv_head_idx * hd + col;
+                            if (src_off < 0 || src_off + elem_per_cp > cache_elems) {
+                                if (lid == 0)
+                                    printf("PREFILL_OOB: SM=%d row=%d col=%d src_off=%ld cache_elems=%ld "
+                                           "addr=%p page_batch=%d\n",
+                                        blockIdx.x, row, col, src_off, cache_elems,
+                                        &k_base[src_off], page_batch);
+                                // Skip this cp.async to avoid crash
+                            } else {
+                                asm volatile(
+                                    "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
+                                    "r"(K_tile.idx(k_smem, {row, col})),
+                                    "l"(&k_base[src_off]) : "memory");
+                                asm volatile(
+                                    "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
+                                    "r"(V_tile.idx(v_smem, {row, col})),
+                                    "l"(&v_base[src_off]) : "memory");
+                            }
+                        }
                     }
                 }
-                __syncwarp();
 
-                // Load K from paged cache.
-                warp::load_async<1, false>(K(s, stage), g.k_cache,
-                    {(int)g.num_pages * pi.layer_idx + kv_page_index,
-                     0, pi.kv_head_idx, 0});
-
-                // Load V from paged cache.
-                warp::load_async<1, false>(V(s, stage), g.v_cache,
-                    {(int)g.num_pages * pi.layer_idx + kv_page_index,
-                     0, pi.kv_head_idx, 0});
-
-                asm volatile("cp.async.wait_all;\n" ::: "memory");
+                asm volatile("cp.async.commit_group;\ncp.async.wait_all;\n" ::: "memory");
                 __syncwarp();
 
                 if (lid == 0) {
@@ -312,10 +371,6 @@ struct attention_prefill {
         }
     };
 
-    // Page release count: each active warp must signal enough so that
-    // GQA_RATIO warps × FINISH_COUNT = NUM_CONSUMER_WARPS.
-    static constexpr int FINISH_COUNT = Config::NUM_CONSUMER_WARPS / GQA_RATIO;
-
     // ── consumer ────────────────────────────────────────────────────────
     // Each of the 8 consumer warps handles one Q head within the GQA group.
     // For GQA_RATIO=4: warps 0-3 each handle one head, warps 4-7 are idle.
@@ -325,13 +380,7 @@ struct attention_prefill {
             int wid = group<Config::NUM_CONSUMER_WARPS>::warpid();
             prefill_instruction pi(g, s);
 
-            if (wid >= GQA_RATIO) {
-                // Idle warps: do nothing. Active warps use FINISH_COUNT=NUM_CONSUMER_WARPS/GQA_RATIO
-                // to account for idle warps in page release. Loader releases unused pages.
-                return;
-            }
-
-            {
+            if (wid < GQA_RATIO) {
                 int q_head = pi.kv_head_idx * GQA_RATIO + wid;
 
                 // Wait for Q barrier and load Q from q_post_rope.
@@ -374,7 +423,7 @@ struct attention_prefill {
                     // Release K pages at pipeline tail.
                     if (i >= pi.attn_blocks - NUM_STAGES && warp::laneid() == 0) {
                         for (int p = 0; p < K_PAGES; p++)
-                            s.finish_page(s.pid(stage * PAGES_PER_STAGE + p), FINISH_COUNT);
+                            s.finish_page(s.pid(stage * PAGES_PER_STAGE + p), Config::NUM_CONSUMER_WARPS / GQA_RATIO);
                     }
 
                     // Causal masking: mask positions where kv_pos > q_pos.
@@ -423,7 +472,7 @@ struct attention_prefill {
                     // Release V pages at pipeline tail.
                     if (i >= pi.attn_blocks - NUM_STAGES && warp::laneid() == 0) {
                         for (int p = 0; p < V_PAGES; p++)
-                            s.finish_page(s.pid(stage * PAGES_PER_STAGE + K_PAGES + p), FINISH_COUNT);
+                            s.finish_page(s.pid(stage * PAGES_PER_STAGE + K_PAGES + p), Config::NUM_CONSUMER_WARPS / GQA_RATIO);
                     }
 
                     warp::mul(norm_vec, norm_vec, diff_scaled_max);
@@ -431,28 +480,18 @@ struct attention_prefill {
                     warp::copy(last_scaled_max, scaled_max);
                 }
 
-                // Handle case where attn_blocks < NUM_STAGES — release unused pages.
-                if (pi.attn_blocks < NUM_STAGES) {
-                    for (int i = pi.attn_blocks; i < NUM_STAGES; i++) {
-                        if (warp::laneid() == 0) {
-                            for (int p = 0; p < PAGES_PER_STAGE; p++) {
-                                int pid = s.pid(i * PAGES_PER_STAGE + p);
-                                s.wait_page_ready(pid);
-                                s.finish_page(pid, FINISH_COUNT);
-                            }
-                        }
-                    }
-                }
+                // Note: unused stage pages are released by the loader (not the consumer),
+                // matching the decode attention pattern.
 
                 // Normalize output.
                 warp::add(norm_vec, norm_vec, 1e-16f);
                 warp::div_row(O_reg, O_reg, norm_vec);
 
-                // Store O to shared memory tile (reuse Q_smem region).
+                // Store to shmem.
                 o_rt_bf O_bf;
                 warp::copy(O_bf, O_reg);
-                q_st &O_smem = get_Q_smem(s, wid);
-                warp::store(O_smem, O_bf);
+                o_sv (&O_smem)[4] = get_O_smem(s, wid);
+                store_4_rows(O_smem, O_bf);
 
                 warp::sync();
                 warp::arrive(O_arrived(s));
@@ -472,19 +511,26 @@ struct attention_prefill {
             wait(O_arrived(s), 0);
 
             // Write each active warp's output to global memory.
-            // Consumer stored O as st_bf<16, head_dim> via warp::store.
             for (int wid = 0; wid < GQA_RATIO; wid++) {
-                q_st &O_smem = get_Q_smem(s, wid);
+                o_sv (&O_smem)[4] = get_O_smem(s, wid);
                 int head = pi.kv_head_idx * GQA_RATIO + wid;
 
-                // Write valid rows to global memory.
+                // Write 16 rows (or fewer if at end of sequence).
                 for (int row = 0; row < 16; row++) {
                     int abs_row = pi.abs_q_row + row;
                     if (abs_row > pi.abs_q_row_last) break;
 
+                    // Find which of the 4 o_sv vectors contains this row.
+                    // store_4_rows packs rows 0-3 into dst[0..3].
+                    // Actually store_4_rows stores rt_bf<16,head_dim> into sv_bf<head_dim>[4].
+                    // With the mma register layout, rows map as: row 0-3 → dst[0-3].
+                    // But store_4_rows actually stores lid/4 rows, not sequential rows.
+                    // Let's just use raw pointer stores like decode storer.
                     auto *dst = (bf16*)&g.attn_out[coord<>{abs_row, head * head_dim}];
+                    auto *src = (bf16*)&O_smem[row / 4].data[0];
+                    int offset_in_sv = (row % 4) * head_dim;
                     for (int i = lid; i < head_dim; i += 32) {
-                        dst[i] = *(bf16*)&O_smem[{row, i}];
+                        dst[i] = src[offset_in_sv + i];
                     }
                 }
             }

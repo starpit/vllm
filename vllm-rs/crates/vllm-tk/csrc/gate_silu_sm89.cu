@@ -15,9 +15,18 @@ using config  = llama_sm89_config;
 struct gate_silu_gmem_waiter {
     template <typename Cfg, typename G, typename Inst>
     static __device__ inline void gmem_wait(const G &g, state<Cfg> &s, Inst &inst) {
+        int _w = 0;
         while (*(volatile int *)&g.Bar[{inst.layer, OPCODE_MlpNorm - 1, inst.row, 0}]
-               < G::matmul_batch_block_size)
+               < G::matmul_batch_block_size) {
             __nanosleep(20);
+            if (++_w > 50000000 && warp::laneid() == 0) {
+                printf("GATE_SILU HANG: layer=%d row=%d col=%d val=%d need=%d\n",
+                    inst.layer, inst.row, inst.col,
+                    *(volatile int *)&g.Bar[{inst.layer, OPCODE_MlpNorm - 1, inst.row, 0}],
+                    (int)G::matmul_batch_block_size);
+                break;
+            }
+        }
     }
 };
 

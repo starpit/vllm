@@ -51,40 +51,8 @@ __device__ static inline void store_kv_paged(
     auto &cache = is_k ? g.k_cache : g.v_cache;
     __nv_bfloat16 *cache_ptr = (__nv_bfloat16 *)cache.raw_ptr;
 
-    // Compute strides: [D0, D1, num_kv_heads, head_dim]
-    // D1 = depth dim = page_size / kv_block_size (but for raw-ptr store we use page_size directly)
-    // Actually, cache gl is [num_layers*num_pages, kv_page_size, num_kv_heads, head_dim] (depth=-1, rows=nkh, cols=hdm)
-    // With gl<bf16, -1, -1, num_kv_heads, head_dim>, stride per batch = depth * rows * cols
-    long stride_d0 = (long)cache.depth() * Globals::num_kv_heads * Globals::head_dim;
-    long stride_d1 = (long)Globals::num_kv_heads * Globals::head_dim;
-    long stride_kv_head = (long)Globals::head_dim;
-
-    long base_lo_addr = (long)((int)g.num_pages * layer + page_idx_lo) * stride_d0
-                      + (long)offset_lo * stride_kv_head  // Wait — offset is within the page
-                      + (long)kv_head_idx * stride_kv_head;
-    // Actually let me reconsider the cache layout.
-    // gl<bf16, -1, -1, num_kv_heads, head_dim> means dims are [B, D, R, C]
-    // where B = num_layers * num_pages, D = page_size / kv_block_size (iters_per_page),
-    //       R = num_kv_heads, C = head_dim
-    // But for paged append, offset_in_page is in units of TOKENS, not kv_blocks.
-    // The throughput branch stores with: {num_pages * layer + page_idx, offset_in_page, kv_head, 0}
-    // where offset_in_page = append_idx % kv_page_size
-    // So each "depth" slot in the gl is one token position within the page.
-    // That means D = kv_page_size (not kv_page_size / kv_block_size).
-    // But for DECODE reads, D = kv_page_size / kv_block_size (iters_per_page) and each
-    // "depth" slot is a kv_block_size chunk...
-    // The throughput branch uses kv_page_size for stores but iters_per_page for loads.
-    // The kv_st for loads is st_bf<kv_block_size, head_dim>, so each load gets kv_block_size rows.
-    // For stores, it's one token at a time (sv_bf<head_dim>).
-    //
-    // Let me just use the gl indexing directly via store to be safe.
-    // Unfortunately we have rt_bf<16, head_dim> which is 16 rows, but each row is a different token.
-    // We need per-token stores. Convert to sv_bf<head_dim> and use warp::store per row.
-    // That's expensive but correct. For sm89 without TMA this is the only option.
-
-    // Actually — let's just do raw pointer math. The cache is row-major:
-    // element at [b, d, r, c] is at offset b*(D*R*C) + d*(R*C) + r*C + c
-    // where D = cache.depth(), R = num_kv_heads, C = head_dim
+    // Raw pointer store into [B, D, R, C] = [num_layers*num_pages, kv_page_size, num_kv_heads, head_dim].
+    // Element at [b, d, r, c] = raw[b*(D*R*C) + d*(R*C) + r*C + c].
     long D = cache.depth();
     long R = Globals::num_kv_heads;
     long C = Globals::head_dim;
@@ -242,31 +210,12 @@ struct qkv_rope_append {
             }
 
             // Apply RoPE if needed.
-            // For paged KV, each row in the warp's 16-row tile is a different token
-            // with its own position_id. We apply rope per-row.
-            // However, the mma register layout packs rows in pairs (r_lo = lane/4,
-            // r_hi = lane/4 + 8), and data[k] holds float2 for (col, col+1).
-            // The RoPE cos/sin values depend only on COLUMN position (not row),
-            // and are the SAME for all rows with the SAME position_id.
-            //
-            // For decode: all tokens in a batch block typically have different positions.
-            // But within a single warp tile (16 rows), the mma layout means
-            // data[0] = (r_lo, cols), data[1] = (r_hi, cols).
-            // r_lo and r_hi may have different position_ids!
-            //
-            // The simple correct approach: since we're already in f32 registers,
-            // just load rope cos/sin per-position from global memory (it's only head_dim
-            // floats per position, and the rope table is likely in L2).
+            // HF LLaMA uses "halved" RoPE: dim i pairs with dim i+half.
+            // For head_dim=64, half=32: subtile c=0 (cols 0-15) pairs with c=2 (cols 32-47),
+            // and c=1 (cols 16-31) pairs with c=3 (cols 48-63).
             if (needs_rope) {
-                // We don't actually need the rope page anymore — load directly from global.
-                // But we still need to wait for it to maintain the semaphore protocol.
                 wait(rope_arrived(s), 0);
 
-                // For each of the 16 rows in the tile, look up its position_id.
-                // Rows 0..7 are r_lo = lane/4 (for lanes 0..31), rows 8..15 are r_hi.
-                // But in the mma layout, "row" is determined by which data[] slot.
-                // data[0]/data[2] → r_lo = laneid/4
-                // data[1]/data[3] → r_hi = laneid/4 + 8
                 int lane = laneid();
                 int r_lo = lane / 4;
                 int r_hi = r_lo + 8;
@@ -275,10 +224,6 @@ struct qkv_rope_append {
                 int pos_lo = g.position_ids[{token_lo}];
                 int pos_hi = g.position_ids[{token_hi}];
 
-                // HF LLaMA uses "halved" RoPE: dim i pairs with dim i+half.
-                // For head_dim=64, half=32: subtile c=0 (cols 0-15) pairs with c=2 (cols 32-47),
-                // and c=1 (cols 16-31) pairs with c=3 (cols 48-63).
-                // Same data[] slot in paired subtiles holds the rotation pair.
                 constexpr int half_dim = Globals::head_dim / 2;
                 constexpr int half_subtiles = half_dim / 16;  // =2 for head_dim=64
                 float *cos_ptr = (float *)g.rope_cos.raw_ptr;
@@ -376,9 +321,18 @@ struct qkv_rope_append {
 struct qkv_gmem_waiter_sm89 {
     template <typename Cfg, typename G, typename Inst>
     static __device__ inline void gmem_wait(const G &g, state<Cfg> &s, Inst &inst) {
+        int _w = 0;
         while (*(volatile int *)&g.Bar[{inst.layer, OPCODE_AttnNorm - 1, inst.row, 0}]
-               < (int)G::matmul_batch_block_size)
+               < (int)G::matmul_batch_block_size) {
             __nanosleep(20);
+            if (++_w > 50000000 && inst.col == 0 && warp::laneid() == 0) {
+                printf("QKV HANG: waiting AttnNorm barrier, layer=%d row=%d val=%d need=%d\n",
+                    inst.layer, inst.row,
+                    *(volatile int *)&g.Bar[{inst.layer, OPCODE_AttnNorm - 1, inst.row, 0}],
+                    (int)G::matmul_batch_block_size);
+                break;
+            }
+        }
     }
 };
 

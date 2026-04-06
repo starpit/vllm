@@ -205,7 +205,6 @@ struct attention_decode {
         static __device__ void run(const Globals &g, state<Config> &s) {
             parsed_instruction inst{s};
             int lid = warp::laneid();
-
             // Each batch item in the attention block has its own paged KV sequence.
             // For simplicity in the loader, we process batch items sequentially,
             // loading K and V tiles for each item's page table.
@@ -226,9 +225,11 @@ struct attention_decode {
             int first_batch_idx = inst.batch_block_idx * ATTN_BATCH_BLOCK_SIZE;
 
             // We need the maximum total_attn_blocks across all items in this block.
+            // Guard: batch may be smaller than ATTN_BATCH_BLOCK_SIZE.
             int max_total_blocks = 0;
             for (int b = 0; b < ATTN_BATCH_BLOCK_SIZE; b++) {
                 int seq_idx = first_batch_idx + b;
+                if (seq_idx >= g.batch_size) break;
                 int indptr_start = g.decode_kv_indptr[{seq_idx}];
                 int indptr_end   = g.decode_kv_indptr[{seq_idx + 1}];
                 int np = indptr_end - indptr_start;
@@ -270,9 +271,19 @@ struct attention_decode {
 
                 // Wait for QKV write to KV cache (lane 0 spins).
                 if (i == 0 && lid == 0) {
+                    int _wait_cnt = 0;
                     while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1,
-                           batch_block_idx, Globals::num_attention_heads + inst.kv_head_idx}] < 1)
+                           batch_block_idx, Globals::num_attention_heads + inst.kv_head_idx}] < 1) {
                         __nanosleep(20);
+                        if (++_wait_cnt > 50000000 && inst.kv_head_idx == 0) {
+                            printf("ATTN_DECODE HANG: loader K barrier, layer=%d kv_head=%d bb=%d col=%d val=%d\n",
+                                inst.layer_idx, inst.kv_head_idx, batch_block_idx,
+                                (int)Globals::num_attention_heads + inst.kv_head_idx,
+                                *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1,
+                                    batch_block_idx, Globals::num_attention_heads + inst.kv_head_idx}]);
+                            break;
+                        }
+                    }
                 }
                 __syncwarp();
 
@@ -281,6 +292,7 @@ struct attention_decode {
                 // but for ATTN_BATCH_BLOCK_SIZE <= 8 the overhead is minimal.
                 for (int b = 0; b < ATTN_BATCH_BLOCK_SIZE; b++) {
                     int seq_idx = first_batch_idx + b;
+                    if (seq_idx >= g.batch_size) break;
                     int indptr_start_b = g.decode_kv_indptr[{seq_idx}];
                     int indptr_end_b   = g.decode_kv_indptr[{seq_idx + 1}];
                     int np_b = indptr_end_b - indptr_start_b;
@@ -290,9 +302,9 @@ struct attention_decode {
                     if (i < total_b) {
                         int kv_page_index = g.decode_kv_indices[{indptr_start_b + (i / iters_per_page)}];
                         int iter_in_page = i % iters_per_page;
+                        int page_batch = (int)g.num_pages * inst.layer_idx + kv_page_index;
                         warp::load_async<1, false>(get_K_smem(s, stage, b), g.k_cache,
-                                         {(int)g.num_pages * inst.layer_idx + kv_page_index,
-                                          iter_in_page, inst.kv_head_idx, 0});
+                                         {page_batch, iter_in_page, inst.kv_head_idx, 0});
                     }
                     // If i >= total_b, this item has no more KV blocks — smem stays zero/stale
                     // but the consumer will mask it out via seq_len.
@@ -300,16 +312,28 @@ struct attention_decode {
 
                 // Wait for V barrier (lane 0 spins).
                 if (i == 0 && lid == 0) {
+                    int _wait_cnt_v = 0;
                     while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1,
                            batch_block_idx, (int)Globals::num_attention_heads
-                           + (int)Globals::num_kv_heads + inst.kv_head_idx}] < 1)
+                           + (int)Globals::num_kv_heads + inst.kv_head_idx}] < 1) {
                         __nanosleep(20);
+                        if (++_wait_cnt_v > 50000000 && inst.kv_head_idx == 0) {
+                            printf("ATTN_DECODE HANG: loader V barrier, layer=%d kv_head=%d bb=%d col=%d val=%d\n",
+                                inst.layer_idx, inst.kv_head_idx, batch_block_idx,
+                                (int)Globals::num_attention_heads + (int)Globals::num_kv_heads + inst.kv_head_idx,
+                                *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1,
+                                    batch_block_idx, (int)Globals::num_attention_heads
+                                    + (int)Globals::num_kv_heads + inst.kv_head_idx}]);
+                            break;
+                        }
+                    }
                 }
                 __syncwarp();
 
                 // Load V from paged KV cache for each batch item.
                 for (int b = 0; b < ATTN_BATCH_BLOCK_SIZE; b++) {
                     int seq_idx = first_batch_idx + b;
+                    if (seq_idx >= g.batch_size) break;
                     int indptr_start_b = g.decode_kv_indptr[{seq_idx}];
                     int indptr_end_b   = g.decode_kv_indptr[{seq_idx + 1}];
                     int np_b = indptr_end_b - indptr_start_b;
@@ -319,9 +343,9 @@ struct attention_decode {
                     if (i < total_b) {
                         int kv_page_index = g.decode_kv_indices[{indptr_start_b + (i / iters_per_page)}];
                         int iter_in_page = i % iters_per_page;
+                        int page_batch_v = (int)g.num_pages * inst.layer_idx + kv_page_index;
                         warp::load_async<1, false>(get_V_smem(s, stage, b), g.v_cache,
-                                         {(int)g.num_pages * inst.layer_idx + kv_page_index,
-                                          iter_in_page, inst.kv_head_idx, 0});
+                                         {page_batch_v, iter_in_page, inst.kv_head_idx, 0});
                     }
                 }
 
@@ -361,11 +385,72 @@ struct attention_decode {
                 int batch_block_idx = batch_idx / Globals::matmul_batch_block_size;
                 int q_head_start   = inst.kv_head_idx * GQA_RATIO;
 
+                // Check if this is a padding warp (no real KV data).
+                int seq_idx = inst.batch_block_idx * ATTN_BATCH_BLOCK_SIZE + wid;
+                bool padding_warp = (seq_idx >= g.batch_size);
+                int indptr_start = padding_warp ? 0 : (int)g.decode_kv_indptr[{seq_idx}];
+                int indptr_end   = padding_warp ? 0 : (int)g.decode_kv_indptr[{seq_idx + 1}];
+                int num_kv_pages = indptr_end - indptr_start;
+                int last_page_len = padding_warp ? 0 : (int)g.decode_kv_last_page_len[{seq_idx}];
+                int seq_len    = (num_kv_pages - 1) * Globals::kv_page_size + last_page_len;
+                int total_blks = ((num_kv_pages - 1) * iters_per_page) +
+                                 (last_page_len + kv_block_size - 1) / kv_block_size;
+
+                if (padding_warp || num_kv_pages <= 0) {
+                    // Padding warp: no real sequence. Release pages and signal O_arrived.
+                    // Compute max_total_blocks to know which stages the loader used.
+                    int first_batch_idx_for_max = inst.batch_block_idx * ATTN_BATCH_BLOCK_SIZE;
+                    int max_total_blocks = 0;
+                    for (int b2 = 0; b2 < ATTN_BATCH_BLOCK_SIZE; b2++) {
+                        int si2 = first_batch_idx_for_max + b2;
+                        if (si2 >= g.batch_size) break;
+                        int is2 = g.decode_kv_indptr[{si2}];
+                        int ie2 = g.decode_kv_indptr[{si2 + 1}];
+                        int np2 = ie2 - is2;
+                        int lp2 = g.decode_kv_last_page_len[{si2}];
+                        int tb2 = (np2 > 0) ? (((np2 - 1) * iters_per_page) +
+                                    (lp2 + kv_block_size - 1) / kv_block_size) : 0;
+                        max_total_blocks = max(max_total_blocks, tb2);
+                    }
+                    // Participate in K_finished/V_finished for all iterations so the
+                    // loader (when max_total_blocks > NUM_STAGES) can recycle stages.
+                    for (int i = 0; i < max_total_blocks; i++) {
+                        int stage = i % NUM_STAGES;
+                        warp::wait(K_arrived(s, stage), (i / NUM_STAGES) % 2);
+                        warp::sync();
+                        warp::arrive(K_finished(s, stage));
+                        warp::wait(V_arrived(s, stage), (i / NUM_STAGES) % 2);
+                        warp::sync();
+                        warp::arrive(V_finished(s, stage));
+                        if (max_total_blocks - i <= NUM_STAGES && warp::laneid() == 0)
+                            finish_KV_page(s, stage);
+                    }
+                    // Write zeros to O_smem.
+                    o_sv (&O_smem)[4] = get_O_smem(s, wid);
+                    for (int h = 0; h < 4; h++) {
+                        auto *p = (bf16*)&O_smem[h].data[0];
+                        for (int i2 = warp::laneid(); i2 < head_dim; i2 += 32)
+                            p[i2] = __float2bfloat16(0.0f);
+                    }
+                    warp::sync();
+                    warp::arrive(O_arrived(s));
+                } else {
+                // Real warp: full attention computation.
+
                 // Wait for all GQA heads to be written.
                 for (int i = 0; i < GQA_RATIO; i++) {
+                    int _cwait = 0;
                     while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1,
-                           batch_block_idx, inst.kv_head_idx * GQA_RATIO + i}] < 1)
+                           batch_block_idx, inst.kv_head_idx * GQA_RATIO + i}] < 1) {
                         __nanosleep(20);
+                        if (++_cwait > 50000000 && wid == 0 && inst.kv_head_idx == 0) {
+                            printf("ATTN_DECODE HANG: consumer Q barrier, layer=%d wid=%d kv_head=%d col=%d val=%d\n",
+                                inst.layer_idx, wid, inst.kv_head_idx, inst.kv_head_idx * GQA_RATIO + i,
+                                *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1,
+                                    batch_block_idx, inst.kv_head_idx * GQA_RATIO + i}]);
+                            break;
+                        }
+                    }
                 }
 
                 q_st &Q_smem = get_Q_smem(s, wid);
@@ -386,16 +471,6 @@ struct attention_decode {
 
                 warp::load_async_wait();
                 warp::load(Q_reg, Q_smem);
-
-                // Compute sequence length from paged KV metadata.
-                int seq_idx = inst.batch_block_idx * ATTN_BATCH_BLOCK_SIZE + wid;
-                int indptr_start = g.decode_kv_indptr[{seq_idx}];
-                int indptr_end   = g.decode_kv_indptr[{seq_idx + 1}];
-                int num_kv_pages = indptr_end - indptr_start;
-                int last_page_len = g.decode_kv_last_page_len[{seq_idx}];
-                int seq_len    = (num_kv_pages - 1) * Globals::kv_page_size + last_page_len;
-                int total_blks = ((num_kv_pages - 1) * iters_per_page) +
-                                 (last_page_len + kv_block_size - 1) / kv_block_size;
 
                 for (int i = 0; i < total_blks; i++) {
                     int stage = i % NUM_STAGES;
@@ -444,6 +519,7 @@ struct attention_decode {
 
                 warp::sync();
                 warp::arrive(O_arrived(s));
+                } // end else (real warp)
             }
         }
     };
@@ -458,13 +534,17 @@ struct attention_decode {
             wait(O_arrived(s), 0);
 
             // Store O_smem to global memory using raw stores.
-            // Each lane handles a portion of the data across all (batch, head) pairs.
+            // Skip padding batch items (no real sequence) to avoid OOB writes.
             for (int batch_in_block = 0; batch_in_block < ATTN_BATCH_BLOCK_SIZE; batch_in_block++) {
-                o_sv (&O_smem)[4] = get_O_smem(s, batch_in_block);
                 int out_batch = inst.batch_block_idx * ATTN_BATCH_BLOCK_SIZE + batch_in_block;
+                // Check if this is a real batch item via kv_indptr.
+                int is = g.decode_kv_indptr[{out_batch}];
+                int ie = g.decode_kv_indptr[{out_batch + 1}];
+                if (ie <= is) continue;  // padding item — skip store
+
+                o_sv (&O_smem)[4] = get_O_smem(s, batch_in_block);
                 for (int head_in_group = 0; head_in_group < GQA_RATIO; head_in_group++) {
                     int out_head = q_head_start + head_in_group;
-                    // Raw store: each lane writes 2 bf16 values in a loop
                     auto *dst = (bf16*)&g.attn_out[coord<>{out_batch, out_head * head_dim}];
                     auto *src = (bf16*)&O_smem[head_in_group].data[0];
                     for (int i = lid; i < head_dim; i += 32) {

@@ -69,10 +69,10 @@ struct up_matmul {
             rt_bf<16, OUT_BLOCK> gate_bf;
             warp::load(gate_bf, g.silu_out, {inst.row * (BATCH_BLOCK / 16) + ::kittens::warpid(), inst.col});
 
-            // Element-wise multiply in bf16 (matches Python reference precision).
-            // Doing the multiply in fp32 would require both acc (rt_fl<16,64>) and
-            // gate_fl (rt_fl<16,64>) live simultaneously, exceeding register budget
-            // and causing spill corruption on tiles 1-3.
+            // Element-wise multiply in fp32 to match PyTorch/HF precision.
+            // PyTorch's element-wise * on bf16 tensors computes in fp32 internally.
+            // We convert one packed pair at a time to avoid needing two full fp32
+            // register tiles simultaneously (which exceeds register budget).
             #pragma unroll
             for (int r = 0; r < acc_bf.height; r++) {
                 #pragma unroll
@@ -81,7 +81,11 @@ struct up_matmul {
                     for (int k = 0; k < acc_bf.tiles[0][0].packed_per_thread; k++) {
                         bf16_2 &a = acc_bf.tiles[r][c].data[k];
                         bf16_2 &g_ = gate_bf.tiles[r][c].data[k];
-                        a = __hmul2(a, g_);
+                        float a_lo = __bfloat162float(__low2bfloat16(a));
+                        float a_hi = __bfloat162float(__high2bfloat16(a));
+                        float g_lo = __bfloat162float(__low2bfloat16(g_));
+                        float g_hi = __bfloat162float(__high2bfloat16(g_));
+                        a = __floats2bfloat162_rn(a_lo * g_lo, a_hi * g_hi);
                     }
                 }
             }

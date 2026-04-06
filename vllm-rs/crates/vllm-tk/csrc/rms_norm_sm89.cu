@@ -87,7 +87,6 @@ struct rms_op_sm89 {
 
         static __device__ void run(const Globals &g, state<Config> &s) {
             parsed_instruction inst{s};
-
             // Clear scratch partial-sum slots.
             ((uint64_t *)s.scratch())[laneid()] = 0;
             warp::sync();
@@ -239,9 +238,18 @@ struct attn_norm_gmem_waiter {
     static __device__ inline void gmem_wait(const G &g, state<Cfg> &s, Inst &inst) {
         int bb = inst.batch_idx / G::matmul_batch_block_size;
         if (inst.layer_idx > 0) {
+            int _w = 0;
             while (*(volatile int *)&g.Bar[{inst.layer_idx - 1, OPCODE_DownProjResidual - 1, bb, 0}]
-                   < (int)(G::hidden_dim / G::down_out_block))
+                   < (int)(G::hidden_dim / G::down_out_block)) {
                 __nanosleep(20);
+                if (++_w > 50000000 && inst.batch_idx == 0 && warp::laneid() == 0) {
+                    printf("ATTN_NORM HANG: waiting DownProj barrier, layer=%d bb=%d val=%d need=%d\n",
+                        inst.layer_idx - 1, bb,
+                        *(volatile int *)&g.Bar[{inst.layer_idx - 1, OPCODE_DownProjResidual - 1, bb, 0}],
+                        (int)(G::hidden_dim / G::down_out_block));
+                    break;
+                }
+            }
         }
     }
 };

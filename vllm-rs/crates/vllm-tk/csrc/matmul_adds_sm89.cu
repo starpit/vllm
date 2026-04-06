@@ -117,9 +117,18 @@ struct MatMulAddOp_sm89 {
 struct o_proj_gmem_waiter {
     template <typename Cfg, typename G, typename Inst>
     static __device__ inline void gmem_wait(const G &g, state<Cfg> &s, Inst &inst) {
+        int _w = 0;
         while (*(volatile int *)&g.Bar[{inst.layer, OPCODE_GQA_AttentionDecode - 1, inst.row, 0}]
-               < (int)(G::matmul_batch_block_size * G::num_kv_heads))
+               < (int)(G::matmul_batch_block_size * G::num_kv_heads)) {
             __nanosleep(20);
+            if (++_w > 50000000 && inst.col == 0 && warp::laneid() == 0) {
+                printf("O_PROJ HANG: waiting AttentionDecode barrier, layer=%d row=%d val=%d need=%d\n",
+                    inst.layer, inst.row,
+                    *(volatile int *)&g.Bar[{inst.layer, OPCODE_GQA_AttentionDecode - 1, inst.row, 0}],
+                    (int)(G::matmul_batch_block_size * G::num_kv_heads));
+                break;
+            }
+        }
     }
 };
 template <typename Config, typename Globals>

@@ -183,8 +183,9 @@ struct sm89_globals_t {
     using norm_weights_t    = gl<bf16, 1, 1, -1, hidden_dim, sv_bf<hidden_dim>>;
     using rope_table_t      = gl<float, 1, 1, -1, head_dim,  sv_fl<head_dim>>;
 
-    // KV cache: paged layout [num_layers * num_pages, page_size / kv_block_size, num_kv_heads, head_dim]
-    // Indexed as: cache[{num_pages * layer + page_idx, iter_in_page, kv_head, 0}]
+    // KV cache: paged layout [num_layers * num_pages, kv_page_size, num_kv_heads, head_dim]
+    // Tile loads use axis=1: warp::load_async<1,false>(st, cache, {page, iter_block, kv_head, 0})
+    //   iter_block maps to depth positions iter_block*kv_block_size .. +kv_block_size-1
     using kv_cache_t        = gl<bf16, -1, -1, num_kv_heads, head_dim,
                                  st_bf<kv_block_size, head_dim>>;
 
@@ -242,6 +243,10 @@ struct sm89_globals_t {
     int32_vector_t   kv_append_indices;
 
     // Prefill KV metadata (CSR format, same structure as decode).
+    // prefill_qo_indptr:        [num_prefill_seqs + 1]  — CSR row pointers into q_post_rope
+    // prefill_kv_indptr:        [num_prefill_seqs + 1]  — CSR row pointers into prefill_kv_indices
+    // prefill_kv_indices:       [total_prefill_pages]   — physical page IDs for prefill sequences
+    // prefill_kv_last_page_len: [num_prefill_seqs]      — valid tokens in last page per prefill seq
     int32_vector_t   prefill_qo_indptr;
     int32_vector_t   prefill_kv_indptr;
     int32_vector_t   prefill_kv_indices;

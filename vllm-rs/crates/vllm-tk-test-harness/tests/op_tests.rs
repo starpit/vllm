@@ -2076,3 +2076,191 @@ fn test_fused_prefill_layer_golden() {
         );
     }
 }
+
+/// Timing test: fused prefill layer kernel.
+/// Compare against Python vLLM prefill latency on same model/seq_len.
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_fused_prefill_layer_timing() {
+    use cudarc::driver::sys;
+
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════╗");
+    eprintln!("║  Fused Prefill Layer Timing (1B LLaMA, L40S)    ║");
+    eprintln!("║  {NL} layers, single CTA per 16 tokens             ║");
+    eprintln!("╠══════════════════════════════════════════════════╣");
+
+    // Test multiple sequence lengths
+    for &seq_len in &[48_usize, 128, 256, 512, 1024] {
+        let num_pages_used = (seq_len + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE;
+        // Activation rows must fit seq_len (round up to next 16)
+        let act_rows = ((seq_len + 15) / 16) * 16;
+
+        let mut b = TestBuffers::new();
+        let input_f32: Vec<f32> = make_random(act_rows * HD, 42, 0.5);
+        b.hidden = gpu_upload_bf16(&input_f32);
+
+        // Weights
+        b.attn_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 10, 0.1)));
+        b.qkv_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * QKV_DIM * HD, 100, 0.01)));
+        b.o_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * HD, 150, 0.01)));
+        b.mlp_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 20, 0.1)));
+        b.gate_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * ID * HD, 200, 0.01)));
+        b.up_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * ID * HD, 300, 0.01)));
+        b.down_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * ID, 400, 0.01)));
+
+        // KV cache
+        let total_kv = NL * NUM_PAGES * KV_PAGE_SIZE * NKH * HDM;
+        b.k_cache = gpu_alloc_zeros(total_kv * BF16);
+        b.v_cache = gpu_alloc_zeros(total_kv * BF16);
+
+        // RoPE (identity)
+        let rope_data = vec![1.0_f32; 4096 * HDM];
+        let rope_zeros = vec![0.0_f32; 4096 * HDM];
+        b.rope_cos = gpu_upload_f32(&rope_data);
+        b.rope_sin = gpu_upload_f32(&rope_zeros);
+
+        // Activation buffers (sized for seq_len, not ACT_ROWS)
+        b.rms_rope = gpu_alloc_zeros(act_rows * HD * BF16);
+        b.q_post = gpu_alloc_zeros(act_rows * HD * BF16);
+        b.attn_out = gpu_alloc_zeros(act_rows * HD * BF16);
+        b.rms_gate = gpu_alloc_zeros(act_rows * HD * BF16);
+        b.silu_buf = gpu_alloc_zeros(act_rows * ID * BF16);
+        b.rms_lm = gpu_alloc_zeros(act_rows * HD * BF16);
+        b.logits = gpu_alloc_zeros(act_rows * VS * BF16);
+
+        // Prefill metadata
+        let prefill_qo_indptr = gpu_upload_i32(&[0_i32, seq_len as i32]);
+        let prefill_kv_indptr = gpu_upload_i32(&[0_i32, num_pages_used as i32]);
+        let mut kv_indices_vec: Vec<i32> = (0..num_pages_used as i32).collect();
+        kv_indices_vec.resize(NUM_PAGES, 0);
+        let prefill_kv_indices = gpu_upload_i32(&kv_indices_vec);
+        let prefill_kv_last_page_len = gpu_upload_i32(&[seq_len as i32]);
+
+        // Position IDs
+        let mut pos_ids_data = vec![0_i32; act_rows];
+        for i in 0..seq_len {
+            pos_ids_data[i] = i as i32;
+        }
+        b.pos_ids = gpu_upload_i32(&pos_ids_data);
+
+        // KV append indices
+        let mut kv_append_data = vec![0_i32; act_rows];
+        for i in 0..seq_len {
+            kv_append_data[i] = i as i32;
+        }
+        b.kv_append = gpu_upload_i32(&kv_append_data);
+
+        // Decode metadata (not used but passed in FFI, size for act_rows)
+        b.kv_indptr = gpu_alloc_zeros((act_rows + 1) * 4);
+        b.kv_last_page = gpu_alloc_zeros(act_rows * 4);
+
+        let kv_pages = NL * NUM_PAGES;
+
+        // Helper closure to call the launch
+        macro_rules! launch_prefill {
+            () => {
+                unsafe {
+                    ffi::fused_prefill_layer_launch(
+                        BarrierArg::new(b.bar, NL, NUM_OPS, N_BATCH_BLOCKS, MAX_BARRIER_COLS),
+                        TkTensorArg::raw(b.instr, &[SM_COUNT, MAX_PER_SM, INSTRUCTION_WIDTH]),
+                        TkTensorArg::raw(b.timings, &[SM_COUNT, MAX_PER_SM, TIMING_WIDTH]),
+                        WeightArg::new(b.qkv_w, NL, QKV_DIM, HD),
+                        NormWeightArg::new(b.attn_norm_w, NL, HD),
+                        WeightArg::new(b.o_w, NL, HD, HD),
+                        NormWeightArg::new(b.mlp_norm_w, NL, HD),
+                        WeightArg::new(b.up_w, NL, ID, HD),
+                        WeightArg::new(b.gate_w, NL, ID, HD),
+                        WeightArg::new(b.down_w, NL, HD, ID),
+                        NormWeightArg::new(b.lm_norm_w, 1, HD),
+                        WeightArg::new(b.lm_w, 1, VS, HD),
+                        KvCacheArg::new(b.k_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+                        KvCacheArg::new(b.v_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+                        RopeArg::new(b.rope_cos, 4096, HDM),
+                        RopeArg::new(b.rope_sin, 4096, HDM),
+                        ActivationArg::new(b.hidden, act_rows, HD),
+                        ActivationArg::new(b.rms_rope, act_rows, HD),
+                        ActivationArg::new(b.rms_gate, act_rows, HD),
+                        ActivationArg::new(b.q_post, act_rows, HD),
+                        ActivationArg::new(b.attn_out, act_rows, HD),
+                        ActivationArg::new(b.silu_buf, act_rows, ID),
+                        ActivationArg::new(b.rms_lm, act_rows, HD),
+                        LogitsArg::new(b.logits, act_rows, VS),
+                        IntVecArg::new(b.pos_ids, act_rows),
+                        IntVecArg::new(b.kv_indptr, act_rows + 1),
+                        IntVecArg::new(b.kv_indices, NUM_PAGES),
+                        IntVecArg::new(b.kv_last_page, act_rows),
+                        IntVecArg::new(b.kv_append, act_rows),
+                        IntVecArg::new(prefill_qo_indptr, 2),
+                        IntVecArg::new(prefill_kv_indptr, 2),
+                        IntVecArg::new(prefill_kv_indices, num_pages_used),
+                        IntVecArg::new(prefill_kv_last_page_len, 1),
+                        1.0 / (HDM as f32).sqrt(),
+                        1e-5_f32,
+                        NUM_PAGES as i32,
+                        BS as i32,
+                        seq_len as i32,
+                        NL as i32,
+                        0_u64,
+                    )
+                }
+            };
+        }
+
+        // Verify launch works
+        let rc = launch_prefill!();
+        unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+        assert_eq!(
+            rc, 0,
+            "fused_prefill_layer_launch error {rc} for seq_len={seq_len}"
+        );
+
+        // Warmup
+        for _ in 0..4 {
+            launch_prefill!();
+        }
+        unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+
+        // Timed iterations
+        let num_iters = 50;
+        let mut start: sys::CUevent = std::ptr::null_mut();
+        let mut stop: sys::CUevent = std::ptr::null_mut();
+        unsafe {
+            sys::cuEventCreate(&mut start, 0);
+            sys::cuEventCreate(&mut stop, 0);
+            sys::cuEventRecord(start, std::ptr::null_mut());
+        }
+
+        for _ in 0..num_iters {
+            launch_prefill!();
+        }
+
+        unsafe {
+            sys::cuEventRecord(stop, std::ptr::null_mut());
+            sys::cuEventSynchronize(stop);
+            let mut elapsed_ms: f32 = 0.0;
+            sys::cuEventElapsedTime(&mut elapsed_ms, start, stop);
+            let avg_ms = elapsed_ms / num_iters as f32;
+            let grid = (seq_len + 15) / 16;
+            eprintln!("║  seq={seq_len:4}  grid={grid:3} CTAs  avg={avg_ms:8.3}ms  ║");
+            sys::cuEventDestroy_v2(start);
+            sys::cuEventDestroy_v2(stop);
+        }
+    }
+
+    eprintln!("╚══════════════════════════════════════════════════╝");
+    eprintln!();
+}

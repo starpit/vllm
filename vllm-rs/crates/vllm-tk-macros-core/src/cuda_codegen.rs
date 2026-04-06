@@ -293,9 +293,18 @@ fn emit_run_op_template(out: &mut String) {
     writeln!(out, "        kvms.instruction()[2] = row;").unwrap();
     writeln!(out, "        kvms.instruction()[3] = col;").unwrap();
     writeln!(out).unwrap();
+    writeln!(out, "        // Initialize KVM state for standalone op execution").unwrap();
+    writeln!(out, "        kvms.instruction_index = 0;").unwrap();
+    writeln!(out, "        kvms.instruction_ring = 0;").unwrap();
+    writeln!(out).unwrap();
     writeln!(out, "        // Identity page mapping").unwrap();
     writeln!(out, "        for (int i = 0; i < config::NUM_PAGES; i++)").unwrap();
     writeln!(out, "            kvms.pid_order()[i] = i;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        // Initialize page_finished semaphores so wait_page_ready doesn't hang").unwrap();
+    writeln!(out, "        for (int p = 0; p < config::NUM_PAGES; p++)").unwrap();
+    writeln!(out, "            for (int b = 0; b < config::INSTRUCTION_PIPELINE_STAGES_BITS; b++)").unwrap();
+    writeln!(out, "                init_semaphore(kvms.page_finished[p][b], 0);").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "        Op::controller::init_semaphores(g, kvms);").unwrap();
     writeln!(out, "    }}").unwrap();

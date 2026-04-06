@@ -36,7 +36,8 @@ const MAX_PER_SM: usize = 1;
 const INSTRUCTION_WIDTH: usize = 32;
 const TIMING_WIDTH: usize = 128;
 const NUM_PAGES: usize = 16;
-const PAGE_SIZE: usize = 16;
+const KV_PAGE_SIZE: usize = 64;  // tokens per page (SM89_KV_PAGE_SIZE in llama_sm89.cuh)
+const KV_BLOCK_SIZE: usize = 16; // tile rows per KV block (SM89_KV_BLOCK_SIZE)
 
 /// Allocate `bytes` of zeroed GPU memory.
 fn gpu_alloc_zeros(bytes: usize) -> u64 {
@@ -116,8 +117,8 @@ impl TestBuffers {
             down_w: gpu_alloc_zeros(NL * HD * ID * BF16),
             lm_norm_w: gpu_alloc_zeros(HD * BF16),
             lm_w: gpu_alloc_zeros(VS * HD * BF16),
-            k_cache: gpu_alloc_zeros(NUM_PAGES * PAGE_SIZE * NKH * HDM * BF16),
-            v_cache: gpu_alloc_zeros(NUM_PAGES * PAGE_SIZE * NKH * HDM * BF16),
+            k_cache: gpu_alloc_zeros(NUM_PAGES * KV_PAGE_SIZE * NKH * HDM * BF16),
+            v_cache: gpu_alloc_zeros(NUM_PAGES * KV_PAGE_SIZE * NKH * HDM * BF16),
             rope_cos: gpu_alloc_zeros(4096 * HDM * BF16),
             rope_sin: gpu_alloc_zeros(4096 * HDM * BF16),
             hidden: gpu_alloc_zeros(ACT_ROWS * HD * BF16),
@@ -158,8 +159,8 @@ macro_rules! call_launch {
                 TkTensorArg::new($b.lm_norm_w, &[1, HD]),
                 TkTensorArg::new($b.lm_w, &[VS, HD]),
                 // KV cache — d=1 (page_size is baked into GL type)
-                TkTensorArg::new($b.k_cache, &[NUM_PAGES, 1, NKH, HDM]),
-                TkTensorArg::new($b.v_cache, &[NUM_PAGES, 1, NKH, HDM]),
+                TkTensorArg::new($b.k_cache, &[NUM_PAGES, KV_PAGE_SIZE, NKH, HDM]),
+                TkTensorArg::new($b.v_cache, &[NUM_PAGES, KV_PAGE_SIZE, NKH, HDM]),
                 TkTensorArg::new($b.rope_cos, &[4096, HDM]),
                 TkTensorArg::new($b.rope_sin, &[4096, HDM]),
                 // Activations — 4D with b=1, d=1

@@ -3900,6 +3900,40 @@ pub fn generate_fused_full_layer_kernel(dag: &ModelDag) -> String {
     out
 }
 
+/// Generate a fused multi-layer kernel WITH attention decode (no KVM protocol).
+///
+/// Same as `generate_fused_full_layer_kernel` but loops over all NL layers.
+/// Single block, BS=1 decode. For timing comparison against KVM/CUDA graphs.
+pub fn generate_fused_multi_layer_kernel(dag: &ModelDag) -> String {
+    let single = generate_fused_full_layer_kernel(dag);
+    // Transform: single layer → multi layer
+    let mut out = single;
+    // Replace layer constant with loop (line by line replacement)
+    out = out.replace(
+        "    const int layer = 0;",
+        "    // layer variable is set by the loop below",
+    );
+    out = out.replace(
+        "    const int row = 0;",
+        "    const int row = 0;\n    for (int layer = 0; layer < num_layers; layer++) {",
+    );
+    // Close the layer loop: insert before the kernel closing brace.
+    // The kernel body ends with "}\n\n// Flat tensor" (kernel close, then launch wrapper).
+    out = out.replacen(
+        "\n}\n\n// Flat tensor",
+        "\n    } // end layer loop\n}\n\n// Flat tensor",
+        1,
+    );
+    // Rename kernel and launch
+    out = out.replace("fused_full_layer", "fused_multi_layer");
+    // Update comment
+    out = out.replace(
+        "// GENERATED: Fused full-layer kernel WITH attention",
+        "// GENERATED: Fused MULTI-layer kernel WITH attention",
+    );
+    out
+}
+
 /// List all op names that can be used with `generate_single_op_kernel`.
 pub fn available_op_names() -> Vec<&'static str> {
     vec![
@@ -4269,5 +4303,38 @@ mod tests {
         assert!(cuda.contains("warp::mma_AB"));  // attention attn@V
         assert!(cuda.contains("fused_full_layer("));
         assert!(cuda.contains("fused_full_layer_launch("));
+    }
+
+    #[test]
+    fn generates_fused_multi_layer() {
+        let input: proc_macro2::TokenStream = quote::quote! {
+            kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                    let qkv = gemm(normed, qkv_weights[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                    let gate = silu(gemm(normed2, gate_weights[layer]));
+                    let up = gemm(normed2, up_weights[layer]);
+                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                }
+                let normed = rmsnorm(hidden_states, lm_head_norm);
+                logits = gemm(normed, lm_head);
+            }
+        };
+        let def: crate::parse::MegakernelDef = syn::parse2(input).expect("parse");
+        let dag = crate::parse::build_dag(&def).expect("dag");
+        let cuda = generate_fused_multi_layer_kernel(&dag);
+
+        // Has layer loop
+        assert!(cuda.contains("for (int layer = 0; layer < num_layers; layer++)"));
+        assert!(cuda.contains("end layer loop"));
+        // Has multi-layer names
+        assert!(cuda.contains("fused_multi_layer("));
+        assert!(cuda.contains("fused_multi_layer_launch("));
+        // Does NOT have single-layer constant
+        assert!(!cuda.contains("const int layer = 0;"));
     }
 }

@@ -109,6 +109,13 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", inline_attn_path.display()));
     cu_files.push(inline_attn_path.display().to_string());
 
+    let fused_multi_layer_source = vllm_tk_macros_core::generate_fused_multi_layer_kernel(dsl)
+        .unwrap_or_else(|e| panic!("fused multi layer codegen failed: {e}"));
+    let fused_multi_layer_path = out_dir.join("fused_multi_layer.cu");
+    std::fs::write(&fused_multi_layer_path, &fused_multi_layer_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_multi_layer_path.display()));
+    cu_files.push(fused_multi_layer_path.display().to_string());
+
     let fused_full_layer_source = vllm_tk_macros_core::generate_fused_full_layer_kernel(dsl)
         .unwrap_or_else(|e| panic!("fused full layer codegen failed: {e}"));
     let fused_full_layer_path = out_dir.join("fused_full_layer.cu");

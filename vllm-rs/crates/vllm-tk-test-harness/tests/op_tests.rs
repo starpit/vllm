@@ -1070,3 +1070,159 @@ fn test_inline_attention_decode_golden() {
     // Tolerance is higher than GEMM due to softmax numerical sensitivity
     assert_close(gpu_row0, &expected, 2.0, 0.2, "inline_attention_decode_golden");
 }
+
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_fused_full_layer_golden() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    // Attention params
+    let seq_len: usize = 48;
+    let num_pages_used = (seq_len + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE;
+    let last_page_len = seq_len - (num_pages_used - 1) * KV_PAGE_SIZE;
+    let attn_scale = 1.0 / (HDM as f32).sqrt();
+
+    // Weights
+    let attn_norm_w = bf16_roundtrip(&gen_weight(HD));
+    let qkv_w = bf16_roundtrip(&make_random(HD * HD, 100, 0.01));
+    let o_w = bf16_roundtrip(&make_random(HD * HD, 150, 0.01));
+    let mlp_norm_w = bf16_roundtrip(&gen_weight(HD));
+    let gate_w = bf16_roundtrip(&make_random(ID * HD, 200, 0.01));
+    let up_w = bf16_roundtrip(&make_random(ID * HD, 300, 0.01));
+    let down_w = bf16_roundtrip(&make_random(HD * ID, 400, 0.01));
+
+    // Input hidden states
+    let input_f32 = bf16_roundtrip(&gen_input(HD));
+
+    // KV cache data (pre-filled history)
+    let k_cache_flat = bf16_roundtrip(&make_random(seq_len * NKH * HDM, 600, 0.5));
+    let v_cache_flat = bf16_roundtrip(&make_random(seq_len * NKH * HDM, 700, 0.5));
+
+    // ── CPU golden chain ──
+
+    // 1. attn_norm
+    let mut normed = vec![0.0_f32; HD];
+    cpu_golden::rmsnorm(&input_f32, &attn_norm_w, &mut normed, 1e-5);
+    let normed = bf16_roundtrip(&normed);
+
+    // 2. QKV GEMM (Q portion only, HD columns)
+    let mut q_out = vec![0.0_f32; HD];
+    cpu_golden::gemm(&normed, &qkv_w, &mut q_out, 1, HD, HD);
+    let q_out = bf16_roundtrip(&q_out);
+
+    // 3. Attention decode: Q from qkv GEMM, K/V from pre-filled cache
+    let mut attn_out = vec![0.0_f32; NAH * HDM];
+    cpu_golden::attention_decode(
+        &q_out, &k_cache_flat, &v_cache_flat,
+        &mut attn_out, seq_len, NAH, NKH, HDM, attn_scale,
+    );
+    let attn_out_cpu = bf16_roundtrip(&attn_out);
+
+    // 4. o_proj + residual
+    let mut hidden_after_attn = vec![0.0_f32; HD];
+    cpu_golden::gemm_add(&attn_out_cpu, &o_w, &input_f32, &mut hidden_after_attn, 1, HD, HD);
+    let hidden_after_attn = bf16_roundtrip(&hidden_after_attn);
+
+    // 5. mlp_norm
+    let mut mlp_normed = vec![0.0_f32; HD];
+    cpu_golden::rmsnorm(&hidden_after_attn, &mlp_norm_w, &mut mlp_normed, 1e-5);
+    let mlp_normed = bf16_roundtrip(&mlp_normed);
+
+    // 6-8. MLP block
+    let mut gate_out = vec![0.0_f32; ID];
+    cpu_golden::gemm(&mlp_normed, &gate_w, &mut gate_out, 1, HD, ID);
+    let gate_out = bf16_roundtrip(&gate_out);
+    let mut gate_silu = vec![0.0_f32; ID];
+    cpu_golden::silu(&gate_out, &mut gate_silu);
+    let gate_silu = bf16_roundtrip(&gate_silu);
+    let mut up_out = vec![0.0_f32; ID];
+    cpu_golden::gemm(&mlp_normed, &up_w, &mut up_out, 1, HD, ID);
+    let up_out = bf16_roundtrip(&up_out);
+    let mut mlp_inter = vec![0.0_f32; ID];
+    cpu_golden::mul(&gate_silu, &up_out, &mut mlp_inter);
+    let mlp_inter = bf16_roundtrip(&mlp_inter);
+    let mut expected = vec![0.0_f32; HD];
+    cpu_golden::gemm_add(&mlp_inter, &down_w, &hidden_after_attn, &mut expected, 1, ID, HD);
+
+    // ── GPU setup ──
+    let mut b = TestBuffers::new();
+
+    // hidden_states
+    let mut input_full = vec![0.0_f32; ACT_ROWS * HD];
+    input_full[..HD].copy_from_slice(&input_f32);
+    b.hidden = gpu_upload_bf16(&input_full);
+
+    // Weights (replicated across NL layers)
+    let anw: Vec<f32> = attn_norm_w.iter().copied().cycle().take(NL * HD).collect();
+    b.attn_norm_w = gpu_upload_bf16(&anw);
+    let qw: Vec<f32> = qkv_w.iter().copied().cycle().take(NL * HD * HD).collect();
+    b.qkv_w = gpu_upload_bf16(&qw);
+    let ow: Vec<f32> = o_w.iter().copied().cycle().take(NL * HD * HD).collect();
+    b.o_w = gpu_upload_bf16(&ow);
+    let mnw: Vec<f32> = mlp_norm_w.iter().copied().cycle().take(NL * HD).collect();
+    b.mlp_norm_w = gpu_upload_bf16(&mnw);
+    let gw: Vec<f32> = gate_w.iter().copied().cycle().take(NL * ID * HD).collect();
+    b.gate_w = gpu_upload_bf16(&gw);
+    let uw: Vec<f32> = up_w.iter().copied().cycle().take(NL * ID * HD).collect();
+    b.up_w = gpu_upload_bf16(&uw);
+    let dw: Vec<f32> = down_w.iter().copied().cycle().take(NL * HD * ID).collect();
+    b.down_w = gpu_upload_bf16(&dw);
+
+    // Paged KV cache
+    let total_kv_cache_size = NL * NUM_PAGES * KV_PAGE_SIZE * NKH * HDM;
+    let mut k_paged = vec![0.0_f32; total_kv_cache_size];
+    let mut v_paged = vec![0.0_f32; total_kv_cache_size];
+    let page_index = 0_usize;
+    let page_batch = NUM_PAGES * 0 + page_index;
+    for tok in 0..seq_len {
+        for kv_h in 0..NKH {
+            for d in 0..HDM {
+                let flat_idx = tok * NKH * HDM + kv_h * HDM + d;
+                let paged_idx = page_batch * KV_PAGE_SIZE * NKH * HDM
+                    + tok * NKH * HDM + kv_h * HDM + d;
+                k_paged[paged_idx] = k_cache_flat[flat_idx];
+                v_paged[paged_idx] = v_cache_flat[flat_idx];
+            }
+        }
+    }
+    b.k_cache = gpu_upload_bf16(&k_paged);
+    b.v_cache = gpu_upload_bf16(&v_paged);
+
+    // KV metadata
+    let mut indptr_full = vec![0_i32; ACT_ROWS + 1];
+    indptr_full[0] = 0;
+    indptr_full[1] = num_pages_used as i32;
+    b.kv_indptr = gpu_upload_i32(&indptr_full);
+    let mut indices_full = vec![0_i32; NUM_PAGES];
+    indices_full[0] = page_index as i32;
+    b.kv_indices = gpu_upload_i32(&indices_full);
+    let mut last_page_full = vec![0_i32; ACT_ROWS];
+    last_page_full[0] = last_page_len as i32;
+    b.kv_last_page = gpu_upload_i32(&last_page_full);
+
+    let rc = call_launch!(ffi::fused_full_layer_launch, b);
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "fused_full_layer_launch returned error {rc}");
+
+    let gpu_out = gpu_download_bf16(b.hidden, ACT_ROWS * HD);
+    let gpu_row0 = &gpu_out[..HD];
+
+    eprintln!("FullLayer GPU[0..4]: {:?}", &gpu_row0[..4]);
+    eprintln!("FullLayer CPU[0..4]: {:?}", &expected[..4]);
+
+    // Higher tolerance: attention softmax + 8 chained ops
+    assert_close(gpu_row0, &expected, 2.0, 0.2, "fused_full_layer_golden");
+}

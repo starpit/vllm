@@ -3346,6 +3346,560 @@ pub fn generate_fused_layer_kernel(dag: &ModelDag) -> String {
     out
 }
 
+/// Generate a fused full-layer kernel WITH attention decode (no KVM protocol).
+///
+/// Chains ALL ops for one transformer layer:
+///   attn_norm → QKV GEMM → attention_decode → o_proj+residual →
+///   mlp_norm → gate GEMM+SiLU → up GEMM×gate → down GEMM+residual
+///
+/// During GEMM/RMSNorm phases: 8 warps cooperate (group<8>).
+/// During attention phase: each warp independently handles 1 KV head.
+/// KV cache must be pre-filled by test (QKV split/RoPE/KV-append not yet inlined).
+pub fn generate_fused_full_layer_kernel(dag: &ModelDag) -> String {
+    let mut out = String::new();
+
+    let hd = dag.params.get("HD").copied().unwrap_or(2048);
+    let nl = dag.params.get("NL").copied().unwrap_or(16);
+    let nah = dag.params.get("NAH").copied().unwrap_or(32);
+    let nkh = dag.params.get("NKH").copied().unwrap_or(8);
+    let hdm = dag.params.get("HDM").copied().unwrap_or(64);
+    let id = dag.params.get("ID").copied().unwrap_or(8192);
+
+    let gqa_ratio = nah / nkh;
+    let k_dim = 64;
+    let batch_block = 128;
+    let out_block = 64;
+    let num_warps = 8;
+    let num_threads = num_warps * 32;
+    let rdpw = hd / num_warps;
+    let kv_block_size = 16;
+    let kv_page_size = 64;
+    let iters_per_page = kv_page_size / kv_block_size;
+
+    let hd_k_iters = hd / k_dim;
+    let id_k_iters = id / k_dim;
+    let id_col_tiles = id / out_block;
+    let hd_col_tiles = hd / out_block;
+
+    let a_size = batch_block * k_dim * 2;
+    let b_size = out_block * k_dim * 2;
+    let stage_size = a_size + b_size;
+    let gemm_shmem = 2 * stage_size;
+    let rmsnorm_shmem = hd * 4 + num_warps * 4;
+    // Attention shmem: per-warp Q + K + V tiles
+    let q_tile_bytes = 16 * hdm * 2;
+    let kv_tile_bytes = kv_block_size * hdm * 2;
+    let attn_warp_shmem = q_tile_bytes + kv_tile_bytes + kv_tile_bytes;
+    let attn_shmem = attn_warp_shmem * num_warps;
+    let total_shmem = *[gemm_shmem, rmsnorm_shmem, attn_shmem].iter().max().unwrap();
+
+    // Preamble
+    writeln!(out, "// GENERATED: Fused full-layer kernel WITH attention (no KVM protocol)").unwrap();
+    writeln!(out, "// attn_norm → QKV GEMM → attention_decode → o_proj+res → MLP block").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#define SM89_NUM_LAYERS             {nl}").unwrap();
+    writeln!(out, "#define SM89_HIDDEN_DIM             {hd}").unwrap();
+    writeln!(out, "#define SM89_INTERMEDIATE_DIM       {id}").unwrap();
+    writeln!(out, "#define SM89_HEAD_DIM               {hdm}").unwrap();
+    writeln!(out, "#define SM89_NUM_ATTENTION_HEADS    {nah}").unwrap();
+    writeln!(out, "#define SM89_NUM_KV_HEADS           {nkh}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#include \"llama_sm89.cuh\"").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "using namespace kittens;").unwrap();
+    writeln!(out, "using namespace kittens::prototype::vm;").unwrap();
+    writeln!(out, "using globals = llama_sm89_globals;").unwrap();
+    writeln!(out).unwrap();
+
+    // Helpers
+    writeln!(out, "__device__ static inline void fl_cp_async_wait_all() {{").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.wait_all;\\n\"     ::: \"memory\");").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "__device__ static inline void fl_load_b_slice(").unwrap();
+    writeln!(out, "    rt_bf<16, {k_dim}> &dst, const st_bf<16, {k_dim}> &src) {{").unwrap();
+    writeln!(out, "    uint32_t saddr = static_cast<uint32_t>(__cvta_generic_to_shared(&src.data[0]));").unwrap();
+    writeln!(out, "    int lane = kittens::laneid();").unwrap();
+    writeln!(out, "    int row = lane % 16;").unwrap();
+    writeln!(out, "    bf16_2 tmp[4];").unwrap();
+    writeln!(out, "    #pragma unroll").unwrap();
+    writeln!(out, "    for (int j = 0; j < {k_dim} / 16; j++) {{").unwrap();
+    writeln!(out, "        int col = j * 16 + (lane / 16) * 8;").unwrap();
+    writeln!(out, "        move<bf16_2>::ldsm4(tmp[0], tmp[1], tmp[2], tmp[3], src.idx(saddr, {{row, col}}));").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[0] = tmp[0];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[1] = tmp[1];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[2] = tmp[2];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[3] = tmp[3];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // right_fill for causal masking
+    writeln!(out, "template <ducks::rt::row_layout RT>").unwrap();
+    writeln!(out, "__device__ static inline void fl_right_fill(RT &dst, const RT &src, int col_idx,").unwrap();
+    writeln!(out, "    typename base_types::packing<typename RT::dtype>::unpacked_type val = 0) {{").unwrap();
+    writeln!(out, "    if (col_idx >= dst.cols) return;").unwrap();
+    writeln!(out, "    for (int i = 0; i < dst.height; i++)").unwrap();
+    writeln!(out, "        for (int j = 0; j < dst.width; j++)").unwrap();
+    writeln!(out, "            for (int k = 0; k < dst.packed_per_tile; k++) {{").unwrap();
+    writeln!(out, "                auto &d = dst.tiles[i][j].data[k];").unwrap();
+    writeln!(out, "                auto &sv = src.tiles[i][j].data[k];").unwrap();
+    writeln!(out, "                int cx = (j * dst.tile_size_col) + ((k / 2) * 8) + ((warp::laneid() % 4) * 2);").unwrap();
+    writeln!(out, "                int cy = cx + 1;").unwrap();
+    writeln!(out, "                d.x = (cx >= col_idx) ? val : sv.x;").unwrap();
+    writeln!(out, "                d.y = (cy >= col_idx) ? val : sv.y;").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // store_4_rows for attention output
+    writeln!(out, "template <ducks::sv::all SV, ducks::rt::all RT>").unwrap();
+    writeln!(out, "__device__ static inline void fl_store_4_rows(SV (&dst)[4], const RT &src) {{").unwrap();
+    writeln!(out, "    static_assert(RT::rows == 16);").unwrap();
+    writeln!(out, "    static_assert(SV::length == src.cols);").unwrap();
+    writeln!(out, "    using T2 = typename RT::dtype;").unwrap();
+    writeln!(out, "    using U  = typename SV::dtype;").unwrap();
+    writeln!(out, "    using U2 = typename base_types::packing<U>::packed_type;").unwrap();
+    writeln!(out, "    uint32_t dst_ptr[4];").unwrap();
+    writeln!(out, "    for (int i = 0; i < 4; ++i)").unwrap();
+    writeln!(out, "        dst_ptr[i] = static_cast<uint32_t>(__cvta_generic_to_shared(&dst[i].data[0]));").unwrap();
+    writeln!(out, "    int lid = kittens::laneid();").unwrap();
+    writeln!(out, "    if (lid < 16) {{").unwrap();
+    writeln!(out, "        int lr = lid / 4, lc = lid % 4;").unwrap();
+    writeln!(out, "        for (int j = 0; j < src.width; j++) {{").unwrap();
+    writeln!(out, "            U2 tmp[2];").unwrap();
+    writeln!(out, "            tmp[0] = base_types::convertor<U2, T2>::convert(src.tiles[0][j].data[0]);").unwrap();
+    writeln!(out, "            tmp[1] = base_types::convertor<U2, T2>::convert(src.tiles[0][j].data[2]);").unwrap();
+    writeln!(out, "            int ci = lc * 2 + j * 16;").unwrap();
+    writeln!(out, "            move<U2>::sts(dst_ptr[lr] + sizeof(U) * ci,     tmp[0]);").unwrap();
+    writeln!(out, "            move<U2>::sts(dst_ptr[lr] + sizeof(U) * (ci+8), tmp[1]);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Constants
+    writeln!(out, "constexpr int FL_K_DIM = {k_dim};").unwrap();
+    writeln!(out, "constexpr int FL_BATCH_BLOCK = {batch_block};").unwrap();
+    writeln!(out, "constexpr int FL_OUT_BLOCK = {out_block};").unwrap();
+    writeln!(out, "constexpr int FL_NUM_WARPS = {num_warps};").unwrap();
+    writeln!(out, "constexpr int FL_SHMEM = {total_shmem};").unwrap();
+    writeln!(out, "constexpr int FL_RDPW = {rdpw};").unwrap();
+    writeln!(out, "constexpr int FL_GQA_RATIO = {gqa_ratio};").unwrap();
+    writeln!(out, "constexpr int FL_KV_BLOCK_SIZE = {kv_block_size};").unwrap();
+    writeln!(out, "constexpr int FL_KV_PAGE_SIZE = {kv_page_size};").unwrap();
+    writeln!(out, "constexpr int FL_ITERS_PER_PAGE = {iters_per_page};").unwrap();
+    writeln!(out, "constexpr int FL_HEAD_DIM = {hdm};").unwrap();
+    writeln!(out, "constexpr int FL_WARP_ATTN_SHMEM = {attn_warp_shmem};").unwrap();
+    writeln!(out, "constexpr int FL_Q_TILE_BYTES = {q_tile_bytes};").unwrap();
+    writeln!(out, "constexpr int FL_KV_TILE_BYTES = {kv_tile_bytes};").unwrap();
+    writeln!(out).unwrap();
+
+    // Types for GEMM phases
+    writeln!(out, "using fl_a_st = st_bf<{batch_block}, {k_dim}>;").unwrap();
+    writeln!(out, "using fl_b_st = st_bf<{out_block}, {k_dim}>;").unwrap();
+    writeln!(out, "using fl_acc_rt = rt_fl<16, {out_block}>;").unwrap();
+    writeln!(out, "using fl_a_slice_st = st_bf<16, {k_dim}>;").unwrap();
+    writeln!(out, "using fl_b_slice_st = st_bf<16, {k_dim}>;").unwrap();
+    writeln!(out, "constexpr int FL_N_TILES = FL_OUT_BLOCK / 16;").unwrap();
+    writeln!(out).unwrap();
+
+    // Types for attention phase
+    writeln!(out, "using fl_q_st  = st_bf<16, FL_HEAD_DIM>;").unwrap();
+    writeln!(out, "using fl_kv_st = st_bf<FL_KV_BLOCK_SIZE, FL_HEAD_DIM>;").unwrap();
+    writeln!(out, "using fl_q_rt  = rt_bf<16, FL_HEAD_DIM>;").unwrap();
+    writeln!(out, "using fl_k_rt  = rt_bf<FL_KV_BLOCK_SIZE, FL_HEAD_DIM>;").unwrap();
+    writeln!(out, "using fl_v_rt  = rt_bf<FL_KV_BLOCK_SIZE, FL_HEAD_DIM, col_l>;").unwrap();
+    writeln!(out, "using fl_score_fl = rt_fl<16, FL_KV_BLOCK_SIZE>;").unwrap();
+    writeln!(out, "using fl_score_bf = rt_bf<16, FL_KV_BLOCK_SIZE>;").unwrap();
+    writeln!(out, "using fl_o_rt  = rt_fl<16, FL_HEAD_DIM>;").unwrap();
+    writeln!(out, "using fl_o_bf  = rt_bf<16, FL_HEAD_DIM>;").unwrap();
+    writeln!(out, "using fl_max_rv = col_vec<rt_fl<16, FL_HEAD_DIM>>;").unwrap();
+    writeln!(out, "using fl_norm_rv = col_vec<rt_fl<16, FL_HEAD_DIM>>;").unwrap();
+    writeln!(out, "using fl_o_sv  = sv_bf<FL_HEAD_DIM>;").unwrap();
+    writeln!(out).unwrap();
+
+    // GEMM loop helper
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fl_gemm_loop(
+        out: &mut String,
+        input_global: &str,
+        weight_global: &str,
+        num_k_iters: &str,
+        num_col_tiles: &str,
+        epilogue: &str,
+        a_size: usize,
+        stage_size: usize,
+    ) {
+        writeln!(out, "    {{").unwrap();
+        writeln!(out, "    fl_a_st &a_s0 = *reinterpret_cast<fl_a_st*>(__shm);").unwrap();
+        writeln!(out, "    fl_b_st &b_s0 = *reinterpret_cast<fl_b_st*>(__shm + {a_size});").unwrap();
+        writeln!(out, "    fl_a_st &a_s1 = *reinterpret_cast<fl_a_st*>(__shm + {stage_size});").unwrap();
+        writeln!(out, "    fl_b_st &b_s1 = *reinterpret_cast<fl_b_st*>(__shm + {stage_size} + {a_size});").unwrap();
+        writeln!(out, "    fl_a_st *a_stages[2] = {{&a_s0, &a_s1}};").unwrap();
+        writeln!(out, "    fl_b_st *b_stages[2] = {{&b_s0, &b_s1}};").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    for (int col = 0; col < {num_col_tiles}; col++) {{").unwrap();
+        writeln!(out, "        fl_acc_rt acc;").unwrap();
+        writeln!(out, "        warp::zero(acc);").unwrap();
+        writeln!(out, "        for (int iter = 0; iter < {num_k_iters}; iter++) {{").unwrap();
+        writeln!(out, "            int stage = iter % 2;").unwrap();
+        writeln!(out, "            fl_a_st &a_smem = *a_stages[stage];").unwrap();
+        writeln!(out, "            fl_b_st &b_smem = *b_stages[stage];").unwrap();
+        writeln!(out, "            group<FL_NUM_WARPS>::load_async(a_smem, {input_global}, {{row, iter}});").unwrap();
+        writeln!(out, "            group<FL_NUM_WARPS>::load_async(b_smem, {weight_global}, {{layer, col, iter}});").unwrap();
+        writeln!(out, "            asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");").unwrap();
+        writeln!(out, "            group<FL_NUM_WARPS>::sync(14);").unwrap();
+        writeln!(out, "            rt_bf<16, FL_K_DIM> a_reg;").unwrap();
+        writeln!(out, "            {{ const fl_a_slice_st &a_warp = reinterpret_cast<const fl_a_slice_st*>(&a_smem)[wid];").unwrap();
+        writeln!(out, "               warp::load(a_reg, a_warp); }}").unwrap();
+        writeln!(out, "            fl_b_slice_st *b_slices = reinterpret_cast<fl_b_slice_st*>(&b_smem);").unwrap();
+        writeln!(out, "            #pragma unroll").unwrap();
+        writeln!(out, "            for (int n = 0; n < FL_N_TILES; n++) {{").unwrap();
+        writeln!(out, "                rt_bf<16, FL_K_DIM> b_n; fl_load_b_slice(b_n, b_slices[n]);").unwrap();
+        writeln!(out, "                warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][0], b_n.tiles[0][0], acc.tiles[0][n]);").unwrap();
+        writeln!(out, "                #pragma unroll").unwrap();
+        writeln!(out, "                for (int k = 1; k < a_reg.width; k++)").unwrap();
+        writeln!(out, "                    warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);").unwrap();
+        writeln!(out, "            }}").unwrap();
+        writeln!(out, "            group<FL_NUM_WARPS>::sync(14);").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "{epilogue}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+    }
+
+    // RMSNorm helper
+    fn emit_fl_rmsnorm(
+        out: &mut String,
+        input_global: &str,
+        weight_global: &str,
+        output_global: &str,
+        hd: usize,
+    ) {
+        writeln!(out, "    {{").unwrap();
+        writeln!(out, "    bf16 *act_smem = reinterpret_cast<bf16*>(__shm);").unwrap();
+        writeln!(out, "    bf16 *wgt_smem = reinterpret_cast<bf16*>(__shm + {});", hd * 2).unwrap();
+        writeln!(out, "    float *scratch = reinterpret_cast<float*>(__shm + {});", hd * 4).unwrap();
+        writeln!(out, "    sv_bf<FL_RDPW> *act_tiles = reinterpret_cast<sv_bf<FL_RDPW>*>(act_smem);").unwrap();
+        writeln!(out, "    sv_bf<FL_RDPW> *wgt_tiles = reinterpret_cast<sv_bf<FL_RDPW>*>(wgt_smem);").unwrap();
+        writeln!(out, "    {{ sv_bf<globals::hidden_dim> &w = *reinterpret_cast<sv_bf<globals::hidden_dim>*>(wgt_smem);").unwrap();
+        writeln!(out, "       warp::load_async(w, {weight_global}, {{layer, 0}}); }}").unwrap();
+        writeln!(out, "    {{ sv_bf<globals::hidden_dim> &a = *reinterpret_cast<sv_bf<globals::hidden_dim>*>(act_smem);").unwrap();
+        writeln!(out, "       warp::load_async(a, {input_global}, {{0, 0}}); }}").unwrap();
+        writeln!(out, "    fl_cp_async_wait_all();").unwrap();
+        writeln!(out, "    group<FL_NUM_WARPS>::sync(0);").unwrap();
+        writeln!(out, "    rv_fl<FL_RDPW> act_vec, copy_vec, scale_vec;").unwrap();
+        writeln!(out, "    warp::load(act_vec, act_tiles[wid]); warp::sync();").unwrap();
+        writeln!(out, "    warp::copy(copy_vec, act_vec); warp::mul(copy_vec, copy_vec, copy_vec);").unwrap();
+        writeln!(out, "    float ps = warp::sum(copy_vec);").unwrap();
+        writeln!(out, "    if (lid == 0) scratch[wid] = ps;").unwrap();
+        writeln!(out, "    group<FL_NUM_WARPS>::sync(0);").unwrap();
+        writeln!(out, "    float fs = 0.f; for (int i = 0; i < FL_NUM_WARPS; i++) fs += scratch[i];").unwrap();
+        writeln!(out, "    float rms = rsqrtf(fs / (float)globals::hidden_dim + g.rms_norm_eps);").unwrap();
+        writeln!(out, "    warp::copy(copy_vec, act_vec); warp::mul(copy_vec, copy_vec, rms);").unwrap();
+        writeln!(out, "    warp::copy(act_vec, copy_vec);").unwrap();
+        writeln!(out, "    warp::load(scale_vec, wgt_tiles[wid]); warp::sync();").unwrap();
+        writeln!(out, "    warp::mul(act_vec, act_vec, scale_vec);").unwrap();
+        writeln!(out, "    warp::store(act_tiles[wid], act_vec); warp::sync();").unwrap();
+        writeln!(out, "    group<FL_NUM_WARPS>::sync(0);").unwrap();
+        writeln!(out, "    if (wid == 0) {{").unwrap();
+        writeln!(out, "        sv_bf<globals::hidden_dim> &r = *reinterpret_cast<sv_bf<globals::hidden_dim>*>(act_smem);").unwrap();
+        writeln!(out, "        warp::store({output_global}, r, {{0, 0}});").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    __threadfence(); group<FL_NUM_WARPS>::sync(0);").unwrap();
+        writeln!(out, "    }}").unwrap();
+    }
+
+    // ── The kernel ──
+    writeln!(out, "__global__ void __launch_bounds__({num_threads}, 1)").unwrap();
+    writeln!(out, "fused_full_layer(const globals g, int batch_size, int num_layers) {{").unwrap();
+    writeln!(out, "    const int wid = kittens::warpid();").unwrap();
+    writeln!(out, "    const int lid = kittens::laneid();").unwrap();
+    writeln!(out, "    extern __shared__ char __shm[];").unwrap();
+    writeln!(out, "    const int layer = 0;").unwrap();
+    writeln!(out, "    const int row = 0;").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 1: attn_norm
+    writeln!(out, "    // ════ Phase 1: attn_norm (RMSNorm) ════").unwrap();
+    emit_fl_rmsnorm(&mut out, "g.hidden_states", "g.attn_norm_weights", "g.rms_rope_intermediates", hd);
+    writeln!(out).unwrap();
+
+    // Phase 2: QKV GEMM → q_post_rope (Q heads only, HD columns)
+    writeln!(out, "    // ════ Phase 2: QKV GEMM → q_post_rope ════").unwrap();
+    emit_fl_gemm_loop(
+        &mut out, "g.rms_rope_intermediates", "g.qkv_weights",
+        &hd_k_iters.to_string(), &hd_col_tiles.to_string(),
+        "        {   rt_bf<16, FL_OUT_BLOCK> out_bf;
+            warp::copy(out_bf, acc);
+            warp::store(g.q_post_rope, out_bf, {row * (FL_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out, "    __threadfence(); group<FL_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 3: Attention decode (per-warp flash attention)
+    writeln!(out, "    // ════ Phase 3: attention_decode (per-warp, 1 KV head each) ════").unwrap();
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "    const int batch_idx = 0;").unwrap();
+    writeln!(out, "    const int kv_head = wid;").unwrap();
+    writeln!(out, "    const int q_head_start = kv_head * FL_GQA_RATIO;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    char *warp_shm = __shm + wid * FL_WARP_ATTN_SHMEM;").unwrap();
+    writeln!(out, "    fl_q_st  &Q_smem = *reinterpret_cast<fl_q_st*>(warp_shm);").unwrap();
+    writeln!(out, "    fl_kv_st &K_smem = *reinterpret_cast<fl_kv_st*>(warp_shm + FL_Q_TILE_BYTES);").unwrap();
+    writeln!(out, "    fl_kv_st &V_smem = *reinterpret_cast<fl_kv_st*>(warp_shm + FL_Q_TILE_BYTES + FL_KV_TILE_BYTES);").unwrap();
+    writeln!(out).unwrap();
+
+    // Read paged KV metadata
+    writeln!(out, "    int indptr_start = g.decode_kv_indptr[{{batch_idx}}];").unwrap();
+    writeln!(out, "    int indptr_end   = g.decode_kv_indptr[{{batch_idx + 1}}];").unwrap();
+    writeln!(out, "    int num_kv_pages = indptr_end - indptr_start;").unwrap();
+    writeln!(out, "    int last_page_len = g.decode_kv_last_page_len[{{batch_idx}}];").unwrap();
+    writeln!(out, "    int seq_len = (num_kv_pages - 1) * FL_KV_PAGE_SIZE + last_page_len;").unwrap();
+    writeln!(out, "    int total_blks = ((num_kv_pages - 1) * FL_ITERS_PER_PAGE) +").unwrap();
+    writeln!(out, "                     (last_page_len + FL_KV_BLOCK_SIZE - 1) / FL_KV_BLOCK_SIZE;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load Q via cp.async
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "        constexpr int elem_per_memcpy = sizeof(float4) / sizeof(bf16);").unwrap();
+    writeln!(out, "        constexpr int memcpy_per_row = FL_HEAD_DIM / elem_per_memcpy;").unwrap();
+    writeln!(out, "        auto *src_ptr = (bf16*)&g.q_post_rope[coord<>{{batch_idx, q_head_start * FL_HEAD_DIM}}];").unwrap();
+    writeln!(out, "        uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&Q_smem.data[0]));").unwrap();
+    writeln!(out, "        int col_q = (lid % memcpy_per_row) * elem_per_memcpy;").unwrap();
+    writeln!(out, "        int base_row = (lid < memcpy_per_row) ? 0 : 1;").unwrap();
+    writeln!(out, "        for (int iq = 0; iq < (FL_GQA_RATIO / 2); iq++) {{").unwrap();
+    writeln!(out, "            int qrow = base_row + iq * 2;").unwrap();
+    writeln!(out, "            asm volatile(").unwrap();
+    writeln!(out, "                \"cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\\n\" ::").unwrap();
+    writeln!(out, "                \"r\"(Q_smem.idx(dst_ptr, {{qrow, col_q}})),").unwrap();
+    writeln!(out, "                \"l\"(&src_ptr[qrow * FL_HEAD_DIM + col_q]) : \"memory\");").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "        asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    fl_q_rt Q_reg;").unwrap();
+    writeln!(out, "    warp::load(Q_reg, Q_smem);").unwrap();
+    writeln!(out).unwrap();
+
+    // Flash attention state
+    writeln!(out, "    fl_o_rt O_reg;").unwrap();
+    writeln!(out, "    fl_max_rv max_vec, scaled_max, last_scaled_max, diff_scaled_max;").unwrap();
+    writeln!(out, "    fl_norm_rv norm_vec;").unwrap();
+    writeln!(out, "    warp::neg_infty(max_vec);").unwrap();
+    writeln!(out, "    warp::zero(last_scaled_max);").unwrap();
+    writeln!(out, "    warp::zero(norm_vec);").unwrap();
+    writeln!(out, "    warp::zero(O_reg);").unwrap();
+    writeln!(out, "    float softmax_temp = g.attn_scale * 1.44269504089f;").unwrap();
+    writeln!(out).unwrap();
+
+    // KV block loop
+    writeln!(out, "    for (int i = 0; i < total_blks; i++) {{").unwrap();
+    writeln!(out, "        int kv_page_index = g.decode_kv_indices[{{indptr_start + (i / FL_ITERS_PER_PAGE)}}];").unwrap();
+    writeln!(out, "        int iter_in_page = i % FL_ITERS_PER_PAGE;").unwrap();
+    writeln!(out, "        int page_batch = (int)g.num_pages * layer + kv_page_index;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        warp::load_async<1, false>(K_smem, g.k_cache, {{page_batch, iter_in_page, kv_head, 0}});").unwrap();
+    writeln!(out, "        fl_cp_async_wait_all();").unwrap();
+    writeln!(out, "        fl_k_rt K_reg;").unwrap();
+    writeln!(out, "        warp::load(K_reg, K_smem);").unwrap();
+    writeln!(out, "        fl_score_fl attn_fl;").unwrap();
+    writeln!(out, "        warp::zero(attn_fl);").unwrap();
+    writeln!(out, "        warp::mma_ABt(attn_fl, Q_reg, K_reg, attn_fl);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        if ((i + 1) * FL_KV_BLOCK_SIZE > seq_len)").unwrap();
+    writeln!(out, "            fl_right_fill(attn_fl, attn_fl, seq_len % FL_KV_BLOCK_SIZE, -999999999999.f);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        warp::row_max(max_vec, attn_fl, max_vec);").unwrap();
+    writeln!(out, "        warp::mul(attn_fl, attn_fl, softmax_temp);").unwrap();
+    writeln!(out, "        warp::mul(scaled_max, max_vec, softmax_temp);").unwrap();
+    writeln!(out, "        warp::sub_row(attn_fl, attn_fl, scaled_max);").unwrap();
+    writeln!(out, "        warp::exp2(attn_fl, attn_fl);").unwrap();
+    writeln!(out, "        warp::sub(diff_scaled_max, last_scaled_max, scaled_max);").unwrap();
+    writeln!(out, "        warp::exp2(diff_scaled_max, diff_scaled_max);").unwrap();
+    writeln!(out, "        warp::mul_row(O_reg, O_reg, diff_scaled_max);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        warp::load_async<1, false>(V_smem, g.v_cache, {{page_batch, iter_in_page, kv_head, 0}});").unwrap();
+    writeln!(out, "        fl_cp_async_wait_all();").unwrap();
+    writeln!(out, "        fl_v_rt V_reg;").unwrap();
+    writeln!(out, "        warp::load(V_reg, V_smem);").unwrap();
+    writeln!(out, "        fl_score_bf attn_bf;").unwrap();
+    writeln!(out, "        warp::copy(attn_bf, attn_fl);").unwrap();
+    writeln!(out, "        warp::mma_AB(O_reg, attn_bf, V_reg, O_reg);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        warp::mul(norm_vec, norm_vec, diff_scaled_max);").unwrap();
+    writeln!(out, "        warp::row_sum(norm_vec, attn_fl, norm_vec);").unwrap();
+    writeln!(out, "        warp::copy(last_scaled_max, scaled_max);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Normalize and store attention output
+    writeln!(out, "    warp::div_row(O_reg, O_reg, norm_vec);").unwrap();
+    writeln!(out, "    fl_o_bf O_bf;").unwrap();
+    writeln!(out, "    warp::copy(O_bf, O_reg);").unwrap();
+    writeln!(out, "    fl_o_sv (&O_smem)[4] = *reinterpret_cast<fl_o_sv(*)[4]>(warp_shm);").unwrap();
+    writeln!(out, "    fl_store_4_rows(O_smem, O_bf);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out, "    for (int head_in_group = 0; head_in_group < FL_GQA_RATIO; head_in_group++) {{").unwrap();
+    writeln!(out, "        int out_head = q_head_start + head_in_group;").unwrap();
+    writeln!(out, "        auto *dst = (bf16*)&g.attn_out[coord<>{{batch_idx, out_head * FL_HEAD_DIM}}];").unwrap();
+    writeln!(out, "        auto *src = (bf16*)&O_smem[head_in_group].data[0];").unwrap();
+    writeln!(out, "        for (int ci = lid; ci < FL_HEAD_DIM; ci += 32) dst[ci] = src[ci];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    }} // end Phase 3: attention").unwrap();
+    writeln!(out, "    __threadfence(); group<FL_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 4: o_proj + residual
+    writeln!(out, "    // ════ Phase 4: o_proj GEMM + residual ════").unwrap();
+    emit_fl_gemm_loop(
+        &mut out, "g.attn_out", "g.o_weights",
+        &hd_k_iters.to_string(), &hd_col_tiles.to_string(),
+        "        {   rt_bf<16, FL_OUT_BLOCK> acc_bf;
+            warp::copy(acc_bf, acc);
+            rt_bf<16, FL_OUT_BLOCK> res_bf;
+            warp::load(res_bf, g.hidden_states, {row * (FL_BATCH_BLOCK / 16) + wid, col});
+            #pragma unroll
+            for (int r = 0; r < acc_bf.height; r++)
+                #pragma unroll
+                for (int c = 0; c < acc_bf.width; c++)
+                    #pragma unroll
+                    for (int k = 0; k < acc_bf.tiles[0][0].packed_per_thread; k++) {
+                        bf16_2 &a = acc_bf.tiles[r][c].data[k];
+                        bf16_2 &rv = res_bf.tiles[r][c].data[k];
+                        float a_lo = __bfloat162float(__low2bfloat16(a));
+                        float a_hi = __bfloat162float(__high2bfloat16(a));
+                        float r_lo = __bfloat162float(__low2bfloat16(rv));
+                        float r_hi = __bfloat162float(__high2bfloat16(rv));
+                        a = __floats2bfloat162_rn(a_lo + r_lo, a_hi + r_hi);
+                    }
+            warp::store(g.hidden_states, acc_bf, {row * (FL_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out, "    __threadfence(); group<FL_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 5: mlp_norm
+    writeln!(out, "    // ════ Phase 5: mlp_norm (RMSNorm) ════").unwrap();
+    emit_fl_rmsnorm(&mut out, "g.hidden_states", "g.mlp_norm_weights", "g.rms_gate_intermediates", hd);
+    writeln!(out).unwrap();
+
+    // Phase 6: gate GEMM + SiLU
+    writeln!(out, "    // ════ Phase 6: gate GEMM + SiLU ════").unwrap();
+    emit_fl_gemm_loop(
+        &mut out, "g.rms_gate_intermediates", "g.gate_weights",
+        &hd_k_iters.to_string(), &id_col_tiles.to_string(),
+        "        {   rt_bf<16, FL_OUT_BLOCK> out_bf;
+            #pragma unroll
+            for (int i = 0; i < acc.height; i++)
+                #pragma unroll
+                for (int j = 0; j < acc.width; j++)
+                    #pragma unroll
+                    for (int d = 0; d < acc.tiles[i][j].num_elements; d++) {
+                        float2 &v = acc.tiles[i][j].data[d];
+                        v.x = v.x / (1.f + expf(-v.x));
+                        v.y = v.y / (1.f + expf(-v.y));
+                    }
+            warp::copy(out_bf, acc);
+            warp::store(g.silu_out, out_bf, {row * (FL_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out, "    __threadfence(); group<FL_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 7: up GEMM × gate
+    writeln!(out, "    // ════ Phase 7: up GEMM × gate ════").unwrap();
+    emit_fl_gemm_loop(
+        &mut out, "g.rms_gate_intermediates", "g.up_weights",
+        &hd_k_iters.to_string(), &id_col_tiles.to_string(),
+        "        {   rt_bf<16, FL_OUT_BLOCK> acc_bf;
+            warp::copy(acc_bf, acc);
+            rt_bf<16, FL_OUT_BLOCK> gate_bf;
+            warp::load(gate_bf, g.silu_out, {row * (FL_BATCH_BLOCK / 16) + wid, col});
+            #pragma unroll
+            for (int r = 0; r < acc_bf.height; r++)
+                #pragma unroll
+                for (int c = 0; c < acc_bf.width; c++)
+                    #pragma unroll
+                    for (int k = 0; k < acc_bf.tiles[0][0].packed_per_thread; k++) {
+                        bf16_2 &a = acc_bf.tiles[r][c].data[k];
+                        bf16_2 &gv = gate_bf.tiles[r][c].data[k];
+                        float a_lo = __bfloat162float(__low2bfloat16(a));
+                        float a_hi = __bfloat162float(__high2bfloat16(a));
+                        float g_lo = __bfloat162float(__low2bfloat16(gv));
+                        float g_hi = __bfloat162float(__high2bfloat16(gv));
+                        a = __floats2bfloat162_rn(a_lo * g_lo, a_hi * g_hi);
+                    }
+            warp::store(g.silu_out, acc_bf, {row * (FL_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out, "    __threadfence(); group<FL_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 8: down GEMM + residual
+    writeln!(out, "    // ════ Phase 8: down GEMM + residual ════").unwrap();
+    emit_fl_gemm_loop(
+        &mut out, "g.silu_out", "g.down_weights",
+        &id_k_iters.to_string(), &hd_col_tiles.to_string(),
+        "        {   rt_bf<16, FL_OUT_BLOCK> acc_bf;
+            warp::copy(acc_bf, acc);
+            rt_bf<16, FL_OUT_BLOCK> res_bf;
+            warp::load(res_bf, g.hidden_states, {row * (FL_BATCH_BLOCK / 16) + wid, col});
+            #pragma unroll
+            for (int r = 0; r < acc_bf.height; r++)
+                #pragma unroll
+                for (int c = 0; c < acc_bf.width; c++)
+                    #pragma unroll
+                    for (int k = 0; k < acc_bf.tiles[0][0].packed_per_thread; k++) {
+                        bf16_2 &a = acc_bf.tiles[r][c].data[k];
+                        bf16_2 &rv = res_bf.tiles[r][c].data[k];
+                        float a_lo = __bfloat162float(__low2bfloat16(a));
+                        float a_hi = __bfloat162float(__high2bfloat16(a));
+                        float r_lo = __bfloat162float(__low2bfloat16(rv));
+                        float r_hi = __bfloat162float(__high2bfloat16(rv));
+                        a = __floats2bfloat162_rn(a_lo + r_lo, a_hi + r_hi);
+                    }
+            warp::store(g.hidden_states, acc_bf, {row * (FL_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out).unwrap();
+
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Launch wrapper
+    emit_tensor_arg_and_globals_helper(&mut out);
+    writeln!(out, "extern \"C\" int fused_full_layer_launch(").unwrap();
+    writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "  try {{").unwrap();
+    emit_globals_construction(&mut out, "    ");
+    writeln!(out).unwrap();
+    writeln!(out, "    int shmem = FL_SHMEM;").unwrap();
+    writeln!(out, "    auto err = cudaFuncSetAttribute(fused_full_layer,").unwrap();
+    writeln!(out, "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);").unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
+    writeln!(out, "    fused_full_layer<<<1, {num_threads}, shmem, (cudaStream_t)stream>>>(").unwrap();
+    writeln!(out, "        g, batch_size, num_layers);").unwrap();
+    writeln!(out, "    err = cudaGetLastError();").unwrap();
+    writeln!(out, "    return (int)err;").unwrap();
+    writeln!(out, "  }} catch (...) {{ return -2; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    out
+}
+
 /// List all op names that can be used with `generate_single_op_kernel`.
 pub fn available_op_names() -> Vec<&'static str> {
     vec![
@@ -3679,5 +4233,41 @@ mod tests {
         assert!(cuda.contains("warp::div_row"));  // normalization
         assert!(cuda.contains("decode_kv_indptr")); // paged KV
         assert!(!cuda.contains("init_semaphore")); // no KVM
+    }
+
+    #[test]
+    fn generates_fused_full_layer() {
+        let input: proc_macro2::TokenStream = quote::quote! {
+            kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                    let qkv = gemm(normed, qkv_weights[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                    let gate = silu(gemm(normed2, gate_weights[layer]));
+                    let up = gemm(normed2, up_weights[layer]);
+                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                }
+                let normed = rmsnorm(hidden_states, lm_head_norm);
+                logits = gemm(normed, lm_head);
+            }
+        };
+        let def: crate::parse::MegakernelDef = syn::parse2(input).expect("parse");
+        let dag = crate::parse::build_dag(&def).expect("dag");
+        let cuda = generate_fused_full_layer_kernel(&dag);
+
+        // Has all phases including attention
+        assert!(cuda.contains("Phase 1: attn_norm"));
+        assert!(cuda.contains("Phase 2: QKV GEMM"));
+        assert!(cuda.contains("Phase 3: attention_decode"));
+        assert!(cuda.contains("Phase 4: o_proj"));
+        assert!(cuda.contains("Phase 5: mlp_norm"));
+        assert!(cuda.contains("Phase 8: down GEMM"));
+        assert!(cuda.contains("warp::mma_ABt")); // attention Q@K^T
+        assert!(cuda.contains("warp::mma_AB"));  // attention attn@V
+        assert!(cuda.contains("fused_full_layer("));
+        assert!(cuda.contains("fused_full_layer_launch("));
     }
 }

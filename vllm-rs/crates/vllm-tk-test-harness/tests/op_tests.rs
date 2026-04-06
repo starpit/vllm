@@ -1835,99 +1835,94 @@ fn test_fused_prefill_layer_golden() {
         .map(|t| bf16_roundtrip(&make_random(HD, 1000 + t as u64, 0.5)))
         .collect();
 
-    // ── CPU golden chain (per token, then attention across all tokens) ──
+    // ── CPU golden chain: multi-layer loop ──
+    // Each layer: attn_norm → QKV GEMM → attention_prefill → o_proj+residual → MLP block
+    // Weights are replicated (same for all layers), but hidden_states evolve.
 
-    // 1. attn_norm each token
-    let mut normed_all = vec![0.0_f32; seq_len * HD];
-    for t in 0..seq_len {
-        let mut normed = vec![0.0_f32; HD];
-        cpu_golden::rmsnorm(&input_tokens[t], &attn_norm_w, &mut normed, 1e-5);
-        let normed = bf16_roundtrip(&normed);
-        normed_all[t * HD..(t + 1) * HD].copy_from_slice(&normed);
-    }
-
-    // 2. QKV GEMM each token → extract Q portion [seq_len, NAH*HDM]
-    // QKV weight is [QKV_DIM, HD], output per token is [QKV_DIM]
-    // Q = first NAH*HDM elements = first HD elements
-    let mut q_all = vec![0.0_f32; seq_len * NAH * HDM];
-    for t in 0..seq_len {
-        let normed_t = &normed_all[t * HD..(t + 1) * HD];
-        let mut qkv_out = vec![0.0_f32; QKV_DIM];
-        cpu_golden::gemm(normed_t, &qkv_w, &mut qkv_out, 1, HD, QKV_DIM);
-        let qkv_out = bf16_roundtrip(&qkv_out);
-        // Q portion: first NAH*HDM = HD elements
-        q_all[t * NAH * HDM..(t + 1) * NAH * HDM].copy_from_slice(&qkv_out[..NAH * HDM]);
-    }
-
-    // Extract K/V from QKV for the KV cache
-    // K = [HD .. HD + NKH*HDM], V = [HD + NKH*HDM .. HD + 2*NKH*HDM]
     let k_size = NKH * HDM;
     let v_size = NKH * HDM;
-    let mut k_cache_flat = vec![0.0_f32; seq_len * NKH * HDM];
-    let mut v_cache_flat = vec![0.0_f32; seq_len * NKH * HDM];
-    for t in 0..seq_len {
-        let normed_t = &normed_all[t * HD..(t + 1) * HD];
-        let mut qkv_out = vec![0.0_f32; QKV_DIM];
-        cpu_golden::gemm(normed_t, &qkv_w, &mut qkv_out, 1, HD, QKV_DIM);
-        let qkv_out = bf16_roundtrip(&qkv_out);
-        k_cache_flat[t * k_size..(t + 1) * k_size].copy_from_slice(&qkv_out[HD..HD + k_size]);
-        v_cache_flat[t * v_size..(t + 1) * v_size]
-            .copy_from_slice(&qkv_out[HD + k_size..HD + k_size + v_size]);
+    let seq_starts = vec![0_usize, seq_len];
+
+    // Current hidden states (updated each layer)
+    let mut hidden_states: Vec<Vec<f32>> = input_tokens.clone();
+
+    for _layer in 0..NL {
+        // 1. attn_norm each token
+        let mut normed_all = vec![0.0_f32; seq_len * HD];
+        for t in 0..seq_len {
+            let mut normed = vec![0.0_f32; HD];
+            cpu_golden::rmsnorm(&hidden_states[t], &attn_norm_w, &mut normed, 1e-5);
+            let normed = bf16_roundtrip(&normed);
+            normed_all[t * HD..(t + 1) * HD].copy_from_slice(&normed);
+        }
+
+        // 2. QKV GEMM → extract Q, K, V
+        let mut q_all = vec![0.0_f32; seq_len * NAH * HDM];
+        let mut k_cache_flat = vec![0.0_f32; seq_len * k_size];
+        let mut v_cache_flat = vec![0.0_f32; seq_len * v_size];
+        for t in 0..seq_len {
+            let normed_t = &normed_all[t * HD..(t + 1) * HD];
+            let mut qkv_out = vec![0.0_f32; QKV_DIM];
+            cpu_golden::gemm(normed_t, &qkv_w, &mut qkv_out, 1, HD, QKV_DIM);
+            let qkv_out = bf16_roundtrip(&qkv_out);
+            q_all[t * NAH * HDM..(t + 1) * NAH * HDM].copy_from_slice(&qkv_out[..NAH * HDM]);
+            k_cache_flat[t * k_size..(t + 1) * k_size].copy_from_slice(&qkv_out[HD..HD + k_size]);
+            v_cache_flat[t * v_size..(t + 1) * v_size]
+                .copy_from_slice(&qkv_out[HD + k_size..HD + k_size + v_size]);
+        }
+
+        // 3. Attention prefill
+        let mut attn_out_all = vec![0.0_f32; seq_len * NAH * HDM];
+        cpu_golden::attention_prefill(
+            &q_all,
+            &k_cache_flat,
+            &v_cache_flat,
+            &mut attn_out_all,
+            &seq_starts,
+            NAH,
+            NKH,
+            HDM,
+            attn_scale,
+        );
+
+        // 4-8. o_proj+residual → MLP block
+        for t in 0..seq_len {
+            let attn_t = bf16_roundtrip(&attn_out_all[t * NAH * HDM..(t + 1) * NAH * HDM]);
+
+            let mut hidden = vec![0.0_f32; HD];
+            cpu_golden::gemm_add(&attn_t, &o_w, &hidden_states[t], &mut hidden, 1, HD, HD);
+            let hidden = bf16_roundtrip(&hidden);
+
+            let mut mlp_normed = vec![0.0_f32; HD];
+            cpu_golden::rmsnorm(&hidden, &mlp_norm_w, &mut mlp_normed, 1e-5);
+            let mlp_normed = bf16_roundtrip(&mlp_normed);
+
+            let mut gate_out = vec![0.0_f32; ID];
+            cpu_golden::gemm(&mlp_normed, &gate_w, &mut gate_out, 1, HD, ID);
+            let gate_out = bf16_roundtrip(&gate_out);
+            let mut gate_silu = vec![0.0_f32; ID];
+            cpu_golden::silu(&gate_out, &mut gate_silu);
+            let gate_silu = bf16_roundtrip(&gate_silu);
+
+            let mut up_out = vec![0.0_f32; ID];
+            cpu_golden::gemm(&mlp_normed, &up_w, &mut up_out, 1, HD, ID);
+            let up_out = bf16_roundtrip(&up_out);
+
+            let mut mlp_inter = vec![0.0_f32; ID];
+            cpu_golden::mul(&gate_silu, &up_out, &mut mlp_inter);
+            let mlp_inter = bf16_roundtrip(&mlp_inter);
+
+            let mut final_hidden = vec![0.0_f32; HD];
+            cpu_golden::gemm_add(&mlp_inter, &down_w, &hidden, &mut final_hidden, 1, ID, HD);
+
+            hidden_states[t] = final_hidden;
+        }
     }
 
-    // 3. Attention prefill (all tokens at once)
-    let seq_starts = vec![0_usize, seq_len];
-    let mut attn_out_all = vec![0.0_f32; seq_len * NAH * HDM];
-    cpu_golden::attention_prefill(
-        &q_all,
-        &k_cache_flat,
-        &v_cache_flat,
-        &mut attn_out_all,
-        &seq_starts,
-        NAH,
-        NKH,
-        HDM,
-        attn_scale,
-    );
-
-    // 4-8. o_proj+residual → mlp_norm → gate+silu → up×gate → down+residual
+    // Expected = final hidden_states after all layers
     let mut expected = vec![0.0_f32; seq_len * HD];
     for t in 0..seq_len {
-        let attn_t = bf16_roundtrip(&attn_out_all[t * NAH * HDM..(t + 1) * NAH * HDM]);
-
-        // o_proj + residual
-        let mut hidden = vec![0.0_f32; HD];
-        cpu_golden::gemm_add(&attn_t, &o_w, &input_tokens[t], &mut hidden, 1, HD, HD);
-        let hidden = bf16_roundtrip(&hidden);
-
-        // mlp_norm
-        let mut mlp_normed = vec![0.0_f32; HD];
-        cpu_golden::rmsnorm(&hidden, &mlp_norm_w, &mut mlp_normed, 1e-5);
-        let mlp_normed = bf16_roundtrip(&mlp_normed);
-
-        // gate + silu
-        let mut gate_out = vec![0.0_f32; ID];
-        cpu_golden::gemm(&mlp_normed, &gate_w, &mut gate_out, 1, HD, ID);
-        let gate_out = bf16_roundtrip(&gate_out);
-        let mut gate_silu = vec![0.0_f32; ID];
-        cpu_golden::silu(&gate_out, &mut gate_silu);
-        let gate_silu = bf16_roundtrip(&gate_silu);
-
-        // up
-        let mut up_out = vec![0.0_f32; ID];
-        cpu_golden::gemm(&mlp_normed, &up_w, &mut up_out, 1, HD, ID);
-        let up_out = bf16_roundtrip(&up_out);
-
-        // gate * up
-        let mut mlp_inter = vec![0.0_f32; ID];
-        cpu_golden::mul(&gate_silu, &up_out, &mut mlp_inter);
-        let mlp_inter = bf16_roundtrip(&mlp_inter);
-
-        // down + residual
-        let mut final_hidden = vec![0.0_f32; HD];
-        cpu_golden::gemm_add(&mlp_inter, &down_w, &hidden, &mut final_hidden, 1, ID, HD);
-
-        expected[t * HD..(t + 1) * HD].copy_from_slice(&final_hidden);
+        expected[t * HD..(t + 1) * HD].copy_from_slice(&hidden_states[t]);
     }
 
     // ── GPU setup ──

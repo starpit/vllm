@@ -7754,7 +7754,11 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
     writeln!(out, "    const int lid = kittens::laneid();").unwrap();
     writeln!(out, "    const int bid = blockIdx.x;").unwrap();
     writeln!(out, "    extern __shared__ char __shm[];").unwrap();
-    writeln!(out, "    const int layer = 0;  // single layer").unwrap();
+    writeln!(
+        out,
+        "    for (int layer = 0; layer < num_layers; layer++) {{"
+    )
+    .unwrap();
     writeln!(out).unwrap();
 
     // This CTA's Q rows
@@ -8031,7 +8035,7 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
     writeln!(out, "    const int token_pos = abs_q_row + qr;").unwrap();
     writeln!(
         out,
-        "    const int page_idx = g.prefill_kv_indices[{{token_pos / PFL_KV_PAGE_SIZE}}];"
+        "    const int page_idx = g.prefill_kv_indices[{{token_pos / PFL_KV_PAGE_SIZE}}] + layer * (int)g.num_pages;"
     )
     .unwrap();
     writeln!(
@@ -8808,6 +8812,7 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
     );
     writeln!(out).unwrap();
 
+    writeln!(out, "    }}  // end layer loop").unwrap();
     writeln!(out, "}}  // end fused_prefill_layer").unwrap();
     writeln!(out).unwrap();
 

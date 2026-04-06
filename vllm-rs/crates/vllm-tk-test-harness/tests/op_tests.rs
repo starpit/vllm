@@ -143,24 +143,27 @@ impl TestBuffers {
 /// Shapes match `args_to_ffi` in the proc-macro exactly.
 macro_rules! call_launch {
     ($fn:path, $b:expr) => {
+        call_launch!($fn, $b, NUM_PAGES)
+    };
+    ($fn:path, $b:expr, $kv_pages:expr) => {
         unsafe {
             $fn(
                 TkTensorArg::new($b.bar, &[NL, NUM_OPS, N_BATCH_BLOCKS, MAX_BARRIER_COLS]),
                 TkTensorArg::new($b.instr, &[SM_COUNT, MAX_PER_SM, INSTRUCTION_WIDTH]),
                 TkTensorArg::new($b.timings, &[SM_COUNT, MAX_PER_SM, TIMING_WIDTH]),
-                // Weights — NL folded into row dim (not depth)
-                TkTensorArg::new($b.qkv_w, &[NL * QKV_DIM, HD]),
-                TkTensorArg::new($b.attn_norm_w, &[NL, HD]),
-                TkTensorArg::new($b.o_w, &[NL * HD, HD]),
-                TkTensorArg::new($b.mlp_norm_w, &[NL, HD]),
-                TkTensorArg::new($b.up_w, &[NL * ID, HD]),
-                TkTensorArg::new($b.gate_w, &[NL * ID, HD]),
-                TkTensorArg::new($b.down_w, &[NL * HD, ID]),
-                TkTensorArg::new($b.lm_norm_w, &[1, HD]),
-                TkTensorArg::new($b.lm_w, &[VS, HD]),
+                // Weights — 4D [1, NL, output_dim, input_dim] matching KVM layout
+                TkTensorArg::new($b.qkv_w, &[1, NL, QKV_DIM, HD]),
+                TkTensorArg::new($b.attn_norm_w, &[1, 1, NL, HD]),
+                TkTensorArg::new($b.o_w, &[1, NL, HD, HD]),
+                TkTensorArg::new($b.mlp_norm_w, &[1, 1, NL, HD]),
+                TkTensorArg::new($b.up_w, &[1, NL, ID, HD]),
+                TkTensorArg::new($b.gate_w, &[1, NL, ID, HD]),
+                TkTensorArg::new($b.down_w, &[1, NL, HD, ID]),
+                TkTensorArg::new($b.lm_norm_w, &[1, 1, 1, HD]),
+                TkTensorArg::new($b.lm_w, &[1, 1, VS, HD]),
                 // KV cache — d=1 (page_size is baked into GL type)
-                TkTensorArg::new($b.k_cache, &[NUM_PAGES, KV_PAGE_SIZE, NKH, HDM]),
-                TkTensorArg::new($b.v_cache, &[NUM_PAGES, KV_PAGE_SIZE, NKH, HDM]),
+                TkTensorArg::new($b.k_cache, &[$kv_pages, KV_PAGE_SIZE, NKH, HDM]),
+                TkTensorArg::new($b.v_cache, &[$kv_pages, KV_PAGE_SIZE, NKH, HDM]),
                 TkTensorArg::new($b.rope_cos, &[4096, HDM]),
                 TkTensorArg::new($b.rope_sin, &[4096, HDM]),
                 // Activations — 4D with b=1, d=1
@@ -1260,7 +1263,7 @@ fn test_fused_multi_layer_timing() {
 
     // Weights
     b.attn_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 10, 0.1)));
-    b.qkv_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * HD, 100, 0.01)));
+    b.qkv_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * QKV_DIM * HD, 100, 0.01)));
     b.o_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * HD, 150, 0.01)));
     b.mlp_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 20, 0.1)));
     b.gate_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * ID * HD, 200, 0.01)));
@@ -1284,9 +1287,18 @@ fn test_fused_multi_layer_timing() {
     last_page_full[0] = last_page_len as i32;
     b.kv_last_page = gpu_upload_i32(&last_page_full);
 
+    // Single launch + sync to check for errors
+    {
+        let rc = call_launch!(ffi::fused_multi_layer_launch, b, NL * NUM_PAGES);
+        assert_eq!(rc, 0, "fused_multi_layer_launch returned error {rc}");
+        eprintln!("multi-layer kernel launched, syncing...");
+        unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+        eprintln!("multi-layer kernel sync OK");
+    }
+
     // Warmup
-    for _ in 0..5 {
-        let rc = call_launch!(ffi::fused_multi_layer_launch, b);
+    for _ in 0..4 {
+        let rc = call_launch!(ffi::fused_multi_layer_launch, b, NL * NUM_PAGES);
         assert_eq!(rc, 0, "fused_multi_layer_launch returned error {rc}");
     }
     unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
@@ -1302,7 +1314,7 @@ fn test_fused_multi_layer_timing() {
     }
 
     for _ in 0..num_iters {
-        let rc = call_launch!(ffi::fused_multi_layer_launch, b);
+        let rc = call_launch!(ffi::fused_multi_layer_launch, b, NL * NUM_PAGES);
         assert_eq!(rc, 0);
     }
 

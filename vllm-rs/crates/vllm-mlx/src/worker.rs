@@ -960,14 +960,7 @@ impl Worker for MlxWorker {
             }
 
             let prompt_ids = new_req.prompt_token_ids.as_deref().unwrap_or(&[]);
-            let num_computed = new_req.num_computed_tokens as usize;
-
-            // Fix: slice from num_computed_tokens, not 0.
-            // The scheduler tells us how many prefix tokens are already cached;
-            // we only need to forward the remaining tokens.
-            let start = num_computed.min(prompt_ids.len());
-            let end = (start + num_tokens).min(prompt_ids.len());
-            let tokens_to_use = &prompt_ids[start..end];
+            let mut num_computed = new_req.num_computed_tokens as usize;
 
             self.token_buffers
                 .insert(new_req.req_id.clone(), prompt_ids.to_vec());
@@ -1024,6 +1017,9 @@ impl Worker for MlxWorker {
                         "prefix cache miss for req {} ({} computed tokens, forwarding all)",
                         new_req.req_id, num_computed
                     );
+                    // Scheduler thought tokens were cached but our pool
+                    // doesn't have them — forward everything from the start.
+                    num_computed = 0;
                     cache::empty_kv_cache(num_layers)
                 }
             } else {
@@ -1031,6 +1027,18 @@ impl Worker for MlxWorker {
             };
             self.kv_caches.insert(new_req.req_id.clone(), kv_cache);
 
+            // Recompute token slice and positions after potential num_computed reset.
+            // When num_computed was reset to 0 (pool miss), we must forward the
+            // entire prompt — num_tokens from the scheduler only covers the
+            // non-cached portion.
+            let start = num_computed.min(prompt_ids.len());
+            let effective_num_tokens = if num_computed == 0 && new_req.num_computed_tokens > 0 {
+                prompt_ids.len() // pool miss: forward everything
+            } else {
+                num_tokens
+            };
+            let end = (start + effective_num_tokens).min(prompt_ids.len());
+            let tokens_to_use = &prompt_ids[start..end];
             let pos_offset = num_computed as i32;
             let positions: Vec<i32> = (0..tokens_to_use.len() as i32)
                 .map(|i| pos_offset + i)
@@ -1873,29 +1881,42 @@ impl Worker for MlxWorker {
                     }
                 }
 
-                // Build reference slices for the trait method.
-                let per_layer_k_refs: Vec<Vec<&Array>> = per_layer_span_k
-                    .iter()
-                    .map(|v| v.iter().collect())
-                    .collect();
-                let per_layer_v_refs: Vec<Vec<&Array>> = per_layer_span_v
-                    .iter()
-                    .map(|v| v.iter().collect())
-                    .collect();
+                // If no span blocks were actually found in the pool, fall back to
+                // normal forward. forward_with_segments with empty segments computes
+                // incorrect RoPE offsets (active_pos_offset = 1 instead of 0).
+                if span_position_offsets.is_empty() {
+                    model
+                        .forward(&input_ids, &positions, kv_cache, rope_offset)
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
+                        })?
+                } else {
+                    // Build reference slices for the trait method.
+                    let per_layer_k_refs: Vec<Vec<&Array>> = per_layer_span_k
+                        .iter()
+                        .map(|v| v.iter().collect())
+                        .collect();
+                    let per_layer_v_refs: Vec<Vec<&Array>> = per_layer_span_v
+                        .iter()
+                        .map(|v| v.iter().collect())
+                        .collect();
 
-                let offset = rope_offset.unwrap_or(0);
-                model
-                    .forward_with_segments(
-                        &input_ids,
-                        kv_cache,
-                        offset,
-                        &per_layer_k_refs,
-                        &per_layer_v_refs,
-                        &span_position_offsets,
-                    )
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("forward_with_segments failed: {e}"))
-                    })?
+                    let offset = rope_offset.unwrap_or(0);
+                    model
+                        .forward_with_segments(
+                            &input_ids,
+                            kv_cache,
+                            offset,
+                            &per_layer_k_refs,
+                            &per_layer_v_refs,
+                            &span_position_offsets,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "forward_with_segments failed: {e}"
+                            ))
+                        })?
+                }
             } else {
                 model
                     .forward(&input_ids, &positions, kv_cache, rope_offset)

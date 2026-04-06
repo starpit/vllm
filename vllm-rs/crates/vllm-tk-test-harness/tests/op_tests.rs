@@ -318,6 +318,16 @@ fn gpu_upload_bf16(data: &[f32]) -> u64 {
     }
 }
 
+/// Upload f32 data to GPU (no bf16 conversion).
+fn gpu_upload_f32(data: &[f32]) -> u64 {
+    unsafe {
+        let bytes = data.len() * 4;
+        let dptr = result::malloc_sync(bytes).expect("cuMemAlloc failed");
+        result::memcpy_htod_sync(dptr, data).expect("cuMemcpyHtoD failed");
+        dptr as u64
+    }
+}
+
 /// Download bf16 data from GPU and convert to f32.
 fn gpu_download_bf16(dptr: u64, count: usize) -> Vec<f32> {
     let mut bf16_data = vec![bf16::ZERO; count];
@@ -1783,6 +1793,307 @@ fn test_fused_prefill_attention_golden() {
             2.0,
             0.2,
             &format!("prefill_attention_golden tok={tok}"),
+        );
+    }
+}
+
+/// Full single-layer prefill: attn_norm → QKV GEMM → attention_prefill → o_proj+residual → MLP block.
+/// Each CTA owns 16 rows through the full layer pipeline.
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_fused_prefill_layer_golden() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    let seq_len: usize = 48;
+    let num_pages_used = (seq_len + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE; // 1
+    let attn_scale = 1.0 / (HDM as f32).sqrt();
+
+    // Weights (single layer)
+    let attn_norm_w = bf16_roundtrip(&gen_weight(HD));
+    let qkv_w = bf16_roundtrip(&make_random(QKV_DIM * HD, 100, 0.01));
+    let o_w = bf16_roundtrip(&make_random(HD * HD, 150, 0.01));
+    let mlp_norm_w = bf16_roundtrip(&gen_weight(HD));
+    let gate_w = bf16_roundtrip(&make_random(ID * HD, 200, 0.01));
+    let up_w = bf16_roundtrip(&make_random(ID * HD, 300, 0.01));
+    let down_w = bf16_roundtrip(&make_random(HD * ID, 400, 0.01));
+
+    // Input hidden states: [seq_len, HD]
+    let input_tokens: Vec<Vec<f32>> = (0..seq_len)
+        .map(|t| bf16_roundtrip(&make_random(HD, 1000 + t as u64, 0.5)))
+        .collect();
+
+    // ── CPU golden chain (per token, then attention across all tokens) ──
+
+    // 1. attn_norm each token
+    let mut normed_all = vec![0.0_f32; seq_len * HD];
+    for t in 0..seq_len {
+        let mut normed = vec![0.0_f32; HD];
+        cpu_golden::rmsnorm(&input_tokens[t], &attn_norm_w, &mut normed, 1e-5);
+        let normed = bf16_roundtrip(&normed);
+        normed_all[t * HD..(t + 1) * HD].copy_from_slice(&normed);
+    }
+
+    // 2. QKV GEMM each token → extract Q portion [seq_len, NAH*HDM]
+    // QKV weight is [QKV_DIM, HD], output per token is [QKV_DIM]
+    // Q = first NAH*HDM elements = first HD elements
+    let mut q_all = vec![0.0_f32; seq_len * NAH * HDM];
+    for t in 0..seq_len {
+        let normed_t = &normed_all[t * HD..(t + 1) * HD];
+        let mut qkv_out = vec![0.0_f32; QKV_DIM];
+        cpu_golden::gemm(normed_t, &qkv_w, &mut qkv_out, 1, HD, QKV_DIM);
+        let qkv_out = bf16_roundtrip(&qkv_out);
+        // Q portion: first NAH*HDM = HD elements
+        q_all[t * NAH * HDM..(t + 1) * NAH * HDM].copy_from_slice(&qkv_out[..NAH * HDM]);
+    }
+
+    // Extract K/V from QKV for the KV cache
+    // K = [HD .. HD + NKH*HDM], V = [HD + NKH*HDM .. HD + 2*NKH*HDM]
+    let k_size = NKH * HDM;
+    let v_size = NKH * HDM;
+    let mut k_cache_flat = vec![0.0_f32; seq_len * NKH * HDM];
+    let mut v_cache_flat = vec![0.0_f32; seq_len * NKH * HDM];
+    for t in 0..seq_len {
+        let normed_t = &normed_all[t * HD..(t + 1) * HD];
+        let mut qkv_out = vec![0.0_f32; QKV_DIM];
+        cpu_golden::gemm(normed_t, &qkv_w, &mut qkv_out, 1, HD, QKV_DIM);
+        let qkv_out = bf16_roundtrip(&qkv_out);
+        k_cache_flat[t * k_size..(t + 1) * k_size].copy_from_slice(&qkv_out[HD..HD + k_size]);
+        v_cache_flat[t * v_size..(t + 1) * v_size]
+            .copy_from_slice(&qkv_out[HD + k_size..HD + k_size + v_size]);
+    }
+
+    // 3. Attention prefill (all tokens at once)
+    let seq_starts = vec![0_usize, seq_len];
+    let mut attn_out_all = vec![0.0_f32; seq_len * NAH * HDM];
+    cpu_golden::attention_prefill(
+        &q_all,
+        &k_cache_flat,
+        &v_cache_flat,
+        &mut attn_out_all,
+        &seq_starts,
+        NAH,
+        NKH,
+        HDM,
+        attn_scale,
+    );
+
+    // 4-8. o_proj+residual → mlp_norm → gate+silu → up×gate → down+residual
+    let mut expected = vec![0.0_f32; seq_len * HD];
+    for t in 0..seq_len {
+        let attn_t = bf16_roundtrip(&attn_out_all[t * NAH * HDM..(t + 1) * NAH * HDM]);
+
+        // o_proj + residual
+        let mut hidden = vec![0.0_f32; HD];
+        cpu_golden::gemm_add(&attn_t, &o_w, &input_tokens[t], &mut hidden, 1, HD, HD);
+        let hidden = bf16_roundtrip(&hidden);
+
+        // mlp_norm
+        let mut mlp_normed = vec![0.0_f32; HD];
+        cpu_golden::rmsnorm(&hidden, &mlp_norm_w, &mut mlp_normed, 1e-5);
+        let mlp_normed = bf16_roundtrip(&mlp_normed);
+
+        // gate + silu
+        let mut gate_out = vec![0.0_f32; ID];
+        cpu_golden::gemm(&mlp_normed, &gate_w, &mut gate_out, 1, HD, ID);
+        let gate_out = bf16_roundtrip(&gate_out);
+        let mut gate_silu = vec![0.0_f32; ID];
+        cpu_golden::silu(&gate_out, &mut gate_silu);
+        let gate_silu = bf16_roundtrip(&gate_silu);
+
+        // up
+        let mut up_out = vec![0.0_f32; ID];
+        cpu_golden::gemm(&mlp_normed, &up_w, &mut up_out, 1, HD, ID);
+        let up_out = bf16_roundtrip(&up_out);
+
+        // gate * up
+        let mut mlp_inter = vec![0.0_f32; ID];
+        cpu_golden::mul(&gate_silu, &up_out, &mut mlp_inter);
+        let mlp_inter = bf16_roundtrip(&mlp_inter);
+
+        // down + residual
+        let mut final_hidden = vec![0.0_f32; HD];
+        cpu_golden::gemm_add(&mlp_inter, &down_w, &hidden, &mut final_hidden, 1, ID, HD);
+
+        expected[t * HD..(t + 1) * HD].copy_from_slice(&final_hidden);
+    }
+
+    // ── GPU setup ──
+    let mut b = TestBuffers::new();
+
+    // hidden_states: [ACT_ROWS, HD] — fill first seq_len rows
+    let mut input_full = vec![0.0_f32; ACT_ROWS * HD];
+    for t in 0..seq_len {
+        input_full[t * HD..(t + 1) * HD].copy_from_slice(&input_tokens[t]);
+    }
+    b.hidden = gpu_upload_bf16(&input_full);
+
+    // Weights (replicated across NL layers)
+    let anw: Vec<f32> = attn_norm_w.iter().copied().cycle().take(NL * HD).collect();
+    b.attn_norm_w = gpu_upload_bf16(&anw);
+    let qw: Vec<f32> = qkv_w
+        .iter()
+        .copied()
+        .cycle()
+        .take(NL * QKV_DIM * HD)
+        .collect();
+    b.qkv_w = gpu_upload_bf16(&qw);
+    let ow: Vec<f32> = o_w.iter().copied().cycle().take(NL * HD * HD).collect();
+    b.o_w = gpu_upload_bf16(&ow);
+    let mnw: Vec<f32> = mlp_norm_w.iter().copied().cycle().take(NL * HD).collect();
+    b.mlp_norm_w = gpu_upload_bf16(&mnw);
+    let gw: Vec<f32> = gate_w.iter().copied().cycle().take(NL * ID * HD).collect();
+    b.gate_w = gpu_upload_bf16(&gw);
+    let uw: Vec<f32> = up_w.iter().copied().cycle().take(NL * ID * HD).collect();
+    b.up_w = gpu_upload_bf16(&uw);
+    let dw: Vec<f32> = down_w.iter().copied().cycle().take(NL * HD * ID).collect();
+    b.down_w = gpu_upload_bf16(&dw);
+
+    // Paged KV cache — pre-load K/V from CPU QKV GEMM output
+    // (kernel doesn't have RoPE+append phase yet, so we must pre-fill)
+    let total_kv_cache_size = NL * NUM_PAGES * KV_PAGE_SIZE * NKH * HDM;
+    let mut k_paged = vec![0.0_f32; total_kv_cache_size];
+    let mut v_paged = vec![0.0_f32; total_kv_cache_size];
+    let page_index = 0_usize;
+    let page_batch = NUM_PAGES * 0 + page_index; // layer 0
+    for tok in 0..seq_len {
+        for kv_h in 0..NKH {
+            for d in 0..HDM {
+                let flat_idx = tok * NKH * HDM + kv_h * HDM + d;
+                let paged_idx =
+                    page_batch * KV_PAGE_SIZE * NKH * HDM + tok * NKH * HDM + kv_h * HDM + d;
+                k_paged[paged_idx] = k_cache_flat[flat_idx];
+                v_paged[paged_idx] = v_cache_flat[flat_idx];
+            }
+        }
+    }
+    b.k_cache = gpu_upload_bf16(&k_paged);
+    b.v_cache = gpu_upload_bf16(&v_paged);
+
+    // RoPE: identity (cos=1, sin=0) so we can compare without RoPE math
+    let mut rope_cos_data = vec![0.0_f32; 4096 * HDM];
+    let mut rope_sin_data = vec![0.0_f32; 4096 * HDM];
+    for i in 0..4096 * HDM {
+        rope_cos_data[i] = 1.0;
+        rope_sin_data[i] = 0.0;
+    }
+    b.rope_cos = gpu_upload_f32(&rope_cos_data);
+    b.rope_sin = gpu_upload_f32(&rope_sin_data);
+
+    // Activation buffers
+    b.rms_rope = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+    b.q_post = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+    b.attn_out = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+    b.rms_gate = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+    b.silu_buf = gpu_alloc_zeros(ACT_ROWS * ID * BF16);
+
+    // Prefill metadata
+    let prefill_qo_indptr = gpu_upload_i32(&[0_i32, seq_len as i32]);
+    let prefill_kv_indptr = gpu_upload_i32(&[0_i32, num_pages_used as i32]);
+    let prefill_kv_indices = gpu_upload_i32(&[0_i32]); // page 0
+    let prefill_kv_last_page_len = gpu_upload_i32(&[seq_len as i32]);
+
+    // Position IDs for RoPE (0..seq_len)
+    let mut pos_ids_data = vec![0_i32; ACT_ROWS];
+    for i in 0..seq_len {
+        pos_ids_data[i] = i as i32;
+    }
+    b.pos_ids = gpu_upload_i32(&pos_ids_data);
+
+    // KV append indices (page_offset for each token)
+    let mut kv_append_data = vec![0_i32; ACT_ROWS];
+    for i in 0..seq_len {
+        kv_append_data[i] = i as i32; // slot within page 0
+    }
+    b.kv_append = gpu_upload_i32(&kv_append_data);
+
+    let kv_pages = NL * NUM_PAGES;
+    let rc = unsafe {
+        ffi::fused_prefill_layer_launch(
+            // VM state
+            BarrierArg::new(b.bar, NL, NUM_OPS, N_BATCH_BLOCKS, MAX_BARRIER_COLS),
+            TkTensorArg::raw(b.instr, &[SM_COUNT, MAX_PER_SM, INSTRUCTION_WIDTH]),
+            TkTensorArg::raw(b.timings, &[SM_COUNT, MAX_PER_SM, TIMING_WIDTH]),
+            // Weights
+            WeightArg::new(b.qkv_w, NL, QKV_DIM, HD),
+            NormWeightArg::new(b.attn_norm_w, NL, HD),
+            WeightArg::new(b.o_w, NL, HD, HD),
+            NormWeightArg::new(b.mlp_norm_w, NL, HD),
+            WeightArg::new(b.up_w, NL, ID, HD),
+            WeightArg::new(b.gate_w, NL, ID, HD),
+            WeightArg::new(b.down_w, NL, HD, ID),
+            NormWeightArg::new(b.lm_norm_w, 1, HD),
+            WeightArg::new(b.lm_w, 1, VS, HD),
+            // KV cache
+            KvCacheArg::new(b.k_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+            KvCacheArg::new(b.v_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+            // RoPE
+            RopeArg::new(b.rope_cos, 4096, HDM),
+            RopeArg::new(b.rope_sin, 4096, HDM),
+            // Activations
+            ActivationArg::new(b.hidden, ACT_ROWS, HD),
+            ActivationArg::new(b.rms_rope, ACT_ROWS, HD),
+            ActivationArg::new(b.rms_gate, ACT_ROWS, HD),
+            ActivationArg::new(b.q_post, ACT_ROWS, HD),
+            ActivationArg::new(b.attn_out, ACT_ROWS, HD),
+            ActivationArg::new(b.silu_buf, ACT_ROWS, ID),
+            ActivationArg::new(b.rms_lm, ACT_ROWS, HD),
+            LogitsArg::new(b.logits, ACT_ROWS, VS),
+            // Decode KV metadata (not used by prefill)
+            IntVecArg::new(b.pos_ids, ACT_ROWS),
+            IntVecArg::new(b.kv_indptr, ACT_ROWS + 1),
+            IntVecArg::new(b.kv_indices, NUM_PAGES),
+            IntVecArg::new(b.kv_last_page, ACT_ROWS),
+            IntVecArg::new(b.kv_append, ACT_ROWS),
+            // Prefill KV metadata
+            IntVecArg::new(prefill_qo_indptr, 2),
+            IntVecArg::new(prefill_kv_indptr, 2),
+            IntVecArg::new(prefill_kv_indices, num_pages_used),
+            IntVecArg::new(prefill_kv_last_page_len, 1),
+            // Scalars
+            attn_scale,
+            1e-5_f32,
+            NUM_PAGES as i32,
+            BS as i32,
+            seq_len as i32, // num_prefill_tokens
+            NL as i32,
+            0_u64,
+        )
+    };
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "fused_prefill_layer_launch returned error {rc}");
+
+    // Read back hidden_states
+    let gpu_out = gpu_download_bf16(b.hidden, ACT_ROWS * HD);
+
+    for tok in 0..seq_len {
+        let gpu_row = &gpu_out[tok * HD..(tok + 1) * HD];
+        let cpu_row = &expected[tok * HD..(tok + 1) * HD];
+
+        if tok == 0 || tok == seq_len / 2 || tok == seq_len - 1 {
+            eprintln!("PrefillLayer tok={tok} GPU[0..4]: {:?}", &gpu_row[..4]);
+            eprintln!("PrefillLayer tok={tok} CPU[0..4]: {:?}", &cpu_row[..4]);
+        }
+
+        // Higher tolerance: 8 chained ops + attention softmax
+        assert_close(
+            gpu_row,
+            cpu_row,
+            3.0,
+            0.3,
+            &format!("prefill_layer_golden tok={tok}"),
         );
     }
 }

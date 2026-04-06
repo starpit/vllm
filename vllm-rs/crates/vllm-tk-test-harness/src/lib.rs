@@ -49,6 +49,71 @@ impl TkTensorArg {
             c: 1,
         }
     }
+
+    // ── Typed constructors matching llama_sm89 GL types ──
+    // These enforce the correct (b, d, r, c) mapping for each GL type,
+    // preventing the shape mismatches that cause silent OOB on GPU.
+
+    /// `weights_t = gl<bf16, 1, -1, -1, hidden_dim>`
+    /// Memory layout: `[1, num_layers, output_dim, input_dim]`
+    pub fn weight(ptr: u64, num_layers: usize, output_dim: usize, input_dim: usize) -> Self {
+        Self { ptr, b: 1, d: num_layers as i32, r: output_dim as i32, c: input_dim as i32 }
+    }
+
+    /// `norm_weights_t = gl<bf16, 1, 1, -1, hidden_dim>`
+    /// Memory layout: `[1, 1, num_layers, hidden_dim]`
+    pub fn norm_weight(ptr: u64, num_layers: usize, hidden_dim: usize) -> Self {
+        Self { ptr, b: 1, d: 1, r: num_layers as i32, c: hidden_dim as i32 }
+    }
+
+    /// `activations_t = gl<bf16, 1, 1, -1, dim>`
+    /// Memory layout: `[1, 1, batch, dim]`
+    pub fn activation(ptr: u64, batch: usize, dim: usize) -> Self {
+        Self { ptr, b: 1, d: 1, r: batch as i32, c: dim as i32 }
+    }
+
+    /// `logits_t = gl<bf16, 1, 1, -1, -1>`
+    /// Memory layout: `[1, 1, batch, vocab_size]`
+    pub fn logits(ptr: u64, batch: usize, vocab_size: usize) -> Self {
+        Self { ptr, b: 1, d: 1, r: batch as i32, c: vocab_size as i32 }
+    }
+
+    /// `kv_cache_t = gl<bf16, -1, -1, num_kv_heads, head_dim>`
+    /// Memory layout: `[total_pages, page_size, num_kv_heads, head_dim]`
+    pub fn kv_cache(
+        ptr: u64, total_pages: usize, page_size: usize,
+        num_kv_heads: usize, head_dim: usize,
+    ) -> Self {
+        Self {
+            ptr,
+            b: total_pages as i32, d: page_size as i32,
+            r: num_kv_heads as i32, c: head_dim as i32,
+        }
+    }
+
+    /// `rope_table_t = gl<float, 1, 1, -1, head_dim>`
+    /// Memory layout: `[1, 1, max_positions, head_dim]`
+    pub fn rope(ptr: u64, max_positions: usize, head_dim: usize) -> Self {
+        Self { ptr, b: 1, d: 1, r: max_positions as i32, c: head_dim as i32 }
+    }
+
+    /// `int32_vector_t = gl<int, 1, 1, 1, -1>`
+    /// Memory layout: `[1, 1, 1, len]`
+    pub fn int_vec(ptr: u64, len: usize) -> Self {
+        Self { ptr, b: 1, d: 1, r: 1, c: len as i32 }
+    }
+
+    /// `barriers = gl<uint, -1, -1, -1, -1>`
+    pub fn barrier(
+        ptr: u64, num_layers: usize, num_ops: usize,
+        batch_blocks: usize, cols: usize,
+    ) -> Self {
+        Self {
+            ptr,
+            b: num_layers as i32, d: num_ops as i32,
+            r: batch_blocks as i32, c: cols as i32,
+        }
+    }
 }
 
 /// Op names that have compiled test kernels.

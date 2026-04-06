@@ -7947,9 +7947,8 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
     .unwrap();
     writeln!(out, "    pfl_a_st *a_stages[2] = {{&a_s0, &a_s1}};").unwrap();
     writeln!(out, "    pfl_b_st *b_stages[2] = {{&b_s0, &b_s1}};").unwrap();
-    // Only warp 0 does GEMMs (avoids shmem races between warps).
-    // Other warps idle during GEMM phases.
-    writeln!(out, "    if (wid == 0) {{").unwrap();
+    // All 8 warps cooperate on loads (8x faster cp.async throughput),
+    // then all warps do the same MMA (redundant compute, but memory-bound).
     writeln!(
         out,
         "    for (int col = 0; col < {qkv_col_tiles}; col++) {{"
@@ -7967,12 +7966,12 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
     writeln!(out, "            pfl_b_st &b_smem = *b_stages[stage];").unwrap();
     writeln!(
         out,
-        "            warp::load_async(a_smem, g.rms_rope_intermediates, {{bid, iter}});"
+        "            group<PFL_NUM_WARPS>::load_async(a_smem, g.rms_rope_intermediates, {{bid, iter}});"
     )
     .unwrap();
     writeln!(
         out,
-        "            warp::load_async(b_smem, g.qkv_weights, {{layer, col, iter}});"
+        "            group<PFL_NUM_WARPS>::load_async(b_smem, g.qkv_weights, {{layer, col, iter}});"
     )
     .unwrap();
     writeln!(
@@ -7980,7 +7979,7 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
         "            asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");"
     )
     .unwrap();
-    writeln!(out, "            warp::sync();").unwrap();
+    writeln!(out, "            group<PFL_NUM_WARPS>::sync(1);").unwrap();
     writeln!(out, "            rt_bf<16, PFL_K_DIM> a_reg;").unwrap();
     writeln!(out, "            warp::load(a_reg, a_smem);").unwrap();
     writeln!(
@@ -8000,8 +7999,9 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
     writeln!(out, "                for (int k = 1; k < a_reg.width; k++)").unwrap();
     writeln!(out, "                    warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);").unwrap();
     writeln!(out, "            }}").unwrap();
-    writeln!(out, "            warp::sync();").unwrap();
+    writeln!(out, "            group<PFL_NUM_WARPS>::sync(1);").unwrap();
     writeln!(out, "        }}").unwrap();
+    writeln!(out, "        if (wid == 0) {{").unwrap();
     writeln!(out, "        {{   rt_bf<16, PFL_OUT_BLOCK> out_bf;").unwrap();
     writeln!(out, "            warp::copy(out_bf, acc);").unwrap();
     writeln!(
@@ -8009,8 +8009,8 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
         "            warp::store(g.silu_out, out_bf, {{bid, col}}); }}"
     )
     .unwrap();
+    writeln!(out, "        }}").unwrap(); // close if(wid==0)
     writeln!(out, "    }}").unwrap(); // close col loop
-    writeln!(out, "    }}").unwrap(); // close if(wid==0)
     writeln!(out, "    }}").unwrap(); // close shmem scope
     writeln!(out, "    __syncthreads();").unwrap();
     writeln!(out, "    __threadfence(); __syncthreads();").unwrap();
@@ -8861,9 +8861,9 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
         a_size: usize,
         stage_size: usize,
     ) {
-        // Only warp 0 does GEMM (avoids shmem races between warps).
-        // Other warps idle during GEMM phases.
-        writeln!(out, "    if (wid == 0) {{").unwrap();
+        // All 8 warps cooperate on loads (8x faster cp.async throughput),
+        // then all warps do the same MMA (redundant compute, but memory-bound).
+        // Only warp 0 executes the epilogue (store/accumulate).
         writeln!(out, "    {{").unwrap();
         writeln!(
             out,
@@ -8904,12 +8904,12 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
         writeln!(out, "            pfl_b_st &b_smem = *b_stages[stage];").unwrap();
         writeln!(
             out,
-            "            warp::load_async(a_smem, {input_global}, {{bid, iter}});"
+            "            group<PFL_NUM_WARPS>::load_async(a_smem, {input_global}, {{bid, iter}});"
         )
         .unwrap();
         writeln!(
             out,
-            "            warp::load_async(b_smem, {weight_global}, {{layer, col, iter}});"
+            "            group<PFL_NUM_WARPS>::load_async(b_smem, {weight_global}, {{layer, col, iter}});"
         )
         .unwrap();
         writeln!(
@@ -8917,7 +8917,7 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
             "            asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");"
         )
         .unwrap();
-        writeln!(out, "            warp::sync();").unwrap();
+        writeln!(out, "            group<PFL_NUM_WARPS>::sync(1);").unwrap();
         writeln!(out, "            rt_bf<16, PFL_K_DIM> a_reg;").unwrap();
         writeln!(out, "            warp::load(a_reg, a_smem);").unwrap();
         writeln!(
@@ -8937,10 +8937,13 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
         writeln!(out, "                for (int k = 1; k < a_reg.width; k++)").unwrap();
         writeln!(out, "                    warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);").unwrap();
         writeln!(out, "            }}").unwrap();
-        writeln!(out, "            warp::sync();").unwrap();
+        writeln!(out, "            group<PFL_NUM_WARPS>::sync(1);").unwrap();
         writeln!(out, "        }}").unwrap();
+        // Only warp 0 executes the epilogue (store) — all warps computed
+        // the same result, so only one needs to write it out.
+        writeln!(out, "        if (wid == 0) {{").unwrap();
         writeln!(out, "{epilogue}").unwrap();
-        writeln!(out, "    }}").unwrap();
+        writeln!(out, "        }}").unwrap();
         writeln!(out, "    }}").unwrap();
         writeln!(out, "    }}").unwrap();
         writeln!(out, "    __syncthreads();").unwrap();

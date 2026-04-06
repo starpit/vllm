@@ -498,3 +498,30 @@ fn test_lm_head_norm_golden() {
 
     assert_close(gpu_row0, &expected, 5e-2, 5e-2, "lm_head_norm_golden");
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Inline kernel tests (static tile pipeline, no KVM protocol)
+// ════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore] // Requires GPU
+fn test_inline_rmsnorm_golden() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+    let gb = GoldenBuffers::for_rmsnorm(|b, ptr| b.hidden = ptr, |b, ptr| b.attn_norm_w = ptr);
+
+    let rc = call_launch!(ffi::inline_rmsnorm_launch, gb.inner);
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "inline_rmsnorm_launch returned error {rc}");
+
+    // Read back output (rms_rope buffer, first row)
+    let gpu_out = gpu_download_bf16(gb.inner.rms_rope, ACT_ROWS * HD);
+    let gpu_row0 = &gpu_out[..HD];
+
+    // CPU golden
+    let mut expected = vec![0.0_f32; HD];
+    cpu_golden::rmsnorm(&gb.input_f32, &gb.weight_f32, &mut expected, 1e-5);
+
+    assert_close(gpu_row0, &expected, 5e-2, 5e-2, "inline_rmsnorm_golden");
+}

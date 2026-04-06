@@ -1715,6 +1715,212 @@ pub fn generate_single_op_kernel(dag: &ModelDag, op_name: &str) -> Result<String
     Ok(out)
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Inline tile pipeline kernels (no KVM protocol)
+// ════════════════════════════════════════════════════════════════════
+//
+// These kernels use TK tile primitives directly with group::sync
+// for synchronization. No semaphores, no pages, no warp roles.
+// All warps cooperate on load, compute, and store.
+
+/// Generate an inline RMSNorm test kernel.
+///
+/// This is the first step of the static tile pipeline: a standalone kernel
+/// that computes RMSNorm using 8 cooperative warps with only group::sync
+/// for synchronization. No KVM protocol, no semaphores, no pages.
+///
+/// The kernel reads hidden_states[batch_idx] and norm_weights[layer],
+/// writes the normalized result to the output activation tensor.
+pub fn generate_inline_rmsnorm_kernel(dag: &ModelDag) -> String {
+    let mut out = String::new();
+
+    let hd = dag.params.get("HD").copied().unwrap_or(2048);
+    let nl = dag.params.get("NL").copied().unwrap_or(16);
+    let nah = dag.params.get("NAH").copied().unwrap_or(32);
+    let nkh = dag.params.get("NKH").copied().unwrap_or(8);
+    let hdm = dag.params.get("HDM").copied().unwrap_or(64);
+    let id = dag.params.get("ID").copied().unwrap_or(8192);
+
+    // We need the dimension macros defined before including the header.
+    writeln!(out, "// GENERATED: Inline RMSNorm kernel (no KVM protocol)").unwrap();
+    writeln!(out, "// Uses TK tile primitives + group::sync only.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#define SM89_NUM_LAYERS             {nl}").unwrap();
+    writeln!(out, "#define SM89_HIDDEN_DIM             {hd}").unwrap();
+    writeln!(out, "#define SM89_INTERMEDIATE_DIM       {id}").unwrap();
+    writeln!(out, "#define SM89_HEAD_DIM               {hdm}").unwrap();
+    writeln!(out, "#define SM89_NUM_ATTENTION_HEADS    {nah}").unwrap();
+    writeln!(out, "#define SM89_NUM_KV_HEADS           {nkh}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#include \"llama_sm89.cuh\"").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "using namespace kittens;").unwrap();
+    writeln!(out, "using namespace kittens::prototype::vm;").unwrap();
+    writeln!(out, "using globals = llama_sm89_globals;").unwrap();
+    writeln!(out).unwrap();
+
+    // Number of consumer warps — same as KVM for tile compatibility
+    let num_warps = 8;
+    let num_threads = num_warps * 32;
+    let rdpw = hd / num_warps; // reduction_dim_per_warp
+
+    writeln!(out, "// ── Inline RMSNorm kernel ──").unwrap();
+    writeln!(out, "// {num_warps} warps, {num_threads} threads, no KVM protocol.").unwrap();
+    writeln!(out, "// Each warp handles {rdpw} elements of hidden_dim={hd}.").unwrap();
+    writeln!(out, "//").unwrap();
+    writeln!(out, "// Synchronization: group<{num_warps}>::sync(BAR) only.").unwrap();
+    writeln!(out, "// No mbarrier semaphores. No pages. No warp roles.").unwrap();
+    writeln!(out).unwrap();
+
+    // cp.async helper (same as in rms_norm_sm89.cu)
+    writeln!(out, "__device__ static inline void inline_cp_async_wait_all() {{").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.wait_all;\\n\"     ::: \"memory\");").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Shmem layout:
+    // [0 .. HD*2): activations (sv_bf<HD>)
+    // [HD*2 .. HD*4): weights (sv_bf<HD>)
+    // [HD*4 .. HD*4 + num_warps*4): scratch for partial sums
+    let act_offset = 0;
+    let wgt_offset = hd * 2;
+    let scratch_offset = hd * 4;
+    let total_shmem = scratch_offset + num_warps * 4;
+
+    writeln!(out, "constexpr int INLINE_SHMEM_BYTES = {total_shmem};").unwrap();
+    writeln!(out, "constexpr int INLINE_NUM_WARPS = {num_warps};").unwrap();
+    writeln!(out, "constexpr int INLINE_RDPW = {rdpw};  // reduction_dim_per_warp").unwrap();
+    writeln!(out).unwrap();
+
+    // The kernel
+    writeln!(out, "__global__ void __launch_bounds__({num_threads}, 1)").unwrap();
+    writeln!(out, "inline_rmsnorm(const globals g, int batch_size, int num_layers) {{").unwrap();
+    writeln!(out, "    const int wid = kittens::warpid();").unwrap();
+    writeln!(out, "    const int lid = kittens::laneid();").unwrap();
+    writeln!(out).unwrap();
+
+    // Shmem declarations
+    writeln!(out, "    extern __shared__ char __shm[];").unwrap();
+    writeln!(out, "    bf16 *act_smem = reinterpret_cast<bf16*>(__shm + {act_offset});").unwrap();
+    writeln!(out, "    bf16 *wgt_smem = reinterpret_cast<bf16*>(__shm + {wgt_offset});").unwrap();
+    writeln!(out, "    float *scratch = reinterpret_cast<float*>(__shm + {scratch_offset});").unwrap();
+    writeln!(out).unwrap();
+
+    // Tile types for loads/stores — use sv_bf for vector operations
+    writeln!(out, "    // Reinterpret shmem as TK shared vectors for warp-level ops").unwrap();
+    writeln!(out, "    sv_bf<INLINE_RDPW> *act_tiles = reinterpret_cast<sv_bf<INLINE_RDPW>*>(act_smem);").unwrap();
+    writeln!(out, "    sv_bf<INLINE_RDPW> *wgt_tiles = reinterpret_cast<sv_bf<INLINE_RDPW>*>(wgt_smem);").unwrap();
+    writeln!(out).unwrap();
+
+    // Single token per SM (for now — each SM handles one batch_idx)
+    writeln!(out, "    const int sm = blockIdx.x;").unwrap();
+    writeln!(out, "    const int sm_count = gridDim.x;").unwrap();
+    writeln!(out, "    const int batch_idx = sm;  // 1 token per SM").unwrap();
+    writeln!(out, "    if (batch_idx >= batch_size) return;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    const int layer = 0;  // Single layer for testing").unwrap();
+    writeln!(out).unwrap();
+
+    // Load weights: all warps cooperate via group::load_async
+    writeln!(out, "    // ── Load weights (all warps cooperate) ──").unwrap();
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "        sv_bf<globals::hidden_dim> &wgt_vec =").unwrap();
+    writeln!(out, "            *reinterpret_cast<sv_bf<globals::hidden_dim>*>(wgt_smem);").unwrap();
+    writeln!(out, "        warp::load_async(wgt_vec, g.attn_norm_weights, {{layer, 0}});").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Load activations
+    writeln!(out, "    // ── Load activations ──").unwrap();
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "        sv_bf<globals::hidden_dim> &act_vec =").unwrap();
+    writeln!(out, "            *reinterpret_cast<sv_bf<globals::hidden_dim>*>(act_smem);").unwrap();
+    writeln!(out, "        warp::load_async(act_vec, g.hidden_states, {{batch_idx, 0}});").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    inline_cp_async_wait_all();").unwrap();
+    writeln!(out, "    group<INLINE_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Compute: each warp handles its slice of hidden_dim
+    writeln!(out, "    // ── RMSNorm compute (each warp handles {rdpw} elements) ──").unwrap();
+    writeln!(out, "    rv_fl<INLINE_RDPW> act_vec, copy_vec, scale_vec;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Load per-warp slice from shmem into registers").unwrap();
+    writeln!(out, "    warp::load(act_vec, act_tiles[wid]);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out).unwrap();
+
+    // Sum of squares
+    writeln!(out, "    // Sum of squares").unwrap();
+    writeln!(out, "    warp::copy(copy_vec, act_vec);").unwrap();
+    writeln!(out, "    warp::mul(copy_vec, copy_vec, copy_vec);").unwrap();
+    writeln!(out, "    float partial_sum = warp::sum(copy_vec);").unwrap();
+    writeln!(out, "    if (lid == 0) scratch[wid] = partial_sum;").unwrap();
+    writeln!(out, "    group<INLINE_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Full reduction
+    writeln!(out, "    float full_sum = 0.f;").unwrap();
+    writeln!(out, "    for (int i = 0; i < INLINE_NUM_WARPS; i++) full_sum += scratch[i];").unwrap();
+    writeln!(out, "    float rms = rsqrtf(full_sum / (float)globals::hidden_dim + g.rms_norm_eps);").unwrap();
+    writeln!(out).unwrap();
+
+    // Scale by rms
+    writeln!(out, "    // Scale: x = x * rms").unwrap();
+    writeln!(out, "    warp::copy(copy_vec, act_vec);").unwrap();
+    writeln!(out, "    warp::mul(copy_vec, copy_vec, rms);").unwrap();
+    writeln!(out, "    warp::copy(act_vec, copy_vec);").unwrap();
+    writeln!(out).unwrap();
+
+    // Multiply by learned scale
+    writeln!(out, "    // Multiply by learned weight").unwrap();
+    writeln!(out, "    warp::load(scale_vec, wgt_tiles[wid]);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out, "    warp::mul(act_vec, act_vec, scale_vec);").unwrap();
+    writeln!(out).unwrap();
+
+    // Store result to shmem (for potential inter-op passing) then to gmem
+    writeln!(out, "    // Store result to shmem then gmem").unwrap();
+    writeln!(out, "    warp::store(act_tiles[wid], act_vec);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out, "    group<INLINE_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // One warp writes the full result to gmem
+    writeln!(out, "    // Write to gmem (warp 0 writes the full vector)").unwrap();
+    writeln!(out, "    if (wid == 0) {{").unwrap();
+    writeln!(out, "        sv_bf<globals::hidden_dim> &result =").unwrap();
+    writeln!(out, "            *reinterpret_cast<sv_bf<globals::hidden_dim>*>(act_smem);").unwrap();
+    writeln!(out, "        warp::store(g.rms_rope_intermediates, result, {{batch_idx, 0}});").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // ── C launch wrapper ──
+    emit_tensor_arg_and_globals_helper(&mut out);
+    writeln!(out, "extern \"C\" int inline_rmsnorm_launch(").unwrap();
+    writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "  try {{").unwrap();
+    emit_globals_construction(&mut out, "    ");
+    writeln!(out).unwrap();
+    writeln!(out, "    int shmem = {total_shmem};").unwrap();
+    writeln!(out, "    auto err = cudaFuncSetAttribute(inline_rmsnorm,").unwrap();
+    writeln!(out, "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);").unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
+    // Launch with batch_size blocks (one token per SM)
+    writeln!(out, "    inline_rmsnorm<<<batch_size, {num_threads}, shmem, (cudaStream_t)stream>>>(").unwrap();
+    writeln!(out, "        g, batch_size, num_layers);").unwrap();
+    writeln!(out, "    err = cudaGetLastError();").unwrap();
+    writeln!(out, "    return (int)err;").unwrap();
+    writeln!(out, "  }} catch (...) {{ return -2; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    out
+}
+
 /// List all op names that can be used with `generate_single_op_kernel`.
 pub fn available_op_names() -> Vec<&'static str> {
     vec![
@@ -1879,5 +2085,56 @@ mod tests {
         let prefill_cuda = generate_single_op_kernel(&dag, "attention_prefill").unwrap();
         assert!(prefill_cuda.contains("run_op_ext<"));
         assert!(prefill_cuda.contains("OPCODE_GQA_AttentionPrefill"));
+    }
+
+    #[test]
+    fn generates_inline_rmsnorm() {
+        let input: proc_macro2::TokenStream = quote::quote! {
+            kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                    let qkv = gemm(normed, qkv_weights[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                    let gate = silu(gemm(normed2, gate_weights[layer]));
+                    let up = gemm(normed2, up_weights[layer]);
+                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                }
+                let normed = rmsnorm(hidden_states, lm_head_norm);
+                logits = gemm(normed, lm_head);
+            }
+        };
+        let def: crate::parse::MegakernelDef = syn::parse2(input).unwrap();
+        let dag = crate::parse::build_dag(&def).unwrap();
+
+        let cuda = generate_inline_rmsnorm_kernel(&dag);
+
+        // No KVM protocol
+        assert!(!cuda.contains("run_op"), "should not use run_op");
+        assert!(!cuda.contains("state<config>"), "should not use KVM state");
+        assert!(!cuda.contains("init_semaphore"), "should not use semaphores");
+        assert!(!cuda.contains("page_finished"), "should not use page_finished");
+        assert!(!cuda.contains("instruction_arrived"), "should not use instruction_arrived");
+
+        // Has inline kernel + launch wrapper
+        assert!(cuda.contains("inline_rmsnorm("));
+        assert!(cuda.contains("inline_rmsnorm_launch("));
+
+        // Uses TK tile primitives
+        assert!(cuda.contains("group<"));
+        assert!(cuda.contains("warp::load"));
+        assert!(cuda.contains("warp::store"));
+        assert!(cuda.contains("warp::mul"));
+        assert!(cuda.contains("warp::sum"));
+        assert!(cuda.contains("rsqrtf"));
+
+        // Uses 8 warps (256 threads), not 12
+        assert!(cuda.contains("__launch_bounds__(256, 1)"));
+
+        // Print for inspection
+        eprintln!("{cuda}");
     }
 }

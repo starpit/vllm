@@ -141,4 +141,7 @@ pub mod ffi {
     declare_test_launch!(test_up_matmul_launch);
     declare_test_launch!(test_down_proj_residual_launch);
     declare_test_launch!(test_lm_head_launch);
+
+    // Inline kernels (no KVM protocol — static tile pipeline)
+    declare_test_launch!(inline_rmsnorm_launch);
 }

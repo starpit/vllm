@@ -1961,26 +1961,10 @@ fn test_fused_prefill_layer_golden() {
     let dw: Vec<f32> = down_w.iter().copied().cycle().take(NL * HD * ID).collect();
     b.down_w = gpu_upload_bf16(&dw);
 
-    // Paged KV cache — pre-load K/V from CPU QKV GEMM output
-    // (kernel doesn't have RoPE+append phase yet, so we must pre-fill)
+    // Paged KV cache — starts empty, kernel populates via RoPE+append phase
     let total_kv_cache_size = NL * NUM_PAGES * KV_PAGE_SIZE * NKH * HDM;
-    let mut k_paged = vec![0.0_f32; total_kv_cache_size];
-    let mut v_paged = vec![0.0_f32; total_kv_cache_size];
-    let page_index = 0_usize;
-    let page_batch = NUM_PAGES * 0 + page_index; // layer 0
-    for tok in 0..seq_len {
-        for kv_h in 0..NKH {
-            for d in 0..HDM {
-                let flat_idx = tok * NKH * HDM + kv_h * HDM + d;
-                let paged_idx =
-                    page_batch * KV_PAGE_SIZE * NKH * HDM + tok * NKH * HDM + kv_h * HDM + d;
-                k_paged[paged_idx] = k_cache_flat[flat_idx];
-                v_paged[paged_idx] = v_cache_flat[flat_idx];
-            }
-        }
-    }
-    b.k_cache = gpu_upload_bf16(&k_paged);
-    b.v_cache = gpu_upload_bf16(&v_paged);
+    b.k_cache = gpu_alloc_zeros(total_kv_cache_size * BF16);
+    b.v_cache = gpu_alloc_zeros(total_kv_cache_size * BF16);
 
     // RoPE: identity (cos=1, sin=0) so we can compare without RoPE math
     let mut rope_cos_data = vec![0.0_f32; 4096 * HDM];

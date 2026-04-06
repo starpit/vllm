@@ -8006,13 +8006,214 @@ pub fn generate_fused_prefill_layer_kernel(dag: &ModelDag) -> String {
     writeln!(out, "            warp::copy(out_bf, acc);").unwrap();
     writeln!(
         out,
-        "            warp::store(g.q_post_rope, out_bf, {{bid, col}}); }}"
+        "            warp::store(g.silu_out, out_bf, {{bid, col}}); }}"
     )
     .unwrap();
     writeln!(out, "    }}").unwrap(); // close col loop
     writeln!(out, "    }}").unwrap(); // close if(wid==0)
     writeln!(out, "    }}").unwrap(); // close shmem scope
     writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out, "    __threadfence(); __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+
+    // ═══════ Phase 2b: RoPE + KV cache append ═══════
+    // QKV output is in silu_out: [seq_len, QKV_DIM] where QKV_DIM = (NAH+2*NKH)*HDM
+    // Q = [0, NAH*HDM), K = [NAH*HDM, NAH*HDM+NKH*HDM), V = [NAH*HDM+NKH*HDM, QKV_DIM)
+    // Apply RoPE to Q and K, write K/V to paged cache, copy Q to q_post_rope.
+    let q_end = nah * hdm; // = HD
+    let k_start = q_end;
+    let k_end = q_end + nkh * hdm;
+    let v_start = k_end;
+
+    writeln!(out, "    // ════ Phase 2b: RoPE + KV cache append ════").unwrap();
+    writeln!(out, "    for (int qr = 0; qr < PFL_Q_ROWS && (abs_q_row + qr) <= (q_start + rel_q_row_last); qr++) {{").unwrap();
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "    const int token_pos = abs_q_row + qr;").unwrap();
+    writeln!(
+        out,
+        "    const int page_idx = g.prefill_kv_indices[{{token_pos / PFL_KV_PAGE_SIZE}}];"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    const int slot_in_page = token_pos % PFL_KV_PAGE_SIZE;"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+
+    // Each warp handles a subset of the head_dim elements
+    // Q: apply RoPE and copy to q_post_rope
+    // K: apply RoPE and write to k_cache
+    // V: write to v_cache (no RoPE)
+    // Use scalar loads since we're doing element-wise ops
+
+    writeln!(out, "    // Each warp handles a portion of Q/K/V elements").unwrap();
+    writeln!(
+        out,
+        "    const int elems_per_warp_q = ({q_end} + PFL_NUM_WARPS - 1) / PFL_NUM_WARPS;"
+    )
+    .unwrap();
+    writeln!(out, "    const int q_start_elem = wid * elems_per_warp_q;").unwrap();
+    writeln!(
+        out,
+        "    const int q_end_elem = min(q_start_elem + elems_per_warp_q, {q_end});"
+    )
+    .unwrap();
+
+    // RoPE: for element i within a head, cos/sin are at pos_ids[token]*HDM + (i % HDM)
+    // The rotation pairs (i, i+HDM/2) for each head
+    writeln!(out, "    // Q: RoPE + copy to q_post_rope").unwrap();
+    writeln!(
+        out,
+        "    for (int tid = q_start_elem + lid; tid < q_end_elem; tid += 32) {{"
+    )
+    .unwrap();
+    writeln!(out, "        const int head = tid / {hdm};").unwrap();
+    writeln!(out, "        const int d = tid % {hdm};").unwrap();
+    writeln!(out, "        const int half = {hdm} / 2;").unwrap();
+    writeln!(
+        out,
+        "        float val = __bfloat162float(g.silu_out[coord<>{{token_pos, tid}}]);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        float cos_val = g.rope_cos[coord<>{{token_pos, d}}];"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        float sin_val = g.rope_sin[coord<>{{token_pos, d}}];"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        // RoPE rotation: if d < half, pair with d+half; else pair with d-half"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        int pair_d = (d < half) ? (d + half) : (d - half);"
+    )
+    .unwrap();
+    writeln!(out, "        int pair_idx = head * {hdm} + pair_d;").unwrap();
+    writeln!(
+        out,
+        "        float pair_val = __bfloat162float(g.silu_out[coord<>{{token_pos, pair_idx}}]);"
+    )
+    .unwrap();
+    writeln!(out, "        float rotated;").unwrap();
+    writeln!(
+        out,
+        "        if (d < half) rotated = val * cos_val - pair_val * sin_val;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        else          rotated = val * cos_val + pair_val * sin_val;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        g.q_post_rope[coord<>{{token_pos, tid}}] = __float2bfloat16(rotated);"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+
+    // K: RoPE + write to paged k_cache
+    let kv_elems = nkh * hdm;
+    writeln!(out, "    // K: RoPE + write to k_cache").unwrap();
+    writeln!(
+        out,
+        "    const int elems_per_warp_kv = ({kv_elems} + PFL_NUM_WARPS - 1) / PFL_NUM_WARPS;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    const int kv_start_elem = wid * elems_per_warp_kv;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    const int kv_end_elem = min(kv_start_elem + elems_per_warp_kv, {kv_elems});"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    for (int tid = kv_start_elem + lid; tid < kv_end_elem; tid += 32) {{"
+    )
+    .unwrap();
+    writeln!(out, "        const int kv_head = tid / {hdm};").unwrap();
+    writeln!(out, "        const int d = tid % {hdm};").unwrap();
+    writeln!(out, "        const int half = {hdm} / 2;").unwrap();
+    writeln!(
+        out,
+        "        float val = __bfloat162float(g.silu_out[coord<>{{token_pos, {k_start} + tid}}]);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        float cos_val = g.rope_cos[coord<>{{token_pos, d}}];"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        float sin_val = g.rope_sin[coord<>{{token_pos, d}}];"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        int pair_d = (d < half) ? (d + half) : (d - half);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        float pair_val = __bfloat162float(g.silu_out[coord<>{{token_pos, {k_start} + kv_head * {hdm} + pair_d}}]);"
+    )
+    .unwrap();
+    writeln!(out, "        float rotated;").unwrap();
+    writeln!(
+        out,
+        "        if (d < half) rotated = val * cos_val - pair_val * sin_val;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        else          rotated = val * cos_val + pair_val * sin_val;"
+    )
+    .unwrap();
+    // k_cache: gl<bf16, -1, -1, num_kv_heads, head_dim> = [total_pages, page_size, NKH, HDM]
+    // layer 0: pages [0, NUM_PAGES), so page_batch = page_idx
+    writeln!(
+        out,
+        "        g.k_cache[coord<>{{page_idx, slot_in_page, kv_head, d}}] = __float2bfloat16(rotated);"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+
+    // V: no RoPE, just write to paged v_cache
+    writeln!(out, "    // V: write to v_cache (no RoPE)").unwrap();
+    writeln!(
+        out,
+        "    for (int tid = kv_start_elem + lid; tid < kv_end_elem; tid += 32) {{"
+    )
+    .unwrap();
+    writeln!(out, "        const int kv_head = tid / {hdm};").unwrap();
+    writeln!(out, "        const int d = tid % {hdm};").unwrap();
+    writeln!(
+        out,
+        "        bf16 val = g.silu_out[coord<>{{token_pos, {v_start} + tid}}];"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        g.v_cache[coord<>{{page_idx, slot_in_page, kv_head, d}}] = val;"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+
+    writeln!(out, "    }}").unwrap(); // close scope
+    writeln!(out, "    }}").unwrap(); // close qr loop
     writeln!(out, "    __threadfence(); __syncthreads();").unwrap();
     writeln!(out).unwrap();
 

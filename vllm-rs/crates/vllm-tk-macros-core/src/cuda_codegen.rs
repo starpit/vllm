@@ -2467,6 +2467,7 @@ pub fn generate_fused_mlp_kernel(dag: &ModelDag) -> String {
     writeln!(out).unwrap();
 
     // GEMM loop helper
+    #[allow(clippy::too_many_arguments)]
     fn emit_gemm_loop(
         out: &mut String,
         input_global: &str,
@@ -2660,6 +2661,381 @@ pub fn generate_fused_mlp_kernel(dag: &ModelDag) -> String {
     writeln!(out, "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);").unwrap();
     writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
     writeln!(out, "    fused_mlp<<<1, {num_threads}, shmem, (cudaStream_t)stream>>>(").unwrap();
+    writeln!(out, "        g, batch_size, num_layers);").unwrap();
+    writeln!(out, "    err = cudaGetLastError();").unwrap();
+    writeln!(out, "    return (int)err;").unwrap();
+    writeln!(out, "  }} catch (...) {{ return -2; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    out
+}
+
+/// Generate a fused single-layer kernel (no KVM protocol).
+///
+/// Chains all non-attention ops for one transformer layer:
+///   attn_norm → QKV GEMM → [skip attention] → o_proj GEMM+residual →
+///   mlp_norm → gate GEMM+SiLU → up GEMM×gate → down GEMM+residual
+///
+/// Attention is skipped — the test harness writes fake attn_out data.
+/// Single block, all 8 warps cooperate. Layer 0 only (for testing).
+pub fn generate_fused_layer_kernel(dag: &ModelDag) -> String {
+    let mut out = String::new();
+
+    let hd = dag.params.get("HD").copied().unwrap_or(2048);
+    let nl = dag.params.get("NL").copied().unwrap_or(16);
+    let nah = dag.params.get("NAH").copied().unwrap_or(32);
+    let nkh = dag.params.get("NKH").copied().unwrap_or(8);
+    let hdm = dag.params.get("HDM").copied().unwrap_or(64);
+    let id = dag.params.get("ID").copied().unwrap_or(8192);
+
+    let k_dim = 64;
+    let batch_block = 128;
+    let out_block = 64;
+    let num_warps = 8;
+    let num_threads = num_warps * 32;
+    let rdpw = hd / num_warps;
+
+    let hd_k_iters = hd / k_dim;
+    let id_k_iters = id / k_dim;
+    let id_col_tiles = id / out_block;
+    let hd_col_tiles = hd / out_block;
+
+    let a_size = batch_block * k_dim * 2;
+    let b_size = out_block * k_dim * 2;
+    let stage_size = a_size + b_size;
+    let gemm_shmem = 2 * stage_size;
+    let rmsnorm_shmem = hd * 4 + num_warps * 4;
+    let total_shmem = std::cmp::max(gemm_shmem, rmsnorm_shmem);
+
+    // Preamble
+    writeln!(out, "// GENERATED: Fused single-layer kernel (no KVM protocol)").unwrap();
+    writeln!(out, "// attn_norm → QKV GEMM → [skip attn] → o_proj+res → MLP block").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#define SM89_NUM_LAYERS             {nl}").unwrap();
+    writeln!(out, "#define SM89_HIDDEN_DIM             {hd}").unwrap();
+    writeln!(out, "#define SM89_INTERMEDIATE_DIM       {id}").unwrap();
+    writeln!(out, "#define SM89_HEAD_DIM               {hdm}").unwrap();
+    writeln!(out, "#define SM89_NUM_ATTENTION_HEADS    {nah}").unwrap();
+    writeln!(out, "#define SM89_NUM_KV_HEADS           {nkh}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#include \"llama_sm89.cuh\"").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "using namespace kittens;").unwrap();
+    writeln!(out, "using namespace kittens::prototype::vm;").unwrap();
+    writeln!(out, "using globals = llama_sm89_globals;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "__device__ static inline void layer_cp_async_wait_all() {{").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");").unwrap();
+    writeln!(out, "    asm volatile(\"cp.async.wait_all;\\n\"     ::: \"memory\");").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "__device__ static inline void layer_load_b_slice(").unwrap();
+    writeln!(out, "    rt_bf<16, {k_dim}> &dst, const st_bf<16, {k_dim}> &src) {{").unwrap();
+    writeln!(out, "    uint32_t saddr = static_cast<uint32_t>(__cvta_generic_to_shared(&src.data[0]));").unwrap();
+    writeln!(out, "    int lane = kittens::laneid();").unwrap();
+    writeln!(out, "    int row = lane % 16;").unwrap();
+    writeln!(out, "    bf16_2 tmp[4];").unwrap();
+    writeln!(out, "    #pragma unroll").unwrap();
+    writeln!(out, "    for (int j = 0; j < {k_dim} / 16; j++) {{").unwrap();
+    writeln!(out, "        int col = j * 16 + (lane / 16) * 8;").unwrap();
+    writeln!(out, "        move<bf16_2>::ldsm4(tmp[0], tmp[1], tmp[2], tmp[3], src.idx(saddr, {{row, col}}));").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[0] = tmp[0];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[1] = tmp[1];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[2] = tmp[2];").unwrap();
+    writeln!(out, "        dst.tiles[0][j].data[3] = tmp[3];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "constexpr int LY_K_DIM = {k_dim};").unwrap();
+    writeln!(out, "constexpr int LY_BATCH_BLOCK = {batch_block};").unwrap();
+    writeln!(out, "constexpr int LY_OUT_BLOCK = {out_block};").unwrap();
+    writeln!(out, "constexpr int LY_NUM_WARPS = {num_warps};").unwrap();
+    writeln!(out, "constexpr int LY_SHMEM = {total_shmem};").unwrap();
+    writeln!(out, "constexpr int LY_RDPW = {rdpw};").unwrap();
+    writeln!(out, "using ly_a_st = st_bf<{batch_block}, {k_dim}>;").unwrap();
+    writeln!(out, "using ly_b_st = st_bf<{out_block}, {k_dim}>;").unwrap();
+    writeln!(out, "using ly_acc_rt = rt_fl<16, {out_block}>;").unwrap();
+    writeln!(out, "using ly_a_slice_st = st_bf<16, {k_dim}>;").unwrap();
+    writeln!(out, "using ly_b_slice_st = st_bf<16, {k_dim}>;").unwrap();
+    writeln!(out, "constexpr int LY_N_TILES = LY_OUT_BLOCK / 16;").unwrap();
+    writeln!(out).unwrap();
+
+    // GEMM loop helper (local to this function)
+    #[allow(clippy::too_many_arguments)]
+    fn emit_layer_gemm_loop(
+        out: &mut String,
+        input_global: &str,
+        weight_global: &str,
+        num_k_iters: &str,
+        num_col_tiles: &str,
+        epilogue: &str,
+        a_size: usize,
+        stage_size: usize,
+    ) {
+        writeln!(out, "    {{").unwrap();
+        writeln!(out, "    ly_a_st &a_s0 = *reinterpret_cast<ly_a_st*>(__shm);").unwrap();
+        writeln!(out, "    ly_b_st &b_s0 = *reinterpret_cast<ly_b_st*>(__shm + {a_size});").unwrap();
+        writeln!(out, "    ly_a_st &a_s1 = *reinterpret_cast<ly_a_st*>(__shm + {stage_size});").unwrap();
+        writeln!(out, "    ly_b_st &b_s1 = *reinterpret_cast<ly_b_st*>(__shm + {stage_size} + {a_size});").unwrap();
+        writeln!(out, "    ly_a_st *a_stages[2] = {{&a_s0, &a_s1}};").unwrap();
+        writeln!(out, "    ly_b_st *b_stages[2] = {{&b_s0, &b_s1}};").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    for (int col = 0; col < {num_col_tiles}; col++) {{").unwrap();
+        writeln!(out, "        ly_acc_rt acc;").unwrap();
+        writeln!(out, "        warp::zero(acc);").unwrap();
+        writeln!(out, "        for (int iter = 0; iter < {num_k_iters}; iter++) {{").unwrap();
+        writeln!(out, "            int stage = iter % 2;").unwrap();
+        writeln!(out, "            ly_a_st &a_smem = *a_stages[stage];").unwrap();
+        writeln!(out, "            ly_b_st &b_smem = *b_stages[stage];").unwrap();
+        writeln!(out, "            group<LY_NUM_WARPS>::load_async(a_smem, {input_global}, {{row, iter}});").unwrap();
+        writeln!(out, "            group<LY_NUM_WARPS>::load_async(b_smem, {weight_global}, {{layer, col, iter}});").unwrap();
+        writeln!(out, "            asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");").unwrap();
+        writeln!(out, "            group<LY_NUM_WARPS>::sync(14);").unwrap();
+        writeln!(out, "            rt_bf<16, LY_K_DIM> a_reg;").unwrap();
+        writeln!(out, "            {{ const ly_a_slice_st &a_warp = reinterpret_cast<const ly_a_slice_st*>(&a_smem)[wid];").unwrap();
+        writeln!(out, "               warp::load(a_reg, a_warp); }}").unwrap();
+        writeln!(out, "            ly_b_slice_st *b_slices = reinterpret_cast<ly_b_slice_st*>(&b_smem);").unwrap();
+        writeln!(out, "            #pragma unroll").unwrap();
+        writeln!(out, "            for (int n = 0; n < LY_N_TILES; n++) {{").unwrap();
+        writeln!(out, "                rt_bf<16, LY_K_DIM> b_n; layer_load_b_slice(b_n, b_slices[n]);").unwrap();
+        writeln!(out, "                warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][0], b_n.tiles[0][0], acc.tiles[0][n]);").unwrap();
+        writeln!(out, "                #pragma unroll").unwrap();
+        writeln!(out, "                for (int k = 1; k < a_reg.width; k++)").unwrap();
+        writeln!(out, "                    warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);").unwrap();
+        writeln!(out, "            }}").unwrap();
+        writeln!(out, "            group<LY_NUM_WARPS>::sync(14);").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "{epilogue}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+    }
+
+    // Helper to emit an RMSNorm block
+    fn emit_layer_rmsnorm(
+        out: &mut String,
+        input_global: &str,
+        weight_global: &str,
+        output_global: &str,
+        hd: usize,
+    ) {
+        writeln!(out, "    {{").unwrap();
+        writeln!(out, "    bf16 *act_smem = reinterpret_cast<bf16*>(__shm);").unwrap();
+        writeln!(out, "    bf16 *wgt_smem = reinterpret_cast<bf16*>(__shm + {});", hd * 2).unwrap();
+        writeln!(out, "    float *scratch = reinterpret_cast<float*>(__shm + {});", hd * 4).unwrap();
+        writeln!(out, "    sv_bf<LY_RDPW> *act_tiles = reinterpret_cast<sv_bf<LY_RDPW>*>(act_smem);").unwrap();
+        writeln!(out, "    sv_bf<LY_RDPW> *wgt_tiles = reinterpret_cast<sv_bf<LY_RDPW>*>(wgt_smem);").unwrap();
+        writeln!(out, "    {{ sv_bf<globals::hidden_dim> &w = *reinterpret_cast<sv_bf<globals::hidden_dim>*>(wgt_smem);").unwrap();
+        writeln!(out, "       warp::load_async(w, {weight_global}, {{layer, 0}}); }}").unwrap();
+        writeln!(out, "    {{ sv_bf<globals::hidden_dim> &a = *reinterpret_cast<sv_bf<globals::hidden_dim>*>(act_smem);").unwrap();
+        writeln!(out, "       warp::load_async(a, {input_global}, {{0, 0}}); }}").unwrap();
+        writeln!(out, "    layer_cp_async_wait_all();").unwrap();
+        writeln!(out, "    group<LY_NUM_WARPS>::sync(0);").unwrap();
+        writeln!(out, "    rv_fl<LY_RDPW> act_vec, copy_vec, scale_vec;").unwrap();
+        writeln!(out, "    warp::load(act_vec, act_tiles[wid]); warp::sync();").unwrap();
+        writeln!(out, "    warp::copy(copy_vec, act_vec); warp::mul(copy_vec, copy_vec, copy_vec);").unwrap();
+        writeln!(out, "    float ps = warp::sum(copy_vec);").unwrap();
+        writeln!(out, "    if (lid == 0) scratch[wid] = ps;").unwrap();
+        writeln!(out, "    group<LY_NUM_WARPS>::sync(0);").unwrap();
+        writeln!(out, "    float fs = 0.f; for (int i = 0; i < LY_NUM_WARPS; i++) fs += scratch[i];").unwrap();
+        writeln!(out, "    float rms = rsqrtf(fs / (float)globals::hidden_dim + g.rms_norm_eps);").unwrap();
+        writeln!(out, "    warp::copy(copy_vec, act_vec); warp::mul(copy_vec, copy_vec, rms);").unwrap();
+        writeln!(out, "    warp::copy(act_vec, copy_vec);").unwrap();
+        writeln!(out, "    warp::load(scale_vec, wgt_tiles[wid]); warp::sync();").unwrap();
+        writeln!(out, "    warp::mul(act_vec, act_vec, scale_vec);").unwrap();
+        writeln!(out, "    warp::store(act_tiles[wid], act_vec); warp::sync();").unwrap();
+        writeln!(out, "    group<LY_NUM_WARPS>::sync(0);").unwrap();
+        writeln!(out, "    if (wid == 0) {{").unwrap();
+        writeln!(out, "        sv_bf<globals::hidden_dim> &r = *reinterpret_cast<sv_bf<globals::hidden_dim>*>(act_smem);").unwrap();
+        writeln!(out, "        warp::store({output_global}, r, {{0, 0}});").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    __threadfence(); group<LY_NUM_WARPS>::sync(0);").unwrap();
+        writeln!(out, "    }}").unwrap();
+    }
+
+    // ── The kernel ──
+    writeln!(out, "__global__ void __launch_bounds__({num_threads}, 1)").unwrap();
+    writeln!(out, "fused_layer(const globals g, int batch_size, int num_layers) {{").unwrap();
+    writeln!(out, "    const int wid = kittens::warpid();").unwrap();
+    writeln!(out, "    const int lid = kittens::laneid();").unwrap();
+    writeln!(out, "    extern __shared__ char __shm[];").unwrap();
+    writeln!(out, "    const int layer = 0;").unwrap();
+    writeln!(out, "    const int row = 0;").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 1: attn_norm (RMSNorm)
+    writeln!(out, "    // ════ Phase 1: attn_norm (RMSNorm) ════").unwrap();
+    emit_layer_rmsnorm(
+        &mut out,
+        "g.hidden_states",
+        "g.attn_norm_weights",
+        "g.rms_rope_intermediates",
+        hd,
+    );
+    writeln!(out).unwrap();
+
+    // Phase 2: QKV GEMM (rms_rope × qkv_weights → q_post)
+    // For the full layer test, we only compute the first HD columns (same as o_proj input width)
+    // The real QKV would be wider (HD * (1 + 2*NKH/NAH)), but for testing o_proj we just need HD-wide output
+    writeln!(out, "    // ════ Phase 2: QKV GEMM (rms_rope × qkv_weights → q_post) ════").unwrap();
+    emit_layer_gemm_loop(
+        &mut out, "g.rms_rope_intermediates", "g.qkv_weights",
+        &hd_k_iters.to_string(), &hd_col_tiles.to_string(),
+        "        {   rt_bf<16, LY_OUT_BLOCK> out_bf;
+            warp::copy(out_bf, acc);
+            warp::store(g.q_post_rope, out_bf, {row * (LY_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out, "    __threadfence(); group<LY_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 3: [SKIP ATTENTION] — test harness writes fake attn_out
+    writeln!(out, "    // ════ Phase 3: attention (SKIPPED — attn_out pre-filled by test) ════").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 4: o_proj GEMM + residual (attn_out × o_weights + hidden_states → hidden_states)
+    writeln!(out, "    // ════ Phase 4: o_proj GEMM + residual ════").unwrap();
+    emit_layer_gemm_loop(
+        &mut out, "g.attn_out", "g.o_weights",
+        &hd_k_iters.to_string(), &hd_col_tiles.to_string(),
+        "        {   rt_bf<16, LY_OUT_BLOCK> acc_bf;
+            warp::copy(acc_bf, acc);
+            rt_bf<16, LY_OUT_BLOCK> res_bf;
+            warp::load(res_bf, g.hidden_states, {row * (LY_BATCH_BLOCK / 16) + wid, col});
+            #pragma unroll
+            for (int r = 0; r < acc_bf.height; r++)
+                #pragma unroll
+                for (int c = 0; c < acc_bf.width; c++)
+                    #pragma unroll
+                    for (int k = 0; k < acc_bf.tiles[0][0].packed_per_thread; k++) {
+                        bf16_2 &a = acc_bf.tiles[r][c].data[k];
+                        bf16_2 &rv = res_bf.tiles[r][c].data[k];
+                        float a_lo = __bfloat162float(__low2bfloat16(a));
+                        float a_hi = __bfloat162float(__high2bfloat16(a));
+                        float r_lo = __bfloat162float(__low2bfloat16(rv));
+                        float r_hi = __bfloat162float(__high2bfloat16(rv));
+                        a = __floats2bfloat162_rn(a_lo + r_lo, a_hi + r_hi);
+                    }
+            warp::store(g.hidden_states, acc_bf, {row * (LY_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out, "    __threadfence(); group<LY_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 5: mlp_norm (RMSNorm)
+    writeln!(out, "    // ════ Phase 5: mlp_norm (RMSNorm) ════").unwrap();
+    emit_layer_rmsnorm(
+        &mut out,
+        "g.hidden_states",
+        "g.mlp_norm_weights",
+        "g.rms_gate_intermediates",
+        hd,
+    );
+    writeln!(out).unwrap();
+
+    // Phase 6: gate GEMM + SiLU
+    writeln!(out, "    // ════ Phase 6: gate GEMM + SiLU ════").unwrap();
+    emit_layer_gemm_loop(
+        &mut out, "g.rms_gate_intermediates", "g.gate_weights",
+        &hd_k_iters.to_string(), &id_col_tiles.to_string(),
+        "        {   rt_bf<16, LY_OUT_BLOCK> out_bf;
+            #pragma unroll
+            for (int i = 0; i < acc.height; i++)
+                #pragma unroll
+                for (int j = 0; j < acc.width; j++)
+                    #pragma unroll
+                    for (int d = 0; d < acc.tiles[i][j].num_elements; d++) {
+                        float2 &v = acc.tiles[i][j].data[d];
+                        v.x = v.x / (1.f + expf(-v.x));
+                        v.y = v.y / (1.f + expf(-v.y));
+                    }
+            warp::copy(out_bf, acc);
+            warp::store(g.silu_out, out_bf, {row * (LY_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out, "    __threadfence(); group<LY_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 7: up GEMM × gate
+    writeln!(out, "    // ════ Phase 7: up GEMM × gate (register multiply) ════").unwrap();
+    emit_layer_gemm_loop(
+        &mut out, "g.rms_gate_intermediates", "g.up_weights",
+        &hd_k_iters.to_string(), &id_col_tiles.to_string(),
+        "        {   rt_bf<16, LY_OUT_BLOCK> acc_bf;
+            warp::copy(acc_bf, acc);
+            rt_bf<16, LY_OUT_BLOCK> gate_bf;
+            warp::load(gate_bf, g.silu_out, {row * (LY_BATCH_BLOCK / 16) + wid, col});
+            #pragma unroll
+            for (int r = 0; r < acc_bf.height; r++)
+                #pragma unroll
+                for (int c = 0; c < acc_bf.width; c++)
+                    #pragma unroll
+                    for (int k = 0; k < acc_bf.tiles[0][0].packed_per_thread; k++) {
+                        bf16_2 &a = acc_bf.tiles[r][c].data[k];
+                        bf16_2 &gv = gate_bf.tiles[r][c].data[k];
+                        float a_lo = __bfloat162float(__low2bfloat16(a));
+                        float a_hi = __bfloat162float(__high2bfloat16(a));
+                        float g_lo = __bfloat162float(__low2bfloat16(gv));
+                        float g_hi = __bfloat162float(__high2bfloat16(gv));
+                        a = __floats2bfloat162_rn(a_lo * g_lo, a_hi * g_hi);
+                    }
+            warp::store(g.silu_out, acc_bf, {row * (LY_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out, "    __threadfence(); group<LY_NUM_WARPS>::sync(0);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 8: down GEMM + residual
+    writeln!(out, "    // ════ Phase 8: down GEMM + residual ════").unwrap();
+    emit_layer_gemm_loop(
+        &mut out, "g.silu_out", "g.down_weights",
+        &id_k_iters.to_string(), &hd_col_tiles.to_string(),
+        "        {   rt_bf<16, LY_OUT_BLOCK> acc_bf;
+            warp::copy(acc_bf, acc);
+            rt_bf<16, LY_OUT_BLOCK> res_bf;
+            warp::load(res_bf, g.hidden_states, {row * (LY_BATCH_BLOCK / 16) + wid, col});
+            #pragma unroll
+            for (int r = 0; r < acc_bf.height; r++)
+                #pragma unroll
+                for (int c = 0; c < acc_bf.width; c++)
+                    #pragma unroll
+                    for (int k = 0; k < acc_bf.tiles[0][0].packed_per_thread; k++) {
+                        bf16_2 &a = acc_bf.tiles[r][c].data[k];
+                        bf16_2 &rv = res_bf.tiles[r][c].data[k];
+                        float a_lo = __bfloat162float(__low2bfloat16(a));
+                        float a_hi = __bfloat162float(__high2bfloat16(a));
+                        float r_lo = __bfloat162float(__low2bfloat16(rv));
+                        float r_hi = __bfloat162float(__high2bfloat16(rv));
+                        a = __floats2bfloat162_rn(a_lo + r_lo, a_hi + r_hi);
+                    }
+            warp::store(g.hidden_states, acc_bf, {row * (LY_BATCH_BLOCK / 16) + wid, col});
+        }",
+        a_size, stage_size,
+    );
+    writeln!(out).unwrap();
+
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Launch wrapper
+    emit_tensor_arg_and_globals_helper(&mut out);
+    writeln!(out, "extern \"C\" int fused_layer_launch(").unwrap();
+    writeln!(out, "{}", LAUNCH_PARAMS).unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "  try {{").unwrap();
+    emit_globals_construction(&mut out, "    ");
+    writeln!(out).unwrap();
+    writeln!(out, "    int shmem = LY_SHMEM;").unwrap();
+    writeln!(out, "    auto err = cudaFuncSetAttribute(fused_layer,").unwrap();
+    writeln!(out, "        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);").unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return (int)err;").unwrap();
+    writeln!(out, "    fused_layer<<<1, {num_threads}, shmem, (cudaStream_t)stream>>>(").unwrap();
     writeln!(out, "        g, batch_size, num_layers);").unwrap();
     writeln!(out, "    err = cudaGetLastError();").unwrap();
     writeln!(out, "    return (int)err;").unwrap();
@@ -2934,5 +3310,40 @@ mod tests {
         assert!(cuda.contains("__launch_bounds__(256, 1)"));
 
         eprintln!("{cuda}");
+    }
+
+    #[test]
+    fn generates_fused_layer() {
+        let input: proc_macro2::TokenStream = quote::quote! {
+            kernel llama_sm89<NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                    let qkv = gemm(normed, qkv_weights[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                    let gate = silu(gemm(normed2, gate_weights[layer]));
+                    let up = gemm(normed2, up_weights[layer]);
+                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                }
+                let normed = rmsnorm(hidden_states, lm_head_norm);
+                logits = gemm(normed, lm_head);
+            }
+        };
+        let def: crate::parse::MegakernelDef = syn::parse2(input).expect("parse");
+        let dag = crate::parse::build_dag(&def).expect("dag");
+        let cuda = generate_fused_layer_kernel(&dag);
+
+        // Has all 8 phases
+        assert!(cuda.contains("Phase 1: attn_norm"));
+        assert!(cuda.contains("Phase 2: QKV GEMM"));
+        assert!(cuda.contains("Phase 4: o_proj"));
+        assert!(cuda.contains("Phase 5: mlp_norm"));
+        assert!(cuda.contains("Phase 6: gate GEMM"));
+        assert!(cuda.contains("Phase 7: up GEMM"));
+        assert!(cuda.contains("Phase 8: down GEMM"));
+        assert!(cuda.contains("fused_layer("));
+        assert!(cuda.contains("fused_layer_launch("));
     }
 }

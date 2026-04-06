@@ -823,3 +823,125 @@ fn test_fused_mlp_golden() {
 
     assert_close(gpu_row0, &expected, 1.0, 0.1, "fused_mlp_golden");
 }
+
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_fused_layer_golden() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    // Inputs
+    let input_f32 = bf16_roundtrip(&gen_input(HD));
+    // Weights
+    let attn_norm_w = bf16_roundtrip(&gen_weight(HD));
+    let qkv_w = bf16_roundtrip(&make_random(HD * HD, 100, 0.01)); // HD×HD (testing first HD cols)
+    let o_w = bf16_roundtrip(&make_random(HD * HD, 150, 0.01));
+    let attn_out_data = bf16_roundtrip(&make_random(HD, 175, 0.5)); // fake attention output
+    let mlp_norm_w = bf16_roundtrip(&gen_weight(HD));
+    let gate_w = bf16_roundtrip(&make_random(ID * HD, 200, 0.01));
+    let up_w = bf16_roundtrip(&make_random(ID * HD, 300, 0.01));
+    let down_w = bf16_roundtrip(&make_random(HD * ID, 400, 0.01));
+
+    let mut b = TestBuffers::new();
+
+    // Upload hidden_states
+    let mut input_full = vec![0.0_f32; ACT_ROWS * HD];
+    input_full[..HD].copy_from_slice(&input_f32);
+    b.hidden = gpu_upload_bf16(&input_full);
+
+    // Upload weights (replicated across NL layers)
+    let anw: Vec<f32> = attn_norm_w.iter().copied().cycle().take(NL * HD).collect();
+    b.attn_norm_w = gpu_upload_bf16(&anw);
+
+    let qw: Vec<f32> = qkv_w.iter().copied().cycle().take(NL * HD * HD).collect();
+    b.qkv_w = gpu_upload_bf16(&qw);
+
+    let ow: Vec<f32> = o_w.iter().copied().cycle().take(NL * HD * HD).collect();
+    b.o_w = gpu_upload_bf16(&ow);
+
+    // Upload fake attn_out
+    let mut attn_full = vec![0.0_f32; ACT_ROWS * HD];
+    attn_full[..HD].copy_from_slice(&attn_out_data);
+    b.attn_out = gpu_upload_bf16(&attn_full);
+
+    let mnw: Vec<f32> = mlp_norm_w.iter().copied().cycle().take(NL * HD).collect();
+    b.mlp_norm_w = gpu_upload_bf16(&mnw);
+
+    let gw: Vec<f32> = gate_w.iter().copied().cycle().take(NL * ID * HD).collect();
+    b.gate_w = gpu_upload_bf16(&gw);
+
+    let uw: Vec<f32> = up_w.iter().copied().cycle().take(NL * ID * HD).collect();
+    b.up_w = gpu_upload_bf16(&uw);
+
+    let dw: Vec<f32> = down_w.iter().copied().cycle().take(NL * HD * ID).collect();
+    b.down_w = gpu_upload_bf16(&dw);
+
+    let rc = call_launch!(ffi::fused_layer_launch, b);
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "fused_layer_launch returned error {rc}");
+
+    // Read back final hidden_states
+    let gpu_out = gpu_download_bf16(b.hidden, ACT_ROWS * HD);
+    let gpu_row0 = &gpu_out[..HD];
+
+    // ── CPU golden chain ──
+
+    // 1. attn_norm
+    let mut normed = vec![0.0_f32; HD];
+    cpu_golden::rmsnorm(&input_f32, &attn_norm_w, &mut normed, 1e-5);
+    let normed = bf16_roundtrip(&normed);
+
+    // 2. QKV GEMM: normed[1,HD] × qkv_w[HD,HD]^T → [1,HD]
+    let mut qkv_out = vec![0.0_f32; HD];
+    cpu_golden::gemm(&normed, &qkv_w, &mut qkv_out, 1, HD, HD);
+    let _qkv_out = bf16_roundtrip(&qkv_out);
+
+    // 3. [skip attention — use fake attn_out_data directly]
+
+    // 4. o_proj + residual: attn_out[1,HD] × o_w[HD,HD]^T + hidden → hidden
+    let mut hidden_after_attn = vec![0.0_f32; HD];
+    cpu_golden::gemm_add(&attn_out_data, &o_w, &input_f32, &mut hidden_after_attn, 1, HD, HD);
+    let hidden_after_attn = bf16_roundtrip(&hidden_after_attn);
+
+    // 5. mlp_norm
+    let mut mlp_normed = vec![0.0_f32; HD];
+    cpu_golden::rmsnorm(&hidden_after_attn, &mlp_norm_w, &mut mlp_normed, 1e-5);
+    let mlp_normed = bf16_roundtrip(&mlp_normed);
+
+    // 6. gate GEMM + SiLU
+    let mut gate_out = vec![0.0_f32; ID];
+    cpu_golden::gemm(&mlp_normed, &gate_w, &mut gate_out, 1, HD, ID);
+    let gate_out = bf16_roundtrip(&gate_out);
+    let mut gate_silu = vec![0.0_f32; ID];
+    cpu_golden::silu(&gate_out, &mut gate_silu);
+    let gate_silu = bf16_roundtrip(&gate_silu);
+
+    // 7. up GEMM × gate
+    let mut up_out = vec![0.0_f32; ID];
+    cpu_golden::gemm(&mlp_normed, &up_w, &mut up_out, 1, HD, ID);
+    let up_out = bf16_roundtrip(&up_out);
+    let mut mlp_inter = vec![0.0_f32; ID];
+    cpu_golden::mul(&gate_silu, &up_out, &mut mlp_inter);
+    let mlp_inter = bf16_roundtrip(&mlp_inter);
+
+    // 8. down GEMM + residual
+    let mut expected = vec![0.0_f32; HD];
+    cpu_golden::gemm_add(&mlp_inter, &down_w, &hidden_after_attn, &mut expected, 1, ID, HD);
+
+    eprintln!("Layer GPU[0..4]: {:?}", &gpu_row0[..4]);
+    eprintln!("Layer CPU[0..4]: {:?}", &expected[..4]);
+
+    assert_close(gpu_row0, &expected, 1.5, 0.15, "fused_layer_golden");
+}

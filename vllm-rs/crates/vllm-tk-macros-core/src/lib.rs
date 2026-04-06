@@ -114,6 +114,18 @@ pub fn generate_fused_rmsnorm_gemm_kernel(dsl: &str) -> Result<String, String> {
     Ok(cuda_codegen::generate_fused_rmsnorm_gemm_kernel(&dag))
 }
 
+/// Generate a fused single-layer kernel (no KVM protocol).
+///
+/// Chains: attn_norm → QKV GEMM → [skip attention] → o_proj+residual → MLP block.
+pub fn generate_fused_layer_kernel(dsl: &str) -> Result<String, String> {
+    let tokens: proc_macro2::TokenStream = dsl
+        .parse()
+        .map_err(|e| format!("failed to tokenize DSL: {e}"))?;
+    let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("parse error: {e}"))?;
+    let dag = parse::build_dag(&def)?;
+    Ok(cuda_codegen::generate_fused_layer_kernel(&dag))
+}
+
 /// Generate a debug variant of the decode kernel that syncs and writes a
 /// marker to a debug buffer after each op. Useful for identifying which op
 /// crashes in the full megakernel.

@@ -102,6 +102,13 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_mlp_path.display()));
     cu_files.push(fused_mlp_path.display().to_string());
 
+    let fused_layer_source = vllm_tk_macros_core::generate_fused_layer_kernel(dsl)
+        .unwrap_or_else(|e| panic!("fused layer codegen failed: {e}"));
+    let fused_layer_path = out_dir.join("fused_layer.cu");
+    std::fs::write(&fused_layer_path, &fused_layer_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_layer_path.display()));
+    cu_files.push(fused_layer_path.display().to_string());
+
     // Build all test kernels into one static library
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)

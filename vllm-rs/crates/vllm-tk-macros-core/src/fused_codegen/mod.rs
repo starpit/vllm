@@ -906,4 +906,61 @@ mod tests {
         assert!(rendered.contains("hd = 2048"));
         assert!(rendered.contains("phase: rmsnorm"));
     }
+
+    // ── Decode config / derived tests ─────────────────────────────────
+
+    #[test]
+    fn decode_derived_1b_rows16() {
+        let dag = build_1b_dag();
+        let cfg = config::FusedDecodeConfig::decode_rows16();
+        let d = derived::FusedDecodeDerived::new(&dag, &cfg);
+
+        // Model dimensions
+        assert_eq!(d.hd, 2048);
+        assert_eq!(d.id, 8192);
+        assert_eq!(d.nl, 16);
+        assert_eq!(d.nah, 32);
+        assert_eq!(d.nkh, 8);
+        assert_eq!(d.hdm, 64);
+        assert_eq!(d.gqa_ratio, 4);
+        assert_eq!(d.qkv_dim, (32 + 16) * 64); // 3072
+
+        // CTA geometry
+        assert_eq!(d.cta_rows, 16);
+        assert_eq!(d.padded_cta_rows, 16);
+        assert_eq!(d.num_warps, 8);
+        assert_eq!(d.num_threads, 256);
+
+        // Shmem
+        let hidden = 16 * 2048 * 2; // 65536
+        assert_eq!(d.hidden_shmem, hidden);
+
+        // Peak must fit in sm89
+        assert!(
+            d.peak_shmem <= config::SM89_MAX_SHMEM,
+            "peak_shmem {} exceeds sm89 limit {}",
+            d.peak_shmem,
+            config::SM89_MAX_SHMEM,
+        );
+    }
+
+    #[test]
+    fn decode_derived_rows4() {
+        let dag = build_1b_dag();
+        let cfg = config::FusedDecodeConfig::decode_rows4();
+        let d = derived::FusedDecodeDerived::new(&dag, &cfg);
+        assert_eq!(d.cta_rows, 4);
+        assert_eq!(d.padded_cta_rows, 16); // rounds up to 16
+        assert!(d.peak_shmem <= config::SM89_MAX_SHMEM);
+    }
+
+    #[test]
+    fn decode_derived_rows1() {
+        let dag = build_1b_dag();
+        let cfg = config::FusedDecodeConfig::decode_rows1();
+        let d = derived::FusedDecodeDerived::new(&dag, &cfg);
+        assert_eq!(d.cta_rows, 1);
+        assert_eq!(d.padded_cta_rows, 16);
+        assert!(d.peak_shmem <= config::SM89_MAX_SHMEM);
+    }
 }

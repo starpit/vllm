@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Configuration for the fused prefill kernel.
+//! Configuration for fused prefill and decode kernels.
 
 /// GEMM parallelism strategy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,5 +176,77 @@ impl FusedPrefillConfig {
 
     pub fn attn_passes(&self) -> usize {
         self.cta_rows / 16
+    }
+}
+
+// ── Decode configuration ──────────────────────────────────────────────
+
+/// Configuration for a fused decode kernel variant.
+///
+/// Row-fused architecture: each CTA owns `cta_rows` sequences and runs them
+/// through ALL phases of ALL layers with no cross-CTA barriers.  Activations
+/// stay in shmem between phases; only weights and KV cache touch global memory.
+#[derive(Clone, Debug)]
+pub struct FusedDecodeConfig {
+    /// Sequences (rows) owned by each CTA.
+    pub cta_rows: usize,
+    /// GEMM K-dimension tile size.
+    pub k_dim: usize,
+    /// GEMM output column tile size.
+    pub out_block: usize,
+    /// Number of warps per CTA.
+    pub num_warps: usize,
+    /// KV cache page size (tokens per page, must match cache allocation).
+    pub kv_page_size: usize,
+    /// Number of pipeline stages for weight loads (2 = double-buffer).
+    pub num_stages: usize,
+}
+
+/// Maximum shared memory per CTA on sm89 (in bytes).
+pub const SM89_MAX_SHMEM: usize = 101_376; // 99 KB
+
+impl FusedDecodeConfig {
+    /// Primary config: 16 rows per CTA — optimal for BS >= 16.
+    ///
+    /// 8 warps, each owns 2 rows in MMA tiles.  Cooperative GEMM with shared B.
+    /// Shmem peak ~82KB (attention phase: Q[16,HD] + K_page + V_page).
+    pub fn decode_rows16() -> Self {
+        Self {
+            cta_rows: 16,
+            k_dim: 64,
+            out_block: 64,
+            num_warps: 8,
+            kv_page_size: 64,
+            num_stages: 2,
+        }
+    }
+
+    /// Small-batch config: 4 rows per CTA — for BS in [2, 15].
+    pub fn decode_rows4() -> Self {
+        Self {
+            cta_rows: 4,
+            k_dim: 64,
+            out_block: 64,
+            num_warps: 8,
+            kv_page_size: 64,
+            num_stages: 2,
+        }
+    }
+
+    /// Single-row config: BS = 1.
+    pub fn decode_rows1() -> Self {
+        Self {
+            cta_rows: 1,
+            k_dim: 64,
+            out_block: 64,
+            num_warps: 8,
+            kv_page_size: 64,
+            num_stages: 2,
+        }
+    }
+
+    /// Padded CTA rows (rounded up to 16 for MMA tile alignment).
+    pub fn padded_cta_rows(&self) -> usize {
+        (self.cta_rows + 15) & !15
     }
 }

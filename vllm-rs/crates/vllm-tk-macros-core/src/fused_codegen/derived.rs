@@ -69,8 +69,17 @@ impl FusedDerived {
                 let ss = a_size + col_batch * b_size;
                 (ss, num_stages * ss, 0)
             }
+            GemmMode::Cooperative if cfg.per_warp_b => {
+                // Each warp owns BOTH its A tile AND its own B tile copy.
+                // Per-warp allocation: a_size + b_size.
+                // Stage = num_warps * (a_size + b_size).
+                // b_offset is relative to each warp's allocation start (= a_size).
+                let per_warp = a_size + b_size;
+                let ss = cfg.num_warps * per_warp;
+                (ss, num_stages * ss, a_size)
+            }
             GemmMode::Cooperative => {
-                // Each warp owns its own A tile; B is shared
+                // Each warp owns its own A tile; B is shared across warps
                 let ss = cfg.num_warps * a_size + b_size;
                 let bo = cfg.num_warps * a_size;
                 (ss, num_stages * ss, bo)

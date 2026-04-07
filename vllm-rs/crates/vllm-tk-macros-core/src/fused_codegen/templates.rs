@@ -7,7 +7,37 @@
 
 use askama::Template;
 
-// ── Preamble ────────────────────────────────────────────────────────────
+// ── Preamble (split for polyalgorithm) ──────────────────────────────────
+
+#[derive(Template)]
+#[template(path = "fused/preamble_header.cu", escape = "none")]
+pub struct PreambleHeaderCtx<'a> {
+    pub mode_label: &'a str,
+    pub nl: usize,
+    pub hd: usize,
+    pub id: usize,
+    pub hdm: usize,
+    pub nah: usize,
+    pub nkh: usize,
+}
+
+#[derive(Template)]
+#[template(path = "fused/preamble_constants.cu", escape = "none")]
+pub struct PreambleConstantsCtx {
+    pub cta_rows: usize,
+    pub num_warps: usize,
+    pub gqa_ratio: usize,
+    pub kv_page_size: usize,
+    pub iters_per_page: usize,
+    pub total_shmem: usize,
+    pub kv_tile_bytes: usize,
+    pub k_dim: usize,
+    pub out_block: usize,
+    pub rdpw: usize,
+    pub hdm: usize,
+}
+
+// ── Preamble (combined, used by non-polyalgorithm paths) ────────────────
 
 #[derive(Template)]
 #[template(path = "fused/preamble.cu", escape = "none")]
@@ -157,6 +187,7 @@ pub struct GemmMctaCtx<'a> {
     pub cooperative: bool,
     pub col_batch: usize,
     pub num_stages: usize,
+    pub per_warp_b: bool,
 }
 
 #[derive(Template)]
@@ -203,6 +234,7 @@ pub struct GemmGateUpMctaCtx<'a> {
     pub b_offset: usize,
     pub cooperative: bool,
     pub num_stages: usize,
+    pub per_warp_b: bool,
 }
 
 #[derive(Template)]
@@ -214,6 +246,23 @@ pub struct LaunchWrapperMctaCtx<'a> {
     pub num_threads: usize,
     pub grid_size: usize,
     pub id_col_tiles: usize,
+    pub kernel_suffix: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "fused/launch_inner_mcta.cu", escape = "none")]
+pub struct LaunchInnerMctaCtx<'a> {
+    pub num_threads: usize,
+    pub id_col_tiles: usize,
+    pub kernel_suffix: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "fused/polyalgorithm_dispatch.cu", escape = "none")]
+pub struct PolyalgorithmDispatchCtx<'a> {
+    pub tensor_arg_helper: &'a str,
+    pub launch_params: &'a str,
+    pub globals_construction: &'a str,
 }
 
 #[derive(Template)]
@@ -226,4 +275,5 @@ pub struct KernelMctaCtx<'a> {
     pub phase_names_str: &'a str,
     pub num_phases: usize,
     pub grid_size: usize,
+    pub kernel_suffix: &'a str,
 }

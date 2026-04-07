@@ -203,8 +203,10 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
     let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("parse error: {e}"))?;
     let dag = parse::build_dag(&def)?;
 
-    let backend = std::env::var("TK_FUSED_PREFILL").unwrap_or_else(|_| "v1".to_string());
+    let backend = std::env::var("TK_FUSED_PREFILL")
+        .unwrap_or_else(|_| "auto".to_string());
     let cfg = match backend.as_str() {
+        "auto" => return Ok(fused_codegen::generate_fused_prefill_polyalgorithm(&dag)),
         "v1" => return Ok(cuda_codegen::generate_fused_prefill_layer_kernel(&dag)),
         "v2-16row" => fused_codegen::config::FusedPrefillConfig::rows16(),
         "v2-16row-col4" => fused_codegen::config::FusedPrefillConfig::rows16_col4(),
@@ -247,10 +249,40 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
                 &dag, &cfg, 128,
             ));
         }
+        "v2-mcta-64row-nosync" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows64_nosync();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag, &cfg, 128,
+            ));
+        }
+        "v2-mcta-32row-nosync-k128" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows32_nosync_k128();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag, &cfg, 128,
+            ));
+        }
+        "v2-mcta-64row-wide-3stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows64_wide_3stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag, &cfg, 128,
+            ));
+        }
+        "v2-mcta-64row-k128-grid32" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows64_k128();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag, &cfg, 32,
+            ));
+        }
+        "v2-mcta-64row-k128-grid64" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows64_k128();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag, &cfg, 64,
+            ));
+        }
         other => {
             return Err(format!(
                 "unknown TK_FUSED_PREFILL backend '{other}' \
-                 (expected v1, v2-16row, v2-16row-col4, v2-32row, v2-64row, v2-128row, v2-mcta, v2-mcta-col1, v2-mcta-128row, or v2-mcta-128row-fused)"
+                 (expected v1, v2-16row, v2-16row-col4, v2-32row, v2-64row, v2-128row, v2-mcta, v2-mcta-col1, v2-mcta-128row, v2-mcta-128row-fused, v2-mcta-128row-wide, v2-mcta-64row-k128, v2-mcta-64row-3stage, or v2-mcta-64row-nosync)"
             ));
         }
     };

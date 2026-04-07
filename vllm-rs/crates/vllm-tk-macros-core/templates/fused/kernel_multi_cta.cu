@@ -30,7 +30,7 @@ __device__ static inline void mcta_barrier(int *bar, int layer, int phase, int g
 }
 
 __global__ void __launch_bounds__({{ num_threads }}, 1)
-fused_prefill_layer(const globals g, int batch_size, int num_layers, int *mcta_bar) {
+fused_prefill_layer{{ kernel_suffix }}(const globals g, int batch_size, int num_layers, int *mcta_bar) {
     const int wid = kittens::warpid();
     const int lid = kittens::laneid();
     const int bid = blockIdx.x;

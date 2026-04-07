@@ -420,6 +420,7 @@ pub fn generate_fused_prefill_mcta(
         num_threads: d.num_threads,
         grid_size,
         id_col_tiles: d.id_col_tiles,
+        kernel_suffix: "",
     }
     .render()
     .expect("launch_wrapper_mcta template render");
@@ -451,6 +452,7 @@ pub fn generate_fused_prefill_mcta(
         phase_names_str: &phase_names_str,
         num_phases: phases.len(),
         grid_size,
+        kernel_suffix: "",
     }
     .render()
     .expect("kernel_mcta template render")
@@ -558,6 +560,7 @@ pub fn generate_fused_prefill_mcta_fused_gateup(
         num_threads: d.num_threads,
         grid_size,
         id_col_tiles: d.id_col_tiles,
+        kernel_suffix: "",
     }
     .render()
     .expect("launch_wrapper_mcta template render");
@@ -586,9 +589,164 @@ pub fn generate_fused_prefill_mcta_fused_gateup(
         phase_names_str: &phase_names_str,
         num_phases: phases.len(),
         grid_size,
+        kernel_suffix: "",
     }
     .render()
     .expect("kernel_mcta template render")
+}
+
+/// Generate a polyalgorithm kernel that includes 3 variants and dispatches at runtime.
+///
+/// Variants (determined by L40S benchmarks on LLaMA 1B):
+/// - `_small` (64row-k128): best for seq ≤ 128
+/// - `_medium` (128row-fused): best for 128 < seq < 1024
+/// - `_large` (128row-wide): best for seq ≥ 1024
+///
+/// Each variant is wrapped in its own C++ namespace to isolate PFL_* constants
+/// and type aliases. A single `fused_prefill_layer_launch` dispatches based on
+/// `num_prefill_tokens`.
+pub fn generate_fused_prefill_polyalgorithm(dag: &ModelDag) -> String {
+    let grid_size = 128;
+
+    // Three winning configs (L40S benchmarks, LLaMA 1B, 16 layers)
+    let variants: Vec<(&str, FusedPrefillConfig)> = vec![
+        ("_small", FusedPrefillConfig::rows64_k128()),   // best seq ≤ 128
+        ("_medium", FusedPrefillConfig::rows128()),      // best 128 < seq < 1024
+        ("_large", FusedPrefillConfig::rows128_wide()),  // best seq ≥ 1024
+    ];
+
+    let mut out = String::new();
+
+    // Emit #define SM89_* and #include ONCE at file scope (before any namespace).
+    // This avoids pulling C++ standard headers inside a namespace.
+    let d0 = FusedDerived::new(dag, &variants[0].1);
+    let header = PreambleHeaderCtx {
+        mode_label: "polyalgorithm",
+        nl: d0.nl,
+        hd: d0.hd,
+        id: d0.id,
+        hdm: d0.hdm,
+        nah: d0.nah,
+        nkh: d0.nkh,
+    }
+    .render()
+    .expect("preamble_header template render");
+    out.push_str(&header);
+    out.push('\n');
+
+    // Each variant in its own namespace with PFL_* constants + type aliases.
+    for (suffix, cfg) in &variants {
+        let d = FusedDerived::new(dag, cfg);
+
+        let constants = PreambleConstantsCtx {
+            cta_rows: cfg.cta_rows,
+            num_warps: cfg.num_warps,
+            gqa_ratio: d.gqa_ratio,
+            kv_page_size: cfg.kv_page_size,
+            iters_per_page: d.iters_per_page,
+            total_shmem: d.total_shmem,
+            kv_tile_bytes: d.kv_tile_bytes,
+            k_dim: cfg.k_dim,
+            out_block: cfg.out_block,
+            rdpw: d.rdpw,
+            hdm: d.hdm,
+        }
+        .render()
+        .expect("preamble_constants template render");
+
+        let phases = build_fused_gateup_phases(&d, cfg);
+
+        let phase_name_list = [
+            "attn_norm", "QKV_GEMM", "RoPE_KV", "attention",
+            "o_proj", "mlp_norm", "fused_gate_up", "down_residual",
+        ];
+        let phase_names_str = phase_name_list[..phases.len()]
+            .iter()
+            .map(|n| format!("\"{}\"", n))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let inner_launch = LaunchInnerMctaCtx {
+            num_threads: d.num_threads,
+            id_col_tiles: d.id_col_tiles,
+            kernel_suffix: suffix,
+        }
+        .render()
+        .expect("launch_inner_mcta template render");
+
+        // KernelMctaCtx expects a preamble string — use the constants-only preamble
+        let kernel = KernelMctaCtx {
+            preamble: &constants,
+            phases: &phases,
+            launch_wrapper: &inner_launch,
+            num_threads: d.num_threads,
+            phase_names_str: &phase_names_str,
+            num_phases: phases.len(),
+            grid_size,
+            kernel_suffix: suffix,
+        }
+        .render()
+        .expect("kernel_mcta template render");
+
+        out.push_str(&format!("namespace pfl{} {{\n", suffix));
+        out.push_str(&kernel);
+        out.push_str(&format!("}}  // namespace pfl{}\n\n", suffix));
+    }
+
+    // Dispatch launch wrapper at file scope
+    let mut tah = String::new();
+    emit_tensor_arg_and_globals_helper(&mut tah);
+    let mut gc = String::new();
+    emit_globals_construction(&mut gc, "    ");
+
+    let dispatch = PolyalgorithmDispatchCtx {
+        tensor_arg_helper: &tah,
+        launch_params: LAUNCH_PARAMS,
+        globals_construction: &gc,
+    }
+    .render()
+    .expect("polyalgorithm dispatch render");
+
+    out.push_str(&dispatch);
+    out
+}
+
+/// Build the 8-phase (fused gate+up) phase list for a variant.
+fn build_fused_gateup_phases(d: &FusedDerived, cfg: &FusedPrefillConfig) -> Vec<String> {
+    vec![
+        render_rmsnorm_mcta(d, "g.hidden_states", "g.attn_norm_weights", "g.rms_rope_intermediates"),
+        render_gemm_mcta(d, cfg, "QKV GEMM", "g.rms_rope_intermediates", "g.qkv_weights",
+            d.hd_k_iters, d.qkv_col_tiles, EpilogueKind::Store("g.silu_out")),
+        render_rope_kv_append_mcta(d),
+        render_attention_mcta(d),
+        render_gemm_mcta(d, cfg, "o_proj + residual", "g.attn_out", "g.o_weights",
+            d.hd_k_iters, d.hd_col_tiles, EpilogueKind::ResidualAdd("g.hidden_states")),
+        render_rmsnorm_mcta(d, "g.hidden_states", "g.mlp_norm_weights", "g.rms_gate_intermediates"),
+        render_gemm_gate_up_mcta(d, cfg, "fused gate+up", "g.rms_gate_intermediates",
+            "g.gate_weights", "g.up_weights", "g.silu_out", d.hd_k_iters, d.id_col_tiles),
+        render_gemm_mcta(d, cfg, "down_proj + residual", "g.silu_out", "g.down_weights",
+            d.id_k_iters, d.hd_col_tiles, EpilogueKind::ResidualAdd("g.hidden_states")),
+    ]
+}
+
+/// Build the 9-phase (separate gate/up) phase list for a variant.
+fn build_separate_gateup_phases(d: &FusedDerived, cfg: &FusedPrefillConfig) -> Vec<String> {
+    vec![
+        render_rmsnorm_mcta(d, "g.hidden_states", "g.attn_norm_weights", "g.rms_rope_intermediates"),
+        render_gemm_mcta(d, cfg, "QKV GEMM", "g.rms_rope_intermediates", "g.qkv_weights",
+            d.hd_k_iters, d.qkv_col_tiles, EpilogueKind::Store("g.silu_out")),
+        render_rope_kv_append_mcta(d),
+        render_attention_mcta(d),
+        render_gemm_mcta(d, cfg, "o_proj + residual", "g.attn_out", "g.o_weights",
+            d.hd_k_iters, d.hd_col_tiles, EpilogueKind::ResidualAdd("g.hidden_states")),
+        render_rmsnorm_mcta(d, "g.hidden_states", "g.mlp_norm_weights", "g.rms_gate_intermediates"),
+        render_gemm_mcta(d, cfg, "gate GEMM + SiLU", "g.rms_gate_intermediates", "g.gate_weights",
+            d.hd_k_iters, d.id_col_tiles, EpilogueKind::SiLU("g.silu_out")),
+        render_gemm_mcta(d, cfg, "up GEMM × gate", "g.rms_gate_intermediates", "g.up_weights",
+            d.hd_k_iters, d.id_col_tiles, EpilogueKind::MulGate("g.silu_out")),
+        render_gemm_mcta(d, cfg, "down_proj + residual", "g.silu_out", "g.down_weights",
+            d.id_k_iters, d.hd_col_tiles, EpilogueKind::ResidualAdd("g.hidden_states")),
+    ]
 }
 
 // ── Multi-CTA phase rendering helpers ───────────────────────────────────
@@ -657,6 +815,7 @@ fn render_gemm_mcta(
         cooperative,
         col_batch: cfg.col_batch,
         num_stages: cfg.num_stages,
+        per_warp_b: cfg.per_warp_b,
     }
     .render()
     .expect("gemm_mcta template render")
@@ -706,6 +865,7 @@ fn render_gemm_gate_up_mcta(
         b_offset: d.b_offset,
         cooperative,
         num_stages: cfg.num_stages,
+        per_warp_b: cfg.per_warp_b,
     }
     .render()
     .expect("gemm_gate_up_mcta template render")
@@ -884,6 +1044,47 @@ mod tests {
         eprintln!("v2_128: {} lines", v2_128.lines().count());
         eprintln!("v2_mcta: {} lines", v2_mcta.lines().count());
         eprintln!("v2_mcta_fused: {} lines", v2_mcta_fused.lines().count());
+    }
+
+    #[test]
+    fn renders_polyalgorithm_kernel() {
+        let dag = build_1b_dag();
+        let poly = generate_fused_prefill_polyalgorithm(&dag);
+
+        // Three namespaces
+        assert!(poly.contains("namespace pfl_small {"), "missing small namespace");
+        assert!(poly.contains("namespace pfl_medium {"), "missing medium namespace");
+        assert!(poly.contains("namespace pfl_large {"), "missing large namespace");
+
+        // Three kernel functions
+        assert!(poly.contains("fused_prefill_layer_small(const globals g"), "missing small kernel");
+        assert!(poly.contains("fused_prefill_layer_medium(const globals g"), "missing medium kernel");
+        assert!(poly.contains("fused_prefill_layer_large(const globals g"), "missing large kernel");
+
+        // Three inner launch functions
+        assert!(poly.contains("fused_prefill_layer_small_launch_inner"), "missing small inner launch");
+        assert!(poly.contains("fused_prefill_layer_medium_launch_inner"), "missing medium inner launch");
+        assert!(poly.contains("fused_prefill_layer_large_launch_inner"), "missing large inner launch");
+
+        // Dispatch wrapper
+        assert!(poly.contains("fused_prefill_layer_launch("), "missing dispatch launch");
+        assert!(poly.contains("num_prefill_tokens <= 128"), "missing small threshold");
+        assert!(poly.contains("num_prefill_tokens < 1024"), "missing medium threshold");
+
+        // Different PFL_CTA_ROWS in different namespaces
+        assert!(poly.contains("PFL_CTA_ROWS = 64"), "missing 64-row variant");
+        assert!(poly.contains("PFL_CTA_ROWS = 128"), "missing 128-row variant");
+
+        // Different PFL_K_DIM values
+        assert!(poly.contains("PFL_K_DIM = 128"), "missing k128 variant");
+        assert!(poly.contains("PFL_K_DIM = 64"), "missing k64 variant");
+
+        // Wide variant has different out_block
+        assert!(poly.contains("PFL_OUT_BLOCK = 128"), "missing wide out_block");
+        assert!(poly.contains("PFL_OUT_BLOCK = 64"), "missing standard out_block");
+
+        std::fs::write("/tmp/fused_poly.cu", &poly).ok();
+        eprintln!("polyalgorithm: {} lines", poly.lines().count());
     }
 
     // Smoke test from earlier — kept to verify askama setup

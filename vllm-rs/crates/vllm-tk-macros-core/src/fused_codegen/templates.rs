@@ -288,3 +288,48 @@ pub struct DecodeLaunchWrapperCtx<'a> {
     pub globals_construction: &'a str,
     pub num_threads: usize,
 }
+
+#[derive(Template)]
+#[template(path = "fused/decode_gemm.cu", escape = "none")]
+pub struct DecodeGemmCtx<'a> {
+    pub phase_comment: &'a str,
+    pub input_shmem_offset: usize,
+    pub weight_global: &'a str,
+    pub num_k_iters: usize,
+    pub num_col_tiles: usize,
+    pub a_size: usize,
+    pub b_size: usize,
+    pub stage_size: usize,
+    pub b_offset: usize,
+    pub num_stages: usize,
+    pub epilogue: String,
+}
+
+#[derive(Template)]
+#[template(path = "fused/decode_epilogue_store_shmem.cu", escape = "none")]
+pub struct DecodeEpilogueStoreShmemCtx<'a> {
+    pub output_shmem_offset: usize,
+    pub output_stride: usize,
+    pub col_var: &'a str,
+    pub a_size: usize,
+    pub b_size: usize,
+}
+
+#[derive(Template)]
+#[template(path = "fused/decode_epilogue_store_global.cu", escape = "none")]
+pub struct DecodeEpilogueStoreGlobalCtx<'a> {
+    pub output_global: &'a str,
+    pub col_var: &'a str,
+    pub a_size: usize,
+    pub b_size: usize,
+}
+
+#[derive(Template)]
+#[template(path = "fused/decode_epilogue_residual_shmem.cu", escape = "none")]
+pub struct DecodeEpilogueResidualShmemCtx<'a> {
+    pub residual_shmem_offset: usize,
+    pub output_shmem_offset: usize,
+    pub col_var: &'a str,
+    pub a_size: usize,
+    pub b_size: usize,
+}

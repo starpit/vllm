@@ -759,8 +759,6 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
     .expect("decode preamble render");
 
     // ── Phases ──
-    // For now, just attn_norm as the first phase (Step 2).
-    // Subsequent steps will add GEMM, RoPE, attention, MLP phases.
     let rdpw = d.hd / cfg.num_warps;
 
     let phases: Vec<String> = vec![
@@ -774,6 +772,19 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
             d.hidden_shmem,           // wgt after hidden data
             d.hidden_shmem + d.hd * 2, // scratch after weight
             rdpw,
+        ),
+        // Phase 2: QKV GEMM (shmem activations × qkv_weights → global qkv output)
+        // Output goes to global because K/V need to be written to paged cache.
+        // Q will be loaded back into shmem for attention.
+        render_decode_gemm(
+            &d,
+            cfg,
+            "Phase 2: QKV GEMM (shmem × qkv_weights → silu_out)",
+            0, // input from hidden slab (after attn_norm, in-place)
+            "g.qkv_weights",
+            d.hd_k_iters,
+            d.qkv_col_tiles,
+            DecodeEpilogueKind::StoreGlobal("g.silu_out"),
         ),
     ];
 
@@ -793,7 +804,7 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
     .expect("decode launch_wrapper render");
 
     // ── Phase names ──
-    let phase_name_list = ["attn_norm"];
+    let phase_name_list = ["attn_norm", "QKV_GEMM"];
     let phase_names_str = phase_name_list[..phases.len()]
         .iter()
         .map(|n| format!("\"{}\"", n))
@@ -840,6 +851,78 @@ fn render_decode_rmsnorm(
     }
     .render()
     .expect("decode rmsnorm render")
+}
+
+enum DecodeEpilogueKind<'a> {
+    /// Store to shmem slab (offset, stride).
+    StoreShmem(usize, usize),
+    /// Store to global.
+    StoreGlobal(&'a str),
+    /// Add residual from shmem, write to shmem.
+    ResidualShmem {
+        residual_offset: usize,
+        output_offset: usize,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_decode_gemm(
+    d: &FusedDecodeDerived,
+    cfg: &FusedDecodeConfig,
+    phase_comment: &str,
+    input_shmem_offset: usize,
+    weight_global: &str,
+    num_k_iters: usize,
+    num_col_tiles: usize,
+    epilogue: DecodeEpilogueKind<'_>,
+) -> String {
+    let epilogue_str = match epilogue {
+        DecodeEpilogueKind::StoreShmem(offset, stride) => DecodeEpilogueStoreShmemCtx {
+            output_shmem_offset: offset,
+            output_stride: stride,
+            col_var: "col",
+            a_size: d.a_size,
+            b_size: d.b_size,
+        }
+        .render()
+        .expect("decode epilogue store shmem"),
+        DecodeEpilogueKind::StoreGlobal(output) => DecodeEpilogueStoreGlobalCtx {
+            output_global: output,
+            col_var: "col",
+            a_size: d.a_size,
+            b_size: d.b_size,
+        }
+        .render()
+        .expect("decode epilogue store global"),
+        DecodeEpilogueKind::ResidualShmem {
+            residual_offset,
+            output_offset,
+        } => DecodeEpilogueResidualShmemCtx {
+            residual_shmem_offset: residual_offset,
+            output_shmem_offset: output_offset,
+            col_var: "col",
+            a_size: d.a_size,
+            b_size: d.b_size,
+        }
+        .render()
+        .expect("decode epilogue residual shmem"),
+    };
+
+    DecodeGemmCtx {
+        phase_comment,
+        input_shmem_offset,
+        weight_global,
+        num_k_iters,
+        num_col_tiles,
+        a_size: d.a_size,
+        b_size: d.b_size,
+        stage_size: d.stage_size,
+        b_offset: d.b_offset,
+        num_stages: cfg.num_stages,
+        epilogue: epilogue_str,
+    }
+    .render()
+    .expect("decode gemm render")
 }
 
 #[cfg(test)]
@@ -1086,6 +1169,20 @@ mod tests {
         assert!(
             cuda.contains("rsqrtf"),
             "missing rsqrtf in RMSNorm"
+        );
+
+        // QKV GEMM
+        assert!(
+            cuda.contains("g.qkv_weights"),
+            "missing QKV weight"
+        );
+        assert!(
+            cuda.contains("mma_ABt_base"),
+            "missing GEMM MMA in decode"
+        );
+        assert!(
+            cuda.contains("g.silu_out"),
+            "missing QKV output"
         );
 
         // Layer loop

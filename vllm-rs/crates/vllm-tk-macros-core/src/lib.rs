@@ -223,10 +223,16 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
             let cfg = fused_codegen::config::FusedPrefillConfig::rows128();
             return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, 128));
         }
+        "v2-mcta-128row-fused" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag, &cfg, 128,
+            ));
+        }
         other => {
             return Err(format!(
                 "unknown TK_FUSED_PREFILL backend '{other}' \
-                 (expected v1, v2-16row, v2-16row-col4, v2-32row, v2-64row, v2-128row, v2-mcta, v2-mcta-col1, or v2-mcta-128row)"
+                 (expected v1, v2-16row, v2-16row-col4, v2-32row, v2-64row, v2-128row, v2-mcta, v2-mcta-col1, v2-mcta-128row, or v2-mcta-128row-fused)"
             ));
         }
     };

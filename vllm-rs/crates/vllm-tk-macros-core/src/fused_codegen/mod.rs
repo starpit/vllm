@@ -455,6 +455,140 @@ pub fn generate_fused_prefill_mcta(
     .expect("kernel_mcta template render")
 }
 
+/// Generate a multi-CTA fused prefill kernel with fused gate+up (8 phases instead of 9).
+pub fn generate_fused_prefill_mcta_fused_gateup(
+    dag: &ModelDag,
+    cfg: &FusedPrefillConfig,
+    grid_size: usize,
+) -> String {
+    let d = FusedDerived::new(dag, cfg);
+
+    let preamble = PreambleCtx {
+        mode_label: "multi-CTA-fused-gateup",
+        cta_rows: cfg.cta_rows,
+        nl: d.nl,
+        hd: d.hd,
+        id: d.id,
+        hdm: d.hdm,
+        nah: d.nah,
+        nkh: d.nkh,
+        num_warps: cfg.num_warps,
+        gqa_ratio: d.gqa_ratio,
+        kv_page_size: cfg.kv_page_size,
+        iters_per_page: d.iters_per_page,
+        total_shmem: d.total_shmem,
+        kv_tile_bytes: d.kv_tile_bytes,
+        k_dim: cfg.k_dim,
+        out_block: cfg.out_block,
+        rdpw: d.rdpw,
+    }
+    .render()
+    .expect("preamble template render");
+
+    // 8 phases: attn_norm, QKV, RoPE, attention, o_proj, mlp_norm, fused_gate_up, down
+    let phases: Vec<String> = vec![
+        render_rmsnorm_mcta(
+            &d,
+            "g.hidden_states",
+            "g.attn_norm_weights",
+            "g.rms_rope_intermediates",
+        ),
+        render_gemm_mcta(
+            &d,
+            cfg,
+            "Phase 2: QKV GEMM (multi-CTA)",
+            "g.rms_rope_intermediates",
+            "g.qkv_weights",
+            d.hd_k_iters,
+            d.qkv_col_tiles,
+            EpilogueKind::Store("g.silu_out"),
+        ),
+        render_rope_kv_append_mcta(&d),
+        render_attention_mcta(&d),
+        render_gemm_mcta(
+            &d,
+            cfg,
+            "Phase 5: o_proj + residual (multi-CTA)",
+            "g.attn_out",
+            "g.o_weights",
+            d.hd_k_iters,
+            d.hd_col_tiles,
+            EpilogueKind::ResidualAdd("g.hidden_states"),
+        ),
+        render_rmsnorm_mcta(
+            &d,
+            "g.hidden_states",
+            "g.mlp_norm_weights",
+            "g.rms_gate_intermediates",
+        ),
+        // Fused gate+up: one phase, no barrier between gate and up
+        render_gemm_gate_up_mcta(
+            &d,
+            cfg,
+            "Phase 7: fused gate+up (multi-CTA)",
+            "g.rms_gate_intermediates",
+            "g.gate_weights",
+            "g.up_weights",
+            "g.silu_out",
+            d.hd_k_iters,
+            d.id_col_tiles,
+        ),
+        render_gemm_mcta(
+            &d,
+            cfg,
+            "Phase 8: down_proj + residual (multi-CTA)",
+            "g.silu_out",
+            "g.down_weights",
+            d.id_k_iters,
+            d.hd_col_tiles,
+            EpilogueKind::ResidualAdd("g.hidden_states"),
+        ),
+    ];
+
+    let mut tah = String::new();
+    emit_tensor_arg_and_globals_helper(&mut tah);
+    let mut gc = String::new();
+    emit_globals_construction(&mut gc, "    ");
+
+    let launch_wrapper = LaunchWrapperMctaCtx {
+        tensor_arg_helper: &tah,
+        launch_params: LAUNCH_PARAMS,
+        globals_construction: &gc,
+        num_threads: d.num_threads,
+        grid_size,
+    }
+    .render()
+    .expect("launch_wrapper_mcta template render");
+
+    let phase_name_list = [
+        "attn_norm",
+        "QKV_GEMM",
+        "RoPE_KV",
+        "attention",
+        "o_proj",
+        "mlp_norm",
+        "fused_gate_up",
+        "down_residual",
+    ];
+    let phase_names_str = phase_name_list[..phases.len()]
+        .iter()
+        .map(|n| format!("\"{}\"", n))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    KernelMctaCtx {
+        preamble: &preamble,
+        phases: &phases,
+        launch_wrapper: &launch_wrapper,
+        num_threads: d.num_threads,
+        phase_names_str: &phase_names_str,
+        num_phases: phases.len(),
+        grid_size,
+    }
+    .render()
+    .expect("kernel_mcta template render")
+}
+
 // ── Multi-CTA phase rendering helpers ───────────────────────────────────
 
 fn render_rmsnorm_mcta(
@@ -540,6 +674,37 @@ fn render_rope_kv_append_mcta(d: &FusedDerived) -> String {
     }
     .render()
     .expect("rope_kv_append_mcta template render")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_gemm_gate_up_mcta(
+    d: &FusedDerived,
+    cfg: &FusedPrefillConfig,
+    phase_comment: &str,
+    input_global: &str,
+    gate_weight_global: &str,
+    up_weight_global: &str,
+    output_global: &str,
+    num_k_iters: usize,
+    num_col_tiles: usize,
+) -> String {
+    let cooperative = matches!(cfg.gemm_mode, GemmMode::Cooperative);
+    GemmGateUpMctaCtx {
+        phase_comment,
+        input_global,
+        gate_weight_global,
+        up_weight_global,
+        output_global,
+        num_k_iters,
+        num_col_tiles,
+        a_size: d.a_size,
+        b_size: d.b_size,
+        stage_size: d.stage_size,
+        b_offset: d.b_offset,
+        cooperative,
+    }
+    .render()
+    .expect("gemm_gate_up_mcta template render")
 }
 
 fn render_attention_mcta(d: &FusedDerived) -> String {
@@ -636,7 +801,7 @@ mod tests {
             v2.contains("fused_prefill_layer_launch("),
             "missing mcta launch wrapper"
         );
-        assert!(v2.contains("MCTA_GRID = 128"), "missing grid size");
+        assert!(v2.contains("MCTA_MAX_GRID = 128"), "missing grid size");
         assert!(v2.contains("mcta_barrier"), "missing cross-CTA barrier");
         // Multi-CTA GEMM: tiles distributed via wu loop
         assert!(
@@ -666,6 +831,34 @@ mod tests {
     }
 
     #[test]
+    fn renders_mcta_fused_gateup_kernel() {
+        let dag = build_1b_dag();
+        let v2 =
+            generate_fused_prefill_mcta_fused_gateup(&dag, &FusedPrefillConfig::rows128(), 128);
+
+        // 8 phases instead of 9
+        assert!(v2.contains("MCTA_NUM_PHASES = 8"), "should have 8 phases");
+        // Fused gate+up marker
+        assert!(
+            v2.contains("fused gate+up"),
+            "missing fused gate+up comment"
+        );
+        // Both weight references in one phase
+        assert!(v2.contains("g.gate_weights"), "missing gate weights");
+        assert!(v2.contains("g.up_weights"), "missing up weights");
+        // SiLU epilogue inline
+        assert!(
+            v2.contains("1.f + expf(-v.x)"),
+            "missing inline SiLU in fused gate+up"
+        );
+        // Mulgate epilogue inline
+        assert!(v2.contains("mulgate"), "missing mulgate in fused gate+up");
+        // All other phases still present
+        assert!(v2.contains("g.qkv_weights"), "missing QKV");
+        assert!(v2.contains("g.down_weights"), "missing down");
+    }
+
+    #[test]
     fn dump_for_diff() {
         let dag = build_1b_dag();
         let v1 = crate::cuda_codegen::generate_fused_prefill_layer_kernel(&dag);
@@ -673,16 +866,20 @@ mod tests {
         let v2_128 = generate_fused_prefill_v2(&dag, &FusedPrefillConfig::rows128());
 
         let v2_mcta = generate_fused_prefill_mcta(&dag, &FusedPrefillConfig::rows16_col4(), 128);
+        let v2_mcta_fused =
+            generate_fused_prefill_mcta_fused_gateup(&dag, &FusedPrefillConfig::rows128(), 128);
 
         std::fs::write("/tmp/fused_v1.cu", &v1).ok();
         std::fs::write("/tmp/fused_v2_16.cu", &v2_16).ok();
         std::fs::write("/tmp/fused_v2_128.cu", &v2_128).ok();
         std::fs::write("/tmp/fused_v2_mcta.cu", &v2_mcta).ok();
+        std::fs::write("/tmp/fused_v2_mcta_fused.cu", &v2_mcta_fused).ok();
 
         eprintln!("v1: {} lines", v1.lines().count());
         eprintln!("v2_16: {} lines", v2_16.lines().count());
         eprintln!("v2_128: {} lines", v2_128.lines().count());
         eprintln!("v2_mcta: {} lines", v2_mcta.lines().count());
+        eprintln!("v2_mcta_fused: {} lines", v2_mcta_fused.lines().count());
     }
 
     // Smoke test from earlier — kept to verify askama setup

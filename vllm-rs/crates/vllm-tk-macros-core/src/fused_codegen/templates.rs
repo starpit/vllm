@@ -187,6 +187,23 @@ pub struct AttentionMctaCtx {
 }
 
 #[derive(Template)]
+#[template(path = "fused/gemm_gate_up_mcta.cu", escape = "none")]
+pub struct GemmGateUpMctaCtx<'a> {
+    pub phase_comment: &'a str,
+    pub input_global: &'a str,
+    pub gate_weight_global: &'a str,
+    pub up_weight_global: &'a str,
+    pub output_global: &'a str,
+    pub num_k_iters: usize,
+    pub num_col_tiles: usize,
+    pub a_size: usize,
+    pub b_size: usize,
+    pub stage_size: usize,
+    pub b_offset: usize,
+    pub cooperative: bool,
+}
+
+#[derive(Template)]
 #[template(path = "fused/launch_wrapper_mcta.cu", escape = "none")]
 pub struct LaunchWrapperMctaCtx<'a> {
     pub tensor_arg_helper: &'a str,

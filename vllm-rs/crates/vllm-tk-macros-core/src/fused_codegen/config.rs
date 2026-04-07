@@ -10,6 +10,8 @@ pub enum GemmMode {
     Redundant,
     /// Each warp owns 16 rows of the CTA tile; B is shared across warps.
     Cooperative,
+    /// Warp 0 is producer (loads only), warps 1..N are consumers (MMA only).
+    WarpSpecialized,
 }
 
 /// Configuration for one fused prefill kernel variant.
@@ -141,6 +143,40 @@ impl FusedPrefillConfig {
         Iters(self.cta_rows.0 / 16)
     }
 
+    /// 128-row CTA, warp-specialized producer/consumer.
+    /// Warp 0 loads, warps 1-7 compute (112 effective rows). 3-stage pipeline.
+    /// cta_rows=128 so non-GEMM phases (rmsnorm, attention) have 16 rows/warp.
+    pub fn rows112_warpspec() -> Self {
+        Self {
+            cta_rows: Dim(128), // 8 warps × 16 rows (producer warp's rows unused in GEMM)
+            gemm_mode: GemmMode::WarpSpecialized,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2), // 3 stages would need 108KB, L40S limit is 99KB
+            per_warp_b: false,
+        }
+    }
+
+    /// 64-row CTA, warp-specialized, 4 warps total.
+    /// Warp 0 loads, warps 1-3 compute (48 effective rows). 3-stage pipeline.
+    /// cta_rows=64 so non-GEMM phases have 16 rows/warp.
+    pub fn rows48_warpspec() -> Self {
+        Self {
+            cta_rows: Dim(64), // 4 warps × 16 rows (producer warp's rows unused in GEMM)
+            gemm_mode: GemmMode::WarpSpecialized,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(3),
+            per_warp_b: false,
+        }
+    }
+
     /// 64-row CTA, cooperative, per-warp B tiles (no group::sync in K-loop).
     pub fn rows64_nosync() -> Self {
         Self {
@@ -179,6 +215,22 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(3),
             per_warp_b: false,
+        }
+    }
+
+    /// 32-row CTA, 2 warps, k64, out_block=128, per-warp B, 2-stage.
+    /// Shmem: 2 × (2 × (4096 + 16384)) = 2 × 40960 = 80KB. Fits L40S.
+    pub fn rows32_wide_nosync() -> Self {
+        Self {
+            cta_rows: Dim(32),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(128),
+            num_warps: Count(2),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: true,
         }
     }
 }

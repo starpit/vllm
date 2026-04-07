@@ -84,6 +84,15 @@ impl FusedDerived {
                 let bo = num_warps * a_size;
                 (ss, num_stages * ss, bo)
             }
+            GemmMode::WarpSpecialized => {
+                // (NUM_WARPS-1) consumer A tiles + 1 shared B tile per stage
+                // Plus flags: STAGES * 2 ints at end
+                let num_consumers = num_warps - 1;
+                let ss = num_consumers * a_size + b_size;
+                let bo = num_consumers * a_size;
+                let flags_bytes = num_stages * 2 * 4; // 2 ints per stage
+                (ss, num_stages * ss + flags_bytes, bo)
+            }
         };
 
         let rmsnorm_shmem = hd * 4 + num_warps * 4;

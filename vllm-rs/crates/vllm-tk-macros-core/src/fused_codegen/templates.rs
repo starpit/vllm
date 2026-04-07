@@ -193,6 +193,22 @@ pub struct GemmMctaCtx<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "fused/gemm_warpspec_mcta.cu", escape = "none")]
+pub struct GemmWarpspecMctaCtx<'a> {
+    pub phase_comment: &'a str,
+    pub input_global: &'a str,
+    pub weight_global: &'a str,
+    pub num_k_iters: Iters,
+    pub num_col_tiles: Tiles,
+    pub a_size: Bytes,
+    pub b_size: Bytes,
+    pub stage_size: Bytes,
+    pub b_offset: Bytes,
+    pub epilogue: String,
+    pub num_stages: Count,
+}
+
+#[derive(Template)]
 #[template(path = "fused/rmsnorm_mcta.cu", escape = "none")]
 pub struct RmsNormMctaCtx<'a> {
     pub input_global: &'a str,

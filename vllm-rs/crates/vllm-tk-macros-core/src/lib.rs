@@ -205,8 +205,7 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
     let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("parse error: {e}"))?;
     let dag = parse::build_dag(&def)?;
 
-    let backend = std::env::var("TK_FUSED_PREFILL")
-        .unwrap_or_else(|_| "auto".to_string());
+    let backend = std::env::var("TK_FUSED_PREFILL").unwrap_or_else(|_| "auto".to_string());
     let cfg = match backend.as_str() {
         "auto" => return Ok(fused_codegen::generate_fused_prefill_polyalgorithm(&dag)),
         "v1" => return Ok(cuda_codegen::generate_fused_prefill_layer_kernel(&dag)),
@@ -217,68 +216,122 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
         "v2-128row" => fused_codegen::config::FusedPrefillConfig::rows128(),
         "v2-mcta" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows16_col4();
-            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, Count(128)));
+            return Ok(fused_codegen::generate_fused_prefill_mcta(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
         }
         "v2-mcta-col1" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows16();
-            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, Count(128)));
+            return Ok(fused_codegen::generate_fused_prefill_mcta(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
         }
         "v2-mcta-128row" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows128();
-            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, Count(128)));
+            return Ok(fused_codegen::generate_fused_prefill_mcta(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
         }
         "v2-mcta-128row-fused" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, Count(128),
+                &dag,
+                &cfg,
+                Count(128),
             ));
         }
         "v2-mcta-128row-wide" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows128_wide();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, Count(128),
+                &dag,
+                &cfg,
+                Count(128),
             ));
         }
         "v2-mcta-64row-k128" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_k128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, Count(128),
+                &dag,
+                &cfg,
+                Count(128),
             ));
         }
         "v2-mcta-64row-3stage" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_3stage();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, Count(128),
+                &dag,
+                &cfg,
+                Count(128),
             ));
         }
         "v2-mcta-64row-nosync" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_nosync();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, Count(128),
+                &dag,
+                &cfg,
+                Count(128),
             ));
         }
         "v2-mcta-32row-nosync-k128" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows32_nosync_k128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, Count(128),
+                &dag,
+                &cfg,
+                Count(128),
             ));
         }
         "v2-mcta-64row-wide-3stage" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_wide_3stage();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, Count(128),
+                &dag,
+                &cfg,
+                Count(128),
             ));
         }
         "v2-mcta-64row-k128-grid32" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_k128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, Count(32),
+                &dag,
+                &cfg,
+                Count(32),
+            ));
+        }
+        "v2-warpspec-112row" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows112_warpspec();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_warpspec(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-warpspec-48row" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows48_warpspec();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_warpspec(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-32row-wide-nosync" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows32_wide_nosync();
+            return Ok(fused_codegen::generate_fused_prefill_mcta(
+                &dag,
+                &cfg,
+                Count(128),
             ));
         }
         "v2-mcta-64row-k128-grid64" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_k128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, Count(64),
+                &dag,
+                &cfg,
+                Count(64),
             ));
         }
         other => {

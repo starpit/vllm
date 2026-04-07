@@ -152,7 +152,9 @@ pub struct GemmMctaCtx<'a> {
     pub a_size: usize,
     pub b_size: usize,
     pub stage_size: usize,
+    pub b_offset: usize,
     pub epilogue: String,
+    pub cooperative: bool,
     pub col_batch: usize,
 }
 

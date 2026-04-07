@@ -1,11 +1,76 @@
 {# Multi-CTA GEMM phase: tiles distributed across all CTAs.
    Variables: same as gemm.cu, but uses row_tiles (from kernel scope) and num_ctas.
    Row variable for epilogues: row_tile (not bid).
+   Modes:
+     cooperative=true: 128-row CTA, each warp owns 16 rows, B shared. Best compute intensity.
+     col_batch>1: col-distributed, each warp computes a different output col tile.
+     else: redundant mode, all warps compute same tile, warp 0 stores.
 #}
     // ════ {{ phase_comment }} ════
     {
     const int col_tiles = {{ num_col_tiles }};
-{%- if col_batch > 1 %}
+{%- if cooperative %}
+    // ── Multi-CTA cooperative: 8 warps × 16 rows = 128 rows per CTA ──
+    // row_tiles_128 = tiles of 128 rows in the sequence
+    const int rows_per_cta = PFL_CTA_ROWS;  // 128
+    const int row_tiles_coop = (q_size + rows_per_cta - 1) / rows_per_cta;
+    const int total_work = row_tiles_coop * col_tiles;
+
+    pfl_a_st &my_a_s0 = *reinterpret_cast<pfl_a_st*>(__shm + wid * {{ a_size }});
+    pfl_b_st &b_s0 = *reinterpret_cast<pfl_b_st*>(__shm + {{ b_offset }});
+    pfl_a_st &my_a_s1 = *reinterpret_cast<pfl_a_st*>(__shm + {{ stage_size }} + wid * {{ a_size }});
+    pfl_b_st &b_s1 = *reinterpret_cast<pfl_b_st*>(__shm + {{ stage_size }} + {{ b_offset }});
+    pfl_a_st *my_a_stages[2] = {&my_a_s0, &my_a_s1};
+    pfl_b_st *b_stages[2] = {&b_s0, &b_s1};
+
+    for (int wu = bid; wu < total_work; wu += num_ctas) {
+        const int coop_row_tile = wu / col_tiles;  // which 128-row block
+        const int col = wu % col_tiles;
+        // Each warp's 16-row block within the 128-row block
+        const int my_row_tile = coop_row_tile * (rows_per_cta / PFL_Q_ROWS) + wid;
+        const int my_row_valid = (coop_row_tile * rows_per_cta + wid * PFL_Q_ROWS) < q_size;
+        const int safe_row_tile = my_row_valid ? my_row_tile : 0;
+
+        pfl_acc_rt acc;
+        warp::zero(acc);
+
+        // Pre-load iter 0
+        warp::load_async(*my_a_stages[0], {{ input_global }}, {safe_row_tile, 0});
+        group<PFL_NUM_WARPS>::load_async(*b_stages[0], {{ weight_global }}, {layer, col, 0});
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+
+        for (int iter = 0; iter < {{ num_k_iters }}; iter++) {
+            int cur = iter % 2;
+            if (iter + 1 < {{ num_k_iters }}) {
+                int nxt = (iter + 1) % 2;
+                warp::load_async(*my_a_stages[nxt], {{ input_global }}, {safe_row_tile, iter + 1});
+                group<PFL_NUM_WARPS>::load_async(*b_stages[nxt], {{ weight_global }}, {layer, col, iter + 1});
+                asm volatile("cp.async.commit_group;\n" ::: "memory");
+                asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+            } else {
+                asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            }
+            pfl_a_st &a_smem = *my_a_stages[cur];
+            pfl_b_st &b_smem = *b_stages[cur];
+            group<PFL_NUM_WARPS>::sync(1);
+            rt_bf<16, PFL_K_DIM> a_reg;
+            warp::load(a_reg, a_smem);
+            pfl_b_slice_st *b_slices = reinterpret_cast<pfl_b_slice_st*>(&b_smem);
+            #pragma unroll
+            for (int n = 0; n < PFL_N_TILES; n++) {
+                rt_bf<16, PFL_K_DIM> b_n; pfl_load_b_slice(b_n, b_slices[n]);
+                warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][0], b_n.tiles[0][0], acc.tiles[0][n]);
+                #pragma unroll
+                for (int k = 1; k < a_reg.width; k++)
+                    warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);
+            }
+        }
+        if (my_row_valid) {
+            const int row_tile = my_row_tile;
+{{ epilogue }}
+        }
+    }
+{%- elif col_batch > 1 %}
     // ── Multi-CTA col-distributed: {{ col_batch }} warps compute different output cols ──
     constexpr int COL_BATCH = {{ col_batch }};
     const int col_groups = (col_tiles + COL_BATCH - 1) / COL_BATCH;

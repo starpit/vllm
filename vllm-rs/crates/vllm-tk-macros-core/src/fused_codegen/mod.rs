@@ -485,6 +485,8 @@ fn render_gemm_mcta(
     num_col_tiles: usize,
     epilogue: EpilogueKind<'_>,
 ) -> String {
+    let cooperative = matches!(cfg.gemm_mode, GemmMode::Cooperative);
+    // In cooperative mode, each warp stores its own row_tile; template sets it as local var
     let row_var = "row_tile";
 
     let epilogue_str = match epilogue {
@@ -514,7 +516,9 @@ fn render_gemm_mcta(
         a_size: d.a_size,
         b_size: d.b_size,
         stage_size: d.stage_size,
+        b_offset: d.b_offset,
         epilogue: epilogue_str,
+        cooperative,
         col_batch: cfg.col_batch,
     }
     .render()

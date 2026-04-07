@@ -721,6 +721,127 @@ fn render_attention_mcta(d: &FusedDerived) -> String {
     .expect("attention_mcta template render")
 }
 
+// ── Decode kernel generation ────────────────────────────────────────────
+
+use crate::fused_codegen::config::FusedDecodeConfig;
+use crate::fused_codegen::derived::FusedDecodeDerived;
+
+/// Generate a fused decode layer kernel using the template pipeline.
+///
+/// Row-fused architecture: each CTA owns `cta_rows` sequences and runs them
+/// through ALL phases of ALL layers. No cross-CTA barriers.
+pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String {
+    let d = FusedDecodeDerived::new(dag, cfg);
+
+    // ── Preamble ──
+    let preamble = DecodePreambleCtx {
+        cta_rows: cfg.cta_rows,
+        padded_cta_rows: d.padded_cta_rows,
+        nl: d.nl,
+        hd: d.hd,
+        id: d.id,
+        hdm: d.hdm,
+        nah: d.nah,
+        nkh: d.nkh,
+        num_warps: cfg.num_warps,
+        gqa_ratio: d.gqa_ratio,
+        kv_page_size: cfg.kv_page_size,
+        iters_per_page: d.iters_per_page,
+        peak_shmem: d.peak_shmem,
+        kv_tile_bytes: d.kv_tile_bytes,
+        k_dim: cfg.k_dim,
+        out_block: cfg.out_block,
+        hidden_shmem: d.hidden_shmem,
+        meta_shmem: d.meta_shmem,
+        num_stages: cfg.num_stages,
+    }
+    .render()
+    .expect("decode preamble render");
+
+    // ── Phases ──
+    // For now, just attn_norm as the first phase (Step 2).
+    // Subsequent steps will add GEMM, RoPE, attention, MLP phases.
+    let rdpw = d.hd / cfg.num_warps;
+
+    let phases: Vec<String> = vec![
+        // Phase 1: attn_norm (hidden_shmem → hidden_shmem, in-place)
+        render_decode_rmsnorm(
+            &d,
+            cfg,
+            "g.attn_norm_weights",
+            0,                        // input_offset: start of hidden slab
+            0,                        // output_offset: in-place
+            d.hidden_shmem,           // wgt after hidden data
+            d.hidden_shmem + d.hd * 2, // scratch after weight
+            rdpw,
+        ),
+    ];
+
+    // ── Launch wrapper ──
+    let mut tah = String::new();
+    emit_tensor_arg_and_globals_helper(&mut tah);
+    let mut gc = String::new();
+    emit_globals_construction(&mut gc, "    ");
+
+    let launch_wrapper = DecodeLaunchWrapperCtx {
+        tensor_arg_helper: &tah,
+        launch_params: LAUNCH_PARAMS,
+        globals_construction: &gc,
+        num_threads: d.num_threads,
+    }
+    .render()
+    .expect("decode launch_wrapper render");
+
+    // ── Phase names ──
+    let phase_name_list = ["attn_norm"];
+    let phase_names_str = phase_name_list[..phases.len()]
+        .iter()
+        .map(|n| format!("\"{}\"", n))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // ── Compose ──
+    DecodeKernelCtx {
+        preamble: &preamble,
+        phases: &phases,
+        launch_wrapper: &launch_wrapper,
+        num_threads: d.num_threads,
+        phase_names_str: &phase_names_str,
+        num_phases: phases.len(),
+        cta_rows: cfg.cta_rows,
+        padded_cta_rows: d.padded_cta_rows,
+        hidden_shmem: d.hidden_shmem,
+        meta_shmem: d.meta_shmem,
+    }
+    .render()
+    .expect("decode kernel render")
+}
+
+// ── Decode phase rendering helpers ──────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn render_decode_rmsnorm(
+    _d: &FusedDecodeDerived,
+    _cfg: &FusedDecodeConfig,
+    weight_global: &str,
+    input_offset: usize,
+    output_offset: usize,
+    wgt_shmem_offset: usize,
+    scratch_offset: usize,
+    rdpw: usize,
+) -> String {
+    DecodeRmsNormCtx {
+        weight_global,
+        input_offset,
+        output_offset,
+        wgt_shmem_offset,
+        scratch_offset,
+        rdpw,
+    }
+    .render()
+    .expect("decode rmsnorm render")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,11 +1000,15 @@ mod tests {
         std::fs::write("/tmp/fused_v2_mcta.cu", &v2_mcta).ok();
         std::fs::write("/tmp/fused_v2_mcta_fused.cu", &v2_mcta_fused).ok();
 
+        let dec = generate_fused_decode(&dag, &config::FusedDecodeConfig::decode_rows16());
+        std::fs::write("/tmp/fused_decode_rows16.cu", &dec).ok();
+
         eprintln!("v1: {} lines", v1.lines().count());
         eprintln!("v2_16: {} lines", v2_16.lines().count());
         eprintln!("v2_128: {} lines", v2_128.lines().count());
         eprintln!("v2_mcta: {} lines", v2_mcta.lines().count());
         eprintln!("v2_mcta_fused: {} lines", v2_mcta_fused.lines().count());
+        eprintln!("decode_rows16: {} lines", dec.lines().count());
     }
 
     // Smoke test from earlier — kept to verify askama setup
@@ -908,6 +1033,73 @@ mod tests {
     }
 
     // ── Decode config / derived tests ─────────────────────────────────
+
+    #[test]
+    fn renders_decode_rmsnorm_kernel() {
+        let dag = build_1b_dag();
+        let cfg = config::FusedDecodeConfig::decode_rows16();
+        let cuda = generate_fused_decode(&dag, &cfg);
+
+        // Kernel function
+        assert!(
+            cuda.contains("fused_decode_layer("),
+            "missing decode kernel function"
+        );
+        assert!(
+            cuda.contains("fused_decode_layer_launch("),
+            "missing decode launch wrapper"
+        );
+
+        // Decode-specific constants
+        assert!(cuda.contains("DEC_CTA_ROWS      = 16"), "wrong CTA_ROWS");
+        assert!(cuda.contains("DEC_PADDED_ROWS   = 16"), "wrong PADDED_ROWS");
+        assert!(cuda.contains("DEC_NUM_WARPS     = 8"), "wrong NUM_WARPS");
+
+        // Row-fused: no cross-CTA barriers
+        assert!(
+            !cuda.contains("mcta_barrier"),
+            "decode should NOT have cross-CTA barriers"
+        );
+
+        // Per-row metadata
+        assert!(cuda.contains("DecRowMeta"), "missing per-row metadata struct");
+        assert!(
+            cuda.contains("row_meta[r].position_id"),
+            "missing metadata load"
+        );
+
+        // Hidden states in shmem
+        assert!(
+            cuda.contains("DEC_HIDDEN_SHMEM"),
+            "missing hidden shmem constant"
+        );
+
+        // RMSNorm from shmem
+        assert!(
+            cuda.contains("g.attn_norm_weights"),
+            "missing attn_norm weight"
+        );
+        assert!(
+            cuda.contains("rms_norm_eps"),
+            "missing RMSNorm epsilon"
+        );
+        assert!(
+            cuda.contains("rsqrtf"),
+            "missing rsqrtf in RMSNorm"
+        );
+
+        // Layer loop
+        assert!(
+            cuda.contains("for (int layer = 0; layer < num_layers; layer++)"),
+            "missing layer loop"
+        );
+
+        // Final writeback
+        assert!(
+            cuda.contains("Write final hidden_states back to global"),
+            "missing final writeback"
+        );
+    }
 
     #[test]
     fn decode_derived_1b_rows16() {

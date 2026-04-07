@@ -723,7 +723,9 @@ fn render_attention_mcta(d: &FusedDerived) -> String {
 
 // ── Decode kernel generation ────────────────────────────────────────────
 
-use crate::fused_codegen::config::FusedDecodeConfig;
+use crate::fused_codegen::config::{
+    ByteSize, FusedDecodeConfig, KIters, ShmemOffset, StorageStrategy, TileCount,
+};
 use crate::fused_codegen::derived::FusedDecodeDerived;
 
 /// Generate a fused decode layer kernel using the template pipeline.
@@ -747,12 +749,12 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
         gqa_ratio: d.gqa_ratio,
         kv_page_size: cfg.kv_page_size,
         iters_per_page: d.iters_per_page,
-        peak_shmem: d.peak_shmem,
-        kv_tile_bytes: d.kv_tile_bytes,
+        peak_shmem: d.peak_shmem.0,
+        kv_tile_bytes: d.kv_tile_bytes.0,
         k_dim: cfg.k_dim,
         out_block: cfg.out_block,
-        hidden_shmem: d.hidden_shmem,
-        meta_shmem: d.meta_shmem,
+        hidden_shmem: d.hidden_shmem.0,
+        meta_shmem: d.meta_shmem.0,
         num_stages: cfg.num_stages,
     }
     .render()
@@ -765,8 +767,12 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
     //   [0 .. hidden_shmem): hidden_states slab [padded_rows, HD] BF16
     //   The rest is time-shared by different phases.
     // For attention, we reuse the hidden slab area for Q and attn_out.
-    let q_stride = d.nah * d.hdm;                // Q elements per row
-    let attn_out_stride = d.nah * d.hdm;          // same as Q
+    let q_stride = d.nah * d.hdm; // Q elements per row
+    let attn_out_stride = d.nah * d.hdm; // same as Q
+
+    let hidden_offset = ShmemOffset(0);
+    let wgt_offset = ShmemOffset(d.hidden_shmem.0);
+    let scratch_offset = ShmemOffset(d.hidden_shmem.0 + d.hd * 2);
 
     let phases: Vec<String> = vec![
         // Phase 1: attn_norm (hidden_shmem → hidden_shmem, in-place)
@@ -774,10 +780,10 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
             &d,
             cfg,
             "g.attn_norm_weights",
-            0,                        // input_offset: start of hidden slab
-            0,                        // output_offset: in-place
-            d.hidden_shmem,           // wgt after hidden data
-            d.hidden_shmem + d.hd * 2, // scratch after weight
+            hidden_offset,
+            hidden_offset,
+            wgt_offset,
+            scratch_offset,
             rdpw,
         ),
         // Phase 2: QKV GEMM (shmem activations × qkv_weights → global qkv output)
@@ -786,7 +792,7 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
             &d,
             cfg,
             "Phase 2: QKV GEMM (shmem × qkv_weights → silu_out)",
-            0,
+            hidden_offset,
             "g.qkv_weights",
             d.hd_k_iters,
             d.qkv_col_tiles,
@@ -794,9 +800,9 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
         ),
         // Phase 3: RoPE + KV cache append
         // Reads QKV from global silu_out, applies RoPE, writes K/V to cache, Q to shmem
-        render_decode_rope_kv_append(&d, 0, q_stride),
+        render_decode_rope_kv_append(&d, hidden_offset, q_stride),
         // Phase 4: Decode attention (Q from shmem, KV from cache, output to shmem)
-        render_decode_attention(&d, 0, q_stride, 0, attn_out_stride),
+        render_decode_attention(&d, hidden_offset, q_stride, hidden_offset, attn_out_stride),
         // Phase 5: o_proj + residual (attn_out from shmem × o_weights + hidden → hidden)
         // After attention, attn_out is in shmem at offset 0.
         // hidden_states were written to global at start; we need to re-read.
@@ -815,13 +821,13 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
             &d,
             cfg,
             "Phase 5: o_proj + residual (attn_out × o_weights + hidden → hidden_shmem)",
-            0, // attn_out in shmem at offset 0
+            hidden_offset,
             "g.o_weights",
             d.hd_k_iters,
             d.hd_col_tiles,
             DecodeEpilogueKind::ResidualShmem {
-                residual_offset: 0, // hidden_states slab (will be reloaded)
-                output_offset: 0,
+                residual_offset: hidden_offset,
+                output_offset: hidden_offset,
             },
         ),
         // Phase 6: mlp_norm (hidden_shmem → hidden_shmem, in-place)
@@ -829,19 +835,14 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
             &d,
             cfg,
             "g.mlp_norm_weights",
-            0,
-            0,
-            d.hidden_shmem,
-            d.hidden_shmem + d.hd * 2,
+            hidden_offset,
+            hidden_offset,
+            wgt_offset,
+            scratch_offset,
             rdpw,
         ),
         // Phase 7: Fused MLP (streaming gate+up+SiLU+down over ID tiles)
-        render_decode_fused_mlp(
-            &d,
-            cfg,
-            0,  // input: mlp_norm output (in-place at hidden slab)
-            0,  // hidden: residual from hidden_shmem
-        ),
+        render_decode_fused_mlp(&d, cfg, hidden_offset, hidden_offset),
     ];
 
     // ── Launch wrapper ──
@@ -861,8 +862,13 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
 
     // ── Phase names ──
     let phase_name_list = [
-        "attn_norm", "QKV_GEMM", "RoPE_KV", "attention",
-        "o_proj", "mlp_norm", "fused_MLP",
+        "attn_norm",
+        "QKV_GEMM",
+        "RoPE_KV",
+        "attention",
+        "o_proj",
+        "mlp_norm",
+        "fused_MLP",
     ];
     let phase_names_str = phase_name_list[..phases.len()]
         .iter()
@@ -880,11 +886,117 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
         num_phases: phases.len(),
         cta_rows: cfg.cta_rows,
         padded_cta_rows: d.padded_cta_rows,
-        hidden_shmem: d.hidden_shmem,
-        meta_shmem: d.meta_shmem,
+        hidden_shmem: d.hidden_shmem.0,
+        meta_shmem: d.meta_shmem.0,
     }
     .render()
     .expect("decode kernel render")
+}
+
+// ── DAG-driven storage assignment ──────────────────────────────────────
+
+use crate::dag::{BufferId, BufferKind};
+use std::collections::HashMap;
+
+/// Assign a `StorageStrategy` to each activation buffer in the DAG, based on
+/// the shmem budget, buffer sizes, and the polyalgorithmic rules.
+///
+/// Weights, KV cache, and metadata always get `Global`. The interesting choices
+/// are for activations:
+/// - `hidden_states` → Shmem(0), persistent across phases
+/// - Norm outputs → FusedIntoConsumer (when shmem budget doesn't allow a second slab)
+/// - QKV output → Global (too large for shmem alongside hidden)
+/// - Q after RoPE → Shmem (reuses hidden slab area since hidden is preserved elsewhere)
+/// - Attention output → Shmem (same region as Q)
+/// - MLP intermediates (gate, up, silu*up) → Register (streaming, never materialized)
+/// - hidden_states after residual → Shmem(0), overwrites previous value
+#[allow(dead_code)]
+pub fn assign_decode_storage(
+    dag: &ModelDag,
+    d: &FusedDecodeDerived,
+    _cfg: &FusedDecodeConfig,
+) -> HashMap<BufferId, StorageStrategy> {
+    let mut storage = HashMap::new();
+    let hidden_offset = ShmemOffset(0);
+    let hidden_size = d.hidden_shmem;
+
+    for (id, buf) in &dag.buffers {
+        let strategy = match buf.kind {
+            BufferKind::Weight | BufferKind::KvCache | BufferKind::Metadata => {
+                StorageStrategy::Global {
+                    accessor: format!("g.{}", id.0),
+                }
+            }
+            BufferKind::Activation => {
+                assign_activation_storage(id, buf, dag, d, hidden_offset, hidden_size)
+            }
+        };
+        storage.insert(id.clone(), strategy);
+    }
+    storage
+}
+
+/// Polyalgorithmic activation storage assignment.
+///
+/// Rules (for cta_rows=16, HD=2048):
+/// - `hidden_states`: Shmem(0) — persistent, 64KB, the primary slab
+/// - Norm outputs (`normed`, `mlp_normed`): FusedIntoConsumer — no separate buffer,
+///   inv_rms precomputed and applied during GEMM A-load. Keeps hidden in shmem.
+/// - `qkv`: Global — 3072 × 16 × 2 = 96KB, too large for shmem alongside hidden
+/// - `q_post_rope`: Shmem(0) — reuses hidden slab (hidden preserved via FusedIntoConsumer)
+/// - `attn_out`: Shmem(0) — reuses same region, feeds o_proj
+/// - `gate_out`, `up_out`, `silu_out` (MLP intermediates): Register — streaming
+/// - `mlp_out`: Shmem(0) — final result overwrites hidden slab
+#[allow(dead_code)]
+fn assign_activation_storage(
+    id: &BufferId,
+    _buf: &crate::dag::Buffer,
+    _dag: &ModelDag,
+    _d: &FusedDecodeDerived,
+    hidden_offset: ShmemOffset,
+    hidden_size: ByteSize,
+) -> StorageStrategy {
+    match id.0.as_str() {
+        // Primary hidden state slab — persistent in shmem
+        "hidden_states" | "hidden_post_attn" | "hidden_post_mlp" => StorageStrategy::Shmem {
+            offset: hidden_offset,
+            size: hidden_size,
+        },
+
+        // Norm outputs — fused into the consuming GEMM's A-load
+        "normed" | "mlp_normed" => StorageStrategy::FusedIntoConsumer,
+
+        // QKV projection output — too large for shmem, goes to global
+        "qkv" => StorageStrategy::Global {
+            accessor: "g.silu_out".into(),
+        },
+
+        // Q after RoPE — lives in shmem, reuses hidden slab region
+        // (hidden is preserved because norm is FusedIntoConsumer)
+        "q_post_rope" => StorageStrategy::Shmem {
+            offset: hidden_offset,
+            size: hidden_size,
+        },
+
+        // Attention output — same shmem region as Q (Q consumed before attn writes)
+        "attn_out" => StorageStrategy::Shmem {
+            offset: hidden_offset,
+            size: hidden_size,
+        },
+
+        // K/V outputs go to paged cache (global)
+        "k_out" | "v_out" => StorageStrategy::Global {
+            accessor: "g.kv_cache".into(),
+        },
+
+        // MLP intermediates — streaming in registers, never materialized
+        "gate_out" | "up_out" | "silu_mul_out" => StorageStrategy::Register,
+
+        // Fallback: anything else goes to global
+        other => StorageStrategy::Global {
+            accessor: format!("g.{other}"),
+        },
+    }
 }
 
 // ── Decode phase rendering helpers ──────────────────────────────────────
@@ -894,18 +1006,18 @@ fn render_decode_rmsnorm(
     _d: &FusedDecodeDerived,
     _cfg: &FusedDecodeConfig,
     weight_global: &str,
-    input_offset: usize,
-    output_offset: usize,
-    wgt_shmem_offset: usize,
-    scratch_offset: usize,
+    input_offset: ShmemOffset,
+    output_offset: ShmemOffset,
+    wgt_shmem_offset: ShmemOffset,
+    scratch_offset: ShmemOffset,
     rdpw: usize,
 ) -> String {
     DecodeRmsNormCtx {
         weight_global,
-        input_offset,
-        output_offset,
-        wgt_shmem_offset,
-        scratch_offset,
+        input_offset: input_offset.0,
+        output_offset: output_offset.0,
+        wgt_shmem_offset: wgt_shmem_offset.0,
+        scratch_offset: scratch_offset.0,
         rdpw,
     }
     .render()
@@ -913,14 +1025,14 @@ fn render_decode_rmsnorm(
 }
 
 enum DecodeEpilogueKind<'a> {
-    /// Store to shmem slab (offset, stride).
-    StoreShmem(usize, usize),
+    /// Store to shmem slab (offset, stride in elements).
+    StoreShmem(ShmemOffset, usize),
     /// Store to global.
     StoreGlobal(&'a str),
     /// Add residual from shmem, write to shmem.
     ResidualShmem {
-        residual_offset: usize,
-        output_offset: usize,
+        residual_offset: ShmemOffset,
+        output_offset: ShmemOffset,
     },
 }
 
@@ -929,27 +1041,27 @@ fn render_decode_gemm(
     d: &FusedDecodeDerived,
     cfg: &FusedDecodeConfig,
     phase_comment: &str,
-    input_shmem_offset: usize,
+    input_shmem_offset: ShmemOffset,
     weight_global: &str,
-    num_k_iters: usize,
-    num_col_tiles: usize,
+    num_k_iters: KIters,
+    num_col_tiles: TileCount,
     epilogue: DecodeEpilogueKind<'_>,
 ) -> String {
     let epilogue_str = match epilogue {
         DecodeEpilogueKind::StoreShmem(offset, stride) => DecodeEpilogueStoreShmemCtx {
-            output_shmem_offset: offset,
+            output_shmem_offset: offset.0,
             output_stride: stride,
             col_var: "col",
-            a_size: d.a_size,
-            b_size: d.b_size,
+            a_size: d.a_size.0,
+            b_size: d.b_size.0,
         }
         .render()
         .expect("decode epilogue store shmem"),
         DecodeEpilogueKind::StoreGlobal(output) => DecodeEpilogueStoreGlobalCtx {
             output_global: output,
             col_var: "col",
-            a_size: d.a_size,
-            b_size: d.b_size,
+            a_size: d.a_size.0,
+            b_size: d.b_size.0,
         }
         .render()
         .expect("decode epilogue store global"),
@@ -957,11 +1069,11 @@ fn render_decode_gemm(
             residual_offset,
             output_offset,
         } => DecodeEpilogueResidualShmemCtx {
-            residual_shmem_offset: residual_offset,
-            output_shmem_offset: output_offset,
+            residual_shmem_offset: residual_offset.0,
+            output_shmem_offset: output_offset.0,
             col_var: "col",
-            a_size: d.a_size,
-            b_size: d.b_size,
+            a_size: d.a_size.0,
+            b_size: d.b_size.0,
         }
         .render()
         .expect("decode epilogue residual shmem"),
@@ -969,14 +1081,14 @@ fn render_decode_gemm(
 
     DecodeGemmCtx {
         phase_comment,
-        input_shmem_offset,
+        input_shmem_offset: input_shmem_offset.0,
         weight_global,
-        num_k_iters,
-        num_col_tiles,
-        a_size: d.a_size,
-        b_size: d.b_size,
-        stage_size: d.stage_size,
-        b_offset: d.b_offset,
+        num_k_iters: num_k_iters.0,
+        num_col_tiles: num_col_tiles.0,
+        a_size: d.a_size.0,
+        b_size: d.b_size.0,
+        stage_size: d.stage_size.0,
+        b_offset: d.b_offset.0,
         num_stages: cfg.num_stages,
         epilogue: epilogue_str,
     }
@@ -986,7 +1098,7 @@ fn render_decode_gemm(
 
 fn render_decode_rope_kv_append(
     d: &FusedDecodeDerived,
-    q_output_shmem_offset: usize,
+    q_output_shmem_offset: ShmemOffset,
     q_output_stride: usize,
 ) -> String {
     let q_end = d.nah * d.hdm;
@@ -1000,7 +1112,7 @@ fn render_decode_rope_kv_append(
         k_start,
         v_start,
         kv_elems,
-        q_output_shmem_offset,
+        q_output_shmem_offset: q_output_shmem_offset.0,
         q_output_stride,
     }
     .render()
@@ -1009,17 +1121,17 @@ fn render_decode_rope_kv_append(
 
 fn render_decode_attention(
     d: &FusedDecodeDerived,
-    q_shmem_offset: usize,
+    q_shmem_offset: ShmemOffset,
     q_stride: usize,
-    output_shmem_offset: usize,
+    output_shmem_offset: ShmemOffset,
     output_stride: usize,
 ) -> String {
     DecodeAttentionCtx {
         nkh: d.nkh,
         nah: d.nah,
-        q_shmem_offset,
+        q_shmem_offset: q_shmem_offset.0,
         q_stride,
-        output_shmem_offset,
+        output_shmem_offset: output_shmem_offset.0,
         output_stride,
     }
     .render()
@@ -1029,20 +1141,22 @@ fn render_decode_attention(
 fn render_decode_fused_mlp(
     d: &FusedDecodeDerived,
     cfg: &FusedDecodeConfig,
-    input_shmem_offset: usize,
-    hidden_shmem_offset: usize,
+    input_shmem_offset: ShmemOffset,
+    hidden_shmem_offset: ShmemOffset,
 ) -> String {
     DecodeFusedMlpCtx {
-        input_shmem_offset,
-        hidden_shmem_offset,
+        input_shmem_offset: input_shmem_offset.0,
+        hidden_shmem_offset: hidden_shmem_offset.0,
         gate_weight_global: "g.gate_weights",
         up_weight_global: "g.up_weights",
         down_weight_global: "g.down_weights",
-        hd_k_iters: d.hd_k_iters,
-        id_col_tiles: d.id_col_tiles,
-        a_size: d.a_size,
-        b_size: d.b_size,
+        hd_k_iters: d.hd_k_iters.0,
+        id_col_tiles: d.id_col_tiles.0,
+        a_size: d.a_size.0,
+        b_size: d.b_size.0,
         num_stages: cfg.num_stages,
+        hd: d.hd,
+        id: d.id,
     }
     .render()
     .expect("decode fused_mlp render")
@@ -1268,7 +1382,10 @@ mod tests {
         );
 
         // Per-row metadata
-        assert!(cuda.contains("DecRowMeta"), "missing per-row metadata struct");
+        assert!(
+            cuda.contains("DecRowMeta"),
+            "missing per-row metadata struct"
+        );
         assert!(
             cuda.contains("row_meta[r].position_id"),
             "missing metadata load"
@@ -1285,14 +1402,8 @@ mod tests {
             cuda.contains("g.attn_norm_weights"),
             "missing attn_norm weight"
         );
-        assert!(
-            cuda.contains("rms_norm_eps"),
-            "missing RMSNorm epsilon"
-        );
-        assert!(
-            cuda.contains("rsqrtf"),
-            "missing rsqrtf in RMSNorm"
-        );
+        assert!(cuda.contains("rms_norm_eps"), "missing RMSNorm epsilon");
+        assert!(cuda.contains("rsqrtf"), "missing rsqrtf in RMSNorm");
 
         // QKV GEMM
         assert!(cuda.contains("g.qkv_weights"), "missing QKV weight");
@@ -1361,13 +1472,13 @@ mod tests {
 
         // Shmem
         let hidden = 16 * 2048 * 2; // 65536
-        assert_eq!(d.hidden_shmem, hidden);
+        assert_eq!(d.hidden_shmem.0, hidden);
 
         // Peak must fit in sm89
         assert!(
-            d.peak_shmem <= config::SM89_MAX_SHMEM,
+            d.peak_shmem.0 <= config::SM89_MAX_SHMEM,
             "peak_shmem {} exceeds sm89 limit {}",
-            d.peak_shmem,
+            d.peak_shmem.0,
             config::SM89_MAX_SHMEM,
         );
     }
@@ -1379,7 +1490,7 @@ mod tests {
         let d = derived::FusedDecodeDerived::new(&dag, &cfg);
         assert_eq!(d.cta_rows, 4);
         assert_eq!(d.padded_cta_rows, 16); // rounds up to 16
-        assert!(d.peak_shmem <= config::SM89_MAX_SHMEM);
+        assert!(d.peak_shmem.0 <= config::SM89_MAX_SHMEM);
     }
 
     #[test]
@@ -1389,6 +1500,34 @@ mod tests {
         let d = derived::FusedDecodeDerived::new(&dag, &cfg);
         assert_eq!(d.cta_rows, 1);
         assert_eq!(d.padded_cta_rows, 16);
-        assert!(d.peak_shmem <= config::SM89_MAX_SHMEM);
+        assert!(d.peak_shmem.0 <= config::SM89_MAX_SHMEM);
+    }
+
+    #[test]
+    fn assign_storage_hidden_in_shmem() {
+        let dag = build_1b_dag();
+        let cfg = config::FusedDecodeConfig::decode_rows16();
+        let d = derived::FusedDecodeDerived::new(&dag, &cfg);
+        let storage = assign_decode_storage(&dag, &d, &cfg);
+
+        // hidden_states must be in shmem at offset 0
+        let hs = &storage[&BufferId("hidden_states".into())];
+        assert!(
+            matches!(hs, StorageStrategy::Shmem { offset, .. } if offset.0 == 0),
+            "hidden_states must be Shmem(0), got {hs:?}"
+        );
+
+        // Norm outputs must be FusedIntoConsumer (shmem budget too tight for second slab)
+        if let Some(normed) = storage.get(&BufferId("normed".into())) {
+            assert_eq!(*normed, StorageStrategy::FusedIntoConsumer);
+        }
+
+        // QKV must be global (too large for shmem)
+        if let Some(qkv) = storage.get(&BufferId("qkv".into())) {
+            assert!(
+                matches!(qkv, StorageStrategy::Global { .. }),
+                "qkv must be Global"
+            );
+        }
     }
 }

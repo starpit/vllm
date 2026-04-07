@@ -1,6 +1,83 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Configuration for fused prefill and decode kernels.
 
+// ── Newtypes for type-safe shmem/GEMM arithmetic ──────────────────────
+
+/// Byte offset into shared memory. `ShmemOffset + ByteSize = ShmemOffset`, but
+/// `ShmemOffset + ShmemOffset` is a compile error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShmemOffset(pub usize);
+
+/// Size in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ByteSize(pub usize);
+
+/// Number of output column tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileCount(pub usize);
+
+/// Number of K-loop iterations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KIters(pub usize);
+
+// Arithmetic: ShmemOffset + ByteSize = ShmemOffset
+impl std::ops::Add<ByteSize> for ShmemOffset {
+    type Output = ShmemOffset;
+    fn add(self, rhs: ByteSize) -> ShmemOffset {
+        ShmemOffset(self.0 + rhs.0)
+    }
+}
+
+// ByteSize + ByteSize = ByteSize
+impl std::ops::Add for ByteSize {
+    type Output = ByteSize;
+    fn add(self, rhs: ByteSize) -> ByteSize {
+        ByteSize(self.0 + rhs.0)
+    }
+}
+
+// ByteSize * usize = ByteSize (for `num_stages * b_size`)
+impl std::ops::Mul<usize> for ByteSize {
+    type Output = ByteSize;
+    fn mul(self, rhs: usize) -> ByteSize {
+        ByteSize(self.0 * rhs)
+    }
+}
+
+impl std::ops::Mul<ByteSize> for usize {
+    type Output = ByteSize;
+    fn mul(self, rhs: ByteSize) -> ByteSize {
+        ByteSize(self * rhs.0)
+    }
+}
+
+// Comparison helpers for shmem budget checks
+impl ByteSize {
+    pub fn max(self, other: ByteSize) -> ByteSize {
+        ByteSize(self.0.max(other.0))
+    }
+}
+
+// ── Storage strategy (polyalgorithmic choice per DAG buffer) ──────────
+
+/// How an activation buffer is stored between producer and consumer phases.
+///
+/// The DAG emitter assigns a `StorageStrategy` to each inter-op buffer based on
+/// the shmem budget, buffer size, and consumer count. "Fusion" is an emergent
+/// property: adjacent ops sharing shmem or registers get optimized by nvcc+ptxas.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StorageStrategy {
+    /// Lives in shared memory at a fixed offset. Persists until overwritten.
+    Shmem { offset: ShmemOffset, size: ByteSize },
+    /// Lives in registers (only valid for single-consumer, small buffers).
+    Register,
+    /// Lives in global memory (unavoidable for KV cache, large intermediates).
+    Global { accessor: String },
+    /// Output is computed on-the-fly by the consumer (e.g., norm fused into GEMM A-load).
+    /// Only valid when there's exactly one consumer and the transform is element-wise.
+    FusedIntoConsumer,
+}
+
 /// GEMM parallelism strategy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GemmMode {

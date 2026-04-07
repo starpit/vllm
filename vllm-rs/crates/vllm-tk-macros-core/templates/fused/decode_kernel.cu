@@ -38,7 +38,7 @@ fused_decode_layer(const globals g, int batch_size, int num_layers) {
     // ── Load per-row metadata into shmem (once, before layer loop) ──
     if (wid == 0) {
         for (int r = lid; r < my_rows; r += 32) {
-            row_meta[r].position_id    = g.decode_positions[{row_start + r}];
+            row_meta[r].position_id    = g.position_ids[{row_start + r}];
             row_meta[r].kv_indptr_start = g.decode_kv_indptr[{row_start + r}];
             row_meta[r].kv_indptr_end   = g.decode_kv_indptr[{row_start + r + 1}];
             row_meta[r].kv_last_page_len = g.decode_kv_last_page_len[{row_start + r}];

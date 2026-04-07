@@ -185,6 +185,8 @@ pub fn generate_fused_prefill_kernel(dsl: &str) -> Result<String, String> {
     Ok(cuda_codegen::generate_fused_prefill_kernel(&dag))
 }
 
+use fused_codegen::units::Count;
+
 /// Generate a fused single-layer prefill kernel (no KVM protocol).
 ///
 /// Full layer: attn_norm → QKV GEMM → attention → o_proj+residual → MLP block.
@@ -215,68 +217,68 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
         "v2-128row" => fused_codegen::config::FusedPrefillConfig::rows128(),
         "v2-mcta" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows16_col4();
-            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, 128));
+            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, Count(128)));
         }
         "v2-mcta-col1" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows16();
-            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, 128));
+            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, Count(128)));
         }
         "v2-mcta-128row" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows128();
-            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, 128));
+            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, Count(128)));
         }
         "v2-mcta-128row-fused" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, 128,
+                &dag, &cfg, Count(128),
             ));
         }
         "v2-mcta-128row-wide" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows128_wide();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, 128,
+                &dag, &cfg, Count(128),
             ));
         }
         "v2-mcta-64row-k128" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_k128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, 128,
+                &dag, &cfg, Count(128),
             ));
         }
         "v2-mcta-64row-3stage" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_3stage();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, 128,
+                &dag, &cfg, Count(128),
             ));
         }
         "v2-mcta-64row-nosync" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_nosync();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, 128,
+                &dag, &cfg, Count(128),
             ));
         }
         "v2-mcta-32row-nosync-k128" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows32_nosync_k128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, 128,
+                &dag, &cfg, Count(128),
             ));
         }
         "v2-mcta-64row-wide-3stage" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_wide_3stage();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, 128,
+                &dag, &cfg, Count(128),
             ));
         }
         "v2-mcta-64row-k128-grid32" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_k128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, 32,
+                &dag, &cfg, Count(32),
             ));
         }
         "v2-mcta-64row-k128-grid64" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows64_k128();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
-                &dag, &cfg, 64,
+                &dag, &cfg, Count(64),
             ));
         }
         other => {

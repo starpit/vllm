@@ -7,34 +7,36 @@
 
 use askama::Template;
 
+use super::units::{Bytes, Count, Dim, Iters, Tiles};
+
 // ── Preamble (split for polyalgorithm) ──────────────────────────────────
 
 #[derive(Template)]
 #[template(path = "fused/preamble_header.cu", escape = "none")]
 pub struct PreambleHeaderCtx<'a> {
     pub mode_label: &'a str,
-    pub nl: usize,
-    pub hd: usize,
-    pub id: usize,
-    pub hdm: usize,
-    pub nah: usize,
-    pub nkh: usize,
+    pub nl: Count,
+    pub hd: Dim,
+    pub id: Dim,
+    pub hdm: Dim,
+    pub nah: Count,
+    pub nkh: Count,
 }
 
 #[derive(Template)]
 #[template(path = "fused/preamble_constants.cu", escape = "none")]
 pub struct PreambleConstantsCtx {
-    pub cta_rows: usize,
-    pub num_warps: usize,
-    pub gqa_ratio: usize,
-    pub kv_page_size: usize,
-    pub iters_per_page: usize,
-    pub total_shmem: usize,
-    pub kv_tile_bytes: usize,
-    pub k_dim: usize,
-    pub out_block: usize,
-    pub rdpw: usize,
-    pub hdm: usize,
+    pub cta_rows: Dim,
+    pub num_warps: Count,
+    pub gqa_ratio: Count,
+    pub kv_page_size: Dim,
+    pub iters_per_page: Iters,
+    pub total_shmem: Bytes,
+    pub kv_tile_bytes: Bytes,
+    pub k_dim: Dim,
+    pub out_block: Dim,
+    pub rdpw: Count,
+    pub hdm: Dim,
 }
 
 // ── Preamble (combined, used by non-polyalgorithm paths) ────────────────
@@ -43,22 +45,22 @@ pub struct PreambleConstantsCtx {
 #[template(path = "fused/preamble.cu", escape = "none")]
 pub struct PreambleCtx<'a> {
     pub mode_label: &'a str,
-    pub cta_rows: usize,
-    pub nl: usize,
-    pub hd: usize,
-    pub id: usize,
-    pub hdm: usize,
-    pub nah: usize,
-    pub nkh: usize,
-    pub num_warps: usize,
-    pub gqa_ratio: usize,
-    pub kv_page_size: usize,
-    pub iters_per_page: usize,
-    pub total_shmem: usize,
-    pub kv_tile_bytes: usize,
-    pub k_dim: usize,
-    pub out_block: usize,
-    pub rdpw: usize,
+    pub cta_rows: Dim,
+    pub nl: Count,
+    pub hd: Dim,
+    pub id: Dim,
+    pub hdm: Dim,
+    pub nah: Count,
+    pub nkh: Count,
+    pub num_warps: Count,
+    pub gqa_ratio: Count,
+    pub kv_page_size: Dim,
+    pub iters_per_page: Iters,
+    pub total_shmem: Bytes,
+    pub kv_tile_bytes: Bytes,
+    pub k_dim: Dim,
+    pub out_block: Dim,
+    pub rdpw: Count,
 }
 
 // ── RMSNorm ─────────────────────────────────────────────────────────────
@@ -69,8 +71,8 @@ pub struct RmsNormCtx<'a> {
     pub input_global: &'a str,
     pub weight_global: &'a str,
     pub output_global: &'a str,
-    pub wgt_offset: usize,
-    pub scratch_offset: usize,
+    pub wgt_offset: Bytes,
+    pub scratch_offset: Bytes,
 }
 
 // ── GEMM phase ──────────────────────────────────────────────────────────
@@ -81,15 +83,15 @@ pub struct GemmCtx<'a> {
     pub phase_comment: &'a str,
     pub input_global: &'a str,
     pub weight_global: &'a str,
-    pub num_k_iters: usize,
-    pub num_col_tiles: usize,
-    pub a_size: usize,
-    pub b_size: usize,
-    pub stage_size: usize,
-    pub b_offset: usize,
+    pub num_k_iters: Iters,
+    pub num_col_tiles: Tiles,
+    pub a_size: Bytes,
+    pub b_size: Bytes,
+    pub stage_size: Bytes,
+    pub b_offset: Bytes,
     pub epilogue: String,
     pub cooperative: bool,
-    pub col_batch: usize,
+    pub col_batch: Tiles,
 }
 
 // ── Epilogue variants ───────────────────────────────────────────────────
@@ -127,11 +129,11 @@ pub struct EpilogueMulGateCtx<'a> {
 #[derive(Template)]
 #[template(path = "fused/rope_kv_append.cu", escape = "none")]
 pub struct RopeKvAppendCtx {
-    pub hdm: usize,
-    pub q_end: usize,
-    pub k_start: usize,
-    pub v_start: usize,
-    pub kv_elems: usize,
+    pub hdm: Dim,
+    pub q_end: Dim,
+    pub k_start: Dim,
+    pub v_start: Dim,
+    pub kv_elems: Dim,
 }
 
 // ── Attention ───────────────────────────────────────────────────────────
@@ -139,10 +141,10 @@ pub struct RopeKvAppendCtx {
 #[derive(Template)]
 #[template(path = "fused/attention.cu", escape = "none")]
 pub struct AttentionCtx {
-    pub attn_passes: usize,
-    pub nkh: usize,
-    pub nah: usize,
-    pub stage_sz: usize,
+    pub attn_passes: Iters,
+    pub nkh: Count,
+    pub nah: Count,
+    pub stage_sz: Bytes,
 }
 
 // ── Launch wrapper ──────────────────────────────────────────────────────
@@ -153,7 +155,7 @@ pub struct LaunchWrapperCtx<'a> {
     pub tensor_arg_helper: &'a str,
     pub launch_params: &'a str,
     pub globals_construction: &'a str,
-    pub num_threads: usize,
+    pub num_threads: Count,
 }
 
 // ── Top-level kernel ────────────────────────────────────────────────────
@@ -164,7 +166,7 @@ pub struct KernelCtx<'a> {
     pub preamble: &'a str,
     pub phases: &'a [String],
     pub launch_wrapper: &'a str,
-    pub num_threads: usize,
+    pub num_threads: Count,
     pub phase_names_str: &'a str,
     pub num_phases: usize,
 }
@@ -177,16 +179,16 @@ pub struct GemmMctaCtx<'a> {
     pub phase_comment: &'a str,
     pub input_global: &'a str,
     pub weight_global: &'a str,
-    pub num_k_iters: usize,
-    pub num_col_tiles: usize,
-    pub a_size: usize,
-    pub b_size: usize,
-    pub stage_size: usize,
-    pub b_offset: usize,
+    pub num_k_iters: Iters,
+    pub num_col_tiles: Tiles,
+    pub a_size: Bytes,
+    pub b_size: Bytes,
+    pub stage_size: Bytes,
+    pub b_offset: Bytes,
     pub epilogue: String,
     pub cooperative: bool,
-    pub col_batch: usize,
-    pub num_stages: usize,
+    pub col_batch: Tiles,
+    pub num_stages: Count,
     pub per_warp_b: bool,
 }
 
@@ -196,26 +198,26 @@ pub struct RmsNormMctaCtx<'a> {
     pub input_global: &'a str,
     pub weight_global: &'a str,
     pub output_global: &'a str,
-    pub wgt_offset: usize,
-    pub scratch_offset: usize,
+    pub wgt_offset: Bytes,
+    pub scratch_offset: Bytes,
 }
 
 #[derive(Template)]
 #[template(path = "fused/rope_kv_append_mcta.cu", escape = "none")]
 pub struct RopeKvAppendMctaCtx {
-    pub hdm: usize,
-    pub q_end: usize,
-    pub k_start: usize,
-    pub v_start: usize,
-    pub kv_elems: usize,
+    pub hdm: Dim,
+    pub q_end: Dim,
+    pub k_start: Dim,
+    pub v_start: Dim,
+    pub kv_elems: Dim,
 }
 
 #[derive(Template)]
 #[template(path = "fused/attention_mcta.cu", escape = "none")]
 pub struct AttentionMctaCtx {
-    pub nkh: usize,
-    pub nah: usize,
-    pub stage_sz: usize,
+    pub nkh: Count,
+    pub nah: Count,
+    pub stage_sz: Bytes,
 }
 
 #[derive(Template)]
@@ -226,14 +228,14 @@ pub struct GemmGateUpMctaCtx<'a> {
     pub gate_weight_global: &'a str,
     pub up_weight_global: &'a str,
     pub output_global: &'a str,
-    pub num_k_iters: usize,
-    pub num_col_tiles: usize,
-    pub a_size: usize,
-    pub b_size: usize,
-    pub stage_size: usize,
-    pub b_offset: usize,
+    pub num_k_iters: Iters,
+    pub num_col_tiles: Tiles,
+    pub a_size: Bytes,
+    pub b_size: Bytes,
+    pub stage_size: Bytes,
+    pub b_offset: Bytes,
     pub cooperative: bool,
-    pub num_stages: usize,
+    pub num_stages: Count,
     pub per_warp_b: bool,
 }
 
@@ -243,17 +245,17 @@ pub struct LaunchWrapperMctaCtx<'a> {
     pub tensor_arg_helper: &'a str,
     pub launch_params: &'a str,
     pub globals_construction: &'a str,
-    pub num_threads: usize,
-    pub grid_size: usize,
-    pub id_col_tiles: usize,
+    pub num_threads: Count,
+    pub grid_size: Count,
+    pub id_col_tiles: Tiles,
     pub kernel_suffix: &'a str,
 }
 
 #[derive(Template)]
 #[template(path = "fused/launch_inner_mcta.cu", escape = "none")]
 pub struct LaunchInnerMctaCtx<'a> {
-    pub num_threads: usize,
-    pub id_col_tiles: usize,
+    pub num_threads: Count,
+    pub id_col_tiles: Tiles,
     pub kernel_suffix: &'a str,
 }
 
@@ -271,9 +273,9 @@ pub struct KernelMctaCtx<'a> {
     pub preamble: &'a str,
     pub phases: &'a [String],
     pub launch_wrapper: &'a str,
-    pub num_threads: usize,
+    pub num_threads: Count,
     pub phase_names_str: &'a str,
     pub num_phases: usize,
-    pub grid_size: usize,
+    pub grid_size: Count,
     pub kernel_suffix: &'a str,
 }

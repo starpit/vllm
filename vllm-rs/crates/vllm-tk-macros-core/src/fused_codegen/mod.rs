@@ -14,6 +14,7 @@
 pub mod config;
 mod derived;
 mod templates;
+pub mod units;
 
 use askama::Template;
 
@@ -24,6 +25,7 @@ use crate::dag::ModelDag;
 use crate::fused_codegen::config::{FusedPrefillConfig, GemmMode};
 use crate::fused_codegen::derived::FusedDerived;
 use crate::fused_codegen::templates::*;
+use crate::fused_codegen::units::{Bytes, Count, Dim, Iters, Tiles};
 
 /// Generate a fused prefill layer kernel using the template pipeline.
 pub fn generate_fused_prefill_v2(dag: &ModelDag, cfg: &FusedPrefillConfig) -> String {
@@ -201,8 +203,8 @@ fn render_rmsnorm(
         input_global,
         weight_global,
         output_global,
-        wgt_offset: d.hd * 2,
-        scratch_offset: d.hd * 4,
+        wgt_offset: Bytes(d.hd.0 * 2),
+        scratch_offset: Bytes(d.hd.0 * 4),
     }
     .render()
     .expect("rmsnorm template render")
@@ -215,8 +217,8 @@ fn render_gemm(
     phase_comment: &str,
     input_global: &str,
     weight_global: &str,
-    num_k_iters: usize,
-    num_col_tiles: usize,
+    num_k_iters: Iters,
+    num_col_tiles: Tiles,
     epilogue: EpilogueKind<'_>,
 ) -> String {
     let cooperative = matches!(cfg.gemm_mode, GemmMode::Cooperative);
@@ -259,17 +261,17 @@ fn render_gemm(
 }
 
 fn render_rope_kv_append(d: &FusedDerived) -> String {
-    let q_end = d.nah * d.hdm;
+    let q_end = d.nah.0 * d.hdm.0;
     let k_start = q_end;
-    let k_end = q_end + d.nkh * d.hdm;
+    let k_end = q_end + d.nkh.0 * d.hdm.0;
     let v_start = k_end;
-    let kv_elems = d.nkh * d.hdm;
+    let kv_elems = d.nkh.0 * d.hdm.0;
     RopeKvAppendCtx {
         hdm: d.hdm,
-        q_end,
-        k_start,
-        v_start,
-        kv_elems,
+        q_end: Dim(q_end),
+        k_start: Dim(k_start),
+        v_start: Dim(v_start),
+        kv_elems: Dim(kv_elems),
     }
     .render()
     .expect("rope_kv_append template render")
@@ -280,7 +282,7 @@ fn render_attention(d: &FusedDerived, cfg: &FusedPrefillConfig) -> String {
         attn_passes: cfg.attn_passes(),
         nkh: d.nkh,
         nah: d.nah,
-        stage_sz: d.kv_tile_bytes * 2,
+        stage_sz: Bytes(d.kv_tile_bytes.0 * 2),
     }
     .render()
     .expect("attention template render")
@@ -303,7 +305,7 @@ enum EpilogueKind<'a> {
 pub fn generate_fused_prefill_mcta(
     dag: &ModelDag,
     cfg: &FusedPrefillConfig,
-    grid_size: usize,
+    grid_size: Count,
 ) -> String {
     let d = FusedDerived::new(dag, cfg);
 
@@ -462,7 +464,7 @@ pub fn generate_fused_prefill_mcta(
 pub fn generate_fused_prefill_mcta_fused_gateup(
     dag: &ModelDag,
     cfg: &FusedPrefillConfig,
-    grid_size: usize,
+    grid_size: Count,
 ) -> String {
     let d = FusedDerived::new(dag, cfg);
 
@@ -606,7 +608,7 @@ pub fn generate_fused_prefill_mcta_fused_gateup(
 /// and type aliases. A single `fused_prefill_layer_launch` dispatches based on
 /// `num_prefill_tokens`.
 pub fn generate_fused_prefill_polyalgorithm(dag: &ModelDag) -> String {
-    let grid_size = 128;
+    let grid_size = Count(128);
 
     // Three winning configs (L40S benchmarks, LLaMA 1B, 16 layers)
     let variants: Vec<(&str, FusedPrefillConfig)> = vec![
@@ -761,8 +763,8 @@ fn render_rmsnorm_mcta(
         input_global,
         weight_global,
         output_global,
-        wgt_offset: d.hd * 2,
-        scratch_offset: d.hd * 4,
+        wgt_offset: Bytes(d.hd.0 * 2),
+        scratch_offset: Bytes(d.hd.0 * 4),
     }
     .render()
     .expect("rmsnorm_mcta template render")
@@ -775,8 +777,8 @@ fn render_gemm_mcta(
     phase_comment: &str,
     input_global: &str,
     weight_global: &str,
-    num_k_iters: usize,
-    num_col_tiles: usize,
+    num_k_iters: Iters,
+    num_col_tiles: Tiles,
     epilogue: EpilogueKind<'_>,
 ) -> String {
     let cooperative = matches!(cfg.gemm_mode, GemmMode::Cooperative);
@@ -822,17 +824,17 @@ fn render_gemm_mcta(
 }
 
 fn render_rope_kv_append_mcta(d: &FusedDerived) -> String {
-    let q_end = d.nah * d.hdm;
+    let q_end = d.nah.0 * d.hdm.0;
     let k_start = q_end;
-    let k_end = q_end + d.nkh * d.hdm;
+    let k_end = q_end + d.nkh.0 * d.hdm.0;
     let v_start = k_end;
-    let kv_elems = d.nkh * d.hdm;
+    let kv_elems = d.nkh.0 * d.hdm.0;
     RopeKvAppendMctaCtx {
         hdm: d.hdm,
-        q_end,
-        k_start,
-        v_start,
-        kv_elems,
+        q_end: Dim(q_end),
+        k_start: Dim(k_start),
+        v_start: Dim(v_start),
+        kv_elems: Dim(kv_elems),
     }
     .render()
     .expect("rope_kv_append_mcta template render")
@@ -847,8 +849,8 @@ fn render_gemm_gate_up_mcta(
     gate_weight_global: &str,
     up_weight_global: &str,
     output_global: &str,
-    num_k_iters: usize,
-    num_col_tiles: usize,
+    num_k_iters: Iters,
+    num_col_tiles: Tiles,
 ) -> String {
     let cooperative = matches!(cfg.gemm_mode, GemmMode::Cooperative);
     GemmGateUpMctaCtx {
@@ -875,7 +877,7 @@ fn render_attention_mcta(d: &FusedDerived) -> String {
     AttentionMctaCtx {
         nkh: d.nkh,
         nah: d.nah,
-        stage_sz: d.kv_tile_bytes * 2,
+        stage_sz: Bytes(d.kv_tile_bytes.0 * 2),
     }
     .render()
     .expect("attention_mcta template render")
@@ -958,7 +960,7 @@ mod tests {
     #[test]
     fn renders_mcta_kernel() {
         let dag = build_1b_dag();
-        let v2 = generate_fused_prefill_mcta(&dag, &FusedPrefillConfig::rows16_col4(), 128);
+        let v2 = generate_fused_prefill_mcta(&dag, &FusedPrefillConfig::rows16_col4(), Count(128));
 
         assert!(v2.contains("fused_prefill_layer(const globals g, int batch_size, int num_layers, int *mcta_bar)"), "missing mcta kernel function");
         assert!(
@@ -998,7 +1000,7 @@ mod tests {
     fn renders_mcta_fused_gateup_kernel() {
         let dag = build_1b_dag();
         let v2 =
-            generate_fused_prefill_mcta_fused_gateup(&dag, &FusedPrefillConfig::rows128(), 128);
+            generate_fused_prefill_mcta_fused_gateup(&dag, &FusedPrefillConfig::rows128(), Count(128));
 
         // 8 phases instead of 9
         assert!(v2.contains("MCTA_NUM_PHASES = 8"), "should have 8 phases");
@@ -1029,9 +1031,9 @@ mod tests {
         let v2_16 = generate_fused_prefill_v2(&dag, &FusedPrefillConfig::rows16());
         let v2_128 = generate_fused_prefill_v2(&dag, &FusedPrefillConfig::rows128());
 
-        let v2_mcta = generate_fused_prefill_mcta(&dag, &FusedPrefillConfig::rows16_col4(), 128);
+        let v2_mcta = generate_fused_prefill_mcta(&dag, &FusedPrefillConfig::rows16_col4(), Count(128));
         let v2_mcta_fused =
-            generate_fused_prefill_mcta_fused_gateup(&dag, &FusedPrefillConfig::rows128(), 128);
+            generate_fused_prefill_mcta_fused_gateup(&dag, &FusedPrefillConfig::rows128(), Count(128));
 
         std::fs::write("/tmp/fused_v1.cu", &v1).ok();
         std::fs::write("/tmp/fused_v2_16.cu", &v2_16).ok();

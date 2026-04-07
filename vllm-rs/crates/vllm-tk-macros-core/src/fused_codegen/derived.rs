@@ -3,38 +3,39 @@
 
 use crate::dag::ModelDag;
 use crate::fused_codegen::config::{FusedPrefillConfig, GemmMode};
+use crate::fused_codegen::units::{Bytes, Count, Dim, Iters, Tiles};
 
 /// All the numeric constants the templates need.
 pub struct FusedDerived {
-    pub num_stages: usize,
-    pub hd: usize,
-    pub id: usize,
-    pub nl: usize,
-    pub nah: usize,
-    pub nkh: usize,
-    pub hdm: usize,
-    pub gqa_ratio: usize,
-    pub qkv_dim: usize,
-    pub rdpw: usize,
-    pub hd_k_iters: usize,
-    pub id_k_iters: usize,
-    pub qkv_col_tiles: usize,
-    pub hd_col_tiles: usize,
-    pub id_col_tiles: usize,
-    pub iters_per_page: usize,
-    pub a_size: usize,
-    pub b_size: usize,
-    pub stage_size: usize,
-    pub gemm_shmem: usize,
-    pub rmsnorm_shmem: usize,
-    pub attn_shmem: usize,
-    pub total_shmem: usize,
-    pub kv_tile_bytes: usize,
-    pub num_threads: usize,
+    pub num_stages: Count,
+    pub hd: Dim,
+    pub id: Dim,
+    pub nl: Count,
+    pub nah: Count,
+    pub nkh: Count,
+    pub hdm: Dim,
+    pub gqa_ratio: Count,
+    pub qkv_dim: Dim,
+    pub rdpw: Count,
+    pub hd_k_iters: Iters,
+    pub id_k_iters: Iters,
+    pub qkv_col_tiles: Tiles,
+    pub hd_col_tiles: Tiles,
+    pub id_col_tiles: Tiles,
+    pub iters_per_page: Iters,
+    pub a_size: Bytes,
+    pub b_size: Bytes,
+    pub stage_size: Bytes,
+    pub gemm_shmem: Bytes,
+    pub rmsnorm_shmem: Bytes,
+    pub attn_shmem: Bytes,
+    pub total_shmem: Bytes,
+    pub kv_tile_bytes: Bytes,
+    pub num_threads: Count,
     /// B tile offset within a stage (cooperative mode only). 0 for redundant.
-    pub b_offset: usize,
+    pub b_offset: Bytes,
     /// Number of col tiles computed in parallel per K-loop pass.
-    pub col_batch: usize,
+    pub col_batch: Tiles,
 }
 
 impl FusedDerived {
@@ -48,21 +49,23 @@ impl FusedDerived {
 
         let gqa_ratio = nah / nkh;
         let qkv_dim = (nah + 2 * nkh) * hdm;
-        let rdpw = hd / cfg.num_warps;
+        let rdpw = hd / cfg.num_warps.0;
 
-        let hd_k_iters = hd / cfg.k_dim;
-        let id_k_iters = id / cfg.k_dim;
-        let qkv_col_tiles = qkv_dim / cfg.out_block;
-        let hd_col_tiles = hd / cfg.out_block;
-        let id_col_tiles = id / cfg.out_block;
-        let iters_per_page = cfg.kv_page_size / 16;
+        let hd_k_iters = hd / cfg.k_dim.0;
+        let id_k_iters = id / cfg.k_dim.0;
+        let qkv_col_tiles = qkv_dim / cfg.out_block.0;
+        let hd_col_tiles = hd / cfg.out_block.0;
+        let id_col_tiles = id / cfg.out_block.0;
+        let iters_per_page = cfg.kv_page_size.0 / 16;
 
         // A tile padded to 32 rows to avoid OOB cp.async writes
-        let a_size = 32 * cfg.k_dim * 2;
-        let b_size = cfg.out_block * cfg.k_dim * 2;
+        let a_size = 32 * cfg.k_dim.0 * 2;
+        let b_size = cfg.out_block.0 * cfg.k_dim.0 * 2;
 
-        let col_batch = cfg.col_batch;
-        let num_stages = cfg.num_stages;
+        let col_batch = cfg.col_batch.0;
+        let num_stages = cfg.num_stages.0;
+        let num_warps = cfg.num_warps.0;
+
         let (stage_size, gemm_shmem, b_offset) = match cfg.gemm_mode {
             GemmMode::Redundant => {
                 // col_batch B tiles per stage (each warp computes a different col)
@@ -71,23 +74,20 @@ impl FusedDerived {
             }
             GemmMode::Cooperative if cfg.per_warp_b => {
                 // Each warp owns BOTH its A tile AND its own B tile copy.
-                // Per-warp allocation: a_size + b_size.
-                // Stage = num_warps * (a_size + b_size).
-                // b_offset is relative to each warp's allocation start (= a_size).
                 let per_warp = a_size + b_size;
-                let ss = cfg.num_warps * per_warp;
+                let ss = num_warps * per_warp;
                 (ss, num_stages * ss, a_size)
             }
             GemmMode::Cooperative => {
                 // Each warp owns its own A tile; B is shared across warps
-                let ss = cfg.num_warps * a_size + b_size;
-                let bo = cfg.num_warps * a_size;
+                let ss = num_warps * a_size + b_size;
+                let bo = num_warps * a_size;
                 (ss, num_stages * ss, bo)
             }
         };
 
-        let rmsnorm_shmem = hd * 4 + cfg.num_warps * 4;
-        let kv_tile_bytes = cfg.kv_page_size * hdm * 2;
+        let rmsnorm_shmem = hd * 4 + num_warps * 4;
+        let kv_tile_bytes = cfg.kv_page_size.0 * hdm * 2;
         let attn_shmem = kv_tile_bytes * 2 * 2;
 
         let total_shmem = *[gemm_shmem, rmsnorm_shmem, attn_shmem]
@@ -96,33 +96,33 @@ impl FusedDerived {
             .unwrap();
 
         Self {
-            num_stages,
-            hd,
-            id,
-            nl,
-            nah,
-            nkh,
-            hdm,
-            gqa_ratio,
-            qkv_dim,
-            rdpw,
-            hd_k_iters,
-            id_k_iters,
-            qkv_col_tiles,
-            hd_col_tiles,
-            id_col_tiles,
-            iters_per_page,
-            a_size,
-            b_size,
-            stage_size,
-            gemm_shmem,
-            rmsnorm_shmem,
-            attn_shmem,
-            total_shmem,
-            kv_tile_bytes,
-            num_threads: cfg.num_warps * 32,
-            b_offset,
-            col_batch,
+            num_stages: cfg.num_stages,
+            hd: Dim(hd),
+            id: Dim(id),
+            nl: Count(nl),
+            nah: Count(nah),
+            nkh: Count(nkh),
+            hdm: Dim(hdm),
+            gqa_ratio: Count(gqa_ratio),
+            qkv_dim: Dim(qkv_dim),
+            rdpw: Count(rdpw),
+            hd_k_iters: Iters(hd_k_iters),
+            id_k_iters: Iters(id_k_iters),
+            qkv_col_tiles: Tiles(qkv_col_tiles),
+            hd_col_tiles: Tiles(hd_col_tiles),
+            id_col_tiles: Tiles(id_col_tiles),
+            iters_per_page: Iters(iters_per_page),
+            a_size: Bytes(a_size),
+            b_size: Bytes(b_size),
+            stage_size: Bytes(stage_size),
+            gemm_shmem: Bytes(gemm_shmem),
+            rmsnorm_shmem: Bytes(rmsnorm_shmem),
+            attn_shmem: Bytes(attn_shmem),
+            total_shmem: Bytes(total_shmem),
+            kv_tile_bytes: Bytes(kv_tile_bytes),
+            num_threads: Count(num_warps * 32),
+            b_offset: Bytes(b_offset),
+            col_batch: Tiles(col_batch),
         }
     }
 }

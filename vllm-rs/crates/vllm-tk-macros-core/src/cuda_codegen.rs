@@ -1147,7 +1147,7 @@ fn emit_post_loop(out: &mut String, mappings: &HashMap<&str, OpMapping>, batch_e
 }
 
 /// Emit the TkTensorArg struct + make_arg helper (same as tk_launch.cu).
-fn emit_tensor_arg_and_globals_helper(out: &mut String) {
+pub(crate) fn emit_tensor_arg_and_globals_helper(out: &mut String) {
     writeln!(out, "// Flat tensor descriptor passed from Rust via FFI.").unwrap();
     writeln!(out, "struct TkTensorArg {{").unwrap();
     writeln!(out, "    uint64_t ptr;").unwrap();
@@ -1164,7 +1164,7 @@ fn emit_tensor_arg_and_globals_helper(out: &mut String) {
 
 /// Emit the globals construction code (shared between decode and prefill launch wrappers).
 /// Identical to tk_launch.cu's globals construction.
-fn emit_globals_construction(out: &mut String, indent: &str) {
+pub(crate) fn emit_globals_construction(out: &mut String, indent: &str) {
     // Use `globals` type alias (= llama_sm89_globals from the header).
     // NL in the template is the header's macro value — only used for weight shape
     // metadata, not the runtime loop bound (which uses num_layers param).
@@ -1245,7 +1245,7 @@ fn emit_globals_construction(out: &mut String, indent: &str) {
 
 /// The flat-arg parameter list shared by both decode and prefill launch wrappers.
 /// Matches tk_llama_1b_launch in tk_launch.cu exactly.
-const LAUNCH_PARAMS: &str = "\
+pub(crate) const LAUNCH_PARAMS: &str = "\
     // VM state (3 tensors)
     TkTensorArg bar, TkTensorArg instructions, TkTensorArg timings,
     // Weights (9 tensors)

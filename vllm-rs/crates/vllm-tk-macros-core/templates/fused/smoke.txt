@@ -1,0 +1,6 @@
+// smoke test
+hd = {{ hd }}
+nl = {{ nl }}
+{% for phase in phases -%}
+phase: {{ phase }}
+{% endfor %}

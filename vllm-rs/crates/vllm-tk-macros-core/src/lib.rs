@@ -15,6 +15,7 @@ pub mod cpu_golden;
 pub mod cuda_codegen;
 pub mod dag;
 pub mod diagram;
+pub mod fused_codegen;
 pub mod parse;
 pub mod verify;
 
@@ -188,13 +189,44 @@ pub fn generate_fused_prefill_kernel(dsl: &str) -> Result<String, String> {
 ///
 /// Full layer: attn_norm → QKV GEMM → attention → o_proj+residual → MLP block.
 /// Grid = ceil(num_prefill_tokens / 16). Each CTA owns 16 rows through the full layer.
+///
+/// Backend selection via `TK_FUSED_PREFILL` env var:
+/// - unset or `v1`: monolithic v1 codegen (default — known good)
+/// - `v2-16row`: template-based v2 codegen, 16-row CTAs (Redundant GEMM)
+/// - `v2-32row`: template-based v2 codegen, 32-row CTAs (Cooperative GEMM, 2/8 warps productive)
+/// - `v2-64row`: template-based v2 codegen, 64-row CTAs (Cooperative GEMM, 4/8 warps productive)
+/// - `v2-128row`: template-based v2 codegen, 128-row CTAs (Cooperative GEMM, 8/8 warps productive)
 pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> {
     let tokens: proc_macro2::TokenStream = dsl
         .parse()
         .map_err(|e| format!("failed to tokenize DSL: {e}"))?;
     let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("parse error: {e}"))?;
     let dag = parse::build_dag(&def)?;
-    Ok(cuda_codegen::generate_fused_prefill_layer_kernel(&dag))
+
+    let backend = std::env::var("TK_FUSED_PREFILL").unwrap_or_else(|_| "v1".to_string());
+    let cfg = match backend.as_str() {
+        "v1" => return Ok(cuda_codegen::generate_fused_prefill_layer_kernel(&dag)),
+        "v2-16row" => fused_codegen::config::FusedPrefillConfig::rows16(),
+        "v2-16row-col4" => fused_codegen::config::FusedPrefillConfig::rows16_col4(),
+        "v2-32row" => fused_codegen::config::FusedPrefillConfig::rows32(),
+        "v2-64row" => fused_codegen::config::FusedPrefillConfig::rows64(),
+        "v2-128row" => fused_codegen::config::FusedPrefillConfig::rows128(),
+        "v2-mcta" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows16_col4();
+            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, 128));
+        }
+        "v2-mcta-col1" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows16();
+            return Ok(fused_codegen::generate_fused_prefill_mcta(&dag, &cfg, 128));
+        }
+        other => {
+            return Err(format!(
+                "unknown TK_FUSED_PREFILL backend '{other}' \
+                 (expected v1, v2-16row, v2-16row-col4, v2-32row, v2-64row, v2-128row, v2-mcta, or v2-mcta-col1)"
+            ));
+        }
+    };
+    Ok(fused_codegen::generate_fused_prefill_v2(&dag, &cfg))
 }
 
 /// Generate a debug variant of the decode kernel that syncs and writes a

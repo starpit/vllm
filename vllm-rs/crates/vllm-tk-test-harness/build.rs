@@ -17,6 +17,9 @@ fn build_cuda() {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
+    // Re-run build.rs when the fused prefill backend selector changes
+    println!("cargo:rerun-if-env-changed=TK_FUSED_PREFILL");
+
     // Set up cudaforge cache directory
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))

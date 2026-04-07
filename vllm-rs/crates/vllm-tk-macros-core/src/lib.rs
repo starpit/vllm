@@ -270,3 +270,34 @@ pub fn generate_debug_kernel(dsl: &str) -> Result<String, String> {
 
     Ok(cuda_codegen::generate_debug_kernel(&dag))
 }
+
+/// Generate a fused decode layer kernel (v2 template-driven).
+///
+/// Row-fused architecture: each CTA owns `cta_rows` sequences through ALL
+/// phases of ALL layers. No cross-CTA barriers. Activations stay in shmem.
+///
+/// Backend selection via `TK_FUSED_DECODE` env var:
+/// - `v2-rows16`: 16 rows per CTA (optimal for BS >= 16)
+/// - `v2-rows4`: 4 rows per CTA (BS in [2, 15])
+/// - `v2-rows1`: 1 row per CTA (BS = 1)
+pub fn generate_fused_decode_kernel(dsl: &str) -> Result<String, String> {
+    let tokens: proc_macro2::TokenStream = dsl
+        .parse()
+        .map_err(|e| format!("failed to tokenize DSL: {e}"))?;
+    let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("parse error: {e}"))?;
+    let dag = parse::build_dag(&def)?;
+
+    let backend = std::env::var("TK_FUSED_DECODE").unwrap_or_else(|_| "v2-rows16".to_string());
+    let cfg = match backend.as_str() {
+        "v2-rows16" => fused_codegen::config::FusedDecodeConfig::decode_rows16(),
+        "v2-rows4" => fused_codegen::config::FusedDecodeConfig::decode_rows4(),
+        "v2-rows1" => fused_codegen::config::FusedDecodeConfig::decode_rows1(),
+        other => {
+            return Err(format!(
+                "unknown TK_FUSED_DECODE backend '{other}' \
+                 (expected v2-rows16, v2-rows4, or v2-rows1)"
+            ));
+        }
+    };
+    Ok(fused_codegen::generate_fused_decode(&dag, &cfg))
+}

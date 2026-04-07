@@ -333,3 +333,41 @@ pub struct DecodeEpilogueResidualShmemCtx<'a> {
     pub a_size: usize,
     pub b_size: usize,
 }
+
+#[derive(Template)]
+#[template(path = "fused/decode_rope_kv_append.cu", escape = "none")]
+pub struct DecodeRopeKvAppendCtx {
+    pub hdm: usize,
+    pub q_end: usize,
+    pub k_start: usize,
+    pub v_start: usize,
+    pub kv_elems: usize,
+    pub q_output_shmem_offset: usize,
+    pub q_output_stride: usize,
+}
+
+#[derive(Template)]
+#[template(path = "fused/decode_attention.cu", escape = "none")]
+pub struct DecodeAttentionCtx {
+    pub nkh: usize,
+    pub nah: usize,
+    pub q_shmem_offset: usize,
+    pub q_stride: usize,
+    pub output_shmem_offset: usize,
+    pub output_stride: usize,
+}
+
+#[derive(Template)]
+#[template(path = "fused/decode_fused_mlp.cu", escape = "none")]
+pub struct DecodeFusedMlpCtx<'a> {
+    pub input_shmem_offset: usize,
+    pub hidden_shmem_offset: usize,
+    pub gate_weight_global: &'a str,
+    pub up_weight_global: &'a str,
+    pub down_weight_global: &'a str,
+    pub hd_k_iters: usize,
+    pub id_col_tiles: usize,
+    pub a_size: usize,
+    pub b_size: usize,
+    pub num_stages: usize,
+}

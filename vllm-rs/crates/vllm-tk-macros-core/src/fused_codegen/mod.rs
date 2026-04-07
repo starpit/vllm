@@ -761,6 +761,13 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
     // ── Phases ──
     let rdpw = d.hd / cfg.num_warps;
 
+    // Shmem layout offsets within phase_shm:
+    //   [0 .. hidden_shmem): hidden_states slab [padded_rows, HD] BF16
+    //   The rest is time-shared by different phases.
+    // For attention, we reuse the hidden slab area for Q and attn_out.
+    let q_stride = d.nah * d.hdm;                // Q elements per row
+    let attn_out_stride = d.nah * d.hdm;          // same as Q
+
     let phases: Vec<String> = vec![
         // Phase 1: attn_norm (hidden_shmem → hidden_shmem, in-place)
         render_decode_rmsnorm(
@@ -775,16 +782,65 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
         ),
         // Phase 2: QKV GEMM (shmem activations × qkv_weights → global qkv output)
         // Output goes to global because K/V need to be written to paged cache.
-        // Q will be loaded back into shmem for attention.
         render_decode_gemm(
             &d,
             cfg,
             "Phase 2: QKV GEMM (shmem × qkv_weights → silu_out)",
-            0, // input from hidden slab (after attn_norm, in-place)
+            0,
             "g.qkv_weights",
             d.hd_k_iters,
             d.qkv_col_tiles,
             DecodeEpilogueKind::StoreGlobal("g.silu_out"),
+        ),
+        // Phase 3: RoPE + KV cache append
+        // Reads QKV from global silu_out, applies RoPE, writes K/V to cache, Q to shmem
+        render_decode_rope_kv_append(&d, 0, q_stride),
+        // Phase 4: Decode attention (Q from shmem, KV from cache, output to shmem)
+        render_decode_attention(&d, 0, q_stride, 0, attn_out_stride),
+        // Phase 5: o_proj + residual (attn_out from shmem × o_weights + hidden → hidden)
+        // After attention, attn_out is in shmem at offset 0.
+        // hidden_states were written to global at start; we need to re-read.
+        // Actually, hidden_states are maintained in the hidden slab.
+        // But attention overwrote shmem... Let me reconsider.
+        //
+        // Design: hidden_states live at shmem offset 0 between attn_norm and the
+        // first GEMM. After QKV GEMM, the hidden slab is no longer needed for attn_norm
+        // output. We need hidden_states for the residual in o_proj.
+        //
+        // Solution: write hidden_states to global BEFORE the QKV GEMM,
+        // then read back for residual. OR: keep hidden in a separate slab.
+        //
+        // For now: read residual from global hidden_states.
+        render_decode_gemm(
+            &d,
+            cfg,
+            "Phase 5: o_proj + residual (attn_out × o_weights + hidden → hidden_shmem)",
+            0, // attn_out in shmem at offset 0
+            "g.o_weights",
+            d.hd_k_iters,
+            d.hd_col_tiles,
+            DecodeEpilogueKind::ResidualShmem {
+                residual_offset: 0, // hidden_states slab (will be reloaded)
+                output_offset: 0,
+            },
+        ),
+        // Phase 6: mlp_norm (hidden_shmem → hidden_shmem, in-place)
+        render_decode_rmsnorm(
+            &d,
+            cfg,
+            "g.mlp_norm_weights",
+            0,
+            0,
+            d.hidden_shmem,
+            d.hidden_shmem + d.hd * 2,
+            rdpw,
+        ),
+        // Phase 7: Fused MLP (streaming gate+up+SiLU+down over ID tiles)
+        render_decode_fused_mlp(
+            &d,
+            cfg,
+            0,  // input: mlp_norm output (in-place at hidden slab)
+            0,  // hidden: residual from hidden_shmem
         ),
     ];
 
@@ -804,7 +860,10 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
     .expect("decode launch_wrapper render");
 
     // ── Phase names ──
-    let phase_name_list = ["attn_norm", "QKV_GEMM"];
+    let phase_name_list = [
+        "attn_norm", "QKV_GEMM", "RoPE_KV", "attention",
+        "o_proj", "mlp_norm", "fused_MLP",
+    ];
     let phase_names_str = phase_name_list[..phases.len()]
         .iter()
         .map(|n| format!("\"{}\"", n))
@@ -923,6 +982,70 @@ fn render_decode_gemm(
     }
     .render()
     .expect("decode gemm render")
+}
+
+fn render_decode_rope_kv_append(
+    d: &FusedDecodeDerived,
+    q_output_shmem_offset: usize,
+    q_output_stride: usize,
+) -> String {
+    let q_end = d.nah * d.hdm;
+    let k_start = q_end;
+    let k_end = q_end + d.nkh * d.hdm;
+    let v_start = k_end;
+    let kv_elems = d.nkh * d.hdm;
+    DecodeRopeKvAppendCtx {
+        hdm: d.hdm,
+        q_end,
+        k_start,
+        v_start,
+        kv_elems,
+        q_output_shmem_offset,
+        q_output_stride,
+    }
+    .render()
+    .expect("decode rope_kv_append render")
+}
+
+fn render_decode_attention(
+    d: &FusedDecodeDerived,
+    q_shmem_offset: usize,
+    q_stride: usize,
+    output_shmem_offset: usize,
+    output_stride: usize,
+) -> String {
+    DecodeAttentionCtx {
+        nkh: d.nkh,
+        nah: d.nah,
+        q_shmem_offset,
+        q_stride,
+        output_shmem_offset,
+        output_stride,
+    }
+    .render()
+    .expect("decode attention render")
+}
+
+fn render_decode_fused_mlp(
+    d: &FusedDecodeDerived,
+    cfg: &FusedDecodeConfig,
+    input_shmem_offset: usize,
+    hidden_shmem_offset: usize,
+) -> String {
+    DecodeFusedMlpCtx {
+        input_shmem_offset,
+        hidden_shmem_offset,
+        gate_weight_global: "g.gate_weights",
+        up_weight_global: "g.up_weights",
+        down_weight_global: "g.down_weights",
+        hd_k_iters: d.hd_k_iters,
+        id_col_tiles: d.id_col_tiles,
+        a_size: d.a_size,
+        b_size: d.b_size,
+        num_stages: cfg.num_stages,
+    }
+    .render()
+    .expect("decode fused_mlp render")
 }
 
 #[cfg(test)]
@@ -1172,18 +1295,34 @@ mod tests {
         );
 
         // QKV GEMM
-        assert!(
-            cuda.contains("g.qkv_weights"),
-            "missing QKV weight"
-        );
-        assert!(
-            cuda.contains("mma_ABt_base"),
-            "missing GEMM MMA in decode"
-        );
-        assert!(
-            cuda.contains("g.silu_out"),
-            "missing QKV output"
-        );
+        assert!(cuda.contains("g.qkv_weights"), "missing QKV weight");
+        assert!(cuda.contains("mma_ABt_base"), "missing GEMM MMA in decode");
+        assert!(cuda.contains("g.silu_out"), "missing QKV output");
+
+        // RoPE + KV append
+        assert!(cuda.contains("rope_cos"), "missing RoPE cos");
+        assert!(cuda.contains("k_cache"), "missing K cache write");
+        assert!(cuda.contains("v_cache"), "missing V cache write");
+
+        // Attention
+        assert!(cuda.contains("Decode attention"), "missing attention phase");
+        assert!(cuda.contains("Online softmax"), "missing online softmax");
+        assert!(cuda.contains("DEC_GQA_RATIO"), "missing GQA");
+
+        // o_proj
+        assert!(cuda.contains("g.o_weights"), "missing o_proj weights");
+
+        // MLP norm
+        assert!(cuda.contains("g.mlp_norm_weights"), "missing mlp_norm");
+
+        // Fused MLP
+        assert!(cuda.contains("g.gate_weights"), "missing gate weights");
+        assert!(cuda.contains("g.up_weights"), "missing up weights");
+        assert!(cuda.contains("g.down_weights"), "missing down weights");
+        assert!(cuda.contains("SiLU"), "missing SiLU in fused MLP");
+
+        // 7 phases
+        assert!(cuda.contains("NUM_PHASES = 7"), "expected 7 phases");
 
         // Layer loop
         assert!(

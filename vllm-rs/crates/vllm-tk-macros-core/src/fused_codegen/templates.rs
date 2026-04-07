@@ -211,6 +211,7 @@ pub struct LaunchWrapperMctaCtx<'a> {
     pub globals_construction: &'a str,
     pub num_threads: usize,
     pub grid_size: usize,
+    pub id_col_tiles: usize,
 }
 
 #[derive(Template)]

@@ -4,7 +4,7 @@
      num_threads: threads per CTA
      num_phases: number of phases per layer
      phase_names_str: C string array for timing
-     grid_size: number of CTAs
+     grid_size: max grid size (launch wrapper picks actual grid at runtime)
      phases: list of rendered phase strings
      launch_wrapper: rendered launch wrapper
 #}
@@ -13,19 +13,18 @@
 // ── Cross-CTA barrier helpers ──────────────────────────────────────────
 // barrier array: [num_layers * num_phases] ints, zero-initialized before launch.
 // Each (layer, phase) pair uses a unique slot — no reset needed.
+// Grid size is dynamic (gridDim.x), not constexpr.
 constexpr int MCTA_NUM_PHASES = {{ num_phases }};
-constexpr int MCTA_GRID = {{ grid_size }};
+constexpr int MCTA_MAX_GRID = {{ grid_size }};
 
-__device__ static inline void mcta_barrier(int *bar, int layer, int phase) {
+__device__ static inline void mcta_barrier(int *bar, int layer, int phase, int grid) {
     __syncthreads();
     __threadfence();
     if (threadIdx.x == 0) {
         int idx = layer * MCTA_NUM_PHASES + phase;
-        // Signal arrival
         atomicAdd(&bar[idx], 1);
-        // Spin until all CTAs have arrived (volatile read avoids atomic RMW)
         volatile int *vbar = (volatile int*)&bar[idx];
-        while (*vbar < MCTA_GRID) {}
+        while (*vbar < grid) {}
     }
     __syncthreads();
 }
@@ -55,7 +54,7 @@ fused_prefill_layer(const globals g, int batch_size, int num_layers, int *mcta_b
 
 {% for phase in phases -%}
 {{ phase }}
-    mcta_barrier(mcta_bar, layer, {{ loop.index0 }});
+    mcta_barrier(mcta_bar, layer, {{ loop.index0 }}, num_ctas);
     if (bid == 0 && wid == 0 && lid == 0 && layer == 0)
         phase_clocks[{{ loop.index }}] = clock64();
 

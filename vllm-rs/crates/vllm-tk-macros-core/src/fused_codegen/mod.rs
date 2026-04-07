@@ -419,6 +419,7 @@ pub fn generate_fused_prefill_mcta(
         globals_construction: &gc,
         num_threads: d.num_threads,
         grid_size,
+        id_col_tiles: d.id_col_tiles,
     }
     .render()
     .expect("launch_wrapper_mcta template render");
@@ -556,6 +557,7 @@ pub fn generate_fused_prefill_mcta_fused_gateup(
         globals_construction: &gc,
         num_threads: d.num_threads,
         grid_size,
+        id_col_tiles: d.id_col_tiles,
     }
     .render()
     .expect("launch_wrapper_mcta template render");

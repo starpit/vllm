@@ -12,23 +12,26 @@
      num_col_tiles: output col tiles (same for both GEMMs)
      a_size, b_size, stage_size, b_offset: shmem layout
      cooperative: bool
+     num_stages: pipeline stages (2 or 3)
 #}
     // ════ {{ phase_comment }} ════
     // Fused gate+up: two GEMMs, same A input, no barrier between.
     {
     const int col_tiles = {{ num_col_tiles }};
 {%- if cooperative %}
-    // ── Cooperative 128-row fused gate+up ──
+    // ── Cooperative fused gate+up, {{ num_stages }}-stage pipeline ──
     const int rows_per_cta = PFL_CTA_ROWS;
     const int row_tiles_coop = (q_size + rows_per_cta - 1) / rows_per_cta;
     const int total_work = row_tiles_coop * col_tiles;
 
-    pfl_a_st &my_a_s0 = *reinterpret_cast<pfl_a_st*>(__shm + wid * {{ a_size }});
-    pfl_b_st &b_s0 = *reinterpret_cast<pfl_b_st*>(__shm + {{ b_offset }});
-    pfl_a_st &my_a_s1 = *reinterpret_cast<pfl_a_st*>(__shm + {{ stage_size }} + wid * {{ a_size }});
-    pfl_b_st &b_s1 = *reinterpret_cast<pfl_b_st*>(__shm + {{ stage_size }} + {{ b_offset }});
-    pfl_a_st *my_a_stages[2] = {&my_a_s0, &my_a_s1};
-    pfl_b_st *b_stages[2] = {&b_s0, &b_s1};
+    constexpr int STAGES = {{ num_stages }};
+    pfl_a_st *my_a_stages[STAGES];
+    pfl_b_st *b_stages[STAGES];
+    #pragma unroll
+    for (int s = 0; s < STAGES; s++) {
+        my_a_stages[s] = reinterpret_cast<pfl_a_st*>(__shm + s * {{ stage_size }} + wid * {{ a_size }});
+        b_stages[s] = reinterpret_cast<pfl_b_st*>(__shm + s * {{ stage_size }} + {{ b_offset }});
+    }
 
     for (int wu = bid; wu < total_work; wu += num_ctas) {
         const int coop_row_tile = wu / col_tiles;
@@ -42,20 +45,33 @@
         {
             pfl_acc_rt acc;
             warp::zero(acc);
-            warp::load_async(*my_a_stages[0], {{ input_global }}, {safe_row_tile, 0});
-            group<PFL_NUM_WARPS>::load_async(*b_stages[0], {{ gate_weight_global }}, {layer, col, 0});
-            asm volatile("cp.async.commit_group;\n" ::: "memory");
+            // Prologue: fill stages 0..STAGES-2
+            #pragma unroll
+            for (int s = 0; s < STAGES - 1 && s < {{ num_k_iters }}; s++) {
+                warp::load_async(*my_a_stages[s], {{ input_global }}, {safe_row_tile, s});
+                group<PFL_NUM_WARPS>::load_async(*b_stages[s], {{ gate_weight_global }}, {layer, col, s});
+                asm volatile("cp.async.commit_group;\n" ::: "memory");
+            }
             for (int iter = 0; iter < {{ num_k_iters }}; iter++) {
-                int cur = iter % 2;
-                if (iter + 1 < {{ num_k_iters }}) {
-                    int nxt = (iter + 1) % 2;
-                    warp::load_async(*my_a_stages[nxt], {{ input_global }}, {safe_row_tile, iter + 1});
-                    group<PFL_NUM_WARPS>::load_async(*b_stages[nxt], {{ gate_weight_global }}, {layer, col, iter + 1});
+                int cur = iter % STAGES;
+                int prefetch_iter = iter + STAGES - 1;
+                if (prefetch_iter < {{ num_k_iters }}) {
+                    int nxt = prefetch_iter % STAGES;
+                    warp::load_async(*my_a_stages[nxt], {{ input_global }}, {safe_row_tile, prefetch_iter});
+                    group<PFL_NUM_WARPS>::load_async(*b_stages[nxt], {{ gate_weight_global }}, {layer, col, prefetch_iter});
                     asm volatile("cp.async.commit_group;\n" ::: "memory");
+                }
+{%- if num_stages == 3 %}
+                asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+{%- elif num_stages == 2 %}
+                if (prefetch_iter < {{ num_k_iters }}) {
                     asm volatile("cp.async.wait_group 1;\n" ::: "memory");
                 } else {
                     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
                 }
+{%- else %}
+                asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+{%- endif %}
                 pfl_a_st &a_smem = *my_a_stages[cur];
                 pfl_b_st &b_smem = *b_stages[cur];
                 group<PFL_NUM_WARPS>::sync(1);
@@ -95,20 +111,33 @@
         {
             pfl_acc_rt acc;
             warp::zero(acc);
-            warp::load_async(*my_a_stages[0], {{ input_global }}, {safe_row_tile, 0});
-            group<PFL_NUM_WARPS>::load_async(*b_stages[0], {{ up_weight_global }}, {layer, col, 0});
-            asm volatile("cp.async.commit_group;\n" ::: "memory");
+            // Prologue: fill stages 0..STAGES-2
+            #pragma unroll
+            for (int s = 0; s < STAGES - 1 && s < {{ num_k_iters }}; s++) {
+                warp::load_async(*my_a_stages[s], {{ input_global }}, {safe_row_tile, s});
+                group<PFL_NUM_WARPS>::load_async(*b_stages[s], {{ up_weight_global }}, {layer, col, s});
+                asm volatile("cp.async.commit_group;\n" ::: "memory");
+            }
             for (int iter = 0; iter < {{ num_k_iters }}; iter++) {
-                int cur = iter % 2;
-                if (iter + 1 < {{ num_k_iters }}) {
-                    int nxt = (iter + 1) % 2;
-                    warp::load_async(*my_a_stages[nxt], {{ input_global }}, {safe_row_tile, iter + 1});
-                    group<PFL_NUM_WARPS>::load_async(*b_stages[nxt], {{ up_weight_global }}, {layer, col, iter + 1});
+                int cur = iter % STAGES;
+                int prefetch_iter = iter + STAGES - 1;
+                if (prefetch_iter < {{ num_k_iters }}) {
+                    int nxt = prefetch_iter % STAGES;
+                    warp::load_async(*my_a_stages[nxt], {{ input_global }}, {safe_row_tile, prefetch_iter});
+                    group<PFL_NUM_WARPS>::load_async(*b_stages[nxt], {{ up_weight_global }}, {layer, col, prefetch_iter});
                     asm volatile("cp.async.commit_group;\n" ::: "memory");
+                }
+{%- if num_stages == 3 %}
+                asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+{%- elif num_stages == 2 %}
+                if (prefetch_iter < {{ num_k_iters }}) {
                     asm volatile("cp.async.wait_group 1;\n" ::: "memory");
                 } else {
                     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
                 }
+{%- else %}
+                asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+{%- endif %}
                 pfl_a_st &a_smem = *my_a_stages[cur];
                 pfl_b_st &b_smem = *b_stages[cur];
                 group<PFL_NUM_WARPS>::sync(1);
@@ -150,9 +179,6 @@
     }
 {%- else %}
     // ── 16-row fused gate+up (col_batch path) ──
-    // Falls back to sequential: gate GEMM then up GEMM, same work distribution.
-    // TODO: implement col_batch variant if needed.
-    // For now, use the cooperative path via v2-mcta-128row.
     if (bid == 0 && wid == 0 && lid == 0 && layer == 0)
         printf("WARNING: fused gate+up not implemented for 16-row mode\n");
 {%- endif %}

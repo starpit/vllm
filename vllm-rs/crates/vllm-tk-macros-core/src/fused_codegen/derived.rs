@@ -6,6 +6,7 @@ use crate::fused_codegen::config::{FusedPrefillConfig, GemmMode};
 
 /// All the numeric constants the templates need.
 pub struct FusedDerived {
+    pub num_stages: usize,
     pub hd: usize,
     pub id: usize,
     pub nl: usize,
@@ -61,17 +62,18 @@ impl FusedDerived {
         let b_size = cfg.out_block * cfg.k_dim * 2;
 
         let col_batch = cfg.col_batch;
+        let num_stages = cfg.num_stages;
         let (stage_size, gemm_shmem, b_offset) = match cfg.gemm_mode {
             GemmMode::Redundant => {
                 // col_batch B tiles per stage (each warp computes a different col)
                 let ss = a_size + col_batch * b_size;
-                (ss, 2 * ss, 0)
+                (ss, num_stages * ss, 0)
             }
             GemmMode::Cooperative => {
                 // Each warp owns its own A tile; B is shared
                 let ss = cfg.num_warps * a_size + b_size;
                 let bo = cfg.num_warps * a_size;
-                (ss, 2 * ss, bo)
+                (ss, num_stages * ss, bo)
             }
         };
 
@@ -85,6 +87,7 @@ impl FusedDerived {
             .unwrap();
 
         Self {
+            num_stages,
             hd,
             id,
             nl,

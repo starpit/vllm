@@ -656,6 +656,7 @@ fn render_gemm_mcta(
         epilogue: epilogue_str,
         cooperative,
         col_batch: cfg.col_batch,
+        num_stages: cfg.num_stages,
     }
     .render()
     .expect("gemm_mcta template render")
@@ -704,6 +705,7 @@ fn render_gemm_gate_up_mcta(
         stage_size: d.stage_size,
         b_offset: d.b_offset,
         cooperative,
+        num_stages: cfg.num_stages,
     }
     .render()
     .expect("gemm_gate_up_mcta template render")

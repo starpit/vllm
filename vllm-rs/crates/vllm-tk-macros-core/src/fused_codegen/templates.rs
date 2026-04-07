@@ -156,6 +156,7 @@ pub struct GemmMctaCtx<'a> {
     pub epilogue: String,
     pub cooperative: bool,
     pub col_batch: usize,
+    pub num_stages: usize,
 }
 
 #[derive(Template)]
@@ -201,6 +202,7 @@ pub struct GemmGateUpMctaCtx<'a> {
     pub stage_size: usize,
     pub b_offset: usize,
     pub cooperative: bool,
+    pub num_stages: usize,
 }
 
 #[derive(Template)]

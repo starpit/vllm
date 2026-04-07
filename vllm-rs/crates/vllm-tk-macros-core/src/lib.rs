@@ -241,6 +241,12 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
                 &dag, &cfg, 128,
             ));
         }
+        "v2-mcta-64row-3stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows64_3stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag, &cfg, 128,
+            ));
+        }
         other => {
             return Err(format!(
                 "unknown TK_FUSED_PREFILL backend '{other}' \

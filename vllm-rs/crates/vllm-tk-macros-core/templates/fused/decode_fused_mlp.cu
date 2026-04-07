@@ -94,14 +94,15 @@
                 }
             }  // id_tile loop
 
-            // Write tile_acc to shmem with residual add (residual from global)
+            // Write tile_acc to GLOBAL with residual add.
+            // Cannot write to shmem because the input (mlp_act_smem) shares the same
+            // region — writing partial tiles would corrupt the input for subsequent tiles.
             {
-                bf16 *out_smem = reinterpret_cast<bf16*>(phase_shm + {{ hidden_shmem_offset }});
+                bf16 *h_rw = reinterpret_cast<bf16*>(g.hidden_states.raw_ptr);
                 for (int h = lid; h < DEC_OUT_BLOCK; h += 32) {
-                    float res = __bfloat162float(
-                        g.hidden_states[coord<>{row_start + r, hd_out + h}]);
-                    out_smem[r * {{ hd }} + hd_out + h] =
-                        __float2bfloat16(tile_acc[h] + res);
+                    int gidx = (row_start + r) * {{ hd }} + hd_out + h;
+                    float res = __bfloat162float(h_rw[gidx]);
+                    h_rw[gidx] = __float2bfloat16(tile_acc[h] + res);
                 }
             }
         }  // hd_out loop

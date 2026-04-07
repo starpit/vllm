@@ -14,13 +14,13 @@
                 warp::store(*acc_st, acc_bf);
                 warp::sync();
                 for (int r = 0; r < my_rows && r < 16; r++) {
-                    bf16 *gemm_row = reinterpret_cast<bf16*>(acc_st) + r * DEC_OUT_BLOCK;
                     bf16 *out_row = out_smem + r * globals::hidden_dim + {{ col_var }} * DEC_OUT_BLOCK;
-                    // Read residual from global hidden_states
+                    const bf16 *h_base = reinterpret_cast<const bf16*>(g.hidden_states.raw_ptr);
                     for (int j = lid; j < DEC_OUT_BLOCK; j += 32) {
-                        float g_val = __bfloat162float(gemm_row[j]);
+                        float g_val = __bfloat162float((*acc_st)[{r, j}]);
+                        int col_idx = {{ col_var }} * DEC_OUT_BLOCK + j;
                         float res = __bfloat162float(
-                            g.hidden_states[coord<>{row_start + r, {{ col_var }} * DEC_OUT_BLOCK + j}]);
+                            h_base[(row_start + r) * globals::hidden_dim + col_idx]);
                         out_row[j] = __float2bfloat16(g_val + res);
                     }
                 }

@@ -12,9 +12,9 @@
                 warp::store(*acc_st, acc_bf);
                 warp::sync();
                 for (int r = 0; r < my_rows && r < 16; r++) {
-                    // Write row to global
-                    sv_bf<DEC_OUT_BLOCK> &row_sv = *reinterpret_cast<sv_bf<DEC_OUT_BLOCK>*>(
-                        reinterpret_cast<bf16*>(acc_st) + r * DEC_OUT_BLOCK);
-                    warp::store({{ output_global }}, row_sv, {row_start + r, {{ col_var }} * DEC_OUT_BLOCK / 16});
+                    for (int j = lid; j < DEC_OUT_BLOCK; j += 32) {
+                        int col_idx = {{ col_var }} * DEC_OUT_BLOCK + j;
+                        {{ output_global }}[{row_start + r, col_idx}] = (*acc_st)[{r, j}];
+                    }
                 }
             }

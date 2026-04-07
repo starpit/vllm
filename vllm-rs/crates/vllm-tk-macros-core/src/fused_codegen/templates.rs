@@ -388,3 +388,20 @@ pub struct DecodeFusedMlpCtx<'a> {
 pub struct DecodeShmemToGlobalCtx {
     pub shmem_offset: usize,
 }
+
+#[derive(Template)]
+#[template(path = "fused/decode_global_to_shmem.cu", escape = "none")]
+pub struct DecodeGlobalToShmemCtx {
+    pub shmem_offset: usize,
+}
+
+#[derive(Template)]
+#[template(
+    path = "fused/decode_epilogue_residual_global_writeback.cu",
+    escape = "none"
+)]
+pub struct DecodeEpilogueResidualGlobalWritebackCtx<'a> {
+    pub col_var: &'a str,
+    pub a_size: usize,
+    pub b_size: usize,
+}

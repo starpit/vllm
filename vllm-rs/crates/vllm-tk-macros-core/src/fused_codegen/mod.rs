@@ -777,12 +777,17 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
             phases.push(cuda);
             phase_names.push(name.clone());
 
-            // Insert shmem→global writeback after phases that update hidden_states.
-            // This keeps g.hidden_states in sync so subsequent phases (and the next
-            // layer) can read correct residuals from global memory.
-            if name == "o_proj" || name == "fused_MLP" {
-                phases.push(render_decode_writeback(&d));
-                phase_names.push("writeback".into());
+            // Sync shmem ↔ global after phases that update hidden_states.
+            if name == "o_proj" {
+                // o_proj wrote result to GLOBAL (to avoid input/output shmem overlap).
+                // Load it back into shmem so subsequent phases can read from shmem.
+                phases.push(render_decode_global_to_shmem(&d));
+                phase_names.push("load_hidden".into());
+            } else if name == "fused_MLP" {
+                // fused_MLP wrote result to GLOBAL (to avoid input/output shmem overlap).
+                // Load it back into shmem so next layer's attn_norm can read from shmem.
+                phases.push(render_decode_global_to_shmem(&d));
+                phase_names.push("load_hidden".into());
             }
         }
     }
@@ -1355,14 +1360,17 @@ fn render_decode_gemm(
         }
         .render()
         .expect("decode epilogue residual shmem"),
-        DecodeEpilogueKind::ResidualGlobal { output_offset } => DecodeEpilogueResidualGlobalCtx {
-            output_shmem_offset: output_offset.0,
-            col_var: "col",
-            a_size: d.a_size.0,
-            b_size: d.b_size.0,
+        DecodeEpilogueKind::ResidualGlobal { .. } => {
+            // Write result to GLOBAL (not shmem) to avoid input/output shmem overlap.
+            // A subsequent global→shmem copy loads the result back.
+            DecodeEpilogueResidualGlobalWritebackCtx {
+                col_var: "col",
+                a_size: d.a_size.0,
+                b_size: d.b_size.0,
+            }
+            .render()
+            .expect("decode epilogue residual global writeback")
         }
-        .render()
-        .expect("decode epilogue residual global"),
     };
 
     DecodeGemmCtx {
@@ -1451,6 +1459,14 @@ fn render_decode_fused_mlp(
 /// Render a shmem → global writeback phase.
 /// Writes shmem hidden_states back to g.hidden_states so that subsequent
 /// phases (and the next layer) can read correct residuals from global.
+/// Render a global → shmem load phase.
+/// Loads g.hidden_states into shmem after o_proj wrote results to global.
+fn render_decode_global_to_shmem(_d: &FusedDecodeDerived) -> String {
+    DecodeGlobalToShmemCtx { shmem_offset: 0 }
+        .render()
+        .expect("decode global_to_shmem render")
+}
+
 fn render_decode_writeback(_d: &FusedDecodeDerived) -> String {
     DecodeShmemToGlobalCtx {
         shmem_offset: 0, // hidden_states always at phase_shm + 0
@@ -1732,10 +1748,12 @@ mod tests {
         // 9 phases: 7 compute + 2 writebacks (after o_proj and fused_MLP)
         assert!(cuda.contains("NUM_PHASES = 9"), "expected 9 phases");
 
-        // Writeback phases
+        // Global→shmem load phases (after o_proj and fused_MLP, both write to global)
+        // Count occurrences of load_hidden pattern
+        let load_count = cuda.matches("Load: g.hidden_states").count();
         assert!(
-            cuda.contains("Writeback: shmem hidden"),
-            "missing shmem→global writeback phase"
+            load_count >= 2,
+            "expected at least 2 global→shmem loads (after o_proj and fused_MLP), found {load_count}"
         );
 
         // Layer loop

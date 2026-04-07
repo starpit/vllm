@@ -15,11 +15,10 @@
                 warp::store(*acc_st, acc_bf);
                 warp::sync();
                 for (int r = 0; r < my_rows && r < 16; r++) {
-                    bf16 *gemm_row = reinterpret_cast<bf16*>(acc_st) + r * DEC_OUT_BLOCK;
                     bf16 *res_row = res_smem + r * globals::hidden_dim + {{ col_var }} * DEC_OUT_BLOCK;
                     bf16 *out_row = out_smem + r * globals::hidden_dim + {{ col_var }} * DEC_OUT_BLOCK;
                     for (int j = lid; j < DEC_OUT_BLOCK; j += 32) {
-                        float g = __bfloat162float(gemm_row[j]);
+                        float g = __bfloat162float((*acc_st)[{r, j}]);
                         float re = __bfloat162float(res_row[j]);
                         out_row[j] = __float2bfloat16(g + re);
                     }

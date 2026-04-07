@@ -773,8 +773,17 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
         }
         let cuda = emit_decode_op(op, dag, &d, cfg, &storage);
         if !cuda.is_empty() {
-            phase_names.push(phase_name_for_op(&op.kind));
+            let name = phase_name_for_op(&op.kind);
             phases.push(cuda);
+            phase_names.push(name.clone());
+
+            // Insert shmem→global writeback after phases that update hidden_states.
+            // This keeps g.hidden_states in sync so subsequent phases (and the next
+            // layer) can read correct residuals from global memory.
+            if name == "o_proj" || name == "fused_MLP" {
+                phases.push(render_decode_writeback(&d));
+                phase_names.push("writeback".into());
+            }
         }
     }
 
@@ -1157,12 +1166,32 @@ fn emit_decode_op(
             let weight_global = weight_accessor(storage, b);
             let (k_iters, col_tiles) = gemm_shape_for_weight(d, b);
 
-            let residual_offset = shmem_offset_of(storage, residual);
             let output_offset = shmem_offset_of(storage, output);
 
-            let epilogue = DecodeEpilogueKind::ResidualShmem {
-                residual_offset,
-                output_offset,
+            // Polyalgorithmic choice: can we read the residual from shmem, or was it
+            // overwritten by intervening ops (e.g., attention clobbered hidden_states)?
+            //
+            // For cta_rows >= 16 with HD=2048, two [padded_rows, HD] slabs don't fit in
+            // shmem (2×64KB > 99KB). So Q and attn_out share the hidden slab at offset 0,
+            // clobbering the original hidden_states. The o_proj residual must come from
+            // global g.hidden_states instead.
+            //
+            // For cta_rows <= 4 (padded to 16), hidden = 16*2048*2 = 64KB. A second slab
+            // STILL wouldn't fit (128KB > 99KB). So global fallback is always needed when
+            // the residual's shmem region was reused by the attention path.
+            //
+            // Detection: if the input (a) and residual share the same shmem offset,
+            // the residual was overwritten by ops that wrote a's data to that region.
+            let a_offset = shmem_offset_of(storage, a);
+            let residual_offset = shmem_offset_of(storage, residual);
+            let epilogue = if a_offset == residual_offset {
+                // Residual region was clobbered — read from global
+                DecodeEpilogueKind::ResidualGlobal { output_offset }
+            } else {
+                DecodeEpilogueKind::ResidualShmem {
+                    residual_offset,
+                    output_offset,
+                }
             };
 
             let phase_comment =
@@ -1279,6 +1308,10 @@ enum DecodeEpilogueKind<'a> {
         residual_offset: ShmemOffset,
         output_offset: ShmemOffset,
     },
+    /// Add residual from global memory, write to shmem.
+    /// Used when the shmem residual region was overwritten by intervening ops
+    /// (e.g., attention clobbers hidden_states at shmem[0]).
+    ResidualGlobal { output_offset: ShmemOffset },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1322,6 +1355,14 @@ fn render_decode_gemm(
         }
         .render()
         .expect("decode epilogue residual shmem"),
+        DecodeEpilogueKind::ResidualGlobal { output_offset } => DecodeEpilogueResidualGlobalCtx {
+            output_shmem_offset: output_offset.0,
+            col_var: "col",
+            a_size: d.a_size.0,
+            b_size: d.b_size.0,
+        }
+        .render()
+        .expect("decode epilogue residual global"),
     };
 
     DecodeGemmCtx {
@@ -1405,6 +1446,17 @@ fn render_decode_fused_mlp(
     }
     .render()
     .expect("decode fused_mlp render")
+}
+
+/// Render a shmem → global writeback phase.
+/// Writes shmem hidden_states back to g.hidden_states so that subsequent
+/// phases (and the next layer) can read correct residuals from global.
+fn render_decode_writeback(_d: &FusedDecodeDerived) -> String {
+    DecodeShmemToGlobalCtx {
+        shmem_offset: 0, // hidden_states always at phase_shm + 0
+    }
+    .render()
+    .expect("decode shmem_to_global render")
 }
 
 #[cfg(test)]
@@ -1677,8 +1729,14 @@ mod tests {
         assert!(cuda.contains("g.down_weights"), "missing down weights");
         assert!(cuda.contains("SiLU"), "missing SiLU in fused MLP");
 
-        // 7 phases
-        assert!(cuda.contains("NUM_PHASES = 7"), "expected 7 phases");
+        // 9 phases: 7 compute + 2 writebacks (after o_proj and fused_MLP)
+        assert!(cuda.contains("NUM_PHASES = 9"), "expected 9 phases");
+
+        // Writeback phases
+        assert!(
+            cuda.contains("Writeback: shmem hidden"),
+            "missing shmem→global writeback phase"
+        );
 
         // Layer loop
         assert!(

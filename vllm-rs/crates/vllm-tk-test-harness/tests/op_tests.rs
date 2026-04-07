@@ -2264,3 +2264,514 @@ fn test_fused_prefill_layer_timing() {
     eprintln!("╚══════════════════════════════════════════════════╝");
     eprintln!();
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Fused decode layer: golden correctness test
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Golden test for fused decode kernel.
+///
+/// Sets up a batched decode scenario:
+/// - 4 sequences, each with 8 pre-existing KV cache tokens
+/// - Decode position = 8 (appending token 8)
+/// - Identity RoPE (cos=1, sin=0) to simplify golden comparison
+/// - All layers use same weights (replicated)
+///
+/// CPU golden chain per layer:
+///   attn_norm → QKV GEMM → (identity RoPE) → append KV → attention_decode → o_proj+residual
+///   → mlp_norm → gate GEMM → SiLU → up GEMM → mul → down GEMM + residual
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_fused_decode_layer_golden() {
+    use vllm_tk_macros_core::cpu_golden;
+
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    let batch_size: usize = 4;
+    let pre_kv_len: usize = 8; // tokens already in KV cache per row
+    let decode_pos: usize = pre_kv_len; // position of the new token
+    let total_kv_len: usize = pre_kv_len + 1; // after append
+    let attn_scale = 1.0 / (HDM as f32).sqrt();
+    let k_size = NKH * HDM; // 512
+    let v_size = NKH * HDM; // 512
+
+    // Weights (single set, replicated for all layers)
+    let attn_norm_w = bf16_roundtrip(&make_random(HD, 10, 0.1));
+    let qkv_w = bf16_roundtrip(&make_random(QKV_DIM * HD, 100, 0.01));
+    let o_w = bf16_roundtrip(&make_random(HD * HD, 150, 0.01));
+    let mlp_norm_w = bf16_roundtrip(&make_random(HD, 20, 0.1));
+    let gate_w = bf16_roundtrip(&make_random(ID * HD, 200, 0.01));
+    let up_w = bf16_roundtrip(&make_random(ID * HD, 300, 0.01));
+    let down_w = bf16_roundtrip(&make_random(HD * ID, 400, 0.01));
+
+    // Input hidden states: [batch_size, HD] — one token per sequence
+    let input_tokens: Vec<Vec<f32>> = (0..batch_size)
+        .map(|r| bf16_roundtrip(&make_random(HD, 1000 + r as u64, 0.5)))
+        .collect();
+
+    // Pre-existing KV cache data: [pre_kv_len, NKH, HDM] per row per layer
+    // Same for all rows/layers for simplicity
+    let prefilled_k: Vec<f32> = bf16_roundtrip(&make_random(pre_kv_len * k_size, 5000, 0.1));
+    let prefilled_v: Vec<f32> = bf16_roundtrip(&make_random(pre_kv_len * v_size, 6000, 0.1));
+
+    // ── CPU golden chain ──
+    let mut hidden_states: Vec<Vec<f32>> = input_tokens.clone();
+
+    // Track KV cache per row per layer: [total_kv_len, NKH, HDM]
+    // Start with pre-filled values; new token appended during processing
+    let mut all_k_caches: Vec<Vec<Vec<f32>>> = vec![
+        vec![prefilled_k.clone(); batch_size]; NL
+    ];
+    let mut all_v_caches: Vec<Vec<Vec<f32>>> = vec![
+        vec![prefilled_v.clone(); batch_size]; NL
+    ];
+
+    for layer in 0..NL {
+        for r in 0..batch_size {
+            // 1. attn_norm
+            let mut normed = vec![0.0_f32; HD];
+            cpu_golden::rmsnorm(&hidden_states[r], &attn_norm_w, &mut normed, 1e-5);
+            let normed = bf16_roundtrip(&normed);
+
+            // 2. QKV GEMM
+            let mut qkv_out = vec![0.0_f32; QKV_DIM];
+            cpu_golden::gemm(&normed, &qkv_w, &mut qkv_out, 1, HD, QKV_DIM);
+            let qkv_out = bf16_roundtrip(&qkv_out);
+
+            // 3. Identity RoPE (cos=1, sin=0 → no change)
+            // Extract Q, K, V
+            let q = &qkv_out[..NAH * HDM]; // [NAH * HDM]
+            let new_k = &qkv_out[NAH * HDM..NAH * HDM + k_size];
+            let new_v = &qkv_out[NAH * HDM + k_size..NAH * HDM + k_size + v_size];
+
+            // 4. Append K/V to cache
+            all_k_caches[layer][r].extend_from_slice(new_k);
+            all_v_caches[layer][r].extend_from_slice(new_v);
+
+            // 5. Decode attention over full KV (pre_kv_len + 1 tokens)
+            let mut attn_out = vec![0.0_f32; NAH * HDM];
+            cpu_golden::attention_decode(
+                q,
+                &all_k_caches[layer][r],
+                &all_v_caches[layer][r],
+                &mut attn_out,
+                total_kv_len,
+                NAH,
+                NKH,
+                HDM,
+                attn_scale,
+            );
+            let attn_out = bf16_roundtrip(&attn_out);
+
+            // 6. o_proj + residual
+            let mut hidden = vec![0.0_f32; HD];
+            cpu_golden::gemm_add(&attn_out, &o_w, &hidden_states[r], &mut hidden, 1, HD, HD);
+            let hidden = bf16_roundtrip(&hidden);
+
+            // 7. mlp_norm
+            let mut mlp_normed = vec![0.0_f32; HD];
+            cpu_golden::rmsnorm(&hidden, &mlp_norm_w, &mut mlp_normed, 1e-5);
+            let mlp_normed = bf16_roundtrip(&mlp_normed);
+
+            // 8. Fused MLP: gate→SiLU, up, mul, down+residual
+            let mut gate_out = vec![0.0_f32; ID];
+            cpu_golden::gemm(&mlp_normed, &gate_w, &mut gate_out, 1, HD, ID);
+            let gate_out = bf16_roundtrip(&gate_out);
+            let mut gate_silu = vec![0.0_f32; ID];
+            cpu_golden::silu(&gate_out, &mut gate_silu);
+            let gate_silu = bf16_roundtrip(&gate_silu);
+
+            let mut up_out = vec![0.0_f32; ID];
+            cpu_golden::gemm(&mlp_normed, &up_w, &mut up_out, 1, HD, ID);
+            let up_out = bf16_roundtrip(&up_out);
+
+            let mut mlp_inter = vec![0.0_f32; ID];
+            cpu_golden::mul(&gate_silu, &up_out, &mut mlp_inter);
+            let mlp_inter = bf16_roundtrip(&mlp_inter);
+
+            let mut final_hidden = vec![0.0_f32; HD];
+            cpu_golden::gemm_add(&mlp_inter, &down_w, &hidden, &mut final_hidden, 1, ID, HD);
+
+            hidden_states[r] = final_hidden;
+        }
+    }
+
+    // Expected = final hidden_states after all layers
+    let mut expected = vec![0.0_f32; batch_size * HD];
+    for r in 0..batch_size {
+        expected[r * HD..(r + 1) * HD].copy_from_slice(&hidden_states[r]);
+    }
+
+    // ── GPU setup ──
+    let mut b = TestBuffers::new();
+
+    // hidden_states: [ACT_ROWS, HD] — fill first batch_size rows
+    let mut input_full = vec![0.0_f32; ACT_ROWS * HD];
+    for r in 0..batch_size {
+        input_full[r * HD..(r + 1) * HD].copy_from_slice(&input_tokens[r]);
+    }
+    b.hidden = gpu_upload_bf16(&input_full);
+
+    // Weights (replicated across NL layers)
+    let anw: Vec<f32> = attn_norm_w.iter().copied().cycle().take(NL * HD).collect();
+    b.attn_norm_w = gpu_upload_bf16(&anw);
+    let qw: Vec<f32> = qkv_w.iter().copied().cycle().take(NL * QKV_DIM * HD).collect();
+    b.qkv_w = gpu_upload_bf16(&qw);
+    let ow: Vec<f32> = o_w.iter().copied().cycle().take(NL * HD * HD).collect();
+    b.o_w = gpu_upload_bf16(&ow);
+    let mnw: Vec<f32> = mlp_norm_w.iter().copied().cycle().take(NL * HD).collect();
+    b.mlp_norm_w = gpu_upload_bf16(&mnw);
+    let gw: Vec<f32> = gate_w.iter().copied().cycle().take(NL * ID * HD).collect();
+    b.gate_w = gpu_upload_bf16(&gw);
+    let uw: Vec<f32> = up_w.iter().copied().cycle().take(NL * ID * HD).collect();
+    b.up_w = gpu_upload_bf16(&uw);
+    let dw: Vec<f32> = down_w.iter().copied().cycle().take(NL * HD * ID).collect();
+    b.down_w = gpu_upload_bf16(&dw);
+
+    // Paged KV cache: [NL * NUM_PAGES, KV_PAGE_SIZE, NKH, HDM]
+    // Pre-fill page 0 for each layer with pre_kv_len tokens (same data for all rows)
+    // Each row uses its own page (pages 0..batch_size-1 per layer)
+    let kv_pages_per_layer = NUM_PAGES;
+    let total_kv_pages = NL * kv_pages_per_layer;
+    let page_elems = KV_PAGE_SIZE * NKH * HDM;
+    let mut k_cache_data = vec![0.0_f32; total_kv_pages * page_elems];
+    let mut v_cache_data = vec![0.0_f32; total_kv_pages * page_elems];
+
+    // For each layer, each row gets its own page
+    for layer in 0..NL {
+        for row in 0..batch_size {
+            let page_idx = layer * kv_pages_per_layer + row;
+            let page_start = page_idx * page_elems;
+            // Fill pre_kv_len tokens: [token, NKH, HDM]
+            for t in 0..pre_kv_len {
+                for elem in 0..k_size {
+                    k_cache_data[page_start + t * NKH * HDM + elem] = prefilled_k[t * k_size + elem];
+                    v_cache_data[page_start + t * NKH * HDM + elem] = prefilled_v[t * v_size + elem];
+                }
+            }
+        }
+    }
+    b.k_cache = gpu_upload_bf16(&k_cache_data);
+    b.v_cache = gpu_upload_bf16(&v_cache_data);
+
+    // RoPE: identity (cos=1, sin=0)
+    let rope_cos_data = vec![1.0_f32; 4096 * HDM];
+    let rope_sin_data = vec![0.0_f32; 4096 * HDM];
+    b.rope_cos = gpu_upload_f32(&rope_cos_data);
+    b.rope_sin = gpu_upload_f32(&rope_sin_data);
+
+    // Activation buffers (silu_out used for QKV output by decode GEMM)
+    b.rms_rope = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+    b.q_post = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+    b.attn_out = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+    b.rms_gate = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+    b.silu_buf = gpu_alloc_zeros(ACT_ROWS * ID * BF16);
+
+    // Decode metadata
+    // Position IDs: all rows decode at position pre_kv_len
+    let pos_ids_data: Vec<i32> = (0..ACT_ROWS).map(|r| {
+        if r < batch_size { decode_pos as i32 } else { 0 }
+    }).collect();
+    b.pos_ids = gpu_upload_i32(&pos_ids_data);
+
+    // kv_indptr: CSR format. Each row has 1 page.
+    // Row i uses page i. kv_indptr = [0, 1, 2, 3, 4, ...]
+    let kv_indptr: Vec<i32> = (0..=batch_size as i32).collect();
+    let mut kv_indptr_full = vec![0_i32; ACT_ROWS + 1];
+    kv_indptr_full[..kv_indptr.len()].copy_from_slice(&kv_indptr);
+    b.kv_indptr = gpu_upload_i32(&kv_indptr_full);
+
+    // kv_indices: page indices. Row i → page i.
+    let mut kv_indices_data = vec![0_i32; NUM_PAGES];
+    for i in 0..batch_size {
+        kv_indices_data[i] = i as i32;
+    }
+    b.kv_indices = gpu_upload_i32(&kv_indices_data);
+
+    // kv_last_page_len: pre_kv_len tokens before this decode step
+    let kv_last_page_data: Vec<i32> = (0..ACT_ROWS).map(|r| {
+        if r < batch_size { pre_kv_len as i32 } else { 0 }
+    }).collect();
+    b.kv_last_page = gpu_upload_i32(&kv_last_page_data);
+
+    // kv_append: not used by v2 decode kernel (RoPE handles append)
+    b.kv_append = gpu_alloc_zeros(ACT_ROWS * 4);
+
+    let kv_pages = NL * NUM_PAGES;
+    let rc = unsafe {
+        ffi::fused_decode_layer_launch(
+            // VM state (unused by decode kernel but required by FFI)
+            BarrierArg::new(b.bar, NL, NUM_OPS, N_BATCH_BLOCKS, MAX_BARRIER_COLS),
+            TkTensorArg::raw(b.instr, &[SM_COUNT, MAX_PER_SM, INSTRUCTION_WIDTH]),
+            TkTensorArg::raw(b.timings, &[SM_COUNT, MAX_PER_SM, TIMING_WIDTH]),
+            // Weights
+            WeightArg::new(b.qkv_w, NL, QKV_DIM, HD),
+            NormWeightArg::new(b.attn_norm_w, NL, HD),
+            WeightArg::new(b.o_w, NL, HD, HD),
+            NormWeightArg::new(b.mlp_norm_w, NL, HD),
+            WeightArg::new(b.up_w, NL, ID, HD),
+            WeightArg::new(b.gate_w, NL, ID, HD),
+            WeightArg::new(b.down_w, NL, HD, ID),
+            NormWeightArg::new(b.lm_norm_w, 1, HD),
+            WeightArg::new(b.lm_w, 1, VS, HD),
+            // KV cache
+            KvCacheArg::new(b.k_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+            KvCacheArg::new(b.v_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+            // RoPE
+            RopeArg::new(b.rope_cos, 4096, HDM),
+            RopeArg::new(b.rope_sin, 4096, HDM),
+            // Activations
+            ActivationArg::new(b.hidden, ACT_ROWS, HD),
+            ActivationArg::new(b.rms_rope, ACT_ROWS, HD),
+            ActivationArg::new(b.rms_gate, ACT_ROWS, HD),
+            ActivationArg::new(b.q_post, ACT_ROWS, HD),
+            ActivationArg::new(b.attn_out, ACT_ROWS, HD),
+            ActivationArg::new(b.silu_buf, ACT_ROWS, ID),
+            ActivationArg::new(b.rms_lm, ACT_ROWS, HD),
+            LogitsArg::new(b.logits, ACT_ROWS, VS),
+            // Decode KV metadata
+            IntVecArg::new(b.pos_ids, ACT_ROWS),
+            IntVecArg::new(b.kv_indptr, ACT_ROWS + 1),
+            IntVecArg::new(b.kv_indices, NUM_PAGES),
+            IntVecArg::new(b.kv_last_page, ACT_ROWS),
+            IntVecArg::new(b.kv_append, ACT_ROWS),
+            // Prefill KV metadata (unused by decode)
+            IntVecArg::new(b.dummy_meta, 1),
+            IntVecArg::new(b.dummy_meta, 1),
+            IntVecArg::new(b.dummy_meta, 1),
+            IntVecArg::new(b.dummy_meta, 1),
+            // Scalars
+            attn_scale,
+            1e-5_f32,
+            NUM_PAGES as i32,
+            batch_size as i32,
+            0_i32, // num_prefill_tokens (unused)
+            NL as i32,
+            0_u64,
+        )
+    };
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    assert_eq!(rc, 0, "fused_decode_layer_launch returned error {rc}");
+
+    // Read back hidden_states
+    let gpu_out = gpu_download_bf16(b.hidden, ACT_ROWS * HD);
+
+    for r in 0..batch_size {
+        let gpu_row = &gpu_out[r * HD..(r + 1) * HD];
+        let cpu_row = &expected[r * HD..(r + 1) * HD];
+
+        eprintln!("DecodeLayer row={r} GPU[0..4]: {:?}", &gpu_row[..4]);
+        eprintln!("DecodeLayer row={r} CPU[0..4]: {:?}", &cpu_row[..4]);
+
+        // Higher tolerance: 8 chained ops per layer × NL layers + attention softmax
+        assert_close(
+            gpu_row,
+            cpu_row,
+            5.0,
+            0.5,
+            &format!("decode_layer_golden row={r}"),
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Fused decode layer: timing benchmark
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Timing test: fused decode layer kernel at various batch sizes.
+/// Reports per-forward-pass latency (all layers).
+#[test]
+#[ignore = "needs GPU"]
+#[cfg(feature = "cuda")]
+fn test_fused_decode_layer_timing() {
+    use cudarc::driver::sys;
+
+    init_cuda();
+
+    fn make_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 33) as i32 as f32) / (i32::MAX as f32) * scale
+            })
+            .collect()
+    }
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════╗");
+    eprintln!("║  Fused Decode Layer Timing (1B LLaMA, L40S)     ║");
+    eprintln!("║  {NL} layers, row-fused CTA, paged KV             ║");
+    eprintln!("╠══════════════════════════════════════════════════╣");
+
+    let pre_kv_len: usize = 128; // simulate 128-token context
+
+    for &bs in &[1_usize, 4, 8, 16, 32] {
+        let mut b = TestBuffers::new();
+        let input_f32: Vec<f32> = make_random(ACT_ROWS * HD, 42, 0.5);
+        b.hidden = gpu_upload_bf16(&input_f32);
+
+        // Weights
+        b.attn_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 10, 0.1)));
+        b.qkv_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * QKV_DIM * HD, 100, 0.01)));
+        b.o_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * HD, 150, 0.01)));
+        b.mlp_norm_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD, 20, 0.1)));
+        b.gate_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * ID * HD, 200, 0.01)));
+        b.up_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * ID * HD, 300, 0.01)));
+        b.down_w = gpu_upload_bf16(&bf16_roundtrip(&make_random(NL * HD * ID, 400, 0.01)));
+
+        // KV cache (pre-filled pages)
+        let kv_pages_total = NL * NUM_PAGES;
+        let page_elems = KV_PAGE_SIZE * NKH * HDM;
+        b.k_cache = gpu_upload_bf16(&make_random(kv_pages_total * page_elems, 5000, 0.1));
+        b.v_cache = gpu_upload_bf16(&make_random(kv_pages_total * page_elems, 6000, 0.1));
+
+        // RoPE (identity)
+        b.rope_cos = gpu_upload_f32(&vec![1.0_f32; 4096 * HDM]);
+        b.rope_sin = gpu_upload_f32(&vec![0.0_f32; 4096 * HDM]);
+
+        // Activations
+        b.rms_rope = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+        b.q_post = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+        b.attn_out = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+        b.rms_gate = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+        b.silu_buf = gpu_alloc_zeros(ACT_ROWS * ID * BF16);
+        b.rms_lm = gpu_alloc_zeros(ACT_ROWS * HD * BF16);
+        b.logits = gpu_alloc_zeros(ACT_ROWS * VS * BF16);
+
+        // Decode metadata: each row has pre_kv_len tokens in 1 page (fits in 64-token page)
+        // Use 2 pages if pre_kv_len > KV_PAGE_SIZE
+        let pages_per_row = (pre_kv_len + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE;
+        let last_page_tokens = pre_kv_len - (pages_per_row - 1) * KV_PAGE_SIZE;
+
+        let pos_ids: Vec<i32> = (0..ACT_ROWS).map(|r| {
+            if r < bs { pre_kv_len as i32 } else { 0 }
+        }).collect();
+        b.pos_ids = gpu_upload_i32(&pos_ids);
+
+        // kv_indptr: CSR, each row has pages_per_row pages
+        let mut kv_indptr = vec![0_i32; ACT_ROWS + 1];
+        for r in 0..=bs {
+            kv_indptr[r] = (r * pages_per_row) as i32;
+        }
+        b.kv_indptr = gpu_upload_i32(&kv_indptr);
+
+        // kv_indices: page indices
+        let mut kv_indices = vec![0_i32; NUM_PAGES];
+        for r in 0..bs {
+            for p in 0..pages_per_row {
+                kv_indices[r * pages_per_row + p] = (r * pages_per_row + p) as i32;
+            }
+        }
+        b.kv_indices = gpu_upload_i32(&kv_indices);
+
+        let kv_last_page: Vec<i32> = (0..ACT_ROWS).map(|r| {
+            if r < bs { last_page_tokens as i32 } else { 0 }
+        }).collect();
+        b.kv_last_page = gpu_upload_i32(&kv_last_page);
+        b.kv_append = gpu_alloc_zeros(ACT_ROWS * 4);
+
+        let kv_pages = NL * NUM_PAGES;
+
+        macro_rules! launch_decode {
+            () => {
+                unsafe {
+                    ffi::fused_decode_layer_launch(
+                        BarrierArg::new(b.bar, NL, NUM_OPS, N_BATCH_BLOCKS, MAX_BARRIER_COLS),
+                        TkTensorArg::raw(b.instr, &[SM_COUNT, MAX_PER_SM, INSTRUCTION_WIDTH]),
+                        TkTensorArg::raw(b.timings, &[SM_COUNT, MAX_PER_SM, TIMING_WIDTH]),
+                        WeightArg::new(b.qkv_w, NL, QKV_DIM, HD),
+                        NormWeightArg::new(b.attn_norm_w, NL, HD),
+                        WeightArg::new(b.o_w, NL, HD, HD),
+                        NormWeightArg::new(b.mlp_norm_w, NL, HD),
+                        WeightArg::new(b.up_w, NL, ID, HD),
+                        WeightArg::new(b.gate_w, NL, ID, HD),
+                        WeightArg::new(b.down_w, NL, HD, ID),
+                        NormWeightArg::new(b.lm_norm_w, 1, HD),
+                        WeightArg::new(b.lm_w, 1, VS, HD),
+                        KvCacheArg::new(b.k_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+                        KvCacheArg::new(b.v_cache, kv_pages, KV_PAGE_SIZE, NKH, HDM),
+                        RopeArg::new(b.rope_cos, 4096, HDM),
+                        RopeArg::new(b.rope_sin, 4096, HDM),
+                        ActivationArg::new(b.hidden, ACT_ROWS, HD),
+                        ActivationArg::new(b.rms_rope, ACT_ROWS, HD),
+                        ActivationArg::new(b.rms_gate, ACT_ROWS, HD),
+                        ActivationArg::new(b.q_post, ACT_ROWS, HD),
+                        ActivationArg::new(b.attn_out, ACT_ROWS, HD),
+                        ActivationArg::new(b.silu_buf, ACT_ROWS, ID),
+                        ActivationArg::new(b.rms_lm, ACT_ROWS, HD),
+                        LogitsArg::new(b.logits, ACT_ROWS, VS),
+                        IntVecArg::new(b.pos_ids, ACT_ROWS),
+                        IntVecArg::new(b.kv_indptr, ACT_ROWS + 1),
+                        IntVecArg::new(b.kv_indices, NUM_PAGES),
+                        IntVecArg::new(b.kv_last_page, ACT_ROWS),
+                        IntVecArg::new(b.kv_append, ACT_ROWS),
+                        IntVecArg::new(b.dummy_meta, 1),
+                        IntVecArg::new(b.dummy_meta, 1),
+                        IntVecArg::new(b.dummy_meta, 1),
+                        IntVecArg::new(b.dummy_meta, 1),
+                        1.0 / (HDM as f32).sqrt(),
+                        1e-5_f32,
+                        NUM_PAGES as i32,
+                        bs as i32,
+                        0_i32,
+                        NL as i32,
+                        0_u64,
+                    )
+                }
+            };
+        }
+
+        // Verify launch works
+        let rc = launch_decode!();
+        unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+        assert_eq!(rc, 0, "fused_decode_layer_launch error {rc} for bs={bs}");
+
+        // Warmup
+        for _ in 0..4 {
+            launch_decode!();
+        }
+        unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+
+        // Timed iterations
+        let num_iters = 50;
+        let mut start: sys::CUevent = std::ptr::null_mut();
+        let mut stop: sys::CUevent = std::ptr::null_mut();
+        unsafe {
+            sys::cuEventCreate(&mut start, 0);
+            sys::cuEventCreate(&mut stop, 0);
+            sys::cuEventRecord(start, std::ptr::null_mut());
+        }
+
+        for _ in 0..num_iters {
+            launch_decode!();
+        }
+
+        unsafe {
+            sys::cuEventRecord(stop, std::ptr::null_mut());
+            sys::cuEventSynchronize(stop);
+            let mut elapsed_ms: f32 = 0.0;
+            sys::cuEventElapsedTime(&mut elapsed_ms, start, stop);
+            let avg_ms = elapsed_ms / num_iters as f32;
+            let cta_rows = 16; // default config
+            let grid = (bs + cta_rows - 1) / cta_rows;
+            eprintln!("║  BS={bs:3}  kv={pre_kv_len:4}  grid={grid:2} CTAs  avg={avg_ms:8.3}ms  ║");
+            sys::cuEventDestroy_v2(start);
+            sys::cuEventDestroy_v2(stop);
+        }
+    }
+
+    eprintln!("╚══════════════════════════════════════════════════╝");
+    eprintln!();
+}

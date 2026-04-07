@@ -54,7 +54,8 @@
             for (int page = 0; page < num_kv_pages; page++) {
                 int kv_page_index = g.decode_kv_indices[{kv_start + page}];
                 int page_batch = (int)g.num_pages * layer + kv_page_index;
-                int valid_tokens = (page == num_kv_pages - 1) ? last_page_len : DEC_KV_PAGE_SIZE;
+                // +1 on last page: RoPE phase just appended the new token at slot last_page_len
+                int valid_tokens = (page == num_kv_pages - 1) ? (last_page_len + 1) : DEC_KV_PAGE_SIZE;
 
                 // Compute QK^T for each token in this page
                 for (int tok = 0; tok < valid_tokens; tok++) {

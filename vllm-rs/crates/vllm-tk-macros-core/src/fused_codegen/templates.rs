@@ -335,6 +335,15 @@ pub struct DecodeEpilogueResidualShmemCtx<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "fused/decode_epilogue_residual_global.cu", escape = "none")]
+pub struct DecodeEpilogueResidualGlobalCtx<'a> {
+    pub output_shmem_offset: usize,
+    pub col_var: &'a str,
+    pub a_size: usize,
+    pub b_size: usize,
+}
+
+#[derive(Template)]
 #[template(path = "fused/decode_rope_kv_append.cu", escape = "none")]
 pub struct DecodeRopeKvAppendCtx {
     pub hdm: usize,
@@ -370,4 +379,12 @@ pub struct DecodeFusedMlpCtx<'a> {
     pub a_size: usize,
     pub b_size: usize,
     pub num_stages: usize,
+    pub hd: usize,
+    pub id: usize,
+}
+
+#[derive(Template)]
+#[template(path = "fused/decode_shmem_to_global.cu", escape = "none")]
+pub struct DecodeShmemToGlobalCtx {
+    pub shmem_offset: usize,
 }

@@ -760,90 +760,23 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
     .render()
     .expect("decode preamble render");
 
-    // ── Phases ──
-    let rdpw = d.hd / cfg.num_warps;
+    // ── Storage assignment (DAG-driven polyalgorithm) ──
+    let storage = assign_decode_storage(dag, &d, cfg);
 
-    // Shmem layout offsets within phase_shm:
-    //   [0 .. hidden_shmem): hidden_states slab [padded_rows, HD] BF16
-    //   The rest is time-shared by different phases.
-    // For attention, we reuse the hidden slab area for Q and attn_out.
-    let q_stride = d.nah * d.hdm; // Q elements per row
-    let attn_out_stride = d.nah * d.hdm; // same as Q
+    // ── Phases: walk DAG ops in topological order ──
+    let mut phases = Vec::new();
+    let mut phase_names = Vec::new();
 
-    let hidden_offset = ShmemOffset(0);
-    let wgt_offset = ShmemOffset(d.hidden_shmem.0);
-    let scratch_offset = ShmemOffset(d.hidden_shmem.0 + d.hd * 2);
-
-    let phases: Vec<String> = vec![
-        // Phase 1: attn_norm (hidden_shmem → hidden_shmem, in-place)
-        render_decode_rmsnorm(
-            &d,
-            cfg,
-            "g.attn_norm_weights",
-            hidden_offset,
-            hidden_offset,
-            wgt_offset,
-            scratch_offset,
-            rdpw,
-        ),
-        // Phase 2: QKV GEMM (shmem activations × qkv_weights → global qkv output)
-        // Output goes to global because K/V need to be written to paged cache.
-        render_decode_gemm(
-            &d,
-            cfg,
-            "Phase 2: QKV GEMM (shmem × qkv_weights → silu_out)",
-            hidden_offset,
-            "g.qkv_weights",
-            d.hd_k_iters,
-            d.qkv_col_tiles,
-            DecodeEpilogueKind::StoreGlobal("g.silu_out"),
-        ),
-        // Phase 3: RoPE + KV cache append
-        // Reads QKV from global silu_out, applies RoPE, writes K/V to cache, Q to shmem
-        render_decode_rope_kv_append(&d, hidden_offset, q_stride),
-        // Phase 4: Decode attention (Q from shmem, KV from cache, output to shmem)
-        render_decode_attention(&d, hidden_offset, q_stride, hidden_offset, attn_out_stride),
-        // Phase 5: o_proj + residual (attn_out from shmem × o_weights + hidden → hidden)
-        // After attention, attn_out is in shmem at offset 0.
-        // hidden_states were written to global at start; we need to re-read.
-        // Actually, hidden_states are maintained in the hidden slab.
-        // But attention overwrote shmem... Let me reconsider.
-        //
-        // Design: hidden_states live at shmem offset 0 between attn_norm and the
-        // first GEMM. After QKV GEMM, the hidden slab is no longer needed for attn_norm
-        // output. We need hidden_states for the residual in o_proj.
-        //
-        // Solution: write hidden_states to global BEFORE the QKV GEMM,
-        // then read back for residual. OR: keep hidden in a separate slab.
-        //
-        // For now: read residual from global hidden_states.
-        render_decode_gemm(
-            &d,
-            cfg,
-            "Phase 5: o_proj + residual (attn_out × o_weights + hidden → hidden_shmem)",
-            hidden_offset,
-            "g.o_weights",
-            d.hd_k_iters,
-            d.hd_col_tiles,
-            DecodeEpilogueKind::ResidualShmem {
-                residual_offset: hidden_offset,
-                output_offset: hidden_offset,
-            },
-        ),
-        // Phase 6: mlp_norm (hidden_shmem → hidden_shmem, in-place)
-        render_decode_rmsnorm(
-            &d,
-            cfg,
-            "g.mlp_norm_weights",
-            hidden_offset,
-            hidden_offset,
-            wgt_offset,
-            scratch_offset,
-            rdpw,
-        ),
-        // Phase 7: Fused MLP (streaming gate+up+SiLU+down over ID tiles)
-        render_decode_fused_mlp(&d, cfg, hidden_offset, hidden_offset),
-    ];
+    for op in &dag.ops {
+        if !op.in_layer_loop {
+            continue;
+        }
+        let cuda = emit_decode_op(op, dag, &d, cfg, &storage);
+        if !cuda.is_empty() {
+            phase_names.push(phase_name_for_op(&op.kind));
+            phases.push(cuda);
+        }
+    }
 
     // ── Launch wrapper ──
     let mut tah = String::new();
@@ -861,18 +794,9 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
     .expect("decode launch_wrapper render");
 
     // ── Phase names ──
-    let phase_name_list = [
-        "attn_norm",
-        "QKV_GEMM",
-        "RoPE_KV",
-        "attention",
-        "o_proj",
-        "mlp_norm",
-        "fused_MLP",
-    ];
-    let phase_names_str = phase_name_list[..phases.len()]
+    let phase_names_str = phase_names
         .iter()
-        .map(|n| format!("\"{}\"", n))
+        .map(|n| format!("\"{n}\""))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -895,7 +819,7 @@ pub fn generate_fused_decode(dag: &ModelDag, cfg: &FusedDecodeConfig) -> String 
 
 // ── DAG-driven storage assignment ──────────────────────────────────────
 
-use crate::dag::{BufferId, BufferKind};
+use crate::dag::{BufferId, BufferKind, Op, OpKind};
 use std::collections::HashMap;
 
 /// Assign a `StorageStrategy` to each activation buffer in the DAG, based on
@@ -924,7 +848,7 @@ pub fn assign_decode_storage(
         let strategy = match buf.kind {
             BufferKind::Weight | BufferKind::KvCache | BufferKind::Metadata => {
                 StorageStrategy::Global {
-                    accessor: format!("g.{}", id.0),
+                    accessor: dag_name_to_global_accessor(&id.0),
                 }
             }
             BufferKind::Activation => {
@@ -936,66 +860,387 @@ pub fn assign_decode_storage(
     storage
 }
 
-/// Polyalgorithmic activation storage assignment.
+/// Polyalgorithmic activation storage assignment based on the producing op.
 ///
 /// Rules (for cta_rows=16, HD=2048):
-/// - `hidden_states`: Shmem(0) — persistent, 64KB, the primary slab
-/// - Norm outputs (`normed`, `mlp_normed`): FusedIntoConsumer — no separate buffer,
-///   inv_rms precomputed and applied during GEMM A-load. Keeps hidden in shmem.
-/// - `qkv`: Global — 3072 × 16 × 2 = 96KB, too large for shmem alongside hidden
-/// - `q_post_rope`: Shmem(0) — reuses hidden slab (hidden preserved via FusedIntoConsumer)
-/// - `attn_out`: Shmem(0) — reuses same region, feeds o_proj
-/// - `gate_out`, `up_out`, `silu_out` (MLP intermediates): Register — streaming
-/// - `mlp_out`: Shmem(0) — final result overwrites hidden slab
+/// - `hidden_states` (external input): Shmem(0) — persistent, 64KB
+/// - RmsNorm outputs: FusedIntoConsumer — norm fused into GEMM A-load
+/// - Gemm outputs where output dim > HD: Global (e.g., QKV = 3072 cols)
+/// - Gemm outputs where output dim ≤ HD: Shmem(0) (reuses hidden slab)
+/// - GemmAdd outputs: Shmem(0) — residual writes back to hidden slab
+/// - RopeAppend Q output: Shmem(0); K/V outputs: Global (paged cache)
+/// - AttentionDecode output: Shmem(0)
+/// - Silu/Mul outputs: Register — streaming MLP intermediates
 #[allow(dead_code)]
 fn assign_activation_storage(
     id: &BufferId,
-    _buf: &crate::dag::Buffer,
-    _dag: &ModelDag,
-    _d: &FusedDecodeDerived,
+    buf: &crate::dag::Buffer,
+    dag: &ModelDag,
+    d: &FusedDecodeDerived,
     hidden_offset: ShmemOffset,
     hidden_size: ByteSize,
 ) -> StorageStrategy {
-    match id.0.as_str() {
-        // Primary hidden state slab — persistent in shmem
-        "hidden_states" | "hidden_post_attn" | "hidden_post_mlp" => StorageStrategy::Shmem {
+    // External inputs (no producer) — hidden_states is the primary one
+    if buf.is_input {
+        return StorageStrategy::Shmem {
+            offset: hidden_offset,
+            size: hidden_size,
+        };
+    }
+
+    // Look at the producing op to determine storage
+    let producer_op = buf.producer.map(|idx| &dag.ops[idx].kind);
+    match producer_op {
+        Some(OpKind::RmsNorm { .. }) => {
+            // Norm outputs are fused into the consuming GEMM's A-load.
+            // No separate buffer needed — hidden_states stay in shmem.
+            StorageStrategy::FusedIntoConsumer
+        }
+
+        Some(OpKind::Gemm { b, .. }) => {
+            // If this Gemm's output feeds only into Silu or Mul (MLP intermediates),
+            // it should be Register — the fused MLP handles it inline.
+            if buf.consumers.len() == 1 {
+                let consumer_kind = &dag.ops[buf.consumers[0]].kind;
+                if matches!(consumer_kind, OpKind::Silu { .. } | OpKind::Mul { .. }) {
+                    return StorageStrategy::Register;
+                }
+            }
+
+            // Check the output dimension to decide shmem vs global.
+            // QKV GEMM outputs 3072 cols × 16 rows × 2B = 96KB → too large for shmem.
+            let out_cols = output_cols_for_weight(d, b);
+            if out_cols > d.hd {
+                StorageStrategy::Global {
+                    accessor: "g.silu_out".into(),
+                }
+            } else {
+                StorageStrategy::Shmem {
+                    offset: hidden_offset,
+                    size: hidden_size,
+                }
+            }
+        }
+
+        Some(OpKind::GemmAdd { .. }) => {
+            // GemmAdd writes residual result back to hidden slab
+            StorageStrategy::Shmem {
+                offset: hidden_offset,
+                size: hidden_size,
+            }
+        }
+
+        Some(OpKind::RopeAppend { q_out, .. }) => {
+            // Q goes to shmem, K/V go to paged cache (global)
+            if id == q_out {
+                StorageStrategy::Shmem {
+                    offset: hidden_offset,
+                    size: hidden_size,
+                }
+            } else {
+                StorageStrategy::Global {
+                    accessor: "g.kv_cache".into(),
+                }
+            }
+        }
+
+        Some(OpKind::AttentionDecode { .. }) => StorageStrategy::Shmem {
             offset: hidden_offset,
             size: hidden_size,
         },
 
-        // Norm outputs — fused into the consuming GEMM's A-load
-        "normed" | "mlp_normed" => StorageStrategy::FusedIntoConsumer,
+        Some(OpKind::Silu { .. }) | Some(OpKind::Mul { .. }) => {
+            // MLP intermediates — streaming in registers
+            StorageStrategy::Register
+        }
 
-        // QKV projection output — too large for shmem, goes to global
-        "qkv" => StorageStrategy::Global {
-            accessor: "g.silu_out".into(),
+        _ => StorageStrategy::Global {
+            accessor: format!("g.{}", id.0),
         },
+    }
+}
 
-        // Q after RoPE — lives in shmem, reuses hidden slab region
-        // (hidden is preserved because norm is FusedIntoConsumer)
-        "q_post_rope" => StorageStrategy::Shmem {
-            offset: hidden_offset,
-            size: hidden_size,
-        },
+/// Map DAG buffer names to globals struct field accessors.
+///
+/// The globals struct uses specific naming conventions (e.g., `attn_norm_weights`
+/// for the norm weight vector named `attn_norm` in the DSL). This function
+/// translates DAG buffer IDs to the correct `g.<field>` accessor strings.
+fn dag_name_to_global_accessor(name: &str) -> String {
+    match name {
+        // Norm weights: DSL says `attn_norm`, globals has `attn_norm_weights`
+        "attn_norm" => "g.attn_norm_weights".into(),
+        "mlp_norm" => "g.mlp_norm_weights".into(),
+        "lm_head_norm" => "g.lm_head_norm_weights".into(),
+        // O-proj: DSL says `o_proj`, globals says `o_weights`
+        "o_proj" => "g.o_weights".into(),
+        // Down-proj: DSL says `down_proj`, globals says `down_weights`
+        "down_proj" => "g.down_weights".into(),
+        // Everything else: g.<name> directly
+        other => format!("g.{other}"),
+    }
+}
 
-        // Attention output — same shmem region as Q (Q consumed before attn writes)
-        "attn_out" => StorageStrategy::Shmem {
-            offset: hidden_offset,
-            size: hidden_size,
-        },
+/// Generate a human-readable phase name from an op kind.
+fn phase_name_for_op(kind: &OpKind) -> String {
+    match kind {
+        OpKind::RmsNorm { weights, .. } => {
+            let w = &weights.0;
+            if w.contains("attn") {
+                "attn_norm".into()
+            } else if w.contains("mlp") {
+                "mlp_norm".into()
+            } else {
+                format!("rmsnorm_{w}")
+            }
+        }
+        OpKind::Gemm { b, .. } => {
+            let w = &b.0;
+            if w.contains("qkv") {
+                "QKV_GEMM".into()
+            } else {
+                format!("GEMM_{w}")
+            }
+        }
+        OpKind::GemmAdd { b, .. } => {
+            let w = &b.0;
+            if w.contains("o_") {
+                "o_proj".into()
+            } else if w.contains("down") {
+                "fused_MLP".into()
+            } else {
+                format!("GemmAdd_{w}")
+            }
+        }
+        OpKind::RopeAppend { .. } => "RoPE_KV".into(),
+        OpKind::AttentionDecode { .. } => "attention".into(),
+        OpKind::Silu { .. } => "silu".into(),
+        OpKind::Mul { .. } => "mul".into(),
+        OpKind::AttentionPrefill { .. } => "attn_prefill".into(),
+    }
+}
 
-        // K/V outputs go to paged cache (global)
-        "k_out" | "v_out" => StorageStrategy::Global {
-            accessor: "g.kv_cache".into(),
-        },
+/// Get the output column count for a GEMM based on the weight buffer.
+fn output_cols_for_weight(d: &FusedDecodeDerived, weight: &BufferId) -> usize {
+    let name = weight.0.as_str();
+    match name {
+        n if n.contains("qkv") => d.qkv_dim,
+        n if n.contains("o_proj") || n.contains("o_weight") => d.hd,
+        n if n.contains("gate") || n.contains("up") => d.id,
+        n if n.contains("down") => d.hd,
+        n if n.contains("lm_head") => d.vs,
+        _ => d.hd, // conservative default
+    }
+}
 
-        // MLP intermediates — streaming in registers, never materialized
-        "gate_out" | "up_out" | "silu_mul_out" => StorageStrategy::Register,
+// ── DAG-driven op emitter ──────────────────────────────────────────────
 
-        // Fallback: anything else goes to global
-        other => StorageStrategy::Global {
-            accessor: format!("g.{other}"),
-        },
+/// Emit CUDA code for a single decode DAG op, choosing the right template
+/// variant based on the storage strategies of its inputs and outputs.
+///
+/// This is the core dispatch function: match on `OpKind` × storage strategy.
+#[allow(dead_code)]
+fn emit_decode_op(
+    op: &Op,
+    _dag: &ModelDag,
+    d: &FusedDecodeDerived,
+    cfg: &FusedDecodeConfig,
+    storage: &HashMap<BufferId, StorageStrategy>,
+) -> String {
+    match &op.kind {
+        OpKind::RmsNorm {
+            input,
+            weights,
+            output,
+        } => {
+            let out_strategy = &storage[output];
+            match out_strategy {
+                StorageStrategy::FusedIntoConsumer => {
+                    // Norm is fused into the consuming GEMM's A-load.
+                    // Emit just the inv_rms precompute (TODO: implement fused norm template).
+                    // For now, emit the standard norm but in-place.
+                    let in_offset = shmem_offset_of(storage, input);
+                    let out_offset = in_offset; // in-place when fused
+                    let wgt_offset = ShmemOffset(d.hidden_shmem.0);
+                    let scratch_offset = ShmemOffset(d.hidden_shmem.0 + d.hd * 2);
+                    let rdpw = d.hd / cfg.num_warps;
+                    let weight_global = weight_accessor(storage, weights);
+                    render_decode_rmsnorm(
+                        d,
+                        cfg,
+                        &weight_global,
+                        in_offset,
+                        out_offset,
+                        wgt_offset,
+                        scratch_offset,
+                        rdpw,
+                    )
+                }
+                StorageStrategy::Shmem { offset, .. } => {
+                    let in_offset = shmem_offset_of(storage, input);
+                    let wgt_offset = ShmemOffset(d.hidden_shmem.0);
+                    let scratch_offset = ShmemOffset(d.hidden_shmem.0 + d.hd * 2);
+                    let rdpw = d.hd / cfg.num_warps;
+                    let weight_global = weight_accessor(storage, weights);
+                    render_decode_rmsnorm(
+                        d,
+                        cfg,
+                        &weight_global,
+                        in_offset,
+                        *offset,
+                        wgt_offset,
+                        scratch_offset,
+                        rdpw,
+                    )
+                }
+                other => panic!("RmsNorm output storage {other:?} not supported for decode"),
+            }
+        }
+
+        OpKind::Gemm { a, b, output } => {
+            let out_strategy = &storage[output];
+            let input_offset = shmem_offset_of(storage, a);
+            let weight_global = weight_accessor(storage, b);
+
+            // Determine K iters and col tiles from the weight shape
+            let (k_iters, col_tiles) = gemm_shape_for_weight(d, b);
+
+            let epilogue = match out_strategy {
+                StorageStrategy::Shmem { offset, .. } => {
+                    // Determine stride from output dimension
+                    let stride = output_stride_for(d, output);
+                    DecodeEpilogueKind::StoreShmem(*offset, stride)
+                }
+                StorageStrategy::Global { accessor } => DecodeEpilogueKind::StoreGlobal(accessor),
+                StorageStrategy::Register => {
+                    // Register outputs are handled by the fused MLP path (gate/up GEMMs)
+                    return String::new();
+                }
+                StorageStrategy::FusedIntoConsumer => {
+                    // Fused outputs are absorbed by the consumer — nothing to emit
+                    return String::new();
+                }
+            };
+
+            let phase_comment = format!("GEMM: {} × {} → {}", a.0, b.0, output.0);
+            render_decode_gemm(
+                d,
+                cfg,
+                &phase_comment,
+                input_offset,
+                &weight_global,
+                k_iters,
+                col_tiles,
+                epilogue,
+            )
+        }
+
+        OpKind::GemmAdd {
+            a,
+            b,
+            residual,
+            output,
+        } => {
+            let a_strategy = &storage[a];
+
+            // If the input is Register, this is the fused MLP down_proj path
+            // (gate*up in registers → down_proj GEMM + residual add).
+            // Emit the entire fused MLP block instead of a standalone GemmAdd.
+            if matches!(a_strategy, StorageStrategy::Register) {
+                // The fused MLP handles gate+SiLU+up+mul+down+residual as one block.
+                // Find the norm input — it's the hidden_states before the MLP norm.
+                let residual_offset = shmem_offset_of(storage, residual);
+                let input_offset = residual_offset; // mlp_norm reads from hidden slab
+                return render_decode_fused_mlp(d, cfg, input_offset, residual_offset);
+            }
+
+            let input_offset = shmem_offset_of(storage, a);
+            let weight_global = weight_accessor(storage, b);
+            let (k_iters, col_tiles) = gemm_shape_for_weight(d, b);
+
+            let residual_offset = shmem_offset_of(storage, residual);
+            let output_offset = shmem_offset_of(storage, output);
+
+            let epilogue = DecodeEpilogueKind::ResidualShmem {
+                residual_offset,
+                output_offset,
+            };
+
+            let phase_comment =
+                format!("GemmAdd: {} × {} + {} → {}", a.0, b.0, residual.0, output.0);
+            render_decode_gemm(
+                d,
+                cfg,
+                &phase_comment,
+                input_offset,
+                &weight_global,
+                k_iters,
+                col_tiles,
+                epilogue,
+            )
+        }
+
+        OpKind::RopeAppend { q_out, .. } => {
+            let q_offset = shmem_offset_of(storage, q_out);
+            let q_stride = d.nah * d.hdm;
+            render_decode_rope_kv_append(d, q_offset, q_stride)
+        }
+
+        OpKind::AttentionDecode { q, output, .. } => {
+            let q_offset = shmem_offset_of(storage, q);
+            let q_stride = d.nah * d.hdm;
+            let out_offset = shmem_offset_of(storage, output);
+            let out_stride = d.nah * d.hdm;
+            render_decode_attention(d, q_offset, q_stride, out_offset, out_stride)
+        }
+
+        // Silu/Mul are handled inline by the fused MLP path, not emitted separately
+        OpKind::Silu { .. } | OpKind::Mul { .. } => String::new(),
+
+        OpKind::AttentionPrefill { .. } => {
+            panic!("AttentionPrefill not supported in decode emitter")
+        }
+    }
+}
+
+/// Extract shmem offset from a buffer's storage strategy. Panics if not Shmem.
+fn shmem_offset_of(storage: &HashMap<BufferId, StorageStrategy>, buf: &BufferId) -> ShmemOffset {
+    match &storage[buf] {
+        StorageStrategy::Shmem { offset, .. } => *offset,
+        // FusedIntoConsumer outputs are computed in-place from their input's shmem
+        StorageStrategy::FusedIntoConsumer => ShmemOffset(0),
+        other => panic!("Expected Shmem for {}, got {other:?}", buf.0),
+    }
+}
+
+/// Get the global accessor string for a weight buffer.
+fn weight_accessor(storage: &HashMap<BufferId, StorageStrategy>, buf: &BufferId) -> String {
+    match &storage[buf] {
+        StorageStrategy::Global { accessor } => accessor.clone(),
+        other => panic!("Expected Global for weight {}, got {other:?}", buf.0),
+    }
+}
+
+/// Determine K-loop iterations and column tiles for a GEMM based on the weight buffer name.
+fn gemm_shape_for_weight(d: &FusedDecodeDerived, weight: &BufferId) -> (KIters, TileCount) {
+    let name = weight.0.as_str();
+    match name {
+        n if n.contains("qkv") => (d.hd_k_iters, d.qkv_col_tiles),
+        n if n.contains("o_proj") || n.contains("o_weight") => (d.hd_k_iters, d.hd_col_tiles),
+        n if n.contains("gate") || n.contains("up") => (d.hd_k_iters, d.id_col_tiles),
+        n if n.contains("down") => (d.id_k_iters, d.hd_col_tiles),
+        n if n.contains("lm_head") => (d.hd_k_iters, TileCount(d.vs / d.out_block)),
+        _ => panic!("Unknown weight buffer: {name}"),
+    }
+}
+
+/// Determine output stride (elements per row) for a buffer.
+fn output_stride_for(d: &FusedDecodeDerived, buf: &BufferId) -> usize {
+    match buf.0.as_str() {
+        "hidden_states" | "hidden_post_attn" | "hidden_post_mlp" | "normed" | "mlp_normed" => d.hd,
+        "qkv" => d.qkv_dim,
+        "q_post_rope" | "attn_out" => d.nah * d.hdm,
+        "gate_out" | "up_out" => d.id,
+        _ => d.hd, // default
     }
 }
 
@@ -1529,5 +1774,44 @@ mod tests {
                 "qkv must be Global"
             );
         }
+    }
+
+    #[test]
+    fn emit_decode_ops_from_dag() {
+        let dag = build_1b_dag();
+        let cfg = config::FusedDecodeConfig::decode_rows16();
+        let d = derived::FusedDecodeDerived::new(&dag, &cfg);
+        let storage = assign_decode_storage(&dag, &d, &cfg);
+
+        // Emit each in-layer-loop op via the dispatcher
+        let mut phases = Vec::new();
+        for op in &dag.ops {
+            if !op.in_layer_loop {
+                continue;
+            }
+            let cuda = emit_decode_op(op, &dag, &d, &cfg, &storage);
+            if !cuda.is_empty() {
+                phases.push(cuda);
+            }
+        }
+
+        // Should have generated phases for: rmsnorm, QKV gemm, rope, attention,
+        // o_proj gemm_add, mlp_norm rmsnorm, fused MLP (gate gemm, up gemm, down gemm_add)
+        // Silu and Mul emit empty strings (handled by fused MLP path)
+        assert!(
+            phases.len() >= 5,
+            "expected at least 5 non-empty phases, got {}",
+            phases.len()
+        );
+
+        // Check key content in emitted phases
+        let all = phases.join("\n");
+        assert!(all.contains("rms_norm_eps"), "missing RmsNorm");
+        assert!(all.contains("mma_ABt_base"), "missing GEMM MMA");
+        assert!(all.contains("g.qkv_weights"), "missing QKV weights");
+        assert!(
+            all.contains("g.o_proj") || all.contains("g.o_weights"),
+            "missing o_proj"
+        );
     }
 }

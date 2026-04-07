@@ -117,6 +117,40 @@ impl FusedPrefillConfig {
         }
     }
 
+    /// 128-row cooperative GEMM with wider output tiles (out_block=128).
+    /// Halves col_tiles (64→32 for ID GEMMs), doubles output per K-loop pass.
+    /// Shmem: 2 × (8×8192 + 16384) = 2×81920 — TOO BIG (160KB > 99KB).
+    /// But with out_block=128 and k_dim=64: b=128×64×2=16384, a=32×64×2=4096
+    /// stage = 8×4096 + 16384 = 49152, gemm = 2×49152 = 98304 = 96KB. Fits!
+    pub fn rows128_wide() -> Self {
+        Self {
+            cta_rows: 128,
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: 64,
+            out_block: 128,
+            num_warps: 8,
+            kv_page_size: 64,
+            col_batch: 1,
+        }
+    }
+
+    /// 64-row cooperative GEMM with k_dim=128.
+    /// Halves K-loop iterations (32→16 for HD GEMMs, 64→32 for ID).
+    /// 4 warps × 16 rows = 64 rows. Each warp does 2× compute per iteration.
+    /// a_size = 32×128×2 = 8192, b_size = 64×128×2 = 16384
+    /// stage = 4×8192 + 16384 = 49152, gemm = 2×49152 = 98304 = 96KB. Fits!
+    pub fn rows64_k128() -> Self {
+        Self {
+            cta_rows: 64,
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: 128,
+            out_block: 64,
+            num_warps: 4,
+            kv_page_size: 64,
+            col_batch: 1,
+        }
+    }
+
     pub fn rows_per_warp(&self) -> usize {
         self.cta_rows / self.num_warps
     }

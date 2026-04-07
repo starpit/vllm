@@ -19,6 +19,7 @@ fn build_cuda() {
 
     // Re-run build.rs when the fused prefill backend selector changes
     println!("cargo:rerun-if-env-changed=TK_FUSED_PREFILL");
+    println!("cargo:rerun-if-env-changed=TK_FUSED_DECODE");
 
     // Set up cudaforge cache directory
     let cache_dir = dirs::cache_dir()
@@ -157,6 +158,14 @@ fn build_cuda() {
     std::fs::write(&fused_layer_path, &fused_layer_source)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_layer_path.display()));
     cu_files.push(fused_layer_path.display().to_string());
+
+    // Fused decode kernel (v2 template-driven, row-fused architecture)
+    let fused_decode_source = vllm_tk_macros_core::generate_fused_decode_kernel(dsl)
+        .unwrap_or_else(|e| panic!("fused decode codegen failed: {e}"));
+    let fused_decode_path = out_dir.join("fused_decode.cu");
+    std::fs::write(&fused_decode_path, &fused_decode_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_decode_path.display()));
+    cu_files.push(fused_decode_path.display().to_string());
 
     // Build all test kernels into one static library
     cudaforge::KernelBuilder::new()

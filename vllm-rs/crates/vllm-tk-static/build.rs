@@ -122,6 +122,14 @@ fn build_cuda() {
         std::fs::write(&cu_path, &cuda_source)
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", cu_path.display()));
         cu_files.push(cu_path.display().to_string());
+
+        // Also generate the fused decode kernel for this variant
+        let decode_source = vllm_tk_macros_core::generate_fused_decode_kernel(&dsl)
+            .unwrap_or_else(|e| panic!("fused decode codegen failed for variant {name}: {e}"));
+        let decode_path = out_dir.join(format!("{name}_decode.cu"));
+        std::fs::write(&decode_path, &decode_source)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", decode_path.display()));
+        cu_files.push(decode_path.display().to_string());
     }
 
     // Build ALL variants into one static library

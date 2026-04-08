@@ -157,28 +157,7 @@ fn scheduled_megakernel_executes_topologically() {
     let kernel_waves = unsafe { ffi::scheduled_megakernel_num_waves() };
     eprintln!("scheduled_megakernel: {n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
 
-    let hd = dims.hidden_dim as usize;
-    let id = dims.intermediate_dim as usize;
-    let qkv_dim = ((dims.num_attn_heads + 2 * dims.num_kv_heads) * dims.head_dim) as usize;
-    let seq = dims.seq_len as usize;
-    let nl = dims.num_layers as usize;
-
-    // Buffers — minimal allocation just to make the kernel happy. Random fill.
-    let h_data = random_bf16(seq * hd, 1, 0.5);
-    let an_w_data = random_bf16(nl * hd, 2, 1.0);
-    let mn_w_data = random_bf16(nl * hd, 3, 1.0);
-
-    let b = TestBuffers {
-        hidden_states: gpu_upload_bf16(&h_data),
-        rms_rope: gpu_alloc_zeros(seq * hd * 2),
-        qkv: gpu_alloc_zeros(seq * qkv_dim * 2),
-        attn_out: gpu_alloc_zeros(seq * hd * 2),
-        rms_gate: gpu_alloc_zeros(seq * hd * 2),
-        silu_out: gpu_alloc_zeros(seq * id * 2),
-        attn_norm_w: gpu_upload_bf16(&an_w_data),
-        mlp_norm_w: gpu_upload_bf16(&mn_w_data),
-    };
-
+    let (b, _, _, _, _) = build_test_buffers();
     let (ticks, final_tick) = launch_with_buffers(&b, 1e-5);
     eprintln!("final tick = {final_tick}");
 
@@ -212,56 +191,23 @@ fn scheduled_megakernel_executes_topologically() {
     }
 }
 
-#[test]
-#[ignore = "needs GPU"]
-fn tile_attn_norm_matches_cpu_golden() {
-    init_cuda();
-    let dims = scheduled_prefill_tiny_dims();
-    let hd = dims.hidden_dim as usize;
-    let seq = dims.seq_len as usize;
-    let nl = dims.num_layers as usize;
-    let id = dims.intermediate_dim as usize;
-    let qkv_dim = ((dims.num_attn_heads + 2 * dims.num_kv_heads) * dims.head_dim) as usize;
-    let eps: f32 = 1e-5;
-
-    // Random fixed-seed input — must be deterministic so the test is reproducible.
-    let h_data = random_bf16(seq * hd, 1, 0.5);
-    let an_w_data = random_bf16(nl * hd, 2, 1.0);
-    let mn_w_data = random_bf16(nl * hd, 3, 1.0);
-
-    let b = TestBuffers {
-        hidden_states: gpu_upload_bf16(&h_data),
-        rms_rope: gpu_alloc_zeros(seq * hd * 2),
-        qkv: gpu_alloc_zeros(seq * qkv_dim * 2),
-        attn_out: gpu_alloc_zeros(seq * hd * 2),
-        rms_gate: gpu_alloc_zeros(seq * hd * 2),
-        silu_out: gpu_alloc_zeros(seq * id * 2),
-        attn_norm_w: gpu_upload_bf16(&an_w_data),
-        mlp_norm_w: gpu_upload_bf16(&mn_w_data),
-    };
-
-    let _ = launch_with_buffers(&b, eps);
-
-    // Read back rms_rope and validate against CPU golden.
-    // Because all downstream tiles are still placeholders (no writes to
-    // hidden_states), every layer's attn_norm reads the SAME hidden_states.
-    // Each row in rms_rope should match the rms_norm of that hidden_states
-    // row using the LAST layer's weights to write — actually no, multiple
-    // layers write to the same rms_rope buffer. Whichever attn_norm tile
-    // executed last for that row wins. The wave schedule executes layers in
-    // order, so layer (NL-1)'s attn_norm runs after layer 0..NL-2 — its
-    // output is what we'll see.
-    let rms_rope_gpu = gpu_download_bf16(b.rms_rope, seq * hd);
-    let last_layer_w = &an_w_data[(nl - 1) * hd..nl * hd];
-
+/// Helper: validate that GPU output matches the CPU golden row-by-row.
+/// The golden is computed by `golden_fn(row_idx)` so each test can supply
+/// its own per-row reference.
+fn assert_matches_golden<F: Fn(usize) -> Vec<bf16>>(
+    gpu: &[bf16],
+    seq: usize,
+    hd: usize,
+    label: &str,
+    golden_fn: F,
+) {
     let mut max_abs_err = 0.0_f32;
     let mut max_rel_err = 0.0_f32;
     for r in 0..seq {
-        let x_row = &h_data[r * hd..(r + 1) * hd];
-        let golden = cpu_rms_norm(x_row, last_layer_w, eps);
+        let golden = golden_fn(r);
         for c in 0..hd {
             let g = golden[c].to_f32();
-            let k = rms_rope_gpu[r * hd + c].to_f32();
+            let k = gpu[r * hd + c].to_f32();
             let abs = (g - k).abs();
             let rel = if g.abs() > 1e-3 { abs / g.abs() } else { 0.0 };
             if abs > max_abs_err {
@@ -273,16 +219,88 @@ fn tile_attn_norm_matches_cpu_golden() {
         }
     }
     eprintln!(
-        "tile_attn_norm vs CPU golden: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
+        "{label}: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
         max_rel_err * 100.0
     );
-    // bf16 has ~3 decimal digits of precision; tolerance reflects that.
     assert!(
         max_abs_err < 0.05,
-        "max abs err {max_abs_err} too large vs CPU golden"
+        "{label}: max abs err {max_abs_err} too large"
     );
     assert!(
         max_rel_err < 0.05,
-        "max rel err {max_rel_err} too large vs CPU golden"
+        "{label}: max rel err {max_rel_err} too large"
     );
+}
+
+/// Build the standard set of test buffers for the tiny model. Inputs are
+/// pre-filled with deterministic random data so each tile body has
+/// meaningful input even when its upstream tiles are still placeholders.
+fn build_test_buffers() -> (TestBuffers, Vec<bf16>, Vec<bf16>, Vec<bf16>, Vec<bf16>) {
+    let dims = scheduled_prefill_tiny_dims();
+    let hd = dims.hidden_dim as usize;
+    let seq = dims.seq_len as usize;
+    let nl = dims.num_layers as usize;
+    let id = dims.intermediate_dim as usize;
+    let qkv_dim = ((dims.num_attn_heads + 2 * dims.num_kv_heads) * dims.head_dim) as usize;
+
+    let h_data = random_bf16(seq * hd, 1, 0.5);
+    let an_w_data = random_bf16(nl * hd, 2, 1.0);
+    let mn_w_data = random_bf16(nl * hd, 3, 1.0);
+    let attn_out_data = random_bf16(seq * hd, 4, 0.5);
+
+    let b = TestBuffers {
+        hidden_states: gpu_upload_bf16(&h_data),
+        rms_rope: gpu_alloc_zeros(seq * hd * 2),
+        qkv: gpu_alloc_zeros(seq * qkv_dim * 2),
+        attn_out: gpu_upload_bf16(&attn_out_data),
+        rms_gate: gpu_alloc_zeros(seq * hd * 2),
+        silu_out: gpu_alloc_zeros(seq * id * 2),
+        attn_norm_w: gpu_upload_bf16(&an_w_data),
+        mlp_norm_w: gpu_upload_bf16(&mn_w_data),
+    };
+    (b, h_data, an_w_data, mn_w_data, attn_out_data)
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn tile_attn_norm_matches_cpu_golden() {
+    init_cuda();
+    let dims = scheduled_prefill_tiny_dims();
+    let hd = dims.hidden_dim as usize;
+    let seq = dims.seq_len as usize;
+    let nl = dims.num_layers as usize;
+    let eps: f32 = 1e-5;
+
+    let (b, h_data, an_w_data, _, _) = build_test_buffers();
+    let _ = launch_with_buffers(&b, eps);
+
+    // The wave schedule executes layers in order, so layer (NL-1)'s attn_norm
+    // is the last writer for each row in rms_rope. Validate against that.
+    let rms_rope_gpu = gpu_download_bf16(b.rms_rope, seq * hd);
+    let last_layer_w = &an_w_data[(nl - 1) * hd..nl * hd];
+    assert_matches_golden(&rms_rope_gpu, seq, hd, "tile_attn_norm", |r| {
+        cpu_rms_norm(&h_data[r * hd..(r + 1) * hd], last_layer_w, eps)
+    });
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn tile_mlp_norm_matches_cpu_golden() {
+    init_cuda();
+    let dims = scheduled_prefill_tiny_dims();
+    let hd = dims.hidden_dim as usize;
+    let seq = dims.seq_len as usize;
+    let nl = dims.num_layers as usize;
+    let eps: f32 = 1e-5;
+
+    let (b, _, _, mn_w_data, attn_out_data) = build_test_buffers();
+    let _ = launch_with_buffers(&b, eps);
+
+    // Last writer wins: layer (NL-1)'s mlp_norm. attn_out is non-zero
+    // (pre-filled by build_test_buffers) so the validation is meaningful.
+    let rms_gate_gpu = gpu_download_bf16(b.rms_gate, seq * hd);
+    let last_layer_w = &mn_w_data[(nl - 1) * hd..nl * hd];
+    assert_matches_golden(&rms_gate_gpu, seq, hd, "tile_mlp_norm", |r| {
+        cpu_rms_norm(&attn_out_data[r * hd..(r + 1) * hd], last_layer_w, eps)
+    });
 }

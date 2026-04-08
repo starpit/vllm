@@ -325,7 +325,41 @@ __device__ __forceinline__ void tile_qkv      (const globals_t&, uint32_t /*laye
 __device__ __forceinline__ void tile_rope     (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/) {}
 __device__ __forceinline__ void tile_attention(const globals_t&, uint32_t /*layer*/, uint32_t /*row*/) {}
 __device__ __forceinline__ void tile_o_proj   (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
-__device__ __forceinline__ void tile_mlp_norm (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/) {}
+
+// ── tile_mlp_norm: real RMS norm, same structure as tile_attn_norm but
+// reads attn_out and writes rms_gate using mlp_norm_w. ──
+__device__ __forceinline__ void tile_mlp_norm(const globals_t& g, uint32_t layer, uint32_t row) {
+    constexpr uint32_t HD       = MODEL_HIDDEN_DIM;
+    constexpr uint32_t ROW_TILE = MODEL_ROW_TILE;
+    const uint32_t row_start = row * ROW_TILE;
+    const __nv_bfloat16* w = g.mlp_norm_w + (size_t)layer * HD;
+    const uint32_t lane = threadIdx.x;
+
+    #pragma unroll 1
+    for (uint32_t r = 0; r < ROW_TILE; ++r) {
+        const uint32_t row_idx = row_start + r;
+        if (row_idx >= MODEL_SEQ_LEN) break;
+        const __nv_bfloat16* x = g.attn_out + (size_t)row_idx * HD;
+        __nv_bfloat16*       y = g.rms_gate + (size_t)row_idx * HD;
+
+        float my_sum = 0.0f;
+        for (uint32_t c = lane; c < HD; c += 32) {
+            float v = __bfloat162float(x[c]);
+            my_sum += v * v;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            my_sum += __shfl_xor_sync(0xffffffff, my_sum, offset);
+        }
+        const float scale = rsqrtf(my_sum / float(HD) + g.eps);
+
+        for (uint32_t c = lane; c < HD; c += 32) {
+            float xv = __bfloat162float(x[c]);
+            float wv = __bfloat162float(w[c]);
+            y[c] = __float2bfloat16(xv * scale * wv);
+        }
+    }
+}
+
 __device__ __forceinline__ void tile_gate_up  (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
 __device__ __forceinline__ void tile_down     (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
 

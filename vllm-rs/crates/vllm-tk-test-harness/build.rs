@@ -190,6 +190,16 @@ fn build_cuda() {
     let cutlass_include = cutlass_root.join("include");
     let cutlass_tools_util = cutlass_root.join("tools/util/include");
 
+    // FlashInfer headers — pinned via cudaforge git dependency. Cudaforge
+    // clones+caches the repo at the pinned commit into
+    // `~/.cudaforge/git/checkouts/flashinfer-<hash>/`, shared across
+    // worktrees and version-locked by the SHA below. Used by upcoming
+    // attention/gemm/norm/rope tile bodies that call FlashInfer device-
+    // side primitives instead of being hand-written.
+    //
+    // Bump this commit deliberately and rerun goldens.
+    const FLASHINFER_COMMIT: &str = "08ab45d67705b301ee66e63c6999c934c72dd41c";
+
     let mut builder = cudaforge::KernelBuilder::new();
     builder = builder
         .out_dir(&cache_dir)
@@ -197,7 +207,14 @@ fn build_cuda() {
         .watch(header_files)
         .include_path(tk_include.display().to_string())
         .include_path(tk_prototype.display().to_string())
-        .include_path(tk_csrc.display().to_string());
+        .include_path(tk_csrc.display().to_string())
+        .with_git_dependency(
+            "flashinfer",
+            "https://github.com/flashinfer-ai/flashinfer.git",
+            FLASHINFER_COMMIT,
+            vec!["include"],
+            /*recurse_submodules=*/ false,
+        );
     if cutlass_include.exists() {
         println!("cargo:warning=cutlass found at {}", cutlass_root.display());
         builder = builder

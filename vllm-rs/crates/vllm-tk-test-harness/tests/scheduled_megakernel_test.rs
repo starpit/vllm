@@ -601,12 +601,7 @@ fn read_golden(variant: &str) -> Vec<bf16> {
 }
 
 /// Validate a GPU output buffer against a committed golden file.
-fn assert_matches_committed_golden(
-    variant: &str,
-    gpu: &[bf16],
-    abs_tol: f32,
-    rel_tol: f32,
-) {
+fn assert_matches_committed_golden(variant: &str, gpu: &[bf16], abs_tol: f32, rel_tol: f32) {
     let golden = read_golden(variant);
     assert_eq!(
         gpu.len(),
@@ -620,14 +615,8 @@ fn assert_matches_committed_golden(
         "{variant} h_final vs golden: max_abs_err={abs:.5}  max_rel_err={:.4}%",
         rel * 100.0
     );
-    assert!(
-        abs < abs_tol,
-        "{variant}: abs err {abs} >= tol {abs_tol}"
-    );
-    assert!(
-        rel < rel_tol,
-        "{variant}: rel err {rel} >= tol {rel_tol}"
-    );
+    assert!(abs < abs_tol, "{variant}: abs err {abs} >= tol {abs_tol}");
+    assert!(rel < rel_tol, "{variant}: rel err {rel} >= tol {rel_tol}");
 }
 
 fn errs(gpu: &[bf16], cpu: &[bf16]) -> (f32, f32) {
@@ -1237,9 +1226,7 @@ fn llama_1b_seq1024_bench() {
     eprintln!();
     eprintln!("╔════════════════════════════════════════════════════════════╗");
     eprintln!("║  scheduled megakernel: llama_3_2_1b @ seq=1024              ║");
-    eprintln!(
-        "║  {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs"
-    );
+    eprintln!("║  {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
     eprintln!("╠════════════════════════════════════════════════════════════╣");
 
     // Validation buffers (allocated once, reused across launches). The
@@ -1340,8 +1327,14 @@ fn llama_1b_seq1024_bench() {
         }
     }
     let labels = [
-        "attn_norm", "qkv      ", "rope     ", "attention",
-        "o_proj   ", "mlp_norm ", "gate_up  ", "down     ",
+        "attn_norm",
+        "qkv      ",
+        "rope     ",
+        "attention",
+        "o_proj   ",
+        "mlp_norm ",
+        "gate_up  ",
+        "down     ",
         "idle/sync",
     ];
     // L4 SM clock under load: ~1.5 GHz. Convert clocks → ms.
@@ -1387,9 +1380,7 @@ fn llama_1b_seq64_h_final_matches_committed_golden() {
     let kernel_n = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq64_num_nodes() };
     let kernel_ctas = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq64_num_ctas() };
     let kernel_waves = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq64_num_waves() };
-    eprintln!(
-        "  kernel: {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs"
-    );
+    eprintln!("  kernel: {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
 
     let launch_start = std::time::Instant::now();
     let _ = launch_with_buffers(

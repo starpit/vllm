@@ -276,6 +276,7 @@ mod tests {
     use super::*;
     use crate::kernel_library::coalesce;
     use crate::reified_dag::{LlamaDims, ReifiedDag, TileSizes};
+    use crate::target_profile::TargetProfile;
 
     fn llama_1b_dims(seq: u32) -> LlamaDims {
         LlamaDims {
@@ -330,21 +331,23 @@ mod tests {
     #[test]
     fn num_waves_equals_critical_path_in_nodes() {
         // The minimum-K partition has exactly critical-path-depth waves.
+        let profile = TargetProfile::l4_sm89();
         let reified = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
         let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
-        let sched = partition_into_waves(&dag, 58, &cost, 100);
+        let sched = partition_into_waves(&dag, profile.cooperative_grid_size(), &cost, 100);
         let cp_nodes = reified.critical_path_depth();
         assert_eq!(sched.num_waves(), cp_nodes as usize);
     }
 
     #[test]
     fn schedule_1b_seq1024_smoke() {
+        let profile = TargetProfile::l4_sm89();
         let reified = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
         let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
         // 100 mma units ≈ 1.0 µs at 1.5 GHz — ballpark for an L4 gmem-flag barrier.
-        let sched = partition_into_waves(&dag, 58, &cost, 100);
+        let sched = partition_into_waves(&dag, profile.cooperative_grid_size(), &cost, 100);
 
         let l4_clock_hz = 1.5e9;
         eprintln!(

@@ -43,13 +43,6 @@ using namespace flashinfer;
 
 namespace {
 
-// Workspaces. The float buffer holds `partial_o` (per-CTA per-Q-tile fp32
-// partial outputs across all KV splits) and `partial_lse`. With L4's 58 SMs
-// and FlashInfer using 2 CTAs/SM, the partial_o footprint at seq=64 head_dim=64
-// already pushes ~68 MiB. Size generously to cover seq up to 4096.
-constexpr size_t kFloatWorkspaceBytes = 512ull * 1024 * 1024;
-constexpr size_t kIntWorkspaceBytes = 64ull * 1024 * 1024;
-
 // Cast helper that adds a byte offset to a void* and reinterprets.
 template <typename T>
 __host__ __device__ inline T* offset_ptr(void* base, size_t byte_offset) {
@@ -76,7 +69,8 @@ extern "C" int32_t run_flashinfer_attention_smoke(
     int32_t* kv_indices,        // device  [num_pages]
     DTypeO* o,                  // device  [seq_len, num_qo_heads, head_dim]
     int32_t seq_len, int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
-    int32_t page_size, int32_t num_pages, float sm_scale, cudaStream_t stream) {
+    int32_t page_size, int32_t num_pages, size_t float_ws_bytes, size_t int_ws_bytes,
+    float sm_scale, cudaStream_t stream) {
   if (head_dim != HEAD_DIM_QK) {
     std::fprintf(stderr,
                  "flashinfer_attention_shim: head_dim=%d does not match "
@@ -90,14 +84,14 @@ extern "C" int32_t run_flashinfer_attention_smoke(
   void* int_ws_d = nullptr;
   void* int_ws_h = nullptr;  // page-locked mirror — required by TwoStageHolisticPlan
 
-  if (cudaMalloc(&float_ws_d, kFloatWorkspaceBytes) != cudaSuccess) {
+  if (cudaMalloc(&float_ws_d, float_ws_bytes) != cudaSuccess) {
     return static_cast<int32_t>(FlashInferShimStatus::CudaMallocFailed);
   }
-  if (cudaMalloc(&int_ws_d, kIntWorkspaceBytes) != cudaSuccess) {
+  if (cudaMalloc(&int_ws_d, int_ws_bytes) != cudaSuccess) {
     cudaFree(float_ws_d);
     return static_cast<int32_t>(FlashInferShimStatus::CudaMallocFailed);
   }
-  if (cudaMallocHost(&int_ws_h, kIntWorkspaceBytes) != cudaSuccess) {
+  if (cudaMallocHost(&int_ws_h, int_ws_bytes) != cudaSuccess) {
     cudaFree(float_ws_d);
     cudaFree(int_ws_d);
     return static_cast<int32_t>(FlashInferShimStatus::CudaMallocHostFailed);
@@ -110,7 +104,7 @@ extern "C" int32_t run_flashinfer_attention_smoke(
 
   HolisticPlanInfo<2> plan_info;
   cudaError_t status = TwoStageHolisticPlan<IdType>(
-      float_ws_d, kFloatWorkspaceBytes, int_ws_d, int_ws_h, kIntWorkspaceBytes, plan_info,
+      float_ws_d, float_ws_bytes, int_ws_d, int_ws_h, int_ws_bytes, plan_info,
       qo_indptr_h, kv_indptr_h, kv_len_h, /*batch_size=*/1, num_qo_heads, num_kv_heads, head_dim,
       /*causal=*/true, stream);
   if (status != cudaSuccess) {
@@ -502,8 +496,8 @@ extern "C" int32_t setup_flashinfer_params_for_megakernel(
     DTypeQ* q_post_rope, DTypeKV* k_cache_layer0, DTypeKV* v_cache_layer0, int32_t* kv_indices,
     DTypeO* attn_out, int32_t seq_len, int32_t num_qo_heads, int32_t num_kv_heads,
     int32_t head_dim, int32_t page_size, int32_t pages_per_layer, int32_t num_layers,
-    int32_t target_num_clusters, float sm_scale, cudaStream_t stream,
-    FlashInferAttentionPlan* out_plan) {
+    int32_t target_num_clusters, size_t float_ws_bytes, size_t int_ws_bytes, float sm_scale,
+    cudaStream_t stream, FlashInferAttentionPlan* out_plan) {
   if (head_dim != HEAD_DIM_QK) {
     std::fprintf(stderr,
                  "setup_flashinfer_params_for_megakernel: head_dim=%d does not match "
@@ -517,14 +511,14 @@ extern "C" int32_t setup_flashinfer_params_for_megakernel(
   out_plan->int_ws_h = nullptr;
   out_plan->params_d = nullptr;
 
-  if (cudaMalloc(&out_plan->float_ws_d, kFloatWorkspaceBytes) != cudaSuccess) {
+  if (cudaMalloc(&out_plan->float_ws_d, float_ws_bytes) != cudaSuccess) {
     return static_cast<int32_t>(FlashInferShimStatus::CudaMallocFailed);
   }
-  if (cudaMalloc(&out_plan->int_ws_d, kIntWorkspaceBytes) != cudaSuccess) {
+  if (cudaMalloc(&out_plan->int_ws_d, int_ws_bytes) != cudaSuccess) {
     cudaFree(out_plan->float_ws_d);
     return static_cast<int32_t>(FlashInferShimStatus::CudaMallocFailed);
   }
-  if (cudaMallocHost(&out_plan->int_ws_h, kIntWorkspaceBytes) != cudaSuccess) {
+  if (cudaMallocHost(&out_plan->int_ws_h, int_ws_bytes) != cudaSuccess) {
     cudaFree(out_plan->float_ws_d);
     cudaFree(out_plan->int_ws_d);
     return static_cast<int32_t>(FlashInferShimStatus::CudaMallocHostFailed);
@@ -541,8 +535,8 @@ extern "C" int32_t setup_flashinfer_params_for_megakernel(
   // num_blks_y == NUM_CTAS in the megakernel template — see the
   // function-level comment on TwoStageHolisticPlanWithNumSm.
   cudaError_t status = TwoStageHolisticPlanWithNumSm<IdType>(
-      out_plan->float_ws_d, kFloatWorkspaceBytes, out_plan->int_ws_d, out_plan->int_ws_h,
-      kIntWorkspaceBytes, plan_info, qo_indptr_h, kv_indptr_h, kv_len_h, /*batch_size=*/1,
+      out_plan->float_ws_d, float_ws_bytes, out_plan->int_ws_d, out_plan->int_ws_h,
+      int_ws_bytes, plan_info, qo_indptr_h, kv_indptr_h, kv_len_h, /*batch_size=*/1,
       num_qo_heads, num_kv_heads, head_dim, /*causal=*/true, stream,
       /*num_sm_in=*/target_num_clusters);
   if (status != cudaSuccess) {

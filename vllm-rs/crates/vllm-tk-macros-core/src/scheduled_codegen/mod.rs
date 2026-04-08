@@ -30,7 +30,9 @@ use askama::Template;
 
 use crate::kernel_library::{BoundKernel, CoalescedDag};
 use crate::schedule::WaveSchedule;
-use crate::target_profile::TargetProfile;
+use crate::target_profile::{
+    AttentionKernelChoice, GemmKernelChoice, NormKernelChoice, RopeKernelChoice, TargetProfile,
+};
 
 mod templates;
 
@@ -142,8 +144,89 @@ pub fn emit_scheduled_megakernel_cu(
         target_cooperative_blocks_per_sm: profile.cooperative_blocks_per_sm,
         target_num_clusters: profile.cooperative_grid_size(),
         target_max_dynamic_shmem_bytes: profile.max_dynamic_shmem_bytes,
+
+        target_gemm_kernel: gemm_kernel_tag(&profile.gemm_kernel),
+        target_attention_kernel: attention_kernel_tag(&profile.attention_kernel),
+        target_norm_kernel: norm_kernel_tag(&profile.norm_kernel),
+        target_rope_kernel: rope_kernel_tag(&profile.rope_kernel),
+
+        target_gemm_tile_m: gemm_tile_m(&profile.gemm_kernel),
+        target_gemm_tile_n: gemm_tile_n(&profile.gemm_kernel),
+        target_gemm_tile_k: gemm_tile_k(&profile.gemm_kernel),
+        target_gemm_pipeline_stages: gemm_pipeline_stages(&profile.gemm_kernel),
     };
     ctx.render().expect("scheduled megakernel template render")
+}
+
+// ── Kernel choice → string tag conversion ─────────────────────────
+//
+// askama can't pattern-match Rust enums; the codegen flattens each
+// `*KernelChoice` to a stable string tag the template branches on
+// via `{% if target_gemm_kernel == "..." %}`. Tags are stable across
+// codegen versions — bumping the FlashInfer / CUTLASS dep should
+// not require renaming them. New variants get new tags here.
+
+fn gemm_kernel_tag(c: &GemmKernelChoice) -> &'static str {
+    match c {
+        GemmKernelChoice::HandWrittenWmma => "hand_written_wmma",
+        GemmKernelChoice::CutlassSm80Multistage { .. } => "cutlass_sm80_multistage",
+        GemmKernelChoice::CutlassSm90WarpspecializedSs => "cutlass_sm90_warpspecialized_ss",
+    }
+}
+
+fn attention_kernel_tag(c: &AttentionKernelChoice) -> &'static str {
+    match c {
+        AttentionKernelChoice::FlashInferPersistent => "flashinfer_persistent",
+        AttentionKernelChoice::HandWrittenCooperativeFa2 => "hand_written_cooperative_fa2",
+    }
+}
+
+fn norm_kernel_tag(c: &NormKernelChoice) -> &'static str {
+    match c {
+        NormKernelChoice::HandWrittenWarpShuffle => "hand_written_warp_shuffle",
+        NormKernelChoice::FlashInferNormCuh => "flashinfer_norm_cuh",
+    }
+}
+
+fn rope_kernel_tag(c: &RopeKernelChoice) -> &'static str {
+    match c {
+        RopeKernelChoice::HandWrittenSplitHalf => "hand_written_split_half",
+        RopeKernelChoice::FlashInferPosEncCuh => "flashinfer_pos_enc_cuh",
+    }
+}
+
+// GEMM tile-shape extractors. The HandWrittenWmma variant carries no
+// tile shape (it's hardcoded inside the template body); the codegen
+// emits zeros, and the template branch ignores them.
+fn gemm_tile_m(c: &GemmKernelChoice) -> u32 {
+    match c {
+        GemmKernelChoice::HandWrittenWmma => 0,
+        GemmKernelChoice::CutlassSm80Multistage { tile_m, .. } => *tile_m,
+        GemmKernelChoice::CutlassSm90WarpspecializedSs => 0,
+    }
+}
+fn gemm_tile_n(c: &GemmKernelChoice) -> u32 {
+    match c {
+        GemmKernelChoice::HandWrittenWmma => 0,
+        GemmKernelChoice::CutlassSm80Multistage { tile_n, .. } => *tile_n,
+        GemmKernelChoice::CutlassSm90WarpspecializedSs => 0,
+    }
+}
+fn gemm_tile_k(c: &GemmKernelChoice) -> u32 {
+    match c {
+        GemmKernelChoice::HandWrittenWmma => 0,
+        GemmKernelChoice::CutlassSm80Multistage { tile_k, .. } => *tile_k,
+        GemmKernelChoice::CutlassSm90WarpspecializedSs => 0,
+    }
+}
+fn gemm_pipeline_stages(c: &GemmKernelChoice) -> u32 {
+    match c {
+        GemmKernelChoice::HandWrittenWmma => 0,
+        GemmKernelChoice::CutlassSm80Multistage {
+            pipeline_stages, ..
+        } => *pipeline_stages,
+        GemmKernelChoice::CutlassSm90WarpspecializedSs => 0,
+    }
 }
 
 /// Render `WAVE_OPS` as `  { phase, layer, row, col },\n` per entry.

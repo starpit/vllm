@@ -426,6 +426,11 @@ pub mod ffi {
             head_dim: i32,
             page_size: i32,
             num_pages: i32,
+            // Workspaces sized by the caller (typically derived from
+            // `TargetProfile::flashinfer_*_workspace_bytes`). No
+            // magic numbers in the C++ shim.
+            float_ws_bytes: usize,
+            int_ws_bytes: usize,
             sm_scale: f32,
             stream: u64,
         ) -> i32;
@@ -481,6 +486,11 @@ pub mod ffi {
             // work_indptr[blockIdx.y] indexing covers all the
             // planned work.
             target_num_clusters: i32,
+            // Workspaces sized by the caller (typically derived from
+            // `TargetProfile::flashinfer_*_workspace_bytes`). No
+            // magic numbers in the C++ shim.
+            float_ws_bytes: usize,
+            int_ws_bytes: usize,
             sm_scale: f32,
             stream: u64,
             out_plan: *mut FlashInferAttentionPlan,

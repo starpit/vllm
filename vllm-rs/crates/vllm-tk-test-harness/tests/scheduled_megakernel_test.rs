@@ -191,6 +191,8 @@ fn build_flashinfer_plan(b: &TestBuffers, dims: LlamaDims) -> ffi::FlashInferAtt
             pages_per_layer,
             dims.num_layers as i32,
             profile.cooperative_grid_size() as i32,
+            profile.flashinfer_float_workspace_bytes(dims.head_dim, dims.num_kv_heads),
+            profile.flashinfer_int_workspace_bytes(),
             sm_scale,
             /*stream=*/ 0,
             &mut plan,

@@ -21,6 +21,7 @@
 
 use cudarc::driver::result;
 use half::bf16;
+use vllm_tk_macros_core::target_profile::TargetProfile;
 use vllm_tk_test_harness::ffi;
 
 // ── Test dims (small enough that the CPU reference runs in milliseconds) ──
@@ -250,6 +251,13 @@ fn flashinfer_attention_runner_smoke() {
     let kv_indices_d = gpu_upload_i32(&kv_indices);
     let o_d = gpu_alloc_bf16(SEQ_LEN * NUM_QO_HEADS * HEAD_DIM);
 
+    // ── Workspace sizes from the target profile (no magic
+    //    constants in the C++ shim or here) ──
+    let profile = TargetProfile::l4_sm89();
+    let float_ws_bytes =
+        profile.flashinfer_float_workspace_bytes(HEAD_DIM as u32, NUM_KV_HEADS as u32);
+    let int_ws_bytes = profile.flashinfer_int_workspace_bytes();
+
     // ── Run shim ──
     let status = unsafe {
         ffi::run_flashinfer_attention_smoke(
@@ -264,6 +272,8 @@ fn flashinfer_attention_runner_smoke() {
             HEAD_DIM as i32,
             PAGE_SIZE as i32,
             NUM_PAGES as i32,
+            float_ws_bytes,
+            int_ws_bytes,
             sm_scale,
             /*stream=*/ 0,
         )

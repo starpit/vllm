@@ -69,4 +69,23 @@ pub struct MegakernelCtx<'a> {
     pub target_num_clusters: u32,
     /// Per-block dynamic shmem ceiling, in bytes.
     pub target_max_dynamic_shmem_bytes: u32,
+
+    // ── Kernel choices (rendered as plain string tags so the
+    //    template can `{% if target_gemm_kernel == "..." %}` branch
+    //    on them). Each tag corresponds to a `*KernelChoice` enum
+    //    variant in `crate::target_profile`.
+    pub target_gemm_kernel: &'static str,
+    pub target_attention_kernel: &'static str,
+    pub target_norm_kernel: &'static str,
+    pub target_rope_kernel: &'static str,
+
+    // ── GEMM tile shape parameters (only meaningful when
+    //    target_gemm_kernel is one of the CUTLASS variants).
+    //    Rendered unconditionally so the template can substitute
+    //    them into the cute boilerplate. For HandWrittenWmma the
+    //    template branch ignores them.
+    pub target_gemm_tile_m: u32,
+    pub target_gemm_tile_n: u32,
+    pub target_gemm_tile_k: u32,
+    pub target_gemm_pipeline_stages: u32,
 }

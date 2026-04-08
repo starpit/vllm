@@ -640,128 +640,187 @@ __device__ __forceinline__ void tile_rope(const globals_t& g, uint32_t layer, ui
         }
     }
 }
-// ── tile_attention: paged FA-2 online softmax for one ROW_TILE-row tile.
+// ── tile_attention: 8-warp cooperative paged FA-2 with shmem K/V staging.
 //
-// Reads Q from q_post_rope[row, NAH * HEAD_DIM], K/V from the paged caches
-// via prefill_kv_indices. Causal mask: each query at position p attends to
-// keys 0..=p. GQA-aware: kv_head = q_head / GQA_RATIO.
+// Each warp owns ROWS_PER_WARP = ROW_TILE / N_WARPS consecutive rows of
+// the row tile (typically 16/8 = 2 rows per warp). All 8 warps share K
+// and V via shmem, loaded cooperatively one (kv_head, page) at a time.
 //
-// Per (row, q_head) we run a streaming online softmax scan:
+// Per q_head:
+//   - Each warp loads its 2 Q vectors into registers
+//   - Per-row online softmax state (m, l, O) lives in registers
+//   - For each page in 0..num_pages:
+//       all 256 threads load K[page, kv_head, :] and V[page, kv_head, :]
+//       into shmem, __syncthreads
+//       each warp: for each key in the page, dot product, causal mask,
+//                  online softmax update, V accumulator
+//   - After all pages: divide O by l, write to attn_out
 //
-//   m = -inf, l = 0, O = 0
-//   for k in 0..=p:
-//     score   = (q · K[k]) * attn_scale
-//     m_new   = max(m, score)
-//     alpha   = exp(m - m_new)
-//     se      = exp(score - m_new)
-//     O       = O * alpha + se * V[k]
-//     l       = l * alpha + se
-//     m       = m_new
-//   out       = O / l
+// Causal mask is per-row (warps own different rows with different q_pos).
+// num_pages is computed from cta_max_attend so all warps stay in lockstep
+// at the cooperative load + sync. Warps whose rows don't need a particular
+// page just skip the inner work for that page.
 //
-// 32 threads cooperate on one (row, head) at a time. Each lane owns
-// HEAD_DIM/32 elements of the head dimension. Q stays in registers across
-// the entire k-loop. K/V are reloaded per k from the paged cache. Score is
-// reduced via warp shuffle.
-//
-// This is correct, paged, masked, and numerically stable. It is NOT fast —
-// no shmem K/V staging, no cp.async, no warp-level mma. Phase 4 will swap
-// in the FA-2 implementation from the existing kernel's templates.
-__device__ __forceinline__ void tile_attention(const globals_t& g, uint32_t layer, uint32_t row) {
-    if (threadIdx.x >= 32) return;  // warp 0 only
+// Shmem footprint: K_smem (PAGE_SIZE × HDM × 2 B) + V_smem same. For
+// PAGE_SIZE=16, HDM=64: 4 KB total. Fits comfortably in the tile_smem
+// arena alongside any other tile body.
+__device__ __forceinline__ void tile_attention(
+    const globals_t& g, uint32_t layer, uint32_t row, char* tile_smem)
+{
     constexpr uint32_t HDM             = MODEL_HEAD_DIM;
     constexpr uint32_t NAH             = MODEL_NUM_ATTN_H;
     constexpr uint32_t NKH             = MODEL_NUM_KV_H;
     constexpr uint32_t GQA_RATIO       = NAH / NKH;
-    constexpr uint32_t HD_FULL         = NAH * HDM;            // attn_out dim
-    constexpr uint32_t Q_DIM           = NAH * HDM;            // q_post_rope row stride
+    constexpr uint32_t HD_FULL         = NAH * HDM;
+    constexpr uint32_t Q_DIM           = NAH * HDM;
     constexpr uint32_t ROW_TILE        = MODEL_ROW_TILE;
     constexpr uint32_t PAGE_SIZE       = MODEL_KV_PAGE_SIZE;
     constexpr uint32_t PAGES_PER_LAYER = MODEL_PAGES_PER_LAYER;
-    constexpr uint32_t SLOT_STRIDE     = NKH * HDM;
-    constexpr uint32_t PAGE_STRIDE     = PAGE_SIZE * NKH * HDM;
-    constexpr uint32_t D_PER_LANE      = HDM / 32;             // head_dim chunks per thread
-    static_assert(HDM % 32 == 0, "tile_attention assumes HEAD_DIM % 32 == 0");
-    const uint32_t lane = threadIdx.x;
+    constexpr uint32_t N_WARPS         = 8;
+    constexpr uint32_t ROWS_PER_WARP   = ROW_TILE / N_WARPS;
+    constexpr uint32_t D_PER_LANE      = HDM / 32;
+    static_assert(ROW_TILE == N_WARPS * ROWS_PER_WARP,
+                  "tile_attention: ROW_TILE must be 8 * ROWS_PER_WARP");
+    static_assert(HDM % 32 == 0, "tile_attention: HEAD_DIM must be multiple of 32");
+
     const uint32_t row_start = row * ROW_TILE;
+    if (row_start >= MODEL_SEQ_LEN) return;
+    const uint32_t warp_id = threadIdx.x / 32;
+    const uint32_t lane    = threadIdx.x % 32;
+    const uint32_t my_r0   = warp_id * ROWS_PER_WARP;
+
+    // Shmem partition: K_smem | V_smem (each [PAGE_SIZE, HDM] row-major).
+    __nv_bfloat16* k_smem = reinterpret_cast<__nv_bfloat16*>(tile_smem);
+    __nv_bfloat16* v_smem = k_smem + PAGE_SIZE * HDM;
+
     const float attn_scale = g.attn_scale;
 
-    #pragma unroll 1
-    for (uint32_t r = 0; r < ROW_TILE; ++r) {
-        const uint32_t row_idx = row_start + r;
-        if (row_idx >= MODEL_SEQ_LEN) break;
-        const uint32_t attend_len = row_idx + 1;  // causal: keys 0..=row_idx
+    // CTA-wide max q_pos determines how many pages every warp must walk
+    // (so that the cooperative loads stay in lockstep across warps).
+    const uint32_t cta_max_qpos =
+        (row_start + ROW_TILE - 1 < MODEL_SEQ_LEN) ? (row_start + ROW_TILE - 1)
+                                                   : (MODEL_SEQ_LEN - 1);
+    const uint32_t cta_max_attend = cta_max_qpos + 1;
+    const uint32_t num_pages = (cta_max_attend + PAGE_SIZE - 1) / PAGE_SIZE;
 
-        for (uint32_t h = 0; h < NAH; ++h) {
-            const uint32_t kv_head = h / GQA_RATIO;
+    // Outer loop: q_head. Each iteration processes ALL rows (for all 8
+    // warps) against the same kv_head's K/V data, so the cooperative load
+    // amortizes across all 16 rows in the tile.
+    for (uint32_t h = 0; h < NAH; ++h) {
+        const uint32_t kv_head = h / GQA_RATIO;
 
-            // Load Q[row_idx, h, :] into registers (D_PER_LANE elements per lane).
-            float q_reg[D_PER_LANE];
+        // Load Q for this warp's rows into registers.
+        float q_reg[ROWS_PER_WARP][D_PER_LANE];
+        #pragma unroll
+        for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+            const uint32_t row_idx = row_start + my_r0 + r;
             #pragma unroll
             for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
                 const uint32_t d = dd * 32 + lane;
-                q_reg[dd] = __bfloat162float(
-                    g.q_post_rope[(size_t)row_idx * Q_DIM + h * HDM + d]);
+                if (row_idx < MODEL_SEQ_LEN) {
+                    q_reg[r][dd] = __bfloat162float(
+                        g.q_post_rope[(size_t)row_idx * Q_DIM + h * HDM + d]);
+                } else {
+                    q_reg[r][dd] = 0.0f;
+                }
             }
+        }
 
-            // Online softmax state.
-            float o_reg[D_PER_LANE];
+        // Per-row online softmax state.
+        float m_state[ROWS_PER_WARP];
+        float l_state[ROWS_PER_WARP];
+        float o_reg[ROWS_PER_WARP][D_PER_LANE];
+        #pragma unroll
+        for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+            m_state[r] = -1e30f;
+            l_state[r] = 0.0f;
             #pragma unroll
             for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
-                o_reg[dd] = 0.0f;
+                o_reg[r][dd] = 0.0f;
             }
-            float m_state = -1e30f;
-            float l_state = 0.0f;
+        }
 
-            // Stream over keys 0..=row_idx.
-            for (uint32_t k_pos = 0; k_pos < attend_len; ++k_pos) {
-                // Paged cache offset for this key position.
-                const uint32_t logical_page = k_pos / PAGE_SIZE;
-                const uint32_t slot = k_pos % PAGE_SIZE;
-                const int32_t physical_page = g.prefill_kv_indices[logical_page]
-                                              + (int32_t)layer * (int32_t)PAGES_PER_LAYER;
-                const size_t slot_base = (size_t)physical_page * PAGE_STRIDE
-                                         + (size_t)slot * SLOT_STRIDE
-                                         + (size_t)kv_head * HDM;
-                const __nv_bfloat16* K_slot = g.k_cache + slot_base;
-                const __nv_bfloat16* V_slot = g.v_cache + slot_base;
+        // Page loop: cooperative K/V load + per-row scan.
+        for (uint32_t p = 0; p < num_pages; ++p) {
+            // Resolve the (kv_head, page) slice in gmem.
+            const int32_t physical_page =
+                g.prefill_kv_indices[p] + (int32_t)layer * (int32_t)PAGES_PER_LAYER;
+            const size_t page_off =
+                (size_t)physical_page * PAGE_SIZE * NKH * HDM
+                + (size_t)kv_head * HDM;
+            const __nv_bfloat16* k_src = g.k_cache + page_off;
+            const __nv_bfloat16* v_src = g.v_cache + page_off;
 
-                // Dot product q · K[k_pos].
-                float score_partial = 0.0f;
+            // Cooperative gmem→shmem load. 256 threads, PAGE_SIZE * HDM
+            // elements per buffer = (16*64) / 256 = 4 elements per thread.
+            for (uint32_t i = threadIdx.x; i < PAGE_SIZE * HDM; i += 256) {
+                const uint32_t k_local = i / HDM;
+                const uint32_t d       = i % HDM;
+                k_smem[k_local * HDM + d] = k_src[k_local * NKH * HDM + d];
+                v_smem[k_local * HDM + d] = v_src[k_local * NKH * HDM + d];
+            }
+            __syncthreads();
+
+            // How many keys in this page are valid (last page may be short).
+            const uint32_t page_kv_start = p * PAGE_SIZE;
+            const uint32_t valid_keys =
+                (page_kv_start + PAGE_SIZE <= cta_max_attend)
+                    ? PAGE_SIZE
+                    : (cta_max_attend - page_kv_start);
+
+            // Per-warp scan: each row in this warp processes its valid keys.
+            for (uint32_t k_local = 0; k_local < valid_keys; ++k_local) {
+                const uint32_t k_pos = page_kv_start + k_local;
                 #pragma unroll
-                for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
-                    const uint32_t d = dd * 32 + lane;
-                    score_partial += q_reg[dd] * __bfloat162float(K_slot[d]);
-                }
-                // Warp-shuffle reduce → all lanes hold the full dot.
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    score_partial += __shfl_xor_sync(0xffffffff, score_partial, offset);
-                }
-                const float score = score_partial * attn_scale;
+                for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+                    const uint32_t q_pos = row_start + my_r0 + r;
+                    if (q_pos >= MODEL_SEQ_LEN) continue;
+                    if (k_pos > q_pos) continue;  // causal mask
 
-                // Online softmax update.
-                const float m_new = fmaxf(m_state, score);
-                const float alpha = __expf(m_state - m_new);
-                const float se    = __expf(score   - m_new);
+                    // Q[r] · K[k_local].
+                    float score_partial = 0.0f;
+                    #pragma unroll
+                    for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
+                        const uint32_t d = dd * 32 + lane;
+                        score_partial += q_reg[r][dd]
+                                       * __bfloat162float(k_smem[k_local * HDM + d]);
+                    }
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        score_partial +=
+                            __shfl_xor_sync(0xffffffff, score_partial, offset);
+                    }
+                    const float score = score_partial * attn_scale;
 
-                #pragma unroll
-                for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
-                    const uint32_t d = dd * 32 + lane;
-                    const float vv = __bfloat162float(V_slot[d]);
-                    o_reg[dd] = o_reg[dd] * alpha + se * vv;
+                    // Online softmax update.
+                    const float m_new = fmaxf(m_state[r], score);
+                    const float alpha = __expf(m_state[r] - m_new);
+                    const float se    = __expf(score      - m_new);
+                    #pragma unroll
+                    for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
+                        const uint32_t d = dd * 32 + lane;
+                        const float vv = __bfloat162float(v_smem[k_local * HDM + d]);
+                        o_reg[r][dd] = o_reg[r][dd] * alpha + se * vv;
+                    }
+                    l_state[r] = l_state[r] * alpha + se;
+                    m_state[r] = m_new;
                 }
-                l_state = l_state * alpha + se;
-                m_state = m_new;
             }
 
-            // Normalize and write out.
-            const float inv_l = 1.0f / l_state;
+            __syncthreads();  // before next page overwrites shmem
+        }
+
+        // Normalize and write attn_out for this warp's rows / this q_head.
+        #pragma unroll
+        for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+            const uint32_t row_idx = row_start + my_r0 + r;
+            if (row_idx >= MODEL_SEQ_LEN) continue;
+            const float inv_l = 1.0f / l_state[r];
             #pragma unroll
             for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
                 const uint32_t d = dd * 32 + lane;
                 g.attn_out[(size_t)row_idx * HD_FULL + h * HDM + d] =
-                    __float2bfloat16(o_reg[dd] * inv_l);
+                    __float2bfloat16(o_reg[r][dd] * inv_l);
             }
         }
     }
@@ -1153,7 +1212,7 @@ __global__ void scheduled_megakernel(globals_t g, SchedRuntime rt) {
                 case PHASE_ATTN_NORM: tile_attn_norm(g, op.layer, op.row); break;
                 case PHASE_QKV:       tile_qkv      (g, op.layer, op.row, op.col, tile_smem); break;
                 case PHASE_ROPE:      tile_rope     (g, op.layer, op.row); break;
-                case PHASE_ATTENTION: tile_attention(g, op.layer, op.row); break;
+                case PHASE_ATTENTION: tile_attention(g, op.layer, op.row, tile_smem); break;
                 case PHASE_O_PROJ:    tile_o_proj   (g, op.layer, op.row, op.col, tile_smem); break;
                 case PHASE_MLP_NORM:  tile_mlp_norm (g, op.layer, op.row); break;
                 case PHASE_GATE_UP:   tile_gate_up  (g, op.layer, op.row, op.col, tile_smem); break;

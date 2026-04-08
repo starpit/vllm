@@ -542,6 +542,92 @@ fn cpu_forward(inp: &TestInputs, dims: LlamaDims, eps: f32) -> CpuForward {
 }
 
 /// Compute (max_abs_err, max_rel_err) between two bf16 arrays.
+// ── Golden file infrastructure ───────────────────────────────────────────
+//
+// For variants where cpu_forward is too slow to run on every test (1B and
+// up), we commit a binary "golden" containing the bf16 bytes of h_final
+// from a one-time CPU forward pass. The test reads the golden and compares
+// the GPU output against it with bf16 tolerance.
+//
+// File format: raw little-endian bf16 bytes, no header. Variant name is
+// in the filename. Regenerate via `cargo test --features cuda --release \
+//   --test scheduled_megakernel_test regen_committed_goldens -- --ignored \
+//   --nocapture`.
+
+/// Path to the committed golden for a given variant.
+fn golden_path(variant: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(format!("{variant}_h_final.golden"))
+}
+
+/// Write the bf16 buffer as little-endian bytes to the variant's golden path.
+/// Creates the parent directory if needed. Used by the regen test.
+fn write_golden(variant: &str, data: &[bf16]) {
+    let path = golden_path(variant);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create fixtures dir");
+    }
+    let mut bytes = Vec::with_capacity(data.len() * 2);
+    for v in data {
+        bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    std::fs::write(&path, &bytes)
+        .unwrap_or_else(|e| panic!("write golden {}: {e}", path.display()));
+    eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+}
+
+/// Load a committed golden as a bf16 vector. Panics with a helpful message
+/// if the file is missing (the user needs to run the regen target).
+fn read_golden(variant: &str) -> Vec<bf16> {
+    let path = golden_path(variant);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "missing golden for variant `{variant}` at {}: {e}\n\
+             regenerate via:\n  \
+             cargo test --features cuda --release --test scheduled_megakernel_test \
+             regen_committed_goldens -- --ignored --nocapture",
+            path.display()
+        )
+    });
+    assert_eq!(bytes.len() % 2, 0, "golden file size not a multiple of 2");
+    bytes
+        .chunks_exact(2)
+        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
+}
+
+/// Validate a GPU output buffer against a committed golden file.
+fn assert_matches_committed_golden(
+    variant: &str,
+    gpu: &[bf16],
+    abs_tol: f32,
+    rel_tol: f32,
+) {
+    let golden = read_golden(variant);
+    assert_eq!(
+        gpu.len(),
+        golden.len(),
+        "variant {variant}: gpu size {} != golden size {}",
+        gpu.len(),
+        golden.len()
+    );
+    let (abs, rel) = errs(gpu, &golden);
+    eprintln!(
+        "{variant} h_final vs golden: max_abs_err={abs:.5}  max_rel_err={:.4}%",
+        rel * 100.0
+    );
+    assert!(
+        abs < abs_tol,
+        "{variant}: abs err {abs} >= tol {abs_tol}"
+    );
+    assert!(
+        rel < rel_tol,
+        "{variant}: rel err {rel} >= tol {rel_tol}"
+    );
+}
+
 fn errs(gpu: &[bf16], cpu: &[bf16]) -> (f32, f32) {
     let mut max_abs = 0.0_f32;
     let mut max_rel = 0.0_f32;
@@ -960,4 +1046,84 @@ fn medium_full_forward_pass_matches_cpu_golden() {
         }
     }
     assert!(!any_failed, "medium full forward pass validation failed");
+}
+
+// ── Phase 4 step 5: golden file infrastructure ──────────────────────────
+//
+// `regen_committed_goldens` runs the CPU forward simulator for every
+// variant whose simulator runtime is fast enough for an interactive run
+// (currently tiny + medium) and writes h_final to disk as a committed
+// golden file. The fast variants run in <1 second so this is cheap to
+// rerun whenever the algorithm intentionally changes.
+//
+// 1B real-dim variants are NOT regenerated here — their CPU simulator
+// runtime is many minutes. They get a separate, slower regen target.
+#[test]
+#[ignore = "regenerates committed golden files; run on demand"]
+fn regen_committed_goldens() {
+    init_cuda();
+    let eps: f32 = 1e-5;
+
+    // Tiny.
+    {
+        let dims = scheduled_prefill_tiny_dims();
+        let (_, inp) = build_test_buffers(dims, 0);
+        let cpu = cpu_forward(&inp, dims, eps);
+        write_golden("tiny", &cpu.h_final);
+    }
+    // Medium.
+    {
+        let dims = scheduled_prefill_medium_dims();
+        let (_, inp) = build_test_buffers(dims, 1000);
+        let cpu = cpu_forward(&inp, dims, eps);
+        write_golden("medium", &cpu.h_final);
+    }
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn tiny_h_final_matches_committed_golden() {
+    init_cuda();
+    let dims = scheduled_prefill_tiny_dims();
+    let hd = dims.hidden_dim as usize;
+    let seq = dims.seq_len as usize;
+    let eps: f32 = 1e-5;
+
+    let (b, _) = build_test_buffers(dims, 0);
+    let n_nodes = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() };
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_tiny,
+        n_nodes,
+    );
+    let h_gpu = gpu_download_bf16(b.hidden_states, seq * hd);
+    // Tiny's 2-layer residual cascade: bf16 ULP at the accumulated
+    // magnitude reaches ~2-5; 5.0 matches the live full_residual_chain tol.
+    assert_matches_committed_golden("tiny", &h_gpu, 5.0, 0.05);
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn medium_h_final_matches_committed_golden() {
+    init_cuda();
+    let dims = scheduled_prefill_medium_dims();
+    let hd = dims.hidden_dim as usize;
+    let seq = dims.seq_len as usize;
+    let eps: f32 = 1e-5;
+
+    let (b, _) = build_test_buffers(dims, 1000);
+    let n_nodes = unsafe { ffi::scheduled_megakernel_medium_num_nodes() };
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_medium,
+        n_nodes,
+    );
+    let h_gpu = gpu_download_bf16(b.hidden_states, seq * hd);
+    // Medium accumulates a 4-layer cascade — bf16 ULP noise reaches ~30
+    // at the magnitudes the residual builds up to.
+    assert_matches_committed_golden("medium", &h_gpu, 32.0, 0.05);
 }

@@ -11,7 +11,13 @@
 // ── Prelude: schedule data tables + model dim constants ──────────────
 namespace pfl_sched_{{ name }} {
 
+// NUM_NODES = number of unique coalesced DAG nodes (sizes the per-node
+// validation flag array). NUM_OPS = total length of the per-CTA op
+// stream (sizes WAVE_OPS and NODE_ID_FOR_OP). They differ when the
+// schedule replicates wave-cooperative bindings across all CTAs in a
+// wave; otherwise NUM_OPS == NUM_NODES.
 constexpr uint32_t NUM_NODES = {{ num_nodes }};
+constexpr uint32_t NUM_OPS   = {{ num_ops }};
 constexpr uint32_t NUM_WAVES = {{ num_waves }};
 constexpr uint32_t NUM_CTAS  = {{ num_ctas }};
 
@@ -48,12 +54,16 @@ struct TileOp {
 };
 static_assert(sizeof(TileOp) == 16, "TileOp layout drifted");
 
-// WAVE_OPS — flat array of TileOps; one entry per scheduled tile op.
-static __device__ const TileOp WAVE_OPS[NUM_NODES] = {
+// WAVE_OPS — flat array of TileOps; one entry per scheduled op stream
+// position (NUM_OPS, not NUM_NODES — wave-cooperative bindings can
+// appear in every CTA's stream).
+static __device__ const TileOp WAVE_OPS[NUM_OPS] = {
 {{ wave_ops_table }}};
 
 // NODE_ID_FOR_OP — parallel to WAVE_OPS for tick-stamp validation.
-static __device__ const uint32_t NODE_ID_FOR_OP[NUM_NODES] = {
+// Indexed by op stream position; the value is the unique coalesced
+// node id (0..NUM_NODES-1) used as the rt.flags subscript.
+static __device__ const uint32_t NODE_ID_FOR_OP[NUM_OPS] = {
 {{ node_id_for_op_table }}};
 
 // WAVE_CTA_OFFSETS — flat (NUM_WAVES * (NUM_CTAS+1)) prefix table.
@@ -1231,7 +1241,14 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                 t_outside = clock64();
                 phase_clock[op.kernel_tag] += t_outside - t_in;
             }
-            if (tid == 0) {
+            // Validation tick stamp. Wave-cooperative bindings (e.g.
+            // FlashInferAttentionLayer) appear once per CTA in the
+            // wave op stream, but the work is done once cooperatively
+            // — so only cta_id 0 stamps the validation flag, otherwise
+            // the tick counter overcounts and rt.flags[node_id] gets
+            // a different value than the per-CTA count.
+            const bool wave_coop = (op.kernel_tag == PHASE_FLASHINFER_ATTN);
+            if (tid == 0 && (!wave_coop || cta_id == 0)) {
                 const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;
                 const uint32_t node_id = NODE_ID_FOR_OP[i];
                 rt.flags[node_id] = tick;

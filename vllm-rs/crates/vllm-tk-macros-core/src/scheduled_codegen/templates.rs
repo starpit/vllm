@@ -24,6 +24,14 @@ pub struct MegakernelCtx<'a> {
 
     // Schedule shape
     pub num_nodes: u32,
+    /// Total number of (potentially-replicated) op stream entries — sums
+    /// over `cta_nodes[c].len()` across every wave and CTA. With
+    /// wave-cooperative bindings (e.g. FlashInferAttentionLayer) the
+    /// same NodeId can appear in every CTA's stream, so `num_ops`
+    /// can exceed `num_nodes`. WAVE_OPS and NODE_ID_FOR_OP are sized
+    /// by num_ops; per-node validation arrays (rt.flags) stay sized
+    /// by num_nodes.
+    pub num_ops: u32,
     pub num_waves: u32,
     pub num_ctas: u32,
 

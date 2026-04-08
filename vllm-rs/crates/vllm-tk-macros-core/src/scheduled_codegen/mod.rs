@@ -103,14 +103,19 @@ pub fn emit_scheduled_megakernel_cu(
         // Sentinel "end of last cta in this wave" for clean range queries.
         wave_cta_offsets.push(cursor);
     }
-    debug_assert_eq!(cursor, num_nodes);
+    // `cursor` is the total op stream length, which can exceed
+    // `num_nodes` when the schedule replicates wave-cooperative
+    // bindings across all CTAs in a wave (see schedule.rs).
+    debug_assert!(cursor >= num_nodes);
     debug_assert_eq!(wave_cta_offsets.len(), offsets_len, "offset table size");
+    let num_ops = cursor;
 
     let pages_per_layer = dag.dims.seq_len.div_ceil(kv_page_size);
 
     let ctx = MegakernelCtx {
         name,
         num_nodes,
+        num_ops,
         num_waves,
         num_ctas,
         wave_ops_table: render_wave_ops_table(&ops),

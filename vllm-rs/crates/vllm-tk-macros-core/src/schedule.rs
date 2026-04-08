@@ -203,14 +203,31 @@ pub fn partition_into_waves(
         let mut cta_load: Vec<u64> = vec![0; num_ctas as usize];
 
         for &node in wave_nodes.iter() {
-            // Pick CTA with lowest current load.
-            let (best_cta, _) = cta_load
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, l)| **l)
-                .unwrap();
-            cta_nodes[best_cta].push(NodeId(node));
-            cta_load[best_cta] += costs[node as usize] as u64;
+            let cnode = &dag.nodes[node as usize];
+            if cnode.kernel.is_wave_cooperative() {
+                // Wave-cooperative bindings (e.g. FlashInferAttentionLayer)
+                // are not bin-packed onto one CTA. The runner internally
+                // partitions the work across all CTAs in the persistent
+                // grid via its own work indptr — we mirror that by
+                // placing the same NodeId into every CTA's op stream.
+                // The per-CTA load contribution is `cost / num_ctas`
+                // so the wave's makespan rollup matches reality
+                // (parallel execution, not serialized).
+                let per_cta = (costs[node as usize] as u64).div_ceil(num_ctas as u64);
+                for cta_id in 0..(num_ctas as usize) {
+                    cta_nodes[cta_id].push(NodeId(node));
+                    cta_load[cta_id] += per_cta;
+                }
+            } else {
+                // Standard LPT: pick the CTA with lowest current load.
+                let (best_cta, _) = cta_load
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, l)| **l)
+                    .unwrap();
+                cta_nodes[best_cta].push(NodeId(node));
+                cta_load[best_cta] += costs[node as usize] as u64;
+            }
         }
 
         let max_cta_cost = *cta_load.iter().max().unwrap_or(&0);

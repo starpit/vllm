@@ -118,6 +118,29 @@ impl BoundKernel {
     /// New library entries claim a stable tag in this enum. The
     /// megakernel template's dispatch switch must grow a matching
     /// `case` arm at the same time.
+    /// Does this binding consume an entire wave's worth of CTAs
+    /// cooperatively (i.e. all CTAs in the wave participate in the
+    /// same work item), or is it a per-CTA tile dispatched LPT-style
+    /// across the wave's CTAs?
+    ///
+    /// `HandWrittenRowTile` is the per-CTA model: each binding is
+    /// one tile body call on one CTA, the wave scheduler bin-packs
+    /// many of them across the wave's CTAs via LPT.
+    ///
+    /// `FlashInferAttentionLayer` is wave-cooperative: the FlashInfer
+    /// runner internally partitions the layer's attention work across
+    /// every CTA in the persistent grid via `work_indptr[blockIdx.y]`,
+    /// so the scheduler must place the binding on **every** CTA in
+    /// the wave (not bin-pack it onto one CTA). The per-CTA cost is
+    /// the rolled-up `cost()` divided across `num_ctas`, since the
+    /// CTAs run in parallel.
+    pub fn is_wave_cooperative(&self) -> bool {
+        match self {
+            BoundKernel::HandWrittenRowTile { .. } => false,
+            BoundKernel::FlashInferAttentionLayer { .. } => true,
+        }
+    }
+
     pub fn kernel_tag(&self) -> u32 {
         match self {
             BoundKernel::HandWrittenRowTile { phase, .. } => match phase {
@@ -349,6 +372,27 @@ pub fn coalesce_with_flashinfer_attention(dag: &ReifiedDag) -> CoalescedDag {
                 },
                 deps,
             });
+        }
+    }
+
+    // ── Step 5: renumber NodeIds to be dense [0, nodes.len()). ──
+    // The schedule + codegen passes index into `dag.nodes[NodeId.0 as
+    // usize]` and assume `NodeId == array index`. Fusion creates gaps
+    // (absorbed ids 1..N-1 disappear, leaving a hole) and the array
+    // shrinks, so without renumbering the surviving ids point past
+    // the end of the new array. Build an old_id → new_id remap from
+    // the post-fusion order, then rewrite every node's id and every
+    // dep through it.
+    let mut id_remap: HashMap<NodeId, NodeId> = HashMap::with_capacity(nodes.len());
+    for (new_idx, n) in nodes.iter().enumerate() {
+        id_remap.insert(n.id, NodeId(new_idx as u32));
+    }
+    for n in &mut nodes {
+        n.id = id_remap[&n.id];
+        for d in &mut n.deps {
+            *d = *id_remap
+                .get(d)
+                .expect("dep references a node that doesn't exist in coalesced output");
         }
     }
 

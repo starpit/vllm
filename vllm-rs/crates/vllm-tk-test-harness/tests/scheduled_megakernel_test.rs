@@ -13,8 +13,9 @@
 use cudarc::driver::result;
 use half::bf16;
 use vllm_tk_macros_core::{
-    SCHEDULED_PREFILL_KV_PAGE_SIZE, reified_dag::LlamaDims, reified_dag::ReifiedDag,
-    reified_dag::TileSizes, scheduled_prefill_medium_dims, scheduled_prefill_tiny_dims,
+    SCHEDULED_PREFILL_KV_PAGE_SIZE, kernel_library::coalesce_with_flashinfer_attention,
+    reified_dag::LlamaDims, reified_dag::ReifiedDag, reified_dag::TileSizes,
+    scheduled_prefill_medium_dims, scheduled_prefill_tiny_dims,
 };
 use vllm_tk_test_harness::ffi;
 
@@ -216,11 +217,21 @@ fn launch_with_buffers(
 fn scheduled_megakernel_executes_topologically() {
     init_cuda();
     let dims = scheduled_prefill_tiny_dims();
-    let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+    // The kernel was generated against the *coalesced* DAG (the
+    // production codegen path now goes through
+    // coalesce_with_flashinfer_attention), so the topology
+    // invariants are about the coalesced node space, not the raw
+    // reified one. Coalesce here too so the test sees the same view
+    // the kernel did.
+    let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+    let dag = coalesce_with_flashinfer_attention(&reified);
     let n = dag.nodes.len();
 
     let kernel_n = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() } as usize;
-    assert_eq!(n, kernel_n);
+    assert_eq!(
+        n, kernel_n,
+        "coalesced node count must match kernel NUM_NODES"
+    );
     let kernel_ctas = unsafe { ffi::scheduled_megakernel_tiny_num_ctas() };
     let _ = kernel_ctas; // CTA pool size is now picked by the DSL emitter heuristic
     let kernel_waves = unsafe { ffi::scheduled_megakernel_tiny_num_waves() };
@@ -236,7 +247,7 @@ fn scheduled_megakernel_executes_topologically() {
     );
     eprintln!("final tick = {final_tick}");
 
-    // Invariant 1: every node executed exactly once.
+    // Invariant 1: every coalesced node executed exactly once.
     let unexecuted: Vec<usize> = ticks
         .iter()
         .enumerate()
@@ -249,15 +260,15 @@ fn scheduled_megakernel_executes_topologically() {
     );
     assert_eq!(final_tick as usize, n);
 
-    // Invariant 2: topological order.
-    for nd in &dag.nodes {
-        let my_tick = ticks[nd.id.0 as usize];
-        for d in &nd.deps {
+    // Invariant 2: topological order on the coalesced DAG.
+    for cnode in &dag.nodes {
+        let my_tick = ticks[cnode.id.0 as usize];
+        for d in &cnode.deps {
             let dep_tick = ticks[d.0 as usize];
             assert!(
                 my_tick > dep_tick,
                 "topological violation: node {} (tick={}) ran before dep {} (tick={})",
-                nd.id.0,
+                cnode.id.0,
                 my_tick,
                 d.0,
                 dep_tick

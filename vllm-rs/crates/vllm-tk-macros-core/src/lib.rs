@@ -643,7 +643,7 @@ pub const SCHEDULED_PREFILL_TINY_CTAS: u32 = 4;
 pub const SCHEDULED_PREFILL_KV_PAGE_SIZE: u32 = 16;
 
 pub fn generate_scheduled_prefill_tiny() -> String {
-    use crate::kernel_library::coalesce;
+    use crate::kernel_library::coalesce_with_flashinfer_attention as coalesce;
     use crate::reified_dag::{ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
@@ -681,7 +681,7 @@ pub fn scheduled_prefill_medium_dims() -> reified_dag::LlamaDims {
 pub const SCHEDULED_PREFILL_MEDIUM_CTAS: u32 = 16;
 
 pub fn generate_scheduled_prefill_medium() -> String {
-    use crate::kernel_library::coalesce;
+    use crate::kernel_library::coalesce_with_flashinfer_attention as coalesce;
     use crate::reified_dag::{ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
@@ -729,7 +729,7 @@ fn ctas_for_variant(dims: &reified_dag::LlamaDims) -> u32 {
 /// params, then apply the variant's overrides. Missing dim parameters are
 /// an error.
 pub fn generate_scheduled_prefill_variants(dsl: &str) -> Result<Vec<ScheduledVariant>, String> {
-    use crate::kernel_library::coalesce;
+    use crate::kernel_library::coalesce_with_flashinfer_attention as coalesce;
     use crate::reified_dag::{LlamaDims, ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;

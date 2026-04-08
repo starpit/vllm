@@ -528,7 +528,131 @@ __device__ __forceinline__ void tile_rope(const globals_t& g, uint32_t layer, ui
         }
     }
 }
-__device__ __forceinline__ void tile_attention(const globals_t&, uint32_t /*layer*/, uint32_t /*row*/) {}
+// ── tile_attention: paged FA-2 online softmax for one ROW_TILE-row tile.
+//
+// Reads Q from q_post_rope[row, NAH * HEAD_DIM], K/V from the paged caches
+// via prefill_kv_indices. Causal mask: each query at position p attends to
+// keys 0..=p. GQA-aware: kv_head = q_head / GQA_RATIO.
+//
+// Per (row, q_head) we run a streaming online softmax scan:
+//
+//   m = -inf, l = 0, O = 0
+//   for k in 0..=p:
+//     score   = (q · K[k]) * attn_scale
+//     m_new   = max(m, score)
+//     alpha   = exp(m - m_new)
+//     se      = exp(score - m_new)
+//     O       = O * alpha + se * V[k]
+//     l       = l * alpha + se
+//     m       = m_new
+//   out       = O / l
+//
+// 32 threads cooperate on one (row, head) at a time. Each lane owns
+// HEAD_DIM/32 elements of the head dimension. Q stays in registers across
+// the entire k-loop. K/V are reloaded per k from the paged cache. Score is
+// reduced via warp shuffle.
+//
+// This is correct, paged, masked, and numerically stable. It is NOT fast —
+// no shmem K/V staging, no cp.async, no warp-level mma. Phase 4 will swap
+// in the FA-2 implementation from the existing kernel's templates.
+__device__ __forceinline__ void tile_attention(const globals_t& g, uint32_t layer, uint32_t row) {
+    constexpr uint32_t HDM             = MODEL_HEAD_DIM;
+    constexpr uint32_t NAH             = MODEL_NUM_ATTN_H;
+    constexpr uint32_t NKH             = MODEL_NUM_KV_H;
+    constexpr uint32_t GQA_RATIO       = NAH / NKH;
+    constexpr uint32_t HD_FULL         = NAH * HDM;            // attn_out dim
+    constexpr uint32_t Q_DIM           = NAH * HDM;            // q_post_rope row stride
+    constexpr uint32_t ROW_TILE        = MODEL_ROW_TILE;
+    constexpr uint32_t PAGE_SIZE       = MODEL_KV_PAGE_SIZE;
+    constexpr uint32_t PAGES_PER_LAYER = MODEL_PAGES_PER_LAYER;
+    constexpr uint32_t SLOT_STRIDE     = NKH * HDM;
+    constexpr uint32_t PAGE_STRIDE     = PAGE_SIZE * NKH * HDM;
+    constexpr uint32_t D_PER_LANE      = HDM / 32;             // head_dim chunks per thread
+    static_assert(HDM % 32 == 0, "tile_attention assumes HEAD_DIM % 32 == 0");
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row_start = row * ROW_TILE;
+    const float attn_scale = g.attn_scale;
+
+    #pragma unroll 1
+    for (uint32_t r = 0; r < ROW_TILE; ++r) {
+        const uint32_t row_idx = row_start + r;
+        if (row_idx >= MODEL_SEQ_LEN) break;
+        const uint32_t attend_len = row_idx + 1;  // causal: keys 0..=row_idx
+
+        for (uint32_t h = 0; h < NAH; ++h) {
+            const uint32_t kv_head = h / GQA_RATIO;
+
+            // Load Q[row_idx, h, :] into registers (D_PER_LANE elements per lane).
+            float q_reg[D_PER_LANE];
+            #pragma unroll
+            for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
+                const uint32_t d = dd * 32 + lane;
+                q_reg[dd] = __bfloat162float(
+                    g.q_post_rope[(size_t)row_idx * Q_DIM + h * HDM + d]);
+            }
+
+            // Online softmax state.
+            float o_reg[D_PER_LANE];
+            #pragma unroll
+            for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
+                o_reg[dd] = 0.0f;
+            }
+            float m_state = -1e30f;
+            float l_state = 0.0f;
+
+            // Stream over keys 0..=row_idx.
+            for (uint32_t k_pos = 0; k_pos < attend_len; ++k_pos) {
+                // Paged cache offset for this key position.
+                const uint32_t logical_page = k_pos / PAGE_SIZE;
+                const uint32_t slot = k_pos % PAGE_SIZE;
+                const int32_t physical_page = g.prefill_kv_indices[logical_page]
+                                              + (int32_t)layer * (int32_t)PAGES_PER_LAYER;
+                const size_t slot_base = (size_t)physical_page * PAGE_STRIDE
+                                         + (size_t)slot * SLOT_STRIDE
+                                         + (size_t)kv_head * HDM;
+                const __nv_bfloat16* K_slot = g.k_cache + slot_base;
+                const __nv_bfloat16* V_slot = g.v_cache + slot_base;
+
+                // Dot product q · K[k_pos].
+                float score_partial = 0.0f;
+                #pragma unroll
+                for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
+                    const uint32_t d = dd * 32 + lane;
+                    score_partial += q_reg[dd] * __bfloat162float(K_slot[d]);
+                }
+                // Warp-shuffle reduce → all lanes hold the full dot.
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    score_partial += __shfl_xor_sync(0xffffffff, score_partial, offset);
+                }
+                const float score = score_partial * attn_scale;
+
+                // Online softmax update.
+                const float m_new = fmaxf(m_state, score);
+                const float alpha = __expf(m_state - m_new);
+                const float se    = __expf(score   - m_new);
+
+                #pragma unroll
+                for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
+                    const uint32_t d = dd * 32 + lane;
+                    const float vv = __bfloat162float(V_slot[d]);
+                    o_reg[dd] = o_reg[dd] * alpha + se * vv;
+                }
+                l_state = l_state * alpha + se;
+                m_state = m_new;
+            }
+
+            // Normalize and write out.
+            const float inv_l = 1.0f / l_state;
+            #pragma unroll
+            for (uint32_t dd = 0; dd < D_PER_LANE; ++dd) {
+                const uint32_t d = dd * 32 + lane;
+                g.attn_out[(size_t)row_idx * HD_FULL + h * HDM + d] =
+                    __float2bfloat16(o_reg[dd] * inv_l);
+            }
+        }
+    }
+}
 
 // ── tile_o_proj: GEMM + residual. M=ROW_TILE, N=O_COL_TILE, K=HIDDEN_DIM. ──
 //

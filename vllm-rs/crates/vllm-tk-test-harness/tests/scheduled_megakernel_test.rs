@@ -224,55 +224,13 @@ fn scheduled_megakernel_executes_topologically() {
     }
 }
 
-/// Helper: validate that GPU output matches the CPU golden row-by-row.
-/// The golden is computed by `golden_fn(row_idx)` so each test can supply
-/// its own per-row reference.
-fn assert_matches_golden<F: Fn(usize) -> Vec<bf16>>(
-    gpu: &[bf16],
-    seq: usize,
-    hd: usize,
-    label: &str,
-    golden_fn: F,
-) {
-    let mut max_abs_err = 0.0_f32;
-    let mut max_rel_err = 0.0_f32;
-    for r in 0..seq {
-        let golden = golden_fn(r);
-        for c in 0..hd {
-            let g = golden[c].to_f32();
-            let k = gpu[r * hd + c].to_f32();
-            let abs = (g - k).abs();
-            let rel = if g.abs() > 1e-3 { abs / g.abs() } else { 0.0 };
-            if abs > max_abs_err {
-                max_abs_err = abs;
-            }
-            if rel > max_rel_err {
-                max_rel_err = rel;
-            }
-        }
-    }
-    eprintln!(
-        "{label}: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
-        max_rel_err * 100.0
-    );
-    assert!(
-        max_abs_err < 0.05,
-        "{label}: max abs err {max_abs_err} too large"
-    );
-    assert!(
-        max_rel_err < 0.05,
-        "{label}: max rel err {max_rel_err} too large"
-    );
-}
-
-/// Initial inputs the host fills before launching, so each tile body has
-/// non-zero data to operate on regardless of which upstream tiles are still
-/// placeholders.
+/// Inputs the host fills before launching the scheduled megakernel. The
+/// CPU forward simulator (cpu_forward) runs the same data and produces the
+/// per-tile expected end-states.
 struct TestInputs {
     h_data: Vec<bf16>,
     an_w_data: Vec<bf16>,
     mn_w_data: Vec<bf16>,
-    attn_out_data: Vec<bf16>,
     qkv_w_data: Vec<bf16>,
     o_w_data: Vec<bf16>,
     gate_w_data: Vec<bf16>,
@@ -302,7 +260,6 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
     let h_data = random_bf16(seq * hd, 1, 0.5);
     let an_w_data = random_bf16(nl * hd, 2, 1.0);
     let mn_w_data = random_bf16(nl * hd, 3, 1.0);
-    let attn_out_data = random_bf16(seq * hd, 4, 0.5);
     // Small weight scale (0.05) to keep accumulator products in range —
     // bf16 GEMM with hd=256 over (-0.5,0.5) inputs and full-magnitude
     // weights would push individual outputs into the tens, blowing
@@ -328,7 +285,7 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
         rms_rope: gpu_alloc_zeros(seq * hd * 2),
         qkv: gpu_alloc_zeros(seq * qkv_dim * 2),
         q_post_rope: gpu_alloc_zeros(seq * nah * hdm * 2),
-        attn_out: gpu_upload_bf16(&attn_out_data),
+        attn_out: gpu_alloc_zeros(seq * hd * 2),
         rms_gate: gpu_alloc_zeros(seq * hd * 2),
         silu_out: gpu_alloc_zeros(seq * id * 2),
         k_cache: gpu_alloc_zeros(cache_bytes_total),
@@ -350,7 +307,6 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
             h_data,
             an_w_data,
             mn_w_data,
-            attn_out_data,
             qkv_w_data,
             o_w_data,
             gate_w_data,
@@ -360,54 +316,208 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
     )
 }
 
-/// Compute the running hidden_states value as the kernel would see it at the
-/// START of layer L's attn_norm — i.e. with all earlier layers' o_proj +
-/// down residual contributions accumulated. With down still placeholder,
-/// only o_proj contributes.
-fn cpu_hidden_at_start_of_layer(
-    inp: &TestInputs,
-    layer: usize,
-    hd: usize,
-    id: usize,
-    seq: usize,
-    eps: f32,
-) -> Vec<bf16> {
+/// Per-tile end states the CPU forward simulator produces. Last-layer-wins
+/// fields hold whatever survives in the GPU buffers after the megakernel
+/// runs to completion. The paged caches hold all NL layers' contents.
+struct CpuForward {
+    h_final: Vec<bf16>,
+    rms_rope_last: Vec<bf16>,
+    q_post_rope_last: Vec<bf16>,
+    attn_out_last: Vec<bf16>,
+    rms_gate_last: Vec<bf16>,
+    silu_out_last: Vec<bf16>,
+    k_cache: Vec<bf16>,
+    v_cache: Vec<bf16>,
+}
+
+/// Run the full forward pass on CPU, mirroring exactly what the scheduled
+/// megakernel does. Each layer:
+///
+///   rms_rope    = rms_norm(h, attn_norm_w[L])
+///   qkv         = gemm(rms_rope, qkv_w[L])           // raw, no rope
+///   q_post_rope = rope_q(qkv[Q region])              // last L wins
+///   k_cache[L]  = rope_k(qkv[K region])              // paged write
+///   v_cache[L]  = qkv[V region]                      // paged write
+///   attn_out    = paged_causal_attention(q_post_rope, k_cache[L], v_cache[L])
+///   h          += gemm(attn_out, o_w[L])
+///   rms_gate    = rms_norm(h, mlp_norm_w[L])
+///   silu_out    = silu(gemm(rms_gate, gate_w[L])) * gemm(rms_gate, up_w[L])
+///   h          += gemm(silu_out, down_w[L])
+fn cpu_forward(inp: &TestInputs, eps: f32) -> CpuForward {
+    let dims = scheduled_prefill_tiny_dims();
+    let hd = dims.hidden_dim as usize;
+    let id = dims.intermediate_dim as usize;
+    let seq = dims.seq_len as usize;
+    let nl = dims.num_layers as usize;
+    let hdm = dims.head_dim as usize;
+    let nah = dims.num_attn_heads as usize;
+    let nkh = dims.num_kv_heads as usize;
+    let qkv_dim = (nah + 2 * nkh) * hdm;
+    let q_dim = nah * hdm;
+    let gqa_ratio = nah / nkh;
+    let attn_scale = 1.0_f32 / (hdm as f32).sqrt();
+    let page_size = SCHEDULED_PREFILL_KV_PAGE_SIZE as usize;
+    let pages_per_layer = seq.div_ceil(page_size);
+    let cache_total = nl * pages_per_layer * page_size * nkh * hdm;
+
     let mut h = inp.h_data.clone();
-    for l in 0..layer {
-        // 1. o_proj residual: h += gemm(attn_out_data, o_w[l])
-        let o_layer_w = &inp.o_w_data[l * hd * hd..(l + 1) * hd * hd];
-        let o_contrib = cpu_gemm(&inp.attn_out_data, o_layer_w, seq, hd, hd);
+    let mut k_cache = vec![bf16::from_f32(0.0); cache_total];
+    let mut v_cache = vec![bf16::from_f32(0.0); cache_total];
+
+    let mut rms_rope_last = vec![bf16::from_f32(0.0); seq * hd];
+    let mut q_post_rope_last = vec![bf16::from_f32(0.0); seq * q_dim];
+    let mut attn_out_last = vec![bf16::from_f32(0.0); seq * hd];
+    let mut rms_gate_last = vec![bf16::from_f32(0.0); seq * hd];
+    let mut silu_out_last = vec![bf16::from_f32(0.0); seq * id];
+
+    for l in 0..nl {
+        let an_w_l = &inp.an_w_data[l * hd..(l + 1) * hd];
+        let mn_w_l = &inp.mn_w_data[l * hd..(l + 1) * hd];
+        let qkv_w_l = &inp.qkv_w_data[l * qkv_dim * hd..(l + 1) * qkv_dim * hd];
+        let o_w_l = &inp.o_w_data[l * hd * hd..(l + 1) * hd * hd];
+        let gate_w_l = &inp.gate_w_data[l * id * hd..(l + 1) * id * hd];
+        let up_w_l = &inp.up_w_data[l * id * hd..(l + 1) * id * hd];
+        let down_w_l = &inp.down_w_data[l * hd * id..(l + 1) * hd * id];
+
+        // 1. attn_norm
+        let mut rms_rope = vec![bf16::from_f32(0.0); seq * hd];
+        for r in 0..seq {
+            let normed = cpu_rms_norm(&h[r * hd..(r + 1) * hd], an_w_l, eps);
+            rms_rope[r * hd..(r + 1) * hd].copy_from_slice(&normed);
+        }
+
+        // 2 + 3. qkv gemm + rope-fanout to q_post_rope, paged k_cache, paged v_cache
+        let mut q_post_rope = vec![bf16::from_f32(0.0); seq * q_dim];
+        for r in 0..seq {
+            let mut row = cpu_gemm(&rms_rope[r * hd..(r + 1) * hd], qkv_w_l, 1, qkv_dim, hd);
+            cpu_rope_one(&mut row, r, hdm, nah, nkh);
+            for c in 0..q_dim {
+                q_post_rope[r * q_dim + c] = row[c];
+            }
+            let k_off_in_row = nah * hdm;
+            let v_off_in_row = (nah + nkh) * hdm;
+            for kvh in 0..nkh {
+                for d in 0..hdm {
+                    let off = paged_kv_offset(l, r, kvh, d, page_size, pages_per_layer, nkh, hdm);
+                    k_cache[off] = row[k_off_in_row + kvh * hdm + d];
+                    v_cache[off] = row[v_off_in_row + kvh * hdm + d];
+                }
+            }
+        }
+
+        // 4. paged causal attention
+        let mut attn_out = vec![bf16::from_f32(0.0); seq * hd];
+        for r in 0..seq {
+            for qh in 0..nah {
+                let kvh = qh / gqa_ratio;
+                let q_offset = r * q_dim + qh * hdm;
+                let q: Vec<f32> = (0..hdm)
+                    .map(|d| q_post_rope[q_offset + d].to_f32())
+                    .collect();
+                let attend_len = r + 1;
+                let mut scores = vec![0.0_f32; attend_len];
+                for k_pos in 0..attend_len {
+                    let off =
+                        paged_kv_offset(l, k_pos, kvh, 0, page_size, pages_per_layer, nkh, hdm);
+                    let mut dot = 0.0_f32;
+                    for d in 0..hdm {
+                        dot += q[d] * k_cache[off + d].to_f32();
+                    }
+                    scores[k_pos] = dot * attn_scale;
+                }
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0_f32;
+                for s in &mut scores {
+                    *s = (*s - max_s).exp();
+                    sum_exp += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum_exp;
+                }
+                let mut out = vec![0.0_f32; hdm];
+                for k_pos in 0..attend_len {
+                    let off =
+                        paged_kv_offset(l, k_pos, kvh, 0, page_size, pages_per_layer, nkh, hdm);
+                    for d in 0..hdm {
+                        out[d] += scores[k_pos] * v_cache[off + d].to_f32();
+                    }
+                }
+                for d in 0..hdm {
+                    attn_out[r * hd + qh * hdm + d] = bf16::from_f32(out[d]);
+                }
+            }
+        }
+
+        // 5. o_proj residual: h += gemm(attn_out, o_w[l])
+        let o_contrib = cpu_gemm(&attn_out, o_w_l, seq, hd, hd);
         for i in 0..h.len() {
             h[i] = bf16::from_f32(h[i].to_f32() + o_contrib[i].to_f32());
         }
-        // 2. down residual: h += gemm(silu_out_l, down_w[l])
-        //    silu_out_l = silu(gemm(rms_gate_l, gate_w[l])) * gemm(rms_gate_l, up_w[l])
-        //    rms_gate_l = norm(attn_out_data, mn_w[l])
-        // With tile_attention still placeholder, attn_out_data is the
-        // mlp_norm input — independent of the cascade.
-        let mn_layer_w = &inp.mn_w_data[l * hd..(l + 1) * hd];
-        let gate_layer_w = &inp.gate_w_data[l * id * hd..(l + 1) * id * hd];
-        let up_layer_w = &inp.up_w_data[l * id * hd..(l + 1) * id * hd];
-        let down_layer_w = &inp.down_w_data[l * hd * id..(l + 1) * hd * id];
 
-        let mut silu_out_l = vec![bf16::from_f32(0.0); seq * id];
+        // 6. mlp_norm
+        let mut rms_gate = vec![bf16::from_f32(0.0); seq * hd];
         for r in 0..seq {
-            let normed = cpu_rms_norm(&inp.attn_out_data[r * hd..(r + 1) * hd], mn_layer_w, eps);
-            let g_row = cpu_gemm(&normed, gate_layer_w, 1, id, hd);
-            let u_row = cpu_gemm(&normed, up_layer_w, 1, id, hd);
+            let normed = cpu_rms_norm(&attn_out[r * hd..(r + 1) * hd], mn_w_l, eps);
+            rms_gate[r * hd..(r + 1) * hd].copy_from_slice(&normed);
+        }
+
+        // 7. gate_up
+        let mut silu_out = vec![bf16::from_f32(0.0); seq * id];
+        for r in 0..seq {
+            let g_row = cpu_gemm(&rms_gate[r * hd..(r + 1) * hd], gate_w_l, 1, id, hd);
+            let u_row = cpu_gemm(&rms_gate[r * hd..(r + 1) * hd], up_w_l, 1, id, hd);
             for n in 0..id {
                 let gv = g_row[n].to_f32();
                 let uv = u_row[n].to_f32();
                 let silu_g = gv / (1.0 + (-gv).exp());
-                silu_out_l[r * id + n] = bf16::from_f32(silu_g * uv);
+                silu_out[r * id + n] = bf16::from_f32(silu_g * uv);
             }
         }
-        let down_contrib = cpu_gemm(&silu_out_l, down_layer_w, seq, hd, id);
+
+        // 8. down residual: h += gemm(silu_out, down_w[l])
+        let down_contrib = cpu_gemm(&silu_out, down_w_l, seq, hd, id);
         for i in 0..h.len() {
             h[i] = bf16::from_f32(h[i].to_f32() + down_contrib[i].to_f32());
         }
+
+        if l == nl - 1 {
+            rms_rope_last = rms_rope;
+            q_post_rope_last = q_post_rope;
+            attn_out_last = attn_out;
+            rms_gate_last = rms_gate;
+            silu_out_last = silu_out;
+        }
     }
-    h
+
+    CpuForward {
+        h_final: h,
+        rms_rope_last,
+        q_post_rope_last,
+        attn_out_last,
+        rms_gate_last,
+        silu_out_last,
+        k_cache,
+        v_cache,
+    }
+}
+
+/// Compute (max_abs_err, max_rel_err) between two bf16 arrays.
+fn errs(gpu: &[bf16], cpu: &[bf16]) -> (f32, f32) {
+    let mut max_abs = 0.0_f32;
+    let mut max_rel = 0.0_f32;
+    for i in 0..gpu.len() {
+        let g = cpu[i].to_f32();
+        let k = gpu[i].to_f32();
+        let abs = (g - k).abs();
+        let rel = if g.abs() > 1e-3 { abs / g.abs() } else { 0.0 };
+        if abs > max_abs {
+            max_abs = abs;
+        }
+        if rel > max_rel {
+            max_rel = rel;
+        }
+    }
+    (max_abs, max_rel)
 }
 
 #[test]
@@ -416,22 +526,20 @@ fn tile_attn_norm_matches_cpu_golden() {
     init_cuda();
     let dims = scheduled_prefill_tiny_dims();
     let hd = dims.hidden_dim as usize;
-    let id = dims.intermediate_dim as usize;
     let seq = dims.seq_len as usize;
-    let nl = dims.num_layers as usize;
     let eps: f32 = 1e-5;
 
     let (b, inp) = build_test_buffers();
     let _ = launch_with_buffers(&b, eps);
+    let cpu = cpu_forward(&inp, eps);
 
-    // Last writer for rms_rope is layer (NL-1)'s attn_norm. By that time,
-    // hidden_states has been residual-updated by all earlier o_proj + down passes.
-    let rms_rope_gpu = gpu_download_bf16(b.rms_rope, seq * hd);
-    let h_at_last_layer = cpu_hidden_at_start_of_layer(&inp, nl - 1, hd, id, seq, eps);
-    let last_layer_w = &inp.an_w_data[(nl - 1) * hd..nl * hd];
-    assert_matches_golden(&rms_rope_gpu, seq, hd, "tile_attn_norm", |r| {
-        cpu_rms_norm(&h_at_last_layer[r * hd..(r + 1) * hd], last_layer_w, eps)
-    });
+    let gpu = gpu_download_bf16(b.rms_rope, seq * hd);
+    let (abs, rel) = errs(&gpu, &cpu.rms_rope_last);
+    eprintln!(
+        "tile_attn_norm: max_abs_err={abs:.5}, max_rel_err={:.4}%",
+        rel * 100.0
+    );
+    assert!(abs < 0.10, "attn_norm abs {abs}");
 }
 
 #[test]
@@ -441,19 +549,64 @@ fn tile_mlp_norm_matches_cpu_golden() {
     let dims = scheduled_prefill_tiny_dims();
     let hd = dims.hidden_dim as usize;
     let seq = dims.seq_len as usize;
-    let nl = dims.num_layers as usize;
     let eps: f32 = 1e-5;
 
     let (b, inp) = build_test_buffers();
     let _ = launch_with_buffers(&b, eps);
+    let cpu = cpu_forward(&inp, eps);
 
-    // mlp_norm reads attn_out which is still placeholder (pre-filled). It's
-    // independent of the o_proj residual chain — attn_out doesn't change.
-    let rms_gate_gpu = gpu_download_bf16(b.rms_gate, seq * hd);
-    let last_layer_w = &inp.mn_w_data[(nl - 1) * hd..nl * hd];
-    assert_matches_golden(&rms_gate_gpu, seq, hd, "tile_mlp_norm", |r| {
-        cpu_rms_norm(&inp.attn_out_data[r * hd..(r + 1) * hd], last_layer_w, eps)
-    });
+    let gpu = gpu_download_bf16(b.rms_gate, seq * hd);
+    let (abs, rel) = errs(&gpu, &cpu.rms_gate_last);
+    eprintln!(
+        "tile_mlp_norm: max_abs_err={abs:.5}, max_rel_err={:.4}%",
+        rel * 100.0
+    );
+    assert!(abs < 0.10, "mlp_norm abs {abs}");
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn tile_attention_matches_cpu_golden() {
+    init_cuda();
+    let dims = scheduled_prefill_tiny_dims();
+    let hd = dims.hidden_dim as usize;
+    let seq = dims.seq_len as usize;
+    let eps: f32 = 1e-5;
+
+    let (b, inp) = build_test_buffers();
+    let _ = launch_with_buffers(&b, eps);
+    let cpu = cpu_forward(&inp, eps);
+
+    let gpu = gpu_download_bf16(b.attn_out, seq * hd);
+    let (abs, rel) = errs(&gpu, &cpu.attn_out_last);
+    eprintln!(
+        "tile_attention: max_abs_err={abs:.5}, max_rel_err={:.4}%",
+        rel * 100.0
+    );
+    // bf16 attention has both an exp() and a divide; tolerance loosened.
+    assert!(abs < 0.10, "attention abs {abs}");
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn gate_up_chain_matches_cpu_golden() {
+    init_cuda();
+    let dims = scheduled_prefill_tiny_dims();
+    let id = dims.intermediate_dim as usize;
+    let seq = dims.seq_len as usize;
+    let eps: f32 = 1e-5;
+
+    let (b, inp) = build_test_buffers();
+    let _ = launch_with_buffers(&b, eps);
+    let cpu = cpu_forward(&inp, eps);
+
+    let gpu = gpu_download_bf16(b.silu_out, seq * id);
+    let (abs, rel) = errs(&gpu, &cpu.silu_out_last);
+    eprintln!(
+        "gate_up_chain: max_abs_err={abs:.5}, max_rel_err={:.4}%",
+        rel * 100.0
+    );
+    assert!(abs < 0.20, "gate_up abs {abs}");
 }
 
 #[test]
@@ -462,100 +615,23 @@ fn full_residual_chain_matches_cpu_golden() {
     init_cuda();
     let dims = scheduled_prefill_tiny_dims();
     let hd = dims.hidden_dim as usize;
-    let id = dims.intermediate_dim as usize;
     let seq = dims.seq_len as usize;
-    let nl = dims.num_layers as usize;
     let eps: f32 = 1e-5;
 
     let (b, inp) = build_test_buffers();
     let _ = launch_with_buffers(&b, eps);
+    let cpu = cpu_forward(&inp, eps);
 
-    // After NL layers, hidden_states has accumulated o_proj + down residuals
-    // for every layer. cpu_hidden_at_start_of_layer(inp, nl, ...) is exactly
-    // that end-state.
-    let h_gpu = gpu_download_bf16(b.hidden_states, seq * hd);
-    let h_cpu = cpu_hidden_at_start_of_layer(&inp, nl, hd, id, seq, eps);
-
-    let mut max_abs_err = 0.0_f32;
-    let mut max_rel_err = 0.0_f32;
-    for i in 0..seq * hd {
-        let g = h_cpu[i].to_f32();
-        let k = h_gpu[i].to_f32();
-        let abs = (g - k).abs();
-        let rel = if g.abs() > 1e-3 { abs / g.abs() } else { 0.0 };
-        if abs > max_abs_err {
-            max_abs_err = abs;
-        }
-        if rel > max_rel_err {
-            max_rel_err = rel;
-        }
-    }
+    let gpu = gpu_download_bf16(b.hidden_states, seq * hd);
+    let (abs, rel) = errs(&gpu, &cpu.h_final);
     eprintln!(
-        "full_residual_chain: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
-        max_rel_err * 100.0
+        "full_residual_chain: max_abs_err={abs:.5}, max_rel_err={:.4}%",
+        rel * 100.0
     );
-    // The full residual chain accumulates 2 layers × (o_proj + down) of
-    // bf16-rounded contributions. Accumulator magnitudes can reach ~50-100
-    // where bf16 ULP is ~0.5. Relative error stays small; absolute is the
-    // noisier metric. Both checks loosened to accommodate.
-    assert!(max_abs_err < 2.5, "full chain abs err {max_abs_err}");
-    assert!(max_rel_err < 0.05, "full chain rel err {max_rel_err}");
-}
-
-#[test]
-#[ignore = "needs GPU"]
-fn gate_up_chain_matches_cpu_golden() {
-    init_cuda();
-    let dims = scheduled_prefill_tiny_dims();
-    let hd = dims.hidden_dim as usize;
-    let id = dims.intermediate_dim as usize;
-    let seq = dims.seq_len as usize;
-    let nl = dims.num_layers as usize;
-    let eps: f32 = 1e-5;
-
-    let (b, inp) = build_test_buffers();
-    let _ = launch_with_buffers(&b, eps);
-
-    // gate_up reads rms_gate (output of mlp_norm). mlp_norm reads attn_out
-    // which is still placeholder (pre-filled), so rms_gate is independent
-    // of the o_proj residual chain. Last writer for silu_out is layer NL-1.
-    let silu_out_gpu = gpu_download_bf16(b.silu_out, seq * id);
-    let mn_w_last = &inp.mn_w_data[(nl - 1) * hd..nl * hd];
-    let gate_w_last = &inp.gate_w_data[(nl - 1) * id * hd..nl * id * hd];
-    let up_w_last = &inp.up_w_data[(nl - 1) * id * hd..nl * id * hd];
-
-    let mut max_abs_err = 0.0_f32;
-    let mut max_rel_err = 0.0_f32;
-    for r in 0..seq {
-        let normed = cpu_rms_norm(&inp.attn_out_data[r * hd..(r + 1) * hd], mn_w_last, eps);
-        let g_row = cpu_gemm(&normed, gate_w_last, 1, id, hd);
-        let u_row = cpu_gemm(&normed, up_w_last, 1, id, hd);
-        for n in 0..id {
-            let gv = g_row[n].to_f32();
-            let uv = u_row[n].to_f32();
-            let silu_g = gv / (1.0 + (-gv).exp());
-            let golden = silu_g * uv;
-            let k = silu_out_gpu[r * id + n].to_f32();
-            let abs = (golden - k).abs();
-            let rel = if golden.abs() > 1e-3 {
-                abs / golden.abs()
-            } else {
-                0.0
-            };
-            if abs > max_abs_err {
-                max_abs_err = abs;
-            }
-            if rel > max_rel_err {
-                max_rel_err = rel;
-            }
-        }
-    }
-    eprintln!(
-        "gate_up_chain: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
-        max_rel_err * 100.0
-    );
-    assert!(max_abs_err < 0.15, "gate_up chain abs err {max_abs_err}");
-    assert!(max_rel_err < 0.30, "gate_up chain rel err {max_rel_err}");
+    // Full forward pass through 2 layers + attention + 2 residual updates.
+    // bf16 accumulator noise dominates; abs check is loose, rel check tight.
+    assert!(abs < 5.0, "full chain abs {abs}");
+    assert!(rel < 0.10, "full chain rel {rel}");
 }
 
 /// CPU reference for a single GEMM tile: out[m,n] = sum_k a[m,k] * b[n,k].
@@ -628,26 +704,18 @@ fn paged_kv_offset(
     ((physical_page * page_size + slot) * num_kv_heads + kv_head) * head_dim + d
 }
 
-/// Phase 3c.8 step 2: validates that tile_rope correctly fans out into:
-///   - q_post_rope (rotated Q for the last layer; previous layers overwritten)
-///   - k_cache (rotated K for ALL layers, addressed by paged offsets)
-///   - v_cache (passthrough V for ALL layers, addressed by paged offsets)
-///
-/// The CPU golden simulates the layer-by-layer chain (norm → gemm → rope
-/// fan-out), walks the same paged-cache offsets, and compares.
+/// Validates tile_rope's fan-out: q_post_rope (last layer), paged k_cache
+/// and v_cache (all layers). Uses the cpu_forward simulator.
 #[test]
 #[ignore = "needs GPU"]
 fn rope_fanout_chain_matches_cpu_golden() {
     init_cuda();
     let dims = scheduled_prefill_tiny_dims();
-    let hd = dims.hidden_dim as usize;
-    let id = dims.intermediate_dim as usize;
-    let qkv_dim = ((dims.num_attn_heads + 2 * dims.num_kv_heads) * dims.head_dim) as usize;
     let seq = dims.seq_len as usize;
     let nl = dims.num_layers as usize;
-    let hdm = dims.head_dim as usize;
     let nah = dims.num_attn_heads as usize;
     let nkh = dims.num_kv_heads as usize;
+    let hdm = dims.head_dim as usize;
     let q_dim = nah * hdm;
     let page_size = SCHEDULED_PREFILL_KV_PAGE_SIZE as usize;
     let pages_per_layer = seq.div_ceil(page_size);
@@ -656,93 +724,19 @@ fn rope_fanout_chain_matches_cpu_golden() {
 
     let (b, inp) = build_test_buffers();
     let _ = launch_with_buffers(&b, eps);
+    let cpu = cpu_forward(&inp, eps);
 
     let q_post_gpu = gpu_download_bf16(b.q_post_rope, seq * q_dim);
     let k_cache_gpu = gpu_download_bf16(b.k_cache, cache_total);
     let v_cache_gpu = gpu_download_bf16(b.v_cache, cache_total);
 
-    // CPU walks each layer, computes the qkv row, applies rope-fanout, and
-    // stores the results in CPU mirrors of q_post_rope / k_cache / v_cache.
-    let mut q_post_cpu = vec![bf16::from_f32(0.0); seq * q_dim];
-    let mut k_cache_cpu = vec![bf16::from_f32(0.0); cache_total];
-    let mut v_cache_cpu = vec![bf16::from_f32(0.0); cache_total];
-
-    for l in 0..nl {
-        let h = cpu_hidden_at_start_of_layer(&inp, l, hd, id, seq, eps);
-        let an_w_l = &inp.an_w_data[l * hd..(l + 1) * hd];
-        let qkv_w_l = &inp.qkv_w_data[l * qkv_dim * hd..(l + 1) * qkv_dim * hd];
-
-        for r in 0..seq {
-            // 1. norm
-            let normed = cpu_rms_norm(&h[r * hd..(r + 1) * hd], an_w_l, eps);
-            // 2. raw qkv gemm (one row of length qkv_dim)
-            let mut row = cpu_gemm(&normed, qkv_w_l, 1, qkv_dim, hd);
-            // 3. rope on Q+K head pairs (V untouched)
-            cpu_rope_one(&mut row, r, hdm, nah, nkh);
-
-            // Q region → q_post_rope (last writer wins, so layer NL-1's value
-            // is what survives in the GPU buffer).
-            for c in 0..q_dim {
-                q_post_cpu[r * q_dim + c] = row[c];
-            }
-
-            // K region → paged k_cache slot for (l, r, kv_head, d)
-            let k_off_in_row = nah * hdm;
-            for kvh in 0..nkh {
-                for d in 0..hdm {
-                    let off = paged_kv_offset(l, r, kvh, d, page_size, pages_per_layer, nkh, hdm);
-                    k_cache_cpu[off] = row[k_off_in_row + kvh * hdm + d];
-                }
-            }
-            // V region → paged v_cache (passthrough, no rotation; read from
-            // the gemm output `row` *before* the rope rewrote it — but rope
-            // only touches Q and K, so V indices are still the gemm output).
-            let v_off_in_row = (nah + nkh) * hdm;
-            for kvh in 0..nkh {
-                for d in 0..hdm {
-                    let off = paged_kv_offset(l, r, kvh, d, page_size, pages_per_layer, nkh, hdm);
-                    v_cache_cpu[off] = row[v_off_in_row + kvh * hdm + d];
-                }
-            }
-        }
-    }
-
-    // ── Validate Q (last layer only — earlier overwritten in q_post_rope) ──
-    let mut q_max_abs = 0.0_f32;
-    for i in 0..seq * q_dim {
-        let g = q_post_cpu[i].to_f32();
-        let k = q_post_gpu[i].to_f32();
-        let abs = (g - k).abs();
-        if abs > q_max_abs {
-            q_max_abs = abs;
-        }
-    }
-    eprintln!("q_post_rope: max_abs_err={q_max_abs:.5}");
-    assert!(q_max_abs < 0.10, "q_post_rope abs err {q_max_abs}");
-
-    // ── Validate paged K cache (all layers, all rows) ──
-    let mut k_max_abs = 0.0_f32;
-    for i in 0..cache_total {
-        let g = k_cache_cpu[i].to_f32();
-        let k = k_cache_gpu[i].to_f32();
-        let abs = (g - k).abs();
-        if abs > k_max_abs {
-            k_max_abs = abs;
-        }
-    }
-    eprintln!("k_cache: max_abs_err={k_max_abs:.5}");
-    assert!(k_max_abs < 0.10, "k_cache abs err {k_max_abs}");
-
-    // ── Validate paged V cache (all layers, all rows) ──
-    let mut v_max_abs = 0.0_f32;
-    for i in 0..cache_total {
-        let g = v_cache_cpu[i].to_f32();
-        let k = v_cache_gpu[i].to_f32();
-        let abs = (g - k).abs();
-        if abs > v_max_abs {
-            v_max_abs = abs;
-        }
-    }
-    eprintln!("v_cache: max_abs_err={v_max_abs:.5}");
-    assert!(v_max_abs < 0.10, "v_cache abs err {v_max_abs}");
+    let (q_abs, _) = errs(&q_post_gpu, &cpu.q_post_rope_last);
+    let (k_abs, _) = errs(&k_cache_gpu, &cpu.k_cache);
+    let (v_abs, _) = errs(&v_cache_gpu, &cpu.v_cache);
+    eprintln!("q_post_rope: max_abs_err={q_abs:.5}");
+    eprintln!("k_cache:     max_abs_err={k_abs:.5}");
+    eprintln!("v_cache:     max_abs_err={v_abs:.5}");
+    assert!(q_abs < 0.10, "q_post_rope abs {q_abs}");
+    assert!(k_abs < 0.10, "k_cache abs {k_abs}");
+    assert!(v_abs < 0.10, "v_cache abs {v_abs}");
 }

@@ -17,6 +17,7 @@ pub mod dag;
 pub mod diagram;
 pub mod fused_codegen;
 pub mod parse;
+pub mod reified_dag;
 pub mod verify;
 
 /// Generate the complete CUDA source for a LLaMA-like megakernel from DSL source.

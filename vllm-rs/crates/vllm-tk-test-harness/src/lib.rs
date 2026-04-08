@@ -398,4 +398,30 @@ pub mod ffi {
         scheduled_megakernel_llama_3_2_1b_seq1024_num_ctas,
         scheduled_megakernel_llama_3_2_1b_seq1024_num_waves
     );
+
+    // Phase A.3 — FlashInfer attention runner shim. Standalone path that
+    // calls flashinfer::BatchPagedAttentionPersistent end-to-end via
+    // csrc/flashinfer_attention_shim.cu. Used by the smoke test to validate
+    // the runner against a CPU reference BEFORE we wire it into
+    // tile_attention. Pointer types are u16 because cudarc has no native
+    // bf16 type — bf16 buffers are uploaded/downloaded via reinterpret.
+    unsafe extern "C" {
+        /// Returns 0 on success. Non-zero error codes match
+        /// `FlashInferShimStatus` in the C++ shim.
+        pub fn run_flashinfer_attention_smoke(
+            q: *mut u16,          // device  [seq_len, num_qo_heads, head_dim]
+            k: *mut u16,          // device  [num_pages, page_size, num_kv_heads, head_dim]
+            v: *mut u16,          // device  same layout as k
+            kv_indices: *mut i32, // device  [num_pages]
+            o: *mut u16,          // device  [seq_len, num_qo_heads, head_dim]
+            seq_len: i32,
+            num_qo_heads: i32,
+            num_kv_heads: i32,
+            head_dim: i32,
+            page_size: i32,
+            num_pages: i32,
+            sm_scale: f32,
+            stream: u64,
+        ) -> i32;
+    }
 }

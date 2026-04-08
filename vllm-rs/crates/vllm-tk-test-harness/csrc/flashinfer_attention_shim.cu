@@ -42,11 +42,12 @@ using namespace flashinfer;
 
 namespace {
 
-// Workspaces are sized generously — we only run this on small (≤1024 token,
-// 1B-class) prefill in the smoke test, so 16 MiB each is plenty and the
-// alloc/free cost is hidden behind the CPU reference run.
-constexpr size_t kFloatWorkspaceBytes = 16ull * 1024 * 1024;
-constexpr size_t kIntWorkspaceBytes = 16ull * 1024 * 1024;
+// Workspaces. The float buffer holds `partial_o` (per-CTA per-Q-tile fp32
+// partial outputs across all KV splits) and `partial_lse`. With L4's 58 SMs
+// and FlashInfer using 2 CTAs/SM, the partial_o footprint at seq=64 head_dim=64
+// already pushes ~68 MiB. Size generously to cover seq up to 4096.
+constexpr size_t kFloatWorkspaceBytes = 512ull * 1024 * 1024;
+constexpr size_t kIntWorkspaceBytes = 64ull * 1024 * 1024;
 
 // Cast helper that adds a byte offset to a void* and reinterprets.
 template <typename T>

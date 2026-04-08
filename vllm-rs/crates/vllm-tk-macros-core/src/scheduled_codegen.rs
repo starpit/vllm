@@ -314,6 +314,7 @@ const KERNEL_BODY: &str = r#"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 #include <cstdio>
 
 namespace pfl_sched {
@@ -407,46 +408,84 @@ __device__ __forceinline__ void tile_attn_norm(const globals_t& g, uint32_t laye
     }
 }
 
-// ── tile_qkv: real GEMM. M=ROW_TILE, N=QKV_COL_TILE, K=HIDDEN_DIM. ──
+// ── tile_qkv: tensor-core GEMM. M=ROW_TILE, N=QKV_COL_TILE, K=HIDDEN_DIM. ──
 //
 // Output:  qkv[row*M..row*M+M, col*N..col*N+N]   ([seq, qkv_dim] row-major)
 // A:       rms_rope[row*M..row*M+M, 0..K]        ([seq, hidden_dim] row-major)
 // B:       qkv_w[layer, col*N..col*N+N, 0..K]    ([num_layers, qkv_dim, hidden_dim] row-major)
 //
-// Per-output formula: C[m,n] = sum_k A[m,k] * B[n,k]
+// Each warp owns one 16x16 sub-tile of the output. With M=16 and 8 warps,
+// the 8 warps cover the full N dimension by partitioning N into 8 slices
+// of width 16 each (so this requires N == 8 * 16 = 128). Per-warp K loop
+// issues wmma::mma_sync(16,16,16) once per K=16 step, fp32 accumulator.
 //
-// Threading: 32 threads, naive output-stationary. Each thread owns
-// (M*N)/32 outputs and walks K. Correct, not fast — Phase 4 will swap in
-// CUTLASS-quality bodies. fp32 accumulator.
+// Output is staged through shared memory as fp32 (one 16x16 slice per
+// warp), then all 256 threads cooperatively convert to bf16 and write to
+// gmem.
 __device__ __forceinline__ void tile_qkv(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
-    constexpr uint32_t M           = MODEL_ROW_TILE;
-    constexpr uint32_t K           = MODEL_HIDDEN_DIM;
-    constexpr uint32_t N           = MODEL_QKV_COL_TILE;
+    using namespace nvcuda::wmma;
+    constexpr uint32_t M            = MODEL_ROW_TILE;
+    constexpr uint32_t K            = MODEL_HIDDEN_DIM;
+    constexpr uint32_t N            = MODEL_QKV_COL_TILE;
     constexpr uint32_t QKV_DIM_FULL = (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
+    constexpr uint32_t WMMA_M       = 16;
+    constexpr uint32_t WMMA_N       = 16;
+    constexpr uint32_t WMMA_K       = 16;
+    constexpr uint32_t N_WARPS      = 8;
+    constexpr uint32_t N_PER_WARP   = N / N_WARPS;
+    static_assert(M == WMMA_M, "tile_qkv assumes M == 16 (wmma frag M)");
+    static_assert(N % (WMMA_N * N_WARPS) == 0, "tile_qkv: N must be 8*16=128 multiple");
+    static_assert(K % WMMA_K == 0, "tile_qkv: K must be a multiple of 16");
+    static_assert(N_PER_WARP == 16, "tile_qkv: each warp owns one 16-col slice");
+
     const uint32_t row_start = row * M;
     const uint32_t col_start = col * N;
     if (row_start >= MODEL_SEQ_LEN) return;
 
-    const __nv_bfloat16* A = g.rms_rope + (size_t)row_start * K;
-    const __nv_bfloat16* B = g.qkv_w
-        + (size_t)layer * QKV_DIM_FULL * K
-        + (size_t)col_start * K;
-    __nv_bfloat16* C = g.qkv + (size_t)row_start * QKV_DIM_FULL + col_start;
+    const __nv_bfloat16* A_base = g.rms_rope + (size_t)row_start * K;
+    const __nv_bfloat16* B_base = g.qkv_w + (size_t)layer * QKV_DIM_FULL * K;
+    __nv_bfloat16* C_base = g.qkv + (size_t)row_start * QKV_DIM_FULL + col_start;
 
+    const uint32_t warp_id = threadIdx.x / 32;
+    const uint32_t n_warp_start = warp_id * N_PER_WARP;
+
+    // Per-warp 16x16 fp32 scratch in shmem so the cooperative writeback
+    // converts to bf16 with 256-thread granularity.
+    __shared__ float qkv_scratch[N_WARPS * WMMA_M * WMMA_N];
+    float* my_scratch = qkv_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
+
+    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, col_major> b_frag;
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    // K loop. A is row-major [M, K] with stride K. B is the weight stored as
+    // [N, K] row-major in memory which equals [K, N] col-major; col-major
+    // load with ldm = K reads the (k_block, n_warp_start) slice.
+    #pragma unroll 1
+    for (uint32_t k = 0; k < K; k += WMMA_K) {
+        load_matrix_sync(a_frag, A_base + k, K);
+        load_matrix_sync(b_frag, B_base + (size_t)(col_start + n_warp_start) * K + k, K);
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // Stage fp32 accumulator to per-warp shmem slice (warp-synchronous).
+    store_matrix_sync(my_scratch, c_frag, WMMA_N, mem_row_major);
+    __syncthreads();
+
+    // Cooperative bf16 writeback across all 256 threads.
     const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
     for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
         const uint32_t n = idx % N;
         if (row_start + m >= MODEL_SEQ_LEN) continue;
-        float acc = 0.0f;
-        for (uint32_t k = 0; k < K; ++k) {
-            const float a = __bfloat162float(A[m * K + k]);
-            const float b = __bfloat162float(B[n * K + k]);
-            acc += a * b;
-        }
-        C[m * QKV_DIM_FULL + n] = __float2bfloat16(acc);
+        const uint32_t w = n / N_PER_WARP;
+        const uint32_t local_n = n % N_PER_WARP;
+        const float v = qkv_scratch[w * WMMA_M * WMMA_N + m * WMMA_N + local_n];
+        C_base[m * QKV_DIM_FULL + n] = __float2bfloat16(v);
     }
+    __syncthreads();
 }
 
 
@@ -677,42 +716,73 @@ __device__ __forceinline__ void tile_attention(const globals_t& g, uint32_t laye
     }
 }
 
-// ── tile_o_proj: GEMM + residual. M=ROW_TILE, N=O_COL_TILE, K=HIDDEN_DIM. ──
+// ── tile_o_proj: tensor-core GEMM + residual.
 //
 // hidden_states[m,n] += sum_k attn_out[m,k] * o_w[layer, n, k]
 //
-// Same naive output-stationary structure as tile_qkv but with a residual
-// seed: each output reads its current value and accumulates onto it.
+// Same wmma structure as tile_qkv. The residual seed is folded into the
+// fp32 scratch during the cooperative writeback (read existing bf16 C
+// value, add the wmma fp32 result, store as bf16).
 __device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
-    constexpr uint32_t M = MODEL_ROW_TILE;
-    constexpr uint32_t K = MODEL_HIDDEN_DIM;
-    constexpr uint32_t N = MODEL_O_COL_TILE;
-    constexpr uint32_t HD_FULL = MODEL_HIDDEN_DIM;
+    using namespace nvcuda::wmma;
+    constexpr uint32_t M          = MODEL_ROW_TILE;
+    constexpr uint32_t K          = MODEL_HIDDEN_DIM;
+    constexpr uint32_t N          = MODEL_O_COL_TILE;
+    constexpr uint32_t HD_FULL    = MODEL_HIDDEN_DIM;
+    constexpr uint32_t WMMA_M     = 16;
+    constexpr uint32_t WMMA_N     = 16;
+    constexpr uint32_t WMMA_K     = 16;
+    constexpr uint32_t N_WARPS    = 8;
+    constexpr uint32_t N_PER_WARP = N / N_WARPS;
+    static_assert(M == WMMA_M, "tile_o_proj assumes M == 16");
+    static_assert(N % (WMMA_N * N_WARPS) == 0, "tile_o_proj: N must be 8*16 multiple");
+    static_assert(K % WMMA_K == 0, "tile_o_proj: K must be a multiple of 16");
+    static_assert(N_PER_WARP == 16, "tile_o_proj: each warp owns one 16-col slice");
+
     const uint32_t row_start = row * M;
     const uint32_t col_start = col * N;
     if (row_start >= MODEL_SEQ_LEN) return;
 
-    const __nv_bfloat16* A = g.attn_out + (size_t)row_start * K;
-    const __nv_bfloat16* B = g.o_w
-        + (size_t)layer * HD_FULL * K
-        + (size_t)col_start * K;
-    __nv_bfloat16* C = g.hidden_states + (size_t)row_start * HD_FULL + col_start;
+    const __nv_bfloat16* A_base = g.attn_out + (size_t)row_start * K;
+    const __nv_bfloat16* B_base = g.o_w + (size_t)layer * HD_FULL * K;
+    __nv_bfloat16* C_base = g.hidden_states + (size_t)row_start * HD_FULL + col_start;
 
+    const uint32_t warp_id = threadIdx.x / 32;
+    const uint32_t n_warp_start = warp_id * N_PER_WARP;
+
+    __shared__ float oproj_scratch[N_WARPS * WMMA_M * WMMA_N];
+    float* my_scratch = oproj_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
+
+    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, col_major> b_frag;
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    #pragma unroll 1
+    for (uint32_t k = 0; k < K; k += WMMA_K) {
+        load_matrix_sync(a_frag, A_base + k, K);
+        load_matrix_sync(b_frag, B_base + (size_t)(col_start + n_warp_start) * K + k, K);
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    store_matrix_sync(my_scratch, c_frag, WMMA_N, mem_row_major);
+    __syncthreads();
+
+    // Cooperative residual + writeback. Read existing bf16, add fp32 mma
+    // result, store bf16.
     const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
     for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
         const uint32_t n = idx % N;
         if (row_start + m >= MODEL_SEQ_LEN) continue;
-        // Residual seed: read existing C value into the accumulator.
-        float acc = __bfloat162float(C[m * HD_FULL + n]);
-        for (uint32_t k = 0; k < K; ++k) {
-            const float a = __bfloat162float(A[m * K + k]);
-            const float b = __bfloat162float(B[n * K + k]);
-            acc += a * b;
-        }
-        C[m * HD_FULL + n] = __float2bfloat16(acc);
+        const uint32_t w = n / N_PER_WARP;
+        const uint32_t local_n = n % N_PER_WARP;
+        const float mma_val = oproj_scratch[w * WMMA_M * WMMA_N + m * WMMA_N + local_n];
+        const float old_c  = __bfloat162float(C_base[m * HD_FULL + n]);
+        C_base[m * HD_FULL + n] = __float2bfloat16(old_c + mma_val);
     }
+    __syncthreads();
 }
 
 
@@ -724,44 +794,82 @@ __device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, 
 //   g_acc = sum_k rms_gate[m, k] * gate_w[layer, n, k]
 //   u_acc = sum_k rms_gate[m, k] *   up_w[layer, n, k]
 //
-// Two GEMMs sharing the same A operand, fused with the SwiGLU elementwise.
-// Naive 32-thread output-stationary; each thread computes both g_acc and
-// u_acc for its outputs in one K loop.
+// Two GEMMs sharing the same A operand (rms_gate), fused with the SwiGLU
+// elementwise op. Each warp owns ONE 16x16 sub-tile and computes both the
+// gate accumulator AND the up accumulator over the same K loop, sharing
+// the A fragment between the two mma calls. The fused silu*mul happens
+// in fp32 in the cooperative writeback.
 __device__ __forceinline__ void tile_gate_up(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
-    constexpr uint32_t M  = MODEL_ROW_TILE;
-    constexpr uint32_t K  = MODEL_HIDDEN_DIM;
-    constexpr uint32_t N  = MODEL_GATE_UP_COL_TILE;
-    constexpr uint32_t ID = MODEL_INTERMEDIATE;
+    using namespace nvcuda::wmma;
+    constexpr uint32_t M          = MODEL_ROW_TILE;
+    constexpr uint32_t K          = MODEL_HIDDEN_DIM;
+    constexpr uint32_t N          = MODEL_GATE_UP_COL_TILE;
+    constexpr uint32_t ID         = MODEL_INTERMEDIATE;
+    constexpr uint32_t WMMA_M     = 16;
+    constexpr uint32_t WMMA_N     = 16;
+    constexpr uint32_t WMMA_K     = 16;
+    constexpr uint32_t N_WARPS    = 8;
+    constexpr uint32_t N_PER_WARP = N / N_WARPS;
+    static_assert(M == WMMA_M, "tile_gate_up assumes M == 16");
+    static_assert(N % (WMMA_N * N_WARPS) == 0, "tile_gate_up: N must be 8*16 multiple");
+    static_assert(K % WMMA_K == 0, "tile_gate_up: K must be a multiple of 16");
+    static_assert(N_PER_WARP == 16, "tile_gate_up: each warp owns one 16-col slice");
+
     const uint32_t row_start = row * M;
     const uint32_t col_start = col * N;
     if (row_start >= MODEL_SEQ_LEN) return;
 
-    const __nv_bfloat16* A = g.rms_gate + (size_t)row_start * K;
-    const __nv_bfloat16* B_gate = g.gate_w
-        + (size_t)layer * ID * K
-        + (size_t)col_start * K;
-    const __nv_bfloat16* B_up = g.up_w
-        + (size_t)layer * ID * K
-        + (size_t)col_start * K;
-    __nv_bfloat16* C = g.silu_out + (size_t)row_start * ID + col_start;
+    const __nv_bfloat16* A_base      = g.rms_gate + (size_t)row_start * K;
+    const __nv_bfloat16* B_gate_base = g.gate_w + (size_t)layer * ID * K;
+    const __nv_bfloat16* B_up_base   = g.up_w   + (size_t)layer * ID * K;
+    __nv_bfloat16* C_base = g.silu_out + (size_t)row_start * ID + col_start;
 
+    const uint32_t warp_id = threadIdx.x / 32;
+    const uint32_t n_warp_start = warp_id * N_PER_WARP;
+
+    // Two separate per-warp scratch slices: one for gate, one for up.
+    __shared__ float gate_scratch[N_WARPS * WMMA_M * WMMA_N];
+    __shared__ float up_scratch  [N_WARPS * WMMA_M * WMMA_N];
+    float* my_g_scratch = gate_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
+    float* my_u_scratch = up_scratch   + (size_t)warp_id * WMMA_M * WMMA_N;
+
+    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, col_major> b_g_frag;
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, col_major> b_u_frag;
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> g_acc_frag;
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> u_acc_frag;
+    fill_fragment(g_acc_frag, 0.0f);
+    fill_fragment(u_acc_frag, 0.0f);
+
+    #pragma unroll 1
+    for (uint32_t k = 0; k < K; k += WMMA_K) {
+        load_matrix_sync(a_frag, A_base + k, K);
+        load_matrix_sync(b_g_frag, B_gate_base + (size_t)(col_start + n_warp_start) * K + k, K);
+        load_matrix_sync(b_u_frag, B_up_base   + (size_t)(col_start + n_warp_start) * K + k, K);
+        mma_sync(g_acc_frag, a_frag, b_g_frag, g_acc_frag);
+        mma_sync(u_acc_frag, a_frag, b_u_frag, u_acc_frag);
+    }
+
+    store_matrix_sync(my_g_scratch, g_acc_frag, WMMA_N, mem_row_major);
+    store_matrix_sync(my_u_scratch, u_acc_frag, WMMA_N, mem_row_major);
+    __syncthreads();
+
+    // Cooperative SwiGLU writeback: silu(g) * u → bf16
     const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
     for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
         const uint32_t n = idx % N;
         if (row_start + m >= MODEL_SEQ_LEN) continue;
-        float g_acc = 0.0f;
-        float u_acc = 0.0f;
-        for (uint32_t k = 0; k < K; ++k) {
-            const float a = __bfloat162float(A[m * K + k]);
-            g_acc += a * __bfloat162float(B_gate[n * K + k]);
-            u_acc += a * __bfloat162float(B_up[n * K + k]);
-        }
-        // silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
-        const float silu_g = g_acc / (1.0f + __expf(-g_acc));
-        C[m * ID + n] = __float2bfloat16(silu_g * u_acc);
+        const uint32_t w = n / N_PER_WARP;
+        const uint32_t local_n = n % N_PER_WARP;
+        const uint32_t off = w * WMMA_M * WMMA_N + m * WMMA_N + local_n;
+        const float gv = gate_scratch[off];
+        const float uv = up_scratch[off];
+        const float silu_g = gv / (1.0f + __expf(-gv));
+        C_base[m * ID + n] = __float2bfloat16(silu_g * uv);
     }
+    __syncthreads();
 }
 
 __device__ __forceinline__ void tile_mlp_norm(const globals_t& g, uint32_t layer, uint32_t row) {
@@ -797,25 +905,56 @@ __device__ __forceinline__ void tile_mlp_norm(const globals_t& g, uint32_t layer
     }
 }
 
-// ── tile_down: GEMM + residual. M=ROW_TILE, N=DOWN_COL_TILE, K=INTERMEDIATE.
+// ── tile_down: tensor-core GEMM + residual.
 //
 // hidden_states[m,n] += sum_k silu_out[m,k] * down_w[layer, n, k]
 //
-// Same residual structure as tile_o_proj, just different K and inputs.
+// Same wmma + residual writeback as tile_o_proj. Different K (intermediate
+// dim) and different operand pointers.
 __device__ __forceinline__ void tile_down(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
-    constexpr uint32_t M  = MODEL_ROW_TILE;
-    constexpr uint32_t K  = MODEL_INTERMEDIATE;
-    constexpr uint32_t N  = MODEL_DOWN_COL_TILE;
-    constexpr uint32_t HD_FULL = MODEL_HIDDEN_DIM;
+    using namespace nvcuda::wmma;
+    constexpr uint32_t M          = MODEL_ROW_TILE;
+    constexpr uint32_t K          = MODEL_INTERMEDIATE;
+    constexpr uint32_t N          = MODEL_DOWN_COL_TILE;
+    constexpr uint32_t HD_FULL    = MODEL_HIDDEN_DIM;
+    constexpr uint32_t WMMA_M     = 16;
+    constexpr uint32_t WMMA_N     = 16;
+    constexpr uint32_t WMMA_K     = 16;
+    constexpr uint32_t N_WARPS    = 8;
+    constexpr uint32_t N_PER_WARP = N / N_WARPS;
+    static_assert(M == WMMA_M, "tile_down assumes M == 16");
+    static_assert(N % (WMMA_N * N_WARPS) == 0, "tile_down: N must be 8*16 multiple");
+    static_assert(K % WMMA_K == 0, "tile_down: K must be a multiple of 16");
+    static_assert(N_PER_WARP == 16, "tile_down: each warp owns one 16-col slice");
+
     const uint32_t row_start = row * M;
     const uint32_t col_start = col * N;
     if (row_start >= MODEL_SEQ_LEN) return;
 
-    const __nv_bfloat16* A = g.silu_out + (size_t)row_start * K;
-    const __nv_bfloat16* B = g.down_w
-        + (size_t)layer * HD_FULL * K
-        + (size_t)col_start * K;
-    __nv_bfloat16* C = g.hidden_states + (size_t)row_start * HD_FULL + col_start;
+    const __nv_bfloat16* A_base = g.silu_out + (size_t)row_start * K;
+    const __nv_bfloat16* B_base = g.down_w + (size_t)layer * HD_FULL * K;
+    __nv_bfloat16* C_base = g.hidden_states + (size_t)row_start * HD_FULL + col_start;
+
+    const uint32_t warp_id = threadIdx.x / 32;
+    const uint32_t n_warp_start = warp_id * N_PER_WARP;
+
+    __shared__ float down_scratch[N_WARPS * WMMA_M * WMMA_N];
+    float* my_scratch = down_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
+
+    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, col_major> b_frag;
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    #pragma unroll 1
+    for (uint32_t k = 0; k < K; k += WMMA_K) {
+        load_matrix_sync(a_frag, A_base + k, K);
+        load_matrix_sync(b_frag, B_base + (size_t)(col_start + n_warp_start) * K + k, K);
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    store_matrix_sync(my_scratch, c_frag, WMMA_N, mem_row_major);
+    __syncthreads();
 
     const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
@@ -823,14 +962,13 @@ __device__ __forceinline__ void tile_down(const globals_t& g, uint32_t layer, ui
         const uint32_t m = idx / N;
         const uint32_t n = idx % N;
         if (row_start + m >= MODEL_SEQ_LEN) continue;
-        float acc = __bfloat162float(C[m * HD_FULL + n]);
-        for (uint32_t k = 0; k < K; ++k) {
-            const float a = __bfloat162float(A[m * K + k]);
-            const float b = __bfloat162float(B[n * K + k]);
-            acc += a * b;
-        }
-        C[m * HD_FULL + n] = __float2bfloat16(acc);
+        const uint32_t w = n / N_PER_WARP;
+        const uint32_t local_n = n % N_PER_WARP;
+        const float mma_val = down_scratch[w * WMMA_M * WMMA_N + m * WMMA_N + local_n];
+        const float old_c  = __bfloat162float(C_base[m * HD_FULL + n]);
+        C_base[m * HD_FULL + n] = __float2bfloat16(old_c + mma_val);
     }
+    __syncthreads();
 }
 
 

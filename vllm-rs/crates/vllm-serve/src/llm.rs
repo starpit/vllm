@@ -541,6 +541,123 @@ impl LLM {
         )
     }
 
+    /// Execute many SPNL queries in one continuous-batched engine call.
+    ///
+    /// Each query is run through `augment::index` + `optimize_augments` (with
+    /// the offline-path RAPTOR summarizer wired up), then tokenized into a
+    /// `Prompt::TokenIdsWithAnnotations`. All resulting prompts are submitted
+    /// to a single `generate_impl` call so the engine's continuous-batching
+    /// scheduler can interleave their decode steps and keep the GPU busy.
+    ///
+    /// Returns one `RequestOutput` per input query, in the same order. The
+    /// caller scores them individually. Cold-start cost (e.g. RAPTOR
+    /// summarization on the first sample of a fresh corpus) is paid inside
+    /// this call but doesn't affect subsequent samples — the layer-1 done
+    /// marker means later queries skip indexing entirely.
+    ///
+    /// Limitations:
+    ///   - Each input query must be an outer `Query::Generate` (no nested
+    ///     generates inside the input). The bench's queries satisfy this.
+    ///   - The progress / per-query latency you observe is amortized across
+    ///     the whole batched call; isolated p50/p99 are not meaningful in
+    ///     this mode. For sequential per-query timing, use `execute_spnl`.
+    #[cfg(feature = "rag")]
+    pub fn execute_spnl_concurrent(
+        &mut self,
+        queries: Vec<spnl_core::ir::Query>,
+        params: Option<SamplingParams>,
+    ) -> Result<Vec<RequestOutput>> {
+        use spnl_core::optimizer::llo::llir::SingleGenerate;
+
+        let (tokenizer, template_ptr, cfg, _block_size) = self.query_setup()?;
+        // SAFETY: template_ptr points into self.chat_template, which is not
+        // mutated for the duration of this call. The borrow checker can't
+        // see that, so we use a raw pointer to keep `template` independent
+        // of `&mut self` reborrows below.
+        let template = unsafe { &*template_ptr };
+        let aug_options = self.aug_options();
+
+        // Phase 1: rewrite each query (augment::index + optimize_augments).
+        // The summarizer slot lets RAPTOR summarize via this LLM if any
+        // sample triggers a fresh build; subsequent samples are no-ops.
+        let rewritten: Vec<spnl_core::ir::Query> = {
+            let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+                let rt = Box::leak(Box::new(
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to create current_thread runtime"),
+                ));
+                rt.handle().clone()
+            });
+
+            let mut summarize_fn = |spec: &SingleGenerate| -> Result<String> {
+                let span_tok = crate::spans::tokenize_span_query(spec, &tokenizer, template, &cfg)
+                    .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+                let prompt = Prompt::TokenIds(span_tok.tokens);
+                let sp = vllm_common::SamplingParams {
+                    max_tokens: spec
+                        .metadata
+                        .max_tokens
+                        .filter(|&t| t > 0)
+                        .map(|t| t as u32),
+                    temperature: spec.metadata.temperature.unwrap_or(0.0) as f64,
+                    ..Default::default()
+                };
+                let outputs = self.generate_impl(&[prompt], Some(sp), false, false, false)?;
+                Ok(outputs
+                    .first()
+                    .and_then(|r| r.outputs.first())
+                    .map(|o| o.text.clone())
+                    .unwrap_or_default())
+            };
+
+            let mut aug_options_local = aug_options.clone();
+            aug_options_local.summarizer = Some(std::sync::Arc::new(
+                crate::augment::summarize::SyncClosureSummarizer,
+            ));
+
+            crate::augment::summarize::with_sync_summarizer(
+                &mut summarize_fn,
+                || -> Result<Vec<spnl_core::ir::Query>> {
+                    let mut out = Vec::with_capacity(queries.len());
+                    for q in &queries {
+                        rt.block_on(crate::augment::index(q, &aug_options_local))
+                            .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
+                        let r =
+                            rt.block_on(crate::spans::optimize_augments(q, &aug_options_local))?;
+                        out.push(r);
+                    }
+                    Ok(out)
+                },
+            )?
+        };
+
+        // Phase 2: HLO + tokenize each rewritten query into a Prompt.
+        let mut prompts: Vec<Prompt> = Vec::with_capacity(rewritten.len());
+        for q in &rewritten {
+            let q = crate::spans::hlo_insert_prepares(q);
+            let g = match &q {
+                spnl_core::ir::Query::Generate(g) => g.clone(),
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "execute_spnl_concurrent: each query must be an outer Generate, got {other:?}"
+                    ));
+                }
+            };
+            let spec = crate::spans::outer_generate_to_single(&g);
+            let span_tok = crate::spans::tokenize_span_query(&spec, &tokenizer, template, &cfg)
+                .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+            prompts.push(Prompt::TokenIdsWithAnnotations(
+                span_tok.tokens,
+                span_tok.annotations.unwrap_or_default(),
+            ));
+        }
+
+        // Phase 3: one continuous-batched generate call.
+        self.generate_impl(&prompts, params, false, false, false)
+    }
+
     /// Execute a SPNL span query from a JSON string.
     ///
     /// Prefer [`execute_spnl`](Self::execute_spnl) when you already have a

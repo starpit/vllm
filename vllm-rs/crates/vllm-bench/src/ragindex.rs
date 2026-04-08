@@ -294,14 +294,20 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
         let use_spans = args.query_mode == QueryMode::Spans;
 
         eprintln!();
+        if args.concurrency > 1 {
+            eprintln!(
+                "  Concurrency: {} (per-query latency is amortized)",
+                args.concurrency
+            );
+        }
         let mut stats = RunningStats::new(n_queries);
         let mut overlap = BlockOverlapTracker::new(args.block_size);
         let pb = make_progress_bar(n_queries);
 
-        for (qi, sample) in samples.iter().enumerate() {
-            // Both modes use LEANN retrieval via Augment. The difference:
-            // - spans: Plus wraps fragments as relocatable blocks (cache reuse)
-            // - plain: Seq treats fragments as plain sequential tokens (no reuse)
+        // Build the SPNL query for one sample. Same shape regardless of
+        // concurrency mode — the difference is whether we submit one or
+        // K queries to the engine at once.
+        let build_query = |sample: &crate::datasets::RagSample| -> SpnlQuery {
             let augment = SpnlQuery::Augment(Augment {
                 embedding_model: embedding_model.clone(),
                 body: Box::new(SpnlQuery::Message(Message::User(sample.question.clone()))),
@@ -312,8 +318,7 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
                 sample.question
             )));
             let children = vec![augment, question];
-
-            let query = SpnlQuery::Generate(Generate {
+            SpnlQuery::Generate(Generate {
                 metadata: GenerateMetadata {
                     model: model_name.clone(),
                     max_tokens: Some(args.max_tokens as i32),
@@ -324,34 +329,54 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
                 } else {
                     SpnlQuery::Seq(children)
                 }),
-            });
+            })
+        };
 
-            let start = Instant::now();
-            let result = llm.execute_spnl(query, Some(sampling.clone()), false, false)?;
-            let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let mut qi: usize = 0;
+        for chunk in samples.chunks(args.concurrency.max(1)) {
+            let chunk_start = Instant::now();
 
-            let output = result.output();
-            let response = &output.outputs[0].text;
-            let acc = evaluate_accuracy(response, &sample.answers);
-            let f1 = best_token_f1(&sample.answers, response);
-            let prompt_tokens = output.prompt_token_ids.len() as u32;
-            let cached_tokens = output.num_cached_tokens;
-            let reused_blocks = overlap.record(&output.prompt_token_ids);
-            stats.push(acc, f1, ms, prompt_tokens, cached_tokens);
+            // Sequential path (concurrency=1) keeps the existing
+            // execute_spnl flow so per-query latency stays meaningful.
+            // Concurrent path (>1) collects chunk queries and submits
+            // them in one continuous-batched generate call.
+            let outputs: Vec<vllm_serve::llm::RequestOutput> = if args.concurrency <= 1 {
+                let query = build_query(&chunk[0]);
+                let result = llm.execute_spnl(query, Some(sampling.clone()), false, false)?;
+                vec![result.output().clone()]
+            } else {
+                let queries: Vec<SpnlQuery> = chunk.iter().map(&build_query).collect();
+                llm.execute_spnl_concurrent(queries, Some(sampling.clone()))?
+            };
 
-            if args.debug && qi < 3 {
-                pb.suspend(|| {
-                    eprintln!("  {DIM}Q: {}{RST}", sample.question);
-                    eprintln!("  {DIM}A: {response}{RST}");
-                    eprintln!("  {DIM}Expected: {}{RST}", sample.answers.join(" | "));
-                    eprintln!(
-                        "  {DIM}acc={acc:.0} F1={f1:.3} {} reusable_blocks={reused_blocks}{RST}",
-                        fmt_ms(ms)
-                    );
-                });
+            let chunk_ms = chunk_start.elapsed().as_secs_f64() * 1000.0;
+            let per_query_ms = chunk_ms / chunk.len() as f64;
+
+            for (i, output) in outputs.iter().enumerate() {
+                let sample = &chunk[i];
+                let response = &output.outputs[0].text;
+                let acc = evaluate_accuracy(response, &sample.answers);
+                let f1 = best_token_f1(&sample.answers, response);
+                let prompt_tokens = output.prompt_token_ids.len() as u32;
+                let cached_tokens = output.num_cached_tokens;
+                let reused_blocks = overlap.record(&output.prompt_token_ids);
+                stats.push(acc, f1, per_query_ms, prompt_tokens, cached_tokens);
+
+                if args.debug && qi < 3 {
+                    pb.suspend(|| {
+                        eprintln!("  {DIM}Q: {}{RST}", sample.question);
+                        eprintln!("  {DIM}A: {response}{RST}");
+                        eprintln!("  {DIM}Expected: {}{RST}", sample.answers.join(" | "));
+                        eprintln!(
+                            "  {DIM}acc={acc:.0} F1={f1:.3} {} reusable_blocks={reused_blocks}{RST}",
+                            fmt_ms(per_query_ms)
+                        );
+                    });
+                }
+
+                qi += 1;
+                update_progress(&pb, &stats, &overlap);
             }
-
-            update_progress(&pb, &stats, &overlap);
         }
         pb.finish_and_clear();
 

@@ -294,7 +294,9 @@ struct globals_t {
     __nv_bfloat16* mlp_norm_w;     // [num_layers, HIDDEN_DIM]
     // GEMM weights, per layer.
     __nv_bfloat16* qkv_w;          // [num_layers, qkv_dim, HIDDEN_DIM]
-    __nv_bfloat16* o_w;            // [num_layers, HIDDEN_DIM, HIDDEN_DIM]
+    __nv_bfloat16* o_w;             // [num_layers, HIDDEN_DIM, HIDDEN_DIM]
+    __nv_bfloat16* gate_w;          // [num_layers, INTERMEDIATE, HIDDEN_DIM]
+    __nv_bfloat16* up_w;            // [num_layers, INTERMEDIATE, HIDDEN_DIM]
     float          eps;
 };
 
@@ -484,6 +486,52 @@ __device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, 
 
 // ── tile_mlp_norm: real RMS norm, same structure as tile_attn_norm but
 // reads attn_out and writes rms_gate using mlp_norm_w. ──
+// ── tile_gate_up: silu(rms_gate @ gate_w^T) * (rms_gate @ up_w^T). ──
+//
+// Output:  silu_out[m, n] = silu(g_acc) * u_acc
+//   g_acc = sum_k rms_gate[m, k] * gate_w[layer, n, k]
+//   u_acc = sum_k rms_gate[m, k] *   up_w[layer, n, k]
+//
+// Two GEMMs sharing the same A operand, fused with the SwiGLU elementwise.
+// Naive 32-thread output-stationary; each thread computes both g_acc and
+// u_acc for its outputs in one K loop.
+__device__ __forceinline__ void tile_gate_up(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
+    constexpr uint32_t M  = MODEL_ROW_TILE;
+    constexpr uint32_t K  = MODEL_HIDDEN_DIM;
+    constexpr uint32_t N  = MODEL_GATE_UP_COL_TILE;
+    constexpr uint32_t ID = MODEL_INTERMEDIATE;
+    const uint32_t row_start = row * M;
+    const uint32_t col_start = col * N;
+    if (row_start >= MODEL_SEQ_LEN) return;
+
+    const __nv_bfloat16* A = g.rms_gate + (size_t)row_start * K;
+    const __nv_bfloat16* B_gate = g.gate_w
+        + (size_t)layer * ID * K
+        + (size_t)col_start * K;
+    const __nv_bfloat16* B_up = g.up_w
+        + (size_t)layer * ID * K
+        + (size_t)col_start * K;
+    __nv_bfloat16* C = g.silu_out + (size_t)row_start * ID + col_start;
+
+    const uint32_t lane = threadIdx.x;
+    const uint32_t total = M * N;
+    for (uint32_t idx = lane; idx < total; idx += 32) {
+        const uint32_t m = idx / N;
+        const uint32_t n = idx % N;
+        if (row_start + m >= MODEL_SEQ_LEN) continue;
+        float g_acc = 0.0f;
+        float u_acc = 0.0f;
+        for (uint32_t k = 0; k < K; ++k) {
+            const float a = __bfloat162float(A[m * K + k]);
+            g_acc += a * __bfloat162float(B_gate[n * K + k]);
+            u_acc += a * __bfloat162float(B_up[n * K + k]);
+        }
+        // silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
+        const float silu_g = g_acc / (1.0f + __expf(-g_acc));
+        C[m * ID + n] = __float2bfloat16(silu_g * u_acc);
+    }
+}
+
 __device__ __forceinline__ void tile_mlp_norm(const globals_t& g, uint32_t layer, uint32_t row) {
     constexpr uint32_t HD       = MODEL_HIDDEN_DIM;
     constexpr uint32_t ROW_TILE = MODEL_ROW_TILE;
@@ -516,7 +564,6 @@ __device__ __forceinline__ void tile_mlp_norm(const globals_t& g, uint32_t layer
     }
 }
 
-__device__ __forceinline__ void tile_gate_up  (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
 __device__ __forceinline__ void tile_down     (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
 
 // Grid-wide barrier via a single global counter. Every CTA's thread 0 bumps
@@ -590,6 +637,8 @@ extern "C" void launch_scheduled_megakernel(
     // GEMM weights (bf16)
     void* qkv_w,
     void* o_w,
+    void* gate_w,
+    void* up_w,
     float eps,
     // Validation buffers
     unsigned int* flags,
@@ -607,6 +656,8 @@ extern "C" void launch_scheduled_megakernel(
         reinterpret_cast<__nv_bfloat16*>(mlp_norm_w),
         reinterpret_cast<__nv_bfloat16*>(qkv_w),
         reinterpret_cast<__nv_bfloat16*>(o_w),
+        reinterpret_cast<__nv_bfloat16*>(gate_w),
+        reinterpret_cast<__nv_bfloat16*>(up_w),
         eps,
     };
     pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived};

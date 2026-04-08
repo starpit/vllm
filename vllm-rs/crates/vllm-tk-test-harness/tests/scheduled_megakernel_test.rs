@@ -109,6 +109,8 @@ struct TestBuffers {
     mlp_norm_w: u64,
     qkv_w: u64,
     o_w: u64,
+    gate_w: u64,
+    up_w: u64,
 }
 
 fn launch_with_buffers(b: &TestBuffers, eps: f32) -> (Vec<u32>, u32) {
@@ -132,6 +134,8 @@ fn launch_with_buffers(b: &TestBuffers, eps: f32) -> (Vec<u32>, u32) {
             b.mlp_norm_w as *mut _,
             b.qkv_w as *mut _,
             b.o_w as *mut _,
+            b.gate_w as *mut _,
+            b.up_w as *mut _,
             eps,
             flags,
             tick,
@@ -246,6 +250,8 @@ struct TestInputs {
     attn_out_data: Vec<bf16>,
     qkv_w_data: Vec<bf16>,
     o_w_data: Vec<bf16>,
+    gate_w_data: Vec<bf16>,
+    up_w_data: Vec<bf16>,
 }
 
 /// Build the standard set of test buffers for the tiny model.
@@ -268,6 +274,9 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
     let qkv_w_data = random_bf16(nl * qkv_dim * hd, 6, 0.05);
     // o_w is HD×HD per layer; same small-scale weight to keep accumulators sane.
     let o_w_data = random_bf16(nl * hd * hd, 7, 0.05);
+    // gate_w / up_w are ID×HD per layer.
+    let gate_w_data = random_bf16(nl * id * hd, 8, 0.05);
+    let up_w_data = random_bf16(nl * id * hd, 9, 0.05);
 
     let b = TestBuffers {
         hidden_states: gpu_upload_bf16(&h_data),
@@ -280,6 +289,8 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
         mlp_norm_w: gpu_upload_bf16(&mn_w_data),
         qkv_w: gpu_upload_bf16(&qkv_w_data),
         o_w: gpu_upload_bf16(&o_w_data),
+        gate_w: gpu_upload_bf16(&gate_w_data),
+        up_w: gpu_upload_bf16(&up_w_data),
     };
     (
         b,
@@ -290,6 +301,8 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
             attn_out_data,
             qkv_w_data,
             o_w_data,
+            gate_w_data,
+            up_w_data,
         },
     )
 }
@@ -401,6 +414,62 @@ fn tile_o_proj_residual_chain_matches_cpu_golden() {
     );
     assert!(max_abs_err < 0.15, "o_proj chain abs err {max_abs_err}");
     assert!(max_rel_err < 0.05, "o_proj chain rel err {max_rel_err}");
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn gate_up_chain_matches_cpu_golden() {
+    init_cuda();
+    let dims = scheduled_prefill_tiny_dims();
+    let hd = dims.hidden_dim as usize;
+    let id = dims.intermediate_dim as usize;
+    let seq = dims.seq_len as usize;
+    let nl = dims.num_layers as usize;
+    let eps: f32 = 1e-5;
+
+    let (b, inp) = build_test_buffers();
+    let _ = launch_with_buffers(&b, eps);
+
+    // gate_up reads rms_gate (output of mlp_norm). mlp_norm reads attn_out
+    // which is still placeholder (pre-filled), so rms_gate is independent
+    // of the o_proj residual chain. Last writer for silu_out is layer NL-1.
+    let silu_out_gpu = gpu_download_bf16(b.silu_out, seq * id);
+    let mn_w_last = &inp.mn_w_data[(nl - 1) * hd..nl * hd];
+    let gate_w_last = &inp.gate_w_data[(nl - 1) * id * hd..nl * id * hd];
+    let up_w_last = &inp.up_w_data[(nl - 1) * id * hd..nl * id * hd];
+
+    let mut max_abs_err = 0.0_f32;
+    let mut max_rel_err = 0.0_f32;
+    for r in 0..seq {
+        let normed = cpu_rms_norm(&inp.attn_out_data[r * hd..(r + 1) * hd], mn_w_last, eps);
+        let g_row = cpu_gemm(&normed, gate_w_last, 1, id, hd);
+        let u_row = cpu_gemm(&normed, up_w_last, 1, id, hd);
+        for n in 0..id {
+            let gv = g_row[n].to_f32();
+            let uv = u_row[n].to_f32();
+            let silu_g = gv / (1.0 + (-gv).exp());
+            let golden = silu_g * uv;
+            let k = silu_out_gpu[r * id + n].to_f32();
+            let abs = (golden - k).abs();
+            let rel = if golden.abs() > 1e-3 {
+                abs / golden.abs()
+            } else {
+                0.0
+            };
+            if abs > max_abs_err {
+                max_abs_err = abs;
+            }
+            if rel > max_rel_err {
+                max_rel_err = rel;
+            }
+        }
+    }
+    eprintln!(
+        "gate_up_chain: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
+        max_rel_err * 100.0
+    );
+    assert!(max_abs_err < 0.15, "gate_up chain abs err {max_abs_err}");
+    assert!(max_rel_err < 0.30, "gate_up chain rel err {max_rel_err}");
 }
 
 /// CPU reference for a single GEMM tile: out[m,n] = sum_k a[m,k] * b[n,k].

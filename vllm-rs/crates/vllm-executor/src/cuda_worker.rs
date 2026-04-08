@@ -5977,6 +5977,84 @@ impl Worker for CudaWorker {
                 / 1_073_741_824.0,
         );
 
+        // Decode-shape cuBLAS warmup. The prefill forward above primes
+        // cuBLAS for prefill shapes (q_len = max_num_batched_tokens), but
+        // graph capture in `compile_or_warm_up_model` runs at decode
+        // shapes (q_len = 1, batch_size up to max). Decode shapes select
+        // different cuBLAS algorithm variants and trigger different
+        // `cuLibraryGetModule` calls — and under threaded TP those lazy
+        // loads can race against another rank's `cuGraphInstantiate`
+        // (read-vs-write on the libcuda internal rwlock), deadlocking
+        // graph capture. Doing the decode warmup HERE — inside scope 1
+        // of `init.rs::initialize_core_tp` which has a join barrier
+        // before scope 2 (graph capture) — guarantees every TP rank has
+        // every cuBLAS kernel loaded before any rank starts capturing,
+        // structurally eliminating the race.
+        //
+        // We pick a small batch size (1) to minimize the work; cuBLAS
+        // kernel loads are per-kernel-variant (not per-shape), and the
+        // largest model dimensions (hidden_size, vocab) drive variant
+        // selection more than batch size. One small forward is enough
+        // to load every variant the decode path will hit later.
+        {
+            let device = self.device.as_mut().unwrap();
+            let model = self.model.as_ref().unwrap();
+
+            let decode_bs: usize = 1;
+            let dummy_ids = device.alloc_gpu_tensor_zeroed(&[decode_bs], GpuDType::U32);
+            let dummy_pos = device.alloc_gpu_tensor_zeroed(&[decode_bs], GpuDType::U32);
+            let slot_data: Vec<i64> = vec![0i64];
+            let dummy_slots =
+                device.alloc_gpu_tensor_from_host(&[decode_bs], GpuDType::I64, unsafe {
+                    std::slice::from_raw_parts(slot_data.as_ptr() as *const u8, 8)
+                });
+            let cu_q_data: Vec<u32> = vec![0, 1];
+            let dummy_cu_q = device.alloc_gpu_tensor_from_host(&[2], GpuDType::U32, unsafe {
+                std::slice::from_raw_parts(cu_q_data.as_ptr() as *const u8, 8)
+            });
+            let seqused_data: Vec<u32> = vec![1u32];
+            let dummy_seqused = device.alloc_gpu_tensor_from_host(&[1], GpuDType::U32, unsafe {
+                std::slice::from_raw_parts(seqused_data.as_ptr() as *const u8, 4)
+            });
+            let bt_data: Vec<u32> = vec![0u32];
+            let dummy_bt = device.alloc_gpu_tensor_from_host(&[1, 1], GpuDType::U32, unsafe {
+                std::slice::from_raw_parts(bt_data.as_ptr() as *const u8, 4)
+            });
+            let dummy_kv = unsafe {
+                vllm_cuda::KvCachePool::new(
+                    model.num_layers(),
+                    1,
+                    self.config.block_size,
+                    model.num_kv_heads(),
+                    model.head_dim(),
+                    self.model_dtype,
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerInit(format!("decode warmup KvCachePool: {e}")))?;
+
+            info!("Decode-shape cuBLAS warmup forward (bs=1)...");
+            unsafe {
+                let _ = model.forward(
+                    TensorView::from_raw(dummy_ids),
+                    TensorView::from_raw(dummy_pos),
+                    TensorView::from_raw(dummy_slots),
+                    TensorView::from_raw(dummy_cu_q),
+                    TensorView::from_raw(dummy_seqused),
+                    TensorView::from_raw(dummy_bt),
+                    1, // max_seqlen_q
+                    1, // max_seqlen_k
+                    &dummy_kv,
+                    device,
+                    None,
+                );
+                if let Err(e) = driver::stream_synchronize(device.compute_stream) {
+                    tracing::warn!("Decode warmup forward sync failed: {e}");
+                }
+            }
+            drop(dummy_kv);
+            device.caching.trim();
+        }
+
         // Return the direct KV cache bytes. compute_num_blocks must NOT
         // apply gpu_memory_utilization again — it's already baked in.
         Ok(available_kv_bytes)

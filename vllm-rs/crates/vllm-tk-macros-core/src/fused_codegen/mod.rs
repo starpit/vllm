@@ -662,10 +662,17 @@ pub fn generate_fused_prefill_polyalgorithm(dag: &ModelDag) -> String {
     // 1-stage dual-accumulator variants (single K-loop over gate+up with A
     // reuse, 1-stage pipeline letting 2 CTAs/SM on rows128 or hosting a big
     // 256-row CTA on a single SM slot with half the mcta_barrier trips).
+    // _large is now cutlass4: every GEMM phase runs through CUTLASS
+    // device-side ThreadblockMma. gate_up uses two sequential CUTLASS calls
+    // (up + gate-with-LinearCombinationSiluMul). 1.76× over baseline at
+    // seq=1024 vs the old polyalgo's 1.34×.
     let variants: Vec<(&str, FusedPrefillConfig)> = vec![
         ("_small", FusedPrefillConfig::rows64_k128()), // seq ≤ 64
         ("_medium", FusedPrefillConfig::rows128_gemm16_dual_1stage()), // 64 < seq < 256
-        ("_large", FusedPrefillConfig::rows256_gemm32_dual_1stage()), // seq ≥ 256
+        (
+            "_large",
+            FusedPrefillConfig::rows256_gemm32_dual_1stage_cutlass4(),
+        ), // seq ≥ 256
     ];
 
     let mut out = String::new();

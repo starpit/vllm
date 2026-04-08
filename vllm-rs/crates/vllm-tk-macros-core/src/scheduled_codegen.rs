@@ -501,10 +501,17 @@ __device__ __forceinline__ void tile_qkv(
     const uint32_t n_warp_start = warp_id * N_PER_WARP;
     const uint32_t lane = threadIdx.x;
 
-    // Partition the kernel-scope shmem arena.
-    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(tile_smem);
-    __nv_bfloat16* b_smem = a_smem + M * KB;
-    float* qkv_scratch = reinterpret_cast<float*>(b_smem + N * KB);
+    // 2-stage cp.async double buffer for A and B (see tile_gate_up).
+    constexpr uint32_t STAGE_BYTES = (M + N) * KB * 2;
+    __nv_bfloat16* a_smem[2];
+    __nv_bfloat16* b_smem[2];
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        char* base = tile_smem + (size_t)s * STAGE_BYTES;
+        a_smem[s] = reinterpret_cast<__nv_bfloat16*>(base);
+        b_smem[s] = a_smem[s] + M * KB;
+    }
+    float* qkv_scratch = reinterpret_cast<float*>(tile_smem);
     float* my_scratch = qkv_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
 
     fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
@@ -512,29 +519,62 @@ __device__ __forceinline__ void tile_qkv(
     fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
     fill_fragment(c_frag, 0.0f);
 
+    constexpr uint32_t ELTS_PER_CHUNK = 8;
+    constexpr uint32_t A_CHUNKS = (M * KB) / ELTS_PER_CHUNK;
+    constexpr uint32_t B_CHUNKS = (N * KB) / ELTS_PER_CHUNK;
+
+    // Prefetch stage 0.
+    {
+        const int s = 0;
+        const uint32_t k_outer_local = 0;
+        if (lane < A_CHUNKS) {
+            const uint32_t m  = lane / (KB / ELTS_PER_CHUNK);
+            const uint32_t k8 = lane % (KB / ELTS_PER_CHUNK);
+            cp_async_16(a_smem[s] + m * KB + k8 * ELTS_PER_CHUNK,
+                        A_base + (size_t)m * K + k_outer_local + k8 * ELTS_PER_CHUNK);
+        }
+        #pragma unroll
+        for (uint32_t i = lane; i < B_CHUNKS; i += 256) {
+            const uint32_t n  = i / (KB / ELTS_PER_CHUNK);
+            const uint32_t k8 = i % (KB / ELTS_PER_CHUNK);
+            cp_async_16(b_smem[s] + n * KB + k8 * ELTS_PER_CHUNK,
+                        B_base + (size_t)n * K + k_outer_local + k8 * ELTS_PER_CHUNK);
+        }
+        cp_async_commit();
+    }
+
     #pragma unroll 1
     for (uint32_t k_outer = 0; k_outer < K; k_outer += KB) {
-        // ── Cooperative gmem→shmem load of A[0:M, k_outer:k_outer+KB] ──
-        // M*KB elements, 256 threads → (M*KB/256) per thread.
-        for (uint32_t i = lane; i < M * KB; i += 256) {
-            const uint32_t m = i / KB;
-            const uint32_t k_local = i % KB;
-            a_smem[m * KB + k_local] = A_base[m * K + k_outer + k_local];
-        }
-        // ── Cooperative gmem→shmem load of B[col_start:col_start+N, k_outer:k_outer+KB] ──
-        for (uint32_t i = lane; i < N * KB; i += 256) {
-            const uint32_t n = i / KB;
-            const uint32_t k_local = i % KB;
-            b_smem[n * KB + k_local] = B_base[(size_t)n * K + k_outer + k_local];
+        const int cur = (k_outer / KB) & 1;
+        const uint32_t k_next = k_outer + KB;
+
+        if (k_next < K) {
+            const int s_next = cur ^ 1;
+            if (lane < A_CHUNKS) {
+                const uint32_t m  = lane / (KB / ELTS_PER_CHUNK);
+                const uint32_t k8 = lane % (KB / ELTS_PER_CHUNK);
+                cp_async_16(a_smem[s_next] + m * KB + k8 * ELTS_PER_CHUNK,
+                            A_base + (size_t)m * K + k_next + k8 * ELTS_PER_CHUNK);
+            }
+            #pragma unroll
+            for (uint32_t i = lane; i < B_CHUNKS; i += 256) {
+                const uint32_t n  = i / (KB / ELTS_PER_CHUNK);
+                const uint32_t k8 = i % (KB / ELTS_PER_CHUNK);
+                cp_async_16(b_smem[s_next] + n * KB + k8 * ELTS_PER_CHUNK,
+                            B_base + (size_t)n * K + k_next + k8 * ELTS_PER_CHUNK);
+            }
+            cp_async_commit();
+            cp_async_wait_group<1>();
+        } else {
+            cp_async_wait_group<0>();
         }
         __syncthreads();
 
-        // ── wmma over the K_BLOCK from shmem ──
         #pragma unroll
         for (uint32_t k_inner = 0; k_inner < KB; k_inner += WMMA_K) {
-            load_matrix_sync(a_frag, a_smem + k_inner, KB);
+            load_matrix_sync(a_frag, a_smem[cur] + k_inner, KB);
             load_matrix_sync(b_frag,
-                             b_smem + (size_t)n_warp_start * KB + k_inner,
+                             b_smem[cur] + (size_t)n_warp_start * KB + k_inner,
                              KB);
             mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
@@ -886,9 +926,17 @@ __device__ __forceinline__ void tile_o_proj(
     const uint32_t n_warp_start = warp_id * N_PER_WARP;
     const uint32_t lane = threadIdx.x;
 
-    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(tile_smem);
-    __nv_bfloat16* b_smem = a_smem + M * KB;
-    float* oproj_scratch = reinterpret_cast<float*>(b_smem + N * KB);
+    // 2-stage cp.async double buffer for A and B (see tile_gate_up).
+    constexpr uint32_t STAGE_BYTES = (M + N) * KB * 2;
+    __nv_bfloat16* a_smem[2];
+    __nv_bfloat16* b_smem[2];
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        char* base = tile_smem + (size_t)s * STAGE_BYTES;
+        a_smem[s] = reinterpret_cast<__nv_bfloat16*>(base);
+        b_smem[s] = a_smem[s] + M * KB;
+    }
+    float* oproj_scratch = reinterpret_cast<float*>(tile_smem);
     float* my_scratch = oproj_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
 
     fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
@@ -896,25 +944,62 @@ __device__ __forceinline__ void tile_o_proj(
     fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
     fill_fragment(c_frag, 0.0f);
 
+    constexpr uint32_t ELTS_PER_CHUNK = 8;
+    constexpr uint32_t A_CHUNKS = (M * KB) / ELTS_PER_CHUNK;
+    constexpr uint32_t B_CHUNKS = (N * KB) / ELTS_PER_CHUNK;
+
+    // Prefetch stage 0.
+    {
+        const int s = 0;
+        const uint32_t k_outer_local = 0;
+        if (lane < A_CHUNKS) {
+            const uint32_t m  = lane / (KB / ELTS_PER_CHUNK);
+            const uint32_t k8 = lane % (KB / ELTS_PER_CHUNK);
+            cp_async_16(a_smem[s] + m * KB + k8 * ELTS_PER_CHUNK,
+                        A_base + (size_t)m * K + k_outer_local + k8 * ELTS_PER_CHUNK);
+        }
+        #pragma unroll
+        for (uint32_t i = lane; i < B_CHUNKS; i += 256) {
+            const uint32_t n  = i / (KB / ELTS_PER_CHUNK);
+            const uint32_t k8 = i % (KB / ELTS_PER_CHUNK);
+            cp_async_16(b_smem[s] + n * KB + k8 * ELTS_PER_CHUNK,
+                        B_base + (size_t)n * K + k_outer_local + k8 * ELTS_PER_CHUNK);
+        }
+        cp_async_commit();
+    }
+
     #pragma unroll 1
     for (uint32_t k_outer = 0; k_outer < K; k_outer += KB) {
-        for (uint32_t i = lane; i < M * KB; i += 256) {
-            const uint32_t m = i / KB;
-            const uint32_t k_local = i % KB;
-            a_smem[m * KB + k_local] = A_base[m * K + k_outer + k_local];
-        }
-        for (uint32_t i = lane; i < N * KB; i += 256) {
-            const uint32_t n = i / KB;
-            const uint32_t k_local = i % KB;
-            b_smem[n * KB + k_local] = B_base[(size_t)n * K + k_outer + k_local];
+        const int cur = (k_outer / KB) & 1;
+        const uint32_t k_next = k_outer + KB;
+
+        if (k_next < K) {
+            const int s_next = cur ^ 1;
+            if (lane < A_CHUNKS) {
+                const uint32_t m  = lane / (KB / ELTS_PER_CHUNK);
+                const uint32_t k8 = lane % (KB / ELTS_PER_CHUNK);
+                cp_async_16(a_smem[s_next] + m * KB + k8 * ELTS_PER_CHUNK,
+                            A_base + (size_t)m * K + k_next + k8 * ELTS_PER_CHUNK);
+            }
+            #pragma unroll
+            for (uint32_t i = lane; i < B_CHUNKS; i += 256) {
+                const uint32_t n  = i / (KB / ELTS_PER_CHUNK);
+                const uint32_t k8 = i % (KB / ELTS_PER_CHUNK);
+                cp_async_16(b_smem[s_next] + n * KB + k8 * ELTS_PER_CHUNK,
+                            B_base + (size_t)n * K + k_next + k8 * ELTS_PER_CHUNK);
+            }
+            cp_async_commit();
+            cp_async_wait_group<1>();
+        } else {
+            cp_async_wait_group<0>();
         }
         __syncthreads();
 
         #pragma unroll
         for (uint32_t k_inner = 0; k_inner < KB; k_inner += WMMA_K) {
-            load_matrix_sync(a_frag, a_smem + k_inner, KB);
+            load_matrix_sync(a_frag, a_smem[cur] + k_inner, KB);
             load_matrix_sync(b_frag,
-                             b_smem + (size_t)n_warp_start * KB + k_inner,
+                             b_smem[cur] + (size_t)n_warp_start * KB + k_inner,
                              KB);
             mma_sync(c_frag, a_frag, b_frag, c_frag);
         }

@@ -18,7 +18,7 @@ tls = ["axum-server", "rustls", "rustls-pemfile"]
 metrics = ["prometheus"]
 top = ["metrics"]
 multiproc = ["vllm-engine/multiproc"]
-rag = ["spnl-core/rag", "dep:leann-core", "dep:ndarray", "dep:reqwest"]
+rag = ["spnl-core/rag", "dep:leann-core", "dep:ndarray", "dep:reqwest", "dep:futures-util", "dep:async-trait"]
 
 [dependencies]
 vllm-common = { workspace = true }
@@ -60,6 +60,8 @@ spnl-core = { workspace = true }
 leann-core = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true, features = ["blocking"] }
+futures-util = { workspace = true, optional = true }
+async-trait = { version = "0.1", optional = true }
 itertools = "0.14"
 
 [dev-dependencies]

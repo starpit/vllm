@@ -606,13 +606,15 @@ impl LLM {
             .client
             .embed_sender()
             .map(|s| std::sync::Arc::new(s) as _);
-        crate::augment::AugmentOptions {
+        let mut opts = crate::augment::AugmentOptions {
             current_model: Some(self.model_name.clone()),
             embedder,
             tokenizer: self.tokenizer.clone(),
             sidecar_manager: Some(std::sync::Arc::clone(&self.sidecar_manager)),
             ..Default::default()
-        }
+        };
+        opts.apply_env_overrides();
+        opts
     }
 
     /// Reset the prefix cache, evicting all cached KV blocks.

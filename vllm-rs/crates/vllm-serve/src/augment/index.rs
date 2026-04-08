@@ -8,7 +8,18 @@ use spnl_core::ir::{Augment, Document, Generate, GenerateMetadata, Query};
 use tracing::info;
 
 use super::embed::{HttpEmbeddingProvider, InProcessEmbeddingProvider};
-use super::options::AugmentOptions;
+use super::options::{AugmentOptions, Indexer};
+
+/// Metadata about a layer-1 indexed corpus, returned by `process_document_layer1`
+/// so RAPTOR phase 2/3 can re-open and rebuild the index.
+#[derive(Clone)]
+pub(crate) struct IndexedCorpus {
+    pub filename: String,
+    pub index_path: PathBuf,
+    pub enclosing_model: String,
+    pub embedding_model: String,
+    pub dimensions: usize,
+}
 
 /// Adapts an indicatif `ProgressBar` to the `BuildProgress` trait.
 ///
@@ -76,31 +87,52 @@ fn extract_augments(query: &Query, enclosing_model: &Option<String>) -> Vec<(Str
 
 /// Scan the query for `Augment` nodes and build LEANN indexes for any that
 /// don't already have one on disk.
+///
+/// When `options.indexer == Indexer::Raptor`, `options.summarizer` must be
+/// set; the server path populates it with an `AppStateSummarizer` that
+/// drives generation through the in-process async engine.
 pub async fn index(query: &Query, options: &AugmentOptions) -> Result<()> {
     let augments = extract_augments(query, &None);
     for augmentation in &augments {
-        process_document(augmentation, options).await?;
+        let corpus = process_document_layer1(augmentation, options).await?;
+        if let (Indexer::Raptor, Some(corpus)) = (options.indexer, corpus) {
+            let summarizer = options.summarizer.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "RAPTOR indexing requires a summarizer; the offline LLM path does not yet support it"
+                )
+            })?;
+            super::raptor::cross_index(corpus, options, summarizer.as_ref()).await?;
+        }
     }
     Ok(())
 }
 
-/// Build a LEANN index for a single document if not already indexed.
-async fn process_document(
-    (_enclosing_model, a): &(String, Augment),
+/// Build a layer-1 LEANN index for a single document. Returns `Some(corpus)`
+/// describing the resulting index (used by RAPTOR for cross-indexing), or
+/// `None` if the index was already present on disk.
+async fn process_document_layer1(
+    (enclosing_model, a): &(String, Augment),
     options: &AugmentOptions,
-) -> Result<()> {
+) -> Result<Option<IndexedCorpus>> {
     let (filename, content) = &a.doc;
 
     let index_name = sanitize_name(&format!(
-        "default.{}.{filename}.SimpleEmbedRetrieve",
-        a.embedding_model,
+        "default.{}.{filename}.{:?}",
+        a.embedding_model, options.indexer,
     ));
     let index_dir = PathBuf::from(&options.index_dir);
     let index_path = index_dir.join(format!("{index_name}.leann"));
     let done_file = index_dir.join(format!("{index_name}.ok"));
 
     if done_file.exists() {
-        return Ok(());
+        // Already fully indexed. For raptor this means cross_index has
+        // completed — its done-marker is written *after* phase 3 rebuild,
+        // so a present marker is the authoritative "skip everything"
+        // signal regardless of indexer mode. Returning `None` here
+        // prevents the caller from re-running cross_index per query
+        // (which would re-cluster the rebuilt tree and grow it without
+        // bound).
+        return Ok(None);
     }
 
     // Extract text from document
@@ -208,19 +240,28 @@ async fn process_document(
 
     pb.finish_and_clear();
 
-    // Mark as done
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&done_file)?;
+    // For RAPTOR we defer marking the corpus done until phase 3 rebuild
+    // completes; that way a crash mid-cross-index re-runs cleanly.
+    if options.indexer == Indexer::Layer1 {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&done_file)?;
+    }
 
-    Ok(())
+    Ok(Some(IndexedCorpus {
+        filename: filename.clone(),
+        index_path,
+        enclosing_model: enclosing_model.clone(),
+        embedding_model: a.embedding_model.clone(),
+        dimensions,
+    }))
 }
 
 /// Resolve the base URL for an embedding model: use a sidecar if available,
 /// otherwise fall back to the env-var default.
-fn resolve_embedding_base_url(model: &str, options: &AugmentOptions) -> Result<String> {
+pub(crate) fn resolve_embedding_base_url(model: &str, options: &AugmentOptions) -> Result<String> {
     if let Some(mgr) = &options.sidecar_manager {
         let sidecar = mgr.get_or_spawn(model)?;
         Ok(sidecar.base_url.clone())

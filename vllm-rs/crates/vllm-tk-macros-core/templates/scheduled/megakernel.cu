@@ -1176,7 +1176,18 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
 
     // Single CTA-wide shmem arena reused across tile bodies. Wave scheduling
     // means only one tile body runs at a time per CTA, so they can share.
-    __shared__ alignas(16) char tile_smem[TILE_SHMEM_BYTES];
+    //
+    // Phase C2b-step-3a: this is now a *dynamic* shmem allocation
+    // (`extern __shared__`) so the launcher can opt into L4's 99 KiB
+    // carveout via `cudaFuncSetAttribute(...,
+    // cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`. The size is
+    // passed through the third launch arg of
+    // `cudaLaunchCooperativeKernel`. For sub-step 3a the requested
+    // size is unchanged from the old static `TILE_SHMEM_BYTES`
+    // (36 KiB) — sub-step 3c grows it to fit FlashInfer's
+    // `KTraits::SharedStorage` once the runner is wired in.
+    extern __shared__ __align__(16) uint8_t tile_smem_dyn[];
+    char* tile_smem = reinterpret_cast<char*>(tile_smem_dyn);
 
     // Per-CTA per-kernel-tag clock accumulator (sum of clock64() deltas
     // around each tile body). Lives in registers; written to gmem at
@@ -1337,14 +1348,54 @@ extern "C" void launch_scheduled_megakernel_{{ name }}(
     // 256 threads = 8 warps. Warp-shuffle phases (norms, rope, attention)
     // are gated to warp 0 inside their bodies; GEMM phases use all 256
     // threads cooperatively via per-thread output partitioning.
+    //
+    // Phase C2b-step-3c will bump this to
+    //   max(KTraits1::NUM_THREADS, KTraits2::NUM_THREADS, 256)
+    // when the FlashInfer runner is wired into the dispatch arm. For
+    // sub-step 3a we keep 256 — the structural change is just static
+    // → dynamic shmem and a switch to cooperative launch.
     dim3 block(256);
+
+    // Dynamic shared memory size for the megakernel. Currently equals
+    // the old static `TILE_SHMEM_BYTES` (36 KiB), but the path is now
+    // dynamic so sub-step 3c can grow it to fit FlashInfer's
+    // `KTraits::SharedStorage` without re-plumbing the launcher.
+    constexpr size_t kSmemBytes = pfl_sched_{{ name }}::TILE_SHMEM_BYTES;
+
+    // Opt the kernel into the larger dynamic shmem carveout. Required
+    // any time `kSmemBytes` exceeds the default 48 KiB ceiling on
+    // sm_80+, harmless when it doesn't.
+    auto attr_err = cudaFuncSetAttribute(
+        (const void*)pfl_sched_{{ name }}::scheduled_megakernel_{{ name }},
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)kSmemBytes);
+    if (attr_err != cudaSuccess) {
+        printf("scheduled_megakernel_{{ name }}: cudaFuncSetAttribute failed: %s\n",
+               cudaGetErrorString(attr_err));
+        return;
+    }
+
     // The grid-barrier counter is cumulative across waves, so it must be
     // reset to 0 before every launch — otherwise the second launch's
     // wave-0 barrier sees the counter already past its target and exits
     // without actually synchronizing, racing the rest of the kernel.
     // Async on the same stream → effectively free.
     cudaMemsetAsync(barrier_arrived, 0, sizeof(unsigned int), stream);
-    pfl_sched_{{ name }}::scheduled_megakernel_{{ name }}<<<grid, block, 0, stream>>>(g, rt);
+
+    // Cooperative launch — the megakernel uses `grid_barrier()` (a
+    // gmem-flag spin-loop) for inter-wave synchronization, which only
+    // works correctly when ALL the launched CTAs are guaranteed to be
+    // resident concurrently. cudaLaunchCooperativeKernel enforces
+    // that constraint at launch time and is also what FlashInfer's
+    // `cg::this_grid().sync()` requires (sub-step 3c).
+    void* args[] = { &g, &rt };
+    auto launch_err = cudaLaunchCooperativeKernel(
+        (const void*)pfl_sched_{{ name }}::scheduled_megakernel_{{ name }},
+        grid, block, args, kSmemBytes, stream);
+    if (launch_err != cudaSuccess) {
+        printf("scheduled_megakernel_{{ name }}: cudaLaunchCooperativeKernel failed: %s\n",
+               cudaGetErrorString(launch_err));
+    }
 }
 
 extern "C" unsigned int scheduled_megakernel_{{ name }}_num_nodes() {

@@ -334,42 +334,55 @@ pub mod ffi {
     // Phase 3b — scheduled megakernel placeholder. Different signature
     // (just three pointers / counters), declared by hand instead of via
     // the macro.
-    unsafe extern "C" {
-        pub fn launch_scheduled_megakernel(
-            // Activations (device pointers, bf16 data)
-            hidden_states: *mut std::ffi::c_void,
-            rms_rope: *mut std::ffi::c_void,
-            qkv: *mut std::ffi::c_void,
-            q_post_rope: *mut std::ffi::c_void,
-            attn_out: *mut std::ffi::c_void,
-            rms_gate: *mut std::ffi::c_void,
-            silu_out: *mut std::ffi::c_void,
-            // Paged KV cache
-            k_cache: *mut std::ffi::c_void,
-            v_cache: *mut std::ffi::c_void,
-            // Block table + indptrs (i32 device pointers)
-            prefill_kv_indices: *const i32,
-            prefill_kv_indptr: *const i32,
-            prefill_qo_indptr: *const i32,
-            // Norm weights
-            attn_norm_w: *mut std::ffi::c_void,
-            mlp_norm_w: *mut std::ffi::c_void,
-            // GEMM weights
-            qkv_w: *mut std::ffi::c_void,
-            o_w: *mut std::ffi::c_void,
-            gate_w: *mut std::ffi::c_void,
-            up_w: *mut std::ffi::c_void,
-            down_w: *mut std::ffi::c_void,
-            eps: f32,
-            attn_scale: f32,
-            // Validation buffers
-            flags: *mut u32,
-            tick_counter: *mut u32,
-            barrier_arrived: *mut u32,
-            stream: *mut std::ffi::c_void,
-        );
-        pub fn scheduled_megakernel_num_nodes() -> u32;
-        pub fn scheduled_megakernel_num_ctas() -> u32;
-        pub fn scheduled_megakernel_num_waves() -> u32;
+    // The scheduled megakernel signature is generated per variant — same
+    // shape, different symbol suffix. We declare it as a macro to keep the
+    // declarations in sync.
+    macro_rules! decl_scheduled_megakernel {
+        ($launch:ident, $num_nodes:ident, $num_ctas:ident, $num_waves:ident) => {
+            unsafe extern "C" {
+                pub fn $launch(
+                    hidden_states: *mut std::ffi::c_void,
+                    rms_rope: *mut std::ffi::c_void,
+                    qkv: *mut std::ffi::c_void,
+                    q_post_rope: *mut std::ffi::c_void,
+                    attn_out: *mut std::ffi::c_void,
+                    rms_gate: *mut std::ffi::c_void,
+                    silu_out: *mut std::ffi::c_void,
+                    k_cache: *mut std::ffi::c_void,
+                    v_cache: *mut std::ffi::c_void,
+                    prefill_kv_indices: *const i32,
+                    prefill_kv_indptr: *const i32,
+                    prefill_qo_indptr: *const i32,
+                    attn_norm_w: *mut std::ffi::c_void,
+                    mlp_norm_w: *mut std::ffi::c_void,
+                    qkv_w: *mut std::ffi::c_void,
+                    o_w: *mut std::ffi::c_void,
+                    gate_w: *mut std::ffi::c_void,
+                    up_w: *mut std::ffi::c_void,
+                    down_w: *mut std::ffi::c_void,
+                    eps: f32,
+                    attn_scale: f32,
+                    flags: *mut u32,
+                    tick_counter: *mut u32,
+                    barrier_arrived: *mut u32,
+                    stream: *mut std::ffi::c_void,
+                );
+                pub fn $num_nodes() -> u32;
+                pub fn $num_ctas() -> u32;
+                pub fn $num_waves() -> u32;
+            }
+        };
     }
+    decl_scheduled_megakernel!(
+        launch_scheduled_megakernel_tiny,
+        scheduled_megakernel_tiny_num_nodes,
+        scheduled_megakernel_tiny_num_ctas,
+        scheduled_megakernel_tiny_num_waves
+    );
+    decl_scheduled_megakernel!(
+        launch_scheduled_megakernel_medium,
+        scheduled_megakernel_medium_num_nodes,
+        scheduled_megakernel_medium_num_ctas,
+        scheduled_megakernel_medium_num_waves
+    );
 }

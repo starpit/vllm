@@ -187,10 +187,18 @@ fn emit_u32_chunked(out: &mut String, vals: &[u32]) {
 ///
 /// `kv_page_size` is the slots-per-page for the paged KV cache. Pages-per-
 /// layer is derived as ceil(seq_len / kv_page_size).
+///
+/// `name` is appended to the namespace and to all extern "C" symbols so
+/// multiple variants can coexist in the same translation-unit batch:
+///   namespace pfl_sched_<name>
+///   extern "C" void launch_scheduled_megakernel_<name>(...)
+///   extern "C" unsigned scheduled_megakernel_<name>_num_nodes()
+///   etc.
 pub fn emit_scheduled_megakernel_cu(
     dag: &ReifiedDag,
     sched: &WaveSchedule,
     kv_page_size: u32,
+    name: &str,
 ) -> String {
     let mut out = String::new();
     out.push_str(&emit_wave_schedule_cpp(dag, sched));
@@ -284,7 +292,18 @@ pub fn emit_scheduled_megakernel_cu(
     .unwrap();
     writeln!(out, "}}  // namespace pfl_sched").unwrap();
     out.push_str(KERNEL_BODY);
-    out
+
+    // ── Per-variant rename pass ──
+    // The kernel template is written with the literal namespace `pfl_sched`
+    // and the literal extern-"C" symbol root `scheduled_megakernel`. To make
+    // multiple variants coexist in the same translation-unit batch, suffix
+    // them with `_<name>`. Order matters: rename the namespace first so the
+    // symbol-root rename doesn't accidentally match `pfl_sched_*` substrings.
+    let ns_old = "pfl_sched";
+    let ns_new = format!("pfl_sched_{name}");
+    let sym_old = "scheduled_megakernel";
+    let sym_new = format!("scheduled_megakernel_{name}");
+    out.replace(ns_old, &ns_new).replace(sym_old, &sym_new)
 }
 
 const KERNEL_BODY: &str = r#"
@@ -964,7 +983,7 @@ mod tests {
         let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
         let cost = CostModel::from_dag(&dag);
         let sched = partition_into_waves(&dag, 4, &cost, 100);
-        let cpp = emit_scheduled_megakernel_cu(&dag, &sched, 16);
+        let cpp = emit_scheduled_megakernel_cu(&dag, &sched, 16, "tiny");
 
         assert!(cpp.contains("namespace pfl_sched"));
         assert!(cpp.contains("WAVE_OPS"));

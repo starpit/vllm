@@ -158,12 +158,19 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_layer_path.display()));
     cu_files.push(fused_layer_path.display().to_string());
 
-    // Phase 3b — placeholder scheduled megakernel for the tiny test fixture.
+    // Phase 3b/3c — scheduled megakernel for the tiny test fixture.
     let scheduled_tiny_source = vllm_tk_macros_core::generate_scheduled_prefill_tiny();
     let scheduled_tiny_path = out_dir.join("scheduled_prefill_tiny.cu");
     std::fs::write(&scheduled_tiny_path, &scheduled_tiny_source)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", scheduled_tiny_path.display()));
     cu_files.push(scheduled_tiny_path.display().to_string());
+
+    // Phase 3d — scheduled megakernel for the medium scaling test fixture.
+    let scheduled_medium_source = vllm_tk_macros_core::generate_scheduled_prefill_medium();
+    let scheduled_medium_path = out_dir.join("scheduled_prefill_medium.cu");
+    std::fs::write(&scheduled_medium_path, &scheduled_medium_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", scheduled_medium_path.display()));
+    cu_files.push(scheduled_medium_path.display().to_string());
 
     // Build all test kernels into one static library
     // CUTLASS headers (optional — if present, the megakernel can include

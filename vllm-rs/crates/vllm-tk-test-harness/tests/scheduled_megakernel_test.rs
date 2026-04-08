@@ -13,8 +13,9 @@
 use cudarc::driver::result;
 use half::bf16;
 use vllm_tk_macros_core::{
-    SCHEDULED_PREFILL_KV_PAGE_SIZE, SCHEDULED_PREFILL_TINY_CTAS, reified_dag::ReifiedDag,
-    reified_dag::TileSizes, scheduled_prefill_tiny_dims,
+    SCHEDULED_PREFILL_KV_PAGE_SIZE, SCHEDULED_PREFILL_MEDIUM_CTAS, SCHEDULED_PREFILL_TINY_CTAS,
+    reified_dag::LlamaDims, reified_dag::ReifiedDag, reified_dag::TileSizes,
+    scheduled_prefill_medium_dims, scheduled_prefill_tiny_dims,
 };
 use vllm_tk_test_harness::ffi;
 
@@ -129,10 +130,44 @@ struct TestBuffers {
     down_w: u64,
 }
 
-fn launch_with_buffers(b: &TestBuffers, eps: f32) -> (Vec<u32>, u32) {
-    let dims = scheduled_prefill_tiny_dims();
-    let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
-    let n = dag.nodes.len();
+/// Function pointer type for the per-variant launch helpers. Same shape
+/// across variants — only the symbol name differs.
+type LaunchFn = unsafe extern "C" fn(
+    hidden_states: *mut std::ffi::c_void,
+    rms_rope: *mut std::ffi::c_void,
+    qkv: *mut std::ffi::c_void,
+    q_post_rope: *mut std::ffi::c_void,
+    attn_out: *mut std::ffi::c_void,
+    rms_gate: *mut std::ffi::c_void,
+    silu_out: *mut std::ffi::c_void,
+    k_cache: *mut std::ffi::c_void,
+    v_cache: *mut std::ffi::c_void,
+    prefill_kv_indices: *const i32,
+    prefill_kv_indptr: *const i32,
+    prefill_qo_indptr: *const i32,
+    attn_norm_w: *mut std::ffi::c_void,
+    mlp_norm_w: *mut std::ffi::c_void,
+    qkv_w: *mut std::ffi::c_void,
+    o_w: *mut std::ffi::c_void,
+    gate_w: *mut std::ffi::c_void,
+    up_w: *mut std::ffi::c_void,
+    down_w: *mut std::ffi::c_void,
+    eps: f32,
+    attn_scale: f32,
+    flags: *mut u32,
+    tick_counter: *mut u32,
+    barrier_arrived: *mut u32,
+    stream: *mut std::ffi::c_void,
+);
+
+fn launch_with_buffers(
+    b: &TestBuffers,
+    dims: LlamaDims,
+    eps: f32,
+    launch: LaunchFn,
+    num_nodes: u32,
+) -> (Vec<u32>, u32) {
+    let n = num_nodes as usize;
     let attn_scale = 1.0 / (dims.head_dim as f32).sqrt();
 
     let flags = gpu_alloc_zeros_u32(n);
@@ -140,7 +175,7 @@ fn launch_with_buffers(b: &TestBuffers, eps: f32) -> (Vec<u32>, u32) {
     let barrier = gpu_alloc_zeros_u32(1);
 
     unsafe {
-        ffi::launch_scheduled_megakernel(
+        launch(
             b.hidden_states as *mut _,
             b.rms_rope as *mut _,
             b.qkv as *mut _,
@@ -183,15 +218,21 @@ fn scheduled_megakernel_executes_topologically() {
     let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
     let n = dag.nodes.len();
 
-    let kernel_n = unsafe { ffi::scheduled_megakernel_num_nodes() } as usize;
+    let kernel_n = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() } as usize;
     assert_eq!(n, kernel_n);
-    let kernel_ctas = unsafe { ffi::scheduled_megakernel_num_ctas() };
+    let kernel_ctas = unsafe { ffi::scheduled_megakernel_tiny_num_ctas() };
     assert_eq!(kernel_ctas, SCHEDULED_PREFILL_TINY_CTAS);
-    let kernel_waves = unsafe { ffi::scheduled_megakernel_num_waves() };
-    eprintln!("scheduled_megakernel: {n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
+    let kernel_waves = unsafe { ffi::scheduled_megakernel_tiny_num_waves() };
+    eprintln!("scheduled_megakernel(tiny): {n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
 
-    let (b, _) = build_test_buffers();
-    let (ticks, final_tick) = launch_with_buffers(&b, 1e-5);
+    let (b, _) = build_test_buffers(dims, 0);
+    let (ticks, final_tick) = launch_with_buffers(
+        &b,
+        dims,
+        1e-5,
+        ffi::launch_scheduled_megakernel_tiny,
+        kernel_n as u32,
+    );
     eprintln!("final tick = {final_tick}");
 
     // Invariant 1: every node executed exactly once.
@@ -238,9 +279,10 @@ struct TestInputs {
     down_w_data: Vec<bf16>,
 }
 
-/// Build the standard set of test buffers for the tiny model.
-fn build_test_buffers() -> (TestBuffers, TestInputs) {
-    let dims = scheduled_prefill_tiny_dims();
+/// Build the standard set of test buffers for any LLaMA-shaped variant.
+/// Uses deterministic seeds keyed by `seed_base` so different variants don't
+/// share buffer values.
+fn build_test_buffers(dims: LlamaDims, seed_base: u64) -> (TestBuffers, TestInputs) {
     let hd = dims.hidden_dim as usize;
     let seq = dims.seq_len as usize;
     let nl = dims.num_layers as usize;
@@ -257,20 +299,20 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
     let cache_bytes_per_layer = pages_per_layer * page_size * nkh * hdm * 2;
     let cache_bytes_total = nl * cache_bytes_per_layer;
 
-    let h_data = random_bf16(seq * hd, 1, 0.5);
-    let an_w_data = random_bf16(nl * hd, 2, 1.0);
-    let mn_w_data = random_bf16(nl * hd, 3, 1.0);
+    let h_data = random_bf16(seq * hd, seed_base + 1, 0.5);
+    let an_w_data = random_bf16(nl * hd, seed_base + 2, 1.0);
+    let mn_w_data = random_bf16(nl * hd, seed_base + 3, 1.0);
     // Small weight scale (0.05) to keep accumulator products in range —
     // bf16 GEMM with hd=256 over (-0.5,0.5) inputs and full-magnitude
     // weights would push individual outputs into the tens, blowing
     // through bf16's relative precision.
-    let qkv_w_data = random_bf16(nl * qkv_dim * hd, 6, 0.05);
+    let qkv_w_data = random_bf16(nl * qkv_dim * hd, seed_base + 6, 0.05);
     // o_w is HD×HD per layer; same small-scale weight to keep accumulators sane.
-    let o_w_data = random_bf16(nl * hd * hd, 7, 0.05);
+    let o_w_data = random_bf16(nl * hd * hd, seed_base + 7, 0.05);
     // gate_w / up_w are ID×HD per layer.
-    let gate_w_data = random_bf16(nl * id * hd, 8, 0.05);
-    let up_w_data = random_bf16(nl * id * hd, 9, 0.05);
-    let down_w_data = random_bf16(nl * hd * id, 10, 0.02);
+    let gate_w_data = random_bf16(nl * id * hd, seed_base + 8, 0.05);
+    let up_w_data = random_bf16(nl * id * hd, seed_base + 9, 0.05);
+    let down_w_data = random_bf16(nl * hd * id, seed_base + 10, 0.02);
 
     // Block table: identity mapping for the single test sequence.
     let prefill_kv_indices: Vec<i32> = (0..pages_per_layer as i32).collect();
@@ -343,8 +385,7 @@ struct CpuForward {
 ///   rms_gate    = rms_norm(h, mlp_norm_w[L])
 ///   silu_out    = silu(gemm(rms_gate, gate_w[L])) * gemm(rms_gate, up_w[L])
 ///   h          += gemm(silu_out, down_w[L])
-fn cpu_forward(inp: &TestInputs, eps: f32) -> CpuForward {
-    let dims = scheduled_prefill_tiny_dims();
+fn cpu_forward(inp: &TestInputs, dims: LlamaDims, eps: f32) -> CpuForward {
     let hd = dims.hidden_dim as usize;
     let id = dims.intermediate_dim as usize;
     let seq = dims.seq_len as usize;
@@ -529,9 +570,16 @@ fn tile_attn_norm_matches_cpu_golden() {
     let seq = dims.seq_len as usize;
     let eps: f32 = 1e-5;
 
-    let (b, inp) = build_test_buffers();
-    let _ = launch_with_buffers(&b, eps);
-    let cpu = cpu_forward(&inp, eps);
+    let (b, inp) = build_test_buffers(dims, 0);
+    let n_nodes = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() };
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_tiny,
+        n_nodes,
+    );
+    let cpu = cpu_forward(&inp, dims, eps);
 
     let gpu = gpu_download_bf16(b.rms_rope, seq * hd);
     let (abs, rel) = errs(&gpu, &cpu.rms_rope_last);
@@ -551,9 +599,16 @@ fn tile_mlp_norm_matches_cpu_golden() {
     let seq = dims.seq_len as usize;
     let eps: f32 = 1e-5;
 
-    let (b, inp) = build_test_buffers();
-    let _ = launch_with_buffers(&b, eps);
-    let cpu = cpu_forward(&inp, eps);
+    let (b, inp) = build_test_buffers(dims, 0);
+    let n_nodes = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() };
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_tiny,
+        n_nodes,
+    );
+    let cpu = cpu_forward(&inp, dims, eps);
 
     let gpu = gpu_download_bf16(b.rms_gate, seq * hd);
     let (abs, rel) = errs(&gpu, &cpu.rms_gate_last);
@@ -573,9 +628,16 @@ fn tile_attention_matches_cpu_golden() {
     let seq = dims.seq_len as usize;
     let eps: f32 = 1e-5;
 
-    let (b, inp) = build_test_buffers();
-    let _ = launch_with_buffers(&b, eps);
-    let cpu = cpu_forward(&inp, eps);
+    let (b, inp) = build_test_buffers(dims, 0);
+    let n_nodes = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() };
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_tiny,
+        n_nodes,
+    );
+    let cpu = cpu_forward(&inp, dims, eps);
 
     let gpu = gpu_download_bf16(b.attn_out, seq * hd);
     let (abs, rel) = errs(&gpu, &cpu.attn_out_last);
@@ -596,9 +658,16 @@ fn gate_up_chain_matches_cpu_golden() {
     let seq = dims.seq_len as usize;
     let eps: f32 = 1e-5;
 
-    let (b, inp) = build_test_buffers();
-    let _ = launch_with_buffers(&b, eps);
-    let cpu = cpu_forward(&inp, eps);
+    let (b, inp) = build_test_buffers(dims, 0);
+    let n_nodes = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() };
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_tiny,
+        n_nodes,
+    );
+    let cpu = cpu_forward(&inp, dims, eps);
 
     let gpu = gpu_download_bf16(b.silu_out, seq * id);
     let (abs, rel) = errs(&gpu, &cpu.silu_out_last);
@@ -618,9 +687,16 @@ fn full_residual_chain_matches_cpu_golden() {
     let seq = dims.seq_len as usize;
     let eps: f32 = 1e-5;
 
-    let (b, inp) = build_test_buffers();
-    let _ = launch_with_buffers(&b, eps);
-    let cpu = cpu_forward(&inp, eps);
+    let (b, inp) = build_test_buffers(dims, 0);
+    let n_nodes = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() };
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_tiny,
+        n_nodes,
+    );
+    let cpu = cpu_forward(&inp, dims, eps);
 
     let gpu = gpu_download_bf16(b.hidden_states, seq * hd);
     let (abs, rel) = errs(&gpu, &cpu.h_final);
@@ -722,9 +798,16 @@ fn rope_fanout_chain_matches_cpu_golden() {
     let cache_total = nl * pages_per_layer * page_size * nkh * hdm;
     let eps: f32 = 1e-5;
 
-    let (b, inp) = build_test_buffers();
-    let _ = launch_with_buffers(&b, eps);
-    let cpu = cpu_forward(&inp, eps);
+    let (b, inp) = build_test_buffers(dims, 0);
+    let n_nodes = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() };
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_tiny,
+        n_nodes,
+    );
+    let cpu = cpu_forward(&inp, dims, eps);
 
     let q_post_gpu = gpu_download_bf16(b.q_post_rope, seq * q_dim);
     let k_cache_gpu = gpu_download_bf16(b.k_cache, cache_total);
@@ -739,4 +822,144 @@ fn rope_fanout_chain_matches_cpu_golden() {
     assert!(q_abs < 0.10, "q_post_rope abs {q_abs}");
     assert!(k_abs < 0.10, "k_cache abs {k_abs}");
     assert!(v_abs < 0.10, "v_cache abs {v_abs}");
+}
+
+/// Phase 3d — comprehensive validation at the medium scaling fixture.
+/// NL=4, seq=64, HD=512, ID=1024, NAH=8, NKH=4, HDM=64.
+///
+/// Exercises:
+///   - multi-page KV cache (seq=64 / page_size=16 → 4 pages per layer,
+///     total 16 physical pages across NL=4 layers)
+///   - more layers than tiny — catches cross-layer cache slot collisions
+///     and longer residual cascade accumulation
+///   - GQA ratio = 2 (NAH=8, NKH=4) — exercises the head fan-out
+///   - 4× larger HD/ID/qkv_dim per tile vs tiny
+///
+/// Validates every end-state buffer (h_final, all "_last" intermediates,
+/// paged caches) against cpu_forward, in one shot. This is the bridge from
+/// "tiny test fixture works" to "scaling holds with bigger dims".
+#[test]
+#[ignore = "needs GPU"]
+fn medium_full_forward_pass_matches_cpu_golden() {
+    init_cuda();
+    let dims = scheduled_prefill_medium_dims();
+    let hd = dims.hidden_dim as usize;
+    let id = dims.intermediate_dim as usize;
+    let seq = dims.seq_len as usize;
+    let nl = dims.num_layers as usize;
+    let nah = dims.num_attn_heads as usize;
+    let nkh = dims.num_kv_heads as usize;
+    let hdm = dims.head_dim as usize;
+    let q_dim = nah * hdm;
+    let page_size = SCHEDULED_PREFILL_KV_PAGE_SIZE as usize;
+    let pages_per_layer = seq.div_ceil(page_size);
+    let cache_total = nl * pages_per_layer * page_size * nkh * hdm;
+    let eps: f32 = 1e-5;
+
+    // Sanity: kernel reports the right node and CTA counts.
+    let kernel_n = unsafe { ffi::scheduled_megakernel_medium_num_nodes() };
+    let kernel_ctas = unsafe { ffi::scheduled_megakernel_medium_num_ctas() };
+    let kernel_waves = unsafe { ffi::scheduled_megakernel_medium_num_waves() };
+    assert_eq!(kernel_ctas, SCHEDULED_PREFILL_MEDIUM_CTAS);
+    eprintln!(
+        "scheduled_megakernel(medium): {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs, {pages_per_layer} pages/layer × {nl} layers"
+    );
+
+    // Use a different seed base than tiny so a leak from a stale buffer
+    // would be obvious.
+    let (b, inp) = build_test_buffers(dims, 1000);
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_medium,
+        kernel_n,
+    );
+    let cpu = cpu_forward(&inp, dims, eps);
+
+    // Download every end-state buffer the simulator records.
+    let h_gpu = gpu_download_bf16(b.hidden_states, seq * hd);
+    let rms_rope_gpu = gpu_download_bf16(b.rms_rope, seq * hd);
+    let q_post_gpu = gpu_download_bf16(b.q_post_rope, seq * q_dim);
+    let attn_out_gpu = gpu_download_bf16(b.attn_out, seq * hd);
+    let rms_gate_gpu = gpu_download_bf16(b.rms_gate, seq * hd);
+    let silu_out_gpu = gpu_download_bf16(b.silu_out, seq * id);
+    let k_cache_gpu = gpu_download_bf16(b.k_cache, cache_total);
+    let v_cache_gpu = gpu_download_bf16(b.v_cache, cache_total);
+
+    // Validate each end-state buffer. Tolerances are pairs of (max_abs,
+    // max_rel) — both must hold. The cascade accumulates bf16 noise faster
+    // at larger magnitudes, so abs tolerances are scaled to ~4 ULPs at the
+    // expected magnitude. Rel tolerance is the meaningful precision check
+    // and stays tight (under 5%) except for buffers like q_post_rope and
+    // k_cache that contain near-zero values where rel err is undefined.
+    let checks: [(&str, &[bf16], &[bf16], f32, f32); 8] = [
+        (
+            "rms_rope_last",
+            &rms_rope_gpu,
+            &cpu.rms_rope_last,
+            0.10,
+            0.05,
+        ),
+        (
+            "q_post_rope_last",
+            &q_post_gpu,
+            &cpu.q_post_rope_last,
+            0.20,
+            10.0,
+        ),
+        (
+            "attn_out_last",
+            &attn_out_gpu,
+            &cpu.attn_out_last,
+            0.10,
+            0.05,
+        ),
+        (
+            "rms_gate_last",
+            &rms_gate_gpu,
+            &cpu.rms_gate_last,
+            0.10,
+            0.05,
+        ),
+        (
+            "silu_out_last",
+            &silu_out_gpu,
+            &cpu.silu_out_last,
+            0.50,
+            0.05,
+        ),
+        (
+            "k_cache (all layers)",
+            &k_cache_gpu,
+            &cpu.k_cache,
+            0.20,
+            10.0,
+        ),
+        (
+            "v_cache (all layers)",
+            &v_cache_gpu,
+            &cpu.v_cache,
+            0.10,
+            0.05,
+        ),
+        ("h_final", &h_gpu, &cpu.h_final, 64.0, 0.05),
+    ];
+    let mut any_failed = false;
+    for (label, gpu, cpu_buf, abs_tol, rel_tol) in checks {
+        let (abs, rel) = errs(gpu, cpu_buf);
+        eprintln!(
+            "medium  {label:24}: max_abs_err={abs:.5}  max_rel_err={:.4}%",
+            rel * 100.0
+        );
+        if abs >= abs_tol {
+            eprintln!("    !! FAIL: abs {abs} >= tol {abs_tol}");
+            any_failed = true;
+        }
+        if rel >= rel_tol {
+            eprintln!("    !! FAIL: rel {rel} >= tol {rel_tol}");
+            any_failed = true;
+        }
+    }
+    assert!(!any_failed, "medium full forward pass validation failed");
 }

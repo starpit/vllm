@@ -652,7 +652,41 @@ pub fn generate_scheduled_prefill_tiny() -> String {
     // Use a small CTA pool for the tiny model — keeps the launch fast.
     // Barrier cost ~100 mma units (≈1 µs at 1.5 GHz) is the L4 ballpark.
     let sched = partition_into_waves(&dag, SCHEDULED_PREFILL_TINY_CTAS, &cost, 100);
-    emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE)
+    emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE, "tiny")
+}
+
+/// Phase 3d — medium variant for scaling validation. NL=4, seq=64,
+/// HD=512, ID=1024, NAH=8, NKH=4, HDM=64. Exercises:
+///   - multi-page KV cache (seq=64 / page_size=16 = 4 pages per layer)
+///   - more layers (NL=4) catching cross-layer cache slot collisions
+///   - GQA ratio = 2 (NAH=8, NKH=4)
+///   - larger HD/ID/qkv_dim than tiny (4x bigger work per tile)
+pub fn scheduled_prefill_medium_dims() -> reified_dag::LlamaDims {
+    reified_dag::LlamaDims {
+        num_layers: 4,
+        hidden_dim: 512,
+        intermediate_dim: 1024,
+        num_attn_heads: 8,
+        num_kv_heads: 4,
+        head_dim: 64,
+        seq_len: 64,
+    }
+}
+
+/// CTA pool size for the medium fixture. Bigger than tiny because the work
+/// is bigger.
+pub const SCHEDULED_PREFILL_MEDIUM_CTAS: u32 = 16;
+
+pub fn generate_scheduled_prefill_medium() -> String {
+    use crate::reified_dag::{ReifiedDag, TileSizes};
+    use crate::schedule::{CostModel, partition_into_waves};
+    use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
+
+    let dims = scheduled_prefill_medium_dims();
+    let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+    let cost = CostModel::from_dag(&dag);
+    let sched = partition_into_waves(&dag, SCHEDULED_PREFILL_MEDIUM_CTAS, &cost, 100);
+    emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE, "medium")
 }
 
 /// Generate a debug variant of the decode kernel that syncs and writes a

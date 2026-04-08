@@ -24,7 +24,8 @@
 //! A future pass can coarsen by merging adjacent waves if doing so reduces
 //! `K * barrier_cost` more than it increases `sum_max_per_cta`.
 
-use crate::reified_dag::{NodeId, Phase, ReifiedDag};
+use crate::kernel_library::CoalescedDag;
+use crate::reified_dag::{NodeId, Phase};
 
 /// Per-node compute / memory cost in "mma units" (≈16 sm89 cycles each).
 /// Identical to the previous list-scheduler model — the cost domain doesn't
@@ -45,7 +46,7 @@ pub struct CostModel {
 }
 
 impl CostModel {
-    pub fn from_dag(dag: &ReifiedDag) -> Self {
+    pub fn from_dag(dag: &CoalescedDag) -> Self {
         Self {
             row_tile: dag.tiles.row_tile,
             qkv_col_tile: dag.tiles.qkv_col_tile,
@@ -153,13 +154,17 @@ impl WaveSchedule {
 /// `barrier_cost` is in the same mma-unit domain as the cost model. On L4
 /// a gmem-flag grid barrier is ~1-2 µs ≈ 1500-3000 cycles ≈ 100-200 mma units.
 pub fn partition_into_waves(
-    dag: &ReifiedDag,
+    dag: &CoalescedDag,
     num_ctas: u32,
     cost: &CostModel,
     barrier_cost: u64,
 ) -> WaveSchedule {
     let n = dag.nodes.len();
-    let costs: Vec<u32> = dag.nodes.iter().map(|nd| cost.cost(nd.phase)).collect();
+    // Cost is now per-binding, not per-phase. With only `HandWrittenRowTile`
+    // registered the result is identical to the old `cost.cost(nd.phase)`
+    // path; new library entries (FlashInferAttentionLayer, …) compute it
+    // their own way inside `BoundKernel::cost`.
+    let costs: Vec<u32> = dag.nodes.iter().map(|nd| nd.kernel.cost(cost)).collect();
 
     // ── Step 1: earliest_wave[i] = 1 + max(earliest_wave[d] for d in deps), or 0 ──
     // Topological order is implicit (deps point backward by Phase 1 invariant).
@@ -252,7 +257,8 @@ pub fn partition_into_waves(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reified_dag::{LlamaDims, TileSizes};
+    use crate::kernel_library::coalesce;
+    use crate::reified_dag::{LlamaDims, ReifiedDag, TileSizes};
 
     fn llama_1b_dims(seq: u32) -> LlamaDims {
         LlamaDims {
@@ -270,7 +276,8 @@ mod tests {
     fn waves_are_dependency_safe() {
         // No two nodes in the same wave may depend on each other, and every
         // node's deps must lie in strictly earlier waves.
-        let dag = ReifiedDag::reify_llama(llama_1b_dims(64), TileSizes::default_v1());
+        let reified = ReifiedDag::reify_llama(llama_1b_dims(64), TileSizes::default_v1());
+        let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
         let sched = partition_into_waves(&dag, 8, &cost, 100);
 
@@ -306,16 +313,18 @@ mod tests {
     #[test]
     fn num_waves_equals_critical_path_in_nodes() {
         // The minimum-K partition has exactly critical-path-depth waves.
-        let dag = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
+        let reified = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
+        let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
         let sched = partition_into_waves(&dag, 58, &cost, 100);
-        let cp_nodes = dag.critical_path_depth();
+        let cp_nodes = reified.critical_path_depth();
         assert_eq!(sched.num_waves(), cp_nodes as usize);
     }
 
     #[test]
     fn schedule_1b_seq1024_smoke() {
-        let dag = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
+        let reified = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
+        let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
         // 100 mma units ≈ 1.0 µs at 1.5 GHz — ballpark for an L4 gmem-flag barrier.
         let sched = partition_into_waves(&dag, 58, &cost, 100);

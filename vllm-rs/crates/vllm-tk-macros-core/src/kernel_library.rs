@@ -36,7 +36,8 @@
 //! today's hand-written body. Registering a new kernel only changes
 //! the kinds it claims, never the rest.
 
-use crate::reified_dag::{NodeId, Phase, ReifiedDag};
+use crate::reified_dag::{LlamaDims, NodeId, Phase, ReifiedDag, TileSizes};
+use crate::schedule::CostModel;
 
 /// One concrete binding instance: a kernel implementation choice plus
 /// the DAG inputs it consumes.
@@ -78,6 +79,21 @@ impl BoundKernel {
             BoundKernel::HandWrittenRowTile { phase, .. } => phase.name(),
         }
     }
+
+    /// Predicted cost of executing this binding, in the same mma-unit
+    /// domain as `CostModel`. The wave scheduler uses this number for
+    /// LPT bin packing inside a wave and for the makespan rollup.
+    ///
+    /// For `HandWrittenRowTile` we delegate to the existing per-phase
+    /// cost (one tile body per node, the status quo). When new
+    /// library entries land, each provides its own per-binding cost
+    /// — e.g. `FlashInferAttentionLayer` will roll up the whole
+    /// layer's attention into one number.
+    pub fn cost(&self, model: &CostModel) -> u32 {
+        match self {
+            BoundKernel::HandWrittenRowTile { phase, .. } => model.cost(*phase),
+        }
+    }
 }
 
 /// One node in the coalesced DAG.
@@ -106,6 +122,14 @@ pub struct CoalescedNode {
 /// coalesced ids.
 #[derive(Clone, Debug)]
 pub struct CoalescedDag {
+    /// Model dimensions, lifted from the source `ReifiedDag`. Cost
+    /// models, codegen prelude, and FlashInfer plan-time inputs all
+    /// need these — keep them attached so consumers don't need to
+    /// hold a separate handle to the source DAG.
+    pub dims: LlamaDims,
+    /// Tile shape policy, lifted from the source `ReifiedDag`. Used
+    /// by the cost model and the codegen template.
+    pub tiles: TileSizes,
     pub nodes: Vec<CoalescedNode>,
 }
 
@@ -148,7 +172,11 @@ pub fn coalesce(dag: &ReifiedDag) -> CoalescedDag {
             deps: n.deps.clone(),
         })
         .collect();
-    CoalescedDag { nodes }
+    CoalescedDag {
+        dims: dag.dims,
+        tiles: dag.tiles,
+        nodes,
+    }
 }
 
 #[cfg(test)]

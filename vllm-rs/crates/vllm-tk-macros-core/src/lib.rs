@@ -643,12 +643,14 @@ pub const SCHEDULED_PREFILL_TINY_CTAS: u32 = 4;
 pub const SCHEDULED_PREFILL_KV_PAGE_SIZE: u32 = 16;
 
 pub fn generate_scheduled_prefill_tiny() -> String {
+    use crate::kernel_library::coalesce;
     use crate::reified_dag::{ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
 
     let dims = scheduled_prefill_tiny_dims();
-    let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+    let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+    let dag = coalesce(&reified);
     let cost = CostModel::from_dag(&dag);
     // Use a small CTA pool for the tiny model — keeps the launch fast.
     // Barrier cost ~100 mma units (≈1 µs at 1.5 GHz) is the L4 ballpark.
@@ -679,12 +681,14 @@ pub fn scheduled_prefill_medium_dims() -> reified_dag::LlamaDims {
 pub const SCHEDULED_PREFILL_MEDIUM_CTAS: u32 = 16;
 
 pub fn generate_scheduled_prefill_medium() -> String {
+    use crate::kernel_library::coalesce;
     use crate::reified_dag::{ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
 
     let dims = scheduled_prefill_medium_dims();
-    let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+    let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+    let dag = coalesce(&reified);
     let cost = CostModel::from_dag(&dag);
     let sched = partition_into_waves(&dag, SCHEDULED_PREFILL_MEDIUM_CTAS, &cost, 100);
     emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE, "medium")
@@ -725,6 +729,7 @@ fn ctas_for_variant(dims: &reified_dag::LlamaDims) -> u32 {
 /// params, then apply the variant's overrides. Missing dim parameters are
 /// an error.
 pub fn generate_scheduled_prefill_variants(dsl: &str) -> Result<Vec<ScheduledVariant>, String> {
+    use crate::kernel_library::coalesce;
     use crate::reified_dag::{LlamaDims, ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
@@ -764,7 +769,8 @@ pub fn generate_scheduled_prefill_variants(dsl: &str) -> Result<Vec<ScheduledVar
         let dims = LlamaDims::from_params(&params, seq_len)
             .map_err(|e| format!("variant `{}`: {e}", variant.name))?;
 
-        let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+        let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+        let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
         let num_ctas = ctas_for_variant(&dims);
         let sched = partition_into_waves(&dag, num_ctas, &cost, 100);

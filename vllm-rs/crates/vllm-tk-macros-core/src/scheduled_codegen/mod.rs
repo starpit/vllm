@@ -28,7 +28,8 @@ use std::fmt::Write as _;
 
 use askama::Template;
 
-use crate::reified_dag::{Phase, ReifiedDag};
+use crate::kernel_library::{BoundKernel, CoalescedDag};
+use crate::reified_dag::Phase;
 use crate::schedule::WaveSchedule;
 
 mod templates;
@@ -61,7 +62,7 @@ pub fn phase_tag(p: Phase) -> u32 {
 ///   extern "C" void launch_scheduled_megakernel_<name>(...)
 ///   extern "C" unsigned scheduled_megakernel_<name>_num_nodes()
 pub fn emit_scheduled_megakernel_cu(
-    dag: &ReifiedDag,
+    dag: &CoalescedDag,
     sched: &WaveSchedule,
     kv_page_size: u32,
     name: &str,
@@ -72,6 +73,11 @@ pub fn emit_scheduled_megakernel_cu(
 
     // ── Pack the per-wave per-CTA op streams into one flat array. ──
     // Layout order: wave 0 / cta 0..N-1; wave 1 / cta 0..N-1; ...
+    //
+    // Phase C1: only `HandWrittenRowTile` is registered, so every coalesced
+    // node carries a (phase, layer, row, col) we can lift directly into the
+    // existing WAVE_OPS schema. Phase C2 will add a kernel-tagged variant
+    // when `FlashInferAttentionLayer` lands and the schema needs to grow.
     let mut ops: Vec<(
         u32, /*phase*/
         u32, /*layer*/
@@ -88,12 +94,16 @@ pub fn emit_scheduled_megakernel_cu(
             wave_cta_offsets.push(cursor);
             for nid in &wave.cta_nodes[cta] {
                 let nd = &dag.nodes[nid.0 as usize];
-                ops.push((
-                    phase_tag(nd.phase),
-                    nd.layer as u32,
-                    nd.row as u32,
-                    nd.col as u32,
-                ));
+                match nd.kernel {
+                    BoundKernel::HandWrittenRowTile {
+                        phase,
+                        layer,
+                        row,
+                        col,
+                    } => {
+                        ops.push((phase_tag(phase), layer as u32, row as u32, col as u32));
+                    }
+                }
                 node_ids.push(nid.0);
                 cursor += 1;
             }
@@ -158,7 +168,8 @@ fn render_u32_table_chunked(vals: &[u32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reified_dag::{LlamaDims, TileSizes};
+    use crate::kernel_library::coalesce;
+    use crate::reified_dag::{LlamaDims, ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
 
     fn tiny_dims() -> LlamaDims {
@@ -175,7 +186,8 @@ mod tests {
 
     #[test]
     fn emit_smoke() {
-        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let reified = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
         let sched = partition_into_waves(&dag, 4, &cost, 100);
         let cpp = emit_scheduled_megakernel_cu(&dag, &sched, 16, "tiny");
@@ -193,7 +205,8 @@ mod tests {
 
     #[test]
     fn op_count_matches_node_count() {
-        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let reified = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
         let sched = partition_into_waves(&dag, 4, &cost, 100);
 

@@ -73,6 +73,69 @@ pub enum BoundKernel {
     /// edge that lived purely between absorbed attention nodes is
     /// dropped (no internal edges in a fused node).
     FlashInferAttentionLayer { layer: u16 },
+
+    /// CUTLASS sm80 multistage GEMM via
+    /// `cutlass::gemm::threadblock::MmaMultistage::operator()`,
+    /// applied to one layer's worth of work for one of the GEMM
+    /// phases (qkv / o_proj / gate_up / down).
+    ///
+    /// Same wave-cooperative pattern as `FlashInferAttentionLayer`:
+    /// the coalesce rule fuses every reified node for one
+    /// `(layer, phase)` pair into a single bound node, the
+    /// scheduler replicates it across every CTA in its wave, and the
+    /// dispatch arm runs CUTLASS's `MmaMultistage` per-CTA with each
+    /// CTA picking its `(M_tile, N_tile)` work via its `bid`.
+    ///
+    /// The four phases share one variant — the megakernel's dispatch
+    /// arm branches on `phase` to pick the right A/B/C base pointers
+    /// and the right epilogue (LinearCombinationSiluMul for gate_up,
+    /// LinearCombination(beta=1) residual-add for o_proj/down,
+    /// LinearCombination(beta=0) for qkv).
+    CutlassGemmLayer { layer: u16, phase: GemmPhase },
+}
+
+/// Which of the four GEMM phases a [`BoundKernel::CutlassGemmLayer`]
+/// node represents. Carried as the `row` field of the WAVE_OPS entry
+/// (since cutlass-fused nodes don't have a row index — the cutlass
+/// body iterates over the layer's full M dim internally).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GemmPhase {
+    Qkv,
+    OProj,
+    GateUp,
+    Down,
+}
+
+impl GemmPhase {
+    /// Numeric tag in the WAVE_OPS `row` slot. Stable across codegen
+    /// versions. Matches `PFL_GEMM_PHASE_*` constants in megakernel.cu.
+    pub fn tag(self) -> u32 {
+        match self {
+            GemmPhase::Qkv => 0,
+            GemmPhase::OProj => 1,
+            GemmPhase::GateUp => 2,
+            GemmPhase::Down => 3,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            GemmPhase::Qkv => "qkv",
+            GemmPhase::OProj => "o_proj",
+            GemmPhase::GateUp => "gate_up",
+            GemmPhase::Down => "down",
+        }
+    }
+
+    /// Which reified-DAG `Phase` this gemm phase coalesces.
+    pub fn source_phase(self) -> Phase {
+        match self {
+            GemmPhase::Qkv => Phase::Qkv,
+            GemmPhase::OProj => Phase::OProj,
+            GemmPhase::GateUp => Phase::GateUp,
+            GemmPhase::Down => Phase::Down,
+        }
+    }
 }
 
 impl BoundKernel {
@@ -94,6 +157,12 @@ impl BoundKernel {
         match self {
             BoundKernel::HandWrittenRowTile { phase, .. } => phase.name(),
             BoundKernel::FlashInferAttentionLayer { .. } => "flashinfer_attention_layer",
+            BoundKernel::CutlassGemmLayer { phase, .. } => match phase {
+                GemmPhase::Qkv => "cutlass_gemm_qkv_layer",
+                GemmPhase::OProj => "cutlass_gemm_o_proj_layer",
+                GemmPhase::GateUp => "cutlass_gemm_gate_up_layer",
+                GemmPhase::Down => "cutlass_gemm_down_layer",
+            },
         }
     }
 
@@ -138,6 +207,13 @@ impl BoundKernel {
         match self {
             BoundKernel::HandWrittenRowTile { .. } => false,
             BoundKernel::FlashInferAttentionLayer { .. } => true,
+            // CUTLASS GEMM layer kernels are wave-cooperative for the
+            // same reason as FlashInfer attention: each persistent CTA
+            // in the wave picks one (M_tile, N_tile) work item via its
+            // `bid`, and the layer's full GEMM is distributed across
+            // them in a CTA-strided loop. Same `gemm_cutlass_mcta.cu`
+            // pattern as the existing fused prefill kernel.
+            BoundKernel::CutlassGemmLayer { .. } => true,
         }
     }
 
@@ -154,6 +230,19 @@ impl BoundKernel {
                 Phase::Down => 7,
             },
             BoundKernel::FlashInferAttentionLayer { .. } => 8,
+            // 9 reserved for future use (e.g. unused/idle marker).
+            // 10..13 are the four cutlass gemm phases. The dispatch
+            // arms in the megakernel template each handle one tag,
+            // so the dispatch switch knows which cutlass call to
+            // make without having to read the GemmPhase from the
+            // op stream's `row` slot. (We DO also stash the phase
+            // in the `row` slot for cross-checking.)
+            BoundKernel::CutlassGemmLayer { phase, .. } => match phase {
+                GemmPhase::Qkv => 10,
+                GemmPhase::OProj => 11,
+                GemmPhase::GateUp => 12,
+                GemmPhase::Down => 13,
+            },
         }
     }
 
@@ -166,16 +255,24 @@ impl BoundKernel {
             // mma-units per layer.
             //
             // The number is intentionally an over-estimate of FlashInfer's
-            // real cost — Phase C2b will pivot this to a real measured
-            // number once we have a bench. Treating each layer as a
-            // single big work unit is the right thing for the LPT bin
-            // packer either way: a flashinfer-attention wave consumes
-            // all the CTAs at once, not by per-CTA partitioning, so the
-            // wave's makespan is determined by this rolled-up cost
-            // regardless of the per-CTA breakdown.
+            // real cost — measured FlashInfer attention runs in ~3.5 ms
+            // per layer at seq=1024 (~0.2 ms per row tile), the cost
+            // model says ~10× more. Doesn't matter for the LPT bin
+            // packer because attention waves are wave-cooperative
+            // (every CTA participates); the wave's makespan is
+            // determined by this rolled-up cost regardless.
             BoundKernel::FlashInferAttentionLayer { .. } => {
                 let row_tiles = model.seq_len.div_ceil(model.row_tile);
                 row_tiles * model.cost(Phase::Attention)
+            }
+            // Per-layer rolled-up cost for the four CUTLASS GEMM
+            // phases — same shape as the FlashInfer attention rollup
+            // and same caveats about over-estimation. Wave-cooperative
+            // execution means all CTAs participate, so per-CTA cost
+            // distribution doesn't matter — only the wave-level total.
+            BoundKernel::CutlassGemmLayer { phase, .. } => {
+                let row_tiles = model.seq_len.div_ceil(model.row_tile);
+                row_tiles * model.cost(phase.source_phase())
             }
         }
     }
@@ -375,19 +472,26 @@ pub fn coalesce_with_flashinfer_attention(dag: &ReifiedDag) -> CoalescedDag {
         }
     }
 
-    // ── Step 5: renumber NodeIds to be dense [0, nodes.len()). ──
-    // The schedule + codegen passes index into `dag.nodes[NodeId.0 as
-    // usize]` and assume `NodeId == array index`. Fusion creates gaps
-    // (absorbed ids 1..N-1 disappear, leaving a hole) and the array
-    // shrinks, so without renumbering the surviving ids point past
-    // the end of the new array. Build an old_id → new_id remap from
-    // the post-fusion order, then rewrite every node's id and every
-    // dep through it.
+    renumber_dense_ids(&mut nodes);
+
+    CoalescedDag {
+        dims: dag.dims,
+        tiles: dag.tiles,
+        nodes,
+    }
+}
+
+/// In-place dense renumbering of `NodeId`s to `[0, nodes.len())`.
+/// Used at the end of every coalesce pass that drops or reorders
+/// nodes (the schedule + codegen index `dag.nodes[NodeId.0 as usize]`,
+/// so any gap in the id space blows them up).
+fn renumber_dense_ids(nodes: &mut [CoalescedNode]) {
+    use std::collections::HashMap;
     let mut id_remap: HashMap<NodeId, NodeId> = HashMap::with_capacity(nodes.len());
     for (new_idx, n) in nodes.iter().enumerate() {
         id_remap.insert(n.id, NodeId(new_idx as u32));
     }
-    for n in &mut nodes {
+    for n in nodes.iter_mut() {
         n.id = id_remap[&n.id];
         for d in &mut n.deps {
             *d = *id_remap
@@ -395,12 +499,163 @@ pub fn coalesce_with_flashinfer_attention(dag: &ReifiedDag) -> CoalescedDag {
                 .expect("dep references a node that doesn't exist in coalesced output");
         }
     }
+}
 
-    CoalescedDag {
-        dims: dag.dims,
-        tiles: dag.tiles,
-        nodes,
+/// Per-phase GEMM coalesce rule. Fuses every reified
+/// `(layer, phase, row, col)` node where `node.phase == gemm_phase.source_phase()`
+/// into one [`BoundKernel::CutlassGemmLayer { layer, phase: gemm_phase }`]
+/// node per layer. Other phases (and other GEMM phases not matching
+/// `gemm_phase`) pass through unchanged.
+///
+/// Mirrors `coalesce_with_flashinfer_attention`'s shape: pick a stable
+/// fused id (smallest absorbed), drop internal edges, rewrite incoming
+/// deps to the fused id, dense-renumber.
+///
+/// **Takes a `CoalescedDag` so multiple coalesce rules can be
+/// composed.** The combined entry point
+/// `coalesce_with_target_profile` runs whichever rules the profile
+/// asks for, in dependency-safe order.
+pub fn coalesce_gemm_phase(input: CoalescedDag, gemm_phase: GemmPhase) -> CoalescedDag {
+    use std::collections::{HashMap, HashSet};
+    let source_phase = gemm_phase.source_phase();
+
+    // Index target nodes by layer.
+    let mut target_ids_by_layer: HashMap<u16, Vec<NodeId>> = HashMap::new();
+    for n in &input.nodes {
+        if let BoundKernel::HandWrittenRowTile { phase, layer, .. } = n.kernel
+            && phase == source_phase
+        {
+            target_ids_by_layer.entry(layer).or_default().push(n.id);
+        }
     }
+    if target_ids_by_layer.is_empty() {
+        return input;
+    }
+
+    // Pick the fused id per layer (smallest absorbed id).
+    let mut fused_id_by_layer: HashMap<u16, NodeId> = HashMap::new();
+    for (layer, ids) in &target_ids_by_layer {
+        let min_id = ids.iter().copied().min().expect("layer has target nodes");
+        fused_id_by_layer.insert(*layer, min_id);
+    }
+
+    // absorbed_id → fused_id rewrite map.
+    let mut rewrite: HashMap<NodeId, NodeId> = HashMap::new();
+    for (layer, ids) in &target_ids_by_layer {
+        let fused = fused_id_by_layer[layer];
+        for id in ids {
+            rewrite.insert(*id, fused);
+        }
+    }
+    let absorbed: HashSet<NodeId> = rewrite.keys().copied().collect();
+
+    let mut new_nodes: Vec<CoalescedNode> = Vec::with_capacity(input.nodes.len());
+    for n in &input.nodes {
+        let is_target = matches!(
+            n.kernel,
+            BoundKernel::HandWrittenRowTile { phase, .. } if phase == source_phase
+        );
+        if is_target {
+            let layer = match n.kernel {
+                BoundKernel::HandWrittenRowTile { layer, .. } => layer,
+                _ => unreachable!(),
+            };
+            let fused_id = fused_id_by_layer[&layer];
+            if n.id != fused_id {
+                continue; // absorbed into the fused node
+            }
+            // Union the absorbed nodes' deps, prune internal edges,
+            // rewrite already-fused incoming deps.
+            let mut deps: Vec<NodeId> = Vec::new();
+            let mut seen: HashSet<NodeId> = HashSet::new();
+            for absorbed_id in &target_ids_by_layer[&layer] {
+                // Find the absorbed node by id
+                let absorbed_node = input
+                    .nodes
+                    .iter()
+                    .find(|nd| nd.id == *absorbed_id)
+                    .expect("absorbed id must exist in input");
+                for d in &absorbed_node.deps {
+                    if absorbed.contains(d) {
+                        continue; // internal edge — drop
+                    }
+                    if seen.insert(*d) {
+                        deps.push(*d);
+                    }
+                }
+            }
+            new_nodes.push(CoalescedNode {
+                id: fused_id,
+                kernel: BoundKernel::CutlassGemmLayer {
+                    layer,
+                    phase: gemm_phase,
+                },
+                deps,
+            });
+        } else {
+            // Non-target: rewrite any deps that point at the absorbed set.
+            let deps: Vec<NodeId> = n
+                .deps
+                .iter()
+                .map(|d| rewrite.get(d).copied().unwrap_or(*d))
+                .collect();
+            new_nodes.push(CoalescedNode {
+                id: n.id,
+                kernel: n.kernel.clone(),
+                deps,
+            });
+        }
+    }
+
+    renumber_dense_ids(&mut new_nodes);
+    CoalescedDag {
+        dims: input.dims,
+        tiles: input.tiles,
+        nodes: new_nodes,
+    }
+}
+
+/// Combined coalesce pass driven by [`TargetProfile`]. Runs whichever
+/// fusion rules the profile's kernel choices ask for, in
+/// dependency-safe order. This is the **entry point** the production
+/// codegen calls.
+///
+/// Adding a new fusion rule (e.g. for a future `FusedNormGemm`
+/// kernel) is one new call here, gated on the appropriate profile
+/// field.
+pub fn coalesce_with_target_profile(
+    dag: &ReifiedDag,
+    profile: &crate::target_profile::TargetProfile,
+) -> CoalescedDag {
+    use crate::target_profile::{AttentionKernelChoice, GemmKernelChoice};
+
+    // Always start from the trivial 1:1 lift.
+    let mut coalesced = coalesce(dag);
+
+    // Attention fusion (FlashInferPersistent path).
+    if matches!(
+        profile.attention_kernel,
+        AttentionKernelChoice::FlashInferPersistent
+    ) {
+        // Reuse the existing coalesce_with_flashinfer_attention logic
+        // by re-running it on the reified DAG and inheriting its
+        // output. The output already covers the non-attention nodes
+        // via HandWrittenRowTile.
+        coalesced = coalesce_with_flashinfer_attention(dag);
+    }
+
+    // CUTLASS GEMM fusion — one rule per phase.
+    if matches!(
+        profile.gemm_kernel,
+        GemmKernelChoice::CutlassSm80Multistage { .. }
+    ) {
+        coalesced = coalesce_gemm_phase(coalesced, GemmPhase::Qkv);
+        coalesced = coalesce_gemm_phase(coalesced, GemmPhase::OProj);
+        coalesced = coalesce_gemm_phase(coalesced, GemmPhase::GateUp);
+        coalesced = coalesce_gemm_phase(coalesced, GemmPhase::Down);
+    }
+
+    coalesced
 }
 
 #[cfg(test)]
@@ -449,6 +704,9 @@ mod tests {
                 }
                 BoundKernel::FlashInferAttentionLayer { .. } => {
                     panic!("trivial coalesce should never produce FlashInferAttentionLayer");
+                }
+                BoundKernel::CutlassGemmLayer { .. } => {
+                    panic!("trivial coalesce should never produce CutlassGemmLayer");
                 }
             }
         }
@@ -546,6 +804,149 @@ mod tests {
             }
         }
         assert_eq!(reified_non_attn, coalesced_non_attn);
+    }
+
+    #[test]
+    fn cutlass_gemm_coalesce_fuses_one_phase_per_layer() {
+        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let trivial = coalesce(&dag);
+        let fused = coalesce_gemm_phase(trivial, GemmPhase::GateUp);
+
+        let mut by_kind = std::collections::HashMap::<&'static str, usize>::new();
+        for cn in &fused.nodes {
+            *by_kind.entry(cn.kernel.kind()).or_insert(0) += 1;
+        }
+
+        // tiny: NL=2 layers, gate_up has 1 row tile × 4 col tiles per
+        // layer = 4 nodes, fused into 1 CutlassGemmGateUpLayer node
+        // per layer = 2 fused nodes total.
+        let nl = tiny_dims().num_layers as usize;
+        assert_eq!(
+            by_kind
+                .get("cutlass_gemm_gate_up_layer")
+                .copied()
+                .unwrap_or(0),
+            nl
+        );
+        // Other GEMM phases pass through untouched (still
+        // HandWrittenRowTile).
+        assert!(
+            by_kind.get("gate_up").copied().unwrap_or(0) == 0,
+            "no HandWrittenRowTile gate_up should remain after fusion: {by_kind:?}"
+        );
+        assert!(by_kind.get("qkv").copied().unwrap_or(0) > 0);
+        assert!(by_kind.get("down").copied().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn cutlass_gemm_coalesce_composes_with_attention_fusion() {
+        // Run flashinfer attention fusion + all four cutlass gemm
+        // fusions in sequence (the production order).
+        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let mut c = coalesce_with_flashinfer_attention(&dag);
+        c = coalesce_gemm_phase(c, GemmPhase::Qkv);
+        c = coalesce_gemm_phase(c, GemmPhase::OProj);
+        c = coalesce_gemm_phase(c, GemmPhase::GateUp);
+        c = coalesce_gemm_phase(c, GemmPhase::Down);
+
+        let mut by_kind = std::collections::HashMap::<&'static str, usize>::new();
+        for cn in &c.nodes {
+            *by_kind.entry(cn.kernel.kind()).or_insert(0) += 1;
+        }
+
+        let nl = tiny_dims().num_layers as usize;
+        assert_eq!(
+            by_kind
+                .get("flashinfer_attention_layer")
+                .copied()
+                .unwrap_or(0),
+            nl
+        );
+        for kind in [
+            "cutlass_gemm_qkv_layer",
+            "cutlass_gemm_o_proj_layer",
+            "cutlass_gemm_gate_up_layer",
+            "cutlass_gemm_down_layer",
+        ] {
+            assert_eq!(
+                by_kind.get(kind).copied().unwrap_or(0),
+                nl,
+                "expected {nl} {kind} nodes; got {by_kind:?}"
+            );
+        }
+
+        // Every node id should be dense [0, len) — schedule.rs
+        // depends on this.
+        let live_ids: std::collections::HashSet<NodeId> = c.nodes.iter().map(|n| n.id).collect();
+        for cn in &c.nodes {
+            for d in &cn.deps {
+                assert!(
+                    live_ids.contains(d),
+                    "coalesced node has dep {d:?} not in the coalesced output"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coalesce_with_target_profile_dispatches_correctly() {
+        use crate::target_profile::{
+            AttentionKernelChoice, GemmKernelChoice, NormKernelChoice, RopeKernelChoice,
+            TargetProfile,
+        };
+        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+
+        // Profile with cutlass enabled — should produce CutlassGemmLayer
+        // nodes for all four phases plus FlashInferAttentionLayer.
+        let profile_cutlass = TargetProfile {
+            num_sm: 58,
+            cooperative_blocks_per_sm: 1,
+            max_dynamic_shmem_bytes: 99 * 1024,
+            gemm_kernel: GemmKernelChoice::CutlassSm80Multistage {
+                tile_m: 256,
+                tile_n: 128,
+                tile_k: 32,
+                pipeline_stages: 4,
+            },
+            attention_kernel: AttentionKernelChoice::FlashInferPersistent,
+            norm_kernel: NormKernelChoice::HandWrittenWarpShuffle,
+            rope_kernel: RopeKernelChoice::HandWrittenSplitHalf,
+        };
+        let coalesced_cutlass = coalesce_with_target_profile(&dag, &profile_cutlass);
+        let mut kinds: std::collections::HashSet<&'static str> = Default::default();
+        for cn in &coalesced_cutlass.nodes {
+            kinds.insert(cn.kernel.kind());
+        }
+        assert!(kinds.contains("flashinfer_attention_layer"));
+        assert!(kinds.contains("cutlass_gemm_qkv_layer"));
+        assert!(kinds.contains("cutlass_gemm_o_proj_layer"));
+        assert!(kinds.contains("cutlass_gemm_gate_up_layer"));
+        assert!(kinds.contains("cutlass_gemm_down_layer"));
+        // No HandWrittenRowTile remnants for the four GEMM phases
+        // when cutlass is enabled.
+        assert!(!kinds.contains("qkv"));
+        assert!(!kinds.contains("o_proj"));
+        assert!(!kinds.contains("gate_up"));
+        assert!(!kinds.contains("down"));
+
+        // Profile with cutlass DISABLED — should NOT produce any
+        // CutlassGemmLayer nodes; the four GEMM phases stay as
+        // HandWrittenRowTile.
+        let profile_wmma = TargetProfile {
+            gemm_kernel: GemmKernelChoice::HandWrittenWmma,
+            ..profile_cutlass
+        };
+        let coalesced_wmma = coalesce_with_target_profile(&dag, &profile_wmma);
+        let mut kinds_wmma: std::collections::HashSet<&'static str> = Default::default();
+        for cn in &coalesced_wmma.nodes {
+            kinds_wmma.insert(cn.kernel.kind());
+        }
+        assert!(kinds_wmma.contains("flashinfer_attention_layer"));
+        assert!(kinds_wmma.contains("qkv"));
+        assert!(kinds_wmma.contains("o_proj"));
+        assert!(kinds_wmma.contains("gate_up"));
+        assert!(kinds_wmma.contains("down"));
+        assert!(!kinds_wmma.contains("cutlass_gemm_qkv_layer"));
     }
 
     #[test]

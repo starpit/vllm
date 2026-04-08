@@ -98,6 +98,14 @@ pub fn emit_scheduled_megakernel_cu(
                         layer, row, col, ..
                     } => (layer as u32, row as u32, col as u32),
                     BoundKernel::FlashInferAttentionLayer { layer } => (layer as u32, 0, 0),
+                    // CutlassGemmLayer carries phase in the variant; we
+                    // also stash it in the WAVE_OPS `row` slot for
+                    // cross-checking from device code, but the dispatch
+                    // arm normally selects on `kernel_tag` (10..13)
+                    // which already encodes the phase.
+                    BoundKernel::CutlassGemmLayer { layer, phase } => {
+                        (layer as u32, phase.tag(), 0)
+                    }
                 };
                 ops.push((tag, layer, row, col));
                 node_ids.push(nid.0);

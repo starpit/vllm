@@ -16,6 +16,7 @@ pub mod cuda_codegen;
 pub mod dag;
 pub mod diagram;
 pub mod fused_codegen;
+pub mod kernel_library;
 pub mod parse;
 pub mod reified_dag;
 pub mod schedule;

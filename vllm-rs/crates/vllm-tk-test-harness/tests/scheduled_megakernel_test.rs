@@ -13,9 +13,8 @@
 use cudarc::driver::result;
 use half::bf16;
 use vllm_tk_macros_core::{
-    SCHEDULED_PREFILL_KV_PAGE_SIZE, SCHEDULED_PREFILL_MEDIUM_CTAS, SCHEDULED_PREFILL_TINY_CTAS,
-    reified_dag::LlamaDims, reified_dag::ReifiedDag, reified_dag::TileSizes,
-    scheduled_prefill_medium_dims, scheduled_prefill_tiny_dims,
+    SCHEDULED_PREFILL_KV_PAGE_SIZE, reified_dag::LlamaDims, reified_dag::ReifiedDag,
+    reified_dag::TileSizes, scheduled_prefill_medium_dims, scheduled_prefill_tiny_dims,
 };
 use vllm_tk_test_harness::ffi;
 
@@ -221,7 +220,7 @@ fn scheduled_megakernel_executes_topologically() {
     let kernel_n = unsafe { ffi::scheduled_megakernel_tiny_num_nodes() } as usize;
     assert_eq!(n, kernel_n);
     let kernel_ctas = unsafe { ffi::scheduled_megakernel_tiny_num_ctas() };
-    assert_eq!(kernel_ctas, SCHEDULED_PREFILL_TINY_CTAS);
+    let _ = kernel_ctas; // CTA pool size is now picked by the DSL emitter heuristic
     let kernel_waves = unsafe { ffi::scheduled_megakernel_tiny_num_waves() };
     eprintln!("scheduled_megakernel(tiny): {n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
 
@@ -856,11 +855,10 @@ fn medium_full_forward_pass_matches_cpu_golden() {
     let cache_total = nl * pages_per_layer * page_size * nkh * hdm;
     let eps: f32 = 1e-5;
 
-    // Sanity: kernel reports the right node and CTA counts.
+    // Kernel reports its own node/CTA/wave counts (DSL-driven heuristic).
     let kernel_n = unsafe { ffi::scheduled_megakernel_medium_num_nodes() };
     let kernel_ctas = unsafe { ffi::scheduled_megakernel_medium_num_ctas() };
     let kernel_waves = unsafe { ffi::scheduled_megakernel_medium_num_waves() };
-    assert_eq!(kernel_ctas, SCHEDULED_PREFILL_MEDIUM_CTAS);
     eprintln!(
         "scheduled_megakernel(medium): {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs, {pages_per_layer} pages/layer × {nl} layers"
     );

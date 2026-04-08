@@ -689,6 +689,156 @@ pub fn generate_scheduled_prefill_medium() -> String {
     emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE, "medium")
 }
 
+// ── Phase 4 step 4: DSL-driven multi-variant codegen ─────────────────────
+//
+// The DSL is the single source of truth for the supported model variants.
+// `LLAMA_DSL` ships with the macros-core crate; `generate_scheduled_prefill
+// _variants` parses it, walks the variants block, and produces one .cu
+// source per variant.
+
+/// LLaMA architecture + supported model variants. Single source of truth
+/// for the scheduled megakernel codegen registry.
+pub const LLAMA_DSL: &str = include_str!("../models/llama.dsl");
+
+/// One emitted scheduled megakernel: variant name + CUDA source.
+pub struct ScheduledVariant {
+    pub name: String,
+    pub cu_source: String,
+}
+
+/// Pick a CTA pool size for a given variant. Conservative: scale with the
+/// variant's work load (rough heuristic = number of row tiles per layer).
+fn ctas_for_variant(dims: &reified_dag::LlamaDims) -> u32 {
+    use reified_dag::TileSizes;
+    let row_tiles = dims.seq_len.div_ceil(TileSizes::default_v1().row_tile);
+    // Cap at 58 (L4 SM count); ceiling at 4 to avoid spawning more CTAs than
+    // there's parallel work for the smallest variants.
+    row_tiles.clamp(4, 58)
+}
+
+/// Walk the `variants` block of the LLaMA DSL and emit one scheduled
+/// megakernel per variant. Returns `Vec<(name, cu_source)>` ordered by
+/// variant declaration order.
+///
+/// Resolution rule for each variant: start with the kernel header's default
+/// params, then apply the variant's overrides. Missing dim parameters are
+/// an error.
+pub fn generate_scheduled_prefill_variants(dsl: &str) -> Result<Vec<ScheduledVariant>, String> {
+    use crate::reified_dag::{LlamaDims, ReifiedDag, TileSizes};
+    use crate::schedule::{CostModel, partition_into_waves};
+    use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
+    use std::collections::HashMap;
+
+    let tokens: proc_macro2::TokenStream = dsl.parse().map_err(|e| format!("DSL tokenize: {e}"))?;
+    let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("DSL parse: {e}"))?;
+
+    if def.variants.is_empty() {
+        return Err("DSL has no `variants { ... }` block — nothing to emit".into());
+    }
+
+    // Default param table from the kernel header.
+    let defaults: HashMap<String, usize> = def
+        .params
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
+
+    let mut out = Vec::new();
+    for variant in &def.variants {
+        // Resolve params: defaults overlaid with the variant's overrides.
+        let mut params = defaults.clone();
+        for (k, v) in &variant.params {
+            params.insert(k.to_string(), *v);
+        }
+
+        // Pull seq_len out — it's a required parametric symbol for the
+        // scheduled megakernel since the wave schedule bakes against it.
+        let seq_len = *params.get("SEQ_LEN").ok_or_else(|| {
+            format!(
+                "variant `{}` missing SEQ_LEN (must be in defaults or variant params)",
+                variant.name
+            )
+        })? as u32;
+
+        let dims = LlamaDims::from_params(&params, seq_len)
+            .map_err(|e| format!("variant `{}`: {e}", variant.name))?;
+
+        let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+        let cost = CostModel::from_dag(&dag);
+        let num_ctas = ctas_for_variant(&dims);
+        let sched = partition_into_waves(&dag, num_ctas, &cost, 100);
+        let name = variant.name.to_string();
+        let cu_source =
+            emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE, &name);
+
+        out.push(ScheduledVariant { name, cu_source });
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+
+    #[test]
+    fn llama_dsl_parses_and_emits_all_variants() {
+        let variants =
+            generate_scheduled_prefill_variants(LLAMA_DSL).expect("LLAMA_DSL must parse and emit");
+        // We expect at least: tiny, medium, llama_3_2_1b_seq1024
+        assert!(
+            variants.len() >= 3,
+            "expected ≥3 variants, got {}",
+            variants.len()
+        );
+        let names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
+        assert!(names.contains(&"tiny"), "missing tiny in {names:?}");
+        assert!(names.contains(&"medium"), "missing medium in {names:?}");
+        assert!(
+            names.contains(&"llama_3_2_1b_seq1024"),
+            "missing llama_3_2_1b_seq1024 in {names:?}"
+        );
+
+        // Each emitted source should reference its own per-variant namespace
+        // and at least the CTA-stream constant name.
+        for v in &variants {
+            assert!(
+                v.cu_source
+                    .contains(&format!("namespace pfl_sched_{}", v.name)),
+                "variant {} missing per-variant namespace",
+                v.name
+            );
+            assert!(
+                v.cu_source.contains("WAVE_OPS"),
+                "variant {} missing WAVE_OPS",
+                v.name
+            );
+            assert!(
+                v.cu_source
+                    .contains(&format!("launch_scheduled_megakernel_{}", v.name)),
+                "variant {} missing launch helper",
+                v.name
+            );
+        }
+    }
+
+    #[test]
+    fn llama_3_2_1b_variant_has_real_dims_baked() {
+        let variants = generate_scheduled_prefill_variants(LLAMA_DSL).unwrap();
+        let v = variants
+            .iter()
+            .find(|v| v.name == "llama_3_2_1b_seq1024")
+            .expect("missing llama_3_2_1b_seq1024");
+        assert!(v.cu_source.contains("MODEL_NUM_LAYERS    = 16"));
+        assert!(v.cu_source.contains("MODEL_HIDDEN_DIM    = 2048"));
+        assert!(v.cu_source.contains("MODEL_INTERMEDIATE  = 8192"));
+        assert!(v.cu_source.contains("MODEL_NUM_ATTN_H    = 32"));
+        assert!(v.cu_source.contains("MODEL_NUM_KV_H      = 8"));
+        assert!(v.cu_source.contains("MODEL_HEAD_DIM      = 64"));
+        assert!(v.cu_source.contains("MODEL_SEQ_LEN       = 1024"));
+    }
+}
+
 /// Generate a debug variant of the decode kernel that syncs and writes a
 /// marker to a debug buffer after each op. Useful for identifying which op
 /// crashes in the full megakernel.

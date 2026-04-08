@@ -158,19 +158,28 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_layer_path.display()));
     cu_files.push(fused_layer_path.display().to_string());
 
-    // Phase 3b/3c — scheduled megakernel for the tiny test fixture.
-    let scheduled_tiny_source = vllm_tk_macros_core::generate_scheduled_prefill_tiny();
-    let scheduled_tiny_path = out_dir.join("scheduled_prefill_tiny.cu");
-    std::fs::write(&scheduled_tiny_path, &scheduled_tiny_source)
-        .unwrap_or_else(|e| panic!("failed to write {}: {e}", scheduled_tiny_path.display()));
-    cu_files.push(scheduled_tiny_path.display().to_string());
-
-    // Phase 3d — scheduled megakernel for the medium scaling test fixture.
-    let scheduled_medium_source = vllm_tk_macros_core::generate_scheduled_prefill_medium();
-    let scheduled_medium_path = out_dir.join("scheduled_prefill_medium.cu");
-    std::fs::write(&scheduled_medium_path, &scheduled_medium_source)
-        .unwrap_or_else(|e| panic!("failed to write {}: {e}", scheduled_medium_path.display()));
-    cu_files.push(scheduled_medium_path.display().to_string());
+    // Phase 4 step 4 — scheduled megakernel emission is now DSL-driven.
+    // The single source of truth is models/llama.dsl in the macros-core
+    // crate; this loop walks the variants block and emits one .cu per
+    // declared variant. Adding a new model variant means editing the DSL,
+    // not touching this build script.
+    let variants =
+        vllm_tk_macros_core::generate_scheduled_prefill_variants(vllm_tk_macros_core::LLAMA_DSL)
+            .unwrap_or_else(|e| panic!("failed to emit scheduled megakernel variants: {e}"));
+    println!(
+        "cargo:warning=scheduled megakernel: emitting {} variant(s)",
+        variants.len()
+    );
+    for v in variants {
+        let path = out_dir.join(format!("scheduled_prefill_{}.cu", v.name));
+        std::fs::write(&path, &v.cu_source)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        cu_files.push(path.display().to_string());
+        println!(
+            "cargo:warning=scheduled megakernel: emitted variant `{}`",
+            v.name
+        );
+    }
 
     // Build all test kernels into one static library
     // CUTLASS headers (optional — if present, the megakernel can include

@@ -385,4 +385,10 @@ pub mod ffi {
         scheduled_megakernel_medium_num_ctas,
         scheduled_megakernel_medium_num_waves
     );
+    decl_scheduled_megakernel!(
+        launch_scheduled_megakernel_llama_3_2_1b_seq1024,
+        scheduled_megakernel_llama_3_2_1b_seq1024_num_nodes,
+        scheduled_megakernel_llama_3_2_1b_seq1024_num_ctas,
+        scheduled_megakernel_llama_3_2_1b_seq1024_num_waves
+    );
 }

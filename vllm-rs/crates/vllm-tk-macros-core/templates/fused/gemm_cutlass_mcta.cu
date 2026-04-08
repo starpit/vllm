@@ -94,13 +94,18 @@
         // ── The main loop. CUTLASS multistage cp.async pipelined mainloop. ──
         mma(gemm_k_iterations, accum, iter_A, iter_B, accum);
 
-        // ── Epilogue: residual add (acc + hidden_states) → hidden_states ──
-        // LinearCombination(alpha=1, beta=1) gives D = acc + source.
-        // OutputTileIterator is used twice — once as source iterator (load
-        // existing hidden_states for the residual), once as destination D.
+        // ── Epilogue: variant selected at codegen time ──
+        // LinearCombination     (default): D = α*acc + β*source  (β literal)
+        // LinearCombinationSiluMul        : D = silu(α*acc) * source
+{%- if silu_mul %}
+        using Epilogue = pfl_cutlass::EpilogueSiluMul;
+        using OutputTileIterator = pfl_cutlass::OutputTileIterator;
+        using OutputOp = pfl_cutlass::OutputOpSiluMul;
+{%- else %}
         using Epilogue = pfl_cutlass::Epilogue;
         using OutputTileIterator = pfl_cutlass::OutputTileIterator;
         using OutputOp = pfl_cutlass::OutputOpT;
+{%- endif %}
 
         // Need a CUTLASS-side __syncthreads before the epilogue starts
         // touching shmem (the main loop and epilogue share __shm via the

@@ -79,6 +79,92 @@ namespace pfl_cutlass {
         MmaSharedStorage main_loop;
         EpilogueSharedStorage epilogue;
     };
+
+    // ── Custom output op: D = silu(alpha*acc) * source ──
+    // For the gate_up fused phase: gate's epilogue reads the already-computed
+    // up output from `source` (which lives in the same gmem buffer the gate
+    // GEMM writes to) and emits silu(gate_acc) * up_existing.
+    template <typename ElementOutput_, int Count_, typename ElementAccum_,
+              typename ElementCompute_ = ElementAccum_>
+    class LinearCombinationSiluMul {
+    public:
+        using ElementOutput      = ElementOutput_;
+        using ElementAccumulator = ElementAccum_;
+        using ElementCompute     = ElementCompute_;
+        static int const kCount  = Count_;
+
+        using FragmentOutput      = cutlass::Array<ElementOutput, kCount>;
+        using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
+        using FragmentSource      = cutlass::Array<ElementOutput, kCount>;
+        using ComputeFragment     = cutlass::Array<ElementCompute, kCount>;
+
+        struct Params {
+            ElementCompute alpha = ElementCompute(1);
+            ElementCompute beta  = ElementCompute(1);  // unused but kept for API parity
+            ElementCompute const *alpha_ptr = nullptr;
+            ElementCompute const *beta_ptr  = nullptr;
+            ElementCompute const *const *alpha_ptr_array = nullptr;
+            ElementCompute const *const *beta_ptr_array  = nullptr;
+            CUTLASS_HOST_DEVICE
+            Params() {}
+            CUTLASS_HOST_DEVICE
+            Params(ElementCompute a, ElementCompute b) : alpha(a), beta(b) {}
+        };
+
+    private:
+        ElementCompute alpha_;
+
+    public:
+        CUTLASS_HOST_DEVICE
+        explicit LinearCombinationSiluMul(Params const &params)
+            : alpha_(params.alpha) {}
+
+        CUTLASS_HOST_DEVICE
+        bool is_source_needed() const { return true; }
+        CUTLASS_HOST_DEVICE
+        void set_k_partition(int k_partition, int k_partition_count) {}
+
+        // residual fragment (acc only) — without source. Defines D = silu(α*acc).
+        // CUTLASS LinearCombination provides this overload; we mirror it.
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum) const {
+            FragmentOutput result;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                float s = a / (1.0f + ::expf(-a));
+                result[i] = ElementOutput(s);
+            }
+            return result;
+        }
+
+        // The fused op: D = silu(α*acc) * source
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum,
+                                  FragmentSource const &source) const {
+            FragmentOutput result;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                float silu_a = a / (1.0f + ::expf(-a));
+                float src = float(source[i]);
+                result[i] = ElementOutput(silu_a * src);
+            }
+            return result;
+        }
+    };
+
+    // Epilogue specialized to use the SiluMul output op.
+    using OutputOpSiluMul = LinearCombinationSiluMul<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+
+    using DefaultEpilogueSiluMulT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape,
+        typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1,
+        OutputOpSiluMul,
+        kEpilogueElementsPerAccess>;
+    using EpilogueSiluMul = typename DefaultEpilogueSiluMulT::Epilogue;
 }  // namespace pfl_cutlass
 
 constexpr int PFL_NUM_WARPS = {{ num_warps }};

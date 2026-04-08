@@ -85,6 +85,73 @@ namespace pfl_cutlass {
         EpilogueSharedStorage epilogue;
     };
 
+    // ── Custom output op: D = silu(alpha*acc) * source ──
+    template <typename ElementOutput_, int Count_, typename ElementAccum_,
+              typename ElementCompute_ = ElementAccum_>
+    class LinearCombinationSiluMul {
+    public:
+        using ElementOutput      = ElementOutput_;
+        using ElementAccumulator = ElementAccum_;
+        using ElementCompute     = ElementCompute_;
+        static int const kCount  = Count_;
+
+        using FragmentOutput      = cutlass::Array<ElementOutput, kCount>;
+        using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
+        using FragmentSource      = cutlass::Array<ElementOutput, kCount>;
+        using ComputeFragment     = cutlass::Array<ElementCompute, kCount>;
+
+        struct Params {
+            ElementCompute alpha = ElementCompute(1);
+            ElementCompute beta  = ElementCompute(1);
+            ElementCompute const *alpha_ptr = nullptr;
+            ElementCompute const *beta_ptr  = nullptr;
+            ElementCompute const *const *alpha_ptr_array = nullptr;
+            ElementCompute const *const *beta_ptr_array  = nullptr;
+            CUTLASS_HOST_DEVICE Params() {}
+            CUTLASS_HOST_DEVICE Params(ElementCompute a, ElementCompute b) : alpha(a), beta(b) {}
+        };
+
+    private:
+        ElementCompute alpha_;
+    public:
+        CUTLASS_HOST_DEVICE explicit LinearCombinationSiluMul(Params const &params) : alpha_(params.alpha) {}
+        CUTLASS_HOST_DEVICE bool is_source_needed() const { return true; }
+        CUTLASS_HOST_DEVICE void set_k_partition(int, int) {}
+
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum) const {
+            FragmentOutput result;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                result[i] = ElementOutput(a / (1.0f + ::expf(-a)));
+            }
+            return result;
+        }
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum,
+                                  FragmentSource const &source) const {
+            FragmentOutput result;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                float silu_a = a / (1.0f + ::expf(-a));
+                result[i] = ElementOutput(silu_a * float(source[i]));
+            }
+            return result;
+        }
+    };
+
+    using OutputOpSiluMul = LinearCombinationSiluMul<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueSiluMulT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape,
+        typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1,
+        OutputOpSiluMul,
+        kEpilogueElementsPerAccess>;
+    using EpilogueSiluMul = typename DefaultEpilogueSiluMulT::Epilogue;
+
     static_assert(sizeof(SharedStorage) <= 80 * 1024,
                   "CUTLASS SharedStorage exceeds 80KB budget");
     // Print the actual size at compile time via _Static_assert with the

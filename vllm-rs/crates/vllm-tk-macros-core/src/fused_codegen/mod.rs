@@ -965,6 +965,43 @@ fn build_fused_gateup_phases(
             EpilogueKind::ResidualAdd("g.hidden_states"),
         )
     };
+    let gate_up_phase = if cfg.cutlass_gate_up {
+        // Two CUTLASS calls: up first (β=0 plain store to silu_out), then
+        // gate with the SiluMul epilogue that reads silu_out (= up output)
+        // and writes silu_out = silu(gate_acc) * up_loaded.
+        let up_call = render_gemm_cutlass_mcta(
+            "fused gate+up :: UP (CUTLASS, plain store)",
+            "g.rms_gate_intermediates.raw_ptr",
+            "(g.up_weights.raw_ptr + (size_t)layer * (size_t)g.intermediate_dim * (size_t)g.hidden_dim)",
+            "g.silu_out.raw_ptr",
+            "q_size",
+            d.hd.0, // K = HD
+            d.id.0, // N = ID
+            "0.0f", // β=0
+        );
+        let gate_call = render_gemm_cutlass_silumul_mcta(
+            "fused gate+up :: GATE (CUTLASS, silu*source)",
+            "g.rms_gate_intermediates.raw_ptr",
+            "(g.gate_weights.raw_ptr + (size_t)layer * (size_t)g.intermediate_dim * (size_t)g.hidden_dim)",
+            "g.silu_out.raw_ptr",
+            "q_size",
+            d.hd.0,
+            d.id.0,
+        );
+        format!("{up_call}\n{gate_call}")
+    } else {
+        render_gemm_gate_up_mcta(
+            d,
+            cfg,
+            "fused gate+up",
+            "g.rms_gate_intermediates",
+            "g.gate_weights",
+            "g.up_weights",
+            "g.silu_out",
+            d.hd_k_iters,
+            d.id_col_tiles,
+        )
+    };
     vec![
         render_rmsnorm_mcta(
             d,
@@ -982,17 +1019,7 @@ fn build_fused_gateup_phases(
             "g.mlp_norm_weights",
             "g.rms_gate_intermediates",
         ),
-        render_gemm_gate_up_mcta(
-            d,
-            cfg,
-            "fused gate+up",
-            "g.rms_gate_intermediates",
-            "g.gate_weights",
-            "g.up_weights",
-            "g.silu_out",
-            d.hd_k_iters,
-            d.id_col_tiles,
-        ),
+        gate_up_phase,
         down_phase,
     ]
 }
@@ -1221,9 +1248,35 @@ fn render_gemm_cutlass_mcta(
         k_dim_value,
         n_dim_value,
         beta_literal,
+        silu_mul: false,
     }
     .render()
     .expect("gemm_cutlass_mcta template render")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_gemm_cutlass_silumul_mcta(
+    phase_comment: &str,
+    a_ptr_expr: &str,
+    b_ptr_expr: &str,
+    out_ptr_expr: &str,
+    m_dim_expr: &str,
+    k_dim_value: usize,
+    n_dim_value: usize,
+) -> String {
+    GemmCutlassMctaCtx {
+        phase_comment,
+        a_ptr_expr,
+        b_ptr_expr,
+        out_ptr_expr,
+        m_dim: m_dim_expr,
+        k_dim_value,
+        n_dim_value,
+        beta_literal: "1.0f", // unused in silu_mul branch but kept for ctx parity
+        silu_mul: true,
+    }
+    .render()
+    .expect("gemm_cutlass_mcta silumul template render")
 }
 
 /// Render a GEMM phase with a per-phase tile override applied. The kernel-wide

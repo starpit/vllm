@@ -48,6 +48,13 @@ pub struct FusedPrefillConfig {
     /// tiles (they stay hot across row_tile iterations) at the cost of some
     /// load imbalance when col_tiles doesn't evenly divide num_ctas.
     pub col_fixed_schedule: bool,
+    /// If true, the gate_up fused phase is replaced by TWO sequential CUTLASS
+    /// GEMM calls: first `up` writes its output to silu_out (β=0 plain store),
+    /// then `gate` runs with the LinearCombinationSiluMul epilogue
+    /// (D = silu(α*acc) * source) reading the up output back from silu_out.
+    /// This gives cuBLAS-quality compute on the dominant 41%-of-time phase
+    /// at the cost of doubling A traffic (no dual_accum reuse).
+    pub cutlass_gate_up: bool,
     /// If true, the QKV / o_proj phases are implemented via CUTLASS device-side
     /// `ThreadblockMma` (in addition to down_proj if `cutlass_down_proj` is set).
     /// These small-N phases are 2.8-3.5x slower than cuBLAS in our hand-rolled
@@ -113,6 +120,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -151,6 +159,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -173,6 +182,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -195,6 +205,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -248,6 +259,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -272,6 +284,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -303,6 +316,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -327,6 +341,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -350,6 +365,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -386,6 +402,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -409,6 +426,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -433,6 +451,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(64),
         }
     }
@@ -457,6 +476,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -480,6 +500,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -513,6 +534,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -537,6 +559,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(64),
         }
     }
@@ -561,6 +584,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -587,6 +611,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -612,6 +637,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -636,6 +662,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -664,6 +691,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -690,6 +718,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -718,6 +747,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -741,6 +771,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -764,6 +795,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -794,6 +826,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -817,6 +850,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -844,6 +878,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -873,6 +908,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -906,7 +942,20 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(64),
+        }
+    }
+
+    /// 256-row CTA, 8 warps × 32, CUTLASS for ALL FOUR GEMM phases.
+    /// QKV / o_proj / down_proj use the standard LinearCombination epilogue;
+    /// gate_up is replaced by two CUTLASS calls (up + gate-with-SiluMul).
+    pub fn rows256_gemm32_dual_1stage_cutlass4() -> Self {
+        Self {
+            cutlass_down_proj: true,
+            cutlass_qkv_o: true,
+            cutlass_gate_up: true,
+            ..Self::rows256_gemm32_dual_1stage()
         }
     }
 
@@ -968,6 +1017,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -994,6 +1044,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -1021,6 +1072,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -1045,6 +1097,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -1068,6 +1121,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(64),
         }
     }
@@ -1092,6 +1146,7 @@ impl FusedPrefillConfig {
             phase_opt: false,
             cutlass_down_proj: false,
             cutlass_qkv_o: false,
+            cutlass_gate_up: false,
             gemm_warp_m: Dim(16),
         }
     }

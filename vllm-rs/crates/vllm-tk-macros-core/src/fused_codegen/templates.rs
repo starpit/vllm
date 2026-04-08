@@ -190,6 +190,9 @@ pub struct GemmCutlassMctaCtx<'a> {
     /// LinearCombination beta value as a literal (e.g. "1.0f" for residual,
     /// "0.0f" for plain store).
     pub beta_literal: &'a str,
+    /// If true, emit the LinearCombinationSiluMul epilogue (D = silu(acc) * source).
+    /// Used for the gate phase of the gate_up fused pair.
+    pub silu_mul: bool,
 }
 
 #[derive(Template)]

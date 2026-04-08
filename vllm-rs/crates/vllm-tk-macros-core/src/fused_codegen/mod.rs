@@ -1156,15 +1156,10 @@ fn emit_decode_op(
         } => {
             let a_strategy = &storage[a];
 
-            // If the input is Register, this is the fused MLP down_proj path
-            // (gate*up in registers → down_proj GEMM + residual add).
-            // Emit the entire fused MLP block instead of a standalone GemmAdd.
+            // If the input is Register, this is the fused MLP down_proj path.
+            // Emit 3 MMA GEMM phases: gate+SiLU, up×gate, down+residual.
             if matches!(a_strategy, StorageStrategy::Register) {
-                // The fused MLP handles gate+SiLU+up+mul+down+residual as one block.
-                // Find the norm input — it's the hidden_states before the MLP norm.
-                let residual_offset = shmem_offset_of(storage, residual);
-                let input_offset = residual_offset; // mlp_norm reads from hidden slab
-                return render_decode_fused_mlp(d, cfg, input_offset, residual_offset);
+                return render_decode_mma_mlp(d, cfg);
             }
 
             let input_offset = shmem_offset_of(storage, a);
@@ -1317,6 +1312,10 @@ enum DecodeEpilogueKind<'a> {
     /// Used when the shmem residual region was overwritten by intervening ops
     /// (e.g., attention clobbers hidden_states at shmem[0]).
     ResidualGlobal { output_offset: ShmemOffset },
+    /// SiLU activation → global. Used for gate GEMM in MLP.
+    SiluGlobal(&'a str),
+    /// Multiply with existing gate values in global. Used for up GEMM in MLP.
+    MulGateGlobal(&'a str),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1371,6 +1370,22 @@ fn render_decode_gemm(
             .render()
             .expect("decode epilogue residual global writeback")
         }
+        DecodeEpilogueKind::SiluGlobal(output) => DecodeEpilogueSiluGlobalCtx {
+            output_global: output,
+            col_var: "col",
+            a_size: d.a_size.0,
+            b_size: d.b_size.0,
+        }
+        .render()
+        .expect("decode epilogue silu global"),
+        DecodeEpilogueKind::MulGateGlobal(gate) => DecodeEpilogueMulGateGlobalCtx {
+            gate_global: gate,
+            col_var: "col",
+            a_size: d.a_size.0,
+            b_size: d.b_size.0,
+        }
+        .render()
+        .expect("decode epilogue mulgate global"),
     };
 
     DecodeGemmCtx {
@@ -1432,6 +1447,65 @@ fn render_decode_attention(
     .expect("decode attention render")
 }
 
+/// Render 3 MMA GEMM phases for MLP: gate+SiLU, up×gate, down+residual.
+/// All concatenated into a single CUDA block (one "fused_MLP" phase).
+fn render_decode_mma_mlp(d: &FusedDecodeDerived, cfg: &FusedDecodeConfig) -> String {
+    let input_offset = ShmemOffset(0); // normed hidden_states in shmem
+
+    // Phase 1: Gate GEMM — normed × gate_proj → SiLU → g.silu_out
+    let gate_gemm = render_decode_gemm(
+        d,
+        cfg,
+        "MLP gate GEMM: normed × gate_proj → SiLU → g.silu_out",
+        input_offset,
+        "g.gate_weights",
+        d.hd_k_iters,
+        d.id_col_tiles,
+        DecodeEpilogueKind::SiluGlobal("g.silu_out"),
+    );
+
+    // Phase 2: Up GEMM — normed × up_proj → multiply with g.silu_out
+    let up_gemm = render_decode_gemm(
+        d,
+        cfg,
+        "MLP up GEMM: normed × up_proj × gate → g.silu_out",
+        input_offset,
+        "g.up_weights",
+        d.hd_k_iters,
+        d.id_col_tiles,
+        DecodeEpilogueKind::MulGateGlobal("g.silu_out"),
+    );
+
+    // Phase 3: Down GEMM — g.silu_out × down_proj + residual → g.hidden_states
+    let down_epilogue = DecodeEpilogueResidualGlobalWritebackCtx {
+        col_var: "col",
+        a_size: d.a_size.0,
+        b_size: d.b_size.0,
+    }
+    .render()
+    .expect("decode down epilogue render");
+
+    let down_gemm = DecodeGemmAGlobalCtx {
+        phase_comment: "MLP down GEMM: g.silu_out × down_proj + residual → g.hidden_states",
+        a_global: "g.silu_out",
+        a_stride: d.id,
+        weight_global: "g.down_weights",
+        num_k_iters: d.id_k_iters.0,
+        num_col_tiles: d.hd_col_tiles.0,
+        a_size: d.a_size.0,
+        b_size: d.b_size.0,
+        stage_size: d.stage_size.0,
+        b_offset: d.b_offset.0,
+        num_stages: cfg.num_stages,
+        epilogue: down_epilogue,
+    }
+    .render()
+    .expect("decode down gemm render");
+
+    format!("{gate_gemm}\n{up_gemm}\n{down_gemm}")
+}
+
+#[allow(dead_code)]
 fn render_decode_fused_mlp(
     d: &FusedDecodeDerived,
     cfg: &FusedDecodeConfig,

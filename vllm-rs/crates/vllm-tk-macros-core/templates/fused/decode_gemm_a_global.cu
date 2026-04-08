@@ -1,31 +1,23 @@
-{# Decode GEMM: A from shmem (activations), B from global (weights), output via epilogue.
-   Always cooperative: each warp owns its own 16-row A slice.
-   Double-buffered K-loop.
-
-   For decode, we process rows sequentially (small batch). Each warp handles
-   one 16-row MMA tile. With padded_cta_rows=16 and 8 warps, all warps
-   redundantly compute the same tile (warp 0 stores). With padded_cta_rows=16,
-   only wid=0 is active; others skip.
+{# Decode GEMM with A loaded from GLOBAL memory (not shmem).
+   Used for down_proj in MLP where the input (silu_out) is in global.
+   Same K-loop structure as decode_gemm.cu but A comes from a global accessor.
 
    Variables:
      phase_comment: description string
-     input_shmem_offset: byte offset into phase_shm for A activation slab
+     a_global: global accessor for A input (e.g., "g.silu_out")
+     a_stride: row stride in elements for A (e.g., intermediate_dim)
      weight_global: global accessor for B weights
      num_k_iters: K-loop iteration count
      num_col_tiles: number of output column tiles
      a_size, b_size, stage_size, b_offset: GEMM tile sizes
      num_stages: pipeline depth
      epilogue: rendered epilogue string
-     epilogue_target: "shmem" or "global" — where epilogue writes
-     output_shmem_offset: byte offset for output slab (when epilogue_target == "shmem")
 #}
     // ════ {{ phase_comment }} ════
     {
-    // A source: shmem activation slab at phase_shm + {{ input_shmem_offset }}
-    bf16 *gemm_a_src = reinterpret_cast<bf16*>(phase_shm + {{ input_shmem_offset }});
+    // A source: global memory ({{ a_global }})
 
-    // GEMM shmem region: reuse the phase_shm area (time-shared with RMSNorm/attention)
-    // We need space for B tiles only — A is loaded from shmem directly into registers.
+    // GEMM shmem region: B tiles only
     constexpr int DEC_GEMM_STAGES = {{ num_stages }};
     dec_b_st *b_stages[DEC_GEMM_STAGES];
     #pragma unroll
@@ -66,26 +58,16 @@
 {%- endif %}
             __syncthreads();
 
-            // Load A tile from shmem into registers (row 0, k_iter = iter)
-            // For decode: each row is [HD] BF16 in shmem. We need a [16, k_dim] slice.
-            // Only wid==0 has valid data for the single MMA row tile.
-            // A[row, k_iter*k_dim .. (k_iter+1)*k_dim]
+            // Load A tile from GLOBAL into registers via shmem scratch
             rt_bf<16, DEC_K_DIM> a_reg;
-            // Load A directly from activation shmem — this is the key decode optimization.
-            // For now, wid==0 loads the data; all warps compute redundantly.
             {
-                // A layout in shmem: [padded_rows, HD] BF16, row-major
-                // For the current row being processed (in the outer row loop):
-                // We need shmem[row * HD + iter * k_dim] as a [16, k_dim] tile.
-                // But we only have 1 actual row per "MMA tile" in decode.
-                // Broadcast: load the row into all 16 MMA rows of a_reg.
                 dec_a_st &a_smem = *reinterpret_cast<dec_a_st*>(__shm + DEC_META_SHMEM + DEC_HIDDEN_SHMEM + DEC_GEMM_STAGES * {{ b_size }});
-                // Copy row slice from activation shmem to A tile shmem
+                // Copy from global: A[row, iter*k_dim .. (iter+1)*k_dim]
                 if (wid == 0) {
                     for (int r = 0; r < my_rows && r < 16; r++) {
-                        bf16 *src = gemm_a_src + r * globals::hidden_dim + iter * DEC_K_DIM;
                         for (int j = lid; j < DEC_K_DIM; j += 32) {
-                            a_smem[{r, j}] = src[j];
+                            int global_col = iter * DEC_K_DIM + j;
+                            a_smem[{r, j}] = {{ a_global }}[{row_start + r, global_col}];
                         }
                     }
                 }
@@ -99,7 +81,6 @@
             #pragma unroll
             for (int n = 0; n < N_TILES; n++) {
                 rt_bf<16, DEC_K_DIM> b_n;
-                // Load B slice using same pattern as prefill
                 uint32_t saddr = static_cast<uint32_t>(__cvta_generic_to_shared(&b_slices[n].data[0]));
                 int lane = kittens::laneid();
                 int row = lane % 16;

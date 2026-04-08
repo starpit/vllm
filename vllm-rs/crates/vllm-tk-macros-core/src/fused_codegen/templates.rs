@@ -405,3 +405,38 @@ pub struct DecodeEpilogueResidualGlobalWritebackCtx<'a> {
     pub a_size: usize,
     pub b_size: usize,
 }
+
+#[derive(Template)]
+#[template(path = "fused/decode_epilogue_silu_global.cu", escape = "none")]
+pub struct DecodeEpilogueSiluGlobalCtx<'a> {
+    pub output_global: &'a str,
+    pub col_var: &'a str,
+    pub a_size: usize,
+    pub b_size: usize,
+}
+
+#[derive(Template)]
+#[template(path = "fused/decode_epilogue_mulgate_global.cu", escape = "none")]
+pub struct DecodeEpilogueMulGateGlobalCtx<'a> {
+    pub gate_global: &'a str,
+    pub col_var: &'a str,
+    pub a_size: usize,
+    pub b_size: usize,
+}
+
+#[derive(Template)]
+#[template(path = "fused/decode_gemm_a_global.cu", escape = "none")]
+pub struct DecodeGemmAGlobalCtx<'a> {
+    pub phase_comment: &'a str,
+    pub a_global: &'a str,
+    pub a_stride: usize,
+    pub weight_global: &'a str,
+    pub num_k_iters: usize,
+    pub num_col_tiles: usize,
+    pub a_size: usize,
+    pub b_size: usize,
+    pub stage_size: usize,
+    pub b_offset: usize,
+    pub num_stages: usize,
+    pub epilogue: String,
+}

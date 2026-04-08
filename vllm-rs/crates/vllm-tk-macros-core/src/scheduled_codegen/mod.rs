@@ -30,6 +30,7 @@ use askama::Template;
 
 use crate::kernel_library::{BoundKernel, CoalescedDag};
 use crate::schedule::WaveSchedule;
+use crate::target_profile::TargetProfile;
 
 mod templates;
 
@@ -50,6 +51,7 @@ pub fn emit_scheduled_megakernel_cu(
     dag: &CoalescedDag,
     sched: &WaveSchedule,
     kv_page_size: u32,
+    profile: &TargetProfile,
     name: &str,
 ) -> String {
     let num_nodes = dag.nodes.len() as u32;
@@ -135,6 +137,11 @@ pub fn emit_scheduled_megakernel_cu(
         model_down_col_tile: dag.tiles.down_col_tile,
         model_kv_page_size: kv_page_size,
         model_pages_per_layer: pages_per_layer,
+
+        target_num_sm: profile.num_sm,
+        target_cooperative_blocks_per_sm: profile.cooperative_blocks_per_sm,
+        target_num_clusters: profile.cooperative_grid_size(),
+        target_max_dynamic_shmem_bytes: profile.max_dynamic_shmem_bytes,
     };
     ctx.render().expect("scheduled megakernel template render")
 }
@@ -183,11 +190,13 @@ mod tests {
 
     #[test]
     fn emit_smoke() {
+        use crate::target_profile::TargetProfile;
         let reified = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
         let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
         let sched = partition_into_waves(&dag, 4, &cost, 100);
-        let cpp = emit_scheduled_megakernel_cu(&dag, &sched, 16, "tiny");
+        let profile = TargetProfile::l4_sm89();
+        let cpp = emit_scheduled_megakernel_cu(&dag, &sched, 16, &profile, "tiny");
 
         assert!(cpp.contains("namespace pfl_sched_tiny"));
         assert!(cpp.contains("WAVE_OPS"));

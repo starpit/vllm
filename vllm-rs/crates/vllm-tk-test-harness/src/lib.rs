@@ -366,6 +366,12 @@ pub mod ffi {
                     tick_counter: *mut u32,
                     barrier_arrived: *mut u32,
                     phase_clocks: *mut u64,
+                    // Device pointer to a `PersistentParams[NUM_LAYERS]`
+                    // array, populated host-side via the FlashInfer
+                    // shim helper. May be null in test paths that
+                    // don't exercise the FlashInferAttentionLayer
+                    // dispatch arm.
+                    flashinfer_params: *mut std::ffi::c_void,
                     stream: *mut std::ffi::c_void,
                 );
                 pub fn $num_nodes() -> u32;
@@ -423,5 +429,63 @@ pub mod ffi {
             sm_scale: f32,
             stream: u64,
         ) -> i32;
+    }
+
+    /// Opaque handle returned by `setup_flashinfer_params_for_megakernel`
+    /// — owns the float / int workspace buffers and the device-resident
+    /// `PersistentParams[NUM_LAYERS]` array. Mirrors the C struct
+    /// `FlashInferAttentionPlan` in
+    /// `csrc/flashinfer_attention_shim.cu`. Free with
+    /// `teardown_flashinfer_attention_plan`.
+    #[repr(C)]
+    pub struct FlashInferAttentionPlan {
+        pub float_ws_d: *mut std::ffi::c_void,
+        pub int_ws_d: *mut std::ffi::c_void,
+        pub int_ws_h: *mut std::ffi::c_void,
+        pub params_d: *mut std::ffi::c_void, // PersistentParams[num_layers]
+    }
+
+    impl Default for FlashInferAttentionPlan {
+        fn default() -> Self {
+            Self {
+                float_ws_d: std::ptr::null_mut(),
+                int_ws_d: std::ptr::null_mut(),
+                int_ws_h: std::ptr::null_mut(),
+                params_d: std::ptr::null_mut(),
+            }
+        }
+    }
+
+    unsafe extern "C" {
+        /// Build the per-launch FlashInfer plan and per-layer
+        /// `PersistentParams` array for the scheduled megakernel.
+        /// Call once per launch; pass `out_plan->params_d` as the
+        /// `flashinfer_params` arg to the megakernel launcher; free
+        /// with `teardown_flashinfer_attention_plan` after the launch
+        /// has synchronized.
+        pub fn setup_flashinfer_params_for_megakernel(
+            q_post_rope: *mut u16,
+            k_cache_layer0: *mut u16,
+            v_cache_layer0: *mut u16,
+            kv_indices: *mut i32,
+            attn_out: *mut u16,
+            seq_len: i32,
+            num_qo_heads: i32,
+            num_kv_heads: i32,
+            head_dim: i32,
+            page_size: i32,
+            pages_per_layer: i32,
+            num_layers: i32,
+            // = TargetProfile::cooperative_grid_size(); must equal
+            // the megakernel's NUM_CTAS so the planner's
+            // work_indptr[blockIdx.y] indexing covers all the
+            // planned work.
+            target_num_clusters: i32,
+            sm_scale: f32,
+            stream: u64,
+            out_plan: *mut FlashInferAttentionPlan,
+        ) -> i32;
+
+        pub fn teardown_flashinfer_attention_plan(plan: *mut FlashInferAttentionPlan);
     }
 }

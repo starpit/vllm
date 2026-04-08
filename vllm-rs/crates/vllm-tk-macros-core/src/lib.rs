@@ -21,6 +21,7 @@ pub mod parse;
 pub mod reified_dag;
 pub mod schedule;
 pub mod scheduled_codegen;
+pub mod target_profile;
 pub mod verify;
 
 /// Generate the complete CUDA source for a LLaMA-like megakernel from DSL source.
@@ -647,15 +648,24 @@ pub fn generate_scheduled_prefill_tiny() -> String {
     use crate::reified_dag::{ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
+    use crate::target_profile::TargetProfile;
 
+    let profile = TargetProfile::l4_sm89();
     let dims = scheduled_prefill_tiny_dims();
     let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
     let dag = coalesce(&reified);
     let cost = CostModel::from_dag(&dag);
-    // Use a small CTA pool for the tiny model — keeps the launch fast.
-    // Barrier cost ~100 mma units (≈1 µs at 1.5 GHz) is the L4 ballpark.
-    let sched = partition_into_waves(&dag, SCHEDULED_PREFILL_TINY_CTAS, &cost, 100);
-    emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE, "tiny")
+    // CTA pool size = profile.cooperative_grid_size() so the
+    // FlashInfer attention runner inside the megakernel sees a
+    // grid that matches its planner's `num_blks_y`.
+    let sched = partition_into_waves(&dag, profile.cooperative_grid_size(), &cost, 100);
+    emit_scheduled_megakernel_cu(
+        &dag,
+        &sched,
+        SCHEDULED_PREFILL_KV_PAGE_SIZE,
+        &profile,
+        "tiny",
+    )
 }
 
 /// Phase 3d — medium variant for scaling validation. NL=4, seq=64,
@@ -685,13 +695,21 @@ pub fn generate_scheduled_prefill_medium() -> String {
     use crate::reified_dag::{ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
+    use crate::target_profile::TargetProfile;
 
+    let profile = TargetProfile::l4_sm89();
     let dims = scheduled_prefill_medium_dims();
     let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
     let dag = coalesce(&reified);
     let cost = CostModel::from_dag(&dag);
-    let sched = partition_into_waves(&dag, SCHEDULED_PREFILL_MEDIUM_CTAS, &cost, 100);
-    emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE, "medium")
+    let sched = partition_into_waves(&dag, profile.cooperative_grid_size(), &cost, 100);
+    emit_scheduled_megakernel_cu(
+        &dag,
+        &sched,
+        SCHEDULED_PREFILL_KV_PAGE_SIZE,
+        &profile,
+        "medium",
+    )
 }
 
 // ── Phase 4 step 4: DSL-driven multi-variant codegen ─────────────────────
@@ -711,14 +729,26 @@ pub struct ScheduledVariant {
     pub cu_source: String,
 }
 
-/// Pick a CTA pool size for a given variant. Conservative: scale with the
-/// variant's work load (rough heuristic = number of row tiles per layer).
-fn ctas_for_variant(dims: &reified_dag::LlamaDims) -> u32 {
-    use reified_dag::TileSizes;
-    let row_tiles = dims.seq_len.div_ceil(TileSizes::default_v1().row_tile);
-    // Cap at 58 (L4 SM count); ceiling at 4 to avoid spawning more CTAs than
-    // there's parallel work for the smallest variants.
-    row_tiles.clamp(4, 58)
+/// Pick a CTA pool size for a given variant.
+///
+/// Always equals `profile.cooperative_grid_size()` — the FlashInfer
+/// attention runner inside the megakernel reads
+/// `work_indptr[blockIdx.y]`, so the launch grid's `y` dim **must**
+/// match the cluster count the FlashInfer planner generates work
+/// for. The planner is also given this same number via the shim
+/// (no `cudaDeviceGetAttribute` lying happens), so the two stay
+/// in sync.
+///
+/// Smaller variants (tiny, seq=64) end up with many idle CTAs in
+/// their non-attention waves — the LPT bin packer distributes only
+/// as many row tiles as exist — but the attention wave needs all
+/// `cooperative_grid_size()` CTAs, and correctness trumps
+/// load-balance efficiency on tiny fixtures.
+fn ctas_for_variant(
+    profile: &target_profile::TargetProfile,
+    _dims: &reified_dag::LlamaDims,
+) -> u32 {
+    profile.cooperative_grid_size()
 }
 
 /// Walk the `variants` block of the LLaMA DSL and emit one scheduled
@@ -733,7 +763,12 @@ pub fn generate_scheduled_prefill_variants(dsl: &str) -> Result<Vec<ScheduledVar
     use crate::reified_dag::{LlamaDims, ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
+    use crate::target_profile::TargetProfile;
     use std::collections::HashMap;
+
+    // Hardware target. L4 (sm_89) is the only target wired in
+    // today; an `sm_90` build flag would pick a different profile.
+    let profile = TargetProfile::l4_sm89();
 
     let tokens: proc_macro2::TokenStream = dsl.parse().map_err(|e| format!("DSL tokenize: {e}"))?;
     let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("DSL parse: {e}"))?;
@@ -772,11 +807,16 @@ pub fn generate_scheduled_prefill_variants(dsl: &str) -> Result<Vec<ScheduledVar
         let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
         let dag = coalesce(&reified);
         let cost = CostModel::from_dag(&dag);
-        let num_ctas = ctas_for_variant(&dims);
+        let num_ctas = ctas_for_variant(&profile, &dims);
         let sched = partition_into_waves(&dag, num_ctas, &cost, 100);
         let name = variant.name.to_string();
-        let cu_source =
-            emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE, &name);
+        let cu_source = emit_scheduled_megakernel_cu(
+            &dag,
+            &sched,
+            SCHEDULED_PREFILL_KV_PAGE_SIZE,
+            &profile,
+            &name,
+        );
 
         out.push(ScheduledVariant { name, cu_source });
     }

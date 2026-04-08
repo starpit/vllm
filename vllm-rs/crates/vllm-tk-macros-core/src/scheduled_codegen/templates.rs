@@ -55,4 +55,18 @@ pub struct MegakernelCtx<'a> {
     pub model_down_col_tile: u32,
     pub model_kv_page_size: u32,
     pub model_pages_per_layer: u32,
+
+    // ── Per-target hardware profile (see target_profile::TargetProfile) ──
+    /// SM count of the target device.
+    pub target_num_sm: u32,
+    /// CTAs per SM under cooperative-launch residency for THIS megakernel.
+    /// Multiplied with `target_num_sm` gives the cooperative grid size,
+    /// which is what FlashInfer's planner must produce work_indptr for.
+    pub target_cooperative_blocks_per_sm: u32,
+    /// = target_num_sm * target_cooperative_blocks_per_sm. Equals
+    /// `NUM_CTAS` in the rendered megakernel and the FlashInfer
+    /// planner's `num_blks_y`.
+    pub target_num_clusters: u32,
+    /// Per-block dynamic shmem ceiling, in bytes.
+    pub target_max_dynamic_shmem_bytes: u32,
 }

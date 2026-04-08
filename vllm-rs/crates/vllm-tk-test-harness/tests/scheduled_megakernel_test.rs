@@ -15,7 +15,7 @@ use half::bf16;
 use vllm_tk_macros_core::{
     SCHEDULED_PREFILL_KV_PAGE_SIZE, kernel_library::coalesce_with_flashinfer_attention,
     reified_dag::LlamaDims, reified_dag::ReifiedDag, reified_dag::TileSizes,
-    scheduled_prefill_medium_dims, scheduled_prefill_tiny_dims,
+    scheduled_prefill_medium_dims, scheduled_prefill_tiny_dims, target_profile::TargetProfile,
 };
 use vllm_tk_test_harness::ffi;
 
@@ -158,8 +158,50 @@ type LaunchFn = unsafe extern "C" fn(
     tick_counter: *mut u32,
     barrier_arrived: *mut u32,
     phase_clocks: *mut u64,
+    flashinfer_params: *mut std::ffi::c_void,
     stream: *mut std::ffi::c_void,
 );
+
+/// Build a per-launch FlashInfer plan + per-layer PersistentParams
+/// device array for `dims`, using the megakernel's own buffers as the
+/// q/k/v/kv_indices source pointers. Returns a `FlashInferAttentionPlan`
+/// handle the caller passes to the launcher and frees afterwards.
+fn build_flashinfer_plan(b: &TestBuffers, dims: LlamaDims) -> ffi::FlashInferAttentionPlan {
+    let mut plan = ffi::FlashInferAttentionPlan::default();
+    let page_size = SCHEDULED_PREFILL_KV_PAGE_SIZE as i32;
+    let pages_per_layer = ((dims.seq_len as i32) + page_size - 1) / page_size;
+    let sm_scale = 1.0f32 / (dims.head_dim as f32).sqrt();
+    // Use the same TargetProfile the codegen used so the
+    // FlashInfer planner produces a `num_blks_y` that matches the
+    // megakernel's `NUM_CTAS`. Single source of truth, no magic
+    // numbers.
+    let profile = TargetProfile::l4_sm89();
+    let status = unsafe {
+        ffi::setup_flashinfer_params_for_megakernel(
+            b.q_post_rope as *mut u16,
+            b.k_cache as *mut u16,
+            b.v_cache as *mut u16,
+            b.prefill_kv_indices as *mut i32,
+            b.attn_out as *mut u16,
+            dims.seq_len as i32,
+            dims.num_attn_heads as i32,
+            dims.num_kv_heads as i32,
+            dims.head_dim as i32,
+            page_size,
+            pages_per_layer,
+            dims.num_layers as i32,
+            profile.cooperative_grid_size() as i32,
+            sm_scale,
+            /*stream=*/ 0,
+            &mut plan,
+        )
+    };
+    assert_eq!(
+        status, 0,
+        "setup_flashinfer_params_for_megakernel failed: status={status}"
+    );
+    plan
+}
 
 fn launch_with_buffers(
     b: &TestBuffers,
@@ -174,6 +216,10 @@ fn launch_with_buffers(
     let flags = gpu_alloc_zeros_u32(n);
     let tick = gpu_alloc_zeros_u32(1);
     let barrier = gpu_alloc_zeros_u32(1);
+
+    // The production coalesce path now emits FlashInferAttentionLayer
+    // nodes, so every megakernel launch needs a per-launch plan.
+    let mut plan = build_flashinfer_plan(b, dims);
 
     unsafe {
         launch(
@@ -202,6 +248,7 @@ fn launch_with_buffers(
             tick,
             barrier,
             std::ptr::null_mut(), // phase_clocks (disabled)
+            plan.params_d,
             std::ptr::null_mut(),
         );
         result::stream::synchronize(std::ptr::null_mut()).expect("stream sync failed");
@@ -209,6 +256,9 @@ fn launch_with_buffers(
 
     let ticks = gpu_read_u32(flags, n);
     let final_tick = gpu_read_u32(tick, 1)[0];
+
+    unsafe { ffi::teardown_flashinfer_attention_plan(&mut plan) };
+
     (ticks, final_tick)
 }
 
@@ -1255,6 +1305,11 @@ fn llama_1b_seq1024_bench() {
     const NUM_CLOCK_SLOTS: usize = 10;
     let phase_clocks_bytes = (kernel_ctas as usize) * NUM_CLOCK_SLOTS * 8;
     let phase_clocks = gpu_alloc_zeros(phase_clocks_bytes) as *mut u64;
+    // Build the FlashInfer plan once and reuse for all 50+ launches.
+    // Per-launch plan rebuild would be ~1ms of cudaMalloc churn that
+    // belongs to setup, not bench-of-record.
+    let mut plan = build_flashinfer_plan(&b, dims);
+
     let launch = || unsafe {
         ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024(
             b.hidden_states as *mut _,
@@ -1282,6 +1337,7 @@ fn llama_1b_seq1024_bench() {
             tick,
             barrier,
             phase_clocks,
+            plan.params_d,
             std::ptr::null_mut(),
         );
     };
@@ -1371,6 +1427,8 @@ fn llama_1b_seq1024_bench() {
     eprintln!("║    total (sum of maxes)   {total_ms:8.2} ms                  ║");
     eprintln!("╚════════════════════════════════════════════════════════════╝");
     eprintln!();
+
+    unsafe { ffi::teardown_flashinfer_attention_plan(&mut plan) };
 }
 
 #[test]

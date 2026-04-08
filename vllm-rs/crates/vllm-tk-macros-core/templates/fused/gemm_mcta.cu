@@ -147,25 +147,50 @@
             pfl_b_st &b_smem = *b_stages[cur];
             group<PFL_NUM_WARPS>::sync(1);
 {%- if kstripe %}
-            // ── CUTLASS-style K-stripe inner loop ──
-            // Load only one K-stripe of A (rt_bf<PFL_GEMM_M, 16>) at a time
-            // instead of the full per-warp A. Drops live A register footprint
-            // from ~PFL_GEMM_M * (PFL_K_DIM/16) regs/lane to ~PFL_GEMM_M/16,
-            // which unlocks larger gemm_warp_m without hitting the sm89 cap.
+            // ── CUTLASS-style K-stripe inner loop with double-buffering ──
+            // Two register fragments per warp held simultaneously: one being
+            // computed against (cur), one being prefetched from shmem (nxt).
+            // The compiler can overlap `ldsm` for the prefetch with `mma` on
+            // the current fragment, exposing instruction-level parallelism
+            // that single-buffered loops miss. This is the trick CUTLASS uses
+            // in mma_multistage.h to hit ~70% of peak.
             constexpr int K_STRIPES = PFL_K_DIM / 16;
-            #pragma unroll
-            for (int kt = 0; kt < K_STRIPES; kt++) {
-                rt_bf<PFL_GEMM_M, 16> a_strip;
-                auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, kt});
-                warp::load(a_strip, a_view);
+            rt_bf<PFL_GEMM_M, 16> a_buf[2];
+            rt_bf<16, 16> b_buf[PFL_N_TILES][2];
+
+            // Prologue: prime stripe 0 (a + all n tiles of b).
+            {
+                auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, 0});
+                warp::load(a_buf[0], a_view);
                 #pragma unroll
                 for (int n = 0; n < PFL_N_TILES; n++) {
-                    rt_bf<16, 16> b_strip;
-                    auto b_view = b_smem.template subtile<16, 16>(int2{n, kt});
-                    warp::load(b_strip, b_view);
+                    auto b_view = b_smem.template subtile<16, 16>(int2{n, 0});
+                    warp::load(b_buf[n][0], b_view);
+                }
+            }
+
+            #pragma unroll
+            for (int kt = 0; kt < K_STRIPES; kt++) {
+                const int cur = kt & 1;
+                const int nxt = (kt + 1) & 1;
+                // Prefetch next K-stripe (A + all N B-tiles) while we still
+                // have the current stripe in regs. Compiler should issue these
+                // ldsm in parallel with the upcoming mma instructions.
+                if (kt + 1 < K_STRIPES) {
+                    auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, kt + 1});
+                    warp::load(a_buf[nxt], a_view);
+                    #pragma unroll
+                    for (int n = 0; n < PFL_N_TILES; n++) {
+                        auto b_view = b_smem.template subtile<16, 16>(int2{n, kt + 1});
+                        warp::load(b_buf[n][nxt], b_view);
+                    }
+                }
+                // Compute on current stripe.
+                #pragma unroll
+                for (int n = 0; n < PFL_N_TILES; n++) {
                     #pragma unroll
                     for (int m_sub = 0; m_sub < PFL_GEMM_M_SUBS; m_sub++) {
-                        warp::mma_ABt_base(acc.tiles[m_sub][n], a_strip.tiles[m_sub][0], b_strip.tiles[0][0], acc.tiles[m_sub][n]);
+                        warp::mma_ABt_base(acc.tiles[m_sub][n], a_buf[cur].tiles[m_sub][0], b_buf[n][cur].tiles[0][0], acc.tiles[m_sub][n]);
                     }
                 }
             }

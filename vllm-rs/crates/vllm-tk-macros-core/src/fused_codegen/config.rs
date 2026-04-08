@@ -798,6 +798,29 @@ impl FusedPrefillConfig {
         }
     }
 
+    /// 256-row CTA, 8 warps × 32, dual-accum, 2-stage.
+    /// Same as `_large` polyalgo winner (1-stage) but with shmem prefetch
+    /// pipeline. Shmem: 49152 × 2 = 98304 bytes (just under 99KB opt-in cap).
+    /// 1 CTA/SM (shmem-bound). Tests if cp.async pipelining helps when
+    /// we have the shmem budget for it.
+    pub fn rows256_gemm32_dual_2stage() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            kstripe_inner: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
     /// 256-row CTA, 8 warps × 32, single-accum, 1-stage.
     /// Drops dual_accum vs the current `_large` winner; gate_up reverts to
     /// back-to-back gate then up. The win: shmem drops from 49152 → 40960
@@ -839,6 +862,27 @@ impl FusedPrefillConfig {
             num_stages: Count(1),
             per_warp_b: false,
             dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            kstripe_inner: true,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 256-row CTA, 8 warps × 32, single-accum, 1-stage, K-stripe, out_block=128.
+    /// Wider N tile (closer to CUTLASS 128 threadblock N). Shmem: 8×4096 + 16384 = 49152.
+    /// Reg with kstripe: rt_fl<32,128>=128/lane + a_strip 8 + b_strip 8 ≈ 150/lane.
+    pub fn rows256_gemm32_kstripe_wide_1stage() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(128),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
             col_fixed_schedule: false,
             kstripe_inner: true,
             gemm_warp_m: Dim(32),

@@ -529,6 +529,23 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
                 Count(128),
             ));
         }
+        "v2-mcta-256row-gemm32-kstripe-wide-1stage" => {
+            let cfg =
+                fused_codegen::config::FusedPrefillConfig::rows256_gemm32_kstripe_wide_1stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-256row-gemm32-dual-2stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows256_gemm32_dual_2stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
         "v2-mcta-256row-gemm32-1stage" => {
             let cfg = fused_codegen::config::FusedPrefillConfig::rows256_gemm32_1stage();
             return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(

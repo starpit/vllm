@@ -376,28 +376,48 @@
             pfl_b_st &bu_smem = *bu_stages[cur];
             group<PFL_NUM_WARPS>::sync(1);
 {%- if kstripe %}
-            // Dual-accum + K-stripe: load A and B as 16-K stripes inside the
-            // n-loop instead of holding the full a_reg. Drops the live A
-            // register footprint, freeing registers for the live gate_acc +
-            // up_acc accumulators.
+            // Dual-accum + double-buffered K-stripe inner loop. Two register
+            // ring buffers per warp: one being computed against (cur), one
+            // being prefetched (nxt). Compiler can interleave ldsm with mma
+            // for instruction-level parallelism.
             constexpr int K_STRIPES_DA = PFL_K_DIM / 16;
-            #pragma unroll
-            for (int kt = 0; kt < K_STRIPES_DA; kt++) {
-                rt_bf<PFL_GEMM_M, 16> a_strip;
-                auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, kt});
-                warp::load(a_strip, a_view);
+            rt_bf<PFL_GEMM_M, 16> a_buf[2];
+            rt_bf<16, 16> bg_buf[PFL_N_TILES][2];
+            rt_bf<16, 16> bu_buf[PFL_N_TILES][2];
+
+            {
+                auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, 0});
+                warp::load(a_buf[0], a_view);
                 #pragma unroll
                 for (int n = 0; n < PFL_N_TILES; n++) {
-                    rt_bf<16, 16> bg_strip;
-                    rt_bf<16, 16> bu_strip;
-                    auto bg_view = bg_smem.template subtile<16, 16>(int2{n, kt});
-                    auto bu_view = bu_smem.template subtile<16, 16>(int2{n, kt});
-                    warp::load(bg_strip, bg_view);
-                    warp::load(bu_strip, bu_view);
+                    auto bg_view = bg_smem.template subtile<16, 16>(int2{n, 0});
+                    auto bu_view = bu_smem.template subtile<16, 16>(int2{n, 0});
+                    warp::load(bg_buf[n][0], bg_view);
+                    warp::load(bu_buf[n][0], bu_view);
+                }
+            }
+
+            #pragma unroll
+            for (int kt = 0; kt < K_STRIPES_DA; kt++) {
+                const int cur = kt & 1;
+                const int nxt = (kt + 1) & 1;
+                if (kt + 1 < K_STRIPES_DA) {
+                    auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, kt + 1});
+                    warp::load(a_buf[nxt], a_view);
+                    #pragma unroll
+                    for (int n = 0; n < PFL_N_TILES; n++) {
+                        auto bg_view = bg_smem.template subtile<16, 16>(int2{n, kt + 1});
+                        auto bu_view = bu_smem.template subtile<16, 16>(int2{n, kt + 1});
+                        warp::load(bg_buf[n][nxt], bg_view);
+                        warp::load(bu_buf[n][nxt], bu_view);
+                    }
+                }
+                #pragma unroll
+                for (int n = 0; n < PFL_N_TILES; n++) {
                     #pragma unroll
                     for (int m_sub = 0; m_sub < PFL_GEMM_M_SUBS; m_sub++) {
-                        warp::mma_ABt_base(gate_acc.tiles[m_sub][n], a_strip.tiles[m_sub][0], bg_strip.tiles[0][0], gate_acc.tiles[m_sub][n]);
-                        warp::mma_ABt_base(up_acc.tiles[m_sub][n],   a_strip.tiles[m_sub][0], bu_strip.tiles[0][0], up_acc.tiles[m_sub][n]);
+                        warp::mma_ABt_base(gate_acc.tiles[m_sub][n], a_buf[cur].tiles[m_sub][0], bg_buf[n][cur].tiles[0][0], gate_acc.tiles[m_sub][n]);
+                        warp::mma_ABt_base(up_acc.tiles[m_sub][n],   a_buf[cur].tiles[m_sub][0], bu_buf[n][cur].tiles[0][0], up_acc.tiles[m_sub][n]);
                     }
                 }
             }

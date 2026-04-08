@@ -5,17 +5,24 @@
 //! into its `__global__`. Layout:
 //!
 //! ```text
-//! static __device__ const uint32_t SCHED_ALL_DEPS[N_EDGES] = { ... };
-//! static __device__ const NodeRecord SCHED_NODES[N_NODES] = { ... };
-//! static __device__ const uint32_t SCHED_CTA_OFFSETS[NUM_CTAS+1] = { ... };
-//! static __device__ const uint32_t SCHED_CTA_NODES[N_NODES] = { ... };
+//! static __device__ const uint32_t  SCHED_ALL_DEPS[N_EDGES];
+//! static __device__ const NodeRecord SCHED_CTA_STREAM[N_NODES];
+//! static __device__ const uint32_t  SCHED_CTA_OFFSETS[NUM_CTAS + 1];
 //! ```
 //!
-//! - `SCHED_ALL_DEPS`: flat array of dep NodeIds, indexed by `(dep_off, dep_count)`.
-//! - `SCHED_NODES[i]`: the i-th node in canonical (NodeId) order. Holds phase tag,
-//!   coordinates (layer, row, col), and `(dep_off, dep_count)` into `SCHED_ALL_DEPS`.
-//! - `SCHED_CTA_OFFSETS[c..c+1]`: range into `SCHED_CTA_NODES` listing the NodeIds
-//!   that CTA `c` should execute, in schedule order (start time ascending).
+//! - `SCHED_CTA_STREAM[c..c+1]`: each CTA's full NodeRecord work stream
+//!   in start-time order. Reading it is a pure sequential access by CTA c —
+//!   stays in L1/L2.
+//! - Each `NodeRecord` carries `(phase, layer, row, col, my_node_id, dep_off,
+//!   dep_count)`. `my_node_id` is the global NodeId so the CTA knows which
+//!   completion flag to set.
+//! - `SCHED_ALL_DEPS[dep_off..dep_off+dep_count]`: contiguous list of dep
+//!   NodeIds for that node. Sequential per-node read.
+//! - `SCHED_CTA_OFFSETS[c..c+1]`: prefix sum into `SCHED_CTA_STREAM` for CTA c.
+//!
+//! The only intentionally-scattered access at runtime is the spin-wait on
+//! per-node completion flags (deps may live on any CTA, anywhere in the
+//! flag array). That's unavoidable and is a small constant per node.
 //!
 //! This module does **only** the Rust→C++ string emission. No CUDA side effects,
 //! no kernel changes — pure Phase 3a so we can validate before touching the
@@ -58,6 +65,9 @@ pub fn emit_schedule_cpp(dag: &ReifiedDag, sched: &Schedule) -> String {
     }
 
     // ── Step 2: per-CTA node lists, sorted by start time ascending. ──
+    // We inline the full NodeRecord into the per-CTA stream so each CTA's
+    // schedule lookup is one sequential read instead of a scattered index
+    // into a global SCHED_NODES array.
     let mut per_cta: Vec<Vec<(u64, u32)>> = vec![Vec::new(); num_ctas];
     for p in &sched.placements {
         per_cta[p.cta as usize].push((p.start, p.node.0));
@@ -67,15 +77,13 @@ pub fn emit_schedule_cpp(dag: &ReifiedDag, sched: &Schedule) -> String {
     }
 
     let mut cta_offsets: Vec<u32> = Vec::with_capacity(num_ctas + 1);
-    let mut cta_nodes: Vec<u32> = Vec::with_capacity(n);
     cta_offsets.push(0);
+    let mut packed_count = 0u32;
     for v in &per_cta {
-        for &(_, node) in v {
-            cta_nodes.push(node);
-        }
-        cta_offsets.push(cta_nodes.len() as u32);
+        packed_count += v.len() as u32;
+        cta_offsets.push(packed_count);
     }
-    debug_assert_eq!(cta_nodes.len(), n);
+    debug_assert_eq!(packed_count as usize, n);
 
     // ── Step 3: emit ──
     let mut out = String::new();
@@ -115,35 +123,54 @@ pub fn emit_schedule_cpp(dag: &ReifiedDag, sched: &Schedule) -> String {
     writeln!(out, "constexpr uint32_t PHASE_DOWN      = 7;").unwrap();
     writeln!(out).unwrap();
 
+    // 24-byte NodeRecord. Aligned/padded so an array stride is exactly 24.
+    // 4 (phase) + 4 (my_node_id) + 2*3 (layer/row/col) + 2 (dep_count) + 4
+    // (dep_off) + 4 pad = 24.
     writeln!(
         out,
-        "struct NodeRecord {{\n  uint32_t phase;\n  uint16_t layer;\n  uint16_t row;\n  uint16_t col;\n  uint16_t dep_count;\n  uint32_t dep_off;\n}};"
-    ).unwrap();
-    writeln!(out).unwrap();
-
-    // SCHED_NODES
-    writeln!(
-        out,
-        "static __device__ const NodeRecord SCHED_NODES[NUM_NODES] = {{"
+        "struct NodeRecord {{\n  \
+           uint32_t phase;\n  \
+           uint32_t my_node_id;\n  \
+           uint16_t layer;\n  \
+           uint16_t row;\n  \
+           uint16_t col;\n  \
+           uint16_t dep_count;\n  \
+           uint32_t dep_off;\n  \
+           uint32_t pad;\n\
+         }};\n\
+         static_assert(sizeof(NodeRecord) == 24, \"NodeRecord layout drifted\");"
     )
     .unwrap();
-    for nd in &dag.nodes {
-        writeln!(
-            out,
-            "  {{ {}, {}, {}, {}, {}, {} }},",
-            phase_tag(nd.phase),
-            nd.layer,
-            nd.row,
-            nd.col,
-            node_dep_cnt[nd.id.0 as usize],
-            node_dep_off[nd.id.0 as usize],
-        )
-        .unwrap();
+    writeln!(out).unwrap();
+
+    // SCHED_CTA_STREAM — emit per-CTA, NodeRecords inline.
+    writeln!(
+        out,
+        "static __device__ const NodeRecord SCHED_CTA_STREAM[NUM_NODES] = {{"
+    )
+    .unwrap();
+    for (cta_id, v) in per_cta.iter().enumerate() {
+        writeln!(out, "  // ── CTA {} ({} nodes) ──", cta_id, v.len()).unwrap();
+        for &(_, node) in v {
+            let nd = &dag.nodes[node as usize];
+            writeln!(
+                out,
+                "  {{ {}, {}, {}, {}, {}, {}, {}, 0 }},",
+                phase_tag(nd.phase),
+                node,
+                nd.layer,
+                nd.row,
+                nd.col,
+                node_dep_cnt[node as usize],
+                node_dep_off[node as usize],
+            )
+            .unwrap();
+        }
     }
     writeln!(out, "}};").unwrap();
     writeln!(out).unwrap();
 
-    // SCHED_ALL_DEPS — emit as raw u32 array. May be very large; chunk per line.
+    // SCHED_ALL_DEPS — flat u32 array.
     writeln!(
         out,
         "static __device__ const uint32_t SCHED_ALL_DEPS[NUM_EDGES] = {{"
@@ -153,23 +180,13 @@ pub fn emit_schedule_cpp(dag: &ReifiedDag, sched: &Schedule) -> String {
     writeln!(out, "}};").unwrap();
     writeln!(out).unwrap();
 
-    // CTA offset prefix table
+    // Per-CTA prefix sum into SCHED_CTA_STREAM.
     writeln!(
         out,
         "static __device__ const uint32_t SCHED_CTA_OFFSETS[NUM_CTAS + 1] = {{"
     )
     .unwrap();
     emit_u32_chunked(&mut out, &cta_offsets);
-    writeln!(out, "}};").unwrap();
-    writeln!(out).unwrap();
-
-    // Per-CTA node-id list, ordered by schedule
-    writeln!(
-        out,
-        "static __device__ const uint32_t SCHED_CTA_NODES[NUM_NODES] = {{"
-    )
-    .unwrap();
-    emit_u32_chunked(&mut out, &cta_nodes);
     writeln!(out, "}};").unwrap();
     writeln!(out).unwrap();
 
@@ -218,10 +235,10 @@ mod tests {
 
         assert!(cpp.contains("namespace pfl_sched"));
         assert!(cpp.contains("constexpr uint32_t NUM_NODES ="));
-        assert!(cpp.contains("SCHED_NODES"));
+        assert!(cpp.contains("SCHED_CTA_STREAM"));
         assert!(cpp.contains("SCHED_ALL_DEPS"));
         assert!(cpp.contains("SCHED_CTA_OFFSETS"));
-        assert!(cpp.contains("SCHED_CTA_NODES"));
+        assert!(cpp.contains("static_assert(sizeof(NodeRecord) == 24"));
         // Sanity: NUM_NODES line matches actual node count.
         let n = dag.nodes.len();
         assert!(cpp.contains(&format!("NUM_NODES = {n}")));

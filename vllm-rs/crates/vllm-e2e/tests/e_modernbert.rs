@@ -43,10 +43,7 @@ fn embedding_len(value: &serde_json::Value) -> usize {
 
 /// Check if the embedding JSON array is non-empty.
 fn embedding_is_nonempty(value: &serde_json::Value) -> bool {
-    value
-        .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false)
+    value.as_array().map(|a| !a.is_empty()).unwrap_or(false)
 }
 
 // ===========================================================================

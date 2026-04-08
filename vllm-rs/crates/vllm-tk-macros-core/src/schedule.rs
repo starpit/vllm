@@ -1,36 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Static greedy list-scheduler for the reified DAG.
+//! BSP wave-front partitioner for the reified DAG.
 //!
-//! Phase 2 of the static-scheduler pivot. Takes a `ReifiedDag` plus a CTA
-//! pool size and a per-node cost model, produces a `Schedule` that assigns
-//! every node to a (cta_id, start_cycle, end_cycle) slot respecting all
-//! data dependencies.
+//! Input:  `ReifiedDag` + num_ctas + `CostModel` + barrier cost.
+//! Output: `WaveSchedule` — a sequence of waves where each wave is a
+//!         per-CTA list of NodeIds. Inside a wave, no synchronization is
+//!         needed (no two nodes in the same wave depend on each other).
+//!         Between waves, one global grid barrier.
 //!
-//! Algorithm: standard list-scheduling with critical-path-from-sink priority.
-//! 1. Compute `cp_remaining[n]` = longest path of cumulative cost from n to
-//!    any sink. This is the priority — higher = scheduled earlier.
-//! 2. Maintain a ready set (nodes with all deps satisfied) ordered by
-//!    `cp_remaining` desc.
-//! 3. Maintain `cta_free[c]` = next free cycle for CTA c.
-//! 4. Each step: pop highest-priority ready node N, pick CTA with smallest
-//!    `cta_free`, schedule N at `max(cta_free[c], max_dep_finish)`.
-//! 5. Update successors' remaining-dep counts; promote any that hit 0.
+//! Algorithm:
+//!   1. Compute `earliest_wave[n]` = `1 + max(earliest_wave[d] for d in n.deps)`,
+//!      or 0 for sources. The minimum number of waves is exactly the longest
+//!      such depth (the critical path in node count).
+//!   2. Bucket nodes by their wave index.
+//!   3. Within each wave, distribute nodes across CTAs greedily by current
+//!      load (each node assigned to the CTA with the lowest accumulated cost
+//!      so far in this wave).
 //!
-//! The cost model is intentionally crude — Phase 2 cares about *structure*
-//! and *predicted shape*, not absolute calibration. Phase 3+ refines the
-//! model and validates against measured timings.
-
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+//! Cost model is BW-aware: each tile costs `max(compute, mem_bw)`. The
+//! predicted makespan is `sum_over_waves(max_per_cta_cost) + K * barrier_cost`.
+//! See the field comments on `WaveSchedule` for the breakdown.
+//!
+//! This is the "minimum K" partition (one wave per critical-path level).
+//! A future pass can coarsen by merging adjacent waves if doing so reduces
+//! `K * barrier_cost` more than it increases `sum_max_per_cta`.
 
 use crate::reified_dag::{NodeId, Phase, ReifiedDag};
 
-/// Per-node cost in abstract "tensor-core mma units." One unit is roughly
-/// the time of one m16n8k16 bf16 MMA (~16 sm89 cycles). Memory phases get
-/// translated into the same unit so the scheduler sees a single timeline.
+/// Per-node compute / memory cost in "mma units" (≈16 sm89 cycles each).
+/// Identical to the previous list-scheduler model — the cost domain doesn't
+/// change when we switch from list scheduling to wave partitioning.
 #[derive(Clone, Debug)]
 pub struct CostModel {
-    /// Tile shape used by the reifier (needed to size GEMM costs).
     pub row_tile: u32,
     pub qkv_col_tile: u32,
     pub o_col_tile: u32,
@@ -61,8 +61,6 @@ impl CostModel {
         }
     }
 
-    /// Compute cost in "mma units" for a single GEMM tile of shape (M, N, K).
-    /// One m16n8k16 bf16 mma covers 16*8*16 = 2048 fma → use that as the unit.
     fn gemm_compute(m: u32, n: u32, k: u32) -> u32 {
         let mma_m = m.div_ceil(16);
         let mma_n = n.div_ceil(8);
@@ -70,28 +68,16 @@ impl CostModel {
         mma_m * mma_n * mma_k
     }
 
-    /// Memory cost in mma units, given bytes loaded by a single CTA running
-    /// this tile. Assumes global memory bandwidth is fairly shared across
-    /// `num_sms`-many concurrent CTAs.
-    ///
     /// L4 numbers: 300 GB/s global BW, 58 SMs, ~1.5 GHz boost. Per-SM share
-    /// = 300/58 ≈ 5.17 GB/s = ~3.45 B/cycle. One mma unit ≈ 16 cycles, so
-    /// ~55 B/mma-unit. We bake the constant in for sm89/L4; future targets
-    /// can plug a different number.
+    /// ≈ 5.17 GB/s ≈ 3.45 B/cycle. One mma unit ≈ 16 cycles ⇒ ~55 B/mma-unit.
     const BYTES_PER_MMA_UNIT_L4: u32 = 55;
 
     fn mem_cost(bytes: u32) -> u32 {
         bytes / Self::BYTES_PER_MMA_UNIT_L4 + 1
     }
 
-    /// GEMM tile cost = max(compute, A_bytes + B_bytes + C_bytes loaded).
-    /// Assumes cp.async pipelining overlaps memory with compute, so the
-    /// steady-state bound is whichever is larger.
     fn gemm_total(m: u32, n: u32, k: u32) -> u32 {
         let compute = Self::gemm_compute(m, n, k);
-        // bf16 = 2 bytes per element. A=[M,K], B=[K,N], output=[M,N].
-        // Output write counted at 1x (no read for plain GEMM; residual add
-        // would add another M*N read but we ignore that ε contribution).
         let bytes = 2 * (m * k + k * n + m * n);
         let memory = Self::mem_cost(bytes);
         compute.max(memory)
@@ -100,21 +86,16 @@ impl CostModel {
     pub fn cost(&self, phase: Phase) -> u32 {
         let m = self.row_tile;
         match phase {
-            // RMSNorm: load M*HD activations + HD weights, write M*HD. Pure BW.
             Phase::AttnNorm | Phase::MlpNorm => {
                 let bytes = 2 * (m * self.hidden_dim * 2 + self.hidden_dim);
                 Self::mem_cost(bytes) + 8
             }
             Phase::Qkv => Self::gemm_total(m, self.qkv_col_tile, self.hidden_dim),
             Phase::Rope => {
-                // Load Q+K+V tile (~M*qkv_dim), write same. Memory bound.
                 let qkv = (self.num_attn_heads + 2 * self.num_kv_heads) * self.head_dim;
                 Self::mem_cost(2 * 2 * m * qkv) + 4
             }
             Phase::Attention => {
-                // Loads full K/V across seq_len (M*K_bytes + M*V_bytes per
-                // attn group) and computes scaled-dot-product. Use the larger
-                // of compute and BW.
                 let kv_bytes_per_row = 2 * 2 * self.seq_len * self.num_kv_heads * self.head_dim;
                 let mem = Self::mem_cost(kv_bytes_per_row + 2 * m * self.hidden_dim);
                 let compute = (2 * m * self.seq_len * self.head_dim * self.num_attn_heads
@@ -129,172 +110,142 @@ impl CostModel {
     }
 }
 
-/// Where one node ended up in the schedule.
-#[derive(Clone, Copy, Debug)]
-pub struct ScheduledNode {
-    pub node: NodeId,
-    pub cta: u32,
-    pub start: u64,
-    pub end: u64,
+/// One wave's worth of work: a per-CTA ordered list of NodeIds. Inside a
+/// wave, no synchronization is needed.
+#[derive(Clone, Debug)]
+pub struct Wave {
+    /// `cta_nodes[c]` is the ordered list of NodeIds CTA c executes in this wave.
+    pub cta_nodes: Vec<Vec<NodeId>>,
+    /// Predicted cost of this wave (max over CTAs of sum of node costs).
+    pub max_cta_cost: u64,
+    /// Sum of all node costs in this wave (work-conservation lower bound).
+    pub total_cost: u64,
 }
 
-#[derive(Debug)]
-pub struct Schedule {
+/// The full BSP schedule: K waves, plus a cost breakdown.
+#[derive(Clone, Debug)]
+pub struct WaveSchedule {
     pub num_ctas: u32,
-    /// Per-node placement, indexed by NodeId.
-    pub placements: Vec<ScheduledNode>,
-    /// Total wall-clock cycles (max end across all nodes).
-    pub makespan: u64,
-    /// Lower bound from the longest weighted path (no resource constraint).
+    pub waves: Vec<Wave>,
+    /// Predicted makespan in mma-unit cycles. Equals
+    /// `sum(wave.max_cta_cost) + num_waves * barrier_cost`.
+    pub predicted_cost: u64,
+    /// Critical-path lower bound (sum of costs along longest weighted path).
     pub critical_path_cost: u64,
+    /// Per-barrier cost used for the prediction.
+    pub barrier_cost: u64,
 }
 
-impl Schedule {
-    pub fn ms_at(&self, gpu_clock_hz: f64) -> f64 {
-        self.makespan as f64 / gpu_clock_hz * 1000.0
+impl WaveSchedule {
+    pub fn num_waves(&self) -> usize {
+        self.waves.len()
     }
-
+    pub fn ms_at(&self, gpu_clock_hz: f64) -> f64 {
+        self.predicted_cost as f64 / gpu_clock_hz * 1000.0
+    }
     pub fn cp_ms_at(&self, gpu_clock_hz: f64) -> f64 {
         self.critical_path_cost as f64 / gpu_clock_hz * 1000.0
     }
-
-    /// Per-CTA utilization: busy_cycles / makespan.
-    pub fn utilization(&self) -> Vec<f64> {
-        let mut busy = vec![0u64; self.num_ctas as usize];
-        for p in &self.placements {
-            busy[p.cta as usize] += p.end - p.start;
-        }
-        busy.into_iter()
-            .map(|b| b as f64 / self.makespan as f64)
-            .collect()
-    }
 }
 
-/// Heap entry for the ready queue. Higher priority comes out first.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ReadyEntry {
-    priority: u64,
-    node: u32,
-}
-
-impl Ord for ReadyEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| other.node.cmp(&self.node))
-    }
-}
-
-impl PartialOrd for ReadyEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Build the schedule.
-pub fn schedule(dag: &ReifiedDag, num_ctas: u32, cost: &CostModel) -> Schedule {
+/// Build a BSP wave schedule.
+///
+/// `barrier_cost` is in the same mma-unit domain as the cost model. On L4
+/// a gmem-flag grid barrier is ~1-2 µs ≈ 1500-3000 cycles ≈ 100-200 mma units.
+pub fn partition_into_waves(
+    dag: &ReifiedDag,
+    num_ctas: u32,
+    cost: &CostModel,
+    barrier_cost: u64,
+) -> WaveSchedule {
     let n = dag.nodes.len();
     let costs: Vec<u32> = dag.nodes.iter().map(|nd| cost.cost(nd.phase)).collect();
 
-    // ── Build forward successor list ──
+    // ── Step 1: earliest_wave[i] = 1 + max(earliest_wave[d] for d in deps), or 0 ──
+    // Topological order is implicit (deps point backward by Phase 1 invariant).
+    let mut wave_idx: Vec<u32> = vec![0; n];
+    let mut max_wave: u32 = 0;
+    for i in 0..n {
+        let mut w = 0u32;
+        for d in &dag.nodes[i].deps {
+            let dw = wave_idx[d.0 as usize] + 1;
+            if dw > w {
+                w = dw;
+            }
+        }
+        wave_idx[i] = w;
+        if w > max_wave {
+            max_wave = w;
+        }
+    }
+    let num_waves = (max_wave + 1) as usize;
+
+    // ── Step 2: bucket nodes by wave ──
+    let mut nodes_per_wave: Vec<Vec<u32>> = vec![Vec::new(); num_waves];
+    for i in 0..n {
+        nodes_per_wave[wave_idx[i] as usize].push(i as u32);
+    }
+
+    // ── Step 3: load-balance each wave across CTAs ──
+    // Sort each wave's nodes by descending cost so the heaviest get placed
+    // first (LPT — longest processing time first — gives a known 4/3-OPT bound
+    // for makespan minimization on identical machines).
+    let mut waves: Vec<Wave> = Vec::with_capacity(num_waves);
+    for wave_nodes in nodes_per_wave.iter_mut() {
+        wave_nodes.sort_by_key(|&i| std::cmp::Reverse(costs[i as usize]));
+
+        let mut cta_nodes: Vec<Vec<NodeId>> = vec![Vec::new(); num_ctas as usize];
+        let mut cta_load: Vec<u64> = vec![0; num_ctas as usize];
+
+        for &node in wave_nodes.iter() {
+            // Pick CTA with lowest current load.
+            let (best_cta, _) = cta_load
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, l)| **l)
+                .unwrap();
+            cta_nodes[best_cta].push(NodeId(node));
+            cta_load[best_cta] += costs[node as usize] as u64;
+        }
+
+        let max_cta_cost = *cta_load.iter().max().unwrap_or(&0);
+        let total_cost: u64 = cta_load.iter().sum();
+        waves.push(Wave {
+            cta_nodes,
+            max_cta_cost,
+            total_cost,
+        });
+    }
+
+    // ── Step 4: cost rollups ──
+    let work_cost: u64 = waves.iter().map(|w| w.max_cta_cost).sum();
+    let predicted_cost = work_cost + (num_waves as u64) * barrier_cost;
+
+    // Critical path: longest weighted dep chain. Single forward sweep since
+    // nodes are in topo order.
+    let mut cp_remaining: Vec<u64> = vec![0; n];
     let mut successors: Vec<Vec<u32>> = vec![Vec::new(); n];
     for nd in &dag.nodes {
         for d in &nd.deps {
             successors[d.0 as usize].push(nd.id.0);
         }
     }
-
-    // ── Critical path remaining cost (longest weighted path from node to sink) ──
-    // Process in reverse topological order. Since nodes are emitted in topo
-    // order, iterating high-index → low-index works.
-    let mut cp_remaining: Vec<u64> = vec![0; n];
     for i in (0..n).rev() {
-        let mut best: u64 = 0;
-        for &s in &successors[i] {
-            let v = cp_remaining[s as usize];
-            if v > best {
-                best = v;
-            }
-        }
+        let best = successors[i]
+            .iter()
+            .map(|&s| cp_remaining[s as usize])
+            .max()
+            .unwrap_or(0);
         cp_remaining[i] = best + costs[i] as u64;
     }
     let critical_path_cost = *cp_remaining.iter().max().unwrap_or(&0);
 
-    // ── List schedule ──
-    let mut remaining_deps: Vec<u32> = dag.nodes.iter().map(|nd| nd.deps.len() as u32).collect();
-    let mut node_finish: Vec<u64> = vec![0; n];
-    let mut placements: Vec<ScheduledNode> = vec![
-        ScheduledNode {
-            node: NodeId(0),
-            cta: 0,
-            start: 0,
-            end: 0,
-        };
-        n
-    ];
-    let mut cta_free: Vec<u64> = vec![0; num_ctas as usize];
-
-    let mut ready: BinaryHeap<ReadyEntry> = BinaryHeap::new();
-    for i in 0..n {
-        if remaining_deps[i] == 0 {
-            ready.push(ReadyEntry {
-                priority: cp_remaining[i],
-                node: i as u32,
-            });
-        }
-    }
-
-    while let Some(ReadyEntry { node, .. }) = ready.pop() {
-        let nd_idx = node as usize;
-        // Pick CTA with smallest free-time. Linear scan is fine for L4-class
-        // SM counts (~58) and Phase 2 doesn't need to be fast.
-        let mut best_cta = 0u32;
-        let mut best_free = cta_free[0];
-        for c in 1..num_ctas {
-            let f = cta_free[c as usize];
-            if f < best_free {
-                best_free = f;
-                best_cta = c;
-            }
-        }
-
-        // Earliest start = max(cta_free, max_dep_finish).
-        let mut start = best_free;
-        for d in &dag.nodes[nd_idx].deps {
-            let f = node_finish[d.0 as usize];
-            if f > start {
-                start = f;
-            }
-        }
-        let end = start + costs[nd_idx] as u64;
-
-        placements[nd_idx] = ScheduledNode {
-            node: NodeId(node),
-            cta: best_cta,
-            start,
-            end,
-        };
-        node_finish[nd_idx] = end;
-        cta_free[best_cta as usize] = end;
-
-        for &s in &successors[nd_idx] {
-            let s_idx = s as usize;
-            remaining_deps[s_idx] -= 1;
-            if remaining_deps[s_idx] == 0 {
-                ready.push(ReadyEntry {
-                    priority: cp_remaining[s_idx],
-                    node: s,
-                });
-            }
-        }
-    }
-
-    let makespan = *cta_free.iter().max().unwrap_or(&0);
-    Schedule {
+    WaveSchedule {
         num_ctas,
-        placements,
-        makespan,
+        waves,
+        predicted_cost,
         critical_path_cost,
+        barrier_cost,
     }
 }
 
@@ -316,69 +267,69 @@ mod tests {
     }
 
     #[test]
-    fn schedule_1b_seq1024_smoke() {
-        let dims = llama_1b_dims(1024);
-        let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+    fn waves_are_dependency_safe() {
+        // No two nodes in the same wave may depend on each other, and every
+        // node's deps must lie in strictly earlier waves.
+        let dag = ReifiedDag::reify_llama(llama_1b_dims(64), TileSizes::default_v1());
         let cost = CostModel::from_dag(&dag);
-        let sched = schedule(&dag, 58, &cost);
+        let sched = partition_into_waves(&dag, 8, &cost, 100);
 
-        // Every node placed exactly once.
-        assert_eq!(sched.placements.len(), dag.nodes.len());
-        for (i, p) in sched.placements.iter().enumerate() {
-            assert_eq!(p.node.0 as usize, i);
-            assert!(p.end >= p.start);
-            assert!(p.cta < sched.num_ctas);
+        // Build node → wave_idx lookup.
+        let mut node_wave = vec![u32::MAX; dag.nodes.len()];
+        for (w, wave) in sched.waves.iter().enumerate() {
+            for cta in &wave.cta_nodes {
+                for nid in cta {
+                    node_wave[nid.0 as usize] = w as u32;
+                }
+            }
         }
+        // Every node placed.
+        assert!(node_wave.iter().all(|&w| w != u32::MAX));
 
-        // Makespan is at least the critical path (cannot finish faster).
-        assert!(sched.makespan >= sched.critical_path_cost);
-        // Sanity: the work-conservation lower bound also holds.
-        let total_work: u64 = sched.placements.iter().map(|p| p.end - p.start).sum();
-        let work_lower_bound = total_work / sched.num_ctas as u64;
-        assert!(sched.makespan >= work_lower_bound);
-
-        // Print the prediction for human inspection.
-        let l4_clock_hz = 1.5e9;
-        eprintln!(
-            "schedule: nodes={}, makespan={} cycles, cp={} cycles, predicted={:.2}ms (cp={:.2}ms) @ 1.5GHz",
-            dag.nodes.len(),
-            sched.makespan,
-            sched.critical_path_cost,
-            sched.ms_at(l4_clock_hz),
-            sched.cp_ms_at(l4_clock_hz),
-        );
-        let util = sched.utilization();
-        let avg = util.iter().sum::<f64>() / util.len() as f64;
-        let min = util.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = util.iter().cloned().fold(0.0_f64, f64::max);
-        eprintln!(
-            "cta utilization: avg={:.1}% min={:.1}% max={:.1}%",
-            avg * 100.0,
-            min * 100.0,
-            max * 100.0
-        );
-    }
-
-    #[test]
-    fn schedule_respects_dependencies() {
-        let dims = llama_1b_dims(64);
-        let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
-        let cost = CostModel::from_dag(&dag);
-        let sched = schedule(&dag, 8, &cost);
-
+        // Strict-earlier dep invariant.
         for nd in &dag.nodes {
-            let p = &sched.placements[nd.id.0 as usize];
+            let my_w = node_wave[nd.id.0 as usize];
             for d in &nd.deps {
-                let dp = &sched.placements[d.0 as usize];
+                let dep_w = node_wave[d.0 as usize];
                 assert!(
-                    p.start >= dp.end,
-                    "node {} starts at {} before dep {} ends at {}",
+                    dep_w < my_w,
+                    "node {} in wave {} has dep {} in wave {}",
                     nd.id.0,
-                    p.start,
+                    my_w,
                     d.0,
-                    dp.end
+                    dep_w
                 );
             }
         }
+    }
+
+    #[test]
+    fn num_waves_equals_critical_path_in_nodes() {
+        // The minimum-K partition has exactly critical-path-depth waves.
+        let dag = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
+        let cost = CostModel::from_dag(&dag);
+        let sched = partition_into_waves(&dag, 58, &cost, 100);
+        let cp_nodes = dag.critical_path_depth();
+        assert_eq!(sched.num_waves(), cp_nodes as usize);
+    }
+
+    #[test]
+    fn schedule_1b_seq1024_smoke() {
+        let dag = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
+        let cost = CostModel::from_dag(&dag);
+        // 100 mma units ≈ 1.0 µs at 1.5 GHz — ballpark for an L4 gmem-flag barrier.
+        let sched = partition_into_waves(&dag, 58, &cost, 100);
+
+        let l4_clock_hz = 1.5e9;
+        eprintln!(
+            "BSP schedule: nodes={}, waves={}, predicted={:.2}ms (cp={:.2}ms, barrier={:.2}ms) @ 1.5GHz",
+            dag.nodes.len(),
+            sched.num_waves(),
+            sched.ms_at(l4_clock_hz),
+            sched.cp_ms_at(l4_clock_hz),
+            (sched.num_waves() as u64 * sched.barrier_cost) as f64 / l4_clock_hz * 1000.0,
+        );
+        // Sanity: predicted >= critical path.
+        assert!(sched.predicted_cost >= sched.critical_path_cost);
     }
 }

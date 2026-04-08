@@ -63,12 +63,7 @@ impl ModernBertConfig {
             .extra
             .get("norm_eps")
             .and_then(|v| v.as_f64())
-            .or_else(|| {
-                config
-                    .extra
-                    .get("layer_norm_eps")
-                    .and_then(|v| v.as_f64())
-            })
+            .or_else(|| config.extra.get("layer_norm_eps").and_then(|v| v.as_f64()))
             .unwrap_or(1e-5) as f32;
 
         let attention_bias = config
@@ -200,9 +195,7 @@ impl ModernBertAttention {
 
         // Per-layer RoPE theta: global vs local layers.
         let rope_theta = if !layer_id.is_multiple_of(config.global_attn_every_n_layers) {
-            config
-                .local_rope_theta
-                .unwrap_or(config.global_rope_theta)
+            config.local_rope_theta.unwrap_or(config.global_rope_theta)
         } else {
             config.global_rope_theta
         };
@@ -230,11 +223,7 @@ impl ModernBertAttention {
         load_linear_weights(&mut self.wo, weights, &format!("{prefix}.Wo"));
     }
 
-    fn forward(
-        &mut self,
-        hidden_states: &Array,
-        _positions: &Array,
-    ) -> Result<Array, Exception> {
+    fn forward(&mut self, hidden_states: &Array, _positions: &Array) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
         let num_heads = self.num_heads as i32;
         let head_dim = self.head_dim as i32;
@@ -265,8 +254,7 @@ impl ModernBertAttention {
         let k = self.rope.forward((&k, 0))?;
 
         // Bidirectional attention (no causal mask).
-        let attn_output =
-            mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None)?;
+        let attn_output = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None)?;
 
         // Reshape back: [1, num_heads, seq, head_dim] → [seq, hidden]
         let attn_output = attn_output
@@ -355,18 +343,12 @@ impl ModernBertLayer {
         if let Some(ref mut norm) = self.attn_norm {
             load_layernorm_weights(norm, weights, &format!("{prefix}.attn_norm"));
         }
-        self.attn
-            .load_weights(weights, &format!("{prefix}.attn"));
+        self.attn.load_weights(weights, &format!("{prefix}.attn"));
         load_layernorm_weights(&mut self.mlp_norm, weights, &format!("{prefix}.mlp_norm"));
-        self.mlp
-            .load_weights(weights, &format!("{prefix}.mlp"));
+        self.mlp.load_weights(weights, &format!("{prefix}.mlp"));
     }
 
-    fn forward(
-        &mut self,
-        hidden_states: &Array,
-        positions: &Array,
-    ) -> Result<Array, Exception> {
+    fn forward(&mut self, hidden_states: &Array, positions: &Array) -> Result<Array, Exception> {
         // Pre-norm attention.
         let normed = if let Some(ref mut norm) = self.attn_norm {
             norm.forward(hidden_states)?
@@ -574,9 +556,11 @@ mod tests {
         let input_ids = Array::from_slice(&[1i32], &[1]);
         let positions = Array::from_slice(&[0i32], &[1]);
         let mut kv_cache: MlxKvCache = vec![];
-        assert!(model
-            .forward(&input_ids, &positions, &mut kv_cache, None)
-            .is_err());
+        assert!(
+            model
+                .forward(&input_ids, &positions, &mut kv_cache, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -602,10 +586,8 @@ mod tests {
         hf.intermediate_size = Some(1152);
         hf.vocab_size = Some(50368);
         hf.max_position_embeddings = Some(8192);
-        hf.extra.insert(
-            "norm_eps".to_string(),
-            serde_json::Value::from(1e-5),
-        );
+        hf.extra
+            .insert("norm_eps".to_string(), serde_json::Value::from(1e-5));
         hf.extra.insert(
             "global_rope_theta".to_string(),
             serde_json::Value::from(160000.0),

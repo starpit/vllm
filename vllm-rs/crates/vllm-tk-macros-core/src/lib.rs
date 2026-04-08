@@ -639,14 +639,15 @@ pub const SCHEDULED_PREFILL_TINY_CTAS: u32 = 4;
 
 pub fn generate_scheduled_prefill_tiny() -> String {
     use crate::reified_dag::{ReifiedDag, TileSizes};
-    use crate::schedule::{CostModel, schedule};
+    use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
 
     let dims = scheduled_prefill_tiny_dims();
     let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
     let cost = CostModel::from_dag(&dag);
     // Use a small CTA pool for the tiny model — keeps the launch fast.
-    let sched = schedule(&dag, SCHEDULED_PREFILL_TINY_CTAS, &cost);
+    // Barrier cost ~100 mma units (≈1 µs at 1.5 GHz) is the L4 ballpark.
+    let sched = partition_into_waves(&dag, SCHEDULED_PREFILL_TINY_CTAS, &cost, 100);
     emit_scheduled_megakernel_cu(&dag, &sched)
 }
 

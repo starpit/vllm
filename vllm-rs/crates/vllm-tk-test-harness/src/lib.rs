@@ -338,9 +338,11 @@ pub mod ffi {
         pub fn launch_scheduled_megakernel(
             flags: *mut u32,
             tick_counter: *mut u32,
+            barrier_arrived: *mut u32,
             stream: *mut std::ffi::c_void,
         );
         pub fn scheduled_megakernel_num_nodes() -> u32;
         pub fn scheduled_megakernel_num_ctas() -> u32;
+        pub fn scheduled_megakernel_num_waves() -> u32;
     }
 }

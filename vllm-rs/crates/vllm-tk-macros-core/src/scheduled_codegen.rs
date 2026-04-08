@@ -1,39 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Phase 3a: serialize a `Schedule` into C++ const arrays.
+//! Phase 3a-bsp / Phase 3b-bsp: emit a BSP wave-front megakernel.
 //!
-//! Emits a header-only chunk of CUDA that the scheduled megakernel pulls
-//! into its `__global__`. Layout:
-//!
+//! Layout:
 //! ```text
-//! static __device__ const uint32_t  SCHED_ALL_DEPS[N_EDGES];
-//! static __device__ const NodeRecord SCHED_CTA_STREAM[N_NODES];
-//! static __device__ const uint32_t  SCHED_CTA_OFFSETS[NUM_CTAS + 1];
+//! constexpr uint32_t NUM_WAVES;
+//! constexpr uint32_t NUM_CTAS;
+//! constexpr uint32_t NUM_NODES;   // for sizing the validation tick array
+//!
+//! struct TileOp { phase, layer, row, col };          // 12 B (with padding 16)
+//! __device__ const TileOp WAVE_OPS[N_OPS_TOTAL];     // packed: per wave, per CTA, in order
+//! __device__ const uint32_t WAVE_CTA_OFFSETS[
+//!     NUM_WAVES * (NUM_CTAS + 1)];                   // prefix-sum table
+//! __device__ const uint32_t NODE_ID_FOR_OP[N_OPS_TOTAL]; // parallel to WAVE_OPS, for tick stamping
 //! ```
 //!
-//! - `SCHED_CTA_STREAM[c..c+1]`: each CTA's full NodeRecord work stream
-//!   in start-time order. Reading it is a pure sequential access by CTA c —
-//!   stays in L1/L2.
-//! - Each `NodeRecord` carries `(phase, layer, row, col, my_node_id, dep_off,
-//!   dep_count)`. `my_node_id` is the global NodeId so the CTA knows which
-//!   completion flag to set.
-//! - `SCHED_ALL_DEPS[dep_off..dep_off+dep_count]`: contiguous list of dep
-//!   NodeIds for that node. Sequential per-node read.
-//! - `SCHED_CTA_OFFSETS[c..c+1]`: prefix sum into `SCHED_CTA_STREAM` for CTA c.
-//!
-//! The only intentionally-scattered access at runtime is the spin-wait on
-//! per-node completion flags (deps may live on any CTA, anywhere in the
-//! flag array). That's unavoidable and is a small constant per node.
-//!
-//! This module does **only** the Rust→C++ string emission. No CUDA side effects,
-//! no kernel changes — pure Phase 3a so we can validate before touching the
-//! megakernel itself.
+//! Per CTA per wave: stream of TileOp records contiguous in WAVE_OPS, indexed
+//! via WAVE_CTA_OFFSETS[wave * (NUM_CTAS+1) + cta..+ cta+1]. Sequential read
+//! → L1/L2 hot. After each wave, all CTAs participate in one grid barrier
+//! (atomic-counter style) before moving to the next.
 
 use std::fmt::Write as _;
 
 use crate::reified_dag::{Phase, ReifiedDag};
-use crate::schedule::Schedule;
+use crate::schedule::WaveSchedule;
 
-/// Numeric phase tag matching the C++ enum the scheduled kernel will use.
+/// Numeric phase tag matching the C++ enum.
 pub fn phase_tag(p: Phase) -> u32 {
     match p {
         Phase::AttnNorm => 0,
@@ -47,45 +38,51 @@ pub fn phase_tag(p: Phase) -> u32 {
     }
 }
 
-/// Render the dispatch table as a CUDA include chunk.
-pub fn emit_schedule_cpp(dag: &ReifiedDag, sched: &Schedule) -> String {
+/// Render the wave program as a CUDA include chunk.
+pub fn emit_wave_schedule_cpp(dag: &ReifiedDag, sched: &WaveSchedule) -> String {
     let n = dag.nodes.len();
     let num_ctas = sched.num_ctas as usize;
+    let num_waves = sched.waves.len();
 
-    // ── Step 1: build SCHED_ALL_DEPS by concatenating each node's deps. ──
-    let mut all_deps: Vec<u32> = Vec::new();
-    let mut node_dep_off: Vec<u32> = Vec::with_capacity(n);
-    let mut node_dep_cnt: Vec<u32> = Vec::with_capacity(n);
-    for nd in &dag.nodes {
-        node_dep_off.push(all_deps.len() as u32);
-        node_dep_cnt.push(nd.deps.len() as u32);
-        for d in &nd.deps {
-            all_deps.push(d.0);
+    // ── Pack the per-wave per-CTA op streams into one flat array. ──
+    // Layout order: wave 0 / cta 0, cta 1, ..., cta N-1; wave 1 / cta 0, ...
+    let mut ops: Vec<(
+        u32, /*phase*/
+        u32, /*layer*/
+        u32, /*row*/
+        u32, /*col*/
+    )> = Vec::with_capacity(n);
+    let mut node_ids: Vec<u32> = Vec::with_capacity(n);
+    let offsets_len = num_waves * (num_ctas + 1);
+    let mut wave_cta_offsets: Vec<u32> = Vec::with_capacity(offsets_len);
+
+    let mut cursor: u32 = 0;
+    for wave in &sched.waves {
+        for cta in 0..num_ctas {
+            wave_cta_offsets.push(cursor);
+            for nid in &wave.cta_nodes[cta] {
+                let nd = &dag.nodes[nid.0 as usize];
+                ops.push((
+                    phase_tag(nd.phase),
+                    nd.layer as u32,
+                    nd.row as u32,
+                    nd.col as u32,
+                ));
+                node_ids.push(nid.0);
+                cursor += 1;
+            }
         }
+        // Sentinel "end of last cta in this wave" for clean range queries.
+        wave_cta_offsets.push(cursor);
     }
+    debug_assert_eq!(cursor as usize, n);
+    debug_assert_eq!(
+        wave_cta_offsets.len(),
+        num_waves * (num_ctas + 1),
+        "offset table size"
+    );
 
-    // ── Step 2: per-CTA node lists, sorted by start time ascending. ──
-    // We inline the full NodeRecord into the per-CTA stream so each CTA's
-    // schedule lookup is one sequential read instead of a scattered index
-    // into a global SCHED_NODES array.
-    let mut per_cta: Vec<Vec<(u64, u32)>> = vec![Vec::new(); num_ctas];
-    for p in &sched.placements {
-        per_cta[p.cta as usize].push((p.start, p.node.0));
-    }
-    for v in &mut per_cta {
-        v.sort_by_key(|&(t, _)| t);
-    }
-
-    let mut cta_offsets: Vec<u32> = Vec::with_capacity(num_ctas + 1);
-    cta_offsets.push(0);
-    let mut packed_count = 0u32;
-    for v in &per_cta {
-        packed_count += v.len() as u32;
-        cta_offsets.push(packed_count);
-    }
-    debug_assert_eq!(packed_count as usize, n);
-
-    // ── Step 3: emit ──
+    // ── Emit ──
     let mut out = String::new();
     writeln!(
         out,
@@ -94,21 +91,18 @@ pub fn emit_schedule_cpp(dag: &ReifiedDag, sched: &Schedule) -> String {
     .unwrap();
     writeln!(
         out,
-        "// {} nodes, {} edges, {} CTAs",
-        n,
-        all_deps.len(),
-        num_ctas
+        "// {} nodes, {} waves, {} CTAs",
+        n, num_waves, num_ctas
     )
     .unwrap();
     writeln!(out).unwrap();
-
     writeln!(out, "#pragma once").unwrap();
     writeln!(out, "#include <cstdint>").unwrap();
     writeln!(out).unwrap();
 
     writeln!(out, "namespace pfl_sched {{").unwrap();
     writeln!(out, "constexpr uint32_t NUM_NODES = {};", n).unwrap();
-    writeln!(out, "constexpr uint32_t NUM_EDGES = {};", all_deps.len()).unwrap();
+    writeln!(out, "constexpr uint32_t NUM_WAVES = {};", num_waves).unwrap();
     writeln!(out, "constexpr uint32_t NUM_CTAS  = {};", num_ctas).unwrap();
     writeln!(out).unwrap();
 
@@ -123,70 +117,51 @@ pub fn emit_schedule_cpp(dag: &ReifiedDag, sched: &Schedule) -> String {
     writeln!(out, "constexpr uint32_t PHASE_DOWN      = 7;").unwrap();
     writeln!(out).unwrap();
 
-    // 24-byte NodeRecord. Aligned/padded so an array stride is exactly 24.
-    // 4 (phase) + 4 (my_node_id) + 2*3 (layer/row/col) + 2 (dep_count) + 4
-    // (dep_off) + 4 pad = 24.
+    // 16-byte TileOp (4 u32s — phase + layer + row + col). u32 layer/row/col
+    // is plenty for any model we'll target and keeps the struct nicely aligned.
     writeln!(
         out,
-        "struct NodeRecord {{\n  \
+        "struct TileOp {{\n  \
            uint32_t phase;\n  \
-           uint32_t my_node_id;\n  \
-           uint16_t layer;\n  \
-           uint16_t row;\n  \
-           uint16_t col;\n  \
-           uint16_t dep_count;\n  \
-           uint32_t dep_off;\n  \
-           uint32_t pad;\n\
+           uint32_t layer;\n  \
+           uint32_t row;\n  \
+           uint32_t col;\n\
          }};\n\
-         static_assert(sizeof(NodeRecord) == 24, \"NodeRecord layout drifted\");"
+         static_assert(sizeof(TileOp) == 16, \"TileOp layout drifted\");"
     )
     .unwrap();
     writeln!(out).unwrap();
 
-    // SCHED_CTA_STREAM — emit per-CTA, NodeRecords inline.
+    // WAVE_OPS — flat array of TileOps.
     writeln!(
         out,
-        "static __device__ const NodeRecord SCHED_CTA_STREAM[NUM_NODES] = {{"
+        "static __device__ const TileOp WAVE_OPS[NUM_NODES] = {{"
     )
     .unwrap();
-    for (cta_id, v) in per_cta.iter().enumerate() {
-        writeln!(out, "  // ── CTA {} ({} nodes) ──", cta_id, v.len()).unwrap();
-        for &(_, node) in v {
-            let nd = &dag.nodes[node as usize];
-            writeln!(
-                out,
-                "  {{ {}, {}, {}, {}, {}, {}, {}, 0 }},",
-                phase_tag(nd.phase),
-                node,
-                nd.layer,
-                nd.row,
-                nd.col,
-                node_dep_cnt[node as usize],
-                node_dep_off[node as usize],
-            )
-            .unwrap();
-        }
+    for (phase, layer, row, col) in &ops {
+        writeln!(out, "  {{ {}, {}, {}, {} }},", phase, layer, row, col).unwrap();
     }
     writeln!(out, "}};").unwrap();
     writeln!(out).unwrap();
 
-    // SCHED_ALL_DEPS — flat u32 array.
+    // NODE_ID_FOR_OP — parallel to WAVE_OPS so each CTA can stamp the right
+    // tick slot in the validation array.
     writeln!(
         out,
-        "static __device__ const uint32_t SCHED_ALL_DEPS[NUM_EDGES] = {{"
+        "static __device__ const uint32_t NODE_ID_FOR_OP[NUM_NODES] = {{"
     )
     .unwrap();
-    emit_u32_chunked(&mut out, &all_deps);
+    emit_u32_chunked(&mut out, &node_ids);
     writeln!(out, "}};").unwrap();
     writeln!(out).unwrap();
 
-    // Per-CTA prefix sum into SCHED_CTA_STREAM.
+    // WAVE_CTA_OFFSETS — flattened (NUM_WAVES * (NUM_CTAS+1)) prefix table.
     writeln!(
         out,
-        "static __device__ const uint32_t SCHED_CTA_OFFSETS[NUM_CTAS + 1] = {{"
+        "static __device__ const uint32_t WAVE_CTA_OFFSETS[NUM_WAVES * (NUM_CTAS + 1)] = {{"
     )
     .unwrap();
-    emit_u32_chunked(&mut out, &cta_offsets);
+    emit_u32_chunked(&mut out, &wave_cta_offsets);
     writeln!(out, "}};").unwrap();
     writeln!(out).unwrap();
 
@@ -206,31 +181,19 @@ fn emit_u32_chunked(out: &mut String, vals: &[u32]) {
     }
 }
 
-/// Phase 3b — emit a complete `.cu` file containing:
-///   1. The schedule data (via `emit_schedule_cpp`)
-///   2. Placeholder `tile_<phase>` device functions (sentinel-write only)
-///   3. The persistent-CTA megakernel
-///   4. An `extern "C"` host launch helper
-///
-/// The placeholder tiles do NO real compute. They exist to validate the
-/// dispatch loop / dep-flag sync end-to-end. Phase 3c+ will replace the
-/// placeholders with the actual phase implementations.
-///
-/// The kernel is parameterized by the reified DAG that produced the schedule
-/// so the validation buffer (one u32 tick per node) can be sized correctly.
-pub fn emit_scheduled_megakernel_cu(dag: &ReifiedDag, sched: &Schedule) -> String {
+/// Phase 3b-bsp — emit a complete `.cu` file containing the wave program
+/// data + placeholder tile stubs + grid-barrier megakernel + extern "C"
+/// launch helper.
+pub fn emit_scheduled_megakernel_cu(dag: &ReifiedDag, sched: &WaveSchedule) -> String {
     let mut out = String::new();
-    out.push_str(&emit_schedule_cpp(dag, sched));
+    out.push_str(&emit_wave_schedule_cpp(dag, sched));
     out.push_str(KERNEL_BODY);
     out
 }
 
-/// The kernel body is a static string — pure CUDA, only depends on the
-/// schedule namespace emitted just above. No TK headers, no CUTLASS — that
-/// keeps compile time tiny and the validator self-contained.
 const KERNEL_BODY: &str = r#"
 // ──────────────────────────────────────────────────────────────────────
-// Phase 3b: scheduled megakernel — placeholder tiles, real dispatch loop.
+// Phase 3b-bsp: scheduled BSP megakernel — placeholder tiles, grid barrier.
 // ──────────────────────────────────────────────────────────────────────
 
 #include <cuda_runtime.h>
@@ -238,15 +201,13 @@ const KERNEL_BODY: &str = r#"
 
 namespace pfl_sched {
 
-// Per-node completion flag (set to monotonic tick when the node finishes).
-// Sized to NUM_NODES, allocated host-side and zero-initialized before launch.
-//
-// We store the *tick* (a global monotonic counter) at the producer's slot
-// instead of just "1" so the validator can verify topological order: every
-// node's tick must be greater than every one of its deps' ticks.
+// Per-node validation slot. The kernel writes a monotonic tick into
+// `flags[node_id]` at the moment the node executes; the host then checks
+// that every node ran exactly once and that ticks respect topological order.
 struct SchedRuntime {
-    unsigned int* flags;       // [NUM_NODES] — 0 means not done; nonzero is the tick
+    unsigned int* flags;        // [NUM_NODES] — 0 means not done; nonzero is the tick
     unsigned int* tick_counter; // [1] — global atomic, returns the next tick
+    unsigned int* barrier_arrived; // [1] — accumulated grid-barrier counter
 };
 
 __device__ __forceinline__ void tile_attn_norm(uint32_t /*layer*/, uint32_t /*row*/) {}
@@ -258,52 +219,58 @@ __device__ __forceinline__ void tile_mlp_norm (uint32_t /*layer*/, uint32_t /*ro
 __device__ __forceinline__ void tile_gate_up  (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
 __device__ __forceinline__ void tile_down     (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
 
+// Grid-wide barrier via a single global counter. Every CTA's thread 0 bumps
+// the counter once per wave; all CTAs spin until the counter reaches the
+// expected (wave_idx + 1) * NUM_CTAS value. Requires the launch to fit all
+// CTAs concurrently — true for us at num_ctas == num_sms with 1 CTA/SM.
+__device__ __forceinline__ void grid_barrier(unsigned int* counter, unsigned int wave_idx) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int target = (wave_idx + 1u) * NUM_CTAS;
+        atomicAdd(counter, 1u);
+        __threadfence();
+        while (atomicAdd(counter, 0u) < target) {
+            // spin
+        }
+    }
+    __syncthreads();
+}
+
 __global__ void scheduled_megakernel(SchedRuntime rt) {
     const uint32_t cta_id = blockIdx.x;
     const uint32_t tid    = threadIdx.x;
     if (cta_id >= NUM_CTAS) return;
 
-    const uint32_t my_off  = SCHED_CTA_OFFSETS[cta_id];
-    const uint32_t my_end  = SCHED_CTA_OFFSETS[cta_id + 1];
+    for (uint32_t w = 0; w < NUM_WAVES; ++w) {
+        const uint32_t off = WAVE_CTA_OFFSETS[w * (NUM_CTAS + 1) + cta_id];
+        const uint32_t end = WAVE_CTA_OFFSETS[w * (NUM_CTAS + 1) + cta_id + 1];
 
-    for (uint32_t i = my_off; i < my_end; ++i) {
-        const NodeRecord rec = SCHED_CTA_STREAM[i];
-
-        // ── Wait on every dep's completion flag ──
-        // Single-threaded spin: only thread 0 polls, then __syncthreads.
-        // Hierarchical sync (smem barrier per row group) is a Phase 3+
-        // optimization once correctness is locked in.
-        if (tid == 0) {
-            for (uint16_t d = 0; d < rec.dep_count; ++d) {
-                const uint32_t dep_id = SCHED_ALL_DEPS[rec.dep_off + d];
-                while (atomicAdd(&rt.flags[dep_id], 0u) == 0u) {
-                    // spin
-                }
+        // Execute every tile assigned to this CTA in this wave.
+        for (uint32_t i = off; i < end; ++i) {
+            const TileOp op = WAVE_OPS[i];
+            switch (op.phase) {
+                case PHASE_ATTN_NORM: tile_attn_norm(op.layer, op.row); break;
+                case PHASE_QKV:       tile_qkv      (op.layer, op.row, op.col); break;
+                case PHASE_ROPE:      tile_rope     (op.layer, op.row); break;
+                case PHASE_ATTENTION: tile_attention(op.layer, op.row); break;
+                case PHASE_O_PROJ:    tile_o_proj   (op.layer, op.row, op.col); break;
+                case PHASE_MLP_NORM:  tile_mlp_norm (op.layer, op.row); break;
+                case PHASE_GATE_UP:   tile_gate_up  (op.layer, op.row, op.col); break;
+                case PHASE_DOWN:      tile_down     (op.layer, op.row, op.col); break;
+                default: break;
             }
-        }
-        __syncthreads();
-
-        // ── Dispatch to the right placeholder ──
-        switch (rec.phase) {
-            case PHASE_ATTN_NORM: tile_attn_norm(rec.layer, rec.row); break;
-            case PHASE_QKV:       tile_qkv      (rec.layer, rec.row, rec.col); break;
-            case PHASE_ROPE:      tile_rope     (rec.layer, rec.row); break;
-            case PHASE_ATTENTION: tile_attention(rec.layer, rec.row); break;
-            case PHASE_O_PROJ:    tile_o_proj   (rec.layer, rec.row, rec.col); break;
-            case PHASE_MLP_NORM:  tile_mlp_norm (rec.layer, rec.row); break;
-            case PHASE_GATE_UP:   tile_gate_up  (rec.layer, rec.row, rec.col); break;
-            case PHASE_DOWN:      tile_down     (rec.layer, rec.row, rec.col); break;
-            default: break;
+            // Stamp validation tick. Single-threaded.
+            __syncthreads();
+            if (tid == 0) {
+                const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;
+                const uint32_t node_id = NODE_ID_FOR_OP[i];
+                rt.flags[node_id] = tick;
+            }
+            __syncthreads();
         }
 
-        // ── Signal completion: stamp our tick into our flag slot ──
-        __syncthreads();
-        if (tid == 0) {
-            const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;  // 1-based
-            __threadfence();
-            atomicExch(&rt.flags[rec.my_node_id], tick);
-        }
-        __syncthreads();
+        // One grid barrier per wave.
+        grid_barrier(rt.barrier_arrived, w);
     }
 }
 
@@ -311,8 +278,9 @@ __global__ void scheduled_megakernel(SchedRuntime rt) {
 
 extern "C" void launch_scheduled_megakernel(unsigned int* flags,
                                             unsigned int* tick_counter,
+                                            unsigned int* barrier_arrived,
                                             cudaStream_t stream) {
-    pfl_sched::SchedRuntime rt{flags, tick_counter};
+    pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived};
     dim3 grid(pfl_sched::NUM_CTAS);
     dim3 block(32);
     pfl_sched::scheduled_megakernel<<<grid, block, 0, stream>>>(rt);
@@ -325,17 +293,19 @@ extern "C" unsigned int scheduled_megakernel_num_nodes() {
 extern "C" unsigned int scheduled_megakernel_num_ctas() {
     return pfl_sched::NUM_CTAS;
 }
+
+extern "C" unsigned int scheduled_megakernel_num_waves() {
+    return pfl_sched::NUM_WAVES;
+}
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::reified_dag::{LlamaDims, TileSizes};
-    use crate::schedule::{CostModel, schedule};
+    use crate::schedule::{CostModel, partition_into_waves};
 
     fn tiny_dims() -> LlamaDims {
-        // 2-layer, seq=32 toy model — keeps the emitted text small enough to
-        // sanity-check by eye.
         LlamaDims {
             num_layers: 2,
             hidden_dim: 256,
@@ -351,64 +321,32 @@ mod tests {
     fn emit_smoke() {
         let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
         let cost = CostModel::from_dag(&dag);
-        let sched = schedule(&dag, 4, &cost);
-        let cpp = emit_schedule_cpp(&dag, &sched);
+        let sched = partition_into_waves(&dag, 4, &cost, 100);
+        let cpp = emit_scheduled_megakernel_cu(&dag, &sched);
 
         assert!(cpp.contains("namespace pfl_sched"));
-        assert!(cpp.contains("constexpr uint32_t NUM_NODES ="));
-        assert!(cpp.contains("SCHED_CTA_STREAM"));
-        assert!(cpp.contains("SCHED_ALL_DEPS"));
-        assert!(cpp.contains("SCHED_CTA_OFFSETS"));
-        assert!(cpp.contains("static_assert(sizeof(NodeRecord) == 24"));
-        // Sanity: NUM_NODES line matches actual node count.
+        assert!(cpp.contains("WAVE_OPS"));
+        assert!(cpp.contains("WAVE_CTA_OFFSETS"));
+        assert!(cpp.contains("NODE_ID_FOR_OP"));
+        assert!(cpp.contains("static_assert(sizeof(TileOp) == 16"));
         let n = dag.nodes.len();
         assert!(cpp.contains(&format!("NUM_NODES = {n}")));
+        let w = sched.waves.len();
+        assert!(cpp.contains(&format!("NUM_WAVES = {w}")));
     }
 
     #[test]
-    fn cta_offsets_partition_all_nodes() {
-        // Every node must appear in exactly one CTA's slice.
+    fn op_count_matches_node_count() {
         let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
         let cost = CostModel::from_dag(&dag);
-        let sched = schedule(&dag, 4, &cost);
+        let sched = partition_into_waves(&dag, 4, &cost, 100);
 
-        // Re-build the same per-CTA grouping the emitter does and verify.
-        let mut per_cta: Vec<Vec<u32>> = vec![Vec::new(); sched.num_ctas as usize];
-        for p in &sched.placements {
-            per_cta[p.cta as usize].push(p.node.0);
-        }
-        let total: usize = per_cta.iter().map(|v| v.len()).sum();
-        assert_eq!(total, dag.nodes.len());
-
-        // No node id appears twice across CTAs.
-        let mut seen = vec![false; dag.nodes.len()];
-        for v in &per_cta {
-            for &nid in v {
-                assert!(!seen[nid as usize], "node {nid} placed twice");
-                seen[nid as usize] = true;
+        let mut total = 0u32;
+        for w in &sched.waves {
+            for c in &w.cta_nodes {
+                total += c.len() as u32;
             }
         }
-        assert!(seen.iter().all(|&b| b));
-    }
-
-    #[test]
-    fn schedule_order_within_cta_is_monotonic_in_start_time() {
-        // The emitter sorts each CTA's nodes by start time. Verify that the
-        // resulting order also respects topological order (no node appears
-        // before all its CTA-local deps).
-        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
-        let cost = CostModel::from_dag(&dag);
-        let sched = schedule(&dag, 4, &cost);
-
-        let mut per_cta: Vec<Vec<(u64, u32)>> = vec![Vec::new(); sched.num_ctas as usize];
-        for p in &sched.placements {
-            per_cta[p.cta as usize].push((p.start, p.node.0));
-        }
-        for v in &mut per_cta {
-            v.sort_by_key(|&(t, _)| t);
-            for window in v.windows(2) {
-                assert!(window[0].0 <= window[1].0);
-            }
-        }
+        assert_eq!(total as usize, dag.nodes.len());
     }
 }

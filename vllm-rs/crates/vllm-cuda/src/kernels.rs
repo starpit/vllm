@@ -11272,8 +11272,10 @@ mod layer_norm_bias_tests {
 
             // Row 0: [1,2,3,4], mean=2.5, var=1.25, std=sqrt(1.25+eps)
             let mean0 = 2.5f32;
-            let var0 = ((1.0 - mean0).powi(2) + (2.0 - mean0).powi(2)
-                + (3.0 - mean0).powi(2) + (4.0 - mean0).powi(2))
+            let var0 = ((1.0 - mean0).powi(2)
+                + (2.0 - mean0).powi(2)
+                + (3.0 - mean0).powi(2)
+                + (4.0 - mean0).powi(2))
                 / 4.0;
             let std0 = (var0 + eps).sqrt();
             for i in 0..4 {
@@ -11287,13 +11289,14 @@ mod layer_norm_bias_tests {
 
             // Row 1: [5,6,7,8], mean=6.5
             let mean1 = 6.5f32;
-            let var1 = ((5.0 - mean1).powi(2) + (6.0 - mean1).powi(2)
-                + (7.0 - mean1).powi(2) + (8.0 - mean1).powi(2))
+            let var1 = ((5.0 - mean1).powi(2)
+                + (6.0 - mean1).powi(2)
+                + (7.0 - mean1).powi(2)
+                + (8.0 - mean1).powi(2))
                 / 4.0;
             let std1 = (var1 + eps).sqrt();
             for i in 0..4 {
-                let expected =
-                    (input_data[4 + i] - mean1) / std1 * weight_data[i] + bias_data[i];
+                let expected = (input_data[4 + i] - mean1) / std1 * weight_data[i] + bias_data[i];
                 assert!(
                     (result[4 + i] - expected).abs() < 1e-4,
                     "row 1 elem {i}: got {}, expected {expected}",

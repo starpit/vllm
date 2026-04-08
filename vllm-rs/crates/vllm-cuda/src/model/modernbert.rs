@@ -11,6 +11,7 @@
 
 use anyhow::Result;
 
+use crate::DType;
 use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::device::GpuDevice;
 use crate::kernels;
@@ -18,7 +19,6 @@ use crate::layers::{Embedding, LayerNorm, Linear};
 use crate::model::llama::RotaryCache;
 use crate::tensor::{GpuTensor, TensorView};
 use crate::weights::GpuWeights;
-use crate::DType;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -76,19 +76,10 @@ impl ModernBertEmbeddings {
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
-        let hidden = kernels::embedding_gather(
-            self.tok_embeddings.weight,
-            *input_ids,
-            alloc,
-            stream,
-        );
+        let hidden =
+            kernels::embedding_gather(self.tok_embeddings.weight, *input_ids, alloc, stream);
         // Apply LayerNorm.
-        layer_norm_forward(
-            hidden.as_gpu_tensor(),
-            &self.norm,
-            alloc,
-            stream,
-        )
+        layer_norm_forward(hidden.as_gpu_tensor(), &self.norm, alloc, stream)
     }
 }
 
@@ -98,20 +89,16 @@ impl ModernBertEmbeddings {
 
 /// Bidirectional self-attention with fused QKV and RoPE.
 pub struct ModernBertAttention {
-    pub wqkv: Linear,   // [3 * hidden_size, hidden_size]
-    pub wo: Linear,      // [hidden_size, hidden_size]
+    pub wqkv: Linear, // [3 * hidden_size, hidden_size]
+    pub wo: Linear,   // [hidden_size, hidden_size]
     pub num_heads: usize,
     pub head_dim: usize,
-    pub q_size: usize,   // num_heads * head_dim
-    pub kv_size: usize,  // num_heads * head_dim (no GQA in ModernBERT)
+    pub q_size: usize,  // num_heads * head_dim
+    pub kv_size: usize, // num_heads * head_dim (no GQA in ModernBERT)
 }
 
 impl ModernBertAttention {
-    pub fn load(
-        weights: &mut GpuWeights,
-        prefix: &str,
-        config: &ModernBertConfig,
-    ) -> Result<Self> {
+    pub fn load(weights: &mut GpuWeights, prefix: &str, config: &ModernBertConfig) -> Result<Self> {
         let wqkv = Linear::load(weights, &format!("{prefix}.Wqkv"))?;
         let wo = Linear::load(weights, &format!("{prefix}.Wo"))?;
         let head_dim = config.hidden_size / config.num_attention_heads;
@@ -142,11 +129,9 @@ impl ModernBertAttention {
         device: &mut GpuDevice,
     ) -> OwnedTensor {
         // QKV projection: [num_tokens, 3 * hidden_size]
-        let qkv = self.wqkv.forward(
-            hidden_states,
-            &mut device.cublas,
-            &mut device.caching,
-        );
+        let qkv = self
+            .wqkv
+            .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // Split QKV → [num_tokens, num_heads, head_dim] each.
         let (q, k, v) = kernels::split_qkv(
@@ -212,11 +197,9 @@ impl ModernBertAttention {
         attn_flat.reshape(&[num_tokens, self.num_heads * self.head_dim], dt);
 
         // Output projection.
-        let out = self.wo.forward(
-            attn_flat.view(),
-            &mut device.cublas,
-            &mut device.caching,
-        );
+        let out = self
+            .wo
+            .forward(attn_flat.view(), &mut device.cublas, &mut device.caching);
         drop(attn_flat);
         out
     }
@@ -229,17 +212,13 @@ impl ModernBertAttention {
 /// GeGLU MLP: Wi projects to 2*intermediate_size, chunks into gate+input,
 /// GELU(gate) * input → Wo.
 pub struct ModernBertMlp {
-    pub wi: Linear,  // [2 * intermediate_size, hidden_size]
-    pub wo: Linear,  // [hidden_size, intermediate_size]
+    pub wi: Linear, // [2 * intermediate_size, hidden_size]
+    pub wo: Linear, // [hidden_size, intermediate_size]
     pub intermediate_size: usize,
 }
 
 impl ModernBertMlp {
-    pub fn load(
-        weights: &mut GpuWeights,
-        prefix: &str,
-        config: &ModernBertConfig,
-    ) -> Result<Self> {
+    pub fn load(weights: &mut GpuWeights, prefix: &str, config: &ModernBertConfig) -> Result<Self> {
         let wi = Linear::load(weights, &format!("{prefix}.Wi"))?;
         let wo = Linear::load(weights, &format!("{prefix}.Wo"))?;
         Ok(Self {
@@ -259,11 +238,9 @@ impl ModernBertMlp {
         device: &mut GpuDevice,
     ) -> OwnedTensor {
         // Wi: [num_tokens, 2 * intermediate_size]
-        let gate_up = self.wi.forward(
-            hidden_states,
-            &mut device.cublas,
-            &mut device.caching,
-        );
+        let gate_up = self
+            .wi
+            .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // GeGLU activation: chunks gate_up into gate and input halves,
         // applies GELU to gate, multiplies.
@@ -276,11 +253,9 @@ impl ModernBertMlp {
         drop(gate_up);
 
         // Wo: [num_tokens, hidden_size]
-        let out = self.wo.forward(
-            activated.view(),
-            &mut device.cublas,
-            &mut device.caching,
-        );
+        let out = self
+            .wo
+            .forward(activated.view(), &mut device.cublas, &mut device.caching);
         drop(activated);
         out
     }
@@ -332,11 +307,7 @@ impl ModernBertLayer {
             )?)
         };
 
-        let attn = ModernBertAttention::load(
-            weights,
-            &format!("{prefix}.attn"),
-            config,
-        )?;
+        let attn = ModernBertAttention::load(weights, &format!("{prefix}.attn"), config)?;
         let mlp_norm = LayerNorm::load(
             weights,
             &format!("{prefix}.mlp_norm"),
@@ -467,9 +438,8 @@ impl ModernBertModel {
             } else {
                 config.local_rope_theta
             };
-            let rotary = unsafe {
-                RotaryCache::new(head_dim, max_pos, theta, None, dtype, device)?
-            };
+            let rotary =
+                unsafe { RotaryCache::new(head_dim, max_pos, theta, None, dtype, device)? };
             rotary_caches.push(rotary);
         }
 
@@ -478,11 +448,8 @@ impl ModernBertModel {
             layers.push(ModernBertLayer::load(weights, layer_id, config)?);
         }
 
-        let final_norm = LayerNorm::load(
-            weights,
-            "model.final_norm",
-            config.layer_norm_eps as f32,
-        )?;
+        let final_norm =
+            LayerNorm::load(weights, "model.final_norm", config.layer_norm_eps as f32)?;
 
         Ok(Self {
             embeddings,
@@ -515,11 +482,9 @@ impl ModernBertModel {
         device: &mut GpuDevice,
     ) -> OwnedTensor {
         // Embedding lookup + LayerNorm.
-        let mut hidden_states = self.embeddings.forward(
-            input_ids,
-            &mut device.caching,
-            device.compute_stream,
-        );
+        let mut hidden_states =
+            self.embeddings
+                .forward(input_ids, &mut device.caching, device.compute_stream);
 
         // Encoder layers.
         for (layer_id, layer) in self.layers.iter().enumerate() {
@@ -639,10 +604,7 @@ mod tests {
         // Layer 0 should have attn_norm = None (identity).
         // We can't construct layers without GPU weights, but we can verify the logic.
         let layer_id = 0;
-        assert!(
-            layer_id == 0,
-            "layer 0 should use identity for attn_norm"
-        );
+        assert!(layer_id == 0, "layer 0 should use identity for attn_norm");
     }
 
     #[test]

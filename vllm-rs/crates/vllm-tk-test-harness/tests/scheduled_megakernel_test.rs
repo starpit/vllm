@@ -63,20 +63,24 @@ fn scheduled_megakernel_executes_topologically() {
     let kernel_ctas = unsafe { ffi::scheduled_megakernel_num_ctas() };
     assert_eq!(kernel_ctas, SCHEDULED_PREFILL_TINY_CTAS);
 
-    // Allocate flag array and tick counter on GPU.
+    let kernel_waves = unsafe { ffi::scheduled_megakernel_num_waves() };
+    eprintln!("scheduled_megakernel: {n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
+
+    // Allocate flag array, tick counter, and grid-barrier counter on GPU.
     let flags = gpu_alloc_zeros_u32(n);
     let tick = gpu_alloc_zeros_u32(1);
+    let barrier = gpu_alloc_zeros_u32(1);
 
     // Launch.
     unsafe {
-        ffi::launch_scheduled_megakernel(flags, tick, std::ptr::null_mut());
+        ffi::launch_scheduled_megakernel(flags, tick, barrier, std::ptr::null_mut());
         result::stream::synchronize(std::ptr::null_mut()).expect("stream sync failed");
     }
 
     // Read back the tick array.
     let ticks = gpu_read_u32(flags, n);
     let final_tick = gpu_read_u32(tick, 1)[0];
-    eprintln!("scheduled_megakernel: {n} nodes, final tick = {final_tick}");
+    eprintln!("final tick = {final_tick}");
 
     // ── Invariant 1: every node executed exactly once. ──
     let unexecuted: Vec<usize> = ticks

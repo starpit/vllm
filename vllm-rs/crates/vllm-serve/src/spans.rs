@@ -654,7 +654,7 @@ fn hlo_rewrite_generate_input(input: &SpnlQuery, g: &Generate) -> SpnlQuery {
 }
 
 /// Top-level HLO: for a Generate with Plus in its input, insert prepares.
-fn hlo_insert_prepares(query: &SpnlQuery) -> SpnlQuery {
+pub(crate) fn hlo_insert_prepares(query: &SpnlQuery) -> SpnlQuery {
     match query {
         SpnlQuery::Generate(g) => SpnlQuery::Generate(Generate {
             metadata: g.metadata.clone(),
@@ -813,7 +813,7 @@ fn query_variant_name(query: &SpnlQuery) -> &'static str {
 /// Recursively rewrite `Augment` nodes into `Plus(Message(...))` fragments
 /// by retrieving from the pre-built LEANN index.
 #[cfg(feature = "rag")]
-fn optimize_augments<'a>(
+pub(crate) fn optimize_augments<'a>(
     query: &'a SpnlQuery,
     options: &'a crate::augment::AugmentOptions,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpnlQuery>> + Send + 'a>> {
@@ -1164,7 +1164,7 @@ fn non_generate_input_has_messages(input: &NonGenerateInput) -> bool {
 /// nested `Generate` nodes) into a `SingleGenerate` by stripping inner
 /// generates from the input tree.  The resulting `SingleGenerate` covers only
 /// the non-generate message content of the outer input.
-fn outer_generate_to_single(g: &Generate) -> SingleGenerate {
+pub(crate) fn outer_generate_to_single(g: &Generate) -> SingleGenerate {
     SingleGenerate {
         metadata: g.metadata.clone(),
         input: strip_generates(&g.input),

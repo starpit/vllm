@@ -1574,6 +1574,13 @@ pub struct BenchRagindexArgs {
     #[arg(short = 'n', long, default_value_t = 20)]
     pub num_queries: usize,
 
+    /// Number of queries to keep in flight at once. The engine's
+    /// continuous-batching scheduler interleaves their decode steps,
+    /// so higher values raise GPU utilization. `1` (default) preserves
+    /// the original sequential per-query latency measurement.
+    #[arg(short = 'k', long, default_value_t = 1)]
+    pub concurrency: usize,
+
     /// Query mode: "plain" (chat with gold documents) or "spans" (SPNL with
     /// LEANN retrieval).
     #[arg(long, value_enum, default_value_t = QueryMode::Spans)]

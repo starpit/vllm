@@ -496,65 +496,9 @@ pub fn generate_fused_prefill_mcta_fused_gateup(
     .render()
     .expect("preamble template render");
 
-    // 8 phases: attn_norm, QKV, RoPE, attention, o_proj, mlp_norm, fused_gate_up, down
-    let phases: Vec<String> = vec![
-        render_rmsnorm_mcta(
-            &d,
-            "g.hidden_states",
-            "g.attn_norm_weights",
-            "g.rms_rope_intermediates",
-        ),
-        render_gemm_mcta(
-            &d,
-            cfg,
-            "Phase 2: QKV GEMM (multi-CTA)",
-            "g.rms_rope_intermediates",
-            "g.qkv_weights",
-            d.hd_k_iters,
-            d.qkv_col_tiles,
-            EpilogueKind::Store("g.silu_out"),
-        ),
-        render_rope_kv_append_mcta(&d),
-        render_attention_mcta(&d),
-        render_gemm_mcta(
-            &d,
-            cfg,
-            "Phase 5: o_proj + residual (multi-CTA)",
-            "g.attn_out",
-            "g.o_weights",
-            d.hd_k_iters,
-            d.hd_col_tiles,
-            EpilogueKind::ResidualAdd("g.hidden_states"),
-        ),
-        render_rmsnorm_mcta(
-            &d,
-            "g.hidden_states",
-            "g.mlp_norm_weights",
-            "g.rms_gate_intermediates",
-        ),
-        // Fused gate+up: one phase, no barrier between gate and up
-        render_gemm_gate_up_mcta(
-            &d,
-            cfg,
-            "Phase 7: fused gate+up (multi-CTA)",
-            "g.rms_gate_intermediates",
-            "g.gate_weights",
-            "g.up_weights",
-            "g.silu_out",
-            d.hd_k_iters,
-            d.id_col_tiles,
-        ),
-        render_gemm_mcta(
-            &d,
-            cfg,
-            "Phase 8: down_proj + residual (multi-CTA)",
-            "g.silu_out",
-            "g.down_weights",
-            d.id_k_iters,
-            d.hd_col_tiles,
-            EpilogueKind::ResidualAdd("g.hidden_states"),
-        ),
-    ];
+    // Build the 8-phase fused-gateup pipeline. Honors cfg.phase_opt to apply
+    // per-phase tile overrides for the small-N GEMMs (QKV, o_proj, down_proj).
+    let phases: Vec<String> = build_fused_gateup_phases(dag, &d, cfg);
 
     let mut tah = String::new();
     emit_tensor_arg_and_globals_helper(&mut tah);
@@ -765,7 +709,7 @@ pub fn generate_fused_prefill_polyalgorithm(dag: &ModelDag) -> String {
         .render()
         .expect("preamble_constants template render");
 
-        let phases = build_fused_gateup_phases(&d, cfg);
+        let phases = build_fused_gateup_phases(dag, &d, cfg);
 
         let phase_name_list = [
             "attn_norm",
@@ -900,14 +844,29 @@ fn build_warpspec_phases(d: &FusedDerived, cfg: &FusedPrefillConfig) -> Vec<Stri
 }
 
 /// Build the 8-phase (fused gate+up) phase list for a variant.
-fn build_fused_gateup_phases(d: &FusedDerived, cfg: &FusedPrefillConfig) -> Vec<String> {
-    vec![
-        render_rmsnorm_mcta(
-            d,
-            "g.hidden_states",
-            "g.attn_norm_weights",
+/// When `cfg.phase_opt` is true, the small-N GEMMs (QKV, o_proj, down_proj)
+/// get a per-phase tile override (gemm_warp_m=16, out_block=32) wrapped in a
+/// C++ scope-shadow block. gate_up keeps the kernel-wide shape.
+fn build_fused_gateup_phases(
+    dag: &ModelDag,
+    d: &FusedDerived,
+    cfg: &FusedPrefillConfig,
+) -> Vec<String> {
+    let small_n_ovr = PhaseTileOverride {
+        gemm_warp_m: 16,
+        out_block: 32,
+    };
+    let qkv_phase = if cfg.phase_opt {
+        render_gemm_mcta_override(
+            dag,
+            cfg,
+            small_n_ovr,
+            "QKV GEMM (phase-opt)",
             "g.rms_rope_intermediates",
-        ),
+            "g.qkv_weights",
+            EpilogueKind::Store("g.silu_out"),
+        )
+    } else {
         render_gemm_mcta(
             d,
             cfg,
@@ -917,9 +876,19 @@ fn build_fused_gateup_phases(d: &FusedDerived, cfg: &FusedPrefillConfig) -> Vec<
             d.hd_k_iters,
             d.qkv_col_tiles,
             EpilogueKind::Store("g.silu_out"),
-        ),
-        render_rope_kv_append_mcta(d),
-        render_attention_mcta(d),
+        )
+    };
+    let o_phase = if cfg.phase_opt {
+        render_gemm_mcta_override(
+            dag,
+            cfg,
+            small_n_ovr,
+            "o_proj + residual (phase-opt)",
+            "g.attn_out",
+            "g.o_weights",
+            EpilogueKind::ResidualAdd("g.hidden_states"),
+        )
+    } else {
         render_gemm_mcta(
             d,
             cfg,
@@ -929,7 +898,41 @@ fn build_fused_gateup_phases(d: &FusedDerived, cfg: &FusedPrefillConfig) -> Vec<
             d.hd_k_iters,
             d.hd_col_tiles,
             EpilogueKind::ResidualAdd("g.hidden_states"),
+        )
+    };
+    let down_phase = if cfg.phase_opt {
+        render_gemm_mcta_override(
+            dag,
+            cfg,
+            small_n_ovr,
+            "down_proj + residual (phase-opt)",
+            "g.silu_out",
+            "g.down_weights",
+            EpilogueKind::ResidualAdd("g.hidden_states"),
+        )
+    } else {
+        render_gemm_mcta(
+            d,
+            cfg,
+            "down_proj + residual",
+            "g.silu_out",
+            "g.down_weights",
+            d.id_k_iters,
+            d.hd_col_tiles,
+            EpilogueKind::ResidualAdd("g.hidden_states"),
+        )
+    };
+    vec![
+        render_rmsnorm_mcta(
+            d,
+            "g.hidden_states",
+            "g.attn_norm_weights",
+            "g.rms_rope_intermediates",
         ),
+        qkv_phase,
+        render_rope_kv_append_mcta(d),
+        render_attention_mcta(d),
+        o_phase,
         render_rmsnorm_mcta(
             d,
             "g.hidden_states",
@@ -947,16 +950,7 @@ fn build_fused_gateup_phases(d: &FusedDerived, cfg: &FusedPrefillConfig) -> Vec<
             d.hd_k_iters,
             d.id_col_tiles,
         ),
-        render_gemm_mcta(
-            d,
-            cfg,
-            "down_proj + residual",
-            "g.silu_out",
-            "g.down_weights",
-            d.id_k_iters,
-            d.hd_col_tiles,
-            EpilogueKind::ResidualAdd("g.hidden_states"),
-        ),
+        down_phase,
     ]
 }
 
@@ -1049,6 +1043,59 @@ fn render_rmsnorm_mcta(
     .expect("rmsnorm_mcta template render")
 }
 
+/// Per-phase tile override. When supplied, the GEMM phase is emitted with
+/// its own gemm_warp_m / out_block (and matching shmem layout), wrapped in a
+/// C++ block that shadows the kernel-wide PFL_* constants and tile typedefs.
+/// num_warps stays at the kernel-wide value (the launch geometry can't change
+/// per-phase). cta_rows is therefore num_warps × override.gemm_warp_m.
+#[derive(Clone, Copy, Debug)]
+pub struct PhaseTileOverride {
+    pub gemm_warp_m: u32,
+    pub out_block: u32,
+}
+
+/// Build a per-phase config + derived by overriding the small-N tile dims.
+/// Used by render_gemm_mcta to emit a phase block with shadowed PFL_* values.
+fn phase_override_cfg(base: &FusedPrefillConfig, ovr: PhaseTileOverride) -> FusedPrefillConfig {
+    FusedPrefillConfig {
+        cta_rows: Dim(base.num_warps.0 * ovr.gemm_warp_m as usize),
+        out_block: Dim(ovr.out_block as usize),
+        gemm_warp_m: Dim(ovr.gemm_warp_m as usize),
+        // Per-phase override is only meaningful for non-dual_accum GEMMs
+        // (QKV, o_proj, down_proj). gate_up uses its own dual_accum path.
+        dual_accum_gate_up: false,
+        ..base.clone()
+    }
+}
+
+/// Emit a C++ scope block that shadows the kernel-wide PFL_* constants and
+/// tile typedefs with phase-local versions, so a phase body using PFL_GEMM_M
+/// etc. resolves to the per-phase value. The block is closed by `phase_override_close`.
+fn phase_override_open(ovr: PhaseTileOverride) -> String {
+    let m = ovr.gemm_warp_m;
+    let m_subs = m / 16;
+    let out = ovr.out_block;
+    let n_tiles = out / 16;
+    format!(
+        "    // ── Phase tile override: gemm_warp_m={m} out_block={out} ──\n\
+         {{\n\
+         constexpr int PFL_GEMM_M = {m};\n\
+         constexpr int PFL_GEMM_M_SUBS = {m_subs};\n\
+         constexpr int PFL_OUT_BLOCK = {out};\n\
+         constexpr int PFL_N_TILES = {n_tiles};\n\
+         constexpr int PFL_CTA_ROWS = PFL_NUM_WARPS * PFL_GEMM_M;\n\
+         using pfl_a_st = st_bf<PFL_GEMM_M, PFL_K_DIM>;\n\
+         using pfl_b_st = st_bf<PFL_OUT_BLOCK, PFL_K_DIM>;\n\
+         using pfl_acc_rt = rt_fl<PFL_GEMM_M, PFL_OUT_BLOCK>;\n\
+         using pfl_a_rt = rt_bf<PFL_GEMM_M, PFL_K_DIM>;\n\
+         using pfl_b_slice_st = st_bf<16, PFL_K_DIM>;\n"
+    )
+}
+
+fn phase_override_close() -> String {
+    "    }\n".to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_gemm_mcta(
     d: &FusedDerived,
@@ -1101,6 +1148,63 @@ fn render_gemm_mcta(
     }
     .render()
     .expect("gemm_mcta template render")
+}
+
+/// Render a GEMM phase with a per-phase tile override applied. The kernel-wide
+/// `cfg` provides the launch geometry (num_warps, num_stages); the override
+/// supplies gemm_warp_m and out_block. Phase shmem comes from a fresh
+/// FusedDerived computed against the override-augmented cfg.
+#[allow(clippy::too_many_arguments)]
+fn render_gemm_mcta_override(
+    dag: &ModelDag,
+    base_cfg: &FusedPrefillConfig,
+    ovr: PhaseTileOverride,
+    phase_comment: &str,
+    input_global: &str,
+    weight_global: &str,
+    epilogue: EpilogueKind<'_>,
+) -> String {
+    let phase_cfg = phase_override_cfg(base_cfg, ovr);
+    let phase_d = FusedDerived::new(dag, &phase_cfg);
+    // Pick num_k_iters / num_col_tiles based on what this phase actually
+    // operates on. Caller will encode that via the input/weight global names,
+    // but we still need to compute them from the phase_cfg.
+    // We map them by inspecting the weight_global string (cheap heuristic).
+    let (num_k_iters, num_col_tiles) = phase_dims(&phase_d, weight_global);
+    let body = render_gemm_mcta(
+        &phase_d,
+        &phase_cfg,
+        phase_comment,
+        input_global,
+        weight_global,
+        num_k_iters,
+        num_col_tiles,
+        epilogue,
+    );
+    let mut out = String::new();
+    out.push_str(&phase_override_open(ovr));
+    out.push_str(&body);
+    out.push_str(&phase_override_close());
+    out
+}
+
+/// Map the weight global name to (num_k_iters, num_col_tiles) for the
+/// phase's GEMM. Used by render_gemm_mcta_override to compute per-phase
+/// loop bounds against the per-phase derived (which has the override's
+/// k_dim and out_block).
+fn phase_dims(d: &FusedDerived, weight_global: &str) -> (Iters, Tiles) {
+    if weight_global.contains("qkv_weights") {
+        (d.hd_k_iters, d.qkv_col_tiles)
+    } else if weight_global.contains("o_weights") || weight_global.contains("o_proj") {
+        (d.hd_k_iters, d.hd_col_tiles)
+    } else if weight_global.contains("down_weights") {
+        (d.id_k_iters, d.hd_col_tiles)
+    } else if weight_global.contains("gate_weights") || weight_global.contains("up_weights") {
+        (d.hd_k_iters, d.id_col_tiles)
+    } else {
+        // Fall back: use the same as a generic HD-input GEMM.
+        (d.hd_k_iters, d.hd_col_tiles)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

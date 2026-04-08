@@ -159,13 +159,32 @@ fn build_cuda() {
     cu_files.push(fused_layer_path.display().to_string());
 
     // Build all test kernels into one static library
-    cudaforge::KernelBuilder::new()
+    // CUTLASS headers (optional — if present, the megakernel can include
+    // cute/CUTLASS device-side primitives for cuBLAS-quality GEMM phases).
+    let cutlass_root = std::path::PathBuf::from(
+        std::env::var("CUTLASS_ROOT")
+            .unwrap_or_else(|_| "/home/moosevan/cutlass".to_string()),
+    );
+    let cutlass_include = cutlass_root.join("include");
+    let cutlass_tools_util = cutlass_root.join("tools/util/include");
+
+    let mut builder = cudaforge::KernelBuilder::new();
+    builder = builder
         .out_dir(&cache_dir)
         .source_files(cu_files)
         .watch(header_files)
         .include_path(tk_include.display().to_string())
         .include_path(tk_prototype.display().to_string())
-        .include_path(tk_csrc.display().to_string())
+        .include_path(tk_csrc.display().to_string());
+    if cutlass_include.exists() {
+        println!("cargo:warning=cutlass found at {}", cutlass_root.display());
+        builder = builder
+            .include_path(cutlass_include.display().to_string())
+            .include_path(cutlass_tools_util.display().to_string());
+    } else {
+        println!("cargo:warning=cutlass not found at {} (set CUTLASS_ROOT)", cutlass_root.display());
+    }
+    builder
         .arg("-std=c++20")
         .arg("-O3")
         .arg("--use_fast_math")

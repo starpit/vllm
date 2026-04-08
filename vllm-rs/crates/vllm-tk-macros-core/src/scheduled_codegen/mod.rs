@@ -103,6 +103,22 @@ pub fn emit_scheduled_megakernel_cu(
                     } => {
                         ops.push((phase_tag(phase), layer as u32, row as u32, col as u32));
                     }
+                    BoundKernel::FlashInferAttentionLayer { .. } => {
+                        // C2a: this variant exists in the library but is
+                        // not yet emitted by the production coalesce pass
+                        // wired into this codegen path. C2b grows the
+                        // WAVE_OPS schema to be kernel-tagged and adds a
+                        // dispatch arm that emits a flashinfer work item
+                        // carrying the layer index. Until then, hitting
+                        // this arm means somebody used
+                        // `coalesce_with_flashinfer_attention` from the
+                        // production path prematurely.
+                        panic!(
+                            "scheduled_codegen reached a FlashInferAttentionLayer node \
+                             in Phase C2a; the production pipeline must still use the \
+                             trivial coalesce() until C2b grows the WAVE_OPS schema"
+                        );
+                    }
                 }
                 node_ids.push(nid.0);
                 cursor += 1;

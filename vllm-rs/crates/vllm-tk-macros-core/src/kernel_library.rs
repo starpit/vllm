@@ -57,6 +57,22 @@ pub enum BoundKernel {
         row: u16,
         col: u16,
     },
+
+    /// FlashInfer's `BlockBatchPagedAttentionPersistent::Run` runner,
+    /// applied to one layer's full attention. The runner is a
+    /// `__device__` function that takes `Params` + `SharedStorage` and
+    /// processes the work assigned to its CTA via `work_indptr` —
+    /// i.e. each persistent CTA in the wave pulls its share at runtime
+    /// from a host-built plan, rather than the scheduler enumerating
+    /// per-row tiles.
+    ///
+    /// The coalesce rule fuses every reified `Phase::Attention` node
+    /// for a given layer into a single bound node carrying just the
+    /// layer index. The dependencies of the absorbed nodes (typically
+    /// the layer's RoPE outputs) become this node's dependencies; any
+    /// edge that lived purely between absorbed attention nodes is
+    /// dropped (no internal edges in a fused node).
+    FlashInferAttentionLayer { layer: u16 },
 }
 
 impl BoundKernel {
@@ -77,6 +93,7 @@ impl BoundKernel {
     pub fn kind(&self) -> &'static str {
         match self {
             BoundKernel::HandWrittenRowTile { phase, .. } => phase.name(),
+            BoundKernel::FlashInferAttentionLayer { .. } => "flashinfer_attention_layer",
         }
     }
 
@@ -92,6 +109,23 @@ impl BoundKernel {
     pub fn cost(&self, model: &CostModel) -> u32 {
         match self {
             BoundKernel::HandWrittenRowTile { phase, .. } => model.cost(*phase),
+            // Layer-rolled-up attention: one binding does the work that
+            // used to be `seq_len / row_tile` separate row tiles. Sum
+            // them so the wave scheduler still budgets the right total
+            // mma-units per layer.
+            //
+            // The number is intentionally an over-estimate of FlashInfer's
+            // real cost — Phase C2b will pivot this to a real measured
+            // number once we have a bench. Treating each layer as a
+            // single big work unit is the right thing for the LPT bin
+            // packer either way: a flashinfer-attention wave consumes
+            // all the CTAs at once, not by per-CTA partitioning, so the
+            // wave's makespan is determined by this rolled-up cost
+            // regardless of the per-CTA breakdown.
+            BoundKernel::FlashInferAttentionLayer { .. } => {
+                let row_tiles = model.seq_len.div_ceil(model.row_tile);
+                row_tiles * model.cost(Phase::Attention)
+            }
         }
     }
 }
@@ -179,6 +213,124 @@ pub fn coalesce(dag: &ReifiedDag) -> CoalescedDag {
     }
 }
 
+/// Coalesce variant that fuses every layer's attention row tiles into
+/// one [`BoundKernel::FlashInferAttentionLayer`] node, leaving every
+/// other phase on the [`BoundKernel::HandWrittenRowTile`] fallback.
+///
+/// Phase C2a: this function exists alongside the trivial [`coalesce`]
+/// but is **not** wired into the production pipeline yet — Phase C2b
+/// switches the call sites to use it once the dispatch + launcher
+/// plumbing in `scheduled_codegen` and the megakernel template can
+/// emit a `FlashInferAttentionLayer` work item.
+///
+/// Fusion semantics for one layer:
+/// 1. Find every reified node with `phase == Attention && layer == L`.
+/// 2. Drop those nodes from the coalesced output.
+/// 3. Replace them with one fused node:
+///    - id: the smallest absorbed `NodeId` (stable across rebuilds —
+///      the codegen test asserts this).
+///    - kernel: `FlashInferAttentionLayer { layer: L }`.
+///    - deps: the union of the absorbed nodes' deps, *minus* any
+///      dependency that pointed to another absorbed node (no
+///      internal edges in a fused node).
+/// 4. For every other coalesced node (any non-attention phase) that
+///    used to depend on an absorbed attention id, rewrite that dep
+///    to point at the fused node's id.
+///
+/// All other phases pass through unchanged (1:1 fallback).
+pub fn coalesce_with_flashinfer_attention(dag: &ReifiedDag) -> CoalescedDag {
+    use std::collections::{HashMap, HashSet};
+
+    // ── Step 1: index attention nodes by layer ──
+    let mut attn_ids_by_layer: HashMap<u16, Vec<NodeId>> = HashMap::new();
+    for n in &dag.nodes {
+        if n.phase == Phase::Attention {
+            attn_ids_by_layer.entry(n.layer).or_default().push(n.id);
+        }
+    }
+
+    // ── Step 2: pick the fused id per layer (smallest absorbed id) ──
+    let mut fused_id_by_layer: HashMap<u16, NodeId> = HashMap::new();
+    for (layer, ids) in &attn_ids_by_layer {
+        let min_id = ids.iter().copied().min().expect("layer has attn nodes");
+        fused_id_by_layer.insert(*layer, min_id);
+    }
+
+    // ── Step 3: build absorbed-id → fused-id rewrite map ──
+    let mut rewrite: HashMap<NodeId, NodeId> = HashMap::new();
+    for (layer, ids) in &attn_ids_by_layer {
+        let fused = fused_id_by_layer[layer];
+        for id in ids {
+            rewrite.insert(*id, fused);
+        }
+    }
+
+    // ── Step 4: build the coalesced node list ──
+    // For each reified node:
+    //   - If it's an attention node and its id IS the fused id for its
+    //     layer, emit one fused FlashInferAttentionLayer node with the
+    //     unioned, internally-pruned deps.
+    //   - If it's an attention node and its id is NOT the fused id,
+    //     drop it (it's been absorbed into the fused node).
+    //   - Otherwise, emit a HandWrittenRowTile fallback, rewriting
+    //     any deps that pointed to absorbed attention ids.
+    let mut nodes: Vec<CoalescedNode> = Vec::with_capacity(dag.nodes.len());
+    let absorbed: HashSet<NodeId> = rewrite.keys().copied().collect();
+
+    for n in &dag.nodes {
+        if n.phase == Phase::Attention {
+            let fused_id = fused_id_by_layer[&n.layer];
+            if n.id != fused_id {
+                continue; // absorbed into the fused node — drop
+            }
+            // Union all deps from every attention node in this layer,
+            // pruning internal edges and deduping.
+            let mut deps: Vec<NodeId> = Vec::new();
+            let mut seen: HashSet<NodeId> = HashSet::new();
+            for absorbed_id in &attn_ids_by_layer[&n.layer] {
+                let absorbed_node = &dag.nodes[absorbed_id.0 as usize];
+                for d in &absorbed_node.deps {
+                    if absorbed.contains(d) {
+                        continue; // internal edge — drop
+                    }
+                    if seen.insert(*d) {
+                        deps.push(*d);
+                    }
+                }
+            }
+            nodes.push(CoalescedNode {
+                id: fused_id,
+                kernel: BoundKernel::FlashInferAttentionLayer { layer: n.layer },
+                deps,
+            });
+        } else {
+            // Non-attention phase: rewrite any dep pointing into the
+            // absorbed set to point at the matching fused id.
+            let deps: Vec<NodeId> = n
+                .deps
+                .iter()
+                .map(|d| rewrite.get(d).copied().unwrap_or(*d))
+                .collect();
+            nodes.push(CoalescedNode {
+                id: n.id,
+                kernel: BoundKernel::HandWrittenRowTile {
+                    phase: n.phase,
+                    layer: n.layer,
+                    row: n.row,
+                    col: n.col,
+                },
+                deps,
+            });
+        }
+    }
+
+    CoalescedDag {
+        dims: dag.dims,
+        tiles: dag.tiles,
+        nodes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +375,9 @@ mod tests {
                     assert_eq!(*row, rnode.row);
                     assert_eq!(*col, rnode.col);
                 }
+                BoundKernel::FlashInferAttentionLayer { .. } => {
+                    panic!("trivial coalesce should never produce FlashInferAttentionLayer");
+                }
             }
         }
     }
@@ -239,6 +394,119 @@ mod tests {
         for (cnode, rnode) in coalesced.nodes.iter().zip(dag.nodes.iter()) {
             assert_eq!(cnode.kernel.kind(), rnode.phase.name());
         }
+    }
+
+    #[test]
+    fn flashinfer_coalesce_fuses_attention_per_layer() {
+        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let coalesced = coalesce_with_flashinfer_attention(&dag);
+
+        // Count by kind in the coalesced output.
+        let mut by_kind = std::collections::HashMap::<&'static str, usize>::new();
+        for cn in &coalesced.nodes {
+            *by_kind.entry(cn.kernel.kind()).or_insert(0) += 1;
+        }
+
+        // tiny has NL=2 layers and SEQ_LEN=32 with row_tile=16 → 2 attn
+        // row tiles per layer × 2 layers = 4 reified attention nodes,
+        // fused into 2 FlashInferAttentionLayer nodes (one per layer).
+        let nl = tiny_dims().num_layers as usize;
+        assert_eq!(
+            by_kind
+                .get("flashinfer_attention_layer")
+                .copied()
+                .unwrap_or(0),
+            nl,
+            "expected one FlashInferAttentionLayer per layer; got {by_kind:?}",
+        );
+
+        // The total node count drops by exactly the number of absorbed
+        // attention nodes minus the one fused replacement per layer.
+        let row_tiles_per_layer = tiny_dims()
+            .seq_len
+            .div_ceil(TileSizes::default_v1().row_tile) as usize;
+        let absorbed = nl * row_tiles_per_layer;
+        let replacements = nl;
+        assert_eq!(coalesced.len(), dag.nodes.len() - (absorbed - replacements));
+    }
+
+    #[test]
+    fn flashinfer_coalesce_drops_internal_attention_edges() {
+        // No coalesced node should depend on a NodeId that was absorbed
+        // into a different fused FlashInferAttentionLayer node — only
+        // on its own fused id (which is impossible since we drop
+        // internal edges) or on non-absorbed ids.
+        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let coalesced = coalesce_with_flashinfer_attention(&dag);
+
+        let live_ids: std::collections::HashSet<NodeId> =
+            coalesced.nodes.iter().map(|n| n.id).collect();
+
+        for cn in &coalesced.nodes {
+            for d in &cn.deps {
+                assert!(
+                    live_ids.contains(d),
+                    "coalesced node {:?} has dep {d:?} that doesn't exist in the coalesced output",
+                    cn.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flashinfer_coalesce_preserves_non_attention_phases() {
+        // Every non-attention phase should still appear in the coalesced
+        // output, untouched, with the same row/col counts as the
+        // reified DAG.
+        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let coalesced = coalesce_with_flashinfer_attention(&dag);
+
+        let mut reified_non_attn = 0usize;
+        for n in &dag.nodes {
+            if n.phase != Phase::Attention {
+                reified_non_attn += 1;
+            }
+        }
+        let mut coalesced_non_attn = 0usize;
+        for cn in &coalesced.nodes {
+            if !matches!(cn.kernel, BoundKernel::FlashInferAttentionLayer { .. }) {
+                coalesced_non_attn += 1;
+            }
+        }
+        assert_eq!(reified_non_attn, coalesced_non_attn);
+    }
+
+    #[test]
+    fn flashinfer_coalesce_rewrites_deps_into_fused_ids() {
+        // A non-attention node that used to depend on an attention row
+        // tile (e.g. o_proj depends on attention) should, after the
+        // flashinfer coalesce, depend on the *fused* attention node id
+        // for its layer — not on a now-absorbed reified attention id.
+        let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
+        let coalesced = coalesce_with_flashinfer_attention(&dag);
+
+        // Build (id → kind tag) for the coalesced output so we can
+        // assert that downstream attention deps point at a fused node.
+        let kind_of: std::collections::HashMap<NodeId, &'static str> = coalesced
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.kernel.kind()))
+            .collect();
+
+        let mut rewritten_count = 0usize;
+        for cn in &coalesced.nodes {
+            if cn.kernel.kind() == "o_proj" {
+                for d in &cn.deps {
+                    if kind_of.get(d).copied() == Some("flashinfer_attention_layer") {
+                        rewritten_count += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            rewritten_count > 0,
+            "expected at least one o_proj→flashinfer_attention_layer dep after coalesce"
+        );
     }
 
     #[test]

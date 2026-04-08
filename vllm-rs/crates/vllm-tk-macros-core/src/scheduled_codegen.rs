@@ -1220,6 +1220,12 @@ extern "C" void launch_scheduled_megakernel(
     // are gated to warp 0 inside their bodies; GEMM phases use all 256
     // threads cooperatively via per-thread output partitioning.
     dim3 block(256);
+    // The grid-barrier counter is cumulative across waves, so it must be
+    // reset to 0 before every launch — otherwise the second launch's
+    // wave-0 barrier sees the counter already past its target and exits
+    // without actually synchronizing, racing the rest of the kernel.
+    // Async on the same stream → effectively free.
+    cudaMemsetAsync(barrier_arrived, 0, sizeof(unsigned int), stream);
     pfl_sched::scheduled_megakernel<<<grid, block, 0, stream>>>(g, rt);
 }
 

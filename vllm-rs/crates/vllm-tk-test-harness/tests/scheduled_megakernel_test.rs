@@ -1164,6 +1164,154 @@ fn regen_llama_1b_seq64_golden() {
     write_golden("llama_3_2_1b_seq64", &cpu.h_final);
 }
 
+/// Real LLaMA 1B at production prefill seq=1024. Same model dims as
+/// llama_1b_seq64 — 16 layers, HD=2048, ID=8192 — but with the full
+/// production sequence length. CPU forward simulator runtime would be
+/// ~80 minutes single-threaded so there's no committed golden; this
+/// variant is for performance benchmarking only. Correctness is inherited
+/// from llama_1b_seq64 (same algorithm, same compiled kernel template,
+/// only the sequence count and wave schedule differ).
+fn llama_1b_seq1024_dims() -> LlamaDims {
+    LlamaDims {
+        num_layers: 16,
+        hidden_dim: 2048,
+        intermediate_dim: 8192,
+        num_attn_heads: 32,
+        num_kv_heads: 8,
+        head_dim: 64,
+        seq_len: 1024,
+    }
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn llama_1b_seq1024_smoke() {
+    init_cuda();
+    let dims = llama_1b_seq1024_dims();
+    eprintln!(
+        "llama_1b_seq1024 smoke: NL={}, HD={}, ID={}, seq={}",
+        dims.num_layers, dims.hidden_dim, dims.intermediate_dim, dims.seq_len
+    );
+    let alloc_start = std::time::Instant::now();
+    let (b, _) = build_test_buffers(dims, 17);
+    eprintln!(
+        "  buffer allocation + upload: {:.2}s",
+        alloc_start.elapsed().as_secs_f64()
+    );
+    let kernel_n = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq1024_num_nodes() };
+    let kernel_ctas = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq1024_num_ctas() };
+    let kernel_waves = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq1024_num_waves() };
+    eprintln!("  kernel: {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
+
+    let launch_start = std::time::Instant::now();
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        1e-5,
+        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024,
+        kernel_n,
+    );
+    eprintln!(
+        "  scheduled megakernel run (single launch incl. cuStreamSync): {:.3}s",
+        launch_start.elapsed().as_secs_f64()
+    );
+}
+
+/// Microbenchmark: warm up + N timed launches via CUDA events. Reports
+/// avg/min/max ms. Compare against the existing fused prefill kernel's
+/// `test_fused_prefill_layer_timing` baseline at seq=1024 (~42 ms on L4).
+#[test]
+#[ignore = "needs GPU"]
+fn llama_1b_seq1024_bench() {
+    use cudarc::driver::sys;
+
+    init_cuda();
+    let dims = llama_1b_seq1024_dims();
+    let (b, _) = build_test_buffers(dims, 17);
+    let kernel_n = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq1024_num_nodes() };
+    let kernel_ctas = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq1024_num_ctas() };
+    let kernel_waves = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq1024_num_waves() };
+
+    eprintln!();
+    eprintln!("╔════════════════════════════════════════════════════════════╗");
+    eprintln!("║  scheduled megakernel: llama_3_2_1b @ seq=1024              ║");
+    eprintln!(
+        "║  {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs"
+    );
+    eprintln!("╠════════════════════════════════════════════════════════════╣");
+
+    // Validation buffers (allocated once, reused across launches). The
+    // launch helper internally cudaMemsets the barrier counter to 0 before
+    // each launch so we don't need to reset between iterations.
+    let n = kernel_n as usize;
+    let flags = gpu_alloc_zeros_u32(n);
+    let tick = gpu_alloc_zeros_u32(1);
+    let barrier = gpu_alloc_zeros_u32(1);
+
+    let launch = || unsafe {
+        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024(
+            b.hidden_states as *mut _,
+            b.rms_rope as *mut _,
+            b.qkv as *mut _,
+            b.q_post_rope as *mut _,
+            b.attn_out as *mut _,
+            b.rms_gate as *mut _,
+            b.silu_out as *mut _,
+            b.k_cache as *mut _,
+            b.v_cache as *mut _,
+            b.prefill_kv_indices as *const i32,
+            b.prefill_kv_indptr as *const i32,
+            b.prefill_qo_indptr as *const i32,
+            b.attn_norm_w as *mut _,
+            b.mlp_norm_w as *mut _,
+            b.qkv_w as *mut _,
+            b.o_w as *mut _,
+            b.gate_w as *mut _,
+            b.up_w as *mut _,
+            b.down_w as *mut _,
+            1e-5,
+            1.0 / (dims.head_dim as f32).sqrt(),
+            flags,
+            tick,
+            barrier,
+            std::ptr::null_mut(),
+        );
+    };
+
+    // Warmup.
+    for _ in 0..4 {
+        launch();
+    }
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+
+    // Timed iterations via CUDA events.
+    const NUM_ITERS: u32 = 50;
+    let mut start: sys::CUevent = std::ptr::null_mut();
+    let mut stop: sys::CUevent = std::ptr::null_mut();
+    unsafe {
+        sys::cuEventCreate(&mut start, 0);
+        sys::cuEventCreate(&mut stop, 0);
+        sys::cuEventRecord(start, std::ptr::null_mut());
+    }
+    for _ in 0..NUM_ITERS {
+        launch();
+    }
+    let avg_ms = unsafe {
+        sys::cuEventRecord(stop, std::ptr::null_mut());
+        sys::cuEventSynchronize(stop);
+        let mut elapsed_ms: f32 = 0.0;
+        sys::cuEventElapsedTime(&mut elapsed_ms, start, stop);
+        sys::cuEventDestroy_v2(start);
+        sys::cuEventDestroy_v2(stop);
+        elapsed_ms / NUM_ITERS as f32
+    };
+
+    eprintln!("║  avg over {NUM_ITERS} iters: {avg_ms:8.3} ms             ║");
+    eprintln!("║  baseline (existing fused prefill): ~42 ms                  ║");
+    eprintln!("╚════════════════════════════════════════════════════════════╝");
+    eprintln!();
+}
+
 #[test]
 #[ignore = "needs GPU"]
 fn llama_1b_seq64_h_final_matches_committed_golden() {

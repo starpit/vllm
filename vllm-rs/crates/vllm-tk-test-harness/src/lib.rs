@@ -351,6 +351,7 @@ pub mod ffi {
             o_w: *mut std::ffi::c_void,
             gate_w: *mut std::ffi::c_void,
             up_w: *mut std::ffi::c_void,
+            down_w: *mut std::ffi::c_void,
             eps: f32,
             // Validation buffers
             flags: *mut u32,

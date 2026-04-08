@@ -297,6 +297,7 @@ struct globals_t {
     __nv_bfloat16* o_w;             // [num_layers, HIDDEN_DIM, HIDDEN_DIM]
     __nv_bfloat16* gate_w;          // [num_layers, INTERMEDIATE, HIDDEN_DIM]
     __nv_bfloat16* up_w;            // [num_layers, INTERMEDIATE, HIDDEN_DIM]
+    __nv_bfloat16* down_w;          // [num_layers, HIDDEN_DIM, INTERMEDIATE]
     float          eps;
 };
 
@@ -564,7 +565,42 @@ __device__ __forceinline__ void tile_mlp_norm(const globals_t& g, uint32_t layer
     }
 }
 
-__device__ __forceinline__ void tile_down     (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+// ── tile_down: GEMM + residual. M=ROW_TILE, N=DOWN_COL_TILE, K=INTERMEDIATE.
+//
+// hidden_states[m,n] += sum_k silu_out[m,k] * down_w[layer, n, k]
+//
+// Same residual structure as tile_o_proj, just different K and inputs.
+__device__ __forceinline__ void tile_down(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
+    constexpr uint32_t M  = MODEL_ROW_TILE;
+    constexpr uint32_t K  = MODEL_INTERMEDIATE;
+    constexpr uint32_t N  = MODEL_DOWN_COL_TILE;
+    constexpr uint32_t HD_FULL = MODEL_HIDDEN_DIM;
+    const uint32_t row_start = row * M;
+    const uint32_t col_start = col * N;
+    if (row_start >= MODEL_SEQ_LEN) return;
+
+    const __nv_bfloat16* A = g.silu_out + (size_t)row_start * K;
+    const __nv_bfloat16* B = g.down_w
+        + (size_t)layer * HD_FULL * K
+        + (size_t)col_start * K;
+    __nv_bfloat16* C = g.hidden_states + (size_t)row_start * HD_FULL + col_start;
+
+    const uint32_t lane = threadIdx.x;
+    const uint32_t total = M * N;
+    for (uint32_t idx = lane; idx < total; idx += 32) {
+        const uint32_t m = idx / N;
+        const uint32_t n = idx % N;
+        if (row_start + m >= MODEL_SEQ_LEN) continue;
+        float acc = __bfloat162float(C[m * HD_FULL + n]);
+        for (uint32_t k = 0; k < K; ++k) {
+            const float a = __bfloat162float(A[m * K + k]);
+            const float b = __bfloat162float(B[n * K + k]);
+            acc += a * b;
+        }
+        C[m * HD_FULL + n] = __float2bfloat16(acc);
+    }
+}
+
 
 // Grid-wide barrier via a single global counter. Every CTA's thread 0 bumps
 // the counter once per wave; all CTAs spin until the counter reaches the
@@ -639,6 +675,7 @@ extern "C" void launch_scheduled_megakernel(
     void* o_w,
     void* gate_w,
     void* up_w,
+    void* down_w,
     float eps,
     // Validation buffers
     unsigned int* flags,
@@ -658,6 +695,7 @@ extern "C" void launch_scheduled_megakernel(
         reinterpret_cast<__nv_bfloat16*>(o_w),
         reinterpret_cast<__nv_bfloat16*>(gate_w),
         reinterpret_cast<__nv_bfloat16*>(up_w),
+        reinterpret_cast<__nv_bfloat16*>(down_w),
         eps,
     };
     pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived};

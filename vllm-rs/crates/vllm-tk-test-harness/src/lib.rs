@@ -365,6 +365,7 @@ pub mod ffi {
                     flags: *mut u32,
                     tick_counter: *mut u32,
                     barrier_arrived: *mut u32,
+                    phase_clocks: *mut u64,
                     stream: *mut std::ffi::c_void,
                 );
                 pub fn $num_nodes() -> u32;

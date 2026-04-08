@@ -363,6 +363,11 @@ struct SchedRuntime {
     unsigned int* flags;           // [NUM_NODES]
     unsigned int* tick_counter;    // [1]
     unsigned int* barrier_arrived; // [1]
+    // Optional per-phase clock accumulator. NULL disables instrumentation.
+    // Layout: [num_ctas][9] u64 — one row per CTA, 8 phase counters + a
+    // total_idle counter (time spent in grid_barrier and validation tick
+    // stamping outside any tile body).
+    unsigned long long* phase_clocks;
 };
 
 // ── tile_attn_norm: real RMS norm. Reads hidden_states, writes rms_rope. ──
@@ -1124,6 +1129,14 @@ __global__ void scheduled_megakernel(globals_t g, SchedRuntime rt) {
     // means only one tile body runs at a time per CTA, so they can share.
     __shared__ alignas(16) char tile_smem[TILE_SHMEM_BYTES];
 
+    // Per-CTA per-phase clock accumulator (sum of clock64() deltas around
+    // each tile body). Lives in registers; written to gmem at the very end
+    // if instrumentation is enabled (rt.phase_clocks != nullptr). Index 8
+    // is "idle / sync / barrier" — everything outside a tile body.
+    unsigned long long phase_clock[9] = {0,0,0,0,0,0,0,0,0};
+    const bool prof = (rt.phase_clocks != nullptr) && (tid == 0);
+    unsigned long long t_outside = prof ? clock64() : 0ULL;
+
     for (uint32_t w = 0; w < NUM_WAVES; ++w) {
         const uint32_t off = WAVE_CTA_OFFSETS[w * (NUM_CTAS + 1) + cta_id];
         const uint32_t end = WAVE_CTA_OFFSETS[w * (NUM_CTAS + 1) + cta_id + 1];
@@ -1131,6 +1144,11 @@ __global__ void scheduled_megakernel(globals_t g, SchedRuntime rt) {
         // Execute every tile assigned to this CTA in this wave.
         for (uint32_t i = off; i < end; ++i) {
             const TileOp op = WAVE_OPS[i];
+            unsigned long long t_in = 0ULL;
+            if (prof) {
+                t_in = clock64();
+                phase_clock[8] += t_in - t_outside;  // accumulate idle time
+            }
             switch (op.phase) {
                 case PHASE_ATTN_NORM: tile_attn_norm(g, op.layer, op.row); break;
                 case PHASE_QKV:       tile_qkv      (g, op.layer, op.row, op.col, tile_smem); break;
@@ -1144,6 +1162,10 @@ __global__ void scheduled_megakernel(globals_t g, SchedRuntime rt) {
             }
             // Stamp validation tick. Single-threaded.
             __syncthreads();
+            if (prof) {
+                t_outside = clock64();
+                phase_clock[op.phase] += t_outside - t_in;
+            }
             if (tid == 0) {
                 const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;
                 const uint32_t node_id = NODE_ID_FOR_OP[i];
@@ -1154,6 +1176,17 @@ __global__ void scheduled_megakernel(globals_t g, SchedRuntime rt) {
 
         // One grid barrier per wave.
         grid_barrier(rt.barrier_arrived, w);
+    }
+
+    // Flush per-phase clocks to gmem.
+    if (prof) {
+        const unsigned long long t_end = clock64();
+        phase_clock[8] += t_end - t_outside;
+        unsigned long long* row = rt.phase_clocks + (size_t)cta_id * 9;
+        #pragma unroll
+        for (int p = 0; p < 9; ++p) {
+            row[p] = phase_clock[p];
+        }
     }
 }
 
@@ -1190,6 +1223,9 @@ extern "C" void launch_scheduled_megakernel(
     unsigned int* flags,
     unsigned int* tick_counter,
     unsigned int* barrier_arrived,
+    // Optional per-phase clock instrumentation. Pass nullptr to disable.
+    // Layout when set: [num_ctas][9] u64 (8 phases + 1 idle bucket).
+    unsigned long long* phase_clocks,
     cudaStream_t stream) {
     pfl_sched::globals_t g{
         reinterpret_cast<__nv_bfloat16*>(hidden_states),
@@ -1214,7 +1250,7 @@ extern "C" void launch_scheduled_megakernel(
         eps,
         attn_scale,
     };
-    pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived};
+    pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived, phase_clocks};
     dim3 grid(pfl_sched::NUM_CTAS);
     // 256 threads = 8 warps. Warp-shuffle phases (norms, rope, attention)
     // are gated to warp 0 inside their bodies; GEMM phases use all 256

@@ -156,6 +156,7 @@ type LaunchFn = unsafe extern "C" fn(
     flags: *mut u32,
     tick_counter: *mut u32,
     barrier_arrived: *mut u32,
+    phase_clocks: *mut u64,
     stream: *mut std::ffi::c_void,
 );
 
@@ -199,6 +200,7 @@ fn launch_with_buffers(
             flags,
             tick,
             barrier,
+            std::ptr::null_mut(), // phase_clocks (disabled)
             std::ptr::null_mut(),
         );
         result::stream::synchronize(std::ptr::null_mut()).expect("stream sync failed");
@@ -1248,6 +1250,9 @@ fn llama_1b_seq1024_bench() {
     let tick = gpu_alloc_zeros_u32(1);
     let barrier = gpu_alloc_zeros_u32(1);
 
+    // Per-phase clock buffer: [num_ctas][9] u64. Sized once.
+    let phase_clocks_bytes = (kernel_ctas as usize) * 9 * 8;
+    let phase_clocks = gpu_alloc_zeros(phase_clocks_bytes) as *mut u64;
     let launch = || unsafe {
         ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024(
             b.hidden_states as *mut _,
@@ -1274,6 +1279,7 @@ fn llama_1b_seq1024_bench() {
             flags,
             tick,
             barrier,
+            phase_clocks,
             std::ptr::null_mut(),
         );
     };
@@ -1308,6 +1314,52 @@ fn llama_1b_seq1024_bench() {
 
     eprintln!("║  avg over {NUM_ITERS} iters: {avg_ms:8.3} ms             ║");
     eprintln!("║  baseline (existing fused prefill): ~42 ms                  ║");
+    eprintln!("╠════════════════════════════════════════════════════════════╣");
+
+    // Download per-phase clock breakdown from the LAST launch.
+    // (50 launches' worth would average out, but reading once after all
+    //  launches gives us the breakdown of the most recent run.)
+    let mut clocks = vec![0u64; (kernel_ctas as usize) * 9];
+    unsafe {
+        result::memcpy_dtoh_sync(
+            &mut clocks,
+            phase_clocks as cudarc::driver::sys::CUdeviceptr,
+        )
+        .unwrap();
+    }
+    // Sum across CTAs (max would also be informative for tail effect).
+    let mut sum_per_phase = [0u64; 9];
+    let mut max_per_phase = [0u64; 9];
+    for cta in 0..kernel_ctas as usize {
+        for p in 0..9 {
+            let v = clocks[cta * 9 + p];
+            sum_per_phase[p] += v;
+            if v > max_per_phase[p] {
+                max_per_phase[p] = v;
+            }
+        }
+    }
+    let labels = [
+        "attn_norm", "qkv      ", "rope     ", "attention",
+        "o_proj   ", "mlp_norm ", "gate_up  ", "down     ",
+        "idle/sync",
+    ];
+    // L4 SM clock under load: ~1.5 GHz. Convert clocks → ms.
+    let clk_hz = 1.5e9_f64;
+    let total_max: u64 = max_per_phase.iter().sum();
+    eprintln!("║  per-phase MAX clocks per CTA (single launch):              ║");
+    for (i, lbl) in labels.iter().enumerate() {
+        let cycles = max_per_phase[i];
+        let ms = (cycles as f64 / clk_hz) * 1000.0;
+        let pct = if total_max > 0 {
+            (cycles as f64 / total_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        eprintln!("║    {lbl}  {ms:8.2} ms  ({pct:5.1}%)             ║");
+    }
+    let total_ms = (total_max as f64 / clk_hz) * 1000.0;
+    eprintln!("║    total (sum of maxes)   {total_ms:8.2} ms                  ║");
     eprintln!("╚════════════════════════════════════════════════════════════╝");
     eprintln!();
 }

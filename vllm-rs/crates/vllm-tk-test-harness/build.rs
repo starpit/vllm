@@ -200,6 +200,13 @@ fn build_cuda() {
     // Bump this commit deliberately and rerun goldens.
     const FLASHINFER_COMMIT: &str = "08ab45d67705b301ee66e63c6999c934c72dd41c";
 
+    // Vendored FlashInfer instantiation shim — hand-rendered .inc + thin
+    // C++ wrapper around BlockBatchPagedAttentionPersistent::Run. Lives in
+    // crates/vllm-tk-test-harness/csrc/.
+    let harness_csrc = manifest_dir.join("csrc");
+    let shim_cu = harness_csrc.join("flashinfer_attention_shim.cu");
+    cu_files.push(shim_cu.display().to_string());
+
     let mut builder = cudaforge::KernelBuilder::new();
     builder = builder
         .out_dir(&cache_dir)
@@ -208,6 +215,7 @@ fn build_cuda() {
         .include_path(tk_include.display().to_string())
         .include_path(tk_prototype.display().to_string())
         .include_path(tk_csrc.display().to_string())
+        .include_path(harness_csrc.display().to_string())
         .with_git_dependency(
             "flashinfer",
             "https://github.com/flashinfer-ai/flashinfer.git",

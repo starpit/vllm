@@ -170,15 +170,26 @@ struct sm89_globals_t {
 
     // Activation layouts: [1, 1, batch, hidden_dim]
     // sv_bf for per-head / per-hidden vector loads; st_bf for GEMM and store tiles.
+    // Tile types with M∈{16,32,64} × N∈{16,32,64,128} are all declared so the
+    // prefill megakernel's parametric per-warp GEMM accumulator (PFL_GEMM_M in
+    // {16,32,64}) can warp::store into any of them via static dispatch.
+    // Purely additive vs. the decode KVM path — existing {16,*} tile types are
+    // unchanged and decode ops don't reference the new {32,*}/{64,*} shapes.
     using activations_t     = gl<bf16, 1, 1, -1, hidden_dim,
                                  sv_bf<head_dim>, sv_bf<hidden_dim>,
                                  st_bf<matmul_batch_block_size, 64>,  // GEMM A tiles
-                                 st_bf<16, 16>, st_bf<16, 32>, st_bf<16, 64>, st_bf<16, 128>>;
+                                 st_bf<16, 16>, st_bf<16, 32>, st_bf<16, 64>, st_bf<16, 128>,
+                                 st_bf<32, 16>, st_bf<32, 32>, st_bf<32, 64>, st_bf<32, 128>,
+                                 st_bf<64, 16>, st_bf<64, 32>, st_bf<64, 64>, st_bf<64, 128>>;
     using activations_big_t = gl<bf16, 1, 1, -1, intermediate_dim,
                                  st_bf<matmul_batch_block_size, 64>,
-                                 st_bf<16, 16>, st_bf<16, 32>, st_bf<16, 64>, st_bf<16, 128>>;
+                                 st_bf<16, 16>, st_bf<16, 32>, st_bf<16, 64>, st_bf<16, 128>,
+                                 st_bf<32, 16>, st_bf<32, 32>, st_bf<32, 64>, st_bf<32, 128>,
+                                 st_bf<64, 16>, st_bf<64, 32>, st_bf<64, 64>, st_bf<64, 128>>;
     using logits_t          = gl<bf16, 1, 1, -1, -1,
-                                 st_bf<16, 16>, st_bf<16, 32>, st_bf<16, 64>, st_bf<16, 128>>;
+                                 st_bf<16, 16>, st_bf<16, 32>, st_bf<16, 64>, st_bf<16, 128>,
+                                 st_bf<32, 16>, st_bf<32, 32>, st_bf<32, 64>, st_bf<32, 128>,
+                                 st_bf<64, 16>, st_bf<64, 32>, st_bf<64, 64>, st_bf<64, 128>>;
 
     using norm_weights_t    = gl<bf16, 1, 1, -1, hidden_dim, sv_bf<hidden_dim>>;
     using rope_table_t      = gl<float, 1, 1, -1, head_dim,  sv_fl<head_dim>>;

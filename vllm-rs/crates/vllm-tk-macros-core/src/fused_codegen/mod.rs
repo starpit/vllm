@@ -56,6 +56,8 @@ pub fn generate_fused_prefill_v2(dag: &ModelDag, cfg: &FusedPrefillConfig) -> St
         k_dim: cfg.k_dim,
         out_block: cfg.out_block,
         rdpw: d.rdpw,
+        gemm_warp_m: d.gemm_warp_m,
+        gemm_m_subs: d.gemm_m_subs,
     }
     .render()
     .expect("preamble template render");
@@ -328,6 +330,8 @@ pub fn generate_fused_prefill_mcta(
         k_dim: cfg.k_dim,
         out_block: cfg.out_block,
         rdpw: d.rdpw,
+        gemm_warp_m: d.gemm_warp_m,
+        gemm_m_subs: d.gemm_m_subs,
     }
     .render()
     .expect("preamble template render");
@@ -486,6 +490,8 @@ pub fn generate_fused_prefill_mcta_fused_gateup(
         k_dim: cfg.k_dim,
         out_block: cfg.out_block,
         rdpw: d.rdpw,
+        gemm_warp_m: d.gemm_warp_m,
+        gemm_m_subs: d.gemm_m_subs,
     }
     .render()
     .expect("preamble template render");
@@ -623,6 +629,8 @@ pub fn generate_fused_prefill_mcta_warpspec(
         k_dim: cfg.k_dim,
         out_block: cfg.out_block,
         rdpw: d.rdpw,
+        gemm_warp_m: d.gemm_warp_m,
+        gemm_m_subs: d.gemm_m_subs,
     }
     .render()
     .expect("preamble template render");
@@ -679,22 +687,41 @@ pub fn generate_fused_prefill_mcta_warpspec(
 
 /// Generate a polyalgorithm kernel that includes 3 variants and dispatches at runtime.
 ///
-/// Variants (determined by L40S benchmarks on LLaMA 1B):
-/// - `_small` (64row-k128): best for seq ≤ 128
-/// - `_medium` (128row-fused): best for 128 < seq < 1024
-/// - `_large` (128row-wide): best for seq ≥ 1024
+/// Variants (determined by the L4 sweep on LLaMA 1B, rounds 1–5):
+/// - `_small`  = `rows64_k128` for seq ≤ 64 (parity with old baseline at ~10.9 ms @ seq=48).
+///   Classic 64-row CTA with `k_dim=128` (half the K-loop iterations); wins for tiny
+///   sequences where total work is dominated by setup overhead.
+/// - `_medium` = `rows128_gemm16_dual_1stage` for 64 < seq < 256 (1.40× @ seq=128).
+///   Dual-accumulator fused gate+up (single K-loop, A reused across gate/up MMAs)
+///   with a 1-stage pipeline that fits 2 CTAs/SM on L4. 8 warps × 16 rows.
+/// - `_large`  = `rows256_gemm32_dual_1stage` for seq ≥ 256 (1.34–1.43× @ seq=256–1024).
+///   8 warps × 32 rows cooperative, dual-accumulator, 1-stage; 1 CTA/SM with half
+///   the cross-CTA `mcta_barrier` trips of `_medium` plus A reuse in gate+up.
 ///
-/// Each variant is wrapped in its own C++ namespace to isolate PFL_* constants
+/// Each variant is wrapped in its own C++ namespace to isolate `PFL_*` constants
 /// and type aliases. A single `fused_prefill_layer_launch` dispatches based on
 /// `num_prefill_tokens`.
 pub fn generate_fused_prefill_polyalgorithm(dag: &ModelDag) -> String {
     let grid_size = Count(128);
 
-    // Three winning configs (L40S benchmarks, LLaMA 1B, 16 layers)
+    // Three winning configs from the L4 sweep (rounds 1-5):
+    //   Baseline (old polyalgo) at seq=1024: 74.47 ms
+    //     seq=48  : rows64_k128               @ 10.86 ms   (parity with old small)
+    //     seq=128 : rows128_gemm16_dual_1stage @ 12.97 ms  (1.40×)
+    //     seq=256 : rows256_gemm32_dual_1stage @ 16.94 ms  (1.42×)
+    //     seq=512 : rows256_gemm32_dual_1stage @ 30.56 ms  (1.38×)
+    //     seq=1024: rows256_gemm32_dual_1stage @ 55.63 ms  (1.34×)
+    //
+    // _small is the classic rows64_k128 which has k_dim=128 (half the K-loop
+    // iterations, less per-iter barrier overhead — wins for tiny sequences
+    // where total work is dominated by setup). _medium and _large are the
+    // 1-stage dual-accumulator variants (single K-loop over gate+up with A
+    // reuse, 1-stage pipeline letting 2 CTAs/SM on rows128 or hosting a big
+    // 256-row CTA on a single SM slot with half the mcta_barrier trips).
     let variants: Vec<(&str, FusedPrefillConfig)> = vec![
-        ("_small", FusedPrefillConfig::rows64_k128()), // best seq ≤ 128
-        ("_medium", FusedPrefillConfig::rows128()),    // best 128 < seq < 1024
-        ("_large", FusedPrefillConfig::rows128_wide()), // best seq ≥ 1024
+        ("_small", FusedPrefillConfig::rows64_k128()), // seq ≤ 64
+        ("_medium", FusedPrefillConfig::rows128_gemm16_dual_1stage()), // 64 < seq < 256
+        ("_large", FusedPrefillConfig::rows256_gemm32_dual_1stage()), // seq ≥ 256
     ];
 
     let mut out = String::new();
@@ -732,6 +759,8 @@ pub fn generate_fused_prefill_polyalgorithm(dag: &ModelDag) -> String {
             out_block: cfg.out_block,
             rdpw: d.rdpw,
             hdm: d.hdm,
+            gemm_warp_m: d.gemm_warp_m,
+            gemm_m_subs: d.gemm_m_subs,
         }
         .render()
         .expect("preamble_constants template render");
@@ -1165,6 +1194,9 @@ fn render_gemm_gate_up_mcta(
         cooperative,
         num_stages: cfg.num_stages,
         per_warp_b: cfg.per_warp_b,
+        dual_accum: cfg.dual_accum_gate_up,
+        up_b_offset: Bytes(d.b_offset.0 + d.b_size.0),
+        col_fixed: cfg.col_fixed_schedule,
     }
     .render()
     .expect("gemm_gate_up_mcta template render")

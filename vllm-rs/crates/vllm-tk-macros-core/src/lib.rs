@@ -334,6 +334,184 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
                 Count(64),
             ));
         }
+        // ── gemm_warp_m variants (PFL_GEMM_M > 16) ──
+        "v2-mcta-64row-gemm32" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows64_gemm32();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-128row-gemm32" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm32();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-128row-gemm64" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm64();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-128row-gemm32-wide" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm32_wide();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-64row-gemm32-k128" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows64_gemm32_k128();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        // ── Round 2: bigger-CTA / fewer-barrier variants ──
+        "v2-mcta-256row-gemm32" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows256_gemm32();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-256row-gemm64" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows256_gemm64();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-128row-gemm32-3stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm32_3stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        // ── Round 3: occupancy/per-CTA-work probes ──
+        "v2-mcta-192row-gemm32" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows192_gemm32();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-64row-gemm32-nosync" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows64_gemm32_nosync();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-128row-gemm32-narrow" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm32_narrow();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        // ── Round 4: dual-accumulator fused gate+up (A reuse) ──
+        "v2-mcta-128row-gemm16-dual" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm16_dual();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-128row-gemm32-dual" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm32_dual();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        // ── Round 5: 1-stage dual_accum (2 CTAs/SM + A reuse) ──
+        "v2-mcta-128row-gemm16-dual-1stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm16_dual_1stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-128row-gemm32-dual-1stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm32_dual_1stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-256row-gemm32-dual-1stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows256_gemm32_dual_1stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        // ── Round 6: k_dim=128 + narrow variants ──
+        "v2-mcta-128row-gemm32-dual-1stage-k128" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm32_dual_1stage_k128();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-256row-gemm32-dual-1stage-k128" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows256_gemm32_dual_1stage_k128();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-256row-gemm32-dual-1stage-narrow" => {
+            let cfg =
+                fused_codegen::config::FusedPrefillConfig::rows256_gemm32_dual_1stage_narrow();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        // ── Round 7: col-fixed CTA scheduling (L2 reuse on B tiles) ──
+        "v2-mcta-256row-gemm32-dual-1stage-colfix" => {
+            let cfg =
+                fused_codegen::config::FusedPrefillConfig::rows256_gemm32_dual_1stage_colfix();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-128row-gemm16-dual-1stage-colfix" => {
+            let cfg =
+                fused_codegen::config::FusedPrefillConfig::rows128_gemm16_dual_1stage_colfix();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
         other => {
             return Err(format!(
                 "unknown TK_FUSED_PREFILL backend '{other}' \

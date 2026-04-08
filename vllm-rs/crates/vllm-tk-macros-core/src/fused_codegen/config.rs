@@ -8,7 +8,8 @@ use super::units::{Count, Dim, Iters, Tiles};
 pub enum GemmMode {
     /// All warps redundantly compute the same tile; warp 0 stores.
     Redundant,
-    /// Each warp owns 16 rows of the CTA tile; B is shared across warps.
+    /// Each warp owns `gemm_warp_m` rows of the CTA tile; B is shared across warps.
+    /// Requires `cta_rows == num_warps * gemm_warp_m`.
     Cooperative,
     /// Warp 0 is producer (loads only), warps 1..N are consumers (MMA only).
     WarpSpecialized,
@@ -35,6 +36,32 @@ pub struct FusedPrefillConfig {
     pub num_stages: Count,
     /// If true, each warp gets its own B tile — eliminates group::sync from K-loop.
     pub per_warp_b: bool,
+    /// If true, the fused gate+up GEMM phase loads A once per K-iter and
+    /// accumulates into two separate accumulators (gate_acc, up_acc). This
+    /// halves A traffic at the cost of ~33% more gate_up shmem (2 B tiles
+    /// per stage) and ~2x registers (two fp32 accumulators live at once).
+    /// Only meaningful when gemm_warp_m × out_block × 2 ≤ 4096 register cap.
+    pub dual_accum_gate_up: bool,
+    /// If true, the fused gate+up phase uses column-fixed CTA scheduling:
+    /// each CTA owns a contiguous subset of col tiles and iterates over
+    /// row_tiles within each col. Improves L2 reuse on the gate/up B-weight
+    /// tiles (they stay hot across row_tile iterations) at the cost of some
+    /// load imbalance when col_tiles doesn't evenly divide num_ctas.
+    pub col_fixed_schedule: bool,
+    /// Per-warp GEMM accumulator M dimension (must be multiple of 16).
+    ///
+    /// Each warp accumulates a logical tile of size `gemm_warp_m × out_block`,
+    /// issuing `(gemm_warp_m/16) × (out_block/16)` mma.m16n8k16 instructions
+    /// per K-iteration. Larger values increase compute density per shmem load
+    /// (CUTLASS uses 64×64 or 128×64 warp tiles) at the cost of more registers.
+    ///
+    /// Cooperative-mode invariant: `cta_rows == num_warps × gemm_warp_m`.
+    /// Register budget on sm89 (255/thread): `gemm_warp_m × out_block / 32`
+    /// floats for the accumulator, plus a_reg and loop state. Safe envelope:
+    /// `gemm_warp_m × out_block ≤ 4096` (e.g. 64×64, 32×128, 16×256).
+    ///
+    /// This is independent of `PFL_Q_ROWS` (which stays at 16 for attention).
+    pub gemm_warp_m: Dim,
 }
 
 impl FusedPrefillConfig {
@@ -50,6 +77,9 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(2),
             per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
         }
     }
 
@@ -81,6 +111,9 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(2),
             per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
         }
     }
 
@@ -96,6 +129,9 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(2),
             per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
         }
     }
 
@@ -111,6 +147,9 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(2),
             per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
         }
     }
 
@@ -157,6 +196,9 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(2), // 3 stages would need 108KB, L40S limit is 99KB
             per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
         }
     }
 
@@ -174,6 +216,9 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(3),
             per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
         }
     }
 
@@ -198,6 +243,9 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(2),
             per_warp_b: true,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
         }
     }
 
@@ -215,6 +263,9 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(3),
             per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
         }
     }
 
@@ -231,6 +282,472 @@ impl FusedPrefillConfig {
             col_batch: Tiles(1),
             num_stages: Count(2),
             per_warp_b: true,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
+        }
+    }
+
+    // ── gemm_warp_m variants: larger per-warp GEMM accumulators ──
+    //
+    // These variants exploit the PFL_GEMM_M knob to increase per-warp compute
+    // density. Each warp issues (gemm_warp_m/16) × (out_block/16) mma.m16n8k16
+    // instructions per K-iter per B-slice load, vs. 1 × (out_block/16) for the
+    // baseline gemm_warp_m=16. This is the CUTLASS-style warp-tile win:
+    // MMA pipeline saturation via more compute per shmem load.
+    //
+    // Register budget (sm89 hard cap 255/thread): `gemm_warp_m × out_block / 32`
+    // floats for the accumulator alone. All variants below are ≤ 128/thread.
+    //
+    // Cooperative invariant: cta_rows == num_warps × gemm_warp_m.
+
+    /// 64-row CTA, 2 warps × 32, cooperative. Smallest gemm_warp_m=32 variant.
+    /// Reg acc: 2048 floats / 32 = 64 per thread. Shmem: 32KB.
+    pub fn rows64_gemm32() -> Self {
+        Self {
+            cta_rows: Dim(64),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(2),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 128-row CTA, 4 warps × 32, cooperative. Parallelism + compute density.
+    /// Reg acc: 2048 / 32 = 64/thread. Shmem: 48KB.
+    pub fn rows128_gemm32() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 128-row CTA, 2 warps × 64, cooperative. Max per-warp M density.
+    /// Reg acc: 4096 / 32 = 128/thread (at register cap). Shmem: 48KB.
+    /// This is the CUTLASS-shaped warp tile (64×64 logical).
+    pub fn rows128_gemm64() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(2),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(64),
+        }
+    }
+
+    /// 128-row CTA, 4 warps × 32, out_block=128. Wide output tile.
+    /// Reg acc: 4096 / 32 = 128/thread (at cap). Shmem: 64KB.
+    /// More N-direction parallelism; good for large-N GEMMs (gate/up).
+    pub fn rows128_gemm32_wide() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(128),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 64-row CTA, 2 warps × 32, k_dim=128. Bigger K-tile → more work/B-load.
+    /// Reg acc: 2048 / 32 = 64/thread. Shmem: 64KB.
+    pub fn rows64_gemm32_k128() -> Self {
+        Self {
+            cta_rows: Dim(64),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(128),
+            out_block: Dim(64),
+            num_warps: Count(2),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    // ── Round 2: bigger-CTA / less-barrier variants ──
+    //
+    // Round 1 showed rows128_gemm32 beats baseline by 7-24%, with the speedup
+    // partly from 2x occupancy (shmem-small enough to fit 2 CTAs/SM). Round 2
+    // pushes the opposite direction: FEWER bigger CTAs with MORE per-CTA work,
+    // so cross-CTA barriers fire half as often. Shmem is sized to force
+    // 1 CTA/SM (~80KB/stage × 2 stages), giving grid=sm_count.
+
+    /// 256-row CTA, 8 warps × 32, cooperative. 1 CTA/SM on L4 (82KB).
+    /// 2x per-CTA work vs rows128 → 50% fewer mcta_barrier trips.
+    /// Reg acc: 2048 / 32 = 64/thread (plenty of headroom).
+    /// Shmem: 8 × 4096 + 8192 = 40960 per stage × 2 = 81920 bytes.
+    pub fn rows256_gemm32() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 256-row CTA, 4 warps × 64, cooperative. CUTLASS-style 64x64 warp tile.
+    /// 1 CTA/SM (82KB shmem). Reg acc: 4096 / 32 = 128/thread (at cap).
+    /// Shmem: 4 × 8192 + 8192 = 40960 per stage × 2 = 81920 bytes.
+    pub fn rows256_gemm64() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(64),
+        }
+    }
+
+    /// 128-row CTA, 4 warps × 32, 3-stage pipeline. Deeper pipelining on the
+    /// round-1 winner. Shmem: 4 × 4096 + 8192 = 24576 per stage × 3 = 73728.
+    /// Still fits 2 CTAs/SM? 73728 × 2 = 147456 > 82K → only 1 CTA/SM.
+    pub fn rows128_gemm32_3stage() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(3),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    // ── Round 3: occupancy vs per-CTA-work tradeoff probes ──
+
+    /// 192-row CTA, 6 warps × 32. Middle ground between 128 (grid=116) and 256 (grid=58).
+    /// Shmem: 6 × 4096 + 8192 = 32768 per stage × 2 = 65536. 1 CTA/SM.
+    /// Tests whether the sweet spot is between the two round-2 extremes.
+    pub fn rows192_gemm32() -> Self {
+        Self {
+            cta_rows: Dim(192),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(6),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 64-row CTA, 2 warps × 32, per_warp_b. Eliminates K-loop group::sync by
+    /// giving each warp its own B tile copy. Shmem: 2 × (4096 + 8192) × 2 = 49152.
+    /// Tests whether K-loop synchronization is a bottleneck on the round-1 winner
+    /// shape scaled down to fit per-warp-B shmem.
+    pub fn rows64_gemm32_nosync() -> Self {
+        Self {
+            cta_rows: Dim(64),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(2),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: true,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 128-row CTA, 4 warps × 32, out_block=32. Narrower output tile for
+    /// higher occupancy via smaller B shmem. Shmem: 4×4096 + 2048 = 18432 per
+    /// stage × 2 = 36864. Targets 2 CTAs/SM with less per-CTA B shmem contention.
+    pub fn rows128_gemm32_narrow() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(32),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    // ── Round 4: dual-accumulator fused gate+up (A reuse) ──
+
+    /// 128-row CTA, 8 warps × 16, cooperative, dual-accum gate+up.
+    /// A loaded once per K-iter, applied to both gate_acc and up_acc.
+    /// Reg acc: 2 × 16 × 64 / 32 = 64 floats/thread (comfortable).
+    /// Shmem/stage: 8 × 2048 + 2 × 8192 = 32768 × 2-stage = 65536 bytes.
+    /// Occupancy: 1 CTA/SM (shmem-bound).
+    pub fn rows128_gemm16_dual() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
+        }
+    }
+
+    /// 128-row CTA, 4 warps × 32, cooperative, dual-accum gate+up.
+    /// Combines the gemm_warp_m=32 density win with A reuse.
+    /// Reg acc: 2 × 32 × 64 / 32 = 128 floats/thread (at sm89 cap — risky).
+    /// Shmem/stage: 4 × 4096 + 2 × 8192 = 32768 × 2-stage = 65536 bytes.
+    /// Occupancy: 1 CTA/SM.
+    pub fn rows128_gemm32_dual() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(2),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    // ── Round 5: 1-stage dual_accum variants (sacrifice pipeline → 2 CTAs/SM) ──
+
+    /// 128-row CTA, 8 warps × 16, dual-accum, 1-stage. Shmem: 32768 bytes
+    /// total (single stage, no pipelining). Fits 2 CTAs/SM on L4, giving
+    /// occupancy parity with rows128_gemm32 while keeping the A-reuse win.
+    /// Trade-off: no prefetch pipelining — relies on warp-level latency hiding
+    /// across 16 warps/SM.
+    pub fn rows128_gemm16_dual_1stage() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(16),
+        }
+    }
+
+    /// 128-row CTA, 4 warps × 32, dual-accum, 1-stage. Same shmem as
+    /// gemm16_dual_1stage (32768) but compute density from gemm_warp_m=32.
+    pub fn rows128_gemm32_dual_1stage() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 256-row CTA, 8 warps × 32, dual-accum, 1-stage. Shmem: 8×4096 + 2×8192 = 49152.
+    /// Fits 1 CTA/SM (same as rows256_gemm32 but with A reuse).
+    pub fn rows256_gemm32_dual_1stage() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    // ── Round 6: k_dim=128 variants on top of round 5 winners ──
+    //
+    // Doubles K-tile size → halves num_k_iters → halves per-iter loop overhead
+    // (cp.async.wait, group::sync, prefetch bookkeeping). At k_dim=64 the
+    // gate_up phase does 32 iters; at k_dim=128 only 16 iters. Same total
+    // compute, same A/B traffic, fewer barriers in the inner loop.
+
+    /// 128-row CTA, 4 warps × 32, dual-accum, 1-stage, k_dim=128.
+    /// Shmem: 4×8192 + 2×16384 = 65536. 1 CTA/SM.
+    pub fn rows128_gemm32_dual_1stage_k128() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(128),
+            out_block: Dim(64),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 256-row CTA, 8 warps × 32, dual-accum, 1-stage, k_dim=128.
+    /// Shmem: 8×8192 + 2×16384 = 98304. 1 CTA/SM (at the 99KB opt-in ceiling).
+    pub fn rows256_gemm32_dual_1stage_k128() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(128),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 256-row CTA, 8 warps × 32, dual-accum, 1-stage, out_block=32.
+    /// Shmem: 8×4096 + 2×4096 = 40960. 2 CTAs/SM! (same per-CTA work density
+    /// as rows256_gemm32_dual_1stage but with 2x the occupancy.)
+    /// Note: out_block=32 means id_col_tiles = 256 (vs 128 for out_block=64),
+    /// doubling the work-unit count. L4 scheduler has more parallelism to
+    /// work with even at half the per-tile arithmetic intensity.
+    pub fn rows256_gemm32_dual_1stage_narrow() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(32),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    // ── Round 7: col-fixed scheduling for L2 reuse on gate_up B tiles ──
+
+    /// 256-row CTA, 8 warps × 32, dual-accum, 1-stage, col-fixed scheduling.
+    /// Each CTA owns a contiguous set of col tiles and iterates over row_tiles
+    /// within each col. The gate/up B weight for a given col stays hot in L2
+    /// across the CTA's row_tile iterations. Imbalance: at col_tiles=128 and
+    /// num_ctas=58, 12 CTAs get 3 cols × 4 rows = 12 wu each, 46 CTAs get 8 wu.
+    /// Max/avg ratio ≈ 1.36. If the L2-reuse win exceeds 36%, this wins.
+    pub fn rows256_gemm32_dual_1stage_colfix() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: true,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 128-row CTA, 8 warps × 16, dual-accum, 1-stage, col-fixed scheduling.
+    /// Same as rows128_gemm16_dual_1stage but with col-fixed CTA scheduling.
+    /// At rows128 with 2 CTAs/SM → grid=116, L2 reuse in a different regime.
+    pub fn rows128_gemm16_dual_1stage_colfix() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: true,
+            gemm_warp_m: Dim(16),
         }
     }
 }

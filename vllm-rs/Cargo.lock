@@ -7923,6 +7923,7 @@ dependencies = [
  "askama",
  "proc-macro2",
  "quote",
+ "rayon",
  "syn",
 ]
 

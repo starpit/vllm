@@ -29,8 +29,8 @@
     for (int wu = bid; wu < total_work; wu += num_ctas) {
         const int coop_row_tile = wu / col_tiles;
         const int col = wu % col_tiles;
-        const int my_row_tile = coop_row_tile * (rows_per_cta / PFL_Q_ROWS) + wid;
-        const int my_row_valid = (coop_row_tile * rows_per_cta + wid * PFL_Q_ROWS) < q_size;
+        const int my_row_tile = coop_row_tile * (rows_per_cta / PFL_GEMM_M) + wid;
+        const int my_row_valid = (coop_row_tile * rows_per_cta + wid * PFL_GEMM_M) < q_size;
         const int safe_row_tile = my_row_valid ? my_row_tile : 0;
 
         pfl_acc_rt acc;
@@ -67,16 +67,21 @@
             // No group::sync needed — each warp owns its own A and B tiles
             pfl_a_st &a_smem = *my_a_stages[cur];
             pfl_b_st &b_smem = *my_b_stages[cur];
-            rt_bf<16, PFL_K_DIM> a_reg;
+            pfl_a_rt a_reg;
             warp::load(a_reg, a_smem);
             pfl_b_slice_st *b_slices = reinterpret_cast<pfl_b_slice_st*>(&b_smem);
             #pragma unroll
             for (int n = 0; n < PFL_N_TILES; n++) {
                 rt_bf<16, PFL_K_DIM> b_n; pfl_load_b_slice(b_n, b_slices[n]);
-                warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][0], b_n.tiles[0][0], acc.tiles[0][n]);
+                // Reuse each loaded b_n across all M sub-tiles — this is the
+                // compute-density win: PFL_GEMM_M_SUBS MMA chains per shmem B-load.
                 #pragma unroll
-                for (int k = 1; k < a_reg.width; k++)
-                    warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);
+                for (int m_sub = 0; m_sub < PFL_GEMM_M_SUBS; m_sub++) {
+                    warp::mma_ABt_base(acc.tiles[m_sub][n], a_reg.tiles[m_sub][0], b_n.tiles[0][0], acc.tiles[m_sub][n]);
+                    #pragma unroll
+                    for (int k = 1; k < a_reg.width; k++)
+                        warp::mma_ABt_base(acc.tiles[m_sub][n], a_reg.tiles[m_sub][k], b_n.tiles[0][k], acc.tiles[m_sub][n]);
+                }
             }
         }
         if (my_row_valid) {
@@ -102,8 +107,8 @@
     for (int wu = bid; wu < total_work; wu += num_ctas) {
         const int coop_row_tile = wu / col_tiles;
         const int col = wu % col_tiles;
-        const int my_row_tile = coop_row_tile * (rows_per_cta / PFL_Q_ROWS) + wid;
-        const int my_row_valid = (coop_row_tile * rows_per_cta + wid * PFL_Q_ROWS) < q_size;
+        const int my_row_tile = coop_row_tile * (rows_per_cta / PFL_GEMM_M) + wid;
+        const int my_row_valid = (coop_row_tile * rows_per_cta + wid * PFL_GEMM_M) < q_size;
         const int safe_row_tile = my_row_valid ? my_row_tile : 0;
 
         pfl_acc_rt acc;
@@ -141,16 +146,21 @@
             pfl_a_st &a_smem = *my_a_stages[cur];
             pfl_b_st &b_smem = *b_stages[cur];
             group<PFL_NUM_WARPS>::sync(1);
-            rt_bf<16, PFL_K_DIM> a_reg;
+            pfl_a_rt a_reg;
             warp::load(a_reg, a_smem);
             pfl_b_slice_st *b_slices = reinterpret_cast<pfl_b_slice_st*>(&b_smem);
             #pragma unroll
             for (int n = 0; n < PFL_N_TILES; n++) {
                 rt_bf<16, PFL_K_DIM> b_n; pfl_load_b_slice(b_n, b_slices[n]);
-                warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][0], b_n.tiles[0][0], acc.tiles[0][n]);
+                // Reuse each loaded b_n across all M sub-tiles — this is the
+                // compute-density win: PFL_GEMM_M_SUBS MMA chains per shmem B-load.
                 #pragma unroll
-                for (int k = 1; k < a_reg.width; k++)
-                    warp::mma_ABt_base(acc.tiles[0][n], a_reg.tiles[0][k], b_n.tiles[0][k], acc.tiles[0][n]);
+                for (int m_sub = 0; m_sub < PFL_GEMM_M_SUBS; m_sub++) {
+                    warp::mma_ABt_base(acc.tiles[m_sub][n], a_reg.tiles[m_sub][0], b_n.tiles[0][0], acc.tiles[m_sub][n]);
+                    #pragma unroll
+                    for (int k = 1; k < a_reg.width; k++)
+                        warp::mma_ABt_base(acc.tiles[m_sub][n], a_reg.tiles[m_sub][k], b_n.tiles[0][k], acc.tiles[m_sub][n]);
+                }
             }
         }
         if (my_row_valid) {
@@ -212,7 +222,7 @@
             }
             group<PFL_NUM_WARPS>::sync(1);
 
-            rt_bf<16, PFL_K_DIM> a_reg;
+            pfl_a_rt a_reg;
             warp::load(a_reg, *a_stages[cur]);
             pfl_b_st &my_b = *(cur == 0 ? b_tiles_s0[my_b_idx] : b_tiles_s1[my_b_idx]);
             pfl_b_slice_st *b_slices = reinterpret_cast<pfl_b_slice_st*>(&my_b);
@@ -262,7 +272,7 @@
                 asm volatile("cp.async.wait_group 0;\n" ::: "memory");
             }
             group<PFL_NUM_WARPS>::sync(1);
-            rt_bf<16, PFL_K_DIM> a_reg;
+            pfl_a_rt a_reg;
             warp::load(a_reg, *a_stages[cur]);
             pfl_b_slice_st *b_slices = reinterpret_cast<pfl_b_slice_st*>(b_stages[cur]);
             #pragma unroll

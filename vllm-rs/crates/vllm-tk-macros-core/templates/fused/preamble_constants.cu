@@ -11,16 +11,32 @@ constexpr int PFL_ITERS_PER_PAGE = {{ iters_per_page }};
 constexpr int PFL_HEAD_DIM = {{ hdm }};
 constexpr int PFL_SHMEM = {{ total_shmem }};
 constexpr int PFL_KV_TILE_BYTES = {{ kv_tile_bytes }};
+// PFL_Q_ROWS: per-warp M for attention / rope / rmsnorm phases.
+// Fixed at 16 because the attention path uses rt_fl<PFL_Q_ROWS, PFL_HEAD_DIM>
+// with column-vector max/norm reductions — changing this would require
+// restructuring the attention epilogue.
 constexpr int PFL_Q_ROWS = 16;
+
+// PFL_GEMM_M: per-warp M for the main GEMM accumulator. Independent of
+// PFL_Q_ROWS. Valid values are multiples of 16 subject to register budget
+// (gemm_warp_m * out_block <= 4096 floats on sm89). Larger values increase
+// compute density per shmem B-load (CUTLASS-style warp tiles).
+constexpr int PFL_GEMM_M = {{ gemm_warp_m }};
+constexpr int PFL_GEMM_M_SUBS = {{ gemm_m_subs }};  // PFL_GEMM_M / 16
+
 constexpr int PFL_CTA_ROWS = {{ cta_rows }};
 constexpr int PFL_K_DIM = {{ k_dim }};
 constexpr int PFL_OUT_BLOCK = {{ out_block }};
 constexpr int PFL_RDPW = {{ rdpw }};
 constexpr int PFL_N_TILES = PFL_OUT_BLOCK / 16;
 
-using pfl_a_st = st_bf<PFL_Q_ROWS, PFL_K_DIM>;
+// GEMM tile types (use PFL_GEMM_M for the warp M dimension).
+using pfl_a_st = st_bf<PFL_GEMM_M, PFL_K_DIM>;
 using pfl_b_st = st_bf<PFL_OUT_BLOCK, PFL_K_DIM>;
-using pfl_acc_rt = rt_fl<16, PFL_OUT_BLOCK>;
+using pfl_acc_rt = rt_fl<PFL_GEMM_M, PFL_OUT_BLOCK>;
+using pfl_acc_bf_st = rt_bf<PFL_GEMM_M, PFL_OUT_BLOCK>;
+using pfl_a_rt = rt_bf<PFL_GEMM_M, PFL_K_DIM>;
+// B is sliced into 16-row chunks along N (fixed — N-slicing is per mma.m16n8k16).
 using pfl_b_slice_st = st_bf<16, PFL_K_DIM>;
 
 using pfl_q_st  = st_bf<PFL_Q_ROWS, PFL_HEAD_DIM>;

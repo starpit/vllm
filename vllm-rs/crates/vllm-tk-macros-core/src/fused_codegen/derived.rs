@@ -36,6 +36,10 @@ pub struct FusedDerived {
     pub b_offset: Bytes,
     /// Number of col tiles computed in parallel per K-loop pass.
     pub col_batch: Tiles,
+    /// Per-warp GEMM accumulator M dimension (warp tile height in rows).
+    pub gemm_warp_m: Dim,
+    /// Number of 16-row MMA sub-tiles stacked in the M dimension (`gemm_warp_m / 16`).
+    pub gemm_m_subs: Count,
 }
 
 impl FusedDerived {
@@ -58,13 +62,60 @@ impl FusedDerived {
         let id_col_tiles = id / cfg.out_block.0;
         let iters_per_page = cfg.kv_page_size.0 / 16;
 
-        // A tile padded to 32 rows to avoid OOB cp.async writes
-        let a_size = 32 * cfg.k_dim.0 * 2;
+        // ── GEMM warp tile validation ──
+        // Cooperative invariant: cta_rows == num_warps * gemm_warp_m.
+        // Each warp owns `gemm_warp_m` rows; B shared across warps.
+        let gemm_warp_m = cfg.gemm_warp_m.0;
+        assert!(
+            gemm_warp_m > 0 && gemm_warp_m.is_multiple_of(16),
+            "gemm_warp_m must be a positive multiple of 16, got {gemm_warp_m}"
+        );
+        if matches!(cfg.gemm_mode, GemmMode::Cooperative) {
+            assert_eq!(
+                cfg.cta_rows.0,
+                cfg.num_warps.0 * gemm_warp_m,
+                "cooperative GEMM requires cta_rows ({}) == num_warps ({}) * gemm_warp_m ({})",
+                cfg.cta_rows.0,
+                cfg.num_warps.0,
+                gemm_warp_m
+            );
+        }
+        // Register-pressure envelope: accumulator is rt_fl<gemm_warp_m, out_block>,
+        // storing 2 floats per thread per 16x16 sub-tile. With 255-reg cap on sm89
+        // and a_reg + loop state, a safe budget is acc_elements/32 <= 128 → product
+        // gemm_warp_m * out_block <= 4096. Dual-accumulator mode doubles the
+        // accumulator footprint because gate_acc and up_acc live simultaneously.
+        let acc_elements = gemm_warp_m * cfg.out_block.0;
+        let live_acc_elements = if cfg.dual_accum_gate_up {
+            2 * acc_elements
+        } else {
+            acc_elements
+        };
+        assert!(
+            live_acc_elements <= 4096,
+            "live accumulator elements = {} (gemm_warp_m={} * out_block={} * dual={}) exceeds sm89 register budget (max 4096)",
+            live_acc_elements,
+            gemm_warp_m,
+            cfg.out_block.0,
+            cfg.dual_accum_gate_up
+        );
+
+        // A tile padded to max(gemm_warp_m, 32) rows to avoid OOB cp.async writes.
+        // Per-warp A tile is st_bf<gemm_warp_m, k_dim>; legacy 32-row padding is
+        // preserved when gemm_warp_m <= 32 for backward compat with existing variants.
+        let a_rows_padded = if gemm_warp_m >= 32 { gemm_warp_m } else { 32 };
+        let a_size = a_rows_padded * cfg.k_dim.0 * 2;
         let b_size = cfg.out_block.0 * cfg.k_dim.0 * 2;
 
         let col_batch = cfg.col_batch.0;
         let num_stages = cfg.num_stages.0;
         let num_warps = cfg.num_warps.0;
+
+        // Per-stage B-tile multiplier: 2 if the gate+up phase holds both B_gate
+        // and B_up live simultaneously (dual-accum mode), 1 otherwise. The
+        // non-gate-up GEMM phases only ever hold 1 B tile, but they share the
+        // kernel-wide shmem budget, so we size the stage for the worst case.
+        let b_mul = if cfg.dual_accum_gate_up { 2 } else { 1 };
 
         let (stage_size, gemm_shmem, b_offset) = match cfg.gemm_mode {
             GemmMode::Redundant => {
@@ -74,13 +125,14 @@ impl FusedDerived {
             }
             GemmMode::Cooperative if cfg.per_warp_b => {
                 // Each warp owns BOTH its A tile AND its own B tile copy.
-                let per_warp = a_size + b_size;
+                let per_warp = a_size + b_mul * b_size;
                 let ss = num_warps * per_warp;
                 (ss, num_stages * ss, a_size)
             }
             GemmMode::Cooperative => {
-                // Each warp owns its own A tile; B is shared across warps
-                let ss = num_warps * a_size + b_size;
+                // Each warp owns its own A tile; B is shared across warps.
+                // In dual-accum mode, 2 B tiles (gate + up) are held per stage.
+                let ss = num_warps * a_size + b_mul * b_size;
                 let bo = num_warps * a_size;
                 (ss, num_stages * ss, bo)
             }
@@ -132,6 +184,8 @@ impl FusedDerived {
             num_threads: Count(num_warps * 32),
             b_offset: Bytes(b_offset),
             col_batch: Tiles(col_batch),
+            gemm_warp_m: Dim(gemm_warp_m),
+            gemm_m_subs: Count(gemm_warp_m / 16),
         }
     }
 }

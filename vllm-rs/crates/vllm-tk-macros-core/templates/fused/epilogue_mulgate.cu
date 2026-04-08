@@ -1,6 +1,6 @@
-        {   rt_bf<16, PFL_OUT_BLOCK> acc_bf;
+        {   rt_bf<PFL_GEMM_M, PFL_OUT_BLOCK> acc_bf;
             warp::copy(acc_bf, acc);
-            rt_bf<16, PFL_OUT_BLOCK> gate_bf;
+            rt_bf<PFL_GEMM_M, PFL_OUT_BLOCK> gate_bf;
             warp::load(gate_bf, {{ gate_output }}, {{"{"}}{{ row_var }}, col});
             #pragma unroll
             for (int r = 0; r < acc_bf.height; r++)

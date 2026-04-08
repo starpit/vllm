@@ -8,6 +8,8 @@
 //! All functions operate on flat `&[f32]` slices (convert bf16→f32 before calling).
 //! Shape conventions match the TK globals layout.
 
+use rayon::prelude::*;
+
 /// RMS normalization: output = (x / rms(x)) * weight
 ///
 /// - `input`: [hidden_dim] — one row of activations
@@ -38,15 +40,30 @@ pub fn gemm(input: &[f32], weight: &[f32], output: &mut [f32], m: usize, k: usiz
     assert_eq!(weight.len(), n * k);
     assert_eq!(output.len(), m * n);
 
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum = 0.0_f32;
-            for l in 0..k {
-                sum += input[i * k + l] * weight[j * k + l];
+    // Parallelize over output elements in coarse chunks. Works for any (m,n),
+    // including the common golden case m=1 (per-token GEMM calls). Chunk size
+    // targets ~64 tasks total so rayon overhead stays bounded while still
+    // feeding a 16-core box.
+    let total = m * n;
+    let chunk_size = (total / 64).max(1);
+    output
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            let base = chunk_idx * chunk_size;
+            for (local, out) in out_chunk.iter_mut().enumerate() {
+                let idx = base + local;
+                let i = idx / n;
+                let j = idx % n;
+                let in_row = &input[i * k..(i + 1) * k];
+                let w_row = &weight[j * k..(j + 1) * k];
+                let mut sum = 0.0_f32;
+                for l in 0..k {
+                    sum += in_row[l] * w_row[l];
+                }
+                *out = sum;
             }
-            output[i * n + j] = sum;
-        }
-    }
+        });
 }
 
 /// Matrix multiply with residual add: output = (input @ weight^T) + residual

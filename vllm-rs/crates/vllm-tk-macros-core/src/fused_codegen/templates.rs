@@ -37,6 +37,8 @@ pub struct PreambleConstantsCtx {
     pub out_block: Dim,
     pub rdpw: Count,
     pub hdm: Dim,
+    pub gemm_warp_m: Dim,
+    pub gemm_m_subs: Count,
 }
 
 // ── Preamble (combined, used by non-polyalgorithm paths) ────────────────
@@ -61,6 +63,8 @@ pub struct PreambleCtx<'a> {
     pub k_dim: Dim,
     pub out_block: Dim,
     pub rdpw: Count,
+    pub gemm_warp_m: Dim,
+    pub gemm_m_subs: Count,
 }
 
 // ── RMSNorm ─────────────────────────────────────────────────────────────
@@ -253,6 +257,14 @@ pub struct GemmGateUpMctaCtx<'a> {
     pub cooperative: bool,
     pub num_stages: Count,
     pub per_warp_b: bool,
+    /// If true, emit the dual-accumulator branch that loads A once per K-iter
+    /// and computes gate+up in the same loop with two live accumulators.
+    pub dual_accum: bool,
+    /// Offset of the up-weight B tile inside a stage (only used in dual_accum mode).
+    /// gate B sits at `b_offset`; up B sits at `b_offset + b_size`.
+    pub up_b_offset: Bytes,
+    /// If true, use col-fixed CTA scheduling inside the dual_accum branch.
+    pub col_fixed: bool,
 }
 
 #[derive(Template)]

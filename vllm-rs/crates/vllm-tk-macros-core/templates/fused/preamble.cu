@@ -21,16 +21,22 @@ constexpr int PFL_ITERS_PER_PAGE = {{ iters_per_page }};
 constexpr int PFL_HEAD_DIM = {{ hdm }};
 constexpr int PFL_SHMEM = {{ total_shmem }};
 constexpr int PFL_KV_TILE_BYTES = {{ kv_tile_bytes }};
+// PFL_Q_ROWS: per-warp M for attention / rope / rmsnorm (fixed at 16).
 constexpr int PFL_Q_ROWS = 16;
+// PFL_GEMM_M: per-warp M for GEMM accumulator (parametric).
+constexpr int PFL_GEMM_M = {{ gemm_warp_m }};
+constexpr int PFL_GEMM_M_SUBS = {{ gemm_m_subs }};
+
 constexpr int PFL_CTA_ROWS = {{ cta_rows }};
 constexpr int PFL_K_DIM = {{ k_dim }};
 constexpr int PFL_OUT_BLOCK = {{ out_block }};
 constexpr int PFL_RDPW = {{ rdpw }};
 constexpr int PFL_N_TILES = PFL_OUT_BLOCK / 16;
 
-using pfl_a_st = st_bf<PFL_Q_ROWS, PFL_K_DIM>;
+using pfl_a_st = st_bf<PFL_GEMM_M, PFL_K_DIM>;
 using pfl_b_st = st_bf<PFL_OUT_BLOCK, PFL_K_DIM>;
-using pfl_acc_rt = rt_fl<16, PFL_OUT_BLOCK>;
+using pfl_acc_rt = rt_fl<PFL_GEMM_M, PFL_OUT_BLOCK>;
+using pfl_a_rt = rt_bf<PFL_GEMM_M, PFL_K_DIM>;
 using pfl_b_slice_st = st_bf<16, PFL_K_DIM>;
 
 using pfl_q_st  = st_bf<PFL_Q_ROWS, PFL_HEAD_DIM>;

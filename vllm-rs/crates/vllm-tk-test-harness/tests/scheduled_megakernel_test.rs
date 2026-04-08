@@ -1127,3 +1127,90 @@ fn medium_h_final_matches_committed_golden() {
     // at the magnitudes the residual builds up to.
     assert_matches_committed_golden("medium", &h_gpu, 32.0, 0.05);
 }
+
+// ── Phase 4 step 5b: real LLaMA 1B validation ────────────────────────────
+//
+// Real model dims (NL=16, HD=2048, ID=8192, NAH=32, NKH=8, HDM=64), short
+// seq=64 prefill. CPU forward simulator runtime is ~5 minutes (one-time
+// regen). GPU kernel runs in seconds. The committed golden file is the
+// proof that the scheduled megakernel produces correct output at real
+// model dimensions.
+fn llama_1b_seq64_dims() -> LlamaDims {
+    LlamaDims {
+        num_layers: 16,
+        hidden_dim: 2048,
+        intermediate_dim: 8192,
+        num_attn_heads: 32,
+        num_kv_heads: 8,
+        head_dim: 64,
+        seq_len: 64,
+    }
+}
+
+#[test]
+#[ignore = "regenerates the LLaMA 1B golden — runs cpu_forward at real model dims, ~5 minutes"]
+fn regen_llama_1b_seq64_golden() {
+    init_cuda();
+    let dims = llama_1b_seq64_dims();
+    eprintln!(
+        "regen_llama_1b_seq64_golden: cpu_forward at NL={} HD={} ID={} seq={} starting...",
+        dims.num_layers, dims.hidden_dim, dims.intermediate_dim, dims.seq_len
+    );
+    let start = std::time::Instant::now();
+    let (_b, inp) = build_test_buffers(dims, 17);
+    let cpu = cpu_forward(&inp, dims, 1e-5);
+    let elapsed = start.elapsed();
+    eprintln!("cpu_forward done in {:.1}s", elapsed.as_secs_f64());
+    write_golden("llama_3_2_1b_seq64", &cpu.h_final);
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn llama_1b_seq64_h_final_matches_committed_golden() {
+    init_cuda();
+    let dims = llama_1b_seq64_dims();
+    let hd = dims.hidden_dim as usize;
+    let seq = dims.seq_len as usize;
+    let eps: f32 = 1e-5;
+
+    eprintln!(
+        "llama_1b_seq64: NL={}, HD={}, ID={}, seq={} — running scheduled megakernel",
+        dims.num_layers, dims.hidden_dim, dims.intermediate_dim, dims.seq_len
+    );
+    let alloc_start = std::time::Instant::now();
+    let (b, _) = build_test_buffers(dims, 17);
+    eprintln!(
+        "  buffer allocation + upload: {:.2}s",
+        alloc_start.elapsed().as_secs_f64()
+    );
+
+    let kernel_n = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq64_num_nodes() };
+    let kernel_ctas = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq64_num_ctas() };
+    let kernel_waves = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq64_num_waves() };
+    eprintln!(
+        "  kernel: {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs"
+    );
+
+    let launch_start = std::time::Instant::now();
+    let _ = launch_with_buffers(
+        &b,
+        dims,
+        eps,
+        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq64,
+        kernel_n,
+    );
+    eprintln!(
+        "  scheduled megakernel run: {:.3}s",
+        launch_start.elapsed().as_secs_f64()
+    );
+
+    let h_gpu = gpu_download_bf16(b.hidden_states, seq * hd);
+    // Real 1B dims: 16-layer residual cascade through 5 GEMMs each with
+    // K up to 8192. Accumulator magnitudes can reach into the hundreds of
+    // thousands at outlier elements. bf16 ULP at magnitude 870k is ~3400,
+    // and we accumulate ~80 rounding events end-to-end (16 layers × 5
+    // gemms), so worst-case abs noise is ~30k. Empirically the GPU/CPU
+    // delta is ~8k (well under that bound). Use 32k abs tol with 10% rel
+    // tol — the rel tol is the meaningful precision gate.
+    assert_matches_committed_golden("llama_3_2_1b_seq64", &h_gpu, 32768.0, 0.10);
+}

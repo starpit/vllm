@@ -48,9 +48,17 @@ variants {
     // ── Real model variants ──
     //
     // LLaMA 3.2 1B: 16 layers, HD=2048, ID=8192, NAH=32, NKH=8, HDM=64.
-    // Standard prefill seq=1024 bucket. Declared but not yet exercised by
-    // tests — runtime is non-trivial and golden generation is the next
-    // chunk of work.
+    //
+    // seq64: validation bucket. Real model dims, short prefill. Used for
+    // golden-file end-to-end correctness — CPU forward at seq=64 runs in
+    // ~5 minutes (one-time, slow, committed). Smallest "real" variant.
+    llama_3_2_1b_seq64: {
+        NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256, SEQ_LEN=64
+    },
+    // seq1024: production prefill bucket. Used for benchmarking. Compiled
+    // and linked but not validated against a CPU golden (cpu_forward
+    // runtime would be ~80 minutes single-threaded). Cross-validation
+    // against the existing fused prefill kernel is a separate task.
     llama_3_2_1b_seq1024: {
         NL=16, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256, SEQ_LEN=1024
     },

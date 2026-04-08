@@ -184,7 +184,14 @@ fn emit_u32_chunked(out: &mut String, vals: &[u32]) {
 /// Phase 3b-bsp — emit a complete `.cu` file containing the wave program
 /// data + tile bodies (real where implemented, placeholder where not) +
 /// grid-barrier megakernel + extern "C" launch helper.
-pub fn emit_scheduled_megakernel_cu(dag: &ReifiedDag, sched: &WaveSchedule) -> String {
+///
+/// `kv_page_size` is the slots-per-page for the paged KV cache. Pages-per-
+/// layer is derived as ceil(seq_len / kv_page_size).
+pub fn emit_scheduled_megakernel_cu(
+    dag: &ReifiedDag,
+    sched: &WaveSchedule,
+    kv_page_size: u32,
+) -> String {
     let mut out = String::new();
     out.push_str(&emit_wave_schedule_cpp(dag, sched));
     // Bake the model dims as compile-time constants so tile bodies can index
@@ -262,6 +269,19 @@ pub fn emit_scheduled_megakernel_cu(dag: &ReifiedDag, sched: &WaveSchedule) -> S
         dag.tiles.down_col_tile
     )
     .unwrap();
+    let pages_per_layer = dag.dims.seq_len.div_ceil(kv_page_size);
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_KV_PAGE_SIZE  = {};",
+        kv_page_size
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_PAGES_PER_LAYER = {};",
+        pages_per_layer
+    )
+    .unwrap();
     writeln!(out, "}}  // namespace pfl_sched").unwrap();
     out.push_str(KERNEL_BODY);
     out
@@ -282,13 +302,27 @@ namespace pfl_sched {
 // Activation + weight pointers the tile bodies need. Pointers are typed as
 // __nv_bfloat16* because that's what the existing fused kernel uses.
 struct globals_t {
-    // Activations (all bf16, all [seq_len, dim] row-major)
+    // Activations (all bf16, all [seq_len, dim] row-major unless noted)
     __nv_bfloat16* hidden_states;  // [seq, HIDDEN_DIM]
     __nv_bfloat16* rms_rope;       // [seq, HIDDEN_DIM]  — output of attn_norm
     __nv_bfloat16* qkv;            // [seq, qkv_dim]      — output of qkv gemm
+    __nv_bfloat16* q_post_rope;    // [seq, NAH * HEAD_DIM] — Q after rope
     __nv_bfloat16* attn_out;       // [seq, HIDDEN_DIM]
     __nv_bfloat16* rms_gate;       // [seq, HIDDEN_DIM]
     __nv_bfloat16* silu_out;       // [seq, INTERMEDIATE]
+    // Paged KV cache. Layout matches the existing fused prefill kernel:
+    //   [num_layers * pages_per_layer, page_size, num_kv_heads, head_dim]
+    // Indexed as cache[page_idx * page_size * nkh * hd + slot * nkh * hd
+    //                  + kv_head * hd + d]
+    // where page_idx = prefill_kv_indices[token_pos / page_size]
+    //                  + layer * pages_per_layer
+    //       slot     = token_pos % page_size
+    __nv_bfloat16* k_cache;
+    __nv_bfloat16* v_cache;
+    // Block table + indptrs (single sequence for the test fixture).
+    const int32_t* prefill_kv_indices; // [pages_per_layer]
+    const int32_t* prefill_kv_indptr;  // [num_seqs + 1]
+    const int32_t* prefill_qo_indptr;  // [num_seqs + 1]
     // Norm weights, per layer.
     __nv_bfloat16* attn_norm_w;    // [num_layers, HIDDEN_DIM]
     __nv_bfloat16* mlp_norm_w;     // [num_layers, HIDDEN_DIM]
@@ -299,6 +333,7 @@ struct globals_t {
     __nv_bfloat16* up_w;            // [num_layers, INTERMEDIATE, HIDDEN_DIM]
     __nv_bfloat16* down_w;          // [num_layers, HIDDEN_DIM, INTERMEDIATE]
     float          eps;
+    float          attn_scale;     // = 1 / sqrt(HEAD_DIM)
 };
 
 // Per-node validation slot. The kernel writes a monotonic tick into
@@ -664,9 +699,17 @@ extern "C" void launch_scheduled_megakernel(
     void* hidden_states,
     void* rms_rope,
     void* qkv,
+    void* q_post_rope,
     void* attn_out,
     void* rms_gate,
     void* silu_out,
+    // Paged KV cache (bf16)
+    void* k_cache,
+    void* v_cache,
+    // Block table + indptrs (i32)
+    const int* prefill_kv_indices,
+    const int* prefill_kv_indptr,
+    const int* prefill_qo_indptr,
     // Norm weights (bf16, [num_layers, hidden_dim])
     void* attn_norm_w,
     void* mlp_norm_w,
@@ -677,6 +720,7 @@ extern "C" void launch_scheduled_megakernel(
     void* up_w,
     void* down_w,
     float eps,
+    float attn_scale,
     // Validation buffers
     unsigned int* flags,
     unsigned int* tick_counter,
@@ -686,9 +730,15 @@ extern "C" void launch_scheduled_megakernel(
         reinterpret_cast<__nv_bfloat16*>(hidden_states),
         reinterpret_cast<__nv_bfloat16*>(rms_rope),
         reinterpret_cast<__nv_bfloat16*>(qkv),
+        reinterpret_cast<__nv_bfloat16*>(q_post_rope),
         reinterpret_cast<__nv_bfloat16*>(attn_out),
         reinterpret_cast<__nv_bfloat16*>(rms_gate),
         reinterpret_cast<__nv_bfloat16*>(silu_out),
+        reinterpret_cast<__nv_bfloat16*>(k_cache),
+        reinterpret_cast<__nv_bfloat16*>(v_cache),
+        prefill_kv_indices,
+        prefill_kv_indptr,
+        prefill_qo_indptr,
         reinterpret_cast<__nv_bfloat16*>(attn_norm_w),
         reinterpret_cast<__nv_bfloat16*>(mlp_norm_w),
         reinterpret_cast<__nv_bfloat16*>(qkv_w),
@@ -697,6 +747,7 @@ extern "C" void launch_scheduled_megakernel(
         reinterpret_cast<__nv_bfloat16*>(up_w),
         reinterpret_cast<__nv_bfloat16*>(down_w),
         eps,
+        attn_scale,
     };
     pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived};
     dim3 grid(pfl_sched::NUM_CTAS);
@@ -740,7 +791,7 @@ mod tests {
         let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
         let cost = CostModel::from_dag(&dag);
         let sched = partition_into_waves(&dag, 4, &cost, 100);
-        let cpp = emit_scheduled_megakernel_cu(&dag, &sched);
+        let cpp = emit_scheduled_megakernel_cu(&dag, &sched, 16);
 
         assert!(cpp.contains("namespace pfl_sched"));
         assert!(cpp.contains("WAVE_OPS"));

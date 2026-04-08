@@ -13,8 +13,8 @@
 use cudarc::driver::result;
 use half::bf16;
 use vllm_tk_macros_core::{
-    SCHEDULED_PREFILL_TINY_CTAS, reified_dag::ReifiedDag, reified_dag::TileSizes,
-    scheduled_prefill_tiny_dims,
+    SCHEDULED_PREFILL_KV_PAGE_SIZE, SCHEDULED_PREFILL_TINY_CTAS, reified_dag::ReifiedDag,
+    reified_dag::TileSizes, scheduled_prefill_tiny_dims,
 };
 use vllm_tk_test_harness::ffi;
 
@@ -35,6 +35,15 @@ fn gpu_alloc_zeros(bytes: usize) -> u64 {
 
 fn gpu_alloc_zeros_u32(count: usize) -> *mut u32 {
     gpu_alloc_zeros(count * 4) as *mut u32
+}
+
+fn gpu_upload_i32(host: &[i32]) -> u64 {
+    unsafe {
+        let bytes = host.len() * 4;
+        let dptr = result::malloc_sync(bytes).expect("cuMemAlloc failed");
+        result::memcpy_htod_sync(dptr, host).expect("cuMemcpyHtoD failed");
+        dptr
+    }
 }
 
 fn gpu_upload_bf16(host: &[bf16]) -> u64 {
@@ -102,9 +111,15 @@ struct TestBuffers {
     hidden_states: u64,
     rms_rope: u64,
     qkv: u64,
+    q_post_rope: u64,
     attn_out: u64,
     rms_gate: u64,
     silu_out: u64,
+    k_cache: u64,
+    v_cache: u64,
+    prefill_kv_indices: u64,
+    prefill_kv_indptr: u64,
+    prefill_qo_indptr: u64,
     attn_norm_w: u64,
     mlp_norm_w: u64,
     qkv_w: u64,
@@ -118,6 +133,7 @@ fn launch_with_buffers(b: &TestBuffers, eps: f32) -> (Vec<u32>, u32) {
     let dims = scheduled_prefill_tiny_dims();
     let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
     let n = dag.nodes.len();
+    let attn_scale = 1.0 / (dims.head_dim as f32).sqrt();
 
     let flags = gpu_alloc_zeros_u32(n);
     let tick = gpu_alloc_zeros_u32(1);
@@ -128,9 +144,15 @@ fn launch_with_buffers(b: &TestBuffers, eps: f32) -> (Vec<u32>, u32) {
             b.hidden_states as *mut _,
             b.rms_rope as *mut _,
             b.qkv as *mut _,
+            b.q_post_rope as *mut _,
             b.attn_out as *mut _,
             b.rms_gate as *mut _,
             b.silu_out as *mut _,
+            b.k_cache as *mut _,
+            b.v_cache as *mut _,
+            b.prefill_kv_indices as *const i32,
+            b.prefill_kv_indptr as *const i32,
+            b.prefill_qo_indptr as *const i32,
             b.attn_norm_w as *mut _,
             b.mlp_norm_w as *mut _,
             b.qkv_w as *mut _,
@@ -139,6 +161,7 @@ fn launch_with_buffers(b: &TestBuffers, eps: f32) -> (Vec<u32>, u32) {
             b.up_w as *mut _,
             b.down_w as *mut _,
             eps,
+            attn_scale,
             flags,
             tick,
             barrier,
@@ -264,7 +287,17 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
     let seq = dims.seq_len as usize;
     let nl = dims.num_layers as usize;
     let id = dims.intermediate_dim as usize;
-    let qkv_dim = ((dims.num_attn_heads + 2 * dims.num_kv_heads) * dims.head_dim) as usize;
+    let nah = dims.num_attn_heads as usize;
+    let nkh = dims.num_kv_heads as usize;
+    let hdm = dims.head_dim as usize;
+    let qkv_dim = (nah + 2 * nkh) * hdm;
+    // Paged KV cache geometry.
+    let page_size = SCHEDULED_PREFILL_KV_PAGE_SIZE as usize;
+    let pages_per_layer = seq.div_ceil(page_size);
+    let total_pages = nl * pages_per_layer;
+    // bf16, [total_pages, page_size, num_kv_heads, head_dim]
+    let cache_bytes_per_layer = pages_per_layer * page_size * nkh * hdm * 2;
+    let cache_bytes_total = nl * cache_bytes_per_layer;
 
     let h_data = random_bf16(seq * hd, 1, 0.5);
     let an_w_data = random_bf16(nl * hd, 2, 1.0);
@@ -282,13 +315,27 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
     let up_w_data = random_bf16(nl * id * hd, 9, 0.05);
     let down_w_data = random_bf16(nl * hd * id, 10, 0.02);
 
+    // Block table: identity mapping for the single test sequence.
+    let prefill_kv_indices: Vec<i32> = (0..pages_per_layer as i32).collect();
+    // Per-sequence indptrs (one sequence): [0, pages_per_layer], [0, seq].
+    let prefill_kv_indptr_data: Vec<i32> = vec![0, pages_per_layer as i32];
+    let prefill_qo_indptr_data: Vec<i32> = vec![0, seq as i32];
+
+    let _ = total_pages; // (sized via cache_bytes_total)
+
     let b = TestBuffers {
         hidden_states: gpu_upload_bf16(&h_data),
         rms_rope: gpu_alloc_zeros(seq * hd * 2),
         qkv: gpu_alloc_zeros(seq * qkv_dim * 2),
+        q_post_rope: gpu_alloc_zeros(seq * nah * hdm * 2),
         attn_out: gpu_upload_bf16(&attn_out_data),
         rms_gate: gpu_alloc_zeros(seq * hd * 2),
         silu_out: gpu_alloc_zeros(seq * id * 2),
+        k_cache: gpu_alloc_zeros(cache_bytes_total),
+        v_cache: gpu_alloc_zeros(cache_bytes_total),
+        prefill_kv_indices: gpu_upload_i32(&prefill_kv_indices),
+        prefill_kv_indptr: gpu_upload_i32(&prefill_kv_indptr_data),
+        prefill_qo_indptr: gpu_upload_i32(&prefill_qo_indptr_data),
         attn_norm_w: gpu_upload_bf16(&an_w_data),
         mlp_norm_w: gpu_upload_bf16(&mn_w_data),
         qkv_w: gpu_upload_bf16(&qkv_w_data),

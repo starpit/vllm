@@ -340,9 +340,17 @@ pub mod ffi {
             hidden_states: *mut std::ffi::c_void,
             rms_rope: *mut std::ffi::c_void,
             qkv: *mut std::ffi::c_void,
+            q_post_rope: *mut std::ffi::c_void,
             attn_out: *mut std::ffi::c_void,
             rms_gate: *mut std::ffi::c_void,
             silu_out: *mut std::ffi::c_void,
+            // Paged KV cache
+            k_cache: *mut std::ffi::c_void,
+            v_cache: *mut std::ffi::c_void,
+            // Block table + indptrs (i32 device pointers)
+            prefill_kv_indices: *const i32,
+            prefill_kv_indptr: *const i32,
+            prefill_qo_indptr: *const i32,
             // Norm weights
             attn_norm_w: *mut std::ffi::c_void,
             mlp_norm_w: *mut std::ffi::c_void,
@@ -353,6 +361,7 @@ pub mod ffi {
             up_w: *mut std::ffi::c_void,
             down_w: *mut std::ffi::c_void,
             eps: f32,
+            attn_scale: f32,
             // Validation buffers
             flags: *mut u32,
             tick_counter: *mut u32,

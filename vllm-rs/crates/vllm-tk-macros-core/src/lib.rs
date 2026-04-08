@@ -637,6 +637,10 @@ pub fn scheduled_prefill_tiny_dims() -> reified_dag::LlamaDims {
 /// CTA pool size used for the tiny scheduled megakernel test fixture.
 pub const SCHEDULED_PREFILL_TINY_CTAS: u32 = 4;
 
+/// KV cache page size (slots per page) for the scheduled megakernel.
+/// Matches the existing fused prefill kernel's PFL_KV_PAGE_SIZE.
+pub const SCHEDULED_PREFILL_KV_PAGE_SIZE: u32 = 16;
+
 pub fn generate_scheduled_prefill_tiny() -> String {
     use crate::reified_dag::{ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
@@ -648,7 +652,7 @@ pub fn generate_scheduled_prefill_tiny() -> String {
     // Use a small CTA pool for the tiny model — keeps the launch fast.
     // Barrier cost ~100 mma units (≈1 µs at 1.5 GHz) is the L4 ballpark.
     let sched = partition_into_waves(&dag, SCHEDULED_PREFILL_TINY_CTAS, &cost, 100);
-    emit_scheduled_megakernel_cu(&dag, &sched)
+    emit_scheduled_megakernel_cu(&dag, &sched, SCHEDULED_PREFILL_KV_PAGE_SIZE)
 }
 
 /// Generate a debug variant of the decode kernel that syncs and writes a

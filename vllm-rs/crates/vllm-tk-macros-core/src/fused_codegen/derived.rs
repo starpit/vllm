@@ -153,6 +153,20 @@ impl FusedDerived {
             }
         };
 
+        // CUTLASS phases need a SharedStorage region whose size is determined
+        // at C++ compile time. For ThreadblockShape<256,128,32> with 3 stages
+        // and bf16, the mainloop SharedStorage is roughly:
+        //   3 * (256*32 + 32*128) * 2 bytes = 3 * 12288 = ~36 KB
+        // Plus epilogue: ~32 KB. Union: max(mainloop, epilogue) ≈ 36 KB.
+        // We reserve 64 KB to be safe; the static_assert in preamble verifies
+        // the actual size fits. Larger reservations REDUCE L1 cache (Ada
+        // shmem+L1 are unified-pool) and slow down our hand-rolled phases.
+        let cutlass_shmem = if cfg.cutlass_down_proj || cfg.cutlass_qkv_o {
+            80 * 1024
+        } else {
+            0
+        };
+        let gemm_shmem = gemm_shmem.max(cutlass_shmem);
         let rmsnorm_shmem = hd * 4 + num_warps * 4;
         let kv_tile_bytes = cfg.kv_page_size.0 * hdm * 2;
         let attn_shmem = kv_tile_bytes * 2 * 2;

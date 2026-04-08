@@ -178,6 +178,21 @@ pub struct KernelCtx<'a> {
 // ── Multi-CTA templates ────────────────────────────────────────────────
 
 #[derive(Template)]
+#[template(path = "fused/gemm_cutlass_mcta.cu", escape = "none")]
+pub struct GemmCutlassMctaCtx<'a> {
+    pub phase_comment: &'a str,
+    pub a_ptr_expr: &'a str,
+    pub b_ptr_expr: &'a str,
+    pub out_ptr_expr: &'a str,
+    pub m_dim: &'a str,
+    pub k_dim_value: usize,
+    pub n_dim_value: usize,
+    /// LinearCombination beta value as a literal (e.g. "1.0f" for residual,
+    /// "0.0f" for plain store).
+    pub beta_literal: &'a str,
+}
+
+#[derive(Template)]
 #[template(path = "fused/gemm_mcta.cu", escape = "none")]
 pub struct GemmMctaCtx<'a> {
     pub kstripe: bool,

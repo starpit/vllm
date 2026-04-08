@@ -856,7 +856,23 @@ fn build_fused_gateup_phases(
         gemm_warp_m: 16,
         out_block: 32,
     };
-    let qkv_phase = if cfg.phase_opt {
+    let qkv_phase = if cfg.cutlass_qkv_o {
+        // CUTLASS path. QKV writes to silu_out (used as scratch). No residual,
+        // but the LinearCombination(α=1, β=0) form gives plain "store".
+        // For now we use the same residual-add template path but with the
+        // "C" iterator pointing at silu_out and beta=0 — this lets us reuse
+        // gemm_cutlass_mcta.cu without forking for store-only.
+        render_gemm_cutlass_mcta(
+            "QKV GEMM (CUTLASS)",
+            "g.rms_rope_intermediates.raw_ptr",
+            "(g.qkv_weights.raw_ptr + (size_t)layer * (size_t)g.qkv_weights.cols() * (size_t)g.hidden_dim)",
+            "g.silu_out.raw_ptr",
+            "q_size",
+            d.hd.0,      // K = HD = 2048
+            d.qkv_dim.0, // N = QKV_DIM = 2304
+            "0.0f",      // beta=0: pure store, no residual
+        )
+    } else if cfg.phase_opt {
         render_gemm_mcta_override(
             dag,
             cfg,
@@ -878,7 +894,18 @@ fn build_fused_gateup_phases(
             EpilogueKind::Store("g.silu_out"),
         )
     };
-    let o_phase = if cfg.phase_opt {
+    let o_phase = if cfg.cutlass_qkv_o {
+        render_gemm_cutlass_mcta(
+            "o_proj + residual (CUTLASS)",
+            "g.attn_out.raw_ptr",
+            "(g.o_weights.raw_ptr + (size_t)layer * (size_t)g.hidden_dim * (size_t)g.hidden_dim)",
+            "g.hidden_states.raw_ptr",
+            "q_size",
+            d.hd.0, // K = HD
+            d.hd.0, // N = HD
+            "1.0f", // beta=1: residual add
+        )
+    } else if cfg.phase_opt {
         render_gemm_mcta_override(
             dag,
             cfg,
@@ -900,7 +927,23 @@ fn build_fused_gateup_phases(
             EpilogueKind::ResidualAdd("g.hidden_states"),
         )
     };
-    let down_phase = if cfg.phase_opt {
+    let down_phase = if cfg.cutlass_down_proj {
+        // CUTLASS device-side ThreadblockMma. The hand-rolled cooperative
+        // GEMM is bypassed for this phase. Output is written via a manual
+        // residual-add epilogue inside the template body.
+        render_gemm_cutlass_mcta(
+            "down_proj + residual (CUTLASS)",
+            // A = silu_out [seq, ID]
+            "g.silu_out.raw_ptr",
+            // B = down_weights[layer] [HD, ID]. Per-layer offset added at runtime.
+            "(g.down_weights.raw_ptr + (size_t)layer * (size_t)g.hidden_dim * (size_t)g.intermediate_dim)",
+            "g.hidden_states.raw_ptr",
+            "q_size",
+            d.id.0, // K = intermediate_dim
+            d.hd.0, // N = hidden_dim
+            "1.0f", // beta=1: residual add
+        )
+    } else if cfg.phase_opt {
         render_gemm_mcta_override(
             dag,
             cfg,
@@ -1148,6 +1191,39 @@ fn render_gemm_mcta(
     }
     .render()
     .expect("gemm_mcta template render")
+}
+
+/// Render a CUTLASS-backed GEMM phase. Replaces the hand-rolled cooperative
+/// GEMM with `cutlass::gemm::threadblock::ThreadblockMma` instantiated against
+/// our shmem region. Currently used for `down_proj` only as a proof-of-concept
+/// to close the cuBLAS gap on the worst-performing single GEMM phase.
+///
+/// `m_dim_expr`: C++ expression evaluated at runtime for the M extent
+/// (e.g. "q_size" for our prefill kernel).
+/// `k_dim_value` / `n_dim_value`: compile-time K and N values from the model dim.
+#[allow(clippy::too_many_arguments)]
+fn render_gemm_cutlass_mcta(
+    phase_comment: &str,
+    a_ptr_expr: &str,
+    b_ptr_expr: &str,
+    out_ptr_expr: &str,
+    m_dim_expr: &str,
+    k_dim_value: usize,
+    n_dim_value: usize,
+    beta_literal: &str,
+) -> String {
+    GemmCutlassMctaCtx {
+        phase_comment,
+        a_ptr_expr,
+        b_ptr_expr,
+        out_ptr_expr,
+        m_dim: m_dim_expr,
+        k_dim_value,
+        n_dim_value,
+        beta_literal,
+    }
+    .render()
+    .expect("gemm_cutlass_mcta template render")
 }
 
 /// Render a GEMM phase with a per-phase tile override applied. The kernel-wide

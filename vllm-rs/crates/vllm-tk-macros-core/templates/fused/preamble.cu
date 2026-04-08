@@ -10,9 +10,76 @@
 
 #include "llama_sm89.cuh"
 
+// CUTLASS device-side GEMM primitives. Include-only here; whether any
+// CUTLASS code is actually emitted depends on per-variant phase templates.
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/arch/mma.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/threadblock/default_mma.h>
+#include <cutlass/layout/matrix.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/threadblock/default_epilogue_tensor_op.h>
+
 using namespace kittens;
 using namespace kittens::prototype::vm;
 using globals = llama_sm89_globals;
+
+// ── CUTLASS type instantiation (mirrors preamble_header.cu) ──
+namespace pfl_cutlass {
+    using ElementA       = cutlass::bfloat16_t;
+    using ElementB       = cutlass::bfloat16_t;
+    using ElementAccum   = float;
+    using LayoutA        = cutlass::layout::RowMajor;
+    using LayoutB        = cutlass::layout::ColumnMajor;
+    using LayoutC        = cutlass::layout::RowMajor;
+
+    using ThreadblockShape = cutlass::gemm::GemmShape<256, 128, 32>;
+    using WarpShape        = cutlass::gemm::GemmShape<64, 64, 32>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using DefaultMmaT = cutlass::gemm::threadblock::DefaultMma<
+        ElementA, LayoutA, /*kAlignmentA=*/8,
+        ElementB, LayoutB, /*kAlignmentB=*/8,
+        ElementAccum, LayoutC,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        ThreadblockShape, WarpShape, InstructionShape,
+        /*Stages=*/3,
+        cutlass::arch::OpMultiplyAdd>;
+
+    using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;
+    using IteratorA      = typename DefaultMmaT::IteratorA;
+    using IteratorB      = typename DefaultMmaT::IteratorB;
+    using MmaSharedStorage = typename ThreadblockMma::SharedStorage;
+
+    // Epilogue: residual add via LinearCombination(alpha=1, beta=1).
+    // ElementOutput = bf16, vec width = 8, accum = fp32, compute = fp32.
+    using ElementOutput = cutlass::bfloat16_t;
+    static constexpr int kEpilogueElementsPerAccess = 8;
+    using OutputOpT = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput,
+        kEpilogueElementsPerAccess,
+        ElementAccum,
+        ElementAccum>;
+
+    using DefaultEpilogueT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape,
+        typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1,
+        OutputOpT,
+        kEpilogueElementsPerAccess>;
+
+    using Epilogue            = typename DefaultEpilogueT::Epilogue;
+    using OutputTileIterator  = typename DefaultEpilogueT::OutputTileIterator;
+    using EpilogueSharedStorage = typename Epilogue::SharedStorage;
+
+    // Total shmem for the cutlass GEMM phase: union of mainloop and epilogue.
+    union SharedStorage {
+        MmaSharedStorage main_loop;
+        EpilogueSharedStorage epilogue;
+    };
+}  // namespace pfl_cutlass
 
 constexpr int PFL_NUM_WARPS = {{ num_warps }};
 constexpr int PFL_GQA_RATIO = {{ gqa_ratio }};

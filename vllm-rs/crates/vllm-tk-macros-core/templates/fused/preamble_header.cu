@@ -18,6 +18,8 @@
 #include <cutlass/gemm/gemm.h>
 #include <cutlass/gemm/threadblock/default_mma.h>
 #include <cutlass/layout/matrix.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/threadblock/default_epilogue_tensor_op.h>
 
 // ── CUTLASS type definitions for our GEMM phases ──
 // These are SIZE-CHECKED at compile time; they don't emit any code unless a
@@ -56,16 +58,39 @@ namespace pfl_cutlass {
     using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;
     using IteratorA      = typename DefaultMmaT::IteratorA;
     using IteratorB      = typename DefaultMmaT::IteratorB;
-    using SharedStorage  = typename ThreadblockMma::SharedStorage;
+    using MmaSharedStorage = typename ThreadblockMma::SharedStorage;
 
-    // Static checks: this region of CUTLASS shared storage must fit in our
-    // dynamic shmem budget (~99KB on sm89 with opt-in). If this static_assert
-    // fires, we picked too big a Threadblock/Stages combination.
-    static_assert(sizeof(SharedStorage) <= 99 * 1024,
-                  "CUTLASS SharedStorage exceeds sm89 dynamic shmem budget");
+    // Epilogue (residual add via LinearCombination(alpha=1, beta=1)).
+    using ElementOutput = cutlass::bfloat16_t;
+    static constexpr int kEpilogueElementsPerAccess = 8;
+    using OutputOpT = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput,
+        kEpilogueElementsPerAccess,
+        ElementAccum,
+        ElementAccum>;
 
-    // Sanity: the Mma's WarpCount * 32 must equal our launch thread count.
-    // Our megakernel runs with 256 threads (8 warps).
+    using DefaultEpilogueT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape,
+        typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1,
+        OutputOpT,
+        kEpilogueElementsPerAccess>;
+
+    using Epilogue              = typename DefaultEpilogueT::Epilogue;
+    using OutputTileIterator    = typename DefaultEpilogueT::OutputTileIterator;
+    using EpilogueSharedStorage = typename Epilogue::SharedStorage;
+
+    union SharedStorage {
+        MmaSharedStorage main_loop;
+        EpilogueSharedStorage epilogue;
+    };
+
+    static_assert(sizeof(SharedStorage) <= 80 * 1024,
+                  "CUTLASS SharedStorage exceeds 80KB budget");
+    // Print the actual size at compile time via _Static_assert with the
+    // value embedded in the message (commented out — uncomment to inspect):
+    // static_assert(sizeof(SharedStorage) == 0, "see size");
+
     static constexpr int kCutlassThreads = ThreadblockMma::WarpCount::kCount * 32;
     static_assert(kCutlassThreads == 256,
                   "CUTLASS ThreadblockMma WarpCount must equal 8 (256 threads)");

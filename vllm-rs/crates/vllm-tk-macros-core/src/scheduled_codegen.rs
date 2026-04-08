@@ -408,21 +408,44 @@ __device__ __forceinline__ void tile_attn_norm(const globals_t& g, uint32_t laye
     }
 }
 
-// ── tile_qkv: tensor-core GEMM. M=ROW_TILE, N=QKV_COL_TILE, K=HIDDEN_DIM. ──
+// K-block size for shmem-staged wmma. The K dim is processed in chunks of
+// this size; each chunk is loaded gmem→shmem cooperatively (256 threads)
+// then consumed by 8 warps × (K_BLOCK/WMMA_K) wmma calls. Larger blocks
+// amortize the gmem load cost over more compute but cost more shmem.
+constexpr uint32_t SHMEM_GEMM_K_BLOCK = 32;
+
+// Single CTA-wide shmem arena reused across tile bodies. Wave scheduling
+// guarantees only one tile body runs at a time per CTA, so all tile
+// bodies that need shmem share this arena and partition it locally.
 //
-// Output:  qkv[row*M..row*M+M, col*N..col*N+N]   ([seq, qkv_dim] row-major)
-// A:       rms_rope[row*M..row*M+M, 0..K]        ([seq, hidden_dim] row-major)
-// B:       qkv_w[layer, col*N..col*N+N, 0..K]    ([num_layers, qkv_dim, hidden_dim] row-major)
+// Sized for the worst case (tile_gate_up with two B operands + two
+// accumulator scratches):
+//   a_smem        = M × KB × 2 = 16 × 32 × 2  = 1024 B
+//   b_gate_smem   = N × KB × 2 = 128 × 32 × 2 = 8192 B
+//   b_up_smem     = N × KB × 2 = 128 × 32 × 2 = 8192 B
+//   gate_scratch  = NW × WMMA_M × WMMA_N × 4   = 8192 B
+//   up_scratch    = NW × WMMA_M × WMMA_N × 4   = 8192 B
+//   total                                       = 33792 B
+// Rounded up to 36 KiB for headroom. Still well within the 48 KiB
+// default sm89 carveout.
+constexpr uint32_t TILE_SHMEM_BYTES = 36 * 1024;
+
+// ── tile_qkv: shmem-staged tensor-core GEMM. ──
 //
-// Each warp owns one 16x16 sub-tile of the output. With M=16 and 8 warps,
-// the 8 warps cover the full N dimension by partitioning N into 8 slices
-// of width 16 each (so this requires N == 8 * 16 = 128). Per-warp K loop
-// issues wmma::mma_sync(16,16,16) once per K=16 step, fp32 accumulator.
+// M=ROW_TILE=16, N=QKV_COL_TILE=128, K=HIDDEN_DIM.
 //
-// Output is staged through shared memory as fp32 (one 16x16 slice per
-// warp), then all 256 threads cooperatively convert to bf16 and write to
-// gmem.
-__device__ __forceinline__ void tile_qkv(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
+// Each K_BLOCK iteration:
+//   1. Cooperative gmem→shmem load of A[0:M, k:k+K_BLOCK] and
+//      B[col_start:col_start+N, k:k+K_BLOCK] (256 threads, coalesced).
+//   2. Each warp does K_BLOCK/16 wmma calls reading from shmem on its
+//      16-col slice of the output.
+//
+// fp32 accumulator stays in registers across the full K. Per-warp 16×16
+// fp32 scratch in shmem stages the bf16 writeback. All shmem comes from
+// the kernel-scope arena passed via `tile_smem`.
+__device__ __forceinline__ void tile_qkv(
+    const globals_t& g, uint32_t layer, uint32_t row, uint32_t col, char* tile_smem)
+{
     using namespace nvcuda::wmma;
     constexpr uint32_t M            = MODEL_ROW_TILE;
     constexpr uint32_t K            = MODEL_HIDDEN_DIM;
@@ -433,9 +456,11 @@ __device__ __forceinline__ void tile_qkv(const globals_t& g, uint32_t layer, uin
     constexpr uint32_t WMMA_K       = 16;
     constexpr uint32_t N_WARPS      = 8;
     constexpr uint32_t N_PER_WARP   = N / N_WARPS;
-    static_assert(M == WMMA_M, "tile_qkv assumes M == 16 (wmma frag M)");
-    static_assert(N % (WMMA_N * N_WARPS) == 0, "tile_qkv: N must be 8*16=128 multiple");
-    static_assert(K % WMMA_K == 0, "tile_qkv: K must be a multiple of 16");
+    constexpr uint32_t KB           = SHMEM_GEMM_K_BLOCK;
+    static_assert(M == WMMA_M, "tile_qkv assumes M == 16");
+    static_assert(N % (WMMA_N * N_WARPS) == 0, "tile_qkv: N must be 8*16 multiple");
+    static_assert(K % KB == 0, "tile_qkv: K must be a multiple of KB");
+    static_assert(KB % WMMA_K == 0, "tile_qkv: KB must be a multiple of 16");
     static_assert(N_PER_WARP == 16, "tile_qkv: each warp owns one 16-col slice");
 
     const uint32_t row_start = row * M;
@@ -443,15 +468,19 @@ __device__ __forceinline__ void tile_qkv(const globals_t& g, uint32_t layer, uin
     if (row_start >= MODEL_SEQ_LEN) return;
 
     const __nv_bfloat16* A_base = g.rms_rope + (size_t)row_start * K;
-    const __nv_bfloat16* B_base = g.qkv_w + (size_t)layer * QKV_DIM_FULL * K;
+    const __nv_bfloat16* B_base = g.qkv_w
+        + (size_t)layer * QKV_DIM_FULL * K
+        + (size_t)col_start * K;
     __nv_bfloat16* C_base = g.qkv + (size_t)row_start * QKV_DIM_FULL + col_start;
 
     const uint32_t warp_id = threadIdx.x / 32;
     const uint32_t n_warp_start = warp_id * N_PER_WARP;
+    const uint32_t lane = threadIdx.x;
 
-    // Per-warp 16x16 fp32 scratch in shmem so the cooperative writeback
-    // converts to bf16 with 256-thread granularity.
-    __shared__ float qkv_scratch[N_WARPS * WMMA_M * WMMA_N];
+    // Partition the kernel-scope shmem arena.
+    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(tile_smem);
+    __nv_bfloat16* b_smem = a_smem + M * KB;
+    float* qkv_scratch = reinterpret_cast<float*>(b_smem + N * KB);
     float* my_scratch = qkv_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
 
     fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
@@ -459,22 +488,39 @@ __device__ __forceinline__ void tile_qkv(const globals_t& g, uint32_t layer, uin
     fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
     fill_fragment(c_frag, 0.0f);
 
-    // K loop. A is row-major [M, K] with stride K. B is the weight stored as
-    // [N, K] row-major in memory which equals [K, N] col-major; col-major
-    // load with ldm = K reads the (k_block, n_warp_start) slice.
     #pragma unroll 1
-    for (uint32_t k = 0; k < K; k += WMMA_K) {
-        load_matrix_sync(a_frag, A_base + k, K);
-        load_matrix_sync(b_frag, B_base + (size_t)(col_start + n_warp_start) * K + k, K);
-        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    for (uint32_t k_outer = 0; k_outer < K; k_outer += KB) {
+        // ── Cooperative gmem→shmem load of A[0:M, k_outer:k_outer+KB] ──
+        // M*KB elements, 256 threads → (M*KB/256) per thread.
+        for (uint32_t i = lane; i < M * KB; i += 256) {
+            const uint32_t m = i / KB;
+            const uint32_t k_local = i % KB;
+            a_smem[m * KB + k_local] = A_base[m * K + k_outer + k_local];
+        }
+        // ── Cooperative gmem→shmem load of B[col_start:col_start+N, k_outer:k_outer+KB] ──
+        for (uint32_t i = lane; i < N * KB; i += 256) {
+            const uint32_t n = i / KB;
+            const uint32_t k_local = i % KB;
+            b_smem[n * KB + k_local] = B_base[(size_t)n * K + k_outer + k_local];
+        }
+        __syncthreads();
+
+        // ── wmma over the K_BLOCK from shmem ──
+        #pragma unroll
+        for (uint32_t k_inner = 0; k_inner < KB; k_inner += WMMA_K) {
+            load_matrix_sync(a_frag, a_smem + k_inner, KB);
+            load_matrix_sync(b_frag,
+                             b_smem + (size_t)n_warp_start * KB + k_inner,
+                             KB);
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        __syncthreads();
     }
 
-    // Stage fp32 accumulator to per-warp shmem slice (warp-synchronous).
     store_matrix_sync(my_scratch, c_frag, WMMA_N, mem_row_major);
     __syncthreads();
 
     // Cooperative bf16 writeback across all 256 threads.
-    const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
     for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
@@ -716,14 +762,16 @@ __device__ __forceinline__ void tile_attention(const globals_t& g, uint32_t laye
     }
 }
 
-// ── tile_o_proj: tensor-core GEMM + residual.
+// ── tile_o_proj: shmem-staged tensor-core GEMM + residual. ──
 //
 // hidden_states[m,n] += sum_k attn_out[m,k] * o_w[layer, n, k]
 //
-// Same wmma structure as tile_qkv. The residual seed is folded into the
-// fp32 scratch during the cooperative writeback (read existing bf16 C
-// value, add the wmma fp32 result, store as bf16).
-__device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
+// Same shmem-staged wmma structure as tile_qkv. The residual seed is
+// folded in during the cooperative writeback (read existing bf16, add
+// the wmma fp32 result, store bf16).
+__device__ __forceinline__ void tile_o_proj(
+    const globals_t& g, uint32_t layer, uint32_t row, uint32_t col, char* tile_smem)
+{
     using namespace nvcuda::wmma;
     constexpr uint32_t M          = MODEL_ROW_TILE;
     constexpr uint32_t K          = MODEL_HIDDEN_DIM;
@@ -734,9 +782,11 @@ __device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, 
     constexpr uint32_t WMMA_K     = 16;
     constexpr uint32_t N_WARPS    = 8;
     constexpr uint32_t N_PER_WARP = N / N_WARPS;
+    constexpr uint32_t KB         = SHMEM_GEMM_K_BLOCK;
     static_assert(M == WMMA_M, "tile_o_proj assumes M == 16");
     static_assert(N % (WMMA_N * N_WARPS) == 0, "tile_o_proj: N must be 8*16 multiple");
-    static_assert(K % WMMA_K == 0, "tile_o_proj: K must be a multiple of 16");
+    static_assert(K % KB == 0, "tile_o_proj: K must be a multiple of KB");
+    static_assert(KB % WMMA_K == 0, "tile_o_proj: KB must be a multiple of 16");
     static_assert(N_PER_WARP == 16, "tile_o_proj: each warp owns one 16-col slice");
 
     const uint32_t row_start = row * M;
@@ -744,13 +794,18 @@ __device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, 
     if (row_start >= MODEL_SEQ_LEN) return;
 
     const __nv_bfloat16* A_base = g.attn_out + (size_t)row_start * K;
-    const __nv_bfloat16* B_base = g.o_w + (size_t)layer * HD_FULL * K;
+    const __nv_bfloat16* B_base = g.o_w
+        + (size_t)layer * HD_FULL * K
+        + (size_t)col_start * K;
     __nv_bfloat16* C_base = g.hidden_states + (size_t)row_start * HD_FULL + col_start;
 
     const uint32_t warp_id = threadIdx.x / 32;
     const uint32_t n_warp_start = warp_id * N_PER_WARP;
+    const uint32_t lane = threadIdx.x;
 
-    __shared__ float oproj_scratch[N_WARPS * WMMA_M * WMMA_N];
+    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(tile_smem);
+    __nv_bfloat16* b_smem = a_smem + M * KB;
+    float* oproj_scratch = reinterpret_cast<float*>(b_smem + N * KB);
     float* my_scratch = oproj_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
 
     fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
@@ -759,18 +814,34 @@ __device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, 
     fill_fragment(c_frag, 0.0f);
 
     #pragma unroll 1
-    for (uint32_t k = 0; k < K; k += WMMA_K) {
-        load_matrix_sync(a_frag, A_base + k, K);
-        load_matrix_sync(b_frag, B_base + (size_t)(col_start + n_warp_start) * K + k, K);
-        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    for (uint32_t k_outer = 0; k_outer < K; k_outer += KB) {
+        for (uint32_t i = lane; i < M * KB; i += 256) {
+            const uint32_t m = i / KB;
+            const uint32_t k_local = i % KB;
+            a_smem[m * KB + k_local] = A_base[m * K + k_outer + k_local];
+        }
+        for (uint32_t i = lane; i < N * KB; i += 256) {
+            const uint32_t n = i / KB;
+            const uint32_t k_local = i % KB;
+            b_smem[n * KB + k_local] = B_base[(size_t)n * K + k_outer + k_local];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (uint32_t k_inner = 0; k_inner < KB; k_inner += WMMA_K) {
+            load_matrix_sync(a_frag, a_smem + k_inner, KB);
+            load_matrix_sync(b_frag,
+                             b_smem + (size_t)n_warp_start * KB + k_inner,
+                             KB);
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        __syncthreads();
     }
 
     store_matrix_sync(my_scratch, c_frag, WMMA_N, mem_row_major);
     __syncthreads();
 
-    // Cooperative residual + writeback. Read existing bf16, add fp32 mma
-    // result, store bf16.
-    const uint32_t lane = threadIdx.x;
+    // Cooperative residual + writeback.
     const uint32_t total = M * N;
     for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
@@ -794,12 +865,14 @@ __device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, 
 //   g_acc = sum_k rms_gate[m, k] * gate_w[layer, n, k]
 //   u_acc = sum_k rms_gate[m, k] *   up_w[layer, n, k]
 //
-// Two GEMMs sharing the same A operand (rms_gate), fused with the SwiGLU
-// elementwise op. Each warp owns ONE 16x16 sub-tile and computes both the
-// gate accumulator AND the up accumulator over the same K loop, sharing
-// the A fragment between the two mma calls. The fused silu*mul happens
-// in fp32 in the cooperative writeback.
-__device__ __forceinline__ void tile_gate_up(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
+// Two shmem-staged GEMMs sharing the same A operand (rms_gate), fused
+// with the SwiGLU elementwise op. Per K_BLOCK: cooperatively load A, gate
+// B, and up B into shmem; each warp issues paired wmma over the K_BLOCK
+// for both the gate and up accumulators. The fused silu*mul happens in
+// fp32 during the cooperative writeback.
+__device__ __forceinline__ void tile_gate_up(
+    const globals_t& g, uint32_t layer, uint32_t row, uint32_t col, char* tile_smem)
+{
     using namespace nvcuda::wmma;
     constexpr uint32_t M          = MODEL_ROW_TILE;
     constexpr uint32_t K          = MODEL_HIDDEN_DIM;
@@ -810,9 +883,11 @@ __device__ __forceinline__ void tile_gate_up(const globals_t& g, uint32_t layer,
     constexpr uint32_t WMMA_K     = 16;
     constexpr uint32_t N_WARPS    = 8;
     constexpr uint32_t N_PER_WARP = N / N_WARPS;
+    constexpr uint32_t KB         = SHMEM_GEMM_K_BLOCK;
     static_assert(M == WMMA_M, "tile_gate_up assumes M == 16");
     static_assert(N % (WMMA_N * N_WARPS) == 0, "tile_gate_up: N must be 8*16 multiple");
-    static_assert(K % WMMA_K == 0, "tile_gate_up: K must be a multiple of 16");
+    static_assert(K % KB == 0, "tile_gate_up: K must be a multiple of KB");
+    static_assert(KB % WMMA_K == 0, "tile_gate_up: KB must be a multiple of 16");
     static_assert(N_PER_WARP == 16, "tile_gate_up: each warp owns one 16-col slice");
 
     const uint32_t row_start = row * M;
@@ -820,16 +895,24 @@ __device__ __forceinline__ void tile_gate_up(const globals_t& g, uint32_t layer,
     if (row_start >= MODEL_SEQ_LEN) return;
 
     const __nv_bfloat16* A_base      = g.rms_gate + (size_t)row_start * K;
-    const __nv_bfloat16* B_gate_base = g.gate_w + (size_t)layer * ID * K;
-    const __nv_bfloat16* B_up_base   = g.up_w   + (size_t)layer * ID * K;
+    const __nv_bfloat16* B_gate_base = g.gate_w
+        + (size_t)layer * ID * K
+        + (size_t)col_start * K;
+    const __nv_bfloat16* B_up_base   = g.up_w
+        + (size_t)layer * ID * K
+        + (size_t)col_start * K;
     __nv_bfloat16* C_base = g.silu_out + (size_t)row_start * ID + col_start;
 
     const uint32_t warp_id = threadIdx.x / 32;
     const uint32_t n_warp_start = warp_id * N_PER_WARP;
+    const uint32_t lane = threadIdx.x;
 
-    // Two separate per-warp scratch slices: one for gate, one for up.
-    __shared__ float gate_scratch[N_WARPS * WMMA_M * WMMA_N];
-    __shared__ float up_scratch  [N_WARPS * WMMA_M * WMMA_N];
+    // Partition shmem: a_smem | b_gate_smem | b_up_smem | gate_scratch | up_scratch
+    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(tile_smem);
+    __nv_bfloat16* b_gate_smem = a_smem + M * KB;
+    __nv_bfloat16* b_up_smem   = b_gate_smem + N * KB;
+    float* gate_scratch = reinterpret_cast<float*>(b_up_smem + N * KB);
+    float* up_scratch   = gate_scratch + N_WARPS * WMMA_M * WMMA_N;
     float* my_g_scratch = gate_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
     float* my_u_scratch = up_scratch   + (size_t)warp_id * WMMA_M * WMMA_N;
 
@@ -842,12 +925,30 @@ __device__ __forceinline__ void tile_gate_up(const globals_t& g, uint32_t layer,
     fill_fragment(u_acc_frag, 0.0f);
 
     #pragma unroll 1
-    for (uint32_t k = 0; k < K; k += WMMA_K) {
-        load_matrix_sync(a_frag, A_base + k, K);
-        load_matrix_sync(b_g_frag, B_gate_base + (size_t)(col_start + n_warp_start) * K + k, K);
-        load_matrix_sync(b_u_frag, B_up_base   + (size_t)(col_start + n_warp_start) * K + k, K);
-        mma_sync(g_acc_frag, a_frag, b_g_frag, g_acc_frag);
-        mma_sync(u_acc_frag, a_frag, b_u_frag, u_acc_frag);
+    for (uint32_t k_outer = 0; k_outer < K; k_outer += KB) {
+        // Cooperative loads of A, B_gate, B_up.
+        for (uint32_t i = lane; i < M * KB; i += 256) {
+            const uint32_t m = i / KB;
+            const uint32_t k_local = i % KB;
+            a_smem[m * KB + k_local] = A_base[m * K + k_outer + k_local];
+        }
+        for (uint32_t i = lane; i < N * KB; i += 256) {
+            const uint32_t n = i / KB;
+            const uint32_t k_local = i % KB;
+            b_gate_smem[n * KB + k_local] = B_gate_base[(size_t)n * K + k_outer + k_local];
+            b_up_smem[n * KB + k_local]   = B_up_base[(size_t)n * K + k_outer + k_local];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (uint32_t k_inner = 0; k_inner < KB; k_inner += WMMA_K) {
+            load_matrix_sync(a_frag, a_smem + k_inner, KB);
+            load_matrix_sync(b_g_frag, b_gate_smem + (size_t)n_warp_start * KB + k_inner, KB);
+            load_matrix_sync(b_u_frag, b_up_smem   + (size_t)n_warp_start * KB + k_inner, KB);
+            mma_sync(g_acc_frag, a_frag, b_g_frag, g_acc_frag);
+            mma_sync(u_acc_frag, a_frag, b_u_frag, u_acc_frag);
+        }
+        __syncthreads();
     }
 
     store_matrix_sync(my_g_scratch, g_acc_frag, WMMA_N, mem_row_major);
@@ -855,7 +956,6 @@ __device__ __forceinline__ void tile_gate_up(const globals_t& g, uint32_t layer,
     __syncthreads();
 
     // Cooperative SwiGLU writeback: silu(g) * u → bf16
-    const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
     for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
@@ -905,13 +1005,15 @@ __device__ __forceinline__ void tile_mlp_norm(const globals_t& g, uint32_t layer
     }
 }
 
-// ── tile_down: tensor-core GEMM + residual.
+// ── tile_down: shmem-staged tensor-core GEMM + residual.
 //
 // hidden_states[m,n] += sum_k silu_out[m,k] * down_w[layer, n, k]
 //
-// Same wmma + residual writeback as tile_o_proj. Different K (intermediate
-// dim) and different operand pointers.
-__device__ __forceinline__ void tile_down(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
+// Same shmem-staged wmma + residual writeback as tile_o_proj. K is the
+// intermediate dim, which is the largest K of the four GEMMs.
+__device__ __forceinline__ void tile_down(
+    const globals_t& g, uint32_t layer, uint32_t row, uint32_t col, char* tile_smem)
+{
     using namespace nvcuda::wmma;
     constexpr uint32_t M          = MODEL_ROW_TILE;
     constexpr uint32_t K          = MODEL_INTERMEDIATE;
@@ -922,9 +1024,11 @@ __device__ __forceinline__ void tile_down(const globals_t& g, uint32_t layer, ui
     constexpr uint32_t WMMA_K     = 16;
     constexpr uint32_t N_WARPS    = 8;
     constexpr uint32_t N_PER_WARP = N / N_WARPS;
+    constexpr uint32_t KB         = SHMEM_GEMM_K_BLOCK;
     static_assert(M == WMMA_M, "tile_down assumes M == 16");
     static_assert(N % (WMMA_N * N_WARPS) == 0, "tile_down: N must be 8*16 multiple");
-    static_assert(K % WMMA_K == 0, "tile_down: K must be a multiple of 16");
+    static_assert(K % KB == 0, "tile_down: K must be a multiple of KB");
+    static_assert(KB % WMMA_K == 0, "tile_down: KB must be a multiple of 16");
     static_assert(N_PER_WARP == 16, "tile_down: each warp owns one 16-col slice");
 
     const uint32_t row_start = row * M;
@@ -932,13 +1036,18 @@ __device__ __forceinline__ void tile_down(const globals_t& g, uint32_t layer, ui
     if (row_start >= MODEL_SEQ_LEN) return;
 
     const __nv_bfloat16* A_base = g.silu_out + (size_t)row_start * K;
-    const __nv_bfloat16* B_base = g.down_w + (size_t)layer * HD_FULL * K;
+    const __nv_bfloat16* B_base = g.down_w
+        + (size_t)layer * HD_FULL * K
+        + (size_t)col_start * K;
     __nv_bfloat16* C_base = g.hidden_states + (size_t)row_start * HD_FULL + col_start;
 
     const uint32_t warp_id = threadIdx.x / 32;
     const uint32_t n_warp_start = warp_id * N_PER_WARP;
+    const uint32_t lane = threadIdx.x;
 
-    __shared__ float down_scratch[N_WARPS * WMMA_M * WMMA_N];
+    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(tile_smem);
+    __nv_bfloat16* b_smem = a_smem + M * KB;
+    float* down_scratch = reinterpret_cast<float*>(b_smem + N * KB);
     float* my_scratch = down_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
 
     fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
@@ -947,16 +1056,33 @@ __device__ __forceinline__ void tile_down(const globals_t& g, uint32_t layer, ui
     fill_fragment(c_frag, 0.0f);
 
     #pragma unroll 1
-    for (uint32_t k = 0; k < K; k += WMMA_K) {
-        load_matrix_sync(a_frag, A_base + k, K);
-        load_matrix_sync(b_frag, B_base + (size_t)(col_start + n_warp_start) * K + k, K);
-        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    for (uint32_t k_outer = 0; k_outer < K; k_outer += KB) {
+        for (uint32_t i = lane; i < M * KB; i += 256) {
+            const uint32_t m = i / KB;
+            const uint32_t k_local = i % KB;
+            a_smem[m * KB + k_local] = A_base[m * K + k_outer + k_local];
+        }
+        for (uint32_t i = lane; i < N * KB; i += 256) {
+            const uint32_t n = i / KB;
+            const uint32_t k_local = i % KB;
+            b_smem[n * KB + k_local] = B_base[(size_t)n * K + k_outer + k_local];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (uint32_t k_inner = 0; k_inner < KB; k_inner += WMMA_K) {
+            load_matrix_sync(a_frag, a_smem + k_inner, KB);
+            load_matrix_sync(b_frag,
+                             b_smem + (size_t)n_warp_start * KB + k_inner,
+                             KB);
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        __syncthreads();
     }
 
     store_matrix_sync(my_scratch, c_frag, WMMA_N, mem_row_major);
     __syncthreads();
 
-    const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
     for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
@@ -994,6 +1120,10 @@ __global__ void scheduled_megakernel(globals_t g, SchedRuntime rt) {
     const uint32_t tid    = threadIdx.x;
     if (cta_id >= NUM_CTAS) return;
 
+    // Single CTA-wide shmem arena reused across tile bodies. Wave scheduling
+    // means only one tile body runs at a time per CTA, so they can share.
+    __shared__ alignas(16) char tile_smem[TILE_SHMEM_BYTES];
+
     for (uint32_t w = 0; w < NUM_WAVES; ++w) {
         const uint32_t off = WAVE_CTA_OFFSETS[w * (NUM_CTAS + 1) + cta_id];
         const uint32_t end = WAVE_CTA_OFFSETS[w * (NUM_CTAS + 1) + cta_id + 1];
@@ -1003,13 +1133,13 @@ __global__ void scheduled_megakernel(globals_t g, SchedRuntime rt) {
             const TileOp op = WAVE_OPS[i];
             switch (op.phase) {
                 case PHASE_ATTN_NORM: tile_attn_norm(g, op.layer, op.row); break;
-                case PHASE_QKV:       tile_qkv      (g, op.layer, op.row, op.col); break;
+                case PHASE_QKV:       tile_qkv      (g, op.layer, op.row, op.col, tile_smem); break;
                 case PHASE_ROPE:      tile_rope     (g, op.layer, op.row); break;
                 case PHASE_ATTENTION: tile_attention(g, op.layer, op.row); break;
-                case PHASE_O_PROJ:    tile_o_proj   (g, op.layer, op.row, op.col); break;
+                case PHASE_O_PROJ:    tile_o_proj   (g, op.layer, op.row, op.col, tile_smem); break;
                 case PHASE_MLP_NORM:  tile_mlp_norm (g, op.layer, op.row); break;
-                case PHASE_GATE_UP:   tile_gate_up  (g, op.layer, op.row, op.col); break;
-                case PHASE_DOWN:      tile_down     (g, op.layer, op.row, op.col); break;
+                case PHASE_GATE_UP:   tile_gate_up  (g, op.layer, op.row, op.col, tile_smem); break;
+                case PHASE_DOWN:      tile_down     (g, op.layer, op.row, op.col, tile_smem); break;
                 default: break;
             }
             // Stamp validation tick. Single-threaded.

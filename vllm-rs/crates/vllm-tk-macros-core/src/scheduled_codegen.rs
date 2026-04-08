@@ -368,9 +368,11 @@ struct SchedRuntime {
 //
 // Per-row formula: y[c] = x[c] * w[c] / sqrt(mean(x^2) + eps)
 //
-// Block size = 32 (one warp). Each tile owns ROW_TILE consecutive rows.
-// Per row: warp-shuffle reduction over HIDDEN_DIM, then writeback. No shmem.
+// Runs on warp 0 only (32 threads). Other warps idle until the next
+// __syncthreads. Each row: warp-shuffle reduction over HIDDEN_DIM, then
+// writeback. No shmem.
 __device__ __forceinline__ void tile_attn_norm(const globals_t& g, uint32_t layer, uint32_t row) {
+    if (threadIdx.x >= 32) return;
     constexpr uint32_t HD       = MODEL_HIDDEN_DIM;
     constexpr uint32_t ROW_TILE = MODEL_ROW_TILE;
     const uint32_t row_start = row * ROW_TILE;
@@ -433,7 +435,7 @@ __device__ __forceinline__ void tile_qkv(const globals_t& g, uint32_t layer, uin
 
     const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
-    for (uint32_t idx = lane; idx < total; idx += 32) {
+    for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
         const uint32_t n = idx % N;
         if (row_start + m >= MODEL_SEQ_LEN) continue;
@@ -468,6 +470,7 @@ __device__ __forceinline__ void tile_qkv(const globals_t& g, uint32_t layer, uin
 //
 // 32 threads (one warp). The qkv buffer is NOT modified.
 __device__ __forceinline__ void tile_rope(const globals_t& g, uint32_t layer, uint32_t row) {
+    if (threadIdx.x >= 32) return;  // warp 0 only
     constexpr uint32_t HDM             = MODEL_HEAD_DIM;
     constexpr uint32_t HALF            = HDM / 2;
     constexpr uint32_t NAH             = MODEL_NUM_ATTN_H;
@@ -575,6 +578,7 @@ __device__ __forceinline__ void tile_rope(const globals_t& g, uint32_t layer, ui
 // no shmem K/V staging, no cp.async, no warp-level mma. Phase 4 will swap
 // in the FA-2 implementation from the existing kernel's templates.
 __device__ __forceinline__ void tile_attention(const globals_t& g, uint32_t layer, uint32_t row) {
+    if (threadIdx.x >= 32) return;  // warp 0 only
     constexpr uint32_t HDM             = MODEL_HEAD_DIM;
     constexpr uint32_t NAH             = MODEL_NUM_ATTN_H;
     constexpr uint32_t NKH             = MODEL_NUM_KV_H;
@@ -696,7 +700,7 @@ __device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, 
 
     const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
-    for (uint32_t idx = lane; idx < total; idx += 32) {
+    for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
         const uint32_t n = idx % N;
         if (row_start + m >= MODEL_SEQ_LEN) continue;
@@ -743,7 +747,7 @@ __device__ __forceinline__ void tile_gate_up(const globals_t& g, uint32_t layer,
 
     const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
-    for (uint32_t idx = lane; idx < total; idx += 32) {
+    for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
         const uint32_t n = idx % N;
         if (row_start + m >= MODEL_SEQ_LEN) continue;
@@ -761,6 +765,7 @@ __device__ __forceinline__ void tile_gate_up(const globals_t& g, uint32_t layer,
 }
 
 __device__ __forceinline__ void tile_mlp_norm(const globals_t& g, uint32_t layer, uint32_t row) {
+    if (threadIdx.x >= 32) return;  // warp 0 only
     constexpr uint32_t HD       = MODEL_HIDDEN_DIM;
     constexpr uint32_t ROW_TILE = MODEL_ROW_TILE;
     const uint32_t row_start = row * ROW_TILE;
@@ -814,7 +819,7 @@ __device__ __forceinline__ void tile_down(const globals_t& g, uint32_t layer, ui
 
     const uint32_t lane = threadIdx.x;
     const uint32_t total = M * N;
-    for (uint32_t idx = lane; idx < total; idx += 32) {
+    for (uint32_t idx = lane; idx < total; idx += 256) {
         const uint32_t m = idx / N;
         const uint32_t n = idx % N;
         if (row_start + m >= MODEL_SEQ_LEN) continue;
@@ -943,7 +948,10 @@ extern "C" void launch_scheduled_megakernel(
     };
     pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived};
     dim3 grid(pfl_sched::NUM_CTAS);
-    dim3 block(32);
+    // 256 threads = 8 warps. Warp-shuffle phases (norms, rope, attention)
+    // are gated to warp 0 inside their bodies; GEMM phases use all 256
+    // threads cooperatively via per-thread output partitioning.
+    dim3 block(256);
     pfl_sched::scheduled_megakernel<<<grid, block, 0, stream>>>(g, rt);
 }
 

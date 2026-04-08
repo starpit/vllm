@@ -107,6 +107,7 @@ struct TestBuffers {
     silu_out: u64,
     attn_norm_w: u64,
     mlp_norm_w: u64,
+    qkv_w: u64,
 }
 
 fn launch_with_buffers(b: &TestBuffers, eps: f32) -> (Vec<u32>, u32) {
@@ -128,6 +129,7 @@ fn launch_with_buffers(b: &TestBuffers, eps: f32) -> (Vec<u32>, u32) {
             b.silu_out as *mut _,
             b.attn_norm_w as *mut _,
             b.mlp_norm_w as *mut _,
+            b.qkv_w as *mut _,
             eps,
             flags,
             tick,
@@ -240,7 +242,7 @@ struct TestInputs {
     an_w_data: Vec<bf16>,
     mn_w_data: Vec<bf16>,
     attn_out_data: Vec<bf16>,
-    qkv_data: Vec<bf16>,
+    qkv_w_data: Vec<bf16>,
 }
 
 /// Build the standard set of test buffers for the tiny model.
@@ -256,17 +258,22 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
     let an_w_data = random_bf16(nl * hd, 2, 1.0);
     let mn_w_data = random_bf16(nl * hd, 3, 1.0);
     let attn_out_data = random_bf16(seq * hd, 4, 0.5);
-    let qkv_data = random_bf16(seq * qkv_dim, 5, 0.5);
+    // Small weight scale (0.05) to keep accumulator products in range —
+    // bf16 GEMM with hd=256 over (-0.5,0.5) inputs and full-magnitude
+    // weights would push individual outputs into the tens, blowing
+    // through bf16's relative precision.
+    let qkv_w_data = random_bf16(nl * qkv_dim * hd, 6, 0.05);
 
     let b = TestBuffers {
         hidden_states: gpu_upload_bf16(&h_data),
         rms_rope: gpu_alloc_zeros(seq * hd * 2),
-        qkv: gpu_upload_bf16(&qkv_data),
+        qkv: gpu_alloc_zeros(seq * qkv_dim * 2),
         attn_out: gpu_upload_bf16(&attn_out_data),
         rms_gate: gpu_alloc_zeros(seq * hd * 2),
         silu_out: gpu_alloc_zeros(seq * id * 2),
         attn_norm_w: gpu_upload_bf16(&an_w_data),
         mlp_norm_w: gpu_upload_bf16(&mn_w_data),
+        qkv_w: gpu_upload_bf16(&qkv_w_data),
     };
     (
         b,
@@ -275,7 +282,7 @@ fn build_test_buffers() -> (TestBuffers, TestInputs) {
             an_w_data,
             mn_w_data,
             attn_out_data,
-            qkv_data,
+            qkv_w_data,
         },
     )
 }
@@ -324,6 +331,23 @@ fn tile_mlp_norm_matches_cpu_golden() {
     });
 }
 
+/// CPU reference for a single GEMM tile: out[m,n] = sum_k a[m,k] * b[n,k].
+/// `a` is [m_dim, k_dim], `b` is [n_dim, k_dim] (B is "stored transposed"),
+/// `out` is [m_dim, n_dim]. Computes in fp32, rounds to bf16 on store.
+fn cpu_gemm(a: &[bf16], b: &[bf16], m_dim: usize, n_dim: usize, k_dim: usize) -> Vec<bf16> {
+    let mut out = vec![bf16::from_f32(0.0); m_dim * n_dim];
+    for m in 0..m_dim {
+        for n in 0..n_dim {
+            let mut acc = 0.0_f32;
+            for k in 0..k_dim {
+                acc += a[m * k_dim + k].to_f32() * b[n * k_dim + k].to_f32();
+            }
+            out[m * n_dim + n] = bf16::from_f32(acc);
+        }
+    }
+    out
+}
+
 /// CPU reference for one application of LLaMA-style split-half RoPE on Q/K
 /// portions of a qkv row, in place. V heads pass through.
 fn cpu_rope_one(
@@ -352,11 +376,21 @@ fn cpu_rope_one(
     }
 }
 
+/// Phase 3c step 4: validates the full norm → gemm → rope chain through the
+/// last layer. Once tile_qkv is real it overwrites the qkv buffer on every
+/// layer's qkv pass before rope re-rotates it, so the only meaningful
+/// validation point is the qkv buffer end-state, which equals
+///
+///     rope( gemm( norm( hidden_states, an_w[NL-1] ),  qkv_w[NL-1] ),  pos )
+///
+/// applied once (not NL times — each layer's qkv overwrites the previous).
+/// Implicitly validates tile_qkv AND tile_rope.
 #[test]
 #[ignore = "needs GPU"]
-fn tile_rope_matches_cpu_golden() {
+fn qkv_chain_matches_cpu_golden() {
     init_cuda();
     let dims = scheduled_prefill_tiny_dims();
+    let hd = dims.hidden_dim as usize;
     let qkv_dim = ((dims.num_attn_heads + 2 * dims.num_kv_heads) * dims.head_dim) as usize;
     let seq = dims.seq_len as usize;
     let nl = dims.num_layers as usize;
@@ -368,38 +402,40 @@ fn tile_rope_matches_cpu_golden() {
     let (b, inp) = build_test_buffers();
     let _ = launch_with_buffers(&b, eps);
 
-    // RoPE is in-place on the qkv buffer. The wave schedule applies RoPE
-    // once per layer using the same parameters, so the buffer is rotated
-    // NL times in total. CPU golden does the same.
     let qkv_gpu = gpu_download_bf16(b.qkv, seq * qkv_dim);
-    let mut qkv_golden: Vec<bf16> = inp.qkv_data.clone();
-    for r in 0..seq {
-        for _ in 0..nl {
-            let row = &mut qkv_golden[r * qkv_dim..(r + 1) * qkv_dim];
-            cpu_rope_one(row, r, hdm, nah, nkh);
-        }
-    }
+
+    // CPU chain through layer NL-1 only (last writer wins).
+    let an_w_last = &inp.an_w_data[(nl - 1) * hd..nl * hd];
+    let qkv_w_last = &inp.qkv_w_data[(nl - 1) * qkv_dim * hd..nl * qkv_dim * hd];
 
     let mut max_abs_err = 0.0_f32;
     let mut max_rel_err = 0.0_f32;
-    for i in 0..seq * qkv_dim {
-        let g = qkv_golden[i].to_f32();
-        let k = qkv_gpu[i].to_f32();
-        let abs = (g - k).abs();
-        let rel = if g.abs() > 1e-3 { abs / g.abs() } else { 0.0 };
-        if abs > max_abs_err {
-            max_abs_err = abs;
-        }
-        if rel > max_rel_err {
-            max_rel_err = rel;
+    for r in 0..seq {
+        // 1. norm
+        let normed = cpu_rms_norm(&inp.h_data[r * hd..(r + 1) * hd], an_w_last, eps);
+        // 2. gemm — produces a single row of length qkv_dim
+        let mut row = cpu_gemm(&normed, qkv_w_last, 1, qkv_dim, hd);
+        // 3. rope (in-place on Q/K heads)
+        cpu_rope_one(&mut row, r, hdm, nah, nkh);
+
+        for n in 0..qkv_dim {
+            let g = row[n].to_f32();
+            let k = qkv_gpu[r * qkv_dim + n].to_f32();
+            let abs = (g - k).abs();
+            let rel = if g.abs() > 1e-3 { abs / g.abs() } else { 0.0 };
+            if abs > max_abs_err {
+                max_abs_err = abs;
+            }
+            if rel > max_rel_err {
+                max_rel_err = rel;
+            }
         }
     }
     eprintln!(
-        "tile_rope: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
+        "qkv_chain: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
         max_rel_err * 100.0
     );
-    // RoPE accumulates rounding error each layer. NL=2 layers + bf16 → tolerance
-    // of 0.05 abs / 5% rel covers it comfortably.
-    assert!(max_abs_err < 0.05, "tile_rope: max abs err {max_abs_err}");
-    assert!(max_rel_err < 0.05, "tile_rope: max rel err {max_rel_err}");
+    // bf16 GEMM at K=256 + RMS norm + RoPE rounding. 5% rel is comfortable.
+    assert!(max_abs_err < 0.10, "qkv_chain: max abs err {max_abs_err}");
+    assert!(max_rel_err < 0.05, "qkv_chain: max rel err {max_rel_err}");
 }

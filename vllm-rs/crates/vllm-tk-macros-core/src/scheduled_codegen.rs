@@ -238,6 +238,30 @@ pub fn emit_scheduled_megakernel_cu(dag: &ReifiedDag, sched: &WaveSchedule) -> S
         dag.tiles.row_tile
     )
     .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_QKV_COL_TILE  = {};",
+        dag.tiles.qkv_col_tile
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_O_COL_TILE    = {};",
+        dag.tiles.o_col_tile
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_GATE_UP_COL_TILE = {};",
+        dag.tiles.gate_up_col_tile
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_DOWN_COL_TILE = {};",
+        dag.tiles.down_col_tile
+    )
+    .unwrap();
     writeln!(out, "}}  // namespace pfl_sched").unwrap();
     out.push_str(KERNEL_BODY);
     out
@@ -268,6 +292,8 @@ struct globals_t {
     // Norm weights, per layer.
     __nv_bfloat16* attn_norm_w;    // [num_layers, HIDDEN_DIM]
     __nv_bfloat16* mlp_norm_w;     // [num_layers, HIDDEN_DIM]
+    // GEMM weights, per layer.
+    __nv_bfloat16* qkv_w;          // [num_layers, qkv_dim, HIDDEN_DIM]
     float          eps;
 };
 
@@ -321,7 +347,48 @@ __device__ __forceinline__ void tile_attn_norm(const globals_t& g, uint32_t laye
     }
 }
 
-__device__ __forceinline__ void tile_qkv      (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+// ── tile_qkv: real GEMM. M=ROW_TILE, N=QKV_COL_TILE, K=HIDDEN_DIM. ──
+//
+// Output:  qkv[row*M..row*M+M, col*N..col*N+N]   ([seq, qkv_dim] row-major)
+// A:       rms_rope[row*M..row*M+M, 0..K]        ([seq, hidden_dim] row-major)
+// B:       qkv_w[layer, col*N..col*N+N, 0..K]    ([num_layers, qkv_dim, hidden_dim] row-major)
+//
+// Per-output formula: C[m,n] = sum_k A[m,k] * B[n,k]
+//
+// Threading: 32 threads, naive output-stationary. Each thread owns
+// (M*N)/32 outputs and walks K. Correct, not fast — Phase 4 will swap in
+// CUTLASS-quality bodies. fp32 accumulator.
+__device__ __forceinline__ void tile_qkv(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
+    constexpr uint32_t M           = MODEL_ROW_TILE;
+    constexpr uint32_t K           = MODEL_HIDDEN_DIM;
+    constexpr uint32_t N           = MODEL_QKV_COL_TILE;
+    constexpr uint32_t QKV_DIM_FULL = (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
+    const uint32_t row_start = row * M;
+    const uint32_t col_start = col * N;
+    if (row_start >= MODEL_SEQ_LEN) return;
+
+    const __nv_bfloat16* A = g.rms_rope + (size_t)row_start * K;
+    const __nv_bfloat16* B = g.qkv_w
+        + (size_t)layer * QKV_DIM_FULL * K
+        + (size_t)col_start * K;
+    __nv_bfloat16* C = g.qkv + (size_t)row_start * QKV_DIM_FULL + col_start;
+
+    const uint32_t lane = threadIdx.x;
+    const uint32_t total = M * N;
+    for (uint32_t idx = lane; idx < total; idx += 32) {
+        const uint32_t m = idx / N;
+        const uint32_t n = idx % N;
+        if (row_start + m >= MODEL_SEQ_LEN) continue;
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < K; ++k) {
+            const float a = __bfloat162float(A[m * K + k]);
+            const float b = __bfloat162float(B[n * K + k]);
+            acc += a * b;
+        }
+        C[m * QKV_DIM_FULL + n] = __float2bfloat16(acc);
+    }
+}
+
 
 // ── tile_rope: in-place RoPE on the qkv buffer for one ROW_TILE-row tile.
 //
@@ -481,6 +548,8 @@ extern "C" void launch_scheduled_megakernel(
     // Norm weights (bf16, [num_layers, hidden_dim])
     void* attn_norm_w,
     void* mlp_norm_w,
+    // GEMM weights (bf16)
+    void* qkv_w,
     float eps,
     // Validation buffers
     unsigned int* flags,
@@ -496,6 +565,7 @@ extern "C" void launch_scheduled_megakernel(
         reinterpret_cast<__nv_bfloat16*>(silu_out),
         reinterpret_cast<__nv_bfloat16*>(attn_norm_w),
         reinterpret_cast<__nv_bfloat16*>(mlp_norm_w),
+        reinterpret_cast<__nv_bfloat16*>(qkv_w),
         eps,
     };
     pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived};

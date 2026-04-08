@@ -182,42 +182,152 @@ fn emit_u32_chunked(out: &mut String, vals: &[u32]) {
 }
 
 /// Phase 3b-bsp — emit a complete `.cu` file containing the wave program
-/// data + placeholder tile stubs + grid-barrier megakernel + extern "C"
-/// launch helper.
+/// data + tile bodies (real where implemented, placeholder where not) +
+/// grid-barrier megakernel + extern "C" launch helper.
 pub fn emit_scheduled_megakernel_cu(dag: &ReifiedDag, sched: &WaveSchedule) -> String {
     let mut out = String::new();
     out.push_str(&emit_wave_schedule_cpp(dag, sched));
+    // Bake the model dims as compile-time constants so tile bodies can index
+    // gmem buffers without an extra struct field per dim.
+    writeln!(out, "namespace pfl_sched {{").unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_NUM_LAYERS    = {};",
+        dag.dims.num_layers
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_HIDDEN_DIM    = {};",
+        dag.dims.hidden_dim
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_INTERMEDIATE  = {};",
+        dag.dims.intermediate_dim
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_NUM_ATTN_H    = {};",
+        dag.dims.num_attn_heads
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_NUM_KV_H      = {};",
+        dag.dims.num_kv_heads
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_HEAD_DIM      = {};",
+        dag.dims.head_dim
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_SEQ_LEN       = {};",
+        dag.dims.seq_len
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "constexpr uint32_t MODEL_ROW_TILE      = {};",
+        dag.tiles.row_tile
+    )
+    .unwrap();
+    writeln!(out, "}}  // namespace pfl_sched").unwrap();
     out.push_str(KERNEL_BODY);
     out
 }
 
 const KERNEL_BODY: &str = r#"
 // ──────────────────────────────────────────────────────────────────────
-// Phase 3b-bsp: scheduled BSP megakernel — placeholder tiles, grid barrier.
+// Phase 3c (in progress): scheduled BSP megakernel.
+// Real tile bodies for phases that have been ported. Placeholders elsewhere.
 // ──────────────────────────────────────────────────────────────────────
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cstdio>
 
 namespace pfl_sched {
+
+// Activation + weight pointers the tile bodies need. Pointers are typed as
+// __nv_bfloat16* because that's what the existing fused kernel uses.
+struct globals_t {
+    // Activations (all bf16, all [seq_len, dim] row-major)
+    __nv_bfloat16* hidden_states;  // [seq, HIDDEN_DIM]
+    __nv_bfloat16* rms_rope;       // [seq, HIDDEN_DIM]  — output of attn_norm
+    __nv_bfloat16* qkv;            // [seq, qkv_dim]      — output of qkv gemm
+    __nv_bfloat16* attn_out;       // [seq, HIDDEN_DIM]
+    __nv_bfloat16* rms_gate;       // [seq, HIDDEN_DIM]
+    __nv_bfloat16* silu_out;       // [seq, INTERMEDIATE]
+    // Norm weights, per layer.
+    __nv_bfloat16* attn_norm_w;    // [num_layers, HIDDEN_DIM]
+    __nv_bfloat16* mlp_norm_w;     // [num_layers, HIDDEN_DIM]
+    float          eps;
+};
 
 // Per-node validation slot. The kernel writes a monotonic tick into
 // `flags[node_id]` at the moment the node executes; the host then checks
 // that every node ran exactly once and that ticks respect topological order.
 struct SchedRuntime {
-    unsigned int* flags;        // [NUM_NODES] — 0 means not done; nonzero is the tick
-    unsigned int* tick_counter; // [1] — global atomic, returns the next tick
-    unsigned int* barrier_arrived; // [1] — accumulated grid-barrier counter
+    unsigned int* flags;           // [NUM_NODES]
+    unsigned int* tick_counter;    // [1]
+    unsigned int* barrier_arrived; // [1]
 };
 
-__device__ __forceinline__ void tile_attn_norm(uint32_t /*layer*/, uint32_t /*row*/) {}
-__device__ __forceinline__ void tile_qkv      (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
-__device__ __forceinline__ void tile_rope     (uint32_t /*layer*/, uint32_t /*row*/) {}
-__device__ __forceinline__ void tile_attention(uint32_t /*layer*/, uint32_t /*row*/) {}
-__device__ __forceinline__ void tile_o_proj   (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
-__device__ __forceinline__ void tile_mlp_norm (uint32_t /*layer*/, uint32_t /*row*/) {}
-__device__ __forceinline__ void tile_gate_up  (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
-__device__ __forceinline__ void tile_down     (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+// ── tile_attn_norm: real RMS norm. Reads hidden_states, writes rms_rope. ──
+//
+// Per-row formula: y[c] = x[c] * w[c] / sqrt(mean(x^2) + eps)
+//
+// Block size = 32 (one warp). Each tile owns ROW_TILE consecutive rows.
+// Per row: warp-shuffle reduction over HIDDEN_DIM, then writeback. No shmem.
+__device__ __forceinline__ void tile_attn_norm(const globals_t& g, uint32_t layer, uint32_t row) {
+    constexpr uint32_t HD       = MODEL_HIDDEN_DIM;
+    constexpr uint32_t ROW_TILE = MODEL_ROW_TILE;
+    const uint32_t row_start = row * ROW_TILE;
+    const __nv_bfloat16* w = g.attn_norm_w + (size_t)layer * HD;
+    const uint32_t lane = threadIdx.x;  // 0..31
+
+    #pragma unroll 1
+    for (uint32_t r = 0; r < ROW_TILE; ++r) {
+        const uint32_t row_idx = row_start + r;
+        if (row_idx >= MODEL_SEQ_LEN) break;
+        const __nv_bfloat16* x = g.hidden_states + (size_t)row_idx * HD;
+        __nv_bfloat16*       y = g.rms_rope      + (size_t)row_idx * HD;
+
+        // ── Reduction: sum of squares across HIDDEN_DIM ──
+        float my_sum = 0.0f;
+        for (uint32_t c = lane; c < HD; c += 32) {
+            float v = __bfloat162float(x[c]);
+            my_sum += v * v;
+        }
+        // Warp shuffle reduction.
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            my_sum += __shfl_xor_sync(0xffffffff, my_sum, offset);
+        }
+        const float scale = rsqrtf(my_sum / float(HD) + g.eps);
+
+        // ── Writeback: y[c] = x[c] * scale * w[c] ──
+        for (uint32_t c = lane; c < HD; c += 32) {
+            float xv = __bfloat162float(x[c]);
+            float wv = __bfloat162float(w[c]);
+            y[c] = __float2bfloat16(xv * scale * wv);
+        }
+    }
+}
+
+__device__ __forceinline__ void tile_qkv      (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+__device__ __forceinline__ void tile_rope     (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/) {}
+__device__ __forceinline__ void tile_attention(const globals_t&, uint32_t /*layer*/, uint32_t /*row*/) {}
+__device__ __forceinline__ void tile_o_proj   (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+__device__ __forceinline__ void tile_mlp_norm (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/) {}
+__device__ __forceinline__ void tile_gate_up  (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+__device__ __forceinline__ void tile_down     (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
 
 // Grid-wide barrier via a single global counter. Every CTA's thread 0 bumps
 // the counter once per wave; all CTAs spin until the counter reaches the
@@ -236,7 +346,7 @@ __device__ __forceinline__ void grid_barrier(unsigned int* counter, unsigned int
     __syncthreads();
 }
 
-__global__ void scheduled_megakernel(SchedRuntime rt) {
+__global__ void scheduled_megakernel(globals_t g, SchedRuntime rt) {
     const uint32_t cta_id = blockIdx.x;
     const uint32_t tid    = threadIdx.x;
     if (cta_id >= NUM_CTAS) return;
@@ -249,14 +359,14 @@ __global__ void scheduled_megakernel(SchedRuntime rt) {
         for (uint32_t i = off; i < end; ++i) {
             const TileOp op = WAVE_OPS[i];
             switch (op.phase) {
-                case PHASE_ATTN_NORM: tile_attn_norm(op.layer, op.row); break;
-                case PHASE_QKV:       tile_qkv      (op.layer, op.row, op.col); break;
-                case PHASE_ROPE:      tile_rope     (op.layer, op.row); break;
-                case PHASE_ATTENTION: tile_attention(op.layer, op.row); break;
-                case PHASE_O_PROJ:    tile_o_proj   (op.layer, op.row, op.col); break;
-                case PHASE_MLP_NORM:  tile_mlp_norm (op.layer, op.row); break;
-                case PHASE_GATE_UP:   tile_gate_up  (op.layer, op.row, op.col); break;
-                case PHASE_DOWN:      tile_down     (op.layer, op.row, op.col); break;
+                case PHASE_ATTN_NORM: tile_attn_norm(g, op.layer, op.row); break;
+                case PHASE_QKV:       tile_qkv      (g, op.layer, op.row, op.col); break;
+                case PHASE_ROPE:      tile_rope     (g, op.layer, op.row); break;
+                case PHASE_ATTENTION: tile_attention(g, op.layer, op.row); break;
+                case PHASE_O_PROJ:    tile_o_proj   (g, op.layer, op.row, op.col); break;
+                case PHASE_MLP_NORM:  tile_mlp_norm (g, op.layer, op.row); break;
+                case PHASE_GATE_UP:   tile_gate_up  (g, op.layer, op.row, op.col); break;
+                case PHASE_DOWN:      tile_down     (g, op.layer, op.row, op.col); break;
                 default: break;
             }
             // Stamp validation tick. Single-threaded.
@@ -276,14 +386,38 @@ __global__ void scheduled_megakernel(SchedRuntime rt) {
 
 }  // namespace pfl_sched
 
-extern "C" void launch_scheduled_megakernel(unsigned int* flags,
-                                            unsigned int* tick_counter,
-                                            unsigned int* barrier_arrived,
-                                            cudaStream_t stream) {
+extern "C" void launch_scheduled_megakernel(
+    // Activation buffers (bf16, [seq, dim] row-major)
+    void* hidden_states,
+    void* rms_rope,
+    void* qkv,
+    void* attn_out,
+    void* rms_gate,
+    void* silu_out,
+    // Norm weights (bf16, [num_layers, hidden_dim])
+    void* attn_norm_w,
+    void* mlp_norm_w,
+    float eps,
+    // Validation buffers
+    unsigned int* flags,
+    unsigned int* tick_counter,
+    unsigned int* barrier_arrived,
+    cudaStream_t stream) {
+    pfl_sched::globals_t g{
+        reinterpret_cast<__nv_bfloat16*>(hidden_states),
+        reinterpret_cast<__nv_bfloat16*>(rms_rope),
+        reinterpret_cast<__nv_bfloat16*>(qkv),
+        reinterpret_cast<__nv_bfloat16*>(attn_out),
+        reinterpret_cast<__nv_bfloat16*>(rms_gate),
+        reinterpret_cast<__nv_bfloat16*>(silu_out),
+        reinterpret_cast<__nv_bfloat16*>(attn_norm_w),
+        reinterpret_cast<__nv_bfloat16*>(mlp_norm_w),
+        eps,
+    };
     pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived};
     dim3 grid(pfl_sched::NUM_CTAS);
     dim3 block(32);
-    pfl_sched::scheduled_megakernel<<<grid, block, 0, stream>>>(rt);
+    pfl_sched::scheduled_megakernel<<<grid, block, 0, stream>>>(g, rt);
 }
 
 extern "C" unsigned int scheduled_megakernel_num_nodes() {

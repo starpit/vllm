@@ -336,6 +336,18 @@ pub mod ffi {
     // the macro.
     unsafe extern "C" {
         pub fn launch_scheduled_megakernel(
+            // Activations (device pointers, bf16 data)
+            hidden_states: *mut std::ffi::c_void,
+            rms_rope: *mut std::ffi::c_void,
+            qkv: *mut std::ffi::c_void,
+            attn_out: *mut std::ffi::c_void,
+            rms_gate: *mut std::ffi::c_void,
+            silu_out: *mut std::ffi::c_void,
+            // Norm weights
+            attn_norm_w: *mut std::ffi::c_void,
+            mlp_norm_w: *mut std::ffi::c_void,
+            eps: f32,
+            // Validation buffers
             flags: *mut u32,
             tick_counter: *mut u32,
             barrier_arrived: *mut u32,

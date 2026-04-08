@@ -7733,10 +7733,12 @@ name = "vllm-serve"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "axum-server",
  "bincode",
  "chrono",
+ "futures-util",
  "http",
  "http-body-util",
  "indicatif 0.17.11",

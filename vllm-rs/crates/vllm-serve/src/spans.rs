@@ -519,7 +519,12 @@ pub(crate) async fn execute_query(
     }
 }
 
-async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> ServeResult<Response> {
+async fn execute_query_inner(
+    state: &Arc<AppState>,
+    body: &str,
+    stream: bool,
+) -> ServeResult<Response> {
+    let state_ref: &AppState = state.as_ref();
     let tokenizer = state
         .engine
         .tokenizer()
@@ -544,7 +549,7 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
         // RAG: index any Augment nodes, then rewrite them to retrieved fragments.
         #[cfg(feature = "rag")]
         let query = {
-            let aug_options = crate::augment::AugmentOptions {
+            let mut aug_options = crate::augment::AugmentOptions {
                 current_model: Some(state.engine.model_name().to_string()),
                 embedder: Some(std::sync::Arc::new(
                     crate::augment::embed::AsyncEngineEmbedder::new(state.engine.clone()),
@@ -553,6 +558,10 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
                 sidecar_manager: Some(std::sync::Arc::new(crate::augment::SidecarManager::new())),
                 ..Default::default()
             };
+            aug_options.summarizer = Some(std::sync::Arc::new(
+                crate::augment::summarize::AppStateSummarizer::new(std::sync::Arc::clone(state)),
+            ));
+            aug_options.apply_env_overrides();
             crate::augment::index(&query, &aug_options)
                 .await
                 .map_err(|e| ServeError::Validation(format!("RAG indexing failed: {e}")))?;
@@ -562,8 +571,10 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
         };
         // HLO: insert prepare completions for Plus children.
         let query = hlo_insert_prepares(&query);
-        return dispatch_spnl_query(state, &query, stream, tokenizer, template, &cfg, block_size)
-            .await;
+        return dispatch_spnl_query(
+            state_ref, &query, stream, tokenizer, template, &cfg, block_size,
+        )
+        .await;
     }
 
     let query: SingleGenerateQuery = serde_json::from_str(body)
@@ -571,13 +582,13 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
 
     match query {
         SingleGenerateQuery::SingleGenerate(spec) => {
-            execute_single(state, &spec, 1, stream, tokenizer, template, &cfg).await
+            execute_single(state_ref, &spec, 1, stream, tokenizer, template, &cfg).await
         }
         SingleGenerateQuery::Bulk(Bulk::Repeat(Repeat { n, generate: spec })) => {
-            execute_single(state, &spec, n, stream, tokenizer, template, &cfg).await
+            execute_single(state_ref, &spec, n, stream, tokenizer, template, &cfg).await
         }
         SingleGenerateQuery::Bulk(Bulk::Map(map)) => {
-            execute_map(state, &map, stream, tokenizer, template, &cfg).await
+            execute_map(state_ref, &map, stream, tokenizer, template, &cfg).await
         }
     }
 }
@@ -616,10 +627,8 @@ fn hlo_rewrite_generate_input(input: &SpnlQuery, g: &Generate) -> SpnlQuery {
             for child in v {
                 if let SpnlQuery::Plus(fragments) = child {
                     // Insert Monad(Plus([prepare(f) for f])) before the Plus.
-                    let prepares: Vec<_> = fragments
-                        .iter()
-                        .map(|m| prepare_fragment(m, g))
-                        .collect();
+                    let prepares: Vec<_> =
+                        fragments.iter().map(|m| prepare_fragment(m, g)).collect();
                     if let Some(monad) = prepare_monad(prepares) {
                         out.push(monad);
                     }
@@ -632,10 +641,7 @@ fn hlo_rewrite_generate_input(input: &SpnlQuery, g: &Generate) -> SpnlQuery {
         }
         SpnlQuery::Plus(fragments) => {
             // Plus directly as input (not in a Seq): wrap in Seq with prepares.
-            let prepares: Vec<_> = fragments
-                .iter()
-                .map(|m| prepare_fragment(m, g))
-                .collect();
+            let prepares: Vec<_> = fragments.iter().map(|m| prepare_fragment(m, g)).collect();
             SpnlQuery::Seq(
                 [prepare_monad(prepares), Some(input.clone())]
                     .into_iter()
@@ -894,15 +900,64 @@ async fn execute_single(
     }
 }
 
+/// Like `execute_single` but returns the assistant's plain-text response.
+///
+/// Used by RAG indexing (e.g. RAPTOR phase 2 summarization) to drive a
+/// single non-streaming generation through the in-process engine while
+/// reusing the spans tokenization + scheduling pipeline.
+#[cfg(feature = "rag")]
+pub(crate) async fn execute_single_text(
+    state: &AppState,
+    spec: &SingleGenerate,
+) -> ServeResult<String> {
+    let tokenizer = state
+        .engine
+        .tokenizer()
+        .ok_or_else(|| ServeError::Internal("execute_single_text requires a tokenizer".into()))?;
+    let template = state.engine.chat_template().ok_or_else(|| {
+        ServeError::Internal("execute_single_text requires a chat template".into())
+    })?;
+    let block_size = state
+        .vllm_config
+        .as_ref()
+        .map(|c| c.block_size)
+        .unwrap_or(16);
+    let cfg = SpanConfig::from_tokenizer(block_size, tokenizer);
+
+    let span_tok = tokenize_span_query(spec, tokenizer, template.as_ref(), &cfg)?;
+    let max_tokens = spec
+        .metadata
+        .max_tokens
+        .filter(|&t| t > 0)
+        .map(|t| t as u32)
+        .unwrap_or(2048);
+    let temperature = spec.metadata.temperature.unwrap_or(0.0);
+
+    let request = build_completion_request(
+        &spec.metadata.model,
+        protocol::CompletionPrompt::TokenIds(span_tok.tokens),
+        span_tok.annotations,
+        1,
+        max_tokens,
+        temperature,
+        false,
+    );
+
+    let response = state.engine.completion(request).await?;
+    Ok(response
+        .choices
+        .into_iter()
+        .next()
+        .map(|c| c.text)
+        .unwrap_or_default())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::chat_template::ChatTemplate;
-
     /// Regression test for the stale template-suffix bug.
     ///
     /// When messages are consolidated (same role, appended with \n), the
@@ -1185,15 +1240,56 @@ pub(crate) fn execute_spnl_struct_sync(
 ) -> anyhow::Result<crate::llm::QueryOutput> {
     #[cfg(feature = "rag")]
     let query = {
+        // We use a `current_thread` runtime so that any await inside
+        // `augment::index` resumes on the calling OS thread — required by
+        // the `SyncClosureSummarizer` thread-local trick below.
         let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
             let rt = Box::leak(Box::new(
-                tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to create current_thread runtime"),
             ));
             rt.handle().clone()
         });
-        rt.block_on(crate::augment::index(&query, aug_options))
-            .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
-        rt.block_on(optimize_augments(&query, aug_options))?
+
+        // Build a synchronous summarizer closure over the offline `generate`
+        // FnMut. RAPTOR's per-cluster summary calls land here via
+        // `SyncClosureSummarizer`, which reads the installed slot.
+        let mut summarize_fn = |spec: &SingleGenerate| -> anyhow::Result<String> {
+            let span_tok = tokenize_span_query(spec, tokenizer, template, cfg)
+                .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+            let prompt = crate::llm::Prompt::TokenIds(span_tok.tokens);
+            let sp = vllm_common::SamplingParams {
+                max_tokens: spec
+                    .metadata
+                    .max_tokens
+                    .filter(|&t| t > 0)
+                    .map(|t| t as u32),
+                temperature: spec.metadata.temperature.unwrap_or(0.0) as f64,
+                ..Default::default()
+            };
+            let outputs = generate(&[prompt], Some(sp), false, false)?;
+            Ok(outputs
+                .first()
+                .and_then(|r| r.outputs.first())
+                .map(|o| o.text.clone())
+                .unwrap_or_default())
+        };
+
+        let mut aug_options_local = aug_options.clone();
+        aug_options_local.summarizer = Some(std::sync::Arc::new(
+            crate::augment::summarize::SyncClosureSummarizer,
+        ));
+
+        crate::augment::summarize::with_sync_summarizer(
+            &mut summarize_fn,
+            || -> anyhow::Result<SpnlQuery> {
+                rt.block_on(crate::augment::index(&query, &aug_options_local))
+                    .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
+                rt.block_on(optimize_augments(&query, &aug_options_local))
+            },
+        )?
     };
     // HLO: insert prepare completions for Plus children.
     let query = hlo_insert_prepares(&query);

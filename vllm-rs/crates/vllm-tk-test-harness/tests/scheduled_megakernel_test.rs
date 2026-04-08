@@ -157,7 +157,7 @@ fn scheduled_megakernel_executes_topologically() {
     let kernel_waves = unsafe { ffi::scheduled_megakernel_num_waves() };
     eprintln!("scheduled_megakernel: {n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
 
-    let (b, _, _, _, _) = build_test_buffers();
+    let (b, _) = build_test_buffers();
     let (ticks, final_tick) = launch_with_buffers(&b, 1e-5);
     eprintln!("final tick = {final_tick}");
 
@@ -232,10 +232,19 @@ fn assert_matches_golden<F: Fn(usize) -> Vec<bf16>>(
     );
 }
 
-/// Build the standard set of test buffers for the tiny model. Inputs are
-/// pre-filled with deterministic random data so each tile body has
-/// meaningful input even when its upstream tiles are still placeholders.
-fn build_test_buffers() -> (TestBuffers, Vec<bf16>, Vec<bf16>, Vec<bf16>, Vec<bf16>) {
+/// Initial inputs the host fills before launching, so each tile body has
+/// non-zero data to operate on regardless of which upstream tiles are still
+/// placeholders.
+struct TestInputs {
+    h_data: Vec<bf16>,
+    an_w_data: Vec<bf16>,
+    mn_w_data: Vec<bf16>,
+    attn_out_data: Vec<bf16>,
+    qkv_data: Vec<bf16>,
+}
+
+/// Build the standard set of test buffers for the tiny model.
+fn build_test_buffers() -> (TestBuffers, TestInputs) {
     let dims = scheduled_prefill_tiny_dims();
     let hd = dims.hidden_dim as usize;
     let seq = dims.seq_len as usize;
@@ -247,18 +256,28 @@ fn build_test_buffers() -> (TestBuffers, Vec<bf16>, Vec<bf16>, Vec<bf16>, Vec<bf
     let an_w_data = random_bf16(nl * hd, 2, 1.0);
     let mn_w_data = random_bf16(nl * hd, 3, 1.0);
     let attn_out_data = random_bf16(seq * hd, 4, 0.5);
+    let qkv_data = random_bf16(seq * qkv_dim, 5, 0.5);
 
     let b = TestBuffers {
         hidden_states: gpu_upload_bf16(&h_data),
         rms_rope: gpu_alloc_zeros(seq * hd * 2),
-        qkv: gpu_alloc_zeros(seq * qkv_dim * 2),
+        qkv: gpu_upload_bf16(&qkv_data),
         attn_out: gpu_upload_bf16(&attn_out_data),
         rms_gate: gpu_alloc_zeros(seq * hd * 2),
         silu_out: gpu_alloc_zeros(seq * id * 2),
         attn_norm_w: gpu_upload_bf16(&an_w_data),
         mlp_norm_w: gpu_upload_bf16(&mn_w_data),
     };
-    (b, h_data, an_w_data, mn_w_data, attn_out_data)
+    (
+        b,
+        TestInputs {
+            h_data,
+            an_w_data,
+            mn_w_data,
+            attn_out_data,
+            qkv_data,
+        },
+    )
 }
 
 #[test]
@@ -271,15 +290,15 @@ fn tile_attn_norm_matches_cpu_golden() {
     let nl = dims.num_layers as usize;
     let eps: f32 = 1e-5;
 
-    let (b, h_data, an_w_data, _, _) = build_test_buffers();
+    let (b, inp) = build_test_buffers();
     let _ = launch_with_buffers(&b, eps);
 
     // The wave schedule executes layers in order, so layer (NL-1)'s attn_norm
     // is the last writer for each row in rms_rope. Validate against that.
     let rms_rope_gpu = gpu_download_bf16(b.rms_rope, seq * hd);
-    let last_layer_w = &an_w_data[(nl - 1) * hd..nl * hd];
+    let last_layer_w = &inp.an_w_data[(nl - 1) * hd..nl * hd];
     assert_matches_golden(&rms_rope_gpu, seq, hd, "tile_attn_norm", |r| {
-        cpu_rms_norm(&h_data[r * hd..(r + 1) * hd], last_layer_w, eps)
+        cpu_rms_norm(&inp.h_data[r * hd..(r + 1) * hd], last_layer_w, eps)
     });
 }
 
@@ -293,14 +312,94 @@ fn tile_mlp_norm_matches_cpu_golden() {
     let nl = dims.num_layers as usize;
     let eps: f32 = 1e-5;
 
-    let (b, _, _, mn_w_data, attn_out_data) = build_test_buffers();
+    let (b, inp) = build_test_buffers();
     let _ = launch_with_buffers(&b, eps);
 
     // Last writer wins: layer (NL-1)'s mlp_norm. attn_out is non-zero
     // (pre-filled by build_test_buffers) so the validation is meaningful.
     let rms_gate_gpu = gpu_download_bf16(b.rms_gate, seq * hd);
-    let last_layer_w = &mn_w_data[(nl - 1) * hd..nl * hd];
+    let last_layer_w = &inp.mn_w_data[(nl - 1) * hd..nl * hd];
     assert_matches_golden(&rms_gate_gpu, seq, hd, "tile_mlp_norm", |r| {
-        cpu_rms_norm(&attn_out_data[r * hd..(r + 1) * hd], last_layer_w, eps)
+        cpu_rms_norm(&inp.attn_out_data[r * hd..(r + 1) * hd], last_layer_w, eps)
     });
+}
+
+/// CPU reference for one application of LLaMA-style split-half RoPE on Q/K
+/// portions of a qkv row, in place. V heads pass through.
+fn cpu_rope_one(
+    qkv_row: &mut [bf16],
+    position: usize,
+    head_dim: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+) {
+    let half = head_dim / 2;
+    let theta_base: f32 = 10000.0;
+    let total_rotated_heads = num_q_heads + num_kv_heads;
+    for h in 0..total_rotated_heads {
+        let head_off = h * head_dim;
+        for c in 0..half {
+            let exp = (2 * c) as f32 / head_dim as f32;
+            let inv_freq = theta_base.powf(-exp);
+            let ang = position as f32 * inv_freq;
+            let cos_v = ang.cos();
+            let sin_v = ang.sin();
+            let x0 = qkv_row[head_off + c].to_f32();
+            let x1 = qkv_row[head_off + c + half].to_f32();
+            qkv_row[head_off + c] = bf16::from_f32(x0 * cos_v - x1 * sin_v);
+            qkv_row[head_off + c + half] = bf16::from_f32(x0 * sin_v + x1 * cos_v);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn tile_rope_matches_cpu_golden() {
+    init_cuda();
+    let dims = scheduled_prefill_tiny_dims();
+    let qkv_dim = ((dims.num_attn_heads + 2 * dims.num_kv_heads) * dims.head_dim) as usize;
+    let seq = dims.seq_len as usize;
+    let nl = dims.num_layers as usize;
+    let hdm = dims.head_dim as usize;
+    let nah = dims.num_attn_heads as usize;
+    let nkh = dims.num_kv_heads as usize;
+    let eps: f32 = 1e-5;
+
+    let (b, inp) = build_test_buffers();
+    let _ = launch_with_buffers(&b, eps);
+
+    // RoPE is in-place on the qkv buffer. The wave schedule applies RoPE
+    // once per layer using the same parameters, so the buffer is rotated
+    // NL times in total. CPU golden does the same.
+    let qkv_gpu = gpu_download_bf16(b.qkv, seq * qkv_dim);
+    let mut qkv_golden: Vec<bf16> = inp.qkv_data.clone();
+    for r in 0..seq {
+        for _ in 0..nl {
+            let row = &mut qkv_golden[r * qkv_dim..(r + 1) * qkv_dim];
+            cpu_rope_one(row, r, hdm, nah, nkh);
+        }
+    }
+
+    let mut max_abs_err = 0.0_f32;
+    let mut max_rel_err = 0.0_f32;
+    for i in 0..seq * qkv_dim {
+        let g = qkv_golden[i].to_f32();
+        let k = qkv_gpu[i].to_f32();
+        let abs = (g - k).abs();
+        let rel = if g.abs() > 1e-3 { abs / g.abs() } else { 0.0 };
+        if abs > max_abs_err {
+            max_abs_err = abs;
+        }
+        if rel > max_rel_err {
+            max_rel_err = rel;
+        }
+    }
+    eprintln!(
+        "tile_rope: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
+        max_rel_err * 100.0
+    );
+    // RoPE accumulates rounding error each layer. NL=2 layers + bf16 → tolerance
+    // of 0.05 abs / 5% rel covers it comfortably.
+    assert!(max_abs_err < 0.05, "tile_rope: max abs err {max_abs_err}");
+    assert!(max_rel_err < 0.05, "tile_rope: max rel err {max_rel_err}");
 }

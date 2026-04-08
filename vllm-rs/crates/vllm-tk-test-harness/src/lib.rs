@@ -348,6 +348,7 @@ pub mod ffi {
             mlp_norm_w: *mut std::ffi::c_void,
             // GEMM weights
             qkv_w: *mut std::ffi::c_void,
+            o_w: *mut std::ffi::c_void,
             eps: f32,
             // Validation buffers
             flags: *mut u32,

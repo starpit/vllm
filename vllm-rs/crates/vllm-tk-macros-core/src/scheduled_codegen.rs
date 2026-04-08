@@ -294,6 +294,7 @@ struct globals_t {
     __nv_bfloat16* mlp_norm_w;     // [num_layers, HIDDEN_DIM]
     // GEMM weights, per layer.
     __nv_bfloat16* qkv_w;          // [num_layers, qkv_dim, HIDDEN_DIM]
+    __nv_bfloat16* o_w;            // [num_layers, HIDDEN_DIM, HIDDEN_DIM]
     float          eps;
 };
 
@@ -441,7 +442,45 @@ __device__ __forceinline__ void tile_rope(const globals_t& g, uint32_t /*layer*/
     }
 }
 __device__ __forceinline__ void tile_attention(const globals_t&, uint32_t /*layer*/, uint32_t /*row*/) {}
-__device__ __forceinline__ void tile_o_proj   (const globals_t&, uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+
+// ── tile_o_proj: GEMM + residual. M=ROW_TILE, N=O_COL_TILE, K=HIDDEN_DIM. ──
+//
+// hidden_states[m,n] += sum_k attn_out[m,k] * o_w[layer, n, k]
+//
+// Same naive output-stationary structure as tile_qkv but with a residual
+// seed: each output reads its current value and accumulates onto it.
+__device__ __forceinline__ void tile_o_proj(const globals_t& g, uint32_t layer, uint32_t row, uint32_t col) {
+    constexpr uint32_t M = MODEL_ROW_TILE;
+    constexpr uint32_t K = MODEL_HIDDEN_DIM;
+    constexpr uint32_t N = MODEL_O_COL_TILE;
+    constexpr uint32_t HD_FULL = MODEL_HIDDEN_DIM;
+    const uint32_t row_start = row * M;
+    const uint32_t col_start = col * N;
+    if (row_start >= MODEL_SEQ_LEN) return;
+
+    const __nv_bfloat16* A = g.attn_out + (size_t)row_start * K;
+    const __nv_bfloat16* B = g.o_w
+        + (size_t)layer * HD_FULL * K
+        + (size_t)col_start * K;
+    __nv_bfloat16* C = g.hidden_states + (size_t)row_start * HD_FULL + col_start;
+
+    const uint32_t lane = threadIdx.x;
+    const uint32_t total = M * N;
+    for (uint32_t idx = lane; idx < total; idx += 32) {
+        const uint32_t m = idx / N;
+        const uint32_t n = idx % N;
+        if (row_start + m >= MODEL_SEQ_LEN) continue;
+        // Residual seed: read existing C value into the accumulator.
+        float acc = __bfloat162float(C[m * HD_FULL + n]);
+        for (uint32_t k = 0; k < K; ++k) {
+            const float a = __bfloat162float(A[m * K + k]);
+            const float b = __bfloat162float(B[n * K + k]);
+            acc += a * b;
+        }
+        C[m * HD_FULL + n] = __float2bfloat16(acc);
+    }
+}
+
 
 // ── tile_mlp_norm: real RMS norm, same structure as tile_attn_norm but
 // reads attn_out and writes rms_gate using mlp_norm_w. ──
@@ -550,6 +589,7 @@ extern "C" void launch_scheduled_megakernel(
     void* mlp_norm_w,
     // GEMM weights (bf16)
     void* qkv_w,
+    void* o_w,
     float eps,
     // Validation buffers
     unsigned int* flags,
@@ -566,6 +606,7 @@ extern "C" void launch_scheduled_megakernel(
         reinterpret_cast<__nv_bfloat16*>(attn_norm_w),
         reinterpret_cast<__nv_bfloat16*>(mlp_norm_w),
         reinterpret_cast<__nv_bfloat16*>(qkv_w),
+        reinterpret_cast<__nv_bfloat16*>(o_w),
         eps,
     };
     pfl_sched::SchedRuntime rt{flags, tick_counter, barrier_arrived};

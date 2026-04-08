@@ -206,6 +206,127 @@ fn emit_u32_chunked(out: &mut String, vals: &[u32]) {
     }
 }
 
+/// Phase 3b — emit a complete `.cu` file containing:
+///   1. The schedule data (via `emit_schedule_cpp`)
+///   2. Placeholder `tile_<phase>` device functions (sentinel-write only)
+///   3. The persistent-CTA megakernel
+///   4. An `extern "C"` host launch helper
+///
+/// The placeholder tiles do NO real compute. They exist to validate the
+/// dispatch loop / dep-flag sync end-to-end. Phase 3c+ will replace the
+/// placeholders with the actual phase implementations.
+///
+/// The kernel is parameterized by the reified DAG that produced the schedule
+/// so the validation buffer (one u32 tick per node) can be sized correctly.
+pub fn emit_scheduled_megakernel_cu(dag: &ReifiedDag, sched: &Schedule) -> String {
+    let mut out = String::new();
+    out.push_str(&emit_schedule_cpp(dag, sched));
+    out.push_str(KERNEL_BODY);
+    out
+}
+
+/// The kernel body is a static string — pure CUDA, only depends on the
+/// schedule namespace emitted just above. No TK headers, no CUTLASS — that
+/// keeps compile time tiny and the validator self-contained.
+const KERNEL_BODY: &str = r#"
+// ──────────────────────────────────────────────────────────────────────
+// Phase 3b: scheduled megakernel — placeholder tiles, real dispatch loop.
+// ──────────────────────────────────────────────────────────────────────
+
+#include <cuda_runtime.h>
+#include <cstdio>
+
+namespace pfl_sched {
+
+// Per-node completion flag (set to monotonic tick when the node finishes).
+// Sized to NUM_NODES, allocated host-side and zero-initialized before launch.
+//
+// We store the *tick* (a global monotonic counter) at the producer's slot
+// instead of just "1" so the validator can verify topological order: every
+// node's tick must be greater than every one of its deps' ticks.
+struct SchedRuntime {
+    unsigned int* flags;       // [NUM_NODES] — 0 means not done; nonzero is the tick
+    unsigned int* tick_counter; // [1] — global atomic, returns the next tick
+};
+
+__device__ __forceinline__ void tile_attn_norm(uint32_t /*layer*/, uint32_t /*row*/) {}
+__device__ __forceinline__ void tile_qkv      (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+__device__ __forceinline__ void tile_rope     (uint32_t /*layer*/, uint32_t /*row*/) {}
+__device__ __forceinline__ void tile_attention(uint32_t /*layer*/, uint32_t /*row*/) {}
+__device__ __forceinline__ void tile_o_proj   (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+__device__ __forceinline__ void tile_mlp_norm (uint32_t /*layer*/, uint32_t /*row*/) {}
+__device__ __forceinline__ void tile_gate_up  (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+__device__ __forceinline__ void tile_down     (uint32_t /*layer*/, uint32_t /*row*/, uint32_t /*col*/) {}
+
+__global__ void scheduled_megakernel(SchedRuntime rt) {
+    const uint32_t cta_id = blockIdx.x;
+    const uint32_t tid    = threadIdx.x;
+    if (cta_id >= NUM_CTAS) return;
+
+    const uint32_t my_off  = SCHED_CTA_OFFSETS[cta_id];
+    const uint32_t my_end  = SCHED_CTA_OFFSETS[cta_id + 1];
+
+    for (uint32_t i = my_off; i < my_end; ++i) {
+        const NodeRecord rec = SCHED_CTA_STREAM[i];
+
+        // ── Wait on every dep's completion flag ──
+        // Single-threaded spin: only thread 0 polls, then __syncthreads.
+        // Hierarchical sync (smem barrier per row group) is a Phase 3+
+        // optimization once correctness is locked in.
+        if (tid == 0) {
+            for (uint16_t d = 0; d < rec.dep_count; ++d) {
+                const uint32_t dep_id = SCHED_ALL_DEPS[rec.dep_off + d];
+                while (atomicAdd(&rt.flags[dep_id], 0u) == 0u) {
+                    // spin
+                }
+            }
+        }
+        __syncthreads();
+
+        // ── Dispatch to the right placeholder ──
+        switch (rec.phase) {
+            case PHASE_ATTN_NORM: tile_attn_norm(rec.layer, rec.row); break;
+            case PHASE_QKV:       tile_qkv      (rec.layer, rec.row, rec.col); break;
+            case PHASE_ROPE:      tile_rope     (rec.layer, rec.row); break;
+            case PHASE_ATTENTION: tile_attention(rec.layer, rec.row); break;
+            case PHASE_O_PROJ:    tile_o_proj   (rec.layer, rec.row, rec.col); break;
+            case PHASE_MLP_NORM:  tile_mlp_norm (rec.layer, rec.row); break;
+            case PHASE_GATE_UP:   tile_gate_up  (rec.layer, rec.row, rec.col); break;
+            case PHASE_DOWN:      tile_down     (rec.layer, rec.row, rec.col); break;
+            default: break;
+        }
+
+        // ── Signal completion: stamp our tick into our flag slot ──
+        __syncthreads();
+        if (tid == 0) {
+            const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;  // 1-based
+            __threadfence();
+            atomicExch(&rt.flags[rec.my_node_id], tick);
+        }
+        __syncthreads();
+    }
+}
+
+}  // namespace pfl_sched
+
+extern "C" void launch_scheduled_megakernel(unsigned int* flags,
+                                            unsigned int* tick_counter,
+                                            cudaStream_t stream) {
+    pfl_sched::SchedRuntime rt{flags, tick_counter};
+    dim3 grid(pfl_sched::NUM_CTAS);
+    dim3 block(32);
+    pfl_sched::scheduled_megakernel<<<grid, block, 0, stream>>>(rt);
+}
+
+extern "C" unsigned int scheduled_megakernel_num_nodes() {
+    return pfl_sched::NUM_NODES;
+}
+
+extern "C" unsigned int scheduled_megakernel_num_ctas() {
+    return pfl_sched::NUM_CTAS;
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

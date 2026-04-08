@@ -613,6 +613,43 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
     Ok(fused_codegen::generate_fused_prefill_v2(&dag, &cfg))
 }
 
+/// Phase 3b — generate a placeholder scheduled megakernel for a tiny test
+/// model (2 layers, 32 tokens). Includes the schedule data, placeholder
+/// `tile_<phase>` stubs, the persistent CTA loop, and an `extern "C"`
+/// `launch_scheduled_megakernel` host helper.
+///
+/// Returns the complete `.cu` source so build.rs can drop it into the
+/// cudaforge static library.
+pub fn scheduled_prefill_tiny_dims() -> reified_dag::LlamaDims {
+    // Tiny model — keeps the schedule small (~hundreds of nodes) so the
+    // validator runs in microseconds and the static array fits in a few KB.
+    reified_dag::LlamaDims {
+        num_layers: 2,
+        hidden_dim: 256,
+        intermediate_dim: 512,
+        num_attn_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 64,
+        seq_len: 32,
+    }
+}
+
+/// CTA pool size used for the tiny scheduled megakernel test fixture.
+pub const SCHEDULED_PREFILL_TINY_CTAS: u32 = 4;
+
+pub fn generate_scheduled_prefill_tiny() -> String {
+    use crate::reified_dag::{ReifiedDag, TileSizes};
+    use crate::schedule::{CostModel, schedule};
+    use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
+
+    let dims = scheduled_prefill_tiny_dims();
+    let dag = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
+    let cost = CostModel::from_dag(&dag);
+    // Use a small CTA pool for the tiny model — keeps the launch fast.
+    let sched = schedule(&dag, SCHEDULED_PREFILL_TINY_CTAS, &cost);
+    emit_scheduled_megakernel_cu(&dag, &sched)
+}
+
 /// Generate a debug variant of the decode kernel that syncs and writes a
 /// marker to a debug buffer after each op. Useful for identifying which op
 /// crashes in the full megakernel.

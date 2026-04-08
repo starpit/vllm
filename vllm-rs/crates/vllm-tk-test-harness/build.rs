@@ -158,12 +158,18 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_layer_path.display()));
     cu_files.push(fused_layer_path.display().to_string());
 
+    // Phase 3b — placeholder scheduled megakernel for the tiny test fixture.
+    let scheduled_tiny_source = vllm_tk_macros_core::generate_scheduled_prefill_tiny();
+    let scheduled_tiny_path = out_dir.join("scheduled_prefill_tiny.cu");
+    std::fs::write(&scheduled_tiny_path, &scheduled_tiny_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", scheduled_tiny_path.display()));
+    cu_files.push(scheduled_tiny_path.display().to_string());
+
     // Build all test kernels into one static library
     // CUTLASS headers (optional — if present, the megakernel can include
     // cute/CUTLASS device-side primitives for cuBLAS-quality GEMM phases).
     let cutlass_root = std::path::PathBuf::from(
-        std::env::var("CUTLASS_ROOT")
-            .unwrap_or_else(|_| "/home/moosevan/cutlass".to_string()),
+        std::env::var("CUTLASS_ROOT").unwrap_or_else(|_| "/home/moosevan/cutlass".to_string()),
     );
     let cutlass_include = cutlass_root.join("include");
     let cutlass_tools_util = cutlass_root.join("tools/util/include");
@@ -182,7 +188,10 @@ fn build_cuda() {
             .include_path(cutlass_include.display().to_string())
             .include_path(cutlass_tools_util.display().to_string());
     } else {
-        println!("cargo:warning=cutlass not found at {} (set CUTLASS_ROOT)", cutlass_root.display());
+        println!(
+            "cargo:warning=cutlass not found at {} (set CUTLASS_ROOT)",
+            cutlass_root.display()
+        );
     }
     builder
         .arg("-std=c++20")

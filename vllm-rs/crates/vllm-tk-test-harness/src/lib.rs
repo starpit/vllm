@@ -330,4 +330,17 @@ pub mod ffi {
     declare_test_launch!(fused_multi_sm_profile_launch);
     declare_test_launch!(fused_prefill_attn_launch);
     declare_test_launch!(fused_prefill_layer_launch);
+
+    // Phase 3b — scheduled megakernel placeholder. Different signature
+    // (just three pointers / counters), declared by hand instead of via
+    // the macro.
+    unsafe extern "C" {
+        pub fn launch_scheduled_megakernel(
+            flags: *mut u32,
+            tick_counter: *mut u32,
+            stream: *mut std::ffi::c_void,
+        );
+        pub fn scheduled_megakernel_num_nodes() -> u32;
+        pub fn scheduled_megakernel_num_ctas() -> u32;
+    }
 }

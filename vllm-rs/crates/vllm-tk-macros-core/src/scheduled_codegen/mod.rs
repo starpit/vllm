@@ -29,26 +29,11 @@ use std::fmt::Write as _;
 use askama::Template;
 
 use crate::kernel_library::{BoundKernel, CoalescedDag};
-use crate::reified_dag::Phase;
 use crate::schedule::WaveSchedule;
 
 mod templates;
 
 use templates::MegakernelCtx;
-
-/// Numeric phase tag matching the C++ enum.
-pub fn phase_tag(p: Phase) -> u32 {
-    match p {
-        Phase::AttnNorm => 0,
-        Phase::Qkv => 1,
-        Phase::Rope => 2,
-        Phase::Attention => 3,
-        Phase::OProj => 4,
-        Phase::MlpNorm => 5,
-        Phase::GateUp => 6,
-        Phase::Down => 7,
-    }
-}
 
 /// Phase 3b-bsp — emit a complete `.cu` file containing the wave program
 /// data + tile bodies + grid-barrier megakernel + extern "C" launchers.
@@ -94,32 +79,23 @@ pub fn emit_scheduled_megakernel_cu(
             wave_cta_offsets.push(cursor);
             for nid in &wave.cta_nodes[cta] {
                 let nd = &dag.nodes[nid.0 as usize];
-                match nd.kernel {
+                // The WAVE_OPS schema is now kernel-tagged: the first
+                // u32 is `BoundKernel::kernel_tag()` rather than a phase
+                // index. For HandWrittenRowTile bindings the tag is
+                // numerically identical to the old phase tag (0..7), so
+                // the table is byte-equivalent to pre-C2b-step-1
+                // output. For FlashInferAttentionLayer the tag is 8 and
+                // (row, col) are unused (the per-row work is rolled up
+                // into the runner) — the megakernel's dispatch switch
+                // grows a matching `case 8` arm.
+                let tag = nd.kernel.kernel_tag();
+                let (layer, row, col) = match nd.kernel {
                     BoundKernel::HandWrittenRowTile {
-                        phase,
-                        layer,
-                        row,
-                        col,
-                    } => {
-                        ops.push((phase_tag(phase), layer as u32, row as u32, col as u32));
-                    }
-                    BoundKernel::FlashInferAttentionLayer { .. } => {
-                        // C2a: this variant exists in the library but is
-                        // not yet emitted by the production coalesce pass
-                        // wired into this codegen path. C2b grows the
-                        // WAVE_OPS schema to be kernel-tagged and adds a
-                        // dispatch arm that emits a flashinfer work item
-                        // carrying the layer index. Until then, hitting
-                        // this arm means somebody used
-                        // `coalesce_with_flashinfer_attention` from the
-                        // production path prematurely.
-                        panic!(
-                            "scheduled_codegen reached a FlashInferAttentionLayer node \
-                             in Phase C2a; the production pipeline must still use the \
-                             trivial coalesce() until C2b grows the WAVE_OPS schema"
-                        );
-                    }
-                }
+                        layer, row, col, ..
+                    } => (layer as u32, row as u32, col as u32),
+                    BoundKernel::FlashInferAttentionLayer { layer } => (layer as u32, 0, 0),
+                };
+                ops.push((tag, layer, row, col));
                 node_ids.push(nid.0);
                 cursor += 1;
             }

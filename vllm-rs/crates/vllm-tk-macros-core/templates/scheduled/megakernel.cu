@@ -15,19 +15,33 @@ constexpr uint32_t NUM_NODES = {{ num_nodes }};
 constexpr uint32_t NUM_WAVES = {{ num_waves }};
 constexpr uint32_t NUM_CTAS  = {{ num_ctas }};
 
-// Phase tags
-constexpr uint32_t PHASE_ATTN_NORM = 0;
-constexpr uint32_t PHASE_QKV       = 1;
-constexpr uint32_t PHASE_ROPE      = 2;
-constexpr uint32_t PHASE_ATTENTION = 3;
-constexpr uint32_t PHASE_O_PROJ    = 4;
-constexpr uint32_t PHASE_MLP_NORM  = 5;
-constexpr uint32_t PHASE_GATE_UP   = 6;
-constexpr uint32_t PHASE_DOWN      = 7;
+// Kernel tags. The first u32 of each TileOp identifies which library
+// kernel binding is responsible for that work item — see
+// `BoundKernel::kernel_tag` in vllm-tk-macros-core/src/kernel_library.rs.
+//
+// Tags 0..7 dispatch to the existing per-row hand-written tile bodies
+// (`HandWrittenRowTile`). Tags ≥8 dispatch to library-bound kernels:
+//
+//   8 — FlashInferAttentionLayer (one work item per layer; the
+//       per-row work is rolled up into FlashInfer's persistent
+//       runner). Production codegen does not yet emit this tag —
+//       Phase C2b-step-2 enables it via the flashinfer-aware
+//       coalesce pass and Phase C2b-step-3 replaces the placeholder
+//       dispatch body below with a real call to
+//       BlockBatchPagedAttentionPersistent::Run.
+constexpr uint32_t PHASE_ATTN_NORM      = 0;
+constexpr uint32_t PHASE_QKV            = 1;
+constexpr uint32_t PHASE_ROPE           = 2;
+constexpr uint32_t PHASE_ATTENTION      = 3;
+constexpr uint32_t PHASE_O_PROJ         = 4;
+constexpr uint32_t PHASE_MLP_NORM       = 5;
+constexpr uint32_t PHASE_GATE_UP        = 6;
+constexpr uint32_t PHASE_DOWN           = 7;
+constexpr uint32_t PHASE_FLASHINFER_ATTN = 8;
 
-// 16-byte TileOp (4 u32s — phase + layer + row + col).
+// 16-byte TileOp (4 u32s — kernel_tag + layer + row + col).
 struct TileOp {
-  uint32_t phase;
+  uint32_t kernel_tag;
   uint32_t layer;
   uint32_t row;
   uint32_t col;
@@ -1154,11 +1168,16 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
     // means only one tile body runs at a time per CTA, so they can share.
     __shared__ alignas(16) char tile_smem[TILE_SHMEM_BYTES];
 
-    // Per-CTA per-phase clock accumulator (sum of clock64() deltas around
-    // each tile body). Lives in registers; written to gmem at the very end
-    // if instrumentation is enabled (rt.phase_clocks != nullptr). Index 8
-    // is "idle / sync / barrier" — everything outside a tile body.
-    unsigned long long phase_clock[9] = {0,0,0,0,0,0,0,0,0};
+    // Per-CTA per-kernel-tag clock accumulator (sum of clock64() deltas
+    // around each tile body). Lives in registers; written to gmem at
+    // the very end if instrumentation is enabled (rt.phase_clocks !=
+    // nullptr). Slots 0..7 are the per-phase HandWrittenRowTile bodies,
+    // slot 8 is FlashInferAttentionLayer, slot 9 is "idle / sync /
+    // barrier" (everything outside a tile body). The Rust bench reader
+    // strides at 10 to match.
+    constexpr uint32_t NUM_CLOCK_SLOTS = 10;
+    constexpr uint32_t IDLE_SLOT = 9;
+    unsigned long long phase_clock[NUM_CLOCK_SLOTS] = {0,0,0,0,0,0,0,0,0,0};
     const bool prof = (rt.phase_clocks != nullptr) && (tid == 0);
     unsigned long long t_outside = prof ? clock64() : 0ULL;
 
@@ -1172,9 +1191,9 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
             unsigned long long t_in = 0ULL;
             if (prof) {
                 t_in = clock64();
-                phase_clock[8] += t_in - t_outside;  // accumulate idle time
+                phase_clock[IDLE_SLOT] += t_in - t_outside;  // accumulate idle time
             }
-            switch (op.phase) {
+            switch (op.kernel_tag) {
                 case PHASE_ATTN_NORM: tile_attn_norm(g, op.layer, op.row); break;
                 case PHASE_QKV:       tile_qkv      (g, op.layer, op.row, op.col, tile_smem); break;
                 case PHASE_ROPE:      tile_rope     (g, op.layer, op.row); break;
@@ -1183,13 +1202,34 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                 case PHASE_MLP_NORM:  tile_mlp_norm (g, op.layer, op.row); break;
                 case PHASE_GATE_UP:   tile_gate_up  (g, op.layer, op.row, op.col, tile_smem); break;
                 case PHASE_DOWN:      tile_down     (g, op.layer, op.row, op.col, tile_smem); break;
+                case PHASE_FLASHINFER_ATTN: {
+                    // Phase C2b-step-1 placeholder. The production
+                    // codegen path does not yet emit this tag — Phase
+                    // C2b-step-2 enables it via the flashinfer-aware
+                    // coalesce pass. C2b-step-3 replaces this body
+                    // with a real call to
+                    // BlockBatchPagedAttentionPersistent::Run.
+                    //
+                    // Until C2b-step-3 lands, the placeholder body
+                    // reproduces the pre-coalesce per-row tile_attention
+                    // behavior so that flipping the coalesce switch in
+                    // C2b-step-2 produces correct (if not faster)
+                    // output. CTA-strided over row tiles so all CTAs
+                    // in a wave-cooperative wave do useful work.
+                    constexpr uint32_t NUM_ROW_TILES =
+                        (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+                    for (uint32_t r = cta_id; r < NUM_ROW_TILES; r += NUM_CTAS) {
+                        tile_attention(g, op.layer, r, tile_smem);
+                    }
+                    break;
+                }
                 default: break;
             }
             // Stamp validation tick. Single-threaded.
             __syncthreads();
             if (prof) {
                 t_outside = clock64();
-                phase_clock[op.phase] += t_outside - t_in;
+                phase_clock[op.kernel_tag] += t_outside - t_in;
             }
             if (tid == 0) {
                 const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;
@@ -1203,13 +1243,13 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
         grid_barrier(rt.barrier_arrived, w);
     }
 
-    // Flush per-phase clocks to gmem.
+    // Flush per-kernel-tag clocks to gmem.
     if (prof) {
         const unsigned long long t_end = clock64();
-        phase_clock[8] += t_end - t_outside;
-        unsigned long long* row = rt.phase_clocks + (size_t)cta_id * 9;
+        phase_clock[IDLE_SLOT] += t_end - t_outside;
+        unsigned long long* row = rt.phase_clocks + (size_t)cta_id * NUM_CLOCK_SLOTS;
         #pragma unroll
-        for (int p = 0; p < 9; ++p) {
+        for (int p = 0; p < (int)NUM_CLOCK_SLOTS; ++p) {
             row[p] = phase_clock[p];
         }
     }

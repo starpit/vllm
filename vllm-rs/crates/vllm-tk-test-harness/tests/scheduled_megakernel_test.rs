@@ -1237,8 +1237,12 @@ fn llama_1b_seq1024_bench() {
     let tick = gpu_alloc_zeros_u32(1);
     let barrier = gpu_alloc_zeros_u32(1);
 
-    // Per-phase clock buffer: [num_ctas][9] u64. Sized once.
-    let phase_clocks_bytes = (kernel_ctas as usize) * 9 * 8;
+    // Per-kernel-tag clock buffer: [num_ctas][10] u64. Sized once.
+    // Slots 0..7 are HandWrittenRowTile by phase, 8 is
+    // FlashInferAttentionLayer, 9 is idle/sync. See megakernel.cu's
+    // NUM_CLOCK_SLOTS / IDLE_SLOT constants.
+    const NUM_CLOCK_SLOTS: usize = 10;
+    let phase_clocks_bytes = (kernel_ctas as usize) * NUM_CLOCK_SLOTS * 8;
     let phase_clocks = gpu_alloc_zeros(phase_clocks_bytes) as *mut u64;
     let launch = || unsafe {
         ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024(
@@ -1306,7 +1310,7 @@ fn llama_1b_seq1024_bench() {
     // Download per-phase clock breakdown from the LAST launch.
     // (50 launches' worth would average out, but reading once after all
     //  launches gives us the breakdown of the most recent run.)
-    let mut clocks = vec![0u64; (kernel_ctas as usize) * 9];
+    let mut clocks = vec![0u64; (kernel_ctas as usize) * NUM_CLOCK_SLOTS];
     unsafe {
         result::memcpy_dtoh_sync(
             &mut clocks,
@@ -1315,11 +1319,11 @@ fn llama_1b_seq1024_bench() {
         .unwrap();
     }
     // Sum across CTAs (max would also be informative for tail effect).
-    let mut sum_per_phase = [0u64; 9];
-    let mut max_per_phase = [0u64; 9];
+    let mut sum_per_phase = [0u64; NUM_CLOCK_SLOTS];
+    let mut max_per_phase = [0u64; NUM_CLOCK_SLOTS];
     for cta in 0..kernel_ctas as usize {
-        for p in 0..9 {
-            let v = clocks[cta * 9 + p];
+        for p in 0..NUM_CLOCK_SLOTS {
+            let v = clocks[cta * NUM_CLOCK_SLOTS + p];
             sum_per_phase[p] += v;
             if v > max_per_phase[p] {
                 max_per_phase[p] = v;
@@ -1335,6 +1339,7 @@ fn llama_1b_seq1024_bench() {
         "mlp_norm ",
         "gate_up  ",
         "down     ",
+        "fi_attn  ",
         "idle/sync",
     ];
     // L4 SM clock under load: ~1.5 GHz. Convert clocks → ms.

@@ -106,6 +106,34 @@ impl BoundKernel {
     /// library entries land, each provides its own per-binding cost
     /// — e.g. `FlashInferAttentionLayer` will roll up the whole
     /// layer's attention into one number.
+    /// Numeric tag identifying this binding's dispatch arm in the
+    /// generated megakernel's per-CTA op switch. Tags 0..7 are
+    /// reserved for the existing per-phase
+    /// [`BoundKernel::HandWrittenRowTile`] dispatch (matching the
+    /// `PHASE_*` constants in the megakernel template). Tags ≥8 are
+    /// for library-bound kernels:
+    ///
+    /// - `8` — `FlashInferAttentionLayer`
+    ///
+    /// New library entries claim a stable tag in this enum. The
+    /// megakernel template's dispatch switch must grow a matching
+    /// `case` arm at the same time.
+    pub fn kernel_tag(&self) -> u32 {
+        match self {
+            BoundKernel::HandWrittenRowTile { phase, .. } => match phase {
+                Phase::AttnNorm => 0,
+                Phase::Qkv => 1,
+                Phase::Rope => 2,
+                Phase::Attention => 3,
+                Phase::OProj => 4,
+                Phase::MlpNorm => 5,
+                Phase::GateUp => 6,
+                Phase::Down => 7,
+            },
+            BoundKernel::FlashInferAttentionLayer { .. } => 8,
+        }
+    }
+
     pub fn cost(&self, model: &CostModel) -> u32 {
         match self {
             BoundKernel::HandWrittenRowTile { phase, .. } => model.cost(*phase),

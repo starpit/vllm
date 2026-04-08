@@ -419,20 +419,39 @@ __device__ __forceinline__ void tile_attn_norm(const globals_t& g, uint32_t laye
 // amortize the gmem load cost over more compute but cost more shmem.
 constexpr uint32_t SHMEM_GEMM_K_BLOCK = 32;
 
+// cp.async 16-byte chunk copy from gmem→shmem. The shmem pointer must be
+// 16-byte aligned. Issues a single sm_80+ cp.async.cg instruction; group
+// commit / wait_group is the caller's responsibility.
+__device__ __forceinline__ void cp_async_16(void* smem_dst, const void* gmem_src) {
+    unsigned smem_int = static_cast<unsigned>(__cvta_generic_to_shared(smem_dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(smem_int), "l"(gmem_src));
+}
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+template<int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
 // Single CTA-wide shmem arena reused across tile bodies. Wave scheduling
 // guarantees only one tile body runs at a time per CTA, so all tile
 // bodies that need shmem share this arena and partition it locally.
 //
-// Sized for the worst case (tile_gate_up with two B operands + two
-// accumulator scratches):
-//   a_smem        = M × KB × 2 = 16 × 32 × 2  = 1024 B
-//   b_gate_smem   = N × KB × 2 = 128 × 32 × 2 = 8192 B
-//   b_up_smem     = N × KB × 2 = 128 × 32 × 2 = 8192 B
-//   gate_scratch  = NW × WMMA_M × WMMA_N × 4   = 8192 B
-//   up_scratch    = NW × WMMA_M × WMMA_N × 4   = 8192 B
-//   total                                       = 33792 B
-// Rounded up to 36 KiB for headroom. Still well within the 48 KiB
-// default sm89 carveout.
+// Sized for the worst case (tile_gate_up: 2-stage cp.async double buffer
+// for A + B_gate + B_up):
+//   stage 0 / stage 1 each:
+//     a_smem      = M  × KB × 2 = 16  × 32 × 2 = 1024 B
+//     b_gate_smem = N  × KB × 2 = 128 × 32 × 2 = 8192 B
+//     b_up_smem   = N  × KB × 2 = 128 × 32 × 2 = 8192 B
+//     stage total                              = 17408 B
+//   2 stages                                   = 34816 B
+// Accumulator scratches (gate_scratch + up_scratch = 16 KiB) alias with
+// stage 0 — they are only touched after the K loop ends, by which point
+// stage 0 has been fully consumed.
+// Rounded up to 36 KiB. Still within the 48 KiB default sm89 static
+// shmem carveout.
 constexpr uint32_t TILE_SHMEM_BYTES = 36 * 1024;
 
 // ── tile_qkv: shmem-staged tensor-core GEMM. ──
@@ -971,11 +990,30 @@ __device__ __forceinline__ void tile_gate_up(
     const uint32_t n_warp_start = warp_id * N_PER_WARP;
     const uint32_t lane = threadIdx.x;
 
-    // Partition shmem: a_smem | b_gate_smem | b_up_smem | gate_scratch | up_scratch
-    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(tile_smem);
-    __nv_bfloat16* b_gate_smem = a_smem + M * KB;
-    __nv_bfloat16* b_up_smem   = b_gate_smem + N * KB;
-    float* gate_scratch = reinterpret_cast<float*>(b_up_smem + N * KB);
+    // Two-stage cp.async double buffer for A, B_gate, B_up.
+    //
+    // Layout (per stage):
+    //   a_smem      [M  × KB] = 16  × 32 × 2 =  1024 B
+    //   b_gate_smem [N  × KB] = 128 × 32 × 2 =  8192 B
+    //   b_up_smem   [N  × KB] = 128 × 32 × 2 =  8192 B
+    //   stage size                              17408 B
+    // Two stages: 34816 B. Scratches (g+u = 16 KiB) alias with stage 0,
+    // because they are only touched after the K loop completes.
+    constexpr uint32_t STAGE_BYTES = (M + 2 * N) * KB * 2;  // bf16
+    __nv_bfloat16* a_smem[2];
+    __nv_bfloat16* b_gate_smem[2];
+    __nv_bfloat16* b_up_smem[2];
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        char* base = tile_smem + (size_t)s * STAGE_BYTES;
+        a_smem[s]      = reinterpret_cast<__nv_bfloat16*>(base);
+        b_gate_smem[s] = a_smem[s] + M * KB;
+        b_up_smem[s]   = b_gate_smem[s] + N * KB;
+    }
+    // Scratches alias with stage 0 — used only after the K loop, by which
+    // point stage 0 has been fully consumed and the wmma fragments hold
+    // the data we need to spill.
+    float* gate_scratch = reinterpret_cast<float*>(tile_smem);
     float* up_scratch   = gate_scratch + N_WARPS * WMMA_M * WMMA_N;
     float* my_g_scratch = gate_scratch + (size_t)warp_id * WMMA_M * WMMA_N;
     float* my_u_scratch = up_scratch   + (size_t)warp_id * WMMA_M * WMMA_N;
@@ -988,27 +1026,68 @@ __device__ __forceinline__ void tile_gate_up(
     fill_fragment(g_acc_frag, 0.0f);
     fill_fragment(u_acc_frag, 0.0f);
 
+    // 16-byte cp.async = 8 bf16 elements per copy.
+    constexpr uint32_t ELTS_PER_CHUNK = 8;
+    constexpr uint32_t A_CHUNKS = (M * KB) / ELTS_PER_CHUNK;        // 64
+    constexpr uint32_t B_CHUNKS = (N * KB) / ELTS_PER_CHUNK;        // 512
+
+    // Prefetch stage 0 (inlined; A: 64 chunks, B_gate/B_up: 512 chunks each).
+    {
+        const int s = 0;
+        const uint32_t k_outer_local = 0;
+        if (lane < A_CHUNKS) {
+            const uint32_t m   = lane / (KB / ELTS_PER_CHUNK);
+            const uint32_t k8  = lane % (KB / ELTS_PER_CHUNK);
+            cp_async_16(a_smem[s] + m * KB + k8 * ELTS_PER_CHUNK,
+                        A_base + (size_t)m * K + k_outer_local + k8 * ELTS_PER_CHUNK);
+        }
+        #pragma unroll
+        for (uint32_t i = lane; i < B_CHUNKS; i += 256) {
+            const uint32_t n   = i / (KB / ELTS_PER_CHUNK);
+            const uint32_t k8  = i % (KB / ELTS_PER_CHUNK);
+            cp_async_16(b_gate_smem[s] + n * KB + k8 * ELTS_PER_CHUNK,
+                        B_gate_base + (size_t)n * K + k_outer_local + k8 * ELTS_PER_CHUNK);
+            cp_async_16(b_up_smem[s]   + n * KB + k8 * ELTS_PER_CHUNK,
+                        B_up_base   + (size_t)n * K + k_outer_local + k8 * ELTS_PER_CHUNK);
+        }
+        cp_async_commit();
+    }
+
     #pragma unroll 1
     for (uint32_t k_outer = 0; k_outer < K; k_outer += KB) {
-        // Cooperative loads of A, B_gate, B_up.
-        for (uint32_t i = lane; i < M * KB; i += 256) {
-            const uint32_t m = i / KB;
-            const uint32_t k_local = i % KB;
-            a_smem[m * KB + k_local] = A_base[m * K + k_outer + k_local];
-        }
-        for (uint32_t i = lane; i < N * KB; i += 256) {
-            const uint32_t n = i / KB;
-            const uint32_t k_local = i % KB;
-            b_gate_smem[n * KB + k_local] = B_gate_base[(size_t)n * K + k_outer + k_local];
-            b_up_smem[n * KB + k_local]   = B_up_base[(size_t)n * K + k_outer + k_local];
+        const int cur = (k_outer / KB) & 1;
+        const uint32_t k_next = k_outer + KB;
+
+        if (k_next < K) {
+            // Issue next stage (inline), then wait for the previous one.
+            const int s_next = cur ^ 1;
+            if (lane < A_CHUNKS) {
+                const uint32_t m   = lane / (KB / ELTS_PER_CHUNK);
+                const uint32_t k8  = lane % (KB / ELTS_PER_CHUNK);
+                cp_async_16(a_smem[s_next] + m * KB + k8 * ELTS_PER_CHUNK,
+                            A_base + (size_t)m * K + k_next + k8 * ELTS_PER_CHUNK);
+            }
+            #pragma unroll
+            for (uint32_t i = lane; i < B_CHUNKS; i += 256) {
+                const uint32_t n   = i / (KB / ELTS_PER_CHUNK);
+                const uint32_t k8  = i % (KB / ELTS_PER_CHUNK);
+                cp_async_16(b_gate_smem[s_next] + n * KB + k8 * ELTS_PER_CHUNK,
+                            B_gate_base + (size_t)n * K + k_next + k8 * ELTS_PER_CHUNK);
+                cp_async_16(b_up_smem[s_next]   + n * KB + k8 * ELTS_PER_CHUNK,
+                            B_up_base   + (size_t)n * K + k_next + k8 * ELTS_PER_CHUNK);
+            }
+            cp_async_commit();
+            cp_async_wait_group<1>();
+        } else {
+            cp_async_wait_group<0>();
         }
         __syncthreads();
 
         #pragma unroll
         for (uint32_t k_inner = 0; k_inner < KB; k_inner += WMMA_K) {
-            load_matrix_sync(a_frag, a_smem + k_inner, KB);
-            load_matrix_sync(b_g_frag, b_gate_smem + (size_t)n_warp_start * KB + k_inner, KB);
-            load_matrix_sync(b_u_frag, b_up_smem   + (size_t)n_warp_start * KB + k_inner, KB);
+            load_matrix_sync(a_frag, a_smem[cur] + k_inner, KB);
+            load_matrix_sync(b_g_frag, b_gate_smem[cur] + (size_t)n_warp_start * KB + k_inner, KB);
+            load_matrix_sync(b_u_frag, b_up_smem[cur]   + (size_t)n_warp_start * KB + k_inner, KB);
             mma_sync(g_acc_frag, a_frag, b_g_frag, g_acc_frag);
             mma_sync(u_acc_frag, a_frag, b_u_frag, u_acc_frag);
         }

@@ -603,18 +603,41 @@ fn cpu_rope_one(
     }
 }
 
-/// Phase 3c step 4: validates the full norm → gemm → rope chain through the
-/// last layer. Once tile_qkv is real it overwrites the qkv buffer on every
-/// layer's qkv pass before rope re-rotates it, so the only meaningful
-/// validation point is the qkv buffer end-state, which equals
+/// Returns the paged-cache offset for a (layer, row, kv_head, d) tuple,
+/// matching the layout the GPU writes:
 ///
-///     rope( gemm( norm( hidden_states, an_w[NL-1] ),  qkv_w[NL-1] ),  pos )
+///   page_idx = prefill_kv_indices[row / page_size] + layer * pages_per_layer
+///   slot     = row % page_size
+///   offset   = ((page_idx * page_size + slot) * num_kv_heads + kv_head) * head_dim + d
 ///
-/// applied once (not NL times — each layer's qkv overwrites the previous).
-/// Implicitly validates tile_qkv AND tile_rope.
+/// For the test fixture, prefill_kv_indices is the identity mapping, so
+/// physical_page = layer * pages_per_layer + (row / page_size).
+fn paged_kv_offset(
+    layer: usize,
+    row: usize,
+    kv_head: usize,
+    d: usize,
+    page_size: usize,
+    pages_per_layer: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> usize {
+    let logical_page = row / page_size;
+    let slot = row % page_size;
+    let physical_page = layer * pages_per_layer + logical_page;
+    ((physical_page * page_size + slot) * num_kv_heads + kv_head) * head_dim + d
+}
+
+/// Phase 3c.8 step 2: validates that tile_rope correctly fans out into:
+///   - q_post_rope (rotated Q for the last layer; previous layers overwritten)
+///   - k_cache (rotated K for ALL layers, addressed by paged offsets)
+///   - v_cache (passthrough V for ALL layers, addressed by paged offsets)
+///
+/// The CPU golden simulates the layer-by-layer chain (norm → gemm → rope
+/// fan-out), walks the same paged-cache offsets, and compares.
 #[test]
 #[ignore = "needs GPU"]
-fn qkv_chain_matches_cpu_golden() {
+fn rope_fanout_chain_matches_cpu_golden() {
     init_cuda();
     let dims = scheduled_prefill_tiny_dims();
     let hd = dims.hidden_dim as usize;
@@ -625,50 +648,101 @@ fn qkv_chain_matches_cpu_golden() {
     let hdm = dims.head_dim as usize;
     let nah = dims.num_attn_heads as usize;
     let nkh = dims.num_kv_heads as usize;
+    let q_dim = nah * hdm;
+    let page_size = SCHEDULED_PREFILL_KV_PAGE_SIZE as usize;
+    let pages_per_layer = seq.div_ceil(page_size);
+    let cache_total = nl * pages_per_layer * page_size * nkh * hdm;
     let eps: f32 = 1e-5;
 
     let (b, inp) = build_test_buffers();
     let _ = launch_with_buffers(&b, eps);
 
-    let qkv_gpu = gpu_download_bf16(b.qkv, seq * qkv_dim);
+    let q_post_gpu = gpu_download_bf16(b.q_post_rope, seq * q_dim);
+    let k_cache_gpu = gpu_download_bf16(b.k_cache, cache_total);
+    let v_cache_gpu = gpu_download_bf16(b.v_cache, cache_total);
 
-    // CPU chain through layer NL-1 only (last writer wins). The chain input
-    // is hidden_states *as the kernel sees it* at the start of layer NL-1,
-    // which has all earlier o_proj residual contributions baked in.
-    let an_w_last = &inp.an_w_data[(nl - 1) * hd..nl * hd];
-    let qkv_w_last = &inp.qkv_w_data[(nl - 1) * qkv_dim * hd..nl * qkv_dim * hd];
-    let h_at_last_layer = cpu_hidden_at_start_of_layer(&inp, nl - 1, hd, id, seq, eps);
+    // CPU walks each layer, computes the qkv row, applies rope-fanout, and
+    // stores the results in CPU mirrors of q_post_rope / k_cache / v_cache.
+    let mut q_post_cpu = vec![bf16::from_f32(0.0); seq * q_dim];
+    let mut k_cache_cpu = vec![bf16::from_f32(0.0); cache_total];
+    let mut v_cache_cpu = vec![bf16::from_f32(0.0); cache_total];
 
-    let mut max_abs_err = 0.0_f32;
-    let mut max_rel_err = 0.0_f32;
-    for r in 0..seq {
-        // 1. norm
-        let normed = cpu_rms_norm(&h_at_last_layer[r * hd..(r + 1) * hd], an_w_last, eps);
-        // 2. gemm — produces a single row of length qkv_dim
-        let mut row = cpu_gemm(&normed, qkv_w_last, 1, qkv_dim, hd);
-        // 3. rope (in-place on Q/K heads)
-        cpu_rope_one(&mut row, r, hdm, nah, nkh);
+    for l in 0..nl {
+        let h = cpu_hidden_at_start_of_layer(&inp, l, hd, id, seq, eps);
+        let an_w_l = &inp.an_w_data[l * hd..(l + 1) * hd];
+        let qkv_w_l = &inp.qkv_w_data[l * qkv_dim * hd..(l + 1) * qkv_dim * hd];
 
-        for n in 0..qkv_dim {
-            let g = row[n].to_f32();
-            let k = qkv_gpu[r * qkv_dim + n].to_f32();
-            let abs = (g - k).abs();
-            let rel = if g.abs() > 1e-3 { abs / g.abs() } else { 0.0 };
-            if abs > max_abs_err {
-                max_abs_err = abs;
+        for r in 0..seq {
+            // 1. norm
+            let normed = cpu_rms_norm(&h[r * hd..(r + 1) * hd], an_w_l, eps);
+            // 2. raw qkv gemm (one row of length qkv_dim)
+            let mut row = cpu_gemm(&normed, qkv_w_l, 1, qkv_dim, hd);
+            // 3. rope on Q+K head pairs (V untouched)
+            cpu_rope_one(&mut row, r, hdm, nah, nkh);
+
+            // Q region → q_post_rope (last writer wins, so layer NL-1's value
+            // is what survives in the GPU buffer).
+            for c in 0..q_dim {
+                q_post_cpu[r * q_dim + c] = row[c];
             }
-            if rel > max_rel_err {
-                max_rel_err = rel;
+
+            // K region → paged k_cache slot for (l, r, kv_head, d)
+            let k_off_in_row = nah * hdm;
+            for kvh in 0..nkh {
+                for d in 0..hdm {
+                    let off = paged_kv_offset(l, r, kvh, d, page_size, pages_per_layer, nkh, hdm);
+                    k_cache_cpu[off] = row[k_off_in_row + kvh * hdm + d];
+                }
+            }
+            // V region → paged v_cache (passthrough, no rotation; read from
+            // the gemm output `row` *before* the rope rewrote it — but rope
+            // only touches Q and K, so V indices are still the gemm output).
+            let v_off_in_row = (nah + nkh) * hdm;
+            for kvh in 0..nkh {
+                for d in 0..hdm {
+                    let off = paged_kv_offset(l, r, kvh, d, page_size, pages_per_layer, nkh, hdm);
+                    v_cache_cpu[off] = row[v_off_in_row + kvh * hdm + d];
+                }
             }
         }
     }
-    eprintln!(
-        "qkv_chain: max_abs_err={max_abs_err:.5}, max_rel_err={:.4}%",
-        max_rel_err * 100.0
-    );
-    // The chain (residual + norm + gemm + rope) accumulates bf16 rounding,
-    // and per-element rel err is unreliable on near-zero outputs (rope can
-    // produce values arbitrarily close to zero). Abs err is the only
-    // meaningful gate at this scale.
-    assert!(max_abs_err < 0.10, "qkv_chain: max abs err {max_abs_err}");
+
+    // ── Validate Q (last layer only — earlier overwritten in q_post_rope) ──
+    let mut q_max_abs = 0.0_f32;
+    for i in 0..seq * q_dim {
+        let g = q_post_cpu[i].to_f32();
+        let k = q_post_gpu[i].to_f32();
+        let abs = (g - k).abs();
+        if abs > q_max_abs {
+            q_max_abs = abs;
+        }
+    }
+    eprintln!("q_post_rope: max_abs_err={q_max_abs:.5}");
+    assert!(q_max_abs < 0.10, "q_post_rope abs err {q_max_abs}");
+
+    // ── Validate paged K cache (all layers, all rows) ──
+    let mut k_max_abs = 0.0_f32;
+    for i in 0..cache_total {
+        let g = k_cache_cpu[i].to_f32();
+        let k = k_cache_gpu[i].to_f32();
+        let abs = (g - k).abs();
+        if abs > k_max_abs {
+            k_max_abs = abs;
+        }
+    }
+    eprintln!("k_cache: max_abs_err={k_max_abs:.5}");
+    assert!(k_max_abs < 0.10, "k_cache abs err {k_max_abs}");
+
+    // ── Validate paged V cache (all layers, all rows) ──
+    let mut v_max_abs = 0.0_f32;
+    for i in 0..cache_total {
+        let g = v_cache_cpu[i].to_f32();
+        let k = v_cache_gpu[i].to_f32();
+        let abs = (g - k).abs();
+        if abs > v_max_abs {
+            v_max_abs = abs;
+        }
+    }
+    eprintln!("v_cache: max_abs_err={v_max_abs:.5}");
+    assert!(v_max_abs < 0.10, "v_cache abs err {v_max_abs}");
 }

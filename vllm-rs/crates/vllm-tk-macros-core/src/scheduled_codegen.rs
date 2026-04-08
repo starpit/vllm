@@ -429,29 +429,40 @@ __device__ __forceinline__ void tile_qkv(const globals_t& g, uint32_t layer, uin
 }
 
 
-// ── tile_rope: in-place RoPE on the qkv buffer for one ROW_TILE-row tile.
+// ── tile_rope: rotate + KV cache append for one ROW_TILE-row tile.
 //
-// Layout per row (qkv_dim = (NAH + 2*NKH) * HDM):
-//   [Q heads (NAH * HDM)][K heads (NKH * HDM)][V heads (NKH * HDM)]
-// We rotate Q and K head pairs (split-half: index c paired with c + HDM/2)
-// and leave V untouched. Position = absolute row index.
+// Reads qkv[row, qkv_dim] where qkv_dim = (NAH + 2*NKH) * HEAD_DIM and is
+// laid out as [Q (NAH*HDM)][K (NKH*HDM)][V (NKH*HDM)].
+//
+// Writes:
+//   - q_post_rope[row, NAH*HDM]   ← rotated Q heads
+//   - k_cache[page_idx, slot, kv_head, d]  ← rotated K heads (paged)
+//   - v_cache[page_idx, slot, kv_head, d]  ← passthrough V heads (paged)
+//
+// page_idx = prefill_kv_indices[row / PAGE_SIZE] + layer * PAGES_PER_LAYER
+// slot     = row % PAGE_SIZE
 //
 // Split-half rotation:
 //   x0_new = x0 * cos(θ) - x1 * sin(θ)
 //   x1_new = x0 * sin(θ) + x1 * cos(θ)
 // where θ = position / 10000^(2c/HDM), c ∈ [0, HDM/2).
 //
-// 32 threads (one warp). Each lane handles one pair index per (row, head)
-// pass. For tiny HDM=64 → HDM/2=32, lanes 0..31 each cover exactly one pair.
-__device__ __forceinline__ void tile_rope(const globals_t& g, uint32_t /*layer*/, uint32_t row) {
-    constexpr uint32_t HDM      = MODEL_HEAD_DIM;
-    constexpr uint32_t HALF     = HDM / 2;
-    constexpr uint32_t NAH      = MODEL_NUM_ATTN_H;
-    constexpr uint32_t NKH      = MODEL_NUM_KV_H;
-    constexpr uint32_t NQK      = NAH + NKH;  // total heads to rotate (Q and K)
-    constexpr uint32_t QKV_DIM  = (NAH + 2 * NKH) * HDM;
-    constexpr uint32_t ROW_TILE = MODEL_ROW_TILE;
-    constexpr float THETA_BASE  = 10000.0f;
+// 32 threads (one warp). The qkv buffer is NOT modified.
+__device__ __forceinline__ void tile_rope(const globals_t& g, uint32_t layer, uint32_t row) {
+    constexpr uint32_t HDM             = MODEL_HEAD_DIM;
+    constexpr uint32_t HALF            = HDM / 2;
+    constexpr uint32_t NAH             = MODEL_NUM_ATTN_H;
+    constexpr uint32_t NKH             = MODEL_NUM_KV_H;
+    constexpr uint32_t QKV_DIM         = (NAH + 2 * NKH) * HDM;
+    constexpr uint32_t Q_DIM           = NAH * HDM;
+    constexpr uint32_t K_OFF           = NAH * HDM;            // K region offset in qkv row
+    constexpr uint32_t V_OFF           = (NAH + NKH) * HDM;    // V region offset in qkv row
+    constexpr uint32_t ROW_TILE        = MODEL_ROW_TILE;
+    constexpr uint32_t PAGE_SIZE       = MODEL_KV_PAGE_SIZE;
+    constexpr uint32_t PAGES_PER_LAYER = MODEL_PAGES_PER_LAYER;
+    constexpr uint32_t SLOT_STRIDE     = NKH * HDM;            // bf16 elements
+    constexpr uint32_t PAGE_STRIDE     = PAGE_SIZE * NKH * HDM;
+    constexpr float    THETA_BASE      = 10000.0f;
     const uint32_t lane = threadIdx.x;
     const uint32_t row_start = row * ROW_TILE;
 
@@ -460,21 +471,59 @@ __device__ __forceinline__ void tile_rope(const globals_t& g, uint32_t /*layer*/
         const uint32_t row_idx = row_start + r;
         if (row_idx >= MODEL_SEQ_LEN) break;
         const float pos = float(row_idx);
-        __nv_bfloat16* base = g.qkv + (size_t)row_idx * QKV_DIM;
+        const __nv_bfloat16* qkv_row = g.qkv + (size_t)row_idx * QKV_DIM;
 
-        for (uint32_t h = 0; h < NQK; ++h) {
-            __nv_bfloat16* head_ptr = base + h * HDM;
-            // Each lane covers pair indices c, c+32, c+64, ... while c < HALF.
+        // Paged cache slot for this token.
+        const uint32_t logical_page  = row_idx / PAGE_SIZE;
+        const uint32_t slot_in_page  = row_idx % PAGE_SIZE;
+        const int32_t physical_page  = g.prefill_kv_indices[logical_page]
+                                       + (int32_t)layer * (int32_t)PAGES_PER_LAYER;
+        const size_t page_off = (size_t)physical_page * PAGE_STRIDE;
+        const size_t slot_off = (size_t)slot_in_page * SLOT_STRIDE;
+        __nv_bfloat16* k_slot = g.k_cache + page_off + slot_off;
+        __nv_bfloat16* v_slot = g.v_cache + page_off + slot_off;
+
+        // ── Q heads: rotate, write to q_post_rope ──
+        __nv_bfloat16* q_post = g.q_post_rope + (size_t)row_idx * Q_DIM;
+        for (uint32_t h = 0; h < NAH; ++h) {
+            const __nv_bfloat16* q_in  = qkv_row + h * HDM;
+            __nv_bfloat16*       q_out = q_post  + h * HDM;
             for (uint32_t c = lane; c < HALF; c += 32) {
-                const float exp = float(2 * c) / float(HDM);
-                const float inv_freq = __powf(THETA_BASE, -exp);
-                const float ang = pos * inv_freq;
+                const float exp_v   = float(2 * c) / float(HDM);
+                const float inv_freq = __powf(THETA_BASE, -exp_v);
+                const float ang     = pos * inv_freq;
                 float cos_v, sin_v;
                 __sincosf(ang, &sin_v, &cos_v);
-                const float x0 = __bfloat162float(head_ptr[c]);
-                const float x1 = __bfloat162float(head_ptr[c + HALF]);
-                head_ptr[c]        = __float2bfloat16(x0 * cos_v - x1 * sin_v);
-                head_ptr[c + HALF] = __float2bfloat16(x0 * sin_v + x1 * cos_v);
+                const float x0 = __bfloat162float(q_in[c]);
+                const float x1 = __bfloat162float(q_in[c + HALF]);
+                q_out[c]        = __float2bfloat16(x0 * cos_v - x1 * sin_v);
+                q_out[c + HALF] = __float2bfloat16(x0 * sin_v + x1 * cos_v);
+            }
+        }
+
+        // ── K heads: rotate, write to k_cache[page, slot, kv_head, d] ──
+        for (uint32_t h = 0; h < NKH; ++h) {
+            const __nv_bfloat16* k_in  = qkv_row + K_OFF + h * HDM;
+            __nv_bfloat16*       k_out = k_slot  + h * HDM;
+            for (uint32_t c = lane; c < HALF; c += 32) {
+                const float exp_v   = float(2 * c) / float(HDM);
+                const float inv_freq = __powf(THETA_BASE, -exp_v);
+                const float ang     = pos * inv_freq;
+                float cos_v, sin_v;
+                __sincosf(ang, &sin_v, &cos_v);
+                const float x0 = __bfloat162float(k_in[c]);
+                const float x1 = __bfloat162float(k_in[c + HALF]);
+                k_out[c]        = __float2bfloat16(x0 * cos_v - x1 * sin_v);
+                k_out[c + HALF] = __float2bfloat16(x0 * sin_v + x1 * cos_v);
+            }
+        }
+
+        // ── V heads: passthrough copy to v_cache[page, slot, kv_head, d] ──
+        for (uint32_t h = 0; h < NKH; ++h) {
+            const __nv_bfloat16* v_in  = qkv_row + V_OFF + h * HDM;
+            __nv_bfloat16*       v_out = v_slot  + h * HDM;
+            for (uint32_t d = lane; d < HDM; d += 32) {
+                v_out[d] = v_in[d];
             }
         }
     }

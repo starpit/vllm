@@ -193,6 +193,9 @@ pub struct GemmCutlassMctaCtx<'a> {
     /// If true, emit the LinearCombinationSiluMul epilogue (D = silu(acc) * source).
     /// Used for the gate phase of the gate_up fused pair.
     pub silu_mul: bool,
+    /// CUTLASS namespace to instantiate against (e.g. "pfl_cutlass" for the
+    /// default 256x128x32 shape, "pfl_cutlass_small" for 128x128x32).
+    pub ns: &'a str,
 }
 
 #[derive(Template)]

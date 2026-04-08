@@ -162,7 +162,9 @@ impl FusedDerived {
         // the actual size fits. Larger reservations REDUCE L1 cache (Ada
         // shmem+L1 are unified-pool) and slow down our hand-rolled phases.
         let cutlass_shmem = if cfg.cutlass_down_proj || cfg.cutlass_qkv_o {
-            80 * 1024
+            // 4-stage <256,128,32> mainloop: 4 × (256*32 + 32*128) × 2 = 96 KB.
+            // Plus epilogue ≈ 32 KB. Union ≈ 96 KB.
+            96 * 1024
         } else {
             0
         };

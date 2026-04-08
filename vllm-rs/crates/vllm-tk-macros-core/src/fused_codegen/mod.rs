@@ -878,6 +878,7 @@ fn build_fused_gateup_phases(
             d.hd.0,      // K = HD = 2048
             d.qkv_dim.0, // N = QKV_DIM = 2304
             "0.0f",      // beta=0: pure store, no residual
+            "pfl_cutlass_small",
         )
     } else if cfg.phase_opt {
         render_gemm_mcta_override(
@@ -911,6 +912,7 @@ fn build_fused_gateup_phases(
             d.hd.0, // K = HD
             d.hd.0, // N = HD
             "1.0f", // beta=1: residual add
+            "pfl_cutlass_small",
         )
     } else if cfg.phase_opt {
         render_gemm_mcta_override(
@@ -949,6 +951,7 @@ fn build_fused_gateup_phases(
             d.id.0, // K = intermediate_dim
             d.hd.0, // N = hidden_dim
             "1.0f", // beta=1: residual add
+            "pfl_cutlass",
         )
     } else if cfg.phase_opt {
         render_gemm_mcta_override(
@@ -985,6 +988,7 @@ fn build_fused_gateup_phases(
             d.hd.0, // K = HD
             d.id.0, // N = ID
             "0.0f", // β=0
+            "pfl_cutlass",
         );
         let gate_call = render_gemm_cutlass_silumul_mcta(
             "fused gate+up :: GATE (CUTLASS, silu*source)",
@@ -994,6 +998,7 @@ fn build_fused_gateup_phases(
             "q_size",
             d.hd.0,
             d.id.0,
+            "pfl_cutlass",
         );
         format!("{up_call}\n{gate_call}")
     } else {
@@ -1245,6 +1250,7 @@ fn render_gemm_cutlass_mcta(
     k_dim_value: usize,
     n_dim_value: usize,
     beta_literal: &str,
+    ns: &str,
 ) -> String {
     GemmCutlassMctaCtx {
         phase_comment,
@@ -1256,6 +1262,7 @@ fn render_gemm_cutlass_mcta(
         n_dim_value,
         beta_literal,
         silu_mul: false,
+        ns,
     }
     .render()
     .expect("gemm_cutlass_mcta template render")
@@ -1270,6 +1277,7 @@ fn render_gemm_cutlass_silumul_mcta(
     m_dim_expr: &str,
     k_dim_value: usize,
     n_dim_value: usize,
+    ns: &str,
 ) -> String {
     GemmCutlassMctaCtx {
         phase_comment,
@@ -1281,6 +1289,7 @@ fn render_gemm_cutlass_silumul_mcta(
         n_dim_value,
         beta_literal: "1.0f", // unused in silu_mul branch but kept for ctx parity
         silu_mul: true,
+        ns,
     }
     .render()
     .expect("gemm_cutlass_mcta silumul template render")

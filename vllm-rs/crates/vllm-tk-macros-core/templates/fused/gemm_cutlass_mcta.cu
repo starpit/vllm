@@ -16,14 +16,14 @@
     // Type aliases pulled from the file-scope `pfl_cutlass` namespace
     // (defined in preamble_header.cu). Fully-qualified names everywhere
     // because TK / kittens have their own bf16 type names that would shadow.
-    using PflCutlassMma            = pfl_cutlass::ThreadblockMma;
-    using PflCutlassIteratorA      = pfl_cutlass::IteratorA;
-    using PflCutlassIteratorB      = pfl_cutlass::IteratorB;
-    using PflCutlassSharedStorageT = pfl_cutlass::SharedStorage;
+    using PflCutlassMma            = {{ ns }}::ThreadblockMma;
+    using PflCutlassIteratorA      = {{ ns }}::IteratorA;
+    using PflCutlassIteratorB      = {{ ns }}::IteratorB;
+    using PflCutlassSharedStorageT = {{ ns }}::SharedStorage;
     using PflCutlassFragmentC      = typename PflCutlassMma::FragmentC;
-    constexpr int kThreadblockM = pfl_cutlass::ThreadblockShape::kM;  // 256
-    constexpr int kThreadblockN = pfl_cutlass::ThreadblockShape::kN;  // 128
-    constexpr int kThreadblockK = pfl_cutlass::ThreadblockShape::kK;  // 32
+    constexpr int kThreadblockM = {{ ns }}::ThreadblockShape::kM;  // 256
+    constexpr int kThreadblockN = {{ ns }}::ThreadblockShape::kN;  // 128
+    constexpr int kThreadblockK = {{ ns }}::ThreadblockShape::kK;  // 32
 
     const int M = ({{ m_dim }});
     constexpr int K = ({{ k_dim_value }});
@@ -48,8 +48,8 @@
     // can't smuggle host-precomputed Params through the megakernel boundary.
     // NOTE: brace init to dodge the most-vexing-parse — `Params x(Layout(K))`
     // is parsed as a function declaration. `Params x{Layout{K}}` is not.
-    pfl_cutlass::LayoutA layout_a{K};
-    pfl_cutlass::LayoutB layout_b{K};
+    {{ ns }}::LayoutA layout_a{K};
+    {{ ns }}::LayoutB layout_b{K};
     typename PflCutlassIteratorA::Params params_A{layout_a};
     typename PflCutlassIteratorB::Params params_B{layout_b};
 
@@ -98,13 +98,13 @@
         // LinearCombination     (default): D = α*acc + β*source  (β literal)
         // LinearCombinationSiluMul        : D = silu(α*acc) * source
 {%- if silu_mul %}
-        using Epilogue = pfl_cutlass::EpilogueSiluMul;
-        using OutputTileIterator = pfl_cutlass::OutputTileIterator;
-        using OutputOp = pfl_cutlass::OutputOpSiluMul;
+        using Epilogue = {{ ns }}::EpilogueSiluMul;
+        using OutputTileIterator = {{ ns }}::OutputTileIterator;
+        using OutputOp = {{ ns }}::OutputOpSiluMul;
 {%- else %}
-        using Epilogue = pfl_cutlass::Epilogue;
-        using OutputTileIterator = pfl_cutlass::OutputTileIterator;
-        using OutputOp = pfl_cutlass::OutputOpT;
+        using Epilogue = {{ ns }}::Epilogue;
+        using OutputTileIterator = {{ ns }}::OutputTileIterator;
+        using OutputOp = {{ ns }}::OutputOpT;
 {%- endif %}
 
         // Need a CUTLASS-side __syncthreads before the epilogue starts
@@ -116,7 +116,7 @@
         // raw __nv_bfloat16* (TK type) — same 16-bit layout, different name.
         cutlass::bfloat16_t *ptr_OUT_cl = reinterpret_cast<cutlass::bfloat16_t*>(ptr_OUT);
 
-        pfl_cutlass::LayoutC layout_c{N};
+        {{ ns }}::LayoutC layout_c{N};
         typename OutputTileIterator::Params params_C{layout_c};
         typename OutputTileIterator::Params params_D{layout_c};
 

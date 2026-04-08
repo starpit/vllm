@@ -52,7 +52,7 @@ namespace pfl_cutlass {
         cutlass::arch::OpClassTensorOp,
         cutlass::arch::Sm80,
         ThreadblockShape, WarpShape, InstructionShape,
-        /*Stages=*/3,
+        /*Stages=*/4,
         cutlass::arch::OpMultiplyAdd>;
 
     using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;
@@ -152,8 +152,8 @@ namespace pfl_cutlass {
         kEpilogueElementsPerAccess>;
     using EpilogueSiluMul = typename DefaultEpilogueSiluMulT::Epilogue;
 
-    static_assert(sizeof(SharedStorage) <= 80 * 1024,
-                  "CUTLASS SharedStorage exceeds 80KB budget");
+    static_assert(sizeof(SharedStorage) <= 99 * 1024,
+                  "CUTLASS SharedStorage exceeds 99KB sm89 dynamic shmem cap");
     // Print the actual size at compile time via _Static_assert with the
     // value embedded in the message (commented out — uncomment to inspect):
     // static_assert(sizeof(SharedStorage) == 0, "see size");
@@ -162,3 +162,112 @@ namespace pfl_cutlass {
     static_assert(kCutlassThreads == 256,
                   "CUTLASS ThreadblockMma WarpCount must equal 8 (256 threads)");
 }  // namespace pfl_cutlass
+
+// ── Small CUTLASS shape: <128,128,32> with WarpShape <64,64,32> (4 warps).
+// Tuned for QKV and o_proj where the M dim is small.
+namespace pfl_cutlass_small {
+    using ElementA       = cutlass::bfloat16_t;
+    using ElementB       = cutlass::bfloat16_t;
+    using ElementAccum   = float;
+    using LayoutA        = cutlass::layout::RowMajor;
+    using LayoutB        = cutlass::layout::ColumnMajor;
+    using LayoutC        = cutlass::layout::RowMajor;
+
+    // 8 warps (256 threads) to match kernel launch. 128x128/(64x32) = 8 warps.
+    using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
+    using WarpShape        = cutlass::gemm::GemmShape<64, 32, 32>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using DefaultMmaT = cutlass::gemm::threadblock::DefaultMma<
+        ElementA, LayoutA, /*kAlignmentA=*/8,
+        ElementB, LayoutB, /*kAlignmentB=*/8,
+        ElementAccum, LayoutC,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        ThreadblockShape, WarpShape, InstructionShape,
+        /*Stages=*/3,
+        cutlass::arch::OpMultiplyAdd>;
+
+    using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;
+    using IteratorA      = typename DefaultMmaT::IteratorA;
+    using IteratorB      = typename DefaultMmaT::IteratorB;
+    using MmaSharedStorage = typename ThreadblockMma::SharedStorage;
+
+    using ElementOutput = cutlass::bfloat16_t;
+    static constexpr int kEpilogueElementsPerAccess = 8;
+    using OutputOpT = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpT, kEpilogueElementsPerAccess>;
+    using Epilogue              = typename DefaultEpilogueT::Epilogue;
+    using OutputTileIterator    = typename DefaultEpilogueT::OutputTileIterator;
+    using EpilogueSharedStorage = typename Epilogue::SharedStorage;
+
+    union SharedStorage {
+        MmaSharedStorage main_loop;
+        EpilogueSharedStorage epilogue;
+    };
+
+    template <typename ElementOutput_, int Count_, typename ElementAccum_,
+              typename ElementCompute_ = ElementAccum_>
+    class LinearCombinationSiluMul {
+    public:
+        using ElementOutput      = ElementOutput_;
+        using ElementAccumulator = ElementAccum_;
+        using ElementCompute     = ElementCompute_;
+        static int const kCount  = Count_;
+        using FragmentOutput      = cutlass::Array<ElementOutput, kCount>;
+        using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
+        using FragmentSource      = cutlass::Array<ElementOutput, kCount>;
+        struct Params {
+            ElementCompute alpha = ElementCompute(1);
+            ElementCompute beta  = ElementCompute(1);
+            ElementCompute const *alpha_ptr = nullptr;
+            ElementCompute const *beta_ptr  = nullptr;
+            ElementCompute const *const *alpha_ptr_array = nullptr;
+            ElementCompute const *const *beta_ptr_array  = nullptr;
+            CUTLASS_HOST_DEVICE Params() {}
+            CUTLASS_HOST_DEVICE Params(ElementCompute a, ElementCompute b) : alpha(a), beta(b) {}
+        };
+    private:
+        ElementCompute alpha_;
+    public:
+        CUTLASS_HOST_DEVICE explicit LinearCombinationSiluMul(Params const &p) : alpha_(p.alpha) {}
+        CUTLASS_HOST_DEVICE bool is_source_needed() const { return true; }
+        CUTLASS_HOST_DEVICE void set_k_partition(int, int) {}
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum) const {
+            FragmentOutput r;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                r[i] = ElementOutput(a / (1.0f + ::expf(-a)));
+            }
+            return r;
+        }
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum,
+                                  FragmentSource const &source) const {
+            FragmentOutput r;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                float s = a / (1.0f + ::expf(-a));
+                r[i] = ElementOutput(s * float(source[i]));
+            }
+            return r;
+        }
+    };
+    using OutputOpSiluMul = LinearCombinationSiluMul<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueSiluMulT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpSiluMul, kEpilogueElementsPerAccess>;
+    using EpilogueSiluMul = typename DefaultEpilogueSiluMulT::Epilogue;
+
+    static_assert(sizeof(SharedStorage) <= 99 * 1024,
+                  "small CUTLASS SharedStorage exceeds 99KB sm89 cap");
+    static_assert(ThreadblockMma::WarpCount::kCount == 8,
+                  "small CUTLASS must use 8 warps to match kernel launch");
+}  // namespace pfl_cutlass_small

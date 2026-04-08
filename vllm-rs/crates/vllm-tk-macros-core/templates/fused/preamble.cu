@@ -45,7 +45,7 @@ namespace pfl_cutlass {
         cutlass::arch::OpClassTensorOp,
         cutlass::arch::Sm80,
         ThreadblockShape, WarpShape, InstructionShape,
-        /*Stages=*/3,
+        /*Stages=*/4,
         cutlass::arch::OpMultiplyAdd>;
 
     using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;
@@ -166,6 +166,117 @@ namespace pfl_cutlass {
         kEpilogueElementsPerAccess>;
     using EpilogueSiluMul = typename DefaultEpilogueSiluMulT::Epilogue;
 }  // namespace pfl_cutlass
+
+// ── Small CUTLASS shape: <128,128,32> with WarpShape <64,64,32> (4 warps).
+// Tuned for QKV (M=q_size, K=2048, N=2304) and o_proj (M=q_size, K=2048, N=2048),
+// where the default 256-row CTA M is mostly padding.
+namespace pfl_cutlass_small {
+    using ElementA       = cutlass::bfloat16_t;
+    using ElementB       = cutlass::bfloat16_t;
+    using ElementAccum   = float;
+    using LayoutA        = cutlass::layout::RowMajor;
+    using LayoutB        = cutlass::layout::ColumnMajor;
+    using LayoutC        = cutlass::layout::RowMajor;
+
+    // 8 warps (256 threads) to match the kernel-wide launch geometry.
+    // 128x128 / (64x32) = 2 x 4 = 8 warps. K=32. Stages=3.
+    using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
+    using WarpShape        = cutlass::gemm::GemmShape<64, 32, 32>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using DefaultMmaT = cutlass::gemm::threadblock::DefaultMma<
+        ElementA, LayoutA, /*kAlignmentA=*/8,
+        ElementB, LayoutB, /*kAlignmentB=*/8,
+        ElementAccum, LayoutC,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        ThreadblockShape, WarpShape, InstructionShape,
+        /*Stages=*/3,
+        cutlass::arch::OpMultiplyAdd>;
+
+    using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;
+    using IteratorA      = typename DefaultMmaT::IteratorA;
+    using IteratorB      = typename DefaultMmaT::IteratorB;
+    using MmaSharedStorage = typename ThreadblockMma::SharedStorage;
+
+    using ElementOutput = cutlass::bfloat16_t;
+    static constexpr int kEpilogueElementsPerAccess = 8;
+    using OutputOpT = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpT, kEpilogueElementsPerAccess>;
+    using Epilogue            = typename DefaultEpilogueT::Epilogue;
+    using OutputTileIterator  = typename DefaultEpilogueT::OutputTileIterator;
+    using EpilogueSharedStorage = typename Epilogue::SharedStorage;
+
+    static_assert(ThreadblockMma::WarpCount::kCount == 8,
+                  "small CUTLASS must use 8 warps to match kernel launch");
+
+    union SharedStorage {
+        MmaSharedStorage main_loop;
+        EpilogueSharedStorage epilogue;
+    };
+
+    // SiluMul not used by QKV/o, but include for template parity so the
+    // ns-parametric template compiles unconditionally.
+    template <typename ElementOutput_, int Count_, typename ElementAccum_,
+              typename ElementCompute_ = ElementAccum_>
+    class LinearCombinationSiluMul {
+    public:
+        using ElementOutput      = ElementOutput_;
+        using ElementAccumulator = ElementAccum_;
+        using ElementCompute     = ElementCompute_;
+        static int const kCount  = Count_;
+        using FragmentOutput      = cutlass::Array<ElementOutput, kCount>;
+        using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
+        using FragmentSource      = cutlass::Array<ElementOutput, kCount>;
+        struct Params {
+            ElementCompute alpha = ElementCompute(1);
+            ElementCompute beta  = ElementCompute(1);
+            ElementCompute const *alpha_ptr = nullptr;
+            ElementCompute const *beta_ptr  = nullptr;
+            ElementCompute const *const *alpha_ptr_array = nullptr;
+            ElementCompute const *const *beta_ptr_array  = nullptr;
+            CUTLASS_HOST_DEVICE Params() {}
+            CUTLASS_HOST_DEVICE Params(ElementCompute a, ElementCompute b) : alpha(a), beta(b) {}
+        };
+    private:
+        ElementCompute alpha_;
+    public:
+        CUTLASS_HOST_DEVICE explicit LinearCombinationSiluMul(Params const &p) : alpha_(p.alpha) {}
+        CUTLASS_HOST_DEVICE bool is_source_needed() const { return true; }
+        CUTLASS_HOST_DEVICE void set_k_partition(int, int) {}
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum) const {
+            FragmentOutput r;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                r[i] = ElementOutput(a / (1.0f + ::expf(-a)));
+            }
+            return r;
+        }
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum,
+                                  FragmentSource const &source) const {
+            FragmentOutput r;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                float s = a / (1.0f + ::expf(-a));
+                r[i] = ElementOutput(s * float(source[i]));
+            }
+            return r;
+        }
+    };
+    using OutputOpSiluMul = LinearCombinationSiluMul<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueSiluMulT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpSiluMul, kEpilogueElementsPerAccess>;
+    using EpilogueSiluMul = typename DefaultEpilogueSiluMulT::Epilogue;
+}  // namespace pfl_cutlass_small
 
 constexpr int PFL_NUM_WARPS = {{ num_warps }};
 constexpr int PFL_GQA_RATIO = {{ gqa_ratio }};

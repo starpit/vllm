@@ -40,6 +40,15 @@ pub enum RagDataset {
     Musique,
     /// MS MARCO v2.1 validation set (~10 Bing search passages per query).
     Msmarco,
+    /// NarrativeQA validation set (long-form story summaries from Gutenberg
+    /// books and movie scripts; ~660-word summary per document, multiple
+    /// questions per doc — long-context territory where RAPTOR's level
+    /// summaries are designed to help).
+    Narrativeqa,
+    /// QASPER validation set (NLP scientific papers with multi-section full
+    /// text and 4–5 expert-annotated questions per paper; tests retrieval
+    /// over structured long documents).
+    Qasper,
 }
 
 /// Query execution mode for `vllm bench ragindex`.
@@ -58,6 +67,8 @@ impl std::fmt::Display for RagDataset {
             Self::Multihop => write!(f, "multihop"),
             Self::Musique => write!(f, "musique"),
             Self::Msmarco => write!(f, "msmarco"),
+            Self::Narrativeqa => write!(f, "narrativeqa"),
+            Self::Qasper => write!(f, "qasper"),
         }
     }
 }
@@ -69,6 +80,8 @@ pub fn fetch_rag_dataset(which: RagDataset, num_queries: usize) -> Result<Vec<Ra
         RagDataset::Multihop => fetch_multihop(num_queries),
         RagDataset::Musique => fetch_musique(num_queries),
         RagDataset::Msmarco => fetch_msmarco(num_queries),
+        RagDataset::Narrativeqa => fetch_narrativeqa(num_queries),
+        RagDataset::Qasper => fetch_qasper(num_queries),
     }
 }
 
@@ -373,6 +386,223 @@ fn fetch_msmarco(num_queries: usize) -> Result<Vec<RagSample>> {
 
         if samples.len() >= num_queries {
             break;
+        }
+    }
+    Ok(samples)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-shard parquet helper
+// ---------------------------------------------------------------------------
+
+/// Like `download_parquet_as_json` but takes N URLs (parquet shards) and
+/// concatenates the rows. Used by datasets whose HF parquet split is not
+/// in a single file.
+fn download_parquet_shards_as_json(
+    cache_dir_name: &str,
+    cache_filename: &str,
+    urls: &[&str],
+    label: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let cache_dir = dirs::cache_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine cache directory"))?
+        .join("vllm-bench")
+        .join(cache_dir_name);
+    std::fs::create_dir_all(&cache_dir)?;
+    let cache_file = cache_dir.join(cache_filename);
+
+    if cache_file.exists() {
+        let data = std::fs::read_to_string(&cache_file)?;
+        return Ok(serde_json::from_str(&data)?);
+    }
+
+    eprintln!("Downloading {label} ({} shards)...", urls.len());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()?;
+
+    let mut all_records: Vec<serde_json::Value> = Vec::new();
+    for (i, url) in urls.iter().enumerate() {
+        let shard_path = cache_dir.join(format!("shard-{i}.parquet"));
+        let response = client.get(*url).header("User-Agent", "vllm-bench").send()?;
+        let bytes = response.bytes()?;
+        std::fs::write(&shard_path, &bytes)?;
+        let mut records = parquet_to_json_records(&shard_path)?;
+        all_records.append(&mut records);
+    }
+    eprintln!("Caching {} records as JSON...", all_records.len());
+    let json_str = serde_json::to_string(&all_records)?;
+    std::fs::write(&cache_file, json_str.as_bytes())?;
+    Ok(all_records)
+}
+
+// ---------------------------------------------------------------------------
+// NarrativeQA
+// ---------------------------------------------------------------------------
+
+fn fetch_narrativeqa(num_queries: usize) -> Result<Vec<RagSample>> {
+    // The HF parquet split for `deepmind/narrativeqa` validation is sharded
+    // across two files. URLs from the HF datasets-server parquet API.
+    let raw = download_parquet_shards_as_json(
+        "narrativeqa",
+        "validation.json",
+        &[
+            "https://huggingface.co/api/datasets/deepmind/narrativeqa/parquet/default/validation/0.parquet",
+            "https://huggingface.co/api/datasets/deepmind/narrativeqa/parquet/default/validation/1.parquet",
+        ],
+        "NarrativeQA validation set",
+    )?;
+
+    let mut samples = Vec::new();
+    for record in &raw {
+        let document = &record["document"];
+        let summary = &document["summary"];
+        let title = summary["title"].as_str().unwrap_or("").to_string();
+        let text = summary["text"].as_str().unwrap_or("").to_string();
+        let question = record["question"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        // Two reference answers per question; collect both.
+        let answers: Vec<String> = record["answers"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| a["text"].as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.trim().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if question.is_empty() || text.is_empty() || answers.is_empty() {
+            continue;
+        }
+
+        samples.push(RagSample {
+            question,
+            answers,
+            documents: vec![(title, text)],
+        });
+
+        if samples.len() >= num_queries {
+            break;
+        }
+    }
+    Ok(samples)
+}
+
+// ---------------------------------------------------------------------------
+// QASPER
+// ---------------------------------------------------------------------------
+
+fn fetch_qasper(num_queries: usize) -> Result<Vec<RagSample>> {
+    // Each QASPER row is one paper carrying 4–5 expert-annotated questions
+    // and a sectioned full text. We flatten to one RagSample per question:
+    // documents = paper sections, answers = union of extractive_spans +
+    // free_form_answer across all annotators.
+    let raw = download_parquet_shards_as_json(
+        "qasper",
+        "validation.json",
+        &["https://huggingface.co/api/datasets/allenai/qasper/parquet/qasper/validation/0.parquet"],
+        "QASPER validation set",
+    )?;
+
+    let mut samples = Vec::new();
+    'papers: for record in &raw {
+        let title = record["title"].as_str().unwrap_or("").to_string();
+        let abstract_text = record["abstract"].as_str().unwrap_or("").to_string();
+
+        // Build the document list once per paper: abstract + each section.
+        let mut documents: Vec<(String, String)> = Vec::new();
+        if !abstract_text.is_empty() {
+            documents.push((format!("{title} — Abstract"), abstract_text));
+        }
+        let full_text = &record["full_text"];
+        let section_names = full_text["section_name"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let sections = full_text["paragraphs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for (name_val, paras_val) in section_names.iter().zip(sections.iter()) {
+            let name = name_val.as_str().unwrap_or("").to_string();
+            let body = paras_val
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            if body.trim().is_empty() {
+                continue;
+            }
+            documents.push((format!("{title} — {name}"), body));
+        }
+        if documents.is_empty() {
+            continue;
+        }
+
+        let qas = &record["qas"];
+        let questions = qas["question"].as_array().cloned().unwrap_or_default();
+        let answers_lists = qas["answers"].as_array().cloned().unwrap_or_default();
+
+        for (q_val, ann_list_val) in questions.iter().zip(answers_lists.iter()) {
+            let question = q_val.as_str().unwrap_or("").to_string();
+            if question.is_empty() {
+                continue;
+            }
+
+            // Collect all distinct answer strings across annotators. Skip
+            // unanswerable / yes-no markers — we evaluate by substring/F1
+            // and those don't carry over.
+            let mut answers: Vec<String> = Vec::new();
+            if let Some(ann_arr) = ann_list_val.as_array() {
+                for ann in ann_arr {
+                    let inner = &ann["answer"];
+                    let inner_arr = inner.as_array().cloned().unwrap_or_default();
+                    for a in &inner_arr {
+                        if a["unanswerable"].as_bool().unwrap_or(false) {
+                            continue;
+                        }
+                        if let Some(spans) = a["extractive_spans"].as_array() {
+                            for s in spans {
+                                if let Some(t) = s.as_str().filter(|t| !t.trim().is_empty()) {
+                                    answers.push(t.to_string());
+                                }
+                            }
+                        }
+                        if let Some(ff) = a["free_form_answer"]
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                        {
+                            answers.push(ff.to_string());
+                        }
+                        if let Some(yn) = a["yes_no"].as_bool() {
+                            answers.push(if yn { "yes".into() } else { "no".into() });
+                        }
+                    }
+                }
+            }
+            answers.sort();
+            answers.dedup();
+            if answers.is_empty() {
+                continue;
+            }
+
+            samples.push(RagSample {
+                question,
+                answers,
+                documents: documents.clone(),
+            });
+
+            if samples.len() >= num_queries {
+                break 'papers;
+            }
         }
     }
     Ok(samples)

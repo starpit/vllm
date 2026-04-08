@@ -146,6 +146,30 @@
             pfl_a_st &a_smem = *my_a_stages[cur];
             pfl_b_st &b_smem = *b_stages[cur];
             group<PFL_NUM_WARPS>::sync(1);
+{%- if kstripe %}
+            // ── CUTLASS-style K-stripe inner loop ──
+            // Load only one K-stripe of A (rt_bf<PFL_GEMM_M, 16>) at a time
+            // instead of the full per-warp A. Drops live A register footprint
+            // from ~PFL_GEMM_M * (PFL_K_DIM/16) regs/lane to ~PFL_GEMM_M/16,
+            // which unlocks larger gemm_warp_m without hitting the sm89 cap.
+            constexpr int K_STRIPES = PFL_K_DIM / 16;
+            #pragma unroll
+            for (int kt = 0; kt < K_STRIPES; kt++) {
+                rt_bf<PFL_GEMM_M, 16> a_strip;
+                auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, kt});
+                warp::load(a_strip, a_view);
+                #pragma unroll
+                for (int n = 0; n < PFL_N_TILES; n++) {
+                    rt_bf<16, 16> b_strip;
+                    auto b_view = b_smem.template subtile<16, 16>(int2{n, kt});
+                    warp::load(b_strip, b_view);
+                    #pragma unroll
+                    for (int m_sub = 0; m_sub < PFL_GEMM_M_SUBS; m_sub++) {
+                        warp::mma_ABt_base(acc.tiles[m_sub][n], a_strip.tiles[m_sub][0], b_strip.tiles[0][0], acc.tiles[m_sub][n]);
+                    }
+                }
+            }
+{%- else %}
             pfl_a_rt a_reg;
             warp::load(a_reg, a_smem);
             pfl_b_slice_st *b_slices = reinterpret_cast<pfl_b_slice_st*>(&b_smem);
@@ -162,6 +186,7 @@
                         warp::mma_ABt_base(acc.tiles[m_sub][n], a_reg.tiles[m_sub][k], b_n.tiles[0][k], acc.tiles[m_sub][n]);
                 }
             }
+{%- endif %}
         }
         if (my_row_valid) {
             const int row_tile = my_row_tile;

@@ -59,9 +59,16 @@
             for (int iter = 0; iter < {{ num_k_iters }}; iter++) {
                 const int stg = iter % STAGES;
 
-                // Wait for consumers to finish reading this stage (if reusing)
+                // Wait for consumers to finish reading this stage (if reusing).
+                // Each consumer increments flag[stg*2+1] once per iter that hits
+                // this stage. After consumer iter (iter - STAGES) the cumulative
+                // count for stg is `iter/STAGES * NUM_CONSUMERS` (the previous use
+                // was the (iter/STAGES)-th use of this stage). The original
+                // formula `(iter - STAGES + 1) * NUM_CONSUMERS` was wrong: it
+                // counted total iterations rather than per-stage uses, causing a
+                // hard deadlock at iter == 2*STAGES.
                 if (iter >= STAGES) {
-                    while (flags[stg * 2 + 1] < (iter - STAGES + 1) * NUM_CONSUMERS) {}
+                    while (flags[stg * 2 + 1] < (iter / STAGES) * NUM_CONSUMERS) {}
                     __threadfence_block();
                 }
 

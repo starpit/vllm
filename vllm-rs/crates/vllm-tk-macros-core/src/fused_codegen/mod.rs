@@ -1083,6 +1083,7 @@ fn render_gemm_mcta(
     };
 
     GemmMctaCtx {
+        kstripe: cfg.kstripe_inner,
         phase_comment,
         input_global,
         weight_global,
@@ -1197,6 +1198,7 @@ fn render_gemm_gate_up_mcta(
         dual_accum: cfg.dual_accum_gate_up,
         up_b_offset: Bytes(d.b_offset.0 + d.b_size.0),
         col_fixed: cfg.col_fixed_schedule,
+        kstripe: cfg.kstripe_inner,
     }
     .render()
     .expect("gemm_gate_up_mcta template render")

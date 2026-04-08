@@ -48,6 +48,14 @@ pub struct FusedPrefillConfig {
     /// tiles (they stay hot across row_tile iterations) at the cost of some
     /// load imbalance when col_tiles doesn't evenly divide num_ctas.
     pub col_fixed_schedule: bool,
+    /// If true, GEMM phases use a CUTLASS-style K-pipelined inner loop:
+    /// instead of loading the full per-warp A tile (`rt_bf<gemm_warp_m,k_dim>`)
+    /// once and holding it across the n-loop, the inner loop iterates K-stripes,
+    /// loading only `rt_bf<gemm_warp_m,16>` (one k-strip) at a time. Drops the
+    /// live A register footprint from `gemm_warp_m * k_dim / 16` registers to
+    /// `gemm_warp_m / 16` per K-stripe. This unlocks `gemm_warp_m=64` single-acc
+    /// (which otherwise spills) without sacrificing compute density.
+    pub kstripe_inner: bool,
     /// Per-warp GEMM accumulator M dimension (must be multiple of 16).
     ///
     /// Each warp accumulates a logical tile of size `gemm_warp_m × out_block`,
@@ -79,6 +87,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -113,6 +122,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -131,6 +141,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -149,6 +160,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -198,6 +210,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -218,6 +231,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -245,6 +259,7 @@ impl FusedPrefillConfig {
             per_warp_b: true,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -265,6 +280,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -284,6 +300,7 @@ impl FusedPrefillConfig {
             per_warp_b: true,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -316,6 +333,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -335,6 +353,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -355,6 +374,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(64),
         }
     }
@@ -375,6 +395,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -394,6 +415,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -423,6 +445,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -443,6 +466,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(64),
         }
     }
@@ -463,6 +487,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -485,6 +510,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -506,6 +532,7 @@ impl FusedPrefillConfig {
             per_warp_b: true,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -526,6 +553,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: false,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -550,6 +578,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -572,6 +601,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -596,6 +626,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }
@@ -615,6 +646,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -634,6 +666,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -660,6 +693,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -679,6 +713,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -702,6 +737,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: false,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
         }
     }
@@ -727,7 +763,105 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: true,
+            kstripe_inner: false,
             gemm_warp_m: Dim(32),
+        }
+    }
+
+    // ── Round 8: K-pipelined inner loop (CUTLASS-style register lifetime) ──
+    //
+    // Instead of `warp::load(a_reg, a_smem)` loading the full per-warp A
+    // (`rt_bf<gemm_warp_m, k_dim>`) up front, the inner loop iterates K-stripes
+    // and loads only `rt_bf<gemm_warp_m, 16>` (1 K-strip) at a time. The live
+    // A register footprint drops from `gemm_warp_m × k_dim / 16` to
+    // `gemm_warp_m / 16` per stripe. This unlocks `gemm_warp_m=64` single-acc.
+
+    /// 256-row CTA, 4 warps × 64, single-accum, 1-stage, K-stripe inner loop.
+    /// Reg budget (with K-pipelining): acc 128 + a_strip 16 + b_strip 4 ≈ 168/lane.
+    /// Shmem: 4×8192 + 8192 = 40960 → fits 2 CTAs/SM on L4.
+    /// Combines CUTLASS-shape 64×64 warp tile + high occupancy + small registers.
+    pub fn rows256_gemm64_kstripe_1stage() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(4),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            kstripe_inner: true,
+            gemm_warp_m: Dim(64),
+        }
+    }
+
+    /// 256-row CTA, 8 warps × 32, single-accum, 1-stage.
+    /// Drops dual_accum vs the current `_large` winner; gate_up reverts to
+    /// back-to-back gate then up. The win: shmem drops from 49152 → 40960
+    /// (single B tile per stage instead of two), unlocking 2 CTAs/SM!
+    /// Loses A-reuse in gate_up but gains 2× occupancy across all phases.
+    pub fn rows256_gemm32_1stage() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            kstripe_inner: false,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 256-row CTA, 8 warps × 32, dual-accum + K-stripe, 1-stage.
+    /// Same shape as the current `_large` polyalgo winner, but with K-stripe
+    /// inner loop. Tests whether reducing register pressure on the dual-accum
+    /// hot path improves compiler scheduling. Shmem unchanged: 49152 bytes,
+    /// 1 CTA/SM. Live regs: 2×acc(64) + a_strip(16) + 2×b_strip(2) ≈ 146/lane
+    /// vs ~210/lane without kstripe (32 reg savings).
+    pub fn rows256_gemm32_dual_1stage_kstripe() -> Self {
+        Self {
+            cta_rows: Dim(256),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(8),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: true,
+            col_fixed_schedule: false,
+            kstripe_inner: true,
+            gemm_warp_m: Dim(32),
+        }
+    }
+
+    /// 128-row CTA, 2 warps × 64, single-accum, 1-stage, K-stripe inner loop.
+    /// Smaller variant for medium seq. Shmem: 2×8192 + 8192 = 24576 → 2 CTAs/SM.
+    pub fn rows128_gemm64_kstripe_1stage() -> Self {
+        Self {
+            cta_rows: Dim(128),
+            gemm_mode: GemmMode::Cooperative,
+            k_dim: Dim(64),
+            out_block: Dim(64),
+            num_warps: Count(2),
+            kv_page_size: Dim(64),
+            col_batch: Tiles(1),
+            num_stages: Count(1),
+            per_warp_b: false,
+            dual_accum_gate_up: false,
+            col_fixed_schedule: false,
+            kstripe_inner: true,
+            gemm_warp_m: Dim(64),
         }
     }
 
@@ -747,6 +881,7 @@ impl FusedPrefillConfig {
             per_warp_b: false,
             dual_accum_gate_up: true,
             col_fixed_schedule: true,
+            kstripe_inner: false,
             gemm_warp_m: Dim(16),
         }
     }

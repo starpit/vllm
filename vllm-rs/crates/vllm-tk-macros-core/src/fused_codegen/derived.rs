@@ -85,19 +85,25 @@ impl FusedDerived {
         // and a_reg + loop state, a safe budget is acc_elements/32 <= 128 → product
         // gemm_warp_m * out_block <= 4096. Dual-accumulator mode doubles the
         // accumulator footprint because gate_acc and up_acc live simultaneously.
+        // K-stripe inner loop relaxes the constraint: live A footprint drops
+        // from `gemm_warp_m * k_dim` to `gemm_warp_m * 16`, freeing roughly
+        // `gemm_warp_m * (k_dim - 16) / 32` registers per thread.
         let acc_elements = gemm_warp_m * cfg.out_block.0;
         let live_acc_elements = if cfg.dual_accum_gate_up {
             2 * acc_elements
         } else {
             acc_elements
         };
+        let acc_budget = if cfg.kstripe_inner { 8192 } else { 4096 };
         assert!(
-            live_acc_elements <= 4096,
-            "live accumulator elements = {} (gemm_warp_m={} * out_block={} * dual={}) exceeds sm89 register budget (max 4096)",
+            live_acc_elements <= acc_budget,
+            "live accumulator elements = {} (gemm_warp_m={} * out_block={} * dual={}, kstripe={}) exceeds sm89 register budget (max {})",
             live_acc_elements,
             gemm_warp_m,
             cfg.out_block.0,
-            cfg.dual_accum_gate_up
+            cfg.dual_accum_gate_up,
+            cfg.kstripe_inner,
+            acc_budget
         );
 
         // A tile padded to max(gemm_warp_m, 32) rows to avoid OOB cp.async writes.

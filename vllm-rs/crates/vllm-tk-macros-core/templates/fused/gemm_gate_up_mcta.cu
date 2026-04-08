@@ -375,6 +375,33 @@
             pfl_b_st &bg_smem = *bg_stages[cur];
             pfl_b_st &bu_smem = *bu_stages[cur];
             group<PFL_NUM_WARPS>::sync(1);
+{%- if kstripe %}
+            // Dual-accum + K-stripe: load A and B as 16-K stripes inside the
+            // n-loop instead of holding the full a_reg. Drops the live A
+            // register footprint, freeing registers for the live gate_acc +
+            // up_acc accumulators.
+            constexpr int K_STRIPES_DA = PFL_K_DIM / 16;
+            #pragma unroll
+            for (int kt = 0; kt < K_STRIPES_DA; kt++) {
+                rt_bf<PFL_GEMM_M, 16> a_strip;
+                auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, kt});
+                warp::load(a_strip, a_view);
+                #pragma unroll
+                for (int n = 0; n < PFL_N_TILES; n++) {
+                    rt_bf<16, 16> bg_strip;
+                    rt_bf<16, 16> bu_strip;
+                    auto bg_view = bg_smem.template subtile<16, 16>(int2{n, kt});
+                    auto bu_view = bu_smem.template subtile<16, 16>(int2{n, kt});
+                    warp::load(bg_strip, bg_view);
+                    warp::load(bu_strip, bu_view);
+                    #pragma unroll
+                    for (int m_sub = 0; m_sub < PFL_GEMM_M_SUBS; m_sub++) {
+                        warp::mma_ABt_base(gate_acc.tiles[m_sub][n], a_strip.tiles[m_sub][0], bg_strip.tiles[0][0], gate_acc.tiles[m_sub][n]);
+                        warp::mma_ABt_base(up_acc.tiles[m_sub][n],   a_strip.tiles[m_sub][0], bu_strip.tiles[0][0], up_acc.tiles[m_sub][n]);
+                    }
+                }
+            }
+{%- else %}
             pfl_a_rt a_reg;
             warp::load(a_reg, a_smem);
             pfl_b_slice_st *bg_slices = reinterpret_cast<pfl_b_slice_st*>(&bg_smem);
@@ -395,6 +422,7 @@
                     }
                 }
             }
+{%- endif %}
         }
 
         // Epilogue: silu(gate_acc) * up_acc → silu_out.
@@ -495,6 +523,26 @@
                 pfl_a_st &a_smem = *my_a_stages[cur];
                 pfl_b_st &b_smem = *b_stages[cur];
                 group<PFL_NUM_WARPS>::sync(1);
+{%- if kstripe %}
+                // K-stripe inner loop (CUTLASS-style register lifetime)
+                constexpr int K_STRIPES_GU = PFL_K_DIM / 16;
+                #pragma unroll
+                for (int kt = 0; kt < K_STRIPES_GU; kt++) {
+                    rt_bf<PFL_GEMM_M, 16> a_strip;
+                    auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, kt});
+                    warp::load(a_strip, a_view);
+                    #pragma unroll
+                    for (int n = 0; n < PFL_N_TILES; n++) {
+                        rt_bf<16, 16> b_strip;
+                        auto b_view = b_smem.template subtile<16, 16>(int2{n, kt});
+                        warp::load(b_strip, b_view);
+                        #pragma unroll
+                        for (int m_sub = 0; m_sub < PFL_GEMM_M_SUBS; m_sub++) {
+                            warp::mma_ABt_base(acc.tiles[m_sub][n], a_strip.tiles[m_sub][0], b_strip.tiles[0][0], acc.tiles[m_sub][n]);
+                        }
+                    }
+                }
+{%- else %}
                 pfl_a_rt a_reg;
                 warp::load(a_reg, a_smem);
                 pfl_b_slice_st *b_slices = reinterpret_cast<pfl_b_slice_st*>(&b_smem);
@@ -509,6 +557,7 @@
                             warp::mma_ABt_base(acc.tiles[m_sub][n], a_reg.tiles[m_sub][k], b_n.tiles[0][k], acc.tiles[m_sub][n]);
                     }
                 }
+{%- endif %}
             }
             // SiLU epilogue + store
             if (my_row_valid) {
@@ -567,6 +616,26 @@
                 pfl_a_st &a_smem = *my_a_stages[cur];
                 pfl_b_st &b_smem = *b_stages[cur];
                 group<PFL_NUM_WARPS>::sync(1);
+{%- if kstripe %}
+                // K-stripe inner loop (CUTLASS-style register lifetime)
+                constexpr int K_STRIPES_GU = PFL_K_DIM / 16;
+                #pragma unroll
+                for (int kt = 0; kt < K_STRIPES_GU; kt++) {
+                    rt_bf<PFL_GEMM_M, 16> a_strip;
+                    auto a_view = a_smem.template subtile<PFL_GEMM_M, 16>(int2{0, kt});
+                    warp::load(a_strip, a_view);
+                    #pragma unroll
+                    for (int n = 0; n < PFL_N_TILES; n++) {
+                        rt_bf<16, 16> b_strip;
+                        auto b_view = b_smem.template subtile<16, 16>(int2{n, kt});
+                        warp::load(b_strip, b_view);
+                        #pragma unroll
+                        for (int m_sub = 0; m_sub < PFL_GEMM_M_SUBS; m_sub++) {
+                            warp::mma_ABt_base(acc.tiles[m_sub][n], a_strip.tiles[m_sub][0], b_strip.tiles[0][0], acc.tiles[m_sub][n]);
+                        }
+                    }
+                }
+{%- else %}
                 pfl_a_rt a_reg;
                 warp::load(a_reg, a_smem);
                 pfl_b_slice_st *b_slices = reinterpret_cast<pfl_b_slice_st*>(&b_smem);
@@ -581,6 +650,7 @@
                             warp::mma_ABt_base(acc.tiles[m_sub][n], a_reg.tiles[m_sub][k], b_n.tiles[0][k], acc.tiles[m_sub][n]);
                     }
                 }
+{%- endif %}
             }
             // Mulgate epilogue: acc * silu_out → silu_out
             if (my_row_valid) {

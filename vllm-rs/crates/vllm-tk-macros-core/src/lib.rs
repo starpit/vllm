@@ -512,6 +512,40 @@ pub fn generate_fused_prefill_layer_kernel(dsl: &str) -> Result<String, String> 
                 Count(128),
             ));
         }
+        // ── Round 8: K-stripe inner loop (CUTLASS-style) ──
+        "v2-mcta-256row-gemm64-kstripe-1stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows256_gemm64_kstripe_1stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-128row-gemm64-kstripe-1stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows128_gemm64_kstripe_1stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-256row-gemm32-1stage" => {
+            let cfg = fused_codegen::config::FusedPrefillConfig::rows256_gemm32_1stage();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
+        "v2-mcta-256row-gemm32-dual-1stage-kstripe" => {
+            let cfg =
+                fused_codegen::config::FusedPrefillConfig::rows256_gemm32_dual_1stage_kstripe();
+            return Ok(fused_codegen::generate_fused_prefill_mcta_fused_gateup(
+                &dag,
+                &cfg,
+                Count(128),
+            ));
+        }
         other => {
             return Err(format!(
                 "unknown TK_FUSED_PREFILL backend '{other}' \

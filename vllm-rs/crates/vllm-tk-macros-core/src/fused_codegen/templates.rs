@@ -180,6 +180,7 @@ pub struct KernelCtx<'a> {
 #[derive(Template)]
 #[template(path = "fused/gemm_mcta.cu", escape = "none")]
 pub struct GemmMctaCtx<'a> {
+    pub kstripe: bool,
     pub phase_comment: &'a str,
     pub input_global: &'a str,
     pub weight_global: &'a str,
@@ -265,6 +266,9 @@ pub struct GemmGateUpMctaCtx<'a> {
     pub up_b_offset: Bytes,
     /// If true, use col-fixed CTA scheduling inside the dual_accum branch.
     pub col_fixed: bool,
+    /// If true, use the K-stripe inner loop (loads only one K-strip of A
+    /// at a time, dropping live A register footprint).
+    pub kstripe: bool,
 }
 
 #[derive(Template)]

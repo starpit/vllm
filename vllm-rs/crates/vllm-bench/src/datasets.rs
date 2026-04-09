@@ -20,6 +20,7 @@ use tokenizers::tokenizer::PostProcessor;
 
 /// A single RAG sample: question + acceptable answers + document fragments.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "rag"), allow(dead_code))]
 pub struct RagSample {
     /// The question to answer.
     pub question: String,
@@ -618,6 +619,7 @@ fn fetch_qasper(num_queries: usize) -> Result<Vec<RagSample>> {
 
 /// Evaluate response against any acceptable answer.
 /// Returns 1.0 if any answer is a substring match or token F1 >= 0.5.
+#[cfg(any(feature = "rag", test))]
 pub fn evaluate_accuracy(response: &str, answers: &[String]) -> f64 {
     let resp_lower = response.to_lowercase();
     for ans in answers {
@@ -634,6 +636,7 @@ pub fn evaluate_accuracy(response: &str, answers: &[String]) -> f64 {
 }
 
 /// Compute best token F1 across all acceptable answers.
+#[cfg(any(feature = "rag", test))]
 pub fn best_token_f1(answers: &[String], actual: &str) -> f64 {
     answers
         .iter()
@@ -641,6 +644,7 @@ pub fn best_token_f1(answers: &[String], actual: &str) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+#[cfg(any(feature = "rag", test))]
 fn normalize_tokens(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())
@@ -648,6 +652,7 @@ fn normalize_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(feature = "rag", test))]
 fn compute_token_f1(expected: &str, actual: &str) -> f64 {
     let et = normalize_tokens(expected);
     let at = normalize_tokens(actual);

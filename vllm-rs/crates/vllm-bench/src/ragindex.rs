@@ -10,22 +10,32 @@
 //! and generates an answer. Reports running and final accuracy, F1, and
 //! latency statistics.
 
+#[cfg(feature = "rag")]
 use std::collections::HashSet;
+#[cfg(feature = "rag")]
 use std::hash::{Hash, Hasher};
+#[cfg(feature = "rag")]
 use std::time::Instant;
 
 use anyhow::Result;
+#[cfg(feature = "rag")]
 use indicatif::{ProgressBar, ProgressStyle};
 #[cfg(feature = "rag")]
 use spnl_core::ir::{Augment, Document};
+#[cfg(any(feature = "rag", test))]
 use spnl_core::ir::{Generate, GenerateMetadata, Message, Query as SpnlQuery};
 use vllm_config::{CudaGraphConfig, CudaGraphMode};
-use vllm_serve::llm::{LLM, LLMBuilder, SamplingParams};
+#[cfg(feature = "rag")]
+use vllm_serve::llm::SamplingParams;
+use vllm_serve::llm::{LLM, LLMBuilder};
 
 use crate::args::BenchRagindexArgs;
-use crate::datasets::{QueryMode, best_token_f1, evaluate_accuracy, fetch_rag_dataset};
+use crate::datasets::fetch_rag_dataset;
+#[cfg(any(feature = "rag", test))]
+use crate::datasets::{QueryMode, best_token_f1, evaluate_accuracy};
 
 const BOLD: &str = "\x1b[1m";
+#[cfg(feature = "rag")]
 const DIM: &str = "\x1b[2m";
 const RST: &str = "\x1b[0m";
 
@@ -74,6 +84,7 @@ fn build_llm(args: &BenchRagindexArgs) -> Result<LLM> {
 // Running statistics
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "rag")]
 struct RunningStats {
     accs: Vec<f64>,
     f1s: Vec<f64>,
@@ -82,6 +93,7 @@ struct RunningStats {
     total_cached_tokens: u64,
 }
 
+#[cfg(feature = "rag")]
 impl RunningStats {
     fn new(capacity: usize) -> Self {
         Self {
@@ -142,6 +154,7 @@ impl RunningStats {
 /// *could* be reused if the cache worked perfectly. Hashes each block's
 /// tokens with a fixed parent (like relocatable blocks), so any two queries
 /// sharing the same token block will match.
+#[cfg(feature = "rag")]
 struct BlockOverlapTracker {
     block_size: usize,
     seen: HashSet<u64>,
@@ -149,6 +162,7 @@ struct BlockOverlapTracker {
     reusable_blocks: u64,
 }
 
+#[cfg(feature = "rag")]
 impl BlockOverlapTracker {
     fn new(block_size: usize) -> Self {
         Self {
@@ -193,6 +207,7 @@ impl BlockOverlapTracker {
 
 /// Hash a block's tokens the same way the scheduler does for relocatable
 /// blocks (parent = NONE_HASH = 0).
+#[cfg(feature = "rag")]
 fn hash_block(tokens: &[u32]) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     0u64.hash(&mut hasher); // NONE_HASH parent
@@ -200,6 +215,7 @@ fn hash_block(tokens: &[u32]) -> u64 {
     hasher.finish()
 }
 
+#[cfg(feature = "rag")]
 fn percentile_of(values: &[f64], p: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -233,10 +249,12 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
         return Ok(());
     }
 
+    #[cfg_attr(not(feature = "rag"), allow(unused_mut))]
     let mut llm = build_llm(&args)?;
     let model_name = llm.model_name().to_string();
     let embedding_model = args.resolved_embedding_model();
 
+    #[cfg(feature = "rag")]
     let sampling = SamplingParams {
         max_tokens: Some(args.max_tokens as u32),
         temperature: 0.0,
@@ -256,7 +274,6 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
     {
         eprintln!();
         eprintln!("{BOLD}Skipped{RST} (build with --features rag for LEANN indexing)");
-        return Ok(());
     }
 
     #[cfg(feature = "rag")]
@@ -399,6 +416,7 @@ pub(crate) fn run_bench_ragindex(args: BenchRagindexArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rag")]
 fn make_progress_bar(n: usize) -> ProgressBar {
     ProgressBar::new(n as u64).with_style(
         ProgressStyle::default_bar()
@@ -407,6 +425,7 @@ fn make_progress_bar(n: usize) -> ProgressBar {
     )
 }
 
+#[cfg(feature = "rag")]
 fn update_progress(pb: &ProgressBar, stats: &RunningStats, overlap: &BlockOverlapTracker) {
     pb.set_message(format!(
         "acc={:.1}%  F1={:.3}  cache={:.0}%  potential={:.0}%  avg={}  p50={}  p99={}",
@@ -421,6 +440,7 @@ fn update_progress(pb: &ProgressBar, stats: &RunningStats, overlap: &BlockOverla
     pb.inc(1);
 }
 
+#[cfg(feature = "rag")]
 fn print_stats(label: &str, s: &RunningStats, overlap: &BlockOverlapTracker) {
     println!(
         "  {BOLD}{label}{RST}:  acc={BOLD}{:.1}%{RST}  F1={BOLD}{:.3}{RST}  cache={BOLD}{:.0}%{RST}  potential={BOLD}{:.0}%{RST}  avg={}  p50={}  p99={}",
@@ -435,6 +455,7 @@ fn print_stats(label: &str, s: &RunningStats, overlap: &BlockOverlapTracker) {
 }
 
 /// Format milliseconds as a human-readable duration (e.g. "7.4s", "238ms").
+#[cfg(feature = "rag")]
 fn fmt_ms(ms: f64) -> String {
     if ms >= 1000.0 {
         format!("{:.1}s", ms / 1000.0)

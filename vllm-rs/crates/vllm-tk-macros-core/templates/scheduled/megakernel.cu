@@ -152,6 +152,12 @@ namespace pfl_cutlass_small {
     using WarpShape        = cutlass::gemm::GemmShape<64, 32, 32>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 
+    // 4 cp.async pipeline stages (was 3): measured 53.19 → 52.94 ms
+    // at seq=1024 in the scheduled megakernel (cumulative across all
+    // four cutlass dispatch arms). Tried 5 stages and it regressed
+    // (53.54 ms) — extra shmem footprint hurts the rest of the
+    // megakernel. The framework should be searching this constant
+    // automatically once the polyalgo library lands.
     using DefaultMmaT = cutlass::gemm::threadblock::DefaultMma<
         ElementA, LayoutA, /*kAlignmentA=*/8,
         ElementB, LayoutB, /*kAlignmentB=*/8,
@@ -159,7 +165,7 @@ namespace pfl_cutlass_small {
         cutlass::arch::OpClassTensorOp,
         cutlass::arch::Sm80,
         ThreadblockShape, WarpShape, InstructionShape,
-        /*Stages=*/3,
+        /*Stages=*/4,
         cutlass::arch::OpMultiplyAdd>;
 
     using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;

@@ -2004,6 +2004,271 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
     }
 }
 
+// ── CP2: per-wave megakernel ────────────────────────────────────────
+//
+// One `__global__` that processes a SINGLE wave's worth of work per
+// invocation. The matching launcher
+// (`launch_scheduled_megakernel_{{ name }}_per_wave` below) loops
+// `cudaLaunchCooperativeKernel` over `wave_idx ∈ [0..NUM_WAVES)`,
+// using the **kernel boundary** as the inter-wave grid barrier
+// instead of the in-kernel `cooperative_groups::this_grid().sync()`
+// or gmem-flag spin barrier the legacy single-launch kernel uses.
+//
+// On L4 sm_89 a kernel boundary on the same stream is ~3-5 µs vs
+// the in-kernel grid sync's ~100 µs. The lowering solver
+// (`crate::lowering::solver`) outputs an `ExecutionPlan` whose
+// per-target solver picks this strategy when `barrier_cost_us ≫
+// launch_cost_us` AND `regs_dynamic_per_warpgroup` is false — i.e.
+// the L4 sm_89 case.
+//
+// The kernel body is structurally identical to the inner of the
+// legacy wave loop (a single iteration), with two differences:
+//
+// 1. No call to `grid_barrier()` — the kernel-end is the barrier.
+// 2. Phase-clock accumulation reads the current `rt.phase_clocks`
+//    row at the start and writes back at the end, so per-wave
+//    deltas across many launches sum into the same gmem row instead
+//    of overwriting. Each CTA owns its own row → no inter-CTA race.
+//    Launches are sequential on the same stream → no inter-launch
+//    race either.
+__global__ void scheduled_megakernel_{{ name }}_one_wave(
+    globals_t g,
+    SchedRuntime rt,
+    uint32_t wave_idx)
+{
+    const uint32_t cta_id = blockIdx.y;
+    const uint32_t tid    = threadIdx.x;
+    if (cta_id >= NUM_CTAS) return;
+
+    extern __shared__ __align__(16) uint8_t tile_smem_dyn[];
+    char* tile_smem = reinterpret_cast<char*>(tile_smem_dyn);
+
+    // Per-CTA per-kernel-tag clock accumulator. See the matching
+    // declaration in `scheduled_megakernel_{{ name }}` for the slot
+    // layout.
+    constexpr uint32_t NUM_CLOCK_SLOTS = 17;
+    constexpr uint32_t IDLE_SLOT = 9;
+    unsigned long long phase_clock[NUM_CLOCK_SLOTS] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    const bool prof = (rt.phase_clocks != nullptr) && (tid == 0);
+    unsigned long long t_outside = prof ? clock64() : 0ULL;
+
+    const uint32_t off = WAVE_CTA_OFFSETS[wave_idx * (NUM_CTAS + 1) + cta_id];
+    const uint32_t end = WAVE_CTA_OFFSETS[wave_idx * (NUM_CTAS + 1) + cta_id + 1];
+
+    for (uint32_t i = off; i < end; ++i) {
+        const TileOp op = WAVE_OPS[i];
+        unsigned long long t_in = 0ULL;
+        if (prof) {
+            t_in = clock64();
+            phase_clock[IDLE_SLOT] += t_in - t_outside;
+        }
+
+        // ── Identical dispatch body to the legacy kernel ──
+        switch (op.kernel_tag) {
+            case PHASE_ATTN_NORM: tile_attn_norm(g, op.layer, op.row); break;
+            case PHASE_QKV:       tile_qkv      (g, op.layer, op.row, op.col, tile_smem); break;
+            case PHASE_ROPE:      tile_rope     (g, op.layer, op.row); break;
+            case PHASE_ATTENTION: tile_attention(g, op.layer, op.row, tile_smem); break;
+            case PHASE_O_PROJ:    tile_o_proj   (g, op.layer, op.row, op.col, tile_smem); break;
+            case PHASE_MLP_NORM:  tile_mlp_norm (g, op.layer, op.row); break;
+            case PHASE_GATE_UP:   tile_gate_up  (g, op.layer, op.row, op.col, tile_smem); break;
+            case PHASE_DOWN:      tile_down     (g, op.layer, op.row, op.col, tile_smem); break;
+            case 10 /* CutlassGemmLayer { Qkv } */: {
+                constexpr uint32_t QKV_DIM_FULL =
+                    (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
+                auto* a_ptr = g.rms_rope;
+                auto* b_ptr = g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
+                                                          * (size_t)MODEL_HIDDEN_DIM;
+                auto* out_ptr = g.qkv;
+                if (op.col == 0u) {
+                    tile_cutlass_gemm_small_lincomb(
+                        a_ptr, b_ptr, out_ptr,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                        /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                } else {
+                    tile_cutlass_gemm_narrow_lincomb(
+                        a_ptr, b_ptr, out_ptr,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                        /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                }
+                break;
+            }
+            case 11 /* CutlassGemmLayer { OProj } */: {
+                auto* b_ptr = g.o_w + (size_t)op.layer
+                                          * (size_t)MODEL_HIDDEN_DIM
+                                          * (size_t)MODEL_HIDDEN_DIM;
+                if (op.col == 0u) {
+                    tile_cutlass_gemm_small_lincomb(
+                        g.attn_out, b_ptr, g.hidden_states,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_HIDDEN_DIM,
+                        /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                } else {
+                    tile_cutlass_gemm_narrow_lincomb(
+                        g.attn_out, b_ptr, g.hidden_states,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_HIDDEN_DIM,
+                        /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                }
+                break;
+            }
+            case 12 /* CutlassGemmLayer { GateUp } */: {
+                auto* b_up = g.up_w + (size_t)op.layer
+                                          * (size_t)MODEL_INTERMEDIATE
+                                          * (size_t)MODEL_HIDDEN_DIM;
+                auto* b_gate = g.gate_w + (size_t)op.layer
+                                              * (size_t)MODEL_INTERMEDIATE
+                                              * (size_t)MODEL_HIDDEN_DIM;
+                if (op.col == 0u) {
+                    tile_cutlass_gemm_small_lincomb(
+                        g.rms_gate, b_up, g.silu_out,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                        /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                    tile_cutlass_gemm_small_silumul(
+                        g.rms_gate, b_gate, g.silu_out,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                        /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                } else {
+                    tile_cutlass_gemm_narrow_lincomb(
+                        g.rms_gate, b_up, g.silu_out,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                        /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                    tile_cutlass_gemm_narrow_silumul(
+                        g.rms_gate, b_gate, g.silu_out,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                        /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                }
+                break;
+            }
+            case 13 /* CutlassGemmLayer { Down } */: {
+                auto* b_ptr = g.down_w + (size_t)op.layer
+                                             * (size_t)MODEL_HIDDEN_DIM
+                                             * (size_t)MODEL_INTERMEDIATE;
+                if (op.col == 0u) {
+                    tile_cutlass_gemm_small_lincomb(
+                        g.silu_out, b_ptr, g.hidden_states,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_INTERMEDIATE, (int)MODEL_HIDDEN_DIM,
+                        /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                } else {
+                    tile_cutlass_gemm_narrow_lincomb(
+                        g.silu_out, b_ptr, g.hidden_states,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_INTERMEDIATE, (int)MODEL_HIDDEN_DIM,
+                        /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                }
+                break;
+            }
+            case PHASE_FLASHINFER_ATTN: {
+                auto& smem_storage =
+                    *reinterpret_cast<FlashInferKTraits::SharedStorage*>(tile_smem_dyn);
+                FlashInferRunner::Run(rt.flashinfer_params[op.layer], &smem_storage);
+                break;
+            }
+            case 14 /* FusedFaninLayer { AttnNorm → Cutlass Qkv } */: {
+                constexpr uint32_t ROW_TILES =
+                    (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+                for (uint32_t rt_idx = cta_id; rt_idx < ROW_TILES; rt_idx += NUM_CTAS) {
+                    tile_attn_norm(g, op.layer, rt_idx);
+                }
+                cooperative_groups::this_grid().sync();
+                constexpr uint32_t QKV_DIM_FULL =
+                    (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
+                auto* a_ptr = g.rms_rope;
+                auto* b_ptr = g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
+                                                          * (size_t)MODEL_HIDDEN_DIM;
+                auto* out_ptr = g.qkv;
+                if (op.col == 0u) {
+                    tile_cutlass_gemm_small_lincomb(
+                        a_ptr, b_ptr, out_ptr,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                        /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                } else {
+                    tile_cutlass_gemm_narrow_lincomb(
+                        a_ptr, b_ptr, out_ptr,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                        /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                }
+                break;
+            }
+            case 15 /* FusedFaninLayer { Rope → FlashInfer attention } */: {
+                constexpr uint32_t ROW_TILES =
+                    (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+                for (uint32_t rt_idx = cta_id; rt_idx < ROW_TILES; rt_idx += NUM_CTAS) {
+                    tile_rope(g, op.layer, rt_idx);
+                }
+                cooperative_groups::this_grid().sync();
+                auto& smem_storage =
+                    *reinterpret_cast<FlashInferKTraits::SharedStorage*>(tile_smem_dyn);
+                FlashInferRunner::Run(rt.flashinfer_params[op.layer], &smem_storage);
+                break;
+            }
+            case 16 /* FusedFaninLayer { MlpNorm → Cutlass GateUp } */: {
+                constexpr uint32_t ROW_TILES =
+                    (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+                for (uint32_t rt_idx = cta_id; rt_idx < ROW_TILES; rt_idx += NUM_CTAS) {
+                    tile_mlp_norm(g, op.layer, rt_idx);
+                }
+                cooperative_groups::this_grid().sync();
+                auto* b_up = g.up_w + (size_t)op.layer
+                                          * (size_t)MODEL_INTERMEDIATE
+                                          * (size_t)MODEL_HIDDEN_DIM;
+                auto* b_gate = g.gate_w + (size_t)op.layer
+                                              * (size_t)MODEL_INTERMEDIATE
+                                              * (size_t)MODEL_HIDDEN_DIM;
+                if (op.col == 0u) {
+                    tile_cutlass_gemm_small_lincomb(
+                        g.rms_gate, b_up, g.silu_out,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                        /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                    tile_cutlass_gemm_small_silumul(
+                        g.rms_gate, b_gate, g.silu_out,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                        /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                } else {
+                    tile_cutlass_gemm_narrow_lincomb(
+                        g.rms_gate, b_up, g.silu_out,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                        /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                    tile_cutlass_gemm_narrow_silumul(
+                        g.rms_gate, b_gate, g.silu_out,
+                        (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                        /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                }
+                break;
+            }
+            default: break;
+        }
+        // Stamp validation tick. Single-threaded.
+        __syncthreads();
+        if (prof) {
+            t_outside = clock64();
+            phase_clock[op.kernel_tag] += t_outside - t_in;
+        }
+        const bool wave_coop = (op.kernel_tag == PHASE_FLASHINFER_ATTN)
+                            || (op.kernel_tag >= 10 && op.kernel_tag <= 16);
+        if (tid == 0 && (!wave_coop || cta_id == 0)) {
+            const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;
+            const uint32_t node_id = NODE_ID_FOR_OP[i];
+            rt.flags[node_id] = tick;
+        }
+        __syncthreads();
+    }
+
+    // No grid_barrier — kernel boundary IS the barrier in CP2.
+
+    // Per-wave clock flush: ACCUMULATE into rt.phase_clocks instead
+    // of overwriting, so multiple per-wave launches in sequence
+    // produce the same total as the legacy single-launch kernel
+    // would. Each CTA owns its own row, no inter-CTA race; launches
+    // are sequential on the same stream so no inter-launch race.
+    if (prof) {
+        const unsigned long long t_end = clock64();
+        phase_clock[IDLE_SLOT] += t_end - t_outside;
+        unsigned long long* row = rt.phase_clocks + (size_t)cta_id * NUM_CLOCK_SLOTS;
+        #pragma unroll
+        for (int p = 0; p < (int)NUM_CLOCK_SLOTS; ++p) {
+            row[p] += phase_clock[p];
+        }
+    }
+}
+
 }  // namespace pfl_sched_{{ name }}
 
 extern "C" void launch_scheduled_megakernel_{{ name }}(
@@ -2143,6 +2408,130 @@ extern "C" void launch_scheduled_megakernel_{{ name }}(
     if (launch_err != cudaSuccess) {
         printf("scheduled_megakernel_{{ name }}: cudaLaunchCooperativeKernel failed: %s\n",
                cudaGetErrorString(launch_err));
+    }
+}
+
+// CP2: per-wave launcher. Same args as the legacy launcher above —
+// build globals + runtime once, then loop `cudaLaunchCooperativeKernel`
+// over `wave_idx ∈ [0..NUM_WAVES)`. Kernel boundary on the same
+// stream provides the inter-wave grid sync. Phase-clock accumulation
+// is handled inside the per-wave kernel by reading + writing back
+// `rt.phase_clocks` so the totals match the legacy kernel exactly.
+extern "C" void launch_scheduled_megakernel_{{ name }}_per_wave(
+    void* hidden_states,
+    void* rms_rope,
+    void* qkv,
+    void* q_post_rope,
+    void* attn_out,
+    void* rms_gate,
+    void* silu_out,
+    void* k_cache,
+    void* v_cache,
+    const int* prefill_kv_indices,
+    const int* prefill_kv_indptr,
+    const int* prefill_qo_indptr,
+    void* attn_norm_w,
+    void* mlp_norm_w,
+    void* qkv_w,
+    void* o_w,
+    void* gate_w,
+    void* up_w,
+    void* down_w,
+    float eps,
+    float attn_scale,
+    unsigned int* flags,
+    unsigned int* tick_counter,
+    unsigned int* barrier_arrived,
+    unsigned long long* phase_clocks,
+    void* flashinfer_params,
+    cudaStream_t stream)
+{
+    pfl_sched_{{ name }}::globals_t g{
+        reinterpret_cast<__nv_bfloat16*>(hidden_states),
+        reinterpret_cast<__nv_bfloat16*>(rms_rope),
+        reinterpret_cast<__nv_bfloat16*>(qkv),
+        reinterpret_cast<__nv_bfloat16*>(q_post_rope),
+        reinterpret_cast<__nv_bfloat16*>(attn_out),
+        reinterpret_cast<__nv_bfloat16*>(rms_gate),
+        reinterpret_cast<__nv_bfloat16*>(silu_out),
+        reinterpret_cast<__nv_bfloat16*>(k_cache),
+        reinterpret_cast<__nv_bfloat16*>(v_cache),
+        prefill_kv_indices,
+        prefill_kv_indptr,
+        prefill_qo_indptr,
+        reinterpret_cast<__nv_bfloat16*>(attn_norm_w),
+        reinterpret_cast<__nv_bfloat16*>(mlp_norm_w),
+        reinterpret_cast<__nv_bfloat16*>(qkv_w),
+        reinterpret_cast<__nv_bfloat16*>(o_w),
+        reinterpret_cast<__nv_bfloat16*>(gate_w),
+        reinterpret_cast<__nv_bfloat16*>(up_w),
+        reinterpret_cast<__nv_bfloat16*>(down_w),
+        eps,
+        attn_scale,
+    };
+    pfl_sched_{{ name }}::SchedRuntime rt{
+        flags,
+        tick_counter,
+        barrier_arrived,
+        phase_clocks,
+        reinterpret_cast<pfl_sched_{{ name }}::FlashInferParams*>(flashinfer_params),
+    };
+    dim3 grid(1, pfl_sched_{{ name }}::NUM_CTAS);
+    dim3 block(pfl_sched_{{ name }}::MEGAKERNEL_NUM_THREADS);
+
+    // Same shmem sizing as the legacy launcher — for CP2 the per-wave
+    // kernel still has every dispatch arm linked into one __global__
+    // (CP3 will split per kind), so its arena is sized to the union.
+    constexpr size_t kCutlassBigShmem = sizeof(::pfl_cutlass::SharedStorage);
+    constexpr size_t kCutlassSmallShmem = sizeof(::pfl_cutlass_small::SharedStorage);
+    constexpr size_t kCutlassNarrowShmem = sizeof(::pfl_cutlass_narrow::SharedStorage);
+    constexpr size_t kMaxAB =
+        pfl_sched_{{ name }}::TILE_SHMEM_BYTES > pfl_sched_{{ name }}::FI_SHARED_STORAGE_BYTES
+            ? pfl_sched_{{ name }}::TILE_SHMEM_BYTES
+            : pfl_sched_{{ name }}::FI_SHARED_STORAGE_BYTES;
+    constexpr size_t kMaxABC = kMaxAB > kCutlassBigShmem ? kMaxAB : kCutlassBigShmem;
+    constexpr size_t kMaxABCD = kMaxABC > kCutlassSmallShmem ? kMaxABC : kCutlassSmallShmem;
+    constexpr size_t kSmemBytes = kMaxABCD > kCutlassNarrowShmem ? kMaxABCD : kCutlassNarrowShmem;
+    static_assert(kSmemBytes <= pfl_sched_{{ name }}::TARGET_MAX_DYNAMIC_SHMEM_BYTES,
+                  "per-wave megakernel SharedStorage exceeds target.max_dynamic_shmem_bytes");
+
+    auto attr_err = cudaFuncSetAttribute(
+        (const void*)pfl_sched_{{ name }}::scheduled_megakernel_{{ name }}_one_wave,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)kSmemBytes);
+    if (attr_err != cudaSuccess) {
+        printf("scheduled_megakernel_{{ name }}_one_wave: cudaFuncSetAttribute failed: %s\n",
+               cudaGetErrorString(attr_err));
+        return;
+    }
+
+    // Zero out the phase_clocks region before the first wave so the
+    // per-wave accumulation in `scheduled_megakernel_*_one_wave`
+    // starts from a clean slate. Async on the same stream → free.
+    if (phase_clocks != nullptr) {
+        cudaMemsetAsync(
+            phase_clocks,
+            0,
+            (size_t)pfl_sched_{{ name }}::NUM_CTAS * (size_t)17 * sizeof(unsigned long long),
+            stream);
+    }
+
+    // Loop `cudaLaunchCooperativeKernel` per wave. Each launch's
+    // exit on the same stream provides the inter-wave grid barrier
+    // — replacing the ~100 µs `cooperative_groups::this_grid().sync()`
+    // the legacy single-launch kernel uses with a ~3-5 µs kernel
+    // boundary. The lowering solver picks this strategy when its
+    // `LoweringConstraints::barrier_cost_us ≫ launch_cost_us`.
+    for (uint32_t wave_idx = 0; wave_idx < pfl_sched_{{ name }}::NUM_WAVES; ++wave_idx) {
+        void* args[] = { &g, &rt, &wave_idx };
+        auto launch_err = cudaLaunchCooperativeKernel(
+            (const void*)pfl_sched_{{ name }}::scheduled_megakernel_{{ name }}_one_wave,
+            grid, block, args, kSmemBytes, stream);
+        if (launch_err != cudaSuccess) {
+            printf("scheduled_megakernel_{{ name }}_one_wave[w=%u]: cudaLaunchCooperativeKernel failed: %s\n",
+                   wave_idx, cudaGetErrorString(launch_err));
+            return;
+        }
     }
 }
 

@@ -94,14 +94,20 @@ fn sm89_l4_plan_separates_every_wave() {
             assert!(matches!(g.handoff_to_next, Handoff::LaunchBoundary { .. }));
         }
     }
-    // The plan should predict savings vs the legacy "all-in-one
-    // mega __global__" lowering: we replace ~80 grid syncs (100µs each)
-    // with ~80 launch boundaries (5µs each). Net ≈ 7.6 ms saving on
-    // the handoff cost alone, before any per-kind register-budget
-    // wins (which CP2/3 add).
+    // The plan should predict positive savings vs the legacy
+    // "all-in-one mega __global__" lowering. With L4 sm_89 numbers
+    // (barrier 100 µs, measured cooperative launch 80 µs) the
+    // difference is only ~20 µs/boundary, so 80 boundaries yields
+    // ~1.6 ms gross savings before occupancy-penalty refunds.
+    // CP2 bench confirmed this: idle/sync collapses from 5.89 ms to
+    // 0.33 ms (5.56 ms saved on barriers) but ~80 launches × 80 µs
+    // each adds back ~6.4 ms of launch overhead — net wall-clock is
+    // a wash on sm_89. The structural win has to come from CP3's
+    // per-kind register budgets, which is the load-bearing benefit
+    // of this whole refactor on sm_89.
     assert!(
-        plan.savings_vs_legacy_us() > 5_000.0,
-        "expected ≥ 5 ms barrier savings; got {:.1} µs",
+        plan.savings_vs_legacy_us() > 1_000.0,
+        "expected positive barrier savings; got {:.1} µs",
         plan.savings_vs_legacy_us()
     );
 }

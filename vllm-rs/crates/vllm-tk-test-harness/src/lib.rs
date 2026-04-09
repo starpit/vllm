@@ -338,7 +338,7 @@ pub mod ffi {
     // shape, different symbol suffix. We declare it as a macro to keep the
     // declarations in sync.
     macro_rules! decl_scheduled_megakernel {
-        ($launch:ident, $num_nodes:ident, $num_ctas:ident, $num_waves:ident) => {
+        ($launch:ident, $launch_per_wave:ident, $num_nodes:ident, $num_ctas:ident, $num_waves:ident) => {
             unsafe extern "C" {
                 pub fn $launch(
                     hidden_states: *mut std::ffi::c_void,
@@ -374,6 +374,40 @@ pub mod ffi {
                     flashinfer_params: *mut std::ffi::c_void,
                     stream: *mut std::ffi::c_void,
                 );
+                // CP2: per-wave launcher. Same signature as the
+                // legacy launcher above; loops cudaLaunchCooperativeKernel
+                // over each wave in the schedule. Picked at runtime
+                // via the FERRITE_PER_WAVE_LOWERING env var. See
+                // `templates/scheduled/megakernel.cu` for the body.
+                pub fn $launch_per_wave(
+                    hidden_states: *mut std::ffi::c_void,
+                    rms_rope: *mut std::ffi::c_void,
+                    qkv: *mut std::ffi::c_void,
+                    q_post_rope: *mut std::ffi::c_void,
+                    attn_out: *mut std::ffi::c_void,
+                    rms_gate: *mut std::ffi::c_void,
+                    silu_out: *mut std::ffi::c_void,
+                    k_cache: *mut std::ffi::c_void,
+                    v_cache: *mut std::ffi::c_void,
+                    prefill_kv_indices: *const i32,
+                    prefill_kv_indptr: *const i32,
+                    prefill_qo_indptr: *const i32,
+                    attn_norm_w: *mut std::ffi::c_void,
+                    mlp_norm_w: *mut std::ffi::c_void,
+                    qkv_w: *mut std::ffi::c_void,
+                    o_w: *mut std::ffi::c_void,
+                    gate_w: *mut std::ffi::c_void,
+                    up_w: *mut std::ffi::c_void,
+                    down_w: *mut std::ffi::c_void,
+                    eps: f32,
+                    attn_scale: f32,
+                    flags: *mut u32,
+                    tick_counter: *mut u32,
+                    barrier_arrived: *mut u32,
+                    phase_clocks: *mut u64,
+                    flashinfer_params: *mut std::ffi::c_void,
+                    stream: *mut std::ffi::c_void,
+                );
                 pub fn $num_nodes() -> u32;
                 pub fn $num_ctas() -> u32;
                 pub fn $num_waves() -> u32;
@@ -382,24 +416,28 @@ pub mod ffi {
     }
     decl_scheduled_megakernel!(
         launch_scheduled_megakernel_tiny,
+        launch_scheduled_megakernel_tiny_per_wave,
         scheduled_megakernel_tiny_num_nodes,
         scheduled_megakernel_tiny_num_ctas,
         scheduled_megakernel_tiny_num_waves
     );
     decl_scheduled_megakernel!(
         launch_scheduled_megakernel_medium,
+        launch_scheduled_megakernel_medium_per_wave,
         scheduled_megakernel_medium_num_nodes,
         scheduled_megakernel_medium_num_ctas,
         scheduled_megakernel_medium_num_waves
     );
     decl_scheduled_megakernel!(
         launch_scheduled_megakernel_llama_3_2_1b_seq64,
+        launch_scheduled_megakernel_llama_3_2_1b_seq64_per_wave,
         scheduled_megakernel_llama_3_2_1b_seq64_num_nodes,
         scheduled_megakernel_llama_3_2_1b_seq64_num_ctas,
         scheduled_megakernel_llama_3_2_1b_seq64_num_waves
     );
     decl_scheduled_megakernel!(
         launch_scheduled_megakernel_llama_3_2_1b_seq1024,
+        launch_scheduled_megakernel_llama_3_2_1b_seq1024_per_wave,
         scheduled_megakernel_llama_3_2_1b_seq1024_num_nodes,
         scheduled_megakernel_llama_3_2_1b_seq1024_num_ctas,
         scheduled_megakernel_llama_3_2_1b_seq1024_num_waves

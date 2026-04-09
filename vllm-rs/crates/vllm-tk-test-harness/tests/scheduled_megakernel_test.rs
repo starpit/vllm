@@ -19,6 +19,17 @@ use vllm_tk_macros_core::{
 };
 use vllm_tk_test_harness::ffi;
 
+/// Returns true when the harness should call the CP2 per-wave
+/// launcher (`launch_scheduled_megakernel_*_per_wave`) instead of
+/// the legacy single-launch megakernel. Picked at runtime via the
+/// `FERRITE_PER_WAVE_LOWERING=1` env var so the same binary can A/B
+/// the lowering strategies for bench comparisons without recompiling.
+fn use_per_wave_lowering() -> bool {
+    std::env::var("FERRITE_PER_WAVE_LOWERING")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 fn init_cuda() {
     result::init().expect("cuInit failed");
     let device = result::device::get(0).expect("cuDeviceGet failed");
@@ -1257,14 +1268,14 @@ fn llama_1b_seq1024_smoke() {
     let kernel_waves = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq1024_num_waves() };
     eprintln!("  kernel: {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
 
+    let launch_fn: LaunchFn = if use_per_wave_lowering() {
+        eprintln!("  using CP2 per-wave lowering (FERRITE_PER_WAVE_LOWERING=1)");
+        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024_per_wave
+    } else {
+        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024
+    };
     let launch_start = std::time::Instant::now();
-    let _ = launch_with_buffers(
-        &b,
-        dims,
-        1e-5,
-        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024,
-        kernel_n,
-    );
+    let _ = launch_with_buffers(&b, dims, 1e-5, launch_fn, kernel_n);
     eprintln!(
         "  scheduled megakernel run (single launch incl. cuStreamSync): {:.3}s",
         launch_start.elapsed().as_secs_f64()
@@ -1313,8 +1324,14 @@ fn llama_1b_seq1024_bench() {
     // belongs to setup, not bench-of-record.
     let mut plan = build_flashinfer_plan(&b, dims);
 
+    let launch_fn: LaunchFn = if use_per_wave_lowering() {
+        eprintln!("║  using CP2 per-wave lowering (FERRITE_PER_WAVE_LOWERING=1)");
+        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024_per_wave
+    } else {
+        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024
+    };
     let launch = || unsafe {
-        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024(
+        launch_fn(
             b.hidden_states as *mut _,
             b.rms_rope as *mut _,
             b.qkv as *mut _,
@@ -1466,14 +1483,14 @@ fn llama_1b_seq64_h_final_matches_committed_golden() {
     let kernel_waves = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq64_num_waves() };
     eprintln!("  kernel: {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
 
+    let launch_fn: LaunchFn = if use_per_wave_lowering() {
+        eprintln!("  using CP2 per-wave lowering (FERRITE_PER_WAVE_LOWERING=1)");
+        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq64_per_wave
+    } else {
+        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq64
+    };
     let launch_start = std::time::Instant::now();
-    let _ = launch_with_buffers(
-        &b,
-        dims,
-        eps,
-        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq64,
-        kernel_n,
-    );
+    let _ = launch_with_buffers(&b, dims, eps, launch_fn, kernel_n);
     eprintln!(
         "  scheduled megakernel run: {:.3}s",
         launch_start.elapsed().as_secs_f64()

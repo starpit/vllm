@@ -202,10 +202,19 @@ impl LoweringConstraints {
             // From SCHEDULED_MEGAKERNEL_HANDOFF: "Grid barrier cost is
             // fundamental on L4 sm_89; mechanism doesn't matter (~115 µs)".
             barrier_cost_us: 100.0,
-            // Estimate: cooperative launch overhead between back-to-back
-            // launches on the same stream is ~3-10 µs in steady state.
-            // Will refine with a real measurement before CP2.
-            launch_cost_us: 5.0,
+            // **Measured during CP2 bench**: cudaLaunchCooperativeKernel
+            // overhead on L4 in steady state (back-to-back launches on
+            // the same stream, no host roundtrip) is ~70-80 µs per call.
+            // Much higher than the ~3-10 µs I initially assumed —
+            // cooperative launches do per-launch residency verification
+            // that regular grid launches skip. This calibration ate
+            // most of the predicted CP2 barrier savings (5.5 ms saved
+            // on idle/sync, ~6.4 ms paid in launch overhead, net ≈ 0
+            // ms on wall clock). The solver still picks separation
+            // (80 µs < 100 µs barrier) but the margin is small —
+            // CP3's per-kind register budget split is where the
+            // actual win comes from.
+            launch_cost_us: 80.0,
             regs_dynamic_per_warpgroup: false,
             mbarrier_handoff_us: None,
             dsmem_cluster_handoff_us: None,

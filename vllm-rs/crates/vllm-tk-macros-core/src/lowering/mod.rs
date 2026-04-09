@@ -101,6 +101,7 @@ pub mod cost;
 pub mod implementation;
 pub mod library;
 pub mod problem;
+pub mod solver;
 pub mod tile_graph;
 
 pub use assignment::Assignment;
@@ -112,6 +113,7 @@ pub use implementation::{
 };
 pub use library::ImplementationLibrary;
 pub use problem::Problem;
+pub use solver::{BacktrackCpSolver, ExecutionPlan, SolveResult, Solver};
 pub use tile_graph::{TileGraph, TileId, TileKind};
 
 #[cfg(test)]

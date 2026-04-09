@@ -27,6 +27,33 @@
 use crate::kernel_library::CoalescedDag;
 use crate::reified_dag::{NodeId, Phase};
 
+/// Per-grid-barrier cost in mma units. Calibrated against the L4
+/// gmem-flag spin barrier (~115 µs measured at seq=1024 = ~170k cycles
+/// = ~10.6k mma units), but rounded down to 100 because the cost-model
+/// scoring should err on the side of *under*-counting barrier cost so
+/// the cost-gated coalesce passes are conservative — they only fire
+/// when the savings clearly outweigh a barrier worth of work, even at
+/// the optimistic barrier-cost estimate.
+///
+/// All `partition_into_waves` callers in production use this constant.
+/// Tests can pass their own value to exercise the predicate logic.
+pub const BARRIER_COST_MMA_UNITS: u64 = 100;
+
+/// Score a DAG by simulating its schedule and returning the predicted
+/// makespan. This is the cost function the cost-gated coalesce passes
+/// minimize over: a coalesce pass is accepted only if applying it
+/// reduces this score.
+///
+/// Builds a fresh `CostModel` from the DAG (cheap — just a struct copy
+/// of `dims` + `tiles`) and runs `partition_into_waves` with the
+/// production `barrier_cost`. The returned value is in the same
+/// mma-unit domain as `WaveSchedule::predicted_cost`.
+pub fn score_dag(dag: &CoalescedDag, num_ctas: u32) -> u64 {
+    let cost = CostModel::from_dag(dag);
+    let sched = partition_into_waves(dag, num_ctas, &cost, BARRIER_COST_MMA_UNITS);
+    sched.predicted_cost
+}
+
 /// Per-node compute / memory cost in "mma units" (≈16 sm89 cycles each).
 /// Identical to the previous list-scheduler model — the cost domain doesn't
 /// change when we switch from list scheduling to wave partitioning.

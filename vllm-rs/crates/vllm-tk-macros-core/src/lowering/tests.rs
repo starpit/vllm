@@ -1,312 +1,357 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Lowering solver tests.
+//! CP5-A validation tests.
 //!
-//! Pinning the **structural decisions** the solver makes for each
-//! target profile, so future refactors can't silently change them.
+//! These tests validate that the **model** is right, NOT that the
+//! solver works (there's no solver yet — that's CP5-B). They build
+//! a tile graph, populate a library, hand-construct an
+//! `Assignment` corresponding to the natural-sm89 lowering, and
+//! verify:
 //!
-//! ## Headline assertions
+//!   1. Every constraint reports `Satisfied` on the assignment.
+//!   2. The cost function returns a number close to the CP4
+//!      microbench measurement (~38 ms without attention, ~48 ms
+//!      with).
 //!
-//! - `sm89_l4_plan_separates_every_wave`: on the production L4 sm_89
-//!   profile (`barrier_cost_us = 100, launch_cost_us = 5,
-//!   regs_dynamic = false`), the solver outputs **one group per wave**
-//!   for the Llama-1B seq=1024 production schedule. Each cooperative
-//!   launch handles a single wave; kernel-boundary sync replaces the
-//!   ~100 µs grid sync. This is the structural change that gets sm_89
-//!   from ~54 ms toward the per-kind-register-budget regime.
-//!
-//! - `synthetic_sm90_plan_collapses_to_one_group`: a synthetic profile
-//!   matching Hopper's capabilities (`mbarrier_handoff_us = Some(1),
-//!   regs_dynamic = true`) on the **same** wave schedule produces a
-//!   single group with `n - 1` in-group mbarrier handoffs. This proves
-//!   the same solver, with no per-target code, emits a structurally
-//!   different lowering when the target's constants change. It's the
-//!   compiler-shaped argument: target backends are translators, the
-//!   solver is the lowering.
-//!
-//! - `solver_respects_shmem_budget`: a synthetic profile with a tight
-//!   shmem ceiling forces the solver to split groups whose unioned
-//!   shmem would overflow.
+//! If both pass, the model types and the cost calibration are
+//! self-consistent and CP5-B can plug a solver on top with
+//! confidence.
 
-use crate::kernel_library::{BoundKernel, FaninConsumer, coalesce_with_target_profile};
-use crate::lowering::plan::Handoff;
-use crate::lowering::solver::lower;
-use crate::reified_dag::{LlamaDims, ReifiedDag, TileSizes};
-use crate::schedule::{BARRIER_COST_MMA_UNITS, CostModel, partition_into_waves};
+use crate::lowering::assignment::{Assignment, CompilationUnitId, ScheduleSlot, SubgraphId};
+use crate::lowering::constraint::ConstraintStatus;
+use crate::lowering::cost::cost_us;
+use crate::lowering::implementation::{Handoff, ImplId};
+use crate::lowering::library::ImplementationLibrary;
+use crate::lowering::problem::Problem;
+use crate::lowering::tile_graph::{TileGraph, TileId, TileKind};
 use crate::target_profile::TargetProfile;
 
-fn llama_1b_seq1024_dims() -> LlamaDims {
-    LlamaDims {
-        num_layers: 16,
-        hidden_dim: 2048,
-        intermediate_dim: 8192,
-        num_attn_heads: 32,
-        num_kv_heads: 8,
-        head_dim: 64,
-        seq_len: 1024,
-    }
+/// Look up an `ImplId` by name in the library. Tests use this to
+/// build the assignment without depending on the library's
+/// internal index ordering.
+fn impl_by_name(library: &ImplementationLibrary, name: &str) -> ImplId {
+    library
+        .iter()
+        .find(|(_, imp)| imp.name() == name)
+        .map(|(id, _)| id)
+        .unwrap_or_else(|| panic!("library has no implementation named {name:?}"))
 }
 
-fn build_production_plan_inputs() -> (
-    crate::kernel_library::CoalescedDag,
-    crate::schedule::WaveSchedule,
-    TargetProfile,
-) {
-    let profile = TargetProfile::l4_sm89();
-    let reified = ReifiedDag::reify_llama(llama_1b_seq1024_dims(), TileSizes::default_v1());
-    let dag = coalesce_with_target_profile(&reified, &profile);
-    let cost = CostModel::from_dag(&dag, profile.cooperative_grid_size());
-    let sched = partition_into_waves(
-        &dag,
-        profile.cooperative_grid_size(),
-        &cost,
-        BARRIER_COST_MMA_UNITS,
-    );
-    (dag, sched, profile)
-}
-
-#[test]
-fn sm89_l4_plan_separates_every_wave() {
-    let (dag, schedule, profile) = build_production_plan_inputs();
-    let plan = lower(&schedule, &dag, &profile.lowering);
-
-    // The structural assertion: each wave gets its own group on
-    // sm_89, because barrier_cost (100µs) ≫ launch_cost (5µs) and
-    // grouping mismatched-reg waves would also pay an occupancy
-    // penalty (no setmaxnreg on sm_89).
-    assert_eq!(
-        plan.groups.len(),
-        schedule.waves.len(),
-        "sm_89 lowering should produce one group per wave; \
-         got {} groups for {} waves",
-        plan.groups.len(),
-        schedule.waves.len(),
-    );
-    for g in &plan.groups {
-        assert_eq!(g.waves.len(), 1, "expected singleton groups on sm_89");
-        assert_eq!(g.in_group_handoffs, 0);
-    }
-    // Every cross-group handoff is a launch boundary except the last.
-    let last_idx = plan.groups.len() - 1;
-    for (idx, g) in plan.groups.iter().enumerate() {
-        if idx == last_idx {
-            assert_eq!(g.handoff_to_next, Handoff::None);
-        } else {
-            assert!(matches!(g.handoff_to_next, Handoff::LaunchBoundary { .. }));
+/// For a given tile kind, return the impl in the library that
+/// claims a single-tile subgraph of that kind in the natural
+/// sm_89 lowering. Used to make the test assignment construction
+/// readable.
+fn natural_sm89_impl_for(library: &ImplementationLibrary, kind: TileKind) -> &'static str {
+    let _ = library;
+    match kind {
+        TileKind::RmsNorm => "vllm_rs_rms_norm",
+        TileKind::GemmQkv => "cublas_gemm_ex_qkv",
+        TileKind::GemmOProj => "cublas_gemm_ex_oproj",
+        TileKind::GemmGate => "cublas_gemm_ex_gate",
+        TileKind::GemmUp => "cublas_gemm_ex_up",
+        TileKind::GemmDown => "cublas_gemm_ex_down",
+        TileKind::QkvSplit => "qkv_split_free",
+        TileKind::Rope => "vllm_rs_rotary_embedding",
+        TileKind::KvCacheWrite => "kv_cache_write",
+        TileKind::Attention => "flashinfer_standalone_fa2",
+        TileKind::ResidualAdd => "residual_add",
+        // GateUpConcat + SiluMul are claimed *together* by the
+        // VllmRsSiluAndMulFusedImpl as one two-tile subgraph; the
+        // test below handles them specially.
+        TileKind::GateUpConcat | TileKind::SiluMul => {
+            unreachable!("GateUpConcat / SiluMul handled by the silu_and_mul claim, not 1:1")
         }
     }
-    // The plan should predict positive savings vs the legacy
-    // "all-in-one mega __global__" lowering. With L4 sm_89 numbers
-    // (barrier 100 µs, measured cooperative launch 80 µs) the
-    // difference is only ~20 µs/boundary, so 80 boundaries yields
-    // ~1.6 ms gross savings before occupancy-penalty refunds.
-    // CP2 bench confirmed this: idle/sync collapses from 5.89 ms to
-    // 0.33 ms (5.56 ms saved on barriers) but ~80 launches × 80 µs
-    // each adds back ~6.4 ms of launch overhead — net wall-clock is
-    // a wash on sm_89. The structural win has to come from CP3's
-    // per-kind register budgets, which is the load-bearing benefit
-    // of this whole refactor on sm_89.
-    assert!(
-        plan.savings_vs_legacy_us() > 1_000.0,
-        "expected positive barrier savings; got {:.1} µs",
-        plan.savings_vs_legacy_us()
-    );
 }
 
-#[test]
-fn synthetic_sm90_plan_collapses_to_one_group() {
-    // A profile that mirrors Hopper's two key capabilities:
-    //   - regs_dynamic_per_warpgroup (setmaxnreg.inc/dec)
-    //   - mbarrier_handoff_us cheaper than launch_cost_us
-    // Same wave schedule, same DAG, **only the LoweringConstraints
-    // change** — but the solver emits a structurally different plan.
-    let (dag, schedule, mut profile) = build_production_plan_inputs();
-    profile.lowering.regs_dynamic_per_warpgroup = true;
-    profile.lowering.mbarrier_handoff_us = Some(1.0);
-    profile.lowering.barrier_cost_us = 1.0; // mbarrier is in-group cost too
-    profile.lowering.launch_cost_us = 5.0;
-    let plan = lower(&schedule, &dag, &profile.lowering);
+/// Hand-build the natural-sm89 [`Assignment`] for the given tile
+/// graph. Each tile gets its own subgraph + impl + schedule slot
+/// EXCEPT GateUpConcat + SiluMul which share a two-tile subgraph
+/// claimed by `vllm_rs_silu_and_mul_fused`.
+///
+/// All subgraphs land in their own compilation unit (each
+/// HostCallback is its own kernel boundary). Steps are assigned
+/// in topological order.
+fn build_natural_sm89_assignment(
+    tile_graph: &TileGraph,
+    library: &ImplementationLibrary,
+) -> Assignment {
+    let mut a = Assignment::default();
+    let mut next_subgraph: u32 = 0;
+    let mut next_unit: u32 = 0;
+    let mut next_step: u32 = 0;
 
-    assert_eq!(
-        plan.groups.len(),
-        1,
-        "Hopper-like profile should collapse to a single warp-specialized group; \
-         got {} groups",
-        plan.groups.len()
-    );
-    let g = &plan.groups[0];
-    assert_eq!(g.waves.len(), schedule.waves.len());
-    assert_eq!(g.in_group_handoffs as usize, schedule.waves.len() - 1);
-    assert_eq!(g.handoff_to_next, Handoff::None);
-}
+    // First pass: assign subgraphs + impls per tile, with the
+    // silu+mul fusion handled inline.
+    let mut tile_to_subgraph: std::collections::HashMap<TileId, SubgraphId> =
+        std::collections::HashMap::new();
+    let mut subgraph_impl: std::collections::HashMap<SubgraphId, ImplId> =
+        std::collections::HashMap::new();
 
-#[test]
-fn shmem_budget_above_max_wave_is_satisfied() {
-    // With the budget set just above the heaviest single-wave shmem
-    // demand (FlashInfer attention ≈ 70 KiB), every group's shmem
-    // should fit. This is the normal case.
-    let (dag, schedule, mut profile) = build_production_plan_inputs();
-    profile.lowering.max_shmem_per_cta_bytes = 72 * 1024;
-    let plan = lower(&schedule, &dag, &profile.lowering);
-    for g in &plan.groups {
-        assert!(
-            g.max_shmem_per_cta <= 72 * 1024,
-            "group {} has shmem {} > budget 73728",
-            g.group_id,
-            g.max_shmem_per_cta
+    for node in tile_graph.iter_topo() {
+        if tile_to_subgraph.contains_key(&node.id) {
+            continue; // already claimed (e.g. SiluMul claimed with GateUpConcat)
+        }
+
+        let sg = SubgraphId(next_subgraph);
+        next_subgraph += 1;
+
+        match node.kind {
+            TileKind::GateUpConcat => {
+                // Claim this concat AND its consumer SiluMul under
+                // one subgraph realized by vllm_rs_silu_and_mul_fused.
+                let silu = tile_graph
+                    .nodes
+                    .iter()
+                    .find(|n| n.kind == TileKind::SiluMul && n.deps.contains(&node.id))
+                    .expect("every GateUpConcat has a SiluMul consumer");
+                tile_to_subgraph.insert(node.id, sg);
+                tile_to_subgraph.insert(silu.id, sg);
+                let imp_id = impl_by_name(library, "vllm_rs_silu_and_mul_fused");
+                subgraph_impl.insert(sg, imp_id);
+            }
+            _ => {
+                tile_to_subgraph.insert(node.id, sg);
+                let name = natural_sm89_impl_for(library, node.kind);
+                let imp_id = impl_by_name(library, name);
+                subgraph_impl.insert(sg, imp_id);
+            }
+        }
+    }
+
+    a.cover.extend(tile_to_subgraph);
+    a.impls.extend(subgraph_impl);
+
+    // Second pass: assign each subgraph its own compilation unit
+    // and a unique step (sequential — no concurrency in the
+    // baseline natural lowering).
+    let mut subgraph_seen: std::collections::BTreeSet<SubgraphId> = Default::default();
+    for node in tile_graph.iter_topo() {
+        let sg = a.cover[&node.id];
+        if subgraph_seen.insert(sg) {
+            let unit = CompilationUnitId(next_unit);
+            next_unit += 1;
+            let slot = ScheduleSlot {
+                step: next_step,
+                unit,
+            };
+            next_step += 1;
+            a.schedule.insert(sg, slot);
+        }
+    }
+
+    // Third pass: assign default RowMajorBf16 layouts to every tile
+    // (the natural-sm89 lowering doesn't introduce conversions).
+    for node in tile_graph.iter_topo() {
+        a.layouts.insert(
+            node.id,
+            crate::lowering::implementation::Layout::RowMajorBf16,
         );
     }
-    assert!(plan.predicted_total_us.is_finite());
+
+    // Fourth pass: insert StreamOrder handoffs between consecutive
+    // subgraphs along every dep edge that crosses a subgraph
+    // boundary. (StreamOrder = same stream, implicit ordering.)
+    for node in tile_graph.iter_topo() {
+        let consumer_sg = a.cover[&node.id];
+        for dep in &node.deps {
+            let producer_sg = a.cover[dep];
+            if producer_sg != consumer_sg {
+                a.handoffs
+                    .entry((producer_sg, consumer_sg))
+                    .or_insert(Handoff::StreamOrder);
+            }
+        }
+    }
+
+    a
 }
 
 #[test]
-fn shmem_budget_below_single_wave_is_infeasible() {
-    // Set the budget BELOW FlashInfer's 70 KiB requirement. No valid
-    // partition exists (a single wave's own shmem overflows the
-    // hardware carveout — there's no group small enough to fit).
-    // The solver must surface infeasibility via an infinite total
-    // cost; the codegen backend will refuse to emit code for such
-    // a plan rather than silently producing unschedulable kernels.
-    let (dag, schedule, mut profile) = build_production_plan_inputs();
-    profile.lowering.max_shmem_per_cta_bytes = 32 * 1024;
-    let plan = lower(&schedule, &dag, &profile.lowering);
+fn natural_sm89_assignment_satisfies_all_static_constraints() {
+    let tile_graph = TileGraph::build_llama_forward(16);
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let profile = TargetProfile::l4_sm89();
+    let problem = Problem::build(&tile_graph, &library, &profile);
+    let assignment = build_natural_sm89_assignment(&tile_graph, &library);
+
+    // Every static constraint must report Satisfied (or Unknown
+    // for ones that need extra info we haven't added — none of
+    // the constraints in this set should be Unknown for a fully
+    // populated assignment).
+    let mut violated = Vec::new();
+    let mut unknown = Vec::new();
+    for c in &problem.static_constraints {
+        match c.check(&assignment, &tile_graph, &library, &profile) {
+            ConstraintStatus::Satisfied => {}
+            ConstraintStatus::Violated => violated.push(format!("{c:?}")),
+            ConstraintStatus::Unknown => unknown.push(format!("{c:?}")),
+        }
+    }
+
     assert!(
-        plan.predicted_total_us.is_infinite(),
-        "expected infeasible plan with infinite cost; got {} µs",
-        plan.predicted_total_us
+        violated.is_empty(),
+        "constraints violated by the natural-sm89 assignment: {violated:#?}",
+    );
+    assert!(
+        unknown.is_empty(),
+        "constraints in unknown state for a complete assignment: {unknown:#?}",
     );
 }
 
 #[test]
-fn plan_dump_for_inspection() {
-    // Not an assertion test — prints the L4 plan to stderr so
-    // `cargo test ... -- --nocapture plan_dump_for_inspection` shows
-    // the plan for human eyeballing. The CI test below
-    // (`sm89_l4_plan_separates_every_wave`) is the structural lock-in.
-    let (dag, schedule, profile) = build_production_plan_inputs();
-    let plan = lower(&schedule, &dag, &profile.lowering);
-    eprintln!("\n--- L4 sm_89 ExecutionPlan (Llama-1B seq=1024) ---");
-    eprintln!("{plan}");
-}
-
-#[test]
-fn solver_actually_uses_the_constants_not_hardcoded_singletons() {
-    // Counter-experiment: take the production L4 sm_89 schedule but
-    // FLIP the constraint constants so in-kernel barriers are cheaper
-    // than kernel-boundary launches. With `regs_dynamic` = true so
-    // there's no occupancy penalty muddying the math, the solver
-    // **must** merge — otherwise it's hardcoding the singleton
-    // partition rather than computing it from constants.
+fn natural_sm89_cost_matches_cp4_microbench_estimate() {
+    // Build the same assignment, compute the cost, assert it's
+    // within the right ballpark of the CP4 measurement.
     //
-    // This is the load-bearing test that proves the solver is doing
-    // real optimization, not just emitting `groups.len() == waves.len()`.
-    let (dag, schedule, mut profile) = build_production_plan_inputs();
-    profile.lowering.barrier_cost_us = 2.0; // in-group cost
-    profile.lowering.launch_cost_us = 100.0; // cross-group cost
-    profile.lowering.regs_dynamic_per_warpgroup = true; // no occupancy penalty
-    let plan = lower(&schedule, &dag, &profile.lowering);
+    // CP4 measurements (50-iter avg, L4 sm_89, Llama-1B seq=1024):
+    //   cuBLAS-only GEMMs:                  36.6 ms
+    //   Natural forward (no attention):     37.8 ms
+    //   Natural forward + estimated attn:  ~48.0 ms
+    //
+    // The cost model includes attention (the FlashInfer standalone
+    // entry contributes ~625 µs/layer × 16 = 10 ms), plus the
+    // per-launch overhead for every HostCallback (80 launches ×
+    // 80 µs = 6.4 ms — but the cost model uses the launch_cost_us
+    // calibrated in CP2 which is 80 µs).
+    //
+    // Expected total: ~36 ms (GEMMs) + ~10 ms (attention) +
+    //                 ~1 ms (norms/rope/silu) + ~6 ms (launch
+    //                 overhead × ~80 calls) ≈ 53 ms.
+    //
+    // The CP4 microbench measured 37.8 ms WITHOUT attention and
+    // WITHOUT explicit launch-overhead accounting (cuBLAS+vllm-rs
+    // FFI calls in a tight Rust loop, where the launch overhead
+    // is hidden inside cuBLAS's internal cudaLaunchKernel cost
+    // already baked into the per-call wall-clock).
+    //
+    // So this assertion checks that the model produces a number
+    // in the same ORDER OF MAGNITUDE as the measurement, not exact
+    // agreement. CP5-B will refine the cost model from real per-impl
+    // microbench data.
+
+    let tile_graph = TileGraph::build_llama_forward(16);
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let profile = TargetProfile::l4_sm89();
+    let assignment = build_natural_sm89_assignment(&tile_graph, &library);
+
+    let predicted_us = cost_us(&assignment, &tile_graph, &library, &profile);
+    let predicted_ms = predicted_us / 1000.0;
+
     eprintln!(
-        "[audit] flipped constants → {} groups for {} waves",
-        plan.groups.len(),
-        schedule.waves.len()
+        "natural sm_89 predicted: {:.2} ms (CP4 measured: 37.8 ms no-attn, ~48 ms with-attn)",
+        predicted_ms
     );
+
+    // Plausible range: between 30 ms and 100 ms. This is a
+    // sanity bound — the model returns SOMETHING reasonable, not
+    // wildly off (e.g. 0 or 1000 ms). CP5-B will tighten this.
     assert!(
-        plan.groups.len() < schedule.waves.len() / 2,
-        "with launch_cost ≫ barrier_cost the solver should merge \
-         heavily; got {} groups for {} waves",
-        plan.groups.len(),
-        schedule.waves.len()
+        predicted_ms > 30.0 && predicted_ms < 100.0,
+        "predicted cost {predicted_ms} ms is outside the plausible 30-100 ms range",
     );
 }
 
 #[test]
-fn solver_separates_when_constants_demand_it() {
-    // Inverse of the above. Force barrier ≫ launch on a profile
-    // identical to L4 sm_89 except the constants. Should separate
-    // every wave (matching the L4 production result) regardless of
-    // any other field on the profile.
-    let (dag, schedule, mut profile) = build_production_plan_inputs();
-    profile.lowering.barrier_cost_us = 1000.0;
-    profile.lowering.launch_cost_us = 1.0;
-    let plan = lower(&schedule, &dag, &profile.lowering);
-    assert_eq!(plan.groups.len(), schedule.waves.len());
-}
+fn dependency_order_constraint_catches_swapped_subgraphs() {
+    // Negative test: if we maliciously schedule a producer AFTER
+    // its consumer, the DependencyOrder constraint must catch it.
+    let tile_graph = TileGraph::build_llama_forward(2);
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let profile = TargetProfile::l4_sm89();
+    let problem = Problem::build(&tile_graph, &library, &profile);
+    let mut assignment = build_natural_sm89_assignment(&tile_graph, &library);
 
-#[test]
-fn solver_responds_to_occupancy_penalty() {
-    // Set barrier == launch so the in-group vs cross-group barrier
-    // cost is a wash, then verify the solver still separates waves
-    // with mismatched register footprints (because of the occupancy
-    // penalty), AND merges waves with matched footprints (because
-    // there's no occupancy penalty). This is a structural assertion
-    // about the occupancy term doing its job in the cost function.
-    //
-    // Approach: synthetic 4-wave schedule with two distinct kinds.
-    // Kind A: regs=32 (light norm). Kind B: regs=128 (heavy cutlass).
-    // Sequence: A, A, B, B.
-    //
-    // Expected: solver merges A,A and B,B but splits between them
-    // because grouping {A,A,B} forces A waves to pay sqrt(128/32) = 2x
-    // occupancy penalty.
-    use crate::kernel_library::Resources;
-    use crate::lowering::cost_occupancy::occupancy_penalty;
-    use crate::target_profile::LoweringConstraints;
+    // Find layer 0's qkv subgraph and its consumer (qkv_split).
+    // Swap their step ordering.
+    let qkv_tile = tile_graph
+        .iter_topo()
+        .find(|n| n.kind == TileKind::GemmQkv && n.layer == 0)
+        .unwrap();
+    let split_tile = tile_graph
+        .iter_topo()
+        .find(|n| n.kind == TileKind::QkvSplit && n.layer == 0)
+        .unwrap();
+    let qkv_sg = assignment.cover[&qkv_tile.id];
+    let split_sg = assignment.cover[&split_tile.id];
+    let qkv_step = assignment.schedule[&qkv_sg].step;
+    let split_step = assignment.schedule[&split_sg].step;
+    // Sanity: qkv was scheduled before split before we swap.
+    assert!(qkv_step < split_step);
+    // Swap.
+    let qkv_slot = assignment.schedule[&qkv_sg];
+    let split_slot = assignment.schedule[&split_sg];
+    assignment.schedule.insert(
+        qkv_sg,
+        ScheduleSlot {
+            step: split_slot.step,
+            unit: qkv_slot.unit,
+        },
+    );
+    assignment.schedule.insert(
+        split_sg,
+        ScheduleSlot {
+            step: qkv_slot.step,
+            unit: split_slot.unit,
+        },
+    );
 
-    let mut c = LoweringConstraints::l4_sm89();
-    c.barrier_cost_us = 5.0;
-    c.launch_cost_us = 5.0;
-
-    // Sanity check the penalty function does what we expect.
-    let light = Resources {
-        shmem_bytes: 4096,
-        regs_per_thread: 32,
-        threads_per_cta: 256,
-    };
-    let heavy_regs = 128;
-    let p = occupancy_penalty(light, heavy_regs, &c);
+    // Now at least one DependencyOrder constraint must report
+    // Violated (the qkv → qkv_split edge specifically).
+    let mut found_violation = false;
+    for c in &problem.static_constraints {
+        if matches!(
+            c.check(&assignment, &tile_graph, &library, &profile),
+            ConstraintStatus::Violated
+        ) {
+            found_violation = true;
+            break;
+        }
+    }
     assert!(
-        (p - 2.0).abs() < 0.01,
-        "expected sqrt(128/32) = 2.0 penalty, got {p}"
+        found_violation,
+        "DependencyOrder constraint did not catch a swapped producer/consumer schedule"
     );
-    // And no penalty when matched.
-    let p_matched = occupancy_penalty(light, 32, &c);
-    assert!((p_matched - 1.0).abs() < 0.01);
 }
 
 #[test]
-fn binding_resources_are_nonzero() {
-    // Sanity: every BoundKernel variant has non-zero resource
-    // estimates. Without this, the occupancy model trivially
-    // returns 1.0 (which would mask solver bugs).
-    use crate::kernel_library::{CutlassTile, GemmPhase};
-    use crate::reified_dag::Phase;
-    let cases = [
-        BoundKernel::HandWrittenRowTile {
-            phase: Phase::AttnNorm,
-            layer: 0,
-            row: 0,
-            col: 0,
-        },
-        BoundKernel::FlashInferAttentionLayer { layer: 0 },
-        BoundKernel::CutlassGemmLayer {
-            layer: 0,
-            phase: GemmPhase::Qkv,
-            tile: CutlassTile::Small,
-        },
-        BoundKernel::CutlassGemmLayer {
-            layer: 0,
-            phase: GemmPhase::OProj,
-            tile: CutlassTile::Narrow,
-        },
-        BoundKernel::FusedFaninLayer {
-            layer: 0,
-            producer_phase: Phase::MlpNorm,
-            consumer: FaninConsumer::CutlassGemm(GemmPhase::GateUp, CutlassTile::Small),
-        },
-    ];
-    for k in cases {
-        let r = k.resources();
-        assert!(r.shmem_bytes > 0, "shmem_bytes must be > 0 for {k:?}");
-        assert!(r.regs_per_thread > 0);
-        assert!(r.threads_per_cta > 0);
+fn cooperative_exclusive_constraint_holds_for_all_host_callback_lowering() {
+    // The natural-sm89 lowering uses zero CooperativeLaunch impls
+    // (everything is HostCallback), so CooperativeExclusive
+    // trivially holds. Sanity test that the constraint doesn't
+    // false-positive on the all-HostCallback case.
+    let tile_graph = TileGraph::build_llama_forward(4);
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let profile = TargetProfile::l4_sm89();
+    let assignment = build_natural_sm89_assignment(&tile_graph, &library);
+    let coop = crate::lowering::constraint::Constraint::CooperativeExclusive;
+    assert_eq!(
+        coop.check(&assignment, &tile_graph, &library, &profile),
+        ConstraintStatus::Satisfied
+    );
+}
+
+#[test]
+fn library_starter_has_all_kinds_covered() {
+    // Sanity: for every TileKind that appears in the natural-sm89
+    // lowering, the library has at least one matching impl.
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let tile_graph = TileGraph::build_llama_forward(1);
+    let profile = TargetProfile::l4_sm89();
+    for node in tile_graph.iter_topo() {
+        // SiluMul + GateUpConcat are claimed together; we only
+        // need one matcher to fire on at least one of them.
+        let mut any_match = false;
+        for (_, imp) in library.iter() {
+            if imp.matches(&tile_graph, node.id, &profile).is_some() {
+                any_match = true;
+                break;
+            }
+        }
+        assert!(
+            any_match,
+            "no library impl matches tile {:?} ({})",
+            node.id,
+            node.kind.name()
+        );
     }
 }

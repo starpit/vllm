@@ -164,13 +164,14 @@ pub fn emit_scheduled_megakernel_cu(
     // `__global__` instantiation.
     let mut wave_kinds: Vec<u32> = Vec::with_capacity(num_waves as usize);
     for wave in &sched.waves {
-        let mut wave_tag: u32 = 0;
-        'find_tag: for cta_stream in &wave.cta_nodes {
-            for nid in cta_stream {
-                wave_tag = dag.nodes[nid.0 as usize].kernel.kernel_tag();
-                break 'find_tag;
-            }
-        }
+        // Find the first non-empty CTA stream and read its first
+        // op's kernel_tag — that's the wave's monomorphic kind.
+        let wave_tag: u32 = wave
+            .cta_nodes
+            .iter()
+            .find_map(|cta_stream| cta_stream.first())
+            .map(|nid| dag.nodes[nid.0 as usize].kernel.kernel_tag())
+            .unwrap_or(0);
         wave_kinds.push(wave_tag);
     }
     let mut wave_kind_host_table = String::with_capacity(wave_kinds.len() * 6);

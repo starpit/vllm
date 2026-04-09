@@ -4,6 +4,39 @@
 > `vllm-tk-macros-core/src/{kernel_library,schedule,scheduled_codegen}.rs` or
 > `templates/scheduled/megakernel.cu`.
 
+## Quick start (15 minutes to orient)
+
+You are working in **a git worktree**, not the primary repo. The path is
+`/home/moosevan/vllm/.claude/worktrees/claude4` and the branch is
+`worktree-claude4`. The user has multiple worktrees in parallel — do **not**
+`cd` to the original repo at `~/vllm/vllm-rs`. Stay in this worktree.
+
+```bash
+cd /home/moosevan/vllm/.claude/worktrees/claude4/vllm-rs
+git log --oneline -5    # confirm you're on worktree-claude4 at c399f7638 or later
+```
+
+**The 15-minute orientation read:**
+
+1. This file (you're reading it)
+2. `crates/vllm-tk-macros-core/src/kernel_library.rs` — start at line 50
+   (`enum BoundKernel`), then read down through the cost / coalesce passes
+3. `crates/vllm-tk-macros-core/src/schedule.rs` lines 1–270 — `CostModel`,
+   `BARRIER_COST_MMA_UNITS`, `score_dag`, `partition_into_waves`
+4. `crates/vllm-tk-macros-core/templates/scheduled/megakernel.cu` line ranges in
+   the **megakernel.cu line map** below — don't read the whole file
+5. `tools/cublas_bench/README.md` — the cuBLAS L4 ceiling numbers
+
+After that you should be able to find any spot you need.
+
+**The user's communication style** (this matters): terse, impatient, will push
+hard for performance results. Has zero tolerance for "hacks" — every change
+must fit the DAG/cost-model framework (see "Methodology rule" below). Has
+called out hand-edits to `megakernel.cu` outside the framework as "the wrong
+fix" repeatedly. Will *not* be impressed by 1 ms wins; the goal is structural
+movement toward `<24 ms`. Don't pad your responses; give the answer and the
+bench number.
+
 ## TL;DR — current state
 
 - **Branch**: `worktree-claude4`
@@ -162,7 +195,174 @@ ONE GPU test at a time:
 RUN_GPU_TESTS=1 cargo test -p vllm-tk-test-harness --release --features cuda <one_test_name> -- --nocapture --ignored
 ```
 
-## Architecture map
+## The reified DAG and per-layer dataflow
+
+Before reading any DAG code, internalize what work the model actually does.
+LLaMA-1B prefill at seq=1024 has **16 layers**, each running **8 phases**:
+
+```
+Phase            reads                              writes              shape
+─────────────────────────────────────────────────────────────────────────────
+attn_norm        hidden_states[seq, hd]             rms_rope[seq, hd]   per row
+qkv (GEMM)       rms_rope, qkv_w[3*hd, hd]          qkv[seq, 3*hd]      M=seq, K=hd, N=qkv_dim
+rope             qkv (Q/K halves), KV cache         qkv_rotated, KV     per row
+attention        Q, K, V (KV cache)                 attn_out[seq, hd]   per row
+o_proj (GEMM)    attn_out, o_w[hd, hd]              hidden_states+=     M=seq, K=hd, N=hd
+mlp_norm         hidden_states                      rms_gate[seq, hd]   per row
+gate_up (2GEMMs) rms_gate, gate_w, up_w             silu_out[seq, id]   M=seq, K=hd, N=intermediate
+down (GEMM)      silu_out, down_w[hd, id]           hidden_states+=     M=seq, K=id, N=hd
+```
+
+For Llama-1B: `hd=2048, id=8192, num_attn_heads=32, num_kv_heads=8, head_dim=64,
+qkv_dim=(32+2*8)*64=3072, num_layers=16, seq_len=1024`.
+
+**The DAG is a chain.** No intra-layer parallelism. Each phase strictly depends
+on the previous. The only parallelism is *within* a phase, which we get via
+wave-cooperative dispatch (every CTA participates in one cutlass GEMM call) and
+LPT bin-packing (per-row tile phases distribute their tiles across CTAs).
+
+**The reified DAG** (`reified_dag.rs`) produces nodes at the finest possible
+granularity: one per `(layer, phase, row_tile, col_tile)` work unit. At seq=1024
+with row_tile=16 and Llama-1B dims, that's ~85k nodes per forward. **Coalesce
+passes** (`kernel_library.rs`) collapse subsets of these into fewer wave-cooperative
+nodes — currently:
+- `coalesce_with_flashinfer_attention`: all attention rows of a layer → 1 node
+- `coalesce_gemm_phase`: all (row, col) GEMM tiles of a layer → 1 node
+- `coalesce_consumer_fanin`: norm/rope rows + their wave-coop consumer → 1 node
+
+After all passes the DAG has **80 nodes per forward** (down from 85k).
+
+## How to read megakernel.cu (line range map)
+
+`templates/scheduled/megakernel.cu` is ~3000 lines. Don't scroll. Use these
+ranges (line numbers approximate, look for the labelled comments):
+
+```
+   1–30   File header + includes (cutlass, flashinfer, cooperative_groups)
+  32–139  namespace pfl_cutlass            (256x128x32 big tile — UNUSED, see history)
+ 143–205  namespace pfl_cutlass_small      (128x128x32, 4 stages — current default)
+ 207–280  namespace pfl_cutlass_narrow     (128x64x32, 4 stages — polyalgo alt)
+ 282–370  TileOp struct, WAVE_OPS / NODE_ID_FOR_OP / WAVE_CTA_OFFSETS const arrays
+ 350–370  FlashInferKTraits + FlashInferRunner typedefs
+ 380–430  SchedRuntime struct (per-launch ptrs: flashinfer plan, flags, barrier, phase_clocks)
+ 440–500  tile_attn_norm + tile_mlp_norm   (warp-0 only, called from fan-in arms)
+ 503–560  Static shmem layout for tile bodies (TILE_SHMEM_BYTES, kSmemBytes calc)
+ 660–720  tile_rope                         (called from fan-in 15)
+ 720–820  tile_attention                    (DEAD — replaced by FlashInfer)
+ 820–960  tile_qkv / tile_o_proj            (DEAD — replaced by cutlass)
+ 960–1090 tile_gate_up                      (DEAD — replaced by cutlass)
+1090–1265 tile_down                         (DEAD — replaced by cutlass)
+1267–1310 tile_mlp_norm body
+1440–1565 TILE_CUTLASS_GEMM_BODY macro      ← The shared cutlass dispatch body
+1568–1581 grid_barrier                      ← gmem-flag spin barrier between waves
+1582+    __global__ scheduled_megakernel    ← THE megakernel function
+1614–1625 phase_clock declaration           ← !!! NUM_CLOCK_SLOTS gotcha lives here
+1627+    main wave loop:
+   1635   per-op phase_clock idle accounting
+   1639   switch (op.kernel_tag)
+   1742   case PHASE_ATTN_NORM..PHASE_DOWN  ← dead arms but referenced
+   1750   case 10..13: cutlass dispatch arms (qkv, oproj, gate_up, down)
+   1839   case PHASE_FLASHINFER_ATTN
+   1890   case 14: fan-in attn_norm + cutlass qkv
+   1911   case 15: fan-in rope + flashinfer attention
+   1923   case 16: fan-in mlp_norm + cutlass gate+up
+   1980   wave_coop tag check + tick stamper
+   1987   end of per-op loop
+   1995   grid_barrier end-of-wave
+2070+    extern "C" launcher                ← cudaLaunchCooperativeKernel call site
+   2090   kSmemBytes calculation (max of tile arena + cutlass + FI)
+   2110   cudaLaunchCooperativeKernel
+```
+
+## TileOp / WAVE_OPS schema
+
+```c++
+struct TileOp { uint32_t kernel_tag; uint32_t layer; uint32_t row; uint32_t col; };
+__device__ const TileOp WAVE_OPS[NUM_OPS] = { ... };
+__device__ const uint32_t WAVE_CTA_OFFSETS[NUM_WAVES * (NUM_CTAS + 1)] = { ... };
+__device__ const uint32_t NODE_ID_FOR_OP[NUM_OPS] = { ... };
+```
+
+- `kernel_tag` is the dispatch switch key. See "kernel_tag map" section above.
+- `layer` is the layer index for layer-fused ops.
+- `row` and `col` are the tile coordinates for `HandWrittenRowTile` ops, OR
+  re-purposed slots for cutlass / fan-in ops:
+  - For `CutlassGemmLayer`: `row = phase.tag()` (cross-check), `col = tile_tag` (0=Small, 1=Narrow)
+  - For `FusedFaninLayer`: `row` unused (0), `col = tile_tag` for cutlass consumers
+- `WAVE_CTA_OFFSETS` is a flat prefix-sum table: `WAVE_OPS[ wave_cta_offsets[w*(N+1)+c] .. wave_cta_offsets[w*(N+1)+c+1] ]`
+  is CTA `c`'s op stream in wave `w`.
+- The dispatch loop runs `for (i = off; i < end; ++i) { dispatch WAVE_OPS[i]; }` per CTA.
+- The wave-end `grid_barrier` ensures all CTAs finish before the next wave's
+  WAVE_OPS reads.
+
+**The encoding lives in `scheduled_codegen/mod.rs::emit_scheduled_megakernel_cu`
+lines ~80–125.** When you add a new BoundKernel variant, this is the file that
+serializes it into WAVE_OPS.
+
+## The fused/ kernel — prior art, NOT the same thing
+
+`templates/fused/` contains the OTHER megakernel in this project — a hand-tuned,
+non-scheduled, single-purpose Llama-1B prefill kernel that hits **~42 ms** at
+seq=1024. It's the prior project best.
+
+**Differences vs the scheduled kernel:**
+- Fused has no scheduler — it's a hardcoded sequence of phases
+- Fused uses TK kittens (`warp::load_async`, `warp::mma_ABt_base`) — a different
+  template library than CUTLASS multistage
+- Fused already has fused norm+gemm patterns in some paths — **read these for
+  prior art** when implementing Step B
+- Fused uses a single set of tile shapes hand-picked for Llama-1B — no polyalgo
+- Fused does its own grid sync via `cooperative_groups::this_grid().sync()` and
+  ad-hoc patterns
+
+**Important**: the fused kernel uses `pfl_cutlass` (the big 256×128×32 tile) for
+`down` successfully. We tried this in the scheduled kernel and regressed (see
+"What was tried and didn't work"). The lesson is that *what works in
+single-purpose fused doesn't necessarily work in scheduled* because of the
+cross-arm register pressure — the megakernel's register footprint is bound by
+the worst dispatch arm in the TU. This is why **Step A (resource-aware cost
+model with `binary_footprint`) is the prerequisite for ever using big tile.**
+
+The fused kernel's source layout: `templates/fused/{kernel.cu,
+preamble_header.cu, gemm_cutlass_mcta.cu, gemm_gate_up_mcta.cu, attention.cu, rmsnorm.cu, ...}`.
+For Step B you'll specifically want to read `gemm_cutlass_mcta.cu` (the only
+file that uses pfl_cutlass and shows how `MmaMultistage` is invoked from inside
+a megakernel) and any of the `rmsnorm*` files for the norm body.
+
+## Variant generation pipeline
+
+The scheduled megakernel is generated as **multiple variants** (one per shape
+config) in the same TU, each with its own namespace:
+
+```
+namespace pfl_sched_tiny             { ... }
+namespace pfl_sched_medium           { ... }
+namespace pfl_sched_llama_3_2_1b_seq64   { ... }
+namespace pfl_sched_llama_3_2_1b_seq1024 { ... }
+```
+
+Each gets its own:
+- `WAVE_OPS`, `NODE_ID_FOR_OP`, `WAVE_CTA_OFFSETS` const arrays
+- `__global__ scheduled_megakernel_<name>` function
+- `extern "C" void launch_scheduled_megakernel_<name>(...)`
+
+Generation entry points in `vllm-tk-macros-core/src/lib.rs`:
+- `scheduled_prefill_tiny` (line ~654) — smallest test variant
+- `scheduled_prefill_medium` (line ~700) — medium test variant
+- `scheduled_prefill_variants_for_dsl` (line ~760) — production variants from
+  the build script
+
+The build script (`vllm-tk-test-harness/build.rs`) calls these and writes the
+result to `crates/vllm-tk-test-harness/target/release/build/.../scheduled_prefill_*.cu`.
+NVCC compiles all variants into one shared library that the harness loads at
+test time.
+
+**Practical implication**: when you change `megakernel.cu` (the askama template),
+all variants regenerate on next `cargo build`. NVCC compilation can take
+minutes per variant — be patient. If you see a stale cache, `rm` the
+`~/.cudaforge/git/checkouts/...` `.a` files.
+
+
 
 ### Crates / files
 
@@ -285,7 +485,85 @@ below that requires either:
 
 ## The plan (in priority order)
 
-### Step A — Resource-aware cost model (PURE RUST, ONE SESSION)
+### Step A — Resource-aware cost model (PURE RUST, ONE SESSION) — START HERE
+
+**Concrete TODO checklist** (execute in order, each step is committable):
+
+- [ ] **A.1** Add `Resources` struct to `kernel_library.rs`. Fields:
+  `shmem_bytes: u32, registers_per_thread: u32, threads_per_cta: u32,
+  binary_footprint_bytes: u32`. Add `BoundKernel::resources(&self) -> Resources`
+  method. For each existing variant, return reasonable estimates:
+  - `HandWrittenRowTile{Norm}`: shmem=0, regs=24, threads=32 (warp-0), footprint=2KB
+  - `HandWrittenRowTile{Rope}`: shmem=0, regs=32, threads=32, footprint=3KB
+  - `FlashInferAttentionLayer`: shmem=~70KB (FI_SHARED_STORAGE_BYTES at compile time
+    — pull the constant in via the cost model or hardcode the measured value),
+    regs=128, threads=256, footprint=20KB (FI is heavy)
+  - `CutlassGemmLayer{tile=Small}`: shmem=sizeof(pfl_cutlass_small::SharedStorage)≈49KB,
+    regs=128, threads=256, footprint=15KB
+  - `CutlassGemmLayer{tile=Narrow}`: shmem=sizeof(pfl_cutlass_narrow::SharedStorage)≈25KB,
+    regs=96, threads=256, footprint=13KB
+  - `FusedFaninLayer{...CutlassGemm(...,tile)}`: same as the inner cutlass + ~1KB
+    fan-in glue
+  - These numbers don't have to be exact — they have to be RELATIVELY correct
+    so the gate's inequalities work.
+- [ ] **A.2** Extend `CostModel` with a per-binding penalty:
+  `binary_footprint_penalty_per_use: u64`. Calibration: pick a value such that
+  adding a polyalgo candidate with `binary_footprint_bytes=15000` makes the
+  Narrow tile reject at seq=1024. The current data points: Narrow regressed by
+  ~1 ms at production dims; the cost gate at production dims sees ~5000 mma
+  units of work per phase; so the penalty should be ~6000 mma units per
+  binary KB if we want 15KB to outweigh the savings.
+- [ ] **A.3** Update `BoundKernel::cost(model)` to add the binary footprint
+  penalty: `cost += model.binary_footprint_penalty(self.resources())`. The
+  penalty is paid PER USE — so a polyalgo candidate that's used in many waves
+  pays it many times. This naturally penalizes adding rarely-winning kernels.
+- [ ] **A.4** Add a per-CTA shmem budget check in `partition_into_waves`. After
+  bin-packing each wave, compute `max_shmem_per_cta = max over CTAs of sum of
+  shmem of all bindings on that CTA`. If `max_shmem_per_cta > TARGET_MAX_SHMEM`,
+  return a wave schedule with `predicted_cost = u64::MAX` so the cost gate
+  rejects it. Today this is checked at compile time via static_assert but not
+  during cost-model search.
+- [ ] **A.5** Add unit test `cost_model_rejects_binary_bloat`:
+  - Build a tiny DAG
+  - Apply `try_coalesce` with a transform that adds a CutlassGemmLayer{Narrow}
+    binding for one phase
+  - Verify the transform reverts (cost gate sees the binary penalty)
+  - This locks in the behavior so future changes don't silently re-enable bloat
+- [ ] **A.6** Re-enable `CutlassTile::Narrow` in `CUTLASS_TILE_CANDIDATES` (it's
+  already there). Run the bench. Expected outcomes:
+  - Either the gate now correctly REJECTS Narrow for every phase (back to
+    Small everywhere) and the bench returns to ~53 ms
+  - OR the gate accepts Narrow for some phase where it actually wins (genuine
+    polyalgo win, > 1 ms improvement)
+- [ ] **A.7** Update `try_coalesce_rejects_a_regression` test to also assert
+  the binary-bloat reject case (or make it a separate test)
+- [ ] **A.8** `cargo fmt -p vllm-tk-macros-core && cargo clippy -p vllm-tk-macros-core -- -D warnings`
+- [ ] **A.9** Run all 3 GPU tests one at a time. Golden must still pass with
+  unchanged err. Bench should be 53–55 ms (in the noise band).
+- [ ] **A.10** Commit. Suggested commit message:
+  `feat(kernel_library): resource-aware cost model with binary_footprint penalty`
+
+**Bench impact**: ~0 ms (the gate now correctly auto-rejects regressions). The
+*win* is that the framework is now safe for adding more polyalgo candidates,
+fused norm+gemm kernels, etc. Without this, every Step B/C experiment risks
+the same kind of binary-bloat regression we just hit with Narrow.
+
+**File:line pointers** for the work:
+- `crates/vllm-tk-macros-core/src/kernel_library.rs:50` — `enum BoundKernel`
+- `crates/vllm-tk-macros-core/src/kernel_library.rs:185` — `impl BoundKernel { fn kind() }`
+- `crates/vllm-tk-macros-core/src/kernel_library.rs:248` — `impl BoundKernel { fn cost() }`
+- `crates/vllm-tk-macros-core/src/schedule.rs:34` — `struct CostModel`
+- `crates/vllm-tk-macros-core/src/schedule.rs:96` — `fn cutlass_gemm_total`
+- `crates/vllm-tk-macros-core/src/schedule.rs:158` — `pub fn partition_into_waves`
+- `crates/vllm-tk-macros-core/src/kernel_library.rs:993` — `fn try_coalesce`
+- `crates/vllm-tk-macros-core/src/kernel_library.rs:1010` — `fn coalesce_with_target_profile`
+
+(Line numbers as of commit `c399f7638`. Use `grep -n` if drift.)
+
+---
+
+**Original Step A scope (kept for context):**
+
 
 **Motivation**: today's cost gate doesn't predict binary bloat. Adding
 `pfl_cutlass_narrow` regressed by ~1 ms even though the cost model said it

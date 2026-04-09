@@ -661,7 +661,7 @@ pub fn coalesce_with_target_profile(
         // wave-cooperative gate_up node when multiple wave-coop nodes
         // (gate_up + fi_attn) coexist in the same wave at large M.
         // Leaving on the hand-written cooperative path until rooted.
-        // coalesced = coalesce_gemm_phase(coalesced, GemmPhase::GateUp);
+        coalesced = coalesce_gemm_phase(coalesced, GemmPhase::GateUp);
         coalesced = coalesce_gemm_phase(coalesced, GemmPhase::Down);
     }
 

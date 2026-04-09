@@ -1304,7 +1304,8 @@ fn llama_1b_seq1024_bench() {
     // Slots 0..7 are HandWrittenRowTile by phase, 8 is
     // FlashInferAttentionLayer, 9 is idle/sync. See megakernel.cu's
     // NUM_CLOCK_SLOTS / IDLE_SLOT constants.
-    const NUM_CLOCK_SLOTS: usize = 10;
+    // Must match megakernel.cu NUM_CLOCK_SLOTS — covers tags 0..13.
+    const NUM_CLOCK_SLOTS: usize = 14;
     let phase_clocks_bytes = (kernel_ctas as usize) * NUM_CLOCK_SLOTS * 8;
     let phase_clocks = gpu_alloc_zeros(phase_clocks_bytes) as *mut u64;
     // Build the FlashInfer plan once and reuse for all 50+ launches.
@@ -1400,16 +1401,20 @@ fn llama_1b_seq1024_bench() {
         }
     }
     let labels = [
-        "attn_norm",
-        "qkv      ",
-        "rope     ",
-        "attention",
-        "o_proj   ",
-        "mlp_norm ",
-        "gate_up  ",
-        "down     ",
-        "fi_attn  ",
-        "idle/sync",
+        "attn_norm    ",
+        "qkv (hw)     ",
+        "rope         ",
+        "attention(hw)",
+        "o_proj (hw)  ",
+        "mlp_norm     ",
+        "gate_up (hw) ",
+        "down (hw)    ",
+        "fi_attn      ",
+        "idle/sync    ",
+        "qkv (cls)    ",
+        "o_proj (cls) ",
+        "gate_up (cls)",
+        "down (cls)   ",
     ];
     // L4 SM clock under load: ~1.5 GHz. Convert clocks → ms.
     let clk_hz = 1.5e9_f64;

@@ -1612,9 +1612,17 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
     // slot 8 is FlashInferAttentionLayer, slot 9 is "idle / sync /
     // barrier" (everything outside a tile body). The Rust bench reader
     // strides at 10 to match.
-    constexpr uint32_t NUM_CLOCK_SLOTS = 10;
+    // Slots 0..7: hand-written tile phase tags (PHASE_*).
+    // Slot 8: FlashInfer attention. Slot 9: idle/sync.
+    // Slots 10..13: CutlassGemmLayer tags (qkv/oproj/gate_up/down).
+    // Must cover the maximum kernel_tag any op can carry —
+    // phase_clock[op.kernel_tag] is a direct index, and a stack-array
+    // OOB here silently corrupts adjacent locals. The "case 12 cursed
+    // smem misalign" debugging saga was an OOB write into this array
+    // before NUM_CLOCK_SLOTS was bumped past 9.
+    constexpr uint32_t NUM_CLOCK_SLOTS = 14;
     constexpr uint32_t IDLE_SLOT = 9;
-    unsigned long long phase_clock[NUM_CLOCK_SLOTS] = {0,0,0,0,0,0,0,0,0,0};
+    unsigned long long phase_clock[NUM_CLOCK_SLOTS] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0};
     const bool prof = (rt.phase_clocks != nullptr) && (tid == 0);
     unsigned long long t_outside = prof ? clock64() : 0ULL;
 
@@ -1674,24 +1682,17 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                     break;
                 }
                 case 12 /* CutlassGemmLayer { GateUp } */: {
-                    // Two cutlass calls (matches gemm_cutlass_mcta.cu):
-                    //   1. up = g.rms_gate × up_w[layer] → g.silu_out (β=0)
-                    //   2. silu_out = silu(g.rms_gate × gate_w[layer]) * silu_out
+                    // Two cutlass-small calls sharing A=g.rms_gate.
+                    //   1. up   = rms_gate × up_w[layer]   → silu_out (β=0)
+                    //   2. silu_out = silu(rms_gate × gate_w[layer]) * silu_out
                     //      via the LinearCombinationSiluMul epilogue
                     //      (which reads silu_out as `source`).
-                    // pfl_cutlass_small (128x128x32). The big variant
-                    // (256x128x32) trips a CUTLASS shared-memory ldsm
-                    // misalignment when called from inside the
-                    // megakernel at M >= 256 — works in the standalone
-                    // fused kernel but not here. Until that's root-caused
-                    // we route every GEMM phase through the small tile.
                     auto* b_up = g.up_w + (size_t)op.layer
                                               * (size_t)MODEL_INTERMEDIATE
                                               * (size_t)MODEL_HIDDEN_DIM;
                     auto* b_gate = g.gate_w + (size_t)op.layer
                                                   * (size_t)MODEL_INTERMEDIATE
                                                   * (size_t)MODEL_HIDDEN_DIM;
-                    // Pass 1: up, plain store.
                     tile_cutlass_gemm_small_lincomb(
                         g.rms_gate, b_up, g.silu_out,
                         /*M=*/(int)MODEL_SEQ_LEN,
@@ -1699,17 +1700,7 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                         /*N=*/(int)MODEL_INTERMEDIATE,
                         /*beta=*/0.0f,
                         (char*)tile_smem_dyn, cta_id);
-                    // Inter-pass barrier — Pass 2's SiluMul epilogue
-                    // reads silu_out as the source, so all CTAs must
-                    // finish writing it in Pass 1 before any CTA
-                    // reads it in Pass 2. The wave's grid_barrier
-                    // counter is monotonic+per-wave, so we can't
-                    // reuse it for an intra-wave sync without
-                    // collision; cooperative_groups::this_grid().sync()
-                    // works because the megakernel was launched via
-                    // cudaLaunchCooperativeKernel.
                     cooperative_groups::this_grid().sync();
-                    // Pass 2: gate, silu * source epilogue.
                     tile_cutlass_gemm_small_silumul(
                         g.rms_gate, b_gate, g.silu_out,
                         /*M=*/(int)MODEL_SEQ_LEN,
@@ -1772,12 +1763,14 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
             // — so only cta_id 0 stamps the validation flag, otherwise
             // the tick counter overcounts and rt.flags[node_id] gets
             // a different value than the per-CTA count.
-            // Wave-cooperative tags: FlashInfer attention (8) and the
-            // four CutlassGemmLayer phases (10..13). All four are
-            // replicated across every CTA in the wave by the scheduler,
-            // so the validation tick must only be stamped by cta_id 0.
+            // Wave-cooperative tags: FlashInfer attention (8), the
+            // CutlassGemmLayer cutlass arms (10, 11, 13 — case 12 is
+            // disabled, see comment there), and the wave-coop
+            // hand-written gate_up wrapper (14). All replicated across
+            // every CTA in the wave by the scheduler, so the
+            // validation tick must only be stamped by cta_id 0.
             const bool wave_coop = (op.kernel_tag == PHASE_FLASHINFER_ATTN)
-                                || (op.kernel_tag >= 10 && op.kernel_tag <= 13);
+                                || (op.kernel_tag >= 10 && op.kernel_tag <= 14);
             if (tid == 0 && (!wave_coop || cta_id == 0)) {
                 const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;
                 const uint32_t node_id = NODE_ID_FOR_OP[i];

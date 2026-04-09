@@ -1620,14 +1620,18 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
     // Slots 0..7: hand-written tile phase tags (PHASE_*).
     // Slot 8: FlashInfer attention. Slot 9: idle/sync.
     // Slots 10..13: CutlassGemmLayer tags (qkv/oproj/gate_up/down).
+    // Slots 14..16: FusedFaninLayer tags
+    //   14 = AttnNorm rows + Cutlass Qkv
+    //   15 = Rope rows + FlashInfer attention
+    //   16 = MlpNorm rows + Cutlass GateUp
     // Must cover the maximum kernel_tag any op can carry —
     // phase_clock[op.kernel_tag] is a direct index, and a stack-array
     // OOB here silently corrupts adjacent locals. The "case 12 cursed
     // smem misalign" debugging saga was an OOB write into this array
     // before NUM_CLOCK_SLOTS was bumped past 9.
-    constexpr uint32_t NUM_CLOCK_SLOTS = 14;
+    constexpr uint32_t NUM_CLOCK_SLOTS = 17;
     constexpr uint32_t IDLE_SLOT = 9;
-    unsigned long long phase_clock[NUM_CLOCK_SLOTS] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    unsigned long long phase_clock[NUM_CLOCK_SLOTS] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
     const bool prof = (rt.phase_clocks != nullptr) && (tid == 0);
     unsigned long long t_outside = prof ? clock64() : 0ULL;
 
@@ -1766,6 +1770,89 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                     FlashInferRunner::Run(rt.flashinfer_params[op.layer], &smem_storage);
                     break;
                 }
+                // ── FusedFaninLayer dispatch arms (tags 14..16) ──
+                //
+                // Pattern: a per-row producer phase (attn_norm / rope /
+                // mlp_norm) whose entire fan terminates in a single
+                // wave-cooperative consumer for the same layer is
+                // wrapped into one wave-coop dispatch. Every CTA in the
+                // wave strides over its share of producer rows, then
+                // grid-syncs (so all rows are visible globally before
+                // the consumer reads them), then participates in the
+                // wrapped consumer body.
+                //
+                // The win is one fewer grid_barrier per layer per fused
+                // pair: instead of `producer wave + barrier + consumer
+                // wave + barrier`, the fused arm runs as one wave with
+                // the inter-half sync absorbed into the dispatch arm,
+                // leaving just the wave-end barrier. The cost-model
+                // gate (`try_coalesce` in kernel_library.rs) accepts the
+                // fusion only if the saved barrier outweighs the per-CTA
+                // work increase from running the producer fan strided
+                // over CTAs instead of LPT-bin-packed.
+                case 14 /* FusedFaninLayer { AttnNorm → Cutlass Qkv } */: {
+                    constexpr uint32_t ROW_TILES =
+                        (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+                    for (uint32_t rt_idx = cta_id; rt_idx < ROW_TILES; rt_idx += NUM_CTAS) {
+                        tile_attn_norm(g, op.layer, rt_idx);
+                    }
+                    cooperative_groups::this_grid().sync();
+                    constexpr uint32_t QKV_DIM_FULL =
+                        (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
+                    tile_cutlass_gemm_small_lincomb(
+                        g.rms_rope,
+                        g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
+                                                   * (size_t)MODEL_HIDDEN_DIM,
+                        g.qkv,
+                        /*M=*/(int)MODEL_SEQ_LEN,
+                        /*K=*/(int)MODEL_HIDDEN_DIM,
+                        /*N=*/(int)QKV_DIM_FULL,
+                        /*beta=*/0.0f,
+                        (char*)tile_smem_dyn, cta_id);
+                    break;
+                }
+                case 15 /* FusedFaninLayer { Rope → FlashInfer attention } */: {
+                    constexpr uint32_t ROW_TILES =
+                        (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+                    for (uint32_t rt_idx = cta_id; rt_idx < ROW_TILES; rt_idx += NUM_CTAS) {
+                        tile_rope(g, op.layer, rt_idx);
+                    }
+                    cooperative_groups::this_grid().sync();
+                    auto& smem_storage =
+                        *reinterpret_cast<FlashInferKTraits::SharedStorage*>(tile_smem_dyn);
+                    FlashInferRunner::Run(rt.flashinfer_params[op.layer], &smem_storage);
+                    break;
+                }
+                case 16 /* FusedFaninLayer { MlpNorm → Cutlass GateUp } */: {
+                    constexpr uint32_t ROW_TILES =
+                        (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+                    for (uint32_t rt_idx = cta_id; rt_idx < ROW_TILES; rt_idx += NUM_CTAS) {
+                        tile_mlp_norm(g, op.layer, rt_idx);
+                    }
+                    cooperative_groups::this_grid().sync();
+                    auto* b_up = g.up_w + (size_t)op.layer
+                                              * (size_t)MODEL_INTERMEDIATE
+                                              * (size_t)MODEL_HIDDEN_DIM;
+                    auto* b_gate = g.gate_w + (size_t)op.layer
+                                                  * (size_t)MODEL_INTERMEDIATE
+                                                  * (size_t)MODEL_HIDDEN_DIM;
+                    tile_cutlass_gemm_small_lincomb(
+                        g.rms_gate, b_up, g.silu_out,
+                        /*M=*/(int)MODEL_SEQ_LEN,
+                        /*K=*/(int)MODEL_HIDDEN_DIM,
+                        /*N=*/(int)MODEL_INTERMEDIATE,
+                        /*beta=*/0.0f,
+                        (char*)tile_smem_dyn, cta_id);
+                    cooperative_groups::this_grid().sync();
+                    tile_cutlass_gemm_small_silumul(
+                        g.rms_gate, b_gate, g.silu_out,
+                        /*M=*/(int)MODEL_SEQ_LEN,
+                        /*K=*/(int)MODEL_HIDDEN_DIM,
+                        /*N=*/(int)MODEL_INTERMEDIATE,
+                        /*beta=*/1.0f, // unused by SiluMul
+                        (char*)tile_smem_dyn, cta_id);
+                    break;
+                }
                 default: break;
             }
             // Stamp validation tick. Single-threaded.
@@ -1781,13 +1868,12 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
             // the tick counter overcounts and rt.flags[node_id] gets
             // a different value than the per-CTA count.
             // Wave-cooperative tags: FlashInfer attention (8), the
-            // CutlassGemmLayer cutlass arms (10, 11, 13 — case 12 is
-            // disabled, see comment there), and the wave-coop
-            // hand-written gate_up wrapper (14). All replicated across
-            // every CTA in the wave by the scheduler, so the
+            // CutlassGemmLayer cutlass arms (10..13), and the
+            // FusedFaninLayer fan-in arms (14..16). All replicated
+            // across every CTA in the wave by the scheduler, so the
             // validation tick must only be stamped by cta_id 0.
             const bool wave_coop = (op.kernel_tag == PHASE_FLASHINFER_ATTN)
-                                || (op.kernel_tag >= 10 && op.kernel_tag <= 14);
+                                || (op.kernel_tag >= 10 && op.kernel_tag <= 16);
             if (tid == 0 && (!wave_coop || cta_id == 0)) {
                 const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;
                 const uint32_t node_id = NODE_ID_FOR_OP[i];

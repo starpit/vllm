@@ -106,6 +106,11 @@ pub fn emit_scheduled_megakernel_cu(
                     BoundKernel::CutlassGemmLayer { layer, phase } => {
                         (layer as u32, phase.tag(), 0)
                     }
+                    // FusedFaninLayer encodes producer/consumer in the
+                    // kernel_tag (14..16); the WAVE_OPS row/col slots
+                    // are unused — the dispatch arm reads `op.layer`
+                    // and the rest is implicit in the tag.
+                    BoundKernel::FusedFaninLayer { layer, .. } => (layer as u32, 0, 0),
                 };
                 ops.push((tag, layer, row, col));
                 node_ids.push(nid.0);

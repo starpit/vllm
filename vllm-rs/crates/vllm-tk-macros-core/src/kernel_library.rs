@@ -92,6 +92,36 @@ pub enum BoundKernel {
     /// LinearCombination(beta=1) residual-add for o_proj/down,
     /// LinearCombination(beta=0) for qkv).
     CutlassGemmLayer { layer: u16, phase: GemmPhase },
+
+    /// Fan-in fusion: a per-row producer phase whose entire fan
+    /// terminates in a single wave-cooperative consumer for the same
+    /// layer is rewritten as one wave-cooperative node that runs the
+    /// producer body strided over CTAs, syncs the grid, then dispatches
+    /// the wrapped consumer body — all inside a single wave's worth of
+    /// time (one barrier instead of two).
+    ///
+    /// Today's enabled fan-in patterns (matched by `coalesce_consumer_fanin`):
+    /// - `AttnNorm` rows → `CutlassGemmLayer{Qkv}`  (one barrier saved per layer)
+    /// - `Rope` rows → `FlashInferAttentionLayer`
+    /// - `MlpNorm` rows → `CutlassGemmLayer{GateUp}`
+    ///
+    /// The pass is cost-gated through `try_coalesce` — if simulating
+    /// `partition_into_waves` says applying this fusion does not
+    /// reduce predicted_cost, the rewrite is reverted.
+    FusedFaninLayer {
+        layer: u16,
+        producer_phase: Phase,
+        consumer: FaninConsumer,
+    },
+}
+
+/// Which wave-cooperative consumer kind a [`BoundKernel::FusedFaninLayer`]
+/// node wraps. Carried by value (not `Box<BoundKernel>`) so the variant
+/// stays `Copy`-friendly and the codegen can match on it directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FaninConsumer {
+    CutlassGemm(GemmPhase),
+    FlashInferAttention,
 }
 
 /// Which of the four GEMM phases a [`BoundKernel::CutlassGemmLayer`]
@@ -163,6 +193,20 @@ impl BoundKernel {
                 GemmPhase::GateUp => "cutlass_gemm_gate_up_layer",
                 GemmPhase::Down => "cutlass_gemm_down_layer",
             },
+            BoundKernel::FusedFaninLayer {
+                producer_phase,
+                consumer,
+                ..
+            } => match (producer_phase, consumer) {
+                (Phase::AttnNorm, FaninConsumer::CutlassGemm(GemmPhase::Qkv)) => {
+                    "fanin_attn_norm_cutlass_qkv"
+                }
+                (Phase::Rope, FaninConsumer::FlashInferAttention) => "fanin_rope_fi_attn",
+                (Phase::MlpNorm, FaninConsumer::CutlassGemm(GemmPhase::GateUp)) => {
+                    "fanin_mlp_norm_cutlass_gate_up"
+                }
+                _ => "fanin_unknown",
+            },
         }
     }
 
@@ -214,6 +258,11 @@ impl BoundKernel {
             // them in a CTA-strided loop. Same `gemm_cutlass_mcta.cu`
             // pattern as the existing fused prefill kernel.
             BoundKernel::CutlassGemmLayer { .. } => true,
+            // Fan-in fusion absorbs a per-row producer into a wave-coop
+            // consumer. The result runs as a single wave-cooperative
+            // node: every CTA strides over its share of producer rows,
+            // grid-syncs, then participates in the consumer body.
+            BoundKernel::FusedFaninLayer { .. } => true,
         }
     }
 
@@ -231,17 +280,34 @@ impl BoundKernel {
             },
             BoundKernel::FlashInferAttentionLayer { .. } => 8,
             // 9 reserved for future use (e.g. unused/idle marker).
-            // 10..13 are the four cutlass gemm phases. The dispatch
-            // arms in the megakernel template each handle one tag,
-            // so the dispatch switch knows which cutlass call to
-            // make without having to read the GemmPhase from the
-            // op stream's `row` slot. (We DO also stash the phase
-            // in the `row` slot for cross-checking.)
+            // 10..13: the four cutlass gemm phases.
+            // 14..16: fan-in fusion patterns. Each carries a unique
+            // dispatch arm in the megakernel template; allocating one
+            // tag per (producer, consumer) combo keeps the dispatch
+            // switch trivial — no need to decode producer_phase /
+            // consumer from the op stream's row/col slots.
             BoundKernel::CutlassGemmLayer { phase, .. } => match phase {
                 GemmPhase::Qkv => 10,
                 GemmPhase::OProj => 11,
                 GemmPhase::GateUp => 12,
                 GemmPhase::Down => 13,
+            },
+            BoundKernel::FusedFaninLayer {
+                producer_phase,
+                consumer,
+                ..
+            } => match (producer_phase, consumer) {
+                (Phase::AttnNorm, FaninConsumer::CutlassGemm(GemmPhase::Qkv)) => 14,
+                (Phase::Rope, FaninConsumer::FlashInferAttention) => 15,
+                (Phase::MlpNorm, FaninConsumer::CutlassGemm(GemmPhase::GateUp)) => 16,
+                // Future fan-in patterns claim 17+ here; the megakernel
+                // template gains a matching dispatch arm at the same
+                // time. Until then, panic clearly so we don't silently
+                // emit a tag with no dispatch arm.
+                _ => panic!(
+                    "FusedFaninLayer with producer={producer_phase:?}, consumer={consumer:?} \
+                     has no kernel_tag assigned; allocate one and add a dispatch arm"
+                ),
             },
         }
     }
@@ -273,6 +339,36 @@ impl BoundKernel {
             BoundKernel::CutlassGemmLayer { phase, .. } => {
                 let row_tiles = model.seq_len.div_ceil(model.row_tile);
                 row_tiles * model.cost(phase.source_phase())
+            }
+            // Fan-in fusion: total work = producer fan + intra-arm
+            // grid sync + consumer. The intra-arm sync exists because
+            // the consumer reads gmem outputs that the producer wrote
+            // across multiple CTAs (cross-CTA dataflow → block-local
+            // __syncthreads is insufficient → must use a real grid
+            // sync). Charging `BARRIER_COST_MMA_UNITS` here is what
+            // makes the cost-gated coalesce honest: the saved
+            // wave-end barrier is exactly cancelled out by the
+            // intra-arm sync, so the cost gate sees no net change
+            // and (correctly) reverts the fusion for these patterns.
+            //
+            // Future fusion patterns where the consumer only reads
+            // its own CTA's producer outputs (e.g. an in-CTA fused
+            // norm+gemm where the gemm reads the same rows the norm
+            // wrote) would override this to a smaller intra-arm cost
+            // (`__syncthreads`-only), and the gate would accept them.
+            BoundKernel::FusedFaninLayer {
+                producer_phase,
+                consumer,
+                ..
+            } => {
+                use crate::schedule::BARRIER_COST_MMA_UNITS;
+                let row_tiles = model.seq_len.div_ceil(model.row_tile);
+                let producer_cost = row_tiles * model.cost(*producer_phase);
+                let consumer_cost = match consumer {
+                    FaninConsumer::CutlassGemm(p) => row_tiles * model.cost(p.source_phase()),
+                    FaninConsumer::FlashInferAttention => row_tiles * model.cost(Phase::Attention),
+                };
+                producer_cost + (BARRIER_COST_MMA_UNITS as u32) + consumer_cost
             }
         }
     }
@@ -615,6 +711,185 @@ pub fn coalesce_gemm_phase(input: CoalescedDag, gemm_phase: GemmPhase) -> Coales
     }
 }
 
+/// Fan-in fusion pass: absorb a per-row producer phase into a
+/// wave-cooperative consumer in the same layer. The pattern is matched
+/// once per layer; if all the producer rows for that layer terminate in
+/// **exactly one** wave-coop consumer node — and that consumer is the
+/// supplied `consumer_kind` — then the producer rows are absorbed and
+/// the consumer node is rewritten as a [`BoundKernel::FusedFaninLayer`].
+///
+/// Constraints checked per layer (any failure → leave layer unchanged):
+/// - All producer rows are `HandWrittenRowTile { phase: producer_phase, layer }`.
+/// - Their union of successors is exactly `{ consumer_id }` — every
+///   producer's only successor must be the consumer. Otherwise some
+///   absorbed producer would leave a dangling dep edge.
+/// - The consumer exists, is in the same layer, and matches `consumer_kind`.
+///
+/// The new node's deps = `(consumer.deps ∪ each producer.deps) − absorbed`.
+/// Internal edges (consumer→producer or producer→producer within the
+/// fused set) are dropped — they're now intra-arm syncthreads in the
+/// rendered dispatch.
+///
+/// **Cost-gating is handled by the caller** via `try_coalesce`. This
+/// function unconditionally applies the rewrite where it pattern-matches.
+pub fn coalesce_consumer_fanin(
+    input: CoalescedDag,
+    producer_phase: Phase,
+    consumer_kind: FaninConsumer,
+) -> CoalescedDag {
+    use std::collections::{HashMap, HashSet};
+
+    // Build successor lists once.
+    let mut successors: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for n in &input.nodes {
+        for d in &n.deps {
+            successors.entry(*d).or_default().push(n.id);
+        }
+    }
+
+    // For each layer, check if the fan-in pattern applies.
+    let mut layers_to_fuse: HashMap<u16, (NodeId, Vec<NodeId>)> = HashMap::new();
+    let nodes_by_id: HashMap<NodeId, &CoalescedNode> =
+        input.nodes.iter().map(|n| (n.id, n)).collect();
+
+    // Collect candidate producer nodes by layer.
+    let mut producers_by_layer: HashMap<u16, Vec<NodeId>> = HashMap::new();
+    for n in &input.nodes {
+        if let BoundKernel::HandWrittenRowTile { phase, layer, .. } = n.kernel
+            && phase == producer_phase
+        {
+            producers_by_layer.entry(layer).or_default().push(n.id);
+        }
+    }
+
+    // For each layer, verify the constraints.
+    for (layer, producer_ids) in &producers_by_layer {
+        // Find every producer's set of successors.
+        let mut consumer_set: HashSet<NodeId> = HashSet::new();
+        let mut all_have_one_succ = true;
+        for pid in producer_ids {
+            let succs = successors.get(pid).cloned().unwrap_or_default();
+            if succs.len() != 1 {
+                all_have_one_succ = false;
+                break;
+            }
+            consumer_set.insert(succs[0]);
+        }
+        if !all_have_one_succ || consumer_set.len() != 1 {
+            continue; // pattern doesn't match — leave layer alone
+        }
+        let consumer_id = *consumer_set.iter().next().unwrap();
+        let consumer_node = match nodes_by_id.get(&consumer_id) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Verify the consumer kind + layer match.
+        let consumer_matches = match (&consumer_node.kernel, consumer_kind) {
+            (
+                BoundKernel::CutlassGemmLayer { layer: cl, phase },
+                FaninConsumer::CutlassGemm(target_phase),
+            ) => *cl == *layer && *phase == target_phase,
+            (
+                BoundKernel::FlashInferAttentionLayer { layer: cl },
+                FaninConsumer::FlashInferAttention,
+            ) => *cl == *layer,
+            _ => false,
+        };
+        if !consumer_matches {
+            continue;
+        }
+        // All checks passed — schedule this layer for fusion.
+        layers_to_fuse.insert(*layer, (consumer_id, producer_ids.clone()));
+    }
+
+    if layers_to_fuse.is_empty() {
+        return input;
+    }
+
+    // Build the absorbed-id set and the rewrite map (absorbed → fused id).
+    let mut absorbed: HashSet<NodeId> = HashSet::new();
+    let mut rewrite: HashMap<NodeId, NodeId> = HashMap::new();
+    for (consumer_id, producers) in layers_to_fuse.values() {
+        for p in producers {
+            absorbed.insert(*p);
+            rewrite.insert(*p, *consumer_id);
+        }
+    }
+
+    // Emit new nodes: consumer becomes FusedFaninLayer, producers are dropped,
+    // everything else has its deps rewritten.
+    let mut new_nodes: Vec<CoalescedNode> = Vec::with_capacity(input.nodes.len());
+    for n in &input.nodes {
+        if absorbed.contains(&n.id) {
+            continue; // dropped — its deps are unioned into the consumer below
+        }
+        // Is this node a fusion target?
+        let fusion_for_layer = layers_to_fuse
+            .iter()
+            .find(|(_, (consumer_id, _))| *consumer_id == n.id)
+            .map(|(layer, (_, producers))| (*layer, producers.clone()));
+
+        if let Some((layer, producers)) = fusion_for_layer {
+            // Union deps of the consumer + every absorbed producer,
+            // drop internal edges, dedupe.
+            let mut deps: Vec<NodeId> = Vec::new();
+            let mut seen: HashSet<NodeId> = HashSet::new();
+            // Consumer's deps (rewritten if any point at absorbed nodes —
+            // shouldn't happen since absorbed are the producers and the
+            // consumer's deps include the producers; we drop those).
+            for d in &n.deps {
+                if absorbed.contains(d) {
+                    continue;
+                }
+                if seen.insert(*d) {
+                    deps.push(*d);
+                }
+            }
+            // Each producer's deps (rewritten / deduped).
+            for pid in &producers {
+                if let Some(pn) = nodes_by_id.get(pid) {
+                    for d in &pn.deps {
+                        if absorbed.contains(d) {
+                            continue;
+                        }
+                        if seen.insert(*d) {
+                            deps.push(*d);
+                        }
+                    }
+                }
+            }
+            new_nodes.push(CoalescedNode {
+                id: n.id,
+                kernel: BoundKernel::FusedFaninLayer {
+                    layer,
+                    producer_phase,
+                    consumer: consumer_kind,
+                },
+                deps,
+            });
+        } else {
+            // Non-target: rewrite any deps pointing into absorbed set.
+            let deps: Vec<NodeId> = n
+                .deps
+                .iter()
+                .map(|d| rewrite.get(d).copied().unwrap_or(*d))
+                .collect();
+            new_nodes.push(CoalescedNode {
+                id: n.id,
+                kernel: n.kernel.clone(),
+                deps,
+            });
+        }
+    }
+
+    renumber_dense_ids(&mut new_nodes);
+    CoalescedDag {
+        dims: input.dims,
+        tiles: input.tiles,
+        nodes: new_nodes,
+    }
+}
+
 /// Combined coalesce pass driven by [`TargetProfile`]. Runs whichever
 /// fusion rules the profile's kernel choices ask for, in
 /// dependency-safe order. This is the **entry point** the production
@@ -696,6 +971,35 @@ pub fn coalesce_with_target_profile(
         });
     }
 
+    // Fan-in fusion passes — each absorbs a per-row producer phase
+    // into a wave-cooperative consumer in the same layer, saving one
+    // grid_barrier per layer per fused pair. Cost-gated through
+    // try_coalesce: if applying a pass doesn't reduce predicted_cost
+    // (e.g. because the pattern doesn't apply, or the saved barrier
+    // is outweighed by the increased per-CTA work), the pass reverts
+    // and the DAG is left untouched. The order matters for the
+    // dependency-safety check inside coalesce_consumer_fanin: each
+    // pass requires its consumer to already be coalesced into a
+    // single wave-coop node, so attention/cutlass passes must run
+    // first (they did, above).
+    coalesced = try_coalesce(coalesced, num_ctas, "fanin_attn_norm_qkv", |c| {
+        coalesce_consumer_fanin(
+            c,
+            Phase::AttnNorm,
+            FaninConsumer::CutlassGemm(GemmPhase::Qkv),
+        )
+    });
+    coalesced = try_coalesce(coalesced, num_ctas, "fanin_rope_fi_attn", |c| {
+        coalesce_consumer_fanin(c, Phase::Rope, FaninConsumer::FlashInferAttention)
+    });
+    coalesced = try_coalesce(coalesced, num_ctas, "fanin_mlp_norm_gate_up", |c| {
+        coalesce_consumer_fanin(
+            c,
+            Phase::MlpNorm,
+            FaninConsumer::CutlassGemm(GemmPhase::GateUp),
+        )
+    });
+
     coalesced
 }
 
@@ -748,6 +1052,9 @@ mod tests {
                 }
                 BoundKernel::CutlassGemmLayer { .. } => {
                     panic!("trivial coalesce should never produce CutlassGemmLayer");
+                }
+                BoundKernel::FusedFaninLayer { .. } => {
+                    panic!("trivial coalesce should never produce FusedFaninLayer");
                 }
             }
         }
@@ -958,17 +1265,31 @@ mod tests {
         for cn in &coalesced_cutlass.nodes {
             kinds.insert(cn.kernel.kind());
         }
-        assert!(kinds.contains("flashinfer_attention_layer"));
-        assert!(kinds.contains("cutlass_gemm_qkv_layer"));
+        // The cutlass arms for o_proj and down survive standalone (no
+        // fan-in pattern absorbs them — their producers are the
+        // wave-coop attn / o_proj outputs, not per-row tiles).
         assert!(kinds.contains("cutlass_gemm_o_proj_layer"));
-        assert!(kinds.contains("cutlass_gemm_gate_up_layer"));
         assert!(kinds.contains("cutlass_gemm_down_layer"));
-        // No HandWrittenRowTile remnants for the four GEMM phases
-        // when cutlass is enabled.
+        // The other three (qkv / gate_up cutlass + flashinfer_attention)
+        // get absorbed by their respective fan-in coalesce passes when
+        // those win under the cost gate. At tiny dims with the
+        // production barrier_cost the gate accepts all three, so the
+        // fan-in kinds appear and the standalone variants do not.
+        assert!(kinds.contains("fanin_attn_norm_cutlass_qkv"));
+        assert!(kinds.contains("fanin_rope_fi_attn"));
+        assert!(kinds.contains("fanin_mlp_norm_cutlass_gate_up"));
+        assert!(!kinds.contains("flashinfer_attention_layer"));
+        assert!(!kinds.contains("cutlass_gemm_qkv_layer"));
+        assert!(!kinds.contains("cutlass_gemm_gate_up_layer"));
+        // No HandWrittenRowTile remnants for the four GEMM phases or
+        // for the per-row producers that got absorbed.
         assert!(!kinds.contains("qkv"));
         assert!(!kinds.contains("o_proj"));
         assert!(!kinds.contains("gate_up"));
         assert!(!kinds.contains("down"));
+        assert!(!kinds.contains("attn_norm"));
+        assert!(!kinds.contains("rope"));
+        assert!(!kinds.contains("mlp_norm"));
 
         // Profile with cutlass DISABLED — should NOT produce any
         // CutlassGemmLayer nodes; the four GEMM phases stay as
@@ -982,12 +1303,27 @@ mod tests {
         for cn in &coalesced_wmma.nodes {
             kinds_wmma.insert(cn.kernel.kind());
         }
-        assert!(kinds_wmma.contains("flashinfer_attention_layer"));
+        // The cutlass GEMM phases stay as HandWrittenRowTile (qkv,
+        // o_proj, gate_up, down) — no fan-in pattern targets a hand-
+        // written GEMM consumer, so the qkv/gate_up rows + the
+        // attn_norm/mlp_norm rows that produce them all stay
+        // standalone.
         assert!(kinds_wmma.contains("qkv"));
         assert!(kinds_wmma.contains("o_proj"));
         assert!(kinds_wmma.contains("gate_up"));
         assert!(kinds_wmma.contains("down"));
+        assert!(kinds_wmma.contains("attn_norm"));
+        assert!(kinds_wmma.contains("mlp_norm"));
         assert!(!kinds_wmma.contains("cutlass_gemm_qkv_layer"));
+        assert!(!kinds_wmma.contains("fanin_attn_norm_cutlass_qkv"));
+        assert!(!kinds_wmma.contains("fanin_mlp_norm_cutlass_gate_up"));
+        // The rope → fi_attn fan-in still applies because fi_attn is
+        // wave-coop coalesced regardless of the GEMM kernel choice.
+        // So the standalone fi_attn kind disappears and the fan-in
+        // kind appears in its place.
+        assert!(kinds_wmma.contains("fanin_rope_fi_attn"));
+        assert!(!kinds_wmma.contains("flashinfer_attention_layer"));
+        assert!(!kinds_wmma.contains("rope"));
     }
 
     #[test]

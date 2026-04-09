@@ -654,7 +654,7 @@ pub fn generate_scheduled_prefill_tiny() -> String {
     let dims = scheduled_prefill_tiny_dims();
     let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
     let dag = coalesce_with_target_profile(&reified, &profile);
-    let cost = CostModel::from_dag(&dag);
+    let cost = CostModel::from_dag(&dag, profile.cooperative_grid_size());
     // CTA pool size = profile.cooperative_grid_size() so the
     // FlashInfer attention runner inside the megakernel sees a
     // grid that matches its planner's `num_blks_y`.
@@ -701,7 +701,7 @@ pub fn generate_scheduled_prefill_medium() -> String {
     let dims = scheduled_prefill_medium_dims();
     let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
     let dag = coalesce_with_target_profile(&reified, &profile);
-    let cost = CostModel::from_dag(&dag);
+    let cost = CostModel::from_dag(&dag, profile.cooperative_grid_size());
     let sched = partition_into_waves(&dag, profile.cooperative_grid_size(), &cost, 100);
     emit_scheduled_megakernel_cu(
         &dag,
@@ -806,8 +806,8 @@ pub fn generate_scheduled_prefill_variants(dsl: &str) -> Result<Vec<ScheduledVar
 
         let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
         let dag = coalesce_with_target_profile(&reified, &profile);
-        let cost = CostModel::from_dag(&dag);
         let num_ctas = ctas_for_variant(&profile, &dims);
+        let cost = CostModel::from_dag(&dag, num_ctas);
         let sched = partition_into_waves(&dag, num_ctas, &cost, 100);
         let name = variant.name.to_string();
         let cu_source = emit_scheduled_megakernel_cu(

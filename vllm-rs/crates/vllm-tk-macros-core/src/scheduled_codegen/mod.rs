@@ -289,7 +289,7 @@ mod tests {
         use crate::target_profile::TargetProfile;
         let reified = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
         let dag = coalesce(&reified);
-        let cost = CostModel::from_dag(&dag);
+        let cost = CostModel::from_dag(&dag, 4);
         let sched = partition_into_waves(&dag, 4, &cost, 100);
         let profile = TargetProfile::l4_sm89();
         let cpp = emit_scheduled_megakernel_cu(&dag, &sched, 16, &profile, "tiny");
@@ -309,7 +309,7 @@ mod tests {
     fn op_count_matches_node_count() {
         let reified = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
         let dag = coalesce(&reified);
-        let cost = CostModel::from_dag(&dag);
+        let cost = CostModel::from_dag(&dag, 4);
         let sched = partition_into_waves(&dag, 4, &cost, 100);
 
         let mut total = 0u32;

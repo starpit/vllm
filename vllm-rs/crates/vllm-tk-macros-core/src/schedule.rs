@@ -49,7 +49,7 @@ pub const BARRIER_COST_MMA_UNITS: u64 = 100;
 /// production `barrier_cost`. The returned value is in the same
 /// mma-unit domain as `WaveSchedule::predicted_cost`.
 pub fn score_dag(dag: &CoalescedDag, num_ctas: u32) -> u64 {
-    let cost = CostModel::from_dag(dag);
+    let cost = CostModel::from_dag(dag, num_ctas);
     let sched = partition_into_waves(dag, num_ctas, &cost, BARRIER_COST_MMA_UNITS);
     sched.predicted_cost
 }
@@ -70,10 +70,16 @@ pub struct CostModel {
     pub head_dim: u32,
     pub num_attn_heads: u32,
     pub num_kv_heads: u32,
+    /// Persistent grid CTA count. Threaded through so the cost
+    /// model can compute *per-CTA* cost for wave-cooperative
+    /// bindings, including polyalgorithmic GEMM tile-shape choices
+    /// where bin-pack rounding (`ceil(work_units / num_ctas)`)
+    /// distinguishes one shape from another.
+    pub num_ctas: u32,
 }
 
 impl CostModel {
-    pub fn from_dag(dag: &CoalescedDag) -> Self {
+    pub fn from_dag(dag: &CoalescedDag, num_ctas: u32) -> Self {
         Self {
             row_tile: dag.tiles.row_tile,
             qkv_col_tile: dag.tiles.qkv_col_tile,
@@ -86,7 +92,37 @@ impl CostModel {
             head_dim: dag.dims.head_dim,
             num_attn_heads: dag.dims.num_attn_heads,
             num_kv_heads: dag.dims.num_kv_heads,
+            num_ctas,
         }
+    }
+
+    /// Per-CTA cost for a wave-cooperative cutlass GEMM at a given
+    /// (M, K, N, tile_M, tile_N, tile_K) shape. The threadblock
+    /// processes work units in a strided loop over `cta_id`, so the
+    /// per-CTA cost is `ceil(work_units / num_ctas) * per_tile_mma`.
+    /// Bin-pack rounding makes smaller tiles win when M*N is small
+    /// relative to `num_ctas * tile_M * tile_N` (e.g. qkv at
+    /// M=1024, N=3072) — they leave fewer wasted CTA-slots.
+    pub fn cutlass_gemm_per_cta(
+        &self,
+        m: u32,
+        n: u32,
+        k: u32,
+        tile_m: u32,
+        tile_n: u32,
+        tile_k: u32,
+    ) -> u32 {
+        let row_tiles = m.div_ceil(tile_m);
+        let col_tiles = n.div_ceil(tile_n);
+        let work_units = row_tiles * col_tiles;
+        let k_iters = k.div_ceil(tile_k);
+        // Per-tile mma instruction count: tile_m/16 × tile_n/8 × tile_k/16
+        // (sm89 mma is m16n8k16). We approximate the per-tile cost in
+        // mma units as the inner-loop count (k_iters × per-iter mmas).
+        let mma_per_iter = (tile_m / 16) * (tile_n / 8) * (tile_k / 16);
+        let per_tile_mma = k_iters * mma_per_iter;
+        let per_cta_units = work_units.div_ceil(self.num_ctas);
+        per_cta_units * per_tile_mma
     }
 
     fn gemm_compute(m: u32, n: u32, k: u32) -> u32 {
@@ -323,7 +359,7 @@ mod tests {
         // node's deps must lie in strictly earlier waves.
         let reified = ReifiedDag::reify_llama(llama_1b_dims(64), TileSizes::default_v1());
         let dag = coalesce(&reified);
-        let cost = CostModel::from_dag(&dag);
+        let cost = CostModel::from_dag(&dag, 8);
         let sched = partition_into_waves(&dag, 8, &cost, 100);
 
         // Build node → wave_idx lookup.
@@ -361,7 +397,7 @@ mod tests {
         let profile = TargetProfile::l4_sm89();
         let reified = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
         let dag = coalesce(&reified);
-        let cost = CostModel::from_dag(&dag);
+        let cost = CostModel::from_dag(&dag, profile.cooperative_grid_size());
         let sched = partition_into_waves(&dag, profile.cooperative_grid_size(), &cost, 100);
         let cp_nodes = reified.critical_path_depth();
         assert_eq!(sched.num_waves(), cp_nodes as usize);
@@ -372,7 +408,7 @@ mod tests {
         let profile = TargetProfile::l4_sm89();
         let reified = ReifiedDag::reify_llama(llama_1b_dims(1024), TileSizes::default_v1());
         let dag = coalesce(&reified);
-        let cost = CostModel::from_dag(&dag);
+        let cost = CostModel::from_dag(&dag, profile.cooperative_grid_size());
         // 100 mma units ≈ 1.0 µs at 1.5 GHz — ballpark for an L4 gmem-flag barrier.
         let sched = partition_into_waves(&dag, profile.cooperative_grid_size(), &cost, 100);
 

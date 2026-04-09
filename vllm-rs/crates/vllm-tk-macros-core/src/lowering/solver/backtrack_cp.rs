@@ -47,13 +47,15 @@
 //! reaches the second tile of the multi-tile claim, it sees the
 //! tile is already claimed and skips it.
 
+use std::collections::HashMap;
+
 use crate::lowering::assignment::{Assignment, CompilationUnitId, ScheduleSlot, SubgraphId};
 use crate::lowering::constraint::ConstraintStatus;
 use crate::lowering::cost::cost_us;
 use crate::lowering::implementation::{Handoff, ImplId};
 use crate::lowering::problem::Problem;
 use crate::lowering::solver::{ExecutionPlan, SolveResult, Solver};
-use crate::lowering::tile_graph::TileId;
+use crate::lowering::tile_graph::{TileId, TileKind};
 
 /// Constraint propagation + backtracking + branch-and-bound solver.
 #[derive(Debug, Default)]
@@ -73,6 +75,64 @@ impl Solver for BacktrackCpSolver {
             None => SolveResult::Infeasible,
         }
     }
+}
+
+/// Precomputed minimum cost of the cheapest impl that can match a
+/// representative tile of each `TileKind`. Used to compute an
+/// optimistic-but-tight remainder bound during branch-and-bound.
+///
+/// **Multi-tile attribution**: a multi-tile claim's full cost is
+/// attributed to the *lowest-id* tile in the claim, with all other
+/// claimed tiles getting 0 in the per-tile min. This way, summing
+/// per-tile minima for an empty partial yields exactly the actual
+/// cost of using each impl (not a divided-by-N underestimate that
+/// fails to prune anything). The branch-and-bound bound becomes
+/// tight enough to prune the (oproj/down) × 16 layers exponential
+/// branching from `CublasGemmExWithResidualImpl`.
+fn min_cost_per_tile_kind(problem: &Problem) -> HashMap<TileKind, f64> {
+    let mut min_costs: HashMap<TileKind, f64> = HashMap::new();
+    let kinds_present: std::collections::HashSet<TileKind> =
+        problem.tile_graph.nodes.iter().map(|n| n.kind).collect();
+    for kind in kinds_present {
+        let representative = problem
+            .tile_graph
+            .iter_topo()
+            .find(|n| n.kind == kind)
+            .map(|n| n.id);
+        let Some(seed) = representative else {
+            continue;
+        };
+        let mut min_cost = f64::INFINITY;
+        for imp in &problem.library.entries {
+            if !imp.target_compatible(problem.profile) {
+                continue;
+            }
+            if let Some(m) = imp.matches(problem.tile_graph, seed, problem.profile) {
+                let c = imp.cost_us(&m, problem.profile);
+                // Attribute the full multi-tile claim cost to its
+                // SEED (the lowest-id claimed tile). For the seed's
+                // kind that's the full cost; other tiles in the
+                // claim contribute 0. This makes the sum bound
+                // exact for any cover that uses this impl, which
+                // is what enables branch-and-bound pruning.
+                let seed_id = m.claimed_tiles.iter().copied().min().unwrap();
+                let seed_kind = problem.tile_graph.nodes[seed_id.0 as usize].kind;
+                let attributed = if seed_kind == kind { c } else { 0.0 };
+                if attributed < min_cost {
+                    min_cost = attributed;
+                }
+            }
+        }
+        // If no impl matches this kind directly with the kind being
+        // the seed (e.g. SiluMul is always claimed by a fused impl
+        // seeded at GateUpConcat), the per-tile contribution for
+        // this kind is 0 — its cost gets attributed to the seed.
+        if !min_cost.is_finite() {
+            min_cost = 0.0;
+        }
+        min_costs.insert(kind, min_cost);
+    }
+    min_costs
 }
 
 /// Search state carried through recursion. The current partial
@@ -95,10 +155,14 @@ struct SearchState<'a> {
     best: Option<(Assignment, f64, u64)>,
     /// Total branch-and-bound steps explored. Used for diagnostics.
     steps: u64,
+    /// Precomputed cheapest cost per `TileKind`. Used by the
+    /// optimistic remainder bound.
+    min_cost_per_kind: HashMap<TileKind, f64>,
 }
 
 impl<'a> SearchState<'a> {
     fn new(problem: &'a Problem<'a>) -> Self {
+        let min_cost_per_kind = min_cost_per_tile_kind(problem);
         Self {
             problem,
             assignment: Assignment::default(),
@@ -107,6 +171,7 @@ impl<'a> SearchState<'a> {
             next_step: 0,
             best: None,
             steps: 0,
+            min_cost_per_kind,
         }
     }
 
@@ -121,19 +186,33 @@ impl<'a> SearchState<'a> {
         None
     }
 
-    /// Compute a lower bound on the final cost given the current
-    /// partial assignment. For first cut: the cost of the bound
-    /// portion only (no estimate of the unbound portion). The
-    /// bound monotonically increases as the solver commits more,
-    /// so branch-and-bound still prunes correctly — we may just
-    /// explore more branches than a tighter bound would.
+    /// Lower bound on the final cost: partial cost (committed
+    /// portion) + optimistic remainder (sum of cheapest impl per
+    /// unclaimed tile). The remainder ignores constraints and
+    /// fusion structure; it's a true lower bound that lets the
+    /// solver prune any branch whose `lb >= best_known_cost`.
     fn lower_bound_cost_us(&self) -> f64 {
-        cost_us(
+        let partial = cost_us(
             &self.assignment,
             self.problem.tile_graph,
             self.problem.library,
             self.problem.profile,
-        )
+        );
+        let mut remainder = 0.0;
+        for node in self.problem.tile_graph.iter_topo() {
+            if self.assignment.cover.contains_key(&node.id) {
+                continue;
+            }
+            // Add the cheapest possible cost for this tile kind.
+            // If unknown, fall back to 0 (won't over-prune).
+            let m = self
+                .min_cost_per_kind
+                .get(&node.kind)
+                .copied()
+                .unwrap_or(0.0);
+            remainder += m;
+        }
+        partial + remainder
     }
 
     /// Check every static constraint against the current partial

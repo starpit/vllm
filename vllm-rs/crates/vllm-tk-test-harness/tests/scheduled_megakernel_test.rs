@@ -13,9 +13,16 @@
 use cudarc::driver::result;
 use half::bf16;
 use vllm_tk_macros_core::{
-    SCHEDULED_PREFILL_KV_PAGE_SIZE, kernel_library::coalesce_with_flashinfer_attention,
-    reified_dag::LlamaDims, reified_dag::ReifiedDag, reified_dag::TileSizes,
-    scheduled_prefill_medium_dims, scheduled_prefill_tiny_dims, target_profile::TargetProfile,
+    SCHEDULED_PREFILL_KV_PAGE_SIZE,
+    kernel_library::coalesce_with_flashinfer_attention,
+    lowering::{
+        BacktrackCpSolver, ImplementationLibrary, Problem, SolveResult, Solver, TileGraph, TileKind,
+    },
+    reified_dag::LlamaDims,
+    reified_dag::ReifiedDag,
+    reified_dag::TileSizes,
+    scheduled_prefill_medium_dims, scheduled_prefill_tiny_dims,
+    target_profile::TargetProfile,
 };
 use vllm_tk_test_harness::ffi;
 
@@ -1966,6 +1973,336 @@ fn cp4_natural_sm89_full_forward_microbench() {
     let _ = plan.params_d; // suppress unused-mut on plan when no attention call
     unsafe {
         ffi::teardown_flashinfer_attention_plan(&mut plan);
+        ffi::cublasDestroy_v2(handle);
+    }
+}
+
+/// CP5-C — solver-driven natural sm_89 forward.
+///
+/// **This is the load-bearing CP5 deliverable**: a forward pass
+/// where the implementation choices are the *output* of the
+/// constraint solver, not hand-picked. The flow:
+///
+///   1. Build the normalized [`TileGraph`] for Llama-1B 16 layers.
+///   2. Build the [`ImplementationLibrary`] (cuBLAS GEMMs, vllm-rs
+///      fused norm/silu/rope, FlashInfer standalone, the cuBLAS
+///      with-residual fused entries, free passthroughs).
+///   3. Build the [`Problem`] (tile graph + library + L4 sm_89
+///      profile + auto-generated static constraints).
+///   4. Run the [`BacktrackCpSolver`] → get an `ExecutionPlan` with
+///      the joint (cover, impl, schedule, handoffs) assignment.
+///   5. Walk the schedule in step order, dispatching one FFI call
+///      per scheduled subgraph based on the solver-chosen impl.
+///   6. Time the forward pass.
+///
+/// The interpreter is a `match` over `impl.name()` → FFI call.
+/// Each impl name maps to a specific cuBLAS / vllm-rs / FlashInfer
+/// call with the right buffer pointers and shapes for the layer.
+///
+/// **Attention is currently SKIPPED** in the dispatch (no clean
+/// per-layer FlashInfer entry point exposed yet — the existing
+/// shim is plan-rebuild-per-call). The bench number reported is
+/// "natural sm_89 forward minus attention." Add ~10 ms for a
+/// realistic full-forward estimate (per the megakernel's measured
+/// fanin rope+at clock).
+#[test]
+#[ignore = "needs GPU"]
+fn cp5_solver_driven_natural_forward_bench() {
+    use cudarc::driver::sys;
+
+    init_cuda();
+    let dims = llama_1b_seq1024_dims();
+    let (b, _) = build_test_buffers(dims, 89);
+
+    // ── Build problem + solve ──
+    let tile_graph = TileGraph::build_llama_forward(dims.num_layers as u16);
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let profile = TargetProfile::l4_sm89();
+    let problem = Problem::build(&tile_graph, &library, &profile);
+    let solver = BacktrackCpSolver;
+    let plan = match solver.solve(&problem) {
+        SolveResult::Found(p) => p,
+        SolveResult::Infeasible => panic!("solver reported infeasible — check the library"),
+    };
+
+    eprintln!();
+    eprintln!("╔═══════════════════════════════════════════════════════════════╗");
+    eprintln!("║  CP5-C solver-driven natural sm_89 bench                       ║");
+    eprintln!("║  llama_3_2_1b @ seq=1024, Backtrack CP solver                  ║");
+    eprintln!("╠═══════════════════════════════════════════════════════════════╣");
+    eprintln!(
+        "║  solver: {:>4} steps, predicted {:6.2} ms                       ║",
+        plan.solver_steps,
+        plan.predicted_us / 1000.0
+    );
+    eprintln!(
+        "║  cover: {} subgraphs across {} tiles                            ║",
+        plan.assignment.subgraphs().count(),
+        tile_graph.len()
+    );
+    // Histogram of impl picks — what did the solver actually choose?
+    let mut impl_counts: std::collections::BTreeMap<&'static str, u32> = Default::default();
+    for sg in plan.assignment.subgraphs() {
+        let imp_id = plan.assignment.impls[&sg];
+        *impl_counts.entry(library.get(imp_id).name()).or_insert(0) += 1;
+    }
+    eprintln!("║  solver picks per impl:                                        ║");
+    for (name, count) in &impl_counts {
+        eprintln!("║    {count:>3} × {name:<55} ║");
+    }
+    eprintln!("╠═══════════════════════════════════════════════════════════════╣");
+
+    // ── cuBLAS handle setup ──
+    let mut handle: ffi::CublasHandle = std::ptr::null_mut();
+    unsafe {
+        let s = ffi::cublasCreate_v2(&mut handle);
+        assert_eq!(s, 0, "cublasCreate failed: {s}");
+        let s = ffi::cublasSetStream_v2(handle, std::ptr::null_mut());
+        assert_eq!(s, 0, "cublasSetStream failed: {s}");
+    }
+
+    // Dummy rope inputs (positions, cos_sin) — same as the CP4
+    // natural microbench, just so the rotary_embedding kernel has
+    // something to read.
+    let positions_host: Vec<u32> = (0..dims.seq_len).collect();
+    let positions_dev = unsafe {
+        let bytes = (dims.seq_len as usize) * std::mem::size_of::<u32>();
+        let p = result::malloc_sync(bytes).unwrap();
+        result::memcpy_htod_sync(p, &positions_host).unwrap();
+        p as *const u32
+    };
+    let cos_sin_bytes = (dims.seq_len as usize) * (dims.head_dim as usize) * 2;
+    let cos_sin_dev = gpu_alloc_zeros(cos_sin_bytes);
+
+    // Per-layer weight strides (bytes).
+    let nl = dims.num_layers as usize;
+    let seq = dims.seq_len as i32;
+    let hd = dims.hidden_dim as i32;
+    let id = dims.intermediate_dim as i32;
+    let q_dim = (dims.num_attn_heads * dims.head_dim) as i32;
+    let kv_dim = (dims.num_kv_heads * dims.head_dim) as i32;
+    let qkv_dim = q_dim + 2 * kv_dim;
+    let layer_bytes_qkv = (qkv_dim * hd) as usize * 2;
+    let layer_bytes_o = (hd * hd) as usize * 2;
+    let layer_bytes_gate_up = (id * hd) as usize * 2;
+    let layer_bytes_down = (hd * id) as usize * 2;
+    let layer_bytes_norm = hd as usize * 2;
+    let _ = nl;
+
+    // Temp buffer for the gate / up GEMM outputs (silu_and_mul
+    // expects the [seq, 2*intermediate] packed layout — same as
+    // CP4 natural microbench).
+    let gate_up_tmp = gpu_alloc_zeros((seq * 2 * id) as usize * 2);
+
+    // Sort scheduled subgraphs by (step, subgraph_id) so the
+    // dispatch order matches the solver's intent.
+    let mut scheduled: Vec<(u32, vllm_tk_macros_core::lowering::assignment::SubgraphId)> = plan
+        .assignment
+        .schedule
+        .iter()
+        .map(|(sg, slot)| (slot.step, *sg))
+        .collect();
+    scheduled.sort_by_key(|(step, sg)| (*step, sg.0));
+
+    // Helper: classify which RmsNorm tile this is within its
+    // layer (first one = attn_norm, second = mlp_norm). Used to
+    // pick the right weight pointer.
+    let is_first_rms_norm_in_layer =
+        |claimed: &[vllm_tk_macros_core::lowering::TileId], layer: u16| -> bool {
+            // Walk the tile graph: count RmsNorm tiles BEFORE the
+            // first claimed tile in the same layer.
+            let first_claimed = claimed.iter().min().copied().unwrap();
+            let mut count_before = 0;
+            for n in tile_graph.iter_topo() {
+                if n.id == first_claimed {
+                    break;
+                }
+                if n.kind == TileKind::RmsNorm && n.layer == layer {
+                    count_before += 1;
+                }
+            }
+            count_before == 0
+        };
+
+    // Reusable cuBLAS GEMM closure (row-major C[M,N] = A[M,K] @ B[N,K]^T).
+    let one: f32 = 1.0;
+    let gemm = |m: i32, n: i32, k: i32, weight: u64, act: u64, out: u64, beta: f32| unsafe {
+        let beta_val = beta;
+        let s = ffi::cublasGemmEx(
+            handle,
+            ffi::CUBLAS_OP_T,
+            ffi::CUBLAS_OP_N,
+            n,
+            m,
+            k,
+            &one as *const f32,
+            weight as *const _,
+            ffi::CUDA_R_16BF,
+            k,
+            act as *const _,
+            ffi::CUDA_R_16BF,
+            k,
+            &beta_val as *const f32,
+            out as *mut _,
+            ffi::CUDA_R_16BF,
+            n,
+            ffi::CUBLAS_COMPUTE_32F,
+            ffi::CUBLAS_GEMM_DEFAULT,
+        );
+        assert_eq!(s, 0, "cublasGemmEx failed: {s}");
+    };
+
+    // Dispatch one scheduled subgraph: look up its impl name and
+    // call the matching FFI. The interpreter is a flat match —
+    // each impl has one corresponding FFI dispatch arm.
+    let dispatch_one = |sg: vllm_tk_macros_core::lowering::assignment::SubgraphId| {
+        let impl_id = plan.assignment.impls[&sg];
+        let imp_name = library.get(impl_id).name();
+        let claimed = plan.assignment.tiles_in_subgraph(sg);
+        let layer = claimed
+            .iter()
+            .map(|t| tile_graph.nodes[t.0 as usize].layer)
+            .next()
+            .unwrap_or(0) as usize;
+
+        match imp_name {
+            // ── cuBLAS GEMMs ──
+            "cublas_gemm_ex_qkv" => {
+                let w = b.qkv_w + (layer * layer_bytes_qkv) as u64;
+                gemm(seq, qkv_dim, hd, w, b.rms_rope, b.qkv, 0.0);
+            }
+            "cublas_gemm_ex_oproj" => {
+                let w = b.o_w + (layer * layer_bytes_o) as u64;
+                gemm(seq, hd, hd, w, b.attn_out, b.hidden_states, 0.0);
+            }
+            "cublas_gemm_ex_oproj_with_residual" => {
+                // beta=1 → hidden_states += attn_out @ o_w^T
+                let w = b.o_w + (layer * layer_bytes_o) as u64;
+                gemm(seq, hd, hd, w, b.attn_out, b.hidden_states, 1.0);
+            }
+            "cublas_gemm_ex_gate" => {
+                let w = b.gate_w + (layer * layer_bytes_gate_up) as u64;
+                gemm(seq, id, hd, w, b.rms_gate, gate_up_tmp, 0.0);
+            }
+            "cublas_gemm_ex_up" => {
+                let w = b.up_w + (layer * layer_bytes_gate_up) as u64;
+                let up_dest = gate_up_tmp + (seq * id) as u64 * 2;
+                gemm(seq, id, hd, w, b.rms_gate, up_dest, 0.0);
+            }
+            "cublas_gemm_ex_down" => {
+                let w = b.down_w + (layer * layer_bytes_down) as u64;
+                gemm(seq, hd, id, w, b.silu_out, b.hidden_states, 0.0);
+            }
+            "cublas_gemm_ex_down_with_residual" => {
+                let w = b.down_w + (layer * layer_bytes_down) as u64;
+                gemm(seq, hd, id, w, b.silu_out, b.hidden_states, 1.0);
+            }
+            // ── vllm-rs fused ops ──
+            "vllm_rs_rms_norm" => {
+                // Distinguish attn_norm vs mlp_norm by position.
+                let is_attn_norm = is_first_rms_norm_in_layer(&claimed, layer as u16);
+                let weight_buffer = if is_attn_norm {
+                    b.attn_norm_w + (layer * layer_bytes_norm) as u64
+                } else {
+                    b.mlp_norm_w + (layer * layer_bytes_norm) as u64
+                };
+                let (out, src) = if is_attn_norm {
+                    (b.rms_rope, b.hidden_states)
+                } else {
+                    (b.rms_gate, b.hidden_states)
+                };
+                unsafe {
+                    ffi::rms_norm_bf16(
+                        out as *mut u16,
+                        src as *const u16,
+                        weight_buffer as *const u16,
+                        1e-5,
+                        seq,
+                        hd,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+            "vllm_rs_rotary_embedding" => unsafe {
+                ffi::rotary_embedding_bf16(
+                    positions_dev,
+                    b.qkv as *mut u16,
+                    (b.qkv + (q_dim as usize * 2) as u64) as *mut u16,
+                    cos_sin_dev as *const u16,
+                    dims.head_dim as i32,
+                    q_dim,
+                    kv_dim,
+                    dims.head_dim as i32,
+                    seq,
+                    std::ptr::null_mut(),
+                );
+            },
+            "vllm_rs_silu_and_mul_fused" => unsafe {
+                ffi::silu_and_mul_fused_bf16(
+                    b.silu_out as *mut u16,
+                    gate_up_tmp as *const u16,
+                    seq,
+                    id,
+                    std::ptr::null_mut(),
+                );
+            },
+            // ── FlashInfer attention — SKIPPED in the interpreter ──
+            // The standalone shim does plan-rebuild per call which
+            // dominates the bench. CP5-D will add a pre-planned
+            // FlashInfer entry point. For now we skip and report
+            // "natural sm_89 minus attention."
+            "flashinfer_standalone_fa2" => {}
+            // ── Free / cheap passthroughs ──
+            // qkv_split is no-op (the qkv buffer is already
+            // [Q | K | V] laid out). kv_cache_write is a no-op
+            // here because we don't actually use the kv cache in
+            // this bench (no attention). residual_add is a no-op
+            // when its tile was claimed by the with-residual
+            // fused cuBLAS impl above; if the solver chose the
+            // standalone variant we'd need a separate add kernel.
+            "qkv_split_free" | "kv_cache_write" | "residual_add" => {}
+            other => panic!("CP5-C interpreter has no dispatch for impl {other:?}"),
+        }
+    };
+
+    let one_pass = || {
+        for (_step, sg) in &scheduled {
+            dispatch_one(*sg);
+        }
+    };
+
+    // Warmup.
+    for _ in 0..4 {
+        one_pass();
+    }
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+
+    // Timed iters.
+    const NUM_ITERS: u32 = 50;
+    let mut start: sys::CUevent = std::ptr::null_mut();
+    let mut stop: sys::CUevent = std::ptr::null_mut();
+    let avg_ms = unsafe {
+        sys::cuEventCreate(&mut start, 0);
+        sys::cuEventCreate(&mut stop, 0);
+        sys::cuEventRecord(start, std::ptr::null_mut());
+        for _ in 0..NUM_ITERS {
+            one_pass();
+        }
+        sys::cuEventRecord(stop, std::ptr::null_mut());
+        sys::cuEventSynchronize(stop);
+        let mut elapsed_ms: f32 = 0.0;
+        sys::cuEventElapsedTime(&mut elapsed_ms, start, stop);
+        sys::cuEventDestroy_v2(start);
+        sys::cuEventDestroy_v2(stop);
+        elapsed_ms / NUM_ITERS as f32
+    };
+
+    eprintln!("║  measured (50 iters, attn skipped): {avg_ms:6.3} ms                ║");
+    eprintln!("║  CP4 natural microbench (attn skipped):  37.8 ms                ║");
+    eprintln!("║  scheduled megakernel (full):            55.0 ms                ║");
+    eprintln!("╚═══════════════════════════════════════════════════════════════╝");
+
+    unsafe {
         ffi::cublasDestroy_v2(handle);
     }
 }

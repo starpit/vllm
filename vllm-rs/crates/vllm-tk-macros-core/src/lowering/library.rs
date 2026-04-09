@@ -83,6 +83,18 @@ impl ImplementationLibrary {
     /// for QkvSplit / KvCacheWrite / ResidualAdd. CP5-D extends.
     pub fn l4_sm89_starter() -> Self {
         let entries: Vec<Box<dyn Implementation>> = vec![
+            // ── cuBLAS GEMM with fused residual (claims GEMM + ResidualAdd
+            //    as a two-tile subgraph; uses cublasGemmEx beta=1.0 to
+            //    fold the residual add into the GEMM epilogue for free).
+            //    Listed BEFORE the standalone CublasGemmExImpl entries
+            //    so the solver's cheapest-first tie-break (when both
+            //    cost 145 µs at the per-call level) prefers the fused
+            //    variant. The fused variant saves a downstream
+            //    ResidualAdd cost so its full-path cost is strictly
+            //    lower; this ordering just makes the solver find it
+            //    on the first branch instead of after backtracking.
+            Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmOProj)),
+            Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmDown)),
             // ── cuBLAS GEMMs (one entry per phase for clean cost lookup) ──
             Box::new(CublasGemmExImpl::new(TileKind::GemmQkv)),
             Box::new(CublasGemmExImpl::new(TileKind::GemmOProj)),
@@ -249,6 +261,135 @@ impl Implementation for CublasGemmExImpl {
     fn supported_output_handoffs(&self) -> &[Handoff] {
         const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
         H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+}
+
+/// `cublasGemmEx` with `beta=1.0` epilogue. Claims a two-tile
+/// subgraph: `(GemmOProj + ResidualAdd)` or `(GemmDown + ResidualAdd)`.
+/// The residual add comes "free" via cuBLAS's beta parameter — the
+/// solver should prefer this entry over the separate
+/// `(CublasGemmExImpl, ResidualAddImpl)` cover because it eliminates
+/// the standalone residual_add cost AND a launch boundary.
+///
+/// **Why only oproj and down**: those are the two GEMMs in a Llama
+/// layer that have a residual operand on their output buffer. qkv,
+/// gate, up GEMMs write to fresh buffers (no residual to fold).
+#[derive(Debug)]
+pub struct CublasGemmExWithResidualImpl {
+    phase: TileKind,
+}
+
+impl CublasGemmExWithResidualImpl {
+    pub fn new(phase: TileKind) -> Self {
+        debug_assert!(matches!(phase, TileKind::GemmOProj | TileKind::GemmDown));
+        Self { phase }
+    }
+}
+
+impl Implementation for CublasGemmExWithResidualImpl {
+    fn name(&self) -> &'static str {
+        match self.phase {
+            TileKind::GemmOProj => "cublas_gemm_ex_oproj_with_residual",
+            TileKind::GemmDown => "cublas_gemm_ex_down_with_residual",
+            _ => "cublas_gemm_ex_with_residual_unknown",
+        }
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        // Match starting from either the GEMM or the ResidualAdd
+        // end of the pattern. Find the (GEMM, ResidualAdd) pair.
+        let (gemm_id, gemm_node, residual_id) = match node.kind {
+            kind if kind == self.phase => {
+                // Find a downstream ResidualAdd that consumes this GEMM.
+                let residual = tile_graph
+                    .nodes
+                    .iter()
+                    .find(|n| n.kind == TileKind::ResidualAdd && n.deps.contains(&seed))?;
+                (seed, node, residual.id)
+            }
+            TileKind::ResidualAdd => {
+                // Find a GEMM dep of the right phase.
+                let gemm = node
+                    .deps
+                    .iter()
+                    .copied()
+                    .find(|d| tile_graph.nodes[d.0 as usize].kind == self.phase)?;
+                (gemm, &tile_graph.nodes[gemm.0 as usize], seed)
+            }
+            _ => return None,
+        };
+
+        // The ResidualAdd's deps should be (hidden_in, gemm_output).
+        // The GEMM's deps are the GEMM operands.
+        // Boundary inputs include the GEMM's deps + the ResidualAdd's
+        // OTHER dep (the hidden_in residual operand).
+        let residual_node = &tile_graph.nodes[residual_id.0 as usize];
+        let mut boundary_inputs = gemm_node.deps.clone();
+        for d in &residual_node.deps {
+            if *d != gemm_id && !boundary_inputs.contains(d) {
+                boundary_inputs.push(*d);
+            }
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![gemm_id, residual_id],
+            boundary_inputs,
+            // The output is the ResidualAdd tile (hidden_states write).
+            boundary_outputs: vec![residual_id],
+            layer: gemm_node.layer,
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
+        // Same as the plain cuBLAS GEMM — beta=1 doesn't change wall
+        // clock vs beta=0 in cuBLAS's mainloop.
+        use l4_llama_1b_seq1024_costs::*;
+        match self.phase {
+            TileKind::GemmOProj => CUBLAS_OPROJ_US,
+            TileKind::GemmDown => CUBLAS_DOWN_US,
+            _ => 0.0,
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
     }
 
     fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {

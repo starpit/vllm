@@ -1687,6 +1687,13 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                     //   2. silu_out = silu(rms_gate × gate_w[layer]) * silu_out
                     //      via the LinearCombinationSiluMul epilogue
                     //      (which reads silu_out as `source`).
+                    // Tried pfl_cutlass big 256x128x32: gate_up went
+                    // 19.3 → 21.3 ms (down went 10.2 → 13.7). The big
+                    // tile wins in the standalone fused kernel but
+                    // loses here because all dispatch arms coexist in
+                    // the same TU — adding the big tile bumps the
+                    // megakernel's worst-case register footprint and
+                    // hurts the other phases.
                     auto* b_up = g.up_w + (size_t)op.layer
                                               * (size_t)MODEL_INTERMEDIATE
                                               * (size_t)MODEL_HIDDEN_DIM;
@@ -1711,9 +1718,14 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                     break;
                 }
                 case 13 /* CutlassGemmLayer { Down } */: {
-                    // down + residual: A=g.silu_out [seq, ID],
-                    // B=g.down_w[layer] [HD, ID], C=g.hidden_states [seq, HD].
-                    // beta=1 (residual add). pfl_cutlass_small (diag).
+                    // down + residual. pfl_cutlass_small (128x128x32).
+                    // Tried big (256x128x32): down went 10.22 → 13.75 ms,
+                    // probably because for down's M=1024, K=8192, N=2048
+                    // shape, total_work_cta = 4 × 16 = 64 ops / 58 CTAs
+                    // ≈ 1 per CTA — not enough work to amortize the
+                    // bigger tile's shmem footprint and accumulator
+                    // state. Small tile's 128 ops / 58 ≈ 2 per CTA
+                    // packs better.
                     tile_cutlass_gemm_small_lincomb(
                         g.silu_out,
                         g.down_w + (size_t)op.layer

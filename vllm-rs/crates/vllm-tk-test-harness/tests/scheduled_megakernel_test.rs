@@ -19,15 +19,42 @@ use vllm_tk_macros_core::{
 };
 use vllm_tk_test_harness::ffi;
 
-/// Returns true when the harness should call the CP2 per-wave
-/// launcher (`launch_scheduled_megakernel_*_per_wave`) instead of
-/// the legacy single-launch megakernel. Picked at runtime via the
-/// `FERRITE_PER_WAVE_LOWERING=1` env var so the same binary can A/B
-/// the lowering strategies for bench comparisons without recompiling.
-fn use_per_wave_lowering() -> bool {
-    std::env::var("FERRITE_PER_WAVE_LOWERING")
+/// Three-way lowering picker. Reads env vars at runtime so the same
+/// binary can A/B/C the lowering strategies without recompiling:
+///
+///   - default (no env var): legacy single-launch megakernel
+///   - `FERRITE_PER_WAVE_LOWERING=1`: CP2 per-wave launcher
+///     (one cudaLaunchCooperativeKernel per wave, one __global__
+///     containing all dispatch arms)
+///   - `FERRITE_PER_KIND_LOWERING=1`: CP3 per-kind launcher
+///     (one cudaLaunchCooperativeKernel per wave, dispatching to a
+///     per-kind __global__ template instantiation that contains
+///     ONLY that kind's dispatch arm)
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LoweringMode {
+    Legacy,
+    PerWave,
+    PerKind,
+}
+
+fn lowering_mode() -> LoweringMode {
+    if std::env::var("FERRITE_PER_KIND_LOWERING")
         .map(|v| v == "1")
         .unwrap_or(false)
+    {
+        LoweringMode::PerKind
+    } else if std::env::var("FERRITE_PER_WAVE_LOWERING")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        LoweringMode::PerWave
+    } else {
+        LoweringMode::Legacy
+    }
+}
+
+fn use_per_wave_lowering() -> bool {
+    lowering_mode() == LoweringMode::PerWave
 }
 
 fn init_cuda() {
@@ -1268,11 +1295,16 @@ fn llama_1b_seq1024_smoke() {
     let kernel_waves = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq1024_num_waves() };
     eprintln!("  kernel: {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
 
-    let launch_fn: LaunchFn = if use_per_wave_lowering() {
-        eprintln!("  using CP2 per-wave lowering (FERRITE_PER_WAVE_LOWERING=1)");
-        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024_per_wave
-    } else {
-        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024
+    let launch_fn: LaunchFn = match lowering_mode() {
+        LoweringMode::PerKind => {
+            eprintln!("  using CP3 per-kind lowering (FERRITE_PER_KIND_LOWERING=1)");
+            ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024_per_kind
+        }
+        LoweringMode::PerWave => {
+            eprintln!("  using CP2 per-wave lowering (FERRITE_PER_WAVE_LOWERING=1)");
+            ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024_per_wave
+        }
+        LoweringMode::Legacy => ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024,
     };
     let launch_start = std::time::Instant::now();
     let _ = launch_with_buffers(&b, dims, 1e-5, launch_fn, kernel_n);
@@ -1324,11 +1356,16 @@ fn llama_1b_seq1024_bench() {
     // belongs to setup, not bench-of-record.
     let mut plan = build_flashinfer_plan(&b, dims);
 
-    let launch_fn: LaunchFn = if use_per_wave_lowering() {
-        eprintln!("║  using CP2 per-wave lowering (FERRITE_PER_WAVE_LOWERING=1)");
-        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024_per_wave
-    } else {
-        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024
+    let launch_fn: LaunchFn = match lowering_mode() {
+        LoweringMode::PerKind => {
+            eprintln!("║  using CP3 per-kind lowering (FERRITE_PER_KIND_LOWERING=1)");
+            ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024_per_kind
+        }
+        LoweringMode::PerWave => {
+            eprintln!("║  using CP2 per-wave lowering (FERRITE_PER_WAVE_LOWERING=1)");
+            ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024_per_wave
+        }
+        LoweringMode::Legacy => ffi::launch_scheduled_megakernel_llama_3_2_1b_seq1024,
     };
     let launch = || unsafe {
         launch_fn(
@@ -1483,11 +1520,16 @@ fn llama_1b_seq64_h_final_matches_committed_golden() {
     let kernel_waves = unsafe { ffi::scheduled_megakernel_llama_3_2_1b_seq64_num_waves() };
     eprintln!("  kernel: {kernel_n} nodes, {kernel_waves} waves, {kernel_ctas} CTAs");
 
-    let launch_fn: LaunchFn = if use_per_wave_lowering() {
-        eprintln!("  using CP2 per-wave lowering (FERRITE_PER_WAVE_LOWERING=1)");
-        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq64_per_wave
-    } else {
-        ffi::launch_scheduled_megakernel_llama_3_2_1b_seq64
+    let launch_fn: LaunchFn = match lowering_mode() {
+        LoweringMode::PerKind => {
+            eprintln!("  using CP3 per-kind lowering (FERRITE_PER_KIND_LOWERING=1)");
+            ffi::launch_scheduled_megakernel_llama_3_2_1b_seq64_per_kind
+        }
+        LoweringMode::PerWave => {
+            eprintln!("  using CP2 per-wave lowering (FERRITE_PER_WAVE_LOWERING=1)");
+            ffi::launch_scheduled_megakernel_llama_3_2_1b_seq64_per_wave
+        }
+        LoweringMode::Legacy => ffi::launch_scheduled_megakernel_llama_3_2_1b_seq64,
     };
     let launch_start = std::time::Instant::now();
     let _ = launch_with_buffers(&b, dims, eps, launch_fn, kernel_n);

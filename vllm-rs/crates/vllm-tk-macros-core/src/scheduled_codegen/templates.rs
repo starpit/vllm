@@ -88,4 +88,20 @@ pub struct MegakernelCtx<'a> {
     pub target_gemm_tile_n: u32,
     pub target_gemm_tile_k: u32,
     pub target_gemm_pipeline_stages: u32,
+
+    // ── CP3: per-kind lowering data ──────────────────────────────────
+    /// Pre-rendered host-side `WAVE_KIND_HOST[NUM_WAVES]` table
+    /// (`{ 14, 15, 11, 16, 13, 14, 15, ... }`) listing each wave's
+    /// `BoundKernel::kernel_tag()`. The CP3 launcher reads this to
+    /// dispatch each wave to the matching per-kind `__global__`
+    /// instantiation. The wave's kind is monomorphic (the BSP
+    /// scheduler enforces it), so we take the first non-empty CTA
+    /// stream's first op's tag and use that as the wave's kind.
+    pub wave_kind_host_table: String,
+    /// Distinct kernel_tag values present in the schedule, sorted.
+    /// The codegen uses this to emit one explicit template
+    /// instantiation per kind (avoiding the cost of compiling 17
+    /// per-variant template instantiations when only ~5 are used).
+    /// Iterated by askama via `{% for k in distinct_kinds %}`.
+    pub distinct_kinds: Vec<u32>,
 }

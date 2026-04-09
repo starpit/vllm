@@ -2269,7 +2269,283 @@ __global__ void scheduled_megakernel_{{ name }}_one_wave(
     }
 }
 
+// ── CP3: per-kind one-wave kernel (templated) ────────────────────────
+//
+// `template<int KIND>` instantiation. Each instantiation contains
+// only the dispatch body for ONE `BoundKernel::kernel_tag()` value
+// — `if constexpr (KIND == X)` selects the branch at compile time
+// and the unused branches DCE away. Each instantiation is its own
+// `__global__` symbol with its own NVCC register / shmem budget,
+// which is the entire point: the legacy single-`__global__`
+// scheduled megakernel hits 255 regs/thread and spills (~1100-1500
+// bytes of spill loads measured via -Xptxas=--verbose), because
+// NVCC has to allocate registers for the union of FlashInfer +
+// every cutlass arm + every hand-written tile body in one function.
+// Splitting per kind lets each kind use only the registers IT
+// actually needs, eliminating the spills and dropping max-regs
+// per kind below 255.
+//
+// The launcher (`launch_scheduled_megakernel_{{ name }}_per_kind`
+// below) reads the host-side `WAVE_KIND_HOST[NUM_WAVES]` table the
+// codegen emitted and dispatches each wave to the matching
+// per-kind instantiation via `cudaLaunchCooperativeKernel`.
+//
+// Codegen emits explicit instantiations only for kinds that
+// actually appear in the schedule (`distinct_kinds`), keeping the
+// number of compiled `__global__` symbols small (~5 for Llama-1B).
+// No `__launch_bounds__` here — tried (256, 2) which forced
+// 128 regs/thread on every per-kind instantiation. For cutlass
+// arms it eliminated remaining spills cleanly, but **for
+// FlashInfer kinds it caused 2128 bytes of spill stores per kernel
+// invocation** (the FI mainloop fundamentally exceeds 128 regs and
+// spills heavily under that cap). FI's rope+fi fanin arm regressed
+// from 10.58 → 15.30 ms — net wall-clock got WORSE by ~6 ms.
+//
+// The other cutlass arms also didn't speed up at 2 blocks/SM
+// because they're MMA-bound, not register- or occupancy-bound on
+// L4: a single tensor core per SM is already saturated by 1 block,
+// adding occupancy doesn't help.
+//
+// The actual CP3 win lives elsewhere: per-kind kernels enable
+// per-kind TILE SHAPES (e.g. cutlass big 256x128 for gate_up
+// without compounding register pressure into FI's __global__).
+// See the CutlassGemmLayer GateUp / Down branches below.
+template <int KIND>
+__global__ void scheduled_megakernel_{{ name }}_one_wave_kind(
+    globals_t g,
+    SchedRuntime rt,
+    uint32_t wave_idx)
+{
+    const uint32_t cta_id = blockIdx.y;
+    const uint32_t tid    = threadIdx.x;
+    if (cta_id >= NUM_CTAS) return;
+
+    extern __shared__ __align__(16) uint8_t tile_smem_dyn[];
+    char* tile_smem = reinterpret_cast<char*>(tile_smem_dyn);
+
+    constexpr uint32_t NUM_CLOCK_SLOTS = 17;
+    constexpr uint32_t IDLE_SLOT = 9;
+    unsigned long long phase_clock[NUM_CLOCK_SLOTS] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    const bool prof = (rt.phase_clocks != nullptr) && (tid == 0);
+    unsigned long long t_outside = prof ? clock64() : 0ULL;
+
+    const uint32_t off = WAVE_CTA_OFFSETS[wave_idx * (NUM_CTAS + 1) + cta_id];
+    const uint32_t end = WAVE_CTA_OFFSETS[wave_idx * (NUM_CTAS + 1) + cta_id + 1];
+
+    for (uint32_t i = off; i < end; ++i) {
+        const TileOp op = WAVE_OPS[i];
+        unsigned long long t_in = 0ULL;
+        if (prof) {
+            t_in = clock64();
+            phase_clock[IDLE_SLOT] += t_in - t_outside;
+        }
+
+        // Compile-time-selected dispatch. Only the branch matching
+        // KIND survives in this instantiation; the others DCE away.
+        if constexpr (KIND == PHASE_ATTN_NORM) {
+            tile_attn_norm(g, op.layer, op.row);
+        } else if constexpr (KIND == PHASE_ROPE) {
+            tile_rope(g, op.layer, op.row);
+        } else if constexpr (KIND == PHASE_MLP_NORM) {
+            tile_mlp_norm(g, op.layer, op.row);
+        } else if constexpr (KIND == 10 /* CutlassGemmLayer Qkv */) {
+            constexpr uint32_t QKV_DIM_FULL =
+                (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
+            auto* a_ptr = g.rms_rope;
+            auto* b_ptr = g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
+                                                      * (size_t)MODEL_HIDDEN_DIM;
+            auto* out_ptr = g.qkv;
+            if (op.col == 0u) {
+                tile_cutlass_gemm_small_lincomb(
+                    a_ptr, b_ptr, out_ptr,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                    /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+            } else {
+                tile_cutlass_gemm_narrow_lincomb(
+                    a_ptr, b_ptr, out_ptr,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                    /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+            }
+        } else if constexpr (KIND == 11 /* CutlassGemmLayer OProj */) {
+            auto* b_ptr = g.o_w + (size_t)op.layer
+                                      * (size_t)MODEL_HIDDEN_DIM
+                                      * (size_t)MODEL_HIDDEN_DIM;
+            if (op.col == 0u) {
+                tile_cutlass_gemm_small_lincomb(
+                    g.attn_out, b_ptr, g.hidden_states,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_HIDDEN_DIM,
+                    /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+            } else {
+                tile_cutlass_gemm_narrow_lincomb(
+                    g.attn_out, b_ptr, g.hidden_states,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_HIDDEN_DIM,
+                    /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+            }
+        } else if constexpr (KIND == 12 /* CutlassGemmLayer GateUp */) {
+            auto* b_up = g.up_w + (size_t)op.layer
+                                      * (size_t)MODEL_INTERMEDIATE
+                                      * (size_t)MODEL_HIDDEN_DIM;
+            auto* b_gate = g.gate_w + (size_t)op.layer
+                                          * (size_t)MODEL_INTERMEDIATE
+                                          * (size_t)MODEL_HIDDEN_DIM;
+            if (op.col == 0u) {
+                tile_cutlass_gemm_small_lincomb(
+                    g.rms_gate, b_up, g.silu_out,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                    /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                tile_cutlass_gemm_small_silumul(
+                    g.rms_gate, b_gate, g.silu_out,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                    /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+            } else {
+                tile_cutlass_gemm_narrow_lincomb(
+                    g.rms_gate, b_up, g.silu_out,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                    /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                tile_cutlass_gemm_narrow_silumul(
+                    g.rms_gate, b_gate, g.silu_out,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                    /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+            }
+        } else if constexpr (KIND == 13 /* CutlassGemmLayer Down */) {
+            auto* b_ptr = g.down_w + (size_t)op.layer
+                                         * (size_t)MODEL_HIDDEN_DIM
+                                         * (size_t)MODEL_INTERMEDIATE;
+            // Down: small (128x128) tile. Empirical: big tile
+            // (256x128) measured 11.74 ms vs small's 9.72 ms for
+            // this shape (M=1024 K=8192 N=2048). Down's large K
+            // makes the per-tile mainloop already long enough that
+            // bigger tile doesn't amortize launch / pipeline-fill
+            // overhead any further; the bigger tile just forces
+            // more bin-pack rounding waste.
+            tile_cutlass_gemm_small_lincomb(
+                g.silu_out, b_ptr, g.hidden_states,
+                (int)MODEL_SEQ_LEN, (int)MODEL_INTERMEDIATE, (int)MODEL_HIDDEN_DIM,
+                /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+        } else if constexpr (KIND == PHASE_FLASHINFER_ATTN /* 8 */) {
+            auto& smem_storage =
+                *reinterpret_cast<FlashInferKTraits::SharedStorage*>(tile_smem_dyn);
+            FlashInferRunner::Run(rt.flashinfer_params[op.layer], &smem_storage);
+        } else if constexpr (KIND == 14 /* FusedFaninLayer AttnNorm → Cutlass Qkv */) {
+            constexpr uint32_t ROW_TILES =
+                (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+            for (uint32_t rt_idx = cta_id; rt_idx < ROW_TILES; rt_idx += NUM_CTAS) {
+                tile_attn_norm(g, op.layer, rt_idx);
+            }
+            cooperative_groups::this_grid().sync();
+            constexpr uint32_t QKV_DIM_FULL =
+                (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
+            auto* a_ptr = g.rms_rope;
+            auto* b_ptr = g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
+                                                      * (size_t)MODEL_HIDDEN_DIM;
+            auto* out_ptr = g.qkv;
+            if (op.col == 0u) {
+                tile_cutlass_gemm_small_lincomb(
+                    a_ptr, b_ptr, out_ptr,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                    /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+            } else {
+                tile_cutlass_gemm_narrow_lincomb(
+                    a_ptr, b_ptr, out_ptr,
+                    (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                    /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+            }
+        } else if constexpr (KIND == 15 /* FusedFaninLayer Rope → FI attention */) {
+            constexpr uint32_t ROW_TILES =
+                (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+            for (uint32_t rt_idx = cta_id; rt_idx < ROW_TILES; rt_idx += NUM_CTAS) {
+                tile_rope(g, op.layer, rt_idx);
+            }
+            cooperative_groups::this_grid().sync();
+            auto& smem_storage =
+                *reinterpret_cast<FlashInferKTraits::SharedStorage*>(tile_smem_dyn);
+            FlashInferRunner::Run(rt.flashinfer_params[op.layer], &smem_storage);
+        } else if constexpr (KIND == 16 /* FusedFaninLayer MlpNorm → Cutlass GateUp */) {
+            constexpr uint32_t ROW_TILES =
+                (MODEL_SEQ_LEN + MODEL_ROW_TILE - 1) / MODEL_ROW_TILE;
+            for (uint32_t rt_idx = cta_id; rt_idx < ROW_TILES; rt_idx += NUM_CTAS) {
+                tile_mlp_norm(g, op.layer, rt_idx);
+            }
+            cooperative_groups::this_grid().sync();
+            auto* b_up = g.up_w + (size_t)op.layer
+                                      * (size_t)MODEL_INTERMEDIATE
+                                      * (size_t)MODEL_HIDDEN_DIM;
+            auto* b_gate = g.gate_w + (size_t)op.layer
+                                          * (size_t)MODEL_INTERMEDIATE
+                                          * (size_t)MODEL_HIDDEN_DIM;
+            // CP3: BIG cutlass tile (256x128x32) for the gate+up
+            // fanin's two GEMMs. This is the heaviest arm in the
+            // schedule (22 ms / 38 % of bench). Big tile was
+            // previously rejected because it raised regs across
+            // ALL other dispatch arms in the monolithic kernel —
+            // now it lives in its own __global__ with its own
+            // budget. The two GEMMs (up + gate-with-silu*mul)
+            // still run sequentially within the arm; CP4+ is the
+            // CUTLASS dual-B fused mainloop work.
+            tile_cutlass_gemm_big_lincomb(
+                g.rms_gate, b_up, g.silu_out,
+                (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+            tile_cutlass_gemm_big_silumul(
+                g.rms_gate, b_gate, g.silu_out,
+                (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+        }
+        // No default — codegen only emits instantiations for kinds
+        // that appear in the schedule, and the launcher only
+        // dispatches to those instantiations.
+
+        __syncthreads();
+        if (prof) {
+            t_outside = clock64();
+            phase_clock[op.kernel_tag] += t_outside - t_in;
+        }
+        const bool wave_coop = (op.kernel_tag == PHASE_FLASHINFER_ATTN)
+                            || (op.kernel_tag >= 10 && op.kernel_tag <= 16);
+        if (tid == 0 && (!wave_coop || cta_id == 0)) {
+            const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;
+            const uint32_t node_id = NODE_ID_FOR_OP[i];
+            rt.flags[node_id] = tick;
+        }
+        __syncthreads();
+    }
+
+    // Per-wave clock flush — accumulate as in `_one_wave` so the
+    // per-kind launcher's loop produces the same totals as the
+    // legacy kernel.
+    if (prof) {
+        const unsigned long long t_end = clock64();
+        phase_clock[IDLE_SLOT] += t_end - t_outside;
+        unsigned long long* row = rt.phase_clocks + (size_t)cta_id * NUM_CLOCK_SLOTS;
+        #pragma unroll
+        for (int p = 0; p < (int)NUM_CLOCK_SLOTS; ++p) {
+            row[p] += phase_clock[p];
+        }
+    }
+}
+
+// Explicit template instantiations for the kinds that appear in
+// this variant's schedule. Each instantiation becomes its own
+// `__global__` symbol with its own NVCC register/shmem budget.
+{%- for k in distinct_kinds %}
+template __global__ void scheduled_megakernel_{{ name }}_one_wave_kind<{{ k }}>(
+    globals_t, SchedRuntime, uint32_t);
+{%- endfor %}
+
+// Host-side per-wave kind table (CP3 launcher dispatch). Mirrors
+// each wave's `BoundKernel::kernel_tag()` so the launcher knows
+// which per-kind instantiation to call without reading device
+// memory. Codegen emits this from the coalesced DAG.
+__device__ const uint32_t WAVE_KIND_DEVICE[NUM_WAVES] = {
+{{ wave_kind_host_table }}};
+
 }  // namespace pfl_sched_{{ name }}
+
+// Mirror of the device-side WAVE_KIND table in host memory so the
+// launcher loop doesn't have to read device const arrays. Same
+// values; sized by NUM_WAVES.
+static const uint32_t WAVE_KIND_HOST_{{ name }}[] = {
+{{ wave_kind_host_table }}};
 
 extern "C" void launch_scheduled_megakernel_{{ name }}(
     // Activation buffers (bf16, [seq, dim] row-major)
@@ -2530,6 +2806,145 @@ extern "C" void launch_scheduled_megakernel_{{ name }}_per_wave(
         if (launch_err != cudaSuccess) {
             printf("scheduled_megakernel_{{ name }}_one_wave[w=%u]: cudaLaunchCooperativeKernel failed: %s\n",
                    wave_idx, cudaGetErrorString(launch_err));
+            return;
+        }
+    }
+}
+
+// CP3: per-kind launcher. Same args as the legacy launcher above.
+// Loops `cudaLaunchCooperativeKernel` over each wave, dispatching
+// to the matching per-kind `__global__` instantiation based on
+// `WAVE_KIND_HOST_{{ name }}[w]`. Each per-kind instantiation has
+// its own NVCC register / shmem budget — the cutlass arms get
+// their actual minimum register count instead of the union with
+// FlashInfer + every other kind, eliminating the spills observed
+// in the legacy kernel (~1100-1500 bytes spill loads at -Xptxas=
+// --verbose).
+extern "C" void launch_scheduled_megakernel_{{ name }}_per_kind(
+    void* hidden_states,
+    void* rms_rope,
+    void* qkv,
+    void* q_post_rope,
+    void* attn_out,
+    void* rms_gate,
+    void* silu_out,
+    void* k_cache,
+    void* v_cache,
+    const int* prefill_kv_indices,
+    const int* prefill_kv_indptr,
+    const int* prefill_qo_indptr,
+    void* attn_norm_w,
+    void* mlp_norm_w,
+    void* qkv_w,
+    void* o_w,
+    void* gate_w,
+    void* up_w,
+    void* down_w,
+    float eps,
+    float attn_scale,
+    unsigned int* flags,
+    unsigned int* tick_counter,
+    unsigned int* barrier_arrived,
+    unsigned long long* phase_clocks,
+    void* flashinfer_params,
+    cudaStream_t stream)
+{
+    pfl_sched_{{ name }}::globals_t g{
+        reinterpret_cast<__nv_bfloat16*>(hidden_states),
+        reinterpret_cast<__nv_bfloat16*>(rms_rope),
+        reinterpret_cast<__nv_bfloat16*>(qkv),
+        reinterpret_cast<__nv_bfloat16*>(q_post_rope),
+        reinterpret_cast<__nv_bfloat16*>(attn_out),
+        reinterpret_cast<__nv_bfloat16*>(rms_gate),
+        reinterpret_cast<__nv_bfloat16*>(silu_out),
+        reinterpret_cast<__nv_bfloat16*>(k_cache),
+        reinterpret_cast<__nv_bfloat16*>(v_cache),
+        prefill_kv_indices,
+        prefill_kv_indptr,
+        prefill_qo_indptr,
+        reinterpret_cast<__nv_bfloat16*>(attn_norm_w),
+        reinterpret_cast<__nv_bfloat16*>(mlp_norm_w),
+        reinterpret_cast<__nv_bfloat16*>(qkv_w),
+        reinterpret_cast<__nv_bfloat16*>(o_w),
+        reinterpret_cast<__nv_bfloat16*>(gate_w),
+        reinterpret_cast<__nv_bfloat16*>(up_w),
+        reinterpret_cast<__nv_bfloat16*>(down_w),
+        eps,
+        attn_scale,
+    };
+    pfl_sched_{{ name }}::SchedRuntime rt{
+        flags,
+        tick_counter,
+        barrier_arrived,
+        phase_clocks,
+        reinterpret_cast<pfl_sched_{{ name }}::FlashInferParams*>(flashinfer_params),
+    };
+    dim3 grid(1, pfl_sched_{{ name }}::NUM_CTAS);
+    dim3 block(pfl_sched_{{ name }}::MEGAKERNEL_NUM_THREADS);
+
+    // Same shmem sizing as the legacy launcher. Each per-kind
+    // instantiation has its own arena footprint (smaller than the
+    // union for kinds that don't use FlashInfer's 70 KiB), but for
+    // CP3-step-1 we keep the union as a conservative upper bound.
+    // CP3-step-2 will compute per-kind arenas from
+    // BoundKernel::resources().
+    constexpr size_t kCutlassBigShmem = sizeof(::pfl_cutlass::SharedStorage);
+    constexpr size_t kCutlassSmallShmem = sizeof(::pfl_cutlass_small::SharedStorage);
+    constexpr size_t kCutlassNarrowShmem = sizeof(::pfl_cutlass_narrow::SharedStorage);
+    constexpr size_t kMaxAB =
+        pfl_sched_{{ name }}::TILE_SHMEM_BYTES > pfl_sched_{{ name }}::FI_SHARED_STORAGE_BYTES
+            ? pfl_sched_{{ name }}::TILE_SHMEM_BYTES
+            : pfl_sched_{{ name }}::FI_SHARED_STORAGE_BYTES;
+    constexpr size_t kMaxABC = kMaxAB > kCutlassBigShmem ? kMaxAB : kCutlassBigShmem;
+    constexpr size_t kMaxABCD = kMaxABC > kCutlassSmallShmem ? kMaxABC : kCutlassSmallShmem;
+    constexpr size_t kSmemBytes = kMaxABCD > kCutlassNarrowShmem ? kMaxABCD : kCutlassNarrowShmem;
+
+    // Opt EACH per-kind instantiation into the larger dynamic
+    // shmem carveout. Each is its own __global__, so each needs its
+    // own cudaFuncSetAttribute call. The set is small (one per
+    // distinct kind in the schedule).
+{%- for k in distinct_kinds %}
+    {
+        auto attr_err = cudaFuncSetAttribute(
+            (const void*)pfl_sched_{{ name }}::scheduled_megakernel_{{ name }}_one_wave_kind<{{ k }}>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)kSmemBytes);
+        if (attr_err != cudaSuccess) {
+            printf("scheduled_megakernel_{{ name }}_one_wave_kind<{{ k }}>: cudaFuncSetAttribute failed: %s\n",
+                   cudaGetErrorString(attr_err));
+            return;
+        }
+    }
+{%- endfor %}
+
+    // Zero phase_clocks before the first wave so per-wave deltas
+    // accumulate cleanly across all per-kind launches.
+    if (phase_clocks != nullptr) {
+        cudaMemsetAsync(
+            phase_clocks,
+            0,
+            (size_t)pfl_sched_{{ name }}::NUM_CTAS * (size_t)17 * sizeof(unsigned long long),
+            stream);
+    }
+
+    for (uint32_t wave_idx = 0; wave_idx < pfl_sched_{{ name }}::NUM_WAVES; ++wave_idx) {
+        const uint32_t kind = WAVE_KIND_HOST_{{ name }}[wave_idx];
+        void* args[] = { &g, &rt, &wave_idx };
+        const void* fn = nullptr;
+        switch (kind) {
+{%- for k in distinct_kinds %}
+            case {{ k }}: fn = (const void*)pfl_sched_{{ name }}::scheduled_megakernel_{{ name }}_one_wave_kind<{{ k }}>; break;
+{%- endfor %}
+            default:
+                printf("scheduled_megakernel_{{ name }}_per_kind: wave %u has unknown kind %u\n",
+                       wave_idx, kind);
+                return;
+        }
+        auto launch_err = cudaLaunchCooperativeKernel(
+            fn, grid, block, args, kSmemBytes, stream);
+        if (launch_err != cudaSuccess) {
+            printf("scheduled_megakernel_{{ name }}_per_kind[w=%u, kind=%u]: cudaLaunchCooperativeKernel failed: %s\n",
+                   wave_idx, kind, cudaGetErrorString(launch_err));
             return;
         }
     }

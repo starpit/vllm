@@ -154,6 +154,33 @@ pub fn emit_scheduled_megakernel_cu(
 
     let pages_per_layer = dag.dims.seq_len.div_ceil(kv_page_size);
 
+    // ── CP3: per-wave kind table for the per-kind launcher ───────
+    // Each wave is monomorphic (the BSP scheduler enforces it):
+    // every binding placed in the wave shares one
+    // `BoundKernel::kernel_tag()`. Pull the tag of the first op of
+    // the first non-empty CTA stream as the wave's kind, and emit
+    // a host-side `WAVE_KIND_HOST[NUM_WAVES]` table the per-kind
+    // launcher reads to dispatch each wave to the right per-kind
+    // `__global__` instantiation.
+    let mut wave_kinds: Vec<u32> = Vec::with_capacity(num_waves as usize);
+    for wave in &sched.waves {
+        let mut wave_tag: u32 = 0;
+        'find_tag: for cta_stream in &wave.cta_nodes {
+            for nid in cta_stream {
+                wave_tag = dag.nodes[nid.0 as usize].kernel.kernel_tag();
+                break 'find_tag;
+            }
+        }
+        wave_kinds.push(wave_tag);
+    }
+    let mut wave_kind_host_table = String::with_capacity(wave_kinds.len() * 6);
+    for k in &wave_kinds {
+        writeln!(wave_kind_host_table, "  {},", k).unwrap();
+    }
+    let mut distinct_kinds: Vec<u32> = wave_kinds.clone();
+    distinct_kinds.sort_unstable();
+    distinct_kinds.dedup();
+
     let ctx = MegakernelCtx {
         name,
         num_nodes,
@@ -192,6 +219,9 @@ pub fn emit_scheduled_megakernel_cu(
         target_gemm_tile_n: gemm_tile_n(&profile.gemm_kernel),
         target_gemm_tile_k: gemm_tile_k(&profile.gemm_kernel),
         target_gemm_pipeline_stages: gemm_pipeline_stages(&profile.gemm_kernel),
+
+        wave_kind_host_table,
+        distinct_kinds,
     };
     ctx.render().expect("scheduled megakernel template render")
 }

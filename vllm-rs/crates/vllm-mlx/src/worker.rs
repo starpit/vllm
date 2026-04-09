@@ -463,27 +463,43 @@ impl MlxWorker {
             Ok(p) => info!("Downloaded tokenizer_config.json to {}", p.display()),
             Err(e) => warn!("Failed to download tokenizer_config.json: {e:?}"),
         }
+        // Read config.json once for both quantization detection and the
+        // encoder-vs-decoder gate below.
+        let config_str = std::fs::read_to_string(&config_path).ok();
+
         // Download quantization config files if config.json indicates GPTQ or AWQ.
-        if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-            if config_str.contains("\"gptq\"")
+        if let Some(s) = config_str.as_deref() {
+            if s.contains("\"gptq\"")
                 && let Ok(p) = repo.get("quantize_config.json")
             {
                 info!("Downloaded quantize_config.json to {}", p.display());
             }
-            if config_str.contains("\"awq\"")
+            if s.contains("\"awq\"")
                 && let Ok(p) = repo.get("quant_config.json")
             {
                 info!("Downloaded quant_config.json to {}", p.display());
             }
         }
 
+        // Sentence-transformers projection files (1_Dense/1_Pooling) only exist
+        // on encoder embedding models. For decoder LMs they're absent, and
+        // hf-hub turns each cache miss into a network HEAD (~40ms each), adding
+        // ~120ms to every warm startup. Gate the speculative fetch on the
+        // architecture string so causal LMs skip it entirely.
+        let needs_st_projection = config_str
+            .as_deref()
+            .map(|s| !s.contains("ForCausalLM") && !s.contains("ForConditionalGeneration"))
+            .unwrap_or(false);
+
         // Download weights.
         if repo.get("model.safetensors").is_ok() {
             info!("Downloaded single safetensors file");
-            // Best-effort: download sentence-transformers projection layer if present.
-            let _ = repo.get("1_Dense/model.safetensors");
-            let _ = repo.get("1_Dense/config.json");
-            let _ = repo.get("1_Pooling/config.json");
+            if needs_st_projection {
+                // Best-effort: download sentence-transformers projection layer if present.
+                let _ = repo.get("1_Dense/model.safetensors");
+                let _ = repo.get("1_Dense/config.json");
+                let _ = repo.get("1_Pooling/config.json");
+            }
             return Ok(model_dir);
         }
 

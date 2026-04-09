@@ -1772,7 +1772,12 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
             // — so only cta_id 0 stamps the validation flag, otherwise
             // the tick counter overcounts and rt.flags[node_id] gets
             // a different value than the per-CTA count.
-            const bool wave_coop = (op.kernel_tag == PHASE_FLASHINFER_ATTN);
+            // Wave-cooperative tags: FlashInfer attention (8) and the
+            // four CutlassGemmLayer phases (10..13). All four are
+            // replicated across every CTA in the wave by the scheduler,
+            // so the validation tick must only be stamped by cta_id 0.
+            const bool wave_coop = (op.kernel_tag == PHASE_FLASHINFER_ATTN)
+                                || (op.kernel_tag >= 10 && op.kernel_tag <= 13);
             if (tid == 0 && (!wave_coop || cta_id == 0)) {
                 const uint32_t tick = atomicAdd(rt.tick_counter, 1u) + 1u;
                 const uint32_t node_id = NODE_ID_FOR_OP[i];

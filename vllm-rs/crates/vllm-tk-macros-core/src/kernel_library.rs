@@ -652,9 +652,15 @@ pub fn coalesce_with_target_profile(
         coalesced = coalesce_gemm_phase(coalesced, GemmPhase::Qkv);
         coalesced = coalesce_gemm_phase(coalesced, GemmPhase::OProj);
         // GateUp coalesce currently triggers a flashinfer-attention
-        // illegal-address downstream — leaving it on the hand-written
-        // tile path until the underlying schedule/smem interaction is
-        // root-caused. See feedback in megakernel.cu case 12.
+        // illegal-address downstream — even with case 12 gutted to a
+        // bare break the compute-sanitizer flags a misaligned 4-byte
+        // __shared__ write inside flashinfer::write_o_reg_gmem at
+        // seq=1024 (works at seq=64). The dispatch helpers are
+        // identical to qkv/oproj/down which are clean, so the bug is
+        // upstream of case 12 — a wave/schedule interaction with the
+        // wave-cooperative gate_up node when multiple wave-coop nodes
+        // (gate_up + fi_attn) coexist in the same wave at large M.
+        // Leaving on the hand-written cooperative path until rooted.
         // coalesced = coalesce_gemm_phase(coalesced, GemmPhase::GateUp);
         coalesced = coalesce_gemm_phase(coalesced, GemmPhase::Down);
     }

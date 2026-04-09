@@ -452,6 +452,81 @@ pub mod ffi {
             }
         };
     }
+    // CP4: cuBLAS FFI for the GEMM-only microbench. cuBLAS exposes
+    // a stable C API; we declare just what the bench needs and link
+    // dynamically against libcublas.so.12 (build.rs adds -lcublas).
+    pub type CublasHandle = *mut std::ffi::c_void;
+    pub type CublasStatus = i32;
+    pub const CUBLAS_OP_N: i32 = 0;
+    pub const CUBLAS_OP_T: i32 = 1;
+    pub const CUDA_R_16BF: i32 = 14;
+    pub const CUBLAS_GEMM_DEFAULT: i32 = -1;
+    pub const CUBLAS_COMPUTE_32F: i32 = 68;
+    unsafe extern "C" {
+        pub fn cublasCreate_v2(handle: *mut CublasHandle) -> CublasStatus;
+        pub fn cublasDestroy_v2(handle: CublasHandle) -> CublasStatus;
+        pub fn cublasSetStream_v2(
+            handle: CublasHandle,
+            stream: *mut std::ffi::c_void,
+        ) -> CublasStatus;
+        #[allow(clippy::too_many_arguments)]
+        pub fn cublasGemmEx(
+            handle: CublasHandle,
+            transa: i32,
+            transb: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: *const f32,
+            a: *const std::ffi::c_void,
+            atype: i32,
+            lda: i32,
+            b: *const std::ffi::c_void,
+            btype: i32,
+            ldb: i32,
+            beta: *const f32,
+            c: *mut std::ffi::c_void,
+            ctype: i32,
+            ldc: i32,
+            compute_type: i32,
+            algo: i32,
+        ) -> CublasStatus;
+    }
+
+    // CP4: vllm-rs fused kernels (linked from libvllm_kernels.a). The
+    // signatures here mirror crates/vllm-cuda/src/kernels.rs for the
+    // bf16 entry points the natural sm_89 lowering would call.
+    unsafe extern "C" {
+        pub fn rms_norm_bf16(
+            out: *mut u16,
+            input: *const u16,
+            weight: *const u16,
+            epsilon: f32,
+            num_tokens: i32,
+            hidden_size: i32,
+            stream: *mut std::ffi::c_void,
+        );
+        pub fn silu_and_mul_fused_bf16(
+            out: *mut u16,
+            gate_up: *const u16,
+            num_tokens: i32,
+            d: i32,
+            stream: *mut std::ffi::c_void,
+        );
+        pub fn rotary_embedding_bf16(
+            positions: *const u32,
+            query: *mut u16,
+            key: *mut u16,
+            cos_sin_cache: *const u16,
+            rotary_dim: i32,
+            total_q_dim: i32,
+            total_k_dim: i32,
+            head_size: i32,
+            num_tokens: i32,
+            stream: *mut std::ffi::c_void,
+        );
+    }
+
     decl_scheduled_megakernel!(
         launch_scheduled_megakernel_tiny,
         launch_scheduled_megakernel_tiny_per_wave,

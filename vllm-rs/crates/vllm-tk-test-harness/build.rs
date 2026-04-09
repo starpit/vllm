@@ -254,6 +254,19 @@ fn build_cuda() {
     println!("cargo:rustc-link-search={cache_str}");
     println!("cargo:rustc-link-lib=static=tk_test_ops");
 
+    // CP4: vllm-rs's fused kernel static lib (built by the
+    // sibling vllm-kernels-cuda crate). The harness FFIs the
+    // bf16 entry points (`fused_add_rms_norm_bf16`,
+    // `silu_and_mul_fused_bf16`, `fused_qkv_rope_cache_bf16`)
+    // directly so the natural sm_89 lowering can call vllm-rs's
+    // fused kernels as host-callback implementations — same code
+    // path as vllm-rs eager.
+    let vllm_kernels_dir = std::env::var("HOME")
+        .map(|h| format!("{h}/.cache/cudaforge/vllm-cuda"))
+        .unwrap_or_else(|_| "/tmp/cudaforge/vllm-cuda".into());
+    println!("cargo:rustc-link-search={vllm_kernels_dir}");
+    println!("cargo:rustc-link-lib=static=vllm_kernels");
+
     // CUDA toolkit
     let cuda_path = std::env::var("CUDA_PATH")
         .or_else(|_| std::env::var("CUDA_HOME"))
@@ -261,6 +274,9 @@ fn build_cuda() {
     println!("cargo:rustc-link-search={cuda_path}/lib64");
     println!("cargo:rustc-link-search={cuda_path}/lib");
     println!("cargo:rustc-link-lib=static=cudart_static");
+    // CP4: cuBLAS for the GEMM host-callback implementation.
+    println!("cargo:rustc-link-lib=dylib=cublas");
+    println!("cargo:rustc-link-lib=dylib=cublasLt");
     println!("cargo:rustc-link-lib=dylib=rt");
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=stdc++");

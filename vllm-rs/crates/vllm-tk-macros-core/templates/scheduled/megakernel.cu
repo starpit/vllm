@@ -204,6 +204,73 @@ namespace pfl_cutlass_small {
                   "pfl_cutlass_small ThreadblockMma WarpCount must equal 8 (256 threads)");
 }  // namespace pfl_cutlass_small
 
+// ── pfl_cutlass_narrow: 128x64x32 / 4-stage. Polyalgo alternative
+//    for narrow-N phases (qkv N=3072, oproj/down N=2048) where the
+//    128x128 tile leaves CTA work-unit rounding waste. With N/64 col
+//    tiles instead of N/128, the work_units / num_ctas ratio is
+//    closer to integer for these shapes, so the cost-gated polyalgo
+//    coalesce sometimes picks Narrow over Small. The cost model
+//    decides per phase via the BoundKernel::cost branch that calls
+//    CostModel::cutlass_gemm_per_cta with this tile's dims.
+namespace pfl_cutlass_narrow {
+    using ElementA       = cutlass::bfloat16_t;
+    using ElementB       = cutlass::bfloat16_t;
+    using ElementAccum   = float;
+    using LayoutA        = cutlass::layout::RowMajor;
+    using LayoutB        = cutlass::layout::ColumnMajor;
+    using LayoutC        = cutlass::layout::RowMajor;
+
+    using ThreadblockShape = cutlass::gemm::GemmShape<128, 64, 32>;
+    // WarpShape (32, 32) gives WarpCount = (128/32) × (64/32) = 4 × 2 = 8
+    // warps total = 256 threads, matching the megakernel CTA size.
+    using WarpShape        = cutlass::gemm::GemmShape<32, 32, 32>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using DefaultMmaT = cutlass::gemm::threadblock::DefaultMma<
+        ElementA, LayoutA, /*kAlignmentA=*/8,
+        ElementB, LayoutB, /*kAlignmentB=*/8,
+        ElementAccum, LayoutC,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        ThreadblockShape, WarpShape, InstructionShape,
+        /*Stages=*/4,
+        cutlass::arch::OpMultiplyAdd>;
+
+    using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;
+    using IteratorA      = typename DefaultMmaT::IteratorA;
+    using IteratorB      = typename DefaultMmaT::IteratorB;
+    using MmaSharedStorage = typename ThreadblockMma::SharedStorage;
+
+    using ElementOutput = cutlass::bfloat16_t;
+    static constexpr int kEpilogueElementsPerAccess = 8;
+    using OutputOpT = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpT, kEpilogueElementsPerAccess>;
+    using Epilogue              = typename DefaultEpilogueT::Epilogue;
+    using OutputTileIterator    = typename DefaultEpilogueT::OutputTileIterator;
+    using EpilogueSharedStorage = typename Epilogue::SharedStorage;
+
+    using OutputOpSiluMul = ::pfl_cutlass::LinearCombinationSiluMul<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueSiluMulT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpSiluMul, kEpilogueElementsPerAccess>;
+    using EpilogueSiluMul = typename DefaultEpilogueSiluMulT::Epilogue;
+
+    union SharedStorage {
+        MmaSharedStorage main_loop;
+        EpilogueSharedStorage epilogue;
+    };
+
+    static_assert(sizeof(SharedStorage) <= 99 * 1024,
+                  "pfl_cutlass_narrow SharedStorage exceeds 99KB sm89 dynamic shmem cap");
+    static constexpr int kCutlassThreads = ThreadblockMma::WarpCount::kCount * 32;
+    static_assert(kCutlassThreads == 256,
+                  "pfl_cutlass_narrow ThreadblockMma WarpCount must equal 8 (256 threads)");
+}  // namespace pfl_cutlass_narrow
+
 // ── Prelude: schedule data tables + model dim constants ──────────────
 namespace pfl_sched_{{ name }} {
 
@@ -1566,6 +1633,24 @@ __device__ __forceinline__ void tile_cutlass_gemm_small_silumul(
                            ::pfl_cutlass_small::OutputOpSiluMul)
 }
 
+__device__ __forceinline__ void tile_cutlass_gemm_narrow_lincomb(
+    __nv_bfloat16* a_ptr, __nv_bfloat16* b_ptr, __nv_bfloat16* out_ptr,
+    int M, int K, int N, float beta_value,
+    char* dyn_smem, uint32_t cta_id_in_grid)
+{
+    TILE_CUTLASS_GEMM_BODY(::pfl_cutlass_narrow, ::pfl_cutlass_narrow::Epilogue,
+                           ::pfl_cutlass_narrow::OutputOpT)
+}
+
+__device__ __forceinline__ void tile_cutlass_gemm_narrow_silumul(
+    __nv_bfloat16* a_ptr, __nv_bfloat16* b_ptr, __nv_bfloat16* out_ptr,
+    int M, int K, int N, float beta_value,
+    char* dyn_smem, uint32_t cta_id_in_grid)
+{
+    TILE_CUTLASS_GEMM_BODY(::pfl_cutlass_narrow, ::pfl_cutlass_narrow::EpilogueSiluMul,
+                           ::pfl_cutlass_narrow::OutputOpSiluMul)
+}
+
 #undef TILE_CUTLASS_GEMM_BODY
 
 // Grid-wide barrier via a single global counter. Every CTA's thread 0 bumps
@@ -1663,92 +1748,101 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                 case PHASE_GATE_UP:   tile_gate_up  (g, op.layer, op.row, op.col, tile_smem); break;
                 case PHASE_DOWN:      tile_down     (g, op.layer, op.row, op.col, tile_smem); break;
                 case 10 /* CutlassGemmLayer { Qkv } */: {
-                    // QKV: A=g.rms_rope [seq, HD], B=g.qkv_w[layer]
-                    // [QKV_DIM_FULL, HD], C=g.qkv [seq, QKV_DIM_FULL].
-                    // beta=0 (plain store). pfl_cutlass_small.
+                    // QKV. The polyalgo cost gate picks the tile shape
+                    // (Small=128x128, Narrow=128x64) per phase shape;
+                    // we read the choice from `op.col` (0=Small,
+                    // 1=Narrow) at runtime and dispatch to the matching
+                    // helper. Both helpers exist in the binary; the
+                    // compiler doesn't know which fires per call site,
+                    // so it keeps both alive.
                     constexpr uint32_t QKV_DIM_FULL =
                         (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
-                    tile_cutlass_gemm_small_lincomb(
-                        g.rms_rope,
-                        g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
-                                                   * (size_t)MODEL_HIDDEN_DIM,
-                        g.qkv,
-                        /*M=*/(int)MODEL_SEQ_LEN,
-                        /*K=*/(int)MODEL_HIDDEN_DIM,
-                        /*N=*/(int)QKV_DIM_FULL,
-                        /*beta=*/0.0f,
-                        (char*)tile_smem_dyn, cta_id);
+                    auto* a_ptr = g.rms_rope;
+                    auto* b_ptr = g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
+                                                              * (size_t)MODEL_HIDDEN_DIM;
+                    auto* out_ptr = g.qkv;
+                    if (op.col == 0u) {
+                        tile_cutlass_gemm_small_lincomb(
+                            a_ptr, b_ptr, out_ptr,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                            /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                    } else {
+                        tile_cutlass_gemm_narrow_lincomb(
+                            a_ptr, b_ptr, out_ptr,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                            /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                    }
                     break;
                 }
                 case 11 /* CutlassGemmLayer { OProj } */: {
-                    // o_proj + residual: A=g.attn_out [seq, HD],
-                    // B=g.o_w[layer] [HD, HD], C=g.hidden_states [seq, HD].
-                    // beta=1 (residual add). pfl_cutlass_small.
-                    tile_cutlass_gemm_small_lincomb(
-                        g.attn_out,
-                        g.o_w + (size_t)op.layer * (size_t)MODEL_HIDDEN_DIM
-                                                 * (size_t)MODEL_HIDDEN_DIM,
-                        g.hidden_states,
-                        /*M=*/(int)MODEL_SEQ_LEN,
-                        /*K=*/(int)MODEL_HIDDEN_DIM,
-                        /*N=*/(int)MODEL_HIDDEN_DIM,
-                        /*beta=*/1.0f,
-                        (char*)tile_smem_dyn, cta_id);
+                    // o_proj + residual. Polyalgo via op.col.
+                    auto* a_ptr = g.attn_out;
+                    auto* b_ptr = g.o_w + (size_t)op.layer * (size_t)MODEL_HIDDEN_DIM
+                                                            * (size_t)MODEL_HIDDEN_DIM;
+                    auto* out_ptr = g.hidden_states;
+                    if (op.col == 0u) {
+                        tile_cutlass_gemm_small_lincomb(
+                            a_ptr, b_ptr, out_ptr,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_HIDDEN_DIM,
+                            /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                    } else {
+                        tile_cutlass_gemm_narrow_lincomb(
+                            a_ptr, b_ptr, out_ptr,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_HIDDEN_DIM,
+                            /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                    }
                     break;
                 }
                 case 12 /* CutlassGemmLayer { GateUp } */: {
-                    // Two cutlass-small calls sharing A=g.rms_gate.
-                    //   1. up   = rms_gate × up_w[layer]   → silu_out (β=0)
-                    //   2. silu_out = silu(rms_gate × gate_w[layer]) * silu_out
-                    //      via the LinearCombinationSiluMul epilogue.
-                    //
-                    // No inter-pass grid sync: each CTA owns the same
-                    // (M_tile, N_tile) work units in both cutlass calls,
-                    // so the silumul epilogue's read of silu_out[m,n]
-                    // is exactly what THIS CTA wrote in the up pass.
-                    // CTA-local dataflow, no cross-CTA visibility needed.
+                    // gate+up. Polyalgo via op.col. Both passes use
+                    // the same tile shape — they share the (M_tile,
+                    // N_tile) iteration order for the CTA-local
+                    // silu_out dataflow trick to work.
                     auto* b_up = g.up_w + (size_t)op.layer
                                               * (size_t)MODEL_INTERMEDIATE
                                               * (size_t)MODEL_HIDDEN_DIM;
                     auto* b_gate = g.gate_w + (size_t)op.layer
                                                   * (size_t)MODEL_INTERMEDIATE
                                                   * (size_t)MODEL_HIDDEN_DIM;
-                    tile_cutlass_gemm_small_lincomb(
-                        g.rms_gate, b_up, g.silu_out,
-                        /*M=*/(int)MODEL_SEQ_LEN,
-                        /*K=*/(int)MODEL_HIDDEN_DIM,
-                        /*N=*/(int)MODEL_INTERMEDIATE,
-                        /*beta=*/0.0f,
-                        (char*)tile_smem_dyn, cta_id);
-                    tile_cutlass_gemm_small_silumul(
-                        g.rms_gate, b_gate, g.silu_out,
-                        /*M=*/(int)MODEL_SEQ_LEN,
-                        /*K=*/(int)MODEL_HIDDEN_DIM,
-                        /*N=*/(int)MODEL_INTERMEDIATE,
-                        /*beta=*/1.0f, // unused by SiluMul
-                        (char*)tile_smem_dyn, cta_id);
+                    if (op.col == 0u) {
+                        tile_cutlass_gemm_small_lincomb(
+                            g.rms_gate, b_up, g.silu_out,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                            /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                        tile_cutlass_gemm_small_silumul(
+                            g.rms_gate, b_gate, g.silu_out,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                            /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                    } else {
+                        tile_cutlass_gemm_narrow_lincomb(
+                            g.rms_gate, b_up, g.silu_out,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                            /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                        tile_cutlass_gemm_narrow_silumul(
+                            g.rms_gate, b_gate, g.silu_out,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                            /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                    }
                     break;
                 }
                 case 13 /* CutlassGemmLayer { Down } */: {
-                    // down + residual. pfl_cutlass_small (128x128x32).
-                    // Tried big (256x128x32): down went 10.22 → 13.75 ms,
-                    // probably because for down's M=1024, K=8192, N=2048
-                    // shape, total_work_cta = 4 × 16 = 64 ops / 58 CTAs
-                    // ≈ 1 per CTA — not enough work to amortize the
-                    // bigger tile's shmem footprint and accumulator
-                    // state. Small tile's 128 ops / 58 ≈ 2 per CTA
-                    // packs better.
-                    tile_cutlass_gemm_small_lincomb(
-                        g.silu_out,
-                        g.down_w + (size_t)op.layer
-                                       * (size_t)MODEL_HIDDEN_DIM
-                                       * (size_t)MODEL_INTERMEDIATE,
-                        g.hidden_states,
-                        /*M=*/(int)MODEL_SEQ_LEN,
-                        /*K=*/(int)MODEL_INTERMEDIATE,
-                        /*N=*/(int)MODEL_HIDDEN_DIM,
-                        /*beta=*/1.0f,
-                        (char*)tile_smem_dyn, cta_id);
+                    // down + residual. Polyalgo via op.col.
+                    auto* a_ptr = g.silu_out;
+                    auto* b_ptr = g.down_w + (size_t)op.layer
+                                                  * (size_t)MODEL_HIDDEN_DIM
+                                                  * (size_t)MODEL_INTERMEDIATE;
+                    auto* out_ptr = g.hidden_states;
+                    if (op.col == 0u) {
+                        tile_cutlass_gemm_small_lincomb(
+                            a_ptr, b_ptr, out_ptr,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_INTERMEDIATE, (int)MODEL_HIDDEN_DIM,
+                            /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                    } else {
+                        tile_cutlass_gemm_narrow_lincomb(
+                            a_ptr, b_ptr, out_ptr,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_INTERMEDIATE, (int)MODEL_HIDDEN_DIM,
+                            /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                    }
                     break;
                 }
                 case PHASE_FLASHINFER_ATTN: {
@@ -1802,16 +1896,21 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                     cooperative_groups::this_grid().sync();
                     constexpr uint32_t QKV_DIM_FULL =
                         (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
-                    tile_cutlass_gemm_small_lincomb(
-                        g.rms_rope,
-                        g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
-                                                   * (size_t)MODEL_HIDDEN_DIM,
-                        g.qkv,
-                        /*M=*/(int)MODEL_SEQ_LEN,
-                        /*K=*/(int)MODEL_HIDDEN_DIM,
-                        /*N=*/(int)QKV_DIM_FULL,
-                        /*beta=*/0.0f,
-                        (char*)tile_smem_dyn, cta_id);
+                    auto* a_ptr = g.rms_rope;
+                    auto* b_ptr = g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
+                                                              * (size_t)MODEL_HIDDEN_DIM;
+                    auto* out_ptr = g.qkv;
+                    if (op.col == 0u) {
+                        tile_cutlass_gemm_small_lincomb(
+                            a_ptr, b_ptr, out_ptr,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                            /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                    } else {
+                        tile_cutlass_gemm_narrow_lincomb(
+                            a_ptr, b_ptr, out_ptr,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)QKV_DIM_FULL,
+                            /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                    }
                     break;
                 }
                 case 15 /* FusedFaninLayer { Rope → FlashInfer attention } */: {
@@ -1839,29 +1938,25 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                     auto* b_gate = g.gate_w + (size_t)op.layer
                                                   * (size_t)MODEL_INTERMEDIATE
                                                   * (size_t)MODEL_HIDDEN_DIM;
-                    tile_cutlass_gemm_small_lincomb(
-                        g.rms_gate, b_up, g.silu_out,
-                        /*M=*/(int)MODEL_SEQ_LEN,
-                        /*K=*/(int)MODEL_HIDDEN_DIM,
-                        /*N=*/(int)MODEL_INTERMEDIATE,
-                        /*beta=*/0.0f,
-                        (char*)tile_smem_dyn, cta_id);
-                    // NO inter-pass grid sync: each CTA owns the same
-                    // (M_tile, N_tile) work units in both cutlass calls
-                    // (the `for (wu = cta_id; wu < total_work; wu += NUM_CTAS)`
-                    // distribution is deterministic across calls), so the
-                    // silumul epilogue's read of silu_out[m,n] is exactly
-                    // what THIS CTA wrote in the up pass — CTA-local
-                    // dataflow, no cross-CTA visibility needed. The
-                    // __syncthreads at the end of the cutlass body loop
-                    // handles intra-block ordering.
-                    tile_cutlass_gemm_small_silumul(
-                        g.rms_gate, b_gate, g.silu_out,
-                        /*M=*/(int)MODEL_SEQ_LEN,
-                        /*K=*/(int)MODEL_HIDDEN_DIM,
-                        /*N=*/(int)MODEL_INTERMEDIATE,
-                        /*beta=*/1.0f, // unused by SiluMul
-                        (char*)tile_smem_dyn, cta_id);
+                    if (op.col == 0u) {
+                        tile_cutlass_gemm_small_lincomb(
+                            g.rms_gate, b_up, g.silu_out,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                            /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                        tile_cutlass_gemm_small_silumul(
+                            g.rms_gate, b_gate, g.silu_out,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                            /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                    } else {
+                        tile_cutlass_gemm_narrow_lincomb(
+                            g.rms_gate, b_up, g.silu_out,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                            /*beta=*/0.0f, (char*)tile_smem_dyn, cta_id);
+                        tile_cutlass_gemm_narrow_silumul(
+                            g.rms_gate, b_gate, g.silu_out,
+                            (int)MODEL_SEQ_LEN, (int)MODEL_HIDDEN_DIM, (int)MODEL_INTERMEDIATE,
+                            /*beta=*/1.0f, (char*)tile_smem_dyn, cta_id);
+                    }
                     break;
                 }
                 default: break;
@@ -2004,12 +2099,14 @@ extern "C" void launch_scheduled_megakernel_{{ name }}(
     // (rendered from `TargetProfile::max_dynamic_shmem_bytes`).
     constexpr size_t kCutlassBigShmem = sizeof(::pfl_cutlass::SharedStorage);
     constexpr size_t kCutlassSmallShmem = sizeof(::pfl_cutlass_small::SharedStorage);
+    constexpr size_t kCutlassNarrowShmem = sizeof(::pfl_cutlass_narrow::SharedStorage);
     constexpr size_t kMaxAB =
         pfl_sched_{{ name }}::TILE_SHMEM_BYTES > pfl_sched_{{ name }}::FI_SHARED_STORAGE_BYTES
             ? pfl_sched_{{ name }}::TILE_SHMEM_BYTES
             : pfl_sched_{{ name }}::FI_SHARED_STORAGE_BYTES;
     constexpr size_t kMaxABC = kMaxAB > kCutlassBigShmem ? kMaxAB : kCutlassBigShmem;
-    constexpr size_t kSmemBytes = kMaxABC > kCutlassSmallShmem ? kMaxABC : kCutlassSmallShmem;
+    constexpr size_t kMaxABCD = kMaxABC > kCutlassSmallShmem ? kMaxABC : kCutlassSmallShmem;
+    constexpr size_t kSmemBytes = kMaxABCD > kCutlassNarrowShmem ? kMaxABCD : kCutlassNarrowShmem;
     static_assert(kSmemBytes <= pfl_sched_{{ name }}::TARGET_MAX_DYNAMIC_SHMEM_BYTES,
                   "megakernel SharedStorage exceeds target.max_dynamic_shmem_bytes");
 

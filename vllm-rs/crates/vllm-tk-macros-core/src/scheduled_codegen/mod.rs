@@ -102,15 +102,40 @@ pub fn emit_scheduled_megakernel_cu(
                     // also stash it in the WAVE_OPS `row` slot for
                     // cross-checking from device code, but the dispatch
                     // arm normally selects on `kernel_tag` (10..13)
-                    // which already encodes the phase.
-                    BoundKernel::CutlassGemmLayer { layer, phase } => {
-                        (layer as u32, phase.tag(), 0)
+                    // which already encodes the phase. The `col` slot
+                    // carries the polyalgo tile choice (0=Small,
+                    // 1=Narrow), read at runtime by the dispatch arm
+                    // to pick which cutlass helper to call.
+                    BoundKernel::CutlassGemmLayer { layer, phase, tile } => {
+                        let tile_tag: u32 = match tile {
+                            crate::kernel_library::CutlassTile::Small => 0,
+                            crate::kernel_library::CutlassTile::Narrow => 1,
+                        };
+                        (layer as u32, phase.tag(), tile_tag)
                     }
-                    // FusedFaninLayer encodes producer/consumer in the
-                    // kernel_tag (14..16); the WAVE_OPS row/col slots
-                    // are unused — the dispatch arm reads `op.layer`
-                    // and the rest is implicit in the tag.
-                    BoundKernel::FusedFaninLayer { layer, .. } => (layer as u32, 0, 0),
+                    // FusedFaninLayer encodes the producer phase in
+                    // the kernel_tag (14..16) and the consumer's
+                    // polyalgo tile choice (for CutlassGemm consumers)
+                    // in the `col` slot — same encoding as the
+                    // CutlassGemmLayer arm so the fan-in dispatch arm
+                    // can dispatch to the matching narrow/small
+                    // cutlass helper.
+                    BoundKernel::FusedFaninLayer {
+                        layer, consumer, ..
+                    } => {
+                        let tile_tag: u32 = match consumer {
+                            crate::kernel_library::FaninConsumer::CutlassGemm(
+                                _,
+                                crate::kernel_library::CutlassTile::Small,
+                            ) => 0,
+                            crate::kernel_library::FaninConsumer::CutlassGemm(
+                                _,
+                                crate::kernel_library::CutlassTile::Narrow,
+                            ) => 1,
+                            crate::kernel_library::FaninConsumer::FlashInferAttention => 0,
+                        };
+                        (layer as u32, 0, tile_tag)
+                    }
                 };
                 ops.push((tag, layer, row, col));
                 node_ids.push(nid.0);

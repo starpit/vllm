@@ -96,14 +96,20 @@ impl CostModel {
         }
     }
 
-    /// Per-CTA cost for a wave-cooperative cutlass GEMM at a given
-    /// (M, K, N, tile_M, tile_N, tile_K) shape. The threadblock
-    /// processes work units in a strided loop over `cta_id`, so the
-    /// per-CTA cost is `ceil(work_units / num_ctas) * per_tile_mma`.
-    /// Bin-pack rounding makes smaller tiles win when M*N is small
-    /// relative to `num_ctas * tile_M * tile_N` (e.g. qkv at
-    /// M=1024, N=3072) — they leave fewer wasted CTA-slots.
-    pub fn cutlass_gemm_per_cta(
+    /// Total work for a wave-cooperative cutlass GEMM at a given
+    /// (M, K, N, tile_M, tile_N, tile_K) shape, in mma units. Returns
+    /// the *post-scheduling* total: `num_ctas × ceil(work_units /
+    /// num_ctas) × per_tile_mma`. This bakes in the bin-pack rounding
+    /// waste explicitly so the cost model can distinguish tile shapes
+    /// — smaller tiles tend to leave fewer idle CTA slots when
+    /// `work_units` is small relative to `num_ctas`.
+    ///
+    /// **Convention**: `BoundKernel::cost` returns TOTAL work that
+    /// `partition_into_waves` then divides by `num_ctas` for
+    /// wave-cooperative bindings (`per_cta = ceil(total / num_ctas)`).
+    /// We multiply by `num_ctas` at the end here so the partitioner's
+    /// later division gives back the per-CTA value we actually want.
+    pub fn cutlass_gemm_total(
         &self,
         m: u32,
         n: u32,
@@ -117,12 +123,15 @@ impl CostModel {
         let work_units = row_tiles * col_tiles;
         let k_iters = k.div_ceil(tile_k);
         // Per-tile mma instruction count: tile_m/16 × tile_n/8 × tile_k/16
-        // (sm89 mma is m16n8k16). We approximate the per-tile cost in
-        // mma units as the inner-loop count (k_iters × per-iter mmas).
+        // (sm89 mma is m16n8k16).
         let mma_per_iter = (tile_m / 16) * (tile_n / 8) * (tile_k / 16);
         let per_tile_mma = k_iters * mma_per_iter;
         let per_cta_units = work_units.div_ceil(self.num_ctas);
-        per_cta_units * per_tile_mma
+        // Pre-multiply by num_ctas so partition_into_waves' div_ceil
+        // recovers per_cta_units * per_tile_mma per CTA — i.e. we
+        // explicitly account for the bin-pack rounding waste here
+        // and the partitioner's later division is exact.
+        per_cta_units * per_tile_mma * self.num_ctas
     }
 
     fn gemm_compute(m: u32, n: u32, k: u32) -> u32 {

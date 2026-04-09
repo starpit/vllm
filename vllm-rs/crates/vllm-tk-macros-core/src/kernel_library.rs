@@ -91,7 +91,19 @@ pub enum BoundKernel {
     /// and the right epilogue (LinearCombinationSiluMul for gate_up,
     /// LinearCombination(beta=1) residual-add for o_proj/down,
     /// LinearCombination(beta=0) for qkv).
-    CutlassGemmLayer { layer: u16, phase: GemmPhase },
+    ///
+    /// `tile` selects which cutlass tile-shape namespace the dispatch
+    /// arm uses. The cost-gated polyalgo coalesce in
+    /// `coalesce_with_target_profile` tries each available tile per
+    /// phase and picks the one that minimizes `score_dag` — different
+    /// (M, N) shapes prefer different tiles because of bin-pack
+    /// rounding (small phases like qkv N=3072 leave CTAs idle with
+    /// 128x128, fewer with 128x64).
+    CutlassGemmLayer {
+        layer: u16,
+        phase: GemmPhase,
+        tile: CutlassTile,
+    },
 
     /// Fan-in fusion: a per-row producer phase whose entire fan
     /// terminates in a single wave-cooperative consumer for the same
@@ -118,10 +130,49 @@ pub enum BoundKernel {
 /// Which wave-cooperative consumer kind a [`BoundKernel::FusedFaninLayer`]
 /// node wraps. Carried by value (not `Box<BoundKernel>`) so the variant
 /// stays `Copy`-friendly and the codegen can match on it directly.
+///
+/// `CutlassGemm` carries the tile choice so the polyalgo decision the
+/// cost gate made before the fan-in absorption is preserved through
+/// the fusion — the fan-in dispatch arm reads the tile from the
+/// FusedFaninLayer's `consumer` field and dispatches to the matching
+/// cutlass helper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FaninConsumer {
-    CutlassGemm(GemmPhase),
+    CutlassGemm(GemmPhase, CutlassTile),
     FlashInferAttention,
+}
+
+/// Polyalgorithmic tile-shape choice for [`BoundKernel::CutlassGemmLayer`].
+/// Each variant maps to a vendored cutlass namespace in
+/// `templates/scheduled/megakernel.cu` (`pfl_cutlass_*`) with a
+/// matching `tile_cutlass_gemm_*_lincomb` / `_silumul` helper.
+///
+/// Adding a tile is: a new namespace + helper(s) in megakernel.cu, a
+/// new variant here, a new dispatch tag in `kernel_tag()`, and the
+/// matching `(tile_m, tile_n, tile_k)` constants returned by
+/// `tile_dims()`. The polyalgo coalesce in
+/// `coalesce_with_target_profile` will then automatically search the
+/// new variant per phase via `try_coalesce`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CutlassTile {
+    /// `pfl_cutlass_small`: 128x128x32, 4 cp.async stages.
+    Small,
+    /// `pfl_cutlass_narrow`: 128x64x32, 4 cp.async stages. Wins for
+    /// narrow-N phases (qkv N=3072, oproj/down N=2048) where 128x128
+    /// would leave CTAs idle from `ceil(work_units / NUM_CTAS)`
+    /// rounding waste.
+    Narrow,
+}
+
+impl CutlassTile {
+    /// Returns `(tile_m, tile_n, tile_k)` for cost-model scoring.
+    /// These must match the cutlass namespace's `ThreadblockShape`.
+    pub const fn tile_dims(self) -> (u32, u32, u32) {
+        match self {
+            CutlassTile::Small => (128, 128, 32),
+            CutlassTile::Narrow => (128, 64, 32),
+        }
+    }
 }
 
 /// Which of the four GEMM phases a [`BoundKernel::CutlassGemmLayer`]
@@ -187,22 +238,26 @@ impl BoundKernel {
         match self {
             BoundKernel::HandWrittenRowTile { phase, .. } => phase.name(),
             BoundKernel::FlashInferAttentionLayer { .. } => "flashinfer_attention_layer",
-            BoundKernel::CutlassGemmLayer { phase, .. } => match phase {
-                GemmPhase::Qkv => "cutlass_gemm_qkv_layer",
-                GemmPhase::OProj => "cutlass_gemm_o_proj_layer",
-                GemmPhase::GateUp => "cutlass_gemm_gate_up_layer",
-                GemmPhase::Down => "cutlass_gemm_down_layer",
+            BoundKernel::CutlassGemmLayer { phase, tile, .. } => match (phase, tile) {
+                (GemmPhase::Qkv, CutlassTile::Small) => "cutlass_gemm_qkv_layer_small",
+                (GemmPhase::Qkv, CutlassTile::Narrow) => "cutlass_gemm_qkv_layer_narrow",
+                (GemmPhase::OProj, CutlassTile::Small) => "cutlass_gemm_o_proj_layer_small",
+                (GemmPhase::OProj, CutlassTile::Narrow) => "cutlass_gemm_o_proj_layer_narrow",
+                (GemmPhase::GateUp, CutlassTile::Small) => "cutlass_gemm_gate_up_layer_small",
+                (GemmPhase::GateUp, CutlassTile::Narrow) => "cutlass_gemm_gate_up_layer_narrow",
+                (GemmPhase::Down, CutlassTile::Small) => "cutlass_gemm_down_layer_small",
+                (GemmPhase::Down, CutlassTile::Narrow) => "cutlass_gemm_down_layer_narrow",
             },
             BoundKernel::FusedFaninLayer {
                 producer_phase,
                 consumer,
                 ..
             } => match (producer_phase, consumer) {
-                (Phase::AttnNorm, FaninConsumer::CutlassGemm(GemmPhase::Qkv)) => {
+                (Phase::AttnNorm, FaninConsumer::CutlassGemm(GemmPhase::Qkv, _)) => {
                     "fanin_attn_norm_cutlass_qkv"
                 }
                 (Phase::Rope, FaninConsumer::FlashInferAttention) => "fanin_rope_fi_attn",
-                (Phase::MlpNorm, FaninConsumer::CutlassGemm(GemmPhase::GateUp)) => {
+                (Phase::MlpNorm, FaninConsumer::CutlassGemm(GemmPhase::GateUp, _)) => {
                     "fanin_mlp_norm_cutlass_gate_up"
                 }
                 _ => "fanin_unknown",
@@ -286,6 +341,11 @@ impl BoundKernel {
             // tag per (producer, consumer) combo keeps the dispatch
             // switch trivial — no need to decode producer_phase /
             // consumer from the op stream's row/col slots.
+            // Per-phase tag (10..13). The tile choice is encoded in
+            // the WAVE_OPS `col` slot (`tile_tag`) and the dispatch
+            // arm switches on it to pick the right cutlass helper.
+            // Keeps the dispatch switch flat — 4 arms instead of 8 —
+            // and the compiler inlines both helper branches per arm.
             BoundKernel::CutlassGemmLayer { phase, .. } => match phase {
                 GemmPhase::Qkv => 10,
                 GemmPhase::OProj => 11,
@@ -297,9 +357,9 @@ impl BoundKernel {
                 consumer,
                 ..
             } => match (producer_phase, consumer) {
-                (Phase::AttnNorm, FaninConsumer::CutlassGemm(GemmPhase::Qkv)) => 14,
+                (Phase::AttnNorm, FaninConsumer::CutlassGemm(GemmPhase::Qkv, _)) => 14,
                 (Phase::Rope, FaninConsumer::FlashInferAttention) => 15,
-                (Phase::MlpNorm, FaninConsumer::CutlassGemm(GemmPhase::GateUp)) => 16,
+                (Phase::MlpNorm, FaninConsumer::CutlassGemm(GemmPhase::GateUp, _)) => 16,
                 // Future fan-in patterns claim 17+ here; the megakernel
                 // template gains a matching dispatch arm at the same
                 // time. Until then, panic clearly so we don't silently
@@ -336,9 +396,32 @@ impl BoundKernel {
             // and same caveats about over-estimation. Wave-cooperative
             // execution means all CTAs participate, so per-CTA cost
             // distribution doesn't matter — only the wave-level total.
-            BoundKernel::CutlassGemmLayer { phase, .. } => {
-                let row_tiles = model.seq_len.div_ceil(model.row_tile);
-                row_tiles * model.cost(phase.source_phase())
+            // Cost is now polyalgo-aware: it depends on the chosen
+            // tile shape via bin-pack rounding. The cost-gated coalesce
+            // search uses this to pick the cheaper tile per phase
+            // shape — small tiles win for narrow-N (qkv N=3072,
+            // oproj/down N=2048) where 128x128 leaves work-unit
+            // rounding waste; the larger tile wins for fat-N (gate_up
+            // N=8192) where there are enough tiles to amortize.
+            BoundKernel::CutlassGemmLayer { phase, tile, .. } => {
+                let m = model.seq_len;
+                let k = match phase {
+                    GemmPhase::Qkv => model.hidden_dim,
+                    GemmPhase::OProj => model.hidden_dim,
+                    GemmPhase::GateUp => model.hidden_dim,
+                    GemmPhase::Down => model.intermediate_dim,
+                };
+                let n = match phase {
+                    GemmPhase::Qkv => {
+                        // (num_attn_h + 2 * num_kv_h) * head_dim
+                        (model.num_attn_heads + 2 * model.num_kv_heads) * model.head_dim
+                    }
+                    GemmPhase::OProj => model.hidden_dim,
+                    GemmPhase::GateUp => model.intermediate_dim,
+                    GemmPhase::Down => model.hidden_dim,
+                };
+                let (tm, tn, tk) = tile.tile_dims();
+                model.cutlass_gemm_total(m, n, k, tm, tn, tk)
             }
             // Fan-in fusion: total work = producer fan + intra-arm
             // grid sync + consumer. The intra-arm sync exists because
@@ -365,7 +448,7 @@ impl BoundKernel {
                 let row_tiles = model.seq_len.div_ceil(model.row_tile);
                 let producer_cost = row_tiles * model.cost(*producer_phase);
                 let consumer_cost = match consumer {
-                    FaninConsumer::CutlassGemm(p) => row_tiles * model.cost(p.source_phase()),
+                    FaninConsumer::CutlassGemm(p, _) => row_tiles * model.cost(p.source_phase()),
                     FaninConsumer::FlashInferAttention => row_tiles * model.cost(Phase::Attention),
                 };
                 producer_cost + (BARRIER_COST_MMA_UNITS as u32) + consumer_cost
@@ -611,9 +694,55 @@ fn renumber_dense_ids(nodes: &mut [CoalescedNode]) {
 /// composed.** The combined entry point
 /// `coalesce_with_target_profile` runs whichever rules the profile
 /// asks for, in dependency-safe order.
-pub fn coalesce_gemm_phase(input: CoalescedDag, gemm_phase: GemmPhase) -> CoalescedDag {
+pub fn coalesce_gemm_phase(
+    input: CoalescedDag,
+    gemm_phase: GemmPhase,
+    tile: CutlassTile,
+) -> CoalescedDag {
     use std::collections::{HashMap, HashSet};
     let source_phase = gemm_phase.source_phase();
+
+    // Polyalgo retile: if the input already contains CutlassGemmLayer
+    // nodes for this phase (because a previous polyalgo iteration
+    // already coalesced it with a different tile), the producer
+    // HandWrittenRowTile nodes are gone — there's nothing left to
+    // absorb. In that case the only thing this call can usefully do
+    // is rewrite the tile field of the existing CutlassGemmLayer
+    // nodes for this phase, so the cost gate can compare different
+    // tile shapes via try_coalesce.
+    let already_fused: bool = input.nodes.iter().any(|n| {
+        matches!(
+            n.kernel,
+            BoundKernel::CutlassGemmLayer { phase, .. } if phase == gemm_phase
+        )
+    });
+    if already_fused {
+        let mut new_nodes: Vec<CoalescedNode> = Vec::with_capacity(input.nodes.len());
+        for n in &input.nodes {
+            let kernel = match n.kernel {
+                BoundKernel::CutlassGemmLayer {
+                    layer,
+                    phase: p,
+                    tile: _,
+                } if p == gemm_phase => BoundKernel::CutlassGemmLayer {
+                    layer,
+                    phase: p,
+                    tile,
+                },
+                ref k => k.clone(),
+            };
+            new_nodes.push(CoalescedNode {
+                id: n.id,
+                kernel,
+                deps: n.deps.clone(),
+            });
+        }
+        return CoalescedDag {
+            dims: input.dims,
+            tiles: input.tiles,
+            nodes: new_nodes,
+        };
+    }
 
     // Index target nodes by layer.
     let mut target_ids_by_layer: HashMap<u16, Vec<NodeId>> = HashMap::new();
@@ -685,6 +814,7 @@ pub fn coalesce_gemm_phase(input: CoalescedDag, gemm_phase: GemmPhase) -> Coales
                 kernel: BoundKernel::CutlassGemmLayer {
                     layer,
                     phase: gemm_phase,
+                    tile,
                 },
                 deps,
             });
@@ -747,8 +877,12 @@ pub fn coalesce_consumer_fanin(
         }
     }
 
-    // For each layer, check if the fan-in pattern applies.
-    let mut layers_to_fuse: HashMap<u16, (NodeId, Vec<NodeId>)> = HashMap::new();
+    // For each layer, check if the fan-in pattern applies. The tuple
+    // is (consumer_id, producer_ids, actual_consumer_kind) — we extract
+    // the consumer's *real* fields (e.g. cutlass tile) here so the
+    // FusedFaninLayer node we emit later carries the polyalgo decision
+    // the cost gate made earlier.
+    let mut layers_to_fuse: HashMap<u16, (NodeId, Vec<NodeId>, FaninConsumer)> = HashMap::new();
     let nodes_by_id: HashMap<NodeId, &CoalescedNode> =
         input.nodes.iter().map(|n| (n.id, n)).collect();
 
@@ -783,23 +917,31 @@ pub fn coalesce_consumer_fanin(
             Some(n) => n,
             None => continue,
         };
-        // Verify the consumer kind + layer match.
-        let consumer_matches = match (&consumer_node.kernel, consumer_kind) {
+        // Verify the consumer kind + layer match, and extract the
+        // actual `FaninConsumer` to store in the fused node.
+        let actual_consumer: Option<FaninConsumer> = match (&consumer_node.kernel, consumer_kind) {
             (
-                BoundKernel::CutlassGemmLayer { layer: cl, phase },
-                FaninConsumer::CutlassGemm(target_phase),
-            ) => *cl == *layer && *phase == target_phase,
+                BoundKernel::CutlassGemmLayer {
+                    layer: cl,
+                    phase,
+                    tile,
+                },
+                FaninConsumer::CutlassGemm(target_phase, _),
+            ) if *cl == *layer && *phase == target_phase => {
+                Some(FaninConsumer::CutlassGemm(*phase, *tile))
+            }
             (
                 BoundKernel::FlashInferAttentionLayer { layer: cl },
                 FaninConsumer::FlashInferAttention,
-            ) => *cl == *layer,
-            _ => false,
+            ) if *cl == *layer => Some(FaninConsumer::FlashInferAttention),
+            _ => None,
         };
-        if !consumer_matches {
-            continue;
-        }
+        let actual_consumer = match actual_consumer {
+            Some(c) => c,
+            None => continue,
+        };
         // All checks passed — schedule this layer for fusion.
-        layers_to_fuse.insert(*layer, (consumer_id, producer_ids.clone()));
+        layers_to_fuse.insert(*layer, (consumer_id, producer_ids.clone(), actual_consumer));
     }
 
     if layers_to_fuse.is_empty() {
@@ -809,7 +951,7 @@ pub fn coalesce_consumer_fanin(
     // Build the absorbed-id set and the rewrite map (absorbed → fused id).
     let mut absorbed: HashSet<NodeId> = HashSet::new();
     let mut rewrite: HashMap<NodeId, NodeId> = HashMap::new();
-    for (consumer_id, producers) in layers_to_fuse.values() {
+    for (consumer_id, producers, _) in layers_to_fuse.values() {
         for p in producers {
             absorbed.insert(*p);
             rewrite.insert(*p, *consumer_id);
@@ -826,10 +968,10 @@ pub fn coalesce_consumer_fanin(
         // Is this node a fusion target?
         let fusion_for_layer = layers_to_fuse
             .iter()
-            .find(|(_, (consumer_id, _))| *consumer_id == n.id)
-            .map(|(layer, (_, producers))| (*layer, producers.clone()));
+            .find(|(_, (consumer_id, _, _))| *consumer_id == n.id)
+            .map(|(layer, (_, producers, actual))| (*layer, producers.clone(), *actual));
 
-        if let Some((layer, producers)) = fusion_for_layer {
+        if let Some((layer, producers, actual_consumer)) = fusion_for_layer {
             // Union deps of the consumer + every absorbed producer,
             // drop internal edges, dedupe.
             let mut deps: Vec<NodeId> = Vec::new();
@@ -863,7 +1005,7 @@ pub fn coalesce_consumer_fanin(
                 kernel: BoundKernel::FusedFaninLayer {
                     layer,
                     producer_phase,
-                    consumer: consumer_kind,
+                    consumer: actual_consumer,
                 },
                 deps,
             });
@@ -952,23 +1094,31 @@ pub fn coalesce_with_target_profile(
         }
     }
 
-    // CUTLASS GEMM fusion — one rule per phase, each cost-gated.
+    // CUTLASS GEMM fusion — polyalgorithmic per phase. For each phase
+    // we try every tile shape in CUTLASS_TILE_CANDIDATES and let
+    // try_coalesce pick the one that minimizes predicted_cost (which
+    // is now polyalgo-aware via the BoundKernel::cost branch for
+    // CutlassGemmLayer that uses CutlassTile::tile_dims). The cost
+    // model handles bin-pack rounding waste, so narrow-N phases
+    // (qkv N=3072, oproj/down N=2048) tend to pick CutlassTile::Narrow
+    // while fat-N phases (gate_up N=8192) tend to pick Small.
     if matches!(
         profile.gemm_kernel,
         GemmKernelChoice::CutlassSm80Multistage { .. }
     ) {
-        coalesced = try_coalesce(coalesced, num_ctas, "cutlass_qkv", |c| {
-            coalesce_gemm_phase(c, GemmPhase::Qkv)
-        });
-        coalesced = try_coalesce(coalesced, num_ctas, "cutlass_oproj", |c| {
-            coalesce_gemm_phase(c, GemmPhase::OProj)
-        });
-        coalesced = try_coalesce(coalesced, num_ctas, "cutlass_gate_up", |c| {
-            coalesce_gemm_phase(c, GemmPhase::GateUp)
-        });
-        coalesced = try_coalesce(coalesced, num_ctas, "cutlass_down", |c| {
-            coalesce_gemm_phase(c, GemmPhase::Down)
-        });
+        const CUTLASS_TILE_CANDIDATES: &[CutlassTile] = &[CutlassTile::Small, CutlassTile::Narrow];
+        for phase in [
+            GemmPhase::Qkv,
+            GemmPhase::OProj,
+            GemmPhase::GateUp,
+            GemmPhase::Down,
+        ] {
+            for &tile in CUTLASS_TILE_CANDIDATES {
+                coalesced = try_coalesce(coalesced, num_ctas, "cutlass_polyalgo", |c| {
+                    coalesce_gemm_phase(c, phase, tile)
+                });
+            }
+        }
     }
 
     // Fan-in fusion passes — each absorbs a per-row producer phase
@@ -982,11 +1132,17 @@ pub fn coalesce_with_target_profile(
     // pass requires its consumer to already be coalesced into a
     // single wave-coop node, so attention/cutlass passes must run
     // first (they did, above).
+    // The placeholder `CutlassTile::Small` here is not the *actual*
+    // tile the fan-in arm will use — coalesce_consumer_fanin extracts
+    // the matched consumer's real tile field and stores it in the
+    // FusedFaninLayer it emits. The argument is only used as a "match
+    // a CutlassGemm consumer" type tag. Two arms with `FaninConsumer
+    // ::CutlassGemm(_, x)` and `(_, y)` would match the same node.
     coalesced = try_coalesce(coalesced, num_ctas, "fanin_attn_norm_qkv", |c| {
         coalesce_consumer_fanin(
             c,
             Phase::AttnNorm,
-            FaninConsumer::CutlassGemm(GemmPhase::Qkv),
+            FaninConsumer::CutlassGemm(GemmPhase::Qkv, CutlassTile::Small),
         )
     });
     coalesced = try_coalesce(coalesced, num_ctas, "fanin_rope_fi_attn", |c| {
@@ -996,7 +1152,7 @@ pub fn coalesce_with_target_profile(
         coalesce_consumer_fanin(
             c,
             Phase::MlpNorm,
-            FaninConsumer::CutlassGemm(GemmPhase::GateUp),
+            FaninConsumer::CutlassGemm(GemmPhase::GateUp, CutlassTile::Small),
         )
     });
 
@@ -1158,7 +1314,7 @@ mod tests {
     fn cutlass_gemm_coalesce_fuses_one_phase_per_layer() {
         let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
         let trivial = coalesce(&dag);
-        let fused = coalesce_gemm_phase(trivial, GemmPhase::GateUp);
+        let fused = coalesce_gemm_phase(trivial, GemmPhase::GateUp, CutlassTile::Small);
 
         let mut by_kind = std::collections::HashMap::<&'static str, usize>::new();
         for cn in &fused.nodes {
@@ -1171,7 +1327,7 @@ mod tests {
         let nl = tiny_dims().num_layers as usize;
         assert_eq!(
             by_kind
-                .get("cutlass_gemm_gate_up_layer")
+                .get("cutlass_gemm_gate_up_layer_small")
                 .copied()
                 .unwrap_or(0),
             nl
@@ -1192,10 +1348,10 @@ mod tests {
         // fusions in sequence (the production order).
         let dag = ReifiedDag::reify_llama(tiny_dims(), TileSizes::default_v1());
         let mut c = coalesce_with_flashinfer_attention(&dag);
-        c = coalesce_gemm_phase(c, GemmPhase::Qkv);
-        c = coalesce_gemm_phase(c, GemmPhase::OProj);
-        c = coalesce_gemm_phase(c, GemmPhase::GateUp);
-        c = coalesce_gemm_phase(c, GemmPhase::Down);
+        c = coalesce_gemm_phase(c, GemmPhase::Qkv, CutlassTile::Small);
+        c = coalesce_gemm_phase(c, GemmPhase::OProj, CutlassTile::Small);
+        c = coalesce_gemm_phase(c, GemmPhase::GateUp, CutlassTile::Small);
+        c = coalesce_gemm_phase(c, GemmPhase::Down, CutlassTile::Small);
 
         let mut by_kind = std::collections::HashMap::<&'static str, usize>::new();
         for cn in &c.nodes {
@@ -1211,10 +1367,10 @@ mod tests {
             nl
         );
         for kind in [
-            "cutlass_gemm_qkv_layer",
-            "cutlass_gemm_o_proj_layer",
-            "cutlass_gemm_gate_up_layer",
-            "cutlass_gemm_down_layer",
+            "cutlass_gemm_qkv_layer_small",
+            "cutlass_gemm_o_proj_layer_small",
+            "cutlass_gemm_gate_up_layer_small",
+            "cutlass_gemm_down_layer_small",
         ] {
             assert_eq!(
                 by_kind.get(kind).copied().unwrap_or(0),
@@ -1267,9 +1423,21 @@ mod tests {
         }
         // The cutlass arms for o_proj and down survive standalone (no
         // fan-in pattern absorbs them — their producers are the
-        // wave-coop attn / o_proj outputs, not per-row tiles).
-        assert!(kinds.contains("cutlass_gemm_o_proj_layer"));
-        assert!(kinds.contains("cutlass_gemm_down_layer"));
+        // wave-coop attn / o_proj outputs, not per-row tiles). The
+        // polyalgo cost gate picks Small or Narrow per phase based on
+        // bin-pack rounding cost, so we accept either suffix.
+        let has_oproj_cutlass = kinds.contains("cutlass_gemm_o_proj_layer_small")
+            || kinds.contains("cutlass_gemm_o_proj_layer_narrow");
+        let has_down_cutlass = kinds.contains("cutlass_gemm_down_layer_small")
+            || kinds.contains("cutlass_gemm_down_layer_narrow");
+        assert!(
+            has_oproj_cutlass,
+            "expected an o_proj cutlass kind; got {kinds:?}"
+        );
+        assert!(
+            has_down_cutlass,
+            "expected a down cutlass kind; got {kinds:?}"
+        );
         // The other three (qkv / gate_up cutlass + flashinfer_attention)
         // get absorbed by their respective fan-in coalesce passes when
         // those win under the cost gate. At tiny dims with the
@@ -1279,8 +1447,10 @@ mod tests {
         assert!(kinds.contains("fanin_rope_fi_attn"));
         assert!(kinds.contains("fanin_mlp_norm_cutlass_gate_up"));
         assert!(!kinds.contains("flashinfer_attention_layer"));
-        assert!(!kinds.contains("cutlass_gemm_qkv_layer"));
-        assert!(!kinds.contains("cutlass_gemm_gate_up_layer"));
+        assert!(!kinds.contains("cutlass_gemm_qkv_layer_small"));
+        assert!(!kinds.contains("cutlass_gemm_qkv_layer_narrow"));
+        assert!(!kinds.contains("cutlass_gemm_gate_up_layer_small"));
+        assert!(!kinds.contains("cutlass_gemm_gate_up_layer_narrow"));
         // No HandWrittenRowTile remnants for the four GEMM phases or
         // for the per-row producers that got absorbed.
         assert!(!kinds.contains("qkv"));
@@ -1314,7 +1484,7 @@ mod tests {
         assert!(kinds_wmma.contains("down"));
         assert!(kinds_wmma.contains("attn_norm"));
         assert!(kinds_wmma.contains("mlp_norm"));
-        assert!(!kinds_wmma.contains("cutlass_gemm_qkv_layer"));
+        assert!(!kinds_wmma.contains("cutlass_gemm_qkv_layer_small"));
         assert!(!kinds_wmma.contains("fanin_attn_norm_cutlass_qkv"));
         assert!(!kinds_wmma.contains("fanin_mlp_norm_cutlass_gate_up"));
         // The rope → fi_attn fan-in still applies because fi_attn is

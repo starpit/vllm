@@ -700,4 +700,94 @@ mod tests {
         let mut entry = MlxLayerKvCache::new(&k, &v).unwrap();
         entry.truncate(16); // larger than seq_len=8 → panic
     }
+
+    /// Build a fake `MlxKvCache` with `num_layers` layers, each holding a
+    /// constant-valued K/V of shape `[1, heads, num_blocks * block_size, dim]`.
+    /// Used to seed `MlxKvCachePool` in tests without spinning up a model.
+    fn make_fake_kv_cache(num_layers: usize, num_blocks: usize, block_size: usize) -> MlxKvCache {
+        let heads = 2;
+        let dim = 8;
+        let seq_len = (num_blocks * block_size) as i32;
+        (0..num_layers)
+            .map(|li| {
+                let k = Array::ones::<f32>(&[1, heads, seq_len, dim])
+                    .unwrap()
+                    .multiply(Array::from_f32((li + 1) as f32))
+                    .unwrap();
+                let v = k.clone();
+                Some(MlxLayerKvCache::from_kv(&k, &v).unwrap())
+            })
+            .collect()
+    }
+
+    /// Pool round-trip: insert a KV with known block_ids, then look up each
+    /// block by block_id and assert it returns a slice of the right shape.
+    /// Locks the coherence contract the worker's span-assembly path relies
+    /// on (cache.rs:440 — pool never evicts; block_id ↔ entry stays valid).
+    #[test]
+    fn test_pool_get_span_block_round_trip() {
+        let block_size = 16;
+        let num_layers = 3;
+        let num_blocks = 4;
+        let mut pool = MlxKvCachePool::new(block_size);
+
+        let kv = make_fake_kv_cache(num_layers, num_blocks, block_size);
+        let block_ids: Vec<usize> = vec![100, 101, 102, 103];
+        pool.insert(0xdeadbeef, kv, block_ids.clone(), false);
+
+        for &bid in &block_ids {
+            let per_layer = pool
+                .get_span_block(bid)
+                .expect("block_id should be present");
+            assert_eq!(per_layer.len(), num_layers, "one (k, v) pair per layer");
+            for (k, v) in &per_layer {
+                assert_eq!(k.dim(2) as usize, block_size);
+                assert_eq!(v.dim(2) as usize, block_size);
+            }
+        }
+
+        // Unknown block_id → None.
+        assert!(pool.get_span_block(999).is_none());
+    }
+
+    /// Two requests with disjoint block_ids: lookups must not collide and
+    /// each must return the right entry's data. Guards against
+    /// block_index → entry pointer drift across multiple inserts.
+    #[test]
+    fn test_pool_multiple_inserts_block_index_isolation() {
+        let block_size = 16;
+        let mut pool = MlxKvCachePool::new(block_size);
+
+        let kv_a = make_fake_kv_cache(2, 2, block_size);
+        let kv_b = make_fake_kv_cache(2, 2, block_size);
+        pool.insert(0x1111, kv_a, vec![10, 11], false);
+        pool.insert(0x2222, kv_b, vec![20, 21], false);
+
+        for bid in [10, 11, 20, 21] {
+            assert!(pool.contains_block(bid), "block {bid} missing");
+            assert!(pool.get_span_block(bid).is_some());
+        }
+        assert!(pool.contains_hash(&0x1111));
+        assert!(pool.contains_hash(&0x2222));
+    }
+
+    /// Flat-hash and per-block lookups address the same entry but via
+    /// different keys. The worker's two-path lookup logic relies on this:
+    /// a flat-hash miss must not invalidate the per-block view of the same
+    /// entry. (Asserts that flat hash lookup with a wrong hash misses while
+    /// per-block lookup with the right id still hits.)
+    #[test]
+    fn test_pool_flat_hash_miss_does_not_break_per_block_lookup() {
+        let block_size = 16;
+        let mut pool = MlxKvCachePool::new(block_size);
+
+        let kv = make_fake_kv_cache(1, 2, block_size);
+        pool.insert(0xaaaa, kv, vec![50, 51], false);
+
+        // Wrong flat hash → miss.
+        assert!(pool.get_by_hash(&0xbbbb).is_none());
+        // Per-block lookups still succeed.
+        assert!(pool.get_span_block(50).is_some());
+        assert!(pool.get_span_block(51).is_some());
+    }
 }

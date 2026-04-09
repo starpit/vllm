@@ -111,6 +111,38 @@ struct BatchedDecodeCache {
     left_padding: Vec<Vec<usize>>,
 }
 
+/// Result of resolving the prefill cache lookup paths.
+#[derive(Debug, PartialEq, Eq)]
+struct PrefillCacheResolution {
+    /// Final num_computed to use for slice/positions. Either the scheduler's
+    /// reported value (some KV reuse path produced state) or 0 (true miss).
+    num_computed: usize,
+    /// True when both lookup paths failed and we must forward the entire
+    /// prompt from position 0. Implies num_computed == 0.
+    forward_all: bool,
+}
+
+/// Decide what `num_computed` the prefill should use after the two cache
+/// lookup paths (flat-hash whole-prefix and per-block_id span assembly) have
+/// run.
+///
+/// Invariant: only when **both** paths fail and the scheduler reported a
+/// non-zero cached prefix do we reset to 0 and forward everything. Resetting
+/// inside an individual lookup arm — as a previous fix did — silently
+/// disables the other arm if it's gated on `num_computed > 0`, which is
+/// exactly what killed the spans speedup.
+fn resolve_prefill_cache_state(
+    scheduler_num_computed: usize,
+    prefix_cache_hit: bool,
+    any_span_blocks: bool,
+) -> PrefillCacheResolution {
+    let true_miss = scheduler_num_computed > 0 && !prefix_cache_hit && !any_span_blocks;
+    PrefillCacheResolution {
+        num_computed: if true_miss { 0 } else { scheduler_num_computed },
+        forward_all: true_miss,
+    }
+}
+
 /// Hash the block-aligned prefix of a prompt (same logic as `SimpleBlockTracker::hash_block`).
 ///
 /// Only full blocks are hashed — trailing partial blocks are ignored so that
@@ -1140,21 +1172,25 @@ impl Worker for MlxWorker {
                 self.annotation_buffers.remove(&new_req.req_id);
             }
 
-            // True cache miss: scheduler said tokens were cached but neither
-            // lookup path produced any KV state. Forward the entire prompt
-            // from position 0 — otherwise we'd skip num_computed tokens with
-            // no backing KV (the 0% accuracy case 9d0674698 was after).
-            if scheduler_num_computed > 0 && !prefix_cache_hit && !any_span_blocks {
+            // Resolve final num_computed from the two lookup paths' results.
+            // Only a *true* miss (both paths failed) resets to 0 — that's
+            // the 0% accuracy case 9d0674698 was originally trying to fix.
+            let resolution = resolve_prefill_cache_state(
+                scheduler_num_computed,
+                prefix_cache_hit,
+                any_span_blocks,
+            );
+            if resolution.forward_all {
                 debug!(
                     "true cache miss for req {} — forwarding entire prompt",
                     new_req.req_id
                 );
-                num_computed = 0;
             }
+            num_computed = resolution.num_computed;
 
             // Compute token slice and positions using the final num_computed.
             let start = num_computed.min(prompt_ids.len());
-            let effective_num_tokens = if num_computed == 0 && scheduler_num_computed > 0 {
+            let effective_num_tokens = if resolution.forward_all {
                 prompt_ids.len() // true miss: forward everything
             } else {
                 num_tokens
@@ -2598,6 +2634,45 @@ mod tests {
             is_pooling: false,
             enable_prefix_caching: false,
         })
+    }
+
+    /// Decision table for `resolve_prefill_cache_state`.
+    ///
+    /// Rows cover all 8 cells of (scheduler_num_computed > 0) ×
+    /// (prefix_cache_hit) × (any_span_blocks). Locks down the regression
+    /// from 9d0674698 where a flat-hash miss zeroed num_computed
+    /// unconditionally, killing the span-assembly path: row
+    /// `(N>0, false, true)` would have caught it on day one.
+    #[test]
+    fn test_resolve_prefill_cache_state_decision_table() {
+        // (scheduler_num_computed, prefix_cache_hit, any_span_blocks)
+        //   → (expected num_computed, expected forward_all)
+        let cases = [
+            // No cached prefix from scheduler: nothing to resolve.
+            ((0, false, false), (0, false)),
+            ((0, true, false), (0, false)),
+            ((0, false, true), (0, false)),
+            ((0, true, true), (0, false)),
+            // Scheduler reports cached: only true miss forwards all.
+            ((42, true, false), (42, false)),
+            // REGRESSION GUARD: span-assembly hit on flat-hash miss must
+            // preserve num_computed, not reset to 0.
+            ((42, false, true), (42, false)),
+            ((42, true, true), (42, false)),
+            // Both lookup paths missed: forward the entire prompt.
+            ((42, false, false), (0, true)),
+        ];
+        for ((snc, hit, span), (want_nc, want_fwd)) in cases {
+            let got = resolve_prefill_cache_state(snc, hit, span);
+            assert_eq!(
+                got,
+                PrefillCacheResolution {
+                    num_computed: want_nc,
+                    forward_all: want_fwd,
+                },
+                "case (snc={snc}, hit={hit}, span={span})"
+            );
+        }
     }
 
     #[test]

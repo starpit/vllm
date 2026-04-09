@@ -39,6 +39,37 @@
 use crate::reified_dag::{LlamaDims, NodeId, Phase, ReifiedDag, TileSizes};
 use crate::schedule::CostModel;
 
+/// Per-binding hardware resource demand. Consumed by the lowering
+/// solver (`crate::lowering`) to decide which waves can share a
+/// `__global__` function: two waves with very different `regs_per_thread`
+/// values pay an occupancy penalty if grouped together (NVCC sets
+/// `max-regs/CTA` per `__global__` to the union, which drops occupancy
+/// for the lighter wave); waves whose summed `shmem_bytes` exceed the
+/// target's per-CTA carveout cannot be grouped at all.
+///
+/// Numbers are estimates calibrated to the existing megakernel
+/// instantiations, not exact NVCC outputs. The solver only needs
+/// **relative** correctness so its inequalities point the right way.
+/// Future work: replace with NVCC-reported per-`__global__` register
+/// counts measured at codegen time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Resources {
+    /// Per-CTA dynamic shmem demand for this binding's dispatch arm,
+    /// in bytes. Hard constraint for the lowering solver: a kernel
+    /// group's max shmem (over its waves) must fit
+    /// `LoweringConstraints::max_shmem_per_cta`.
+    pub shmem_bytes: u32,
+    /// Per-thread register footprint estimate. Soft constraint for
+    /// the solver: grouping waves with mismatched register counts
+    /// raises NVCC's per-`__global__` reg cap, which drops occupancy
+    /// for the lighter wave (modeled in `lowering::cost_occupancy`).
+    pub regs_per_thread: u32,
+    /// Threads per CTA the dispatch arm runs with. Currently 256
+    /// for every variant in the megakernel template; reserved for
+    /// future variants with different CTA shapes.
+    pub threads_per_cta: u32,
+}
+
 /// One concrete binding instance: a kernel implementation choice plus
 /// the DAG inputs it consumes.
 ///
@@ -369,6 +400,85 @@ impl BoundKernel {
                      has no kernel_tag assigned; allocate one and add a dispatch arm"
                 ),
             },
+        }
+    }
+
+    /// Per-binding hardware resource demand. See [`Resources`] for the
+    /// semantics. Numbers are estimates calibrated to the existing
+    /// megakernel instantiations — they only need to be **relatively**
+    /// correct so the lowering solver's inequalities point the right way.
+    ///
+    /// Conventions:
+    /// - `shmem_bytes` for cutlass arms tracks the matching namespace's
+    ///   `SharedStorage` template instantiation.
+    /// - `shmem_bytes` for FlashInfer attention tracks `KTraits::SharedStorage`
+    ///   on bf16 head_dim=64 prefill (~70 KiB measured).
+    /// - `shmem_bytes` for hand-written tile bodies tracks `TILE_SHMEM_BYTES`
+    ///   in the megakernel template (currently 36 KiB).
+    /// - `regs_per_thread` for cutlass mainloops is high (~128); for
+    ///   norm/rope row tile bodies it's much lower (~32).
+    pub fn resources(&self) -> Resources {
+        match self {
+            BoundKernel::HandWrittenRowTile { phase, .. } => {
+                // Per-row tile bodies are warp-level reductions / per-row
+                // copies dispatched on a 256-thread CTA. They share the
+                // megakernel template's TILE_SHMEM_BYTES arena.
+                let regs = match phase {
+                    Phase::AttnNorm | Phase::MlpNorm => 24,
+                    Phase::Rope => 32,
+                    // Hand-written GEMM bodies (mostly dead with the
+                    // cutlass profile) — heavier on registers because
+                    // they unroll the wmma mainloop.
+                    Phase::Qkv | Phase::OProj | Phase::GateUp | Phase::Down => 96,
+                    Phase::Attention => 96,
+                };
+                Resources {
+                    shmem_bytes: 36 * 1024,
+                    regs_per_thread: regs,
+                    threads_per_cta: 256,
+                }
+            }
+            BoundKernel::FlashInferAttentionLayer { .. } => Resources {
+                // FlashInfer KTraits1 SharedStorage at bf16 head_dim=64
+                // prefill ≈ 70 KiB. Sets the megakernel's per-CTA shmem
+                // floor on L4 (the static arena is `max(arm shmem)`).
+                shmem_bytes: 70 * 1024,
+                regs_per_thread: 128,
+                threads_per_cta: 256,
+            },
+            BoundKernel::CutlassGemmLayer { tile, .. } => match tile {
+                CutlassTile::Small => Resources {
+                    // pfl_cutlass_small: 128x128x32, 4 cp.async stages.
+                    // SharedStorage instantiation lands ~49 KiB; round
+                    // to 50 KiB for headroom.
+                    shmem_bytes: 50 * 1024,
+                    regs_per_thread: 128,
+                    threads_per_cta: 256,
+                },
+                CutlassTile::Narrow => Resources {
+                    // pfl_cutlass_narrow: 128x64x32, 4 cp.async stages.
+                    // SharedStorage instantiation lands ~25 KiB.
+                    shmem_bytes: 25 * 1024,
+                    regs_per_thread: 96,
+                    threads_per_cta: 256,
+                },
+            },
+            BoundKernel::FusedFaninLayer { consumer, .. } => {
+                // Fan-in arms wrap a wave-coop consumer with a small
+                // producer prologue + intra-arm grid sync. Resources
+                // are dominated by the wrapped consumer.
+                match consumer {
+                    FaninConsumer::CutlassGemm(phase, tile) => BoundKernel::CutlassGemmLayer {
+                        layer: 0,
+                        phase: *phase,
+                        tile: *tile,
+                    }
+                    .resources(),
+                    FaninConsumer::FlashInferAttention => {
+                        BoundKernel::FlashInferAttentionLayer { layer: 0 }.resources()
+                    }
+                }
+            }
         }
     }
 
@@ -1415,6 +1525,7 @@ mod tests {
             attention_kernel: AttentionKernelChoice::FlashInferPersistent,
             norm_kernel: NormKernelChoice::HandWrittenWarpShuffle,
             rope_kernel: RopeKernelChoice::HandWrittenSplitHalf,
+            lowering: crate::target_profile::LoweringConstraints::l4_sm89(),
         };
         let coalesced_cutlass = coalesce_with_target_profile(&dag, &profile_cutlass);
         let mut kinds: std::collections::HashSet<&'static str> = Default::default();

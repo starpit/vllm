@@ -108,6 +108,120 @@ pub enum RopeKernelChoice {
     FlashInferPosEncCuh,
 }
 
+/// Cost / capability inputs the lowering solver consumes to decide
+/// how to partition the BSP wave schedule into kernel groups (one
+/// `__global__` per group). All wall-clock costs are in microseconds
+/// so the solver objective is directly comparable across handoff
+/// mechanisms.
+///
+/// **Why this is a separate struct**: every field here is something
+/// the wave-grouping solver actually compares against. Hardware
+/// constants that *only* matter to per-target codegen (e.g. SM count,
+/// FlashInfer workspace sizes) live on `TargetProfile` proper.
+///
+/// **Why the lowering falls out from these constants**: the solver
+/// is a single DP over the linear wave sequence
+/// (`crate::lowering::solver`). It picks group boundaries by comparing
+/// in-group barrier cost vs cross-group launch cost, plus an
+/// occupancy penalty for grouping waves with mismatched
+/// `regs_per_thread`. With `barrier_cost_us ≫ launch_cost_us` and
+/// no `regs_dynamic_per_warpgroup` (sm_89), the solver outputs
+/// **one group per wave-of-distinct-kind**. With `regs_dynamic_per_warpgroup`
+/// = true and `mbarrier_handoff_us < launch_cost_us` (sm_90+), the
+/// solver merges everything into **one warp-specialized persistent
+/// `__global__`**. No per-target solver code — the strategies emerge
+/// from the constants.
+#[derive(Clone, Copy, Debug)]
+pub struct LoweringConstraints {
+    /// Cost of an in-kernel grid synchronization (e.g.
+    /// `cooperative_groups::this_grid().sync()` or the gmem-flag spin
+    /// barrier) on this target, in microseconds. Measured on L4
+    /// sm_89 at ~100 µs (see `BARRIER_COST_MMA_UNITS` calibration in
+    /// `schedule.rs` and the SCHEDULED_MEGAKERNEL_HANDOFF doc).
+    pub barrier_cost_us: f32,
+    /// Cost of a kernel-boundary sync — i.e. the steady-state
+    /// `cudaLaunchCooperativeKernel` overhead between back-to-back
+    /// launches on the same stream with no host roundtrip — in
+    /// microseconds. The solver compares this against `barrier_cost_us`
+    /// to decide whether two adjacent waves should share a `__global__`
+    /// (paying barrier_cost) or separate (paying launch_cost).
+    pub launch_cost_us: f32,
+    /// Whether the target supports `setmaxnreg.inc/dec` PTX (sm_90+).
+    /// When true, two waves grouped into the same `__global__` do
+    /// **not** pay the union-of-regs occupancy penalty — each
+    /// warpgroup picks its own register budget at runtime. This is
+    /// the architectural feature that makes a single persistent
+    /// megakernel viable on Hopper+ but not on L4.
+    pub regs_dynamic_per_warpgroup: bool,
+    /// Cost of an `mbarrier`-based shmem handoff between two waves
+    /// in the same `__global__` (sm_90+). When `Some`, the solver
+    /// uses this instead of `barrier_cost_us` for in-group transitions.
+    /// Typically ~1 µs vs the ~100 µs for a true grid sync.
+    pub mbarrier_handoff_us: Option<f32>,
+    /// Cost of a distributed-shmem (DSMEM) cluster handoff (sm_90+).
+    /// Reserved for the solver's future fused-cluster passes that
+    /// keep producer outputs in cluster shmem instead of going via
+    /// gmem.
+    pub dsmem_cluster_handoff_us: Option<f32>,
+    /// Whether the target supports tensor-memory (TMEM) accumulator
+    /// offload (sm_100+). When true, the cutlass mainloop's MMA
+    /// accumulators don't pressure the register file, lowering the
+    /// effective `regs_per_thread` for cutlass arms.
+    pub tmem_accum_offload: bool,
+    /// NVCC's hard cap on registers per thread for a single
+    /// `__global__` function. The solver uses this as a hard
+    /// constraint when grouping waves whose unioned `regs_per_thread`
+    /// would exceed it.
+    pub max_regs_per_thread: u32,
+    /// Per-CTA dynamic shmem ceiling
+    /// (`cudaFuncSetAttribute(MaxDynamicSharedMemorySize)`). Hard
+    /// constraint: a kernel group's max shmem (over its waves)
+    /// cannot exceed this.
+    pub max_shmem_per_cta_bytes: u32,
+    /// Total registers per SM. Used by the occupancy model to
+    /// estimate `blocks_per_sm` for a given group's reg budget.
+    pub regs_per_sm: u32,
+    /// Maximum warps per SM (occupancy ceiling). Used by the
+    /// occupancy model.
+    pub warps_per_sm: u32,
+    /// GPU boost clock in Hz. Used by the lowering solver to
+    /// convert the schedule's compute costs (in `mma units` ≈
+    /// cycles, per the existing `WaveSchedule::ms_at` convention)
+    /// into wall-clock microseconds, so the solver's objective is
+    /// directly comparable against `barrier_cost_us` /
+    /// `launch_cost_us`.
+    pub gpu_clock_hz: f64,
+}
+
+impl LoweringConstraints {
+    /// L4 sm_89: ~100 µs grid barriers, ~5 µs cooperative-launch
+    /// boundaries, no `setmaxnreg`, no mbarrier, no DSMEM, no TMEM.
+    /// 255 max regs/thread, 99 KiB shmem/CTA, 64 K regs/SM, 48 warps/SM.
+    pub const fn l4_sm89() -> Self {
+        Self {
+            // From SCHEDULED_MEGAKERNEL_HANDOFF: "Grid barrier cost is
+            // fundamental on L4 sm_89; mechanism doesn't matter (~115 µs)".
+            barrier_cost_us: 100.0,
+            // Estimate: cooperative launch overhead between back-to-back
+            // launches on the same stream is ~3-10 µs in steady state.
+            // Will refine with a real measurement before CP2.
+            launch_cost_us: 5.0,
+            regs_dynamic_per_warpgroup: false,
+            mbarrier_handoff_us: None,
+            dsmem_cluster_handoff_us: None,
+            tmem_accum_offload: false,
+            max_regs_per_thread: 255,
+            max_shmem_per_cta_bytes: 99 * 1024,
+            regs_per_sm: 65536,
+            warps_per_sm: 48,
+            // L4 boost clock 1.985 GHz (datasheet). The schedule's
+            // `ms_at` convention treats `predicted_cost` as cycles
+            // directly, so we match it here.
+            gpu_clock_hz: 1.985e9,
+        }
+    }
+}
+
 /// Per-target hardware profile. Single source of truth for
 /// device-specific values that flow into the codegen, the
 /// scheduler, the launcher, and the FlashInfer planner shim.
@@ -144,6 +258,12 @@ pub struct TargetProfile {
     pub norm_kernel: NormKernelChoice,
     /// Which RoPE implementation rope dispatches to.
     pub rope_kernel: RopeKernelChoice,
+
+    // ── Lowering solver inputs ──────────────────────────────────────
+    /// Cost / capability inputs the wave-grouping solver
+    /// (`crate::lowering::solver`) consumes. Determines how the BSP
+    /// wave schedule lowers to one-or-many `__global__` functions.
+    pub lowering: LoweringConstraints,
 }
 
 impl TargetProfile {
@@ -178,6 +298,7 @@ impl TargetProfile {
             attention_kernel: AttentionKernelChoice::FlashInferPersistent,
             norm_kernel: NormKernelChoice::HandWrittenWarpShuffle,
             rope_kernel: RopeKernelChoice::HandWrittenSplitHalf,
+            lowering: LoweringConstraints::l4_sm89(),
         }
     }
 

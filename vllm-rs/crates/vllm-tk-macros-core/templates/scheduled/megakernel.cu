@@ -1567,6 +1567,11 @@ __device__ __forceinline__ void tile_cutlass_gemm_small_silumul(
 // expected (wave_idx + 1) * NUM_CTAS value. Requires the launch to fit all
 // CTAs concurrently — true for us at num_ctas == num_sms with 1 CTA/SM.
 __device__ __forceinline__ void grid_barrier(unsigned int* counter, unsigned int wave_idx) {
+    // Hand-rolled gmem-flag spin barrier. Tried replacing with
+    // cooperative_groups::this_grid().sync() — measured identical
+    // idle/sync at seq=1024 (14.6 → 14.8 ms), so the per-barrier cost
+    // is fundamental, not mechanism. Reducing it requires fewer
+    // barriers, not a faster barrier.
     __syncthreads();
     if (threadIdx.x == 0) {
         const unsigned int target = (wave_idx + 1u) * NUM_CTAS;

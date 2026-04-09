@@ -603,6 +603,10 @@ pub mod ffi {
         pub int_ws_d: *mut std::ffi::c_void,
         pub int_ws_h: *mut std::ffi::c_void,
         pub params_d: *mut std::ffi::c_void, // PersistentParams[num_layers]
+        // CP5-D-1: cooperative grid dims for per-layer FlashInfer
+        // launches via `cp5_run_flashinfer_attention_for_layer`.
+        pub num_blks_x: i32,
+        pub num_blks_y: i32,
     }
 
     impl Default for FlashInferAttentionPlan {
@@ -612,6 +616,8 @@ pub mod ffi {
                 int_ws_d: std::ptr::null_mut(),
                 int_ws_h: std::ptr::null_mut(),
                 params_d: std::ptr::null_mut(),
+                num_blks_x: 0,
+                num_blks_y: 0,
             }
         }
     }
@@ -652,5 +658,19 @@ pub mod ffi {
         ) -> i32;
 
         pub fn teardown_flashinfer_attention_plan(plan: *mut FlashInferAttentionPlan);
+
+        /// CP5-D-1: per-layer FlashInfer launcher. Reuses the per-launch
+        /// plan built by `setup_flashinfer_params_for_megakernel` (single
+        /// PersistentParams per layer in `plan->params_d`) and dispatches
+        /// the persistent runner via a tiny `__global__` wrapper that
+        /// calls `BlockBatchPagedAttentionPersistent::Run` for one layer.
+        /// Same code path as the megakernel's inline FlashInfer call,
+        /// just dispatched from the host one layer at a time. Picked
+        /// from the CP5 interpreter's flashinfer_standalone_fa2 dispatch.
+        pub fn cp5_run_flashinfer_attention_for_layer(
+            plan: *mut FlashInferAttentionPlan,
+            layer_idx: i32,
+            stream: *mut std::ffi::c_void,
+        ) -> i32;
     }
 }

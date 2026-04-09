@@ -490,6 +490,12 @@ struct FlashInferAttentionPlan {
   void* int_ws_d;
   void* int_ws_h;
   PersistentParams* params_d;  // device, length = num_layers
+  // Cooperative grid dims for the per-layer FlashInfer launcher
+  // (`cp5_run_flashinfer_attention_for_layer`). Stored on the plan
+  // because the planner picked them — the host would otherwise
+  // have to reach into the planner output to get them.
+  int32_t num_blks_x;
+  int32_t num_blks_y;
 };
 
 extern "C" int32_t setup_flashinfer_params_for_megakernel(
@@ -624,6 +630,9 @@ extern "C" int32_t setup_flashinfer_params_for_megakernel(
   cudaMemcpyAsync(out_plan->params_d, params_h.data(),
                   num_layers * sizeof(PersistentParams), cudaMemcpyHostToDevice, stream);
 
+  out_plan->num_blks_x = static_cast<int32_t>(plan_info.num_blks_x);
+  out_plan->num_blks_y = static_cast<int32_t>(plan_info.num_blks_y);
+
   return static_cast<int32_t>(FlashInferShimStatus::Ok);
 }
 
@@ -636,4 +645,109 @@ extern "C" void teardown_flashinfer_attention_plan(FlashInferAttentionPlan* plan
   plan->float_ws_d = nullptr;
   plan->int_ws_d = nullptr;
   plan->int_ws_h = nullptr;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// CP5-D-1: per-layer FlashInfer launcher.
+//
+// The CP5 lowering interpreter calls this once per Attention tile in
+// the solved Assignment. It reuses the per-launch plan built by
+// `setup_flashinfer_params_for_megakernel` (single-task params per
+// layer in `plan->params_d`) and dispatches the persistent runner via
+// a tiny `__global__` wrapper that calls
+// `BlockBatchPagedAttentionPersistent::Run` for one layer.
+//
+// **Why a wrapper kernel and not `BatchPagedAttentionPersistent`**:
+// the existing per-launch plan stores ONE PersistentParams per layer
+// (the long-Q task-0 entry; for our prefill workload all work lives
+// in task 0). The host launcher
+// `flashinfer::BatchPagedAttentionPersistent` expects TWO params (one
+// per dispatch task). Calling it would either need a second per-layer
+// task or would double-process task 0. The wrapper kernel below uses
+// the same `BlockBatchPagedAttentionPersistent::Run` device function
+// the megakernel calls inline — same exact code path, just dispatched
+// from the host one layer at a time.
+
+namespace cp5_per_layer_attn {
+
+constexpr uint32_t FI_CTA_TILE_Q = 128;
+constexpr uint32_t FI_NUM_WARPS_Q = flashinfer::get_num_warps_q(FI_CTA_TILE_Q);
+constexpr uint32_t FI_NUM_WARPS_KV = flashinfer::get_num_warps_kv(FI_CTA_TILE_Q);
+constexpr uint32_t FI_NUM_MMA_Q = flashinfer::get_num_mma_q(FI_CTA_TILE_Q);
+constexpr uint32_t FI_NUM_MMA_KV = 4;
+constexpr uint32_t FI_NUM_MMA_D_QK = HEAD_DIM_QK / 16;
+constexpr uint32_t FI_NUM_MMA_D_VO = HEAD_DIM_VO / 16;
+
+using KTraits = flashinfer::KernelTraits<
+    flashinfer::MaskMode::kCausal,
+    /*CTA_TILE_Q=*/FI_CTA_TILE_Q,
+    /*NUM_MMA_Q=*/FI_NUM_MMA_Q,
+    /*NUM_MMA_KV=*/FI_NUM_MMA_KV,
+    /*NUM_MMA_D_QK=*/FI_NUM_MMA_D_QK,
+    /*NUM_MMA_D_VO=*/FI_NUM_MMA_D_VO,
+    /*NUM_WARPS_Q=*/FI_NUM_WARPS_Q,
+    /*NUM_WARPS_KV=*/FI_NUM_WARPS_KV,
+    flashinfer::PosEncodingMode::kNone,
+    DTypeQ, DTypeKV, DTypeO, float, IdType,
+    StandardAttention</*UseLogitsSoftCap=*/false>>;
+
+using Runner = flashinfer::BlockBatchPagedAttentionPersistent<KTraits, PersistentParams>;
+
+constexpr uint32_t kNumThreads = KTraits::NUM_THREADS;
+constexpr size_t kSharedStorageBytes = sizeof(KTraits::SharedStorage);
+
+}  // namespace cp5_per_layer_attn
+
+// One-layer wrapper kernel: reads `params_array[layer_idx]` and runs
+// the persistent FlashInfer dispatch on this CTA's slice of work.
+__global__ void cp5_one_layer_attention_kernel(PersistentParams* params_array,
+                                                int32_t layer_idx) {
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  auto& smem_storage =
+      *reinterpret_cast<cp5_per_layer_attn::KTraits::SharedStorage*>(smem_raw);
+  cp5_per_layer_attn::Runner::Run(params_array[layer_idx], &smem_storage);
+}
+
+extern "C" int32_t cp5_run_flashinfer_attention_for_layer(
+    FlashInferAttentionPlan* plan,
+    int32_t layer_idx,
+    cudaStream_t stream)
+{
+  size_t smem_bytes = cp5_per_layer_attn::kSharedStorageBytes;
+
+  // Opt the wrapper into the per-CTA dynamic shmem carveout. This
+  // call is idempotent — safe to call before every launch.
+  auto attr_err = cudaFuncSetAttribute(
+      (const void*)cp5_one_layer_attention_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_bytes));
+  if (attr_err != cudaSuccess) {
+    std::fprintf(stderr,
+                 "cp5_run_flashinfer_attention_for_layer: cudaFuncSetAttribute failed: %s\n",
+                 cudaGetErrorString(attr_err));
+    return -1;
+  }
+
+  PersistentParams* params_d = plan->params_d;
+  void* args[] = { &params_d, &layer_idx };
+
+  // Match the megakernel's launch shape: blockIdx.y carries the
+  // persistent CTA id (FlashInfer reads `work_indptr[blockIdx.y]`),
+  // blockIdx.x is the cluster Q-split (always 1 for our prefill
+  // config). num_blks_y is the cooperative grid size from the
+  // planner — same value the megakernel uses.
+  dim3 grid(plan->num_blks_x, plan->num_blks_y);
+  dim3 block(cp5_per_layer_attn::kNumThreads);
+
+  auto launch_err = cudaLaunchCooperativeKernel(
+      (const void*)cp5_one_layer_attention_kernel,
+      grid, block, args, smem_bytes, stream);
+  if (launch_err != cudaSuccess) {
+    std::fprintf(stderr,
+                 "cp5_run_flashinfer_attention_for_layer[layer=%d]: "
+                 "cudaLaunchCooperativeKernel failed: %s\n",
+                 layer_idx, cudaGetErrorString(launch_err));
+    return -2;
+  }
+  return 0;
 }

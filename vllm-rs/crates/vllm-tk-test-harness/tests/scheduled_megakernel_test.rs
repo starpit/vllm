@@ -2025,6 +2025,12 @@ fn cp5_solver_driven_natural_forward_bench() {
         SolveResult::Infeasible => panic!("solver reported infeasible — check the library"),
     };
 
+    // ── Build the FlashInfer plan once per launch (reused across
+    //    all 16 per-layer FlashInfer calls below). The plan stores
+    //    per-layer PersistentParams + the cooperative grid dims the
+    //    per-layer launcher needs.
+    let mut fi_plan = build_flashinfer_plan(&b, dims);
+
     eprintln!();
     eprintln!("╔═══════════════════════════════════════════════════════════════╗");
     eprintln!("║  CP5-C solver-driven natural sm_89 bench                       ║");
@@ -2155,7 +2161,8 @@ fn cp5_solver_driven_natural_forward_bench() {
     // Dispatch one scheduled subgraph: look up its impl name and
     // call the matching FFI. The interpreter is a flat match —
     // each impl has one corresponding FFI dispatch arm.
-    let dispatch_one = |sg: vllm_tk_macros_core::lowering::assignment::SubgraphId| {
+    // `mut` because the FlashInfer dispatch arm needs &mut fi_plan.
+    let mut dispatch_one = |sg: vllm_tk_macros_core::lowering::assignment::SubgraphId| {
         let impl_id = plan.assignment.impls[&sg];
         let imp_name = library.get(impl_id).name();
         let claimed = plan.assignment.tiles_in_subgraph(sg);
@@ -2246,12 +2253,21 @@ fn cp5_solver_driven_natural_forward_bench() {
                     std::ptr::null_mut(),
                 );
             },
-            // ── FlashInfer attention — SKIPPED in the interpreter ──
-            // The standalone shim does plan-rebuild per call which
-            // dominates the bench. CP5-D will add a pre-planned
-            // FlashInfer entry point. For now we skip and report
-            // "natural sm_89 minus attention."
-            "flashinfer_standalone_fa2" => {}
+            // ── FlashInfer attention — CP5-D-1 wires it up via a
+            // tiny per-layer launcher that reuses the per-launch
+            // plan built once at the top of this test. Calls
+            // BlockBatchPagedAttentionPersistent::Run via a small
+            // cooperative __global__ wrapper — same code path as
+            // the megakernel's inline FlashInfer dispatch, just
+            // launched from the host one layer at a time.
+            "flashinfer_standalone_fa2" => unsafe {
+                let s = ffi::cp5_run_flashinfer_attention_for_layer(
+                    &mut fi_plan as *mut _,
+                    layer as i32,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(s, 0, "cp5_run_flashinfer_attention_for_layer failed: {s}");
+            },
             // ── Free / cheap passthroughs ──
             // qkv_split is no-op (the qkv buffer is already
             // [Q | K | V] laid out). kv_cache_write is a no-op
@@ -2265,7 +2281,7 @@ fn cp5_solver_driven_natural_forward_bench() {
         }
     };
 
-    let one_pass = || {
+    let mut one_pass = || {
         for (_step, sg) in &scheduled {
             dispatch_one(*sg);
         }
@@ -2297,12 +2313,13 @@ fn cp5_solver_driven_natural_forward_bench() {
         elapsed_ms / NUM_ITERS as f32
     };
 
-    eprintln!("║  measured (50 iters, attn skipped): {avg_ms:6.3} ms                ║");
-    eprintln!("║  CP4 natural microbench (attn skipped):  37.8 ms                ║");
+    eprintln!("║  measured (50 iters, full incl. attn): {avg_ms:6.3} ms              ║");
+    eprintln!("║  CP4 natural microbench (no attention):  37.8 ms                ║");
     eprintln!("║  scheduled megakernel (full):            55.0 ms                ║");
     eprintln!("╚═══════════════════════════════════════════════════════════════╝");
 
     unsafe {
+        ffi::teardown_flashinfer_attention_plan(&mut fi_plan as *mut _);
         ffi::cublasDestroy_v2(handle);
     }
 }

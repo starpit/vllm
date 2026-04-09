@@ -1010,6 +1010,21 @@ impl Worker for MlxWorker {
             }
 
             // Try to reuse a cached KV from the prefix pool.
+            //
+            // Two lookup paths, tried in order:
+            //   1. Flat-hash whole-prefix lookup — only matches when an
+            //      identical prompt ran before.
+            //   2. Per-block span assembly — looks up Relocatable blocks
+            //      individually by scheduler block_id. This is what produces
+            //      the spans/RAG speedup; the flat hash effectively never
+            //      matches because the scheduler hashes per-block parent-
+            //      chained while `hash_prefix` is flat.
+            //
+            // Only if BOTH paths produce nothing do we treat this as a true
+            // miss and reset num_computed → 0 (forwarding the whole prompt).
+            // Resetting earlier — as a previous fix did — disables the span
+            // assembly path entirely, killing the speedup.
+            let scheduler_num_computed = new_req.num_computed_tokens as usize;
             let mut prefix_cache_hit = false;
             let kv_cache = if num_computed > 0 && self.enable_prefix_caching {
                 let prefix = &prompt_ids[..num_computed];
@@ -1030,35 +1045,15 @@ impl Worker for MlxWorker {
                     kv
                 } else {
                     debug!(
-                        "prefix cache miss for req {} ({} computed tokens, forwarding all)",
+                        "flat-hash miss for req {} ({} computed tokens, will try span assembly)",
                         new_req.req_id, num_computed
                     );
-                    // Scheduler thought tokens were cached but our pool
-                    // doesn't have them — forward everything from the start.
-                    num_computed = 0;
                     cache::empty_kv_cache(num_layers)
                 }
             } else {
                 cache::empty_kv_cache(num_layers)
             };
             self.kv_caches.insert(new_req.req_id.clone(), kv_cache);
-
-            // Recompute token slice and positions after potential num_computed reset.
-            // When num_computed was reset to 0 (pool miss), we must forward the
-            // entire prompt — num_tokens from the scheduler only covers the
-            // non-cached portion.
-            let start = num_computed.min(prompt_ids.len());
-            let effective_num_tokens = if num_computed == 0 && new_req.num_computed_tokens > 0 {
-                prompt_ids.len() // pool miss: forward everything
-            } else {
-                num_tokens
-            };
-            let end = (start + effective_num_tokens).min(prompt_ids.len());
-            let tokens_to_use = &prompt_ids[start..end];
-            let pos_offset = num_computed as i32;
-            let positions: Vec<i32> = (0..tokens_to_use.len() as i32)
-                .map(|i| pos_offset + i)
-                .collect();
 
             // Store multimodal data for VLM models (consumed during forward).
             if let Some(mm_data) = new_req.mm_data.clone() {
@@ -1079,18 +1074,23 @@ impl Worker for MlxWorker {
             self.prompt_lens
                 .insert(new_req.req_id.clone(), prompt_ids.len());
 
-            // For prefill with span prefix: if there are Relocatable blocks in the
-            // block pool, concatenate their K/V into the active KV cache. The normal
-            // prefill path will apply RoPE to ALL K (including span blocks) at the
-            // correct new positions via apply_rope_to_cached_k.
-            if num_computed > 0
+            // Span-block prefill assembly: look up Relocatable blocks
+            // individually by scheduler block_id and concatenate them into
+            // the active KV cache. The scheduler's block_id space matches
+            // MlxKvCachePool::block_index because both come from the same
+            // allocator and the pool never evicts (cache.rs:440), so any
+            // block_id the scheduler reports as cached should be present in
+            // the pool — assuming the producing request has finished. Skip
+            // when the flat-hash lookup already populated the cache.
+            let mut any_span_blocks = false;
+            if !prefix_cache_hit
+                && num_computed > 0
                 && let Some(ref ann) = new_req.block_annotations
                 && !new_req.block_ids.is_empty()
             {
                 let block_ids = &new_req.block_ids[0];
                 let mut span_k_parts: Vec<Vec<Array>> = vec![Vec::new(); num_layers];
                 let mut span_v_parts: Vec<Vec<Array>> = vec![Vec::new(); num_layers];
-                let mut any_span_blocks = false;
 
                 for (block_idx, &block_id) in block_ids.iter().enumerate() {
                     let is_relocatable =
@@ -1106,8 +1106,6 @@ impl Worker for MlxWorker {
                     }
                 }
 
-                // If we found span blocks, concatenate them into the active cache
-                // as prefix so prefill attention covers them.
                 if any_span_blocks && let Some(kv_cache) = self.kv_caches.get_mut(&new_req.req_id) {
                     for layer_idx in 0..num_layers {
                         if !span_k_parts[layer_idx].is_empty() {
@@ -1117,15 +1115,11 @@ impl Worker for MlxWorker {
                                 mlx_rs::ops::concatenate_axis(&k_refs, 2),
                                 mlx_rs::ops::concatenate_axis(&v_refs, 2),
                             ) {
-                                // Build or extend the layer cache with span prefix.
                                 let layer_cache = &mut kv_cache[layer_idx];
                                 if layer_cache.is_none() {
                                     *layer_cache =
                                         cache::MlxLayerKvCache::from_kv(&k_cat, &v_cat).ok();
                                 }
-                                // If cache already exists (from prefix pool), the
-                                // span blocks are already incorporated via
-                                // num_computed_tokens. No double-add needed.
                             }
                         }
                     }
@@ -1135,16 +1129,42 @@ impl Worker for MlxWorker {
                         span_k_parts[0].len()
                     );
                 }
-
-                // When span block data is already in the active KV cache (either
-                // from a prefix pool hit or from individual span block assembly),
-                // clear annotation_buffers so decode uses regular forward instead
-                // of forward_with_segments. Otherwise decode would fetch the same
-                // span blocks from the pool again, causing double attention.
-                if prefix_cache_hit || any_span_blocks {
-                    self.annotation_buffers.remove(&new_req.req_id);
-                }
             }
+
+            // When span block data is in the active KV cache (either from a
+            // flat-hash hit or per-block assembly), clear annotation_buffers
+            // so decode uses regular forward instead of forward_with_segments.
+            // Otherwise decode would fetch the same span blocks from the pool
+            // again, causing double attention.
+            if prefix_cache_hit || any_span_blocks {
+                self.annotation_buffers.remove(&new_req.req_id);
+            }
+
+            // True cache miss: scheduler said tokens were cached but neither
+            // lookup path produced any KV state. Forward the entire prompt
+            // from position 0 — otherwise we'd skip num_computed tokens with
+            // no backing KV (the 0% accuracy case 9d0674698 was after).
+            if scheduler_num_computed > 0 && !prefix_cache_hit && !any_span_blocks {
+                debug!(
+                    "true cache miss for req {} — forwarding entire prompt",
+                    new_req.req_id
+                );
+                num_computed = 0;
+            }
+
+            // Compute token slice and positions using the final num_computed.
+            let start = num_computed.min(prompt_ids.len());
+            let effective_num_tokens = if num_computed == 0 && scheduler_num_computed > 0 {
+                prompt_ids.len() // true miss: forward everything
+            } else {
+                num_tokens
+            };
+            let end = (start + effective_num_tokens).min(prompt_ids.len());
+            let tokens_to_use = &prompt_ids[start..end];
+            let pos_offset = num_computed as i32;
+            let positions: Vec<i32> = (0..tokens_to_use.len() as i32)
+                .map(|i| pos_offset + i)
+                .collect();
 
             req_inputs.push(ReqInput {
                 req_id: new_req.req_id.clone(),

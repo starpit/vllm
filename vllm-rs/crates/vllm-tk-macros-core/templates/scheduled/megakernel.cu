@@ -1694,15 +1694,13 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                     // Two cutlass-small calls sharing A=g.rms_gate.
                     //   1. up   = rms_gate × up_w[layer]   → silu_out (β=0)
                     //   2. silu_out = silu(rms_gate × gate_w[layer]) * silu_out
-                    //      via the LinearCombinationSiluMul epilogue
-                    //      (which reads silu_out as `source`).
-                    // Tried pfl_cutlass big 256x128x32: gate_up went
-                    // 19.3 → 21.3 ms (down went 10.2 → 13.7). The big
-                    // tile wins in the standalone fused kernel but
-                    // loses here because all dispatch arms coexist in
-                    // the same TU — adding the big tile bumps the
-                    // megakernel's worst-case register footprint and
-                    // hurts the other phases.
+                    //      via the LinearCombinationSiluMul epilogue.
+                    //
+                    // No inter-pass grid sync: each CTA owns the same
+                    // (M_tile, N_tile) work units in both cutlass calls,
+                    // so the silumul epilogue's read of silu_out[m,n]
+                    // is exactly what THIS CTA wrote in the up pass.
+                    // CTA-local dataflow, no cross-CTA visibility needed.
                     auto* b_up = g.up_w + (size_t)op.layer
                                               * (size_t)MODEL_INTERMEDIATE
                                               * (size_t)MODEL_HIDDEN_DIM;
@@ -1716,7 +1714,6 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                         /*N=*/(int)MODEL_INTERMEDIATE,
                         /*beta=*/0.0f,
                         (char*)tile_smem_dyn, cta_id);
-                    cooperative_groups::this_grid().sync();
                     tile_cutlass_gemm_small_silumul(
                         g.rms_gate, b_gate, g.silu_out,
                         /*M=*/(int)MODEL_SEQ_LEN,
@@ -1843,7 +1840,15 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                         /*N=*/(int)MODEL_INTERMEDIATE,
                         /*beta=*/0.0f,
                         (char*)tile_smem_dyn, cta_id);
-                    cooperative_groups::this_grid().sync();
+                    // NO inter-pass grid sync: each CTA owns the same
+                    // (M_tile, N_tile) work units in both cutlass calls
+                    // (the `for (wu = cta_id; wu < total_work; wu += NUM_CTAS)`
+                    // distribution is deterministic across calls), so the
+                    // silumul epilogue's read of silu_out[m,n] is exactly
+                    // what THIS CTA wrote in the up pass — CTA-local
+                    // dataflow, no cross-CTA visibility needed. The
+                    // __syncthreads at the end of the cutlass body loop
+                    // handles intra-block ordering.
                     tile_cutlass_gemm_small_silumul(
                         g.rms_gate, b_gate, g.silu_out,
                         /*M=*/(int)MODEL_SEQ_LEN,

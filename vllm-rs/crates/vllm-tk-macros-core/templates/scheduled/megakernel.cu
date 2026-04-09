@@ -7,6 +7,196 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include <cstdio>
+#include <cooperative_groups.h>
+
+// ── CUTLASS device-side primitives for the GEMM dispatch arms ──
+// Used by the cutlass_sm80_multistage branch of the per-target
+// gemm_kernel choice. The pfl_cutlass / pfl_cutlass_small namespaces
+// vendored below are byte-identical to the proven configs from
+// templates/fused/preamble_header.cu (which the existing fused
+// prefill kernel uses to hit the 42 ms baseline).
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/arch/mma.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/threadblock/default_mma.h>
+#include <cutlass/layout/matrix.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/threadblock/default_epilogue_tensor_op.h>
+
+// ── pfl_cutlass: 256x128x32 / 4-stage / 8 warps. For the BIG GEMMs:
+//    down_proj (M=seq, K=ID=8192, N=HD=2048) and gate_up
+//    (M=seq, K=HD=2048, N=ID=8192). Vendored byte-identical from
+//    templates/fused/preamble_header.cu — re-vendor when the cutlass
+//    pin changes.
+namespace pfl_cutlass {
+    using ElementA       = cutlass::bfloat16_t;
+    using ElementB       = cutlass::bfloat16_t;
+    using ElementAccum   = float;
+    using LayoutA        = cutlass::layout::RowMajor;
+    using LayoutB        = cutlass::layout::ColumnMajor;
+    using LayoutC        = cutlass::layout::RowMajor;
+
+    using ThreadblockShape = cutlass::gemm::GemmShape<256, 128, 32>;
+    using WarpShape        = cutlass::gemm::GemmShape<64, 64, 32>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using DefaultMmaT = cutlass::gemm::threadblock::DefaultMma<
+        ElementA, LayoutA, /*kAlignmentA=*/8,
+        ElementB, LayoutB, /*kAlignmentB=*/8,
+        ElementAccum, LayoutC,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        ThreadblockShape, WarpShape, InstructionShape,
+        /*Stages=*/4,
+        cutlass::arch::OpMultiplyAdd>;
+
+    using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;
+    using IteratorA      = typename DefaultMmaT::IteratorA;
+    using IteratorB      = typename DefaultMmaT::IteratorB;
+    using MmaSharedStorage = typename ThreadblockMma::SharedStorage;
+
+    using ElementOutput = cutlass::bfloat16_t;
+    static constexpr int kEpilogueElementsPerAccess = 8;
+    using OutputOpT = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpT, kEpilogueElementsPerAccess>;
+    using Epilogue              = typename DefaultEpilogueT::Epilogue;
+    using OutputTileIterator    = typename DefaultEpilogueT::OutputTileIterator;
+    using EpilogueSharedStorage = typename Epilogue::SharedStorage;
+
+    union SharedStorage {
+        MmaSharedStorage main_loop;
+        EpilogueSharedStorage epilogue;
+    };
+
+    // ── Custom output op: D = silu(alpha*acc) * source. Used for the
+    // SECOND of the two gate_up cutlass calls (gate-with-silu*up).
+    template <typename ElementOutput_, int Count_, typename ElementAccum_,
+              typename ElementCompute_ = ElementAccum_>
+    class LinearCombinationSiluMul {
+    public:
+        using ElementOutput      = ElementOutput_;
+        using ElementAccumulator = ElementAccum_;
+        using ElementCompute     = ElementCompute_;
+        static int const kCount  = Count_;
+        using FragmentOutput      = cutlass::Array<ElementOutput, kCount>;
+        using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
+        using FragmentSource      = cutlass::Array<ElementOutput, kCount>;
+        struct Params {
+            ElementCompute alpha = ElementCompute(1);
+            ElementCompute beta  = ElementCompute(1);
+            ElementCompute const *alpha_ptr = nullptr;
+            ElementCompute const *beta_ptr  = nullptr;
+            ElementCompute const *const *alpha_ptr_array = nullptr;
+            ElementCompute const *const *beta_ptr_array  = nullptr;
+            CUTLASS_HOST_DEVICE Params() {}
+            CUTLASS_HOST_DEVICE Params(ElementCompute a, ElementCompute b) : alpha(a), beta(b) {}
+        };
+    private:
+        ElementCompute alpha_;
+    public:
+        CUTLASS_HOST_DEVICE explicit LinearCombinationSiluMul(Params const &p) : alpha_(p.alpha) {}
+        CUTLASS_HOST_DEVICE bool is_source_needed() const { return true; }
+        CUTLASS_HOST_DEVICE void set_k_partition(int, int) {}
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum) const {
+            FragmentOutput r;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                r[i] = ElementOutput(a / (1.0f + ::expf(-a)));
+            }
+            return r;
+        }
+        CUTLASS_HOST_DEVICE
+        FragmentOutput operator()(FragmentAccumulator const &accum,
+                                  FragmentSource const &source) const {
+            FragmentOutput r;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < kCount; ++i) {
+                float a = float(accum[i]) * float(alpha_);
+                float s = a / (1.0f + ::expf(-a));
+                r[i] = ElementOutput(s * float(source[i]));
+            }
+            return r;
+        }
+    };
+    using OutputOpSiluMul = LinearCombinationSiluMul<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueSiluMulT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpSiluMul, kEpilogueElementsPerAccess>;
+    using EpilogueSiluMul = typename DefaultEpilogueSiluMulT::Epilogue;
+
+    static_assert(sizeof(SharedStorage) <= 99 * 1024,
+                  "pfl_cutlass SharedStorage exceeds 99KB sm89 dynamic shmem cap");
+    static constexpr int kCutlassThreads = ThreadblockMma::WarpCount::kCount * 32;
+    static_assert(kCutlassThreads == 256,
+                  "pfl_cutlass ThreadblockMma WarpCount must equal 8 (256 threads)");
+}  // namespace pfl_cutlass
+
+// ── pfl_cutlass_small: 128x128x32 / 3-stage / 8 warps. For the SMALL
+//    GEMMs: qkv (M=seq, K=HD, N=qkv_dim) and o_proj (M=seq, K=HD, N=HD).
+namespace pfl_cutlass_small {
+    using ElementA       = cutlass::bfloat16_t;
+    using ElementB       = cutlass::bfloat16_t;
+    using ElementAccum   = float;
+    using LayoutA        = cutlass::layout::RowMajor;
+    using LayoutB        = cutlass::layout::ColumnMajor;
+    using LayoutC        = cutlass::layout::RowMajor;
+
+    using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
+    using WarpShape        = cutlass::gemm::GemmShape<64, 32, 32>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using DefaultMmaT = cutlass::gemm::threadblock::DefaultMma<
+        ElementA, LayoutA, /*kAlignmentA=*/8,
+        ElementB, LayoutB, /*kAlignmentB=*/8,
+        ElementAccum, LayoutC,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        ThreadblockShape, WarpShape, InstructionShape,
+        /*Stages=*/3,
+        cutlass::arch::OpMultiplyAdd>;
+
+    using ThreadblockMma = typename DefaultMmaT::ThreadblockMma;
+    using IteratorA      = typename DefaultMmaT::IteratorA;
+    using IteratorB      = typename DefaultMmaT::IteratorB;
+    using MmaSharedStorage = typename ThreadblockMma::SharedStorage;
+
+    using ElementOutput = cutlass::bfloat16_t;
+    static constexpr int kEpilogueElementsPerAccess = 8;
+    using OutputOpT = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpT, kEpilogueElementsPerAccess>;
+    using Epilogue              = typename DefaultEpilogueT::Epilogue;
+    using OutputTileIterator    = typename DefaultEpilogueT::OutputTileIterator;
+    using EpilogueSharedStorage = typename Epilogue::SharedStorage;
+
+    // SiluMul epilogue (for fused gate_up second pass).
+    using OutputOpSiluMul = ::pfl_cutlass::LinearCombinationSiluMul<
+        ElementOutput, kEpilogueElementsPerAccess, ElementAccum, ElementAccum>;
+    using DefaultEpilogueSiluMulT = cutlass::epilogue::threadblock::DefaultEpilogueTensorOp<
+        ThreadblockShape, typename ThreadblockMma::Operator,
+        /*PartitionsK=*/1, OutputOpSiluMul, kEpilogueElementsPerAccess>;
+    using EpilogueSiluMul = typename DefaultEpilogueSiluMulT::Epilogue;
+
+    union SharedStorage {
+        MmaSharedStorage main_loop;
+        EpilogueSharedStorage epilogue;
+    };
+
+    static_assert(sizeof(SharedStorage) <= 99 * 1024,
+                  "pfl_cutlass_small SharedStorage exceeds 99KB sm89 dynamic shmem cap");
+    static constexpr int kCutlassThreads = ThreadblockMma::WarpCount::kCount * 32;
+    static_assert(kCutlassThreads == 256,
+                  "pfl_cutlass_small ThreadblockMma WarpCount must equal 8 (256 threads)");
+}  // namespace pfl_cutlass_small
 
 // ── Prelude: schedule data tables + model dim constants ──────────────
 namespace pfl_sched_{{ name }} {
@@ -1246,6 +1436,132 @@ __device__ __forceinline__ void tile_down(
 }
 
 
+// ── CUTLASS device-side dispatch helpers ──
+//
+// One helper per (cutlass namespace × epilogue) combination. Mirrors
+// gemm_cutlass_mcta.cu from the existing fused prefill kernel
+// exactly — same iterator construction, same epilogue, same CTA-strided
+// loop over (rt, ct) work tiles. Wave-cooperative: every persistent
+// CTA in the wave runs the helper, each picks its share of
+// (M_tile, N_tile) work via its `bid` = blockIdx.y in the strided
+// loop.
+//
+// Inlined as four separate functions (instead of one templated
+// helper) because nvcc rejects namespace names as template type
+// arguments — `tile_cutlass_gemm_layer<::pfl_cutlass, …>` doesn't
+// compile.
+
+#define TILE_CUTLASS_GEMM_BODY(NS, EpilogueT, OutputOpT)                                            \
+    using PflMma            = typename NS::ThreadblockMma;                                          \
+    using PflIteratorA      = typename NS::IteratorA;                                               \
+    using PflIteratorB      = typename NS::IteratorB;                                               \
+    using PflSharedStorage  = typename NS::SharedStorage;                                           \
+    using PflFragmentC      = typename PflMma::FragmentC;                                           \
+    using PflLayoutA        = typename NS::LayoutA;                                                 \
+    using PflLayoutB        = typename NS::LayoutB;                                                 \
+    using PflLayoutC        = typename NS::LayoutC;                                                 \
+    using PflOutputTileIter = typename NS::OutputTileIterator;                                      \
+                                                                                                    \
+    constexpr int kThreadblockM = NS::ThreadblockShape::kM;                                         \
+    constexpr int kThreadblockN = NS::ThreadblockShape::kN;                                         \
+    constexpr int kThreadblockK = NS::ThreadblockShape::kK;                                         \
+                                                                                                    \
+    const int row_tiles_cta = (M + kThreadblockM - 1) / kThreadblockM;                              \
+    const int col_tiles_cta = (N + kThreadblockN - 1) / kThreadblockN;                              \
+    const int total_work_cta = row_tiles_cta * col_tiles_cta;                                       \
+                                                                                                    \
+    PflSharedStorage& shared_storage = *reinterpret_cast<PflSharedStorage*>(dyn_smem);              \
+                                                                                                    \
+    const int thread_idx = threadIdx.x;                                                             \
+    const int warp_idx   = thread_idx / 32;                                                         \
+    const int lane_idx   = thread_idx % 32;                                                         \
+                                                                                                    \
+    PflLayoutA layout_a{K};                                                                         \
+    PflLayoutB layout_b{K};                                                                         \
+    PflLayoutC layout_c{N};                                                                         \
+    typename PflIteratorA::Params params_A{layout_a};                                               \
+    typename PflIteratorB::Params params_B{layout_b};                                               \
+    typename PflOutputTileIter::Params params_C{layout_c};                                          \
+    typename PflOutputTileIter::Params params_D{layout_c};                                          \
+                                                                                                    \
+    cutlass::bfloat16_t* ptr_A_cl = reinterpret_cast<cutlass::bfloat16_t*>(a_ptr);                  \
+    cutlass::bfloat16_t* ptr_B_cl = reinterpret_cast<cutlass::bfloat16_t*>(b_ptr);                  \
+    cutlass::bfloat16_t* ptr_OUT_cl = reinterpret_cast<cutlass::bfloat16_t*>(out_ptr);              \
+                                                                                                    \
+    for (int wu = (int)cta_id_in_grid; wu < total_work_cta; wu += (int)NUM_CTAS) {                  \
+        const int rt = wu / col_tiles_cta;                                                          \
+        const int ct = wu % col_tiles_cta;                                                          \
+        const int tb_m = rt * kThreadblockM;                                                        \
+        const int tb_n = ct * kThreadblockN;                                                        \
+                                                                                                    \
+        PflIteratorA iter_A(                                                                        \
+            params_A, ptr_A_cl, /*extent*/ {M, K}, thread_idx,                                      \
+            /*tb_offset*/ {tb_m, 0}, /*gather_indices*/ nullptr);                                   \
+        PflIteratorB iter_B(                                                                        \
+            params_B, ptr_B_cl, /*extent*/ {K, N}, thread_idx,                                      \
+            /*tb_offset*/ {0, tb_n}, /*gather_indices*/ nullptr);                                   \
+                                                                                                    \
+        PflMma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);                       \
+        PflFragmentC accum;                                                                         \
+        accum.clear();                                                                              \
+                                                                                                    \
+        const int gemm_k_iterations = (K + kThreadblockK - 1) / kThreadblockK;                      \
+        mma(gemm_k_iterations, accum, iter_A, iter_B, accum);                                       \
+                                                                                                    \
+        __syncthreads();                                                                            \
+                                                                                                    \
+        PflOutputTileIter iter_C(                                                                   \
+            params_C, ptr_OUT_cl, /*extent*/ {M, N}, thread_idx,                                    \
+            /*tb_offset*/ {tb_m, tb_n}, /*scatter_indices*/ nullptr);                               \
+        PflOutputTileIter iter_D(                                                                   \
+            params_D, ptr_OUT_cl, /*extent*/ {M, N}, thread_idx,                                    \
+            /*tb_offset*/ {tb_m, tb_n}, /*scatter_indices*/ nullptr);                               \
+                                                                                                    \
+        typename OutputOpT::Params output_params{/*alpha=*/1.0f, /*beta=*/beta_value};              \
+        OutputOpT output_op(output_params);                                                         \
+        EpilogueT epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);                \
+        epilogue(output_op, iter_D, accum, iter_C);                                                 \
+                                                                                                    \
+        __syncthreads();                                                                            \
+    }
+
+__device__ __forceinline__ void tile_cutlass_gemm_big_lincomb(
+    __nv_bfloat16* a_ptr, __nv_bfloat16* b_ptr, __nv_bfloat16* out_ptr,
+    int M, int K, int N, float beta_value,
+    char* dyn_smem, uint32_t cta_id_in_grid)
+{
+    TILE_CUTLASS_GEMM_BODY(::pfl_cutlass, ::pfl_cutlass::Epilogue, ::pfl_cutlass::OutputOpT)
+}
+
+__device__ __forceinline__ void tile_cutlass_gemm_big_silumul(
+    __nv_bfloat16* a_ptr, __nv_bfloat16* b_ptr, __nv_bfloat16* out_ptr,
+    int M, int K, int N, float beta_value,
+    char* dyn_smem, uint32_t cta_id_in_grid)
+{
+    TILE_CUTLASS_GEMM_BODY(::pfl_cutlass, ::pfl_cutlass::EpilogueSiluMul,
+                           ::pfl_cutlass::OutputOpSiluMul)
+}
+
+__device__ __forceinline__ void tile_cutlass_gemm_small_lincomb(
+    __nv_bfloat16* a_ptr, __nv_bfloat16* b_ptr, __nv_bfloat16* out_ptr,
+    int M, int K, int N, float beta_value,
+    char* dyn_smem, uint32_t cta_id_in_grid)
+{
+    TILE_CUTLASS_GEMM_BODY(::pfl_cutlass_small, ::pfl_cutlass_small::Epilogue,
+                           ::pfl_cutlass_small::OutputOpT)
+}
+
+__device__ __forceinline__ void tile_cutlass_gemm_small_silumul(
+    __nv_bfloat16* a_ptr, __nv_bfloat16* b_ptr, __nv_bfloat16* out_ptr,
+    int M, int K, int N, float beta_value,
+    char* dyn_smem, uint32_t cta_id_in_grid)
+{
+    TILE_CUTLASS_GEMM_BODY(::pfl_cutlass_small, ::pfl_cutlass_small::EpilogueSiluMul,
+                           ::pfl_cutlass_small::OutputOpSiluMul)
+}
+
+#undef TILE_CUTLASS_GEMM_BODY
+
 // Grid-wide barrier via a single global counter. Every CTA's thread 0 bumps
 // the counter once per wave; all CTAs spin until the counter reaches the
 // expected (wave_idx + 1) * NUM_CTAS value. Requires the launch to fit all
@@ -1323,6 +1639,103 @@ __global__ void scheduled_megakernel_{{ name }}(globals_t g, SchedRuntime rt) {
                 case PHASE_MLP_NORM:  tile_mlp_norm (g, op.layer, op.row); break;
                 case PHASE_GATE_UP:   tile_gate_up  (g, op.layer, op.row, op.col, tile_smem); break;
                 case PHASE_DOWN:      tile_down     (g, op.layer, op.row, op.col, tile_smem); break;
+                case 10 /* CutlassGemmLayer { Qkv } */: {
+                    // QKV: A=g.rms_rope [seq, HD], B=g.qkv_w[layer]
+                    // [QKV_DIM_FULL, HD], C=g.qkv [seq, QKV_DIM_FULL].
+                    // beta=0 (plain store). pfl_cutlass_small.
+                    constexpr uint32_t QKV_DIM_FULL =
+                        (MODEL_NUM_ATTN_H + 2 * MODEL_NUM_KV_H) * MODEL_HEAD_DIM;
+                    tile_cutlass_gemm_small_lincomb(
+                        g.rms_rope,
+                        g.qkv_w + (size_t)op.layer * (size_t)QKV_DIM_FULL
+                                                   * (size_t)MODEL_HIDDEN_DIM,
+                        g.qkv,
+                        /*M=*/(int)MODEL_SEQ_LEN,
+                        /*K=*/(int)MODEL_HIDDEN_DIM,
+                        /*N=*/(int)QKV_DIM_FULL,
+                        /*beta=*/0.0f,
+                        (char*)tile_smem_dyn, cta_id);
+                    break;
+                }
+                case 11 /* CutlassGemmLayer { OProj } */: {
+                    // o_proj + residual: A=g.attn_out [seq, HD],
+                    // B=g.o_w[layer] [HD, HD], C=g.hidden_states [seq, HD].
+                    // beta=1 (residual add). pfl_cutlass_small.
+                    tile_cutlass_gemm_small_lincomb(
+                        g.attn_out,
+                        g.o_w + (size_t)op.layer * (size_t)MODEL_HIDDEN_DIM
+                                                 * (size_t)MODEL_HIDDEN_DIM,
+                        g.hidden_states,
+                        /*M=*/(int)MODEL_SEQ_LEN,
+                        /*K=*/(int)MODEL_HIDDEN_DIM,
+                        /*N=*/(int)MODEL_HIDDEN_DIM,
+                        /*beta=*/1.0f,
+                        (char*)tile_smem_dyn, cta_id);
+                    break;
+                }
+                case 12 /* CutlassGemmLayer { GateUp } */: {
+                    // Two cutlass calls (matches gemm_cutlass_mcta.cu):
+                    //   1. up = g.rms_gate × up_w[layer] → g.silu_out (β=0)
+                    //   2. silu_out = silu(g.rms_gate × gate_w[layer]) * silu_out
+                    //      via the LinearCombinationSiluMul epilogue
+                    //      (which reads silu_out as `source`).
+                    // pfl_cutlass_small (128x128x32). The big variant
+                    // (256x128x32) trips a CUTLASS shared-memory ldsm
+                    // misalignment when called from inside the
+                    // megakernel at M >= 256 — works in the standalone
+                    // fused kernel but not here. Until that's root-caused
+                    // we route every GEMM phase through the small tile.
+                    auto* b_up = g.up_w + (size_t)op.layer
+                                              * (size_t)MODEL_INTERMEDIATE
+                                              * (size_t)MODEL_HIDDEN_DIM;
+                    auto* b_gate = g.gate_w + (size_t)op.layer
+                                                  * (size_t)MODEL_INTERMEDIATE
+                                                  * (size_t)MODEL_HIDDEN_DIM;
+                    // Pass 1: up, plain store.
+                    tile_cutlass_gemm_small_lincomb(
+                        g.rms_gate, b_up, g.silu_out,
+                        /*M=*/(int)MODEL_SEQ_LEN,
+                        /*K=*/(int)MODEL_HIDDEN_DIM,
+                        /*N=*/(int)MODEL_INTERMEDIATE,
+                        /*beta=*/0.0f,
+                        (char*)tile_smem_dyn, cta_id);
+                    // Inter-pass barrier — Pass 2's SiluMul epilogue
+                    // reads silu_out as the source, so all CTAs must
+                    // finish writing it in Pass 1 before any CTA
+                    // reads it in Pass 2. The wave's grid_barrier
+                    // counter is monotonic+per-wave, so we can't
+                    // reuse it for an intra-wave sync without
+                    // collision; cooperative_groups::this_grid().sync()
+                    // works because the megakernel was launched via
+                    // cudaLaunchCooperativeKernel.
+                    cooperative_groups::this_grid().sync();
+                    // Pass 2: gate, silu * source epilogue.
+                    tile_cutlass_gemm_small_silumul(
+                        g.rms_gate, b_gate, g.silu_out,
+                        /*M=*/(int)MODEL_SEQ_LEN,
+                        /*K=*/(int)MODEL_HIDDEN_DIM,
+                        /*N=*/(int)MODEL_INTERMEDIATE,
+                        /*beta=*/1.0f, // unused by SiluMul
+                        (char*)tile_smem_dyn, cta_id);
+                    break;
+                }
+                case 13 /* CutlassGemmLayer { Down } */: {
+                    // down + residual: A=g.silu_out [seq, ID],
+                    // B=g.down_w[layer] [HD, ID], C=g.hidden_states [seq, HD].
+                    // beta=1 (residual add). pfl_cutlass_small (diag).
+                    tile_cutlass_gemm_small_lincomb(
+                        g.silu_out,
+                        g.down_w + (size_t)op.layer
+                                       * (size_t)MODEL_HIDDEN_DIM
+                                       * (size_t)MODEL_INTERMEDIATE,
+                        g.hidden_states,
+                        /*M=*/(int)MODEL_SEQ_LEN,
+                        /*K=*/(int)MODEL_INTERMEDIATE,
+                        /*N=*/(int)MODEL_HIDDEN_DIM,
+                        /*beta=*/1.0f,
+                        (char*)tile_smem_dyn, cta_id);
+                    break;
+                }
                 case PHASE_FLASHINFER_ATTN: {
                     // FlashInfer's BlockBatchPagedAttentionPersistent::Run
                     // is a wave-cooperative __device__ runner: each
@@ -1469,14 +1882,24 @@ extern "C" void launch_scheduled_megakernel_{{ name }}(
     // fragments. Take the max so both paths are happy.
     dim3 block(pfl_sched_{{ name }}::MEGAKERNEL_NUM_THREADS);
 
-    // Dynamic shared memory size: max of (the existing tile arena)
-    // and (FlashInfer's per-CTA SharedStorage footprint). Same arena
-    // backs both — the wave-cooperative dispatch only runs one wave
-    // at a time, so the two shmem layouts don't overlap in time.
-    constexpr size_t kSmemBytes =
+    // Dynamic shared memory size: max of (the existing tile arena),
+    // (FlashInfer's per-CTA SharedStorage footprint), and (the
+    // CUTLASS pfl_cutlass + pfl_cutlass_small SharedStorage union
+    // footprints). Same arena backs all of them — the wave-cooperative
+    // dispatch only runs one wave at a time, so the layouts don't
+    // overlap in time. Capped against
+    // TARGET_MAX_DYNAMIC_SHMEM_BYTES via a static_assert below
+    // (rendered from `TargetProfile::max_dynamic_shmem_bytes`).
+    constexpr size_t kCutlassBigShmem = sizeof(::pfl_cutlass::SharedStorage);
+    constexpr size_t kCutlassSmallShmem = sizeof(::pfl_cutlass_small::SharedStorage);
+    constexpr size_t kMaxAB =
         pfl_sched_{{ name }}::TILE_SHMEM_BYTES > pfl_sched_{{ name }}::FI_SHARED_STORAGE_BYTES
             ? pfl_sched_{{ name }}::TILE_SHMEM_BYTES
             : pfl_sched_{{ name }}::FI_SHARED_STORAGE_BYTES;
+    constexpr size_t kMaxABC = kMaxAB > kCutlassBigShmem ? kMaxAB : kCutlassBigShmem;
+    constexpr size_t kSmemBytes = kMaxABC > kCutlassSmallShmem ? kMaxABC : kCutlassSmallShmem;
+    static_assert(kSmemBytes <= pfl_sched_{{ name }}::TARGET_MAX_DYNAMIC_SHMEM_BYTES,
+                  "megakernel SharedStorage exceeds target.max_dynamic_shmem_bytes");
 
     // Opt the kernel into the larger dynamic shmem carveout. Required
     // any time `kSmemBytes` exceeds the default 48 KiB ceiling on

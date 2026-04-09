@@ -644,7 +644,7 @@ pub const SCHEDULED_PREFILL_TINY_CTAS: u32 = 4;
 pub const SCHEDULED_PREFILL_KV_PAGE_SIZE: u32 = 16;
 
 pub fn generate_scheduled_prefill_tiny() -> String {
-    use crate::kernel_library::coalesce_with_flashinfer_attention as coalesce;
+    use crate::kernel_library::coalesce_with_target_profile;
     use crate::reified_dag::{ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
@@ -653,7 +653,7 @@ pub fn generate_scheduled_prefill_tiny() -> String {
     let profile = TargetProfile::l4_sm89();
     let dims = scheduled_prefill_tiny_dims();
     let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
-    let dag = coalesce(&reified);
+    let dag = coalesce_with_target_profile(&reified, &profile);
     let cost = CostModel::from_dag(&dag);
     // CTA pool size = profile.cooperative_grid_size() so the
     // FlashInfer attention runner inside the megakernel sees a
@@ -691,7 +691,7 @@ pub fn scheduled_prefill_medium_dims() -> reified_dag::LlamaDims {
 pub const SCHEDULED_PREFILL_MEDIUM_CTAS: u32 = 16;
 
 pub fn generate_scheduled_prefill_medium() -> String {
-    use crate::kernel_library::coalesce_with_flashinfer_attention as coalesce;
+    use crate::kernel_library::coalesce_with_target_profile;
     use crate::reified_dag::{ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
@@ -700,7 +700,7 @@ pub fn generate_scheduled_prefill_medium() -> String {
     let profile = TargetProfile::l4_sm89();
     let dims = scheduled_prefill_medium_dims();
     let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
-    let dag = coalesce(&reified);
+    let dag = coalesce_with_target_profile(&reified, &profile);
     let cost = CostModel::from_dag(&dag);
     let sched = partition_into_waves(&dag, profile.cooperative_grid_size(), &cost, 100);
     emit_scheduled_megakernel_cu(
@@ -759,7 +759,7 @@ fn ctas_for_variant(
 /// params, then apply the variant's overrides. Missing dim parameters are
 /// an error.
 pub fn generate_scheduled_prefill_variants(dsl: &str) -> Result<Vec<ScheduledVariant>, String> {
-    use crate::kernel_library::coalesce_with_flashinfer_attention as coalesce;
+    use crate::kernel_library::coalesce_with_target_profile;
     use crate::reified_dag::{LlamaDims, ReifiedDag, TileSizes};
     use crate::schedule::{CostModel, partition_into_waves};
     use crate::scheduled_codegen::emit_scheduled_megakernel_cu;
@@ -805,7 +805,7 @@ pub fn generate_scheduled_prefill_variants(dsl: &str) -> Result<Vec<ScheduledVar
             .map_err(|e| format!("variant `{}`: {e}", variant.name))?;
 
         let reified = ReifiedDag::reify_llama(dims, TileSizes::default_v1());
-        let dag = coalesce(&reified);
+        let dag = coalesce_with_target_profile(&reified, &profile);
         let cost = CostModel::from_dag(&dag);
         let num_ctas = ctas_for_variant(&profile, &dims);
         let sched = partition_into_waves(&dag, num_ctas, &cost, 100);

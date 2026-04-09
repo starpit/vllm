@@ -651,7 +651,11 @@ pub fn coalesce_with_target_profile(
     ) {
         coalesced = coalesce_gemm_phase(coalesced, GemmPhase::Qkv);
         coalesced = coalesce_gemm_phase(coalesced, GemmPhase::OProj);
-        coalesced = coalesce_gemm_phase(coalesced, GemmPhase::GateUp);
+        // GateUp coalesce currently triggers a flashinfer-attention
+        // illegal-address downstream — leaving it on the hand-written
+        // tile path until the underlying schedule/smem interaction is
+        // root-caused. See feedback in megakernel.cu case 12.
+        // coalesced = coalesce_gemm_phase(coalesced, GemmPhase::GateUp);
         coalesced = coalesce_gemm_phase(coalesced, GemmPhase::Down);
     }
 

@@ -160,9 +160,21 @@ impl TargetProfile {
             cooperative_blocks_per_sm: 1,
             max_dynamic_shmem_bytes: 99 * 1024,
 
-            // Phase D ships HandWrittenWmma; Phase E flips this to
-            // CutlassSm80Multistage when the template branch lands.
-            gemm_kernel: GemmKernelChoice::HandWrittenWmma,
+            // Phase E2b: GEMM phases dispatch through the
+            // pfl_cutlass / pfl_cutlass_small namespaces vendored
+            // into the megakernel template (matching the existing
+            // fused prefill kernel's 42 ms baseline). The tile shape
+            // and pipeline stages here are informational — the
+            // namespaces themselves are hardcoded with the
+            // matching values, since CUTLASS template instantiation
+            // happens at C++ template-instantiation time, not
+            // codegen time.
+            gemm_kernel: GemmKernelChoice::CutlassSm80Multistage {
+                tile_m: 256,
+                tile_n: 128,
+                tile_k: 32,
+                pipeline_stages: 4,
+            },
             attention_kernel: AttentionKernelChoice::FlashInferPersistent,
             norm_kernel: NormKernelChoice::HandWrittenWarpShuffle,
             rope_kernel: RopeKernelChoice::HandWrittenSplitHalf,

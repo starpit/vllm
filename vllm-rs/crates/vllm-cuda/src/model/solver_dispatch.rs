@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Solver-driven forward pass dispatch.
 //!
-//! The `forward!` macro runs the constraint solver at compile time
-//! and emits `solver_forward_layer()` — a per-layer dispatch function
-//! that selects the optimal kernel mix based on `num_tokens`.
-//!
-//! The generated code uses the same types as the existing eager
-//! forward pass: `OwnedTensor`, `GpuTensor`, `CublasHandle`, etc.
-//! No FFI shim layer, no raw pointer juggling.
+//! The `forward!` macro parses the model's forward structure from the
+//! DSL body, runs the constraint solver at compile time, and emits
+//! `solver_forward_layer()`.
 
 use crate::alloc::OwnedTensor;
 use crate::device::GpuDevice;
@@ -17,15 +13,11 @@ use crate::tensor::{GpuTensor, TensorView};
 use crate::{kernels, layers::LinearLayer};
 
 // ── CUTLASS standalone GEMM FFI ─────────────────────────────────
-//
-// Linked from libcutlass_standalone_gemm.a, compiled by
-// vllm-kernels-cuda's build.rs from csrc/cutlass_standalone_gemm.cu.
 
 type CUstream = cudarc::driver::sys::CUstream;
 
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
-    /// CUTLASS 128×128×32 bf16 GEMM: C = alpha*A@B^T + beta*C.
     pub fn cutlass_gemm_128x128_launch(
         c: *mut u16,
         a: *const u16,
@@ -38,7 +30,6 @@ unsafe extern "C" {
         stream: u64,
     ) -> i32;
 
-    /// CUTLASS 64×64×32 bf16 GEMM: C = alpha*A@B^T + beta*C.
     pub fn cutlass_gemm_64x64_launch(
         c: *mut u16,
         a: *const u16,
@@ -52,18 +43,29 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-// The forward! macro expands here, emitting:
-// - solver_forward_layer() function
-// - solver_layer_bucket_N() functions (one per workload bucket)
+// ── forward! expansion ──────────────────────────────────────────
+//
+// The DSL body describes the model structure. The solver runs at
+// compile time for each model in the `models:` list and emits
+// per-bucket dispatch functions.
+
 vllm_tk_macros::forward! {
-    model: {
-        layers: 28,
-        hidden: 3072,
-        intermediate: 8192,
-        heads: 24,
-        kv_heads: 8,
-        head_dim: 128,
-    },
+    for layer in 0..NL {
+        let normed = rmsnorm(hidden_states, attn_norm[layer]);
+        let qkv = gemm(normed, qkv_weights[layer]);
+        let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+        let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+        hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+        let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+        let gate = silu(gemm(normed2, gate_weights[layer]));
+        let up = gemm(normed2, up_weights[layer]);
+        hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+    }
+
+    models: [
+        { layers: 28, hidden: 3072, intermediate: 8192, heads: 24, kv_heads: 8, head_dim: 128 },
+    ],
     target: l4_sm89,
     workloads: [1..4096],
 }

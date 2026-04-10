@@ -1343,7 +1343,8 @@ impl Implementation for TkFusedMlpBlockImpl {
         "tk_fused_mlp_block"
     }
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
+        // Disabled until TK fused MLP codegen is wired.
+        false
     }
     fn matches(
         &self,

@@ -1,29 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
-//! DSL parser for the `compile!` macro.
+//! DSL parser for the `forward!` macro.
 //!
-//! Parses the binding-mode DSL:
+//! Syntax:
 //!
 //! ```ignore
-//! compile! {
-//!     model: llama_3_2_1b,
+//! forward! {
+//!     // Body: the model's forward pass structure (required, always first).
+//!     for layer in 0..NL {
+//!         let normed = rmsnorm(hidden_states, attn_norm[layer]);
+//!         let qkv = gemm(normed, qkv_weights[layer]);
+//!         ...
+//!     }
+//!
+//!     // Optional fields after the body:
+//!     models: [
+//!         { layers: 28, hidden: 3072, intermediate: 8192, heads: 24, kv_heads: 8, head_dim: 128 },
+//!     ],
 //!     target: l4_sm89,
-//!     workloads: [1..1024],
+//!     workloads: [1..4096],
 //! }
 //! ```
 //!
-//! Each field is either a concrete identifier (resolved at proc-macro
-//! time) or the keyword `runtime` (deferred to model load).
+//! If `models:` is omitted, defaults to runtime (solver at startup).
+//! If `target:` is omitted, defaults to runtime (GPU detection at startup).
+//! If `workloads:` is omitted, uses the default grid.
 
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitInt, Token, braced};
 
+use crate::lowering::tile_graph::ModelDims;
+
 /// A binding that's either resolved at compile time or deferred to runtime.
 #[derive(Clone, Debug)]
 pub enum Binding<T> {
-    /// Concrete value, resolved at proc-macro time.
     Static(T),
-    /// Deferred to runtime — the proc macro emits code that resolves
-    /// this at model load.
     Runtime,
 }
 
@@ -44,63 +54,15 @@ impl<T> Binding<T> {
     }
 }
 
-/// Known model identifiers. Each maps to a specific TileGraph
-/// configuration (num_layers, hidden_size, etc.).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ModelId {
-    Llama3_2_1B,
-    Llama3_2_3B,
-    Llama3_1_8B,
+/// One inline model specification.
+#[derive(Clone, Debug)]
+pub struct InlineModel {
+    pub num_layers: u16,
+    pub dims: ModelDims,
 }
 
-impl ModelId {
-    pub fn num_layers(&self) -> u16 {
-        match self {
-            ModelId::Llama3_2_1B => 16,
-            ModelId::Llama3_2_3B => 28,
-            ModelId::Llama3_1_8B => 32,
-        }
-    }
-
-    pub fn dims(&self) -> crate::lowering::tile_graph::ModelDims {
-        use crate::lowering::tile_graph::ModelDims;
-        match self {
-            ModelId::Llama3_2_1B => ModelDims {
-                hidden_size: 2048,
-                intermediate_size: 8192,
-                num_attention_heads: 32,
-                num_kv_heads: 8,
-                head_dim: 64,
-            },
-            ModelId::Llama3_2_3B => ModelDims {
-                hidden_size: 3072,
-                intermediate_size: 8192,
-                num_attention_heads: 24,
-                num_kv_heads: 8,
-                head_dim: 128,
-            },
-            ModelId::Llama3_1_8B => ModelDims {
-                hidden_size: 4096,
-                intermediate_size: 14336,
-                num_attention_heads: 32,
-                num_kv_heads: 8,
-                head_dim: 128,
-            },
-        }
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            ModelId::Llama3_2_1B => "llama_3_2_1b",
-            ModelId::Llama3_2_3B => "llama_3_2_3b",
-            ModelId::Llama3_1_8B => "llama_3_1_8b",
-        }
-    }
-}
-
-/// Known target GPU identifiers. Each maps to a TargetProfile +
-/// ImplementationLibrary.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Known target GPU identifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetId {
     L4Sm89,
     A100Sm80,
@@ -124,64 +86,151 @@ pub struct WorkloadRange {
     pub max_tokens: u32,
 }
 
-/// Inline model specification — dims spelled out in the DSL.
-#[derive(Clone, Debug)]
-pub struct InlineModel {
-    pub num_layers: u16,
-    pub dims: crate::lowering::tile_graph::ModelDims,
-}
-
-/// Model specification: either a known model ID or inline dims.
-#[derive(Clone, Debug)]
-pub enum ModelSpec {
-    Named(ModelId),
-    Inline(InlineModel),
-}
-
-impl ModelSpec {
-    pub fn num_layers(&self) -> u16 {
-        match self {
-            ModelSpec::Named(id) => id.num_layers(),
-            ModelSpec::Inline(m) => m.num_layers,
-        }
-    }
-
-    pub fn dims(&self) -> crate::lowering::tile_graph::ModelDims {
-        match self {
-            ModelSpec::Named(id) => id.dims(),
-            ModelSpec::Inline(m) => m.dims,
-        }
-    }
-}
-
 /// Parsed `forward!` DSL.
 #[derive(Clone, Debug)]
-pub struct CompileDef {
-    pub model: Binding<ModelSpec>,
+pub struct ForwardDef {
+    /// The model's forward pass structure, parsed as a ModelDag.
+    pub dag: crate::dag::ModelDag,
+    /// Model dimensions to compile in. Multiple = multi-model binary.
+    /// Runtime = solver runs at startup with dims from loaded weights.
+    pub models: Binding<Vec<InlineModel>>,
+    /// Target GPU.
     pub target: Binding<TargetId>,
-    pub workloads: Binding<WorkloadRange>,
+    /// Workload grid. None = use default.
+    pub workloads: Option<WorkloadRange>,
 }
 
-impl CompileDef {
-    /// Whether all bindings are static (fully specialized mode).
+impl ForwardDef {
     pub fn is_fully_specialized(&self) -> bool {
-        self.model.is_static() && self.target.is_static() && self.workloads.is_static()
+        self.models.is_static() && self.target.is_static()
     }
+}
 
-    /// Whether only the model is static (GPU-specialized mode).
-    pub fn is_gpu_specialized(&self) -> bool {
-        self.model.is_static() && self.target.is_runtime()
-    }
+impl Parse for ForwardDef {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        // ── Step 1: Parse the body as megakernel DSL ──
+        //
+        // The body is everything up to the first `models:`, `target:`,
+        // or `workloads:` key. We wrap it in a synthetic `kernel __forward<> { ... }`
+        // so the existing MegakernelDef parser can handle it.
+        //
+        // Collect all tokens until we see `ident :` at the statement level
+        // where ident is one of our known keys.
+        let mut body_tokens = proc_macro2::TokenStream::new();
+        while !input.is_empty() {
+            // Peek: is this a key-value field?
+            if is_field_key(input) {
+                break;
+            }
+            // Consume one token tree (statement, block, etc.)
+            let tt: proc_macro2::TokenTree = input.parse()?;
+            body_tokens.extend(std::iter::once(tt));
+        }
 
-    /// Whether everything is runtime (fully dynamic mode).
-    pub fn is_fully_dynamic(&self) -> bool {
-        self.model.is_runtime() && self.target.is_runtime()
+        // Wrap in `kernel __forward<NL=1, HD=1, ID=1, HDM=1, NAH=1, NKH=1, VS=1> { ... }`
+        // with dummy params. NL will be overridden per-model.
+        let wrapped: proc_macro2::TokenStream = format!(
+            "kernel __forward<NL=1, HD=1, ID=1, HDM=1, NAH=1, NKH=1, VS=1> {{ {} }}",
+            body_tokens
+        )
+        .parse()
+        .map_err(|e| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("body parse error: {e}"),
+            )
+        })?;
+
+        let def: crate::parse::MegakernelDef = syn::parse2(wrapped)?;
+        let dag = crate::parse::build_dag(&def)
+            .map_err(|e| syn::Error::new(proc_macro2::Span::call_site(), e))?;
+
+        // ── Step 2: Parse optional key-value fields ──
+        let mut models: Option<Binding<Vec<InlineModel>>> = None;
+        let mut target: Option<Binding<TargetId>> = None;
+        let mut workloads: Option<WorkloadRange> = None;
+
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![:]>()?;
+
+            match key.to_string().as_str() {
+                "models" => {
+                    if input.peek(Ident) {
+                        let val: Ident = input.parse()?;
+                        if val == "runtime" {
+                            models = Some(Binding::Runtime);
+                        } else {
+                            return Err(syn::Error::new(
+                                val.span(),
+                                format!("expected `runtime` or `[...]`, got `{val}`"),
+                            ));
+                        }
+                    } else {
+                        // Parse [ { ... }, { ... }, ... ]
+                        let bracket_content;
+                        syn::bracketed!(bracket_content in input);
+                        let mut model_list = Vec::new();
+                        while !bracket_content.is_empty() {
+                            let model_content;
+                            braced!(model_content in bracket_content);
+                            model_list.push(parse_inline_model(&model_content)?);
+                            let _ = bracket_content.parse::<Token![,]>();
+                        }
+                        models = Some(Binding::Static(model_list));
+                    }
+                }
+                "target" => {
+                    let val: Ident = input.parse()?;
+                    let val_str = val.to_string();
+                    target = Some(if val_str == "runtime" {
+                        Binding::Runtime
+                    } else {
+                        Binding::Static(parse_target_id(&val_str)?)
+                    });
+                }
+                "workloads" => {
+                    let bracket_content;
+                    syn::bracketed!(bracket_content in input);
+                    let min: LitInt = bracket_content.parse()?;
+                    bracket_content.parse::<Token![..]>()?;
+                    let max: LitInt = bracket_content.parse()?;
+                    workloads = Some(WorkloadRange {
+                        min_tokens: min.base10_parse()?,
+                        max_tokens: max.base10_parse()?,
+                    });
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("unknown field `{other}`. expected: models, target, workloads"),
+                    ));
+                }
+            }
+            let _ = input.parse::<Token![,]>();
+        }
+
+        Ok(ForwardDef {
+            dag,
+            models: models.unwrap_or(Binding::Runtime),
+            target: target.unwrap_or(Binding::Runtime),
+            workloads,
+        })
     }
+}
+
+/// Check if the next tokens look like a field key (`models:`, `target:`, `workloads:`).
+fn is_field_key(input: ParseStream) -> bool {
+    let fork = input.fork();
+    if let Ok(ident) = fork.parse::<Ident>() {
+        let name = ident.to_string();
+        return fork.peek(Token![:])
+            && (name == "models" || name == "target" || name == "workloads");
+    }
+    false
 }
 
 fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
-    use crate::lowering::tile_graph::ModelDims;
-
     let mut layers: Option<u16> = None;
     let mut hidden: Option<u32> = None;
     let mut intermediate: Option<u32> = None;
@@ -205,9 +254,7 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
             other => {
                 return Err(syn::Error::new(
                     key.span(),
-                    format!(
-                        "unknown model field `{other}`. expected: layers, hidden, intermediate, heads, kv_heads, head_dim"
-                    ),
+                    format!("unknown model field `{other}`"),
                 ));
             }
         }
@@ -229,18 +276,6 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
     })
 }
 
-fn parse_model_id(ident: &str) -> syn::Result<ModelId> {
-    match ident {
-        "llama_3_2_1b" => Ok(ModelId::Llama3_2_1B),
-        "llama_3_2_3b" => Ok(ModelId::Llama3_2_3B),
-        "llama_3_1_8b" => Ok(ModelId::Llama3_1_8B),
-        other => Err(syn::Error::new(
-            proc_macro2::Span::call_site(),
-            format!("unknown model: `{other}`. known: llama_3_2_1b, llama_3_2_3b, llama_3_1_8b"),
-        )),
-    }
-}
-
 fn parse_target_id(ident: &str) -> syn::Result<TargetId> {
     match ident {
         "l4_sm89" => Ok(TargetId::L4Sm89),
@@ -253,185 +288,127 @@ fn parse_target_id(ident: &str) -> syn::Result<TargetId> {
     }
 }
 
-impl Parse for CompileDef {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let content;
-        // Optional outer braces (compile! { ... } has them stripped by
-        // the proc_macro entry, but if present, consume them).
-        let has_braces = input.peek(syn::token::Brace);
-        let inner = if has_braces {
-            braced!(content in input);
-            &content
-        } else {
-            input
-        };
-
-        let mut model: Option<Binding<ModelSpec>> = None;
-        let mut target: Option<Binding<TargetId>> = None;
-        let mut workloads: Option<Binding<WorkloadRange>> = None;
-
-        while !inner.is_empty() {
-            let key: Ident = inner.parse()?;
-            inner.parse::<Token![:]>()?;
-
-            match key.to_string().as_str() {
-                "model" => {
-                    // Either a named model (ident) or inline dims ({ ... }).
-                    if inner.peek(syn::token::Brace) {
-                        let model_content;
-                        braced!(model_content in inner);
-                        let inline = parse_inline_model(&model_content)?;
-                        model = Some(Binding::Static(ModelSpec::Inline(inline)));
-                        let _ = inner.parse::<Token![,]>();
-                        continue;
-                    }
-                    let value: Ident = inner.parse()?;
-                    let val_str = value.to_string();
-                    model = Some(if val_str == "runtime" {
-                        Binding::Runtime
-                    } else {
-                        Binding::Static(ModelSpec::Named(parse_model_id(&val_str)?))
-                    });
-                }
-                "target" => {
-                    let value: Ident = inner.parse()?;
-                    let val_str = value.to_string();
-                    target = Some(if val_str == "runtime" {
-                        Binding::Runtime
-                    } else {
-                        Binding::Static(parse_target_id(&val_str)?)
-                    });
-                }
-                "workloads" => {
-                    let value: Option<String> =
-                        inner.fork().parse().ok().map(|i: Ident| i.to_string());
-                    if value.as_deref() == Some("runtime") {
-                        let _: Ident = inner.parse()?;
-                        workloads = Some(Binding::Runtime);
-                    } else {
-                        // Parse [min..max]
-                        let bracket_content;
-                        syn::bracketed!(bracket_content in inner);
-                        let min: LitInt = bracket_content.parse()?;
-                        bracket_content.parse::<Token![..]>()?;
-                        let max: LitInt = bracket_content.parse()?;
-                        workloads = Some(Binding::Static(WorkloadRange {
-                            min_tokens: min.base10_parse()?,
-                            max_tokens: max.base10_parse()?,
-                        }));
-                    }
-                }
-                other => {
-                    return Err(syn::Error::new(
-                        key.span(),
-                        format!("unknown field `{other}`. expected: model, target, workloads"),
-                    ));
-                }
-            }
-
-            // Consume optional trailing comma.
-            let _ = inner.parse::<Token![,]>();
-        }
-
-        Ok(CompileDef {
-            model: model.unwrap_or(Binding::Runtime),
-            target: target.unwrap_or(Binding::Runtime),
-            workloads: workloads.unwrap_or(Binding::Runtime),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_named_model() {
-        let tokens: proc_macro2::TokenStream = "
-            model: llama_3_2_1b,
-            target: l4_sm89,
-            workloads: [1..1024],
-        "
+    fn parse_body_only() {
+        let tokens: proc_macro2::TokenStream = r#"
+            for layer in 0..NL {
+                let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                let qkv = gemm(normed, qkv_weights[layer]);
+                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+                let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                let gate = silu(gemm(normed2, gate_weights[layer]));
+                let up = gemm(normed2, up_weights[layer]);
+                hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+            }
+        "#
         .parse()
         .unwrap();
 
-        let def: CompileDef = syn::parse2(tokens).unwrap();
-        assert!(def.is_fully_specialized());
-        assert_eq!(def.model.as_static().unwrap().num_layers(), 16);
-        assert_eq!(def.model.as_static().unwrap().dims().hidden_size, 2048);
-        assert_eq!(def.target.as_static().unwrap(), &TargetId::L4Sm89);
-        let wl = def.workloads.as_static().unwrap();
-        assert_eq!(wl.min_tokens, 1);
-        assert_eq!(wl.max_tokens, 1024);
-    }
-
-    #[test]
-    fn parse_inline_model() {
-        let tokens: proc_macro2::TokenStream = "
-            model: {
-                layers: 28,
-                hidden: 3072,
-                intermediate: 8192,
-                heads: 24,
-                kv_heads: 8,
-                head_dim: 128,
-            },
-            target: l4_sm89,
-            workloads: [1..4096],
-        "
-        .parse()
-        .unwrap();
-
-        let def: CompileDef = syn::parse2(tokens).unwrap();
-        assert!(def.is_fully_specialized());
-        let spec = def.model.as_static().unwrap();
-        assert_eq!(spec.num_layers(), 28);
-        assert_eq!(spec.dims().hidden_size, 3072);
-        assert_eq!(spec.dims().intermediate_size, 8192);
-        assert_eq!(spec.dims().num_attention_heads, 24);
-        assert_eq!(spec.dims().num_kv_heads, 8);
-        assert_eq!(spec.dims().head_dim, 128);
-    }
-
-    #[test]
-    fn parse_inline_model_missing_field() {
-        let tokens: proc_macro2::TokenStream = "
-            model: { layers: 28, hidden: 3072 },
-            target: l4_sm89,
-            workloads: [1..4096],
-        "
-        .parse()
-        .unwrap();
-
-        let result: syn::Result<CompileDef> = syn::parse2(tokens);
-        assert!(result.is_err(), "should fail with missing fields");
-    }
-
-    #[test]
-    fn parse_gpu_specialized() {
-        let tokens: proc_macro2::TokenStream = "
-            model: llama_3_2_1b,
-            target: runtime,
-        "
-        .parse()
-        .unwrap();
-
-        let def: CompileDef = syn::parse2(tokens).unwrap();
-        assert!(def.is_gpu_specialized());
+        let def: ForwardDef = syn::parse2(tokens).unwrap();
+        assert!(def.models.is_runtime());
         assert!(def.target.is_runtime());
-        assert!(def.workloads.is_runtime());
+        assert!(def.workloads.is_none());
+        assert!(!def.dag.ops.is_empty());
     }
 
     #[test]
-    fn parse_fully_dynamic() {
-        let tokens: proc_macro2::TokenStream = "
-            model: runtime,
-            target: runtime,
-        "
+    fn parse_body_with_models_and_target() {
+        let tokens: proc_macro2::TokenStream = r#"
+            for layer in 0..NL {
+                let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                let qkv = gemm(normed, qkv_weights[layer]);
+                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+                let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                let gate = silu(gemm(normed2, gate_weights[layer]));
+                let up = gemm(normed2, up_weights[layer]);
+                hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+            }
+
+            models: [
+                { layers: 28, hidden: 3072, intermediate: 8192, heads: 24, kv_heads: 8, head_dim: 128 },
+            ],
+            target: l4_sm89,
+            workloads: [1..4096],
+        "#
         .parse()
         .unwrap();
 
-        let def: CompileDef = syn::parse2(tokens).unwrap();
-        assert!(def.is_fully_dynamic());
+        let def: ForwardDef = syn::parse2(tokens).unwrap();
+        assert!(def.is_fully_specialized());
+        let models = def.models.as_static().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].num_layers, 28);
+        assert_eq!(models[0].dims.hidden_size, 3072);
+        assert_eq!(def.target.as_static().unwrap(), &TargetId::L4Sm89);
+        assert_eq!(def.workloads.as_ref().unwrap().max_tokens, 4096);
+    }
+
+    #[test]
+    fn parse_multiple_models() {
+        let tokens: proc_macro2::TokenStream = r#"
+            for layer in 0..NL {
+                let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                let qkv = gemm(normed, qkv_weights[layer]);
+                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+                let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                let gate = silu(gemm(normed2, gate_weights[layer]));
+                let up = gemm(normed2, up_weights[layer]);
+                hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+            }
+
+            models: [
+                { layers: 16, hidden: 2048, intermediate: 8192, heads: 32, kv_heads: 8, head_dim: 64 },
+                { layers: 28, hidden: 3072, intermediate: 8192, heads: 24, kv_heads: 8, head_dim: 128 },
+            ],
+            target: l4_sm89,
+        "#
+        .parse()
+        .unwrap();
+
+        let def: ForwardDef = syn::parse2(tokens).unwrap();
+        let models = def.models.as_static().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].dims.hidden_size, 2048);
+        assert_eq!(models[1].dims.hidden_size, 3072);
+    }
+
+    #[test]
+    fn parse_runtime_models() {
+        let tokens: proc_macro2::TokenStream = r#"
+            for layer in 0..NL {
+                let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                let qkv = gemm(normed, qkv_weights[layer]);
+                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+                let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                let gate = silu(gemm(normed2, gate_weights[layer]));
+                let up = gemm(normed2, up_weights[layer]);
+                hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+            }
+
+            models: runtime,
+            target: l4_sm89,
+        "#
+        .parse()
+        .unwrap();
+
+        let def: ForwardDef = syn::parse2(tokens).unwrap();
+        assert!(def.models.is_runtime());
+        assert!(def.target.is_static());
     }
 }

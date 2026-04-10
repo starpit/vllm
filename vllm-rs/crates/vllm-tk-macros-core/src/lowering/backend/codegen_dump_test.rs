@@ -2,19 +2,35 @@
 #[cfg(test)]
 mod tests {
     use crate::lowering::backend::codegen;
-    use crate::lowering::backend::compile_dsl::CompileDef;
+    use crate::lowering::backend::compile_dsl::ForwardDef;
 
     #[test]
     fn dump_bucket_0_source() {
-        let tokens: proc_macro2::TokenStream =
-            "model: llama_3_2_1b, target: l4_sm89, workloads: [1..4096]"
-                .parse()
-                .unwrap();
-        let def: CompileDef = syn::parse2(tokens).unwrap();
+        let tokens: proc_macro2::TokenStream = r#"
+            for layer in 0..NL {
+                let normed = rmsnorm(hidden_states, attn_norm[layer]);
+                let qkv = gemm(normed, qkv_weights[layer]);
+                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+                hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+                let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+                let gate = silu(gemm(normed2, gate_weights[layer]));
+                let up = gemm(normed2, up_weights[layer]);
+                hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+            }
+
+            models: [
+                { layers: 16, hidden: 2048, intermediate: 8192, heads: 32, kv_heads: 8, head_dim: 64 },
+            ],
+            target: l4_sm89,
+            workloads: [1..4096],
+        "#
+        .parse()
+        .unwrap();
+        let def: ForwardDef = syn::parse2(tokens).unwrap();
         let output = codegen::generate(&def);
         let source = output.to_string();
-
-        // Pretty-print via prettyplease if available, else raw.
         eprintln!("\n=== GENERATED SOURCE ===\n{source}\n=== END ===\n");
     }
 }

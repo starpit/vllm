@@ -7,7 +7,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use super::compile_dsl::{CompileDef, ModelSpec, TargetId, WorkloadRange};
+use super::compile_dsl::{ForwardDef, TargetId, WorkloadRange};
 use super::dispatch::{DispatchEntry, DispatchSequence, GemmPhase, ImplDispatchKind};
 use crate::lowering::BacktrackCpSolver;
 use crate::lowering::library::ImplementationLibrary;
@@ -15,24 +15,33 @@ use crate::lowering::solver::PlanFamily;
 use crate::lowering::tile_graph::TileGraph;
 use crate::target_profile::TargetProfile;
 
-pub fn generate(def: &CompileDef) -> TokenStream {
+pub fn generate(def: &ForwardDef) -> TokenStream {
     if def.is_fully_specialized() {
         generate_fully_specialized(def)
     } else {
-        // GPU-specialized and fully dynamic not yet implemented.
+        // Runtime paths not yet implemented.
         quote! {}
     }
 }
 
-fn generate_fully_specialized(def: &CompileDef) -> TokenStream {
-    let model_id = def.model.as_static().unwrap();
+fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
+    let models = def.models.as_static().unwrap();
     let target_id = def.target.as_static().unwrap();
-    let workloads = def.workloads.as_static().unwrap();
 
-    let tile_graph = build_tile_graph(model_id);
+    if models.is_empty() {
+        return quote! { compile_error!("forward!: models list is empty"); };
+    }
+
+    // For now, use the first model. Multi-model dispatch (from_dims)
+    // is a follow-up.
+    let model = &models[0];
+    let tile_graph = TileGraph::from_model_dag(&def.dag, model.dims);
     let library = build_library(target_id);
     let profile = build_profile(target_id);
-    let grid = build_solve_grid(workloads);
+    let grid = match &def.workloads {
+        Some(wl) => build_solve_grid(wl),
+        None => PlanFamily::DEFAULT_GRID.to_vec(),
+    };
     let family = PlanFamily::solve_grid(&tile_graph, &library, &profile, &BacktrackCpSolver, &grid);
 
     if family.is_empty() {
@@ -126,14 +135,12 @@ fn generate_fully_specialized(def: &CompileDef) -> TokenStream {
     }
 }
 
-// ── Entry-by-entry codegen ──────────────────────────────────────
+// ── Entry-by-entry codegen (unchanged from before) ──────────────
 
-/// Walk layer 0's dispatch entries, emit one statement per entry.
 fn emit_layer_stmts(ds: &DispatchSequence) -> Vec<TokenStream> {
     ds.entries_for_layer(0).filter_map(emit_entry).collect()
 }
 
-/// One dispatch entry → one kernel call.
 fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
     match entry.kind {
         ImplDispatchKind::Noop => None,
@@ -168,7 +175,6 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                     residual = Some(r);
                 })
             } else {
-                // MLP norm: fused_add_rms_norm_inplace mutates both in-place.
                 Some(quote! {
                     let hs_gpu: GpuTensor = *hidden_states;
                     let res_gpu: GpuTensor = **residual.as_ref().unwrap();
@@ -186,9 +192,6 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
         ImplDispatchKind::CublasGemm => {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
-                // For dense models, Gate already produced [M, 2*intermediate]
-                // via the fused gate_up_proj. Up is only needed for quantized
-                // (separate up_proj). Guard the entire GEMM at runtime.
                 return Some(quote! {
                     if let Some(ref up_proj) = layer.mlp.up_proj {
                         let __out = up_proj.forward(
@@ -224,8 +227,6 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
         ImplDispatchKind::CutlassGemm { tile_m, tile_n } => {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
-                // Same as cuBLAS Up: skip for dense, only run for quantized.
-                // CUTLASS doesn't apply to quantized, so this is a noop.
                 return Some(quote! {
                     if let Some(ref up_proj) = layer.mlp.up_proj {
                         let __out = up_proj.forward(
@@ -253,11 +254,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             } else {
                 format_ident!("cutlass_gemm_128x128_launch")
             };
-            // Always beta=0 for CUTLASS — the output buffer is freshly
-            // allocated. The fused_residual flag means the solver folded
-            // the ResidualAdd tile into this subgraph, but the residual
-            // accumulation happens in fused_add_rms_norm_inplace, not
-            // in the GEMM epilogue.
+            // Always beta=0: output buffer is freshly allocated.
+            // Residual accumulation happens in fused_add_rms_norm_inplace.
             Some(quote! {{
                 let __act: GpuTensor = #cutlass_input;
                 let __m = __act.dim(0) as i32;
@@ -281,158 +279,100 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
         }
 
         ImplDispatchKind::CutlassNormGemm { .. } => {
-            // Not yet wired — emit cuBLAS fallback.
             let phase = entry.gemm_phase.unwrap();
             let (input, weight, store) = gemm_operands(phase, entry.fused_residual);
             Some(quote! {{
                 let __out = (#weight).forward(
-                    #input,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
+                    #input, &mut device.cublas, &mut device.caching, device.compute_stream,
                 );
                 #store
             }})
         }
 
-        ImplDispatchKind::FusedQkvRopeCache => {
-            // Decode: fused split + Q RoPE + cache write.
-            Some(quote! {{
-                let __qkv = qkv_out.take().unwrap();
-                let __q = kernels::fused_qkv_rope_cache(
-                    __qkv.as_gpu_tensor(),
-                    *positions,
-                    rotary.cos_sin_cache,
-                    *slot_mapping,
-                    *kv_cache.k_cache(layer.self_attn.layer_idx),
-                    *kv_cache.v_cache(layer.self_attn.layer_idx),
-                    layer.self_attn.q_size,
-                    layer.self_attn.kv_size,
-                    layer.self_attn.num_q_heads,
-                    layer.self_attn.head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                drop(__qkv);
-                qkv_out = Some(__q);
-            }})
-        }
+        ImplDispatchKind::FusedQkvRopeCache => Some(quote! {{
+            let __qkv = qkv_out.take().unwrap();
+            let __q = kernels::fused_qkv_rope_cache(
+                __qkv.as_gpu_tensor(),
+                *positions, rotary.cos_sin_cache, *slot_mapping,
+                *kv_cache.k_cache(layer.self_attn.layer_idx),
+                *kv_cache.v_cache(layer.self_attn.layer_idx),
+                layer.self_attn.q_size, layer.self_attn.kv_size,
+                layer.self_attn.num_q_heads, layer.self_attn.head_dim,
+                &mut device.caching, device.compute_stream,
+            );
+            drop(__qkv);
+            qkv_out = Some(__q);
+        }}),
 
-        ImplDispatchKind::PrefillRopeCache => {
-            // Prefill: split QKV, rotate both Q and K, write cache.
-            Some(quote! {{
-                let __qkv = qkv_out.take().unwrap();
-                let (__q, __k, __v) = kernels::split_qkv(
-                    __qkv.as_gpu_tensor(),
-                    layer.self_attn.q_size,
-                    layer.self_attn.kv_size,
-                    layer.self_attn.num_q_heads,
-                    layer.self_attn.num_kv_heads,
-                    layer.self_attn.head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                drop(__qkv);
-                let __nt = __q.as_gpu_tensor().dim(0);
-                kernels::rotary_embedding_inplace(
-                    __q.as_gpu_tensor().reshape(&[__nt, layer.self_attn.q_size]),
-                    __k.as_gpu_tensor().reshape(&[__nt, layer.self_attn.kv_size]),
-                    *positions,
-                    rotary.cos_sin_cache,
-                    layer.self_attn.head_dim,
-                    device.compute_stream,
-                );
-                crate::model::attention_helpers::write_kv_cache(
-                    __k.view(), __v.view(), slot_mapping,
-                    kv_cache, layer.self_attn.layer_idx,
-                    device.compute_stream,
-                );
-                qkv_out = Some(__q);
-                k_out = Some(__k);
-                v_out = Some(__v);
-            }})
-        }
+        ImplDispatchKind::PrefillRopeCache => Some(quote! {{
+            let __qkv = qkv_out.take().unwrap();
+            let (__q, __k, __v) = kernels::split_qkv(
+                __qkv.as_gpu_tensor(),
+                layer.self_attn.q_size, layer.self_attn.kv_size,
+                layer.self_attn.num_q_heads, layer.self_attn.num_kv_heads,
+                layer.self_attn.head_dim,
+                &mut device.caching, device.compute_stream,
+            );
+            drop(__qkv);
+            let __nt = __q.as_gpu_tensor().dim(0);
+            kernels::rotary_embedding_inplace(
+                __q.as_gpu_tensor().reshape(&[__nt, layer.self_attn.q_size]),
+                __k.as_gpu_tensor().reshape(&[__nt, layer.self_attn.kv_size]),
+                *positions, rotary.cos_sin_cache,
+                layer.self_attn.head_dim, device.compute_stream,
+            );
+            crate::model::attention_helpers::write_kv_cache(
+                __k.view(), __v.view(), slot_mapping,
+                kv_cache, layer.self_attn.layer_idx, device.compute_stream,
+            );
+            qkv_out = Some(__q);
+            k_out = Some(__k);
+            v_out = Some(__v);
+        }}),
 
         ImplDispatchKind::RotaryEmbedding => Some(quote! {{
             let __qkv = **qkv_out.as_ref().unwrap();
             kernels::fused_qkv_rope(
-                __qkv,
-                *positions,
-                rotary.cos_sin_cache,
-                layer.self_attn.q_size,
-                layer.self_attn.kv_size,
-                layer.self_attn.head_dim,
-                device.compute_stream,
+                __qkv, *positions, rotary.cos_sin_cache,
+                layer.self_attn.q_size, layer.self_attn.kv_size,
+                layer.self_attn.head_dim, device.compute_stream,
             );
         }}),
 
-        ImplDispatchKind::FlashInferAttention => {
-            // Decode: attention from paged KV cache.
-            Some(quote! {{
-                let __q = qkv_out.take().unwrap();
-                let __a = crate::model::attention_helpers::attention_decode_from_cache(
-                    __q.view(),
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    layer.self_attn.scale,
-                    0.0,
-                    -1,
-                    kv_cache,
-                    layer.self_attn.layer_idx,
-                    device.num_sm,
-                    &mut device.caching,
-                    device.compute_stream,
-                    std::ptr::null(),
-                    0,
-                    false,
-                );
-                drop(__q);
-                attn_out = Some(__a);
-            }})
-        }
+        ImplDispatchKind::FlashInferAttention => Some(quote! {{
+            let __q = qkv_out.take().unwrap();
+            let __a = crate::model::attention_helpers::attention_decode_from_cache(
+                __q.view(), cu_seqlens_q, seqused_k, block_table,
+                max_seqlen_q, max_seqlen_k, layer.self_attn.scale,
+                0.0, -1, kv_cache, layer.self_attn.layer_idx,
+                device.num_sm, &mut device.caching, device.compute_stream,
+                std::ptr::null(), 0, false,
+            );
+            drop(__q);
+            attn_out = Some(__a);
+        }}),
 
-        ImplDispatchKind::FlashInferStandard => {
-            // Prefill: attention_standard with explicit Q, K, V.
-            Some(quote! {{
-                let __q = qkv_out.take().unwrap();
-                let __k = k_out.take().unwrap();
-                let __v = v_out.take().unwrap();
-                let __a = crate::model::attention_helpers::attention_standard(
-                    __q.view(),
-                    __k.view(),
-                    __v.view(),
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    layer.self_attn.scale,
-                    kv_cache,
-                    layer.self_attn.layer_idx,
-                    device.num_sm,
-                    &mut device.caching,
-                    device.compute_stream,
-                    std::ptr::null(),
-                    0,
-                    false,
-                );
-                drop(__q);
-                drop(__k);
-                drop(__v);
-                attn_out = Some(__a);
-            }})
-        }
+        ImplDispatchKind::FlashInferStandard => Some(quote! {{
+            let __q = qkv_out.take().unwrap();
+            let __k = k_out.take().unwrap();
+            let __v = v_out.take().unwrap();
+            let __a = crate::model::attention_helpers::attention_standard(
+                __q.view(), __k.view(), __v.view(),
+                cu_seqlens_q, seqused_k, block_table,
+                max_seqlen_q, max_seqlen_k, layer.self_attn.scale,
+                kv_cache, layer.self_attn.layer_idx,
+                device.num_sm, &mut device.caching, device.compute_stream,
+                std::ptr::null(), 0, false,
+            );
+            drop(__q); drop(__k); drop(__v);
+            attn_out = Some(__a);
+        }}),
 
         ImplDispatchKind::SiluAndMul => Some(quote! {{
             let __gu = gate_up.take().unwrap();
             let __activated = kernels::silu_and_mul_fused(
-                __gu.as_gpu_tensor(),
-                layer.mlp.intermediate_size,
-                &mut device.caching,
-                device.compute_stream,
+                __gu.as_gpu_tensor(), layer.mlp.intermediate_size,
+                &mut device.caching, device.compute_stream,
             );
             drop(__gu);
             silu_out = Some(__activated);
@@ -444,8 +384,6 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
     }
 }
 
-/// For CUTLASS: return a GpuTensor expression for the input activation.
-/// Derefs from the OwnedTensor dataflow variable.
 fn cutlass_input_expr(phase: GemmPhase) -> TokenStream {
     match phase {
         GemmPhase::Qkv => quote! { **normed.as_ref().unwrap() },
@@ -456,8 +394,6 @@ fn cutlass_input_expr(phase: GemmPhase) -> TokenStream {
     }
 }
 
-/// For a GEMM phase, return (input_expr, weight_expr, store_stmt).
-/// input_expr is a TensorView (for cuBLAS LinearLayer::forward).
 fn gemm_operands(
     phase: GemmPhase,
     _fused_residual: bool,
@@ -469,8 +405,6 @@ fn gemm_operands(
             quote! { drop(normed.take()); qkv_out = Some(__out); },
         ),
         GemmPhase::OProj => (
-            // Reshape attention output from [num_tokens, num_heads, head_dim]
-            // to [num_tokens, q_size] for the o_proj GEMM.
             quote! {{
                 let __ao = attn_out.as_ref().unwrap();
                 let __nt = __ao.dim(0);
@@ -486,24 +420,8 @@ fn gemm_operands(
         ),
         GemmPhase::Up => (
             quote! { normed.as_ref().unwrap().view() },
-            // For quantized: use the separate up_proj weight.
-            // For dense: gate_up_proj is fused, Gate already produced the full output.
             quote! { layer.mlp.gate_up_proj },
-            quote! {
-                // Up GEMM — only meaningful for quantized (separate up_proj).
-                // For dense, Gate already produced [M, 2*intermediate].
-                if layer.mlp.up_proj.is_some() {
-                    let __gu = gate_up.take().unwrap();
-                    let __concat = kernels::concat_dim1(
-                        *__gu, *__out,
-                        &mut device.caching,
-                        device.compute_stream,
-                    );
-                    drop(__gu);
-                    drop(__out);
-                    gate_up = Some(__concat);
-                }
-            },
+            quote! {},
         ),
         GemmPhase::Down => (
             quote! { silu_out.as_ref().unwrap().view() },
@@ -514,10 +432,6 @@ fn gemm_operands(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
-
-fn build_tile_graph(model: &ModelSpec) -> TileGraph {
-    TileGraph::build_llama_forward(model.num_layers(), model.dims())
-}
 
 fn build_library(target: &TargetId) -> ImplementationLibrary {
     match target {

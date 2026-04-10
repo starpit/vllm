@@ -879,7 +879,7 @@ fn to_snake_case(s: &str) -> String {
 pub fn forward(input: TokenStream) -> TokenStream {
     let input2: proc_macro2::TokenStream = input.into();
 
-    let def: compile_dsl::CompileDef = match syn::parse2(input2) {
+    let def: compile_dsl::ForwardDef = match syn::parse2(input2) {
         Ok(d) => d,
         Err(e) => return e.to_compile_error().into(),
     };

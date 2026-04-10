@@ -17,5 +17,5 @@ mod codegen_test;
 pub mod compile_dsl;
 pub mod dispatch;
 
-pub use compile_dsl::CompileDef;
+pub use compile_dsl::ForwardDef;
 pub use dispatch::{DispatchEntry, DispatchSequence, ImplDispatchKind};

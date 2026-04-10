@@ -261,47 +261,59 @@ drop-in replacement for `LlamaDecoderLayer::forward()` that uses
 the constraint solver's optimal kernel mix per workload bucket.
 
 ```rust
-// In vllm-cuda/src/model/solver_dispatch.rs:
 vllm_tk_macros::forward! {
-    model: llama_3_2_1b,
+    // Model structure — same DSL as megakernel!
+    for layer in 0..NL {
+        let normed = rmsnorm(hidden_states, attn_norm[layer]);
+        let qkv = gemm(normed, qkv_weights[layer]);
+        let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+        let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+        hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+        let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+        let gate = silu(gemm(normed2, gate_weights[layer]));
+        let up = gemm(normed2, up_weights[layer]);
+        hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+    }
+
+    // Models to compile in (omit for runtime)
+    models: [
+        { layers: 28, hidden: 3072, intermediate: 8192,
+          heads: 24, kv_heads: 8, head_dim: 128 },
+    ],
     target: l4_sm89,
     workloads: [1..4096],
 }
 ```
 
-### What it emits
+### Pipeline
 
-The macro runs the solver at compile time and emits:
-- `solver_forward_layer(layer, num_tokens, ...)` — matches on
-  `num_tokens` and dispatches to per-bucket functions.
-- `solver_layer_bucket_N(layer, ...)` — one per workload bucket,
-  each a complete layer body using solver-selected kernels.
+DSL body → `MegakernelDef` parser → `ModelDag` →
+`TileGraph::from_model_dag` → solver → codegen.
 
-The generated code uses the same types as the existing forward
-pass: `OwnedTensor`, `GpuTensor`, `CublasHandle`, `kernels::*`.
-No FFI shim, no raw pointer ctx struct.
+No hardcoded `build_llama_forward` — the tile graph is built from
+the DSL body. Any LLaMA-family model works by changing the inline
+dims. Non-LLaMA architectures need new DSL ops.
 
-### Integration
+### What works
 
-`LlamaModel` has a `use_solver_dispatch: bool` field. When true,
-`forward()` calls `solver_forward_layer()` instead of
-`layer.forward()`. Currently defaults to false.
+- 5% throughput improvement on Llama 3.2 3B (bench throughput --input-len 64)
+- Correct output (decode + prefill)
+- CUTLASS 64×64 standalone GEMM wired end-to-end
+- 702 measured L4 cost points from gpu_cost_sweep
+- Decode vs prefill as separate solver implementations
+- Per-phase kernel selection (e.g. CUTLASS for gate, cuBLAS for down)
 
-### What works now
+### What's next
 
-- Solver runs at proc-macro time (fully specialized path)
-- Per-bucket layer bodies are generated with correct types
-- cuBLAS GEMM dispatch (via `LinearLayer::forward()`)
-- Norm, attention, MLP delegate to existing kernels
+- `models: runtime` / `target: runtime` binding modes
+- TK fused MLP wiring (currently disabled)
+- CUTLASS norm+GEMM prologue fusion
+- TP all-reduce tiles for multi-GPU
+- Multi-GPU cost CSVs (A100, H100)
+- Remove old `megakernel!` macro
 
-### What needs wiring
-
-- CUTLASS standalone launchers (codegen falls back to cuBLAS)
-- TK fused MLP launch (codegen falls back to eager MLP)
-- GPU-specialized / fully dynamic paths (emit empty placeholders)
-- TileGraph from DSL instead of hardcoded `build_llama_forward()`
-
-### Tests (22 passing)
+### Tests (33 passing)
 
 ```bash
 cargo test -p vllm-tk-macros-core -- lowering

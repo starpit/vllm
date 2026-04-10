@@ -2058,27 +2058,36 @@ fn cp5_solver_driven_natural_forward_bench() {
     }
     eprintln!("╠═══════════════════════════════════════════════════════════════╣");
 
-    // ── cuBLAS handle setup ──
+    // ── Stream + cuBLAS handle setup ──
+    // Use a real (non-null) stream so we can graph-capture later.
+    let stream: sys::CUstream = unsafe {
+        let mut s: sys::CUstream = std::ptr::null_mut();
+        sys::cuStreamCreate(&mut s, 0);
+        s
+    };
+
     let mut handle: ffi::CublasHandle = std::ptr::null_mut();
     unsafe {
         let s = ffi::cublasCreate_v2(&mut handle);
         assert_eq!(s, 0, "cublasCreate failed: {s}");
-        let s = ffi::cublasSetStream_v2(handle, std::ptr::null_mut());
+        let s = ffi::cublasSetStream_v2(handle, stream as *mut std::ffi::c_void);
         assert_eq!(s, 0, "cublasSetStream failed: {s}");
     }
 
-    // Dummy rope inputs (positions, cos_sin) — same as the CP4
-    // natural microbench, just so the rotary_embedding kernel has
-    // something to read.
+    // RoPE inputs (positions, cos_sin_cache, per-layer slot mappings).
+    let seq_usz = dims.seq_len as usize;
     let positions_host: Vec<u32> = (0..dims.seq_len).collect();
     let positions_dev = unsafe {
-        let bytes = (dims.seq_len as usize) * std::mem::size_of::<u32>();
+        let bytes = seq_usz * std::mem::size_of::<u32>();
         let p = result::malloc_sync(bytes).unwrap();
         result::memcpy_htod_sync(p, &positions_host).unwrap();
         p as *const u32
     };
-    let cos_sin_bytes = (dims.seq_len as usize) * (dims.head_dim as usize) * 2;
-    let cos_sin_dev = gpu_alloc_zeros(cos_sin_bytes);
+    let cos_sin_host = build_cos_sin_cache_bf16(seq_usz, dims.head_dim as usize);
+    let cos_sin_dev = gpu_upload_bf16(&cos_sin_host);
+
+    let page_size = SCHEDULED_PREFILL_KV_PAGE_SIZE as usize;
+    let pages_per_layer = seq_usz.div_ceil(page_size);
 
     // Per-layer weight strides (bytes).
     let nl = dims.num_layers as usize;
@@ -2093,7 +2102,24 @@ fn cp5_solver_driven_natural_forward_bench() {
     let layer_bytes_gate_up = (id * hd) as usize * 2;
     let layer_bytes_down = (hd * id) as usize * 2;
     let layer_bytes_norm = hd as usize * 2;
-    let _ = nl;
+    // Per-layer slot mappings for fused_qkv_rope_cache.
+    let mut slot_dev_per_layer: Vec<u64> = Vec::with_capacity(nl);
+    for l in 0..nl {
+        let host: Vec<i64> = (0..seq_usz)
+            .map(|r| {
+                let lp = r / page_size;
+                let sp = r % page_size;
+                ((l * pages_per_layer + lp) * page_size + sp) as i64
+            })
+            .collect();
+        let bytes = seq_usz * std::mem::size_of::<i64>();
+        let dptr = unsafe {
+            let p = result::malloc_sync(bytes).unwrap();
+            result::memcpy_htod_sync(p, &host).unwrap();
+            p
+        };
+        slot_dev_per_layer.push(dptr);
+    }
 
     // Temp buffer for the gate / up GEMM outputs (silu_and_mul
     // expects the [seq, 2*intermediate] packed layout — same as
@@ -2226,7 +2252,7 @@ fn cp5_solver_driven_natural_forward_bench() {
                         1e-5,
                         seq,
                         hd,
-                        std::ptr::null_mut(),
+                        stream as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -2241,7 +2267,26 @@ fn cp5_solver_driven_natural_forward_bench() {
                     kv_dim,
                     dims.head_dim as i32,
                     seq,
-                    std::ptr::null_mut(),
+                    stream as *mut std::ffi::c_void,
+                );
+            },
+            "vllm_rs_fused_qkv_rope_cache" => unsafe {
+                let slot_dev = slot_dev_per_layer[layer];
+                ffi::fused_qkv_rope_cache_bf16(
+                    b.q_post_rope as *mut u16,
+                    b.k_cache as *mut u16,
+                    b.v_cache as *mut u16,
+                    b.qkv as *const u16,
+                    positions_dev,
+                    cos_sin_dev as *const u16,
+                    slot_dev as *const i64,
+                    q_dim,
+                    kv_dim,
+                    qkv_dim,
+                    dims.head_dim as i32,
+                    dims.head_dim as i32,
+                    seq,
+                    stream as *mut std::ffi::c_void,
                 );
             },
             "vllm_rs_silu_and_mul_fused" => unsafe {
@@ -2250,29 +2295,19 @@ fn cp5_solver_driven_natural_forward_bench() {
                     gate_up_tmp as *const u16,
                     seq,
                     id,
-                    std::ptr::null_mut(),
+                    stream as *mut std::ffi::c_void,
                 );
             },
-            // ── FlashInfer attention — CP5-D-1 wires it up via a
-            // tiny per-layer launcher that reuses the per-launch
-            // plan built once at the top of this test. Calls
-            // BlockBatchPagedAttentionPersistent::Run via a small
-            // cooperative __global__ wrapper — same code path as
-            // the megakernel's inline FlashInfer dispatch, just
-            // launched from the host one layer at a time.
             "flashinfer_standalone_fa2" => unsafe {
                 let s = ffi::cp5_run_flashinfer_attention_for_layer(
                     &mut fi_plan as *mut _,
                     layer as i32,
-                    std::ptr::null_mut(),
+                    stream as *mut std::ffi::c_void,
                 );
                 assert_eq!(s, 0, "cp5_run_flashinfer_attention_for_layer failed: {s}");
             },
             // ── Free / cheap passthroughs ──
-            // qkv_split is no-op (the qkv buffer is already
-            // [Q | K | V] laid out). kv_cache_write is a no-op
-            // here because we don't actually use the kv cache in
-            // this bench (no attention). residual_add is a no-op
+            // residual_add is a no-op
             // when its tile was claimed by the with-residual
             // fused cuBLAS impl above; if the solver chose the
             // standalone variant we'd need a separate add kernel.
@@ -2291,20 +2326,20 @@ fn cp5_solver_driven_natural_forward_bench() {
     for _ in 0..4 {
         one_pass();
     }
-    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    unsafe { result::stream::synchronize(stream).unwrap() };
 
-    // Timed iters.
+    // ── Eager timed iters ──
     const NUM_ITERS: u32 = 50;
     let mut start: sys::CUevent = std::ptr::null_mut();
     let mut stop: sys::CUevent = std::ptr::null_mut();
-    let avg_ms = unsafe {
+    let eager_ms = unsafe {
         sys::cuEventCreate(&mut start, 0);
         sys::cuEventCreate(&mut stop, 0);
-        sys::cuEventRecord(start, std::ptr::null_mut());
+        sys::cuEventRecord(start, stream);
         for _ in 0..NUM_ITERS {
             one_pass();
         }
-        sys::cuEventRecord(stop, std::ptr::null_mut());
+        sys::cuEventRecord(stop, stream);
         sys::cuEventSynchronize(stop);
         let mut elapsed_ms: f32 = 0.0;
         sys::cuEventElapsedTime(&mut elapsed_ms, start, stop);
@@ -2313,7 +2348,56 @@ fn cp5_solver_driven_natural_forward_bench() {
         elapsed_ms / NUM_ITERS as f32
     };
 
-    eprintln!("║  measured (50 iters, full incl. attn): {avg_ms:6.3} ms              ║");
+    // ── CP5-D-2: CUDA graph capture + replay ──
+    // Capture one full pass into a graph, then replay it — eliminates
+    // per-kernel cudaLaunchKernel overhead from the host timeline.
+    let graph_ms = unsafe {
+        // Capture one pass.
+        result::stream::begin_capture(
+            stream,
+            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .expect("stream begin capture failed");
+        one_pass();
+        let graph = result::stream::end_capture(stream).expect("stream end capture failed");
+        let exec = result::graph::instantiate(
+            graph,
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        )
+        .expect("graph instantiate failed");
+        result::graph::destroy(graph).unwrap();
+
+        // Warmup graph.
+        for _ in 0..4 {
+            result::graph::launch(exec, stream).unwrap();
+        }
+        result::stream::synchronize(stream).unwrap();
+
+        // Timed graph iters.
+        let mut g_start: sys::CUevent = std::ptr::null_mut();
+        let mut g_stop: sys::CUevent = std::ptr::null_mut();
+        sys::cuEventCreate(&mut g_start, 0);
+        sys::cuEventCreate(&mut g_stop, 0);
+        sys::cuEventRecord(g_start, stream);
+        for _ in 0..NUM_ITERS {
+            result::graph::launch(exec, stream).unwrap();
+        }
+        sys::cuEventRecord(g_stop, stream);
+        sys::cuEventSynchronize(g_stop);
+        let mut elapsed_ms: f32 = 0.0;
+        sys::cuEventElapsedTime(&mut elapsed_ms, g_start, g_stop);
+        sys::cuEventDestroy_v2(g_start);
+        sys::cuEventDestroy_v2(g_stop);
+        result::graph::exec_destroy(exec).unwrap();
+        elapsed_ms / NUM_ITERS as f32
+    };
+
+    eprintln!("║  eager (50 iters, full incl. attn):     {eager_ms:6.3} ms              ║");
+    eprintln!("║  graph (50 iters, full incl. attn):     {graph_ms:6.3} ms              ║");
+    eprintln!(
+        "║  graph speedup:                         {:.2}×                    ║",
+        eager_ms / graph_ms
+    );
     eprintln!("║  CP4 natural microbench (no attention):  37.8 ms                ║");
     eprintln!("║  scheduled megakernel (full):            55.0 ms                ║");
     eprintln!("╚═══════════════════════════════════════════════════════════════╝");
@@ -2321,6 +2405,7 @@ fn cp5_solver_driven_natural_forward_bench() {
     unsafe {
         ffi::teardown_flashinfer_attention_plan(&mut fi_plan as *mut _);
         ffi::cublasDestroy_v2(handle);
+        sys::cuStreamDestroy_v2(stream);
     }
 }
 
@@ -2355,6 +2440,8 @@ fn build_cos_sin_cache_bf16(max_pos: usize, rotary_dim: usize) -> Vec<bf16> {
 #[test]
 #[ignore = "needs GPU"]
 fn cp5_solver_driven_matches_committed_golden() {
+    use cudarc::driver::sys;
+
     init_cuda();
     let dims = llama_1b_seq64_dims();
     // Same seed as the committed golden generator (regen_llama_1b_seq64_golden).
@@ -2386,11 +2473,18 @@ fn cp5_solver_driven_matches_committed_golden() {
 
     let mut fi_plan = build_flashinfer_plan(&b, dims);
 
+    // Use a real stream so we can graph-capture after the eager pass.
+    let stream: sys::CUstream = unsafe {
+        let mut s: sys::CUstream = std::ptr::null_mut();
+        sys::cuStreamCreate(&mut s, 0);
+        s
+    };
+
     let mut handle: ffi::CublasHandle = std::ptr::null_mut();
     unsafe {
         let s = ffi::cublasCreate_v2(&mut handle);
         assert_eq!(s, 0, "cublasCreate failed: {s}");
-        let s = ffi::cublasSetStream_v2(handle, std::ptr::null_mut());
+        let s = ffi::cublasSetStream_v2(handle, stream as *mut std::ffi::c_void);
         assert_eq!(s, 0, "cublasSetStream failed: {s}");
     }
 
@@ -2556,7 +2650,7 @@ fn cp5_solver_driven_matches_committed_golden() {
                         1e-5,
                         seq,
                         hd,
-                        std::ptr::null_mut(),
+                        stream as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -2576,7 +2670,7 @@ fn cp5_solver_driven_matches_committed_golden() {
                     dims.head_dim as i32,
                     dims.head_dim as i32,
                     seq,
-                    std::ptr::null_mut(),
+                    stream as *mut std::ffi::c_void,
                 );
             },
             "vllm_rs_silu_and_mul_fused" => unsafe {
@@ -2585,14 +2679,14 @@ fn cp5_solver_driven_matches_committed_golden() {
                     gate_up_tmp as *const u16,
                     seq,
                     id,
-                    std::ptr::null_mut(),
+                    stream as *mut std::ffi::c_void,
                 );
             },
             "flashinfer_standalone_fa2" => unsafe {
                 let s = ffi::cp5_run_flashinfer_attention_for_layer(
                     &mut fi_plan as *mut _,
                     layer as i32,
-                    std::ptr::null_mut(),
+                    stream as *mut std::ffi::c_void,
                 );
                 assert_eq!(s, 0, "cp5_run_flashinfer_attention_for_layer failed: {s}");
             },
@@ -2603,17 +2697,77 @@ fn cp5_solver_driven_matches_committed_golden() {
         }
     };
 
-    for (_step, sg) in &scheduled {
-        dispatch_one(*sg);
-    }
-    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+    // ── Eager pass: verify golden ──
+    let mut one_pass = || {
+        for (_step, sg) in &scheduled {
+            dispatch_one(*sg);
+        }
+    };
+    one_pass();
+    unsafe { result::stream::synchronize(stream).unwrap() };
 
-    let h_gpu = gpu_download_bf16(b.hidden_states, seq_usz * dims.hidden_dim as usize);
+    let h_eager = gpu_download_bf16(b.hidden_states, seq_usz * dims.hidden_dim as usize);
+    assert_matches_committed_golden("llama_3_2_1b_seq64", &h_eager, 32768.0, 0.10);
+    eprintln!("cp5 golden — eager pass: OK");
+
+    // ── CP5-D-2: graph replay must also match golden ──
+    // Re-upload initial hidden_states so the graph replay starts fresh.
+    let (b2, _) = build_test_buffers(dims, 17);
+    unsafe {
+        let n = seq_usz * dims.hidden_dim as usize * 2;
+        sys::cuMemcpyDtoD_v2(b.hidden_states, b2.hidden_states, n);
+        // Zero out intermediate buffers that accumulate across layers.
+        sys::cuMemsetD8_v2(b.rms_rope, 0, n);
+        sys::cuMemsetD8_v2(b.qkv, 0, seq_usz * (q_dim + 2 * kv_dim) as usize * 2);
+        sys::cuMemsetD8_v2(b.q_post_rope, 0, seq_usz * q_dim as usize * 2);
+        sys::cuMemsetD8_v2(b.attn_out, 0, n);
+        sys::cuMemsetD8_v2(b.rms_gate, 0, n);
+        sys::cuMemsetD8_v2(b.silu_out, 0, seq_usz * dims.intermediate_dim as usize * 2);
+        let cache_n = nl
+            * pages_per_layer
+            * page_size
+            * dims.num_kv_heads as usize
+            * dims.head_dim as usize
+            * 2;
+        sys::cuMemsetD8_v2(b.k_cache, 0, cache_n);
+        sys::cuMemsetD8_v2(b.v_cache, 0, cache_n);
+        result::stream::synchronize(stream).unwrap();
+    }
+
+    // Capture one pass into a graph.
+    unsafe {
+        result::stream::begin_capture(
+            stream,
+            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .expect("begin capture failed");
+    }
+    one_pass();
+    let (graph, exec) = unsafe {
+        let g = result::stream::end_capture(stream).expect("end capture failed");
+        let e = result::graph::instantiate(
+            g,
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        )
+        .expect("graph instantiate failed");
+        (g, e)
+    };
+
+    // Replay the graph once.
+    unsafe {
+        result::graph::launch(exec, stream).unwrap();
+        result::stream::synchronize(stream).unwrap();
+    }
+
+    let h_graph = gpu_download_bf16(b.hidden_states, seq_usz * dims.hidden_dim as usize);
+    assert_matches_committed_golden("llama_3_2_1b_seq64", &h_graph, 32768.0, 0.10);
+    eprintln!("cp5 golden — graph replay: OK");
 
     unsafe {
+        result::graph::exec_destroy(exec).unwrap();
+        result::graph::destroy(graph).unwrap();
         ffi::teardown_flashinfer_attention_plan(&mut fi_plan as *mut _);
         ffi::cublasDestroy_v2(handle);
+        sys::cuStreamDestroy_v2(stream);
     }
-
-    assert_matches_committed_golden("llama_3_2_1b_seq64", &h_gpu, 32768.0, 0.10);
 }

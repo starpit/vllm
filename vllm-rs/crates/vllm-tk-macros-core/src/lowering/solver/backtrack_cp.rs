@@ -658,21 +658,22 @@ mod tests {
     }
 
     /// Render one launch: `cb:l(gate)` or `tk:l([norm+gate+up+...])`.
+    /// `l()` = one kernel launch, `[a+b]` = fused tiles.
     /// Color-coded by library family.
     fn launch_str(imp_name: &str, kinds: &[TileKind]) -> String {
         let tag = lib_tag(imp_name);
         let color = lib_color(imp_name);
         let tiles = if kinds.len() == 1 {
-            tile_abbrev(kinds[0]).to_string()
+            format!("({})", tile_abbrev(kinds[0]))
         } else {
             let inner: String = kinds
                 .iter()
                 .map(|k| tile_abbrev(*k))
                 .collect::<Vec<_>>()
                 .join("+");
-            format!("[{inner}]")
+            format!("([{inner}])")
         };
-        format!("{color}{tag}:{tiles}{RESET}")
+        format!("{color}{tag}:l{tiles}{RESET}")
     }
 
     /// Compact one-layer representation: sequence of `tag:tiles` tokens.

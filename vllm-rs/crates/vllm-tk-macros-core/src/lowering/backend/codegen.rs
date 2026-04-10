@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! TokenStream codegen for the `forward!` macro.
 //!
-//! Emits the forward function directly — same types as the existing
-//! LlamaModel::forward (OwnedTensor, GpuTensor, CublasHandle, etc.).
-//! Each workload bucket gets a complete per-layer body with
-//! solver-selected kernels.
+//! The codegen is a compiler backend. It walks the solver's
+//! `DispatchSequence` entry by entry and emits one Rust call per
+//! entry. It does NOT interpret, merge, or second-guess the plan.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -48,7 +47,6 @@ fn generate_fully_specialized(def: &CompileDef) -> TokenStream {
         };
     }
 
-    // Build per-bucket layer functions and the match arms.
     let mut bucket_fns = Vec::new();
     let mut match_arms = Vec::new();
     let mut prev_upper = 0u32;
@@ -60,7 +58,7 @@ fn generate_fully_specialized(def: &CompileDef) -> TokenStream {
         let body = emit_layer_body(&ds);
 
         bucket_fns.push(quote! {
-            #[allow(unused_variables, unused_mut)]
+            #[allow(unused_variables, unused_mut, unused_assignments)]
             #[inline(never)]
             unsafe fn #fn_name(
                 layer: &LlamaDecoderLayer,
@@ -99,10 +97,8 @@ fn generate_fully_specialized(def: &CompileDef) -> TokenStream {
     }
 
     quote! {
-        /// Solver-generated per-layer dispatch.
-        ///
-        /// Selects the optimal kernel mix based on `num_tokens`.
-        /// Each bucket is a complete layer body with solver-selected kernels.
+        /// Solver-generated per-layer dispatch. Each bucket is emitted
+        /// directly from the solver's DispatchSequence — one call per entry.
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn solver_forward_layer(
             layer: &LlamaDecoderLayer,
@@ -129,166 +125,271 @@ fn generate_fully_specialized(def: &CompileDef) -> TokenStream {
     }
 }
 
-/// Emit a complete per-layer body from the dispatch sequence.
-/// Uses the same ops as LlamaDecoderLayer::forward but with
-/// solver-selected GEMM implementations.
+/// Walk the dispatch sequence for layer 0 and emit one call per entry.
+/// The sequence is already in dependency order (step-sorted by the solver).
 fn emit_layer_body(ds: &DispatchSequence) -> TokenStream {
     let layer0: Vec<_> = ds.entries_for_layer(0).collect();
 
-    // Determine which GEMM impl is used for each phase.
-    let qkv_gemm = find_gemm_entry(&layer0, GemmPhase::Qkv);
-    let oproj_gemm = find_gemm_entry(&layer0, GemmPhase::OProj);
-    let gate_gemm = find_gemm_entry(&layer0, GemmPhase::Gate);
-    let up_gemm = find_gemm_entry(&layer0, GemmPhase::Up);
-    let down_gemm = find_gemm_entry(&layer0, GemmPhase::Down);
+    let mut stmts: Vec<TokenStream> = Vec::new();
 
-    // Check for TK fused MLP (replaces gate+up+silu+down+norm).
-    let has_tk_fused_mlp = layer0
-        .iter()
-        .any(|e| e.kind == ImplDispatchKind::TkFusedMlpBlock);
+    for entry in &layer0 {
+        if let Some(stmt) = emit_entry(entry) {
+            stmts.push(stmt);
+        }
+    }
 
-    // Emit attn norm.
-    let attn_norm_code = quote! {
-        let (normed, residual) = if let Some(residual) = residual {
-            let hs_gpu = *hidden_states;
-            let res_gpu = *residual;
-            kernels::fused_add_rms_norm_inplace(
-                hs_gpu, res_gpu,
-                layer.input_layernorm.weight,
-                layer.input_layernorm.eps,
+    // The last non-noop entry should produce hidden_states + residual.
+    // The layer contract: return (hidden_states, residual).
+    quote! {
+        // Mutable bindings for the dataflow — each entry reads/writes these.
+        let mut hidden_states = hidden_states;
+        let mut residual = residual;
+        let mut normed: Option<OwnedTensor> = None;
+        let mut qkv_out: Option<OwnedTensor> = None;
+        let mut attn_out: Option<OwnedTensor> = None;
+        let mut gate_up: Option<OwnedTensor> = None;
+        let mut silu_out: Option<OwnedTensor> = None;
+
+        #(#stmts)*
+
+        (hidden_states, residual.unwrap())
+    }
+}
+
+/// Emit one Rust statement for one DispatchEntry.
+/// Returns None for Noop entries.
+fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
+    match entry.kind {
+        ImplDispatchKind::Noop => None,
+
+        ImplDispatchKind::RmsNorm => {
+            let is_attn = entry.is_attn_norm.unwrap_or(true);
+            if is_attn {
+                // Attention norm: fused_add_rms_norm if we have a residual,
+                // plain rms_norm for layer 0.
+                Some(quote! {
+                    let (n, r) = if let Some(res) = residual.take() {
+                        let hs_gpu = *hidden_states;
+                        let res_gpu = *res;
+                        kernels::fused_add_rms_norm_inplace(
+                            hs_gpu, res_gpu,
+                            layer.input_layernorm.weight,
+                            layer.input_layernorm.eps,
+                            device.compute_stream,
+                        );
+                        (hidden_states, res)
+                    } else {
+                        let n = kernels::rms_norm(
+                            *hidden_states,
+                            layer.input_layernorm.weight,
+                            layer.input_layernorm.eps,
+                            &mut device.caching,
+                            device.compute_stream,
+                        );
+                        let r = hidden_states;
+                        (n, r)
+                    };
+                    normed = Some(n);
+                    residual = Some(r);
+                })
+            } else {
+                // MLP norm: always fused_add_rms_norm (post-attention).
+                Some(quote! {
+                    let hs = hidden_states;
+                    let res = residual.as_ref().unwrap();
+                    let res_gpu = res.as_gpu_tensor();
+                    kernels::fused_add_rms_norm_inplace(
+                        *hs, res_gpu,
+                        layer.post_attention_layernorm.weight,
+                        layer.post_attention_layernorm.eps,
+                        device.compute_stream,
+                    );
+                    normed = Some(hs);
+                })
+            }
+        }
+
+        ImplDispatchKind::CublasGemm => Some(emit_gemm(entry, false)),
+
+        ImplDispatchKind::CutlassGemm { .. } => Some(emit_gemm(entry, true)),
+
+        ImplDispatchKind::CutlassNormGemm { .. } => {
+            // Fused norm+GEMM — the norm is folded into the GEMM prologue.
+            // TODO: wire CUTLASS prologue fusion launcher.
+            // For now, emit as separate norm + GEMM.
+            Some(emit_gemm(entry, false))
+        }
+
+        ImplDispatchKind::FusedQkvRopeCache => {
+            Some(quote! {
+                // Fused QKV split + RoPE + KV cache write.
+                let qkv_tensor = qkv_out.as_ref().unwrap();
+                kernels::fused_qkv_rope_cache(
+                    qkv_tensor.as_gpu_tensor(),
+                    positions,
+                    slot_mapping,
+                    &layer.self_attn,
+                    kv_cache,
+                    rotary,
+                    device,
+                );
+            })
+        }
+
+        ImplDispatchKind::RotaryEmbedding => Some(quote! {
+            kernels::rotary_embedding_inplace(
+                qkv_out.as_ref().unwrap().as_gpu_tensor(),
+                positions,
+                rotary,
+                &layer.self_attn,
                 device.compute_stream,
             );
-            (hidden_states, residual)
-        } else {
-            let normed = kernels::rms_norm(
-                *hidden_states,
-                layer.input_layernorm.weight,
-                layer.input_layernorm.eps,
+        }),
+
+        ImplDispatchKind::FlashInferAttention => {
+            Some(quote! {
+                // FlashInfer FA2 standalone attention.
+                let q_in = qkv_out.take().unwrap();
+                let a = layer.self_attn.run_attention(
+                    q_in.view(),
+                    positions, cu_seqlens_q, seqused_k,
+                    block_table, max_seqlen_q, max_seqlen_k,
+                    kv_cache, device,
+                );
+                drop(q_in);
+                attn_out = Some(a);
+            })
+        }
+
+        ImplDispatchKind::SiluAndMul => Some(quote! {
+            let gu = gate_up.take().unwrap();
+            let activated = kernels::silu_and_mul_fused(
+                gu.as_gpu_tensor(),
+                layer.mlp.intermediate_size,
                 &mut device.caching,
                 device.compute_stream,
             );
-            (normed, hidden_states)
-        };
-    };
+            drop(gu);
+            silu_out = Some(activated);
+        }),
 
-    // Emit QKV GEMM.
-    let qkv_code = emit_gemm_call(
-        qkv_gemm,
-        quote! { normed.view() },
-        quote! { layer.self_attn.qkv_proj },
-    );
-
-    // Emit attention block (rope + cache + FA2 + oproj).
-    let oproj_code = emit_gemm_call(
-        oproj_gemm,
-        quote! { attn_output.view() },
-        quote! { layer.self_attn.o_proj },
-    );
-
-    let attn_block = quote! {
-        let qkv_out = #qkv_code;
-        drop(normed);
-
-        let attn_output = layer.self_attn.forward(
-            qkv_out.view(),
-            positions, slot_mapping, cu_seqlens_q, seqused_k,
-            block_table, max_seqlen_q, max_seqlen_k,
-            kv_cache, rotary, device,
-        );
-        drop(qkv_out);
-
-        // Post-attention residual add + oproj.
-        // For now, use the standard oproj path.
-        // TODO: when the solver picks fused oproj+residual (beta=1),
-        // emit the fused variant.
-        let oproj_out = #oproj_code;
-        drop(attn_output);
-    };
-
-    // Emit MLP block.
-    // For now, all MLP paths delegate to layer.mlp.forward() which
-    // uses the eager cuBLAS path. When CUTLASS standalone launchers
-    // and TK fused MLP are wired into vllm-cuda, the codegen will
-    // emit direct kernel calls based on the solver's selection.
-    let _ = (gate_gemm, up_gemm, down_gemm, has_tk_fused_mlp);
-    let mlp_block = quote! {
-        let res_gpu = *residual;
-        kernels::fused_add_rms_norm_inplace(
-            *oproj_out, res_gpu,
-            layer.post_attention_layernorm.weight,
-            layer.post_attention_layernorm.eps,
-            device.compute_stream,
-        );
-        let mlp_output = layer.mlp.forward(oproj_out.view(), device);
-        drop(oproj_out);
-        (mlp_output, residual)
-    };
-
-    quote! {
-        #attn_norm_code
-        #attn_block
-        #mlp_block
+        ImplDispatchKind::TkFusedMlpBlock => {
+            // TK fused MLP: entire MLP block in one kernel.
+            // TODO: emit TK launch. For now, fall back to the
+            // individual ops (the solver shouldn't pick this
+            // until TK is wired).
+            Some(quote! {
+                // TK fused MLP — not yet wired, placeholder.
+                compile_error!("TK fused MLP codegen not yet implemented");
+            })
+        }
     }
 }
 
-/// Emit a GEMM call for the solver-selected implementation.
-fn emit_gemm_call(
-    entry: Option<&&DispatchEntry>,
-    input_expr: TokenStream,
-    weight_expr: TokenStream,
-) -> TokenStream {
-    let cublas_fallback = quote! {
-        #weight_expr.forward(
-            #input_expr,
-            &mut device.cublas,
-            &mut device.caching,
-            device.compute_stream,
-        )
+/// Emit a GEMM call for either cuBLAS or CUTLASS, based on the dispatch entry.
+/// Routes the result to the right dataflow variable based on GemmPhase.
+fn emit_gemm(entry: &DispatchEntry, use_cutlass: bool) -> TokenStream {
+    let phase = entry.gemm_phase.unwrap();
+
+    // Determine input/output/weight expressions based on phase.
+    let (input_expr, weight_expr, output_binding) = match phase {
+        GemmPhase::Qkv => (
+            quote! { normed.as_ref().unwrap().view() },
+            quote! { layer.self_attn.qkv_proj },
+            quote! { qkv_out = Some(__out); },
+        ),
+        GemmPhase::OProj => (
+            quote! { attn_out.as_ref().unwrap().view() },
+            quote! { layer.self_attn.o_proj },
+            quote! { hidden_states = __out; },
+        ),
+        GemmPhase::Gate => (
+            quote! { normed.as_ref().unwrap().view() },
+            quote! { layer.mlp.gate_up_proj },
+            quote! { gate_up = Some(__out); },
+        ),
+        GemmPhase::Up => (
+            // For dense models, gate_up_proj is fused [2*ID, HD].
+            // The solver still has a separate Up entry, but the weight
+            // is the same fused tensor. The gate entry already produced
+            // the full [M, 2*ID] output. Up is a noop for dense.
+            // For quantized with separate up_proj, this is a real GEMM.
+            quote! { normed.as_ref().unwrap().view() },
+            quote! { layer.mlp.up_proj_or_gate_up() },
+            quote! {
+                // For dense: up is part of fused gate_up, skip.
+                // For quantized: concat gate + up.
+                if layer.mlp.has_separate_up() {
+                    let gu = gate_up.take().unwrap();
+                    let concat = kernels::concat_dim1(
+                        gu.as_gpu_tensor(),
+                        __out.as_gpu_tensor(),
+                        &mut device.caching,
+                        device.compute_stream,
+                    );
+                    drop(gu);
+                    drop(__out);
+                    gate_up = Some(concat);
+                }
+            },
+        ),
+        GemmPhase::Down => (
+            quote! { silu_out.as_ref().unwrap().view() },
+            quote! { layer.mlp.down_proj },
+            quote! { hidden_states = __out; },
+        ),
     };
 
-    match entry {
-        Some(e) => match e.kind {
-            ImplDispatchKind::CublasGemm => cublas_fallback,
-            ImplDispatchKind::CutlassGemm { tile_m, tile_n } => {
-                let launch_fn = if tile_m == 64 && tile_n == 64 {
-                    format_ident!("cutlass_gemm_64x64_launch")
-                } else {
-                    format_ident!("cutlass_gemm_128x128_launch")
-                };
-                let beta = if e.fused_residual {
-                    quote! { 1.0f32 }
-                } else {
-                    quote! { 0.0f32 }
-                };
-                quote! {{
-                    // CUTLASS standalone GEMM: C = A @ B^T + beta*C
-                    let act_tensor = (#input_expr).as_gpu_tensor();
-                    let m = act_tensor.dim(0) as i32;
-                    let k = act_tensor.dim(1) as i32;
-                    let w_tensor = #weight_expr.dense_weight();
-                    let n = w_tensor.dim(0) as i32;
-                    let out = device.caching.alloc_tensor(
-                        &[m as usize, n as usize], act_tensor.dtype(),
-                    );
-                    let rc = #launch_fn(
-                        out.as_gpu_tensor().as_mut_ptr::<u16>(),
-                        act_tensor.as_ptr::<u16>(),
-                        w_tensor.as_ptr::<u16>(),
-                        m, n, k,
-                        1.0f32, #beta,
-                        device.compute_stream as u64,
-                    );
-                    debug_assert_eq!(rc, 0, "CUTLASS GEMM failed");
-                    out
-                }}
+    if use_cutlass {
+        let launch_fn = match entry.kind {
+            ImplDispatchKind::CutlassGemm {
+                tile_m: 64,
+                tile_n: 64,
+            } => {
+                format_ident!("cutlass_gemm_64x64_launch")
             }
-            _ => cublas_fallback,
-        },
-        None => cublas_fallback,
+            _ => format_ident!("cutlass_gemm_128x128_launch"),
+        };
+        let beta = if entry.fused_residual {
+            quote! { 1.0f32 }
+        } else {
+            quote! { 0.0f32 }
+        };
+        quote! {{
+            let __input = #input_expr;
+            let __act = __input.as_gpu_tensor();
+            let __m = __act.dim(0) as i32;
+            let __k = __act.dim(1) as i32;
+            let __w = (#weight_expr).dense_weight();
+            let __n = __w.dim(0) as i32;
+            let __out = device.caching.alloc_tensor(
+                &[__m as usize, __n as usize], __act.dtype(),
+            );
+            let __rc = #launch_fn(
+                __out.as_gpu_tensor().as_mut_ptr::<u16>(),
+                __act.as_ptr::<u16>(),
+                __w.as_ptr::<u16>(),
+                __m, __n, __k,
+                1.0f32, #beta,
+                device.compute_stream as u64,
+            );
+            debug_assert_eq!(__rc, 0, "CUTLASS GEMM failed");
+            #output_binding
+        }}
+    } else {
+        quote! {{
+            let __out = (#weight_expr).forward(
+                #input_expr,
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            #output_binding
+        }}
     }
 }
 
-/// Find the DispatchEntry for a given GEMM phase in layer 0.
+/// Find the DispatchEntry for a given GEMM phase in a layer's entries.
 fn find_gemm_entry<'a>(
     entries: &'a [&'a DispatchEntry],
     phase: GemmPhase,
@@ -298,30 +399,14 @@ fn find_gemm_entry<'a>(
         .find(|e| e.gemm_phase == Some(phase) && e.kind != ImplDispatchKind::Noop)
 }
 
-// ── GPU-specialized path ────────────────────────────────────────
+// ── GPU-specialized / fully dynamic (not yet implemented) ───────
 
-fn generate_gpu_specialized(def: &CompileDef) -> TokenStream {
-    let _model_id = def.model.as_static().unwrap();
-
-    // For the GPU-specialized path, we can't run the solver at
-    // compile time (target is runtime). Emit a runtime struct that
-    // solves at startup and dispatches via the eager path with
-    // solver-selected GEMM overrides.
-    // TODO: implement runtime dispatch table.
-    quote! {
-        // GPU-specialized forward! — solver runs at model load time.
-        // Not yet implemented; falls back to eager dispatch.
-    }
+fn generate_gpu_specialized(_def: &CompileDef) -> TokenStream {
+    quote! {}
 }
 
-// ── Fully dynamic path ──────────────────────────────────────────
-
 fn generate_fully_dynamic(_def: &CompileDef) -> TokenStream {
-    // TODO: implement runtime interpreter dispatch.
-    quote! {
-        // Fully dynamic forward! — solver runs at model load time.
-        // Not yet implemented; falls back to eager dispatch.
-    }
+    quote! {}
 }
 
 // ── Helpers ─────────────────────────────────────────────────────

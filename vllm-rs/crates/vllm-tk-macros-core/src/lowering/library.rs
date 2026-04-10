@@ -253,6 +253,11 @@ pub struct GpuCostTable {
     pub elementwise_hd: CostCurve, // dim=hidden_dim (norm, res_add)
     pub elementwise_id: CostCurve,  // dim=intermediate_dim (silu)
     pub elementwise_qkv: CostCurve, // dim=qkv_dim (fused rope+cache)
+    /// CUTLASS 128×128 GEMM — gate shape (N=8192, K=2048).
+    /// Other phases scale proportionally via the analytical model.
+    pub cutlass128_gate: CostCurve,
+    /// CUTLASS 64×64 GEMM — gate shape.
+    pub cutlass64_gate: CostCurve,
     /// FlashInfer attention per-layer cost.
     pub attention: CostCurve,
     /// TK fused MLP block per-layer cost.
@@ -359,6 +364,30 @@ impl GpuCostTable {
                 (1024, 25.0),
                 (4096, 90.0),
             ]),
+            // CUTLASS measured on gate shape (N=8192, K=2048).
+            // Other phases: scale by measured cuBLAS ratio.
+            cutlass128_gate: CostCurve::new(vec![
+                (1, 70.8),
+                (4, 70.9),
+                (16, 70.9),
+                (32, 71.1),
+                (64, 71.4),
+                (128, 72.4),
+                (256, 109.0),
+                (512, 204.6),
+                (1024, 429.0),
+            ]),
+            cutlass64_gate: CostCurve::new(vec![
+                (1, 29.5),
+                (4, 29.5),
+                (16, 29.8),
+                (32, 30.5),
+                (64, 37.8),
+                (128, 75.4),
+                (256, 130.3),
+                (512, 274.9),
+                (1024, 621.2),
+            ]),
             attention: CostCurve::new(vec![
                 (1, 50.0),
                 (64, 90.0),
@@ -419,15 +448,19 @@ mod l4_cost_model {
     }
 
     pub fn cutlass_gemm_us(m: u32, n: u32, k: u32, tile_m: u32, _tile_n: u32, _num_sm: u32) -> f64 {
-        // Measured: CUTLASS 128×128 is ~2% SLOWER than cuBLAS at
-        // large M (cuBLAS autotuner picks better configs). Apply
-        // tile waste penalty for small M where padding hurts.
+        // Use measured CUTLASS data for the gate shape, then scale
+        // for other shapes by the cuBLAS ratio (CUTLASS/cuBLAS
+        // ratio is roughly constant across N for a given M).
+        let cutlass_gate = if tile_m >= 128 {
+            TABLE.cutlass128_gate.lookup(m)
+        } else {
+            TABLE.cutlass64_gate.lookup(m)
+        };
+        let cublas_gate = TABLE.cublas_gate.lookup(m);
+        let ratio = cutlass_gate / cublas_gate.max(0.1);
+        // Apply this ratio to the actual phase's cuBLAS cost.
         let cublas = gemm_us(m, n, k);
-        let tiles_m = ((m as f64) / tile_m as f64).ceil().max(1.0);
-        let actual_m = tiles_m * tile_m as f64;
-        let waste = actual_m / (m as f64).max(1.0);
-        // 1.02 = 2% overhead vs cuBLAS, × waste for tile padding.
-        cublas * 1.02 * waste
+        cublas * ratio
     }
 }
 

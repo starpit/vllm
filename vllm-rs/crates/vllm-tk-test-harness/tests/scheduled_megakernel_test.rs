@@ -3070,3 +3070,200 @@ fn cublas_gemm_sweep_microbench() {
 
     unsafe { ffi::cublasDestroy_v2(handle) };
 }
+
+// ── CUTLASS vs cuBLAS comparison sweep ──
+
+#[test]
+#[ignore = "needs GPU"]
+fn cutlass_vs_cublas_sweep() {
+    use cudarc::driver::sys;
+
+    init_cuda();
+
+    let mut handle: ffi::CublasHandle = std::ptr::null_mut();
+    unsafe {
+        let s = ffi::cublasCreate_v2(&mut handle);
+        assert_eq!(s, 0);
+        ffi::cublasSetStream_v2(handle, std::ptr::null_mut());
+    }
+
+    let one: f32 = 1.0;
+    let zero: f32 = 0.0;
+    let m_values: &[i32] = &[1, 4, 16, 32, 64, 128, 256, 512, 1024];
+    // Test with gate shape (N=8192, K=2048) — the largest GEMM.
+    let n = 8192i32;
+    let k = 2048i32;
+
+    eprintln!();
+    eprintln!("CUTLASS vs cuBLAS — gate GEMM (N={n}, K={k}) on L4");
+    eprintln!(
+        "{:>6} │ {:>10} {:>10} {:>10} │ {:>8} {:>8}",
+        "M", "cuBLAS_us", "CL128_us", "CL64_us", "128/cb", "64/cb"
+    );
+    eprintln!("───────┼──────────────────────────────────┼──────────────────");
+
+    for &m in m_values {
+        let a = gpu_alloc_zeros((m * k) as usize * 2);
+        let b = gpu_alloc_zeros((n * k) as usize * 2);
+        let c = gpu_alloc_zeros((m * n) as usize * 2);
+
+        const ITERS: u32 = 50;
+
+        // cuBLAS
+        let cb_us = unsafe {
+            for _ in 0..10 {
+                ffi::cublasGemmEx(
+                    handle,
+                    ffi::CUBLAS_OP_T,
+                    ffi::CUBLAS_OP_N,
+                    n,
+                    m,
+                    k,
+                    &one as *const f32,
+                    b as *const _,
+                    ffi::CUDA_R_16BF,
+                    k,
+                    a as *const _,
+                    ffi::CUDA_R_16BF,
+                    k,
+                    &zero as *const f32,
+                    c as *mut _,
+                    ffi::CUDA_R_16BF,
+                    n,
+                    ffi::CUBLAS_COMPUTE_32F,
+                    ffi::CUBLAS_GEMM_DEFAULT,
+                );
+            }
+            result::stream::synchronize(std::ptr::null_mut()).unwrap();
+            let mut start: sys::CUevent = std::ptr::null_mut();
+            let mut stop: sys::CUevent = std::ptr::null_mut();
+            sys::cuEventCreate(&mut start, 0);
+            sys::cuEventCreate(&mut stop, 0);
+            sys::cuEventRecord(start, std::ptr::null_mut());
+            for _ in 0..ITERS {
+                ffi::cublasGemmEx(
+                    handle,
+                    ffi::CUBLAS_OP_T,
+                    ffi::CUBLAS_OP_N,
+                    n,
+                    m,
+                    k,
+                    &one as *const f32,
+                    b as *const _,
+                    ffi::CUDA_R_16BF,
+                    k,
+                    a as *const _,
+                    ffi::CUDA_R_16BF,
+                    k,
+                    &zero as *const f32,
+                    c as *mut _,
+                    ffi::CUDA_R_16BF,
+                    n,
+                    ffi::CUBLAS_COMPUTE_32F,
+                    ffi::CUBLAS_GEMM_DEFAULT,
+                );
+            }
+            sys::cuEventRecord(stop, std::ptr::null_mut());
+            sys::cuEventSynchronize(stop);
+            let mut ms: f32 = 0.0;
+            sys::cuEventElapsedTime(&mut ms, start, stop);
+            sys::cuEventDestroy_v2(start);
+            sys::cuEventDestroy_v2(stop);
+            (ms / ITERS as f32) * 1000.0
+        };
+
+        // CUTLASS 128×128
+        let cl128_us = unsafe {
+            for _ in 0..10 {
+                ffi::cutlass_gemm_128x128_launch(
+                    c as *mut u16,
+                    a as *const u16,
+                    b as *const u16,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    0.0,
+                    0,
+                );
+            }
+            result::stream::synchronize(std::ptr::null_mut()).unwrap();
+            let mut start: sys::CUevent = std::ptr::null_mut();
+            let mut stop: sys::CUevent = std::ptr::null_mut();
+            sys::cuEventCreate(&mut start, 0);
+            sys::cuEventCreate(&mut stop, 0);
+            sys::cuEventRecord(start, std::ptr::null_mut());
+            for _ in 0..ITERS {
+                ffi::cutlass_gemm_128x128_launch(
+                    c as *mut u16,
+                    a as *const u16,
+                    b as *const u16,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    0.0,
+                    0,
+                );
+            }
+            sys::cuEventRecord(stop, std::ptr::null_mut());
+            sys::cuEventSynchronize(stop);
+            let mut ms: f32 = 0.0;
+            sys::cuEventElapsedTime(&mut ms, start, stop);
+            sys::cuEventDestroy_v2(start);
+            sys::cuEventDestroy_v2(stop);
+            (ms / ITERS as f32) * 1000.0
+        };
+
+        // CUTLASS 64×64
+        let cl64_us = unsafe {
+            for _ in 0..10 {
+                ffi::cutlass_gemm_64x64_launch(
+                    c as *mut u16,
+                    a as *const u16,
+                    b as *const u16,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    0.0,
+                    0,
+                );
+            }
+            result::stream::synchronize(std::ptr::null_mut()).unwrap();
+            let mut start: sys::CUevent = std::ptr::null_mut();
+            let mut stop: sys::CUevent = std::ptr::null_mut();
+            sys::cuEventCreate(&mut start, 0);
+            sys::cuEventCreate(&mut stop, 0);
+            sys::cuEventRecord(start, std::ptr::null_mut());
+            for _ in 0..ITERS {
+                ffi::cutlass_gemm_64x64_launch(
+                    c as *mut u16,
+                    a as *const u16,
+                    b as *const u16,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    0.0,
+                    0,
+                );
+            }
+            sys::cuEventRecord(stop, std::ptr::null_mut());
+            sys::cuEventSynchronize(stop);
+            let mut ms: f32 = 0.0;
+            sys::cuEventElapsedTime(&mut ms, start, stop);
+            sys::cuEventDestroy_v2(start);
+            sys::cuEventDestroy_v2(stop);
+            (ms / ITERS as f32) * 1000.0
+        };
+
+        eprintln!(
+            "{m:>6} │ {cb_us:>10.1} {cl128_us:>10.1} {cl64_us:>10.1} │ {:.2}×    {:.2}×",
+            cl128_us / cb_us,
+            cl64_us / cb_us,
+        );
+    }
+
+    unsafe { ffi::cublasDestroy_v2(handle) };
+}

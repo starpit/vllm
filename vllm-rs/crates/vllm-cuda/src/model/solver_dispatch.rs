@@ -13,7 +13,7 @@ use crate::alloc::OwnedTensor;
 use crate::device::GpuDevice;
 use crate::kv_cache::KvCachePool;
 use crate::model::llama::{LlamaDecoderLayer, RotaryCache};
-use crate::tensor::TensorView;
+use crate::tensor::{GpuTensor, TensorView};
 use crate::{kernels, layers::LinearLayer};
 
 // ── CUTLASS standalone GEMM FFI ─────────────────────────────────

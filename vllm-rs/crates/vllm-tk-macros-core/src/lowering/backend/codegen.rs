@@ -141,16 +141,19 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             if is_attn {
                 Some(quote! {
                     let (n, r) = if let Some(res) = residual.take() {
+                        let hs_gpu: GpuTensor = *hidden_states;
+                        let res_gpu: GpuTensor = *res;
                         kernels::fused_add_rms_norm_inplace(
-                            *hidden_states, *res,
+                            hs_gpu, res_gpu,
                             layer.input_layernorm.weight,
                             layer.input_layernorm.eps,
                             device.compute_stream,
                         );
                         (hidden_states, res)
                     } else {
+                        let hs_gpu: GpuTensor = *hidden_states;
                         let n = kernels::rms_norm(
-                            *hidden_states,
+                            hs_gpu,
                             layer.input_layernorm.weight,
                             layer.input_layernorm.eps,
                             &mut device.caching,
@@ -163,19 +166,17 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                     residual = Some(r);
                 })
             } else {
+                // MLP norm: fused_add_rms_norm_inplace mutates both in-place.
                 Some(quote! {
-                    {
-                        let res = residual.as_ref().unwrap();
-                        kernels::fused_add_rms_norm_inplace(
-                            *hidden_states, res.as_gpu_tensor(),
-                            layer.post_attention_layernorm.weight,
-                            layer.post_attention_layernorm.eps,
-                            device.compute_stream,
-                        );
-                    }
+                    let hs_gpu: GpuTensor = *hidden_states;
+                    let res_gpu: GpuTensor = **residual.as_ref().unwrap();
+                    kernels::fused_add_rms_norm_inplace(
+                        hs_gpu, res_gpu,
+                        layer.post_attention_layernorm.weight,
+                        layer.post_attention_layernorm.eps,
+                        device.compute_stream,
+                    );
                     normed = Some(hidden_states);
-                    // hidden_states will be reassigned by the down GEMM.
-                    hidden_states = residual.as_ref().unwrap().clone_ref();
                 })
             }
         }
@@ -196,7 +197,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
 
         ImplDispatchKind::CutlassGemm { tile_m, tile_n } => {
             let phase = entry.gemm_phase.unwrap();
-            let (input, weight, store) = gemm_operands(phase, entry.fused_residual);
+            let (_, weight, store) = gemm_operands(phase, entry.fused_residual);
+            let cutlass_input = cutlass_input_expr(phase);
             let launch_fn = if tile_m == 64 && tile_n == 64 {
                 format_ident!("cutlass_gemm_64x64_launch")
             } else {
@@ -208,7 +210,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                 quote! { 0.0f32 }
             };
             Some(quote! {{
-                let __act = (#input).as_gpu_tensor();
+                let __act: GpuTensor = #cutlass_input;
                 let __m = __act.dim(0) as i32;
                 let __k = __act.dim(1) as i32;
                 let __w = (#weight).dense_weight();
@@ -217,7 +219,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                     &[__m as usize, __n as usize], __act.dtype(),
                 );
                 let __rc = #launch_fn(
-                    __out.as_gpu_tensor().as_mut_ptr::<u16>(),
+                    __out.as_mut_ptr::<u16>(),
                     __act.as_ptr::<u16>(),
                     __w.as_ptr::<u16>(),
                     __m, __n, __k,
@@ -265,9 +267,9 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
         }}),
 
         ImplDispatchKind::RotaryEmbedding => Some(quote! {{
-            let __qkv = qkv_out.as_ref().unwrap();
+            let __qkv = **qkv_out.as_ref().unwrap();
             kernels::fused_qkv_rope(
-                __qkv.as_gpu_tensor(),
+                __qkv,
                 *positions,
                 rotary.cos_sin_cache,
                 layer.self_attn.q_size,
@@ -320,8 +322,20 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
     }
 }
 
-/// For a GEMM phase, return (input_expr, weight_expr, store_stmt)
-/// that reads from and writes to the dataflow variables.
+/// For CUTLASS: return a GpuTensor expression for the input activation.
+/// Derefs from the OwnedTensor dataflow variable.
+fn cutlass_input_expr(phase: GemmPhase) -> TokenStream {
+    match phase {
+        GemmPhase::Qkv => quote! { **normed.as_ref().unwrap() },
+        GemmPhase::OProj => quote! { **attn_out.as_ref().unwrap() },
+        GemmPhase::Gate => quote! { **normed.as_ref().unwrap() },
+        GemmPhase::Up => quote! { **normed.as_ref().unwrap() },
+        GemmPhase::Down => quote! { **silu_out.as_ref().unwrap() },
+    }
+}
+
+/// For a GEMM phase, return (input_expr, weight_expr, store_stmt).
+/// input_expr is a TensorView (for cuBLAS LinearLayer::forward).
 fn gemm_operands(
     phase: GemmPhase,
     _fused_residual: bool,
@@ -343,9 +357,6 @@ fn gemm_operands(
             quote! { gate_up = Some(__out); },
         ),
         GemmPhase::Up => (
-            // Dense models have fused gate_up_proj — the Gate entry
-            // already produced [M, 2*intermediate]. Up is a noop for
-            // dense. For quantized with separate up_proj, this is real.
             quote! { normed.as_ref().unwrap().view() },
             quote! { layer.mlp.gate_up_proj },
             quote! {
@@ -354,8 +365,7 @@ fn gemm_operands(
                 if layer.mlp.up_proj.is_some() {
                     let __gu = gate_up.take().unwrap();
                     let __concat = kernels::concat_dim1(
-                        __gu.as_gpu_tensor(),
-                        __out.as_gpu_tensor(),
+                        *__gu, *__out,
                         &mut device.caching,
                         device.compute_stream,
                     );

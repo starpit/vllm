@@ -245,10 +245,12 @@ pub struct TargetProfile {
     pub num_sm: u32,
 
     // ── Workload shape ─────────────────────────────────────────────
-    /// Sequence length for this problem instance. Implementations
-    /// use this to return seq-dependent costs (e.g., TK fused MLP
-    /// is fast at decode seq=1-4, slow at prefill seq=1024).
+    /// Sequence length for this problem instance.
     pub seq_len: u32,
+    /// Batch size. For prefill this is typically 1 (one sequence at
+    /// a time); for decode it can be 1-256 (continuous batching).
+    /// The GEMM M dimension is `num_tokens = batch_size * seq_len`.
+    pub batch_size: u32,
     /// How many megakernel CTAs fit per SM under
     /// cooperative-launch residency constraints. Determined by the
     /// megakernel's per-CTA dynamic shmem + register footprint vs
@@ -293,6 +295,7 @@ impl TargetProfile {
         Self {
             num_sm: 58,
             seq_len: 1024,
+            batch_size: 1,
             cooperative_blocks_per_sm: 1,
             max_dynamic_shmem_bytes: 99 * 1024,
 
@@ -318,12 +321,23 @@ impl TargetProfile {
         }
     }
 
-    /// Return a copy with a different sequence length. Use this to
-    /// solve for decode (`with_seq_len(1)`) vs prefill (`with_seq_len(1024)`).
-    pub const fn with_seq_len(&self, seq_len: u32) -> Self {
+    /// Return a copy with different workload shape.
+    pub const fn with_workload(&self, batch_size: u32, seq_len: u32) -> Self {
         let mut p = *self;
+        p.batch_size = batch_size;
         p.seq_len = seq_len;
         p
+    }
+
+    /// Return a copy with a different sequence length (batch_size=1).
+    pub const fn with_seq_len(&self, seq_len: u32) -> Self {
+        self.with_workload(1, seq_len)
+    }
+
+    /// Total tokens = `batch_size * seq_len`. This is the GEMM M
+    /// dimension for all linear layers.
+    pub const fn num_tokens(&self) -> u32 {
+        self.batch_size * self.seq_len
     }
 
     /// Cooperative grid size = `num_sm * cooperative_blocks_per_sm`.

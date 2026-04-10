@@ -97,7 +97,22 @@ impl ImplementationLibrary {
             //    on the first branch instead of after backtracking.
             Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmOProj)),
             Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmDown)),
-            // ── cuBLAS GEMMs (one entry per phase for clean cost lookup) ──
+            // ── CUTLASS GEMMs (tile-aware cost model) ──
+            // Each (phase × tile_config) is a separate entry. The solver
+            // picks the tile that minimizes cost at the given num_tokens.
+            // Small tiles (64×64) waste less at small M; large tiles
+            // (128×128) have better throughput at large M.
+            Box::new(CutlassGemmImpl::new(TileKind::GemmQkv, 128, 128)),
+            Box::new(CutlassGemmImpl::new(TileKind::GemmQkv, 64, 64)),
+            Box::new(CutlassGemmImpl::new(TileKind::GemmOProj, 128, 128)),
+            Box::new(CutlassGemmImpl::new(TileKind::GemmOProj, 64, 64)),
+            Box::new(CutlassGemmImpl::new(TileKind::GemmGate, 128, 128)),
+            Box::new(CutlassGemmImpl::new(TileKind::GemmGate, 64, 64)),
+            Box::new(CutlassGemmImpl::new(TileKind::GemmUp, 128, 128)),
+            Box::new(CutlassGemmImpl::new(TileKind::GemmUp, 64, 64)),
+            Box::new(CutlassGemmImpl::new(TileKind::GemmDown, 128, 128)),
+            Box::new(CutlassGemmImpl::new(TileKind::GemmDown, 64, 64)),
+            // ── cuBLAS GEMMs (auto-tuned, no explicit tile control) ──
             Box::new(CublasGemmExImpl::new(TileKind::GemmQkv)),
             Box::new(CublasGemmExImpl::new(TileKind::GemmOProj)),
             Box::new(CublasGemmExImpl::new(TileKind::GemmGate)),
@@ -200,6 +215,28 @@ mod l4_cost_model {
         // 625µs at seq=1024).
         LAUNCH_US + 40.0 + 0.57 * seq as f64
     }
+
+    /// CUTLASS tile-aware GEMM cost. Accounts for tile waste (when M
+    /// doesn't divide tile_m, padding rows are wasted) and wave
+    /// quantization (partial last wave underutilizes SMs).
+    pub fn cutlass_gemm_us(m: u32, n: u32, k: u32, tile_m: u32, tile_n: u32, num_sm: u32) -> f64 {
+        const L4_BF16_FLOPS_PER_US: f64 = 120_000_000.0;
+        const LAUNCH_US: f64 = 5.0;
+
+        let tiles_m = ((m as f64) / tile_m as f64).ceil().max(1.0);
+        let tiles_n = ((n as f64) / tile_n as f64).ceil().max(1.0);
+        let total_tiles = tiles_m * tiles_n;
+        let waves = (total_tiles / num_sm as f64).ceil();
+
+        // Each tile does tile_m × tile_n × K FLOPs (×2 for FMA).
+        let flops_per_tile = 2.0 * tile_m as f64 * tile_n as f64 * k as f64;
+        let tile_us = flops_per_tile / (L4_BF16_FLOPS_PER_US / num_sm as f64);
+
+        // Also BW-bound floor: must read weights at minimum.
+        let bw_us = (n as f64 * k as f64 * 2.0) / 300_000.0;
+
+        LAUNCH_US + (waves * tile_us).max(bw_us)
+    }
 }
 
 // Re-export fixed constants for non-seq-dependent code that still
@@ -274,7 +311,7 @@ impl Implementation for CublasGemmExImpl {
 
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
         // LLaMA 1B shapes: HD=2048, ID=8192, QKV_DIM=3072
-        let m = profile.seq_len;
+        let m = profile.num_tokens();
         match self.phase {
             TileKind::GemmQkv => l4_cost_model::gemm_us(m, 3072, 2048),
             TileKind::GemmOProj => l4_cost_model::gemm_us(m, 2048, 2048),
@@ -415,7 +452,7 @@ impl Implementation for CublasGemmExWithResidualImpl {
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
         // Same as the plain cuBLAS GEMM — beta=1 doesn't change wall
         // clock vs beta=0 in cuBLAS's mainloop.
-        let m = profile.seq_len;
+        let m = profile.num_tokens();
         match self.phase {
             TileKind::GemmOProj => l4_cost_model::gemm_us(m, 2048, 2048),
             TileKind::GemmDown => l4_cost_model::gemm_us(m, 2048, 8192),
@@ -486,7 +523,7 @@ impl Implementation for VllmRsRmsNormImpl {
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
-        l4_cost_model::elementwise_us(profile.seq_len, 2048)
+        l4_cost_model::elementwise_us(profile.num_tokens(), 2048)
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -622,7 +659,7 @@ impl Implementation for VllmRsSiluAndMulFusedImpl {
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
-        l4_cost_model::elementwise_us(profile.seq_len, 8192) // intermediate_dim
+        l4_cost_model::elementwise_us(profile.num_tokens(), 8192) // intermediate_dim
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -678,7 +715,7 @@ impl Implementation for FlashInferStandaloneImpl {
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
-        l4_cost_model::attention_us(profile.seq_len)
+        l4_cost_model::attention_us(profile.num_tokens())
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -801,7 +838,7 @@ impl Implementation for KvCacheWriteImpl {
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
         // KV cache scatter: seq * kv_size * 2 bytes read + write
-        l4_cost_model::elementwise_us(profile.seq_len, 512) // kv_dim = 8*64 = 512
+        l4_cost_model::elementwise_us(profile.num_tokens(), 512) // kv_dim = 8*64 = 512
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -855,7 +892,7 @@ impl Implementation for ResidualAddImpl {
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
-        l4_cost_model::elementwise_us(profile.seq_len, 2048)
+        l4_cost_model::elementwise_us(profile.num_tokens(), 2048)
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -925,7 +962,7 @@ impl Implementation for VllmRsFusedQkvRopeCacheImpl {
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
         // Fused rope + qkv split + kv cache write: reads qkv_dim,
         // writes q_dim + kv scatter. One kernel instead of three.
-        l4_cost_model::elementwise_us(profile.seq_len, 3072) // qkv_dim
+        l4_cost_model::elementwise_us(profile.num_tokens(), 3072) // qkv_dim
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -1021,13 +1058,115 @@ impl Implementation for TkFusedMlpBlockImpl {
         // Rough model: ~120µs base (one CTA, one row, all phases)
         // + 15µs per additional 128-row batch (K-dim iterations
         // are compute-bound, rows are memory-bound).
-        let batches = ((profile.seq_len as f64) / 128.0).ceil().max(1.0);
+        let batches = ((profile.num_tokens() as f64) / 128.0).ceil().max(1.0);
         120.0 + (batches - 1.0) * 2000.0
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
             shmem_bytes: 32768,
             regs_per_thread: 128,
+            threads_per_cta: 256,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+}
+
+// ── CUTLASS GEMM with explicit tile config ──
+
+/// CUTLASS GEMM with a specific tile shape. The solver explores
+/// multiple tile configs per GEMM phase and picks the one that
+/// minimizes cost at the given `num_tokens`. Not yet backed by
+/// actual CUTLASS kernels — analytical cost model only. When
+/// CUTLASS dispatch is wired, the interpreter uses `tile_m/tile_n`
+/// to select the right template instantiation.
+#[derive(Debug)]
+pub struct CutlassGemmImpl {
+    phase: TileKind,
+    tile_m: u32,
+    tile_n: u32,
+}
+
+impl CutlassGemmImpl {
+    pub fn new(phase: TileKind, tile_m: u32, tile_n: u32) -> Self {
+        debug_assert!(phase.is_gemm(), "CutlassGemmImpl needs a GEMM tile kind");
+        Self {
+            phase,
+            tile_m,
+            tile_n,
+        }
+    }
+}
+
+impl Implementation for CutlassGemmImpl {
+    fn name(&self) -> &'static str {
+        // Static name per (phase, tile) combo. We use a fixed set.
+        match (self.phase, self.tile_m) {
+            (TileKind::GemmQkv, 128) => "cutlass_qkv_128x128",
+            (TileKind::GemmQkv, _) => "cutlass_qkv_64x64",
+            (TileKind::GemmOProj, 128) => "cutlass_oproj_128x128",
+            (TileKind::GemmOProj, _) => "cutlass_oproj_64x64",
+            (TileKind::GemmGate, 128) => "cutlass_gate_128x128",
+            (TileKind::GemmGate, _) => "cutlass_gate_64x64",
+            (TileKind::GemmUp, 128) => "cutlass_up_128x128",
+            (TileKind::GemmUp, _) => "cutlass_up_64x64",
+            (TileKind::GemmDown, 128) => "cutlass_down_128x128",
+            (TileKind::GemmDown, _) => "cutlass_down_64x64",
+            _ => "cutlass_unknown",
+        }
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        if node.kind != self.phase {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: node.deps.clone(),
+            boundary_outputs: vec![seed],
+            layer: node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        let m = profile.num_tokens();
+        let (n, k) = match self.phase {
+            TileKind::GemmQkv => (3072, 2048),
+            TileKind::GemmOProj => (2048, 2048),
+            TileKind::GemmGate | TileKind::GemmUp => (8192, 2048),
+            TileKind::GemmDown => (2048, 8192),
+            _ => (1, 1),
+        };
+        l4_cost_model::cutlass_gemm_us(m, n, k, self.tile_m, self.tile_n, profile.num_sm)
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        // CUTLASS tile config determines shmem: roughly
+        // 2 * (tile_m * tile_k + tile_n * tile_k) * 2 bytes per stage.
+        let tile_k = 32u32;
+        let per_stage = (self.tile_m * tile_k + self.tile_n * tile_k) * 2;
+        Resources {
+            shmem_bytes: per_stage * 4, // 4 pipeline stages
+            regs_per_thread: if self.tile_m >= 128 { 128 } else { 80 },
             threads_per_cta: 256,
         }
     }

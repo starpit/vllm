@@ -1515,6 +1515,7 @@ mod tests {
         let profile_cutlass = TargetProfile {
             num_sm: 58,
             seq_len: 1024,
+            batch_size: 1,
             cooperative_blocks_per_sm: 1,
             max_dynamic_shmem_bytes: 99 * 1024,
             gemm_kernel: GemmKernelChoice::CutlassSm80Multistage {

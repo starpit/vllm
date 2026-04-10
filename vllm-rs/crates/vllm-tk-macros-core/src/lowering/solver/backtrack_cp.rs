@@ -614,7 +614,9 @@ mod tests {
 
     /// ANSI color for each library family.
     fn lib_color(imp_name: &str) -> &'static str {
-        if imp_name.starts_with("cublas") {
+        if imp_name.starts_with("cutlass") {
+            "\x1b[31m" // red
+        } else if imp_name.starts_with("cublas") {
             "\x1b[36m" // cyan
         } else if imp_name.starts_with("tk_") {
             "\x1b[33m" // yellow
@@ -628,9 +630,13 @@ mod tests {
     }
     const RESET: &str = "\x1b[0m";
 
-    /// Short library tag from impl name.
+    /// Short library tag from impl name. Includes tile size for CUTLASS.
     fn lib_tag(imp_name: &str) -> &'static str {
-        if imp_name.starts_with("cublas") {
+        if imp_name.starts_with("cutlass") && imp_name.contains("64x64") {
+            "cl64"
+        } else if imp_name.starts_with("cutlass") {
+            "cl128"
+        } else if imp_name.starts_with("cublas") {
             "cb"
         } else if imp_name.starts_with("tk_") {
             "tk"
@@ -707,10 +713,10 @@ mod tests {
 
         eprintln!();
         eprintln!("Plan family — one layer of LLaMA 1B on L4 sm_89");
+        eprintln!("tag:tiles = one kernel launch, [a+b] = fused tiles");
         eprintln!(
-            "tag:tiles = one kernel launch. Tags: \x1b[36mcb\x1b[0m=cuBLAS \x1b[33mtk\x1b[0m=ThunderKittens \x1b[35mfi\x1b[0m=FlashInfer \x1b[32mvr\x1b[0m=vllm-rs"
+            "\x1b[31mcl64/cl128\x1b[0m=CUTLASS \x1b[36mcb\x1b[0m=cuBLAS \x1b[33mtk\x1b[0m=TK \x1b[35mfi\x1b[0m=FlashInfer \x1b[32mvr\x1b[0m=vllm-rs"
         );
-        eprintln!("[a+b] = fused tiles in one launch");
         eprintln!();
         eprintln!("{:>6} │ {:>7} │ launches", "seq", "pred_ms");
         eprintln!("───────┼─────────┼─{}─", "─".repeat(80));

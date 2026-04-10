@@ -622,7 +622,11 @@ mod tests {
             "\x1b[33m" // yellow
         } else if imp_name.starts_with("flashinfer") {
             "\x1b[35m" // magenta
-        } else if imp_name.starts_with("vllm_rs") {
+        } else if imp_name.starts_with("vllm_rs")
+            || imp_name == "residual_add"
+            || imp_name == "kv_cache_write"
+            || imp_name == "qkv_split_free"
+        {
             "\x1b[32m" // green
         } else {
             "\x1b[37m" // white/default
@@ -642,7 +646,11 @@ mod tests {
             "tk"
         } else if imp_name.starts_with("flashinfer") {
             "fi"
-        } else if imp_name.starts_with("vllm_rs") {
+        } else if imp_name.starts_with("vllm_rs")
+            || imp_name == "residual_add"
+            || imp_name == "kv_cache_write"
+            || imp_name == "qkv_split_free"
+        {
             "vr"
         } else {
             "??"

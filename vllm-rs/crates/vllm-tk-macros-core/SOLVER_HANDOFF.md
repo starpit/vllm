@@ -87,6 +87,68 @@ M=256+:   cuBLAS/CUTLASS individual GEMMs                10 launches/layer
 5. **TK sweep** — measured TK fused MLP costs across M values
 6. **ILP backend** — the Solver trait is ready; needs MILP encoding
 
+## Architecture: compile-time vs runtime binding
+
+The solver, constraints, and plan representation support three binding
+modes from the same codebase. The `compile!` macro controls how much
+is resolved at compile time vs deferred to runtime:
+
+```
+Fully specialized          GPU-specialized           Fully dynamic
+(all compile-time)         (solver at startup)       (everything at startup)
+─────────────────          ─────────────────         ─────────────────────
+compile! {                 compile! {                compile! {
+  model: llama_3_2_1b,      model: llama_3_2_1b,      model: runtime,
+  target: l4_sm89,          target: runtime,           target: runtime,
+  workloads: [1..1024],   }                          }
+}
+```
+
+**Compile time**: TileGraph, CUDA kernel instantiations (standalone
+launchers for HostCallback impls, megakernel bodies for DeviceCallable
+impls), Rust dispatch functions, Implementation library entries.
+
+**Runtime (model load, ~1s)**: GPU detection → GpuCostTable (cached
+or microbench), PlanFamily::solve_grid(), store alongside weights.
+
+**Per-forward (hot path)**: `plan_family.lookup(num_tokens)` → one
+table lookup → walk pre-solved schedule → dispatch.
+
+### Megakernel (1-launch) vs multi-launch
+
+The solver's CompilationUnit assignment determines this:
+
+- **sm_89 (L4)**: most impls are HostCallback (separate launches),
+  because FlashInfer + CUTLASS can't share 99KB shmem. Result: 6-10
+  launches/layer.
+
+- **sm_90+ (H100)**: impls can be DeviceCallable (compiled into one
+  `__global__`), sharing 228KB shmem and using mbarrier sync between
+  steps. Result: 1 cooperative launch for the entire forward pass.
+
+The solver is identical for both cases. The library entries differ
+(DeviceCallable vs HostCallback), and the proc macro codegen branches
+(standalone launcher vs megakernel body). The constraints
+(CompilationUnitRegBudget, ShmemBudget) automatically determine how
+many impls fit in one compilation unit.
+
+### Fully specialized mode
+
+When all variables are bound at compile time, the proc macro runs the
+solver and emits monomorphized dispatch — no match on impl names, no
+plan lookup, just a flat sequence of FFI calls per workload bucket:
+
+```rust
+pub fn forward(tokens: &Tensor, num_tokens: u32) {
+    match num_tokens {
+        0..=16   => plan_m1_dispatch(tokens),    // cuBLAS GEMV
+        17..=48  => plan_m32_dispatch(tokens),   // CUTLASS 64×64
+        49..=192 => plan_m128_dispatch(tokens),  // TK fused MLP
+        _        => plan_m1024_dispatch(tokens),  // cuBLAS
+    }
+}
+```
+
 ## Known issues
 
 - `renders_polyalgorithm_kernel` test fails (pre-existing, unrelated)

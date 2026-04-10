@@ -1,268 +1,65 @@
-# CP5 Constraint Solver — Context Handoff
+# CP5 Constraint Solver — Complete Handoff
 
-## What exists
+## What this is
 
-A constraint-solving compiler that discovers optimal kernel execution plans
-for LLM inference. Given a model DAG, a library of kernel implementations
-(cuBLAS, CUTLASS, ThunderKittens, FlashInfer, vllm-rs), and a target GPU
-profile, the solver produces a per-layer execution plan that minimizes
-predicted wall-clock time subject to hardware and correctness constraints.
+A **compiler** that discovers optimal kernel execution plans for LLM
+inference. Given a model DAG (parsed from a DSL), a library of kernel
+implementations (cuBLAS, CUTLASS, FlashInfer, vllm-rs), and a target
+GPU cost table (measured via sweep), the solver produces per-workload
+execution plans that minimize predicted wall-clock time.
 
-### Key files
+The `forward!` proc macro is the entry point. It runs the solver at
+compile time and emits `solver_forward_layer()` — a drop-in replacement
+for `LlamaDecoderLayer::forward()` that dispatches to solver-selected
+kernels based on `num_tokens`.
 
-| File | What it does |
-|------|-------------|
-| `lowering/tile_graph.rs` | Normalized DAG (15 tiles/layer for LLaMA) |
-| `lowering/library.rs` | Implementation entries + GpuCostTable + CostCurve |
-| `lowering/solver/backtrack_cp.rs` | B&B CP solver + PlanFamily + ASCII viz |
-| `lowering/constraint.rs` | 8 declarative constraint types |
-| `lowering/problem.rs` | Problem + PrecisionMode |
-| `lowering/implementation.rs` | Implementation trait + Handoff + Layout |
-| `target_profile.rs` | TargetProfile with seq_len + batch_size |
-| `lowering/backend/dispatch.rs` | DispatchSequence: plan → step-ordered typed entries |
-| `lowering/backend/compile_dsl.rs` | `compile!` DSL parser (binding modes) |
-| `lowering/backend/codegen.rs` | TokenStream codegen (fully specialized / GPU / dynamic) |
-| `vllm-tk-macros/src/lib.rs` | `compile!` proc macro entry point |
-| `vllm-cuda/src/model/solver_dispatch.rs` | FFI shim + `compile!` invocation site |
-| `tests/scheduled_megakernel_test.rs` | Golden tests + bench + microbench sweeps |
-| `csrc/cutlass_standalone_gemm.cu` | Standalone CUTLASS 128×128 + 64×64 launcher |
+**Result**: 5% throughput improvement on Llama 3.2 3B (L4 GPU),
+verified correct output on both decode and prefill.
 
-### Implementation library (l4_sm89_starter)
+## Rules of the road
 
-| Impl | Tiles claimed | Library |
-|------|--------------|---------|
-| TkFusedMlpBlockImpl | [norm+gate+up+cat+silu+down+res] (7) | TK |
-| CublasGemmExWithResidualImpl | [oproj+res] or [down+res] (2) | cuBLAS |
-| CutlassGemmWithResidualImpl | [oproj+res] or [down+res] (2) | CUTLASS |
-| CutlassNormGemmImpl | [norm+qkv] or [norm+gate/up] (2) | CUTLASS |
-| CutlassGemmImpl | single GEMM (1) | CUTLASS 128/64 |
-| CublasGemmExImpl | single GEMM (1) | cuBLAS |
-| VllmRsFusedQkvRopeCacheImpl | [split+rope+kv_w] (3) | vllm-rs |
-| VllmRsSiluAndMulFusedImpl | [cat+silu] (2) | vllm-rs |
-| VllmRsRmsNormImpl | [norm] (1) | vllm-rs |
-| FlashInferStandaloneImpl | [attn] (1) | FlashInfer |
+**These are critical. Violating them produces garbage or regressions.**
 
-### Constraint system
+1. **Everything is DAG-driven.** The codegen walks the solver's
+   `DispatchSequence` entry by entry and emits one kernel call per
+   entry. It does NOT interpret, merge, shortcut, or second-guess
+   the plan. The dispatch sequence is the IR. The codegen is the
+   backend. A compiler doesn't make stuff up.
 
-1. **CoverComplete** — every tile claimed exactly once
-2. **DependencyOrder** — producer step < consumer step
-3. **IntermediateMaterialized** — fused tile with external consumers must write output
-4. **PrecisionBounded** — handoff truncation vs fusion precision (Serving/BitExact modes)
-5. **CooperativeExclusive** — at most one coop launch per step
-6. **CompilationUnitRegBudget** / **ShmemBudget** — hardware resource limits
-7. **HandoffCompatible** — handoff mechanism supported by both impls
+2. **No hardcoded numbers.** GEMM costs come from the CSV cost table
+   (`data/cost_l4_sm89.csv`), measured by `gpu_cost_sweep`. Model
+   dimensions come from the `forward!` DSL (`models: [{ ... }]`).
+   The tile graph is built from the DSL body via `from_model_dag`.
+   Nothing is hardcoded to a specific model or shape.
 
-### Measured data (L4 sm_89)
+3. **Every DispatchEntry field matters.** `fused_residual`, `gemm_phase`,
+   `kind`, `is_attn_norm` — the codegen must respect all of them. Ignoring
+   `fused_residual` broke the residual stream and produced garbage.
 
-cuBLAS GEMM sweep (gate shape N=8192 K=2048):
-```
-M=1: 27µs  M=32: 39µs  M=64: 78µs  M=128: 71µs  M=1024: 393µs
-```
+4. **Decode vs prefill are separate implementations.** The solver
+   produces different plans for `seq_len=1` (decode) and `seq_len>1`
+   (prefill). The implementation library has separate entries:
+   `VllmRsFusedQkvRopeCacheImpl` (decode only) vs
+   `VllmRsPrefillRopeCacheImpl` (prefill only), and
+   `FlashInferStandaloneImpl` (decode) vs `FlashInferStandardImpl`
+   (prefill). The codegen emits different kernel calls for each.
+   No runtime branching on `max_seqlen_q` in the generated code.
 
-CUTLASS 64×64 sweep (same shape):
-```
-M=1: 30µs  M=32: 31µs  M=64: 38µs  M=128: 75µs  M=1024: 621µs
-```
+5. **CUTLASS GEMMs always beta=0.** The output buffer is freshly
+   allocated. Residual accumulation happens in
+   `fused_add_rms_norm_inplace`, not in the GEMM epilogue.
 
-CUTLASS 64×64 sweet spot: **M=32-64 (21-51% faster than cuBLAS)**.
+6. **Test-driven.** Write tests that would catch the bug BEFORE
+   running on GPU. Structural codegen tests (does the output contain
+   `reshape`? does gate_up_proj.forward appear only once per bucket?)
+   catch dataflow bugs at compile time.
 
-### Solver-discovered plan family
-
-```
-M=1-16:   all cuBLAS (GEMV)                              10 launches/layer
-M=32-64:  CUTLASS 64×64 for all GEMMs                    10 launches/layer
-M=128:    cuBLAS attn + TK fused MLP                      6 launches/layer
-M=256+:   cuBLAS/CUTLASS individual GEMMs                10 launches/layer
-```
-
-### Golden validation
-
-- `cp5_solver_driven_matches_committed_golden`: passes at seq=64 with
-  CUTLASS 64×64 (max_abs=8192, max_rel=0.94%)
-- Graph replay also passes (bit-identical)
-
-## What's next (priority order)
-
-1. **TileGraph from DSL** — replace hardcoded `build_llama_forward`
-   with DAG parsed from model description. Enables Mistral, Qwen, etc.
-2. **`model: runtime` binding** — solver runs at model load, reads
-   dims from loaded weights. No model catalog needed.
-3. **CUTLASS norm+GEMM prologue kernel** — impl exists in solver but
-   no backing CUDA kernel (eliminates 2 launches/layer)
-4. **TK fused MLP wiring** — codegen placeholder exists, needs the
-   TK launcher FFI in vllm-cuda
-5. **Multi-GPU calibration** — run `gpu_cost_sweep` on A100, H100,
-   check in CSV files
-6. **ILP backend** — the Solver trait is ready; needs MILP encoding
-
-## Architecture: compile-time vs runtime binding
-
-The solver, constraints, and plan representation support three binding
-modes from the same codebase. The `compile!` macro controls how much
-is resolved at compile time vs deferred to runtime:
-
-```
-Fully specialized          GPU-specialized           Fully dynamic
-(all compile-time)         (solver at startup)       (everything at startup)
-─────────────────          ─────────────────         ─────────────────────
-compile! {                 compile! {                compile! {
-  model: llama_3_2_1b,      model: llama_3_2_1b,      model: runtime,
-  target: l4_sm89,          target: runtime,           target: runtime,
-  workloads: [1..1024],   }                          }
-}
-```
-
-**Compile time**: TileGraph, CUDA kernel instantiations (standalone
-launchers for HostCallback impls, megakernel bodies for DeviceCallable
-impls), Rust dispatch functions, Implementation library entries.
-
-**Runtime (model load, ~1s)**: GPU detection → GpuCostTable (cached
-or microbench), PlanFamily::solve_grid(), store alongside weights.
-
-**Per-forward (hot path)**: `plan_family.lookup(num_tokens)` → one
-table lookup → walk pre-solved schedule → dispatch.
-
-### Megakernel (1-launch) vs multi-launch
-
-The solver's CompilationUnit assignment determines this:
-
-- **sm_89 (L4)**: most impls are HostCallback (separate launches),
-  because FlashInfer + CUTLASS can't share 99KB shmem. Result: 6-10
-  launches/layer.
-
-- **sm_90+ (H100)**: impls can be DeviceCallable (compiled into one
-  `__global__`), sharing 228KB shmem and using mbarrier sync between
-  steps. Result: 1 cooperative launch for the entire forward pass.
-
-The solver is identical for both cases. The library entries differ
-(DeviceCallable vs HostCallback), and the proc macro codegen branches
-(standalone launcher vs megakernel body). The constraints
-(CompilationUnitRegBudget, ShmemBudget) automatically determine how
-many impls fit in one compilation unit.
-
-### Fully specialized mode
-
-When all variables are bound at compile time, the proc macro runs the
-solver and emits monomorphized dispatch — no match on impl names, no
-plan lookup, just a flat sequence of FFI calls per workload bucket:
-
-```rust
-pub fn forward(tokens: &Tensor, num_tokens: u32) {
-    match num_tokens {
-        0..=16   => plan_m1_dispatch(tokens),    // cuBLAS GEMV
-        17..=48  => plan_m32_dispatch(tokens),   // CUTLASS 64×64
-        49..=192 => plan_m128_dispatch(tokens),  // TK fused MLP
-        _        => plan_m1024_dispatch(tokens),  // cuBLAS
-    }
-}
-```
-
-## How to run
-
-All tests require `CUDA_PATH=/usr/local/cuda-12.9`:
-
-```bash
-# Solver tests (no GPU needed, fast):
-cargo test -p vllm-tk-macros-core -- --nocapture
-
-# Plan family visualization:
-cargo test -p vllm-tk-macros-core print_plan_family_compact -- --nocapture
-
-# Golden test (needs GPU, ~80s):
-CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
-  --features cuda --test scheduled_megakernel_test \
-  cp5_solver_driven_matches_committed_golden -- --ignored --nocapture
-
-# Bench (needs GPU, ~45s):
-CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
-  --features cuda --test scheduled_megakernel_test \
-  cp5_solver_driven_natural_forward_bench -- --ignored --nocapture
-
-# cuBLAS sweep:
-CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
-  --features cuda --test scheduled_megakernel_test \
-  cublas_gemm_sweep_microbench -- --ignored --nocapture
-
-# CUTLASS vs cuBLAS comparison:
-CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
-  --features cuda --test scheduled_megakernel_test \
-  cutlass_vs_cublas_sweep -- --ignored --nocapture
-```
-
-## Interpreter dispatch pattern
-
-The CP5 bench/golden tests contain a "runtime interpreter" — a
-`dispatch_one` closure that matches on impl name and calls the
-corresponding FFI:
-
-```rust
-let mut dispatch_one = |sg: SubgraphId| {
-    let imp_name = library.get(plan.assignment.impls[&sg]).name();
-    match imp_name {
-        "cublas_gemm_ex_qkv" => gemm(seq, qkv_dim, hd, w, act, out, 0.0),
-        "cutlass_qkv_64x64"  => ffi::cutlass_gemm_64x64_launch(...),
-        "vllm_rs_rms_norm"    => ffi::rms_norm_bf16(...),
-        "flashinfer_standalone_fa2" => ffi::cp5_run_flashinfer_attention_for_layer(...),
-        "vllm_rs_fused_qkv_rope_cache" => ffi::fused_qkv_rope_cache_bf16(...),
-        "tk_fused_mlp_block"  => ffi::cp5_fused_mlp_launch(...),
-        name if name.starts_with("cutlass_") => { /* generic CUTLASS dispatch */ },
-        ...
-    }
-};
-for (_, sg) in &scheduled { dispatch_one(*sg); }
-```
-
-This is the pattern the runtime integration should follow — the proc
-macro generates the dispatch function at compile time.
-
-## Relationship to the existing megakernel
-
-The existing megakernel (`templates/scheduled/megakernel.cu`) is a
-hand-tuned cooperative-grid kernel that runs the entire LLaMA forward
-pass in one launch. It uses:
-- Barrier-based phase synchronization (gmem flags)
-- CUTLASS GEMM phases with custom prologues
-- FlashInfer attention inlined via `BlockBatchPagedAttentionPersistent`
-- TK RMSNorm + RoPE + SiLU tile bodies
-
-Performance: 55ms at seq=1024 on L4 (vs 40ms for the CP5 solver's
-multi-launch cuBLAS plan). The megakernel is slower because:
-- Single cooperative grid limits parallelism (1 CTA/SM on L4)
-- All dispatch arms compiled into one kernel → register spill (255 regs)
-- Barrier overhead between phases (~100µs per grid sync)
-
-The CP5 solver replaces the megakernel with a **multi-launch plan**
-that lets each kernel use its optimal register/shmem budget. On sm_90+
-with more shmem and mbarrier, the solver could discover that a
-megakernel IS optimal — but it would be a solver-discovered megakernel,
-not a hand-tuned one.
-
-## Why not torch.compile / Triton / TensorRT
-
-torch.compile: fuses pointwise ops via Triton but doesn't jointly
-optimize GEMM kernel selection × fusion × workload shape. One plan
-for all batch sizes. Can't pick CUTLASS 64×64 at M=32 and cuBLAS at
-M=1.
-
-TensorRT: profiles multiple backends (closest to us) but uses
-pattern-matching for fusion, not constraint solving. Can't express
-"this fusion is invalid because tile X has an external consumer."
-Opaque plan — can't inspect why it chose what.
-
-Our approach: the solver discovers fusion from the constraint system.
-Adding a new kernel is one Implementation struct. The constraints
-validate it automatically. Plans are inspectable (`tag:l([a+b])`
-visualization). Per-GPU calibrated via microbench sweep.
-
-## forward! macro — runtime integration (CP5-C)
-
-The `forward!` proc macro generates `solver_forward_layer()` — a
-drop-in replacement for `LlamaDecoderLayer::forward()` that uses
-the constraint solver's optimal kernel mix per workload bucket.
+## The `forward!` DSL
 
 ```rust
 vllm_tk_macros::forward! {
-    // Model structure — same DSL as megakernel!
+    // Body: model structure (required, always first).
+    // Same syntax as megakernel! DSL.
     for layer in 0..NL {
         let normed = rmsnorm(hidden_states, attn_norm[layer]);
         let qkv = gemm(normed, qkv_weights[layer]);
@@ -276,7 +73,7 @@ vllm_tk_macros::forward! {
         hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
     }
 
-    // Models to compile in (omit for runtime)
+    // Optional fields after the body:
     models: [
         { layers: 28, hidden: 3072, intermediate: 8192,
           heads: 24, kv_heads: 8, head_dim: 128 },
@@ -286,51 +83,225 @@ vllm_tk_macros::forward! {
 }
 ```
 
-### Pipeline
+- `models:` — omit for runtime (solver at startup). List multiple
+  for multi-model binary.
+- `target:` — omit for runtime (GPU detection at startup).
+- `workloads:` — omit for default grid (1,2,4,...,4096).
 
-DSL body → `MegakernelDef` parser → `ModelDag` →
-`TileGraph::from_model_dag` → solver → codegen.
+## Pipeline
 
-No hardcoded `build_llama_forward` — the tile graph is built from
-the DSL body. Any LLaMA-family model works by changing the inline
-dims. Non-LLaMA architectures need new DSL ops.
+```
+forward! DSL
+    │
+    ▼
+MegakernelDef parser (parse.rs)
+    │
+    ▼
+ModelDag (dag.rs) — typed DAG with buffer shapes
+    │
+    ▼
+TileGraph::from_model_dag (tile_graph.rs)
+    │  Maps OpKind → TileKind(s):
+    │  RmsNorm → RmsNorm
+    │  Gemm → GemmQkv/Gate/Up (by weight name)
+    │  GemmAdd → GemmOProj/Down + ResidualAdd
+    │  RopeAppend → QkvSplit + Rope + KvCacheWrite
+    │  AttentionDecode → Attention
+    │  Silu + Mul → GateUpConcat + SiluMul
+    │
+    ▼
+Problem::build (problem.rs)
+    │  Tile graph + Implementation library + TargetProfile
+    │  → auto-generates constraints
+    │
+    ▼
+PlanFamily::solve_grid (solver/mod.rs)
+    │  For each seq_len in grid:
+    │    BacktrackCpSolver → ExecutionPlan
+    │
+    ▼
+DispatchSequence::from_plan (backend/dispatch.rs)
+    │  Flattens plan into step-ordered typed entries
+    │  Each entry: ImplDispatchKind + GemmPhase + layer + flags
+    │
+    ▼
+codegen::generate (backend/codegen.rs)
+    │  Walks entries, emits one Rust call per entry
+    │
+    ▼
+solver_forward_layer() — the generated function
+```
 
-### What works
+## Key files
 
-- 5% throughput improvement on Llama 3.2 3B (bench throughput --input-len 64)
-- Correct output (decode + prefill)
-- CUTLASS 64×64 standalone GEMM wired end-to-end
-- 702 measured L4 cost points from gpu_cost_sweep
-- Decode vs prefill as separate solver implementations
-- Per-phase kernel selection (e.g. CUTLASS for gate, cuBLAS for down)
+| File | Purpose |
+|------|---------|
+| **Solver core** | |
+| `lowering/tile_graph.rs` | TileGraph, TileKind, ModelDims, `from_model_dag()` |
+| `lowering/library.rs` | Implementation entries, GpuCostTable, l4_cost_model |
+| `lowering/cost_table.rs` | GpuCostGrid: CSV-based (M,N,K) cost lookup |
+| `lowering/solver/backtrack_cp.rs` | B&B CP solver |
+| `lowering/solver/mod.rs` | PlanFamily, ExecutionPlan, Solver trait |
+| `lowering/constraint.rs` | 8 declarative constraint types |
+| `lowering/problem.rs` | Problem + PrecisionMode |
+| `lowering/implementation.rs` | Implementation trait, Handoff, Layout, LaunchKind |
+| **Codegen backend** | |
+| `lowering/backend/compile_dsl.rs` | ForwardDef parser (body + models + target + workloads) |
+| `lowering/backend/dispatch.rs` | DispatchSequence, ImplDispatchKind, GemmPhase |
+| `lowering/backend/codegen.rs` | TokenStream emission — one call per dispatch entry |
+| `lowering/backend/codegen_test.rs` | Structural codegen tests |
+| **Proc macro** | |
+| `vllm-tk-macros/src/lib.rs` | `forward!` proc macro entry point |
+| **Runtime integration** | |
+| `vllm-cuda/src/model/solver_dispatch.rs` | forward! invocation + CUTLASS FFI declarations |
+| `vllm-cuda/src/model/llama.rs` | LlamaModel::forward() calls solver_forward_layer() |
+| `vllm-cuda/src/layers.rs` | LinearLayer::dense_weight() for CUTLASS pointer extraction |
+| `vllm-cuda/csrc/cutlass_standalone_gemm.cu` | CUTLASS 64×64 + 128×128 standalone launchers |
+| `vllm-cuda/build.rs` | Links libcutlass_standalone_gemm.a |
+| `vllm-kernels-cuda/build.rs` | Compiles cutlass_standalone_gemm.cu |
+| **Cost data** | |
+| `data/cost_l4_sm89.csv` | 702 measured cost points (18 shapes × 13 M × 3 kernels) |
+| **Sweep test** | |
+| `tests/scheduled_megakernel_test.rs` | `gpu_cost_sweep` — THE entrypoint for new GPUs |
 
-### What's next
+## Adding a new GPU
 
-- `models: runtime` / `target: runtime` binding modes
-- TK fused MLP wiring (currently disabled)
-- CUTLASS norm+GEMM prologue fusion
-- TP all-reduce tiles for multi-GPU
-- Multi-GPU cost CSVs (A100, H100)
-- Remove old `megakernel!` macro
-
-### Tests (33 passing)
+Run the sweep test on the target GPU:
 
 ```bash
+CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
+  --features cuda --test scheduled_megakernel_test \
+  gpu_cost_sweep -- --ignored --nocapture \
+  2>/dev/null > crates/vllm-tk-macros-core/data/cost_YOUR_GPU.csv
+```
+
+Clean the test runner lines from the CSV:
+```bash
+grep -E "^#|^kernel|^cublas|^cutlass" cost_YOUR_GPU.csv > clean.csv
+mv clean.csv cost_YOUR_GPU.csv
+```
+
+Update `cost_table.rs` to load the new CSV, add a new `TargetId` in
+`compile_dsl.rs`, and a new `TargetProfile` constructor. The solver
+automatically produces optimal plans for the new GPU.
+
+## Adding a new model
+
+Change the `models:` field in `solver_dispatch.rs`:
+
+```rust
+models: [
+    { layers: 32, hidden: 4096, intermediate: 14336,
+      heads: 32, kv_heads: 8, head_dim: 128 },
+],
+```
+
+If the model has the same structure as LLaMA (norm → QKV → rope →
+attention → oproj → residual → norm → gate → up → silu → down →
+residual), it just works. Different dims, same body.
+
+For non-LLaMA architectures (MoE, sliding window, etc.), add new
+`OpKind` variants to `dag.rs`, new `TileKind` variants to
+`tile_graph.rs`, and new `Implementation` entries to `library.rs`.
+
+## Implementation library (current)
+
+| Impl | Tiles claimed | Decode/Prefill | Status |
+|------|--------------|----------------|--------|
+| CublasGemmExImpl | single GEMM (1) | both | ✅ wired |
+| CublasGemmExWithResidualImpl | GEMM+res (2) | both | ✅ wired |
+| CutlassGemmImpl (64/128) | single GEMM (1) | both | ✅ wired |
+| CutlassGemmWithResidualImpl | GEMM+res (2) | both | ✅ wired |
+| VllmRsRmsNormImpl | norm (1) | both | ✅ wired |
+| VllmRsFusedQkvRopeCacheImpl | split+rope+kv (3) | decode only | ✅ wired |
+| VllmRsPrefillRopeCacheImpl | split+rope+kv (3) | prefill only | ✅ wired |
+| VllmRsSiluAndMulFusedImpl | cat+silu (2) | both | ✅ wired |
+| FlashInferStandaloneImpl | attn (1) | decode only | ✅ wired |
+| FlashInferStandardImpl | attn (1) | prefill only | ✅ wired |
+| CutlassNormGemmImpl | norm+GEMM (2) | both | ❌ no backing kernel |
+| TkFusedMlpBlockImpl | 7-tile MLP | both | ❌ disabled (codegen not wired) |
+| KvCacheWriteImpl | kv_write (1) | both | ✅ noop |
+| ResidualAddImpl | res_add (1) | both | ✅ noop |
+
+## Codegen dataflow variables
+
+The generated per-bucket function uses these `Option<OwnedTensor>`
+variables to pass data between dispatch entries:
+
+| Variable | Written by | Read by |
+|----------|-----------|---------|
+| `hidden_states` | input, OProj, Down | attn norm, MLP norm, output |
+| `residual` | attn norm | MLP norm, output |
+| `normed` | RmsNorm | QKV GEMM, Gate GEMM, Up GEMM |
+| `qkv_out` | QKV GEMM, FusedQkvRopeCache, PrefillRopeCache | RopeCache, Attention |
+| `k_out` / `v_out` | PrefillRopeCache | FlashInferStandard |
+| `attn_out` | Attention | OProj |
+| `gate_up` | Gate GEMM, Up concat | SiluAndMul |
+| `silu_out` | SiluAndMul | Down GEMM |
+
+## What's next (priority order)
+
+1. **`models: runtime` / `target: runtime`** — solver runs at startup
+   with dims from loaded weights. Any model without recompiling.
+   The ForwardDef parser already accepts `models: runtime`.
+
+2. **TK fused MLP wiring** — `TkFusedMlpBlockImpl` is disabled
+   (`target_compatible = false`). Wire the TK launcher FFI into
+   vllm-cuda so the solver can pick it at M=128. The codegen has
+   a `compile_error!` placeholder for `ImplDispatchKind::TkFusedMlpBlock`.
+
+3. **CUTLASS norm+GEMM prologue** — `CutlassNormGemmImpl` exists in
+   the library but has no backing CUDA kernel. Eliminates 2 norm
+   launches/layer by folding RMSNorm into the CUTLASS prologue.
+
+4. **TP all-reduce tiles** — add `TileKind::AllReduce` after OProj
+   and Down in the tile graph. Required for multi-GPU correctness.
+   With TP, GEMM shapes change (sharded dims) — needs `models: runtime`.
+
+5. **Multi-GPU cost CSVs** — run `gpu_cost_sweep` on A100, H100.
+   Check in the CSVs. Add `TargetId` variants.
+
+6. **Elementwise + attention in CSV** — norm, SiLU, FlashInfer costs
+   are still hardcoded `CostCurve`. Move them to the sweep.
+
+7. **Remove `megakernel!`** — dead code, replaced by `forward!`.
+
+8. **ILP backend** — the `Solver` trait is ready; `solver::ilp` is a
+   stub. Encode constraints as MILP when the CP solver proves
+   intractable on richer libraries.
+
+## How to run
+
+```bash
+# Solver + codegen tests (no GPU needed, ~30s):
 cargo test -p vllm-tk-macros-core -- lowering
+
+# Build with CUDA (compiles CUTLASS standalone GEMM):
+cargo build -p vllm-cuda --features cuda --release
+
+# GPU cost sweep (needs GPU, ~75s, generates CSV):
+CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
+  --features cuda --test scheduled_megakernel_test \
+  gpu_cost_sweep -- --ignored --nocapture
+
+# Benchmark:
+./target/release/vllm bench throughput MODEL --input-len 64
+./target/release/vllm bench latency MODEL
 ```
 
 ## Known issues
 
 - `renders_polyalgorithm_kernel` test fails (pre-existing, unrelated)
 - CutlassNormGemmImpl: solver doesn't pick it within 10K step budget
-  (saving is ~1% of forward pass; B&B bound is too loose)
-- `lowering/tests.rs` hand-built tests replaced with solver-driven
-- TK fused MLP costs are placeholder (120µs at M=1, not measured)
-- Elementwise costs are rough estimates, not measured
+- TkFusedMlpBlockImpl: disabled until codegen is wired
+- Elementwise/attention costs are rough estimates, not in CSV yet
+- Multi-model (`models: [...]` with >1 entry) not yet implemented
+  (uses first model only)
 
 ## Environment notes
 
-- Must use `CUDA_PATH=/usr/local/cuda-12.9` (system nvcc 12.0 breaks TK)
+- `CUDA_PATH=/usr/local/cuda-12.9` required (system nvcc 12.0 breaks TK)
 - After clearing cudaforge cache: `touch crates/vllm-cuda/csrc/*.cu`
   then `cargo build -p vllm-kernels-cuda --features cuda` to regenerate
-- CUDA kernel compilation takes minutes (cicc); don't kill cargo during build
+- CUDA kernel compilation takes minutes (cicc); don't kill cargo
+- CSV file is gitignored by default — use `git add -f` to check it in

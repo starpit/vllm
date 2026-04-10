@@ -253,11 +253,11 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             } else {
                 format_ident!("cutlass_gemm_128x128_launch")
             };
-            let beta = if entry.fused_residual {
-                quote! { 1.0f32 }
-            } else {
-                quote! { 0.0f32 }
-            };
+            // Always beta=0 for CUTLASS — the output buffer is freshly
+            // allocated. The fused_residual flag means the solver folded
+            // the ResidualAdd tile into this subgraph, but the residual
+            // accumulation happens in fused_add_rms_norm_inplace, not
+            // in the GEMM epilogue.
             Some(quote! {{
                 let __act: GpuTensor = #cutlass_input;
                 let __m = __act.dim(0) as i32;
@@ -272,7 +272,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                     __act.as_ptr::<u16>(),
                     __w.as_ptr::<u16>(),
                     __m, __n, __k,
-                    1.0f32, #beta,
+                    1.0f32, 0.0f32,
                     device.compute_stream as u64,
                 );
                 debug_assert_eq!(__rc, 0, "CUTLASS GEMM failed");

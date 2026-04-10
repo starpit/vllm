@@ -612,22 +612,62 @@ mod tests {
         }
     }
 
-    /// Render one launch as `l(tile)` or `l([a+b+c])` for fused.
-    fn launch_str(kinds: &[TileKind]) -> String {
-        if kinds.len() == 1 {
-            format!("l({})", tile_abbrev(kinds[0]))
+    /// ANSI color for each library family.
+    fn lib_color(imp_name: &str) -> &'static str {
+        if imp_name.starts_with("cublas") {
+            "\x1b[36m" // cyan
+        } else if imp_name.starts_with("tk_") {
+            "\x1b[33m" // yellow
+        } else if imp_name.starts_with("flashinfer") {
+            "\x1b[35m" // magenta
+        } else if imp_name.starts_with("vllm_rs") {
+            "\x1b[32m" // green
+        } else {
+            "\x1b[37m" // white/default
+        }
+    }
+    const RESET: &str = "\x1b[0m";
+
+    /// Short library tag from impl name.
+    fn lib_tag(imp_name: &str) -> &'static str {
+        if imp_name.starts_with("cublas") {
+            "cb"
+        } else if imp_name.starts_with("tk_") {
+            "tk"
+        } else if imp_name.starts_with("flashinfer") {
+            "fi"
+        } else if imp_name.starts_with("vllm_rs") {
+            "vr"
+        } else {
+            "??"
+        }
+    }
+
+    /// Render one launch: `cb:l(gate)` or `tk:l([norm+gate+up+...])`.
+    /// Color-coded by library family.
+    fn launch_str(imp_name: &str, kinds: &[TileKind]) -> String {
+        let tag = lib_tag(imp_name);
+        let color = lib_color(imp_name);
+        let tiles = if kinds.len() == 1 {
+            tile_abbrev(kinds[0]).to_string()
         } else {
             let inner: String = kinds
                 .iter()
                 .map(|k| tile_abbrev(*k))
                 .collect::<Vec<_>>()
                 .join("+");
-            format!("l([{inner}])")
-        }
+            format!("[{inner}]")
+        };
+        format!("{color}{tag}:{tiles}{RESET}")
     }
 
-    /// Compact one-layer representation: sequence of `l(...)` tokens.
-    fn plan_one_layer_compact(plan: &ExecutionPlan, tile_graph: &TileGraph, layer: u16) -> String {
+    /// Compact one-layer representation: sequence of `tag:tiles` tokens.
+    fn plan_one_layer_compact(
+        plan: &ExecutionPlan,
+        tile_graph: &TileGraph,
+        library: &ImplementationLibrary,
+        layer: u16,
+    ) -> String {
         let mut scheduled: Vec<_> = plan
             .assignment
             .schedule
@@ -647,11 +687,12 @@ mod tests {
             if sg_layer != layer {
                 continue;
             }
+            let imp_name = library.get(plan.assignment.impls[sg]).name();
             let kinds: Vec<_> = claimed
                 .iter()
                 .map(|t| tile_graph.nodes[t.0 as usize].kind)
                 .collect();
-            parts.push(launch_str(&kinds));
+            parts.push(launch_str(imp_name, &kinds));
         }
         parts.join(" ")
     }
@@ -666,10 +707,13 @@ mod tests {
 
         eprintln!();
         eprintln!("Plan family — one layer of LLaMA 1B on L4 sm_89");
-        eprintln!("l() = kernel launch, [a+b] = fused tiles in one launch");
+        eprintln!(
+            "tag:tiles = one kernel launch. Tags: \x1b[36mcb\x1b[0m=cuBLAS \x1b[33mtk\x1b[0m=ThunderKittens \x1b[35mfi\x1b[0m=FlashInfer \x1b[32mvr\x1b[0m=vllm-rs"
+        );
+        eprintln!("[a+b] = fused tiles in one launch");
         eprintln!();
         eprintln!("{:>6} │ {:>7} │ launches", "seq", "pred_ms");
-        eprintln!("───────┼─────────┼─{}─", "─".repeat(70));
+        eprintln!("───────┼─────────┼─{}─", "─".repeat(80));
 
         for &seq in seq_lens {
             let profile = base.with_seq_len(seq);
@@ -682,7 +726,7 @@ mod tests {
                 }
             };
             // Show layer 1 (layer 0 has the extra initial residual_add).
-            let compact = plan_one_layer_compact(&plan, &tg, 1);
+            let compact = plan_one_layer_compact(&plan, &tg, &library, 1);
             let pred = plan.predicted_us / 1000.0;
             eprintln!("{seq:>6} │ {pred:>7.2} │ {compact}");
         }

@@ -593,23 +593,41 @@ mod tests {
         );
     }
 
-    /// Render a solved plan as ASCII art showing per-layer launches.
-    fn print_plan_ascii(
-        plan: &ExecutionPlan,
-        tile_graph: &TileGraph,
-        library: &ImplementationLibrary,
-        label: &str,
-    ) {
-        eprintln!();
-        eprintln!("╔══ {label} ══╗");
-        eprintln!(
-            "║  predicted: {:.2} ms   {} subgraphs   {} steps",
-            plan.predicted_us / 1000.0,
-            plan.assignment.subgraphs().count(),
-            plan.solver_steps,
-        );
+    /// Short abbreviation for a TileKind.
+    fn tile_abbrev(kind: TileKind) -> &'static str {
+        match kind {
+            TileKind::RmsNorm => "norm",
+            TileKind::GemmQkv => "qkv",
+            TileKind::GemmOProj => "oproj",
+            TileKind::GemmGate => "gate",
+            TileKind::GemmUp => "up",
+            TileKind::GemmDown => "down",
+            TileKind::QkvSplit => "split",
+            TileKind::Rope => "rope",
+            TileKind::KvCacheWrite => "kv_w",
+            TileKind::Attention => "attn",
+            TileKind::ResidualAdd => "res",
+            TileKind::GateUpConcat => "cat",
+            TileKind::SiluMul => "silu",
+        }
+    }
 
-        // Sort by schedule step.
+    /// Render one launch as `l(tile)` or `l([a+b+c])` for fused.
+    fn launch_str(kinds: &[TileKind]) -> String {
+        if kinds.len() == 1 {
+            format!("l({})", tile_abbrev(kinds[0]))
+        } else {
+            let inner: String = kinds
+                .iter()
+                .map(|k| tile_abbrev(*k))
+                .collect::<Vec<_>>()
+                .join("+");
+            format!("l([{inner}])")
+        }
+    }
+
+    /// Compact one-layer representation: sequence of `l(...)` tokens.
+    fn plan_one_layer_compact(plan: &ExecutionPlan, tile_graph: &TileGraph, layer: u16) -> String {
         let mut scheduled: Vec<_> = plan
             .assignment
             .schedule
@@ -618,65 +636,57 @@ mod tests {
             .collect();
         scheduled.sort_by_key(|(step, sg)| (*step, sg.0));
 
-        let mut prev_layer: Option<u16> = None;
+        let mut parts = Vec::new();
         for (_step, sg) in &scheduled {
-            let imp_id = plan.assignment.impls[sg];
-            let imp = library.get(imp_id);
             let claimed = plan.assignment.tiles_in_subgraph(*sg);
-            let layer = claimed
+            let sg_layer = claimed
                 .iter()
                 .map(|t| tile_graph.nodes[t.0 as usize].layer)
                 .next()
                 .unwrap_or(0);
+            if sg_layer != layer {
+                continue;
+            }
             let kinds: Vec<_> = claimed
                 .iter()
                 .map(|t| tile_graph.nodes[t.0 as usize].kind)
                 .collect();
-
-            if prev_layer != Some(layer) {
-                eprintln!("║");
-                eprintln!("║  ── Layer {layer} ──");
-                prev_layer = Some(layer);
-            }
-
-            let kind_str: String = kinds
-                .iter()
-                .map(|k| format!("{k:?}"))
-                .collect::<Vec<_>>()
-                .join("+");
-            let launch_kind = match imp.launch_kind() {
-                LaunchKind::HostCallback => "launch",
-                LaunchKind::CooperativeLaunch => "coop",
-                LaunchKind::RegularLaunch => "grid",
-                LaunchKind::DeviceCallable => "device",
-            };
-            eprintln!("║    {launch_kind:<6} {:<40} [{kind_str}]", imp.name());
+            parts.push(launch_str(&kinds));
         }
-        eprintln!("╚{}╝", "═".repeat(60));
+        parts.join(" ")
     }
 
     #[test]
-    fn print_prefill_vs_decode_plans() {
-        let library = ImplementationLibrary::l4_sm89_starter();
-
-        // Prefill plan (seq=1024, 2 layers for readability).
+    fn print_plan_family_compact() {
         let tg = TileGraph::build_llama_forward(2);
-        let profile = TargetProfile::l4_sm89().with_seq_len(1024);
-        let problem = Problem::build(&tg, &library, &profile);
-        let prefill = match BacktrackCpSolver.solve(&problem) {
-            SolveResult::Found(p) => p,
-            _ => panic!("infeasible"),
-        };
-        print_plan_ascii(&prefill, &tg, &library, "PREFILL (seq=1024, 2 layers)");
+        let library = ImplementationLibrary::l4_sm89_starter();
+        let base = TargetProfile::l4_sm89();
 
-        // Decode plan (seq=1, 2 layers).
-        let profile = TargetProfile::l4_sm89().with_seq_len(1);
-        let problem = Problem::build(&tg, &library, &profile);
-        let decode = match BacktrackCpSolver.solve(&problem) {
-            SolveResult::Found(p) => p,
-            _ => panic!("infeasible"),
-        };
-        print_plan_ascii(&decode, &tg, &library, "DECODE (seq=1, 2 layers)");
+        let seq_lens: &[u32] = &[1, 4, 32, 128, 256, 512, 1024, 4096];
+
+        eprintln!();
+        eprintln!("Plan family — one layer of LLaMA 1B on L4 sm_89");
+        eprintln!("l() = kernel launch, [a+b] = fused tiles in one launch");
+        eprintln!();
+        eprintln!("{:>6} │ {:>7} │ launches", "seq", "pred_ms");
+        eprintln!("───────┼─────────┼─{}─", "─".repeat(70));
+
+        for &seq in seq_lens {
+            let profile = base.with_seq_len(seq);
+            let problem = Problem::build(&tg, &library, &profile);
+            let plan = match BacktrackCpSolver.solve(&problem) {
+                SolveResult::Found(p) => p,
+                _ => {
+                    eprintln!("{seq:>6} │  INFEAS │");
+                    continue;
+                }
+            };
+            // Show layer 1 (layer 0 has the extra initial residual_add).
+            let compact = plan_one_layer_compact(&plan, &tg, 1);
+            let pred = plan.predicted_us / 1000.0;
+            eprintln!("{seq:>6} │ {pred:>7.2} │ {compact}");
+        }
+        eprintln!();
     }
 
     #[test]

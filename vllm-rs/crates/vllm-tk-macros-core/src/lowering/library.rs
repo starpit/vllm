@@ -971,14 +971,18 @@ impl Implementation for TkFusedMlpBlockImpl {
             layer: norm.layer,
         })
     }
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        // Microbench result: the TK fused MLP (8-warp, 1 CTA per
-        // row-batch) is ~16 ms PER LAYER at seq=1024 — far slower
-        // than cuBLAS (~1.6 ms for the same 7 tiles). The TK kernel
-        // is designed for decode (BS=1-4), not prefill. Set cost
-        // high so the solver picks cuBLAS at seq=1024. At lower
-        // seq (decode), a seq-dependent cost model would pick TK.
-        16000.0 // ~16 ms per layer at seq=1024 on L4
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // Seq-dependent cost: the TK kernel's single-CTA-per-row
+        // design is fast for decode (BS=1-4) but slow at prefill.
+        // At seq=1, the fused pipeline saves GMEM round-trips and
+        // beats separate cuBLAS calls. At seq=1024, cuBLAS's
+        // massively parallel GEMMs dominate.
+        //
+        // Rough model: ~120µs base (one CTA, one row, all phases)
+        // + 15µs per additional 128-row batch (K-dim iterations
+        // are compute-bound, rows are memory-bound).
+        let batches = ((profile.seq_len as f64) / 128.0).ceil().max(1.0);
+        120.0 + (batches - 1.0) * 2000.0
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {

@@ -552,4 +552,41 @@ mod tests {
         let imp_name = library.get(imp_id).name();
         assert_eq!(imp_name, "vllm_rs_silu_and_mul_fused");
     }
+
+    #[test]
+    fn solver_picks_tk_fused_mlp_for_decode() {
+        // At seq=1 (decode), the TK fused MLP block should beat
+        // separate cuBLAS calls because the fused pipeline saves
+        // GMEM round-trips and launch overhead that dominate at
+        // small batch sizes.
+        let tile_graph = TileGraph::build_llama_forward(2);
+        let library = ImplementationLibrary::l4_sm89_starter();
+        let profile = TargetProfile::l4_sm89().with_seq_len(1);
+        let problem = Problem::build(&tile_graph, &library, &profile);
+
+        let solver = BacktrackCpSolver;
+        let plan = match solver.solve(&problem) {
+            SolveResult::Found(p) => p,
+            SolveResult::Infeasible => panic!("infeasible"),
+        };
+
+        eprintln!(
+            "decode solver: {} steps, predicted {:.2} ms",
+            plan.solver_steps,
+            plan.predicted_us / 1000.0
+        );
+        let mut impl_counts: std::collections::BTreeMap<&str, u32> = Default::default();
+        for sg in plan.assignment.subgraphs() {
+            let name = library.get(plan.assignment.impls[&sg]).name();
+            *impl_counts.entry(name).or_insert(0) += 1;
+        }
+        for (name, count) in &impl_counts {
+            eprintln!("  {count:>3} × {name}");
+        }
+
+        assert!(
+            impl_counts.contains_key("tk_fused_mlp_block"),
+            "expected solver to pick tk_fused_mlp_block for decode (seq=1)"
+        );
+    }
 }

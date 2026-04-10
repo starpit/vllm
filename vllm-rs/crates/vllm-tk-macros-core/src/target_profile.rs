@@ -243,6 +243,12 @@ pub struct TargetProfile {
     /// Streaming multiprocessor count
     /// (`cudaDevAttrMultiProcessorCount`).
     pub num_sm: u32,
+
+    // ── Workload shape ─────────────────────────────────────────────
+    /// Sequence length for this problem instance. Implementations
+    /// use this to return seq-dependent costs (e.g., TK fused MLP
+    /// is fast at decode seq=1-4, slow at prefill seq=1024).
+    pub seq_len: u32,
     /// How many megakernel CTAs fit per SM under
     /// cooperative-launch residency constraints. Determined by the
     /// megakernel's per-CTA dynamic shmem + register footprint vs
@@ -286,6 +292,7 @@ impl TargetProfile {
     pub const fn l4_sm89() -> Self {
         Self {
             num_sm: 58,
+            seq_len: 1024,
             cooperative_blocks_per_sm: 1,
             max_dynamic_shmem_bytes: 99 * 1024,
 
@@ -309,6 +316,14 @@ impl TargetProfile {
             rope_kernel: RopeKernelChoice::HandWrittenSplitHalf,
             lowering: LoweringConstraints::l4_sm89(),
         }
+    }
+
+    /// Return a copy with a different sequence length. Use this to
+    /// solve for decode (`with_seq_len(1)`) vs prefill (`with_seq_len(1024)`).
+    pub const fn with_seq_len(&self, seq_len: u32) -> Self {
+        let mut p = *self;
+        p.seq_len = seq_len;
+        p
     }
 
     /// Cooperative grid size = `num_sm * cooperative_blocks_per_sm`.

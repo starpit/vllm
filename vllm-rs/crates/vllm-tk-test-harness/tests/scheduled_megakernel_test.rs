@@ -2924,7 +2924,10 @@ fn cublas_gemm_sweep_microbench() {
 
     eprintln!();
     eprintln!("cuBLAS GEMM microbench sweep — LLaMA 1B shapes on L4");
-    eprintln!("{:>6} │ {:>10} {:>10} {:>10} {:>10} {:>10}", "M", "qkv_us", "oproj_us", "gate_us", "up_us", "down_us");
+    eprintln!(
+        "{:>6} │ {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "M", "qkv_us", "oproj_us", "gate_us", "up_us", "down_us"
+    );
     eprintln!("───────┼─{}", "─".repeat(55));
 
     let one: f32 = 1.0;
@@ -2941,14 +2944,24 @@ fn cublas_gemm_sweep_microbench() {
             let gemm = |stream: sys::CUstream| unsafe {
                 ffi::cublasGemmEx(
                     handle,
-                    ffi::CUBLAS_OP_T, ffi::CUBLAS_OP_N,
-                    n, m, k,
+                    ffi::CUBLAS_OP_T,
+                    ffi::CUBLAS_OP_N,
+                    n,
+                    m,
+                    k,
                     &one as *const f32,
-                    b as *const _, ffi::CUDA_R_16BF, k,
-                    a as *const _, ffi::CUDA_R_16BF, k,
+                    b as *const _,
+                    ffi::CUDA_R_16BF,
+                    k,
+                    a as *const _,
+                    ffi::CUDA_R_16BF,
+                    k,
                     &zero as *const f32,
-                    c as *mut _, ffi::CUDA_R_16BF, n,
-                    ffi::CUBLAS_COMPUTE_32F, ffi::CUBLAS_GEMM_DEFAULT,
+                    c as *mut _,
+                    ffi::CUDA_R_16BF,
+                    n,
+                    ffi::CUBLAS_COMPUTE_32F,
+                    ffi::CUBLAS_GEMM_DEFAULT,
                 );
             };
 

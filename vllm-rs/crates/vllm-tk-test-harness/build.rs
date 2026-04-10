@@ -228,6 +228,9 @@ fn build_cuda() {
     let harness_csrc = manifest_dir.join("csrc");
     let shim_cu = harness_csrc.join("flashinfer_attention_shim.cu");
     cu_files.push(shim_cu.display().to_string());
+    // CP5: standalone CUTLASS GEMM launcher (128×128 and 64×64 tiles).
+    let cutlass_gemm_cu = harness_csrc.join("cutlass_standalone_gemm.cu");
+    cu_files.push(cutlass_gemm_cu.display().to_string());
 
     let mut builder = cudaforge::KernelBuilder::new();
     builder = builder

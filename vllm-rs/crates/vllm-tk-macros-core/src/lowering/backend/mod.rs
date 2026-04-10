@@ -11,6 +11,8 @@
 
 pub mod codegen;
 #[cfg(test)]
+mod codegen_dump_test;
+#[cfg(test)]
 mod codegen_test;
 pub mod compile_dsl;
 pub mod dispatch;

@@ -147,18 +147,21 @@ impl ImplementationLibrary {
             // Fused 3-tile claim (QkvSplit + Rope + KvCacheWrite) — listed
             // before the standalone variants so the solver picks it on the
             // first branch.
+            // Decode: fused 3-tile (QkvSplit + Rope + KvCacheWrite).
+            // Only matches at seq_len <= 1.
             Box::new(VllmRsFusedQkvRopeCacheImpl),
+            // Prefill: 3-tile (QkvSplit + Rope + KvCacheWrite) with
+            // split_qkv + rotary_both + write_kv_cache.
+            // Only matches at seq_len > 1.
+            Box::new(VllmRsPrefillRopeCacheImpl),
             Box::new(VllmRsRotaryEmbeddingImpl),
             Box::new(VllmRsSiluAndMulFusedImpl),
-            // ── FlashInfer standalone ──
+            // ── FlashInfer ──
+            // Decode: attention_decode_from_cache (seq_len <= 1).
             Box::new(FlashInferStandaloneImpl),
+            // Prefill: attention_standard with explicit Q, K, V (seq_len > 1).
+            Box::new(FlashInferStandardImpl),
             // ── Free / cheap passthroughs ──
-            // Note: QkvSplitFreeImpl is intentionally omitted. The fused
-            // VllmRsFusedQkvRopeCacheImpl is the only cover for QkvSplit
-            // (and folds in Rope + KvCacheWrite as a side effect), which
-            // forces the solver to use it. The cheapest-first per-seed
-            // greedy with the loose remainder bound otherwise picks
-            // free-split for the QkvSplit tile and never recovers.
             Box::new(KvCacheWriteImpl),
             Box::new(ResidualAddImpl),
         ];
@@ -918,8 +921,9 @@ impl Implementation for FlashInferStandaloneImpl {
     fn name(&self) -> &'static str {
         "flashinfer_standalone_fa2"
     }
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // Decode path: attention reads from paged KV cache.
+        profile.seq_len <= 1
     }
     fn matches(
         &self,
@@ -1155,8 +1159,10 @@ impl Implementation for VllmRsFusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         "vllm_rs_fused_qkv_rope_cache"
     }
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // Decode only: fused split + Q rope + cache write.
+        // Prefill uses split_qkv + rotary_both + write_kv_cache.
+        profile.seq_len <= 1
     }
     fn matches(
         &self,
@@ -1209,6 +1215,134 @@ impl Implementation for VllmRsFusedQkvRopeCacheImpl {
     }
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::RowMajorBf16, Layout::PagedKvBf16]
+    }
+}
+
+/// Prefill rope + cache: claims [QkvSplit + Rope + KvCacheWrite].
+/// Uses split_qkv + rotary_embedding_inplace (both Q and K) + write_kv_cache.
+/// Only matches at seq_len > 1 (prefill).
+#[derive(Debug)]
+pub struct VllmRsPrefillRopeCacheImpl;
+
+impl Implementation for VllmRsPrefillRopeCacheImpl {
+    fn name(&self) -> &'static str {
+        "vllm_rs_prefill_rope_cache"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.seq_len > 1
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        // Same subgraph as the decode variant.
+        let split_node = &tile_graph.nodes[seed.0 as usize];
+        if split_node.kind != TileKind::QkvSplit {
+            return None;
+        }
+        let rope = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::Rope && n.deps.contains(&seed))?;
+        let kvw = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::KvCacheWrite && n.deps.contains(&rope.id))?;
+        Some(MatchInfo {
+            claimed_tiles: vec![seed, rope.id, kvw.id],
+            boundary_inputs: split_node.deps.clone(),
+            boundary_outputs: vec![rope.id, kvw.id],
+            layer: split_node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // Prefill: split_qkv + rotary_both + write_kv_cache.
+        // More work than decode fused variant.
+        l4_cost_model::elementwise_us(profile.num_tokens(), 3072) * 1.5
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16, Layout::PagedKvBf16]
+    }
+}
+
+/// FlashInfer attention_standard: prefill attention with explicit Q, K, V.
+/// Only matches at seq_len > 1 (prefill).
+#[derive(Debug)]
+pub struct FlashInferStandardImpl;
+
+impl Implementation for FlashInferStandardImpl {
+    fn name(&self) -> &'static str {
+        "flashinfer_standard_fa2"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.seq_len > 1
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        if node.kind != TileKind::Attention {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: node.deps.clone(),
+            boundary_outputs: vec![seed],
+            layer: node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        l4_cost_model::attention_us(profile.num_tokens())
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        let mut layouts = Vec::with_capacity(m.boundary_inputs.len());
+        for _ in &m.boundary_inputs {
+            layouts.push(Layout::Any);
+        }
+        layouts
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
     }
 }
 

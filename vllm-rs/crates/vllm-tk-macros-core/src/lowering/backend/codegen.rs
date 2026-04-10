@@ -71,6 +71,8 @@ fn generate_fully_specialized(def: &CompileDef) -> TokenStream {
                 let mut residual = residual;
                 let mut normed: Option<OwnedTensor> = None;
                 let mut qkv_out: Option<OwnedTensor> = None;
+                let mut k_out: Option<OwnedTensor> = None;
+                let mut v_out: Option<OwnedTensor> = None;
                 let mut attn_out: Option<OwnedTensor> = None;
                 let mut gate_up: Option<OwnedTensor> = None;
                 let mut silu_out: Option<OwnedTensor> = None;
@@ -293,25 +295,63 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             }})
         }
 
-        ImplDispatchKind::FusedQkvRopeCache => Some(quote! {{
-            let __qkv = qkv_out.take().unwrap();
-            let __q = kernels::fused_qkv_rope_cache(
-                __qkv.as_gpu_tensor(),
-                *positions,
-                rotary.cos_sin_cache,
-                *slot_mapping,
-                *kv_cache.k_cache(layer.self_attn.layer_idx),
-                *kv_cache.v_cache(layer.self_attn.layer_idx),
-                layer.self_attn.q_size,
-                layer.self_attn.kv_size,
-                layer.self_attn.num_q_heads,
-                layer.self_attn.head_dim,
-                &mut device.caching,
-                device.compute_stream,
-            );
-            drop(__qkv);
-            qkv_out = Some(__q);
-        }}),
+        ImplDispatchKind::FusedQkvRopeCache => {
+            // Decode: fused split + Q RoPE + cache write.
+            Some(quote! {{
+                let __qkv = qkv_out.take().unwrap();
+                let __q = kernels::fused_qkv_rope_cache(
+                    __qkv.as_gpu_tensor(),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    *slot_mapping,
+                    *kv_cache.k_cache(layer.self_attn.layer_idx),
+                    *kv_cache.v_cache(layer.self_attn.layer_idx),
+                    layer.self_attn.q_size,
+                    layer.self_attn.kv_size,
+                    layer.self_attn.num_q_heads,
+                    layer.self_attn.head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(__qkv);
+                qkv_out = Some(__q);
+            }})
+        }
+
+        ImplDispatchKind::PrefillRopeCache => {
+            // Prefill: split QKV, rotate both Q and K, write cache.
+            Some(quote! {{
+                let __qkv = qkv_out.take().unwrap();
+                let (__q, __k, __v) = kernels::split_qkv(
+                    __qkv.as_gpu_tensor(),
+                    layer.self_attn.q_size,
+                    layer.self_attn.kv_size,
+                    layer.self_attn.num_q_heads,
+                    layer.self_attn.num_kv_heads,
+                    layer.self_attn.head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(__qkv);
+                let __nt = __q.as_gpu_tensor().dim(0);
+                kernels::rotary_embedding_inplace(
+                    __q.as_gpu_tensor().reshape(&[__nt, layer.self_attn.q_size]),
+                    __k.as_gpu_tensor().reshape(&[__nt, layer.self_attn.kv_size]),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    layer.self_attn.head_dim,
+                    device.compute_stream,
+                );
+                crate::model::attention_helpers::write_kv_cache(
+                    __k.view(), __v.view(), slot_mapping,
+                    kv_cache, layer.self_attn.layer_idx,
+                    device.compute_stream,
+                );
+                qkv_out = Some(__q);
+                k_out = Some(__k);
+                v_out = Some(__v);
+            }})
+        }
 
         ImplDispatchKind::RotaryEmbedding => Some(quote! {{
             let __qkv = **qkv_out.as_ref().unwrap();
@@ -326,30 +366,65 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             );
         }}),
 
-        ImplDispatchKind::FlashInferAttention => Some(quote! {{
-            let __q = qkv_out.take().unwrap();
-            let __a = crate::model::attention_helpers::attention_decode_from_cache(
-                __q.view(),
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                layer.self_attn.scale,
-                0.0,
-                -1,
-                kv_cache,
-                layer.self_attn.layer_idx,
-                device.num_sm,
-                &mut device.caching,
-                device.compute_stream,
-                std::ptr::null(),
-                0,
-                false,
-            );
-            drop(__q);
-            attn_out = Some(__a);
-        }}),
+        ImplDispatchKind::FlashInferAttention => {
+            // Decode: attention from paged KV cache.
+            Some(quote! {{
+                let __q = qkv_out.take().unwrap();
+                let __a = crate::model::attention_helpers::attention_decode_from_cache(
+                    __q.view(),
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    layer.self_attn.scale,
+                    0.0,
+                    -1,
+                    kv_cache,
+                    layer.self_attn.layer_idx,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                    std::ptr::null(),
+                    0,
+                    false,
+                );
+                drop(__q);
+                attn_out = Some(__a);
+            }})
+        }
+
+        ImplDispatchKind::FlashInferStandard => {
+            // Prefill: attention_standard with explicit Q, K, V.
+            Some(quote! {{
+                let __q = qkv_out.take().unwrap();
+                let __k = k_out.take().unwrap();
+                let __v = v_out.take().unwrap();
+                let __a = crate::model::attention_helpers::attention_standard(
+                    __q.view(),
+                    __k.view(),
+                    __v.view(),
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    layer.self_attn.scale,
+                    kv_cache,
+                    layer.self_attn.layer_idx,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                    std::ptr::null(),
+                    0,
+                    false,
+                );
+                drop(__q);
+                drop(__k);
+                drop(__v);
+                attn_out = Some(__a);
+            }})
+        }
 
         ImplDispatchKind::SiluAndMul => Some(quote! {{
             let __gu = gate_up.take().unwrap();

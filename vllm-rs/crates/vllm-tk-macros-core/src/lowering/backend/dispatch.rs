@@ -30,14 +30,18 @@ pub enum ImplDispatchKind {
     CutlassNormGemm { tile_m: u32, tile_n: u32 },
     /// `rms_norm_bf16`.
     RmsNorm,
-    /// `fused_qkv_rope_cache_bf16` — 3-tile fused.
+    /// Decode: `fused_qkv_rope_cache_bf16` — 3-tile fused (split + Q rope + cache write).
     FusedQkvRopeCache,
+    /// Prefill: `split_qkv` + `rotary_embedding_inplace` (both Q and K) + `write_kv_cache`.
+    PrefillRopeCache,
     /// `rotary_embedding_bf16`.
     RotaryEmbedding,
     /// `silu_and_mul_fused_bf16`.
     SiluAndMul,
-    /// FlashInfer FA2 standalone.
+    /// Decode: FlashInfer `attention_decode_from_cache`.
     FlashInferAttention,
+    /// Prefill: FlashInfer `attention_standard` with explicit Q, K, V.
+    FlashInferStandard,
     /// TK fused MLP block (7-tile).
     TkFusedMlpBlock,
     /// Free passthrough — no FFI call needed (e.g. QkvSplit, KvCacheWrite, ResidualAdd
@@ -235,12 +239,16 @@ fn classify_impl(
         return (ImplDispatchKind::RmsNorm, None, false, Some(is_attn));
     } else if imp_name == "vllm_rs_fused_qkv_rope_cache" {
         ImplDispatchKind::FusedQkvRopeCache
+    } else if imp_name == "vllm_rs_prefill_rope_cache" {
+        ImplDispatchKind::PrefillRopeCache
     } else if imp_name == "vllm_rs_rotary_embedding" {
         ImplDispatchKind::RotaryEmbedding
     } else if imp_name == "vllm_rs_silu_and_mul_fused" {
         ImplDispatchKind::SiluAndMul
     } else if imp_name == "flashinfer_standalone_fa2" {
         ImplDispatchKind::FlashInferAttention
+    } else if imp_name == "flashinfer_standard_fa2" {
+        ImplDispatchKind::FlashInferStandard
     } else if imp_name == "tk_fused_mlp_block" {
         ImplDispatchKind::TkFusedMlpBlock
     } else if imp_name == "qkv_split_free"

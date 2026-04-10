@@ -1036,9 +1036,12 @@ impl LlamaModel {
         // its memory returns to the caching allocator's free list.
         let mut hidden_states: OwnedTensor = hidden_states;
         let mut residual: Option<OwnedTensor> = None;
+        let num_tokens = hidden_states.dim(0) as u32;
 
         for layer in self.layers.iter() {
-            let (hs, res) = layer.forward(
+            let (hs, res) = super::solver_dispatch::solver_forward_layer(
+                layer,
+                num_tokens,
                 hidden_states,
                 residual,
                 positions,

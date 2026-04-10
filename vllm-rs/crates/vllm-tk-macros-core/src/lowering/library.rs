@@ -419,14 +419,15 @@ mod l4_cost_model {
     }
 
     pub fn cutlass_gemm_us(m: u32, n: u32, k: u32, tile_m: u32, _tile_n: u32, _num_sm: u32) -> f64 {
-        // Use measured cuBLAS as baseline, apply tile waste penalty.
+        // Measured: CUTLASS 128×128 is ~2% SLOWER than cuBLAS at
+        // large M (cuBLAS autotuner picks better configs). Apply
+        // tile waste penalty for small M where padding hurts.
         let cublas = gemm_us(m, n, k);
         let tiles_m = ((m as f64) / tile_m as f64).ceil().max(1.0);
         let actual_m = tiles_m * tile_m as f64;
         let waste = actual_m / (m as f64).max(1.0);
-        // CUTLASS with explicit tiles: ~95% of cuBLAS when tiles align,
-        // worse when they don't (waste factor).
-        cublas * 0.95 * waste
+        // 1.02 = 2% overhead vs cuBLAS, × waste for tile padding.
+        cublas * 1.02 * waste
     }
 }
 

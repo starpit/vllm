@@ -112,6 +112,23 @@ impl ImplementationLibrary {
             Box::new(CutlassGemmImpl::new(TileKind::GemmUp, 64, 64)),
             Box::new(CutlassGemmImpl::new(TileKind::GemmDown, 128, 128)),
             Box::new(CutlassGemmImpl::new(TileKind::GemmDown, 64, 64)),
+            // ── CUTLASS GEMM + residual (beta=1 epilogue, same as cuBLAS fused) ──
+            Box::new(CutlassGemmWithResidualImpl::new(
+                TileKind::GemmOProj,
+                128,
+                128,
+            )),
+            Box::new(CutlassGemmWithResidualImpl::new(
+                TileKind::GemmOProj,
+                64,
+                64,
+            )),
+            Box::new(CutlassGemmWithResidualImpl::new(
+                TileKind::GemmDown,
+                128,
+                128,
+            )),
+            Box::new(CutlassGemmWithResidualImpl::new(TileKind::GemmDown, 64, 64)),
             // ── cuBLAS GEMMs (auto-tuned, no explicit tile control) ──
             Box::new(CublasGemmExImpl::new(TileKind::GemmQkv)),
             Box::new(CublasGemmExImpl::new(TileKind::GemmOProj)),
@@ -1332,6 +1349,113 @@ impl Implementation for CutlassGemmImpl {
         let per_stage = (self.tile_m * tile_k + self.tile_n * tile_k) * 2;
         Resources {
             shmem_bytes: per_stage * 4, // 4 pipeline stages
+            regs_per_thread: if self.tile_m >= 128 { 128 } else { 80 },
+            threads_per_cta: 256,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+}
+
+// ── CUTLASS GEMM with fused residual (beta=1 epilogue) ──
+
+/// CUTLASS GEMM claiming `[GEMM + ResidualAdd]` as a 2-tile subgraph,
+/// using a beta=1 linear combination epilogue (same trick as cuBLAS).
+/// The residual add is free — it happens in the epilogue store.
+#[derive(Debug)]
+pub struct CutlassGemmWithResidualImpl {
+    phase: TileKind,
+    tile_m: u32,
+    tile_n: u32,
+}
+
+impl CutlassGemmWithResidualImpl {
+    pub fn new(phase: TileKind, tile_m: u32, tile_n: u32) -> Self {
+        debug_assert!(
+            phase == TileKind::GemmOProj || phase == TileKind::GemmDown,
+            "only oproj and down have residual add"
+        );
+        Self {
+            phase,
+            tile_m,
+            tile_n,
+        }
+    }
+}
+
+impl Implementation for CutlassGemmWithResidualImpl {
+    fn name(&self) -> &'static str {
+        match (self.phase, self.tile_m) {
+            (TileKind::GemmOProj, 128) => "cutlass_oproj_128x128_res",
+            (TileKind::GemmOProj, _) => "cutlass_oproj_64x64_res",
+            (TileKind::GemmDown, 128) => "cutlass_down_128x128_res",
+            (TileKind::GemmDown, _) => "cutlass_down_64x64_res",
+            _ => "cutlass_unknown_res",
+        }
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        // Same 2-tile claim pattern as CublasGemmExWithResidualImpl.
+        let gemm_node = &tile_graph.nodes[seed.0 as usize];
+        if gemm_node.kind != self.phase {
+            return None;
+        }
+        let gemm_id = seed;
+        let residual = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::ResidualAdd
+                && n.layer == gemm_node.layer
+                && n.deps.contains(&gemm_id)
+        })?;
+        let residual_id = residual.id;
+        let residual_node = &tile_graph.nodes[residual_id.0 as usize];
+        let mut boundary_inputs = gemm_node.deps.clone();
+        for d in &residual_node.deps {
+            if *d != gemm_id && !boundary_inputs.contains(d) {
+                boundary_inputs.push(*d);
+            }
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![gemm_id, residual_id],
+            boundary_inputs,
+            boundary_outputs: vec![residual_id],
+            layer: gemm_node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // Same as standalone CUTLASS GEMM — beta=1 is free in the epilogue.
+        let m = profile.num_tokens();
+        let (n, k) = match self.phase {
+            TileKind::GemmOProj => (2048, 2048),
+            TileKind::GemmDown => (2048, 8192),
+            _ => (1, 1),
+        };
+        l4_cost_model::cutlass_gemm_us(m, n, k, self.tile_m, self.tile_n, profile.num_sm)
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        let tile_k = 32u32;
+        let per_stage = (self.tile_m * tile_k + self.tile_n * tile_k) * 2;
+        Resources {
+            shmem_bytes: per_stage * 4,
             regs_per_thread: if self.tile_m >= 128 { 128 } else { 80 },
             threads_per_cta: 256,
         }

@@ -83,15 +83,16 @@ M=256+:   cuBLAS/CUTLASS individual GEMMs                10 launches/layer
 
 ## What's next (priority order)
 
-1. **FFI wiring** — connect `solver_dispatch_ffi` stubs in
-   `vllm-cuda/src/model/solver_dispatch.rs` to real CUDA kernel
-   launchers (cuBLAS handle, CUTLASS launchers, vllm-kernels FFI,
-   FlashInfer, TK). Then test: solver dispatch matches eager forward.
-2. **Model generalization** — TileGraph for Mistral, Qwen, etc.
-3. **Multi-GPU calibration** — GpuCostTable for A100, H100
-4. **CUTLASS norm+GEMM prologue kernel** — impl exists in solver but
+1. **TileGraph from DSL** — replace hardcoded `build_llama_forward`
+   with DAG parsed from model description. Enables Mistral, Qwen, etc.
+2. **`model: runtime` binding** — solver runs at model load, reads
+   dims from loaded weights. No model catalog needed.
+3. **CUTLASS norm+GEMM prologue kernel** — impl exists in solver but
    no backing CUDA kernel (eliminates 2 launches/layer)
-5. **TK sweep** — measured TK fused MLP costs across M values
+4. **TK fused MLP wiring** — codegen placeholder exists, needs the
+   TK launcher FFI in vllm-cuda
+5. **Multi-GPU calibration** — run `gpu_cost_sweep` on A100, H100,
+   check in CSV files
 6. **ILP backend** — the Solver trait is ready; needs MILP encoding
 
 ## Architecture: compile-time vs runtime binding

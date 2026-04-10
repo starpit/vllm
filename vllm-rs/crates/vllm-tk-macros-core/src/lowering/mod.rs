@@ -116,7 +116,7 @@ pub use implementation::{
 pub use library::ImplementationLibrary;
 pub use problem::{PrecisionMode, Problem};
 pub use solver::{BacktrackCpSolver, ExecutionPlan, PlanFamily, SolveResult, Solver};
-pub use tile_graph::{TileGraph, TileId, TileKind};
+pub use tile_graph::{ModelDims, TileGraph, TileId, TileKind};
 
 #[cfg(test)]
 mod tests;

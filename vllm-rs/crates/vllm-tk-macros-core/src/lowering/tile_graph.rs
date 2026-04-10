@@ -208,6 +208,42 @@ pub struct TileGraph {
     /// Number of layers in the model. Used by the solver to
     /// estimate cross-layer overlap potential.
     pub num_layers: u16,
+    /// Model dimensions — used by the cost model to look up GEMM
+    /// costs at the correct (M, N, K) shapes.
+    pub dims: ModelDims,
+}
+
+/// Model-specific dimensions that determine GEMM shapes.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelDims {
+    pub hidden_size: u32,
+    pub intermediate_size: u32,
+    pub num_attention_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+}
+
+impl ModelDims {
+    pub const LLAMA_3_2_1B: Self = Self {
+        hidden_size: 2048,
+        intermediate_size: 8192,
+        num_attention_heads: 32,
+        num_kv_heads: 8,
+        head_dim: 64,
+    };
+
+    /// QKV output dimension = (num_q_heads + 2 * num_kv_heads) * head_dim.
+    pub fn qkv_dim(&self) -> u32 {
+        (self.num_attention_heads + 2 * self.num_kv_heads) * self.head_dim
+    }
+
+    pub fn q_size(&self) -> u32 {
+        self.num_attention_heads * self.head_dim
+    }
+
+    pub fn kv_size(&self) -> u32 {
+        self.num_kv_heads * self.head_dim
+    }
 }
 
 impl TileGraph {
@@ -236,7 +272,12 @@ impl TileGraph {
     /// `hidden_states` flows through the residual_adds; each layer
     /// reads it from the previous layer's final residual_add (or the
     /// input embedding for layer 0).
-    pub fn build_llama_forward(num_layers: u16) -> Self {
+    /// Build with default LLaMA 1B dimensions (for tests).
+    pub fn build_llama_forward_1b(num_layers: u16) -> Self {
+        Self::build_llama_forward(num_layers, ModelDims::LLAMA_3_2_1B)
+    }
+
+    pub fn build_llama_forward(num_layers: u16, dims: ModelDims) -> Self {
         let mut nodes: Vec<TileNode> = Vec::with_capacity(num_layers as usize * 14);
         let mut hidden_state_tile = TileId(u32::MAX); // sentinel; replaced after layer 0's residual
 
@@ -303,7 +344,11 @@ impl TileGraph {
             hidden_state_tile = mlp_residual;
         }
 
-        TileGraph { nodes, num_layers }
+        TileGraph {
+            nodes,
+            num_layers,
+            dims,
+        }
     }
 
     /// Iterate over all tiles in topological order. Equivalent to
@@ -350,14 +395,14 @@ mod self_tests {
         //            1 up_gemm, 1 gate_up_concat, 1 silu_mul,
         //            1 down_gemm, 1 mlp_residual = 15 nodes per layer.
         // Plus 1 synthetic input node for the very first layer.
-        let g = TileGraph::build_llama_forward(2);
+        let g = TileGraph::build_llama_forward_1b(2);
         assert_eq!(g.nodes.len(), 1 + 2 * 15);
         assert_eq!(g.num_layers, 2);
     }
 
     #[test]
     fn topological_order_invariant() {
-        let g = TileGraph::build_llama_forward(3);
+        let g = TileGraph::build_llama_forward_1b(3);
         for node in &g.nodes {
             for dep in &node.deps {
                 assert!(
@@ -372,7 +417,7 @@ mod self_tests {
 
     #[test]
     fn dense_ids() {
-        let g = TileGraph::build_llama_forward(4);
+        let g = TileGraph::build_llama_forward_1b(4);
         for (i, node) in g.nodes.iter().enumerate() {
             assert_eq!(node.id.0 as usize, i);
         }
@@ -380,7 +425,7 @@ mod self_tests {
 
     #[test]
     fn every_layer_has_one_attention() {
-        let g = TileGraph::build_llama_forward(5);
+        let g = TileGraph::build_llama_forward_1b(5);
         let attn: Vec<_> = g.tiles_of_kind(TileKind::Attention).collect();
         assert_eq!(attn.len(), 5);
         for (i, n) in attn.iter().enumerate() {

@@ -516,7 +516,7 @@ fn gemm_operands(
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn build_tile_graph(model: &ModelId) -> TileGraph {
-    TileGraph::build_llama_forward(model.num_layers())
+    TileGraph::build_llama_forward(model.num_layers(), model.dims())
 }
 
 fn build_library(target: &TargetId) -> ImplementationLibrary {

@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn solver_finds_natural_sm89_assignment() {
-        let tile_graph = TileGraph::build_llama_forward(16);
+        let tile_graph = TileGraph::build_llama_forward_1b(16);
         let library = ImplementationLibrary::l4_sm89_starter();
         let profile = TargetProfile::l4_sm89();
         let problem = Problem::build(&tile_graph, &library, &profile);
@@ -556,7 +556,7 @@ mod tests {
         // Verify the multi-tile claim works: the solver should
         // discover that vllm_rs_silu_and_mul_fused claims both
         // GateUpConcat AND SiluMul under one subgraph.
-        let tile_graph = TileGraph::build_llama_forward(2);
+        let tile_graph = TileGraph::build_llama_forward_1b(2);
         let library = ImplementationLibrary::l4_sm89_starter();
         let profile = TargetProfile::l4_sm89();
         let problem = Problem::build(&tile_graph, &library, &profile);
@@ -597,7 +597,7 @@ mod tests {
         // mixes at different M values. At M=1 cuBLAS GEMV wins; at
         // M=32-64 CUTLASS 64×64 wins. The test verifies the plans
         // actually differ — the specific picks depend on calibration.
-        let tile_graph = TileGraph::build_llama_forward(2);
+        let tile_graph = TileGraph::build_llama_forward_1b(2);
         let library = ImplementationLibrary::l4_sm89_starter();
 
         let decode = {
@@ -751,7 +751,7 @@ mod tests {
 
     #[test]
     fn print_plan_family_compact() {
-        let tg = TileGraph::build_llama_forward(2);
+        let tg = TileGraph::build_llama_forward_1b(2);
         let library = ImplementationLibrary::l4_sm89_starter();
         let base = TargetProfile::l4_sm89();
 
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn plan_family_across_seq_lens() {
-        let tg = TileGraph::build_llama_forward(2);
+        let tg = TileGraph::build_llama_forward_1b(2);
         let library = ImplementationLibrary::l4_sm89_starter();
         let profile = TargetProfile::l4_sm89();
 

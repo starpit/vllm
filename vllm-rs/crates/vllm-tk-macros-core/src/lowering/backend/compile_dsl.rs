@@ -49,6 +49,7 @@ impl<T> Binding<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelId {
     Llama3_2_1B,
+    Llama3_2_3B,
     Llama3_1_8B,
 }
 
@@ -56,13 +57,42 @@ impl ModelId {
     pub fn num_layers(&self) -> u16 {
         match self {
             ModelId::Llama3_2_1B => 16,
+            ModelId::Llama3_2_3B => 28,
             ModelId::Llama3_1_8B => 32,
+        }
+    }
+
+    pub fn dims(&self) -> crate::lowering::tile_graph::ModelDims {
+        use crate::lowering::tile_graph::ModelDims;
+        match self {
+            ModelId::Llama3_2_1B => ModelDims {
+                hidden_size: 2048,
+                intermediate_size: 8192,
+                num_attention_heads: 32,
+                num_kv_heads: 8,
+                head_dim: 64,
+            },
+            ModelId::Llama3_2_3B => ModelDims {
+                hidden_size: 3072,
+                intermediate_size: 8192,
+                num_attention_heads: 24,
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
+            ModelId::Llama3_1_8B => ModelDims {
+                hidden_size: 4096,
+                intermediate_size: 14336,
+                num_attention_heads: 32,
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
             ModelId::Llama3_2_1B => "llama_3_2_1b",
+            ModelId::Llama3_2_3B => "llama_3_2_3b",
             ModelId::Llama3_1_8B => "llama_3_1_8b",
         }
     }
@@ -122,10 +152,11 @@ impl CompileDef {
 fn parse_model_id(ident: &str) -> syn::Result<ModelId> {
     match ident {
         "llama_3_2_1b" => Ok(ModelId::Llama3_2_1B),
+        "llama_3_2_3b" => Ok(ModelId::Llama3_2_3B),
         "llama_3_1_8b" => Ok(ModelId::Llama3_1_8B),
         other => Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            format!("unknown model: `{other}`. known: llama_3_2_1b, llama_3_1_8b"),
+            format!("unknown model: `{other}`. known: llama_3_2_1b, llama_3_2_3b, llama_3_1_8b"),
         )),
     }
 }

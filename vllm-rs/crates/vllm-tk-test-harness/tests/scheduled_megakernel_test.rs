@@ -2058,12 +2058,22 @@ fn cp5_solver_driven_natural_forward_bench() {
     }
     eprintln!("╠═══════════════════════════════════════════════════════════════╣");
 
-    // ── Stream + cuBLAS handle setup ──
-    // Use a real (non-null) stream so we can graph-capture later.
+    // ── Streams + cuBLAS handle setup ──
+    // stream_a: primary; stream_b: secondary for gate/up GEMM overlap.
     let stream: sys::CUstream = unsafe {
         let mut s: sys::CUstream = std::ptr::null_mut();
         sys::cuStreamCreate(&mut s, 0);
         s
+    };
+    let stream_b: sys::CUstream = unsafe {
+        let mut s: sys::CUstream = std::ptr::null_mut();
+        sys::cuStreamCreate(&mut s, 0);
+        s
+    };
+    let gate_up_event: sys::CUevent = unsafe {
+        let mut e: sys::CUevent = std::ptr::null_mut();
+        sys::cuEventCreate(&mut e, sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32);
+        e
     };
 
     let mut handle: ffi::CublasHandle = std::ptr::null_mut();
@@ -2316,9 +2326,33 @@ fn cp5_solver_driven_natural_forward_bench() {
         }
     };
 
+    // ── CP5-D-5: multi-stream one_pass ──
+    // gate_gemm and up_gemm are independent (both read rms_gate,
+    // write to disjoint halves of gate_up_tmp). Overlap them:
+    //   stream:   gate_gemm ──────────────────── [wait(event)] silu_and_mul ...
+    //   stream_b:            [wait(fork)] up_gemm [record(event)]
     let mut one_pass = || {
         for (_step, sg) in &scheduled {
-            dispatch_one(*sg);
+            let imp_name = library.get(plan.assignment.impls[sg]).name();
+            match imp_name {
+                "cublas_gemm_ex_up" => unsafe {
+                    // Fork stream_b from stream (needed for graph capture).
+                    sys::cuEventRecord(gate_up_event, stream);
+                    sys::cuStreamWaitEvent(stream_b, gate_up_event, 0);
+                    // Launch up_gemm on stream_b.
+                    ffi::cublasSetStream_v2(handle, stream_b as *mut std::ffi::c_void);
+                    dispatch_one(*sg);
+                    // Record completion on stream_b.
+                    sys::cuEventRecord(gate_up_event, stream_b);
+                    ffi::cublasSetStream_v2(handle, stream as *mut std::ffi::c_void);
+                },
+                "vllm_rs_silu_and_mul_fused" => unsafe {
+                    // Join: wait for up_gemm on stream_b.
+                    sys::cuStreamWaitEvent(stream, gate_up_event, 0);
+                    dispatch_one(*sg);
+                },
+                _ => dispatch_one(*sg),
+            }
         }
     };
 
@@ -2405,6 +2439,8 @@ fn cp5_solver_driven_natural_forward_bench() {
     unsafe {
         ffi::teardown_flashinfer_attention_plan(&mut fi_plan as *mut _);
         ffi::cublasDestroy_v2(handle);
+        sys::cuEventDestroy_v2(gate_up_event);
+        sys::cuStreamDestroy_v2(stream_b);
         sys::cuStreamDestroy_v2(stream);
     }
 }

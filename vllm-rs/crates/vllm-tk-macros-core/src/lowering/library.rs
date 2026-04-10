@@ -147,35 +147,74 @@ impl ImplementationLibrary {
     }
 }
 
-// ── Cost calibration constants (from CP4 microbench) ──
+// ── Analytical cost model (L4 sm_89, LLaMA 1B shapes) ──
 //
-// All numbers are wall-clock microseconds for ONE invocation on the
-// Llama-1B seq=1024 production shape on L4 sm_89.
+// Instead of fixed constants, costs are functions of seq_len (the M
+// dimension). This lets the solver discover different optimal kernel
+// mixes for decode (M=1) vs prefill (M=1024).
+//
+// Calibration anchors (from CP4 microbench at seq=1024):
+//   gate GEMM: M=1024 K=2048 N=8192 → 530 µs
+//   oproj GEMM: M=1024 K=2048 N=2048 → 145 µs
+//   qkv GEMM: M=1024 K=2048 N=3072 → 220 µs
 
+mod l4_cost_model {
+    /// GEMM cost model: at small M (decode), memory-bandwidth bound
+    /// (reading the weight matrix dominates). At large M (prefill),
+    /// compute-bound (FLOPs dominate). The crossover is around M=32
+    /// on L4 for typical LLaMA shapes.
+    ///
+    /// Model: `max(bw_us, compute_us) + launch_overhead`
+    ///   bw_us      = N * K * 2 bytes / L4_BW_BYTES_PER_US
+    ///   compute_us = 2 * M * N * K / L4_FLOPS_PER_US
+    ///   launch     = 5 µs (cudaLaunchKernel overhead)
+    pub fn gemm_us(m: u32, n: u32, k: u32) -> f64 {
+        // L4: ~300 GB/s memory BW, ~120 TFLOPS bf16 tensor cores
+        const L4_BW_BYTES_PER_US: f64 = 300_000.0; // 300 GB/s = 300K bytes/µs
+        const L4_BF16_FLOPS_PER_US: f64 = 120_000_000.0; // 120 TFLOPS = 120M FLOPS/µs
+        const LAUNCH_US: f64 = 5.0;
+
+        // BW-bound: read weight matrix (N×K×2 bytes). At M=1 this dominates.
+        let bw_us = (n as f64 * k as f64 * 2.0) / L4_BW_BYTES_PER_US;
+        // Compute-bound: 2*M*N*K FLOPs. At large M this dominates.
+        let compute_us = (2.0 * m as f64 * n as f64 * k as f64) / L4_BF16_FLOPS_PER_US;
+        LAUNCH_US + bw_us.max(compute_us)
+    }
+
+    /// Elementwise ops (norm, silu, rope, residual add) are always
+    /// memory-bandwidth bound: read + write `M * dim` bf16 elements.
+    pub fn elementwise_us(m: u32, dim: u32) -> f64 {
+        const L4_BW_BYTES_PER_US: f64 = 300_000.0;
+        const LAUNCH_US: f64 = 3.0;
+        // Read + write: 2 * M * dim * 2 bytes
+        let bytes = 2.0 * m as f64 * dim as f64 * 2.0;
+        LAUNCH_US + bytes / L4_BW_BYTES_PER_US
+    }
+
+    /// FlashInfer attention: compute-bound at large seq, memory-bound
+    /// at small seq (KV cache reads dominate for short contexts in
+    /// decode, QK^T compute dominates for long prefills).
+    pub fn attention_us(seq: u32) -> f64 {
+        const LAUNCH_US: f64 = 10.0;
+        // Rough model: 40µs base + 0.57µs per token (calibrated from
+        // 625µs at seq=1024).
+        LAUNCH_US + 40.0 + 0.57 * seq as f64
+    }
+}
+
+// Re-export fixed constants for non-seq-dependent code that still
+// references them (e.g. fused impls that sum constituent costs).
 mod l4_llama_1b_seq1024_costs {
-    /// cuBLAS per-call costs for each GEMM phase. From the CP4
-    /// gemm-only microbench (36.6 ms total / 80 calls = 458 µs avg,
-    /// distributed unevenly per shape — bigger N gets more time).
-    pub const CUBLAS_QKV_US: f64 = 220.0; // M=1024 K=2048 N=3072
-    pub const CUBLAS_OPROJ_US: f64 = 145.0; // M=1024 K=2048 N=2048
-    pub const CUBLAS_GATE_US: f64 = 530.0; // M=1024 K=2048 N=8192
-    pub const CUBLAS_UP_US: f64 = 530.0; // M=1024 K=2048 N=8192
-    pub const CUBLAS_DOWN_US: f64 = 540.0; // M=1024 K=8192 N=2048
-
-    /// vllm-rs fused-op per-call costs (negligible relative to GEMMs;
-    /// the natural microbench measured 1.2 ms total for all 16 layers
-    /// of norm + rope + silu_mul, distributed across 5 calls per
-    /// layer = ~15 µs per call avg).
     pub const RMS_NORM_US: f64 = 15.0;
     pub const ROTARY_EMBEDDING_US: f64 = 20.0;
     pub const SILU_AND_MUL_US: f64 = 12.0;
     pub const KV_CACHE_WRITE_US: f64 = 10.0;
     pub const RESIDUAL_ADD_US: f64 = 8.0;
-    pub const QKV_SPLIT_US: f64 = 0.0; // free — the buffer is already laid out
-
-    /// FlashInfer attention per-layer cost from the megakernel's
-    /// `fanin rope+at` clock (~10 ms / 16 layers = ~625 µs/layer).
+    pub const QKV_SPLIT_US: f64 = 0.0;
     pub const FLASHINFER_ATTENTION_US: f64 = 625.0;
+    pub const CUBLAS_GATE_US: f64 = 530.0;
+    pub const CUBLAS_UP_US: f64 = 530.0;
+    pub const CUBLAS_DOWN_US: f64 = 540.0;
 }
 
 // ── cuBLAS GEMM implementation ──
@@ -233,14 +272,15 @@ impl Implementation for CublasGemmExImpl {
         })
     }
 
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        use l4_llama_1b_seq1024_costs::*;
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // LLaMA 1B shapes: HD=2048, ID=8192, QKV_DIM=3072
+        let m = profile.seq_len;
         match self.phase {
-            TileKind::GemmQkv => CUBLAS_QKV_US,
-            TileKind::GemmOProj => CUBLAS_OPROJ_US,
-            TileKind::GemmGate => CUBLAS_GATE_US,
-            TileKind::GemmUp => CUBLAS_UP_US,
-            TileKind::GemmDown => CUBLAS_DOWN_US,
+            TileKind::GemmQkv => l4_cost_model::gemm_us(m, 3072, 2048),
+            TileKind::GemmOProj => l4_cost_model::gemm_us(m, 2048, 2048),
+            TileKind::GemmGate => l4_cost_model::gemm_us(m, 8192, 2048),
+            TileKind::GemmUp => l4_cost_model::gemm_us(m, 8192, 2048),
+            TileKind::GemmDown => l4_cost_model::gemm_us(m, 2048, 8192),
             _ => 0.0,
         }
     }
@@ -372,13 +412,13 @@ impl Implementation for CublasGemmExWithResidualImpl {
         })
     }
 
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
         // Same as the plain cuBLAS GEMM — beta=1 doesn't change wall
         // clock vs beta=0 in cuBLAS's mainloop.
-        use l4_llama_1b_seq1024_costs::*;
+        let m = profile.seq_len;
         match self.phase {
-            TileKind::GemmOProj => CUBLAS_OPROJ_US,
-            TileKind::GemmDown => CUBLAS_DOWN_US,
+            TileKind::GemmOProj => l4_cost_model::gemm_us(m, 2048, 2048),
+            TileKind::GemmDown => l4_cost_model::gemm_us(m, 2048, 8192),
             _ => 0.0,
         }
     }
@@ -445,8 +485,8 @@ impl Implementation for VllmRsRmsNormImpl {
             layer: node.layer,
         })
     }
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        l4_llama_1b_seq1024_costs::RMS_NORM_US
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        l4_cost_model::elementwise_us(profile.seq_len, 2048)
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -581,8 +621,8 @@ impl Implementation for VllmRsSiluAndMulFusedImpl {
             layer: node.layer,
         })
     }
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        l4_llama_1b_seq1024_costs::SILU_AND_MUL_US
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        l4_cost_model::elementwise_us(profile.seq_len, 8192) // intermediate_dim
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -637,8 +677,8 @@ impl Implementation for FlashInferStandaloneImpl {
             layer: node.layer,
         })
     }
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        l4_llama_1b_seq1024_costs::FLASHINFER_ATTENTION_US
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        l4_cost_model::attention_us(profile.seq_len)
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -759,8 +799,9 @@ impl Implementation for KvCacheWriteImpl {
             layer: node.layer,
         })
     }
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        l4_llama_1b_seq1024_costs::KV_CACHE_WRITE_US
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // KV cache scatter: seq * kv_size * 2 bytes read + write
+        l4_cost_model::elementwise_us(profile.seq_len, 512) // kv_dim = 8*64 = 512
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -813,8 +854,8 @@ impl Implementation for ResidualAddImpl {
             layer: node.layer,
         })
     }
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        l4_llama_1b_seq1024_costs::RESIDUAL_ADD_US
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        l4_cost_model::elementwise_us(profile.seq_len, 2048)
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -881,11 +922,10 @@ impl Implementation for VllmRsFusedQkvRopeCacheImpl {
             layer: split_node.layer,
         })
     }
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        l4_llama_1b_seq1024_costs::ROTARY_EMBEDDING_US
-            + l4_llama_1b_seq1024_costs::KV_CACHE_WRITE_US
-            + l4_llama_1b_seq1024_costs::QKV_SPLIT_US
-            - 5.0
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // Fused rope + qkv split + kv cache write: reads qkv_dim,
+        // writes q_dim + kv scatter. One kernel instead of three.
+        l4_cost_model::elementwise_us(profile.seq_len, 3072) // qkv_dim
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {

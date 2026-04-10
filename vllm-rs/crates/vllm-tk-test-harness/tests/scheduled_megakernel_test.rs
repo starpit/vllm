@@ -2639,7 +2639,9 @@ fn cp5_solver_driven_matches_committed_golden() {
 
     let tile_graph = TileGraph::build_llama_forward(dims.num_layers as u16);
     let library = ImplementationLibrary::l4_sm89_starter();
-    let profile = TargetProfile::l4_sm89();
+    // Use actual seq_len so the solver picks the right plan (e.g.,
+    // CUTLASS 64×64 at seq=64 instead of cuBLAS).
+    let profile = TargetProfile::l4_sm89().with_seq_len(dims.seq_len);
     let problem = Problem::build(&tile_graph, &library, &profile);
     let solver = BacktrackCpSolver;
     let plan = match solver.solve(&problem) {
@@ -2880,8 +2882,76 @@ fn cp5_solver_driven_matches_committed_golden() {
                 );
                 assert_eq!(s, 0, "cp5_run_flashinfer_attention_for_layer failed: {s}");
             },
-            // Standalone fall-throughs — should not be picked when the
-            // fused 3-tile impl is in the library, but tolerate them.
+            // ── CUTLASS standalone GEMMs (same dispatch as bench) ──
+            name if name.starts_with("cutlass_") => {
+                let has_res = name.ends_with("_res");
+                let beta = if has_res { 1.0f32 } else { 0.0f32 };
+                let use_64 = name.contains("64x64");
+                let (n, k, weight, act, out) = if name.contains("qkv") {
+                    (
+                        qkv_dim,
+                        hd,
+                        b.qkv_w + (layer * layer_bytes_qkv) as u64,
+                        b.rms_rope,
+                        b.qkv,
+                    )
+                } else if name.contains("oproj") {
+                    (
+                        hd,
+                        hd,
+                        b.o_w + (layer * layer_bytes_o) as u64,
+                        b.attn_out,
+                        b.hidden_states,
+                    )
+                } else if name.contains("gate") {
+                    (
+                        id,
+                        hd,
+                        b.gate_w + (layer * layer_bytes_gate_up) as u64,
+                        b.rms_gate,
+                        gate_up_tmp,
+                    )
+                } else if name.contains("_up_") || name.ends_with("_up") {
+                    let up_dest = gate_up_tmp + (seq * id) as u64 * 2;
+                    (
+                        id,
+                        hd,
+                        b.up_w + (layer * layer_bytes_gate_up) as u64,
+                        b.rms_gate,
+                        up_dest,
+                    )
+                } else if name.contains("down") {
+                    (
+                        hd,
+                        id,
+                        b.down_w + (layer * layer_bytes_down) as u64,
+                        b.silu_out,
+                        b.hidden_states,
+                    )
+                } else {
+                    panic!("unrecognized CUTLASS phase in {name}");
+                };
+                let launch_fn = if use_64 {
+                    ffi::cutlass_gemm_64x64_launch
+                } else {
+                    ffi::cutlass_gemm_128x128_launch
+                };
+                let rc = unsafe {
+                    launch_fn(
+                        out as *mut u16,
+                        act as *const u16,
+                        weight as *const u16,
+                        seq,
+                        n,
+                        k,
+                        1.0,
+                        beta,
+                        stream as u64,
+                    )
+                };
+                assert_eq!(rc, 0, "{name} failed: {rc}");
+            }
+            // Standalone fall-throughs
             "qkv_split_free" | "kv_cache_write" | "vllm_rs_rotary_embedding" | "residual_add" => {}
             other => panic!("CP5 golden interpreter has no dispatch for impl {other:?}"),
         }

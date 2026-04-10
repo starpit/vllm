@@ -709,32 +709,56 @@ mod tests {
         let library = ImplementationLibrary::l4_sm89_starter();
         let base = TargetProfile::l4_sm89();
 
-        let seq_lens: &[u32] = &[1, 4, 32, 128, 256, 512, 1024, 4096];
-
         eprintln!();
-        eprintln!("Plan family — one layer of LLaMA 1B on L4 sm_89");
+        eprintln!("LLaMA 1B on L4 sm_89 — solver-discovered plans (one layer, 2-layer model)");
         eprintln!("tag:tiles = one kernel launch, [a+b] = fused tiles");
         eprintln!(
-            "\x1b[31mcl64/cl128\x1b[0m=CUTLASS \x1b[36mcb\x1b[0m=cuBLAS \x1b[33mtk\x1b[0m=TK \x1b[35mfi\x1b[0m=FlashInfer \x1b[32mvr\x1b[0m=vllm-rs"
+            "\x1b[31mcl128\x1b[0m=CUTLASS \x1b[36mcb\x1b[0m=cuBLAS \x1b[33mtk\x1b[0m=TK \x1b[35mfi\x1b[0m=FlashInfer \x1b[32mvr\x1b[0m=vllm-rs"
         );
-        eprintln!();
-        eprintln!("{:>6} │ {:>7} │ launches", "seq", "pred_ms");
-        eprintln!("───────┼─────────┼─{}─", "─".repeat(80));
 
-        for &seq in seq_lens {
-            let profile = base.with_seq_len(seq);
+        // Workload grid: (label, batch_size, seq_len)
+        let workloads: &[(&str, u32, u32)] = &[
+            // ── Decode (seq=1, varying BS) ──
+            ("decode BS=1", 1, 1),
+            ("decode BS=4", 4, 1),
+            ("decode BS=16", 16, 1),
+            ("decode BS=32", 32, 1),
+            ("decode BS=64", 64, 1),
+            ("decode BS=128", 128, 1),
+            ("decode BS=256", 256, 1),
+            // ── Prefill (BS=1, varying seq) ──
+            ("prefill seq=64", 1, 64),
+            ("prefill seq=128", 1, 128),
+            ("prefill seq=256", 1, 256),
+            ("prefill seq=512", 1, 512),
+            ("prefill seq=1024", 1, 1024),
+            ("prefill seq=4096", 1, 4096),
+        ];
+
+        eprintln!();
+        eprintln!(
+            "{:<20} │ {:>4} │ {:>7} │ launches",
+            "workload", "M", "pred_ms"
+        );
+        eprintln!(
+            "─────────────────────┼──────┼─────────┼─{}─",
+            "─".repeat(75)
+        );
+
+        for &(label, bs, seq) in workloads {
+            let profile = base.with_workload(bs, seq);
+            let m = profile.num_tokens();
             let problem = Problem::build(&tg, &library, &profile);
             let plan = match BacktrackCpSolver.solve(&problem) {
                 SolveResult::Found(p) => p,
                 _ => {
-                    eprintln!("{seq:>6} │  INFEAS │");
+                    eprintln!("{label:<20} │ {m:>4} │  INFEAS │");
                     continue;
                 }
             };
-            // Show layer 1 (layer 0 has the extra initial residual_add).
             let compact = plan_one_layer_compact(&plan, &tg, &library, 1);
             let pred = plan.predicted_us / 1000.0;
-            eprintln!("{seq:>6} │ {pred:>7.2} │ {compact}");
+            eprintln!("{label:<20} │ {m:>4} │ {pred:>7.2} │ {compact}");
         }
         eprintln!();
     }

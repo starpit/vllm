@@ -468,6 +468,7 @@ fn pick_handoff(producer_out: &[Handoff], consumer_in: &[Handoff]) -> Option<Han
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lowering::implementation::LaunchKind;
     use crate::lowering::library::ImplementationLibrary;
     use crate::lowering::tile_graph::{TileGraph, TileKind};
     use crate::target_profile::TargetProfile;
@@ -588,5 +589,91 @@ mod tests {
             impl_counts.contains_key("tk_fused_mlp_block"),
             "expected solver to pick tk_fused_mlp_block for decode (seq=1)"
         );
+    }
+
+    /// Render a solved plan as ASCII art showing per-layer launches.
+    fn print_plan_ascii(
+        plan: &ExecutionPlan,
+        tile_graph: &TileGraph,
+        library: &ImplementationLibrary,
+        label: &str,
+    ) {
+        eprintln!();
+        eprintln!("╔══ {label} ══╗");
+        eprintln!(
+            "║  predicted: {:.2} ms   {} subgraphs   {} steps",
+            plan.predicted_us / 1000.0,
+            plan.assignment.subgraphs().count(),
+            plan.solver_steps,
+        );
+
+        // Sort by schedule step.
+        let mut scheduled: Vec<_> = plan
+            .assignment
+            .schedule
+            .iter()
+            .map(|(sg, slot)| (slot.step, *sg))
+            .collect();
+        scheduled.sort_by_key(|(step, sg)| (*step, sg.0));
+
+        let mut prev_layer: Option<u16> = None;
+        for (_step, sg) in &scheduled {
+            let imp_id = plan.assignment.impls[sg];
+            let imp = library.get(imp_id);
+            let claimed = plan.assignment.tiles_in_subgraph(*sg);
+            let layer = claimed
+                .iter()
+                .map(|t| tile_graph.nodes[t.0 as usize].layer)
+                .next()
+                .unwrap_or(0);
+            let kinds: Vec<_> = claimed
+                .iter()
+                .map(|t| tile_graph.nodes[t.0 as usize].kind)
+                .collect();
+
+            if prev_layer != Some(layer) {
+                eprintln!("║");
+                eprintln!("║  ── Layer {layer} ──");
+                prev_layer = Some(layer);
+            }
+
+            let kind_str: String = kinds
+                .iter()
+                .map(|k| format!("{k:?}"))
+                .collect::<Vec<_>>()
+                .join("+");
+            let launch_kind = match imp.launch_kind() {
+                LaunchKind::HostCallback => "launch",
+                LaunchKind::CooperativeLaunch => "coop",
+                LaunchKind::RegularLaunch => "grid",
+                LaunchKind::DeviceCallable => "device",
+            };
+            eprintln!("║    {launch_kind:<6} {:<40} [{kind_str}]", imp.name());
+        }
+        eprintln!("╚{}╝", "═".repeat(60));
+    }
+
+    #[test]
+    fn print_prefill_vs_decode_plans() {
+        let library = ImplementationLibrary::l4_sm89_starter();
+
+        // Prefill plan (seq=1024, 2 layers for readability).
+        let tg = TileGraph::build_llama_forward(2);
+        let profile = TargetProfile::l4_sm89().with_seq_len(1024);
+        let problem = Problem::build(&tg, &library, &profile);
+        let prefill = match BacktrackCpSolver.solve(&problem) {
+            SolveResult::Found(p) => p,
+            _ => panic!("infeasible"),
+        };
+        print_plan_ascii(&prefill, &tg, &library, "PREFILL (seq=1024, 2 layers)");
+
+        // Decode plan (seq=1, 2 layers).
+        let profile = TargetProfile::l4_sm89().with_seq_len(1);
+        let problem = Problem::build(&tg, &library, &profile);
+        let decode = match BacktrackCpSolver.solve(&problem) {
+            SolveResult::Found(p) => p,
+            _ => panic!("infeasible"),
+        };
+        print_plan_ascii(&decode, &tg, &library, "DECODE (seq=1, 2 layers)");
     }
 }

@@ -972,15 +972,13 @@ impl Implementation for TkFusedMlpBlockImpl {
         })
     }
     fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        // Sum of individual costs minus GMEM savings from fusion.
-        // Placeholder — calibrate via microbench.
-        l4_llama_1b_seq1024_costs::RMS_NORM_US
-            + l4_llama_1b_seq1024_costs::CUBLAS_GATE_US
-            + l4_llama_1b_seq1024_costs::CUBLAS_UP_US
-            + l4_llama_1b_seq1024_costs::SILU_AND_MUL_US
-            + l4_llama_1b_seq1024_costs::CUBLAS_DOWN_US
-            + l4_llama_1b_seq1024_costs::RESIDUAL_ADD_US
-            - 200.0
+        // Microbench result: the TK fused MLP (8-warp, 1 CTA per
+        // row-batch) is ~16 ms PER LAYER at seq=1024 — far slower
+        // than cuBLAS (~1.6 ms for the same 7 tiles). The TK kernel
+        // is designed for decode (BS=1-4), not prefill. Set cost
+        // high so the solver picks cuBLAS at seq=1024. At lower
+        // seq (decode), a seq-dependent cost model would pick TK.
+        16000.0 // ~16 ms per layer at seq=1024 on L4
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {

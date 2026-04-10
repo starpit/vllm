@@ -63,3 +63,85 @@ pub trait Solver {
     /// `Infeasible` if none exists.
     fn solve(&self, problem: &Problem) -> SolveResult;
 }
+
+/// Pre-solved execution plans across a grid of sequence lengths.
+///
+/// The runtime indexes into this table by actual `seq_len` to get
+/// the plan the solver discovered for that workload shape. Plans
+/// are solved offline so the hot path is a table lookup, not a
+/// solver invocation.
+///
+/// ```ignore
+/// let family = PlanFamily::solve_grid(
+///     &tile_graph, &library,
+///     &TargetProfile::l4_sm89(),
+///     &BacktrackCpSolver,
+/// );
+/// let plan = family.lookup(actual_seq_len);
+/// ```
+#[derive(Clone, Debug)]
+pub struct PlanFamily {
+    /// Solved plans keyed by seq_len, sorted ascending.
+    plans: Vec<(u32, ExecutionPlan)>,
+}
+
+impl PlanFamily {
+    /// Default grid of sequence lengths to solve for.
+    /// Covers decode (1), small-batch (2-32), and prefill (64-4096).
+    pub const DEFAULT_GRID: &[u32] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+    /// Solve for every seq_len in the grid. Uses the base profile's
+    /// `with_seq_len()` to vary the workload shape while keeping
+    /// hardware constants fixed.
+    pub fn solve_grid(
+        tile_graph: &crate::lowering::tile_graph::TileGraph,
+        library: &crate::lowering::library::ImplementationLibrary,
+        base_profile: &crate::target_profile::TargetProfile,
+        solver: &dyn Solver,
+        grid: &[u32],
+    ) -> Self {
+        let mut plans = Vec::with_capacity(grid.len());
+        for &seq in grid {
+            let profile = base_profile.with_seq_len(seq);
+            let problem = Problem::build(tile_graph, library, &profile);
+            match solver.solve(&problem) {
+                SolveResult::Found(plan) => plans.push((seq, plan)),
+                SolveResult::Infeasible => {
+                    // Skip infeasible seq_lens (shouldn't happen with
+                    // a well-formed library).
+                }
+            }
+        }
+        PlanFamily { plans }
+    }
+
+    /// Look up the plan for the closest seq_len <= `target`. If
+    /// `target` is smaller than the smallest solved seq_len, returns
+    /// the smallest. Returns `None` only if the family is empty.
+    pub fn lookup(&self, target_seq_len: u32) -> Option<&ExecutionPlan> {
+        if self.plans.is_empty() {
+            return None;
+        }
+        // Find the largest seq_len <= target.
+        let idx = self
+            .plans
+            .partition_point(|(seq, _)| *seq <= target_seq_len);
+        let idx = if idx == 0 { 0 } else { idx - 1 };
+        Some(&self.plans[idx].1)
+    }
+
+    /// Iterate all (seq_len, plan) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &ExecutionPlan)> {
+        self.plans.iter().map(|(s, p)| (*s, p))
+    }
+
+    /// Number of plans in the family.
+    pub fn len(&self) -> usize {
+        self.plans.len()
+    }
+
+    /// Whether the family is empty.
+    pub fn is_empty(&self) -> bool {
+        self.plans.is_empty()
+    }
+}

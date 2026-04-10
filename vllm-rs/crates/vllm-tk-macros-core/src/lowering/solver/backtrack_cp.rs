@@ -676,4 +676,62 @@ mod tests {
         };
         print_plan_ascii(&decode, &tg, &library, "DECODE (seq=1, 2 layers)");
     }
+
+    #[test]
+    fn plan_family_across_seq_lens() {
+        let tg = TileGraph::build_llama_forward(2);
+        let library = ImplementationLibrary::l4_sm89_starter();
+        let profile = TargetProfile::l4_sm89();
+
+        let family = super::super::PlanFamily::solve_grid(
+            &tg,
+            &library,
+            &profile,
+            &BacktrackCpSolver,
+            super::super::PlanFamily::DEFAULT_GRID,
+        );
+
+        eprintln!();
+        eprintln!("╔══ Plan Family (2 layers, L4 sm_89) ══════════════════════════╗");
+        eprintln!("║  seq_len │ predicted │ steps │ tk_fused_mlp │ cublas_gate   ║");
+        eprintln!("╠──────────┼───────────┼───────┼──────────────┼──────────────╣");
+        for (seq, plan) in family.iter() {
+            let mut tk_count = 0u32;
+            let mut gate_count = 0u32;
+            for sg in plan.assignment.subgraphs() {
+                let name = library.get(plan.assignment.impls[&sg]).name();
+                if name == "tk_fused_mlp_block" {
+                    tk_count += 1;
+                }
+                if name == "cublas_gemm_ex_gate" {
+                    gate_count += 1;
+                }
+            }
+            eprintln!(
+                "║  {:>6} │ {:>7.2} ms│  {:>4} │ {:>12} │ {:>12} ║",
+                seq,
+                plan.predicted_us / 1000.0,
+                plan.solver_steps,
+                tk_count,
+                gate_count,
+            );
+        }
+        eprintln!("╚══════════════════════════════════════════════════════════════╝");
+
+        assert_eq!(family.len(), super::super::PlanFamily::DEFAULT_GRID.len());
+
+        // At seq=1, solver should pick TK fused MLP.
+        let decode_plan = family.lookup(1).unwrap();
+        let has_tk = decode_plan.assignment.subgraphs().any(|sg| {
+            library.get(decode_plan.assignment.impls[&sg]).name() == "tk_fused_mlp_block"
+        });
+        assert!(has_tk, "decode plan should use tk_fused_mlp_block");
+
+        // At seq=1024, solver should NOT pick TK fused MLP.
+        let prefill_plan = family.lookup(1024).unwrap();
+        let has_tk = prefill_plan.assignment.subgraphs().any(|sg| {
+            library.get(prefill_plan.assignment.impls[&sg]).name() == "tk_fused_mlp_block"
+        });
+        assert!(!has_tk, "prefill plan should not use tk_fused_mlp_block");
+    }
 }

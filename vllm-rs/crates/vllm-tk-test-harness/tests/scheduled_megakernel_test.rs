@@ -2136,6 +2136,10 @@ fn cp5_solver_driven_natural_forward_bench() {
     // CP4 natural microbench).
     let gate_up_tmp = gpu_alloc_zeros((seq * 2 * id) as usize * 2);
 
+    // Dummy barrier for TK fused MLP (pre-allocated outside dispatch
+    // to avoid cuMemAlloc during graph capture).
+    let tk_bar_buf = gpu_alloc_zeros(4);
+
     // Sort scheduled subgraphs by (step, subgraph_id) so the
     // dispatch order matches the solver's intent.
     let mut scheduled: Vec<(u32, vllm_tk_macros_core::lowering::assignment::SubgraphId)> = plan
@@ -2316,11 +2320,91 @@ fn cp5_solver_driven_natural_forward_bench() {
                 );
                 assert_eq!(s, 0, "cp5_run_flashinfer_attention_for_layer failed: {s}");
             },
+            // ── TK fused MLP block (D-4) ──
+            "tk_fused_mlp_block" => {
+                use vllm_tk_test_harness::*;
+                // GL static dims must match the config constants:
+                // INSTRUCTION_WIDTH=32, TIMING_WIDTH=128
+                let instr_arg = TkTensorArg::raw(0, &[1, 1, 32]);
+                let timing_arg = TkTensorArg::raw(0, &[1, 1, 128]);
+                let rc = unsafe {
+                    ffi::cp5_fused_mlp_launch(
+                        BarrierArg::new(tk_bar_buf, 1, 1, 1, 1),
+                        instr_arg,
+                        timing_arg,
+                        WeightArg::new(0, 1, 1, hd as usize),
+                        NormWeightArg::new(0, 1, hd as usize),
+                        WeightArg::new(0, 1, hd as usize, hd as usize),
+                        NormWeightArg::new(
+                            b.mlp_norm_w + (layer * layer_bytes_norm) as u64,
+                            1,
+                            hd as usize,
+                        ),
+                        WeightArg::new(
+                            b.up_w + (layer * layer_bytes_gate_up) as u64,
+                            1,
+                            id as usize,
+                            hd as usize,
+                        ),
+                        WeightArg::new(
+                            b.gate_w + (layer * layer_bytes_gate_up) as u64,
+                            1,
+                            id as usize,
+                            hd as usize,
+                        ),
+                        WeightArg::new(
+                            b.down_w + (layer * layer_bytes_down) as u64,
+                            1,
+                            hd as usize,
+                            id as usize,
+                        ),
+                        NormWeightArg::new(0, 1, hd as usize),
+                        WeightArg::new(0, 1, 1, hd as usize),
+                        KvCacheArg::new(
+                            0,
+                            1,
+                            1,
+                            dims.num_kv_heads as usize,
+                            dims.head_dim as usize,
+                        ),
+                        KvCacheArg::new(
+                            0,
+                            1,
+                            1,
+                            dims.num_kv_heads as usize,
+                            dims.head_dim as usize,
+                        ),
+                        RopeArg::new(0, 1, dims.head_dim as usize),
+                        RopeArg::new(0, 1, dims.head_dim as usize),
+                        ActivationArg::new(b.hidden_states, seq as usize, hd as usize),
+                        ActivationArg::new(b.rms_rope, seq as usize, hd as usize),
+                        ActivationArg::new(b.rms_gate, seq as usize, hd as usize),
+                        ActivationArg::new(b.q_post_rope, seq as usize, q_dim as usize),
+                        ActivationArg::new(b.attn_out, seq as usize, hd as usize),
+                        ActivationArg::new(b.silu_out, seq as usize, id as usize),
+                        ActivationArg::new(0, 1, hd as usize),
+                        LogitsArg::new(0, 1, 1),
+                        IntVecArg::new(0, 1),
+                        IntVecArg::new(0, 1),
+                        IntVecArg::new(0, 1),
+                        IntVecArg::new(0, 1),
+                        IntVecArg::new(0, 1),
+                        IntVecArg::new(0, 1),
+                        IntVecArg::new(0, 1),
+                        IntVecArg::new(0, 1),
+                        IntVecArg::new(0, 1),
+                        1.0 / (dims.head_dim as f32).sqrt(),
+                        1e-5,
+                        1,
+                        seq,
+                        seq,
+                        1,
+                        stream as u64,
+                    )
+                };
+                assert_eq!(rc, 0, "cp5_fused_mlp_launch failed: {rc}");
+            }
             // ── Free / cheap passthroughs ──
-            // residual_add is a no-op
-            // when its tile was claimed by the with-residual
-            // fused cuBLAS impl above; if the solver chose the
-            // standalone variant we'd need a separate add kernel.
             "qkv_split_free" | "kv_cache_write" | "residual_add" => {}
             other => panic!("CP5-C interpreter has no dispatch for impl {other:?}"),
         }

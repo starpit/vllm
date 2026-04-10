@@ -314,8 +314,19 @@ fn recurse(state: &mut SearchState<'_>, _starting_step: u32) {
         let cost = imp.cost_us(&m, profile);
         candidates.push((ImplId(idx as u32), m, cost));
     }
-    // Cheapest first → branch-and-bound finds good solutions early.
-    candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by amortized cost per claimed tile: a 1435µs 7-tile fused
+    // claim (205µs/tile) beats a 15µs 1-tile standalone (15µs/tile)
+    // at the global level even though its raw cost is higher. This
+    // makes B&B find multi-tile claims early instead of greedily
+    // picking standalone impls that commit the remaining tiles to
+    // more expensive individual covers.
+    candidates.sort_by(|a, b| {
+        let a_per = a.2 / a.1.claimed_tiles.len() as f64;
+        let b_per = b.2 / b.1.claimed_tiles.len() as f64;
+        a_per
+            .partial_cmp(&b_per)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     for (impl_id, match_info, _cost) in candidates {
         let snap = commit_match(state, impl_id, &match_info);

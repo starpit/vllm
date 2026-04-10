@@ -158,6 +158,9 @@ fn cuda_build() {
     // 5. FlashAttention-2 paged kernels
     build_flash_attention(&cache_str, &mut rerun_files);
 
+    // 6. CUTLASS standalone GEMM launchers (128×128 + 64×64 for solver dispatch)
+    build_cutlass_standalone_gemm(&cache_str, &mut rerun_files);
+
     for f in &rerun_files {
         let path = std::path::Path::new(f);
         if let Ok(canonical) = path.canonicalize() {
@@ -296,4 +299,27 @@ fn build_flash_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("-fPIC")
         .build_lib(format!("{}/libvllm_flash_attn.a", cache_dir))
         .expect("Failed to build flash attention");
+}
+
+#[cfg(feature = "cuda")]
+fn build_cutlass_standalone_gemm(cache_dir: &str, rerun_files: &mut Vec<String>) {
+    // Same CUTLASS commit as scaled_mm — the standalone GEMM only uses
+    // the CUTLASS 2.x device::Gemm interface, compatible with any recent commit.
+    const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
+
+    let sources = vec!["../../crates/vllm-cuda/csrc/cutlass_standalone_gemm.cu".to_string()];
+    rerun_files.extend(sources.iter().cloned());
+
+    cudaforge::KernelBuilder::new()
+        .out_dir(cache_dir)
+        .source_files(sources)
+        .with_cutlass(Some(CUTLASS_COMMIT))
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("--use_fast_math")
+        .arg("--expt-relaxed-constexpr")
+        .arg("-Xcompiler")
+        .arg("-fPIC")
+        .build_lib(format!("{}/libcutlass_standalone_gemm.a", cache_dir))
+        .expect("Failed to build cutlass_standalone_gemm");
 }

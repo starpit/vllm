@@ -17,6 +17,7 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use quote::quote;
+use vllm_tk_macros_core::lowering::backend::{codegen, compile_dsl};
 use vllm_tk_macros_core::{cuda_codegen, diagram, parse, verify};
 
 /// The `megakernel!` macro: compile-time verified GPU megakernel generation.
@@ -850,4 +851,38 @@ fn to_snake_case(s: &str) -> String {
         result.push(ch.to_lowercase().next().unwrap());
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// forward! — solver-driven forward pass codegen
+// ---------------------------------------------------------------------------
+
+/// The `forward!` macro: generates a solver-driven forward function.
+///
+/// Emits `solver_forward_layer()` — a drop-in replacement for
+/// `LlamaDecoderLayer::forward()` that uses the constraint solver's
+/// optimal kernel mix for each workload bucket.
+///
+/// ```ignore
+/// // Fully specialized: solver runs at compile time, zero startup cost.
+/// forward! {
+///     model: llama_3_2_1b,
+///     target: l4_sm89,
+///     workloads: [1..4096],
+/// }
+/// ```
+///
+/// The generated function matches on `num_tokens` and dispatches to
+/// per-bucket layer implementations with solver-selected kernels
+/// (cuBLAS, CUTLASS, TK, FlashInfer).
+#[proc_macro]
+pub fn forward(input: TokenStream) -> TokenStream {
+    let input2: proc_macro2::TokenStream = input.into();
+
+    let def: compile_dsl::CompileDef = match syn::parse2(input2) {
+        Ok(d) => d,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    codegen::generate(&def).into()
 }

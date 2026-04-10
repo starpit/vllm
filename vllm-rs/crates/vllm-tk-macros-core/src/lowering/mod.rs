@@ -95,6 +95,7 @@
 //! kittens entries so the solver finds richer fusions.
 
 pub mod assignment;
+pub mod backend;
 pub mod concurrency;
 pub mod constraint;
 pub mod cost;
@@ -105,6 +106,7 @@ pub mod solver;
 pub mod tile_graph;
 
 pub use assignment::Assignment;
+pub use backend::{DispatchEntry, DispatchSequence, ImplDispatchKind};
 pub use concurrency::ConcurrencyModel;
 pub use constraint::Constraint;
 pub use cost::cost_us;
@@ -113,7 +115,7 @@ pub use implementation::{
 };
 pub use library::ImplementationLibrary;
 pub use problem::{PrecisionMode, Problem};
-pub use solver::{BacktrackCpSolver, ExecutionPlan, SolveResult, Solver};
+pub use solver::{BacktrackCpSolver, ExecutionPlan, PlanFamily, SolveResult, Solver};
 pub use tile_graph::{TileGraph, TileId, TileKind};
 
 #[cfg(test)]

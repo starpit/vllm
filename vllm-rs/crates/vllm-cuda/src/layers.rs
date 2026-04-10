@@ -486,6 +486,15 @@ impl LinearLayer {
         }
     }
 
+    /// Access the raw dense weight tensor. Panics if quantized —
+    /// CUTLASS standalone GEMM only works with dense bf16 weights.
+    pub fn dense_weight(&self) -> crate::tensor::GpuTensor {
+        match self {
+            Self::Dense(l) => l.weight,
+            _ => panic!("dense_weight() called on quantized LinearLayer"),
+        }
+    }
+
     pub fn out_features(&self) -> usize {
         match self {
             Self::Dense(l) => l.out_features(),

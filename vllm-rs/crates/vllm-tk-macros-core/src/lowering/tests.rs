@@ -6,6 +6,7 @@
 //! (which hand-built an assignment for a specific library layout),
 //! these use the solver and are resilient to library changes.
 
+use crate::lowering::backend::dispatch::{DispatchSequence, ImplDispatchKind};
 use crate::lowering::constraint::ConstraintStatus;
 use crate::lowering::cost::cost_us;
 use crate::lowering::library::ImplementationLibrary;
@@ -152,4 +153,126 @@ fn cooperative_exclusive_constraint_holds_for_all_host_callback_lowering() {
         .unwrap()
         .check(&plan.assignment, &tile_graph, &library, &profile);
     assert_eq!(status, ConstraintStatus::Satisfied);
+}
+
+// ── Backend / DispatchSequence tests ──
+
+#[test]
+fn dispatch_sequence_from_solver_plan_classifies_all_entries() {
+    let tile_graph = TileGraph::build_llama_forward(2);
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let profile = TargetProfile::l4_sm89();
+    let problem = Problem::build(&tile_graph, &library, &profile);
+
+    let plan = match BacktrackCpSolver.solve(&problem) {
+        SolveResult::Found(p) => p,
+        SolveResult::Infeasible => panic!("solver reported infeasible"),
+    };
+
+    let ds = DispatchSequence::from_plan(&plan, &library, &tile_graph);
+
+    // Every entry should have a valid classification (no panics during from_plan).
+    assert!(
+        !ds.entries.is_empty(),
+        "dispatch sequence should not be empty"
+    );
+
+    // Verify step ordering: entries are monotonically non-decreasing in step.
+    for w in ds.entries.windows(2) {
+        assert!(
+            w[0].step <= w[1].step,
+            "step ordering violated: step {} > step {}",
+            w[0].step,
+            w[1].step,
+        );
+    }
+
+    // All-host-callback on L4 (no DeviceCallable or CooperativeLaunch in the library).
+    assert!(
+        ds.is_all_host_callback(),
+        "L4 plan should be all HostCallback"
+    );
+
+    // There should be exactly 2 RmsNorm entries per layer (attn + mlp).
+    for layer in 0..2u16 {
+        let norms: Vec<_> = ds
+            .entries_for_layer(layer)
+            .filter(|e| e.kind == ImplDispatchKind::RmsNorm)
+            .collect();
+        // May be 0 if the norm is fused into a CUTLASS prologue, or 2 if standalone.
+        // But should not be 1 (that would mean one norm is missing).
+        assert_ne!(
+            norms.len(),
+            1,
+            "layer {layer}: expected 0 or 2 RmsNorm entries, got 1"
+        );
+        // When standalone, first should be attn_norm, second should be mlp_norm.
+        if norms.len() == 2 {
+            assert_eq!(norms[0].is_attn_norm, Some(true));
+            assert_eq!(norms[1].is_attn_norm, Some(false));
+        }
+    }
+}
+
+#[test]
+fn dispatch_sequence_noop_entries_are_free_passthroughs() {
+    let tile_graph = TileGraph::build_llama_forward(1);
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let profile = TargetProfile::l4_sm89();
+    let problem = Problem::build(&tile_graph, &library, &profile);
+
+    let plan = match BacktrackCpSolver.solve(&problem) {
+        SolveResult::Found(p) => p,
+        SolveResult::Infeasible => panic!("solver reported infeasible"),
+    };
+
+    let ds = DispatchSequence::from_plan(&plan, &library, &tile_graph);
+
+    // Noop entries should only be free passthroughs.
+    for entry in &ds.entries {
+        if entry.kind == ImplDispatchKind::Noop {
+            assert!(
+                entry.impl_name == "qkv_split_free"
+                    || entry.impl_name == "kv_cache_write"
+                    || entry.impl_name == "residual_add",
+                "unexpected noop impl: {}",
+                entry.impl_name,
+            );
+        }
+    }
+
+    // num_launches should not count noops.
+    let non_noop = ds
+        .entries
+        .iter()
+        .filter(|e| e.kind != ImplDispatchKind::Noop)
+        .count();
+    assert_eq!(ds.num_launches(), non_noop);
+}
+
+#[test]
+fn dispatch_sequence_plan_family_format() {
+    use crate::lowering::backend::dispatch::format_plan_family;
+    use crate::lowering::solver::PlanFamily;
+
+    let tile_graph = TileGraph::build_llama_forward(1);
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let profile = TargetProfile::l4_sm89();
+
+    let family = PlanFamily::solve_grid(
+        &tile_graph,
+        &library,
+        &profile,
+        &BacktrackCpSolver,
+        &[1, 32, 128, 1024],
+    );
+
+    let formatted = format_plan_family(&family, &library, &tile_graph);
+    eprintln!("{formatted}");
+
+    // Should have one section per seq_len.
+    assert!(formatted.contains("seq=1"));
+    assert!(formatted.contains("seq=32"));
+    assert!(formatted.contains("seq=128"));
+    assert!(formatted.contains("seq=1024"));
 }

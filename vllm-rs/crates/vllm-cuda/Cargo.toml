@@ -28,6 +28,7 @@ thiserror = { workspace = true }
 vllm-common = { path = "../vllm-common" }
 vllm-config = { path = "../vllm-config" }
 vllm-model = { path = "../vllm-model" }
+vllm-tk-macros = { path = "../vllm-tk-macros" }
 libc = { workspace = true }
 hf-hub = { version = "0.4", optional = true }
 

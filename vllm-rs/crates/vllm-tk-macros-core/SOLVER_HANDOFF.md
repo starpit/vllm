@@ -19,6 +19,11 @@ predicted wall-clock time subject to hardware and correctness constraints.
 | `lowering/problem.rs` | Problem + PrecisionMode |
 | `lowering/implementation.rs` | Implementation trait + Handoff + Layout |
 | `target_profile.rs` | TargetProfile with seq_len + batch_size |
+| `lowering/backend/dispatch.rs` | DispatchSequence: plan → step-ordered typed entries |
+| `lowering/backend/compile_dsl.rs` | `compile!` DSL parser (binding modes) |
+| `lowering/backend/codegen.rs` | TokenStream codegen (fully specialized / GPU / dynamic) |
+| `vllm-tk-macros/src/lib.rs` | `compile!` proc macro entry point |
+| `vllm-cuda/src/model/solver_dispatch.rs` | FFI shim + `compile!` invocation site |
 | `tests/scheduled_megakernel_test.rs` | Golden tests + bench + microbench sweeps |
 | `csrc/cutlass_standalone_gemm.cu` | Standalone CUTLASS 128×128 + 64×64 launcher |
 
@@ -78,8 +83,10 @@ M=256+:   cuBLAS/CUTLASS individual GEMMs                10 launches/layer
 
 ## What's next (priority order)
 
-1. **Runtime integration** — PlanFamily drives vllm-rs forward pass
-   (currently plans are test-only; the runtime uses hardcoded eager dispatch)
+1. **FFI wiring** — connect `solver_dispatch_ffi` stubs in
+   `vllm-cuda/src/model/solver_dispatch.rs` to real CUDA kernel
+   launchers (cuBLAS handle, CUTLASS launchers, vllm-kernels FFI,
+   FlashInfer, TK). Then test: solver dispatch matches eager forward.
 2. **Model generalization** — TileGraph for Mistral, Qwen, etc.
 3. **Multi-GPU calibration** — GpuCostTable for A100, H100
 4. **CUTLASS norm+GEMM prologue kernel** — impl exists in solver but
@@ -245,6 +252,59 @@ Our approach: the solver discovers fusion from the constraint system.
 Adding a new kernel is one Implementation struct. The constraints
 validate it automatically. Plans are inspectable (`tag:l([a+b])`
 visualization). Per-GPU calibrated via microbench sweep.
+
+## forward! macro — runtime integration (CP5-C)
+
+The `forward!` proc macro generates `solver_forward_layer()` — a
+drop-in replacement for `LlamaDecoderLayer::forward()` that uses
+the constraint solver's optimal kernel mix per workload bucket.
+
+```rust
+// In vllm-cuda/src/model/solver_dispatch.rs:
+vllm_tk_macros::forward! {
+    model: llama_3_2_1b,
+    target: l4_sm89,
+    workloads: [1..4096],
+}
+```
+
+### What it emits
+
+The macro runs the solver at compile time and emits:
+- `solver_forward_layer(layer, num_tokens, ...)` — matches on
+  `num_tokens` and dispatches to per-bucket functions.
+- `solver_layer_bucket_N(layer, ...)` — one per workload bucket,
+  each a complete layer body using solver-selected kernels.
+
+The generated code uses the same types as the existing forward
+pass: `OwnedTensor`, `GpuTensor`, `CublasHandle`, `kernels::*`.
+No FFI shim, no raw pointer ctx struct.
+
+### Integration
+
+`LlamaModel` has a `use_solver_dispatch: bool` field. When true,
+`forward()` calls `solver_forward_layer()` instead of
+`layer.forward()`. Currently defaults to false.
+
+### What works now
+
+- Solver runs at proc-macro time (fully specialized path)
+- Per-bucket layer bodies are generated with correct types
+- cuBLAS GEMM dispatch (via `LinearLayer::forward()`)
+- Norm, attention, MLP delegate to existing kernels
+
+### What needs wiring
+
+- CUTLASS standalone launchers (codegen falls back to cuBLAS)
+- TK fused MLP launch (codegen falls back to eager MLP)
+- GPU-specialized / fully dynamic paths (emit empty placeholders)
+- TileGraph from DSL instead of hardcoded `build_llama_forward()`
+
+### Tests (22 passing)
+
+```bash
+cargo test -p vllm-tk-macros-core -- lowering
+```
 
 ## Known issues
 

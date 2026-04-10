@@ -7631,6 +7631,7 @@ dependencies = [
  "vllm-config",
  "vllm-kernels-cuda",
  "vllm-model",
+ "vllm-tk-macros",
 ]
 
 [[package]]

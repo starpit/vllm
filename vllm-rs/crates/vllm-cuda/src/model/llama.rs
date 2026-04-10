@@ -990,6 +990,9 @@ pub struct LlamaModel {
     pub rotary: RotaryCache,
     /// Granite embedding multiplier (1.0 = no-op for LLaMA).
     pub embedding_multiplier: f32,
+    /// When true, use the solver-generated `solver_forward_layer()`
+    /// instead of the eager per-layer dispatch.
+    pub use_solver_dispatch: bool,
 }
 
 impl LlamaModel {
@@ -1036,22 +1039,42 @@ impl LlamaModel {
         // its memory returns to the caching allocator's free list.
         let mut hidden_states: OwnedTensor = hidden_states;
         let mut residual: Option<OwnedTensor> = None;
+        let num_tokens = hidden_states.as_gpu_tensor().dim(0) as u32;
 
         for layer in self.layers.iter() {
-            let (hs, res) = layer.forward(
-                hidden_states,
-                residual,
-                positions,
-                slot_mapping,
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                kv_cache,
-                &self.rotary,
-                device,
-            );
+            let (hs, res) = if self.use_solver_dispatch {
+                super::solver_dispatch::solver_forward_layer(
+                    layer,
+                    num_tokens,
+                    hidden_states,
+                    residual,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    &self.rotary,
+                    device,
+                )
+            } else {
+                layer.forward(
+                    hidden_states,
+                    residual,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    &self.rotary,
+                    device,
+                )
+            };
             // Old hidden_states was consumed by the layer (dropped inside).
             // Old residual was passed through (or created from hidden_states).
             hidden_states = hs;
@@ -2358,6 +2381,7 @@ impl LlamaForCausalLM {
             norm,
             rotary,
             embedding_multiplier: 1.0,
+            use_solver_dispatch: false,
         };
 
         // lm_head is always dense (not quantized)
@@ -2425,6 +2449,7 @@ impl LlamaForCausalLM {
             norm,
             rotary,
             embedding_multiplier: 1.0,
+            use_solver_dispatch: false,
         };
 
         // lm_head is always dense (not quantized) — matches Python.
@@ -2492,6 +2517,7 @@ impl LlamaForCausalLM {
             norm,
             rotary,
             embedding_multiplier: 1.0,
+            use_solver_dispatch: false,
         };
 
         // lm_head is always dense (not quantized) — matches Python.
@@ -2560,6 +2586,7 @@ impl LlamaForCausalLM {
             norm,
             rotary,
             embedding_multiplier: 1.0,
+            use_solver_dispatch: false,
         };
 
         let lm_head = if config.tie_word_embeddings {
@@ -2629,6 +2656,7 @@ impl LlamaForCausalLM {
             norm,
             rotary,
             embedding_multiplier: 1.0,
+            use_solver_dispatch: false,
         };
 
         let lm_head = if config.tie_word_embeddings {
@@ -3185,6 +3213,7 @@ impl LlamaForCausalLM {
             norm,
             rotary,
             embedding_multiplier: 1.0,
+            use_solver_dispatch: false,
         };
 
         // lm_head: check if GGUF has output.weight (→ lm_head.weight), else tie embeddings.
@@ -3286,6 +3315,7 @@ impl LlamaForCausalLM {
             norm,
             rotary,
             embedding_multiplier: 1.0,
+            use_solver_dispatch: false,
         };
 
         let lm_head = LinearLayer::Dense(if config.tie_word_embeddings {

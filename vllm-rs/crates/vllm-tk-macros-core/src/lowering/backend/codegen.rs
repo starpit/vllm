@@ -183,6 +183,30 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
 
         ImplDispatchKind::CublasGemm => {
             let phase = entry.gemm_phase.unwrap();
+            if phase == GemmPhase::Up {
+                // For dense models, Gate already produced [M, 2*intermediate]
+                // via the fused gate_up_proj. Up is only needed for quantized
+                // (separate up_proj). Guard the entire GEMM at runtime.
+                return Some(quote! {
+                    if let Some(ref up_proj) = layer.mlp.up_proj {
+                        let __out = up_proj.forward(
+                            normed.as_ref().unwrap().view(),
+                            &mut device.cublas,
+                            &mut device.caching,
+                            device.compute_stream,
+                        );
+                        let __gu = gate_up.take().unwrap();
+                        let __concat = kernels::concat_dim1(
+                            *__gu, *__out,
+                            &mut device.caching,
+                            device.compute_stream,
+                        );
+                        drop(__gu);
+                        drop(__out);
+                        gate_up = Some(__concat);
+                    }
+                });
+            }
             let (input, weight, store) = gemm_operands(phase, entry.fused_residual);
             Some(quote! {{
                 let __out = (#weight).forward(
@@ -197,6 +221,29 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
 
         ImplDispatchKind::CutlassGemm { tile_m, tile_n } => {
             let phase = entry.gemm_phase.unwrap();
+            if phase == GemmPhase::Up {
+                // Same as cuBLAS Up: skip for dense, only run for quantized.
+                // CUTLASS doesn't apply to quantized, so this is a noop.
+                return Some(quote! {
+                    if let Some(ref up_proj) = layer.mlp.up_proj {
+                        let __out = up_proj.forward(
+                            normed.as_ref().unwrap().view(),
+                            &mut device.cublas,
+                            &mut device.caching,
+                            device.compute_stream,
+                        );
+                        let __gu = gate_up.take().unwrap();
+                        let __concat = kernels::concat_dim1(
+                            *__gu, *__out,
+                            &mut device.caching,
+                            device.compute_stream,
+                        );
+                        drop(__gu);
+                        drop(__out);
+                        gate_up = Some(__concat);
+                    }
+                });
+            }
             let (_, weight, store) = gemm_operands(phase, entry.fused_residual);
             let cutlass_input = cutlass_input_expr(phase);
             let launch_fn = if tile_m == 64 && tile_n == 64 {
@@ -347,7 +394,13 @@ fn gemm_operands(
             quote! { drop(normed.take()); qkv_out = Some(__out); },
         ),
         GemmPhase::OProj => (
-            quote! { attn_out.as_ref().unwrap().view() },
+            // Reshape attention output from [num_tokens, num_heads, head_dim]
+            // to [num_tokens, q_size] for the o_proj GEMM.
+            quote! {{
+                let __ao = attn_out.as_ref().unwrap();
+                let __nt = __ao.dim(0);
+                __ao.view().reshape(&[__nt, layer.self_attn.q_size])
+            }},
             quote! { layer.self_attn.o_proj },
             quote! { drop(attn_out.take()); hidden_states = __out; },
         ),
@@ -358,10 +411,12 @@ fn gemm_operands(
         ),
         GemmPhase::Up => (
             quote! { normed.as_ref().unwrap().view() },
+            // For quantized: use the separate up_proj weight.
+            // For dense: gate_up_proj is fused, Gate already produced the full output.
             quote! { layer.mlp.gate_up_proj },
             quote! {
                 // Up GEMM — only meaningful for quantized (separate up_proj).
-                // For dense, Gate already produced the full output.
+                // For dense, Gate already produced [M, 2*intermediate].
                 if layer.mlp.up_proj.is_some() {
                     let __gu = gate_up.take().unwrap();
                     let __concat = kernels::concat_dim1(

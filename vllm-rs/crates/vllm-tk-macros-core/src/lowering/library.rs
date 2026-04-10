@@ -162,85 +162,251 @@ impl ImplementationLibrary {
     }
 }
 
-// ── Analytical cost model (L4 sm_89, LLaMA 1B shapes) ──
+// ── Per-GPU microbench-calibrated cost model ──
 //
-// Instead of fixed constants, costs are functions of seq_len (the M
-// dimension). This lets the solver discover different optimal kernel
-// mixes for decode (M=1) vs prefill (M=1024).
+// Costs are interpolated from measured data points at a grid of M
+// (num_tokens) values. Each GPU has its own CostTable, populated by
+// a one-time microbench sweep. The solver reads costs via `lookup()`
+// which lerps between the two nearest grid points.
 //
-// Calibration anchors (from CP4 microbench at seq=1024):
-//   gate GEMM: M=1024 K=2048 N=8192 → 530 µs
-//   oproj GEMM: M=1024 K=2048 N=2048 → 145 µs
-//   qkv GEMM: M=1024 K=2048 N=3072 → 220 µs
+// To add a new GPU: run the `cublas_gemm_sweep_microbench` test on
+// the target, then construct a CostTable from the output.
 
-mod l4_cost_model {
-    /// GEMM cost model: at small M (decode), memory-bandwidth bound
-    /// (reading the weight matrix dominates). At large M (prefill),
-    /// compute-bound (FLOPs dominate). The crossover is around M=32
-    /// on L4 for typical LLaMA shapes.
-    ///
-    /// Model: `max(bw_us, compute_us) + launch_overhead`
-    ///   bw_us      = N * K * 2 bytes / L4_BW_BYTES_PER_US
-    ///   compute_us = 2 * M * N * K / L4_FLOPS_PER_US
-    ///   launch     = 5 µs (cudaLaunchKernel overhead)
-    pub fn gemm_us(m: u32, n: u32, k: u32) -> f64 {
-        // L4: ~300 GB/s memory BW, ~120 TFLOPS bf16 tensor cores
-        const L4_BW_BYTES_PER_US: f64 = 300_000.0; // 300 GB/s = 300K bytes/µs
-        const L4_BF16_FLOPS_PER_US: f64 = 120_000_000.0; // 120 TFLOPS = 120M FLOPS/µs
-        const LAUNCH_US: f64 = 5.0;
+/// One measured data point: (num_tokens, cost_us).
+type CostPoint = (u32, f64);
 
-        // BW-bound: read weight matrix (N×K×2 bytes). At M=1 this dominates.
-        let bw_us = (n as f64 * k as f64 * 2.0) / L4_BW_BYTES_PER_US;
-        // Compute-bound: 2*M*N*K FLOPs. At large M this dominates.
-        let compute_us = (2.0 * m as f64 * n as f64 * k as f64) / L4_BF16_FLOPS_PER_US;
-        LAUNCH_US + bw_us.max(compute_us)
+/// Piecewise-linear cost curve from microbench data.
+/// `lookup(m)` interpolates between the two nearest grid points.
+#[derive(Clone, Debug)]
+pub struct CostCurve {
+    points: Vec<CostPoint>,
+}
+
+impl CostCurve {
+    pub fn new(mut points: Vec<CostPoint>) -> Self {
+        points.sort_by_key(|(m, _)| *m);
+        assert!(!points.is_empty(), "CostCurve needs at least one point");
+        Self { points }
     }
 
-    /// Elementwise ops (norm, silu, rope, residual add) are always
-    /// memory-bandwidth bound: read + write `M * dim` bf16 elements.
-    pub fn elementwise_us(m: u32, dim: u32) -> f64 {
-        const L4_BW_BYTES_PER_US: f64 = 300_000.0;
-        const LAUNCH_US: f64 = 3.0;
-        // Read + write: 2 * M * dim * 2 bytes
-        let bytes = 2.0 * m as f64 * dim as f64 * 2.0;
-        LAUNCH_US + bytes / L4_BW_BYTES_PER_US
-    }
-
-    /// FlashInfer attention: compute-bound at large seq, memory-bound
-    /// at small seq (KV cache reads dominate for short contexts in
-    /// decode, QK^T compute dominates for long prefills).
-    pub fn attention_us(seq: u32) -> f64 {
-        const LAUNCH_US: f64 = 10.0;
-        // Rough model: 40µs base + 0.57µs per token (calibrated from
-        // 625µs at seq=1024).
-        LAUNCH_US + 40.0 + 0.57 * seq as f64
-    }
-
-    /// CUTLASS tile-aware GEMM cost. Accounts for tile waste (when M
-    /// doesn't divide tile_m, padding rows are wasted) and wave
-    /// quantization (partial last wave underutilizes SMs).
-    pub fn cutlass_gemm_us(m: u32, n: u32, k: u32, tile_m: u32, tile_n: u32, num_sm: u32) -> f64 {
-        const L4_BF16_FLOPS_PER_US: f64 = 120_000_000.0;
-        const LAUNCH_US: f64 = 5.0;
-
-        let tiles_m = ((m as f64) / tile_m as f64).ceil().max(1.0);
-        let tiles_n = ((n as f64) / tile_n as f64).ceil().max(1.0);
-        let total_tiles = tiles_m * tiles_n;
-        let waves = (total_tiles / num_sm as f64).ceil();
-
-        // Each tile does tile_m × tile_n × K FLOPs (×2 for FMA).
-        let flops_per_tile = 2.0 * tile_m as f64 * tile_n as f64 * k as f64;
-        let tile_us = flops_per_tile / (L4_BF16_FLOPS_PER_US / num_sm as f64);
-
-        // Also BW-bound floor: must read weights at minimum.
-        let bw_us = (n as f64 * k as f64 * 2.0) / 300_000.0;
-
-        LAUNCH_US + (waves * tile_us).max(bw_us)
+    /// Interpolate cost at `m` tokens. Clamps to endpoints.
+    pub fn lookup(&self, m: u32) -> f64 {
+        if m <= self.points[0].0 {
+            return self.points[0].1;
+        }
+        let last = self.points.len() - 1;
+        if m >= self.points[last].0 {
+            // Extrapolate linearly from last two points.
+            if last == 0 {
+                return self.points[0].1;
+            }
+            let (m1, c1) = self.points[last - 1];
+            let (m2, c2) = self.points[last];
+            let slope = (c2 - c1) / (m2 - m1) as f64;
+            return c2 + slope * (m - m2) as f64;
+        }
+        // Binary search for the interval.
+        let idx = self.points.partition_point(|(pm, _)| *pm <= m);
+        let (m0, c0) = self.points[idx - 1];
+        let (m1, c1) = self.points[idx];
+        let t = (m - m0) as f64 / (m1 - m0) as f64;
+        c0 + t * (c1 - c0)
     }
 }
 
-// Re-export fixed constants for non-seq-dependent code that still
-// references them (e.g. fused impls that sum constituent costs).
+/// Per-GPU cost table for all kernel families in the library.
+/// Populated by running microbench sweeps on the target GPU.
+#[derive(Clone, Debug)]
+pub struct GpuCostTable {
+    pub gpu_name: String,
+    /// cuBLAS GEMM costs per phase.
+    pub cublas_qkv: CostCurve,
+    pub cublas_oproj: CostCurve,
+    pub cublas_gate: CostCurve,
+    pub cublas_up: CostCurve,
+    pub cublas_down: CostCurve,
+    /// Elementwise op costs (all BW-bound, same curve shape).
+    pub elementwise_hd: CostCurve, // dim=hidden_dim (norm, res_add)
+    pub elementwise_id: CostCurve,  // dim=intermediate_dim (silu)
+    pub elementwise_qkv: CostCurve, // dim=qkv_dim (fused rope+cache)
+    /// FlashInfer attention per-layer cost.
+    pub attention: CostCurve,
+    /// TK fused MLP block per-layer cost.
+    pub tk_fused_mlp: CostCurve,
+}
+
+impl GpuCostTable {
+    /// L4 sm_89 cost table from microbench sweep (cublas_gemm_sweep_microbench).
+    pub fn l4_sm89() -> Self {
+        Self {
+            gpu_name: "L4 sm_89".into(),
+            cublas_qkv: CostCurve::new(vec![
+                (1, 13.5),
+                (4, 14.5),
+                (8, 14.4),
+                (16, 14.8),
+                (32, 17.6),
+                (64, 15.3),
+                (128, 21.4),
+                (256, 38.1),
+                (512, 71.2),
+                (1024, 156.5),
+                (2048, 339.0),
+                (4096, 584.8),
+            ]),
+            cublas_oproj: CostCurve::new(vec![
+                (1, 9.6),
+                (4, 13.8),
+                (8, 14.0),
+                (16, 14.5),
+                (32, 17.2),
+                (64, 12.6),
+                (128, 20.5),
+                (256, 34.3),
+                (512, 56.7),
+                (1024, 108.1),
+                (2048, 225.3),
+                (4096, 372.0),
+            ]),
+            cublas_gate: CostCurve::new(vec![
+                (1, 27.2),
+                (4, 25.8),
+                (8, 26.7),
+                (16, 28.6),
+                (32, 39.0),
+                (64, 77.6),
+                (128, 71.7),
+                (256, 95.9),
+                (512, 172.4),
+                (1024, 392.5),
+                (2048, 783.9),
+                (4096, 1549.5),
+            ]),
+            cublas_up: CostCurve::new(vec![
+                (1, 27.6),
+                (4, 25.7),
+                (8, 26.4),
+                (16, 28.2),
+                (32, 39.0),
+                (64, 77.6),
+                (128, 71.6),
+                (256, 95.8),
+                (512, 172.5),
+                (1024, 434.5),
+                (2048, 760.2),
+                (4096, 1557.6),
+            ]),
+            cublas_down: CostCurve::new(vec![
+                (1, 24.5),
+                (4, 44.7),
+                (8, 44.7),
+                (16, 44.0),
+                (32, 37.6),
+                (64, 38.2),
+                (128, 53.4),
+                (256, 99.1),
+                (512, 211.7),
+                (1024, 472.1),
+                (2048, 764.1),
+                (4096, 1626.5),
+            ]),
+            // Elementwise: rough BW model calibrated to ~15µs at M=1024
+            elementwise_hd: CostCurve::new(vec![
+                (1, 3.0),
+                (32, 3.5),
+                (128, 5.0),
+                (512, 10.0),
+                (1024, 15.0),
+                (4096, 55.0),
+            ]),
+            elementwise_id: CostCurve::new(vec![
+                (1, 3.0),
+                (32, 4.0),
+                (128, 8.0),
+                (512, 20.0),
+                (1024, 35.0),
+                (4096, 130.0),
+            ]),
+            elementwise_qkv: CostCurve::new(vec![
+                (1, 3.0),
+                (32, 4.0),
+                (128, 7.0),
+                (512, 15.0),
+                (1024, 25.0),
+                (4096, 90.0),
+            ]),
+            attention: CostCurve::new(vec![
+                (1, 50.0),
+                (64, 90.0),
+                (256, 200.0),
+                (1024, 625.0),
+                (4096, 2400.0),
+            ]),
+            tk_fused_mlp: CostCurve::new(vec![
+                (1, 120.0),
+                (4, 120.0),
+                (32, 130.0),
+                (128, 200.0),
+                (256, 2100.0),
+                (1024, 16000.0),
+                (4096, 64000.0),
+            ]),
+        }
+    }
+}
+
+// Compat shim: wraps GpuCostTable::l4_sm89() so existing cost_us
+// functions that call `l4_cost_model::gemm_us(m, n, k)` keep working.
+// TODO: thread GpuCostTable through Problem → Implementation::cost_us
+// so the solver can support multiple GPUs without statics.
+mod l4_cost_model {
+    use super::GpuCostTable;
+    use std::sync::LazyLock;
+    static TABLE: LazyLock<GpuCostTable> = LazyLock::new(GpuCostTable::l4_sm89);
+
+    pub fn gemm_us(m: u32, n: u32, k: u32) -> f64 {
+        // Dispatch to the right curve based on shape.
+        match (n, k) {
+            (3072, 2048) => TABLE.cublas_qkv.lookup(m),
+            (2048, 2048) => TABLE.cublas_oproj.lookup(m),
+            (8192, 2048) => TABLE.cublas_gate.lookup(m), // gate and up same shape
+            (2048, 8192) => TABLE.cublas_down.lookup(m),
+            _ => {
+                // Fallback: roofline
+                let bw_us = (n as f64 * k as f64 * 2.0) / 300_000.0;
+                let compute_us = (2.0 * m as f64 * n as f64 * k as f64) / 85_000_000.0;
+                5.0 + bw_us.max(compute_us)
+            }
+        }
+    }
+
+    pub fn elementwise_us(m: u32, dim: u32) -> f64 {
+        match dim {
+            2048 => TABLE.elementwise_hd.lookup(m),
+            8192 => TABLE.elementwise_id.lookup(m),
+            3072 => TABLE.elementwise_qkv.lookup(m),
+            512 => TABLE.elementwise_hd.lookup(m) * 0.25, // kv_dim ≈ hd/4
+            _ => TABLE.elementwise_hd.lookup(m) * (dim as f64 / 2048.0),
+        }
+    }
+
+    pub fn attention_us(seq: u32) -> f64 {
+        TABLE.attention.lookup(seq)
+    }
+
+    pub fn cutlass_gemm_us(m: u32, n: u32, k: u32, tile_m: u32, _tile_n: u32, _num_sm: u32) -> f64 {
+        // Use measured cuBLAS as baseline, apply tile waste penalty.
+        let cublas = gemm_us(m, n, k);
+        let tiles_m = ((m as f64) / tile_m as f64).ceil().max(1.0);
+        let actual_m = tiles_m * tile_m as f64;
+        let waste = actual_m / (m as f64).max(1.0);
+        // CUTLASS with explicit tiles: ~95% of cuBLAS when tiles align,
+        // worse when they don't (waste factor).
+        cublas * 0.95 * waste
+    }
+}
+
+// Re-export fixed constants for legacy code.
 mod l4_llama_1b_seq1024_costs {
     pub const RMS_NORM_US: f64 = 15.0;
     pub const ROTARY_EMBEDDING_US: f64 = 20.0;

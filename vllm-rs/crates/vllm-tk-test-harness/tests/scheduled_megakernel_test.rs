@@ -2891,3 +2891,99 @@ fn cp5_solver_driven_matches_committed_golden() {
         sys::cuStreamDestroy_v2(stream);
     }
 }
+
+// ── cuBLAS GEMM microbench sweep across M values ──
+//
+// Measures wall-clock for each GEMM phase at a grid of M (seq_len)
+// values. Output is a table the cost model can be fitted against.
+
+#[test]
+#[ignore = "needs GPU"]
+fn cublas_gemm_sweep_microbench() {
+    use cudarc::driver::sys;
+
+    init_cuda();
+
+    let mut handle: ffi::CublasHandle = std::ptr::null_mut();
+    unsafe {
+        let s = ffi::cublasCreate_v2(&mut handle);
+        assert_eq!(s, 0);
+        let s = ffi::cublasSetStream_v2(handle, std::ptr::null_mut());
+        assert_eq!(s, 0);
+    }
+
+    // LLaMA 1B shapes: (name, N, K)
+    let phases: &[(&str, i32, i32)] = &[
+        ("qkv", 3072, 2048),
+        ("oproj", 2048, 2048),
+        ("gate", 8192, 2048),
+        ("up", 8192, 2048),
+        ("down", 2048, 8192),
+    ];
+    let m_values: &[i32] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+    eprintln!();
+    eprintln!("cuBLAS GEMM microbench sweep — LLaMA 1B shapes on L4");
+    eprintln!("{:>6} │ {:>10} {:>10} {:>10} {:>10} {:>10}", "M", "qkv_us", "oproj_us", "gate_us", "up_us", "down_us");
+    eprintln!("───────┼─{}", "─".repeat(55));
+
+    let one: f32 = 1.0;
+    let zero: f32 = 0.0;
+
+    for &m in m_values {
+        let mut times = Vec::new();
+        for &(_, n, k) in phases {
+            // Allocate
+            let a = gpu_alloc_zeros((m * k) as usize * 2);
+            let b = gpu_alloc_zeros((n * k) as usize * 2);
+            let c = gpu_alloc_zeros((m * n) as usize * 2);
+
+            let gemm = |stream: sys::CUstream| unsafe {
+                ffi::cublasGemmEx(
+                    handle,
+                    ffi::CUBLAS_OP_T, ffi::CUBLAS_OP_N,
+                    n, m, k,
+                    &one as *const f32,
+                    b as *const _, ffi::CUDA_R_16BF, k,
+                    a as *const _, ffi::CUDA_R_16BF, k,
+                    &zero as *const f32,
+                    c as *mut _, ffi::CUDA_R_16BF, n,
+                    ffi::CUBLAS_COMPUTE_32F, ffi::CUBLAS_GEMM_DEFAULT,
+                );
+            };
+
+            // Warmup
+            for _ in 0..10 {
+                gemm(std::ptr::null_mut());
+            }
+            unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+
+            // Timed
+            const ITERS: u32 = 50;
+            let elapsed_ms = unsafe {
+                let mut start: sys::CUevent = std::ptr::null_mut();
+                let mut stop: sys::CUevent = std::ptr::null_mut();
+                sys::cuEventCreate(&mut start, 0);
+                sys::cuEventCreate(&mut stop, 0);
+                sys::cuEventRecord(start, std::ptr::null_mut());
+                for _ in 0..ITERS {
+                    gemm(std::ptr::null_mut());
+                }
+                sys::cuEventRecord(stop, std::ptr::null_mut());
+                sys::cuEventSynchronize(stop);
+                let mut ms: f32 = 0.0;
+                sys::cuEventElapsedTime(&mut ms, start, stop);
+                sys::cuEventDestroy_v2(start);
+                sys::cuEventDestroy_v2(stop);
+                ms / ITERS as f32
+            };
+            times.push(elapsed_ms * 1000.0); // convert to µs
+        }
+        eprintln!(
+            "{m:>6} │ {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1}",
+            times[0], times[1], times[2], times[3], times[4]
+        );
+    }
+
+    unsafe { ffi::cublasDestroy_v2(handle) };
+}

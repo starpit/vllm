@@ -56,7 +56,14 @@ unsafe extern "C" {
 // - solver_forward_layer() function
 // - solver_layer_bucket_N() functions (one per workload bucket)
 vllm_tk_macros::forward! {
-    model: llama_3_2_3b,
+    model: {
+        layers: 28,
+        hidden: 3072,
+        intermediate: 8192,
+        heads: 24,
+        kv_heads: 8,
+        head_dim: 128,
+    },
     target: l4_sm89,
     workloads: [1..4096],
 }

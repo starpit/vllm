@@ -7,7 +7,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use super::compile_dsl::{CompileDef, ModelId, TargetId, WorkloadRange};
+use super::compile_dsl::{CompileDef, ModelSpec, TargetId, WorkloadRange};
 use super::dispatch::{DispatchEntry, DispatchSequence, GemmPhase, ImplDispatchKind};
 use crate::lowering::BacktrackCpSolver;
 use crate::lowering::library::ImplementationLibrary;
@@ -515,7 +515,7 @@ fn gemm_operands(
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-fn build_tile_graph(model: &ModelId) -> TileGraph {
+fn build_tile_graph(model: &ModelSpec) -> TileGraph {
     TileGraph::build_llama_forward(model.num_layers(), model.dims())
 }
 

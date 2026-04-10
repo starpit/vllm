@@ -124,10 +124,40 @@ pub struct WorkloadRange {
     pub max_tokens: u32,
 }
 
-/// Parsed `compile!` DSL.
+/// Inline model specification — dims spelled out in the DSL.
+#[derive(Clone, Debug)]
+pub struct InlineModel {
+    pub num_layers: u16,
+    pub dims: crate::lowering::tile_graph::ModelDims,
+}
+
+/// Model specification: either a known model ID or inline dims.
+#[derive(Clone, Debug)]
+pub enum ModelSpec {
+    Named(ModelId),
+    Inline(InlineModel),
+}
+
+impl ModelSpec {
+    pub fn num_layers(&self) -> u16 {
+        match self {
+            ModelSpec::Named(id) => id.num_layers(),
+            ModelSpec::Inline(m) => m.num_layers,
+        }
+    }
+
+    pub fn dims(&self) -> crate::lowering::tile_graph::ModelDims {
+        match self {
+            ModelSpec::Named(id) => id.dims(),
+            ModelSpec::Inline(m) => m.dims,
+        }
+    }
+}
+
+/// Parsed `forward!` DSL.
 #[derive(Clone, Debug)]
 pub struct CompileDef {
-    pub model: Binding<ModelId>,
+    pub model: Binding<ModelSpec>,
     pub target: Binding<TargetId>,
     pub workloads: Binding<WorkloadRange>,
 }
@@ -147,6 +177,56 @@ impl CompileDef {
     pub fn is_fully_dynamic(&self) -> bool {
         self.model.is_runtime() && self.target.is_runtime()
     }
+}
+
+fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
+    use crate::lowering::tile_graph::ModelDims;
+
+    let mut layers: Option<u16> = None;
+    let mut hidden: Option<u32> = None;
+    let mut intermediate: Option<u32> = None;
+    let mut heads: Option<u32> = None;
+    let mut kv_heads: Option<u32> = None;
+    let mut head_dim: Option<u32> = None;
+
+    while !input.is_empty() {
+        let key: Ident = input.parse()?;
+        input.parse::<Token![:]>()?;
+        let val: LitInt = input.parse()?;
+        let _ = input.parse::<Token![,]>();
+
+        match key.to_string().as_str() {
+            "layers" => layers = Some(val.base10_parse()?),
+            "hidden" => hidden = Some(val.base10_parse()?),
+            "intermediate" => intermediate = Some(val.base10_parse()?),
+            "heads" => heads = Some(val.base10_parse()?),
+            "kv_heads" => kv_heads = Some(val.base10_parse()?),
+            "head_dim" => head_dim = Some(val.base10_parse()?),
+            other => {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!(
+                        "unknown model field `{other}`. expected: layers, hidden, intermediate, heads, kv_heads, head_dim"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(InlineModel {
+        num_layers: layers.ok_or_else(|| syn::Error::new(input.span(), "missing `layers`"))?,
+        dims: ModelDims {
+            hidden_size: hidden.ok_or_else(|| syn::Error::new(input.span(), "missing `hidden`"))?,
+            intermediate_size: intermediate
+                .ok_or_else(|| syn::Error::new(input.span(), "missing `intermediate`"))?,
+            num_attention_heads: heads
+                .ok_or_else(|| syn::Error::new(input.span(), "missing `heads`"))?,
+            num_kv_heads: kv_heads
+                .ok_or_else(|| syn::Error::new(input.span(), "missing `kv_heads`"))?,
+            head_dim: head_dim
+                .ok_or_else(|| syn::Error::new(input.span(), "missing `head_dim`"))?,
+        },
+    })
 }
 
 fn parse_model_id(ident: &str) -> syn::Result<ModelId> {
@@ -186,7 +266,7 @@ impl Parse for CompileDef {
             input
         };
 
-        let mut model: Option<Binding<ModelId>> = None;
+        let mut model: Option<Binding<ModelSpec>> = None;
         let mut target: Option<Binding<TargetId>> = None;
         let mut workloads: Option<Binding<WorkloadRange>> = None;
 
@@ -196,12 +276,21 @@ impl Parse for CompileDef {
 
             match key.to_string().as_str() {
                 "model" => {
+                    // Either a named model (ident) or inline dims ({ ... }).
+                    if inner.peek(syn::token::Brace) {
+                        let model_content;
+                        braced!(model_content in inner);
+                        let inline = parse_inline_model(&model_content)?;
+                        model = Some(Binding::Static(ModelSpec::Inline(inline)));
+                        let _ = inner.parse::<Token![,]>();
+                        continue;
+                    }
                     let value: Ident = inner.parse()?;
                     let val_str = value.to_string();
                     model = Some(if val_str == "runtime" {
                         Binding::Runtime
                     } else {
-                        Binding::Static(parse_model_id(&val_str)?)
+                        Binding::Static(ModelSpec::Named(parse_model_id(&val_str)?))
                     });
                 }
                 "target" => {
@@ -257,7 +346,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_fully_specialized() {
+    fn parse_named_model() {
         let tokens: proc_macro2::TokenStream = "
             model: llama_3_2_1b,
             target: l4_sm89,
@@ -268,11 +357,54 @@ mod tests {
 
         let def: CompileDef = syn::parse2(tokens).unwrap();
         assert!(def.is_fully_specialized());
-        assert_eq!(def.model.as_static().unwrap(), &ModelId::Llama3_2_1B);
+        assert_eq!(def.model.as_static().unwrap().num_layers(), 16);
+        assert_eq!(def.model.as_static().unwrap().dims().hidden_size, 2048);
         assert_eq!(def.target.as_static().unwrap(), &TargetId::L4Sm89);
         let wl = def.workloads.as_static().unwrap();
         assert_eq!(wl.min_tokens, 1);
         assert_eq!(wl.max_tokens, 1024);
+    }
+
+    #[test]
+    fn parse_inline_model() {
+        let tokens: proc_macro2::TokenStream = "
+            model: {
+                layers: 28,
+                hidden: 3072,
+                intermediate: 8192,
+                heads: 24,
+                kv_heads: 8,
+                head_dim: 128,
+            },
+            target: l4_sm89,
+            workloads: [1..4096],
+        "
+        .parse()
+        .unwrap();
+
+        let def: CompileDef = syn::parse2(tokens).unwrap();
+        assert!(def.is_fully_specialized());
+        let spec = def.model.as_static().unwrap();
+        assert_eq!(spec.num_layers(), 28);
+        assert_eq!(spec.dims().hidden_size, 3072);
+        assert_eq!(spec.dims().intermediate_size, 8192);
+        assert_eq!(spec.dims().num_attention_heads, 24);
+        assert_eq!(spec.dims().num_kv_heads, 8);
+        assert_eq!(spec.dims().head_dim, 128);
+    }
+
+    #[test]
+    fn parse_inline_model_missing_field() {
+        let tokens: proc_macro2::TokenStream = "
+            model: { layers: 28, hidden: 3072 },
+            target: l4_sm89,
+            workloads: [1..4096],
+        "
+        .parse()
+        .unwrap();
+
+        let result: syn::Result<CompileDef> = syn::parse2(tokens);
+        assert!(result.is_err(), "should fail with missing fields");
     }
 
     #[test]

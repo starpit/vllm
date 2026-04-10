@@ -108,6 +108,27 @@ pub enum Constraint {
         /// subgraph claiming `producer`.
         consumer: TileId,
     },
+    /// Controls whether a dependency edge's handoff must truncate
+    /// the intermediate to storage dtype (bf16). When
+    /// `require_truncation` is true, fusion across this edge is
+    /// forbidden (the handoff must go through GMEM) — ensuring the
+    /// output is bit-identical to the unfused reference.
+    ///
+    /// When false (default for serving), fusion can skip the
+    /// truncation point, producing slightly different (but more
+    /// precise) output.
+    ///
+    /// Generated per dependency edge where the producer is a
+    /// reduction (norm) or accumulation (GEMM epilogue) — the
+    /// points where dtype truncation changes the numerical path.
+    PrecisionBounded {
+        producer: TileId,
+        consumer: TileId,
+        /// If true, the handoff between these tiles must truncate
+        /// to storage dtype (i.e., go through GMEM). If false,
+        /// any handoff is acceptable.
+        require_truncation: bool,
+    },
 }
 
 impl Constraint {
@@ -369,6 +390,39 @@ impl Constraint {
                     // fusion but an external tile needs its output.
                     // This fusion is invalid for this cover.
                     ConstraintStatus::Violated
+                }
+            }
+
+            Constraint::PrecisionBounded {
+                producer,
+                consumer,
+                require_truncation,
+            } => {
+                if !require_truncation {
+                    // No precision constraint on this edge.
+                    return ConstraintStatus::Satisfied;
+                }
+                let p_sg = assignment.cover.get(producer);
+                let c_sg = assignment.cover.get(consumer);
+                let (Some(p_sg), Some(c_sg)) = (p_sg, c_sg) else {
+                    return ConstraintStatus::Unknown;
+                };
+                if p_sg == c_sg {
+                    // Same subgraph → Internal handoff → no
+                    // truncation. If truncation is required, this
+                    // fusion violates precision.
+                    return ConstraintStatus::Violated;
+                }
+                // Different subgraphs → check the actual handoff.
+                if let Some(handoff) = assignment.handoffs.get(&(*p_sg, *c_sg)) {
+                    if handoff.truncates_to_storage_dtype() {
+                        ConstraintStatus::Satisfied
+                    } else {
+                        ConstraintStatus::Violated
+                    }
+                } else {
+                    // Handoff not yet assigned.
+                    ConstraintStatus::Unknown
                 }
             }
         }

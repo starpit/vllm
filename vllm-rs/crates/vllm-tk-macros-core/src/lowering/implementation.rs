@@ -159,6 +159,31 @@ impl Handoff {
             Handoff::Internal => 0.0,
         }
     }
+
+    /// Whether this handoff truncates the intermediate to storage
+    /// dtype. GMEM-based handoffs truncate (the value is written as
+    /// bf16/fp16/fp8 then re-read). In-kernel handoffs (Internal,
+    /// Mbarrier, shmem) can preserve accumulator precision (f32).
+    ///
+    /// This affects numerical reproducibility: a fused plan that
+    /// skips a GMEM truncation point produces slightly different
+    /// output than the unfused reference (more precise, but
+    /// different). The solver uses this via
+    /// [`Constraint::PrecisionBounded`].
+    pub fn truncates_to_storage_dtype(&self) -> bool {
+        match self {
+            // GMEM-transiting handoffs: data is written to and read
+            // from global memory in the storage dtype.
+            Handoff::StreamOrder
+            | Handoff::StreamEvent
+            | Handoff::KernelBoundary
+            | Handoff::InKernelGridSync
+            | Handoff::GmemFlag => true,
+            // In-register / shmem handoffs: data stays in the
+            // accumulator's wider dtype (f32 for bf16 tensor cores).
+            Handoff::Internal | Handoff::Mbarrier | Handoff::DsmemRead => false,
+        }
+    }
 }
 
 /// Layout of a tile in memory. Used by the layout-compatibility

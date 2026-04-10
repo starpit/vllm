@@ -32,23 +32,48 @@ use crate::target_profile::TargetProfile;
 /// library of implementations to choose from, the target's
 /// constraints, and the precomputed constraint set the solver
 /// must satisfy.
+/// Controls whether the solver is allowed to fuse across precision
+/// truncation points. In `Serving` mode, fusion is unrestricted
+/// (slightly different but more precise output). In `BitExact` mode,
+/// every dependency edge requires a GMEM truncation — no fusion can
+/// skip a dtype boundary — producing bit-identical output to the
+/// unfused reference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrecisionMode {
+    /// Allow fusion across truncation points. Output may differ
+    /// from the unfused reference by the accumulated precision of
+    /// skipped truncations. Default for serving.
+    #[default]
+    Serving,
+    /// Require all handoffs to truncate to storage dtype. No fusion
+    /// can skip a GMEM write. Output is bit-identical to the
+    /// unfused reference. Useful for golden validation / debugging.
+    BitExact,
+}
+
 pub struct Problem<'a> {
     pub tile_graph: &'a TileGraph,
     pub library: &'a ImplementationLibrary,
     pub profile: &'a TargetProfile,
-    /// Statically-derivable constraints. The solver may also
-    /// generate additional per-unit constraints
-    /// (`CompilationUnitRegBudget`, `ShmemBudget`,
-    /// `HandoffCompatible`) lazily as it commits subgraph
-    /// assignments — those don't live here.
     pub static_constraints: Vec<Constraint>,
 }
 
 impl<'a> Problem<'a> {
+    /// Build with default precision mode (Serving — allow fusion).
     pub fn build(
         tile_graph: &'a TileGraph,
         library: &'a ImplementationLibrary,
         profile: &'a TargetProfile,
+    ) -> Self {
+        Self::build_with_precision(tile_graph, library, profile, PrecisionMode::Serving)
+    }
+
+    /// Build with explicit precision mode.
+    pub fn build_with_precision(
+        tile_graph: &'a TileGraph,
+        library: &'a ImplementationLibrary,
+        profile: &'a TargetProfile,
+        precision: PrecisionMode,
     ) -> Self {
         let mut static_constraints: Vec<Constraint> = Vec::new();
 
@@ -61,8 +86,9 @@ impl<'a> Problem<'a> {
         //    per step on this target. Always required.
         static_constraints.push(Constraint::CooperativeExclusive);
 
-        // 3. DependencyOrder + IntermediateMaterialized: one of each
-        //    per dep edge in the tile graph.
+        // 3. DependencyOrder + IntermediateMaterialized + PrecisionBounded:
+        //    one of each per dep edge in the tile graph.
+        let require_truncation = precision == PrecisionMode::BitExact;
         for node in &tile_graph.nodes {
             for dep in &node.deps {
                 static_constraints.push(Constraint::DependencyOrder {
@@ -72,6 +98,11 @@ impl<'a> Problem<'a> {
                 static_constraints.push(Constraint::IntermediateMaterialized {
                     producer: *dep,
                     consumer: node.id,
+                });
+                static_constraints.push(Constraint::PrecisionBounded {
+                    producer: *dep,
+                    consumer: node.id,
+                    require_truncation,
                 });
             }
         }

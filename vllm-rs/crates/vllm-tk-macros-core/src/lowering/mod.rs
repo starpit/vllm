@@ -112,7 +112,7 @@ pub use implementation::{
     Handoff, ImplId, Implementation, LaunchKind, Layout, MatchInfo, Resources,
 };
 pub use library::ImplementationLibrary;
-pub use problem::Problem;
+pub use problem::{PrecisionMode, Problem};
 pub use solver::{BacktrackCpSolver, ExecutionPlan, SolveResult, Solver};
 pub use tile_graph::{TileGraph, TileId, TileKind};
 

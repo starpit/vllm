@@ -492,6 +492,14 @@ mod tests {
             plan.solver_steps,
             plan.predicted_us / 1000.0
         );
+        let mut impl_counts: std::collections::BTreeMap<&str, u32> = Default::default();
+        for sg in plan.assignment.subgraphs() {
+            let name = library.get(plan.assignment.impls[&sg]).name();
+            *impl_counts.entry(name).or_insert(0) += 1;
+        }
+        for (name, count) in &impl_counts {
+            eprintln!("  {count:>3} × {name}");
+        }
 
         // Sanity: every tile claimed.
         assert!(plan.assignment.is_cover_complete(tile_graph.len()));

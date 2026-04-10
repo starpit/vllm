@@ -105,6 +105,28 @@ fn build_cuda() {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", fused_mlp_path.display()));
     cu_files.push(fused_mlp_path.display().to_string());
 
+    // CP5-D-4: grid-dispatched fused MLP. The original kernel has
+    // hardcoded row=0, layer=0, <<<1,256>>>. Patch to use blockIdx
+    // and launch with a grid covering all rows × 1 layer (called
+    // per-layer from the host). The kernel body doesn't use barriers
+    // (verified: only make_arg<G::barriers> in globals ctor, no
+    // reads/writes in the kernel), so grid dispatch is safe.
+    let cp5_mlp_source = fused_mlp_source
+        .replace("fused_mlp", "cp5_fused_mlp")
+        .replace(
+            "const int layer = 0;",
+            "const int layer = 0; // single-layer dispatch",
+        )
+        .replace("const int row = 0;", "const int row = blockIdx.x;")
+        .replace(
+            "cp5_fused_mlp<<<1,",
+            "cp5_fused_mlp<<<(batch_size + MLP_BATCH_BLOCK - 1) / MLP_BATCH_BLOCK,",
+        );
+    let cp5_mlp_path = out_dir.join("cp5_fused_mlp.cu");
+    std::fs::write(&cp5_mlp_path, &cp5_mlp_source)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", cp5_mlp_path.display()));
+    cu_files.push(cp5_mlp_path.display().to_string());
+
     let inline_attn_source = vllm_tk_macros_core::generate_inline_attention_decode_kernel(dsl)
         .unwrap_or_else(|e| panic!("inline attention decode codegen failed: {e}"));
     let inline_attn_path = out_dir.join("inline_attention_decode.cu");

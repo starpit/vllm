@@ -83,6 +83,8 @@ impl ImplementationLibrary {
     /// for QkvSplit / KvCacheWrite / ResidualAdd. CP5-D extends.
     pub fn l4_sm89_starter() -> Self {
         let entries: Vec<Box<dyn Implementation>> = vec![
+            // ── TK fused MLP block (7-tile claim) ──
+            Box::new(TkFusedMlpBlockImpl),
             // ── cuBLAS GEMM with fused residual (claims GEMM + ResidualAdd
             //    as a two-tile subgraph; uses cublasGemmEx beta=1.0 to
             //    fold the residual add into the GEMM epilogue for free).
@@ -906,5 +908,100 @@ impl Implementation for VllmRsFusedQkvRopeCacheImpl {
     }
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::RowMajorBf16, Layout::PagedKvBf16]
+    }
+}
+
+/// TK fused MLP block: claims the 7-tile subgraph
+/// `(RmsNorm_mlp → GemmGate → GemmUp → GateUpConcat → SiluMul → GemmDown → ResidualAdd_mlp)`
+/// as a single kernel launch via the grid-dispatched `cp5_fused_mlp`.
+#[derive(Debug)]
+pub struct TkFusedMlpBlockImpl;
+
+impl Implementation for TkFusedMlpBlockImpl {
+    fn name(&self) -> &'static str {
+        "tk_fused_mlp_block"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let norm = &tile_graph.nodes[seed.0 as usize];
+        if norm.kind != TileKind::RmsNorm {
+            return None;
+        }
+        let consumers: Vec<_> = tile_graph
+            .nodes
+            .iter()
+            .filter(|n| n.deps.contains(&seed) && n.layer == norm.layer)
+            .collect();
+        let gate = consumers.iter().find(|n| n.kind == TileKind::GemmGate)?;
+        let up = consumers.iter().find(|n| n.kind == TileKind::GemmUp)?;
+        let concat = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::GateUpConcat
+                && n.layer == norm.layer
+                && n.deps.contains(&gate.id)
+                && n.deps.contains(&up.id)
+        })?;
+        let silu = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::SiluMul && n.layer == norm.layer && n.deps.contains(&concat.id)
+        })?;
+        let down = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::GemmDown && n.layer == norm.layer && n.deps.contains(&silu.id)
+        })?;
+        let residual = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::ResidualAdd && n.layer == norm.layer && n.deps.contains(&down.id)
+        })?;
+        Some(MatchInfo {
+            claimed_tiles: vec![
+                seed,
+                gate.id,
+                up.id,
+                concat.id,
+                silu.id,
+                down.id,
+                residual.id,
+            ],
+            boundary_inputs: norm.deps.clone(),
+            boundary_outputs: vec![residual.id],
+            layer: norm.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
+        // Sum of individual costs minus GMEM savings from fusion.
+        // Placeholder — calibrate via microbench.
+        l4_llama_1b_seq1024_costs::RMS_NORM_US
+            + l4_llama_1b_seq1024_costs::CUBLAS_GATE_US
+            + l4_llama_1b_seq1024_costs::CUBLAS_UP_US
+            + l4_llama_1b_seq1024_costs::SILU_AND_MUL_US
+            + l4_llama_1b_seq1024_costs::CUBLAS_DOWN_US
+            + l4_llama_1b_seq1024_costs::RESIDUAL_ADD_US
+            - 200.0
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 32768,
+            regs_per_thread: 128,
+            threads_per_cta: 256,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
     }
 }

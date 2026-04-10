@@ -411,29 +411,22 @@ impl GpuCostTable {
     }
 }
 
-// Compat shim: wraps GpuCostTable::l4_sm89() so existing cost_us
-// functions that call `l4_cost_model::gemm_us(m, n, k)` keep working.
-// TODO: thread GpuCostTable through Problem → Implementation::cost_us
-// so the solver can support multiple GPUs without statics.
+// Cost model backed by the CSV grid. Looks up costs by (M, N, K)
+// with interpolation — no hardcoded per-phase shapes.
 mod l4_cost_model {
     use super::GpuCostTable;
+    use crate::lowering::cost_table::{GpuCostGrid, KernelFamily};
     use std::sync::LazyLock;
+
+    static GRID: LazyLock<GpuCostGrid> = LazyLock::new(|| {
+        crate::lowering::cost_table::load_l4_sm89()
+            .expect("L4 cost CSV not found — run gpu_cost_sweep")
+    });
+    // Keep the legacy table for elementwise/attention (not yet in CSV).
     static TABLE: LazyLock<GpuCostTable> = LazyLock::new(GpuCostTable::l4_sm89);
 
     pub fn gemm_us(m: u32, n: u32, k: u32) -> f64 {
-        // Dispatch to the right curve based on shape.
-        match (n, k) {
-            (3072, 2048) => TABLE.cublas_qkv.lookup(m),
-            (2048, 2048) => TABLE.cublas_oproj.lookup(m),
-            (8192, 2048) => TABLE.cublas_gate.lookup(m), // gate and up same shape
-            (2048, 8192) => TABLE.cublas_down.lookup(m),
-            _ => {
-                // Fallback: roofline
-                let bw_us = (n as f64 * k as f64 * 2.0) / 300_000.0;
-                let compute_us = (2.0 * m as f64 * n as f64 * k as f64) / 85_000_000.0;
-                5.0 + bw_us.max(compute_us)
-            }
-        }
+        GRID.lookup(KernelFamily::CuBlas, m, n, k)
     }
 
     pub fn elementwise_us(m: u32, dim: u32) -> f64 {
@@ -441,7 +434,7 @@ mod l4_cost_model {
             2048 => TABLE.elementwise_hd.lookup(m),
             8192 => TABLE.elementwise_id.lookup(m),
             3072 => TABLE.elementwise_qkv.lookup(m),
-            512 => TABLE.elementwise_hd.lookup(m) * 0.25, // kv_dim ≈ hd/4
+            512 => TABLE.elementwise_hd.lookup(m) * 0.25,
             _ => TABLE.elementwise_hd.lookup(m) * (dim as f64 / 2048.0),
         }
     }
@@ -451,19 +444,12 @@ mod l4_cost_model {
     }
 
     pub fn cutlass_gemm_us(m: u32, n: u32, k: u32, tile_m: u32, _tile_n: u32, _num_sm: u32) -> f64 {
-        // Use measured CUTLASS data for the gate shape, then scale
-        // for other shapes by the cuBLAS ratio (CUTLASS/cuBLAS
-        // ratio is roughly constant across N for a given M).
-        let cutlass_gate = if tile_m >= 128 {
-            TABLE.cutlass128_gate.lookup(m)
+        let family = if tile_m >= 128 {
+            KernelFamily::Cutlass128x128
         } else {
-            TABLE.cutlass64_gate.lookup(m)
+            KernelFamily::Cutlass64x64
         };
-        let cublas_gate = TABLE.cublas_gate.lookup(m);
-        let ratio = cutlass_gate / cublas_gate.max(0.1);
-        // Apply this ratio to the actual phase's cuBLAS cost.
-        let cublas = gemm_us(m, n, k);
-        cublas * ratio
+        GRID.lookup(family, m, n, k)
     }
 }
 

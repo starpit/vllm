@@ -99,6 +99,7 @@ pub mod backend;
 pub mod concurrency;
 pub mod constraint;
 pub mod cost;
+pub mod cost_table;
 pub mod implementation;
 pub mod library;
 pub mod problem;

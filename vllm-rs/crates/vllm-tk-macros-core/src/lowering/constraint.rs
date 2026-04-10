@@ -95,6 +95,19 @@ pub enum Constraint {
         producer: SubgraphId,
         consumer: SubgraphId,
     },
+    /// If a claimed tile has consumers outside its subgraph, the
+    /// tile must appear in the subgraph's `boundary_outputs` (its
+    /// output must be materialized to GMEM so external consumers
+    /// can read it). Without this, prologue fusion that consumes
+    /// an intermediate internally would silently starve downstream
+    /// tiles.
+    IntermediateMaterialized {
+        /// The tile whose output might be consumed externally.
+        producer: TileId,
+        /// A consumer of `producer` that may end up outside the
+        /// subgraph claiming `producer`.
+        consumer: TileId,
+    },
 }
 
 impl Constraint {
@@ -320,6 +333,43 @@ impl Constraint {
                     return ConstraintStatus::Violated;
                 }
                 ConstraintStatus::Satisfied
+            }
+
+            Constraint::IntermediateMaterialized { producer, consumer } => {
+                // Both tiles must be assigned before we can check.
+                let p_sg = assignment.cover.get(producer);
+                let c_sg = assignment.cover.get(consumer);
+                let (Some(p_sg), Some(c_sg)) = (p_sg, c_sg) else {
+                    return ConstraintStatus::Unknown;
+                };
+                if p_sg == c_sg {
+                    // Same subgraph — the impl handles the dep
+                    // internally. No materialization needed.
+                    return ConstraintStatus::Satisfied;
+                }
+                // Different subgraphs: the producer's output must be
+                // in its subgraph's boundary_outputs. Check via the
+                // impl's match info.
+                let Some(p_impl_id) = assignment.impls.get(p_sg) else {
+                    return ConstraintStatus::Unknown;
+                };
+                let p_imp = library.get(*p_impl_id);
+                let seed = assignment
+                    .tiles_in_subgraph(*p_sg)
+                    .into_iter()
+                    .min()
+                    .unwrap();
+                let Some(m) = p_imp.matches(tile_graph, seed, profile) else {
+                    return ConstraintStatus::Violated;
+                };
+                if m.boundary_outputs.contains(producer) {
+                    ConstraintStatus::Satisfied
+                } else {
+                    // The producer is consumed internally by the
+                    // fusion but an external tile needs its output.
+                    // This fusion is invalid for this cover.
+                    ConstraintStatus::Violated
+                }
             }
         }
     }

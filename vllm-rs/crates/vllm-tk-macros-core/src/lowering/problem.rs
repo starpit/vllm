@@ -61,11 +61,15 @@ impl<'a> Problem<'a> {
         //    per step on this target. Always required.
         static_constraints.push(Constraint::CooperativeExclusive);
 
-        // 3. DependencyOrder: one constraint per dep edge in the
-        //    tile graph.
+        // 3. DependencyOrder + IntermediateMaterialized: one of each
+        //    per dep edge in the tile graph.
         for node in &tile_graph.nodes {
             for dep in &node.deps {
                 static_constraints.push(Constraint::DependencyOrder {
+                    producer: *dep,
+                    consumer: node.id,
+                });
+                static_constraints.push(Constraint::IntermediateMaterialized {
                     producer: *dep,
                     consumer: node.id,
                 });

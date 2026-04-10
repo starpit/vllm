@@ -359,11 +359,11 @@ impl RotaryCache {
 /// Quantized: gate_proj(x), up_proj(x) → SiLU(gate) * up → down_proj  (separate GEMMs)
 pub struct LlamaMLP {
     /// Fused gate+up for dense, or gate-only for quantized.
-    gate_up_proj: LinearLayer,
+    pub(crate) gate_up_proj: LinearLayer,
     /// Separate up projection — only used for quantized (None for dense).
-    up_proj: Option<LinearLayer>,
-    down_proj: LinearLayer,
-    intermediate_size: usize,
+    pub(crate) up_proj: Option<LinearLayer>,
+    pub(crate) down_proj: LinearLayer,
+    pub(crate) intermediate_size: usize,
     /// NCCL group for TP all-reduce after down_proj (row parallel).
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,

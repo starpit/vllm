@@ -149,6 +149,103 @@ pub fn forward(tokens: &Tensor, num_tokens: u32) {
 }
 ```
 
+## How to run
+
+All tests require `CUDA_PATH=/usr/local/cuda-12.9`:
+
+```bash
+# Solver tests (no GPU needed, fast):
+cargo test -p vllm-tk-macros-core -- --nocapture
+
+# Plan family visualization:
+cargo test -p vllm-tk-macros-core print_plan_family_compact -- --nocapture
+
+# Golden test (needs GPU, ~80s):
+CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
+  --features cuda --test scheduled_megakernel_test \
+  cp5_solver_driven_matches_committed_golden -- --ignored --nocapture
+
+# Bench (needs GPU, ~45s):
+CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
+  --features cuda --test scheduled_megakernel_test \
+  cp5_solver_driven_natural_forward_bench -- --ignored --nocapture
+
+# cuBLAS sweep:
+CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
+  --features cuda --test scheduled_megakernel_test \
+  cublas_gemm_sweep_microbench -- --ignored --nocapture
+
+# CUTLASS vs cuBLAS comparison:
+CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
+  --features cuda --test scheduled_megakernel_test \
+  cutlass_vs_cublas_sweep -- --ignored --nocapture
+```
+
+## Interpreter dispatch pattern
+
+The CP5 bench/golden tests contain a "runtime interpreter" — a
+`dispatch_one` closure that matches on impl name and calls the
+corresponding FFI:
+
+```rust
+let mut dispatch_one = |sg: SubgraphId| {
+    let imp_name = library.get(plan.assignment.impls[&sg]).name();
+    match imp_name {
+        "cublas_gemm_ex_qkv" => gemm(seq, qkv_dim, hd, w, act, out, 0.0),
+        "cutlass_qkv_64x64"  => ffi::cutlass_gemm_64x64_launch(...),
+        "vllm_rs_rms_norm"    => ffi::rms_norm_bf16(...),
+        "flashinfer_standalone_fa2" => ffi::cp5_run_flashinfer_attention_for_layer(...),
+        "vllm_rs_fused_qkv_rope_cache" => ffi::fused_qkv_rope_cache_bf16(...),
+        "tk_fused_mlp_block"  => ffi::cp5_fused_mlp_launch(...),
+        name if name.starts_with("cutlass_") => { /* generic CUTLASS dispatch */ },
+        ...
+    }
+};
+for (_, sg) in &scheduled { dispatch_one(*sg); }
+```
+
+This is the pattern the runtime integration should follow — the proc
+macro generates the dispatch function at compile time.
+
+## Relationship to the existing megakernel
+
+The existing megakernel (`templates/scheduled/megakernel.cu`) is a
+hand-tuned cooperative-grid kernel that runs the entire LLaMA forward
+pass in one launch. It uses:
+- Barrier-based phase synchronization (gmem flags)
+- CUTLASS GEMM phases with custom prologues
+- FlashInfer attention inlined via `BlockBatchPagedAttentionPersistent`
+- TK RMSNorm + RoPE + SiLU tile bodies
+
+Performance: 55ms at seq=1024 on L4 (vs 40ms for the CP5 solver's
+multi-launch cuBLAS plan). The megakernel is slower because:
+- Single cooperative grid limits parallelism (1 CTA/SM on L4)
+- All dispatch arms compiled into one kernel → register spill (255 regs)
+- Barrier overhead between phases (~100µs per grid sync)
+
+The CP5 solver replaces the megakernel with a **multi-launch plan**
+that lets each kernel use its optimal register/shmem budget. On sm_90+
+with more shmem and mbarrier, the solver could discover that a
+megakernel IS optimal — but it would be a solver-discovered megakernel,
+not a hand-tuned one.
+
+## Why not torch.compile / Triton / TensorRT
+
+torch.compile: fuses pointwise ops via Triton but doesn't jointly
+optimize GEMM kernel selection × fusion × workload shape. One plan
+for all batch sizes. Can't pick CUTLASS 64×64 at M=32 and cuBLAS at
+M=1.
+
+TensorRT: profiles multiple backends (closest to us) but uses
+pattern-matching for fusion, not constraint solving. Can't express
+"this fusion is invalid because tile X has an external consumer."
+Opaque plan — can't inspect why it chose what.
+
+Our approach: the solver discovers fusion from the constraint system.
+Adding a new kernel is one Implementation struct. The constraints
+validate it automatically. Plans are inspectable (`tag:l([a+b])`
+visualization). Per-GPU calibrated via microbench sweep.
+
 ## Known issues
 
 - `renders_polyalgorithm_kernel` test fails (pre-existing, unrelated)

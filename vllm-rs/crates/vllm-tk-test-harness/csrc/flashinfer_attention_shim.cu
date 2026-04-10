@@ -736,16 +736,24 @@ extern "C" int32_t cp5_run_flashinfer_attention_for_layer(
   // blockIdx.x is the cluster Q-split (always 1 for our prefill
   // config). num_blks_y is the cooperative grid size from the
   // planner — same value the megakernel uses.
+  //
+  // **cudaLaunchKernel, not cudaLaunchCooperativeKernel**:
+  // FlashInfer's `BlockBatchPagedAttentionPersistent::Run` uses
+  // `__syncthreads()` (block-local) and gmem-flag work distribution
+  // via `work_indptr[blockIdx.y]`. It does NOT call
+  // `cooperative_groups::this_grid().sync()`, so it does not need
+  // cooperative-launch semantics. Using the regular launcher
+  // (a) keeps this kernel capturable in CUDA graphs and
+  // (b) avoids the per-launch cooperative-grid residency check
+  //     overhead the megakernel pays.
   dim3 grid(plan->num_blks_x, plan->num_blks_y);
   dim3 block(cp5_per_layer_attn::kNumThreads);
 
-  auto launch_err = cudaLaunchCooperativeKernel(
-      (const void*)cp5_one_layer_attention_kernel,
-      grid, block, args, smem_bytes, stream);
+  cp5_one_layer_attention_kernel<<<grid, block, smem_bytes, stream>>>(params_d, layer_idx);
+  auto launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
     std::fprintf(stderr,
-                 "cp5_run_flashinfer_attention_for_layer[layer=%d]: "
-                 "cudaLaunchCooperativeKernel failed: %s\n",
+                 "cp5_run_flashinfer_attention_for_layer[layer=%d]: launch failed: %s\n",
                  layer_idx, cudaGetErrorString(launch_err));
     return -2;
   }

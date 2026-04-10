@@ -525,6 +525,22 @@ pub mod ffi {
             num_tokens: i32,
             stream: *mut std::ffi::c_void,
         );
+        pub fn fused_qkv_rope_cache_bf16(
+            q_out: *mut u16,
+            key_cache: *mut u16,
+            value_cache: *mut u16,
+            qkv: *const u16,
+            positions: *const u32,
+            cos_sin_cache: *const u16,
+            slot_mapping: *const i64,
+            q_size: i32,
+            kv_size: i32,
+            total_dim: i32,
+            rotary_dim: i32,
+            head_size: i32,
+            num_tokens: i32,
+            stream: *mut std::ffi::c_void,
+        );
     }
 
     decl_scheduled_megakernel!(

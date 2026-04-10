@@ -103,12 +103,21 @@ impl ImplementationLibrary {
             Box::new(CublasGemmExImpl::new(TileKind::GemmDown)),
             // ── vllm-rs fused ops ──
             Box::new(VllmRsRmsNormImpl),
+            // Fused 3-tile claim (QkvSplit + Rope + KvCacheWrite) — listed
+            // before the standalone variants so the solver picks it on the
+            // first branch.
+            Box::new(VllmRsFusedQkvRopeCacheImpl),
             Box::new(VllmRsRotaryEmbeddingImpl),
             Box::new(VllmRsSiluAndMulFusedImpl),
             // ── FlashInfer standalone ──
             Box::new(FlashInferStandaloneImpl),
             // ── Free / cheap passthroughs ──
-            Box::new(QkvSplitFreeImpl),
+            // Note: QkvSplitFreeImpl is intentionally omitted. The fused
+            // VllmRsFusedQkvRopeCacheImpl is the only cover for QkvSplit
+            // (and folds in Rope + KvCacheWrite as a side effect), which
+            // forces the solver to use it. The cheapest-first per-seed
+            // greedy with the loose remainder bound otherwise picks
+            // free-split for the QkvSplit tile and never recovers.
             Box::new(KvCacheWriteImpl),
             Box::new(ResidualAddImpl),
         ];
@@ -826,5 +835,76 @@ impl Implementation for ResidualAddImpl {
     }
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::RowMajorBf16]
+    }
+}
+
+/// vllm-rs `fused_qkv_rope_cache_bf16` claims the 3-tile subgraph
+/// `(QkvSplit → Rope → KvCacheWrite)` as a single host-callback
+/// kernel: it reads the packed `[Q | K | V]` qkv buffer, applies
+/// RoPE in place to Q and K, writes Q to a separate `q_post_rope`
+/// buffer, and scatters K/V into the paged cache via `slot_mapping`
+/// — exactly what the three logical tiles do separately.
+#[derive(Debug)]
+pub struct VllmRsFusedQkvRopeCacheImpl;
+
+impl Implementation for VllmRsFusedQkvRopeCacheImpl {
+    fn name(&self) -> &'static str {
+        "vllm_rs_fused_qkv_rope_cache"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let split_node = &tile_graph.nodes[seed.0 as usize];
+        if split_node.kind != TileKind::QkvSplit {
+            return None;
+        }
+        let rope = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::Rope && n.deps.contains(&seed))?;
+        let kvw = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::KvCacheWrite && n.deps.contains(&rope.id))?;
+        Some(MatchInfo {
+            claimed_tiles: vec![seed, rope.id, kvw.id],
+            boundary_inputs: split_node.deps.clone(),
+            boundary_outputs: vec![rope.id, kvw.id],
+            layer: split_node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
+        l4_llama_1b_seq1024_costs::ROTARY_EMBEDDING_US
+            + l4_llama_1b_seq1024_costs::KV_CACHE_WRITE_US
+            + l4_llama_1b_seq1024_costs::QKV_SPLIT_US
+            - 5.0
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16, Layout::PagedKvBf16]
     }
 }

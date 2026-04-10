@@ -2323,3 +2323,297 @@ fn cp5_solver_driven_natural_forward_bench() {
         ffi::cublasDestroy_v2(handle);
     }
 }
+
+// ── CP5-D-1.5: golden validation for the solver-driven natural forward ──
+//
+// Builds the same TileGraph + Library + solver as
+// `cp5_solver_driven_natural_forward_bench`, but at LLaMA 1B seq=64
+// dims (matching the committed `llama_3_2_1b_seq64` golden) and runs
+// the interpreter ONCE with real RoPE inputs (positions, cos_sin
+// cache, per-layer slot mappings) rather than dummy zeros, then
+// compares `h_final` to the committed CPU-forward golden.
+//
+// Uses the new `vllm_rs_fused_qkv_rope_cache` 3-tile claim (replaces
+// the standalone QkvSplit + Rope + KvCacheWrite) so the cache writes
+// land in the right slots and FlashInfer reads valid Q/K/V.
+
+fn build_cos_sin_cache_bf16(max_pos: usize, rotary_dim: usize) -> Vec<bf16> {
+    let half = rotary_dim / 2;
+    let mut out = vec![bf16::from_f32(0.0); max_pos * rotary_dim];
+    for p in 0..max_pos {
+        for c in 0..half {
+            let exp = (2 * c) as f32 / rotary_dim as f32;
+            let inv_freq = 10000.0_f32.powf(-exp);
+            let ang = p as f32 * inv_freq;
+            out[p * rotary_dim + c] = bf16::from_f32(ang.cos());
+            out[p * rotary_dim + c + half] = bf16::from_f32(ang.sin());
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "needs GPU"]
+fn cp5_solver_driven_matches_committed_golden() {
+    init_cuda();
+    let dims = llama_1b_seq64_dims();
+    // Same seed as the committed golden generator (regen_llama_1b_seq64_golden).
+    let (b, _) = build_test_buffers(dims, 17);
+
+    let tile_graph = TileGraph::build_llama_forward(dims.num_layers as u16);
+    let library = ImplementationLibrary::l4_sm89_starter();
+    let profile = TargetProfile::l4_sm89();
+    let problem = Problem::build(&tile_graph, &library, &profile);
+    let solver = BacktrackCpSolver;
+    let plan = match solver.solve(&problem) {
+        SolveResult::Found(p) => p,
+        SolveResult::Infeasible => panic!("solver infeasible"),
+    };
+
+    // Verify the solver picked the fused QKV+RoPE+cache impl. If not,
+    // the test would silently use no-op KvCacheWrite and FlashInfer
+    // would read zeros — fail loudly here.
+    let mut cp5_impl_counts: std::collections::BTreeMap<&'static str, u32> = Default::default();
+    for sg in plan.assignment.subgraphs() {
+        let imp_name = library.get(plan.assignment.impls[&sg]).name();
+        *cp5_impl_counts.entry(imp_name).or_insert(0) += 1;
+    }
+    eprintln!("cp5 golden — solver picks: {cp5_impl_counts:#?}");
+    assert!(
+        cp5_impl_counts.contains_key("vllm_rs_fused_qkv_rope_cache"),
+        "solver did not pick vllm_rs_fused_qkv_rope_cache — golden test cannot validate"
+    );
+
+    let mut fi_plan = build_flashinfer_plan(&b, dims);
+
+    let mut handle: ffi::CublasHandle = std::ptr::null_mut();
+    unsafe {
+        let s = ffi::cublasCreate_v2(&mut handle);
+        assert_eq!(s, 0, "cublasCreate failed: {s}");
+        let s = ffi::cublasSetStream_v2(handle, std::ptr::null_mut());
+        assert_eq!(s, 0, "cublasSetStream failed: {s}");
+    }
+
+    // ── Real RoPE inputs ──
+    let seq_usz = dims.seq_len as usize;
+    let nl = dims.num_layers as usize;
+    let page_size = SCHEDULED_PREFILL_KV_PAGE_SIZE as usize;
+    let pages_per_layer = seq_usz.div_ceil(page_size);
+
+    let positions_host: Vec<u32> = (0..dims.seq_len).collect();
+    let positions_dev = unsafe {
+        let bytes = seq_usz * std::mem::size_of::<u32>();
+        let p = result::malloc_sync(bytes).unwrap();
+        result::memcpy_htod_sync(p, &positions_host).unwrap();
+        p as *const u32
+    };
+
+    let cos_sin_host = build_cos_sin_cache_bf16(seq_usz, dims.head_dim as usize);
+    let cos_sin_dev = gpu_upload_bf16(&cos_sin_host);
+
+    // Per-layer slot mapping: slot[layer][r] = (layer*pages_per_layer + r/page_size)*page_size + r%page_size.
+    let mut slot_dev_per_layer: Vec<u64> = Vec::with_capacity(nl);
+    for l in 0..nl {
+        let host: Vec<i64> = (0..seq_usz)
+            .map(|r| {
+                let logical_page = r / page_size;
+                let slot_in_page = r % page_size;
+                ((l * pages_per_layer + logical_page) * page_size + slot_in_page) as i64
+            })
+            .collect();
+        let bytes = seq_usz * std::mem::size_of::<i64>();
+        let dptr = unsafe {
+            let p = result::malloc_sync(bytes).unwrap();
+            result::memcpy_htod_sync(p, &host).unwrap();
+            p
+        };
+        slot_dev_per_layer.push(dptr);
+    }
+
+    let seq = dims.seq_len as i32;
+    let hd = dims.hidden_dim as i32;
+    let id = dims.intermediate_dim as i32;
+    let q_dim = (dims.num_attn_heads * dims.head_dim) as i32;
+    let kv_dim = (dims.num_kv_heads * dims.head_dim) as i32;
+    let qkv_dim = q_dim + 2 * kv_dim;
+    let layer_bytes_qkv = (qkv_dim * hd) as usize * 2;
+    let layer_bytes_o = (hd * hd) as usize * 2;
+    let layer_bytes_gate_up = (id * hd) as usize * 2;
+    let layer_bytes_down = (hd * id) as usize * 2;
+    let layer_bytes_norm = hd as usize * 2;
+
+    let gate_up_tmp = gpu_alloc_zeros((seq * 2 * id) as usize * 2);
+
+    let mut scheduled: Vec<(u32, vllm_tk_macros_core::lowering::assignment::SubgraphId)> = plan
+        .assignment
+        .schedule
+        .iter()
+        .map(|(sg, slot)| (slot.step, *sg))
+        .collect();
+    scheduled.sort_by_key(|(step, sg)| (*step, sg.0));
+
+    let is_first_rms_norm_in_layer =
+        |claimed: &[vllm_tk_macros_core::lowering::TileId], layer: u16| -> bool {
+            let first_claimed = claimed.iter().min().copied().unwrap();
+            let mut count_before = 0;
+            for n in tile_graph.iter_topo() {
+                if n.id == first_claimed {
+                    break;
+                }
+                if n.kind == TileKind::RmsNorm && n.layer == layer {
+                    count_before += 1;
+                }
+            }
+            count_before == 0
+        };
+
+    let one: f32 = 1.0;
+    let gemm = |m: i32, n: i32, k: i32, weight: u64, act: u64, out: u64, beta: f32| unsafe {
+        let beta_val = beta;
+        let s = ffi::cublasGemmEx(
+            handle,
+            ffi::CUBLAS_OP_T,
+            ffi::CUBLAS_OP_N,
+            n,
+            m,
+            k,
+            &one as *const f32,
+            weight as *const _,
+            ffi::CUDA_R_16BF,
+            k,
+            act as *const _,
+            ffi::CUDA_R_16BF,
+            k,
+            &beta_val as *const f32,
+            out as *mut _,
+            ffi::CUDA_R_16BF,
+            n,
+            ffi::CUBLAS_COMPUTE_32F,
+            ffi::CUBLAS_GEMM_DEFAULT,
+        );
+        assert_eq!(s, 0, "cublasGemmEx failed: {s}");
+    };
+
+    let mut dispatch_one = |sg: vllm_tk_macros_core::lowering::assignment::SubgraphId| {
+        let impl_id = plan.assignment.impls[&sg];
+        let imp_name = library.get(impl_id).name();
+        let claimed = plan.assignment.tiles_in_subgraph(sg);
+        let layer = claimed
+            .iter()
+            .map(|t| tile_graph.nodes[t.0 as usize].layer)
+            .next()
+            .unwrap_or(0) as usize;
+
+        match imp_name {
+            "cublas_gemm_ex_qkv" => {
+                let w = b.qkv_w + (layer * layer_bytes_qkv) as u64;
+                gemm(seq, qkv_dim, hd, w, b.rms_rope, b.qkv, 0.0);
+            }
+            "cublas_gemm_ex_oproj" => {
+                let w = b.o_w + (layer * layer_bytes_o) as u64;
+                gemm(seq, hd, hd, w, b.attn_out, b.hidden_states, 0.0);
+            }
+            "cublas_gemm_ex_oproj_with_residual" => {
+                let w = b.o_w + (layer * layer_bytes_o) as u64;
+                gemm(seq, hd, hd, w, b.attn_out, b.hidden_states, 1.0);
+            }
+            "cublas_gemm_ex_gate" => {
+                let w = b.gate_w + (layer * layer_bytes_gate_up) as u64;
+                gemm(seq, id, hd, w, b.rms_gate, gate_up_tmp, 0.0);
+            }
+            "cublas_gemm_ex_up" => {
+                let w = b.up_w + (layer * layer_bytes_gate_up) as u64;
+                let up_dest = gate_up_tmp + (seq * id) as u64 * 2;
+                gemm(seq, id, hd, w, b.rms_gate, up_dest, 0.0);
+            }
+            "cublas_gemm_ex_down" => {
+                let w = b.down_w + (layer * layer_bytes_down) as u64;
+                gemm(seq, hd, id, w, b.silu_out, b.hidden_states, 0.0);
+            }
+            "cublas_gemm_ex_down_with_residual" => {
+                let w = b.down_w + (layer * layer_bytes_down) as u64;
+                gemm(seq, hd, id, w, b.silu_out, b.hidden_states, 1.0);
+            }
+            "vllm_rs_rms_norm" => {
+                let is_attn_norm = is_first_rms_norm_in_layer(&claimed, layer as u16);
+                let weight_buffer = if is_attn_norm {
+                    b.attn_norm_w + (layer * layer_bytes_norm) as u64
+                } else {
+                    b.mlp_norm_w + (layer * layer_bytes_norm) as u64
+                };
+                // NOTE: cpu_forward normalizes attn_out (NOT post-residual h) for
+                // mlp_norm — match that convention so we hit the committed golden.
+                let (out, src) = if is_attn_norm {
+                    (b.rms_rope, b.hidden_states)
+                } else {
+                    (b.rms_gate, b.attn_out)
+                };
+                unsafe {
+                    ffi::rms_norm_bf16(
+                        out as *mut u16,
+                        src as *const u16,
+                        weight_buffer as *const u16,
+                        1e-5,
+                        seq,
+                        hd,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+            "vllm_rs_fused_qkv_rope_cache" => unsafe {
+                let slot_dev = slot_dev_per_layer[layer];
+                ffi::fused_qkv_rope_cache_bf16(
+                    b.q_post_rope as *mut u16,
+                    b.k_cache as *mut u16,
+                    b.v_cache as *mut u16,
+                    b.qkv as *const u16,
+                    positions_dev,
+                    cos_sin_dev as *const u16,
+                    slot_dev as *const i64,
+                    q_dim,
+                    kv_dim,
+                    qkv_dim,
+                    dims.head_dim as i32,
+                    dims.head_dim as i32,
+                    seq,
+                    std::ptr::null_mut(),
+                );
+            },
+            "vllm_rs_silu_and_mul_fused" => unsafe {
+                ffi::silu_and_mul_fused_bf16(
+                    b.silu_out as *mut u16,
+                    gate_up_tmp as *const u16,
+                    seq,
+                    id,
+                    std::ptr::null_mut(),
+                );
+            },
+            "flashinfer_standalone_fa2" => unsafe {
+                let s = ffi::cp5_run_flashinfer_attention_for_layer(
+                    &mut fi_plan as *mut _,
+                    layer as i32,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(s, 0, "cp5_run_flashinfer_attention_for_layer failed: {s}");
+            },
+            // Standalone fall-throughs — should not be picked when the
+            // fused 3-tile impl is in the library, but tolerate them.
+            "qkv_split_free" | "kv_cache_write" | "vllm_rs_rotary_embedding" | "residual_add" => {}
+            other => panic!("CP5 golden interpreter has no dispatch for impl {other:?}"),
+        }
+    };
+
+    for (_step, sg) in &scheduled {
+        dispatch_one(*sg);
+    }
+    unsafe { result::stream::synchronize(std::ptr::null_mut()).unwrap() };
+
+    let h_gpu = gpu_download_bf16(b.hidden_states, seq_usz * dims.hidden_dim as usize);
+
+    unsafe {
+        ffi::teardown_flashinfer_attention_plan(&mut fi_plan as *mut _);
+        ffi::cublasDestroy_v2(handle);
+    }
+
+    assert_matches_committed_golden("llama_3_2_1b_seq64", &h_gpu, 32768.0, 0.10);
+}

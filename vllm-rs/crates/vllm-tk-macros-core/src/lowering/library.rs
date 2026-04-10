@@ -97,6 +97,13 @@ impl ImplementationLibrary {
             //    on the first branch instead of after backtracking.
             Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmOProj)),
             Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmDown)),
+            // ── CUTLASS norm+GEMM prologue fusion (D-3) ──
+            // Claims [RmsNorm + GEMM] as a 2-tile subgraph. The norm
+            // runs in the CUTLASS prologue iterator — no GMEM write
+            // between norm and GEMM.
+            Box::new(CutlassNormGemmImpl::new(TileKind::GemmQkv, 128, 128)),
+            Box::new(CutlassNormGemmImpl::new(TileKind::GemmGate, 128, 128)),
+            Box::new(CutlassNormGemmImpl::new(TileKind::GemmUp, 128, 128)),
             // ── CUTLASS GEMMs (tile-aware cost model) ──
             // Each (phase × tile_config) is a separate entry. The solver
             // picks the tile that minimizes cost at the given num_tokens.
@@ -1457,6 +1464,110 @@ impl Implementation for CutlassGemmWithResidualImpl {
         Resources {
             shmem_bytes: per_stage * 4,
             regs_per_thread: if self.tile_m >= 128 { 128 } else { 80 },
+            threads_per_cta: 256,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+}
+
+// ── CUTLASS norm+GEMM prologue fusion ──
+
+/// Claims `[RmsNorm + GEMM]` as a 2-tile subgraph. The RMS norm
+/// runs in the CUTLASS prologue iterator: each threadblock loads
+/// its tile of A from GMEM, applies row-wise RMS norm in shared
+/// memory, then feeds the normalized values into the MMA pipeline.
+/// Saves one kernel launch + one full GMEM write+read of the
+/// normalized activation buffer.
+#[derive(Debug)]
+pub struct CutlassNormGemmImpl {
+    gemm_phase: TileKind,
+    tile_m: u32,
+    tile_n: u32,
+}
+
+impl CutlassNormGemmImpl {
+    pub fn new(gemm_phase: TileKind, tile_m: u32, tile_n: u32) -> Self {
+        Self {
+            gemm_phase,
+            tile_m,
+            tile_n,
+        }
+    }
+}
+
+impl Implementation for CutlassNormGemmImpl {
+    fn name(&self) -> &'static str {
+        match self.gemm_phase {
+            TileKind::GemmQkv => "cutlass_norm_qkv_128",
+            TileKind::GemmGate => "cutlass_norm_gate_128",
+            TileKind::GemmUp => "cutlass_norm_up_128",
+            _ => "cutlass_norm_unknown",
+        }
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        // Seed on the GEMM tile so this competes directly with
+        // standalone CutlassGemmImpl at the same branching point.
+        // Walk backward to find the feeding RmsNorm.
+        let gemm = &tile_graph.nodes[seed.0 as usize];
+        if gemm.kind != self.gemm_phase {
+            return None;
+        }
+        let norm = gemm.deps.iter().find_map(|dep| {
+            let n = &tile_graph.nodes[dep.0 as usize];
+            if n.kind == TileKind::RmsNorm && n.layer == gemm.layer {
+                Some(n)
+            } else {
+                None
+            }
+        })?;
+        Some(MatchInfo {
+            claimed_tiles: vec![norm.id, seed],
+            boundary_inputs: norm.deps.clone(),
+            boundary_outputs: vec![seed],
+            layer: gemm.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // The norm is "free" — it runs in the prologue while waiting
+        // for the B-operand load. Cost ≈ CUTLASS GEMM cost alone
+        // (maybe 2-5% overhead for the norm compute in the prologue).
+        let m = profile.num_tokens();
+        let (n, k) = match self.gemm_phase {
+            TileKind::GemmQkv => (3072, 2048),
+            TileKind::GemmGate | TileKind::GemmUp => (8192, 2048),
+            _ => (1, 1),
+        };
+        l4_cost_model::cutlass_gemm_us(m, n, k, self.tile_m, self.tile_n, profile.num_sm) * 1.03 // 3% overhead for prologue norm
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        let tile_k = 32u32;
+        let per_stage = (self.tile_m * tile_k + self.tile_n * tile_k) * 2;
+        Resources {
+            // Extra shmem for norm: hidden_dim * 4 bytes (f32 accumulator)
+            shmem_bytes: per_stage * 4 + 2048 * 4,
+            regs_per_thread: 140, // slightly more than plain GEMM
             threads_per_cta: 256,
         }
     }

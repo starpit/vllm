@@ -253,8 +253,16 @@ struct CommitSnapshot {
 /// every matching implementation in cheapest-first order, recurses
 /// on each feasible commit. Backtracks on infeasibility or when
 /// the lower-bound cost exceeds the best known.
+/// Maximum branch-and-bound steps before the solver returns the
+/// best solution found so far. Prevents search explosion when the
+/// library has many competing multi-tile fusion candidates.
+const MAX_STEPS: u64 = 10_000;
+
 fn recurse(state: &mut SearchState<'_>, _starting_step: u32) {
     state.steps += 1;
+    if state.steps > MAX_STEPS && state.best.is_some() {
+        return; // budget exhausted, return best found so far
+    }
 
     // Termination: every tile claimed → check completeness + record.
     let Some(seed) = state.next_unclaimed() else {

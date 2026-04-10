@@ -2015,7 +2015,7 @@ fn cp5_solver_driven_natural_forward_bench() {
     let (b, _) = build_test_buffers(dims, 89);
 
     // ── Build problem + solve ──
-    let tile_graph = TileGraph::build_llama_forward(dims.num_layers as u16);
+    let tile_graph = TileGraph::build_llama_forward_1b(dims.num_layers as u16);
     let library = ImplementationLibrary::l4_sm89_starter();
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
@@ -2637,7 +2637,7 @@ fn cp5_solver_driven_matches_committed_golden() {
     // Same seed as the committed golden generator (regen_llama_1b_seq64_golden).
     let (b, _) = build_test_buffers(dims, 17);
 
-    let tile_graph = TileGraph::build_llama_forward(dims.num_layers as u16);
+    let tile_graph = TileGraph::build_llama_forward_1b(dims.num_layers as u16);
     let library = ImplementationLibrary::l4_sm89_starter();
     // Use actual seq_len so the solver picks the right plan (e.g.,
     // CUTLASS 64×64 at seq=64 instead of cuBLAS).
@@ -3451,9 +3451,9 @@ fn gpu_cost_sweep() {
             });
             println!("cutlass_128x128,{m},{n},{k},{cutlass128_us:.1}");
 
-            gpu_free(a);
-            gpu_free(b);
-            gpu_free(c);
+            unsafe { cudarc::driver::sys::cuMemFree_v2(a); }
+            unsafe { cudarc::driver::sys::cuMemFree_v2(b); }
+            unsafe { cudarc::driver::sys::cuMemFree_v2(c); }
         }
     }
 

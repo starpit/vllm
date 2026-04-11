@@ -24,8 +24,14 @@ use crate::lowering::tile_graph::{TileGraph, TileKind};
 pub enum ImplDispatchKind {
     /// `cublasGemmEx` — params: (M, N, K, alpha, beta, weight, act, out).
     CublasGemm,
-    /// `cutlass_gemm_{tile}x{tile}_launch` — same params + tile size.
-    CutlassGemm { tile_m: u32, tile_n: u32 },
+    /// `cutlass_gemm_{M}x{N}_s{stages}_launch` — same params + tile size + stages.
+    CutlassGemm {
+        tile_m: u32,
+        tile_n: u32,
+        stages: u32,
+    },
+    /// `cutlass_gemv_launch` — M=1 specialization (SIMT GEMV).
+    CutlassGemv,
     /// `cutlass_norm_gemm` — fused norm→GEMM prologue, no separate norm launch.
     CutlassNormGemm { tile_m: u32, tile_n: u32 },
     /// `rms_norm_bf16`.
@@ -219,18 +225,20 @@ fn classify_impl(
     // Classify by impl name prefix → typed dispatch kind.
     let kind = if imp_name.starts_with("cublas_gemm_ex") {
         ImplDispatchKind::CublasGemm
-    } else if imp_name.starts_with("cutlass_norm_gemm") || imp_name.starts_with("cutlass_norm_") {
-        // Parse tile size from name (e.g. "cutlass_norm_gemm_qkv_128x128").
-        let (tm, tn) = parse_cutlass_tile(imp_name);
+    } else if imp_name.starts_with("cutlass_norm_") {
+        let (tm, tn, _stages) = parse_cutlass_config(imp_name);
         ImplDispatchKind::CutlassNormGemm {
             tile_m: tm,
             tile_n: tn,
         }
+    } else if imp_name.starts_with("cutlass_gemv_") {
+        ImplDispatchKind::CutlassGemv
     } else if imp_name.starts_with("cutlass_") {
-        let (tm, tn) = parse_cutlass_tile(imp_name);
+        let (tm, tn, stages) = parse_cutlass_config(imp_name);
         ImplDispatchKind::CutlassGemm {
             tile_m: tm,
             tile_n: tn,
+            stages,
         }
     } else if imp_name == "vllm_rs_rms_norm" {
         let count = norm_count.entry(layer).or_insert(0);
@@ -268,13 +276,24 @@ fn classify_impl(
 
 /// Parse CUTLASS tile sizes from impl name.
 /// E.g. "cutlass_qkv_64x64" → (64, 64), "cutlass_down_128x128_res" → (128, 128).
-fn parse_cutlass_tile(name: &str) -> (u32, u32) {
-    if name.contains("64x64") {
-        (64, 64)
-    } else {
-        // Default to 128×128 for any CUTLASS entry without an explicit tile tag.
-        (128, 128)
-    }
+/// Parse tile dims + stages from impl name.
+/// Format: `cutlass_{phase}_{M}x{N}_s{stages}` (e.g. `cutlass_qkv_128x128_s4`).
+/// Falls back to 128×128 s4 for legacy names.
+fn parse_cutlass_config(name: &str) -> (u32, u32, u32) {
+    // Find {M}x{N} pattern
+    let (tm, tn) = name
+        .split('_')
+        .find_map(|seg| {
+            let (m, n) = seg.split_once('x')?;
+            Some((m.parse::<u32>().ok()?, n.parse::<u32>().ok()?))
+        })
+        .unwrap_or((128, 128));
+    // Find s{stages} pattern
+    let stages = name
+        .split('_')
+        .find_map(|seg| seg.strip_prefix('s')?.parse::<u32>().ok())
+        .unwrap_or(4);
+    (tm, tn, stages)
 }
 
 /// Compact plan family summary for debugging / test visualization.

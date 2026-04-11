@@ -109,6 +109,121 @@ pub fn generate_fused_mlp_kernel(dsl: &str) -> Result<String, String> {
     Ok(cuda_codegen::generate_fused_mlp_kernel(&dag))
 }
 
+/// Generate the cp5 grid-dispatched fused MLP kernel with a solver-friendly
+/// launch wrapper that takes raw pointers instead of the full TK LAUNCH_PARAMS.
+///
+/// The kernel is the same as `generate_fused_mlp_kernel` but patched for grid
+/// dispatch (blockIdx.x = row) and with a minimal-arg `cp5_fused_mlp_solver_launch`
+/// wrapper appended.
+pub fn generate_cp5_fused_mlp_solver_source(dsl: &str) -> Result<String, String> {
+    let tokens: proc_macro2::TokenStream = dsl
+        .parse()
+        .map_err(|e| format!("failed to tokenize DSL: {e}"))?;
+    let def: parse::MegakernelDef = syn::parse2(tokens).map_err(|e| format!("parse error: {e}"))?;
+    let dag = parse::build_dag(&def)?;
+
+    let hd = dag.params.get("HD").copied().unwrap_or(2048);
+    let id = dag.params.get("ID").copied().unwrap_or(8192);
+
+    // Step 1: generate the base fused MLP kernel source
+    let base = cuda_codegen::generate_fused_mlp_kernel(&dag);
+
+    // Step 2: rename to cp5_fused_mlp (keep single-CTA, single-row kernel).
+    // The solver wrapper loops over batch rows on the host side,
+    // calling the kernel once per row with offset pointers.
+    let cp5 = base.replace("fused_mlp", "cp5_fused_mlp");
+
+    // Step 3: append a solver-friendly launch wrapper with minimal args.
+    // Uses make_gl<GL, false> for unused globals fields (skips dim validation).
+    let wrapper = format!(
+        r#"
+// ── Solver-friendly launch wrapper ──
+// Takes only the MLP-relevant pointers (per-layer, already offset).
+// Constructs TK globals internally with zeroed unused fields.
+extern "C" int cp5_fused_mlp_solver_launch(
+    uint64_t hidden_ptr,       // bf16 [batch_size, {hd}] — in/out (residual add)
+    uint64_t rms_gate_ptr,     // bf16 [1, {hd}] — scratch for normed activation (1 row)
+    uint64_t silu_ptr,         // bf16 [1, {id}] — scratch for gate*up (1 row)
+    uint64_t mlp_norm_w_ptr,   // bf16 [1, {hd}] — norm weight (single layer)
+    uint64_t gate_w_ptr,       // bf16 [{id}, {hd}] — gate weight (single layer)
+    uint64_t up_w_ptr,         // bf16 [{id}, {hd}] — up weight (single layer)
+    uint64_t down_w_ptr,       // bf16 [{hd}, {id}] — down weight (single layer)
+    float rms_norm_eps,
+    int batch_size,
+    uint64_t stream
+) {{
+    try {{
+        int shmem = MLP_SHMEM;
+        auto err = cudaFuncSetAttribute(cp5_fused_mlp,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+        if (err != cudaSuccess) return (int)err;
+
+        // The fused MLP kernel is a single-row kernel: one CTA processes
+        // one batch element. Loop over rows on the host side, offsetting
+        // the hidden_states pointer for each row. Scratch buffers (rms_gate,
+        // silu) are reused across rows (each launch is on the same stream
+        // so they execute sequentially).
+        constexpr int hd_bytes = {hd} * 2;  // bf16
+        for (int row = 0; row < batch_size; row++) {{
+            uint64_t row_hidden = hidden_ptr + (uint64_t)row * hd_bytes;
+
+            using G = globals;
+            G g {{
+                make_gl<G::barriers, false>(0, 0, 0, 0, 0),
+                make_gl<G::instruction_layout, false>(0, 0, 0, 0, 0),
+                make_gl<G::timing_layout, false>(0, 0, 0, 0, 0),
+                make_gl<G::weights_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::norm_weights_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::weights_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::norm_weights_t>(mlp_norm_w_ptr, 1, 1, 1, {hd}),
+                make_gl<G::weights_t>(up_w_ptr, 1, 1, {id}, {hd}),
+                make_gl<G::weights_t>(gate_w_ptr, 1, 1, {id}, {hd}),
+                make_gl<G::weights_big_t>(down_w_ptr, 1, 1, {hd}, {id}),
+                make_gl<G::norm_weights_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::weights_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::kv_cache_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::kv_cache_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::rope_table_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::rope_table_t, false>(0, 0, 0, 0, 0),
+                // hidden_states: point to this row (1 row)
+                make_gl<G::activations_t>(row_hidden, 1, 1, 1, {hd}),
+                make_gl<G::activations_t, false>(0, 0, 0, 0, 0),
+                // rms_gate scratch (1 row, reused)
+                make_gl<G::activations_t>(rms_gate_ptr, 1, 1, 1, {hd}),
+                make_gl<G::activations_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::activations_t, false>(0, 0, 0, 0, 0),
+                // silu scratch (1 row, reused)
+                make_gl<G::activations_big_t>(silu_ptr, 1, 1, 1, {id}),
+                make_gl<G::activations_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::logits_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::int32_vector_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::int32_vector_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::int32_vector_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::int32_vector_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::int32_vector_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::int32_vector_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::int32_vector_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::int32_vector_t, false>(0, 0, 0, 0, 0),
+                make_gl<G::int32_vector_t, false>(0, 0, 0, 0, 0),
+                0, 0.0f, rms_norm_eps, 0, 1,
+            }};
+
+            cp5_fused_mlp<<<1, {num_threads}, shmem, (cudaStream_t)stream>>>(
+                g, 1, 1);
+        }}
+        err = cudaGetLastError();
+        return (int)err;
+    }} catch (...) {{ return -2; }}
+}}
+"#,
+        hd = hd,
+        id = id,
+        num_threads = 8 * 32, // MLP_NUM_WARPS * 32
+    );
+
+    Ok(format!("{cp5}\n{wrapper}"))
+}
+
 /// Generate a fused RMSNorm → GEMM kernel (no KVM protocol, shmem inter-op passing).
 pub fn generate_fused_rmsnorm_gemm_kernel(dsl: &str) -> Result<String, String> {
     let tokens: proc_macro2::TokenStream = dsl

@@ -7761,6 +7761,8 @@ version = "0.1.0"
 dependencies = [
  "cudaforge",
  "dirs 6.0.0",
+ "vllm-tk-macros-core",
+ "walkdir",
 ]
 
 [[package]]

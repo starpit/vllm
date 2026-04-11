@@ -35,19 +35,15 @@ struct CostPoint3D {
     cost_us: f64,
 }
 
-/// Kernel family identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum KernelFamily {
-    CuBlas,
-    Cutlass64x64,
-    Cutlass128x128,
-}
+/// Kernel family identifier — matches the CSV kernel column exactly.
+/// Examples: `"cublas"`, `"cutlass_64x64_s4"`, `"cutlass_128x128_s3"`.
+pub type KernelFamily = String;
 
 /// Cost table loaded from CSV. Provides `lookup(kernel, m, n, k) -> f64`.
 #[derive(Clone, Debug)]
 pub struct GpuCostGrid {
     pub gpu_name: String,
-    /// Per-kernel measured data, keyed by (N, K) → CostCurve over M.
+    /// Per-kernel measured data, keyed by kernel name.
     tables: HashMap<KernelFamily, Vec<CostPoint3D>>,
     /// Sorted unique M values for interpolation.
     m_grid: Vec<u32>,
@@ -68,12 +64,7 @@ impl GpuCostGrid {
             if cols.len() < 5 {
                 continue;
             }
-            let kernel = match cols[0].trim() {
-                "cublas" => KernelFamily::CuBlas,
-                "cutlass_64x64" => KernelFamily::Cutlass64x64,
-                "cutlass_128x128" => KernelFamily::Cutlass128x128,
-                _ => continue,
-            };
+            let kernel = cols[0].trim().to_string();
             let m: u32 = cols[1].trim().parse().unwrap_or(0);
             let n: u32 = cols[2].trim().parse().unwrap_or(0);
             let k: u32 = cols[3].trim().parse().unwrap_or(0);
@@ -98,8 +89,8 @@ impl GpuCostGrid {
     /// Look up cost for a (kernel, M, N, K) query.
     /// Finds the two nearest (N, K) pairs in the data and interpolates
     /// between their M-curves.
-    pub fn lookup(&self, kernel: KernelFamily, m: u32, n: u32, k: u32) -> f64 {
-        let points = match self.tables.get(&kernel) {
+    pub fn lookup(&self, kernel: &str, m: u32, n: u32, k: u32) -> f64 {
+        let points = match self.tables.get(kernel) {
             Some(p) => p,
             None => return self.roofline_fallback(m, n, k),
         };
@@ -182,8 +173,8 @@ impl GpuCostGrid {
     }
 
     /// Whether we have any measured data for this kernel.
-    pub fn has_data(&self, kernel: KernelFamily) -> bool {
-        self.tables.contains_key(&kernel)
+    pub fn has_data(&self, kernel: &str) -> bool {
+        self.tables.contains_key(kernel)
     }
 }
 
@@ -219,15 +210,15 @@ cutlass_64x64,1024,8192,2048,621.2
     #[test]
     fn parse_csv() {
         let grid = GpuCostGrid::from_csv("test", SAMPLE_CSV);
-        assert!(grid.has_data(KernelFamily::CuBlas));
-        assert!(grid.has_data(KernelFamily::Cutlass64x64));
-        assert!(!grid.has_data(KernelFamily::Cutlass128x128));
+        assert!(grid.has_data("cublas"));
+        assert!(grid.has_data("cutlass_64x64"));
+        assert!(!grid.has_data("cutlass_128x128"));
     }
 
     #[test]
     fn exact_lookup() {
         let grid = GpuCostGrid::from_csv("test", SAMPLE_CSV);
-        let cost = grid.lookup(KernelFamily::CuBlas, 32, 3072, 2048);
+        let cost = grid.lookup("cublas", 32, 3072, 2048);
         assert!((cost - 17.6).abs() < 0.1);
     }
 
@@ -235,7 +226,7 @@ cutlass_64x64,1024,8192,2048,621.2
     fn interpolated_lookup() {
         let grid = GpuCostGrid::from_csv("test", SAMPLE_CSV);
         // M=16 between M=1 (13.5) and M=32 (17.6) for (N=3072, K=2048).
-        let cost = grid.lookup(KernelFamily::CuBlas, 16, 3072, 2048);
+        let cost = grid.lookup("cublas", 16, 3072, 2048);
         assert!(cost > 13.5 && cost < 17.6, "interpolated cost {cost}");
     }
 
@@ -244,7 +235,7 @@ cutlass_64x64,1024,8192,2048,621.2
         let grid = GpuCostGrid::from_csv("test", SAMPLE_CSV);
         // Query (N=4096, K=2048) — not in the data. Should find nearest
         // and scale by compute ratio.
-        let cost = grid.lookup(KernelFamily::CuBlas, 32, 4096, 2048);
+        let cost = grid.lookup("cublas", 32, 4096, 2048);
         assert!(cost > 0.0, "should return positive cost");
     }
 }

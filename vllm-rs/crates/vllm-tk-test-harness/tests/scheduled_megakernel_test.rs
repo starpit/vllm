@@ -3420,40 +3420,89 @@ fn gpu_cost_sweep() {
             let cublas_gemm = || unsafe {
                 ffi::cublasGemmEx(
                     handle,
-                    ffi::CUBLAS_OP_T, ffi::CUBLAS_OP_N,
-                    n_i, m_i, k_i,
+                    ffi::CUBLAS_OP_T,
+                    ffi::CUBLAS_OP_N,
+                    n_i,
+                    m_i,
+                    k_i,
                     &one as *const f32,
-                    b as *const _, ffi::CUDA_R_16BF, k_i,
-                    a as *const _, ffi::CUDA_R_16BF, k_i,
+                    b as *const _,
+                    ffi::CUDA_R_16BF,
+                    k_i,
+                    a as *const _,
+                    ffi::CUDA_R_16BF,
+                    k_i,
                     &zero as *const f32,
-                    c as *mut _, ffi::CUDA_R_16BF, n_i,
-                    ffi::CUBLAS_COMPUTE_32F, ffi::CUBLAS_GEMM_DEFAULT,
+                    c as *mut _,
+                    ffi::CUDA_R_16BF,
+                    n_i,
+                    ffi::CUBLAS_COMPUTE_32F,
+                    ffi::CUBLAS_GEMM_DEFAULT,
                 );
             };
             let cublas_us = bench_kernel(stream, WARMUP, ITERS, cublas_gemm);
             println!("cublas,{m},{n},{k},{cublas_us:.1}");
 
-            // ── CUTLASS 64×64 ──
-            let cutlass64_us = bench_kernel(stream, WARMUP, ITERS, || unsafe {
-                ffi::cutlass_gemm_64x64_launch(
-                    c as *mut u16, a as *const u16, b as *const u16,
-                    m_i, n_i, k_i, 1.0, 0.0, stream as u64,
-                );
-            });
-            println!("cutlass_64x64,{m},{n},{k},{cutlass64_us:.1}");
+            // ── All CUTLASS tile configs ──
+            macro_rules! bench_cutlass {
+                ($($name:literal => $fn:path),* $(,)?) => {
+                    $(
+                        let us = bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                            $fn(
+                                c as *mut u16, a as *const u16, b as *const u16,
+                                m_i, n_i, k_i, 1.0, 0.0, stream as u64,
+                            );
+                        });
+                        println!(concat!($name, ",{},{},{},{:.1}"), m, n, k, us);
+                    )*
+                };
+            }
+            bench_cutlass!(
+                "cutlass_32x64_s4"   => ffi::cutlass_gemm_32x64_s4_launch,
+                "cutlass_32x64_s3"   => ffi::cutlass_gemm_32x64_s3_launch,
+                "cutlass_32x128_s4"  => ffi::cutlass_gemm_32x128_s4_launch,
+                "cutlass_32x128_s3"  => ffi::cutlass_gemm_32x128_s3_launch,
+                "cutlass_32x256_s3"  => ffi::cutlass_gemm_32x256_s3_launch,
+                "cutlass_64x64_s4"   => ffi::cutlass_gemm_64x64_s4_launch,
+                "cutlass_64x64_s3"   => ffi::cutlass_gemm_64x64_s3_launch,
+                "cutlass_64x128_s4"  => ffi::cutlass_gemm_64x128_s4_launch,
+                "cutlass_64x128_s3"  => ffi::cutlass_gemm_64x128_s3_launch,
+                "cutlass_128x64_s4"  => ffi::cutlass_gemm_128x64_s4_launch,
+                "cutlass_128x64_s3"  => ffi::cutlass_gemm_128x64_s3_launch,
+                "cutlass_128x128_s4" => ffi::cutlass_gemm_128x128_s4_launch,
+                "cutlass_128x128_s3" => ffi::cutlass_gemm_128x128_s3_launch,
+                "cutlass_128x256_s3" => ffi::cutlass_gemm_128x256_s3_launch,
+                "cutlass_256x64_s4"  => ffi::cutlass_gemm_256x64_s4_launch,
+                "cutlass_256x64_s3"  => ffi::cutlass_gemm_256x64_s3_launch,
+            );
 
-            // ── CUTLASS 128×128 ──
-            let cutlass128_us = bench_kernel(stream, WARMUP, ITERS, || unsafe {
-                ffi::cutlass_gemm_128x128_launch(
-                    c as *mut u16, a as *const u16, b as *const u16,
-                    m_i, n_i, k_i, 1.0, 0.0, stream as u64,
-                );
-            });
-            println!("cutlass_128x128,{m},{n},{k},{cutlass128_us:.1}");
+            // GEMV only makes sense at M=1
+            if m == 1 {
+                let us = bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                    ffi::cutlass_gemv_launch(
+                        c as *mut u16,
+                        a as *const u16,
+                        b as *const u16,
+                        m_i,
+                        n_i,
+                        k_i,
+                        1.0,
+                        0.0,
+                        stream as u64,
+                    );
+                });
+                println!("cutlass_gemv,{m},{n},{k},{us:.1}");
+            }
 
-            unsafe { cudarc::driver::sys::cuMemFree_v2(a); }
-            unsafe { cudarc::driver::sys::cuMemFree_v2(b); }
-            unsafe { cudarc::driver::sys::cuMemFree_v2(c); }
+            unsafe {
+                cudarc::driver::sys::cuMemFree_v2(a);
+            }
+            unsafe {
+                cudarc::driver::sys::cuMemFree_v2(b);
+            }
+            unsafe {
+                cudarc::driver::sys::cuMemFree_v2(c);
+            }
         }
     }
 

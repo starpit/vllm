@@ -36,7 +36,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     // is a follow-up.
     let model = &models[0];
     let tile_graph = TileGraph::from_model_dag(&def.dag, model.dims);
-    let library = build_library(target_id);
+    let library = build_library(target_id, model.dims);
     let profile = build_profile(target_id);
     let grid = match &def.workloads {
         Some(wl) => build_solve_grid(wl),
@@ -224,7 +224,11 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             }})
         }
 
-        ImplDispatchKind::CutlassGemm { tile_m, tile_n } => {
+        ImplDispatchKind::CutlassGemm {
+            tile_m,
+            tile_n,
+            stages,
+        } => {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
@@ -249,11 +253,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             }
             let (_, weight, store) = gemm_operands(phase, entry.fused_residual);
             let cutlass_input = cutlass_input_expr(phase);
-            let launch_fn = if tile_m == 64 && tile_n == 64 {
-                format_ident!("cutlass_gemm_64x64_launch")
-            } else {
-                format_ident!("cutlass_gemm_128x128_launch")
-            };
+            let launch_fn = format_ident!("cutlass_gemm_{}x{}_s{}_launch", tile_m, tile_n, stages);
             // Always beta=0: output buffer is freshly allocated.
             // Residual accumulation happens in fused_add_rms_norm_inplace.
             Some(quote! {{
@@ -274,6 +274,55 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                     device.compute_stream as u64,
                 );
                 debug_assert_eq!(__rc, 0, "CUTLASS GEMM failed");
+                #store
+            }})
+        }
+
+        ImplDispatchKind::CutlassGemv => {
+            // CUTLASS SIMT GEMV: y[N] = W[N,K] @ x[K], only at M=1.
+            // Same calling convention as CUTLASS GEMM, just a different launch fn.
+            let phase = entry.gemm_phase.unwrap();
+            if phase == GemmPhase::Up {
+                return Some(quote! {
+                    if let Some(ref up_proj) = layer.mlp.up_proj {
+                        let __out = up_proj.forward(
+                            normed.as_ref().unwrap().view(),
+                            &mut device.cublas,
+                            &mut device.caching,
+                            device.compute_stream,
+                        );
+                        let __gu = gate_up.take().unwrap();
+                        let __concat = kernels::concat_dim1(
+                            *__gu, *__out,
+                            &mut device.caching,
+                            device.compute_stream,
+                        );
+                        drop(__gu);
+                        drop(__out);
+                        gate_up = Some(__concat);
+                    }
+                });
+            }
+            let (_, weight, store) = gemm_operands(phase, entry.fused_residual);
+            let cutlass_input = cutlass_input_expr(phase);
+            Some(quote! {{
+                let __act: GpuTensor = #cutlass_input;
+                let __m = __act.dim(0) as i32;
+                let __k = __act.dim(1) as i32;
+                let __w = (#weight).dense_weight();
+                let __n = __w.dim(0) as i32;
+                let __out = device.caching.alloc_tensor(
+                    &[__m as usize, __n as usize], __act.dtype(),
+                );
+                let __rc = cutlass_gemv_launch(
+                    __out.as_mut_ptr::<u16>(),
+                    __act.as_ptr::<u16>(),
+                    __w.as_ptr::<u16>(),
+                    __m, __n, __k,
+                    1.0f32, 0.0f32,
+                    device.compute_stream as u64,
+                );
+                debug_assert_eq!(__rc, 0, "CUTLASS GEMV failed");
                 #store
             }})
         }
@@ -378,9 +427,83 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             silu_out = Some(__activated);
         }}),
 
-        ImplDispatchKind::TkFusedMlpBlock => Some(quote! {
-            compile_error!("TK fused MLP codegen not yet implemented");
-        }),
+        ImplDispatchKind::TkFusedMlpBlock => Some(quote! {{
+            // ── TK fused MLP: norm → gate+SiLU → up×gate → down+residual ──
+            //
+            // The TK kernel uses hidden_states as both norm input AND residual.
+            // Fold the separate residual stream into hidden_states first.
+            //
+            // fused_add_rms_norm_inplace(hs, res): res += hs; hs = norm(res)
+            // After: res = accumulated, hs = normed (wasted — TK redoes norm)
+            //
+            // After TK, hidden_states = accumulated + MLP_output (the new
+            // accumulated residual). The bucket function must return
+            // (hidden_states, residual) where next layer's attn norm does
+            // residual += hidden_states. We put the TK output into residual
+            // and zero hidden_states so it contributes nothing.
+            if let Some(__res) = residual.take() {
+                let __hs: GpuTensor = *hidden_states;
+                let __rs: GpuTensor = *__res;
+                kernels::fused_add_rms_norm_inplace(
+                    __hs, __rs,
+                    layer.post_attention_layernorm.weight,
+                    layer.post_attention_layernorm.eps,
+                    device.compute_stream,
+                );
+                // __res = accumulated, hidden_states tensor = normed (waste)
+                let __normed_waste = hidden_states;
+                hidden_states = __res;
+                residual = Some(__normed_waste);
+            }
+
+            let __m = hidden_states.dim(0);
+            let __hd = hidden_states.dim(1);
+            let __id = layer.mlp.intermediate_size;
+
+            // Scratch buffers — 1 row each (kernel processes one row at a time)
+            let __rms_gate = device.caching.alloc_tensor(
+                &[1, __hd], hidden_states.dtype(),
+            );
+            let __silu_buf = device.caching.alloc_tensor(
+                &[1, __id], hidden_states.dtype(),
+            );
+
+            // Extract weight pointers (dense bf16).
+            // gate_up_proj is [2*ID, HD] with gate first, up second.
+            let __gate_up_w = layer.mlp.gate_up_proj.dense_weight();
+            let __gate_w_ptr = __gate_up_w.as_ptr::<u16>() as u64;
+            let __up_w_ptr = __gate_w_ptr + (__id * __hd * 2) as u64;
+            let __down_w = layer.mlp.down_proj.dense_weight();
+
+            let __rc = cp5_fused_mlp_solver_launch(
+                hidden_states.as_mut_ptr::<u16>() as u64,
+                __rms_gate.as_mut_ptr::<u16>() as u64,
+                __silu_buf.as_mut_ptr::<u16>() as u64,
+                layer.post_attention_layernorm.weight.as_ptr::<u16>() as u64,
+                __gate_w_ptr,
+                __up_w_ptr,
+                __down_w.as_ptr::<u16>() as u64,
+                layer.post_attention_layernorm.eps,
+                __m as i32,
+                device.compute_stream as u64,
+            );
+            debug_assert_eq!(__rc, 0, "cp5_fused_mlp_solver_launch failed");
+            drop(__rms_gate);
+            drop(__silu_buf);
+
+            // hidden_states (in-place) = accumulated + MLP_output = new residual.
+            // Swap: TK output → residual, normed waste → hidden_states (zeroed).
+            let __tk_out = hidden_states;
+            hidden_states = residual.take().unwrap();
+            // Zero the normed-waste tensor so next layer's
+            // fused_add_rms_norm(hs, res) just does res += 0.
+            crate::driver::memset_d8(
+                hidden_states.as_mut_ptr::<u8>(),
+                0, __m * __hd * 2,
+                device.compute_stream,
+            ).expect("memset failed");
+            residual = Some(__tk_out);
+        }}),
     }
 }
 
@@ -433,10 +556,13 @@ fn gemm_operands(
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-fn build_library(target: &TargetId) -> ImplementationLibrary {
+fn build_library(
+    target: &TargetId,
+    dims: crate::lowering::tile_graph::ModelDims,
+) -> ImplementationLibrary {
     match target {
-        TargetId::L4Sm89 => ImplementationLibrary::l4_sm89_starter(),
-        _ => ImplementationLibrary::l4_sm89_starter(),
+        TargetId::L4Sm89 => ImplementationLibrary::l4_sm89_starter(dims),
+        _ => ImplementationLibrary::l4_sm89_starter(dims),
     }
 }
 

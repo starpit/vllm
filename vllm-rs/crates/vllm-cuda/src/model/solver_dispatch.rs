@@ -7,38 +7,70 @@
 
 use crate::alloc::OwnedTensor;
 use crate::device::GpuDevice;
+use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::model::llama::{LlamaDecoderLayer, RotaryCache};
 use crate::tensor::{GpuTensor, TensorView};
-use crate::{kernels, layers::LinearLayer};
 
 // ── CUTLASS standalone GEMM FFI ─────────────────────────────────
 
-type CUstream = cudarc::driver::sys::CUstream;
+macro_rules! cutlass_gemm_ffi {
+    ($($name:ident),* $(,)?) => {
+        #[cfg(feature = "cuda")]
+        unsafe extern "C" {
+            $(
+                pub fn $name(
+                    c: *mut u16, a: *const u16, b: *const u16,
+                    m: i32, n: i32, k: i32,
+                    alpha: f32, beta: f32, stream: u64,
+                ) -> i32;
+            )*
+        }
+    };
+}
+
+// Every (TB_M × TB_N, stages) config from cutlass_standalone_gemm.cu.
+// The solver codegen constructs the name: cutlass_gemm_{M}x{N}_s{S}_launch.
+cutlass_gemm_ffi!(
+    cutlass_gemm_32x64_s4_launch,
+    cutlass_gemm_32x64_s3_launch,
+    cutlass_gemm_32x128_s4_launch,
+    cutlass_gemm_32x128_s3_launch,
+    cutlass_gemm_32x256_s3_launch,
+    cutlass_gemm_64x64_s4_launch,
+    cutlass_gemm_64x64_s3_launch,
+    cutlass_gemm_64x128_s4_launch,
+    cutlass_gemm_64x128_s3_launch,
+    cutlass_gemm_128x64_s4_launch,
+    cutlass_gemm_128x64_s3_launch,
+    cutlass_gemm_128x128_s4_launch,
+    cutlass_gemm_128x128_s3_launch,
+    cutlass_gemm_128x256_s3_launch,
+    cutlass_gemm_256x64_s4_launch,
+    cutlass_gemm_256x64_s3_launch,
+    // CUTLASS GEMV (M=1 specialization)
+    cutlass_gemv_launch,
+    // Legacy aliases (backward compat)
+    cutlass_gemm_128x128_launch,
+    cutlass_gemm_64x64_launch,
+);
+
+// ── TK fused MLP FFI ───────────────────────────────────────────
 
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
-    pub fn cutlass_gemm_128x128_launch(
-        c: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        beta: f32,
-        stream: u64,
-    ) -> i32;
-
-    pub fn cutlass_gemm_64x64_launch(
-        c: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        beta: f32,
+    /// Grid-dispatched TK fused MLP: norm → gate GEMM+SiLU → up GEMM×gate → down GEMM+residual.
+    /// One CTA per row (blockIdx.x), called once per layer with per-layer weight pointers.
+    pub fn cp5_fused_mlp_solver_launch(
+        hidden_ptr: u64,     // bf16 [batch_size, HD] — in/out (residual add)
+        rms_gate_ptr: u64,   // bf16 [batch_size, HD] — scratch for normed activations
+        silu_ptr: u64,       // bf16 [batch_size, ID] — scratch for gate*up
+        mlp_norm_w_ptr: u64, // bf16 [1, HD] — norm weight (single layer)
+        gate_w_ptr: u64,     // bf16 [ID, HD] — gate weight (single layer)
+        up_w_ptr: u64,       // bf16 [ID, HD] — up weight (single layer)
+        down_w_ptr: u64,     // bf16 [HD, ID] — down weight (single layer)
+        rms_norm_eps: f32,
+        batch_size: i32,
         stream: u64,
     ) -> i32;
 }

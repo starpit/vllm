@@ -544,32 +544,44 @@ pub mod ffi {
         );
     }
 
-    // CP5: standalone CUTLASS GEMM launchers.
+    // CP5: standalone CUTLASS GEMM launchers — all tile configs.
     // C[M,N] = alpha * A[M,K] @ B[K,N]^T + beta * C[M,N]
-    unsafe extern "C" {
-        pub fn cutlass_gemm_128x128_launch(
-            c: *mut u16,
-            a: *const u16,
-            b: *const u16,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            beta: f32,
-            stream: u64,
-        ) -> i32;
-        pub fn cutlass_gemm_64x64_launch(
-            c: *mut u16,
-            a: *const u16,
-            b: *const u16,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            beta: f32,
-            stream: u64,
-        ) -> i32;
+    macro_rules! cutlass_gemm_ffi {
+        ($($name:ident),* $(,)?) => {
+            unsafe extern "C" {
+                $(
+                    pub fn $name(
+                        c: *mut u16, a: *const u16, b: *const u16,
+                        m: i32, n: i32, k: i32,
+                        alpha: f32, beta: f32, stream: u64,
+                    ) -> i32;
+                )*
+            }
+        };
     }
+    cutlass_gemm_ffi!(
+        cutlass_gemm_32x64_s4_launch,
+        cutlass_gemm_32x64_s3_launch,
+        cutlass_gemm_32x128_s4_launch,
+        cutlass_gemm_32x128_s3_launch,
+        cutlass_gemm_32x256_s3_launch,
+        cutlass_gemm_64x64_s4_launch,
+        cutlass_gemm_64x64_s3_launch,
+        cutlass_gemm_64x128_s4_launch,
+        cutlass_gemm_64x128_s3_launch,
+        cutlass_gemm_128x64_s4_launch,
+        cutlass_gemm_128x64_s3_launch,
+        cutlass_gemm_128x128_s4_launch,
+        cutlass_gemm_128x128_s3_launch,
+        cutlass_gemm_128x256_s3_launch,
+        cutlass_gemm_256x64_s4_launch,
+        cutlass_gemm_256x64_s3_launch,
+        // CUTLASS GEMV (M=1 specialization)
+        cutlass_gemv_launch,
+        // Legacy aliases
+        cutlass_gemm_128x128_launch,
+        cutlass_gemm_64x64_launch,
+    );
 
     decl_scheduled_megakernel!(
         launch_scheduled_megakernel_tiny,

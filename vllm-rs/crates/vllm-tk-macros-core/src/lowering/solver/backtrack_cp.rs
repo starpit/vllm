@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn solver_finds_natural_sm89_assignment() {
         let tile_graph = TileGraph::build_llama_forward_1b(16);
-        let library = ImplementationLibrary::l4_sm89_starter();
+        let library = ImplementationLibrary::l4_sm89_starter_default();
         let profile = TargetProfile::l4_sm89();
         let problem = Problem::build(&tile_graph, &library, &profile);
 
@@ -557,7 +557,7 @@ mod tests {
         // discover that vllm_rs_silu_and_mul_fused claims both
         // GateUpConcat AND SiluMul under one subgraph.
         let tile_graph = TileGraph::build_llama_forward_1b(2);
-        let library = ImplementationLibrary::l4_sm89_starter();
+        let library = ImplementationLibrary::l4_sm89_starter_default();
         let profile = TargetProfile::l4_sm89();
         let problem = Problem::build(&tile_graph, &library, &profile);
 
@@ -598,7 +598,7 @@ mod tests {
         // M=32-64 CUTLASS 64×64 wins. The test verifies the plans
         // actually differ — the specific picks depend on calibration.
         let tile_graph = TileGraph::build_llama_forward_1b(2);
-        let library = ImplementationLibrary::l4_sm89_starter();
+        let library = ImplementationLibrary::l4_sm89_starter_default();
 
         let decode = {
             let profile = TargetProfile::l4_sm89().with_seq_len(1);
@@ -673,7 +673,9 @@ mod tests {
 
     /// Short library tag from impl name. Includes tile size for CUTLASS.
     fn lib_tag(imp_name: &str) -> &'static str {
-        if imp_name.starts_with("cutlass") && imp_name.contains("64x64") {
+        if imp_name.starts_with("cutlass_gemv") {
+            "gv"
+        } else if imp_name.starts_with("cutlass") && imp_name.contains("64x64") {
             "cl64"
         } else if imp_name.starts_with("cutlass") {
             "cl128"
@@ -752,7 +754,7 @@ mod tests {
     #[test]
     fn print_plan_family_compact() {
         let tg = TileGraph::build_llama_forward_1b(2);
-        let library = ImplementationLibrary::l4_sm89_starter();
+        let library = ImplementationLibrary::l4_sm89_starter_default();
         let base = TargetProfile::l4_sm89();
 
         eprintln!();
@@ -812,7 +814,7 @@ mod tests {
     #[test]
     fn plan_family_across_seq_lens() {
         let tg = TileGraph::build_llama_forward_1b(2);
-        let library = ImplementationLibrary::l4_sm89_starter();
+        let library = ImplementationLibrary::l4_sm89_starter_default();
         let profile = TargetProfile::l4_sm89();
 
         let family = super::super::PlanFamily::solve_grid(

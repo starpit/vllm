@@ -7,7 +7,7 @@ description = "CUDA kernel compilation for vllm-rs (fused ops, Marlin, FlashAtte
 
 [features]
 default = []
-cuda = ["cudaforge"]
+cuda = ["cudaforge", "vllm-tk-macros-core", "walkdir"]
 
 [dependencies]
 # No runtime deps — this crate exists solely to compile CUDA kernels via build.rs.
@@ -15,3 +15,5 @@ cuda = ["cudaforge"]
 [build-dependencies]
 cudaforge = { version = "=0.1.4", path = "../../third_party/cudaforge", optional = true }
 dirs = "6"
+vllm-tk-macros-core = { path = "../vllm-tk-macros-core", optional = true }
+walkdir = { version = "2", optional = true }

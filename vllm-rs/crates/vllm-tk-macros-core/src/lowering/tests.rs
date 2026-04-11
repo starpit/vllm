@@ -18,7 +18,7 @@ use crate::target_profile::TargetProfile;
 #[test]
 fn natural_sm89_assignment_satisfies_all_static_constraints() {
     let tile_graph = TileGraph::build_llama_forward_1b(16);
-    let library = ImplementationLibrary::l4_sm89_starter();
+    let library = ImplementationLibrary::l4_sm89_starter_default();
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
@@ -47,7 +47,7 @@ fn natural_sm89_assignment_satisfies_all_static_constraints() {
 #[test]
 fn natural_sm89_cost_matches_cp4_microbench_estimate() {
     let tile_graph = TileGraph::build_llama_forward_1b(16);
-    let library = ImplementationLibrary::l4_sm89_starter();
+    let library = ImplementationLibrary::l4_sm89_starter_default();
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
@@ -81,7 +81,7 @@ fn dependency_order_constraint_catches_swapped_subgraphs() {
     // to create a dependency violation. Verify the constraint
     // catches it.
     let tile_graph = TileGraph::build_llama_forward_1b(2);
-    let library = ImplementationLibrary::l4_sm89_starter();
+    let library = ImplementationLibrary::l4_sm89_starter_default();
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
@@ -133,7 +133,7 @@ fn cooperative_exclusive_constraint_holds_for_all_host_callback_lowering() {
     // All impls in the current library are HostCallback, so the
     // CooperativeExclusive constraint is trivially satisfied.
     let tile_graph = TileGraph::build_llama_forward_1b(2);
-    let library = ImplementationLibrary::l4_sm89_starter();
+    let library = ImplementationLibrary::l4_sm89_starter_default();
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
@@ -160,7 +160,7 @@ fn cooperative_exclusive_constraint_holds_for_all_host_callback_lowering() {
 #[test]
 fn dispatch_sequence_from_solver_plan_classifies_all_entries() {
     let tile_graph = TileGraph::build_llama_forward_1b(2);
-    let library = ImplementationLibrary::l4_sm89_starter();
+    let library = ImplementationLibrary::l4_sm89_starter_default();
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
@@ -217,7 +217,7 @@ fn dispatch_sequence_from_solver_plan_classifies_all_entries() {
 #[test]
 fn dispatch_sequence_noop_entries_are_free_passthroughs() {
     let tile_graph = TileGraph::build_llama_forward_1b(1);
-    let library = ImplementationLibrary::l4_sm89_starter();
+    let library = ImplementationLibrary::l4_sm89_starter_default();
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
@@ -256,7 +256,7 @@ fn dispatch_sequence_plan_family_format() {
     use crate::lowering::solver::PlanFamily;
 
     let tile_graph = TileGraph::build_llama_forward_1b(1);
-    let library = ImplementationLibrary::l4_sm89_starter();
+    let library = ImplementationLibrary::l4_sm89_starter_default();
     let profile = TargetProfile::l4_sm89();
 
     let family = PlanFamily::solve_grid(

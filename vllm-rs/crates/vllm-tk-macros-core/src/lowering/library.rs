@@ -418,6 +418,12 @@ mod l4_cost_model {
         GRID.lookup(&name, m, n, k)
     }
 
+    /// Fast path: caller pre-computed the cost table key as `&'static str`.
+    /// Avoids the format! allocation on every solver backtrack.
+    pub fn cutlass_gemm_us_by_key(key: &str, m: u32, n: u32, k: u32) -> f64 {
+        GRID.lookup(key, m, n, k)
+    }
+
     /// Look up measured CUTLASS GEMV cost (only valid at M=1).
     pub fn gemv_us(m: u32, n: u32, k: u32) -> f64 {
         GRID.lookup("cutlass_gemv", m, n, k)
@@ -1410,6 +1416,10 @@ pub struct CutlassGemmImpl {
     tile_n: u32,
     stages: u32,
     dims: crate::lowering::tile_graph::ModelDims,
+    /// Pre-computed "cutlass_{phase}_{M}x{N}_s{stages}" — stable name.
+    name: &'static str,
+    /// Pre-computed "cutlass_{M}x{N}_s{stages}" — cost table lookup key.
+    cost_key: &'static str,
 }
 
 impl CutlassGemmImpl {
@@ -1421,12 +1431,27 @@ impl CutlassGemmImpl {
         dims: crate::lowering::tile_graph::ModelDims,
     ) -> Self {
         debug_assert!(phase.is_gemm(), "CutlassGemmImpl needs a GEMM tile kind");
+        let phase_str = match phase {
+            TileKind::GemmQkv => "qkv",
+            TileKind::GemmOProj => "oproj",
+            TileKind::GemmGate => "gate",
+            TileKind::GemmUp => "up",
+            TileKind::GemmDown => "down",
+            _ => "unknown",
+        };
+        let name: &'static str = Box::leak(
+            format!("cutlass_{}_{}x{}_s{}", phase_str, tile_m, tile_n, stages).into_boxed_str(),
+        );
+        let cost_key: &'static str =
+            Box::leak(format!("cutlass_{}x{}_s{}", tile_m, tile_n, stages).into_boxed_str());
         Self {
             phase,
             tile_m,
             tile_n,
             stages,
             dims,
+            name,
+            cost_key,
         }
     }
 
@@ -1488,21 +1513,7 @@ fn gemm_nk(phase: TileKind, dims: crate::lowering::tile_graph::ModelDims) -> (u3
 
 impl Implementation for CutlassGemmImpl {
     fn name(&self) -> &'static str {
-        // Leak a static string for the name. This runs at compile time
-        // in the proc macro, so the leak is harmless.
-        let phase = match self.phase {
-            TileKind::GemmQkv => "qkv",
-            TileKind::GemmOProj => "oproj",
-            TileKind::GemmGate => "gate",
-            TileKind::GemmUp => "up",
-            TileKind::GemmDown => "down",
-            _ => "unknown",
-        };
-        let s = format!(
-            "cutlass_{}_{}x{}_s{}",
-            phase, self.tile_m, self.tile_n, self.stages
-        );
-        Box::leak(s.into_boxed_str())
+        self.name
     }
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {
         true
@@ -1527,7 +1538,7 @@ impl Implementation for CutlassGemmImpl {
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
         let m = profile.num_tokens();
         let (n, k) = gemm_nk(self.phase, self.dims);
-        l4_cost_model::cutlass_gemm_us(m, n, k, self.tile_m, self.tile_n, self.stages)
+        l4_cost_model::cutlass_gemm_us_by_key(self.cost_key, m, n, k)
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         // CUTLASS tile config determines shmem: roughly
@@ -1665,6 +1676,8 @@ pub struct CutlassGemmWithResidualImpl {
     tile_n: u32,
     stages: u32,
     dims: crate::lowering::tile_graph::ModelDims,
+    name: &'static str,
+    cost_key: &'static str,
 }
 
 impl CutlassGemmWithResidualImpl {
@@ -1679,12 +1692,28 @@ impl CutlassGemmWithResidualImpl {
             phase == TileKind::GemmOProj || phase == TileKind::GemmDown,
             "only oproj and down have residual add"
         );
+        let phase_str = match phase {
+            TileKind::GemmOProj => "oproj",
+            TileKind::GemmDown => "down",
+            _ => "unknown",
+        };
+        let name: &'static str = Box::leak(
+            format!(
+                "cutlass_{}_{}x{}_s{}_res",
+                phase_str, tile_m, tile_n, stages
+            )
+            .into_boxed_str(),
+        );
+        let cost_key: &'static str =
+            Box::leak(format!("cutlass_{}x{}_s{}", tile_m, tile_n, stages).into_boxed_str());
         Self {
             phase,
             tile_m,
             tile_n,
             stages,
             dims,
+            name,
+            cost_key,
         }
     }
 
@@ -1724,16 +1753,7 @@ impl CutlassGemmWithResidualImpl {
 
 impl Implementation for CutlassGemmWithResidualImpl {
     fn name(&self) -> &'static str {
-        let phase = match self.phase {
-            TileKind::GemmOProj => "oproj",
-            TileKind::GemmDown => "down",
-            _ => "unknown",
-        };
-        let s = format!(
-            "cutlass_{}_{}x{}_s{}_res",
-            phase, self.tile_m, self.tile_n, self.stages
-        );
-        Box::leak(s.into_boxed_str())
+        self.name
     }
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {
         true
@@ -1774,7 +1794,7 @@ impl Implementation for CutlassGemmWithResidualImpl {
         // Same as standalone CUTLASS GEMM — beta=1 is free in the epilogue.
         let m = profile.num_tokens();
         let (n, k) = gemm_nk(self.phase, self.dims);
-        l4_cost_model::cutlass_gemm_us(m, n, k, self.tile_m, self.tile_n, self.stages)
+        l4_cost_model::cutlass_gemm_us_by_key(self.cost_key, m, n, k)
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         let tile_k = 32u32;

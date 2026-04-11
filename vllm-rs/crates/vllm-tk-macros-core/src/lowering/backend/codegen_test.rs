@@ -105,6 +105,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn solve_time_one_forward() {
+        // Time one full forward! macro expansion for Llama 3.2 3B.
+        // Run with:
+        //   cargo test --release -p vllm-tk-macros-core -- --ignored solve_time_one_forward --nocapture
+        let start = std::time::Instant::now();
+        let source = gen_source("1..4096");
+        let elapsed = start.elapsed();
+        println!(
+            "solve_time_one_forward: {:?} ({} bytes)",
+            elapsed,
+            source.len()
+        );
+    }
+
+    #[test]
     fn cp5_fused_mlp_solver_source_generates_valid_cuda() {
         // Verify the CUDA source generator for the 3B model produces valid output.
         let dsl = r#"kernel llama_sm89<NL=28, HD=3072, ID=8192, HDM=128, NAH=24, NKH=8, VS=128256> {

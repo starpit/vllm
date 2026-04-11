@@ -654,6 +654,7 @@ fn build_library(
 ) -> ImplementationLibrary {
     match target {
         TargetId::L4Sm89 => ImplementationLibrary::l4_sm89_starter(dims),
+        TargetId::L40sSm89 => ImplementationLibrary::l40s_sm89_starter(dims),
         _ => ImplementationLibrary::l4_sm89_starter(dims),
     }
 }
@@ -661,6 +662,7 @@ fn build_library(
 fn build_profile(target: &TargetId) -> TargetProfile {
     match target {
         TargetId::L4Sm89 => TargetProfile::l4_sm89(),
+        TargetId::L40sSm89 => TargetProfile::l40s_sm89(),
         _ => TargetProfile::l4_sm89(),
     }
 }

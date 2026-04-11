@@ -190,6 +190,12 @@ pub fn load_l4_sm89() -> Option<GpuCostGrid> {
     Some(GpuCostGrid::from_csv("L4 sm_89", csv))
 }
 
+/// Load the L40S sm_89 cost grid from the built-in CSV.
+pub fn load_l40s_sm89() -> Option<GpuCostGrid> {
+    let csv = include_str!("../../data/cost_l40s_sm89.csv");
+    Some(GpuCostGrid::from_csv("L40S sm_89", csv))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

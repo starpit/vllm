@@ -65,6 +65,7 @@ pub struct InlineModel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetId {
     L4Sm89,
+    L40sSm89,
     A100Sm80,
     H100Sm90,
 }
@@ -73,6 +74,7 @@ impl TargetId {
     pub fn name(&self) -> &'static str {
         match self {
             TargetId::L4Sm89 => "l4_sm89",
+            TargetId::L40sSm89 => "l40s_sm89",
             TargetId::A100Sm80 => "a100_sm80",
             TargetId::H100Sm90 => "h100_sm90",
         }
@@ -284,6 +286,7 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
 fn parse_target_id(ident: &str) -> syn::Result<TargetId> {
     match ident {
         "l4_sm89" => Ok(TargetId::L4Sm89),
+        "l40s_sm89" => Ok(TargetId::L40sSm89),
         "a100_sm80" => Ok(TargetId::A100Sm80),
         "h100_sm90" => Ok(TargetId::H100Sm90),
         other => Err(syn::Error::new(

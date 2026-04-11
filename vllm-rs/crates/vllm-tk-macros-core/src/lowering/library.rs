@@ -83,10 +83,29 @@ impl ImplementationLibrary {
         Self::l4_sm89_starter(crate::lowering::tile_graph::ModelDims::LLAMA_3_2_1B)
     }
 
+    /// Construct the L40S sm_89 starter library. Same implementation
+    /// set as L4 (same ISA), but initializes the cost model with
+    /// L40S-measured microbenchmarks so the solver picks optimal tile
+    /// configs for the L40S's 142 SMs / 2.52 GHz clock.
+    pub fn l40s_sm89_starter(dims: crate::lowering::tile_graph::ModelDims) -> Self {
+        l4_cost_model::init_for_target(
+            crate::lowering::cost_table::load_l40s_sm89()
+                .expect("L40S cost CSV not found — run gpu_cost_sweep on L40S"),
+            GpuCostTable::l4_sm89(), // elementwise/attention not yet in CSV; use L4 estimates scaled by SM ratio
+        );
+        Self::sm89_starter_common(dims)
+    }
+
     /// Construct the L4 sm_89 starter library: cuBLAS, vllm-rs
     /// fused, FlashInfer standalone, plus the small passthroughs
     /// for QkvSplit / KvCacheWrite / ResidualAdd. CP5-D extends.
     pub fn l4_sm89_starter(dims: crate::lowering::tile_graph::ModelDims) -> Self {
+        // L4 cost model is the default (lazy-initialized), no explicit init needed.
+        Self::sm89_starter_common(dims)
+    }
+
+    /// Shared implementation library for all sm_89 targets.
+    fn sm89_starter_common(dims: crate::lowering::tile_graph::ModelDims) -> Self {
         let mut entries: Vec<Box<dyn Implementation>> = vec![
             // ── cuBLAS GEMM with fused residual (claims GEMM + ResidualAdd
             //    as a two-tile subgraph; uses cublasGemmEx beta=1.0 to
@@ -372,52 +391,70 @@ impl GpuCostTable {
 
 // Cost model backed by the CSV grid. Looks up costs by (M, N, K)
 // with interpolation — no hardcoded per-phase shapes.
+//
+// The active grid is set once via `init_for_target()` and thereafter
+// used by every `Implementation::cost_us()` call. Default: L4 sm_89.
 mod l4_cost_model {
     use super::GpuCostTable;
     use crate::lowering::cost_table::GpuCostGrid;
-    use std::sync::LazyLock;
+    use std::sync::OnceLock;
 
-    static GRID: LazyLock<GpuCostGrid> = LazyLock::new(|| {
-        crate::lowering::cost_table::load_l4_sm89()
-            .expect("L4 cost CSV not found — run gpu_cost_sweep")
-    });
-    // Keep the legacy table for elementwise/attention (not yet in CSV).
-    static TABLE: LazyLock<GpuCostTable> = LazyLock::new(GpuCostTable::l4_sm89);
+    static GRID: OnceLock<GpuCostGrid> = OnceLock::new();
+    static TABLE: OnceLock<GpuCostTable> = OnceLock::new();
+
+    /// Initialize the cost model for a specific target. Call once before
+    /// solving. Subsequent calls are no-ops (first writer wins).
+    pub fn init_for_target(grid: GpuCostGrid, table: GpuCostTable) {
+        let _ = GRID.set(grid);
+        let _ = TABLE.set(table);
+    }
+
+    fn grid() -> &'static GpuCostGrid {
+        GRID.get_or_init(|| {
+            crate::lowering::cost_table::load_l4_sm89()
+                .expect("L4 cost CSV not found — run gpu_cost_sweep")
+        })
+    }
+
+    fn table() -> &'static GpuCostTable {
+        TABLE.get_or_init(GpuCostTable::l4_sm89)
+    }
 
     pub fn gemm_us(m: u32, n: u32, k: u32) -> f64 {
-        GRID.lookup("cublas", m, n, k)
+        grid().lookup("cublas", m, n, k)
     }
 
     pub fn elementwise_us(m: u32, dim: u32) -> f64 {
+        let t = table();
         match dim {
-            2048 => TABLE.elementwise_hd.lookup(m),
-            8192 => TABLE.elementwise_id.lookup(m),
-            3072 => TABLE.elementwise_qkv.lookup(m),
-            512 => TABLE.elementwise_hd.lookup(m) * 0.25,
-            _ => TABLE.elementwise_hd.lookup(m) * (dim as f64 / 2048.0),
+            2048 => t.elementwise_hd.lookup(m),
+            8192 => t.elementwise_id.lookup(m),
+            3072 => t.elementwise_qkv.lookup(m),
+            512 => t.elementwise_hd.lookup(m) * 0.25,
+            _ => t.elementwise_hd.lookup(m) * (dim as f64 / 2048.0),
         }
     }
 
     pub fn attention_us(seq: u32) -> f64 {
-        TABLE.attention.lookup(seq)
+        table().attention.lookup(seq)
     }
 
     /// Look up measured CUTLASS cost by tile config.
     /// CSV kernel names: `cutlass_{M}x{N}_s{stages}`.
     pub fn cutlass_gemm_us(m: u32, n: u32, k: u32, tile_m: u32, tile_n: u32, stages: u32) -> f64 {
         let name = format!("cutlass_{}x{}_s{}", tile_m, tile_n, stages);
-        GRID.lookup(&name, m, n, k)
+        grid().lookup(&name, m, n, k)
     }
 
     /// Fast path: caller pre-computed the cost table key as `&'static str`.
     /// Avoids the format! allocation on every solver backtrack.
     pub fn cutlass_gemm_us_by_key(key: &str, m: u32, n: u32, k: u32) -> f64 {
-        GRID.lookup(key, m, n, k)
+        grid().lookup(key, m, n, k)
     }
 
     /// Look up measured CUTLASS GEMV cost (only valid at M=1).
     pub fn gemv_us(m: u32, n: u32, k: u32) -> f64 {
-        GRID.lookup("cutlass_gemv", m, n, k)
+        grid().lookup("cutlass_gemv", m, n, k)
     }
 }
 

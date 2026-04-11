@@ -229,6 +229,25 @@ impl LoweringConstraints {
             gpu_clock_hz: 1.985e9,
         }
     }
+
+    /// L40S sm_89: same ISA as L4 but 142 SMs, higher clocks.
+    /// Barrier/launch costs measured on L4 — TODO: re-measure on L40S.
+    pub const fn l40s_sm89() -> Self {
+        Self {
+            barrier_cost_us: 100.0,
+            launch_cost_us: 80.0,
+            regs_dynamic_per_warpgroup: false,
+            mbarrier_handoff_us: None,
+            dsmem_cluster_handoff_us: None,
+            tmem_accum_offload: false,
+            max_regs_per_thread: 255,
+            max_shmem_per_cta_bytes: 99 * 1024,
+            regs_per_sm: 65536,
+            warps_per_sm: 48,
+            // L40S boost clock 2.520 GHz (datasheet).
+            gpu_clock_hz: 2.520e9,
+        }
+    }
 }
 
 /// Per-target hardware profile. Single source of truth for
@@ -318,6 +337,28 @@ impl TargetProfile {
             norm_kernel: NormKernelChoice::HandWrittenWarpShuffle,
             rope_kernel: RopeKernelChoice::HandWrittenSplitHalf,
             lowering: LoweringConstraints::l4_sm89(),
+        }
+    }
+
+    /// L40S (sm_89). 142 SMs, same ISA as L4 but ~2.4x more SMs and
+    /// higher boost clock (2.52 GHz vs 1.98 GHz). Same shmem/reg limits.
+    pub const fn l40s_sm89() -> Self {
+        Self {
+            num_sm: 142,
+            seq_len: 1024,
+            batch_size: 1,
+            cooperative_blocks_per_sm: 1,
+            max_dynamic_shmem_bytes: 99 * 1024,
+            gemm_kernel: GemmKernelChoice::CutlassSm80Multistage {
+                tile_m: 256,
+                tile_n: 128,
+                tile_k: 32,
+                pipeline_stages: 4,
+            },
+            attention_kernel: AttentionKernelChoice::FlashInferPersistent,
+            norm_kernel: NormKernelChoice::HandWrittenWarpShuffle,
+            rope_kernel: RopeKernelChoice::HandWrittenSplitHalf,
+            lowering: LoweringConstraints::l40s_sm89(),
         }
     }
 

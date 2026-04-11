@@ -153,16 +153,17 @@ solver_forward_layer() — the generated function
 | **Proc macro** | |
 | `vllm-tk-macros/src/lib.rs` | `forward!` proc macro entry point |
 | **Runtime integration** | |
-| `vllm-cuda/src/model/solver_dispatch.rs` | forward! invocation + CUTLASS FFI declarations |
+| `vllm-cuda/src/model/solver_dispatch.rs` | forward! invocation + CUTLASS/GEMV FFI via `cutlass_gemm_ffi!` macro |
 | `vllm-cuda/src/model/llama.rs` | LlamaModel::forward() calls solver_forward_layer() |
 | `vllm-cuda/src/layers.rs` | LinearLayer::dense_weight() for CUTLASS pointer extraction |
-| `vllm-cuda/csrc/cutlass_standalone_gemm.cu` | CUTLASS 64×64 + 128×128 standalone launchers |
+| `vllm-cuda/csrc/cutlass_standalone_gemm.cu` | **canonical** CUTLASS GEMM grid (16 configs + GEMV) via `CUTLASS_GEMM` macro |
 | `vllm-cuda/build.rs` | Links libcutlass_standalone_gemm.a |
-| `vllm-kernels-cuda/build.rs` | Compiles cutlass_standalone_gemm.cu |
+| `vllm-kernels-cuda/build.rs` | Compiles cutlass_standalone_gemm.cu + cp5_fused_mlp (TK) |
+| `vllm-tk-test-harness/build.rs` | Builds test harness; references **canonical** `cutlass_standalone_gemm.cu` (no duplicate) |
 | **Cost data** | |
-| `data/cost_l4_sm89.csv` | 702 measured cost points (18 shapes × 13 M × 3 kernels) |
+| `data/cost_l4_sm89.csv` | 3999 measured cost points (18 shapes × 13 M × 17 kernels) |
 | **Sweep test** | |
-| `tests/scheduled_megakernel_test.rs` | `gpu_cost_sweep` — THE entrypoint for new GPUs |
+| `vllm-tk-test-harness/tests/scheduled_megakernel_test.rs` | `gpu_cost_sweep` — THE entrypoint for new GPUs. Benchmarks via the `bench_cutlass!` data-driven macro so new configs are picked up automatically. |
 
 ## Adding a new GPU
 
@@ -208,10 +209,9 @@ For non-LLaMA architectures (MoE, sliding window, etc.), add new
 
 | Impl | Tiles claimed | Decode/Prefill | Status |
 |------|--------------|----------------|--------|
-| CublasGemmExImpl | single GEMM (1) | both | ✅ wired |
-| CublasGemmExWithResidualImpl | GEMM+res (2) | both | ✅ wired |
-| CutlassGemmImpl (64/128) | single GEMM (1) | both | ✅ wired |
-| CutlassGemmWithResidualImpl | GEMM+res (2) | both | ✅ wired |
+| CutlassGemmImpl (16 configs) | single GEMM (1) | both | ✅ wired |
+| CutlassGemmWithResidualImpl (16 configs) | GEMM+res (2) | both | ✅ wired |
+| CutlassGemvImpl (M=1 only) | single GEMM (1) | both | ✅ wired |
 | VllmRsRmsNormImpl | norm (1) | both | ✅ wired |
 | VllmRsFusedQkvRopeCacheImpl | split+rope+kv (3) | decode only | ✅ wired |
 | VllmRsPrefillRopeCacheImpl | split+rope+kv (3) | prefill only | ✅ wired |
@@ -219,9 +219,38 @@ For non-LLaMA architectures (MoE, sliding window, etc.), add new
 | FlashInferStandaloneImpl | attn (1) | decode only | ✅ wired |
 | FlashInferStandardImpl | attn (1) | prefill only | ✅ wired |
 | CutlassNormGemmImpl | norm+GEMM (2) | both | ❌ no backing kernel |
-| TkFusedMlpBlockImpl | 7-tile MLP | both | ❌ disabled (codegen not wired) |
+| TkFusedMlpBlockImpl | 7-tile MLP | both | ❌ disabled (single-row kernel, see below) |
 | KvCacheWriteImpl | kv_write (1) | both | ✅ noop |
 | ResidualAddImpl | res_add (1) | both | ✅ noop |
+| ~~CublasGemmExImpl~~ | — | — | **removed** from starter library |
+| ~~CublasGemmExWithResidualImpl~~ | — | — | **removed** from starter library |
+
+### CUTLASS tile grid
+
+Defined via C macro `CUTLASS_GEMM(M, N, K, WM, WN, WK, STAGES)` in
+`vllm-cuda/csrc/cutlass_standalone_gemm.cu`. Each entry stamps out a
+kernel + `extern "C"` launch wrapper. Current grid:
+
+| TB shape | Stages | Use case |
+|----------|--------|----------|
+| 32×64    | 3, 4   | M=2–16 small-batch decode |
+| 32×128   | 3, 4   | M=2–16 gate/up where N>>K |
+| 32×256   | 3      | M=2–16 large output dim |
+| 64×64    | 3, 4   | General small-M |
+| 64×128   | 3, 4   | M≈16-64, larger N |
+| 128×64   | 3, 4   | M≈64-128 |
+| 128×128  | 3, 4   | General large-M |
+| 128×256  | 3      | Large prefill, wide N |
+| 256×64   | 3, 4   | Large prefill, narrow N |
+| ~~256×128 s3~~ | — | excluded — exceeds 99 KB sm89 SMEM |
+
+Plus `cutlass_gemv_launch` (SIMT GEMV for M=1, wraps `cutlass::gemm::device::Gemv`).
+
+Adding a new tile config is **three edits**: the `CUTLASS_GEMM(...)`
+line in the `.cu`, the `(M, N, K)` tuple in `CutlassGemmImpl::all_configs`
+and `CutlassGemmWithResidualImpl::all_configs` in `library.rs`, and the
+symbol name in `cutlass_gemm_ffi!` in both `solver_dispatch.rs` and
+`vllm-tk-test-harness/src/lib.rs`. Then re-run `gpu_cost_sweep`.
 
 ## Codegen dataflow variables
 
@@ -239,36 +268,90 @@ variables to pass data between dispatch entries:
 | `gate_up` | Gate GEMM, Up concat | SiluAndMul |
 | `silu_out` | SiluAndMul | Down GEMM |
 
+## Done recently (2026-04-11)
+
+- ✅ **cuBLAS-free solver**: `CublasGemmExImpl` + `CublasGemmExWithResidualImpl`
+  removed from starter library. Measured **1–5% faster than cuBLAS baseline**
+  at every tested batch size (BS=1–32) on Llama 3.2 3B / L4. See commit
+  `0e2dfb6f2` for per-batch data. (Binary still links `libcublas.so.12`
+  via `LinearLayer::Dense::forward()` for lm_head — see TODO below.)
+- ✅ **Expanded CUTLASS grid**: 2 tile configs → 16 configs via C macro.
+  Adding a new config is 3 edits + re-sweep.
+- ✅ **CUTLASS GEMV at M=1**: `CutlassGemvImpl` wraps `cutlass::gemm::device::Gemv`.
+  1.5–1.9× faster than cuBLAS at BS=1 decode (the most common workload).
+- ✅ **Dims-aware cost model**: plumbed `ModelDims` through `l4_sm89_starter`
+  → `CutlassGemmImpl::cost_us()`. Previously used hardcoded 1B shapes
+  which caused the solver to pick wrong kernels on 3B models.
+- ✅ **String-keyed cost table**: `GpuCostGrid::lookup` takes `&str` instead
+  of an enum. CSV kernel names (`cutlass_{M}x{N}_s{stages}`, `cutlass_gemv`)
+  map directly — no code change needed when adding configs.
+- ✅ **Single-source CUTLASS GEMM**: test harness now builds
+  `vllm-cuda/csrc/cutlass_standalone_gemm.cu` directly instead of a
+  drifting duplicate in `vllm-tk-test-harness/csrc/`.
+- ✅ **TK fused MLP wiring investigation**: fully wired the solver
+  codegen + FFI + build, then discovered the underlying kernel is
+  **single-row by design** (norm phase hardcoded to row 0, GEMM tiles
+  are internal tiling not batch parallelism). The cp5 grid-dispatch
+  patch only fixed GEMM addressing, not the norm. Cost model now
+  reports `M × single-row cost` so the solver never picks it — a
+  correct multi-batch kernel would need real kernel engineering.
+
 ## What's next (priority order)
 
-1. **`models: runtime` / `target: runtime`** — solver runs at startup
-   with dims from loaded weights. Any model without recompiling.
-   The ForwardDef parser already accepts `models: runtime`.
+1. **Binary-level cuBLAS elimination** — `LinearLayer::Dense::forward()`
+   still uses `cublas.gemm()` for lm_head, embedding, and quantized
+   fallbacks. ~12% of total GEMM compute at BS=1 is the lm_head
+   `[128256, 3072]` projection. To drop `libcublas.so.12` from the
+   container image (816 MB saving on ~250 MB binary — 3× image
+   reduction), route lm_head through `cutlass_gemm_*_launch` directly
+   and remove `cublas`/`cublaslt` features from `cudarc` in
+   `vllm-cuda/Cargo.toml`. See commit `0e2dfb6f2` body for details.
 
-2. **TK fused MLP wiring** — `TkFusedMlpBlockImpl` is disabled
-   (`target_compatible = false`). Wire the TK launcher FFI into
-   vllm-cuda so the solver can pick it at M=128. The codegen has
-   a `compile_error!` placeholder for `ImplDispatchKind::TkFusedMlpBlock`.
+2. **`models: runtime` / `target: runtime`** — solver runs at startup
+   with dims from loaded weights. Any model without recompiling.
+   The ForwardDef parser already accepts `models: runtime`. Blocks
+   multi-model deployments and simplifies the "different dims = different
+   binary" workflow.
 
 3. **CUTLASS norm+GEMM prologue** — `CutlassNormGemmImpl` exists in
    the library but has no backing CUDA kernel. Eliminates 2 norm
-   launches/layer by folding RMSNorm into the CUTLASS prologue.
+   launches/layer by folding RMSNorm into the CUTLASS prologue. Profile
+   shows RMSNorm is ~2.5% of GPU time — real gain is ~1-2% after
+   accounting for launch overhead savings. Lower priority than it looks.
 
-4. **TP all-reduce tiles** — add `TileKind::AllReduce` after OProj
+4. **Batch-aware TK fused MLP** — the current kernel is single-row by
+   design (norm processes exactly 1 row, GEMM's 128-row tile is K-dim
+   tiling not batch). To make fusion worthwhile for M>1, either:
+   (a) rewrite the norm phase to cooperatively norm all M rows, or
+   (b) launch grid=M with per-row addressing throughout. Theoretical
+   win: ~5-15% at BS=1-4 from eliminating GMEM round-trips between
+   norm/gate/up/silu/down. Real kernel work, not a config change.
+
+5. **TP all-reduce tiles** — add `TileKind::AllReduce` after OProj
    and Down in the tile graph. Required for multi-GPU correctness.
    With TP, GEMM shapes change (sharded dims) — needs `models: runtime`.
 
-5. **Multi-GPU cost CSVs** — run `gpu_cost_sweep` on A100, H100.
-   Check in the CSVs. Add `TargetId` variants.
+6. **Multi-GPU cost CSVs** — run `gpu_cost_sweep` on A100, H100.
+   Check in the CSVs. Add `TargetId` variants. The sweep is now
+   data-driven (all 16 configs enumerated in a `bench_cutlass!` macro
+   loop), so this is a matter of running it on new hardware.
 
-6. **Elementwise + attention in CSV** — norm, SiLU, FlashInfer costs
+7. **Elementwise + attention in CSV** — norm, SiLU, FlashInfer costs
    are still hardcoded `CostCurve`. Move them to the sweep.
 
-7. **Remove `megakernel!`** — dead code, replaced by `forward!`.
+8. **Split-K CUTLASS variants** — at some shapes (e.g. Down GEMM with
+   K=8192 at M=64), cuBLAS's split-K strategy can outperform our serial-K
+   `device::Gemm`. `cutlass::gemm::device::GemmSplitKParallel` exists
+   and would slot into the existing `CUTLASS_GEMM` macro pattern.
+   Currently CUTLASS wins everywhere anyway, so this is optional polish.
 
-8. **ILP backend** — the `Solver` trait is ready; `solver::ilp` is a
-   stub. Encode constraints as MILP when the CP solver proves
-   intractable on richer libraries.
+9. **Remove `megakernel!`** — dead code, replaced by `forward!`.
+
+10. **ILP backend** — the `Solver` trait is ready; `solver::ilp` is a
+    stub. Encode constraints as MILP when the CP solver proves
+    intractable on richer libraries. Solve time is currently ~11s with
+    the expanded 16-config grid (was ~2s with 2 configs) — still tractable
+    but trending up.
 
 ## How to run
 
@@ -293,10 +376,21 @@ CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
 
 - `renders_polyalgorithm_kernel` test fails (pre-existing, unrelated)
 - CutlassNormGemmImpl: solver doesn't pick it within 10K step budget
-- TkFusedMlpBlockImpl: disabled until codegen is wired
+- TkFusedMlpBlockImpl: kernel is single-row; cost model prevents solver
+  from picking it. Won't fire until kernel is rewritten to handle batch>1.
 - Elementwise/attention costs are rough estimates, not in CSV yet
 - Multi-model (`models: [...]` with >1 entry) not yet implemented
   (uses first model only)
+- `cutlass_256x128_s3` config exceeds sm89 99 KB SMEM limit and fails
+  `can_implement` silently; excluded from the library (see
+  `cutlass_standalone_gemm.cu` comment)
+- Cost sweep runs kernels in tight warm-cache loops; real production
+  cost may differ ~3-5% due to cold-cache effects. In practice the
+  solver's picks still beat cuBLAS end-to-end, but individual
+  microbenchmark numbers should be treated as relative, not absolute.
+- Binary still dynamically links `libcublas.so.12` + `libcublasLt.so.12`
+  (816 MB combined). Solver never calls them, but `LinearLayer::Dense::forward()`
+  does for lm_head / embedding / quantized fallbacks. See TODO #1.
 
 ## Environment notes
 

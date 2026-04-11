@@ -20,6 +20,7 @@
 #![cfg(feature = "cuda")]
 
 use cudarc::driver::result;
+use cudarc::driver::sys;
 use half::bf16;
 use vllm_tk_macros_core::target_profile::TargetProfile;
 use vllm_tk_test_harness::ffi;
@@ -33,11 +34,27 @@ const PAGE_SIZE: usize = 16;
 // SEQ_LEN / PAGE_SIZE = 4 pages.
 const NUM_PAGES: usize = SEQ_LEN.div_ceil(PAGE_SIZE);
 
-fn init_cuda() {
+fn init_cuda() -> sys::CUdevice {
     result::init().expect("cuInit failed");
     let device = result::device::get(0).expect("cuDeviceGet failed");
     let ctx = unsafe { result::primary_ctx::retain(device) }.expect("cuCtxRetain failed");
     unsafe { result::ctx::set_current(ctx) }.expect("cuCtxSetCurrent failed");
+    device
+}
+
+/// Query the device for `MultiProcessorCount`. Used to size FlashInfer
+/// workspaces and to pass `num_sm` into the forked planner, so both
+/// sides agree on the cluster count regardless of which GPU we're on.
+fn device_num_sms(device: sys::CUdevice) -> u32 {
+    let n = unsafe {
+        result::device::get_attribute(
+            device,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )
+    }
+    .expect("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT) failed");
+    assert!(n > 0, "device reported MultiProcessorCount = {n}");
+    n as u32
 }
 
 fn gpu_upload_bf16(host: &[bf16]) -> u64 {
@@ -202,7 +219,7 @@ fn errs(a: &[bf16], b: &[bf16]) -> (f32, f32) {
 #[test]
 #[ignore = "needs GPU"]
 fn flashinfer_attention_runner_smoke() {
-    init_cuda();
+    let device = init_cuda();
 
     // ── Inputs (host) ──
     let q_flat = det_bf16_fill(SEQ_LEN * NUM_QO_HEADS * HEAD_DIM, /*seed=*/ 1);
@@ -251,9 +268,24 @@ fn flashinfer_attention_runner_smoke() {
     let kv_indices_d = gpu_upload_i32(&kv_indices);
     let o_d = gpu_alloc_bf16(SEQ_LEN * NUM_QO_HEADS * HEAD_DIM);
 
-    // ── Workspace sizes from the target profile (no magic
-    //    constants in the C++ shim or here) ──
-    let profile = TargetProfile::l4_sm89();
+    // ── Workspace sizes from a device-derived target profile. ──
+    //
+    // The test queries the running GPU for its SM count and patches
+    // the L4 profile's `num_sm` field with the real value. Both the
+    // workspace calculation and the `target_num_clusters` argument
+    // passed into the shim's forked planner (`TwoStageHolisticPlanWithNumSm`)
+    // are derived from the SAME number, so they cannot disagree on
+    // how big the planner's bump-allocator scratch needs to be. This
+    // makes the test portable across any sm80+ card (L4, L40S, A100,
+    // H100, ...) without maintaining per-GPU `TargetProfile`
+    // constructors just for the smoke test. A proper per-GPU
+    // `TargetProfile` is still useful for the solver's cost model
+    // (see SOLVER_HANDOFF.md TODO "Multi-GPU cost CSVs"), but it's
+    // orthogonal to this test.
+    let num_sm = device_num_sms(device);
+    let mut profile = TargetProfile::l4_sm89();
+    profile.num_sm = num_sm;
+    let num_clusters = profile.cooperative_grid_size();
     let float_ws_bytes =
         profile.flashinfer_float_workspace_bytes(HEAD_DIM as u32, NUM_KV_HEADS as u32);
     let int_ws_bytes = profile.flashinfer_int_workspace_bytes();
@@ -274,6 +306,7 @@ fn flashinfer_attention_runner_smoke() {
             NUM_PAGES as i32,
             float_ws_bytes,
             int_ws_bytes,
+            num_clusters as i32,
             sm_scale,
             /*stream=*/ 0,
         )

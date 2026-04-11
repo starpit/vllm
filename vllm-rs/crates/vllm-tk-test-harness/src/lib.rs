@@ -121,6 +121,16 @@ pub mod ffi {
             // magic numbers in the C++ shim.
             float_ws_bytes: usize,
             int_ws_bytes: usize,
+            // Must match the `num_sm` value the caller used to size the
+            // workspaces above. The shim passes this through to its
+            // forked `TwoStageHolisticPlanWithNumSm` planner so the
+            // planner's internal cluster count is guaranteed to agree
+            // with the allocated workspace — otherwise the planner's
+            // bump-allocator overruns the buffer and the persistent
+            // runner aborts. Typically
+            // `device_num_sms * cooperative_blocks_per_sm`, i.e. what
+            // `TargetProfile::cooperative_grid_size()` returns.
+            target_num_clusters: i32,
             sm_scale: f32,
             stream: u64,
         ) -> i32;

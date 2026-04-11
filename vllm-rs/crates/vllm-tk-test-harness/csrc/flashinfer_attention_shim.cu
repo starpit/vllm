@@ -62,6 +62,21 @@ enum class FlashInferShimStatus : int32_t {
   CudaSyncFailed = 5,
 };
 
+// Forward declaration for the forked planner (definition further down).
+// See the function-level comment near its definition for why the fork
+// exists: upstream `TwoStageHolisticPlan` queries
+// `cudaDevAttrMultiProcessorCount` and doubles it under the assumption
+// of 2 CTAs/SM cooperative residency, which produces a `num_sm` that
+// disagrees with the caller's workspace-sizing calculation. The fork
+// takes `num_sm` as an explicit caller parameter so both sides agree.
+template <typename IdType>
+inline cudaError_t TwoStageHolisticPlanWithNumSm(
+    void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
+    void* page_locked_int_buffer, size_t int_workspace_size_in_bytes,
+    HolisticPlanInfo<2>& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h,
+    IdType* kv_len_arr_h, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t head_dim, bool causal, cudaStream_t stream, int num_sm_in);
+
 extern "C" int32_t run_flashinfer_attention_smoke(
     DTypeQ* q,                  // device  [seq_len, num_qo_heads, head_dim]
     DTypeKV* k,                 // device  [num_pages, page_size, num_kv_heads, head_dim]
@@ -70,6 +85,12 @@ extern "C" int32_t run_flashinfer_attention_smoke(
     DTypeO* o,                  // device  [seq_len, num_qo_heads, head_dim]
     int32_t seq_len, int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
     int32_t page_size, int32_t num_pages, size_t float_ws_bytes, size_t int_ws_bytes,
+    // `target_num_clusters` must match the value the caller used to size
+    // `float_ws_bytes` / `int_ws_bytes`. Typically
+    // `cudaDeviceGetAttribute(cudaDevAttrMultiProcessorCount) *
+    //  cooperative_blocks_per_sm` (see the Rust-side
+    // `TargetProfile::cooperative_grid_size()`).
+    int32_t target_num_clusters,
     float sm_scale, cudaStream_t stream) {
   if (head_dim != HEAD_DIM_QK) {
     std::fprintf(stderr,
@@ -82,7 +103,7 @@ extern "C" int32_t run_flashinfer_attention_smoke(
   // ── Workspace allocation ──
   void* float_ws_d = nullptr;
   void* int_ws_d = nullptr;
-  void* int_ws_h = nullptr;  // page-locked mirror — required by TwoStageHolisticPlan
+  void* int_ws_h = nullptr;  // page-locked mirror — required by the planner
 
   if (cudaMalloc(&float_ws_d, float_ws_bytes) != cudaSuccess) {
     return static_cast<int32_t>(FlashInferShimStatus::CudaMallocFailed);
@@ -102,13 +123,18 @@ extern "C" int32_t run_flashinfer_attention_smoke(
   IdType kv_indptr_h[2] = {0, num_pages};
   IdType kv_len_h[1] = {seq_len};
 
+  // Call the forked planner with caller-supplied num_sm so the planner's
+  // internal cluster count matches the workspace we allocated. Calling
+  // upstream `TwoStageHolisticPlan` here instead would silently
+  // disagree with the Rust-side workspace calculation by the 2×
+  // residency assumption baked into upstream.
   HolisticPlanInfo<2> plan_info;
-  cudaError_t status = TwoStageHolisticPlan<IdType>(
+  cudaError_t status = TwoStageHolisticPlanWithNumSm<IdType>(
       float_ws_d, float_ws_bytes, int_ws_d, int_ws_h, int_ws_bytes, plan_info,
       qo_indptr_h, kv_indptr_h, kv_len_h, /*batch_size=*/1, num_qo_heads, num_kv_heads, head_dim,
-      /*causal=*/true, stream);
+      /*causal=*/true, stream, /*num_sm_in=*/target_num_clusters);
   if (status != cudaSuccess) {
-    std::fprintf(stderr, "TwoStageHolisticPlan failed: %s\n", cudaGetErrorString(status));
+    std::fprintf(stderr, "TwoStageHolisticPlanWithNumSm failed: %s\n", cudaGetErrorString(status));
     cudaFree(float_ws_d);
     cudaFree(int_ws_d);
     cudaFreeHost(int_ws_h);

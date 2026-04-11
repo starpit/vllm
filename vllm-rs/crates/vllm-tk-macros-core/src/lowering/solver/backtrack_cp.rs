@@ -103,8 +103,12 @@ fn min_cost_per_tile_kind(problem: &Problem) -> HashMap<TileKind, f64> {
             continue;
         };
         let mut min_cost = f64::INFINITY;
+        let num_tokens = problem.profile.num_tokens();
         for imp in &problem.library.entries {
             if !imp.target_compatible(problem.profile) {
+                continue;
+            }
+            if !imp.workload_constraint().accepts(num_tokens) {
                 continue;
             }
             if let Some(m) = imp.matches(problem.tile_graph, seed, problem.profile) {
@@ -210,8 +214,12 @@ impl<'a> SearchState<'a> {
                 continue;
             }
             let mut best = f64::MAX;
+            let num_tokens = self.problem.profile.num_tokens();
             for imp in &self.problem.library.entries {
                 if !imp.target_compatible(self.problem.profile) {
+                    continue;
+                }
+                if !imp.workload_constraint().accepts(num_tokens) {
                     continue;
                 }
                 if let Some(m) = imp.matches(self.problem.tile_graph, node.id, self.problem.profile)
@@ -328,9 +336,13 @@ fn recurse(state: &mut SearchState<'_>, _starting_step: u32) {
     let library_entries = &state.problem.library.entries;
     let profile = state.problem.profile;
     let tile_graph = state.problem.tile_graph;
+    let num_tokens = profile.num_tokens();
     let mut candidates: Vec<(ImplId, crate::lowering::implementation::MatchInfo, f64)> = Vec::new();
     for (idx, imp) in library_entries.iter().enumerate() {
         if !imp.target_compatible(profile) {
+            continue;
+        }
+        if !imp.workload_constraint().accepts(num_tokens) {
             continue;
         }
         let Some(m) = imp.matches(tile_graph, seed, profile) else {
@@ -639,6 +651,7 @@ mod tests {
             TileKind::GemmGate => "gate",
             TileKind::GemmUp => "up",
             TileKind::GemmDown => "down",
+            TileKind::GemmLmHead => "lmh",
             TileKind::QkvSplit => "split",
             TileKind::Rope => "rope",
             TileKind::KvCacheWrite => "kv_w",

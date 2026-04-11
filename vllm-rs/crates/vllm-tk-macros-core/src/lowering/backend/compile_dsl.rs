@@ -237,6 +237,7 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
     let mut heads: Option<u32> = None;
     let mut kv_heads: Option<u32> = None;
     let mut head_dim: Option<u32> = None;
+    let mut vocab: Option<u32> = None;
 
     while !input.is_empty() {
         let key: Ident = input.parse()?;
@@ -251,6 +252,7 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
             "heads" => heads = Some(val.base10_parse()?),
             "kv_heads" => kv_heads = Some(val.base10_parse()?),
             "head_dim" => head_dim = Some(val.base10_parse()?),
+            "vocab" => vocab = Some(val.base10_parse()?),
             other => {
                 return Err(syn::Error::new(
                     key.span(),
@@ -272,6 +274,9 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
                 .ok_or_else(|| syn::Error::new(input.span(), "missing `kv_heads`"))?,
             head_dim: head_dim
                 .ok_or_else(|| syn::Error::new(input.span(), "missing `head_dim`"))?,
+            // Default to Llama 3 vocab if not specified — the solver still
+            // compiles without this; it's only used by the lm_head cost lookup.
+            vocab_size: vocab.unwrap_or(128256),
         },
     })
 }

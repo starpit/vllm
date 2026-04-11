@@ -109,6 +109,10 @@ pub enum TileKind {
     GemmUp,
     /// Down projection GEMM. Beta=1 residual is **lifted out**.
     GemmDown,
+    /// Final lm_head projection: `logits = hidden @ lm_head^T`.
+    /// Output `[seq, vocab_size]`. Runs once at the end of the
+    /// forward pass, after all decoder layers and the final norm.
+    GemmLmHead,
 
     // ── Position encoding + cache ──
     /// Splits the packed qkv buffer into three logical outputs
@@ -153,6 +157,7 @@ impl TileKind {
                 | TileKind::GemmGate
                 | TileKind::GemmUp
                 | TileKind::GemmDown
+                | TileKind::GemmLmHead
         )
     }
 
@@ -165,6 +170,7 @@ impl TileKind {
             TileKind::GemmGate => "gemm_gate",
             TileKind::GemmUp => "gemm_up",
             TileKind::GemmDown => "gemm_down",
+            TileKind::GemmLmHead => "gemm_lm_head",
             TileKind::QkvSplit => "qkv_split",
             TileKind::Rope => "rope",
             TileKind::KvCacheWrite => "kv_cache_write",
@@ -221,6 +227,8 @@ pub struct ModelDims {
     pub num_attention_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
+    /// Vocabulary size — the output dim of the lm_head projection.
+    pub vocab_size: u32,
 }
 
 impl ModelDims {
@@ -230,6 +238,7 @@ impl ModelDims {
         num_attention_heads: 32,
         num_kv_heads: 8,
         head_dim: 64,
+        vocab_size: 128256,
     };
 
     /// QKV output dimension = (num_q_heads + 2 * num_kv_heads) * head_dim.
@@ -490,6 +499,40 @@ impl TileGraph {
             hidden_state_tile = current_hidden;
         }
 
+        // ── Post-loop ops (final norm, lm_head) ──
+        //
+        // DSL statements after the `for layer in 0..NL` loop. These
+        // run once per forward pass, not per layer. We use `layer =
+        // num_layers` as the layer tag so the solver treats them
+        // as a distinct per-forward-pass phase.
+        let post_loop_ops: Vec<_> = dag.ops.iter().filter(|op| !op.in_layer_loop).collect();
+        if !post_loop_ops.is_empty() {
+            buf_to_tile.clear();
+            let post_layer = num_layers;
+            let mut current_hidden = hidden_state_tile;
+
+            for op in &post_loop_ops {
+                match &op.kind {
+                    OpKind::RmsNorm { input, output, .. } => {
+                        let dep = self_or_hidden(&buf_to_tile, &input.0, current_hidden);
+                        let tile = push(&mut nodes, TileKind::RmsNorm, post_layer, vec![dep]);
+                        buf_to_tile.insert(output.0.clone(), tile);
+                        current_hidden = tile;
+                    }
+                    OpKind::Gemm { a, b, output } => {
+                        let dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
+                        let kind = classify_gemm(&b.0);
+                        let tile = push(&mut nodes, kind, post_layer, vec![dep]);
+                        buf_to_tile.insert(output.0.clone(), tile);
+                        current_hidden = tile;
+                    }
+                    // Other ops (GemmAdd, RopeAppend, Attention, Silu, Mul)
+                    // are not expected in the post-loop phase. Skip gracefully.
+                    _ => {}
+                }
+            }
+        }
+
         TileGraph {
             nodes,
             num_layers,
@@ -528,16 +571,14 @@ fn classify_gemm(weight_name: &str) -> TileKind {
         TileKind::GemmQkv
     } else if w.contains("o_proj") {
         TileKind::GemmOProj
+    } else if w.contains("lm_head") {
+        TileKind::GemmLmHead
     } else if w.contains("gate") {
         TileKind::GemmGate
     } else if w.contains("up") {
         TileKind::GemmUp
     } else if w.contains("down") {
         TileKind::GemmDown
-    } else if w.contains("lm_head") {
-        // Final projection — not a per-layer GEMM.
-        // For now, treat as OProj (closest shape).
-        TileKind::GemmOProj
     } else {
         // Unknown weight — default to generic GEMM.
         TileKind::GemmQkv
@@ -642,13 +683,18 @@ mod self_tests {
         let from_dag = TileGraph::from_model_dag(&dag, ModelDims::LLAMA_3_2_1B);
         let hardcoded = TileGraph::build_llama_forward_1b(2);
 
-        // Same number of nodes.
+        // from_dag includes the post-loop (rmsnorm + lm_head) ops tagged
+        // with layer=num_layers; the hardcoded build_llama_forward_1b
+        // doesn't emit them. Count only in-loop nodes for comparison.
+        let in_loop = |tg: &TileGraph, num_layers: u16| -> usize {
+            tg.nodes.iter().filter(|n| n.layer < num_layers).count()
+        };
         assert_eq!(
-            from_dag.nodes.len(),
-            hardcoded.nodes.len(),
+            in_loop(&from_dag, 2),
+            in_loop(&hardcoded, 2),
             "node count mismatch: from_dag={}, hardcoded={}",
-            from_dag.nodes.len(),
-            hardcoded.nodes.len(),
+            in_loop(&from_dag, 2),
+            in_loop(&hardcoded, 2),
         );
 
         // Same tile kinds per layer.

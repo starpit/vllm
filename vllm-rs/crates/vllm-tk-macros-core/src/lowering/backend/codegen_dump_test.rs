@@ -19,6 +19,7 @@ mod tests {
                 let up = gemm(normed2, up_weights[layer]);
                 hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
             }
+            logits = gemm(hidden_states, lm_head);
 
             models: [
                 { layers: 16, hidden: 2048, intermediate: 8192, heads: 32, kv_heads: 8, head_dim: 64 },

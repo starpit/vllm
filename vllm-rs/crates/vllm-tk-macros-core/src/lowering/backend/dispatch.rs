@@ -64,6 +64,9 @@ pub enum GemmPhase {
     Gate,
     Up,
     Down,
+    /// Final projection `[seq, vocab] = [seq, hidden] @ [hidden, vocab]`.
+    /// Runs once after all decoder layers; weight is `model.lm_head`.
+    LmHead,
 }
 
 /// One entry in the dispatch sequence — fully resolved, ready for
@@ -219,6 +222,7 @@ fn classify_impl(
             TileKind::GemmGate => Some(GemmPhase::Gate),
             TileKind::GemmUp => Some(GemmPhase::Up),
             TileKind::GemmDown => Some(GemmPhase::Down),
+            TileKind::GemmLmHead => Some(GemmPhase::LmHead),
             _ => None,
         });
 

@@ -72,6 +72,12 @@ pub enum Constraint {
     /// The impl assigned to this subgraph must report
     /// `target_compatible(profile) == true`.
     TargetCompatible { subgraph: SubgraphId },
+    /// The impl assigned to this subgraph must have a
+    /// `workload_constraint()` that accepts `profile.num_tokens()`.
+    /// Distinct from `TargetCompatible` (GPU capability) — this is
+    /// about workload-shape correctness requirements (e.g. "GEMV
+    /// only handles M=1" or "this fused kernel requires M ≥ 64").
+    WorkloadCompatible { subgraph: SubgraphId },
     /// The dep edge `producer_tile → consumer_tile` must be
     /// respected by the schedule: either both tiles are in the
     /// same subgraph (in which case the impl handles it
@@ -197,6 +203,21 @@ impl Constraint {
                     return ConstraintStatus::Unknown;
                 };
                 if library.get(*impl_id).target_compatible(profile) {
+                    ConstraintStatus::Satisfied
+                } else {
+                    ConstraintStatus::Violated
+                }
+            }
+
+            Constraint::WorkloadCompatible { subgraph } => {
+                let Some(impl_id) = assignment.impls.get(subgraph) else {
+                    return ConstraintStatus::Unknown;
+                };
+                if library
+                    .get(*impl_id)
+                    .workload_constraint()
+                    .accepts(profile.num_tokens())
+                {
                     ConstraintStatus::Satisfied
                 } else {
                     ConstraintStatus::Violated

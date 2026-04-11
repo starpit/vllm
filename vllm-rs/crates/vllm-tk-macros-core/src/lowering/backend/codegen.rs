@@ -50,8 +50,18 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
 
     let mut bucket_fns = Vec::new();
     let mut match_arms = Vec::new();
+    let mut lm_head_bucket_fns = Vec::new();
+    let mut lm_head_match_arms = Vec::new();
     let mut prev_upper = 0u32;
+    let mut lm_head_prev_upper = 0u32;
     let plans: Vec<_> = family.iter().collect();
+    let num_layers = tile_graph.num_layers;
+
+    // Detect whether the DSL includes the post-loop phase (has any
+    // tile tagged with layer == num_layers). If so, we emit the
+    // lm_head dispatcher; otherwise we skip it (back-compat with the
+    // pre-lm_head DSL).
+    let has_post_loop = tile_graph.nodes.iter().any(|n| n.layer == num_layers);
 
     for (i, (seq, plan)) in plans.iter().enumerate() {
         let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
@@ -106,7 +116,57 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
             ),
         });
         prev_upper = upper.saturating_add(1);
+
+        // ── Post-loop (lm_head) bucket function ──
+        if has_post_loop {
+            let lm_fn_name = format_ident!("solver_lm_head_bucket_{}", i);
+            let lm_stmts = emit_post_loop_stmts(&ds, num_layers);
+
+            lm_head_bucket_fns.push(quote! {
+                #[allow(unused_variables, unused_mut, unused_assignments)]
+                #[inline(never)]
+                unsafe fn #lm_fn_name(
+                    lm_head: &LinearLayer,
+                    hidden_states: OwnedTensor,
+                    device: &mut GpuDevice,
+                ) -> OwnedTensor {
+                    let mut hidden_states = hidden_states;
+                    let mut logits: Option<OwnedTensor> = None;
+
+                    #(#lm_stmts)*
+
+                    logits.expect("lm_head dispatch produced no logits")
+                }
+            });
+
+            let lm_lower = lm_head_prev_upper;
+            lm_head_match_arms.push(quote! {
+                #lm_lower ..= #upper => #lm_fn_name(
+                    lm_head, hidden_states, device,
+                ),
+            });
+            lm_head_prev_upper = upper.saturating_add(1);
+        }
     }
+
+    let lm_head_dispatcher = if has_post_loop {
+        quote! {
+            pub unsafe fn solver_forward_lm_head(
+                lm_head: &LinearLayer,
+                num_tokens: u32,
+                hidden_states: OwnedTensor,
+                device: &mut GpuDevice,
+            ) -> OwnedTensor {
+                match num_tokens {
+                    #(#lm_head_match_arms)*
+                }
+            }
+
+            #(#lm_head_bucket_fns)*
+        }
+    } else {
+        quote! {}
+    };
 
     quote! {
         #[allow(clippy::too_many_arguments)]
@@ -132,6 +192,8 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         }
 
         #(#bucket_fns)*
+
+        #lm_head_dispatcher
     }
 }
 
@@ -139,6 +201,98 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
 
 fn emit_layer_stmts(ds: &DispatchSequence) -> Vec<TokenStream> {
     ds.entries_for_layer(0).filter_map(emit_entry).collect()
+}
+
+/// Emit statements for the post-loop (lm_head) phase.
+/// These entries are tagged with `layer == num_layers` in the tile graph.
+/// The enclosing function signature is:
+///     solver_forward_lm_head_bucket_N(
+///         lm_head: &LinearLayer,
+///         final_norm_weight: GpuTensor,
+///         final_norm_eps: f32,
+///         hidden_states: OwnedTensor,
+///         residual: Option<OwnedTensor>,
+///         device: &mut GpuDevice,
+///     ) -> OwnedTensor  // logits
+fn emit_post_loop_stmts(ds: &DispatchSequence, num_layers: u16) -> Vec<TokenStream> {
+    ds.entries_for_layer(num_layers)
+        .filter_map(emit_post_loop_entry)
+        .collect()
+}
+
+fn emit_post_loop_entry(entry: &DispatchEntry) -> Option<TokenStream> {
+    match entry.kind {
+        ImplDispatchKind::Noop => None,
+
+        // lm_head GEMM via cuBLAS dispatch (fallback; solver may pick CUTLASS).
+        ImplDispatchKind::CublasGemm => Some(quote! {{
+            let __out = lm_head.forward(
+                hidden_states.view(),
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            drop(hidden_states);
+            logits = Some(__out);
+        }}),
+
+        // CUTLASS GEMM for lm_head — use the same launch-function pattern
+        // as the decoder GEMMs but with `lm_head.dense_weight()` as the
+        // weight and `hidden_states` (already-normed) as the input.
+        ImplDispatchKind::CutlassGemm {
+            tile_m,
+            tile_n,
+            stages,
+        } => {
+            let launch_fn = format_ident!("cutlass_gemm_{}x{}_s{}_launch", tile_m, tile_n, stages);
+            Some(quote! {{
+                let __act: GpuTensor = *hidden_states;
+                let __m = __act.dim(0) as i32;
+                let __k = __act.dim(1) as i32;
+                let __w = lm_head.dense_weight();
+                let __n = __w.dim(0) as i32;
+                let __out = device.caching.alloc_tensor(
+                    &[__m as usize, __n as usize], __act.dtype(),
+                );
+                let __rc = #launch_fn(
+                    __out.as_mut_ptr::<u16>(),
+                    __act.as_ptr::<u16>(),
+                    __w.as_ptr::<u16>(),
+                    __m, __n, __k,
+                    1.0f32, 0.0f32,
+                    device.compute_stream as u64,
+                );
+                debug_assert_eq!(__rc, 0, "CUTLASS GEMM failed (lm_head)");
+                drop(hidden_states);
+                logits = Some(__out);
+            }})
+        }
+
+        ImplDispatchKind::CutlassGemv => Some(quote! {{
+            let __act: GpuTensor = *hidden_states;
+            let __m = __act.dim(0) as i32;
+            let __k = __act.dim(1) as i32;
+            let __w = lm_head.dense_weight();
+            let __n = __w.dim(0) as i32;
+            let __out = device.caching.alloc_tensor(
+                &[__m as usize, __n as usize], __act.dtype(),
+            );
+            let __rc = cutlass_gemv_launch(
+                __out.as_mut_ptr::<u16>(),
+                __act.as_ptr::<u16>(),
+                __w.as_ptr::<u16>(),
+                __m, __n, __k,
+                1.0f32, 0.0f32,
+                device.compute_stream as u64,
+            );
+            debug_assert_eq!(__rc, 0, "CUTLASS GEMV failed (lm_head)");
+            drop(hidden_states);
+            logits = Some(__out);
+        }}),
+
+        // Any other kind isn't expected in the post-loop phase.
+        _ => None,
+    }
 }
 
 fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
@@ -514,6 +668,7 @@ fn cutlass_input_expr(phase: GemmPhase) -> TokenStream {
         GemmPhase::Gate => quote! { **normed.as_ref().unwrap() },
         GemmPhase::Up => quote! { **normed.as_ref().unwrap() },
         GemmPhase::Down => quote! { **silu_out.as_ref().unwrap() },
+        GemmPhase::LmHead => quote! { *hidden_states },
     }
 }
 
@@ -550,6 +705,13 @@ fn gemm_operands(
             quote! { silu_out.as_ref().unwrap().view() },
             quote! { layer.mlp.down_proj },
             quote! { drop(silu_out.take()); hidden_states = __out; },
+        ),
+        GemmPhase::LmHead => (
+            // Input is the final-normed hidden states (residual already folded in
+            // by the preceding RmsNorm step; see lm_head's RmsNorm entry below).
+            quote! { hidden_states.view() },
+            quote! { (*lm_head) },
+            quote! { drop(hidden_states); logits = Some(__out); },
         ),
     }
 }

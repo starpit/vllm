@@ -97,13 +97,17 @@ impl ImplementationLibrary {
             //    so the solver's cheapest-first tie-break (when both
             //    cost 145 µs at the per-call level) prefers the fused
             //    variant. The fused variant saves a downstream
+            Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmOProj)),
+            Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmDown)),
             // ── CUTLASS norm+GEMM prologue fusion (D-3) ──
             Box::new(CutlassNormGemmImpl::new(TileKind::GemmQkv, 128, 128)),
             Box::new(CutlassNormGemmImpl::new(TileKind::GemmGate, 128, 128)),
             Box::new(CutlassNormGemmImpl::new(TileKind::GemmUp, 128, 128)),
-            // cuBLAS disabled — measured faster without it at every tested
-            // batch size (BS=1-32) on Llama 3.2 3B / L4 sm_89. See commit
-            // history for benchmark data.
+            Box::new(CublasGemmExImpl::new(TileKind::GemmQkv)),
+            Box::new(CublasGemmExImpl::new(TileKind::GemmOProj)),
+            Box::new(CublasGemmExImpl::new(TileKind::GemmGate)),
+            Box::new(CublasGemmExImpl::new(TileKind::GemmUp)),
+            Box::new(CublasGemmExImpl::new(TileKind::GemmDown)),
             // ── vllm-rs fused ops ──
             Box::new(VllmRsRmsNormImpl),
             // Fused 3-tile claim (QkvSplit + Rope + KvCacheWrite) — listed
@@ -1322,6 +1326,16 @@ impl Implementation for TkFusedMlpBlockImpl {
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {
         true
     }
+    /// The TK fused MLP kernel is single-row by design: the norm
+    /// phase hardcodes row=0 and each CTA processes one batch
+    /// element. At M > 1 it produces garbage (reads/writes the wrong
+    /// rows of the scratch buffers). This is a hard correctness
+    /// constraint — the kernel simply cannot handle batch > 1 in
+    /// its current form. Once the kernel is batch-aware we can
+    /// widen this range or remove the override entirely.
+    fn workload_constraint(&self) -> crate::lowering::implementation::WorkloadConstraint {
+        crate::lowering::implementation::WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
     fn matches(
         &self,
         tile_graph: &TileGraph,
@@ -1437,6 +1451,7 @@ impl CutlassGemmImpl {
             TileKind::GemmGate => "gate",
             TileKind::GemmUp => "up",
             TileKind::GemmDown => "down",
+            TileKind::GemmLmHead => "lm_head",
             _ => "unknown",
         };
         let name: &'static str = Box::leak(
@@ -1465,6 +1480,7 @@ impl CutlassGemmImpl {
             TileKind::GemmGate,
             TileKind::GemmUp,
             TileKind::GemmDown,
+            TileKind::GemmLmHead,
         ];
         // (tile_m, tile_n, stages) — matches the CUDA macro instantiations
         let tiles: &[(u32, u32, u32)] = &[
@@ -1501,12 +1517,14 @@ impl CutlassGemmImpl {
 /// - OProj: N = hidden, K = num_q * head_dim  (input is attention output)
 /// - Gate/Up: N = intermediate, K = hidden
 /// - Down: N = hidden, K = intermediate
+/// - LmHead: N = vocab_size, K = hidden
 fn gemm_nk(phase: TileKind, dims: crate::lowering::tile_graph::ModelDims) -> (u32, u32) {
     match phase {
         TileKind::GemmQkv => (dims.qkv_dim(), dims.hidden_size),
         TileKind::GemmOProj => (dims.hidden_size, dims.num_attention_heads * dims.head_dim),
         TileKind::GemmGate | TileKind::GemmUp => (dims.intermediate_size, dims.hidden_size),
         TileKind::GemmDown => (dims.hidden_size, dims.intermediate_size),
+        TileKind::GemmLmHead => (dims.vocab_size, dims.hidden_size),
         _ => (1, 1),
     }
 }
@@ -1592,12 +1610,15 @@ impl CutlassGemvImpl {
         dims: crate::lowering::tile_graph::ModelDims,
     ) -> Vec<Box<dyn Implementation>> {
         // Only phases that don't benefit from fused residual (beta=1 epilogue).
-        // OProj and Down use cuBLAS with fused residual — replacing them with
+        // OProj and Down use fused-residual GEMMs — replacing them with
         // standalone GEMV + separate residual add adds 2 launches per layer.
+        // LmHead runs once per forward pass with no residual, so GEMV wins
+        // at BS=1 where the vocab×hidden projection is memory-bound.
         vec![
             Box::new(Self::new(TileKind::GemmQkv, dims)),
             Box::new(Self::new(TileKind::GemmGate, dims)),
             Box::new(Self::new(TileKind::GemmUp, dims)),
+            Box::new(Self::new(TileKind::GemmLmHead, dims)),
         ]
     }
 }
@@ -1610,13 +1631,21 @@ impl Implementation for CutlassGemvImpl {
             TileKind::GemmGate => "cutlass_gemv_gate",
             TileKind::GemmUp => "cutlass_gemv_up",
             TileKind::GemmDown => "cutlass_gemv_down",
+            TileKind::GemmLmHead => "cutlass_gemv_lm_head",
             _ => "cutlass_gemv_unknown",
         }
     }
-    fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        // Only worth picking at M=1 (BS=1 decode). At M>1, the
-        // regular GEMMs are cheaper.
-        profile.num_tokens() == 1
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    /// CUTLASS GEMV mathematically only produces a matrix-vector
+    /// product: y[N] = W[N,K] @ x[K]. It has no notion of "batch"
+    /// beyond calling it M times, so using it at M > 1 is a
+    /// correctness requirement violation (the launched kernel
+    /// only writes one row of output). This is distinct from
+    /// "GEMV is slow at M > 1" — it's "GEMV is wrong at M > 1".
+    fn workload_constraint(&self) -> crate::lowering::implementation::WorkloadConstraint {
+        crate::lowering::implementation::WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
     }
     fn matches(
         &self,

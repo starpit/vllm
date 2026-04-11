@@ -253,6 +253,40 @@ pub struct MatchInfo {
 /// resource demands, its launch kind, the handoff mechanisms it
 /// supports, the layouts it requires, and its target compatibility.
 /// Cost is calibrated from microbench data per shape.
+/// Declarative workload eligibility for an implementation.
+///
+/// Distinct from `target_compatible` (which is about GPU capability,
+/// e.g. sm_89 vs sm_90). A `WorkloadConstraint` expresses correctness
+/// requirements on the workload itself — e.g. "this GEMV kernel only
+/// handles M=1" or "this batched kernel requires num_tokens ≥ 64".
+///
+/// Correctness, not cost: if `accepts(num_tokens)` returns false, the
+/// impl must NOT be picked at that workload, regardless of its cost.
+/// The solver enforces this via the `WorkloadCompatible` constraint
+/// (same shape as `TargetCompatible`).
+///
+/// Data, not closures — so the ILP backend can linearize each variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkloadConstraint {
+    /// Valid for any `num_tokens` value. Default for most impls.
+    Any,
+    /// Valid only when `num_tokens` falls in this inclusive range.
+    /// Used by kernels with hard correctness limits — e.g. a GEMV
+    /// kernel that only handles M=1, or a fused kernel designed for
+    /// a specific batch block that produces garbage at other sizes.
+    NumTokensRange { min: u32, max: u32 },
+}
+
+impl WorkloadConstraint {
+    /// Whether this constraint admits the given `num_tokens`.
+    pub fn accepts(&self, num_tokens: u32) -> bool {
+        match self {
+            Self::Any => true,
+            Self::NumTokensRange { min, max } => num_tokens >= *min && num_tokens <= *max,
+        }
+    }
+}
+
 pub trait Implementation: fmt::Debug + Send + Sync {
     /// Stable name for debug / display / cost-table keys.
     fn name(&self) -> &'static str;
@@ -261,6 +295,20 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// E.g. CUTLASS sm_90 warp-specialized requires sm_90+ and
     /// returns false on the L4 sm_89 profile.
     fn target_compatible(&self, profile: &TargetProfile) -> bool;
+
+    /// Workload eligibility for this implementation.
+    ///
+    /// Default: accepts any `num_tokens`. Override for kernels that
+    /// have hard correctness requirements on the workload shape
+    /// (e.g. GEMV at M=1 only, or a fused kernel that only handles
+    /// specific batch sizes).
+    ///
+    /// This is a correctness constraint, not a cost signal. The
+    /// solver refuses to pick impls whose workload constraint is
+    /// violated, regardless of cost. Use `cost_us` for soft signals.
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::Any
+    }
 
     /// Try to match a subgraph rooted at the given seed tile.
     /// Returns `Some(MatchInfo)` if this implementation can claim

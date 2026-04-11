@@ -81,6 +81,8 @@ unsafe extern "C" {
 // compile time for each model in the `models:` list and emits
 // per-bucket dispatch functions.
 
+use crate::layers::LinearLayer;
+
 vllm_tk_macros::forward! {
     for layer in 0..NL {
         let normed = rmsnorm(hidden_states, attn_norm[layer]);
@@ -94,9 +96,13 @@ vllm_tk_macros::forward! {
         let up = gemm(normed2, up_weights[layer]);
         hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
     }
+    // Caller applies the final norm via fused_add_rms_norm_inplace
+    // (already cuBLAS-free) and passes the normed hidden_states in.
+    // The solver picks the optimal kernel for the [seq, vocab] projection.
+    logits = gemm(hidden_states, lm_head);
 
     models: [
-        { layers: 28, hidden: 3072, intermediate: 8192, heads: 24, kv_heads: 8, head_dim: 128 },
+        { layers: 28, hidden: 3072, intermediate: 8192, heads: 24, kv_heads: 8, head_dim: 128, vocab: 128256 },
     ],
     target: l4_sm89,
     workloads: [1..4096],

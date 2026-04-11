@@ -1141,6 +1141,7 @@ impl LlamaForCausalLM {
         } else {
             hidden_states
         };
+        // TEMP: back to cuBLAS for lm_head to debug garbage output.
         #[allow(unused_mut)]
         let mut logits = self.lm_head.forward(
             hidden_states.view(),

@@ -30,7 +30,6 @@ fn cuda_link() {
     println!("cargo:rustc-link-lib=static=cutlass_standalone_gemm");
     println!("cargo:rustc-link-lib=static=vllm_flash_attn");
 
-    println!("cargo:rustc-link-lib=static=tk_fused_mlp");
     // cudart_static requires rt + dl; cublas/cublasLt remain dynamic.
     println!("cargo:rustc-link-lib=static=cudart_static");
     println!("cargo:rustc-link-lib=dylib=rt");

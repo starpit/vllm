@@ -7761,8 +7761,6 @@ version = "0.1.0"
 dependencies = [
  "cudaforge",
  "dirs 6.0.0",
- "vllm-tk-macros-core",
- "walkdir",
 ]
 
 [[package]]
@@ -7890,22 +7888,7 @@ dependencies = [
  "vllm-mlx",
  "vllm-model",
  "vllm-protocol",
- "vllm-tk",
  "vllm-wgpu",
-]
-
-[[package]]
-name = "vllm-tk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudaforge",
- "cudarc",
- "dirs 6.0.0",
- "tracing",
- "vllm-cuda",
- "vllm-executor",
- "vllm-tk-static",
 ]
 
 [[package]]
@@ -7928,22 +7911,6 @@ dependencies = [
  "quote",
  "rayon",
  "syn",
-]
-
-[[package]]
-name = "vllm-tk-static"
-version = "0.1.0"
-dependencies = [
- "cudaforge",
- "cudarc",
- "dirs 6.0.0",
- "half",
- "hf-hub",
- "serde_json",
- "vllm-cuda",
- "vllm-tk",
- "vllm-tk-macros",
- "vllm-tk-macros-core",
 ]
 
 [[package]]

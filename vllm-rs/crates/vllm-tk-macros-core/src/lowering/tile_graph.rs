@@ -63,8 +63,6 @@
 //! match per-layer-op patterns. CP5-D will optionally drop to per-row
 //! granularity once we have implementations that benefit from it.
 
-use crate::reified_dag::Phase;
-
 /// Identifier for one node in a [`TileGraph`]. Indices are dense
 /// `[0..nodes.len())` so consumers can index directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -583,25 +581,6 @@ fn classify_gemm(weight_name: &str) -> TileKind {
         // Unknown weight — default to generic GEMM.
         TileKind::GemmQkv
     }
-}
-
-/// Map from a [`Phase`] (the source DAG's coarse phase tag) to a
-/// [`TileKind`]. Used by future migration code that bridges the
-/// reified DAG's per-row nodes into the normalized tile graph.
-/// Currently unused — `build_llama_forward` constructs the
-/// normalized graph directly — but kept here so the bridge has a
-/// home when CP5 expands to per-row granularity.
-#[allow(dead_code)]
-pub fn phase_to_tile_kind(phase: Phase) -> Option<TileKind> {
-    Some(match phase {
-        Phase::AttnNorm | Phase::MlpNorm => TileKind::RmsNorm,
-        Phase::Qkv => TileKind::GemmQkv,
-        Phase::Rope => TileKind::Rope,
-        Phase::Attention => TileKind::Attention,
-        Phase::OProj => TileKind::GemmOProj,
-        Phase::GateUp => TileKind::GemmGate, // gate; up is a separate node
-        Phase::Down => TileKind::GemmDown,
-    })
 }
 
 #[cfg(test)]

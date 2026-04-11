@@ -48,8 +48,6 @@ pub enum ImplDispatchKind {
     FlashInferAttention,
     /// Prefill: FlashInfer `attention_standard` with explicit Q, K, V.
     FlashInferStandard,
-    /// TK fused MLP block (7-tile).
-    TkFusedMlpBlock,
     /// Free passthrough — no FFI call needed (e.g. QkvSplit, KvCacheWrite, ResidualAdd
     /// when folded into an upstream beta=1 epilogue).
     Noop,
@@ -261,8 +259,6 @@ fn classify_impl(
         ImplDispatchKind::FlashInferAttention
     } else if imp_name == "flashinfer_standard_fa2" {
         ImplDispatchKind::FlashInferStandard
-    } else if imp_name == "tk_fused_mlp_block" {
-        ImplDispatchKind::TkFusedMlpBlock
     } else if imp_name == "qkv_split_free"
         || imp_name == "kv_cache_write"
         || imp_name == "residual_add"

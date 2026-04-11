@@ -55,26 +55,6 @@ cutlass_gemm_ffi!(
     cutlass_gemm_64x64_launch,
 );
 
-// ── TK fused MLP FFI ───────────────────────────────────────────
-
-#[cfg(feature = "cuda")]
-unsafe extern "C" {
-    /// Grid-dispatched TK fused MLP: norm → gate GEMM+SiLU → up GEMM×gate → down GEMM+residual.
-    /// One CTA per row (blockIdx.x), called once per layer with per-layer weight pointers.
-    pub fn cp5_fused_mlp_solver_launch(
-        hidden_ptr: u64,     // bf16 [batch_size, HD] — in/out (residual add)
-        rms_gate_ptr: u64,   // bf16 [batch_size, HD] — scratch for normed activations
-        silu_ptr: u64,       // bf16 [batch_size, ID] — scratch for gate*up
-        mlp_norm_w_ptr: u64, // bf16 [1, HD] — norm weight (single layer)
-        gate_w_ptr: u64,     // bf16 [ID, HD] — gate weight (single layer)
-        up_w_ptr: u64,       // bf16 [ID, HD] — up weight (single layer)
-        down_w_ptr: u64,     // bf16 [HD, ID] — down weight (single layer)
-        rms_norm_eps: f32,
-        batch_size: i32,
-        stream: u64,
-    ) -> i32;
-}
-
 // ── forward! expansion ──────────────────────────────────────────
 //
 // The DSL body describes the model structure. The solver runs at

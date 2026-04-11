@@ -161,9 +161,6 @@ fn cuda_build() {
     // 6. CUTLASS standalone GEMM launchers (128×128 + 64×64 for solver dispatch)
     build_cutlass_standalone_gemm(&cache_str, &mut rerun_files);
 
-    // 7. TK fused MLP kernel (grid-dispatched, solver-friendly launch wrapper)
-    build_tk_fused_mlp(&cache_str, &mut rerun_files);
-
     for f in &rerun_files {
         let path = std::path::Path::new(f);
         if let Ok(canonical) = path.canonicalize() {
@@ -302,80 +299,6 @@ fn build_flash_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("-fPIC")
         .build_lib(format!("{}/libvllm_flash_attn.a", cache_dir))
         .expect("Failed to build flash attention");
-}
-
-#[cfg(feature = "cuda")]
-fn build_tk_fused_mlp(cache_dir: &str, rerun_files: &mut Vec<String>) {
-    use std::path::PathBuf;
-
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-
-    // DSL for Llama 3.2 3B — must match the model in solver_dispatch.rs.
-    let dsl = r#"kernel llama_sm89<NL=28, HD=3072, ID=8192, HDM=128, NAH=24, NKH=8, VS=128256> {
-        for layer in 0..NL {
-            let normed = rmsnorm(hidden_states, attn_norm[layer]);
-            let qkv = gemm(normed, qkv_weights[layer]);
-            let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
-            let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-            hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
-
-            let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
-            let gate = silu(gemm(normed2, gate_weights[layer]));
-            let up = gemm(normed2, up_weights[layer]);
-            hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
-        }
-        let normed = rmsnorm(hidden_states, lm_head_norm);
-        logits = gemm(normed, lm_head);
-    }"#;
-
-    let cu_source = vllm_tk_macros_core::generate_cp5_fused_mlp_solver_source(dsl)
-        .unwrap_or_else(|e| panic!("cp5 fused MLP codegen failed: {e}"));
-    let cu_path = out_dir.join("cp5_fused_mlp_solver.cu");
-    std::fs::write(&cu_path, &cu_source)
-        .unwrap_or_else(|e| panic!("failed to write {}: {e}", cu_path.display()));
-
-    // TK include paths
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
-    let tk_csrc = workspace_root.join("crates/vllm-tk/csrc");
-    let tk_include = tk_csrc.join("include");
-    let tk_prototype = tk_csrc.join("prototype");
-
-    // Collect TK headers for content-hash tracking
-    let header_files: Vec<String> = walkdir::WalkDir::new(&tk_include)
-        .into_iter()
-        .chain(walkdir::WalkDir::new(&tk_csrc))
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let s = e.path().display().to_string();
-            s.ends_with(".cuh") || s.ends_with(".h")
-        })
-        .map(|e| e.path().display().to_string())
-        .collect();
-
-    rerun_files.extend(header_files.iter().cloned());
-
-    cudaforge::KernelBuilder::new()
-        .out_dir(cache_dir)
-        .source_files(vec![cu_path.display().to_string()])
-        .watch(header_files)
-        .include_path(tk_include.display().to_string())
-        .include_path(tk_prototype.display().to_string())
-        .include_path(tk_csrc.display().to_string())
-        .arg("-std=c++20")
-        .arg("-O3")
-        .arg("--use_fast_math")
-        .arg("--expt-extended-lambda")
-        .arg("--expt-relaxed-constexpr")
-        .arg("-DKITTENS_4090")
-        .arg("-DNDEBUG")
-        .arg("-Xcompiler=-fPIC")
-        .arg("-Xcompiler=-fno-strict-aliasing")
-        .arg("-Xcompiler=-Wno-psabi")
-        .arg("-arch=sm_89")
-        .arg("-lineinfo")
-        .build_lib(format!("{}/libtk_fused_mlp.a", cache_dir))
-        .expect("Failed to build tk_fused_mlp");
 }
 
 #[cfg(feature = "cuda")]

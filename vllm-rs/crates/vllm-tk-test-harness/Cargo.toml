@@ -16,6 +16,5 @@ half = "2"
 vllm-tk-macros-core = { path = "../vllm-tk-macros-core" }
 
 [build-dependencies]
-vllm-tk-macros-core = { path = "../vllm-tk-macros-core" }
 cudaforge = { path = "../../third_party/cudaforge", optional = true }
 dirs = { version = "6", optional = true }

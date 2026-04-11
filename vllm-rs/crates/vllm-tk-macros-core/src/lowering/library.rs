@@ -88,8 +88,6 @@ impl ImplementationLibrary {
     /// for QkvSplit / KvCacheWrite / ResidualAdd. CP5-D extends.
     pub fn l4_sm89_starter(dims: crate::lowering::tile_graph::ModelDims) -> Self {
         let mut entries: Vec<Box<dyn Implementation>> = vec![
-            // ── TK fused MLP block (7-tile claim) ──
-            Box::new(TkFusedMlpBlockImpl),
             // ── cuBLAS GEMM with fused residual (claims GEMM + ResidualAdd
             //    as a two-tile subgraph; uses cublasGemmEx beta=1.0 to
             //    fold the residual add into the GEMM epilogue for free).
@@ -235,8 +233,6 @@ pub struct GpuCostTable {
     pub cutlass64_gate: CostCurve,
     /// FlashInfer attention per-layer cost.
     pub attention: CostCurve,
-    /// TK fused MLP block per-layer cost.
-    pub tk_fused_mlp: CostCurve,
 }
 
 impl GpuCostTable {
@@ -369,15 +365,6 @@ impl GpuCostTable {
                 (256, 200.0),
                 (1024, 625.0),
                 (4096, 2400.0),
-            ]),
-            tk_fused_mlp: CostCurve::new(vec![
-                (1, 120.0),
-                (4, 120.0),
-                (32, 130.0),
-                (128, 200.0),
-                (256, 2100.0),
-                (1024, 16000.0),
-                (4096, 64000.0),
             ]),
         }
     }
@@ -1307,108 +1294,6 @@ impl Implementation for FlashInferStandardImpl {
             layouts.push(Layout::Any);
         }
         layouts
-    }
-    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16]
-    }
-}
-
-/// TK fused MLP block: claims the 7-tile subgraph
-/// `(RmsNorm_mlp → GemmGate → GemmUp → GateUpConcat → SiluMul → GemmDown → ResidualAdd_mlp)`
-/// as a single kernel launch via the grid-dispatched `cp5_fused_mlp`.
-#[derive(Debug)]
-pub struct TkFusedMlpBlockImpl;
-
-impl Implementation for TkFusedMlpBlockImpl {
-    fn name(&self) -> &'static str {
-        "tk_fused_mlp_block"
-    }
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
-    }
-    /// The TK fused MLP kernel is single-row by design: the norm
-    /// phase hardcodes row=0 and each CTA processes one batch
-    /// element. At M > 1 it produces garbage (reads/writes the wrong
-    /// rows of the scratch buffers). This is a hard correctness
-    /// constraint — the kernel simply cannot handle batch > 1 in
-    /// its current form. Once the kernel is batch-aware we can
-    /// widen this range or remove the override entirely.
-    fn workload_constraint(&self) -> crate::lowering::implementation::WorkloadConstraint {
-        crate::lowering::implementation::WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
-    }
-    fn matches(
-        &self,
-        tile_graph: &TileGraph,
-        seed: TileId,
-        _profile: &TargetProfile,
-    ) -> Option<MatchInfo> {
-        let norm = &tile_graph.nodes[seed.0 as usize];
-        if norm.kind != TileKind::RmsNorm {
-            return None;
-        }
-        let consumers: Vec<_> = tile_graph
-            .nodes
-            .iter()
-            .filter(|n| n.deps.contains(&seed) && n.layer == norm.layer)
-            .collect();
-        let gate = consumers.iter().find(|n| n.kind == TileKind::GemmGate)?;
-        let up = consumers.iter().find(|n| n.kind == TileKind::GemmUp)?;
-        let concat = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::GateUpConcat
-                && n.layer == norm.layer
-                && n.deps.contains(&gate.id)
-                && n.deps.contains(&up.id)
-        })?;
-        let silu = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::SiluMul && n.layer == norm.layer && n.deps.contains(&concat.id)
-        })?;
-        let down = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::GemmDown && n.layer == norm.layer && n.deps.contains(&silu.id)
-        })?;
-        let residual = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::ResidualAdd && n.layer == norm.layer && n.deps.contains(&down.id)
-        })?;
-        Some(MatchInfo {
-            claimed_tiles: vec![
-                seed,
-                gate.id,
-                up.id,
-                concat.id,
-                silu.id,
-                down.id,
-                residual.id,
-            ],
-            boundary_inputs: norm.deps.clone(),
-            boundary_outputs: vec![residual.id],
-            layer: norm.layer,
-        })
-    }
-    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
-        // The TK fused MLP kernel processes one row per CTA launch.
-        // Cost = num_tokens × single-row cost. At BS=1 this beats
-        // 7 separate cuBLAS launches; at BS>~4 the linear scaling
-        // makes cuBLAS cheaper.
-        let m = profile.num_tokens() as f64;
-        m * 120.0
-    }
-    fn resources(&self, _m: &MatchInfo) -> Resources {
-        Resources {
-            shmem_bytes: 32768,
-            regs_per_thread: 128,
-            threads_per_cta: 256,
-        }
-    }
-    fn launch_kind(&self) -> LaunchKind {
-        LaunchKind::HostCallback
-    }
-    fn supported_input_handoffs(&self) -> &[Handoff] {
-        &[Handoff::StreamOrder, Handoff::StreamEvent]
-    }
-    fn supported_output_handoffs(&self) -> &[Handoff] {
-        &[Handoff::StreamOrder, Handoff::StreamEvent]
-    }
-    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
     }
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::RowMajorBf16]

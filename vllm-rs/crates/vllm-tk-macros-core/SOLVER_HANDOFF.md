@@ -78,7 +78,6 @@ verified correct output on both decode and prefill.
 ```rust
 vllm_tk_macros::forward! {
     // Body: model structure (required, always first).
-    // Same syntax as megakernel! DSL.
     for layer in 0..NL {
         let normed = rmsnorm(hidden_states, attn_norm[layer]);
         let qkv = gemm(normed, qkv_weights[layer]);
@@ -224,12 +223,12 @@ do not lie via `target_compatible`.
 | `vllm-cuda/src/layers.rs` | LinearLayer::dense_weight() for CUTLASS pointer extraction |
 | `vllm-cuda/csrc/cutlass_standalone_gemm.cu` | **canonical** CUTLASS GEMM grid (16 configs + GEMV) via `CUTLASS_GEMM` macro |
 | `vllm-cuda/build.rs` | Links libcutlass_standalone_gemm.a |
-| `vllm-kernels-cuda/build.rs` | Compiles cutlass_standalone_gemm.cu + cp5_fused_mlp (TK) |
+| `vllm-kernels-cuda/build.rs` | Compiles cutlass_standalone_gemm.cu |
 | `vllm-tk-test-harness/build.rs` | Builds test harness; references **canonical** `cutlass_standalone_gemm.cu` (no duplicate) |
 | **Cost data** | |
 | `data/cost_l4_sm89.csv` | 3999 measured cost points (18 shapes × 13 M × 17 kernels) |
 | **Sweep test** | |
-| `vllm-tk-test-harness/tests/scheduled_megakernel_test.rs` | `gpu_cost_sweep` — THE entrypoint for new GPUs. Benchmarks via the `bench_cutlass!` data-driven macro so new configs are picked up automatically. |
+| `vllm-tk-test-harness/tests/gpu_cost_sweep.rs` | `gpu_cost_sweep` — THE entrypoint for new GPUs. Benchmarks via the `bench_cutlass!` data-driven macro so new configs are picked up automatically. |
 
 ## Adding a new GPU
 
@@ -287,7 +286,6 @@ For non-LLaMA architectures (MoE, sliding window, etc.), add new
 | FlashInferStandaloneImpl | attn (1) | decode | ✅ wired |
 | FlashInferStandardImpl | attn (1) | prefill | ✅ wired |
 | CutlassNormGemmImpl | norm+GEMM (2) | any M | ❌ no backing kernel |
-| TkFusedMlpBlockImpl | 7-tile MLP | **M=1 only** (WorkloadConstraint) | ⚠️ kernel is single-row; constraint prevents picks at M>1 |
 | KvCacheWriteImpl | kv_write (1) | any M | ✅ noop |
 | ResidualAddImpl | res_add (1) | any M | ✅ noop |
 
@@ -336,6 +334,23 @@ variables to pass data between dispatch entries:
 
 ## Done recently (2026-04-11)
 
+- ✅ **Removed the `megakernel!` macro and the pre-Ferrite TK runtime**:
+  deleted the `megakernel!` proc-macro entry, the `vllm-tk-macros-core`
+  CUDA-source codegen backend (`cuda_codegen.rs` 9.5K lines,
+  `scheduled_codegen/`, `fused_codegen/`, `verify.rs`, `diagram.rs`,
+  `schedule.rs`, `kernel_library.rs`, `reified_dag.rs`, `templates/`,
+  `models/llama.dsl`), the `vllm-tk` + `vllm-tk-static` crates, the
+  `vllm-serve --backend tk` KVM-megakernel runtime, the
+  `cp5_fused_mlp_solver_launch` codegen + `TkFusedMlpBlockImpl`
+  library entry (the kernel was single-row-by-design and never
+  fired), and the now-obsolete per-op test harness
+  (`op_tests.rs`, `scheduled_megakernel_test.rs`). `gpu_cost_sweep`
+  was rescued into its own test file. What remains: the shared DSL
+  frontend (`parse.rs`/`dag.rs`), `target_profile.rs`, `cpu_golden.rs`,
+  the live `lowering/` solver + `forward!` macro. Verified with
+  `cargo test -p vllm-tk-macros-core --lib` (44 pass) and
+  `vllm chat unsloth/Llama-3.2-3B-Instruct` (coherent Rayleigh
+  scattering answer — Ferrite path correct end-to-end).
 - ✅ **Expanded CUTLASS grid**: 2 tile configs → 16 configs via a C macro
   (`CUTLASS_GEMM(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)`).
   Covers the same threadblock shapes cuBLAS picks on sm80/sm89 plus
@@ -362,10 +377,8 @@ variables to pass data between dispatch entries:
   specific range". The solver enforces it via an early filter in all
   three candidate-enumeration sites alongside `target_compatible`,
   plus a new `Constraint::WorkloadCompatible` variant for ILP later.
-  `CutlassGemvImpl` and `TkFusedMlpBlockImpl` both declare
-  `NumTokensRange { min: 1, max: 1 }` — the first because GEMV is
-  mathematically a matrix-vector product, the second because the
-  kernel is single-row by design (norm phase hardcodes row=0).
+  `CutlassGemvImpl` declares `NumTokensRange { min: 1, max: 1 }`
+  because GEMV is mathematically a matrix-vector product.
 - ✅ **`forward!` DSL now covers lm_head** (commit `700682422`):
   `from_model_dag` processes post-loop ops (tagged with layer=num_layers).
   New `TileKind::GemmLmHead` + `GemmPhase::LmHead`. `ModelDims` gains
@@ -432,37 +445,35 @@ variables to pass data between dispatch entries:
    shows RMSNorm is ~2.5% of GPU time — real gain is ~1-2% after
    accounting for launch overhead savings. Lower priority than it looks.
 
-5. **Batch-aware TK fused MLP** — the current kernel is single-row by
-   design (norm processes exactly 1 row, GEMM's 128-row tile is K-dim
-   tiling not batch). To make fusion worthwhile for M > 1, either:
-   (a) rewrite the norm phase to cooperatively norm all M rows, or
-   (b) launch grid=M with per-row addressing throughout. Theoretical
-   win: ~5-15% at BS=1-4 from eliminating GMEM round-trips between
-   norm/gate/up/silu/down. Real kernel work, not a config change.
-   Once the kernel is fixed, widen its `WorkloadConstraint` past the
-   current `NumTokensRange { min: 1, max: 1 }`.
-
-6. **TP all-reduce tiles** — add `TileKind::AllReduce` after OProj
+5. **TP all-reduce tiles** — add `TileKind::AllReduce` after OProj
    and Down in the tile graph. Required for multi-GPU correctness.
    With TP, GEMM shapes change (sharded dims) — needs `models: runtime`.
 
-7. **Multi-GPU cost CSVs** — run `gpu_cost_sweep` on A100, H100.
+6. **Multi-GPU cost CSVs** — run `gpu_cost_sweep` on A100, H100.
    Check in the CSVs. Add `TargetId` variants. The sweep is now
    data-driven (all 16 configs enumerated in a `bench_cutlass!` macro
    loop), so this is a matter of running it on new hardware.
 
-8. **Elementwise + attention in CSV** — norm, SiLU, FlashInfer costs
+7. **Elementwise + attention in CSV** — norm, SiLU, FlashInfer costs
    are still hardcoded `CostCurve`. Move them to the sweep.
 
-9. **Split-K CUTLASS variants** — at some shapes (e.g. Down GEMM with
+8. **Split-K CUTLASS variants** — at some shapes (e.g. Down GEMM with
    K=8192 at M=64), cuBLAS's split-K strategy can outperform our serial-K
    `device::Gemm`. `cutlass::gemm::device::GemmSplitKParallel` exists
    and would slot into the existing `CUTLASS_GEMM` macro pattern.
    Currently CUTLASS wins everywhere anyway, so this is optional polish.
 
-10. **Remove `megakernel!`** — dead code, replaced by `forward!`.
+9. **Batch-aware fused MLP (new kernel)** — the old TK fused MLP
+   kernel was single-row by design and got deleted along with the
+   rest of the pre-Ferrite path. If a new batch-aware fused MLP
+   kernel shows up, wire it in as a fresh `Implementation` entry
+   claiming the 7-tile `(norm → gate → up → concat → silu → down → res)`
+   subgraph. The TK-as-kernel-library pattern (kernel wrapped behind
+   the `Implementation` trait, governed by `WorkloadConstraint`) is
+   the only legitimate way TK kernels show up going forward —
+   no parallel runtimes, no `megakernel!` regressions.
 
-11. **ILP backend** — the `Solver` trait is ready; `solver::ilp` is a
+10. **ILP backend** — the `Solver` trait is ready; `solver::ilp` is a
     stub. Encode constraints as MILP when the CP solver proves
     intractable on richer libraries. **Not currently needed**: release-
     mode solve time is ~70ms per `forward!` expansion.
@@ -488,14 +499,8 @@ CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
 
 ## Known issues
 
-- `renders_polyalgorithm_kernel` test fails (pre-existing, unrelated)
 - CutlassNormGemmImpl: solver doesn't pick it within 10K step budget
   (also has no backing kernel, so picks would fail anyway)
-- TkFusedMlpBlockImpl: kernel is single-row;
-  `workload_constraint() = NumTokensRange { min: 1, max: 1 }` prevents
-  the solver from picking it at M > 1. Won't fire at M=1 either
-  because individual CUTLASS + GEMV ops win. Kernel needs a real
-  batch-aware rewrite to be useful.
 - Elementwise/attention costs are rough estimates, not in CSV yet
 - Multi-model (`models: [...]` with >1 entry) not yet implemented
   (uses first model only)
@@ -518,8 +523,12 @@ CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
 
 ## Environment notes
 
-- `CUDA_PATH=/usr/local/cuda-12.9` required (system nvcc 12.0 breaks TK)
+- `CUDA_PATH=/usr/local/cuda-12.9` required
 - After clearing cudaforge cache: `touch crates/vllm-cuda/csrc/*.cu`
   then `cargo build -p vllm-kernels-cuda --features cuda` to regenerate
 - CUDA kernel compilation takes minutes (cicc); don't kill cargo
 - CSV file is gitignored by default — use `git add -f` to check it in
+- `parse::MegakernelDef` is the **live** DSL-body parser used by `forward!`.
+  Name is historical; `lowering::backend::compile_dsl::ForwardDef` wraps
+  it to parse the `forward!`-specific outer structure (`models:`,
+  `target:`, `workloads:`). Keep the name for now to avoid rename churn.

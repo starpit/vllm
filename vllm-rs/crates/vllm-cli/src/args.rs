@@ -112,12 +112,6 @@ pub struct ServeArgs {
     #[arg(long)]
     pub enable_metrics: bool,
 
-    /// Inference backend: "auto", "cuda", or "tk".
-    /// "tk" selects the ThunderKittens KVM megakernel (sm89, LLaMA only).
-    #[cfg(feature = "tk")]
-    #[arg(long, default_value = "auto")]
-    pub backend: String,
-
     /// KV cache block size in tokens.
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,

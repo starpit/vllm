@@ -817,20 +817,5 @@ mod tests {
             "expected >= 12 ops, got {}",
             dag.ops.len()
         );
-
-        // Verify it passes the safety checks
-        let errors = crate::verify::verify(&dag);
-        for e in &errors {
-            eprintln!("  {e}");
-        }
-        // Filter out dead buffer warnings (some generated intermediates may appear dead)
-        let real_errors: Vec<_> = errors
-            .iter()
-            .filter(|e| e.kind != crate::verify::ErrorKind::DeadBuffer)
-            .collect();
-        assert!(
-            real_errors.is_empty(),
-            "LLaMA DAG should verify clean, got: {real_errors:?}"
-        );
     }
 }

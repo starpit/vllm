@@ -515,7 +515,6 @@ fn pick_handoff(producer_out: &[Handoff], consumer_in: &[Handoff]) -> Option<Han
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lowering::implementation::LaunchKind;
     use crate::lowering::library::ImplementationLibrary;
     use crate::lowering::tile_graph::{TileGraph, TileKind};
     use crate::target_profile::TargetProfile;
@@ -839,31 +838,26 @@ mod tests {
         );
 
         eprintln!();
-        eprintln!("╔══ Plan Family (2 layers, L4 sm_89) ══════════════════════════╗");
-        eprintln!("║  seq_len │ predicted │ steps │ tk_fused_mlp │ cublas_gate   ║");
-        eprintln!("╠──────────┼───────────┼───────┼──────────────┼──────────────╣");
+        eprintln!("╔══ Plan Family (2 layers, L4 sm_89) ══════════════╗");
+        eprintln!("║  seq_len │ predicted │ steps │ cublas_gate     ║");
+        eprintln!("╠──────────┼───────────┼───────┼────────────────╣");
         for (seq, plan) in family.iter() {
-            let mut tk_count = 0u32;
             let mut gate_count = 0u32;
             for sg in plan.assignment.subgraphs() {
                 let name = library.get(plan.assignment.impls[&sg]).name();
-                if name == "tk_fused_mlp_block" {
-                    tk_count += 1;
-                }
                 if name == "cublas_gemm_ex_gate" {
                     gate_count += 1;
                 }
             }
             eprintln!(
-                "║  {:>6} │ {:>7.2} ms│  {:>4} │ {:>12} │ {:>12} ║",
+                "║  {:>6} │ {:>7.2} ms│  {:>4} │ {:>14} ║",
                 seq,
                 plan.predicted_us / 1000.0,
                 plan.solver_steps,
-                tk_count,
                 gate_count,
             );
         }
-        eprintln!("╚══════════════════════════════════════════════════════════════╝");
+        eprintln!("╚══════════════════════════════════════════════════╝");
 
         assert_eq!(family.len(), super::super::PlanFamily::DEFAULT_GRID.len());
 

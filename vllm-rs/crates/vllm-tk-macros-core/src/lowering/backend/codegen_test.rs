@@ -94,18 +94,6 @@ mod tests {
     }
 
     #[test]
-    fn tk_fused_mlp_not_picked_with_single_row_kernel() {
-        // The TK fused MLP kernel processes one row per launch. Its cost
-        // model reports M × 120µs, which is more expensive than cuBLAS
-        // at every batch size. Verify the solver doesn't pick it.
-        let source = gen_source("1..4096");
-        assert!(
-            !source.contains("cp5_fused_mlp_solver_launch"),
-            "TK fused MLP should not be picked — single-row kernel is too expensive"
-        );
-    }
-
-    #[test]
     #[ignore]
     fn solve_time_one_forward() {
         // Time one full forward! macro expansion for Llama 3.2 3B.
@@ -119,40 +107,6 @@ mod tests {
             elapsed,
             source.len()
         );
-    }
-
-    #[test]
-    fn cp5_fused_mlp_solver_source_generates_valid_cuda() {
-        // Verify the CUDA source generator for the 3B model produces valid output.
-        let dsl = r#"kernel llama_sm89<NL=28, HD=3072, ID=8192, HDM=128, NAH=24, NKH=8, VS=128256> {
-            for layer in 0..NL {
-                let normed = rmsnorm(hidden_states, attn_norm[layer]);
-                let qkv = gemm(normed, qkv_weights[layer]);
-                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
-                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
-
-                let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
-                let gate = silu(gemm(normed2, gate_weights[layer]));
-                let up = gemm(normed2, up_weights[layer]);
-                hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
-            }
-            let normed = rmsnorm(hidden_states, lm_head_norm);
-            logits = gemm(normed, lm_head);
-        }"#;
-        let source = crate::generate_cp5_fused_mlp_solver_source(dsl).unwrap();
-        assert!(
-            source.contains("cp5_fused_mlp_solver_launch"),
-            "missing solver wrapper"
-        );
-        assert!(source.contains("for (int row = 0;"), "missing per-row loop");
-        assert!(
-            source.contains("make_gl<G::"),
-            "missing globals construction"
-        );
-        // Verify 3B-specific dims appear in the wrapper
-        assert!(source.contains("3072"), "should contain HD=3072");
-        assert!(source.contains("8192"), "should contain ID=8192");
     }
 
     #[test]

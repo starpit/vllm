@@ -664,7 +664,15 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
 fn cutlass_input_expr(phase: GemmPhase) -> TokenStream {
     match phase {
         GemmPhase::Qkv => quote! { **normed.as_ref().unwrap() },
-        GemmPhase::OProj => quote! { **attn_out.as_ref().unwrap() },
+        // attn_out is allocated 3D as [num_tokens, num_q_heads, head_dim]
+        // by flash attention; reshape to 2D [num_tokens, q_size] for the
+        // CUTLASS GEMM. The cuBLAS path handles this via the reshape in
+        // gemm_operands; CUTLASS launches need the same flattened view.
+        GemmPhase::OProj => quote! {{
+            let __ao = attn_out.as_ref().unwrap();
+            let __nt = __ao.dim(0);
+            *__ao.view().reshape(&[__nt, layer.self_attn.q_size])
+        }},
         GemmPhase::Gate => quote! { **normed.as_ref().unwrap() },
         GemmPhase::Up => quote! { **normed.as_ref().unwrap() },
         GemmPhase::Down => quote! { **silu_out.as_ref().unwrap() },

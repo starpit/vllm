@@ -88,8 +88,7 @@ mod tests {
             ("post_attention_layernorm", "RmsNorm"),
             ("self_attn.qkv_proj", "LinearLayer"),
             ("self_attn.o_proj", "LinearLayer"),
-            ("mlp.gate_proj", "LinearLayer"),
-            ("mlp.up_proj", "LinearLayer"),
+            ("mlp.gate_up_proj", "LinearLayer"),
             ("mlp.down_proj", "LinearLayer"),
         ] {
             // Dotted names become underscored idents in the struct.
@@ -206,6 +205,27 @@ mod tests {
         assert!(
             !source.contains("pub self_attn_v_proj"),
             "solver should NOT produce separate V field when fused"
+        );
+    }
+
+    #[test]
+    fn solver_elects_fused_gate_up_on_l4() {
+        let source = gen_source("1..1024");
+
+        // Fused gate+up field IS present.
+        assert!(
+            source.contains("mlp_gate_up_proj"),
+            "solver should produce fused gate+up field on L4"
+        );
+
+        // Separate gate/up fields are NOT in the struct definition.
+        assert!(
+            !source.contains("pub mlp_gate_proj"),
+            "solver should NOT produce separate gate field when fused"
+        );
+        assert!(
+            !source.contains("pub mlp_up_proj"),
+            "solver should NOT produce separate up field when fused"
         );
     }
 

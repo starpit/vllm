@@ -63,6 +63,9 @@ pub enum ImplDispatchKind {
     /// Fused QKV GEMM — one GEMM with concatenated [q|k|v] weight.
     /// Claims {GemmQ, GemmK, GemmV} as a 3-tile subgraph.
     FusedQkvGemm,
+    /// Fused gate+up GEMM — one GEMM with concatenated [gate|up] weight.
+    /// Claims {GemmGate, GemmUp} as a 2-tile subgraph.
+    FusedGateUpGemm,
     /// Embedding-table gather — `kernels::embedding_gather`.
     /// Always pre-loop (runs once per forward, before the
     /// per-layer match dispatch).
@@ -276,8 +279,19 @@ fn classify_impl(
         .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::GemmV);
     let is_fused_qkv = has_q && has_k && has_v;
 
+    // Detect fused gate+up: claimed tiles include both {GemmGate, GemmUp}.
+    let has_gate = claimed
+        .iter()
+        .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::GemmGate);
+    let has_up = claimed
+        .iter()
+        .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::GemmUp);
+    let is_fused_gate_up = has_gate && has_up;
+
     let kind = if is_fused_qkv {
         ImplDispatchKind::FusedQkvGemm
+    } else if is_fused_gate_up {
+        ImplDispatchKind::FusedGateUpGemm
     } else if imp_name.ends_with("_with_bias") {
         // cublas_gemm_ex_<phase>_with_bias — fused {Gemm, BiasAdd}.
         // Must come before the generic cublas_gemm_ex prefix check.

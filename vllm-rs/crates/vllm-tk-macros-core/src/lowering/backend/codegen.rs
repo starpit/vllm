@@ -49,15 +49,23 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         return quote! { compile_error!("forward!: solver found no feasible plans"); };
     }
 
-    // Check if the solver fused Q+K+V (any plan — fusion is structural).
-    let first_plan = &family.iter().next().unwrap().1;
-    let ds_first = DispatchSequence::from_plan(first_plan, &library, &tile_graph);
-    let qkv_fused = ds_first
-        .entries_for_layer(0)
-        .any(|e| e.kind == ImplDispatchKind::FusedQkvGemm);
+    // Fusion decisions must be uniform across ALL buckets (the struct
+    // is shared). Check if ANY bucket fuses — if so, all must.
+    let plans_vec: Vec<_> = family.iter().collect();
+    let qkv_fused = plans_vec.iter().any(|(_, plan)| {
+        let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+        ds.entries_for_layer(0)
+            .any(|e| e.kind == ImplDispatchKind::FusedQkvGemm)
+    });
+    let gate_up_fused = plans_vec.iter().any(|(_, plan)| {
+        let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+        ds.entries_for_layer(0)
+            .any(|e| e.kind == ImplDispatchKind::FusedGateUpGemm)
+    });
 
     // Extract struct fields from the DAG, applying solver fusion decisions.
-    let (per_layer_fields, global_fields) = extract_weight_fields(&def.dag, qkv_fused);
+    let (per_layer_fields, global_fields) =
+        extract_weight_fields(&def.dag, qkv_fused, gate_up_fused);
     let struct_defs = emit_structs(&per_layer_fields, &global_fields);
 
     let mut bucket_fns = Vec::new();
@@ -299,6 +307,7 @@ fn emit_post_loop_entry(entry: &DispatchEntry) -> Option<TokenStream> {
         ImplDispatchKind::Noop => None,
         ImplDispatchKind::Embed => None,
         ImplDispatchKind::FusedQkvGemm => None, // not in post-loop
+        ImplDispatchKind::FusedGateUpGemm => None, // not in post-loop
         ImplDispatchKind::BiasAdd => None,
         ImplDispatchKind::CublasGemmWithBias => None,
 
@@ -389,6 +398,19 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                 );
                 drop(normed.take());
                 qkv_out = Some(__out);
+            }})
+        }
+        ImplDispatchKind::FusedGateUpGemm => {
+            // Fused gate+up GEMM: one GEMM with concatenated weight.
+            Some(quote! {{
+                let __out = layer.mlp_gate_up_proj.forward(
+                    normed.as_ref().unwrap().view(),
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(normed.take());
+                gate_up = Some(__out);
             }})
         }
         ImplDispatchKind::BiasAdd => {
@@ -794,6 +816,7 @@ struct FieldSpec {
 fn extract_weight_fields(
     dag: &crate::dag::ModelDag,
     qkv_fused: bool,
+    gate_up_fused: bool,
 ) -> (Vec<FieldSpec>, Vec<FieldSpec>) {
     use crate::dag::{BufferKind, OpKind};
     use std::collections::BTreeMap;
@@ -837,8 +860,6 @@ fn extract_weight_fields(
 
     // Apply solver fusion decisions to the per-layer fields.
     if qkv_fused {
-        // Replace self_attn.q_proj, self_attn.k_proj, self_attn.v_proj
-        // with a single self_attn.qkv_proj.
         per_layer.retain(|f| {
             !f.name.contains("q_proj") && !f.name.contains("k_proj") && !f.name.contains("v_proj")
         });
@@ -846,8 +867,15 @@ fn extract_weight_fields(
             name: "self_attn.qkv_proj".to_string(),
             ty: "LinearLayer",
         });
-        per_layer.sort_by(|a, b| a.name.cmp(&b.name));
     }
+    if gate_up_fused {
+        per_layer.retain(|f| !f.name.contains("gate_proj") && !f.name.contains("up_proj"));
+        per_layer.push(FieldSpec {
+            name: "mlp.gate_up_proj".to_string(),
+            ty: "LinearLayer",
+        });
+    }
+    per_layer.sort_by(|a, b| a.name.cmp(&b.name));
 
     (per_layer, global)
 }

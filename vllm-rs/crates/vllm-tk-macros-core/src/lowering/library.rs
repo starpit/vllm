@@ -128,6 +128,8 @@ impl ImplementationLibrary {
             Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmQ)),
             Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmK)),
             Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmV)),
+            // ── Fused gate+up GEMM ──
+            Box::new(CublasFusedGateUpGemmImpl),
             // ── CUTLASS norm+GEMM prologue fusion (D-3) ──
             Box::new(CutlassNormGemmImpl::new(TileKind::GemmQ, 128, 128)),
             Box::new(CutlassNormGemmImpl::new(TileKind::GemmK, 128, 128)),
@@ -693,6 +695,97 @@ impl Implementation for CublasFusedQkvGemmImpl {
 
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         // One fused output: [M, qkv_dim]
+        vec![Layout::RowMajorBf16]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+}
+
+/// Fused gate+up GEMM via cuBLAS. Claims {GemmGate, GemmUp} as a
+/// single two-tile subgraph. The loader concatenates the gate and up
+/// weight tensors into one contiguous [2*intermediate, hidden] buffer;
+/// the generated forward code runs one GEMM instead of two, then
+/// `silu_and_mul_fused` splits the output.
+#[derive(Debug)]
+pub struct CublasFusedGateUpGemmImpl;
+
+impl Implementation for CublasFusedGateUpGemmImpl {
+    fn name(&self) -> &'static str {
+        "cublas_fused_gate_up_gemm"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        // Only seed on GemmGate — avoids double-matching.
+        if node.kind != TileKind::GemmGate {
+            return None;
+        }
+        let layer = node.layer;
+        let deps = &node.deps;
+
+        // Find sibling GemmUp on the same layer with the same deps.
+        let up_tile = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::GemmUp && n.layer == layer && n.deps == *deps)?;
+
+        Some(MatchInfo {
+            claimed_tiles: vec![seed, up_tile.id],
+            boundary_inputs: deps.clone(),
+            boundary_outputs: vec![seed, up_tile.id],
+            layer,
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // One fused GEMM instead of two: saves a launch + better
+        // utilization. Cost < sum of two separate gate/up GEMMs.
+        let m = profile.num_tokens();
+        let separate_cost =
+            l4_cost_model::gemm_us(m, 8192, 2048) + l4_cost_model::gemm_us(m, 8192, 2048);
+        // Fused is ~10-20% cheaper than the sum (one launch, better
+        // memory coalescing on the weight read).
+        // Always cheaper than 2 separate GEMMs — ensures uniform
+        // fusion decision across all buckets (the struct is shared).
+        separate_cost * 0.5
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::RowMajorBf16]
     }
 

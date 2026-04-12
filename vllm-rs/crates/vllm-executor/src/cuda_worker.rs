@@ -471,11 +471,9 @@ impl CudaModel {
                 } else {
                     hs
                 };
-                let logits = lm_head.forward(
-                    hs.view(),
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
+                let num_tokens = hs.dim(0) as u32;
+                let logits = vllm_cuda::model::llama::solver_forward_lm_head(
+                    lm_head, num_tokens, hs.view(), device,
                 );
                 drop(hs);
                 logits

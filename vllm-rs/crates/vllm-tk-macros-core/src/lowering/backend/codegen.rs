@@ -168,7 +168,62 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         quote! {}
     };
 
+    let model_hidden_states = if has_post_loop {
+        quote! {
+            /// Generated backbone: input_ids → hidden_states (post-norm).
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe fn solver_hidden_states(
+                model: &LlamaModel,
+                input_ids: TensorView<'_>,
+                positions: TensorView<'_>,
+                slot_mapping: TensorView<'_>,
+                cu_seqlens_q: TensorView<'_>,
+                seqused_k: TensorView<'_>,
+                block_table: TensorView<'_>,
+                max_seqlen_q: usize,
+                max_seqlen_k: usize,
+                kv_cache: &KvCachePool,
+                device: &mut GpuDevice,
+            ) -> OwnedTensor {
+                let hidden_states = kernels::embedding_gather(
+                    model.embed_tokens.weight,
+                    *input_ids,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                let mut hidden_states: OwnedTensor = hidden_states;
+                let mut residual: Option<OwnedTensor> = None;
+                let num_tokens = hidden_states.dim(0) as u32;
+
+                for layer in model.layers.iter() {
+                    let (hs, res) = solver_forward_layer(
+                        layer, num_tokens, hidden_states, residual,
+                        positions, slot_mapping, cu_seqlens_q, seqused_k,
+                        block_table, max_seqlen_q, max_seqlen_k,
+                        kv_cache, &model.rotary, device,
+                    );
+                    hidden_states = hs;
+                    residual = Some(res);
+                }
+
+                let hs_gpu: GpuTensor = *hidden_states;
+                let res_gpu: GpuTensor = residual.as_ref().unwrap().as_gpu_tensor();
+                kernels::fused_add_rms_norm_inplace(
+                    hs_gpu, res_gpu,
+                    model.norm.weight, model.norm.eps,
+                    device.compute_stream,
+                );
+                drop(residual);
+                hidden_states
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
+        #model_hidden_states
+
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn solver_forward_layer(
             layer: &LlamaDecoderLayer,

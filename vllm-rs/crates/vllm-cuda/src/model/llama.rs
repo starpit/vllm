@@ -1118,7 +1118,9 @@ impl LlamaForCausalLM {
         device: &mut GpuDevice,
         last_token_indices: Option<TensorView<'_>>,
     ) -> OwnedTensor {
-        let hidden_states = self.model.forward(
+        // Generated backbone: embed → layer loop → final norm.
+        let hidden_states = solver_hidden_states(
+            &self.model,
             input_ids,
             positions,
             slot_mapping,
@@ -1130,7 +1132,7 @@ impl LlamaForCausalLM {
             kv_cache,
             device,
         );
-        // Gather only last-token hidden states before the expensive lm_head GEMM.
+        // Last-token gather (optional).
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
                 hidden_states.as_gpu_tensor(),
@@ -1141,7 +1143,8 @@ impl LlamaForCausalLM {
         } else {
             hidden_states
         };
-        // TEMP: back to cuBLAS for lm_head to debug garbage output.
+        // lm_head (cuBLAS — CUTLASS lm_head has a known async
+        // lifetime bug, tracked separately).
         #[allow(unused_mut)]
         let mut logits = self.lm_head.forward(
             hidden_states.view(),

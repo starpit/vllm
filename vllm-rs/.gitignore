@@ -5,3 +5,5 @@
 
 # Override root *.csv ignore for parity data
 !crates/vllm-parity/**/*.csv
+# Override root *.csv ignore for solver cost tables
+!crates/vllm-tk-macros-core/data/**/*.csv

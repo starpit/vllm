@@ -116,6 +116,10 @@ impl ImplementationLibrary {
             //    variant. The fused variant saves a downstream
             Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmOProj)),
             Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmDown)),
+            // ── Fused QKV GEMM ──
+            // Claims {GemmQ, GemmK, GemmV} as one 3-tile subgraph.
+            // Listed before individual Q/K/V so the solver prefers it.
+            Box::new(CublasFusedQkvGemmImpl),
             // ── cuBLAS GEMM with fused bias epilogue ──
             // For biased models (Qwen2, Qwen2.5, ...). Registered
             // before the standalone CublasGemmExImpl variants so the
@@ -592,6 +596,103 @@ impl Implementation for CublasGemmExImpl {
     }
 
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+}
+
+/// Fused QKV GEMM via cuBLAS. Claims {GemmQ, GemmK, GemmV} as a
+/// single three-tile subgraph. The loader concatenates the three
+/// separate weight tensors into one contiguous [q_size+2*kv_size, hidden]
+/// buffer; the generated forward code runs one GEMM instead of three.
+///
+/// The solver prefers this over 3× `CublasGemmExImpl` because one
+/// large GEMM is cheaper than three small ones (better GPU utilization,
+/// one launch instead of three).
+#[derive(Debug)]
+pub struct CublasFusedQkvGemmImpl;
+
+impl Implementation for CublasFusedQkvGemmImpl {
+    fn name(&self) -> &'static str {
+        "cublas_fused_qkv_gemm"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        // Only seed on GemmQ — avoids triple-matching the same group.
+        if node.kind != TileKind::GemmQ {
+            return None;
+        }
+        let layer = node.layer;
+        let deps = &node.deps;
+
+        // Find sibling GemmK and GemmV on the same layer with the
+        // same dependencies (i.e. same input activation).
+        let k_tile = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::GemmK && n.layer == layer && n.deps == *deps)?;
+        let v_tile = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::GemmV && n.layer == layer && n.deps == *deps)?;
+
+        Some(MatchInfo {
+            claimed_tiles: vec![seed, k_tile.id, v_tile.id],
+            boundary_inputs: deps.clone(),
+            boundary_outputs: vec![seed, k_tile.id, v_tile.id],
+            layer,
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // One fused GEMM: [M, hidden] × [qkv_dim, hidden]^T.
+        // Cheaper than 3 separate GEMMs due to better utilization.
+        // Uses hardcoded Llama 3B dims (qkv=3072, hidden=3072) — the
+        // cost model is approximate; exact dims don't change the
+        // solver's relative preference for fused vs unfused.
+        let m = profile.num_tokens();
+        l4_cost_model::gemm_us(m, 3072, 3072)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        // One fused output: [M, qkv_dim]
         vec![Layout::RowMajorBf16]
     }
 

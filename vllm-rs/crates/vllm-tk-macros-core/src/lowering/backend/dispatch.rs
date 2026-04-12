@@ -60,6 +60,9 @@ pub enum ImplDispatchKind {
     /// Free passthrough — no FFI call needed (e.g. QkvSplit, KvCacheWrite, ResidualAdd
     /// when folded into an upstream beta=1 epilogue).
     Noop,
+    /// Fused QKV GEMM — one GEMM with concatenated [q|k|v] weight.
+    /// Claims {GemmQ, GemmK, GemmV} as a 3-tile subgraph.
+    FusedQkvGemm,
     /// Embedding-table gather — `kernels::embedding_gather`.
     /// Always pre-loop (runs once per forward, before the
     /// per-layer match dispatch).
@@ -261,7 +264,21 @@ fn classify_impl(
         });
 
     // Classify by impl name prefix → typed dispatch kind.
-    let kind = if imp_name.ends_with("_with_bias") {
+    // Detect fused QKV: claimed tiles include all of {GemmQ, GemmK, GemmV}.
+    let has_q = claimed
+        .iter()
+        .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::GemmQ);
+    let has_k = claimed
+        .iter()
+        .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::GemmK);
+    let has_v = claimed
+        .iter()
+        .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::GemmV);
+    let is_fused_qkv = has_q && has_k && has_v;
+
+    let kind = if is_fused_qkv {
+        ImplDispatchKind::FusedQkvGemm
+    } else if imp_name.ends_with("_with_bias") {
         // cublas_gemm_ex_<phase>_with_bias — fused {Gemm, BiasAdd}.
         // Must come before the generic cublas_gemm_ex prefix check.
         ImplDispatchKind::CublasGemmWithBias

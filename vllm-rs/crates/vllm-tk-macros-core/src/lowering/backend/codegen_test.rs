@@ -82,12 +82,11 @@ mod tests {
         // preserve the legacy fused-gate_up runtime behavior — see
         // `field_token` in codegen.rs.
         // Per-layer fields — HF weight path names from the DSL body.
+        // The solver fuses Q+K+V into one self_attn_qkv_proj field.
         for (name, ty) in [
             ("input_layernorm", "RmsNorm"),
             ("post_attention_layernorm", "RmsNorm"),
-            ("self_attn.q_proj", "LinearLayer"),
-            ("self_attn.k_proj", "LinearLayer"),
-            ("self_attn.v_proj", "LinearLayer"),
+            ("self_attn.qkv_proj", "LinearLayer"),
             ("self_attn.o_proj", "LinearLayer"),
             ("mlp.gate_proj", "LinearLayer"),
             ("mlp.up_proj", "LinearLayer"),
@@ -163,9 +162,10 @@ mod tests {
         // not the retired `layer.self_attn.*` / `layer.mlp.*` paths.
         let source = gen_source("1..1024");
         assert!(source.contains("input_layernorm"), "missing attn norm");
-        assert!(source.contains("self_attn_q_proj"), "missing Q GEMM");
-        assert!(source.contains("self_attn_k_proj"), "missing K GEMM");
-        assert!(source.contains("self_attn_v_proj"), "missing V GEMM");
+        assert!(
+            source.contains("self_attn_qkv_proj"),
+            "missing fused QKV GEMM"
+        );
         assert!(
             source.contains("attention_decode_from_cache") || source.contains("attention_standard"),
             "missing attention"

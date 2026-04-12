@@ -33,10 +33,6 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         return quote! { compile_error!("forward!: models list is empty"); };
     }
 
-    // Extract struct fields from the DAG.
-    let (per_layer_fields, global_fields) = extract_weight_fields(&def.dag);
-    let struct_defs = emit_structs(&per_layer_fields, &global_fields);
-
     // For now, use the first model. Multi-model dispatch (from_dims)
     // is a follow-up.
     let model = &models[0];
@@ -52,6 +48,17 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     if family.is_empty() {
         return quote! { compile_error!("forward!: solver found no feasible plans"); };
     }
+
+    // Check if the solver fused Q+K+V (any plan — fusion is structural).
+    let first_plan = &family.iter().next().unwrap().1;
+    let ds_first = DispatchSequence::from_plan(first_plan, &library, &tile_graph);
+    let qkv_fused = ds_first
+        .entries_for_layer(0)
+        .any(|e| e.kind == ImplDispatchKind::FusedQkvGemm);
+
+    // Extract struct fields from the DAG, applying solver fusion decisions.
+    let (per_layer_fields, global_fields) = extract_weight_fields(&def.dag, qkv_fused);
+    let struct_defs = emit_structs(&per_layer_fields, &global_fields);
 
     let mut bucket_fns = Vec::new();
     let mut match_arms = Vec::new();
@@ -291,8 +298,9 @@ fn emit_post_loop_entry(entry: &DispatchEntry) -> Option<TokenStream> {
     match entry.kind {
         ImplDispatchKind::Noop => None,
         ImplDispatchKind::Embed => None,
-        ImplDispatchKind::BiasAdd => None, // no bias on lm_head
-        ImplDispatchKind::CublasGemmWithBias => None, // not used for lm_head
+        ImplDispatchKind::FusedQkvGemm => None, // not in post-loop
+        ImplDispatchKind::BiasAdd => None,
+        ImplDispatchKind::CublasGemmWithBias => None,
 
         // lm_head GEMM via cuBLAS dispatch (fallback; solver may pick CUTLASS).
         ImplDispatchKind::CublasGemm => Some(quote! {{
@@ -369,6 +377,20 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
     match entry.kind {
         ImplDispatchKind::Noop => None,
         ImplDispatchKind::Embed => None, // handled in pre-loop, not per-layer
+        ImplDispatchKind::FusedQkvGemm => {
+            // Fused QKV GEMM: one GEMM with concatenated weight.
+            // The fused weight field on Layer is `self_attn_qkv_proj`.
+            Some(quote! {{
+                let __out = layer.self_attn_qkv_proj.forward(
+                    normed.as_ref().unwrap().view(),
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(normed.take());
+                qkv_out = Some(__out);
+            }})
+        }
         ImplDispatchKind::BiasAdd => {
             // Standalone bias add on a projection output.
             let phase = entry.gemm_phase.unwrap();
@@ -769,7 +791,10 @@ struct FieldSpec {
 /// Walk the DAG and extract weight buffer references, grouped into
 /// per-layer (Layer struct) and global (Model struct) fields.
 /// The Rust type is inferred from which op consumes the weight.
-fn extract_weight_fields(dag: &crate::dag::ModelDag) -> (Vec<FieldSpec>, Vec<FieldSpec>) {
+fn extract_weight_fields(
+    dag: &crate::dag::ModelDag,
+    qkv_fused: bool,
+) -> (Vec<FieldSpec>, Vec<FieldSpec>) {
     use crate::dag::{BufferKind, OpKind};
     use std::collections::BTreeMap;
 
@@ -808,6 +833,20 @@ fn extract_weight_fields(dag: &crate::dag::ModelDag) -> (Vec<FieldSpec>, Vec<Fie
         } else {
             global.push(spec);
         }
+    }
+
+    // Apply solver fusion decisions to the per-layer fields.
+    if qkv_fused {
+        // Replace self_attn.q_proj, self_attn.k_proj, self_attn.v_proj
+        // with a single self_attn.qkv_proj.
+        per_layer.retain(|f| {
+            !f.name.contains("q_proj") && !f.name.contains("k_proj") && !f.name.contains("v_proj")
+        });
+        per_layer.push(FieldSpec {
+            name: "self_attn.qkv_proj".to_string(),
+            ty: "LinearLayer",
+        });
+        per_layer.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     (per_layer, global)

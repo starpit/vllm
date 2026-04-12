@@ -67,6 +67,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     let (per_layer_fields, global_fields) =
         extract_weight_fields(&def.dag, qkv_fused, gate_up_fused);
     let struct_defs = emit_structs(&per_layer_fields, &global_fields);
+    let model_load = emit_model_load(&per_layer_fields, &global_fields, qkv_fused, gate_up_fused);
 
     let mut bucket_fns = Vec::new();
     let mut match_arms = Vec::new();
@@ -233,7 +234,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
                 let res_gpu: GpuTensor = residual.as_ref().unwrap().as_gpu_tensor();
                 kernels::fused_add_rms_norm_inplace(
                     hs_gpu, res_gpu,
-                    model.final_norm.weight, model.final_norm.eps,
+                    model.norm.weight, model.norm.eps,
                     device.compute_stream,
                 );
                 drop(residual);
@@ -246,6 +247,8 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
 
     quote! {
         #struct_defs
+
+        #model_load
 
         #model_hidden_states
 
@@ -921,6 +924,234 @@ fn emit_structs(per_layer: &[FieldSpec], global: &[FieldSpec]) -> TokenStream {
             pub layers: Vec<Layer>,
             pub dims: RuntimeDims,
             #(#model_fields,)*
+        }
+    }
+}
+
+/// Emit `impl Model { pub unsafe fn load(...) }` — the generated
+/// loader that reads weights from `GpuWeights` by their HF paths.
+///
+/// Fused fields (QKV, gate+up) allocate a contiguous buffer and
+/// `take_into` each constituent weight at the right offset.
+/// Unfused fields call `Linear::load` / `RmsNorm::load` / etc.
+/// All derived from the plan + DAG buffer names — no hardcoded
+/// mapping tables.
+fn emit_model_load(
+    per_layer: &[FieldSpec],
+    global: &[FieldSpec],
+    qkv_fused: bool,
+    gate_up_fused: bool,
+) -> TokenStream {
+    // Per-layer field loads.
+    let layer_loads: Vec<TokenStream> = per_layer.iter().map(|f| {
+        let ident = field_ident(&f.name);
+        match (f.ty, f.name.as_str()) {
+            ("RmsNorm", _) => {
+                // Build format string at macro time: "{layer_prefix}.input_layernorm"
+                let fmt_str = format!("{{layer_prefix}}.{}", f.name);
+                quote! {
+                    let #ident = RmsNorm::load(
+                        weights,
+                        &format!(#fmt_str),
+                        config.rms_norm_eps,
+                    )?;
+                }
+            }
+            ("LinearLayer", name) if name == "self_attn.qkv_proj" && qkv_fused => {
+                // Fused QKV: allocate one buffer, take_into q/k/v.
+                quote! {
+                    let #ident = {
+                        let q_name = format!("{layer_prefix}.self_attn.q_proj.weight");
+                        let k_name = format!("{layer_prefix}.self_attn.k_proj.weight");
+                        let v_name = format!("{layer_prefix}.self_attn.v_proj.weight");
+                        let (q_shape, q_dtype) = weights.tensor_info(&q_name)
+                            .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+                        let hidden = if q_shape.len() == 2 { q_shape[1] } else { 1 };
+                        let elem = q_dtype.size_bytes();
+                        let q_bytes = q_size * hidden * elem;
+                        let kv_bytes = kv_size * hidden * elem;
+                        let total = q_bytes + 2 * kv_bytes;
+                        let ptr = crate::driver::mem_alloc(total)?;
+                        weights.record_alloc(ptr, total);
+                        weights.take_into(&q_name, ptr, device.compute_stream)?;
+                        weights.take_into(&k_name, ptr.add(q_bytes), device.compute_stream)?;
+                        weights.take_into(&v_name, ptr.add(q_bytes + kv_bytes), device.compute_stream)?;
+                        let w = GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype);
+                        // Fuse bias if present (Qwen2).
+                        let q_bias_name = format!("{layer_prefix}.self_attn.q_proj.bias");
+                        let bias = if weights.contains(&q_bias_name) {
+                            let k_bias_name = format!("{layer_prefix}.self_attn.k_proj.bias");
+                            let v_bias_name = format!("{layer_prefix}.self_attn.v_proj.bias");
+                            let (qb_shape, qb_dtype) = weights.tensor_info(&q_bias_name).unwrap();
+                            let qb_bytes = qb_shape.iter().product::<usize>() * qb_dtype.size_bytes();
+                            let (kb_shape, _) = weights.tensor_info(&k_bias_name).unwrap();
+                            let kb_bytes = kb_shape.iter().product::<usize>() * qb_dtype.size_bytes();
+                            let (vb_shape, _) = weights.tensor_info(&v_bias_name).unwrap();
+                            let vb_bytes = vb_shape.iter().product::<usize>() * qb_dtype.size_bytes();
+                            let total_bias = qb_bytes + kb_bytes + vb_bytes;
+                            let total_elems = total_bias / qb_dtype.size_bytes();
+                            let bias_ptr = crate::driver::mem_alloc(total_bias)?;
+                            weights.record_alloc(bias_ptr, total_bias);
+                            weights.take_into(&q_bias_name, bias_ptr, device.compute_stream)?;
+                            weights.take_into(&k_bias_name, bias_ptr.add(qb_bytes), device.compute_stream)?;
+                            weights.take_into(&v_bias_name, bias_ptr.add(qb_bytes + kb_bytes), device.compute_stream)?;
+                            Some(GpuTensor::new(bias_ptr, &[total_elems], qb_dtype))
+                        } else {
+                            None
+                        };
+                        LinearLayer::Dense(Linear::new(w, bias))
+                    };
+                }
+            }
+            ("LinearLayer", name) if name == "mlp.gate_up_proj" && gate_up_fused => {
+                // Fused gate+up: allocate one buffer, take_into gate and up.
+                quote! {
+                    let #ident = {
+                        let gate_name = format!("{layer_prefix}.mlp.gate_proj.weight");
+                        let up_name = format!("{layer_prefix}.mlp.up_proj.weight");
+                        let (g_shape, g_dtype) = weights.tensor_info(&gate_name)
+                            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+                        let hidden = if g_shape.len() == 2 { g_shape[1] } else { 1 };
+                        let elem = g_dtype.size_bytes();
+                        let gate_bytes = g_shape.iter().product::<usize>() * elem;
+                        let up_bytes = gate_bytes;
+                        let total = gate_bytes + up_bytes;
+                        let ptr = crate::driver::mem_alloc(total)?;
+                        weights.record_alloc(ptr, total);
+                        weights.take_into(&gate_name, ptr, device.compute_stream)?;
+                        weights.take_into(&up_name, ptr.add(gate_bytes), device.compute_stream)?;
+                        let w = GpuTensor::new(ptr, &[2 * intermediate_size, hidden], g_dtype);
+                        LinearLayer::Dense(Linear::new(w, None))
+                    };
+                }
+            }
+            ("LinearLayer", _) => {
+                let fmt_str = format!("{{layer_prefix}}.{}", f.name);
+                quote! {
+                    let #ident = LinearLayer::Dense(
+                        Linear::load(weights, &format!(#fmt_str))?
+                    );
+                }
+            }
+            _ => quote! {},
+        }
+    }).collect();
+
+    let layer_field_inits: Vec<TokenStream> = per_layer
+        .iter()
+        .map(|f| {
+            let ident = field_ident(&f.name);
+            quote! { #ident }
+        })
+        .collect();
+
+    // Global field loads.
+    let global_loads: Vec<TokenStream> = global
+        .iter()
+        .map(|f| {
+            let ident = field_ident(&f.name);
+            match f.ty {
+                "Embedding" => {
+                    let path = format!("model.{}", f.name);
+                    quote! {
+                        let #ident = Embedding::load(weights, #path)?;
+                    }
+                }
+                "RmsNorm" => {
+                    let path = format!("model.{}", f.name);
+                    quote! {
+                        let #ident = RmsNorm::load(weights, #path, config.rms_norm_eps)?;
+                    }
+                }
+                "LinearLayer" => {
+                    let name = &f.name;
+                    quote! {
+                        let #ident = if config.tie_word_embeddings {
+                            LinearLayer::Dense(Linear::new(embed_tokens.weight, None))
+                        } else {
+                            LinearLayer::Dense(Linear::load(weights, #name)?)
+                        };
+                    }
+                }
+                "RotaryCache" => quote! {
+                    let #ident = RotaryCache::new(
+                        config.head_dim,
+                        config.max_position_embeddings,
+                        config.rope_theta,
+                        config.llama3_rope_scaling.as_ref(),
+                        dtype,
+                        device,
+                    )?;
+                    weights.record_alloc(
+                        #ident.cos_sin_cache.raw_ptr(),
+                        #ident.cos_sin_cache.size_bytes(),
+                    );
+                },
+                _ => quote! {},
+            }
+        })
+        .collect();
+
+    let global_field_inits: Vec<TokenStream> = global
+        .iter()
+        .map(|f| {
+            let ident = field_ident(&f.name);
+            quote! { #ident }
+        })
+        .collect();
+
+    quote! {
+        impl Model {
+            /// Load weights from a `GpuWeights` holder using HF paths.
+            ///
+            /// # Safety
+            /// `device` must be the live CUDA device; `weights` must own
+            /// the safetensors mmap.
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe fn load(
+                weights: &mut GpuWeights,
+                config: &LlamaConfig,
+                dtype: DType,
+                device: &GpuDevice,
+            ) -> anyhow::Result<(Self, LinearLayer)> {
+                let num_q_heads = config.num_attention_heads;
+                let num_kv_heads = config.num_kv_heads;
+                let head_dim = config.head_dim;
+                let q_size = num_q_heads * head_dim;
+                let kv_size = num_kv_heads * head_dim;
+                let intermediate_size = config.intermediate_size;
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+                #(#global_loads)*
+
+                let mut layers = Vec::with_capacity(config.num_hidden_layers);
+                for i in 0..config.num_hidden_layers {
+                    let layer_prefix = format!("model.layers.{i}");
+                    #(#layer_loads)*
+                    layers.push(Layer {
+                        #(#layer_field_inits,)*
+                    });
+                }
+
+                let dims = RuntimeDims {
+                    num_q_heads, num_kv_heads, head_dim,
+                    q_size, kv_size, intermediate_size, scale,
+                };
+
+                // Separate lm_head from the Model struct — caller
+                // manages it (cuBLAS lm_head for now).
+                let lm_head_layer = if config.tie_word_embeddings {
+                    LinearLayer::Dense(Linear::new(embed_tokens.weight, None))
+                } else {
+                    LinearLayer::Dense(Linear::load(weights, "lm_head")?)
+                };
+
+                Ok((Self {
+                    layers,
+                    dims,
+                    #(#global_field_inits,)*
+                }, lm_head_layer))
+            }
         }
     }
 }

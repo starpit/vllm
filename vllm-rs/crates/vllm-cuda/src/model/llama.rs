@@ -1118,10 +1118,7 @@ impl LlamaForCausalLM {
         device: &mut GpuDevice,
         last_token_indices: Option<TensorView<'_>>,
     ) -> OwnedTensor {
-        // Generated backbone: embed → layer loop → final norm.
-        let sm = SolverModel_DISABLED::from_llama(&self.model);
-        let hidden_states = solver_hidden_states(
-            &sm,
+        let hidden_states = self.model.forward(
             input_ids,
             positions,
             slot_mapping,
@@ -3944,48 +3941,6 @@ impl LlamaForCausalLM {
 
                 ForwardOutput::Logits(logits)
             }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bridge: build a macro-generated Model from legacy LlamaModel.
-// Temporary — goes away once Model::load is generated.
-// ---------------------------------------------------------------------------
-
-impl Model {
-    pub fn from_llama(m: &LlamaModel) -> Self {
-        let attn = &m.layers[0].self_attn;
-        let mlp = &m.layers[0].mlp;
-        let dims = RuntimeDims {
-            num_q_heads: attn.num_q_heads,
-            num_kv_heads: attn.num_kv_heads,
-            head_dim: attn.head_dim,
-            q_size: attn.q_size,
-            kv_size: attn.kv_size,
-            intermediate_size: mlp.intermediate_size,
-            scale: attn.scale,
-        };
-        let layers = m
-            .layers
-            .iter()
-            .map(|l| Layer {
-                attn_norm: l.input_layernorm,
-                qkv_weights: l.self_attn.qkv_proj.shallow_clone(),
-                o_proj: l.self_attn.o_proj.shallow_clone(),
-                mlp_norm: l.post_attention_layernorm,
-                gate_weights: l.mlp.gate_up_proj.shallow_clone(),
-                up_weights: l.mlp.up_proj.as_ref().map(|u| u.shallow_clone()),
-                down_proj: l.mlp.down_proj.shallow_clone(),
-            })
-            .collect();
-        Self {
-            embed_tokens: m.embed_tokens,
-            layers,
-            final_norm: m.norm,
-            rotary: m.rotary,
-            lm_head: LinearLayer::Dense(Linear::new(m.embed_tokens.weight, None)), // placeholder
-            dims,
         }
     }
 }

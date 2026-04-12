@@ -1039,7 +1039,7 @@ impl LlamaModel {
         let num_tokens = hidden_states.dim(0) as u32;
 
         for layer in self.layers.iter() {
-            let (hs, res) = super::solver_dispatch::solver_forward_layer(
+            let (hs, res) = solver_forward_layer(
                 layer,
                 num_tokens,
                 hidden_states,
@@ -3942,4 +3942,67 @@ impl LlamaForCausalLM {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ferrite solver dispatch
+// ---------------------------------------------------------------------------
+
+macro_rules! cutlass_gemm_ffi {
+    ($($name:ident),* $(,)?) => {
+        #[cfg(feature = "cuda")]
+        unsafe extern "C" {
+            $(
+                pub fn $name(
+                    c: *mut u16, a: *const u16, b: *const u16,
+                    m: i32, n: i32, k: i32,
+                    alpha: f32, beta: f32, stream: u64,
+                ) -> i32;
+            )*
+        }
+    };
+}
+
+cutlass_gemm_ffi!(
+    cutlass_gemm_32x64_s4_launch,
+    cutlass_gemm_32x64_s3_launch,
+    cutlass_gemm_32x128_s4_launch,
+    cutlass_gemm_32x128_s3_launch,
+    cutlass_gemm_32x256_s3_launch,
+    cutlass_gemm_64x64_s4_launch,
+    cutlass_gemm_64x64_s3_launch,
+    cutlass_gemm_64x128_s4_launch,
+    cutlass_gemm_64x128_s3_launch,
+    cutlass_gemm_128x64_s4_launch,
+    cutlass_gemm_128x64_s3_launch,
+    cutlass_gemm_128x128_s4_launch,
+    cutlass_gemm_128x128_s3_launch,
+    cutlass_gemm_128x256_s3_launch,
+    cutlass_gemm_256x64_s4_launch,
+    cutlass_gemm_256x64_s3_launch,
+    cutlass_gemv_launch,
+    cutlass_gemm_128x128_launch,
+    cutlass_gemm_64x64_launch,
+);
+
+vllm_tk_macros::forward! {
+    for layer in 0..NL {
+        let normed = rmsnorm(hidden_states, attn_norm[layer]);
+        let qkv = gemm(normed, qkv_weights[layer]);
+        let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+        let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
+        hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+
+        let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
+        let gate = silu(gemm(normed2, gate_weights[layer]));
+        let up = gemm(normed2, up_weights[layer]);
+        hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+    }
+    logits = gemm(hidden_states, lm_head);
+
+    models: [
+        { layers: 28, hidden: 3072, intermediate: 8192, heads: 24, kv_heads: 8, head_dim: 128, vocab: 128256 },
+    ],
+    target: l4_sm89,
+    workloads: [1..4096],
 }

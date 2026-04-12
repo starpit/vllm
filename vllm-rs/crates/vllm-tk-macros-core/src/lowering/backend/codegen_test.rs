@@ -230,6 +230,32 @@ mod tests {
     }
 
     #[test]
+    fn lm_head_takes_tensor_view_not_owned() {
+        // solver_forward_lm_head must take TensorView (borrow), not
+        // OwnedTensor (move). This prevents the bucket function from
+        // freeing the input buffer while the async CUTLASS kernel is
+        // still reading from it.
+        let source = gen_source("1..4096");
+        assert!(
+            source.contains("solver_forward_lm_head"),
+            "missing solver_forward_lm_head dispatcher"
+        );
+        assert!(
+            source.contains("solver_lm_head_bucket_0"),
+            "missing lm_head bucket function"
+        );
+        // The dispatcher and bucket functions must take TensorView, not OwnedTensor.
+        assert!(
+            !source.contains("solver_forward_lm_head (lm_head : & LinearLayer , num_tokens : u32 , hidden_states : OwnedTensor"),
+            "solver_forward_lm_head should take TensorView, not OwnedTensor"
+        );
+        assert!(
+            source.contains("hidden_states : TensorView"),
+            "lm_head functions should take TensorView<'_> for hidden_states"
+        );
+    }
+
+    #[test]
     #[ignore]
     fn solve_time_one_forward() {
         // Time one full forward! macro expansion for Llama 3.2 3B.

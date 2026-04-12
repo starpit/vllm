@@ -495,6 +495,15 @@ impl LinearLayer {
         }
     }
 
+    /// Cheap copy for dense layers (GpuTensor metadata only, no weight copy).
+    /// Panics on quantized variants — solver only supports dense bf16.
+    pub fn shallow_clone(&self) -> Self {
+        match self {
+            Self::Dense(l) => Self::Dense(Linear::new(l.weight, l.bias)),
+            _ => panic!("shallow_clone() called on quantized LinearLayer"),
+        }
+    }
+
     pub fn out_features(&self) -> usize {
         match self {
             Self::Dense(l) => l.out_features(),

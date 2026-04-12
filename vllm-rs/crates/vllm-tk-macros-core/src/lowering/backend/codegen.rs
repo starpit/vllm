@@ -150,10 +150,9 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
                 #[inline(never)]
                 unsafe fn #lm_fn_name(
                     lm_head: &LinearLayer,
-                    hidden_states: OwnedTensor,
+                    hidden_states: TensorView<'_>,
                     device: &mut GpuDevice,
                 ) -> OwnedTensor {
-                    let mut hidden_states = hidden_states;
                     let mut logits: Option<OwnedTensor> = None;
 
                     #(#lm_stmts)*
@@ -174,10 +173,14 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
 
     let lm_head_dispatcher = if has_post_loop {
         quote! {
+            /// CUTLASS/cuBLAS lm_head dispatch. Takes `TensorView` (borrow)
+            /// so the caller keeps the `OwnedTensor` alive — prevents the
+            /// caching allocator from freeing the input while the async
+            /// GPU kernel is still reading from it.
             pub unsafe fn solver_forward_lm_head(
                 lm_head: &LinearLayer,
                 num_tokens: u32,
-                hidden_states: OwnedTensor,
+                hidden_states: TensorView<'_>,
                 device: &mut GpuDevice,
             ) -> OwnedTensor {
                 match num_tokens {
@@ -317,12 +320,11 @@ fn emit_post_loop_entry(entry: &DispatchEntry) -> Option<TokenStream> {
         // lm_head GEMM via cuBLAS dispatch (fallback; solver may pick CUTLASS).
         ImplDispatchKind::CublasGemm => Some(quote! {{
             let __out = lm_head.forward(
-                hidden_states.view(),
+                hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
                 device.compute_stream,
             );
-            drop(hidden_states);
             logits = Some(__out);
         }}),
 
@@ -353,7 +355,6 @@ fn emit_post_loop_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                     device.compute_stream as u64,
                 );
                 debug_assert_eq!(__rc, 0, "CUTLASS GEMM failed (lm_head)");
-                drop(hidden_states);
                 logits = Some(__out);
             }})
         }
@@ -376,7 +377,6 @@ fn emit_post_loop_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                 device.compute_stream as u64,
             );
             debug_assert_eq!(__rc, 0, "CUTLASS GEMV failed (lm_head)");
-            drop(hidden_states);
             logits = Some(__out);
         }}),
 
@@ -746,7 +746,7 @@ fn cutlass_input_expr(phase: GemmPhase) -> TokenStream {
         GemmPhase::Gate => quote! { **normed.as_ref().unwrap() },
         GemmPhase::Up => quote! { **normed.as_ref().unwrap() },
         GemmPhase::Down => quote! { **silu_out.as_ref().unwrap() },
-        GemmPhase::LmHead => quote! { *hidden_states },
+        GemmPhase::LmHead => quote! { *hidden_states }, // TensorView derefs to GpuTensor
     }
 }
 
@@ -797,9 +797,10 @@ fn gemm_operands(
         GemmPhase::LmHead => (
             // Input is the final-normed hidden states (residual already folded in
             // by the preceding RmsNorm step; see lm_head's RmsNorm entry below).
-            quote! { hidden_states.view() },
+            // hidden_states is TensorView (borrow) — caller owns the buffer.
+            quote! { hidden_states },
             quote! { (*lm_head) },
-            quote! { drop(hidden_states); logits = Some(__out); },
+            quote! { logits = Some(__out); },
         ),
     }
 }

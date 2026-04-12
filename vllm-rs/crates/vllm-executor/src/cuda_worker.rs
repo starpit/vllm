@@ -98,6 +98,8 @@ pub struct CudaWorkerConfig {
 /// Supported model architectures in the vllm-cuda backend.
 enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
+    /// Generated Llama forward — dense safetensors only.
+    LlamaSolver(vllm_cuda::model::llama::Model, vllm_cuda::layers::LinearLayer),
     Qwen2(vllm_cuda::model::qwen2::Qwen2ForCausalLM),
     Gemma2(vllm_cuda::model::gemma2::Gemma2ForCausalLM),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
@@ -114,6 +116,7 @@ impl CudaModel {
     fn num_layers(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers.len(),
+            Self::LlamaSolver(m, _) => m.layers.len(),
             Self::Qwen2(m) => m.0.model.layers.len(),
             Self::Gemma2(m) => m.model.layers.len(),
             Self::Gemma3(m) => m.model.layers.len(),
@@ -132,6 +135,7 @@ impl CudaModel {
     fn num_kv_heads(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers[0].self_attn.num_kv_heads,
+            Self::LlamaSolver(m, _) => m.dims.num_kv_heads,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
@@ -148,6 +152,7 @@ impl CudaModel {
     fn head_dim(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers[0].self_attn.head_dim,
+            Self::LlamaSolver(m, _) => m.dims.head_dim,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.head_dim,
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
             Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
@@ -164,6 +169,7 @@ impl CudaModel {
     fn vocab_size(&self) -> usize {
         match self {
             Self::Llama(m) => m.lm_head.out_features(),
+            Self::LlamaSolver(_, lm) => lm.out_features(),
             Self::Qwen2(m) => m.0.lm_head.out_features(),
             Self::Gemma2(m) => m.lm_head.out_features(),
             Self::Gemma3(m) => m.lm_head.out_features(),
@@ -191,6 +197,7 @@ impl CudaModel {
     fn hidden_size(&self) -> usize {
         match self {
             Self::Llama(m) => m.lm_head.in_features(),
+            Self::LlamaSolver(_, lm) => lm.in_features(),
             Self::Qwen2(m) => m.0.lm_head.in_features(),
             Self::Gemma2(m) => m.lm_head.in_features(),
             Self::Gemma3(m) => m.lm_head.in_features(),
@@ -254,6 +261,13 @@ impl CudaModel {
                     max_seqlen_k,
                     kv_cache,
                     device,
+                )
+            },
+            Self::LlamaSolver(m, _) => unsafe {
+                vllm_cuda::model::llama::solver_hidden_states(
+                    m, input_ids, positions, slot_mapping,
+                    cu_seqlens_q, seqused_k, block_table,
+                    max_seqlen_q, max_seqlen_k, kv_cache, device,
                 )
             },
             Self::Qwen2(m) => unsafe {
@@ -420,6 +434,20 @@ impl CudaModel {
                     device,
                     last_token_indices,
                 )
+            },
+            Self::LlamaSolver(m, lm_head) => unsafe {
+                let _ = last_token_indices;
+                let hs = vllm_cuda::model::llama::solver_hidden_states(
+                    m, input_ids, positions, slot_mapping,
+                    cu_seqlens_q, seqused_k, block_table,
+                    max_seqlen_q, max_seqlen_k, kv_cache, device,
+                );
+                let logits = lm_head.forward(
+                    hs.view(), &mut device.cublas,
+                    &mut device.caching, device.compute_stream,
+                );
+                drop(hs);
+                logits
             },
             Self::Qwen2(m) => unsafe {
                 m.forward(
@@ -4932,6 +4960,44 @@ impl Worker for CudaWorker {
         let model = match arch.as_str() {
             "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
+                // Dense path: use generated Model::load.
+                if !qconfig.is_bnb4bit() && !qconfig.is_fp8() && !qconfig.is_quantized() && !use_tp && !use_pp {
+                    let (model, lm_head) = unsafe {
+                        vllm_cuda::model::llama::Model::load(
+                            &mut weights, &config, dtype, device,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerInit(format!("Llama load: {e}")))?;
+                    eprintln!("[DEBUG] Model::load OK: layers={}, dims={{q_heads={}, kv={}, hd={}}}, embed=[{},{}]",
+                        model.layers.len(), model.dims.num_q_heads, model.dims.num_kv_heads,
+                        model.dims.head_dim, model.embed_tokens.vocab_size(), model.embed_tokens.hidden_size());
+                    // Dump first 8 bf16 of layer 0 QKV weight
+                    if let vllm_cuda::layers::LinearLayer::Dense(lin) = &model.layers[0].self_attn_qkv_proj {
+                        let w = lin.weight;
+                        let mut buf = [0u8; 16];
+                        unsafe {
+                            let host = vllm_cuda::driver::mem_alloc_host(16).unwrap();
+                            vllm_cuda::driver::memcpy_dtoh_async(host, w.raw_ptr() as *const u8, 16, device.compute_stream).unwrap();
+                            vllm_cuda::driver::stream_synchronize(device.compute_stream).unwrap();
+                            std::ptr::copy_nonoverlapping(host, buf.as_mut_ptr(), 16);
+                            vllm_cuda::driver::mem_free_host(host).ok();
+                        }
+                        let vals: Vec<f32> = (0..8).map(|i| {
+                            half::bf16::from_le_bytes([buf[i*2], buf[i*2+1]]).to_f32()
+                        }).collect();
+                        eprintln!("[DEBUG] Layer 0 QKV first 8 bf16: {:?}", vals);
+                    eprintln!("[DEBUG] rotary ptr={:?} head_dim={}", model.rotary.cos_sin_cache.raw_ptr(), model.rotary.head_dim);
+                    eprintln!("[DEBUG] norm ptr={:?} eps={}", model.norm.weight.raw_ptr(), model.norm.eps);
+                    }
+                    // Check remaining weights
+                    let remaining: Vec<_> = weights.names().collect();
+                    eprintln!("[DEBUG] remaining weights after Model::load: {}", remaining.len());
+                    if !remaining.is_empty() && remaining.len() < 10 {
+                        eprintln!("[DEBUG] remaining: {:?}", remaining);
+                    }
+                    CudaModel::LlamaSolver(model, lm_head)
+                } else {
+                // Legacy quant/TP/PP paths.
                 let m = if qconfig.is_bnb4bit() {
                     let bnb_cfg = match &qconfig {
                         vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
@@ -5029,6 +5095,7 @@ impl Worker for CudaWorker {
                 }
                 .map_err(|e| ExecutorError::WorkerInit(format!("LlamaForCausalLM load: {e}")))?;
                 CudaModel::Llama(m)
+                } // close the else { legacy } block
             }
             "Qwen2ForCausalLM" | "Qwen2_5ForCausalLM" => {
                 let llama_config = llama_config_from_hf(&hf_config)?;

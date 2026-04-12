@@ -1039,9 +1039,7 @@ impl LlamaModel {
         let num_tokens = hidden_states.dim(0) as u32;
 
         for layer in self.layers.iter() {
-            let (hs, res) = solver_forward_layer(
-                layer,
-                num_tokens,
+            let (hs, res) = layer.forward(
                 hidden_states,
                 residual,
                 positions,
@@ -1055,8 +1053,6 @@ impl LlamaModel {
                 &self.rotary,
                 device,
             );
-            // Old hidden_states was consumed by the layer (dropped inside).
-            // Old residual was passed through (or created from hidden_states).
             hidden_states = hs;
             residual = Some(res);
         }

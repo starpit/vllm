@@ -645,7 +645,7 @@ mod tests {
     fn tile_abbrev(kind: TileKind) -> &'static str {
         match kind {
             TileKind::RmsNorm => "norm",
-            TileKind::GemmQkv => "qkv",
+            TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => "qkv",
             TileKind::GemmOProj => "oproj",
             TileKind::GemmGate => "gate",
             TileKind::GemmUp => "up",

@@ -369,12 +369,21 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
     match entry.kind {
         ImplDispatchKind::Noop => None,
         ImplDispatchKind::Embed => None, // handled in pre-loop, not per-layer
-        ImplDispatchKind::BiasAdd => Some(quote! {{
-            // Standalone bias add on the QKV output.
-            let __qkv = qkv_out.as_ref().unwrap();
-            let __bias = layer.self_attn_q_proj.dense_bias().expect("BiasAdd: no bias on qkv_weights");
-            kernels::bias_add_inplace(__qkv.as_gpu_tensor(), __bias, device.compute_stream);
-        }}),
+        ImplDispatchKind::BiasAdd => {
+            // Standalone bias add on a projection output.
+            let phase = entry.gemm_phase.unwrap();
+            let (buf, weight) = match phase {
+                GemmPhase::Q => (quote! { q_out }, quote! { layer.self_attn_q_proj }),
+                GemmPhase::K => (quote! { k_out }, quote! { layer.self_attn_k_proj }),
+                GemmPhase::V => (quote! { v_out }, quote! { layer.self_attn_v_proj }),
+                _ => (quote! { hidden_states }, quote! { layer.self_attn_q_proj }), // fallback
+            };
+            Some(quote! {{
+                let __t = #buf.as_ref().unwrap();
+                let __bias = (#weight).dense_bias().expect("BiasAdd: no bias");
+                kernels::bias_add_inplace(__t.as_gpu_tensor(), __bias, device.compute_stream);
+            }})
+        }
         ImplDispatchKind::CublasGemmWithBias => {
             // Fused GEMM+bias via cuBLAS. Same as CublasGemm but the
             // LinearLayer::forward picks the bias path automatically.
@@ -439,7 +448,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
-                    if let Some(ref up_proj) = layer.up_weights {
+                    if let Some(ref up_proj) = layer.mlp_up_proj_opt {
                         let __out = up_proj.forward(
                             normed.as_ref().unwrap().view(),
                             &mut device.cublas,
@@ -478,7 +487,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
-                    if let Some(ref up_proj) = layer.up_weights {
+                    if let Some(ref up_proj) = layer.mlp_up_proj_opt {
                         let __out = up_proj.forward(
                             normed.as_ref().unwrap().view(),
                             &mut device.cublas,
@@ -530,7 +539,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
-                    if let Some(ref up_proj) = layer.up_weights {
+                    if let Some(ref up_proj) = layer.mlp_up_proj_opt {
                         let __out = up_proj.forward(
                             normed.as_ref().unwrap().view(),
                             &mut device.cublas,
@@ -677,7 +686,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
 
 fn cutlass_input_expr(phase: GemmPhase) -> TokenStream {
     match phase {
-        GemmPhase::Qkv => quote! { **normed.as_ref().unwrap() },
+        GemmPhase::Q | GemmPhase::K | GemmPhase::V => quote! { **normed.as_ref().unwrap() },
         // attn_out is allocated 3D as [num_tokens, num_q_heads, head_dim]
         // by flash attention; reshape to 2D [num_tokens, q_size] for the
         // CUTLASS GEMM. The cuBLAS path handles this via the reshape in
@@ -699,10 +708,20 @@ fn gemm_operands(
     _fused_residual: bool,
 ) -> (TokenStream, TokenStream, TokenStream) {
     match phase {
-        GemmPhase::Qkv => (
+        GemmPhase::Q => (
             quote! { normed.as_ref().unwrap().view() },
             quote! { layer.self_attn_q_proj },
-            quote! { drop(normed.take()); qkv_out = Some(__out); },
+            quote! { q_out = Some(__out); },
+        ),
+        GemmPhase::K => (
+            quote! { normed.as_ref().unwrap().view() },
+            quote! { layer.self_attn_k_proj },
+            quote! { k_out = Some(__out); },
+        ),
+        GemmPhase::V => (
+            quote! { normed.as_ref().unwrap().view() },
+            quote! { layer.self_attn_v_proj },
+            quote! { drop(normed.take()); v_out = Some(__out); },
         ),
         GemmPhase::OProj => (
             quote! {{
@@ -710,22 +729,22 @@ fn gemm_operands(
                 let __nt = __ao.dim(0);
                 __ao.view().reshape(&[__nt, dims.q_size])
             }},
-            quote! { layer.o_proj },
+            quote! { layer.self_attn_o_proj },
             quote! { drop(attn_out.take()); hidden_states = __out; },
         ),
         GemmPhase::Gate => (
             quote! { normed.as_ref().unwrap().view() },
-            quote! { layer.gate_weights },
+            quote! { layer.mlp_gate_proj },
             quote! { gate_up = Some(__out); },
         ),
         GemmPhase::Up => (
             quote! { normed.as_ref().unwrap().view() },
-            quote! { layer.gate_weights },
+            quote! { layer.mlp_up_proj },
             quote! {},
         ),
         GemmPhase::Down => (
             quote! { silu_out.as_ref().unwrap().view() },
-            quote! { layer.down_proj },
+            quote! { layer.mlp_down_proj },
             quote! { drop(silu_out.take()); hidden_states = __out; },
         ),
         GemmPhase::LmHead => (

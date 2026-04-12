@@ -147,7 +147,7 @@ mod tests {
         // `layer.up_weights.is_some()` which falls through on Llama.
         let source = gen_source("1..4096");
         let forward_count = source.matches("gate_weights . forward").count()
-            + source.matches("gate_weights.forward").count();
+            + source.matches("mlp_gate_proj.forward").count();
         let bucket_count = source.matches("solver_layer_bucket_").count();
         assert!(
             forward_count <= bucket_count,
@@ -162,17 +162,22 @@ mod tests {
         // field access (`layer.attn_norm`, `layer.qkv_weights`, …),
         // not the retired `layer.self_attn.*` / `layer.mlp.*` paths.
         let source = gen_source("1..1024");
-        assert!(source.contains("attn_norm"), "missing attn norm");
-        assert!(source.contains("qkv_weights"), "missing QKV GEMM");
+        assert!(source.contains("input_layernorm"), "missing attn norm");
+        assert!(source.contains("self_attn_q_proj"), "missing Q GEMM");
+        assert!(source.contains("self_attn_k_proj"), "missing K GEMM");
+        assert!(source.contains("self_attn_v_proj"), "missing V GEMM");
         assert!(
             source.contains("attention_decode_from_cache") || source.contains("attention_standard"),
             "missing attention"
         );
-        assert!(source.contains("o_proj"), "missing OProj");
-        assert!(source.contains("mlp_norm"), "missing MLP norm");
-        assert!(source.contains("gate_weights"), "missing Gate GEMM");
+        assert!(source.contains("self_attn_o_proj"), "missing OProj");
+        assert!(
+            source.contains("post_attention_layernorm"),
+            "missing MLP norm"
+        );
+        assert!(source.contains("mlp_gate_proj"), "missing Gate GEMM");
         assert!(source.contains("silu_and_mul_fused"), "missing SiLU");
-        assert!(source.contains("down_proj"), "missing Down GEMM");
+        assert!(source.contains("mlp_down_proj"), "missing Down GEMM");
     }
 
     #[test]

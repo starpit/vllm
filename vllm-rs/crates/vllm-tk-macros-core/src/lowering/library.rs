@@ -121,12 +121,18 @@ impl ImplementationLibrary {
             // before the standalone CublasGemmExImpl variants so the
             // solver prefers the fused {GemmQkv + BiasAdd} cover over
             // the split cover when both are feasible.
-            Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmQkv)),
+            Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmQ)),
+            Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmK)),
+            Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmV)),
             // ── CUTLASS norm+GEMM prologue fusion (D-3) ──
-            Box::new(CutlassNormGemmImpl::new(TileKind::GemmQkv, 128, 128)),
+            Box::new(CutlassNormGemmImpl::new(TileKind::GemmQ, 128, 128)),
+            Box::new(CutlassNormGemmImpl::new(TileKind::GemmK, 128, 128)),
+            Box::new(CutlassNormGemmImpl::new(TileKind::GemmV, 128, 128)),
             Box::new(CutlassNormGemmImpl::new(TileKind::GemmGate, 128, 128)),
             Box::new(CutlassNormGemmImpl::new(TileKind::GemmUp, 128, 128)),
-            Box::new(CublasGemmExImpl::new(TileKind::GemmQkv)),
+            Box::new(CublasGemmExImpl::new(TileKind::GemmQ)),
+            Box::new(CublasGemmExImpl::new(TileKind::GemmK)),
+            Box::new(CublasGemmExImpl::new(TileKind::GemmV)),
             Box::new(CublasGemmExImpl::new(TileKind::GemmOProj)),
             Box::new(CublasGemmExImpl::new(TileKind::GemmGate)),
             Box::new(CublasGemmExImpl::new(TileKind::GemmUp)),
@@ -502,7 +508,7 @@ impl CublasGemmExImpl {
 impl Implementation for CublasGemmExImpl {
     fn name(&self) -> &'static str {
         match self.phase {
-            TileKind::GemmQkv => "cublas_gemm_ex_qkv",
+            TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => "cublas_gemm_ex_qkv",
             TileKind::GemmOProj => "cublas_gemm_ex_oproj",
             TileKind::GemmGate => "cublas_gemm_ex_gate",
             TileKind::GemmUp => "cublas_gemm_ex_up",
@@ -541,7 +547,9 @@ impl Implementation for CublasGemmExImpl {
         // LLaMA 1B shapes: HD=2048, ID=8192, QKV_DIM=3072
         let m = profile.num_tokens();
         match self.phase {
-            TileKind::GemmQkv => l4_cost_model::gemm_us(m, 3072, 2048),
+            TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => {
+                l4_cost_model::gemm_us(m, 3072, 2048)
+            }
             TileKind::GemmOProj => l4_cost_model::gemm_us(m, 2048, 2048),
             TileKind::GemmGate => l4_cost_model::gemm_us(m, 8192, 2048),
             TileKind::GemmUp => l4_cost_model::gemm_us(m, 8192, 2048),
@@ -1245,7 +1253,7 @@ impl CublasGemmExWithBiasImpl {
 impl Implementation for CublasGemmExWithBiasImpl {
     fn name(&self) -> &'static str {
         match self.phase {
-            TileKind::GemmQkv => "cublas_gemm_ex_qkv_with_bias",
+            TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => "cublas_gemm_ex_qkv_with_bias",
             TileKind::GemmOProj => "cublas_gemm_ex_oproj_with_bias",
             TileKind::GemmGate => "cublas_gemm_ex_gate_with_bias",
             TileKind::GemmUp => "cublas_gemm_ex_up_with_bias",
@@ -1295,7 +1303,9 @@ impl Implementation for CublasGemmExWithBiasImpl {
         // folded into the mainloop and doesn't change wall clock.
         let m = profile.num_tokens();
         match self.phase {
-            TileKind::GemmQkv => l4_cost_model::gemm_us(m, 3072, 2048),
+            TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => {
+                l4_cost_model::gemm_us(m, 3072, 2048)
+            }
             TileKind::GemmOProj => l4_cost_model::gemm_us(m, 2048, 2048),
             TileKind::GemmGate => l4_cost_model::gemm_us(m, 8192, 2048),
             TileKind::GemmUp => l4_cost_model::gemm_us(m, 8192, 2048),
@@ -1615,7 +1625,7 @@ impl CutlassGemmImpl {
     ) -> Self {
         debug_assert!(phase.is_gemm(), "CutlassGemmImpl needs a GEMM tile kind");
         let phase_str = match phase {
-            TileKind::GemmQkv => "qkv",
+            TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => "qkv",
             TileKind::GemmOProj => "oproj",
             TileKind::GemmGate => "gate",
             TileKind::GemmUp => "up",
@@ -1644,7 +1654,9 @@ impl CutlassGemmImpl {
         dims: crate::lowering::tile_graph::ModelDims,
     ) -> Vec<Box<dyn Implementation>> {
         let phases = [
-            TileKind::GemmQkv,
+            TileKind::GemmQ,
+            TileKind::GemmK,
+            TileKind::GemmV,
             TileKind::GemmOProj,
             TileKind::GemmGate,
             TileKind::GemmUp,
@@ -1689,7 +1701,7 @@ impl CutlassGemmImpl {
 /// - LmHead: N = vocab_size, K = hidden
 fn gemm_nk(phase: TileKind, dims: crate::lowering::tile_graph::ModelDims) -> (u32, u32) {
     match phase {
-        TileKind::GemmQkv => (dims.qkv_dim(), dims.hidden_size),
+        TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => (dims.qkv_dim(), dims.hidden_size),
         TileKind::GemmOProj => (dims.hidden_size, dims.num_attention_heads * dims.head_dim),
         TileKind::GemmGate | TileKind::GemmUp => (dims.intermediate_size, dims.hidden_size),
         TileKind::GemmDown => (dims.hidden_size, dims.intermediate_size),
@@ -1784,7 +1796,9 @@ impl CutlassGemvImpl {
         // LmHead runs once per forward pass with no residual, so GEMV wins
         // at BS=1 where the vocab×hidden projection is memory-bound.
         vec![
-            Box::new(Self::new(TileKind::GemmQkv, dims)),
+            Box::new(Self::new(TileKind::GemmQ, dims)),
+            Box::new(Self::new(TileKind::GemmK, dims)),
+            Box::new(Self::new(TileKind::GemmV, dims)),
             Box::new(Self::new(TileKind::GemmGate, dims)),
             Box::new(Self::new(TileKind::GemmUp, dims)),
             Box::new(Self::new(TileKind::GemmLmHead, dims)),
@@ -1795,7 +1809,7 @@ impl CutlassGemvImpl {
 impl Implementation for CutlassGemvImpl {
     fn name(&self) -> &'static str {
         match self.phase {
-            TileKind::GemmQkv => "cutlass_gemv_qkv",
+            TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => "cutlass_gemv_qkv",
             TileKind::GemmOProj => "cutlass_gemv_oproj",
             TileKind::GemmGate => "cutlass_gemv_gate",
             TileKind::GemmUp => "cutlass_gemv_up",
@@ -2048,7 +2062,7 @@ impl CutlassNormGemmImpl {
 impl Implementation for CutlassNormGemmImpl {
     fn name(&self) -> &'static str {
         match self.gemm_phase {
-            TileKind::GemmQkv => "cutlass_norm_qkv_128",
+            TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => "cutlass_norm_qkv_128",
             TileKind::GemmGate => "cutlass_norm_gate_128",
             TileKind::GemmUp => "cutlass_norm_up_128",
             _ => "cutlass_norm_unknown",
@@ -2091,7 +2105,7 @@ impl Implementation for CutlassNormGemmImpl {
         // (maybe 2-5% overhead for the norm compute in the prologue).
         let m = profile.num_tokens();
         let (n, k) = match self.gemm_phase {
-            TileKind::GemmQkv => (3072, 2048),
+            TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => (3072, 2048),
             TileKind::GemmGate | TileKind::GemmUp => (8192, 2048),
             _ => (1, 1),
         };

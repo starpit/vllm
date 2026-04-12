@@ -92,9 +92,12 @@ pub enum TileKind {
     RmsNorm,
 
     // ── GEMM operations (per layer, per phase) ──
-    /// QKV projection GEMM. Output is the packed qkv buffer of
-    /// shape `[seq, qkv_dim]`. Followed by an explicit `QkvSplit`.
-    GemmQkv,
+    /// Q projection GEMM: `[seq, hidden] → [seq, q_size]`.
+    GemmQ,
+    /// K projection GEMM: `[seq, hidden] → [seq, kv_size]`.
+    GemmK,
+    /// V projection GEMM: `[seq, hidden] → [seq, kv_size]`.
+    GemmV,
     /// O projection GEMM. Beta=1 residual is **lifted out** to a
     /// separate `ResidualAdd` consumer; this node is the pure
     /// matmul.
@@ -179,7 +182,9 @@ impl TileKind {
     pub fn is_gemm(self) -> bool {
         matches!(
             self,
-            TileKind::GemmQkv
+            TileKind::GemmQ
+                | TileKind::GemmK
+                | TileKind::GemmV
                 | TileKind::GemmOProj
                 | TileKind::GemmGate
                 | TileKind::GemmUp
@@ -192,7 +197,9 @@ impl TileKind {
     pub fn name(self) -> &'static str {
         match self {
             TileKind::RmsNorm => "rms_norm",
-            TileKind::GemmQkv => "gemm_qkv",
+            TileKind::GemmQ => "gemm_q",
+            TileKind::GemmK => "gemm_k",
+            TileKind::GemmV => "gemm_v",
             TileKind::GemmOProj => "gemm_o_proj",
             TileKind::GemmGate => "gemm_gate",
             TileKind::GemmUp => "gemm_up",
@@ -364,8 +371,16 @@ impl TileGraph {
 
             // ── Attention block ──
             let attn_norm = push(&mut nodes, TileKind::RmsNorm, layer, vec![hidden_in]);
-            let qkv_gemm = push(&mut nodes, TileKind::GemmQkv, layer, vec![attn_norm]);
-            let qkv_split = push(&mut nodes, TileKind::QkvSplit, layer, vec![qkv_gemm]);
+            // Separate Q, K, V GEMMs (solver may elect to fuse).
+            let q_gemm = push(&mut nodes, TileKind::GemmQ, layer, vec![attn_norm]);
+            let k_gemm = push(&mut nodes, TileKind::GemmK, layer, vec![attn_norm]);
+            let v_gemm = push(&mut nodes, TileKind::GemmV, layer, vec![attn_norm]);
+            let qkv_split = push(
+                &mut nodes,
+                TileKind::QkvSplit,
+                layer,
+                vec![q_gemm, k_gemm, v_gemm],
+            );
             let rope = push(&mut nodes, TileKind::Rope, layer, vec![qkv_split]);
             let kv_write = push(&mut nodes, TileKind::KvCacheWrite, layer, vec![rope]);
             let attention = push(&mut nodes, TileKind::Attention, layer, vec![rope, kv_write]);
@@ -701,7 +716,7 @@ fn self_or_hidden(
 /// new match arms, without touching the DSL body or the codegen.
 fn phase_has_bias(kind: TileKind, dims: ModelDims) -> bool {
     match kind {
-        TileKind::GemmQkv => dims.qkv_bias,
+        TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => dims.qkv_bias,
         _ => false,
     }
 }
@@ -711,8 +726,12 @@ fn phase_has_bias(kind: TileKind, dims: ModelDims) -> bool {
 /// `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`, `lm_head`.
 fn classify_gemm(weight_name: &str) -> TileKind {
     let w = weight_name.to_lowercase();
-    if w.contains("q_proj") || w.contains("k_proj") || w.contains("v_proj") {
-        TileKind::GemmQkv
+    if w.contains("q_proj") {
+        TileKind::GemmQ
+    } else if w.contains("k_proj") {
+        TileKind::GemmK
+    } else if w.contains("v_proj") {
+        TileKind::GemmV
     } else if w.contains("o_proj") {
         TileKind::GemmOProj
     } else if w.contains("lm_head") {
@@ -724,8 +743,8 @@ fn classify_gemm(weight_name: &str) -> TileKind {
     } else if w.contains("down_proj") {
         TileKind::GemmDown
     } else {
-        // Unknown weight — default to generic GEMM.
-        TileKind::GemmQkv
+        // Unknown weight — default to Q projection.
+        TileKind::GemmQ
     }
 }
 
@@ -735,14 +754,14 @@ mod self_tests {
 
     #[test]
     fn llama_forward_has_expected_node_count_per_layer() {
-        // Per layer: 1 attn_norm, 1 qkv_gemm, 1 qkv_split, 1 rope,
-        //            1 kv_cache_write, 1 attention, 1 o_proj,
+        // Per layer: 1 attn_norm, 3 qkv_gemm (q,k,v), 1 qkv_split,
+        //            1 rope, 1 kv_cache_write, 1 attention, 1 o_proj,
         //            1 attn_residual, 1 mlp_norm, 1 gate_gemm,
         //            1 up_gemm, 1 gate_up_concat, 1 silu_mul,
-        //            1 down_gemm, 1 mlp_residual = 15 nodes per layer.
+        //            1 down_gemm, 1 mlp_residual = 17 nodes per layer.
         // Plus 1 synthetic input node for the very first layer.
         let g = TileGraph::build_llama_forward_1b(2);
-        assert_eq!(g.nodes.len(), 1 + 2 * 15);
+        assert_eq!(g.nodes.len(), 1 + 2 * 17);
         assert_eq!(g.num_layers, 2);
     }
 

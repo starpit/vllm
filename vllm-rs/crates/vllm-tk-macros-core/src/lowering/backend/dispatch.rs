@@ -70,7 +70,9 @@ pub enum ImplDispatchKind {
 /// pointers and weight offsets).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GemmPhase {
-    Qkv,
+    Q,
+    K,
+    V,
     OProj,
     Gate,
     Up,
@@ -227,7 +229,9 @@ fn classify_impl(
     // Helper: map a GEMM TileKind to its GemmPhase.
     let kind_to_phase = |k: TileKind| -> Option<GemmPhase> {
         match k {
-            TileKind::GemmQkv => Some(GemmPhase::Qkv),
+            TileKind::GemmQ => Some(GemmPhase::Q),
+            TileKind::GemmK => Some(GemmPhase::K),
+            TileKind::GemmV => Some(GemmPhase::V),
             TileKind::GemmOProj => Some(GemmPhase::OProj),
             TileKind::GemmGate => Some(GemmPhase::Gate),
             TileKind::GemmUp => Some(GemmPhase::Up),

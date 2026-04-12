@@ -181,6 +181,35 @@ mod tests {
     }
 
     #[test]
+    fn solver_elects_fused_qkv_on_l4() {
+        // The DSL body has separate q/k/v GEMMs. On L4 (sm89), the
+        // solver should fuse them into one FusedQkvGemm — one launch
+        // instead of three, better GPU utilization. This test asserts
+        // the plan-level decision, not just the codegen output.
+        let source = gen_source("1..1024");
+
+        // Fused QKV field IS present.
+        assert!(
+            source.contains("self_attn_qkv_proj"),
+            "solver should produce fused QKV field on L4"
+        );
+
+        // Separate Q/K/V fields are NOT present (they were fused away).
+        assert!(
+            !source.contains("pub self_attn_q_proj"),
+            "solver should NOT produce separate Q field when fused"
+        );
+        assert!(
+            !source.contains("pub self_attn_k_proj"),
+            "solver should NOT produce separate K field when fused"
+        );
+        assert!(
+            !source.contains("pub self_attn_v_proj"),
+            "solver should NOT produce separate V field when fused"
+        );
+    }
+
+    #[test]
     #[ignore]
     fn solve_time_one_forward() {
         // Time one full forward! macro expansion for Llama 3.2 3B.

@@ -154,11 +154,15 @@ pub enum OpKind {
         residual: BufferId,
         output: BufferId,
     },
-    /// QKV split + RoPE + KV cache append. The `rotary` buffer is the
+    /// RoPE + KV cache append. Takes separate Q, K, V projections
+    /// (the solver may have fused the upstream GEMMs, but the DAG
+    /// always stores separate inputs). The `rotary` buffer is the
     /// pre-computed cos/sin cache (classified as a global weight of
     /// Rust type `RotaryCache` in the field extractor).
     RopeAppend {
-        qkv: BufferId,
+        q_in: BufferId,
+        k_in: BufferId,
+        v_in: BufferId,
         positions: BufferId,
         rotary: BufferId,
         kv_cache: BufferId,
@@ -210,12 +214,14 @@ impl Op {
             OpKind::Gemm { a, b, .. } => vec![a, b],
             OpKind::GemmAdd { a, b, residual, .. } => vec![a, b, residual],
             OpKind::RopeAppend {
-                qkv,
+                q_in,
+                k_in,
+                v_in,
                 positions,
                 rotary,
                 kv_cache,
                 ..
-            } => vec![qkv, positions, rotary, kv_cache],
+            } => vec![q_in, k_in, v_in, positions, rotary, kv_cache],
             OpKind::AttentionDecode {
                 q,
                 kv_cache,

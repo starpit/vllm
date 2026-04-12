@@ -539,14 +539,26 @@ impl TileGraph {
                         current_hidden = residual_tile;
                     }
                     OpKind::RopeAppend {
-                        qkv,
+                        q_in,
+                        k_in,
+                        v_in,
                         q_out,
                         k_out,
                         v_out,
                         ..
                     } => {
-                        let qkv_dep = buf_to_tile.get(&qkv.0).copied().unwrap_or(current_hidden);
-                        let split = push(&mut nodes, TileKind::QkvSplit, layer, vec![qkv_dep]);
+                        // Separate Q/K/V projections. The solver may
+                        // have fused the upstream GEMMs, but the tile
+                        // graph always represents the logical split.
+                        let q_dep = buf_to_tile.get(&q_in.0).copied().unwrap_or(current_hidden);
+                        let k_dep = buf_to_tile.get(&k_in.0).copied().unwrap_or(current_hidden);
+                        let v_dep = buf_to_tile.get(&v_in.0).copied().unwrap_or(current_hidden);
+                        let split = push(
+                            &mut nodes,
+                            TileKind::QkvSplit,
+                            layer,
+                            vec![q_dep, k_dep, v_dep],
+                        );
                         let rope = push(&mut nodes, TileKind::Rope, layer, vec![split]);
                         let kvw = push(&mut nodes, TileKind::KvCacheWrite, layer, vec![rope]);
                         buf_to_tile.insert(q_out.0.clone(), rope);
@@ -695,21 +707,21 @@ fn phase_has_bias(kind: TileKind, dims: ModelDims) -> bool {
 }
 
 /// Classify a GEMM by its weight buffer name.
-/// The DSL uses names like `qkv_weights`, `o_proj`, `gate_weights`,
-/// `up_weights`, `down_proj` — we match on these to determine the phase.
+/// The DSL uses HF weight paths: `self_attn.q_proj`, `self_attn.o_proj`,
+/// `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`, `lm_head`.
 fn classify_gemm(weight_name: &str) -> TileKind {
     let w = weight_name.to_lowercase();
-    if w.contains("qkv") {
+    if w.contains("q_proj") || w.contains("k_proj") || w.contains("v_proj") {
         TileKind::GemmQkv
     } else if w.contains("o_proj") {
         TileKind::GemmOProj
     } else if w.contains("lm_head") {
         TileKind::GemmLmHead
-    } else if w.contains("gate") {
+    } else if w.contains("gate_proj") {
         TileKind::GemmGate
-    } else if w.contains("up") {
+    } else if w.contains("up_proj") {
         TileKind::GemmUp
-    } else if w.contains("down") {
+    } else if w.contains("down_proj") {
         TileKind::GemmDown
     } else {
         // Unknown weight — default to generic GEMM.
@@ -774,16 +786,18 @@ mod self_tests {
         let dsl = r#"
             kernel llama_test<NL=2, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
                 for layer in 0..NL {
-                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
-                    let qkv = gemm(normed, qkv_weights[layer]);
-                    let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
+                    let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                    let q = gemm(normed, self_attn.q_proj[layer]);
+                let k = gemm(normed, self_attn.k_proj[layer]);
+                let v = gemm(normed, self_attn.v_proj[layer]);
+                    let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
                     let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+                    hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
 
-                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
-                    let gate = silu(gemm(normed2, gate_weights[layer]));
-                    let up = gemm(normed2, up_weights[layer]);
-                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                    let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                    let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                    let up = gemm(normed2, mlp.up_proj[layer]);
+                    hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
                 }
                 let normed = rmsnorm(hidden_states, lm_head_norm);
                 logits = gemm(normed, lm_head);
@@ -837,16 +851,18 @@ mod self_tests {
         let dsl = r#"
             kernel test<NL=3, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
                 for layer in 0..NL {
-                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
-                    let qkv = gemm(normed, qkv_weights[layer]);
-                    let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
+                    let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                    let q = gemm(normed, self_attn.q_proj[layer]);
+                let k = gemm(normed, self_attn.k_proj[layer]);
+                let v = gemm(normed, self_attn.v_proj[layer]);
+                    let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
                     let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+                    hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
 
-                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
-                    let gate = silu(gemm(normed2, gate_weights[layer]));
-                    let up = gemm(normed2, up_weights[layer]);
-                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                    let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                    let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                    let up = gemm(normed2, mlp.up_proj[layer]);
+                    hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
                 }
                 let normed = rmsnorm(hidden_states, lm_head_norm);
                 logits = gemm(normed, lm_head);

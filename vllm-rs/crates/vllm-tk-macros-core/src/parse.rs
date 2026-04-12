@@ -77,8 +77,9 @@ pub struct OpCall {
 
 /// An argument to an op call.
 pub enum Arg {
-    /// Simple variable reference: `x` or `x[layer]`
-    Var(Ident, Option<Ident>),
+    /// Variable reference: `x`, `x[layer]`, or `self_attn.q_proj[layer]`.
+    /// The name may contain dots (HF weight path segments).
+    Var(String, Option<Ident>),
     /// Nested call: `silu(gemm(x, w[layer]))`
     Call(OpCall),
     /// Binary expression: `a * b`
@@ -290,15 +291,25 @@ fn parse_primary_arg(input: ParseStream) -> Result<Arg> {
         return Ok(Arg::Call(OpCall { op: ident, args }));
     }
 
-    // Indexed? var[layer]
+    // Dotted path? self_attn.q_proj or self_attn.q_proj[layer]
+    // Join with '.' to form the full HF weight path segment.
+    let mut name = ident.to_string();
+    while input.peek(Token![.]) && !input.peek2(Token![.]) {
+        input.parse::<Token![.]>()?;
+        let next: Ident = input.parse()?;
+        name.push('.');
+        name.push_str(&next.to_string());
+    }
+
+    // Indexed? var[layer] or self_attn.q_proj[layer]
     if input.peek(token::Bracket) {
         let content;
         syn::bracketed!(content in input);
         let idx: Ident = content.parse()?;
-        return Ok(Arg::Var(ident, Some(idx)));
+        return Ok(Arg::Var(name, Some(idx)));
     }
 
-    Ok(Arg::Var(ident, None))
+    Ok(Arg::Var(name, None))
 }
 
 // ── DSL → DAG conversion ─────────────────────────────────────────────────
@@ -539,15 +550,20 @@ fn process_call(
             Ok((out_id, out_shape))
         }
         "rope_append" => {
-            // rope_append(qkv, positions, rotary, kv_cache) -> (q, k, v)
+            // rope_append(q, k, v, positions, rotary, kv_cache) -> (q, k, v)
             //
+            // Takes separate Q, K, V projections (unfused). The solver
+            // may elect to fuse the upstream GEMMs, but the DSL
+            // describes the logical math with separate projections.
             // `rotary` is the pre-computed cos/sin cache — a global
             // weight (not per-layer), classified as Rust type
             // `RotaryCache` in the field extractor.
-            let (qkv_id, _) = resolve_arg(dag, ctx, &call.args[0], in_loop)?;
-            let (pos_id, _) = resolve_arg(dag, ctx, &call.args[1], in_loop)?;
-            let (rot_id, _) = resolve_arg(dag, ctx, &call.args[2], in_loop)?;
-            let (kv_id, _) = resolve_arg(dag, ctx, &call.args[3], in_loop)?;
+            let (q_in_id, _) = resolve_arg(dag, ctx, &call.args[0], in_loop)?;
+            let (k_in_id, _) = resolve_arg(dag, ctx, &call.args[1], in_loop)?;
+            let (v_in_id, _) = resolve_arg(dag, ctx, &call.args[2], in_loop)?;
+            let (pos_id, _) = resolve_arg(dag, ctx, &call.args[3], in_loop)?;
+            let (rot_id, _) = resolve_arg(dag, ctx, &call.args[4], in_loop)?;
+            let (kv_id, _) = resolve_arg(dag, ctx, &call.args[5], in_loop)?;
 
             let base = ctx.fresh_name("rope");
             let q_id = BufferId(format!("{base}_q"));
@@ -579,7 +595,9 @@ fn process_call(
 
             dag.add_op(
                 OpKind::RopeAppend {
-                    qkv: qkv_id,
+                    q_in: q_in_id,
+                    k_in: k_in_id,
+                    v_in: v_in_id,
                     positions: pos_id,
                     rotary: rot_id,
                     kv_cache: kv_id,
@@ -662,8 +680,8 @@ fn resolve_arg(
     in_loop: bool,
 ) -> std::result::Result<(BufferId, TensorShape), String> {
     match arg {
-        Arg::Var(ident, idx) => {
-            let name = ident.to_string();
+        Arg::Var(name, idx) => {
+            let name = name.clone();
             // Check if it's a known variable
             if let Some((id, shape)) = ctx.vars.get(&name) {
                 return Ok((id.clone(), shape.clone()));
@@ -763,7 +781,8 @@ fn infer_external_buffer(name: &str, ctx: &BuildCtx) -> (BufferKind, TensorShape
                 dims: vec![Dim::Lit(1)],
             },
         ),
-        n if n.ends_with("_norm") || n.ends_with("_norm_w") => (
+        // Layernorms: input_layernorm, post_attention_layernorm, norm, *_norm
+        n if n.contains("layernorm") || n.ends_with("_norm") || n == "norm" => (
             BufferKind::Weight,
             TensorShape {
                 dims: vec![ctx.hd()],
@@ -772,12 +791,37 @@ fn infer_external_buffer(name: &str, ctx: &BuildCtx) -> (BufferKind, TensorShape
         "lm_head" | "lm_head_weights" => {
             (BufferKind::Weight, TensorShape::matrix(ctx.vs(), ctx.hd()))
         }
+        // Q/K/V projections: self_attn.q_proj, self_attn.k_proj, self_attn.v_proj
+        n if n.contains("q_proj") || n.contains("k_proj") || n.contains("v_proj") => {
+            let nah = ctx.params.get("NAH").copied().unwrap_or(32);
+            let nkh = ctx.params.get("NKH").copied().unwrap_or(8);
+            let hdm = ctx.params.get("HDM").copied().unwrap_or(64);
+            let out_dim = if n.contains("q_proj") {
+                nah * hdm
+            } else {
+                nkh * hdm
+            };
+            (
+                BufferKind::Weight,
+                TensorShape::matrix(Dim::Lit(out_dim), ctx.hd()),
+            )
+        }
+        // O projection: self_attn.o_proj
+        n if n.contains("o_proj") => (BufferKind::Weight, TensorShape::matrix(ctx.hd(), ctx.hd())),
+        // MLP: gate_proj, up_proj → [intermediate, hidden]
+        n if n.contains("gate_proj") || n.contains("up_proj") => {
+            (BufferKind::Weight, TensorShape::matrix(ctx.id(), ctx.hd()))
+        }
+        // MLP: down_proj → [hidden, intermediate]
+        n if n.contains("down_proj") => {
+            (BufferKind::Weight, TensorShape::matrix(ctx.hd(), ctx.id()))
+        }
+        // Legacy names (backward compat with old DSL bodies)
         n if n.contains("gate") || n.contains("up") => {
             (BufferKind::Weight, TensorShape::matrix(ctx.id(), ctx.hd()))
         }
         n if n.contains("down") => (BufferKind::Weight, TensorShape::matrix(ctx.hd(), ctx.id())),
         n if n.contains("qkv") => {
-            // QKV weight: [(NAH + 2*NKH) * HDM, HD]
             let nah = ctx.params.get("NAH").copied().unwrap_or(32);
             let nkh = ctx.params.get("NKH").copied().unwrap_or(8);
             let hdm = ctx.params.get("HDM").copied().unwrap_or(64);
@@ -787,9 +831,7 @@ fn infer_external_buffer(name: &str, ctx: &BuildCtx) -> (BufferKind, TensorShape
                 TensorShape::matrix(Dim::Lit(qkv_dim), ctx.hd()),
             )
         }
-        n if n.contains("o_proj") || n.contains("proj") => {
-            (BufferKind::Weight, TensorShape::matrix(ctx.hd(), ctx.hd()))
-        }
+        n if n.contains("proj") => (BufferKind::Weight, TensorShape::matrix(ctx.hd(), ctx.hd())),
         // Default: assume activation [BS, HD]
         _ => (
             BufferKind::Activation,
@@ -822,16 +864,18 @@ mod tests {
         let input: TokenStream = quote::quote! {
             kernel llama_sm89<NL=16, HD=2048, ID=5632, HDM=64, NAH=32, NKH=8, VS=128256> {
                 for layer in 0..NL {
-                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
-                    let qkv = gemm(normed, qkv_weights[layer]);
-                    let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
+                    let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                    let q = gemm(normed, self_attn.q_proj[layer]);
+                let k = gemm(normed, self_attn.k_proj[layer]);
+                let v = gemm(normed, self_attn.v_proj[layer]);
+                    let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
                     let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+                    hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
 
-                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
-                    let gate = silu(gemm(normed2, gate_weights[layer]));
-                    let up = gemm(normed2, up_weights[layer]);
-                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                    let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                    let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                    let up = gemm(normed2, mlp.up_proj[layer]);
+                    hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
                 }
                 let normed = rmsnorm(hidden_states, lm_head_norm);
                 logits = gemm(normed, lm_head);
@@ -850,16 +894,18 @@ mod tests {
         let input: TokenStream = quote::quote! {
             kernel llama_sm89<NL=16, HD=2048, ID=5632, HDM=64, NAH=32, NKH=8, VS=128256> {
                 for layer in 0..NL {
-                    let normed = rmsnorm(hidden_states, attn_norm[layer]);
-                    let qkv = gemm(normed, qkv_weights[layer]);
-                    let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
+                    let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                    let q = gemm(normed, self_attn.q_proj[layer]);
+                let k = gemm(normed, self_attn.k_proj[layer]);
+                let v = gemm(normed, self_attn.v_proj[layer]);
+                    let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
                     let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                    hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+                    hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
 
-                    let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
-                    let gate = silu(gemm(normed2, gate_weights[layer]));
-                    let up = gemm(normed2, up_weights[layer]);
-                    hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+                    let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                    let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                    let up = gemm(normed2, mlp.up_proj[layer]);
+                    hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
                 }
                 let normed = rmsnorm(hidden_states, lm_head_norm);
                 logits = gemm(normed, lm_head);

@@ -372,7 +372,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
         ImplDispatchKind::BiasAdd => Some(quote! {{
             // Standalone bias add on the QKV output.
             let __qkv = qkv_out.as_ref().unwrap();
-            let __bias = layer.qkv_weights.dense_bias().expect("BiasAdd: no bias on qkv_weights");
+            let __bias = layer.self_attn_q_proj.dense_bias().expect("BiasAdd: no bias on qkv_weights");
             kernels::bias_add_inplace(__qkv.as_gpu_tensor(), __bias, device.compute_stream);
         }}),
         ImplDispatchKind::CublasGemmWithBias => {
@@ -400,8 +400,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                         let res_gpu: GpuTensor = *res;
                         kernels::fused_add_rms_norm_inplace(
                             hs_gpu, res_gpu,
-                            layer.attn_norm.weight,
-                            layer.attn_norm.eps,
+                            layer.input_layernorm.weight,
+                            layer.input_layernorm.eps,
                             device.compute_stream,
                         );
                         (hidden_states, res)
@@ -409,8 +409,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                         let hs_gpu: GpuTensor = *hidden_states;
                         let n = kernels::rms_norm(
                             hs_gpu,
-                            layer.attn_norm.weight,
-                            layer.attn_norm.eps,
+                            layer.input_layernorm.weight,
+                            layer.input_layernorm.eps,
                             &mut device.caching,
                             device.compute_stream,
                         );
@@ -426,8 +426,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                     let res_gpu: GpuTensor = **residual.as_ref().unwrap();
                     kernels::fused_add_rms_norm_inplace(
                         hs_gpu, res_gpu,
-                        layer.mlp_norm.weight,
-                        layer.mlp_norm.eps,
+                        layer.post_attention_layernorm.weight,
+                        layer.post_attention_layernorm.eps,
                         device.compute_stream,
                     );
                     normed = Some(hidden_states);
@@ -701,7 +701,7 @@ fn gemm_operands(
     match phase {
         GemmPhase::Qkv => (
             quote! { normed.as_ref().unwrap().view() },
-            quote! { layer.qkv_weights },
+            quote! { layer.self_attn_q_proj },
             quote! { drop(normed.take()); qkv_out = Some(__out); },
         ),
         GemmPhase::OProj => (
@@ -796,20 +796,21 @@ fn extract_weight_fields(dag: &crate::dag::ModelDag) -> (Vec<FieldSpec>, Vec<Fie
 
 /// Emit the `Layer`, `RuntimeDims`, and `Model` struct definitions
 /// from the extracted field specs.
+/// Convert a dotted HF path to a valid Rust field ident.
+/// `self_attn.q_proj` → `self_attn_q_proj`
+fn field_ident(name: &str) -> proc_macro2::Ident {
+    format_ident!("{}", name.replace('.', "_"))
+}
+
 fn emit_structs(per_layer: &[FieldSpec], global: &[FieldSpec]) -> TokenStream {
     let layer_fields = per_layer.iter().map(|f| {
-        let name = format_ident!("{}", f.name);
+        let name = field_ident(&f.name);
         let ty = format_ident!("{}", f.ty);
-        // up_weights is Option<LinearLayer> in the fused gate+up case
-        if f.name == "up_weights" {
-            quote! { pub #name: Option<#ty> }
-        } else {
-            quote! { pub #name: #ty }
-        }
+        quote! { pub #name: #ty }
     });
 
     let model_fields = global.iter().map(|f| {
-        let name = format_ident!("{}", f.name);
+        let name = field_ident(&f.name);
         let ty = format_ident!("{}", f.ty);
         quote! { pub #name: #ty }
     });

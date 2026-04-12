@@ -7,18 +7,22 @@ mod tests {
     use crate::lowering::backend::compile_dsl::ForwardDef;
 
     const LLAMA_BODY: &str = r#"
+        hidden_states = embed(input_ids, embed_tokens);
         for layer in 0..NL {
-            let normed = rmsnorm(hidden_states, attn_norm[layer]);
-            let qkv = gemm(normed, qkv_weights[layer]);
-            let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
+            let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+            let q = gemm(normed, self_attn.q_proj[layer]);
+            let k = gemm(normed, self_attn.k_proj[layer]);
+            let v = gemm(normed, self_attn.v_proj[layer]);
+            let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
             let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-            hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
+            hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
 
-            let normed2 = rmsnorm(hidden_states, mlp_norm[layer]);
-            let gate = silu(gemm(normed2, gate_weights[layer]));
-            let up = gemm(normed2, up_weights[layer]);
-            hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
+            let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+            let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+            let up = gemm(normed2, mlp.up_proj[layer]);
+            hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
         }
+        hidden_states = rmsnorm(hidden_states, norm);
         logits = gemm(hidden_states, lm_head);
     "#;
 
@@ -77,37 +81,44 @@ mod tests {
         // `up_weights` is special-cased to `Option<LinearLayer>` to
         // preserve the legacy fused-gate_up runtime behavior — see
         // `field_token` in codegen.rs.
+        // Per-layer fields — HF weight path names from the DSL body.
         for (name, ty) in [
-            ("attn_norm", "RmsNorm"),
-            ("mlp_norm", "RmsNorm"),
-            ("qkv_weights", "LinearLayer"),
-            ("o_proj", "LinearLayer"),
-            ("gate_weights", "LinearLayer"),
-            ("down_proj", "LinearLayer"),
+            ("input_layernorm", "RmsNorm"),
+            ("post_attention_layernorm", "RmsNorm"),
+            ("self_attn.q_proj", "LinearLayer"),
+            ("self_attn.k_proj", "LinearLayer"),
+            ("self_attn.v_proj", "LinearLayer"),
+            ("self_attn.o_proj", "LinearLayer"),
+            ("mlp.gate_proj", "LinearLayer"),
+            ("mlp.up_proj", "LinearLayer"),
+            ("mlp.down_proj", "LinearLayer"),
         ] {
-            let field_tokens = format!("pub {name} : {ty}");
+            // Dotted names become underscored idents in the struct.
+            let field_name = name.replace('.', "_");
+            let field_tokens = format!("pub {field_name} : {ty}");
             assert!(
                 source.contains(&field_tokens),
                 "Layer struct missing field `{field_tokens}`"
             );
         }
-        assert!(
-            source.contains("pub up_weights : Option < LinearLayer >"),
-            "Layer struct missing `up_weights: Option<LinearLayer>` (Llama fused gate_up holdover)"
-        );
 
-        // Global weights live on the Model struct. LLAMA_BODY today
-        // has only `lm_head` as a global weight — the rest
-        // (`embed_tokens`, `rotary`, `final_norm`) land once the
-        // body is extended in Task 24.
+        // Global weights on the Model struct.
         assert!(
             source.contains("pub layers : Vec < Layer >"),
             "Model struct missing `layers: Vec<Layer>` field"
         );
-        assert!(
-            source.contains("pub lm_head : LinearLayer"),
-            "Model struct missing `lm_head: LinearLayer` field"
-        );
+        for (name, ty) in [
+            ("embed_tokens", "Embedding"),
+            ("norm", "RmsNorm"),
+            ("lm_head", "LinearLayer"),
+            ("rotary", "RotaryCache"),
+        ] {
+            let field_tokens = format!("pub {name} : {ty}");
+            assert!(
+                source.contains(&field_tokens),
+                "Model struct missing field `{field_tokens}`"
+            );
+        }
     }
 
     #[test]

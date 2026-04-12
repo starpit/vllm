@@ -658,6 +658,8 @@ mod tests {
             TileKind::ResidualAdd => "res",
             TileKind::GateUpConcat => "cat",
             TileKind::SiluMul => "silu",
+            TileKind::BiasAdd => "bias",
+            TileKind::Embed => "embed",
         }
     }
 

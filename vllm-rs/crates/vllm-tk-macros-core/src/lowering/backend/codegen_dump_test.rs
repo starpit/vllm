@@ -7,10 +7,11 @@ mod tests {
     #[test]
     fn dump_bucket_0_source() {
         let tokens: proc_macro2::TokenStream = r#"
+            hidden_states = embed(input_ids, embed_tokens);
             for layer in 0..NL {
                 let normed = rmsnorm(hidden_states, attn_norm[layer]);
                 let qkv = gemm(normed, qkv_weights[layer]);
-                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
                 let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
                 hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
 
@@ -19,6 +20,7 @@ mod tests {
                 let up = gemm(normed2, up_weights[layer]);
                 hidden_states = gemm_add(gate * up, down_proj[layer], hidden_states);
             }
+            hidden_states = rmsnorm(hidden_states, final_norm);
             logits = gemm(hidden_states, lm_head);
 
             models: [

@@ -97,16 +97,16 @@ fn dependency_order_constraint_catches_swapped_subgraphs() {
         if let crate::lowering::constraint::Constraint::DependencyOrder { producer, consumer } = c {
             let p_sg = assignment.cover.get(producer);
             let c_sg = assignment.cover.get(consumer);
-            if let (Some(p_sg), Some(c_sg)) = (p_sg, c_sg) {
-                if p_sg != c_sg {
-                    // Swap their steps.
-                    let p_step = assignment.schedule[p_sg].step;
-                    let c_step = assignment.schedule[c_sg].step;
-                    assignment.schedule.get_mut(p_sg).unwrap().step = c_step;
-                    assignment.schedule.get_mut(c_sg).unwrap().step = p_step;
-                    swapped = true;
-                    break 'outer;
-                }
+            if let (Some(p_sg), Some(c_sg)) = (p_sg, c_sg)
+                && p_sg != c_sg
+            {
+                // Swap their steps.
+                let p_step = assignment.schedule[p_sg].step;
+                let c_step = assignment.schedule[c_sg].step;
+                assignment.schedule.get_mut(p_sg).unwrap().step = c_step;
+                assignment.schedule.get_mut(c_sg).unwrap().step = p_step;
+                swapped = true;
+                break 'outer;
             }
         }
     }

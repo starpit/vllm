@@ -9,6 +9,7 @@ use quote::{format_ident, quote};
 
 use super::compile_dsl::{ForwardDef, TargetId, WorkloadRange};
 use super::dispatch::{DispatchEntry, DispatchSequence, GemmPhase, ImplDispatchKind};
+use crate::dag::BufferId;
 use crate::lowering::BacktrackCpSolver;
 use crate::lowering::library::ImplementationLibrary;
 use crate::lowering::solver::PlanFamily;
@@ -31,6 +32,10 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     if models.is_empty() {
         return quote! { compile_error!("forward!: models list is empty"); };
     }
+
+    // Extract struct fields from the DAG.
+    let (per_layer_fields, global_fields) = extract_weight_fields(&def.dag);
+    let struct_defs = emit_structs(&per_layer_fields, &global_fields);
 
     // For now, use the first model. Multi-model dispatch (from_dims)
     // is a follow-up.
@@ -72,7 +77,9 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
             #[allow(unused_variables, unused_mut, unused_assignments)]
             #[inline(never)]
             unsafe fn #fn_name(
-                layer: &LlamaDecoderLayer,
+                layer: &Layer,
+                dims: &RuntimeDims,
+                layer_idx: usize,
                 hidden_states: OwnedTensor,
                 residual: Option<OwnedTensor>,
                 positions: TensorView<'_>,
@@ -110,7 +117,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         let lower = prev_upper;
         match_arms.push(quote! {
             #lower ..= #upper => #fn_name(
-                layer, hidden_states, residual, positions, slot_mapping,
+                layer, dims, layer_idx, hidden_states, residual, positions, slot_mapping,
                 cu_seqlens_q, seqused_k, block_table,
                 max_seqlen_q, max_seqlen_k, kv_cache, rotary, device,
             ),
@@ -173,7 +180,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
             /// Generated backbone: input_ids → hidden_states (post-norm).
             #[allow(clippy::too_many_arguments)]
             pub unsafe fn solver_hidden_states(
-                model: &LlamaModel,
+                model: &Model,
                 input_ids: TensorView<'_>,
                 positions: TensorView<'_>,
                 slot_mapping: TensorView<'_>,
@@ -195,9 +202,10 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
                 let mut residual: Option<OwnedTensor> = None;
                 let num_tokens = hidden_states.dim(0) as u32;
 
-                for layer in model.layers.iter() {
+                for (layer_idx, layer) in model.layers.iter().enumerate() {
                     let (hs, res) = solver_forward_layer(
-                        layer, num_tokens, hidden_states, residual,
+                        layer, &model.dims, layer_idx,
+                        num_tokens, hidden_states, residual,
                         positions, slot_mapping, cu_seqlens_q, seqused_k,
                         block_table, max_seqlen_q, max_seqlen_k,
                         kv_cache, &model.rotary, device,
@@ -210,7 +218,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
                 let res_gpu: GpuTensor = residual.as_ref().unwrap().as_gpu_tensor();
                 kernels::fused_add_rms_norm_inplace(
                     hs_gpu, res_gpu,
-                    model.norm.weight, model.norm.eps,
+                    model.final_norm.weight, model.final_norm.eps,
                     device.compute_stream,
                 );
                 drop(residual);
@@ -222,11 +230,15 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     };
 
     quote! {
+        #struct_defs
+
         #model_hidden_states
 
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn solver_forward_layer(
-            layer: &LlamaDecoderLayer,
+            layer: &Layer,
+            dims: &RuntimeDims,
+            layer_idx: usize,
             num_tokens: u32,
             hidden_states: OwnedTensor,
             residual: Option<OwnedTensor>,
@@ -278,6 +290,9 @@ fn emit_post_loop_stmts(ds: &DispatchSequence, num_layers: u16) -> Vec<TokenStre
 fn emit_post_loop_entry(entry: &DispatchEntry) -> Option<TokenStream> {
     match entry.kind {
         ImplDispatchKind::Noop => None,
+        ImplDispatchKind::Embed => None,
+        ImplDispatchKind::BiasAdd => None, // no bias on lm_head
+        ImplDispatchKind::CublasGemmWithBias => None, // not used for lm_head
 
         // lm_head GEMM via cuBLAS dispatch (fallback; solver may pick CUTLASS).
         ImplDispatchKind::CublasGemm => Some(quote! {{
@@ -353,6 +368,28 @@ fn emit_post_loop_entry(entry: &DispatchEntry) -> Option<TokenStream> {
 fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
     match entry.kind {
         ImplDispatchKind::Noop => None,
+        ImplDispatchKind::Embed => None, // handled in pre-loop, not per-layer
+        ImplDispatchKind::BiasAdd => Some(quote! {{
+            // Standalone bias add on the QKV output.
+            let __qkv = qkv_out.as_ref().unwrap();
+            let __bias = layer.qkv_weights.dense_bias().expect("BiasAdd: no bias on qkv_weights");
+            kernels::bias_add_inplace(__qkv.as_gpu_tensor(), __bias, device.compute_stream);
+        }}),
+        ImplDispatchKind::CublasGemmWithBias => {
+            // Fused GEMM+bias via cuBLAS. Same as CublasGemm but the
+            // LinearLayer::forward picks the bias path automatically.
+            let phase = entry.gemm_phase.unwrap();
+            let (input, weight, store) = gemm_operands(phase, entry.fused_residual);
+            Some(quote! {{
+                let __out = (#weight).forward(
+                    #input,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                #store
+            }})
+        }
 
         ImplDispatchKind::RmsNorm => {
             let is_attn = entry.is_attn_norm.unwrap_or(true);
@@ -363,8 +400,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                         let res_gpu: GpuTensor = *res;
                         kernels::fused_add_rms_norm_inplace(
                             hs_gpu, res_gpu,
-                            layer.input_layernorm.weight,
-                            layer.input_layernorm.eps,
+                            layer.attn_norm.weight,
+                            layer.attn_norm.eps,
                             device.compute_stream,
                         );
                         (hidden_states, res)
@@ -372,8 +409,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                         let hs_gpu: GpuTensor = *hidden_states;
                         let n = kernels::rms_norm(
                             hs_gpu,
-                            layer.input_layernorm.weight,
-                            layer.input_layernorm.eps,
+                            layer.attn_norm.weight,
+                            layer.attn_norm.eps,
                             &mut device.caching,
                             device.compute_stream,
                         );
@@ -389,8 +426,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                     let res_gpu: GpuTensor = **residual.as_ref().unwrap();
                     kernels::fused_add_rms_norm_inplace(
                         hs_gpu, res_gpu,
-                        layer.post_attention_layernorm.weight,
-                        layer.post_attention_layernorm.eps,
+                        layer.mlp_norm.weight,
+                        layer.mlp_norm.eps,
                         device.compute_stream,
                     );
                     normed = Some(hidden_states);
@@ -402,7 +439,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
-                    if let Some(ref up_proj) = layer.mlp.up_proj {
+                    if let Some(ref up_proj) = layer.up_weights {
                         let __out = up_proj.forward(
                             normed.as_ref().unwrap().view(),
                             &mut device.cublas,
@@ -441,7 +478,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
-                    if let Some(ref up_proj) = layer.mlp.up_proj {
+                    if let Some(ref up_proj) = layer.up_weights {
                         let __out = up_proj.forward(
                             normed.as_ref().unwrap().view(),
                             &mut device.cublas,
@@ -493,7 +530,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
-                    if let Some(ref up_proj) = layer.mlp.up_proj {
+                    if let Some(ref up_proj) = layer.up_weights {
                         let __out = up_proj.forward(
                             normed.as_ref().unwrap().view(),
                             &mut device.cublas,
@@ -552,10 +589,10 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let __q = kernels::fused_qkv_rope_cache(
                 __qkv.as_gpu_tensor(),
                 *positions, rotary.cos_sin_cache, *slot_mapping,
-                *kv_cache.k_cache(layer.self_attn.layer_idx),
-                *kv_cache.v_cache(layer.self_attn.layer_idx),
-                layer.self_attn.q_size, layer.self_attn.kv_size,
-                layer.self_attn.num_q_heads, layer.self_attn.head_dim,
+                *kv_cache.k_cache(layer_idx),
+                *kv_cache.v_cache(layer_idx),
+                dims.q_size, dims.kv_size,
+                dims.num_q_heads, dims.head_dim,
                 &mut device.caching, device.compute_stream,
             );
             drop(__qkv);
@@ -566,22 +603,22 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let __qkv = qkv_out.take().unwrap();
             let (__q, __k, __v) = kernels::split_qkv(
                 __qkv.as_gpu_tensor(),
-                layer.self_attn.q_size, layer.self_attn.kv_size,
-                layer.self_attn.num_q_heads, layer.self_attn.num_kv_heads,
-                layer.self_attn.head_dim,
+                dims.q_size, dims.kv_size,
+                dims.num_q_heads, dims.num_kv_heads,
+                dims.head_dim,
                 &mut device.caching, device.compute_stream,
             );
             drop(__qkv);
             let __nt = __q.as_gpu_tensor().dim(0);
             kernels::rotary_embedding_inplace(
-                __q.as_gpu_tensor().reshape(&[__nt, layer.self_attn.q_size]),
-                __k.as_gpu_tensor().reshape(&[__nt, layer.self_attn.kv_size]),
+                __q.as_gpu_tensor().reshape(&[__nt, dims.q_size]),
+                __k.as_gpu_tensor().reshape(&[__nt, dims.kv_size]),
                 *positions, rotary.cos_sin_cache,
-                layer.self_attn.head_dim, device.compute_stream,
+                dims.head_dim, device.compute_stream,
             );
             crate::model::attention_helpers::write_kv_cache(
                 __k.view(), __v.view(), slot_mapping,
-                kv_cache, layer.self_attn.layer_idx, device.compute_stream,
+                kv_cache, layer_idx, device.compute_stream,
             );
             qkv_out = Some(__q);
             k_out = Some(__k);
@@ -592,8 +629,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let __qkv = **qkv_out.as_ref().unwrap();
             kernels::fused_qkv_rope(
                 __qkv, *positions, rotary.cos_sin_cache,
-                layer.self_attn.q_size, layer.self_attn.kv_size,
-                layer.self_attn.head_dim, device.compute_stream,
+                dims.q_size, dims.kv_size,
+                dims.head_dim, device.compute_stream,
             );
         }}),
 
@@ -601,8 +638,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let __q = qkv_out.take().unwrap();
             let __a = crate::model::attention_helpers::attention_decode_from_cache(
                 __q.view(), cu_seqlens_q, seqused_k, block_table,
-                max_seqlen_q, max_seqlen_k, layer.self_attn.scale,
-                0.0, -1, kv_cache, layer.self_attn.layer_idx,
+                max_seqlen_q, max_seqlen_k, dims.scale,
+                0.0, -1, kv_cache, layer_idx,
                 device.num_sm, &mut device.caching, device.compute_stream,
                 std::ptr::null(), 0, false,
             );
@@ -617,8 +654,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let __a = crate::model::attention_helpers::attention_standard(
                 __q.view(), __k.view(), __v.view(),
                 cu_seqlens_q, seqused_k, block_table,
-                max_seqlen_q, max_seqlen_k, layer.self_attn.scale,
-                kv_cache, layer.self_attn.layer_idx,
+                max_seqlen_q, max_seqlen_k, dims.scale,
+                kv_cache, layer_idx,
                 device.num_sm, &mut device.caching, device.compute_stream,
                 std::ptr::null(), 0, false,
             );
@@ -629,7 +666,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
         ImplDispatchKind::SiluAndMul => Some(quote! {{
             let __gu = gate_up.take().unwrap();
             let __activated = kernels::silu_and_mul_fused(
-                __gu.as_gpu_tensor(), layer.mlp.intermediate_size,
+                __gu.as_gpu_tensor(), dims.intermediate_size,
                 &mut device.caching, device.compute_stream,
             );
             drop(__gu);
@@ -648,7 +685,7 @@ fn cutlass_input_expr(phase: GemmPhase) -> TokenStream {
         GemmPhase::OProj => quote! {{
             let __ao = attn_out.as_ref().unwrap();
             let __nt = __ao.dim(0);
-            *__ao.view().reshape(&[__nt, layer.self_attn.q_size])
+            *__ao.view().reshape(&[__nt, dims.q_size])
         }},
         GemmPhase::Gate => quote! { **normed.as_ref().unwrap() },
         GemmPhase::Up => quote! { **normed.as_ref().unwrap() },
@@ -664,31 +701,31 @@ fn gemm_operands(
     match phase {
         GemmPhase::Qkv => (
             quote! { normed.as_ref().unwrap().view() },
-            quote! { layer.self_attn.qkv_proj },
+            quote! { layer.qkv_weights },
             quote! { drop(normed.take()); qkv_out = Some(__out); },
         ),
         GemmPhase::OProj => (
             quote! {{
                 let __ao = attn_out.as_ref().unwrap();
                 let __nt = __ao.dim(0);
-                __ao.view().reshape(&[__nt, layer.self_attn.q_size])
+                __ao.view().reshape(&[__nt, dims.q_size])
             }},
-            quote! { layer.self_attn.o_proj },
+            quote! { layer.o_proj },
             quote! { drop(attn_out.take()); hidden_states = __out; },
         ),
         GemmPhase::Gate => (
             quote! { normed.as_ref().unwrap().view() },
-            quote! { layer.mlp.gate_up_proj },
+            quote! { layer.gate_weights },
             quote! { gate_up = Some(__out); },
         ),
         GemmPhase::Up => (
             quote! { normed.as_ref().unwrap().view() },
-            quote! { layer.mlp.gate_up_proj },
+            quote! { layer.gate_weights },
             quote! {},
         ),
         GemmPhase::Down => (
             quote! { silu_out.as_ref().unwrap().view() },
-            quote! { layer.mlp.down_proj },
+            quote! { layer.down_proj },
             quote! { drop(silu_out.take()); hidden_states = __out; },
         ),
         GemmPhase::LmHead => (
@@ -698,6 +735,106 @@ fn gemm_operands(
             quote! { (*lm_head) },
             quote! { drop(hidden_states); logits = Some(__out); },
         ),
+    }
+}
+
+// ── Struct generation from DAG ──────────────────────────────────
+
+/// A field to emit in a generated struct.
+struct FieldSpec {
+    name: String,
+    /// Rust type as a string: "RmsNorm", "LinearLayer", "Embedding", "RotaryCache"
+    ty: &'static str,
+}
+
+/// Walk the DAG and extract weight buffer references, grouped into
+/// per-layer (Layer struct) and global (Model struct) fields.
+/// The Rust type is inferred from which op consumes the weight.
+fn extract_weight_fields(dag: &crate::dag::ModelDag) -> (Vec<FieldSpec>, Vec<FieldSpec>) {
+    use crate::dag::{BufferKind, OpKind};
+    use std::collections::BTreeMap;
+
+    // Map buffer id → consuming op kind (first consumer).
+    let mut weight_op: BTreeMap<&BufferId, &OpKind> = BTreeMap::new();
+    for op in &dag.ops {
+        for input_id in op.inputs() {
+            if let Some(buf) = dag.buffers.get(input_id)
+                && buf.kind == BufferKind::Weight
+                && !weight_op.contains_key(input_id)
+            {
+                weight_op.insert(input_id, &op.kind);
+            }
+        }
+    }
+
+    let mut per_layer = Vec::new();
+    let mut global = Vec::new();
+
+    for (buf_id, op_kind) in &weight_op {
+        let buf = &dag.buffers[*buf_id];
+        let ty = match op_kind {
+            OpKind::Embed { weights, .. } if weights == *buf_id => "Embedding",
+            OpKind::RmsNorm { weights, .. } if weights == *buf_id => "RmsNorm",
+            OpKind::Gemm { b, .. } | OpKind::GemmAdd { b, .. } if b == *buf_id => "LinearLayer",
+            OpKind::RopeAppend { rotary, .. } if rotary == *buf_id => "RotaryCache",
+            _ => continue,
+        };
+
+        let spec = FieldSpec {
+            name: buf_id.0.clone(),
+            ty,
+        };
+        if buf.per_layer {
+            per_layer.push(spec);
+        } else {
+            global.push(spec);
+        }
+    }
+
+    (per_layer, global)
+}
+
+/// Emit the `Layer`, `RuntimeDims`, and `Model` struct definitions
+/// from the extracted field specs.
+fn emit_structs(per_layer: &[FieldSpec], global: &[FieldSpec]) -> TokenStream {
+    let layer_fields = per_layer.iter().map(|f| {
+        let name = format_ident!("{}", f.name);
+        let ty = format_ident!("{}", f.ty);
+        // up_weights is Option<LinearLayer> in the fused gate+up case
+        if f.name == "up_weights" {
+            quote! { pub #name: Option<#ty> }
+        } else {
+            quote! { pub #name: #ty }
+        }
+    });
+
+    let model_fields = global.iter().map(|f| {
+        let name = format_ident!("{}", f.name);
+        let ty = format_ident!("{}", f.ty);
+        quote! { pub #name: #ty }
+    });
+
+    quote! {
+        pub struct Layer {
+            #(#layer_fields,)*
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        pub struct RuntimeDims {
+            pub num_q_heads: usize,
+            pub num_kv_heads: usize,
+            pub head_dim: usize,
+            pub q_size: usize,
+            pub kv_size: usize,
+            pub intermediate_size: usize,
+            pub scale: f32,
+        }
+
+        pub struct Model {
+            pub layers: Vec<Layer>,
+            pub dims: RuntimeDims,
+            #(#model_fields,)*
+        }
     }
 }
 

@@ -142,7 +142,36 @@ pub enum TileKind {
     /// `hidden_states += operand`. Two per layer (after o_proj and
     /// after down).
     ResidualAdd,
+
+    // ── Bias add (lifted out of the classified QKV phase when the
+    //     model has `ModelDims::qkv_bias == true`) ──
+    /// Per-column bias broadcast add on a GEMM output:
+    /// `out[row, col] += bias[col]`. Inserted by `from_model_dag`
+    /// after `Gemm*` tiles whose phase is flagged as biased in the
+    /// live `ModelDims` (today only `GemmQkv` via `qkv_bias`). The
+    /// solver can either (a) elect a fused impl that claims both
+    /// `Gemm*` + `BiasAdd` as one subgraph (e.g. `cublas.gemm_bias`
+    /// or a CUTLASS bias-epilogue kernel), or (b) elect a plain GEMM
+    /// impl + a standalone `kernels::bias_add_inplace` launch. The
+    /// choice is an emergent property of the solver's cover, not a
+    /// codegen decision.
+    BiasAdd,
+
+    // ── Embedding lookup (pre-loop, runs once per forward) ──
+    /// `hidden_states[i] = embed_tokens[input_ids[i]]`. Emitted by
+    /// the DSL op `hidden_states = embed(input_ids, embed_tokens)`
+    /// at the top of a `forward!()` body. Lives in the pre-loop
+    /// phase (tagged with `layer == PRE_LOOP_LAYER`) so the
+    /// generated `Model::forward` runs it once before the
+    /// per-layer dispatch match, not once per layer.
+    Embed,
 }
+
+/// Sentinel layer index for pre-loop tiles (`Embed` today). Picked
+/// as `u16::MAX` so it's clearly out of the actual layer range
+/// `0..num_layers` and can't collide with a real layer, while still
+/// fitting in the existing `u16 layer` field on `TileNode`.
+pub const PRE_LOOP_LAYER: u16 = u16::MAX;
 
 impl TileKind {
     /// Whether this kind is GEMM-shaped (eligible for cuBLAS /
@@ -176,6 +205,8 @@ impl TileKind {
             TileKind::GateUpConcat => "gate_up_concat",
             TileKind::SiluMul => "silu_mul",
             TileKind::ResidualAdd => "residual_add",
+            TileKind::BiasAdd => "bias_add",
+            TileKind::Embed => "embed",
         }
     }
 }
@@ -217,7 +248,18 @@ pub struct TileGraph {
     pub dims: ModelDims,
 }
 
-/// Model-specific dimensions that determine GEMM shapes.
+/// Model-specific dimensions that determine GEMM shapes **and** the
+/// structural shape of the tile graph.
+///
+/// Per-instance numeric dims (hidden / intermediate / heads / …)
+/// parameterize the cost model. Per-instance topology flags like
+/// `qkv_bias` drive `from_model_dag`'s lowering — when `qkv_bias`
+/// is set, the lowering inserts a `BiasAdd` tile after the
+/// `GemmQkv` tile, which the solver then covers via
+/// `CublasGemmExWithBiasImpl` (fused) or `CutlassGemm +
+/// StandaloneBiasAddImpl` (split). The DSL body stays generic
+/// (one `gemm(normed, qkv_weights[layer])`), and every structural
+/// difference between variants lives on this struct.
 #[derive(Clone, Copy, Debug)]
 pub struct ModelDims {
     pub hidden_size: u32,
@@ -227,6 +269,11 @@ pub struct ModelDims {
     pub head_dim: u32,
     /// Vocabulary size — the output dim of the lm_head projection.
     pub vocab_size: u32,
+    /// Whether the QKV projection has a per-column bias (Qwen2/2.5
+    /// = `true`, Llama / Mistral / Qwen3 = `false`). Drives the
+    /// insertion of a `BiasAdd` tile after `GemmQkv` in
+    /// `from_model_dag`.
+    pub qkv_bias: bool,
 }
 
 impl ModelDims {
@@ -237,6 +284,7 @@ impl ModelDims {
         num_kv_heads: 8,
         head_dim: 64,
         vocab_size: 128256,
+        qkv_bias: false,
     };
 
     /// QKV output dimension = (num_q_heads + 2 * num_kv_heads) * head_dim.
@@ -388,10 +436,43 @@ impl TileGraph {
         // Count layers from the for-loop ops.
         let num_layers = dag.params.get("NL").copied().unwrap_or(1) as u16;
 
-        // Synthesize input node (model input = hidden_states).
-        let input_tile = push(&mut nodes, TileKind::ResidualAdd, 0, Vec::new());
-        // Track hidden_states across layers.
-        let mut hidden_state_tile = input_tile;
+        // Pre-loop pass: non-loop ops that appear BEFORE any
+        // in-loop op in the DSL body. These emit into the pre-loop
+        // phase (tagged with `layer == PRE_LOOP_LAYER`) and run
+        // once per forward, before the per-layer match dispatch.
+        // Today this is just `embed` — the DSL's first op that
+        // produces `hidden_states` from `input_ids`.
+        //
+        // When the DSL body has a pre-loop `embed`, its output
+        // tile becomes the `hidden_state_tile` seed for layer 0.
+        // When it doesn't (legacy DSL bodies in tests), we fall
+        // back to a synthetic `ResidualAdd` sentinel input.
+        let first_loop_op_idx = dag
+            .ops
+            .iter()
+            .position(|op| op.in_layer_loop)
+            .unwrap_or(dag.ops.len());
+
+        let mut hidden_state_tile = {
+            let mut seed: Option<TileId> = None;
+            for op in &dag.ops[..first_loop_op_idx] {
+                if let OpKind::Embed { output, .. } = &op.kind {
+                    let tile = push(&mut nodes, TileKind::Embed, PRE_LOOP_LAYER, Vec::new());
+                    buf_to_tile.insert(output.0.clone(), tile);
+                    seed = Some(tile);
+                }
+                // Other pre-loop op kinds (none today) would be
+                // handled here.
+            }
+            seed.unwrap_or_else(|| {
+                // Legacy: synthesize a ResidualAdd input node so
+                // layer 0's first op has a real predecessor. Used
+                // by the hardcoded `build_llama_forward` test path
+                // and by DSL bodies that don't yet start with
+                // `embed(...)`.
+                push(&mut nodes, TileKind::ResidualAdd, 0, Vec::new())
+            })
+        };
 
         // We process one layer's ops and repeat for num_layers.
         // Collect the in-loop ops.
@@ -409,17 +490,34 @@ impl TileGraph {
 
             for op in &loop_ops {
                 match &op.kind {
+                    // `Embed` only appears in the pre-loop pass
+                    // above. If it somehow ends up inside the
+                    // layer loop, the DSL body is malformed; skip
+                    // silently (the validator would reject it
+                    // upstream).
+                    OpKind::Embed { .. } => {}
                     OpKind::RmsNorm { input, output, .. } => {
                         let dep = self_or_hidden(&buf_to_tile, &input.0, current_hidden);
                         let tile = push(&mut nodes, TileKind::RmsNorm, layer, vec![dep]);
                         buf_to_tile.insert(output.0.clone(), tile);
                     }
                     OpKind::Gemm { a, b, output } => {
+                        // Classify the GEMM by weight name, then
+                        // consult `ModelDims` to decide whether this
+                        // phase has a broadcast bias. The DSL body
+                        // stays Llama-shaped (one `gemm(...)`); per-
+                        // model topology flags drive the structural
+                        // divergence here. Llama → no BiasAdd tile.
+                        // Qwen2 → BiasAdd tile after GemmQkv.
                         let dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
-                        // Classify GEMM by weight name.
                         let kind = classify_gemm(&b.0);
-                        let tile = push(&mut nodes, kind, layer, vec![dep]);
-                        buf_to_tile.insert(output.0.clone(), tile);
+                        let gemm_tile = push(&mut nodes, kind, layer, vec![dep]);
+                        let final_tile = if phase_has_bias(kind, dims) {
+                            push(&mut nodes, TileKind::BiasAdd, layer, vec![gemm_tile])
+                        } else {
+                            gemm_tile
+                        };
+                        buf_to_tile.insert(output.0.clone(), final_tile);
                     }
                     OpKind::GemmAdd {
                         a,
@@ -502,8 +600,17 @@ impl TileGraph {
         // DSL statements after the `for layer in 0..NL` loop. These
         // run once per forward pass, not per layer. We use `layer =
         // num_layers` as the layer tag so the solver treats them
-        // as a distinct per-forward-pass phase.
-        let post_loop_ops: Vec<_> = dag.ops.iter().filter(|op| !op.in_layer_loop).collect();
+        // as a distinct per-forward-pass phase. Pre-loop ops (any
+        // non-loop op whose DSL position is before the first loop
+        // op, e.g. `embed`) are skipped here — they were already
+        // handled above.
+        let post_loop_ops: Vec<_> = dag
+            .ops
+            .iter()
+            .enumerate()
+            .filter(|(idx, op)| !op.in_layer_loop && *idx >= first_loop_op_idx)
+            .map(|(_, op)| op)
+            .collect();
         if !post_loop_ops.is_empty() {
             buf_to_tile.clear();
             let post_layer = num_layers;
@@ -518,11 +625,20 @@ impl TileGraph {
                         current_hidden = tile;
                     }
                     OpKind::Gemm { a, b, output } => {
+                        // Same bias-aware pattern as the in-loop
+                        // handler: consult `ModelDims` via
+                        // `phase_has_bias` and append a BiasAdd tile
+                        // if the model wants it at this phase.
                         let dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
                         let kind = classify_gemm(&b.0);
-                        let tile = push(&mut nodes, kind, post_layer, vec![dep]);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                        current_hidden = tile;
+                        let gemm_tile = push(&mut nodes, kind, post_layer, vec![dep]);
+                        let final_tile = if phase_has_bias(kind, dims) {
+                            push(&mut nodes, TileKind::BiasAdd, post_layer, vec![gemm_tile])
+                        } else {
+                            gemm_tile
+                        };
+                        buf_to_tile.insert(output.0.clone(), final_tile);
+                        current_hidden = final_tile;
                     }
                     // Other ops (GemmAdd, RopeAppend, Attention, Silu, Mul)
                     // are not expected in the post-loop phase. Skip gracefully.
@@ -558,6 +674,24 @@ fn self_or_hidden(
     hidden: TileId,
 ) -> TileId {
     buf_to_tile.get(buf_name).copied().unwrap_or(hidden)
+}
+
+/// Does the classified GEMM phase carry a broadcast bias on this
+/// specific model? Reads topology flags out of `ModelDims`.
+///
+/// This is the ONE place where the shared Llama-shaped DSL body
+/// diverges structurally per model: if `ModelDims::qkv_bias == true`,
+/// the classified `GemmQkv` tile gains a downstream `BiasAdd` tile,
+/// which the solver covers via `CublasGemmExWithBiasImpl` (fused)
+/// or `StandaloneBiasAddImpl` + a plain GEMM impl (split).
+///
+/// Future topology flags (`o_bias`, `mlp_bias`, …) plug in here as
+/// new match arms, without touching the DSL body or the codegen.
+fn phase_has_bias(kind: TileKind, dims: ModelDims) -> bool {
+    match kind {
+        TileKind::GemmQkv => dims.qkv_bias,
+        _ => false,
+    }
 }
 
 /// Classify a GEMM by its weight buffer name.
@@ -642,7 +776,7 @@ mod self_tests {
                 for layer in 0..NL {
                     let normed = rmsnorm(hidden_states, attn_norm[layer]);
                     let qkv = gemm(normed, qkv_weights[layer]);
-                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
                     let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
                     hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
 
@@ -705,7 +839,7 @@ mod self_tests {
                 for layer in 0..NL {
                     let normed = rmsnorm(hidden_states, attn_norm[layer]);
                     let qkv = gemm(normed, qkv_weights[layer]);
-                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
                     let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
                     hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
 

@@ -75,7 +75,7 @@ impl fmt::Display for TensorShape {
 }
 
 /// A named buffer (activation or weight) in the DAG.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BufferId(pub String);
 
 impl fmt::Display for BufferId {
@@ -119,13 +119,29 @@ pub type OpIdx = usize;
 /// The known megakernel op types. Each carries typed input/output references.
 #[derive(Clone, Debug)]
 pub enum OpKind {
+    /// Token-id → hidden state lookup: `output[i] = embed_tokens[input_ids[i]]`.
+    /// Produces the initial `hidden_states` activation at the top of the
+    /// forward pass. The `weights` buffer is classified as a weight of
+    /// Rust type `Embedding` in the field extractor.
+    Embed {
+        input_ids: BufferId,
+        weights: BufferId,
+        output: BufferId,
+    },
     /// RMS normalization: input[BS, D] * weights[D] -> output[BS, D]
     RmsNorm {
         input: BufferId,
         weights: BufferId,
         output: BufferId,
     },
-    /// General matrix multiply: A[BS, K] @ B[N, K]^T -> output[BS, N]
+    /// General matrix multiply: A[BS, K] @ B[N, K]^T -> output[BS, N].
+    ///
+    /// Note: a bias term on the GEMM output is **not** encoded at the
+    /// DSL level. The DSL body stays shape-generic across every
+    /// Llama-family architecture; whether a classified GEMM phase
+    /// (e.g. QKV) gains a downstream `BiasAdd` tile is a property of
+    /// `ModelDims` (see `ModelDims::qkv_bias`), resolved in
+    /// `from_model_dag`. One DSL, many model variants.
     Gemm {
         a: BufferId,
         b: BufferId,
@@ -138,10 +154,13 @@ pub enum OpKind {
         residual: BufferId,
         output: BufferId,
     },
-    /// QKV split + RoPE + KV cache append
+    /// QKV split + RoPE + KV cache append. The `rotary` buffer is the
+    /// pre-computed cos/sin cache (classified as a global weight of
+    /// Rust type `RotaryCache` in the field extractor).
     RopeAppend {
         qkv: BufferId,
         positions: BufferId,
+        rotary: BufferId,
         kv_cache: BufferId,
         q_out: BufferId,
         k_out: BufferId,
@@ -184,15 +203,19 @@ impl Op {
     /// All buffer IDs read by this op.
     pub fn inputs(&self) -> Vec<&BufferId> {
         match &self.kind {
+            OpKind::Embed {
+                input_ids, weights, ..
+            } => vec![input_ids, weights],
             OpKind::RmsNorm { input, weights, .. } => vec![input, weights],
             OpKind::Gemm { a, b, .. } => vec![a, b],
             OpKind::GemmAdd { a, b, residual, .. } => vec![a, b, residual],
             OpKind::RopeAppend {
                 qkv,
                 positions,
+                rotary,
                 kv_cache,
                 ..
-            } => vec![qkv, positions, kv_cache],
+            } => vec![qkv, positions, rotary, kv_cache],
             OpKind::AttentionDecode {
                 q,
                 kv_cache,
@@ -213,6 +236,7 @@ impl Op {
     /// All buffer IDs written by this op.
     pub fn outputs(&self) -> Vec<&BufferId> {
         match &self.kind {
+            OpKind::Embed { output, .. } => vec![output],
             OpKind::RmsNorm { output, .. } => vec![output],
             OpKind::Gemm { output, .. } => vec![output],
             OpKind::GemmAdd { output, .. } => vec![output],

@@ -240,21 +240,47 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
     let mut kv_heads: Option<u32> = None;
     let mut head_dim: Option<u32> = None;
     let mut vocab: Option<u32> = None;
+    // Topology flags — default to Llama behavior (no bias anywhere).
+    let mut qkv_bias: bool = false;
 
     while !input.is_empty() {
         let key: Ident = input.parse()?;
         input.parse::<Token![:]>()?;
-        let val: LitInt = input.parse()?;
-        let _ = input.parse::<Token![,]>();
 
         match key.to_string().as_str() {
-            "layers" => layers = Some(val.base10_parse()?),
-            "hidden" => hidden = Some(val.base10_parse()?),
-            "intermediate" => intermediate = Some(val.base10_parse()?),
-            "heads" => heads = Some(val.base10_parse()?),
-            "kv_heads" => kv_heads = Some(val.base10_parse()?),
-            "head_dim" => head_dim = Some(val.base10_parse()?),
-            "vocab" => vocab = Some(val.base10_parse()?),
+            "qkv_bias" => {
+                // `qkv_bias: true` / `qkv_bias: false` — bool literal.
+                let lit: syn::LitBool = input.parse()?;
+                qkv_bias = lit.value;
+            }
+            "layers" => {
+                let val: LitInt = input.parse()?;
+                layers = Some(val.base10_parse()?);
+            }
+            "hidden" => {
+                let val: LitInt = input.parse()?;
+                hidden = Some(val.base10_parse()?);
+            }
+            "intermediate" => {
+                let val: LitInt = input.parse()?;
+                intermediate = Some(val.base10_parse()?);
+            }
+            "heads" => {
+                let val: LitInt = input.parse()?;
+                heads = Some(val.base10_parse()?);
+            }
+            "kv_heads" => {
+                let val: LitInt = input.parse()?;
+                kv_heads = Some(val.base10_parse()?);
+            }
+            "head_dim" => {
+                let val: LitInt = input.parse()?;
+                head_dim = Some(val.base10_parse()?);
+            }
+            "vocab" => {
+                let val: LitInt = input.parse()?;
+                vocab = Some(val.base10_parse()?);
+            }
             other => {
                 return Err(syn::Error::new(
                     key.span(),
@@ -262,6 +288,7 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
                 ));
             }
         }
+        let _ = input.parse::<Token![,]>();
     }
 
     Ok(InlineModel {
@@ -279,6 +306,7 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
             // Default to Llama 3 vocab if not specified — the solver still
             // compiles without this; it's only used by the lm_head cost lookup.
             vocab_size: vocab.unwrap_or(128256),
+            qkv_bias,
         },
     })
 }
@@ -306,7 +334,7 @@ mod tests {
             for layer in 0..NL {
                 let normed = rmsnorm(hidden_states, attn_norm[layer]);
                 let qkv = gemm(normed, qkv_weights[layer]);
-                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
                 let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
                 hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
 
@@ -332,7 +360,7 @@ mod tests {
             for layer in 0..NL {
                 let normed = rmsnorm(hidden_states, attn_norm[layer]);
                 let qkv = gemm(normed, qkv_weights[layer]);
-                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
                 let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
                 hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
 
@@ -367,7 +395,7 @@ mod tests {
             for layer in 0..NL {
                 let normed = rmsnorm(hidden_states, attn_norm[layer]);
                 let qkv = gemm(normed, qkv_weights[layer]);
-                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
                 let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
                 hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
 
@@ -399,7 +427,7 @@ mod tests {
             for layer in 0..NL {
                 let normed = rmsnorm(hidden_states, attn_norm[layer]);
                 let qkv = gemm(normed, qkv_weights[layer]);
-                let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
                 let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
                 hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
 

@@ -422,6 +422,36 @@ fn process_call(
     let op_name = call.op.to_string();
 
     match op_name.as_str() {
+        "embed" => {
+            // embed(input_ids, embed_tokens) -> output[BS, HD]
+            //
+            // Produces the initial `hidden_states` activation at the
+            // top of the forward pass. `embed_tokens` is a weight
+            // (Embedding type); `input_ids` is a runtime input.
+            let (ids_id, _) = resolve_arg(dag, ctx, &call.args[0], in_loop)?;
+            let (w_id, _) = resolve_arg(dag, ctx, &call.args[1], in_loop)?;
+            let out_shape = TensorShape::matrix(ctx.bs(), ctx.hd());
+            let out_name = ctx.fresh_name("embed");
+            let out_id = BufferId(out_name);
+            dag.add_buffer(Buffer {
+                id: out_id.clone(),
+                kind: BufferKind::Activation,
+                shape: out_shape.clone(),
+                producer: None,
+                consumers: vec![],
+                per_layer: in_loop,
+                is_input: false,
+            });
+            dag.add_op(
+                OpKind::Embed {
+                    input_ids: ids_id,
+                    weights: w_id,
+                    output: out_id.clone(),
+                },
+                in_loop,
+            );
+            Ok((out_id, out_shape))
+        }
         "rmsnorm" => {
             // rmsnorm(input, weights) -> output[BS, D] where D = input's last dim
             let (input_id, input_shape) = resolve_arg(dag, ctx, &call.args[0], in_loop)?;
@@ -509,10 +539,15 @@ fn process_call(
             Ok((out_id, out_shape))
         }
         "rope_append" => {
-            // rope_append(qkv, positions, kv_cache) -> (q, k, v)
+            // rope_append(qkv, positions, rotary, kv_cache) -> (q, k, v)
+            //
+            // `rotary` is the pre-computed cos/sin cache — a global
+            // weight (not per-layer), classified as Rust type
+            // `RotaryCache` in the field extractor.
             let (qkv_id, _) = resolve_arg(dag, ctx, &call.args[0], in_loop)?;
             let (pos_id, _) = resolve_arg(dag, ctx, &call.args[1], in_loop)?;
-            let (kv_id, _) = resolve_arg(dag, ctx, &call.args[2], in_loop)?;
+            let (rot_id, _) = resolve_arg(dag, ctx, &call.args[2], in_loop)?;
+            let (kv_id, _) = resolve_arg(dag, ctx, &call.args[3], in_loop)?;
 
             let base = ctx.fresh_name("rope");
             let q_id = BufferId(format!("{base}_q"));
@@ -546,6 +581,7 @@ fn process_call(
                 OpKind::RopeAppend {
                     qkv: qkv_id,
                     positions: pos_id,
+                    rotary: rot_id,
                     kv_cache: kv_id,
                     q_out: q_id.clone(),
                     k_out: k_id,
@@ -642,7 +678,11 @@ fn resolve_arg(
                     shape: shape.clone(),
                     producer: None,
                     consumers: vec![],
-                    per_layer: idx.is_some() || in_loop,
+                    // `per_layer` is solely determined by whether the
+                    // DSL reference carries a `[layer]` index. A
+                    // global weight (e.g. `rotary`) referenced from
+                    // inside the layer loop is NOT per-layer.
+                    per_layer: idx.is_some(),
                     is_input: true, // external buffer — provided by caller
                 });
             }
@@ -682,6 +722,28 @@ fn infer_external_buffer(name: &str, ctx: &BuildCtx) -> (BufferKind, TensorShape
         "hidden_states" => (
             BufferKind::Activation,
             TensorShape::matrix(ctx.bs(), ctx.hd()),
+        ),
+        "input_ids" => (
+            // Token IDs fed to the initial `embed(...)` op. Runtime
+            // input, not a weight.
+            BufferKind::Metadata,
+            TensorShape {
+                dims: vec![ctx.bs()],
+            },
+        ),
+        "embed_tokens" => (
+            // Embedding table — a global weight of Rust type `Embedding`.
+            BufferKind::Weight,
+            TensorShape::matrix(ctx.vs(), ctx.hd()),
+        ),
+        "rotary" => (
+            // Pre-computed cos/sin cache — a global weight (Rust type
+            // `RotaryCache`). Shape is runtime (depends on
+            // max_position_embeddings), so use a 1-element placeholder.
+            BufferKind::Weight,
+            TensorShape {
+                dims: vec![Dim::Lit(1)],
+            },
         ),
         "positions" => (
             BufferKind::Metadata,
@@ -762,7 +824,7 @@ mod tests {
                 for layer in 0..NL {
                     let normed = rmsnorm(hidden_states, attn_norm[layer]);
                     let qkv = gemm(normed, qkv_weights[layer]);
-                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
                     let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
                     hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
 
@@ -790,7 +852,7 @@ mod tests {
                 for layer in 0..NL {
                     let normed = rmsnorm(hidden_states, attn_norm[layer]);
                     let qkv = gemm(normed, qkv_weights[layer]);
-                    let (q, k, v) = rope_append(qkv, positions, kv_cache[layer]);
+                    let (q, k, v) = rope_append(qkv, positions, rotary, kv_cache[layer]);
                     let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
                     hidden_states = gemm_add(attn, o_proj[layer], hidden_states);
 

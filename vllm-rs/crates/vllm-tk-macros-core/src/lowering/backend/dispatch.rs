@@ -24,6 +24,15 @@ use crate::lowering::tile_graph::{TileGraph, TileKind};
 pub enum ImplDispatchKind {
     /// `cublasGemmEx` — params: (M, N, K, alpha, beta, weight, act, out).
     CublasGemm,
+    /// `cublasGemmEx` with fused bias epilogue (`cublas.gemm_bias`).
+    /// Claims {Gemm{phase}, BiasAdd}. Codegen dispatches through
+    /// `LinearLayer::forward`, which internally picks the bias path
+    /// when `bias.is_some()`.
+    CublasGemmWithBias,
+    /// Standalone per-column bias broadcast add on a GEMM output
+    /// buffer. Claims {BiasAdd} only — pairs with a bias-less GEMM
+    /// impl on the preceding `Gemm{phase}` tile.
+    BiasAdd,
     /// `cutlass_gemm_{M}x{N}_s{stages}_launch` — same params + tile size + stages.
     CutlassGemm {
         tile_m: u32,
@@ -51,6 +60,10 @@ pub enum ImplDispatchKind {
     /// Free passthrough — no FFI call needed (e.g. QkvSplit, KvCacheWrite, ResidualAdd
     /// when folded into an upstream beta=1 epilogue).
     Noop,
+    /// Embedding-table gather — `kernels::embedding_gather`.
+    /// Always pre-loop (runs once per forward, before the
+    /// per-layer match dispatch).
+    Embed,
 }
 
 /// Which GEMM phase this entry operates on (determines buffer
@@ -211,10 +224,9 @@ fn classify_impl(
         .iter()
         .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::ResidualAdd);
 
-    // Helper: extract GEMM phase from the claimed tiles.
-    let gemm_phase = claimed
-        .iter()
-        .find_map(|t| match tile_graph.nodes[t.0 as usize].kind {
+    // Helper: map a GEMM TileKind to its GemmPhase.
+    let kind_to_phase = |k: TileKind| -> Option<GemmPhase> {
+        match k {
             TileKind::GemmQkv => Some(GemmPhase::Qkv),
             TileKind::GemmOProj => Some(GemmPhase::OProj),
             TileKind::GemmGate => Some(GemmPhase::Gate),
@@ -222,11 +234,37 @@ fn classify_impl(
             TileKind::GemmDown => Some(GemmPhase::Down),
             TileKind::GemmLmHead => Some(GemmPhase::LmHead),
             _ => None,
+        }
+    };
+
+    // Extract GEMM phase from the claimed tiles, or (for standalone
+    // BiasAdd impls that only claim the BiasAdd tile) from the BiasAdd
+    // tile's upstream GEMM dep. Without this, a standalone bias_add
+    // dispatch entry wouldn't know which buffer to target.
+    let gemm_phase = claimed
+        .iter()
+        .find_map(|t| kind_to_phase(tile_graph.nodes[t.0 as usize].kind))
+        .or_else(|| {
+            claimed.iter().find_map(|t| {
+                let node = &tile_graph.nodes[t.0 as usize];
+                if node.kind != TileKind::BiasAdd {
+                    return None;
+                }
+                node.deps
+                    .iter()
+                    .find_map(|d| kind_to_phase(tile_graph.nodes[d.0 as usize].kind))
+            })
         });
 
     // Classify by impl name prefix → typed dispatch kind.
-    let kind = if imp_name.starts_with("cublas_gemm_ex") {
+    let kind = if imp_name.ends_with("_with_bias") {
+        // cublas_gemm_ex_<phase>_with_bias — fused {Gemm, BiasAdd}.
+        // Must come before the generic cublas_gemm_ex prefix check.
+        ImplDispatchKind::CublasGemmWithBias
+    } else if imp_name.starts_with("cublas_gemm_ex") {
         ImplDispatchKind::CublasGemm
+    } else if imp_name == "standalone_bias_add" {
+        ImplDispatchKind::BiasAdd
     } else if imp_name.starts_with("cutlass_norm_") {
         let (tm, tn, _stages) = parse_cutlass_config(imp_name);
         ImplDispatchKind::CutlassNormGemm {
@@ -264,6 +302,8 @@ fn classify_impl(
         || imp_name == "residual_add"
     {
         ImplDispatchKind::Noop
+    } else if imp_name == "embedding_gather" {
+        ImplDispatchKind::Embed
     } else {
         panic!(
             "DispatchSequence::classify_impl: unknown impl name {:?}",

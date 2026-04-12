@@ -116,6 +116,12 @@ impl ImplementationLibrary {
             //    variant. The fused variant saves a downstream
             Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmOProj)),
             Box::new(CublasGemmExWithResidualImpl::new(TileKind::GemmDown)),
+            // ── cuBLAS GEMM with fused bias epilogue ──
+            // For biased models (Qwen2, Qwen2.5, ...). Registered
+            // before the standalone CublasGemmExImpl variants so the
+            // solver prefers the fused {GemmQkv + BiasAdd} cover over
+            // the split cover when both are feasible.
+            Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmQkv)),
             // ── CUTLASS norm+GEMM prologue fusion (D-3) ──
             Box::new(CutlassNormGemmImpl::new(TileKind::GemmQkv, 128, 128)),
             Box::new(CutlassNormGemmImpl::new(TileKind::GemmGate, 128, 128)),
@@ -145,8 +151,12 @@ impl ImplementationLibrary {
             // Prefill: attention_standard with explicit Q, K, V (seq_len > 1).
             Box::new(FlashInferStandardImpl),
             // ── Free / cheap passthroughs ──
+            Box::new(EmbedImpl),
             Box::new(KvCacheWriteImpl),
             Box::new(ResidualAddImpl),
+            // Standalone bias_add (covers BiasAdd tiles when the solver
+            // picks a bias-less GEMM for the preceding Gemm{phase}).
+            Box::new(StandaloneBiasAddImpl),
         ];
         // ── CUTLASS GEMMs (full tile config grid) ──
         // Every (phase × tile_m × tile_n × stages) combo. The solver
@@ -1028,6 +1038,67 @@ impl Implementation for QkvSplitFreeImpl {
     }
 }
 
+/// Embedding-table gather: `out[i] = embed_tokens[input_ids[i]]`.
+/// Claims a single `TileKind::Embed` tile (always the pre-loop
+/// tile at `layer == PRE_LOOP_LAYER`). The codegen emits a call
+/// to `kernels::embedding_gather`.
+#[derive(Debug)]
+pub struct EmbedImpl;
+
+impl Implementation for EmbedImpl {
+    fn name(&self) -> &'static str {
+        "embedding_gather"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        if node.kind != TileKind::Embed {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: node.deps.clone(),
+            boundary_outputs: vec![seed],
+            layer: node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // Memory-bound gather, ~1-2µs for small seq lens, scales
+        // with num_tokens * hidden. Reuse the hd elementwise curve
+        // as a rough proxy.
+        l4_cost_model::elementwise_us(profile.num_tokens(), 2048)
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+}
+
 #[derive(Debug)]
 pub struct KvCacheWriteImpl;
 
@@ -1080,6 +1151,182 @@ impl Implementation for KvCacheWriteImpl {
     }
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::PagedKvBf16]
+    }
+}
+
+/// Standalone per-column bias add: `out[row, col] += bias[col]`.
+/// Claims a single `BiasAdd` tile. Dispatches
+/// `kernels::bias_add_inplace` on the GEMM output buffer. The tile
+/// preceding it in the DAG is the `Gemm*` that produced the output,
+/// and it's claimed by a separate (unbiased) GEMM impl — so the
+/// solver's cover for `gemm_bias` becomes `CutlassGemm* + BiasAdd`
+/// (two launches) or `CublasGemmExWithBiasImpl` (one launch, fused).
+#[derive(Debug)]
+pub struct StandaloneBiasAddImpl;
+
+impl Implementation for StandaloneBiasAddImpl {
+    fn name(&self) -> &'static str {
+        "standalone_bias_add"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        if node.kind != TileKind::BiasAdd {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: node.deps.clone(),
+            boundary_outputs: vec![seed],
+            layer: node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // Memory-bound broadcast add on the GEMM output. BW is
+        // proportional to M*N (the output buffer); for QKV, N ≈
+        // qkv_dim ≈ 3072, same order as the fused rope+cache path.
+        l4_cost_model::elementwise_us(profile.num_tokens(), 3072)
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+}
+
+/// `cublasGemmEx` with a fused bias epilogue (`cublas.gemm_bias`).
+/// Claims a two-tile subgraph `(Gemm{phase}, BiasAdd)`. The solver
+/// should prefer this over `CublasGemmExImpl + StandaloneBiasAddImpl`
+/// when both are feasible, because one launch is cheaper than two
+/// and the bias epilogue is ~free in cuBLAS's mainloop.
+///
+/// Registered per phase — for Qwen2 only `GemmQkv` is needed today,
+/// but the impl is parameterized so future models with biased
+/// gate/up/down/o_proj projections can reuse it.
+#[derive(Debug)]
+pub struct CublasGemmExWithBiasImpl {
+    phase: TileKind,
+}
+
+impl CublasGemmExWithBiasImpl {
+    pub fn new(phase: TileKind) -> Self {
+        debug_assert!(
+            phase.is_gemm(),
+            "CublasGemmExWithBiasImpl needs a GEMM tile kind"
+        );
+        Self { phase }
+    }
+}
+
+impl Implementation for CublasGemmExWithBiasImpl {
+    fn name(&self) -> &'static str {
+        match self.phase {
+            TileKind::GemmQkv => "cublas_gemm_ex_qkv_with_bias",
+            TileKind::GemmOProj => "cublas_gemm_ex_oproj_with_bias",
+            TileKind::GemmGate => "cublas_gemm_ex_gate_with_bias",
+            TileKind::GemmUp => "cublas_gemm_ex_up_with_bias",
+            TileKind::GemmDown => "cublas_gemm_ex_down_with_bias",
+            TileKind::GemmLmHead => "cublas_gemm_ex_lm_head_with_bias",
+            _ => "cublas_gemm_ex_with_bias_unknown",
+        }
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        // Seedable from either end: the GEMM or the BiasAdd.
+        let (gemm_id, gemm_node, bias_id) = match node.kind {
+            kind if kind == self.phase => {
+                let bias = tile_graph
+                    .nodes
+                    .iter()
+                    .find(|n| n.kind == TileKind::BiasAdd && n.deps.contains(&seed))?;
+                (seed, node, bias.id)
+            }
+            TileKind::BiasAdd => {
+                let gemm = node
+                    .deps
+                    .iter()
+                    .copied()
+                    .find(|d| tile_graph.nodes[d.0 as usize].kind == self.phase)?;
+                (gemm, &tile_graph.nodes[gemm.0 as usize], seed)
+            }
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![gemm_id, bias_id],
+            boundary_inputs: gemm_node.deps.clone(),
+            boundary_outputs: vec![bias_id],
+            layer: gemm_node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // Identical to the plain cuBLAS GEMM — epilogue bias is
+        // folded into the mainloop and doesn't change wall clock.
+        let m = profile.num_tokens();
+        match self.phase {
+            TileKind::GemmQkv => l4_cost_model::gemm_us(m, 3072, 2048),
+            TileKind::GemmOProj => l4_cost_model::gemm_us(m, 2048, 2048),
+            TileKind::GemmGate => l4_cost_model::gemm_us(m, 8192, 2048),
+            TileKind::GemmUp => l4_cost_model::gemm_us(m, 8192, 2048),
+            TileKind::GemmDown => l4_cost_model::gemm_us(m, 2048, 8192),
+            _ => 0.0,
+        }
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+    fn is_compute_bound(&self) -> bool {
+        true
     }
 }
 

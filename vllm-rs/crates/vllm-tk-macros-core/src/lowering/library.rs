@@ -66,7 +66,7 @@
 //! No solver / framework changes.
 
 use crate::lowering::implementation::{
-    Handoff, ImplId, Implementation, LaunchKind, Layout, MatchInfo, Resources,
+    Handoff, ImplId, Implementation, LaunchKind, Layout, MatchInfo, Resources, WorkloadConstraint,
 };
 use crate::lowering::tile_graph::{TileGraph, TileId, TileKind};
 use crate::target_profile::TargetProfile;
@@ -94,6 +94,32 @@ impl ImplementationLibrary {
             GpuCostTable::l4_sm89(), // elementwise/attention not yet in CSV; use L4 estimates scaled by SM ratio
         );
         Self::sm89_starter_common(dims)
+    }
+
+    /// Construct the H100 sm_90 starter library. Same implementation
+    /// set as sm_89 for now (cuBLAS, CUTLASS 2.x, vllm-rs fused,
+    /// FlashInfer), but uses H100 cost data so the solver picks
+    /// optimal kernels for Hopper. Future: add sm90 CUTLASS 3.x
+    /// and TK persistent-grid implementations.
+    pub fn h100_sm90_starter(dims: crate::lowering::tile_graph::ModelDims) -> Self {
+        l4_cost_model::init_for_target(
+            crate::lowering::cost_table::load_h100_sm90()
+                .expect("H100 cost CSV not found — run gpu_cost_sweep on H100"),
+            GpuCostTable::l4_sm89(), // elementwise/attention not yet in CSV; use L4 estimates
+        );
+        let mut lib = Self::sm89_starter_common(dims);
+        // Add DeviceCallable variants of all ops for megakernel grouping.
+        // These have the same compute cost as standalone (setmaxnreg
+        // eliminates register-union penalty on sm90) but use Mbarrier
+        // handoffs instead of StreamOrder. The solver groups them into
+        // one CompilationUnitId, saving per_launch_overhead_us per op.
+        lib.add_device_callable_variants(dims);
+        lib
+    }
+
+    /// Convenience: H100 starter library with Llama 3.2 1B dims.
+    pub fn h100_sm90_starter_default() -> Self {
+        Self::h100_sm90_starter(crate::lowering::tile_graph::ModelDims::LLAMA_3_2_1B)
     }
 
     /// Construct the L4 sm_89 starter library: cuBLAS, vllm-rs
@@ -177,6 +203,92 @@ impl ImplementationLibrary {
         entries.extend(CutlassGemmWithResidualImpl::all_configs(dims));
         entries.extend(CutlassGemvImpl::all_configs(dims));
         ImplementationLibrary { entries }
+    }
+
+    /// Add DeviceCallable (megakernel-embeddable) variants of the key
+    /// ops. Each wraps a standalone impl with the DeviceCallableWrapper
+    /// so it uses Mbarrier handoffs and can share a CompilationUnitId.
+    fn add_device_callable_variants(&mut self, dims: crate::lowering::tile_graph::ModelDims) {
+        // DeviceCallable GEMM: use cuBLAS-equivalent costs from CSV.
+        // The solver will pick these when grouping saves enough launch overhead.
+        for &phase in &[
+            TileKind::GemmQkv,
+            TileKind::GemmOProj,
+            TileKind::GemmGate,
+            TileKind::GemmUp,
+            TileKind::GemmDown,
+            TileKind::GemmLmHead,
+        ] {
+            self.entries
+                .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                    CublasGemmExImpl::new(phase),
+                ))));
+        }
+        // DeviceCallable fused GEMM+residual (oproj, down).
+        for &phase in &[TileKind::GemmOProj, TileKind::GemmDown] {
+            self.entries
+                .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                    CublasGemmExWithResidualImpl::new(phase),
+                ))));
+        }
+        // DeviceCallable elementwise ops.
+        self.entries
+            .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                VllmRsRmsNormImpl,
+            ))));
+        self.entries
+            .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                VllmRsSiluAndMulFusedImpl,
+            ))));
+        // DeviceCallable fused QkvRopeCache (decode).
+        self.entries
+            .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                VllmRsFusedQkvRopeCacheImpl,
+            ))));
+        // DeviceCallable prefill QkvRopeCache.
+        self.entries
+            .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                VllmRsPrefillRopeCacheImpl,
+            ))));
+        // DeviceCallable attention (TK native, sm90+ wgmma-based).
+        self.entries.push(Box::new(TkAttentionDecodeImpl));
+        self.entries.push(Box::new(TkAttentionPrefillImpl));
+        // DeviceCallable GEMV (TK matvec for BS=1 decode).
+        for &phase in &[
+            TileKind::GemmQkv,
+            TileKind::GemmGate,
+            TileKind::GemmUp,
+            TileKind::GemmLmHead,
+        ] {
+            self.entries
+                .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                    CutlassGemvImpl::new(phase, dims),
+                ))));
+        }
+        // DeviceCallable CUTLASS GEMM configs (best tile per shape).
+        // Add a subset of tile configs — the solver picks the best.
+        let best_tiles: &[(u32, u32, u32)] = &[
+            (128, 128, 4),
+            (128, 128, 3),
+            (64, 128, 4),
+            (64, 128, 3),
+            (128, 256, 3),
+        ];
+        for &phase in &[
+            TileKind::GemmQkv,
+            TileKind::GemmOProj,
+            TileKind::GemmGate,
+            TileKind::GemmUp,
+            TileKind::GemmDown,
+            TileKind::GemmLmHead,
+        ] {
+            for &(tm, tn, s) in best_tiles {
+                self.entries
+                    .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                        CutlassGemmImpl::new(phase, tm, tn, s, dims),
+                    ))));
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -447,6 +559,15 @@ mod l4_cost_model {
     }
 
     pub fn elementwise_us(m: u32, dim: u32) -> f64 {
+        // Prefer measured data from GPU cost sweep CSV if available.
+        // The sweep stores rms_norm and silu_mul with N=dim, K=0.
+        // Use rms_norm as the representative elementwise cost (it's
+        // the more expensive of the two).
+        let g = grid();
+        if g.has_data("rms_norm") {
+            return g.lookup("rms_norm", m, dim, 0);
+        }
+        // Fallback: L4 hardcoded curves.
         let t = table();
         match dim {
             2048 => t.elementwise_hd.lookup(m),
@@ -455,6 +576,33 @@ mod l4_cost_model {
             512 => t.elementwise_hd.lookup(m) * 0.25,
             _ => t.elementwise_hd.lookup(m) * (dim as f64 / 2048.0),
         }
+    }
+
+    /// SiLU+Mul cost — uses measured data if available.
+    pub fn silu_mul_us(m: u32, dim: u32) -> f64 {
+        let g = grid();
+        if g.has_data("silu_mul") {
+            return g.lookup("silu_mul", m, dim, 0);
+        }
+        // Fallback: same as elementwise (silu is similar cost).
+        elementwise_us(m, dim)
+    }
+
+    /// Fused QKV RoPE cost — uses measured data if available.
+    pub fn rope_us(m: u32, total_dim: u32, rotary_dim: u32) -> f64 {
+        let g = grid();
+        // Try model-specific config first, then generic.
+        for name in &["rope_1b", "rope_7b", "rope_70b"] {
+            if g.has_data(name) {
+                // Match by total_dim (N column).
+                let cost = g.lookup(name, m, total_dim, rotary_dim);
+                if cost > 0.0 {
+                    return cost;
+                }
+            }
+        }
+        // Fallback: elementwise at QKV dim.
+        elementwise_us(m, total_dim)
     }
 
     pub fn attention_us(seq: u32) -> f64 {
@@ -1006,8 +1154,8 @@ impl Implementation for VllmRsRotaryEmbeddingImpl {
             layer: node.layer,
         })
     }
-    fn cost_us(&self, _m: &MatchInfo, _profile: &TargetProfile) -> f64 {
-        l4_llama_1b_seq1024_costs::ROTARY_EMBEDDING_US
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        l4_cost_model::rope_us(profile.num_tokens(), 2048, 64)
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -1089,7 +1237,7 @@ impl Implementation for VllmRsSiluAndMulFusedImpl {
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
-        l4_cost_model::elementwise_us(profile.num_tokens(), 8192) // intermediate_dim
+        l4_cost_model::silu_mul_us(profile.num_tokens(), 8192) // intermediate_dim
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -1109,6 +1257,152 @@ impl Implementation for VllmRsSiluAndMulFusedImpl {
     }
     fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+}
+
+// ── DeviceCallable attention (sm90+) — TK-native ──
+//
+// Attention that runs inside the persistent megakernel using
+// ThunderKittens' native attention primitives (`mma_ABt` for Q×K^T
+// scores, online softmax via `exp2`/`max`/`sub_row`, `mma_AB` for
+// attn×V accumulation). Fully device-callable — no separate kernel
+// launch needed.
+//
+// For decode (seq_len=1): partial attention per SM with TMA-streamed
+// K/V pages from the paged cache, plus a cross-SM log-sum-exp
+// reduction step (see Megakernels `attention_partial.cu` +
+// `attention_reduction.cu`).
+//
+// For prefill: 64-row Q blocks × 128-token KV pages with causal
+// masking and 3-stage TMA pipeline (see Megakernels
+// `attention_prefill.cu`).
+//
+// Both variants receive input via mbarrier from the preceding
+// rope/split op and hand off output to oproj via mbarrier.
+
+/// Decode attention via TK-native `mma_ABt`/`mma_AB` with online
+/// softmax. Paged KV cache, seq_len <= 1.
+#[derive(Debug)]
+pub struct TkAttentionDecodeImpl;
+
+impl Implementation for TkAttentionDecodeImpl {
+    fn name(&self) -> &'static str {
+        "tk_attention_decode"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // sm90+ only (needs wgmma + mbarrier).
+        profile.lowering.regs_dynamic_per_warpgroup
+            && profile.lowering.mbarrier_handoff_us.is_some()
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange { min: 0, max: 1 }
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        if node.kind != TileKind::Attention {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: node.deps.clone(),
+            boundary_outputs: vec![seed],
+            layer: node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // TK-native attention (mma_ABt + online softmax + mma_AB).
+        // TODO: replace with measured TK attention cost from B2 benchmarks.
+        l4_cost_model::attention_us(profile.num_tokens())
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 228 * 1024, // 228 KiB for Q/K/V tiles + softmax scratch
+            regs_per_thread: 232,    // wgmma consumer warpgroup
+            threads_per_cta: 128,    // 1 warpgroup
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+}
+
+/// Prefill attention via TK-native primitives (64-row Q blocks,
+/// causal masking, 3-stage TMA pipeline). Explicit Q, K, V, seq_len > 1.
+#[derive(Debug)]
+pub struct TkAttentionPrefillImpl;
+
+impl Implementation for TkAttentionPrefillImpl {
+    fn name(&self) -> &'static str {
+        "tk_attention_prefill"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.lowering.regs_dynamic_per_warpgroup
+            && profile.lowering.mbarrier_handoff_us.is_some()
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        if node.kind != TileKind::Attention {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: node.deps.clone(),
+            boundary_outputs: vec![seed],
+            layer: node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        l4_cost_model::attention_us(profile.num_tokens())
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 228 * 1024,
+            regs_per_thread: 232,
+            threads_per_cta: 128,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_inputs.len()]
     }
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::RowMajorBf16]
@@ -1634,7 +1928,7 @@ impl Implementation for VllmRsFusedQkvRopeCacheImpl {
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
         // Fused rope + qkv split + kv cache write: reads qkv_dim,
         // writes q_dim + kv scatter. One kernel instead of three.
-        l4_cost_model::elementwise_us(profile.num_tokens(), 3072) // qkv_dim
+        l4_cost_model::rope_us(profile.num_tokens(), 3072, 64) // LLaMA 1B: total_dim=3072, rotary=64
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -1702,7 +1996,7 @@ impl Implementation for VllmRsPrefillRopeCacheImpl {
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
         // Prefill: split_qkv + rotary_both + write_kv_cache.
         // More work than decode fused variant.
-        l4_cost_model::elementwise_us(profile.num_tokens(), 3072) * 1.5
+        l4_cost_model::rope_us(profile.num_tokens(), 3072, 64) * 1.5 // prefill: ~1.5× decode rope
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
@@ -1843,6 +2137,83 @@ impl CutlassGemmImpl {
         }
     }
 
+    /// Create a splitK variant. Same tile config but different cost_key
+    /// (e.g. `cutlass_64x64_s4_sk8`) so it looks up splitK-specific costs.
+    pub fn new_splitk(
+        phase: TileKind,
+        tile_m: u32,
+        tile_n: u32,
+        stages: u32,
+        split_k: u32,
+        dims: crate::lowering::tile_graph::ModelDims,
+    ) -> Self {
+        let phase_str = match phase {
+            TileKind::GemmQkv => "qkv",
+            TileKind::GemmOProj => "oproj",
+            TileKind::GemmGate => "gate",
+            TileKind::GemmUp => "up",
+            TileKind::GemmDown => "down",
+            TileKind::GemmLmHead => "lm_head",
+            _ => "unknown",
+        };
+        let name: &'static str = Box::leak(
+            format!(
+                "cutlass_{}_{}x{}_s{}_sk{}",
+                phase_str, tile_m, tile_n, stages, split_k
+            )
+            .into_boxed_str(),
+        );
+        let cost_key: &'static str = Box::leak(
+            format!("cutlass_{}x{}_s{}_sk{}", tile_m, tile_n, stages, split_k).into_boxed_str(),
+        );
+        Self {
+            phase,
+            tile_m,
+            tile_n,
+            stages,
+            dims,
+            name,
+            cost_key,
+        }
+    }
+
+    /// Create a TB_K=64 variant with cost_key like `cutlass_64x64_k64_s4`.
+    pub fn new_k64(
+        phase: TileKind,
+        tile_m: u32,
+        tile_n: u32,
+        stages: u32,
+        dims: crate::lowering::tile_graph::ModelDims,
+    ) -> Self {
+        let phase_str = match phase {
+            TileKind::GemmQkv => "qkv",
+            TileKind::GemmOProj => "oproj",
+            TileKind::GemmGate => "gate",
+            TileKind::GemmUp => "up",
+            TileKind::GemmDown => "down",
+            TileKind::GemmLmHead => "lm_head",
+            _ => "unknown",
+        };
+        let name: &'static str = Box::leak(
+            format!(
+                "cutlass_{}_{}x{}_k64_s{}",
+                phase_str, tile_m, tile_n, stages
+            )
+            .into_boxed_str(),
+        );
+        let cost_key: &'static str =
+            Box::leak(format!("cutlass_{}x{}_k64_s{}", tile_m, tile_n, stages).into_boxed_str());
+        Self {
+            phase,
+            tile_m,
+            tile_n,
+            stages,
+            dims,
+            name,
+            cost_key,
+        }
+    }
+
     /// Generate all (phase × tile_config) entries for the library.
     pub fn all_configs(
         dims: crate::lowering::tile_graph::ModelDims,
@@ -1875,12 +2246,103 @@ impl CutlassGemmImpl {
             (128, 256, 3),
             (256, 64, 4),
             (256, 64, 3),
-            // (256, 128, 3) — exceeds sm89 SMEM
+            // stages=2 variants
+            (64, 64, 2),
+            (64, 128, 2),
+            (128, 64, 2),
+            (128, 128, 2),
+            (128, 256, 2),
+            (256, 64, 2),
+        ];
+        // TB_K=64 configs — cost_key like "cutlass_64x64_k64_s4"
+        // Note: 128x128_k64_s4, 256x64_k64_s{3,4}, 128x256_k64_s3 exceed
+        // sm89 SMEM and are excluded.
+        let k64_tiles: &[(u32, u32, u32)] = &[
+            (64, 64, 4),
+            (64, 64, 3),
+            (64, 64, 2),
+            (64, 128, 4),
+            (64, 128, 3),
+            (64, 128, 2),
+            (128, 64, 4),
+            (128, 64, 3),
+            (128, 64, 2),
+            (128, 128, 3),
+            (128, 128, 2),
+            (256, 64, 2),
+            (32, 64, 4),
+            (32, 128, 4),
+        ];
+        // SplitK configs — (tile_m, tile_n, stages, split_k_slices)
+        let splitk_tiles: &[(u32, u32, u32, u32)] = &[
+            (64, 64, 4, 2),
+            (64, 64, 4, 4),
+            (64, 64, 4, 8),
+            (64, 64, 4, 16),
+            (128, 128, 3, 2),
+            (128, 128, 3, 4),
+            (128, 128, 3, 8),
+            (64, 128, 4, 2),
+            (64, 128, 4, 4),
+            (64, 128, 4, 8),
+            (64, 128, 4, 16),
+            (32, 64, 4, 4),
+            (32, 64, 4, 8),
+            (32, 64, 4, 16),
+            (128, 128, 4, 2),
+            (128, 128, 4, 4),
+            (128, 128, 4, 8),
+            (128, 64, 4, 2),
+            (128, 64, 4, 4),
+            (128, 64, 4, 8),
+            (256, 64, 4, 2),
+            (256, 64, 4, 4),
+        ];
+        // k64 splitK configs
+        let k64_splitk_tiles: &[(u32, u32, u32, u32)] = &[
+            (64, 64, 4, 2),
+            (64, 64, 4, 4),
+            (64, 64, 4, 8),
+            (128, 128, 3, 2),
+            (128, 128, 3, 4),
         ];
         let mut out: Vec<Box<dyn Implementation>> = Vec::new();
         for &phase in &phases {
             for &(m, n, s) in tiles {
                 out.push(Box::new(Self::new(phase, m, n, s, dims)));
+            }
+            for &(m, n, s) in k64_tiles {
+                out.push(Box::new(Self::new_k64(phase, m, n, s, dims)));
+            }
+            for &(m, n, s, sk) in splitk_tiles {
+                out.push(Box::new(Self::new_splitk(phase, m, n, s, sk, dims)));
+            }
+            for &(m, n, s, sk) in k64_splitk_tiles {
+                // k64 splitK: cost_key like "cutlass_64x64_k64_s4_sk2"
+                let phase_str = match phase {
+                    TileKind::GemmQkv => "qkv",
+                    TileKind::GemmOProj => "oproj",
+                    TileKind::GemmGate => "gate",
+                    TileKind::GemmUp => "up",
+                    TileKind::GemmDown => "down",
+                    TileKind::GemmLmHead => "lm_head",
+                    _ => "unknown",
+                };
+                let name: &'static str = Box::leak(
+                    format!("cutlass_{}_{}x{}_k64_s{}_sk{}", phase_str, m, n, s, sk)
+                        .into_boxed_str(),
+                );
+                let cost_key: &'static str =
+                    Box::leak(format!("cutlass_{}x{}_k64_s{}_sk{}", m, n, s, sk).into_boxed_str());
+                out.push(Box::new(Self {
+                    phase,
+                    tile_m: m,
+                    tile_n: n,
+                    stages: s,
+                    dims,
+                    name,
+                    cost_key,
+                }));
             }
         }
         out
@@ -2123,6 +2585,80 @@ impl CutlassGemmWithResidualImpl {
         }
     }
 
+    pub fn new_splitk(
+        phase: TileKind,
+        tile_m: u32,
+        tile_n: u32,
+        stages: u32,
+        split_k: u32,
+        dims: crate::lowering::tile_graph::ModelDims,
+    ) -> Self {
+        debug_assert!(
+            phase == TileKind::GemmOProj || phase == TileKind::GemmDown,
+            "only oproj and down have residual add"
+        );
+        let phase_str = match phase {
+            TileKind::GemmOProj => "oproj",
+            TileKind::GemmDown => "down",
+            _ => "unknown",
+        };
+        let name: &'static str = Box::leak(
+            format!(
+                "cutlass_{}_{}x{}_s{}_sk{}_res",
+                phase_str, tile_m, tile_n, stages, split_k
+            )
+            .into_boxed_str(),
+        );
+        let cost_key: &'static str = Box::leak(
+            format!("cutlass_{}x{}_s{}_sk{}", tile_m, tile_n, stages, split_k).into_boxed_str(),
+        );
+        Self {
+            phase,
+            tile_m,
+            tile_n,
+            stages,
+            dims,
+            name,
+            cost_key,
+        }
+    }
+
+    pub fn new_k64(
+        phase: TileKind,
+        tile_m: u32,
+        tile_n: u32,
+        stages: u32,
+        dims: crate::lowering::tile_graph::ModelDims,
+    ) -> Self {
+        debug_assert!(
+            phase == TileKind::GemmOProj || phase == TileKind::GemmDown,
+            "only oproj and down have residual add"
+        );
+        let phase_str = match phase {
+            TileKind::GemmOProj => "oproj",
+            TileKind::GemmDown => "down",
+            _ => "unknown",
+        };
+        let name: &'static str = Box::leak(
+            format!(
+                "cutlass_{}_{}x{}_k64_s{}_res",
+                phase_str, tile_m, tile_n, stages
+            )
+            .into_boxed_str(),
+        );
+        let cost_key: &'static str =
+            Box::leak(format!("cutlass_{}x{}_k64_s{}", tile_m, tile_n, stages).into_boxed_str());
+        Self {
+            phase,
+            tile_m,
+            tile_n,
+            stages,
+            dims,
+            name,
+            cost_key,
+        }
+    }
+
     /// Generate all (phase × tile_config) entries for residual-fused GEMMs.
     pub fn all_configs(
         dims: crate::lowering::tile_graph::ModelDims,
@@ -2145,12 +2681,93 @@ impl CutlassGemmWithResidualImpl {
             (128, 256, 3),
             (256, 64, 4),
             (256, 64, 3),
-            // (256, 128, 3) — exceeds sm89 SMEM
+            // stages=2 variants
+            (64, 64, 2),
+            (64, 128, 2),
+            (128, 64, 2),
+            (128, 128, 2),
+            (128, 256, 2),
+            (256, 64, 2),
+        ];
+        let k64_tiles: &[(u32, u32, u32)] = &[
+            (64, 64, 4),
+            (64, 64, 3),
+            (64, 64, 2),
+            (64, 128, 4),
+            (64, 128, 3),
+            (64, 128, 2),
+            (128, 64, 4),
+            (128, 64, 3),
+            (128, 64, 2),
+            (128, 128, 3),
+            (128, 128, 2),
+            (256, 64, 2),
+            (32, 64, 4),
+            (32, 128, 4),
+        ];
+        let splitk_tiles: &[(u32, u32, u32, u32)] = &[
+            (64, 64, 4, 2),
+            (64, 64, 4, 4),
+            (64, 64, 4, 8),
+            (64, 64, 4, 16),
+            (128, 128, 3, 2),
+            (128, 128, 3, 4),
+            (128, 128, 3, 8),
+            (64, 128, 4, 2),
+            (64, 128, 4, 4),
+            (64, 128, 4, 8),
+            (64, 128, 4, 16),
+            (32, 64, 4, 4),
+            (32, 64, 4, 8),
+            (32, 64, 4, 16),
+            (128, 128, 4, 2),
+            (128, 128, 4, 4),
+            (128, 128, 4, 8),
+            (128, 64, 4, 2),
+            (128, 64, 4, 4),
+            (128, 64, 4, 8),
+            (256, 64, 4, 2),
+            (256, 64, 4, 4),
+        ];
+        let k64_splitk_tiles: &[(u32, u32, u32, u32)] = &[
+            (64, 64, 4, 2),
+            (64, 64, 4, 4),
+            (64, 64, 4, 8),
+            (128, 128, 3, 2),
+            (128, 128, 3, 4),
         ];
         let mut out: Vec<Box<dyn Implementation>> = Vec::new();
         for &phase in &phases {
             for &(m, n, s) in tiles {
                 out.push(Box::new(Self::new(phase, m, n, s, dims)));
+            }
+            for &(m, n, s) in k64_tiles {
+                out.push(Box::new(Self::new_k64(phase, m, n, s, dims)));
+            }
+            for &(m, n, s, sk) in splitk_tiles {
+                out.push(Box::new(Self::new_splitk(phase, m, n, s, sk, dims)));
+            }
+            for &(m, n, s, sk) in k64_splitk_tiles {
+                let phase_str = match phase {
+                    TileKind::GemmOProj => "oproj",
+                    TileKind::GemmDown => "down",
+                    _ => "unknown",
+                };
+                let name: &'static str = Box::leak(
+                    format!("cutlass_{}_{}x{}_k64_s{}_sk{}_res", phase_str, m, n, s, sk)
+                        .into_boxed_str(),
+                );
+                let cost_key: &'static str =
+                    Box::leak(format!("cutlass_{}x{}_k64_s{}_sk{}", m, n, s, sk).into_boxed_str());
+                out.push(Box::new(Self {
+                    phase,
+                    tile_m: m,
+                    tile_n: n,
+                    stages: s,
+                    dims,
+                    name,
+                    cost_key,
+                }));
             }
         }
         out
@@ -2225,6 +2842,84 @@ impl Implementation for CutlassGemmWithResidualImpl {
     }
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::RowMajorBf16]
+    }
+}
+
+// ── DeviceCallable wrapper (sm90+ megakernel-embeddable ops) ──
+
+/// Wraps any existing `Implementation` and makes it `DeviceCallable`
+/// with `Mbarrier` handoffs. Used to create megakernel-embeddable
+/// variants of standalone ops for the H100 library.
+///
+/// On sm90+ with `setmaxnreg`, grouping DeviceCallable ops into one
+/// persistent kernel has minimal occupancy penalty — each warpgroup
+/// picks its own register budget. The cost is the same as standalone
+/// (validated assumption; to be confirmed by B2 benchmarks).
+#[derive(Debug)]
+pub struct DeviceCallableWrapper {
+    inner: Box<dyn Implementation>,
+    name: &'static str,
+}
+
+impl DeviceCallableWrapper {
+    pub fn new(inner: Box<dyn Implementation>) -> Self {
+        let name: &'static str = Box::leak(format!("dc_{}", inner.name()).into_boxed_str());
+        Self { inner, name }
+    }
+}
+
+impl Implementation for DeviceCallableWrapper {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.lowering.regs_dynamic_per_warpgroup
+            && profile.lowering.mbarrier_handoff_us.is_some()
+            && self.inner.target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        self.inner.workload_constraint()
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        self.inner.matches(tile_graph, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        self.inner.cost_us(m, profile)
+    }
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        self.inner.resources(m)
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        // Mbarrier for intra-megakernel handoffs (cheapest).
+        // StreamOrder for receiving from a preceding HostCallback
+        // (the persistent kernel reads gmem after the host call
+        // completes on the same stream).
+        &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        // Mbarrier for intra-megakernel handoffs.
+        // StreamOrder for feeding a following HostCallback.
+        &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.inner.input_layouts(m)
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.inner.output_layouts(m)
+    }
+    fn is_compute_bound(&self) -> bool {
+        self.inner.is_compute_bound()
+    }
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
     }
 }
 

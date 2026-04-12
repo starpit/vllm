@@ -22,8 +22,8 @@ fn natural_sm89_assignment_satisfies_all_static_constraints() {
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
-    let plan = match BacktrackCpSolver.solve(&problem) {
-        SolveResult::Found(p) => p,
+    let plan = match BacktrackCpSolver::default().solve(&problem) {
+        SolveResult::Found { best: p, .. } => p,
         SolveResult::Infeasible => panic!("solver reported infeasible"),
     };
 
@@ -51,8 +51,8 @@ fn natural_sm89_cost_matches_cp4_microbench_estimate() {
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
-    let plan = match BacktrackCpSolver.solve(&problem) {
-        SolveResult::Found(p) => p,
+    let plan = match BacktrackCpSolver::default().solve(&problem) {
+        SolveResult::Found { best: p, .. } => p,
         SolveResult::Infeasible => panic!("solver reported infeasible"),
     };
 
@@ -85,8 +85,8 @@ fn dependency_order_constraint_catches_swapped_subgraphs() {
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
-    let plan = match BacktrackCpSolver.solve(&problem) {
-        SolveResult::Found(p) => p,
+    let plan = match BacktrackCpSolver::default().solve(&problem) {
+        SolveResult::Found { best: p, .. } => p,
         SolveResult::Infeasible => panic!("solver reported infeasible"),
     };
 
@@ -137,8 +137,8 @@ fn cooperative_exclusive_constraint_holds_for_all_host_callback_lowering() {
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
-    let plan = match BacktrackCpSolver.solve(&problem) {
-        SolveResult::Found(p) => p,
+    let plan = match BacktrackCpSolver::default().solve(&problem) {
+        SolveResult::Found { best: p, .. } => p,
         SolveResult::Infeasible => panic!("solver reported infeasible"),
     };
 
@@ -164,8 +164,8 @@ fn dispatch_sequence_from_solver_plan_classifies_all_entries() {
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
-    let plan = match BacktrackCpSolver.solve(&problem) {
-        SolveResult::Found(p) => p,
+    let plan = match BacktrackCpSolver::default().solve(&problem) {
+        SolveResult::Found { best: p, .. } => p,
         SolveResult::Infeasible => panic!("solver reported infeasible"),
     };
 
@@ -221,8 +221,8 @@ fn dispatch_sequence_noop_entries_are_free_passthroughs() {
     let profile = TargetProfile::l4_sm89();
     let problem = Problem::build(&tile_graph, &library, &profile);
 
-    let plan = match BacktrackCpSolver.solve(&problem) {
-        SolveResult::Found(p) => p,
+    let plan = match BacktrackCpSolver::default().solve(&problem) {
+        SolveResult::Found { best: p, .. } => p,
         SolveResult::Infeasible => panic!("solver reported infeasible"),
     };
 
@@ -263,7 +263,7 @@ fn dispatch_sequence_plan_family_format() {
         &tile_graph,
         &library,
         &profile,
-        &BacktrackCpSolver,
+        &BacktrackCpSolver::default(),
         &[1, 32, 128, 1024],
     );
 
@@ -275,4 +275,158 @@ fn dispatch_sequence_plan_family_format() {
     assert!(formatted.contains("seq=32"));
     assert!(formatted.contains("seq=128"));
     assert!(formatted.contains("seq=1024"));
+}
+
+#[test]
+fn h100_sm90_plan_family() {
+    use crate::lowering::backend::dispatch::format_plan_family;
+    use crate::lowering::solver::PlanFamily;
+
+    let tile_graph = TileGraph::build_llama_forward_1b(1);
+    let library = ImplementationLibrary::h100_sm90_starter_default();
+    let profile = TargetProfile::h100_sm90();
+
+    let family = PlanFamily::solve_grid(
+        &tile_graph,
+        &library,
+        &profile,
+        &BacktrackCpSolver::default(),
+        &[1, 32, 128, 1024],
+    );
+
+    let formatted = format_plan_family(&family, &library, &tile_graph);
+    eprintln!("{formatted}");
+
+    assert!(formatted.contains("seq=1"));
+    assert!(formatted.contains("seq=1024"));
+}
+
+#[test]
+fn l40s_sm89_plan_family() {
+    use crate::lowering::backend::dispatch::format_plan_family;
+    use crate::lowering::solver::PlanFamily;
+
+    let tile_graph = TileGraph::build_llama_forward_1b(1);
+    let library = ImplementationLibrary::l40s_sm89_starter(
+        crate::lowering::tile_graph::ModelDims::LLAMA_3_2_1B,
+    );
+    let profile = TargetProfile::l40s_sm89();
+
+    let family = PlanFamily::solve_grid(
+        &tile_graph,
+        &library,
+        &profile,
+        &BacktrackCpSolver::default(),
+        &[1, 32, 128, 1024],
+    );
+
+    let formatted = format_plan_family(&family, &library, &tile_graph);
+    eprintln!("{formatted}");
+
+    assert!(formatted.contains("seq=1"));
+    assert!(formatted.contains("seq=1024"));
+}
+
+#[test]
+fn l40s_sm89_ranked_plans() {
+    use crate::lowering::backend::dispatch::{DispatchSequence, ImplDispatchKind};
+
+    let tile_graph = TileGraph::build_llama_forward_1b(1);
+    let library = ImplementationLibrary::l40s_sm89_starter(
+        crate::lowering::tile_graph::ModelDims::LLAMA_3_2_1B,
+    );
+    let profile = TargetProfile::l40s_sm89().with_seq_len(1);
+    let problem = Problem::build(&tile_graph, &library, &profile);
+
+    let result = BacktrackCpSolver::default().solve(&problem);
+    let (best, alts) = match result {
+        SolveResult::Found { best, alternatives } => (best, alternatives),
+        SolveResult::Infeasible => panic!("infeasible"),
+    };
+
+    eprintln!("\n=== L40S seq=1 — Top {} plans ===", 1 + alts.len());
+    for (rank, plan) in std::iter::once(&best).chain(alts.iter()).enumerate() {
+        let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+        let n_launches = ds
+            .entries
+            .iter()
+            .filter(|e| e.kind != ImplDispatchKind::Noop)
+            .map(|e| plan.assignment.schedule[&e.subgraph].unit.0)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        eprintln!(
+            "\n  #{} — {:.1}µs, {} launches, {} steps explored",
+            rank + 1,
+            plan.predicted_us,
+            n_launches,
+            plan.solver_steps,
+        );
+        for entry in &ds.entries {
+            if entry.kind == ImplDispatchKind::Noop {
+                continue;
+            }
+            eprintln!(
+                "    step {:2}  {:?}  {}",
+                entry.step, entry.kind, entry.impl_name,
+            );
+        }
+    }
+
+    for alt in &alts {
+        assert!(best.predicted_us <= alt.predicted_us);
+    }
+}
+
+#[test]
+fn h100_sm90_ranked_plans() {
+    use crate::lowering::backend::dispatch::{DispatchSequence, ImplDispatchKind};
+
+    let tile_graph = TileGraph::build_llama_forward_1b(1);
+    let library = ImplementationLibrary::h100_sm90_starter_default();
+    let profile = TargetProfile::h100_sm90().with_seq_len(1);
+    let problem = Problem::build(&tile_graph, &library, &profile);
+
+    let result = BacktrackCpSolver::default().solve(&problem);
+    let (best, alts) = match result {
+        SolveResult::Found { best, alternatives } => (best, alternatives),
+        SolveResult::Infeasible => panic!("infeasible"),
+    };
+
+    eprintln!("\n=== H100 seq=1 — Top {} plans ===", 1 + alts.len());
+    for (rank, plan) in std::iter::once(&best).chain(alts.iter()).enumerate() {
+        let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+        let n_launches = ds
+            .entries
+            .iter()
+            .filter(|e| e.kind != ImplDispatchKind::Noop)
+            .map(|e| plan.assignment.schedule[&e.subgraph].unit.0)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        eprintln!(
+            "\n  #{} — {:.1}µs, {} launches, {} steps explored",
+            rank + 1,
+            plan.predicted_us,
+            n_launches,
+            plan.solver_steps,
+        );
+        for entry in &ds.entries {
+            if entry.kind == ImplDispatchKind::Noop {
+                continue;
+            }
+            eprintln!(
+                "    step {:2}  {:?}  {}",
+                entry.step, entry.kind, entry.impl_name,
+            );
+        }
+    }
+
+    // Best plan should be cheaper than all alternatives.
+    for alt in &alts {
+        assert!(
+            best.predicted_us <= alt.predicted_us,
+            "best ({:.1}µs) should be <= alt ({:.1}µs)",
+            best.predicted_us,
+            alt.predicted_us
+        );
+    }
 }

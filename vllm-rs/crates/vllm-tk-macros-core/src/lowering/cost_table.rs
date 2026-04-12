@@ -40,9 +40,17 @@ struct CostPoint3D {
 pub type KernelFamily = String;
 
 /// Cost table loaded from CSV. Provides `lookup(kernel, m, n, k) -> f64`.
+///
+/// Timings are **compute-only** — kernel launch overhead has been
+/// subtracted during the sweep. The `launch_overhead_us` field holds
+/// the measured per-launch cost so the solver can add it back:
+///   total = num_launches × launch_overhead_us + Σ compute_costs
 #[derive(Clone, Debug)]
 pub struct GpuCostGrid {
     pub gpu_name: String,
+    /// Measured kernel launch overhead in microseconds (from null
+    /// kernel benchmark). Zero if not present in the CSV.
+    pub launch_overhead_us: f64,
     /// Per-kernel measured data, keyed by kernel name.
     tables: HashMap<KernelFamily, Vec<CostPoint3D>>,
     /// Sorted unique M values for interpolation.
@@ -51,9 +59,13 @@ pub struct GpuCostGrid {
 
 impl GpuCostGrid {
     /// Parse a CSV string (as produced by the sweep test).
+    ///
+    /// Recognizes a special `launch_overhead,0,0,0,<cost>` row that
+    /// records the measured per-launch overhead in microseconds.
     pub fn from_csv(gpu_name: &str, csv: &str) -> Self {
         let mut tables: HashMap<KernelFamily, Vec<CostPoint3D>> = HashMap::new();
         let mut m_set = std::collections::BTreeSet::new();
+        let mut launch_overhead_us = 0.0;
 
         for line in csv.lines() {
             let line = line.trim();
@@ -64,23 +76,31 @@ impl GpuCostGrid {
             if cols.len() < 5 {
                 continue;
             }
-            let kernel = cols[0].trim().to_string();
+            let kernel = cols[0].trim();
             let m: u32 = cols[1].trim().parse().unwrap_or(0);
             let n: u32 = cols[2].trim().parse().unwrap_or(0);
             let k: u32 = cols[3].trim().parse().unwrap_or(0);
             let cost_us: f64 = cols[4].trim().parse().unwrap_or(0.0);
+
+            // Special row: launch overhead measurement.
+            if kernel == "launch_overhead" {
+                launch_overhead_us = cost_us;
+                continue;
+            }
+
             if m == 0 || n == 0 || k == 0 || cost_us <= 0.0 {
                 continue;
             }
             m_set.insert(m);
             tables
-                .entry(kernel)
+                .entry(kernel.to_string())
                 .or_default()
                 .push(CostPoint3D { m, n, k, cost_us });
         }
 
         GpuCostGrid {
             gpu_name: gpu_name.to_string(),
+            launch_overhead_us,
             tables,
             m_grid: m_set.into_iter().collect(),
         }
@@ -196,6 +216,12 @@ pub fn load_l40s_sm89() -> Option<GpuCostGrid> {
     Some(GpuCostGrid::from_csv("L40S sm_89", csv))
 }
 
+/// Load the H100 sm_90 cost grid from the built-in CSV.
+pub fn load_h100_sm90() -> Option<GpuCostGrid> {
+    let csv = include_str!("../../data/cost_h100_sm90.csv");
+    Some(GpuCostGrid::from_csv("H100 sm_90", csv))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +260,32 @@ cutlass_64x64,1024,8192,2048,621.2
         // M=16 between M=1 (13.5) and M=32 (17.6) for (N=3072, K=2048).
         let cost = grid.lookup("cublas", 16, 3072, 2048);
         assert!(cost > 13.5 && cost < 17.6, "interpolated cost {cost}");
+    }
+
+    #[test]
+    fn launch_overhead_parsed() {
+        let csv_with_overhead = "\
+kernel,M,N,K,cost_us
+launch_overhead,0,0,0,3.01
+cublas,1,3072,2048,10.5
+cublas,32,3072,2048,14.6
+";
+        let grid = GpuCostGrid::from_csv("test", csv_with_overhead);
+        assert!((grid.launch_overhead_us - 3.01).abs() < 0.01);
+    }
+
+    #[test]
+    fn h100_csv_loads() {
+        let grid = super::load_h100_sm90().unwrap();
+        assert!(
+            grid.launch_overhead_us > 0.0,
+            "H100 CSV should have launch_overhead"
+        );
+        assert!(grid.has_data("cublas"), "H100 CSV should have cuBLAS data");
+        assert!(
+            grid.has_data("sm90_128x128_coop"),
+            "H100 CSV should have sm90 data"
+        );
     }
 
     #[test]

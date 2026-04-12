@@ -39,36 +39,38 @@ fn build_cuda() {
     let shim_cu = harness_csrc.join("flashinfer_attention_shim.cu");
     let cutlass_gemm_cu = workspace_root.join("crates/vllm-cuda/csrc/cutlass_standalone_gemm.cu");
 
+    let barrier_cu = harness_csrc.join("barrier_sweep.cu");
     let cu_files: Vec<String> = vec![
         shim_cu.display().to_string(),
         cutlass_gemm_cu.display().to_string(),
+        barrier_cu.display().to_string(),
     ];
 
-    // ── Include paths ──
-    //
-    // CUTLASS headers (used by both source files). Optional include path —
-    // not set on all dev machines; if missing, cudaforge will surface the
-    // error from nvcc.
-    let cutlass_root = std::path::PathBuf::from(
-        std::env::var("CUTLASS_ROOT").unwrap_or_else(|_| "/home/moosevan/cutlass".to_string()),
-    );
-    let cutlass_include = cutlass_root.join("include");
-    let cutlass_tools_util = cutlass_root.join("tools/util/include");
+    // ── CUTLASS via cudaforge ──
+    // Same commit as vllm-kernels-cuda uses for the standalone GEMM.
+    // CUTLASS 4.2.1 — has full sm90 (Hopper) support.
+    const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
 
     // FlashInfer headers — pinned via cudaforge git dependency.
-    // Cudaforge clones+caches the repo at the pinned commit into
-    // `~/.cudaforge/git/checkouts/flashinfer-<hash>/`, shared across
-    // worktrees and version-locked by the SHA below. Used by the
-    // attention shim.
-    //
-    // Bump this commit deliberately and rerun goldens.
     const FLASHINFER_COMMIT: &str = "08ab45d67705b301ee66e63c6999c934c72dd41c";
 
+    let arch = detect_cuda_arch();
+    let arch_num: u32 = arch.parse().unwrap_or(89);
+
+    // sm90+ needs c++20 for CuTe; sm89 and below use c++17.
+    let std_flag = if arch_num >= 90 {
+        "-std=c++20"
+    } else {
+        "-std=c++17"
+    };
+
+    // ── Build 1: CUTLASS + FlashInfer (existing kernels) ──
     let mut builder = cudaforge::KernelBuilder::new();
     builder = builder
         .out_dir(&cache_dir)
         .source_files(cu_files)
         .include_path(harness_csrc.display().to_string())
+        .with_cutlass(Some(CUTLASS_COMMIT))
         .with_git_dependency(
             "flashinfer",
             "https://github.com/flashinfer-ai/flashinfer.git",
@@ -76,19 +78,9 @@ fn build_cuda() {
             vec!["include"],
             /*recurse_submodules=*/ false,
         );
-    if cutlass_include.exists() {
-        println!("cargo:warning=cutlass found at {}", cutlass_root.display());
-        builder = builder
-            .include_path(cutlass_include.display().to_string())
-            .include_path(cutlass_tools_util.display().to_string());
-    } else {
-        println!(
-            "cargo:warning=cutlass not found at {} (set CUTLASS_ROOT)",
-            cutlass_root.display()
-        );
-    }
+
     builder
-        .arg("-std=c++20")
+        .arg(std_flag)
         .arg("-O3")
         .arg("--use_fast_math")
         .arg("--expt-extended-lambda")
@@ -97,10 +89,15 @@ fn build_cuda() {
         .arg("-Xcompiler=-fPIC")
         .arg("-Xcompiler=-fno-strict-aliasing")
         .arg("-Xcompiler=-Wno-psabi")
-        .arg("-arch=sm_89")
+        .arg(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
         .arg("-lineinfo")
         .build_lib(format!("{cache_str}/libtk_test_ops.a"))
         .expect("failed to build solver-adjacent test kernels");
+
+    // ── Build 2: ThunderKittens GEMM (sm90+ only) ──
+    if arch_num >= 90 {
+        build_tk_gemm(&cache_dir, &cache_str, &harness_csrc, &arch);
+    }
 
     // ── Link directives ──
     println!("cargo:rustc-link-search={cache_str}");
@@ -131,8 +128,90 @@ fn build_cuda() {
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=cuda");
 
+    // Expose detected arch as cfg flag for conditional FFI/test code.
+    println!("cargo:rustc-check-cfg=cfg(cuda_arch_sm90)");
+    if arch_num >= 90 {
+        println!("cargo:rustc-cfg=cuda_arch_sm90");
+    }
+
     // Rerun triggers
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", shim_cu.display());
     println!("cargo:rerun-if-changed={}", cutlass_gemm_cu.display());
+    let tk_cu = harness_csrc.join("tk_gemm_wrapper.cu");
+    println!("cargo:rerun-if-changed={}", tk_cu.display());
+    println!("cargo:rerun-if-changed={}", barrier_cu.display());
+}
+
+/// Build ThunderKittens GEMM wrapper (sm90+ only).
+///
+/// TK requires `-arch=sm_90a` (the `a` enables wgmma + TMA PTX),
+/// which is incompatible with the CUTLASS TU's `-arch=sm_90`.
+/// So we build it as a separate static lib.
+#[cfg(feature = "cuda")]
+fn build_tk_gemm(
+    cache_dir: &std::path::Path,
+    cache_str: &str,
+    harness_csrc: &std::path::Path,
+    _arch: &str,
+) {
+    // ThunderKittens source — expected at ~/git/ThunderKittens or
+    // via TK_PATH env var.
+    let tk_path = std::env::var("TK_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        format!("{home}/git/ThunderKittens")
+    });
+    let tk_root = std::path::PathBuf::from(&tk_path);
+    if !tk_root.join("include/kittens.cuh").exists() {
+        println!("cargo:warning=ThunderKittens not found at {tk_path}, skipping TK GEMM build");
+        return;
+    }
+    println!("cargo:warning=Building ThunderKittens GEMM from {tk_path}");
+
+    let tk_cu = harness_csrc.join("tk_gemm_wrapper.cu");
+    let mut builder = cudaforge::KernelBuilder::new();
+    builder = builder
+        .out_dir(cache_dir)
+        .source_files(vec![tk_cu.display().to_string()])
+        .include_path(tk_root.join("include").display().to_string())
+        .include_path(tk_root.join("prototype").display().to_string());
+
+    builder
+        .arg("-std=c++20")
+        .arg("-O3")
+        .arg("--use_fast_math")
+        .arg("--expt-extended-lambda")
+        .arg("--expt-relaxed-constexpr")
+        .arg("-DNDEBUG")
+        .arg("-DKITTENS_HOPPER")
+        .arg("-Xcompiler=-fPIC")
+        .arg("-Xcompiler=-fno-strict-aliasing")
+        .arg("-Xcompiler=-Wno-psabi")
+        .arg("-gencode=arch=compute_90a,code=sm_90a")
+        .arg("-lineinfo")
+        .build_lib(format!("{cache_str}/libtk_gemm.a"))
+        .expect("failed to build ThunderKittens GEMM wrapper");
+
+    println!("cargo:rustc-link-lib=static=tk_gemm");
+}
+
+/// Detect the GPU compute capability via nvidia-smi. Falls back to 89 (sm_89).
+#[cfg(feature = "cuda")]
+fn detect_cuda_arch() -> String {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .output();
+    if let Ok(out) = output {
+        let s = String::from_utf8_lossy(&out.stdout);
+        if let Some(line) = s.lines().next() {
+            // "9.0" -> "90", "8.9" -> "89"
+            let cleaned = line.trim().replace('.', "");
+            if !cleaned.is_empty() {
+                println!("cargo:warning=detected GPU compute capability: sm_{cleaned}");
+                return cleaned;
+            }
+        }
+    }
+    println!("cargo:warning=nvidia-smi not found, defaulting to sm_89");
+    "89".to_string()
 }

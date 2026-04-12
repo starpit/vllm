@@ -57,6 +57,10 @@ pub enum ImplDispatchKind {
     FlashInferAttention,
     /// Prefill: FlashInfer `attention_standard` with explicit Q, K, V.
     FlashInferStandard,
+    /// Decode attention inside persistent kernel (FlashInfer `BlockPersistentRunner::Run()`).
+    TkAttentionDecode,
+    /// Prefill attention inside persistent kernel (FlashInfer `BlockPersistentRunner::Run()`).
+    TkAttentionPrefill,
     /// Free passthrough — no FFI call needed (e.g. QkvSplit, KvCacheWrite, ResidualAdd
     /// when folded into an upstream beta=1 epilogue).
     Noop,
@@ -227,6 +231,10 @@ fn classify_impl(
     layer: u16,
     norm_count: &mut BTreeMap<u16, u32>,
 ) -> (ImplDispatchKind, Option<GemmPhase>, bool, Option<bool>) {
+    // Strip `dc_` prefix from DeviceCallable wrapper names so the
+    // classifier sees the underlying impl name.
+    let imp_name = imp_name.strip_prefix("dc_").unwrap_or(imp_name);
+
     // Helper: does this claim include a ResidualAdd tile?
     let has_residual = claimed
         .iter()
@@ -332,6 +340,10 @@ fn classify_impl(
         ImplDispatchKind::FlashInferAttention
     } else if imp_name == "flashinfer_standard_fa2" {
         ImplDispatchKind::FlashInferStandard
+    } else if imp_name == "tk_attention_decode" {
+        ImplDispatchKind::TkAttentionDecode
+    } else if imp_name == "tk_attention_prefill" {
+        ImplDispatchKind::TkAttentionPrefill
     } else if imp_name == "qkv_split_free"
         || imp_name == "kv_cache_write"
         || imp_name == "residual_add"
@@ -384,9 +396,27 @@ pub fn format_plan_family(
     let mut out = String::new();
     for (seq, plan) in family.iter() {
         let ds = DispatchSequence::from_plan(plan, library, tile_graph);
+        // Count distinct compilation units = actual kernel launches.
+        // Count distinct compilation units, excluding Noop entries
+        // (logical-only ops like residual_add, qkv_split get their
+        // own unit but don't produce actual kernel launches).
+        let noop_sgs: std::collections::HashSet<_> = ds
+            .entries
+            .iter()
+            .filter(|e| e.kind == ImplDispatchKind::Noop)
+            .map(|e| e.subgraph)
+            .collect();
+        let distinct_units: std::collections::HashSet<u32> = plan
+            .assignment
+            .schedule
+            .iter()
+            .filter(|(sg, _)| !noop_sgs.contains(sg))
+            .map(|(_, slot)| slot.unit.0)
+            .collect();
         out.push_str(&format!(
-            "\n=== seq={seq} ({} launches, {:.0}µs predicted) ===\n",
+            "\n=== seq={seq} ({} ops, {} kernel launches, {:.0}µs predicted) ===\n",
             ds.num_launches(),
+            distinct_units.len(),
             plan.predicted_us,
         ));
         for entry in &ds.entries {

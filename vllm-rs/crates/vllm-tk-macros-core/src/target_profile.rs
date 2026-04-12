@@ -191,6 +191,17 @@ pub struct LoweringConstraints {
     /// directly comparable against `barrier_cost_us` /
     /// `launch_cost_us`.
     pub gpu_clock_hz: f64,
+    /// Per-kernel-launch overhead in microseconds, measured by the
+    /// null-kernel benchmark in gpu_cost_sweep. This is the
+    /// host→device→sync cost of `cudaLaunchKernel` for a regular
+    /// (non-cooperative) grid launch.
+    ///
+    /// The cost CSV has this overhead **subtracted** from all
+    /// timings, so the solver must add it back: one
+    /// `per_launch_overhead_us` per distinct `CompilationUnitId`
+    /// that contains non-`DeviceCallable` impls. `DeviceCallable`
+    /// impls sharing a unit pay only the unit's single launch.
+    pub per_launch_overhead_us: f32,
 }
 
 impl LoweringConstraints {
@@ -227,6 +238,9 @@ impl LoweringConstraints {
             // `ms_at` convention treats `predicted_cost` as cycles
             // directly, so we match it here.
             gpu_clock_hz: 1.985e9,
+            // TODO: re-measure on L4 with null-kernel benchmark.
+            // Using H100's value as a reasonable default.
+            per_launch_overhead_us: 3.0,
         }
     }
 
@@ -246,6 +260,63 @@ impl LoweringConstraints {
             warps_per_sm: 48,
             // L40S boost clock 2.520 GHz (datasheet).
             gpu_clock_hz: 2.520e9,
+            // TODO: re-measure on L40S with null-kernel benchmark.
+            per_launch_overhead_us: 3.0,
+        }
+    }
+
+    /// H100 SXM sm_90: Hopper architecture. 132 SMs, wgmma + TMA,
+    /// `setmaxnreg` for dynamic register allocation per warpgroup,
+    /// mbarrier for sub-microsecond intra-kernel handoffs, DSMEM
+    /// for cluster-level shared memory.
+    ///
+    /// Key difference from sm_89: `mbarrier_handoff_us` (~0.5 µs) is
+    /// far cheaper than `launch_cost_us` (3.0 µs), so the solver
+    /// should merge all embeddable ops into one persistent kernel.
+    /// On sm_89 the opposite holds (barrier ~100 µs > launch ~80 µs),
+    /// forcing separate launches per op.
+    ///
+    /// Launch overhead measured via null kernel benchmark in
+    /// gpu_cost_sweep (2026-04-11): 3.01 µs.
+    pub const fn h100_sm90() -> Self {
+        Self {
+            // Measured via barrier_sweep on H100 (2026-04-11):
+            // cooperative_groups::this_grid().sync() at 132 CTAs = 3.4 µs.
+            barrier_cost_us: 3.4,
+            // Measured: cooperative kernel launch overhead.
+            // Using grid_sync cost as proxy — the launch itself is ~1.8 µs
+            // (null kernel) but cooperative launch adds verification.
+            launch_cost_us: 3.4,
+            // sm_90 supports `setmaxnreg.inc.sync.aligned` PTX —
+            // each warpgroup picks its own register budget at runtime.
+            // This eliminates the union-of-regs occupancy penalty when
+            // grouping heterogeneous ops (high-reg GEMM + low-reg norm)
+            // into one `__global__`.
+            regs_dynamic_per_warpgroup: true,
+            // Measured via barrier_sweep on H100 (2026-04-11):
+            // mbarrier arrive+wait round-trip = 0.14 µs.
+            // This is the intra-kernel handoff mechanism that makes
+            // persistent megakernels viable — producer writes output,
+            // signals mbarrier, consumer waits on mbarrier, reads input.
+            mbarrier_handoff_us: Some(0.14),
+            // DSMEM: distributed shared memory across cluster CTAs.
+            // Enables direct shmem-to-shmem data movement without
+            // going through global memory. ~1 µs for a 64 KiB tile.
+            // TODO: measure precisely on H100.
+            dsmem_cluster_handoff_us: Some(1.0),
+            tmem_accum_offload: false, // sm_100+ only
+            max_regs_per_thread: 255,
+            // H100 supports 228 KiB dynamic shmem per CTA.
+            max_shmem_per_cta_bytes: 228 * 1024,
+            // H100: 65536 registers per SM (same as sm_89).
+            regs_per_sm: 65536,
+            // H100: 64 warps per SM.
+            warps_per_sm: 64,
+            // H100 SXM boost clock 1.830 GHz (datasheet).
+            gpu_clock_hz: 1.830e9,
+            // Measured via barrier_sweep on H100 (2026-04-11):
+            // null kernel launch overhead = 1.78 µs.
+            per_launch_overhead_us: 1.8,
         }
     }
 }
@@ -359,6 +430,27 @@ impl TargetProfile {
             norm_kernel: NormKernelChoice::HandWrittenWarpShuffle,
             rope_kernel: RopeKernelChoice::HandWrittenSplitHalf,
             lowering: LoweringConstraints::l40s_sm89(),
+        }
+    }
+
+    /// H100 SXM (sm_90). 132 SMs, 228 KiB shmem per CTA.
+    /// Hopper wgmma + TMA enables persistent megakernels with
+    /// mbarrier handoffs (~0.5 µs) that are cheaper than separate
+    /// launches (3.0 µs). The solver should merge all embeddable ops
+    /// into one persistent `__global__`.
+    pub const fn h100_sm90() -> Self {
+        Self {
+            num_sm: 132,
+            seq_len: 1024,
+            batch_size: 1,
+            // H100 with 228 KiB shmem can fit 2 CTAs at ~100 KiB each.
+            cooperative_blocks_per_sm: 2,
+            max_dynamic_shmem_bytes: 228 * 1024,
+            gemm_kernel: GemmKernelChoice::CutlassSm90WarpspecializedSs,
+            attention_kernel: AttentionKernelChoice::FlashInferPersistent,
+            norm_kernel: NormKernelChoice::HandWrittenWarpShuffle,
+            rope_kernel: RopeKernelChoice::HandWrittenSplitHalf,
+            lowering: LoweringConstraints::h100_sm90(),
         }
     }
 

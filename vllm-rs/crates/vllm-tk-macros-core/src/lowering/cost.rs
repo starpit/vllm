@@ -14,9 +14,14 @@
 //!         * concurrency_model.contention_factor(impl, concurrent_impls)
 //!     + sum over scheduled handoffs of:
 //!         handoff.cost_us(profile)
-//!     + sum over scheduled subgraphs of:
-//!         (per-launch boundary cost when this subgraph is HostCallback)
+//!     + num_coop_units × launch_cost_us
+//!     + num_regular_units × per_launch_overhead_us
 //! ```
+//!
+//! The CSV costs are **compute-only** (launch overhead subtracted),
+//! so each distinct `CompilationUnitId` adds the per-launch overhead
+//! back. `DeviceCallable` impls don't add launch cost — they run
+//! inside an enclosing kernel.
 //!
 //! ## What it does NOT model (yet)
 //!
@@ -111,23 +116,45 @@ pub fn cost_us(
         total_us += handoff.cost_us(profile);
     }
 
-    // ── Per-launch overhead. Only CooperativeLaunch pays an
-    // explicit overhead (the ~80 µs cudaLaunchCooperativeKernel
-    // cost CP2 measured). HostCallback and RegularLaunch costs
-    // already INCLUDE per-call cudaLaunchKernel overhead in their
-    // calibration: the CP4 microbench measured end-to-end wall-
-    // clock for cuBLAS GEMMs and vllm-rs fused ops, so adding the
-    // launch overhead a second time would double-count it.
-    // DeviceCallable doesn't add launch overhead at all — it
-    // runs inside an enclosing kernel.
-    for sg in assignment.subgraphs() {
-        let Some(impl_id) = assignment.impls.get(&sg) else {
-            continue;
-        };
-        let imp = library.get(*impl_id);
-        if matches!(imp.launch_kind(), LaunchKind::CooperativeLaunch) {
-            total_us += profile.lowering.launch_cost_us as f64;
+    // ── Per-launch overhead ──
+    //
+    // Each distinct CompilationUnitId represents one __global__
+    // launch. The CSV costs have per-launch overhead subtracted
+    // (compute-only), so we add it back here.
+    //
+    // - CooperativeLaunch: pays the higher cooperative launch cost.
+    // - HostCallback / RegularLaunch: pays per_launch_overhead_us.
+    // - DeviceCallable: no launch cost — runs inside an enclosing
+    //   kernel. If all impls in a unit are DeviceCallable, that
+    //   unit's single launch cost is already counted by the
+    //   enclosing unit.
+    {
+        use std::collections::HashSet;
+        let mut regular_units: HashSet<u32> = HashSet::new();
+        let mut coop_units: HashSet<u32> = HashSet::new();
+
+        for sg in assignment.subgraphs() {
+            let Some(slot) = assignment.schedule.get(&sg) else {
+                continue;
+            };
+            let Some(impl_id) = assignment.impls.get(&sg) else {
+                continue;
+            };
+            let imp = library.get(*impl_id);
+            let uid = slot.unit.0;
+            match imp.launch_kind() {
+                LaunchKind::CooperativeLaunch => {
+                    coop_units.insert(uid);
+                }
+                LaunchKind::HostCallback | LaunchKind::RegularLaunch => {
+                    regular_units.insert(uid);
+                }
+                LaunchKind::DeviceCallable => {}
+            }
         }
+
+        total_us += coop_units.len() as f64 * profile.lowering.launch_cost_us as f64;
+        total_us += regular_units.len() as f64 * profile.lowering.per_launch_overhead_us as f64;
     }
 
     total_us

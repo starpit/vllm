@@ -52,27 +52,46 @@ use std::collections::HashMap;
 use crate::lowering::assignment::{Assignment, CompilationUnitId, ScheduleSlot, SubgraphId};
 use crate::lowering::constraint::ConstraintStatus;
 use crate::lowering::cost::cost_us;
-use crate::lowering::implementation::{Handoff, ImplId};
+use crate::lowering::implementation::{Handoff, ImplId, LaunchKind};
 use crate::lowering::problem::Problem;
 use crate::lowering::solver::{ExecutionPlan, SolveResult, Solver};
 use crate::lowering::tile_graph::{TileId, TileKind};
 
 /// Constraint propagation + backtracking + branch-and-bound solver.
-#[derive(Debug, Default)]
-pub struct BacktrackCpSolver;
+#[derive(Debug)]
+pub struct BacktrackCpSolver {
+    /// How many plans to keep (best + alternatives). Default: 5.
+    pub top_k: usize,
+}
+
+impl Default for BacktrackCpSolver {
+    fn default() -> Self {
+        Self { top_k: 5 }
+    }
+}
 
 impl Solver for BacktrackCpSolver {
     fn solve(&self, problem: &Problem) -> SolveResult {
-        let mut state = SearchState::new(problem);
+        let mut state = SearchState::new(problem, self.top_k);
         let starting_step: u32 = 0;
         recurse(&mut state, starting_step);
-        match state.best {
-            Some((assignment, predicted_us, steps)) => SolveResult::Found(ExecutionPlan {
+        if state.top_plans.is_empty() {
+            return SolveResult::Infeasible;
+        }
+        // top_plans is sorted cheapest-first.
+        let mut plans: Vec<ExecutionPlan> = state
+            .top_plans
+            .into_iter()
+            .map(|(assignment, cost, steps)| ExecutionPlan {
                 assignment,
-                predicted_us,
+                predicted_us: cost,
                 solver_steps: steps,
-            }),
-            None => SolveResult::Infeasible,
+            })
+            .collect();
+        let best = plans.remove(0);
+        SolveResult::Found {
+            best,
+            alternatives: plans,
         }
     }
 }
@@ -155,17 +174,25 @@ struct SearchState<'a> {
     /// will introduce concurrent steps when DeviceCallable impls
     /// can share a step.
     next_step: u32,
-    /// Best (assignment, cost, steps) found so far.
-    best: Option<(Assignment, f64, u64)>,
+    /// Top-K plans found so far, sorted by cost ascending.
+    /// The K-th entry's cost is the B&B pruning bound.
+    top_plans: Vec<(Assignment, f64, u64)>,
+    /// Maximum number of plans to keep.
+    top_k: usize,
     /// Total branch-and-bound steps explored. Used for diagnostics.
     steps: u64,
     /// Precomputed cheapest cost per `TileKind`. Used by the
     /// optimistic remainder bound.
     min_cost_per_kind: HashMap<TileKind, f64>,
+    /// When the last committed impl was `DeviceCallable`, this holds
+    /// its `CompilationUnitId` so the next DeviceCallable impl can
+    /// join the same kernel (group). Cleared when a non-DeviceCallable
+    /// impl is committed.
+    active_device_unit: Option<CompilationUnitId>,
 }
 
 impl<'a> SearchState<'a> {
-    fn new(problem: &'a Problem<'a>) -> Self {
+    fn new(problem: &'a Problem<'a>, top_k: usize) -> Self {
         let min_cost_per_kind = min_cost_per_tile_kind(problem);
         Self {
             problem,
@@ -173,9 +200,36 @@ impl<'a> SearchState<'a> {
             next_subgraph: 0,
             next_unit: 0,
             next_step: 0,
-            best: None,
+            top_plans: Vec::new(),
+            top_k: top_k.max(1),
             steps: 0,
             min_cost_per_kind,
+            active_device_unit: None,
+        }
+    }
+
+    /// The pruning bound: cost of the K-th best plan, or infinity
+    /// if we haven't found K plans yet.
+    fn pruning_bound(&self) -> f64 {
+        if self.top_plans.len() < self.top_k {
+            f64::INFINITY
+        } else {
+            self.top_plans.last().unwrap().1
+        }
+    }
+
+    /// Try to insert a new plan. Maintains sorted order and drops
+    /// the worst plan if we exceed top_k.
+    fn try_insert_plan(&mut self, assignment: Assignment, cost: f64, steps: u64) {
+        // Find insertion point (sorted ascending by cost).
+        let pos = self.top_plans.partition_point(|(_, c, _)| *c < cost);
+        // Skip if we're full and this is worse than the worst.
+        if pos >= self.top_k {
+            return;
+        }
+        self.top_plans.insert(pos, (assignment, cost, steps));
+        if self.top_plans.len() > self.top_k {
+            self.top_plans.pop();
         }
     }
 
@@ -247,7 +301,18 @@ impl<'a> SearchState<'a> {
                 // this seed only. This is still a valid lower bound.)
             }
         }
-        partial + remainder
+        // Grouping discount: when there's an active DeviceCallable unit,
+        // the next DeviceCallable op in the remainder could join it for
+        // free (no new compilation unit = saves per_launch_overhead_us).
+        // Subtract this from the bound to avoid pruning dc_ branches
+        // too aggressively. This is still a valid lower bound because
+        // we're being optimistic (the remainder op might not be DC).
+        let grouping_discount = if self.active_device_unit.is_some() {
+            self.problem.profile.lowering.per_launch_overhead_us as f64
+        } else {
+            0.0
+        };
+        partial + remainder - grouping_discount
     }
 
     /// Check every static constraint against the current partial
@@ -282,6 +347,7 @@ struct CommitSnapshot {
     saved_next_subgraph: u32,
     saved_next_unit: u32,
     saved_next_step: u32,
+    saved_active_device_unit: Option<CompilationUnitId>,
 }
 
 /// Recursive search step. Picks the next unclaimed tile, tries
@@ -295,7 +361,7 @@ const MAX_STEPS: u64 = 10_000;
 
 fn recurse(state: &mut SearchState<'_>, _starting_step: u32) {
     state.steps += 1;
-    if state.steps > MAX_STEPS && state.best.is_some() {
+    if state.steps > MAX_STEPS && !state.top_plans.is_empty() {
         return; // budget exhausted, return best found so far
     }
 
@@ -306,29 +372,21 @@ fn recurse(state: &mut SearchState<'_>, _starting_step: u32) {
         if !state.no_constraint_violated() {
             return;
         }
-        // Compute final cost and record if it's the new best.
+        // Compute final cost and try to insert into top-K.
         let total = cost_us(
             &state.assignment,
             state.problem.tile_graph,
             state.problem.library,
             state.problem.profile,
         );
-        let is_new_best = match state.best.as_ref() {
-            None => true,
-            Some((_, cur, _)) => total < *cur,
-        };
-        if is_new_best {
-            state.best = Some((state.assignment.clone(), total, state.steps));
-        }
+        state.try_insert_plan(state.assignment.clone(), total, state.steps);
         return;
     };
 
     // Branch-and-bound: prune if our partial cost already exceeds
     // the current best.
     let lb = state.lower_bound_cost_us();
-    if let Some((_, best_cost, _)) = state.best.as_ref()
-        && lb >= *best_cost
-    {
+    if lb >= state.pruning_bound() {
         return;
     }
 
@@ -373,6 +431,14 @@ fn recurse(state: &mut SearchState<'_>, _starting_step: u32) {
         a_per
             .partial_cmp(&b_per)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                // Tie-break: prefer DeviceCallable (grouping potential).
+                let a_dc =
+                    library_entries[a.0.0 as usize].launch_kind() == LaunchKind::DeviceCallable;
+                let b_dc =
+                    library_entries[b.0.0 as usize].launch_kind() == LaunchKind::DeviceCallable;
+                b_dc.cmp(&a_dc) // true (DC) sorts before false
+            })
     });
 
     for (impl_id, match_info, _cost) in candidates {
@@ -389,6 +455,11 @@ fn recurse(state: &mut SearchState<'_>, _starting_step: u32) {
 
 /// Tentatively commit one (impl, match) into the assignment.
 /// Allocates a fresh subgraph id, compilation unit, and step.
+///
+/// **Grouping**: When the impl is `DeviceCallable` and there's an
+/// active device unit from the previous commit, reuse that unit
+/// (same `__global__`, saving a launch). Non-DeviceCallable impls
+/// always get a fresh unit and clear the active device unit.
 /// Returns a snapshot of the keys that were added so the caller
 /// can roll them back on backtrack.
 fn commit_match(
@@ -399,11 +470,33 @@ fn commit_match(
     let saved_next_subgraph = state.next_subgraph;
     let saved_next_unit = state.next_unit;
     let saved_next_step = state.next_step;
+    let saved_active_device_unit = state.active_device_unit;
 
+    let imp = state.problem.library.get(impl_id);
     let sg = SubgraphId(state.next_subgraph);
     state.next_subgraph += 1;
-    let unit = CompilationUnitId(state.next_unit);
-    state.next_unit += 1;
+
+    // DeviceCallable impls join the active device unit if one exists;
+    // otherwise they start a new unit. Non-DeviceCallable impls always
+    // get a fresh unit and break the grouping chain.
+    let unit = if matches!(imp.launch_kind(), LaunchKind::DeviceCallable) {
+        if let Some(active) = state.active_device_unit {
+            // Reuse — no new unit allocated.
+            active
+        } else {
+            let u = CompilationUnitId(state.next_unit);
+            state.next_unit += 1;
+            state.active_device_unit = Some(u);
+            u
+        }
+    } else {
+        let u = CompilationUnitId(state.next_unit);
+        state.next_unit += 1;
+        // Break the grouping chain.
+        state.active_device_unit = None;
+        u
+    };
+
     let step = state.next_step;
     state.next_step += 1;
 
@@ -472,6 +565,7 @@ fn commit_match(
         saved_next_subgraph,
         saved_next_unit,
         saved_next_step,
+        saved_active_device_unit,
     }
 }
 
@@ -490,6 +584,7 @@ fn rollback(state: &mut SearchState<'_>, snap: CommitSnapshot) {
     state.next_subgraph = snap.saved_next_subgraph;
     state.next_unit = snap.saved_next_unit;
     state.next_step = snap.saved_next_step;
+    state.active_device_unit = snap.saved_active_device_unit;
 }
 
 /// Pick the cheapest handoff that's in both supported sets. For
@@ -526,11 +621,11 @@ mod tests {
         let profile = TargetProfile::l4_sm89();
         let problem = Problem::build(&tile_graph, &library, &profile);
 
-        let solver = BacktrackCpSolver;
+        let solver = BacktrackCpSolver::default();
         let result = solver.solve(&problem);
 
         let plan = match result {
-            SolveResult::Found(p) => p,
+            SolveResult::Found { best: p, .. } => p,
             SolveResult::Infeasible => panic!("solver reported infeasible"),
         };
 
@@ -572,10 +667,10 @@ mod tests {
         let profile = TargetProfile::l4_sm89();
         let problem = Problem::build(&tile_graph, &library, &profile);
 
-        let solver = BacktrackCpSolver;
+        let solver = BacktrackCpSolver::default();
         let result = solver.solve(&problem);
         let plan = match result {
-            SolveResult::Found(p) => p,
+            SolveResult::Found { best: p, .. } => p,
             SolveResult::Infeasible => panic!("infeasible"),
         };
 
@@ -614,16 +709,16 @@ mod tests {
         let decode = {
             let profile = TargetProfile::l4_sm89().with_seq_len(1);
             let problem = Problem::build(&tile_graph, &library, &profile);
-            match BacktrackCpSolver.solve(&problem) {
-                SolveResult::Found(p) => p,
+            match BacktrackCpSolver::default().solve(&problem) {
+                SolveResult::Found { best: p, .. } => p,
                 _ => panic!("infeasible"),
             }
         };
         let prefill = {
             let profile = TargetProfile::l4_sm89().with_seq_len(1024);
             let problem = Problem::build(&tile_graph, &library, &profile);
-            match BacktrackCpSolver.solve(&problem) {
-                SolveResult::Found(p) => p,
+            match BacktrackCpSolver::default().solve(&problem) {
+                SolveResult::Found { best: p, .. } => p,
                 _ => panic!("infeasible"),
             }
         };
@@ -811,8 +906,8 @@ mod tests {
             let profile = base.with_workload(bs, seq);
             let m = profile.num_tokens();
             let problem = Problem::build(&tg, &library, &profile);
-            let plan = match BacktrackCpSolver.solve(&problem) {
-                SolveResult::Found(p) => p,
+            let plan = match BacktrackCpSolver::default().solve(&problem) {
+                SolveResult::Found { best: p, .. } => p,
                 _ => {
                     eprintln!("{label:<20} │ {m:>4} │  INFEAS │");
                     continue;
@@ -835,7 +930,7 @@ mod tests {
             &tg,
             &library,
             &profile,
-            &BacktrackCpSolver,
+            &BacktrackCpSolver::default(),
             super::super::PlanFamily::DEFAULT_GRID,
         );
 

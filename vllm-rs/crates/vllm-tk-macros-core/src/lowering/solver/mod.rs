@@ -46,7 +46,12 @@ pub enum SolveResult {
     /// Solver found a feasible assignment. Optimal under the
     /// solver's search strategy (CP backtracking finds the
     /// minimum-cost solution at the search depth it explored).
-    Found(ExecutionPlan),
+    /// `alternatives` contains additional feasible plans ranked
+    /// by cost (cheapest first), excluding the best plan.
+    Found {
+        best: ExecutionPlan,
+        alternatives: Vec<ExecutionPlan>,
+    },
     /// No feasible assignment exists. Either the problem is
     /// over-constrained or the library is missing required
     /// implementations.
@@ -75,7 +80,7 @@ pub trait Solver {
 /// let family = PlanFamily::solve_grid(
 ///     &tile_graph, &library,
 ///     &TargetProfile::l4_sm89(),
-///     &BacktrackCpSolver,
+///     &BacktrackCpSolver::default(),
 /// );
 /// let plan = family.lookup(actual_seq_len);
 /// ```
@@ -105,7 +110,7 @@ impl PlanFamily {
             let profile = base_profile.with_seq_len(seq);
             let problem = Problem::build(tile_graph, library, &profile);
             match solver.solve(&problem) {
-                SolveResult::Found(plan) => plans.push((seq, plan)),
+                SolveResult::Found { best: plan, .. } => plans.push((seq, plan)),
                 SolveResult::Infeasible => {
                     // Skip infeasible seq_lens (shouldn't happen with
                     // a well-formed library).

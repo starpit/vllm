@@ -131,6 +131,12 @@ pub enum Handoff {
     /// Cheaper than InKernelGridSync because it can synchronize
     /// only the tiles that need it.
     GmemFlag,
+    /// `__syncthreads()` — intra-CTA barrier. Available on all
+    /// architectures (~0.3-0.5 µs). Used between DeviceCallable ops
+    /// within the same persistent kernel, especially on sm89 where
+    /// mbarrier isn't the primary intra-kernel mechanism. Data goes
+    /// through gmem (write → barrier → read), so it truncates.
+    SyncThreads,
     /// No handoff — both impls are claimed by the same subgraph
     /// (the implementation handles the dep internally).
     Internal,
@@ -156,6 +162,11 @@ impl Handoff {
                 .map(|c| c as f64)
                 .unwrap_or(f64::INFINITY),
             Handoff::GmemFlag => 0.5, // empirical sub-µs gmem-flag spin
+            Handoff::SyncThreads => profile
+                .lowering
+                .syncthreads_handoff_us
+                .map(|c| c as f64)
+                .unwrap_or(f64::INFINITY),
             Handoff::Internal => 0.0,
         }
     }
@@ -178,7 +189,8 @@ impl Handoff {
             | Handoff::StreamEvent
             | Handoff::KernelBoundary
             | Handoff::InKernelGridSync
-            | Handoff::GmemFlag => true,
+            | Handoff::GmemFlag
+            | Handoff::SyncThreads => true,
             // In-register / shmem handoffs: data stays in the
             // accumulator's wider dtype (f32 for bf16 tensor cores).
             Handoff::Internal | Handoff::Mbarrier | Handoff::DsmemRead => false,

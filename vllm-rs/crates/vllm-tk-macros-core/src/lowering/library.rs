@@ -93,7 +93,13 @@ impl ImplementationLibrary {
                 .expect("L40S cost CSV not found — run gpu_cost_sweep on L40S"),
             GpuCostTable::l4_sm89(), // elementwise/attention not yet in CSV; use L4 estimates scaled by SM ratio
         );
-        Self::sm89_starter_common(dims)
+        let mut lib = Self::sm89_starter_common(dims);
+        // DeviceCallable variants for persistent-kernel grouping.
+        // On sm89, uses __syncthreads() handoffs (not mbarrier).
+        // The solver groups ops when launch-overhead savings exceed
+        // the per-handoff cost (~0.5µs syncthreads vs ~3µs launch).
+        lib.add_device_callable_variants(dims);
+        lib
     }
 
     /// Construct the H100 sm_90 starter library. Same implementation
@@ -212,7 +218,7 @@ impl ImplementationLibrary {
         // DeviceCallable GEMM: use cuBLAS-equivalent costs from CSV.
         // The solver will pick these when grouping saves enough launch overhead.
         for &phase in &[
-            TileKind::GemmQkv,
+            TileKind::GemmQ,
             TileKind::GemmOProj,
             TileKind::GemmGate,
             TileKind::GemmUp,
@@ -255,7 +261,7 @@ impl ImplementationLibrary {
         self.entries.push(Box::new(TkAttentionPrefillImpl));
         // DeviceCallable GEMV (TK matvec for BS=1 decode).
         for &phase in &[
-            TileKind::GemmQkv,
+            TileKind::GemmQ,
             TileKind::GemmGate,
             TileKind::GemmUp,
             TileKind::GemmLmHead,
@@ -275,7 +281,7 @@ impl ImplementationLibrary {
             (128, 256, 3),
         ];
         for &phase in &[
-            TileKind::GemmQkv,
+            TileKind::GemmQ,
             TileKind::GemmOProj,
             TileKind::GemmGate,
             TileKind::GemmUp,
@@ -2148,7 +2154,7 @@ impl CutlassGemmImpl {
         dims: crate::lowering::tile_graph::ModelDims,
     ) -> Self {
         let phase_str = match phase {
-            TileKind::GemmQkv => "qkv",
+            TileKind::GemmQ => "qkv",
             TileKind::GemmOProj => "oproj",
             TileKind::GemmGate => "gate",
             TileKind::GemmUp => "up",
@@ -2186,7 +2192,7 @@ impl CutlassGemmImpl {
         dims: crate::lowering::tile_graph::ModelDims,
     ) -> Self {
         let phase_str = match phase {
-            TileKind::GemmQkv => "qkv",
+            TileKind::GemmQ => "qkv",
             TileKind::GemmOProj => "oproj",
             TileKind::GemmGate => "gate",
             TileKind::GemmUp => "up",
@@ -2320,7 +2326,7 @@ impl CutlassGemmImpl {
             for &(m, n, s, sk) in k64_splitk_tiles {
                 // k64 splitK: cost_key like "cutlass_64x64_k64_s4_sk2"
                 let phase_str = match phase {
-                    TileKind::GemmQkv => "qkv",
+                    TileKind::GemmQ => "qkv",
                     TileKind::GemmOProj => "oproj",
                     TileKind::GemmGate => "gate",
                     TileKind::GemmUp => "up",
@@ -2873,9 +2879,11 @@ impl Implementation for DeviceCallableWrapper {
         self.name
     }
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        profile.lowering.regs_dynamic_per_warpgroup
-            && profile.lowering.mbarrier_handoff_us.is_some()
-            && self.inner.target_compatible(profile)
+        // Need at least one intra-kernel handoff mechanism:
+        // mbarrier (sm90+) or __syncthreads() (all arches).
+        let has_intra_kernel_handoff = profile.lowering.mbarrier_handoff_us.is_some()
+            || profile.lowering.syncthreads_handoff_us.is_some();
+        has_intra_kernel_handoff && self.inner.target_compatible(profile)
     }
     fn workload_constraint(&self) -> WorkloadConstraint {
         self.inner.workload_constraint()
@@ -2898,16 +2906,23 @@ impl Implementation for DeviceCallableWrapper {
         LaunchKind::DeviceCallable
     }
     fn supported_input_handoffs(&self) -> &[Handoff] {
-        // Mbarrier for intra-megakernel handoffs (cheapest).
-        // StreamOrder for receiving from a preceding HostCallback
-        // (the persistent kernel reads gmem after the host call
-        // completes on the same stream).
-        &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder]
+        // Mbarrier (sm90+) or SyncThreads (all arches) for
+        // intra-megakernel handoffs. StreamOrder for receiving
+        // from a preceding HostCallback.
+        &[
+            Handoff::Mbarrier,
+            Handoff::SyncThreads,
+            Handoff::Internal,
+            Handoff::StreamOrder,
+        ]
     }
     fn supported_output_handoffs(&self) -> &[Handoff] {
-        // Mbarrier for intra-megakernel handoffs.
-        // StreamOrder for feeding a following HostCallback.
-        &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder]
+        &[
+            Handoff::Mbarrier,
+            Handoff::SyncThreads,
+            Handoff::Internal,
+            Handoff::StreamOrder,
+        ]
     }
     fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
         self.inner.input_layouts(m)

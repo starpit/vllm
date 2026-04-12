@@ -592,11 +592,12 @@ fn rollback(state: &mut SearchState<'_>, snap: CommitSnapshot) {
 /// every host-callback ↔ host-callback edge.
 fn pick_handoff(producer_out: &[Handoff], consumer_in: &[Handoff]) -> Option<Handoff> {
     // Preference order — cheapest first.
-    const PREFERENCES: [Handoff; 8] = [
+    const PREFERENCES: [Handoff; 9] = [
         Handoff::Internal,
         Handoff::StreamOrder,
         Handoff::GmemFlag,
         Handoff::Mbarrier,
+        Handoff::SyncThreads,
         Handoff::DsmemRead,
         Handoff::StreamEvent,
         Handoff::KernelBoundary,

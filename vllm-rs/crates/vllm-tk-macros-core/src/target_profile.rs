@@ -163,6 +163,12 @@ pub struct LoweringConstraints {
     /// keep producer outputs in cluster shmem instead of going via
     /// gmem.
     pub dsmem_cluster_handoff_us: Option<f32>,
+    /// Cost of a `__syncthreads()` intra-CTA barrier in µs. Available
+    /// on all architectures. Used for DeviceCallable intra-kernel
+    /// handoffs on sm89 where mbarrier isn't the primary mechanism.
+    /// On sm90+ this is also available but mbarrier is preferred
+    /// (cheaper, finer-grained).
+    pub syncthreads_handoff_us: Option<f32>,
     /// Whether the target supports tensor-memory (TMEM) accumulator
     /// offload (sm_100+). When true, the cutlass mainloop's MMA
     /// accumulators don't pressure the register file, lowering the
@@ -229,6 +235,10 @@ impl LoweringConstraints {
             regs_dynamic_per_warpgroup: false,
             mbarrier_handoff_us: None,
             dsmem_cluster_handoff_us: None,
+            // __syncthreads() within a CTA: ~0.5µs on sm89.
+            // This enables DeviceCallable grouping on Ada/Ampere
+            // where mbarrier-based handoffs aren't the primary path.
+            syncthreads_handoff_us: Some(0.5),
             tmem_accum_offload: false,
             max_regs_per_thread: 255,
             max_shmem_per_cta_bytes: 99 * 1024,
@@ -253,6 +263,7 @@ impl LoweringConstraints {
             regs_dynamic_per_warpgroup: false,
             mbarrier_handoff_us: None,
             dsmem_cluster_handoff_us: None,
+            syncthreads_handoff_us: Some(0.5),
             tmem_accum_offload: false,
             max_regs_per_thread: 255,
             max_shmem_per_cta_bytes: 99 * 1024,
@@ -304,7 +315,8 @@ impl LoweringConstraints {
             // going through global memory. ~1 µs for a 64 KiB tile.
             // TODO: measure precisely on H100.
             dsmem_cluster_handoff_us: Some(1.0),
-            tmem_accum_offload: false, // sm_100+ only
+            syncthreads_handoff_us: Some(0.3), // __syncthreads also available on sm90
+            tmem_accum_offload: false,         // sm_100+ only
             max_regs_per_thread: 255,
             // H100 supports 228 KiB dynamic shmem per CTA.
             max_shmem_per_cta_bytes: 228 * 1024,

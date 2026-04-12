@@ -374,6 +374,11 @@ impl Constraint {
                 {
                     return ConstraintStatus::Violated;
                 }
+                if matches!(handoff, Handoff::SyncThreads)
+                    && profile.lowering.syncthreads_handoff_us.is_none()
+                {
+                    return ConstraintStatus::Violated;
+                }
                 ConstraintStatus::Satisfied
             }
 

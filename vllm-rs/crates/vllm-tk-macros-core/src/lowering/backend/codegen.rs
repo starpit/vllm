@@ -248,10 +248,62 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         quote! {}
     };
 
+    let model_forward = if has_post_loop {
+        quote! {
+            impl Model {
+                /// Full forward: input_ids → logits.
+                ///
+                /// Runs the generated backbone (embed → layers → norm),
+                /// optionally gathers last-token hidden states, then
+                /// projects through lm_head via solver dispatch.
+                #[allow(clippy::too_many_arguments)]
+                pub unsafe fn forward(
+                    &self,
+                    input_ids: TensorView<'_>,
+                    positions: TensorView<'_>,
+                    slot_mapping: TensorView<'_>,
+                    cu_seqlens_q: TensorView<'_>,
+                    seqused_k: TensorView<'_>,
+                    block_table: TensorView<'_>,
+                    max_seqlen_q: usize,
+                    max_seqlen_k: usize,
+                    kv_cache: &KvCachePool,
+                    device: &mut GpuDevice,
+                    last_token_indices: Option<TensorView<'_>>,
+                ) -> OwnedTensor {
+                    let hs = solver_hidden_states(
+                        self, input_ids, positions, slot_mapping,
+                        cu_seqlens_q, seqused_k, block_table,
+                        max_seqlen_q, max_seqlen_k, kv_cache, device,
+                    );
+                    // Gather last-token hidden states (scheduler optimization).
+                    let hs = if let Some(indices) = last_token_indices {
+                        kernels::embedding_gather(
+                            hs.as_gpu_tensor(), *indices,
+                            &mut device.caching, device.compute_stream,
+                        )
+                    } else {
+                        hs
+                    };
+                    let num_tokens = hs.dim(0) as u32;
+                    let logits = solver_forward_lm_head(
+                        &self.lm_head, num_tokens, hs.view(), device,
+                    );
+                    drop(hs);
+                    logits
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         #struct_defs
 
         #model_load
+
+        #model_forward
 
         #model_hidden_states
 

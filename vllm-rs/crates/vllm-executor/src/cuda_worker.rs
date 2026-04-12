@@ -99,10 +99,7 @@ pub struct CudaWorkerConfig {
 enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
     /// Generated Llama forward — dense safetensors only.
-    LlamaSolver(
-        vllm_cuda::model::llama::Model,
-        vllm_cuda::layers::LinearLayer,
-    ),
+    LlamaSolver(vllm_cuda::model::llama::Model),
     Qwen2(vllm_cuda::model::qwen2::Qwen2ForCausalLM),
     Gemma2(vllm_cuda::model::gemma2::Gemma2ForCausalLM),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
@@ -119,7 +116,7 @@ impl CudaModel {
     fn num_layers(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers.len(),
-            Self::LlamaSolver(m, _) => m.layers.len(),
+            Self::LlamaSolver(m) => m.layers.len(),
             Self::Qwen2(m) => m.0.model.layers.len(),
             Self::Gemma2(m) => m.model.layers.len(),
             Self::Gemma3(m) => m.model.layers.len(),
@@ -138,7 +135,7 @@ impl CudaModel {
     fn num_kv_heads(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers[0].self_attn.num_kv_heads,
-            Self::LlamaSolver(m, _) => m.dims.num_kv_heads,
+            Self::LlamaSolver(m) => m.dims.num_kv_heads,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
@@ -155,7 +152,7 @@ impl CudaModel {
     fn head_dim(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers[0].self_attn.head_dim,
-            Self::LlamaSolver(m, _) => m.dims.head_dim,
+            Self::LlamaSolver(m) => m.dims.head_dim,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.head_dim,
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
             Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
@@ -172,7 +169,7 @@ impl CudaModel {
     fn vocab_size(&self) -> usize {
         match self {
             Self::Llama(m) => m.lm_head.out_features(),
-            Self::LlamaSolver(_, lm) => lm.out_features(),
+            Self::LlamaSolver(m) => m.lm_head.out_features(),
             Self::Qwen2(m) => m.0.lm_head.out_features(),
             Self::Gemma2(m) => m.lm_head.out_features(),
             Self::Gemma3(m) => m.lm_head.out_features(),
@@ -200,7 +197,7 @@ impl CudaModel {
     fn hidden_size(&self) -> usize {
         match self {
             Self::Llama(m) => m.lm_head.in_features(),
-            Self::LlamaSolver(_, lm) => lm.in_features(),
+            Self::LlamaSolver(m) => m.lm_head.in_features(),
             Self::Qwen2(m) => m.0.lm_head.in_features(),
             Self::Gemma2(m) => m.lm_head.in_features(),
             Self::Gemma3(m) => m.lm_head.in_features(),
@@ -266,7 +263,7 @@ impl CudaModel {
                     device,
                 )
             },
-            Self::LlamaSolver(m, _) => unsafe {
+            Self::LlamaSolver(m) => unsafe {
                 vllm_cuda::model::llama::solver_hidden_states(
                     m,
                     input_ids,
@@ -446,9 +443,8 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
-            Self::LlamaSolver(m, lm_head) => unsafe {
-                let hs = vllm_cuda::model::llama::solver_hidden_states(
-                    m,
+            Self::LlamaSolver(m) => unsafe {
+                m.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -459,24 +455,8 @@ impl CudaModel {
                     max_seqlen_k,
                     kv_cache,
                     device,
-                );
-                // Gather last-token hidden states before lm_head.
-                let hs = if let Some(indices) = last_token_indices {
-                    vllm_cuda::kernels::embedding_gather(
-                        hs.as_gpu_tensor(),
-                        *indices,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                } else {
-                    hs
-                };
-                let num_tokens = hs.dim(0) as u32;
-                let logits = vllm_cuda::model::llama::solver_forward_lm_head(
-                    lm_head, num_tokens, hs.view(), device,
-                );
-                drop(hs);
-                logits
+                    last_token_indices,
+                )
             },
             Self::Qwen2(m) => unsafe {
                 m.forward(
@@ -4996,11 +4976,11 @@ impl Worker for CudaWorker {
                     && !use_tp
                     && !use_pp
                 {
-                    let (model, lm_head) = unsafe {
+                    let (model, _lm_head) = unsafe {
                         vllm_cuda::model::llama::Model::load(&mut weights, &config, dtype, device)
                     }
                     .map_err(|e| ExecutorError::WorkerInit(format!("Llama load: {e}")))?;
-                    CudaModel::LlamaSolver(model, lm_head)
+                    CudaModel::LlamaSolver(model)
                 } else {
                     // Legacy quant/TP/PP paths.
                     let m = if qconfig.is_bnb4bit() {

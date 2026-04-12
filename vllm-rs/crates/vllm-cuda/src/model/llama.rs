@@ -1141,9 +1141,8 @@ impl LlamaForCausalLM {
         // Takes TensorView (borrow) — hidden_states stays alive until drop.
         let num_tokens = hidden_states.dim(0) as u32;
         #[allow(unused_mut)]
-        let mut logits = solver_forward_lm_head(
-            &self.lm_head, num_tokens, hidden_states.view(), device,
-        );
+        let mut logits =
+            solver_forward_lm_head(&self.lm_head, num_tokens, hidden_states.view(), device);
         drop(hidden_states);
 
         // TP: all-gather logits (column parallel lm_head).

@@ -237,13 +237,32 @@ just change the `models:` entries — the bias handling is automatic.
   Suppressed via `-A` flag.
 - CutlassNormGemmImpl: no backing kernel yet.
 - Binary still links libcublas.so.12 for non-Llama models.
-- Only Llama has a `forward!()` DSL. Qwen2 is next.
+- CUTLASS `stages=2` tile configs disabled (no compiled kernels in
+  `cutlass_standalone_gemm.cu`). Re-enable after adding instantiations.
+
+## DSL / lowering design debt
+
+The lowering introduces tiles that are kernel-API artifacts rather
+than mathematical operations. These should eventually be expressed in
+the DSL or eliminated:
+
+- **`QkvSplit`** — exists to split a fused QKV concatenated buffer.
+  But the DSL already has separate Q, K, V. The split is a fusion
+  artifact. When the codegen becomes data-flow-driven (variables
+  derived from the dispatch sequence, not hardcoded names), QkvSplit
+  becomes unnecessary.
+- **`GateUpConcat`** — the DSL says `gate * up` (element-wise multiply)
+  but the `silu_and_mul` kernel takes a concatenated `[gate|up]` input.
+  The concat is a kernel-API detail, not math.
+- **`KvCacheWrite`** — a side effect (writing to the paged KV cache)
+  not expressed in the DSL.
+- **Codegen variable names** (`qkv_out`, `q_out`, `k_out`, etc.) are
+  hardcoded in `emit_entry()`. They should be derived from the dispatch
+  sequence's data flow so the codegen is purely mechanical.
 
 ## What's next (priority order)
 
-1. **Qwen2 `forward!()`** — same DSL body as Llama, `qkv_bias: true`
-   in models entries. BiasAdd infrastructure already exists. Should be
-   minimal work.
+1. **H100 megakernel for Qwen2** — see detailed TODO below.
 
 2. **Other architectures** — each needs its own DSL body + any new
    op/tile kinds. MoE, sliding window, etc.
@@ -253,11 +272,119 @@ just change the `models:` entries — the bias handling is automatic.
 
 4. **TP tiles** — `TileKind::AllReduce` after OProj and Down.
 
-5. **Multi-GPU cost CSVs** — run `gpu_cost_sweep` on A100, H100.
+5. **CUTLASS bias epilogue** — instantiate CUTLASS GEMM templates with
+   `LinearCombinationBias` epilogue in `cutlass_standalone_gemm.cu`.
+   Register `CutlassFusedQkvGemmWithBiasImpl` so the solver has a
+   CUTLASS option for fused QKV+bias (competes with cuBLAS at certain
+   M values).
 
 6. **Cleanup** — remove `Model::load` returning separate lm_head,
    remove legacy `from_llama` bridge if still present, remove
    `_num_tokens` in legacy `LlamaModel::forward`.
+
+## TODO: H100 megakernel for Qwen2 (separate Q/K/V rope path)
+
+### Problem
+
+Qwen2 has `bias_add` after Q/K/V GEMMs. On sm89, the solver picks
+`CublasFusedQkvGemmWithBiasImpl` (host-callback, 1 cuBLAS call, fused
+QKV+bias → concatenated output). The existing `FusedQkvRopeCache` impl
+reads from this concatenated buffer. This works but is host-callback
+only — no megakernel benefit.
+
+On H100, the megakernel wants device-callable ops. The ideal plan:
+3 separate device-callable CUTLASS GEMMs (Q, K, V) + 3 device-callable
+`bias_add_inplace` + device-callable rope on separate Q/K + device-
+callable KV cache write + TkAttention. All inside one persistent kernel.
+
+### What exists
+
+- **TkAttentionDecodeImpl / TkAttentionPrefillImpl** — device-callable
+  attention, sm90+, in `library.rs`. Already work with separate Q input
+  (reads from `qkv_out` after rope).
+- **`rotary_embedding_inplace(q, k, ...)`** — CUDA kernel in
+  `kernels.rs` line 1784. Takes separate Q and K tensors, applies RoPE
+  in-place. Exists and works.
+- **`write_kv_cache`** — CUDA helper in `model/attention_helpers.rs`.
+  Writes separate K, V tensors to the paged cache.
+- **DeviceCallable CUTLASS GEMMs** — already registered per-phase in
+  `add_device_callable_variants()`.
+
+### What's missing
+
+1. **Separate-input rope Implementation** — a new impl (e.g.
+   `SeparateQkvRopeCacheImpl`) that claims `{QkvSplit, Rope,
+   KvCacheWrite}` and matches when QkvSplit's deps are 3 different
+   tiles (meaning upstream GEMMs are unfused/separate). The existing
+   `VllmRsFusedQkvRopeCacheImpl` should add the inverse check (deps
+   all point to the same tile = fused QKV).
+
+   Two variants needed:
+   - Decode (seq_len ≤ 1): call `rotary_embedding_inplace` on Q+K,
+     `write_kv_cache` for K/V, store Q → `qkv_out`.
+   - Prefill (seq_len > 1): same kernel calls but prefill shapes.
+
+2. **DeviceCallable wrapper for the new rope impl** — wrap it with
+   `DeviceCallableWrapper` and register in `add_device_callable_variants()`.
+
+3. **New `ImplDispatchKind` variants** — `SeparateQkvRopeCache` and
+   `SeparateQkvPrefillRopeCache` in `dispatch.rs`.
+
+4. **Codegen for the new dispatch kinds** — in `emit_entry()` in
+   `codegen.rs`:
+   ```rust
+   ImplDispatchKind::SeparateQkvRopeCache => Some(quote! {{
+       let __q = q_out.take().unwrap();
+       let __k = k_out.take().unwrap();
+       let __v = v_out.take().unwrap();
+       let __nt = __q.as_gpu_tensor().dim(0);
+       kernels::rotary_embedding_inplace(
+           __q.as_gpu_tensor().reshape(&[__nt, dims.q_size]),
+           __k.as_gpu_tensor().reshape(&[__nt, dims.kv_size]),
+           *positions, rotary.cos_sin_cache,
+           dims.head_dim, device.compute_stream,
+       );
+       crate::model::attention_helpers::write_kv_cache(
+           __k.view(), __v.view(), slot_mapping,
+           kv_cache, layer_idx, device.compute_stream,
+       );
+       drop(__k); drop(__v);
+       qkv_out = Some(__q);  // downstream attention reads from qkv_out
+   }}),
+   ```
+   The prefill variant is identical (same kernel calls, different
+   shapes are handled by the kernels themselves). After rope, Q goes
+   into `qkv_out` so `FlashInferAttention` / `TkAttention` work
+   unchanged.
+
+5. **DeviceCallable `bias_add_inplace`** — wrap `StandaloneBiasAddImpl`
+   with `DeviceCallableWrapper` so the bias add can run inside the
+   megakernel. Currently not registered in `add_device_callable_variants()`.
+
+### Variable plumbing note
+
+The bucket function declares `q_out: Option<OwnedTensor>` (added in
+this PR). Unfused Q GEMM stores into `q_out` via `gemm_operands
+(GemmPhase::Q)`. The new rope codegen reads from `q_out`/`k_out`/
+`v_out` and stores post-rope Q into `qkv_out`. This converges with
+the fused path — downstream attention always reads from `qkv_out`.
+
+### How to test
+
+After implementing, the solver should pick the separate path on H100
+(device-callable ops have zero launch overhead, so 3 CUTLASS GEMMs +
+3 bias_add + separate rope beats 1 fused cuBLAS call because CUTLASS
+tiles can overlap with attention in the megakernel pipeline).
+
+```bash
+# Verify solver picks separate path on H100:
+cargo test -p vllm-tk-macros-core "h100_sm90_plan_family"
+
+# Correctness:
+cargo build -p vllm-cli --features cuda --release
+timeout 60 target/release/vllm chat -m Qwen/Qwen2.5-0.5B-Instruct \
+  --prompt "The capital of France is" --max-tokens 20
+```
 
 ## How to run
 
@@ -269,8 +396,12 @@ cargo test -p vllm-tk-macros-core
 cargo test -p vllm-e2e --features e2e,cuda --release --test e_correctness \
   -- --ignored --test-threads=1
 
-# Build + chat test:
+# Build + chat test (Llama):
 cargo build -p vllm-cli --features cuda --release
 timeout 60 target/release/vllm chat -m unsloth/Llama-3.2-1B-Instruct \
+  --prompt "The capital of France is" --max-tokens 20
+
+# Build + chat test (Qwen2):
+timeout 60 target/release/vllm chat -m Qwen/Qwen2.5-0.5B-Instruct \
   --prompt "The capital of France is" --max-tokens 20
 ```

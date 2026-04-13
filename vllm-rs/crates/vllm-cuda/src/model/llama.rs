@@ -3999,7 +3999,14 @@ vllm_tk_macros::forward! {
     logits = gemm(hidden_states, lm_head);
 
     models: [
+        // Llama 3.2 3B (first — used by the solver until `models: runtime` lands)
         { layers: 28, hidden: 3072, intermediate: 8192, heads: 24, kv_heads: 8, head_dim: 128, vocab: 128256 },
+        // Llama 3.2 1B
+        { layers: 16, hidden: 2048, intermediate: 8192, heads: 32, kv_heads: 8, head_dim: 64, vocab: 128256 },
+        // Llama 3.1 8B
+        { layers: 32, hidden: 4096, intermediate: 14336, heads: 32, kv_heads: 8, head_dim: 128, vocab: 128256 },
+        // Llama 3.1 70B
+        { layers: 80, hidden: 8192, intermediate: 28672, heads: 64, kv_heads: 8, head_dim: 128, vocab: 128256 },
     ],
     target: l4_sm89,
     workloads: [1..4096],

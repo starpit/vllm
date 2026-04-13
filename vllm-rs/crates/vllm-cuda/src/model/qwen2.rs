@@ -293,7 +293,20 @@ vllm_tk_macros::forward! {
     logits = gemm(hidden_states, lm_head);
 
     models: [
+        // Qwen2.5 0.5B
         { layers: 24, hidden: 896, intermediate: 4864, heads: 14, kv_heads: 2, head_dim: 64, vocab: 151936 },
+        // Qwen2.5 1.5B
+        { layers: 28, hidden: 1536, intermediate: 8960, heads: 12, kv_heads: 2, head_dim: 128, vocab: 151936 },
+        // Qwen2.5 3B
+        { layers: 36, hidden: 2048, intermediate: 11008, heads: 16, kv_heads: 2, head_dim: 128, vocab: 151936 },
+        // Qwen2.5 7B
+        { layers: 28, hidden: 3584, intermediate: 18944, heads: 28, kv_heads: 4, head_dim: 128, vocab: 151936 },
+        // Qwen2.5 14B
+        { layers: 48, hidden: 5120, intermediate: 13824, heads: 40, kv_heads: 8, head_dim: 128, vocab: 152064 },
+        // Qwen2.5 32B
+        { layers: 64, hidden: 5120, intermediate: 27648, heads: 40, kv_heads: 8, head_dim: 128, vocab: 152064 },
+        // Qwen2.5 72B
+        { layers: 80, hidden: 8192, intermediate: 29568, heads: 64, kv_heads: 8, head_dim: 128, vocab: 152064 },
     ],
     target: l4_sm89,
     workloads: [1..4096],

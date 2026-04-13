@@ -63,12 +63,8 @@ fn emit_tile(
         quote! { #v }
     };
 
-    // Noop tiles (ResidualAdd claimed as passthrough, QkvSplit, etc.)
-    if imp_name == "residual_add" || imp_name == "qkv_split_free" || imp_name == "kv_cache_write" {
-        // For ResidualAdd: the output IS the dep that carries the value.
-        // The codegen just aliases: let t42 = t41;
-        // But actually, residual adds need real addition in the general case.
-        // For now, skip — these are noops handled by the fused norm/GEMM impls.
+    // Noop tiles (QkvSplit, KvCacheWrite — logically free passthroughs).
+    if imp_name == "qkv_split_free" || imp_name == "kv_cache_write" {
         return None;
     }
 

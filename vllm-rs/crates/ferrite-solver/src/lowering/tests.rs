@@ -686,3 +686,130 @@ fn fuf_codegen_emits_tile_vars() {
     // Should have the lm_head at the end
     assert!(source.contains("lm_head"), "missing lm_head");
 }
+
+#[test]
+fn generate_fuf_produces_bucket_dispatch() {
+    use crate::lowering::backend::codegen::generate_fuf;
+    use crate::lowering::backend::compile_dsl::ForwardDef;
+
+    let tokens: proc_macro2::TokenStream = r#"
+        hidden_states = embed(input_ids, embed_tokens);
+        for layer in 0..NL {
+            let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+            let q = gemm(normed, self_attn.q_proj[layer]);
+            let k = gemm(normed, self_attn.k_proj[layer]);
+            let v = gemm(normed, self_attn.v_proj[layer]);
+            let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+            let attn = attention(q, k, v, kv_cache[layer], block_table);
+            let oproj = gemm(attn, self_attn.o_proj[layer]);
+            hidden_states = add(oproj, hidden_states);
+
+            let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+            let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+            let up = gemm(normed2, mlp.up_proj[layer]);
+            let down = gemm(gate * up, mlp.down_proj[layer]);
+            hidden_states = add(down, hidden_states);
+        }
+        hidden_states = rmsnorm(hidden_states, norm);
+        logits = gemm(hidden_states, lm_head);
+
+        models: [
+            { layers: 2, hidden: 2048, intermediate: 8192, heads: 32, kv_heads: 8, head_dim: 64, vocab: 128256 },
+        ],
+        target: l4_sm89,
+        workloads: [1..128],
+    "#
+    .parse()
+    .unwrap();
+    let def: ForwardDef = syn::parse2(tokens).unwrap();
+    let source = generate_fuf(&def).to_string();
+
+    eprintln!("generate_fuf output ({} chars)", source.len());
+
+    // Should have the fuf_forward dispatcher.
+    assert!(
+        source.contains("fuf_forward"),
+        "missing fuf_forward function"
+    );
+    // Should have bucket functions.
+    assert!(source.contains("fuf_bucket_0"), "missing fuf_bucket_0");
+    // Should have tile variables.
+    assert!(source.contains("let t0"), "missing tile variables");
+    // Should reference per-layer weights.
+    assert!(
+        source.contains("model . layers"),
+        "missing per-layer weight access"
+    );
+    // Should have embedding_gather.
+    assert!(
+        source.contains("embedding_gather"),
+        "missing embedding_gather"
+    );
+}
+
+#[test]
+fn generate_fuf_gemma2() {
+    use crate::lowering::backend::codegen::generate_fuf;
+    use crate::lowering::backend::compile_dsl::ForwardDef;
+
+    let tokens: proc_macro2::TokenStream = r#"
+        hidden_states = embed(input_ids, embed_tokens);
+        for layer in 0..NL {
+            let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+            let q = gemm(normed, self_attn.q_proj[layer]);
+            let k = gemm(normed, self_attn.k_proj[layer]);
+            let v = gemm(normed, self_attn.v_proj[layer]);
+            let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+            let attn = attention(q, k, v, kv_cache[layer], block_table);
+            let attn_out = gemm(attn, self_attn.o_proj[layer]);
+            let attn_normed = rmsnorm(attn_out, post_attention_layernorm[layer]);
+            hidden_states = add(attn_normed, hidden_states);
+            let ff_normed = rmsnorm(hidden_states, pre_feedforward_layernorm[layer]);
+            let gate = silu(gemm(ff_normed, mlp.gate_proj[layer]));
+            let up = gemm(ff_normed, mlp.up_proj[layer]);
+            let mlp_out = gemm(gate * up, mlp.down_proj[layer]);
+            hidden_states = rmsnorm(mlp_out, post_feedforward_layernorm[layer]);
+        }
+        logits = gemm(hidden_states, lm_head);
+
+        models: [
+            { layers: 2, hidden: 2304, intermediate: 9216, heads: 8, kv_heads: 4, head_dim: 256, vocab: 256000 },
+        ],
+        target: l4_sm89,
+        workloads: [1..128],
+    "#
+    .parse()
+    .unwrap();
+    let def: ForwardDef = syn::parse2(tokens).unwrap();
+    let source = generate_fuf(&def).to_string();
+
+    eprintln!("Gemma2 FUF output ({} chars)", source.len());
+
+    // Should have all 4 norm weight fields.
+    assert!(
+        source.contains("input_layernorm"),
+        "missing input_layernorm"
+    );
+    assert!(
+        source.contains("post_attention_layernorm"),
+        "missing post_attention_layernorm"
+    );
+    assert!(
+        source.contains("pre_feedforward_layernorm"),
+        "missing pre_feedforward_layernorm"
+    );
+    assert!(
+        source.contains("post_feedforward_layernorm"),
+        "missing post_feedforward_layernorm"
+    );
+    // Should have the fuf_forward dispatcher.
+    assert!(source.contains("fuf_forward"), "missing fuf_forward");
+    // No hardcoded model.norm (Gemma2 has no post-loop norm).
+    // The lm_head should be present.
+    assert!(source.contains("lm_head"), "missing lm_head");
+    // Should have residual add (from explicit add() in DSL).
+    assert!(
+        source.contains("add_inplace"),
+        "missing add_inplace for residual"
+    );
+}

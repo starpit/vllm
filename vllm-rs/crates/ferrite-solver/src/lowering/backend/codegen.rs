@@ -25,6 +25,113 @@ pub fn generate(def: &ForwardDef) -> TokenStream {
     }
 }
 
+/// FUF-based code generation. Builds the Fully Unrolled Forward,
+/// solves with the DP solver, and emits tile-graph-driven code.
+///
+/// This is the new path that replaces the layer-based codegen for
+/// architectures beyond LLaMA (Gemma2, etc.). It produces a
+/// `Model::forward_fuf` method alongside the existing codegen output.
+pub fn generate_fuf(def: &ForwardDef) -> TokenStream {
+    use super::fuf_codegen::generate_fuf_forward;
+    use crate::lowering::solver::Solver;
+    use crate::lowering::solver::dp::DpSolver;
+
+    let models = def.models.as_static().unwrap();
+    if models.is_empty() {
+        return quote! {};
+    }
+    let model = &models[0];
+    let target_id = def.target.as_static().unwrap();
+    let profile = build_profile(target_id);
+    let grid = match &def.workloads {
+        Some(wl) => build_solve_grid(wl),
+        None => PlanFamily::DEFAULT_GRID.to_vec(),
+    };
+
+    // Build the FUF tile graph.
+    let fuf = TileGraph::build_fuf(&def.dag, model.dims);
+    let library = build_library(target_id, model.dims);
+
+    // Solve each workload bucket with the DP solver on the FUF.
+    let mut bucket_fns = Vec::new();
+    let mut match_arms = Vec::new();
+    let mut prev_upper = 0u32;
+
+    for (i, &seq) in grid.iter().enumerate() {
+        let bucket_profile = profile.with_seq_len(seq);
+        let problem = crate::lowering::problem::Problem::build(&fuf, &library, &bucket_profile);
+        let result = DpSolver.solve(&problem);
+        let plan = match result {
+            crate::lowering::solver::SolveResult::Found { best, .. } => best,
+            crate::lowering::solver::SolveResult::Infeasible => continue,
+        };
+
+        let fn_name = format_ident!("fuf_bucket_{}", i);
+        let body = generate_fuf_forward(&fuf, &plan.assignment, &library);
+
+        bucket_fns.push(quote! {
+            #[allow(unused_variables, unused_mut, unused_assignments)]
+            #[inline(never)]
+            unsafe fn #fn_name(
+                model: &Model,
+                input_ids: TensorView<'_>,
+                positions: TensorView<'_>,
+                slot_mapping: TensorView<'_>,
+                cu_seqlens_q: TensorView<'_>,
+                seqused_k: TensorView<'_>,
+                block_table: TensorView<'_>,
+                max_seqlen_q: usize,
+                max_seqlen_k: usize,
+                kv_cache: &KvCachePool,
+                device: &mut GpuDevice,
+            ) -> OwnedTensor {
+                #body
+            }
+        });
+
+        let upper = if i + 1 < grid.len() {
+            (seq + grid[i + 1]) / 2
+        } else {
+            u32::MAX
+        };
+        let lower = prev_upper;
+        match_arms.push(quote! {
+            #lower ..= #upper => #fn_name(
+                model, input_ids, positions, slot_mapping,
+                cu_seqlens_q, seqused_k, block_table,
+                max_seqlen_q, max_seqlen_k, kv_cache, device,
+            ),
+        });
+        prev_upper = upper.saturating_add(1);
+    }
+
+    quote! {
+        /// FUF-generated forward: input_ids → logits.
+        /// Each bucket contains the fully unrolled forward for that
+        /// workload's optimal impl assignment.
+        pub unsafe fn fuf_forward(
+            model: &Model,
+            input_ids: TensorView<'_>,
+            positions: TensorView<'_>,
+            slot_mapping: TensorView<'_>,
+            cu_seqlens_q: TensorView<'_>,
+            seqused_k: TensorView<'_>,
+            block_table: TensorView<'_>,
+            max_seqlen_q: usize,
+            max_seqlen_k: usize,
+            kv_cache: &KvCachePool,
+            device: &mut GpuDevice,
+        ) -> OwnedTensor {
+            let num_tokens = (*input_ids).dim(0) as u32;
+            match num_tokens {
+                #(#match_arms)*
+            }
+        }
+
+        #(#bucket_fns)*
+    }
+}
+
 /// Per-model solved data: everything the codegen needs to emit one
 /// model variant's structs, loader, and dispatch functions.
 struct SolvedModel {

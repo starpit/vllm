@@ -1137,12 +1137,10 @@ impl LlamaForCausalLM {
         } else {
             hidden_states
         };
-        // Solver-dispatched lm_head (CUTLASS or cuBLAS per solver).
-        // Takes TensorView (borrow) — hidden_states stays alive until drop.
-        let num_tokens = hidden_states.dim(0) as u32;
+        // cuBLAS lm_head projection.
         #[allow(unused_mut)]
         let mut logits =
-            solver_forward_lm_head(&self.lm_head, num_tokens, hidden_states.view(), device);
+            self.lm_head.forward(hidden_states.view(), &mut device.cublas, &mut device.caching, device.compute_stream);
         drop(hidden_states);
 
         // TP: all-gather logits (column parallel lm_head).

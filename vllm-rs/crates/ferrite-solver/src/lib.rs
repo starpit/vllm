@@ -20,6 +20,7 @@ pub mod cfg;
 pub mod cfg_analysis;
 pub mod cpu_golden;
 pub mod dag;
+pub mod fuf;
 pub mod lowering;
 pub mod parse;
 pub mod target_profile;

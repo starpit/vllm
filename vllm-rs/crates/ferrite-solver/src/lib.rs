@@ -17,6 +17,7 @@
     clippy::useless_vec
 )]
 pub mod cfg;
+pub mod cfg_analysis;
 pub mod cpu_golden;
 pub mod dag;
 pub mod lowering;

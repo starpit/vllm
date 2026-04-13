@@ -99,10 +99,10 @@ pub struct CudaWorkerConfig {
 enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
     /// Generated Llama forward — dense safetensors only.
-    LlamaSolver(vllm_cuda::model::llama::Model),
+    LlamaSolver(ferrite_models::llama::Model),
     Qwen2(vllm_cuda::model::qwen2::Qwen2ForCausalLM),
     /// Generated Qwen2 forward — dense safetensors only.
-    Qwen2Solver(vllm_cuda::model::qwen2::Model),
+    Qwen2Solver(ferrite_models::qwen2::Model),
     Gemma2(vllm_cuda::model::gemma2::Gemma2ForCausalLM),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
     Mixtral(vllm_cuda::model::mixtral::MixtralForCausalLM),
@@ -271,7 +271,7 @@ impl CudaModel {
                 )
             },
             Self::LlamaSolver(m) => unsafe {
-                vllm_cuda::model::llama::solver_hidden_states(
+                ferrite_models::llama::solver_hidden_states(
                     m,
                     input_ids,
                     positions,
@@ -286,7 +286,7 @@ impl CudaModel {
                 )
             },
             Self::Qwen2Solver(m) => unsafe {
-                vllm_cuda::model::qwen2::solver_hidden_states(
+                ferrite_models::qwen2::solver_hidden_states(
                     m,
                     input_ids,
                     positions,
@@ -5014,7 +5014,7 @@ impl Worker for CudaWorker {
                     && !use_pp
                 {
                     let (model, _lm_head) = unsafe {
-                        vllm_cuda::model::llama::Model::load(&mut weights, &config, dtype, device)
+                        ferrite_models::llama::Model::load(&mut weights, &config, dtype, device)
                     }
                     .map_err(|e| ExecutorError::WorkerInit(format!("Llama load: {e}")))?;
                     CudaModel::LlamaSolver(model)
@@ -5133,7 +5133,7 @@ impl Worker for CudaWorker {
                     && !use_pp
                 {
                     let (model, _lm_head) = unsafe {
-                        vllm_cuda::model::qwen2::Model::load(
+                        ferrite_models::qwen2::Model::load(
                             &mut weights,
                             &qwen2_config.0,
                             dtype,

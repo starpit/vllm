@@ -7778,6 +7778,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "cudarc",
+ "ferrite-models",
  "half",
  "hf-hub",
  "indicatif 0.17.11",

@@ -668,6 +668,32 @@ fn process_call(
             );
             Ok((out_id, input_shape))
         }
+        "bias_add" => {
+            // bias_add(input, bias_weights) -> output (same shape as input)
+            let (input_id, input_shape) = resolve_arg(dag, ctx, &call.args[0], in_loop)?;
+            let (bias_id, _) = resolve_arg(dag, ctx, &call.args[1], in_loop)?;
+            let out_name = ctx.fresh_name("bias_add");
+            let out_shape = input_shape.clone();
+            let out_id = BufferId(out_name);
+            dag.add_buffer(Buffer {
+                id: out_id.clone(),
+                kind: BufferKind::Activation,
+                shape: out_shape.clone(),
+                producer: None,
+                consumers: vec![],
+                per_layer: in_loop,
+                is_input: false,
+            });
+            dag.add_op(
+                OpKind::BiasAdd {
+                    input: input_id,
+                    bias: bias_id,
+                    output: out_id.clone(),
+                },
+                in_loop,
+            );
+            Ok((out_id, out_shape))
+        }
         other => Err(format!("unknown op: {other}")),
     }
 }
@@ -790,6 +816,26 @@ fn infer_external_buffer(name: &str, ctx: &BuildCtx) -> (BufferKind, TensorShape
         ),
         "lm_head" | "lm_head_weights" => {
             (BufferKind::Weight, TensorShape::matrix(ctx.vs(), ctx.hd()))
+        }
+        // Bias vectors: self_attn.q_proj.bias, self_attn.k_proj.bias, etc.
+        // Shape is [out_features] — a 1-D weight vector.
+        n if n.ends_with(".bias") => {
+            // Infer the bias dimension from the parent projection name.
+            let parent = &n[..n.len() - ".bias".len()];
+            let nah = ctx.params.get("NAH").copied().unwrap_or(32);
+            let nkh = ctx.params.get("NKH").copied().unwrap_or(8);
+            let hdm = ctx.params.get("HDM").copied().unwrap_or(64);
+            let dim = if parent.contains("q_proj") {
+                Dim::Lit(nah * hdm)
+            } else if parent.contains("k_proj") || parent.contains("v_proj") {
+                Dim::Lit(nkh * hdm)
+            } else if parent.contains("gate_proj") || parent.contains("up_proj") {
+                ctx.id()
+            } else {
+                // o_proj, down_proj, and anything else: hidden dim.
+                ctx.hd()
+            };
+            (BufferKind::Weight, TensorShape { dims: vec![dim] })
         }
         // Q/K/V projections: self_attn.q_proj, self_attn.k_proj, self_attn.v_proj
         n if n.contains("q_proj") || n.contains("k_proj") || n.contains("v_proj") => {

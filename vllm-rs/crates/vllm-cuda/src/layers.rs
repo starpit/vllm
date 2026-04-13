@@ -495,6 +495,16 @@ impl LinearLayer {
         }
     }
 
+    /// Access the bias tensor from a dense layer. Returns the bias
+    /// `GpuTensor` or `None` if the layer has no bias. Panics on
+    /// quantized variants — solver only supports dense bf16.
+    pub fn dense_bias(&self) -> Option<crate::tensor::GpuTensor> {
+        match self {
+            Self::Dense(l) => l.bias,
+            _ => panic!("dense_bias() called on quantized LinearLayer"),
+        }
+    }
+
     /// Cheap copy for dense layers (GpuTensor metadata only, no weight copy).
     /// Panics on quantized variants — solver only supports dense bf16.
     pub fn shallow_clone(&self) -> Self {

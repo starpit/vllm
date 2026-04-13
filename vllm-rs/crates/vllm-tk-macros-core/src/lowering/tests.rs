@@ -256,12 +256,12 @@ fn dispatch_sequence_plan_family_format() {
     use crate::lowering::solver::PlanFamily;
 
     let tile_graph = TileGraph::build_llama_forward_1b(1);
-    let library = ImplementationLibrary::l4_sm89_starter_default();
+    let mut library = ImplementationLibrary::l4_sm89_starter_default();
     let profile = TargetProfile::l4_sm89();
 
     let family = PlanFamily::solve_grid(
         &tile_graph,
-        &library,
+        &mut library,
         &profile,
         &BacktrackCpSolver::default(),
         &[1, 32, 128, 1024],
@@ -283,12 +283,12 @@ fn h100_sm90_plan_family() {
     use crate::lowering::solver::PlanFamily;
 
     let tile_graph = TileGraph::build_llama_forward_1b(1);
-    let library = ImplementationLibrary::h100_sm90_starter_default();
+    let mut library = ImplementationLibrary::h100_sm90_starter_default();
     let profile = TargetProfile::h100_sm90();
 
     let family = PlanFamily::solve_grid(
         &tile_graph,
-        &library,
+        &mut library,
         &profile,
         &BacktrackCpSolver::default(),
         &[1, 32, 128, 1024],
@@ -307,14 +307,14 @@ fn l40s_sm89_plan_family() {
     use crate::lowering::solver::PlanFamily;
 
     let tile_graph = TileGraph::build_llama_forward_1b(1);
-    let library = ImplementationLibrary::l40s_sm89_starter(
+    let mut library = ImplementationLibrary::l40s_sm89_starter(
         crate::lowering::tile_graph::ModelDims::LLAMA_3_2_1B,
     );
     let profile = TargetProfile::l40s_sm89();
 
     let family = PlanFamily::solve_grid(
         &tile_graph,
-        &library,
+        &mut library,
         &profile,
         &BacktrackCpSolver::default(),
         &[1, 32, 128, 1024],

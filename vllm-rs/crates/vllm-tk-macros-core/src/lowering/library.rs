@@ -75,6 +75,99 @@ use crate::target_profile::TargetProfile;
 /// lowering solver.
 pub struct ImplementationLibrary {
     pub entries: Vec<Box<dyn Implementation>>,
+    /// When set, the solver only considers entries at these indices.
+    /// Used by `pruned_for_workload` to pre-select the cheapest
+    /// CUTLASS config per GEMM phase, reducing solver branching from
+    /// ~60 CUTLASS configs per tile to ~1.
+    pub active_indices: Option<Vec<usize>>,
+}
+
+impl ImplementationLibrary {
+    /// Return the entries the solver should iterate over: either the
+    /// active subset (if pruned) or all entries.
+    pub fn active_entries(&self) -> Vec<(usize, &dyn Implementation)> {
+        match &self.active_indices {
+            Some(indices) => indices
+                .iter()
+                .map(|&i| (i, self.entries[i].as_ref()))
+                .collect(),
+            None => self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i, e.as_ref()))
+                .collect(),
+        }
+    }
+
+    /// Pre-select the cheapest CUTLASS config per GEMM phase for the
+    /// given workload, returning a library view that only exposes those
+    /// winners plus all non-CUTLASS impls. This reduces the solver's
+    /// branching factor from ~60 CUTLASS configs per GEMM tile to ~1.
+    pub fn pruned_for_workload(&mut self, tile_graph: &TileGraph, profile: &TargetProfile) {
+        use std::collections::HashMap;
+
+        let num_tokens = profile.num_tokens();
+
+        // Find one representative seed tile per GEMM phase.
+        let mut phase_seeds: HashMap<TileKind, TileId> = HashMap::new();
+        for node in tile_graph.iter_topo() {
+            if node.kind.is_gemm() && !phase_seeds.contains_key(&node.kind) {
+                phase_seeds.insert(node.kind, node.id);
+            }
+        }
+
+        // For each GEMM phase, find the cheapest single-tile CUTLASS impl.
+        // Key: TileKind, Value: (entry index, cost).
+        let mut best_cutlass: HashMap<TileKind, (usize, f64)> = HashMap::new();
+
+        for (idx, imp) in self.entries.iter().enumerate() {
+            if !imp.name().starts_with("cutlass_") {
+                continue;
+            }
+            if !imp.target_compatible(profile) {
+                continue;
+            }
+            if !imp.workload_constraint().accepts(num_tokens) {
+                continue;
+            }
+            for (&kind, &seed) in &phase_seeds {
+                if let Some(m) = imp.matches(tile_graph, seed, profile)
+                    && m.claimed_tiles.len() == 1
+                {
+                    let cost = imp.cost_us(&m, profile);
+                    let entry = best_cutlass.entry(kind).or_insert((idx, f64::INFINITY));
+                    if cost < entry.1 {
+                        *entry = (idx, cost);
+                    }
+                }
+            }
+        }
+
+        let winner_set: std::collections::HashSet<usize> =
+            best_cutlass.values().map(|(idx, _)| *idx).collect();
+
+        let mut indices = Vec::new();
+        for (idx, imp) in self.entries.iter().enumerate() {
+            let name = imp.name();
+            if name.starts_with("cutlass_")
+                && !winner_set.contains(&idx)
+                && !name.contains("_residual")
+                && !name.contains("_bias")
+            {
+                // Non-winning single-tile CUTLASS config — skip.
+                continue;
+            }
+            indices.push(idx);
+        }
+
+        self.active_indices = Some(indices);
+    }
+
+    /// Clear the active indices filter.
+    pub fn clear_pruning(&mut self) {
+        self.active_indices = None;
+    }
 }
 
 impl ImplementationLibrary {
@@ -152,10 +245,15 @@ impl ImplementationLibrary {
             // Claims {GemmQ, GemmK, GemmV} as one 3-tile subgraph.
             // Listed before individual Q/K/V so the solver prefers it.
             Box::new(CublasFusedQkvGemmImpl),
+            // ── Fused QKV GEMM + bias ──
+            // Claims all 6 tiles {GemmQ, BiasAdd, GemmK, BiasAdd, GemmV, BiasAdd}.
+            // One cuBLAS gemm_bias call with concatenated weight + bias.
+            // Listed before individual GEMM+bias so the solver prefers it.
+            Box::new(CublasFusedQkvGemmWithBiasImpl::new(dims)),
             // ── cuBLAS GEMM with fused bias epilogue ──
             // For biased models (Qwen2, Qwen2.5, ...). Registered
             // before the standalone CublasGemmExImpl variants so the
-            // solver prefers the fused {GemmQkv + BiasAdd} cover over
+            // solver prefers the fused {GemmQ + BiasAdd} cover over
             // the split cover when both are feasible.
             Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmQ)),
             Box::new(CublasGemmExWithBiasImpl::new(TileKind::GemmK)),
@@ -208,13 +306,40 @@ impl ImplementationLibrary {
         entries.extend(CutlassGemmImpl::all_configs(dims));
         entries.extend(CutlassGemmWithResidualImpl::all_configs(dims));
         entries.extend(CutlassGemvImpl::all_configs(dims));
-        ImplementationLibrary { entries }
+        ImplementationLibrary {
+            entries,
+            active_indices: None,
+        }
     }
 
     /// Add DeviceCallable (megakernel-embeddable) variants of the key
     /// ops. Each wraps a standalone impl with the DeviceCallableWrapper
     /// so it uses Mbarrier handoffs and can share a CompilationUnitId.
     fn add_device_callable_variants(&mut self, dims: crate::lowering::tile_graph::ModelDims) {
+        // DeviceCallable GEMM: use cuBLAS-equivalent costs from CSV.
+        // The solver will pick these when grouping saves enough launch overhead.
+        for &phase in &[
+            TileKind::GemmQ,
+            TileKind::GemmK,
+            TileKind::GemmV,
+            TileKind::GemmOProj,
+            TileKind::GemmGate,
+            TileKind::GemmUp,
+            TileKind::GemmDown,
+            TileKind::GemmLmHead,
+        ] {
+            self.entries
+                .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                    CublasGemmExImpl::new(phase),
+                ))));
+        }
+        // DeviceCallable fused GEMM+residual (oproj, down).
+        for &phase in &[TileKind::GemmOProj, TileKind::GemmDown] {
+            self.entries
+                .push(Box::new(DeviceCallableWrapper::new(Box::new(
+                    CublasGemmExWithResidualImpl::new(phase),
+                ))));
+        }
         // DeviceCallable elementwise ops.
         self.entries
             .push(Box::new(DeviceCallableWrapper::new(Box::new(
@@ -240,6 +365,8 @@ impl ImplementationLibrary {
         // DeviceCallable GEMV (TK matvec for BS=1 decode).
         for &phase in &[
             TileKind::GemmQ,
+            TileKind::GemmK,
+            TileKind::GemmV,
             TileKind::GemmGate,
             TileKind::GemmUp,
             TileKind::GemmLmHead,
@@ -260,6 +387,8 @@ impl ImplementationLibrary {
         ];
         for &phase in &[
             TileKind::GemmQ,
+            TileKind::GemmK,
+            TileKind::GemmV,
             TileKind::GemmOProj,
             TileKind::GemmGate,
             TileKind::GemmUp,
@@ -827,6 +956,126 @@ impl Implementation for CublasFusedQkvGemmImpl {
 
     fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         // One fused output: [M, qkv_dim]
+        vec![Layout::RowMajorBf16]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+}
+
+/// Fused QKV GEMM + bias via cuBLAS. Claims 6 tiles:
+/// `{GemmQ, BiasAdd, GemmK, BiasAdd, GemmV, BiasAdd}`.
+///
+/// The loader concatenates Q/K/V weights into one `[qkv_dim, hidden]`
+/// buffer and Q/K/V biases into one `[qkv_dim]` vector. cuBLAS runs
+/// one `gemm_bias` call (cublasLt with BIAS_POINTER epilogue) that
+/// produces a concatenated `[M, qkv_dim]` output with bias folded in.
+///
+/// This is the sm89 fast path for biased models (Qwen2). On sm90+
+/// the megakernel may prefer unfused CUTLASS GEMMs + separate bias,
+/// since device-callable launches have no overhead.
+#[derive(Debug)]
+pub struct CublasFusedQkvGemmWithBiasImpl {
+    dims: crate::lowering::tile_graph::ModelDims,
+}
+
+impl CublasFusedQkvGemmWithBiasImpl {
+    pub fn new(dims: crate::lowering::tile_graph::ModelDims) -> Self {
+        Self { dims }
+    }
+}
+
+impl Implementation for CublasFusedQkvGemmWithBiasImpl {
+    fn name(&self) -> &'static str {
+        "cublas_fused_qkv_gemm_with_bias"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        // Only seed on GemmQ — avoids triple-matching the same group.
+        if node.kind != TileKind::GemmQ {
+            return None;
+        }
+        let layer = node.layer;
+        let deps = &node.deps;
+
+        // Find sibling GemmK and GemmV on the same layer with the
+        // same dependencies (i.e. same input activation).
+        let k_tile = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::GemmK && n.layer == layer && n.deps == *deps)?;
+        let v_tile = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::GemmV && n.layer == layer && n.deps == *deps)?;
+
+        // Find downstream BiasAdd for each GEMM tile.
+        let q_bias = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::BiasAdd && n.layer == layer && n.deps.contains(&seed))?;
+        let k_bias = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::BiasAdd && n.layer == layer && n.deps.contains(&k_tile.id)
+        })?;
+        let v_bias = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::BiasAdd && n.layer == layer && n.deps.contains(&v_tile.id)
+        })?;
+
+        Some(MatchInfo {
+            claimed_tiles: vec![seed, q_bias.id, k_tile.id, k_bias.id, v_tile.id, v_bias.id],
+            boundary_inputs: deps.clone(),
+            // Outputs are the BiasAdd tiles (downstream consumers
+            // depend on these, not the raw GEMM tiles).
+            boundary_outputs: vec![q_bias.id, k_bias.id, v_bias.id],
+            layer,
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        // One fused GEMM: [M, hidden] × [qkv_dim, hidden]^T.
+        // Bias epilogue is free (folded into cublasLt writeback).
+        let m = profile.num_tokens();
+        let n = self.dims.qkv_dim();
+        let k = self.dims.hidden_size;
+        l4_cost_model::gemm_us(m, n, k)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 0,
+            regs_per_thread: 0,
+            threads_per_cta: 0,
+        }
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::RowMajorBf16]
     }
 
@@ -1704,7 +1953,7 @@ impl Implementation for StandaloneBiasAddImpl {
 /// when both are feasible, because one launch is cheaper than two
 /// and the bias epilogue is ~free in cuBLAS's mainloop.
 ///
-/// Registered per phase — for Qwen2 only `GemmQkv` is needed today,
+/// Registered per phase — for Qwen2 only Q/K/V are needed today,
 /// but the impl is parameterized so future models with biased
 /// gate/up/down/o_proj projections can reuse it.
 #[derive(Debug)]
@@ -2132,7 +2381,9 @@ impl CutlassGemmImpl {
         dims: crate::lowering::tile_graph::ModelDims,
     ) -> Self {
         let phase_str = match phase {
-            TileKind::GemmQ => "qkv",
+            TileKind::GemmQ => "q",
+            TileKind::GemmK => "k",
+            TileKind::GemmV => "v",
             TileKind::GemmOProj => "oproj",
             TileKind::GemmGate => "gate",
             TileKind::GemmUp => "up",
@@ -2170,7 +2421,9 @@ impl CutlassGemmImpl {
         dims: crate::lowering::tile_graph::ModelDims,
     ) -> Self {
         let phase_str = match phase {
-            TileKind::GemmQ => "qkv",
+            TileKind::GemmQ => "q",
+            TileKind::GemmK => "k",
+            TileKind::GemmV => "v",
             TileKind::GemmOProj => "oproj",
             TileKind::GemmGate => "gate",
             TileKind::GemmUp => "up",
@@ -2230,13 +2483,10 @@ impl CutlassGemmImpl {
             (128, 256, 3),
             (256, 64, 4),
             (256, 64, 3),
-            // stages=2 variants
-            (64, 64, 2),
-            (64, 128, 2),
-            (128, 64, 2),
-            (128, 128, 2),
-            (128, 256, 2),
-            (256, 64, 2),
+            // stages=2 variants — disabled until CUDA kernel instantiations
+            // are added to cutlass_standalone_gemm.cu.
+            // (64, 64, 2), (64, 128, 2), (128, 64, 2),
+            // (128, 128, 2), (128, 256, 2), (256, 64, 2),
         ];
         // TB_K=64 configs — cost_key like "cutlass_64x64_k64_s4"
         // Note: 128x128_k64_s4, 256x64_k64_s{3,4}, 128x256_k64_s3 exceed
@@ -2244,16 +2494,16 @@ impl CutlassGemmImpl {
         let k64_tiles: &[(u32, u32, u32)] = &[
             (64, 64, 4),
             (64, 64, 3),
-            (64, 64, 2),
+            // (64, 64, 2),  // stages=2 disabled — no CUDA kernel
             (64, 128, 4),
             (64, 128, 3),
-            (64, 128, 2),
+            // (64, 128, 2),
             (128, 64, 4),
             (128, 64, 3),
-            (128, 64, 2),
+            // (128, 64, 2),
             (128, 128, 3),
-            (128, 128, 2),
-            (256, 64, 2),
+            // (128, 128, 2),
+            // (256, 64, 2),
             (32, 64, 4),
             (32, 128, 4),
         ];
@@ -2304,7 +2554,9 @@ impl CutlassGemmImpl {
             for &(m, n, s, sk) in k64_splitk_tiles {
                 // k64 splitK: cost_key like "cutlass_64x64_k64_s4_sk2"
                 let phase_str = match phase {
-                    TileKind::GemmQ => "qkv",
+                    TileKind::GemmQ => "q",
+                    TileKind::GemmK => "k",
+                    TileKind::GemmV => "v",
                     TileKind::GemmOProj => "oproj",
                     TileKind::GemmGate => "gate",
                     TileKind::GemmUp => "up",
@@ -2665,27 +2917,24 @@ impl CutlassGemmWithResidualImpl {
             (128, 256, 3),
             (256, 64, 4),
             (256, 64, 3),
-            // stages=2 variants
-            (64, 64, 2),
-            (64, 128, 2),
-            (128, 64, 2),
-            (128, 128, 2),
-            (128, 256, 2),
-            (256, 64, 2),
+            // stages=2 variants — disabled until CUDA kernel instantiations
+            // are added to cutlass_standalone_gemm.cu.
+            // (64, 64, 2), (64, 128, 2), (128, 64, 2),
+            // (128, 128, 2), (128, 256, 2), (256, 64, 2),
         ];
         let k64_tiles: &[(u32, u32, u32)] = &[
             (64, 64, 4),
             (64, 64, 3),
-            (64, 64, 2),
+            // (64, 64, 2),  // stages=2 disabled — no CUDA kernel
             (64, 128, 4),
             (64, 128, 3),
-            (64, 128, 2),
+            // (64, 128, 2),
             (128, 64, 4),
             (128, 64, 3),
-            (128, 64, 2),
+            // (128, 64, 2),
             (128, 128, 3),
-            (128, 128, 2),
-            (256, 64, 2),
+            // (128, 128, 2),
+            // (256, 64, 2),
             (32, 64, 4),
             (32, 128, 4),
         ];

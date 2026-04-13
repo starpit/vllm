@@ -67,6 +67,9 @@ pub enum ImplDispatchKind {
     /// Fused QKV GEMM — one GEMM with concatenated [q|k|v] weight.
     /// Claims {GemmQ, GemmK, GemmV} as a 3-tile subgraph.
     FusedQkvGemm,
+    /// Fused QKV GEMM + bias — one `gemm_bias` with concatenated
+    /// weight + bias. Claims {GemmQ, BiasAdd, GemmK, BiasAdd, GemmV, BiasAdd}.
+    FusedQkvGemmWithBias,
     /// Fused gate+up GEMM — one GEMM with concatenated [gate|up] weight.
     /// Claims {GemmGate, GemmUp} as a 2-tile subgraph.
     FusedGateUpGemm,
@@ -286,6 +289,10 @@ fn classify_impl(
         .iter()
         .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::GemmV);
     let is_fused_qkv = has_q && has_k && has_v;
+    let has_bias_add = claimed
+        .iter()
+        .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::BiasAdd);
+    let is_fused_qkv_with_bias = is_fused_qkv && has_bias_add;
 
     // Detect fused gate+up: claimed tiles include both {GemmGate, GemmUp}.
     let has_gate = claimed
@@ -296,7 +303,9 @@ fn classify_impl(
         .any(|t| tile_graph.nodes[t.0 as usize].kind == TileKind::GemmUp);
     let is_fused_gate_up = has_gate && has_up;
 
-    let kind = if is_fused_qkv {
+    let kind = if is_fused_qkv_with_bias {
+        ImplDispatchKind::FusedQkvGemmWithBias
+    } else if is_fused_qkv {
         ImplDispatchKind::FusedQkvGemm
     } else if is_fused_gate_up {
         ImplDispatchKind::FusedGateUpGemm

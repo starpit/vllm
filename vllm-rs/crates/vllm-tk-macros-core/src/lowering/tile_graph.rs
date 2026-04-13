@@ -146,18 +146,11 @@ pub enum TileKind {
     /// after down).
     ResidualAdd,
 
-    // ── Bias add (lifted out of the classified QKV phase when the
-    //     model has `ModelDims::qkv_bias == true`) ──
-    /// Per-column bias broadcast add on a GEMM output:
-    /// `out[row, col] += bias[col]`. Inserted by `from_model_dag`
-    /// after `Gemm*` tiles whose phase is flagged as biased in the
-    /// live `ModelDims` (today only `GemmQkv` via `qkv_bias`). The
-    /// solver can either (a) elect a fused impl that claims both
-    /// `Gemm*` + `BiasAdd` as one subgraph (e.g. `cublas.gemm_bias`
-    /// or a CUTLASS bias-epilogue kernel), or (b) elect a plain GEMM
-    /// impl + a standalone `kernels::bias_add_inplace` launch. The
-    /// choice is an emergent property of the solver's cover, not a
-    /// codegen decision.
+    // ── Bias add ──
+    /// Per-column bias broadcast add: `out[row, col] += bias[col]`.
+    /// Expressed explicitly in the DSL via `bias_add(input, weights)`.
+    /// The solver can fuse `Gemm* + BiasAdd` into one kernel (e.g.
+    /// cuBLAS bias epilogue) or dispatch them separately.
     BiasAdd,
 
     // ── Embedding lookup (pre-loop, runs once per forward) ──
@@ -259,14 +252,7 @@ pub struct TileGraph {
 /// structural shape of the tile graph.
 ///
 /// Per-instance numeric dims (hidden / intermediate / heads / …)
-/// parameterize the cost model. Per-instance topology flags like
-/// `qkv_bias` drive `from_model_dag`'s lowering — when `qkv_bias`
-/// is set, the lowering inserts a `BiasAdd` tile after the
-/// `GemmQkv` tile, which the solver then covers via
-/// `CublasGemmExWithBiasImpl` (fused) or `CutlassGemm +
-/// StandaloneBiasAddImpl` (split). The DSL body stays generic
-/// (one `gemm(normed, qkv_weights[layer])`), and every structural
-/// difference between variants lives on this struct.
+/// parameterize the cost model.
 #[derive(Clone, Copy, Debug)]
 pub struct ModelDims {
     pub hidden_size: u32,
@@ -276,11 +262,6 @@ pub struct ModelDims {
     pub head_dim: u32,
     /// Vocabulary size — the output dim of the lm_head projection.
     pub vocab_size: u32,
-    /// Whether the QKV projection has a per-column bias (Qwen2/2.5
-    /// = `true`, Llama / Mistral / Qwen3 = `false`). Drives the
-    /// insertion of a `BiasAdd` tile after `GemmQkv` in
-    /// `from_model_dag`.
-    pub qkv_bias: bool,
 }
 
 impl ModelDims {
@@ -291,7 +272,6 @@ impl ModelDims {
         num_kv_heads: 8,
         head_dim: 64,
         vocab_size: 128256,
-        qkv_bias: false,
     };
 
     /// QKV output dimension = (num_q_heads + 2 * num_kv_heads) * head_dim.
@@ -517,22 +497,15 @@ impl TileGraph {
                         buf_to_tile.insert(output.0.clone(), tile);
                     }
                     OpKind::Gemm { a, b, output } => {
-                        // Classify the GEMM by weight name, then
-                        // consult `ModelDims` to decide whether this
-                        // phase has a broadcast bias. The DSL body
-                        // stays Llama-shaped (one `gemm(...)`); per-
-                        // model topology flags drive the structural
-                        // divergence here. Llama → no BiasAdd tile.
-                        // Qwen2 → BiasAdd tile after GemmQkv.
                         let dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
                         let kind = classify_gemm(&b.0);
                         let gemm_tile = push(&mut nodes, kind, layer, vec![dep]);
-                        let final_tile = if phase_has_bias(kind, dims) {
-                            push(&mut nodes, TileKind::BiasAdd, layer, vec![gemm_tile])
-                        } else {
-                            gemm_tile
-                        };
-                        buf_to_tile.insert(output.0.clone(), final_tile);
+                        buf_to_tile.insert(output.0.clone(), gemm_tile);
+                    }
+                    OpKind::BiasAdd { input, output, .. } => {
+                        let dep = buf_to_tile.get(&input.0).copied().unwrap_or(current_hidden);
+                        let tile = push(&mut nodes, TileKind::BiasAdd, layer, vec![dep]);
+                        buf_to_tile.insert(output.0.clone(), tile);
                     }
                     OpKind::GemmAdd {
                         a,
@@ -652,20 +625,17 @@ impl TileGraph {
                         current_hidden = tile;
                     }
                     OpKind::Gemm { a, b, output } => {
-                        // Same bias-aware pattern as the in-loop
-                        // handler: consult `ModelDims` via
-                        // `phase_has_bias` and append a BiasAdd tile
-                        // if the model wants it at this phase.
                         let dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
                         let kind = classify_gemm(&b.0);
                         let gemm_tile = push(&mut nodes, kind, post_layer, vec![dep]);
-                        let final_tile = if phase_has_bias(kind, dims) {
-                            push(&mut nodes, TileKind::BiasAdd, post_layer, vec![gemm_tile])
-                        } else {
-                            gemm_tile
-                        };
-                        buf_to_tile.insert(output.0.clone(), final_tile);
-                        current_hidden = final_tile;
+                        buf_to_tile.insert(output.0.clone(), gemm_tile);
+                        current_hidden = gemm_tile;
+                    }
+                    OpKind::BiasAdd { input, output, .. } => {
+                        let dep = buf_to_tile.get(&input.0).copied().unwrap_or(current_hidden);
+                        let tile = push(&mut nodes, TileKind::BiasAdd, post_layer, vec![dep]);
+                        buf_to_tile.insert(output.0.clone(), tile);
+                        current_hidden = tile;
                     }
                     // Other ops (GemmAdd, RopeAppend, Attention, Silu, Mul)
                     // are not expected in the post-loop phase. Skip gracefully.
@@ -701,24 +671,6 @@ fn self_or_hidden(
     hidden: TileId,
 ) -> TileId {
     buf_to_tile.get(buf_name).copied().unwrap_or(hidden)
-}
-
-/// Does the classified GEMM phase carry a broadcast bias on this
-/// specific model? Reads topology flags out of `ModelDims`.
-///
-/// This is the ONE place where the shared Llama-shaped DSL body
-/// diverges structurally per model: if `ModelDims::qkv_bias == true`,
-/// the classified `GemmQkv` tile gains a downstream `BiasAdd` tile,
-/// which the solver covers via `CublasGemmExWithBiasImpl` (fused)
-/// or `StandaloneBiasAddImpl` + a plain GEMM impl (split).
-///
-/// Future topology flags (`o_bias`, `mlp_bias`, …) plug in here as
-/// new match arms, without touching the DSL body or the codegen.
-fn phase_has_bias(kind: TileKind, dims: ModelDims) -> bool {
-    match kind {
-        TileKind::GemmQ | TileKind::GemmK | TileKind::GemmV => dims.qkv_bias,
-        _ => false,
-    }
 }
 
 /// Classify a GEMM by its weight buffer name.

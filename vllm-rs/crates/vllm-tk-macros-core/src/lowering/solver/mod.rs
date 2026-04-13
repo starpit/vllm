@@ -100,7 +100,7 @@ impl PlanFamily {
     /// hardware constants fixed.
     pub fn solve_grid(
         tile_graph: &crate::lowering::tile_graph::TileGraph,
-        library: &crate::lowering::library::ImplementationLibrary,
+        library: &mut crate::lowering::library::ImplementationLibrary,
         base_profile: &crate::target_profile::TargetProfile,
         solver: &dyn Solver,
         grid: &[u32],
@@ -108,6 +108,10 @@ impl PlanFamily {
         let mut plans = Vec::with_capacity(grid.len());
         for &seq in grid {
             let profile = base_profile.with_seq_len(seq);
+            // Pre-select the cheapest CUTLASS config per GEMM phase
+            // for this workload. This reduces the solver's branching
+            // factor from ~60 to ~1 at each GEMM tile.
+            library.pruned_for_workload(tile_graph, &profile);
             let problem = Problem::build(tile_graph, library, &profile);
             match solver.solve(&problem) {
                 SolveResult::Found { best: plan, .. } => plans.push((seq, plan)),

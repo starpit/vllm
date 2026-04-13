@@ -101,6 +101,8 @@ enum CudaModel {
     /// Generated Llama forward — dense safetensors only.
     LlamaSolver(vllm_cuda::model::llama::Model),
     Qwen2(vllm_cuda::model::qwen2::Qwen2ForCausalLM),
+    /// Generated Qwen2 forward — dense safetensors only.
+    Qwen2Solver(vllm_cuda::model::qwen2::Model),
     Gemma2(vllm_cuda::model::gemma2::Gemma2ForCausalLM),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
     Mixtral(vllm_cuda::model::mixtral::MixtralForCausalLM),
@@ -118,6 +120,7 @@ impl CudaModel {
             Self::Llama(m) => m.model.layers.len(),
             Self::LlamaSolver(m) => m.layers.len(),
             Self::Qwen2(m) => m.0.model.layers.len(),
+            Self::Qwen2Solver(m) => m.layers.len(),
             Self::Gemma2(m) => m.model.layers.len(),
             Self::Gemma3(m) => m.model.layers.len(),
             Self::Mixtral(m) => m.model.layers.len(),
@@ -137,6 +140,7 @@ impl CudaModel {
             Self::Llama(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::LlamaSolver(m) => m.dims.num_kv_heads,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.num_kv_heads,
+            Self::Qwen2Solver(m) => m.dims.num_kv_heads,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Mixtral(m) => m.model.layers[0].self_attn.num_kv_heads,
@@ -154,6 +158,7 @@ impl CudaModel {
             Self::Llama(m) => m.model.layers[0].self_attn.head_dim,
             Self::LlamaSolver(m) => m.dims.head_dim,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.head_dim,
+            Self::Qwen2Solver(m) => m.dims.head_dim,
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
             Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
             Self::Mixtral(m) => m.model.layers[0].self_attn.head_dim,
@@ -171,6 +176,7 @@ impl CudaModel {
             Self::Llama(m) => m.lm_head.out_features(),
             Self::LlamaSolver(m) => m.lm_head.out_features(),
             Self::Qwen2(m) => m.0.lm_head.out_features(),
+            Self::Qwen2Solver(m) => m.lm_head.out_features(),
             Self::Gemma2(m) => m.lm_head.out_features(),
             Self::Gemma3(m) => m.lm_head.out_features(),
             Self::Mixtral(m) => m.lm_head.out_features(),
@@ -199,6 +205,7 @@ impl CudaModel {
             Self::Llama(m) => m.lm_head.in_features(),
             Self::LlamaSolver(m) => m.lm_head.in_features(),
             Self::Qwen2(m) => m.0.lm_head.in_features(),
+            Self::Qwen2Solver(m) => m.lm_head.in_features(),
             Self::Gemma2(m) => m.lm_head.in_features(),
             Self::Gemma3(m) => m.lm_head.in_features(),
             Self::Mixtral(m) => m.lm_head.in_features(),
@@ -265,6 +272,21 @@ impl CudaModel {
             },
             Self::LlamaSolver(m) => unsafe {
                 vllm_cuda::model::llama::solver_hidden_states(
+                    m,
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
+            Self::Qwen2Solver(m) => unsafe {
+                vllm_cuda::model::qwen2::solver_hidden_states(
                     m,
                     input_ids,
                     positions,
@@ -459,6 +481,21 @@ impl CudaModel {
                 )
             },
             Self::Qwen2(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Qwen2Solver(m) => unsafe {
                 m.forward(
                     input_ids,
                     positions,
@@ -5088,26 +5125,61 @@ impl Worker for CudaWorker {
                 let llama_config = llama_config_from_hf(&hf_config)?;
                 let qwen2_config =
                     vllm_cuda::model::qwen2::Qwen2Config::from_llama_config(llama_config);
-                let m = if qconfig.is_bnb4bit() {
-                    let bnb_cfg = match &qconfig {
-                        vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
-                        _ => unreachable!(),
-                    };
-                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_bnb4bit(
-                        &mut weights,
-                        &qwen2_config,
-                        dtype,
-                        bnb_cfg,
-                        device,
-                    )
-                } else if qconfig.is_fp8() {
-                    let fp8_cfg = match &qconfig {
-                        vllm_cuda::quant::QuantConfig::Fp8(c) => c,
-                        _ => unreachable!(),
-                    };
-                    if fp8_cfg.weight_block_size.is_some() {
-                        if use_tp {
-                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_block_tp(
+                // Dense path: use generated Model::load (solver forward).
+                if !qconfig.is_bnb4bit()
+                    && !qconfig.is_fp8()
+                    && !qconfig.is_quantized()
+                    && !use_tp
+                    && !use_pp
+                {
+                    let (model, _lm_head) = unsafe {
+                        vllm_cuda::model::qwen2::Model::load(
+                            &mut weights,
+                            &qwen2_config.0,
+                            dtype,
+                            device,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 solver load: {e}")))?;
+                    CudaModel::Qwen2Solver(model)
+                } else {
+                    // Legacy quant/TP/PP paths.
+                    let m = if qconfig.is_bnb4bit() {
+                        let bnb_cfg = match &qconfig {
+                            vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                            _ => unreachable!(),
+                        };
+                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_bnb4bit(
+                            &mut weights,
+                            &qwen2_config,
+                            dtype,
+                            bnb_cfg,
+                            device,
+                        )
+                    } else if qconfig.is_fp8() {
+                        let fp8_cfg = match &qconfig {
+                            vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                            _ => unreachable!(),
+                        };
+                        if fp8_cfg.weight_block_size.is_some() {
+                            if use_tp {
+                                vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_block_tp(
+                                    &mut weights,
+                                    &qwen2_config,
+                                    dtype,
+                                    tp,
+                                    device,
+                                )
+                            } else {
+                                vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8(
+                                    &mut weights,
+                                    &qwen2_config,
+                                    dtype,
+                                    device,
+                                )
+                            }
+                        } else if use_tp {
+                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_tp(
                                 &mut weights,
                                 &qwen2_config,
                                 dtype,
@@ -5122,8 +5194,33 @@ impl Worker for CudaWorker {
                                 device,
                             )
                         }
+                    } else if qconfig.is_quantized() {
+                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_quantized(
+                            &mut weights,
+                            &qwen2_config,
+                            dtype,
+                            &qconfig,
+                            device,
+                        )
+                    } else if use_tp && use_pp {
+                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp_pp(
+                            &mut weights,
+                            &qwen2_config,
+                            dtype,
+                            tp,
+                            pp_config.unwrap(),
+                            device,
+                        )
+                    } else if use_pp {
+                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_pp(
+                            &mut weights,
+                            &qwen2_config,
+                            dtype,
+                            pp_config.unwrap(),
+                            device,
+                        )
                     } else if use_tp {
-                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_tp(
+                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp(
                             &mut weights,
                             &qwen2_config,
                             dtype,
@@ -5131,56 +5228,16 @@ impl Worker for CudaWorker {
                             device,
                         )
                     } else {
-                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8(
+                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load(
                             &mut weights,
                             &qwen2_config,
                             dtype,
                             device,
                         )
                     }
-                } else if qconfig.is_quantized() {
-                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_quantized(
-                        &mut weights,
-                        &qwen2_config,
-                        dtype,
-                        &qconfig,
-                        device,
-                    )
-                } else if use_tp && use_pp {
-                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp_pp(
-                        &mut weights,
-                        &qwen2_config,
-                        dtype,
-                        tp,
-                        pp_config.unwrap(),
-                        device,
-                    )
-                } else if use_pp {
-                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_pp(
-                        &mut weights,
-                        &qwen2_config,
-                        dtype,
-                        pp_config.unwrap(),
-                        device,
-                    )
-                } else if use_tp {
-                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp(
-                        &mut weights,
-                        &qwen2_config,
-                        dtype,
-                        tp,
-                        device,
-                    )
-                } else {
-                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load(
-                        &mut weights,
-                        &qwen2_config,
-                        dtype,
-                        device,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 load: {e}")))?;
-                CudaModel::Qwen2(m)
+                    .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 load: {e}")))?;
+                    CudaModel::Qwen2(m)
+                } // close else { legacy }
             }
             "Gemma2ForCausalLM" => {
                 let config = gemma2_config_from_hf(&hf_config)?;

@@ -135,13 +135,6 @@ pub enum OpKind {
         output: BufferId,
     },
     /// General matrix multiply: A[BS, K] @ B[N, K]^T -> output[BS, N].
-    ///
-    /// Note: a bias term on the GEMM output is **not** encoded at the
-    /// DSL level. The DSL body stays shape-generic across every
-    /// Llama-family architecture; whether a classified GEMM phase
-    /// (e.g. QKV) gains a downstream `BiasAdd` tile is a property of
-    /// `ModelDims` (see `ModelDims::qkv_bias`), resolved in
-    /// `from_model_dag`. One DSL, many model variants.
     Gemm {
         a: BufferId,
         b: BufferId,
@@ -192,6 +185,15 @@ pub enum OpKind {
         b: BufferId,
         output: BufferId,
     },
+    /// Per-column bias add: input[BS, N] + bias[N] -> output[BS, N].
+    /// Expressed explicitly in the DSL for architectures that use bias
+    /// (e.g. Qwen2 QKV projections). The solver decides whether to
+    /// fuse this with the upstream GEMM or dispatch it standalone.
+    BiasAdd {
+        input: BufferId,
+        bias: BufferId,
+        output: BufferId,
+    },
 }
 
 /// A single operation in the DAG.
@@ -236,6 +238,7 @@ impl Op {
             } => vec![q, kv_cache, block_table],
             OpKind::Silu { input, .. } => vec![input],
             OpKind::Mul { a, b, .. } => vec![a, b],
+            OpKind::BiasAdd { input, bias, .. } => vec![input, bias],
         }
     }
 
@@ -257,6 +260,7 @@ impl Op {
             }
             OpKind::Silu { output, .. } => vec![output],
             OpKind::Mul { output, .. } => vec![output],
+            OpKind::BiasAdd { output, .. } => vec![output],
         }
     }
 }

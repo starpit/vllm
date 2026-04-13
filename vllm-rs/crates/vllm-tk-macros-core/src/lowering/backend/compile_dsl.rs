@@ -242,19 +242,12 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
     let mut kv_heads: Option<u32> = None;
     let mut head_dim: Option<u32> = None;
     let mut vocab: Option<u32> = None;
-    // Topology flags — default to Llama behavior (no bias anywhere).
-    let mut qkv_bias: bool = false;
 
     while !input.is_empty() {
         let key: Ident = input.parse()?;
         input.parse::<Token![:]>()?;
 
         match key.to_string().as_str() {
-            "qkv_bias" => {
-                // `qkv_bias: true` / `qkv_bias: false` — bool literal.
-                let lit: syn::LitBool = input.parse()?;
-                qkv_bias = lit.value;
-            }
             "layers" => {
                 let val: LitInt = input.parse()?;
                 layers = Some(val.base10_parse()?);
@@ -308,7 +301,6 @@ fn parse_inline_model(input: ParseStream) -> syn::Result<InlineModel> {
             // Default to Llama 3 vocab if not specified — the solver still
             // compiles without this; it's only used by the lm_head cost lookup.
             vocab_size: vocab.unwrap_or(128256),
-            qkv_bias,
         },
     })
 }

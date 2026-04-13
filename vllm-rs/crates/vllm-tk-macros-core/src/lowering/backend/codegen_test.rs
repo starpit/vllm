@@ -273,10 +273,11 @@ mod tests {
 
     // (The old `qwen2_*` structural tests targeted the retired
     // `name:` suffix on `forward!` and the legacy `OpKind::GemmBias`
-    // DSL op. Bias coverage now flows through `ModelDims::qkv_bias`
-    // + `from_model_dag`, and Qwen2 support arrives via a separate
-    // `forward!()` invocation in `qwen2.rs`. Equivalent coverage
-    // tests will be added once that invocation lands.)
+    // DSL op. Bias is now expressed explicitly in the DSL via
+    // `bias_add(input, weights)` and lowered to `TileKind::BiasAdd`
+    // by `from_model_dag`. Qwen2 support uses a separate
+    // `forward!()` invocation in `qwen2.rs` with explicit bias_add
+    // ops after Q/K/V GEMMs.)
 
     #[test]
     fn runtime_models_produce_empty() {

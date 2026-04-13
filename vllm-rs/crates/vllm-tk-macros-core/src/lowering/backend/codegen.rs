@@ -37,7 +37,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     // is a follow-up.
     let model = &models[0];
     let tile_graph = TileGraph::from_model_dag(&def.dag, model.dims);
-    let library = build_library(target_id, model.dims);
+    let mut library = build_library(target_id, model.dims);
     let profile = build_profile(target_id);
     let grid = match &def.workloads {
         Some(wl) => build_solve_grid(wl),
@@ -45,7 +45,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     };
     let family = PlanFamily::solve_grid(
         &tile_graph,
-        &library,
+        &mut library,
         &profile,
         &BacktrackCpSolver::default(),
         &grid,
@@ -60,8 +60,12 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     let plans_vec: Vec<_> = family.iter().collect();
     let qkv_fused = plans_vec.iter().any(|(_, plan)| {
         let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
-        ds.entries_for_layer(0)
-            .any(|e| e.kind == ImplDispatchKind::FusedQkvGemm)
+        ds.entries_for_layer(0).any(|e| {
+            matches!(
+                e.kind,
+                ImplDispatchKind::FusedQkvGemm | ImplDispatchKind::FusedQkvGemmWithBias
+            )
+        })
     });
     let gate_up_fused = plans_vec.iter().any(|(_, plan)| {
         let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
@@ -119,6 +123,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
                 let mut residual = residual;
                 let mut normed: Option<OwnedTensor> = None;
                 let mut qkv_out: Option<OwnedTensor> = None;
+                let mut q_out: Option<OwnedTensor> = None;
                 let mut k_out: Option<OwnedTensor> = None;
                 let mut v_out: Option<OwnedTensor> = None;
                 let mut attn_out: Option<OwnedTensor> = None;
@@ -447,9 +452,12 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
     match entry.kind {
         ImplDispatchKind::Noop => None,
         ImplDispatchKind::Embed => None, // handled in pre-loop, not per-layer
-        ImplDispatchKind::FusedQkvGemm => {
+        ImplDispatchKind::FusedQkvGemm | ImplDispatchKind::FusedQkvGemmWithBias => {
             // Fused QKV GEMM: one GEMM with concatenated weight.
             // The fused weight field on Layer is `self_attn_qkv_proj`.
+            // For FusedQkvGemmWithBias, the LinearLayer's `bias` field
+            // holds the concatenated bias; `LinearLayer::forward` applies
+            // it automatically via cuBLAS bias epilogue.
             Some(quote! {{
                 let __out = layer.self_attn_qkv_proj.forward(
                     normed.as_ref().unwrap().view(),
@@ -476,6 +484,10 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
         }
         ImplDispatchKind::BiasAdd => {
             // Standalone bias add on a projection output.
+            // Variable names match the bucket function locals:
+            // q_out holds unfused Q output, k_out holds K, v_out holds V.
+            // (qkv_out holds fused QKV output — BiasAdd only appears
+            // in the unfused path.)
             let phase = entry.gemm_phase.unwrap();
             let (buf, weight) = match phase {
                 GemmPhase::Q => (quote! { q_out }, quote! { layer.self_attn_q_proj }),
@@ -553,8 +565,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
-                    if let Some(ref up_proj) = layer.mlp_up_proj_opt {
-                        let __out = up_proj.forward(
+                    {
+                        let __out = layer.mlp_up_proj.forward(
                             normed.as_ref().unwrap().view(),
                             &mut device.cublas,
                             &mut device.caching,
@@ -592,8 +604,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
-                    if let Some(ref up_proj) = layer.mlp_up_proj_opt {
-                        let __out = up_proj.forward(
+                    {
+                        let __out = layer.mlp_up_proj.forward(
                             normed.as_ref().unwrap().view(),
                             &mut device.cublas,
                             &mut device.caching,
@@ -644,8 +656,8 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let phase = entry.gemm_phase.unwrap();
             if phase == GemmPhase::Up {
                 return Some(quote! {
-                    if let Some(ref up_proj) = layer.mlp_up_proj_opt {
-                        let __out = up_proj.forward(
+                    {
+                        let __out = layer.mlp_up_proj.forward(
                             normed.as_ref().unwrap().view(),
                             &mut device.cublas,
                             &mut device.caching,
@@ -911,6 +923,12 @@ fn extract_weight_fields(
 
     for (buf_id, op_kind) in &weight_op {
         let buf = &dag.buffers[*buf_id];
+        // Bias weight buffers (e.g. `self_attn.q_proj.bias`) are loaded
+        // as part of the parent LinearLayer — they don't need a separate
+        // struct field.
+        if buf_id.0.ends_with(".bias") {
+            continue;
+        }
         let ty = match op_kind {
             OpKind::Embed { weights, .. } if weights == *buf_id => "Embedding",
             OpKind::RmsNorm { weights, .. } if weights == *buf_id => "RmsNorm",

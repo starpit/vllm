@@ -123,7 +123,8 @@ fn min_cost_per_tile_kind(problem: &Problem) -> HashMap<TileKind, f64> {
         };
         let mut min_cost = f64::INFINITY;
         let num_tokens = problem.profile.num_tokens();
-        for imp in &problem.library.entries {
+        let active = problem.library.active_entries();
+        for (_idx, imp) in &active {
             if !imp.target_compatible(problem.profile) {
                 continue;
             }
@@ -390,13 +391,15 @@ fn recurse(state: &mut SearchState<'_>, _starting_step: u32) {
         return;
     }
 
-    // Enumerate matches at this seed across the whole library.
-    let library_entries = &state.problem.library.entries;
+    // Enumerate matches at this seed across the active library entries.
+    let library = &state.problem.library;
+    let library_entries = &library.entries;
+    let active = library.active_entries();
     let profile = state.problem.profile;
     let tile_graph = state.problem.tile_graph;
     let num_tokens = profile.num_tokens();
     let mut candidates: Vec<(ImplId, crate::lowering::implementation::MatchInfo, f64)> = Vec::new();
-    for (idx, imp) in library_entries.iter().enumerate() {
+    for (idx, imp) in &active {
         if !imp.target_compatible(profile) {
             continue;
         }
@@ -417,8 +420,56 @@ fn recurse(state: &mut SearchState<'_>, _starting_step: u32) {
             continue;
         }
         let cost = imp.cost_us(&m, profile);
-        candidates.push((ImplId(idx as u32), m, cost));
+        candidates.push((ImplId(*idx as u32), m, cost));
     }
+
+    // ── CUTLASS deduplication ──
+    // The library registers dozens of CUTLASS tile/pipeline configs per
+    // GEMM phase. The solver doesn't need to branch over all of them —
+    // it just needs the cheapest CUTLASS option per phase to compete
+    // against cuBLAS / fused impls. Without this, the branching factor
+    // at each GEMM tile is ~60 instead of ~3, making solve time minutes
+    // instead of milliseconds.
+    //
+    // For each single-tile CUTLASS candidate, keep only the cheapest.
+    // Multi-tile claims (fused QKV, fused gate+up, GEMM+residual,
+    // GEMM+bias) pass through — they have different structural effects
+    // the solver needs to evaluate.
+    {
+        let mut best_cutlass_cost: f64 = f64::INFINITY;
+        let mut best_cutlass_idx: Option<usize> = None;
+        for (i, (impl_id, match_info, cost)) in candidates.iter().enumerate() {
+            let name = library_entries[impl_id.0 as usize].name();
+            if name.starts_with("cutlass_")
+                && match_info.claimed_tiles.len() == 1
+                && *cost < best_cutlass_cost
+            {
+                best_cutlass_cost = *cost;
+                best_cutlass_idx = Some(i);
+            }
+        }
+        if let Some(winner) = best_cutlass_idx {
+            // Mark all single-tile CUTLASS candidates except the winner for removal.
+            let mut remove = vec![false; candidates.len()];
+            for (i, (impl_id, match_info, _)) in candidates.iter().enumerate() {
+                if i != winner
+                    && library_entries[impl_id.0 as usize]
+                        .name()
+                        .starts_with("cutlass_")
+                    && match_info.claimed_tiles.len() == 1
+                {
+                    remove[i] = true;
+                }
+            }
+            let mut ri = 0;
+            candidates.retain(|_| {
+                let keep = !remove[ri];
+                ri += 1;
+                keep
+            });
+        }
+    }
+
     // Sort by amortized cost per claimed tile: a 1435µs 7-tile fused
     // claim (205µs/tile) beats a 15µs 1-tile standalone (15µs/tile)
     // at the global level even though its raw cost is higher. This
@@ -924,12 +975,12 @@ mod tests {
     #[test]
     fn plan_family_across_seq_lens() {
         let tg = TileGraph::build_llama_forward_1b(2);
-        let library = ImplementationLibrary::l4_sm89_starter_default();
+        let mut library = ImplementationLibrary::l4_sm89_starter_default();
         let profile = TargetProfile::l4_sm89();
 
         let family = super::super::PlanFamily::solve_grid(
             &tg,
-            &library,
+            &mut library,
             &profile,
             &BacktrackCpSolver::default(),
             super::super::PlanFamily::DEFAULT_GRID,

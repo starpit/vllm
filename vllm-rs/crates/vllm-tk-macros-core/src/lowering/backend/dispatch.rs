@@ -124,9 +124,6 @@ pub struct DispatchEntry {
     pub step: u32,
     /// Launch kind (determines standalone vs megakernel body).
     pub launch_kind: LaunchKind,
-    /// Compilation unit this entry belongs to. Entries sharing a unit
-    /// are fused into a single kernel launch (mini-megakernel).
-    pub unit: CompilationUnitId,
     /// Whether this GEMM folds a residual add (beta=1).
     pub fused_residual: bool,
     /// For GEMM entries: which phase (determines N, K, buffer pointers).
@@ -134,6 +131,10 @@ pub struct DispatchEntry {
     /// For RmsNorm: whether this is the attention norm (true) or MLP
     /// norm (false) within the layer.
     pub is_attn_norm: Option<bool>,
+    /// Compilation unit this entry belongs to. Entries sharing a
+    /// `CompilationUnitId` with `LaunchKind::DeviceCallable` are
+    /// fused into one `__global__` kernel by the megakernel codegen.
+    pub compilation_unit: CompilationUnitId,
 }
 
 /// Ordered dispatch sequence built from one [`ExecutionPlan`].
@@ -172,11 +173,12 @@ impl DispatchSequence {
         let mut norm_count_per_layer: BTreeMap<u16, u32> = BTreeMap::new();
 
         let mut entries = Vec::with_capacity(scheduled.len());
-        for (step, unit, sg) in &scheduled {
+        for (step, _unit, sg) in &scheduled {
             let impl_id = assignment.impls[sg];
             let imp = library.get(impl_id);
             let imp_name = imp.name();
             let launch_kind = imp.launch_kind();
+            let compilation_unit = assignment.schedule[sg].unit;
 
             let claimed = assignment.tiles_in_subgraph(*sg);
             let layer = claimed
@@ -201,10 +203,10 @@ impl DispatchSequence {
                 layer,
                 step: *step,
                 launch_kind,
-                unit: *unit,
                 fused_residual,
                 gemm_phase,
                 is_attn_norm,
+                compilation_unit,
             });
         }
 
@@ -245,8 +247,8 @@ impl DispatchSequence {
         let mut seen = std::collections::BTreeSet::new();
         let mut units = Vec::new();
         for e in &self.entries {
-            if e.kind != ImplDispatchKind::Noop && seen.insert(e.unit) {
-                units.push(e.unit);
+            if e.kind != ImplDispatchKind::Noop && seen.insert(e.compilation_unit) {
+                units.push(e.compilation_unit);
             }
         }
         units
@@ -257,7 +259,7 @@ impl DispatchSequence {
         &self,
         unit: CompilationUnitId,
     ) -> impl Iterator<Item = &DispatchEntry> {
-        self.entries.iter().filter(move |e| e.unit == unit)
+        self.entries.iter().filter(move |e| e.compilation_unit == unit)
     }
 
     /// Whether a compilation unit contains a single HostCallback entry
@@ -266,6 +268,31 @@ impl DispatchSequence {
     pub fn unit_is_standalone(&self, unit: CompilationUnitId) -> bool {
         self.entries_for_unit(unit)
             .all(|e| e.launch_kind == LaunchKind::HostCallback)
+    }
+
+    /// Group entries by [`CompilationUnitId`], preserving step order
+    /// within each group. Returns `(unit_id, entries)` pairs sorted
+    /// by the first step in each unit.
+    pub fn units(&self) -> Vec<(CompilationUnitId, Vec<&DispatchEntry>)> {
+        let mut map: BTreeMap<CompilationUnitId, Vec<&DispatchEntry>> = BTreeMap::new();
+        for entry in &self.entries {
+            map.entry(entry.compilation_unit)
+                .or_default()
+                .push(entry);
+        }
+        let mut units: Vec<_> = map.into_iter().collect();
+        // Sort by earliest step in each unit.
+        units.sort_by_key(|(_, entries)| entries.first().map(|e| e.step).unwrap_or(0));
+        units
+    }
+
+    /// Distinct non-Noop compilation units (actual kernel launches).
+    pub fn distinct_launch_units(&self) -> std::collections::HashSet<CompilationUnitId> {
+        self.entries
+            .iter()
+            .filter(|e| e.kind != ImplDispatchKind::Noop)
+            .map(|e| e.compilation_unit)
+            .collect()
     }
 }
 
@@ -455,23 +482,7 @@ pub fn format_plan_family(
     let mut out = String::new();
     for (seq, plan) in family.iter() {
         let ds = DispatchSequence::from_plan(plan, library, tile_graph);
-        // Count distinct compilation units = actual kernel launches.
-        // Count distinct compilation units, excluding Noop entries
-        // (logical-only ops like residual_add, qkv_split get their
-        // own unit but don't produce actual kernel launches).
-        let noop_sgs: std::collections::HashSet<_> = ds
-            .entries
-            .iter()
-            .filter(|e| e.kind == ImplDispatchKind::Noop)
-            .map(|e| e.subgraph)
-            .collect();
-        let distinct_units: std::collections::HashSet<u32> = plan
-            .assignment
-            .schedule
-            .iter()
-            .filter(|(sg, _)| !noop_sgs.contains(sg))
-            .map(|(_, slot)| slot.unit.0)
-            .collect();
+        let distinct_units = ds.distinct_launch_units();
         out.push_str(&format!(
             "\n=== seq={seq} ({} ops, {} kernel launches, {:.0}µs predicted) ===\n",
             ds.num_launches(),
@@ -482,9 +493,16 @@ pub fn format_plan_family(
             if entry.kind == ImplDispatchKind::Noop {
                 continue;
             }
+            let layer_label = if entry.layer == u16::MAX {
+                "pre".to_string()
+            } else if entry.layer as u32 == tile_graph.num_layers as u32 {
+                "post".to_string()
+            } else {
+                format!("layer {}", entry.layer)
+            };
             out.push_str(&format!(
-                "  step {:2}  U{:02}  L{:02}  {:?}  {}\n",
-                entry.step, entry.unit.0, entry.layer, entry.kind, entry.impl_name,
+                "  step {:2}  U{:02}  {:<8}  {:?}  {}\n",
+                entry.step, entry.compilation_unit.0, layer_label, entry.kind, entry.impl_name,
             ));
         }
     }

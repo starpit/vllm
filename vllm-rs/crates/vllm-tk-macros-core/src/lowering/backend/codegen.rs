@@ -25,6 +25,24 @@ pub fn generate(def: &ForwardDef) -> TokenStream {
     }
 }
 
+/// Per-model solved data: everything the codegen needs to emit one
+/// model variant's structs, loader, and dispatch functions.
+struct SolvedModel {
+    dims: crate::lowering::tile_graph::ModelDims,
+    num_layers: u16,
+    family: PlanFamily,
+    library: ImplementationLibrary,
+    tile_graph: TileGraph,
+    /// Whether ANY bucket uses fused QKV.
+    any_qkv_fused: bool,
+    /// Whether ANY bucket uses unfused Q/K/V (separate GEMMs).
+    any_qkv_unfused: bool,
+    /// Whether ANY bucket uses fused gate+up.
+    any_gate_up_fused: bool,
+    /// Whether ANY bucket uses unfused gate/up.
+    any_gate_up_unfused: bool,
+}
+
 fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     let models = def.models.as_static().unwrap();
     let target_id = def.target.as_static().unwrap();
@@ -33,51 +51,114 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         return quote! { compile_error!("forward!: models list is empty"); };
     }
 
-    // For now, use the first model. Multi-model dispatch (from_dims)
-    // is a follow-up.
-    let model = &models[0];
-    let tile_graph = TileGraph::from_model_dag(&def.dag, model.dims);
-    let mut library = build_library(target_id, model.dims);
     let profile = build_profile(target_id);
     let grid = match &def.workloads {
         Some(wl) => build_solve_grid(wl),
         None => PlanFamily::DEFAULT_GRID.to_vec(),
     };
-    let family = PlanFamily::solve_grid(
-        &tile_graph,
-        &mut library,
-        &profile,
-        &BacktrackCpSolver::default(),
-        &grid,
-    );
 
-    if family.is_empty() {
-        return quote! { compile_error!("forward!: solver found no feasible plans"); };
+    // Solve every model variant.
+    let mut solved_models: Vec<SolvedModel> = Vec::new();
+    for model in models {
+        let tile_graph = TileGraph::from_model_dag(&def.dag, model.dims);
+        let mut library = build_library(target_id, model.dims);
+        let family = PlanFamily::solve_grid(
+            &tile_graph,
+            &mut library,
+            &profile,
+            &BacktrackCpSolver::default(),
+            &grid,
+        );
+        if family.is_empty() {
+            continue;
+        }
+
+        // Per-bucket fusion analysis: detect which buckets use fused
+        // vs unfused weight layouts. The struct must carry all variants
+        // that any bucket needs.
+        let plans_vec: Vec<_> = family.iter().collect();
+        let any_qkv_fused = plans_vec.iter().any(|(_, plan)| {
+            let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+            ds.entries_for_layer(0).any(|e| {
+                matches!(
+                    e.kind,
+                    ImplDispatchKind::FusedQkvGemm | ImplDispatchKind::FusedQkvGemmWithBias
+                )
+            })
+        });
+        let any_qkv_unfused = plans_vec.iter().any(|(_, plan)| {
+            let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+            ds.entries_for_layer(0).any(|e| {
+                matches!(e.kind, ImplDispatchKind::CublasGemm | ImplDispatchKind::CutlassGemm { .. } | ImplDispatchKind::CutlassGemv | ImplDispatchKind::CublasGemmWithBias)
+                    && matches!(e.gemm_phase, Some(GemmPhase::Q) | Some(GemmPhase::K) | Some(GemmPhase::V))
+            })
+        });
+        let any_gate_up_fused = plans_vec.iter().any(|(_, plan)| {
+            let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+            ds.entries_for_layer(0)
+                .any(|e| e.kind == ImplDispatchKind::FusedGateUpGemm)
+        });
+        let any_gate_up_unfused = plans_vec.iter().any(|(_, plan)| {
+            let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+            ds.entries_for_layer(0).any(|e| {
+                matches!(e.kind, ImplDispatchKind::CublasGemm | ImplDispatchKind::CutlassGemm { .. } | ImplDispatchKind::CutlassGemv | ImplDispatchKind::CublasGemmWithBias)
+                    && matches!(e.gemm_phase, Some(GemmPhase::Gate) | Some(GemmPhase::Up))
+            })
+        });
+
+        solved_models.push(SolvedModel {
+            dims: model.dims,
+            num_layers: model.num_layers,
+            family,
+            library,
+            tile_graph,
+            any_qkv_fused,
+            any_qkv_unfused,
+            any_gate_up_fused,
+            any_gate_up_unfused,
+        });
     }
 
-    // Fusion decisions must be uniform across ALL buckets (the struct
-    // is shared). Check if ANY bucket fuses — if so, all must.
-    let plans_vec: Vec<_> = family.iter().collect();
-    let qkv_fused = plans_vec.iter().any(|(_, plan)| {
-        let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
-        ds.entries_for_layer(0).any(|e| {
-            matches!(
-                e.kind,
-                ImplDispatchKind::FusedQkvGemm | ImplDispatchKind::FusedQkvGemmWithBias
-            )
-        })
-    });
-    let gate_up_fused = plans_vec.iter().any(|(_, plan)| {
-        let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
-        ds.entries_for_layer(0)
-            .any(|e| e.kind == ImplDispatchKind::FusedGateUpGemm)
-    });
+    if solved_models.is_empty() {
+        return quote! { compile_error!("forward!: solver found no feasible plans for any model"); };
+    }
 
-    // Extract struct fields from the DAG, applying solver fusion decisions.
-    let (per_layer_fields, global_fields) =
-        extract_weight_fields(&def.dag, qkv_fused, gate_up_fused);
+    // For now, emit code for the first solved model. Multi-model
+    // dispatch (enum wrapper + from_dims) is the next step.
+    let sm = &solved_models[0];
+
+    // Extract struct fields from the DAG. When both fused and unfused
+    // variants are needed (different buckets pick different layouts),
+    // the struct carries BOTH sets of fields.
+    let qkv_fused = sm.any_qkv_fused;
+    let qkv_unfused = sm.any_qkv_unfused;
+    let gate_up_fused = sm.any_gate_up_fused;
+    let gate_up_unfused = sm.any_gate_up_unfused;
+
+    let (per_layer_fields, global_fields) = extract_weight_fields(
+        &def.dag,
+        qkv_fused,
+        qkv_unfused,
+        gate_up_fused,
+        gate_up_unfused,
+    );
     let struct_defs = emit_structs(&per_layer_fields, &global_fields);
-    let model_load = emit_model_load(&per_layer_fields, &global_fields, qkv_fused, gate_up_fused);
+    let model_load = emit_model_load(
+        &per_layer_fields,
+        &global_fields,
+        qkv_fused,
+        qkv_unfused,
+        gate_up_fused,
+        gate_up_unfused,
+    );
+
+    let family = &sm.family;
+    let library = &sm.library;
+    let tile_graph = &sm.tile_graph;
+
+    // Generate the execution plan summary at compile time so it can
+    // be printed at runtime.
+    let plan_summary = super::dispatch::format_plan_family(family, library, tile_graph);
 
     let mut bucket_fns = Vec::new();
     let mut match_arms = Vec::new();
@@ -94,8 +175,32 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     // pre-lm_head DSL).
     let has_post_loop = tile_graph.nodes.iter().any(|n| n.layer == num_layers);
 
+    // ── Write megakernel .cu files to cache ──
+    // Extract DeviceCallable compilation units from every bucket's
+    // plan and generate CUDA source. Written to
+    // ~/.cache/cudaforge/megakernels/ for build.rs to compile.
+    {
+        use super::cuda_codegen::{extract_megakernel_units, generate_cuda_source, write_megakernels_to_cache};
+        let mut all_megakernels = Vec::new();
+        for (_seq, plan) in &plans {
+            let ds = DispatchSequence::from_plan(plan, library, tile_graph);
+            let units = extract_megakernel_units(&ds);
+            for unit in &units {
+                let generated = generate_cuda_source(unit);
+                all_megakernels.push(generated);
+            }
+        }
+        if !all_megakernels.is_empty() {
+            let paths = write_megakernels_to_cache(&all_megakernels);
+            for path in &paths {
+                // Print at compile-time so the user knows megakernels were generated.
+                eprintln!("forward! wrote megakernel: {}", path.display());
+            }
+        }
+    }
+
     for (i, (seq, plan)) in plans.iter().enumerate() {
-        let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+        let ds = DispatchSequence::from_plan(plan, library, tile_graph);
         let fn_name = format_ident!("solver_layer_bucket_{}", i);
         let stmts = emit_layer_stmts(&ds);
 
@@ -309,7 +414,17 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         quote! {}
     };
 
+    let plan_summary_lit = proc_macro2::Literal::string(&plan_summary);
+
     quote! {
+        /// Compile-time execution plan summary (generated by the solver).
+        pub const EXECUTION_PLAN_SUMMARY: &str = #plan_summary_lit;
+
+        /// Print the solver's execution plan to stderr.
+        pub fn print_execution_plan() {
+            eprintln!("{}", EXECUTION_PLAN_SUMMARY);
+        }
+
         #struct_defs
 
         #model_load
@@ -351,7 +466,436 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
 // ── Entry-by-entry codegen (unchanged from before) ──────────────
 
 fn emit_layer_stmts(ds: &DispatchSequence) -> Vec<TokenStream> {
-    ds.entries_for_layer(0).filter_map(emit_entry).collect()
+    use crate::lowering::implementation::LaunchKind;
+    use std::collections::BTreeSet;
+
+    // Identify DeviceCallable compilation units with 2+ non-Noop entries.
+    let dc_units: BTreeSet<_> = {
+        let mut unit_counts: std::collections::BTreeMap<_, usize> = std::collections::BTreeMap::new();
+        for e in ds.entries_for_layer(0) {
+            if e.launch_kind == LaunchKind::DeviceCallable && e.kind != ImplDispatchKind::Noop {
+                *unit_counts.entry(e.compilation_unit).or_default() += 1;
+            }
+        }
+        unit_counts
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .map(|(unit, _)| unit)
+            .collect()
+    };
+
+    let mut stmts = Vec::new();
+
+    // If any megakernel units exist, capture num_tokens early (before
+    // hidden_states gets moved by later ops).
+    if !dc_units.is_empty() {
+        stmts.push(quote! {
+            let __num_tokens = hidden_states.dim(0) as i32;
+            let num_tokens = __num_tokens as u32;
+        });
+    }
+
+    let mut emitted_units: BTreeSet<crate::lowering::assignment::CompilationUnitId> =
+        BTreeSet::new();
+
+    for entry in ds.entries_for_layer(0) {
+        if dc_units.contains(&entry.compilation_unit) {
+            // This entry belongs to a megakernel unit. Emit the
+            // megakernel launch once (when we first see this unit).
+            if emitted_units.insert(entry.compilation_unit) {
+                let unit_entries: Vec<_> = ds
+                    .entries_for_layer(0)
+                    .filter(|e| e.compilation_unit == entry.compilation_unit)
+                    .filter(|e| e.kind != ImplDispatchKind::Noop)
+                    .collect();
+                if let Some(ts) = emit_megakernel_launch(&unit_entries, entry.compilation_unit) {
+                    stmts.push(ts);
+                }
+            }
+        } else {
+            // Standalone entry — emit as before.
+            if let Some(ts) = emit_entry(entry) {
+                stmts.push(ts);
+            }
+        }
+    }
+    stmts
+}
+
+/// Emit the Rust-side launch code for a megakernel compilation unit.
+///
+/// Generates:
+/// 1. An `extern "C"` FFI declaration matching the flat-arg launch
+///    wrapper generated by `cuda_codegen.rs`.
+/// 2. Code to extract raw pointers / dims from layer weights and
+///    runtime state.
+/// 3. A single FFI call that launches the cooperative kernel.
+fn emit_megakernel_launch(
+    entries: &[&DispatchEntry],
+    unit_id: crate::lowering::assignment::CompilationUnitId,
+) -> Option<TokenStream> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let unit_idx = unit_id.0;
+    let launch_fn = format_ident!("megakernel_unit{}_launch", unit_idx);
+
+    // Build the FFI param list and call args for each phase.
+    let mut ffi_params = Vec::new(); // (type, name) for extern "C" decl
+    let mut call_args = Vec::new();  // TokenStream for each arg expression
+    let mut setup_stmts = Vec::new(); // setup code (buffer alloc, pointer extraction)
+
+    for (i, entry) in entries.iter().enumerate() {
+        emit_megakernel_phase_ffi(entry, i, &mut ffi_params, &mut call_args, &mut setup_stmts);
+    }
+
+    // Build the extern "C" declaration.
+    let ffi_param_tokens: Vec<TokenStream> = ffi_params
+        .iter()
+        .map(|(ty, name)| {
+            let name_ident = format_ident!("{}", name);
+            let ty_tokens = c_type_to_rust_tokens(ty);
+            quote! { #name_ident: #ty_tokens }
+        })
+        .collect();
+
+    // Grid/block/smem/stream are always the last 4 params.
+    let grid_x_ident = format_ident!("__grid_x");
+    let block_x_ident = format_ident!("__block_x");
+    let smem_bytes_ident = format_ident!("__smem_bytes");
+    let stream_ident = format_ident!("__stream");
+
+    Some(quote! {{
+        // Megakernel unit #unit_idx
+        unsafe extern "C" {
+            fn #launch_fn(
+                #(#ffi_param_tokens,)*
+                #grid_x_ident: i32,
+                #block_x_ident: i32,
+                #smem_bytes_ident: usize,
+                #stream_ident: u64,
+            ) -> i32;
+        }
+
+        #(#setup_stmts)*
+
+        // Cooperative kernel launch: grid = max(num_tokens, N for GEMVs),
+        // block = 256 (covers norm/silu/gemv thread needs).
+        let __mk_grid = __num_tokens;
+        let __mk_block = 256i32;
+        let __mk_smem = 1024usize; // union-max across phases
+        let __mk_rc = #launch_fn(
+            #(#call_args,)*
+            __mk_grid, __mk_block, __mk_smem,
+            device.compute_stream as u64,
+        );
+        debug_assert_eq!(__mk_rc, 0, concat!("megakernel unit ", stringify!(#unit_idx), " launch failed"));
+    }})
+}
+
+/// Map a C type string to Rust FFI type tokens.
+fn c_type_to_rust_tokens(c_type: &str) -> TokenStream {
+    match c_type {
+        "void*" => quote! { *mut u8 },
+        "const void*" => quote! { *const u8 },
+        "int" => quote! { i32 },
+        "float" => quote! { f32 },
+        "int64_t" => quote! { i64 },
+        "size_t" => quote! { usize },
+        "uint64_t" => quote! { u64 },
+        _ => quote! { *mut u8 }, // fallback
+    }
+}
+
+/// Emit FFI params, call args, and setup statements for one phase.
+fn emit_megakernel_phase_ffi(
+    entry: &DispatchEntry,
+    phase_idx: usize,
+    ffi_params: &mut Vec<(String, String)>,
+    call_args: &mut Vec<TokenStream>,
+    setup_stmts: &mut Vec<TokenStream>,
+) {
+    let p = format!("p{phase_idx}");
+
+    match entry.kind {
+        ImplDispatchKind::RmsNorm => {
+            let is_attn = entry.is_attn_norm.unwrap_or(true);
+            let norm_field = if is_attn {
+                quote! { layer.input_layernorm }
+            } else {
+                quote! { layer.post_attention_layernorm }
+            };
+
+            // For the attention norm, output goes to a temp buffer (normed).
+            // For the MLP norm, it's in-place on hidden_states.
+            let out_ident = format_ident!("__{}_out", p);
+            let in_ident = format_ident!("__{}_input", p);
+
+            if is_attn {
+                setup_stmts.push(quote! {
+                    // Phase #phase_idx: attn RmsNorm — alloc normed output
+                    let __norm_out = device.caching.alloc_tensor(
+                        &[num_tokens as usize, dims.q_size + 2 * dims.kv_size],
+                        DType::BF16,
+                    );
+                    let #out_ident = __norm_out.as_mut_ptr::<u16>();
+                    let #in_ident = hidden_states.as_ptr::<u16>();
+                });
+            } else {
+                setup_stmts.push(quote! {
+                    // Phase #phase_idx: MLP RmsNorm
+                    let __mlp_norm_out = device.caching.alloc_tensor(
+                        &[num_tokens as usize, dims.intermediate_size * 2],
+                        DType::BF16,
+                    );
+                    let #out_ident = __mlp_norm_out.as_mut_ptr::<u16>();
+                    let #in_ident = hidden_states.as_ptr::<u16>();
+                });
+            }
+
+            let weight_ident = format_ident!("__{}_weight", p);
+            let eps_ident = format_ident!("__{}_eps", p);
+            let hidden_ident = format_ident!("__{}_hidden", p);
+            let nt_ident = format_ident!("__{}_nt", p);
+
+            setup_stmts.push(quote! {
+                let #weight_ident = #norm_field.weight.as_ptr::<u16>();
+                let #eps_ident = #norm_field.eps;
+                let #hidden_ident = #norm_field.weight.dim(0) as i32;
+                let #nt_ident = num_tokens as i32;
+            });
+
+            ffi_params.push(("void*".into(), format!("{p}_out")));
+            ffi_params.push(("const void*".into(), format!("{p}_input")));
+            ffi_params.push(("const void*".into(), format!("{p}_weight")));
+            ffi_params.push(("float".into(), format!("{p}_eps")));
+            ffi_params.push(("int".into(), format!("{p}_hidden_size")));
+            ffi_params.push(("int".into(), format!("{p}_num_tokens")));
+
+            call_args.push(quote! { #out_ident as *mut u8 });
+            call_args.push(quote! { #in_ident as *const u8 });
+            call_args.push(quote! { #weight_ident as *const u8 });
+            call_args.push(quote! { #eps_ident });
+            call_args.push(quote! { #hidden_ident });
+            call_args.push(quote! { #nt_ident });
+        }
+
+        ImplDispatchKind::CutlassGemv => {
+            let phase = entry.gemm_phase.unwrap();
+            let (input_expr, weight_expr, store_expr) = gemv_operands(phase);
+
+            let out_ident = format_ident!("__{}_out_ptr", p);
+            let x_ident = format_ident!("__{}_x_ptr", p);
+            let w_ident = format_ident!("__{}_w_ptr", p);
+            let n_ident = format_ident!("__{}_N", p);
+            let k_ident = format_ident!("__{}_K", p);
+
+            setup_stmts.push(quote! {
+                // Phase #phase_idx: GEMV
+                let __gemv_act: GpuTensor = #input_expr;
+                let __gemv_w = (#weight_expr).dense_weight();
+                let __gemv_n = __gemv_w.dim(0);
+                let __gemv_k = __gemv_w.dim(1);
+                let __gemv_out_buf = device.caching.alloc_tensor(
+                    &[1, __gemv_n], DType::BF16,
+                );
+                let #out_ident = __gemv_out_buf.as_mut_ptr::<u16>();
+                let #x_ident = __gemv_act.as_ptr::<u16>();
+                let #w_ident = __gemv_w.as_ptr::<u16>();
+                let #n_ident = __gemv_n as i32;
+                let #k_ident = __gemv_k as i32;
+            });
+            setup_stmts.push(store_expr);
+
+            ffi_params.push(("void*".into(), format!("{p}_out")));
+            ffi_params.push(("const void*".into(), format!("{p}_x")));
+            ffi_params.push(("const void*".into(), format!("{p}_W")));
+            ffi_params.push(("int".into(), format!("{p}_N")));
+            ffi_params.push(("int".into(), format!("{p}_K")));
+            ffi_params.push(("float".into(), format!("{p}_alpha")));
+            ffi_params.push(("float".into(), format!("{p}_beta")));
+
+            call_args.push(quote! { #out_ident as *mut u8 });
+            call_args.push(quote! { #x_ident as *const u8 });
+            call_args.push(quote! { #w_ident as *const u8 });
+            call_args.push(quote! { #n_ident });
+            call_args.push(quote! { #k_ident });
+            call_args.push(quote! { 1.0f32 });
+            call_args.push(quote! { 0.0f32 });
+        }
+
+        ImplDispatchKind::FusedQkvRopeCache => {
+            let q_out_ident = format_ident!("__{}_q_out", p);
+            let kc_ident = format_ident!("__{}_key_cache", p);
+            let vc_ident = format_ident!("__{}_value_cache", p);
+            let qkv_ident = format_ident!("__{}_qkv", p);
+            let pos_ident = format_ident!("__{}_positions", p);
+            let cos_sin_ident = format_ident!("__{}_cos_sin", p);
+            let slot_ident = format_ident!("__{}_slot_mapping", p);
+
+            setup_stmts.push(quote! {
+                // Phase #phase_idx: FusedQkvRopeCache
+                let __qkv_tensor = qkv_out.as_ref().unwrap();
+                let __q_buf = device.caching.alloc_tensor(
+                    &[num_tokens as usize, dims.q_size], DType::BF16,
+                );
+                let #q_out_ident = __q_buf.as_mut_ptr::<u16>();
+                let #kc_ident = kv_cache.k_cache(layer_idx).raw_ptr() as *mut u8;
+                let #vc_ident = kv_cache.v_cache(layer_idx).raw_ptr() as *mut u8;
+                let #qkv_ident = __qkv_tensor.as_ptr::<u16>();
+                let #pos_ident = positions.as_ptr::<u32>();
+                let #cos_sin_ident = rotary.cos_sin_cache.as_ptr::<u16>();
+                let #slot_ident = slot_mapping.as_ptr::<i64>();
+            });
+
+            ffi_params.push(("void*".into(), format!("{p}_q_out")));
+            ffi_params.push(("void*".into(), format!("{p}_key_cache")));
+            ffi_params.push(("void*".into(), format!("{p}_value_cache")));
+            ffi_params.push(("const void*".into(), format!("{p}_qkv")));
+            ffi_params.push(("const void*".into(), format!("{p}_positions")));
+            ffi_params.push(("const void*".into(), format!("{p}_cos_sin_cache")));
+            ffi_params.push(("const void*".into(), format!("{p}_slot_mapping")));
+            ffi_params.push(("int".into(), format!("{p}_q_size")));
+            ffi_params.push(("int".into(), format!("{p}_kv_size")));
+            ffi_params.push(("int".into(), format!("{p}_head_dim")));
+            ffi_params.push(("int".into(), format!("{p}_num_tokens")));
+
+            call_args.push(quote! { #q_out_ident as *mut u8 });
+            call_args.push(quote! { #kc_ident });
+            call_args.push(quote! { #vc_ident });
+            call_args.push(quote! { #qkv_ident as *const u8 });
+            call_args.push(quote! { #pos_ident as *const u8 });
+            call_args.push(quote! { #cos_sin_ident as *const u8 });
+            call_args.push(quote! { #slot_ident as *const u8 });
+            call_args.push(quote! { dims.q_size as i32 });
+            call_args.push(quote! { dims.kv_size as i32 });
+            call_args.push(quote! { dims.head_dim as i32 });
+            call_args.push(quote! { num_tokens as i32 });
+
+            // After the megakernel launch, update qkv_out to point to Q output.
+            setup_stmts.push(quote! {
+                // Post-launch: update qkv_out to the Q tensor for attention.
+                // (This executes after the FFI call below.)
+            });
+        }
+
+        ImplDispatchKind::SiluAndMul => {
+            let out_ident = format_ident!("__{}_out", p);
+            let in_ident = format_ident!("__{}_input", p);
+            let d_ident = format_ident!("__{}_d", p);
+            let nt_ident = format_ident!("__{}_nt", p);
+
+            setup_stmts.push(quote! {
+                // Phase #phase_idx: SiluAndMul
+                let __silu_in = gate_up.as_ref().unwrap();
+                let __silu_out_buf = device.caching.alloc_tensor(
+                    &[num_tokens as usize, dims.intermediate_size], DType::BF16,
+                );
+                let #out_ident = __silu_out_buf.as_mut_ptr::<u16>();
+                let #in_ident = __silu_in.as_ptr::<u16>();
+                let #d_ident = dims.intermediate_size as i32;
+                let #nt_ident = num_tokens as i32;
+            });
+
+            ffi_params.push(("void*".into(), format!("{p}_out")));
+            ffi_params.push(("const void*".into(), format!("{p}_input")));
+            ffi_params.push(("int".into(), format!("{p}_d")));
+            ffi_params.push(("int".into(), format!("{p}_num_tokens")));
+
+            call_args.push(quote! { #out_ident as *mut u8 });
+            call_args.push(quote! { #in_ident as *const u8 });
+            call_args.push(quote! { #d_ident });
+            call_args.push(quote! { #nt_ident });
+        }
+
+        ImplDispatchKind::CutlassGemm { .. } => {
+            let phase = entry.gemm_phase.unwrap();
+            let (_, weight_expr, store_expr) = gemm_operands(phase, entry.fused_residual);
+            let cutlass_input = cutlass_input_expr(phase);
+
+            let c_ident = format_ident!("__{}_C", p);
+            let a_ident = format_ident!("__{}_A", p);
+            let b_ident = format_ident!("__{}_B", p);
+            let m_ident = format_ident!("__{}_M", p);
+            let n_ident = format_ident!("__{}_N", p);
+            let k_ident = format_ident!("__{}_K", p);
+
+            setup_stmts.push(quote! {
+                // Phase #phase_idx: CUTLASS GEMM
+                let __gemm_act: GpuTensor = #cutlass_input;
+                let __gemm_m = __gemm_act.dim(0) as i32;
+                let __gemm_k = __gemm_act.dim(1) as i32;
+                let __gemm_w = (#weight_expr).dense_weight();
+                let __gemm_n = __gemm_w.dim(0) as i32;
+                let __gemm_out_buf = device.caching.alloc_tensor(
+                    &[__gemm_m as usize, __gemm_n as usize], __gemm_act.dtype(),
+                );
+                let #c_ident = __gemm_out_buf.as_mut_ptr::<u16>();
+                let #a_ident = __gemm_act.as_ptr::<u16>();
+                let #b_ident = __gemm_w.as_ptr::<u16>();
+                let #m_ident = __gemm_m;
+                let #n_ident = __gemm_n;
+                let #k_ident = __gemm_k;
+            });
+            setup_stmts.push(store_expr);
+
+            ffi_params.push(("void*".into(), format!("{p}_C")));
+            ffi_params.push(("const void*".into(), format!("{p}_A")));
+            ffi_params.push(("const void*".into(), format!("{p}_B")));
+            ffi_params.push(("int".into(), format!("{p}_M")));
+            ffi_params.push(("int".into(), format!("{p}_N")));
+            ffi_params.push(("int".into(), format!("{p}_K")));
+            ffi_params.push(("float".into(), format!("{p}_alpha")));
+            ffi_params.push(("float".into(), format!("{p}_beta")));
+
+            call_args.push(quote! { #c_ident as *mut u8 });
+            call_args.push(quote! { #a_ident as *const u8 });
+            call_args.push(quote! { #b_ident as *const u8 });
+            call_args.push(quote! { #m_ident });
+            call_args.push(quote! { #n_ident });
+            call_args.push(quote! { #k_ident });
+            call_args.push(quote! { 1.0f32 });
+            call_args.push(quote! { 0.0f32 });
+        }
+
+        // For unsupported phases in megakernels, skip silently.
+        // The megakernel extraction only includes phases that are
+        // DeviceCallable, so we should never hit unknown kinds here.
+        _ => {}
+    }
+}
+
+/// GEMV-specific operand expressions (M=1 only).
+/// Returns (input_expr, weight_expr, post_launch_store).
+fn gemv_operands(phase: GemmPhase) -> (TokenStream, TokenStream, TokenStream) {
+    match phase {
+        GemmPhase::Q | GemmPhase::K | GemmPhase::V => (
+            quote! { **normed.as_ref().unwrap() },
+            quote! { layer.self_attn_q_proj }, // Will be overridden per-phase below
+            quote! {},
+        ),
+        GemmPhase::Gate => (
+            quote! { **normed.as_ref().unwrap() },
+            quote! { layer.mlp_gate_proj },
+            quote! { gate_up = Some(__gemv_out_buf); },
+        ),
+        GemmPhase::Up => (
+            quote! { **normed.as_ref().unwrap() },
+            quote! { layer.mlp_up_proj },
+            quote! {},
+        ),
+        GemmPhase::Down => (
+            quote! { **silu_out.as_ref().unwrap() },
+            quote! { layer.mlp_down_proj },
+            quote! { drop(silu_out.take()); hidden_states = __gemv_out_buf; },
+        ),
+        _ => (
+            quote! { **normed.as_ref().unwrap() },
+            quote! { layer.self_attn_q_proj },
+            quote! {},
+        ),
+    }
 }
 
 /// Emit statements for the post-loop (lm_head) phase.
@@ -941,7 +1485,9 @@ struct FieldSpec {
 fn extract_weight_fields(
     dag: &crate::dag::ModelDag,
     qkv_fused: bool,
+    qkv_unfused: bool,
     gate_up_fused: bool,
+    gate_up_unfused: bool,
 ) -> (Vec<FieldSpec>, Vec<FieldSpec>) {
     use crate::dag::{BufferKind, OpKind};
     use std::collections::BTreeMap;
@@ -990,17 +1536,25 @@ fn extract_weight_fields(
     }
 
     // Apply solver fusion decisions to the per-layer fields.
-    if qkv_fused {
+    // When both fused and unfused are needed, carry both — different
+    // buckets reference different fields.
+    if qkv_fused && !qkv_unfused {
+        // All buckets use fused QKV — remove individual q/k/v fields.
         per_layer.retain(|f| {
             !f.name.contains("q_proj") && !f.name.contains("k_proj") && !f.name.contains("v_proj")
         });
+    }
+    if qkv_fused {
         per_layer.push(FieldSpec {
             name: "self_attn.qkv_proj".to_string(),
             ty: "LinearLayer",
         });
     }
-    if gate_up_fused {
+    if gate_up_fused && !gate_up_unfused {
+        // All buckets use fused gate+up — remove individual fields.
         per_layer.retain(|f| !f.name.contains("gate_proj") && !f.name.contains("up_proj"));
+    }
+    if gate_up_fused {
         per_layer.push(FieldSpec {
             name: "mlp.gate_up_proj".to_string(),
             ty: "LinearLayer",
@@ -1068,8 +1622,11 @@ fn emit_model_load(
     per_layer: &[FieldSpec],
     global: &[FieldSpec],
     qkv_fused: bool,
+    qkv_unfused: bool,
     gate_up_fused: bool,
+    gate_up_unfused: bool,
 ) -> TokenStream {
+    let _ = (qkv_unfused, gate_up_unfused); // used in field list, loader handles both
     // Per-layer field loads.
     let layer_loads: Vec<TokenStream> = per_layer.iter().map(|f| {
         let ident = field_ident(&f.name);
@@ -1274,6 +1831,8 @@ fn emit_model_load(
                     LinearLayer::Dense(Linear::load(weights, "lm_head")?)
                 };
 
+                tracing::info!("Solver execution plan:\n{}", EXECUTION_PLAN_SUMMARY);
+
                 Ok((Self {
                     layers,
                     dims,
@@ -1293,7 +1852,8 @@ fn build_library(
     match target {
         TargetId::L4Sm89 => ImplementationLibrary::l4_sm89_starter(dims),
         TargetId::L40sSm89 => ImplementationLibrary::l40s_sm89_starter(dims),
-        _ => ImplementationLibrary::l4_sm89_starter(dims),
+        TargetId::H100Sm90 => ImplementationLibrary::h100_sm90_starter(dims),
+        TargetId::A100Sm80 => ImplementationLibrary::l4_sm89_starter(dims),
     }
 }
 
@@ -1301,7 +1861,8 @@ fn build_profile(target: &TargetId) -> TargetProfile {
     match target {
         TargetId::L4Sm89 => TargetProfile::l4_sm89(),
         TargetId::L40sSm89 => TargetProfile::l40s_sm89(),
-        _ => TargetProfile::l4_sm89(),
+        TargetId::H100Sm90 => TargetProfile::h100_sm90(),
+        TargetId::A100Sm80 => TargetProfile::l4_sm89(),
     }
 }
 

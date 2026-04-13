@@ -22,6 +22,16 @@ fn cuda_link() {
     println!("cargo:rerun-if-changed=build.rs");
 
     println!("cargo:rustc-link-search={}", cache_str);
+
+    // Megakernel .a compiled by vllm-tk-test-harness (or any crate
+    // whose build.rs globs ~/.cache/cudaforge/megakernels/*.cu).
+    // The proc macro writes the .cu files during vllm-cuda compilation;
+    // a subsequent build of the harness crate compiles them. Link if present.
+    let mk_lib = std::path::Path::new(&cache_str).join("libmegakernels.a");
+    if mk_lib.exists() {
+        println!("cargo:rustc-link-lib=static=megakernels");
+    }
+
     println!("cargo:rustc-link-lib=static=vllm_kernels");
     println!("cargo:rustc-link-lib=static=ggml_kernels");
     println!("cargo:rustc-link-lib=static=marlin_kernels");

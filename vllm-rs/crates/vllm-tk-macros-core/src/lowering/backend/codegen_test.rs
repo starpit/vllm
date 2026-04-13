@@ -214,21 +214,16 @@ mod tests {
     fn solver_elects_fused_gate_up_on_l4() {
         let source = gen_source("1..1024");
 
-        // Fused gate+up field IS present.
+        // Fused gate+up field IS present (some buckets use it).
         assert!(
             source.contains("mlp_gate_up_proj"),
             "solver should produce fused gate+up field on L4"
         );
 
-        // Separate gate/up fields are NOT in the struct definition.
-        assert!(
-            !source.contains("pub mlp_gate_proj"),
-            "solver should NOT produce separate gate field when fused"
-        );
-        assert!(
-            !source.contains("pub mlp_up_proj"),
-            "solver should NOT produce separate up field when fused"
-        );
+        // Some buckets (e.g. BS=64) use separate CUTLASS GEMMs for
+        // gate and up, so the struct carries BOTH fused and unfused
+        // fields. Each bucket function references whichever it needs.
+        // (Prior to per-bucket flexibility, fusion was forced uniform.)
     }
 
     #[test]
@@ -270,6 +265,19 @@ mod tests {
             "solve_time_one_forward: {:?} ({} bytes)",
             elapsed,
             source.len()
+        );
+    }
+
+    #[test]
+    fn emits_execution_plan_summary() {
+        let source = gen_source("1..1024");
+        assert!(
+            source.contains("EXECUTION_PLAN_SUMMARY"),
+            "missing EXECUTION_PLAN_SUMMARY const"
+        );
+        assert!(
+            source.contains("print_execution_plan"),
+            "missing print_execution_plan function"
         );
     }
 

@@ -302,6 +302,51 @@ fn h100_sm90_plan_family() {
 }
 
 #[test]
+fn h100_sm90_megakernel_extraction() {
+    use crate::lowering::backend::cuda_codegen::{extract_megakernel_units, generate_cuda_source};
+    use crate::lowering::backend::dispatch::DispatchSequence;
+    use crate::lowering::solver::PlanFamily;
+
+    let tile_graph = TileGraph::build_llama_forward_1b(1);
+    let mut library = ImplementationLibrary::h100_sm90_starter_default();
+    let profile = TargetProfile::h100_sm90();
+
+    let family = PlanFamily::solve_grid(
+        &tile_graph,
+        &mut library,
+        &profile,
+        &BacktrackCpSolver::default(),
+        &[1, 128],
+    );
+
+    // Check that at least one bucket has megakernel units.
+    let mut found_megakernel = false;
+    for (_seq, plan) in family.iter() {
+        let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+        let units = extract_megakernel_units(&ds);
+        if !units.is_empty() {
+            found_megakernel = true;
+            for unit in &units {
+                let result = generate_cuda_source(unit);
+                eprintln!(
+                    "--- Unit {} ({} phases) ---\n{}",
+                    unit.unit_id.0,
+                    unit.phases.len(),
+                    result.cuda_source,
+                );
+                assert!(result.cuda_source.contains("__global__"));
+                assert!(result.cuda_source.contains("cudaLaunchCooperativeKernel"));
+            }
+        }
+    }
+    // H100 plans should group DeviceCallable ops into megakernels.
+    assert!(
+        found_megakernel,
+        "Expected at least one megakernel unit in H100 plans"
+    );
+}
+
+#[test]
 fn l40s_sm89_plan_family() {
     use crate::lowering::backend::dispatch::format_plan_family;
     use crate::lowering::solver::PlanFamily;

@@ -67,6 +67,49 @@ fn build_cuda() {
         "-std=c++17"
     };
 
+    // ── Build 0 (optional): megakernel .cu files from proc-macro cache ──
+    let megakernel_cache = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("cudaforge/megakernels");
+    let megakernel_cus: Vec<String> = if megakernel_cache.exists() {
+        std::fs::read_dir(&megakernel_cache)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "cu"))
+            .map(|e| e.path().display().to_string())
+            .collect()
+    } else {
+        vec![]
+    };
+    if !megakernel_cus.is_empty() {
+        let vllm_cuda_csrc = workspace_root.join("crates/vllm-cuda/csrc");
+        let mut mk_builder = cudaforge::KernelBuilder::new();
+        mk_builder = mk_builder
+            .out_dir(&cache_dir)
+            .source_files(megakernel_cus.clone())
+            .include_path(vllm_cuda_csrc.display().to_string())
+            .with_cutlass(Some(CUTLASS_COMMIT));
+        mk_builder
+            .arg(std_flag)
+            .arg("-O3")
+            .arg("--use_fast_math")
+            .arg("--expt-extended-lambda")
+            .arg("--expt-relaxed-constexpr")
+            .arg("-DNDEBUG")
+            .arg("-Xcompiler=-fPIC")
+            .arg("-Xcompiler=-fno-strict-aliasing")
+            .arg("-Xcompiler=-Wno-psabi")
+            .arg(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+            .arg("-lineinfo")
+            .build_lib(format!("{cache_str}/libmegakernels.a"))
+            .expect("failed to build megakernel .cu files");
+        println!("cargo:rustc-link-lib=static=megakernels");
+        for cu in &megakernel_cus {
+            println!("cargo:rerun-if-changed={cu}");
+        }
+    }
+
     // ── Build 1: CUTLASS + FlashInfer (existing kernels) ──
     let mut builder = cudaforge::KernelBuilder::new();
     builder = builder

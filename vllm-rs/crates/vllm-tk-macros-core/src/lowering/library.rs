@@ -317,30 +317,12 @@ impl ImplementationLibrary {
     /// ops. Each wraps a standalone impl with the DeviceCallableWrapper
     /// so it uses Mbarrier handoffs and can share a CompilationUnitId.
     fn add_device_callable_variants(&mut self, dims: crate::lowering::tile_graph::ModelDims) {
-        // DeviceCallable GEMM: use cuBLAS-equivalent costs from CSV.
-        // The solver will pick these when grouping saves enough launch overhead.
-        for &phase in &[
-            TileKind::GemmQ,
-            TileKind::GemmK,
-            TileKind::GemmV,
-            TileKind::GemmOProj,
-            TileKind::GemmGate,
-            TileKind::GemmUp,
-            TileKind::GemmDown,
-            TileKind::GemmLmHead,
-        ] {
-            self.entries
-                .push(Box::new(DeviceCallableWrapper::new(Box::new(
-                    CublasGemmExImpl::new(phase),
-                ))));
-        }
-        // DeviceCallable fused GEMM+residual (oproj, down).
-        for &phase in &[TileKind::GemmOProj, TileKind::GemmDown] {
-            self.entries
-                .push(Box::new(DeviceCallableWrapper::new(Box::new(
-                    CublasGemmExWithResidualImpl::new(phase),
-                ))));
-        }
+        // NOTE: cuBLAS GEMM is NOT device-callable — it's a host API that
+        // internally calls cudaLaunchKernel. Only genuinely __device__
+        // implementations (CUTLASS GemmUniversal::invoke, elementwise ops)
+        // get DeviceCallable wrappers. CUTLASS GEMM/GEMV DC variants are
+        // added below; TK attention is added above.
+
         // DeviceCallable elementwise ops.
         self.entries
             .push(Box::new(DeviceCallableWrapper::new(Box::new(

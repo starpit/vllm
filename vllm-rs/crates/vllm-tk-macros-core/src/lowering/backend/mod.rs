@@ -15,6 +15,7 @@ mod codegen_dump_test;
 #[cfg(test)]
 mod codegen_test;
 pub mod compile_dsl;
+pub mod cuda_codegen;
 pub mod dispatch;
 
 pub use compile_dsl::ForwardDef;

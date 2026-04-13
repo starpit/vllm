@@ -558,3 +558,64 @@ fn gemma2_solver_finds_feasible_plan() {
         );
     }
 }
+
+#[test]
+fn dp_solver_on_fuf() {
+    use crate::lowering::solver::dp::DpSolver;
+    use crate::lowering::tile_graph::ModelDims;
+
+    // Build FUF from LLaMA DSL with 3 layers.
+    let dsl = r#"
+        kernel llama_dp<NL=3, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..NL {
+                let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                let q = gemm(normed, self_attn.q_proj[layer]);
+                let k = gemm(normed, self_attn.k_proj[layer]);
+                let v = gemm(normed, self_attn.v_proj[layer]);
+                let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                let attn = attention(q, k, v, kv_cache[layer], block_table);
+                let oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+
+                let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                let up = gemm(normed2, mlp.up_proj[layer]);
+                let down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
+            }
+            hidden_states = rmsnorm(hidden_states, norm);
+            logits = gemm(hidden_states, lm_head);
+        }
+    "#;
+    let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
+    let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
+    let dag = crate::parse::build_dag(&def).unwrap();
+    let fuf = TileGraph::build_fuf(&dag, ModelDims::LLAMA_3_2_1B);
+
+    // Build problem from FUF.
+    let mut library = ImplementationLibrary::l4_sm89_starter(ModelDims::LLAMA_3_2_1B);
+    let profile = TargetProfile::l4_sm89();
+    let problem = crate::lowering::problem::Problem::build(&fuf, &mut library, &profile);
+
+    // Solve with DP.
+    let result = DpSolver.solve(&problem);
+    match result {
+        SolveResult::Found { best, .. } => {
+            eprintln!(
+                "DP solver: {:.1}µs, {} steps",
+                best.predicted_us, best.solver_steps
+            );
+            // Every tile should be covered.
+            for node in fuf.iter_topo() {
+                assert!(
+                    best.assignment.cover.contains_key(&node.id),
+                    "tile {:?} ({:?}) not covered",
+                    node.id,
+                    node.kind,
+                );
+            }
+        }
+        SolveResult::Infeasible => panic!("DP solver reported infeasible on LLaMA FUF"),
+    }
+}

@@ -22,6 +22,7 @@
 //! gave the call: ship CP first, shift to ILP if we need it.
 
 pub mod backtrack_cp;
+pub mod dp;
 pub mod ilp;
 
 use crate::lowering::assignment::Assignment;

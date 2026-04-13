@@ -16,6 +16,7 @@
     clippy::needless_range_loop,
     clippy::useless_vec
 )]
+pub mod cfg;
 pub mod cpu_golden;
 pub mod dag;
 pub mod lowering;

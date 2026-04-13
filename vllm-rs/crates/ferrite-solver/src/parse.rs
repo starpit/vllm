@@ -37,6 +37,7 @@ pub struct MegakernelDef {
 }
 
 /// A statement in the kernel body.
+#[derive(Clone, Debug)]
 pub enum Stmt {
     /// `let x = op(args...);`
     Let(LetStmt),
@@ -48,21 +49,25 @@ pub enum Stmt {
     ForLoop(ForLoopStmt),
 }
 
+#[derive(Clone, Debug)]
 pub struct LetStmt {
     pub name: Ident,
     pub call: OpCall,
 }
 
+#[derive(Clone, Debug)]
 pub struct LetTupleStmt {
     pub names: Vec<Ident>,
     pub call: OpCall,
 }
 
+#[derive(Clone, Debug)]
 pub struct AssignStmt {
     pub target: Ident,
     pub call: OpCall,
 }
 
+#[derive(Clone, Debug)]
 pub struct ForLoopStmt {
     pub var: Ident,
     pub range_end: Ident, // e.g. NL
@@ -70,12 +75,14 @@ pub struct ForLoopStmt {
 }
 
 /// An op call: `op_name(arg1, arg2, ...)` or `op_name(arg1 * arg2, ...)`
+#[derive(Clone, Debug)]
 pub struct OpCall {
     pub op: Ident,
     pub args: Vec<Arg>,
 }
 
 /// An argument to an op call.
+#[derive(Clone, Debug)]
 pub enum Arg {
     /// Variable reference: `x`, `x[layer]`, or `self_attn.q_proj[layer]`.
     /// The name may contain dots (HF weight path segments).

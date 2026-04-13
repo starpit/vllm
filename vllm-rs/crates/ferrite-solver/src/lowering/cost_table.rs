@@ -5,13 +5,13 @@
 //!
 //! 1. Run the microbench sweep on the target GPU:
 //!    ```bash
-//!    CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
+//!    CUDA_PATH=/usr/local/cuda-12.9 cargo test -p ferrite-test-harness \
 //!      --features cuda --test scheduled_megakernel_test \
 //!      gpu_cost_sweep -- --ignored --nocapture
 //!    ```
 //!    This prints CSV to stdout. Redirect to a file:
 //!    ```bash
-//!    ... 2>/dev/null > crates/vllm-tk-macros-core/data/cost_l4_sm89.csv
+//!    ... 2>/dev/null > crates/ferrite-solver/data/cost_l4_sm89.csv
 //!    ```
 //!
 //! 2. The CSV has columns: `kernel,M,N,K,cost_us`

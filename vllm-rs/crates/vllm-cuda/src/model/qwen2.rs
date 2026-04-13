@@ -272,7 +272,7 @@ cutlass_gemm_ffi!(
     cutlass_gemm_64x64_launch,
 );
 
-vllm_tk_macros::forward! {
+ferrite_macros::forward! {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..NL {
         let normed = rmsnorm(hidden_states, input_layernorm[layer]);

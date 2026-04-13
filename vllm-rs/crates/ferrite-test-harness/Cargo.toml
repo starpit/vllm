@@ -1,5 +1,5 @@
 [package]
-name = "vllm-tk-test-harness"
+name = "ferrite-test-harness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ cudarc = { workspace = true, optional = true, features = ["dynamic-linking", "cu
 [dev-dependencies]
 cudarc = { workspace = true, features = ["dynamic-linking", "cuda-version-from-build-system"] }
 half = "2"
-vllm-tk-macros-core = { path = "../vllm-tk-macros-core" }
+ferrite-solver = { path = "../ferrite-solver" }
 
 [build-dependencies]
 cudaforge = { path = "../../third_party/cudaforge", optional = true }

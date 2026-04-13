@@ -9,7 +9,7 @@
 //!
 //! The .cu files behind these FFIs are compiled by `build.rs`:
 //!   - `crates/vllm-cuda/csrc/cutlass_standalone_gemm.cu` (canonical)
-//!   - `crates/vllm-tk-test-harness/csrc/flashinfer_attention_shim.cu`
+//!   - `crates/ferrite-test-harness/csrc/flashinfer_attention_shim.cu`
 
 #[cfg(feature = "cuda")]
 pub mod ffi {

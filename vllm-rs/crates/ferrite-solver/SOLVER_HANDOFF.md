@@ -69,7 +69,7 @@ one line.
 ## The `forward!` DSL
 
 ```rust
-vllm_tk_macros::forward! {
+ferrite_macros::forward! {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..NL {
         let normed = rmsnorm(hidden_states, input_layernorm[layer]);
@@ -378,7 +378,7 @@ tiles can overlap with attention in the megakernel pipeline).
 
 ```bash
 # Verify solver picks separate path on H100:
-cargo test -p vllm-tk-macros-core "h100_sm90_plan_family"
+cargo test -p ferrite-solver "h100_sm90_plan_family"
 
 # Correctness:
 cargo build -p vllm-cli --features cuda --release
@@ -390,7 +390,7 @@ timeout 60 target/release/vllm chat -m Qwen/Qwen2.5-0.5B-Instruct \
 
 ```bash
 # Solver + codegen tests (no GPU needed):
-cargo test -p vllm-tk-macros-core
+cargo test -p ferrite-solver
 
 # Golden correctness tests (needs GPU):
 cargo test -p vllm-e2e --features e2e,cuda --release --test e_correctness \

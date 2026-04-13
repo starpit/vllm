@@ -12,6 +12,6 @@ cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda"]
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-kernels = { path = "../ferrite-kernels" }
-vllm-tk-macros = { path = "../vllm-tk-macros" }
+ferrite-macros = { path = "../ferrite-macros" }
 anyhow = { workspace = true }
 tracing = { workspace = true }

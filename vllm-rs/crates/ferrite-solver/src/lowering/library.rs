@@ -10,7 +10,7 @@
 //! ## Cost calibration
 //!
 //! Per-shape wall-clock costs come from the CP4 microbenches in
-//! `crates/vllm-tk-test-harness/tests/scheduled_megakernel_test.rs`:
+//! `crates/ferrite-test-harness/tests/scheduled_megakernel_test.rs`:
 //!
 //! - `cp4_cublas_gemm_only_microbench` measured 36.6 ms total for
 //!   5 cuBLAS GEMMs × 16 layers at the Llama-1B seq=1024 shape.

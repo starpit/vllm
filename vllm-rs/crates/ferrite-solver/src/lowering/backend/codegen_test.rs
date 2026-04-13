@@ -257,7 +257,7 @@ mod tests {
     fn solve_time_one_forward() {
         // Time one full forward! macro expansion for Llama 3.2 3B.
         // Run with:
-        //   cargo test --release -p vllm-tk-macros-core -- --ignored solve_time_one_forward --nocapture
+        //   cargo test --release -p ferrite-solver -- --ignored solve_time_one_forward --nocapture
         let start = std::time::Instant::now();
         let source = gen_source("1..4096");
         let elapsed = start.elapsed();

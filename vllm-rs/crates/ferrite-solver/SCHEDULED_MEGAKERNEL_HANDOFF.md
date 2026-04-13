@@ -1,7 +1,7 @@
 # Scheduled megakernel — context handoff
 
 > Read this end to end before touching anything in
-> `vllm-tk-macros-core/src/{kernel_library,schedule,scheduled_codegen}.rs` or
+> `ferrite-solver/src/{kernel_library,schedule,scheduled_codegen}.rs` or
 > `templates/scheduled/megakernel.cu`.
 
 ## Quick start (15 minutes to orient)
@@ -19,11 +19,11 @@ git log --oneline -5    # confirm you're on worktree-claude4 at c399f7638 or lat
 **The 15-minute orientation read:**
 
 1. This file (you're reading it)
-2. `crates/vllm-tk-macros-core/src/kernel_library.rs` — start at line 50
+2. `crates/ferrite-solver/src/kernel_library.rs` — start at line 50
    (`enum BoundKernel`), then read down through the cost / coalesce passes
-3. `crates/vllm-tk-macros-core/src/schedule.rs` lines 1–270 — `CostModel`,
+3. `crates/ferrite-solver/src/schedule.rs` lines 1–270 — `CostModel`,
    `BARRIER_COST_MMA_UNITS`, `score_dag`, `partition_into_waves`
-4. `crates/vllm-tk-macros-core/templates/scheduled/megakernel.cu` line ranges in
+4. `crates/ferrite-solver/templates/scheduled/megakernel.cu` line ranges in
    the **megakernel.cu line map** below — don't read the whole file
 5. `tools/cublas_bench/README.md` — the cuBLAS L4 ceiling numbers
 
@@ -192,7 +192,7 @@ sticky errors (cudaFuncSetAttribute → "illegal memory access" etc.). Always ru
 ONE GPU test at a time:
 
 ```
-RUN_GPU_TESTS=1 cargo test -p vllm-tk-test-harness --release --features cuda <one_test_name> -- --nocapture --ignored
+RUN_GPU_TESTS=1 cargo test -p ferrite-test-harness --release --features cuda <one_test_name> -- --nocapture --ignored
 ```
 
 ## The reified DAG and per-layer dataflow
@@ -346,14 +346,14 @@ Each gets its own:
 - `__global__ scheduled_megakernel_<name>` function
 - `extern "C" void launch_scheduled_megakernel_<name>(...)`
 
-Generation entry points in `vllm-tk-macros-core/src/lib.rs`:
+Generation entry points in `ferrite-solver/src/lib.rs`:
 - `scheduled_prefill_tiny` (line ~654) — smallest test variant
 - `scheduled_prefill_medium` (line ~700) — medium test variant
 - `scheduled_prefill_variants_for_dsl` (line ~760) — production variants from
   the build script
 
-The build script (`vllm-tk-test-harness/build.rs`) calls these and writes the
-result to `crates/vllm-tk-test-harness/target/release/build/.../scheduled_prefill_*.cu`.
+The build script (`ferrite-test-harness/build.rs`) calls these and writes the
+result to `crates/ferrite-test-harness/target/release/build/.../scheduled_prefill_*.cu`.
 NVCC compiles all variants into one shared library that the harness loads at
 test time.
 
@@ -369,7 +369,7 @@ minutes per variant — be patient. If you see a stale cache, `rm` the
 ```
 vllm-rs/
   crates/
-    vllm-tk-macros-core/
+    ferrite-solver/
       src/
         kernel_library.rs       ← BoundKernel enum, coalesce passes, try_coalesce framework
         schedule.rs             ← CostModel, partition_into_waves, BARRIER_COST_MMA_UNITS, score_dag
@@ -378,7 +378,7 @@ vllm-rs/
         scheduled_codegen/mod.rs ← Renders WAVE_OPS table from CoalescedDag + WaveSchedule
       templates/
         scheduled/megakernel.cu ← The rendered megakernel template (3000+ lines)
-    vllm-tk-test-harness/
+    ferrite-test-harness/
       tests/
         scheduled_megakernel_test.rs  ← Golden + smoke + bench tests
   tools/
@@ -537,7 +537,7 @@ below that requires either:
     polyalgo win, > 1 ms improvement)
 - [ ] **A.7** Update `try_coalesce_rejects_a_regression` test to also assert
   the binary-bloat reject case (or make it a separate test)
-- [ ] **A.8** `cargo fmt -p vllm-tk-macros-core && cargo clippy -p vllm-tk-macros-core -- -D warnings`
+- [ ] **A.8** `cargo fmt -p ferrite-solver && cargo clippy -p ferrite-solver -- -D warnings`
 - [ ] **A.9** Run all 3 GPU tests one at a time. Golden must still pass with
   unchanged err. Bench should be 53–55 ms (in the noise band).
 - [ ] **A.10** Commit. Suggested commit message:
@@ -549,14 +549,14 @@ fused norm+gemm kernels, etc. Without this, every Step B/C experiment risks
 the same kind of binary-bloat regression we just hit with Narrow.
 
 **File:line pointers** for the work:
-- `crates/vllm-tk-macros-core/src/kernel_library.rs:50` — `enum BoundKernel`
-- `crates/vllm-tk-macros-core/src/kernel_library.rs:185` — `impl BoundKernel { fn kind() }`
-- `crates/vllm-tk-macros-core/src/kernel_library.rs:248` — `impl BoundKernel { fn cost() }`
-- `crates/vllm-tk-macros-core/src/schedule.rs:34` — `struct CostModel`
-- `crates/vllm-tk-macros-core/src/schedule.rs:96` — `fn cutlass_gemm_total`
-- `crates/vllm-tk-macros-core/src/schedule.rs:158` — `pub fn partition_into_waves`
-- `crates/vllm-tk-macros-core/src/kernel_library.rs:993` — `fn try_coalesce`
-- `crates/vllm-tk-macros-core/src/kernel_library.rs:1010` — `fn coalesce_with_target_profile`
+- `crates/ferrite-solver/src/kernel_library.rs:50` — `enum BoundKernel`
+- `crates/ferrite-solver/src/kernel_library.rs:185` — `impl BoundKernel { fn kind() }`
+- `crates/ferrite-solver/src/kernel_library.rs:248` — `impl BoundKernel { fn cost() }`
+- `crates/ferrite-solver/src/schedule.rs:34` — `struct CostModel`
+- `crates/ferrite-solver/src/schedule.rs:96` — `fn cutlass_gemm_total`
+- `crates/ferrite-solver/src/schedule.rs:158` — `pub fn partition_into_waves`
+- `crates/ferrite-solver/src/kernel_library.rs:993` — `fn try_coalesce`
+- `crates/ferrite-solver/src/kernel_library.rs:1010` — `fn coalesce_with_target_profile`
 
 (Line numbers as of commit `c399f7638`. Use `grep -n` if drift.)
 
@@ -735,15 +735,15 @@ shows this is acceptable on L4 but it changes the runtime memory plan.
 cd vllm-rs
 
 # Golden: validates correctness against committed CPU reference at seq=64
-RUN_GPU_TESTS=1 cargo test -p vllm-tk-test-harness --release --features cuda \
+RUN_GPU_TESTS=1 cargo test -p ferrite-test-harness --release --features cuda \
   llama_1b_seq64_h_final_matches_committed_golden -- --nocapture --ignored
 
 # Smoke: single-launch sanity check at seq=1024
-RUN_GPU_TESTS=1 cargo test -p vllm-tk-test-harness --release --features cuda \
+RUN_GPU_TESTS=1 cargo test -p ferrite-test-harness --release --features cuda \
   llama_1b_seq1024_smoke -- --nocapture --ignored
 
 # Bench: 50-iter timed run with per-phase max-clocks rollup
-RUN_GPU_TESTS=1 cargo test -p vllm-tk-test-harness --release --features cuda \
+RUN_GPU_TESTS=1 cargo test -p ferrite-test-harness --release --features cuda \
   llama_1b_seq1024_bench -- --nocapture --ignored
 ```
 
@@ -758,20 +758,20 @@ RUN_GPU_TESTS=1 cargo test -p vllm-tk-test-harness --release --features cuda \
 - **Bench**: report avg-over-50-iters. Differences < 1 ms are noise. Any change
   that regresses by > 1 ms needs justification or revert.
 
-- **Unit tests**: `cargo test -p vllm-tk-macros-core --lib`. The
+- **Unit tests**: `cargo test -p ferrite-solver --lib`. The
   `try_coalesce_rejects_a_regression` test must still pass (proves the gate
   works). The `coalesce_with_target_profile_dispatches_correctly` test must
   still pass (proves the polyalgo + fan-in passes compose correctly).
 
-- **fmt + clippy**: `cargo fmt -p vllm-tk-macros-core && cargo clippy -p vllm-tk-macros-core -- -D warnings`
-  before every commit. Same for `vllm-tk-test-harness` if you touched it.
+- **fmt + clippy**: `cargo fmt -p ferrite-solver && cargo clippy -p ferrite-solver -- -D warnings`
+  before every commit. Same for `ferrite-test-harness` if you touched it.
 
 ### Sanitizer for debugging
 
 ```bash
 RUN_GPU_TESTS=1 /usr/local/cuda-12.9/compute-sanitizer/compute-sanitizer \
   --print-limit 5 \
-  cargo test -p vllm-tk-test-harness --release --features cuda \
+  cargo test -p ferrite-test-harness --release --features cuda \
   <test> -- --nocapture --ignored 2>&1 | grep -E "Invalid|Error|====" | head -40
 ```
 
@@ -781,7 +781,7 @@ constant OOB, not a real alignment bug. Check `NUM_CLOCK_SLOTS`, `NUM_NODES`,
 
 ### Build flags
 
-- `--features cuda` (no `ferrite` for `vllm-tk-macros-core` — that's a different crate)
+- `--features cuda` (no `ferrite` for `ferrite-solver` — that's a different crate)
 - The cudaforge cache is shared across worktrees. If a build picks up stale
   `.a` files, `rm` them under `~/.cudaforge/git/checkouts/`.
 
@@ -796,8 +796,8 @@ The fused/ baseline kernel takes minutes to compile via `cicc` — don't kill it
 ## How to commit
 
 ```bash
-cargo fmt -p vllm-tk-macros-core
-cargo clippy -p vllm-tk-macros-core -- -D warnings
+cargo fmt -p ferrite-solver
+cargo clippy -p ferrite-solver -- -D warnings
 git add -u crates
 git commit -m "$(cat <<'EOF'
 <type>(<scope>): <one-line summary>

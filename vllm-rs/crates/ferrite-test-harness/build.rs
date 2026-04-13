@@ -30,7 +30,7 @@ fn build_cuda() {
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("cudaforge")
-        .join("vllm-tk-test-harness");
+        .join("ferrite-test-harness");
     std::fs::create_dir_all(&cache_dir).ok();
     let cache_str = cache_dir.display().to_string();
 

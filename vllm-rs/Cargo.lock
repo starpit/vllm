@@ -2045,14 +2045,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-macros"
+version = "0.1.0"
+dependencies = [
+ "ferrite-solver",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "trybuild",
+]
+
+[[package]]
 name = "ferrite-models"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-kernels",
+ "ferrite-macros",
  "tracing",
- "vllm-tk-macros",
+]
+
+[[package]]
+name = "ferrite-solver"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "proc-macro2",
+ "quote",
+ "rayon",
+ "syn",
+]
+
+[[package]]
+name = "ferrite-test-harness"
+version = "0.1.0"
+dependencies = [
+ "cudaforge",
+ "cudarc",
+ "dirs 6.0.0",
+ "ferrite-solver",
+ "half",
 ]
 
 [[package]]
@@ -7666,6 +7699,7 @@ dependencies = [
  "ferrite-cuda-builder",
  "ferrite-cuda-core",
  "ferrite-kernels",
+ "ferrite-macros",
  "ferrite-models",
  "half",
  "hf-hub",
@@ -7682,7 +7716,6 @@ dependencies = [
  "vllm-common",
  "vllm-config",
  "vllm-model",
- "vllm-tk-macros",
 ]
 
 [[package]]
@@ -7932,39 +7965,6 @@ dependencies = [
  "vllm-model",
  "vllm-protocol",
  "vllm-wgpu",
-]
-
-[[package]]
-name = "vllm-tk-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
- "trybuild",
- "vllm-tk-macros-core",
-]
-
-[[package]]
-name = "vllm-tk-macros-core"
-version = "0.1.0"
-dependencies = [
- "askama",
- "proc-macro2",
- "quote",
- "rayon",
- "syn",
-]
-
-[[package]]
-name = "vllm-tk-test-harness"
-version = "0.1.0"
-dependencies = [
- "cudaforge",
- "cudarc",
- "dirs 6.0.0",
- "half",
- "vllm-tk-macros-core",
 ]
 
 [[package]]

@@ -25,9 +25,9 @@ members = [
     "crates/ferrite-kernels",
     "crates/ferrite-models",
     "crates/ferrite-cuda-builder",
-    "crates/vllm-tk-macros",
-    "crates/vllm-tk-macros-core",
-    "crates/vllm-tk-test-harness",
+    "crates/ferrite-macros",
+    "crates/ferrite-solver",
+    "crates/ferrite-test-harness",
 ]
 exclude = []
 

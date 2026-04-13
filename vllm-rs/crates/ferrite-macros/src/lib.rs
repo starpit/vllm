@@ -2,7 +2,7 @@
 //! `forward!` proc macro — the compile-time entrypoint to Ferrite.
 //!
 //! At `cargo build` time, `forward!` parses a DSL describing the model's
-//! forward pass, builds a typed [`ModelDag`](vllm_tk_macros_core::dag::ModelDag),
+//! forward pass, builds a typed [`ModelDag`](ferrite_solver::dag::ModelDag),
 //! decomposes it into a tile graph, runs the constraint solver against
 //! the implementation library, and emits Rust that calls individual
 //! kernels via FFI.
@@ -13,8 +13,8 @@
 
 extern crate proc_macro;
 
+use ferrite_solver::lowering::backend::{codegen, compile_dsl};
 use proc_macro::TokenStream;
-use vllm_tk_macros_core::lowering::backend::{codegen, compile_dsl};
 
 /// Generates a solver-driven forward function.
 ///

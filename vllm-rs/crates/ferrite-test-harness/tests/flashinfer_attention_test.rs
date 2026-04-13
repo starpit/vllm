@@ -21,9 +21,9 @@
 
 use cudarc::driver::result;
 use cudarc::driver::sys;
+use ferrite_solver::target_profile::TargetProfile;
+use ferrite_test_harness::ffi;
 use half::bf16;
-use vllm_tk_macros_core::target_profile::TargetProfile;
-use vllm_tk_test_harness::ffi;
 
 // ── Test dims (small enough that the CPU reference runs in milliseconds) ──
 const SEQ_LEN: usize = 64;

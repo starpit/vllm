@@ -3,22 +3,22 @@
 //!
 //! Benchmarks every kernel the solver can pick (cuBLAS + the full CUTLASS
 //! tile grid + GEMV at M=1) across a dense (M, N, K) grid, printing a CSV to
-//! stdout that becomes `crates/vllm-tk-macros-core/data/cost_<gpu>.csv`.
+//! stdout that becomes `crates/ferrite-solver/data/cost_<gpu>.csv`.
 //!
 //! The solver's cost model is keyed by the CSV column names — adding a new
 //! CUTLASS config means adding one entry to the `bench_cutlass!` macro below
 //! (and the `cutlass_gemm_ffi!` macro in `solver_dispatch.rs`).
 //!
 //! Running:
-//!   CUDA_PATH=/usr/local/cuda-12.9 cargo test -p vllm-tk-test-harness \
+//!   CUDA_PATH=/usr/local/cuda-12.9 cargo test -p ferrite-test-harness \
 //!     --features cuda --test gpu_cost_sweep gpu_cost_sweep \
 //!     -- --ignored --nocapture \
-//!     2>/dev/null > crates/vllm-tk-macros-core/data/cost_<gpu>.csv
+//!     2>/dev/null > crates/ferrite-solver/data/cost_<gpu>.csv
 
 #![cfg(feature = "cuda")]
 
 use cudarc::driver::result;
-use vllm_tk_test_harness::ffi;
+use ferrite_test_harness::ffi;
 
 fn init_cuda() {
     result::init().expect("cuInit failed");

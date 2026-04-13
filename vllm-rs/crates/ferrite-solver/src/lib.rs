@@ -9,7 +9,7 @@
 //! against an [`lowering::ImplementationLibrary`], and emitting Rust
 //! code that calls individual kernels via FFI. This crate hosts the
 //! non-proc-macro half of that pipeline so it's available to both
-//! `vllm-tk-macros` (the proc-macro crate) and tests.
+//! `ferrite-macros` (the proc-macro crate) and tests.
 
 #[allow(
     clippy::too_many_arguments,

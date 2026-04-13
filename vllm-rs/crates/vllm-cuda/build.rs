@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Links the CUDA kernel .a files compiled by vllm-kernels-cuda's build.rs.
+// Links the CUDA kernel .a files compiled by ferrite-cuda-builder's build.rs.
 // Kernel compilation lives in that crate; this build.rs only emits linker flags.
 
 fn main() {
@@ -12,7 +12,7 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn cuda_link() {
-    // Locate the shared cudaforge cache populated by vllm-kernels-cuda's build.rs.
+    // Locate the shared cudaforge cache populated by ferrite-cuda-builder's build.rs.
     let cache_dir = dirs::cache_dir()
         .expect("no cache directory found")
         .join("cudaforge")
@@ -23,10 +23,9 @@ fn cuda_link() {
 
     println!("cargo:rustc-link-search={}", cache_str);
 
-    // Megakernel .a compiled by vllm-tk-test-harness (or any crate
-    // whose build.rs globs ~/.cache/cudaforge/megakernels/*.cu).
-    // The proc macro writes the .cu files during vllm-cuda compilation;
-    // a subsequent build of the harness crate compiles them. Link if present.
+    // Megakernel .a compiled by ferrite-cuda-builder (or ferrite-test-harness).
+    // The forward!() proc macro writes .cu files during ferrite-models compilation;
+    // ferrite-cuda-builder compiles them. Link if present.
     let mk_lib = std::path::Path::new(&cache_str).join("libmegakernels.a");
     if mk_lib.exists() {
         println!("cargo:rustc-link-lib=static=megakernels");

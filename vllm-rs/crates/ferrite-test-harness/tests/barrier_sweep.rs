@@ -11,7 +11,7 @@
 //! Output: CSV to stdout with `mechanism,cost_us` rows.
 //!
 //! Running:
-//!   cargo test -p vllm-tk-test-harness --features cuda \
+//!   cargo test -p ferrite-test-harness --features cuda \
 //!     --test barrier_sweep barrier_sweep -- --ignored --nocapture \
 //!     2>/dev/null
 
@@ -19,7 +19,7 @@
 
 use cudarc::driver::result;
 use cudarc::driver::sys;
-use vllm_tk_test_harness::ffi;
+use ferrite_test_harness::ffi;
 
 fn init_cuda() {
     result::init().expect("cuInit failed");

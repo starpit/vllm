@@ -1,5 +1,5 @@
 [package]
-name = "vllm-tk-macros"
+name = "ferrite-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 proc-macro = true
 
 [dependencies]
-vllm-tk-macros-core = { path = "../vllm-tk-macros-core" }
+ferrite-solver = { path = "../ferrite-solver" }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

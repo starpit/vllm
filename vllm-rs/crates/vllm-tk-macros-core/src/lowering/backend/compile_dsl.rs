@@ -331,13 +331,15 @@ mod tests {
                 let k = gemm(normed, self_attn.k_proj[layer]);
                 let v = gemm(normed, self_attn.v_proj[layer]);
                 let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
+                let attn = attention(q, k, v, kv_cache[layer], block_table);
+                let oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
 
                 let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
                 let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
                 let up = gemm(normed2, mlp.up_proj[layer]);
-                hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
+                let down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
             }
         "#
         .parse()
@@ -359,13 +361,15 @@ mod tests {
                 let k = gemm(normed, self_attn.k_proj[layer]);
                 let v = gemm(normed, self_attn.v_proj[layer]);
                 let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
+                let attn = attention(q, k, v, kv_cache[layer], block_table);
+                let oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
 
                 let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
                 let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
                 let up = gemm(normed2, mlp.up_proj[layer]);
-                hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
+                let down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
             }
 
             models: [
@@ -396,13 +400,15 @@ mod tests {
                 let k = gemm(normed, self_attn.k_proj[layer]);
                 let v = gemm(normed, self_attn.v_proj[layer]);
                 let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
+                let attn = attention(q, k, v, kv_cache[layer], block_table);
+                let oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
 
                 let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
                 let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
                 let up = gemm(normed2, mlp.up_proj[layer]);
-                hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
+                let down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
             }
 
             models: [
@@ -430,13 +436,15 @@ mod tests {
                 let k = gemm(normed, self_attn.k_proj[layer]);
                 let v = gemm(normed, self_attn.v_proj[layer]);
                 let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
+                let attn = attention(q, k, v, kv_cache[layer], block_table);
+                let oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
 
                 let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
                 let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
                 let up = gemm(normed2, mlp.up_proj[layer]);
-                hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
+                let down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
             }
 
             models: runtime,

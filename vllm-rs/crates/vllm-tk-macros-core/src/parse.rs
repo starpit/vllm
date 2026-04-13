@@ -612,8 +612,9 @@ fn process_call(
             let group_id = BufferId(format!("__rope_{base}"));
             Ok((group_id, q_shape))
         }
-        "attention_decode" => {
-            // attention_decode(q, k, v, kv_cache, block_table) -> output[BS, HD]
+        "attention" | "attention_decode" => {
+            // attention(q, k, v, kv_cache, block_table) -> output[BS, HD]
+            // The solver picks decode vs prefill based on seq_len.
             let (q_id, _) = resolve_arg(dag, ctx, &call.args[0], in_loop)?;
             // k and v args are ignored (they're in the kv_cache)
             let (_k_id, _) = resolve_arg(dag, ctx, &call.args[1], in_loop)?;
@@ -643,6 +644,31 @@ fn process_call(
                 in_loop,
             );
             Ok((out_id, out_shape))
+        }
+        "add" => {
+            // add(a, b) -> output (same shape as a)
+            let (a_id, a_shape) = resolve_arg(dag, ctx, &call.args[0], in_loop)?;
+            let (b_id, _b_shape) = resolve_arg(dag, ctx, &call.args[1], in_loop)?;
+            let out_name = ctx.fresh_name("add");
+            let out_id = BufferId(out_name);
+            dag.add_buffer(Buffer {
+                id: out_id.clone(),
+                kind: BufferKind::Activation,
+                shape: a_shape.clone(),
+                producer: None,
+                consumers: vec![],
+                per_layer: in_loop,
+                is_input: false,
+            });
+            dag.add_op(
+                OpKind::Add {
+                    a: a_id,
+                    b: b_id,
+                    output: out_id.clone(),
+                },
+                in_loop,
+            );
+            Ok((out_id, a_shape))
         }
         "silu" => {
             // silu(x) -> output (same shape)
@@ -915,13 +941,15 @@ mod tests {
                 let k = gemm(normed, self_attn.k_proj[layer]);
                 let v = gemm(normed, self_attn.v_proj[layer]);
                     let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                    hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
+                    let attn = attention(q, k, v, kv_cache[layer], block_table);
+                    let oproj = gemm(attn, self_attn.o_proj[layer]);
+                    hidden_states = add(oproj, hidden_states);
 
                     let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
                     let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
                     let up = gemm(normed2, mlp.up_proj[layer]);
-                    hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
+                    let down = gemm(gate * up, mlp.down_proj[layer]);
+                    hidden_states = add(down, hidden_states);
                 }
                 let normed = rmsnorm(hidden_states, lm_head_norm);
                 logits = gemm(normed, lm_head);
@@ -945,13 +973,15 @@ mod tests {
                 let k = gemm(normed, self_attn.k_proj[layer]);
                 let v = gemm(normed, self_attn.v_proj[layer]);
                     let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                    hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
+                    let attn = attention(q, k, v, kv_cache[layer], block_table);
+                    let oproj = gemm(attn, self_attn.o_proj[layer]);
+                    hidden_states = add(oproj, hidden_states);
 
                     let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
                     let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
                     let up = gemm(normed2, mlp.up_proj[layer]);
-                    hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
+                    let down = gemm(gate * up, mlp.down_proj[layer]);
+                    hidden_states = add(down, hidden_states);
                 }
                 let normed = rmsnorm(hidden_states, lm_head_norm);
                 logits = gemm(normed, lm_head);
@@ -961,9 +991,9 @@ mod tests {
         let def: MegakernelDef = syn::parse2(input).expect("parse failed");
         let dag = build_dag(&def).expect("DAG build failed");
 
-        // Should have 13 ops per the LLaMA pipeline:
-        // rmsnorm, gemm(qkv), rope_append, attention_decode, gemm_add(o_proj),
-        // rmsnorm, gemm(gate)+silu, gemm(up), mul, gemm_add(down),
+        // Should have ops per the LLaMA pipeline:
+        // rmsnorm, gemm(qkv), rope_append, attention, gemm(o_proj), add,
+        // rmsnorm, gemm(gate)+silu, gemm(up), mul, gemm(down), add,
         // rmsnorm(lm_head), gemm(lm_head)
         // Note: silu(gemm(...)) creates 2 ops (gemm + silu)
         assert!(

@@ -77,8 +77,8 @@ fn gpu_cost_sweep() {
 
     let m_values: &[u32] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
-    const WARMUP: u32 = 10;
-    const ITERS: u32 = 50;
+    const WARMUP: u32 = 5;
+    const ITERS: u32 = 5;
 
     let stream: sys::CUstream = std::ptr::null_mut();
 
@@ -369,6 +369,26 @@ fn gpu_cost_sweep() {
                 }) - launch_overhead_us)
                     .max(0.0);
                 println!("cutlass_gemv,{m},{n},{k},{us:.1}");
+            }
+
+            // ── CUTLASS GEMM + SiLU + Mul (EVT epilogue fusion) ──
+            // The fused kernel computes D = silu(A @ B_gate) * C_up.
+            // C_up has the same shape as the output [M, N].
+            {
+                let up = gpu_alloc_zeros((m * n) as usize * 2);
+                let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                    ffi::cutlass_gemm_silu_mul_launch(
+                        c as *mut u16,
+                        a as *const u16,
+                        b as *const u16,
+                        up as *mut u16,
+                        m_i, n_i, k_i,
+                        stream as u64,
+                    );
+                }) - launch_overhead_us)
+                    .max(0.0);
+                println!("cutlass_silu_mul,{m},{n},{k},{us:.1}");
+                unsafe { cudarc::driver::sys::cuMemFree_v2(up) };
             }
 
             unsafe {

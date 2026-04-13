@@ -244,6 +244,18 @@ pub mod ffi {
         cutlass_sm90_gemm_128x256_c2x1_launch,
     );
 
+    // ── CUTLASS GEMM + SiLU + Mul (EVT epilogue fusion) ──
+    unsafe extern "C" {
+        pub fn cutlass_gemm_silu_mul_launch(
+            d: *mut u16,       // [M, N] output: silu(gate) * up
+            a: *const u16,     // [M, K] normed hidden states
+            b_gate: *const u16, // [N, K] gate weight
+            c_up: *mut u16,    // [M, N] up-projection output (aux)
+            m: i32, n: i32, k: i32,
+            stream: u64,
+        ) -> i32;
+    }
+
     // ── Null kernel for measuring launch overhead ──
     unsafe extern "C" {
         pub fn null_kernel_launch(stream: u64);

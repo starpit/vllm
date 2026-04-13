@@ -194,6 +194,15 @@ pub enum OpKind {
         bias: BufferId,
         output: BufferId,
     },
+    /// Element-wise add: a + b -> output.
+    /// Used for explicit residual connections (Gemma2, etc.).
+    /// The solver may fuse this with an upstream GEMM (beta=1 epilogue)
+    /// or a downstream norm (fused_add_rms_norm).
+    Add {
+        a: BufferId,
+        b: BufferId,
+        output: BufferId,
+    },
 }
 
 /// A single operation in the DAG.
@@ -239,6 +248,7 @@ impl Op {
             OpKind::Silu { input, .. } => vec![input],
             OpKind::Mul { a, b, .. } => vec![a, b],
             OpKind::BiasAdd { input, bias, .. } => vec![input, bias],
+            OpKind::Add { a, b, .. } => vec![a, b],
         }
     }
 
@@ -261,6 +271,7 @@ impl Op {
             OpKind::Silu { output, .. } => vec![output],
             OpKind::Mul { output, .. } => vec![output],
             OpKind::BiasAdd { output, .. } => vec![output],
+            OpKind::Add { output, .. } => vec![output],
         }
     }
 }

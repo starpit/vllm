@@ -430,3 +430,86 @@ fn h100_sm90_ranked_plans() {
         );
     }
 }
+
+#[test]
+fn gemma2_solver_finds_feasible_plan() {
+    use crate::lowering::backend::dispatch::format_plan_family;
+    use crate::lowering::solver::PlanFamily;
+    use crate::lowering::tile_graph::ModelDims;
+
+    // Build Gemma2 tile graph from DSL.
+    let dsl = r#"
+        kernel gemma2<NL=1, HD=2048, ID=16384, HDM=256, NAH=8, NKH=4, VS=256000> {
+            for layer in 0..NL {
+                let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                let q = gemm(normed, self_attn.q_proj[layer]);
+                let k = gemm(normed, self_attn.k_proj[layer]);
+                let v = gemm(normed, self_attn.v_proj[layer]);
+                let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                let attn = attention(q, k, v, kv_cache[layer], block_table);
+                let attn_out = gemm(attn, self_attn.o_proj[layer]);
+                let attn_normed = rmsnorm(attn_out, post_attention_layernorm[layer]);
+                hidden_states = add(attn_normed, hidden_states);
+                let ff_normed = rmsnorm(hidden_states, pre_feedforward_layernorm[layer]);
+                let gate = silu(gemm(ff_normed, mlp.gate_proj[layer]));
+                let up = gemm(ff_normed, mlp.up_proj[layer]);
+                let mlp_out = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = rmsnorm(mlp_out, post_feedforward_layernorm[layer]);
+            }
+            logits = gemm(hidden_states, lm_head);
+        }
+    "#;
+    let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
+    let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
+    let dag = crate::parse::build_dag(&def).unwrap();
+    let dims = ModelDims {
+        hidden_size: 2048,
+        intermediate_size: 16384,
+        num_attention_heads: 8,
+        num_kv_heads: 4,
+        head_dim: 256,
+        vocab_size: 256000,
+    };
+    let tile_graph = TileGraph::from_model_dag(&dag, dims);
+    let mut library = ImplementationLibrary::l4_sm89_starter(dims);
+    let profile = TargetProfile::l4_sm89();
+
+    let family = PlanFamily::solve_grid(
+        &tile_graph,
+        &mut library,
+        &profile,
+        &BacktrackCpSolver::default(),
+        &[1, 32, 128],
+    );
+
+    let formatted = format_plan_family(&family, &library, &tile_graph);
+    eprintln!("{formatted}");
+
+    // Solver must find a plan for each seq_len.
+    assert!(!family.is_empty(), "solver found no plans for Gemma2");
+    assert!(formatted.contains("seq=1"), "missing seq=1 plan");
+    assert!(formatted.contains("seq=32"), "missing seq=32 plan");
+    assert!(formatted.contains("seq=128"), "missing seq=128 plan");
+
+    // Each plan should have attention + the 4 norms.
+    for (_, plan) in family.iter() {
+        let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
+        let has_attn = ds.entries.iter().any(|e| {
+            matches!(
+                e.kind,
+                ImplDispatchKind::FlashInferAttention | ImplDispatchKind::FlashInferStandard
+            )
+        });
+        assert!(has_attn, "Gemma2 plan missing attention");
+
+        let norm_count = ds
+            .entries
+            .iter()
+            .filter(|e| e.kind == ImplDispatchKind::RmsNorm)
+            .count();
+        assert!(
+            norm_count >= 3,
+            "Gemma2 plan should have ≥3 norms (got {norm_count})"
+        );
+    }
+}

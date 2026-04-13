@@ -480,7 +480,7 @@ impl TileGraph {
             let hidden_in = hidden_state_tile;
 
             // Track what the DSL calls "hidden_states" — it's the
-            // implicit variable that gemm_add writes to.
+            // implicit variable that add() writes to.
             let mut current_hidden = hidden_in;
 
             for op in &loop_ops {
@@ -575,6 +575,17 @@ impl TileGraph {
                         // the Silu+Mul combo when we see the Mul op.
                         let dep = buf_to_tile.get(&input.0).copied().unwrap_or(current_hidden);
                         buf_to_tile.insert(output.0.clone(), dep);
+                    }
+                    OpKind::Add { a, b, output } => {
+                        // Explicit residual add: a + b → ResidualAdd tile.
+                        // The solver may fuse this with an upstream GEMM
+                        // (beta=1 epilogue) or downstream norm (fused_add_rms_norm).
+                        let a_dep = buf_to_tile.get(&a.0).copied().unwrap_or(current_hidden);
+                        let b_dep = buf_to_tile.get(&b.0).copied().unwrap_or(current_hidden);
+                        let residual_tile =
+                            push(&mut nodes, TileKind::ResidualAdd, layer, vec![a_dep, b_dep]);
+                        buf_to_tile.insert(output.0.clone(), residual_tile);
+                        current_hidden = residual_tile;
                     }
                     OpKind::Mul { a, b, output } => {
                         // gate * up → GateUpConcat + SiluMul.
@@ -762,13 +773,15 @@ mod self_tests {
                 let k = gemm(normed, self_attn.k_proj[layer]);
                 let v = gemm(normed, self_attn.v_proj[layer]);
                     let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                    hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
+                    let attn = attention(q, k, v, kv_cache[layer], block_table);
+                    let oproj = gemm(attn, self_attn.o_proj[layer]);
+                    hidden_states = add(oproj, hidden_states);
 
                     let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
                     let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
                     let up = gemm(normed2, mlp.up_proj[layer]);
-                    hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
+                    let down = gemm(gate * up, mlp.down_proj[layer]);
+                    hidden_states = add(down, hidden_states);
                 }
                 let normed = rmsnorm(hidden_states, lm_head_norm);
                 logits = gemm(normed, lm_head);
@@ -827,13 +840,15 @@ mod self_tests {
                 let k = gemm(normed, self_attn.k_proj[layer]);
                 let v = gemm(normed, self_attn.v_proj[layer]);
                     let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                    let attn = attention_decode(q, k, v, kv_cache[layer], block_table);
-                    hidden_states = gemm_add(attn, self_attn.o_proj[layer], hidden_states);
+                    let attn = attention(q, k, v, kv_cache[layer], block_table);
+                    let oproj = gemm(attn, self_attn.o_proj[layer]);
+                    hidden_states = add(oproj, hidden_states);
 
                     let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
                     let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
                     let up = gemm(normed2, mlp.up_proj[layer]);
-                    hidden_states = gemm_add(gate * up, mlp.down_proj[layer], hidden_states);
+                    let down = gemm(gate * up, mlp.down_proj[layer]);
+                    hidden_states = add(down, hidden_states);
                 }
                 let normed = rmsnorm(hidden_states, lm_head_norm);
                 logits = gemm(normed, lm_head);
@@ -854,5 +869,118 @@ mod self_tests {
                 );
             }
         }
+    }
+
+    /// LLaMA DSL using explicit `add` instead of `gemm_add`.
+    /// The tile graph should produce the same ResidualAdd tiles.
+    #[test]
+    fn llama_with_explicit_add() {
+        let dsl = r#"
+            kernel llama_add<NL=2, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                    let q = gemm(normed, self_attn.q_proj[layer]);
+                    let k = gemm(normed, self_attn.k_proj[layer]);
+                    let v = gemm(normed, self_attn.v_proj[layer]);
+                    let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                    let attn = attention(q, k, v, kv_cache[layer], block_table);
+                    let oproj = gemm(attn, self_attn.o_proj[layer]);
+                    hidden_states = add(oproj, hidden_states);
+
+                    let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                    let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                    let up = gemm(normed2, mlp.up_proj[layer]);
+                    let down = gemm(gate * up, mlp.down_proj[layer]);
+                    hidden_states = add(down, hidden_states);
+                }
+                logits = gemm(hidden_states, lm_head);
+            }
+        "#;
+        let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
+        let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
+        let dag = crate::parse::build_dag(&def).unwrap();
+        let tg = TileGraph::from_model_dag(&dag, ModelDims::LLAMA_3_2_1B);
+
+        // Should have ResidualAdd tiles (from explicit add ops).
+        let residuals: Vec<_> = tg.tiles_of_kind(TileKind::ResidualAdd).collect();
+        assert!(
+            residuals.len() >= 4, // 2 per layer × 2 layers (oproj + down)
+            "expected ≥4 ResidualAdd tiles, got {}",
+            residuals.len()
+        );
+
+        // Should still have the same GEMM phases.
+        assert!(tg.tiles_of_kind(TileKind::GemmOProj).count() >= 2);
+        assert!(tg.tiles_of_kind(TileKind::GemmDown).count() >= 2);
+        assert!(tg.tiles_of_kind(TileKind::Attention).count() >= 2);
+    }
+
+    /// Gemma2 DSL body — 4 norms per layer, explicit residual adds.
+    #[test]
+    fn gemma2_tile_graph() {
+        let dsl = r#"
+            kernel gemma2<NL=2, HD=2048, ID=16384, HDM=256, NAH=8, NKH=4, VS=256000> {
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                    let q = gemm(normed, self_attn.q_proj[layer]);
+                    let k = gemm(normed, self_attn.k_proj[layer]);
+                    let v = gemm(normed, self_attn.v_proj[layer]);
+                    let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                    let attn = attention(q, k, v, kv_cache[layer], block_table);
+                    let attn_out = gemm(attn, self_attn.o_proj[layer]);
+                    let attn_normed = rmsnorm(attn_out, post_attention_layernorm[layer]);
+                    hidden_states = add(attn_normed, hidden_states);
+                    let ff_normed = rmsnorm(hidden_states, pre_feedforward_layernorm[layer]);
+                    let gate = silu(gemm(ff_normed, mlp.gate_proj[layer]));
+                    let up = gemm(ff_normed, mlp.up_proj[layer]);
+                    let mlp_out = gemm(gate * up, mlp.down_proj[layer]);
+                    hidden_states = rmsnorm(mlp_out, post_feedforward_layernorm[layer]);
+                }
+                logits = gemm(hidden_states, lm_head);
+            }
+        "#;
+        let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
+        let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
+        let dag = crate::parse::build_dag(&def).unwrap();
+        let tg = TileGraph::from_model_dag(
+            &dag,
+            ModelDims {
+                hidden_size: 2048,
+                intermediate_size: 16384,
+                num_attention_heads: 8,
+                num_kv_heads: 4,
+                head_dim: 256,
+                vocab_size: 256000,
+            },
+        );
+
+        // 4 norms per layer × 2 layers = 8 RmsNorm tiles.
+        let norms: Vec<_> = tg.tiles_of_kind(TileKind::RmsNorm).collect();
+        assert_eq!(
+            norms.len(),
+            8,
+            "expected 8 RmsNorm tiles (4 per layer × 2 layers), got {}",
+            norms.len()
+        );
+
+        // 1 explicit add per layer (after post_attention_layernorm).
+        let residuals: Vec<_> = tg
+            .tiles_of_kind(TileKind::ResidualAdd)
+            .filter(|n| n.layer < tg.num_layers)
+            .collect();
+        assert!(
+            residuals.len() >= 2,
+            "expected ≥2 ResidualAdd tiles, got {}",
+            residuals.len()
+        );
+
+        // Attention + OProj + Gate + Up + Down GEMMs present.
+        assert_eq!(tg.tiles_of_kind(TileKind::Attention).count(), 2);
+        assert_eq!(tg.tiles_of_kind(TileKind::GemmOProj).count(), 2);
+        assert_eq!(tg.tiles_of_kind(TileKind::GemmGate).count(), 2);
+        assert_eq!(tg.tiles_of_kind(TileKind::GemmDown).count(), 2);
+
+        // Post-loop: lm_head.
+        assert_eq!(tg.tiles_of_kind(TileKind::GemmLmHead).count(), 1);
     }
 }

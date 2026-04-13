@@ -619,3 +619,70 @@ fn dp_solver_on_fuf() {
         SolveResult::Infeasible => panic!("DP solver reported infeasible on LLaMA FUF"),
     }
 }
+
+#[test]
+fn fuf_codegen_emits_tile_vars() {
+    use crate::lowering::backend::fuf_codegen::generate_fuf_forward;
+    use crate::lowering::solver::dp::DpSolver;
+    use crate::lowering::tile_graph::ModelDims;
+
+    let dsl = r#"
+        kernel llama_fuf_cg<NL=2, HD=2048, ID=8192, HDM=64, NAH=32, NKH=8, VS=128256> {
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..NL {
+                let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                let q = gemm(normed, self_attn.q_proj[layer]);
+                let k = gemm(normed, self_attn.k_proj[layer]);
+                let v = gemm(normed, self_attn.v_proj[layer]);
+                let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                let attn = attention(q, k, v, kv_cache[layer], block_table);
+                let oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+
+                let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                let up = gemm(normed2, mlp.up_proj[layer]);
+                let down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
+            }
+            hidden_states = rmsnorm(hidden_states, norm);
+            logits = gemm(hidden_states, lm_head);
+        }
+    "#;
+    let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
+    let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
+    let dag = crate::parse::build_dag(&def).unwrap();
+    let fuf = TileGraph::build_fuf(&dag, ModelDims::LLAMA_3_2_1B);
+
+    let mut library = ImplementationLibrary::l4_sm89_starter(ModelDims::LLAMA_3_2_1B);
+    let profile = TargetProfile::l4_sm89();
+    let problem = crate::lowering::problem::Problem::build(&fuf, &mut library, &profile);
+
+    let result = DpSolver.solve(&problem);
+    let plan = match result {
+        SolveResult::Found { best, .. } => best,
+        SolveResult::Infeasible => panic!("infeasible"),
+    };
+
+    let source = generate_fuf_forward(&fuf, &plan.assignment, &library).to_string();
+    eprintln!(
+        "FUF codegen output ({} chars):\n{}",
+        source.len(),
+        &source[..source.len().min(2000)]
+    );
+
+    // Should have tile variable names (t0, t1, ...)
+    assert!(source.contains("let t0"), "missing t0 (embed)");
+    assert!(source.contains("rms_norm"), "missing rms_norm call");
+    assert!(
+        source.contains("embedding_gather"),
+        "missing embedding_gather"
+    );
+    // Should reference per-layer weights via model.layers[N].field
+    assert!(
+        source.contains("model . layers"),
+        "missing per-layer weight access"
+    );
+    // Should have the lm_head at the end
+    assert!(source.contains("lm_head"), "missing lm_head");
+}

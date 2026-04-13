@@ -17,6 +17,7 @@ mod codegen_test;
 pub mod compile_dsl;
 pub mod cuda_codegen;
 pub mod dispatch;
+pub mod fuf_codegen;
 
 pub use compile_dsl::ForwardDef;
 pub use dispatch::{DispatchEntry, DispatchSequence, ImplDispatchKind};

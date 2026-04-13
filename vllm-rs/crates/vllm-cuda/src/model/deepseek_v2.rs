@@ -633,7 +633,7 @@ impl DeepSeekV2Attention {
         drop(kv_b_out);
 
         // Write K, V into paged cache (BF16→FP8 when FP8 cache).
-        crate::model::attention_helpers::write_kv_cache(
+        crate::attention_helpers::write_kv_cache(
             k.view(),
             v.view(),
             slot_mapping,
@@ -643,7 +643,7 @@ impl DeepSeekV2Attention {
         );
 
         // FlashAttention
-        let attn_output = crate::model::attention_helpers::attention_standard(
+        let attn_output = crate::attention_helpers::attention_standard(
             q,
             k.view(),
             v.view(),

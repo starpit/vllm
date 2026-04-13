@@ -13,13 +13,13 @@
 #[cfg(feature = "nccl")]
 use std::sync::Arc;
 
-use crate::alloc::OwnedTensor;
-use crate::device::GpuDevice;
 use crate::kernels;
 use crate::layers::Linear;
+use ferrite_cuda_core::alloc::OwnedTensor;
+use ferrite_cuda_core::device::GpuDevice;
 #[cfg(feature = "nccl")]
-use crate::nccl::NcclGroup;
-use crate::tensor::{GpuTensor, TensorView};
+use ferrite_cuda_core::nccl::NcclGroup;
+use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
 
 /// Dynamic BLOCK_M selection for fused MoE GEMM tiling.
 ///
@@ -700,8 +700,8 @@ impl GgmlFusedMoELayer {
         hidden_states: TensorView<'_>,
         device: &mut GpuDevice,
     ) -> OwnedTensor {
-        use crate::dtype::DType;
         use crate::ggml::{MATRIX_ROW_PADDING, ggml_moe_forward, ggml_quantize_q8_1_alloc};
+        use ferrite_cuda_core::dtype::DType;
 
         let input_dtype = hidden_states.dtype();
         let num_tokens = hidden_states.dim(0);
@@ -753,7 +753,7 @@ impl GgmlFusedMoELayer {
         // quantized input row (no replication needed).
         let out1 = device.caching.alloc_tensor(
             &[num_tokens * self.top_k, 2 * self.intermediate_size],
-            crate::dtype::DType::F32,
+            ferrite_cuda_core::dtype::DType::F32,
         );
         ggml_moe_forward(
             &self.w1,
@@ -795,7 +795,7 @@ impl GgmlFusedMoELayer {
         // so input_dim1 = batch * topk (i.e. not 1).
         let out2 = device.caching.alloc_tensor(
             &[num_tokens * self.top_k, self.hidden_size],
-            crate::dtype::DType::F32,
+            ferrite_cuda_core::dtype::DType::F32,
         );
         ggml_moe_forward(
             &self.w2,
@@ -871,10 +871,10 @@ impl GgmlFusedMoELayer {
 pub fn load_fp8_moe_weights_dequant(
     w_fp8: GpuTensor, // [num_experts, dim, hidden] FP8 E4M3
     scale: GpuTensor, // [num_experts] f32 (per-tensor) or per-block
-    output_dtype: crate::dtype::DType,
-    alloc: &mut crate::alloc::CachingAllocator,
+    output_dtype: ferrite_cuda_core::dtype::DType,
+    alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: cudarc::driver::sys::CUstream,
-) -> crate::alloc::OwnedTensor {
+) -> ferrite_cuda_core::alloc::OwnedTensor {
     // For now, use the per-tensor approach: dequantize the entire stacked tensor.
     // This works because scale is per-expert (the fused_moe_gemm kernel selects
     // the right expert slice anyway).
@@ -1205,7 +1205,7 @@ impl MarlinSharedFusedMoELayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DType;
+    use ferrite_cuda_core::DType;
 
     #[test]
     fn test_fused_moe_layer_sizes() {

@@ -2008,6 +2008,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-cuda-builder"
+version = "0.1.0"
+dependencies = [
+ "cudaforge",
+ "dirs 6.0.0",
+ "ferrite-models",
+]
+
+[[package]]
+name = "ferrite-cuda-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "dirs 6.0.0",
+ "half",
+ "libc",
+ "memmap2",
+ "safetensors 0.7.0",
+ "serde_json",
+ "tracing",
+ "vllm-model",
+]
+
+[[package]]
+name = "ferrite-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "ferrite-cuda-core",
+ "half",
+ "tracing",
+ "vllm-model",
+]
+
+[[package]]
+name = "ferrite-models"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-kernels",
+ "tracing",
+ "vllm-tk-macros",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7615,6 +7663,10 @@ dependencies = [
  "anyhow",
  "cudarc",
  "dirs 6.0.0",
+ "ferrite-cuda-builder",
+ "ferrite-cuda-core",
+ "ferrite-kernels",
+ "ferrite-models",
  "half",
  "hf-hub",
  "libc",
@@ -7629,7 +7681,6 @@ dependencies = [
  "tracing",
  "vllm-common",
  "vllm-config",
- "vllm-kernels-cuda",
  "vllm-model",
  "vllm-tk-macros",
 ]
@@ -7753,14 +7804,6 @@ dependencies = [
  "tower-test",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "vllm-kernels-cuda"
-version = "0.1.0"
-dependencies = [
- "cudaforge",
- "dirs 6.0.0",
 ]
 
 [[package]]

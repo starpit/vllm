@@ -7,9 +7,9 @@
 
 use core::ffi::{c_int, c_void};
 
-use crate::alloc::{CachingAllocator, OwnedTensor};
-use crate::dtype::DType;
-use crate::tensor::GpuTensor;
+use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
+use ferrite_cuda_core::dtype::DType;
+use ferrite_cuda_core::tensor::GpuTensor;
 
 // ---------------------------------------------------------------------------
 // FFI declarations (same C symbols as vllm-kernels, linked from libvllm_cuda.a)
@@ -1325,7 +1325,7 @@ pub unsafe fn fused_add_rms_norm(
 ) -> (OwnedTensor, GpuTensor) {
     // Allocate a copy of input for the normed output.
     let normed_buf = alloc.alloc_tensor(&[input.dim(0), input.dim(1)], input.dtype());
-    crate::driver::memcpy_dtod_async(
+    ferrite_cuda_core::driver::memcpy_dtod_async(
         normed_buf.as_gpu_tensor().raw_ptr(),
         input.raw_ptr() as *const u8,
         input.size_bytes(),
@@ -2850,9 +2850,12 @@ pub unsafe fn fp8_requantize_weight_rows(
 /// Matches Python vLLM's `ops.scaled_fp8_quant(input, scale=None)`.
 pub unsafe fn scaled_fp8_quant_dynamic(
     input: GpuTensor,
-    alloc: &mut crate::alloc::CachingAllocator,
+    alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: CUstream,
-) -> (crate::alloc::OwnedTensor, crate::alloc::OwnedTensor) {
+) -> (
+    ferrite_cuda_core::alloc::OwnedTensor,
+    ferrite_cuda_core::alloc::OwnedTensor,
+) {
     debug_assert_eq!(input.ndim(), 2);
     let num_tokens = input.dim(0);
     let hidden_dim = input.dim(1);
@@ -2893,9 +2896,9 @@ pub unsafe fn scaled_fp8_quant_dynamic(
 pub unsafe fn scaled_fp8_quant_static(
     input: GpuTensor,
     scale: *const f32,
-    alloc: &mut crate::alloc::CachingAllocator,
+    alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: CUstream,
-) -> crate::alloc::OwnedTensor {
+) -> ferrite_cuda_core::alloc::OwnedTensor {
     debug_assert_eq!(input.ndim(), 2);
     let num_elements = input.dim(0) * input.dim(1);
 
@@ -2933,9 +2936,9 @@ pub unsafe fn scaled_fp8_quant_static(
 pub unsafe fn fp8_quantize_weight(
     weight: GpuTensor,
     scale_out: *mut f32,
-    alloc: &mut crate::alloc::CachingAllocator,
+    alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: CUstream,
-) -> crate::alloc::OwnedTensor {
+) -> ferrite_cuda_core::alloc::OwnedTensor {
     debug_assert_eq!(weight.ndim(), 2);
     debug_assert_eq!(
         weight.dtype(),
@@ -3007,9 +3010,9 @@ pub unsafe fn fp8_block_dequant(
     scale_inv: GpuTensor,
     block_size: [usize; 2],
     output_dtype: DType,
-    alloc: &mut crate::alloc::CachingAllocator,
+    alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: CUstream,
-) -> crate::alloc::OwnedTensor {
+) -> ferrite_cuda_core::alloc::OwnedTensor {
     debug_assert_eq!(weight.ndim(), 2);
     debug_assert_eq!(weight.dtype(), DType::Fp8E4m3);
     let n = weight.dim(0);
@@ -3105,9 +3108,9 @@ pub unsafe fn cutlass_scaled_mm(
     a_scales: GpuTensor,
     b_scales: GpuTensor,
     output_dtype: DType,
-    alloc: &mut crate::alloc::CachingAllocator,
+    alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: CUstream,
-) -> crate::alloc::OwnedTensor {
+) -> ferrite_cuda_core::alloc::OwnedTensor {
     debug_assert_eq!(a.ndim(), 2);
     debug_assert_eq!(b.ndim(), 2);
     debug_assert_eq!(a.dtype(), DType::Fp8E4m3);
@@ -3151,9 +3154,9 @@ pub unsafe fn cutlass_scaled_mm_with_bias(
     b_scales: GpuTensor,
     bias: GpuTensor,
     output_dtype: DType,
-    alloc: &mut crate::alloc::CachingAllocator,
+    alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: CUstream,
-) -> crate::alloc::OwnedTensor {
+) -> ferrite_cuda_core::alloc::OwnedTensor {
     debug_assert_eq!(a.ndim(), 2);
     debug_assert_eq!(b.ndim(), 2);
     debug_assert_eq!(a.dtype(), DType::Fp8E4m3);
@@ -3565,9 +3568,9 @@ pub unsafe fn flash_attn_paged_ext(
         q.dtype(),
     );
     // Zero the entire padded buffer, then copy actual Q data.
-    crate::driver::memset_d8(q_padded.raw_ptr(), 0, q_padded.size_bytes(), _stream)
+    ferrite_cuda_core::driver::memset_d8(q_padded.raw_ptr(), 0, q_padded.size_bytes(), _stream)
         .expect("memset q_padded");
-    crate::driver::memcpy_dtod_async(
+    ferrite_cuda_core::driver::memcpy_dtod_async(
         q_padded.raw_ptr(),
         q.raw_ptr() as *const u8,
         eff_total_q * eff_num_heads * head_dim * q.dtype().size_bytes(),
@@ -3639,7 +3642,7 @@ pub unsafe fn flash_attn_paged_ext(
     // Python passes cu_seqlens_k.data_ptr() (line 683). We use a zero buffer
     // since our caller doesn't provide cu_seqlens_k for the paged path.
     let dummy_cu_seqlens_k = alloc.alloc_tensor(&[batch_size + 1], DType::I32);
-    crate::driver::memset_d8(
+    ferrite_cuda_core::driver::memset_d8(
         dummy_cu_seqlens_k.raw_ptr(),
         0,
         (batch_size + 1) * 4,
@@ -3820,7 +3823,11 @@ unsafe extern "C" {
 /// * `x`: any contiguous tensor (F16, BF16, or F32)
 /// * `scale`: the scalar multiplier (always f32)
 /// * `cublas`: cuBLAS handle on the compute stream
-pub unsafe fn scale_inplace(x: GpuTensor, scale: f32, cublas: &crate::cublas::CublasHandle) {
+pub unsafe fn scale_inplace(
+    x: GpuTensor,
+    scale: f32,
+    cublas: &ferrite_cuda_core::cublas::CublasHandle,
+) {
     use cudarc::cublas::sys::cudaDataType_t;
     let n = x.numel() as c_int;
     let x_type = match x.dtype() {
@@ -3866,7 +3873,7 @@ pub unsafe fn pool_select_row(
 
     let out = alloc.alloc_tensor(&[hidden_size], hidden_states.dtype());
     let src = hidden_states.raw_ptr().add(row_idx * row_bytes);
-    crate::driver::memcpy_dtod_async(out.raw_ptr(), src, row_bytes, stream)
+    ferrite_cuda_core::driver::memcpy_dtod_async(out.raw_ptr(), src, row_bytes, stream)
         .expect("pool_select_row: D2D copy failed");
     out
 }
@@ -3881,7 +3888,7 @@ pub unsafe fn pool_select_row(
 /// For bf16/f16 inputs, caller must cast to f32 first.
 pub unsafe fn pool_mean_f32(
     hidden_states: GpuTensor,
-    cublas: &crate::cublas::CublasHandle,
+    cublas: &ferrite_cuda_core::cublas::CublasHandle,
     alloc: &mut CachingAllocator,
     stream: CUstream,
 ) -> OwnedTensor {
@@ -3906,7 +3913,7 @@ pub unsafe fn pool_mean_f32(
     // set all bytes to 0, then use cuBLAS to set to 1.0 would be circular.
     // Instead, write 1.0f32 via a small H2D.
     let ones_host: Vec<f32> = vec![1.0f32; num_tokens];
-    crate::driver::memcpy_htod_async(
+    ferrite_cuda_core::driver::memcpy_htod_async(
         ones.raw_ptr(),
         ones_host.as_ptr() as *const u8,
         num_tokens * 4,
@@ -4940,7 +4947,7 @@ pub unsafe fn cast_logits_to_f32(
     match logits.dtype() {
         DType::F32 => {
             // Just D2D copy.
-            crate::driver::memcpy_dtod_async(
+            ferrite_cuda_core::driver::memcpy_dtod_async(
                 out.as_gpu_tensor().raw_ptr(),
                 logits.raw_ptr() as *const u8,
                 logits.size_bytes(),
@@ -4991,7 +4998,7 @@ pub unsafe fn cast_from_f32(
     let out = alloc.alloc_tensor(&shape, target_dtype);
     match target_dtype {
         DType::F32 => {
-            crate::driver::memcpy_dtod_async(
+            ferrite_cuda_core::driver::memcpy_dtod_async(
                 out.as_gpu_tensor().raw_ptr(),
                 input.raw_ptr() as *const u8,
                 input.size_bytes(),
@@ -5030,7 +5037,7 @@ pub unsafe fn cast_from_f32_into(
     let n_i = n as c_int;
     match target_dtype {
         DType::F32 => {
-            crate::driver::memcpy_dtod_async(output, input as *const u8, n * 4, stream)
+            ferrite_cuda_core::driver::memcpy_dtod_async(output, input as *const u8, n * 4, stream)
                 .expect("cast_from_f32_into: D2D copy failed");
         }
         DType::F16 => cast_from_f32_f16(output as *mut u16, input, n_i, stream),
@@ -5899,7 +5906,7 @@ pub unsafe fn qk_norm_rope_inplace(
 #[cfg(feature = "cuda")]
 mod tests_flash_attn {
     use super::*;
-    use crate::driver;
+    use ferrite_cuda_core::driver;
 
     /// Initialize CUDA context for test. Returns a stream.
     unsafe fn test_init() -> cudarc::driver::sys::CUstream {
@@ -6966,8 +6973,8 @@ mod tests_flash_attn {
 #[cfg(feature = "cuda")]
 mod tests_sampling {
     use super::*;
-    use crate::alloc::CachingAllocator;
-    use crate::driver;
+    use ferrite_cuda_core::alloc::CachingAllocator;
+    use ferrite_cuda_core::driver;
 
     unsafe fn test_init() -> (CachingAllocator, cudarc::driver::sys::CUstream) {
         driver::init().expect("CUDA init");
@@ -7189,8 +7196,8 @@ mod tests_sampling {
 #[cfg(feature = "cuda")]
 mod tests_pooling {
     use super::*;
-    use crate::alloc::CachingAllocator;
-    use crate::driver;
+    use ferrite_cuda_core::alloc::CachingAllocator;
+    use ferrite_cuda_core::driver;
 
     unsafe fn test_init() -> cudarc::driver::sys::CUstream {
         driver::init().expect("CUDA init");
@@ -7339,7 +7346,8 @@ mod tests_pooling {
         unsafe {
             let stream = test_init();
             let mut alloc = CachingAllocator::new();
-            let cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
+            let cublas =
+                ferrite_cuda_core::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
 
             // 3 tokens, hidden_size=3
             // row0=[1,2,3], row1=[3,4,5], row2=[5,6,7] → mean=[3,4,5]
@@ -7364,7 +7372,8 @@ mod tests_pooling {
         unsafe {
             let stream = test_init();
             let mut alloc = CachingAllocator::new();
-            let cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
+            let cublas =
+                ferrite_cuda_core::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
 
             let data: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0];
             let ptr = upload_f32(&data, stream);
@@ -7385,7 +7394,8 @@ mod tests_pooling {
         unsafe {
             let stream = test_init();
             let mut alloc = CachingAllocator::new();
-            let cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
+            let cublas =
+                ferrite_cuda_core::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
 
             // [0, 4] and [2, 6] → mean [1, 5]
             let data: Vec<f32> = vec![0.0, 4.0, 2.0, 6.0];
@@ -7436,10 +7446,15 @@ pub unsafe fn concat_dim1(
         let dst_base = out.raw_ptr().add(i * n_out * elem);
         let src_a = (a.raw_ptr() as *const u8).add(i * na * elem);
         let src_b = (b.raw_ptr() as *const u8).add(i * nb * elem);
-        crate::driver::memcpy_dtod_async(dst_base, src_a, na * elem, stream)
+        ferrite_cuda_core::driver::memcpy_dtod_async(dst_base, src_a, na * elem, stream)
             .expect("concat_dim1: D2D copy a");
-        crate::driver::memcpy_dtod_async(dst_base.add(na * elem), src_b, nb * elem, stream)
-            .expect("concat_dim1: D2D copy b");
+        ferrite_cuda_core::driver::memcpy_dtod_async(
+            dst_base.add(na * elem),
+            src_b,
+            nb * elem,
+            stream,
+        )
+        .expect("concat_dim1: D2D copy b");
     }
 
     out
@@ -7884,7 +7899,8 @@ pub unsafe fn marlin_moe_gemm(
     // ops.cu: min(size_n * sorted_token_ids.size(0), sms * 4 * moe_block_size * max_thread_n)
     // Each threadblock slice needs its own c_tmp region indexed by locks_off.
     let sorted_token_count = sorted_token_ids.dim(0);
-    let sms = unsafe { crate::driver::device_get_num_sm(device_id) }.unwrap_or(128) as usize;
+    let sms =
+        unsafe { ferrite_cuda_core::driver::device_get_num_sm(device_id) }.unwrap_or(128) as usize;
     const MAX_THREAD_N: usize = 256; // from marlin.cuh
     let max_c_tmp_size = std::cmp::min(
         size_n * sorted_token_count,
@@ -8532,16 +8548,16 @@ pub unsafe fn gdn_qkvz_split(
     key_dim: usize,
     value_dim: usize,
     conv_dim: usize,
-    caching: &mut crate::alloc::CachingAllocator,
+    caching: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: CUstream,
 ) -> (
-    crate::alloc::OwnedTensor, // q [T, key_dim]
-    crate::alloc::OwnedTensor, // k [T, key_dim]
-    crate::alloc::OwnedTensor, // v [T, value_dim]
-    crate::alloc::OwnedTensor, // z [T, value_dim]
-    crate::alloc::OwnedTensor, // a [T, num_v_heads]
-    crate::alloc::OwnedTensor, // b [T, num_v_heads]
-    crate::alloc::OwnedTensor, // mixed_qkv [T, conv_dim]
+    ferrite_cuda_core::alloc::OwnedTensor, // q [T, key_dim]
+    ferrite_cuda_core::alloc::OwnedTensor, // k [T, key_dim]
+    ferrite_cuda_core::alloc::OwnedTensor, // v [T, value_dim]
+    ferrite_cuda_core::alloc::OwnedTensor, // z [T, value_dim]
+    ferrite_cuda_core::alloc::OwnedTensor, // a [T, num_v_heads]
+    ferrite_cuda_core::alloc::OwnedTensor, // b [T, num_v_heads]
+    ferrite_cuda_core::alloc::OwnedTensor, // mixed_qkv [T, conv_dim]
 ) {
     let q = caching.alloc_tensor(&[num_tokens, key_dim], DType::F32);
     let k = caching.alloc_tensor(&[num_tokens, key_dim], DType::F32);
@@ -8641,12 +8657,12 @@ pub unsafe fn gdn_conv_split(
     key_dim: usize,
     value_dim: usize,
     conv_dim: usize,
-    caching: &mut crate::alloc::CachingAllocator,
+    caching: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: CUstream,
 ) -> (
-    crate::alloc::OwnedTensor, // q [T, num_k_heads, head_k_dim]
-    crate::alloc::OwnedTensor, // k [T, num_k_heads, head_k_dim]
-    crate::alloc::OwnedTensor, // v [T, num_v_heads, head_v_dim]
+    ferrite_cuda_core::alloc::OwnedTensor, // q [T, num_k_heads, head_k_dim]
+    ferrite_cuda_core::alloc::OwnedTensor, // k [T, num_k_heads, head_k_dim]
+    ferrite_cuda_core::alloc::OwnedTensor, // v [T, num_v_heads, head_v_dim]
 ) {
     let q = caching.alloc_tensor(&[num_tokens, num_k_heads, head_k_dim], DType::F32);
     let k = caching.alloc_tensor(&[num_tokens, num_k_heads, head_k_dim], DType::F32);
@@ -8675,8 +8691,8 @@ pub unsafe fn gdn_conv_split(
 #[cfg(feature = "cuda")]
 mod tests_gdn {
     use super::*;
-    use crate::driver;
-    use crate::tensor::GpuTensor;
+    use ferrite_cuda_core::driver;
+    use ferrite_cuda_core::tensor::GpuTensor;
 
     unsafe fn test_init() -> CUstream {
         driver::init().expect("CUDA init");
@@ -8691,7 +8707,7 @@ mod tests_gdn {
         driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream)
             .expect("memcpy_htod");
         driver::stream_synchronize(stream).expect("sync");
-        GpuTensor::new(ptr, &[data.len()], crate::dtype::DType::F32)
+        GpuTensor::new(ptr, &[data.len()], ferrite_cuda_core::dtype::DType::F32)
     }
 
     unsafe fn upload_i32(data: &[i32], stream: CUstream) -> GpuTensor {
@@ -8700,14 +8716,14 @@ mod tests_gdn {
         driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream)
             .expect("memcpy_htod");
         driver::stream_synchronize(stream).expect("sync");
-        GpuTensor::new(ptr, &[data.len()], crate::dtype::DType::I32)
+        GpuTensor::new(ptr, &[data.len()], ferrite_cuda_core::dtype::DType::I32)
     }
 
     unsafe fn alloc_f32(n: usize, stream: CUstream) -> GpuTensor {
         let bytes = n * 4;
         let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
         driver::memset_d8(ptr, 0, bytes, stream).expect("memset");
-        GpuTensor::new(ptr, &[n], crate::dtype::DType::F32)
+        GpuTensor::new(ptr, &[n], ferrite_cuda_core::dtype::DType::F32)
     }
 
     unsafe fn download_f32(t: GpuTensor, stream: CUstream) -> Vec<f32> {
@@ -8953,7 +8969,7 @@ mod tests_gdn {
 #[cfg(feature = "cuda")]
 mod tests_fp8_kv {
     use super::*;
-    use crate::driver;
+    use ferrite_cuda_core::driver;
 
     type CUstream = cudarc::driver::sys::CUstream;
 
@@ -9564,7 +9580,7 @@ mod tests_fp8_kv {
 #[cfg(feature = "cuda")]
 mod tests_fp8_quant {
     use super::*;
-    use crate::driver;
+    use ferrite_cuda_core::driver;
     type CUstream = cudarc::driver::sys::CUstream;
 
     unsafe fn test_init() -> (CachingAllocator, CUstream) {
@@ -9711,7 +9727,7 @@ mod tests_fp8_quant {
 #[cfg(feature = "cuda")]
 mod tests_fp8_moe_gemm {
     use super::*;
-    use crate::driver;
+    use ferrite_cuda_core::driver;
 
     unsafe fn test_init() -> (CachingAllocator, cudarc::driver::sys::CUstream, u32) {
         driver::init().expect("CUDA init");
@@ -10145,7 +10161,7 @@ mod tests_fp8_moe_gemm {
 #[cfg(feature = "cuda")]
 mod tests_fused_moe_gemm_bf16 {
     use super::*;
-    use crate::driver;
+    use ferrite_cuda_core::driver;
 
     type CUstream = cudarc::driver::sys::CUstream;
 
@@ -10420,7 +10436,7 @@ mod tests_fused_moe_gemm_bf16 {
 #[cfg(feature = "cuda")]
 mod tests_fused_qkv_rope_cache {
     use super::*;
-    use crate::driver;
+    use ferrite_cuda_core::driver;
 
     type CUstream = cudarc::driver::sys::CUstream;
 
@@ -11217,7 +11233,7 @@ mod tests_fused_qkv_rope_cache {
 #[cfg(all(test, feature = "cuda"))]
 mod layer_norm_bias_tests {
     use super::*;
-    use crate::driver;
+    use ferrite_cuda_core::driver;
 
     unsafe fn test_init() -> (CachingAllocator, CUstream) {
         driver::init().expect("init");

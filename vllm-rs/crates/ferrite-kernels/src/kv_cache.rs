@@ -4,11 +4,11 @@
 //! Layout per layer: `[num_blocks, block_size, num_kv_heads, head_dim]`
 //! Paged KV cache pool for GPU inference.
 
-use crate::alloc::RawGpuMem;
-use crate::driver;
-use crate::dtype::DType;
-use crate::tensor::{GpuTensor, TensorView};
 use anyhow::Result;
+use ferrite_cuda_core::alloc::RawGpuMem;
+use ferrite_cuda_core::driver;
+use ferrite_cuda_core::dtype::DType;
+use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
 
 /// Paged KV cache pool for all transformer layers.
 ///
@@ -249,7 +249,7 @@ impl KvCachePool {
         total_tokens: usize,
         num_kv_heads: usize,
         head_dim: usize,
-        arena: &mut crate::arena::ScratchArena,
+        arena: &mut ferrite_cuda_core::arena::ScratchArena,
         stream: cudarc::driver::sys::CUstream,
     ) -> GpuTensor {
         let cache = if is_key {

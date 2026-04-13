@@ -1,0 +1,19 @@
+[package]
+name = "ferrite-cuda-builder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compiles all CUDA kernels (.cu -> .a) for the ferrite inference framework"
+
+[features]
+default = []
+cuda = ["cudaforge", "ferrite-models/cuda"]
+
+[dependencies]
+# Dep on ferrite-models ensures forward!() runs first (generates .cu files)
+# before this crate's build.rs compiles them.
+ferrite-models = { path = "../ferrite-models" }
+
+[build-dependencies]
+cudaforge = { version = "=0.1.4", path = "../../third_party/cudaforge", optional = true }
+dirs = "6"

@@ -8,15 +8,18 @@ description = "Purpose-built CUDA tensor runtime for LLM inference — replaces 
 [features]
 default = []
 # Enable CUDA runtime. Requires CUDA toolkit + nvcc.
-cuda = ["dep:cudarc", "dep:vllm-kernels-cuda", "vllm-kernels-cuda/cuda", "dep:hf-hub"]
+cuda = ["dep:cudarc", "dep:ferrite-cuda-builder", "ferrite-cuda-builder/cuda", "dep:hf-hub", "ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-models/cuda"]
 # Enable NCCL multi-GPU collective communication (requires libnccl).
-nccl = ["cuda", "cudarc/nccl"]
+nccl = ["cuda", "cudarc/nccl", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl"]
 # Enable NVTX profiling annotations for nsys/Nsight traces.
 profiling = ["cuda", "cudarc/nvtx"]
 
 [dependencies]
 cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
-vllm-kernels-cuda = { path = "../vllm-kernels-cuda", optional = true }
+ferrite-cuda-builder = { path = "../ferrite-cuda-builder", optional = true }
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-models = { path = "../ferrite-models" }
 half = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }

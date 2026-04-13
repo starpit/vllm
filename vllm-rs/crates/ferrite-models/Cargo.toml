@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite model architectures using forward!() macro"
+
+[features]
+default = []
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda"]
+
+[dependencies]
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+vllm-tk-macros = { path = "../vllm-tk-macros" }
+anyhow = { workspace = true }
+tracing = { workspace = true }

@@ -191,7 +191,7 @@ impl CommandRAttention {
                 );
 
                 // Write unrotated K and V to cache.
-                crate::model::attention_helpers::write_kv_cache(
+                crate::attention_helpers::write_kv_cache(
                     k.view(),
                     v.view(),
                     slot_mapping,
@@ -204,7 +204,7 @@ impl CommandRAttention {
 
                 // FA2 with fused interleaved RoPE on cached K.
                 let rotary_dim = rotary.cos_sin_cache.dim(1);
-                let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
+                let attn_output = crate::attention_helpers::attention_decode_from_cache(
                     q.view(),
                     cu_seqlens_q,
                     seqused_k,
@@ -250,7 +250,7 @@ impl CommandRAttention {
                 drop(qkv);
 
                 // Write unrotated K/V to cache first.
-                crate::model::attention_helpers::write_kv_cache(
+                crate::attention_helpers::write_kv_cache(
                     k.view(),
                     v.view(),
                     slot_mapping,
@@ -270,7 +270,7 @@ impl CommandRAttention {
                 );
 
                 let rotary_dim = rotary.cos_sin_cache.dim(1);
-                let attn_output = crate::model::attention_helpers::attention_standard(
+                let attn_output = crate::attention_helpers::attention_standard(
                     q.view(),
                     k.view(),
                     v.view(),
@@ -305,7 +305,7 @@ impl CommandRAttention {
             };
 
         // QK-norm fallthrough: write K/V then run attention.
-        crate::model::attention_helpers::write_kv_cache(
+        crate::attention_helpers::write_kv_cache(
             k.view(),
             v.view(),
             slot_mapping,
@@ -317,7 +317,7 @@ impl CommandRAttention {
         // QK-norm uses NeoX Q-only RoPE (rotary_embedding_q_only), K unrotated.
         // Note: if CommandR QK-norm models use interleaved RoPE, this needs
         // rotary_embedding_interleaved_q_only instead.
-        let attn_output = crate::model::attention_helpers::attention_standard(
+        let attn_output = crate::attention_helpers::attention_standard(
             q.view(),
             k.view(),
             v.view(),

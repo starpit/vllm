@@ -960,7 +960,7 @@ impl Qwen3NextFullAttention {
         );
 
         // 6. Write K/V to paged cache (BF16→FP8 when FP8 cache).
-        crate::model::attention_helpers::write_kv_cache(
+        crate::attention_helpers::write_kv_cache(
             k.view(),
             v.view(),
             slot_mapping,
@@ -970,7 +970,7 @@ impl Qwen3NextFullAttention {
         );
 
         // 7. FlashAttention-2.
-        let attn_output = crate::model::attention_helpers::attention_standard(
+        let attn_output = crate::attention_helpers::attention_standard(
             q.view(),
             k.view(),
             v.view(),

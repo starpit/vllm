@@ -382,7 +382,9 @@ fn gpu_cost_sweep() {
                         a as *const u16,
                         b as *const u16,
                         up as *mut u16,
-                        m_i, n_i, k_i,
+                        m_i,
+                        n_i,
+                        k_i,
                         stream as u64,
                     );
                 }) - launch_overhead_us)

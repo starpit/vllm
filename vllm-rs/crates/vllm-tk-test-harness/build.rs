@@ -38,8 +38,7 @@ fn build_cuda() {
     let harness_csrc = manifest_dir.join("csrc");
     let shim_cu = harness_csrc.join("flashinfer_attention_shim.cu");
     let cutlass_gemm_cu = workspace_root.join("crates/vllm-cuda/csrc/cutlass_standalone_gemm.cu");
-    let cutlass_silu_mul_cu =
-        workspace_root.join("crates/vllm-cuda/csrc/cutlass_gemm_silu_mul.cu");
+    let cutlass_silu_mul_cu = workspace_root.join("crates/vllm-cuda/csrc/cutlass_gemm_silu_mul.cu");
 
     let barrier_cu = harness_csrc.join("barrier_sweep.cu");
     let cu_files: Vec<String> = vec![

@@ -11,11 +11,11 @@
 
 use std::cell::Cell;
 
-use crate::alloc::{CachingAllocator, OwnedTensor};
-use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
-use crate::tensor::{GpuTensor, TensorView};
+use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
+use ferrite_cuda_core::dtype::DType;
+use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
 
 type CUstream = cudarc::driver::sys::CUstream;
 
@@ -434,14 +434,14 @@ unsafe fn fp8_decode_attention(
 
     // D2H seqused_k to build cu_seqlens_k on CPU.
     let mut seq_lens = vec![0i32; batch_size];
-    crate::driver::memcpy_dtoh_async(
+    ferrite_cuda_core::driver::memcpy_dtoh_async(
         seq_lens.as_mut_ptr() as *mut u8,
         seqused_k.raw_ptr() as *const u8,
         batch_size * 4,
         stream,
     )
     .expect("D2H seqused_k");
-    crate::driver::stream_synchronize(stream).expect("sync seqused_k");
+    ferrite_cuda_core::driver::stream_synchronize(stream).expect("sync seqused_k");
 
     // Build cu_seqlens_k prefix sum: [0, s0, s0+s1, ...]
     let mut cu_seqlens_k_host = vec![0i32; batch_size + 1];
@@ -475,7 +475,7 @@ unsafe fn fp8_decode_attention(
 
     // Upload cu_seqlens_k to GPU.
     let cu_seqlens_k_gpu = alloc.alloc_tensor(&[batch_size + 1], DType::I32);
-    crate::driver::memcpy_htod_async(
+    ferrite_cuda_core::driver::memcpy_htod_async(
         cu_seqlens_k_gpu.as_gpu_tensor().raw_ptr() as *mut u8,
         cu_seqlens_k_host.as_ptr() as *const u8,
         (batch_size + 1) * 4,
@@ -486,21 +486,21 @@ unsafe fn fp8_decode_attention(
     // Read K scale and V scale from GPU (single f32 each).
     let mut k_scale_host: f32 = 1.0;
     let mut v_scale_host: f32 = 1.0;
-    crate::driver::memcpy_dtoh_async(
+    ferrite_cuda_core::driver::memcpy_dtoh_async(
         &mut k_scale_host as *mut f32 as *mut u8,
         kv_cache.k_scale_ptr(layer_idx) as *const u8,
         4,
         stream,
     )
     .expect("D2H k_scale");
-    crate::driver::memcpy_dtoh_async(
+    ferrite_cuda_core::driver::memcpy_dtoh_async(
         &mut v_scale_host as *mut f32 as *mut u8,
         kv_cache.v_scale_ptr(layer_idx) as *const u8,
         4,
         stream,
     )
     .expect("D2H v_scale");
-    crate::driver::stream_synchronize(stream).expect("sync scales");
+    ferrite_cuda_core::driver::stream_synchronize(stream).expect("sync scales");
 
     // Dequant+gather K and V from FP8 cache pages to contiguous BF16.
     let k_contiguous = kernels::dequant_gather_pages(

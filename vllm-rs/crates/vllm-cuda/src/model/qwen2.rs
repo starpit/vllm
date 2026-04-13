@@ -16,7 +16,9 @@
 use anyhow::Result;
 
 use crate::alloc::OwnedTensor;
+use crate::attention_helpers;
 use crate::device::GpuDevice;
+use crate::driver;
 use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;

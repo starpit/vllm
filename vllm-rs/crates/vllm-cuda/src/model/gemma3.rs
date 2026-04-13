@@ -272,7 +272,7 @@ impl Gemma3Attention {
         let q_3d = q_flat_rope.reshape(&[num_tokens, self.num_q_heads, self.head_dim]);
         let k_3d = k_flat_rope.reshape(&[num_tokens, self.num_kv_heads, self.head_dim]);
 
-        crate::model::attention_helpers::write_kv_cache(
+        crate::attention_helpers::write_kv_cache(
             k_3d,
             v.view(),
             slot_mapping,
@@ -283,7 +283,7 @@ impl Gemma3Attention {
 
         let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
 
-        let attn_output = crate::model::attention_helpers::attention_ext(
+        let attn_output = crate::attention_helpers::attention_ext(
             q_3d,
             k_3d,
             v.view(),

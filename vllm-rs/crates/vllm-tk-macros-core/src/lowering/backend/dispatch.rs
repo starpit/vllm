@@ -259,7 +259,9 @@ impl DispatchSequence {
         &self,
         unit: CompilationUnitId,
     ) -> impl Iterator<Item = &DispatchEntry> {
-        self.entries.iter().filter(move |e| e.compilation_unit == unit)
+        self.entries
+            .iter()
+            .filter(move |e| e.compilation_unit == unit)
     }
 
     /// Whether a compilation unit contains a single HostCallback entry
@@ -276,9 +278,7 @@ impl DispatchSequence {
     pub fn units(&self) -> Vec<(CompilationUnitId, Vec<&DispatchEntry>)> {
         let mut map: BTreeMap<CompilationUnitId, Vec<&DispatchEntry>> = BTreeMap::new();
         for entry in &self.entries {
-            map.entry(entry.compilation_unit)
-                .or_default()
-                .push(entry);
+            map.entry(entry.compilation_unit).or_default().push(entry);
         }
         let mut units: Vec<_> = map.into_iter().collect();
         // Sort by earliest step in each unit.

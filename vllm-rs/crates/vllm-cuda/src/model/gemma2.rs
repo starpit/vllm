@@ -513,7 +513,7 @@ impl Gemma2Attention {
             } else {
                 (std::ptr::null(), 0)
             };
-            let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
+            let attn_output = crate::attention_helpers::attention_decode_from_cache(
                 q.view(),
                 cu_seqlens_q,
                 seqused_k,
@@ -567,7 +567,7 @@ impl Gemma2Attention {
         );
         drop(qkv);
 
-        crate::model::attention_helpers::write_kv_cache(
+        crate::attention_helpers::write_kv_cache(
             k.view(),
             v.view(),
             slot_mapping,
@@ -588,7 +588,7 @@ impl Gemma2Attention {
         } else {
             (std::ptr::null(), 0)
         };
-        let attn_output = crate::model::attention_helpers::attention_ext(
+        let attn_output = crate::attention_helpers::attention_ext(
             q.view(),
             k.view(),
             v.view(),

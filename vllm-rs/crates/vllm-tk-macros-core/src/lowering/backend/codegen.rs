@@ -89,8 +89,16 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         let any_qkv_unfused = plans_vec.iter().any(|(_, plan)| {
             let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
             ds.entries_for_layer(0).any(|e| {
-                matches!(e.kind, ImplDispatchKind::CublasGemm | ImplDispatchKind::CutlassGemm { .. } | ImplDispatchKind::CutlassGemv | ImplDispatchKind::CublasGemmWithBias)
-                    && matches!(e.gemm_phase, Some(GemmPhase::Q) | Some(GemmPhase::K) | Some(GemmPhase::V))
+                matches!(
+                    e.kind,
+                    ImplDispatchKind::CublasGemm
+                        | ImplDispatchKind::CutlassGemm { .. }
+                        | ImplDispatchKind::CutlassGemv
+                        | ImplDispatchKind::CublasGemmWithBias
+                ) && matches!(
+                    e.gemm_phase,
+                    Some(GemmPhase::Q) | Some(GemmPhase::K) | Some(GemmPhase::V)
+                )
             })
         });
         let any_gate_up_fused = plans_vec.iter().any(|(_, plan)| {
@@ -101,8 +109,13 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
         let any_gate_up_unfused = plans_vec.iter().any(|(_, plan)| {
             let ds = DispatchSequence::from_plan(plan, &library, &tile_graph);
             ds.entries_for_layer(0).any(|e| {
-                matches!(e.kind, ImplDispatchKind::CublasGemm | ImplDispatchKind::CutlassGemm { .. } | ImplDispatchKind::CutlassGemv | ImplDispatchKind::CublasGemmWithBias)
-                    && matches!(e.gemm_phase, Some(GemmPhase::Gate) | Some(GemmPhase::Up))
+                matches!(
+                    e.kind,
+                    ImplDispatchKind::CublasGemm
+                        | ImplDispatchKind::CutlassGemm { .. }
+                        | ImplDispatchKind::CutlassGemv
+                        | ImplDispatchKind::CublasGemmWithBias
+                ) && matches!(e.gemm_phase, Some(GemmPhase::Gate) | Some(GemmPhase::Up))
             })
         });
 
@@ -180,7 +193,9 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     // plan and generate CUDA source. Written to
     // ~/.cache/cudaforge/megakernels/ for build.rs to compile.
     {
-        use super::cuda_codegen::{extract_megakernel_units, generate_cuda_source, write_megakernels_to_cache};
+        use super::cuda_codegen::{
+            extract_megakernel_units, generate_cuda_source, write_megakernels_to_cache,
+        };
         let mut all_megakernels = Vec::new();
         for (_seq, plan) in &plans {
             let ds = DispatchSequence::from_plan(plan, library, tile_graph);
@@ -471,7 +486,8 @@ fn emit_layer_stmts(ds: &DispatchSequence) -> Vec<TokenStream> {
 
     // Identify DeviceCallable compilation units with 2+ non-Noop entries.
     let dc_units: BTreeSet<_> = {
-        let mut unit_counts: std::collections::BTreeMap<_, usize> = std::collections::BTreeMap::new();
+        let mut unit_counts: std::collections::BTreeMap<_, usize> =
+            std::collections::BTreeMap::new();
         for e in ds.entries_for_layer(0) {
             if e.launch_kind == LaunchKind::DeviceCallable && e.kind != ImplDispatchKind::Noop {
                 *unit_counts.entry(e.compilation_unit).or_default() += 1;
@@ -543,7 +559,7 @@ fn emit_megakernel_launch(
 
     // Build the FFI param list and call args for each phase.
     let mut ffi_params = Vec::new(); // (type, name) for extern "C" decl
-    let mut call_args = Vec::new();  // TokenStream for each arg expression
+    let mut call_args = Vec::new(); // TokenStream for each arg expression
     let mut setup_stmts = Vec::new(); // setup code (buffer alloc, pointer extraction)
 
     for (i, entry) in entries.iter().enumerate() {
@@ -1327,7 +1343,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
                 *positions, rotary.cos_sin_cache,
                 dims.head_dim, device.compute_stream,
             );
-            crate::model::attention_helpers::write_kv_cache(
+            attention_helpers::write_kv_cache(
                 __k.view(), __v.view(), slot_mapping,
                 kv_cache, layer_idx, device.compute_stream,
             );
@@ -1347,7 +1363,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
 
         ImplDispatchKind::FlashInferAttention => Some(quote! {{
             let __q = qkv_out.take().unwrap();
-            let __a = crate::model::attention_helpers::attention_decode_from_cache(
+            let __a = attention_helpers::attention_decode_from_cache(
                 __q.view(), cu_seqlens_q, seqused_k, block_table,
                 max_seqlen_q, max_seqlen_k, dims.scale,
                 0.0, -1, kv_cache, layer_idx,
@@ -1362,7 +1378,7 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             let __q = qkv_out.take().unwrap();
             let __k = k_out.take().unwrap();
             let __v = v_out.take().unwrap();
-            let __a = crate::model::attention_helpers::attention_standard(
+            let __a = attention_helpers::attention_standard(
                 __q.view(), __k.view(), __v.view(),
                 cu_seqlens_q, seqused_k, block_table,
                 max_seqlen_q, max_seqlen_k, dims.scale,
@@ -1656,7 +1672,7 @@ fn emit_model_load(
                         let q_bytes = q_size * hidden * elem;
                         let kv_bytes = kv_size * hidden * elem;
                         let total = q_bytes + 2 * kv_bytes;
-                        let ptr = crate::driver::mem_alloc(total)?;
+                        let ptr = driver::mem_alloc(total)?;
                         weights.record_alloc(ptr, total);
                         weights.take_into(&q_name, ptr, device.compute_stream)?;
                         weights.take_into(&k_name, ptr.add(q_bytes), device.compute_stream)?;
@@ -1675,7 +1691,7 @@ fn emit_model_load(
                             let vb_bytes = vb_shape.iter().product::<usize>() * qb_dtype.size_bytes();
                             let total_bias = qb_bytes + kb_bytes + vb_bytes;
                             let total_elems = total_bias / qb_dtype.size_bytes();
-                            let bias_ptr = crate::driver::mem_alloc(total_bias)?;
+                            let bias_ptr = driver::mem_alloc(total_bias)?;
                             weights.record_alloc(bias_ptr, total_bias);
                             weights.take_into(&q_bias_name, bias_ptr, device.compute_stream)?;
                             weights.take_into(&k_bias_name, bias_ptr.add(qb_bytes), device.compute_stream)?;
@@ -1701,7 +1717,7 @@ fn emit_model_load(
                         let gate_bytes = g_shape.iter().product::<usize>() * elem;
                         let up_bytes = gate_bytes;
                         let total = gate_bytes + up_bytes;
-                        let ptr = crate::driver::mem_alloc(total)?;
+                        let ptr = driver::mem_alloc(total)?;
                         weights.record_alloc(ptr, total);
                         weights.take_into(&gate_name, ptr, device.compute_stream)?;
                         weights.take_into(&up_name, ptr.add(gate_bytes), device.compute_stream)?;

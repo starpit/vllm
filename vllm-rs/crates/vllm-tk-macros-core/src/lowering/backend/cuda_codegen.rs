@@ -85,10 +85,7 @@ pub fn extract_megakernel_units(ds: &DispatchSequence) -> Vec<MegakernelUnit> {
                 impl_name: e.impl_name,
             })
             .collect();
-        units.push(MegakernelUnit {
-            unit_id,
-            phases,
-        });
+        units.push(MegakernelUnit { unit_id, phases });
     }
     units
 }
@@ -120,20 +117,33 @@ pub fn generate_cuda_source(unit: &MegakernelUnit) -> GeneratedMegakernel {
     let mut src = String::new();
 
     // ── Header ──
-    writeln!(src, "// Auto-generated megakernel for compilation unit {unit_idx}").unwrap();
-    writeln!(src, "// DO NOT EDIT — regenerate via the forward! proc macro.").unwrap();
+    writeln!(
+        src,
+        "// Auto-generated megakernel for compilation unit {unit_idx}"
+    )
+    .unwrap();
+    writeln!(
+        src,
+        "// DO NOT EDIT — regenerate via the forward! proc macro."
+    )
+    .unwrap();
     writeln!(src).unwrap();
     writeln!(src, "#include <cuda_bf16.h>").unwrap();
     writeln!(src, "#include <cooperative_groups.h>").unwrap();
 
     // Include CUTLASS if any GEMM phase.
-    let has_cutlass_gemm = unit.phases.iter().any(|p| {
-        matches!(p.kind, ImplDispatchKind::CutlassGemm { .. })
-    });
+    let has_cutlass_gemm = unit
+        .phases
+        .iter()
+        .any(|p| matches!(p.kind, ImplDispatchKind::CutlassGemm { .. }));
     if has_cutlass_gemm {
         writeln!(src, "#include <cutlass/cutlass.h>").unwrap();
         writeln!(src, "#include <cutlass/gemm/device/gemm.h>").unwrap();
-        writeln!(src, "#include <cutlass/epilogue/thread/linear_combination.h>").unwrap();
+        writeln!(
+            src,
+            "#include <cutlass/epilogue/thread/linear_combination.h>"
+        )
+        .unwrap();
     }
 
     writeln!(src, "#include \"megakernel_ops.cuh\"").unwrap();
@@ -142,26 +152,51 @@ pub fn generate_cuda_source(unit: &MegakernelUnit) -> GeneratedMegakernel {
     // ── CUTLASS type aliases (one per distinct GEMM config) ──
     let mut gemm_aliases: Vec<(u32, u32, u32, String)> = Vec::new(); // (tile_m, tile_n, stages, alias)
     for (i, phase) in unit.phases.iter().enumerate() {
-        if let ImplDispatchKind::CutlassGemm { tile_m, tile_n, stages } = phase.kind {
+        if let ImplDispatchKind::CutlassGemm {
+            tile_m,
+            tile_n,
+            stages,
+        } = phase.kind
+        {
             let alias = format!("GemmKernel_p{i}");
             // Use the same template params as cutlass_standalone_gemm.cu.
             // TB_K is always 32 for sm89 (the solver encodes tile_m x tile_n only).
             let tb_k = 32;
             let (warp_m, warp_n) = warp_shape_for_tb(tile_m, tile_n);
-            writeln!(src, "// Phase {i}: CUTLASS GEMM {tile_m}x{tile_n} s{stages}").unwrap();
+            writeln!(
+                src,
+                "// Phase {i}: CUTLASS GEMM {tile_m}x{tile_n} s{stages}"
+            )
+            .unwrap();
             writeln!(src, "using DeviceGemm_p{i} = cutlass::gemm::device::Gemm<").unwrap();
             writeln!(src, "    cutlass::bfloat16_t, cutlass::layout::RowMajor,").unwrap();
-            writeln!(src, "    cutlass::bfloat16_t, cutlass::layout::ColumnMajor,").unwrap();
+            writeln!(
+                src,
+                "    cutlass::bfloat16_t, cutlass::layout::ColumnMajor,"
+            )
+            .unwrap();
             writeln!(src, "    cutlass::bfloat16_t, cutlass::layout::RowMajor,").unwrap();
             writeln!(src, "    float,").unwrap();
             writeln!(src, "    cutlass::arch::OpClassTensorOp,").unwrap();
             writeln!(src, "    cutlass::arch::Sm80,").unwrap();
-            writeln!(src, "    cutlass::gemm::GemmShape<{tile_m}, {tile_n}, {tb_k}>,").unwrap();
-            writeln!(src, "    cutlass::gemm::GemmShape<{warp_m}, {warp_n}, {tb_k}>,").unwrap();
+            writeln!(
+                src,
+                "    cutlass::gemm::GemmShape<{tile_m}, {tile_n}, {tb_k}>,"
+            )
+            .unwrap();
+            writeln!(
+                src,
+                "    cutlass::gemm::GemmShape<{warp_m}, {warp_n}, {tb_k}>,"
+            )
+            .unwrap();
             writeln!(src, "    cutlass::gemm::GemmShape<16, 8, 16>,").unwrap();
             writeln!(src, "    cutlass::epilogue::thread::LinearCombination<").unwrap();
             writeln!(src, "        cutlass::bfloat16_t, 8, float, float>,").unwrap();
-            writeln!(src, "    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,").unwrap();
+            writeln!(
+                src,
+                "    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,"
+            )
+            .unwrap();
             writeln!(src, "    {stages}").unwrap();
             writeln!(src, ">;").unwrap();
             writeln!(src, "using {alias} = typename DeviceGemm_p{i}::GemmKernel;").unwrap();
@@ -242,7 +277,11 @@ pub fn generate_cuda_source(unit: &MegakernelUnit) -> GeneratedMegakernel {
     writeln!(src, "    void* args[] = {{ &params }};").unwrap();
     writeln!(src, "    return cudaLaunchCooperativeKernel(").unwrap();
     writeln!(src, "        (void*){kernel_name},").unwrap();
-    writeln!(src, "        grid, block, args, __smem_bytes, (cudaStream_t)__stream);").unwrap();
+    writeln!(
+        src,
+        "        grid, block, args, __smem_bytes, (cudaStream_t)__stream);"
+    )
+    .unwrap();
     writeln!(src, "}}").unwrap();
 
     let all_flat: Vec<(String, String)> = flat_params
@@ -265,14 +304,11 @@ pub fn generate_cuda_source(unit: &MegakernelUnit) -> GeneratedMegakernel {
 /// don't trigger recompilation.
 ///
 /// Returns the paths of all written `.cu` files.
-pub fn write_megakernels_to_cache(
-    megakernels: &[GeneratedMegakernel],
-) -> Vec<std::path::PathBuf> {
+pub fn write_megakernels_to_cache(megakernels: &[GeneratedMegakernel]) -> Vec<std::path::PathBuf> {
     use std::io::Write as IoWrite;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let cache_dir = std::path::PathBuf::from(home)
-        .join(".cache/cudaforge/megakernels");
+    let cache_dir = std::path::PathBuf::from(home).join(".cache/cudaforge/megakernels");
     std::fs::create_dir_all(&cache_dir).ok();
 
     let mut paths = Vec::new();
@@ -318,7 +354,11 @@ fn phase_comment(phase: &MegakernelPhase) -> String {
         ImplDispatchKind::SiluAndMul => "SiLU+Mul".to_string(),
         ImplDispatchKind::FusedQkvRopeCache => "FusedQkvRopeCache".to_string(),
         ImplDispatchKind::PrefillRopeCache => "PrefillRopeCache".to_string(),
-        ImplDispatchKind::CutlassGemm { tile_m, tile_n, stages } => {
+        ImplDispatchKind::CutlassGemm {
+            tile_m,
+            tile_n,
+            stages,
+        } => {
             let label = phase
                 .gemm_phase
                 .map(|p| format!("{p:?}"))
@@ -342,71 +382,210 @@ fn phase_flat_params(phase: &MegakernelPhase, idx: usize) -> Vec<FlatParam> {
     let p = format!("p{idx}");
     match phase.kind {
         ImplDispatchKind::RmsNorm => vec![
-            FlatParam { c_type: "void*".into(), name: format!("{p}_out") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_input") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_weight") },
-            FlatParam { c_type: "float".into(), name: format!("{p}_eps") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_hidden_size") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_num_tokens") },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_out"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_input"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_weight"),
+            },
+            FlatParam {
+                c_type: "float".into(),
+                name: format!("{p}_eps"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_hidden_size"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_num_tokens"),
+            },
         ],
         ImplDispatchKind::SiluAndMul => vec![
-            FlatParam { c_type: "void*".into(), name: format!("{p}_out") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_input") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_d") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_num_tokens") },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_out"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_input"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_d"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_num_tokens"),
+            },
         ],
         ImplDispatchKind::CutlassGemm { .. } => vec![
-            FlatParam { c_type: "void*".into(), name: format!("{p}_C") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_A") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_B") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_M") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_N") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_K") },
-            FlatParam { c_type: "float".into(), name: format!("{p}_alpha") },
-            FlatParam { c_type: "float".into(), name: format!("{p}_beta") },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_C"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_A"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_B"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_M"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_N"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_K"),
+            },
+            FlatParam {
+                c_type: "float".into(),
+                name: format!("{p}_alpha"),
+            },
+            FlatParam {
+                c_type: "float".into(),
+                name: format!("{p}_beta"),
+            },
         ],
         ImplDispatchKind::CutlassGemv => vec![
-            FlatParam { c_type: "void*".into(), name: format!("{p}_out") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_x") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_W") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_N") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_K") },
-            FlatParam { c_type: "float".into(), name: format!("{p}_alpha") },
-            FlatParam { c_type: "float".into(), name: format!("{p}_beta") },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_out"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_x"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_W"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_N"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_K"),
+            },
+            FlatParam {
+                c_type: "float".into(),
+                name: format!("{p}_alpha"),
+            },
+            FlatParam {
+                c_type: "float".into(),
+                name: format!("{p}_beta"),
+            },
         ],
         ImplDispatchKind::FusedQkvRopeCache => vec![
-            FlatParam { c_type: "void*".into(), name: format!("{p}_q_out") },
-            FlatParam { c_type: "void*".into(), name: format!("{p}_key_cache") },
-            FlatParam { c_type: "void*".into(), name: format!("{p}_value_cache") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_qkv") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_positions") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_cos_sin_cache") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_slot_mapping") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_q_size") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_kv_size") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_head_dim") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_num_tokens") },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_q_out"),
+            },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_key_cache"),
+            },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_value_cache"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_qkv"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_positions"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_cos_sin_cache"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_slot_mapping"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_q_size"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_kv_size"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_head_dim"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_num_tokens"),
+            },
         ],
         ImplDispatchKind::PrefillRopeCache => vec![
-            FlatParam { c_type: "void*".into(), name: format!("{p}_q_out") },
-            FlatParam { c_type: "void*".into(), name: format!("{p}_k_out") },
-            FlatParam { c_type: "void*".into(), name: format!("{p}_v_out") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_qkv") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_positions") },
-            FlatParam { c_type: "const void*".into(), name: format!("{p}_cos_sin_cache") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_q_size") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_kv_size") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_head_dim") },
-            FlatParam { c_type: "int".into(), name: format!("{p}_num_tokens") },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_q_out"),
+            },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_k_out"),
+            },
+            FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_v_out"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_qkv"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_positions"),
+            },
+            FlatParam {
+                c_type: "const void*".into(),
+                name: format!("{p}_cos_sin_cache"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_q_size"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_kv_size"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_head_dim"),
+            },
+            FlatParam {
+                c_type: "int".into(),
+                name: format!("{p}_num_tokens"),
+            },
         ],
         ImplDispatchKind::TkAttentionDecode | ImplDispatchKind::TkAttentionPrefill => {
             // TK attention is embedded in the megakernel via the
             // FlashInfer persistent runner. Its params are complex
             // (BlockPersistentRunner state). For now, emit a placeholder
             // that will be filled when TK integration lands.
-            vec![
-                FlatParam { c_type: "void*".into(), name: format!("{p}_runner_state") },
-            ]
+            vec![FlatParam {
+                c_type: "void*".into(),
+                name: format!("{p}_runner_state"),
+            }]
         }
         _ => vec![],
     }
@@ -469,9 +648,9 @@ fn phase_internal_fields(phase: &MegakernelPhase, idx: usize) -> Vec<String> {
             format!("int {p}_head_dim"),
             format!("int {p}_num_tokens"),
         ],
-        ImplDispatchKind::TkAttentionDecode | ImplDispatchKind::TkAttentionPrefill => vec![
-            format!("void* {p}_runner_state"),
-        ],
+        ImplDispatchKind::TkAttentionDecode | ImplDispatchKind::TkAttentionPrefill => {
+            vec![format!("void* {p}_runner_state")]
+        }
         _ => vec![],
     }
 }
@@ -480,20 +659,20 @@ fn phase_internal_fields(phase: &MegakernelPhase, idx: usize) -> Vec<String> {
 fn phase_kernel_body(phase: &MegakernelPhase, idx: usize) -> Vec<String> {
     let p = format!("p.p{idx}");
     match phase.kind {
-        ImplDispatchKind::RmsNorm => vec![
-            format!("dc_rms_norm({p}_out, {p}_input, {p}_weight, {p}_eps, {p}_hidden_size, {p}_num_tokens, smem);"),
-        ],
-        ImplDispatchKind::SiluAndMul => vec![
-            format!("dc_silu_and_mul({p}_out, {p}_input, {p}_d, {p}_num_tokens);"),
-        ],
+        ImplDispatchKind::RmsNorm => vec![format!(
+            "dc_rms_norm({p}_out, {p}_input, {p}_weight, {p}_eps, {p}_hidden_size, {p}_num_tokens, smem);"
+        )],
+        ImplDispatchKind::SiluAndMul => vec![format!(
+            "dc_silu_and_mul({p}_out, {p}_input, {p}_d, {p}_num_tokens);"
+        )],
         ImplDispatchKind::CutlassGemm { .. } => vec![
             format!("// CUTLASS GEMM kernel-level invocation"),
             format!("GemmKernel_p{idx}()({p}_gemm_params,"),
             format!("    *reinterpret_cast<typename GemmKernel_p{idx}::SharedStorage*>(smem));"),
         ],
-        ImplDispatchKind::CutlassGemv => vec![
-            format!("dc_gemv({p}_out, {p}_x, {p}_W, {p}_N, {p}_K, {p}_alpha, {p}_beta, {p}_N);"),
-        ],
+        ImplDispatchKind::CutlassGemv => vec![format!(
+            "dc_gemv({p}_out, {p}_x, {p}_W, {p}_N, {p}_K, {p}_alpha, {p}_beta, {p}_N);"
+        )],
         ImplDispatchKind::FusedQkvRopeCache => vec![
             format!("dc_fused_qkv_rope_cache({p}_q_out, {p}_key_cache, {p}_value_cache,"),
             format!("    {p}_qkv, {p}_positions, {p}_cos_sin_cache, {p}_slot_mapping,"),
@@ -552,7 +731,9 @@ fn phase_params_build(phase: &MegakernelPhase, idx: usize) -> Vec<String> {
             // Extract kernel params. GemmUniversalBase stores params_
             // as the sole data member, so we can safely reinterpret.
             format!("    static_assert("),
-            format!("        sizeof(DeviceGemm_p{idx}) >= sizeof(typename GemmKernel_p{idx}::Params),"),
+            format!(
+                "        sizeof(DeviceGemm_p{idx}) >= sizeof(typename GemmKernel_p{idx}::Params),"
+            ),
             format!("        \"DeviceGemm layout assumption violated\");"),
             format!("    params.{p}_gemm_params = *reinterpret_cast<"),
             format!("        typename GemmKernel_p{idx}::Params const*>(&gemm_op);"),
@@ -592,9 +773,9 @@ fn phase_params_build(phase: &MegakernelPhase, idx: usize) -> Vec<String> {
             format!("params.{p}_head_dim = {p}_head_dim;"),
             format!("params.{p}_num_tokens = {p}_num_tokens;"),
         ],
-        ImplDispatchKind::TkAttentionDecode | ImplDispatchKind::TkAttentionPrefill => vec![
-            format!("params.{p}_runner_state = {p}_runner_state;"),
-        ],
+        ImplDispatchKind::TkAttentionDecode | ImplDispatchKind::TkAttentionPrefill => {
+            vec![format!("params.{p}_runner_state = {p}_runner_state;")]
+        }
         _ => vec![],
     }
 }
@@ -657,9 +838,9 @@ mod tests {
         // Flat params should include all phases' args.
         assert!(!result.flat_params.is_empty());
         let param_names: Vec<&str> = result.flat_params.iter().map(|p| p.1.as_str()).collect();
-        assert!(param_names.contains(&"p0_out"));     // RmsNorm
-        assert!(param_names.contains(&"p1_out"));     // GEMV
-        assert!(param_names.contains(&"p2_out"));     // SiLU
+        assert!(param_names.contains(&"p0_out")); // RmsNorm
+        assert!(param_names.contains(&"p1_out")); // GEMV
+        assert!(param_names.contains(&"p2_out")); // SiLU
     }
 
     #[test]
@@ -691,7 +872,11 @@ mod tests {
         assert!(result.cuda_source.contains("DeviceGemm_p1"));
         assert!(result.cuda_source.contains("GemmKernel_p1"));
         // Should have CUTLASS kernel invocation in kernel body.
-        assert!(result.cuda_source.contains("GemmKernel_p1()(p.p1_gemm_params"));
+        assert!(
+            result
+                .cuda_source
+                .contains("GemmKernel_p1()(p.p1_gemm_params")
+        );
         // Should have params build from flat args.
         assert!(result.cuda_source.contains("gemm_op.initialize(args"));
         // Flat params should have GEMM args.
@@ -727,6 +912,10 @@ mod tests {
         assert!(result.cuda_source.contains("p1_key_cache"));
         assert!(result.cuda_source.contains("p1_slot_mapping"));
         // Verify the launch wrapper builds params correctly.
-        assert!(result.cuda_source.contains("params.p1_q_out = (__nv_bfloat16*)p1_q_out"));
+        assert!(
+            result
+                .cuda_source
+                .contains("params.p1_q_out = (__nv_bfloat16*)p1_q_out")
+        );
     }
 }

@@ -210,11 +210,11 @@ impl CudaGraphRunner {
 
     /// Build an [`Fp8GraphCtx`] for the thread-local. Returns `None` if FP8
     /// buffers are not allocated.
-    pub fn fp8_graph_ctx(&self) -> Option<crate::model::attention_helpers::Fp8GraphCtx> {
+    pub fn fp8_graph_ctx(&self) -> Option<crate::attention_helpers::Fp8GraphCtx> {
         let k_buf = self.fp8_k_buf.as_ref()?.ptr();
         let v_buf = self.fp8_v_buf.as_ref()?.ptr();
         let cu_seqlens_k = self.fp8_cu_seqlens_k.as_ref()?.ptr();
-        Some(crate::model::attention_helpers::Fp8GraphCtx {
+        Some(crate::attention_helpers::Fp8GraphCtx {
             k_buf,
             v_buf,
             cu_seqlens_k,

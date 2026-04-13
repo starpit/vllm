@@ -1,0 +1,25 @@
+[package]
+name = "ferrite-cuda-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core GPU types for the ferrite inference framework"
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+nccl = ["cuda", "cudarc/nccl"]
+
+[dependencies]
+cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+half = { workspace = true }
+safetensors = { workspace = true }
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+vllm-model = { path = "../vllm-model" }
+
+[build-dependencies]
+dirs = "6"

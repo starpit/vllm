@@ -1,0 +1,19 @@
+[package]
+name = "ferrite-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU kernel wrappers and layer types for the ferrite inference framework"
+
+[features]
+default = []
+cuda = ["ferrite-cuda-core/cuda"]
+nccl = ["cuda", "ferrite-cuda-core/nccl"]
+
+[dependencies]
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+cudarc = { workspace = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+half = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+vllm-model = { path = "../vllm-model" }

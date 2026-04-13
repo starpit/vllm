@@ -8,9 +8,9 @@
 //!
 //! Launch configs match llama.cpp's quantized kernel configs.
 
-use crate::alloc::{CachingAllocator, OwnedTensor};
-use crate::dtype::DType;
-use crate::tensor::GpuTensor;
+use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
+use ferrite_cuda_core::dtype::DType;
+use ferrite_cuda_core::tensor::GpuTensor;
 
 type CUstream = cudarc::driver::sys::CUstream;
 
@@ -1274,7 +1274,7 @@ impl GgufGpuWeights {
             })
             .max()
             .unwrap_or(0);
-        let host_buf = crate::driver::mem_alloc_host(max_tensor_bytes)?;
+        let host_buf = ferrite_cuda_core::driver::mem_alloc_host(max_tensor_bytes)?;
 
         for (gguf_name, info) in &content.tensor_infos {
             let hf_name = vllm_model::gguf::gguf_to_hf_name(gguf_name);
@@ -1332,8 +1332,10 @@ impl GgufGpuWeights {
                     if source_dtype == target_dtype
                         || (source_dtype == DType::F32 && target_dtype == DType::F32)
                     {
-                        let gpu_ptr = crate::driver::mem_alloc(size_bytes)?;
-                        crate::driver::memcpy_htod_async(gpu_ptr, host_buf, size_bytes, stream)?;
+                        let gpu_ptr = ferrite_cuda_core::driver::mem_alloc(size_bytes)?;
+                        ferrite_cuda_core::driver::memcpy_htod_async(
+                            gpu_ptr, host_buf, size_bytes, stream,
+                        )?;
                         let tensor = GpuTensor::new(gpu_ptr, dims, source_dtype);
                         weights.insert(hf_name, GgufWeight::Dense(tensor));
                     } else {
@@ -1345,7 +1347,7 @@ impl GgufGpuWeights {
                             let f32_slice =
                                 std::slice::from_raw_parts(host_buf as *const f32, elem_count);
                             let out_size = elem_count * target_dtype.size_bytes();
-                            let conv_buf = crate::driver::mem_alloc_host(out_size)?;
+                            let conv_buf = ferrite_cuda_core::driver::mem_alloc_host(out_size)?;
                             match target_dtype {
                                 DType::BF16 => {
                                     let out = std::slice::from_raw_parts_mut(
@@ -1369,16 +1371,18 @@ impl GgufGpuWeights {
                                     "unsupported conversion: {source_dtype:?} -> {target_dtype:?}"
                                 ),
                             }
-                            let gpu_ptr = crate::driver::mem_alloc(out_size)?;
-                            crate::driver::memcpy_htod_async(gpu_ptr, conv_buf, out_size, stream)?;
-                            crate::driver::stream_synchronize(stream)?;
-                            crate::driver::mem_free_host(conv_buf)?;
+                            let gpu_ptr = ferrite_cuda_core::driver::mem_alloc(out_size)?;
+                            ferrite_cuda_core::driver::memcpy_htod_async(
+                                gpu_ptr, conv_buf, out_size, stream,
+                            )?;
+                            ferrite_cuda_core::driver::stream_synchronize(stream)?;
+                            ferrite_cuda_core::driver::mem_free_host(conv_buf)?;
                             let tensor = GpuTensor::new(gpu_ptr, dims, target_dtype);
                             weights.insert(hf_name, GgufWeight::Dense(tensor));
                         } else {
                             // Non-f32 source needing conversion — just store as-is for now.
-                            let gpu_ptr = crate::driver::mem_alloc(size_bytes)?;
-                            crate::driver::memcpy_htod_async(
+                            let gpu_ptr = ferrite_cuda_core::driver::mem_alloc(size_bytes)?;
+                            ferrite_cuda_core::driver::memcpy_htod_async(
                                 gpu_ptr, host_buf, size_bytes, stream,
                             )?;
                             let tensor = GpuTensor::new(gpu_ptr, dims, source_dtype);
@@ -1387,9 +1391,11 @@ impl GgufGpuWeights {
                     }
                 } else if let Some(our_dt) = our_dtype {
                     // Quantized norm/embedding: upload raw bytes, then dequant on GPU.
-                    let gpu_raw = crate::driver::mem_alloc(size_bytes)?;
-                    crate::driver::memcpy_htod_async(gpu_raw, host_buf, size_bytes, stream)?;
-                    crate::driver::stream_synchronize(stream)?;
+                    let gpu_raw = ferrite_cuda_core::driver::mem_alloc(size_bytes)?;
+                    ferrite_cuda_core::driver::memcpy_htod_async(
+                        gpu_raw, host_buf, size_bytes, stream,
+                    )?;
+                    ferrite_cuda_core::driver::stream_synchronize(stream)?;
 
                     let storage = GgmlStorage {
                         ptr: gpu_raw,
@@ -1405,9 +1411,9 @@ impl GgufGpuWeights {
                         model_dtype
                     };
                     let tensor = ggml_dequantize_to_tensor(&storage, target, dims, alloc, stream);
-                    crate::driver::stream_synchronize(stream)?;
+                    ferrite_cuda_core::driver::stream_synchronize(stream)?;
                     // Free the raw quantized buffer since we dequantized.
-                    crate::driver::mem_free(gpu_raw)?;
+                    ferrite_cuda_core::driver::mem_free(gpu_raw)?;
                     // Weight tensors are permanent — leak from allocator tracking.
                     let gpu_tensor = tensor.into_gpu_tensor();
                     weights.insert(hf_name, GgufWeight::Dense(gpu_tensor));
@@ -1420,8 +1426,10 @@ impl GgufGpuWeights {
                 }
             } else if let Some(our_dt) = our_dtype {
                 // Quantized linear: raw H2D copy, keep compressed.
-                let gpu_ptr = crate::driver::mem_alloc(size_bytes)?;
-                crate::driver::memcpy_htod_async(gpu_ptr, host_buf, size_bytes, stream)?;
+                let gpu_ptr = ferrite_cuda_core::driver::mem_alloc(size_bytes)?;
+                ferrite_cuda_core::driver::memcpy_htod_async(
+                    gpu_ptr, host_buf, size_bytes, stream,
+                )?;
 
                 // For 3D tensors (fused MoE experts), flatten first dims:
                 // [num_experts, output_dim, input_dim] → nrows = num_experts * output_dim.
@@ -1449,8 +1457,8 @@ impl GgufGpuWeights {
             }
         }
 
-        crate::driver::stream_synchronize(stream)?;
-        crate::driver::mem_free_host(host_buf)?;
+        ferrite_cuda_core::driver::stream_synchronize(stream)?;
+        ferrite_cuda_core::driver::mem_free_host(host_buf)?;
 
         tracing::info!(
             "GgufGpuWeights: loaded {} tensors from {}",

@@ -86,7 +86,11 @@ pub struct OpCall {
 pub enum Arg {
     /// Variable reference: `x`, `x[layer]`, or `self_attn.q_proj[layer]`.
     /// The name may contain dots (HF weight path segments).
+    /// The optional `Ident` is the symbolic loop variable (pre-unroll).
     Var(String, Option<Ident>),
+    /// Post-unroll: concrete indexed reference. `VarAt("foo", 3)`
+    /// represents element 3 of the `foo` array.
+    VarAt(String, usize),
     /// Nested call: `silu(gemm(x, w[layer]))`
     Call(OpCall),
     /// Binary expression: `a * b`
@@ -764,6 +768,12 @@ fn resolve_arg(
                 });
             }
             Ok((buf_id, shape))
+        }
+        Arg::VarAt(..) => {
+            // VarAt is produced only by the unroll pass (CFG → FUF).
+            // The legacy DAG builder runs on pre-unroll ASTs and
+            // should never see one.
+            unreachable!("Arg::VarAt reached legacy resolve_arg — unroll output should flow through the new FUF pipeline")
         }
         Arg::Call(call) => process_call(dag, ctx, call, in_loop),
         Arg::Mul(a, b) => {

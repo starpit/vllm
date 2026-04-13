@@ -23,3 +23,4 @@ pub mod dag;
 pub mod lowering;
 pub mod parse;
 pub mod target_profile;
+pub mod unroll;

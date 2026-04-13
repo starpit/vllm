@@ -699,6 +699,47 @@ fn emit_entry(entry: &DispatchEntry) -> Option<TokenStream> {
             }})
         }
 
+        ImplDispatchKind::CutlassGemmSiluMul {
+            tile_m,
+            tile_n,
+            stages,
+        } => {
+            // Gate GEMM + SiLU + Mul epilogue fusion.
+            // The EVT epilogue computes silu(accum) * up_output.
+            // TODO: wire up the EVT-based CUTLASS kernel. For now,
+            // fall back to separate gate GEMM + silu_and_mul (the solver
+            // won't pick this until the kernel exists and cost data is measured).
+            let launch_fn = format_ident!(
+                "cutlass_gemm_silu_mul_{}x{}_s{}_launch",
+                tile_m,
+                tile_n,
+                stages
+            );
+            let cutlass_input = cutlass_input_expr(GemmPhase::Gate);
+            Some(quote! {{
+                let __act: GpuTensor = #cutlass_input;
+                let __m = __act.dim(0) as i32;
+                let __k = __act.dim(1) as i32;
+                let __up = gate_up.as_ref().expect("up output not ready for silu_mul fusion");
+                let __n = __up.dim(1) as i32;
+                let __w = layer.gate_weights.dense_weight();
+                let __out = device.caching.alloc_tensor(
+                    &[__m as usize, __n as usize], __act.dtype(),
+                );
+                let __rc = #launch_fn(
+                    __out.as_mut_ptr::<u16>(),
+                    __act.as_ptr::<u16>(),
+                    __w.as_ptr::<u16>(),
+                    __up.as_gpu_tensor().as_ptr::<u16>(),
+                    __m, __n, __k,
+                    device.compute_stream as u64,
+                );
+                debug_assert_eq!(__rc, 0, "CUTLASS GEMM+SiLU+Mul failed");
+                drop(gate_up.take());
+                silu_out = Some(__out);
+            }})
+        }
+
         ImplDispatchKind::CutlassNormGemm { .. } => {
             let phase = entry.gemm_phase.unwrap();
             let (input, weight, store) = gemm_operands(phase, entry.fused_residual);

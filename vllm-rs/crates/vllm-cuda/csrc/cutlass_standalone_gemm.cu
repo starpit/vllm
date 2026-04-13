@@ -11,6 +11,7 @@
 #include <cutlass/gemm/device/gemv.h>
 #include <cutlass/gemm/kernel/gemv.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/thread/linear_combination_silu.h>
 #include <cutlass/reduction/device/reduce_split_k.h>
 #include <cuda_runtime.h>
 
@@ -774,6 +775,68 @@ extern "C" int cutlass_gemm_64x64_launch(
 ) {
     return cutlass_gemm_64x64_s4_launch(C, A, B, M, N, K, alpha, beta, stream);
 }
+
+// ── CUTLASS GEMM with SiLU epilogue ──
+//
+// D = silu(alpha * A[M,K] @ B[K,N]^T + beta * C[M,N])
+//
+// Drop-in replacement for the standard GEMM with LinearCombinationSiLU
+// epilogue. Used for the Gate GEMM phase where the activation function
+// is fused into the GEMM epilogue, saving one kernel launch + one
+// full GMEM round-trip of the gate output.
+
+#define CUTLASS_GEMM_SILU_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)      \
+    using GemmSilu_##TB_M##x##TB_N##x##TB_K##_s##STAGES = cutlass::gemm::device::Gemm<   \
+        cutlass::bfloat16_t, cutlass::layout::RowMajor,                                   \
+        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                                \
+        cutlass::bfloat16_t, cutlass::layout::RowMajor,                                   \
+        float,                                                                            \
+        cutlass::arch::OpClassTensorOp,                                                   \
+        cutlass::arch::Sm80,                                                              \
+        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                      \
+        cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                                \
+        cutlass::gemm::GemmShape<16, 8, 16>,                                              \
+        cutlass::epilogue::thread::LinearCombinationSilu<                                  \
+            cutlass::bfloat16_t, 8, float, float>,                                        \
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,                     \
+        STAGES                                                                            \
+    >;
+
+#define CUTLASS_GEMM_SILU_LAUNCH(TB_M, TB_N, TB_K, STAGES)                               \
+    extern "C" int cutlass_gemm_silu_##TB_M##x##TB_N##_s##STAGES##_launch(                \
+        void* C, const void* A, const void* B,                                            \
+        int M, int N, int K,                                                              \
+        float alpha, float beta,                                                          \
+        uint64_t stream                                                                   \
+    ) {                                                                                   \
+        return run_gemm<GemmSilu_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                   \
+            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                         \
+    }
+
+#define CUTLASS_GEMM_SILU(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)             \
+    CUTLASS_GEMM_SILU_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)          \
+    CUTLASS_GEMM_SILU_LAUNCH(TB_M, TB_N, TB_K, STAGES)
+
+// Same tile configs as the standard GEMM — solver picks per workload.
+CUTLASS_GEMM_SILU( 64,   64,  32,    32,     32,     32,    4)
+CUTLASS_GEMM_SILU( 64,  128,  32,    32,     64,     32,    4)
+CUTLASS_GEMM_SILU(128,   64,  32,    64,     32,     32,    4)
+CUTLASS_GEMM_SILU(128,  128,  32,    64,     32,     32,    4)
+CUTLASS_GEMM_SILU(128,  256,  32,    64,     64,     32,    3)
+CUTLASS_GEMM_SILU(256,   64,  32,    64,     32,     32,    4)
+
+CUTLASS_GEMM_SILU( 64,   64,  32,    32,     32,     32,    3)
+CUTLASS_GEMM_SILU( 64,  128,  32,    32,     64,     32,    3)
+CUTLASS_GEMM_SILU(128,   64,  32,    64,     32,     32,    3)
+CUTLASS_GEMM_SILU(128,  128,  32,    64,     32,     32,    3)
+CUTLASS_GEMM_SILU(256,   64,  32,    64,     32,     32,    3)
+
+// Small M tiles for decode regime.
+CUTLASS_GEMM_SILU( 32,   64,  32,    32,     32,     32,    4)
+CUTLASS_GEMM_SILU( 32,  128,  32,    32,     64,     32,    4)
+CUTLASS_GEMM_SILU( 32,  256,  32,    32,     64,     32,    3)
+CUTLASS_GEMM_SILU( 32,   64,  32,    32,     32,     32,    3)
+CUTLASS_GEMM_SILU( 32,  128,  32,    32,     64,     32,    3)
 
 // ── Null kernel for measuring launch overhead ──
 __global__ void null_kernel() {}

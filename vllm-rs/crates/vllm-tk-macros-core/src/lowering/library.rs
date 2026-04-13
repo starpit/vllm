@@ -305,6 +305,7 @@ impl ImplementationLibrary {
         // picks the config that minimizes measured cost per workload.
         entries.extend(CutlassGemmImpl::all_configs(dims));
         entries.extend(CutlassGemmWithResidualImpl::all_configs(dims));
+        entries.extend(CutlassGemmSiluMulImpl::all_configs(dims));
         entries.extend(CutlassGemvImpl::all_configs(dims));
         ImplementationLibrary {
             entries,
@@ -3249,6 +3250,147 @@ impl Implementation for CutlassNormGemmImpl {
             // Extra shmem for norm: hidden_dim * 4 bytes (f32 accumulator)
             shmem_bytes: per_stage * 4 + 2048 * 4,
             regs_per_thread: 140, // slightly more than plain GEMM
+            threads_per_cta: 256,
+        }
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder, Handoff::StreamEvent]
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+}
+
+// ── CUTLASS Gate GEMM + SiLU + Mul epilogue fusion ──
+
+/// Claims `[GemmGate, GateUpConcat, SiluMul]` as a 3-tile subgraph.
+/// The CUTLASS epilogue computes `silu(accumulator) * up_output`,
+/// where `up_output` is loaded from GMEM via VisitorAuxLoad.
+/// Saves two kernel launches + two GMEM round-trips vs separate
+/// gate GEMM + silu_and_mul kernels.
+#[derive(Debug)]
+pub struct CutlassGemmSiluMulImpl {
+    tile_m: u32,
+    tile_n: u32,
+    stages: u32,
+    dims: crate::lowering::tile_graph::ModelDims,
+    name: &'static str,
+    cost_key: &'static str,
+}
+
+impl CutlassGemmSiluMulImpl {
+    pub fn new(
+        tile_m: u32,
+        tile_n: u32,
+        stages: u32,
+        dims: crate::lowering::tile_graph::ModelDims,
+    ) -> Self {
+        let name: &'static str = Box::leak(
+            format!("cutlass_gate_silu_mul_{}x{}_s{}", tile_m, tile_n, stages).into_boxed_str(),
+        );
+        let cost_key: &'static str =
+            Box::leak(format!("cutlass_{}x{}_s{}", tile_m, tile_n, stages).into_boxed_str());
+        Self {
+            tile_m,
+            tile_n,
+            stages,
+            dims,
+            name,
+            cost_key,
+        }
+    }
+
+    pub fn all_configs(
+        dims: crate::lowering::tile_graph::ModelDims,
+    ) -> Vec<Box<dyn Implementation>> {
+        let tiles: &[(u32, u32, u32)] = &[
+            (32, 64, 4),
+            (32, 64, 3),
+            (32, 128, 4),
+            (32, 128, 3),
+            (32, 256, 3),
+            (64, 64, 4),
+            (64, 64, 3),
+            (64, 128, 4),
+            (64, 128, 3),
+            (128, 64, 4),
+            (128, 64, 3),
+            (128, 128, 4),
+            (128, 128, 3),
+            (128, 256, 3),
+            (256, 64, 4),
+            (256, 64, 3),
+        ];
+        tiles
+            .iter()
+            .map(|&(tm, tn, s)| -> Box<dyn Implementation> { Box::new(Self::new(tm, tn, s, dims)) })
+            .collect()
+    }
+}
+
+impl Implementation for CutlassGemmSiluMulImpl {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(
+        &self,
+        tile_graph: &TileGraph,
+        seed: TileId,
+        _profile: &TargetProfile,
+    ) -> Option<MatchInfo> {
+        let node = &tile_graph.nodes[seed.0 as usize];
+        if node.kind != TileKind::GemmGate {
+            return None;
+        }
+        let gate_id = seed;
+
+        let concat = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::GateUpConcat && n.layer == node.layer && n.deps.contains(&gate_id)
+        })?;
+        let silu_mul = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::SiluMul && n.layer == node.layer && n.deps.contains(&concat.id)
+        })?;
+
+        let up_dep = concat.deps.iter().find(|&&d| d != gate_id).copied()?;
+        let mut boundary_inputs = node.deps.clone();
+        boundary_inputs.push(up_dep);
+
+        Some(MatchInfo {
+            claimed_tiles: vec![gate_id, concat.id, silu_mul.id],
+            boundary_inputs,
+            boundary_outputs: vec![silu_mul.id],
+            layer: node.layer,
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
+        let seq = profile.num_tokens();
+        l4_cost_model::cutlass_gemm_us(
+            seq,
+            self.dims.intermediate_size,
+            self.dims.hidden_size,
+            self.tile_m,
+            self.tile_n,
+            self.stages,
+        )
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        let tile_k = 32u32;
+        let per_stage = (self.tile_m * tile_k + self.tile_n * tile_k) * 2;
+        Resources {
+            shmem_bytes: per_stage * self.stages,
+            regs_per_thread: 128,
             threads_per_cta: 256,
         }
     }

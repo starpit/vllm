@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::lowering::assignment::SubgraphId;
+use crate::lowering::assignment::{CompilationUnitId, SubgraphId};
 use crate::lowering::implementation::{ImplId, LaunchKind};
 use crate::lowering::library::ImplementationLibrary;
 use crate::lowering::solver::ExecutionPlan;
@@ -77,6 +77,16 @@ pub enum ImplDispatchKind {
     /// Always pre-loop (runs once per forward, before the
     /// per-layer match dispatch).
     Embed,
+    /// CUTLASS Gate GEMM + SiLU + Mul epilogue fusion.
+    /// Claims {GemmGate, GateUpConcat, SiluMul} as a 3-tile subgraph.
+    /// The CUTLASS epilogue computes `silu(accumulator) * up_output`,
+    /// where `up_output` is loaded from GMEM via VisitorAuxLoad.
+    /// Saves two kernel launches + two GMEM round-trips.
+    CutlassGemmSiluMul {
+        tile_m: u32,
+        tile_n: u32,
+        stages: u32,
+    },
 }
 
 /// Which GEMM phase this entry operates on (determines buffer
@@ -114,6 +124,9 @@ pub struct DispatchEntry {
     pub step: u32,
     /// Launch kind (determines standalone vs megakernel body).
     pub launch_kind: LaunchKind,
+    /// Compilation unit this entry belongs to. Entries sharing a unit
+    /// are fused into a single kernel launch (mini-megakernel).
+    pub unit: CompilationUnitId,
     /// Whether this GEMM folds a residual add (beta=1).
     pub fused_residual: bool,
     /// For GEMM entries: which phase (determines N, K, buffer pointers).
@@ -147,10 +160,10 @@ impl DispatchSequence {
         let assignment = &plan.assignment;
 
         // Collect subgraphs sorted by (step, subgraph_id).
-        let mut scheduled: Vec<(u32, SubgraphId)> = assignment
+        let mut scheduled: Vec<(u32, CompilationUnitId, SubgraphId)> = assignment
             .schedule
             .iter()
-            .map(|(sg, slot)| (slot.step, *sg))
+            .map(|(sg, slot)| (slot.step, slot.unit, *sg))
             .collect();
         scheduled.sort();
 
@@ -159,7 +172,7 @@ impl DispatchSequence {
         let mut norm_count_per_layer: BTreeMap<u16, u32> = BTreeMap::new();
 
         let mut entries = Vec::with_capacity(scheduled.len());
-        for (step, sg) in &scheduled {
+        for (step, unit, sg) in &scheduled {
             let impl_id = assignment.impls[sg];
             let imp = library.get(impl_id);
             let imp_name = imp.name();
@@ -188,6 +201,7 @@ impl DispatchSequence {
                 layer,
                 step: *step,
                 launch_kind,
+                unit: *unit,
                 fused_residual,
                 gemm_phase,
                 is_attn_norm,
@@ -223,6 +237,35 @@ impl DispatchSequence {
             .iter()
             .filter(|e| e.kind != ImplDispatchKind::Noop)
             .count()
+    }
+
+    /// Compilation units in step order, deduplicated. Each unit
+    /// appears once at the position of its first entry.
+    pub fn units_in_order(&self) -> Vec<CompilationUnitId> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut units = Vec::new();
+        for e in &self.entries {
+            if e.kind != ImplDispatchKind::Noop && seen.insert(e.unit) {
+                units.push(e.unit);
+            }
+        }
+        units
+    }
+
+    /// All entries belonging to a given compilation unit, in step order.
+    pub fn entries_for_unit(
+        &self,
+        unit: CompilationUnitId,
+    ) -> impl Iterator<Item = &DispatchEntry> {
+        self.entries.iter().filter(move |e| e.unit == unit)
+    }
+
+    /// Whether a compilation unit contains a single HostCallback entry
+    /// (standalone launch) or multiple DeviceCallable entries (grouped
+    /// mini-megakernel).
+    pub fn unit_is_standalone(&self, unit: CompilationUnitId) -> bool {
+        self.entries_for_unit(unit)
+            .all(|e| e.launch_kind == LaunchKind::HostCallback)
     }
 }
 
@@ -322,6 +365,13 @@ fn classify_impl(
         ImplDispatchKind::CutlassNormGemm {
             tile_m: tm,
             tile_n: tn,
+        }
+    } else if imp_name.starts_with("cutlass_gate_silu_mul_") {
+        let (tm, tn, stages) = parse_cutlass_config(imp_name);
+        ImplDispatchKind::CutlassGemmSiluMul {
+            tile_m: tm,
+            tile_n: tn,
+            stages,
         }
     } else if imp_name.starts_with("cutlass_gemv_") {
         ImplDispatchKind::CutlassGemv
@@ -433,8 +483,8 @@ pub fn format_plan_family(
                 continue;
             }
             out.push_str(&format!(
-                "  step {:2}  L{:02}  {:?}  {}\n",
-                entry.step, entry.layer, entry.kind, entry.impl_name,
+                "  step {:2}  U{:02}  L{:02}  {:?}  {}\n",
+                entry.step, entry.unit.0, entry.layer, entry.kind, entry.impl_name,
             ));
         }
     }

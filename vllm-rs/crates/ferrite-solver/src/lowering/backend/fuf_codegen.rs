@@ -42,7 +42,7 @@ fn global_weight_field(weight_name: &str) -> TokenStream {
 fn emit_tile(
     node: &TileNode,
     assignment: &Assignment,
-    tile_graph: &TileGraph,
+    _tile_graph: &TileGraph,
     library: &ImplementationLibrary,
 ) -> Option<TokenStream> {
     let sg = assignment.cover.get(&node.id)?;
@@ -230,34 +230,42 @@ fn emit_tile(
             None
         }
 
-        TileKind::GateUpConcat => {
-            // Logical concat — no actual kernel. The silu_mul impl
-            // handles reading both gate and up outputs.
-            None
-        }
-
-        TileKind::SiluMul => {
-            // Find the GateUpConcat dep, then its two deps (gate, up).
-            let concat_id = node.deps[0];
-            let concat = &tile_graph.nodes[concat_id.0 as usize];
-            let gate = tile_var(concat.deps[0]);
-            let up = tile_var(concat.deps[1]);
+        TileKind::Silu => {
+            // Standalone silu — passes through the input tensor
+            // as-is, the Mul consumer downstream uses it directly.
+            // When fused with the surrounding {GemmGate, Mul} (or
+            // {Silu, Mul}), the fused impl claims this tile and
+            // emits the real kernel; the emit-once-per-tile walk
+            // here is only used by the standalone FUF codegen
+            // path.
+            let x = dep_var(0);
             Some(quote! {
                 let #out = {
-                    // Concatenate gate + up, then silu_and_mul.
-                    let __concat = kernels::concat_dim1(
-                        *#gate, *#up,
+                    let __in: GpuTensor = *#x;
+                    kernels::silu(
+                        __in,
                         &mut device.caching,
                         device.compute_stream,
-                    );
-                    let __activated = kernels::silu_and_mul_fused(
-                        __concat.as_gpu_tensor(),
-                        model.dims.intermediate_size,
+                    )
+                };
+            })
+        }
+
+        TileKind::Mul => {
+            // Element-wise multiply of the two operand tiles.
+            // Fused gate/up kernels claim {Silu, Mul} and handle
+            // this inline; this arm covers the standalone case.
+            let a = dep_var(0);
+            let b = dep_var(1);
+            Some(quote! {
+                let #out = {
+                    let __a: GpuTensor = *#a;
+                    let __b: GpuTensor = *#b;
+                    kernels::mul_elementwise(
+                        __a, __b,
                         &mut device.caching,
                         device.compute_stream,
-                    );
-                    drop(__concat);
-                    __activated
+                    )
                 };
             })
         }

@@ -726,25 +726,26 @@ mod tests {
             SolveResult::Infeasible => panic!("infeasible"),
         };
 
-        // Find a GateUpConcat tile and check that its subgraph
-        // also claims a SiluMul tile in the same layer.
-        let concat_tile = tile_graph
+        // Find a Silu tile and check that its subgraph also
+        // claims the downstream Mul tile (phase 4a: the fused
+        // silu_and_mul impl now claims {Silu, Mul}, not the
+        // retired GateUpConcat/SiluMul phantoms).
+        let silu_tile = tile_graph
             .iter_topo()
-            .find(|n| n.kind == TileKind::GateUpConcat)
-            .expect("test graph has GateUpConcat");
-        let concat_sg = plan.assignment.cover[&concat_tile.id];
-        let claimed = plan.assignment.tiles_in_subgraph(concat_sg);
+            .find(|n| n.kind == TileKind::Silu)
+            .expect("test graph has Silu");
+        let silu_sg = plan.assignment.cover[&silu_tile.id];
+        let claimed = plan.assignment.tiles_in_subgraph(silu_sg);
         let claimed_kinds: Vec<TileKind> = claimed
             .iter()
             .map(|t| tile_graph.nodes[t.0 as usize].kind)
             .collect();
         assert!(
-            claimed_kinds.contains(&TileKind::GateUpConcat)
-                && claimed_kinds.contains(&TileKind::SiluMul),
-            "expected the SiluAndMulFused subgraph to claim both \
-             GateUpConcat AND SiluMul; claimed kinds = {claimed_kinds:?}",
+            claimed_kinds.contains(&TileKind::Silu) && claimed_kinds.contains(&TileKind::Mul),
+            "expected the silu_and_mul fused subgraph to claim \
+             both Silu AND Mul; claimed kinds = {claimed_kinds:?}",
         );
-        let imp_id = plan.assignment.impls[&concat_sg];
+        let imp_id = plan.assignment.impls[&silu_sg];
         let imp_name = library.get(imp_id).name();
         assert_eq!(imp_name, "vllm_rs_silu_and_mul_fused");
     }
@@ -803,8 +804,8 @@ mod tests {
             TileKind::KvCacheWrite => "kv_w",
             TileKind::Attention => "attn",
             TileKind::ResidualAdd => "res",
-            TileKind::GateUpConcat => "cat",
-            TileKind::SiluMul => "silu",
+            TileKind::Silu => "silu",
+            TileKind::Mul => "mul",
             TileKind::BiasAdd => "bias",
             TileKind::Embed => "embed",
         }

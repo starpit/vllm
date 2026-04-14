@@ -133,13 +133,14 @@ pub enum TileKind {
     Attention,
 
     // ── MLP epilogue ──
-    /// Concatenates `GemmGate` and `GemmUp` outputs into a single
-    /// `[seq, 2*intermediate]` buffer. The solver may eliminate
-    /// this node when an implementation claims `(GemmGate +
-    /// GemmUp + GateUpConcat)` as one fused subgraph.
-    GateUpConcat,
-    /// Per-element `silu(gate) * up` from the concatenated buffer.
-    SiluMul,
+    /// `silu(x)` — the DSL's `silu(expr)` op. Consumes its one
+    /// input, produces a tensor of the same shape.
+    Silu,
+    /// Element-wise multiply — the DSL's `a * b` form. Takes two
+    /// inputs (operand tiles), produces one output. Used in the
+    /// MLP's gate/up pattern (`silu(gate) * up`) and anywhere else
+    /// the DSL asks for an element-wise product.
+    Mul,
 
     // ── Residual adds (lifted out of cutlass beta=1 epilogues) ──
     /// `hidden_states += operand`. Two per layer (after o_proj and
@@ -202,8 +203,8 @@ impl TileKind {
             TileKind::Rope => "rope",
             TileKind::KvCacheWrite => "kv_cache_write",
             TileKind::Attention => "attention",
-            TileKind::GateUpConcat => "gate_up_concat",
-            TileKind::SiluMul => "silu_mul",
+            TileKind::Silu => "silu",
+            TileKind::Mul => "mul",
             TileKind::ResidualAdd => "residual_add",
             TileKind::BiasAdd => "bias_add",
             TileKind::Embed => "embed",

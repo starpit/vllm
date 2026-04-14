@@ -175,8 +175,12 @@ impl Builder {
                 Some(self.emit_call(call, phase)?)
             }
             Arg::Mul(a, b) => {
-                // The `gate * up` pattern. Legacy lowers it to
-                // `GateUpConcat` + `SiluMul`. Preserve for phase 1.
+                // Honest lowering of `a * b`: one `Mul` tile with
+                // two operand deps. Any kernel that wants packed
+                // or fused semantics (e.g. CUTLASS's gate|up
+                // silu_mul, vllm-rs's silu_and_mul_fused) declares
+                // it claims `{Silu, Mul}` or the wider subgraph and
+                // handles packing/fusion internally.
                 let a_tile = self
                     .resolve_arg(a, phase)?
                     .or(self.current_hidden)
@@ -186,9 +190,8 @@ impl Builder {
                     .or(self.current_hidden)
                     .expect("Arg::Mul operand has no producer");
                 let layer = self.layer_for(phase);
-                let concat = self.push(TileKind::GateUpConcat, layer, vec![a_tile, b_tile], None);
-                let silu_mul = self.push(TileKind::SiluMul, layer, vec![concat], None);
-                Some(silu_mul)
+                let mul = self.push(TileKind::Mul, layer, vec![a_tile, b_tile], None);
+                Some(mul)
             }
         })
     }
@@ -245,13 +248,15 @@ impl Builder {
             }
 
             "silu" => {
-                // Passthrough: silu isn't materialized as its own
-                // tile in the legacy build_fuf. The input's tile
-                // becomes the "silu output" tile.
-                let dep = resolved[0]
-                    .or(self.current_hidden)
-                    .expect("silu input has no producer");
-                Ok(dep)
+                // Honest lowering of `silu(x)`: one `Silu` tile
+                // with a single input dep. Any kernel that wants
+                // to fuse silu with a surrounding op (gate gemm +
+                // silu + mul, silu+mul, etc.) declares it claims
+                // the subgraph and fuses internally.
+                let layer = self.layer_for(phase);
+                let dep = resolved[0].or(self.current_hidden).expect("silu input");
+                let tile = self.push(TileKind::Silu, layer, vec![dep], None);
+                Ok(tile)
             }
 
             "bias_add" => {
@@ -597,7 +602,7 @@ mod tests {
             TileKind::GemmQ,
             TileKind::GemmK,
             TileKind::GemmV,
-            TileKind::QkvSplit,     // phantom (phase 4 removes)
+            TileKind::QkvSplit,     // phantom (phase 4c removes)
             TileKind::Rope,         // phantom
             TileKind::KvCacheWrite, // phantom
             TileKind::Attention,
@@ -605,9 +610,9 @@ mod tests {
             TileKind::ResidualAdd, // attn residual
             TileKind::RmsNorm,     // mlp_norm
             TileKind::GemmGate,
+            TileKind::Silu, // honest silu(gate_gemm) — was passthrough before 4a
             TileKind::GemmUp,
-            TileKind::GateUpConcat, // phantom (phase 4 removes)
-            TileKind::SiluMul,      // phantom
+            TileKind::Mul, // honest gate * up — was GateUpConcat+SiluMul before 4a
             TileKind::GemmDown,
             TileKind::ResidualAdd, // mlp residual
         ];

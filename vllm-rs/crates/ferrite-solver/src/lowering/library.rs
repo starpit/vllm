@@ -1398,9 +1398,11 @@ impl Implementation for VllmRsRotaryEmbeddingImpl {
 }
 
 /// vllm-rs's `silu_and_mul_fused` operates on a packed
-/// `[seq, 2*intermediate]` buffer, so it CLAIMS the
-/// `(GateUpConcat + SiluMul)` two-tile subgraph as a single
-/// invocation.
+/// `[seq, 2*intermediate]` buffer, so it claims the honest
+/// `{Silu, Mul}` two-tile subgraph as a single invocation — the
+/// DSL says `silu(gate) * up`, which now lowers to a `Silu` tile
+/// chained into a `Mul` tile (phase 4a). The kernel packs the
+/// gate/up buffers internally.
 #[derive(Debug)]
 pub struct VllmRsSiluAndMulFusedImpl;
 
@@ -1418,37 +1420,44 @@ impl Implementation for VllmRsSiluAndMulFusedImpl {
         _profile: &TargetProfile,
     ) -> Option<MatchInfo> {
         let node = &tile_graph.nodes[seed.0 as usize];
-        // We seed-match either the GateUpConcat or the SiluMul end
-        // of the pattern. The seed-rooted enumeration in the solver
-        // will call us once per tile in the graph; we accept whichever
-        // tile starts the match.
-        let (concat_id, silu_id) = match node.kind {
-            TileKind::GateUpConcat => {
-                // Find the SiluMul that consumes this concat.
-                let silu = tile_graph
+        // Seed-match at either the Silu or the Mul end of the
+        // pattern. The solver's seed-rooted enumeration calls us
+        // once per tile; we accept whichever tile starts the match.
+        let (silu_id, mul_id) = match node.kind {
+            TileKind::Silu => {
+                // Find the Mul that consumes this silu.
+                let mul = tile_graph
                     .nodes
                     .iter()
-                    .find(|n| n.kind == TileKind::SiluMul && n.deps.contains(&seed))?;
-                (seed, silu.id)
+                    .find(|n| n.kind == TileKind::Mul && n.deps.contains(&seed))?;
+                (seed, mul.id)
             }
-            TileKind::SiluMul => {
-                // The dep is the GateUpConcat.
-                let concat = node
+            TileKind::Mul => {
+                // Find the Silu operand (the other operand is the
+                // up_gemm output — not a Silu tile).
+                let silu = node
                     .deps
                     .iter()
                     .copied()
-                    .find(|d| tile_graph.nodes[d.0 as usize].kind == TileKind::GateUpConcat)?;
-                (concat, seed)
+                    .find(|d| tile_graph.nodes[d.0 as usize].kind == TileKind::Silu)?;
+                (silu, seed)
             }
             _ => return None,
         };
-        let concat_node = &tile_graph.nodes[concat_id.0 as usize];
+        let silu_node = &tile_graph.nodes[silu_id.0 as usize];
+        let mul_node = &tile_graph.nodes[mul_id.0 as usize];
+        // Boundary inputs = gate (dep of Silu) + up (the Mul dep
+        // that isn't Silu).
+        let mut boundary_inputs = silu_node.deps.clone();
+        for &d in &mul_node.deps {
+            if d != silu_id {
+                boundary_inputs.push(d);
+            }
+        }
         Some(MatchInfo {
-            claimed_tiles: vec![concat_id, silu_id],
-            // Inputs are GateGemm + UpGemm (deps of GateUpConcat).
-            boundary_inputs: concat_node.deps.clone(),
-            // Output is the SiluMul tile (downstream consumer).
-            boundary_outputs: vec![silu_id],
+            claimed_tiles: vec![silu_id, mul_id],
+            boundary_inputs,
+            boundary_outputs: vec![mul_id],
             layer: node.layer,
         })
     }
@@ -3338,21 +3347,25 @@ impl Implementation for CutlassGemmSiluMulImpl {
         }
         let gate_id = seed;
 
-        let concat = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::GateUpConcat && n.layer == node.layer && n.deps.contains(&gate_id)
+        // Honest subgraph: GemmGate → Silu → Mul ← GemmUp. Phase 4a
+        // replaced the old GateUpConcat+SiluMul phantoms with honest
+        // Silu + Mul tiles; this kernel now claims the 3-tile chain.
+        let silu = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::Silu && n.layer == node.layer && n.deps.contains(&gate_id)
         })?;
-        let silu_mul = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::SiluMul && n.layer == node.layer && n.deps.contains(&concat.id)
+        let mul = tile_graph.nodes.iter().find(|n| {
+            n.kind == TileKind::Mul && n.layer == node.layer && n.deps.contains(&silu.id)
         })?;
 
-        let up_dep = concat.deps.iter().find(|&&d| d != gate_id).copied()?;
+        // `mul`'s deps are [silu, up_gemm] (order depends on DSL).
+        let up_dep = mul.deps.iter().find(|&&d| d != silu.id).copied()?;
         let mut boundary_inputs = node.deps.clone();
         boundary_inputs.push(up_dep);
 
         Some(MatchInfo {
-            claimed_tiles: vec![gate_id, concat.id, silu_mul.id],
+            claimed_tiles: vec![gate_id, silu.id, mul.id],
             boundary_inputs,
-            boundary_outputs: vec![silu_mul.id],
+            boundary_outputs: vec![mul.id],
             layer: node.layer,
         })
     }

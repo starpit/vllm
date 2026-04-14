@@ -176,7 +176,18 @@ mod tests {
             source.contains("post_attention_layernorm"),
             "missing MLP norm"
         );
-        assert!(source.contains("mlp_gate_proj"), "missing Gate GEMM");
+        // Gate phase is present either as the unfused field
+        // (`mlp_gate_proj`) or as the fused gate+up field
+        // (`mlp_gate_up_proj`). After the phase-4a tile-graph
+        // cleanup (Silu/Mul as honest tiles instead of
+        // GateUpConcat/SiluMul phantoms), the solver's cost model
+        // may now pick the fused gate+up GEMM where it previously
+        // didn't.
+        assert!(
+            source.contains("mlp_gate_proj") || source.contains("mlp_gate_up_proj"),
+            "missing Gate GEMM (neither unfused mlp_gate_proj nor \
+             fused mlp_gate_up_proj present)"
+        );
         assert!(source.contains("silu_and_mul_fused"), "missing SiLU");
         assert!(source.contains("mlp_down_proj"), "missing Down GEMM");
     }

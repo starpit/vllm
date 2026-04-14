@@ -146,7 +146,6 @@ impl Solver for DpSolver {
                         crate::lowering::tile_graph::TileKind::ResidualAdd
                             | crate::lowering::tile_graph::TileKind::QkvSplit
                             | crate::lowering::tile_graph::TileKind::KvCacheWrite
-                            | crate::lowering::tile_graph::TileKind::GateUpConcat
                     ) {
                         let sg = SubgraphId(next_subgraph);
                         next_subgraph += 1;

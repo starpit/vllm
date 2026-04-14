@@ -28,6 +28,7 @@ mod ast;
 mod cfg;
 mod classified;
 mod classify;
+mod codegen_model;
 mod config;
 mod fuf;
 mod impl_lib;
@@ -208,7 +209,20 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
 
         let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
 
-        per_model_ts.push(emit_model_stub(model, &model_fuf, &sfufs, &loops));
+        let model_types = codegen_model::emit(&classified, model).map_err(|e| {
+            syn::Error::new(
+                args.span,
+                format!("model-struct codegen [{}]: {e}", model.source_stem),
+            )
+        })?;
+
+        per_model_ts.push(emit_model_stub(
+            model,
+            &model_fuf,
+            &sfufs,
+            &loops,
+            model_types,
+        ));
     }
 
     // Group every model's emitted module under one `pub mod <arch>`
@@ -236,6 +250,7 @@ fn emit_model_stub(
     fuf: &fuf::Fuf,
     sfufs: &solver::WorkloadAssignments,
     loops: &schedule::WorkloadLoops,
+    model_types: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     let model_mod = &model.name;
     let num_tiles = fuf.len();
@@ -265,6 +280,8 @@ fn emit_model_stub(
         pub mod #model_mod {
             pub const NUM_TILES: usize = #num_tiles;
             #(#workload_ts)*
+
+            #model_types
         }
     }
 }

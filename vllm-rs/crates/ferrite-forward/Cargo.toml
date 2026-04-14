@@ -4,5 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enables the emitted `Model` / `Layer` / `Model::load` types by
+# pulling in ferrite-kernels (which depends on cudarc + libcublas).
+# Integration tests that reference the emitted types must gate on
+# this feature; without it, only the numeric pipeline observations
+# (NUM_TILES, NUM_WAVES, PREDICTED_US) compile.
+cuda = ["ferrite-kernels/cuda"]
+
 [dependencies]
 ferrite-forward-macro = { path = "../ferrite-forward-macro" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+anyhow = { workspace = true }

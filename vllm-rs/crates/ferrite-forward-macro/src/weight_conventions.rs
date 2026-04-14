@@ -74,6 +74,39 @@ fn bound(name: &str) -> Dim {
     Dim::Bound(name.into())
 }
 
+/// Runtime weight path for a DSL weight reference.
+///
+/// HF safetensors files name the backbone weights under `model.`
+/// and place `lm_head` at the root. Per-layer weights get a
+/// `model.layers.<i>.` prefix. This fn encodes that convention so
+/// the compiler doesn't carry a model.rs-specific layout rule in
+/// its code.
+///
+/// Examples:
+///
+/// - `["self_attn", "q_proj"]`, layer=Some(3)  → `model.layers.3.self_attn.q_proj`
+/// - `["embed_tokens"]`, layer=None            → `model.embed_tokens`
+/// - `["norm"]`, layer=None                    → `model.norm`
+/// - `["lm_head"]`, layer=None                 → `lm_head`
+///
+/// The returned string is the *prefix* passed to
+/// `Linear::load` / `Embedding::load` / `RmsNorm::load`; the
+/// runtime loaders append `.weight` / `.bias` as appropriate.
+pub fn hf_weight_prefix(path: &[String], layer: Option<usize>) -> String {
+    let dotted = path.join(".");
+    if let Some(i) = layer {
+        return format!("model.layers.{i}.{dotted}");
+    }
+    // Global: lm_head is at the root; everything else lives under
+    // `model.`. If more HF-convention exceptions surface (e.g.
+    // embeddings in some MoE configs), add them here.
+    if dotted == "lm_head" {
+        dotted
+    } else {
+        format!("model.{dotted}")
+    }
+}
+
 /// Apply HF's implicit config.json defaults to the bounds map.
 ///
 /// HF configs are allowed to omit certain fields that have
@@ -206,6 +239,26 @@ mod tests {
         b.insert("num_attention_heads".into(), 40);
         derive_implicit_bounds(&mut b);
         assert_eq!(b.get("num_key_value_heads"), Some(&40));
+    }
+
+    #[test]
+    fn hf_weight_prefix_per_layer() {
+        let p = hf_weight_prefix(&["self_attn".into(), "q_proj".into()], Some(3));
+        assert_eq!(p, "model.layers.3.self_attn.q_proj");
+    }
+
+    #[test]
+    fn hf_weight_prefix_global_under_model() {
+        assert_eq!(
+            hf_weight_prefix(&["embed_tokens".into()], None),
+            "model.embed_tokens"
+        );
+        assert_eq!(hf_weight_prefix(&["norm".into()], None), "model.norm");
+    }
+
+    #[test]
+    fn hf_weight_prefix_lm_head_at_root() {
+        assert_eq!(hf_weight_prefix(&["lm_head".into()], None), "lm_head");
     }
 
     #[test]

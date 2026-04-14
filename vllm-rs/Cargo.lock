@@ -2036,10 +2036,7 @@ dependencies = [
 name = "ferrite-forward"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "ferrite-cuda-core",
  "ferrite-forward-macro",
- "ferrite-kernels",
 ]
 
 [[package]]

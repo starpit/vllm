@@ -12,12 +12,6 @@
 //!   - the `layer` field on each `TileNode` comes from the
 //!     iteration phase tagged by unroll.
 //!
-//! Semantically this is drop-in equivalent to the legacy
-//! `TileGraph::build_fuf(ModelDag, ModelDims)` it replaces. A
-//! golden test (`build_fuf_matches_legacy_llama`) asserts node-by-
-//! node equivalence on the LLaMA DSL so downstream consumers
-//! (solver, codegen) see no change.
-//!
 //! FUF = TileGraph. There is no parallel IR type living here.
 
 use std::collections::HashMap;
@@ -374,19 +368,14 @@ impl Builder {
         let rope = self.push(TileKind::Rope, layer, vec![split], None);
         let _kvw = self.push(TileKind::KvCacheWrite, layer, vec![rope], None);
 
-        // Phase-1 quirk: the legacy `parse::build_dag` + `build_fuf`
-        // pipeline has a latent bug in its LetTuple handler
-        // (`trim_start_matches("__rope_")` strips too aggressively),
-        // so `let (q, k, v) = rope_append(...)` silently **fails** to
-        // rebind q/k/v. Downstream readers of `q`/`k`/`v` end up
-        // pointing at the pre-rope GEMM outputs (e.g. attention's
-        // q_dep = GemmQ, not Rope). Mirror that here by NOT
-        // rebinding — leave buf_to_tile's entries for q/k/v pointing
-        // at their input tiles. The rope/kvw tiles still exist as
-        // nodes; attention finds the KvCacheWrite tile for its
-        // second dep via a separate by-layer search. This whole bug
-        // goes away in phase 4 when we rip QkvSplit/KvCacheWrite out
-        // and emit a single honest `RopeAppend` tile.
+        // Legacy quirk preserved for phase-1 compat: the Rope /
+        // KvCacheWrite tiles exist in the graph, but q/k/v stay
+        // bound to the *pre*-rope GEMM tiles. Attention picks up
+        // its KvCacheWrite dep via a separate by-layer scan below.
+        // This whole mess (QkvSplit, KvCacheWrite, the decoupling
+        // between output names and producer tiles) is scheduled
+        // for removal in phase 4, which will emit a single honest
+        // `RopeAppend` tile whose outputs are the real q/k/v.
         let _ = names;
         Ok(())
     }
@@ -395,11 +384,8 @@ impl Builder {
 /// Walk the CFG and extract the weight fields needed for the
 /// generated `Layer` and `Model` structs.
 ///
-/// This is the CFG-driven replacement for the legacy
-/// `codegen::extract_weight_fields(&def.dag, ...)`, which walked
-/// a `ModelDag` to classify buffers by consuming op kind. Here we
-/// walk the unrolled instruction stream directly — no `ModelDag`
-/// intermediate — and classify weight args by:
+/// Walks the unrolled instruction stream and classifies weight
+/// args by:
 ///   1. the op that consumes them (`embed` → `Embedding`,
 ///      `rmsnorm` → `RmsNorm`, `gemm` → `LinearLayer`,
 ///      `rope_append`'s rotary arg → `RotaryCache`);

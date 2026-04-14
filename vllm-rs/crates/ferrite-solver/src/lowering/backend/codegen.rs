@@ -47,10 +47,7 @@ pub fn generate_fuf(def: &ForwardDef) -> TokenStream {
         None => PlanFamily::DEFAULT_GRID.to_vec(),
     };
 
-    // Build the FUF tile graph via the new honest CFG + unroll
-    // pipeline (was `TileGraph::build_fuf(&def.dag, ...)` in the
-    // legacy ModelDag path; both produce structurally equivalent
-    // tile graphs — see `fuf::build_fuf_matches_legacy_llama`).
+    // Build the FUF tile graph via the CFG + unroll pipeline.
     let fuf = crate::fuf::build_fuf(&def.cfg, model.dims)
         .expect("fuf::build_fuf should not fail on a well-formed DSL");
     let library = build_library(target_id, model.dims);
@@ -170,10 +167,7 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     // Solve every model variant.
     let mut solved_models: Vec<SolvedModel> = Vec::new();
     for model in models {
-        // New pipeline: AST → CFG → unroll → TileGraph. Replaces the
-        // legacy ModelDag path (`TileGraph::from_model_dag(&def.dag,
-        // ...)`); structurally equivalent on our DSL, verified by
-        // `fuf::build_fuf_matches_legacy_llama`.
+        // AST → CFG → unroll → TileGraph.
         let tile_graph = crate::fuf::build_fuf(&def.cfg, model.dims)
             .expect("fuf::build_fuf should not fail on a well-formed DSL");
         let mut library = build_library(target_id, model.dims);
@@ -1626,7 +1620,9 @@ pub struct FieldSpec {
 ///
 /// Pure transform on a `Vec<FieldSpec>` — same logic as the
 /// second half of the legacy `extract_weight_fields`, factored
-/// out so both the ModelDag and CFG pipelines feed through it.
+/// Consumes the raw per-layer field list produced by
+/// `fuf::extract_weight_fields` and reshapes it according to the
+/// solver's fusion picks.
 pub(crate) fn apply_weight_field_fusion(
     per_layer: &mut Vec<FieldSpec>,
     qkv_fused: bool,

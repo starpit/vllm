@@ -506,7 +506,7 @@ fn gemma2_solver_finds_feasible_plan() {
     "#;
     let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
     let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
-    let dag = crate::parse::build_dag(&def).unwrap();
+    let cfg = crate::cfg::build_cfg(&def);
     let dims = ModelDims {
         hidden_size: 2048,
         intermediate_size: 16384,
@@ -515,7 +515,7 @@ fn gemma2_solver_finds_feasible_plan() {
         head_dim: 256,
         vocab_size: 256000,
     };
-    let tile_graph = TileGraph::from_model_dag(&dag, dims);
+    let tile_graph = crate::fuf::build_fuf(&cfg, dims).unwrap();
     let mut library = ImplementationLibrary::l4_sm89_starter(dims);
     let profile = TargetProfile::l4_sm89();
 
@@ -590,8 +590,8 @@ fn dp_solver_on_fuf() {
     "#;
     let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
     let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
-    let dag = crate::parse::build_dag(&def).unwrap();
-    let fuf = TileGraph::build_fuf(&dag, ModelDims::LLAMA_3_2_1B);
+    let cfg = crate::cfg::build_cfg(&def);
+    let fuf = crate::fuf::build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
 
     // Build problem from FUF.
     let mut library = ImplementationLibrary::l4_sm89_starter(ModelDims::LLAMA_3_2_1B);
@@ -651,8 +651,8 @@ fn fuf_codegen_emits_tile_vars() {
     "#;
     let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
     let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
-    let dag = crate::parse::build_dag(&def).unwrap();
-    let fuf = TileGraph::build_fuf(&dag, ModelDims::LLAMA_3_2_1B);
+    let cfg = crate::cfg::build_cfg(&def);
+    let fuf = crate::fuf::build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
 
     let mut library = ImplementationLibrary::l4_sm89_starter(ModelDims::LLAMA_3_2_1B);
     let profile = TargetProfile::l4_sm89();

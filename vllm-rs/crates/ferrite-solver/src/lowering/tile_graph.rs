@@ -374,269 +374,6 @@ impl TileGraph {
         crate::fuf::build_fuf(&cfg, dims).expect("hardcoded DSL builds FUF")
     }
 
-    /// Build a TileGraph from a parsed ModelDag.
-    ///
-    /// Walks the DAG's ops, maps each OpKind to TileKind(s), and
-    /// applies normalization passes (lifting residual adds, splitting
-    /// rope_append into QkvSplit + Rope + KvCacheWrite, etc.).
-    ///
-    /// The ModelDag comes from parsing the megakernel!/forward! DSL body.
-    pub fn from_model_dag(dag: &crate::dag::ModelDag, dims: ModelDims) -> Self {
-        use crate::dag::OpKind;
-        use std::collections::HashMap;
-
-        let mut nodes: Vec<TileNode> = Vec::new();
-        // Map from DAG buffer ID → most recent TileId that produces it.
-        let mut buf_to_tile: HashMap<String, TileId> = HashMap::new();
-
-        let push =
-            |nodes: &mut Vec<TileNode>, kind: TileKind, layer: u16, deps: Vec<TileId>| -> TileId {
-                let id = TileId(nodes.len() as u32);
-                nodes.push(TileNode {
-                    id,
-                    kind,
-                    layer,
-                    deps,
-                    weight_name: None,
-                });
-                id
-            };
-
-        // Count layers from the for-loop ops.
-        let num_layers = dag.params.get("NL").copied().unwrap_or(1) as u16;
-
-        // Pre-loop pass: non-loop ops that appear BEFORE any
-        // in-loop op in the DSL body. These emit into the pre-loop
-        // phase (tagged with `layer == PRE_LOOP_LAYER`) and run
-        // once per forward, before the per-layer match dispatch.
-        // Today this is just `embed` — the DSL's first op that
-        // produces `hidden_states` from `input_ids`.
-        //
-        // When the DSL body has a pre-loop `embed`, its output
-        // tile becomes the `hidden_state_tile` seed for layer 0.
-        // When it doesn't (legacy DSL bodies in tests), we fall
-        // back to a synthetic `ResidualAdd` sentinel input.
-        let first_loop_op_idx = dag
-            .ops
-            .iter()
-            .position(|op| op.in_layer_loop)
-            .unwrap_or(dag.ops.len());
-
-        let mut hidden_state_tile = {
-            let mut seed: Option<TileId> = None;
-            for op in &dag.ops[..first_loop_op_idx] {
-                if let OpKind::Embed { output, .. } = &op.kind {
-                    let tile = push(&mut nodes, TileKind::Embed, PRE_LOOP_LAYER, Vec::new());
-                    buf_to_tile.insert(output.0.clone(), tile);
-                    seed = Some(tile);
-                }
-                // Other pre-loop op kinds (none today) would be
-                // handled here.
-            }
-            seed.unwrap_or_else(|| {
-                // Legacy: synthesize a ResidualAdd input node so
-                // layer 0's first op has a real predecessor. Used
-                // by the hardcoded `build_llama_forward` test path
-                // and by DSL bodies that don't yet start with
-                // `embed(...)`.
-                push(&mut nodes, TileKind::ResidualAdd, 0, Vec::new())
-            })
-        };
-
-        // We process one layer's ops and repeat for num_layers.
-        // Collect the in-loop ops.
-        let loop_ops: Vec<_> = dag.ops.iter().filter(|op| op.in_layer_loop).collect();
-
-        for layer in 0..num_layers {
-            buf_to_tile.clear();
-
-            // The "hidden_states" input for this layer.
-            let hidden_in = hidden_state_tile;
-
-            // Track what the DSL calls "hidden_states" — it's the
-            // implicit variable that add() writes to.
-            let mut current_hidden = hidden_in;
-
-            for op in &loop_ops {
-                match &op.kind {
-                    // `Embed` only appears in the pre-loop pass
-                    // above. If it somehow ends up inside the
-                    // layer loop, the DSL body is malformed; skip
-                    // silently (the validator would reject it
-                    // upstream).
-                    OpKind::Embed { .. } => {}
-                    OpKind::RmsNorm { input, output, .. } => {
-                        let dep = self_or_hidden(&buf_to_tile, &input.0, current_hidden);
-                        let tile = push(&mut nodes, TileKind::RmsNorm, layer, vec![dep]);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                    }
-                    OpKind::Gemm { a, b, output } => {
-                        let dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
-                        let kind = classify_gemm(&b.0);
-                        let gemm_tile = push(&mut nodes, kind, layer, vec![dep]);
-                        buf_to_tile.insert(output.0.clone(), gemm_tile);
-                    }
-                    OpKind::BiasAdd { input, output, .. } => {
-                        let dep = buf_to_tile.get(&input.0).copied().unwrap_or(current_hidden);
-                        let tile = push(&mut nodes, TileKind::BiasAdd, layer, vec![dep]);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                    }
-                    OpKind::GemmAdd {
-                        a,
-                        b,
-                        residual,
-                        output,
-                    } => {
-                        let a_dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
-                        let res_dep = self_or_hidden(&buf_to_tile, &residual.0, current_hidden);
-                        let kind = classify_gemm(&b.0);
-                        let gemm_tile = push(&mut nodes, kind, layer, vec![a_dep]);
-                        let residual_tile = push(
-                            &mut nodes,
-                            TileKind::ResidualAdd,
-                            layer,
-                            vec![res_dep, gemm_tile],
-                        );
-                        buf_to_tile.insert(output.0.clone(), residual_tile);
-                        current_hidden = residual_tile;
-                    }
-                    OpKind::RopeAppend {
-                        q_in,
-                        k_in,
-                        v_in,
-                        q_out,
-                        k_out,
-                        v_out,
-                        ..
-                    } => {
-                        // Separate Q/K/V projections. The solver may
-                        // have fused the upstream GEMMs, but the tile
-                        // graph always represents the logical split.
-                        let q_dep = buf_to_tile.get(&q_in.0).copied().unwrap_or(current_hidden);
-                        let k_dep = buf_to_tile.get(&k_in.0).copied().unwrap_or(current_hidden);
-                        let v_dep = buf_to_tile.get(&v_in.0).copied().unwrap_or(current_hidden);
-                        let split = push(
-                            &mut nodes,
-                            TileKind::QkvSplit,
-                            layer,
-                            vec![q_dep, k_dep, v_dep],
-                        );
-                        let rope = push(&mut nodes, TileKind::Rope, layer, vec![split]);
-                        let kvw = push(&mut nodes, TileKind::KvCacheWrite, layer, vec![rope]);
-                        buf_to_tile.insert(q_out.0.clone(), rope);
-                        buf_to_tile.insert(k_out.0.clone(), kvw);
-                        buf_to_tile.insert(v_out.0.clone(), kvw);
-                    }
-                    OpKind::AttentionDecode { q, output, .. }
-                    | OpKind::AttentionPrefill { q, output, .. } => {
-                        let q_dep = buf_to_tile.get(&q.0).copied().unwrap_or(current_hidden);
-                        // Attention depends on Q and the KV cache write.
-                        let kvw_dep = nodes
-                            .iter()
-                            .rev()
-                            .find(|n| n.kind == TileKind::KvCacheWrite && n.layer == layer)
-                            .map(|n| n.id);
-                        let mut deps = vec![q_dep];
-                        if let Some(kvw) = kvw_dep {
-                            deps.push(kvw);
-                        }
-                        let tile = push(&mut nodes, TileKind::Attention, layer, deps);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                    }
-                    OpKind::Silu { input, output } => {
-                        // Silu is part of the gate*up pattern. The tile graph
-                        // models this as GateUpConcat + SiluMul. We'll handle
-                        // the Silu+Mul combo when we see the Mul op.
-                        let dep = buf_to_tile.get(&input.0).copied().unwrap_or(current_hidden);
-                        buf_to_tile.insert(output.0.clone(), dep);
-                    }
-                    OpKind::Add { a, b, output } => {
-                        // Explicit residual add: a + b → ResidualAdd tile.
-                        // The solver may fuse this with an upstream GEMM
-                        // (beta=1 epilogue) or downstream norm (fused_add_rms_norm).
-                        let a_dep = buf_to_tile.get(&a.0).copied().unwrap_or(current_hidden);
-                        let b_dep = buf_to_tile.get(&b.0).copied().unwrap_or(current_hidden);
-                        let residual_tile =
-                            push(&mut nodes, TileKind::ResidualAdd, layer, vec![a_dep, b_dep]);
-                        buf_to_tile.insert(output.0.clone(), residual_tile);
-                        current_hidden = residual_tile;
-                    }
-                    OpKind::Mul { a, b, output } => {
-                        // gate * up → GateUpConcat + SiluMul.
-                        let a_dep = buf_to_tile.get(&a.0).copied().unwrap_or(current_hidden);
-                        let b_dep = buf_to_tile.get(&b.0).copied().unwrap_or(current_hidden);
-                        let concat = push(
-                            &mut nodes,
-                            TileKind::GateUpConcat,
-                            layer,
-                            vec![a_dep, b_dep],
-                        );
-                        let silu_mul = push(&mut nodes, TileKind::SiluMul, layer, vec![concat]);
-                        buf_to_tile.insert(output.0.clone(), silu_mul);
-                    }
-                }
-            }
-
-            hidden_state_tile = current_hidden;
-        }
-
-        // ── Post-loop ops (final norm, lm_head) ──
-        //
-        // DSL statements after the `for layer in 0..NL` loop. These
-        // run once per forward pass, not per layer. We use `layer =
-        // num_layers` as the layer tag so the solver treats them
-        // as a distinct per-forward-pass phase. Pre-loop ops (any
-        // non-loop op whose DSL position is before the first loop
-        // op, e.g. `embed`) are skipped here — they were already
-        // handled above.
-        let post_loop_ops: Vec<_> = dag
-            .ops
-            .iter()
-            .enumerate()
-            .filter(|(idx, op)| !op.in_layer_loop && *idx >= first_loop_op_idx)
-            .map(|(_, op)| op)
-            .collect();
-        if !post_loop_ops.is_empty() {
-            buf_to_tile.clear();
-            let post_layer = num_layers;
-            let mut current_hidden = hidden_state_tile;
-
-            for op in &post_loop_ops {
-                match &op.kind {
-                    OpKind::RmsNorm { input, output, .. } => {
-                        let dep = self_or_hidden(&buf_to_tile, &input.0, current_hidden);
-                        let tile = push(&mut nodes, TileKind::RmsNorm, post_layer, vec![dep]);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                        current_hidden = tile;
-                    }
-                    OpKind::Gemm { a, b, output } => {
-                        let dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
-                        let kind = classify_gemm(&b.0);
-                        let gemm_tile = push(&mut nodes, kind, post_layer, vec![dep]);
-                        buf_to_tile.insert(output.0.clone(), gemm_tile);
-                        current_hidden = gemm_tile;
-                    }
-                    OpKind::BiasAdd { input, output, .. } => {
-                        let dep = buf_to_tile.get(&input.0).copied().unwrap_or(current_hidden);
-                        let tile = push(&mut nodes, TileKind::BiasAdd, post_layer, vec![dep]);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                        current_hidden = tile;
-                    }
-                    // Other ops (GemmAdd, RopeAppend, Attention, Silu, Mul)
-                    // are not expected in the post-loop phase. Skip gracefully.
-                    _ => {}
-                }
-            }
-        }
-
-        TileGraph {
-            nodes,
-            num_layers,
-            dims,
-        }
-    }
-
-    /// Iterate over all tiles in topological order. Equivalent to
     /// `self.nodes.iter()` since `nodes` is constructed in topo order.
     pub fn iter_topo(&self) -> impl Iterator<Item = &TileNode> {
         self.nodes.iter()
@@ -646,279 +383,6 @@ impl TileGraph {
     /// solver and tests to find candidate subgraphs.
     pub fn tiles_of_kind(&self, kind: TileKind) -> impl Iterator<Item = &TileNode> {
         self.nodes.iter().filter(move |n| n.kind == kind)
-    }
-
-    /// Build a Fully Unrolled Forward (FUF) tile graph from a parsed
-    /// ModelDag.
-    ///
-    /// Unlike `from_model_dag` which builds one layer's worth of tiles
-    /// (reused across layers by the solver), the FUF unrolls ALL layers
-    /// plus pre/post-loop ops into a single flat DAG. Cross-layer
-    /// dependencies become explicit data-flow edges.
-    ///
-    /// The FUF is the IR for the DP solver and wavefront codegen.
-    /// There are no "layers" — just tiles and edges in topological order.
-    pub fn build_fuf(dag: &crate::dag::ModelDag, dims: ModelDims) -> Self {
-        use crate::dag::OpKind;
-        use std::collections::HashMap;
-
-        let mut nodes: Vec<TileNode> = Vec::new();
-        let mut buf_to_tile: HashMap<String, TileId> = HashMap::new();
-
-        let push =
-            |nodes: &mut Vec<TileNode>, kind: TileKind, layer: u16, deps: Vec<TileId>| -> TileId {
-                let id = TileId(nodes.len() as u32);
-                nodes.push(TileNode {
-                    id,
-                    kind,
-                    layer,
-                    deps,
-                    weight_name: None,
-                });
-                id
-            };
-
-        let num_layers = dag.params.get("NL").copied().unwrap_or(1) as u16;
-
-        // ── Pre-loop ops (embed, etc.) ──
-        let first_loop_op_idx = dag
-            .ops
-            .iter()
-            .position(|op| op.in_layer_loop)
-            .unwrap_or(dag.ops.len());
-
-        let mut hidden_state_tile: Option<TileId> = None;
-
-        for op in dag.ops.iter().take(first_loop_op_idx) {
-            if let OpKind::Embed {
-                output, weights, ..
-            } = &op.kind
-            {
-                let tile = push(&mut nodes, TileKind::Embed, 0, vec![]);
-                nodes[tile.0 as usize].weight_name = Some(weights.0.clone());
-                buf_to_tile.insert(output.0.clone(), tile);
-                hidden_state_tile = Some(tile);
-            }
-        }
-
-        // Fallback: synthetic input node if no embed.
-        let mut current_hidden =
-            hidden_state_tile.unwrap_or_else(|| push(&mut nodes, TileKind::ResidualAdd, 0, vec![]));
-
-        // ── Unrolled layer ops ──
-        let loop_ops: Vec<_> = dag.ops.iter().filter(|op| op.in_layer_loop).collect();
-
-        for layer in 0..num_layers {
-            // Per-layer buffers get layer-scoped names so they don't
-            // collide across layers. Cross-layer buffers (hidden_states)
-            // carry forward naturally via current_hidden.
-            let scope = |name: &str| -> String { format!("__L{layer}_{name}") };
-
-            for op in &loop_ops {
-                match &op.kind {
-                    OpKind::Embed { .. } => {}
-                    OpKind::RmsNorm {
-                        input,
-                        weights,
-                        output,
-                    } => {
-                        let dep = self_or_hidden(&buf_to_tile, &input.0, current_hidden);
-                        let tile = push(&mut nodes, TileKind::RmsNorm, layer, vec![dep]);
-                        nodes[tile.0 as usize].weight_name = Some(weights.0.clone());
-                        buf_to_tile.insert(scope(&output.0), tile);
-                        // Also insert unscoped so downstream ops in this
-                        // layer can find it by the DSL name.
-                        buf_to_tile.insert(output.0.clone(), tile);
-                    }
-                    OpKind::Gemm { a, b, output } => {
-                        let dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
-                        let kind = classify_gemm(&b.0);
-                        let tile = push(&mut nodes, kind, layer, vec![dep]);
-                        nodes[tile.0 as usize].weight_name = Some(b.0.clone());
-                        buf_to_tile.insert(scope(&output.0), tile);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                    }
-                    OpKind::GemmAdd {
-                        a,
-                        b,
-                        residual,
-                        output,
-                    } => {
-                        let a_dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
-                        let res_dep = self_or_hidden(&buf_to_tile, &residual.0, current_hidden);
-                        let kind = classify_gemm(&b.0);
-                        let gemm_tile = push(&mut nodes, kind, layer, vec![a_dep]);
-                        nodes[gemm_tile.0 as usize].weight_name = Some(b.0.clone());
-                        let residual_tile = push(
-                            &mut nodes,
-                            TileKind::ResidualAdd,
-                            layer,
-                            vec![res_dep, gemm_tile],
-                        );
-                        buf_to_tile.insert(scope(&output.0), residual_tile);
-                        buf_to_tile.insert(output.0.clone(), residual_tile);
-                        current_hidden = residual_tile;
-                    }
-                    OpKind::Add { a, b, output } => {
-                        let a_dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
-                        let b_dep = self_or_hidden(&buf_to_tile, &b.0, current_hidden);
-                        let tile =
-                            push(&mut nodes, TileKind::ResidualAdd, layer, vec![a_dep, b_dep]);
-                        buf_to_tile.insert(scope(&output.0), tile);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                        current_hidden = tile;
-                    }
-                    OpKind::BiasAdd { input, output, .. } => {
-                        let dep = buf_to_tile.get(&input.0).copied().unwrap_or(current_hidden);
-                        let tile = push(&mut nodes, TileKind::BiasAdd, layer, vec![dep]);
-                        buf_to_tile.insert(scope(&output.0), tile);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                    }
-                    OpKind::RopeAppend {
-                        q_in,
-                        k_in,
-                        v_in,
-                        q_out,
-                        k_out,
-                        v_out,
-                        ..
-                    } => {
-                        let q_dep = buf_to_tile.get(&q_in.0).copied().unwrap_or(current_hidden);
-                        let k_dep = buf_to_tile.get(&k_in.0).copied().unwrap_or(current_hidden);
-                        let v_dep = buf_to_tile.get(&v_in.0).copied().unwrap_or(current_hidden);
-                        let split = push(
-                            &mut nodes,
-                            TileKind::QkvSplit,
-                            layer,
-                            vec![q_dep, k_dep, v_dep],
-                        );
-                        let rope = push(&mut nodes, TileKind::Rope, layer, vec![split]);
-                        let kvw = push(&mut nodes, TileKind::KvCacheWrite, layer, vec![rope]);
-                        buf_to_tile.insert(q_out.0.clone(), rope);
-                        buf_to_tile.insert(k_out.0.clone(), kvw);
-                        buf_to_tile.insert(v_out.0.clone(), kvw);
-                    }
-                    OpKind::AttentionDecode { q, output, .. }
-                    | OpKind::AttentionPrefill { q, output, .. } => {
-                        let q_dep = buf_to_tile.get(&q.0).copied().unwrap_or(current_hidden);
-                        let kvw_dep = nodes
-                            .iter()
-                            .rev()
-                            .find(|n| n.kind == TileKind::KvCacheWrite && n.layer == layer)
-                            .map(|n| n.id);
-                        let mut deps = vec![q_dep];
-                        if let Some(kvw) = kvw_dep {
-                            deps.push(kvw);
-                        }
-                        let tile = push(&mut nodes, TileKind::Attention, layer, deps);
-                        buf_to_tile.insert(scope(&output.0), tile);
-                        buf_to_tile.insert(output.0.clone(), tile);
-                    }
-                    OpKind::Silu { input, output } => {
-                        let dep = buf_to_tile.get(&input.0).copied().unwrap_or(current_hidden);
-                        buf_to_tile.insert(scope(&output.0), dep);
-                        buf_to_tile.insert(output.0.clone(), dep);
-                    }
-                    OpKind::Mul { a, b, output } => {
-                        let a_dep = buf_to_tile.get(&a.0).copied().unwrap_or(current_hidden);
-                        let b_dep = buf_to_tile.get(&b.0).copied().unwrap_or(current_hidden);
-                        let concat = push(
-                            &mut nodes,
-                            TileKind::GateUpConcat,
-                            layer,
-                            vec![a_dep, b_dep],
-                        );
-                        let silu_mul = push(&mut nodes, TileKind::SiluMul, layer, vec![concat]);
-                        buf_to_tile.insert(scope(&output.0), silu_mul);
-                        buf_to_tile.insert(output.0.clone(), silu_mul);
-                    }
-                }
-            }
-        }
-
-        // ── Post-loop ops (final norm, lm_head, etc.) ──
-        // These are just more tiles in the flat graph. No special handling.
-        let post_layer = num_layers; // metadata only
-        let post_loop_ops: Vec<_> = dag
-            .ops
-            .iter()
-            .enumerate()
-            .filter(|(idx, op)| !op.in_layer_loop && *idx >= first_loop_op_idx)
-            .map(|(_, op)| op)
-            .collect();
-
-        for op in &post_loop_ops {
-            match &op.kind {
-                OpKind::RmsNorm {
-                    input,
-                    weights,
-                    output,
-                } => {
-                    let dep = self_or_hidden(&buf_to_tile, &input.0, current_hidden);
-                    let tile = push(&mut nodes, TileKind::RmsNorm, post_layer, vec![dep]);
-                    nodes[tile.0 as usize].weight_name = Some(weights.0.clone());
-                    buf_to_tile.insert(output.0.clone(), tile);
-                    current_hidden = tile;
-                }
-                OpKind::Gemm { a, b, output } => {
-                    let dep = self_or_hidden(&buf_to_tile, &a.0, current_hidden);
-                    let kind = classify_gemm(&b.0);
-                    let tile = push(&mut nodes, kind, post_layer, vec![dep]);
-                    nodes[tile.0 as usize].weight_name = Some(b.0.clone());
-                    buf_to_tile.insert(output.0.clone(), tile);
-                    current_hidden = tile;
-                }
-                OpKind::BiasAdd { input, output, .. } => {
-                    let dep = buf_to_tile.get(&input.0).copied().unwrap_or(current_hidden);
-                    let tile = push(&mut nodes, TileKind::BiasAdd, post_layer, vec![dep]);
-                    buf_to_tile.insert(output.0.clone(), tile);
-                    current_hidden = tile;
-                }
-                _ => {}
-            }
-        }
-
-        TileGraph {
-            nodes,
-            num_layers,
-            dims,
-        }
-    }
-}
-
-/// Look up a buffer's producing tile, or fall back to the current hidden_states.
-fn self_or_hidden(
-    buf_to_tile: &std::collections::HashMap<String, TileId>,
-    buf_name: &str,
-    hidden: TileId,
-) -> TileId {
-    buf_to_tile.get(buf_name).copied().unwrap_or(hidden)
-}
-
-/// Classify a GEMM by its weight buffer name.
-/// The DSL uses HF weight paths: `self_attn.q_proj`, `self_attn.o_proj`,
-/// `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`, `lm_head`.
-fn classify_gemm(weight_name: &str) -> TileKind {
-    let w = weight_name.to_lowercase();
-    if w.contains("q_proj") {
-        TileKind::GemmQ
-    } else if w.contains("k_proj") {
-        TileKind::GemmK
-    } else if w.contains("v_proj") {
-        TileKind::GemmV
-    } else if w.contains("o_proj") {
-        TileKind::GemmOProj
-    } else if w.contains("lm_head") {
-        TileKind::GemmLmHead
-    } else if w.contains("gate_proj") {
-        TileKind::GemmGate
-    } else if w.contains("up_proj") {
-        TileKind::GemmUp
-    } else if w.contains("down_proj") {
-        TileKind::GemmDown
-    } else {
-        // Unknown weight — default to Q projection.
-        TileKind::GemmQ
     }
 }
 
@@ -1000,28 +464,29 @@ mod self_tests {
         "#;
         let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
         let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
-        let dag = crate::parse::build_dag(&def).unwrap();
+        let cfg = crate::cfg::build_cfg(&def);
 
-        let from_dag = TileGraph::from_model_dag(&dag, ModelDims::LLAMA_3_2_1B);
+        let from_cfg = crate::fuf::build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
         let hardcoded = TileGraph::build_llama_forward_1b(2);
 
-        // from_dag includes the post-loop (rmsnorm + lm_head) ops tagged
-        // with layer=num_layers; the hardcoded build_llama_forward_1b
-        // doesn't emit them. Count only in-loop nodes for comparison.
+        // from_cfg includes the post-loop (rmsnorm + lm_head) ops
+        // tagged with layer=num_layers; the hardcoded
+        // build_llama_forward_1b doesn't emit them. Count only
+        // in-loop nodes for comparison.
         let in_loop = |tg: &TileGraph, num_layers: u16| -> usize {
             tg.nodes.iter().filter(|n| n.layer < num_layers).count()
         };
         assert_eq!(
-            in_loop(&from_dag, 2),
+            in_loop(&from_cfg, 2),
             in_loop(&hardcoded, 2),
-            "node count mismatch: from_dag={}, hardcoded={}",
-            in_loop(&from_dag, 2),
+            "node count mismatch: from_cfg={}, hardcoded={}",
+            in_loop(&from_cfg, 2),
             in_loop(&hardcoded, 2),
         );
 
         // Same tile kinds per layer.
         for layer in 0..2u16 {
-            let dag_kinds: Vec<_> = from_dag
+            let cfg_kinds: Vec<_> = from_cfg
                 .nodes
                 .iter()
                 .filter(|n| n.layer == layer)
@@ -1034,8 +499,8 @@ mod self_tests {
                 .map(|n| n.kind)
                 .collect();
             assert_eq!(
-                dag_kinds, hc_kinds,
-                "layer {layer} tile kinds differ:\n  from_dag: {dag_kinds:?}\n  hardcoded: {hc_kinds:?}"
+                cfg_kinds, hc_kinds,
+                "layer {layer} tile kinds differ:\n  from_cfg: {cfg_kinds:?}\n  hardcoded: {hc_kinds:?}"
             );
         }
     }
@@ -1067,8 +532,8 @@ mod self_tests {
         "#;
         let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
         let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
-        let dag = crate::parse::build_dag(&def).unwrap();
-        let g = TileGraph::from_model_dag(&dag, ModelDims::LLAMA_3_2_1B);
+        let cfg = crate::cfg::build_cfg(&def);
+        let g = crate::fuf::build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
 
         for node in &g.nodes {
             for dep in &node.deps {
@@ -1109,8 +574,8 @@ mod self_tests {
         "#;
         let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
         let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
-        let dag = crate::parse::build_dag(&def).unwrap();
-        let tg = TileGraph::from_model_dag(&dag, ModelDims::LLAMA_3_2_1B);
+        let cfg = crate::cfg::build_cfg(&def);
+        let tg = crate::fuf::build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
 
         // Should have ResidualAdd tiles (from explicit add ops).
         let residuals: Vec<_> = tg.tiles_of_kind(TileKind::ResidualAdd).collect();
@@ -1152,9 +617,9 @@ mod self_tests {
         "#;
         let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
         let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
-        let dag = crate::parse::build_dag(&def).unwrap();
-        let tg = TileGraph::from_model_dag(
-            &dag,
+        let cfg = crate::cfg::build_cfg(&def);
+        let tg = crate::fuf::build_fuf(
+            &cfg,
             ModelDims {
                 hidden_size: 2048,
                 intermediate_size: 16384,
@@ -1163,7 +628,8 @@ mod self_tests {
                 head_dim: 256,
                 vocab_size: 256000,
             },
-        );
+        )
+        .unwrap();
 
         // 4 norms per layer × 2 layers = 8 RmsNorm tiles.
         let norms: Vec<_> = tg.tiles_of_kind(TileKind::RmsNorm).collect();
@@ -1223,9 +689,9 @@ mod self_tests {
         "#;
         let tokens: proc_macro2::TokenStream = dsl.parse().unwrap();
         let def: crate::parse::MegakernelDef = syn::parse2(tokens).unwrap();
-        let dag = crate::parse::build_dag(&def).unwrap();
+        let cfg = crate::cfg::build_cfg(&def);
 
-        let fuf = TileGraph::build_fuf(&dag, ModelDims::LLAMA_3_2_1B);
+        let fuf = crate::fuf::build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
 
         // 3 layers of tiles + embed + final norm + lm_head.
         // Each layer has ~17 tiles (same as from_model_dag).

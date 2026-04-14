@@ -392,6 +392,138 @@ impl Builder {
     }
 }
 
+/// Walk the CFG and extract the weight fields needed for the
+/// generated `Layer` and `Model` structs.
+///
+/// This is the CFG-driven replacement for the legacy
+/// `codegen::extract_weight_fields(&def.dag, ...)`, which walked
+/// a `ModelDag` to classify buffers by consuming op kind. Here we
+/// walk the unrolled instruction stream directly — no `ModelDag`
+/// intermediate — and classify weight args by:
+///   1. the op that consumes them (`embed` → `Embedding`,
+///      `rmsnorm` → `RmsNorm`, `gemm` → `LinearLayer`,
+///      `rope_append`'s rotary arg → `RotaryCache`);
+///   2. per-layer vs global: `Arg::VarAt(_, _)` (indexed in the
+///      DSL, e.g. `self_attn.q_proj[layer]`) is per-layer;
+///      `Arg::Var(_, None)` (unindexed, e.g. `lm_head`, `rotary`)
+///      is global.
+///
+/// The `.bias` suffix is skipped — bias buffers are loaded as
+/// part of their parent LinearLayer and don't need a separate
+/// struct field.
+///
+/// Returns `(per_layer_fields, global_fields)` sorted by name for
+/// stable output.
+pub fn extract_weight_fields(
+    cfg: &Cfg,
+) -> Result<
+    (
+        Vec<crate::lowering::backend::codegen::FieldSpec>,
+        Vec<crate::lowering::backend::codegen::FieldSpec>,
+    ),
+    FufError,
+> {
+    use crate::lowering::backend::codegen::FieldSpec;
+    use std::collections::BTreeMap;
+
+    let tagged = unroll_tagged(cfg)?;
+
+    // Per-weight-name classification. First-seen wins — a name that
+    // appears first inside a loop body stays as per-layer even if
+    // referenced later outside (extremely unusual; mirror the
+    // legacy's first-consumer-wins behavior).
+    let mut per_layer: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut global: BTreeMap<String, &'static str> = BTreeMap::new();
+
+    for (instr, _phase) in &tagged {
+        let call = match instr {
+            Instr::Let { call, .. } | Instr::LetTuple { call, .. } | Instr::Assign { call, .. } => {
+                call
+            }
+        };
+        collect_weight_args_from_call(call, &mut per_layer, &mut global);
+    }
+
+    let to_specs = |m: BTreeMap<String, &'static str>| -> Vec<FieldSpec> {
+        m.into_iter()
+            .map(|(name, ty)| FieldSpec { name, ty })
+            .collect()
+    };
+
+    Ok((to_specs(per_layer), to_specs(global)))
+}
+
+/// Classify all weight-shaped args of one `OpCall`, recursing into
+/// nested `Arg::Call` so `gemm(silu(gemm(x, w1)), w2)` picks up
+/// both `w1` and `w2`.
+fn collect_weight_args_from_call(
+    call: &OpCall,
+    per_layer: &mut std::collections::BTreeMap<String, &'static str>,
+    global: &mut std::collections::BTreeMap<String, &'static str>,
+) {
+    let op = call.op.to_string();
+
+    // Per-op weight-arg positions. None = no weights for this op.
+    // (arg_index, rust_type)
+    let weight_positions: &[(usize, &'static str)] = match op.as_str() {
+        "embed" => &[(1, "Embedding")],
+        "rmsnorm" => &[(1, "RmsNorm")],
+        "gemm" => &[(1, "LinearLayer")],
+        "bias_add" => &[], // bias is folded into parent LinearLayer
+        "rope_append" => &[(4, "RotaryCache")],
+        _ => &[],
+    };
+
+    for (arg_idx, ty) in weight_positions {
+        if let Some(arg) = call.args.get(*arg_idx) {
+            classify_weight_arg(arg, ty, per_layer, global);
+        }
+    }
+
+    // Recurse into nested calls / muls so inner weight args are seen.
+    for arg in &call.args {
+        recurse_weight_args_in_arg(arg, per_layer, global);
+    }
+}
+
+fn recurse_weight_args_in_arg(
+    arg: &Arg,
+    per_layer: &mut std::collections::BTreeMap<String, &'static str>,
+    global: &mut std::collections::BTreeMap<String, &'static str>,
+) {
+    match arg {
+        Arg::Call(c) => collect_weight_args_from_call(c, per_layer, global),
+        Arg::Mul(a, b) => {
+            recurse_weight_args_in_arg(a, per_layer, global);
+            recurse_weight_args_in_arg(b, per_layer, global);
+        }
+        _ => {}
+    }
+}
+
+fn classify_weight_arg(
+    arg: &Arg,
+    ty: &'static str,
+    per_layer: &mut std::collections::BTreeMap<String, &'static str>,
+    global: &mut std::collections::BTreeMap<String, &'static str>,
+) {
+    let (name, is_per_layer) = match arg {
+        Arg::VarAt(n, _) => (n.clone(), true),
+        Arg::Var(n, None) => (n.clone(), false),
+        // Weight args shouldn't be nested calls / mul / symbolic-idx
+        // in any DSL we support; ignore.
+        _ => return,
+    };
+    if name.ends_with(".bias") {
+        return;
+    }
+    if is_per_layer {
+        per_layer.entry(name).or_insert(ty);
+    } else {
+        global.entry(name).or_insert(ty);
+    }
+}
+
 /// Classify a GEMM tile by its weight argument's string name.
 ///
 /// Same substring rules as the legacy `tile_graph::classify_gemm`,
@@ -537,6 +669,110 @@ mod tests {
         assert_eq!(tg.nodes[1].kind, TileKind::GemmLmHead);
         assert_eq!(tg.nodes[1].weight_name.as_deref(), Some("lm_head"));
         assert_eq!(tg.nodes[1].deps, vec![tg.nodes[0].id]);
+    }
+
+    #[test]
+    fn extract_weight_fields_llama() {
+        use crate::lowering::backend::codegen::FieldSpec;
+        let def = parse_dsl(LLAMA_DSL);
+        let cfg = build_cfg(&def);
+
+        let (per_layer, global) = extract_weight_fields(&cfg).expect("extract");
+
+        let pl_names: Vec<_> = per_layer.iter().map(|f| f.name.clone()).collect();
+        let g_names: Vec<_> = global.iter().map(|f| f.name.clone()).collect();
+
+        // Per-layer: every HF weight path that's indexed by `[layer]`
+        // in the DSL should show up.
+        for expected in [
+            "input_layernorm",
+            "mlp.down_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "post_attention_layernorm",
+            "self_attn.k_proj",
+            "self_attn.o_proj",
+            "self_attn.q_proj",
+            "self_attn.v_proj",
+        ] {
+            assert!(
+                pl_names.contains(&expected.to_string()),
+                "missing per-layer field {expected}: got {pl_names:?}",
+            );
+        }
+        // Global: unindexed weights.
+        for expected in ["embed_tokens", "lm_head", "norm", "rotary"] {
+            assert!(
+                g_names.contains(&expected.to_string()),
+                "missing global field {expected}: got {g_names:?}",
+            );
+        }
+
+        // Type classification.
+        let ty_of = |v: &[FieldSpec], name: &str| -> &'static str {
+            v.iter().find(|f| f.name == name).unwrap().ty
+        };
+        assert_eq!(ty_of(&per_layer, "self_attn.q_proj"), "LinearLayer");
+        assert_eq!(ty_of(&per_layer, "input_layernorm"), "RmsNorm");
+        assert_eq!(ty_of(&global, "embed_tokens"), "Embedding");
+        assert_eq!(ty_of(&global, "rotary"), "RotaryCache");
+        assert_eq!(ty_of(&global, "lm_head"), "LinearLayer");
+        assert_eq!(ty_of(&global, "norm"), "RmsNorm");
+    }
+
+    #[test]
+    fn extract_weight_fields_matches_legacy_llama() {
+        // Raw (pre-fusion-transform) extraction should match the
+        // legacy path. We pass `false` for all fusion flags to get
+        // the pure extraction from the legacy function.
+        let def = parse_dsl(LLAMA_DSL);
+        let cfg = build_cfg(&def);
+        let dag = build_dag(&def).unwrap();
+
+        let (got_pl, got_g) = extract_weight_fields(&cfg).expect("fuf extract");
+        let (want_pl, want_g) =
+            crate::lowering::backend::codegen::extract_weight_fields_legacy_for_test(
+                &dag, false, false, false, false,
+            );
+
+        let pl_pair: Vec<_> = got_pl.iter().map(|f| (f.name.clone(), f.ty)).collect();
+        let want_pl_pair: Vec<_> = want_pl.iter().map(|f| (f.name.clone(), f.ty)).collect();
+        assert_eq!(pl_pair, want_pl_pair, "per_layer fields differ");
+
+        let g_pair: Vec<_> = got_g.iter().map(|f| (f.name.clone(), f.ty)).collect();
+        let want_g_pair: Vec<_> = want_g.iter().map(|f| (f.name.clone(), f.ty)).collect();
+        assert_eq!(g_pair, want_g_pair, "global fields differ");
+    }
+
+    #[test]
+    fn extract_weight_fields_skips_bias() {
+        // `*.bias` weights are handled by their parent LinearLayer's
+        // loader and shouldn't appear as their own fields.
+        let def = parse_dsl(
+            r#"
+            kernel test<NL=2, HD=128, ID=128, HDM=32, NAH=4, NKH=1, VS=1024> {
+                hidden_states = embed(input_ids, embed_tokens);
+                for layer in 0..NL {
+                    let n = rmsnorm(hidden_states, input_layernorm[layer]);
+                    let q = gemm(n, self_attn.q_proj[layer]);
+                    let q = bias_add(q, self_attn.q_proj.bias[layer]);
+                    hidden_states = add(q, hidden_states);
+                }
+                logits = gemm(hidden_states, lm_head);
+            }
+            "#,
+        );
+        let cfg = build_cfg(&def);
+        let (per_layer, _global) = extract_weight_fields(&cfg).expect("extract");
+        let names: Vec<_> = per_layer.iter().map(|f| f.name.clone()).collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(".bias")),
+            "bias fields should be skipped: got {names:?}",
+        );
+        assert!(
+            names.iter().any(|n| n == "self_attn.q_proj"),
+            "parent LinearLayer field should be kept: got {names:?}",
+        );
     }
 
     #[test]

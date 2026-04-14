@@ -171,7 +171,12 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     // Solve every model variant.
     let mut solved_models: Vec<SolvedModel> = Vec::new();
     for model in models {
-        let tile_graph = TileGraph::from_model_dag(&def.dag, model.dims);
+        // New pipeline: AST → CFG → unroll → TileGraph. Replaces the
+        // legacy ModelDag path (`TileGraph::from_model_dag(&def.dag,
+        // ...)`); structurally equivalent on our DSL, verified by
+        // `fuf::build_fuf_matches_legacy_llama`.
+        let tile_graph = crate::fuf::build_fuf(&def.cfg, model.dims)
+            .expect("fuf::build_fuf should not fail on a well-formed DSL");
         let mut library = build_library(target_id, model.dims);
         let family = PlanFamily::solve_grid(
             &tile_graph,
@@ -259,8 +264,14 @@ fn generate_fully_specialized(def: &ForwardDef) -> TokenStream {
     let gate_up_fused = sm.any_gate_up_fused;
     let gate_up_unfused = sm.any_gate_up_unfused;
 
-    let (per_layer_fields, global_fields) = extract_weight_fields(
-        &def.dag,
+    // New pipeline: extract raw weight fields from the CFG, then
+    // apply the fusion transforms based on the solver's plan. The
+    // legacy `extract_weight_fields(&def.dag, ...)` did both in one
+    // call — split to keep the raw extraction purely CFG-driven.
+    let (mut per_layer_fields, global_fields) = crate::fuf::extract_weight_fields(&def.cfg)
+        .expect("fuf::extract_weight_fields should not fail on a well-formed DSL");
+    apply_weight_field_fusion(
+        &mut per_layer_fields,
         qkv_fused,
         qkv_unfused,
         gate_up_fused,
@@ -1600,15 +1611,70 @@ fn gemm_operands(
 // ── Struct generation from DAG ──────────────────────────────────
 
 /// A field to emit in a generated struct.
-struct FieldSpec {
-    name: String,
+pub struct FieldSpec {
+    pub name: String,
     /// Rust type as a string: "RmsNorm", "LinearLayer", "Embedding", "RotaryCache"
-    ty: &'static str,
+    pub ty: &'static str,
 }
 
 /// Walk the DAG and extract weight buffer references, grouped into
 /// per-layer (Layer struct) and global (Model struct) fields.
 /// The Rust type is inferred from which op consumes the weight.
+/// Test-only public wrapper so fuf.rs can compare its
+/// CFG-driven extractor against the legacy DAG-based one.
+/// Will be deleted alongside the legacy path in phase 3b.
+#[cfg(test)]
+pub(crate) fn extract_weight_fields_legacy_for_test(
+    dag: &crate::dag::ModelDag,
+    qkv_fused: bool,
+    qkv_unfused: bool,
+    gate_up_fused: bool,
+    gate_up_unfused: bool,
+) -> (Vec<FieldSpec>, Vec<FieldSpec>) {
+    extract_weight_fields(dag, qkv_fused, qkv_unfused, gate_up_fused, gate_up_unfused)
+}
+
+/// Apply solver fusion decisions to a raw per-layer field list.
+///
+/// When both fused and unfused variants are needed (different
+/// buckets pick different layouts), the struct carries BOTH sets
+/// of fields. When only fused is needed, the individual q/k/v
+/// (or gate/up) fields are dropped and a single fused one is
+/// added.
+///
+/// Pure transform on a `Vec<FieldSpec>` — same logic as the
+/// second half of the legacy `extract_weight_fields`, factored
+/// out so both the ModelDag and CFG pipelines feed through it.
+pub(crate) fn apply_weight_field_fusion(
+    per_layer: &mut Vec<FieldSpec>,
+    qkv_fused: bool,
+    qkv_unfused: bool,
+    gate_up_fused: bool,
+    gate_up_unfused: bool,
+) {
+    if qkv_fused && !qkv_unfused {
+        per_layer.retain(|f| {
+            !f.name.contains("q_proj") && !f.name.contains("k_proj") && !f.name.contains("v_proj")
+        });
+    }
+    if qkv_fused {
+        per_layer.push(FieldSpec {
+            name: "self_attn.qkv_proj".to_string(),
+            ty: "LinearLayer",
+        });
+    }
+    if gate_up_fused && !gate_up_unfused {
+        per_layer.retain(|f| !f.name.contains("gate_proj") && !f.name.contains("up_proj"));
+    }
+    if gate_up_fused {
+        per_layer.push(FieldSpec {
+            name: "mlp.gate_up_proj".to_string(),
+            ty: "LinearLayer",
+        });
+    }
+    per_layer.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
 fn extract_weight_fields(
     dag: &crate::dag::ModelDag,
     qkv_fused: bool,

@@ -783,7 +783,6 @@ impl Implementation for CublasGemmExImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
 
@@ -893,7 +892,6 @@ impl Implementation for CublasFusedQkvGemmImpl {
             claimed_tiles: vec![seed, k_tile.id, v_tile.id],
             boundary_inputs: deps.clone(),
             boundary_outputs: vec![seed, k_tile.id, v_tile.id],
-            layer,
         })
     }
 
@@ -1015,7 +1013,6 @@ impl Implementation for CublasFusedQkvGemmWithBiasImpl {
             // Outputs are the BiasAdd tiles (downstream consumers
             // depend on these, not the raw GEMM tiles).
             boundary_outputs: vec![q_bias.id, k_bias.id, v_bias.id],
-            layer,
         })
     }
 
@@ -1102,7 +1099,6 @@ impl Implementation for CublasFusedGateUpGemmImpl {
             claimed_tiles: vec![seed, up_tile.id],
             boundary_inputs: deps.clone(),
             boundary_outputs: vec![seed, up_tile.id],
-            layer,
         })
     }
 
@@ -1233,7 +1229,6 @@ impl Implementation for CublasGemmExWithResidualImpl {
             boundary_inputs,
             // The output is the ResidualAdd tile (hidden_states write).
             boundary_outputs: vec![residual_id],
-            layer: gemm_node.layer,
         })
     }
 
@@ -1307,7 +1302,6 @@ impl Implementation for VllmRsRmsNormImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -1398,7 +1392,6 @@ impl Implementation for VllmRsSiluAndMulFusedImpl {
             claimed_tiles: vec![silu_id, mul_id],
             boundary_inputs,
             boundary_outputs: vec![mul_id],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -1479,7 +1472,6 @@ impl Implementation for TkAttentionDecodeImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -1544,7 +1536,6 @@ impl Implementation for TkAttentionPrefillImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -1601,7 +1592,6 @@ impl Implementation for FlashInferStandaloneImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -1665,7 +1655,6 @@ impl Implementation for EmbedImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -1726,7 +1715,6 @@ impl Implementation for StandaloneBiasAddImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -1828,7 +1816,6 @@ impl Implementation for CublasGemmExWithBiasImpl {
             claimed_tiles: vec![gemm_id, bias_id],
             boundary_inputs: gemm_node.deps.clone(),
             boundary_outputs: vec![bias_id],
-            layer: gemm_node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -1897,7 +1884,6 @@ impl Implementation for ResidualAddImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -1959,7 +1945,6 @@ impl Implementation for VllmRsFusedQkvRopeCacheImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -2019,7 +2004,6 @@ impl Implementation for VllmRsPrefillRopeCacheImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -2077,7 +2061,6 @@ impl Implementation for FlashInferStandardImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -2419,7 +2402,6 @@ impl Implementation for CutlassGemmImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -2532,7 +2514,6 @@ impl Implementation for CutlassGemvImpl {
             claimed_tiles: vec![seed],
             boundary_inputs: node.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -2839,7 +2820,6 @@ impl Implementation for CutlassGemmWithResidualImpl {
             claimed_tiles: vec![gemm_id, residual_id],
             boundary_inputs,
             boundary_outputs: vec![residual_id],
-            layer: gemm_node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -3023,7 +3003,6 @@ impl Implementation for CutlassNormGemmImpl {
             claimed_tiles: vec![norm.id, seed],
             boundary_inputs: norm.deps.clone(),
             boundary_outputs: vec![seed],
-            layer: gemm.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {
@@ -3170,7 +3149,6 @@ impl Implementation for CutlassGemmSiluMulImpl {
             claimed_tiles: vec![gate_id, silu.id, mul.id],
             boundary_inputs,
             boundary_outputs: vec![mul.id],
-            layer: node.layer,
         })
     }
     fn cost_us(&self, _m: &MatchInfo, profile: &TargetProfile) -> f64 {

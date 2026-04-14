@@ -52,7 +52,7 @@ use crate::target_profile::TargetProfile;
 /// incomplete).
 pub fn cost_us(
     assignment: &Assignment,
-    tile_graph: &TileGraph,
+    _tile_graph: &TileGraph,
     library: &ImplementationLibrary,
     profile: &TargetProfile,
 ) -> f64 {
@@ -77,18 +77,15 @@ pub fn cost_us(
             };
             let imp = library.get(*impl_id);
             let claimed = assignment.tiles_in_subgraph(sg);
-            let layer = claimed
-                .first()
-                .map(|t| tile_graph.nodes[t.0 as usize].layer)
-                .unwrap_or(0);
             // Build a fresh MatchInfo for cost lookup. The matcher's
-            // boundary_inputs/outputs aren't needed for cost, only
-            // claimed_tiles + layer.
+            // boundary_inputs/outputs aren't needed for cost — only
+            // claimed_tiles is (and no cost_us impl today even reads
+            // that directly, but we keep the field for future cost
+            // models that might key off the subgraph shape).
             let m = MatchInfo {
                 claimed_tiles: claimed,
                 boundary_inputs: vec![],
                 boundary_outputs: vec![],
-                layer,
             };
             step_entries.push((sg, imp, m));
         }

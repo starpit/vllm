@@ -250,8 +250,6 @@ pub struct MatchInfo {
     /// inside `claimed_tiles` whose outputs are read by tiles
     /// outside the claim).
     pub boundary_outputs: Vec<TileId>,
-    /// The layer this claim operates on (for per-layer impls).
-    pub layer: u16,
 }
 
 /// One curated implementation in the library.

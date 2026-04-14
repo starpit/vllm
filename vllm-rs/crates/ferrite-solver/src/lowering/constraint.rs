@@ -293,16 +293,10 @@ impl Constraint {
                     // Build a fake MatchInfo carrying just the
                     // claimed tiles for resource lookup.
                     let claimed = assignment.tiles_in_subgraph(sg);
-                    let layer = if let Some(t) = claimed.first() {
-                        tile_graph.nodes[t.0 as usize].layer
-                    } else {
-                        0
-                    };
                     let m = crate::lowering::implementation::MatchInfo {
                         claimed_tiles: claimed,
                         boundary_inputs: vec![],
                         boundary_outputs: vec![],
-                        layer,
                     };
                     let r = imp.resources(&m);
                     max_regs = max_regs.max(r.regs_per_thread);
@@ -326,16 +320,10 @@ impl Constraint {
                     };
                     let imp = library.get(*impl_id);
                     let claimed = assignment.tiles_in_subgraph(sg);
-                    let layer = if let Some(t) = claimed.first() {
-                        tile_graph.nodes[t.0 as usize].layer
-                    } else {
-                        0
-                    };
                     let m = crate::lowering::implementation::MatchInfo {
                         claimed_tiles: claimed,
                         boundary_inputs: vec![],
                         boundary_outputs: vec![],
-                        layer,
                     };
                     let r = imp.resources(&m);
                     max_shmem = max_shmem.max(r.shmem_bytes);

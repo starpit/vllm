@@ -31,12 +31,35 @@ pub enum UnrollError {
     Unsupported(String),
 }
 
+/// Which phase of the unrolled program an instruction belongs to.
+///
+/// Tags attached by [`unroll_tagged`] so downstream passes (namely
+/// [`crate::fuf::build_fuf`]) can recover the loop iteration a
+/// particular instruction came from. We need this because the
+/// instruction stream itself has no trace of "which `for` body
+/// expansion produced me" after substitution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopPhase {
+    /// Instruction appears before any loop has been entered.
+    PreLoop,
+    /// Instruction is a copy of a loop body, at the given iteration.
+    InLoop { iter: u16 },
+    /// Instruction appears after a loop has been exited.
+    PostLoop,
+}
+
 /// Unroll all natural loops in the CFG.
 ///
 /// Returns a flat sequence of instructions in execution order,
 /// with all symbolic indexed references (`Arg::Var(name, Some(id))`)
 /// replaced by concrete `Arg::VarAt(name, idx)`.
 pub fn unroll(cfg: &Cfg) -> Result<Vec<Instr>, UnrollError> {
+    Ok(unroll_tagged(cfg)?.into_iter().map(|(i, _)| i).collect())
+}
+
+/// Like [`unroll`] but also tags each instruction with its
+/// [`LoopPhase`].
+pub fn unroll_tagged(cfg: &Cfg) -> Result<Vec<(Instr, LoopPhase)>, UnrollError> {
     let dom = Dominators::compute(cfg);
     let loops = find_loops(cfg, &dom);
 
@@ -46,11 +69,19 @@ pub fn unroll(cfg: &Cfg) -> Result<Vec<Instr>, UnrollError> {
 
     let mut out = Vec::new();
     let mut visited: BTreeSet<BlockId> = BTreeSet::new();
-    walk(cfg, cfg.entry, &loop_by_header, &mut visited, &mut out)?;
+    let mut have_looped = false;
+    walk(
+        cfg,
+        cfg.entry,
+        &loop_by_header,
+        &mut visited,
+        &mut have_looped,
+        &mut out,
+    )?;
     Ok(out)
 }
 
-/// Walk the CFG in execution order, emitting instructions.
+/// Walk the CFG in execution order, emitting tagged instructions.
 /// When we hit a loop header, we unroll its body and skip the
 /// corresponding loop blocks in the linear walk.
 fn walk(
@@ -58,7 +89,8 @@ fn walk(
     block: BlockId,
     loops: &std::collections::BTreeMap<BlockId, &Loop>,
     visited: &mut BTreeSet<BlockId>,
-    out: &mut Vec<Instr>,
+    have_looped: &mut bool,
+    out: &mut Vec<(Instr, LoopPhase)>,
 ) -> Result<(), UnrollError> {
     let mut cur = block;
     loop {
@@ -85,6 +117,7 @@ fn walk(
             })?;
 
             unroll_loop(cfg, l, &var, bound, out)?;
+            *have_looped = true;
 
             // Mark all loop body blocks as visited so the linear
             // walk skips them.
@@ -101,9 +134,14 @@ fn walk(
             continue;
         }
 
-        // Non-loop block: emit its instructions, then follow the terminator.
+        // Non-loop block: emit its instructions tagged by phase.
+        let phase = if *have_looped {
+            LoopPhase::PostLoop
+        } else {
+            LoopPhase::PreLoop
+        };
         for instr in &b.instrs {
-            out.push(substitute_instr(instr, None, 0)?);
+            out.push((substitute_instr(instr, None, 0)?, phase));
         }
         match &b.term {
             Terminator::Jump(next) => {
@@ -121,13 +159,14 @@ fn walk(
 }
 
 /// Unroll one natural loop `bound` times, emitting the body's
-/// instructions with the loop variable substituted.
+/// instructions with the loop variable substituted and an
+/// [`LoopPhase::InLoop`] tag for the iteration index.
 fn unroll_loop(
     cfg: &Cfg,
     l: &Loop,
     var: &syn::Ident,
     bound: usize,
-    out: &mut Vec<Instr>,
+    out: &mut Vec<(Instr, LoopPhase)>,
 ) -> Result<(), UnrollError> {
     // Determine the body blocks in execution order: start at the
     // header's body successor, walk until we hit the latch (which
@@ -145,10 +184,11 @@ fn unroll_loop(
     let body_order = body_linear_order(cfg, body_entry, l)?;
 
     for i in 0..bound {
+        let phase = LoopPhase::InLoop { iter: i as u16 };
         for bid in &body_order {
             let b = &cfg.blocks[bid.0 as usize];
             for instr in &b.instrs {
-                out.push(substitute_instr(instr, Some(var), i)?);
+                out.push((substitute_instr(instr, Some(var), i)?, phase));
             }
         }
     }

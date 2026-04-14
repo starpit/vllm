@@ -773,7 +773,9 @@ fn resolve_arg(
             // VarAt is produced only by the unroll pass (CFG → FUF).
             // The legacy DAG builder runs on pre-unroll ASTs and
             // should never see one.
-            unreachable!("Arg::VarAt reached legacy resolve_arg — unroll output should flow through the new FUF pipeline")
+            unreachable!(
+                "Arg::VarAt reached legacy resolve_arg — unroll output should flow through the new FUF pipeline"
+            )
         }
         Arg::Call(call) => process_call(dag, ctx, call, in_loop),
         Arg::Mul(a, b) => {

@@ -315,8 +315,8 @@ mod tests {
     use crate::config::{self, ModelParams};
     use crate::fuf::unroll;
     use crate::impl_lib::{
-        CostCtx, Implementation, ImplementationLibrary, LaunchKind, MatchInfo, TargetFilter,
-        WorkloadConstraint, starter_library,
+        CostCtx, Implementation, ImplementationLibrary, LaunchKind, Layout, MatchInfo,
+        TargetFilter, WorkloadConstraint, starter_library,
     };
     use crate::parse::parse_block;
     use crate::shape::infer;
@@ -483,6 +483,7 @@ mod tests {
             target_filter: TargetFilter::Any,
             cost_fn: always_none,
             matches_fn: None,
+            weight_layouts: &[Layout::Plain],
         });
 
         let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap_err();
@@ -515,6 +516,7 @@ mod tests {
             target_filter: TargetFilter::Any,
             cost_fn: cheap,
             matches_fn: None,
+            weight_layouts: &[Layout::Plain],
         });
 
         // At M=1 it's fine.
@@ -584,6 +586,9 @@ mod tests {
             target_filter: TargetFilter::Any,
             cost_fn: cheap,
             matches_fn: Some(matches_double_add),
+            // Add has no weight args; the double-add Impl
+            // consumes two tile outputs and produces one tile output.
+            weight_layouts: &[],
         });
 
         let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();

@@ -294,6 +294,41 @@ impl TileGraph {
         self.nodes.is_empty()
     }
 
+    /// Compute the BSP wavefront index for every tile.
+    ///
+    /// A wavefront is the set of tiles whose every dep is in a
+    /// strictly lower wavefront. Root tiles (no tile-producer deps)
+    /// are in wavefront 0; every other tile sits at
+    /// `max(dep.wavefront) + 1`.
+    ///
+    /// This is the BSP grouping primitive the megakernel codegen
+    /// uses to schedule ops inside one long-running kernel: run
+    /// every tile in wavefront `W`, barrier, run wavefront `W+1`,
+    /// barrier, … Tiles within a wavefront can execute in parallel
+    /// (by partitioning CTAs or warps among them).
+    ///
+    /// Returned vector is indexed by `TileId.0` — parallel to
+    /// `self.nodes`. O(V + E), single pass since nodes are in topo
+    /// order (a node's deps are already resolved by the time we
+    /// visit it).
+    pub fn compute_wavefronts(&self) -> Vec<u32> {
+        let mut wavefronts = vec![0u32; self.nodes.len()];
+        for (i, node) in self.nodes.iter().enumerate() {
+            debug_assert_eq!(
+                node.id.0 as usize, i,
+                "tile ids must be dense + topo-ordered"
+            );
+            let w = node
+                .deps
+                .iter()
+                .map(|d| wavefronts[d.0 as usize] + 1)
+                .max()
+                .unwrap_or(0);
+            wavefronts[i] = w;
+        }
+        wavefronts
+    }
+
     /// Build a normalized tile graph for one Llama-style forward
     /// pass with the given layer count. Every operation is an
     /// explicit node; per-row tile granularity is not exposed at
@@ -383,6 +418,125 @@ impl TileGraph {
 #[cfg(test)]
 mod self_tests {
     use super::*;
+
+    /// A LLaMA body iteration spans 12 wavefronts (BSP-style):
+    ///
+    /// ```text
+    /// w: tile(s) in that wavefront
+    /// 0: hidden_states input (synthetic ResidualAdd seed here;
+    ///    Embed tile in a DSL that starts with embed)
+    /// 1: RmsNorm (attn)
+    /// 2: GemmQ, GemmK, GemmV              ← 3 tiles parallel
+    /// 3: Rope                              (rope_append)
+    /// 4: Attention
+    /// 5: GemmOProj
+    /// 6: ResidualAdd (attn)
+    /// 7: RmsNorm (mlp)
+    /// 8: GemmGate, GemmUp                  ← 2 tiles parallel
+    /// 9: Silu
+    /// 10: Mul
+    /// 11: GemmDown
+    /// 12: ResidualAdd (mlp)   ← feeds the next iteration's wavefront 1
+    /// ```
+    ///
+    /// For `build_llama_forward_1b(N)` (which uses the synthetic
+    /// seed, no embed and no post-loop), the whole graph fits in
+    /// wavefronts `0..=12*N`. This test pins that pattern.
+    #[test]
+    fn compute_wavefronts_llama_body() {
+        let n = 3;
+        let g = TileGraph::build_llama_forward_1b(n);
+        let w = g.compute_wavefronts();
+
+        // Highest wavefront = last tile of last iteration = 12 * n.
+        let max_w = *w.iter().max().unwrap();
+        assert_eq!(max_w, 12 * n as u32);
+
+        // Every iteration's final ResidualAdd (last tile of the
+        // 15-tile block) sits at wavefront 12 * iter.
+        let per_iter_tiles = 15;
+        for iter in 0..n as usize {
+            let final_add_idx = 1 + iter * per_iter_tiles + (per_iter_tiles - 1);
+            assert_eq!(
+                g.nodes[final_add_idx].kind,
+                TileKind::ResidualAdd,
+                "iter {iter} last tile should be ResidualAdd",
+            );
+            assert_eq!(
+                w[final_add_idx],
+                12 * (iter + 1) as u32,
+                "iter {iter} final ResidualAdd wavefront",
+            );
+        }
+
+        // Same-wavefront parallelism: Q, K, V at the same
+        // wavefront within an iteration (they share an RmsNorm
+        // parent and have no inter-dep).
+        let q_idx = 1 + 1; // block offset 0 = RmsNorm, 1 = GemmQ
+        let k_idx = q_idx + 1;
+        let v_idx = k_idx + 1;
+        assert_eq!(g.nodes[q_idx].kind, TileKind::GemmQ);
+        assert_eq!(g.nodes[k_idx].kind, TileKind::GemmK);
+        assert_eq!(g.nodes[v_idx].kind, TileKind::GemmV);
+        assert_eq!(w[q_idx], w[k_idx]);
+        assert_eq!(w[k_idx], w[v_idx]);
+
+        // And Gate/Up at the same wavefront within an iteration
+        // (both consume the MLP RmsNorm, independent otherwise).
+        // Block offsets within the 15-tile iteration: 0 RmsNorm,
+        // 1..=3 QKV gemms, 4 Rope, 5 Attention, 6 OProj, 7 attn
+        // ResidualAdd, 8 mlp RmsNorm, 9 GemmGate, 10 Silu,
+        // 11 GemmUp, 12 Mul, 13 GemmDown, 14 mlp ResidualAdd.
+        let gate_idx = 1 + 9;
+        let up_idx = 1 + 11;
+        assert_eq!(g.nodes[gate_idx].kind, TileKind::GemmGate);
+        assert_eq!(g.nodes[up_idx].kind, TileKind::GemmUp);
+        assert_eq!(w[gate_idx], w[up_idx]);
+    }
+
+    #[test]
+    fn compute_wavefronts_respects_deps() {
+        // Invariant: every tile's wavefront is strictly greater
+        // than the max of its deps' wavefronts. This is what
+        // makes the BSP barriers sufficient — after barrier at
+        // wavefront W, every wavefront-W+1 tile can read any
+        // upstream result without racing.
+        let g = TileGraph::build_llama_forward_1b(2);
+        let w = g.compute_wavefronts();
+        for (i, node) in g.nodes.iter().enumerate() {
+            for dep in &node.deps {
+                assert!(
+                    w[dep.0 as usize] < w[i],
+                    "tile {} (wavefront {}) has dep {:?} at wavefront {}",
+                    i,
+                    w[i],
+                    dep,
+                    w[dep.0 as usize],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compute_wavefronts_loop_free_dsl() {
+        // Loop-free DSL — just embed + lm_head. Wavefronts are
+        // 0 (Embed) and 1 (GemmLmHead).
+        let def: crate::parse::MegakernelDef = syn::parse2(
+            r#"
+                kernel t<HD=128, ID=128, HDM=32, NAH=4, NKH=1, VS=1024> {
+                    hidden_states = embed(input_ids, embed_tokens);
+                    logits = gemm(hidden_states, lm_head);
+                }
+            "#
+            .parse::<proc_macro2::TokenStream>()
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = crate::cfg::build_cfg(&def);
+        let tg = crate::fuf::build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
+        let w = tg.compute_wavefronts();
+        assert_eq!(w, vec![0, 1]);
+    }
 
     #[test]
     fn llama_forward_has_expected_node_count_per_layer() {

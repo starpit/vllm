@@ -176,6 +176,18 @@ impl WeightTable {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Test helper: find a weight id by its path segments as strings.
+    #[cfg(test)]
+    pub fn path_for_test(&self, segments: &[&str]) -> Option<WeightId> {
+        self.entries.iter().enumerate().find_map(|(i, p)| {
+            if p.len() == segments.len() && p.iter().zip(segments).all(|(id, s)| id == s) {
+                Some(WeightId(i as u32))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 fn idents_eq(a: &[Ident], b: &[Ident]) -> bool {

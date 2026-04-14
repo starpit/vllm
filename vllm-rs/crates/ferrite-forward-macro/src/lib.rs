@@ -16,6 +16,7 @@ mod classified;
 mod classify;
 mod config;
 mod parse;
+mod shape;
 
 /// Attribute macro entry point.
 ///

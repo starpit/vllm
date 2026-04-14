@@ -203,11 +203,21 @@ pub enum Stmt {
     AssignTuple { targets: Vec<LocalId>, value: Expr },
     /// `for ivar in 0..<bound> { body }`. `ivar` is a fresh LocalId
     /// scoped to the body.
+    ///
+    /// `loop_carry` enumerates the names that are bound both
+    /// *before* the loop and *inside* the body. Each entry is
+    /// `(outer, inner)` where `outer` is the LocalId of the outer
+    /// binding that body reads see initially, and `inner` is the
+    /// LocalId of the body's *last* write to that name. After each
+    /// iteration, the unroller re-binds `outer`'s tile to `inner`'s
+    /// tile so the next iteration's reads see the iteration's
+    /// previous output.
     For {
         ivar: LocalId,
         start: Bound,
         end: Bound,
         body: Vec<Stmt>,
+        loop_carry: Vec<(LocalId, LocalId)>,
     },
 }
 

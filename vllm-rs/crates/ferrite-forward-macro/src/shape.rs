@@ -155,13 +155,17 @@ impl Solver {
         }
     }
 
-    /// Final resolution: every dim in a shape must be fully
-    /// concrete (no remaining Vars) after all constraints have
-    /// been issued.
+    /// Final resolution: walk each dim through current bindings,
+    /// producing a Dim that is either fully concrete (Lit/Bound/
+    /// Mul of those) or a remaining Var. An unresolved Var
+    /// indicates the DSL has a shape the op-signature + dataflow
+    /// couldn't pin to a config.json bound; callers decide what
+    /// to do (often that's fine — the dim becomes a runtime/
+    /// model-specific value fetched from the weight layout).
     pub fn close_dim(&mut self, d: &Dim) -> Result<Dim, ShapeError> {
         let d = self.walk(d);
         match d {
-            Dim::Var(v) => Err(ShapeError::Unresolved(v)),
+            Dim::Var(v) => Ok(Dim::Var(v)),
             Dim::Mul(cs) => {
                 let cs = cs
                     .iter()
@@ -656,11 +660,35 @@ impl InferCtx {
                     })
                 }
             }
-            Stmt::For { body, .. } => {
-                // The unroller in a later phase replicates the body;
-                // shape-wise, one pass over the body sufficies
-                // because shapes don't depend on the iteration index.
-                self.infer_stmts(body)
+            Stmt::For {
+                body, loop_carry, ..
+            } => {
+                // The unroller replicates the body; shape-wise one
+                // pass suffices because shapes don't depend on the
+                // iteration index. Loop-carried locals need their
+                // outer/inner shapes unified so Phase 6 can rewire
+                // bindings across iterations consistently.
+                self.infer_stmts(body)?;
+                for (outer, inner) in loop_carry {
+                    let outer_shape = self.locals.get(outer).cloned();
+                    let inner_shape = self.locals.get(inner).cloned();
+                    if let (Some(o), Some(i)) = (outer_shape, inner_shape) {
+                        if o.len() != i.len() {
+                            return Err(ShapeError::BadArgs {
+                                op: OpKind::Add,
+                                reason: format!(
+                                    "loop-carried local rank mismatch: {} vs {}",
+                                    o.len(),
+                                    i.len()
+                                ),
+                            });
+                        }
+                        for (a, b) in o.iter().zip(&i) {
+                            self.solver.unify(a, b)?;
+                        }
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -805,11 +833,15 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_vars_error() {
+    fn unresolved_vars_preserved() {
+        // Unresolved dim variables are returned as-is; the
+        // `ShapeError::Unresolved` variant exists but callers
+        // decide when to treat a remaining Var as an error
+        // (e.g., at codegen when we need a concrete integer).
         let mut solver = Solver::new();
         let v = solver.fresh();
-        let err = solver.close_dim(&Dim::Var(v));
-        assert!(matches!(err, Err(ShapeError::Unresolved(_))));
+        let closed = solver.close_dim(&Dim::Var(v)).unwrap();
+        assert!(matches!(closed, Dim::Var(_)));
     }
 
     #[test]

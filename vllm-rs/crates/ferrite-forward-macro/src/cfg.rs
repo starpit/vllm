@@ -53,12 +53,17 @@ pub enum Terminator {
     /// proceeds to `exit`. `start`/`end` are *concrete* ints that
     /// came from this model's `ModelParams` (or from a DSL-level
     /// literal bound).
+    ///
+    /// `loop_carry` is forwarded from the classified `Stmt::For`:
+    /// after each iteration, rebind each `(outer, inner)` local so
+    /// the next iteration reads the previous iteration's output.
     LoopHeader {
         ivar: LocalId,
         start: u64,
         end: u64,
         body: BlockId,
         exit: BlockId,
+        loop_carry: Vec<(LocalId, LocalId)>,
     },
     /// Function end.
     Return,
@@ -192,6 +197,7 @@ impl<'a> CfgBuilder<'a> {
                     start,
                     end: loop_end,
                     body,
+                    loop_carry,
                 } => {
                     let start_val = self.resolve_bound(start)?;
                     let end_val = self.resolve_bound(loop_end)?;
@@ -200,10 +206,6 @@ impl<'a> CfgBuilder<'a> {
                     let after = self.alloc_block();
                     // Current block jumps to the header.
                     self.finalize_block(current, Terminator::Jump(header));
-                    // Header's terminator is the LoopHeader itself.
-                    // Instrs accumulated in `header` stay empty; we
-                    // use the open-buffer machinery only for
-                    // flexibility.
                     self.finalize_block(
                         header,
                         Terminator::LoopHeader {
@@ -212,6 +214,7 @@ impl<'a> CfgBuilder<'a> {
                             end: end_val,
                             body: body_block,
                             exit: after,
+                            loop_carry: loop_carry.clone(),
                         },
                     );
                     // Body: recurse. Its last block jumps back to

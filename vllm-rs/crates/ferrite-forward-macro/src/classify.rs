@@ -69,15 +69,40 @@ impl Ctx {
             } => {
                 let start = self.classify_bound(start);
                 let end = self.classify_bound(end);
+                // Snapshot the pre-loop top of stack for every
+                // name currently in scope. After classifying the
+                // body we diff against this snapshot: any name
+                // whose top-of-stack changed was shadowed by a
+                // body write, and needs a loop-carry entry.
+                let pre: HashMap<String, LocalId> = self
+                    .scope
+                    .iter()
+                    .filter_map(|(name, stack)| stack.last().map(|id| (name.clone(), *id)))
+                    .collect();
                 // Push the loop var as a fresh local scoped to the body.
                 let iv_id = self.push_scope(ivar.clone());
                 let body = self.classify_stmts(body)?;
                 self.pop_scope(&ivar.to_string());
+
+                // Compute loop-carry pairs.
+                let mut loop_carry = Vec::new();
+                for (name, outer_id) in &pre {
+                    if let Some(stack) = self.scope.get(name)
+                        && let Some(top) = stack.last()
+                        && *top != *outer_id
+                    {
+                        loop_carry.push((*outer_id, *top));
+                    }
+                }
+                // Stable ordering for determinism.
+                loop_carry.sort_by_key(|(o, _)| o.0);
+
                 Ok(Stmt::For {
                     ivar: iv_id,
                     start,
                     end,
                     body,
+                    loop_carry,
                 })
             }
         }

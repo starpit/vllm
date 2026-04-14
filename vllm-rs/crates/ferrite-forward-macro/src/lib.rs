@@ -16,6 +16,7 @@ mod cfg;
 mod classified;
 mod classify;
 mod config;
+mod fuf;
 mod parse;
 mod shape;
 

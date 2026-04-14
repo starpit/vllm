@@ -14,6 +14,7 @@ use syn::{ItemFn, parse_macro_input};
 mod ast;
 mod classified;
 mod classify;
+mod config;
 mod parse;
 
 /// Attribute macro entry point.

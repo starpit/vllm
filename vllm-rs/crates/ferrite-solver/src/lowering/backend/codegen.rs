@@ -9,7 +9,6 @@ use quote::{format_ident, quote};
 
 use super::compile_dsl::{ForwardDef, TargetId, WorkloadRange};
 use super::dispatch::{DispatchEntry, DispatchSequence, GemmPhase, ImplDispatchKind};
-use crate::dag::BufferId;
 use crate::lowering::BacktrackCpSolver;
 use crate::lowering::library::ImplementationLibrary;
 use crate::lowering::solver::PlanFamily;
@@ -1617,23 +1616,6 @@ pub struct FieldSpec {
     pub ty: &'static str,
 }
 
-/// Walk the DAG and extract weight buffer references, grouped into
-/// per-layer (Layer struct) and global (Model struct) fields.
-/// The Rust type is inferred from which op consumes the weight.
-/// Test-only public wrapper so fuf.rs can compare its
-/// CFG-driven extractor against the legacy DAG-based one.
-/// Will be deleted alongside the legacy path in phase 3b.
-#[cfg(test)]
-pub(crate) fn extract_weight_fields_legacy_for_test(
-    dag: &crate::dag::ModelDag,
-    qkv_fused: bool,
-    qkv_unfused: bool,
-    gate_up_fused: bool,
-    gate_up_unfused: bool,
-) -> (Vec<FieldSpec>, Vec<FieldSpec>) {
-    extract_weight_fields(dag, qkv_fused, qkv_unfused, gate_up_fused, gate_up_unfused)
-}
-
 /// Apply solver fusion decisions to a raw per-layer field list.
 ///
 /// When both fused and unfused variants are needed (different
@@ -1673,89 +1655,6 @@ pub(crate) fn apply_weight_field_fusion(
         });
     }
     per_layer.sort_by(|a, b| a.name.cmp(&b.name));
-}
-
-fn extract_weight_fields(
-    dag: &crate::dag::ModelDag,
-    qkv_fused: bool,
-    qkv_unfused: bool,
-    gate_up_fused: bool,
-    gate_up_unfused: bool,
-) -> (Vec<FieldSpec>, Vec<FieldSpec>) {
-    use crate::dag::{BufferKind, OpKind};
-    use std::collections::BTreeMap;
-
-    // Map buffer id → consuming op kind (first consumer).
-    let mut weight_op: BTreeMap<&BufferId, &OpKind> = BTreeMap::new();
-    for op in &dag.ops {
-        for input_id in op.inputs() {
-            if let Some(buf) = dag.buffers.get(input_id)
-                && buf.kind == BufferKind::Weight
-                && !weight_op.contains_key(input_id)
-            {
-                weight_op.insert(input_id, &op.kind);
-            }
-        }
-    }
-
-    let mut per_layer = Vec::new();
-    let mut global = Vec::new();
-
-    for (buf_id, op_kind) in &weight_op {
-        let buf = &dag.buffers[*buf_id];
-        // Bias weight buffers (e.g. `self_attn.q_proj.bias`) are loaded
-        // as part of the parent LinearLayer — they don't need a separate
-        // struct field.
-        if buf_id.0.ends_with(".bias") {
-            continue;
-        }
-        let ty = match op_kind {
-            OpKind::Embed { weights, .. } if weights == *buf_id => "Embedding",
-            OpKind::RmsNorm { weights, .. } if weights == *buf_id => "RmsNorm",
-            OpKind::Gemm { b, .. } | OpKind::GemmAdd { b, .. } if b == *buf_id => "LinearLayer",
-            OpKind::RopeAppend { rotary, .. } if rotary == *buf_id => "RotaryCache",
-            _ => continue,
-        };
-
-        let spec = FieldSpec {
-            name: buf_id.0.clone(),
-            ty,
-        };
-        if buf.per_layer {
-            per_layer.push(spec);
-        } else {
-            global.push(spec);
-        }
-    }
-
-    // Apply solver fusion decisions to the per-layer fields.
-    // When both fused and unfused are needed, carry both — different
-    // buckets reference different fields.
-    if qkv_fused && !qkv_unfused {
-        // All buckets use fused QKV — remove individual q/k/v fields.
-        per_layer.retain(|f| {
-            !f.name.contains("q_proj") && !f.name.contains("k_proj") && !f.name.contains("v_proj")
-        });
-    }
-    if qkv_fused {
-        per_layer.push(FieldSpec {
-            name: "self_attn.qkv_proj".to_string(),
-            ty: "LinearLayer",
-        });
-    }
-    if gate_up_fused && !gate_up_unfused {
-        // All buckets use fused gate+up — remove individual fields.
-        per_layer.retain(|f| !f.name.contains("gate_proj") && !f.name.contains("up_proj"));
-    }
-    if gate_up_fused {
-        per_layer.push(FieldSpec {
-            name: "mlp.gate_up_proj".to_string(),
-            ty: "LinearLayer",
-        });
-    }
-    per_layer.sort_by(|a, b| a.name.cmp(&b.name));
-
-    (per_layer, global)
 }
 
 /// Emit the `Layer`, `RuntimeDims`, and `Model` struct definitions

@@ -557,59 +557,11 @@ fn classify_gemm(weight_name: &str) -> TileKind {
 mod tests {
     use super::*;
     use crate::cfg::build_cfg;
-    use crate::parse::{MegakernelDef, build_dag};
+    use crate::parse::MegakernelDef;
 
     fn parse_dsl(src: &str) -> MegakernelDef {
         let tokens: proc_macro2::TokenStream = src.parse().unwrap();
         syn::parse2(tokens).unwrap()
-    }
-
-    /// Structural equivalence: same count, same `(kind, layer,
-    /// weight_name)` per tile, same `num_layers`. Deliberately
-    /// does **not** compare `deps` because the legacy pipeline has
-    /// two latent bugs the new one fixes, both of which produce
-    /// cleaner dep graphs than the legacy:
-    ///
-    ///   1. Legacy `parse::build_dag` trims rope_append's group
-    ///      BufferId too aggressively (`"__rope___rope_1"
-    ///      .trim_start_matches("__rope_") == "1"`), so
-    ///      `let (q, k, v) = rope_append(...)` silently fails to
-    ///      rebind q/k/v, and downstream attention dep-reads the
-    ///      pre-rope GemmQ instead of the Rope tile. We emit the
-    ///      same tile topology but preserve the quirk (see
-    ///      `lower_rope_append`) so any solver plan that hinges on
-    ///      it continues to apply.
-    ///   2. Legacy `build_dag` captures buffer IDs at parse time
-    ///      before the layer loop runs, so every iteration's first
-    ///      `rmsnorm(hidden_states, ...)` dep-reads the pre-loop
-    ///      embed output rather than the previous layer's residual
-    ///      add. The new pipeline produces the correct cross-layer
-    ///      edge.
-    ///
-    /// Both (1) and (2) are dep-only divergences — kinds, layers,
-    /// and weight names match exactly, so the solver and codegen
-    /// still get the same shape of graph. Dep correctness is an
-    /// unambiguous improvement.
-    fn assert_tilegraphs_structurally_equivalent(got: &TileGraph, want: &TileGraph) {
-        assert_eq!(
-            got.nodes.len(),
-            want.nodes.len(),
-            "node count differs: got {}, want {}\ngot kinds:  {:?}\nwant kinds: {:?}",
-            got.nodes.len(),
-            want.nodes.len(),
-            got.nodes.iter().map(|n| n.kind).collect::<Vec<_>>(),
-            want.nodes.iter().map(|n| n.kind).collect::<Vec<_>>(),
-        );
-        assert_eq!(got.num_layers, want.num_layers);
-        for (i, (g, w)) in got.nodes.iter().zip(&want.nodes).enumerate() {
-            assert_eq!(g.kind, w.kind, "tile {i} kind");
-            assert_eq!(g.layer, w.layer, "tile {i} ({:?}) layer", g.kind);
-            assert_eq!(
-                g.weight_name, w.weight_name,
-                "tile {i} ({:?}) weight_name",
-                g.kind
-            );
-        }
     }
 
     const LLAMA_DSL: &str = r#"
@@ -636,18 +588,93 @@ mod tests {
         }
     "#;
 
+    /// Golden: the CFG-driven FUF on the canonical LLaMA DSL
+    /// produces exactly the kind-and-layer sequence downstream
+    /// solver/codegen expect — 1 pre-loop Embed + 17 tiles per
+    /// layer (matching the legacy per-layer tile layout, preserved
+    /// for phase-1 compatibility) + 2 post-loop tiles (final RMS
+    /// norm + lm_head).
     #[test]
-    fn build_fuf_matches_legacy_llama() {
+    fn build_fuf_golden_llama_shape() {
         let def = parse_dsl(LLAMA_DSL);
         let cfg = build_cfg(&def);
-        let dims = ModelDims::LLAMA_3_2_1B;
+        let tg = build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).expect("build_fuf");
 
-        let got = build_fuf(&cfg, dims).expect("fuf::build_fuf");
+        // 1 embed + 17 per layer * 2 layers + 2 post-loop = 37.
+        assert_eq!(tg.nodes.len(), 37, "tile count on 2-layer LLaMA");
+        assert_eq!(tg.num_layers, 2);
 
-        let legacy_dag = build_dag(&def).expect("build_dag");
-        let want = TileGraph::build_fuf(&legacy_dag, dims);
+        // Per-layer tile pattern (kind, layer) — tiles 1..=17 for
+        // layer 0, tiles 18..=34 for layer 1.
+        let expected_per_layer = [
+            TileKind::RmsNorm, // attn_norm
+            TileKind::GemmQ,
+            TileKind::GemmK,
+            TileKind::GemmV,
+            TileKind::QkvSplit,     // phantom (phase 4 removes)
+            TileKind::Rope,         // phantom
+            TileKind::KvCacheWrite, // phantom
+            TileKind::Attention,
+            TileKind::GemmOProj,
+            TileKind::ResidualAdd, // attn residual
+            TileKind::RmsNorm,     // mlp_norm
+            TileKind::GemmGate,
+            TileKind::GemmUp,
+            TileKind::GateUpConcat, // phantom (phase 4 removes)
+            TileKind::SiluMul,      // phantom
+            TileKind::GemmDown,
+            TileKind::ResidualAdd, // mlp residual
+        ];
+        assert_eq!(tg.nodes[0].kind, TileKind::Embed);
+        for layer in 0..2u16 {
+            let offset = 1 + (layer as usize) * expected_per_layer.len();
+            for (i, kind) in expected_per_layer.iter().enumerate() {
+                let n = &tg.nodes[offset + i];
+                assert_eq!(n.kind, *kind, "tile {} kind (layer {layer})", offset + i);
+                assert_eq!(
+                    n.layer,
+                    layer,
+                    "tile {} layer (expected {layer})",
+                    offset + i
+                );
+            }
+        }
 
-        assert_tilegraphs_structurally_equivalent(&got, &want);
+        // Post-loop: final RMS norm at layer == num_layers, then
+        // GemmLmHead.
+        let post0 = &tg.nodes[35];
+        let post1 = &tg.nodes[36];
+        assert_eq!(post0.kind, TileKind::RmsNorm);
+        assert_eq!(post0.layer, 2);
+        assert_eq!(post0.weight_name.as_deref(), Some("norm"));
+        assert_eq!(post1.kind, TileKind::GemmLmHead);
+        assert_eq!(post1.layer, 2);
+        assert_eq!(post1.weight_name.as_deref(), Some("lm_head"));
+    }
+
+    /// Loop-carried `hidden_states` should thread through every
+    /// layer's residual adds — a property the legacy DAG pipeline
+    /// broke (see commit log for `refactor(fuf): produce TileGraph
+    /// directly`).
+    #[test]
+    fn build_fuf_cross_layer_residual_dep() {
+        let def = parse_dsl(LLAMA_DSL);
+        let cfg = build_cfg(&def);
+        let tg = build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
+
+        // Layer 0's mlp residual add is at index 1 + 16 = 17.
+        // Layer 1's attn rmsnorm is at index 18.
+        let layer0_mlp_add = &tg.nodes[17];
+        let layer1_attn_norm = &tg.nodes[18];
+        assert_eq!(layer0_mlp_add.kind, TileKind::ResidualAdd);
+        assert_eq!(layer1_attn_norm.kind, TileKind::RmsNorm);
+        assert!(
+            layer1_attn_norm.deps.contains(&layer0_mlp_add.id),
+            "layer 1's attn norm should depend on layer 0's final \
+             residual add ({:?}); got deps {:?}",
+            layer0_mlp_add.id,
+            layer1_attn_norm.deps,
+        );
     }
 
     #[test]
@@ -720,28 +747,44 @@ mod tests {
         assert_eq!(ty_of(&global, "norm"), "RmsNorm");
     }
 
+    /// Golden: the full-LLaMA DSL produces *exactly* the expected
+    /// sorted per-layer and global field lists, by name and type.
+    /// Regression guard for any drift in the extractor.
     #[test]
-    fn extract_weight_fields_matches_legacy_llama() {
-        // Raw (pre-fusion-transform) extraction should match the
-        // legacy path. We pass `false` for all fusion flags to get
-        // the pure extraction from the legacy function.
+    fn extract_weight_fields_golden_llama() {
         let def = parse_dsl(LLAMA_DSL);
         let cfg = build_cfg(&def);
-        let dag = build_dag(&def).unwrap();
 
-        let (got_pl, got_g) = extract_weight_fields(&cfg).expect("fuf extract");
-        let (want_pl, want_g) =
-            crate::lowering::backend::codegen::extract_weight_fields_legacy_for_test(
-                &dag, false, false, false, false,
-            );
+        let (per_layer, global) = extract_weight_fields(&cfg).expect("extract");
 
-        let pl_pair: Vec<_> = got_pl.iter().map(|f| (f.name.clone(), f.ty)).collect();
-        let want_pl_pair: Vec<_> = want_pl.iter().map(|f| (f.name.clone(), f.ty)).collect();
-        assert_eq!(pl_pair, want_pl_pair, "per_layer fields differ");
+        let pl: Vec<(String, &'static str)> =
+            per_layer.iter().map(|f| (f.name.clone(), f.ty)).collect();
+        assert_eq!(
+            pl,
+            vec![
+                ("input_layernorm".to_string(), "RmsNorm"),
+                ("mlp.down_proj".to_string(), "LinearLayer"),
+                ("mlp.gate_proj".to_string(), "LinearLayer"),
+                ("mlp.up_proj".to_string(), "LinearLayer"),
+                ("post_attention_layernorm".to_string(), "RmsNorm"),
+                ("self_attn.k_proj".to_string(), "LinearLayer"),
+                ("self_attn.o_proj".to_string(), "LinearLayer"),
+                ("self_attn.q_proj".to_string(), "LinearLayer"),
+                ("self_attn.v_proj".to_string(), "LinearLayer"),
+            ],
+        );
 
-        let g_pair: Vec<_> = got_g.iter().map(|f| (f.name.clone(), f.ty)).collect();
-        let want_g_pair: Vec<_> = want_g.iter().map(|f| (f.name.clone(), f.ty)).collect();
-        assert_eq!(g_pair, want_g_pair, "global fields differ");
+        let g: Vec<(String, &'static str)> =
+            global.iter().map(|f| (f.name.clone(), f.ty)).collect();
+        assert_eq!(
+            g,
+            vec![
+                ("embed_tokens".to_string(), "Embedding"),
+                ("lm_head".to_string(), "LinearLayer"),
+                ("norm".to_string(), "RmsNorm"),
+                ("rotary".to_string(), "RotaryCache"),
+            ],
+        );
     }
 
     #[test]

@@ -318,92 +318,60 @@ impl TileGraph {
     /// `hidden_states` flows through the residual_adds; each layer
     /// reads it from the previous layer's final residual_add (or the
     /// input embedding for layer 0).
-    /// Build with default LLaMA 1B dimensions (for tests).
+    /// Build with default LLaMA 1B dimensions. Test-only convenience.
+    ///
+    /// Routes through the canonical CFG → FUF pipeline, so tests
+    /// using this helper exercise the same code path as the real
+    /// `forward!()` macro. Produces a LLaMA tile graph with a
+    /// synthetic-input `ResidualAdd` seed (no `embed`) plus
+    /// `num_layers` × 17 loop-body tiles (no post-loop).
+    #[cfg(test)]
     pub fn build_llama_forward_1b(num_layers: u16) -> Self {
         Self::build_llama_forward(num_layers, ModelDims::LLAMA_3_2_1B)
     }
 
+    /// Test-only helper — builds a LLaMA tile graph by parsing a
+    /// canonical DSL and running it through `fuf::build_fuf`.
+    ///
+    /// This replaces the legacy hardcoded builder; the DSL body is
+    /// identical to the real LLaMA DSL minus `embed` and the
+    /// post-loop (final norm + lm_head) so the synthetic-input
+    /// `ResidualAdd` seed + 17 × num_layers loop-body tiles shape
+    /// matches what the hardcoded builder used to emit.
+    #[cfg(test)]
     pub fn build_llama_forward(num_layers: u16, dims: ModelDims) -> Self {
-        let mut nodes: Vec<TileNode> = Vec::with_capacity(num_layers as usize * 14);
-        let mut hidden_state_tile = TileId(u32::MAX); // sentinel; replaced after layer 0's residual
+        let src = format!(
+            r#"
+            kernel llama<NL={num_layers}, HD={hd}, ID={id}, HDM={hdm}, NAH={nah}, NKH={nkh}, VS={vs}> {{
+                for layer in 0..NL {{
+                    let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                    let q = gemm(normed, self_attn.q_proj[layer]);
+                    let k = gemm(normed, self_attn.k_proj[layer]);
+                    let v = gemm(normed, self_attn.v_proj[layer]);
+                    let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                    let attn = attention(q, k, v, kv_cache[layer], block_table);
+                    let oproj = gemm(attn, self_attn.o_proj[layer]);
+                    hidden_states = add(oproj, hidden_states);
 
-        // Push helper that auto-assigns a dense TileId.
-        let push = |nodes: &mut Vec<TileNode>, kind: TileKind, layer: u16, deps: Vec<TileId>| {
-            let id = TileId(nodes.len() as u32);
-            nodes.push(TileNode {
-                id,
-                kind,
-                layer,
-                deps,
-                weight_name: None,
-            });
-            id
-        };
-
-        for layer in 0..num_layers {
-            // hidden_states for this layer = previous layer's final
-            // residual_add output, or a sentinel "model input" tile
-            // for layer 0. We model the model input as a virtual
-            // ResidualAdd-shaped tile so the dataflow is uniform —
-            // this isn't a real op, just a name for the input.
-            let hidden_in = if layer == 0 {
-                // Synthesize an input node so layer 0's first op
-                // has a real predecessor.
-                push(&mut nodes, TileKind::ResidualAdd, layer, Vec::new())
-            } else {
-                hidden_state_tile
-            };
-
-            // ── Attention block ──
-            let attn_norm = push(&mut nodes, TileKind::RmsNorm, layer, vec![hidden_in]);
-            // Separate Q, K, V GEMMs (solver may elect to fuse).
-            let q_gemm = push(&mut nodes, TileKind::GemmQ, layer, vec![attn_norm]);
-            let k_gemm = push(&mut nodes, TileKind::GemmK, layer, vec![attn_norm]);
-            let v_gemm = push(&mut nodes, TileKind::GemmV, layer, vec![attn_norm]);
-            let qkv_split = push(
-                &mut nodes,
-                TileKind::QkvSplit,
-                layer,
-                vec![q_gemm, k_gemm, v_gemm],
-            );
-            let rope = push(&mut nodes, TileKind::Rope, layer, vec![qkv_split]);
-            let kv_write = push(&mut nodes, TileKind::KvCacheWrite, layer, vec![rope]);
-            let attention = push(&mut nodes, TileKind::Attention, layer, vec![rope, kv_write]);
-            let o_proj = push(&mut nodes, TileKind::GemmOProj, layer, vec![attention]);
-            let attn_residual = push(
-                &mut nodes,
-                TileKind::ResidualAdd,
-                layer,
-                vec![hidden_in, o_proj],
-            );
-
-            // ── MLP block ──
-            let mlp_norm = push(&mut nodes, TileKind::RmsNorm, layer, vec![attn_residual]);
-            let gate_gemm = push(&mut nodes, TileKind::GemmGate, layer, vec![mlp_norm]);
-            let up_gemm = push(&mut nodes, TileKind::GemmUp, layer, vec![mlp_norm]);
-            let gate_up_concat = push(
-                &mut nodes,
-                TileKind::GateUpConcat,
-                layer,
-                vec![gate_gemm, up_gemm],
-            );
-            let silu_mul = push(&mut nodes, TileKind::SiluMul, layer, vec![gate_up_concat]);
-            let down_gemm = push(&mut nodes, TileKind::GemmDown, layer, vec![silu_mul]);
-            let mlp_residual = push(
-                &mut nodes,
-                TileKind::ResidualAdd,
-                layer,
-                vec![attn_residual, down_gemm],
-            );
-
-            hidden_state_tile = mlp_residual;
-        }
-
-        TileGraph {
-            nodes,
-            num_layers,
-            dims,
-        }
+                    let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                    let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                    let up = gemm(normed2, mlp.up_proj[layer]);
+                    let down = gemm(gate * up, mlp.down_proj[layer]);
+                    hidden_states = add(down, hidden_states);
+                }}
+            }}
+            "#,
+            hd = dims.hidden_size,
+            id = dims.intermediate_size,
+            hdm = dims.head_dim,
+            nah = dims.num_attention_heads,
+            nkh = dims.num_kv_heads,
+            vs = dims.vocab_size,
+        );
+        let tokens: proc_macro2::TokenStream = src.parse().expect("hardcoded DSL tokenizes");
+        let def: crate::parse::MegakernelDef = syn::parse2(tokens).expect("hardcoded DSL parses");
+        let cfg = crate::cfg::build_cfg(&def);
+        crate::fuf::build_fuf(&cfg, dims).expect("hardcoded DSL builds FUF")
     }
 
     /// Build a TileGraph from a parsed ModelDag.

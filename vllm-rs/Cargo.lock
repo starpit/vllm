@@ -2033,6 +2033,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-forward"
+version = "0.1.0"
+dependencies = [
+ "ferrite-forward-macro",
+]
+
+[[package]]
+name = "ferrite-forward-macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "trybuild",
+]
+
+[[package]]
 name = "ferrite-kernels"
 version = "0.1.0"
 dependencies = [

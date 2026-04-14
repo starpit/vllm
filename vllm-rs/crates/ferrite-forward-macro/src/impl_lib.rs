@@ -76,34 +76,6 @@ pub enum TargetFilter {
     Any,
 }
 
-/// Memory layout a kernel Impl requires for one of its weight args.
-///
-/// Declared as metadata on each [`Implementation`] (parallel to its
-/// op's weight-arg positions). After the solver picks an Impl for
-/// each tile group, a post-solver pass reads the chosen Impls'
-/// layouts to decide, per weight instance, what final layout to
-/// materialize at load time. The layout drives
-/// [`WeightModel::organize`](crate::codegen_weight_model)
-/// emission. The compiler itself never interprets the layout
-/// beyond what each variant's semantics say — no transformer-
-/// domain knowledge lives here.
-///
-/// Variant set is open-ended; extend when a real Impl needs a new
-/// layout. Start minimal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Layout {
-    /// The weight tensor is consumed as-is. `organize` loads it
-    /// directly from safetensors with no memory transform.
-    Plain,
-    /// `count` sibling weights are concatenated along `axis` at
-    /// load time. All participating weights must share every dim
-    /// except `axis`. `organize` allocates one combined tensor and
-    /// copies siblings into adjacent slices. Example use: a fused
-    /// QKV gemm Impl that claims 3 adjacent tiles wants
-    /// `Stacked { axis: 0, count: 3 }` over q_proj/k_proj/v_proj.
-    Stacked { axis: usize, count: usize },
-}
-
 impl TargetFilter {
     pub fn matches(&self, _target: &TargetProfile) -> bool {
         match self {
@@ -150,20 +122,6 @@ pub struct Implementation {
     /// returns `Some({claimed_tiles: [seed]})` iff `fuf[seed].op ==
     /// self.op`. Impls that claim multiple tiles set this.
     pub matches_fn: Option<fn(seed: TileId, fuf: &Fuf) -> Option<MatchInfo>>,
-    /// Layout required for each of this Impl's weight args, in
-    /// their op-signature-declared order. Length must equal the
-    /// number of weight args the op has. Drives [`WeightModel`]
-    /// emission: the compiler reads this off the chosen Impls and
-    /// materializes each weight instance in the requested layout.
-    ///
-    /// For single-tile Impls whose op takes one weight (gemm,
-    /// rmsnorm, embed), this is `&[Layout::Plain]`. For a fused
-    /// multi-tile Impl (e.g. fused QKV gemm that claims 3 tiles),
-    /// this is `&[Layout::Stacked { axis: 0, count: 3 }]`.
-    ///
-    /// Impls whose op has no weight args (add, mul, silu,
-    /// attention, rope_append) set this to `&[]`.
-    pub weight_layouts: &'static [Layout],
 }
 
 impl Implementation {
@@ -263,54 +221,24 @@ impl ImplementationLibrary {
 /// cost estimates derived from analytical FLOPs / bandwidth. Every
 /// impl accepts any workload and any target; differentiation comes
 /// when real target-specific / workload-specific kernels land.
-///
-/// Weight layouts: every op that takes a weight arg (embed,
-/// rmsnorm, gemm) uses `Layout::Plain` here — the starter impls
-/// are single-tile matchers consuming the weight as-is. Fused
-/// multi-tile variants land later with non-Plain layouts.
 pub fn starter_library() -> ImplementationLibrary {
-    const PLAIN: &[Layout] = &[Layout::Plain];
-    const NO_WEIGHTS: &[Layout] = &[];
-
     let mut lib = ImplementationLibrary::new();
-    lib.push(host_impl("embed_ref", OpKind::Embed, cost_embed, PLAIN));
-    lib.push(host_impl(
-        "rmsnorm_ref",
-        OpKind::RmsNorm,
-        cost_elementwise,
-        PLAIN,
-    ));
-    lib.push(host_impl("gemm_ref", OpKind::Gemm, cost_gemm, PLAIN));
+    lib.push(host_impl("embed_ref", OpKind::Embed, cost_embed));
+    lib.push(host_impl("rmsnorm_ref", OpKind::RmsNorm, cost_elementwise));
+    lib.push(host_impl("gemm_ref", OpKind::Gemm, cost_gemm));
     lib.push(host_impl(
         "rope_append_ref",
         OpKind::RopeAppend,
         cost_elementwise,
-        NO_WEIGHTS,
     ));
     lib.push(host_impl(
         "attention_ref",
         OpKind::Attention,
         cost_attention,
-        NO_WEIGHTS,
     ));
-    lib.push(host_impl(
-        "silu_ref",
-        OpKind::Silu,
-        cost_elementwise,
-        NO_WEIGHTS,
-    ));
-    lib.push(host_impl(
-        "add_ref",
-        OpKind::Add,
-        cost_elementwise,
-        NO_WEIGHTS,
-    ));
-    lib.push(host_impl(
-        "mul_ref",
-        OpKind::Mul,
-        cost_elementwise,
-        NO_WEIGHTS,
-    ));
+    lib.push(host_impl("silu_ref", OpKind::Silu, cost_elementwise));
+    lib.push(host_impl("add_ref", OpKind::Add, cost_elementwise));
+    lib.push(host_impl("mul_ref", OpKind::Mul, cost_elementwise));
     lib
 }
 
@@ -318,7 +246,6 @@ fn host_impl(
     name: &'static str,
     op: OpKind,
     cost_fn: fn(&CostCtx) -> Option<f64>,
-    weight_layouts: &'static [Layout],
 ) -> Implementation {
     Implementation {
         name,
@@ -328,7 +255,6 @@ fn host_impl(
         target_filter: TargetFilter::Any,
         cost_fn,
         matches_fn: None,
-        weight_layouts,
     }
 }
 
@@ -425,61 +351,6 @@ mod tests {
             assert_eq!(matches.len(), 1, "expected 1 candidate for {op:?}");
             assert_eq!(matches[0].1.launch_kind, LaunchKind::HostCallable);
             assert_eq!(matches[0].1.workload_constraint, WorkloadConstraint::Any);
-        }
-    }
-
-    #[test]
-    fn starter_library_weight_layouts_match_op_weight_counts() {
-        // Ops with a single weight arg declare Plain; ops with no
-        // weight args declare an empty layout slice. Anything else
-        // indicates a silent hardcoding we'd want to catch.
-        let lib = starter_library();
-        for (_, imp) in lib.iter_enumerated() {
-            let expected = match imp.op {
-                // One-weight ops.
-                OpKind::Embed | OpKind::RmsNorm | OpKind::Gemm => 1,
-                // Zero-weight ops.
-                OpKind::RopeAppend
-                | OpKind::Attention
-                | OpKind::Silu
-                | OpKind::Add
-                | OpKind::Mul => 0,
-            };
-            assert_eq!(
-                imp.weight_layouts.len(),
-                expected,
-                "impl {} (op {:?}) has {} weight_layouts, expected {}",
-                imp.name,
-                imp.op,
-                imp.weight_layouts.len(),
-                expected,
-            );
-            // Starter impls are all single-tile Plain — no fused
-            // variants live here.
-            for layout in imp.weight_layouts {
-                assert_eq!(
-                    *layout,
-                    Layout::Plain,
-                    "impl {} has non-Plain starter layout {:?}",
-                    imp.name,
-                    layout,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn layout_plain_is_plain_and_stacked_is_stacked() {
-        // Basic sanity on the variants — guards against renames.
-        let p = Layout::Plain;
-        let s = Layout::Stacked { axis: 0, count: 3 };
-        assert_ne!(p, s);
-        match s {
-            Layout::Stacked { axis, count } => {
-                assert_eq!(axis, 0);
-                assert_eq!(count, 3);
-            }
-            _ => panic!("Stacked pattern didn't match"),
         }
     }
 

@@ -461,7 +461,11 @@ mod tests {
     #[test]
     fn fuf_contains_no_strings() {
         // Structural invariant: FufNode carries no String
-        // anywhere. Check each input/output via pattern.
+        // anywhere. Check each input/output via pattern. Body is
+        // a minimal attention flow (q_proj must be followed by
+        // o_proj so the hidden_states = add(...) shape contract
+        // holds — conventions now pin q_proj's output to heads-
+        // layout, which isn't hidden_size directly).
         let params = llama_3_2_1b_params();
         let fuf = unroll_src(
             r#"
@@ -469,7 +473,8 @@ mod tests {
             for layer in 0..2 {
                 normed = rmsnorm(hidden_states, input_layernorm[layer]);
                 q = gemm(normed, self_attn.q_proj[layer]);
-                hidden_states = add(q, hidden_states);
+                oproj = gemm(q, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
             }
             "#,
             &params,

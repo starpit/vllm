@@ -22,6 +22,7 @@ mod parse;
 mod shape;
 mod solver;
 mod target;
+mod weight_conventions;
 
 /// Attribute macro entry point.
 ///

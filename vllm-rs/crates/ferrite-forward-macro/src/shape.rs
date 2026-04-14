@@ -556,8 +556,32 @@ pub fn infer(program: &Program) -> Result<Inferred, ShapeError> {
     let mut cx = InferCtx::new();
     cx.infer_stmts(&program.statements)?;
 
-    // Close every recorded shape: all dim vars must resolve to
-    // concrete expressions.
+    // Anchor remaining weight Vars via the standard HF transformer
+    // weight-name convention table. Dataflow handles attention-block
+    // weights (q/k/v/o_proj get pinned by rope_append + add(oproj,
+    // hidden_states)); the convention table handles MLP weights and
+    // other norms whose dims aren't pinned by any op signature.
+    for (wid, shape) in cx.weights.clone().iter() {
+        let path: Vec<String> = program
+            .weights
+            .path(*wid)
+            .iter()
+            .map(|i| i.to_string())
+            .collect();
+        if let Some(convention) = crate::weight_conventions::standard_shape(&path)
+            && shape.len() == convention.len()
+        {
+            for (inferred, declared) in shape.iter().zip(&convention) {
+                cx.solver.unify(inferred, declared)?;
+            }
+        }
+    }
+
+    // Close every recorded shape. After convention anchoring, most
+    // Vars resolve to concrete dim expressions. Any remaining Vars
+    // correspond to weights not covered by the convention (arch-
+    // specific, pending `weights.json` in a future phase); Dim::Var
+    // is preserved rather than erroring.
     let mut locals = HashMap::new();
     for (id, shape) in cx.locals {
         locals.insert(id, cx.solver.close_shape(&shape)?);
@@ -934,5 +958,36 @@ mod tests {
             .expect("input_layernorm present");
         let ln_shape = inf.weights.get(&ln_id).unwrap();
         assert_eq!(ln_shape, &vec![bound("hidden_size")]);
+    }
+
+    #[test]
+    fn mlp_weights_resolve_via_convention() {
+        // MLP dims (intermediate_size) aren't pinned by any op
+        // signature — they get anchored by the convention table.
+        let p = classify_src(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                normed = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                gate = silu(gemm(normed, mlp.gate_proj[layer]));
+                up = gemm(normed, mlp.up_proj[layer]);
+                down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
+            }
+            "#,
+        );
+        let inf = infer(&p).expect("infer");
+
+        let gate_id = p.weights.path_for_test(&["mlp", "gate_proj"]).unwrap();
+        assert_eq!(
+            inf.weights.get(&gate_id).unwrap(),
+            &vec![bound("hidden_size"), bound("intermediate_size")],
+        );
+
+        let down_id = p.weights.path_for_test(&["mlp", "down_proj"]).unwrap();
+        assert_eq!(
+            inf.weights.get(&down_id).unwrap(),
+            &vec![bound("intermediate_size"), bound("hidden_size")],
+        );
     }
 }

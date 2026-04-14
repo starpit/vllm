@@ -76,70 +76,6 @@ pub enum TargetFilter {
     Any,
 }
 
-/// How a subgraph is invoked. Affects what it can share a schedule
-/// slot with and what handoffs it supports. Ported from old
-/// ferrite-solver — the mechanism set is GPU-structural, no
-/// transformer vocabulary. Variants cover every synchronization
-/// primitive the real library uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Handoff {
-    /// Implicit same-stream ordering between two host launches. Free.
-    StreamOrder,
-    /// cudaEvent recorded after producer, waited on before consumer.
-    /// Used across streams.
-    StreamEvent,
-    /// Kernel boundary: next `cudaLaunchKernel` waits on the previous
-    /// to complete.
-    KernelBoundary,
-    /// `cooperative_groups::this_grid().sync()` or gmem-flag spin
-    /// barrier inside a cooperative launch.
-    InKernelGridSync,
-    /// sm_90+ shmem `mbarrier` between warpgroups in one persistent
-    /// kernel.
-    Mbarrier,
-    /// sm_90+ distributed shmem read across thread-block clusters.
-    DsmemRead,
-    /// gmem flag spin (per-tile counter). Cheaper than grid sync
-    /// because it can synchronize only the tiles that need it.
-    GmemFlag,
-    /// Intra-CTA `__syncthreads()` between DeviceCallable impls in
-    /// the same persistent kernel.
-    SyncThreads,
-    /// No handoff: producer and consumer are in the same subgraph;
-    /// the impl handles the dep internally.
-    Internal,
-}
-
-/// Per-CTA resource demand an Impl imposes on its compilation unit.
-/// Two impls sharing one unit (one `__global__` on sm_89, one
-/// warpgroup on sm_90+) union their demands via [`Self::union_max`];
-/// the union must fit the target's budget (a constraint the
-/// scheduler enforces).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Resources {
-    pub shmem_bytes: u32,
-    pub regs_per_thread: u32,
-    pub threads_per_cta: u32,
-}
-
-impl Resources {
-    pub const ZERO: Self = Self {
-        shmem_bytes: 0,
-        regs_per_thread: 0,
-        threads_per_cta: 0,
-    };
-
-    /// Element-wise max — the budget two impls would need if
-    /// sharing a compilation unit.
-    pub fn union_max(self, other: Self) -> Self {
-        Self {
-            shmem_bytes: self.shmem_bytes.max(other.shmem_bytes),
-            regs_per_thread: self.regs_per_thread.max(other.regs_per_thread),
-            threads_per_cta: self.threads_per_cta.max(other.threads_per_cta),
-        }
-    }
-}
-
 /// Memory layout a kernel Impl requires for one of its weight args.
 ///
 /// Declared as metadata on each [`Implementation`] (parallel to its
@@ -530,57 +466,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn handoff_variants_distinguishable() {
-        // Each variant is its own distinct value. A test with no
-        // semantic content beyond "the enum exists" — guards
-        // against accidental merging and documents the set.
-        let all = [
-            Handoff::StreamOrder,
-            Handoff::StreamEvent,
-            Handoff::KernelBoundary,
-            Handoff::InKernelGridSync,
-            Handoff::Mbarrier,
-            Handoff::DsmemRead,
-            Handoff::GmemFlag,
-            Handoff::SyncThreads,
-            Handoff::Internal,
-        ];
-        for (i, a) in all.iter().enumerate() {
-            for (j, b) in all.iter().enumerate() {
-                if i == j {
-                    assert_eq!(a, b);
-                } else {
-                    assert_ne!(a, b, "{a:?} and {b:?} must be distinct");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn resources_union_max_takes_elementwise_max() {
-        let a = Resources {
-            shmem_bytes: 16 * 1024,
-            regs_per_thread: 48,
-            threads_per_cta: 128,
-        };
-        let b = Resources {
-            shmem_bytes: 32 * 1024,
-            regs_per_thread: 40,
-            threads_per_cta: 256,
-        };
-        let u = a.union_max(b);
-        assert_eq!(u.shmem_bytes, 32 * 1024);
-        assert_eq!(u.regs_per_thread, 48);
-        assert_eq!(u.threads_per_cta, 256);
-        // Commutative.
-        assert_eq!(u, b.union_max(a));
-        // Idempotent.
-        assert_eq!(a, a.union_max(a));
-        // Identity: union_max with ZERO is self.
-        assert_eq!(a, a.union_max(Resources::ZERO));
     }
 
     #[test]

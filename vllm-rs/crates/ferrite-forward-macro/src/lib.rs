@@ -12,6 +12,7 @@ use quote::quote;
 use syn::{ItemFn, parse_macro_input};
 
 mod ast;
+mod cfg;
 mod classified;
 mod classify;
 mod config;

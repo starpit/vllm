@@ -19,6 +19,7 @@ mod config;
 mod fuf;
 mod impl_lib;
 mod parse;
+mod schedule;
 mod shape;
 mod solver;
 mod target;

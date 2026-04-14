@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Classified AST: every free variable reference is tagged as
+//! [`ExternKind`], [`WeightId`], or [`LocalId`]. String identifiers
+//! live only in the side tables ([`LocalTable`], [`WeightTable`]);
+//! the program itself refers to everything by numeric ID.
+//!
+//! This is the last stage where the caller can still recover the
+//! user's original identifiers (via the tables). Passes below here
+//! work with IDs only.
+
+#![allow(dead_code)]
+
+use syn::Ident;
+
+/// A local binding. Each assignment statement introduces a fresh
+/// `LocalId` even if the target name was previously bound; reads
+/// at a site resolve to the *most recent* LocalId for that name at
+/// that site (straight-line SSA).
+///
+/// For-loop induction variables are LocalIds whose scope is the
+/// loop body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LocalId(pub u32);
+
+/// A weight reference, identified by its dotted path. Two DSL
+/// reads of `self_attn.q_proj[layer]` resolve to the same `WeightId`
+/// (indexing is stored on the expression, not on the id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WeightId(pub u32);
+
+/// The fixed enum of non-weight parameters. Every model uses the
+/// same names and shapes for these; the `#[forward]` macro knows
+/// about them by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExternKind {
+    InputIds,
+    Positions,
+    Rotary,
+    BlockTable,
+    KvCache,
+}
+
+impl ExternKind {
+    /// Map a DSL identifier to its `ExternKind`, if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "input_ids" => Some(Self::InputIds),
+            "positions" => Some(Self::Positions),
+            "rotary" => Some(Self::Rotary),
+            "block_table" => Some(Self::BlockTable),
+            "kv_cache" => Some(Self::KvCache),
+            _ => None,
+        }
+    }
+}
+
+/// The fixed enum of DSL op kinds. One variant per op, no
+/// tile-kind sub-variants. Extending the DSL with a new op means
+/// adding one variant here, one shape signature in Phase 4, and
+/// one kernel implementation — nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OpKind {
+    Embed,
+    RmsNorm,
+    Gemm,
+    RopeAppend,
+    Attention,
+    Silu,
+    Add,
+    // Gemma2 extensions land here without touching any other pass:
+    //   Gelu, SoftCap, SlidingAttention
+}
+
+impl OpKind {
+    /// Map a DSL op-call ident to its `OpKind`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "embed" => Some(Self::Embed),
+            "rmsnorm" => Some(Self::RmsNorm),
+            "gemm" => Some(Self::Gemm),
+            "rope_append" => Some(Self::RopeAppend),
+            "attention" => Some(Self::Attention),
+            "silu" => Some(Self::Silu),
+            "add" => Some(Self::Add),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Embed => "embed",
+            Self::RmsNorm => "rmsnorm",
+            Self::Gemm => "gemm",
+            Self::RopeAppend => "rope_append",
+            Self::Attention => "attention",
+            Self::Silu => "silu",
+            Self::Add => "add",
+        }
+    }
+}
+
+/// A classified DSL program.
+#[derive(Clone, Debug)]
+pub struct Program {
+    pub statements: Vec<Stmt>,
+    /// Ident for each LocalId (for diagnostics and codegen only).
+    pub locals: LocalTable,
+    /// Path segments for each WeightId (for diagnostics and
+    /// runtime weight lookup).
+    pub weights: WeightTable,
+}
+
+/// Side table: `LocalId` → debug ident.
+#[derive(Clone, Debug, Default)]
+pub struct LocalTable {
+    entries: Vec<Ident>,
+}
+
+impl LocalTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, name: Ident) -> LocalId {
+        let id = LocalId(self.entries.len() as u32);
+        self.entries.push(name);
+        id
+    }
+
+    pub fn name(&self, id: LocalId) -> &Ident {
+        &self.entries[id.0 as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Side table: `WeightId` → dotted path segments.
+#[derive(Clone, Debug, Default)]
+pub struct WeightTable {
+    /// Invariant: paths are unique (interning).
+    entries: Vec<Vec<Ident>>,
+}
+
+impl WeightTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a path, returning the assigned `WeightId`. Idempotent:
+    /// two calls with paths of equal string segments return the same id.
+    pub fn intern(&mut self, path: Vec<Ident>) -> WeightId {
+        for (i, existing) in self.entries.iter().enumerate() {
+            if idents_eq(existing, &path) {
+                return WeightId(i as u32);
+            }
+        }
+        let id = WeightId(self.entries.len() as u32);
+        self.entries.push(path);
+        id
+    }
+
+    pub fn path(&self, id: WeightId) -> &[Ident] {
+        &self.entries[id.0 as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+fn idents_eq(a: &[Ident], b: &[Ident]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(l, r)| l == r)
+}
+
+/// A statement in the classified program.
+#[derive(Clone, Debug)]
+pub enum Stmt {
+    /// `target = value` where `target` is a fresh LocalId.
+    Assign { target: LocalId, value: Expr },
+    /// `(t0, t1, ...) = value` where each `t_i` is a fresh LocalId.
+    AssignTuple { targets: Vec<LocalId>, value: Expr },
+    /// `for ivar in 0..<bound> { body }`. `ivar` is a fresh LocalId
+    /// scoped to the body.
+    For {
+        ivar: LocalId,
+        start: Bound,
+        end: Bound,
+        body: Vec<Stmt>,
+    },
+}
+
+/// Loop bound: either a literal integer or a symbolic identifier
+/// that names a per-model bound (e.g. `num_hidden_layers`). The
+/// Ident is preserved here because bound resolution happens later,
+/// in Phase 3 when config.json values are loaded.
+#[derive(Clone, Debug)]
+pub enum Bound {
+    Lit(u64),
+    Sym(Ident),
+}
+
+/// A value-producing expression.
+#[derive(Clone, Debug)]
+pub enum Expr {
+    /// Read of a local binding.
+    Local(LocalId),
+    /// Read of a non-weight parameter, optionally indexed by a
+    /// local (the loop variable).
+    Extern {
+        kind: ExternKind,
+        index: Option<LocalId>,
+    },
+    /// Read of a weight, optionally indexed by a local.
+    Weight {
+        id: WeightId,
+        index: Option<LocalId>,
+    },
+    /// Op call.
+    Call { op: OpKind, args: Vec<Expr> },
+    /// Multiplication (`gate * up`).
+    Mul { lhs: Box<Expr>, rhs: Box<Expr> },
+}

@@ -6,13 +6,6 @@
 //! identifiers and loop bounds as symbolic names so later passes
 //! can resolve them per-model.
 
-// AST types are the Phase 1 deliverable. Their fields are read by
-// the parser's unit tests and, from Phase 2 onward, by the
-// classifier, CFG builder, and downstream passes. The lib-only
-// build in Phase 1 has no consumer yet — allow dead-code until
-// Phase 2 lands so the crate compiles cleanly under -D warnings.
-#![allow(dead_code)]
-
 use syn::Ident;
 
 /// Top-level: the body of the `#[forward]` carrier fn.

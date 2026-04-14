@@ -12,6 +12,8 @@ use quote::quote;
 use syn::{ItemFn, parse_macro_input};
 
 mod ast;
+mod classified;
+mod classify;
 mod parse;
 
 /// Attribute macro entry point.
@@ -35,10 +37,15 @@ mod parse;
 pub fn forward(_args: TokenStream, item: TokenStream) -> TokenStream {
     let carrier = parse_macro_input!(item as ItemFn);
 
-    // Parse the body into our AST. Errors propagate as compile
-    // errors at the macro call site.
-    let _ast = match parse::parse_block(&carrier.block) {
+    // Parse the body into our AST, then classify every free
+    // variable reference. Errors propagate as compile errors at
+    // the macro call site.
+    let ast = match parse::parse_block(&carrier.block) {
         Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let _classified = match classify::classify(&ast) {
+        Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
     };
 

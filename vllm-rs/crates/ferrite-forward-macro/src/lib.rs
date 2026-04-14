@@ -17,8 +17,11 @@ mod classified;
 mod classify;
 mod config;
 mod fuf;
+mod impl_lib;
 mod parse;
 mod shape;
+mod solver;
+mod target;
 
 /// Attribute macro entry point.
 ///

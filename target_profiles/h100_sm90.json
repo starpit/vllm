@@ -1,0 +1,8 @@
+{
+  "name": "h100_sm90",
+  "compute_capability": 90,
+  "num_sms": 132,
+  "peak_tflops_fp16": 989.0,
+  "memory_bandwidth_gbps": 3350.0,
+  "shared_memory_per_sm_kb": 228
+}

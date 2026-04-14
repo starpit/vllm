@@ -1,0 +1,8 @@
+{
+  "name": "l4_sm89",
+  "compute_capability": 89,
+  "num_sms": 58,
+  "peak_tflops_fp16": 242.0,
+  "memory_bandwidth_gbps": 300.0,
+  "shared_memory_per_sm_kb": 100
+}

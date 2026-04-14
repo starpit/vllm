@@ -1,114 +1,163 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Phase 8: BSP schedule.
+//! Scheduler: turn the SFUF back into a LOOP of waves.
 //!
-//! Given the solver's per-tile impl picks, produce a sequence of
-//! steps. Each step holds tiles that run concurrently; steps run
-//! sequentially. Within a step, no two tiles may have a dep edge
-//! between them; across steps, tile dependence dictates ordering.
+//! A wave (== BSP superstep) is a set of subgraphs with no
+//! dependence on each other; subgraphs within a wave are
+//! concurrent, waves execute in sequence. Topological layering
+//! over subgraphs: each subgraph's wave index is `1 + max(wave of
+//! any subgraph it depends on)`.
 //!
-//! The MVP computes topological layers over the FUF: each tile's
-//! layer is `1 + max(input layer)`. Tiles in the same layer are
-//! mutually independent (by construction) and go in the same step.
-//! This *is* the step-merge optimization relative to a naive
-//! one-tile-per-step schedule: merging adjacent independent tiles
-//! eliminates launch overhead without violating deps.
+//! A dep between subgraphs A and B exists when some tile in B has
+//! a `FufInput::Tile` edge to a tile in A. Within the same
+//! subgraph, internal deps are irrelevant to scheduling (the Impl
+//! handles them internally).
 //!
-//! Further merging — packing across layers when claim-masks and
-//! resource budgets allow — stays for later phases, when the
-//! library has multiple impls per op with non-trivial claim_masks
-//! and the potential wins are real.
+//! What this pass does NOT do:
+//! - pick kernels (that's the solver's job — already done)
+//! - decide launch mode (that's a tag on each Impl, read by
+//!   codegen, NOT a choice the scheduler makes)
+//! - emit code (codegen's job)
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::fuf::{Fuf, FufInput, TileId};
+use crate::fuf::{Fuf, FufInput};
 use crate::impl_lib::ImplId;
-use crate::solver::Assignment;
+use crate::solver::{Assignment, SubgraphId, WorkloadAssignments};
 
-/// A BSP step: one or more tiles that run concurrently.
+/// A single BSP wave — mutually-independent subgraphs.
 #[derive(Clone, Debug)]
-pub struct Step {
-    pub tiles: Vec<(TileId, ImplId)>,
+pub struct Wave {
+    /// The subgraphs in this wave, each paired with the Impl that
+    /// realizes it. Order within a wave is irrelevant for
+    /// scheduling (subgraphs are concurrent); codegen may pick an
+    /// emission order.
+    pub subgraphs: Vec<(SubgraphId, ImplId)>,
 }
 
-/// An ordered sequence of steps.
-#[derive(Clone, Debug)]
-pub struct Schedule {
-    pub steps: Vec<Step>,
+/// The LOOP: ordered sequence of waves.
+#[derive(Clone, Debug, Default)]
+pub struct Loop {
+    pub waves: Vec<Wave>,
 }
 
-impl Schedule {
-    pub fn num_steps(&self) -> usize {
-        self.steps.len()
+impl Loop {
+    pub fn num_waves(&self) -> usize {
+        self.waves.len()
     }
 
-    pub fn num_tiles(&self) -> usize {
-        self.steps.iter().map(|s| s.tiles.len()).sum()
+    pub fn num_subgraphs(&self) -> usize {
+        self.waves.iter().map(|w| w.subgraphs.len()).sum()
     }
 }
 
-/// Compute a BSP schedule from a FUF + assignment.
-///
-/// Tiles are grouped by topological layer. Within a layer, tiles
-/// execute concurrently; across layers they execute sequentially.
-/// Order within a step follows FUF tile order (deterministic).
-pub fn schedule(fuf: &Fuf, assignment: &Assignment) -> Schedule {
-    if fuf.is_empty() {
-        return Schedule { steps: Vec::new() };
+/// One LOOP per workload point, keyed by `num_tokens`.
+#[derive(Clone, Debug, Default)]
+pub struct WorkloadLoops {
+    pub per_num_tokens: BTreeMap<u64, Loop>,
+}
+
+/// Schedule a single SFUF into a LOOP.
+pub fn schedule(fuf: &Fuf, sfuf: &Assignment) -> Loop {
+    if sfuf.num_subgraphs() == 0 {
+        return Loop::default();
     }
 
-    // Topological layer per tile: 1 + max(layer of any Tile-input
-    // producer).
-    let mut layer: HashMap<TileId, u32> = HashMap::with_capacity(fuf.len());
-    let mut max_layer: u32 = 0;
-    for node in &fuf.nodes {
-        let mut depth = 0;
+    // Deps between subgraphs: SG_B depends on SG_A iff some tile
+    // in SG_B has a FufInput::Tile pointing at some tile in SG_A
+    // (and SG_A != SG_B).
+    let mut deps: HashMap<SubgraphId, HashSet<SubgraphId>> = HashMap::new();
+    for sg in sfuf.subgraphs() {
+        deps.insert(sg, HashSet::new());
+    }
+    for (tile, sg_consumer) in &sfuf.cover {
+        let node = fuf.get(*tile);
         for input in &node.inputs {
-            if let FufInput::Tile { id, .. } = input {
-                let d = layer.get(id).copied().unwrap_or(0) + 1;
-                if d > depth {
-                    depth = d;
-                }
+            if let FufInput::Tile {
+                id: producer_tile, ..
+            } = input
+                && let Some(sg_producer) = sfuf.subgraph_of(*producer_tile)
+                && sg_producer != *sg_consumer
+            {
+                deps.get_mut(sg_consumer)
+                    .expect("entry seeded above")
+                    .insert(sg_producer);
             }
         }
-        layer.insert(node.id, depth);
-        if depth > max_layer {
-            max_layer = depth;
+    }
+
+    // Topological wave assignment. Visit subgraphs in id order
+    // (solver allocates ids in topo order of first-claimed tile,
+    // so deps flow forward — but compute wave via max of predecessor
+    // waves to be safe for multi-tile claims).
+    let mut wave_of: HashMap<SubgraphId, u32> = HashMap::new();
+    let mut max_wave: u32 = 0;
+
+    // Sort subgraphs by id for deterministic iteration. Topological
+    // order by id holds because the solver's forward pass creates
+    // each subgraph only after all its prior tiles were committed.
+    let mut ordered: Vec<SubgraphId> = sfuf.subgraphs().collect();
+    ordered.sort();
+
+    for sg in &ordered {
+        let depth = deps[sg]
+            .iter()
+            .map(|d| wave_of.get(d).copied().unwrap_or(0) + 1)
+            .max()
+            .unwrap_or(0);
+        wave_of.insert(*sg, depth);
+        if depth > max_wave {
+            max_wave = depth;
         }
     }
 
-    let n_layers = (max_layer + 1) as usize;
-    let mut bins: Vec<Vec<(TileId, ImplId)>> = vec![Vec::new(); n_layers];
-    for node in &fuf.nodes {
-        let l = layer[&node.id] as usize;
-        let imp = assignment
-            .tile_to_impl
-            .get(&node.id)
-            .copied()
-            .expect("assignment has entry for every tile");
-        bins[l].push((node.id, imp));
+    let n_waves = (max_wave + 1) as usize;
+    let mut bins: Vec<Vec<(SubgraphId, ImplId)>> = vec![Vec::new(); n_waves];
+    for sg in &ordered {
+        let imp = sfuf.impl_of(*sg).expect("every subgraph has an impl");
+        let w = wave_of[sg] as usize;
+        bins[w].push((*sg, imp));
     }
 
-    Schedule {
-        steps: bins.into_iter().map(|tiles| Step { tiles }).collect(),
+    Loop {
+        waves: bins
+            .into_iter()
+            .map(|subgraphs| Wave { subgraphs })
+            .collect(),
     }
 }
 
-/// Invariant check: within a single step, no tile depends on
-/// another. Returns a (violating_tile, dep_target) pair if the
-/// invariant is broken, otherwise `None`.
-pub fn find_intra_step_dep_violation(schedule: &Schedule, fuf: &Fuf) -> Option<(TileId, TileId)> {
-    for step in &schedule.steps {
-        let step_tiles: std::collections::HashSet<TileId> =
-            step.tiles.iter().map(|(t, _)| *t).collect();
-        for (tile, _) in &step.tiles {
-            let node = fuf.get(*tile);
-            for input in &node.inputs {
-                if let FufInput::Tile { id, .. } = input
-                    && step_tiles.contains(id)
-                {
-                    return Some((*tile, *id));
+/// Schedule every SFUF in a workload sweep, preserving the `num_tokens` keying.
+pub fn schedule_workloads(fuf: &Fuf, workloads: &WorkloadAssignments) -> WorkloadLoops {
+    let per_num_tokens = workloads
+        .per_num_tokens
+        .iter()
+        .map(|(m, sfuf)| (*m, schedule(fuf, sfuf)))
+        .collect();
+    WorkloadLoops { per_num_tokens }
+}
+
+/// Invariant checker: within a single wave, no two subgraphs have
+/// a dep edge. Returns (consumer_sg, producer_sg) on violation.
+pub fn find_intra_wave_dep_violation(
+    loop_ir: &Loop,
+    fuf: &Fuf,
+    sfuf: &Assignment,
+) -> Option<(SubgraphId, SubgraphId)> {
+    for wave in &loop_ir.waves {
+        let wave_set: HashSet<SubgraphId> = wave.subgraphs.iter().map(|(s, _)| *s).collect();
+        for (sg, _) in &wave.subgraphs {
+            for t in sfuf.tiles_in_subgraph(*sg) {
+                let node = fuf.get(t);
+                for input in &node.inputs {
+                    if let FufInput::Tile { id: producer, .. } = input
+                        && let Some(sg_producer) = sfuf.subgraph_of(*producer)
+                        && sg_producer != *sg
+                        && wave_set.contains(&sg_producer)
+                    {
+                        return Some((*sg, sg_producer));
+                    }
                 }
             }
         }
@@ -152,7 +201,7 @@ mod tests {
         load_target(&path).unwrap()
     }
 
-    fn plan_body(src: &str, params: &ModelParams) -> (Fuf, Assignment) {
+    fn solved_body(src: &str, params: &ModelParams) -> (Fuf, Assignment) {
         let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).expect("parse");
         let block = match &file.items[0] {
             syn::Item::Fn(f) => &*f.block,
@@ -165,77 +214,56 @@ mod tests {
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
         let target = l4_target();
-        let mut bounds = params.bounds.clone();
-        bounds.insert("num_tokens".into(), 1);
-        let assignment = solve(&fuf, &lib, &target, &bounds).unwrap();
-        (fuf, assignment)
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
+        let sfuf = workloads.per_num_tokens[&1].clone();
+        (fuf, sfuf)
     }
 
+    const ATTN_BODY: &str = r#"
+        hidden_states = embed(input_ids, embed_tokens);
+        for layer in 0..num_hidden_layers {
+            normed = rmsnorm(hidden_states, input_layernorm[layer]);
+            q = gemm(normed, self_attn.q_proj[layer]);
+            k = gemm(normed, self_attn.k_proj[layer]);
+            v = gemm(normed, self_attn.v_proj[layer]);
+            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+            attn = attention(q, k, v, kv_cache[layer], block_table);
+            oproj = gemm(attn, self_attn.o_proj[layer]);
+            hidden_states = add(oproj, hidden_states);
+        }
+    "#;
+
     #[test]
-    fn schedule_is_shorter_than_one_per_tile() {
-        let (fuf, assignment) = plan_body(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                attn = attention(q, k, v, kv_cache[layer], block_table);
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
-            &llama_3_2_1b_params(),
-        );
+    fn loop_is_shorter_than_one_wave_per_subgraph() {
+        let (fuf, sfuf) = solved_body(ATTN_BODY, &llama_3_2_1b_params());
+        let loop_ir = schedule(&fuf, &sfuf);
 
-        let sched = schedule(&fuf, &assignment);
+        // Every subgraph in the SFUF appears exactly once in the LOOP.
+        assert_eq!(loop_ir.num_subgraphs(), sfuf.num_subgraphs());
 
-        // Every tile in the FUF appears exactly once in the schedule.
-        assert_eq!(sched.num_tiles(), fuf.len());
-
-        // Strictly fewer steps than tiles: q/k/v gemms merge into
-        // one step per iteration (they're mutually independent
-        // reads of `normed`).
+        // Fewer waves than subgraphs: q/k/v gemms merge (they all
+        // read the same `normed` and are mutually independent).
         assert!(
-            sched.num_steps() < fuf.len(),
-            "schedule has {} steps for {} tiles — expected merging",
-            sched.num_steps(),
-            fuf.len(),
+            loop_ir.num_waves() < sfuf.num_subgraphs(),
+            "waves={} subgraphs={} — expected wave merging",
+            loop_ir.num_waves(),
+            sfuf.num_subgraphs(),
         );
     }
 
     #[test]
-    fn no_intra_step_deps() {
-        let (fuf, assignment) = plan_body(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                attn = attention(q, k, v, kv_cache[layer], block_table);
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
-            &llama_3_2_1b_params(),
-        );
-        let sched = schedule(&fuf, &assignment);
+    fn no_intra_wave_deps() {
+        let (fuf, sfuf) = solved_body(ATTN_BODY, &llama_3_2_1b_params());
+        let loop_ir = schedule(&fuf, &sfuf);
         assert!(
-            find_intra_step_dep_violation(&sched, &fuf).is_none(),
-            "schedule invariant broken: two tiles in same step have a dep edge",
+            find_intra_wave_dep_violation(&loop_ir, &fuf, &sfuf).is_none(),
+            "schedule invariant broken",
         );
     }
 
     #[test]
-    fn parallel_qkv_gemms_share_step() {
-        // q/k/v gemms all read `normed` and are mutually independent.
-        // The schedule should put them in a single step.
-        let (fuf, assignment) = plan_body(
+    fn parallel_qkv_gemms_share_a_wave() {
+        let (fuf, sfuf) = solved_body(
             r#"
             hidden_states = embed(input_ids, embed_tokens);
             for layer in 0..1 {
@@ -249,35 +277,78 @@ mod tests {
             "#,
             &llama_3_2_1b_params(),
         );
-        let sched = schedule(&fuf, &assignment);
+        let loop_ir = schedule(&fuf, &sfuf);
 
-        // Find the step that contains all three q/k/v gemms.
-        // (They all read `normed` from the preceding rmsnorm, so
-        // they share a topological layer.)
-        let mut found_qkv_step = false;
-        for step in &sched.steps {
-            let gemm_count = step
-                .tiles
+        // Find the wave containing all three q/k/v gemms (they
+        // read `normed` and are mutually independent). Starter
+        // library is 1 tile = 1 subgraph, so we look for a wave
+        // with 3 Gemm-op subgraphs.
+        use crate::classified::OpKind;
+        let lib = starter_library();
+        let mut found = false;
+        for wave in &loop_ir.waves {
+            let gemm_count = wave
+                .subgraphs
                 .iter()
-                .filter(|(t, _)| matches!(fuf.get(*t).op, crate::classified::OpKind::Gemm))
+                .filter(|(_, imp_id)| lib.get(*imp_id).op == OpKind::Gemm)
                 .count();
             if gemm_count == 3 {
-                found_qkv_step = true;
+                found = true;
                 break;
             }
         }
-        assert!(found_qkv_step, "expected q/k/v gemms to share one step");
+        assert!(found, "expected q/k/v gemms to share one wave");
     }
 
     #[test]
-    fn empty_fuf_empty_schedule() {
-        let fuf = Fuf { nodes: Vec::new() };
-        let assignment = Assignment {
-            tile_to_impl: HashMap::new(),
-            predicted_us: 0.0,
+    fn workload_sweep_produces_one_loop_per_point() {
+        let params = llama_3_2_1b_params();
+        let file: syn::File = syn::parse_str(
+            r#"fn _c() {
+                hidden_states = embed(input_ids, embed_tokens);
+                for layer in 0..num_hidden_layers {
+                    normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                    q = gemm(normed, self_attn.q_proj[layer]);
+                    oproj = gemm(q, self_attn.o_proj[layer]);
+                    hidden_states = add(oproj, hidden_states);
+                }
+            }"#,
+        )
+        .unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
         };
-        let sched = schedule(&fuf, &assignment);
-        assert_eq!(sched.num_steps(), 0);
-        assert_eq!(sched.num_tiles(), 0);
+        let ast = parse_block(block).unwrap();
+        let program = classify(&ast).unwrap();
+        let inferred = infer(&program).unwrap();
+        let cfg = build_cfg(&program, &params).unwrap();
+        let fuf = unroll(&cfg, &inferred).unwrap();
+        let lib = starter_library();
+        let target = l4_target();
+
+        let points = [1u64, 64, 4096];
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &points).unwrap();
+        let loops = schedule_workloads(&fuf, &workloads);
+
+        assert_eq!(loops.per_num_tokens.len(), points.len());
+        for &m in &points {
+            let loop_ir = loops
+                .per_num_tokens
+                .get(&m)
+                .unwrap_or_else(|| panic!("no loop at m={m}"));
+            let sfuf = &workloads.per_num_tokens[&m];
+            assert_eq!(loop_ir.num_subgraphs(), sfuf.num_subgraphs());
+            assert!(find_intra_wave_dep_violation(loop_ir, &fuf, sfuf).is_none());
+        }
+    }
+
+    #[test]
+    fn empty_sfuf_empty_loop() {
+        let fuf = Fuf { nodes: Vec::new() };
+        let sfuf = Assignment::default();
+        let loop_ir = schedule(&fuf, &sfuf);
+        assert_eq!(loop_ir.num_waves(), 0);
+        assert_eq!(loop_ir.num_subgraphs(), 0);
     }
 }

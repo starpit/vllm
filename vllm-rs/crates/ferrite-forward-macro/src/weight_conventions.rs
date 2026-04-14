@@ -1,19 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Standard HuggingFace transformer weight-name conventions.
+//! Standard HuggingFace transformer conventions.
 //!
 //! Every decoder-only LLM in the HF ecosystem (Llama, Qwen2,
-//! Mistral, Phi, DeepSeek, Gemma, …) uses the same set of weight
-//! names for the same roles with shapes expressible in the same
-//! config.json bound vocabulary. This module encodes those
-//! conventions as a table so shape inference has an anchor for
-//! every standard weight — including MLP weights whose dims
-//! ("intermediate_size") aren't pinned by any op signature.
+//! Mistral, Phi, DeepSeek, Gemma, …) agrees on two sets of rules
+//! that aren't written down in any individual model file but are
+//! understood by every HF loader (including `transformers`
+//! itself). This module encodes both:
 //!
-//! Weights not in this table are left unanchored by this module;
-//! a later phase can supply a per-arch `weights.json` override
-//! when an arch has non-standard weights (MoE routers, vision
-//! patch embeddings, etc.). For every arch currently in scope
-//! (Llama, Qwen2, Gemma2) the table alone is sufficient.
+//! 1. **Weight-name → shape conventions** — `self_attn.q_proj`
+//!    has shape `[hidden_size, num_attention_heads * head_dim]`,
+//!    `mlp.down_proj` has shape `[intermediate_size, hidden_size]`,
+//!    and so on. [`standard_shape`] exposes the lookup.
+//!
+//! 2. **Config.json field defaults** — when a config.json omits a
+//!    field, HF's loaders substitute a derived value. E.g. if
+//!    `head_dim` is missing, it's `hidden_size / num_attention_heads`.
+//!    If `num_key_value_heads` is missing, it defaults to
+//!    `num_attention_heads` (multi-head attention, i.e. not GQA).
+//!    [`derive_implicit_bounds`] applies these defaults to the
+//!    bounds map loaded from a config.json.
+//!
+//! Both sets live together because they're aspects of the same
+//! protocol and they reference the same vocabulary of field names.
+//! Keeping them in one file means when a new arch needs an
+//! extension (e.g. Gemma2's `query_pre_attn_scalar`), there's one
+//! obvious place to add it.
+
+use std::collections::BTreeMap;
 
 use crate::shape::{Dim, Shape};
 
@@ -59,6 +72,51 @@ pub fn standard_shape(path: &[String]) -> Option<Shape> {
 
 fn bound(name: &str) -> Dim {
     Dim::Bound(name.into())
+}
+
+/// Apply HF's implicit config.json defaults to the bounds map.
+///
+/// HF configs are allowed to omit certain fields that have
+/// well-defined defaults. A loader that didn't apply these would
+/// look at `llama-2-13b/config.json` (which lists `hidden_size`
+/// and `num_attention_heads` but NOT `head_dim`) and correctly
+/// conclude the shape inference can't close `num_heads * head_dim`.
+/// Applying the default unblocks shape inference without any
+/// per-arch special case — the defaults are the same across every
+/// HF transformer.
+///
+/// Defaults applied here:
+///
+/// - **`head_dim`** → `hidden_size / num_attention_heads`. Llama-2
+///   and Llama-3 (not 3.2+) omit the field; Llama-3.2+, Qwen2.5+,
+///   and Gemma2 list it explicitly. Both forms are valid HF JSON.
+///
+/// - **`num_key_value_heads`** → `num_attention_heads`. Older
+///   configs written before grouped-query attention existed assume
+///   multi-head attention (kv_heads == heads) and don't list the
+///   field.
+///
+/// Defaults are only written if the field is missing — an explicit
+/// value in the JSON always wins.
+pub fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
+    // head_dim: hidden_size / num_attention_heads. Only derive if
+    // the division is exact; a non-divisible config is malformed and
+    // we'd rather surface it downstream than silently round.
+    if !bounds.contains_key("head_dim")
+        && let (Some(&hidden), Some(&heads)) =
+            (bounds.get("hidden_size"), bounds.get("num_attention_heads"))
+        && heads != 0
+        && hidden.is_multiple_of(heads)
+    {
+        bounds.insert("head_dim".to_string(), hidden / heads);
+    }
+
+    // num_key_value_heads: num_attention_heads (MHA default, no GQA).
+    if !bounds.contains_key("num_key_value_heads")
+        && let Some(&heads) = bounds.get("num_attention_heads")
+    {
+        bounds.insert("num_key_value_heads".to_string(), heads);
+    }
 }
 
 /// `num_heads * head_dim` as a canonical Mul.
@@ -117,5 +175,46 @@ mod tests {
         assert!(standard_shape(&path(&["mystery_weight"])).is_none());
         assert!(standard_shape(&path(&["self_attn", "mystery"])).is_none());
         assert!(standard_shape(&path(&["expert", "router"])).is_none());
+    }
+
+    #[test]
+    fn head_dim_derived_from_hidden_over_heads() {
+        // Matches llama-2-13b: hidden=5120, heads=40 → head_dim=128.
+        let mut b = BTreeMap::new();
+        b.insert("hidden_size".into(), 5120);
+        b.insert("num_attention_heads".into(), 40);
+        derive_implicit_bounds(&mut b);
+        assert_eq!(b.get("head_dim"), Some(&128));
+    }
+
+    #[test]
+    fn explicit_head_dim_wins_over_default() {
+        // Matches llama-3.2-1b: explicit head_dim that's NOT
+        // hidden/heads (2048/32 == 64, matches here, but the rule
+        // is that explicit wins regardless).
+        let mut b = BTreeMap::new();
+        b.insert("hidden_size".into(), 2048);
+        b.insert("num_attention_heads".into(), 32);
+        b.insert("head_dim".into(), 999);
+        derive_implicit_bounds(&mut b);
+        assert_eq!(b.get("head_dim"), Some(&999));
+    }
+
+    #[test]
+    fn num_kv_heads_defaults_to_num_heads_when_missing() {
+        let mut b = BTreeMap::new();
+        b.insert("num_attention_heads".into(), 40);
+        derive_implicit_bounds(&mut b);
+        assert_eq!(b.get("num_key_value_heads"), Some(&40));
+    }
+
+    #[test]
+    fn explicit_kv_heads_wins() {
+        // GQA config: 32 heads but only 8 KV heads.
+        let mut b = BTreeMap::new();
+        b.insert("num_attention_heads".into(), 32);
+        b.insert("num_key_value_heads".into(), 8);
+        derive_implicit_bounds(&mut b);
+        assert_eq!(b.get("num_key_value_heads"), Some(&8));
     }
 }

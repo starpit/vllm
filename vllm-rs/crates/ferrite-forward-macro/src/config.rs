@@ -117,7 +117,8 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
         path: path.to_path_buf(),
         reason,
     })?;
-    let bounds = extract_bounds(&json);
+    let mut bounds = extract_bounds(&json);
+    crate::weight_conventions::derive_implicit_bounds(&mut bounds);
 
     Ok(ModelParams {
         name,

@@ -1,344 +1,492 @@
-# ferrite-forward — parallel compiler path
+# ferrite-forward — the forward-pass compiler
 
-A clean reimplementation of the `forward!` pipeline. Separate crate tree,
-zero reuse of the existing `ferrite-solver` IR or DSL parser.
+> **If you are a fresh Claude reading this: read this whole file
+> before you read any code or propose any work. Every section here
+> exists because a prior Claude got the framing wrong and burned
+> hours of user time on bullshit. Specifically, do not:**
+>
+> - **Think of codegen as "deciding" launch mode.** It doesn't.
+>   HostCallable/DeviceCallable is a tag on each Implementation in
+>   the library. Codegen emits a loop nest and invokes each Impl
+>   the way its tag says. Codegen does not pick.
+> - **Think of the solver as picking "launch mode."** The solver
+>   picks Impls. An Impl's launch kind is an attribute like cost.
+>   The solver is just a cost-minimising matcher — algorithm is
+>   the DP ported from
+>   `vllm-rs/crates/ferrite-solver/src/lowering/solver/dp.rs`
+>   onto our clean FUF/Implementation types.
+> - **Think of the scheduler as "packing fused spans" or "deciding
+>   launch boundaries."** It turns the SFUF into a wavefront loop.
+>   That's it. One job.
+> - **Treat greedy as an MVP of DP.** It isn't — it's a different
+>   algorithm that can't solve the problem. Old ferrite already
+>   had the DP; port it.
+> - **Treat `vllm-cuda/src/model/*.rs` as in-scope for replacement.**
+>   It is not. vllm-cuda is untouched. The compiler replaces only
+>   `ferrite-macros` + `ferrite-solver`; its output plugs in at the
+>   same call site the old ferrite's output plugged in at.
+> - **Treat the prior ferrite as non-working.** It worked — it ran
+>   Llama and Qwen2 correctly. Its sin was llama-specific
+>   hardcoding (booleans per layer, weight-name substring checks,
+>   GemmQ/K/V tile variants). We replace the framework, not the
+>   functionality.
 
-**Reuse default is NO.** The existing `ferrite-solver` tree has
-transformer-domain concepts leaked into its types (`TileKind::GemmQ/K/V`,
-`weight_name: String` on tiles, `classify_gemm` substring matching,
-`BTreeMap<String, _>` on the CFG, etc.). Any code that *consumes* those
-types is contaminated even if its own algorithm is clean. The solver, the
-wavefront scheduler, the cost model, the implementation library — none are
-presumed reusable. Reuse is an explicit exception that has to clear a
-concrete bar (see Phase 7/8).
+Takes a DSL describing a forward pass. Compiles to Rust + CUDA that
+vllm invokes for each forward step. Replaces the prior ferrite
+compiler (`ferrite-macros` + `ferrite-solver`) with a real compiler
+framework instead of llama-specific hardcoded behavior sprinkled
+through the codegen.
 
-Things outside the compiler are fine to reuse: the CUDA kernel source
-files themselves, `ferrite-kernel-builder`, the tensor runtime, the KV
-cache manager. Those don't know about the IR.
+The prior ferrite compiler produced working output — it ran Llama
+and Qwen2 correctly. What made it wrong: the compilation path was
+not a compilation path. It had booleans tripping per-layer behavior,
+weight-name substring checks, special-cased tile kinds — so the
+moment you tried to extend it to Gemma2 (or anything that didn't
+match the assumptions baked in for Llama), the framework collapsed.
 
-## Invariants (every phase must preserve these)
+The new compiler produces output that plugs in at the exact same
+call site as the old one. It does not change how vllm-cuda invokes
+forwards, does not replace any vllm-cuda code, does not touch any
+`.cu` sources. Its only intersection with vllm-cuda is that
+vllm-cuda calls the ferrite-generated fn per forward step, the same
+way it calls the prior ferrite's generated fn today.
 
-1. **Below the parser, no transformer-domain concepts.** No "layer," no
-   "iter," no "phase," no `NL`-as-a-string, no `hidden_states` special case,
-   no `GemmQ/K/V` sub-kinds, no weight-name substring matching. AST may
-   carry symbolic bound names verbatim from the DSL; everything below the
-   CFG is either numeric or a small enum.
-2. **FUF is numbers only.** A FUF node is `{ id: u32, op: OpKind,
-   inputs: Vec<Input>, shape: Shape }` with `Input = Tile(u32) |
-   Weight(u32) | ExternParam(ExternKind)`. No strings, no identifiers,
-   no substring matches.
-3. **Three categories of free vars classified at parse time.**
-   - non-weight params: `input_ids`, `positions`, `rotary`, `block_table`,
-     `kv_cache` — fixed enum, same across all models.
-   - weight refs: `self_attn.q_proj[layer]`, `lm_head`, etc. — resolved
-     per-model via the config.
-   - local bindings: everything the DSL introduces with `name = ...`.
-   `hidden_states` is a local binding, not a special case. If a DSL reads
-   it before writing it, that is a parse-time error — not papered over
-   with a sentinel.
-4. **One `#[forward]` per architecture.** The macro is attribute-form,
-   attached to an empty `fn <arch>()` carrier, so rustfmt formats the body
-   like any normal Rust fn.
-5. **Realistic integration tests at each phase.** Tests run on real
-   Llama/Qwen2 config.json inputs, not synthetic `<NL=3>` stubs. A phase
-   isn't done until there's a test that observes the claimed property on a
-   real input.
+One DSL body per architecture. Many models per architecture (one
+JSON per model). Many workload buckets per model. The solver picks
+one kernel Implementation per FUF tile × workload bucket. Some
+kernels are HostCallable (extern "C", run on CPU), some are
+DeviceCallable (`__device__` body, run on GPU); that tag is set by
+the kernel author on the Implementation and the solver sees it like
+any other attribute. Some kernels claim multiple FUF tiles at once
+(fused kernels) — they still go through the solver as a single
+Implementation choice.
 
-## Crates
+Codegen's job is mechanical: walk the loop of waves the scheduler
+produced and emit a loop nest that invokes each wave's kernels. Pure
+host loops → pure Rust. Pure device loops → one CUDA kernel doing
+the whole loop on-GPU. Mixed → Rust outer loop with host waves as
+calls and device waves as megakernel launches.
 
-- `ferrite-forward-macro/` — `proc-macro = true`. Entry point:
-  `#[proc_macro_attribute] fn forward(args, item) -> TokenStream`.
-- `ferrite-forward/` — consumer-facing crate. Re-exports the macro, holds
-  any runtime types the generated code depends on.
-- `model_architectures/` — at repo root. `llama/*.json`, `qwen2/*.json`.
+## Compiler flow — read this before touching anything
 
-## Phases
+The compiler has exactly three passes below the parser. Each pass
+has ONE job. The output of each pass is a distinct IR with a name.
+DO NOT conflate the jobs. DO NOT move work between passes.
 
-Each phase ends with a buildable, commit-able, test-passing state. No phase
-may introduce a shortcut that a later phase has to undo.
+```
+  #[forward] fn llama() { DSL body }
+          │
+          ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ front end   parse → classify → shape-infer               │
+  │             → build CFG → unroll                          │
+  └─────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+                      ┌──────────┐
+                      │   FUF    │   Fully Unrolled Forward.
+                      │          │   An unrolled DAG of numeric
+                      │          │   tile nodes (loops over
+                      │          │   num_hidden_layers etc. are
+                      │          │   expanded into concrete
+                      │          │   tiles). One node per DSL op
+                      │          │   occurrence. Zero strings,
+                      │          │   zero loops, zero transformer
+                      │          │   domain concepts below here.
+                      └────┬─────┘
+                           │
+                           ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │                       SOLVER                              │
+  │                                                           │
+  │  ONE JOB: match kernels (Implementations from the         │
+  │  library) to FUF nodes, cheapest total cost for the       │
+  │  given target profile.                                    │
+  │                                                           │
+  │  A kernel may claim MULTIPLE FUF nodes (a fused           │
+  │  kernel covers several ops). The solver's output is       │
+  │  therefore smaller than its input: tiles collapse into    │
+  │  subgraphs, one subgraph per kernel instance.             │
+  │                                                           │
+  │  DP algorithm, polynomial, ported from old ferrite        │
+  │  (see ferrite-solver/src/lowering/solver/dp.rs).          │
+  │                                                           │
+  │  NOT the solver's job: deciding launch mode (that's a     │
+  │  tag the kernel author sets on each Impl; the solver      │
+  │  reads it like any other attribute), loop structure,      │
+  │  wave grouping, codegen. Don't put those here.            │
+  └─────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+                      ┌──────────┐
+                      │   SFUF   │   Solved FUF.
+                      │          │   The FUF with every tile
+                      │          │   assigned to a subgraph and
+                      │          │   every subgraph assigned one
+                      │          │   Impl from the library.
+                      │          │   When Impls claim a single
+                      │          │   tile each (the common case),
+                      │          │   SFUF has the same node count
+                      │          │   as FUF. When a fused Impl
+                      │          │   claims multiple tiles, the
+                      │          │   SFUF is smaller — those
+                      │          │   tiles share one subgraph.
+                      └────┬─────┘
+                           │
+                           ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │                      SCHEDULER                            │
+  │                                                           │
+  │  ONE JOB: turn the SFUF back into a loop. BSP/wavefront   │
+  │  is fine — subgraphs with no dependence between them      │
+  │  share a wave; dependents go in later waves.              │
+  │                                                           │
+  │  NOT the scheduler's job: kernel selection (done),        │
+  │  launch mode (codegen), emission (codegen). Don't put     │
+  │  that here either.                                        │
+  └─────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+                      ┌──────────┐
+                      │   LOOP   │   Ordered sequence of waves.
+                      │          │   A wave (== BSP superstep)
+                      │          │   is a set of subgraphs with
+                      │          │   no dependence on each other;
+                      │          │   they're mutually concurrent.
+                      │          │   Waves execute in sequence.
+                      └────┬─────┘
+                           │
+                           ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │                       CODEGEN                             │
+  │                                                           │
+  │  ONE JOB: emit a loop nest that walks the LOOP's waves    │
+  │  and invokes each subgraph's Impl.                        │
+  │                                                           │
+  │  Every Impl in the library is tagged HostCallable or      │
+  │  DeviceCallable — that's the kernel author's declaration, │
+  │  not a codegen decision. Codegen reads the tag and emits  │
+  │  accordingly:                                             │
+  │                                                           │
+  │    - A wave of all HostCallables    → Rust calls in       │
+  │                                       sequence.           │
+  │    - A wave of all DeviceCallables  → one __global__      │
+  │                                       megakernel that     │
+  │                                       runs the wave on    │
+  │                                       the GPU.            │
+  │    - 100% Host loop                 → pure Rust loop      │
+  │                                       iterating waves.    │
+  │    - 100% Device loop               → one CUDA kernel     │
+  │                                       implementing the    │
+  │                                       whole loop on-GPU.  │
+  │    - Mixed                          → Rust outer loop;    │
+  │                                       host waves emit as  │
+  │                                       calls, device waves │
+  │                                       emit as megakernel  │
+  │                                       launches.           │
+  │                                                           │
+  │  Codegen does NOT pick kernels, does NOT decide fusion,   │
+  │  does NOT schedule. The solver already picked the kernels │
+  │  (a "fused" kernel is just a DeviceCallable Impl that     │
+  │  claimed multiple FUF tiles at solve time). The scheduler │
+  │  already produced the loop. Codegen's job is mechanical:  │
+  │  emit the loop nest.                                      │
+  │                                                           │
+  │  Output: per model, one pub fn <model>_forward dispatched │
+  │  on num_tokens; plus one .cu per emitted megakernel.      │
+  └─────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+                   linked into vllm;
+                   called at the same call site the prior
+                   ferrite's output was called at.
+```
 
-### Phase 0 — scaffolding + configs
+### The IRs have names. Use them.
 
-- Create `vllm-rs/crates/ferrite-forward-macro/` (proc-macro crate) and
-  `vllm-rs/crates/ferrite-forward/` (consumer crate).
-- The attribute macro is a stub: accepts `#[forward]`, reads and discards
-  the fn's body, emits an empty fn. No DSL parsing yet.
-- Create `model_architectures/llama/` and `model_architectures/qwen2/`.
-  Download canonical configs via `curl`:
-  - Llama (from unsloth mirrors — ungated):
-    - llama-2-7b, llama-2-13b, llama-2-70b
-    - llama-3-8b, llama-3-70b
-    - llama-3.1-8b, llama-3.1-70b, llama-3.1-405b
-    - llama-3.2-1b, llama-3.2-3b
-  - Qwen2 (official Qwen repos — ungated):
-    - qwen2-0.5b, qwen2-1.5b, qwen2-7b, qwen2-72b
-    - qwen2.5-0.5b, qwen2.5-1.5b, qwen2.5-3b, qwen2.5-7b,
-      qwen2.5-14b, qwen2.5-32b, qwen2.5-72b
-  File stem is the generated identifier, so lowercase/hyphenated.
-- **Test:** `#[forward] fn llama() {}` compiles into an empty fn.
-- **Commit:** `ferrite-forward: scaffolding + model architecture configs`.
+- **FUF** = Fully Unrolled Forward. Output of the front end. Input
+  to the solver.
+- **SFUF** = Solved FUF. Output of the solver. Input to the
+  scheduler. FUF with each tile bound to a subgraph and each
+  subgraph bound to one Impl.
+- **LOOP** = ordered wave list. Output of the scheduler. Input to
+  codegen.
+- **wave** = BSP superstep. A set of mutually independent
+  subgraphs. Waves are executed in sequence; subgraphs within a
+  wave are concurrent.
 
-### Phase 1 — parse DSL body into AST
+Calling the solver's output "Assignment" or the scheduler's output
+"Schedule" is fine as a Rust type name, but in prose use the IR
+name (FUF/SFUF/LOOP) so it's obvious which pass produced it.
 
-- Define the AST: `Program { statements }`, `Statement::{Assign, ForLoop}`,
-  `Expr::{Call, Var, VarAt, FieldAccess, BinOp, Literal}`.
-- Parse via `syn`: walk the carrier fn's body, recognize:
-  - assignment statement `name = expr;`
-  - tuple-destructuring assignment `(a, b, c) = expr;`
-  - for-loop `for v in 0..<bound> { ... }` with the bound being an
-    identifier (symbolic).
-  - dotted field access (`self_attn.q_proj`) and indexing (`[layer]`).
-- No classification yet; the AST mirrors source structure.
-- **Tests:**
-  - Parse a realistic Llama body (the one we've sketched). Assert top-level
-    statement count, loop trip-count expression is `Ident("num_hidden_layers")`.
-  - Parse a Qwen2 body (slight arch differences: KV head count, norm
-    placement — whatever the Qwen2 arch actually is; I'll look up the
-    reference forward in the HF source during this phase).
-- **Commit:** `ferrite-forward: parse DSL body into AST`.
+### Per-architecture vs per-model vs per-workload
 
-### Phase 2 — classify free variables
+The front end runs once per architecture (one DSL body).
 
-- Walk the AST, build three tables:
-  - `ExternParams`: match against a fixed enum (`input_ids`, `positions`,
-    `rotary`, `block_table`, `kv_cache`). Anything else in read position
-    that isn't a local binding or a weight ref is an error.
-  - `Weights`: any reference like `foo.bar[idx]` or bare `foo` that's read
-    but never written.
-  - `Locals`: anything written by an assignment statement (SSA; a rewrite
-    shadows the prior binding).
-- Classification is a separate pass; AST nodes get annotated with
-  `VarClass` enum.
-- **Test:** classify realistic Llama body. Assert `hidden_states` is a
-  local binding (written by two `hidden_states = add(...)` statements),
-  `self_attn.q_proj` is a weight ref, `input_ids` is an extern param.
-- **Commit:** `ferrite-forward: classify DSL free variables`.
+The solver, scheduler, and codegen run per (model × workload
+bucket). Models fan out over `model_architectures/<arch>/*.json`;
+workload buckets fan out over the `num_tokens` range. Codegen
+coalesces adjacent-equal assignments into match arms (`1..=8 =>
+<one impl set>`, etc.) so the emitted fn isn't one arm per M.
 
-### Phase 3 — read config.json, resolve per-model bounds
+## What gets replaced
 
-- Directory walker: given `model_architectures/<arch>/`, enumerate
-  `*.json`. For each, parse into `ModelParams { name, bounds }` where
-  `bounds: BTreeMap<String, u64>` maps field names like
-  `num_hidden_layers` → `16`.
-- Register every file read via `proc_macro::tracked_path::path`, plus
-  the directory itself, so cargo rebuilds on add/edit/remove.
-- **Test:** load all 10 Llama configs; assert extracted bounds match the
-  known published values (e.g. `llama-3.2-1b.num_hidden_layers == 16`).
-- **Commit:** `ferrite-forward: read model configs from directory`.
+- `ferrite-macros/` — the `forward!{}` proc-macro. Dead when the
+  last `forward!{}` site has migrated to `#[forward]`.
+- `ferrite-solver/` — the contaminated IR + codegen the old macro
+  drove. Dead when `ferrite-macros` is dead. See "Explicit
+  NON-reuse" below for why we don't reuse any of its types.
+- `ferrite-models/src/*.rs` — the DSL-bearing sites only. The files
+  stay but switch from `forward!{}` to `#[forward]`.
 
-### Phase 4 — shape inference
+What stays untouched:
 
-- Shape language: `Shape = Vec<Expr>` where `Expr` is arithmetic over
-  bound names and literals (`[HD, NAH * HDM]` etc.).
-- Per-op shape signature: each DSL op knows its input/output shapes in
-  terms of its operand shapes. Examples:
-  - `gemm(x: [.., K], w) → [.., N]` implies `w: [K, N]`
-  - `rmsnorm(x: [.., H], w) → [.., H]` implies `w: [H]`
-  - `embed(ids, table) → [.., H]` implies `table: [V, H]`
-  - `rope_append((q, k, v), positions, rotary, kv_cache) → (q', k', v')`
-    with shape-preserving semantics
-  - `attention(q, k, v, kv_cache, block_table) → [.., H']`
-- Walk the classified AST, propagate shapes from extern-param inputs
-  outward. Weight refs get their shape inferred from usage context.
-- **Test:** for realistic Llama body, inferred shape for `self_attn.q_proj`
-  is `[hidden_size, num_attention_heads * head_dim]` — match published
-  value.
-- **Commit:** `ferrite-forward: infer weight shapes from DSL usage`.
+- `vllm-cuda` entirely. Kernel sources, tensor runtime, KV cache,
+  allocator, the call site that invokes the ferrite-generated fn —
+  all unchanged. The only edit to vllm-cuda would be if the new
+  generated fn's signature diverges from the old one's, and that
+  edit should be obvious and local.
+- Everything above vllm-cuda (engine, server, CLI, bench).
 
-### Phase 5 — build CFG from AST
+Adding a new model = drop a JSON into `model_architectures/<arch>/`.
+Adding a new architecture = DSL body + configs + kernels for any
+new ops. No compiler edits.
 
-- CFG with basic blocks, terminators `Jump`, `Return`, `LoopHeader { ivar,
-  start: u64, end: u64, body, exit }`. Bounds are *integers* because the
-  caller (Phase 6) substitutes per-model params.
-- No `BTreeMap<String, usize>`. No symbol table at this level — lookups
-  happened at parse time via Phase 3.
-- **Test:** build a CFG from a classified AST + a chosen set of concrete
-  bounds; assert number of blocks, loop header start/end values.
-- **Commit:** `ferrite-forward: build CFG from classified AST`.
+## HostCallable vs DeviceCallable is a library tag
 
-### Phase 6 — unroll CFG into FUF
+Each `Implementation` in the library has a launch-kind tag set by
+the kernel author:
 
-- Flat graph: `Fuf { nodes: Vec<FufNode> }`. `FufNode { id: u32, op:
-  OpKind, inputs: Vec<FufInput>, shape: Shape }`. `FufInput = Tile(u32) |
-  Weight(u32) | ExternParam(ExternKind)`. `OpKind` is one variant per DSL
-  op (`Gemm`, `RmsNorm`, `Embed`, `Rope`, `Attention`, `Silu`, `Add`,
-  `Mul`). No `GemmQ/K/V` sub-kinds.
-- Unroller substitutes loop-variable references with concrete integers.
-  All weight refs resolve to numeric weight-slot IDs (by hashing/indexing
-  into the schema derived in Phase 4).
-- **Tests:**
-  - `build_fuf` of the realistic Llama-3.2-1B spec has `1 + 15*16 + 2 =
-    243` tiles (or whatever the real per-iteration count is once we've
-    settled it — the point is: `tile_count = f(N)` and we assert against
-    a realistic N).
-  - No node anywhere in the FUF references a `String` or an identifier.
-    (Compiler enforces this structurally, but also a runtime assertion
-    during dev.)
-- **Commit:** `ferrite-forward: unroll CFG into numeric FUF`.
+- **HostCallable** — invoked via `extern "C"` from CPU. Paged
+  attention, flash attention, cutlass gemm, anything that needs
+  host-side orchestration or that's already compiled as a
+  host-launch kernel.
+- **DeviceCallable** — has a `__device__` body that runs on the
+  GPU. Can be composed with other DeviceCallable kernels into a
+  single GPU kernel (a "megakernel"). Elementwise ops, rmsnorm,
+  silu, add, rope, small reductions.
 
-### Phase 7 — solver
+The tag is data. The solver reads it when matching Impls to FUF
+tiles; the cost model may favor one tag over another based on the
+surrounding context. Codegen reads it to emit the right kind of
+call (Rust extern call vs. `__global__` launch).
 
-- **Default: write fresh.** The existing DP solver (`ferrite-solver::
-  lowering::solver::dp`) consumes a `Problem` built from the contaminated
-  `TileGraph`, with tile-kind-specialized cost lookups and an
-  `ImplementationLibrary` keyed on `TileKind::GemmQ/K/V/...`. The
-  algorithm is clean; the interface is not. Writing a fresh DP over our
-  FUF is simpler than building a bidirectional adapter that stays honest.
-- **Reuse bar** (must ALL hold to reuse):
-  1. Zero references to any `TileKind` variant beyond a single unified
-     `Gemm`.
-  2. No `String`-keyed maps in the solver's input or output.
-  3. No weight-name inspection anywhere in the cost path.
-  4. The adapter from our FUF to the solver's `Problem` is ≤ 50 LOC and
-     has no `match tile_kind` or `if weight_name.contains(...)`.
-  5. The existing tests that exercise the DP solver continue to pass
-     after the adapter-only change — so we can be confident the
-     algorithm works as intended.
-- If any of those fail: write fresh. Do not ship a contaminated adapter
-  and promise to clean it up later.
-- The solver's input is the FUF + an implementation library + a target
-  profile. Output is an assignment of tiles → impls + a predicted cost.
-- **Test:** realistic Llama body + starter implementation library
-  produces an assignment with no unassigned tiles. Solve time < 100 ms
-  on Llama-3.1-8B's unrolled graph.
-- **Commit:** `ferrite-forward: wire (or write) solver`.
+The compiler's code contains no hardcoded list of which ops are
+Host and which are Device — it's whatever the library says.
 
-### Phase 8 — schedule (step-merge)
+## Status
 
-- Given the solver's per-tile impl choices plus its preliminary
-  one-per-step schedule, produce the final BSP schedule: a list of
-  steps, each holding one or more `(tile, impl)` pairs.
-- Merge rules:
-  - two tiles can share a step if their impls' claim-states don't
-    collide AND they satisfy cooperative-exclusive constraints AND
-    no edge between them would skip a step boundary in violation of
-    dependency order.
-  - only merge when it reduces predicted cost (handoff elimination ≥
-    serialization overhead of packing).
-- Output: `Schedule { steps: Vec<Step> }`, `Step = Vec<(TileId, ImplId)>`.
-- **Default: write fresh.** Same reasoning as the solver — the existing
-  merge pass consumes contaminated types.
-- **Test:** for realistic Llama body, the merged schedule has strictly
-  fewer steps than the solver's preliminary one-per-step schedule, and
-  cost goes down or stays equal (never regresses).
-- **Commit:** `ferrite-forward: BSP schedule via step-merge`.
+Foundation done (do not redo):
 
-### Phase 9 — codegen: Rust glue
+- Parse DSL → classified program (extern / weight / local).
+- Shape inference with HF weight-name convention anchoring.
+- CFG with integer trip counts; unroll to numeric FUF.
+- Greedy per-tile solver, sweeps workload buckets, real costs for
+  every op (weight shapes threaded from Inferred; first-None is
+  fatal; workload dimension preserved).
+- Topological-layering scheduler.
+- 62 unit tests + 3 integration tests passing, fmt + clippy clean.
 
-- For each model in `models/`, emit:
-  - one `pub fn <model_name>_forward(...)` specialized to its bounds
-  - call into the compiled CUDA kernels via `extern "C"` bindings
-- Weight refs resolve to per-arch runtime paths (`model.layers[i].self_attn.
-  q_proj`), driven by a small per-arch table in the macro.
-- Non-weight params become typed fn arguments.
-- **Test:** `cargo check` on a downstream crate that invokes the
-  macro-generated forward compiles.
-- **Commit:** `ferrite-forward: emit specialized Rust forward fns`.
+**Still to do — this is where the real work is:**
 
-### Phase 10 — codegen: CUDA
+- **Replace** the greedy solver with the DP ported from
+  `ferrite-solver/src/lowering/solver/dp.rs`. The greedy picker
+  is not the algorithm; it's a placeholder written before the user
+  clarified the DP was already proven on Llama + Qwen2. Port it.
+- Rework the scheduler to emit a real LOOP of waves (today's
+  topological layering is close, but its output is `Vec<Step>` —
+  update the type and the downstream consumer accordingly).
+- Codegen does not exist yet. Emit `pub fn <model>_forward`
+  containing a `match num_tokens` dispatch; each arm walks the
+  LOOP emitting Rust calls for host waves and megakernel launches
+  for device waves.
+- Add DeviceCallable Impls to the library (elementwise tail, rope,
+  rmsnorm) so the solver has real Host/Device alternatives.
+- Migrate `ferrite-models/src/llama.rs`, then `qwen2.rs`, then the
+  rest. Each is `forward!{}` → `#[forward]`.
+- Validate with `vllm chat` / `vllm bench` / `vllm serve`.
 
-- Macro writes `.cu` files to `$OUT_DIR` plus a manifest JSON.
-- `ferrite-kernel-builder`'s `build.rs` picks up the manifest and compiles
-  the `.cu` files, emitting linker directives.
-- **Test:** full build succeeds, linker resolves the generated symbols.
-- **Commit:** `ferrite-forward: emit CUDA and wire into kernel builder`.
+Everything before codegen is plumbing. The compiler emits an empty
+fn today.
 
-### Phase 11 — real inference (Llama)
+## Remaining work
 
-- Swap the model crate (`ferrite-models::llama`) to use
-  `#[forward]` instead of the legacy `forward!()`.
-- `vllm chat --model=<small-llama>` produces coherent output (correctness
-  check per `feedback_no_run_chat`).
-- Latency parity or better vs. legacy path.
-- **Commit:** `ferrite-models: switch Llama to #[forward]`.
+Ordered by dependency, not phase number.
 
-### Phase 12 — Gemma2 (the acid test)
+### 1. DP solver + scheduler + Host-only codegen: Llama
 
-This is the whole reason for the rewrite. If the compiler is genuinely
-generic, adding Gemma2 is:
+Three things in parallel because they can't ship independently:
 
-1. Write the Gemma2 body DSL in a new `#[forward] fn gemma2()` block.
-2. Drop Gemma2 configs into `model_architectures/gemma2/`.
-3. Build. Inference works.
+- **Solver**: port the DP from
+  `vllm-rs/crates/ferrite-solver/src/lowering/solver/dp.rs` onto
+  our FUF + Implementation types. Output is the SFUF. Kill the
+  current greedy picker.
+- **Scheduler**: walk the SFUF topologically, produce a LOOP of
+  waves.
+- **Codegen**: emit `pub fn <model>_forward(...)` per model
+  containing a `match num_tokens { … }` dispatch. Each arm walks
+  the LOOP and emits Rust calls for each subgraph's Impl (all
+  HostCallable at this stage — no DeviceCallable Impls exist yet).
 
-Zero framework changes. No new parser arms, no new CFG quirks, no new
-solver branches, no new codegen special cases. If any of those become
-necessary, the rewrite failed its premise and we have to go back.
+`ferrite-models/src/llama.rs` switches from `forward!{}` to
+`#[forward]`. Nothing in vllm-cuda changes.
 
-Gemma2 stresses the framework because it differs from Llama in ways that
-have historically broken generic compilers:
+Done when `timeout 60 vllm chat --model=<small-llama>` produces
+coherent output and `vllm bench` hits parity with the old ferrite
+path.
 
-- **Sliding window attention** alternating per layer. Every odd/even
-  layer uses a different attention span. If the DSL has to grow a new
-  `sliding_attention` op — fine, generic extension. If the CFG or FUF
-  has to grow per-layer metadata to track "is this layer windowed" —
-  failed.
-- **Double norms** (post-attention AND post-FFN layernorm). Structurally
-  different body. The parser/CFG/unroll/codegen should not care.
-- **Approximate GELU** instead of SiLU. New DSL op `gelu`. Adding a DSL
-  op should be: one `OpKind` variant + one shape signature + one kernel
-  implementation. Nothing else.
-- **Query scaling**. Possibly a new op or possibly parameterized
-  attention. Either way, it goes in the DSL body, not the compiler.
-- **Logit soft-capping**. New op `soft_cap`. Pure post-processing.
+### 2. Qwen2 through the same pipeline
 
-**Success criteria** (must ALL hold):
-1. The diff that adds Gemma2 touches ONLY:
-   - a new `gemma2.rs` file in `ferrite-models` with the DSL body,
-   - new `.json` files in `model_architectures/gemma2/`,
-   - kernel implementations for any *new* DSL ops (`gelu`, `soft_cap`,
-     `sliding_attention`) — data, not control flow.
-2. No file in `ferrite-forward-macro/` or `ferrite-forward/` is modified
-   by the Gemma2 diff.
-3. `vllm chat --model=gemma-2-2b` produces coherent output.
-4. The Gemma2 body is visually comparable in size/complexity to the Llama
-   body. No explosion of special cases to work around the generic layer.
+Add Qwen2's bias-add as a HostCallable Impl in the library (a new
+op, one new Impl — not a compiler edit).
+`ferrite-models/src/qwen2.rs` switches to `#[forward]`. Same
+pipeline, same codegen, different body and library.
 
-If any criterion fails, the compiler is not generic and the rewrite has
-not achieved its goal. We fix it by making the offending pass generic,
-not by carving a Gemma2-specific escape hatch.
+### 3. DeviceCallable Impls + megakernel emission in codegen
 
-- **Commit:** `ferrite-models: add Gemma2 via #[forward]`.
+Add DeviceCallable Implementations to the library for the ops where
+on-GPU composition pays (rmsnorm, silu, add, rope, elementwise
+bias-add — the memory-bound tail around gemm/attention). Each has a
+`__device__` body in a `.cu`.
 
-## Explicit non-goals for this plan
+Codegen's output shape now varies per wave: a wave whose subgraphs
+all map to DeviceCallable Impls emits as one `__global__` (the
+megakernel for that wave). A pure-device LOOP emits as one CUDA
+kernel implementing the whole loop on-GPU. Mixed LOOPs emit as
+Rust outer loop + host-wave calls + device-wave megakernel
+launches. Same codegen pass; what it emits is driven by the Impl
+tags in the LOOP it was handed.
 
-- Rewriting the CUDA kernel *sources* (reused — they don't know about
-  the IR).
-- Rewriting ferrite-kernel-builder (reused — it just compiles `.cu` files).
-- Rewriting the runtime (tensor allocation, KV cache mgmt — unchanged).
-- Back-compat with the legacy `forward!` — both live until Phase 11;
-  after that, delete the old one in a separate commit.
+The solver now has real alternatives per tile (HostCallable vs
+DeviceCallable for the ops that have both). Cost model favors
+DeviceCallable when neighbors in the same wave are also
+DeviceCallable, because the launch-overhead amortises.
+
+Done when `vllm bench` shows measurable throughput gain vs.
+pure-Host on the same model.
+
+### 4. Migrate remaining architectures
+
+One arch at a time, each is a DSL body + configs + any new-op
+kernels. `vllm chat` / `serve` / `bench` stay green throughout.
+Order roughly by DSL complexity (smallest first, genericity
+stress-tests later):
+
+- llama, qwen2 (covered in 1–2)
+- gemma2 (the genericity acid test — see 5)
+- mixtral (MoE — see 6)
+- qwen2_moe
+- deepseek_v2 (MLA — see 7)
+
+### 5. Gemma2 acid test — compiler genericity
+
+Gemma2 stresses the compiler where every prior "generic" approach
+broke: sliding window attention alternating by layer, pre+post norms
+on both attention and FFN, approximate GELU, query scaling, logit
+soft-capping.
+
+The diff that adds Gemma2 must touch **only**:
+- a new `ferrite-models/src/gemma2.rs` with the DSL body,
+- `model_architectures/gemma2/*.json`,
+- new kernel impls for new ops (`gelu`, `soft_cap`,
+  `sliding_attention`, `query_scale`).
+
+**Zero lines** in `ferrite-forward-macro` or `ferrite-forward`. If
+the compiler needs surgery to express Gemma2, the design is wrong —
+fix the compiler's generality, not the Gemma2 diff.
+
+### 6. MoE acid test — control-flow genericity
+
+Mixtral / Qwen2-MoE need top-k routing inside the forward. The DSL
+today has no construct for "for each of top-k selected experts, run
+this sub-body." Adding one is a generic language extension, not a
+MoE-specific branch. When we write it, it must also express any
+future conditional dispatch pattern (conditional compute, early exit,
+speculative branches).
+
+### 7. MLA acid test — attention-variant genericity
+
+DeepSeek-V2's Multi-Latent Attention is a different attention op,
+not a compiler change. A new `attention_mla` op + new kernel +
+Shape signature. If anything below the op signature has to learn
+"MLA," the compiler is leaking.
+
+### 8. Delete the legacy
+
+When the last `forward!{}` site is gone: delete `ferrite-solver`,
+`ferrite-macros`, and any support code only those two required.
+vllm-cuda is untouched.
+
+## Invariants
+
+Every step above preserves these. When an invariant breaks, the break
+is the bug, not the invariant.
+
+1. **Below the parser, no transformer-domain concepts.** No "layer,"
+   no "iter," no "phase," no `NL`-as-a-string, no `hidden_states`
+   special case, no `GemmQ/K/V` sub-kinds, no weight-name substring
+   matching. AST may carry symbolic bound names verbatim from the
+   DSL; everything below the CFG is either numeric or a small enum.
+
+2. **FUF is numbers only.** `FufNode { id: u32, op: OpKind, inputs:
+   Vec<Input>, shape: Shape }` with `Input = Tile(u32) | Weight(u32)
+   | Extern(ExternKind)`. No strings, no identifiers.
+
+3. **Three categories of free vars, classified at parse time.**
+   Extern params (fixed enum: `input_ids`, `positions`, `rotary`,
+   `block_table`, `kv_cache`), weight refs (HF paths), locals. No
+   sentinels. `hidden_states` is a local binding, period.
+
+4. **One `#[forward]` per architecture.** Attribute-form, attached
+   to an empty `fn <arch>()` so rustfmt formats the body.
+
+5. **Launch mode is a library attribute, not a compiler attribute.**
+   A new kernel with a new launch mode goes in the library. The
+   compiler reads launch mode off the Implementation; it does not
+   infer it from DSL syntax or op kind.
+
+6. **Realistic integration tests at every step.** Run on real configs
+   at realistic N (≥16 layers). Compile-success is not a test.
+   The test must observe the claimed property on real input.
+
+7. **No silent fallbacks.** An impl's cost function returning `None`
+   is a hard error. An unknown op is a hard error. A missing shape
+   is a hard error. A candidate that can't apply at a given M opts
+   out via an explicit `applicability_fn`, not by returning `None`.
+   The class of bug this prevents: gemm costs silently dropped
+   because weight shapes weren't threaded, the workload dimension
+   silently collapsed because a caller passed one M and nothing
+   complained. Both happened in the current greedy solver before
+   being fixed; neither would have been caught by compile-success
+   tests alone.
 
 ## Explicit NON-reuse
 
-- The existing `ferrite-solver` crate, wholesale. Its types are
-  contaminated; consuming them means importing the contamination. Any
-  reuse has to pass the Phase 7/8 bar.
-- The existing `ImplementationLibrary` type as-is. Its keys are
-  `TileKind::GemmQ/K/V/...` variants. We need a library keyed on a single
-  `Gemm` kind with its dimensions stored as `Shape`, not as a variant
-  selector. We may port the *data* (FLOP counts, microbenchmark numbers)
-  but not the container type.
-- The existing `forward!` proc-macro parser. Writing a fresh `syn`-based
-  parser against the AST we design in Phase 1 is cheaper than untangling
-  what's there.
-- Any type with a `.layer: u16`, `.num_layers: u16`, `weight_name: String`,
-  `loop_bounds: BTreeMap<...>`, or `LoopPhase` field. If importing a
-  function would require importing a type with one of these fields, the
-  function doesn't cross the boundary.
+- `ferrite-solver` wholesale. Its types are contaminated
+  (`TileKind::GemmQ/K/V/...`, `weight_name: String`, BTreeMaps on
+  DSL idents). Consuming them means importing the contamination.
+  **Exception**: the DP algorithm in
+  `ferrite-solver/src/lowering/solver/dp.rs` is explicitly ported
+  — the algorithm is clean, the types it operated over are not.
+  Re-implement against our FUF + Implementation types; do NOT
+  import the old `Problem`, `TileGraph`, or `Assignment`.
+- `ferrite-macros::forward!` as a parser. Fresh `syn`-based parse
+  against the AST we designed is cheaper than untangling.
+- Any type with `.layer: u16`, `.num_layers: u16`, `weight_name:
+  String`, `loop_bounds: BTreeMap<...>`, `LoopPhase`, or a
+  `TileKind::GemmQ/K/V/...`-style variant. Those are the exact
+  llama-specific hardcodings that made the prior ferrite collapse
+  under Gemma2. Importing a function that requires one of those
+  imports the contamination.
 
-## Anti-bullshit checklist (run before committing any phase)
+## Non-goals
 
-- [ ] Does the diff introduce any string that names a transformer concept
-      below the parser? (`"hidden_states"`, `"q_proj"`, `"NL"`, etc.) If
-      yes — why? Move it back up.
-- [ ] Does any pass take a `BTreeMap<String, _>` keyed on a DSL identifier?
-      If yes — the info should have been resolved at parse time.
-- [ ] Does any type carry a `layer: u16` or `num_layers: u16` field? If
-      yes — that's the old IR leaking back. Delete.
-- [ ] Does any code path special-case a specific DSL identifier? If yes —
-      replace with a structural predicate.
-- [ ] Does the phase's test run on a realistic config (N ≥ 16 layers),
-      not a synthetic `NL=2` stub?
-- [ ] Does a new test actually observe the phase's claimed property, or
-      just assert that compile succeeds?
+- Backwards compat with `ferrite_macros::forward!{}`. Gone when the
+  last site migrates.
+- Touching vllm-cuda. The compiler's output plugs in at vllm-cuda's
+  existing call site for ferrite-generated forwards.
+- Runtime solver invocation. Everything is compile-time.
+- Rewriting existing CUDA kernel sources. They stay and are linked
+  as Host-launch Implementation entries.
+- Rewriting the tensor runtime, KV cache manager, or page allocator.
+  Orthogonal.

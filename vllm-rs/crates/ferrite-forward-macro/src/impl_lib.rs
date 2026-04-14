@@ -1,19 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Implementation library: the set of kernels available on a given
-//! target. Keyed by [`OpKind`], many impls per op allowed. Each
-//! [`Implementation`] carries a cost function the solver consults.
+//! target. The solver enumerates candidates from this library,
+//! calls [`Implementation::matches`] at each FUF tile, and picks
+//! the cheapest match whose claim doesn't conflict.
 //!
-//! This is deliberately minimal. The real ferrite-kernels crate
-//! holds the actual CUDA code; this module describes the
-//! *metadata* the solver needs to pick between candidates. Each
-//! target crate (e.g. `ferrite_kernels::l4_sm89`) will own the
-//! actual Implementation instances.
+//! Types ported from old ferrite-solver (kept clean — no
+//! `TileKind::GemmQ/K/V`, no `weight_name: String`, no layer
+//! metadata):
+//!
+//! - [`LaunchKind`] — whether a kernel is invoked from CPU or is a
+//!   `__device__` body that composes with neighbors.
+//! - [`WorkloadConstraint`] — explicit applicability signal
+//!   (replaces "cost returned None meaning N/A"). This is how
+//!   kernels say "only valid at M=1" without overloading `None`
+//!   from the cost function.
+//! - [`TargetFilter`] — per-target applicability.
+//! - [`MatchInfo`] — what a match produces: the list of FUF tiles
+//!   it claims (one tile for single-op impls, multiple for fused).
+//!
+//! Launch mode is an attribute set by the kernel author. The solver
+//! reads it like any other attribute (it affects cost context for
+//! fusion accounting); it does not "decide" launch mode. Codegen
+//! reads the tag to emit extern "C" calls vs megakernel launches.
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-
 use crate::classified::OpKind;
+use crate::fuf::{Fuf, TileId};
 use crate::shape::{Dim, Shape};
 use crate::target::TargetProfile;
 
@@ -21,19 +34,109 @@ use crate::target::TargetProfile;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ImplId(pub u32);
 
-/// One concrete kernel implementation for one op kind.
+/// How a kernel is invoked. Set by the kernel author; read by the
+/// solver's cost model and by codegen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LaunchKind {
+    /// Extern "C" call from CPU. Paged attention, flash attention,
+    /// cutlass gemm, anything that needs host-side orchestration.
+    HostCallable,
+    /// `__device__` body that composes with other DeviceCallable
+    /// kernels in the same wave into a single megakernel.
+    DeviceCallable,
+}
+
+/// Explicit applicability signal. A kernel declares the workload
+/// range it's correct on; the solver refuses to pick it outside
+/// that range regardless of cost. Replaces the old "cost returns
+/// None means N/A" overload, which silently filtered bugs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WorkloadConstraint {
+    /// Valid at any `num_tokens`.
+    Any,
+    /// Valid only at `num_tokens ∈ [min, max]` inclusive. Used by
+    /// e.g. a GEMV kernel that's M=1-only, or a batched kernel
+    /// with a hard lower bound.
+    NumTokensRange { min: u64, max: u64 },
+}
+
+impl WorkloadConstraint {
+    pub fn accepts(&self, num_tokens: u64) -> bool {
+        match self {
+            Self::Any => true,
+            Self::NumTokensRange { min, max } => num_tokens >= *min && num_tokens <= *max,
+        }
+    }
+}
+
+/// Per-target applicability. Today only [`TargetFilter::Any`]; when
+/// we add sm_90-specific impls this grows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TargetFilter {
+    Any,
+}
+
+impl TargetFilter {
+    pub fn matches(&self, _target: &TargetProfile) -> bool {
+        match self {
+            Self::Any => true,
+        }
+    }
+}
+
+/// Result of a successful [`Implementation::matches`] call.
+#[derive(Clone, Debug)]
+pub struct MatchInfo {
+    /// The FUF tiles this match claims. One entry for single-op
+    /// impls; multiple for fused impls (e.g. a hypothetical
+    /// `fused_silu_gemm` claiming both the silu and the gemm tile
+    /// adjacent to it).
+    pub claimed_tiles: Vec<TileId>,
+}
+
+impl MatchInfo {
+    pub fn size(&self) -> usize {
+        self.claimed_tiles.len()
+    }
+    pub fn is_singleton(&self) -> bool {
+        self.claimed_tiles.len() == 1
+    }
+}
+
+/// One concrete kernel implementation.
 pub struct Implementation {
     pub name: &'static str,
+    /// The op this impl's default matcher binds to. For impls with
+    /// `matches_fn: Some`, this is advisory (the seed-op check is
+    /// inside the custom matcher).
     pub op: OpKind,
-    /// Bitmask of cooperative-exclusive resources this impl holds
-    /// for the duration of a step. Two impls with overlapping
-    /// masks can't run in the same BSP step.
-    pub claim_mask: u8,
-    /// Estimate kernel runtime in microseconds given input shapes
-    /// and this target's hardware specs, with all bound names
-    /// resolved via `bounds`. Returns `None` if shapes have
-    /// unresolved dim variables the impl can't estimate.
+    pub launch_kind: LaunchKind,
+    pub workload_constraint: WorkloadConstraint,
+    pub target_filter: TargetFilter,
+    /// Wall-clock estimate in microseconds. Returning `None` is a
+    /// bug, not "N/A" — use `workload_constraint` /
+    /// `target_filter` for applicability. The solver treats `None`
+    /// as a hard error.
     pub cost_fn: fn(&CostCtx) -> Option<f64>,
+    /// Multi-tile matcher. `None` → default single-op matcher that
+    /// returns `Some({claimed_tiles: [seed]})` iff `fuf[seed].op ==
+    /// self.op`. Impls that claim multiple tiles set this.
+    pub matches_fn: Option<fn(seed: TileId, fuf: &Fuf) -> Option<MatchInfo>>,
+}
+
+impl Implementation {
+    /// Try to match this impl starting at the given seed tile.
+    pub fn matches(&self, seed: TileId, fuf: &Fuf) -> Option<MatchInfo> {
+        if let Some(f) = self.matches_fn {
+            f(seed, fuf)
+        } else if fuf.get(seed).op == self.op {
+            Some(MatchInfo {
+                claimed_tiles: vec![seed],
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl std::fmt::Debug for Implementation {
@@ -41,7 +144,8 @@ impl std::fmt::Debug for Implementation {
         f.debug_struct("Implementation")
             .field("name", &self.name)
             .field("op", &self.op)
-            .field("claim_mask", &self.claim_mask)
+            .field("launch_kind", &self.launch_kind)
+            .field("workload_constraint", &self.workload_constraint)
             .finish()
     }
 }
@@ -55,8 +159,6 @@ pub struct CostCtx<'a> {
 }
 
 impl CostCtx<'_> {
-    /// Evaluate a `Dim` to a concrete integer using the current
-    /// bounds. Returns `None` if the dim contains a Var.
     pub fn eval_dim(&self, dim: &Dim) -> Option<u64> {
         match dim {
             Dim::Lit(n) => Some(*n),
@@ -78,7 +180,6 @@ impl CostCtx<'_> {
 #[derive(Debug, Default)]
 pub struct ImplementationLibrary {
     impls: Vec<Implementation>,
-    by_op: HashMap<OpKind, Vec<ImplId>>,
 }
 
 impl ImplementationLibrary {
@@ -88,17 +189,12 @@ impl ImplementationLibrary {
 
     pub fn push(&mut self, imp: Implementation) -> ImplId {
         let id = ImplId(self.impls.len() as u32);
-        self.by_op.entry(imp.op).or_default().push(id);
         self.impls.push(imp);
         id
     }
 
     pub fn get(&self, id: ImplId) -> &Implementation {
         &self.impls[id.0 as usize]
-    }
-
-    pub fn candidates(&self, op: OpKind) -> &[ImplId] {
-        self.by_op.get(&op).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn len(&self) -> usize {
@@ -108,77 +204,68 @@ impl ImplementationLibrary {
     pub fn is_empty(&self) -> bool {
         self.impls.is_empty()
     }
+
+    /// Iterate all impls with their ids. The DP solver uses this to
+    /// enumerate candidates at each seed tile.
+    pub fn iter_enumerated(&self) -> impl Iterator<Item = (ImplId, &Implementation)> + '_ {
+        self.impls
+            .iter()
+            .enumerate()
+            .map(|(i, imp)| (ImplId(i as u32), imp))
+    }
 }
 
 // ── Starter library ──────────────────────────────────────────────
 
-/// Starter library for any target: one Implementation per OpKind,
-/// cost estimates derived from analytical FLOPs / bandwidth.
-///
-/// These are *reference* costs, not hand-tuned CUTLASS numbers.
-/// Later phases can add more impls with better costs; the solver
-/// will pick whichever is cheapest. For Phase 7 MVP every tile has
-/// exactly one candidate, so the solver's job is trivially "assign
-/// the one available impl."
+/// Starter library: one HostCallable Implementation per OpKind,
+/// cost estimates derived from analytical FLOPs / bandwidth. Every
+/// impl accepts any workload and any target; differentiation comes
+/// when real target-specific / workload-specific kernels land.
 pub fn starter_library() -> ImplementationLibrary {
     let mut lib = ImplementationLibrary::new();
-    lib.push(Implementation {
-        name: "embed_ref",
-        op: OpKind::Embed,
-        claim_mask: 0,
-        cost_fn: cost_embed,
-    });
-    lib.push(Implementation {
-        name: "rmsnorm_ref",
-        op: OpKind::RmsNorm,
-        claim_mask: 0,
-        cost_fn: cost_elementwise,
-    });
-    lib.push(Implementation {
-        name: "gemm_ref",
-        op: OpKind::Gemm,
-        claim_mask: 0,
-        cost_fn: cost_gemm,
-    });
-    lib.push(Implementation {
-        name: "rope_append_ref",
-        op: OpKind::RopeAppend,
-        claim_mask: 0,
-        cost_fn: cost_elementwise,
-    });
-    lib.push(Implementation {
-        name: "attention_ref",
-        op: OpKind::Attention,
-        claim_mask: 0,
-        cost_fn: cost_attention,
-    });
-    lib.push(Implementation {
-        name: "silu_ref",
-        op: OpKind::Silu,
-        claim_mask: 0,
-        cost_fn: cost_elementwise,
-    });
-    lib.push(Implementation {
-        name: "add_ref",
-        op: OpKind::Add,
-        claim_mask: 0,
-        cost_fn: cost_elementwise,
-    });
+    lib.push(host_impl("embed_ref", OpKind::Embed, cost_embed));
+    lib.push(host_impl("rmsnorm_ref", OpKind::RmsNorm, cost_elementwise));
+    lib.push(host_impl("gemm_ref", OpKind::Gemm, cost_gemm));
+    lib.push(host_impl(
+        "rope_append_ref",
+        OpKind::RopeAppend,
+        cost_elementwise,
+    ));
+    lib.push(host_impl(
+        "attention_ref",
+        OpKind::Attention,
+        cost_attention,
+    ));
+    lib.push(host_impl("silu_ref", OpKind::Silu, cost_elementwise));
+    lib.push(host_impl("add_ref", OpKind::Add, cost_elementwise));
+    lib.push(host_impl("mul_ref", OpKind::Mul, cost_elementwise));
     lib
+}
+
+fn host_impl(
+    name: &'static str,
+    op: OpKind,
+    cost_fn: fn(&CostCtx) -> Option<f64>,
+) -> Implementation {
+    Implementation {
+        name,
+        op,
+        launch_kind: LaunchKind::HostCallable,
+        workload_constraint: WorkloadConstraint::Any,
+        target_filter: TargetFilter::Any,
+        cost_fn,
+        matches_fn: None,
+    }
 }
 
 // ── Cost functions ───────────────────────────────────────────────
 
-/// Bytes per element. Assume FP16 throughout for the cost model.
 const BYTES_PER_ELEM: f64 = 2.0;
 
-/// Total element count of a shape (product of dims).
 fn shape_elems(ctx: &CostCtx, shape: &Shape) -> Option<u64> {
     ctx.eval_shape(shape).map(|v| v.iter().product::<u64>())
 }
 
-/// Elementwise ops (rmsnorm, silu, add, rope_append): memory-bound.
-/// Cost = bytes_moved / peak_bandwidth.
 fn cost_elementwise(ctx: &CostCtx) -> Option<f64> {
     let bytes: u64 = ctx
         .input_shapes
@@ -191,15 +278,11 @@ fn cost_elementwise(ctx: &CostCtx) -> Option<f64> {
     Some((bytes as f64 / (gb_per_sec * 1e9)) * 1e6)
 }
 
-/// Embed: one gather per output element. Treat as bandwidth-bound.
 fn cost_embed(ctx: &CostCtx) -> Option<f64> {
     cost_elementwise(ctx)
 }
 
-/// Gemm: 2*M*N*K flops, compute-bound on peak FP16 tensor cores.
 fn cost_gemm(ctx: &CostCtx) -> Option<f64> {
-    // inputs[0]: [.., K], inputs[1]: [K, N]. M = product of input[0]
-    // dims except last.
     let x_dims = ctx.eval_shape(&ctx.input_shapes[0])?;
     let w_dims = ctx.eval_shape(&ctx.input_shapes[1])?;
     if x_dims.is_empty() || w_dims.len() != 2 {
@@ -213,19 +296,13 @@ fn cost_gemm(ctx: &CostCtx) -> Option<f64> {
     Some((flops / peak_flops_per_sec) * 1e6)
 }
 
-/// Attention: rough estimate — O(num_tokens^2 * head_dim * num_heads)
-/// for the score matmul + softmax + out matmul. Falls back to
-/// elementwise cost if shapes are Var-contaminated.
 fn cost_attention(ctx: &CostCtx) -> Option<f64> {
-    // Output: [.., num_attention_heads * head_dim]. Inputs 0..2 are q/k/v.
     let q_dims = ctx.eval_shape(&ctx.input_shapes[0])?;
     if q_dims.is_empty() {
         return None;
     }
-    let t = *q_dims.first().unwrap_or(&0); // num_tokens
-    let d = *q_dims.last().unwrap_or(&0); // heads * head_dim
-    // Two matmuls of [t, d] × [d, t] → 2 * t^2 * d, and score × v
-    // of [t, t] × [t, d] → 2 * t^2 * d. Total 4 * t^2 * d.
+    let t = *q_dims.first().unwrap_or(&0);
+    let d = *q_dims.last().unwrap_or(&0);
     let flops = 4.0 * t as f64 * t as f64 * d as f64;
     let peak_flops_per_sec = ctx.target.peak_tflops_fp16 * 1e12;
     Some((flops / peak_flops_per_sec) * 1e6)
@@ -266,25 +343,31 @@ mod tests {
     }
 
     #[test]
-    fn starter_library_has_one_impl_per_opkind() {
+    fn starter_library_has_one_host_impl_per_opkind() {
         let lib = starter_library();
         use OpKind::*;
-        for op in [Embed, RmsNorm, Gemm, RopeAppend, Attention, Silu, Add] {
-            assert_eq!(
-                lib.candidates(op).len(),
-                1,
-                "expected 1 candidate for {op:?}",
-            );
+        for op in [Embed, RmsNorm, Gemm, RopeAppend, Attention, Silu, Add, Mul] {
+            let matches: Vec<_> = lib.iter_enumerated().filter(|(_, i)| i.op == op).collect();
+            assert_eq!(matches.len(), 1, "expected 1 candidate for {op:?}");
+            assert_eq!(matches[0].1.launch_kind, LaunchKind::HostCallable);
+            assert_eq!(matches[0].1.workload_constraint, WorkloadConstraint::Any);
         }
+    }
+
+    #[test]
+    fn workload_constraint_accepts_inside_range() {
+        let c = WorkloadConstraint::NumTokensRange { min: 1, max: 8 };
+        assert!(c.accepts(1));
+        assert!(c.accepts(8));
+        assert!(!c.accepts(9));
+        assert!(!c.accepts(0));
+        assert!(WorkloadConstraint::Any.accepts(4096));
     }
 
     #[test]
     fn gemm_cost_is_proportional_to_mnk() {
         let target = l4();
         let bounds = llama_3_2_1b_bounds();
-        // x: [num_tokens=1, hidden_size=2048]
-        // w: [hidden_size=2048, vocab_size=128256]
-        // M=1, N=128256, K=2048 → 2MNK ≈ 525M FLOPs
         let inputs = vec![
             vec![bound("num_tokens"), bound("hidden_size")],
             vec![bound("hidden_size"), bound("vocab_size")],
@@ -297,7 +380,6 @@ mod tests {
             bounds: &bounds,
         };
         let cost_us = cost_gemm(&ctx).expect("should estimate");
-        // Expected: 525e6 FLOPs / (242e12 FLOPs/sec) * 1e6 us/sec ≈ 2.17 us.
         assert!(cost_us > 0.0);
         assert!(
             cost_us < 100.0,
@@ -309,7 +391,6 @@ mod tests {
     fn var_in_shape_gives_none_cost() {
         let target = l4();
         let bounds = llama_3_2_1b_bounds();
-        // A shape with a Var: cost must fall back to None.
         let mut solver = crate::shape::Solver::new();
         let v = solver.fresh();
         let inputs = vec![vec![bound("num_tokens"), Dim::Var(v)], vec![]];

@@ -67,12 +67,18 @@ pub enum OpKind {
     Attention,
     Silu,
     Add,
+    /// Elementwise multiplication. Produced by the DSL's `*`
+    /// operator (e.g. `gate * up` in the SwiGLU MLP). Not reachable
+    /// from `from_name` because `*` is a binary operator at the
+    /// parse level rather than a named call.
+    Mul,
     // Gemma2 extensions land here without touching any other pass:
     //   Gelu, SoftCap, SlidingAttention
 }
 
 impl OpKind {
-    /// Map a DSL op-call ident to its `OpKind`.
+    /// Map a DSL op-call ident to its `OpKind`. Binary operators
+    /// (currently just `*`) do not flow through this path.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "embed" => Some(Self::Embed),
@@ -95,6 +101,7 @@ impl OpKind {
             Self::Attention => "attention",
             Self::Silu => "silu",
             Self::Add => "add",
+            Self::Mul => "mul",
         }
     }
 }

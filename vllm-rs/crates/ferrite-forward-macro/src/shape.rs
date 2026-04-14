@@ -313,7 +313,8 @@ pub fn apply_signature(
         OpKind::RopeAppend => sig_rope_append(solver, inputs),
         OpKind::Attention => sig_attention(solver, inputs),
         OpKind::Silu => sig_unary_elementwise(solver, inputs, op),
-        OpKind::Add => sig_add(solver, inputs),
+        OpKind::Add => sig_binary_elementwise(solver, inputs, op),
+        OpKind::Mul => sig_binary_elementwise(solver, inputs, op),
     }
 }
 
@@ -478,15 +479,25 @@ fn sig_unary_elementwise(
     })
 }
 
-/// `add(x, y)` → x (shapes must match).
-fn sig_add(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
-    expect_args(OpKind::Add, inputs, 2)?;
+/// Binary elementwise ops (`add`, `mul`). Output shape equals
+/// either operand; operands are unified to enforce shape equality.
+fn sig_binary_elementwise(
+    solver: &mut Solver,
+    inputs: &[Shape],
+    op: OpKind,
+) -> Result<OpSig, ShapeError> {
+    expect_args(op, inputs, 2)?;
     let x = &inputs[0];
     let y = &inputs[1];
     if x.len() != y.len() {
         return Err(ShapeError::BadArgs {
-            op: OpKind::Add,
-            reason: format!("add operands differ in rank: {} vs {}", x.len(), y.len()),
+            op,
+            reason: format!(
+                "{} operands differ in rank: {} vs {}",
+                op.as_str(),
+                x.len(),
+                y.len()
+            ),
         });
     }
     for (a, b) in x.iter().zip(y) {
@@ -508,6 +519,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Attention => &[],
         OpKind::Silu => &[],
         OpKind::Add => &[],
+        OpKind::Mul => &[],
     }
 }
 
@@ -741,7 +753,7 @@ impl InferCtx {
                 let r = self.expr_shape(rhs)?;
                 if l.len() != r.len() {
                     return Err(ShapeError::BadArgs {
-                        op: OpKind::Add, // close enough for diagnostic
+                        op: OpKind::Mul,
                         reason: format!("mul operands differ in rank: {} vs {}", l.len(), r.len()),
                     });
                 }

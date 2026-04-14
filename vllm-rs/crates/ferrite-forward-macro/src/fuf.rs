@@ -257,81 +257,97 @@ impl<'a> Unroller<'a> {
         }
     }
 
-    /// Extract the input edges from a Call's arg list. `Mul` and
-    /// nested Calls are inlined as helper tiles (one per sub-op).
+    /// Extract the input edges from a Call's arg list. Nested calls
+    /// (e.g. `silu(gemm(..))`) and `Mul` expressions are inlined as
+    /// helper tiles (one per sub-op). The returned FufInputs point
+    /// at those helper tiles.
     fn resolve_args_from_expr(&mut self, expr: &Expr) -> Result<Vec<FufInput>, UnrollError> {
         match expr {
             Expr::Call { args, .. } => args
                 .iter()
-                .map(|a| self.resolve_arg(a))
+                .map(|a| self.resolve_arg(a).map(|(inp, _shape)| inp))
                 .collect::<Result<Vec<_>, _>>(),
             _ => unreachable!("RHS must be a Call; caller checks"),
         }
     }
 
     /// Turn a classified Expr that appears as an op arg into a
-    /// `FufInput`. Nested calls (e.g. `silu(gemm(..))`) get lowered
-    /// as their own tiles whose output becomes the input here.
-    fn resolve_arg(&mut self, expr: &Expr) -> Result<FufInput, UnrollError> {
+    /// `FufInput` plus the resolved shape of that input.
+    ///
+    /// The shape is load-bearing: nested calls push helper tiles
+    /// whose output shape must be correct so downstream cost
+    /// functions can evaluate them. A Mul tile whose operands came
+    /// from nested Calls, for example, feeds a downstream GEMM —
+    /// if the Mul's output shape is empty, the GEMM's cost returns
+    /// None and the solver errors out.
+    fn resolve_arg(&mut self, expr: &Expr) -> Result<(FufInput, Shape), UnrollError> {
         match expr {
             Expr::Local(id) => {
                 let &(tile, slot) = self
                     .local_to_tile
                     .get(id)
                     .ok_or(UnrollError::MissingLocal { id: *id })?;
-                Ok(FufInput::Tile { id: tile, slot })
+                let shape = self.nodes[tile.0 as usize]
+                    .outputs
+                    .get(slot as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                Ok((FufInput::Tile { id: tile, slot }, shape))
             }
             Expr::Extern { kind, index } => {
                 let index = index.map(|lid| self.loop_var_value(lid)).transpose()?;
-                Ok(FufInput::Extern { kind: *kind, index })
+                let shape = crate::shape::extern_shape(*kind);
+                Ok((FufInput::Extern { kind: *kind, index }, shape))
             }
             Expr::Weight { id, index } => {
                 let index = index.map(|lid| self.loop_var_value(lid)).transpose()?;
-                Ok(FufInput::Weight { id: *id, index })
+                let shape = self.inferred.weights.get(id).cloned().unwrap_or_default();
+                Ok((FufInput::Weight { id: *id, index }, shape))
             }
             Expr::Call { op, args } => {
-                // Nested call — promote it to its own tile so the
-                // FUF stays a pure op-per-tile graph.
-                let inputs: Vec<FufInput> = args
+                // Nested call — promote it to its own tile. Compute
+                // its output shape via the op's signature so the
+                // FUF carries real shapes for downstream cost
+                // evaluation.
+                let resolved: Vec<(FufInput, Shape)> = args
                     .iter()
                     .map(|a| self.resolve_arg(a))
                     .collect::<Result<_, _>>()?;
-                // Output shape: run the signature synthetically by
-                // reading from Inferred isn't possible (no LocalId
-                // for a nested call). Use an empty shape as a
-                // placeholder; Phase 7+ can reconstruct shapes from
-                // the op signature if they need them. For Phase 6
-                // the structural correctness is what matters.
-                let tile_id = self.push_tile(*op, inputs, vec![Vec::new()]);
-                Ok(FufInput::Tile {
-                    id: tile_id,
-                    slot: 0,
-                })
+                let (inputs, input_shapes): (Vec<FufInput>, Vec<Shape>) =
+                    resolved.into_iter().unzip();
+                let mut throwaway = crate::shape::Solver::new();
+                let sig = crate::shape::apply_signature(&mut throwaway, *op, &input_shapes)
+                    .map_err(|e| {
+                        UnrollError::UnsupportedCfgShape(format!(
+                            "nested {} shape: {e}",
+                            op.as_str()
+                        ))
+                    })?;
+                let out_shape = sig.output.clone();
+                let tile_id = self.push_tile(*op, inputs, vec![sig.output]);
+                Ok((
+                    FufInput::Tile {
+                        id: tile_id,
+                        slot: 0,
+                    },
+                    out_shape,
+                ))
             }
             Expr::Mul { lhs, rhs } => {
-                let l = self.resolve_arg(lhs)?;
-                let r = self.resolve_arg(rhs)?;
-                // Emit a Mul tile. Shape inference tests ensure
-                // the operands' shapes match.
-                let tile_id = self.push_tile(OpKind::Add, vec![l, r], vec![Vec::new()]);
-                // We don't have a dedicated OpKind::Mul (yet); the
-                // DSL's `*` is a structural separator used to split
-                // gate * up. Represent it as Add for now — but
-                // shape inference test above covers it and Phase 7
-                // distinguishes via the tile's source ast node if
-                // needed. For genuine DSL-level Mul we'd add an
-                // OpKind::Mul variant.
-                //
-                // TODO(phase 9): add OpKind::Mul if codegen needs
-                // to distinguish. For the current DSL vocabulary
-                // add and mul serialize to different CUDA kernels
-                // anyway via the op signature, so sharing the
-                // OpKind variant for the Mul node is a bug that'll
-                // surface during codegen. Reserve for future fix.
-                Ok(FufInput::Tile {
-                    id: tile_id,
-                    slot: 0,
-                })
+                // Elementwise multiplication (DSL's `*`, e.g.
+                // `gate * up`). Output shape equals either operand;
+                // we take the left operand's shape since shape
+                // inference has already unified the two.
+                let (l, l_shape) = self.resolve_arg(lhs)?;
+                let (r, _r_shape) = self.resolve_arg(rhs)?;
+                let tile_id = self.push_tile(OpKind::Mul, vec![l, r], vec![l_shape.clone()]);
+                Ok((
+                    FufInput::Tile {
+                        id: tile_id,
+                        slot: 0,
+                    },
+                    l_shape,
+                ))
             }
         }
     }
@@ -549,6 +565,32 @@ mod tests {
             })
             .collect();
         assert_eq!(slots, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn swiglu_mul_emits_opkind_mul_not_add() {
+        // The real Llama SwiGLU MLP uses `silu(gate) * up`. The
+        // unroller emits the `*` as an OpKind::Mul tile. Regression
+        // check for the pre-fix shortcut that emitted OpKind::Add
+        // for Expr::Mul (silent wrong-answer at codegen time).
+        let params = llama_3_2_1b_params();
+        let fuf = unroll_src(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..1 {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                gate = silu(gemm(normed, mlp.gate_proj[layer]));
+                up = gemm(normed, mlp.up_proj[layer]);
+                down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
+            }
+            "#,
+            &params,
+        );
+        let n_mul = fuf.nodes.iter().filter(|n| n.op == OpKind::Mul).count();
+        let n_add = fuf.nodes.iter().filter(|n| n.op == OpKind::Add).count();
+        assert_eq!(n_mul, 1, "expected exactly one Mul tile for `gate * up`");
+        assert_eq!(n_add, 1, "expected exactly one Add tile (residual)");
     }
 
     #[test]

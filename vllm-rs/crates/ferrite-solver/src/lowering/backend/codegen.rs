@@ -48,8 +48,12 @@ pub fn generate_fuf(def: &ForwardDef) -> TokenStream {
         None => PlanFamily::DEFAULT_GRID.to_vec(),
     };
 
-    // Build the FUF tile graph.
-    let fuf = TileGraph::build_fuf(&def.dag, model.dims);
+    // Build the FUF tile graph via the new honest CFG + unroll
+    // pipeline (was `TileGraph::build_fuf(&def.dag, ...)` in the
+    // legacy ModelDag path; both produce structurally equivalent
+    // tile graphs — see `fuf::build_fuf_matches_legacy_llama`).
+    let fuf = crate::fuf::build_fuf(&def.cfg, model.dims)
+        .expect("fuf::build_fuf should not fail on a well-formed DSL");
     let library = build_library(target_id, model.dims);
 
     // Solve each workload bucket with the DP solver on the FUF.

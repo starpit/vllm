@@ -79,7 +79,7 @@ pub struct EdgeId(pub u32);
 /// writes, and gate-up concatenation inside other nodes; the
 /// normalization passes in [`TileGraph::from_reified`] lift them
 /// out so the solver sees every operation as a first-class node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TileKind {
     // ── RMS / norm ──
     /// Plain RMS norm: out = rms_norm(in, weight, eps).
@@ -246,6 +246,35 @@ pub struct TileGraph {
     pub dims: ModelDims,
 }
 
+/// Output of [`TileGraph::detect_iteration_structure`]. Splits the
+/// wavefront sequence into `pre-loop` + `body × reps` + `post-loop`
+/// regions by structural fingerprint matching. Used by codegen to
+/// pick "one iteration's worth" of dispatch entries and emit a
+/// runtime loop, without reading legacy `TileNode.layer` tags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IterationStructure {
+    /// Total wavefront count in the tile graph.
+    pub num_wavefronts: u32,
+    /// Number of wavefronts in the pre-loop prefix.
+    pub pre: u32,
+    /// Repeating body block, if detected. `None` for loop-free
+    /// graphs or graphs without a clean repeating region.
+    pub body: Option<BodyBlock>,
+    /// Number of wavefronts in the post-loop suffix.
+    pub post: u32,
+}
+
+/// A repeating block of wavefronts within the iteration structure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyBlock {
+    /// Wavefront index where the body starts (= `pre`).
+    pub start: u32,
+    /// Number of wavefronts in one iteration of the body.
+    pub size: u32,
+    /// Number of times the body block repeats.
+    pub reps: u32,
+}
+
 /// Model-specific dimensions that determine GEMM shapes **and** the
 /// structural shape of the tile graph.
 ///
@@ -327,6 +356,133 @@ impl TileGraph {
             wavefronts[i] = w;
         }
         wavefronts
+    }
+
+    /// Detect the repeating-iteration structure of the tile graph.
+    ///
+    /// For a uniform transformer (every transformer layer runs the
+    /// same sequence of ops), the wavefront sequence splits into
+    /// three parts:
+    ///
+    /// - a **pre-loop** prefix (e.g. `Embed`),
+    /// - a **body block** of K wavefronts that repeats R times,
+    /// - a **post-loop** suffix (e.g. final `RmsNorm` + `LmHead`).
+    ///
+    /// This method finds the largest such (K, R) split by
+    /// structural fingerprint matching on wavefronts. Two
+    /// wavefronts match if they contain tiles of the same kinds
+    /// reading the same weight-buffer names (without the
+    /// per-layer index).
+    ///
+    /// Returns `None` if no body block is detected (e.g. a
+    /// loop-free DSL, or one where every wavefront is unique).
+    /// Callers fall back to "everything is pre-loop" in that
+    /// case.
+    pub fn detect_iteration_structure(&self) -> IterationStructure {
+        let wavefronts = self.compute_wavefronts();
+        let n_waves = wavefronts.iter().copied().max().map(|m| m + 1).unwrap_or(0) as usize;
+        if n_waves == 0 {
+            return IterationStructure {
+                num_wavefronts: 0,
+                pre: 0,
+                body: None,
+                post: 0,
+            };
+        }
+
+        // Group tiles by wavefront.
+        let mut tiles_by_wf: Vec<Vec<TileId>> = vec![Vec::new(); n_waves];
+        for (i, w) in wavefronts.iter().enumerate() {
+            tiles_by_wf[*w as usize].push(TileId(i as u32));
+        }
+
+        // Compute a structural fingerprint per wavefront: a
+        // sorted list of (kind, weight_name) pairs. Two wavefronts
+        // from different iterations of the same loop body produce
+        // identical fingerprints because their weight names are
+        // un-indexed (`self_attn.q_proj`, not `self_attn.q_proj[3]`
+        // — phase 4 / fuf.rs strips the index).
+        let fingerprints: Vec<Vec<(TileKind, Option<String>)>> = tiles_by_wf
+            .iter()
+            .map(|wf| {
+                let mut v: Vec<(TileKind, Option<String>)> = wf
+                    .iter()
+                    .map(|t| {
+                        let n = &self.nodes[t.0 as usize];
+                        (n.kind, n.weight_name.clone())
+                    })
+                    .collect();
+                v.sort();
+                v
+            })
+            .collect();
+
+        // Find the largest (start, size, reps) triple where
+        // wavefront[start + i + j*size] == wavefront[start + i]
+        // for i in 0..size, j in 0..reps. Maximize reps*size —
+        // the total coverage of the repeating region.
+        let mut best: Option<(usize, usize, usize)> = None; // (start, size, reps)
+        for start in 0..n_waves {
+            // Don't bother searching blocks that extend past half the
+            // wavefront count — we need at least 2 reps to be a loop.
+            let max_size = (n_waves - start) / 2;
+            for size in 1..=max_size {
+                if fingerprints[start..start + size]
+                    .iter()
+                    .any(|f| f.is_empty())
+                {
+                    // Skip empty wavefronts in the candidate block.
+                    continue;
+                }
+                let mut reps = 1usize;
+                while start + (reps + 1) * size <= n_waves
+                    && fingerprints[start..start + size]
+                        == fingerprints[start + reps * size..start + (reps + 1) * size]
+                {
+                    reps += 1;
+                }
+                if reps >= 2 {
+                    let new_coverage = size * reps;
+                    let take = match best {
+                        None => true,
+                        Some((bs, bss, br)) => {
+                            let old_coverage = bss * br;
+                            // Prefer larger coverage. On ties,
+                            // prefer larger `start` — absorbs any
+                            // ambiguous prefix (e.g. a synthetic
+                            // ResidualAdd seed whose fingerprint
+                            // happens to match the loop body's
+                            // final ResidualAdd) into the pre-loop
+                            // rather than into the first iteration.
+                            new_coverage > old_coverage
+                                || (new_coverage == old_coverage && start > bs)
+                        }
+                    };
+                    if take {
+                        best = Some((start, size, reps));
+                    }
+                }
+            }
+        }
+
+        match best {
+            Some((start, size, reps)) => IterationStructure {
+                num_wavefronts: n_waves as u32,
+                pre: start as u32,
+                body: Some(BodyBlock {
+                    start: start as u32,
+                    size: size as u32,
+                    reps: reps as u32,
+                }),
+                post: (n_waves - start - size * reps) as u32,
+            },
+            None => IterationStructure {
+                num_wavefronts: n_waves as u32,
+                pre: n_waves as u32,
+                body: None,
+                post: 0,
+            },
+        }
     }
 
     /// Build a normalized tile graph for one Llama-style forward
@@ -515,6 +671,99 @@ mod self_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn detect_iteration_structure_llama_forward() {
+        // `build_llama_forward_1b(N)` uses a synthetic ResidualAdd
+        // seed (no Embed, no post-loop). So:
+        //   pre  = 1 (the seed — its own wavefront 0)
+        //   body = start=1, size=12, reps=N
+        //   post = 0
+        for n in [1u16, 2, 3, 8, 16] {
+            let g = TileGraph::build_llama_forward_1b(n);
+            let is = g.detect_iteration_structure();
+            if n == 1 {
+                // With a single iteration we can't prove it's a
+                // loop; detector returns None (reps < 2).
+                assert_eq!(is.body, None, "n={n}: single iter isn't a loop");
+                continue;
+            }
+            let body = is.body.expect("body block should be detected");
+            assert_eq!(is.pre, 1, "n={n} pre");
+            assert_eq!(body.start, 1, "n={n} body start");
+            assert_eq!(body.size, 12, "n={n} body size");
+            assert_eq!(body.reps, n as u32, "n={n} body reps");
+            assert_eq!(is.post, 0, "n={n} post");
+            assert_eq!(is.num_wavefronts, 1 + 12 * n as u32);
+        }
+    }
+
+    #[test]
+    fn detect_iteration_structure_full_llama_dsl() {
+        // The real `forward!()`-shape DSL: embed → loop × N → norm
+        // → lm_head. One iteration = 12 wavefronts as before, plus
+        // pre-loop (embed, 1 wavefront) and post-loop (final norm
+        // + lm_head, 2 wavefronts).
+        let dsl = r#"
+            kernel llama<NL=4, HD=128, ID=128, HDM=32, NAH=4, NKH=1, VS=1024> {
+                hidden_states = embed(input_ids, embed_tokens);
+                for layer in 0..NL {
+                    let normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                    let q = gemm(normed, self_attn.q_proj[layer]);
+                    let k = gemm(normed, self_attn.k_proj[layer]);
+                    let v = gemm(normed, self_attn.v_proj[layer]);
+                    let (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                    let attn = attention(q, k, v, kv_cache[layer], block_table);
+                    let oproj = gemm(attn, self_attn.o_proj[layer]);
+                    hidden_states = add(oproj, hidden_states);
+
+                    let normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                    let gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                    let up = gemm(normed2, mlp.up_proj[layer]);
+                    let down = gemm(gate * up, mlp.down_proj[layer]);
+                    hidden_states = add(down, hidden_states);
+                }
+                let final_norm = rmsnorm(hidden_states, norm);
+                logits = gemm(final_norm, lm_head);
+            }
+        "#;
+        let def: crate::parse::MegakernelDef =
+            syn::parse2(dsl.parse::<proc_macro2::TokenStream>().unwrap()).unwrap();
+        let cfg = crate::cfg::build_cfg(&def);
+        let tg = crate::fuf::build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
+
+        let is = tg.detect_iteration_structure();
+        let body = is.body.expect("body block should be detected");
+        assert_eq!(is.pre, 1, "pre-loop = embed (1 wavefront)");
+        assert_eq!(body.start, 1);
+        assert_eq!(body.size, 12, "one iteration = 12 wavefronts");
+        assert_eq!(body.reps, 4, "NL = 4 iterations");
+        assert_eq!(is.post, 2, "final norm + lm_head");
+        assert_eq!(is.num_wavefronts, 1 + 12 * 4 + 2);
+    }
+
+    #[test]
+    fn detect_iteration_structure_loop_free_dsl() {
+        // No loops → no body block. Everything is pre-loop.
+        let def: crate::parse::MegakernelDef = syn::parse2(
+            r#"
+                kernel t<HD=128, ID=128, HDM=32, NAH=4, NKH=1, VS=1024> {
+                    hidden_states = embed(input_ids, embed_tokens);
+                    logits = gemm(hidden_states, lm_head);
+                }
+            "#
+            .parse::<proc_macro2::TokenStream>()
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = crate::cfg::build_cfg(&def);
+        let tg = crate::fuf::build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
+
+        let is = tg.detect_iteration_structure();
+        assert_eq!(is.body, None);
+        assert_eq!(is.pre, 2, "both tiles are pre-loop when there's no loop");
+        assert_eq!(is.post, 0);
     }
 
     #[test]

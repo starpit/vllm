@@ -93,15 +93,10 @@ pub struct WorkloadRange {
 /// Parsed `forward!` DSL.
 #[derive(Clone, Debug)]
 pub struct ForwardDef {
-    /// The model's forward pass structure, parsed as a ModelDag.
-    /// Legacy IR — consumed by `TileGraph::from_model_dag` in the
-    /// layer-based codegen path and by `extract_weight_fields`.
-    /// Scheduled for removal in phase 3 alongside the layer-based
-    /// codegen, at which point only `cfg` remains.
-    pub dag: crate::dag::ModelDag,
-    /// Control-flow graph for the DSL body. The new pipeline runs
+    /// Control-flow graph for the DSL body. The pipeline runs
     /// `fuf::build_fuf(&cfg, dims)` on this to produce the
-    /// solver's `TileGraph`.
+    /// solver's `TileGraph`, and `fuf::extract_weight_fields(&cfg)`
+    /// for the generated `Layer`/`Model` struct fields.
     pub cfg: crate::cfg::Cfg,
     /// Model dimensions to compile in. Multiple = multi-model binary.
     /// Runtime = solver runs at startup with dims from loaded weights.
@@ -154,12 +149,10 @@ impl Parse for ForwardDef {
         })?;
 
         let def: crate::parse::MegakernelDef = syn::parse2(wrapped)?;
-        let dag = crate::parse::build_dag(&def)
-            .map_err(|e| syn::Error::new(proc_macro2::Span::call_site(), e))?;
-        // New pipeline: AST → CFG. Consumed by the FUF codegen
-        // path via `fuf::build_fuf(&cfg, dims)`. Cheap to build; we
-        // do it eagerly so downstream callers don't have to hold
-        // onto the MegakernelDef.
+        // AST → CFG. Consumed by the FUF codegen path via
+        // `fuf::build_fuf(&cfg, dims)`. Cheap to build; we do it
+        // eagerly so downstream callers don't have to hold onto
+        // the `MegakernelDef`.
         let cfg = crate::cfg::build_cfg(&def);
 
         // ── Step 2: Parse optional key-value fields ──
@@ -228,7 +221,6 @@ impl Parse for ForwardDef {
         }
 
         Ok(ForwardDef {
-            dag,
             cfg,
             models: models.unwrap_or(Binding::Runtime),
             target: target.unwrap_or(Binding::Runtime),
@@ -363,7 +355,11 @@ mod tests {
         assert!(def.models.is_runtime());
         assert!(def.target.is_runtime());
         assert!(def.workloads.is_none());
-        assert!(!def.dag.ops.is_empty());
+        // Body parsed into a non-empty CFG with the DSL's block structure.
+        assert!(!def.cfg.blocks.is_empty());
+        // There must be at least one instruction in some block (the
+        // DSL wasn't completely empty).
+        assert!(def.cfg.blocks.iter().any(|b| !b.instrs.is_empty()));
     }
 
     #[test]

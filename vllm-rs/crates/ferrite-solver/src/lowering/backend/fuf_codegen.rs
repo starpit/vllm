@@ -224,9 +224,11 @@ fn emit_tile(
             })
         }
 
-        TileKind::QkvSplit | TileKind::Rope | TileKind::KvCacheWrite => {
-            // These are handled by the fused rope_append impl.
-            // Skip — the fused impl emits all the code.
+        TileKind::Rope => {
+            // Handled by the fused rope_append impl (claims the
+            // single Rope tile). The standalone-FUF codegen path
+            // here doesn't emit a separate kernel for this tile —
+            // the fused impl's wrapper emits the whole thing.
             None
         }
 

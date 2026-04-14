@@ -275,17 +275,26 @@ impl Builder {
             }
 
             "attention" | "attention_decode" | "attention_prefill" => {
+                // Post-phase-4b: q/k/v all bind to the same `Rope`
+                // tile (which is `rope_append`'s sole output
+                // producer). So attention's deps are just the
+                // resolved operand tiles, deduplicated — in
+                // practice [Rope]. The implementation knows how
+                // to split the rope-transformed Q from the cached
+                // K/V when it reads the kernel's input args.
                 let layer = self.layer_for(phase);
-                let q_dep = resolved[0].or(self.current_hidden).expect("attention q");
-                let kvw_dep = self
-                    .nodes
-                    .iter()
-                    .rev()
-                    .find(|n| n.kind == TileKind::KvCacheWrite && n.layer == layer)
-                    .map(|n| n.id);
-                let mut deps = vec![q_dep];
-                if let Some(kvw) = kvw_dep {
-                    deps.push(kvw);
+                let mut deps: Vec<TileId> = Vec::new();
+                for r in &resolved {
+                    if let Some(id) = r
+                        && !deps.contains(id)
+                    {
+                        deps.push(*id);
+                    }
+                }
+                if deps.is_empty()
+                    && let Some(h) = self.current_hidden
+                {
+                    deps.push(h);
                 }
                 let tile = self.push(TileKind::Attention, layer, deps, None);
                 Ok(tile)
@@ -327,9 +336,8 @@ impl Builder {
             Instr::LetTuple { names, call } => {
                 // `let (q, k, v) = rope_append(...)` is the only
                 // tuple-producing op today. Lower it directly so we
-                // can bind the three names to the three internal
-                // tiles (Rope for q, KvCacheWrite for k/v) exactly
-                // like the legacy build_fuf.
+                // can bind all three names to the single honest
+                // `Rope` tile.
                 let op = call.op.to_string();
                 if op == "rope_append" {
                     self.lower_rope_append(names, &call.args, phase)?;
@@ -369,19 +377,20 @@ impl Builder {
             .expect("rope_append v_in");
         // positions, rotary, kv_cache[layer] are externals — not tile producers.
 
-        let split = self.push(TileKind::QkvSplit, layer, vec![q_in, k_in, v_in], None);
-        let rope = self.push(TileKind::Rope, layer, vec![split], None);
-        let _kvw = self.push(TileKind::KvCacheWrite, layer, vec![rope], None);
+        // Single honest `Rope` tile. Represents the whole
+        // `rope_append` op: applies rotary to Q/K and appends
+        // K/V into the paged cache. Any kernel that wants to
+        // split this into separate qkv-unpack / rotary /
+        // cache-write phases handles that internally.
+        let rope = self.push(TileKind::Rope, layer, vec![q_in, k_in, v_in], None);
 
-        // Legacy quirk preserved for phase-1 compat: the Rope /
-        // KvCacheWrite tiles exist in the graph, but q/k/v stay
-        // bound to the *pre*-rope GEMM tiles. Attention picks up
-        // its KvCacheWrite dep via a separate by-layer scan below.
-        // This whole mess (QkvSplit, KvCacheWrite, the decoupling
-        // between output names and producer tiles) is scheduled
-        // for removal in phase 4, which will emit a single honest
-        // `RopeAppend` tile whose outputs are the real q/k/v.
-        let _ = names;
+        // All three output names bind to the single Rope tile.
+        // Downstream attention reads `q`, `k`, `v` — all three
+        // resolve to the Rope tile (its output carries the
+        // rope-transformed Q + cached K/V references).
+        for name in names {
+            self.buf_to_tile.insert(name.to_string(), rope);
+        }
         Ok(())
     }
 }
@@ -591,28 +600,26 @@ mod tests {
         let cfg = build_cfg(&def);
         let tg = build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).expect("build_fuf");
 
-        // 1 embed + 17 per layer * 2 layers + 2 post-loop = 37.
-        assert_eq!(tg.nodes.len(), 37, "tile count on 2-layer LLaMA");
+        // 1 embed + 15 per layer * 2 layers + 2 post-loop = 33.
+        assert_eq!(tg.nodes.len(), 33, "tile count on 2-layer LLaMA");
         assert_eq!(tg.num_layers, 2);
 
-        // Per-layer tile pattern (kind, layer) — tiles 1..=17 for
-        // layer 0, tiles 18..=34 for layer 1.
+        // Per-layer tile pattern (kind, layer) — tiles 1..=15 for
+        // layer 0, tiles 16..=30 for layer 1.
         let expected_per_layer = [
             TileKind::RmsNorm, // attn_norm
             TileKind::GemmQ,
             TileKind::GemmK,
             TileKind::GemmV,
-            TileKind::QkvSplit,     // phantom (phase 4c removes)
-            TileKind::Rope,         // phantom
-            TileKind::KvCacheWrite, // phantom
+            TileKind::Rope, // honest rope_append — was QkvSplit+Rope+KvCacheWrite before 4b
             TileKind::Attention,
             TileKind::GemmOProj,
             TileKind::ResidualAdd, // attn residual
             TileKind::RmsNorm,     // mlp_norm
             TileKind::GemmGate,
-            TileKind::Silu, // honest silu(gate_gemm) — was passthrough before 4a
+            TileKind::Silu, // honest silu(gate_gemm) — 4a
             TileKind::GemmUp,
-            TileKind::Mul, // honest gate * up — was GateUpConcat+SiluMul before 4a
+            TileKind::Mul, // honest gate * up — 4a
             TileKind::GemmDown,
             TileKind::ResidualAdd, // mlp residual
         ];
@@ -632,9 +639,9 @@ mod tests {
         }
 
         // Post-loop: final RMS norm at layer == num_layers, then
-        // GemmLmHead.
-        let post0 = &tg.nodes[35];
-        let post1 = &tg.nodes[36];
+        // GemmLmHead. Offsets: 1 (embed) + 15 × 2 (layer body) = 31.
+        let post0 = &tg.nodes[31];
+        let post1 = &tg.nodes[32];
         assert_eq!(post0.kind, TileKind::RmsNorm);
         assert_eq!(post0.layer, 2);
         assert_eq!(post0.weight_name.as_deref(), Some("norm"));
@@ -653,10 +660,11 @@ mod tests {
         let cfg = build_cfg(&def);
         let tg = build_fuf(&cfg, ModelDims::LLAMA_3_2_1B).unwrap();
 
-        // Layer 0's mlp residual add is at index 1 + 16 = 17.
-        // Layer 1's attn rmsnorm is at index 18.
-        let layer0_mlp_add = &tg.nodes[17];
-        let layer1_attn_norm = &tg.nodes[18];
+        // Layer 0's mlp residual add is at index 1 + 14 = 15
+        // (last tile of the 15-tile per-layer block).
+        // Layer 1's attn rmsnorm is at index 16.
+        let layer0_mlp_add = &tg.nodes[15];
+        let layer1_attn_norm = &tg.nodes[16];
         assert_eq!(layer0_mlp_add.kind, TileKind::ResidualAdd);
         assert_eq!(layer1_attn_norm.kind, TileKind::RmsNorm);
         assert!(

@@ -406,8 +406,8 @@ mod tests {
         let tg = crate::fuf::build_fuf(&cfg, crate::lowering::tile_graph::ModelDims::LLAMA_3_2_1B)
             .expect("fuf build failed");
 
-        // 1 embed + 17 × 16 layers + 2 post-loop = 275 tiles.
+        // 1 embed + 15 × 16 layers + 2 post-loop = 243 tiles.
         assert_eq!(tg.num_layers, 16);
-        assert_eq!(tg.nodes.len(), 1 + 17 * 16 + 2);
+        assert_eq!(tg.nodes.len(), 1 + 15 * 16 + 2);
     }
 }

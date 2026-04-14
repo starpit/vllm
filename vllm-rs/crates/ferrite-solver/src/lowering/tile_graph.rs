@@ -39,12 +39,8 @@
 //!
 //! - `lift_residual_adds`: every layer's down/o_proj GEMM gets a
 //!   distinct `ResidualAdd` consumer.
-//! - `lift_qkv_split`: a `QkvSplit` consumer of every qkv-gemm node
-//!   produces three distinct outputs (Q, K, V).
-//! - `lift_kv_cache_write`: K and V outputs flow through
-//!   `KvCacheWrite` nodes before the attention reads them.
-//! - `lift_gate_up_concat`: gate-gemm and up-gemm outputs flow
-//!   through a `GateUpConcat` node before the silu-mul.
+//! (phase-4 status: phantom lifting is gone. Silu and Mul are
+//! honest tiles; `rope_append` lowers to a single `Rope` tile.)
 //!
 //! Future passes (when CUTLASS sm_90 / TMA enters the library):
 //!
@@ -116,16 +112,15 @@ pub enum TileKind {
     GemmLmHead,
 
     // ── Position encoding + cache ──
-    /// Splits the packed qkv buffer into three logical outputs
-    /// (Q, K, V). One node per layer; outputs Q, K, V as separate
-    /// tiles.
-    QkvSplit,
-    /// Rotary embedding applied to Q and K. Reads from the QkvSplit
-    /// outputs; writes back to the same logical Q/K tiles.
+    /// DSL's `rope_append(q, k, v, positions, rotary, kv_cache)`.
+    /// Single tile for the whole op — applies rotary embedding to
+    /// Q/K and appends K/V into the paged cache. Deps are the
+    /// three operand tiles (q_gemm, k_gemm, v_gemm); external
+    /// inputs (positions, rotary, kv_cache) are not tile-tracked.
+    /// Implementations may claim this alone, or fused with
+    /// adjacent GEMMs / attention — fusion is the cover decision,
+    /// the IR stays honest.
     Rope,
-    /// Writes K and V into the paged KV cache for the layer. One
-    /// node per layer.
-    KvCacheWrite,
 
     // ── Attention ──
     /// FlashAttention-style attention over Q + paged KV cache.
@@ -199,9 +194,7 @@ impl TileKind {
             TileKind::GemmUp => "gemm_up",
             TileKind::GemmDown => "gemm_down",
             TileKind::GemmLmHead => "gemm_lm_head",
-            TileKind::QkvSplit => "qkv_split",
             TileKind::Rope => "rope",
-            TileKind::KvCacheWrite => "kv_cache_write",
             TileKind::Attention => "attention",
             TileKind::Silu => "silu",
             TileKind::Mul => "mul",
@@ -393,14 +386,14 @@ mod self_tests {
 
     #[test]
     fn llama_forward_has_expected_node_count_per_layer() {
-        // Per layer: 1 attn_norm, 3 qkv_gemm (q,k,v), 1 qkv_split,
-        //            1 rope, 1 kv_cache_write, 1 attention, 1 o_proj,
-        //            1 attn_residual, 1 mlp_norm, 1 gate_gemm,
-        //            1 up_gemm, 1 gate_up_concat, 1 silu_mul,
-        //            1 down_gemm, 1 mlp_residual = 17 nodes per layer.
+        // Per layer after phase-4 cleanup: 1 attn_norm, 3 qkv_gemm
+        // (q,k,v), 1 rope (honest rope_append), 1 attention,
+        // 1 o_proj, 1 attn_residual, 1 mlp_norm, 1 gate_gemm,
+        // 1 silu, 1 up_gemm, 1 mul, 1 down_gemm, 1 mlp_residual
+        // = 15 nodes per layer.
         // Plus 1 synthetic input node for the very first layer.
         let g = TileGraph::build_llama_forward_1b(2);
-        assert_eq!(g.nodes.len(), 1 + 2 * 17);
+        assert_eq!(g.nodes.len(), 1 + 2 * 15);
         assert_eq!(g.num_layers, 2);
     }
 

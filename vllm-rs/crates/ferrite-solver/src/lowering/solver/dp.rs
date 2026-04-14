@@ -144,8 +144,6 @@ impl Solver for DpSolver {
                     if matches!(
                         node.kind,
                         crate::lowering::tile_graph::TileKind::ResidualAdd
-                            | crate::lowering::tile_graph::TileKind::QkvSplit
-                            | crate::lowering::tile_graph::TileKind::KvCacheWrite
                     ) {
                         let sg = SubgraphId(next_subgraph);
                         next_subgraph += 1;

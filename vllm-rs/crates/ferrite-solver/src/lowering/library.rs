@@ -874,19 +874,21 @@ impl Implementation for CublasFusedQkvGemmImpl {
         if node.kind != TileKind::GemmQ {
             return None;
         }
-        let layer = node.layer;
         let deps = &node.deps;
 
-        // Find sibling GemmK and GemmV on the same layer with the
-        // same dependencies (i.e. same input activation).
+        // Find sibling GemmK and GemmV with the same dependencies
+        // (i.e. same input activation). Matching deps uniquely
+        // identifies tiles in the same iteration: two GemmK tiles
+        // from different loop iterations necessarily have different
+        // deps (each iteration's RmsNorm is a distinct tile).
         let k_tile = tile_graph
             .nodes
             .iter()
-            .find(|n| n.kind == TileKind::GemmK && n.layer == layer && n.deps == *deps)?;
+            .find(|n| n.kind == TileKind::GemmK && n.deps == *deps)?;
         let v_tile = tile_graph
             .nodes
             .iter()
-            .find(|n| n.kind == TileKind::GemmV && n.layer == layer && n.deps == *deps)?;
+            .find(|n| n.kind == TileKind::GemmV && n.deps == *deps)?;
 
         Some(MatchInfo {
             claimed_tiles: vec![seed, k_tile.id, v_tile.id],
@@ -981,31 +983,34 @@ impl Implementation for CublasFusedQkvGemmWithBiasImpl {
         if node.kind != TileKind::GemmQ {
             return None;
         }
-        let layer = node.layer;
         let deps = &node.deps;
 
-        // Find sibling GemmK and GemmV on the same layer with the
-        // same dependencies (i.e. same input activation).
+        // Find sibling GemmK and GemmV with the same dependencies
+        // (deps-match uniquely identifies same-iteration siblings).
         let k_tile = tile_graph
             .nodes
             .iter()
-            .find(|n| n.kind == TileKind::GemmK && n.layer == layer && n.deps == *deps)?;
+            .find(|n| n.kind == TileKind::GemmK && n.deps == *deps)?;
         let v_tile = tile_graph
             .nodes
             .iter()
-            .find(|n| n.kind == TileKind::GemmV && n.layer == layer && n.deps == *deps)?;
+            .find(|n| n.kind == TileKind::GemmV && n.deps == *deps)?;
 
-        // Find downstream BiasAdd for each GEMM tile.
+        // Find downstream BiasAdd for each GEMM tile. `deps.contains`
+        // on a specific TileId uniquely pins the match to the right
+        // consumer.
         let q_bias = tile_graph
             .nodes
             .iter()
-            .find(|n| n.kind == TileKind::BiasAdd && n.layer == layer && n.deps.contains(&seed))?;
-        let k_bias = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::BiasAdd && n.layer == layer && n.deps.contains(&k_tile.id)
-        })?;
-        let v_bias = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::BiasAdd && n.layer == layer && n.deps.contains(&v_tile.id)
-        })?;
+            .find(|n| n.kind == TileKind::BiasAdd && n.deps.contains(&seed))?;
+        let k_bias = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::BiasAdd && n.deps.contains(&k_tile.id))?;
+        let v_bias = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::BiasAdd && n.deps.contains(&v_tile.id))?;
 
         Some(MatchInfo {
             claimed_tiles: vec![seed, q_bias.id, k_tile.id, k_bias.id, v_tile.id, v_bias.id],
@@ -1086,14 +1091,14 @@ impl Implementation for CublasFusedGateUpGemmImpl {
         if node.kind != TileKind::GemmGate {
             return None;
         }
-        let layer = node.layer;
         let deps = &node.deps;
 
-        // Find sibling GemmUp on the same layer with the same deps.
+        // Find sibling GemmUp with the same deps (deps-match
+        // uniquely identifies the same-iteration sibling).
         let up_tile = tile_graph
             .nodes
             .iter()
-            .find(|n| n.kind == TileKind::GemmUp && n.layer == layer && n.deps == *deps)?;
+            .find(|n| n.kind == TileKind::GemmUp && n.deps == *deps)?;
 
         Some(MatchInfo {
             claimed_tiles: vec![seed, up_tile.id],
@@ -2803,11 +2808,10 @@ impl Implementation for CutlassGemmWithResidualImpl {
             return None;
         }
         let gemm_id = seed;
-        let residual = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::ResidualAdd
-                && n.layer == gemm_node.layer
-                && n.deps.contains(&gemm_id)
-        })?;
+        let residual = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::ResidualAdd && n.deps.contains(&gemm_id))?;
         let residual_id = residual.id;
         let residual_node = &tile_graph.nodes[residual_id.0 as usize];
         let mut boundary_inputs = gemm_node.deps.clone();
@@ -2993,7 +2997,7 @@ impl Implementation for CutlassNormGemmImpl {
         }
         let norm = gemm.deps.iter().find_map(|dep| {
             let n = &tile_graph.nodes[dep.0 as usize];
-            if n.kind == TileKind::RmsNorm && n.layer == gemm.layer {
+            if n.kind == TileKind::RmsNorm {
                 Some(n)
             } else {
                 None
@@ -3133,12 +3137,14 @@ impl Implementation for CutlassGemmSiluMulImpl {
         // Honest subgraph: GemmGate → Silu → Mul ← GemmUp. Phase 4a
         // replaced the old GateUpConcat+SiluMul phantoms with honest
         // Silu + Mul tiles; this kernel now claims the 3-tile chain.
-        let silu = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::Silu && n.layer == node.layer && n.deps.contains(&gate_id)
-        })?;
-        let mul = tile_graph.nodes.iter().find(|n| {
-            n.kind == TileKind::Mul && n.layer == node.layer && n.deps.contains(&silu.id)
-        })?;
+        let silu = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::Silu && n.deps.contains(&gate_id))?;
+        let mul = tile_graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == TileKind::Mul && n.deps.contains(&silu.id))?;
 
         // `mul`'s deps are [silu, up_gemm] (order depends on DSL).
         let up_dep = mul.deps.iter().find(|&&d| d != silu.id).copied()?;

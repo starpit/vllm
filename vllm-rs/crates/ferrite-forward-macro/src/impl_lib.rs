@@ -1815,22 +1815,41 @@ impl Implementation for AttentionViaCacheImpl {
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
         quote! {
+            // Decode paged attention. Delegates to the
+            // `attention_decode_from_cache` helper which:
+            //  - routes to `fp8_decode_attention` when kv_cache is fp8,
+            //  - else calls `flash_attn_paged_ext` with span-rotation
+            //    args derived from `kv_cache.block_unrotated_gpu()` so
+            //    relocatable/unrotated KV blocks get their RoPE applied
+            //    by FA2 in shared memory.
             let mut #out = unsafe {
-                ::ferrite_kernels::kernels::flash_attn_paged(
-                    *#q_expr,
-                    *ctx.kv_cache.k_cache(#layer),
-                    *ctx.kv_cache.v_cache(#layer),
-                    *ctx.cu_seqlens_q,
-                    *ctx.seqused_k,
-                    *ctx.block_table,
+                let has_spans = !ctx.kv_cache.block_unrotated_gpu().is_null();
+                let (cos_sin_ptr, rotary_dim) = if has_spans {
+                    (
+                        ctx.rotary.cos_sin_cache.raw_ptr() as *const u8,
+                        ctx.rotary.cos_sin_cache.dim(1),
+                    )
+                } else {
+                    (::std::ptr::null::<u8>(), 0)
+                };
+                ::ferrite_kernels::attention_helpers::attention_decode_from_cache(
+                    #q_expr,
+                    ctx.cu_seqlens_q,
+                    ctx.seqused_k,
+                    ctx.block_table,
                     ctx.max_seqlen_q,
                     ctx.max_seqlen_k,
                     #scale_tokens,
-                    true, // is_causal — always true for decoder-only LMs
-                    ctx.kv_cache.block_size,
+                    0.0,  // softcap
+                    -1,   // window_size_left (-1 = disabled)
+                    ctx.kv_cache,
+                    #layer,
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
+                    cos_sin_ptr,
+                    rotary_dim,
+                    false, // is_rotary_interleaved
                 )
             };
             // Flatten [num_tokens, num_q_heads, head_dim] → [num_tokens, q_size]

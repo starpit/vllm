@@ -281,16 +281,19 @@ mod tests {
 
         // Find the wave containing all three q/k/v gemms (they
         // read `normed` and are mutually independent). Starter
-        // library is 1 tile = 1 subgraph, so we look for a wave
-        // with 3 Gemm-op subgraphs.
+        // library is 1 tile = 1 subgraph, so look at each
+        // subgraph's single claimed tile's op.
         use crate::classified::OpKind;
-        let lib = starter_library();
         let mut found = false;
         for wave in &loop_ir.waves {
             let gemm_count = wave
                 .subgraphs
                 .iter()
-                .filter(|(_, imp_id)| lib.get(*imp_id).op == OpKind::Gemm)
+                .filter(|(sg, _)| {
+                    sfuf.tiles_in_subgraph(*sg)
+                        .iter()
+                        .any(|t| fuf.get(*t).op == OpKind::Gemm)
+                })
                 .count();
             if gemm_count == 3 {
                 found = true;

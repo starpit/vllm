@@ -199,36 +199,38 @@ fn solve_one(
     // library — see old dp.rs notes).
     let mut matches_at: Vec<Vec<(ImplId, MatchInfo, f64)>> = vec![Vec::new(); n];
 
-    for (i, node) in fuf.nodes.iter().enumerate() {
-        let input_shapes = resolve_input_shapes(fuf, node, inferred);
-        let ctx = CostCtx {
-            input_shapes: &input_shapes,
-            output_shapes: &node.outputs,
-            target,
-            bounds,
-        };
+    let ctx = CostCtx {
+        fuf,
+        profile: target,
+        bounds,
+    };
 
+    for (i, node) in fuf.nodes.iter().enumerate() {
         for (imp_id, imp) in lib.iter_enumerated() {
-            if !imp.target_filter.matches(target) {
+            if !imp.target_compatible(target) {
                 continue;
             }
-            if !imp.workload_constraint.accepts(num_tokens) {
+            if !imp.workload_constraint().accepts(num_tokens as u32) {
                 continue;
             }
-            let Some(info) = imp.matches(node.id, fuf) else {
+            let Some(info) = imp.matches(fuf, node.id, target) else {
                 continue;
             };
-            let cost = (imp.cost_fn)(&ctx).ok_or(SolveError::UnreachableCost {
-                tile: node.id,
-                op: node.op,
-                impl_id: imp_id,
-                num_tokens,
-            })?;
+            let cost = imp.cost_us(&info, &ctx);
+            if !cost.is_finite() {
+                return Err(SolveError::UnreachableCost {
+                    tile: node.id,
+                    op: node.op,
+                    impl_id: imp_id,
+                    num_tokens,
+                });
+            }
             matches_at[i].push((imp_id, info, cost));
         }
 
         matches_at[i].sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
     }
+    let _ = inferred; // no longer used here — shapes come via ctx.fuf
 
     // ── Phase 2: topological forward pass ──
     //
@@ -315,8 +317,8 @@ mod tests {
     use crate::config::{self, ModelParams};
     use crate::fuf::unroll;
     use crate::impl_lib::{
-        CostCtx, Implementation, ImplementationLibrary, LaunchKind, MatchInfo, TargetFilter,
-        WorkloadConstraint, starter_library,
+        CostCtx, Handoff, Implementation, ImplementationLibrary, LaunchKind, Layout, MatchInfo,
+        Resources, WorkloadConstraint, starter_library,
     };
     use crate::parse::parse_block;
     use crate::shape::infer;
@@ -461,29 +463,81 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cost_fn_returning_none_is_fatal() {
-        // First-None-fatal: no silent skipping. Even if another
-        // candidate would cost fine, a None from any matched Impl
-        // is a hard error.
-        fn always_none(_ctx: &CostCtx) -> Option<f64> {
-            None
+    // Minimal trait impl used by tests that exercise solver
+    // semantics at the trait boundary. Configurable cost + workload
+    // constraint + optional multi-tile matcher.
+    #[derive(Debug)]
+    struct TestImpl {
+        name: &'static str,
+        op: OpKind,
+        cost: f64,
+        workload: WorkloadConstraint,
+        multi_tile: Option<fn(&Fuf, TileId) -> Option<MatchInfo>>,
+    }
+    impl Implementation for TestImpl {
+        fn name(&self) -> &'static str {
+            self.name
         }
+        fn target_compatible(&self, _p: &TargetProfile) -> bool {
+            true
+        }
+        fn workload_constraint(&self) -> WorkloadConstraint {
+            self.workload
+        }
+        fn matches(&self, fuf: &Fuf, seed: TileId, _p: &TargetProfile) -> Option<MatchInfo> {
+            if let Some(f) = self.multi_tile {
+                f(fuf, seed)
+            } else if fuf.get(seed).op == self.op {
+                Some(MatchInfo {
+                    claimed_tiles: vec![seed],
+                    boundary_inputs: vec![],
+                    boundary_outputs: vec![seed],
+                })
+            } else {
+                None
+            }
+        }
+        fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+            self.cost
+        }
+        fn resources(&self, _m: &MatchInfo) -> Resources {
+            Resources::ZERO
+        }
+        fn launch_kind(&self) -> LaunchKind {
+            LaunchKind::HostCallback
+        }
+        fn supported_input_handoffs(&self) -> &[Handoff] {
+            &[Handoff::StreamOrder]
+        }
+        fn supported_output_handoffs(&self) -> &[Handoff] {
+            &[Handoff::StreamOrder]
+        }
+        fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+            vec![Layout::Any; m.boundary_inputs.len()]
+        }
+        fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+            vec![Layout::Any; m.boundary_outputs.len()]
+        }
+    }
 
+    #[test]
+    fn infinite_cost_is_fatal() {
+        // The solver's cost aggregator treats non-finite costs as
+        // UnreachableCost. A bug in an Impl's cost_us (returning
+        // INFINITY or NaN) surfaces loudly rather than silently
+        // propagating.
         let params = llama_params("llama-3.2-1b");
         let (fuf, inferred) = build("hidden_states = embed(input_ids, embed_tokens);", &params);
         let target = l4_target();
 
         let mut lib = ImplementationLibrary::new();
-        lib.push(Implementation {
+        lib.push(Box::new(TestImpl {
             name: "embed_buggy",
             op: OpKind::Embed,
-            launch_kind: LaunchKind::HostCallable,
-            workload_constraint: WorkloadConstraint::Any,
-            target_filter: TargetFilter::Any,
-            cost_fn: always_none,
-            matches_fn: None,
-        });
+            cost: f64::INFINITY,
+            workload: WorkloadConstraint::Any,
+            multi_tile: None,
+        }));
 
         let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap_err();
         assert!(
@@ -494,28 +548,18 @@ mod tests {
 
     #[test]
     fn workload_constraint_excludes_impls_outside_range() {
-        // An Impl that only accepts M ≤ 8. At M=4096 it's excluded
-        // by workload_constraint. If no other Impl covers embed,
-        // solver must emit UnclaimedTile — not silently use the
-        // excluded one.
         let params = llama_params("llama-3.2-1b");
         let (fuf, inferred) = build("hidden_states = embed(input_ids, embed_tokens);", &params);
         let target = l4_target();
 
-        fn cheap(_ctx: &CostCtx) -> Option<f64> {
-            Some(1.0)
-        }
-
         let mut lib = ImplementationLibrary::new();
-        lib.push(Implementation {
+        lib.push(Box::new(TestImpl {
             name: "embed_decode_only",
             op: OpKind::Embed,
-            launch_kind: LaunchKind::HostCallable,
-            workload_constraint: WorkloadConstraint::NumTokensRange { min: 1, max: 8 },
-            target_filter: TargetFilter::Any,
-            cost_fn: cheap,
-            matches_fn: None,
-        });
+            cost: 1.0,
+            workload: WorkloadConstraint::NumTokensRange { min: 1, max: 8 },
+            multi_tile: None,
+        }));
 
         // At M=1 it's fine.
         let ok = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
@@ -537,30 +581,21 @@ mod tests {
 
     #[test]
     fn multi_tile_matcher_collapses_to_one_subgraph() {
-        // A synthetic multi-tile matcher: claims ANY two adjacent
-        // add tiles (or returns None). Exercises the cover/impls
-        // split so multiple tiles → one subgraph is proven wired.
-        fn matches_double_add(seed: TileId, fuf: &Fuf) -> Option<MatchInfo> {
+        fn matches_double_add(fuf: &Fuf, seed: TileId) -> Option<MatchInfo> {
             if fuf.get(seed).op != OpKind::Add {
                 return None;
             }
-            // Find the next add after seed in FUF order, if any.
             let after = (seed.0 as usize + 1..fuf.len())
                 .map(|i| TileId(i as u32))
                 .find(|t| fuf.get(*t).op == OpKind::Add)?;
             Some(MatchInfo {
                 claimed_tiles: vec![seed, after],
+                boundary_inputs: vec![],
+                boundary_outputs: vec![seed, after],
             })
         }
 
-        // Cheaper than two single-add costs combined, so greedy
-        // prefers this multi-tile match when it applies.
-        fn cheap(_ctx: &CostCtx) -> Option<f64> {
-            Some(0.001)
-        }
-
         let params = llama_params("llama-3.2-1b");
-        // Body with multiple adds so the matcher has something to claim.
         let (fuf, inferred) = build(
             r#"
             hidden_states = embed(input_ids, embed_tokens);
@@ -574,33 +609,30 @@ mod tests {
         let target = l4_target();
 
         let mut lib = starter_library();
-        // Append a "fused double add" that claims 2 adds in one
-        // subgraph. Cheaper than two single adds from starter_library.
-        lib.push(Implementation {
+        lib.push(Box::new(TestImpl {
             name: "double_add_ref",
             op: OpKind::Add,
-            launch_kind: LaunchKind::DeviceCallable,
-            workload_constraint: WorkloadConstraint::Any,
-            target_filter: TargetFilter::Any,
-            cost_fn: cheap,
-            matches_fn: Some(matches_double_add),
-        });
+            cost: 0.001, // cheaper than two single adds
+            workload: WorkloadConstraint::Any,
+            multi_tile: Some(matches_double_add),
+        }));
 
         let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
         let sfuf = &workloads.per_num_tokens[&1];
 
-        // 1 embed + 4 adds = 5 tiles, but the fused double-add
-        // claims pairs of adds. Expected subgraph count: 1 embed +
-        // 2 fused = 3 (each fused subgraph covers 2 tiles).
+        // 1 embed + 4 adds; fused double-add claims pairs.
+        // Expected: 1 embed + 2 fused = 3 subgraphs.
         assert_eq!(sfuf.num_subgraphs(), 3, "adds should pair into subgraphs");
         assert!(sfuf.is_cover_complete(fuf.len()));
 
-        // Verify each fused subgraph actually covers 2 tiles.
+        // Find the subgraphs that cover Add tiles (structural —
+        // ask the FUF what op each subgraph's tiles have).
         let add_subgraphs: Vec<_> = sfuf
             .subgraphs()
             .filter(|sg| {
-                let imp_id = sfuf.impl_of(*sg).unwrap();
-                lib.get(imp_id).op == OpKind::Add
+                sfuf.tiles_in_subgraph(*sg)
+                    .iter()
+                    .all(|t| fuf.get(*t).op == OpKind::Add)
             })
             .collect();
         assert_eq!(add_subgraphs.len(), 2);

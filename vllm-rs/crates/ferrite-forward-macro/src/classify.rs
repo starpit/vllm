@@ -308,6 +308,7 @@ impl Ctx {
                 })
             }
             ast::Expr::ScalarLit(v) => Ok(Expr::ScalarLit(*v)),
+            ast::Expr::SqrtBound(ident) => Ok(Expr::SqrtBound(ident.clone())),
         }
     }
 

@@ -289,6 +289,10 @@ pub fn parse_expr(expr: &SynExpr) -> ParseResult<Expr> {
         }
 
         // Call: `gemm(x, w)`, `rmsnorm(x, w)`, etc.
+        //
+        // Special case: `sqrt(<bound_name>)` parses to a compile-time
+        // scalar expression (resolved per-model at CFG build). Any
+        // other shape of `sqrt(...)` is rejected.
         SynExpr::Call(c) => {
             let op = match &*c.func {
                 SynExpr::Path(p) if p.path.get_ident().is_some() => {
@@ -301,6 +305,26 @@ pub fn parse_expr(expr: &SynExpr) -> ParseResult<Expr> {
                     ));
                 }
             };
+            if op == "sqrt" {
+                if c.args.len() != 1 {
+                    return Err(syn::Error::new(
+                        op.span(),
+                        "`sqrt(<bound_name>)` takes exactly one argument",
+                    ));
+                }
+                let ident = match &c.args[0] {
+                    SynExpr::Path(p) if p.path.get_ident().is_some() => {
+                        p.path.get_ident().unwrap().clone()
+                    }
+                    other => {
+                        return Err(syn::Error::new(
+                            other.span(),
+                            "`sqrt(...)` argument must be a bound identifier",
+                        ));
+                    }
+                };
+                return Ok(Expr::SqrtBound(ident));
+            }
             let args = c
                 .args
                 .iter()

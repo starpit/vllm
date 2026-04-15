@@ -325,4 +325,8 @@ pub enum Expr {
     /// A numeric scalar literal. Used as an operand to elementwise
     /// ops that admit a scalar broadcast (e.g. Gemma's `w + 1.0`).
     ScalarLit(f64),
+    /// `sqrt(<bound_name>)` — unresolved compile-time scalar. The
+    /// CFG builder resolves this to `ScalarLit(bounds[name].sqrt())`
+    /// per-model (so the value becomes concrete before the FUF).
+    SqrtBound(Ident),
 }

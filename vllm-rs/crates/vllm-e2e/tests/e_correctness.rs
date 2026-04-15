@@ -68,3 +68,10 @@ async fn test_cuda_correctness_qwen2_0_5b() {
 async fn test_cuda_correctness_smollm_135m() {
     run_correctness_test(TestModels::SMOLLM_135M_CUDA, "smollm_135m").await;
 }
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_gemma2_2b() {
+    run_correctness_test(TestModels::GEMMA2, "gemma2_2b").await;
+}

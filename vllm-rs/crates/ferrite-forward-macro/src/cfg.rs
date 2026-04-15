@@ -196,6 +196,35 @@ impl<'a> CfgBuilder<'a> {
         self.blocks[block.0 as usize].term = term;
     }
 
+    /// Recursively fold compile-time scalar expressions using the
+    /// per-model bounds. Currently: `SqrtBound(name)` →
+    /// `ScalarLit((bounds[name] as f64).sqrt())`. Any other
+    /// expression descends into its children.
+    fn fold_scalars(&self, expr: &Expr) -> Result<Expr, CfgError> {
+        match expr {
+            Expr::SqrtBound(ident) => {
+                let name = ident.to_string();
+                let v = self.bounds.get(&name).copied().ok_or_else(|| {
+                    let available: Vec<String> = self.bounds.keys().cloned().collect();
+                    CfgError::UnknownBound { name, available }
+                })?;
+                Ok(Expr::ScalarLit((v as f64).sqrt()))
+            }
+            Expr::Call { op, args } => {
+                let args = args
+                    .iter()
+                    .map(|a| self.fold_scalars(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Expr::Call { op: *op, args })
+            }
+            Expr::Mul { lhs, rhs } => Ok(Expr::Mul {
+                lhs: Box::new(self.fold_scalars(lhs)?),
+                rhs: Box::new(self.fold_scalars(rhs)?),
+            }),
+            other => Ok(other.clone()),
+        }
+    }
+
     /// Lower a straight-line statement sequence into blocks. `start`
     /// is the block instrs begin accumulating in; on exit we jump
     /// to `end`.
@@ -208,20 +237,22 @@ impl<'a> CfgBuilder<'a> {
         for stmt in stmts {
             match stmt {
                 Stmt::Assign { target, value } => {
+                    let value = self.fold_scalars(value)?;
                     self.push_instr(
                         current,
                         Instr::Assign {
                             target: *target,
-                            value: value.clone(),
+                            value,
                         },
                     );
                 }
                 Stmt::AssignTuple { targets, value } => {
+                    let value = self.fold_scalars(value)?;
                     self.push_instr(
                         current,
                         Instr::AssignTuple {
                             targets: targets.clone(),
-                            value: value.clone(),
+                            value,
                         },
                     );
                 }

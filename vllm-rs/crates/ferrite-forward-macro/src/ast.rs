@@ -87,4 +87,9 @@ pub enum Expr {
     /// A numeric scalar literal (f64). Only valid as an operand to
     /// `Add` / `Mul`; not a standalone assignment.
     ScalarLit(f64),
+    /// `sqrt(<bound_name>)` — a compile-time scalar whose value is
+    /// `(bounds[name] as f64).sqrt()`. Resolved at CFG-build time
+    /// (where per-model bounds are known). Used e.g. by Gemma's
+    /// embedding scale `embed(ids, w) * sqrt(hidden_size)`.
+    SqrtBound(Ident),
 }

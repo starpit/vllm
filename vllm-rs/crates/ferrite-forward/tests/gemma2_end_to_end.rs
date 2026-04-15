@@ -22,7 +22,7 @@ use ferrite_forward::forward;
     workloads = [1, 8, 64, 512, 4096],
 )]
 fn gemma2() {
-    hidden_states = embed(input_ids, embed_tokens);
+    hidden_states = embed(input_ids, embed_tokens) * sqrt(hidden_size);
     for layer in 0..num_hidden_layers {
         pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer] + 1.0);
 
@@ -31,9 +31,9 @@ fn gemma2() {
         v = gemm(pre_attn_normed, self_attn.v_proj[layer]);
         (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
         if layer % sliding_window_pattern == 0 {
-            attn = attention(q, k, v, kv_cache[layer], block_table);
-        } else {
             attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
+        } else {
+            attn = attention(q, k, v, kv_cache[layer], block_table);
         }
         oproj = gemm(attn, self_attn.o_proj[layer]);
 
@@ -71,7 +71,7 @@ fn gemma2() {
 /// Total: 21 tiles per layer. Plus 1 embed at the top and 4
 /// post-loop tiles (Add + final rmsnorm + lm_head gemm + tanh_softcap).
 const GEMMA2_TILES_PER_LAYER: usize = 21;
-const GEMMA2_PRE_LOOP_TILES: usize = 1; // embed
+const GEMMA2_PRE_LOOP_TILES: usize = 2; // embed + ScalarMul (embed scale)
 const GEMMA2_POST_LOOP_TILES: usize = 4; // Add + final norm + lm_head + softcap
 
 fn expected_tiles(num_hidden_layers: usize) -> usize {
@@ -80,19 +80,19 @@ fn expected_tiles(num_hidden_layers: usize) -> usize {
 
 #[test]
 fn gemma2_2b_tile_count_matches_expected() {
-    // Gemma2-2B: 26 layers → 1 + 26 × 21 + 4 = 551.
+    // Gemma2-2B: 26 layers → 2 + 26 × 21 + 4 = 552.
     assert_eq!(gemma2_2b::NUM_TILES, expected_tiles(26));
 }
 
 #[test]
 fn gemma2_9b_tile_count_matches_expected() {
-    // Gemma2-9B: 42 layers → 1 + 42 × 21 + 4 = 887.
+    // Gemma2-9B: 42 layers → 2 + 42 × 21 + 4 = 888.
     assert_eq!(gemma2_9b::NUM_TILES, expected_tiles(42));
 }
 
 #[test]
 fn gemma2_27b_tile_count_matches_expected() {
-    // Gemma2-27B: 46 layers → 1 + 46 × 21 + 4 = 971.
+    // Gemma2-27B: 46 layers → 2 + 46 × 21 + 4 = 972.
     assert_eq!(gemma2_27b::NUM_TILES, expected_tiles(46));
 }
 

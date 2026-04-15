@@ -29,7 +29,14 @@ use ferrite_forward::forward;
     workloads = [1, 8, 64, 512, 4096],
 )]
 fn gemma2() {
-    hidden_states = embed(input_ids, embed_tokens);
+    // Gemma scales embeddings by sqrt(hidden_size) — matches vllm
+    // Python `hidden_states *= self.normalizer` (layernorm.py line
+    // 304) and hand-written `kernels::scale_inplace(hidden_states,
+    // embed_scale, ..)` in vllm-cuda's `Gemma2ForCausalLM::forward`.
+    // The `sqrt(hidden_size)` folds to a compile-time f64 per-model
+    // at CFG build; the `* scalar` triggers the ScalarMulImpl which
+    // emits `scale_inplace` on the embed output.
+    hidden_states = embed(input_ids, embed_tokens) * sqrt(hidden_size);
     for layer in 0..num_hidden_layers {
         // Pre-attention norm. Gemma's `(1+w)` convention rides as
         // a scalar addition on the weight ref — the solver's
@@ -43,10 +50,13 @@ fn gemma2() {
         k = gemm(pre_attn_normed, self_attn.k_proj[layer]);
         v = gemm(pre_attn_normed, self_attn.v_proj[layer]);
         (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+        // Gemma2 alternates: even layers are sliding, odd are full.
+        // HF default `layer_is_sliding[i] = (i % sliding_window_pattern == 0)`;
+        // matches vllm-cuda hand-written `i % 2 == 0` → sliding.
         if layer % sliding_window_pattern == 0 {
-            attn = attention(q, k, v, kv_cache[layer], block_table);
-        } else {
             attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
+        } else {
+            attn = attention(q, k, v, kv_cache[layer], block_table);
         }
         oproj = gemm(attn, self_attn.o_proj[layer]);
 

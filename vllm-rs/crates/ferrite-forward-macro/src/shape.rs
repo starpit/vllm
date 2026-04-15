@@ -845,9 +845,22 @@ impl InferCtx {
                 Ok(sig.output)
             }
             Expr::Mul { lhs, rhs } => {
-                // Elementwise multiplication (gate * up): shapes must match.
+                // Elementwise multiplication: tensor×tensor unifies
+                // shapes; scalar×tensor broadcasts the tensor shape
+                // (matches `sig_binary_elementwise`).
                 let l = self.expr_shape(lhs)?;
                 let r = self.expr_shape(rhs)?;
+                match (l.is_empty(), r.is_empty()) {
+                    (true, true) => {
+                        return Err(ShapeError::BadArgs {
+                            op: OpKind::Mul,
+                            reason: "mul of two scalars is a compile-time constant".into(),
+                        });
+                    }
+                    (true, false) => return Ok(r),
+                    (false, true) => return Ok(l),
+                    (false, false) => {}
+                }
                 if l.len() != r.len() {
                     return Err(ShapeError::BadArgs {
                         op: OpKind::Mul,
@@ -917,6 +930,12 @@ impl InferCtx {
             Expr::ScalarLit(_) => {
                 // Rank-0 — sig_binary_elementwise handles broadcast
                 // from the other operand.
+                Ok(Shape::new())
+            }
+            Expr::SqrtBound(_) => {
+                // Same shape treatment as ScalarLit; the CFG builder
+                // folds SqrtBound → ScalarLit once ModelParams is
+                // available, but shape inference runs before that.
                 Ok(Shape::new())
             }
         }

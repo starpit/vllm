@@ -1003,6 +1003,11 @@ pub fn starter_library() -> ImplementationLibrary {
     // (no upstream residual-Add): scalar rides as the rms_norm
     // kernel's `weight_offset` param.
     lib.push(Box::new(ScalarOffsetRmsNormImpl));
+    // Tile × scalar in-place multiply (e.g. Gemma embed scale).
+    // Only claims Mul tiles whose inputs are (Tile, Scalar); the
+    // tensor×tensor SwiGLU / GELU fusions claim the disjoint
+    // (Tile, Tile) pattern.
+    lib.push(Box::new(ScalarMulImpl));
     // Decode / prefill QKV+rope variants — the solver picks via
     // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
     lib.push(Box::new(FusedQkvRopeCacheImpl));
@@ -1511,6 +1516,144 @@ impl Implementation for FusedGateUpGeluMulImpl {
                     &mut device.caching,
                     device.compute_stream,
                 )
+            };
+        }
+    }
+}
+
+// ── ScalarMulImpl ────────────────────────────────────────────────
+//
+// Claims a singleton `OpKind::Mul` whose inputs are exactly one
+// Tile and one Scalar — the `x * s` pattern used e.g. by Gemma's
+// embedding scale (`embed(ids, w) * sqrt(hidden_size)`). Emits an
+// in-place `scale_inplace` kernel call (cublas S-axpy / scalEx)
+// and move-consumes the upstream OwnedTensor as the output.
+//
+// Tensor × tensor Muls (SwiGLU / GELU MLP fusions) have Tile+Tile
+// inputs and are claimed by `FusedGateUp{Silu,Gelu}MulImpl`; they
+// reject any Mul with non-Tile inputs, so the two Impl families
+// pick disjoint patterns.
+
+#[derive(Debug, Default)]
+pub struct ScalarMulImpl;
+
+impl Implementation for ScalarMulImpl {
+    fn name(&self) -> &'static str {
+        "scalar_mul_inplace"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::Mul || node.inputs.len() != 2 {
+            return None;
+        }
+        // Need exactly one Tile and one Scalar input (in either order).
+        let mut has_tile = false;
+        let mut has_scalar = false;
+        for inp in &node.inputs {
+            match inp {
+                FufInput::Tile { .. } => has_tile = true,
+                FufInput::Scalar(_) => has_scalar = true,
+                _ => return None,
+            }
+        }
+        if !(has_tile && has_scalar) {
+            return None;
+        }
+        let tile_input: Vec<TileId> = node
+            .inputs
+            .iter()
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: tile_input,
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // One read + one write over the tensor.
+        let numel = ctx.num_tokens() * ctx.bounds.get("hidden_size").copied().unwrap_or(0);
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 2.0 * numel as f64 * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let node = ctx.fuf.get(tile);
+        // The Tile input (the tensor to scale) and the Scalar.
+        let upstream_slot = node
+            .inputs
+            .iter()
+            .position(|i| matches!(i, FufInput::Tile { .. }))
+            .expect("ScalarMul claim has a Tile input");
+        let upstream = ctx
+            .input_tile_ident(tile, upstream_slot)
+            .expect("ScalarMul's Tile input has an ident");
+        let scale: f32 = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Scalar(v) => Some(*v as f32),
+                _ => None,
+            })
+            .expect("ScalarMul claim has a Scalar input");
+
+        // `scale_inplace` uses cuBLAS S-axpy-like scalEx — mutates
+        // the upstream buffer. Move-consume the OwnedTensor so the
+        // output binding owns the mutated buffer.
+        quote! {
+            let #out = unsafe {
+                ::ferrite_kernels::kernels::scale_inplace(
+                    *#upstream,
+                    #scale,
+                    &device.cublas,
+                );
+                #upstream
             };
         }
     }

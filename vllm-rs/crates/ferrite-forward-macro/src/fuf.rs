@@ -277,21 +277,35 @@ impl<'a> Unroller<'a> {
     fn lower_instr(&mut self, instr: &Instr) -> Result<(), UnrollError> {
         match instr {
             Instr::Assign { target, value } => {
-                let inputs = self.resolve_args_from_expr(value)?;
-                let op = match value {
-                    Expr::Call { op, .. } => *op,
-                    other => {
-                        return Err(UnrollError::UnsupportedCfgShape(format!(
-                            "expected a Call on RHS, got {other:?}"
-                        )));
-                    }
-                };
                 let shape = self
                     .inferred
                     .locals
                     .get(target)
                     .cloned()
                     .ok_or(UnrollError::MissingShape { id: *target })?;
+                let (op, inputs) = match value {
+                    Expr::Call { op, args } => {
+                        let inputs = args
+                            .iter()
+                            .map(|a| self.resolve_arg(a).map(|(inp, _)| inp))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        (*op, inputs)
+                    }
+                    // Top-level `Mul` — e.g. `x = tile * scalar` for
+                    // Gemma's embed scale. Emits a `Mul` tile that
+                    // the `ScalarMulImpl` (or a future tensor×tensor
+                    // fusion) claims.
+                    Expr::Mul { lhs, rhs } => {
+                        let (l, _) = self.resolve_arg(lhs)?;
+                        let (r, _) = self.resolve_arg(rhs)?;
+                        (OpKind::Mul, vec![l, r])
+                    }
+                    other => {
+                        return Err(UnrollError::UnsupportedCfgShape(format!(
+                            "expected a Call or Mul on RHS, got {other:?}"
+                        )));
+                    }
+                };
                 let tile_id = self.push_tile(op, inputs, vec![shape]);
                 self.local_to_tile.insert(*target, (tile_id, 0));
                 Ok(())
@@ -426,6 +440,10 @@ impl<'a> Unroller<'a> {
                 // it as a broadcastable scalar.
                 Ok((FufInput::Scalar(*v), Shape::new()))
             }
+            Expr::SqrtBound(_) => unreachable!(
+                "Expr::SqrtBound should have been folded to Expr::ScalarLit by \
+                 cfg.rs::fold_scalars before reaching the unroller"
+            ),
         }
     }
 

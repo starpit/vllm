@@ -34,6 +34,7 @@ PROMPTS = [
 MODELS = {
     "qwen2_0_5b": "Qwen/Qwen2.5-0.5B",
     "smollm_135m": "HuggingFaceTB/SmolLM2-135M-Instruct",
+    "gemma2_2b": "unsloth/gemma-2-2b-it",
 }
 
 MAX_TOKENS = 32

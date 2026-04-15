@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
-//! CPU golden model implementations for each TK op.
+//
+// Golden reference code — straightforward per-index loops win on
+// readability. Suppress the usual clippy "iterate by element"
+// pedantry so the math stays legible.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
+//! CPU golden model implementations for each ferrite op.
 //!
-//! These are pure-Rust reference implementations of the same operations that
-//! the TK sm89 CUDA kernels perform. Used for correctness testing: run an op
-//! on GPU via the test harness, run the same op here on CPU, compare outputs.
+//! Pure-Rust reference implementations of the same operations the
+//! GPU kernels perform. Used for correctness testing and future
+//! per-layer golden-diff harnesses: run an op on GPU, run the same
+//! op here on CPU, compare outputs.
 //!
-//! All functions operate on flat `&[f32]` slices (convert bf16→f32 before calling).
-//! Shape conventions match the TK globals layout.
-
-use rayon::prelude::*;
+//! All functions operate on flat `&[f32]` slices (convert bf16→f32
+//! before calling). Shape conventions match the ferrite globals
+//! layout.
+//!
+//! Originally `ferrite-solver/src/cpu_golden.rs`; moved here as
+//! part of the Step G legacy-delete (the solver crate and its
+//! `ferrite_macros::forward!{}` consumer are gone).
 
 /// RMS normalization: output = (x / rms(x)) * weight
 ///
@@ -35,35 +45,26 @@ pub fn rmsnorm(input: &[f32], weight: &[f32], output: &mut [f32], eps: f32) {
 /// - `input`: [m, k] row-major
 /// - `weight`: [n, k] row-major (transposed in multiply)
 /// - `output`: [m, n] row-major
+///
+/// Serial — this is reference code for correctness checks, not a
+/// performance path. Parallelise only if a golden-harness regime
+/// starts showing measurable wall-clock pain.
 pub fn gemm(input: &[f32], weight: &[f32], output: &mut [f32], m: usize, k: usize, n: usize) {
     assert_eq!(input.len(), m * k);
     assert_eq!(weight.len(), n * k);
     assert_eq!(output.len(), m * n);
 
-    // Parallelize over output elements in coarse chunks. Works for any (m,n),
-    // including the common golden case m=1 (per-token GEMM calls). Chunk size
-    // targets ~64 tasks total so rayon overhead stays bounded while still
-    // feeding a 16-core box.
-    let total = m * n;
-    let chunk_size = (total / 64).max(1);
-    output
-        .par_chunks_mut(chunk_size)
-        .enumerate()
-        .for_each(|(chunk_idx, out_chunk)| {
-            let base = chunk_idx * chunk_size;
-            for (local, out) in out_chunk.iter_mut().enumerate() {
-                let idx = base + local;
-                let i = idx / n;
-                let j = idx % n;
-                let in_row = &input[i * k..(i + 1) * k];
-                let w_row = &weight[j * k..(j + 1) * k];
-                let mut sum = 0.0_f32;
-                for l in 0..k {
-                    sum += in_row[l] * w_row[l];
-                }
-                *out = sum;
+    for i in 0..m {
+        let in_row = &input[i * k..(i + 1) * k];
+        for j in 0..n {
+            let w_row = &weight[j * k..(j + 1) * k];
+            let mut sum = 0.0_f32;
+            for l in 0..k {
+                sum += in_row[l] * w_row[l];
             }
-        });
+            output[i * n + j] = sum;
+        }
+    }
 }
 
 /// Matrix multiply with residual add: output = (input @ weight^T) + residual

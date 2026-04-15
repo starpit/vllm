@@ -7,6 +7,8 @@
 
 pub use ferrite_forward_macro::forward;
 
+pub mod cpu_golden;
+
 #[cfg(feature = "cuda")]
 mod ctx {
     use ferrite_cuda_core::tensor::TensorView;

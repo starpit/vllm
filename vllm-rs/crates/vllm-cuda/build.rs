@@ -23,9 +23,10 @@ fn cuda_link() {
 
     println!("cargo:rustc-link-search={}", cache_str);
 
-    // Megakernel .a compiled by ferrite-cuda-builder (or ferrite-test-harness).
-    // The forward!() proc macro writes .cu files during ferrite-models compilation;
-    // ferrite-cuda-builder compiles them. Link if present.
+    // Historical megakernel .a (retired with the pre-Ferrite TK
+    // runtime). Kept as a conditional link so rebuilding against a
+    // cache that still contains `libmegakernels.a` doesn't fail the
+    // linker; present builds skip the library entirely.
     let mk_lib = std::path::Path::new(&cache_str).join("libmegakernels.a");
     if mk_lib.exists() {
         println!("cargo:rustc-link-lib=static=megakernels");

@@ -25,9 +25,6 @@ members = [
     "crates/ferrite-kernels",
     "crates/ferrite-models",
     "crates/ferrite-cuda-builder",
-    "crates/ferrite-macros",
-    "crates/ferrite-solver",
-    "crates/ferrite-test-harness",
     "crates/ferrite-forward",
     "crates/ferrite-forward-macro",
 ]

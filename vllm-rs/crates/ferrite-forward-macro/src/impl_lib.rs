@@ -1707,21 +1707,43 @@ impl Implementation for FusedQkvRopeCacheImpl {
             // Fused RoPE + paged-cache write. Reads packed QKV, writes
             // K and V into the layer's slices of the paged cache, and
             // returns Q (rotated) as an OwnedTensor.
+            //
+            // FP8 KV-cache path branches at runtime: the cache dtype
+            // is a per-model property known only at load time.
             let #q_out = unsafe {
-                ::ferrite_kernels::kernels::fused_qkv_rope_cache(
-                    *#qkv_packed_ident,
-                    *ctx.positions,
-                    ctx.rotary.cos_sin_cache,
-                    *ctx.slot_mapping,
-                    *ctx.kv_cache.k_cache(#layer),
-                    *ctx.kv_cache.v_cache(#layer),
-                    #q_size,
-                    #kv_size,
-                    #num_q_heads,
-                    #head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
+                if ctx.kv_cache.is_fp8() {
+                    ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
+                        *#qkv_packed_ident,
+                        *ctx.positions,
+                        ctx.rotary.cos_sin_cache,
+                        *ctx.slot_mapping,
+                        *ctx.kv_cache.k_cache(#layer),
+                        *ctx.kv_cache.v_cache(#layer),
+                        ctx.kv_cache.k_scale_ptr(#layer),
+                        ctx.kv_cache.v_scale_ptr(#layer),
+                        #q_size,
+                        #kv_size,
+                        #num_q_heads,
+                        #head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                } else {
+                    ::ferrite_kernels::kernels::fused_qkv_rope_cache(
+                        *#qkv_packed_ident,
+                        *ctx.positions,
+                        ctx.rotary.cos_sin_cache,
+                        *ctx.slot_mapping,
+                        *ctx.kv_cache.k_cache(#layer),
+                        *ctx.kv_cache.v_cache(#layer),
+                        #q_size,
+                        #kv_size,
+                        #num_q_heads,
+                        #head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                }
             };
             // K/V aliases: the paged-cache layer slices. Bound for
             // symmetry with the FUF's tuple output shape; not read by

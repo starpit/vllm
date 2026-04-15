@@ -823,6 +823,16 @@ fn cost_gemm(m: &MatchInfo, ctx: &CostCtx) -> f64 {
         .and_then(|s| ctx.eval_shape(s))
         .and_then(|v| v.last().copied())
         .unwrap_or(0);
+    // Prefer the calibrated CSV baseline when the target has one —
+    // keeps GemmRefImpl (cuBLAS) on the same measurement scale as
+    // the CutlassGemmImpl variants so the DP's cost comparison is
+    // apples-to-apples.
+    if let Some(cost) = ctx
+        .profile
+        .cost_us_for("cublas", m_dim as u32, n_dim as u32, k_dim as u32)
+    {
+        return cost;
+    }
     let flops = 2.0 * m_dim as f64 * n_dim as f64 * k_dim as f64;
     let peak = ctx.profile.peak_tflops_fp16 * 1e12;
     if peak == 0.0 || flops == 0.0 {
@@ -920,6 +930,22 @@ pub fn starter_library() -> ImplementationLibrary {
     // Matching attention pair — decode reads from cache, prefill
     // reads the contiguous K/V produced by the prefill QKV impl.
     lib.push(Box::new(AttentionPrefillContiguousImpl));
+    // Cutlass standalone GEMM tile zoo — one Impl per tile variant
+    // in `target_profiles/cost_*.csv`. `target_compatible` gates each
+    // by "does this target have a calibrated cost row for this
+    // variant?", so targets without CSV data silently fall back to
+    // `GemmRefImpl` (cuBLAS). Matching is rejected for Gemms whose
+    // output flows into a fusion (RopeAppend / Silu / Mul) so the
+    // solver can never pick cutlass for a QKV or gate/up gemm that
+    // would otherwise break its fusion chain.
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(CutlassGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
+    lib.push(Box::new(CutlassGemvImpl));
     lib
 }
 
@@ -2165,6 +2191,314 @@ impl Implementation for AttentionPrefillContiguousImpl {
     }
 }
 
+// ── CutlassGemmImpl / CutlassGemvImpl ────────────────────────────
+//
+// Singleton matchers on `OpKind::Gemm` parameterised by the CUTLASS
+// tile shape `(tile_m, tile_n, stages)`. Backed by
+// `ferrite_kernels::cutlass::cutlass_gemm` / `cutlass_gemv` — the
+// prior ferrite's hand-picked tile zoo, preserved byte-for-byte in
+// the launch fns.
+//
+// Cost for `(workload M, weight [N, K])` is read directly from
+// `target.cost_table` (`target_profiles/cost_<name>.csv`); variants
+// missing a CSV row for a given shape report `f64::INFINITY` so the
+// DP never picks a data-less kernel. Variants whose target has no
+// CSV data at all are filtered out at `target_compatible` time.
+//
+// `matches` rejects Gemms whose downstream consumer is a fusion
+// partner (RopeAppend / Silu / Mul), so the solver can never steer
+// a QKV or gate/up gemm away from its fused impl — picking cutlass
+// for the gate gemm would orphan the silu tile, which has no
+// singleton kernel.
+
+/// Every cutlass tile variant exported from
+/// `vllm-cuda/csrc/cutlass_standalone_gemm.cu` with a matching
+/// FFI declaration in `ferrite-kernels::cutlass`. Must stay in sync
+/// with that file — add / remove tiles here and in the extern block
+/// together.
+/// Finite "don't pick me" cost for calibrated impls at shapes not
+/// in their CSV. Large enough that any calibrated alternative wins,
+/// small enough to keep `is_finite()` true (the DP rejects
+/// non-finite costs with `SolveError::UnreachableCost`).
+const UNCALIBRATED_COST_US: f64 = 1.0e9;
+
+const CUTLASS_TILE_ZOO: &[(u32, u32, u32)] = &[
+    (32, 64, 3),
+    (32, 64, 4),
+    (32, 128, 3),
+    (32, 128, 4),
+    (32, 256, 3),
+    (64, 64, 3),
+    (64, 64, 4),
+    (64, 128, 3),
+    (64, 128, 4),
+    (128, 64, 3),
+    (128, 64, 4),
+    (128, 128, 3),
+    (128, 128, 4),
+    (128, 256, 3),
+    (256, 64, 3),
+    (256, 64, 4),
+];
+
+#[derive(Debug, Clone)]
+pub struct CutlassGemmImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassGemmImpl {
+    fn csv_name(&self) -> String {
+        format!("cutlass_{}x{}_s{}", self.tile_m, self.tile_n, self.stages)
+    }
+
+    fn static_name(&self) -> &'static str {
+        // Names are compile-time-known per CUTLASS_TILE_ZOO entry.
+        match (self.tile_m, self.tile_n, self.stages) {
+            (32, 64, 3) => "cutlass_32x64_s3",
+            (32, 64, 4) => "cutlass_32x64_s4",
+            (32, 128, 3) => "cutlass_32x128_s3",
+            (32, 128, 4) => "cutlass_32x128_s4",
+            (32, 256, 3) => "cutlass_32x256_s3",
+            (64, 64, 3) => "cutlass_64x64_s3",
+            (64, 64, 4) => "cutlass_64x64_s4",
+            (64, 128, 3) => "cutlass_64x128_s3",
+            (64, 128, 4) => "cutlass_64x128_s4",
+            (128, 64, 3) => "cutlass_128x64_s3",
+            (128, 64, 4) => "cutlass_128x64_s4",
+            (128, 128, 3) => "cutlass_128x128_s3",
+            (128, 128, 4) => "cutlass_128x128_s4",
+            (128, 256, 3) => "cutlass_128x256_s3",
+            (256, 64, 3) => "cutlass_256x64_s3",
+            (256, 64, 4) => "cutlass_256x64_s4",
+            _ => "cutlass_unknown",
+        }
+    }
+}
+
+/// True if `node`'s output is consumed by any tile of the given op
+/// kind. Used to reject cutlass matches on Gemms that feed a
+/// fusion partner (RopeAppend / Silu / Mul).
+fn output_feeds_op(fuf: &Fuf, tile: TileId, op: OpKind) -> bool {
+    fuf.nodes
+        .iter()
+        .any(|n| n.op == op && consumes_tile(n, tile))
+}
+
+/// True if this Gemm tile is a fusion partner (Q/K/V of a
+/// RopeAppend, or gate/up of the `silu(gate) * up` pattern). The
+/// cutlass singletons must never claim these — their fused impls
+/// own them and the downstream chain has no singleton kernel.
+fn gemm_is_fusion_partner(fuf: &Fuf, seed: TileId) -> bool {
+    output_feeds_op(fuf, seed, OpKind::RopeAppend)
+        || output_feeds_op(fuf, seed, OpKind::Silu)
+        || output_feeds_op(fuf, seed, OpKind::Mul)
+}
+
+/// Evaluate the `(M, N, K)` of a Gemm tile for CSV cost lookup.
+/// M comes from the current workload (bounds[`num_tokens`]), N from
+/// the output's last dim, K from the activation-input tile's last
+/// dim.
+fn gemm_mnk(ctx: &CostCtx, node: &crate::fuf::FufNode) -> Option<(u32, u32, u32)> {
+    let m = ctx.num_tokens() as u32;
+    let out_shape = node.outputs.first().and_then(|s| ctx.eval_shape(s))?;
+    if out_shape.len() != 2 {
+        return None;
+    }
+    let n = *out_shape.last()? as u32;
+    let k = node.inputs.iter().find_map(|inp| match inp {
+        FufInput::Tile { id, slot } => {
+            let up = ctx.fuf.get(*id);
+            up.outputs
+                .get(*slot as usize)
+                .and_then(|s| ctx.eval_shape(s))
+                .and_then(|v| v.last().copied())
+        }
+        _ => None,
+    })? as u32;
+    Some((m, n, k))
+}
+
+impl Implementation for CutlassGemmImpl {
+    fn name(&self) -> &'static str {
+        self.static_name()
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        let csv = self.csv_name();
+        profile.cost_table.kernel_names().iter().any(|k| k == &csv)
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        // M=1 is GEMV territory — `CutlassGemvImpl` owns it.
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        if gemm_is_fusion_partner(fuf, seed) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let node = ctx.fuf.get(m.claimed_tiles[0]);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, node) else {
+            return f64::INFINITY;
+        };
+        ctx.profile
+            .cost_us_for(&self.csv_name(), mm, nn, kk)
+            // No CSV row for this shape → emit a finite "too
+            // expensive" sentinel so the DP skips this variant
+            // without tripping the `!cost.is_finite()` guard.
+            .unwrap_or(UNCALIBRATED_COST_US)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::RegularLaunch
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let x = ctx.input_expr(tile, 0);
+        let w = ctx.input_expr(tile, 1);
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        quote! {
+            let #out = unsafe {
+                ::ferrite_kernels::cutlass::cutlass_gemm(
+                    *(#x),
+                    (#w).dense_weight(),
+                    ::ferrite_kernels::cutlass::CutlassTile::new(#tile_m, #tile_n, #stages),
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+/// M=1 SIMT GEMV specialisation — the decode path's lm_head /
+/// o_proj / down_proj.
+#[derive(Debug, Default)]
+pub struct CutlassGemvImpl;
+
+impl Implementation for CutlassGemvImpl {
+    fn name(&self) -> &'static str {
+        "cutlass_gemv"
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile
+            .cost_table
+            .kernel_names()
+            .iter()
+            .any(|k| k == "cutlass_gemv")
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        if gemm_is_fusion_partner(fuf, seed) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let node = ctx.fuf.get(m.claimed_tiles[0]);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, node) else {
+            return f64::INFINITY;
+        };
+        ctx.profile
+            .cost_us_for("cutlass_gemv", mm, nn, kk)
+            .unwrap_or(UNCALIBRATED_COST_US)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::RegularLaunch
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let x = ctx.input_expr(tile, 0);
+        let w = ctx.input_expr(tile, 1);
+        quote! {
+            let #out = unsafe {
+                ::ferrite_kernels::cutlass::cutlass_gemv(
+                    *(#x),
+                    (#w).dense_weight(),
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2257,5 +2591,98 @@ mod tests {
         assert!(!c.accepts(9));
         assert!(!c.accepts(0));
         assert!(WorkloadConstraint::Any.accepts(4096));
+    }
+
+    #[test]
+    fn cutlass_tile_zoo_matches_csv_kernel_names() {
+        // The library registers one CutlassGemmImpl per CUTLASS_TILE_ZOO
+        // entry plus CutlassGemvImpl. Each entry's `csv_name()` must
+        // correspond to a real kernel string in the L4 cost table
+        // (byte-for-byte), otherwise `target_compatible` rejects every
+        // tile and the solver silently falls back to cuBLAS.
+        let profile = crate::target::load_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("..")
+                .join("target_profiles")
+                .join("l4_sm89.json")
+                .as_path(),
+        )
+        .expect("l4_sm89 loads");
+        let csv_kernels = profile.cost_table.kernel_names();
+        for (tm, tn, st) in CUTLASS_TILE_ZOO {
+            let name = format!("cutlass_{tm}x{tn}_s{st}");
+            assert!(
+                csv_kernels.iter().any(|k| k == &name),
+                "CUTLASS_TILE_ZOO has ({tm}, {tn}, {st}) but no `{name}` row in l4 CSV",
+            );
+        }
+        assert!(csv_kernels.iter().any(|k| k == "cutlass_gemv"));
+    }
+
+    #[test]
+    fn cutlass_gemm_impl_rejects_fusion_partners() {
+        // CutlassGemmImpl.matches must return None for a Gemm whose
+        // output feeds a RopeAppend / Silu / Mul — picking cutlass
+        // there would break the fused impl's claim on the downstream
+        // kernel chain (those consumers have no singleton kernel).
+        use crate::classified::{ExternKind, WeightId};
+        use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+        use crate::shape::Dim;
+
+        let t0 = TileId(0);
+        let t1 = TileId(1);
+        let t2 = TileId(2);
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: t0,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(16)]],
+                },
+                FufNode {
+                    id: t1,
+                    op: OpKind::Gemm,
+                    inputs: vec![
+                        FufInput::Tile { id: t0, slot: 0 },
+                        FufInput::Weight {
+                            id: WeightId(0),
+                            index: None,
+                        },
+                    ],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(16)]],
+                },
+                FufNode {
+                    id: t2,
+                    op: OpKind::RopeAppend,
+                    inputs: vec![FufInput::Tile { id: t1, slot: 0 }],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(16)]],
+                },
+            ],
+        };
+        let imp = CutlassGemmImpl {
+            tile_m: 128,
+            tile_n: 128,
+            stages: 4,
+        };
+        let profile = crate::target::load_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("..")
+                .join("target_profiles")
+                .join("l4_sm89.json")
+                .as_path(),
+        )
+        .expect("l4_sm89 loads");
+        assert!(
+            imp.matches(&fuf, t1, &profile).is_none(),
+            "cutlass must not match a Gemm whose output feeds RopeAppend",
+        );
     }
 }

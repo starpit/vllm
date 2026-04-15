@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use crate::cfg::{BlockId, Cfg, Instr, Terminator};
+use crate::cfg::{BlockId, BoolPredResolved, Cfg, Instr, Terminator};
 use crate::classified::{Expr, ExternKind, LocalId, OpKind, WeightId};
 use crate::shape::{Inferred, Shape};
 
@@ -150,6 +150,21 @@ impl<'a> Unroller<'a> {
             }
             match &block.term {
                 Terminator::Jump(next) => cur = *next,
+                Terminator::JumpWithCarry { target, carry } => {
+                    self.apply_carry(carry);
+                    cur = *target;
+                }
+                Terminator::CondJump {
+                    cond,
+                    then_b,
+                    else_b,
+                } => {
+                    cur = if self.eval_pred(cond)? {
+                        *then_b
+                    } else {
+                        *else_b
+                    };
+                }
                 Terminator::LoopHeader {
                     ivar,
                     start,
@@ -196,12 +211,60 @@ impl<'a> Unroller<'a> {
                     }
                     cur = *next;
                 }
+                Terminator::JumpWithCarry { target, carry } => {
+                    self.apply_carry(carry);
+                    if *target == header {
+                        return Ok(());
+                    }
+                    cur = *target;
+                }
+                Terminator::CondJump {
+                    cond,
+                    then_b,
+                    else_b,
+                } => {
+                    cur = if self.eval_pred(cond)? {
+                        *then_b
+                    } else {
+                        *else_b
+                    };
+                }
                 Terminator::LoopHeader { .. } => {
                     return Err(UnrollError::UnsupportedCfgShape(
                         "nested loops not yet supported".into(),
                     ));
                 }
                 Terminator::Return => return Ok(()),
+            }
+        }
+    }
+
+    fn apply_carry(&mut self, carry: &[(LocalId, LocalId)]) {
+        for (merge_id, source_id) in carry {
+            if let Some(&binding) = self.local_to_tile.get(source_id) {
+                self.local_to_tile.insert(*merge_id, binding);
+            }
+        }
+    }
+
+    fn eval_pred(&self, cond: &BoolPredResolved) -> Result<bool, UnrollError> {
+        match cond {
+            BoolPredResolved::Modulo {
+                ivar,
+                divisor,
+                remainder,
+            } => {
+                let v = self.loop_var_value(*ivar)?;
+                if *divisor == 0 {
+                    return Err(UnrollError::UnsupportedCfgShape(
+                        "`if ivar % 0 == ...` is undefined".into(),
+                    ));
+                }
+                Ok(v % *divisor == *remainder)
+            }
+            BoolPredResolved::Less { ivar, bound } => {
+                let v = self.loop_var_value(*ivar)?;
+                Ok(v < *bound)
             }
         }
     }
@@ -591,6 +654,130 @@ mod tests {
         let n_add = fuf.nodes.iter().filter(|n| n.op == OpKind::Add).count();
         assert_eq!(n_mul, 1, "expected exactly one Mul tile for `gate * up`");
         assert_eq!(n_add, 1, "expected exactly one Add tile (residual)");
+    }
+
+    #[test]
+    fn if_alternates_attention_and_sliding_attention() {
+        // Real-shape acid test: a body that branches on `layer % 2`
+        // and picks `attention` for even layers, `sliding_attention`
+        // for odd. With 4 concrete iterations we expect 2 of each,
+        // in the order [Attention, Sliding, Attention, Sliding].
+        // Every downstream Add reads the merge binding for `attn`
+        // which must point at the taken arm's tile per iteration.
+        let params = llama_3_2_1b_params();
+        let fuf = unroll_src(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..4 {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                q = gemm(normed, self_attn.q_proj[layer]);
+                k = gemm(normed, self_attn.k_proj[layer]);
+                v = gemm(normed, self_attn.v_proj[layer]);
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                if layer % 2 == 0 {
+                    attn = attention(q, k, v, kv_cache[layer], block_table);
+                } else {
+                    attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
+                }
+                oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+            }
+            "#,
+            &params,
+        );
+
+        // Exactly one attention-family tile per iteration.
+        let attn_family: Vec<OpKind> = fuf
+            .nodes
+            .iter()
+            .filter_map(|n| match n.op {
+                OpKind::Attention | OpKind::SlidingAttention => Some(n.op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attn_family.len(), 4, "one attn tile per iteration");
+        assert_eq!(
+            attn_family,
+            vec![
+                OpKind::Attention,
+                OpKind::SlidingAttention,
+                OpKind::Attention,
+                OpKind::SlidingAttention,
+            ],
+            "alternating per layer index"
+        );
+
+        // Each iteration's `oproj = gemm(attn, ...)` must read from
+        // the attention tile that *that iteration's arm* produced.
+        let attn_tile_ids: Vec<TileId> = fuf
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, OpKind::Attention | OpKind::SlidingAttention))
+            .map(|n| n.id)
+            .collect();
+        let oproj_attn_refs: Vec<TileId> = fuf
+            .nodes
+            .iter()
+            .filter(|n| n.op == OpKind::Gemm && n.inputs.len() == 2)
+            // `oproj` is the only gemm whose first input is an
+            // attention-family tile; filter by that.
+            .filter_map(|n| match &n.inputs[0] {
+                FufInput::Tile { id, .. } if attn_tile_ids.contains(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            oproj_attn_refs, attn_tile_ids,
+            "each oproj consumes the corresponding iteration's attn output"
+        );
+    }
+
+    #[test]
+    fn if_less_with_config_bound_resolves_per_iteration() {
+        // Pattern used by DeepSeek-V3: "first N layers are dense,
+        // rest use a different variant." Here we stand that in with
+        // attention vs. sliding_attention gated by `layer < N`.
+        let mut params = llama_3_2_1b_params();
+        params.bounds.insert("num_dense_layers".to_string(), 2);
+        let fuf = unroll_src(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..5 {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                q = gemm(normed, self_attn.q_proj[layer]);
+                k = gemm(normed, self_attn.k_proj[layer]);
+                v = gemm(normed, self_attn.v_proj[layer]);
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                if layer < num_dense_layers {
+                    attn = attention(q, k, v, kv_cache[layer], block_table);
+                } else {
+                    attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
+                }
+                oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+            }
+            "#,
+            &params,
+        );
+        let attn_family: Vec<OpKind> = fuf
+            .nodes
+            .iter()
+            .filter_map(|n| match n.op {
+                OpKind::Attention | OpKind::SlidingAttention => Some(n.op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attn_family,
+            vec![
+                OpKind::Attention,
+                OpKind::Attention,
+                OpKind::SlidingAttention,
+                OpKind::SlidingAttention,
+                OpKind::SlidingAttention,
+            ],
+            "first 2 dense, remaining 3 sliding"
+        );
     }
 
     #[test]

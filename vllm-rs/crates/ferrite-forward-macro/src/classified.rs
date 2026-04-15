@@ -65,6 +65,12 @@ pub enum OpKind {
     Gemm,
     RopeAppend,
     Attention,
+    /// Same signature as `Attention`; picked by the DSL body for
+    /// sliding-window attention layers (Gemma2, Gemma3, ...). The
+    /// distinction is carried through the FUF so the solver can
+    /// match distinct Impls (dense flash-attn vs. window-masked
+    /// flash-attn). Shape signature mirrors `Attention`.
+    SlidingAttention,
     Silu,
     Add,
     /// Elementwise multiplication. Produced by the DSL's `*`
@@ -73,7 +79,7 @@ pub enum OpKind {
     /// parse level rather than a named call.
     Mul,
     // Gemma2 extensions land here without touching any other pass:
-    //   Gelu, SoftCap, SlidingAttention
+    //   Gelu, SoftCap
 }
 
 impl OpKind {
@@ -86,6 +92,7 @@ impl OpKind {
             "gemm" => Some(Self::Gemm),
             "rope_append" => Some(Self::RopeAppend),
             "attention" => Some(Self::Attention),
+            "sliding_attention" => Some(Self::SlidingAttention),
             "silu" => Some(Self::Silu),
             "add" => Some(Self::Add),
             _ => None,
@@ -99,6 +106,7 @@ impl OpKind {
             Self::Gemm => "gemm",
             Self::RopeAppend => "rope_append",
             Self::Attention => "attention",
+            Self::SlidingAttention => "sliding_attention",
             Self::Silu => "silu",
             Self::Add => "add",
             Self::Mul => "mul",
@@ -226,6 +234,25 @@ pub enum Stmt {
         body: Vec<Stmt>,
         loop_carry: Vec<(LocalId, LocalId)>,
     },
+    /// `if <predicate> { then_body } else { else_body }`. The
+    /// predicate is a compile-time-evaluable function of a loop
+    /// induction variable and config constants — evaluated at
+    /// unroll time, each unrolled iteration descends into exactly
+    /// one arm.
+    ///
+    /// Both arms must bind the same set of names. For each name
+    /// bound in either arm, `merge_carry` has one entry
+    /// `(merge_id, then_final, else_final)`: reads after the If
+    /// resolve to `merge_id`; at unroll time the unroller sets
+    /// `local_to_tile[merge_id]` to whichever arm ran. An arm that
+    /// doesn't bind the name reuses its pre-If binding's LocalId
+    /// as the arm's "final" id.
+    If {
+        cond: BoolPred,
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
+        merge_carry: Vec<(LocalId, LocalId, LocalId)>,
+    },
 }
 
 /// Loop bound: either a literal integer or a symbolic identifier
@@ -236,6 +263,25 @@ pub enum Stmt {
 pub enum Bound {
     Lit(u64),
     Sym(Ident),
+}
+
+/// Boolean predicate used as an `if` condition. The predicate
+/// enum is deliberately closed and narrow — it exists to express
+/// layer-indexed dispatch patterns (Gemma2 alternating
+/// sliding/full attention, DeepSeek-V3 "first N layers dense")
+/// without extending the expression IR with booleans or general
+/// binary arithmetic. Evaluated only at unroll time against
+/// concrete loop-var values.
+#[derive(Clone, Debug)]
+pub enum BoolPred {
+    /// `ivar % divisor == remainder`.
+    Modulo {
+        ivar: LocalId,
+        divisor: Bound,
+        remainder: Bound,
+    },
+    /// `ivar < bound`.
+    Less { ivar: LocalId, bound: Bound },
 }
 
 /// A value-producing expression.

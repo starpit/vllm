@@ -20,7 +20,7 @@
 use syn::spanned::Spanned;
 use syn::{BinOp, Block, Expr as SynExpr, ExprLit, Lit, Pat, Stmt as SynStmt};
 
-use crate::ast::{Ast, BoundExpr, Expr, Stmt};
+use crate::ast::{Ast, BoolExpr, BoundExpr, Expr, Stmt};
 
 pub type ParseResult<T> = Result<T, syn::Error>;
 
@@ -64,9 +64,11 @@ fn parse_stmt_expr(expr: &SynExpr) -> ParseResult<Stmt> {
     match expr {
         SynExpr::Assign(a) => parse_assign(a),
         SynExpr::ForLoop(f) => parse_for(f),
+        SynExpr::If(i) => parse_if(i),
         other => Err(syn::Error::new(
             other.span(),
-            "expected `name = expr;`, `(a, b, c) = expr;`, or `for x in 0..N { ... }`",
+            "expected `name = expr;`, `(a, b, c) = expr;`, \
+             `for x in 0..N { ... }`, or `if <pred> { ... } else { ... }`",
         )),
     }
 }
@@ -120,6 +122,107 @@ fn parse_for(f: &syn::ExprForLoop) -> ParseResult<Stmt> {
         end,
         body,
     })
+}
+
+fn parse_if(i: &syn::ExprIf) -> ParseResult<Stmt> {
+    let cond = parse_bool_expr(&i.cond)?;
+    let then_body = parse_stmts(&i.then_branch.stmts)?;
+    let else_body = match i.else_branch.as_ref() {
+        Some((_, else_expr)) => match &**else_expr {
+            SynExpr::Block(b) => parse_stmts(&b.block.stmts)?,
+            SynExpr::If(_) => {
+                return Err(syn::Error::new(
+                    else_expr.span(),
+                    "`else if` chains are not supported; nest an `if` inside `else { ... }` instead",
+                ));
+            }
+            _ => {
+                return Err(syn::Error::new(
+                    else_expr.span(),
+                    "`else` must be a block `else { ... }`",
+                ));
+            }
+        },
+        None => {
+            return Err(syn::Error::new(
+                i.span(),
+                "`if` must have an `else` arm; both arms must bind the same set of names",
+            ));
+        }
+    };
+    Ok(Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    })
+}
+
+/// Parse a boolean predicate for an `if` condition. Accepts only
+/// two shapes: `ivar % <bound> == <bound>` or `ivar < <bound>`,
+/// where `ivar` is a plain identifier (must refer to an enclosing
+/// loop induction variable; classify enforces this) and `<bound>`
+/// is an integer literal or a bare identifier naming a per-model
+/// bound (e.g. `sliding_window_pattern`).
+fn parse_bool_expr(expr: &SynExpr) -> ParseResult<BoolExpr> {
+    let expr = unwrap_parens(expr);
+    match expr {
+        SynExpr::Binary(b) => match b.op {
+            BinOp::Eq(_) => {
+                // Expect left = `ivar % <bound>`, right = `<bound>`.
+                let (ivar, divisor) = match unwrap_parens(&b.left) {
+                    SynExpr::Binary(inner) if matches!(inner.op, BinOp::Rem(_)) => {
+                        let ivar = parse_ivar(&inner.left)?;
+                        let divisor = parse_bound(unwrap_parens(&inner.right))?;
+                        (ivar, divisor)
+                    }
+                    other => {
+                        return Err(syn::Error::new(
+                            other.span(),
+                            "left of `==` in an `if` condition must be `ivar % <bound>`",
+                        ));
+                    }
+                };
+                let remainder = parse_bound(unwrap_parens(&b.right))?;
+                Ok(BoolExpr::Modulo {
+                    ivar,
+                    divisor,
+                    remainder,
+                })
+            }
+            BinOp::Lt(_) => {
+                let ivar = parse_ivar(&b.left)?;
+                let bound = parse_bound(unwrap_parens(&b.right))?;
+                Ok(BoolExpr::Less { ivar, bound })
+            }
+            _ => Err(syn::Error::new(
+                b.op.span(),
+                "only `%`+`==` and `<` are supported in `if` conditions; \
+                 shapes: `ivar % N == M` or `ivar < N`",
+            )),
+        },
+        other => Err(syn::Error::new(
+            other.span(),
+            "`if` condition must be `ivar % <bound> == <bound>` or `ivar < <bound>`",
+        )),
+    }
+}
+
+fn parse_ivar(expr: &SynExpr) -> ParseResult<syn::Ident> {
+    match unwrap_parens(expr) {
+        SynExpr::Path(p) if p.path.get_ident().is_some() => Ok(p.path.get_ident().unwrap().clone()),
+        other => Err(syn::Error::new(
+            other.span(),
+            "expected a plain identifier (the enclosing loop induction variable)",
+        )),
+    }
+}
+
+fn unwrap_parens(expr: &SynExpr) -> &SynExpr {
+    let mut cur = expr;
+    while let SynExpr::Paren(p) = cur {
+        cur = &p.expr;
+    }
+    cur
 }
 
 fn parse_range(expr: &SynExpr) -> ParseResult<(BoundExpr, BoundExpr)> {
@@ -435,6 +538,118 @@ mod tests {
         assert!(
             err_msg.contains("`let`"),
             "error should mention let: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn if_modulo_parses() {
+        let ast = parse(
+            "for layer in 0..4 { \
+                if layer % 2 == 0 { x = attention(q, k, v, kv, b); } \
+                else { x = sliding_attention(q, k, v, kv, b); } \
+            }",
+        );
+        match &ast.statements[0] {
+            Stmt::For { body, .. } => match &body[0] {
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    match cond {
+                        BoolExpr::Modulo {
+                            ivar,
+                            divisor,
+                            remainder,
+                        } => {
+                            assert_eq!(ivar.to_string(), "layer");
+                            assert!(matches!(divisor, BoundExpr::Lit(2)));
+                            assert!(matches!(remainder, BoundExpr::Lit(0)));
+                        }
+                        other => panic!("expected Modulo, got {other:?}"),
+                    }
+                    assert_eq!(then_body.len(), 1);
+                    assert_eq!(else_body.len(), 1);
+                }
+                other => panic!("expected If, got {other:?}"),
+            },
+            _ => panic!("expected for-loop"),
+        }
+    }
+
+    #[test]
+    fn if_less_with_symbolic_bound_parses() {
+        let ast = parse(
+            "for layer in 0..4 { \
+                if layer < num_dense_layers { x = gemm(a, b); } \
+                else { x = gemm(a, b); } \
+            }",
+        );
+        match &ast.statements[0] {
+            Stmt::For { body, .. } => match &body[0] {
+                Stmt::If { cond, .. } => match cond {
+                    BoolExpr::Less { ivar, bound } => {
+                        assert_eq!(ivar.to_string(), "layer");
+                        match bound {
+                            BoundExpr::Ident(i) => assert_eq!(i.to_string(), "num_dense_layers"),
+                            _ => panic!("expected symbolic bound"),
+                        }
+                    }
+                    other => panic!("expected Less, got {other:?}"),
+                },
+                _ => panic!("expected If"),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn if_without_else_is_rejected() {
+        let src = "for layer in 0..4 { if layer < 2 { x = gemm(a, b); } }";
+        let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("should reject missing else");
+        assert!(err.to_string().contains("else"), "error mentions else");
+    }
+
+    #[test]
+    fn else_if_chain_is_rejected() {
+        let src = "for layer in 0..4 { \
+            if layer < 2 { x = gemm(a, b); } \
+            else if layer < 4 { x = gemm(a, b); } \
+            else { x = gemm(a, b); } \
+        }";
+        let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("should reject else-if");
+        assert!(
+            err.to_string().contains("else if"),
+            "error mentions else if: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn unsupported_condition_shape_is_rejected() {
+        let src = "for layer in 0..4 { \
+            if layer + 1 == 3 { x = gemm(a, b); } else { x = gemm(a, b); } \
+        }";
+        let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("should reject addition in condition");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ivar % <bound>") || msg.contains("`%`+`==`"),
+            "error names supported shapes: {msg}"
         );
     }
 

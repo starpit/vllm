@@ -28,6 +28,30 @@ pub enum Stmt {
         end: BoundExpr,
         body: Vec<Stmt>,
     },
+    /// `if <cond> { then_body } else { else_body }` — compile-time
+    /// conditional. The condition must be one of a small closed set
+    /// of predicates over a loop-induction variable (see
+    /// [`BoolExpr`]). Evaluated at unroll time.
+    If {
+        cond: BoolExpr,
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
+    },
+}
+
+/// Boolean predicate shape for `if` conditions. Deliberately narrow
+/// — just enough to express layer-indexed dispatch patterns without
+/// extending the expression IR with booleans or binary arithmetic.
+#[derive(Clone, Debug)]
+pub enum BoolExpr {
+    /// `ivar % divisor == remainder`.
+    Modulo {
+        ivar: Ident,
+        divisor: BoundExpr,
+        remainder: BoundExpr,
+    },
+    /// `ivar < bound`.
+    Less { ivar: Ident, bound: BoundExpr },
 }
 
 /// A loop bound expression. Always either an integer literal

@@ -7,13 +7,13 @@
 //! of those at a given site) are parse-time errors, not papered
 //! over.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use syn::Ident;
 
 use crate::ast::{self, BoundExpr};
 use crate::classified::{
-    Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Program, Stmt, WeightTable,
+    BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Program, Stmt, WeightTable,
 };
 
 pub type ClassifyResult<T> = Result<T, syn::Error>;
@@ -103,6 +103,139 @@ impl Ctx {
                     end,
                     body,
                     loop_carry,
+                })
+            }
+            ast::Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => self.classify_if(cond, then_body, else_body),
+        }
+    }
+
+    /// Classify an `if { then } else { else }` statement. Both arms
+    /// must bind the same set of names — violations are errors.
+    /// For each such name, a fresh merge `LocalId` is introduced
+    /// that subsequent reads resolve to; unroll-time dispatch
+    /// populates the merge binding from whichever arm ran.
+    fn classify_if(
+        &mut self,
+        cond: &ast::BoolExpr,
+        then_body: &[ast::Stmt],
+        else_body: &[ast::Stmt],
+    ) -> ClassifyResult<Stmt> {
+        let cond = self.classify_bool_expr(cond)?;
+
+        // Snapshot the full scope stack so we can restore between
+        // arms. `locals` and `weights` tables accrete across arms —
+        // unused LocalIds are harmless.
+        let pre_scope = self.scope.clone();
+        let pre_tops: BTreeMap<String, Option<LocalId>> = self
+            .scope
+            .iter()
+            .map(|(n, s)| (n.clone(), s.last().copied()))
+            .collect();
+
+        let then_body = self.classify_stmts(then_body)?;
+        let post_then: BTreeMap<String, Option<LocalId>> = self
+            .scope
+            .iter()
+            .map(|(n, s)| (n.clone(), s.last().copied()))
+            .collect();
+
+        // Restore for else arm.
+        self.scope = pre_scope.clone();
+
+        let else_body = self.classify_stmts(else_body)?;
+        let post_else: BTreeMap<String, Option<LocalId>> = self
+            .scope
+            .iter()
+            .map(|(n, s)| (n.clone(), s.last().copied()))
+            .collect();
+
+        // Restore for post-if; we install merge bindings next.
+        self.scope = pre_scope;
+
+        // A name is "changed" in an arm if its top-of-stack LocalId
+        // differs from the pre-If top-of-stack. Both arms must
+        // change the same set of names.
+        let then_changed = diff_tops(&pre_tops, &post_then);
+        let else_changed = diff_tops(&pre_tops, &post_else);
+
+        let then_keys: BTreeSet<&String> = then_changed.keys().collect();
+        let else_keys: BTreeSet<&String> = else_changed.keys().collect();
+        if then_keys != else_keys {
+            let only_in_then: Vec<_> = then_keys
+                .difference(&else_keys)
+                .map(|s| s.as_str())
+                .collect();
+            let only_in_else: Vec<_> = else_keys
+                .difference(&then_keys)
+                .map(|s| s.as_str())
+                .collect();
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "`if`/`else` arms must bind the same set of names; \
+                     only in `then`: {only_in_then:?}, only in `else`: {only_in_else:?}",
+                ),
+            ));
+        }
+
+        let mut merge_carry = Vec::new();
+        for (name, then_final) in &then_changed {
+            let else_final = else_changed[name];
+            // Synthesize a merge binding that shadows any pre-If
+            // binding of this name. Use `bind` so reads after the
+            // If resolve to this merge id.
+            let ident = syn::Ident::new(name, proc_macro2::Span::call_site());
+            let merge_id = self.bind(ident);
+            merge_carry.push((merge_id, *then_final, else_final));
+        }
+
+        Ok(Stmt::If {
+            cond,
+            then_body,
+            else_body,
+            merge_carry,
+        })
+    }
+
+    fn classify_bool_expr(&self, expr: &ast::BoolExpr) -> ClassifyResult<BoolPred> {
+        match expr {
+            ast::BoolExpr::Modulo {
+                ivar,
+                divisor,
+                remainder,
+            } => {
+                let ivar_id = self.lookup_local(ivar).ok_or_else(|| {
+                    syn::Error::new(
+                        ivar.span(),
+                        format!(
+                            "`if` condition must reference an enclosing loop variable; \
+                             `{ivar}` is not in scope",
+                        ),
+                    )
+                })?;
+                Ok(BoolPred::Modulo {
+                    ivar: ivar_id,
+                    divisor: self.classify_bound(divisor),
+                    remainder: self.classify_bound(remainder),
+                })
+            }
+            ast::BoolExpr::Less { ivar, bound } => {
+                let ivar_id = self.lookup_local(ivar).ok_or_else(|| {
+                    syn::Error::new(
+                        ivar.span(),
+                        format!(
+                            "`if` condition must reference an enclosing loop variable; \
+                             `{ivar}` is not in scope",
+                        ),
+                    )
+                })?;
+                Ok(BoolPred::Less {
+                    ivar: ivar_id,
+                    bound: self.classify_bound(bound),
                 })
             }
         }
@@ -242,6 +375,26 @@ impl Ctx {
             }
         }
     }
+}
+
+/// Compute the set of names whose top-of-stack `LocalId` changed
+/// between the `pre` snapshot and the `post` snapshot. A name is
+/// changed if (a) it wasn't in pre but is in post, or (b) it was in
+/// both but the top-of-stack id differs.
+fn diff_tops(
+    pre: &BTreeMap<String, Option<LocalId>>,
+    post: &BTreeMap<String, Option<LocalId>>,
+) -> BTreeMap<String, LocalId> {
+    let mut out = BTreeMap::new();
+    for (name, post_top) in post {
+        let pre_top = pre.get(name).copied().flatten();
+        if let Some(post_id) = *post_top
+            && pre_top != Some(post_id)
+        {
+            out.insert(name.clone(), post_id);
+        }
+    }
+    out
 }
 
 /// Attach an index to a Weight or Extern expression; error on
@@ -470,6 +623,82 @@ mod tests {
         let err = classify_err("x = frobnicate(a, b);");
         assert!(err.to_string().contains("unknown op"));
         assert!(err.to_string().contains("frobnicate"));
+    }
+
+    #[test]
+    fn if_merge_carry_is_emitted() {
+        let p = classify_src(
+            "for layer in 0..4 { \
+                if layer % 2 == 0 { attn = attention(q, k, v, kv_cache, block_table); } \
+                else { attn = sliding_attention(q, k, v, kv_cache, block_table); } \
+                hidden_states = add(attn, attn); \
+            }",
+        );
+        match &p.statements[0] {
+            Stmt::For { body, .. } => match &body[0] {
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                    merge_carry,
+                } => {
+                    // Both arms bind exactly `attn`.
+                    assert_eq!(merge_carry.len(), 1, "one merged name (attn)");
+                    let (merge_id, then_final, else_final) = merge_carry[0];
+                    assert_ne!(merge_id, then_final);
+                    assert_ne!(merge_id, else_final);
+                    assert_ne!(then_final, else_final);
+                    assert_eq!(p.locals.name(merge_id).to_string(), "attn");
+                    assert_eq!(p.locals.name(then_final).to_string(), "attn");
+                    assert_eq!(p.locals.name(else_final).to_string(), "attn");
+                    match cond {
+                        BoolPred::Modulo {
+                            divisor, remainder, ..
+                        } => {
+                            assert!(matches!(divisor, Bound::Lit(2)));
+                            assert!(matches!(remainder, Bound::Lit(0)));
+                        }
+                        _ => panic!("expected Modulo"),
+                    }
+                    // Each arm has exactly one assignment.
+                    assert_eq!(then_body.len(), 1);
+                    assert_eq!(else_body.len(), 1);
+                }
+                _ => panic!("expected If"),
+            },
+            _ => panic!("expected for-loop"),
+        }
+    }
+
+    #[test]
+    fn if_arms_binding_different_names_is_rejected() {
+        let err = classify_err(
+            "for layer in 0..4 { \
+                if layer % 2 == 0 { a = attention(q, k, v, kv_cache, block_table); } \
+                else { b = sliding_attention(q, k, v, kv_cache, block_table); } \
+            }",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("same set of names"),
+            "error mentions asymmetric arms: {msg}"
+        );
+    }
+
+    #[test]
+    fn if_condition_with_unbound_ivar_is_rejected() {
+        // `ghost` is not a local, not an extern. The classifier
+        // would normally turn it into a weight ref on the RHS of an
+        // assignment, but inside a predicate it must resolve to a
+        // loop local — so this is rejected.
+        let err = classify_err(
+            "for layer in 0..4 { \
+                if ghost % 2 == 0 { x = attention(q, k, v, kv_cache, block_table); } \
+                else { x = sliding_attention(q, k, v, kv_cache, block_table); } \
+            }",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("ghost"), "error names unbound ivar: {msg}");
     }
 
     #[test]

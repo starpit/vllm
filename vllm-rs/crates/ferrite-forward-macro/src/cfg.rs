@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::classified::{Bound, Expr, LocalId, Program, Stmt};
+use crate::classified::{BoolPred, Bound, Expr, LocalId, Program, Stmt};
 use crate::config::ModelParams;
 
 // ── Types ─────────────────────────────────────────────────────────
@@ -65,8 +65,41 @@ pub enum Terminator {
         exit: BlockId,
         loop_carry: Vec<(LocalId, LocalId)>,
     },
+    /// Compile-time conditional jump. The predicate's bound fields
+    /// have been resolved to concrete `u64`s; at unroll time the
+    /// predicate is evaluated against the current loop-var value
+    /// and flow proceeds into `then_b` or `else_b`.
+    CondJump {
+        cond: BoolPredResolved,
+        then_b: BlockId,
+        else_b: BlockId,
+    },
+    /// Jump to `target` and, before handing control to `target`,
+    /// rebind each `(merge_id, source_id)` pair: the unroller sets
+    /// `local_to_tile[merge_id]` to whatever `source_id` currently
+    /// points at. Used at the exit of each `if` arm to populate
+    /// the merge bindings with the taken arm's final writes.
+    JumpWithCarry {
+        target: BlockId,
+        carry: Vec<(LocalId, LocalId)>,
+    },
     /// Function end.
     Return,
+}
+
+/// `BoolPred` with its `Bound`s resolved to concrete integers using
+/// the model's `ModelParams`. Produced by [`build_cfg`] and consumed
+/// by the unroller.
+#[derive(Clone, Debug)]
+pub enum BoolPredResolved {
+    /// `ivar % divisor == remainder`.
+    Modulo {
+        ivar: LocalId,
+        divisor: u64,
+        remainder: u64,
+    },
+    /// `ivar < bound`.
+    Less { ivar: LocalId, bound: u64 },
 }
 
 /// The CFG for one specialization.
@@ -223,11 +256,80 @@ impl<'a> CfgBuilder<'a> {
                     // Continue with `after`.
                     current = after;
                 }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                    merge_carry,
+                } => {
+                    let cond_resolved = self.resolve_pred(cond)?;
+                    let then_start = self.alloc_block();
+                    let else_start = self.alloc_block();
+                    let then_tail = self.alloc_block();
+                    let else_tail = self.alloc_block();
+                    let merge = self.alloc_block();
+
+                    self.finalize_block(
+                        current,
+                        Terminator::CondJump {
+                            cond: cond_resolved,
+                            then_b: then_start,
+                            else_b: else_start,
+                        },
+                    );
+
+                    // Lower each arm. lower_stmts finalizes each
+                    // arm's last block with `Jump(then_tail)` /
+                    // `Jump(else_tail)` respectively.
+                    self.lower_stmts(then_body, then_start, then_tail)?;
+                    self.lower_stmts(else_body, else_start, else_tail)?;
+
+                    // Install merge carries on the two arm tails.
+                    let then_carry: Vec<(LocalId, LocalId)> =
+                        merge_carry.iter().map(|(mid, tf, _)| (*mid, *tf)).collect();
+                    let else_carry: Vec<(LocalId, LocalId)> =
+                        merge_carry.iter().map(|(mid, _, ef)| (*mid, *ef)).collect();
+                    self.finalize_block(
+                        then_tail,
+                        Terminator::JumpWithCarry {
+                            target: merge,
+                            carry: then_carry,
+                        },
+                    );
+                    self.finalize_block(
+                        else_tail,
+                        Terminator::JumpWithCarry {
+                            target: merge,
+                            carry: else_carry,
+                        },
+                    );
+
+                    // Continue in merge.
+                    current = merge;
+                }
             }
         }
         // After the last statement, jump to the outer end block.
         self.finalize_block(current, Terminator::Jump(end));
         Ok(())
+    }
+
+    fn resolve_pred(&self, pred: &BoolPred) -> Result<BoolPredResolved, CfgError> {
+        match pred {
+            BoolPred::Modulo {
+                ivar,
+                divisor,
+                remainder,
+            } => Ok(BoolPredResolved::Modulo {
+                ivar: *ivar,
+                divisor: self.resolve_bound(divisor)?,
+                remainder: self.resolve_bound(remainder)?,
+            }),
+            BoolPred::Less { ivar, bound } => Ok(BoolPredResolved::Less {
+                ivar: *ivar,
+                bound: self.resolve_bound(bound)?,
+            }),
+        }
     }
 
     fn resolve_bound(&self, b: &Bound) -> Result<u64, CfgError> {
@@ -378,6 +480,95 @@ mod tests {
         let cfg = build_cfg(&p, &llama_3_2_1b_params()).unwrap();
         for b in &cfg.blocks {
             assert_no_strings(&b.term);
+        }
+    }
+
+    #[test]
+    fn if_creates_condjump_and_two_jumpwithcarry_tails() {
+        let p = classify_src(
+            "for layer in 0..4 { \
+                if layer % 2 == 0 { attn = attention(q, k, v, kv_cache, block_table); } \
+                else { attn = sliding_attention(q, k, v, kv_cache, block_table); } \
+                hidden_states = add(attn, attn); \
+            }",
+        );
+        let params = llama_3_2_1b_params();
+        let cfg = build_cfg(&p, &params).expect("build cfg");
+
+        let condjumps: Vec<_> = cfg
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.term, Terminator::CondJump { .. }))
+            .collect();
+        assert_eq!(condjumps.len(), 1, "exactly one CondJump");
+
+        let carries: Vec<_> = cfg
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.term {
+                Terminator::JumpWithCarry { target, carry } => Some((*target, carry.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carries.len(), 2, "two arm tails with JumpWithCarry");
+        // Both arm tails jump to the same merge block and each
+        // carries exactly one rebinding (`attn`).
+        assert_eq!(carries[0].0, carries[1].0, "both arms target same merge");
+        for (_, n) in &carries {
+            assert_eq!(*n, 1, "one carry entry per arm (attn)");
+        }
+
+        // The CondJump's predicate must resolve to `layer % 2 == 0`.
+        match &condjumps[0].term {
+            Terminator::CondJump { cond, .. } => match cond {
+                BoolPredResolved::Modulo {
+                    divisor, remainder, ..
+                } => {
+                    assert_eq!(*divisor, 2);
+                    assert_eq!(*remainder, 0);
+                }
+                _ => panic!("expected Modulo predicate"),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn if_with_symbolic_bound_resolves_to_int() {
+        // `sliding_window_pattern` isn't in llama config, so this
+        // model's params get a synthetic one for the test.
+        let mut params = llama_3_2_1b_params();
+        params
+            .bounds
+            .insert("sliding_window_pattern".to_string(), 2);
+        let p = classify_src(
+            "for layer in 0..4 { \
+                if layer % sliding_window_pattern == 0 { \
+                    attn = attention(q, k, v, kv_cache, block_table); \
+                } else { \
+                    attn = sliding_attention(q, k, v, kv_cache, block_table); \
+                } \
+                hidden_states = add(attn, attn); \
+            }",
+        );
+        let cfg = build_cfg(&p, &params).expect("build cfg");
+        let condjump = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.term, Terminator::CondJump { .. }))
+            .expect("CondJump");
+        match &condjump.term {
+            Terminator::CondJump {
+                cond:
+                    BoolPredResolved::Modulo {
+                        divisor, remainder, ..
+                    },
+                ..
+            } => {
+                assert_eq!(*divisor, 2, "sliding_window_pattern resolved to 2");
+                assert_eq!(*remainder, 0);
+            }
+            _ => panic!("expected Modulo"),
         }
     }
 

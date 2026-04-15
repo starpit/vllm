@@ -312,6 +312,10 @@ pub fn apply_signature(
         OpKind::Gemm => sig_gemm(solver, inputs),
         OpKind::RopeAppend => sig_rope_append(solver, inputs),
         OpKind::Attention => sig_attention(solver, inputs),
+        // Same q/k/v constraints as `attention`; the distinction is
+        // in the picked kernel (window-masked vs. dense), not in
+        // the type signature.
+        OpKind::SlidingAttention => sig_attention(solver, inputs),
         OpKind::Silu => sig_unary_elementwise(solver, inputs, op),
         OpKind::Add => sig_binary_elementwise(solver, inputs, op),
         OpKind::Mul => sig_binary_elementwise(solver, inputs, op),
@@ -517,6 +521,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Gemm => &[(1, 2)],
         OpKind::RopeAppend => &[],
         OpKind::Attention => &[],
+        OpKind::SlidingAttention => &[],
         OpKind::Silu => &[],
         OpKind::Add => &[],
         OpKind::Mul => &[],
@@ -721,6 +726,55 @@ impl InferCtx {
                         }
                         for (a, b) in o.iter().zip(&i) {
                             self.solver.unify(a, b)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                merge_carry,
+                ..
+            } => {
+                // Both arms' shapes must be inferable. Since only
+                // one arm runs at each unrolled iteration, but
+                // shape inference doesn't depend on the iteration
+                // index, we process both. For each merged name,
+                // the then-arm and else-arm final shapes must
+                // unify — a read after the `if` sees one or the
+                // other at runtime, but downstream ops need a
+                // single shape for the merge binding either way.
+                self.infer_stmts(then_body)?;
+                self.infer_stmts(else_body)?;
+                for (merge_id, then_final, else_final) in merge_carry {
+                    let then_shape = self.locals.get(then_final).cloned();
+                    let else_shape = self.locals.get(else_final).cloned();
+                    match (then_shape, else_shape) {
+                        (Some(t), Some(e)) => {
+                            if t.len() != e.len() {
+                                return Err(ShapeError::BadArgs {
+                                    op: OpKind::Add,
+                                    reason: format!(
+                                        "`if` merge rank mismatch: then={}, else={}",
+                                        t.len(),
+                                        e.len()
+                                    ),
+                                });
+                            }
+                            for (a, b) in t.iter().zip(&e) {
+                                self.solver.unify(a, b)?;
+                            }
+                            // Post-unification, the shapes are
+                            // equivalent; bind the merge to the
+                            // then-arm's shape.
+                            self.locals.insert(*merge_id, t);
+                        }
+                        _ => {
+                            return Err(ShapeError::BadArgs {
+                                op: OpKind::Add,
+                                reason: "`if` arm produced no shape for a merged name".into(),
+                            });
                         }
                     }
                 }

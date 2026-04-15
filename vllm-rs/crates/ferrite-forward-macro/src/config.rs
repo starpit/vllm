@@ -208,8 +208,8 @@ mod tests {
         let dir = repo_model_archs().join("llama");
         let configs = load_dir(&dir).expect("load llama configs");
 
-        // We committed 9 Llama configs (405B gated, skipped).
-        assert_eq!(configs.len(), 9, "expected 9 Llama configs");
+        // 9 Llama configs (405B gated, skipped) + smollm2-135m.
+        assert_eq!(configs.len(), 10, "expected 10 Llama configs");
 
         // Ground-truth check on llama-3.2-1b. Published values:
         //   num_hidden_layers = 16

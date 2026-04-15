@@ -913,7 +913,13 @@ pub fn starter_library() -> ImplementationLibrary {
     // `embed` not `Add`, stays a singleton RmsNorm claim).
     lib.push(Box::new(FusedGateUpSiluMulImpl));
     lib.push(Box::new(FusedAddRmsNormImpl));
+    // Decode / prefill QKV+rope variants — the solver picks via
+    // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
     lib.push(Box::new(FusedQkvRopeCacheImpl));
+    lib.push(Box::new(FusedQkvRopePrefillImpl));
+    // Matching attention pair — decode reads from cache, prefill
+    // reads the contiguous K/V produced by the prefill QKV impl.
+    lib.push(Box::new(AttentionPrefillContiguousImpl));
     lib
 }
 
@@ -1438,6 +1444,15 @@ impl Implementation for FusedQkvRopeCacheImpl {
         true
     }
 
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        // `fused_qkv_rope_cache` is the decode-fused kernel (writes
+        // K/V to the paged cache in one shot, returns only Q — the
+        // contiguous K/V are discarded). Restricts paired with the
+        // decode attention impl that reads K/V from the cache.
+        // Prefill is handled by `FusedQkvRopePrefillImpl`.
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let seed_node = fuf.get(seed);
         if seed_node.op != OpKind::Gemm {
@@ -1717,6 +1732,15 @@ impl Implementation for AttentionViaCacheImpl {
         true
     }
 
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        // Paged-cache-reading attention is the decode path. K/V
+        // were written to the cache by the upstream decode QKV
+        // impl; this impl ignores the DSL Attention tile's slot-1
+        // and slot-2 inputs (which are cache aliases in the decode
+        // flow). Prefill uses `AttentionPrefillContiguousImpl`.
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         single_tile_match(fuf, seed, OpKind::Attention)
     }
@@ -1805,6 +1829,298 @@ impl Implementation for AttentionViaCacheImpl {
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+// ── FusedQkvRopePrefillImpl ──────────────────────────────────────
+//
+// Same 4-tile pattern as `FusedQkvRopeCacheImpl` `(Gemm, Gemm, Gemm,
+// RopeAppend)`, but for the prefill path: emits the split `fused_qkv_rope`
+// kernel (returns Q, K, V as contiguous OwnedTensors; does NOT write
+// to the paged cache) followed by an explicit `write_kv_cache` so
+// the cache is populated for future decode steps. The contiguous
+// K/V tensors remain available as the tile's slot-1 and slot-2
+// outputs so the downstream prefill-attention impl reads them
+// directly instead of going through the cache.
+//
+// `WorkloadConstraint::NumTokensRange { min: 2, max: u32::MAX }` —
+// paired with `AttentionPrefillContiguousImpl` for the prefill
+// bucket. Decode goes through `FusedQkvRopeCacheImpl`.
+
+#[derive(Debug, Default)]
+pub struct FusedQkvRopePrefillImpl;
+
+impl Implementation for FusedQkvRopePrefillImpl {
+    fn name(&self) -> &'static str {
+        "fused_qkv_rope_prefill"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        // Same pattern as the cache variant — delegate to it so the
+        // matcher stays in one place.
+        FusedQkvRopeCacheImpl.matches(fuf, seed, profile)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same flops + bandwidth model as the decode-fused variant;
+        // the kernel split is different but the work is the same.
+        FusedQkvRopeCacheImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Same packed QKV weight as the decode variant.
+        FusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let rope_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim must contain a RopeAppend");
+        let rope_node = ctx.fuf.get(rope_id);
+
+        let qkv_ids: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
+        let activation = ctx.input_expr(qkv_ids[0], 0);
+
+        let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
+            .iter()
+            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+            .collect();
+        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let num_q_heads = ctx.bound("num_attention_heads") as usize;
+        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+        let head_dim = ctx.bound("head_dim") as usize;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
+            as usize;
+
+        let q_out = ctx.output_ident(rope_id, 0);
+        let k_out = ctx.output_ident(rope_id, 1);
+        let v_out = ctx.output_ident(rope_id, 2);
+        let qkv_packed_ident = quote::format_ident!("__fused_qkv_{}", rope_id.0);
+
+        quote! {
+            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor.
+            let #qkv_packed_ident = unsafe {
+                (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+            // RoPE-split: rotate Q and K, return all three as
+            // contiguous OwnedTensors. Unlike `fused_qkv_rope_cache`
+            // this does NOT write to the paged cache — the cache
+            // write is a separate step below so the K/V OwnedTensors
+            // remain available for contiguous prefill attention.
+            let (#q_out, #k_out, #v_out) = unsafe {
+                ::ferrite_kernels::kernels::fused_qkv_rope(
+                    *#qkv_packed_ident,
+                    *ctx.positions,
+                    ctx.rotary.cos_sin_cache,
+                    #q_size,
+                    #kv_size,
+                    #num_q_heads,
+                    #num_kv_heads,
+                    #head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+            // Commit rotated K/V into the paged cache at slot_mapping
+            // so subsequent decode steps read the correct values.
+            unsafe {
+                ::ferrite_kernels::attention_helpers::write_kv_cache(
+                    (#k_out).view(),
+                    (#v_out).view(),
+                    ctx.slot_mapping,
+                    ctx.kv_cache,
+                    #layer,
+                    device.compute_stream,
+                );
+            }
+        }
+    }
+}
+
+// ── AttentionPrefillContiguousImpl ───────────────────────────────
+//
+// Singleton matcher on `OpKind::Attention` for the prefill bucket.
+// Reads Q, K, V from the DSL tile's slots 0/1/2 (the outputs of
+// the upstream `FusedQkvRopePrefillImpl`, which are real contiguous
+// OwnedTensors) and calls `flash_attn_contiguous`. This matches
+// what vllm-cuda's hand-written prefill path does.
+//
+// `WorkloadConstraint::NumTokensRange { min: 2, max: u32::MAX }`.
+
+#[derive(Debug, Default)]
+pub struct AttentionPrefillContiguousImpl;
+
+impl Implementation for AttentionPrefillContiguousImpl {
+    fn name(&self) -> &'static str {
+        "attention_prefill_contiguous"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::Attention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same quadratic-in-seqlen cost as the paged decode variant
+        // for now — both call FA2 underneath.
+        cost_attention(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+
+        // Q, K, V from the DSL's `attention(q, k, v, ...)` — slots
+        // 0/1/2 are the upstream rope-append tile's three outputs.
+        // The prefill QKV impl binds these to real contiguous
+        // OwnedTensors (unlike the decode variant which aliases
+        // K/V to the paged cache).
+        let q_expr = ctx.input_expr(tile, 0);
+        let k_expr = ctx.input_expr(tile, 1);
+        let v_expr = ctx.input_expr(tile, 2);
+
+        // Softmax scale: 1/sqrt(head_dim), baked in.
+        let head_dim = ctx.bound("head_dim") as f32;
+        let scale: f32 = 1.0 / head_dim.sqrt();
+        let scale_tokens = quote! { #scale };
+
+        quote! {
+            let #out = unsafe {
+                // Fresh-prefill flash attention reads K/V directly
+                // from the contiguous tensors produced by
+                // `fused_qkv_rope`. K is already rotated, so the
+                // cos_sin_cache pointer is null (no fused RoPE
+                // inside FA2). `cu_seqlens_k = cu_seqlens_q` for
+                // fresh prefill — each sequence's K length equals
+                // its Q length.
+                ::ferrite_kernels::kernels::flash_attn_contiguous(
+                    *#q_expr,
+                    *#k_expr,
+                    *#v_expr,
+                    *ctx.cu_seqlens_q,
+                    *ctx.cu_seqlens_q,
+                    ctx.max_seqlen_q,
+                    ctx.max_seqlen_k,
+                    #scale_tokens,
+                    true, // is_causal
+                    0.0,  // softcap
+                    -1,   // window_size_left (-1 = disabled)
+                    &mut device.caching,
+                    device.compute_stream,
+                    ::std::ptr::null::<u8>(),
+                    0,     // rotary_dim
+                    false, // is_rotary_interleaved
                 )
             };
         }

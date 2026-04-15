@@ -721,9 +721,18 @@ mod tests {
                 if n_gemm == 3 && n_rope == 1 {
                     fused_count += 1;
                     let imp_id = sfuf.impl_of(sg).unwrap();
+                    // WorkloadConstraint-driven dispatch: decode (M=1)
+                    // picks the cache-fused variant, prefill (M>=2)
+                    // picks the split variant that keeps K/V contiguous
+                    // for the prefill attention path.
+                    let expected = if m == 1 {
+                        "fused_qkv_rope_cache"
+                    } else {
+                        "fused_qkv_rope_prefill"
+                    };
                     assert_eq!(
                         lib.get(imp_id).name(),
-                        "fused_qkv_rope_cache",
+                        expected,
                         "subgraph at m={m} has QKV-rope topology but wrong impl",
                     );
                 }

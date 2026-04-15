@@ -29,7 +29,9 @@ mod cfg;
 mod classified;
 mod classify;
 mod codegen;
+mod concurrency;
 mod config;
+mod cost;
 mod emit;
 mod fuf;
 mod impl_lib;
@@ -198,7 +200,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             syn::Error::new(args.span, format!("unroll [{}]: {e}", model.source_stem))
         })?;
 
-        let sfufs = solver::solve(
+        let mut sfufs = solver::solve(
             &model_fuf,
             &library,
             &target_profile,
@@ -209,6 +211,20 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         .map_err(|e| syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem)))?;
 
         let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
+
+        // Post-scheduler: recompute each bucket's `predicted_us`
+        // with per-wave contention applied via ConcurrencyModel.
+        // On the current all-HostCallback serial-chain library this
+        // doesn't change the number, but the machinery stays ready
+        // for DeviceCallable + megakernel waves.
+        cost::refresh_predicted_us(
+            &model_fuf,
+            &mut sfufs,
+            &loops,
+            &library,
+            &target_profile,
+            &model.bounds,
+        );
 
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
         let codegen_items =

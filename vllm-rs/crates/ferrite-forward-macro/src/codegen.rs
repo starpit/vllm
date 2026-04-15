@@ -430,27 +430,46 @@ pub fn emit_model(
         })
         .collect();
 
-    // match num_tokens dispatch. Coalesce adjacent buckets with
-    // the same forward fn in a future pass; for now one arm per
-    // bucket.
-    let match_arms: Vec<TokenStream> = sfufs
-        .per_num_tokens
-        .keys()
-        .map(|m| {
-            let lit = proc_macro2::Literal::u64_unsuffixed(*m);
+    // match num_tokens dispatch. Each compiled bucket `m_k` covers
+    // the inclusive range `[m_k, m_{k+1} - 1]`; the last bucket
+    // covers `m_last..=u64::MAX`. Runtime num_tokens that don't
+    // exactly equal a compiled point get the specialization for
+    // the largest compiled bucket ≤ num_tokens — correct
+    // (kernels work at any M) if suboptimal for cost. The user
+    // compiles more buckets if they want tighter cost fits.
+    let bucket_points: Vec<u64> = sfufs.per_num_tokens.keys().copied().collect();
+    let match_arms: Vec<TokenStream> = bucket_points
+        .iter()
+        .enumerate()
+        .map(|(i, &m)| {
             let fn_name = format_ident!("forward_m_{}", m);
-            quote! { #lit => unsafe { #fn_name(wm, ctx, device) }, }
+            let lo = proc_macro2::Literal::u64_unsuffixed(m);
+            if i + 1 == bucket_points.len() {
+                // last bucket: cover m..=u64::MAX
+                quote! { #lo.. => unsafe { #fn_name(wm, ctx, device) }, }
+            } else {
+                let next = bucket_points[i + 1];
+                let hi = proc_macro2::Literal::u64_unsuffixed(next - 1);
+                quote! { #lo..=#hi => unsafe { #fn_name(wm, ctx, device) }, }
+            }
         })
         .collect();
+    // Below the smallest compiled bucket (e.g. num_tokens=0 if
+    // someone somehow passes it): fall through to the smallest
+    // bucket. Realistically unreachable.
+    let fallback_arm = bucket_points.first().map(|&m| {
+        let fn_name = format_ident!("forward_m_{}", m);
+        quote! { _ => unsafe { #fn_name(wm, ctx, device) }, }
+    });
 
     quote! {
         #weights
 
         #(#bucket_fns)*
 
-        /// Dispatch on `num_tokens`. Panics if the runtime
-        /// num_tokens isn't one of the compiled buckets.
-        /// Future: coalesce into inclusive ranges.
+        /// Dispatch on `num_tokens`. Each compiled bucket covers
+        /// an inclusive range starting at its compiled point; the
+        /// largest bucket covers everything above.
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
@@ -461,7 +480,7 @@ pub fn emit_model(
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
             match num_tokens {
                 #(#match_arms)*
-                other => panic!("no compiled bucket for num_tokens={other}"),
+                #fallback_arm
             }
         }
     }

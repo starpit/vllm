@@ -1147,6 +1147,158 @@ mod tests {
         }
     }
 
+    /// Gemma-style body: GELU MLP (`down(gelu(gate) * up)`),
+    /// sliding attention on odd layers, final logit softcap.
+    /// Exercises [`FusedGateUpGeluMulImpl`], both
+    /// [`SlidingAttentionViaCacheImpl`] variants (decode + prefill),
+    /// and [`TanhSoftCapImpl`] through the real solver.
+    const GEMMA_LIKE_BODY: &str = r#"
+        hidden_states = embed(input_ids, embed_tokens);
+        for layer in 0..num_hidden_layers {
+            normed = rmsnorm(hidden_states, input_layernorm[layer]);
+            q = gemm(normed, self_attn.q_proj[layer]);
+            k = gemm(normed, self_attn.k_proj[layer]);
+            v = gemm(normed, self_attn.v_proj[layer]);
+            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+            if layer % 2 == 0 {
+                attn = attention(q, k, v, kv_cache[layer], block_table);
+            } else {
+                attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
+            }
+            oproj = gemm(attn, self_attn.o_proj[layer]);
+            hidden_states = add(oproj, hidden_states);
+
+            normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+            gate = gelu(gemm(normed2, mlp.gate_proj[layer]));
+            up = gemm(normed2, mlp.up_proj[layer]);
+            down = gemm(gate * up, mlp.down_proj[layer]);
+            hidden_states = add(down, hidden_states);
+        }
+        normed = rmsnorm(hidden_states, norm);
+        logits = gemm(normed, lm_head);
+        capped = tanh_softcap(logits);
+    "#;
+
+    /// Llama-3.2-1B's numeric bounds + the Gemma-convention fields a
+    /// body using `sliding_attention` / `tanh_softcap` requires. No
+    /// real Gemma2 config lives in `model_architectures/` at this
+    /// point; this synthetic `ModelParams` lets the tests exercise
+    /// the new Impls on real unrolled FUF sizes without committing
+    /// the full arch.
+    fn gemma_like_params() -> ModelParams {
+        let mut p = llama_params("llama-3.2-1b");
+        p.bounds.insert("sliding_window".into(), 4096);
+        p.scalars.insert("query_pre_attn_scalar".into(), 256.0);
+        p.scalars.insert("attn_logit_softcapping".into(), 50.0);
+        p.scalars.insert("final_logit_softcapping".into(), 30.0);
+        p
+    }
+
+    #[test]
+    fn gelu_mlp_fusion_claims_four_tiles_per_layer() {
+        // Structural: `(Gemm, Gemm, Gelu, Mul)` collapses into one
+        // FusedGateUpGeluMulImpl subgraph per layer — same shape as
+        // SwiGLU, different activation.
+        let params = gemma_like_params();
+        let (fuf, inferred) = build(GEMMA_LIKE_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1, 512]).unwrap();
+        let nl = params.bounds["num_hidden_layers"] as usize;
+
+        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+            let mut fused = 0;
+            for sg in sfuf.subgraphs() {
+                let tiles = sfuf.tiles_in_subgraph(sg);
+                if tiles.len() != 4 {
+                    continue;
+                }
+                let ops: Vec<OpKind> = tiles.iter().map(|t| fuf.get(*t).op).collect();
+                let n_gemm = ops.iter().filter(|o| **o == OpKind::Gemm).count();
+                let n_gelu = ops.iter().filter(|o| **o == OpKind::Gelu).count();
+                let n_mul = ops.iter().filter(|o| **o == OpKind::Mul).count();
+                if n_gemm == 2 && n_gelu == 1 && n_mul == 1 {
+                    fused += 1;
+                    let imp = lib.get(sfuf.impl_of(sg).unwrap()).name();
+                    assert_eq!(imp, "fused_gate_up_gelu_mul", "m={m}");
+                }
+            }
+            assert_eq!(fused, nl, "one Gelu-fused MLP per layer at m={m}");
+        }
+    }
+
+    #[test]
+    fn sliding_and_dense_attention_each_pick_their_matching_impl() {
+        // With the `if layer % 2 == 0` branch in GEMMA_LIKE_BODY, the
+        // FUF alternates Attention / SlidingAttention tiles. The
+        // solver must bind each to its OpKind-matching Impl — no
+        // OpKind inference, no arch-name filter: each Impl's
+        // `matches` singleton-claims its own kind.
+        let params = gemma_like_params();
+        let (fuf, inferred) = build(GEMMA_LIKE_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+
+        // Decode (m=1) and prefill (m=512) should both split the
+        // picks across the two Attention kinds correctly.
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1, 512]).unwrap();
+
+        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+            let expected_impl_for_decode = ("attention_via_cache", "sliding_attention_via_cache");
+            let expected_impl_for_prefill = (
+                "attention_prefill_contiguous",
+                "sliding_attention_prefill_contiguous",
+            );
+            let (dense_name, sliding_name) = if m == 1 {
+                expected_impl_for_decode
+            } else {
+                expected_impl_for_prefill
+            };
+
+            for sg in sfuf.subgraphs() {
+                let tiles = sfuf.tiles_in_subgraph(sg);
+                if tiles.len() != 1 {
+                    continue;
+                }
+                let op = fuf.get(tiles[0]).op;
+                let name = lib.get(sfuf.impl_of(sg).unwrap()).name();
+                match op {
+                    OpKind::Attention => assert_eq!(name, dense_name, "dense at m={m}"),
+                    OpKind::SlidingAttention => assert_eq!(name, sliding_name, "sliding at m={m}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tanh_softcap_singleton_tile_is_claimed_by_tanh_softcap_impl() {
+        let params = gemma_like_params();
+        let (fuf, inferred) = build(GEMMA_LIKE_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1, 512]).unwrap();
+
+        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+            let softcap_subgraphs: Vec<_> = sfuf
+                .subgraphs()
+                .filter(|sg| {
+                    let tiles = sfuf.tiles_in_subgraph(*sg);
+                    tiles.len() == 1 && fuf.get(tiles[0]).op == OpKind::TanhSoftCap
+                })
+                .collect();
+            assert_eq!(
+                softcap_subgraphs.len(),
+                1,
+                "exactly one TanhSoftCap tile per bucket at m={m}"
+            );
+            let sg = softcap_subgraphs[0];
+            let imp = lib.get(sfuf.impl_of(sg).unwrap()).name();
+            assert_eq!(imp, "tanh_softcap_inplace", "m={m}");
+        }
+    }
+
     #[test]
     fn empty_workload_points_is_empty_result() {
         let params = llama_params("llama-3.2-1b");

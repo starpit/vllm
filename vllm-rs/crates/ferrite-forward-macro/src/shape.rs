@@ -317,6 +317,8 @@ pub fn apply_signature(
         // the type signature.
         OpKind::SlidingAttention => sig_attention(solver, inputs),
         OpKind::Silu => sig_unary_elementwise(solver, inputs, op),
+        OpKind::Gelu => sig_unary_elementwise(solver, inputs, op),
+        OpKind::TanhSoftCap => sig_unary_elementwise(solver, inputs, op),
         OpKind::Add => sig_binary_elementwise(solver, inputs, op),
         OpKind::Mul => sig_binary_elementwise(solver, inputs, op),
     }
@@ -523,6 +525,8 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Attention => &[],
         OpKind::SlidingAttention => &[],
         OpKind::Silu => &[],
+        OpKind::Gelu => &[],
+        OpKind::TanhSoftCap => &[],
         OpKind::Add => &[],
         OpKind::Mul => &[],
     }

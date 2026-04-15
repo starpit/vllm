@@ -65,21 +65,27 @@ pub enum OpKind {
     Gemm,
     RopeAppend,
     Attention,
-    /// Same signature as `Attention`; picked by the DSL body for
-    /// sliding-window attention layers (Gemma2, Gemma3, ...). The
-    /// distinction is carried through the FUF so the solver can
-    /// match distinct Impls (dense flash-attn vs. window-masked
-    /// flash-attn). Shape signature mirrors `Attention`.
+    /// Same signature as `Attention`; picked by the DSL body at
+    /// sliding-window attention layers. The distinction is carried
+    /// through the FUF so the solver can match distinct Impls
+    /// (dense flash-attn vs. window-masked flash-attn).
     SlidingAttention,
     Silu,
+    /// Gaussian-Error Linear Unit. Unary elementwise. Shape-preserving
+    /// like `Silu`; paired with `Mul` in the gate/up fusion of any
+    /// architecture whose MLP is `down(gelu(gate) * up)`.
+    Gelu,
+    /// Tanh-based soft-cap: `y = cap * tanh(x / cap)`. Unary
+    /// elementwise with an additional scalar argument; shape-
+    /// preserving. Used at logit exit for architectures that cap
+    /// large pre-softmax magnitudes.
+    TanhSoftCap,
     Add,
     /// Elementwise multiplication. Produced by the DSL's `*`
     /// operator (e.g. `gate * up` in the SwiGLU MLP). Not reachable
     /// from `from_name` because `*` is a binary operator at the
     /// parse level rather than a named call.
     Mul,
-    // Gemma2 extensions land here without touching any other pass:
-    //   Gelu, SoftCap
 }
 
 impl OpKind {
@@ -94,6 +100,8 @@ impl OpKind {
             "attention" => Some(Self::Attention),
             "sliding_attention" => Some(Self::SlidingAttention),
             "silu" => Some(Self::Silu),
+            "gelu" => Some(Self::Gelu),
+            "tanh_softcap" => Some(Self::TanhSoftCap),
             "add" => Some(Self::Add),
             _ => None,
         }
@@ -108,6 +116,8 @@ impl OpKind {
             Self::Attention => "attention",
             Self::SlidingAttention => "sliding_attention",
             Self::Silu => "silu",
+            Self::Gelu => "gelu",
+            Self::TanhSoftCap => "tanh_softcap",
             Self::Add => "add",
             Self::Mul => "mul",
         }

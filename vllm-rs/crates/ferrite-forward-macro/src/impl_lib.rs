@@ -883,6 +883,34 @@ fn attention_softcap_tokens(ctx: &EmitCtx) -> TokenStream {
     quote! { #cap }
 }
 
+/// `window_size_left` argument for sliding-window attention. Reads
+/// `sliding_window` from the model config (HF convention).
+/// The flash-attn kernel takes `-1` to mean "disabled" and a
+/// non-negative `w` to mean "attend to the last `w` tokens"; every
+/// sliding architecture we know of carries `sliding_window` in
+/// tokens, so the value flows straight through.
+///
+/// A SlidingAttention tile that reaches this helper on a model with
+/// no `sliding_window` in config is a config error — the DSL body
+/// asked for sliding attention but the architecture didn't supply
+/// the window size. Panic with the model name so the failure is
+/// observable at macro expansion.
+pub(crate) fn sliding_window_left_for(model: &crate::config::ModelParams) -> i32 {
+    match model.bounds.get("sliding_window") {
+        Some(w) => (*w) as i32,
+        None => panic!(
+            "sliding_attention tile emitted, but model `{}` has no \
+             `sliding_window` in its config.json",
+            model.source_stem,
+        ),
+    }
+}
+
+fn sliding_window_left_tokens(ctx: &EmitCtx) -> TokenStream {
+    let w = sliding_window_left_for(ctx.model);
+    quote! { #w }
+}
+
 fn cost_attention(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     // Rough: 4 * T^2 * D.
     let node = ctx.fuf.get(m.claimed_tiles[0]);
@@ -963,6 +991,7 @@ pub fn starter_library() -> ImplementationLibrary {
     // (e.g. the first layer's input_layernorm, whose upstream is
     // `embed` not `Add`, stays a singleton RmsNorm claim).
     lib.push(Box::new(FusedGateUpSiluMulImpl));
+    lib.push(Box::new(FusedGateUpGeluMulImpl));
     lib.push(Box::new(FusedAddRmsNormImpl));
     // Decode / prefill QKV+rope variants — the solver picks via
     // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
@@ -971,6 +1000,16 @@ pub fn starter_library() -> ImplementationLibrary {
     // Matching attention pair — decode reads from cache, prefill
     // reads the contiguous K/V produced by the prefill QKV impl.
     lib.push(Box::new(AttentionPrefillContiguousImpl));
+    // Sliding-window variants of the attention pair. Claim
+    // `OpKind::SlidingAttention` so the DSL author opts into window
+    // masking per-tile (e.g. alternating layers via `if` in the DSL
+    // body). `window_size_left` reads from `sliding_window` config.
+    lib.push(Box::new(SlidingAttentionViaCacheImpl));
+    lib.push(Box::new(SlidingAttentionPrefillContiguousImpl));
+    // Standalone TanhSoftCap — reads `final_logit_softcapping` from
+    // config. The DSL body emits `tanh_softcap(...)` only for
+    // architectures that cap logits.
+    lib.push(Box::new(TanhSoftCapImpl));
     // Cutlass standalone GEMM tile zoo — one Impl per tile variant
     // in `target_profiles/cost_*.csv`. `target_compatible` gates each
     // by "does this target have a calibrated cost row for this
@@ -1270,6 +1309,304 @@ fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
     node.inputs
         .iter()
         .any(|i| matches!(i, FufInput::Tile { id, .. } if *id == producer))
+}
+
+// ── FusedGateUpGeluMulImpl ───────────────────────────────────────
+//
+// Structural mirror of [`FusedGateUpSiluMulImpl`] for the GELU
+// variant of the gate/up MLP fusion. Claims the
+// `(Gemm, Gemm, Gelu, Mul)` pattern — the MLP topology of any
+// architecture whose activation is GELU rather than SwiGLU.
+//
+// Pattern-match logic is identical to the Silu variant, seeded on
+// the gate Gemm; the only structural differences in emission are:
+//   - the dispatched kernel is `gelu_and_mul_fused`;
+//   - the upstream activation tile is the `Gelu` node (not `Silu`).
+//
+// Registered alongside the Silu variant in `starter_library`; the
+// two are mutually exclusive on any given FUF since a single gate
+// Gemm cannot simultaneously feed a Silu and a Gelu.
+
+#[derive(Debug, Default)]
+pub struct FusedGateUpGeluMulImpl;
+
+impl Implementation for FusedGateUpGeluMulImpl {
+    fn name(&self) -> &'static str {
+        "fused_gate_up_gelu_mul"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Seed on the gate Gemm (whose output feeds the Gelu). The
+        // FUF's topological order puts Gemms before their downstream
+        // consumers, so seeding on the upstream Gemm commits the
+        // 4-tile claim before the DP greedy-claims the Gelu.
+        let gate_gemm = fuf.get(seed);
+        if gate_gemm.op != OpKind::Gemm {
+            return None;
+        }
+        let gelu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Gelu && consumes_tile(n, seed))?;
+        let gelu_id = gelu_node.id;
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, gelu_id))?;
+        let mul_id = mul_node.id;
+        let up_gemm_id = mul_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != gelu_id => Some(*id),
+            _ => None,
+        })?;
+        let up_gemm = fuf.get(up_gemm_id);
+        if up_gemm.op != OpKind::Gemm {
+            return None;
+        }
+        if first_tile_input(gate_gemm)? != first_tile_input(up_gemm)? {
+            return None;
+        }
+        let mut claimed = [seed, up_gemm_id, gelu_id, mul_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        let activation_tile = first_tile_input(gate_gemm)?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation_tile],
+            boundary_outputs: vec![mul_id],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same cost shape as SwiGLU: fused [M × 2I × H] GEMM + a
+        // bandwidth-bound [M, 2I] → [M, I] elementwise pass.
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as f64;
+        let flops = 2.0 * num_tokens * (2.0 * intermediate) * hidden;
+        let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+        let gemm_us = if peak > 0.0 && flops > 0.0 {
+            (flops / peak) * 1e6
+        } else {
+            0.0
+        };
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 3.0 * num_tokens * intermediate * BYTES_PER_ELEM;
+        let act_mul_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + act_mul_us
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let gelu_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gelu)
+            .expect("fused gate/up/gelu/mul claim must contain Gelu");
+        let mul_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
+            .expect("fused gate/up/gelu/mul claim must contain Mul");
+        let (gate_id, _) =
+            first_tile_input(ctx.fuf.get(gelu_id)).expect("gelu has a tile input — the gate gemm");
+        let up_id = ctx
+            .claimed_tiles
+            .iter()
+            .copied()
+            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
+            .expect("claim contains a second Gemm — the up gemm");
+        let activation = ctx.input_expr(gate_id, 0);
+        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
+        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
+        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+        let mul_out = ctx.output_ident(mul_id, 0);
+        let gate_up_ident = quote::format_ident!("__fused_gate_up_{}", mul_id.0);
+        let intermediate = ctx.bound("intermediate_size") as usize;
+        quote! {
+            let #gate_up_ident = unsafe {
+                (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+            let #mul_out = unsafe {
+                ::ferrite_kernels::kernels::gelu_and_mul_fused(
+                    *#gate_up_ident,
+                    #intermediate,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+// ── TanhSoftCapImpl ──────────────────────────────────────────────
+//
+// Singleton Impl claiming [`OpKind::TanhSoftCap`]. Maps to the
+// in-place `tanh_softcap_inplace` kernel: `x[i] = cap * tanh(x[i] / cap)`.
+//
+// The cap scalar is read from the model config under the convention
+// key `final_logit_softcapping` (HF naming). Architectures that
+// don't cap logits don't emit a `TanhSoftCap` tile in their DSL
+// body, so they never reach this Impl. If a DSL body emits the tile
+// on a model whose config has no cap, the solver reports it — a
+// missing convention field is a hard error at emit time, not a
+// silent no-op. (Same posture as the attention softcap: the convention
+// field exists or the tile shouldn't be in the FUF.)
+
+#[derive(Debug, Default)]
+pub struct TanhSoftCapImpl;
+
+impl Implementation for TanhSoftCapImpl {
+    fn name(&self) -> &'static str {
+        "tanh_softcap_inplace"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::TanhSoftCap)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // One bf16 read + one bf16 write over the input tensor.
+        let numel = ctx.num_tokens() * ctx.bounds.get("vocab_size").copied().unwrap_or(0);
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 2.0 * numel as f64 * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let upstream = ctx
+            .input_tile_ident(tile, 0)
+            .expect("tanh_softcap input must be a tile-sourced tensor");
+
+        // The cap is a config convention. Missing → the DSL body
+        // shouldn't have emitted this tile on this model.
+        let cap: f32 = ctx.scalar("final_logit_softcapping").unwrap_or_else(|| {
+            panic!(
+                "tanh_softcap tile emitted, but model `{}` has no \
+                     `final_logit_softcapping` in its config.json",
+                ctx.model.source_stem,
+            )
+        }) as f32;
+
+        quote! {
+            unsafe {
+                ::ferrite_kernels::kernels::tanh_softcap_inplace(
+                    *#upstream,
+                    #cap,
+                    device.compute_stream,
+                );
+            }
+            // Downstream reads alias the mutated upstream buffer.
+            let #out = unsafe { (*#upstream).as_view() };
+        }
+    }
 }
 
 // ── FusedAddRmsNormImpl ──────────────────────────────────────────
@@ -2248,6 +2585,239 @@ impl Implementation for AttentionPrefillContiguousImpl {
             // Flatten [num_tokens, num_q_heads, head_dim] → [num_tokens, q_size]
             // so the downstream o_proj gemm sees a 2D [M, K] input with the
             // right K dimension.
+            unsafe {
+                let nt = (*#out).dim(0);
+                let dt = (*#out).dtype();
+                #out.reshape(&[nt, #q_size], dt);
+            }
+        }
+    }
+}
+
+// ── SlidingAttentionViaCacheImpl ─────────────────────────────────
+//
+// Mirror of [`AttentionViaCacheImpl`] for [`OpKind::SlidingAttention`].
+// Identical kernel path (paged decode through
+// `attention_decode_from_cache`) but passes `window_size_left` from
+// the model config's `sliding_window` field, so the flash-attn
+// kernel masks out positions beyond the window. Decode-only
+// (`NumTokensRange { 1, 1 }`); the prefill counterpart is
+// [`SlidingAttentionPrefillContiguousImpl`].
+
+#[derive(Debug, Default)]
+pub struct SlidingAttentionViaCacheImpl;
+
+impl Implementation for SlidingAttentionViaCacheImpl {
+    fn name(&self) -> &'static str {
+        "sliding_attention_via_cache"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::SlidingAttention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        cost_attention(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let node = ctx.fuf.get(tile);
+        let q_expr = ctx.input_expr(tile, 0);
+        let layer = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Extern {
+                    kind: crate::classified::ExternKind::KvCache,
+                    index: Some(layer),
+                } => Some(*layer),
+                _ => None,
+            })
+            .expect("SlidingAttention has a kv_cache extern with a concrete layer index")
+            as usize;
+
+        let scale_tokens = attention_scale_tokens(ctx);
+        let softcap_tokens = attention_softcap_tokens(ctx);
+        let window_tokens = sliding_window_left_tokens(ctx);
+        let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
+
+        quote! {
+            let mut #out = unsafe {
+                let has_spans = !ctx.kv_cache.block_unrotated_gpu().is_null();
+                let (cos_sin_ptr, rotary_dim) = if has_spans {
+                    (
+                        ctx.rotary.cos_sin_cache.raw_ptr() as *const u8,
+                        ctx.rotary.cos_sin_cache.dim(1),
+                    )
+                } else {
+                    (::std::ptr::null::<u8>(), 0)
+                };
+                ::ferrite_kernels::attention_helpers::attention_decode_from_cache(
+                    #q_expr,
+                    ctx.cu_seqlens_q,
+                    ctx.seqused_k,
+                    ctx.block_table,
+                    ctx.max_seqlen_q,
+                    ctx.max_seqlen_k,
+                    #scale_tokens,
+                    #softcap_tokens,
+                    #window_tokens,
+                    ctx.kv_cache,
+                    #layer,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                    cos_sin_ptr,
+                    rotary_dim,
+                    false, // is_rotary_interleaved
+                )
+            };
+            unsafe {
+                let nt = (*#out).dim(0);
+                let dt = (*#out).dtype();
+                #out.reshape(&[nt, #q_size], dt);
+            }
+        }
+    }
+}
+
+// ── SlidingAttentionPrefillContiguousImpl ────────────────────────
+//
+// Prefill counterpart of [`SlidingAttentionViaCacheImpl`]. Reads Q,
+// K, V from slots 0/1/2 (populated by an upstream prefill QKV impl)
+// and calls `flash_attn_contiguous` with the config-driven window.
+
+#[derive(Debug, Default)]
+pub struct SlidingAttentionPrefillContiguousImpl;
+
+impl Implementation for SlidingAttentionPrefillContiguousImpl {
+    fn name(&self) -> &'static str {
+        "sliding_attention_prefill_contiguous"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::SlidingAttention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        cost_attention(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+
+        let q_expr = ctx.input_expr(tile, 0);
+        let k_expr = ctx.input_expr(tile, 1);
+        let v_expr = ctx.input_expr(tile, 2);
+
+        let scale_tokens = attention_scale_tokens(ctx);
+        let softcap_tokens = attention_softcap_tokens(ctx);
+        let window_tokens = sliding_window_left_tokens(ctx);
+        let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
+
+        quote! {
+            let mut #out = unsafe {
+                ::ferrite_kernels::kernels::flash_attn_contiguous(
+                    *#q_expr,
+                    *#k_expr,
+                    *#v_expr,
+                    *ctx.cu_seqlens_q,
+                    *ctx.cu_seqlens_q,
+                    ctx.max_seqlen_q,
+                    ctx.max_seqlen_k,
+                    #scale_tokens,
+                    true, // is_causal
+                    #softcap_tokens,
+                    #window_tokens,
+                    &mut device.caching,
+                    device.compute_stream,
+                    ::std::ptr::null::<u8>(),
+                    0,     // rotary_dim
+                    false, // is_rotary_interleaved
+                )
+            };
             unsafe {
                 let nt = (*#out).dim(0);
                 let dt = (*#out).dtype();

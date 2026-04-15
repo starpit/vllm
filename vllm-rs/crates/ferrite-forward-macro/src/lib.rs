@@ -45,10 +45,6 @@ mod weight_conventions;
 // ── Attribute argument parsing ────────────────────────────────────
 
 struct ForwardArgs {
-    /// Path to the directory of config.json files for this
-    /// architecture, relative to CARGO_MANIFEST_DIR of the invoking
-    /// crate.
-    models_dir: LitStr,
     /// Path to the target profile JSON, relative to
     /// CARGO_MANIFEST_DIR of the invoking crate.
     target: LitStr,
@@ -62,7 +58,6 @@ struct ForwardArgs {
 impl Parse for ForwardArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let span = input.span();
-        let mut models_dir: Option<LitStr> = None;
         let mut target: Option<LitStr> = None;
         let mut workloads: Option<Vec<u64>> = None;
 
@@ -71,7 +66,6 @@ impl Parse for ForwardArgs {
             input.parse::<Token![=]>()?;
 
             match key.to_string().as_str() {
-                "models_dir" => models_dir = Some(input.parse()?),
                 "target" => target = Some(input.parse()?),
                 "workloads" => {
                     let list;
@@ -99,8 +93,6 @@ impl Parse for ForwardArgs {
             }
         }
 
-        let models_dir =
-            models_dir.ok_or_else(|| syn::Error::new(span, "#[forward] missing `models_dir`"))?;
         let target = target.ok_or_else(|| syn::Error::new(span, "#[forward] missing `target`"))?;
         let workloads =
             workloads.ok_or_else(|| syn::Error::new(span, "#[forward] missing `workloads`"))?;
@@ -109,12 +101,43 @@ impl Parse for ForwardArgs {
         }
 
         Ok(Self {
-            models_dir,
             target,
             workloads,
             span,
         })
     }
+}
+
+/// Discover `model_architectures/<arch>` for the given arch
+/// identifier by walking up from `start` (the invoking crate's
+/// manifest dir) looking for a parent that contains a
+/// `model_architectures` directory with a `<arch>` child.
+///
+/// This is how `#[forward] fn llama() { ... }` knows to read
+/// `model_architectures/llama/*.json` without the user spelling
+/// out `models_dir`. Walk-up stops at the first match, or returns
+/// an error naming every directory it checked.
+fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path::PathBuf, String> {
+    let mut checked: Vec<std::path::PathBuf> = Vec::new();
+    let mut cur: Option<&std::path::Path> = Some(start);
+    while let Some(dir) = cur {
+        let candidate = dir.join("model_architectures").join(arch);
+        if candidate.is_dir() {
+            return Ok(candidate);
+        }
+        checked.push(candidate);
+        cur = dir.parent();
+    }
+    Err(format!(
+        "no `model_architectures/{arch}` directory found walking up from {}. \
+         Searched: {}",
+        start.display(),
+        checked
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    ))
 }
 
 // ── Macro entry point ─────────────────────────────────────────────
@@ -132,15 +155,19 @@ pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
 
 fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     // CARGO_MANIFEST_DIR at macro-expansion time is the invoking
-    // crate's root. All configured paths resolve against it.
+    // crate's root. Target path resolves against it; the arch
+    // `model_architectures/<arch>` directory is discovered by
+    // walking up from here, using the carrier's fn name as <arch>.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
         syn::Error::new(
             args.span,
-            "CARGO_MANIFEST_DIR not set — cannot resolve models_dir/target paths",
+            "CARGO_MANIFEST_DIR not set — cannot resolve paths",
         )
     })?;
     let base = std::path::PathBuf::from(manifest_dir);
-    let models_dir = base.join(args.models_dir.value());
+    let arch_name = carrier.sig.ident.to_string();
+    let models_dir = discover_models_dir(&base, &arch_name)
+        .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
     let target_path = base.join(args.target.value());
 
     // ── Front end: parse + classify + shape-infer ─────────────────
@@ -154,13 +181,13 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     // ── Load configs + target + library ────────────────────────────
     let models = config::load_dir(&models_dir).map_err(|e| {
         syn::Error::new(
-            args.models_dir.span(),
+            carrier.sig.ident.span(),
             format!("models_dir `{}`: {e}", models_dir.display()),
         )
     })?;
     if models.is_empty() {
         return Err(syn::Error::new(
-            args.models_dir.span(),
+            carrier.sig.ident.span(),
             format!("no *.json configs in {}", models_dir.display()),
         ));
     }
@@ -246,21 +273,21 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
 
     let arch_dispatch_ts = emit_arch_dispatcher(&arch_dispatch_arms);
 
-    // Group every model's emitted module under one `pub mod <arch>`
-    // matching the carrier fn's name. Callers access as
-    // `llama::llama_3_2_1b::NUM_TILES` etc. — the architecture
-    // identifier scopes the models it owns.
-    let arch_mod = &carrier.sig.ident;
-
+    // Emit items INLINE at the carrier's scope (no wrapping mod).
+    // The carrier fn itself is consumed — it was only a host for
+    // the DSL body + the arch ident. The file-module that contains
+    // the #[forward] invocation becomes the public entry point:
+    // if `ferrite-models/src/llama.rs` contains
+    // `#[forward] fn llama() { ... }`, the caller accesses
+    // `ferrite_models::llama::Weights` directly (no
+    // `::arch::` / `::llama::` / etc.).
     Ok(quote! {
-        pub mod #arch_mod {
-            // Rebuild-on-change for every JSON the macro read.
-            #(#tracked)*
+        // Rebuild-on-change for every JSON the macro read.
+        #(#tracked)*
 
-            #(#per_model_ts)*
+        #(#per_model_ts)*
 
-            #arch_dispatch_ts
-        }
+        #arch_dispatch_ts
     })
 }
 

@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! LLaMA model architecture via the `#[forward]` attribute macro.
-//!
-//! The macro compiles the DSL body below against every JSON in
-//! `model_architectures/llama/` at each workload bucket, emitting
-//! `pub mod llama::<model_ident>` with:
-//!   - a `WeightBundle` trait the caller implements to expose weights,
-//!   - `forward_m_<N>` fns — one per workload bucket,
-//!   - a dispatching `forward(wm, ctx, device, num_tokens)` fn.
+//! LLaMA — the math. The `#[forward]` attribute macro reads the
+//! body below, finds `model_architectures/llama/` by walking up
+//! from this crate, and for every config JSON in it emits
+//! specialized `Weights` + `forward` under `ferrite_models::llama`.
 
 use ferrite_forward::forward;
 
 #[forward(
-    models_dir = "../../../model_architectures/llama",
     target = "../../../target_profiles/l4_sm89.json",
     workloads = [1, 8, 64, 512, 4096],
 )]

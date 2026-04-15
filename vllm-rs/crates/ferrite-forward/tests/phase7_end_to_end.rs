@@ -15,8 +15,9 @@ use ferrite_forward::forward;
 
 // The real Llama body — SwiGLU MLP (`silu(gate) * up`), exercising
 // the Expr::Mul path that used to emit OpKind::Add by mistake.
+// `models_dir` is discovered from the carrier fn name `llama` by
+// walking up looking for `model_architectures/llama/`.
 #[forward(
-    models_dir = "../../../model_architectures/llama",
     target = "../../../target_profiles/l4_sm89.json",
     workloads = [1, 8, 64, 512, 4096],
 )]
@@ -49,37 +50,37 @@ fn llama_3_2_1b_tile_count_matches_expected() {
     // rmsnorm2, gate_gemm, silu, up_gemm, mul, down_gemm, add2.
     // Pre: embed (1). Post: rmsnorm + lm_head (2).
     // Total: 1 + 16 × 15 + 2 = 243 tiles.
-    assert_eq!(llama::llama_3_2_1b::NUM_TILES, 243);
+    assert_eq!(llama_3_2_1b::NUM_TILES, 243);
 }
 
 #[test]
 fn llama_3_1_8b_tile_count_matches_expected() {
     // 32 layers × 15 + 3 = 483 tiles.
-    assert_eq!(llama::llama_3_1_8b::NUM_TILES, 483);
+    assert_eq!(llama_3_1_8b::NUM_TILES, 483);
 }
 
 #[test]
 fn every_llama_config_was_compiled() {
     // The nine Llama configs. If any didn't go through the
     // pipeline this file wouldn't compile.
-    let _: usize = llama::llama_2_7b::NUM_TILES;
-    let _: usize = llama::llama_2_13b::NUM_TILES;
-    let _: usize = llama::llama_2_70b::NUM_TILES;
-    let _: usize = llama::llama_3_8b::NUM_TILES;
-    let _: usize = llama::llama_3_70b::NUM_TILES;
-    let _: usize = llama::llama_3_1_8b::NUM_TILES;
-    let _: usize = llama::llama_3_1_70b::NUM_TILES;
-    let _: usize = llama::llama_3_2_1b::NUM_TILES;
-    let _: usize = llama::llama_3_2_3b::NUM_TILES;
+    let _: usize = llama_2_7b::NUM_TILES;
+    let _: usize = llama_2_13b::NUM_TILES;
+    let _: usize = llama_2_70b::NUM_TILES;
+    let _: usize = llama_3_8b::NUM_TILES;
+    let _: usize = llama_3_70b::NUM_TILES;
+    let _: usize = llama_3_1_8b::NUM_TILES;
+    let _: usize = llama_3_1_70b::NUM_TILES;
+    let _: usize = llama_3_2_1b::NUM_TILES;
+    let _: usize = llama_3_2_3b::NUM_TILES;
 }
 
 #[test]
 fn every_workload_point_was_solved_for_llama_3_2_1b() {
-    let _: f64 = llama::llama_3_2_1b::m_1::PREDICTED_US;
-    let _: f64 = llama::llama_3_2_1b::m_8::PREDICTED_US;
-    let _: f64 = llama::llama_3_2_1b::m_64::PREDICTED_US;
-    let _: f64 = llama::llama_3_2_1b::m_512::PREDICTED_US;
-    let _: f64 = llama::llama_3_2_1b::m_4096::PREDICTED_US;
+    let _: f64 = llama_3_2_1b::m_1::PREDICTED_US;
+    let _: f64 = llama_3_2_1b::m_8::PREDICTED_US;
+    let _: f64 = llama_3_2_1b::m_64::PREDICTED_US;
+    let _: f64 = llama_3_2_1b::m_512::PREDICTED_US;
+    let _: f64 = llama_3_2_1b::m_4096::PREDICTED_US;
 }
 
 #[test]
@@ -87,11 +88,11 @@ fn solver_produced_finite_positive_cost_across_workloads() {
     // For the starter library (single-tile claims), subgraph count
     // equals tile count. And predicted cost must be finite > 0.
     let points: [f64; 5] = [
-        llama::llama_3_2_1b::m_1::PREDICTED_US,
-        llama::llama_3_2_1b::m_8::PREDICTED_US,
-        llama::llama_3_2_1b::m_64::PREDICTED_US,
-        llama::llama_3_2_1b::m_512::PREDICTED_US,
-        llama::llama_3_2_1b::m_4096::PREDICTED_US,
+        llama_3_2_1b::m_1::PREDICTED_US,
+        llama_3_2_1b::m_8::PREDICTED_US,
+        llama_3_2_1b::m_64::PREDICTED_US,
+        llama_3_2_1b::m_512::PREDICTED_US,
+        llama_3_2_1b::m_4096::PREDICTED_US,
     ];
     for us in points {
         assert!(us > 0.0 && us.is_finite(), "bogus predicted_us: {us}");
@@ -100,8 +101,8 @@ fn solver_produced_finite_positive_cost_across_workloads() {
     // gemm-cost-drop that used to bite). Bind to locals so
     // clippy::assertions_on_constants doesn't flag the compile-
     // time comparison.
-    let decode: f64 = llama::llama_3_2_1b::m_1::PREDICTED_US;
-    let prefill: f64 = llama::llama_3_2_1b::m_4096::PREDICTED_US;
+    let decode: f64 = llama_3_2_1b::m_1::PREDICTED_US;
+    let prefill: f64 = llama_3_2_1b::m_4096::PREDICTED_US;
     assert!(prefill > decode * 10.0);
 }
 
@@ -116,10 +117,10 @@ fn arch_level_weights_enum_and_dispatch_exist() {
         // Type-level observation: an enum variant for the 1B model
         // exists and wraps that model's `Weights`. If the dispatcher
         // wasn't emitted this line wouldn't type-check.
-        fn _probe(w: llama::llama_3_2_1b::Weights) -> llama::Weights {
-            llama::Weights::Llama_3_2_1b(w)
+        fn _probe(w: llama_3_2_1b::Weights) -> Weights {
+            Weights::Llama_3_2_1b(w)
         }
-        let _: fn(llama::llama_3_2_1b::Weights) -> llama::Weights = _probe;
+        let _: fn(llama_3_2_1b::Weights) -> Weights = _probe;
     }
 }
 
@@ -135,8 +136,8 @@ fn scheduler_produces_linear_chain_on_fused_body() {
     // If a future fusion leaves genuinely independent subgraphs, this
     // test loosens — but for the current impl library the serial
     // chain is the correct expectation.
-    let waves: usize = llama::llama_3_2_1b::m_1::NUM_WAVES;
-    let subgraphs: usize = llama::llama_3_2_1b::m_1::NUM_SUBGRAPHS;
+    let waves: usize = llama_3_2_1b::m_1::NUM_WAVES;
+    let subgraphs: usize = llama_3_2_1b::m_1::NUM_SUBGRAPHS;
     assert_eq!(
         waves, subgraphs,
         "post-fusion Llama body is a serial chain; waves must match subgraphs \

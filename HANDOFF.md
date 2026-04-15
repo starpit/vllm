@@ -26,7 +26,9 @@
   AttentionViaCache). `cargo build -p ferrite-forward --features
   cuda --tests` is **green** — the emitted Llama forward fn
   type-checks across all 9 configs × 5 workload buckets.
-- **Branch**: `worktree-ferrite-forward`. **HEAD**: `6249c2b27`.
+  `ConcurrencyModel` ported; per-wave contention-aware cost
+  aggregation runs post-scheduler.
+- **Branch**: `worktree-ferrite-forward`. **HEAD**: `0cf1165fe`.
 
 ## Verify current state
 
@@ -39,7 +41,7 @@ cargo build   -p ferrite-forward --features cuda --tests
 ```
 
 Expected state:
-- **76 unit + 6 integration tests pass.**
+- **84 unit + 6 integration tests pass.**
 - fmt + clippy clean (non-cuda).
 - Cuda test build compiles the emitted Llama forward fn for every
   (model × workload bucket) pair — no more fake-symbol errors.
@@ -83,7 +85,22 @@ Expected state:
   cheaper singleton at the seed is a correctness failure (no
   singleton Silu/Mul/Add-without-RmsNorm/RopeAppend impls exist),
   not a cost tradeoff. Unmatched tile → hard `SolveError::UnclaimedTile`;
-  no auto-claim fallback.
+  no auto-claim fallback. The DP's per-bucket `predicted_us` is
+  overwritten post-scheduler by the contention-aware aggregator in
+  `cost.rs`.
+- **Concurrency model** (`concurrency.rs`): ported verbatim from
+  old ferrite. Four rules: CooperativeLaunch exclusivity (coresident
+  = `INFINITY`), compute+compute = 1.0 (serialize on tensor cores),
+  memory shadows compute = 0.5, DeviceCallable megakernel stub =
+  1.0. Consumes `launch_kind()` and `is_compute_bound()` off each
+  Impl.
+- **Cost aggregator** (`cost.rs`): `loop_cost_us` walks LOOP waves,
+  applies `contention_factor(self, others_in_wave)` per Impl, sums.
+  `refresh_predicted_us` overwrites each bucket's
+  `Assignment.predicted_us` in place. On the current serial-chain
+  library (every wave = 1 subgraph) contention is always 1.0 —
+  machinery stays dormant until DeviceCallable + megakernel waves
+  land.
 - **Scheduler** (`schedule.rs`): topological wavefront over
   subgraphs. `Loop { waves: Vec<Wave> }` per workload point;
   `WorkloadLoops` keyed by `num_tokens`. Post-fusion the real
@@ -437,6 +454,8 @@ ferrite-forward/                    (worktree root)
             ├── solver.rs           DP solver, SFUF, WorkloadAssignments
             ├── schedule.rs         wavefront scheduler, Loop, Wave,
             │                         WorkloadLoops
+            ├── concurrency.rs      ConcurrencyModel (ported verbatim)
+            ├── cost.rs             contention-aware LOOP aggregator
             ├── emit.rs             EmitCtx + input_expr helpers
             └── codegen.rs          per-(model × workload) forward fn
                                       emitter; SFUF-walking
@@ -463,6 +482,8 @@ compile — the method was aspirational before.
 ## Commit history (current branch, most recent first)
 
 ```
+0cf1165fe  ferrite-forward: port ConcurrencyModel + contention-aware cost aggregator
+2d3600a37  HANDOFF: record C1-C4 port (cuda build green; library complete)
 6249c2b27  ferrite-forward: port AttentionViaCacheImpl; cuda build green
 bacb93277  ferrite-forward: port FusedQkvRopeCacheImpl; delete RopeAppendRefImpl
 179f6a911  ferrite-forward: port FusedAddRmsNormImpl; delete AddRefImpl

@@ -78,8 +78,13 @@ pub enum Expr {
     Index { target: Box<Expr>, index: Ident },
     /// A named op call, e.g. `gemm(x, w)`.
     Call { op: Ident, args: Vec<Expr> },
-    /// `lhs * rhs` — the only binary operator the DSL currently
-    /// admits (used e.g. by `gate * up` feeding the `mlp.down_proj`
-    /// gemm).
+    /// `lhs * rhs` (SwiGLU `gate * up`). Tensor × tensor.
     Mul { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `lhs + rhs`. Admitted when the RHS (or LHS) is a scalar
+    /// literal — e.g. Gemma's `w + 1.0` on rmsnorm weights. Tensor
+    /// + tensor goes through the named `add(a, b)` op instead.
+    Add { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// A numeric scalar literal (f64). Only valid as an operand to
+    /// `Add` / `Mul`; not a standalone assignment.
+    ScalarLit(f64),
 }

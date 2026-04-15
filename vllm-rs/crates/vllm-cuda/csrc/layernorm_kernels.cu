@@ -45,6 +45,7 @@ __global__ void rms_norm_kernel(
     const T* __restrict__ input,
     const T* __restrict__ weight,
     float epsilon,
+    float weight_offset,  // e.g. 1.0 for Gemma2's (1+w); 0.0 for Llama.
     int hidden_size)
 {
     constexpr int VEC_SIZE = VecType<T>::SIZE;
@@ -81,20 +82,22 @@ __global__ void rms_norm_kernel(
     __syncthreads();
 
     // Pass 2: Apply normalization with vectorized loads/stores.
+    // All math in fp32; cast to T happens at pack/store (Gemma
+    // cast-last semantics — matches vllm Python's GemmaRMSNorm).
     for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
         float xbuf[VEC_SIZE], wbuf[VEC_SIZE], obuf[VEC_SIZE];
         unpack_vec<T>(vec_load(&x[vi * VEC_SIZE]), xbuf);
         unpack_vec<T>(vec_load(&weight[vi * VEC_SIZE]), wbuf);
         #pragma unroll
         for (int j = 0; j < VEC_SIZE; j++) {
-            obuf[j] = xbuf[j] * s_inv_rms * wbuf[j];
+            obuf[j] = xbuf[j] * s_inv_rms * (wbuf[j] + weight_offset);
         }
         vec_store(&y[vi * VEC_SIZE], pack_vec<T>(obuf));
     }
     // Scalar tail.
     for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
         float v = static_cast<float>(x[i]) * s_inv_rms;
-        y[i] = static_cast<T>(v * static_cast<float>(weight[i]));
+        y[i] = static_cast<T>(v * (static_cast<float>(weight[i]) + weight_offset));
     }
 }
 
@@ -107,6 +110,7 @@ __global__ void fused_add_rms_norm_kernel(
     T* __restrict__ residual,
     const T* __restrict__ weight,
     float epsilon,
+    float weight_offset,
     int hidden_size)
 {
     constexpr int VEC_SIZE = VecType<T>::SIZE;
@@ -146,21 +150,22 @@ __global__ void fused_add_rms_norm_kernel(
     }
     __syncthreads();
 
-    // Pass 2: Normalize with vectorized loads/stores.
+    // Pass 2: Normalize with vectorized loads/stores. Gemma's
+    // `(1+w)` convention rides `weight_offset`; Llama passes 0.0.
     for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
         float rbuf[VEC_SIZE], wbuf[VEC_SIZE], obuf[VEC_SIZE];
         unpack_vec<T>(vec_load(&res[vi * VEC_SIZE]), rbuf);
         unpack_vec<T>(vec_load(&weight[vi * VEC_SIZE]), wbuf);
         #pragma unroll
         for (int j = 0; j < VEC_SIZE; j++) {
-            obuf[j] = rbuf[j] * s_inv_rms * wbuf[j];
+            obuf[j] = rbuf[j] * s_inv_rms * (wbuf[j] + weight_offset);
         }
         vec_store(&inp[vi * VEC_SIZE], pack_vec<T>(obuf));
     }
     // Scalar tail.
     for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
         float v = static_cast<float>(res[i]) * s_inv_rms;
-        inp[i] = static_cast<T>(v * static_cast<float>(weight[i]));
+        inp[i] = static_cast<T>(v * (static_cast<float>(weight[i]) + weight_offset));
     }
 }
 
@@ -172,64 +177,64 @@ extern "C" {
 
 void rms_norm_f32(
     float* out, const float* input, const float* weight,
-    float epsilon, int num_tokens, int hidden_size,
+    float epsilon, float weight_offset, int num_tokens, int hidden_size,
     cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
     rms_norm_kernel<float><<<num_tokens, threads, 0, stream>>>(
-        out, input, weight, epsilon, hidden_size);
+        out, input, weight, epsilon, weight_offset, hidden_size);
 }
 
 void rms_norm_f16(
     __half* out, const __half* input, const __half* weight,
-    float epsilon, int num_tokens, int hidden_size,
+    float epsilon, float weight_offset, int num_tokens, int hidden_size,
     cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
     rms_norm_kernel<__half><<<num_tokens, threads, 0, stream>>>(
-        out, input, weight, epsilon, hidden_size);
+        out, input, weight, epsilon, weight_offset, hidden_size);
 }
 
 void rms_norm_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* input, const __nv_bfloat16* weight,
-    float epsilon, int num_tokens, int hidden_size,
+    float epsilon, float weight_offset, int num_tokens, int hidden_size,
     cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
     rms_norm_kernel<__nv_bfloat16><<<num_tokens, threads, 0, stream>>>(
-        out, input, weight, epsilon, hidden_size);
+        out, input, weight, epsilon, weight_offset, hidden_size);
 }
 
 // ---- Fused Add + RMS Norm entry points ----
 
 void fused_add_rms_norm_f32(
     float* input, float* residual, const float* weight,
-    float epsilon, int num_tokens, int hidden_size,
+    float epsilon, float weight_offset, int num_tokens, int hidden_size,
     cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
     fused_add_rms_norm_kernel<float><<<num_tokens, threads, 0, stream>>>(
-        input, residual, weight, epsilon, hidden_size);
+        input, residual, weight, epsilon, weight_offset, hidden_size);
 }
 
 void fused_add_rms_norm_f16(
     __half* input, __half* residual, const __half* weight,
-    float epsilon, int num_tokens, int hidden_size,
+    float epsilon, float weight_offset, int num_tokens, int hidden_size,
     cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
     fused_add_rms_norm_kernel<__half><<<num_tokens, threads, 0, stream>>>(
-        input, residual, weight, epsilon, hidden_size);
+        input, residual, weight, epsilon, weight_offset, hidden_size);
 }
 
 void fused_add_rms_norm_bf16(
     __nv_bfloat16* input, __nv_bfloat16* residual, const __nv_bfloat16* weight,
-    float epsilon, int num_tokens, int hidden_size,
+    float epsilon, float weight_offset, int num_tokens, int hidden_size,
     cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
     fused_add_rms_norm_kernel<__nv_bfloat16><<<num_tokens, threads, 0, stream>>>(
-        input, residual, weight, epsilon, hidden_size);
+        input, residual, weight, epsilon, weight_offset, hidden_size);
 }
 
 // ---- Cohere LayerNorm (out-of-place, vectorized) ----

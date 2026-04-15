@@ -312,6 +312,17 @@ pub enum Expr {
     },
     /// Op call.
     Call { op: OpKind, args: Vec<Expr> },
-    /// Multiplication (`gate * up`).
+    /// Multiplication (`gate * up`). Tensor × tensor.
     Mul { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// Addition (`w + 1.0`) — the classifier resolves this to a
+    /// tile-level `OpKind::Add` call with the scalar captured as
+    /// `ScalarLit` inside `args`. See [`classify_expr`].
+    ///
+    /// A purely structural variant; classify reshapes it before
+    /// downstream passes see it, so nothing below the parser needs
+    /// a dedicated `Add` binop variant.
+    Add { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// A numeric scalar literal. Used as an operand to elementwise
+    /// ops that admit a scalar broadcast (e.g. Gemma's `w + 1.0`).
+    ScalarLit(f64),
 }

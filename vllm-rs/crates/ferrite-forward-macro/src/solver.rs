@@ -500,6 +500,7 @@ fn resolve_input_shapes(fuf: &Fuf, node: &FufNode, inferred: &Inferred) -> Vec<S
             }
             FufInput::Weight { id, .. } => inferred.weights.get(id).cloned().unwrap_or_default(),
             FufInput::Extern { kind, .. } => extern_shape(*kind),
+            FufInput::Scalar(_) => Shape::new(),
         })
         .collect()
 }

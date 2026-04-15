@@ -485,8 +485,14 @@ fn sig_unary_elementwise(
     })
 }
 
-/// Binary elementwise ops (`add`, `mul`). Output shape equals
-/// either operand; operands are unified to enforce shape equality.
+/// Binary elementwise ops (`add`, `mul`). Output shape equals the
+/// non-scalar operand; two tensor operands are unified elementwise.
+///
+/// A rank-0 operand (empty Shape) is a scalar broadcast — used by
+/// e.g. `w + 1.0` where `1.0` is a [`ScalarLit`](Expr::ScalarLit).
+/// Broadcast is allowed only when the OTHER operand has positive
+/// rank; scalar-on-both is rejected (`add(1.0, 1.0)` is a
+/// compile-time constant and doesn't belong in the op graph).
 fn sig_binary_elementwise(
     solver: &mut Solver,
     inputs: &[Shape],
@@ -495,21 +501,36 @@ fn sig_binary_elementwise(
     expect_args(op, inputs, 2)?;
     let x = &inputs[0];
     let y = &inputs[1];
-    if x.len() != y.len() {
-        return Err(ShapeError::BadArgs {
+    // Scalar broadcast: one operand rank-0 → output is the other.
+    match (x.is_empty(), y.is_empty()) {
+        (true, true) => Err(ShapeError::BadArgs {
             op,
             reason: format!(
-                "{} operands differ in rank: {} vs {}",
+                "{} of two scalars is a compile-time constant, \
+                 not an op — fold at the call site",
                 op.as_str(),
-                x.len(),
-                y.len()
             ),
-        });
+        }),
+        (true, false) => Ok(OpSig { output: y.clone() }),
+        (false, true) => Ok(OpSig { output: x.clone() }),
+        (false, false) => {
+            if x.len() != y.len() {
+                return Err(ShapeError::BadArgs {
+                    op,
+                    reason: format!(
+                        "{} operands differ in rank: {} vs {}",
+                        op.as_str(),
+                        x.len(),
+                        y.len()
+                    ),
+                });
+            }
+            for (a, b) in x.iter().zip(y) {
+                solver.unify(a, b)?;
+            }
+            Ok(OpSig { output: x.clone() })
+        }
     }
-    for (a, b) in x.iter().zip(y) {
-        solver.unify(a, b)?;
-    }
-    Ok(OpSig { output: x.clone() })
 }
 
 /// For each op, the (arg_idx, expected_rank) pairs of its *weight*
@@ -793,9 +814,27 @@ impl InferCtx {
                 // Ensure any weight args have a shape of the
                 // appropriate rank. Without this, the first call to
                 // a weight would try to read an empty shape.
+                //
+                // Descend one level into a nested `Add` (weight +
+                // scalar) — the parent op's weight_arg_rank applies
+                // to the weight inside the add, since a scalar
+                // broadcast preserves rank.
                 for (arg_idx, rank) in weight_arg_ranks(*op) {
-                    if let Some(Expr::Weight { id, .. }) = args.get(*arg_idx) {
-                        self.ensure_weight_rank(*id, *rank);
+                    match args.get(*arg_idx) {
+                        Some(Expr::Weight { id, .. }) => {
+                            self.ensure_weight_rank(*id, *rank);
+                        }
+                        Some(Expr::Call {
+                            op: OpKind::Add,
+                            args: inner_args,
+                        }) => {
+                            for inner in inner_args {
+                                if let Expr::Weight { id, .. } = inner {
+                                    self.ensure_weight_rank(*id, *rank);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 let inputs: Vec<Shape> = args
@@ -871,6 +910,14 @@ impl InferCtx {
             Expr::Call { .. } | Expr::Mul { .. } => {
                 // Nested call in read position (silu(gemm(...))).
                 self.infer_expr(expr)
+            }
+            Expr::Add { .. } => unreachable!(
+                "Expr::Add is lowered to Expr::Call by classify before shape inference"
+            ),
+            Expr::ScalarLit(_) => {
+                // Rank-0 — sig_binary_elementwise handles broadcast
+                // from the other operand.
+                Ok(Shape::new())
             }
         }
     }

@@ -31,8 +31,12 @@ use ferrite_forward::forward;
 fn gemma2() {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {
-        // Pre-attention norm.
-        pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer]);
+        // Pre-attention norm. Gemma's `(1+w)` convention rides as
+        // a scalar addition on the weight ref — the solver's
+        // ScalarOffsetRmsNormImpl claims the `(Add(w, 1.0), rmsnorm)`
+        // pair and emits a single rms_norm call with the 1.0 as
+        // the kernel's `weight_offset`.
+        pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer] + 1.0);
 
         // Attention block.
         q = gemm(pre_attn_normed, self_attn.q_proj[layer]);
@@ -47,12 +51,11 @@ fn gemma2() {
         oproj = gemm(attn, self_attn.o_proj[layer]);
 
         // Post-attention norm on the attention output, before residual.
-        post_attn_normed = rmsnorm(oproj, post_attention_layernorm[layer]);
+        post_attn_normed = rmsnorm(oproj, post_attention_layernorm[layer] + 1.0);
 
-        // Residual + pre-ffwd norm. The solver's FusedAddRmsNorm
-        // claims the `(add, rmsnorm)` pair automatically.
+        // Residual + pre-ffwd norm.
         hidden_states = add(post_attn_normed, hidden_states);
-        pre_ffwd_normed = rmsnorm(hidden_states, pre_feedforward_layernorm[layer]);
+        pre_ffwd_normed = rmsnorm(hidden_states, pre_feedforward_layernorm[layer] + 1.0);
 
         // GELU MLP — solver claims `(gemm, gemm, gelu, mul)` as a
         // FusedGateUpGeluMul subgraph.
@@ -61,15 +64,12 @@ fn gemma2() {
         down = gemm(gate * up, mlp.down_proj[layer]);
 
         // Post-ffwd norm on the MLP output, before residual.
-        post_ffwd_normed = rmsnorm(down, post_feedforward_layernorm[layer]);
+        post_ffwd_normed = rmsnorm(down, post_feedforward_layernorm[layer] + 1.0);
 
-        // End-of-layer residual. Next iteration's input_layernorm
-        // reads `hidden_states` — the solver fuses this add with
-        // that rmsnorm across the loop back-edge.
         hidden_states = add(post_ffwd_normed, hidden_states);
     }
     // Final norm + lm_head + logit softcap.
-    normed = rmsnorm(hidden_states, norm);
+    normed = rmsnorm(hidden_states, norm + 1.0);
     logits = gemm(normed, lm_head);
     capped = tanh_softcap(logits);
 }

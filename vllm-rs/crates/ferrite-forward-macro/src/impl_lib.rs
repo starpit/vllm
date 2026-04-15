@@ -722,10 +722,11 @@ fn emit_embed(ctx: &EmitCtx) -> TokenStream {
 }
 
 fn emit_rmsnorm(ctx: &EmitCtx) -> TokenStream {
-    // kernels::rms_norm(input: GpuTensor, weight: GpuTensor,
-    // eps: f32, alloc, stream) -> OwnedTensor. Input is a
-    // TensorView we deref to GpuTensor; weight is `&RmsNorm`
-    // (fields .weight: GpuTensor, .eps: f32).
+    // kernels::rms_norm(input, weight, eps, weight_offset, alloc, stream) -> OwnedTensor.
+    // Singleton RmsNorm tiles pass weight_offset=0.0 (Llama/Qwen2 math).
+    // Scalar-offset rmsnorms like Gemma's `(1+w)` flow through a
+    // distinct Impl that consumes the upstream Add(weight, scalar)
+    // tile and passes the scalar as weight_offset.
     let tile = ctx.primary();
     let out = ctx.output_ident(tile, 0);
     let x = ctx.input_expr(tile, 0);
@@ -736,6 +737,7 @@ fn emit_rmsnorm(ctx: &EmitCtx) -> TokenStream {
                 *(#x),
                 (#w).weight,
                 (#w).eps,
+                0.0f32,
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -993,6 +995,15 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(FusedGateUpSiluMulImpl));
     lib.push(Box::new(FusedGateUpGeluMulImpl));
     lib.push(Box::new(FusedAddRmsNormImpl));
+    // Gemma-style 3-tile fusion: residual-Add + scalar-offset-Add
+    // + RmsNorm. Claimed by the DP in preference to the 2-tile
+    // FusedAddRmsNorm + standalone ScalarOffset because it's a
+    // larger claim.
+    lib.push(Box::new(FusedAddRmsNormWithOffsetImpl));
+    // Gemma-style `rmsnorm(x, w + scalar)` for the standalone case
+    // (no upstream residual-Add): scalar rides as the rms_norm
+    // kernel's `weight_offset` param.
+    lib.push(Box::new(ScalarOffsetRmsNormImpl));
     // Decode / prefill QKV+rope variants — the solver picks via
     // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
     lib.push(Box::new(FusedQkvRopeCacheImpl));
@@ -1647,6 +1658,18 @@ impl Implementation for FusedAddRmsNormImpl {
         if add_node.op != OpKind::Add {
             return None;
         }
+        // Residual-stream pattern only: both Add operands must be
+        // tiles (delta + residual, both tensor-valued). An Add with
+        // a `Scalar` or `Weight` input is a different shape (e.g.
+        // Gemma's `w + 1.0` feeding rmsnorm) — hand it to
+        // [`ScalarOffsetRmsNormImpl`] instead of mis-fusing here.
+        if !add_node
+            .inputs
+            .iter()
+            .all(|i| matches!(i, FufInput::Tile { .. }))
+        {
+            return None;
+        }
         // Find an immediate RmsNorm consumer. "Immediate" in the
         // topological sense: any RmsNorm whose first input is this
         // Add's output. More than one such consumer is possible in
@@ -1786,6 +1809,7 @@ impl Implementation for FusedAddRmsNormImpl {
                     *#residual_upstream,
                     (#weight_expr).weight,
                     (#weight_expr).eps,
+                    0.0f32,
                     device.compute_stream,
                 );
             }
@@ -1797,6 +1821,484 @@ impl Implementation for FusedAddRmsNormImpl {
             // the uniform conversion).
             let #rmsnorm_out = unsafe { (*#delta_upstream).as_view() };
             let #add_out = unsafe { (*#residual_upstream).as_view() };
+        }
+    }
+}
+
+// ── FusedAddRmsNormWithOffsetImpl ────────────────────────────────
+//
+// Claims three tiles: a residual-stream Add (two Tile inputs), a
+// scalar-offset Add (Weight + Scalar inputs), and a RmsNorm that
+// consumes the residual-Add at slot 0 and the scalar-Add at slot 1.
+// Emits a single `fused_add_rms_norm_inplace` call with the
+// scalar as the kernel's `weight_offset` param.
+//
+// This is the Gemma2 mid-layer pattern:
+//   hidden_states = add(delta, hidden_states);                 // residual
+//   pre_ffwd     = rmsnorm(hidden_states, weight[i] + 1.0);    // norm
+// and the cross-iteration pattern where the end-of-layer residual
+// Add feeds the next iteration's pre-norm (or the final norm
+// after the last iteration).
+//
+// Without this Impl, `FusedAddRmsNormImpl` absorbs the (Add,
+// RmsNorm) pair, orphaning the scalar-offset Add with no other
+// claim possible — the DP reports UnclaimedTile.
+
+#[derive(Debug, Default)]
+pub struct FusedAddRmsNormWithOffsetImpl;
+
+impl Implementation for FusedAddRmsNormWithOffsetImpl {
+    fn name(&self) -> &'static str {
+        "fused_add_rms_norm_with_offset"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let residual_add = fuf.get(seed);
+        if residual_add.op != OpKind::Add {
+            return None;
+        }
+        // Residual-stream Add: both inputs must be tiles.
+        if !residual_add
+            .inputs
+            .iter()
+            .all(|i| matches!(i, FufInput::Tile { .. }))
+        {
+            return None;
+        }
+
+        // Find a RmsNorm whose input (slot 0) consumes this Add and
+        // whose weight (slot 1) consumes a DIFFERENT Add that is a
+        // scalar-offset Add (Weight + Scalar inputs).
+        for rms in &fuf.nodes {
+            if rms.op != OpKind::RmsNorm || rms.inputs.len() < 2 {
+                continue;
+            }
+            let reads_residual_at_0 =
+                matches!(rms.inputs[0], FufInput::Tile { id, .. } if id == seed);
+            if !reads_residual_at_0 {
+                continue;
+            }
+            let scalar_add_id = match rms.inputs[1] {
+                FufInput::Tile { id, .. } => id,
+                _ => continue,
+            };
+            let scalar_add = fuf.get(scalar_add_id);
+            if scalar_add.op != OpKind::Add {
+                continue;
+            }
+            // Scalar-offset Add: exactly one Weight and one Scalar.
+            let mut has_weight = false;
+            let mut has_scalar = false;
+            let mut ok = true;
+            for inp in &scalar_add.inputs {
+                match inp {
+                    FufInput::Weight { .. } => has_weight = true,
+                    FufInput::Scalar(_) => has_scalar = true,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !(ok && has_weight && has_scalar) {
+                continue;
+            }
+
+            let mut claimed = [seed, scalar_add_id, rms.id];
+            claimed.sort();
+            let claimed = claimed.to_vec();
+
+            // Boundary inputs: the residual-Add's two upstream tiles
+            // (delta and residual). Scalar-Add's Weight/Scalar are
+            // not tile inputs, so nothing else crosses the boundary.
+            let boundary_inputs: Vec<TileId> = residual_add
+                .inputs
+                .iter()
+                .filter_map(|i| match i {
+                    FufInput::Tile { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+
+            return Some(MatchInfo {
+                claimed_tiles: claimed,
+                boundary_inputs,
+                // Both outputs are live downstream: RmsNorm's normed
+                // feeds post-norm compute; residual-Add's updated
+                // residual feeds the next residual stream.
+                boundary_outputs: vec![seed, rms.id],
+            });
+        }
+        None
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same bandwidth cost as the non-offset variant; the `+1`
+        // is an extra fp32 fadd per weight element — free on a
+        // memory-bound kernel.
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = (4.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // The scalar-offset Add's Weight input is the actual rmsnorm
+        // weight. Match the default rmsnorm naming scheme so the
+        // codegen's RmsNorm::load path fires.
+        let scalar_add_id = *claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+            })
+            .expect("claim contains a scalar-offset Add");
+        let scalar_add = fuf.get(scalar_add_id);
+        let (weight_id, weight_idx) = scalar_add
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("scalar-offset Add has a Weight input");
+        let name = weight_field_name(program, weight_id, weight_idx);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
+            source_weights: vec![(weight_id, weight_idx)],
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Identify tiles by op kind + inputs.
+        let residual_add_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = ctx.fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
+            })
+            .expect("claim contains a residual-stream Add");
+        let scalar_add_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = ctx.fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+            })
+            .expect("claim contains a scalar-offset Add");
+        let rmsnorm_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("claim contains a RmsNorm");
+
+        // Residual-Add inputs: delta (slot 0), residual (slot 1).
+        let delta_upstream = ctx
+            .input_tile_ident(residual_add_id, 0)
+            .expect("residual Add input 0 (delta) is a Tile");
+        let residual_upstream = ctx
+            .input_tile_ident(residual_add_id, 1)
+            .expect("residual Add input 1 (residual) is a Tile");
+
+        // Scalar-Add: extract the Weight and the Scalar.
+        let scalar_add_node = ctx.fuf.get(scalar_add_id);
+        let offset: f32 = scalar_add_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Scalar(v) => Some(*v as f32),
+                _ => None,
+            })
+            .expect("scalar-offset Add has a Scalar input");
+        let (weight_id, weight_idx) = scalar_add_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("scalar-offset Add has a Weight input");
+        let weight_name = weight_field_name(ctx.program, weight_id, weight_idx);
+        let weight_expr = ctx.weight_accessor(&weight_name);
+
+        // Output aliases for downstream tiles.
+        let residual_out = ctx.output_ident(residual_add_id, 0);
+        let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
+
+        quote! {
+            unsafe {
+                let _ = ::ferrite_kernels::kernels::fused_add_rms_norm_inplace(
+                    *#delta_upstream,
+                    *#residual_upstream,
+                    (#weight_expr).weight,
+                    (#weight_expr).eps,
+                    #offset,
+                    device.compute_stream,
+                );
+            }
+            let #rmsnorm_out = unsafe { (*#delta_upstream).as_view() };
+            let #residual_out = unsafe { (*#residual_upstream).as_view() };
+        }
+    }
+}
+
+// ── ScalarOffsetRmsNormImpl ──────────────────────────────────────
+//
+// Claims `(Add, RmsNorm)` where the Add has one [`FufInput::Weight`]
+// and one [`FufInput::Scalar`] input, and the RmsNorm consumes the
+// Add's output. Models like Gemma2 store their rmsnorm weights
+// zero-init and treat the forward as `y = x * (1 + w) / rms(x)`;
+// the DSL expresses that as `rmsnorm(x, weight[layer] + 1.0)`,
+// which lowers to this Add + RmsNorm pair.
+//
+// Emit: a single `rms_norm` kernel call where the scalar rides as
+// the kernel's `weight_offset` param (one fp32 fadd per weight
+// element, memory-bound — effectively free vs. the Llama-style
+// `y = x * w / rms(x)`).
+//
+// Residual-stream `(Add, RmsNorm)` continues to route through
+// [`FusedAddRmsNormImpl`], which rejects Adds with non-Tile inputs.
+
+#[derive(Debug, Default)]
+pub struct ScalarOffsetRmsNormImpl;
+
+impl Implementation for ScalarOffsetRmsNormImpl {
+    fn name(&self) -> &'static str {
+        "scalar_offset_rms_norm"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let add_node = fuf.get(seed);
+        if add_node.op != OpKind::Add {
+            return None;
+        }
+        // Need exactly one Weight input and one Scalar input.
+        let mut has_weight = false;
+        let mut has_scalar = false;
+        for inp in &add_node.inputs {
+            match inp {
+                FufInput::Weight { .. } => has_weight = true,
+                FufInput::Scalar(_) => has_scalar = true,
+                _ => return None,
+            }
+        }
+        if !(has_weight && has_scalar) {
+            return None;
+        }
+        let rmsnorm_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::RmsNorm && consumes_tile(n, seed))?;
+        // The RmsNorm must consume the Add at the weight position
+        // (slot 1 of rmsnorm(x, w)). Slot 0 is the input tensor.
+        let rmsnorm_weight_is_add = matches!(
+            rmsnorm_node.inputs.get(1),
+            Some(FufInput::Tile { id, .. }) if *id == seed
+        );
+        if !rmsnorm_weight_is_add {
+            return None;
+        }
+
+        let mut claimed = [seed, rmsnorm_node.id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+
+        // Boundary inputs: the RmsNorm's input tensor (slot 0).
+        let boundary_inputs: Vec<TileId> = rmsnorm_node
+            .inputs
+            .iter()
+            .take(1)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs,
+            boundary_outputs: vec![rmsnorm_node.id],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same cost shape as a plain rmsnorm: one read of x +
+        // weight, one write of y. The +offset is free (fp32 fadd
+        // per element, memory-bound).
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = (2.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // The Add's Weight input is the actual rmsnorm weight; the
+        // downstream consumer (RmsNorm tile) names its type. Declare
+        // one accessor matching the default rmsnorm naming scheme
+        // so the codegen's `RmsNorm::load` path fires.
+        let add_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Add)
+            .expect("claim contains an Add");
+        let add_node = fuf.get(add_id);
+        let (weight_id, weight_idx) = add_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("ScalarOffsetRmsNorm's Add has a Weight input");
+        let name = weight_field_name(program, weight_id, weight_idx);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
+            source_weights: vec![(weight_id, weight_idx)],
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let add_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Add)
+            .expect("claim contains an Add");
+        let rmsnorm_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("claim contains a RmsNorm");
+
+        let add_node = ctx.fuf.get(add_id);
+        // The scalar literal rides on the Add's inputs.
+        let offset: f32 = add_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Scalar(v) => Some(*v as f32),
+                _ => None,
+            })
+            .expect("ScalarOffsetRmsNorm's Add has a Scalar input");
+
+        // The RmsNorm consumes the Add at slot 1 (the weight position).
+        // Slot 0 is the input tensor — we pass that straight through.
+        let x = ctx.input_expr(rmsnorm_id, 0);
+        // Build a weight accessor expression using the same name the
+        // `required_weights` declaration emitted.
+        let (weight_id, weight_idx) = add_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("ScalarOffsetRmsNorm's Add has a Weight input");
+        let name = weight_field_name(ctx.program, weight_id, weight_idx);
+        let weight_expr = ctx.weight_accessor(&name);
+
+        let out = ctx.output_ident(rmsnorm_id, 0);
+
+        quote! {
+            let #out = unsafe {
+                ::ferrite_kernels::kernels::rms_norm(
+                    *(#x),
+                    (#weight_expr).weight,
+                    (#weight_expr).eps,
+                    #offset,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
         }
     }
 }

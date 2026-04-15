@@ -24,7 +24,7 @@ use ferrite_forward::forward;
 fn gemma2() {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {
-        pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer]);
+        pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer] + 1.0);
 
         q = gemm(pre_attn_normed, self_attn.q_proj[layer]);
         k = gemm(pre_attn_normed, self_attn.k_proj[layer]);
@@ -37,38 +37,42 @@ fn gemma2() {
         }
         oproj = gemm(attn, self_attn.o_proj[layer]);
 
-        post_attn_normed = rmsnorm(oproj, post_attention_layernorm[layer]);
+        post_attn_normed = rmsnorm(oproj, post_attention_layernorm[layer] + 1.0);
 
         hidden_states = add(post_attn_normed, hidden_states);
-        pre_ffwd_normed = rmsnorm(hidden_states, pre_feedforward_layernorm[layer]);
+        pre_ffwd_normed = rmsnorm(hidden_states, pre_feedforward_layernorm[layer] + 1.0);
 
         gate = gelu(gemm(pre_ffwd_normed, mlp.gate_proj[layer]));
         up = gemm(pre_ffwd_normed, mlp.up_proj[layer]);
         down = gemm(gate * up, mlp.down_proj[layer]);
 
-        post_ffwd_normed = rmsnorm(down, post_feedforward_layernorm[layer]);
+        post_ffwd_normed = rmsnorm(down, post_feedforward_layernorm[layer] + 1.0);
 
         hidden_states = add(post_ffwd_normed, hidden_states);
     }
-    normed = rmsnorm(hidden_states, norm);
+    normed = rmsnorm(hidden_states, norm + 1.0);
     logits = gemm(normed, lm_head);
     capped = tanh_softcap(logits);
 }
 
 /// Tiles per unrolled Gemma2 layer body:
 ///
-/// - pre-attn rmsnorm (1) + Q/K/V gemms (3) + rope_append (1)
+/// - pre-attn rmsnorm: Add(w, 1.0) + RmsNorm = 2
+/// - Q/K/V gemms (3) + rope_append (1)
 /// - exactly one attention-family tile (the `if` picks one arm)
-/// - o_proj gemm (1) + post-attn rmsnorm (1) + residual add (1)
-/// - pre-ffwd rmsnorm (1)
+/// - o_proj gemm (1)
+/// - post-attn rmsnorm: Add + RmsNorm = 2
+/// - residual add (1)
+/// - pre-ffwd rmsnorm: Add + RmsNorm = 2
 /// - GELU MLP: gate_gemm + gelu + up_gemm + mul + down_gemm = 5
-/// - post-ffwd rmsnorm (1) + residual add (1)
+/// - post-ffwd rmsnorm: Add + RmsNorm = 2
+/// - residual add (1)
 ///
-/// Total: 17 tiles per layer. Plus 1 embed at the top and 3
-/// post-loop tiles (final rmsnorm + lm_head gemm + tanh_softcap).
-const GEMMA2_TILES_PER_LAYER: usize = 17;
+/// Total: 21 tiles per layer. Plus 1 embed at the top and 4
+/// post-loop tiles (Add + final rmsnorm + lm_head gemm + tanh_softcap).
+const GEMMA2_TILES_PER_LAYER: usize = 21;
 const GEMMA2_PRE_LOOP_TILES: usize = 1; // embed
-const GEMMA2_POST_LOOP_TILES: usize = 3; // final norm + lm_head + softcap
+const GEMMA2_POST_LOOP_TILES: usize = 4; // Add + final norm + lm_head + softcap
 
 fn expected_tiles(num_hidden_layers: usize) -> usize {
     GEMMA2_PRE_LOOP_TILES + num_hidden_layers * GEMMA2_TILES_PER_LAYER + GEMMA2_POST_LOOP_TILES
@@ -76,19 +80,19 @@ fn expected_tiles(num_hidden_layers: usize) -> usize {
 
 #[test]
 fn gemma2_2b_tile_count_matches_expected() {
-    // Gemma2-2B: 26 layers → 1 + 26 × 17 + 3 = 446.
+    // Gemma2-2B: 26 layers → 1 + 26 × 21 + 4 = 551.
     assert_eq!(gemma2_2b::NUM_TILES, expected_tiles(26));
 }
 
 #[test]
 fn gemma2_9b_tile_count_matches_expected() {
-    // Gemma2-9B: 42 layers → 1 + 42 × 17 + 3 = 718.
+    // Gemma2-9B: 42 layers → 1 + 42 × 21 + 4 = 887.
     assert_eq!(gemma2_9b::NUM_TILES, expected_tiles(42));
 }
 
 #[test]
 fn gemma2_27b_tile_count_matches_expected() {
-    // Gemma2-27B: 46 layers → 1 + 46 × 17 + 3 = 786.
+    // Gemma2-27B: 46 layers → 1 + 46 × 21 + 4 = 971.
     assert_eq!(gemma2_27b::NUM_TILES, expected_tiles(46));
 }
 

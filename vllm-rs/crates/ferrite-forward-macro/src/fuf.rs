@@ -50,6 +50,11 @@ pub enum FufInput {
         kind: ExternKind,
         index: Option<u64>,
     },
+    /// A compile-time scalar constant. Produced by DSL operators
+    /// like `w + 1.0` — the `1.0` rides the FUF as a `Scalar`
+    /// input. Rank-0 for shape-inference purposes; Impls emit it
+    /// as a literal in the generated kernel call.
+    Scalar(f64),
 }
 
 /// A tile.
@@ -412,6 +417,15 @@ impl<'a> Unroller<'a> {
                     l_shape,
                 ))
             }
+            Expr::Add { .. } => unreachable!(
+                "Expr::Add should have been lowered to Expr::Call{{op:Add}} by classify"
+            ),
+            Expr::ScalarLit(v) => {
+                // Scalar literal — rides along as a tile input with
+                // an empty shape (rank-0) so shape inference treats
+                // it as a broadcastable scalar.
+                Ok((FufInput::Scalar(*v), Shape::new()))
+            }
         }
     }
 
@@ -561,7 +575,10 @@ mod tests {
         for node in &fuf.nodes {
             for input in &node.inputs {
                 match input {
-                    FufInput::Tile { .. } | FufInput::Weight { .. } | FufInput::Extern { .. } => {
+                    FufInput::Tile { .. }
+                    | FufInput::Weight { .. }
+                    | FufInput::Extern { .. }
+                    | FufInput::Scalar(_) => {
                         // All numeric/enum. No String.
                     }
                 }

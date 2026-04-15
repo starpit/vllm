@@ -294,6 +294,20 @@ impl Ctx {
                     rhs: Box::new(rhs),
                 })
             }
+            ast::Expr::Add { lhs, rhs } => {
+                // The DSL's `+` operator lowers to an `OpKind::Add`
+                // call. The fused (Add, ...) solver patterns then
+                // match structurally; a ScalarLit arg flags the
+                // scalar-offset variant (e.g. `w + 1.0`), while two
+                // tensor args remain the ordinary residual add.
+                let lhs = self.classify_expr(lhs)?;
+                let rhs = self.classify_expr(rhs)?;
+                Ok(Expr::Call {
+                    op: OpKind::Add,
+                    args: vec![lhs, rhs],
+                })
+            }
+            ast::Expr::ScalarLit(v) => Ok(Expr::ScalarLit(*v)),
         }
     }
 

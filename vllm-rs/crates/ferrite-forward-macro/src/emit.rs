@@ -149,6 +149,15 @@ impl<'a> EmitCtx<'a> {
                 ExternKind::BlockTable => quote! { ctx.block_table },
                 ExternKind::KvCache => quote! { ctx.kv_cache },
             },
+            FufInput::Scalar(v) => {
+                // Emit as an `f32` literal — the only call sites
+                // that consume a Scalar today are kernel-param
+                // positions that expect `f32`. Wider types can be
+                // handled by specialised emit paths when they show
+                // up.
+                let v = *v as f32;
+                quote! { #v }
+            }
         }
     }
 

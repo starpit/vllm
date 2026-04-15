@@ -309,21 +309,38 @@ pub fn parse_expr(expr: &SynExpr) -> ParseResult<Expr> {
             Ok(Expr::Call { op, args })
         }
 
-        // `gate * up` — the only arithmetic we admit.
+        // `gate * up` (SwiGLU tensor×tensor) or `w + 1.0`
+        // (scalar offset on a weight — e.g. Gemma's `(1+w)` rmsnorm).
+        // Other binary operators are rejected.
         SynExpr::Binary(b) => {
-            if !matches!(b.op, BinOp::Mul(_)) {
-                return Err(syn::Error::new(
-                    b.op.span(),
-                    "only `*` (multiplication) is admitted in DSL expressions",
-                ));
-            }
             let lhs = parse_expr(&b.left)?;
             let rhs = parse_expr(&b.right)?;
-            Ok(Expr::Mul {
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            })
+            match b.op {
+                BinOp::Mul(_) => Ok(Expr::Mul {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                }),
+                BinOp::Add(_) => Ok(Expr::Add {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                }),
+                _ => Err(syn::Error::new(
+                    b.op.span(),
+                    "only `*` and `+` are admitted in DSL expressions",
+                )),
+            }
         }
+
+        // A numeric literal — produces a scalar value usable as an
+        // operand to `+` / `*`. Integer literals are promoted to f64.
+        SynExpr::Lit(ExprLit { lit, .. }) => match lit {
+            Lit::Float(f) => Ok(Expr::ScalarLit(f.base10_parse()?)),
+            Lit::Int(i) => Ok(Expr::ScalarLit(i.base10_parse::<u64>()? as f64)),
+            _ => Err(syn::Error::new(
+                lit.span(),
+                "only numeric literals are admitted as DSL scalars",
+            )),
+        },
 
         // Parenthesized — unwrap.
         SynExpr::Paren(p) => parse_expr(&p.expr),

@@ -125,6 +125,41 @@ fn arch_level_weights_enum_and_dispatch_exist() {
 }
 
 #[test]
+fn backbone_forward_emitted_for_every_bucket() {
+    // The compiler emits both `forward_m_<N>` and `forward_backbone_m_<N>`
+    // for every compiled workload bucket. Backbone-only runs every
+    // subgraph except the terminal lm_head gemm and returns a fresh
+    // OwnedTensor clone of the final rmsnorm output (for PP
+    // intermediate ranks).
+    //
+    // Type-level observation: the fn items exist with the expected
+    // signatures. If any bucket's backbone emit were missing, the
+    // arch-level `forward_backbone` match would be non-exhaustive
+    // and the macro output wouldn't compile.
+    #[cfg(feature = "cuda")]
+    {
+        type F = unsafe fn(
+            &llama_3_2_1b::Weights,
+            &ferrite_forward::ForwardCtx,
+            &mut ferrite_cuda_core::device::GpuDevice,
+        ) -> ferrite_cuda_core::alloc::OwnedTensor;
+        let _: F = llama_3_2_1b::forward_backbone_m_1;
+        let _: F = llama_3_2_1b::forward_backbone_m_8;
+        let _: F = llama_3_2_1b::forward_backbone_m_64;
+        let _: F = llama_3_2_1b::forward_backbone_m_512;
+        let _: F = llama_3_2_1b::forward_backbone_m_4096;
+        // Arch-level dispatcher: name-resolved + signature-shaped.
+        type ArchF = unsafe fn(
+            &Weights,
+            &ferrite_forward::ForwardCtx,
+            &mut ferrite_cuda_core::device::GpuDevice,
+            u64,
+        ) -> ferrite_cuda_core::alloc::OwnedTensor;
+        let _: ArchF = forward_backbone;
+    }
+}
+
+#[test]
 fn scheduler_produces_linear_chain_on_fused_body() {
     // The real Llama body post-fusion is a serial chain: every
     // subgraph depends on the previous one. Q/K/V gemms that used to

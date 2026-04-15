@@ -297,16 +297,29 @@ impl CudaModel {
                     device,
                 )
             },
-            // LlamaFerrite's emitted forward runs through lm_head, so
-            // there's no backbone-only entry point. Backbone-only is
-            // only needed by pipeline-parallelism intermediate ranks;
-            // the ferrite path doesn't support PP yet. Chat/serve on
-            // a single rank goes through the full forward below, not
-            // here.
-            Self::LlamaFerrite(_) => unimplemented!(
-                "LlamaFerrite::hidden_states — backbone-only forward \
-                 not supported (PP-only codepath). Use `forward` instead.",
-            ),
+            // LlamaFerrite uses the compiler-emitted
+            // `forward_backbone` which walks every solver-picked
+            // subgraph except the terminal lm_head gemm and returns
+            // a freshly-allocated clone of the final rmsnorm's output.
+            // Currently only exercised by the test-harness / future
+            // PP intermediate ranks (the loader still gates ferrite
+            // off when `use_pp`).
+            Self::LlamaFerrite(m) => unsafe {
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    rotary: &m.rotary,
+                };
+                ferrite_models::llama::forward_backbone(&m.weights, &ctx, device, num_tokens)
+            },
             Self::Qwen2(m) => unsafe {
                 m.0.model.forward(
                     input_ids,
@@ -321,10 +334,22 @@ impl CudaModel {
                     device,
                 )
             },
-            Self::Qwen2Ferrite(_) => unimplemented!(
-                "Qwen2Ferrite::hidden_states — backbone-only forward \
-                 not supported (PP-only codepath). Use `forward` instead.",
-            ),
+            Self::Qwen2Ferrite(m) => unsafe {
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    rotary: &m.rotary,
+                };
+                ferrite_models::qwen2::forward_backbone(&m.weights, &ctx, device, num_tokens)
+            },
             Self::Gemma2(m) => unsafe {
                 m.model.forward(
                     input_ids,

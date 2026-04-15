@@ -38,7 +38,7 @@ use quote::{format_ident, quote};
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
 use crate::emit::{EmitCtx, LocalMap};
-use crate::fuf::Fuf;
+use crate::fuf::{Fuf, FufInput};
 use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
 use crate::schedule::{Loop, WorkloadLoops};
 use crate::solver::{Assignment, WorkloadAssignments};
@@ -406,6 +406,128 @@ fn emit_forward_for_bucket(
     }
 }
 
+/// Emit a backbone-only per-bucket forward that runs every subgraph
+/// EXCEPT the terminal one (assumed to be the `logits = gemm(normed,
+/// lm_head)` call at the end of every causal-LM DSL body). Returns a
+/// fresh-allocated clone of the subgraph output that would have been
+/// the lm_head's input — typically the final rmsnorm's output.
+///
+/// Used by pipeline-parallelism intermediate ranks, which consume
+/// backbone hidden-states from one rank and hand them to the next
+/// without ever running lm_head.
+///
+/// The emitted fn's signature mirrors `forward_m_<N>` exactly except
+/// for the name and semantic return value.
+fn emit_forward_backbone_for_bucket(
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    loop_ir: &Loop,
+    program: &Program,
+    model: &ModelParams,
+    lib: &ImplementationLibrary,
+    num_tokens: u64,
+) -> TokenStream {
+    let mut locals: LocalMap = HashMap::new();
+    for node in &fuf.nodes {
+        for slot in 0..node.outputs.len().max(1) as u8 {
+            locals.insert((node.id, slot), format_ident!("t_{}_{}", node.id.0, slot));
+        }
+    }
+
+    // The terminal tile — the DSL's last op, expected to be the
+    // lm_head gemm. Skip the subgraph that claims it.
+    let Some(last_node) = fuf.nodes.last() else {
+        // Empty FUF: degenerate, emit a stub that panics.
+        let fn_name = format_ident!("forward_backbone_m_{}", num_tokens);
+        return quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe fn #fn_name(
+                wm: &Weights,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                unreachable!("forward_backbone: empty FUF")
+            }
+        };
+    };
+    let terminal_sg = sfuf
+        .subgraph_of(last_node.id)
+        .expect("terminal tile must be in a subgraph");
+
+    // The backbone output is whatever tile feeds the terminal tile's
+    // first input slot — for a DSL that ends in `gemm(normed, lm_head)`
+    // that's the final `normed` (post-final-rmsnorm) tile.
+    let backbone_out: (crate::fuf::TileId, u8) = match last_node.inputs.first() {
+        Some(FufInput::Tile { id, slot }) => (*id, *slot),
+        _ => panic!(
+            "forward_backbone: terminal tile's first input is not a Tile \
+             (DSL must end in `gemm(<tile>, lm_head)`)"
+        ),
+    };
+    let backbone_ident = locals[&backbone_out].clone();
+
+    let mut body: Vec<TokenStream> = Vec::new();
+    for wave in &loop_ir.waves {
+        for (sg, imp_id) in &wave.subgraphs {
+            if *sg == terminal_sg {
+                continue;
+            }
+            let claimed = sfuf.tiles_in_subgraph(*sg);
+            let ctx = EmitCtx {
+                fuf,
+                program,
+                model,
+                claimed_tiles: &claimed,
+                locals: &locals,
+            };
+            body.push(lib.get(*imp_id).emit_call(&ctx));
+        }
+    }
+
+    let fn_name = format_ident!("forward_backbone_m_{}", num_tokens);
+    quote! {
+        /// Backbone-only forward (no lm_head). Returns the output
+        /// that would have been the final gemm's input — a freshly-
+        /// allocated `OwnedTensor` so the caller owns the buffer
+        /// independent of any in-fn alias.
+        ///
+        /// # Safety
+        /// All tensors in `ctx` must be valid GPU memory; `device`
+        /// must be the live CUDA device.
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments, unused_mut, unused_variables)]
+        pub unsafe fn #fn_name(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            #(#body)*
+            // Clone the backbone tile's output. It may be bound as
+            // either an `OwnedTensor` (singleton impl output) or a
+            // `TensorView` alias on an upstream buffer (fused-impl
+            // output). `(*_).as_view()` works uniformly — both Deref
+            // to `GpuTensor`, and `GpuTensor::as_view` yields a
+            // fresh `TensorView`.
+            let __bb_view = unsafe { (*#backbone_ident).as_view() };
+            let __bb_shape_u32: &[u32] = __bb_view.shape();
+            let __bb_shape: ::std::vec::Vec<usize> =
+                __bb_shape_u32.iter().map(|&d| d as usize).collect();
+            let __bb_out = device
+                .caching
+                .alloc_tensor(&__bb_shape, __bb_view.dtype());
+            ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                __bb_out.raw_ptr(),
+                __bb_view.raw_ptr() as *const u8,
+                __bb_view.size_bytes(),
+                device.compute_stream,
+            )
+            .expect("forward_backbone: DtoD memcpy of output");
+            __bb_out
+        }
+    }
+}
+
 /// Emit the full per-model module body: Weights struct + loader,
 /// one forward fn per workload bucket, and a dispatching wrapper.
 pub fn emit_model(
@@ -427,6 +549,17 @@ pub fn emit_model(
                 .get(m)
                 .expect("schedule populated every key");
             emit_forward_for_bucket(fuf, sfuf, loop_ir, program, model, lib, *m)
+        })
+        .collect();
+    let backbone_fns: Vec<TokenStream> = sfufs
+        .per_num_tokens
+        .iter()
+        .map(|(m, sfuf)| {
+            let loop_ir = loops
+                .per_num_tokens
+                .get(m)
+                .expect("schedule populated every key");
+            emit_forward_backbone_for_bucket(fuf, sfuf, loop_ir, program, model, lib, *m)
         })
         .collect();
 
@@ -454,6 +587,21 @@ pub fn emit_model(
             }
         })
         .collect();
+    let backbone_match_arms: Vec<TokenStream> = bucket_points
+        .iter()
+        .enumerate()
+        .map(|(i, &m)| {
+            let fn_name = format_ident!("forward_backbone_m_{}", m);
+            let lo = proc_macro2::Literal::u64_unsuffixed(m);
+            if i + 1 == bucket_points.len() {
+                quote! { #lo.. => unsafe { #fn_name(wm, ctx, device) }, }
+            } else {
+                let next = bucket_points[i + 1];
+                let hi = proc_macro2::Literal::u64_unsuffixed(next - 1);
+                quote! { #lo..=#hi => unsafe { #fn_name(wm, ctx, device) }, }
+            }
+        })
+        .collect();
     // Below the smallest compiled bucket (e.g. num_tokens=0 if
     // someone somehow passes it): fall through to the smallest
     // bucket. Realistically unreachable.
@@ -461,11 +609,16 @@ pub fn emit_model(
         let fn_name = format_ident!("forward_m_{}", m);
         quote! { _ => unsafe { #fn_name(wm, ctx, device) }, }
     });
+    let backbone_fallback_arm = bucket_points.first().map(|&m| {
+        let fn_name = format_ident!("forward_backbone_m_{}", m);
+        quote! { _ => unsafe { #fn_name(wm, ctx, device) }, }
+    });
 
     quote! {
         #weights
 
         #(#bucket_fns)*
+        #(#backbone_fns)*
 
         /// Dispatch on `num_tokens`. Each compiled bucket covers
         /// an inclusive range starting at its compiled point; the
@@ -481,6 +634,24 @@ pub fn emit_model(
             match num_tokens {
                 #(#match_arms)*
                 #fallback_arm
+            }
+        }
+
+        /// Backbone-only dispatch (no lm_head). See
+        /// [`forward_backbone_m_*`] for what each bucket skips and
+        /// the shape of the returned tensor (per the DSL, a
+        /// freshly-allocated `[num_tokens, hidden_size]` `OwnedTensor`).
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward_backbone(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            num_tokens: u64,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            match num_tokens {
+                #(#backbone_match_arms)*
+                #backbone_fallback_arm
             }
         }
     }

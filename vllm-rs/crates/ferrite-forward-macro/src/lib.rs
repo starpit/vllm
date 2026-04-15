@@ -407,6 +407,17 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>)]) -> proc_macro2::TokenStream 
             }
         })
         .collect();
+    let forward_backbone_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|(model_ident, _)| {
+            let variant_ident = pascal_case(model_ident);
+            quote! {
+                Weights::#variant_ident(w) => unsafe {
+                    #model_ident::forward_backbone(w, ctx, device, num_tokens)
+                },
+            }
+        })
+        .collect();
 
     // Accessor methods on Weights — each returns a per-variant
     // constant from the matched model's bounds. Consumers (e.g.
@@ -504,6 +515,27 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>)]) -> proc_macro2::TokenStream 
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
             match w {
                 #(#forward_arms)*
+            }
+        }
+
+        /// Dispatching backbone-only forward (no lm_head). Returns
+        /// `[num_tokens, hidden_size]` as an independently-owned
+        /// `OwnedTensor`. For pipeline-parallel intermediate ranks
+        /// that hand hidden states to the next rank.
+        ///
+        /// # Safety
+        /// All tensors in `ctx` must be valid GPU memory; `device`
+        /// must be the live CUDA device.
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward_backbone(
+            w: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            num_tokens: u64,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            match w {
+                #(#forward_backbone_arms)*
             }
         }
     }

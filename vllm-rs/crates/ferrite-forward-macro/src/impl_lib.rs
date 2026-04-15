@@ -767,25 +767,11 @@ fn emit_gemm(ctx: &EmitCtx) -> TokenStream {
 // pattern `(Gemm, Gemm, Gemm, RopeAppend)` structurally — so every
 // DSL `rope_append` in Llama/Qwen2 is covered.
 
-fn emit_attention(ctx: &EmitCtx) -> TokenStream {
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let ins = ctx.all_input_exprs(tile);
-    let (q, k, v, kv, bt) = (&ins[0], &ins[1], &ins[2], &ins[3], &ins[4]);
-    quote! {
-        let #out = unsafe {
-            ::ferrite_kernels::kernels::flash_attention(
-                #q, #k, #v, #kv, #bt,
-                ctx.cu_seqlens_q,
-                ctx.seqused_k,
-                ctx.max_seqlen_q,
-                ctx.max_seqlen_k,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
-    }
-}
+// No standalone `emit_attention`. Paged-cache attention
+// (`flash_attn_paged`) takes Q plus cache metadata and reads K/V
+// directly from the KV cache populated by `FusedQkvRopeCacheImpl`.
+// `AttentionViaCacheImpl` below claims the singleton `OpKind::Attention`
+// tile and ignores its DSL-visible K/V inputs entirely.
 
 // No standalone `emit_add`: every `Add` in Llama/Qwen2 is immediately
 // consumed by an `RmsNorm`, so `FusedAddRmsNormImpl` below claims
@@ -897,14 +883,6 @@ trivial_impl!(
     emit_gemm,
     true
 );
-trivial_impl!(
-    AttentionRefImpl,
-    OpKind::Attention,
-    "attention_ref",
-    cost_attention,
-    emit_attention,
-    true
-);
 // Silu and Mul have no singleton impls. The only kernel in
 // `ferrite-kernels` that implements them is `silu_and_mul_fused`,
 // which operates on a packed `[num_tokens, 2*intermediate]` buffer
@@ -927,7 +905,7 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
     lib.push(Box::new(GemmRefImpl));
-    lib.push(Box::new(AttentionRefImpl));
+    lib.push(Box::new(AttentionViaCacheImpl));
     // Multi-tile fusions. The solver's claim-size-DESC sort picks
     // these over singleton coverage when both apply; the singletons
     // stay as fallbacks for tile positions the fusion doesn't match
@@ -1403,9 +1381,12 @@ impl Implementation for FusedAddRmsNormImpl {
             }
             // Aliases: #rmsnorm_out points at the (now-normed)
             // delta buffer; #add_out points at the (now-updated)
-            // residual buffer.
-            let #rmsnorm_out = (#delta_upstream).view();
-            let #add_out = (#residual_upstream).view();
+            // residual buffer. `.as_view()` on a dereffed upstream
+            // works for both OwnedTensor and TensorView bindings
+            // (both Deref to GpuTensor, and `GpuTensor::as_view` is
+            // the uniform conversion).
+            let #rmsnorm_out = unsafe { (*#delta_upstream).as_view() };
+            let #add_out = unsafe { (*#residual_upstream).as_view() };
         }
     }
 }
@@ -1691,8 +1672,8 @@ impl Implementation for FusedQkvRopeCacheImpl {
                     *ctx.positions,
                     ctx.rotary.cos_sin_cache,
                     *ctx.slot_mapping,
-                    ctx.kv_cache.k_cache(#layer),
-                    ctx.kv_cache.v_cache(#layer),
+                    *ctx.kv_cache.k_cache(#layer),
+                    *ctx.kv_cache.v_cache(#layer),
                     #q_size,
                     #kv_size,
                     #num_q_heads,
@@ -1701,11 +1682,131 @@ impl Implementation for FusedQkvRopeCacheImpl {
                     device.compute_stream,
                 )
             };
-            // K/V aliases: the paged-cache layer slices. Consumed by
-            // the downstream Attention singleton today; will be unused
-            // once C4 replaces AttentionRefImpl with AttentionViaCacheImpl.
+            // K/V aliases: the paged-cache layer slices. Bound for
+            // symmetry with the FUF's tuple output shape; not read by
+            // any downstream tile once `AttentionViaCacheImpl` takes
+            // its input from the cache directly.
             let #k_out = ctx.kv_cache.k_cache(#layer);
             let #v_out = ctx.kv_cache.v_cache(#layer);
+        }
+    }
+}
+
+// ── AttentionViaCacheImpl ────────────────────────────────────────
+//
+// Singleton matcher on `OpKind::Attention`. Maps the DSL's
+// `attention(q, k, v, kv_cache[layer], block_table)` to
+// `ferrite_kernels::kernels::flash_attn_paged`, which reads Q + the
+// paged KV cache directly — after `FusedQkvRopeCacheImpl` has
+// written K/V to the layer's cache slice — and ignores the DSL
+// tile's K/V Tile-inputs entirely.
+//
+// The layer index is captured on the Attention tile's own
+// `FufInput::Extern { kind: KvCache, index: Some(L) }` (the DSL's
+// `kv_cache[layer]` argument), same as for RopeAppend.
+
+#[derive(Debug, Default)]
+pub struct AttentionViaCacheImpl;
+
+impl Implementation for AttentionViaCacheImpl {
+    fn name(&self) -> &'static str {
+        "attention_via_cache"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::Attention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        cost_attention(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    // Default `required_weights` yields zero accessors — Attention
+    // consumes no weights. The paged cache and per-call metadata live
+    // on `ForwardCtx`, not `WeightBundle`.
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let node = ctx.fuf.get(tile);
+
+        // Q input: slot 0 of the DSL's attention call. K and V (slots
+        // 1, 2) are ignored — the kernel reads them from the paged
+        // cache written by the upstream FusedQkvRopeCache.
+        let q_expr = ctx.input_expr(tile, 0);
+
+        // Layer index — from the `kv_cache[layer]` extern input.
+        let layer = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Extern {
+                    kind: crate::classified::ExternKind::KvCache,
+                    index: Some(layer),
+                } => Some(*layer),
+                _ => None,
+            })
+            .expect("Attention has a kv_cache extern with a concrete layer index")
+            as usize;
+
+        // Softmax scale: 1.0 / sqrt(head_dim). Emit at compile time.
+        let head_dim = ctx.bound("head_dim") as f32;
+        let scale: f32 = 1.0 / head_dim.sqrt();
+        let scale_tokens = quote! { #scale };
+
+        quote! {
+            let #out = unsafe {
+                ::ferrite_kernels::kernels::flash_attn_paged(
+                    *#q_expr,
+                    *ctx.kv_cache.k_cache(#layer),
+                    *ctx.kv_cache.v_cache(#layer),
+                    *ctx.cu_seqlens_q,
+                    *ctx.seqused_k,
+                    *ctx.block_table,
+                    ctx.max_seqlen_q,
+                    ctx.max_seqlen_k,
+                    #scale_tokens,
+                    true, // is_causal — always true for decoder-only LMs
+                    ctx.kv_cache.block_size,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
         }
     }
 }

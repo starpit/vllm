@@ -69,6 +69,20 @@ impl GpuTensor {
         self.ptr.is_null()
     }
 
+    /// Borrow this `GpuTensor` as a `TensorView`. Used by generated
+    /// code to feed a `GpuTensor`-valued binding (typically produced
+    /// by `*owned_tensor` via `Deref`) into a function that takes a
+    /// `TensorView`.
+    ///
+    /// # Safety
+    /// The caller must ensure the underlying GPU memory outlives the
+    /// returned view. `GpuTensor` is a raw pointer handle; there is
+    /// no ownership tie, so the lifetime is effectively whatever the
+    /// caller binds it to.
+    pub unsafe fn as_view<'a>(&self) -> TensorView<'a> {
+        unsafe { TensorView::from_raw(*self) }
+    }
+
     /// Raw device pointer as `*const T`.
     pub fn as_ptr<T>(self) -> *const T {
         self.ptr as *const T

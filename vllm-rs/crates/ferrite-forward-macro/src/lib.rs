@@ -192,6 +192,10 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
 
     // ── Per-model × per-workload pipeline ─────────────────────────
     let mut per_model_ts: Vec<proc_macro2::TokenStream> = Vec::new();
+    // Collected per-model identifying shape for the arch-level
+    // Weights enum's `load` dispatch. Each entry = (model_ident,
+    // bounds-tuple literals in the fixed order below).
+    let mut arch_dispatch_arms: Vec<(Ident, Vec<u64>)> = Vec::new();
 
     for model in &models {
         let model_cfg = cfg::build_cfg(&classified, model)
@@ -236,7 +240,11 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 #codegen_items
             }
         });
+
+        arch_dispatch_arms.push((model.name.clone(), collect_dispatch_bounds(model)));
     }
+
+    let arch_dispatch_ts = emit_arch_dispatcher(&arch_dispatch_arms);
 
     // Group every model's emitted module under one `pub mod <arch>`
     // matching the carrier fn's name. Callers access as
@@ -250,8 +258,171 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             #(#tracked)*
 
             #(#per_model_ts)*
+
+            #arch_dispatch_ts
         }
     })
+}
+
+/// The identifying HF-config fields the arch-level `Weights::load`
+/// matches on, in a fixed order. Any two compiled models that agree
+/// on all seven values would collide; bump this if you add an arch
+/// where that happens.
+const DISPATCH_FIELDS: &[&str] = &[
+    "num_hidden_layers",
+    "hidden_size",
+    "intermediate_size",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "vocab_size",
+];
+
+fn collect_dispatch_bounds(model: &config::ModelParams) -> Vec<u64> {
+    DISPATCH_FIELDS
+        .iter()
+        .map(|k| {
+            *model.bounds.get(*k).unwrap_or_else(|| {
+                panic!(
+                    "model `{}` is missing required bound `{k}`; add it to \
+                     config.json or to weight_conventions::derive_implicit_bounds",
+                    model.source_stem,
+                )
+            })
+        })
+        .collect()
+}
+
+/// Arch-level dispatcher: an enum over every compiled variant plus
+/// a `load` that fingerprints the runtime config and a `forward`
+/// that delegates to the matched variant's per-model forward.
+fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>)]) -> proc_macro2::TokenStream {
+    if arms.is_empty() {
+        return quote! {};
+    }
+
+    // Variant ident = PascalCase of the model ident (e.g.
+    // `llama_3_2_1b` → `Llama_3_2_1b`). Keep the underscores — they
+    // carry meaning (dotted-version components) and collapsing them
+    // would create ambiguity between e.g. `llama32` and `llama_3_2`.
+    let variants: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|(model_ident, _)| {
+            let variant_ident = pascal_case(model_ident);
+            quote! { #variant_ident(#model_ident::Weights) }
+        })
+        .collect();
+
+    let load_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|(model_ident, bounds)| {
+            let variant_ident = pascal_case(model_ident);
+            let bound_lits: Vec<proc_macro2::Literal> = bounds
+                .iter()
+                .map(|b| proc_macro2::Literal::u64_unsuffixed(*b))
+                .collect();
+            quote! {
+                (#(#bound_lits),*) => Ok(Self::#variant_ident(
+                    #model_ident::Weights::load(gw, stream)?,
+                )),
+            }
+        })
+        .collect();
+
+    let forward_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|(model_ident, _)| {
+            let variant_ident = pascal_case(model_ident);
+            quote! {
+                Weights::#variant_ident(w) => unsafe {
+                    #model_ident::forward(w, ctx, device, num_tokens)
+                },
+            }
+        })
+        .collect();
+
+    let fields: Vec<proc_macro2::TokenStream> = DISPATCH_FIELDS
+        .iter()
+        .map(|k| {
+            let id = Ident::new(k, Span::call_site());
+            quote! { #id: u64 }
+        })
+        .collect();
+    let field_names: Vec<Ident> = DISPATCH_FIELDS
+        .iter()
+        .map(|k| Ident::new(k, Span::call_site()))
+        .collect();
+
+    quote! {
+        /// One variant per compiled model config. Holds that
+        /// model's specialized `Weights`.
+        #[cfg(feature = "cuda")]
+        pub enum Weights {
+            #(#variants),*
+        }
+
+        #[cfg(feature = "cuda")]
+        impl Weights {
+            /// Auto-detect the compiled variant from the runtime
+            /// HF-config fields, load weights (streaming concat for
+            /// fused accessors), and return the enum-wrapped result.
+            ///
+            /// Errors if no compiled variant's fingerprint matches.
+            #[allow(clippy::too_many_arguments)]
+            pub fn load(
+                gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
+                stream: ::ferrite_cuda_core::CUstream,
+                #(#fields),*
+            ) -> ::anyhow::Result<Self> {
+                match (#(#field_names),*) {
+                    #(#load_arms)*
+                    shape => ::anyhow::bail!(
+                        "no compiled variant matches config fingerprint {:?}",
+                        shape,
+                    ),
+                }
+            }
+        }
+
+        /// Dispatching forward. Matches the `Weights` variant and
+        /// calls the per-model specialized `forward`.
+        ///
+        /// # Safety
+        /// All tensors in `ctx` must be valid GPU memory; `device`
+        /// must be the live CUDA device.
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward(
+            w: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            num_tokens: u64,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            match w {
+                #(#forward_arms)*
+            }
+        }
+    }
+}
+
+/// PascalCase a snake_case ident while preserving underscores
+/// between segments (they're version separators in our model names).
+fn pascal_case(ident: &Ident) -> Ident {
+    let s = ident.to_string();
+    let mut out = String::with_capacity(s.len());
+    let mut capitalize_next = true;
+    for c in s.chars() {
+        if c == '_' {
+            out.push('_');
+            capitalize_next = true;
+        } else if capitalize_next {
+            out.extend(c.to_uppercase());
+            capitalize_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    Ident::new(&out, Span::call_site())
 }
 
 /// Emit pipeline-observation constants (NUM_TILES /

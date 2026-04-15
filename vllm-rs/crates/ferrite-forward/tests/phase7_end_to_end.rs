@@ -106,6 +106,24 @@ fn solver_produced_finite_positive_cost_across_workloads() {
 }
 
 #[test]
+fn arch_level_weights_enum_and_dispatch_exist() {
+    // Observe the compiler emitted the arch-level `Weights` enum
+    // with one variant per compiled model, and the dispatching
+    // `forward` fn. Under #[cfg(feature = "cuda")] only — these
+    // reference cuda-only types (GpuWeights, CUstream, GpuDevice).
+    #[cfg(feature = "cuda")]
+    {
+        // Type-level observation: an enum variant for the 1B model
+        // exists and wraps that model's `Weights`. If the dispatcher
+        // wasn't emitted this line wouldn't type-check.
+        fn _probe(w: llama::llama_3_2_1b::Weights) -> llama::Weights {
+            llama::Weights::Llama_3_2_1b(w)
+        }
+        let _: fn(llama::llama_3_2_1b::Weights) -> llama::Weights = _probe;
+    }
+}
+
+#[test]
 fn scheduler_produces_linear_chain_on_fused_body() {
     // The real Llama body post-fusion is a serial chain: every
     // subgraph depends on the previous one. Q/K/V gemms that used to

@@ -117,6 +117,18 @@ impl Parse for ForwardArgs {
 /// `model_architectures/llama/*.json` without the user spelling
 /// out `models_dir`. Walk-up stops at the first match, or returns
 /// an error naming every directory it checked.
+/// Format a microsecond value adaptively for human scanning:
+/// `<1000µs` as `Nµs`, `<100ms` as `N.Xms`, else `Nms`.
+fn fmt_us(us: f64) -> String {
+    if us < 1000.0 {
+        format!("{us:.0}µs")
+    } else if us < 100_000.0 {
+        format!("{:.1}ms", us / 1000.0)
+    } else {
+        format!("{:.0}ms", us / 1000.0)
+    }
+}
+
 fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path::PathBuf, String> {
     let mut checked: Vec<std::path::PathBuf> = Vec::new();
     let mut cur: Option<&std::path::Path> = Some(start);
@@ -260,32 +272,28 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         );
 
         // Per-model compile banner.  Shows the concrete model variant,
-        // the FUF tile count, scheduler wave count (max across
-        // workloads — gives a sense of parallelism depth), workload
-        // grid size, solve wall-clock, and the best→worst span of
-        // predicted post-contention cost across buckets so the
-        // "decode vs prefill" range is visible at a glance.
-        let (best_us, worst_us) = sfufs
-            .per_num_tokens
-            .values()
-            .map(|a| a.predicted_us)
-            .fold((f64::INFINITY, 0.0_f64), |(b, w), v| (b.min(v), w.max(v)));
+        // FUF tile count, scheduler wave count (max across buckets —
+        // parallelism depth), solve wall-clock, and a per-M breakdown
+        // of predicted post-contention cost. The per-M breakdown makes
+        // the decode→prefill curve visible without digging into
+        // Assignment::predicted_us.
         let max_waves = loops
             .per_num_tokens
             .values()
             .map(|l| l.num_waves())
             .max()
             .unwrap_or(0);
+        let per_m: String = sfufs
+            .per_num_tokens
+            .iter()
+            .map(|(&m, a)| format!(" M={m}→{}", fmt_us(a.predicted_us)))
+            .collect();
         eprintln!(
-            "  ferrite · {variant:<18} · {tiles:>4} tiles · {waves:>3} waves · \
-             {workloads:>2} workloads · {solve_ms:>3} ms · {best_us:>5.0}–{worst_us:<5.0} µs",
+            "  ferrite · {variant:<18} · {tiles:>4} tiles · {waves:>3} waves · {solve_ms:>3} ms ·{per_m}",
             variant = model.source_stem,
             tiles = model_fuf.len(),
             waves = max_waves,
-            workloads = args.workloads.len(),
             solve_ms = d_solve.as_millis(),
-            best_us = best_us,
-            worst_us = worst_us,
         );
         let _ = arch_name;
 

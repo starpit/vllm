@@ -6,13 +6,10 @@
 #![allow(clippy::too_many_arguments)]
 //! Ferrite model architectures.
 //!
-//! Each model file contains a `forward!()` invocation that generates:
-//! - `Model` struct with per-layer weights
-//! - `Model::load()` for safetensors weight loading
-//! - `Model::forward()` for the full forward pass
-//! - Solver-generated dispatch functions per workload bucket
+//! `llama.rs` uses the new `#[forward]` macro (ferrite-forward).
+//! `qwen2.rs` still uses the legacy `ferrite_macros::forward!{}`;
+//! it's blocked on Step C (bias-fused QKV Impl) per HANDOFF.md.
 
-#[cfg(feature = "cuda")]
 pub mod llama;
 #[cfg(feature = "cuda")]
 pub mod qwen2;

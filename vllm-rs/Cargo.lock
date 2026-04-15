@@ -2082,6 +2082,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ferrite-cuda-core",
+ "ferrite-forward",
  "ferrite-kernels",
  "ferrite-macros",
  "tracing",

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Qwen2 model architecture via forward!() macro.
+//! Qwen2 model architecture via the legacy `forward!{}` macro.
 //!
 //! Same as Llama except QKV projections include bias terms.
+//!
+//! Migration to `#[forward]` is blocked on HANDOFF.md Step C
+//! (`CublasFusedQkvGemmWithBiasImpl` port — gap #5).
+#![allow(clippy::possible_missing_comma)]
 
 #[allow(unused_imports)]
 use ferrite_cuda_core::alloc::OwnedTensor;

@@ -1,317 +1,392 @@
 # ferrite-forward handoff
 
-Paired with `PLAN.md`. PLAN describes what to build; this describes what's
-built, what decisions were made along the way, and the landmines a fresh
-context needs to know before writing more code.
+> **Read this first if you are picking this up cold.** Paired with
+> `PLAN.md`. PLAN describes what to build; this describes what's
+> built, what decisions were made along the way, the landmines a
+> fresh context needs to know, and — most importantly — **the
+> failure patterns that have repeatedly burned the user's time.**
 
-Read PLAN first. Then read this.
+## TL;DR
 
-## Status — what's done vs. pending
+- **Goal**: a forward-pass compiler. DSL body → solver picks
+  kernels per tile → scheduler orders into wavefront LOOP → codegen
+  emits Rust + CUDA. Replaces `ferrite-macros` + `ferrite-solver`.
+  vllm-cuda is **untouched**; the compiler's output plugs in at
+  the same call site the old ferrite output plugged in at.
+- **End-state proof**: `vllm chat --model=<small-llama>` produces
+  coherent output through the new compiler at perf parity with
+  the existing path. Then Qwen2.
+- **Method**: port the working old ferrite (`ferrite-solver/`,
+  `ferrite-macros/`, `ferrite-kernels/`) verbatim, **detoxifying
+  as you port** — strip transformer-domain hardcoding, do not
+  rewrite mechanisms that already work.
+- **Current state**: trait-based Implementation ported, codegen
+  emission moved onto the trait (`emit_call`), starter impls in
+  place but emit placeholder symbols that don't exist in
+  ferrite-kernels yet. Real Impl library not yet ported.
+- **Branch**: `worktree-ferrite-forward`. **HEAD**: `75aa11312`.
 
-Phases committed on branch `worktree-ferrite-forward` off `2492e3c71`.
-
-| Phase | Done | Commit subject |
-|------:|:----:|:---------------|
-| 0 | ✅ | scaffolding + model architecture configs |
-| 1 | ✅ | parse DSL body into AST |
-| 2 | ✅ | classify free variables |
-| 3 | ✅ | read model configs from directory |
-| 4 | ✅ | shape inference |
-| 5 | ✅ | build CFG from classified program |
-| 6 | ✅ | unroll CFG into numeric FUF |
-| 7 | ✅ | solver — pick impl per tile (MVP) |
-| 7+ | ✅ | anchor MLP weights via HF convention table |
-| 8 | ✅ | BSP schedule via topological layering |
-| 9 | ⬜ | codegen Rust (specialized forward fns) |
-| 10 | ⬜ | codegen CUDA (.cu + manifest in $OUT_DIR) |
-| 11 | ⬜ | real Llama inference via vllm chat |
-| 12 | ⬜ | Gemma2 acid test |
-
-Test count at handoff: **58 unit tests + 3 integration tests passing**.
-Zero clippy warnings on `-p ferrite-forward -p ferrite-forward-macro`.
-
-## How to verify current state
+## Verify current state
 
 ```bash
 cd /home/moosevan/vllm/.claude/worktrees/ferrite-forward/vllm-rs
-cargo test -p ferrite-forward -p ferrite-forward-macro
-cargo fmt   -p ferrite-forward -p ferrite-forward-macro --check
-cargo clippy -p ferrite-forward -p ferrite-forward-macro --lib --tests -- -D warnings
+cargo test    -p ferrite-forward -p ferrite-forward-macro
+cargo fmt     -p ferrite-forward -p ferrite-forward-macro --check
+cargo clippy  -p ferrite-forward -p ferrite-forward-macro --lib --tests -- -D warnings
 ```
 
-All three should exit 0. If they don't, something drifted — investigate
-before adding anything.
+Should be green: **71 unit + 6 integration tests pass.** fmt + clippy
+clean (without `--features cuda`).
+
+`cargo build -p ferrite-forward --features cuda` currently **fails**
+— the codegen module emits calls to wrapper symbols
+(`rms_norm_forward_owned`, `rope_append_kv`, `flash_attention`,
+`silu_owned`, `add_owned`, `mul_owned`) that do not exist in
+`ferrite-kernels`. This is the work item below — the codegen needs
+to be rewired to existing `ferrite-kernels` symbols (or wrapper
+functions added).
+
+## What's actually done
+
+### Foundation (in place, tested)
+
+- **Parser** (`parse.rs`, `ast.rs`): syn-based parse of the DSL
+  body. Rejects `let`. Recognizes assignments, tuple destructure,
+  for-loops with literal or symbolic bounds, dotted weight paths
+  with optional indexing, the `*` operator, op calls.
+- **Classifier** (`classify.rs`, `classified.rs`): walks AST,
+  classifies free vars as Extern (fixed enum:
+  `InputIds, Positions, Rotary, BlockTable, KvCache`), Weight
+  (interned `WeightId` per dotted path), or Local (SSA `LocalId`
+  per assignment). `OpKind` is uniform — no `GemmQ/K/V`
+  sub-variants.
+- **Shape inference** (`shape.rs`): `Dim = Lit | Bound(name) |
+  Mul | Var`; union-find over Vars; per-op shape signatures pin
+  what each op's I/O shapes must be. `Inferred { locals, weights }`.
+- **HF conventions** (`weight_conventions.rs`): standard HF
+  weight-name → shape lookup; `derive_implicit_bounds` fills
+  config defaults like `head_dim = hidden_size / num_attention_heads`
+  and `num_key_value_heads = num_attention_heads`.
+- **Config loader** (`config.rs`): reads
+  `model_architectures/<arch>/*.json`, captures every top-level
+  integer field as a bound.
+- **CFG + unroll** (`cfg.rs`, `fuf.rs`): per-model CFG with
+  concrete `u64` trip counts, then unrolled to a flat
+  `Fuf { nodes: Vec<FufNode> }`. Nested `Expr::Call` and
+  `Expr::Mul` propagate real shapes via `apply_signature`.
+- **Solver** (`solver.rs`): DP ported from
+  `ferrite-solver/src/lowering/solver/dp.rs`. Topo-forward greedy
+  with `claimed[]` bitmap and multi-tile claim support.
+  `Assignment { cover: TileId→SubgraphId, impls: SubgraphId→ImplId,
+  predicted_us }`. Unmatched tile is `SolveError::UnclaimedTile`
+  — no auto-claim fallback. Workload sweep produces
+  `WorkloadAssignments { per_num_tokens: BTreeMap<u64, Assignment> }`.
+- **Scheduler** (`schedule.rs`): topological wavefront over
+  subgraphs. `Loop { waves: Vec<Wave> }` per workload point;
+  `WorkloadLoops` keyed by num_tokens. Intra-wave dep invariant
+  checker.
+- **Implementation trait** (`impl_lib.rs`): full method set
+  ported from old ferrite (name, target_compatible,
+  workload_constraint, matches, cost_us, resources, launch_kind,
+  supported_input/output_handoffs, input/output_layouts,
+  is_compute_bound, can_share_kernel_with). Supporting types:
+  `Resources, LaunchKind, Handoff, Layout (RowMajorBf16,
+  ColMajorBf16, Any — no PagedKvBf16 yet), MatchInfo,
+  WorkloadConstraint`. `ImplementationLibrary` holds
+  `Vec<Box<dyn Implementation>>`. `CostCtx { fuf, profile, bounds }`.
+- **Starter library** (in `impl_lib.rs`): 8 trait-object impls,
+  one per OpKind. All `HostCallback`, all `Layout::RowMajorBf16`,
+  analytical cost (FLOPs / bandwidth). These are placeholders
+  that exercise the trait surface — they are **not** the real
+  fused/calibrated impls and they **don't** map cleanly to
+  ferrite-kernels' actual fused kernels.
+- **Macro pipeline drive** (`lib.rs`): `#[forward(models_dir,
+  target, workloads)]` parses args, runs parse → classify →
+  shape-infer → CFG → unroll → solve × workloads → schedule ×
+  workloads, emits per-(arch, model) module containing pipeline
+  observation constants AND codegen items.
+- **Codegen module** (`codegen.rs` + `emit.rs`): walks the LOOP
+  for each (model × workload bucket), emits `pub trait
+  WeightBundle`, `pub unsafe fn forward_m_<N>(wm, ctx, device) ->
+  OwnedTensor`, and a `pub unsafe fn forward(...)` dispatching on
+  `num_tokens`. Per-subgraph emission is delegated to
+  `Implementation::emit_call(&EmitCtx) -> TokenStream` — no
+  per-OpKind match in `codegen.rs`. New kernels / ops extend the
+  library, not the codegen. **Emitted calls still reference
+  symbols that don't exist in ferrite-kernels** — see "Cuda build
+  gap" below.
+- **`ForwardCtx`** (in `ferrite-forward` crate, cuda-gated):
+  runtime args bundle the emitted forward takes (input_ids,
+  positions, slot_mapping, cu_seqlens_q, seqused_k, block_table,
+  max_seqlen_{q,k}, kv_cache, rotary).
+- **Stable rebuild-on-JSON-change**: every config file the macro
+  reads is registered via `const _: &str = include_str!("...")`
+  in the emitted output. cargo rebuilds when JSONs change. No
+  nightly, no build.rs.
+
+### Cuda build gap (the immediate blocker)
+
+Each starter impl's `emit_call` in `impl_lib.rs` (`emit_embed`,
+`emit_rmsnorm`, `emit_gemm`, `emit_rope_append`, `emit_attention`,
+`emit_silu`, `emit_add`, `emit_mul`) emits a kernel call. Most of
+those calls reference symbols that **do not exist** in
+`ferrite-kernels`. Verified ferrite-kernels public surface (via
+surveys, 2026-04-15):
+
+- `kernels::embedding_gather(weight: GpuTensor, input_ids:
+  GpuTensor, alloc, stream) -> OwnedTensor` — **matches Embed**.
+- `kernels::rms_norm(input: GpuTensor, weight: GpuTensor, eps: f32,
+  alloc, stream) -> OwnedTensor` — **matches RmsNorm**.
+- `LinearLayer::forward(&self, x: TensorView<'_>, cublas, alloc,
+  stream) -> OwnedTensor` — **matches Gemm** (current emit_gemm is
+  already correct).
+- `kernels::silu_and_mul_fused(gate_up: GpuTensor,
+  intermediate_size: usize, alloc, stream) -> OwnedTensor` —
+  takes **packed [gate|up]**; no plain `silu` or `mul` exists.
+  Need a multi-tile `(Silu, Mul)` impl that claims the two ops
+  and maps to this.
+- `attention_helpers::attention_decode_from_cache(q: TensorView,
+  cu_seqlens_q, seqused_k, block_table, max_seqlen_q,
+  max_seqlen_k, scale, softcap, window_size_left, kv_cache,
+  layer_idx, num_sm, alloc, stream, cos_sin_cache_ptr, rotary_dim,
+  is_rotary_interleaved) -> OwnedTensor` — takes **Q only**, reads
+  K/V from cache. DSL's Attention has K/V inputs the kernel
+  doesn't want; the cleanest fix is a multi-tile
+  `(RopeAppend, Attention)` impl that elides the K/V edges.
+- `kernels::fused_qkv_rope_cache(qkv: GpuTensor, positions,
+  cos_sin_cache, slot_mapping, key_cache, value_cache, q_size,
+  kv_size, num_q_heads, head_dim, alloc, stream) -> OwnedTensor`
+  — **takes packed QKV**, writes K/V to cache, returns Q. DSL's
+  RopeAppend has three separate Q/K/V tensors; need a multi-tile
+  `(GemmQ, GemmK, GemmV, RopeAppend)` fused impl OR a cheap
+  pre-pack step.
+- **No `add`, `mul`, standalone `silu`, or `rope` kernels exist.**
+  Old ferrite handled residuals via `fused_add_rms_norm_inplace`
+  (residual add fused into next rmsnorm) — a 2-tile `(Add,
+  RmsNorm)` matcher is probably the port.
+
+**The deeper structural mismatch**: ferrite-kernels' kernel set is
+**fused** (silu+mul fused, rope+kv-cache fused, residual-add+rmsnorm
+fused). Our DSL has separate `silu`, `mul`, `add`, `rope_append`
+ops. The codegen needs **multi-tile matchers** in the Impl library
+that detect adjacent (silu, mul) pairs and pick the
+`silu_and_mul_fused` impl over two single-op impls. Without those
+multi-tile matchers, our DSL can't be lowered to existing
+ferrite-kernels.
+
+This is what the "real Impl library port" means and it's the
+biggest remaining block of work. Old ferrite has these multi-tile
+matchers in `ferrite-solver/src/lowering/library.rs`
+(`VllmRsSiluAndMulFusedImpl`, `VllmRsFusedQkvRopeCacheImpl`, etc.).
+
+## Path to `vllm chat` working (concrete steps)
+
+1. **Port the real Impl library** from
+   `ferrite-solver/src/lowering/library.rs`. Each impl is a
+   trait object with real `matches()` (multi-tile structural
+   patterns), real `cost_us()` (calibrated from CSV cost tables
+   if you also port `cost_table.rs`, or analytical with
+   ferrite-kernels' real shapes), real `resources()`, real
+   `supported_handoffs()`, real `input/output_layouts()`. The
+   minimum set for Llama:
+   - `EmbedImpl` → `embedding_gather`
+   - `RmsNormImpl` → `rms_norm` (or fused with prior add via
+     `FusedAddRmsNormImpl`)
+   - `CublasGemmImpl` → `Linear::forward` via cuBLAS (one generic
+     impl, NOT per-phase; matches any `Gemm` tile)
+   - `FusedQkvRopeCacheImpl` → multi-tile match (3 gemms + rope) →
+     `fused_qkv_rope_cache`
+   - `FlashAttentionImpl` → `flash_attn_paged`
+   - `SiluAndMulFusedImpl` → multi-tile match (silu + mul) →
+     `silu_and_mul_fused`
+   - `ResidualAddImpl` → fused with surrounding rmsnorm via
+     `fused_add_rms_norm` when applicable
+2. **(Done 2026-04-15, commit `75aa11312`.)** `emit_call` is on
+   the `Implementation` trait; codegen.rs dispatches via
+   `imp.emit_call(&EmitCtx)`. Per-impl emission bodies live
+   alongside their cost fns in `impl_lib.rs`.
+3. **Migrate `ferrite-models/src/llama.rs`** from
+   `forward!{}` → `#[forward]`. Implement the emitted
+   `WeightBundle` trait on the existing weight-holding struct.
+4. **Wire into vllm-cuda's call site** so
+   `LlamaForCausalLM::forward()` calls the generated forward fn.
+5. **Run** `timeout 60 vllm chat --model=<small-llama>`. Coherent
+   output → Llama works. Repeat for Qwen2.
+6. **Bench** to verify perf parity.
+
+## Failure patterns from prior sessions (do not repeat)
+
+These are **the actual mistakes that have eaten the user's time
+across multiple sessions**. Catch yourself doing any of these
+and stop.
+
+### Adding speculative types/fields without consumers
+
+> *"add a Layout enum / Constraint enum / Handoff enum, then we'll
+> consume it later"*
+
+Banned. The user's rule: **a commit is 100% complete if and only
+if you will never have to revisit it except for bug fixes**. A
+type with no live consumer will be reshaped the moment you write
+the consumer, which means revisiting it, which means it wasn't
+done. Land types **with their consumers**, not before.
+
+### Inventing scaffolding instead of porting
+
+> *"let me sketch the Impl trait with a few methods, then add
+> more later"*
+
+Banned. The user's rule: **the working old ferrite is the
+exemplar**. Port verbatim, **detoxify as you go**, ship the whole
+ported piece in one commit. Do not invent a smaller-than-old
+interface and grow it.
+
+### Stripping just names
+
+> *"I'll rename `LlamaConfig` to `RopeConfig` and `Llama3RopeScaling`
+> stays as a variant"*
+
+Banned. **Llama3 anywhere in compiler code is bullshit, regardless
+of whether you renamed the struct.** Detoxify means: remove
+transformer-role taxonomies, remove weight-name substring matching,
+remove per-layer/phase tags, remove arch-specific enum variants.
+Not "rename and keep the field."
+
+### Per-OpKind hardcoding in codegen
+
+> *"the codegen has a `match op { OpKind::Embed => ..., OpKind::Gemm
+> => ..., }` and it works for Llama"*
+
+Half-acceptable for getting first-end-to-end running, but it's a
+debt that **must come out before Gemma2 / MoE / MLA**. The right
+shape: codegen calls `impl.emit_call(&match_info, &emit_ctx)` and
+each Impl emits its own kernel call. New ops add new Impls to the
+library, not new arms in codegen.
+
+### Treating `vllm-cuda/src/model/*.rs` as in-scope
+
+Out of scope. **`vllm-cuda` is not touched.** The compiler replaces
+only `ferrite-macros` + `ferrite-solver`. Its output plugs in at
+the same call site the old ferrite output plugged in at.
+
+### Treating the old ferrite as non-working
+
+The old ferrite **runs Llama and Qwen2 correctly**. Its sin was
+internal hardcoding, not non-functionality. Do not "rewrite" any
+mechanism the old code already has — port it.
+
+### Adding "TODO / will-do-later / for now" comments
+
+These are bullshit markers. Either land the thing now or do not
+land the surrounding piece. The only acceptable comment of this
+shape is one that names the next concrete commit that will
+consume the marked code.
+
+### Claiming "100% done"
+
+Only true once: (a) every consumer the new code needs to work
+with is also in place and exercised, (b) tests observe the actual
+end-user behavior (not just type-checks-and-fmt-clean), and (c)
+nothing in the commit will need revisiting except for bugs. If
+you're tempted to say 100% before all three hold, you're wrong.
 
 ## Repository layout
 
 ```
-ferrite-forward/                                 (worktree root)
-├── PLAN.md                                      the plan
-├── HANDOFF.md                                   this file
-├── model_architectures/                         arch-level per-model data
-│   ├── llama/                                     9 Llama configs
-│   └── qwen2/                                     11 Qwen2/2.5 configs
-├── target_profiles/                             hardware metadata
+ferrite-forward/                    (worktree root)
+├── PLAN.md                         the plan
+├── HANDOFF.md                      this file
+├── model_architectures/            arch-level per-model JSONs
+│   ├── llama/                      9 Llama configs
+│   └── qwen2/                      11 Qwen2/2.5 configs
+├── target_profiles/                hardware metadata JSONs
 │   ├── l4_sm89.json
 │   └── h100_sm90.json
 └── vllm-rs/crates/
-    ├── ferrite-forward/                         consumer crate (re-exports macro)
-    │   ├── src/lib.rs
-    │   └── tests/                               end-to-end integration tests
-    └── ferrite-forward-macro/                   proc-macro + all compiler logic
+    ├── ferrite-forward/            consumer crate (re-exports macro)
+    │   ├── src/lib.rs              ForwardCtx (cuda-gated)
+    │   └── tests/
+    │       └── phase7_end_to_end.rs  6 integration tests
+    └── ferrite-forward-macro/      proc-macro + all compiler logic
         └── src/
-            ├── lib.rs                           #[proc_macro_attribute] fn forward
-            ├── ast.rs                           raw parse tree
-            ├── parse.rs                         syn → Ast
-            ├── classified.rs                    classified IR + tables
-            ├── classify.rs                      Ast → classified::Program
-            ├── config.rs                        model config.json loader
-            ├── weight_conventions.rs            HF weight-name → shape table
-            ├── shape.rs                         Dim, Shape, Solver, infer
-            ├── cfg.rs                           classified::Program → Cfg
-            ├── fuf.rs                           Cfg → Fuf (numeric tile graph)
-            ├── target.rs                        TargetProfile loader
-            ├── impl_lib.rs                      Implementation + starter_library
-            ├── solver.rs                        Fuf + lib → Assignment
-            └── schedule.rs                      Assignment → BSP Schedule
+            ├── lib.rs              #[forward] entry point + drive
+            ├── ast.rs              raw parse tree
+            ├── parse.rs            syn → ast::Ast
+            ├── classified.rs       classified IR types
+            ├── classify.rs         ast → classified::Program
+            ├── shape.rs            Dim, Shape, Solver, infer()
+            ├── config.rs           ModelParams loader from dir
+            ├── target.rs           TargetProfile loader
+            ├── weight_conventions.rs  HF conventions
+            ├── cfg.rs              classified → Cfg with u64 bounds
+            ├── fuf.rs              Cfg → Fuf (numeric tile graph)
+            ├── impl_lib.rs         Implementation trait + types +
+            │                         starter library
+            ├── solver.rs           DP solver, SFUF, WorkloadAssignments
+            ├── schedule.rs         wavefront scheduler, Loop, Wave,
+            │                         WorkloadLoops
+            └── codegen.rs          per-(model × workload) forward fn
+                                      emitter (cuda gap noted above)
 ```
 
-## Key types — quick reference
+Old ferrite (the exemplar to port from) is at:
 
-Every type here lives in `ferrite-forward-macro/src/`. Knowing the map
-saves a lot of grep.
+```
+vllm-rs/crates/ferrite-solver/      ports source — 13k lines
+vllm-rs/crates/ferrite-macros/      old proc macro (forward!{})
+vllm-rs/crates/ferrite-kernels/     stays — runtime kernel wrappers
+vllm-rs/crates/ferrite-cuda-builder/  stays — build pipeline
+```
 
-- `ast::{Ast, Stmt, Expr, BoundExpr}` — raw parse tree, syn::Ident preserved verbatim.
-- `classified::{Program, Stmt, Expr, Bound, LocalId, WeightId, ExternKind, OpKind}` —
-  free-var categories classified, names interned, IDs numeric. `LocalTable` and
-  `WeightTable` are the side maps from numeric id → debug ident / path.
-- `shape::{Dim, Shape, Solver, DimVar, Inferred, ShapeError}` — shapes over symbolic
-  bounds with union-find unification. `Inferred` is the output: `locals: HashMap<LocalId, Shape>` and `weights: HashMap<WeightId, Shape>`.
-- `config::{ModelParams, load_dir, load_file}` — `ModelParams { name, source_stem, source_path, bounds: BTreeMap<String,u64> }`.
-- `target::{TargetProfile, load_dir, load_file}` — hardware metadata.
-- `cfg::{Cfg, Block, Instr, Terminator, BlockId}` — per-model CFG with concrete u64 trip counts.
-- `fuf::{Fuf, FufNode, FufInput, TileId}` — flat numeric tile graph. `FufInput = Tile{id, slot} | Weight{id, index} | Extern{kind, index}`.
-- `impl_lib::{Implementation, ImplementationLibrary, ImplId, CostCtx, starter_library}`.
-- `solver::{solve, Assignment, SolveError}` — `Assignment { tile_to_impl, predicted_us }`.
-- `schedule::{schedule, Schedule, Step, find_intra_step_dep_violation}`.
+CUTLASS kernels live in `vllm-rs/crates/vllm-cuda/csrc/` and are
+already compiled + linked via `ferrite-cuda-builder`.
+`vllm-cuda/src/model/llama.rs:3667` has a `ferrite_macros::forward!{}`
+invocation today — that is what task #8 (later) replaces with
+`#[forward]`.
 
-## Decisions made along the way
+## Commit history (current branch)
 
-These aren't in the original PLAN but shouldn't be rediscovered.
+```
+987242340  ferrite-forward: emit forward fn (codegen module) — non-cuda complete
+dd5e98259  ferrite-forward: port Implementation trait + library surface from old ferrite
+083b98836  Revert "ferrite-forward: Layout metadata on Implementation"
+b13d49e7b  Revert "ferrite-forward: port Handoff + Resources + Constraint types"
+1b39fe078  Revert "ferrite-forward: emit Model struct + Model::load per architecture"
+72bf91b99  ferrite-forward: emit Model struct + Model::load per architecture     [reverted 1b39fe078]
+810e87e3b  ferrite-forward: wire macro end-to-end; port DP solver; add OpKind::Mul
+e5f0a9b8e  ferrite-forward: HANDOFF.md — state snapshot for a fresh context     [original handoff — replaced]
+... [phases 0-8 below this]
+```
 
-### DSL syntax
+The reverts are intentional — they're the speculative-types-without-
+consumers commits the user pushed back on. HEAD is the clean
+trait-port + codegen-skeleton state.
 
-- **Attribute macro** `#[forward] fn llama() { body }`, not function-like
-  `forward! { body }`. Chosen so rustfmt formats the body like any Rust fn.
-- **No `let`.** Every binding is `name = expr;` or `(a, b, c) = expr;`.
-  The parser rejects `let` with a pointed error. Rationale: SSA under the hood,
-  `let` was ceremony without semantics.
-- **Only `*` is admitted as a binary op** (used by `gate * up`). Everything else
-  is a parse error.
-- **Loop bounds** are either integer literals or bare identifiers (no arithmetic
-  in the range position). Bound resolution happens at CFG-build time via
-  per-model `ModelParams.bounds`.
+## Tasks (current as of this handoff)
 
-### Models and targets are directory-based, not enumerated
+See the live task list in the agent's task system; high-level:
 
-- `#[forward]` on an arch fn implicitly reads `model_architectures/<arch-name>/*.json`
-  to discover models. File stem = generated identifier (normalized to valid Rust
-  ident — dashes/dots → underscores; leading digit → `m_` prefix).
-- Target profiles live in a parallel `target_profiles/` directory at the repo
-  root. Same discovery pattern.
-- **Not yet wired into the macro**: the macro currently parses + classifies the
-  body and emits an empty fn. Phases 9+ plug the real compilation in, at which
-  point the macro will need to resolve these directory paths relative to
-  `CARGO_MANIFEST_DIR`.
+- `#1` Port DP solver — **completed**.
+- `#4` Scheduler produces LOOP — **completed**.
+- `#7` Wire #[forward] attribute args — **completed**.
+- `#6` Layout metadata + WeightModel + organize() — **superseded**;
+  the Layout / WeightBundle work is now folded into the codegen
+  trajectory (codegen emits a WeightBundle trait per model;
+  Layout is a per-Impl declaration). Probably mark closed and
+  add new tasks per the path-to-vllm-chat steps above.
+- `#5` Emit forward — **partial** (codegen module exists,
+  emission references nonexistent ferrite-kernels symbols).
+- `#8` Switch ferrite-models/llama.rs to #[forward] — **pending**,
+  blocked on real Impl library.
+- `#9–#17` per the PLAN.
 
-### Shape inference
+## Last note
 
-- Dim vocabulary: `Lit(u64) | Bound(String) | Mul(Vec<Dim>) | Var(DimVar)`.
-  `Bound` names come from the **HuggingFace config.json vocabulary**
-  (`hidden_size`, `num_attention_heads`, `head_dim`, …). Using these names in op
-  signatures is transformer-math, not arch-specific — it's the same vocabulary
-  across every HF decoder-only LLM.
-- **Unresolved Vars are preserved, not errored on.** `Solver::close_dim`
-  returns `Ok(Dim::Var(v))` if v has no binding. Callers decide what to do —
-  cost functions return `None`; `solver.rs` treats that as infinite cost and
-  picks some other impl; codegen will concretize via weight manifest or equivalent.
-- **Op signatures anchor dims via transformer-math conventions**:
-  - embed: output's last dim = `hidden_size`; table is `[vocab_size, hidden_size]`
-  - rope_append: q.last = `num_attention_heads * head_dim`; k,v.last = `num_key_value_heads * head_dim`
-  - attention: same as rope_append
-  - rmsnorm: shape-preserving, weight = `[input.last]`
-  - gemm: `[.., K] × [K, N] → [.., N]`, no naming of N (let downstream pin it)
-  - add: shape unify operand-by-operand
-  - silu: shape-preserving
-- **Weight shapes that dataflow doesn't pin** (notably MLP weights — `intermediate_size`
-  isn't a transformer-math anchor, it's a naming convention) get anchored by
-  `weight_conventions::standard_shape()`. This table covers every weight in a
-  standard HF transformer. Arches with non-standard weights (MoE routers, vision
-  patch embeddings) would need a per-arch `weights.json` override — not implemented
-  yet because none of Llama/Qwen2/Gemma2 need it.
-
-### FUF structure
-
-- One `FufNode` per DSL op. No `GemmQ/K/V` variants — all gemms have
-  `OpKind::Gemm`; their role is defined by their inputs and outputs, not by a
-  kind variant.
-- `rope_append` has **three output slots**. The three target LocalIds all map
-  to the same TileId with different slots (0/1/2). Consumers read via
-  `FufInput::Tile { id, slot }`.
-- **Loop-carried locals** are threaded via `Stmt::For.loop_carry: Vec<(LocalId, LocalId)>`
-  (classifier-emitted, CFG-carrying, unroller-applied). Fixes the bug where
-  iteration N+1's body reads would return iteration 0's tile. See classifier's
-  scope-diff logic; PLAN doesn't mention this, it surfaced during Phase 6.
-
-### Solver is MVP
-
-- Phase 7 picks the cheapest candidate per tile independently. With one impl per
-  op, that's trivially correct. When the library grows multi-impls-per-op with
-  real `claim_mask` contention, upgrade to DP over (position, claim_state).
-  Writing DP now would be theatre.
-- Cost functions return `None` when shapes have unresolved Vars. Solver treats
-  that as infinite cost. For the standard body, the convention table closes
-  everything and costs are real.
-- Solve time at NL=16 is well under the 100ms budget (PLAN's requirement).
-
-### Schedule is topological layering
-
-- Not "step-merge from a 1-per-step starting point" as PLAN described — the
-  output is equivalent either way, but topological layering is simpler and
-  matches the natural DAG semantics. q/k/v gemms land in one step because they
-  all read `normed` and don't depend on each other.
-- **Further merging** (packing across layers using claim_masks) is left for when
-  the library grows impls that actually interact. For the starter library with
-  `claim_mask=0` everywhere, layering is optimal.
-
-## Known punt points for phases 9–12
-
-These are things I intentionally deferred. Phase 9+ must handle them.
-
-1. **`Mul` expression (`gate * up`) is currently emitted as `OpKind::Add` tile.**
-   `fuf.rs` has a `TODO(phase 9)` comment at the relevant call site. The DSL has
-   `*` for elementwise multiply but `OpKind` doesn't yet have a `Mul` variant —
-   fix by adding `OpKind::Mul` + a shape signature + (for Phase 10) a CUDA
-   kernel + (for Phase 4) an entry in the ops list. Until fixed, codegen would
-   emit an `add` where a `mul` should be. **Do this before Phase 10.**
-2. **Runtime dims stay symbolic.** `num_tokens` (batch × sequence) is a `Dim::Bound`
-   that never resolves at compile time. Cost functions accept a `num_tokens` in
-   the bounds map (tests pass `num_tokens: 1` for decode). Codegen has to emit
-   code that reads the actual runtime value from the activation tensor — same
-   as any existing forward.
-3. **Attribute args unimplemented.** `#[forward]` currently ignores its args.
-   Phase 9 should parse `#[forward(targets = ["..."])]` and `#[forward(dir = "...")]`.
-4. **Tracked paths unregistered.** The config and target loaders use
-   `std::fs::read` but don't call `proc_macro::tracked_path::path`. When the
-   loader is wired into the macro (Phase 9), add the tracking so cargo
-   rebuilds on config edits.
-5. **`weights.json` deferred.** Not needed until we meet an arch the HF
-   convention table doesn't cover. If Gemma2's new ops or weights require it,
-   add this before Phase 12.
-
-## Remaining phases — what they need to read
-
-Before writing any code for 9–12, the next context should do these reads
-(do not skip — writing blind is the exact failure mode PLAN.md § 5 is about):
-
-### Phase 9 — Rust codegen
-
-Read:
-- `vllm-rs/crates/ferrite-models/src/` — understand the current signature
-  shape (probably `pub fn forward(model: &Model, input_ids: &Tensor, ...) -> Tensor`).
-  Figure out the exact arg list + return type the generated code has to match.
-- `vllm-rs/crates/ferrite-models/src/llama.rs` or equivalent — see how the existing
-  `forward!` macro emits code. Our output needs to plug into the same call sites.
-- `vllm-rs/crates/ferrite-cuda-core/` or wherever the Tensor / FFI types live.
-  Generated code will call into extern "C" functions.
-
-Output:
-- For each `model` in `ModelParams`: a `pub fn <model_name>_forward(...)` that
-  walks the schedule, for each step invokes the chosen Implementation's runtime
-  entry point. Weight refs become `model.layers[i].<path>`; extern params
-  become typed fn args; local bindings become Rust `let` bindings (the one
-  place `let` is appropriate — it's generated Rust, not DSL).
-
-### Phase 10 — CUDA codegen
-
-Read:
-- `vllm-rs/crates/ferrite-cuda-builder/` — what manifest shape does its build.rs
-  consume? Where does it expect `.cu` files? What linker directives?
-- `vllm-rs/crates/ferrite-kernels/` — existing .cu sources, to see what functions
-  already exist and their signatures. Reuse existing kernels; don't rewrite them.
-
-Output:
-- For each `(tile, impl)` that needs fresh CUDA: emit the .cu to $OUT_DIR and
-  add an entry to a manifest JSON. ferrite-cuda-builder (or whatever the current
-  equivalent is) picks it up.
-- For tiles whose chosen Implementation references an already-existing kernel,
-  emit only the extern "C" Rust FFI binding.
-
-### Phase 11 — Llama inference
-
-Read:
-- `vllm-rs/crates/vllm-cli/` — find the `vllm chat` entrypoint.
-- How does vllm-cli get a forward fn today? Replace that path for Llama.
-- Per `feedback_no_run_chat` memory: `timeout ... vllm chat ...`. Exits cleanly
-  on coherent output; loops on garbage.
-
-Acid test: `timeout 60 vllm chat --model=<path-to-a-small-llama>` produces
-coherent text and exits. Latency parity or better vs the legacy path.
-
-### Phase 12 — Gemma2
-
-Gemma2-specific differences (do not encode these in the compiler — they all
-live in the DSL body + new ops + new configs):
-
-- Alternating **sliding window** vs global attention per layer. Needs a
-  `sliding_attention` op (or parameterize `attention`), plus an arch-level
-  signal per layer. Likely a layer-index-keyed branch in the body.
-- **Pre-AND-post attention norms**, plus pre-AND-post FFN norms. Structurally
-  different body shape.
-- **Approximate GELU** instead of SiLU. Add `OpKind::Gelu` + a shape signature
-  (elementwise, shape-preserving) + a kernel.
-- **Query scaling** (fixed scalar multiplier on q before attention). Either a
-  new op or a parameter on `attention`.
-- **Logit soft-capping** (tanh-based clamp on the final logits). `OpKind::SoftCap`
-  + shape sig + kernel.
-
-Acid test (PLAN.md Phase 12): the diff that adds Gemma2 touches only
-`ferrite-models/gemma2.rs`, `model_architectures/gemma2/*.json`, and new kernel
-implementations. **Zero changes to `ferrite-forward` or `ferrite-forward-macro`.**
-If a framework change creeps in, the rewrite failed its premise.
-
-## Invariants to keep firing every commit
-
-The PLAN's anti-bullshit checklist. Literally copy-paste into commit-prep:
-
-- [ ] No string that names a transformer concept appears below the parser.
-- [ ] No `BTreeMap<String, _>` keyed on a DSL identifier.
-- [ ] No type with `.layer: u16`, `.num_layers: u16`, `weight_name: String`,
-      `loop_bounds: BTreeMap<...>`, or `LoopPhase`.
-- [ ] No `match tile_kind` or `if weight_name.contains(...)` anywhere.
-- [ ] The phase's test runs on a realistic config (NL ≥ 16), not a synthetic stub.
-- [ ] The test observes the claimed property, not just compile-success.
-
-## Memory (from prior sessions — do not re-discover)
-
-Already in the user's `~/.claude/projects/-home-moosevan-vllm/memory/`:
-
-- `feedback_wire_up_new_code.md` — name algorithms honestly; wire replacements at
-  every call site in the same commit.
-- `feedback_show_dont_tell.md` — structural claims need real-input tests.
-- `feedback_trace_real_input.md` — trace real inputs before claiming a path works.
-- `feedback_integration_test_per_phase.md` — realistic N, not synthetic.
-- `feedback_worktree_ops.md` — never checkout/stash in a worktree.
-- `feedback_no_run_chat.md` — `timeout` + `vllm chat` for correctness.
-- `feedback_build_flags.md` — `cargo build -p vllm-cli --features cuda --release`;
-  not `cargo check --workspace`.
-
-## Communication back to the user
-
-The user (Nick) has been in pain on this codebase. Spend fewer words, ship more
-code. When a design question surfaces, describe the trade-off in 3–5 sentences
-and pick one — don't dither. When something breaks, investigate the root cause
-rather than patching locally. Do not rename concepts to avoid removing them.
-Do not add `#[allow(dead_code)]` or fallbacks without an explicit "consumed in
-phase N" comment. Do not declare something done without an integration test
-that observes the claim on a real input.
+The user has been burned by prior sessions' patterns of "small
+incremental scaffolding that compounds into bullshit." If you
+catch yourself proposing types-first-consumers-later, hardcoding
+per-OpKind, or adding `todo!()`/placeholder values, **stop and
+reread the failure-patterns section above**. The user's rule is
+not negotiable: every commit complete, no revisit except for bugs.
+The right unit of work is the smallest **port-with-its-consumer**
+that runs end-to-end, not the smallest type definition.

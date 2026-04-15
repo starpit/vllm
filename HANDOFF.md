@@ -30,7 +30,7 @@
   **But: `vllm chat` on a Llama model runs and produces garbage
   tokens (`,,,,,,,`)** — `test_cuda_correctness_smollm_135m`
   fails. Scaffolding is NOT the problem: with `FERRITE_DISABLE=1`
-  (an uncommitted diagnostic toggle) the hand-written
+  (a diagnostic toggle landed in commit `624beb4c8`) the hand-written
   `LlamaForCausalLM` path passes the same golden. The bug is
   somewhere in the ferrite-forward-emitted forward, not yet
   located. Static analysis has been exhausted — next-session
@@ -603,7 +603,7 @@ data.
 
 `test_cuda_correctness_qwen2_0_5b` passes (hand-written path
 works). `test_cuda_correctness_smollm_135m` fails with degenerate
-output (produces `,,,,,,,`). With the uncommitted diagnostic
+output (produces `,,,,,,,`). With the diagnostic
 `FERRITE_DISABLE=1` env-var gate in `cuda_worker.rs`, dense Llama
 routes through `LlamaForCausalLM::load/forward` instead of
 `LlamaFerrite` — SmolLM golden then passes. Bug is 100%

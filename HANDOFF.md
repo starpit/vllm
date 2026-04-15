@@ -20,14 +20,26 @@
   as you port. Do not rewrite mechanisms that already work.
 - **Current state, honest version**: the scaffolding is in place
   (parser, classifier, shape-inference, CFG/unroll, DP solver,
-  scheduler, codegen, WeightBundle emission). The framework works
-  for Llama topology — every DSL op has at least one Impl. But
-  the **library is a tiny fraction of the old one**: 7 Impls vs.
-  the old library's ~1,400 kernel variants. Cost model is
-  analytical estimates vs. the old CSV lookup against 55k rows of
-  measured sweep data. A prior session reported "library complete"
-  meaning topology coverage; that was a misread. See "Real gap
-  inventory" below.
+  scheduler, codegen, `Weights` struct + `load` emission,
+  arch-level dispatcher, decode/prefill attention variant split
+  via `WorkloadConstraint`). vllm-executor routes dense bf16
+  Llama through `ferrite_models::llama::forward` unconditionally —
+  the old `LlamaSolver`/`Qwen2Solver` paths are deleted, and the
+  legacy `ferrite_macros::forward!{}` invocations in
+  `vllm-cuda/src/model/{llama,qwen2}.rs` are gone.
+  **But: `vllm chat` on a Llama model runs and produces garbage
+  tokens (`,,,,,,,`)** — `test_cuda_correctness_smollm_135m`
+  fails. Scaffolding is NOT the problem: with `FERRITE_DISABLE=1`
+  (an uncommitted diagnostic toggle) the hand-written
+  `LlamaForCausalLM` path passes the same golden. The bug is
+  somewhere in the ferrite-forward-emitted forward, not yet
+  located. Static analysis has been exhausted — next-session
+  move is granular per-layer goldens.
+  The **library is still a tiny fraction of the old one**: 9
+  Impls vs. the old library's ~1,400 kernel variants. Cost model
+  is analytical estimates vs. the old CSV lookup against 55k
+  rows of measured sweep data. See "Real gap inventory" below —
+  those gaps are perf work, not correctness work.
 
 ## Real gap inventory (what this compiler is missing vs old ferrite)
 
@@ -44,7 +56,7 @@ correctness or functionality.
 | 5 | **Qwen2 fused-QKV-with-bias**\* | `CublasFusedQkvGemmWithBiasImpl` | 0 | Qwen2 DSL migration blocked |
 | 6 | **Cublas / cutlass gemm+residual fusion** | `CublasGemmExWithResidualImpl`, `CutlassGemmWithResidualImpl` (424 variants) | 0 | Extra launches vs. fused |
 | 7 | **Cutlass gemm+silu+mul fusion** | `CutlassGemmSiluMulImpl` (424 variants) | `FusedGateUpSiluMulImpl` emits cuBLAS | Perf delta on SwiGLU MLP |
-| 8 | **Attention variant split**\* | `TkAttentionDecodeImpl`, `TkAttentionPrefillImpl`, `FlashInferStandaloneImpl`, `FlashInferStandardImpl` | 1 `AttentionViaCacheImpl` (hardcoded `is_causal=true`) | Decode and prefill get the same kernel |
+| 8 | **Attention variant split** (LANDED) | `TkAttentionDecodeImpl`, `TkAttentionPrefillImpl`, `FlashInferStandaloneImpl`, `FlashInferStandardImpl` | `AttentionViaCacheImpl` + `FusedQkvRopeCacheImpl` for decode (M=1); `AttentionPrefillContiguousImpl` + `FusedQkvRopePrefillImpl` for prefill (M≥2); solver picks per `WorkloadConstraint`. Done in Step D commit `16ef52925`. | No longer a split issue — but did not fix `vllm chat` garbage output on its own |
 | 9 | **Prefill rope variant** | `VllmRsPrefillRopeCacheImpl` | 0 | Prefill KV-write path missing |
 | 10 | **Scheduled megakernel**\* (**HIGH PRIORITY**) | Full BSP persistent cooperative-launch kernel system: `kernel_library.rs`, `schedule.rs`, `templates/scheduled/megakernel.cu`, `SCHEDULED_MEGAKERNEL_HANDOFF.md` (~41 KB) | Nothing | Entire megakernel codegen path absent |
 | 11 | **Codegen: stream assignment, wave merging, cooperative-launch emission, graph capture** | All present in `ferrite-solver/src/lowering/backend/cuda_codegen.rs` | Sequential one-launch-per-subgraph only | DeviceCallable waves can't form megakernels |
@@ -121,21 +133,43 @@ Closes gaps #5, #6, #7, #9. Port `CublasFusedQkvGemmWithBiasImpl`
 `CutlassGemmWithResidualImpl`, `CutlassGemmSiluMulImpl`,
 `VllmRsPrefillRopeCacheImpl`.
 
-### Step D — Attention variant split
+### Step D — Attention variant split (DONE, commit `16ef52925`)
 
-Closes gap #8. Port `TkAttentionDecodeImpl`,
-`TkAttentionPrefillImpl`, `FlashInferStandaloneImpl`,
-`FlashInferStandardImpl`. Solver dispatches on workload bucket.
-Remove `is_causal=true` hardcoding.
+Decode vs prefill impls now split via `WorkloadConstraint`:
+`FusedQkvRopeCacheImpl` + `AttentionViaCacheImpl` gated to M=1;
+`FusedQkvRopePrefillImpl` (uses `fused_qkv_rope` + `write_kv_cache`)
++ `AttentionPrefillContiguousImpl` (uses `flash_attn_contiguous`
+on contiguous K/V) for M≥2. Solver's DP picks per bucket.
+Necessary but **not sufficient** for correctness — the SmolLM
+golden still fails after Step D landed. Kept here for reference.
 
-### Step E — Wiring to vllm-cuda + vllm chat
+### Step E — Wiring to vllm-cuda + vllm chat (PARTIALLY DONE)
 
-Only after A–D. Implement `WeightBundle` for `LlamaForCausalLM`,
-build a `ForwardCtx`, swap the hand-written forward for
-`ferrite_models::llama::<model>::forward`. `timeout 60 vllm chat`
-for correctness; `vllm bench` for parity. **Do NOT start before
-A + at-least-partial-B.** Wiring a 7-impl library creates the
-illusion the compiler is ready.
+Dispatch wired up: vllm-executor routes dense-bf16 Llama to
+`CudaModel::LlamaFerrite` which calls
+`ferrite_models::llama::forward(&weights, &ctx, device,
+num_tokens)`. The old `LlamaSolver`/`Qwen2Solver` variants are
+deleted; old `ferrite_macros::forward!{}` in
+`vllm-cuda/src/model/{llama,qwen2}.rs` removed. Qwen2 stays on
+hand-written `Qwen2ForCausalLM` until Step C lands its bias-fused
+QKV impl.
+
+**Correctness is NOT yet achieved.** `vllm chat --model=<llama>`
+runs through the ferrite path but produces garbage tokens (e.g.
+`,,,,,,,,,`). `test_cuda_correctness_smollm_135m` fails.
+`test_cuda_correctness_qwen2_0_5b` passes (Qwen2 still on
+hand-written path). The failure is specific to the
+ferrite-forward-emitted forward.
+
+Diagnostic proof that scaffolding is fine: the uncommitted
+`FERRITE_DISABLE=1` env-var gate (routes dense through the
+hand-written `LlamaForCausalLM` path instead) makes the SmolLM
+golden pass. So the bug is entirely in the ferrite-emitted
+forward's semantics, not in the dispatch / KV cache / weight
+loading / ForwardCtx wiring. Static analysis has been exhausted.
+
+Next-session move: add per-layer goldens so the bug is
+locatable. See "Next session starts here" below.
 
 ### Step F — Qwen2 + Gemma2 + Mixtral + DeepSeek-V2
 
@@ -557,28 +591,104 @@ dd5e98259  ferrite-forward: port Implementation trait + library surface from old
 ... [phases 0-8 below this]
 ```
 
-## Open tasks (next session picks up here)
+## Next session starts here
 
-See "Re-scoped path to vllm chat + parity" near the top of this
-file. In priority order: Step A (cutlass tile zoo + CSV costs),
-Step B (scheduled megakernel — HIGH PRIORITY), Step C (fusion
-parity; Qwen2-unblocking), Step D (attention variants), Step E
-(vllm-cuda wiring — NOT before A + partial B), Step F (other
-architectures), Step G (delete legacy).
+**The critical-path task: locate and fix the ferrite-path
+correctness bug.** Scaffolding + framework design are done; the
+ferrite-emitted forward produces garbage tokens end-to-end for
+Llama. Static analysis has been exhausted; need per-layer diff
+data.
+
+### Proven debug anchor
+
+`test_cuda_correctness_qwen2_0_5b` passes (hand-written path
+works). `test_cuda_correctness_smollm_135m` fails with degenerate
+output (produces `,,,,,,,`). With the uncommitted diagnostic
+`FERRITE_DISABLE=1` env-var gate in `cuda_worker.rs`, dense Llama
+routes through `LlamaForCausalLM::load/forward` instead of
+`LlamaFerrite` — SmolLM golden then passes. Bug is 100%
+ferrite-path-specific.
+
+### Concrete path to the bug: RESTORE the golden harness
+
+**Goldens existed and worked in the prior ferrite.** They were
+deleted with the megakernel retirement, not superseded. Do not
+reinvent them — recover and adapt.
+
+What was there (commit-archaeological references):
+- **`crates/vllm-cuda/src/bin/gen_golden.rs`** (301 lines,
+  deleted in `a13577f75`). Binary that runs hand-written
+  `LlamaForCausalLM` on a fixed prompt, dumps top-k last-token
+  logits to JSON. Recover with `git show
+  a13577f75^:vllm-rs/crates/vllm-cuda/src/bin/gen_golden.rs`.
+- **`crates/vllm-tk-test-harness/tests/op_tests.rs`** (2266
+  lines, deleted in `a13577f75`). Per-op GPU-vs-CPU-golden tests.
+  The pattern to copy — for each library Impl, launch its kernel
+  on known bf16 inputs on GPU, call the matching `cpu_golden.rs`
+  fn on CPU, diff. Recoverable the same way.
+- **`cpu_golden.rs`** — pure-Rust reference per op. Still alive
+  in `crates/ferrite-solver/src/cpu_golden.rs` (will move when
+  Step G deletes `ferrite-solver`; move it to `ferrite-forward`
+  first).
+- **Commit `28a9b3acf`** ("feat(tk): add op-level test harness
+  with CPU golden comparisons") documents the original design
+  decisions.
+
+What to rebuild, adapted to ferrite-forward's idiom:
+1. Recover `gen_golden.rs` as-is initially. Extend output to
+   include per-layer hidden-state stats (not just final logits).
+   A standalone binary trips over cublasLt heuristic for some
+   shapes — run it inside the live worker via a new
+   `DUMP_GOLDEN=<path>` env var on `LlamaForCausalLM::forward`
+   so the full worker preamble (cublas handles, streams, KV
+   cache pool) is present.
+2. Ferrite side: extend the macro to emit a
+   `forward_with_snapshots(wm, ctx, device, num_tokens,
+   snapshots: &mut Vec<(TileId, Vec<f32>)>)` parallel to
+   `forward` — each emitted subgraph gets a DtoH dump of its
+   boundary-output tensor(s) after the kernel call. Gate behind
+   a feature/const so `forward` stays lean.
+3. Diff harness (following `op_tests.rs` pattern at the layer
+   granularity): loads the golden, calls
+   `forward_with_snapshots`, diffs per-layer, reports first
+   diverging tile with max-abs-diff.
+4. Fix the bug. Confirm the new per-layer test passes AND
+   `test_cuda_correctness_smollm_135m` passes.
+
+### Perf + feature work (after correctness)
+
+Per the gap table: Step A (cutlass tile zoo + CSV costs), Step C
+(fusion parity incl. Qwen2 bias-fused QKV), Step B (DeviceCallable
+fused launches), Step F (Gemma2 / Mixtral / DeepSeek-V2), Step G
+(delete legacy `ferrite-solver`/`ferrite-macros`, preserving
+`ferrite-solver/data/*.csv`).
 
 ### Already landed — do not redo
 
 - Parser + classifier + shape inference + CFG/unroll.
-- FUF/SFUF/LOOP IRs + schedule_workloads + cost::refresh_predicted_us.
-- DP solver (ported from ferrite-solver/src/lowering/solver/dp.rs).
-- Codegen delegates to `Implementation::emit_call`. New Impls add
-  to the library; no codegen edits.
-- `WeightBundle` trait emission from the solved graph.
+- FUF/SFUF/LOOP IRs + `schedule_workloads` + `cost::refresh_predicted_us`.
+- DP solver (ported from `ferrite-solver/src/lowering/solver/dp.rs`).
+- Codegen delegates to `Implementation::emit_call`.
+- Arch-level `Weights` enum + `Weights::load` + `forward` dispatcher
+  emission. Caller integration = two calls (`load` at startup,
+  `forward` per step).
 - `ForwardCtx` runtime-args bundle in `ferrite-forward`.
 - `include_str!` rebuild-on-change for every JSON the macro reads.
-- `ferrite-models/src/llama.rs` migrated from `forward!{}` to
-  `#[forward]`. **Qwen2 remains on the old macro — blocked on
-  Step C gap #5.**
+- `#[forward]` derives `models_dir` from the carrier fn name by
+  walking up for `model_architectures/<name>/`.
+- Tied-embedding load (lm_head reuses embed_tokens when
+  `tie_word_embeddings: true`).
+- Range-coalesced dispatch: `forward` accepts any `num_tokens` by
+  mapping to the nearest-lower compiled bucket.
+- Step D: decode/prefill attention variant split via
+  `WorkloadConstraint`.
+- vllm-executor wiring: `CudaModel::LlamaFerrite` variant,
+  `LlamaForCausalLM::Model`-via-`forward!{}` and
+  `Qwen2ForCausalLM::Model`-via-`forward!{}` invocations deleted,
+  `ferrite_macros` dep dropped from vllm-cuda.
+- SmolLM2-135M config in `model_architectures/llama/`.
+- Qwen2 stays on hand-written path (ferrite migration blocked on
+  Step C's `CublasFusedQkvGemmWithBiasImpl`).
 
 ## Last note
 

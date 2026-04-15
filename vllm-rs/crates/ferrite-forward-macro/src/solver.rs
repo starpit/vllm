@@ -386,11 +386,7 @@ fn solve_one(
     if !dp[0][0].cost.is_finite() {
         // No feasible plan for this workload. Emit the specific
         // tile where we ran out of candidates.
-        if let Some((i, _)) = candidates
-            .iter()
-            .enumerate()
-            .find(|(_, c)| c.is_empty())
-        {
+        if let Some((i, _)) = candidates.iter().enumerate().find(|(_, c)| c.is_empty()) {
             return Err(SolveError::UnclaimedTile {
                 tile: fuf.nodes[i].id,
                 op: fuf.nodes[i].op,

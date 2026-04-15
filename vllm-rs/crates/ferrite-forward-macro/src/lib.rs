@@ -341,6 +341,41 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>)]) -> proc_macro2::TokenStream 
         })
         .collect();
 
+    // Accessor methods on Weights — each returns a per-variant
+    // constant from the matched model's bounds. Consumers (e.g.
+    // vllm-executor's CudaModel enum) delegate their own accessor
+    // arms to these, replacing N duplicated `m.model.layers[0].foo`
+    // walks with a single method call.
+    let accessor_methods: Vec<proc_macro2::TokenStream> = DISPATCH_FIELDS
+        .iter()
+        .map(|field| {
+            let method_name = Ident::new(field, Span::call_site());
+            let arms_ts: Vec<proc_macro2::TokenStream> = arms
+                .iter()
+                .map(|(model_ident, bounds)| {
+                    let variant_ident = pascal_case(model_ident);
+                    let idx = DISPATCH_FIELDS
+                        .iter()
+                        .position(|f| f == field)
+                        .expect("field in DISPATCH_FIELDS");
+                    let val = proc_macro2::Literal::u64_unsuffixed(bounds[idx]);
+                    quote! { Weights::#variant_ident(_) => #val, }
+                })
+                .collect();
+            quote! {
+                #[doc = concat!(
+                    "The matched variant's `", stringify!(#method_name),
+                    "` — from the model's config.json at macro-expansion time."
+                )]
+                pub fn #method_name(&self) -> u64 {
+                    match self {
+                        #(#arms_ts)*
+                    }
+                }
+            }
+        })
+        .collect();
+
     let fields: Vec<proc_macro2::TokenStream> = DISPATCH_FIELDS
         .iter()
         .map(|k| {
@@ -363,6 +398,8 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>)]) -> proc_macro2::TokenStream 
 
         #[cfg(feature = "cuda")]
         impl Weights {
+            #(#accessor_methods)*
+
             /// Auto-detect the compiled variant from the runtime
             /// HF-config fields, load weights (streaming concat for
             /// fused accessors), and return the enum-wrapped result.

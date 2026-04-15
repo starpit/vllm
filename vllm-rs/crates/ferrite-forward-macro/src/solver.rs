@@ -228,7 +228,26 @@ fn solve_one(
             matches_at[i].push((imp_id, info, cost));
         }
 
-        matches_at[i].sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
+        // Sort: claim size DESCENDING, then cost ASCENDING.
+        //
+        // Multi-tile claims represent fusion — by construction they
+        // are preferable to covering the same tiles with separate
+        // singletons (that is literally what fusion means: one
+        // launch + shared memory traffic instead of N launches).
+        // Picking the smaller claim at the seed can *orphan*
+        // downstream tiles that only a multi-tile claim can cover
+        // (e.g. Silu/Mul have no singleton impl — `silu_and_mul_fused`
+        // is the only kernel). The greedy has to prefer the larger
+        // claim to stay correct, not just optimal.
+        //
+        // Singleton-vs-singleton at the same seed falls through to
+        // the cost tiebreak.
+        matches_at[i].sort_by(|a, b| {
+            b.1.claimed_tiles
+                .len()
+                .cmp(&a.1.claimed_tiles.len())
+                .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal))
+        });
     }
     let _ = inferred; // no longer used here — shapes come via ctx.fuf
 
@@ -360,6 +379,11 @@ mod tests {
         (fuf, inferred)
     }
 
+    /// Realistic Llama body with the full SwiGLU MLP (gate+silu+up+mul
+    /// → down). The SwiGLU quadruple is the exemplar multi-tile claim
+    /// exercised by `FusedGateUpSiluMulImpl`; if you strip silu/mul
+    /// from this body the solver falls back to all-singleton coverage
+    /// and the fusion tests below go dead.
     const LLAMA_BODY: &str = r#"
         hidden_states = embed(input_ids, embed_tokens);
         for layer in 0..num_hidden_layers {
@@ -373,8 +397,9 @@ mod tests {
             hidden_states = add(oproj, hidden_states);
 
             normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+            gate = silu(gemm(normed2, mlp.gate_proj[layer]));
             up = gemm(normed2, mlp.up_proj[layer]);
-            down = gemm(up, mlp.down_proj[layer]);
+            down = gemm(gate * up, mlp.down_proj[layer]);
             hidden_states = add(down, hidden_states);
         }
         normed = rmsnorm(hidden_states, norm);
@@ -406,9 +431,17 @@ mod tests {
                 sfuf.is_cover_complete(fuf.len()),
                 "cover not complete at m={m}"
             );
-            // Starter library is single-op per impl, so subgraph
-            // count equals tile count.
-            assert_eq!(sfuf.num_subgraphs(), fuf.len(), "at m={m}");
+            // FusedGateUpSiluMulImpl collapses 4 tiles per layer into
+            // one subgraph, so subgraph count is strictly less than
+            // tile count. Per-layer savings: 3 (4 tiles → 1 subgraph
+            // per SwiGLU; other tiles stay singleton). With NL
+            // unrolled layers, that's 3*NL fewer subgraphs.
+            let nl = params.bounds["num_hidden_layers"] as usize;
+            assert_eq!(
+                sfuf.num_subgraphs(),
+                fuf.len() - 3 * nl,
+                "expected 3*NL fewer subgraphs than tiles at m={m} (SwiGLU fusion)"
+            );
             assert!(
                 sfuf.predicted_us > 0.0 && sfuf.predicted_us.is_finite(),
                 "predicted_us at m={m} = {}",
@@ -416,6 +449,135 @@ mod tests {
             );
         }
         assert!(elapsed_ms < 100, "solve took {elapsed_ms} ms, budget 100");
+    }
+
+    #[test]
+    fn swiglu_mlp_claimed_as_fused_subgraph_per_layer() {
+        // For every unrolled MLP in a real Llama body, the (gate_gemm,
+        // up_gemm, silu, mul) quadruple must collapse into one
+        // FusedGateUpSiluMulImpl subgraph. No phase tags, no weight
+        // names — this is the structural-matcher acid test.
+        let params = llama_params("llama-3.1-8b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512, 4096],
+        )
+        .unwrap();
+
+        let nl = params.bounds["num_hidden_layers"] as usize;
+
+        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+            // Count subgraphs that claim 4 tiles of kinds {Gemm,
+            // Gemm, Silu, Mul} with shared activation on the Gemms.
+            let mut fused_count = 0;
+            for sg in sfuf.subgraphs() {
+                let tiles = sfuf.tiles_in_subgraph(sg);
+                if tiles.len() != 4 {
+                    continue;
+                }
+                let ops: Vec<OpKind> = tiles.iter().map(|t| fuf.get(*t).op).collect();
+                let n_gemm = ops.iter().filter(|o| **o == OpKind::Gemm).count();
+                let n_silu = ops.iter().filter(|o| **o == OpKind::Silu).count();
+                let n_mul = ops.iter().filter(|o| **o == OpKind::Mul).count();
+                if n_gemm == 2 && n_silu == 1 && n_mul == 1 {
+                    fused_count += 1;
+                    // And the bound Impl must be the fused one —
+                    // lookup by name to avoid coupling to ImplId ordering.
+                    let imp_id = sfuf.impl_of(sg).unwrap();
+                    assert_eq!(
+                        lib.get(imp_id).name(),
+                        "fused_gate_up_silu_mul",
+                        "subgraph at m={m} has fused topology but wrong impl",
+                    );
+                }
+            }
+            assert_eq!(
+                fused_count, nl,
+                "expected one fused SwiGLU subgraph per layer at m={m}",
+            );
+        }
+    }
+
+    #[test]
+    fn fused_weight_accessor_collides_to_single_declaration_across_buckets() {
+        // A fused impl declares one accessor per claim. Across many
+        // buckets that pick the same Impl, WeightBundle-trait
+        // aggregation must dedupe — otherwise user gets N copies of
+        // the same accessor. Regression-guards the SFUF-walking
+        // emission in codegen::emit_weight_bundle_trait.
+        use crate::impl_lib::default_required_weights;
+        let params = llama_params("llama-3.2-1b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512, 4096],
+        )
+        .unwrap();
+
+        // Pick a SwiGLU-fused subgraph in the first bucket, record
+        // its declared accessor name, then verify the same name
+        // shows up exactly once in every other bucket's SFUF too.
+        let first_sfuf = workloads.per_num_tokens.values().next().unwrap();
+        let first_sg = first_sfuf
+            .subgraphs()
+            .find(|sg| {
+                let tiles = first_sfuf.tiles_in_subgraph(*sg);
+                tiles.len() == 4
+                    && tiles.iter().any(|t| fuf.get(*t).op == OpKind::Silu)
+                    && tiles.iter().any(|t| fuf.get(*t).op == OpKind::Mul)
+            })
+            .expect("at least one fused SwiGLU claim exists");
+        let first_claim = first_sfuf.tiles_in_subgraph(first_sg);
+        let first_imp = lib.get(first_sfuf.impl_of(first_sg).unwrap());
+        let decls = first_imp.required_weights(&first_claim, &fuf, &classify_program(LLAMA_BODY));
+        assert_eq!(
+            decls.len(),
+            1,
+            "fused impl declares exactly one accessor per claim"
+        );
+        assert_eq!(
+            decls[0].source_weights.len(),
+            2,
+            "fused accessor covers two source weights (gate_proj + up_proj)"
+        );
+        // And the default still works for Embed (singleton).
+        let embed_sg = first_sfuf
+            .subgraphs()
+            .find(|sg| {
+                let tiles = first_sfuf.tiles_in_subgraph(*sg);
+                tiles.len() == 1 && fuf.get(tiles[0]).op == OpKind::Embed
+            })
+            .unwrap();
+        let embed_claim = first_sfuf.tiles_in_subgraph(embed_sg);
+        let default_decls =
+            default_required_weights(&embed_claim, &fuf, &classify_program(LLAMA_BODY));
+        assert_eq!(default_decls.len(), 1);
+        assert_eq!(default_decls[0].source_weights.len(), 1);
+    }
+
+    fn classify_program(src: &str) -> crate::classified::Program {
+        let file: syn::File =
+            syn::parse_str(&format!("fn _c() {{ {src} }}")).expect("parse carrier");
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let ast = crate::parse::parse_block(block).unwrap();
+        crate::classify::classify(&ast).unwrap()
     }
 
     #[test]

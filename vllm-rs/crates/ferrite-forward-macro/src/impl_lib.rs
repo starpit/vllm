@@ -14,15 +14,15 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use crate::classified::OpKind;
-use crate::emit::EmitCtx;
-use crate::fuf::{Fuf, TileId};
+use crate::classified::{OpKind, Program, WeightId};
+use crate::emit::{EmitCtx, weight_field_name};
+use crate::fuf::{Fuf, FufInput, TileId};
 use crate::shape::{Dim, Shape};
 use crate::target::TargetProfile;
 
@@ -292,6 +292,94 @@ impl WorkloadConstraint {
     }
 }
 
+/// A method the emitted `WeightBundle` trait must expose, as
+/// declared by an [`Implementation`]. Codegen aggregates these
+/// declarations across every subgraph of an SFUF and emits one
+/// trait method per unique accessor.
+///
+/// Why this lives on the Impl: a fusion impl that claims multiple
+/// Gemm tiles may want the user to pre-concatenate the weights
+/// into one packed buffer, so its `emit_call` can issue a single
+/// cuBLAS call. Declaring a fused accessor (e.g. `mlp_gate_up_0`
+/// returning one `LinearLayer`) is how the impl expresses that
+/// contract to the user, without the compiler knowing anything
+/// about "gate" or "up" specifically.
+#[derive(Clone)]
+pub struct WeightAccessor {
+    /// Trait method name. Two impls that declare the same name
+    /// must agree on `rust_type`; a mismatch is a hard error at
+    /// trait-emission time.
+    pub name: syn::Ident,
+    /// Return type, as emitted Rust tokens (e.g.
+    /// `::ferrite_kernels::layers::LinearLayer`).
+    pub rust_type: TokenStream,
+    /// DSL weights that feed this accessor. One pair for a simple
+    /// accessor, multiple for a fused one. Used for dedup and
+    /// documentation; the user is responsible for providing a
+    /// weight object with the declared `rust_type` that stands in
+    /// for the listed sources.
+    pub source_weights: Vec<(WeightId, Option<u64>)>,
+}
+
+impl fmt::Debug for WeightAccessor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WeightAccessor")
+            .field("name", &self.name.to_string())
+            .field("rust_type", &self.rust_type.to_string())
+            .field("source_weights", &self.source_weights)
+            .finish()
+    }
+}
+
+/// Default [`Implementation::required_weights`] body: one accessor
+/// per unique `(WeightId, index)` referenced by a weight input of
+/// any claimed tile. Name via [`weight_field_name`]; type inferred
+/// from the consuming op (Embed → `Embedding`, RmsNorm → `RmsNorm`,
+/// Gemm → `LinearLayer`). Preserves the single-tile-per-subgraph
+/// accessor shape the FUF-walking WeightBundle emission used
+/// before the trait moved to SFUF-walking.
+pub fn default_required_weights(
+    claimed_tiles: &[TileId],
+    fuf: &Fuf,
+    program: &Program,
+) -> Vec<WeightAccessor> {
+    let mut out: Vec<WeightAccessor> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for &tid in claimed_tiles {
+        let node = fuf.get(tid);
+        for input in &node.inputs {
+            if let FufInput::Weight { id, index } = input {
+                let name = weight_field_name(program, *id, *index);
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
+                out.push(WeightAccessor {
+                    name,
+                    rust_type: rust_type_for_weight_consumed_by(node.op),
+                    source_weights: vec![(*id, *index)],
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The ferrite-kernels layer wrapper corresponding to an op that
+/// consumes a weight. Drives the default accessor-type decision.
+/// Fusion impls that pack multiple weights declare their own type
+/// explicitly and bypass this.
+pub fn rust_type_for_weight_consumed_by(op: OpKind) -> TokenStream {
+    match op {
+        OpKind::Embed => quote! { ::ferrite_kernels::layers::Embedding },
+        OpKind::RmsNorm => quote! { ::ferrite_kernels::layers::RmsNorm },
+        OpKind::Gemm => quote! { ::ferrite_kernels::layers::LinearLayer },
+        // Ops that don't consume weights in the DSL's typical
+        // patterns. If the DSL routes a weight into one of these
+        // unexpectedly, the user must provide a raw `GpuTensor`.
+        _ => quote! { ::ferrite_cuda_core::tensor::GpuTensor },
+    }
+}
+
 /// One curated implementation in the library.
 ///
 /// Implementations are **not** generic — each entry corresponds
@@ -383,6 +471,26 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         let name = self.name();
         let msg = format!("Implementation `{name}` has no emit_call body");
         quote! { compile_error!(#msg); }
+    }
+
+    /// Declare the `WeightBundle` trait methods this impl's
+    /// `emit_call` will invoke for the given claim. Codegen
+    /// aggregates declarations across all picked impls in an SFUF
+    /// and emits one trait method per unique accessor.
+    ///
+    /// Default: one accessor per weight input of each claimed
+    /// tile (see [`default_required_weights`]). Fusion impls that
+    /// want a packed weight (e.g. concatenated `gate_proj|up_proj`)
+    /// override this to declare a single accessor whose
+    /// `source_weights` lists every DSL weight the user must pack
+    /// into the object they return.
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        default_required_weights(claimed_tiles, fuf, program)
     }
 }
 
@@ -691,22 +799,17 @@ fn emit_attention(ctx: &EmitCtx) -> TokenStream {
     }
 }
 
-fn emit_silu(ctx: &EmitCtx) -> TokenStream {
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let x = ctx.input_expr(tile, 0);
-    quote! {
-        let #out = unsafe {
-            ::ferrite_kernels::kernels::silu_owned(
-                #x,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
-    }
-}
-
 fn emit_add(ctx: &EmitCtx) -> TokenStream {
+    // Placeholder: `ferrite-kernels` has `add_inplace` (in-place on
+    // the LHS), not an owned-returning `add`. The real path is a
+    // `FusedAddRmsNorm` multi-tile impl that claims `(Add, RmsNorm)`
+    // and calls `fused_add_rms_norm_inplace`. A surviving standalone
+    // `Add` claim (residual without a following rmsnorm — does not
+    // occur in Llama/Qwen2) would need its own kernel wrapping.
+    //
+    // Cuda build gap: this still references a non-existent symbol.
+    // Untouched here; C2 port of `FusedAddRmsNormImpl` will delete
+    // this fallback along with `AddRefImpl`.
     let tile = ctx.primary();
     let out = ctx.output_ident(tile, 0);
     let a = ctx.input_expr(tile, 0);
@@ -714,22 +817,6 @@ fn emit_add(ctx: &EmitCtx) -> TokenStream {
     quote! {
         let #out = unsafe {
             ::ferrite_kernels::kernels::add_owned(
-                #a, #b,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
-    }
-}
-
-fn emit_mul(ctx: &EmitCtx) -> TokenStream {
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let a = ctx.input_expr(tile, 0);
-    let b = ctx.input_expr(tile, 1);
-    quote! {
-        let #out = unsafe {
-            ::ferrite_kernels::kernels::mul_owned(
                 #a, #b,
                 &mut device.caching,
                 device.compute_stream,
@@ -859,14 +946,6 @@ trivial_impl!(
     true
 );
 trivial_impl!(
-    SiluRefImpl,
-    OpKind::Silu,
-    "silu_ref",
-    elementwise_cost,
-    emit_silu,
-    false
-);
-trivial_impl!(
     AddRefImpl,
     OpKind::Add,
     "add_ref",
@@ -874,18 +953,24 @@ trivial_impl!(
     emit_add,
     false
 );
-trivial_impl!(
-    MulRefImpl,
-    OpKind::Mul,
-    "mul_ref",
-    elementwise_cost,
-    emit_mul,
-    false
-);
 
-/// Baseline library: one HostCallback impl per OpKind, analytical
-/// cost estimates. Replaced by calibrated target-specific impls
-/// as they're ported.
+// Silu and Mul have no singleton impls. The only kernel in
+// `ferrite-kernels` that implements them is `silu_and_mul_fused`,
+// which operates on a packed `[num_tokens, 2*intermediate]` buffer
+// produced by a single fused gate+up GEMM. Any DSL occurrence of
+// `Silu`/`Mul` outside the `(gemm, gemm, silu, mul)` MLP pattern
+// would need its own dedicated kernel + Impl — until such an op
+// exists there is no structural-fallback worth providing, and an
+// unmatched Silu/Mul is a library bug the solver reports via
+// `SolveError::UnclaimedTile`.
+//
+// See `FusedGateUpSiluMulImpl` below for the matcher that claims
+// the MLP pattern.
+
+/// Baseline library: HostCallback impl per OpKind plus the
+/// multi-tile fusions the `ferrite-kernels` shape requires.
+/// Replaced / augmented by calibrated target-specific impls as
+/// they're ported.
 pub fn starter_library() -> ImplementationLibrary {
     let mut lib = ImplementationLibrary::new();
     lib.push(Box::new(EmbedRefImpl));
@@ -893,10 +978,295 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(GemmRefImpl));
     lib.push(Box::new(RopeAppendRefImpl));
     lib.push(Box::new(AttentionRefImpl));
-    lib.push(Box::new(SiluRefImpl));
     lib.push(Box::new(AddRefImpl));
-    lib.push(Box::new(MulRefImpl));
+    // Multi-tile fusions. Must come after the singletons so that the
+    // solver's cost-sort still picks them (they claim more tiles at
+    // lower per-tile cost). No `Silu`/`Mul` singletons exist — the
+    // only kernel path is this 4-tile fused claim.
+    lib.push(Box::new(FusedGateUpSiluMulImpl));
     lib
+}
+
+// ── FusedGateUpSiluMulImpl ───────────────────────────────────────
+//
+// Multi-tile impl claiming the `(Gemm, Gemm, Silu, Mul)` MLP
+// pattern and mapping it to the `silu_and_mul_fused` kernel (which
+// expects a packed `[num_tokens, 2*intermediate]` buffer).
+//
+// Match is purely structural — no phase tags, no weight-name
+// checks. Pattern: two Gemm tiles sharing the same activation
+// Tile-input feed a Silu and a Mul, with the Mul consuming the
+// Silu output and the second Gemm output. Survives renaming
+// gate_proj/up_proj → anything and survives adding new
+// architectures that reuse the same topology.
+//
+// The impl declares one fused WeightBundle accessor (see
+// `required_weights`) whose `rust_type` is `LinearLayer`. The user
+// populates it with a `LinearLayer` carrying the vertically-
+// concatenated `[gate_proj | up_proj]` weight; `LinearLayer::forward`
+// on that produces the packed `gate_up` buffer `silu_and_mul_fused`
+// wants. No intermediate D2D copies; no cross-impl contract.
+
+#[derive(Debug, Default)]
+pub struct FusedGateUpSiluMulImpl;
+
+/// Return the `(TileId, slot)` of a node's first `FufInput::Tile`
+/// input. For Gemm this identifies the activation (the weight input
+/// is a `FufInput::Weight`).
+fn first_tile_input(node: &crate::fuf::FufNode) -> Option<(TileId, u8)> {
+    node.inputs.iter().find_map(|i| match i {
+        FufInput::Tile { id, slot } => Some((*id, *slot)),
+        _ => None,
+    })
+}
+
+/// The `WeightId` + concrete index read by the first weight-typed
+/// input of a tile. For Gemm the weight is in slot 1 of the DSL's
+/// call; we don't care about position, just "which weight flows in".
+fn first_weight_ref(node: &crate::fuf::FufNode) -> Option<(WeightId, Option<u64>)> {
+    node.inputs.iter().find_map(|i| match i {
+        FufInput::Weight { id, index } => Some((*id, *index)),
+        _ => None,
+    })
+}
+
+/// Build a stable, structural accessor name covering multiple
+/// source weights. Joins each source weight's
+/// [`weight_field_name`] with `"__fused__"`, sorted for
+/// order-independence. Two impls that declare the same source set
+/// produce the same name.
+pub fn fused_accessor_name(program: &Program, sources: &[(WeightId, Option<u64>)]) -> syn::Ident {
+    let mut parts: Vec<String> = sources
+        .iter()
+        .map(|(id, idx)| weight_field_name(program, *id, *idx).to_string())
+        .collect();
+    parts.sort();
+    let joined = parts.join("__fused__");
+    syn::Ident::new(&joined, proc_macro2::Span::call_site())
+}
+
+impl Implementation for FusedGateUpSiluMulImpl {
+    fn name(&self) -> &'static str {
+        "fused_gate_up_silu_mul"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Seed on the **gate** Gemm — the Gemm whose output feeds a
+        // Silu. The FUF's topological order processes Gemms before
+        // their downstream Silu/Mul consumers, so seeding on the
+        // upstream Gemm commits the 4-tile claim before the DP
+        // reaches (and would singleton-claim) the Silu. Seeding on
+        // Silu instead would leave the solver's per-tile greedy
+        // picking GemmRefImpl at the gate_gemm's earlier position
+        // and orphaning the downstream Silu/Mul — see the
+        // larger-claim-preferred sort in solver.rs:solve_one.
+        let gate_gemm = fuf.get(seed);
+        if gate_gemm.op != OpKind::Gemm {
+            return None;
+        }
+
+        // Find a downstream Silu consuming this Gemm.
+        let silu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Silu && consumes_tile(n, seed))?;
+        let silu_id = silu_node.id;
+
+        // Find the Mul consuming that Silu.
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, silu_id))?;
+        let mul_id = mul_node.id;
+
+        // Mul's other Tile input is the up Gemm.
+        let up_gemm_id = mul_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != silu_id => Some(*id),
+            _ => None,
+        })?;
+        let up_gemm = fuf.get(up_gemm_id);
+        if up_gemm.op != OpKind::Gemm {
+            return None;
+        }
+
+        // Both Gemms must read the same activation tile + slot.
+        if first_tile_input(gate_gemm)? != first_tile_input(up_gemm)? {
+            return None;
+        }
+
+        // Claimed tiles sorted by TileId for determinism.
+        let mut claimed = [seed, up_gemm_id, silu_id, mul_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+
+        let activation_tile = first_tile_input(gate_gemm)?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation_tile],
+            boundary_outputs: vec![mul_id],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Cost = one fused GEMM (M × 2I × H) + one elementwise pass
+        // over the packed [M, 2I] buffer producing [M, I].
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as f64;
+
+        // Compute-bound GEMM.
+        let flops = 2.0 * num_tokens * (2.0 * intermediate) * hidden;
+        let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+        let gemm_us = if peak > 0.0 && flops > 0.0 {
+            (flops / peak) * 1e6
+        } else {
+            0.0
+        };
+
+        // Bandwidth-bound silu*mul: read 2*M*I, write M*I, bf16 = 2 B.
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 3.0 * num_tokens * intermediate * BYTES_PER_ELEM;
+        let silu_mul_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+
+        gemm_us + silu_mul_us
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Collect the two Gemm tiles' weight refs, merge into one
+        // fused accessor. The user provides a `LinearLayer` whose
+        // weight is the vertically-concatenated `[gate_proj | up_proj]`.
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Identify the four tiles by op kind. The claim is sorted by
+        // TileId (see `matches`); emission is independent of order.
+        let silu_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Silu)
+            .expect("fused gate/up/silu/mul claim must contain Silu");
+        let mul_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
+            .expect("fused gate/up/silu/mul claim must contain Mul");
+        // Gate gemm = Silu's Tile input; up gemm = the other claimed Gemm.
+        let (gate_id, _) =
+            first_tile_input(ctx.fuf.get(silu_id)).expect("silu has a tile input — the gate gemm");
+        let up_id = ctx
+            .claimed_tiles
+            .iter()
+            .copied()
+            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
+            .expect("claim contains a second Gemm — the up gemm");
+
+        // The shared activation — same Tile-input on both Gemms.
+        let activation = ctx.input_expr(gate_id, 0);
+
+        // Fused-weight accessor. Recompute the name from the claim
+        // (matches `required_weights`), so user-provided trait impl
+        // and emit are kept in lockstep.
+        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
+        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
+        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let mul_out = ctx.output_ident(mul_id, 0);
+        let gate_up_ident = quote::format_ident!("__fused_gate_up_{}", mul_id.0);
+        let intermediate = ctx.bound("intermediate_size") as usize;
+
+        quote! {
+            // Fused gate+up GEMM producing a [num_tokens, 2*intermediate]
+            // buffer. The user's WeightBundle returns a LinearLayer
+            // whose weight is the vertically-concatenated
+            // [gate_proj | up_proj].
+            let #gate_up_ident = unsafe {
+                (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+            // SiLU(gate) * up, reading the packed buffer and writing
+            // a [num_tokens, intermediate] output.
+            let #mul_out = unsafe {
+                ::ferrite_kernels::kernels::silu_and_mul_fused(
+                    *#gate_up_ident,
+                    #intermediate,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+/// Whether `node` consumes the output of `producer` via any Tile input.
+fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
+    node.inputs
+        .iter()
+        .any(|i| matches!(i, FufInput::Tile { id, .. } if *id == producer))
 }
 
 #[cfg(test)]

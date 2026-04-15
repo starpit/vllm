@@ -20,6 +20,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use crate::classified::{ExternKind, Program, WeightId};
+use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 
 /// State threaded through per-subgraph emission: names of the Rust
@@ -35,6 +36,10 @@ pub type LocalMap = HashMap<(TileId, u8), syn::Ident>;
 pub struct EmitCtx<'a> {
     pub fuf: &'a Fuf,
     pub program: &'a Program,
+    /// Model being emitted — gives impls read-access to bounds
+    /// (intermediate_size, hidden_size, head_dim, …) when shaping
+    /// kernel arguments.
+    pub model: &'a ModelParams,
     /// Tiles this subgraph claims, in topological order (the order
     /// the DP committed them).
     pub claimed_tiles: &'a [TileId],
@@ -53,6 +58,26 @@ impl<'a> EmitCtx<'a> {
     /// FUF node for a claimed tile.
     pub fn node(&self, tile: TileId) -> &FufNode {
         self.fuf.get(tile)
+    }
+
+    /// Rust expression invoking a [`crate::impl_lib::WeightAccessor`]
+    /// by name on the enclosing `wm: &impl WeightBundle`. Impls that
+    /// override `required_weights` reference their declared
+    /// accessors through this rather than constructing field idents
+    /// ad hoc.
+    pub fn weight_accessor(&self, name: &syn::Ident) -> TokenStream {
+        quote! { wm.#name() }
+    }
+
+    /// Read a model-wide integer bound (e.g. `intermediate_size`,
+    /// `head_dim`). Panics if the key is missing — callers know the
+    /// keys they need by DSL / conventions.
+    pub fn bound(&self, key: &str) -> u64 {
+        *self
+            .model
+            .bounds
+            .get(key)
+            .unwrap_or_else(|| panic!("model has no bound `{key}` in config.json"))
     }
 
     /// Rust expression that evaluates to the Nth input of `tile`.

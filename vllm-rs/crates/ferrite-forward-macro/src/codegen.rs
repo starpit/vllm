@@ -33,80 +33,83 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::classified::{OpKind, Program, WeightId};
+use crate::classified::Program;
 use crate::config::ModelParams;
-use crate::emit::{EmitCtx, LocalMap, weight_field_name};
-use crate::fuf::{Fuf, FufInput};
+use crate::emit::{EmitCtx, LocalMap};
+use crate::fuf::Fuf;
 use crate::impl_lib::ImplementationLibrary;
 use crate::schedule::{Loop, WorkloadLoops};
 use crate::solver::{Assignment, WorkloadAssignments};
 
 // ── WeightBundle emission ────────────────────────────────────────
 
-/// Derive the flat set of `(WeightId, concrete_index)` pairs the
-/// FUF references. Each pair becomes one field on the emitted
-/// `WeightBundle` trait. Fields are named by joining the weight's
-/// dotted path with its concrete index (if any).
-fn weight_instances(fuf: &Fuf) -> Vec<(WeightId, Option<u64>)> {
-    let mut seen: Vec<(WeightId, Option<u64>)> = Vec::new();
-    for node in &fuf.nodes {
-        for input in &node.inputs {
-            if let FufInput::Weight { id, index } = input {
-                let key = (*id, *index);
-                if !seen.contains(&key) {
-                    seen.push(key);
-                }
+/// Emit the per-model `WeightBundle` trait: the union of every
+/// [`crate::impl_lib::WeightAccessor`] declared by every picked
+/// Impl across every workload bucket's SFUF.
+///
+/// Each picked Impl calls [`crate::impl_lib::Implementation::required_weights`]
+/// for its claim; we aggregate, dedupe by name, and enforce that
+/// any two declarations sharing a name also agree on rust_type
+/// (otherwise a compile_error is emitted).
+///
+/// Iteration is stable (BTreeMap keyed on name string) for
+/// reproducible builds.
+fn emit_weight_bundle_trait(
+    program: &Program,
+    fuf: &Fuf,
+    sfufs: &WorkloadAssignments,
+    lib: &ImplementationLibrary,
+) -> TokenStream {
+    // name → (ident, rust_type_tokens, rust_type_string_for_collision_check).
+    let mut by_name: BTreeMap<String, (syn::Ident, TokenStream, String)> = BTreeMap::new();
+    let mut conflicts: Vec<String> = Vec::new();
+
+    for sfuf in sfufs.per_num_tokens.values() {
+        for sg in sfuf.subgraphs() {
+            let imp_id = sfuf
+                .impl_of(sg)
+                .expect("solver committed an impl for every subgraph");
+            let claimed = sfuf.tiles_in_subgraph(sg);
+            let imp = lib.get(imp_id);
+            for acc in imp.required_weights(&claimed, fuf, program) {
+                let key = acc.name.to_string();
+                let ty_str = acc.rust_type.to_string();
+                by_name
+                    .entry(key.clone())
+                    .and_modify(|(_, _, existing_ty)| {
+                        if *existing_ty != ty_str {
+                            conflicts.push(format!(
+                                "WeightBundle accessor `{key}` declared with \
+                                 conflicting types: `{existing_ty}` vs `{ty_str}`"
+                            ));
+                        }
+                    })
+                    .or_insert((acc.name.clone(), acc.rust_type.clone(), ty_str));
             }
         }
     }
-    seen
-}
 
-/// Emit the per-model `WeightBundle` trait: one accessor method
-/// per weight instance, returning a `&Linear` / `&Embedding` /
-/// `&RmsNorm` as appropriate for the op that consumes it.
-fn emit_weight_bundle_trait(program: &Program, fuf: &Fuf) -> TokenStream {
-    let instances = weight_instances(fuf);
-
-    // For each weight instance, derive the runtime type from the
-    // op that consumes it. If a weight is consumed in multiple
-    // ops with incompatible types, error out loudly.
-    let mut consumer_op: HashMap<(WeightId, Option<u64>), OpKind> = HashMap::new();
-    for node in &fuf.nodes {
-        for input in &node.inputs {
-            if let FufInput::Weight { id, index } = input {
-                consumer_op.insert((*id, *index), node.op);
-            }
-        }
+    if !conflicts.is_empty() {
+        let msg = conflicts.join("\n");
+        return quote! { compile_error!(#msg); };
     }
 
-    let methods = instances.iter().map(|key| {
-        let name = weight_field_name(program, key.0, key.1);
-        let ty = match consumer_op.get(key).copied() {
-            Some(OpKind::Embed) => quote! { ::ferrite_kernels::layers::Embedding },
-            Some(OpKind::RmsNorm) => quote! { ::ferrite_kernels::layers::RmsNorm },
-            Some(OpKind::Gemm) => quote! { ::ferrite_kernels::layers::LinearLayer },
-            // Other ops don't take weights; fall through to a
-            // generic tensor reference. (Only fires if the DSL
-            // references a weight in an unexpected position.)
-            _ => quote! { ::ferrite_cuda_core::tensor::GpuTensor },
-        };
-        quote! {
-            fn #name(&self) -> &#ty;
-        }
+    let methods = by_name.values().map(|(name, ty, _)| {
+        quote! { fn #name(&self) -> &#ty; }
     });
 
     quote! {
         /// Accessor trait the caller implements to expose each
-        /// referenced weight to the emitted forward. One method
-        /// per (weight-path, concrete-layer-index) pair the DSL
-        /// touched. Field types are the ferrite-kernels layer
-        /// wrappers matching the op the weight flows into.
+        /// weight the emitted forward needs. One method per
+        /// accessor declared by any picked Implementation in any
+        /// workload bucket. The return type is what the picking
+        /// Impl asked for; fused impls may declare a single
+        /// accessor covering multiple DSL weights.
         pub trait WeightBundle {
             #(#methods)*
         }
@@ -121,6 +124,7 @@ fn emit_forward_for_bucket(
     sfuf: &Assignment,
     loop_ir: &Loop,
     program: &Program,
+    model: &ModelParams,
     lib: &ImplementationLibrary,
     num_tokens: u64,
 ) -> TokenStream {
@@ -142,6 +146,7 @@ fn emit_forward_for_bucket(
             let ctx = EmitCtx {
                 fuf,
                 program,
+                model,
                 claimed_tiles: &claimed,
                 locals: &locals,
             };
@@ -190,7 +195,7 @@ pub fn emit_model(
     loops: &WorkloadLoops,
     lib: &ImplementationLibrary,
 ) -> TokenStream {
-    let weight_bundle_trait = emit_weight_bundle_trait(program, fuf);
+    let weight_bundle_trait = emit_weight_bundle_trait(program, fuf, sfufs, lib);
 
     let bucket_fns: Vec<TokenStream> = sfufs
         .per_num_tokens
@@ -200,7 +205,7 @@ pub fn emit_model(
                 .per_num_tokens
                 .get(m)
                 .expect("schedule populated every key");
-            emit_forward_for_bucket(fuf, sfuf, loop_ir, program, lib, *m)
+            emit_forward_for_bucket(fuf, sfuf, loop_ir, program, model, lib, *m)
         })
         .collect();
 
@@ -216,8 +221,6 @@ pub fn emit_model(
             quote! { #lit => unsafe { #fn_name(wm, ctx, device) }, }
         })
         .collect();
-
-    let _ = (model, Span::call_site());
 
     // Returns the items that go inside the per-model module. The
     // caller (lib.rs) concatenates these with the stub's

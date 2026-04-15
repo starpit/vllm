@@ -79,11 +79,16 @@ enum FieldLoad {
     LinearDense(String),
     /// `LinearLayer::load_dense_concat(gw, &[prefix0, prefix1, ...], stream)`.
     LinearConcat(Vec<String>),
+    /// The model has `tie_word_embeddings: true`: `lm_head` shares
+    /// its weight with `embed_tokens`. No safetensors read — build
+    /// the `LinearLayer` from the already-loaded embedding field
+    /// whose name is carried here.
+    LinearTiedToEmbedding(syn::Ident),
 }
 
 /// Distill a `WeightAccessor` into its field-load plan. Uses the
 /// accessor's declared `rust_type` + `source_weights` and the
-/// model's bounds (for `rms_norm_eps`).
+/// model's config (for `rms_norm_eps` / `tie_word_embeddings`).
 fn plan_field_load(accessor: &WeightAccessor, program: &Program, model: &ModelParams) -> FieldLoad {
     let ty = accessor.rust_type.to_string().replace(' ', "");
     let is_embedding =
@@ -119,6 +124,23 @@ fn plan_field_load(accessor: &WeightAccessor, program: &Program, model: &ModelPa
         let eps = rms_norm_eps(model);
         FieldLoad::RmsNorm(prefixes.into_iter().next().unwrap(), eps)
     } else if is_linear {
+        // Tied-embedding special case: if this accessor is the
+        // `lm_head` and the model's config.json has
+        // `tie_word_embeddings: true`, there's no lm_head weight in
+        // safetensors — its buffer is shared with `embed_tokens`.
+        // HF convention: every decoder-only model that ties them
+        // calls the sharing field `embed_tokens`; the macro looks
+        // up that field by name.
+        if accessor.name == "lm_head"
+            && prefixes.len() == 1
+            && prefixes[0] == "lm_head"
+            && tie_word_embeddings(model)
+        {
+            return FieldLoad::LinearTiedToEmbedding(syn::Ident::new(
+                "embed_tokens",
+                proc_macro2::Span::call_site(),
+            ));
+        }
         if prefixes.len() == 1 {
             FieldLoad::LinearDense(prefixes.into_iter().next().unwrap())
         } else {
@@ -154,6 +176,20 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
         .and_then(|x| x.as_f64())
         .map(|x| x as f32)
         .unwrap_or(fallback)
+}
+
+fn tie_word_embeddings(model: &ModelParams) -> bool {
+    // HF convention: if set, lm_head reuses embed_tokens.weight; no
+    // separate `lm_head.weight` tensor in safetensors.
+    let Ok(s) = std::fs::read_to_string(&model.source_path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return false;
+    };
+    v.get("tie_word_embeddings")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
 }
 
 /// Aggregate every unique WeightAccessor across every workload
@@ -220,28 +256,55 @@ fn emit_weights_struct(
         quote! { pub #name: #ty, }
     });
 
-    let loaders = accessors.iter().map(|a| {
-        let name = &a.name;
-        let plan = plan_field_load(a, program, model);
-        match plan {
-            FieldLoad::Embedding(prefix) => quote! {
-                #name: ::ferrite_kernels::layers::Embedding::load(gw, #prefix)?,
-            },
-            FieldLoad::RmsNorm(prefix, eps) => quote! {
-                #name: ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?,
-            },
-            FieldLoad::LinearDense(prefix) => quote! {
-                #name: ::ferrite_kernels::layers::LinearLayer::load_dense(gw, #prefix)?,
-            },
-            FieldLoad::LinearConcat(prefixes) => quote! {
-                #name: ::ferrite_kernels::layers::LinearLayer::load_dense_concat(
-                    gw,
-                    &[ #(#prefixes),* ],
-                    stream,
-                )?,
-            },
-        }
-    });
+    // Emit each field as its own let-binding in the load body.
+    // This lets later loaders reference earlier ones (e.g. a tied
+    // `lm_head` reads `embed_tokens.weight`). Field order inside
+    // Self { .. } is irrelevant to Rust; let-binding order is what
+    // matters. `accessors` iterates BTreeMap-sorted — which puts
+    // `embed_tokens` before `lm_head` alphabetically, so the tied
+    // case works without a special sort.
+    let lets: Vec<TokenStream> = accessors
+        .iter()
+        .map(|a| {
+            let name = &a.name;
+            let plan = plan_field_load(a, program, model);
+            match plan {
+                FieldLoad::Embedding(prefix) => quote! {
+                    let #name = ::ferrite_kernels::layers::Embedding::load(gw, #prefix)?;
+                },
+                FieldLoad::RmsNorm(prefix, eps) => quote! {
+                    let #name = ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?;
+                },
+                FieldLoad::LinearDense(prefix) => quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense(gw, #prefix)?;
+                },
+                FieldLoad::LinearConcat(prefixes) => quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat(
+                        gw,
+                        &[ #(#prefixes),* ],
+                        stream,
+                    )?;
+                },
+                FieldLoad::LinearTiedToEmbedding(embed_ident) => quote! {
+                    // Tied embedding: lm_head reuses the
+                    // `#embed_ident` field's weight tensor. Shape
+                    // [vocab_size, hidden_size] works for both
+                    // Embedding (gather rows) and LinearLayer
+                    // (matmul against hidden_size). No bias.
+                    let #name = ::ferrite_kernels::layers::LinearLayer::Dense(
+                        ::ferrite_kernels::layers::Linear::new(
+                            #embed_ident.weight,
+                            None,
+                        )
+                    );
+                },
+            }
+        })
+        .collect();
+
+    // `Self { a, b, c }` shorthand — fields are the just-bound
+    // locals, in the same order we declared the struct fields.
+    let field_shorthand: Vec<&syn::Ident> = accessors.iter().map(|a| &a.name).collect();
 
     quote! {
         /// Every weight the emitted forward needs, already packed
@@ -260,12 +323,14 @@ fn emit_weights_struct(
             /// safetensors view). Fused accessors stream their
             /// source weights directly into one packed GPU buffer
             /// without intermediate allocation.
+            #[allow(clippy::too_many_lines, unused_variables)]
             pub fn load(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
             ) -> ::anyhow::Result<Self> {
+                #(#lets)*
                 Ok(Self {
-                    #(#loaders)*
+                    #(#field_shorthand),*
                 })
             }
         }

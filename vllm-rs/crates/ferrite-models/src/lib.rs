@@ -7,9 +7,14 @@
 //! Ferrite model architectures.
 //!
 //! `llama.rs` uses the new `#[forward]` macro (ferrite-forward).
-//! `qwen2.rs` still uses the legacy `ferrite_macros::forward!{}`;
-//! it's blocked on Step C (bias-fused QKV Impl) per HANDOFF.md.
+//!
+//! `qwen2.rs` is gated off: its `ferrite_macros::forward!{}` runs
+//! the pre-DP backtrack-CP solver which dominates compile time
+//! (minutes per edit). It's blocked on HANDOFF.md Step C
+//! (`CublasFusedQkvGemmWithBiasImpl`, gap #5) before it can move
+//! to `#[forward]`. Until then, vllm-cuda routes Qwen2 through the
+//! hand-written `Qwen2ForCausalLM` path — nothing consumes this
+//! file's output.
 
 pub mod llama;
-#[cfg(feature = "cuda")]
-pub mod qwen2;
+// pub mod qwen2;  // re-enable when Step C lands.

@@ -592,14 +592,20 @@ macro_rules! trivial_impl {
 // impls replace these reference entries.
 
 fn emit_embed(ctx: &EmitCtx) -> TokenStream {
+    // kernels::embedding_gather(weight: GpuTensor, input_ids:
+    // GpuTensor, alloc, stream) -> OwnedTensor. Weight comes from
+    // the bundle as `&Embedding` (struct with .weight: GpuTensor);
+    // input_ids comes from ctx as TensorView, deref'd to GpuTensor
+    // via the Copy impl on GpuTensor.
     let tile = ctx.primary();
     let out = ctx.output_ident(tile, 0);
     let ids = ctx.input_expr(tile, 0);
     let weight = ctx.input_expr(tile, 1);
     quote! {
         let #out = unsafe {
-            (#weight).forward(
-                #ids,
+            ::ferrite_kernels::kernels::embedding_gather(
+                (#weight).weight,
+                *(#ids),
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -608,14 +614,18 @@ fn emit_embed(ctx: &EmitCtx) -> TokenStream {
 }
 
 fn emit_rmsnorm(ctx: &EmitCtx) -> TokenStream {
+    // kernels::rms_norm(input: GpuTensor, weight: GpuTensor,
+    // eps: f32, alloc, stream) -> OwnedTensor. Input is a
+    // TensorView we deref to GpuTensor; weight is `&RmsNorm`
+    // (fields .weight: GpuTensor, .eps: f32).
     let tile = ctx.primary();
     let out = ctx.output_ident(tile, 0);
     let x = ctx.input_expr(tile, 0);
     let w = ctx.input_expr(tile, 1);
     quote! {
         let #out = unsafe {
-            ::ferrite_kernels::kernels::rms_norm_forward_owned(
-                #x,
+            ::ferrite_kernels::kernels::rms_norm(
+                *(#x),
                 (#w).weight,
                 (#w).eps,
                 &mut device.caching,

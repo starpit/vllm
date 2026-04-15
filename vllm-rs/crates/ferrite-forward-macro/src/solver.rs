@@ -433,20 +433,17 @@ mod tests {
             );
             // Fusion savings per layer:
             //   SwiGLU (gate, up, silu, mul) → 1 subgraph (saves 3)
+            //   QKV + rope (q, k, v gemms + rope_append) → 1 (saves 3)
             //   attn-residual Add + post_attn_layernorm → 1 (saves 1)
             //   MLP-residual Add + next-layer input_layernorm (or
             //     final norm, on the last layer) → 1 (saves 1)
-            // Total: 5 fewer subgraphs per layer. The first layer's
-            // input_layernorm has no preceding Add (its upstream is
-            // embed), so it stays a singleton — already accounted for
-            // by the 5*NL count because the LAST Add's fusion partner
-            // is the post-loop final RmsNorm.
+            // Total: 8 fewer subgraphs per layer.
             let nl = params.bounds["num_hidden_layers"] as usize;
             assert_eq!(
                 sfuf.num_subgraphs(),
-                fuf.len() - 5 * nl,
-                "expected 5*NL fewer subgraphs than tiles at m={m} \
-                 (SwiGLU + attn-residual + mlp-residual fusions)"
+                fuf.len() - 8 * nl,
+                "expected 8*NL fewer subgraphs than tiles at m={m} \
+                 (SwiGLU + QKV-rope + attn-residual + mlp-residual fusions)"
             );
             assert!(
                 sfuf.predicted_us > 0.0 && sfuf.predicted_us.is_finite(),
@@ -510,6 +507,86 @@ mod tests {
                 "expected one fused SwiGLU subgraph per layer at m={m}",
             );
         }
+    }
+
+    #[test]
+    fn qkv_rope_claimed_as_fused_subgraph_per_layer() {
+        // Every attention block's (q_gemm, k_gemm, v_gemm, rope_append)
+        // quadruple must collapse into one FusedQkvRopeCacheImpl
+        // subgraph. Structural — three Gemms share an activation and
+        // feed the RopeAppend's first three Tile slots.
+        let params = llama_params("llama-3.1-8b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512, 4096],
+        )
+        .unwrap();
+
+        let nl = params.bounds["num_hidden_layers"] as usize;
+
+        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+            let mut fused_count = 0;
+            for sg in sfuf.subgraphs() {
+                let tiles = sfuf.tiles_in_subgraph(sg);
+                if tiles.len() != 4 {
+                    continue;
+                }
+                let ops: Vec<OpKind> = tiles.iter().map(|t| fuf.get(*t).op).collect();
+                let n_gemm = ops.iter().filter(|o| **o == OpKind::Gemm).count();
+                let n_rope = ops.iter().filter(|o| **o == OpKind::RopeAppend).count();
+                if n_gemm == 3 && n_rope == 1 {
+                    fused_count += 1;
+                    let imp_id = sfuf.impl_of(sg).unwrap();
+                    assert_eq!(
+                        lib.get(imp_id).name(),
+                        "fused_qkv_rope_cache",
+                        "subgraph at m={m} has QKV-rope topology but wrong impl",
+                    );
+                }
+            }
+            assert_eq!(
+                fused_count, nl,
+                "expected one fused QKV+rope subgraph per layer at m={m}",
+            );
+        }
+    }
+
+    #[test]
+    fn fused_qkv_accessor_covers_three_source_weights() {
+        // FusedQkvRopeCacheImpl declares one packed LinearLayer
+        // accessor whose source_weights lists q_proj, k_proj, v_proj
+        // for the matched layer.
+        let params = llama_params("llama-3.2-1b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
+        let sfuf = &workloads.per_num_tokens[&1];
+        // First QKV-fused subgraph.
+        let qkv_sg = sfuf
+            .subgraphs()
+            .find(|sg| {
+                let tiles = sfuf.tiles_in_subgraph(*sg);
+                tiles.len() == 4 && tiles.iter().any(|t| fuf.get(*t).op == OpKind::RopeAppend)
+            })
+            .expect("at least one fused QKV subgraph");
+        let claim = sfuf.tiles_in_subgraph(qkv_sg);
+        let imp = lib.get(sfuf.impl_of(qkv_sg).unwrap());
+        let decls = imp.required_weights(&claim, &fuf, &classify_program(LLAMA_BODY));
+        assert_eq!(decls.len(), 1, "one fused accessor per claim");
+        assert_eq!(
+            decls[0].source_weights.len(),
+            3,
+            "fused QKV accessor covers q_proj, k_proj, v_proj (3 sources)"
+        );
     }
 
     #[test]

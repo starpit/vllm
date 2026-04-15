@@ -760,24 +760,12 @@ fn emit_gemm(ctx: &EmitCtx) -> TokenStream {
     }
 }
 
-fn emit_rope_append(ctx: &EmitCtx) -> TokenStream {
-    let tile = ctx.primary();
-    let q_out = ctx.output_ident(tile, 0);
-    let k_out = ctx.output_ident(tile, 1);
-    let v_out = ctx.output_ident(tile, 2);
-    let ins = ctx.all_input_exprs(tile);
-    let (q, k, v, pos, rotary, kv) = (&ins[0], &ins[1], &ins[2], &ins[3], &ins[4], &ins[5]);
-    quote! {
-        let (#q_out, #k_out, #v_out) = unsafe {
-            ::ferrite_kernels::kernels::rope_append_kv(
-                #q, #k, #v, #pos, #rotary, #kv,
-                ctx.slot_mapping,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
-    }
-}
+// No standalone `emit_rope_append`. The only ferrite-kernels path for
+// "apply rotary + write KV to paged cache" is `fused_qkv_rope_cache`,
+// which expects the QKV projections already fused into one packed
+// tensor. `FusedQkvRopeCacheImpl` below claims the whole 4-tile
+// pattern `(Gemm, Gemm, Gemm, RopeAppend)` structurally — so every
+// DSL `rope_append` in Llama/Qwen2 is covered.
 
 fn emit_attention(ctx: &EmitCtx) -> TokenStream {
     let tile = ctx.primary();
@@ -910,14 +898,6 @@ trivial_impl!(
     true
 );
 trivial_impl!(
-    RopeAppendRefImpl,
-    OpKind::RopeAppend,
-    "rope_append_ref",
-    elementwise_cost,
-    emit_rope_append,
-    false
-);
-trivial_impl!(
     AttentionRefImpl,
     OpKind::Attention,
     "attention_ref",
@@ -947,7 +927,6 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
     lib.push(Box::new(GemmRefImpl));
-    lib.push(Box::new(RopeAppendRefImpl));
     lib.push(Box::new(AttentionRefImpl));
     // Multi-tile fusions. The solver's claim-size-DESC sort picks
     // these over singleton coverage when both apply; the singletons
@@ -956,6 +935,7 @@ pub fn starter_library() -> ImplementationLibrary {
     // `embed` not `Add`, stays a singleton RmsNorm claim).
     lib.push(Box::new(FusedGateUpSiluMulImpl));
     lib.push(Box::new(FusedAddRmsNormImpl));
+    lib.push(Box::new(FusedQkvRopeCacheImpl));
     lib
 }
 
@@ -1426,6 +1406,306 @@ impl Implementation for FusedAddRmsNormImpl {
             // residual buffer.
             let #rmsnorm_out = (#delta_upstream).view();
             let #add_out = (#residual_upstream).view();
+        }
+    }
+}
+
+// ── FusedQkvRopeCacheImpl ────────────────────────────────────────
+//
+// Multi-tile impl claiming `(Gemm, Gemm, Gemm, RopeAppend)` where:
+//   - the three Gemms share the same activation Tile-input, and
+//   - each Gemm's output feeds one of the RopeAppend's first three
+//     Tile-input slots (slot 0 = q, 1 = k, 2 = v).
+//
+// Maps to a fused cuBLAS QKV GEMM producing a packed
+// `[num_tokens, q_size + 2*kv_size]` buffer, followed by
+// `ferrite_kernels::fused_qkv_rope_cache` which applies RoPE to Q and
+// K, writes K/V to the paged cache at the matched layer, and returns
+// Q as an OwnedTensor. Structural match, no "GemmQ/K/V" phase tags.
+//
+// Declared WeightAccessor: one packed `LinearLayer` covering all
+// three Q/K/V projections. Users concatenate the three weights at
+// load time. Eliminates the old cross-impl contract between separate
+// Gemm and QkvSplit impls.
+//
+// Seed on Gemm (upstream in topo order). Matcher fires at any of the
+// three Q/K/V gemms; whichever seeds first wins (topo order), and the
+// other two are swallowed by the same claim.
+
+#[derive(Debug, Default)]
+pub struct FusedQkvRopeCacheImpl;
+
+/// Read the layer index captured by the DSL's `kv_cache[layer]`
+/// reference on a RopeAppend tile. Returns `None` if the tile has
+/// no KvCache extern input (shouldn't happen for real RopeAppends).
+fn rope_kv_cache_layer(node: &crate::fuf::FufNode) -> Option<u64> {
+    node.inputs.iter().find_map(|i| match i {
+        FufInput::Extern {
+            kind: crate::classified::ExternKind::KvCache,
+            index: Some(layer),
+        } => Some(*layer),
+        _ => None,
+    })
+}
+
+impl Implementation for FusedQkvRopeCacheImpl {
+    fn name(&self) -> &'static str {
+        "fused_qkv_rope_cache"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let seed_node = fuf.get(seed);
+        if seed_node.op != OpKind::Gemm {
+            return None;
+        }
+
+        // Find a RopeAppend whose first three Tile inputs all point
+        // at Gemm tiles sharing a common activation. The seed must
+        // be one of those three Gemms.
+        let rope_node = fuf.nodes.iter().find(|n| {
+            if n.op != OpKind::RopeAppend || n.inputs.len() < 3 {
+                return false;
+            }
+            // First three inputs must all be Tile references.
+            let qkv: Vec<TileId> = n
+                .inputs
+                .iter()
+                .take(3)
+                .filter_map(|i| match i {
+                    FufInput::Tile { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            if qkv.len() != 3 {
+                return false;
+            }
+            if !qkv.contains(&seed) {
+                return false;
+            }
+            // All three must be Gemms.
+            if qkv.iter().any(|t| fuf.get(*t).op != OpKind::Gemm) {
+                return false;
+            }
+            // All three must share the same activation (first Tile input).
+            let act = first_tile_input(fuf.get(qkv[0]));
+            act.is_some() && qkv.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
+        })?;
+        let rope_id = rope_node.id;
+
+        // Extract the three Gemm tile ids.
+        let qkv_ids: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        let mut claimed: Vec<TileId> = qkv_ids
+            .iter()
+            .copied()
+            .chain(std::iter::once(rope_id))
+            .collect();
+        claimed.sort();
+
+        let activation = first_tile_input(fuf.get(qkv_ids[0]))?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation],
+            // Only slot 0 (Q) is read by tiles outside the claim —
+            // K/V slots flow to the paged cache and the downstream
+            // Attention kernel reads them from there (C4). Declaring
+            // all three for now preserves dep tracking; C4 elides.
+            boundary_outputs: vec![rope_id],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let m = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let num_q_heads = ctx.bounds.get("num_attention_heads").copied().unwrap_or(0) as f64;
+        let num_kv_heads = ctx.bounds.get("num_key_value_heads").copied().unwrap_or(0) as f64;
+        let head_dim = ctx.bounds.get("head_dim").copied().unwrap_or(0) as f64;
+        // q_size = num_q_heads * head_dim; kv_size = num_kv_heads * head_dim.
+        let n = (num_q_heads + 2.0 * num_kv_heads) * head_dim;
+
+        let flops = 2.0 * m * n * hidden;
+        let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+        let gemm_us = if peak > 0.0 && flops > 0.0 {
+            (flops / peak) * 1e6
+        } else {
+            0.0
+        };
+
+        // Rope + cache write: bandwidth-bound, read packed QKV +
+        // write rotated Q + K/V to cache.
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 3.0 * m * n * BYTES_PER_ELEM;
+        let rope_cache_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+
+        gemm_us + rope_cache_us
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Collect the three Gemms' weight refs → one fused accessor.
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Identify the RopeAppend tile and the three Gemms by op kind.
+        let rope_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim must contain a RopeAppend");
+        let rope_node = ctx.fuf.get(rope_id);
+
+        // The three Gemms are rope_node.inputs[0..3]'s tile ids.
+        let qkv_ids: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
+        // Use first Gemm (q_gemm) as the "representative" for activation.
+        let gate_gemm_id = qkv_ids[0];
+        let activation = ctx.input_expr(gate_gemm_id, 0);
+
+        // Fused weight accessor — name reconstructed from claim.
+        let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
+            .iter()
+            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+            .collect();
+        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        // Config-derived kernel args.
+        let hidden = ctx.bound("hidden_size") as usize;
+        let num_q_heads = ctx.bound("num_attention_heads") as usize;
+        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+        let head_dim = ctx.bound("head_dim") as usize;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+        let _ = hidden; // reserved for future checks
+
+        // Layer index — captured by the DSL's `kv_cache[layer]`.
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
+            as usize;
+
+        // Output idents:
+        //   q_out = rope.slot 0 (rotated Q, OwnedTensor returned by kernel)
+        //   k_out = rope.slot 1 (written to cache)
+        //   v_out = rope.slot 2 (written to cache)
+        // Downstream Attention (currently still a fake singleton — C4
+        // territory) will read k_out/v_out via `input_expr`, so bind
+        // them to layer-specific `TensorView` aliases on the paged
+        // cache. After C4 lands, Attention will ignore its K/V slots
+        // and those bindings become unused.
+        let q_out = ctx.output_ident(rope_id, 0);
+        let k_out = ctx.output_ident(rope_id, 1);
+        let v_out = ctx.output_ident(rope_id, 2);
+        let qkv_packed_ident = quote::format_ident!("__fused_qkv_{}", rope_id.0);
+
+        quote! {
+            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor.
+            let #qkv_packed_ident = unsafe {
+                (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+            // Fused RoPE + paged-cache write. Reads packed QKV, writes
+            // K and V into the layer's slices of the paged cache, and
+            // returns Q (rotated) as an OwnedTensor.
+            let #q_out = unsafe {
+                ::ferrite_kernels::kernels::fused_qkv_rope_cache(
+                    *#qkv_packed_ident,
+                    *ctx.positions,
+                    ctx.rotary.cos_sin_cache,
+                    *ctx.slot_mapping,
+                    ctx.kv_cache.k_cache(#layer),
+                    ctx.kv_cache.v_cache(#layer),
+                    #q_size,
+                    #kv_size,
+                    #num_q_heads,
+                    #head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+            // K/V aliases: the paged-cache layer slices. Consumed by
+            // the downstream Attention singleton today; will be unused
+            // once C4 replaces AttentionRefImpl with AttentionViaCacheImpl.
+            let #k_out = ctx.kv_cache.k_cache(#layer);
+            let #v_out = ctx.kv_cache.v_cache(#layer);
         }
     }
 }

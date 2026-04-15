@@ -106,16 +106,22 @@ fn solver_produced_finite_positive_cost_across_workloads() {
 }
 
 #[test]
-fn scheduler_merged_waves_below_subgraph_count() {
-    // Wavefront scheduling collapses mutually-independent subgraphs
-    // into shared waves — qkv gemms all read `normed` and are
-    // concurrent, so a wavefront schedule puts them in one wave.
-    // Wave count must therefore be strictly below subgraph count.
-    // (Bind to locals so clippy doesn't flag the const comparison.)
+fn scheduler_produces_linear_chain_on_fused_body() {
+    // The real Llama body post-fusion is a serial chain: every
+    // subgraph depends on the previous one. Q/K/V gemms that used to
+    // be parallel are now claimed by `FusedQkvRopeCacheImpl` as a
+    // single subgraph (their parallelism is consumed internally).
+    // Gate/up gemms that used to be parallel are likewise inside the
+    // `FusedGateUpSiluMulImpl` claim. Result: waves == subgraphs.
+    //
+    // If a future fusion leaves genuinely independent subgraphs, this
+    // test loosens — but for the current impl library the serial
+    // chain is the correct expectation.
     let waves: usize = llama::llama_3_2_1b::m_1::NUM_WAVES;
     let subgraphs: usize = llama::llama_3_2_1b::m_1::NUM_SUBGRAPHS;
-    assert!(
-        waves < subgraphs,
-        "waves ({waves}) should be fewer than subgraphs ({subgraphs}) — merging broken",
+    assert_eq!(
+        waves, subgraphs,
+        "post-fusion Llama body is a serial chain; waves must match subgraphs \
+         (waves={waves}, subgraphs={subgraphs})",
     );
 }

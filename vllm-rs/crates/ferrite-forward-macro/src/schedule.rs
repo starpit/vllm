@@ -219,6 +219,12 @@ mod tests {
         (fuf, sfuf)
     }
 
+    // Pre-rope attention body: Q/K/V projections without the
+    // `rope_append` or `attention` tiles. Keeping rope_append in the
+    // body would let `FusedQkvRopeCacheImpl` claim the three Gemms as
+    // one subgraph, erasing the Q/K/V parallelism the wave-merging
+    // tests below are inspecting. Dropping rope + attention lets the
+    // three Gemms stay singleton and share a wave.
     const ATTN_BODY: &str = r#"
         hidden_states = embed(input_ids, embed_tokens);
         for layer in 0..num_hidden_layers {
@@ -226,9 +232,7 @@ mod tests {
             q = gemm(normed, self_attn.q_proj[layer]);
             k = gemm(normed, self_attn.k_proj[layer]);
             v = gemm(normed, self_attn.v_proj[layer]);
-            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-            attn = attention(q, k, v, kv_cache[layer], block_table);
-            oproj = gemm(attn, self_attn.o_proj[layer]);
+            oproj = gemm(q, self_attn.o_proj[layer]);
             hidden_states = add(oproj, hidden_states);
         }
         // Post-loop final norm so the last iteration's Add has a

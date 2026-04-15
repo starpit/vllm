@@ -11,24 +11,117 @@
 - **Goal**: a forward-pass compiler. DSL body → solver picks
   kernels per tile → scheduler orders into wavefront LOOP → codegen
   emits Rust + CUDA. Replaces `ferrite-macros` + `ferrite-solver`.
-  vllm-cuda is **untouched**; the compiler's output plugs in at
-  the same call site the old ferrite output plugged in at.
 - **End-state proof**: `timeout 60 vllm chat --model=<small-llama>`
   produces coherent output through the new compiler at perf parity
-  with the existing path. Then Qwen2.
-- **Method**: port the working old ferrite (`ferrite-solver/`,
-  `ferrite-macros/`, `ferrite-kernels/`) verbatim, **detoxifying
-  as you port** — strip transformer-domain hardcoding, do not
-  rewrite mechanisms that already work.
-- **Current state**: all four fusion Impls ported. The library
-  covers every tile in realistic Llama bodies (Embed, RmsNorm,
-  Gemm, plus FusedGateUpSiluMul, FusedAddRmsNorm, FusedQkvRopeCache,
-  AttentionViaCache). `cargo build -p ferrite-forward --features
-  cuda --tests` is **green** — the emitted Llama forward fn
-  type-checks across all 9 configs × 5 workload buckets.
-  `ConcurrencyModel` ported; per-wave contention-aware cost
-  aggregation runs post-scheduler.
-- **Branch**: `worktree-ferrite-forward`. **HEAD**: `0cf1165fe`.
+  with the existing path. **Perf parity is load-bearing — without
+  the kernel-variant port in the gap table below, the new path is
+  strictly slower than old ferrite.**
+- **Method**: port the working old ferrite verbatim, detoxifying
+  as you port. Do not rewrite mechanisms that already work.
+- **Current state, honest version**: the scaffolding is in place
+  (parser, classifier, shape-inference, CFG/unroll, DP solver,
+  scheduler, codegen, WeightBundle emission). The framework works
+  for Llama topology — every DSL op has at least one Impl. But
+  the **library is a tiny fraction of the old one**: 7 Impls vs.
+  the old library's ~1,400 kernel variants. Cost model is
+  analytical estimates vs. the old CSV lookup against 55k rows of
+  measured sweep data. A prior session reported "library complete"
+  meaning topology coverage; that was a misread. See "Real gap
+  inventory" below.
+
+## Real gap inventory (what this compiler is missing vs old ferrite)
+
+Supersedes any earlier "library complete" language. Every gap
+below blocks perf parity on `vllm bench`; starred ones also block
+correctness or functionality.
+
+| # | Gap | Old | New | Impact |
+|---|---|---|---|---|
+| 1 | **Cutlass tile zoo** | 424 `CutlassGemmImpl` + 424 w/Residual + 424 w/SiluMul + 128 `CutlassGemvImpl` ≈ 1,400 variants | 0 | Perf parity — DP has nothing to optimize over |
+| 2 | **CSV cost tables** | `cost_l4_sm89.csv` (4k rows), `cost_l40s_sm89.csv` (16k), `cost_h100_sm90.csv` (32k); `GpuCostGrid` with `(M,N,K)` lookup + launch-overhead accounting | Analytical flops/bandwidth proxy | Solver picks blind |
+| 3 | **GEMV specialization for M=1 decode**\* | 128 `CutlassGemvImpl` variants | 0 | Decode latency regresses |
+| 4 | **SplitK / TB_K=64 variants** | 22 SplitK + 10 TB_K=64 per phase | 0 | L4 memory-bound shapes regress |
+| 5 | **Qwen2 fused-QKV-with-bias**\* | `CublasFusedQkvGemmWithBiasImpl` | 0 | Qwen2 DSL migration blocked |
+| 6 | **Cublas / cutlass gemm+residual fusion** | `CublasGemmExWithResidualImpl`, `CutlassGemmWithResidualImpl` (424 variants) | 0 | Extra launches vs. fused |
+| 7 | **Cutlass gemm+silu+mul fusion** | `CutlassGemmSiluMulImpl` (424 variants) | `FusedGateUpSiluMulImpl` emits cuBLAS | Perf delta on SwiGLU MLP |
+| 8 | **Attention variant split**\* | `TkAttentionDecodeImpl`, `TkAttentionPrefillImpl`, `FlashInferStandaloneImpl`, `FlashInferStandardImpl` | 1 `AttentionViaCacheImpl` (hardcoded `is_causal=true`) | Decode and prefill get the same kernel |
+| 9 | **Prefill rope variant** | `VllmRsPrefillRopeCacheImpl` | 0 | Prefill KV-write path missing |
+| 10 | **Scheduled megakernel**\* (**HIGH PRIORITY**) | Full BSP persistent cooperative-launch kernel system: `kernel_library.rs`, `schedule.rs`, `templates/scheduled/megakernel.cu`, `SCHEDULED_MEGAKERNEL_HANDOFF.md` (~41 KB) | Nothing | Entire megakernel codegen path absent |
+| 11 | **Codegen: stream assignment, wave merging, cooperative-launch emission, graph capture** | All present in `ferrite-solver/src/lowering/backend/cuda_codegen.rs` | Sequential one-launch-per-subgraph only | DeviceCallable waves can't form megakernels |
+| 12 | **Solver constraints** | `CoopExclusivity`, `RegBudget`, `ShmemBudget`, `LayoutCompatibility`, `HandoffCompatibility` (10 classes) | matches() + cost only | Solver will pick infeasible plans when megakernel lands |
+| 13 | **Solver backends** | CP (backtrack) + DP + ILP stub | DP only | Large search spaces may need CP |
+| 14 | **Concurrency model** | Ported but dormant — no DeviceCallable Impls exist, no CoopExclusivity constraint wired | — | Machinery present, unused |
+| 15 | **Layout adapters** | Insert layout-conversion impls between mismatched producers/consumers | `Layout` enum exists; no adapter insertion | Mismatched layouts produce `UnclaimedTile` |
+| 16 | **Test depth** | Structural golden codegen tests + real inference | 85 unit + 6 integration type-check tests | **No end-to-end correctness or perf test exists** |
+
+Additional items not in the table (lower-risk):
+- `OpKind` enum missing `BiasAdd` (blocks Qwen2 DSL), `Gelu`,
+  `SoftCap`, `SlidingAttention` (block Gemma2).
+- `ferrite-solver/data/*.csv` still present in the repo. Source of
+  truth for gap #2. Do not regenerate — measured.
+
+## Re-scoped path to vllm chat + parity
+
+Priority-ordered. Each step is a port of a real thing the old code
+does. See the table above for which gaps each step closes.
+
+### Step A — Cutlass tile zoo + CSV cost backend
+
+Closes gaps #1, #2, #3, #4. Port `ferrite-solver/src/lowering/cost_table.rs`
+(the `GpuCostGrid`) into `ferrite-forward-macro/src/cost_table.rs`,
+pointing at the existing CSVs. Add cutlass tile Impls starting
+with `CutlassGemmImpl` (single Gemm), then `CutlassGemvImpl`. FFI
+block lives in a new `ferrite-kernels::cutlass` module (today
+duplicated in `vllm-cuda/src/model/llama.rs:3645`,
+`vllm-cuda/src/model/qwen2.rs:254`, `ferrite-test-harness/src/lib.rs:79`).
+Done when: `vllm bench` on Llama-3.2-1B hits within 5% of the old
+path on L4.
+
+### Step B — Scheduled megakernel (HIGH PRIORITY per user)
+
+Closes gaps #10, #11, #12, #14. Port `ferrite-solver/src/kernel_library.rs`
++ `templates/scheduled/megakernel.cu`. Read
+`vllm-rs/crates/ferrite-solver/SCHEDULED_MEGAKERNEL_HANDOFF.md`
+first — design decisions already made there, do not re-derive.
+Wave-merging + cooperative-launch codegen. `CoopExclusivity`
+constraint first; `RegBudget` / `ShmemBudget` for megakernel wave
+selection.
+
+### Step C — Fusion parity
+
+Closes gaps #5, #6, #7, #9. Port `CublasFusedQkvGemmWithBiasImpl`
+(unblocks Qwen2), `CublasGemmExWithResidualImpl` +
+`CutlassGemmWithResidualImpl`, `CutlassGemmSiluMulImpl`,
+`VllmRsPrefillRopeCacheImpl`.
+
+### Step D — Attention variant split
+
+Closes gap #8. Port `TkAttentionDecodeImpl`,
+`TkAttentionPrefillImpl`, `FlashInferStandaloneImpl`,
+`FlashInferStandardImpl`. Solver dispatches on workload bucket.
+Remove `is_causal=true` hardcoding.
+
+### Step E — Wiring to vllm-cuda + vllm chat
+
+Only after A–D. Implement `WeightBundle` for `LlamaForCausalLM`,
+build a `ForwardCtx`, swap the hand-written forward for
+`ferrite_models::llama::<model>::forward`. `timeout 60 vllm chat`
+for correctness; `vllm bench` for parity. **Do NOT start before
+A + at-least-partial-B.** Wiring a 7-impl library creates the
+illusion the compiler is ready.
+
+### Step F — Qwen2 + Gemma2 + Mixtral + DeepSeek-V2
+
+Qwen2 unblocks after C (gap #5). Gemma2 needs `Gelu`, `SoftCap`,
+`SlidingAttention` ops. Mixtral needs DSL extension for top-k
+expert dispatch. DeepSeek-V2 needs `attention_mla`.
+
+### Step G — Delete legacy
+
+Once no `forward!{}` site remains: delete `ferrite-solver`,
+`ferrite-macros`. **PRESERVE `ferrite-solver/data/*.csv`** — move
+into `ferrite-forward-macro/data/` first. Measured, not cheaply
+regenerable.
 
 ## Verify current state
 
@@ -152,7 +245,12 @@ Expected state:
   in the emitted output. cargo rebuilds when JSONs change. No
   nightly, no build.rs.
 
-### Impl library (complete for Llama/Qwen2 topology)
+### Impl library (**topology** coverage for Llama only)
+
+> Not kernel-variant coverage. See "Real gap inventory" above —
+> the old library has ~1,400 kernel variants, this has 7. Every
+> DSL op in the Llama body has *an* Impl that claims it; that's
+> all "topology coverage" means.
 
 Singletons that emit real kernel calls:
 - `EmbedRefImpl` → `kernels::embedding_gather`.
@@ -261,71 +359,6 @@ The caller implements this trait on whatever weight-holding struct
 they want; the fused accessors must return a `LinearLayer` whose
 `.weight` is the vertically-concatenated source weights
 (`[gate|up]` for SwiGLU fusion; `[q|k|v]` for QKV fusion).
-
-## Path to `vllm chat` working
-
-Remaining concrete steps (everything above is done):
-
-### 5. Migrate `ferrite-models/src/llama.rs` to `#[forward]`
-
-Current state: `ferrite-models/src/llama.rs` uses the old
-`ferrite_macros::forward!{}` macro. Migration:
-
-1. Replace the `forward!{}` invocation with `#[forward(models_dir,
-   target, workloads)]` on an empty carrier fn whose body is the
-   DSL.
-2. Implement the emitted `WeightBundle` trait on the weight-holding
-   struct. The *fused* accessors need packed `LinearLayer`s:
-   - `mlp_gate_proj_<L>__fused__mlp_up_proj_<L>` → concatenate
-     `gate_proj[L].weight` and `up_proj[L].weight` along the
-     output dim at load time. Shape: `[2*intermediate_size,
-     hidden_size]`.
-   - `self_attn_k_proj_<L>__fused__self_attn_q_proj_<L>__fused__self_attn_v_proj_<L>`
-     → concatenate the three weights along the output dim. Shape:
-     `[q_size + 2*kv_size, hidden_size]`. Note the name is
-     alphabetical-sorted (k, q, v), not positional (q, k, v); the
-     user just has to return the right packed weight for that
-     method name.
-3. Verify the library picks the same Impls the tests expect — run
-   `cargo test -p ferrite-forward-macro --lib
-   swiglu_mlp_claimed_as_fused` etc. against the migrated body.
-
-### 6. Wire into vllm-cuda's call site
-
-`vllm-cuda/src/model/llama.rs` currently calls the old `forward!{}`
-output. The new `#[forward]` emits `pub unsafe fn forward(wm, ctx,
-device, num_tokens) -> OwnedTensor` inside a `pub mod llama::<model_ident>`.
-Replace the old call with the new one. The signature will diverge
-from the old one (new fn takes `&W: WeightBundle`, `&ForwardCtx`,
-`&mut GpuDevice`, `num_tokens: u64`); expect a small shim at the
-vllm-cuda call site to build the ForwardCtx and pass the right
-weight bundle. **That shim is the only vllm-cuda edit.**
-
-### 7. Validate
-
-```bash
-timeout 60 vllm chat --model=<small-llama>
-```
-
-Coherent output → correctness verified. Garbage/hang → bug in a
-fusion's semantics (most likely the in-place aliasing in
-`FusedAddRmsNormImpl` or the layer indexing in
-`FusedQkvRopeCacheImpl` / `AttentionViaCacheImpl`).
-
-Then `vllm bench` for perf parity vs the old ferrite path.
-
-### 8. Migrate Qwen2
-
-Same shape as Llama, with the addition of per-proj biases
-(`qkv_bias` etc.). The current Impl library doesn't handle biases
-— a `FusedQkvRopeCacheWithBiasImpl` (or `CublasGemmExWithBiasImpl`)
-port from old ferrite's library.rs would be needed. Qwen2 stress-
-tests the "one arch adds one Impl; zero compiler edits" rule.
-
-### 9. Gemma2, Mixtral, DeepSeek-V2
-
-Per PLAN.md §5/§6/§7 — each is an acid test of compiler genericity
-across a different axis (pre+post norms, MoE routing, MLA).
 
 ## Failure patterns from prior sessions (do not repeat)
 
@@ -499,26 +532,26 @@ dd5e98259  ferrite-forward: port Implementation trait + library surface from old
 
 ## Open tasks (next session picks up here)
 
-Ordered; each is self-contained and testable on its own.
+See "Re-scoped path to vllm chat + parity" near the top of this
+file. In priority order: Step A (cutlass tile zoo + CSV costs),
+Step B (scheduled megakernel — HIGH PRIORITY), Step C (fusion
+parity; Qwen2-unblocking), Step D (attention variants), Step E
+(vllm-cuda wiring — NOT before A + partial B), Step F (other
+architectures), Step G (delete legacy).
 
-1. **Migrate `ferrite-models/src/llama.rs` to `#[forward]`.** See §5
-   above. Biggest item. Requires the caller-side WeightBundle impl
-   that produces packed fused weights at load time.
-2. **Wire into vllm-cuda's call site** (§6). Small shim.
-3. **Run `timeout 60 vllm chat --model=<small-llama>`.** This is
-   the correctness proof. If output is garbage, debug in order of
-   most-likely culprit:
-   - `FusedAddRmsNormImpl` in-place aliasing (residual buffer
-     semantics are subtle).
-   - `FusedQkvRopeCacheImpl` layer indexing + kv_cache layout
-     assumptions.
-   - `AttentionViaCacheImpl` softmax scale / is_causal.
-   - Packed weight layout mismatch (row-major vs column-major,
-     dim order).
-4. **`vllm bench` parity check.**
-5. **Qwen2 migration** (§8). Adds a bias-capable fused-QKV Impl.
-6. **Delete `ferrite-solver` + `ferrite-macros`** once no
-   `forward!{}` site remains.
+### Already landed — do not redo
+
+- Parser + classifier + shape inference + CFG/unroll.
+- FUF/SFUF/LOOP IRs + schedule_workloads + cost::refresh_predicted_us.
+- DP solver (ported from ferrite-solver/src/lowering/solver/dp.rs).
+- Codegen delegates to `Implementation::emit_call`. New Impls add
+  to the library; no codegen edits.
+- `WeightBundle` trait emission from the solved graph.
+- `ForwardCtx` runtime-args bundle in `ferrite-forward`.
+- `include_str!` rebuild-on-change for every JSON the macro reads.
+- `ferrite-models/src/llama.rs` migrated from `forward!{}` to
+  `#[forward]`. **Qwen2 remains on the old macro — blocked on
+  Step C gap #5.**
 
 ## Last note
 

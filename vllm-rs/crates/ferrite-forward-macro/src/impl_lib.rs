@@ -2271,8 +2271,11 @@ pub struct CutlassGemmImpl {
 }
 
 impl CutlassGemmImpl {
-    fn csv_name(&self) -> String {
-        format!("cutlass_{}x{}_s{}", self.tile_m, self.tile_n, self.stages)
+    /// Same string as `static_name`, returned as `&'static str` so the
+    /// hot `target_compatible` path doesn't allocate. The CSV column
+    /// matches `static_name` by construction.
+    fn csv_name(&self) -> &'static str {
+        self.static_name()
     }
 
     fn static_name(&self) -> &'static str {
@@ -2348,8 +2351,12 @@ impl Implementation for CutlassGemmImpl {
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        let csv = self.csv_name();
-        profile.cost_table.kernel_names().iter().any(|k| k == &csv)
+        // Hot path — called per tile × per impl × per workload.
+        // `has_kernel` is O(1); the previous `kernel_names()` scan
+        // allocated a Vec<String> by cloning every cost-table entry's
+        // key, which produced multi-second compile-time stalls on
+        // large FUFs (1000+ tiles × 16 cutlass variants).
+        profile.cost_table.has_kernel(self.csv_name())
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
@@ -2374,7 +2381,7 @@ impl Implementation for CutlassGemmImpl {
             return f64::INFINITY;
         };
         ctx.profile
-            .cost_us_for(&self.csv_name(), mm, nn, kk)
+            .cost_us_for(self.csv_name(), mm, nn, kk)
             // No CSV row for this shape → emit a finite "too
             // expensive" sentinel so the DP skips this variant
             // without tripping the `!cost.is_finite()` guard.

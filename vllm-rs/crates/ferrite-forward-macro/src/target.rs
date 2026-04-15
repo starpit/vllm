@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,9 +20,16 @@ use serde_json::Value;
 /// Keyed by `kernel` column value (`cublas`, `cutlass_128x128_s4`,
 /// `cutlass_gemv`, …) to support both the cuBLAS reference line and
 /// each cutlass tile variant.
+///
+/// `kernel_set` is a denormalized cache of the distinct kernel names
+/// seen in `entries` — populated lazily on first access. Callers like
+/// `Implementation::target_compatible` hit this in their inner loop
+/// (per tile × per impl × per workload), so a hot-path `contains()`
+/// must be O(1), not O(entries × clone_each_String).
 #[derive(Clone, Debug, Default)]
 pub struct CostTable {
     entries: HashMap<(String, u32, u32, u32), f64>,
+    kernel_set: HashSet<String>,
 }
 
 impl CostTable {
@@ -39,24 +46,32 @@ impl CostTable {
     }
 
     pub fn insert(&mut self, kernel: impl Into<String>, m: u32, n: u32, k: u32, cost_us: f64) {
-        self.entries.insert((kernel.into(), m, n, k), cost_us);
+        let kernel = kernel.into();
+        self.kernel_set.insert(kernel.clone());
+        self.entries.insert((kernel, m, n, k), cost_us);
     }
 
     pub fn get(&self, kernel: &str, m: u32, n: u32, k: u32) -> Option<f64> {
+        // Use a borrowed-key tuple to skip the per-call String allocation.
+        // HashMap's Borrow impl on tuples doesn't quite let us borrow the
+        // String directly, so we still allocate here — but this is the
+        // cold path (called once the candidate is being evaluated, not
+        // per-impl-per-tile-per-workload).
         self.entries.get(&(kernel.to_string(), m, n, k)).copied()
     }
 
+    /// O(1) membership check on kernel names. Used by hot-path
+    /// `target_compatible` to gate impls without scanning the cost
+    /// table per call.
+    pub fn has_kernel(&self, kernel: &str) -> bool {
+        self.kernel_set.contains(kernel)
+    }
+
     /// Every distinct kernel name observed in the CSV. Useful for
-    /// the solver library to enumerate `cutlass_*` variants without
-    /// hardcoding them.
+    /// debugging and tests; NOT for hot paths — use [`has_kernel`] for
+    /// existence checks.
     pub fn kernel_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .entries
-            .keys()
-            .map(|(k, _, _, _)| k.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let mut names: Vec<String> = self.kernel_set.iter().cloned().collect();
         names.sort();
         names
     }

@@ -1808,12 +1808,14 @@ impl Implementation for AttentionViaCacheImpl {
             as usize;
 
         // Softmax scale: 1.0 / sqrt(head_dim). Emit at compile time.
-        let head_dim = ctx.bound("head_dim") as f32;
-        let scale: f32 = 1.0 / head_dim.sqrt();
+        let head_dim_f = ctx.bound("head_dim") as f32;
+        let scale: f32 = 1.0 / head_dim_f.sqrt();
         let scale_tokens = quote! { #scale };
+        // q_size for the [num_tokens, q_size] reshape o_proj needs.
+        let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
         quote! {
-            let #out = unsafe {
+            let mut #out = unsafe {
                 ::ferrite_kernels::kernels::flash_attn_paged(
                     *#q_expr,
                     *ctx.kv_cache.k_cache(#layer),
@@ -1831,6 +1833,14 @@ impl Implementation for AttentionViaCacheImpl {
                     device.compute_stream,
                 )
             };
+            // Flatten [num_tokens, num_q_heads, head_dim] → [num_tokens, q_size]
+            // so the downstream o_proj gemm sees a 2D [M, K] input with the
+            // right K dimension.
+            unsafe {
+                let nt = (*#out).dim(0);
+                let dt = (*#out).dtype();
+                #out.reshape(&[nt, #q_size], dt);
+            }
         }
     }
 }
@@ -2091,12 +2101,13 @@ impl Implementation for AttentionPrefillContiguousImpl {
         let v_expr = ctx.input_expr(tile, 2);
 
         // Softmax scale: 1/sqrt(head_dim), baked in.
-        let head_dim = ctx.bound("head_dim") as f32;
-        let scale: f32 = 1.0 / head_dim.sqrt();
+        let head_dim_f = ctx.bound("head_dim") as f32;
+        let scale: f32 = 1.0 / head_dim_f.sqrt();
         let scale_tokens = quote! { #scale };
+        let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
         quote! {
-            let #out = unsafe {
+            let mut #out = unsafe {
                 // Fresh-prefill flash attention reads K/V directly
                 // from the contiguous tensors produced by
                 // `fused_qkv_rope`. K is already rotated, so the
@@ -2123,6 +2134,14 @@ impl Implementation for AttentionPrefillContiguousImpl {
                     false, // is_rotary_interleaved
                 )
             };
+            // Flatten [num_tokens, num_q_heads, head_dim] → [num_tokens, q_size]
+            // so the downstream o_proj gemm sees a 2D [M, K] input with the
+            // right K dimension.
+            unsafe {
+                let nt = (*#out).dim(0);
+                let dt = (*#out).dtype();
+                #out.reshape(&[nt, #q_size], dt);
+            }
         }
     }
 }

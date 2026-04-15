@@ -21,10 +21,11 @@
   as you port** — strip transformer-domain hardcoding, do not
   rewrite mechanisms that already work.
 - **Current state**: trait-based Implementation ported, codegen
-  emission moved onto the trait (`emit_call`), starter impls in
-  place but emit placeholder symbols that don't exist in
-  ferrite-kernels yet. Real Impl library not yet ported.
-- **Branch**: `worktree-ferrite-forward`. **HEAD**: `75aa11312`.
+  emission on the trait (`emit_call`), 3/8 starter impls wired to
+  real ferrite-kernels symbols (Embed → `embedding_gather`,
+  RmsNorm → `rms_norm`, Gemm → `LinearLayer::forward`). Remaining
+  5 need multi-tile matchers — see "Multi-tile fusion work" below.
+- **Branch**: `worktree-ferrite-forward`. **HEAD**: `96b265d69`.
 
 ## Verify current state
 
@@ -164,6 +165,56 @@ surveys, 2026-04-15):
   Old ferrite handled residuals via `fused_add_rms_norm_inplace`
   (residual add fused into next rmsnorm) — a 2-tile `(Add,
   RmsNorm)` matcher is probably the port.
+
+### Multi-tile fusion work (blocks `vllm chat`)
+
+Each of the 5 remaining starter impls (`emit_silu`, `emit_mul`,
+`emit_add`, `emit_rope_append`, `emit_attention` in `impl_lib.rs`)
+still emits a fake symbol. They **can't** be fixed in isolation
+because no standalone kernel exists for any of them; each needs a
+multi-tile matcher that replaces several singleton impls:
+
+1. **SiluAndMul**: claims `(Silu, Mul)`. Complication: the kernel
+   `silu_and_mul_fused` wants `[..., 2*intermediate]` packed
+   `[gate|up]`. Our DSL has gate/up as separate GEMM outputs.
+   Old ferrite paired this with a `CublasFusedGateUpGemmImpl` that
+   wrote into a shared `gate_up` binding — a named cross-impl
+   contract. **Better approach**: a single 4-tile impl
+   `(GemmGate, GemmUp, Silu, Mul)` that issues the fused cuBLAS
+   call itself and then silu_and_mul_fused. Eliminates the
+   cross-impl contract.
+2. **FusedQkvRopeCache**: claims `(GemmQ, GemmK, GemmV,
+   RopeAppend)`. Kernel `fused_qkv_rope_cache` wants packed QKV.
+   Same shape of fix as above: claim the three Gemms + the rope,
+   do the fused QKV cuBLAS call, pass into the fused rope+cache
+   kernel. Returns only Q; K/V are written to the paged cache.
+3. **AttentionViaCache**: claims `(Attention,)` but needs to know
+   `layer_idx`. Kernel `attention_decode_from_cache` takes only Q
+   and reads K/V from cache. Our DSL says attention has K/V
+   inputs; after (2) lands, those K/V edges have their producer
+   elided (K/V flow to cache, not to attention). The matcher
+   sees the DSL attention tile, ignores the K/V inputs, emits a
+   call with just Q + cache metadata.
+4. **FusedAddRmsNorm**: claims `(Add, RmsNorm)`. Kernel
+   `fused_add_rms_norm_inplace` takes hidden + residual +
+   norm weight + eps. Only fires when Add's output immediately
+   feeds a RmsNorm.
+5. **Standalone RmsNorm** (already wired): keeps its 1-tile
+   fallback when (4) doesn't match.
+
+Config-derived values needed at emit time (intermediate_size,
+num_q_heads, head_dim, num_kv_heads, scale, layer_idx): these
+live in `model.bounds` / the config.json. The emit_call body
+needs access. Simplest path: thread a `ModelParams` ref through
+`EmitCtx`. `layer_idx` is a per-rope/per-attention tile attribute
+produced by unroll (attention appears N_LAYERS times; each
+occurrence has its own index). Need to surface that on FufNode
+(it's already implicitly there via tile id ordering).
+
+`WeightBundle` field types today are keyed off consuming op:
+Gemm→LinearLayer, RmsNorm→RmsNorm, Embed→Embedding. Multi-tile
+impls that claim multiple Gemms still reference each weight via
+the same per-tile accessor; no field-type change needed.
 
 **The deeper structural mismatch**: ferrite-kernels' kernel set is
 **fused** (silu+mul fused, rope+kv-cache fused, residual-add+rmsnorm

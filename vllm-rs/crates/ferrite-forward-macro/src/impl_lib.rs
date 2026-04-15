@@ -842,6 +842,47 @@ fn cost_gemm(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     }
 }
 
+/// Softmax scale for one attention call. Reads
+/// `query_pre_attn_scalar` from the model config when present
+/// (Gemma2's query pre-attention scaling), else falls back to the
+/// standard `1 / sqrt(head_dim)` (Llama, Qwen2, Qwen3, ...). The
+/// HF convention is `scale = query_pre_attn_scalar.powf(-0.5)`.
+pub(crate) fn attention_scale_for(model: &crate::config::ModelParams) -> f32 {
+    match model.scalars.get("query_pre_attn_scalar") {
+        Some(q) => (*q as f32).powf(-0.5),
+        None => {
+            let head_dim_f = *model
+                .bounds
+                .get("head_dim")
+                .expect("attention emit: head_dim missing from model config")
+                as f32;
+            1.0 / head_dim_f.sqrt()
+        }
+    }
+}
+
+/// Attention logit soft-cap. Reads `attn_logit_softcapping` from
+/// the model config when present (Gemma2), else `0.0` meaning the
+/// kernel does no soft-capping. The flash-attn kernel treats
+/// `softcap <= 0` as "disabled."
+pub(crate) fn attention_softcap_for(model: &crate::config::ModelParams) -> f32 {
+    model
+        .scalars
+        .get("attn_logit_softcapping")
+        .copied()
+        .unwrap_or(0.0) as f32
+}
+
+fn attention_scale_tokens(ctx: &EmitCtx) -> TokenStream {
+    let scale = attention_scale_for(ctx.model);
+    quote! { #scale }
+}
+
+fn attention_softcap_tokens(ctx: &EmitCtx) -> TokenStream {
+    let cap = attention_softcap_for(ctx.model);
+    quote! { #cap }
+}
+
 fn cost_attention(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     // Rough: 4 * T^2 * D.
     let node = ctx.fuf.get(m.claimed_tiles[0]);
@@ -1855,10 +1896,13 @@ impl Implementation for AttentionViaCacheImpl {
             .expect("Attention has a kv_cache extern with a concrete layer index")
             as usize;
 
-        // Softmax scale: 1.0 / sqrt(head_dim). Emit at compile time.
-        let head_dim_f = ctx.bound("head_dim") as f32;
-        let scale: f32 = 1.0 / head_dim_f.sqrt();
-        let scale_tokens = quote! { #scale };
+        // Softmax scale: config-driven. Gemma2 sets
+        // `query_pre_attn_scalar` (softmax scale = that^-0.5); Llama/
+        // Qwen2 have no such field, so we fall back to the standard
+        // `1/sqrt(head_dim)`. Both computed at emit time; the emitted
+        // tokens are a plain `f32` literal either way.
+        let scale_tokens = attention_scale_tokens(ctx);
+        let softcap_tokens = attention_softcap_tokens(ctx);
         // q_size for the [num_tokens, q_size] reshape o_proj needs.
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
@@ -1888,8 +1932,8 @@ impl Implementation for AttentionViaCacheImpl {
                     ctx.max_seqlen_q,
                     ctx.max_seqlen_k,
                     #scale_tokens,
-                    0.0,  // softcap
-                    -1,   // window_size_left (-1 = disabled)
+                    #softcap_tokens,
+                    -1,   // window_size_left (-1 = disabled; sliding variant covers non-(-1))
                     ctx.kv_cache,
                     #layer,
                     device.num_sm,
@@ -2167,10 +2211,10 @@ impl Implementation for AttentionPrefillContiguousImpl {
         let k_expr = ctx.input_expr(tile, 1);
         let v_expr = ctx.input_expr(tile, 2);
 
-        // Softmax scale: 1/sqrt(head_dim), baked in.
-        let head_dim_f = ctx.bound("head_dim") as f32;
-        let scale: f32 = 1.0 / head_dim_f.sqrt();
-        let scale_tokens = quote! { #scale };
+        // Config-driven attention scale + softcap (see
+        // `AttentionViaCacheImpl::emit_call` for the rationale).
+        let scale_tokens = attention_scale_tokens(ctx);
+        let softcap_tokens = attention_softcap_tokens(ctx);
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
         quote! {
@@ -2192,8 +2236,8 @@ impl Implementation for AttentionPrefillContiguousImpl {
                     ctx.max_seqlen_k,
                     #scale_tokens,
                     true, // is_causal
-                    0.0,  // softcap
-                    -1,   // window_size_left (-1 = disabled)
+                    #softcap_tokens,
+                    -1,   // window_size_left (-1 = disabled; sliding variant covers non-(-1))
                     &mut device.caching,
                     device.compute_stream,
                     ::std::ptr::null::<u8>(),
@@ -2531,6 +2575,51 @@ impl Implementation for CutlassGemvImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_scalars_default_to_llama_values_when_config_silent() {
+        // Llama-3.2-1B has no `query_pre_attn_scalar` or
+        // `attn_logit_softcapping` — the helpers must fall back to
+        // `1/sqrt(head_dim)` and `0.0` respectively, matching the
+        // previously hardcoded emission byte-for-byte.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("model_architectures")
+            .join("llama")
+            .join("llama-3.2-1b.json");
+        let model = crate::config::load_file(&path).expect("load llama-3.2-1b");
+
+        let expected_scale = 1.0_f32 / (*model.bounds.get("head_dim").unwrap() as f32).sqrt();
+        assert_eq!(attention_scale_for(&model), expected_scale);
+        assert_eq!(attention_softcap_for(&model), 0.0);
+    }
+
+    #[test]
+    fn attention_scalars_honor_gemma_style_config() {
+        // Synthetic ModelParams mirroring Gemma2-2B's attention
+        // config. The scale must flow from `query_pre_attn_scalar`,
+        // not from `head_dim`; softcap must match the capping value.
+        let mut bounds = std::collections::BTreeMap::new();
+        bounds.insert("head_dim".to_string(), 256);
+        let mut scalars = std::collections::BTreeMap::new();
+        // Gemma2 ships `query_pre_attn_scalar = 256.0` on the 2B and 9B.
+        scalars.insert("query_pre_attn_scalar".to_string(), 256.0);
+        scalars.insert("attn_logit_softcapping".to_string(), 50.0);
+        let model = crate::config::ModelParams {
+            name: syn::Ident::new("gemma2_test", proc_macro2::Span::call_site()),
+            source_stem: "gemma2_test".into(),
+            source_path: std::path::PathBuf::new(),
+            bounds,
+            scalars,
+        };
+
+        let scale = attention_scale_for(&model);
+        // scale = 256^-0.5 = 1/16 = 0.0625. Exact in f32.
+        assert_eq!(scale, 0.0625_f32);
+        assert_eq!(attention_softcap_for(&model), 50.0_f32);
+    }
 
     #[test]
     fn resources_union_max_takes_elementwise_max() {

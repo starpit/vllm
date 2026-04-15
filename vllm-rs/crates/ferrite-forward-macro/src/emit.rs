@@ -84,6 +84,16 @@ impl<'a> EmitCtx<'a> {
             .unwrap_or_else(|| panic!("model has no bound `{key}` in config.json"))
     }
 
+    /// Read a model-wide float scalar (e.g. `query_pre_attn_scalar`,
+    /// `attn_logit_softcapping`). Returns `None` if the key is
+    /// absent; callers pick an architecture-appropriate default in
+    /// that case. Unlike [`bound`](Self::bound) this never panics —
+    /// most architectures carry no floats at all, and Impls should
+    /// treat presence as opt-in parameterization.
+    pub fn scalar(&self, key: &str) -> Option<f64> {
+        self.model.scalars.get(key).copied()
+    }
+
     /// Rust expression that evaluates to the Nth input of `tile`.
     ///
     /// Reads from the local binding for tile-sourced inputs, from

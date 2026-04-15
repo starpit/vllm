@@ -39,6 +39,12 @@ pub struct ModelParams {
     /// config.json field names verbatim (`num_hidden_layers`,
     /// `hidden_size`, etc.).
     pub bounds: BTreeMap<String, u64>,
+    /// Every top-level float field from the JSON. Mirror of
+    /// [`bounds`](Self::bounds) for non-integer scalars like
+    /// `query_pre_attn_scalar` (Gemma2), `attn_logit_softcapping`,
+    /// `rms_norm_eps`. Downstream callers read these by name; this
+    /// module doesn't know which ones are used where.
+    pub scalars: BTreeMap<String, f64>,
 }
 
 /// Errors produced while loading configs.
@@ -119,12 +125,14 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
     })?;
     let mut bounds = extract_bounds(&json);
     crate::weight_conventions::derive_implicit_bounds(&mut bounds);
+    let scalars = extract_scalars(&json);
 
     Ok(ModelParams {
         name,
         source_stem,
         source_path: path.to_path_buf(),
         bounds,
+        scalars,
     })
 }
 
@@ -136,6 +144,26 @@ fn extract_bounds(json: &serde_json::Value) -> BTreeMap<String, u64> {
         .map(|obj| {
             obj.iter()
                 .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every top-level *non-integer* number field becomes a scalar.
+/// (Integer fields go to `bounds` via [`extract_bounds`]; `as_u64`
+/// is checked first so an integer like `42` doesn't double-count
+/// into `scalars` as `42.0`.)
+fn extract_scalars(json: &serde_json::Value) -> BTreeMap<String, f64> {
+    json.as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    if v.as_u64().is_some() {
+                        None
+                    } else {
+                        v.as_f64().map(|n| (k.clone(), n))
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -276,6 +304,60 @@ mod tests {
     fn missing_dir_errors_cleanly() {
         let result = load_dir(Path::new("/nonexistent/path/to/configs"));
         assert!(matches!(result, Err(ConfigError::NotADirectory(_))));
+    }
+
+    #[test]
+    fn float_fields_land_in_scalars_integer_fields_do_not() {
+        let tmp = std::env::temp_dir().join("ferrite_forward_scalars_test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("m.json"),
+            r#"{
+                "num_hidden_layers": 16,
+                "hidden_size": 2048,
+                "rms_norm_eps": 0.000001,
+                "query_pre_attn_scalar": 256.0,
+                "attn_logit_softcapping": 50.0
+            }"#,
+        )
+        .unwrap();
+        let cfg = load_file(&tmp.join("m.json")).unwrap();
+
+        // Integers go to bounds, not scalars.
+        assert_eq!(cfg.bounds.get("num_hidden_layers"), Some(&16));
+        assert_eq!(cfg.bounds.get("hidden_size"), Some(&2048));
+        assert!(!cfg.scalars.contains_key("num_hidden_layers"));
+        assert!(!cfg.scalars.contains_key("hidden_size"));
+
+        // Non-integer numbers go to scalars.
+        assert_eq!(cfg.scalars.get("rms_norm_eps"), Some(&0.000001));
+        assert_eq!(cfg.scalars.get("query_pre_attn_scalar"), Some(&256.0));
+        assert_eq!(cfg.scalars.get("attn_logit_softcapping"), Some(&50.0));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn llama_configs_have_no_gemma_scalars() {
+        // Regression guard: if someone adds `query_pre_attn_scalar`
+        // to a Llama config, that would silently change the
+        // hardcoded softmax scale in `AttentionViaCacheImpl`. The
+        // Llama path has no such field today; lock that in.
+        let dir = repo_model_archs().join("llama");
+        let configs = load_dir(&dir).expect("load llama configs");
+        for cfg in &configs {
+            assert!(
+                !cfg.scalars.contains_key("query_pre_attn_scalar"),
+                "{} unexpectedly has query_pre_attn_scalar",
+                cfg.source_stem
+            );
+            assert!(
+                !cfg.scalars.contains_key("attn_logit_softcapping"),
+                "{} unexpectedly has attn_logit_softcapping",
+                cfg.source_stem
+            );
+        }
     }
 
     #[test]

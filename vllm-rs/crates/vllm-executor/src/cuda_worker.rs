@@ -95,14 +95,29 @@ pub struct CudaWorkerConfig {
 // Model enum (dispatches to LLaMA / Qwen2 / Gemma2)
 // ---------------------------------------------------------------------------
 
+/// A dense-bf16 Llama loaded through the new ferrite-forward
+/// compiler. Holds the specialized `Weights` enum (one variant per
+/// compiled config) + the `RotaryCache` the forward needs. Accessors
+/// (num_layers / num_kv_heads / head_dim / vocab_size / hidden_size)
+/// come directly from `Weights`'s methods — baked in at macro-
+/// expansion time from each model's config.json.
+///
+/// Only populated when `VLLM_FERRITE=1` at load time; otherwise a
+/// dense-bf16 Llama routes to `CudaModel::LlamaSolver` as before.
+pub struct LlamaFerriteModel {
+    pub weights: ferrite_models::llama::Weights,
+    pub rotary: vllm_cuda::rotary::RotaryCache,
+}
+
 /// Supported model architectures in the vllm-cuda backend.
 enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
-    /// Generated Llama forward — dense safetensors only.
-    LlamaSolver(vllm_cuda::model::llama::Model),
+    /// Dense-bf16 Llama via the `#[forward]`-emitted forward in
+    /// `ferrite_models::llama`. Boxed because the ferrite `Weights`
+    /// enum has many large variants (one per compiled model config)
+    /// and inlining would inflate every `CudaModel` instance.
+    LlamaFerrite(Box<LlamaFerriteModel>),
     Qwen2(vllm_cuda::model::qwen2::Qwen2ForCausalLM),
-    /// Generated Qwen2 forward — dense safetensors only.
-    Qwen2Solver(vllm_cuda::model::qwen2::Model),
     Gemma2(vllm_cuda::model::gemma2::Gemma2ForCausalLM),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
     Mixtral(vllm_cuda::model::mixtral::MixtralForCausalLM),
@@ -118,9 +133,8 @@ impl CudaModel {
     fn num_layers(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers.len(),
-            Self::LlamaSolver(m) => m.layers.len(),
+            Self::LlamaFerrite(m) => m.weights.num_hidden_layers() as usize,
             Self::Qwen2(m) => m.0.model.layers.len(),
-            Self::Qwen2Solver(m) => m.layers.len(),
             Self::Gemma2(m) => m.model.layers.len(),
             Self::Gemma3(m) => m.model.layers.len(),
             Self::Mixtral(m) => m.model.layers.len(),
@@ -138,9 +152,8 @@ impl CudaModel {
     fn num_kv_heads(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers[0].self_attn.num_kv_heads,
-            Self::LlamaSolver(m) => m.dims.num_kv_heads,
+            Self::LlamaFerrite(m) => m.weights.num_key_value_heads() as usize,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.num_kv_heads,
-            Self::Qwen2Solver(m) => m.dims.num_kv_heads,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Mixtral(m) => m.model.layers[0].self_attn.num_kv_heads,
@@ -156,9 +169,8 @@ impl CudaModel {
     fn head_dim(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers[0].self_attn.head_dim,
-            Self::LlamaSolver(m) => m.dims.head_dim,
+            Self::LlamaFerrite(m) => m.weights.head_dim() as usize,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.head_dim,
-            Self::Qwen2Solver(m) => m.dims.head_dim,
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
             Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
             Self::Mixtral(m) => m.model.layers[0].self_attn.head_dim,
@@ -174,9 +186,8 @@ impl CudaModel {
     fn vocab_size(&self) -> usize {
         match self {
             Self::Llama(m) => m.lm_head.out_features(),
-            Self::LlamaSolver(m) => m.lm_head.out_features(),
+            Self::LlamaFerrite(m) => m.weights.vocab_size() as usize,
             Self::Qwen2(m) => m.0.lm_head.out_features(),
-            Self::Qwen2Solver(m) => m.lm_head.out_features(),
             Self::Gemma2(m) => m.lm_head.out_features(),
             Self::Gemma3(m) => m.lm_head.out_features(),
             Self::Mixtral(m) => m.lm_head.out_features(),
@@ -203,9 +214,8 @@ impl CudaModel {
     fn hidden_size(&self) -> usize {
         match self {
             Self::Llama(m) => m.lm_head.in_features(),
-            Self::LlamaSolver(m) => m.lm_head.in_features(),
+            Self::LlamaFerrite(m) => m.weights.hidden_size() as usize,
             Self::Qwen2(m) => m.0.lm_head.in_features(),
-            Self::Qwen2Solver(m) => m.lm_head.in_features(),
             Self::Gemma2(m) => m.lm_head.in_features(),
             Self::Gemma3(m) => m.lm_head.in_features(),
             Self::Mixtral(m) => m.lm_head.in_features(),
@@ -270,36 +280,16 @@ impl CudaModel {
                     device,
                 )
             },
-            Self::LlamaSolver(m) => unsafe {
-                vllm_cuda::model::llama::solver_hidden_states(
-                    m,
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                )
-            },
-            Self::Qwen2Solver(m) => unsafe {
-                vllm_cuda::model::qwen2::solver_hidden_states(
-                    m,
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                )
-            },
+            // LlamaFerrite's emitted forward runs through lm_head, so
+            // there's no backbone-only entry point. Backbone-only is
+            // only needed by pipeline-parallelism intermediate ranks;
+            // the ferrite path doesn't support PP yet. Chat/serve on
+            // a single rank goes through the full forward below, not
+            // here.
+            Self::LlamaFerrite(_) => unimplemented!(
+                "LlamaFerrite::hidden_states — backbone-only forward \
+                 not supported (PP-only codepath). Use `forward` instead.",
+            ),
             Self::Qwen2(m) => unsafe {
                 m.0.model.forward(
                     input_ids,
@@ -465,8 +455,13 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
-            Self::LlamaSolver(m) => unsafe {
-                m.forward(
+            Self::LlamaFerrite(m) => unsafe {
+                // Build the ambient runtime args bundle the emitted
+                // forward takes. The bundling is intentional — the
+                // macro-emitted fn's argument shape stays stable as
+                // new kernels start needing new runtime state.
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
                     input_ids,
                     positions,
                     slot_mapping,
@@ -476,26 +471,28 @@ impl CudaModel {
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
-                    device,
-                    last_token_indices,
-                )
+                    rotary: &m.rotary,
+                };
+                let logits = ferrite_models::llama::forward(&m.weights, &ctx, device, num_tokens);
+                // Chat/decode path: `last_token_indices` is either
+                // None or the identity (one token per request).
+                // Prefill with selective gather (last-token-only)
+                // needs a gather kernel the ferrite path hasn't
+                // grown yet; bail loudly so we catch it before
+                // returning wrong-shape logits.
+                if let Some(idx) = last_token_indices {
+                    let idx_len = idx.dim(0);
+                    if idx_len != num_tokens as usize {
+                        unimplemented!(
+                            "LlamaFerrite::forward: selective last_token_indices \
+                             gather (idx_len={idx_len} < num_tokens={num_tokens}) \
+                             not yet supported — decode-only.",
+                        );
+                    }
+                }
+                logits
             },
             Self::Qwen2(m) => unsafe {
-                m.forward(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-            Self::Qwen2Solver(m) => unsafe {
                 m.forward(
                     input_ids,
                     positions,
@@ -5006,18 +5003,49 @@ impl Worker for CudaWorker {
         let model = match arch.as_str() {
             "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
-                // Dense path: use generated Model::load.
+                // Dense bf16/fp16 path: ferrite-forward emits the
+                // specialized Weights + forward for each compiled
+                // config. Weights::load fingerprints the runtime HF
+                // config against every compiled model and picks the
+                // matching variant; RotaryCache is built separately
+                // until the ferrite DSL grows to own it too.
                 if !qconfig.is_bnb4bit()
                     && !qconfig.is_fp8()
                     && !qconfig.is_quantized()
                     && !use_tp
                     && !use_pp
                 {
-                    let (model, _lm_head) = unsafe {
-                        vllm_cuda::model::llama::Model::load(&mut weights, &config, dtype, device)
+                    let stream = device.compute_stream;
+                    let ferrite_weights = ferrite_models::llama::Weights::load(
+                        &mut weights,
+                        stream,
+                        config.num_hidden_layers as u64,
+                        config.hidden_size as u64,
+                        config.intermediate_size as u64,
+                        config.num_attention_heads as u64,
+                        config.num_kv_heads as u64,
+                        config.head_dim as u64,
+                        config.vocab_size as u64,
+                    )
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!("Llama ferrite-forward load: {e}"))
+                    })?;
+                    let rotary = unsafe {
+                        vllm_cuda::rotary::RotaryCache::new(
+                            config.head_dim,
+                            config.max_position_embeddings,
+                            config.rope_theta,
+                            config.llama3_rope_scaling.as_ref(),
+                            dtype,
+                            device,
+                        )
                     }
-                    .map_err(|e| ExecutorError::WorkerInit(format!("Llama load: {e}")))?;
-                    CudaModel::LlamaSolver(model)
+                    .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
+                    info!("CudaWorker: loaded Llama via ferrite-forward");
+                    CudaModel::LlamaFerrite(Box::new(LlamaFerriteModel {
+                        weights: ferrite_weights,
+                        rotary,
+                    }))
                 } else {
                     // Legacy quant/TP/PP paths.
                     let m = if qconfig.is_bnb4bit() {
@@ -5125,25 +5153,14 @@ impl Worker for CudaWorker {
                 let llama_config = llama_config_from_hf(&hf_config)?;
                 let qwen2_config =
                     vllm_cuda::model::qwen2::Qwen2Config::from_llama_config(llama_config);
-                // Dense path: use generated Model::load (solver forward).
-                if !qconfig.is_bnb4bit()
-                    && !qconfig.is_fp8()
-                    && !qconfig.is_quantized()
-                    && !use_tp
-                    && !use_pp
+                // Qwen2 through ferrite-forward is blocked on Step C
+                // (CublasFusedQkvGemmWithBiasImpl, HANDOFF.md gap #5).
+                // Until that lands, every Qwen2 path — dense or
+                // quantized — routes to the hand-written
+                // Qwen2ForCausalLM.
+                #[allow(unused_variables)]
+                let _ = &qwen2_config;
                 {
-                    let (model, _lm_head) = unsafe {
-                        vllm_cuda::model::qwen2::Model::load(
-                            &mut weights,
-                            &qwen2_config.0,
-                            dtype,
-                            device,
-                        )
-                    }
-                    .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 solver load: {e}")))?;
-                    CudaModel::Qwen2Solver(model)
-                } else {
-                    // Legacy quant/TP/PP paths.
                     let m = if qconfig.is_bnb4bit() {
                         let bnb_cfg = match &qconfig {
                             vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,

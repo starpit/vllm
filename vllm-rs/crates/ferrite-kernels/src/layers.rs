@@ -535,6 +535,137 @@ impl LinearLayer {
             Self::Fp8Block(l) => l.in_features(),
         }
     }
+
+    /// Load a single dense bf16/fp16 linear layer by safetensors prefix
+    /// (e.g. `"model.lm_head"` → reads `"model.lm_head.weight"` and an
+    /// optional `".bias"`).
+    pub fn load_dense(weights: &mut GpuWeights, prefix: &str) -> Result<Self> {
+        Ok(Self::Dense(Linear::load(weights, prefix)?))
+    }
+
+    /// Load several dense linear layers and concatenate along the
+    /// out-feature dim (dim 0 of the weight matrix), returning one
+    /// packed `LinearLayer::Dense`.
+    ///
+    /// Streams each source weight directly from CPU-safetensors into
+    /// the packed GPU buffer (no D2D copy, no intermediate allocation).
+    /// Used by ferrite-forward's fused accessors — e.g. `FusedQkvRopeCacheImpl`
+    /// expects one packed `[q_size + 2*kv_size, hidden]` weight covering
+    /// the three source q/k/v projections.
+    ///
+    /// If any source weight has a bias, all of them must — the biases
+    /// are concatenated in the same order as the weights. Otherwise
+    /// the returned layer has no bias.
+    pub fn load_dense_concat(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        if prefixes.is_empty() {
+            anyhow::bail!("load_dense_concat: empty prefix list");
+        }
+
+        // First pass: resolve shapes/dtype from CPU-side metadata.
+        let mut shapes_dtypes: Vec<(Vec<usize>, ferrite_cuda_core::dtype::DType)> =
+            Vec::with_capacity(prefixes.len());
+        for p in prefixes {
+            let weight_name = format!("{p}.weight");
+            let (shape, dtype) = weights
+                .tensor_info(&weight_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {weight_name}"))?;
+            if shape.len() != 2 {
+                anyhow::bail!(
+                    "load_dense_concat: `{weight_name}` has rank {}, expected 2",
+                    shape.len(),
+                );
+            }
+            shapes_dtypes.push((shape.to_vec(), dtype));
+        }
+
+        // All sources must share the same in-features (dim 1) and dtype.
+        let hidden = shapes_dtypes[0].0[1];
+        let dtype = shapes_dtypes[0].1;
+        for (i, (shape, dt)) in shapes_dtypes.iter().enumerate() {
+            if shape[1] != hidden {
+                anyhow::bail!(
+                    "load_dense_concat: `{}` has in_features {}, expected {}",
+                    prefixes[i],
+                    shape[1],
+                    hidden,
+                );
+            }
+            if *dt != dtype {
+                anyhow::bail!(
+                    "load_dense_concat: `{}` has dtype {:?}, expected {:?}",
+                    prefixes[i],
+                    dt,
+                    dtype,
+                );
+            }
+        }
+
+        let total_out: usize = shapes_dtypes.iter().map(|(s, _)| s[0]).sum();
+        let elem = dtype.size_bytes();
+        let total_bytes = total_out * hidden * elem;
+
+        // One contiguous GPU buffer; stream each source into its offset.
+        let ptr = unsafe { ferrite_cuda_core::driver::mem_alloc(total_bytes)? };
+        weights.record_alloc(ptr, total_bytes);
+        let mut offset_bytes: usize = 0;
+        for (i, p) in prefixes.iter().enumerate() {
+            let weight_name = format!("{p}.weight");
+            let bytes = shapes_dtypes[i].0[0] * hidden * elem;
+            unsafe {
+                weights.take_into(&weight_name, ptr.add(offset_bytes), stream)?;
+            }
+            offset_bytes += bytes;
+        }
+        let packed_weight = unsafe { GpuTensor::new(ptr, &[total_out, hidden], dtype) };
+
+        // Biases: either all-or-none across the source set.
+        let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();
+        let packed_bias = if weights.contains(&bias_names[0]) {
+            for bn in &bias_names {
+                if !weights.contains(bn) {
+                    anyhow::bail!(
+                        "load_dense_concat: inconsistent bias — `{}` exists but `{bn}` is missing",
+                        bias_names[0],
+                    );
+                }
+            }
+            let mut per_bias_bytes: Vec<usize> = Vec::with_capacity(bias_names.len());
+            let mut total_bias_bytes = 0usize;
+            for bn in &bias_names {
+                let (bshape, bdt) = weights
+                    .tensor_info(bn)
+                    .ok_or_else(|| anyhow::anyhow!("bias metadata missing: {bn}"))?;
+                if bdt != dtype {
+                    anyhow::bail!(
+                        "load_dense_concat: bias `{bn}` dtype {:?} != weight dtype {:?}",
+                        bdt,
+                        dtype,
+                    );
+                }
+                let b = bshape.iter().product::<usize>() * elem;
+                per_bias_bytes.push(b);
+                total_bias_bytes += b;
+            }
+            let bptr = unsafe { ferrite_cuda_core::driver::mem_alloc(total_bias_bytes)? };
+            weights.record_alloc(bptr, total_bias_bytes);
+            let mut boff = 0usize;
+            for (i, bn) in bias_names.iter().enumerate() {
+                unsafe {
+                    weights.take_into(bn, bptr.add(boff), stream)?;
+                }
+                boff += per_bias_bytes[i];
+            }
+            Some(unsafe { GpuTensor::new(bptr, &[total_bias_bytes / elem], dtype) })
+        } else {
+            None
+        };
+
+        Ok(Self::Dense(Linear::new(packed_weight, packed_bias)))
+    }
 }
 
 impl From<Linear> for LinearLayer {

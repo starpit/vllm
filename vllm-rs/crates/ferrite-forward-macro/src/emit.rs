@@ -66,7 +66,11 @@ impl<'a> EmitCtx<'a> {
     /// accessors through this rather than constructing field idents
     /// ad hoc.
     pub fn weight_accessor(&self, name: &syn::Ident) -> TokenStream {
-        quote! { wm.#name() }
+        // Field access on the emitted `Weights` struct. No trait
+        // indirection — the compiler generates both the struct
+        // definition and the `Weights::load` method, so the caller
+        // never writes weight-bookkeeping code.
+        quote! { wm.#name }
     }
 
     /// Read a model-wide integer bound (e.g. `intermediate_size`,
@@ -126,7 +130,7 @@ impl<'a> EmitCtx<'a> {
             }
             FufInput::Weight { id, index } => {
                 let name = weight_field_name(self.program, *id, *index);
-                quote! { wm.#name() }
+                quote! { wm.#name }
             }
             FufInput::Extern { kind, .. } => match kind {
                 ExternKind::InputIds => quote! { ctx.input_ids },

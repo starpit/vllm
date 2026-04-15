@@ -45,6 +45,12 @@ pub use device::GpuDevice;
 #[cfg(feature = "cuda")]
 pub use weights::GpuWeights;
 
+/// Re-export `cudarc::driver::sys::CUstream` at a stable path so
+/// generated code (ferrite-forward, ferrite-models) doesn't have to
+/// pull cudarc into its own Cargo.toml.
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::sys::CUstream;
+
 #[cfg(feature = "nccl")]
 pub mod nccl;
 #[cfg(feature = "nccl")]

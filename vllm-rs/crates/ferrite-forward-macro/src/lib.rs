@@ -231,6 +231,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             syn::Error::new(args.span, format!("unroll [{}]: {e}", model.source_stem))
         })?;
 
+        let t_solve = std::time::Instant::now();
         let mut sfufs = solver::solve(
             &model_fuf,
             &library,
@@ -240,6 +241,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             &args.workloads,
         )
         .map_err(|e| syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem)))?;
+        let d_solve = t_solve.elapsed();
 
         let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
 
@@ -256,6 +258,36 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             &target_profile,
             &model.bounds,
         );
+
+        // Per-model compile banner.  Shows the concrete model variant,
+        // the FUF tile count, scheduler wave count (max across
+        // workloads — gives a sense of parallelism depth), workload
+        // grid size, solve wall-clock, and the best→worst span of
+        // predicted post-contention cost across buckets so the
+        // "decode vs prefill" range is visible at a glance.
+        let (best_us, worst_us) = sfufs
+            .per_num_tokens
+            .values()
+            .map(|a| a.predicted_us)
+            .fold((f64::INFINITY, 0.0_f64), |(b, w), v| (b.min(v), w.max(v)));
+        let max_waves = loops
+            .per_num_tokens
+            .values()
+            .map(|l| l.num_waves())
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "  ferrite · {variant:<18} · {tiles:>4} tiles · {waves:>3} waves · \
+             {workloads:>2} workloads · {solve_ms:>3} ms · {best_us:>5.0}–{worst_us:<5.0} µs",
+            variant = model.source_stem,
+            tiles = model_fuf.len(),
+            waves = max_waves,
+            workloads = args.workloads.len(),
+            solve_ms = d_solve.as_millis(),
+            best_us = best_us,
+            worst_us = worst_us,
+        );
+        let _ = arch_name;
 
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
         let codegen_items =

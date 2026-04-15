@@ -180,23 +180,27 @@ pub fn solve(
     bounds: &BTreeMap<String, u64>,
     num_tokens_points: &[u64],
 ) -> Result<WorkloadAssignments, SolveError> {
-    let t_start = std::time::Instant::now();
+    use rayon::prelude::*;
+
+    // Each workload point is an independent solve: the DP table and
+    // matches_at vector are rebuilt from scratch per `num_tokens`
+    // (workload constraints and per-impl costs vary with it). Running
+    // them in parallel drops the total from `Σ per-workload` to
+    // `max(per-workload)` on well-parallel hardware.
+    let solved: Vec<Result<(u64, Assignment), SolveError>> = num_tokens_points
+        .par_iter()
+        .map(|&m| {
+            let mut scratch = bounds.clone();
+            scratch.insert("num_tokens".into(), m);
+            solve_one(fuf, lib, target, inferred, &scratch, m).map(|a| (m, a))
+        })
+        .collect();
+
     let mut per_num_tokens: BTreeMap<u64, Assignment> = BTreeMap::new();
-    let mut scratch = bounds.clone();
-
-    for &m in num_tokens_points {
-        scratch.insert("num_tokens".into(), m);
-        let assignment = solve_one(fuf, lib, target, inferred, &scratch, m)?;
-        per_num_tokens.insert(m, assignment);
+    for result in solved {
+        let (m, a) = result?;
+        per_num_tokens.insert(m, a);
     }
-
-    let ns = t_start.elapsed().as_nanos();
-    eprintln!(
-        "[ferrite-forward-macro] solver::solve: {} workloads, {} tiles | total={:.1}ms",
-        num_tokens_points.len(),
-        fuf.len(),
-        ns as f64 / 1e6,
-    );
 
     Ok(WorkloadAssignments { per_num_tokens })
 }

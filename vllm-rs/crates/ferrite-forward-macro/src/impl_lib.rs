@@ -737,7 +737,6 @@ fn emit_rmsnorm(ctx: &EmitCtx) -> TokenStream {
                 *(#x),
                 (#w).weight,
                 (#w).eps,
-                0.0f32,
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -1606,16 +1605,19 @@ impl Implementation for TanhSoftCapImpl {
             )
         }) as f32;
 
+        // Mutate the upstream buffer in place, then move it into
+        // the binding as an OwnedTensor so the emitted forward fn
+        // can return it. `tanh_softcap` is terminal (post-lm_head,
+        // final logits) — no later tile reads the upstream ident.
         quote! {
-            unsafe {
+            let #out = unsafe {
                 ::ferrite_kernels::kernels::tanh_softcap_inplace(
                     *#upstream,
                     #cap,
                     device.compute_stream,
                 );
-            }
-            // Downstream reads alias the mutated upstream buffer.
-            let #out = unsafe { (*#upstream).as_view() };
+                #upstream
+            };
         }
     }
 }
@@ -1809,7 +1811,6 @@ impl Implementation for FusedAddRmsNormImpl {
                     *#residual_upstream,
                     (#weight_expr).weight,
                     (#weight_expr).eps,
-                    0.0f32,
                     device.compute_stream,
                 );
             }
@@ -2073,7 +2074,7 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
 
         quote! {
             unsafe {
-                let _ = ::ferrite_kernels::kernels::fused_add_rms_norm_inplace(
+                let _ = ::ferrite_kernels::kernels::fused_add_rms_norm_inplace_with_offset(
                     *#delta_upstream,
                     *#residual_upstream,
                     (#weight_expr).weight,
@@ -2290,7 +2291,7 @@ impl Implementation for ScalarOffsetRmsNormImpl {
 
         quote! {
             let #out = unsafe {
-                ::ferrite_kernels::kernels::rms_norm(
+                ::ferrite_kernels::kernels::rms_norm_with_offset(
                     *(#x),
                     (#weight_expr).weight,
                     (#weight_expr).eps,

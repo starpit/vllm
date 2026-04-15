@@ -118,6 +118,17 @@ pub struct Qwen2FerriteModel {
     pub rotary: vllm_cuda::rotary::RotaryCache,
 }
 
+/// Same as `LlamaFerriteModel` but over Gemma2 — the DSL body in
+/// `ferrite_models::gemma2` expresses Gemma's four-norm-per-layer
+/// structure, alternating sliding/full attention, GELU MLP,
+/// `(1 + w)` rmsnorm convention (as `w + 1.0` in the DSL, folded
+/// to the kernel's `weight_offset` param), and final logit
+/// softcap. Nothing Gemma-specific lives in the compiler.
+pub struct Gemma2FerriteModel {
+    pub weights: ferrite_models::gemma2::Weights,
+    pub rotary: vllm_cuda::rotary::RotaryCache,
+}
+
 /// Supported model architectures in the vllm-cuda backend.
 enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
@@ -131,6 +142,10 @@ enum CudaModel {
     /// boxing rationale as `LlamaFerrite`.
     Qwen2Ferrite(Box<Qwen2FerriteModel>),
     Gemma2(vllm_cuda::model::gemma2::Gemma2ForCausalLM),
+    /// Gemma2 via the `#[forward]`-emitted forward in
+    /// `ferrite_models::gemma2`. Same boxing rationale as
+    /// `LlamaFerrite`.
+    Gemma2Ferrite(Box<Gemma2FerriteModel>),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
     Mixtral(vllm_cuda::model::mixtral::MixtralForCausalLM),
     Qwen2Moe(vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM),
@@ -149,6 +164,7 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.model.layers.len(),
             Self::Qwen2Ferrite(m) => m.weights.num_hidden_layers() as usize,
             Self::Gemma2(m) => m.model.layers.len(),
+            Self::Gemma2Ferrite(m) => m.weights.num_hidden_layers() as usize,
             Self::Gemma3(m) => m.model.layers.len(),
             Self::Mixtral(m) => m.model.layers.len(),
             Self::Qwen2Moe(m) => m.model.layers.len(),
@@ -169,6 +185,7 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen2Ferrite(m) => m.weights.num_key_value_heads() as usize,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
+            Self::Gemma2Ferrite(m) => m.weights.num_key_value_heads() as usize,
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Mixtral(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
@@ -187,6 +204,7 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.head_dim,
             Self::Qwen2Ferrite(m) => m.weights.head_dim() as usize,
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
+            Self::Gemma2Ferrite(m) => m.weights.head_dim() as usize,
             Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
             Self::Mixtral(m) => m.model.layers[0].self_attn.head_dim,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.head_dim,
@@ -205,6 +223,7 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.lm_head.out_features(),
             Self::Qwen2Ferrite(m) => m.weights.vocab_size() as usize,
             Self::Gemma2(m) => m.lm_head.out_features(),
+            Self::Gemma2Ferrite(m) => m.weights.vocab_size() as usize,
             Self::Gemma3(m) => m.lm_head.out_features(),
             Self::Mixtral(m) => m.lm_head.out_features(),
             Self::Qwen2Moe(m) => m.lm_head.out_features(),
@@ -234,6 +253,7 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.lm_head.in_features(),
             Self::Qwen2Ferrite(m) => m.weights.hidden_size() as usize,
             Self::Gemma2(m) => m.lm_head.in_features(),
+            Self::Gemma2Ferrite(m) => m.weights.hidden_size() as usize,
             Self::Gemma3(m) => m.lm_head.in_features(),
             Self::Mixtral(m) => m.lm_head.in_features(),
             Self::Qwen2Moe(m) => m.lm_head.in_features(),
@@ -363,6 +383,22 @@ impl CudaModel {
                     kv_cache,
                     device,
                 )
+            },
+            Self::Gemma2Ferrite(m) => unsafe {
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    rotary: &m.rotary,
+                };
+                ferrite_models::gemma2::forward_backbone(&m.weights, &ctx, device, num_tokens)
             },
             Self::Gemma3(m) => unsafe {
                 m.model.forward(
@@ -597,6 +633,33 @@ impl CudaModel {
                     device,
                     last_token_indices,
                 )
+            },
+            Self::Gemma2Ferrite(m) => unsafe {
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    rotary: &m.rotary,
+                };
+                let logits = ferrite_models::gemma2::forward(&m.weights, &ctx, device, num_tokens);
+                match last_token_indices {
+                    Some(idx) if idx.dim(0) < num_tokens as usize => {
+                        vllm_cuda::kernels::embedding_gather(
+                            logits.as_gpu_tensor(),
+                            *idx,
+                            &mut device.caching,
+                            device.compute_stream,
+                        )
+                    }
+                    _ => logits,
+                }
             },
             Self::Gemma3(m) => unsafe {
                 m.forward(
@@ -5380,21 +5443,105 @@ impl Worker for CudaWorker {
             }
             "Gemma2ForCausalLM" => {
                 let config = gemma2_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_bnb4bit() {
-                    let bnb_cfg = match &qconfig {
-                        vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
-                        _ => unreachable!(),
-                    };
-                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_bnb4bit(
+                // Ferrite-gate: dense-bf16 Gemma2 without quant / TP /
+                // PP routes through `#[forward]`-emitted code. Gate
+                // identical to Llama/Qwen2 above.
+                let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
+                if !qconfig.is_bnb4bit()
+                    && !qconfig.is_fp8()
+                    && !qconfig.is_quantized()
+                    && !use_tp
+                    && !use_pp
+                    && !disable_ferrite
+                {
+                    let stream = device.compute_stream;
+                    let ferrite_weights = ferrite_models::gemma2::Weights::load(
                         &mut weights,
-                        &config,
-                        dtype,
-                        bnb_cfg,
-                        device,
+                        stream,
+                        config.num_hidden_layers as u64,
+                        config.hidden_size as u64,
+                        config.intermediate_size as u64,
+                        config.num_attention_heads as u64,
+                        config.num_kv_heads as u64,
+                        config.head_dim as u64,
+                        config.vocab_size as u64,
                     )
-                } else if qconfig.is_fp8() {
-                    if use_tp {
-                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8_tp(
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!("Gemma2 ferrite-forward load: {e}"))
+                    })?;
+                    let rotary = unsafe {
+                        vllm_cuda::rotary::RotaryCache::new(
+                            config.head_dim,
+                            config.max_position_embeddings,
+                            config.rope_theta,
+                            None, // Gemma2 uses plain RoPE
+                            dtype,
+                            device,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
+                    info!("CudaWorker: loaded Gemma2 via ferrite-forward");
+                    CudaModel::Gemma2Ferrite(Box::new(Gemma2FerriteModel {
+                        weights: ferrite_weights,
+                        rotary,
+                    }))
+                } else {
+                    let m = if qconfig.is_bnb4bit() {
+                        let bnb_cfg = match &qconfig {
+                            vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                            _ => unreachable!(),
+                        };
+                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_bnb4bit(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            bnb_cfg,
+                            device,
+                        )
+                    } else if qconfig.is_fp8() {
+                        if use_tp {
+                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8_tp(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                tp,
+                                device,
+                            )
+                        } else {
+                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                device,
+                            )
+                        }
+                    } else if qconfig.is_quantized() {
+                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_quantized(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            &qconfig,
+                            device,
+                        )
+                    } else if use_tp && use_pp {
+                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp_pp(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            tp,
+                            pp_config.unwrap(),
+                            device,
+                        )
+                    } else if use_pp {
+                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_pp(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            pp_config.unwrap(),
+                            device,
+                        )
+                    } else if use_tp {
+                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp(
                             &mut weights,
                             &config,
                             dtype,
@@ -5402,56 +5549,16 @@ impl Worker for CudaWorker {
                             device,
                         )
                     } else {
-                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8(
+                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load(
                             &mut weights,
                             &config,
                             dtype,
                             device,
                         )
                     }
-                } else if qconfig.is_quantized() {
-                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_quantized(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        &qconfig,
-                        device,
-                    )
-                } else if use_tp && use_pp {
-                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp_pp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        tp,
-                        pp_config.unwrap(),
-                        device,
-                    )
-                } else if use_pp {
-                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_pp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        pp_config.unwrap(),
-                        device,
-                    )
-                } else if use_tp {
-                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        tp,
-                        device,
-                    )
-                } else {
-                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerInit(format!("Gemma2 load: {e}")))?;
-                CudaModel::Gemma2(m)
+                    .map_err(|e| ExecutorError::WorkerInit(format!("Gemma2 load: {e}")))?;
+                    CudaModel::Gemma2(m)
+                } // close else { legacy }
             }
             "Gemma3ForCausalLM" | "Gemma3ForConditionalGeneration" => {
                 // For Gemma3ForConditionalGeneration (multimodal), resolve the

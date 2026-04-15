@@ -1199,15 +1199,32 @@ unsafe extern "C" {
 // RMS Norm
 // ---------------------------------------------------------------------------
 
-/// RMS normalization: `out = input / rms(input) * (weight + weight_offset)`.
+/// RMS normalization: `out = input / rms(input) * weight`.
 ///
 /// * `input`: `[num_tokens, hidden_size]`
 /// * `weight`: `[hidden_size]`
-/// * `weight_offset`: added to each weight element in fp32 before
-///   the multiply. Pass `0.0` for the standard Llama/Qwen2 form
-///   (`y = x * w / rms(x)`); pass `1.0` for Gemma's `(1+w)` form.
 /// * Returns: `[num_tokens, hidden_size]` allocated from arena.
+///
+/// For Gemma-style `y = x * (1 + w) / rms(x)` use the
+/// [`rms_norm_with_offset`] variant that passes the offset to the
+/// kernel.
 pub unsafe fn rms_norm(
+    input: GpuTensor,
+    weight: GpuTensor,
+    eps: f32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    rms_norm_with_offset(input, weight, eps, 0.0, alloc, stream)
+}
+
+/// RMS normalization with an `(weight + weight_offset)` fold,
+/// applied in fp32 inside the kernel with cast-last semantics.
+///
+/// * `weight_offset`: added to each weight element before the
+///   multiply. `0.0` ⇒ standard `rms_norm`; `1.0` ⇒ Gemma-style
+///   `y = x * (1 + w) / rms(x)`.
+pub unsafe fn rms_norm_with_offset(
     input: GpuTensor,
     weight: GpuTensor,
     eps: f32,
@@ -1287,6 +1304,18 @@ pub unsafe fn fused_add_rms_norm_inplace(
     residual: GpuTensor,
     weight: GpuTensor,
     eps: f32,
+    stream: CUstream,
+) -> (GpuTensor, GpuTensor) {
+    fused_add_rms_norm_inplace_with_offset(input, residual, weight, eps, 0.0, stream)
+}
+
+/// Same as [`fused_add_rms_norm_inplace`] but with a
+/// `(weight + weight_offset)` fold for Gemma-style `(1+w)` rmsnorm.
+pub unsafe fn fused_add_rms_norm_inplace_with_offset(
+    input: GpuTensor,
+    residual: GpuTensor,
+    weight: GpuTensor,
+    eps: f32,
     weight_offset: f32,
     stream: CUstream,
 ) -> (GpuTensor, GpuTensor) {
@@ -1342,7 +1371,6 @@ pub unsafe fn fused_add_rms_norm(
     residual: GpuTensor,
     weight: GpuTensor,
     eps: f32,
-    weight_offset: f32,
     alloc: &mut CachingAllocator,
     stream: cudarc::driver::sys::CUstream,
 ) -> (OwnedTensor, GpuTensor) {
@@ -1358,7 +1386,7 @@ pub unsafe fn fused_add_rms_norm(
 
     // Run in-place kernel on normed_buf (which is a copy of input).
     let normed_gpu = normed_buf.as_gpu_tensor();
-    fused_add_rms_norm_inplace(normed_gpu, residual, weight, eps, weight_offset, stream);
+    fused_add_rms_norm_inplace(normed_gpu, residual, weight, eps, stream);
 
     // normed_buf now contains normed output, residual is updated in-place.
     (normed_buf, residual)

@@ -4,17 +4,17 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::too_many_arguments)]
-//! Ferrite model architectures.
+//! Ferrite model architectures. Each module carries one DSL body
+//! via `#[forward]`; the compiler fans out per-model specializations
+//! across `model_architectures/<arch>/*.json`.
 //!
-//! `llama.rs` uses the new `#[forward]` macro (ferrite-forward).
-//!
-//! `qwen2.rs` is gated off: its `ferrite_macros::forward!{}` runs
-//! the pre-DP backtrack-CP solver which dominates compile time
-//! (minutes per edit). It's blocked on HANDOFF.md Step C
-//! (`CublasFusedQkvGemmWithBiasImpl`, gap #5) before it can move
-//! to `#[forward]`. Until then, vllm-cuda routes Qwen2 through the
-//! hand-written `Qwen2ForCausalLM` path — nothing consumes this
-//! file's output.
+//! Qwen2's body is identical to Llama's — the bias on Qwen2's QKV
+//! projections is handled at weight-load time by
+//! `LinearLayer::load_dense_concat`, which auto-detects per-source
+//! `.bias` tensors and packs them into the fused `LinearLayer`;
+//! `Linear::forward` then lights up `cublas.gemm_bias`'s epilog
+//! automatically. No DSL-level `bias_add` op is needed, and no
+//! per-arch Impl addition is required.
 
 pub mod llama;
-// pub mod qwen2;  // re-enable when Step C lands.
+pub mod qwen2;

@@ -28,6 +28,7 @@ mod ast;
 mod cfg;
 mod classified;
 mod classify;
+mod codegen;
 mod config;
 mod fuf;
 mod impl_lib;
@@ -208,7 +209,16 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
 
         let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
 
-        per_model_ts.push(emit_model_stub(model, &model_fuf, &sfufs, &loops));
+        let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
+        let codegen_items =
+            codegen::emit_model(&classified, model, &model_fuf, &sfufs, &loops, &library);
+        let model_mod = &model.name;
+        per_model_ts.push(quote! {
+            pub mod #model_mod {
+                #stub_items
+                #codegen_items
+            }
+        });
     }
 
     // Group every model's emitted module under one `pub mod <arch>`
@@ -227,21 +237,17 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     })
 }
 
-/// Placeholder codegen: emit per-model constants derived from the
-/// real pipeline outputs so integration tests can observe that the
-/// pipeline executed at compile time. Replaced by real codegen in
-/// PLAN task #5.
-fn emit_model_stub(
-    model: &config::ModelParams,
+/// Emit pipeline-observation constants (NUM_TILES /
+/// NUM_SUBGRAPHS / NUM_WAVES / PREDICTED_US per workload) as
+/// items inside the per-model module. Useful for integration
+/// tests that observe the pipeline ran. Lives alongside the
+/// codegen-emitted forward fns in the same module.
+fn emit_model_stub_items(
     fuf: &fuf::Fuf,
     sfufs: &solver::WorkloadAssignments,
     loops: &schedule::WorkloadLoops,
 ) -> proc_macro2::TokenStream {
-    let model_mod = &model.name;
     let num_tiles = fuf.len();
-    // Subgraph count is workload-independent for the starter library
-    // (single-tile claims), but we emit per-workload to avoid baking
-    // in that assumption.
     let mut workload_ts: Vec<proc_macro2::TokenStream> = Vec::new();
     for (m, sfuf) in &sfufs.per_num_tokens {
         let loop_ir = loops
@@ -260,11 +266,8 @@ fn emit_model_stub(
             }
         });
     }
-
     quote! {
-        pub mod #model_mod {
-            pub const NUM_TILES: usize = #num_tiles;
-            #(#workload_ts)*
-        }
+        pub const NUM_TILES: usize = #num_tiles;
+        #(#workload_ts)*
     }
 }

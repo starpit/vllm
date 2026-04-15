@@ -4,5 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Pulls in ferrite-kernels + ferrite-cuda-core so the emitted
+# code's type references resolve. Without this feature, only the
+# numeric pipeline observations (NUM_TILES etc) are available;
+# the emitted runtime types stay gated out.
+cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda"]
+
 [dependencies]
 ferrite-forward-macro = { path = "../ferrite-forward-macro" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+anyhow = { workspace = true }

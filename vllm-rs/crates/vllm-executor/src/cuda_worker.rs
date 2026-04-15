@@ -474,23 +474,26 @@ impl CudaModel {
                     rotary: &m.rotary,
                 };
                 let logits = ferrite_models::llama::forward(&m.weights, &ctx, device, num_tokens);
-                // Chat/decode path: `last_token_indices` is either
-                // None or the identity (one token per request).
-                // Prefill with selective gather (last-token-only)
-                // needs a gather kernel the ferrite path hasn't
-                // grown yet; bail loudly so we catch it before
-                // returning wrong-shape logits.
-                if let Some(idx) = last_token_indices {
-                    let idx_len = idx.dim(0);
-                    if idx_len != num_tokens as usize {
-                        unimplemented!(
-                            "LlamaFerrite::forward: selective last_token_indices \
-                             gather (idx_len={idx_len} < num_tokens={num_tokens}) \
-                             not yet supported — decode-only.",
-                        );
+                // Selective last-token gather for prefill. The
+                // ferrite DSL currently ends with `logits = gemm(..,
+                // lm_head)` which runs lm_head over ALL num_tokens
+                // rows — so we gather AFTER the matmul (correct,
+                // wasteful). A future ferrite-level optimization
+                // would expose a gather op in the DSL so the user
+                // can place it before lm_head. Until then,
+                // `embedding_gather` over logits does the job:
+                // output[i] = logits[indices[i]].
+                match last_token_indices {
+                    Some(idx) if idx.dim(0) < num_tokens as usize => {
+                        vllm_cuda::kernels::embedding_gather(
+                            logits.as_gpu_tensor(),
+                            *idx,
+                            &mut device.caching,
+                            device.compute_stream,
+                        )
                     }
+                    _ => logits,
                 }
-                logits
             },
             Self::Qwen2(m) => unsafe {
                 m.forward(

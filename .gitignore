@@ -202,6 +202,10 @@ AGENTS.md
 
 # Results
 *.csv
+# Calibrated GPU cost sweeps used by the ferrite-forward solver —
+# checked in, never regenerated on every developer machine.
+!vllm-rs/crates/ferrite-solver/data/cost_*.csv
+!target_profiles/cost_*.csv
 
 # Python pickle files
 *.pkl

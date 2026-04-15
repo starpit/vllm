@@ -1,12 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Solver: match kernels to FUF tiles, produce the SFUF.
 //!
-//! Algorithm ported from
-//! `ferrite-solver/src/lowering/solver/dp.rs`. Topological forward
-//! pass with a `claimed[]` bitmap: at each unclaimed tile in topo
-//! order, pick the cheapest [`Implementation`] whose [`MatchInfo`]
-//! doesn't conflict with previously-committed claims. Multi-tile
-//! matches collapse their claimed tiles into one subgraph.
+//! Real dynamic-programming over impl choice. State is
+//! `(position i, claim_state)` where `claim_state` is a K-bit
+//! bitmask encoding which of positions `[i, i+K)` are pre-claimed
+//! by a multi-tile impl committed at an earlier position.
+//!
+//! Recurrence:
+//! ```text
+//! dp[i][cs] =
+//!     if cs bit 0 set:                      // i already claimed
+//!         dp[i+1][cs >> 1]
+//!     else:
+//!         min over candidates c at position i (c.mask & cs == 0):
+//!             per_impl_cost(c) + dp[i+1][(cs | c.mask) >> 1]
+//! ```
+//!
+//! `c.mask` is `c`'s claim pattern as a bitmask with bit 0 = seed
+//! position. After moving past position i, the bitmask shifts left
+//! (bit 0 drops off).
+//!
+//! This is optimal over impl choice given per-impl costs. Contention
+//! (the wave-level 0.5× shadowing of memory-bound impls behind
+//! compute-bound impls) is applied later in `cost::loop_cost_us`
+//! after `schedule::schedule()` builds waves — the solver doesn't
+//! need to know about waves.
+//!
+//! Complexity: O(n × 2^K × C) where n = tiles, K = max claim spread
+//! in the library, C = candidates per position. For today's library
+//! max spread is ~4 and K=8 is plenty of headroom.
 //!
 //! NOT ported from the old DP (llama-specific hacks — see PLAN.md
 //! NON-reuse):
@@ -158,6 +180,7 @@ pub fn solve(
     bounds: &BTreeMap<String, u64>,
     num_tokens_points: &[u64],
 ) -> Result<WorkloadAssignments, SolveError> {
+    let t_start = std::time::Instant::now();
     let mut per_num_tokens: BTreeMap<u64, Assignment> = BTreeMap::new();
     let mut scratch = bounds.clone();
 
@@ -166,6 +189,14 @@ pub fn solve(
         let assignment = solve_one(fuf, lib, target, inferred, &scratch, m)?;
         per_num_tokens.insert(m, assignment);
     }
+
+    let ns = t_start.elapsed().as_nanos();
+    eprintln!(
+        "[ferrite-forward-macro] solver::solve: {} workloads, {} tiles | total={:.1}ms",
+        num_tokens_points.len(),
+        fuf.len(),
+        ns as f64 / 1e6,
+    );
 
     Ok(WorkloadAssignments { per_num_tokens })
 }
@@ -194,9 +225,10 @@ fn solve_one(
     // For each tile (in topological order), enumerate every library
     // Impl whose target/workload filters admit this context. Call
     // matches() at this seed tile; if it returns Some, cost the
-    // match. Sort cheapest first so the forward pass picks greedily
-    // (greedy is optimal over the local-claim structure of the
-    // library — see old dp.rs notes).
+    // match. Unlike greedy, the DP considers all candidates at each
+    // position — no need to sort for optimality. We still sort by
+    // claim size descending for nicer tiebreak determinism during
+    // reconstruction.
     let mut matches_at: Vec<Vec<(ImplId, MatchInfo, f64)>> = vec![Vec::new(); n];
 
     let ctx = CostCtx {
@@ -251,58 +283,202 @@ fn solve_one(
     }
     let _ = inferred; // no longer used here — shapes come via ctx.fuf
 
-    // ── Phase 2: topological forward pass ──
+    // ── Phase 2: convert candidate claim_tiles to bitmasks ──
     //
-    // Walk tiles in order. At each unclaimed tile, pick the cheapest
-    // matching Impl whose claim doesn't overlap previously-committed
-    // claims. Commit: allocate a subgraph id, mark claimed, record.
+    // Each candidate's claim_tiles becomes a K-bit mask relative to
+    // its seed position. Bit 0 = seed; bit j = seed + j. Candidates
+    // whose claim exceeds K bits or reaches backward in topo order
+    // are dropped (with the matches_at[i] entry removed) — they'd
+    // be invariant violations for this DP. Today's library has max
+    // forward spread ~4 so K=8 is plenty of headroom.
+    const K: usize = 8;
+    type ClaimMask = u8;
+
+    let candidates: Vec<Vec<Candidate>> = matches_at
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.iter()
+                .filter_map(|(imp_id, info, cost)| {
+                    let mut mask: ClaimMask = 0;
+                    for t in &info.claimed_tiles {
+                        let pos = t.0 as usize;
+                        if pos < i {
+                            return None; // claims backward — reject
+                        }
+                        let off = pos - i;
+                        if off >= K {
+                            return None; // spread exceeds K bits — reject
+                        }
+                        mask |= 1 << off;
+                    }
+                    if mask & 1 == 0 {
+                        return None; // seed must be in the claim
+                    }
+                    Some(Candidate {
+                        imp_id: *imp_id,
+                        mask,
+                        cost: *cost,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+
+    // ── Phase 3: DP backward fill ──
     //
-    // Unmatched tile (after filtering) → hard UnclaimedTile error.
-    // No auto-claim by tile kind; no silent skip.
-    let mut claimed: Vec<bool> = vec![false; n];
+    // dp[i][cs] = min cost from position i onward given claim_state cs.
+    // f64::INFINITY for infeasible states. Storage: (n+1) × 2^K.
+    let state_count: usize = 1 << K;
+    let infeasible = DpEntry {
+        cost: f64::INFINITY,
+        choice: None,
+    };
+    let mut dp: Vec<Vec<DpEntry>> = vec![vec![infeasible; state_count]; n + 1];
+
+    // Base: reaching the end with no pending claims is the only
+    // feasible terminal state.
+    dp[n][0] = DpEntry {
+        cost: 0.0,
+        choice: None,
+    };
+
+    for i in (0..n).rev() {
+        for cs in 0u32..(state_count as u32) {
+            let cs_mask = cs as ClaimMask;
+            let next_cs = (cs_mask >> 1) as usize;
+
+            if cs_mask & 1 != 0 {
+                // Tile i is pre-claimed — pass through.
+                let next = &dp[i + 1][next_cs];
+                if next.cost.is_finite() {
+                    dp[i][cs as usize] = DpEntry {
+                        cost: next.cost,
+                        choice: None,
+                    };
+                }
+                continue;
+            }
+
+            // Tile i is unclaimed — try each candidate.
+            let mut best = infeasible;
+            for cand in &candidates[i] {
+                if cand.mask & cs_mask != 0 {
+                    continue; // conflict with pending claims
+                }
+                let new_cs = ((cs_mask | cand.mask) >> 1) as usize;
+                let next = &dp[i + 1][new_cs];
+                if !next.cost.is_finite() {
+                    continue;
+                }
+                let total = cand.cost + next.cost;
+                if total < best.cost {
+                    best = DpEntry {
+                        cost: total,
+                        choice: Some((cand.imp_id, cand.mask)),
+                    };
+                }
+            }
+            dp[i][cs as usize] = best;
+        }
+    }
+
+    if !dp[0][0].cost.is_finite() {
+        // No feasible plan for this workload. Emit the specific
+        // tile where we ran out of candidates.
+        if let Some((i, _)) = candidates
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.is_empty())
+        {
+            return Err(SolveError::UnclaimedTile {
+                tile: fuf.nodes[i].id,
+                op: fuf.nodes[i].op,
+                num_tokens,
+            });
+        }
+        // Every tile has candidates but the DP still failed — means
+        // the bitmask K is too small for some multi-tile claim.
+        // Bump K if this ever fires.
+        return Err(SolveError::UnclaimedTile {
+            tile: fuf.nodes[0].id,
+            op: fuf.nodes[0].op,
+            num_tokens,
+        });
+    }
+
+    // ── Phase 4: forward reconstruction ──
+    //
+    // Walk from (position 0, claim_state 0) following stored choices.
+    // Allocate subgraph ids in visitation order.
     let mut assignment = Assignment::default();
     let mut next_sg: u32 = 0;
+    let mut cs: ClaimMask = 0;
     let mut total = 0.0_f64;
 
     for i in 0..n {
-        if claimed[i] {
-            continue;
-        }
-        let node = &fuf.nodes[i];
-
-        let best = matches_at[i]
-            .iter()
-            .find(|(_, info, _)| info.claimed_tiles.iter().all(|t| !claimed[t.0 as usize]));
-
-        let Some((imp_id, info, cost)) = best else {
-            return Err(SolveError::UnclaimedTile {
-                tile: node.id,
-                op: node.op,
-                num_tokens,
-            });
+        let entry = dp[i][cs as usize];
+        let (imp_id, mask) = match entry.choice {
+            Some(c) => c,
+            None => {
+                // Pass-through; tile was pre-claimed.
+                cs >>= 1;
+                continue;
+            }
         };
 
         let sg = SubgraphId(next_sg);
         next_sg += 1;
 
-        for t in &info.claimed_tiles {
-            claimed[t.0 as usize] = true;
-            assignment.cover.insert(*t, sg);
+        // Mark all tiles claimed by this impl, and recover the
+        // per-impl cost. We stored imp_id + mask; look up the cost
+        // again from the matching candidate for determinism.
+        let cand = candidates[i]
+            .iter()
+            .find(|c| c.imp_id == imp_id && c.mask == mask)
+            .expect("DP stored a candidate that exists in the candidate list");
+
+        for j in 0..K {
+            if mask & (1 << j) != 0 {
+                let tile_idx = i + j;
+                if tile_idx < n {
+                    assignment.cover.insert(fuf.nodes[tile_idx].id, sg);
+                }
+            }
         }
-        assignment.impls.insert(sg, *imp_id);
-        total += cost;
+        assignment.impls.insert(sg, imp_id);
+        total += cand.cost;
+
+        cs = (cs | mask) >> 1;
     }
 
-    // Invariant: every tile is claimed. Topo forward pass + "every
-    // seed has at least one matching Impl" should guarantee this.
+    // Invariant: every tile is claimed.
     debug_assert!(
-        claimed.iter().all(|&c| c),
-        "DP left {} tiles unclaimed",
-        claimed.iter().filter(|&&c| !c).count(),
+        assignment.cover.len() == n,
+        "DP left {} tiles uncovered",
+        n - assignment.cover.len(),
     );
 
     assignment.predicted_us = total;
     Ok(assignment)
+}
+
+/// One candidate impl choice at a given tile position.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    imp_id: ImplId,
+    /// Bit `j` set ⇒ position `seed + j` is claimed. Bit 0 (seed)
+    /// is always set by construction.
+    mask: u8,
+    cost: f64,
+}
+
+/// DP table entry: best cost and the choice that achieved it (or
+/// `None` if this position was passed through — pre-claimed).
+#[derive(Debug, Clone, Copy)]
+struct DpEntry {
+    cost: f64,
+    choice: Option<(ImplId, u8)>,
 }
 
 /// Resolve each tile input's shape for the cost function.

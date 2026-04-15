@@ -206,6 +206,47 @@ mod tests {
         );
     }
 
+    /// `loop_cost_us` must be deterministic across repeated calls on
+    /// the same inputs. Non-determinism here (old ferrite-solver had
+    /// a HashMap-iteration bug that caused this) would invalidate
+    /// any future cost-aware optimization pass: two calls in a row
+    /// on the same assignment returned different numbers.
+    #[test]
+    fn loop_cost_us_is_deterministic() {
+        let params = llama_params("llama-3.2-1b");
+        let file: syn::File =
+            syn::parse_str(&format!("fn _c() {{ {LLAMA_BODY} }}")).expect("parse");
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let ast = parse_block(block).unwrap();
+        let program = classify(&ast).unwrap();
+        let inferred = infer(&program).unwrap();
+        let cfg = build_cfg(&program, &params).unwrap();
+        let fuf = unroll(&cfg, &inferred).unwrap();
+        let lib = starter_library();
+        let target = l4_target();
+
+        let sfufs = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1, 512]).unwrap();
+        let loops = schedule_workloads(&fuf, &sfufs);
+
+        let mut scratch = params.bounds.clone();
+        for &m in &[1u64, 512] {
+            scratch.insert("num_tokens".into(), m);
+            let sfuf = &sfufs.per_num_tokens[&m];
+            let loop_ir = &loops.per_num_tokens[&m];
+            let first = loop_cost_us(&fuf, sfuf, loop_ir, &lib, &target, &scratch);
+            for _ in 0..20 {
+                let again = loop_cost_us(&fuf, sfuf, loop_ir, &lib, &target, &scratch);
+                assert!(
+                    (first - again).abs() < 1e-9,
+                    "loop_cost_us returned {first} then {again} at num_tokens={m}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn refresh_predicted_us_overwrites_in_place() {
         let params = llama_params("llama-3.2-1b");

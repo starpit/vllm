@@ -77,15 +77,42 @@ duplicated in `vllm-cuda/src/model/llama.rs:3645`,
 Done when: `vllm bench` on Llama-3.2-1B hits within 5% of the old
 path on L4.
 
-### Step B — Scheduled megakernel (HIGH PRIORITY per user)
+### Step B — DeviceCallable Impls + fused-launch codegen (HIGH PRIORITY per user)
 
-Closes gaps #10, #11, #12, #14. Port `ferrite-solver/src/kernel_library.rs`
-+ `templates/scheduled/megakernel.cu`. Read
-`vllm-rs/crates/ferrite-solver/SCHEDULED_MEGAKERNEL_HANDOFF.md`
-first — design decisions already made there, do not re-derive.
-Wave-merging + cooperative-launch codegen. `CoopExclusivity`
-constraint first; `RegBudget` / `ShmemBudget` for megakernel wave
-selection.
+Today every Impl in the library is `LaunchKind::HostCallback`.
+`LaunchKind::DeviceCallable` exists in the enum but is unused, and
+`codegen.rs` emits one kernel launch per subgraph with no
+awareness of the tag. This step makes DeviceCallable real: a wave
+of DeviceCallable subgraphs becomes one fused GPU launch instead
+of N sequential ones.
+
+Closes gaps #10, #11, #12, #14. Concretely:
+
+1. **Add one DeviceCallable Impl** (e.g. `DeviceCallableRmsNormImpl`).
+   A wave containing DeviceCallable subgraphs is the minimal case
+   that forces every other piece below to get real.
+2. **Scheduler: compilation units within a wave.** Today `Wave =
+   Vec<(SubgraphId, ImplId)>`; in the new shape, a wave is a list
+   of compilation units, where a unit is one HostCallback subgraph
+   *or* a contiguous run of DeviceCallable subgraphs bundled into
+   one fused launch.
+3. **Solver: wire `Resources` budget checks.** When the DP bundles
+   DeviceCallables into a unit, the union of `Resources
+   { registers_per_thread, shared_memory_bytes }` must fit the
+   target SM's per-block limits. Today `Resources::ZERO` is
+   returned by every Impl and nothing checks. This becomes a real
+   constraint once DeviceCallables exist.
+4. **Codegen: emit fused kernel launches.** Sub-decision to make
+   with the first DeviceCallable Impl: (a) emit `.cu` at
+   macro-expansion time, (b) NVRTC at runtime, or (c) a pre-
+   compiled template kernel with a runtime dispatch table.
+5. **Handoff:** `Handoff::Shmem` for intra-unit (DeviceCallable →
+   DeviceCallable inside the same fused launch);
+   `Handoff::StreamOrder` across unit boundaries.
+
+Done when: a wave with two adjacent DeviceCallable Impls emits one
+fused kernel launch, and `vllm bench` shows measurably fewer launch
+overheads on decode.
 
 ### Step C — Fusion parity
 

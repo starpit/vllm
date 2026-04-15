@@ -431,16 +431,22 @@ mod tests {
                 sfuf.is_cover_complete(fuf.len()),
                 "cover not complete at m={m}"
             );
-            // FusedGateUpSiluMulImpl collapses 4 tiles per layer into
-            // one subgraph, so subgraph count is strictly less than
-            // tile count. Per-layer savings: 3 (4 tiles → 1 subgraph
-            // per SwiGLU; other tiles stay singleton). With NL
-            // unrolled layers, that's 3*NL fewer subgraphs.
+            // Fusion savings per layer:
+            //   SwiGLU (gate, up, silu, mul) → 1 subgraph (saves 3)
+            //   attn-residual Add + post_attn_layernorm → 1 (saves 1)
+            //   MLP-residual Add + next-layer input_layernorm (or
+            //     final norm, on the last layer) → 1 (saves 1)
+            // Total: 5 fewer subgraphs per layer. The first layer's
+            // input_layernorm has no preceding Add (its upstream is
+            // embed), so it stays a singleton — already accounted for
+            // by the 5*NL count because the LAST Add's fusion partner
+            // is the post-loop final RmsNorm.
             let nl = params.bounds["num_hidden_layers"] as usize;
             assert_eq!(
                 sfuf.num_subgraphs(),
-                fuf.len() - 3 * nl,
-                "expected 3*NL fewer subgraphs than tiles at m={m} (SwiGLU fusion)"
+                fuf.len() - 5 * nl,
+                "expected 5*NL fewer subgraphs than tiles at m={m} \
+                 (SwiGLU + attn-residual + mlp-residual fusions)"
             );
             assert!(
                 sfuf.predicted_us > 0.0 && sfuf.predicted_us.is_finite(),
@@ -502,6 +508,72 @@ mod tests {
             assert_eq!(
                 fused_count, nl,
                 "expected one fused SwiGLU subgraph per layer at m={m}",
+            );
+        }
+    }
+
+    #[test]
+    fn add_rmsnorm_pairs_claimed_as_fused_subgraph() {
+        // Every Add in a realistic Llama body has an immediate
+        // RmsNorm consumer. FusedAddRmsNormImpl claims each pair as
+        // one 2-tile subgraph. The first layer's input_layernorm is
+        // the exception — its upstream is `embed`, not an Add — so
+        // it stays a singleton RmsNormRefImpl claim.
+        let params = llama_params("llama-3.1-8b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512, 4096],
+        )
+        .unwrap();
+
+        let nl = params.bounds["num_hidden_layers"] as usize;
+
+        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+            let mut fused_pair_count = 0;
+            let mut singleton_rmsnorm_count = 0;
+            for sg in sfuf.subgraphs() {
+                let tiles = sfuf.tiles_in_subgraph(sg);
+                let ops: Vec<OpKind> = tiles.iter().map(|t| fuf.get(*t).op).collect();
+                if tiles.len() == 2 && ops.contains(&OpKind::Add) && ops.contains(&OpKind::RmsNorm)
+                {
+                    fused_pair_count += 1;
+                    let imp_id = sfuf.impl_of(sg).unwrap();
+                    assert_eq!(
+                        lib.get(imp_id).name(),
+                        "fused_add_rms_norm",
+                        "subgraph at m={m} has Add+RmsNorm topology but wrong impl",
+                    );
+                } else if tiles.len() == 1 && ops[0] == OpKind::RmsNorm {
+                    singleton_rmsnorm_count += 1;
+                    let imp_id = sfuf.impl_of(sg).unwrap();
+                    assert_eq!(
+                        lib.get(imp_id).name(),
+                        "rmsnorm_ref",
+                        "singleton RmsNorm at m={m} bound to wrong impl",
+                    );
+                }
+            }
+            // 2 Adds per layer, each fuses with a following RmsNorm
+            // (post_attn or next input_layernorm / final norm) → 2*NL
+            // fused pairs.
+            assert_eq!(
+                fused_pair_count,
+                2 * nl,
+                "expected 2*NL fused Add+RmsNorm pairs at m={m}",
+            );
+            // Only the first layer's input_layernorm escapes fusion
+            // (upstream = embed, not Add). One singleton RmsNorm.
+            assert_eq!(
+                singleton_rmsnorm_count, 1,
+                "expected exactly one singleton RmsNorm (first input_layernorm) at m={m}",
             );
         }
     }

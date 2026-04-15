@@ -799,31 +799,11 @@ fn emit_attention(ctx: &EmitCtx) -> TokenStream {
     }
 }
 
-fn emit_add(ctx: &EmitCtx) -> TokenStream {
-    // Placeholder: `ferrite-kernels` has `add_inplace` (in-place on
-    // the LHS), not an owned-returning `add`. The real path is a
-    // `FusedAddRmsNorm` multi-tile impl that claims `(Add, RmsNorm)`
-    // and calls `fused_add_rms_norm_inplace`. A surviving standalone
-    // `Add` claim (residual without a following rmsnorm — does not
-    // occur in Llama/Qwen2) would need its own kernel wrapping.
-    //
-    // Cuda build gap: this still references a non-existent symbol.
-    // Untouched here; C2 port of `FusedAddRmsNormImpl` will delete
-    // this fallback along with `AddRefImpl`.
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let a = ctx.input_expr(tile, 0);
-    let b = ctx.input_expr(tile, 1);
-    quote! {
-        let #out = unsafe {
-            ::ferrite_kernels::kernels::add_owned(
-                #a, #b,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
-    }
-}
+// No standalone `emit_add`: every `Add` in Llama/Qwen2 is immediately
+// consumed by an `RmsNorm`, so `FusedAddRmsNormImpl` below claims
+// the pair and maps to `fused_add_rms_norm_inplace`. A lone `Add`
+// with no downstream `RmsNorm` surfaces as `SolveError::UnclaimedTile`,
+// not as a silent fallback.
 
 fn cost_embed(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     // One gather per output element, bandwidth-bound.
@@ -945,15 +925,6 @@ trivial_impl!(
     emit_attention,
     true
 );
-trivial_impl!(
-    AddRefImpl,
-    OpKind::Add,
-    "add_ref",
-    elementwise_cost,
-    emit_add,
-    false
-);
-
 // Silu and Mul have no singleton impls. The only kernel in
 // `ferrite-kernels` that implements them is `silu_and_mul_fused`,
 // which operates on a packed `[num_tokens, 2*intermediate]` buffer
@@ -978,12 +949,13 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(GemmRefImpl));
     lib.push(Box::new(RopeAppendRefImpl));
     lib.push(Box::new(AttentionRefImpl));
-    lib.push(Box::new(AddRefImpl));
-    // Multi-tile fusions. Must come after the singletons so that the
-    // solver's cost-sort still picks them (they claim more tiles at
-    // lower per-tile cost). No `Silu`/`Mul` singletons exist — the
-    // only kernel path is this 4-tile fused claim.
+    // Multi-tile fusions. The solver's claim-size-DESC sort picks
+    // these over singleton coverage when both apply; the singletons
+    // stay as fallbacks for tile positions the fusion doesn't match
+    // (e.g. the first layer's input_layernorm, whose upstream is
+    // `embed` not `Add`, stays a singleton RmsNorm claim).
     lib.push(Box::new(FusedGateUpSiluMulImpl));
+    lib.push(Box::new(FusedAddRmsNormImpl));
     lib
 }
 
@@ -1267,6 +1239,195 @@ fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
     node.inputs
         .iter()
         .any(|i| matches!(i, FufInput::Tile { id, .. } if *id == producer))
+}
+
+// ── FusedAddRmsNormImpl ──────────────────────────────────────────
+//
+// Multi-tile impl claiming `(Add, RmsNorm)` where the RmsNorm's
+// input is the Add's output. Maps to
+// `ferrite_kernels::fused_add_rms_norm_inplace`, which:
+//   residual += delta          (in-place on residual)
+//   input_buf = norm(residual) (in-place on delta's buffer)
+// returning (normed_ptr_aliasing_delta, residual_ptr).
+//
+// Emit binds the `RmsNorm` output to the post-mutation delta buffer
+// (as a `TensorView` alias) and the `Add` output to the post-mutation
+// residual buffer (also as a `TensorView` alias). Both aliases borrow
+// off the ambient OwnedTensor bindings that held `delta` and
+// `residual` before the call — those OwnedTensors stay alive in the
+// forward fn scope for the kernel's async lifetime.
+//
+// Seeded on the `Add`: topologically upstream, guaranteed to be
+// processed before the solver reaches the `RmsNorm`. A lone `Add`
+// with no downstream `RmsNorm` (does not occur in Llama/Qwen2)
+// returns `None` → `UnclaimedTile` library gap.
+
+#[derive(Debug, Default)]
+pub struct FusedAddRmsNormImpl;
+
+impl Implementation for FusedAddRmsNormImpl {
+    fn name(&self) -> &'static str {
+        "fused_add_rms_norm"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let add_node = fuf.get(seed);
+        if add_node.op != OpKind::Add {
+            return None;
+        }
+        // Find an immediate RmsNorm consumer. "Immediate" in the
+        // topological sense: any RmsNorm whose first input is this
+        // Add's output. More than one such consumer is possible in
+        // theory (not in Llama/Qwen2); we claim the first we find.
+        let rmsnorm_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::RmsNorm && consumes_tile(n, seed))?;
+
+        let mut claimed = [seed, rmsnorm_node.id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+
+        // Boundary inputs: the Add's two upstream tiles (delta and
+        // residual) — RmsNorm's weight input is a Weight, not a Tile.
+        let boundary_inputs: Vec<TileId> = add_node
+            .inputs
+            .iter()
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs,
+            // Both outputs are live downstream: RmsNorm's normed
+            // feeds the post-norm compute; Add's updated-residual
+            // feeds the next residual stream.
+            boundary_outputs: vec![seed, rmsnorm_node.id],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: one read of delta + residual + weight,
+        // one write of residual + normed. bf16 everywhere.
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        // 2 reads (delta, residual) + 2 writes (residual, normed) of
+        // [num_tokens, hidden] bf16, plus weight [hidden] bf16 read.
+        let bytes = (4.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    // Default `required_weights` suffices: the only weight input
+    // across claimed tiles belongs to the RmsNorm, and it's consumed
+    // by an `OpKind::RmsNorm` tile → typed as `RmsNorm` by
+    // `rust_type_for_weight_consumed_by`.
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Identify Add + RmsNorm tiles from the claim.
+        let add_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Add)
+            .expect("fused add/rmsnorm claim must contain Add");
+        let rmsnorm_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("fused add/rmsnorm claim must contain RmsNorm");
+
+        // Add's inputs: delta (slot 0), residual (slot 1). Reach past
+        // `input_expr`'s `(*_).as_view()` wrapper to get the raw
+        // upstream idents so we can (a) feed GpuTensor to the kernel
+        // and (b) bind TensorView aliases to the same storage.
+        let delta_upstream = ctx
+            .input_tile_ident(add_id, 0)
+            .expect("Add input 0 (delta) is a Tile");
+        let residual_upstream = ctx
+            .input_tile_ident(add_id, 1)
+            .expect("Add input 1 (residual) is a Tile");
+
+        // RmsNorm's weight accessor — uses the default
+        // `required_weights` declaration name.
+        let node = ctx.fuf.get(rmsnorm_id);
+        let (weight_id, weight_idx) = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("RmsNorm has a weight input");
+        let weight_name = weight_field_name(ctx.program, weight_id, weight_idx);
+        let weight_expr = ctx.weight_accessor(&weight_name);
+
+        // Output bindings. The kernel mutates delta_upstream's buffer
+        // into the normed output and residual_upstream's buffer into
+        // the updated residual. Downstream tiles read these via
+        // `(*ident).as_view()`; `TensorView::from_raw` (unsafe) gives
+        // us the Deref-to-GpuTensor shape the emit convention wants.
+        let add_out = ctx.output_ident(add_id, 0);
+        let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
+
+        quote! {
+            // Fused `residual += delta; normed = norm(residual) * w`.
+            // Both buffers are mutated in place; the upstream
+            // OwnedTensors (#delta_upstream / #residual_upstream)
+            // remain the owners — we only alias them as TensorViews
+            // for downstream reads.
+            unsafe {
+                let _ = ::ferrite_kernels::kernels::fused_add_rms_norm_inplace(
+                    *#delta_upstream,
+                    *#residual_upstream,
+                    (#weight_expr).weight,
+                    (#weight_expr).eps,
+                    device.compute_stream,
+                );
+            }
+            // Aliases: #rmsnorm_out points at the (now-normed)
+            // delta buffer; #add_out points at the (now-updated)
+            // residual buffer.
+            let #rmsnorm_out = (#delta_upstream).view();
+            let #add_out = (#residual_upstream).view();
+        }
+    }
 }
 
 #[cfg(test)]

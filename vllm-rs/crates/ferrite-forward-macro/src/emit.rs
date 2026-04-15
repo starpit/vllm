@@ -99,6 +99,21 @@ impl<'a> EmitCtx<'a> {
         node.inputs.iter().map(|i| self.emit_input(i)).collect()
     }
 
+    /// The raw let-binding ident of the producer tile for `tile`'s
+    /// input slot — `None` if the slot is a Weight or Extern.
+    ///
+    /// Fusion impls that need to alias an upstream OwnedTensor (e.g.
+    /// a kernel that mutates `residual` in place and wants a
+    /// downstream TensorView borrowed off the same storage) use this
+    /// to reach past `input_expr`'s `(*_).as_view()` wrapper.
+    pub fn input_tile_ident(&self, tile: TileId, slot: usize) -> Option<syn::Ident> {
+        let node = self.fuf.get(tile);
+        match node.inputs.get(slot)? {
+            FufInput::Tile { id, slot } => self.locals.get(&(*id, *slot)).cloned(),
+            _ => None,
+        }
+    }
+
     fn emit_input(&self, input: &FufInput) -> TokenStream {
         match input {
             FufInput::Tile { id, slot } => {

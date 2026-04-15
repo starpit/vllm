@@ -231,6 +231,10 @@ mod tests {
             oproj = gemm(attn, self_attn.o_proj[layer]);
             hidden_states = add(oproj, hidden_states);
         }
+        // Post-loop final norm so the last iteration's Add has a
+        // downstream RmsNorm consumer — otherwise the solver has no
+        // coverage for that Add (no standalone Add impl exists).
+        final_norm = rmsnorm(hidden_states, norm);
     "#;
 
     #[test]
@@ -274,6 +278,7 @@ mod tests {
                 oproj = gemm(q, self_attn.o_proj[layer]);
                 hidden_states = add(oproj, hidden_states);
             }
+            final_norm = rmsnorm(hidden_states, norm);
             "#,
             &llama_3_2_1b_params(),
         );
@@ -315,6 +320,7 @@ mod tests {
                     oproj = gemm(q, self_attn.o_proj[layer]);
                     hidden_states = add(oproj, hidden_states);
                 }
+                final_norm = rmsnorm(hidden_states, norm);
             }"#,
         )
         .unwrap();

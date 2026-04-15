@@ -5012,11 +5012,18 @@ impl Worker for CudaWorker {
                 // config against every compiled model and picks the
                 // matching variant; RotaryCache is built separately
                 // until the ferrite DSL grows to own it too.
+                //
+                // `FERRITE_DISABLE=1` routes dense through the
+                // hand-written `LlamaForCausalLM` instead — a
+                // known-good reference against which the ferrite
+                // output can be diffed per-layer.
+                let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
                 if !qconfig.is_bnb4bit()
                     && !qconfig.is_fp8()
                     && !qconfig.is_quantized()
                     && !use_tp
                     && !use_pp
+                    && !disable_ferrite
                 {
                     let stream = device.compute_stream;
                     let ferrite_weights = ferrite_models::llama::Weights::load(

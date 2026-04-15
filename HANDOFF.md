@@ -611,87 +611,110 @@ Remaining warnings on the smollm test are expected bf16 drift at
 position ≥ 10 with the diverged token still in each side's
 top-N.
 
+### Landed since the correctness fix
+
+Items from the original gap list that are now done. Dropped from
+the remaining-work section below; re-listed here so future
+sessions don't re-port them.
+
+1. **Qwen2 ferrite migration** — `ferrite-models/src/qwen2.rs`
+   uses the same `#[forward]` DSL body as Llama. Qwen2's QKV bias
+   rides through `LinearLayer::load_dense_concat` + `cublas.gemm_bias`
+   automatically; no bespoke `CublasFusedQkvGemmWithBiasImpl` was
+   needed. `CudaModel::Qwen2Ferrite` in `cuda_worker.rs` parallels
+   `LlamaFerrite` and carries all the accessor / forward arms.
+   Dense-bf16 Qwen2 now routes through ferrite; quant / TP / PP
+   keep the hand-written path.
+2. **Cutlass GEMM zoo + CSV costs** — `target_profiles/cost_*.csv`
+   holds the three calibrated sweeps (L4/SM89, L40S/SM89,
+   H100/SM90). `TargetProfile` auto-loads `cost_<name>.csv`
+   alongside the JSON. `CutlassGemmImpl { tile_m, tile_n, stages }`
+   is registered for every CUTLASS_TILE_ZOO entry plus
+   `CutlassGemvImpl` for M=1. `target_compatible` filters by
+   CSV-row presence so targets without data silently fall back to
+   `GemmRefImpl`; `cost_gemm` (cuBLAS) now also consults the
+   CSV so cutlass-vs-cublas comparisons are apples-to-apples.
+   Matchers reject Gemms whose output feeds `RopeAppend`/`Silu`/
+   `Mul` — picking cutlass for a QKV or gate/up gemm would
+   orphan the fused downstream chain.
+3. **Span rotation on decode attention** —
+   `AttentionViaCacheImpl::emit_call` routes through
+   `attention_helpers::attention_decode_from_cache`, which builds
+   `cos_sin_cache_ptr` + `rotary_dim` from
+   `kv_cache.block_unrotated_gpu()` and dispatches to
+   `fp8_decode_attention` when `kv_cache.is_fp8()`.
+4. **FP8 decode fused-QKV branch** —
+   `FusedQkvRopeCacheImpl::emit_call` emits a runtime
+   `if ctx.kv_cache.is_fp8() { fused_qkv_rope_cache_fp8(...) }
+   else { fused_qkv_rope_cache(...) }` so fp8-KV/bf16-weight
+   models work once `cuda_worker.rs` loosens its fp8 gate.
+5. **PP backbone forward** — `codegen::emit_forward_backbone_for_bucket`
+   emits a parallel `forward_backbone_m_<N>` per bucket that
+   skips the terminal lm_head subgraph and DtoD-clones the
+   penultimate tile's output into a fresh `OwnedTensor`.
+   Arch-level `forward_backbone` dispatches over the Weights
+   enum. `LlamaFerrite::hidden_states` /
+   `Qwen2Ferrite::hidden_states` call it. Loader still gates
+   ferrite off for `use_pp` — backbone is ready for when that
+   flips.
+6. **Delete legacy (Step G)** — `ferrite-macros`, `ferrite-solver`,
+   `ferrite-test-harness` are gone (~73k lines deleted).
+   `cpu_golden.rs` moved to `ferrite-forward/src/cpu_golden.rs`
+   (rayon stripped; it's reference code, not a perf path).
+   `target_profiles/cost_*.csv` preserves the calibrated sweeps.
+
 ### Remaining gaps vs. prior ferrite
 
 Everything below is NOT blocked on another gap unless noted;
 tackle in roughly this order.
 
-1. **Qwen2 ferrite migration** — blocked on a
-   `CublasFusedQkvGemmWithBiasImpl` (Qwen2's QKV gemm has bias;
-   today's `FusedQkvRopeCacheImpl`/`FusedQkvRopePrefillImpl`
-   assume no QKV bias). Once the impl lands, flip
-   `ferrite-models/src/qwen2.rs` from `forward!{}` to
-   `#[forward]`, drop the `Qwen2` routing hack in
-   `cuda_worker.rs`, and confirm `test_cuda_correctness_qwen2_0_5b`
-   stays green.
-2. **Cutlass GEMM zoo + CSV costs** — prior ferrite had
-   calibrated cutlass tile variants per (M, shape) in
-   `ferrite-solver/data/*.csv`, selected by the solver. Port the
-   CSVs (preserve them when Step G deletes the crate) and add
-   `CutlassGemmImpl` with a cost fn that reads the CSV. Today's
-   `GemmRefImpl` always falls through to cuBLAS; that's a real
-   perf regression vs. 3167eb93's path.
-3. **DeviceCallable / megakernel emission** — every library Impl
-   is `LaunchKind::HostCallback`. The compiler's codegen already
-   dispatches on `LaunchKind` in principle, but there are no
-   DeviceCallable Impls for the memory-bound tail (rmsnorm, silu,
-   add, rope, elementwise) so nothing fuses into `__global__`
-   megakernels. Port the device bodies + add the emission arm.
-4. **FP8 decode kernel** — hand-written has
-   `fused_qkv_rope_cache_fp8` / `fp8_decode_attention` for
-   fp8 KV-cache. Ferrite has no fp8 Impl, so fp8 KV routes stay
-   on the hand-written path. Add `FusedQkvRopeCacheFp8Impl` +
-   `AttentionViaCacheFp8Impl`.
-5. **Quantized Linear (marlin INT4, bnb4bit, awq/gptq, fp8
+1. **DeviceCallable / megakernel emission** — every library Impl
+   is `LaunchKind::HostCallback` or `LaunchKind::RegularLaunch`.
+   The compiler's codegen already dispatches on `LaunchKind` in
+   principle, but there are no DeviceCallable Impls for the
+   memory-bound tail (rmsnorm, silu, add, rope, elementwise) so
+   nothing fuses into `__global__` megakernels. Port the device
+   bodies + add the emission arm.
+2. **Quantized Linear (marlin INT4, bnb4bit, awq/gptq, fp8
    block)** — `LinearLayer` has Marlin/Bnb/Ggml/Fp8/Fp8Block
    variants; ferrite's gemm impls only thread
    `LinearLayer::forward`'s dense arm. For quantized models the
    solver would need quantization-aware Impls; today those
    models must route around ferrite. `cuda_worker.rs` already
-   filters ferrite off for `qconfig.is_bnb4bit()`,
-   `is_fp8()`, `is_quantized()`.
-6. **Span rotation / KV compaction** — hand-written
-   `attention_helpers::attention_decode_from_cache` passes
-   `cos_sin_cache_ptr` + `rotary_dim` when
-   `kv_cache.block_unrotated_gpu()` is non-null so FA2 can
-   rotate flagged paged-cache blocks (relocatable KV / spans).
-   Ferrite's `AttentionViaCacheImpl` calls the non-ext
-   `flash_attn_paged` which hardcodes null cos_sin_cache. Move
-   to `flash_attn_paged_ext` with the real flags.
-7. **QK-norm** (Qwen3, Gemma3) — `qk_norm_inplace` +
+   filters ferrite off for `qconfig.is_bnb4bit()`, `is_fp8()`,
+   `is_quantized()`.
+3. **QK-norm** (Qwen3, Gemma3) — `qk_norm_inplace` +
    `rotary_embedding_q_only` path. Needs a `FusedQkvQkNormRopeImpl`.
-8. **Granite multipliers** — `embedding_multiplier`,
+4. **Granite multipliers** — `embedding_multiplier`,
    `residual_multiplier`, `logits_scaling`. DSL doesn't express
    `scale_inplace`; either add a `scale` op + Impl or bake the
    scalar into fused norm/gemm Impls.
-9. **Sliding-window / Gemma2** — alternating sliding-window
+5. **Sliding-window / Gemma2** — alternating sliding-window
    attention by layer, pre+post norms, approximate GELU, query
    scaling, logit soft-capping. The Gemma2 diff should hit
    only the model crate + new op Impls per the "Gemma2 acid
    test" invariant; if anything in the compiler itself needs
    surgery, the design is wrong.
-10. **MoE (Mixtral, Qwen2-MoE)** — needs a DSL construct for
-    `for each of top-k experts run sub-body`. Generic language
-    extension, not an MoE-specific branch.
-11. **MLA (DeepSeek-V2)** — new `attention_mla` op + kernel +
-    Shape signature; compiler stays out of MLA.
-12. **Pipeline-parallelism** — `LlamaFerrite::hidden_states`
-    (backbone-only) is `unimplemented!()` in `cuda_worker.rs`.
-    PP ranks currently can't use ferrite. Emit a
-    `forward_backbone_only` variant (returns hidden_states
-    before lm_head).
-13. **Per-layer golden diff harness** — not needed to unblock
-    the immediate bug (static-analysis fix landed), but still
-    worth rebuilding for future regression work. Recover
-    `gen_golden.rs` from `a13577f75^`, add a `DUMP_GOLDEN=<path>`
-    env-var hook on `LlamaForCausalLM::forward`, emit a
-    `forward_with_snapshots` variant from the macro, and diff
-    per-subgraph. `cpu_golden.rs` moves from `ferrite-solver` to
-    `ferrite-forward` as part of Step G.
-14. **Delete legacy** — once Qwen2 migrates (#1) and any
-    remaining `forward!{}` sites follow, delete
-    `ferrite-macros` and `ferrite-solver` (preserving
-    `ferrite-solver/data/*.csv` first; see #2).
+6. **MoE (Mixtral, Qwen2-MoE)** — needs a DSL construct for
+   `for each of top-k experts run sub-body`. Generic language
+   extension, not an MoE-specific branch.
+7. **MLA (DeepSeek-V2)** — new `attention_mla` op + kernel +
+   Shape signature; compiler stays out of MLA.
+8. **PP weight-load plumbing** — ferrite's backbone forward is
+   in place, but `cuda_worker.rs` still refuses to load
+   `ferrite_models::<arch>::Weights` when `use_pp` (dense Weights
+   type doesn't know about layer ranges). Extend `Weights::load`
+   to accept a layer range so PP intermediate ranks can only
+   materialise their owned layers.
+9. **Per-layer golden diff harness** — not needed to unblock
+   any live bug (static-analysis fix + cutlass costs cover the
+   present regressions), but still worth rebuilding for future
+   regression work. Recover `gen_golden.rs` from `a13577f75^`,
+   add a `DUMP_GOLDEN=<path>` env-var hook on
+   `LlamaForCausalLM::forward`, emit a `forward_with_snapshots`
+   variant from the macro, and diff per-subgraph. `cpu_golden.rs`
+   already lives in `ferrite-forward/src/cpu_golden.rs` — use
+   it for the CPU-reference side.
 
 ### Already landed — do not redo
 
@@ -717,10 +740,22 @@ tackle in roughly this order.
   `Qwen2ForCausalLM::Model`-via-`forward!{}` invocations deleted,
   `ferrite_macros` dep dropped from vllm-cuda.
 - SmolLM2-135M config in `model_architectures/llama/`.
-- Qwen2 stays on hand-written path (ferrite migration blocked on
-  Step C's `CublasFusedQkvGemmWithBiasImpl`).
+- Dense-bf16 Llama + Qwen2 both on the ferrite path (LlamaFerrite
+  / Qwen2Ferrite variants). Quant / TP / PP still hand-written.
 - SmolLM-135M ferrite correctness: attention output 3D→2D reshape
   in `AttentionViaCacheImpl` / `AttentionPrefillContiguousImpl`.
+- Cutlass GEMM zoo (16 tile variants + gemv) with CSV-backed cost
+  comparison against CSV-anchored cuBLAS. `target_profiles/cost_*.csv`.
+- Decode attention: `attention_decode_from_cache` wrapper so
+  span-rotation + fp8-KV branches light up automatically.
+- FP8-KV fused-QKV branch in `FusedQkvRopeCacheImpl::emit_call`.
+- Arch-level `forward_backbone` dispatcher emitted alongside
+  `forward`; per-bucket `forward_backbone_m_<N>` skips the
+  terminal lm_head subgraph. `cuda_worker.rs::hidden_states` uses
+  it for both Llama and Qwen2 ferrite variants.
+- Legacy crates deleted: `ferrite-macros`, `ferrite-solver`,
+  `ferrite-test-harness` (Step G). `cpu_golden.rs` preserved
+  under `ferrite-forward/src/cpu_golden.rs`.
 
 ## Last note
 

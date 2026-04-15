@@ -5,36 +5,43 @@
 > built, what decisions were made along the way, the landmines a
 > fresh context needs to know, and — most importantly — **the
 > failure patterns that have repeatedly burned the user's time.**
+>
+> **Fast start**: most of the "Re-scoped path" + "Gap table"
+> sections below are **historical** — they describe the state
+> when the new compiler was scaffolding without kernels. Several
+> of the "steps" are DONE. For current open work, jump to
+> `## Next session starts here` (≈line 594). The historical
+> sections are kept because their framing of the invariants and
+> failure patterns is still load-bearing; file paths like
+> `ferrite-solver/src/lowering/...` are **deleted** — recover via
+> `git show 5b9fd90ef^:<path>` if you need them.
 
 ## TL;DR
 
 - **Goal**: a forward-pass compiler. DSL body → solver picks
   kernels per tile → scheduler orders into wavefront LOOP → codegen
-  emits Rust + CUDA. Replaces `ferrite-macros` + `ferrite-solver`.
+  emits Rust + CUDA. Replaces `ferrite-macros` + `ferrite-solver`
+  (both now deleted; see commit `5b9fd90ef`).
 - **End-state proof**: `timeout 60 vllm chat --model=<small-llama>`
   produces coherent output through the new compiler at perf parity
-  with the existing path. **Perf parity is load-bearing — without
-  the kernel-variant port in the gap table below, the new path is
-  strictly slower than old ferrite.**
+  with the existing path. Correctness is **proven** for SmolLM-135M
+  and Qwen2.5-0.5B (`test_cuda_correctness_smollm_135m`,
+  `test_cuda_correctness_qwen2_0_5b` — both ignored tests, run via
+  `cargo test -p vllm-e2e --features e2e,cuda --release --test
+  e_correctness -- --ignored --test-threads=1`). Perf: cutlass tile
+  zoo + CSV-driven selection landed in commit `b43bb85b9`.
 - **Method**: port the working old ferrite verbatim, detoxifying
   as you port. Do not rewrite mechanisms that already work.
-- **Current state, honest version**: the scaffolding is in place
-  (parser, classifier, shape-inference, CFG/unroll, DP solver,
-  scheduler, codegen, `Weights` struct + `load` emission,
-  arch-level dispatcher, decode/prefill attention variant split
-  via `WorkloadConstraint`). vllm-executor routes dense bf16
-  Llama through `ferrite_models::llama::forward` unconditionally —
-  the old `LlamaSolver`/`Qwen2Solver` paths are deleted, and the
-  legacy `ferrite_macros::forward!{}` invocations in
-  `vllm-cuda/src/model/{llama,qwen2}.rs` are gone.
-  **But: `vllm chat` on a Llama model runs and produces garbage
-  tokens (`,,,,,,,`)** — `test_cuda_correctness_smollm_135m`
-  fails. Scaffolding is NOT the problem: with `FERRITE_DISABLE=1`
-  (a diagnostic toggle landed in commit `624beb4c8`) the hand-written
-  `LlamaForCausalLM` path passes the same golden. The bug is
-  somewhere in the ferrite-forward-emitted forward, not yet
-  located. Static analysis has been exhausted — next-session
-  move is granular per-layer goldens.
+- **Current state, honest version**: scaffolding AND correctness
+  both green. Dense-bf16 Llama and Qwen2 both route through
+  ferrite via `CudaModel::LlamaFerrite` / `CudaModel::Qwen2Ferrite`
+  in `cuda_worker.rs`. Decode attention uses the
+  `attention_decode_from_cache` wrapper (so span rotation + fp8 KV
+  light up automatically); fused-QKV emit has a runtime
+  `is_fp8()` branch. Backbone-only forward is emitted alongside
+  the full forward for PP intermediate ranks. Quant / TP / PP /
+  MoE / MLA / Gemma2 models still route to the hand-written path
+  for the reasons enumerated in the "Remaining gaps" section.
   The **library is still a tiny fraction of the old one**: 9
   Impls vs. the old library's ~1,400 kernel variants. Cost model
   is analytical estimates vs. the old CSV lookup against 55k
@@ -556,39 +563,57 @@ ferrite-forward/                    (worktree root)
                                       WeightBundle trait emission
 ```
 
-Old ferrite (the exemplar to port from) is at:
+Legacy crates (the exemplars the current code was ported from)
+are **deleted** as of commit `5b9fd90ef` (Step G). If you need to
+look at the prior `forward!{}` / constraint-solver logic, recover
+from git history:
 
 ```
-vllm-rs/crates/ferrite-solver/      ports source — 13k lines
-vllm-rs/crates/ferrite-macros/      old proc macro (forward!{})
-vllm-rs/crates/ferrite-kernels/     stays — runtime kernel wrappers
-vllm-rs/crates/ferrite-cuda-builder/  stays — build pipeline
+git show 5b9fd90ef^:vllm-rs/crates/ferrite-solver/…
+git show 5b9fd90ef^:vllm-rs/crates/ferrite-macros/…
+git show 5b9fd90ef^:vllm-rs/crates/ferrite-test-harness/…
 ```
 
-`vllm-cuda/src/model/llama.rs:3667` has a `ferrite_macros::forward!{}`
-invocation today — that is what step 5 replaces with `#[forward]`.
-
-`ferrite-cuda-core/src/tensor.rs` gained an unsafe
-`GpuTensor::as_view<'a>(&self) -> TensorView<'a>` method (C4) to
-make the `emit_input` pattern `(*#ident).as_view()` actually
-compile — the method was aspirational before.
-
-## Commit history (current branch, most recent first)
+The live crates under `vllm-rs/crates/`:
 
 ```
-0cf1165fe  ferrite-forward: port ConcurrencyModel + contention-aware cost aggregator
-2d3600a37  HANDOFF: record C1-C4 port (cuda build green; library complete)
-6249c2b27  ferrite-forward: port AttentionViaCacheImpl; cuda build green
-bacb93277  ferrite-forward: port FusedQkvRopeCacheImpl; delete RopeAppendRefImpl
-179f6a911  ferrite-forward: port FusedAddRmsNormImpl; delete AddRefImpl
-834144f44  ferrite-forward: Impl-declares-weights + port FusedGateUpSiluMulImpl
-dcd8a90ed  HANDOFF: record 3/8 impls wired + multi-tile fusion plan
-96b265d69  ferrite-forward: wire emit_embed / emit_rmsnorm to real ferrite-kernels symbols
-4b22e722d  HANDOFF: update for emit_call refactor (75aa11312)
-75aa11312  ferrite-forward: move codegen emission onto Implementation trait
-987242340  ferrite-forward: emit forward fn (codegen module) — non-cuda complete
-dd5e98259  ferrite-forward: port Implementation trait + library surface from old ferrite
-... [phases 0-8 below this]
+ferrite-forward         consumer crate (re-exports #[forward],
+                        ForwardCtx, cpu_golden)
+ferrite-forward-macro   proc-macro + compiler logic (parse →
+                        classify → shape → CFG → unroll → FUF →
+                        DP solve → schedule → codegen)
+ferrite-kernels         runtime kernel wrappers (cublas, cutlass
+                        FFI, flash-attn, rms_norm, silu_and_mul,
+                        rope, KV cache, LinearLayer, Embedding)
+ferrite-cuda-core       GpuTensor / TensorView / OwnedTensor /
+                        CachingAllocator / CUstream / GpuDevice
+ferrite-cuda-builder    build pipeline for .cu sources (cached
+                        under ~/.cudaforge)
+ferrite-models          DSL bodies: llama.rs (`#[forward] fn llama`)
+                        + qwen2.rs (`#[forward] fn qwen2`)
+```
+
+`ferrite-cuda-core/src/tensor.rs` carries an unsafe
+`GpuTensor::as_view<'a>(&self) -> TensorView<'a>` method, used by
+`emit.rs` to back the `(*#ident).as_view()` pattern.
+
+## Commit history — `git log --oneline` on the worktree branch
+
+The most recent session's work (correctness fix + Qwen2
+migration + cutlass + fp8 branch + PP backbone + Step G delete)
+is on `worktree-ferrite-forward`:
+
+```
+838669d5f  relax dp_assigns test budget for cutlass zoo
+89a408cd2  HANDOFF: landed items + trimmed remaining list
+5b9fd90ef  delete legacy ferrite-macros/solver/test-harness (Step G)
+9e608b256  fp8 KV-cache branch in FusedQkvRopeCacheImpl emit
+b43bb85b9  cutlass GEMM zoo + CSV-driven kernel selection
+67953f559  load empirical GPU cost CSVs into TargetProfile
+4ad93dafa  emit forward_backbone for PP intermediate ranks
+a01056410  decode attention via attention_decode_from_cache
+2f661b40c  migrate Qwen2 to #[forward]
+af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 ```
 
 ## Next session starts here

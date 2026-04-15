@@ -17,7 +17,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use proc_macro2::TokenStream;
+use quote::quote;
+
 use crate::classified::OpKind;
+use crate::emit::EmitCtx;
 use crate::fuf::{Fuf, TileId};
 use crate::shape::{Dim, Shape};
 use crate::target::TargetProfile;
@@ -360,6 +364,26 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
         false
     }
+
+    /// Emit the Rust token stream that invokes this impl's kernel
+    /// for the given subgraph. Called by codegen once per subgraph
+    /// after the solver has bound the subgraph to this impl.
+    ///
+    /// The emitted tokens must:
+    /// - Read inputs via [`EmitCtx::input_expr`] or
+    ///   [`EmitCtx::all_input_exprs`] for the relevant claimed tile.
+    /// - Produce a `let` binding for every output slot of every
+    ///   claimed tile, using [`EmitCtx::output_ident`] as the ident.
+    /// - Assume ambient `wm: &impl WeightBundle`, `ctx: &ForwardCtx`,
+    ///   and `device: &mut GpuDevice` bindings are in scope.
+    ///
+    /// Default implementation is a `compile_error!` so forgetting
+    /// to implement it fails loudly at macro expansion.
+    fn emit_call(&self, _ctx: &EmitCtx) -> TokenStream {
+        let name = self.name();
+        let msg = format!("Implementation `{name}` has no emit_call body");
+        quote! { compile_error!(#msg); }
+    }
 }
 
 /// The library: all available implementations for some target.
@@ -506,7 +530,7 @@ fn elementwise_cost(m: &MatchInfo, ctx: &CostCtx) -> f64 {
 }
 
 macro_rules! trivial_impl {
-    ($name:ident, $op:expr, $kernel_name:literal, $cost:expr, $compute_bound:expr) => {
+    ($name:ident, $op:expr, $kernel_name:literal, $cost:expr, $emit:expr, $compute_bound:expr) => {
         #[derive(Debug, Default)]
         pub struct $name;
 
@@ -553,8 +577,155 @@ macro_rules! trivial_impl {
             fn is_compute_bound(&self) -> bool {
                 $compute_bound
             }
+            fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+                ($emit)(ctx)
+            }
         }
     };
+}
+
+// ── Per-op emission bodies ───────────────────────────────────────
+//
+// These preserve the shape of the previous hardcoded OpKind match
+// in codegen.rs. The kernel symbols they reference are approximate
+// and cuda-gated; real ferrite-kernels bindings land as calibrated
+// impls replace these reference entries.
+
+fn emit_embed(ctx: &EmitCtx) -> TokenStream {
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let ids = ctx.input_expr(tile, 0);
+    let weight = ctx.input_expr(tile, 1);
+    quote! {
+        let #out = unsafe {
+            (#weight).forward(
+                #ids,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+    }
+}
+
+fn emit_rmsnorm(ctx: &EmitCtx) -> TokenStream {
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let x = ctx.input_expr(tile, 0);
+    let w = ctx.input_expr(tile, 1);
+    quote! {
+        let #out = unsafe {
+            ::ferrite_kernels::kernels::rms_norm_forward_owned(
+                #x,
+                (#w).weight,
+                (#w).eps,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+    }
+}
+
+fn emit_gemm(ctx: &EmitCtx) -> TokenStream {
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let x = ctx.input_expr(tile, 0);
+    let w = ctx.input_expr(tile, 1);
+    quote! {
+        let #out = unsafe {
+            (#w).forward(
+                #x,
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+    }
+}
+
+fn emit_rope_append(ctx: &EmitCtx) -> TokenStream {
+    let tile = ctx.primary();
+    let q_out = ctx.output_ident(tile, 0);
+    let k_out = ctx.output_ident(tile, 1);
+    let v_out = ctx.output_ident(tile, 2);
+    let ins = ctx.all_input_exprs(tile);
+    let (q, k, v, pos, rotary, kv) = (&ins[0], &ins[1], &ins[2], &ins[3], &ins[4], &ins[5]);
+    quote! {
+        let (#q_out, #k_out, #v_out) = unsafe {
+            ::ferrite_kernels::kernels::rope_append_kv(
+                #q, #k, #v, #pos, #rotary, #kv,
+                ctx.slot_mapping,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+    }
+}
+
+fn emit_attention(ctx: &EmitCtx) -> TokenStream {
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let ins = ctx.all_input_exprs(tile);
+    let (q, k, v, kv, bt) = (&ins[0], &ins[1], &ins[2], &ins[3], &ins[4]);
+    quote! {
+        let #out = unsafe {
+            ::ferrite_kernels::kernels::flash_attention(
+                #q, #k, #v, #kv, #bt,
+                ctx.cu_seqlens_q,
+                ctx.seqused_k,
+                ctx.max_seqlen_q,
+                ctx.max_seqlen_k,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+    }
+}
+
+fn emit_silu(ctx: &EmitCtx) -> TokenStream {
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let x = ctx.input_expr(tile, 0);
+    quote! {
+        let #out = unsafe {
+            ::ferrite_kernels::kernels::silu_owned(
+                #x,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+    }
+}
+
+fn emit_add(ctx: &EmitCtx) -> TokenStream {
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let a = ctx.input_expr(tile, 0);
+    let b = ctx.input_expr(tile, 1);
+    quote! {
+        let #out = unsafe {
+            ::ferrite_kernels::kernels::add_owned(
+                #a, #b,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+    }
+}
+
+fn emit_mul(ctx: &EmitCtx) -> TokenStream {
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let a = ctx.input_expr(tile, 0);
+    let b = ctx.input_expr(tile, 1);
+    quote! {
+        let #out = unsafe {
+            ::ferrite_kernels::kernels::mul_owned(
+                #a, #b,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+    }
 }
 
 fn cost_embed(m: &MatchInfo, ctx: &CostCtx) -> f64 {
@@ -637,20 +808,36 @@ fn cost_attention(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     }
 }
 
-trivial_impl!(EmbedRefImpl, OpKind::Embed, "embed_ref", cost_embed, false);
+trivial_impl!(
+    EmbedRefImpl,
+    OpKind::Embed,
+    "embed_ref",
+    cost_embed,
+    emit_embed,
+    false
+);
 trivial_impl!(
     RmsNormRefImpl,
     OpKind::RmsNorm,
     "rmsnorm_ref",
     elementwise_cost,
+    emit_rmsnorm,
     false
 );
-trivial_impl!(GemmRefImpl, OpKind::Gemm, "gemm_ref", cost_gemm, true);
+trivial_impl!(
+    GemmRefImpl,
+    OpKind::Gemm,
+    "gemm_ref",
+    cost_gemm,
+    emit_gemm,
+    true
+);
 trivial_impl!(
     RopeAppendRefImpl,
     OpKind::RopeAppend,
     "rope_append_ref",
     elementwise_cost,
+    emit_rope_append,
     false
 );
 trivial_impl!(
@@ -658,6 +845,7 @@ trivial_impl!(
     OpKind::Attention,
     "attention_ref",
     cost_attention,
+    emit_attention,
     true
 );
 trivial_impl!(
@@ -665,10 +853,25 @@ trivial_impl!(
     OpKind::Silu,
     "silu_ref",
     elementwise_cost,
+    emit_silu,
     false
 );
-trivial_impl!(AddRefImpl, OpKind::Add, "add_ref", elementwise_cost, false);
-trivial_impl!(MulRefImpl, OpKind::Mul, "mul_ref", elementwise_cost, false);
+trivial_impl!(
+    AddRefImpl,
+    OpKind::Add,
+    "add_ref",
+    elementwise_cost,
+    emit_add,
+    false
+);
+trivial_impl!(
+    MulRefImpl,
+    OpKind::Mul,
+    "mul_ref",
+    elementwise_cost,
+    emit_mul,
+    false
+);
 
 /// Baseline library: one HostCallback impl per OpKind, analytical
 /// cost estimates. Replaced by calibrated target-specific impls

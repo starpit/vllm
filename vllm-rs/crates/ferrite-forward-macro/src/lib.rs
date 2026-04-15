@@ -30,6 +30,7 @@ mod classified;
 mod classify;
 mod codegen;
 mod config;
+mod emit;
 mod fuf;
 mod impl_lib;
 mod parse;

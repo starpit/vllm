@@ -22,9 +22,34 @@
 //!
 //! Both sets live together because they're aspects of the same
 //! protocol and they reference the same vocabulary of field names.
-//! Keeping them in one file means when a new arch needs an
-//! extension (e.g. Gemma2's `query_pre_attn_scalar`), there's one
-//! obvious place to add it.
+//!
+//! # What this table is NOT
+//!
+//! [`standard_shape`] is a **fallback anchor** for shape inference,
+//! not a weight-registration API. Shape inference's primary
+//! mechanism is dataflow through op signatures:
+//! `sig_rmsnorm(x, w)` unifies `w[0]` with `x.last()`, so any
+//! rmsnorm weight reached from `hidden_states` (which is pinned to
+//! `hidden_size` via `embed`) ends up with shape `[hidden_size]`
+//! automatically — regardless of what the weight is called. Gemm,
+//! embed, and the residual-add chain pin most attention and MLP
+//! weight dims the same way.
+//!
+//! So **do not add an entry here just because a DSL body references
+//! a new weight path**. Gemma2's `pre_feedforward_layernorm`,
+//! `post_feedforward_layernorm`, Gemma3's future norm variants,
+//! hybrid architectures' SSM weight paths — none of these need
+//! entries: dataflow pins their shapes via the ops that consume
+//! them.
+//!
+//! Add an entry only if (a) the weight's shape can't be derived
+//! from the op signatures that consume it, AND (b) the path name
+//! appears verbatim in HF's stock naming set across multiple
+//! architectures. An entry here is a claim that "every HF config
+//! that ships a weight at this path agrees on its shape" — if that
+//! claim isn't true cross-architecture, the shape belongs somewhere
+//! model-specific (e.g. a forthcoming `weights.json` per model),
+//! not here.
 
 use std::collections::BTreeMap;
 

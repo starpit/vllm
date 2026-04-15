@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: Apache-2.0
+//! End-to-end for the Gemma2 DSL body. Proves:
+//!
+//! 1. The `#[forward]` proc-macro accepts `if`/`else` in the body.
+//! 2. Every Gemma2 config in `model_architectures/gemma2/` compiles
+//!    through parse → classify → shape-infer → CFG → unroll → solve
+//!    × workloads → schedule × workloads → codegen.
+//! 3. The solver finds an Impl for every tile (no UnclaimedTile on
+//!    `Gelu`, `SlidingAttention`, or `TanhSoftCap` at any M).
+//! 4. Per-layer tile count matches the hand-computed expectation,
+//!    confirming the conditional emits exactly one attention-family
+//!    tile per unrolled iteration.
+
+use ferrite_forward::forward;
+
+// The full Gemma2 body, mirrored from `ferrite-models/src/gemma2.rs`.
+// Duplicated here (not `mod`-included) because proc-macro attributes
+// can only annotate items declared in the crate being compiled, not
+// re-exported from another crate.
+#[forward(
+    target = "../../../target_profiles/l4_sm89.json",
+    workloads = [1, 8, 64, 512, 4096],
+)]
+fn gemma2() {
+    hidden_states = embed(input_ids, embed_tokens);
+    for layer in 0..num_hidden_layers {
+        pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer]);
+
+        q = gemm(pre_attn_normed, self_attn.q_proj[layer]);
+        k = gemm(pre_attn_normed, self_attn.k_proj[layer]);
+        v = gemm(pre_attn_normed, self_attn.v_proj[layer]);
+        (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+        if layer % sliding_window_pattern == 0 {
+            attn = attention(q, k, v, kv_cache[layer], block_table);
+        } else {
+            attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
+        }
+        oproj = gemm(attn, self_attn.o_proj[layer]);
+
+        post_attn_normed = rmsnorm(oproj, post_attention_layernorm[layer]);
+
+        hidden_states = add(post_attn_normed, hidden_states);
+        pre_ffwd_normed = rmsnorm(hidden_states, pre_feedforward_layernorm[layer]);
+
+        gate = gelu(gemm(pre_ffwd_normed, mlp.gate_proj[layer]));
+        up = gemm(pre_ffwd_normed, mlp.up_proj[layer]);
+        down = gemm(gate * up, mlp.down_proj[layer]);
+
+        post_ffwd_normed = rmsnorm(down, post_feedforward_layernorm[layer]);
+
+        hidden_states = add(post_ffwd_normed, hidden_states);
+    }
+    normed = rmsnorm(hidden_states, norm);
+    logits = gemm(normed, lm_head);
+    capped = tanh_softcap(logits);
+}
+
+/// Tiles per unrolled Gemma2 layer body:
+///
+/// - pre-attn rmsnorm (1) + Q/K/V gemms (3) + rope_append (1)
+/// - exactly one attention-family tile (the `if` picks one arm)
+/// - o_proj gemm (1) + post-attn rmsnorm (1) + residual add (1)
+/// - pre-ffwd rmsnorm (1)
+/// - GELU MLP: gate_gemm + gelu + up_gemm + mul + down_gemm = 5
+/// - post-ffwd rmsnorm (1) + residual add (1)
+///
+/// Total: 17 tiles per layer. Plus 1 embed at the top and 3
+/// post-loop tiles (final rmsnorm + lm_head gemm + tanh_softcap).
+const GEMMA2_TILES_PER_LAYER: usize = 17;
+const GEMMA2_PRE_LOOP_TILES: usize = 1; // embed
+const GEMMA2_POST_LOOP_TILES: usize = 3; // final norm + lm_head + softcap
+
+fn expected_tiles(num_hidden_layers: usize) -> usize {
+    GEMMA2_PRE_LOOP_TILES + num_hidden_layers * GEMMA2_TILES_PER_LAYER + GEMMA2_POST_LOOP_TILES
+}
+
+#[test]
+fn gemma2_2b_tile_count_matches_expected() {
+    // Gemma2-2B: 26 layers → 1 + 26 × 17 + 3 = 446.
+    assert_eq!(gemma2_2b::NUM_TILES, expected_tiles(26));
+}
+
+#[test]
+fn gemma2_9b_tile_count_matches_expected() {
+    // Gemma2-9B: 42 layers → 1 + 42 × 17 + 3 = 718.
+    assert_eq!(gemma2_9b::NUM_TILES, expected_tiles(42));
+}
+
+#[test]
+fn gemma2_27b_tile_count_matches_expected() {
+    // Gemma2-27B: 46 layers → 1 + 46 × 17 + 3 = 786.
+    assert_eq!(gemma2_27b::NUM_TILES, expected_tiles(46));
+}
+
+#[test]
+fn every_gemma2_config_was_compiled() {
+    // If any Gemma2 JSON failed to compile, this file wouldn't build.
+    // The references force observation of each compiled specialization.
+    let _: usize = gemma2_2b::NUM_TILES;
+    let _: usize = gemma2_9b::NUM_TILES;
+    let _: usize = gemma2_27b::NUM_TILES;
+}
+
+#[test]
+fn every_workload_bucket_solved_for_gemma2_2b() {
+    // The solver reached every workload point without
+    // UnclaimedTile — SlidingAttention / Gelu / TanhSoftCap all
+    // have matching Impls in the library.
+    let _: f64 = gemma2_2b::m_1::PREDICTED_US;
+    let _: f64 = gemma2_2b::m_8::PREDICTED_US;
+    let _: f64 = gemma2_2b::m_64::PREDICTED_US;
+    let _: f64 = gemma2_2b::m_512::PREDICTED_US;
+    let _: f64 = gemma2_2b::m_4096::PREDICTED_US;
+}
+
+#[test]
+fn gemma2_predicted_us_is_finite_and_monotonic_in_m() {
+    // Regression guard on the "silent drop-to-zero cost" class of
+    // bug. Predicted microseconds must be finite positive and rise
+    // with M (prefill should dwarf decode).
+    let decode: f64 = gemma2_2b::m_1::PREDICTED_US;
+    let prefill: f64 = gemma2_2b::m_4096::PREDICTED_US;
+    assert!(decode.is_finite() && decode > 0.0, "decode us = {decode}");
+    assert!(
+        prefill.is_finite() && prefill > 0.0,
+        "prefill us = {prefill}"
+    );
+    assert!(
+        prefill > decode * 10.0,
+        "prefill {prefill} ≯ 10× decode {decode}"
+    );
+}
+
+#[test]
+fn arch_level_weights_enum_and_dispatch_exist_for_gemma2() {
+    // The compiler emitted the arch-level `Weights` enum, its
+    // per-model variants, and the dispatching `forward` fn.
+    #[cfg(feature = "cuda")]
+    {
+        fn _probe_2b(w: gemma2_2b::Weights) -> Weights {
+            Weights::Gemma2_2b(w)
+        }
+        fn _probe_9b(w: gemma2_9b::Weights) -> Weights {
+            Weights::Gemma2_9b(w)
+        }
+        fn _probe_27b(w: gemma2_27b::Weights) -> Weights {
+            Weights::Gemma2_27b(w)
+        }
+        let _: fn(gemma2_2b::Weights) -> Weights = _probe_2b;
+        let _: fn(gemma2_9b::Weights) -> Weights = _probe_9b;
+        let _: fn(gemma2_27b::Weights) -> Weights = _probe_27b;
+    }
+}

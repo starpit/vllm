@@ -30,7 +30,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -38,10 +38,10 @@ use quote::{format_ident, quote};
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
 use crate::emit::{EmitCtx, LocalMap};
-use crate::fuf::{Fuf, FufInput};
+use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
 use crate::schedule::{Loop, WorkloadLoops};
-use crate::solver::{Assignment, WorkloadAssignments};
+use crate::solver::{Assignment, SubgraphId, WorkloadAssignments};
 
 // ── Weights struct + loader emission ─────────────────────────────
 
@@ -339,6 +339,133 @@ fn emit_weights_struct(
 
 // ── Forward fn emission ──────────────────────────────────────────
 
+/// For each `OwnedTensor` tile-local that the forward fn binds, the
+/// subgraph after which it can safely be dropped (its last
+/// cross-subgraph use, with alias chains followed back to the
+/// underlying owner). Produced by `compute_drops_after`, consumed by
+/// the per-bucket emitters to inject `drop(t_X_Y);` in the right spot.
+type DropPlan = HashMap<SubgraphId, Vec<(TileId, u8)>>;
+
+/// Compute when each owning `OwnedTensor` tile-local can be dropped.
+///
+/// Walks every subgraph's `output_alias` declaration to build the
+/// alias map: `(tile, slot) → Some(upstream)` (alias) or
+/// `(tile, slot) → None` (owner). Outputs absent from the map are
+/// treated as untracked (e.g. paged-cache views) and ignored.
+///
+/// For each cross-subgraph tile-input, resolves the consumed tile
+/// through the alias chain to its underlying owner, and records the
+/// latest subgraph that touches it. Returns a map keyed by that
+/// subgraph: after emitting it, drop the listed tile-locals.
+///
+/// `skip_subgraph` is the terminal subgraph excluded from the
+/// backbone forward (`forward_backbone`); its consumptions are
+/// ignored so we don't keep tile-locals alive past the backbone's
+/// real last use. `protected` are owners that must NEVER be dropped
+/// (the function's return tile, and for backbone, the backbone-output
+/// tile that the caller clones out).
+fn compute_drops_after(
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    loop_ir: &Loop,
+    lib: &ImplementationLibrary,
+    skip_subgraph: Option<SubgraphId>,
+    protected: &HashSet<(TileId, u8)>,
+) -> DropPlan {
+    // Per-subgraph topological order (subgraphs within the same wave
+    // are unordered relative to each other in the LOOP, but for
+    // single-wave-per-subgraph graphs that doesn't matter; for the
+    // general case we treat their order in `wave.subgraphs` as
+    // authoritative).
+    let mut order: HashMap<SubgraphId, usize> = HashMap::new();
+    let mut next = 0;
+    for wave in &loop_ir.waves {
+        for (sg, _) in &wave.subgraphs {
+            order.insert(*sg, next);
+            next += 1;
+        }
+    }
+
+    // alias: (tile, slot) → Some(upstream) means this output is a
+    // TensorView aliasing upstream's OwnedTensor; None means this
+    // output IS the owner. Outputs absent are untracked.
+    let mut alias: HashMap<(TileId, u8), Option<(TileId, u8)>> = HashMap::new();
+    for wave in &loop_ir.waves {
+        for (sg, imp_id) in &wave.subgraphs {
+            if Some(*sg) == skip_subgraph {
+                continue;
+            }
+            let claimed = sfuf.tiles_in_subgraph(*sg);
+            for (k, v) in lib.get(*imp_id).output_alias(&claimed, fuf) {
+                alias.insert(k, v);
+            }
+        }
+    }
+
+    // Resolve a (tile, slot) to its underlying owner, or `None` if
+    // untracked / aliases extern memory. Cycle-safe via a small set.
+    let resolve = |start: (TileId, u8)| -> Option<(TileId, u8)> {
+        let mut cur = start;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(cur) {
+                return None;
+            }
+            match alias.get(&cur) {
+                Some(None) => return Some(cur),
+                Some(Some(up)) => cur = *up,
+                None => return None,
+            }
+        }
+    };
+
+    // For each owner, the latest subgraph that touches it (directly
+    // or via an alias).
+    let mut last_use: HashMap<(TileId, u8), SubgraphId> = HashMap::new();
+    for wave in &loop_ir.waves {
+        for (sg, _) in &wave.subgraphs {
+            if Some(*sg) == skip_subgraph {
+                continue;
+            }
+            let claimed: HashSet<TileId> = sfuf.tiles_in_subgraph(*sg).into_iter().collect();
+            for tile in &claimed {
+                for input in &fuf.get(*tile).inputs {
+                    if let FufInput::Tile { id, slot } = input {
+                        // Intra-subgraph consumption is invisible at
+                        // codegen — handled inside emit_call.
+                        if claimed.contains(id) {
+                            continue;
+                        }
+                        if let Some(owner) = resolve((*id, *slot)) {
+                            let new_pos = order[sg];
+                            let keep = match last_use.get(&owner) {
+                                Some(prev) => order[prev] < new_pos,
+                                None => true,
+                            };
+                            if keep {
+                                last_use.insert(owner, *sg);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut plan: DropPlan = HashMap::new();
+    for (owner, sg) in last_use {
+        if protected.contains(&owner) {
+            continue;
+        }
+        plan.entry(sg).or_default().push(owner);
+    }
+    // Determinism — owners within a subgraph drop in stable order.
+    for v in plan.values_mut() {
+        v.sort();
+    }
+    plan
+}
+
 /// Emit one per-workload-bucket forward fn.
 fn emit_forward_for_bucket(
     fuf: &Fuf,
@@ -357,9 +484,18 @@ fn emit_forward_for_bucket(
         }
     }
 
+    // Forward returns the last tile's slot-0 output — its owner must
+    // not be dropped before the function returns.
+    let mut protected: HashSet<(TileId, u8)> = HashSet::new();
+    if let Some(last) = fuf.nodes.last() {
+        protected.insert((last.id, 0));
+    }
+    let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, None, &protected);
+
     // Walk waves in order; each subgraph's bound impl emits its own
     // kernel invocation. Codegen stays mechanical — no per-op match
-    // lives here.
+    // lives here. After each subgraph, drop any tile-local owners
+    // whose last cross-subgraph use was here.
     let mut body: Vec<TokenStream> = Vec::new();
     for wave in &loop_ir.waves {
         for (sg, imp_id) in &wave.subgraphs {
@@ -372,6 +508,12 @@ fn emit_forward_for_bucket(
                 locals: &locals,
             };
             body.push(lib.get(*imp_id).emit_call(&ctx));
+            if let Some(owners) = drops.get(sg) {
+                for (t, s) in owners {
+                    let ident = &locals[&(*t, *s)];
+                    body.push(quote! { drop(#ident); });
+                }
+            }
         }
     }
 
@@ -467,6 +609,13 @@ fn emit_forward_backbone_for_bucket(
     };
     let backbone_ident = locals[&backbone_out].clone();
 
+    // Backbone returns a clone of `backbone_out`; its underlying
+    // owner (resolved via the alias chain in `compute_drops_after`)
+    // must survive until after that clone runs at end of fn.
+    let mut protected: HashSet<(TileId, u8)> = HashSet::new();
+    protected.insert(backbone_out);
+    let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, Some(terminal_sg), &protected);
+
     let mut body: Vec<TokenStream> = Vec::new();
     for wave in &loop_ir.waves {
         for (sg, imp_id) in &wave.subgraphs {
@@ -482,6 +631,12 @@ fn emit_forward_backbone_for_bucket(
                 locals: &locals,
             };
             body.push(lib.get(*imp_id).emit_call(&ctx));
+            if let Some(owners) = drops.get(sg) {
+                for (t, s) in owners {
+                    let ident = &locals[&(*t, *s)];
+                    body.push(quote! { drop(#ident); });
+                }
+            }
         }
     }
 

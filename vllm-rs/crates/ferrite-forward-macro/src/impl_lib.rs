@@ -492,6 +492,37 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
     }
+
+    /// Per-output alias declaration. For each tile-output this impl
+    /// binds, return one entry:
+    /// - `((tile, slot), None)` — output is its own freshly-allocated
+    ///   `OwnedTensor` (the codegen drop pass will free it after its
+    ///   last cross-subgraph consumer).
+    /// - `((tile, slot), Some((src_tile, src_slot)))` — output is a
+    ///   `TensorView` aliasing the upstream `OwnedTensor` at
+    ///   `(src_tile, src_slot)`. Consumers of this output count as
+    ///   uses of the underlying source.
+    ///
+    /// Outputs absent from the returned vec are "untracked" — e.g.
+    /// paged-cache views like `kv_cache.k_cache(layer)` whose memory
+    /// is owned by the cache pool, not the caching allocator.
+    ///
+    /// Default: every output of every claimed tile is `None`
+    /// (its own `OwnedTensor`).
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        claimed_tiles
+            .iter()
+            .flat_map(|&t| {
+                let n = fuf.get(t).outputs.len().max(1);
+                (0..n as u8).map(move |s| ((t, s), None))
+            })
+            .collect()
+    }
 }
 
 /// The library: all available implementations for some target.
@@ -727,6 +758,10 @@ fn emit_rmsnorm(ctx: &EmitCtx) -> TokenStream {
     // Scalar-offset rmsnorms like Gemma's `(1+w)` flow through a
     // distinct Impl that consumes the upstream Add(weight, scalar)
     // tile and passes the scalar as weight_offset.
+    //
+    // Input is a TensorView borrowed via input_expr; the codegen-level
+    // drop pass frees the upstream OwnedTensor after this subgraph
+    // (or after a later subgraph if the upstream has further consumers).
     let tile = ctx.primary();
     let out = ctx.output_ident(tile, 0);
     let x = ctx.input_expr(tile, 0);
@@ -1289,27 +1324,22 @@ impl Implementation for FusedGateUpSiluMulImpl {
         let weight_expr = ctx.weight_accessor(&fused_name);
 
         let mul_out = ctx.output_ident(mul_id, 0);
-        let gate_up_ident = quote::format_ident!("__fused_gate_up_{}", mul_id.0);
         let intermediate = ctx.bound("intermediate_size") as usize;
 
         quote! {
-            // Fused gate+up GEMM producing a [num_tokens, 2*intermediate]
-            // buffer. The user's WeightBundle returns a LinearLayer
-            // whose weight is the vertically-concatenated
-            // [gate_proj | up_proj].
-            let #gate_up_ident = unsafe {
-                (#weight_expr).forward(
+            // Fused gate+up GEMM produces a [num_tokens, 2*intermediate]
+            // packed buffer that's only consumed by `silu_and_mul_fused`
+            // on the next line. Bind it in an inner scope so its
+            // OwnedTensor drops as soon as the kernel returns.
+            let #mul_out = unsafe {
+                let gate_up = (#weight_expr).forward(
                     #activation,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
-                )
-            };
-            // SiLU(gate) * up, reading the packed buffer and writing
-            // a [num_tokens, intermediate] output.
-            let #mul_out = unsafe {
+                );
                 ::ferrite_kernels::kernels::silu_and_mul_fused(
-                    *#gate_up_ident,
+                    *gate_up,
                     #intermediate,
                     &mut device.caching,
                     device.compute_stream,
@@ -1896,6 +1926,40 @@ impl Implementation for FusedAddRmsNormImpl {
     // by an `OpKind::RmsNorm` tile → typed as `RmsNorm` by
     // `rust_type_for_weight_consumed_by`.
 
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Both outputs are TensorView aliases of the Add tile's
+        // upstream Tile inputs. The kernel mutates delta's buffer
+        // in place to produce the rmsnorm output, and residual's
+        // buffer to produce the updated residual; the bindings
+        // simply alias those upstream OwnedTensors.
+        let add_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Add)
+            .expect("claim contains Add");
+        let rmsnorm_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("claim contains RmsNorm");
+        let add_node = fuf.get(add_id);
+        let delta_src = match add_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("Add input 0 (delta) must be a tile"),
+        };
+        let residual_src = match add_node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("Add input 1 (residual) must be a tile"),
+        };
+        vec![
+            ((rmsnorm_id, 0), Some(delta_src)),
+            ((add_id, 0), Some(residual_src)),
+        ]
+    }
+
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
         // Identify Add + RmsNorm tiles from the claim.
         let add_id = *ctx
@@ -1913,6 +1977,12 @@ impl Implementation for FusedAddRmsNormImpl {
         // `input_expr`'s `(*_).as_view()` wrapper to get the raw
         // upstream idents so we can (a) feed GpuTensor to the kernel
         // and (b) bind TensorView aliases to the same storage.
+        //
+        // Aliasing (rather than moving) is necessary because the
+        // residual stream's first iteration sees an upstream tile
+        // (the embed output) with multiple consumers — the codegen
+        // drop pass handles cleanup of those upstream OwnedTensors
+        // after their last cross-subgraph use.
         let delta_upstream = ctx
             .input_tile_ident(add_id, 0)
             .expect("Add input 0 (delta) is a Tile");
@@ -1934,20 +2004,14 @@ impl Implementation for FusedAddRmsNormImpl {
         let weight_name = weight_field_name(ctx.program, weight_id, weight_idx);
         let weight_expr = ctx.weight_accessor(&weight_name);
 
-        // Output bindings. The kernel mutates delta_upstream's buffer
-        // into the normed output and residual_upstream's buffer into
-        // the updated residual. Downstream tiles read these via
-        // `(*ident).as_view()`; `TensorView::from_raw` (unsafe) gives
-        // us the Deref-to-GpuTensor shape the emit convention wants.
         let add_out = ctx.output_ident(add_id, 0);
         let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
 
         quote! {
             // Fused `residual += delta; normed = norm(residual) * w`.
             // Both buffers are mutated in place; the upstream
-            // OwnedTensors (#delta_upstream / #residual_upstream)
-            // remain the owners — we only alias them as TensorViews
-            // for downstream reads.
+            // OwnedTensors stay the owners and the alias bindings
+            // below let downstream tiles read them as views.
             unsafe {
                 let _ = ::ferrite_kernels::kernels::fused_add_rms_norm_inplace(
                     *#delta_upstream,
@@ -1957,12 +2021,6 @@ impl Implementation for FusedAddRmsNormImpl {
                     device.compute_stream,
                 );
             }
-            // Aliases: #rmsnorm_out points at the (now-normed)
-            // delta buffer; #add_out points at the (now-updated)
-            // residual buffer. `.as_view()` on a dereffed upstream
-            // works for both OwnedTensor and TensorView bindings
-            // (both Deref to GpuTensor, and `GpuTensor::as_view` is
-            // the uniform conversion).
             let #rmsnorm_out = unsafe { (*#delta_upstream).as_view() };
             let #add_out = unsafe { (*#residual_upstream).as_view() };
         }
@@ -2632,6 +2690,23 @@ impl Implementation for FusedQkvRopeCacheImpl {
         true
     }
 
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Slot 0 (rotated Q) is a fresh OwnedTensor returned by the
+        // rope-cache kernel. Slots 1 and 2 (K, V) are paged-cache
+        // views — memory owned by the kv_cache pool, not the caching
+        // allocator — so they're absent from the map (untracked).
+        let rope_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim contains RopeAppend");
+        vec![((rope_id, 0), None)]
+    }
+
     fn required_weights(
         &self,
         claimed_tiles: &[TileId],
@@ -2708,36 +2783,30 @@ impl Implementation for FusedQkvRopeCacheImpl {
         //   q_out = rope.slot 0 (rotated Q, OwnedTensor returned by kernel)
         //   k_out = rope.slot 1 (written to cache)
         //   v_out = rope.slot 2 (written to cache)
-        // Downstream Attention (currently still a fake singleton — C4
-        // territory) will read k_out/v_out via `input_expr`, so bind
-        // them to layer-specific `TensorView` aliases on the paged
-        // cache. After C4 lands, Attention will ignore its K/V slots
-        // and those bindings become unused.
+        // Downstream Attention reads K/V from the paged cache directly,
+        // so the k_out/v_out bindings are paged-cache `TensorView`
+        // aliases — no allocation.
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);
         let v_out = ctx.output_ident(rope_id, 2);
-        let qkv_packed_ident = quote::format_ident!("__fused_qkv_{}", rope_id.0);
 
         quote! {
-            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor.
-            let #qkv_packed_ident = unsafe {
-                (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-            // Fused RoPE + paged-cache write. Reads packed QKV, writes
-            // K and V into the layer's slices of the paged cache, and
-            // returns Q (rotated) as an OwnedTensor.
+            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
+            // then fused RoPE + paged-cache write. The packed QKV
+            // buffer drops as soon as the rope-cache kernel returns.
             //
             // FP8 KV-cache path branches at runtime: the cache dtype
             // is a per-model property known only at load time.
             let #q_out = unsafe {
+                let qkv_packed = (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
                 if ctx.kv_cache.is_fp8() {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
-                        *#qkv_packed_ident,
+                        *qkv_packed,
                         *ctx.positions,
                         ctx.rotary.cos_sin_cache,
                         *ctx.slot_mapping,
@@ -2754,7 +2823,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
                     )
                 } else {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache(
-                        *#qkv_packed_ident,
+                        *qkv_packed,
                         *ctx.positions,
                         ctx.rotary.cos_sin_cache,
                         *ctx.slot_mapping,
@@ -3065,26 +3134,25 @@ impl Implementation for FusedQkvRopePrefillImpl {
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);
         let v_out = ctx.output_ident(rope_id, 2);
-        let qkv_packed_ident = quote::format_ident!("__fused_qkv_{}", rope_id.0);
 
         quote! {
-            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor.
-            let #qkv_packed_ident = unsafe {
-                (#weight_expr).forward(
+            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
+            // then RoPE-split into contiguous Q/K/V. The packed QKV
+            // buffer drops as soon as the rope-split kernel returns.
+            //
+            // Unlike `fused_qkv_rope_cache` this does NOT write to the
+            // paged cache — the cache write is a separate step below
+            // so the K/V OwnedTensors remain available for contiguous
+            // prefill attention.
+            let (#q_out, #k_out, #v_out) = unsafe {
+                let qkv_packed = (#weight_expr).forward(
                     #activation,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
-                )
-            };
-            // RoPE-split: rotate Q and K, return all three as
-            // contiguous OwnedTensors. Unlike `fused_qkv_rope_cache`
-            // this does NOT write to the paged cache — the cache
-            // write is a separate step below so the K/V OwnedTensors
-            // remain available for contiguous prefill attention.
-            let (#q_out, #k_out, #v_out) = unsafe {
+                );
                 ::ferrite_kernels::kernels::fused_qkv_rope(
-                    *#qkv_packed_ident,
+                    *qkv_packed,
                     *ctx.positions,
                     ctx.rotary.cos_sin_cache,
                     #q_size,
@@ -3187,9 +3255,6 @@ impl Implementation for AttentionPrefillContiguousImpl {
 
         // Q, K, V from the DSL's `attention(q, k, v, ...)` — slots
         // 0/1/2 are the upstream rope-append tile's three outputs.
-        // The prefill QKV impl binds these to real contiguous
-        // OwnedTensors (unlike the decode variant which aliases
-        // K/V to the paged cache).
         let q_expr = ctx.input_expr(tile, 0);
         let k_expr = ctx.input_expr(tile, 1);
         let v_expr = ctx.input_expr(tile, 2);

@@ -1340,6 +1340,15 @@ impl Implementation for FusedGemmBiasImpl {
         if seed_node.op != OpKind::Gemm {
             return None;
         }
+        // cuBLAS `gemm_bias` epilog on dense BF16/F16 weights. AWQ /
+        // GPTQ Gemms route through `MarlinFusedQkvRope*Impl` (which
+        // walks the same `(Gemm, BiasAdd)` chain and dispatches to
+        // `MarlinLinear::forward` — which internally adds the packed
+        // `.bias` after `marlin_gemm`). Reject here so the DP doesn't
+        // pick this dense-typed accessor for a quantized weight.
+        if !matches!(weight_storage_of(seed_node), Some(StorageFormat::Dense)) {
+            return None;
+        }
         // Find a BiasAdd tile whose first tile input is this Gemm.
         // BiasAdd's shape sig is `(x, b) -> x` with `x` at slot 0 and
         // `b` at slot 1 (the bias weight, not a tile).
@@ -5105,8 +5114,12 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         // Mirror of `FusedQkvRopeCacheImpl.matches`; diffs are the
-        // storage gate (Q/K/V must all be AWQ) and a bail path that
-        // uses the same `is_awq_gemm` helper.
+        // storage gate (Q/K/V must all be AWQ) on top of the
+        // BiasAdd-aware unwrap. Bias is handled at the kernel
+        // boundary: `MarlinLinear::forward` applies `bias_add_inplace`
+        // after `marlin_gemm` when `self.bias.is_some()`, and
+        // `MarlinLinear::load_awq_concat` packs per-prefix `.bias`
+        // tensors into the fused LinearLayer automatically.
         let seed_node = fuf.get(seed);
         if !is_awq_gemm(fuf, seed) {
             return None;
@@ -5116,7 +5129,7 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
             if n.op != OpKind::RopeAppend || n.inputs.len() < 3 {
                 return false;
             }
-            let qkv: Vec<TileId> = n
+            let qkv_raw: Vec<TileId> = n
                 .inputs
                 .iter()
                 .take(3)
@@ -5125,21 +5138,35 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
                     _ => None,
                 })
                 .collect();
-            if qkv.len() != 3 {
+            if qkv_raw.len() != 3 {
                 return false;
             }
-            if !qkv.contains(&seed) {
+            let resolved: Option<Vec<(TileId, Option<TileId>)>> = qkv_raw
+                .iter()
+                .map(|t| unwrap_gemm_through_bias(fuf, *t))
+                .collect();
+            let Some(resolved) = resolved else {
+                return false;
+            };
+            // Uniform bias presence across Q/K/V — mixed is a DSL
+            // inconsistency, reject rather than silently partial-fuse.
+            let biased = resolved[0].1.is_some();
+            if resolved.iter().any(|r| r.1.is_some() != biased) {
                 return false;
             }
-            if qkv.iter().any(|t| !is_awq_gemm(fuf, *t)) {
+            let gemms: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
+            if !gemms.contains(&seed) {
                 return false;
             }
-            let act = first_tile_input(fuf.get(qkv[0]));
-            act.is_some() && qkv.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
+            if gemms.iter().any(|t| !is_awq_gemm(fuf, *t)) {
+                return false;
+            }
+            let act = first_tile_input(fuf.get(gemms[0]));
+            act.is_some() && gemms.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
         })?;
         let rope_id = rope_node.id;
 
-        let qkv_ids: Vec<TileId> = rope_node
+        let qkv_raw: Vec<TileId> = rope_node
             .inputs
             .iter()
             .take(3)
@@ -5148,16 +5175,23 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
                 _ => None,
             })
             .collect();
-
-        let mut claimed: Vec<TileId> = qkv_ids
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
             .iter()
-            .copied()
-            .chain(std::iter::once(rope_id))
+            .map(|t| unwrap_gemm_through_bias(fuf, *t).expect("already validated in find"))
             .collect();
+
+        let mut claimed: Vec<TileId> = Vec::with_capacity(7);
+        for (g, b) in &resolved {
+            claimed.push(*g);
+            if let Some(b) = b {
+                claimed.push(*b);
+            }
+        }
+        claimed.push(rope_id);
         claimed.sort();
 
         let _ = seed_node;
-        let activation = first_tile_input(fuf.get(qkv_ids[0]))?.0;
+        let activation = first_tile_input(fuf.get(resolved[0].0))?.0;
         Some(MatchInfo {
             claimed_tiles: claimed,
             boundary_inputs: vec![activation],
@@ -5245,6 +5279,13 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
         // replaced by `(#w).forward(#x, &mut device.caching, stream)`
         // (MarlinLinear owns the matmul internally). The FP8 KV
         // branch stays — it's orthogonal to the weight format.
+        //
+        // BiasAdd-aware: rope's three tile inputs are unwrapped
+        // through an optional BiasAdd wrapper to find the underlying
+        // Gemms. Bias is still applied — `MarlinLinear::forward`
+        // does `bias_add_inplace` after `marlin_gemm` when its
+        // packed bias is present (auto-detected by
+        // `MarlinLinear::load_awq_concat`).
         let rope_id = *ctx
             .claimed_tiles
             .iter()
@@ -5252,7 +5293,7 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
             .expect("claim must contain a RopeAppend");
         let rope_node = ctx.fuf.get(rope_id);
 
-        let qkv_ids: Vec<TileId> = rope_node
+        let qkv_raw: Vec<TileId> = rope_node
             .inputs
             .iter()
             .take(3)
@@ -5261,13 +5302,20 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
                 _ => None,
             })
             .collect();
-        assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
-        let gate_gemm_id = qkv_ids[0];
-        let activation = ctx.input_expr(gate_gemm_id, 0);
-
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
+        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
             .iter()
-            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+            .map(|t| {
+                unwrap_gemm_through_bias(ctx.fuf, *t)
+                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+        let q_gemm_id = resolved[0].0;
+        let activation = ctx.input_expr(q_gemm_id, 0);
+
+        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
+            .iter()
+            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
             .collect();
         let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
         let weight_expr = ctx.weight_accessor(&fused_name);
@@ -5406,7 +5454,12 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
         // Mirror of `FusedQkvRopePrefillImpl::emit_call` with
         // `MarlinLinear::forward(x, alloc, stream)` replacing the
-        // cuBLAS call.
+        // cuBLAS call. BiasAdd-aware: rope's three tile inputs are
+        // unwrapped through an optional BiasAdd wrapper so the
+        // packed `MarlinLinear` (carrying the concat of the three
+        // source .bias tensors) is still the authoritative bias
+        // applicator — `MarlinLinear::forward` runs
+        // `bias_add_inplace` after `marlin_gemm`.
         let rope_id = *ctx
             .claimed_tiles
             .iter()
@@ -5414,7 +5467,7 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
             .expect("claim must contain a RopeAppend");
         let rope_node = ctx.fuf.get(rope_id);
 
-        let qkv_ids: Vec<TileId> = rope_node
+        let qkv_raw: Vec<TileId> = rope_node
             .inputs
             .iter()
             .take(3)
@@ -5423,12 +5476,20 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
                 _ => None,
             })
             .collect();
-        assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
-        let activation = ctx.input_expr(qkv_ids[0], 0);
-
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
+        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
             .iter()
-            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+            .map(|t| {
+                unwrap_gemm_through_bias(ctx.fuf, *t)
+                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+        let q_gemm_id = resolved[0].0;
+        let activation = ctx.input_expr(q_gemm_id, 0);
+
+        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
+            .iter()
+            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
             .collect();
         let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
         let weight_expr = ctx.weight_accessor(&fused_name);

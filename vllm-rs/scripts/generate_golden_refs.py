@@ -36,6 +36,7 @@ MODELS = {
     "smollm_135m": "HuggingFaceTB/SmolLM2-135M-Instruct",
     "gemma2_2b": "unsloth/gemma-2-2b-it",
     "granite_3_3_2b": "ibm-granite/granite-3.3-2b-instruct",
+    "qwen3_0_6b": "Qwen/Qwen3-0.6B",
     # AWQ — exercises the ferrite-forward MarlinLinear / marlin_gemm path.
     # Both FERRITE_ENABLED and FERRITE_DISABLE=1 runs should match this
     # golden within the same top-N tolerance used for dense correctness tests.

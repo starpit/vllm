@@ -92,3 +92,10 @@ async fn test_cuda_correctness_llama_3_2_1b_awq() {
     // generated from Python vLLM on `AMead10/Llama-3.2-1B-Instruct-AWQ`.
     run_correctness_test(TestModels::LLAMA_3_2_1B_AWQ, "llama_3_2_1b_awq").await;
 }
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_qwen3_0_6b() {
+    run_correctness_test(TestModels::QWEN3_0_6B_CUDA, "qwen3_0_6b").await;
+}

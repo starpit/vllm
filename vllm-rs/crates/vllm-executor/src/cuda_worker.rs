@@ -142,6 +142,18 @@ pub struct GraniteFerriteModel {
     pub rotary: vllm_cuda::rotary::RotaryCache,
 }
 
+/// Same as `LlamaFerriteModel` but over Qwen3 dense — the DSL body
+/// in `ferrite_models::qwen3` adds per-head `rmsnorm(q, q_norm)` /
+/// `rmsnorm(k, k_norm)` between QKV gemms and rope_append; shape
+/// inference's reshape-recovery synthesizes the per-head view tiles,
+/// and `RopeAppendRefImpl` claims the standalone rope_append (the
+/// fused QKV-rope impls can't, since per-head norms break the
+/// gemm→rope adjacency they require). No QKV bias (unlike Qwen2).
+pub struct Qwen3FerriteModel {
+    pub weights: ferrite_models::qwen3::Weights,
+    pub rotary: vllm_cuda::rotary::RotaryCache,
+}
+
 /// Supported model architectures in the vllm-cuda backend.
 enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
@@ -162,6 +174,9 @@ enum CudaModel {
     /// Granite (IBM) via `ferrite_models::granite`. Same boxing
     /// rationale as `LlamaFerrite`.
     GraniteFerrite(Box<GraniteFerriteModel>),
+    /// Dense-bf16 Qwen3 via `ferrite_models::qwen3`. Same boxing
+    /// rationale as `LlamaFerrite`.
+    Qwen3Ferrite(Box<Qwen3FerriteModel>),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
     Mixtral(vllm_cuda::model::mixtral::MixtralForCausalLM),
     Qwen2Moe(vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM),
@@ -182,6 +197,7 @@ impl CudaModel {
             Self::Gemma2(m) => m.model.layers.len(),
             Self::Gemma2Ferrite(m) => m.weights.num_hidden_layers() as usize,
             Self::GraniteFerrite(m) => m.weights.num_hidden_layers() as usize,
+            Self::Qwen3Ferrite(m) => m.weights.num_hidden_layers() as usize,
             Self::Gemma3(m) => m.model.layers.len(),
             Self::Mixtral(m) => m.model.layers.len(),
             Self::Qwen2Moe(m) => m.model.layers.len(),
@@ -204,6 +220,7 @@ impl CudaModel {
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma2Ferrite(m) => m.weights.num_key_value_heads() as usize,
             Self::GraniteFerrite(m) => m.weights.num_key_value_heads() as usize,
+            Self::Qwen3Ferrite(m) => m.weights.num_key_value_heads() as usize,
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Mixtral(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
@@ -224,6 +241,7 @@ impl CudaModel {
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
             Self::Gemma2Ferrite(m) => m.weights.head_dim() as usize,
             Self::GraniteFerrite(m) => m.weights.head_dim() as usize,
+            Self::Qwen3Ferrite(m) => m.weights.head_dim() as usize,
             Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
             Self::Mixtral(m) => m.model.layers[0].self_attn.head_dim,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.head_dim,
@@ -244,6 +262,7 @@ impl CudaModel {
             Self::Gemma2(m) => m.lm_head.out_features(),
             Self::Gemma2Ferrite(m) => m.weights.vocab_size() as usize,
             Self::GraniteFerrite(m) => m.weights.vocab_size() as usize,
+            Self::Qwen3Ferrite(m) => m.weights.vocab_size() as usize,
             Self::Gemma3(m) => m.lm_head.out_features(),
             Self::Mixtral(m) => m.lm_head.out_features(),
             Self::Qwen2Moe(m) => m.lm_head.out_features(),
@@ -275,6 +294,7 @@ impl CudaModel {
             Self::Gemma2(m) => m.lm_head.in_features(),
             Self::Gemma2Ferrite(m) => m.weights.hidden_size() as usize,
             Self::GraniteFerrite(m) => m.weights.hidden_size() as usize,
+            Self::Qwen3Ferrite(m) => m.weights.hidden_size() as usize,
             Self::Gemma3(m) => m.lm_head.in_features(),
             Self::Mixtral(m) => m.lm_head.in_features(),
             Self::Qwen2Moe(m) => m.lm_head.in_features(),
@@ -436,6 +456,22 @@ impl CudaModel {
                     rotary: &m.rotary,
                 };
                 ferrite_models::granite::forward_backbone(&m.weights, &ctx, device, num_tokens)
+            },
+            Self::Qwen3Ferrite(m) => unsafe {
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    rotary: &m.rotary,
+                };
+                ferrite_models::qwen3::forward_backbone(&m.weights, &ctx, device, num_tokens)
             },
             Self::Gemma3(m) => unsafe {
                 m.model.forward(
@@ -713,6 +749,33 @@ impl CudaModel {
                     rotary: &m.rotary,
                 };
                 let logits = ferrite_models::granite::forward(&m.weights, &ctx, device, num_tokens);
+                match last_token_indices {
+                    Some(idx) if idx.dim(0) < num_tokens as usize => {
+                        vllm_cuda::kernels::embedding_gather(
+                            logits.as_gpu_tensor(),
+                            *idx,
+                            &mut device.caching,
+                            device.compute_stream,
+                        )
+                    }
+                    _ => logits,
+                }
+            },
+            Self::Qwen3Ferrite(m) => unsafe {
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    rotary: &m.rotary,
+                };
+                let logits = ferrite_models::qwen3::forward(&m.weights, &ctx, device, num_tokens);
                 match last_token_indices {
                     Some(idx) if idx.dim(0) < num_tokens as usize => {
                         vllm_cuda::kernels::embedding_gather(
@@ -2371,7 +2434,7 @@ impl CudaWorker {
 
         // Construct model.
         let model = match arch.as_str() {
-            "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
+            "LlamaForCausalLM" | "MistralForCausalLM" | "Phi3ForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
                 let m = vllm_cuda::model::llama::LlamaForCausalLM::load_gguf(
                     &mut gguf_weights,
@@ -2397,9 +2460,14 @@ impl CudaWorker {
                 CudaModel::Llama(m)
             }
             _ => {
+                // Qwen3 dense intentionally not in this list — its
+                // per-head q_norm / k_norm tensors don't fit the
+                // LlamaForCausalLM weight layout, so a GGUF Qwen3
+                // would silently drop them. Add a dedicated GGUF
+                // Qwen3 loader before re-enabling.
                 return Err(ExecutorError::WorkerInit(format!(
                     "unsupported architecture for GGUF: {arch}. Supported: LlamaForCausalLM, \
-                     MistralForCausalLM, Qwen2ForCausalLM, Qwen3ForCausalLM, Phi3ForCausalLM"
+                     MistralForCausalLM, Qwen2ForCausalLM, Phi3ForCausalLM"
                 )));
             }
         };
@@ -5217,7 +5285,64 @@ impl Worker for CudaWorker {
         };
 
         let model = match arch.as_str() {
-            "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
+            // Qwen3 dense — Llama math + per-head Q/K rmsnorm before
+            // RoPE (no QKV bias). Routes through ferrite-forward for
+            // dense bf16; quant / TP / PP not yet wired (the
+            // hand-written `LlamaForCausalLM` would silently drop the
+            // q_norm / k_norm tensors and produce garbage). Surface as
+            // a hard `WorkerInit` error in those cases until a
+            // dedicated quant Qwen3 path lands.
+            "Qwen3ForCausalLM" => {
+                let config = llama_config_from_hf(&hf_config)?;
+                let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
+                if qconfig.is_bnb4bit()
+                    || qconfig.is_fp8()
+                    || qconfig.is_quantized()
+                    || use_tp
+                    || use_pp
+                    || disable_ferrite
+                {
+                    return Err(ExecutorError::WorkerInit(
+                        "Qwen3 dense: only bf16/fp16 ferrite-forward path is supported \
+                         (quant / TP / PP / FERRITE_DISABLE require the hand-written \
+                         model, which doesn't yet handle Qwen3's per-head q_norm/k_norm)"
+                            .into(),
+                    ));
+                }
+                let stream = device.compute_stream;
+                let ferrite_weights = ferrite_models::qwen3::Weights::load(
+                    &mut weights,
+                    stream,
+                    config.num_hidden_layers as u64,
+                    config.hidden_size as u64,
+                    config.intermediate_size as u64,
+                    config.num_attention_heads as u64,
+                    config.num_kv_heads as u64,
+                    config.head_dim as u64,
+                    config.vocab_size as u64,
+                    ferrite_quant_kind(&qconfig),
+                )
+                .map_err(|e| {
+                    ExecutorError::WorkerInit(format!("Qwen3 ferrite-forward load: {e}"))
+                })?;
+                let rotary = unsafe {
+                    vllm_cuda::rotary::RotaryCache::new(
+                        config.head_dim,
+                        config.max_position_embeddings,
+                        config.rope_theta,
+                        config.llama3_rope_scaling.as_ref(),
+                        dtype,
+                        device,
+                    )
+                }
+                .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
+                info!("CudaWorker: loaded Qwen3 via ferrite-forward");
+                CudaModel::Qwen3Ferrite(Box::new(Qwen3FerriteModel {
+                    weights: ferrite_weights,
+                    rotary,
+                }))
+            }
+            "LlamaForCausalLM" | "MistralForCausalLM" | "Phi3ForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
                 // Dense bf16/fp16 path: ferrite-forward emits the
                 // specialized Weights + forward for each compiled

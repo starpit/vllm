@@ -822,11 +822,12 @@ fn try_anchor_with_recovery(
         }
 
         // Genuine mismatch. Try reshape recovery for the
-        // per-head-norm pattern.
-        if let Some(hint) =
-            detect_reshape_hint(program, cx, wid, &inferred_walked, &declared_walked)
-        {
-            hints.push(hint);
+        // per-head-norm pattern. `detect_reshape_hint` returns the
+        // split (before-consumer) + flatten-back (after-consumer)
+        // hint pair — or empty if the pattern doesn't fit.
+        let recovered = detect_reshape_hint(program, cx, wid, &inferred_walked, &declared_walked);
+        if !recovered.is_empty() {
+            hints.extend(recovered);
             return Ok(());
         }
         return Err(ShapeError::Mismatch {
@@ -838,10 +839,22 @@ fn try_anchor_with_recovery(
 }
 
 /// If `inferred = Mul([.., Declared, ..])` and `declared` is a single
-/// `Bound`/`Lit`, produce a hint describing the reshape that would
-/// make the consumer's activation tile line up.
+/// `Bound`/`Lit`, produce the hint pair describing the reshape bridge
+/// that makes the consumer's activation tile line up:
 ///
-/// Returns `None` if the mismatch doesn't fit the "axis-factor"
+/// - **Split hint**: reshape the activation feeding the consumer from
+///   `[.., heads*head_dim]` to `[.., heads, head_dim]` so the
+///   consumer's signature (e.g. `rmsnorm(x, w)` with `w: [head_dim]`)
+///   unifies cleanly on the split last axis.
+/// - **Flatten hint**: reshape the consumer's OUTPUT back from
+///   `[.., heads, head_dim]` to the original `[.., heads*head_dim]`
+///   layout so any downstream op (e.g. `rope_append`) that expects
+///   the flat `heads*head_dim` layout sees the correct shape. This
+///   is a no-op at the `apply_reshape_hints` pass when the consumer
+///   has no downstream reader (its `rewrite_and_insert` call finds
+///   nothing to rewrite and inserts nothing).
+///
+/// Returns an empty vec if the mismatch doesn't fit the "axis-factor"
 /// pattern — at which point the caller treats it as a hard Mismatch.
 fn detect_reshape_hint(
     program: &Program,
@@ -849,11 +862,11 @@ fn detect_reshape_hint(
     wid: WeightId,
     inferred: &Dim,
     declared: &Dim,
-) -> Option<ReshapeHint> {
+) -> Vec<ReshapeHint> {
     // Only handle the "inferred is Mul containing declared as a
     // factor" shape. Bail on any other combination for now.
     let Dim::Mul(factors) = inferred else {
-        return None;
+        return Vec::new();
     };
     // The factors OTHER than `declared` form the prefix that gets
     // split out into a new axis.
@@ -867,52 +880,80 @@ fn detect_reshape_hint(
         split_factors.push(f.clone());
     }
     if !found_declared || split_factors.is_empty() {
-        return None;
+        return Vec::new();
     }
-    // Find the consumer stmt that reads this weight, and the
-    // activation tile feeding that stmt's slot 0.
-    let (consumer_producer_local, consumer_shape) =
-        find_consumer_activation(program, &cx.locals, wid)?;
-    // Target shape = consumer's current last axis split into
-    // [split_factors..., declared]. E.g. [..., heads * head_dim]
-    // → [..., heads, head_dim]. For a rank-2 input `[T, heads*D]`
-    // the result is `[T, heads, D]`.
+    // Find the consumer stmt that reads this weight: its activation
+    // input (the upstream producer) and its output target.
+    let Some((consumer_producer_local, consumer_shape, consumer_target_local)) =
+        find_consumer_activation(program, &cx.locals, wid)
+    else {
+        return Vec::new();
+    };
+    // Split target: flatten the leading axes with the split factors
+    // into a single leading dim, keeping `declared` as the trailing
+    // axis. E.g. `[T, heads*head_dim]` with `declared = head_dim`
+    // → `[T*heads, head_dim]`, NOT `[T, heads, head_dim]`.
+    //
+    // The 2D target matches the `rms_norm` kernel's shape
+    // expectations (`input.dim(0) = rows`, `input.dim(1) =
+    // hidden_size`), so each row gets normalized over `head_dim` —
+    // exactly per-head RMS norm. A 3D target would mis-dispatch the
+    // kernel (it reads `dim(1)` as hidden_size → `heads`, allocates
+    // a too-small output, and illegal-memory-access on the first
+    // write past row 0).
     if consumer_shape.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let mut target_shape: Shape = consumer_shape[..consumer_shape.len() - 1].to_vec();
-    // `split_factors` may itself be a single Dim — still push it as one.
-    // Ordering: prefix factors, then declared last (so the LAST axis is
-    // what the consumer's signature unifies against w[0]).
-    match split_factors.len() {
-        1 => target_shape.push(split_factors.into_iter().next().unwrap()),
-        _ => target_shape.push(canonical_mul(split_factors)),
-    }
-    target_shape.push(declared.clone());
-    Some(ReshapeHint {
+    let mut leading: Vec<Dim> = consumer_shape[..consumer_shape.len() - 1].to_vec();
+    leading.extend(split_factors);
+    let merged_leading = match leading.len() {
+        0 => return Vec::new(),
+        1 => leading.into_iter().next().unwrap(),
+        _ => canonical_mul(leading),
+    };
+    let split_shape: Shape = vec![merged_leading, declared.clone()];
+
+    // Flatten-back target: the consumer's output under first-pass
+    // inference inherits the producer's original (flat) shape for
+    // shape-preserving ops like `rmsnorm`, so `consumer_shape` is
+    // exactly the layout we need the rmsnorm output to be viewed as
+    // before `rope_append` reads it. If the consumer's output local
+    // is not known (e.g. AssignTuple destructure), skip the flatten
+    // hint — the caller only synthesizes for scalar-target consumers.
+    let mut hints = vec![ReshapeHint {
         producer_local: consumer_producer_local,
-        target_shape,
+        target_shape: split_shape,
         weight_id: wid,
-    })
+    }];
+    if let Some(target_local) = consumer_target_local {
+        hints.push(ReshapeHint {
+            producer_local: target_local,
+            target_shape: consumer_shape,
+            weight_id: wid,
+        });
+    }
+    hints
 }
 
 /// Walk the program's statements looking for a call whose args include
 /// `Expr::Weight { id: wid, .. }`. Return `(activation_local,
-/// activation_shape)` where the activation is the first `Expr::Local`
-/// arg of that call.
+/// activation_shape, target_local)` where the activation is the first
+/// `Expr::Local` arg of that call and `target_local` is the stmt's
+/// `Assign` target (or `None` for `AssignTuple` destructure — the
+/// current per-head-norm recovery only uses scalar-target consumers).
 fn find_consumer_activation(
     program: &Program,
     locals: &HashMap<LocalId, Shape>,
     wid: WeightId,
-) -> Option<(LocalId, Shape)> {
+) -> Option<(LocalId, Shape, Option<LocalId>)> {
     fn walk(
         stmts: &[Stmt],
         locals: &HashMap<LocalId, Shape>,
         wid: WeightId,
-    ) -> Option<(LocalId, Shape)> {
+    ) -> Option<(LocalId, Shape, Option<LocalId>)> {
         for s in stmts {
             match s {
-                Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => {
+                Stmt::Assign { value, target } => {
                     if let Expr::Call { args, .. } = value {
                         let has_weight = args
                             .iter()
@@ -923,7 +964,22 @@ fn find_consumer_activation(
                                 _ => None,
                             })?;
                             let shape = locals.get(&activation)?.clone();
-                            return Some((activation, shape));
+                            return Some((activation, shape, Some(*target)));
+                        }
+                    }
+                }
+                Stmt::AssignTuple { value, .. } => {
+                    if let Expr::Call { args, .. } = value {
+                        let has_weight = args
+                            .iter()
+                            .any(|a| matches!(a, Expr::Weight { id, .. } if *id == wid));
+                        if has_weight {
+                            let activation = args.iter().find_map(|a| match a {
+                                Expr::Local(id) => Some(*id),
+                                _ => None,
+                            })?;
+                            let shape = locals.get(&activation)?.clone();
+                            return Some((activation, shape, None));
                         }
                     }
                 }

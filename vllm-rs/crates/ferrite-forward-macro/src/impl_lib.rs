@@ -1125,20 +1125,56 @@ impl Implementation for ReshapeRefImpl {
         let tile = ctx.primary();
         let out = ctx.output_ident(tile, 0);
         let input = ctx.input_expr(tile, 0);
-        // Evaluate the target shape numerically. Each Dim is one of
-        // Lit/Bound/Mul; we fold into concrete u64 via the model's
-        // bound table. `reshape_recovery` only emits Mul/Bound over
-        // config.json dims, so every evaluation must succeed — a
-        // Var reaching this point is a compiler bug.
+        // Build per-dim expressions for the target shape. Each Dim is
+        // one of Lit / Bound / Mul. Config.json bounds fold to integer
+        // literals at emit time; the lone runtime bound `num_tokens`
+        // emits as `(input).dim(0)` since the reshape preserves the
+        // input's leading axis. Vars are a compiler bug at this point
+        // (shape inference closed every dim).
         let shape = &ctx.fuf.get(tile).outputs[0];
-        let dims: Vec<usize> = shape
+        let dim_tokens: Vec<proc_macro2::TokenStream> = shape
             .iter()
-            .map(|d| eval_dim_usize(d, ctx).expect("reshape target dim must evaluate"))
+            .map(|d| reshape_dim_token(d, ctx, &input))
             .collect();
-        let dim_tokens: Vec<proc_macro2::TokenStream> =
-            dims.iter().map(|d| quote! { #d }).collect();
         quote! {
             let #out = unsafe { (#input).reshape(&[ #( #dim_tokens ),* ]) };
+        }
+    }
+}
+
+/// Emit a `usize`-typed Rust expression for one Dim of a reshape
+/// target shape. Config bounds fold to literals; `num_tokens` reads
+/// off `ctx.input_ids.dim(0)` (the authoritative runtime source —
+/// the immediate reshape input's `dim(0)` isn't stable once a prior
+/// reshape has merged axes, e.g. `[T, heads*head_dim]` → `[T*heads,
+/// head_dim]`); Mul recurses with `*`.
+fn reshape_dim_token(
+    d: &crate::shape::Dim,
+    ctx: &EmitCtx,
+    input: &TokenStream,
+) -> proc_macro2::TokenStream {
+    use crate::shape::Dim;
+    let _ = input;
+    match d {
+        Dim::Lit(n) => {
+            let v = *n as usize;
+            quote! { #v }
+        }
+        Dim::Bound(name) if name == "num_tokens" => {
+            quote! { (*ctx.input_ids).dim(0) }
+        }
+        Dim::Bound(name) => {
+            let v = ctx.bound(name) as usize;
+            quote! { #v }
+        }
+        Dim::Mul(factors) => {
+            let mut parts = factors.iter().map(|f| reshape_dim_token(f, ctx, input));
+            let first = parts.next().unwrap_or_else(|| quote! { 1usize });
+            let folded = parts.fold(first, |acc, p| quote! { (#acc) * (#p) });
+            quote! { (#folded) }
+        }
+        Dim::Var(_) => {
+            panic!("reshape target dim must be closed (no Var) — compiler bug")
         }
     }
 }
@@ -1218,6 +1254,11 @@ pub fn starter_library() -> ImplementationLibrary {
     // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
     lib.push(Box::new(FusedQkvRopeCacheImpl));
     lib.push(Box::new(FusedQkvRopePrefillImpl));
+    // Singleton fallback claims standalone RopeAppend tiles when the
+    // QKV fusions can't (e.g. Qwen3 with per-head Q/K rmsnorm tiles
+    // sitting between the QKV gemms and rope_append). Emits
+    // `rotary_embedding_inplace` + `reshape_and_cache`.
+    lib.push(Box::new(RopeAppendRefImpl));
     // Matching attention pair — decode reads from cache, prefill
     // reads the contiguous K/V produced by the prefill QKV impl.
     lib.push(Box::new(AttentionPrefillContiguousImpl));
@@ -3035,6 +3076,50 @@ fn unwrap_gemm_through_bias(fuf: &Fuf, tile: TileId) -> Option<(TileId, Option<T
     }
 }
 
+/// True if this RopeAppend tile's first three tile-inputs all resolve
+/// (directly or through `BiasAdd`) to three Gemms sharing the same
+/// activation with uniform bias presence — the exact pattern
+/// `FusedQkvRope{Cache,Prefill}Impl::matches` requires. Used by
+/// `RopeAppendRefImpl` to defer to the fused impl whenever it would
+/// match (Llama, Qwen2) and only claim standalone when the pattern
+/// is broken by intervening ops (Qwen3's per-head Q/K rmsnorms).
+fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
+    let node = fuf.get(rope_tile);
+    if node.op != OpKind::RopeAppend || node.inputs.len() < 3 {
+        return false;
+    }
+    let qkv_raw: Vec<TileId> = node
+        .inputs
+        .iter()
+        .take(3)
+        .filter_map(|i| match i {
+            FufInput::Tile { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    if qkv_raw.len() != 3 {
+        return false;
+    }
+    let Some(resolved): Option<Vec<(TileId, Option<TileId>)>> = qkv_raw
+        .iter()
+        .map(|t| unwrap_gemm_through_bias(fuf, *t))
+        .collect()
+    else {
+        return false;
+    };
+    let biased = resolved[0].1.is_some();
+    if resolved.iter().any(|r| r.1.is_some() != biased) {
+        return false;
+    }
+    let gemms: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
+    let Some(act) = first_tile_input(fuf.get(gemms[0])) else {
+        return false;
+    };
+    gemms
+        .iter()
+        .all(|t| first_tile_input(fuf.get(*t)) == Some(act))
+}
+
 impl Implementation for FusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         "fused_qkv_rope_cache"
@@ -3563,6 +3648,262 @@ impl Implementation for AttentionViaCacheImpl {
                 let dt = (*#out).dtype();
                 #out.reshape(&[nt, #q_size], dt);
             }
+        }
+    }
+}
+
+// ── RopeAppendRefImpl ────────────────────────────────────────────
+//
+// Singleton fallback for `OpKind::RopeAppend` tiles that the QKV
+// fusions (`FusedQkvRopeCacheImpl` / `FusedQkvRopePrefillImpl`)
+// don't claim — typically Qwen3 / Gemma3, where per-head Q/K
+// rmsnorm tiles sit between the QKV gemms and rope_append, breaking
+// the gemm→rope adjacency the fused matchers require.
+//
+// Emits a two-kernel sequence:
+//   1. `rotary_embedding_inplace(q, k, positions, cos_sin, head_dim)`
+//      — applies RoPE to Q and K in-place on the 2D `[T, heads*head_dim]`
+//      / `[T, kv_heads*head_dim]` upstream tensors.
+//   2. `reshape_and_cache(k_3d, v_3d, k_cache, v_cache, slot_mapping,
+//      block_size)` — writes K/V to the paged cache. K and V are
+//      reshaped to 3D `[T, kv_heads, head_dim]` views (metadata only)
+//      to match the kernel's expected layout.
+//
+// Output bindings: all three are 3D TensorView reshapes aliasing the
+// upstream storage — `[T, q_heads, head_dim]` for Q, `[T, kv_heads,
+// head_dim]` for K and V. This matches what the fused
+// `FusedQkvRope{Cache,Prefill}Impl` impls produce, so the downstream
+// `AttentionViaCacheImpl` / `AttentionPrefillContiguousImpl` (which
+// read `q.dim(0,1,2)` as `[total_q, num_heads, head_dim]`) see the
+// same layout whichever upstream fired. No move / no consume — the
+// drop pass resolves aliases to the ultimate owner and keeps it
+// alive until every downstream use is done.
+//
+// All M (decode + prefill) — kernel signatures don't depend on token
+// count.
+
+#[derive(Debug, Default)]
+pub struct RopeAppendRefImpl;
+
+impl Implementation for RopeAppendRefImpl {
+    fn name(&self) -> &'static str {
+        "rope_append_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::RopeAppend {
+            return None;
+        }
+        // Boundary inputs: q, k, v upstream tiles (slots 0, 1, 2 of
+        // the rope_append). Positions / rotary / kv_cache are externs,
+        // sourced from `ForwardCtx`.
+        let qkv: Vec<TileId> = node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        if qkv.len() != 3 {
+            return None;
+        }
+        // Defer to `FusedQkvRope{Cache,Prefill}Impl` when the
+        // upstream pattern matches: three Gemms (optionally through
+        // a BiasAdd) sharing one activation, uniform bias presence.
+        // Rejecting here mirrors `gemm_is_fusion_partner` on
+        // `CutlassGemmImpl` / `CutlassGemvImpl` — singletons must
+        // never steal a claim the fused impl owns, because their
+        // output layouts don't match what the downstream
+        // `AttentionPrefillContiguousImpl` / `AttentionViaCacheImpl`
+        // expects (fused impls produce contiguous `[T, heads,
+        // head_dim]` K/V; the singleton rotates in-place and leaves
+        // K/V at `[T, heads*head_dim]`).
+        if rope_append_has_fused_qkv_upstream(fuf, seed) {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: qkv,
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // RoPE + cache write are bandwidth-bound: read packed Q+K +
+        // write rotated Q+K to same buffers + write K/V to cache.
+        let m = ctx.num_tokens() as f64;
+        let q_size = ctx.bounds.get("num_attention_heads").copied().unwrap_or(0)
+            * ctx.bounds.get("head_dim").copied().unwrap_or(0);
+        let kv_size = ctx.bounds.get("num_key_value_heads").copied().unwrap_or(0)
+            * ctx.bounds.get("head_dim").copied().unwrap_or(0);
+        let bytes = m * (2.0 * q_size as f64 + 4.0 * kv_size as f64) * BYTES_PER_ELEM;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // All three outputs (q', k', v') are 3D TensorView reshapes
+        // over the upstream tile storage — no new allocation, no
+        // move. Upstream Q may itself be a TensorView (Qwen3's
+        // flatten-back Reshape between QK-norm and rope_append) or
+        // an OwnedTensor (architectures without QK-norm that land
+        // here for other reasons), so we never consume — the drop
+        // pass resolves aliases through to the ultimate owner and
+        // keeps it alive until every downstream use is done.
+        let rope_id = claimed_tiles[0];
+        let node = fuf.get(rope_id);
+        let q_src = node.inputs.first().and_then(|i| match i {
+            FufInput::Tile { id, slot } => Some((*id, *slot)),
+            _ => None,
+        });
+        let k_src = node.inputs.get(1).and_then(|i| match i {
+            FufInput::Tile { id, slot } => Some((*id, *slot)),
+            _ => None,
+        });
+        let v_src = node.inputs.get(2).and_then(|i| match i {
+            FufInput::Tile { id, slot } => Some((*id, *slot)),
+            _ => None,
+        });
+        vec![
+            ((rope_id, 0), q_src),
+            ((rope_id, 1), k_src),
+            ((rope_id, 2), v_src),
+        ]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let rope_id = ctx.primary();
+        let node = ctx.fuf.get(rope_id);
+
+        let q_upstream = ctx
+            .input_tile_ident(rope_id, 0)
+            .expect("RopeAppend input 0 (q) must be a Tile");
+        let k_upstream = ctx
+            .input_tile_ident(rope_id, 1)
+            .expect("RopeAppend input 1 (k) must be a Tile");
+        let v_upstream = ctx
+            .input_tile_ident(rope_id, 2)
+            .expect("RopeAppend input 2 (v) must be a Tile");
+
+        let layer = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Extern {
+                    kind: crate::classified::ExternKind::KvCache,
+                    index: Some(layer),
+                } => Some(*layer),
+                _ => None,
+            })
+            .expect("RopeAppend has a kv_cache extern with a concrete layer index")
+            as usize;
+
+        let head_dim = ctx.bound("head_dim") as usize;
+        let num_q_heads = ctx.bound("num_attention_heads") as usize;
+        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+
+        let q_out = ctx.output_ident(rope_id, 0);
+        let k_out = ctx.output_ident(rope_id, 1);
+        let v_out = ctx.output_ident(rope_id, 2);
+
+        quote! {
+            unsafe {
+                // RoPE runs against the flat 2D `[T, heads*head_dim]`
+                // layout — rotary_embedding_inplace reads dim(0)/dim(1)
+                // to derive tokens × total dim.
+                ::ferrite_kernels::kernels::rotary_embedding_inplace(
+                    *#q_upstream,
+                    *#k_upstream,
+                    *ctx.positions,
+                    ctx.rotary.cos_sin_cache,
+                    #head_dim,
+                    device.compute_stream,
+                );
+                let nt = (*#k_upstream).dim(0);
+                let k_3d = (*#k_upstream)
+                    .as_view()
+                    .reshape(&[nt, #num_kv_heads, #head_dim]);
+                let v_3d = (*#v_upstream)
+                    .as_view()
+                    .reshape(&[nt, #num_kv_heads, #head_dim]);
+                ::ferrite_kernels::kernels::reshape_and_cache(
+                    *k_3d,
+                    *v_3d,
+                    *ctx.kv_cache.k_cache(#layer),
+                    *ctx.kv_cache.v_cache(#layer),
+                    *ctx.slot_mapping,
+                    ctx.kv_cache.block_size,
+                    device.compute_stream,
+                );
+            }
+            // Expose Q/K/V as 3D TensorViews so the downstream
+            // attention impls (which read `q.dim(0,1,2)` as
+            // `[total_q, num_heads, head_dim]`) match the layout
+            // produced by the fused `FusedQkvRope*` impls.
+            let #q_out = unsafe {
+                let nt = (*#q_upstream).dim(0);
+                (*#q_upstream)
+                    .as_view()
+                    .reshape(&[nt, #num_q_heads, #head_dim])
+            };
+            let #k_out = unsafe {
+                let nt = (*#k_upstream).dim(0);
+                (*#k_upstream)
+                    .as_view()
+                    .reshape(&[nt, #num_kv_heads, #head_dim])
+            };
+            let #v_out = unsafe {
+                let nt = (*#v_upstream).dim(0);
+                (*#v_upstream)
+                    .as_view()
+                    .reshape(&[nt, #num_kv_heads, #head_dim])
+            };
         }
     }
 }

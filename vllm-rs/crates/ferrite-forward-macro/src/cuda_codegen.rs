@@ -29,6 +29,8 @@ pub struct GeneratedMegakernel {
     /// Per-phase flat parameter descriptors for the Rust FFI caller.
     /// Each entry is `(c_type, param_name)`.
     pub flat_params: Vec<(String, String)>,
+    /// Number of inter-phase barrier counters needed (phases - 1).
+    pub num_barriers: usize,
 }
 
 /// Generate a `.cu` source for one megakernel wave.
@@ -37,8 +39,8 @@ pub struct GeneratedMegakernel {
 /// (e.g. `megakernel_w0`, `megakernel_w1`).
 pub fn generate_megakernel(wave_idx: usize, phases: &[DevicePhase]) -> GeneratedMegakernel {
     assert!(
-        phases.len() >= 2,
-        "megakernel requires at least 2 phases (got {})",
+        !phases.is_empty(),
+        "megakernel requires at least 1 phase (got {})",
         phases.len()
     );
 
@@ -146,10 +148,16 @@ pub fn generate_megakernel(wave_idx: usize, phases: &[DevicePhase]) -> Generated
     .unwrap();
     writeln!(src, "}}").unwrap();
 
+    let num_barriers = if phases.len() > 1 {
+        phases.len() - 1
+    } else {
+        0
+    };
     GeneratedMegakernel {
         cuda_source: src,
         launch_fn_name,
         flat_params: all_flat,
+        num_barriers,
     }
 }
 
@@ -213,15 +221,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "at least 2 phases")]
-    fn panics_on_single_phase() {
-        let p = DevicePhase {
-            flat_params: vec![],
-            kernel_body: vec![],
-            params_build: vec![],
-            internal_fields: vec![],
-            preamble: vec![],
-        };
-        generate_megakernel(0, &[p]);
+    #[should_panic(expected = "at least 1 phase")]
+    fn panics_on_zero_phases() {
+        generate_megakernel(0, &[]);
     }
 }

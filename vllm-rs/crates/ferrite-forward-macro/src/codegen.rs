@@ -506,7 +506,7 @@ fn try_emit_megakernel(
     mctx: &MegakernelEmitCtx,
     mega_idx: &mut usize,
 ) -> Option<Vec<TokenStream>> {
-    if dc_group.len() < 2 {
+    if dc_group.is_empty() {
         return None;
     }
 
@@ -662,8 +662,8 @@ fn generate_megakernel_labeled(
     phases: &[DevicePhase],
 ) -> crate::cuda_codegen::GeneratedMegakernel {
     assert!(
-        phases.len() >= 2,
-        "megakernel requires at least 2 phases (got {})",
+        !phases.is_empty(),
+        "megakernel requires at least 1 phase (got {})",
         phases.len()
     );
 
@@ -681,6 +681,8 @@ fn generate_megakernel_labeled(
     )
     .unwrap();
     writeln!(src).unwrap();
+    writeln!(src, "#include <cstdint>").unwrap();
+    writeln!(src, "#include <cuda_runtime.h>").unwrap();
     writeln!(src, "#include <cuda_bf16.h>").unwrap();
     writeln!(src, "#include <cooperative_groups.h>").unwrap();
     writeln!(src, "#include \"megakernel_ops.cuh\"").unwrap();
@@ -700,6 +702,12 @@ fn generate_megakernel_labeled(
     for phase in phases {
         all_flat.extend(phase.flat_params.iter().cloned());
     }
+
+    let num_barriers = if phases.len() > 1 {
+        phases.len() - 1
+    } else {
+        0
+    };
 
     writeln!(src, "struct {params_struct_name} {{").unwrap();
     for (i, phase) in phases.iter().enumerate() {
@@ -761,14 +769,12 @@ fn generate_megakernel_labeled(
         }
     }
     writeln!(src).unwrap();
-    writeln!(src, "    dim3 grid(__grid_x);").unwrap();
-    writeln!(src, "    dim3 block(__block_x);").unwrap();
     writeln!(src, "    void* args[] = {{ &params }};").unwrap();
     writeln!(src, "    return cudaLaunchCooperativeKernel(").unwrap();
     writeln!(src, "        (void*){kernel_name},").unwrap();
     writeln!(
         src,
-        "        grid, block, args, __smem_bytes, (cudaStream_t)__stream);"
+        "        dim3(__grid_x), dim3(__block_x), args, __smem_bytes, (cudaStream_t)__stream);"
     )
     .unwrap();
     writeln!(src, "}}").unwrap();
@@ -777,6 +783,7 @@ fn generate_megakernel_labeled(
         cuda_source: src,
         launch_fn_name,
         flat_params: all_flat,
+        num_barriers,
     }
 }
 

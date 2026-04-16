@@ -153,9 +153,10 @@ pub fn schedule(fuf: &Fuf, sfuf: &Assignment, lib: &ImplementationLibrary) -> Lo
         waves: bins
             .into_iter()
             .map(|subgraphs| {
-                // A wave is a megakernel wave if it has ≥2 subgraphs
-                // and ALL are DeviceCallable.
-                let is_mega = subgraphs.len() >= 2 && subgraphs.iter().all(|(sg, _)| is_dc[sg]);
+                // A wave is a megakernel wave if ALL subgraphs are
+                // DeviceCallable (even single-subgraph waves — they get
+                // wrapped in a single-phase kernel launch).
+                let is_mega = !subgraphs.is_empty() && subgraphs.iter().all(|(sg, _)| is_dc[sg]);
                 Wave {
                     subgraphs,
                     is_megakernel: is_mega,

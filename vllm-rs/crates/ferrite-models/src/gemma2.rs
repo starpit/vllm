@@ -25,7 +25,7 @@
 use ferrite_forward::forward;
 
 #[forward(
-    target = "../../../target_profiles/l4_sm89.json",
+    target = "../../../target_profiles/h100_sm90.json",
     workloads = [1, 8, 64, 512, 4096],
 )]
 fn gemma2() {

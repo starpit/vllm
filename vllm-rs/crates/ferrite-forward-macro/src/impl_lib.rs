@@ -4183,8 +4183,7 @@ fn dc_device_phase(
                 .iter()
                 .find(|t| {
                     let n = ctx.fuf.get(**t);
-                    n.op == OpKind::Add
-                        && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+                    n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
                 })
                 .expect("claim contains a scalar-offset Add");
             let rmsnorm_id = *ctx
@@ -4415,13 +4414,9 @@ fn dc_device_phase(
             let upstream = ctx
                 .input_tile_ident(tile, 0)
                 .expect("tanh_softcap input is a tile");
-            let cap: f32 = ctx
-                .scalar("final_logit_softcapping")
-                .unwrap_or_else(|| {
-                    panic!(
-                        "tanh_softcap tile emitted but no final_logit_softcapping in config"
-                    )
-                }) as f32;
+            let cap: f32 = ctx.scalar("final_logit_softcapping").unwrap_or_else(|| {
+                panic!("tanh_softcap tile emitted but no final_logit_softcapping in config")
+            }) as f32;
             let inv_cap: f32 = 1.0 / cap;
             Some((
                 DevicePhase {
@@ -4657,8 +4652,8 @@ fn dc_device_phase(
             let q_size = (num_q_heads * head_dim) as i32;
             let kv_size = (num_kv_heads * head_dim) as i32;
             let head_dim_i32 = head_dim as i32;
-            let layer = rope_kv_cache_layer(rope_node)
-                .expect("RopeAppend has KvCache layer index") as usize;
+            let layer = rope_kv_cache_layer(rope_node).expect("RopeAppend has KvCache layer index")
+                as usize;
             let q_out = ctx.output_ident(rope_id, 0);
             let k_out = ctx.output_ident(rope_id, 1);
             let v_out = ctx.output_ident(rope_id, 2);
@@ -4679,9 +4674,13 @@ fn dc_device_phase(
                         ("int".into(), format!("{p}_num_tokens")),
                     ],
                     kernel_body: vec![
-                        format!("dc_fused_qkv_rope_cache({p}_q_out, {p}_key_cache, {p}_value_cache,"),
+                        format!(
+                            "dc_fused_qkv_rope_cache({p}_q_out, {p}_key_cache, {p}_value_cache,"
+                        ),
                         format!("    {p}_qkv, {p}_positions, {p}_cos_sin_cache, {p}_slot_mapping,"),
-                        format!("    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"),
+                        format!(
+                            "    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"
+                        ),
                     ],
                     params_build: vec![
                         format!("params.{p}_q_out = (__nv_bfloat16*){p}_q_out;"),
@@ -4689,7 +4688,9 @@ fn dc_device_phase(
                         format!("params.{p}_value_cache = (__nv_bfloat16*){p}_value_cache;"),
                         format!("params.{p}_qkv = (const __nv_bfloat16*){p}_qkv;"),
                         format!("params.{p}_positions = (const uint32_t*){p}_positions;"),
-                        format!("params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"),
+                        format!(
+                            "params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"
+                        ),
                         format!("params.{p}_slot_mapping = (const int64_t*){p}_slot_mapping;"),
                         format!("params.{p}_q_size = {p}_q_size;"),
                         format!("params.{p}_kv_size = {p}_kv_size;"),
@@ -4800,7 +4801,9 @@ fn dc_device_phase(
                     kernel_body: vec![
                         format!("dc_fused_qkv_rope_prefill({p}_q_out, {p}_k_out, {p}_v_out,"),
                         format!("    {p}_qkv, {p}_positions, {p}_cos_sin_cache,"),
-                        format!("    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"),
+                        format!(
+                            "    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"
+                        ),
                     ],
                     params_build: vec![
                         format!("params.{p}_q_out = (__nv_bfloat16*){p}_q_out;"),
@@ -4808,7 +4811,9 @@ fn dc_device_phase(
                         format!("params.{p}_v_out = (__nv_bfloat16*){p}_v_out;"),
                         format!("params.{p}_qkv = (const __nv_bfloat16*){p}_qkv;"),
                         format!("params.{p}_positions = (const uint32_t*){p}_positions;"),
-                        format!("params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"),
+                        format!(
+                            "params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"
+                        ),
                         format!("params.{p}_q_size = {p}_q_size;"),
                         format!("params.{p}_kv_size = {p}_kv_size;"),
                         format!("params.{p}_head_dim = {p}_head_dim;"),
@@ -4900,10 +4905,8 @@ fn dc_device_phase(
                 .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
                 .expect("claim has a second Gemm — the up gemm");
             let activation = ctx.input_expr(gate_id, 0);
-            let gate_w = first_weight_ref(ctx.fuf.get(gate_id))
-                .expect("gate gemm has a weight");
-            let up_w =
-                first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
+            let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
+            let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
             let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
             let weight_expr = ctx.weight_accessor(&fused_name);
             let intermediate = ctx.bound("intermediate_size") as i32;
@@ -5432,9 +5435,15 @@ impl Implementation for TkGemmImpl {
         emit_gemm(ctx)
     }
 
-    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>, Vec<TokenStream>)> {
+    fn device_phase(
+        &self,
+        idx: usize,
+        ctx: &EmitCtx,
+    ) -> Option<(DevicePhase, Vec<TokenStream>, Vec<TokenStream>)> {
         let p = format!("p{idx}");
-        let num_tokens_val = ctx.num_tokens.expect("TkGemmImpl::device_phase requires num_tokens") as i32;
+        let num_tokens_val =
+            ctx.num_tokens
+                .expect("TkGemmImpl::device_phase requires num_tokens") as i32;
         let tile = ctx.primary();
         let x = ctx.input_expr(tile, 0);
         let w = ctx.input_expr(tile, 1);
@@ -5589,7 +5598,11 @@ impl Implementation for TkGemvImpl {
         emit_gemm(ctx)
     }
 
-    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>, Vec<TokenStream>)> {
+    fn device_phase(
+        &self,
+        idx: usize,
+        ctx: &EmitCtx,
+    ) -> Option<(DevicePhase, Vec<TokenStream>, Vec<TokenStream>)> {
         let p = format!("p{idx}");
         let tile = ctx.primary();
         let x = ctx.input_expr(tile, 0);

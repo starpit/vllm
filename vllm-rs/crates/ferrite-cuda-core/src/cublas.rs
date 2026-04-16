@@ -528,9 +528,9 @@ impl CublasHandle {
             _compute_type,
             sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
         );
-        check(status).unwrap_or_else(|_| {
+        check(status).unwrap_or_else(|e| {
             panic!(
-                "cublasGemmEx failed for GEMM [M={}, K={}, N={}] {:?}",
+                "cublasGemmEx failed for GEMM [M={}, K={}, N={}] {:?}: {e}",
                 k.m, k.k, k.n, k.dtype,
             )
         });

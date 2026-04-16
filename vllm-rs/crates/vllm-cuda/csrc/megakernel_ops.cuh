@@ -22,7 +22,7 @@
 
 // ── Warp/block reduction helpers ───────────────────────────────
 
-__device__ __forceinline__ float dc_warp_reduce_sum(float val) {
+static __device__ __forceinline__ float dc_warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         val += __shfl_xor_sync(0xffffffff, val, offset);
@@ -30,7 +30,7 @@ __device__ __forceinline__ float dc_warp_reduce_sum(float val) {
     return val;
 }
 
-__device__ __forceinline__ float dc_block_reduce_sum(float val) {
+static __device__ __forceinline__ float dc_block_reduce_sum(float val) {
     __shared__ float shared[32];
     int lane = threadIdx.x % 32;
     int wid = threadIdx.x / 32;
@@ -49,7 +49,7 @@ __device__ __forceinline__ float dc_block_reduce_sum(float val) {
 // One CTA per row. CTAs beyond num_rows early-exit.
 
 template <typename T>
-__device__ void dc_rms_norm(
+static __device__ void dc_rms_norm(
     T* __restrict__ out,
     const T* __restrict__ input,
     const T* __restrict__ weight,
@@ -118,7 +118,7 @@ __device__ void dc_rms_norm(
 // Same as fused_add_rms_norm_kernel but __device__.
 
 template <typename T>
-__device__ void dc_fused_add_rms_norm(
+static __device__ void dc_fused_add_rms_norm(
     T* __restrict__ input,
     T* __restrict__ residual,
     const T* __restrict__ weight,
@@ -193,7 +193,7 @@ __device__ void dc_fused_add_rms_norm(
 // reduce over K. W is [N,K] row-major (our GEMM's B transposed).
 
 template <typename T>
-__device__ void dc_gemv(
+static __device__ void dc_gemv(
     T* __restrict__ out,         // [N]
     const T* __restrict__ x,     // [K]
     const T* __restrict__ W,     // [N, K] row-major
@@ -248,7 +248,7 @@ __device__ void dc_gemv(
 // pos_encoding_kernels.cu but as __device__ with num_rows guard.
 
 template <typename T>
-__device__ void dc_fused_qkv_rope_cache(
+static __device__ void dc_fused_qkv_rope_cache(
     T* __restrict__ q_out,                   // [num_tokens, q_size]
     T* __restrict__ key_cache,               // [num_blocks, block_size, kv_heads, head_dim]
     T* __restrict__ value_cache,             // same layout
@@ -388,12 +388,12 @@ __device__ void dc_fused_qkv_rope_cache(
 // packed as [gate|up] in a [num_rows, 2*d] tensor.
 // One CTA per row.
 
-__device__ __forceinline__ float dc_silu_scalar(float x) {
+static __device__ __forceinline__ float dc_silu_scalar(float x) {
     return x / (1.0f + expf(-x));
 }
 
 template <typename T>
-__device__ void dc_silu_and_mul(
+static __device__ void dc_silu_and_mul(
     T* __restrict__ out,
     const T* __restrict__ input,  // [num_rows, 2*d]
     int d,
@@ -434,7 +434,7 @@ __device__ void dc_silu_and_mul(
 // packed as [gate|up] in a [num_rows, 2*d] tensor.
 // One CTA per row.
 
-__device__ __forceinline__ float dc_gelu_tanh(float x) {
+static __device__ __forceinline__ float dc_gelu_tanh(float x) {
     constexpr float BETA = 0.7978845608028654f;  // sqrt(2/pi)
     constexpr float KAPPA = 0.044715f;
     float x3 = x * x * x;
@@ -443,7 +443,7 @@ __device__ __forceinline__ float dc_gelu_tanh(float x) {
 }
 
 template <typename T>
-__device__ void dc_gelu_and_mul(
+static __device__ void dc_gelu_and_mul(
     T* __restrict__ out,
     const T* __restrict__ input,  // [num_rows, 2*d]
     int d,
@@ -484,7 +484,7 @@ __device__ void dc_gelu_and_mul(
 // Used for embedding scaling (e.g. Gemma sqrt(hidden_size)).
 
 template <typename T>
-__device__ void dc_scalar_mul_inplace(
+static __device__ void dc_scalar_mul_inplace(
     T* __restrict__ x,
     float scalar,
     int n,
@@ -518,7 +518,7 @@ __device__ void dc_scalar_mul_inplace(
 // Used for Gemma2 final logit softcapping.
 
 template <typename T>
-__device__ void dc_tanh_softcap_inplace(
+static __device__ void dc_tanh_softcap_inplace(
     T* __restrict__ x,
     float inv_cap,
     float cap,
@@ -538,7 +538,7 @@ __device__ void dc_tanh_softcap_inplace(
 // Same as dc_rms_norm but adds 1.0 to the weight.
 
 template <typename T>
-__device__ void dc_rms_norm_with_offset(
+static __device__ void dc_rms_norm_with_offset(
     T* __restrict__ out,
     const T* __restrict__ input,
     const T* __restrict__ weight,
@@ -606,7 +606,7 @@ __device__ void dc_rms_norm_with_offset(
 // Gemma2 uses weight_offset=1.0 for its (1+w) convention.
 
 template <typename T>
-__device__ void dc_fused_add_rms_norm_with_offset(
+static __device__ void dc_fused_add_rms_norm_with_offset(
     T* __restrict__ input,
     T* __restrict__ residual,
     const T* __restrict__ weight,
@@ -687,7 +687,7 @@ __device__ void dc_fused_add_rms_norm_with_offset(
 // paged cache). One CTA per token. Applies RoPE to Q and K heads.
 
 template <typename T>
-__device__ void dc_fused_qkv_rope_prefill(
+static __device__ void dc_fused_qkv_rope_prefill(
     T* __restrict__ q_out,                   // [num_tokens, q_size]
     T* __restrict__ k_out,                   // [num_tokens, kv_size]
     T* __restrict__ v_out,                   // [num_tokens, kv_size]
@@ -826,7 +826,7 @@ __device__ void dc_fused_qkv_rope_prefill(
 
 #include <mma.h>
 
-__device__ void dc_tk_gemm(
+static __device__ void dc_tk_gemm(
     __nv_bfloat16* __restrict__ C,     // [M, N]
     const __nv_bfloat16* __restrict__ A, // [M, K]
     const __nv_bfloat16* __restrict__ B, // [N, K] row-major (B transposed)
@@ -943,7 +943,7 @@ __device__ void dc_tk_gemm(
 // y[n] = sum_k(A[0,k] * B[n,k]) for M=1. Specialized dot-product
 // per output element. One CTA per output row, threads reduce over K.
 
-__device__ void dc_tk_gemv(
+static __device__ void dc_tk_gemv(
     __nv_bfloat16* __restrict__ out,   // [N]
     const __nv_bfloat16* __restrict__ x, // [K]
     const __nv_bfloat16* __restrict__ W, // [N, K] row-major
@@ -965,7 +965,7 @@ __device__ void dc_tk_gemv(
 // temp buffers, then elementwise silu+mul. Since we're inside a
 // cooperative kernel, we use the grid-cooperative GEMM.
 
-__device__ void dc_fused_gate_up_silu_mul(
+static __device__ void dc_fused_gate_up_silu_mul(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ gate_weight,
@@ -1033,7 +1033,7 @@ __device__ void dc_fused_gate_up_silu_mul(
     }
 }
 
-__device__ void dc_fused_gate_up_gelu_mul(
+static __device__ void dc_fused_gate_up_gelu_mul(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ gate_weight,

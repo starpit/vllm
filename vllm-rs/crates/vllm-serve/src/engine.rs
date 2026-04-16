@@ -2897,13 +2897,15 @@ impl AsyncEngine {
         &self,
         request: &protocol::CompletionRequest,
     ) -> ServeResult<Vec<Vec<u32>>> {
+        let add_special = request.add_special_tokens;
         match &request.prompt {
             Some(protocol::CompletionPrompt::Single(text)) => {
-                Ok(vec![self.tokenize_text(text, false)?])
+                Ok(vec![self.tokenize_text(text, add_special)?])
             }
-            Some(protocol::CompletionPrompt::Multiple(texts)) => {
-                texts.iter().map(|t| self.tokenize_text(t, false)).collect()
-            }
+            Some(protocol::CompletionPrompt::Multiple(texts)) => texts
+                .iter()
+                .map(|t| self.tokenize_text(t, add_special))
+                .collect(),
             Some(protocol::CompletionPrompt::TokenIds(ids)) => Ok(vec![ids.clone()]),
             Some(protocol::CompletionPrompt::MultipleTokenIds(vv)) => Ok(vv.clone()),
             None => Ok(vec![vec![0]]),
@@ -3829,6 +3831,7 @@ mod tests {
             include_stop_str_in_output: false,
             ignore_eos: false,
             skip_special_tokens: true,
+            add_special_tokens: true,
             priority: 0,
             cache_salt: None,
             request_id: None,
@@ -3885,6 +3888,7 @@ mod tests {
             include_stop_str_in_output: false,
             ignore_eos: false,
             skip_special_tokens: true,
+            add_special_tokens: true,
             priority: 0,
             cache_salt: None,
             request_id: None,
@@ -4120,6 +4124,7 @@ mod tests {
             include_stop_str_in_output: false,
             ignore_eos: false,
             skip_special_tokens: true,
+            add_special_tokens: true,
             priority: 0,
             cache_salt: None,
             request_id: None,

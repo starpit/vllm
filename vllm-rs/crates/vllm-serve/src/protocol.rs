@@ -519,6 +519,13 @@ pub struct CompletionRequest {
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
 
+    /// Prepend tokenizer-defined special tokens (e.g. BOS) when tokenizing
+    /// the prompt string. Mirrors Python vLLM's `add_special_tokens` field
+    /// on its completion request; default `true`, same as Python vLLM.
+    /// Ignored for `TokenIds` / `MultipleTokenIds` prompts.
+    #[serde(default = "default_true")]
+    pub add_special_tokens: bool,
+
     /// Request priority.
     #[serde(default)]
     pub priority: i32,

@@ -422,6 +422,7 @@ fn build_completion_request(
         include_stop_str_in_output: false,
         ignore_eos: false,
         skip_special_tokens: true,
+        add_special_tokens: true,
         priority: 0,
         cache_salt: None,
         request_id: None,

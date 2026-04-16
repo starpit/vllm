@@ -1065,6 +1065,7 @@ mod tests {
             include_stop_str_in_output: params.include_stop_str_in_output,
             ignore_eos: params.ignore_eos,
             skip_special_tokens: params.skip_special_tokens,
+            add_special_tokens: true,
             priority: 0,
             cache_salt: None,
             request_id: None,

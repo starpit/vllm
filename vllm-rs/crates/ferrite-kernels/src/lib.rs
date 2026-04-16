@@ -30,6 +30,8 @@ pub mod layers;
 #[cfg(feature = "cuda")]
 pub mod layers_moe;
 #[cfg(feature = "cuda")]
+pub mod layers_quant;
+#[cfg(feature = "cuda")]
 pub mod rotary;
 
 #[cfg(feature = "cuda")]

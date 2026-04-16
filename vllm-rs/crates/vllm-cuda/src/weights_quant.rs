@@ -14,6 +14,12 @@ use crate::layers::MarlinLinear;
 use crate::quant::{self, QuantConfig};
 use crate::tensor::GpuTensor;
 use ferrite_cuda_core::weights::GpuWeights;
+use ferrite_kernels::layers_quant::{concat_cpu_dim1, fuse_bias_parts};
+
+// Re-export so callers that reach the Marlin workspace via
+// `gpu_weights::alloc_marlin_workspace` keep working. One source of
+// truth now lives in ferrite-kernels.
+pub use ferrite_kernels::layers_quant::alloc_marlin_workspace;
 
 /// Load a single quantized linear layer (AWQ or GPTQ) and repack to Marlin format.
 ///
@@ -51,7 +57,8 @@ pub fn load_marlin_linear(
     }
 }
 
-/// Load AWQ quantized linear layer and repack to Marlin format.
+/// Adapter: unwrap the runtime `AwqConfig` into explicit args and call
+/// the single-source-of-truth loader in `ferrite-kernels`.
 #[allow(clippy::too_many_arguments)]
 fn load_awq_marlin_linear(
     weights: &mut GpuWeights,
@@ -60,110 +67,9 @@ fn load_awq_marlin_linear(
     workspace: GpuTensor,
     device_id: i32,
     _alloc: &mut CachingAllocator,
-    stream: CUstream,
+    _stream: CUstream,
 ) -> Result<MarlinLinear> {
-    // AWQ qweight: [K, N/8] i32 — packed along output dim
-    let qw_name = format!("{prefix}.qweight");
-    let scales_name = format!("{prefix}.scales");
-    let qzeros_name = format!("{prefix}.qzeros");
-
-    // Get dimensions from qweight shape
-    let (qw_shape, _qw_dtype) = weights
-        .tensor_info(&qw_name)
-        .ok_or_else(|| anyhow::anyhow!("weight not found: {qw_name}"))?;
-    let size_k = qw_shape[0];
-    let size_n = qw_shape[1] * 8; // 4-bit: 8 values packed per i32
-    let group_size = cfg.group_size;
-    let num_groups = if group_size > 0 {
-        size_k / group_size
-    } else {
-        1
-    };
-
-    // Upload qweight to GPU (raw alloc — will be freed after repack)
-    let qweight_gpu = weights.take(&qw_name)?;
-
-    // Repack AWQ → Marlin tiled layout on GPU.
-    // Use driver::mem_alloc for the output (NOT caching allocator) because model
-    // weights must survive free_leaked_blocks() during profiling.
-    let num_u32 = size_k * size_n / 8;
-    let repack_nbytes = num_u32 * std::mem::size_of::<u32>();
-    let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
-    weights.record_alloc(repack_ptr, repack_nbytes);
-    unsafe {
-        crate::kernels::awq_repack_into(qweight_gpu, repack_ptr, size_k, size_n, device_id, stream);
-        driver::stream_synchronize(stream)?;
-        weights.unrecord_alloc(qweight_gpu.raw_ptr());
-        driver::mem_free(qweight_gpu.raw_ptr())?;
-    }
-    let qweight_marlin = unsafe { GpuTensor::new(repack_ptr, &[num_u32], DType::U32) };
-
-    // Load and permute scales (CPU)
-    let (scales_bytes, _scales_shape, scales_dtype) = weights.take_cpu(&scales_name)?;
-    let mut scales_u16: Vec<u16> = scales_bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    quant::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
-
-    // Upload permuted scales to GPU
-    let scales_bytes_permuted: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    let scales_nbytes = scales_bytes_permuted.len();
-    let scales_ptr = unsafe { driver::mem_alloc(scales_nbytes)? };
-    weights.record_alloc(scales_ptr, scales_nbytes);
-    unsafe {
-        driver::memcpy_htod_async(
-            scales_ptr,
-            scales_bytes_permuted.as_ptr(),
-            scales_nbytes,
-            stream,
-        )?;
-    }
-    let scales_gpu = unsafe { GpuTensor::new(scales_ptr, &[num_groups, size_n], scales_dtype) };
-
-    // Load and convert zero points (CPU)
-    let (qzeros_bytes, _qzeros_shape, _qzeros_dtype) = weights.take_cpu(&qzeros_name)?;
-    let qzeros_u32: Vec<u32> = qzeros_bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let marlin_zp = quant::awq_to_marlin_zero_points(&qzeros_u32, num_groups, size_n);
-
-    // Upload zero points to GPU
-    let zp_bytes: Vec<u8> = marlin_zp.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    let zp_nbytes = zp_bytes.len();
-    let zp_ptr = unsafe { driver::mem_alloc(zp_nbytes)? };
-    weights.record_alloc(zp_ptr, zp_nbytes);
-    unsafe { driver::memcpy_htod_async(zp_ptr, zp_bytes.as_ptr(), zp_nbytes, stream)? };
-    let zeros_gpu = unsafe { GpuTensor::new(zp_ptr, &[num_groups, size_n / 8], DType::U32) };
-
-    // Load bias if present
-    let bias_name = format!("{prefix}.bias");
-    let bias_gpu = if weights.contains(&bias_name) {
-        Some(weights.take(&bias_name)?)
-    } else {
-        None
-    };
-
-    unsafe { driver::stream_synchronize(stream)? };
-
-    Ok(MarlinLinear {
-        qweight: qweight_marlin,
-        scales: scales_gpu,
-        zeros: Some(zeros_gpu),
-        g_idx: None,
-        g_idx_sort_indices: None,
-        workspace,
-        size_k,
-        size_n,
-        group_size,
-        num_groups,
-        has_zp: true,
-        has_act_order: false,
-        b_type_id: 1, // AWQ = uint4
-        device_id,
-        bias: bias_gpu,
-    })
+    MarlinLinear::load_awq(weights, prefix, cfg.group_size, workspace, device_id)
 }
 
 /// Load GPTQ quantized linear layer and repack to Marlin format.
@@ -372,38 +278,10 @@ fn load_gptq_marlin_linear(
     })
 }
 
-/// Concatenate multiple CPU tensors along dimension 1 (the N/output dimension).
-///
-/// All tensors must have the same dim-0 size, dtype, and be 2D.
-/// Returns the concatenated bytes, new shape, and dtype.
-fn concat_cpu_dim1(tensors: &[(&[u8], &[usize], DType)]) -> (Vec<u8>, Vec<usize>, DType) {
-    assert!(!tensors.is_empty());
-    let dtype = tensors[0].2;
-    let dim0 = tensors[0].1[0];
-    let elem_size = dtype.size_bytes();
-
-    // Compute total dim1.
-    let total_dim1: usize = tensors.iter().map(|(_, shape, _)| shape[1]).sum();
-
-    // Row-interleaved concat: for each row, append columns from each tensor.
-    let total_bytes = dim0 * total_dim1 * elem_size;
-    let mut out = vec![0u8; total_bytes];
-
-    for row in 0..dim0 {
-        let mut col_offset = 0usize;
-        for (data, shape, _) in tensors {
-            let n = shape[1];
-            let src_row_bytes = n * elem_size;
-            let src_start = row * src_row_bytes;
-            let dst_start = (row * total_dim1 + col_offset) * elem_size;
-            out[dst_start..dst_start + src_row_bytes]
-                .copy_from_slice(&data[src_start..src_start + src_row_bytes]);
-            col_offset += n;
-        }
-    }
-
-    (out, vec![dim0, total_dim1], dtype)
-}
+// `concat_cpu_dim1` + `fuse_bias_parts` now live in
+// `ferrite_kernels::layers_quant` so ferrite-forward-emitted loader
+// code can reach them; this module's GPTQ path still calls them via
+// the `use` at the top.
 
 /// Load multiple quantized linear layers and fuse into a single Marlin GEMM.
 ///
@@ -640,9 +518,10 @@ fn load_fused_gptq_marlin(
     })
 }
 
-/// Load and fuse multiple AWQ layers into a single Marlin layer.
-///
-/// AWQ qweight: `[K, N/8]` i32 — concat along dim1 → `[K, N_total/8]`.
+/// Adapter: unwrap the runtime `AwqConfig` into explicit args and call
+/// the single-source-of-truth fused loader in `ferrite-kernels`.
+/// AWQ qweight is `[K, N/8]` i32 — ferrite-kernels concatenates along
+/// dim 1 and does a single repack.
 #[allow(clippy::too_many_arguments)]
 fn load_fused_awq_marlin(
     weights: &mut GpuWeights,
@@ -651,192 +530,15 @@ fn load_fused_awq_marlin(
     workspace: GpuTensor,
     device_id: i32,
     _alloc: &mut CachingAllocator,
-    stream: CUstream,
+    _stream: CUstream,
 ) -> Result<MarlinLinear> {
-    // Gather raw CPU tensors.
-    let mut qw_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
-    let mut sc_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
-    let mut qz_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
-    let mut bias_parts: Vec<Vec<u8>> = Vec::new();
-    let mut bias_dtype: Option<DType> = None;
-
-    // Track per-part N sizes for zero-point handling.
-    let mut part_n_sizes: Vec<usize> = Vec::new();
-
-    for prefix in prefixes {
-        let qw_name = format!("{prefix}.qweight");
-        let scales_name = format!("{prefix}.scales");
-        let qzeros_name = format!("{prefix}.qzeros");
-
-        let (qw_data, qw_shape, qw_dt) = weights.take_cpu(&qw_name)?;
-        let part_n = qw_shape[1] * 8; // AWQ: N/8 packed
-        part_n_sizes.push(part_n);
-        qw_parts.push((qw_data, qw_shape, qw_dt));
-        sc_parts.push(weights.take_cpu(&scales_name)?);
-        qz_parts.push(weights.take_cpu(&qzeros_name)?);
-
-        // Collect bias if present.
-        let bias_name = format!("{prefix}.bias");
-        if weights.contains(&bias_name) {
-            let (b_data, _b_shape, b_dtype) = weights.take_cpu(&bias_name)?;
-            bias_parts.push(b_data);
-            bias_dtype = Some(b_dtype);
-        }
-    }
-
-    // Concat qweights along dim1: [K, N1/8] + [K, N2/8] + ... → [K, N_total/8]
-    let qw_refs: Vec<_> = qw_parts
-        .iter()
-        .map(|(d, s, dt)| (d.as_slice(), s.as_slice(), *dt))
-        .collect();
-    let (qw_fused, qw_shape, _) = concat_cpu_dim1(&qw_refs);
-    let size_k = qw_shape[0];
-    let size_n = qw_shape[1] * 8;
-    let group_size = cfg.group_size;
-    let num_groups = if group_size > 0 {
-        size_k / group_size
-    } else {
-        1
-    };
-
-    // Upload fused qweight to GPU and repack.
-    let qw_nbytes = qw_fused.len();
-    let qw_gpu_ptr = unsafe { driver::mem_alloc(qw_nbytes)? };
-    unsafe { driver::memcpy_htod_async(qw_gpu_ptr, qw_fused.as_ptr(), qw_nbytes, stream)? };
-    let qw_gpu = unsafe { GpuTensor::new(qw_gpu_ptr, &qw_shape, DType::I32) };
-
-    let num_u32 = size_k * size_n / 8;
-    let repack_nbytes = num_u32 * std::mem::size_of::<u32>();
-    let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
-    weights.record_alloc(repack_ptr, repack_nbytes);
-    unsafe {
-        crate::kernels::awq_repack_into(qw_gpu, repack_ptr, size_k, size_n, device_id, stream);
-        driver::stream_synchronize(stream)?;
-        driver::mem_free(qw_gpu_ptr)?;
-    }
-    let qweight_marlin = unsafe { GpuTensor::new(repack_ptr, &[num_u32], DType::U32) };
-
-    // Concat and permute scales: [num_groups, N1] + ... → [num_groups, N_total]
-    let sc_refs: Vec<_> = sc_parts
-        .iter()
-        .map(|(d, s, dt)| (d.as_slice(), s.as_slice(), *dt))
-        .collect();
-    let (sc_fused, _sc_shape, scales_dtype) = concat_cpu_dim1(&sc_refs);
-    let mut scales_u16: Vec<u16> = sc_fused
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    quant::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
-
-    let scales_bytes_permuted: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    let scales_nbytes = scales_bytes_permuted.len();
-    let scales_ptr = unsafe { driver::mem_alloc(scales_nbytes)? };
-    weights.record_alloc(scales_ptr, scales_nbytes);
-    unsafe {
-        driver::memcpy_htod_async(
-            scales_ptr,
-            scales_bytes_permuted.as_ptr(),
-            scales_nbytes,
-            stream,
-        )?;
-    }
-    let scales_gpu = unsafe { GpuTensor::new(scales_ptr, &[num_groups, size_n], scales_dtype) };
-
-    // Concat zero points: each part's qzeros [num_groups, N_i/8] → convert to marlin format,
-    // then row-interleave into the fused layout.
-    // awq_to_marlin_zero_points returns Vec<u32> with shape [num_groups, N_i/8].
-    let mut all_marlin_zp: Vec<Vec<u32>> = Vec::new();
-    for (i, (qz_data, _qz_shape, _qz_dt)) in qz_parts.iter().enumerate() {
-        let qzeros_u32: Vec<u32> = qz_data
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let part_zp = quant::awq_to_marlin_zero_points(&qzeros_u32, num_groups, part_n_sizes[i]);
-        all_marlin_zp.push(part_zp);
-    }
-    // Row-interleave: for each group row, append N_i/8 columns from each part.
-    let total_n_div8 = size_n / 8;
-    let mut fused_zp = vec![0u32; num_groups * total_n_div8];
-    let mut col_offsets: Vec<usize> = Vec::new();
-    let mut cumulative = 0usize;
-    for &pn in &part_n_sizes {
-        col_offsets.push(cumulative);
-        cumulative += pn / 8;
-    }
-    for (i, &pn) in part_n_sizes.iter().enumerate() {
-        let part_cols = pn / 8;
-        for g in 0..num_groups {
-            let dst_start = g * total_n_div8 + col_offsets[i];
-            let src_start = g * part_cols;
-            fused_zp[dst_start..dst_start + part_cols]
-                .copy_from_slice(&all_marlin_zp[i][src_start..src_start + part_cols]);
-        }
-    }
-
-    let zp_bytes: Vec<u8> = fused_zp.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    let zp_nbytes = zp_bytes.len();
-    let zp_ptr = unsafe { driver::mem_alloc(zp_nbytes)? };
-    weights.record_alloc(zp_ptr, zp_nbytes);
-    unsafe { driver::memcpy_htod_async(zp_ptr, zp_bytes.as_ptr(), zp_nbytes, stream)? };
-    let zeros_gpu = unsafe { GpuTensor::new(zp_ptr, &[num_groups, total_n_div8], DType::U32) };
-
-    unsafe { driver::stream_synchronize(stream)? };
-
-    Ok(MarlinLinear {
-        qweight: qweight_marlin,
-        scales: scales_gpu,
-        zeros: Some(zeros_gpu),
-        g_idx: None,
-        g_idx_sort_indices: None,
-        workspace,
-        size_k,
-        size_n,
-        group_size,
-        num_groups,
-        has_zp: true,
-        has_act_order: false,
-        b_type_id: 1, // AWQ = uint4
-        device_id,
-        bias: fuse_bias_parts(&bias_parts, bias_dtype, weights, stream)?,
-    })
+    let prefix_refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+    MarlinLinear::load_awq_concat(weights, &prefix_refs, cfg.group_size, workspace, device_id)
 }
 
-/// Concatenate bias parts and upload to GPU. Returns `None` if no bias parts.
-fn fuse_bias_parts(
-    bias_parts: &[Vec<u8>],
-    bias_dtype: Option<DType>,
-    weights: &mut GpuWeights,
-    stream: CUstream,
-) -> Result<Option<GpuTensor>> {
-    if bias_parts.is_empty() {
-        return Ok(None);
-    }
-    let dtype = bias_dtype.unwrap();
-    // Simple byte concatenation — biases are 1D vectors, concat = append.
-    let total_bytes: usize = bias_parts.iter().map(|b| b.len()).sum();
-    let mut fused = Vec::with_capacity(total_bytes);
-    for part in bias_parts {
-        fused.extend_from_slice(part);
-    }
-    let num_elements = total_bytes / dtype.size_bytes();
-    let ptr = unsafe { driver::mem_alloc(total_bytes)? };
-    weights.record_alloc(ptr, total_bytes);
-    unsafe { driver::memcpy_htod_async(ptr, fused.as_ptr(), total_bytes, stream)? };
-    Ok(Some(unsafe { GpuTensor::new(ptr, &[num_elements], dtype) }))
-}
-
-/// Allocate the shared Marlin workspace buffer `[num_sms]` i32.
-///
-/// This is shared across all MarlinLinear layers — only one allocation needed.
-pub fn alloc_marlin_workspace(num_sm: i32, stream: CUstream) -> Result<GpuTensor> {
-    // Match Python: max(2 * num_sm, 1024 * 1024) elements
-    let num_elements = std::cmp::max(2 * num_sm as usize, 1024 * 1024);
-    let nbytes = num_elements * std::mem::size_of::<i32>();
-    let ptr = unsafe { driver::mem_alloc(nbytes)? };
-    // Zero it — Marlin uses it as barrier locks
-    unsafe { driver::memset_d8(ptr, 0, nbytes, stream)? };
-    Ok(unsafe { GpuTensor::new(ptr, &[num_elements], DType::I32) })
-}
+// `alloc_marlin_workspace` and `fuse_bias_parts` live in
+// `ferrite_kernels::layers_quant`; see the `pub use` / `use` at the
+// top of this module.
 
 // ---------------------------------------------------------------------------
 // BitsAndBytes 4-bit weight loading

@@ -572,16 +572,20 @@ pub trait Implementation: fmt::Debug + Send + Sync {
 
     /// Device-phase descriptor for megakernel `.cu` generation.
     ///
-    /// Returns `Some(DevicePhase)` for DeviceCallable impls that can
-    /// participate in a megakernel. `idx` is the 0-based phase index
-    /// within the megakernel; param names use the `p{idx}_` prefix.
+    /// Returns `Some((phase, preamble_stmts, param_values))` for
+    /// DeviceCallable impls that can participate in a megakernel.
+    ///
+    /// - `preamble_stmts`: `let` bindings emitted in the shared scope
+    ///   BEFORE param assignments (output idents, shared temporaries).
+    /// - `param_values`: expressions parallel to `DevicePhase::flat_params`
+    ///   that evaluate to each param's value.
     ///
     /// Returns `None` for HostCallable impls (the default).
-    ///
-    /// Additionally returns the Rust-side `TokenStream` expressions
-    /// that populate each flat param at the call site, parallel to
-    /// `DevicePhase::flat_params`.
-    fn device_phase(&self, _idx: usize, _ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>)> {
+    fn device_phase(
+        &self,
+        _idx: usize,
+        _ctx: &EmitCtx,
+    ) -> Option<(DevicePhase, Vec<TokenStream>, Vec<TokenStream>)> {
         None
     }
 }
@@ -4004,7 +4008,11 @@ impl Implementation for DeviceCallableWrapper {
         self.inner.consumes_input_tiles(claimed_tiles, fuf)
     }
 
-    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>)> {
+    fn device_phase(
+        &self,
+        idx: usize,
+        ctx: &EmitCtx,
+    ) -> Option<(DevicePhase, Vec<TokenStream>, Vec<TokenStream>)> {
         dc_device_phase(self.inner.name(), idx, ctx)
     }
 }
@@ -4017,8 +4025,12 @@ fn dc_device_phase(
     inner_name: &str,
     idx: usize,
     ctx: &EmitCtx,
-) -> Option<(DevicePhase, Vec<TokenStream>)> {
+) -> Option<(DevicePhase, Vec<TokenStream>, Vec<TokenStream>)> {
     let p = format!("p{idx}");
+    // Compile-time constant: num_tokens for this workload bucket.
+    // Interpolated into quote!{} as a literal, NOT as `ctx.num_tokens`
+    // (ForwardCtx doesn't have num_tokens — it's a compile-time value).
+    let num_tokens_val = ctx.num_tokens.expect("dc_device_phase requires num_tokens") as i32;
     match inner_name {
         "rmsnorm_ref" => {
             let tile = ctx.primary();
@@ -4026,6 +4038,7 @@ fn dc_device_phase(
             let w = ctx.input_expr(tile, 1);
             let out = ctx.output_ident(tile, 0);
             let hidden_size = ctx.bound("hidden_size") as i32;
+            let hs = hidden_size;
             Some((
                 DevicePhase {
                     flat_params: vec![
@@ -4057,30 +4070,57 @@ fn dc_device_phase(
                     ],
                     preamble: vec![],
                 },
+                // Preamble: output ident binding
+                vec![quote! {
+                    let #out = device.caching.alloc_tensor(
+                        &[#num_tokens_val as usize, #hs as usize],
+                        ::ferrite_cuda_core::DType::BF16,
+                    );
+                }],
+                // Param values parallel to flat_params
                 vec![
-                    // Rust expressions parallel to flat_params:
-                    // out ptr (allocated), input ptr, weight ptr, eps, hidden_size, num_tokens
-                    {
-                        let hs = hidden_size;
-                        quote! {
-                            let #out = device.caching.alloc_tensor(
-                                &[ctx.num_tokens as usize, #hs as usize],
-                                ::ferrite_cuda_core::DType::BF16,
-                            );
-                            #out.raw_ptr() as *mut ::core::ffi::c_void
-                        }
-                    },
+                    quote! { #out.raw_ptr() as *mut ::core::ffi::c_void },
                     quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
                     quote! { (#w).weight.raw_ptr() as *const ::core::ffi::c_void },
                     quote! { (#w).eps },
                     quote! { #hidden_size },
-                    quote! { ctx.num_tokens as i32 },
+                    quote! { #num_tokens_val },
                 ],
             ))
         }
         "fused_add_rms_norm" => {
             // dc_fused_add_rms_norm<T>(input, residual, weight, eps, hidden_size, num_rows, smem)
             // In-place: residual += input; input = norm(residual) * w
+            let add_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| ctx.fuf.get(**t).op == OpKind::Add)
+                .expect("fused_add_rms_norm: claim contains Add");
+            let rmsnorm_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+                .expect("fused_add_rms_norm: claim contains RmsNorm");
+            let delta = ctx
+                .input_tile_ident(add_id, 0)
+                .expect("Add input 0 is a tile");
+            let residual = ctx
+                .input_tile_ident(add_id, 1)
+                .expect("Add input 1 is a tile");
+            let rmsnorm_node = ctx.fuf.get(rmsnorm_id);
+            let (wid, widx) = rmsnorm_node
+                .inputs
+                .iter()
+                .find_map(|i| match i {
+                    FufInput::Weight { id, index } => Some((*id, *index)),
+                    _ => None,
+                })
+                .expect("RmsNorm has weight");
+            let wname = weight_field_name(ctx.program, wid, widx);
+            let w = ctx.weight_accessor(&wname);
+            let hidden_size = ctx.bound("hidden_size") as i32;
+            let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
+            let add_out = ctx.output_ident(add_id, 0);
             Some((
                 DevicePhase {
                     flat_params: vec![
@@ -4112,66 +4152,74 @@ fn dc_device_phase(
                     ],
                     preamble: vec![],
                 },
-                {
-                    // FusedAddRmsNorm claims Add + RmsNorm. Find each tile.
-                    let add_id = *ctx
-                        .claimed_tiles
-                        .iter()
-                        .find(|t| ctx.fuf.get(**t).op == OpKind::Add)
-                        .expect("fused_add_rms_norm: claim contains Add");
-                    let rmsnorm_id = *ctx
-                        .claimed_tiles
-                        .iter()
-                        .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
-                        .expect("fused_add_rms_norm: claim contains RmsNorm");
-                    // Delta and residual are the Add's tile inputs.
-                    let delta = ctx
-                        .input_tile_ident(add_id, 0)
-                        .expect("Add input 0 is a tile");
-                    let residual = ctx
-                        .input_tile_ident(add_id, 1)
-                        .expect("Add input 1 is a tile");
-                    // Weight from the RmsNorm tile.
-                    let rmsnorm_node = ctx.fuf.get(rmsnorm_id);
-                    let (wid, widx) = rmsnorm_node
-                        .inputs
-                        .iter()
-                        .find_map(|i| match i {
-                            FufInput::Weight { id, index } => Some((*id, *index)),
-                            _ => None,
-                        })
-                        .expect("RmsNorm has weight");
-                    let wname = weight_field_name(ctx.program, wid, widx);
-                    let w = ctx.weight_accessor(&wname);
-                    let hidden_size = ctx.bound("hidden_size") as i32;
-                    // Output aliases — in-place mutation.
-                    let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
-                    let add_out = ctx.output_ident(add_id, 0);
-                    vec![
-                        // delta (input/output — mutated in place to normed output)
-                        quote! {
-                            let #rmsnorm_out = unsafe { (*#delta).as_view() };
-                            (*#delta).raw_ptr() as *mut ::core::ffi::c_void
-                        },
-                        // residual (mutated in place: residual += delta)
-                        quote! {
-                            let #add_out = unsafe { (*#residual).as_view() };
-                            (*#residual).raw_ptr() as *mut ::core::ffi::c_void
-                        },
-                        // weight
-                        quote! { (#w).weight.raw_ptr() as *const ::core::ffi::c_void },
-                        // eps
-                        quote! { (#w).eps },
-                        // hidden_size
-                        quote! { #hidden_size },
-                        // num_tokens
-                        quote! { ctx.num_tokens as i32 },
-                    ]
-                },
+                // Preamble: output alias bindings (in-place mutation)
+                vec![
+                    quote! { let #rmsnorm_out = unsafe { (*#delta).as_view() }; },
+                    quote! { let #add_out = unsafe { (*#residual).as_view() }; },
+                ],
+                // Param values
+                vec![
+                    quote! { (*#delta).raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (*#residual).raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (#w).weight.raw_ptr() as *const ::core::ffi::c_void },
+                    quote! { (#w).eps },
+                    quote! { #hidden_size },
+                    quote! { #num_tokens_val },
+                ],
             ))
         }
         "fused_add_rms_norm_with_offset" => {
-            // dc_fused_add_rms_norm_with_offset<T>(input, residual, weight, eps, weight_offset, hidden_size, num_rows, smem)
+            let residual_add_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| {
+                    let n = ctx.fuf.get(**t);
+                    n.op == OpKind::Add
+                        && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
+                })
+                .expect("claim contains a residual-stream Add");
+            let scalar_add_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| {
+                    let n = ctx.fuf.get(**t);
+                    n.op == OpKind::Add
+                        && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+                })
+                .expect("claim contains a scalar-offset Add");
+            let rmsnorm_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+                .expect("claim contains a RmsNorm");
+            let delta = ctx
+                .input_tile_ident(residual_add_id, 0)
+                .expect("residual Add input 0 (delta)");
+            let residual = ctx
+                .input_tile_ident(residual_add_id, 1)
+                .expect("residual Add input 1 (residual)");
+            let scalar_add_node = ctx.fuf.get(scalar_add_id);
+            let offset: f32 = scalar_add_node
+                .inputs
+                .iter()
+                .find_map(|i| match i {
+                    FufInput::Scalar(v) => Some(*v as f32),
+                    _ => None,
+                })
+                .expect("scalar-offset Add has a Scalar input");
+            let (weight_id, weight_idx) = scalar_add_node
+                .inputs
+                .iter()
+                .find_map(|i| match i {
+                    FufInput::Weight { id, index } => Some((*id, *index)),
+                    _ => None,
+                })
+                .expect("scalar-offset Add has a Weight input");
+            let wname = weight_field_name(ctx.program, weight_id, weight_idx);
+            let w = ctx.weight_accessor(&wname);
+            let hidden_size = ctx.bound("hidden_size") as i32;
+            let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
+            let add_out = ctx.output_ident(residual_add_id, 0);
             Some((
                 DevicePhase {
                     flat_params: vec![
@@ -4206,89 +4254,55 @@ fn dc_device_phase(
                     ],
                     preamble: vec![],
                 },
-                {
-                    // Same tile decomposition as emit_call at line 2420.
-                    let residual_add_id = *ctx
-                        .claimed_tiles
-                        .iter()
-                        .find(|t| {
-                            let n = ctx.fuf.get(**t);
-                            n.op == OpKind::Add
-                                && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
-                        })
-                        .expect("claim contains a residual-stream Add");
-                    let scalar_add_id = *ctx
-                        .claimed_tiles
-                        .iter()
-                        .find(|t| {
-                            let n = ctx.fuf.get(**t);
-                            n.op == OpKind::Add
-                                && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
-                        })
-                        .expect("claim contains a scalar-offset Add");
-                    let rmsnorm_id = *ctx
-                        .claimed_tiles
-                        .iter()
-                        .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
-                        .expect("claim contains a RmsNorm");
-
-                    let delta = ctx
-                        .input_tile_ident(residual_add_id, 0)
-                        .expect("residual Add input 0 (delta)");
-                    let residual = ctx
-                        .input_tile_ident(residual_add_id, 1)
-                        .expect("residual Add input 1 (residual)");
-
-                    let scalar_add_node = ctx.fuf.get(scalar_add_id);
-                    let offset: f32 = scalar_add_node
-                        .inputs
-                        .iter()
-                        .find_map(|i| match i {
-                            FufInput::Scalar(v) => Some(*v as f32),
-                            _ => None,
-                        })
-                        .expect("scalar-offset Add has a Scalar input");
-                    let (weight_id, weight_idx) = scalar_add_node
-                        .inputs
-                        .iter()
-                        .find_map(|i| match i {
-                            FufInput::Weight { id, index } => Some((*id, *index)),
-                            _ => None,
-                        })
-                        .expect("scalar-offset Add has a Weight input");
-                    let wname = weight_field_name(ctx.program, weight_id, weight_idx);
-                    let w = ctx.weight_accessor(&wname);
-                    let hidden_size = ctx.bound("hidden_size") as i32;
-
-                    let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
-                    let add_out = ctx.output_ident(residual_add_id, 0);
-                    vec![
-                        // delta (input — mutated in place to normed output)
-                        quote! {
-                            let #rmsnorm_out = unsafe { (*#delta).as_view() };
-                            (*#delta).raw_ptr() as *mut ::core::ffi::c_void
-                        },
-                        // residual (mutated in place: residual += delta)
-                        quote! {
-                            let #add_out = unsafe { (*#residual).as_view() };
-                            (*#residual).raw_ptr() as *mut ::core::ffi::c_void
-                        },
-                        // weight
-                        quote! { (#w).weight.raw_ptr() as *const ::core::ffi::c_void },
-                        // eps
-                        quote! { (#w).eps },
-                        // weight_offset
-                        quote! { #offset },
-                        // hidden_size
-                        quote! { #hidden_size },
-                        // num_tokens
-                        quote! { ctx.num_tokens as i32 },
-                    ]
-                },
+                vec![
+                    quote! { let #rmsnorm_out = unsafe { (*#delta).as_view() }; },
+                    quote! { let #add_out = unsafe { (*#residual).as_view() }; },
+                ],
+                vec![
+                    quote! { (*#delta).raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (*#residual).raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (#w).weight.raw_ptr() as *const ::core::ffi::c_void },
+                    quote! { (#w).eps },
+                    quote! { #offset },
+                    quote! { #hidden_size },
+                    quote! { #num_tokens_val },
+                ],
             ))
         }
         "scalar_offset_rms_norm" => {
-            // dc_rms_norm_with_offset<T>(out, input, weight, eps, weight_offset, hidden_size, num_rows, smem)
+            let add_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| ctx.fuf.get(**t).op == OpKind::Add)
+                .expect("claim contains an Add");
+            let rmsnorm_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+                .expect("claim contains a RmsNorm");
+            let add_node = ctx.fuf.get(add_id);
+            let offset: f32 = add_node
+                .inputs
+                .iter()
+                .find_map(|i| match i {
+                    FufInput::Scalar(v) => Some(*v as f32),
+                    _ => None,
+                })
+                .expect("scalar-offset Add has a Scalar input");
+            let x = ctx.input_expr(rmsnorm_id, 0);
+            let (weight_id, weight_idx) = add_node
+                .inputs
+                .iter()
+                .find_map(|i| match i {
+                    FufInput::Weight { id, index } => Some((*id, *index)),
+                    _ => None,
+                })
+                .expect("scalar-offset Add has a Weight input");
+            let wname = weight_field_name(ctx.program, weight_id, weight_idx);
+            let w = ctx.weight_accessor(&wname);
+            let hidden_size = ctx.bound("hidden_size") as i32;
+            let hs = hidden_size;
+            let out = ctx.output_ident(rmsnorm_id, 0);
             Some((
                 DevicePhase {
                     flat_params: vec![
@@ -4323,72 +4337,44 @@ fn dc_device_phase(
                     ],
                     preamble: vec![],
                 },
-                {
-                    let add_id = *ctx
-                        .claimed_tiles
-                        .iter()
-                        .find(|t| ctx.fuf.get(**t).op == OpKind::Add)
-                        .expect("claim contains an Add");
-                    let rmsnorm_id = *ctx
-                        .claimed_tiles
-                        .iter()
-                        .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
-                        .expect("claim contains a RmsNorm");
-
-                    let add_node = ctx.fuf.get(add_id);
-                    let offset: f32 = add_node
-                        .inputs
-                        .iter()
-                        .find_map(|i| match i {
-                            FufInput::Scalar(v) => Some(*v as f32),
-                            _ => None,
-                        })
-                        .expect("scalar-offset Add has a Scalar input");
-
-                    let x = ctx.input_expr(rmsnorm_id, 0);
-                    let (weight_id, weight_idx) = add_node
-                        .inputs
-                        .iter()
-                        .find_map(|i| match i {
-                            FufInput::Weight { id, index } => Some((*id, *index)),
-                            _ => None,
-                        })
-                        .expect("scalar-offset Add has a Weight input");
-                    let wname = weight_field_name(ctx.program, weight_id, weight_idx);
-                    let w = ctx.weight_accessor(&wname);
-                    let hidden_size = ctx.bound("hidden_size") as i32;
-                    let out = ctx.output_ident(rmsnorm_id, 0);
-                    vec![
-                        // out — allocate output tensor
-                        {
-                            let hs = hidden_size;
-                            quote! {
-                                let #out = device.caching.alloc_tensor(
-                                    &[ctx.num_tokens as usize, #hs as usize],
-                                    ::ferrite_cuda_core::DType::BF16,
-                                );
-                                #out.raw_ptr() as *mut ::core::ffi::c_void
-                            }
-                        },
-                        // input
-                        quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
-                        // weight
-                        quote! { (#w).weight.raw_ptr() as *const ::core::ffi::c_void },
-                        // eps
-                        quote! { (#w).eps },
-                        // weight_offset
-                        quote! { #offset },
-                        // hidden_size
-                        quote! { #hidden_size },
-                        // num_tokens
-                        quote! { ctx.num_tokens as i32 },
-                    ]
-                },
+                vec![quote! {
+                    let #out = device.caching.alloc_tensor(
+                        &[#num_tokens_val as usize, #hs as usize],
+                        ::ferrite_cuda_core::DType::BF16,
+                    );
+                }],
+                vec![
+                    quote! { #out.raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
+                    quote! { (#w).weight.raw_ptr() as *const ::core::ffi::c_void },
+                    quote! { (#w).eps },
+                    quote! { #offset },
+                    quote! { #hidden_size },
+                    quote! { #num_tokens_val },
+                ],
             ))
         }
         "scalar_mul_inplace" => {
-            // dc_scalar_mul_inplace<T>(x, scalar, n, num_rows)
-            // In-place: x *= scalar
+            let tile = ctx.primary();
+            let out = ctx.output_ident(tile, 0);
+            let node = ctx.fuf.get(tile);
+            let upstream_slot = node
+                .inputs
+                .iter()
+                .position(|i| matches!(i, FufInput::Tile { .. }))
+                .expect("ScalarMul has a Tile input");
+            let upstream = ctx
+                .input_tile_ident(tile, upstream_slot)
+                .expect("ScalarMul Tile input ident");
+            let scale: f32 = node
+                .inputs
+                .iter()
+                .find_map(|i| match i {
+                    FufInput::Scalar(v) => Some(*v as f32),
+                    _ => None,
+                })
+                .expect("ScalarMul has a Scalar input");
+            let hidden_size = ctx.bound("hidden_size") as i32;
             Some((
                 DevicePhase {
                     flat_params: vec![
@@ -4414,46 +4400,29 @@ fn dc_device_phase(
                     ],
                     preamble: vec![],
                 },
-                {
-                    let tile = ctx.primary();
-                    let out = ctx.output_ident(tile, 0);
-                    let node = ctx.fuf.get(tile);
-                    let upstream_slot = node
-                        .inputs
-                        .iter()
-                        .position(|i| matches!(i, FufInput::Tile { .. }))
-                        .expect("ScalarMul has a Tile input");
-                    let upstream = ctx
-                        .input_tile_ident(tile, upstream_slot)
-                        .expect("ScalarMul Tile input ident");
-                    let scale: f32 = node
-                        .inputs
-                        .iter()
-                        .find_map(|i| match i {
-                            FufInput::Scalar(v) => Some(*v as f32),
-                            _ => None,
-                        })
-                        .expect("ScalarMul has a Scalar input");
-                    let hidden_size = ctx.bound("hidden_size") as i32;
-                    vec![
-                        // x — in-place mutation, alias output to upstream
-                        quote! {
-                            let #out = unsafe { #upstream };
-                            (*#out).raw_ptr() as *mut ::core::ffi::c_void
-                        },
-                        // scalar
-                        quote! { #scale },
-                        // n (hidden_size per row)
-                        quote! { #hidden_size },
-                        // num_rows
-                        quote! { ctx.num_tokens as i32 },
-                    ]
-                },
+                vec![quote! { let #out = unsafe { #upstream }; }],
+                vec![
+                    quote! { (*#out).raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { #scale },
+                    quote! { #hidden_size },
+                    quote! { #num_tokens_val },
+                ],
             ))
         }
         "tanh_softcap_inplace" => {
-            // dc_tanh_softcap_inplace<T>(x, inv_cap, cap, n)
-            // In-place: x[i] = cap * tanh(x[i] / cap)
+            let tile = ctx.primary();
+            let out = ctx.output_ident(tile, 0);
+            let upstream = ctx
+                .input_tile_ident(tile, 0)
+                .expect("tanh_softcap input is a tile");
+            let cap: f32 = ctx
+                .scalar("final_logit_softcapping")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tanh_softcap tile emitted but no final_logit_softcapping in config"
+                    )
+                }) as f32;
+            let inv_cap: f32 = 1.0 / cap;
             Some((
                 DevicePhase {
                     flat_params: vec![
@@ -4479,36 +4448,13 @@ fn dc_device_phase(
                     ],
                     preamble: vec![],
                 },
-                {
-                    let tile = ctx.primary();
-                    let out = ctx.output_ident(tile, 0);
-                    let upstream = ctx
-                        .input_tile_ident(tile, 0)
-                        .expect("tanh_softcap input is a tile");
-                    let cap: f32 = ctx
-                        .scalar("final_logit_softcapping")
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "tanh_softcap tile emitted but no final_logit_softcapping in config"
-                            )
-                        }) as f32;
-                    let inv_cap: f32 = 1.0 / cap;
-                    // Total elements — vocab_size per row × num_tokens rows.
-                    // Use the output dim from the upstream tile shape.
-                    vec![
-                        // x — in-place mutation
-                        quote! {
-                            let #out = unsafe { #upstream };
-                            (*#out).raw_ptr() as *mut ::core::ffi::c_void
-                        },
-                        // inv_cap
-                        quote! { #inv_cap },
-                        // cap
-                        quote! { #cap },
-                        // n (total elements)
-                        quote! { ((*#out).numel()) as i32 },
-                    ]
-                },
+                vec![quote! { let #out = unsafe { #upstream }; }],
+                vec![
+                    quote! { (*#out).raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { #inv_cap },
+                    quote! { #cap },
+                    quote! { ((*#out).numel()) as i32 },
+                ],
             ))
         }
         name if name.starts_with("cutlass_") && !name.contains("gemv") => {
@@ -4589,399 +4535,381 @@ fn dc_device_phase(
                 },
                 {
                     let tile = ctx.primary();
-                    let x = ctx.input_expr(tile, 0);
                     let w = ctx.input_expr(tile, 1);
                     let out = ctx.output_ident(tile, 0);
                     vec![
-                        // C (output) — alloc [M, N]
-                        {
-                            quote! {
-                                let __w_dense = (#w).dense_weight();
-                                let __n = __w_dense.dims()[0] as usize;
-                                let __k = __w_dense.dims()[1] as usize;
-                                let #out = device.caching.alloc_tensor(
-                                    &[ctx.num_tokens as usize, __n],
-                                    ::ferrite_cuda_core::DType::BF16,
-                                );
-                                #out.raw_ptr() as *mut ::core::ffi::c_void
-                            }
+                        quote! { let __w_dense = (#w).dense_weight(); },
+                        quote! { let __n = __w_dense.shape()[0] as usize; },
+                        quote! { let __k = __w_dense.shape()[1] as usize; },
+                        quote! {
+                            let #out = device.caching.alloc_tensor(
+                                &[#num_tokens_val as usize, __n],
+                                ::ferrite_cuda_core::DType::BF16,
+                            );
                         },
-                        // A (activation input)
+                    ]
+                },
+                {
+                    let tile = ctx.primary();
+                    let x = ctx.input_expr(tile, 0);
+                    let out = ctx.output_ident(tile, 0);
+                    vec![
+                        quote! { #out.raw_ptr() as *mut ::core::ffi::c_void },
                         quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
-                        // B (weight)
                         quote! { __w_dense.raw_ptr() as *const ::core::ffi::c_void },
-                        // M
-                        quote! { ctx.num_tokens as i32 },
-                        // N
+                        quote! { #num_tokens_val },
                         quote! { __n as i32 },
-                        // K
                         quote! { __k as i32 },
-                        // alpha
                         quote! { 1.0f32 },
-                        // beta
                         quote! { 0.0f32 },
                     ]
                 },
             ))
         }
-        "cutlass_gemv" => Some((
-            DevicePhase {
-                flat_params: vec![
-                    ("void*".into(), format!("{p}_out")),
-                    ("const void*".into(), format!("{p}_x")),
-                    ("const void*".into(), format!("{p}_W")),
-                    ("int".into(), format!("{p}_N")),
-                    ("int".into(), format!("{p}_K")),
-                    ("float".into(), format!("{p}_alpha")),
-                    ("float".into(), format!("{p}_beta")),
-                ],
-                kernel_body: vec![format!(
-                    "dc_gemv({p}_out, {p}_x, {p}_W, {p}_N, {p}_K, {p}_alpha, {p}_beta, {p}_N);"
-                )],
-                params_build: vec![
-                    format!("params.{p}_out = (__nv_bfloat16*){p}_out;"),
-                    format!("params.{p}_x = (const __nv_bfloat16*){p}_x;"),
-                    format!("params.{p}_W = (const __nv_bfloat16*){p}_W;"),
-                    format!("params.{p}_N = {p}_N;"),
-                    format!("params.{p}_K = {p}_K;"),
-                    format!("params.{p}_alpha = {p}_alpha;"),
-                    format!("params.{p}_beta = {p}_beta;"),
-                ],
-                internal_fields: vec![
-                    format!("__nv_bfloat16* {p}_out"),
-                    format!("const __nv_bfloat16* {p}_x"),
-                    format!("const __nv_bfloat16* {p}_W"),
-                    format!("int {p}_N"),
-                    format!("int {p}_K"),
-                    format!("float {p}_alpha"),
-                    format!("float {p}_beta"),
-                ],
-                preamble: vec![],
-            },
-            {
-                let tile = ctx.primary();
-                let x = ctx.input_expr(tile, 0);
-                let w = ctx.input_expr(tile, 1);
-                let out = ctx.output_ident(tile, 0);
+        "cutlass_gemv" => {
+            let tile = ctx.primary();
+            let x = ctx.input_expr(tile, 0);
+            let w = ctx.input_expr(tile, 1);
+            let out = ctx.output_ident(tile, 0);
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_out")),
+                        ("const void*".into(), format!("{p}_x")),
+                        ("const void*".into(), format!("{p}_W")),
+                        ("int".into(), format!("{p}_N")),
+                        ("int".into(), format!("{p}_K")),
+                        ("float".into(), format!("{p}_alpha")),
+                        ("float".into(), format!("{p}_beta")),
+                    ],
+                    kernel_body: vec![format!(
+                        "dc_gemv({p}_out, {p}_x, {p}_W, {p}_N, {p}_K, {p}_alpha, {p}_beta, {p}_N);"
+                    )],
+                    params_build: vec![
+                        format!("params.{p}_out = (__nv_bfloat16*){p}_out;"),
+                        format!("params.{p}_x = (const __nv_bfloat16*){p}_x;"),
+                        format!("params.{p}_W = (const __nv_bfloat16*){p}_W;"),
+                        format!("params.{p}_N = {p}_N;"),
+                        format!("params.{p}_K = {p}_K;"),
+                        format!("params.{p}_alpha = {p}_alpha;"),
+                        format!("params.{p}_beta = {p}_beta;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_out"),
+                        format!("const __nv_bfloat16* {p}_x"),
+                        format!("const __nv_bfloat16* {p}_W"),
+                        format!("int {p}_N"),
+                        format!("int {p}_K"),
+                        format!("float {p}_alpha"),
+                        format!("float {p}_beta"),
+                    ],
+                    preamble: vec![],
+                },
                 vec![
-                    // out — alloc [1, N]
-                    {
-                        quote! {
-                            let __w_dense = (#w).dense_weight();
-                            let __n = __w_dense.dims()[0] as usize;
-                            let __k = __w_dense.dims()[1] as usize;
-                            let #out = device.caching.alloc_tensor(
-                                &[1, __n],
-                                ::ferrite_cuda_core::DType::BF16,
-                            );
-                            #out.raw_ptr() as *mut ::core::ffi::c_void
-                        }
+                    quote! { let __w_dense = (#w).dense_weight(); },
+                    quote! { let __n = __w_dense.shape()[0] as usize; },
+                    quote! { let __k = __w_dense.shape()[1] as usize; },
+                    quote! {
+                        let #out = device.caching.alloc_tensor(
+                            &[1, __n],
+                            ::ferrite_cuda_core::DType::BF16,
+                        );
                     },
-                    // x (activation)
+                ],
+                vec![
+                    quote! { #out.raw_ptr() as *mut ::core::ffi::c_void },
                     quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
-                    // W (weight)
                     quote! { __w_dense.raw_ptr() as *const ::core::ffi::c_void },
-                    // N
                     quote! { __n as i32 },
-                    // K
                     quote! { __k as i32 },
                     quote! { 1.0f32 },
                     quote! { 0.0f32 },
-                ]
-            },
-        )),
-        "fused_qkv_rope_cache" => Some((
-            DevicePhase {
-                flat_params: vec![
-                    ("void*".into(), format!("{p}_q_out")),
-                    ("void*".into(), format!("{p}_key_cache")),
-                    ("void*".into(), format!("{p}_value_cache")),
-                    ("const void*".into(), format!("{p}_qkv")),
-                    ("const void*".into(), format!("{p}_positions")),
-                    ("const void*".into(), format!("{p}_cos_sin_cache")),
-                    ("const void*".into(), format!("{p}_slot_mapping")),
-                    ("int".into(), format!("{p}_q_size")),
-                    ("int".into(), format!("{p}_kv_size")),
-                    ("int".into(), format!("{p}_head_dim")),
-                    ("int".into(), format!("{p}_num_tokens")),
                 ],
-                kernel_body: vec![
-                    format!("dc_fused_qkv_rope_cache({p}_q_out, {p}_key_cache, {p}_value_cache,"),
-                    format!("    {p}_qkv, {p}_positions, {p}_cos_sin_cache, {p}_slot_mapping,"),
-                    format!("    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"),
-                ],
-                params_build: vec![
-                    format!("params.{p}_q_out = (__nv_bfloat16*){p}_q_out;"),
-                    format!("params.{p}_key_cache = (__nv_bfloat16*){p}_key_cache;"),
-                    format!("params.{p}_value_cache = (__nv_bfloat16*){p}_value_cache;"),
-                    format!("params.{p}_qkv = (const __nv_bfloat16*){p}_qkv;"),
-                    format!("params.{p}_positions = (const uint32_t*){p}_positions;"),
-                    format!("params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"),
-                    format!("params.{p}_slot_mapping = (const int64_t*){p}_slot_mapping;"),
-                    format!("params.{p}_q_size = {p}_q_size;"),
-                    format!("params.{p}_kv_size = {p}_kv_size;"),
-                    format!("params.{p}_head_dim = {p}_head_dim;"),
-                    format!("params.{p}_num_tokens = {p}_num_tokens;"),
-                ],
-                internal_fields: vec![
-                    format!("__nv_bfloat16* {p}_q_out"),
-                    format!("__nv_bfloat16* {p}_key_cache"),
-                    format!("__nv_bfloat16* {p}_value_cache"),
-                    format!("const __nv_bfloat16* {p}_qkv"),
-                    format!("const uint32_t* {p}_positions"),
-                    format!("const __nv_bfloat16* {p}_cos_sin_cache"),
-                    format!("const int64_t* {p}_slot_mapping"),
-                    format!("int {p}_q_size"),
-                    format!("int {p}_kv_size"),
-                    format!("int {p}_head_dim"),
-                    format!("int {p}_num_tokens"),
-                ],
-                preamble: vec![],
-            },
-            {
-                let rope_id = *ctx
-                    .claimed_tiles
-                    .iter()
-                    .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
-                    .expect("claim contains a RopeAppend");
-                let rope_node = ctx.fuf.get(rope_id);
-
-                // The three Gemms feed rope slots 0..3.
-                let qkv_ids: Vec<TileId> = rope_node
-                    .inputs
-                    .iter()
-                    .take(3)
-                    .filter_map(|i| match i {
-                        FufInput::Tile { id, .. } => Some(*id),
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
-                let gate_gemm_id = qkv_ids[0];
-                let activation = ctx.input_expr(gate_gemm_id, 0);
-
-                // Fused weight accessor.
-                let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
-                    .iter()
-                    .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
-                    .collect();
-                let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-                let weight_expr = ctx.weight_accessor(&fused_name);
-
-                let num_q_heads = ctx.bound("num_attention_heads") as usize;
-                let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-                let head_dim = ctx.bound("head_dim") as usize;
-                let q_size = (num_q_heads * head_dim) as i32;
-                let kv_size = (num_kv_heads * head_dim) as i32;
-                let head_dim_i32 = head_dim as i32;
-
-                let layer = rope_kv_cache_layer(rope_node)
-                    .expect("RopeAppend has KvCache layer index") as usize;
-
-                let q_out = ctx.output_ident(rope_id, 0);
-                let k_out = ctx.output_ident(rope_id, 1);
-                let v_out = ctx.output_ident(rope_id, 2);
+            ))
+        }
+        "fused_qkv_rope_cache" => {
+            let rope_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+                .expect("claim contains a RopeAppend");
+            let rope_node = ctx.fuf.get(rope_id);
+            let qkv_ids: Vec<TileId> = rope_node
+                .inputs
+                .iter()
+                .take(3)
+                .filter_map(|i| match i {
+                    FufInput::Tile { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
+            let activation = ctx.input_expr(qkv_ids[0], 0);
+            let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
+                .iter()
+                .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+                .collect();
+            let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
+            let weight_expr = ctx.weight_accessor(&fused_name);
+            let num_q_heads = ctx.bound("num_attention_heads") as usize;
+            let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+            let head_dim = ctx.bound("head_dim") as usize;
+            let q_size = (num_q_heads * head_dim) as i32;
+            let kv_size = (num_kv_heads * head_dim) as i32;
+            let head_dim_i32 = head_dim as i32;
+            let layer = rope_kv_cache_layer(rope_node)
+                .expect("RopeAppend has KvCache layer index") as usize;
+            let q_out = ctx.output_ident(rope_id, 0);
+            let k_out = ctx.output_ident(rope_id, 1);
+            let v_out = ctx.output_ident(rope_id, 2);
+            let qs = q_size as usize;
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_q_out")),
+                        ("void*".into(), format!("{p}_key_cache")),
+                        ("void*".into(), format!("{p}_value_cache")),
+                        ("const void*".into(), format!("{p}_qkv")),
+                        ("const void*".into(), format!("{p}_positions")),
+                        ("const void*".into(), format!("{p}_cos_sin_cache")),
+                        ("const void*".into(), format!("{p}_slot_mapping")),
+                        ("int".into(), format!("{p}_q_size")),
+                        ("int".into(), format!("{p}_kv_size")),
+                        ("int".into(), format!("{p}_head_dim")),
+                        ("int".into(), format!("{p}_num_tokens")),
+                    ],
+                    kernel_body: vec![
+                        format!("dc_fused_qkv_rope_cache({p}_q_out, {p}_key_cache, {p}_value_cache,"),
+                        format!("    {p}_qkv, {p}_positions, {p}_cos_sin_cache, {p}_slot_mapping,"),
+                        format!("    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"),
+                    ],
+                    params_build: vec![
+                        format!("params.{p}_q_out = (__nv_bfloat16*){p}_q_out;"),
+                        format!("params.{p}_key_cache = (__nv_bfloat16*){p}_key_cache;"),
+                        format!("params.{p}_value_cache = (__nv_bfloat16*){p}_value_cache;"),
+                        format!("params.{p}_qkv = (const __nv_bfloat16*){p}_qkv;"),
+                        format!("params.{p}_positions = (const uint32_t*){p}_positions;"),
+                        format!("params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"),
+                        format!("params.{p}_slot_mapping = (const int64_t*){p}_slot_mapping;"),
+                        format!("params.{p}_q_size = {p}_q_size;"),
+                        format!("params.{p}_kv_size = {p}_kv_size;"),
+                        format!("params.{p}_head_dim = {p}_head_dim;"),
+                        format!("params.{p}_num_tokens = {p}_num_tokens;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_q_out"),
+                        format!("__nv_bfloat16* {p}_key_cache"),
+                        format!("__nv_bfloat16* {p}_value_cache"),
+                        format!("const __nv_bfloat16* {p}_qkv"),
+                        format!("const uint32_t* {p}_positions"),
+                        format!("const __nv_bfloat16* {p}_cos_sin_cache"),
+                        format!("const int64_t* {p}_slot_mapping"),
+                        format!("int {p}_q_size"),
+                        format!("int {p}_kv_size"),
+                        format!("int {p}_head_dim"),
+                        format!("int {p}_num_tokens"),
+                    ],
+                    preamble: vec![],
+                },
+                // Preamble: allocate output, bind kv cache, run fused GEMM
                 vec![
-                    // q_out — allocate [num_tokens, q_size]
-                    {
-                        let qs = q_size as usize;
-                        quote! {
-                            let __qkv_packed = unsafe {
-                                (#weight_expr).forward(
-                                    #activation,
-                                    &mut device.cublas,
-                                    &mut device.caching,
-                                    device.compute_stream,
-                                )
-                            };
-                            let #q_out = device.caching.alloc_tensor(
-                                &[ctx.num_tokens as usize, #qs],
-                                ::ferrite_cuda_core::DType::BF16,
-                            );
-                            #q_out.raw_ptr() as *mut ::core::ffi::c_void
-                        }
-                    },
-                    // key_cache
                     quote! {
-                        let #k_out = ctx.kv_cache.k_cache(#layer);
-                        (*ctx.kv_cache.k_cache(#layer)).raw_ptr() as *mut ::core::ffi::c_void
+                        let #q_out = device.caching.alloc_tensor(
+                            &[#num_tokens_val as usize, #qs],
+                            ::ferrite_cuda_core::DType::BF16,
+                        );
                     },
-                    // value_cache
+                    quote! { let #k_out = ctx.kv_cache.k_cache(#layer); },
+                    quote! { let #v_out = ctx.kv_cache.v_cache(#layer); },
                     quote! {
-                        let #v_out = ctx.kv_cache.v_cache(#layer);
-                        (*ctx.kv_cache.v_cache(#layer)).raw_ptr() as *mut ::core::ffi::c_void
+                        let __qkv_tmp = unsafe {
+                            (#weight_expr).forward(
+                                #activation,
+                                &mut device.cublas,
+                                &mut device.caching,
+                                device.compute_stream,
+                            )
+                        };
                     },
-                    // qkv (packed output of the fused GEMM)
-                    quote! { (*__qkv_packed).raw_ptr() as *const ::core::ffi::c_void },
-                    // positions
+                ],
+                // Param values
+                vec![
+                    quote! { #q_out.raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (*ctx.kv_cache.k_cache(#layer)).raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (*ctx.kv_cache.v_cache(#layer)).raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (*__qkv_tmp).raw_ptr() as *const ::core::ffi::c_void },
                     quote! { (*ctx.positions).raw_ptr() as *const ::core::ffi::c_void },
-                    // cos_sin_cache
                     quote! { ctx.rotary.cos_sin_cache.raw_ptr() as *const ::core::ffi::c_void },
-                    // slot_mapping
                     quote! { (*ctx.slot_mapping).raw_ptr() as *const ::core::ffi::c_void },
-                    // q_size
                     quote! { #q_size },
-                    // kv_size
                     quote! { #kv_size },
-                    // head_dim
                     quote! { #head_dim_i32 },
-                    // num_tokens
-                    quote! { ctx.num_tokens as i32 },
-                ]
-            },
-        )),
-        "fused_qkv_rope_prefill" => Some((
-            DevicePhase {
-                flat_params: vec![
-                    ("void*".into(), format!("{p}_q_out")),
-                    ("void*".into(), format!("{p}_k_out")),
-                    ("void*".into(), format!("{p}_v_out")),
-                    ("const void*".into(), format!("{p}_qkv")),
-                    ("const void*".into(), format!("{p}_positions")),
-                    ("const void*".into(), format!("{p}_cos_sin_cache")),
-                    ("int".into(), format!("{p}_q_size")),
-                    ("int".into(), format!("{p}_kv_size")),
-                    ("int".into(), format!("{p}_head_dim")),
-                    ("int".into(), format!("{p}_num_tokens")),
+                    quote! { #num_tokens_val },
                 ],
-                kernel_body: vec![
-                    format!("dc_fused_qkv_rope_prefill({p}_q_out, {p}_k_out, {p}_v_out,"),
-                    format!("    {p}_qkv, {p}_positions, {p}_cos_sin_cache,"),
-                    format!("    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"),
-                ],
-                params_build: vec![
-                    format!("params.{p}_q_out = (__nv_bfloat16*){p}_q_out;"),
-                    format!("params.{p}_k_out = (__nv_bfloat16*){p}_k_out;"),
-                    format!("params.{p}_v_out = (__nv_bfloat16*){p}_v_out;"),
-                    format!("params.{p}_qkv = (const __nv_bfloat16*){p}_qkv;"),
-                    format!("params.{p}_positions = (const uint32_t*){p}_positions;"),
-                    format!("params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"),
-                    format!("params.{p}_q_size = {p}_q_size;"),
-                    format!("params.{p}_kv_size = {p}_kv_size;"),
-                    format!("params.{p}_head_dim = {p}_head_dim;"),
-                    format!("params.{p}_num_tokens = {p}_num_tokens;"),
-                ],
-                internal_fields: vec![
-                    format!("__nv_bfloat16* {p}_q_out"),
-                    format!("__nv_bfloat16* {p}_k_out"),
-                    format!("__nv_bfloat16* {p}_v_out"),
-                    format!("const __nv_bfloat16* {p}_qkv"),
-                    format!("const uint32_t* {p}_positions"),
-                    format!("const __nv_bfloat16* {p}_cos_sin_cache"),
-                    format!("int {p}_q_size"),
-                    format!("int {p}_kv_size"),
-                    format!("int {p}_head_dim"),
-                    format!("int {p}_num_tokens"),
-                ],
-                preamble: vec![],
-            },
-            {
-                let rope_id = *ctx
-                    .claimed_tiles
-                    .iter()
-                    .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
-                    .expect("claim contains a RopeAppend");
-                let rope_node = ctx.fuf.get(rope_id);
-
-                let qkv_ids: Vec<TileId> = rope_node
-                    .inputs
-                    .iter()
-                    .take(3)
-                    .filter_map(|i| match i {
-                        FufInput::Tile { id, .. } => Some(*id),
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
-                let activation = ctx.input_expr(qkv_ids[0], 0);
-
-                let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
-                    .iter()
-                    .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
-                    .collect();
-                let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-                let weight_expr = ctx.weight_accessor(&fused_name);
-
-                let num_q_heads = ctx.bound("num_attention_heads") as usize;
-                let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-                let head_dim = ctx.bound("head_dim") as usize;
-                let q_size = (num_q_heads * head_dim) as i32;
-                let kv_size = (num_kv_heads * head_dim) as i32;
-                let head_dim_i32 = head_dim as i32;
-
-                let q_out = ctx.output_ident(rope_id, 0);
-                let k_out = ctx.output_ident(rope_id, 1);
-                let v_out = ctx.output_ident(rope_id, 2);
+            ))
+        }
+        "fused_qkv_rope_prefill" => {
+            let rope_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+                .expect("claim contains a RopeAppend");
+            let rope_node = ctx.fuf.get(rope_id);
+            let qkv_ids: Vec<TileId> = rope_node
+                .inputs
+                .iter()
+                .take(3)
+                .filter_map(|i| match i {
+                    FufInput::Tile { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
+            let activation = ctx.input_expr(qkv_ids[0], 0);
+            let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
+                .iter()
+                .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+                .collect();
+            let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
+            let weight_expr = ctx.weight_accessor(&fused_name);
+            let num_q_heads = ctx.bound("num_attention_heads") as usize;
+            let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+            let head_dim = ctx.bound("head_dim") as usize;
+            let q_size = (num_q_heads * head_dim) as i32;
+            let kv_size = (num_kv_heads * head_dim) as i32;
+            let head_dim_i32 = head_dim as i32;
+            let qs = q_size as usize;
+            let kvs = kv_size as usize;
+            let q_out = ctx.output_ident(rope_id, 0);
+            let k_out = ctx.output_ident(rope_id, 1);
+            let v_out = ctx.output_ident(rope_id, 2);
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_q_out")),
+                        ("void*".into(), format!("{p}_k_out")),
+                        ("void*".into(), format!("{p}_v_out")),
+                        ("const void*".into(), format!("{p}_qkv")),
+                        ("const void*".into(), format!("{p}_positions")),
+                        ("const void*".into(), format!("{p}_cos_sin_cache")),
+                        ("int".into(), format!("{p}_q_size")),
+                        ("int".into(), format!("{p}_kv_size")),
+                        ("int".into(), format!("{p}_head_dim")),
+                        ("int".into(), format!("{p}_num_tokens")),
+                    ],
+                    kernel_body: vec![
+                        format!("dc_fused_qkv_rope_prefill({p}_q_out, {p}_k_out, {p}_v_out,"),
+                        format!("    {p}_qkv, {p}_positions, {p}_cos_sin_cache,"),
+                        format!("    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"),
+                    ],
+                    params_build: vec![
+                        format!("params.{p}_q_out = (__nv_bfloat16*){p}_q_out;"),
+                        format!("params.{p}_k_out = (__nv_bfloat16*){p}_k_out;"),
+                        format!("params.{p}_v_out = (__nv_bfloat16*){p}_v_out;"),
+                        format!("params.{p}_qkv = (const __nv_bfloat16*){p}_qkv;"),
+                        format!("params.{p}_positions = (const uint32_t*){p}_positions;"),
+                        format!("params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"),
+                        format!("params.{p}_q_size = {p}_q_size;"),
+                        format!("params.{p}_kv_size = {p}_kv_size;"),
+                        format!("params.{p}_head_dim = {p}_head_dim;"),
+                        format!("params.{p}_num_tokens = {p}_num_tokens;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_q_out"),
+                        format!("__nv_bfloat16* {p}_k_out"),
+                        format!("__nv_bfloat16* {p}_v_out"),
+                        format!("const __nv_bfloat16* {p}_qkv"),
+                        format!("const uint32_t* {p}_positions"),
+                        format!("const __nv_bfloat16* {p}_cos_sin_cache"),
+                        format!("int {p}_q_size"),
+                        format!("int {p}_kv_size"),
+                        format!("int {p}_head_dim"),
+                        format!("int {p}_num_tokens"),
+                    ],
+                    preamble: vec![],
+                },
                 vec![
-                    // q_out — allocate via fused GEMM + rope split
-                    {
-                        let qs = q_size as usize;
-                        quote! {
-                            let __qkv_packed = unsafe {
-                                (#weight_expr).forward(
-                                    #activation,
-                                    &mut device.cublas,
-                                    &mut device.caching,
-                                    device.compute_stream,
-                                )
-                            };
-                            let #q_out = device.caching.alloc_tensor(
-                                &[ctx.num_tokens as usize, #qs as usize],
-                                ::ferrite_cuda_core::DType::BF16,
-                            );
-                            #q_out.raw_ptr() as *mut ::core::ffi::c_void
-                        }
+                    quote! {
+                        let #q_out = device.caching.alloc_tensor(
+                            &[#num_tokens_val as usize, #qs as usize],
+                            ::ferrite_cuda_core::DType::BF16,
+                        );
                     },
-                    // k_out
-                    {
-                        let kvs = kv_size as usize;
-                        quote! {
-                            let #k_out = device.caching.alloc_tensor(
-                                &[ctx.num_tokens as usize, #kvs as usize],
-                                ::ferrite_cuda_core::DType::BF16,
-                            );
-                            #k_out.raw_ptr() as *mut ::core::ffi::c_void
-                        }
+                    quote! {
+                        let #k_out = device.caching.alloc_tensor(
+                            &[#num_tokens_val as usize, #kvs as usize],
+                            ::ferrite_cuda_core::DType::BF16,
+                        );
                     },
-                    // v_out
-                    {
-                        let kvs = kv_size as usize;
-                        quote! {
-                            let #v_out = device.caching.alloc_tensor(
-                                &[ctx.num_tokens as usize, #kvs as usize],
-                                ::ferrite_cuda_core::DType::BF16,
-                            );
-                            #v_out.raw_ptr() as *mut ::core::ffi::c_void
-                        }
+                    quote! {
+                        let #v_out = device.caching.alloc_tensor(
+                            &[#num_tokens_val as usize, #kvs as usize],
+                            ::ferrite_cuda_core::DType::BF16,
+                        );
                     },
-                    // qkv (packed GEMM output)
-                    quote! { (*__qkv_packed).raw_ptr() as *const ::core::ffi::c_void },
-                    // positions
+                    quote! {
+                        let __qkv_tmp = unsafe {
+                            (#weight_expr).forward(
+                                #activation,
+                                &mut device.cublas,
+                                &mut device.caching,
+                                device.compute_stream,
+                            )
+                        };
+                    },
+                ],
+                vec![
+                    quote! { #q_out.raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { #k_out.raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { #v_out.raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (*__qkv_tmp).raw_ptr() as *const ::core::ffi::c_void },
                     quote! { (*ctx.positions).raw_ptr() as *const ::core::ffi::c_void },
-                    // cos_sin_cache
                     quote! { ctx.rotary.cos_sin_cache.raw_ptr() as *const ::core::ffi::c_void },
-                    // q_size
                     quote! { #q_size },
-                    // kv_size
                     quote! { #kv_size },
-                    // head_dim
                     quote! { #head_dim_i32 },
-                    // num_tokens
-                    quote! { ctx.num_tokens as i32 },
-                ]
-            },
-        )),
+                    quote! { #num_tokens_val },
+                ],
+            ))
+        }
         "fused_gate_up_silu_mul" | "fused_gate_up_gelu_mul" => {
-            // These fused ops contain 2 GEMMs (gate + up) + activation + mul.
-            // In the megakernel, the GEMM portions use CUTLASS device calls
-            // and the activation/mul are elementwise device functions.
-            // For now, the device phase treats the entire fused op as a single
-            // compound phase with its own device function in megakernel_ops.cuh.
             let fn_name = if inner_name == "fused_gate_up_silu_mul" {
                 "dc_fused_gate_up_silu_mul"
             } else {
                 "dc_fused_gate_up_gelu_mul"
             };
+            let silu_or_gelu_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| {
+                    let op = ctx.fuf.get(**t).op;
+                    op == OpKind::Silu || op == OpKind::Gelu
+                })
+                .expect("claim contains Silu or Gelu");
+            let mul_id = *ctx
+                .claimed_tiles
+                .iter()
+                .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
+                .expect("claim contains Mul");
+            let (gate_id, _) = first_tile_input(ctx.fuf.get(silu_or_gelu_id))
+                .expect("activation has a tile input — the gate gemm");
+            let up_id = ctx
+                .claimed_tiles
+                .iter()
+                .copied()
+                .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
+                .expect("claim has a second Gemm — the up gemm");
+            let activation = ctx.input_expr(gate_id, 0);
+            let gate_w = first_weight_ref(ctx.fuf.get(gate_id))
+                .expect("gate gemm has a weight");
+            let up_w =
+                first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
+            let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
+            let weight_expr = ctx.weight_accessor(&fused_name);
+            let intermediate = ctx.bound("intermediate_size") as i32;
+            let hidden_size = ctx.bound("hidden_size") as i32;
+            let mul_out = ctx.output_ident(mul_id, 0);
+            let inter = intermediate as usize;
             Some((
                 DevicePhase {
                     flat_params: vec![
@@ -5017,80 +4945,33 @@ fn dc_device_phase(
                     ],
                     preamble: vec![],
                 },
-                {
-                    let silu_or_gelu_id = *ctx
-                        .claimed_tiles
-                        .iter()
-                        .find(|t| {
-                            let op = ctx.fuf.get(**t).op;
-                            op == OpKind::Silu || op == OpKind::Gelu
-                        })
-                        .expect("claim contains Silu or Gelu");
-                    let mul_id = *ctx
-                        .claimed_tiles
-                        .iter()
-                        .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-                        .expect("claim contains Mul");
-                    let (gate_id, _) = first_tile_input(ctx.fuf.get(silu_or_gelu_id))
-                        .expect("activation has a tile input — the gate gemm");
-                    let up_id = ctx
-                        .claimed_tiles
-                        .iter()
-                        .copied()
-                        .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-                        .expect("claim has a second Gemm — the up gemm");
-
-                    let activation = ctx.input_expr(gate_id, 0);
-
-                    let gate_w = first_weight_ref(ctx.fuf.get(gate_id))
-                        .expect("gate gemm has a weight");
-                    let up_w =
-                        first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-                    let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-                    let weight_expr = ctx.weight_accessor(&fused_name);
-
-                    let intermediate = ctx.bound("intermediate_size") as i32;
-                    let hidden_size = ctx.bound("hidden_size") as i32;
-                    let mul_out = ctx.output_ident(mul_id, 0);
-
-                    vec![
-                        // out — allocate [num_tokens, intermediate_size]
-                        {
-                            let inter = intermediate as usize;
-                            quote! {
-                                let #mul_out = device.caching.alloc_tensor(
-                                    &[ctx.num_tokens as usize, #inter],
-                                    ::ferrite_cuda_core::DType::BF16,
-                                );
-                                #mul_out.raw_ptr() as *mut ::core::ffi::c_void
-                            }
-                        },
-                        // input (activation)
-                        quote! { (#activation).raw_ptr() as *const ::core::ffi::c_void },
-                        // gate_weight — the fused weight contains [gate; up] packed
-                        quote! {
-                            let __fused_w = (#weight_expr).dense_weight();
-                            __fused_w.raw_ptr() as *const ::core::ffi::c_void
-                        },
-                        // up_weight — offset into the fused weight
-                        quote! {
-                            // Gate is [intermediate, hidden], up is [intermediate, hidden],
-                            // packed as [2*intermediate, hidden]. Up starts at row `intermediate`.
-                            let __up_offset = #intermediate as usize * #hidden_size as usize;
-                            unsafe {
-                                (__fused_w.raw_ptr() as *const u8)
-                                    .add(__up_offset * 2) // 2 bytes per bf16
-                                    as *const ::core::ffi::c_void
-                            }
-                        },
-                        // M (num_tokens)
-                        quote! { ctx.num_tokens as i32 },
-                        // N (intermediate_size)
-                        quote! { #intermediate },
-                        // K (hidden_size)
-                        quote! { #hidden_size },
-                    ]
-                },
+                // Preamble: alloc output, get fused weight
+                vec![
+                    quote! {
+                        let #mul_out = device.caching.alloc_tensor(
+                            &[#num_tokens_val as usize, #inter],
+                            ::ferrite_cuda_core::DType::BF16,
+                        );
+                    },
+                    quote! { let __fused_w = (#weight_expr).dense_weight(); },
+                    quote! { let __up_offset = #intermediate as usize * #hidden_size as usize; },
+                ],
+                // Param values
+                vec![
+                    quote! { #mul_out.raw_ptr() as *mut ::core::ffi::c_void },
+                    quote! { (#activation).raw_ptr() as *const ::core::ffi::c_void },
+                    quote! { __fused_w.raw_ptr() as *const ::core::ffi::c_void },
+                    quote! {
+                        unsafe {
+                            (__fused_w.raw_ptr() as *const u8)
+                                .add(__up_offset * 2) // 2 bytes per bf16
+                                as *const ::core::ffi::c_void
+                        }
+                    },
+                    quote! { #num_tokens_val },
+                    quote! { #intermediate },
+                    quote! { #hidden_size },
+                ],
             ))
         }
         _ => None,
@@ -5551,8 +5432,9 @@ impl Implementation for TkGemmImpl {
         emit_gemm(ctx)
     }
 
-    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>)> {
+    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>, Vec<TokenStream>)> {
         let p = format!("p{idx}");
+        let num_tokens_val = ctx.num_tokens.expect("TkGemmImpl::device_phase requires num_tokens") as i32;
         let tile = ctx.primary();
         let x = ctx.input_expr(tile, 0);
         let w = ctx.input_expr(tile, 1);
@@ -5589,28 +5471,22 @@ impl Implementation for TkGemmImpl {
                 preamble: vec![],
             },
             vec![
-                // out — alloc [M, N]
-                {
-                    quote! {
-                        let __w_dense = (#w).dense_weight();
-                        let __n = __w_dense.dims()[0] as usize;
-                        let __k = __w_dense.dims()[1] as usize;
-                        let #out = device.caching.alloc_tensor(
-                            &[ctx.num_tokens as usize, __n],
-                            ::ferrite_cuda_core::DType::BF16,
-                        );
-                        #out.raw_ptr() as *mut ::core::ffi::c_void
-                    }
+                quote! { let __w_dense = (#w).dense_weight(); },
+                quote! { let __n = __w_dense.shape()[0] as usize; },
+                quote! { let __k = __w_dense.shape()[1] as usize; },
+                quote! {
+                    let #out = device.caching.alloc_tensor(
+                        &[#num_tokens_val as usize, __n],
+                        ::ferrite_cuda_core::DType::BF16,
+                    );
                 },
-                // A (activation input)
+            ],
+            vec![
+                quote! { #out.raw_ptr() as *mut ::core::ffi::c_void },
                 quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
-                // B (weight, [N, K] row-major)
                 quote! { __w_dense.raw_ptr() as *const ::core::ffi::c_void },
-                // M
-                quote! { ctx.num_tokens as i32 },
-                // N
+                quote! { #num_tokens_val },
                 quote! { __n as i32 },
-                // K
                 quote! { __k as i32 },
             ],
         ))
@@ -5713,7 +5589,7 @@ impl Implementation for TkGemvImpl {
         emit_gemm(ctx)
     }
 
-    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>)> {
+    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>, Vec<TokenStream>)> {
         let p = format!("p{idx}");
         let tile = ctx.primary();
         let x = ctx.input_expr(tile, 0);
@@ -5748,26 +5624,21 @@ impl Implementation for TkGemvImpl {
                 preamble: vec![],
             },
             vec![
-                // out — alloc [1, N]
-                {
-                    quote! {
-                        let __w_dense = (#w).dense_weight();
-                        let __n = __w_dense.dims()[0] as usize;
-                        let __k = __w_dense.dims()[1] as usize;
-                        let #out = device.caching.alloc_tensor(
-                            &[1, __n],
-                            ::ferrite_cuda_core::DType::BF16,
-                        );
-                        #out.raw_ptr() as *mut ::core::ffi::c_void
-                    }
+                quote! { let __w_dense = (#w).dense_weight(); },
+                quote! { let __n = __w_dense.shape()[0] as usize; },
+                quote! { let __k = __w_dense.shape()[1] as usize; },
+                quote! {
+                    let #out = device.caching.alloc_tensor(
+                        &[1, __n],
+                        ::ferrite_cuda_core::DType::BF16,
+                    );
                 },
-                // x (activation)
+            ],
+            vec![
+                quote! { #out.raw_ptr() as *mut ::core::ffi::c_void },
                 quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
-                // W (weight, [N, K] row-major)
                 quote! { __w_dense.raw_ptr() as *const ::core::ffi::c_void },
-                // N
                 quote! { __n as i32 },
-                // K
                 quote! { __k as i32 },
             ],
         ))

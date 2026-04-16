@@ -512,7 +512,8 @@ fn try_emit_megakernel(
 
     // Collect DevicePhases + Rust param expressions for each subgraph.
     let mut phases: Vec<DevicePhase> = Vec::new();
-    let mut rust_exprs: Vec<Vec<proc_macro2::TokenStream>> = Vec::new();
+    let mut rust_preambles: Vec<Vec<proc_macro2::TokenStream>> = Vec::new();
+    let mut rust_values: Vec<Vec<proc_macro2::TokenStream>> = Vec::new();
 
     for (idx, (sg, imp_id)) in dc_group.iter().enumerate() {
         let claimed = mctx.sfuf.tiles_in_subgraph(**sg);
@@ -522,11 +523,13 @@ fn try_emit_megakernel(
             model: mctx.model,
             claimed_tiles: &claimed,
             locals: mctx.locals,
+            num_tokens: Some(mctx.num_tokens),
         };
         let imp = mctx.lib.get(**imp_id);
-        let (phase, exprs) = imp.device_phase(idx, &ctx)?;
+        let (phase, preamble, values) = imp.device_phase(idx, &ctx)?;
         phases.push(phase);
-        rust_exprs.push(exprs);
+        rust_preambles.push(preamble);
+        rust_values.push(values);
     }
 
     // Generate the .cu source and write to megakernel cache.
@@ -560,7 +563,7 @@ fn try_emit_megakernel(
         .collect();
 
     tokens.push(quote! {
-        extern "C" {
+        unsafe extern "C" {
             fn #launch_fn(
                 #(#extern_params,)*
                 __grid_x: i32,
@@ -571,18 +574,31 @@ fn try_emit_megakernel(
         }
     });
 
-    // Emit param bindings from Rust expressions.
-    for (phase, exprs) in phases.iter().zip(rust_exprs.iter()) {
-        for ((c_type, name), expr) in phase.flat_params.iter().zip(exprs.iter()) {
+    // Preamble statements go in the OUTER scope so output ident
+    // bindings (e.g. `let t_3_0 = device.caching.alloc_tensor(...)`)
+    // survive past the megakernel launch and are visible to
+    // downstream code that consumes those tiles.
+    let mut preamble_stmts: Vec<TokenStream> = Vec::new();
+    for preamble in &rust_preambles {
+        for stmt in preamble {
+            preamble_stmts.push(stmt.clone());
+        }
+    }
+    tokens.push(quote! { #(#preamble_stmts)* });
+
+    // Param value assignments + launch call in a contained block
+    // (the param idents like p0_out are only needed for the FFI call).
+    let mut param_stmts: Vec<TokenStream> = Vec::new();
+    for (phase, values) in phases.iter().zip(rust_values.iter()) {
+        for ((c_type, name), val) in phase.flat_params.iter().zip(values.iter()) {
             let name_ident = format_ident!("{}", name);
             let ty = c_type_to_rust(c_type);
-            tokens.push(quote! {
-                let #name_ident: #ty = #expr;
+            param_stmts.push(quote! {
+                let #name_ident: #ty = #val;
             });
         }
     }
 
-    // Emit the launch call.
     let param_idents: Vec<proc_macro2::Ident> = generated
         .flat_params
         .iter()
@@ -591,17 +607,10 @@ fn try_emit_megakernel(
 
     tokens.push(quote! {
         {
-            let __stream_raw = device.compute_stream.raw() as u64;
-            // Cooperative kernel: grid = num_sm, block = 256.
-            // The DC ops use one CTA per row for elementwise ops
-            // and grid-stride for GEMM. num_sm ensures full GPU
-            // occupancy; each phase early-exits CTAs beyond its
-            // row count.
+            #(#param_stmts)*
+            let __stream_raw = device.compute_stream as u64;
             let __grid_x = device.num_sm as i32;
             let __block_x = 256i32;
-            // smem: enough for block reduce (32 floats = 128B) +
-            // wmma tile scratch (16×16×4 = 1024B) + inv_rms (4B).
-            // Round up to 2048 for safety.
             let __smem_bytes = 2048usize;
             let __ret = unsafe {
                 #launch_fn(
@@ -818,6 +827,7 @@ fn emit_forward_for_bucket(
                 model,
                 claimed_tiles: &claimed,
                 locals: &locals,
+                num_tokens: None,
             };
             body.push(lib.get(*imp_id).emit_call(&ctx));
             if let Some(owners) = drops.get(sg) {
@@ -966,6 +976,7 @@ fn emit_forward_backbone_for_bucket(
                 model,
                 claimed_tiles: &claimed,
                 locals: &locals,
+                num_tokens: None,
             };
             body.push(lib.get(*imp_id).emit_call(&ctx));
             if let Some(owners) = drops.get(sg) {

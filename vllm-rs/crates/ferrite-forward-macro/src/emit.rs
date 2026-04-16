@@ -46,6 +46,9 @@ pub struct EmitCtx<'a> {
     /// Map from (tile, slot) → ident of the let-binding holding
     /// that value in the enclosing fn's scope.
     pub locals: &'a LocalMap,
+    /// Compile-time num_tokens for this workload bucket.
+    /// Set by megakernel codegen; `None` for non-megakernel emit.
+    pub num_tokens: Option<u64>,
 }
 
 impl<'a> EmitCtx<'a> {

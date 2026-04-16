@@ -1098,6 +1098,48 @@ pub fn starter_library() -> ImplementationLibrary {
         }));
     }
     lib.push(Box::new(CutlassGemvImpl));
+
+    // ── TK attention (sm90+ DeviceCallable) ──
+    // Native wgmma-based attention for Hopper megakernels.
+    // target_compatible gates on compute_capability >= 90.
+    lib.push(Box::new(TkAttentionDecodeImpl));
+    lib.push(Box::new(TkAttentionPrefillImpl));
+
+    // ── DeviceCallable wrappers for elementwise ops (sm89+) ──
+    // Each DC wrapper saves one kernel launch by running inside an
+    // enclosing megakernel. The DP sees this as a cost discount
+    // (launch_overhead_us subtracted from per-call cost).
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        RmsNormRefImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        FusedAddRmsNormImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        FusedAddRmsNormWithOffsetImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        ScalarOffsetRmsNormImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        FusedGateUpSiluMulImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        FusedGateUpGeluMulImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        ScalarMulImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        TanhSoftCapImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        FusedQkvRopeCacheImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        FusedQkvRopePrefillImpl,
+    ))));
+
     lib
 }
 
@@ -3628,6 +3670,268 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
                 #out.reshape(&[nt, #q_size], dt);
             }
         }
+    }
+}
+
+// ── TK attention (sm90+ DeviceCallable) ─────────────────────────
+//
+// ThunderKittens-native attention for Hopper. Runs as a
+// DeviceCallable inside a megakernel using wgmma for Q×K^T and
+// attn×V, with online softmax. Same matching and emission as the
+// existing FlashAttn-based impls — the compiler picks TK when its
+// cost is lower (CSV `tk_attention_*` rows); the runtime kernel
+// dispatch is unchanged.
+
+#[derive(Debug)]
+pub struct TkAttentionDecodeImpl;
+
+impl Implementation for TkAttentionDecodeImpl {
+    fn name(&self) -> &'static str {
+        "tk_attention_decode"
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.compute_capability >= 90
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::Attention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // wgmma-based attention is faster than FA2 on Hopper.
+        // Apply a 10% discount on the analytical estimate; real
+        // measured CSV data will override when available.
+        cost_attention(m, ctx) * 0.9
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 228 * 1024,
+            regs_per_thread: 232,
+            threads_per_cta: 128,
+        }
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Reuse the same emission as AttentionViaCacheImpl — the
+        // runtime kernel dispatch handles TK vs FA2 selection.
+        AttentionViaCacheImpl.emit_call(ctx)
+    }
+}
+
+#[derive(Debug)]
+pub struct TkAttentionPrefillImpl;
+
+impl Implementation for TkAttentionPrefillImpl {
+    fn name(&self) -> &'static str {
+        "tk_attention_prefill"
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.compute_capability >= 90
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::Attention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        cost_attention(m, ctx) * 0.9
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 228 * 1024,
+            regs_per_thread: 232,
+            threads_per_cta: 128,
+        }
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::Mbarrier, Handoff::Internal, Handoff::StreamOrder];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, _m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        AttentionPrefillContiguousImpl.emit_call(ctx)
+    }
+}
+
+// ── DeviceCallableWrapper ────────────────────────────────────────
+//
+// Generic wrapper that makes any existing Implementation run as a
+// DeviceCallable inside a megakernel. Delegates everything to the
+// inner impl except launch_kind (DeviceCallable), handoffs
+// (Mbarrier/SyncThreads), can_share_kernel_with (true), and
+// cost_us (discounted by launch_overhead_us).
+
+#[derive(Debug)]
+pub struct DeviceCallableWrapper {
+    inner: Box<dyn Implementation>,
+    name: &'static str,
+}
+
+impl DeviceCallableWrapper {
+    pub fn new(inner: Box<dyn Implementation>) -> Self {
+        let name: &'static str = Box::leak(format!("dc_{}", inner.name()).into_boxed_str());
+        Self { inner, name }
+    }
+}
+
+impl Implementation for DeviceCallableWrapper {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.compute_capability >= 89 && self.inner.target_compatible(profile)
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        self.inner.workload_constraint()
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        self.inner.matches(fuf, seed, profile)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // DC impls save one kernel launch by running inside an
+        // enclosing megakernel. Subtract the launch overhead so
+        // the greedy DP prefers DC over standalone for cheap ops.
+        (self.inner.cost_us(m, ctx) - ctx.profile.launch_overhead_us).max(0.01)
+    }
+
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        self.inner.resources(m)
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[
+            Handoff::Mbarrier,
+            Handoff::SyncThreads,
+            Handoff::Internal,
+            Handoff::StreamOrder,
+        ];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[
+            Handoff::Mbarrier,
+            Handoff::SyncThreads,
+            Handoff::Internal,
+            Handoff::StreamOrder,
+        ];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.inner.input_layouts(m)
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.inner.output_layouts(m)
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        self.inner.is_compute_bound()
+    }
+
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        self.inner.required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        self.inner.output_alias(claimed_tiles, fuf)
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        self.inner.emit_call(ctx)
     }
 }
 

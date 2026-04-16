@@ -100,6 +100,13 @@ pub struct TargetProfile {
     /// variant across a grid of `(M, N, K)`). Empty when no CSV is
     /// present — cost impls fall back to their analytic formula.
     pub cost_table: CostTable,
+    /// Per-kernel-launch overhead in microseconds. CSV costs are
+    /// compute-only (launch overhead already subtracted from measured
+    /// timings). This value is added back per HostCallback/RegularLaunch
+    /// subgraph in `loop_cost_us`, and subtracted from DeviceCallable
+    /// impls' per-call cost so the DP solver sees the launch savings.
+    /// Populated from the `launch_overhead` CSV row; defaults to 2.0µs.
+    pub launch_overhead_us: f64,
 }
 
 impl TargetProfile {
@@ -195,6 +202,8 @@ pub fn load_file(path: &Path) -> Result<TargetProfile, TargetError> {
         CostTable::new()
     };
 
+    let launch_overhead_us = cost_table.get("launch_overhead", 0, 0, 0).unwrap_or(2.0);
+
     Ok(TargetProfile {
         name,
         source_path: path.to_path_buf(),
@@ -204,6 +213,7 @@ pub fn load_file(path: &Path) -> Result<TargetProfile, TargetError> {
         memory_bandwidth_gbps: get_f64(&json, "memory_bandwidth_gbps", path)?,
         shared_memory_per_sm_kb: get_u64(&json, "shared_memory_per_sm_kb", path)? as u32,
         cost_table,
+        launch_overhead_us,
     })
 }
 

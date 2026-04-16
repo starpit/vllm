@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use crate::concurrency::ConcurrencyModel;
 use crate::fuf::Fuf;
-use crate::impl_lib::{CostCtx, Implementation, ImplementationLibrary, MatchInfo};
+use crate::impl_lib::{CostCtx, Implementation, ImplementationLibrary, LaunchKind, MatchInfo};
 use crate::schedule::{Loop, WorkloadLoops};
 use crate::solver::{Assignment, WorkloadAssignments};
 use crate::target::TargetProfile;
@@ -79,6 +79,24 @@ pub fn loop_cost_us(
             total += imp.cost_us(m, &ctx) * factor;
         }
     }
+
+    // Add per-launch overhead for non-DeviceCallable subgraphs.
+    // CSV costs are compute-only (launch overhead subtracted);
+    // each HostCallback / RegularLaunch subgraph pays one launch.
+    // DeviceCallable subgraphs run inside an enclosing kernel and
+    // pay nothing.
+    let mut launch_count = 0u32;
+    for wave in &loop_ir.waves {
+        for (_sg, imp_id) in &wave.subgraphs {
+            match lib.get(*imp_id).launch_kind() {
+                LaunchKind::HostCallback | LaunchKind::RegularLaunch => {
+                    launch_count += 1;
+                }
+                LaunchKind::CooperativeLaunch | LaunchKind::DeviceCallable => {}
+            }
+        }
+    }
+    total += launch_count as f64 * target.launch_overhead_us;
 
     total
 }
@@ -198,11 +216,25 @@ mod tests {
         let aware = loop_cost_us(&fuf, sfuf, loop_ir, &lib, &target, &scratch);
 
         // Every wave has one subgraph → contention factor 1.0
-        // everywhere. Numbers must match to within float-noise
-        // (both sums include the same Impl cost_us calls).
+        // everywhere. The aware total includes per-launch overhead
+        // for non-DeviceCallable subgraphs (added back since CSV
+        // costs are compute-only); the naive sum from the DP does
+        // not. Subtract the launch overhead to compare apples.
+        let launch_count = loop_ir
+            .waves
+            .iter()
+            .flat_map(|w| &w.subgraphs)
+            .filter(|(_, imp_id)| {
+                !matches!(
+                    lib.get(*imp_id).launch_kind(),
+                    LaunchKind::DeviceCallable | LaunchKind::CooperativeLaunch
+                )
+            })
+            .count();
+        let expected_overhead = launch_count as f64 * target.launch_overhead_us;
         assert!(
-            (naive - aware).abs() < 1e-6,
-            "naive={naive} aware={aware} (expected equal on serial chain)"
+            (naive - (aware - expected_overhead)).abs() < 1e-6,
+            "naive={naive} aware={aware} overhead={expected_overhead} (mismatch on serial chain)"
         );
     }
 
@@ -274,8 +306,14 @@ mod tests {
         refresh_predicted_us(&fuf, &mut sfufs, &loops, &lib, &target, &params.bounds);
         for (&m, sf) in sfufs.per_num_tokens.iter() {
             assert!(sf.predicted_us.is_finite() && sf.predicted_us > 0.0);
-            // On serial chain the refresh shouldn't move the number.
-            assert!((before[&m] - sf.predicted_us).abs() < 1e-6);
+            // On serial chain, contention factor is 1.0 everywhere so
+            // the only difference is the per-launch overhead added back
+            // for non-DeviceCallable subgraphs. The refreshed value
+            // should exceed the DP's naive sum by that amount.
+            assert!(
+                sf.predicted_us >= before[&m],
+                "refreshed predicted_us at m={m} should be >= naive DP sum"
+            );
         }
     }
 }

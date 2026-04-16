@@ -521,6 +521,14 @@ mod tests {
     use crate::target::load_file as load_target;
     use std::path::PathBuf;
 
+    /// Strip the `dc_` prefix from an impl name for comparison.
+    /// DC-wrapped impls are functionally identical to their standalone
+    /// counterparts — tests that check fusion topology shouldn't
+    /// break when the solver picks the DC variant.
+    fn base_name(name: &str) -> &str {
+        name.strip_prefix("dc_").unwrap_or(name)
+    }
+
     fn llama_params(stem: &str) -> ModelParams {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -683,7 +691,7 @@ mod tests {
                     // lookup by name to avoid coupling to ImplId ordering.
                     let imp_id = sfuf.impl_of(sg).unwrap();
                     assert_eq!(
-                        lib.get(imp_id).name(),
+                        base_name(lib.get(imp_id).name()),
                         "fused_gate_up_silu_mul",
                         "subgraph at m={m} has fused topology but wrong impl",
                     );
@@ -742,7 +750,7 @@ mod tests {
                         "fused_qkv_rope_prefill"
                     };
                     assert_eq!(
-                        lib.get(imp_id).name(),
+                        base_name(lib.get(imp_id).name()),
                         expected,
                         "subgraph at m={m} has QKV-rope topology but wrong impl",
                     );
@@ -820,7 +828,7 @@ mod tests {
                     fused_pair_count += 1;
                     let imp_id = sfuf.impl_of(sg).unwrap();
                     assert_eq!(
-                        lib.get(imp_id).name(),
+                        base_name(lib.get(imp_id).name()),
                         "fused_add_rms_norm",
                         "subgraph at m={m} has Add+RmsNorm topology but wrong impl",
                     );
@@ -828,7 +836,7 @@ mod tests {
                     singleton_rmsnorm_count += 1;
                     let imp_id = sfuf.impl_of(sg).unwrap();
                     assert_eq!(
-                        lib.get(imp_id).name(),
+                        base_name(lib.get(imp_id).name()),
                         "rmsnorm_ref",
                         "singleton RmsNorm at m={m} bound to wrong impl",
                     );
@@ -1222,7 +1230,7 @@ mod tests {
                 if n_gemm == 2 && n_gelu == 1 && n_mul == 1 {
                     fused += 1;
                     let imp = lib.get(sfuf.impl_of(sg).unwrap()).name();
-                    assert_eq!(imp, "fused_gate_up_gelu_mul", "m={m}");
+                    assert_eq!(base_name(imp), "fused_gate_up_gelu_mul", "m={m}");
                 }
             }
             assert_eq!(fused, nl, "one Gelu-fused MLP per layer at m={m}");
@@ -1296,7 +1304,7 @@ mod tests {
             );
             let sg = softcap_subgraphs[0];
             let imp = lib.get(sfuf.impl_of(sg).unwrap()).name();
-            assert_eq!(imp, "tanh_softcap_inplace", "m={m}");
+            assert_eq!(base_name(imp), "tanh_softcap_inplace", "m={m}");
         }
     }
 
@@ -1310,5 +1318,70 @@ mod tests {
 
         let workloads = solve(&fuf, &lib, &target, &inferred, &bounds, &[]).unwrap();
         assert!(workloads.per_num_tokens.is_empty());
+    }
+
+    fn h100_target() -> TargetProfile {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("target_profiles")
+            .join("h100_sm90.json");
+        load_target(&path).unwrap()
+    }
+
+    #[test]
+    fn h100_picks_tk_attention_and_dc_elementwise() {
+        let params = llama_params("llama-3.2-1b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = h100_target();
+        let bounds = params.bounds.clone();
+
+        let workloads =
+            solve(&fuf, &lib, &target, &inferred, &bounds, &[1, 64]).expect("solve H100");
+
+        // Decode bucket (M=1): collect impl names.
+        let sfuf = &workloads.per_num_tokens[&1];
+        let names: Vec<&str> = sfuf
+            .subgraphs()
+            .map(|sg| lib.get(sfuf.impl_of(sg).unwrap()).name())
+            .collect();
+
+        eprintln!("H100 decode (M=1) plan:");
+        for (i, name) in names.iter().enumerate() {
+            eprintln!("  step {}: {}", i + 1, name);
+        }
+
+        // TK attention must be picked for decode.
+        assert!(
+            names.contains(&"tk_attention_decode"),
+            "expected tk_attention_decode in H100 decode plan, got: {names:?}"
+        );
+
+        // At least some DC elementwise ops should be picked (the
+        // launch_overhead_us discount makes them cheaper than standalone).
+        let dc_count = names.iter().filter(|n| n.starts_with("dc_")).count();
+        assert!(
+            dc_count >= 2,
+            "expected at least 2 dc_ impls in H100 decode plan, got {dc_count}: {names:?}"
+        );
+
+        // Prefill bucket (M=64): TK prefill.
+        let sfuf64 = &workloads.per_num_tokens[&64];
+        let names64: Vec<&str> = sfuf64
+            .subgraphs()
+            .map(|sg| lib.get(sfuf64.impl_of(sg).unwrap()).name())
+            .collect();
+
+        eprintln!("H100 prefill (M=64) plan:");
+        for (i, name) in names64.iter().enumerate() {
+            eprintln!("  step {}: {}", i + 1, name);
+        }
+
+        assert!(
+            names64.contains(&"tk_attention_prefill"),
+            "expected tk_attention_prefill in H100 prefill plan, got: {names64:?}"
+        );
     }
 }

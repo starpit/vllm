@@ -36,6 +36,7 @@ mod emit;
 mod fuf;
 mod impl_lib;
 mod parse;
+mod quantization;
 mod schedule;
 mod shape;
 mod solver;

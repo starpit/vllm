@@ -3987,6 +3987,7 @@ mod tests {
             source_path: std::path::PathBuf::new(),
             bounds,
             scalars,
+            quantization: None,
         };
 
         let scale = attention_scale_for(&model);

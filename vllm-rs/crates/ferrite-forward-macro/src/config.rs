@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use proc_macro2::Span;
 use syn::Ident;
 
+use crate::quantization::QuantizationConfig;
+
 /// One model's parameters, loaded from one `config.json`.
 #[derive(Clone, Debug)]
 pub struct ModelParams {
@@ -45,6 +47,11 @@ pub struct ModelParams {
     /// `rms_norm_eps`. Downstream callers read these by name; this
     /// module doesn't know which ones are used where.
     pub scalars: BTreeMap<String, f64>,
+    /// Parsed `quantization_config` subobject, if present in the
+    /// JSON. `None` for plain dense models. Consumers resolve
+    /// per-weight storage format via
+    /// [`crate::quantization::storage_format_for_weight`].
+    pub quantization: Option<QuantizationConfig>,
 }
 
 /// Errors produced while loading configs.
@@ -63,6 +70,10 @@ pub enum ConfigError {
         path: PathBuf,
         reason: &'static str,
     },
+    Quantization {
+        path: PathBuf,
+        source: crate::quantization::ParseError,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -73,6 +84,9 @@ impl std::fmt::Display for ConfigError {
             Self::NotADirectory(p) => write!(f, "not a directory: {}", p.display()),
             Self::BadStem { path, reason } => {
                 write!(f, "bad file stem for {}: {reason}", path.display())
+            }
+            Self::Quantization { path, source } => {
+                write!(f, "quantization_config in {}: {source}", path.display())
             }
         }
     }
@@ -126,6 +140,12 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
     let mut bounds = extract_bounds(&json);
     crate::weight_conventions::derive_implicit_bounds(&mut bounds);
     let scalars = extract_scalars(&json);
+    let quantization = crate::quantization::QuantizationConfig::parse(&json).map_err(|e| {
+        ConfigError::Quantization {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })?;
 
     Ok(ModelParams {
         name,
@@ -133,6 +153,7 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
         source_path: path.to_path_buf(),
         bounds,
         scalars,
+        quantization,
     })
 }
 

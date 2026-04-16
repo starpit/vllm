@@ -250,6 +250,40 @@ fn emit_weights_struct(
         Err(err) => return err,
     };
 
+    // Storage-format guard: every `LinearLayer` / `Embedding` /
+    // `RmsNorm` FieldLoad today produces dense bf16 safetensors
+    // reads. Any source weight whose storage isn't `Dense` would
+    // silently mis-load; enforce the invariant at macro-expansion
+    // time so new quant formats can't slip through without a
+    // matching FieldLoad arm + kernel wiring.
+    //
+    // When a quant-aware Impl lands (e.g. an AWQ QKV fusion), the
+    // Impl will declare a new accessor `rust_type` — the new type
+    // gets its own allowed-format set in this guard. Until then,
+    // the dense-only invariant is the correct floor.
+    for a in &accessors {
+        for (wid, _idx) in &a.source_weights {
+            let fmt = crate::quantization::storage_format_for_weight(program, *wid, model);
+            if fmt != crate::quantization::StorageFormat::Dense {
+                let path = program.weights.path(*wid);
+                let dotted = path
+                    .iter()
+                    .map(syn::Ident::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let msg = format!(
+                    "model `{stem}`: weight `{dotted}` has non-dense storage ({fmt:?}) \
+                     but accessor `{name}` (type `{ty}`) has no matching loader. \
+                     Add a quant-aware Impl + FieldLoad arm for this format.",
+                    stem = model.source_stem,
+                    name = a.name,
+                    ty = a.rust_type.to_string().replace(' ', ""),
+                );
+                return quote! { compile_error!(#msg); };
+            }
+        }
+    }
+
     let fields = accessors.iter().map(|a| {
         let name = &a.name;
         let ty = &a.rust_type;

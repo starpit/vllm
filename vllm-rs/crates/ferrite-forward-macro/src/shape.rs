@@ -197,7 +197,7 @@ fn dims_structurally_equal(a: &Dim, b: &Dim) -> bool {
 
 /// Flatten and sort a Mul's children to a canonical form. Single-
 /// element products collapse to their inner dim.
-fn canonical_mul(mut children: Vec<Dim>) -> Dim {
+pub fn canonical_mul(mut children: Vec<Dim>) -> Dim {
     // Flatten nested Muls.
     let mut flat = Vec::with_capacity(children.len());
     for c in children.drain(..) {
@@ -259,6 +259,35 @@ pub enum ShapeError {
         expected: usize,
         got: usize,
     },
+    /// A mismatch that the caller can resolve by inserting `Reshape`
+    /// statements into the program. Typical case: per-head operations
+    /// like Qwen3's QK-norm where the DSL writes `rmsnorm(q, q_norm)`
+    /// with `q: [..., heads * head_dim]` and `q_norm: [head_dim]`.
+    /// `apply_reshape_hints` mutates a program clone to insert view
+    /// reshapes, after which a second `infer` pass succeeds cleanly.
+    ReshapeRecovery {
+        hints: Vec<ReshapeHint>,
+    },
+}
+
+/// A single reshape-recoverable mismatch recorded during anchoring.
+/// Produced by [`infer`] when a weight's `standard_shape` declaration
+/// implies the activation reaching its consumer op needs a view
+/// change. Consumed by [`apply_reshape_hints`] to rewrite the program.
+#[derive(Debug, Clone)]
+pub struct ReshapeHint {
+    /// The producer local whose output shape mismatches the consumer's
+    /// expectation. A new local carrying the reshaped view will be
+    /// introduced; the consumer stmt's reference to `producer_local`
+    /// is rewritten to point at it.
+    pub producer_local: LocalId,
+    /// Full target shape for the reshaped view — this is what the
+    /// consumer's op signature expects the producer to look like.
+    /// Element count must equal the producer's current element count.
+    pub target_shape: Shape,
+    /// The weight whose declared shape triggered the recovery — kept
+    /// for diagnostics.
+    pub weight_id: WeightId,
 }
 
 impl fmt::Display for ShapeError {
@@ -273,6 +302,13 @@ impl fmt::Display for ShapeError {
             }
             Self::ArgCount { op, expected, got } => {
                 write!(f, "op {} expected {expected} args, got {got}", op.as_str())
+            }
+            Self::ReshapeRecovery { hints } => {
+                write!(
+                    f,
+                    "shape mismatch recoverable via {} reshape insertion(s)",
+                    hints.len()
+                )
             }
         }
     }
@@ -322,6 +358,17 @@ pub fn apply_signature(
         OpKind::Add => sig_binary_elementwise(solver, inputs, op),
         OpKind::BiasAdd => sig_bias_add(solver, inputs),
         OpKind::Mul => sig_binary_elementwise(solver, inputs, op),
+        // Reshape's output shape is stored on `Program::reshape_targets`
+        // keyed by the stmt's target LocalId, so `apply_signature` isn't
+        // a useful entry point for it — `infer_stmt` routes around this
+        // arm. If something reaches here it's a compiler bug.
+        OpKind::Reshape => Err(ShapeError::BadArgs {
+            op: OpKind::Reshape,
+            reason: "apply_signature should not be called on Reshape; \
+                     infer_stmt looks up the target shape from \
+                     Program::reshape_targets directly"
+                .into(),
+        }),
     }
 }
 
@@ -576,6 +623,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Add => &[],
         OpKind::BiasAdd => &[(1, 1)],
         OpKind::Mul => &[],
+        OpKind::Reshape => &[],
     }
 }
 
@@ -620,15 +668,47 @@ pub struct Inferred {
 }
 
 /// Run shape inference over a classified program.
-pub fn infer(program: &Program) -> Result<Inferred, ShapeError> {
-    let mut cx = InferCtx::new();
-    cx.infer_stmts(&program.statements)?;
+///
+/// Anchors weight shapes against the per-arch `weights.json`
+/// manifest (loaded by the macro and passed in via `manifest`).
+/// `bounds` come from one of the arch's configs — the prober's
+/// cross-size validation guarantees any config's values resolve the
+/// manifest's formulas consistently, so bounds from any one size
+/// suffice.
+///
+/// Anchoring uses **numerical equivalence** rather than structural
+/// unification: if the dataflow-inferred dim and the manifest's
+/// declared dim evaluate to the same integer under `bounds`, they
+/// match even when their symbolic forms differ (e.g. Qwen2.5 where
+/// `hidden_size == num_attention_heads * head_dim` is always true).
+///
+/// On a genuine mismatch — inferred and declared don't even
+/// resolve to the same integer — the recovery machinery kicks in
+/// (per-head norms like Qwen3's `q_norm` where dataflow produces
+/// `[heads * head_dim]` but the manifest declares `[head_dim]`).
+/// `ShapeError::ReshapeRecovery` then carries hints the caller
+/// passes to [`apply_reshape_hints`] to synthesize `Reshape` tiles.
+pub fn infer(
+    program: &Program,
+    manifest: &crate::weights_manifest::WeightsManifest,
+    bounds: &std::collections::BTreeMap<String, u64>,
+) -> Result<Inferred, ShapeError> {
+    let mut cx = InferCtx::from_program(program);
+    cx.infer_stmts(&program.statements, program)?;
 
-    // Anchor remaining weight Vars via the standard HF transformer
-    // weight-name convention table. Dataflow handles attention-block
-    // weights (q/k/v/o_proj get pinned by rope_append + add(oproj,
-    // hidden_states)); the convention table handles MLP weights and
-    // other norms whose dims aren't pinned by any op signature.
+    // Anchor weights against the manifest. Dataflow has pinned every
+    // weight dim it can by now (q_proj[1] via rope_append,
+    // input_layernorm via rmsnorm-of-hidden_states, etc.); the
+    // manifest adds arch-specific declarations dataflow can't derive
+    // (the q_norm / k_norm case).
+    //
+    // For numerical-equivalence anchoring: if the inferred dim and
+    // the declared dim evaluate to the same integer under `bounds`,
+    // no action needed — they agree. If the integers differ,
+    // `try_anchor_with_recovery` checks whether the discrepancy is
+    // a reshape-recoverable factor relationship and, if so, records
+    // a hint.
+    let mut reshape_hints: Vec<ReshapeHint> = Vec::new();
     for (wid, shape) in cx.weights.clone().iter() {
         let path: Vec<String> = program
             .weights
@@ -636,20 +716,29 @@ pub fn infer(program: &Program) -> Result<Inferred, ShapeError> {
             .iter()
             .map(|i| i.to_string())
             .collect();
-        if let Some(convention) = crate::weight_conventions::standard_shape(&path)
-            && shape.len() == convention.len()
+        if let Some(declared) = manifest.lookup(&path)
+            && shape.len() == declared.len()
         {
-            for (inferred, declared) in shape.iter().zip(&convention) {
-                cx.solver.unify(inferred, declared)?;
-            }
+            try_anchor_with_recovery(
+                &mut cx,
+                program,
+                *wid,
+                shape,
+                declared,
+                bounds,
+                &mut reshape_hints,
+            )?;
         }
     }
+    if !reshape_hints.is_empty() {
+        return Err(ShapeError::ReshapeRecovery {
+            hints: reshape_hints,
+        });
+    }
 
-    // Close every recorded shape. After convention anchoring, most
-    // Vars resolve to concrete dim expressions. Any remaining Vars
-    // correspond to weights not covered by the convention (arch-
-    // specific, pending `weights.json` in a future phase); Dim::Var
-    // is preserved rather than erroring.
+    // Close every recorded shape. Any remaining Vars correspond to
+    // weights the manifest didn't cover AND dataflow couldn't pin —
+    // left as `Dim::Var` for downstream consumers to handle.
     let mut locals = HashMap::new();
     for (id, shape) in cx.locals {
         locals.insert(id, cx.solver.close_shape(&shape)?);
@@ -661,24 +750,376 @@ pub fn infer(program: &Program) -> Result<Inferred, ShapeError> {
     Ok(Inferred { locals, weights })
 }
 
+/// Evaluate a `Dim` to a concrete `u64` using `bounds`, walking
+/// through the solver first to resolve any `Var`s. Returns `None`
+/// if the dim doesn't close to a known bound / literal / product of
+/// those (e.g. an unresolved Var) — the caller treats that as
+/// "can't compare numerically."
+fn eval_dim_to_u64(
+    cx: &mut InferCtx,
+    d: &Dim,
+    bounds: &std::collections::BTreeMap<String, u64>,
+) -> Option<u64> {
+    let walked = cx.solver.walk(d);
+    eval_closed_dim(&walked, bounds)
+}
+
+fn eval_closed_dim(d: &Dim, bounds: &std::collections::BTreeMap<String, u64>) -> Option<u64> {
+    match d {
+        Dim::Lit(n) => Some(*n),
+        Dim::Bound(name) => bounds.get(name).copied(),
+        Dim::Mul(factors) => factors
+            .iter()
+            .try_fold(1u64, |acc, f| eval_closed_dim(f, bounds).map(|v| acc * v)),
+        Dim::Var(_) => None,
+    }
+}
+
+/// Anchor a weight's shape to its manifest declaration. Uses
+/// numerical equivalence: a dim pair agrees when `eval(inferred,
+/// bounds) == eval(declared, bounds)`, regardless of symbolic form.
+/// This handles the Qwen2.5-style "coincidence" where `hidden_size`
+/// and `num_attention_heads * head_dim` are always numerically
+/// equal — both forms validate.
+///
+/// On a genuine numeric mismatch, attempts reshape recovery: if the
+/// inferred dim is a `Mul` containing the declared dim as a factor
+/// (Qwen3/Gemma3 per-head norm pattern), records a `ReshapeHint`.
+/// Otherwise, returns `ShapeError::Mismatch`.
+fn try_anchor_with_recovery(
+    cx: &mut InferCtx,
+    program: &Program,
+    wid: WeightId,
+    inferred_shape: &Shape,
+    declared_shape: &Shape,
+    bounds: &std::collections::BTreeMap<String, u64>,
+    hints: &mut Vec<ReshapeHint>,
+) -> Result<(), ShapeError> {
+    for (inferred, declared) in inferred_shape.iter().zip(declared_shape.iter()) {
+        // Try structural unification first. This (a) short-circuits
+        // when inferred and declared have the same symbolic form,
+        // and (b) binds any unresolved `Var` on one side to the
+        // concrete `Bound`/`Mul` on the other — the whole reason
+        // the manifest exists for weights dataflow can't pin.
+        if cx.solver.unify(inferred, declared).is_ok() {
+            continue;
+        }
+
+        // Structural unify rejected because both sides are concrete
+        // and symbolically different. Check numerical equivalence
+        // under this model's bounds: `hidden_size` and
+        // `num_attention_heads * head_dim` may always evaluate to
+        // the same integer (Qwen2.5). If yes, accept — the shapes
+        // agree at runtime regardless of symbolic form.
+        let inferred_walked = cx.solver.walk(inferred);
+        let declared_walked = cx.solver.walk(declared);
+        let inf_n = eval_dim_to_u64(cx, &inferred_walked, bounds);
+        let dec_n = eval_dim_to_u64(cx, &declared_walked, bounds);
+        if let (Some(a), Some(b)) = (inf_n, dec_n)
+            && a == b
+        {
+            continue;
+        }
+
+        // Genuine mismatch. Try reshape recovery for the
+        // per-head-norm pattern.
+        if let Some(hint) =
+            detect_reshape_hint(program, cx, wid, &inferred_walked, &declared_walked)
+        {
+            hints.push(hint);
+            return Ok(());
+        }
+        return Err(ShapeError::Mismatch {
+            lhs: inferred_walked,
+            rhs: declared_walked,
+        });
+    }
+    Ok(())
+}
+
+/// If `inferred = Mul([.., Declared, ..])` and `declared` is a single
+/// `Bound`/`Lit`, produce a hint describing the reshape that would
+/// make the consumer's activation tile line up.
+///
+/// Returns `None` if the mismatch doesn't fit the "axis-factor"
+/// pattern — at which point the caller treats it as a hard Mismatch.
+fn detect_reshape_hint(
+    program: &Program,
+    cx: &InferCtx,
+    wid: WeightId,
+    inferred: &Dim,
+    declared: &Dim,
+) -> Option<ReshapeHint> {
+    // Only handle the "inferred is Mul containing declared as a
+    // factor" shape. Bail on any other combination for now.
+    let Dim::Mul(factors) = inferred else {
+        return None;
+    };
+    // The factors OTHER than `declared` form the prefix that gets
+    // split out into a new axis.
+    let mut split_factors: Vec<Dim> = Vec::with_capacity(factors.len());
+    let mut found_declared = false;
+    for f in factors {
+        if !found_declared && dims_structurally_equal(f, declared) {
+            found_declared = true;
+            continue;
+        }
+        split_factors.push(f.clone());
+    }
+    if !found_declared || split_factors.is_empty() {
+        return None;
+    }
+    // Find the consumer stmt that reads this weight, and the
+    // activation tile feeding that stmt's slot 0.
+    let (consumer_producer_local, consumer_shape) =
+        find_consumer_activation(program, &cx.locals, wid)?;
+    // Target shape = consumer's current last axis split into
+    // [split_factors..., declared]. E.g. [..., heads * head_dim]
+    // → [..., heads, head_dim]. For a rank-2 input `[T, heads*D]`
+    // the result is `[T, heads, D]`.
+    if consumer_shape.is_empty() {
+        return None;
+    }
+    let mut target_shape: Shape = consumer_shape[..consumer_shape.len() - 1].to_vec();
+    // `split_factors` may itself be a single Dim — still push it as one.
+    // Ordering: prefix factors, then declared last (so the LAST axis is
+    // what the consumer's signature unifies against w[0]).
+    match split_factors.len() {
+        1 => target_shape.push(split_factors.into_iter().next().unwrap()),
+        _ => target_shape.push(canonical_mul(split_factors)),
+    }
+    target_shape.push(declared.clone());
+    Some(ReshapeHint {
+        producer_local: consumer_producer_local,
+        target_shape,
+        weight_id: wid,
+    })
+}
+
+/// Walk the program's statements looking for a call whose args include
+/// `Expr::Weight { id: wid, .. }`. Return `(activation_local,
+/// activation_shape)` where the activation is the first `Expr::Local`
+/// arg of that call.
+fn find_consumer_activation(
+    program: &Program,
+    locals: &HashMap<LocalId, Shape>,
+    wid: WeightId,
+) -> Option<(LocalId, Shape)> {
+    fn walk(
+        stmts: &[Stmt],
+        locals: &HashMap<LocalId, Shape>,
+        wid: WeightId,
+    ) -> Option<(LocalId, Shape)> {
+        for s in stmts {
+            match s {
+                Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => {
+                    if let Expr::Call { args, .. } = value {
+                        let has_weight = args
+                            .iter()
+                            .any(|a| matches!(a, Expr::Weight { id, .. } if *id == wid));
+                        if has_weight {
+                            let activation = args.iter().find_map(|a| match a {
+                                Expr::Local(id) => Some(*id),
+                                _ => None,
+                            })?;
+                            let shape = locals.get(&activation)?.clone();
+                            return Some((activation, shape));
+                        }
+                    }
+                }
+                Stmt::For { body, .. } => {
+                    if let Some(hit) = walk(body, locals, wid) {
+                        return Some(hit);
+                    }
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    if let Some(hit) = walk(then_body, locals, wid) {
+                        return Some(hit);
+                    }
+                    if let Some(hit) = walk(else_body, locals, wid) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+        None
+    }
+    walk(&program.statements, locals, wid)
+}
+
+/// Rewrite `program` in place to materialize every `ReshapeHint`:
+/// - Allocate a fresh `LocalId` for the reshaped view.
+/// - Record the hint's `target_shape` under that id in
+///   `program.reshape_targets`.
+/// - Walk the program; in every statement that reads `producer_local`
+///   (directly, via `Expr::Local`), rewrite that read to point at the
+///   new local.
+/// - Insert the synthesized `Reshape` statement right before the
+///   first rewritten stmt in each scope.
+///
+/// Intended to be called in the recovery loop: `infer` returns
+/// `ReshapeRecovery { hints }`, caller applies via this fn, calls
+/// `infer` again. A well-formed hint set resolves on the second pass.
+pub fn apply_reshape_hints(program: &mut Program, hints: &[ReshapeHint]) {
+    for hint in hints {
+        let producer = hint.producer_local;
+        let debug_name = program.locals.name(producer).clone();
+        // Fresh local for the reshaped view. Name embeds the producer's
+        // name for traceability in emitted source.
+        let reshaped_name = syn::Ident::new(
+            &format!("{}_reshaped", debug_name),
+            proc_macro2::Span::call_site(),
+        );
+        let new_local = program.locals.push(reshaped_name);
+        program
+            .reshape_targets
+            .insert(new_local, hint.target_shape.clone());
+
+        // Rewrite every downstream read of `producer` to read the new
+        // local instead, and insert a `Reshape` stmt at the first
+        // rewrite site within each block. The walker tracks a flag
+        // per block so the insertion happens exactly once (right
+        // before the first consumer stmt) and subsequent consumers
+        // just use the already-introduced reshape binding.
+        rewrite_and_insert(&mut program.statements, producer, new_local, &mut false);
+    }
+}
+
+/// Recurse through stmts. Whenever a stmt reads `producer`, rewrite
+/// it to read `replacement` instead; before the first such stmt in
+/// each block, inject the synthesized Reshape stmt.
+fn rewrite_and_insert(
+    stmts: &mut Vec<Stmt>,
+    producer: LocalId,
+    replacement: LocalId,
+    inserted_in_this_block: &mut bool,
+) {
+    let mut i = 0;
+    while i < stmts.len() {
+        // Recurse first so nested rewrites happen before we touch this
+        // stmt (for If/For arms).
+        match &mut stmts[i] {
+            Stmt::For { body, .. } => {
+                let mut child_flag = false;
+                rewrite_and_insert(body, producer, replacement, &mut child_flag);
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let mut t_flag = false;
+                rewrite_and_insert(then_body, producer, replacement, &mut t_flag);
+                let mut e_flag = false;
+                rewrite_and_insert(else_body, producer, replacement, &mut e_flag);
+            }
+            _ => {}
+        }
+
+        // Check if this stmt reads `producer` directly in its value
+        // expression. If yes, rewrite the read AND (on first match in
+        // this block) inject a Reshape stmt right before it.
+        let reads_producer = stmt_reads_local(&stmts[i], producer);
+        if reads_producer {
+            if !*inserted_in_this_block {
+                let reshape_stmt = Stmt::Assign {
+                    target: replacement,
+                    value: Expr::Call {
+                        op: OpKind::Reshape,
+                        args: vec![Expr::Local(producer)],
+                    },
+                };
+                stmts.insert(i, reshape_stmt);
+                *inserted_in_this_block = true;
+                i += 1; // skip past the just-inserted reshape
+            }
+            rewrite_local_reads(&mut stmts[i], producer, replacement);
+        }
+        i += 1;
+    }
+}
+
+/// True if `stmt`'s top-level `value` expression reads `producer`
+/// directly (as `Expr::Local(producer)`) at any depth of nested
+/// `Expr::Call` / `Expr::Mul` / `Expr::Add`. Doesn't recurse into
+/// child blocks (`For::body`, `If::then_body`, `If::else_body`) —
+/// that's handled by the outer walker.
+fn stmt_reads_local(stmt: &Stmt, producer: LocalId) -> bool {
+    let value = match stmt {
+        Stmt::Assign { value, .. } => value,
+        Stmt::AssignTuple { value, .. } => value,
+        Stmt::For { .. } | Stmt::If { .. } => return false,
+    };
+    expr_reads_local(value, producer)
+}
+
+fn expr_reads_local(expr: &Expr, producer: LocalId) -> bool {
+    match expr {
+        Expr::Local(id) => *id == producer,
+        Expr::Call { args, .. } => args.iter().any(|a| expr_reads_local(a, producer)),
+        Expr::Mul { lhs, rhs } | Expr::Add { lhs, rhs } => {
+            expr_reads_local(lhs, producer) || expr_reads_local(rhs, producer)
+        }
+        _ => false,
+    }
+}
+
+/// Rewrite every `Expr::Local(producer)` read in `stmt`'s top-level
+/// value expression to `Expr::Local(replacement)`. Doesn't recurse
+/// into child blocks.
+fn rewrite_local_reads(stmt: &mut Stmt, producer: LocalId, replacement: LocalId) {
+    let value = match stmt {
+        Stmt::Assign { value, .. } => value,
+        Stmt::AssignTuple { value, .. } => value,
+        Stmt::For { .. } | Stmt::If { .. } => return,
+    };
+    rewrite_expr_reads(value, producer, replacement);
+}
+
+fn rewrite_expr_reads(expr: &mut Expr, producer: LocalId, replacement: LocalId) {
+    match expr {
+        Expr::Local(id) if *id == producer => *id = replacement,
+        Expr::Call { args, .. } => {
+            for a in args {
+                rewrite_expr_reads(a, producer, replacement);
+            }
+        }
+        Expr::Mul { lhs, rhs } | Expr::Add { lhs, rhs } => {
+            rewrite_expr_reads(lhs, producer, replacement);
+            rewrite_expr_reads(rhs, producer, replacement);
+        }
+        _ => {}
+    }
+}
+
 struct InferCtx {
     solver: Solver,
     locals: HashMap<LocalId, Shape>,
     weights: HashMap<WeightId, Shape>,
+    /// Copy of `Program::reshape_targets` — on the second inference
+    /// pass (after `apply_reshape_hints` has rewritten the program),
+    /// synthesized `OpKind::Reshape` statements look up their output
+    /// shape here instead of going through `apply_signature`.
+    reshape_targets: HashMap<LocalId, Shape>,
 }
 
 impl InferCtx {
-    fn new() -> Self {
+    fn from_program(program: &Program) -> Self {
         Self {
             solver: Solver::new(),
             locals: HashMap::new(),
             weights: HashMap::new(),
+            reshape_targets: program.reshape_targets.clone(),
         }
     }
 
-    fn infer_stmts(&mut self, stmts: &[Stmt]) -> Result<(), ShapeError> {
+    fn infer_stmts(&mut self, stmts: &[Stmt], program: &Program) -> Result<(), ShapeError> {
         for s in stmts {
-            self.infer_stmt(s)?;
+            self.infer_stmt(s, program)?;
         }
         Ok(())
     }
@@ -694,9 +1135,34 @@ impl InferCtx {
         }
     }
 
-    fn infer_stmt(&mut self, stmt: &Stmt) -> Result<(), ShapeError> {
+    fn infer_stmt(&mut self, stmt: &Stmt, program: &Program) -> Result<(), ShapeError> {
         match stmt {
             Stmt::Assign { target, value } => {
+                // Synthesized `Reshape` stmts bypass the signature
+                // machinery — their output shape comes from
+                // `Program::reshape_targets`. Validate the input is
+                // consumable (to catch malformed synthesized programs)
+                // but ignore the computed input shape for typing.
+                if let Expr::Call {
+                    op: OpKind::Reshape,
+                    args,
+                } = value
+                {
+                    for a in args {
+                        self.expr_shape(a)?;
+                    }
+                    let shape = self.reshape_targets.get(target).cloned().ok_or_else(|| {
+                        ShapeError::BadArgs {
+                            op: OpKind::Reshape,
+                            reason: format!(
+                                "synthesized Reshape target {target:?} missing from \
+                                 Program::reshape_targets"
+                            ),
+                        }
+                    })?;
+                    self.locals.insert(*target, shape);
+                    return Ok(());
+                }
                 let shape = self.infer_expr(value)?;
                 self.locals.insert(*target, shape);
                 Ok(())
@@ -760,7 +1226,7 @@ impl InferCtx {
                 // iteration index. Loop-carried locals need their
                 // outer/inner shapes unified so Phase 6 can rewire
                 // bindings across iterations consistently.
-                self.infer_stmts(body)?;
+                self.infer_stmts(body, program)?;
                 for (outer, inner) in loop_carry {
                     let outer_shape = self.locals.get(outer).cloned();
                     let inner_shape = self.locals.get(inner).cloned();
@@ -796,8 +1262,8 @@ impl InferCtx {
                 // unify — a read after the `if` sees one or the
                 // other at runtime, but downstream ops need a
                 // single shape for the merge binding either way.
-                self.infer_stmts(then_body)?;
-                self.infer_stmts(else_body)?;
+                self.infer_stmts(then_body, program)?;
+                self.infer_stmts(else_body, program)?;
                 for (merge_id, then_final, else_final) in merge_carry {
                     let then_shape = self.locals.get(then_final).cloned();
                     let else_shape = self.locals.get(else_final).cloned();
@@ -1041,7 +1507,12 @@ mod tests {
     #[test]
     fn embed_output_is_num_tokens_hidden_size() {
         let p = classify_src("hidden_states = embed(input_ids, embed_tokens);");
-        let inf = infer(&p).expect("infer");
+        let inf = infer(
+            &p,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("infer");
 
         // There's exactly one local: hidden_states.
         assert_eq!(inf.locals.len(), 1);
@@ -1072,7 +1543,12 @@ mod tests {
             }
             "#,
         );
-        let inf = infer(&p).expect("infer");
+        let inf = infer(
+            &p,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("infer");
 
         // Find q_proj's weight id via its path.
         let q_proj_id = p
@@ -1139,7 +1615,12 @@ mod tests {
             }
             "#,
         );
-        let inf = infer(&p).expect("infer");
+        let inf = infer(
+            &p,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("infer");
 
         let gate_id = p.weights.path_for_test(&["mlp", "gate_proj"]).unwrap();
         assert_eq!(

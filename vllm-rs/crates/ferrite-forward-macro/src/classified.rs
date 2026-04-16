@@ -95,6 +95,19 @@ pub enum OpKind {
     /// from `from_name` because `*` is a binary operator at the
     /// parse level rather than a named call.
     Mul,
+    /// Shape view — reinterprets a tensor under a different rank
+    /// without moving or copying data. Element count is preserved;
+    /// the codegen maps to `OwnedTensor::reshape` / `TensorView::reshape`
+    /// (metadata-only). Today Reshape tiles are **synthesized by
+    /// shape inference** when an op expects a factor of the
+    /// producer's last dim (e.g. per-head rmsnorm expects `[D]` but
+    /// upstream gemm produces `[..., heads * D]`). The target shape
+    /// is stored in [`Program::reshape_targets`] keyed by the new
+    /// local's id; inference re-reads it when typechecking the
+    /// synthesized statement. Not yet exposed to DSL authors via
+    /// `from_name` — add an entry there if a future pattern needs
+    /// explicit user-written reshape.
+    Reshape,
 }
 
 impl OpKind {
@@ -113,6 +126,9 @@ impl OpKind {
             "tanh_softcap" => Some(Self::TanhSoftCap),
             "add" => Some(Self::Add),
             "bias_add" => Some(Self::BiasAdd),
+            // `Reshape` is synthesized by shape inference, not DSL-
+            // writable today. Intentionally not listed in `from_name`;
+            // add the arm if a future pattern needs explicit reshape.
             _ => None,
         }
     }
@@ -131,6 +147,7 @@ impl OpKind {
             Self::Add => "add",
             Self::BiasAdd => "bias_add",
             Self::Mul => "mul",
+            Self::Reshape => "reshape",
         }
     }
 }
@@ -144,6 +161,19 @@ pub struct Program {
     /// Path segments for each WeightId (for diagnostics and
     /// runtime weight lookup).
     pub weights: WeightTable,
+    /// Target shapes for synthesized `Reshape` statements. Keyed by
+    /// the LocalId of the reshape's output (the newly-introduced
+    /// fresh local). Empty for DSL programs with no shape-mismatch
+    /// recoveries.
+    ///
+    /// Populated by `shape::infer` when a per-axis-factor mismatch
+    /// between a weight's declared shape and its consumer's inferred
+    /// shape is detected (e.g. Qwen3's per-head `q_norm` of shape
+    /// `[head_dim]` applied to a gemm output of shape `[..., heads *
+    /// head_dim]`). The synthesizer inserts a `Reshape` Stmt and
+    /// records the target shape here; the second inference pass
+    /// reads this map to typecheck the synthesized statement.
+    pub reshape_targets: std::collections::HashMap<LocalId, Vec<crate::shape::Dim>>,
 }
 
 /// Side table: `LocalId` → debug ident.

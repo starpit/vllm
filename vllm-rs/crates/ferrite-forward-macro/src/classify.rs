@@ -26,6 +26,7 @@ pub fn classify(ast: &ast::Ast) -> ClassifyResult<Program> {
         statements,
         locals: cx.locals,
         weights: cx.weights,
+        reshape_targets: std::collections::HashMap::new(),
     })
 }
 

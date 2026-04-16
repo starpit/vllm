@@ -11,9 +11,28 @@ default = []
 # numeric pipeline observations (NUM_TILES etc) are available;
 # the emitted runtime types stay gated out.
 cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda"]
+# Pulls in `hf-hub`, `safetensors`, `clap` etc for the
+# `probe-weights` binary — these are only needed when somebody
+# runs the prober, so they're gated off by default to keep the
+# ordinary library build fast.
+probe = ["dep:hf-hub", "dep:clap", "dep:ureq", "dep:serde"]
 
 [dependencies]
 ferrite-forward-macro = { path = "../ferrite-forward-macro" }
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 anyhow = { workspace = true }
+# Optional deps used only by the `probe-weights` bin under the
+# `probe` feature. `ureq` is a blocking HTTP client we use for
+# Range-request header-only reads of safetensors (avoiding the
+# multi-GB full-shard downloads `hf_hub::Api.get()` would do).
+hf-hub = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+ureq = { version = "2", optional = true, features = ["tls"] }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "probe-weights"
+path = "src/bin/probe_weights.rs"
+required-features = ["probe"]

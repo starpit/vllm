@@ -180,7 +180,12 @@ mod tests {
         };
         let ast = parse_block(block).unwrap();
         let program = classify(&ast).unwrap();
-        let inferred = infer(&program).unwrap();
+        let inferred = infer(
+            &program,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         let cfg = build_cfg(&program, &params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
@@ -222,7 +227,12 @@ mod tests {
         };
         let ast = parse_block(block).unwrap();
         let program = classify(&ast).unwrap();
-        let inferred = infer(&program).unwrap();
+        let inferred = infer(
+            &program,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         let cfg = build_cfg(&program, &params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
@@ -258,7 +268,12 @@ mod tests {
         };
         let ast = parse_block(block).unwrap();
         let program = classify(&ast).unwrap();
-        let inferred = infer(&program).unwrap();
+        let inferred = infer(
+            &program,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         let cfg = build_cfg(&program, &params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();

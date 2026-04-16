@@ -567,7 +567,12 @@ mod tests {
     /// Glue helper: classify → infer shapes → build CFG → unroll.
     fn unroll_src(src: &str, params: &ModelParams) -> Fuf {
         let program = classify_src(src);
-        let inferred = infer(&program).expect("infer");
+        let inferred = infer(
+            &program,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("infer");
         let cfg = build_cfg(&program, params).expect("build cfg");
         unroll(&cfg, &inferred).expect("unroll")
     }

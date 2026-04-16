@@ -41,7 +41,7 @@ mod schedule;
 mod shape;
 mod solver;
 mod target;
-mod weight_conventions;
+mod weights_manifest;
 
 // ── Attribute argument parsing ────────────────────────────────────
 
@@ -183,15 +183,19 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
     let target_path = base.join(args.target.value());
 
-    // ── Front end: parse + classify + shape-infer ─────────────────
+    // ── Front end: parse + classify ───────────────────────────────
     let ast = parse::parse_block(&carrier.block)
         .map_err(|e| syn::Error::new(args.span, format!("parse: {e}")))?;
-    let classified = classify::classify(&ast)
+    let mut classified = classify::classify(&ast)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
-    let inferred = shape::infer(&classified)
-        .map_err(|e| syn::Error::new(args.span, format!("shape infer: {e}")))?;
 
-    // ── Load configs + target + library ────────────────────────────
+    // ── Load configs + manifest + target ──────────────────────────
+    // Shape inference needs both the arch's `weights.json` manifest
+    // (for declared weight shapes) and one model's bounds (for
+    // numerical-equivalence anchoring). The prober's cross-size
+    // validation guarantees every model's bounds resolve the
+    // manifest's formulas consistently, so any one model's bounds
+    // suffice — we use the first (alphabetical) model.
     let models = config::load_dir(&models_dir).map_err(|e| {
         syn::Error::new(
             carrier.sig.ident.span(),
@@ -204,6 +208,37 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             format!("no *.json configs in {}", models_dir.display()),
         ));
     }
+    let manifest = weights_manifest::load_or_empty(&models_dir).map_err(|e| {
+        syn::Error::new(
+            carrier.sig.ident.span(),
+            format!("weights.json in {}: {e}", models_dir.display()),
+        )
+    })?;
+
+    // Shape inference may flag reshape-recoverable mismatches (e.g.
+    // per-head QK-norm in Qwen3/Gemma3). Catch those, synthesize the
+    // Reshape stmts into `classified`, and retry — downstream passes
+    // (CFG, FUF, solver, codegen) see a program with explicit reshape
+    // tiles. Bounded to one recovery pass: a clean hint set resolves
+    // on the second pass. Anything that doesn't is a compiler bug
+    // we'd rather surface than loop on.
+    let infer_bounds = &models[0].bounds;
+    let inferred = match shape::infer(&classified, &manifest, infer_bounds) {
+        Ok(inf) => inf,
+        Err(shape::ShapeError::ReshapeRecovery { hints }) => {
+            shape::apply_reshape_hints(&mut classified, &hints);
+            shape::infer(&classified, &manifest, infer_bounds).map_err(|e| {
+                syn::Error::new(
+                    args.span,
+                    format!("shape infer (after reshape recovery): {e}"),
+                )
+            })?
+        }
+        Err(e) => {
+            return Err(syn::Error::new(args.span, format!("shape infer: {e}")));
+        }
+    };
+
     let target_profile = target::load_file(&target_path).map_err(|e| {
         syn::Error::new(
             args.target.span(),
@@ -386,7 +421,7 @@ fn collect_dispatch_bounds(model: &config::ModelParams) -> Vec<u64> {
             *model.bounds.get(*k).unwrap_or_else(|| {
                 panic!(
                     "model `{}` is missing required bound `{k}`; add it to \
-                     config.json or to weight_conventions::derive_implicit_bounds",
+                     config.json or to config::derive_implicit_bounds",
                     model.source_stem,
                 )
             })

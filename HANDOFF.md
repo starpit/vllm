@@ -783,8 +783,52 @@ identical to Python vLLM (`" Paris. The capital of the United States
 is Washington"` on the same prompt), and the AWQ Llama-3.2-1B
 correctness golden passes end-to-end.
 
+**Prior session: weight shapes now come from per-arch
+`weights.json`; `weight_conventions.rs` is gone.** The old "global
+HF convention" table masquerading as universal was in reality a
+"dense-attn + SwiGLU LLM" table — only `embed_tokens` was truly
+cross-arch; everything else breaks for MLA/MoE/hybrid archs. That
+session replaced it with per-arch data, generated automatically:
+
+- **`model_architectures/<arch>/weights.json`** — per-arch shape
+  manifest. Keys are dotted weight paths (`self_attn.q_proj`,
+  `self_attn.q_norm`); values are shape formulas in bound names
+  from the arch's `config.json` (`["hidden_size",
+  "head_dim * num_attention_heads"]`). Generated for the four
+  existing arches: llama, qwen2, gemma2, granite.
+- **`probe-weights` binary** (`ferrite-forward --features probe
+  --bin probe-weights`) — bootstraps a new arch from HF. Downloads
+  each size's `config.json`, range-fetches the first ~4 MB of each
+  safetensors shard (header-only — the full multi-GB data is
+  never downloaded), extracts weight shapes, and rewrites integer
+  dims into bound-name products by cross-validating every formula
+  against every listed size's config. Tied-embedding models
+  (Gemma2, Granite, Qwen2.5-0.5B, SmolLM2) are detected
+  structurally (`embed_tokens` present but no `lm_head`) and get a
+  synthesized `lm_head` entry in compiler gemm order
+  (`[hidden_size, vocab_size]`).
+- **`weights_manifest.rs` + `shape.rs::infer`** — shape inference
+  loads the per-arch manifest and anchors weights against it via
+  **numerical-equivalence unification**. When structural unify
+  fails (e.g. Qwen2.5's coincidence of `hidden_size == heads *
+  head_dim`), both sides are evaluated against the first model's
+  bounds; if they resolve to the same integer, accept. Genuine
+  mismatches (Qwen3/Gemma3 per-head `q_norm` — declared
+  `[head_dim]` vs inferred `[heads * head_dim]`) route through
+  `detect_reshape_hint` which synthesizes `OpKind::Reshape` tiles.
+- **`OpKind::Reshape` + `ReshapeRefImpl`** — metadata-only view op
+  synthesized when the manifest declares an axis-factor mismatch.
+  Emits `TensorView::reshape(&[...])` with no allocation or
+  kernel launch.
+- **`model_architectures/README.md`** — documents the per-arch
+  recipe: `mkdir <arch>/` → commit upstream `config.json` per size
+  → run `probe-weights --arch <arch> <repo-ids>` → write DSL body
+  → wire into `cuda_worker.rs` → commit golden.
+- **`weight_conventions.rs` deleted.** `derive_implicit_bounds`
+  (head_dim/num_kv_heads defaulting) moved to `config.rs`.
+
 **Prior session: Qwen2 bias is now first-class math in the DSL.**
-Prior sessions had Qwen2's QKV bias riding silently through
+Earlier sessions had Qwen2's QKV bias riding silently through
 `LinearLayer::forward` — the DSL said `gemm()` but the runtime
 quietly did `gemm_bias`, which is exactly the "hide math inside an
 Impl" antipattern now documented in the "Inventing new OpKinds for

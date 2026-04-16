@@ -115,6 +115,10 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        // `weights.json` is the per-arch shape manifest loaded by
+        // `weights_manifest::load_or_empty`, not a model config.
+        // Filter it out of the per-model scan.
+        .filter(|p| p.file_name().and_then(|s| s.to_str()) != Some("weights.json"))
         .collect();
     // Sort by file stem, not full PathBuf. `PathBuf::cmp` compares
     // byte-by-byte including the extension, which puts
@@ -156,7 +160,7 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
         reason,
     })?;
     let mut bounds = extract_bounds(&json);
-    crate::weight_conventions::derive_implicit_bounds(&mut bounds);
+    derive_implicit_bounds(&mut bounds);
     let scalars = extract_scalars(&json);
     let quantization = crate::quantization::QuantizationConfig::parse(&json).map_err(|e| {
         ConfigError::Quantization {
@@ -211,6 +215,42 @@ fn extract_scalars(json: &serde_json::Value) -> BTreeMap<String, f64> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Apply HF's implicit config.json defaults to the bounds map.
+///
+/// HF configs are allowed to omit certain fields that have well-
+/// defined defaults. Without these, shape inference on an older
+/// config (like `llama-2-13b/config.json`, which omits `head_dim`)
+/// would leave `num_heads * head_dim` unclosed. The defaults are
+/// universal across every HF transformer — they live here, in the
+/// config loader, rather than getting baked into per-arch shape
+/// anchoring.
+///
+/// Defaults applied:
+/// - **`head_dim`** ← `hidden_size / num_attention_heads`. Llama-2
+///   and Llama-3 (pre-3.2) omit the field; Llama-3.2+, Qwen2.5+,
+///   Gemma2 list it explicitly. Both forms are valid HF JSON.
+/// - **`num_key_value_heads`** ← `num_attention_heads`. Configs
+///   predating grouped-query attention assume MHA and don't list
+///   the field.
+///
+/// Explicit values in the JSON always win — we only fill absent
+/// keys.
+fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
+    if !bounds.contains_key("head_dim")
+        && let (Some(&hidden), Some(&heads)) =
+            (bounds.get("hidden_size"), bounds.get("num_attention_heads"))
+        && heads != 0
+        && hidden.is_multiple_of(heads)
+    {
+        bounds.insert("head_dim".to_string(), hidden / heads);
+    }
+    if !bounds.contains_key("num_key_value_heads")
+        && let Some(&heads) = bounds.get("num_attention_heads")
+    {
+        bounds.insert("num_key_value_heads".to_string(), heads);
+    }
 }
 
 /// Normalize a file stem into a valid Rust identifier:
@@ -281,9 +321,10 @@ mod tests {
         let configs = load_dir(&dir).expect("load llama configs");
 
         // 9 Llama configs (405B gated, skipped) + smollm2-135m +
-        // llama-3.2-1b-awq (AWQ config committed for the Commit 3
-        // end-to-end slice).
-        assert_eq!(configs.len(), 11, "expected 11 Llama configs");
+        // smollm2-360m (second size gives `probe-weights` cross-size
+        // disambiguation) + llama-3.2-1b-awq (AWQ end-to-end slice
+        // committed on this branch).
+        assert_eq!(configs.len(), 12, "expected 12 Llama configs");
 
         // Ground-truth check on llama-3.2-1b. Published values:
         //   num_hidden_layers = 16

@@ -1036,6 +1036,129 @@ trivial_impl!(
     emit_gemm,
     true
 );
+
+// ── ReshapeRefImpl ───────────────────────────────────────────────
+//
+// Claims `OpKind::Reshape` tiles — metadata-only view changes
+// synthesized by shape inference to bridge axis-factor mismatches
+// (e.g. per-head QK-norm: rmsnorm on `[T, heads, head_dim]` where
+// upstream produced `[T, heads * head_dim]`). Emits a single
+// `TensorView::reshape(&[d0, d1, ...])` with concrete dims evaluated
+// from the tile's output shape via the model's bound table. No
+// allocation, no kernel launch.
+//
+// Declares an `output_alias` pointing at the upstream tile so the
+// codegen drop pass keeps the underlying `OwnedTensor` alive until
+// every consumer of the reshaped view is done.
+
+#[derive(Debug, Default)]
+pub struct ReshapeRefImpl;
+
+impl Implementation for ReshapeRefImpl {
+    fn name(&self) -> &'static str {
+        "reshape_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::Reshape)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        // Pure metadata change — a handful of nanoseconds host-side,
+        // zero on the GPU. Model as 0.0 so the solver never spends
+        // effort choosing between reshape variants.
+        0.0
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // The reshaped view aliases the upstream tile's OwnedTensor.
+        // The drop pass must keep the upstream alive until every
+        // consumer of this reshape is done.
+        let reshape_id = claimed_tiles[0];
+        let upstream = match fuf.get(reshape_id).inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((reshape_id, 0), upstream)]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let input = ctx.input_expr(tile, 0);
+        // Evaluate the target shape numerically. Each Dim is one of
+        // Lit/Bound/Mul; we fold into concrete u64 via the model's
+        // bound table. `reshape_recovery` only emits Mul/Bound over
+        // config.json dims, so every evaluation must succeed — a
+        // Var reaching this point is a compiler bug.
+        let shape = &ctx.fuf.get(tile).outputs[0];
+        let dims: Vec<usize> = shape
+            .iter()
+            .map(|d| eval_dim_usize(d, ctx).expect("reshape target dim must evaluate"))
+            .collect();
+        let dim_tokens: Vec<proc_macro2::TokenStream> =
+            dims.iter().map(|d| quote! { #d }).collect();
+        quote! {
+            let #out = unsafe { (#input).reshape(&[ #( #dim_tokens ),* ]) };
+        }
+    }
+}
+
+/// Evaluate a symbolic `Dim` to a concrete `usize` via the bound
+/// table embedded in the emit context. Panics if a `Var` is reached
+/// (shape inference should have closed every dim) or a bound is
+/// missing (the model config is incomplete).
+fn eval_dim_usize(d: &crate::shape::Dim, ctx: &EmitCtx) -> Option<usize> {
+    use crate::shape::Dim;
+    match d {
+        Dim::Lit(n) => Some(*n as usize),
+        Dim::Bound(name) => Some(ctx.bound(name) as usize),
+        Dim::Mul(factors) => factors
+            .iter()
+            .try_fold(1usize, |acc, f| eval_dim_usize(f, ctx).map(|v| acc * v)),
+        Dim::Var(_) => None,
+    }
+}
+
 // Silu and Mul have no singleton impls. The only kernel in
 // `ferrite-kernels` that implements them is `silu_and_mul_fused`,
 // which operates on a packed `[num_tokens, 2*intermediate]` buffer
@@ -1059,6 +1182,11 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(RmsNormRefImpl));
     lib.push(Box::new(GemmRefImpl));
     lib.push(Box::new(AttentionViaCacheImpl));
+    // Reshape is a metadata-only view op synthesized by shape
+    // inference to bridge axis-factor mismatches (e.g. per-head QK-
+    // norm in Qwen3/Gemma3). Zero-cost, zero-launch; the emitted
+    // code is a single `TensorView::reshape(&[..])` call.
+    lib.push(Box::new(ReshapeRefImpl));
     // Multi-tile fusions. The solver's claim-size-DESC sort picks
     // these over singleton coverage when both apply; the singletons
     // stay as fallbacks for tile positions the fusion doesn't match

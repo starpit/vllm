@@ -81,6 +81,15 @@ pub enum OpKind {
     /// large pre-softmax magnitudes.
     TanhSoftCap,
     Add,
+    /// Broadcast-add of a learned per-feature bias vector across the
+    /// batch/token dimensions: `bias_add(x: [..., D], b: [D]) -> [..., D]`.
+    /// Semantically distinct from `Add` — `Add` is same-shape
+    /// elementwise (residual stream), `BiasAdd` is a vector
+    /// broadcast-add (affine-transform completion). Kept as its own
+    /// op so fusion patterns that fold bias into a GEMM epilog
+    /// (`(Gemm, BiasAdd)` → cuBLAS `gemm_bias`) can match distinctly
+    /// from patterns that consume residual `Add`.
+    BiasAdd,
     /// Elementwise multiplication. Produced by the DSL's `*`
     /// operator (e.g. `gate * up` in the SwiGLU MLP). Not reachable
     /// from `from_name` because `*` is a binary operator at the
@@ -103,6 +112,7 @@ impl OpKind {
             "gelu" => Some(Self::Gelu),
             "tanh_softcap" => Some(Self::TanhSoftCap),
             "add" => Some(Self::Add),
+            "bias_add" => Some(Self::BiasAdd),
             _ => None,
         }
     }
@@ -119,6 +129,7 @@ impl OpKind {
             Self::Gelu => "gelu",
             Self::TanhSoftCap => "tanh_softcap",
             Self::Add => "add",
+            Self::BiasAdd => "bias_add",
             Self::Mul => "mul",
         }
     }

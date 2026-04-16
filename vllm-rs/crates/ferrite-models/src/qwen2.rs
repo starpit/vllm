@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Qwen2 / Qwen2.5 — same math as Llama, differs only in that the
-//! QKV projections carry bias. Ferrite's fused-QKV weight accessor
-//! uses `LinearLayer::load_dense_concat` which auto-detects biases
-//! on the source weights and packs them into the fused `LinearLayer`;
-//! `Linear::forward` then fuses the bias add into cuBLAS's GEMM epilog
-//! via `gemm_bias`. No DSL-level `bias_add` op is needed.
+//! Qwen2 / Qwen2.5 — same math as Llama except the QKV projections
+//! carry a learned bias term. The bias is explicit in the DSL as a
+//! `bias_add` tile; the solver's `FusedQkvRopeCacheImpl` /
+//! `FusedQkvRopePrefillImpl` claim the `(Gemm, BiasAdd) × 3 + RopeAppend`
+//! pattern and emit cuBLAS `gemm_bias` on the packed weight — so the
+//! bias rides through one fused kernel launch, not a separate add.
 //!
 //! One `#[forward]` body per architecture; per-model configs fan out
 //! via `model_architectures/qwen2/*.json`.
@@ -20,8 +20,11 @@ fn qwen2() {
     for layer in 0..num_hidden_layers {
         normed = rmsnorm(hidden_states, input_layernorm[layer]);
         q = gemm(normed, self_attn.q_proj[layer]);
+        q = bias_add(q, self_attn.q_proj.bias[layer]);
         k = gemm(normed, self_attn.k_proj[layer]);
+        k = bias_add(k, self_attn.k_proj.bias[layer]);
         v = gemm(normed, self_attn.v_proj[layer]);
+        v = bias_add(v, self_attn.v_proj.bias[layer]);
         (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
         attn = attention(q, k, v, kv_cache[layer], block_table);
         oproj = gemm(attn, self_attn.o_proj[layer]);

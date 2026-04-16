@@ -811,18 +811,21 @@ fn emit_rmsnorm(ctx: &EmitCtx) -> TokenStream {
 }
 
 fn emit_gemm(ctx: &EmitCtx) -> TokenStream {
+    // `gemm()` in the DSL is strict matmul. Bias is a separate
+    // `bias_add` tile and is claimed by its own Impl (e.g.
+    // `FusedGemmBiasImpl` fuses an adjacent `(Gemm, BiasAdd)` into
+    // cuBLAS's gemm_bias epilog). If the user passes a `LinearLayer`
+    // that carries a bias but the DSL doesn't say `bias_add`, the
+    // bias is silently ignored here — the stray bias_add, if it
+    // exists, surfaces elsewhere as `UnclaimedTile`. This mirrors
+    // cutlass's `.dense_weight()` emit path.
     let tile = ctx.primary();
     let out = ctx.output_ident(tile, 0);
     let x = ctx.input_expr(tile, 0);
     let w = ctx.input_expr(tile, 1);
     quote! {
         let #out = unsafe {
-            (#w).forward(
-                #x,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            )
+            device.cublas.gemm(*(#x), (#w).dense_weight(), &mut device.caching)
         };
     }
 }
@@ -1061,6 +1064,11 @@ pub fn starter_library() -> ImplementationLibrary {
     // stay as fallbacks for tile positions the fusion doesn't match
     // (e.g. the first layer's input_layernorm, whose upstream is
     // `embed` not `Add`, stays a singleton RmsNorm claim).
+    //
+    // `(Gemm, BiasAdd)` pairs not absorbed by a larger fusion (e.g.
+    // a lone affine-transform gemm that's not a QKV-pre-rope or
+    // gate/up-pre-MLP). Emits cuBLAS gemm_bias via `LinearLayer::forward`.
+    lib.push(Box::new(FusedGemmBiasImpl));
     lib.push(Box::new(FusedGateUpSiluMulImpl));
     lib.push(Box::new(FusedGateUpGeluMulImpl));
     lib.push(Box::new(FusedAddRmsNormImpl));
@@ -1125,6 +1133,192 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(MarlinFusedQkvRopeCacheImpl));
     lib.push(Box::new(MarlinFusedQkvRopePrefillImpl));
     lib
+}
+
+// ── FusedGemmBiasImpl ────────────────────────────────────────────
+//
+// 2-tile fusion: `(Gemm, BiasAdd)` where BiasAdd consumes the Gemm's
+// output at its first input slot. Emits `LinearLayer::forward` on a
+// packed accessor covering (weight, bias) — the dense variant
+// dispatches to cuBLAS's `gemm_bias` epilog, producing the biased
+// result in one launch.
+//
+// This is the fallback path for affine-transform gemms not absorbed
+// by a larger fusion (e.g. `FusedQkvRopeCacheImpl` absorbs Qwen2's
+// QKV pre-rope `(Gemm, BiasAdd) × 3` triples, so this impl only
+// claims stray pairs elsewhere in the body).
+//
+// Required weights: one fused accessor carrying both the Gemm's
+// weight ref and the BiasAdd's bias ref. The user returns a
+// `LinearLayer::Dense` with its `bias: Some(...)` populated —
+// `LinearLayer::load_dense` already auto-detects bias from the
+// safetensors path, so most callers get this for free.
+
+#[derive(Debug, Default)]
+pub struct FusedGemmBiasImpl;
+
+impl Implementation for FusedGemmBiasImpl {
+    fn name(&self) -> &'static str {
+        "fused_gemm_bias"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let seed_node = fuf.get(seed);
+        if seed_node.op != OpKind::Gemm {
+            return None;
+        }
+        // Find a BiasAdd tile whose first tile input is this Gemm.
+        // BiasAdd's shape sig is `(x, b) -> x` with `x` at slot 0 and
+        // `b` at slot 1 (the bias weight, not a tile).
+        let bias_node = fuf.nodes.iter().find(|n| {
+            n.op == OpKind::BiasAdd
+                && matches!(
+                    n.inputs.first(),
+                    Some(FufInput::Tile { id, .. }) if *id == seed
+                )
+        })?;
+        let bias_id = bias_node.id;
+
+        let mut claimed = vec![seed, bias_id];
+        claimed.sort();
+
+        // Boundary inputs: the gemm's upstream activation tile(s).
+        let activation_inputs: Vec<TileId> = seed_node
+            .inputs
+            .iter()
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: activation_inputs,
+            // Only BiasAdd's output is live downstream — the Gemm's
+            // intermediate output is consumed inside the fused kernel.
+            boundary_outputs: vec![bias_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // cuBLAS `gemm_bias` has a negligible epilog cost on top of
+        // the underlying GEMM — delegate to `cost_gemm` on the Gemm
+        // tile so this impl stays on the same measurement scale as
+        // singleton GemmRefImpl / CutlassGemmImpl. The DP's cost
+        // comparison between (strict gemm + orphaned bias_add) and
+        // (fused gemm_bias) will always prefer the fusion because
+        // the alternative is `f64::INFINITY` (BiasAdd has no
+        // singleton impl) — cost parity is not a correctness
+        // concern here, only a calibration one.
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
+            .expect("claim contains Gemm");
+        let gemm_info = MatchInfo {
+            claimed_tiles: vec![gemm_id],
+            boundary_inputs: vec![],
+            boundary_outputs: vec![gemm_id],
+        };
+        cost_gemm(&gemm_info, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Single accessor typed `LinearLayer`, source = the Gemm's
+        // weight. The bias rides through the accessor's
+        // `.dense_bias()` field; the user's loader (typically
+        // `LinearLayer::load_dense`) auto-detects it from the
+        // safetensors path `<prefix>.bias`. `emit_call` asserts
+        // `dense_bias().is_some()` at runtime so a data/DSL mismatch
+        // surfaces loudly instead of silently dropping the bias.
+        let gemm_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("claim contains Gemm");
+        let gemm_weight = first_weight_ref(fuf.get(gemm_id)).expect("gemm has a weight");
+        let sources = vec![gemm_weight];
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let gemm_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
+            .expect("claim contains Gemm");
+        let bias_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::BiasAdd)
+            .expect("claim contains BiasAdd");
+
+        let activation = ctx.input_expr(gemm_id, 0);
+        let gemm_weight = first_weight_ref(ctx.fuf.get(gemm_id)).expect("gemm weight ref");
+        let fused_name = fused_accessor_name(ctx.program, &[gemm_weight]);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let out = ctx.output_ident(bias_id, 0);
+        quote! {
+            let #out = unsafe {
+                debug_assert!(
+                    (#weight_expr).dense_bias().is_some(),
+                    "FusedGemmBiasImpl: DSL `bias_add` claimed but \
+                     LinearLayer has no bias — check safetensors path"
+                );
+                (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
 }
 
 // ── FusedGateUpSiluMulImpl ───────────────────────────────────────
@@ -2683,6 +2877,36 @@ fn rope_kv_cache_layer(node: &crate::fuf::FufNode) -> Option<u64> {
     })
 }
 
+/// Resolve a tile to `(gemm_tile, maybe_bias_add_tile)`:
+/// - `(g, None)`    if `tile` is directly a `Gemm`.
+/// - `(g, Some(b))` if `tile` is a `BiasAdd` whose first tile input
+///   is a `Gemm`.
+/// - `None`         otherwise.
+///
+/// Used by the QKV-fused impls (`FusedQkvRopeCacheImpl`,
+/// `FusedQkvRopePrefillImpl`) so that the DSL can write
+/// `gemm → bias_add → rope_append` (Qwen2/Qwen3 style with explicit
+/// QKV bias) or `gemm → rope_append` (Llama style, no bias) and have
+/// the same fusion claim both shapes.
+fn unwrap_gemm_through_bias(fuf: &Fuf, tile: TileId) -> Option<(TileId, Option<TileId>)> {
+    let node = fuf.get(tile);
+    match node.op {
+        OpKind::Gemm => Some((tile, None)),
+        OpKind::BiasAdd => {
+            let upstream = node.inputs.iter().find_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })?;
+            if fuf.get(upstream).op == OpKind::Gemm {
+                Some((upstream, Some(tile)))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 impl Implementation for FusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         "fused_qkv_rope_cache"
@@ -2711,15 +2935,22 @@ impl Implementation for FusedQkvRopeCacheImpl {
             return None;
         }
 
-        // Find a RopeAppend whose first three Tile inputs all point
-        // at Gemm tiles sharing a common activation. The seed must
-        // be one of those three Gemms.
+        // Find a RopeAppend whose first three Tile inputs all resolve
+        // (directly or through a `BiasAdd` wrapper) to Gemm tiles
+        // sharing a common activation. The seed must be one of those
+        // three Gemms.
+        //
+        // Bias presence must be uniform across Q/K/V — either all
+        // three are Gemm→BiasAdd→RopeAppend (Qwen2/Qwen3 with QKV
+        // bias) or all three are Gemm→RopeAppend (Llama, bias-less).
+        // Mixed would be a DSL-level inconsistency; we reject to
+        // surface it as UnclaimedTile rather than silently do the
+        // wrong thing.
         let rope_node = fuf.nodes.iter().find(|n| {
             if n.op != OpKind::RopeAppend || n.inputs.len() < 3 {
                 return false;
             }
-            // First three inputs must all be Tile references.
-            let qkv: Vec<TileId> = n
+            let qkv_raw: Vec<TileId> = n
                 .inputs
                 .iter()
                 .take(3)
@@ -2728,24 +2959,34 @@ impl Implementation for FusedQkvRopeCacheImpl {
                     _ => None,
                 })
                 .collect();
-            if qkv.len() != 3 {
+            if qkv_raw.len() != 3 {
                 return false;
             }
-            if !qkv.contains(&seed) {
+            // Resolve each of the three to `(gemm, maybe_bias)`.
+            let resolved: Option<Vec<(TileId, Option<TileId>)>> = qkv_raw
+                .iter()
+                .map(|t| unwrap_gemm_through_bias(fuf, *t))
+                .collect();
+            let Some(resolved) = resolved else {
+                return false;
+            };
+            // Uniform bias presence.
+            let biased = resolved[0].1.is_some();
+            if resolved.iter().any(|r| r.1.is_some() != biased) {
                 return false;
             }
-            // All three must be Gemms.
-            if qkv.iter().any(|t| fuf.get(*t).op != OpKind::Gemm) {
+            let gemms: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
+            if !gemms.contains(&seed) {
                 return false;
             }
-            // All three must share the same activation (first Tile input).
-            let act = first_tile_input(fuf.get(qkv[0]));
-            act.is_some() && qkv.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
+            // All three gemms must share the same activation.
+            let act = first_tile_input(fuf.get(gemms[0]));
+            act.is_some() && gemms.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
         })?;
         let rope_id = rope_node.id;
 
-        // Extract the three Gemm tile ids.
-        let qkv_ids: Vec<TileId> = rope_node
+        // Resolve the three rope tile-inputs to (gemm, maybe_bias).
+        let qkv_raw: Vec<TileId> = rope_node
             .inputs
             .iter()
             .take(3)
@@ -2754,15 +2995,22 @@ impl Implementation for FusedQkvRopeCacheImpl {
                 _ => None,
             })
             .collect();
-
-        let mut claimed: Vec<TileId> = qkv_ids
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
             .iter()
-            .copied()
-            .chain(std::iter::once(rope_id))
+            .map(|t| unwrap_gemm_through_bias(fuf, *t).expect("already validated in find"))
             .collect();
+
+        let mut claimed: Vec<TileId> = Vec::with_capacity(7);
+        for (g, b) in &resolved {
+            claimed.push(*g);
+            if let Some(b) = b {
+                claimed.push(*b);
+            }
+        }
+        claimed.push(rope_id);
         claimed.sort();
 
-        let activation = first_tile_input(fuf.get(qkv_ids[0]))?.0;
+        let activation = first_tile_input(fuf.get(resolved[0].0))?.0;
         Some(MatchInfo {
             claimed_tiles: claimed,
             boundary_inputs: vec![activation],
@@ -2857,7 +3105,16 @@ impl Implementation for FusedQkvRopeCacheImpl {
         fuf: &Fuf,
         program: &Program,
     ) -> Vec<WeightAccessor> {
-        // Collect the three Gemms' weight refs → one fused accessor.
+        // One fused accessor covering the three Gemm weights — the
+        // bias vectors (if present) ride through the accessor's
+        // `LinearLayer::dense_bias()` output and `emit_call` asserts
+        // their presence whenever the DSL claimed BiasAdd tiles. The
+        // user populates the accessor with a `LinearLayer::Dense`
+        // whose `weight` is the concatenated `[q | k | v]`; if the
+        // underlying model carries biases, `bias` is the concatenated
+        // `[q_b | k_b | v_b]`. `LinearLayer::load_dense_concat(gw,
+        // prefixes, stream)` does exactly that: auto-detects bias on
+        // the source prefixes and streams into one packed tensor.
         let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
             .iter()
             .filter_map(|t| {
@@ -2878,7 +3135,9 @@ impl Implementation for FusedQkvRopeCacheImpl {
     }
 
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Identify the RopeAppend tile and the three Gemms by op kind.
+        // Identify the RopeAppend tile. The three Gemm tiles come via
+        // `unwrap_gemm_through_bias` on the rope's first three tile
+        // inputs — which strips an optional BiasAdd wrapper.
         let rope_id = *ctx
             .claimed_tiles
             .iter()
@@ -2886,8 +3145,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
             .expect("claim must contain a RopeAppend");
         let rope_node = ctx.fuf.get(rope_id);
 
-        // The three Gemms are rope_node.inputs[0..3]'s tile ids.
-        let qkv_ids: Vec<TileId> = rope_node
+        let qkv_raw: Vec<TileId> = rope_node
             .inputs
             .iter()
             .take(3)
@@ -2896,15 +3154,27 @@ impl Implementation for FusedQkvRopeCacheImpl {
                 _ => None,
             })
             .collect();
-        assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
+        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| {
+                unwrap_gemm_through_bias(ctx.fuf, *t)
+                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+        let biased = resolved[0].1.is_some();
+        let qkv_ids: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
         // Use first Gemm (q_gemm) as the "representative" for activation.
-        let gate_gemm_id = qkv_ids[0];
-        let activation = ctx.input_expr(gate_gemm_id, 0);
+        let q_gemm_id = qkv_ids[0];
+        let activation = ctx.input_expr(q_gemm_id, 0);
 
-        // Fused weight accessor — name reconstructed from claim.
+        // Fused weight accessor — source_weights is the three Gemm
+        // weights. The accessor's `LinearLayer` carries an optional
+        // bias auto-populated by `load_dense_concat`; we assert its
+        // presence below when the DSL claimed BiasAdd tiles.
         let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
             .iter()
-            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm weight"))
             .collect();
         let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
         let weight_expr = ctx.weight_accessor(&fused_name);
@@ -2934,6 +3204,22 @@ impl Implementation for FusedQkvRopeCacheImpl {
         let k_out = ctx.output_ident(rope_id, 1);
         let v_out = ctx.output_ident(rope_id, 2);
 
+        // If the DSL's rope chain includes BiasAdd tiles, require the
+        // packed LinearLayer to actually carry a bias — otherwise
+        // `.forward()` would silently call `cublas.gemm` (no bias)
+        // and the bias_add math in the DSL would be dropped.
+        let bias_assert = if biased {
+            quote! {
+                debug_assert!(
+                    (#weight_expr).dense_bias().is_some(),
+                    "FusedQkvRopeCacheImpl: DSL `bias_add` on QKV claimed but \
+                     packed LinearLayer has no bias — check safetensors path"
+                );
+            }
+        } else {
+            quote! {}
+        };
+
         quote! {
             // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
             // then fused RoPE + paged-cache write. The packed QKV
@@ -2942,6 +3228,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
             // FP8 KV-cache path branches at runtime: the cache dtype
             // is a per-model property known only at load time.
             let #q_out = unsafe {
+                #bias_assert
                 let qkv_packed = (#weight_expr).forward(
                     #activation,
                     &mut device.cublas,
@@ -3246,7 +3533,9 @@ impl Implementation for FusedQkvRopePrefillImpl {
             .expect("claim must contain a RopeAppend");
         let rope_node = ctx.fuf.get(rope_id);
 
-        let qkv_ids: Vec<TileId> = rope_node
+        // Resolve rope's three tile inputs to underlying Gemms, stripping
+        // optional BiasAdd wrappers (matches `FusedQkvRopeCacheImpl`).
+        let qkv_raw: Vec<TileId> = rope_node
             .inputs
             .iter()
             .take(3)
@@ -3255,12 +3544,24 @@ impl Implementation for FusedQkvRopePrefillImpl {
                 _ => None,
             })
             .collect();
-        assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
-        let activation = ctx.input_expr(qkv_ids[0], 0);
-
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
+        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
             .iter()
-            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+            .map(|t| {
+                unwrap_gemm_through_bias(ctx.fuf, *t)
+                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+        let biased = resolved[0].1.is_some();
+        let q_gemm_id = resolved[0].0;
+        let activation = ctx.input_expr(q_gemm_id, 0);
+
+        // Source weights: 3 Gemm weights (biases auto-ride through
+        // the packed LinearLayer). Must match `required_weights` so
+        // `fused_accessor_name` resolves identically.
+        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
+            .iter()
+            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm weight"))
             .collect();
         let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
         let weight_expr = ctx.weight_accessor(&fused_name);
@@ -3279,6 +3580,18 @@ impl Implementation for FusedQkvRopePrefillImpl {
         let k_out = ctx.output_ident(rope_id, 1);
         let v_out = ctx.output_ident(rope_id, 2);
 
+        let bias_assert = if biased {
+            quote! {
+                debug_assert!(
+                    (#weight_expr).dense_bias().is_some(),
+                    "FusedQkvRopePrefillImpl: DSL `bias_add` on QKV claimed but \
+                     packed LinearLayer has no bias — check safetensors path"
+                );
+            }
+        } else {
+            quote! {}
+        };
+
         quote! {
             // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
             // then RoPE-split into contiguous Q/K/V. The packed QKV
@@ -3289,6 +3602,7 @@ impl Implementation for FusedQkvRopePrefillImpl {
             // so the K/V OwnedTensors remain available for contiguous
             // prefill attention.
             let (#q_out, #k_out, #v_out) = unsafe {
+                #bias_assert
                 let qkv_packed = (#weight_expr).forward(
                     #activation,
                     &mut device.cublas,
@@ -3781,13 +4095,16 @@ fn output_feeds_op(fuf: &Fuf, tile: TileId, op: OpKind) -> bool {
 }
 
 /// True if this Gemm tile is a fusion partner (Q/K/V of a
-/// RopeAppend, or gate/up of the `silu(gate) * up` pattern). The
-/// cutlass singletons must never claim these — their fused impls
-/// own them and the downstream chain has no singleton kernel.
+/// RopeAppend, or gate/up of the `silu(gate) * up` pattern, or a
+/// bias-carrying gemm whose output feeds a `bias_add`). The cutlass
+/// singletons must never claim these — their fused impls own them
+/// and the downstream chain has no singleton kernel for the
+/// fusion-partner op (Silu/Mul/RopeAppend/BiasAdd).
 fn gemm_is_fusion_partner(fuf: &Fuf, seed: TileId) -> bool {
     output_feeds_op(fuf, seed, OpKind::RopeAppend)
         || output_feeds_op(fuf, seed, OpKind::Silu)
         || output_feeds_op(fuf, seed, OpKind::Mul)
+        || output_feeds_op(fuf, seed, OpKind::BiasAdd)
 }
 
 /// Evaluate the `(M, N, K)` of a Gemm tile for CSV cost lookup.

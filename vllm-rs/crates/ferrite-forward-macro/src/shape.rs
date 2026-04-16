@@ -320,6 +320,7 @@ pub fn apply_signature(
         OpKind::Gelu => sig_unary_elementwise(solver, inputs, op),
         OpKind::TanhSoftCap => sig_unary_elementwise(solver, inputs, op),
         OpKind::Add => sig_binary_elementwise(solver, inputs, op),
+        OpKind::BiasAdd => sig_bias_add(solver, inputs),
         OpKind::Mul => sig_binary_elementwise(solver, inputs, op),
     }
 }
@@ -362,6 +363,30 @@ fn sig_rmsnorm(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeErro
         });
     }
     solver.unify(x.last().unwrap(), &w[0])?;
+    Ok(OpSig { output: x.clone() })
+}
+
+/// `bias_add(x: [..., D], b: [D])` → `[..., D]`. Same shape math as
+/// `rmsnorm` — both broadcast a rank-1 parameter over the last axis
+/// of the activation. Kept distinct so error messages name the right
+/// op and so `OpKind::BiasAdd` participates in its own fusion patterns.
+fn sig_bias_add(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::BiasAdd, inputs, 2)?;
+    let x = &inputs[0];
+    let b = &inputs[1];
+    if x.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::BiasAdd,
+            reason: "input must have rank >= 1".into(),
+        });
+    }
+    if b.len() != 1 {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::BiasAdd,
+            reason: format!("bias must have rank 1, got {}", b.len()),
+        });
+    }
+    solver.unify(x.last().unwrap(), &b[0])?;
     Ok(OpSig { output: x.clone() })
 }
 
@@ -549,6 +574,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Gelu => &[],
         OpKind::TanhSoftCap => &[],
         OpKind::Add => &[],
+        OpKind::BiasAdd => &[(1, 1)],
         OpKind::Mul => &[],
     }
 }

@@ -45,10 +45,11 @@
   the full forward for PP intermediate ranks. Quant / TP / PP /
   MoE / MLA models still route to the hand-written path for the
   reasons enumerated in the "Remaining gaps" section.
-  The **library is still a tiny fraction of the old one**: 9
-  Impls vs. the old library's ~1,400 kernel variants. Cost model
-  is analytical estimates vs. the old CSV lookup against 55k
-  rows of measured sweep data. See "Real gap inventory" below —
+  The **library is still a tiny fraction of the old one**: 10
+  Impls (after `FusedGemmBiasImpl` + `OpKind::BiasAdd` landed this
+  session) vs. the old library's ~1,400 kernel variants. Cost
+  model is analytical estimates vs. the old CSV lookup against
+  55k rows of measured sweep data. See "Real gap inventory" below —
   those gaps are perf work, not correctness work.
 
 ## Real gap inventory (what this compiler is missing vs old ferrite)
@@ -63,7 +64,7 @@ correctness or functionality.
 | 2 | **CSV cost tables** | `cost_l4_sm89.csv` (4k rows), `cost_l40s_sm89.csv` (16k), `cost_h100_sm90.csv` (32k); `GpuCostGrid` with `(M,N,K)` lookup + launch-overhead accounting | Analytical flops/bandwidth proxy | Solver picks blind |
 | 3 | **GEMV specialization for M=1 decode**\* | 128 `CutlassGemvImpl` variants | 0 | Decode latency regresses |
 | 4 | **SplitK / TB_K=64 variants** | 22 SplitK + 10 TB_K=64 per phase | 0 | L4 memory-bound shapes regress |
-| 5 | **Qwen2 fused-QKV-with-bias**\* | `CublasFusedQkvGemmWithBiasImpl` | 0 | Qwen2 DSL migration blocked |
+| 5 | **Qwen2 fused-QKV-with-bias** (LANDED) | `CublasFusedQkvGemmWithBiasImpl` | `FusedQkvRopeCacheImpl` + `FusedQkvRopePrefillImpl` matchers now walk through an optional `BiasAdd` wrapper on each rope input; claim grows 4→7 tiles when biased. `OpKind::BiasAdd` + `FusedGemmBiasImpl` for stray pairs. | Qwen2 DSL now says `bias_add` explicitly; solver absorbs it into the fused QKV kernel via cuBLAS `gemm_bias` epilog |
 | 6 | **Cublas / cutlass gemm+residual fusion** | `CublasGemmExWithResidualImpl`, `CutlassGemmWithResidualImpl` (424 variants) | 0 | Extra launches vs. fused |
 | 7 | **Cutlass gemm+silu+mul fusion** | `CutlassGemmSiluMulImpl` (424 variants) | `FusedGateUpSiluMulImpl` emits cuBLAS | Perf delta on SwiGLU MLP |
 | 8 | **Attention variant split** (LANDED) | `TkAttentionDecodeImpl`, `TkAttentionPrefillImpl`, `FlashInferStandaloneImpl`, `FlashInferStandardImpl` | `AttentionViaCacheImpl` + `FusedQkvRopeCacheImpl` for decode (M=1); `AttentionPrefillContiguousImpl` + `FusedQkvRopePrefillImpl` for prefill (M≥2); solver picks per `WorkloadConstraint`. Done in Step D commit `16ef52925`. | No longer a split issue — but did not fix `vllm chat` garbage output on its own |
@@ -479,6 +480,44 @@ Not acceptable. The right shape: codegen calls
 call. New ops add new Impls to the library, not new arms in
 codegen. **This is already in place.** Keep it that way.
 
+### Inventing new OpKinds for fusions
+
+> *"Qwen3 needs QK-norm, so I'll add `OpKind::QkNorm` (or
+> `OpKind::QkNormRopeAppend`) to the DSL."*
+
+Banned. **`OpKind` is the vocabulary of math primitives a model
+author would write by hand** — `rmsnorm`, `gemm`, `rope_append`,
+`attention`, `silu`, `gelu`, `add`, `mul`. If a proposed variant
+bundles multiple math steps (`QkNorm` = rmsnorm on Q + rmsnorm
+on K; `QkNormRopeAppend` = that plus RoPE plus cache write), it
+is a **fusion name posing as a math op**. Fusions live in
+`impl_lib.rs` as multi-tile `Implementation`s; the DSL stays
+plain math.
+
+The litmus test: **would a model paper / reference implementation
+describe this as one operation?** If Qwen3's spec says "apply
+RMS norm to Q and K per-head before RoPE," that is two rmsnorm
+calls in the DSL — not a new op. The paper never says "qk_norm."
+
+Mechanism:
+- Keep the DSL body simple: the author writes `q = rmsnorm(q,
+  q_norm_w); k = rmsnorm(k, k_norm_w);` as two ordinary rmsnorm
+  tiles over the [..., head_dim] axis.
+- Solver-side: add a multi-tile Impl (e.g.
+  `FusedQkvQkNormRopeCacheImpl`) that claims the pattern
+  `(Gemm, Gemm, Gemm, RmsNorm, RmsNorm, RopeAppend)` and emits
+  the fused kernel.
+- If a shape signature needs generalizing (e.g. `RmsNorm`
+  admitting `[..., D]` with weight `[D]` for per-head norm),
+  generalize the signature — don't spawn a new OpKind to dodge
+  the shape-inference work.
+
+Same rule applies backward: any existing *compound-sounding*
+OpKind variant (`RopeAppend` couples RoPE with KV-cache write
+today) is a historical compromise that should be revisited the
+moment a model needs them decoupled (e.g. RoPE without cache
+write). Don't compound them further.
+
 ### Treating `vllm-cuda/src/model/*.rs` as in-scope
 
 Out of scope. **`vllm-cuda` is not touched.** The compiler replaces
@@ -744,6 +783,54 @@ identical to Python vLLM (`" Paris. The capital of the United States
 is Washington"` on the same prompt), and the AWQ Llama-3.2-1B
 correctness golden passes end-to-end.
 
+**Prior session: Qwen2 bias is now first-class math in the DSL.**
+Prior sessions had Qwen2's QKV bias riding silently through
+`LinearLayer::forward` — the DSL said `gemm()` but the runtime
+quietly did `gemm_bias`, which is exactly the "hide math inside an
+Impl" antipattern now documented in the "Inventing new OpKinds for
+fusions" subsection of "Failure patterns." That session fixed it:
+
+- **`OpKind::BiasAdd`** (new) — broadcast-add of `[D]` bias across
+  `[..., D]` activation. `bias_add(x, b)` parses, shape-infers, and
+  flows through classify → FUF like any other math primitive.
+- **`GemmRefImpl`** — now emits **strict matmul** via
+  `device.cublas.gemm(*(x), w.dense_weight(), alloc)`. Bias is no
+  longer applied implicitly; `gemm()` in the DSL means matrix
+  multiply, full stop.
+- **`FusedGemmBiasImpl`** (new) — 2-tile fusion for `(Gemm,
+  BiasAdd)` pairs. Emits `(#w).forward()` which dispatches to
+  cuBLAS `gemm_bias` epilog. `debug_assert!` on
+  `dense_bias().is_some()` so a DSL/safetensors mismatch panics
+  loudly instead of silently skipping the bias.
+- **`FusedQkvRopeCacheImpl` / `FusedQkvRopePrefillImpl`** — matcher
+  now walks through an optional `BiasAdd` wrapper on each of the
+  three rope inputs. Claim grows 4→7 tiles when biased. Emit is
+  unchanged (packed `LinearLayer::forward` covers both cases); same
+  `debug_assert!` guards.
+- **`gemm_is_fusion_partner`** — extended to include `BiasAdd` so
+  cutlass singletons don't strand a downstream bias.
+- **`ferrite-models/src/qwen2.rs`** — rewritten with explicit
+  `bias_add(q, self_attn.q_proj.bias[layer])` after each Q/K/V
+  gemm. Mirrors the old `ferrite_macros::forward!` exemplar at
+  `~/vllm/.claude/worktrees/claude4/vllm-rs/crates/ferrite-models/src/qwen2.rs`.
+- **No singleton `BiasAddRefImpl`** — per library-gap guarantee, a
+  lone `bias_add` surfaces as `UnclaimedTile`. Only fusion impls
+  claim it.
+
+Accessor names are unchanged (`source_weights` stays at the 3 Gemm
+weights; bias rides through `load_dense_concat`'s auto-detect path
+as a packed `LinearLayer` field). No changes to
+`cuda_worker.rs::Qwen2Ferrite` needed. All four correctness
+goldens still pass.
+
+**Four correctness goldens green via ferrite-forward.** Dense-bf16
+Llama (SmolLM2-135M), Qwen2 (Qwen2.5-0.5B), Gemma2 (Gemma2-2B), and
+Granite (Granite-3.3-2B) all pass `test_cuda_correctness_*` through
+their `*Ferrite` variants (verified by `loaded ... via ferrite-forward`
+log lines on each; for Granite, also confirmed by diffing against
+`FERRITE_DISABLE=1` — both paths produce identical output down to
+the same tolerated prompt-1 position-2 top-N divergence).
+
 **Prompt-7 root cause was NOT in the kernels.** The prior session's
 "shared CUDA kernel drift" theory was wrong. Per-layer hidden-state
 dumps comparing our hand-written Gemma2 path against HF transformers
@@ -797,13 +884,17 @@ the remaining-work section below; re-listed here so future
 sessions don't re-port them.
 
 1. **Qwen2 ferrite migration** — `ferrite-models/src/qwen2.rs`
-   uses the same `#[forward]` DSL body as Llama. Qwen2's QKV bias
-   rides through `LinearLayer::load_dense_concat` + `cublas.gemm_bias`
-   automatically; no bespoke `CublasFusedQkvGemmWithBiasImpl` was
-   needed. `CudaModel::Qwen2Ferrite` in `cuda_worker.rs` parallels
-   `LlamaFerrite` and carries all the accessor / forward arms.
-   Dense-bf16 Qwen2 now routes through ferrite; quant / TP / PP
-   keep the hand-written path.
+   uses the same `#[forward]` DSL body as Llama plus explicit
+   `bias_add(q, self_attn.q_proj.bias[layer])` tiles after each
+   QKV gemm (same math the old `ferrite_macros::forward!` body
+   encoded). Bias is first-class math in the DSL — not hidden
+   inside `LinearLayer::forward`. The `FusedQkvRopeCache` /
+   `FusedQkvRopePrefill` matchers walk through the BiasAdd
+   wrappers so the packed cuBLAS `gemm_bias` epilog still runs in
+   one launch. `CudaModel::Qwen2Ferrite` in `cuda_worker.rs`
+   parallels `LlamaFerrite` and carries all the accessor / forward
+   arms. Dense-bf16 Qwen2 now routes through ferrite; quant / TP /
+   PP keep the hand-written path.
 2. **Cutlass GEMM zoo + CSV costs** — `target_profiles/cost_*.csv`
    holds the three calibrated sweeps (L4/SM89, L40S/SM89,
    H100/SM90). `TargetProfile` auto-loads `cost_<name>.csv`

@@ -591,11 +591,18 @@ fn try_emit_megakernel(
 
     tokens.push(quote! {
         {
-            let __stream_raw = device.stream().raw() as u64;
-            // TODO: compute grid/block from phase requirements
-            let __grid_x = 1i32;
+            let __stream_raw = device.compute_stream.raw() as u64;
+            // Cooperative kernel: grid = num_sm, block = 256.
+            // The DC ops use one CTA per row for elementwise ops
+            // and grid-stride for GEMM. num_sm ensures full GPU
+            // occupancy; each phase early-exits CTAs beyond its
+            // row count.
+            let __grid_x = device.num_sm as i32;
             let __block_x = 256i32;
-            let __smem_bytes = 0usize;
+            // smem: enough for block reduce (32 floats = 128B) +
+            // wmma tile scratch (16×16×4 = 1024B) + inv_rms (4B).
+            // Round up to 2048 for safety.
+            let __smem_bytes = 2048usize;
             let __ret = unsafe {
                 #launch_fn(
                     #(#param_idents,)*

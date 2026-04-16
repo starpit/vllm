@@ -507,6 +507,39 @@ end-user behavior (not just type-checks-and-fmt-clean), and (c)
 nothing in the commit will need revisiting except for bugs. If
 you're tempted to say 100% before all three hold, you're wrong.
 
+### Runtime polymorphism for quant (recurring trap)
+
+> *"add a `FusedLinear` enum that wraps `Packed(LinearLayer)` or
+> `Split(Vec<LinearLayer>)`, with a runtime `load_auto(gw, prefixes,
+> qconfig, stream)` that branches on qconfig"*
+
+Banned. **Ferrite is a compiler.** The quant format of every weight
+is known at macro-expansion time from the model's `config.json`
+(`quantization_config`). Format decisions belong in the solver
+(per-format Impls whose `matches()` inspects source-weight storage)
+and in codegen (per-format `FieldLoad` arms emitting format-specific
+loader calls). A runtime `match qconfig { ... }` inside a helper
+erases what the compiler already knew, and forces the solver to
+pick kernels blind to the storage format.
+
+Additionally: **marlin is a compute kernel, not a storage format.**
+Storage formats are `awq`, `gptq`, `fp8`, `bnb4bit`, `fp8_block` —
+the shape of the bits on disk, fixed by the upstream HF repo.
+Marlin is one of several possible kernels for 4-bit INT weights
+(awq/gptq bits=4). Name Impls after the kernel they emit
+(`MarlinGemmImpl`); match on the source weight's `StorageFormat`.
+
+### Moving logic around without checking if it's really "bypassing"
+
+When staging changes, don't reach for inflammatory framing
+("bypassing", "hiding the decision") until you've checked whether
+the pattern you're using matches existing ferrite code. Every
+existing `FieldLoad` arm emits a call to a runtime helper
+(`Embedding::load`, `LinearLayer::load_dense_concat`, …) — new quant
+arms emitting `MarlinLinear::load_awq(...)` follow the same shape.
+The user called this out once already; check before self-flagellating
+in the next session.
+
 ## Library-gap guarantee
 
 The library does NOT have singleton impls for Silu, Mul, Add, or
@@ -602,7 +635,17 @@ ferrite-models          DSL bodies: llama.rs (`#[forward] fn llama`)
 
 ## Commit history — `git log --oneline` on the worktree branch
 
-Most recent session (Granite port end-to-end: `scalar(<name>)` /
+Most recent session (AWQ quant — preparation only; no ferrite-forward
+AWQ codegen yet, but the data model and the runtime loader are in
+place so the next session can emit AWQ loads directly — see
+"## Quantization path (in progress)" below):
+
+```
+974e9a4c8  ferrite-kernels: move AWQ→Marlin loader + helpers for codegen reuse
+999076179  ferrite-forward: parse quantization_config, guard dense-only loader
+```
+
+Prior session (Granite port end-to-end: `scalar(<name>)` /
 `recip_scalar(<name>)` DSL, `attention_multiplier` override,
 Granite DSL body + 3 configs, GraniteFerrite cuda_worker wiring,
 granite_3_3_2b golden):
@@ -825,14 +868,13 @@ tackle in roughly this order.
    memory-bound tail (rmsnorm, silu, add, rope, elementwise) so
    nothing fuses into `__global__` megakernels. Port the device
    bodies + add the emission arm.
-2. **Quantized Linear (marlin INT4, bnb4bit, awq/gptq, fp8
-   block)** — `LinearLayer` has Marlin/Bnb/Ggml/Fp8/Fp8Block
-   variants; ferrite's gemm impls only thread
-   `LinearLayer::forward`'s dense arm. For quantized models the
-   solver would need quantization-aware Impls; today those
-   models must route around ferrite. `cuda_worker.rs` already
-   filters ferrite off for `qconfig.is_bnb4bit()`, `is_fp8()`,
-   `is_quantized()`.
+2. **Quantized Linear — AWQ in progress; GPTQ/FP8/BnB untouched.**
+   Preparation landed (commits `999076179`, `974e9a4c8` — see the
+   dedicated **"Quantization path (in progress)"** section below
+   for the compiler-native plan and the concrete Commit 3
+   checklist). Runtime `match qconfig` on load is an anti-pattern
+   here — see the "Runtime polymorphism for quant" failure
+   pattern above.
 3. **QK-norm** (Qwen3, Gemma3) — `qk_norm_inplace` +
    `rotary_embedding_q_only` path. Needs a `FusedQkvQkNormRopeImpl`.
 4. **Gemma3** — another alternating-attention architecture, but
@@ -962,6 +1004,243 @@ tackle in roughly this order.
   golden. Ferrite and `FERRITE_DISABLE=1` paths produce identical
   output down to the same tolerated prompt-1 position-2 top-N
   divergence.
+
+## Quantization path (in progress)
+
+Preparation for ferrite-forward quant is landed; the next session
+finishes the AWQ end-to-end slice. The compiler-native plan —
+agreed after considerable back-and-forth on the record in this
+session — is what the next context must start from. Do not
+re-litigate it.
+
+### Core principle
+
+**Ferrite is a compiler. Every quant decision is made at macro-
+expansion time.** The proc-macro reads each model's `config.json`
+at build time; `quantization_config` is known then. Per-weight
+storage format flows through the solver via format-aware Impls
+(per-format `matches()` predicate, per-format `rust_type` on the
+accessor, per-format `emit_call`) and through codegen via
+per-format `FieldLoad` arms that emit format-specific loader
+calls. No runtime `match qconfig` on load. No `FusedLinear` enum.
+No `load_auto` helper. Marlin is a compute kernel, not a format
+— the storage format is `Awq { bits, group_size, zero_point,
+version }` (or Gptq / Fp8 / …); marlin is one of several possible
+kernels that accept 4-bit INT storage.
+
+The emitted `Weights::load(gw, stream)` signature stays unchanged
+from the dense version — if a given model has AWQ accessors, the
+generated body allocates the marlin workspace inline:
+
+```rust
+pub fn load(gw, stream) -> Result<Self> {
+    let __device_id = /* driver query */;
+    let __num_sm = /* driver query */;
+    let __marlin_ws = alloc_marlin_workspace(__num_sm, stream)?;
+    // … per-weight lets, mixing:
+    let embed_tokens = Embedding::load(gw, "model.embed_tokens")?;
+    let q_proj_0 = MarlinLinear::load_awq(
+        gw, "model.layers.0.self_attn.q_proj",
+        128, __marlin_ws, __device_id,
+    )?;
+    let lm_head = LinearLayer::load_dense(gw, "lm_head")?;  // modules_to_not_convert
+    // …
+}
+```
+
+### What's landed (this session)
+
+1. **`999076179` — `quantization_config` parser + codegen guard.**
+   - `ferrite-forward-macro::quantization` module:
+     - `StorageFormat { Dense, Awq { bits, group_size, zero_point,
+       version } }`, `AwqVersion { Gemm, Gemv, Marlin }`.
+     - `QuantizationConfig::parse(&serde_json::Value)` handles
+       HF's `quant_method: "awq"` shape; unknown methods hard-error
+       via `UnsupportedMethod(_)`. Honors `modules_to_not_convert`
+       with suffix match.
+     - `storage_format_for_weight(program, id, model)` resolves
+       per-weight format on demand.
+   - `ModelParams.quantization: Option<QuantizationConfig>` parsed
+     in `config::load_file`.
+   - Consumer: `codegen::emit_weights_struct` hard-errors via
+     `compile_error!` if any accessor's source weights are non-
+     `Dense` — forces future quant to ship with a matching Impl +
+     FieldLoad arm, not slip through.
+2. **`974e9a4c8` — AWQ→Marlin loader moved to `ferrite-kernels`.**
+   - New `ferrite-kernels/src/layers_quant.rs`:
+     - `alloc_marlin_workspace`, scale/zero-point permutes,
+       `concat_cpu_dim1`, `fuse_bias_parts`, all previously in
+       `vllm-cuda::weights_quant` / `::quant`.
+     - `MarlinLinear::load_awq(gw, prefix, group_size, workspace,
+       device_id)` — single-weight AWQ load + marlin repack.
+     - `MarlinLinear::load_awq_concat(gw, prefixes, group_size,
+       workspace, device_id)` — CPU-concat fused load (AWQ
+       metadata *can* be concatenated at load time; the three
+       QKV weights collapse into one packed `MarlinLinear`,
+       same shape the dense fused accessor carries).
+   - `vllm-cuda::weights_quant::load_awq_marlin_linear` /
+     `load_fused_awq_marlin` are now 2-line adapters that unwrap
+     the runtime `AwqConfig` and delegate. Hand-written Marlin
+     AWQ smoke tests on Qwen2.5-0.5B-AWQ (`test_cuda_marlin_awq_*`
+     in `e1_basic_serving.rs`) pass unchanged.
+
+### What's left (Commit 3 — AWQ Llama end-to-end)
+
+This is a single atomic commit per the "commit complete" rule.
+Split only if a sub-piece truly lands with its consumer.
+
+1. **Per-format Impls in `ferrite-forward-macro/src/impl_lib.rs`.**
+   Following the existing pattern of the dense fused impls —
+   `FusedQkvRopeCacheImpl` (line ~2700), `FusedQkvRopePrefillImpl`
+   (line ~3100), `FusedGateUpSiluMulImpl` (line ~1200):
+   - `MarlinGemmImpl` — singleton Gemm. `matches()` accepts when
+     the source weight's storage is `Awq{..}`. Declares
+     `rust_type: ::ferrite_kernels::layers::MarlinLinear`.
+     `emit_call` emits `(w).forward(x, &mut device.caching,
+     device.compute_stream)` — note: `MarlinLinear::forward`
+     takes `(x, alloc, stream)`, NO cublas handle (compare to
+     `LinearLayer::forward`'s signature).
+   - `MarlinFusedQkvRopeCacheImpl` / `MarlinFusedQkvRopePrefillImpl`
+     — mirror the dense variants but `required_weights` declares
+     `rust_type: MarlinLinear` for the fused QKV accessor, and
+     `emit_call` calls `MarlinLinear::forward`. The packed output
+     shape `[M, q_size + 2*kv_size]` is the same as dense — feed
+     it into `fused_qkv_rope_cache` unchanged.
+   - `MarlinFusedGateUpSiluMulImpl` — same pattern for gate/up
+     fusion. AWQ also collapses two weights into one
+     `MarlinLinear` at load time.
+   - Existing dense impls (`GemmRefImpl`, `FusedQkvRope*Impl`,
+     `FusedGateUpSiluMulImpl`) need their `matches()` to REJECT
+     Awq source weights. Otherwise the solver sees both
+     `GemmRefImpl` and `MarlinGemmImpl` as candidates for an AWQ
+     Gemm tile, and the cost-comparison would be between two
+     impls emitting incompatible code. Simplest fix: add a
+     storage-format predicate early in each dense impl's
+     `matches()` that bails when the source weight isn't
+     `StorageFormat::Dense`. The `matches()` signature currently
+     takes `(fuf, seed, profile)` — need to thread the per-model
+     `ModelParams` + `Program` (or a pre-computed
+     weight-format map) through `solver::solve` into the
+     matcher. Smallest path: extend `MatchCtx` / add a
+     `WeightFormatResolver` arg.
+   - Register all four in `starter_library()`.
+2. **`FieldLoad` arms in `codegen.rs`.** Add:
+   - `FieldLoad::AwqLinear { prefix: String, group_size: u32 }`
+     → emits `MarlinLinear::load_awq(gw, prefix, group_size, __marlin_ws, __device_id)?`.
+   - `FieldLoad::AwqLinearConcat { prefixes: Vec<String>, group_size: u32 }`
+     → emits `MarlinLinear::load_awq_concat(gw, &[prefixes…], group_size, __marlin_ws, __device_id)?`.
+   - Extend `plan_field_load` to detect `rust_type: MarlinLinear`
+     + consult storage format to set `group_size` from the
+     `QuantizationConfig::Awq`.
+   - Relax the storage-format guard in `emit_weights_struct`:
+     when the accessor's `rust_type` is `MarlinLinear`, allow
+     `StorageFormat::Awq` source weights. The guard's current
+     shape is the right place to land the relaxation — one if-arm
+     per accessor-type/format pair.
+3. **Workspace + device_id emission in the `Weights::load` body.**
+   `emit_weights_struct`: if any FieldLoad in the accessor list
+   is AWQ-flavored, emit three top-of-body bindings before the
+   per-accessor `let`s:
+   ```rust
+   let __device_id: i32 = /* ferrite_cuda_core driver query */;
+   let __num_sm: i32 = /* ferrite_cuda_core driver query */;
+   let __marlin_ws = ferrite_kernels::layers_quant::alloc_marlin_workspace(
+       __num_sm, stream,
+   )?;
+   ```
+   Helpers for the driver queries: check `ferrite-cuda-core/src/driver.rs`
+   for existing `current_device_id()` / `num_sms(device)`; if
+   missing, add thin wrappers over `cudarc::driver::result::device::*`.
+   Don't add arguments to the `Weights::load` signature — the
+   caller in `cuda_worker.rs` must stay uniform across dense and
+   AWQ models.
+4. **AWQ model config.** Add
+   `model_architectures/llama/llama-3.2-1b-awq.json` — copy the
+   dense `llama-3.2-1b.json` and append:
+   ```json
+   "quantization_config": {
+     "quant_method": "awq", "bits": 4, "group_size": 128,
+     "zero_point": true, "version": "gemm",
+     "modules_to_not_convert": ["lm_head"]
+   }
+   ```
+   HF's AWQ Llama-3.2-1B repos (e.g. `TheBloke/...` or the
+   `hugging-quants` org) ship configs in this shape; pick a
+   real HF repo whose config matches the committed one so the
+   golden test below has weights to load.
+5. **Lift the `cuda_worker.rs` AWQ gate for `LlamaFerrite`.** The
+   current gate (lines ~5221-5226 of `crates/vllm-executor/src/cuda_worker.rs`
+   in prior sessions — verify line numbers) filters
+   `!qconfig.is_quantized() && !use_tp && !use_pp` to ferrite.
+   Replace with `!qconfig.is_bnb4bit() && !qconfig.is_fp8() &&
+   (!qconfig.is_quantized() || qconfig.is_awq()) && !use_tp &&
+   !use_pp` so AWQ routes to `LlamaFerrite` while the other
+   quant formats still take the hand-written path. The
+   `QuantConfig::Awq(_) | Gptq(_) | None | ...` enum already
+   exists in `vllm-cuda::quant`.
+6. **Marlin golden.** Add `test_cuda_correctness_llama_3_2_1b_awq`
+   under `crates/vllm-e2e/tests/e_correctness.rs`, using a real HF
+   AWQ repo as the model source. Diff against `FERRITE_DISABLE=1`
+   (hand-written AWQ path) — same methodology as
+   `test_cuda_correctness_granite_3_3_2b`. The ferrite path
+   produces tokens via `MarlinLinear::load_awq_concat` (fused
+   QKV, fused gate/up) + `MarlinLinear::forward` per GEMM; the
+   hand-written path produces tokens via the same underlying
+   `MarlinLinear::load_awq_concat` helper (commit `974e9a4c8`
+   wired the delegation) so the two should match byte-for-byte
+   modulo the dense/ferrite tolerance window already used by the
+   Granite golden.
+
+### Pitfalls to dodge (from this session's back-and-forth)
+
+- **Don't add a `FusedLinear` enum.** We removed the one I added
+  in this session's first attempt. See the "Runtime polymorphism
+  for quant" failure pattern above.
+- **Don't change `Weights::load`'s signature.** Workspace +
+  device_id are emitted inline by codegen, not threaded through.
+- **Don't invent an arch-level "quant config" arg.** Per-model
+  storage formats are already in each `ModelParams`.
+- **Don't re-fork the marlin repack logic.** The single source of
+  truth is `ferrite-kernels::layers_quant::MarlinLinear::load_awq{,_concat}`.
+  Hand-written and ferrite-emitted paths both call it.
+- **AWQ fused-QKV is a single `MarlinLinear` (not three).** AWQ
+  metadata (scales, zeros, qweight) all concatenate along dim N
+  before the marlin repack; the fused accessor is one `MarlinLinear`
+  exactly like the dense fused accessor is one `LinearLayer`. The
+  "Split" shape I initially proposed is wrong for AWQ — it's
+  relevant for FP8/BnB where per-tensor scales can't be merged,
+  but those are later commits.
+- **Verify `MarlinLinear::forward`'s arg list before emitting.**
+  It's `(x, alloc, stream)` — no cublas handle. The dense
+  equivalent `LinearLayer::forward` takes `(x, cublas, alloc,
+  stream)`. Per-format emit means per-format signatures; that's
+  the whole point.
+
+### Follow-ons (new commits, not Commit 3)
+
+- **GPTQ-marlin.** Extend the parser with `quant_method: "gptq"`,
+  add a `StorageFormat::Gptq` variant, add `MarlinLinear::load_gptq{,_concat}`
+  in `ferrite-kernels::layers_quant` (mirroring the current AWQ
+  pair — GPTQ adds `g_idx` / `desc_act` handling per the GPTQ
+  loader still in `vllm-cuda::weights_quant`). Same Impls accept
+  GPTQ storage — Marlin doesn't care which INT4 format fed it
+  after repack. Keep impls distinct per storage format so the
+  solver can pick cost-aware in the future.
+- **FP8.** `MarlinLinear::forward` isn't the path — FP8 uses
+  `Fp8Linear::forward` which calls `cutlass_scaled_mm`. The FP8
+  fused-QKV case is the one where `FusedLinear::Split` was
+  actually applicable — per-tensor weight scales can't be merged,
+  so three separate `Fp8Linear` calls + one `concat_dim1` is the
+  shape. Codegen-native: the QKV FieldLoad emits three separate
+  `Fp8Linear::load` lines + the fused Impl's `emit_call` emits
+  three `Fp8Linear::forward` calls followed by `concat_dim1`.
+  No `FusedLinear` enum needed — the generated code inlines the
+  pattern.
+- **BnB4bit.** Similar to FP8 split pattern. Shared dequant
+  scratch buffer needs a top-of-body emit (like the marlin
+  workspace).
+- **FP8-block.** Per-block scales — same split pattern as FP8,
+  different kernel.
 
 ## Last note
 

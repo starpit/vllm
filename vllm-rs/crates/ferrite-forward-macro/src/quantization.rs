@@ -21,8 +21,9 @@
 
 use syn::Ident;
 
-use crate::classified::{Program, WeightId};
+use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
+use crate::fuf::{Fuf, FufInput};
 
 /// How a single weight's bits are laid out on disk. Attached to
 /// every `WeightId` via [`storage_format_for_weight`] once per
@@ -226,13 +227,26 @@ fn parse_awq(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMe
 }
 
 /// Resolve the storage format of a single weight by matching its
-/// dotted path against the model's `quantization_config`. The
-/// `modules_to_not_convert` list is matched by SUFFIX — HF's
-/// canonical entries are weight-name tails like `"lm_head"` or
-/// `"model.layers.0.self_attn.q_proj"`. A weight whose path ends
-/// with any listed string keeps `StorageFormat::Dense`.
+/// dotted path against the model's `quantization_config`.
+///
+/// Rules, in order (each returns `Dense` on success):
+/// 1. Model has no `quantization_config` → every weight is `Dense`.
+/// 2. The weight's dotted path ends with any entry in
+///    `modules_to_not_convert` — HF's canonical exclusion list.
+/// 3. `tie_word_embeddings: true` AND the weight is `lm_head` —
+///    tied models have no `lm_head.*` safetensors to quantize; the
+///    Gemm at the lm_head tile shares the embedding buffer via
+///    [`crate::codegen::FieldLoad::LinearTiedToEmbedding`] and must
+///    stay dense.
+/// 4. The weight is never consumed by a `Gemm` tile in the FUF. AWQ
+///    metadata only applies to matmul weights (qweight/scales/qzeros
+///    triples). `Embedding`, `RmsNorm`, biases, etc. stay `Dense`.
+///
+/// Otherwise the method's parameters (bits/group_size/…) are carried
+/// through into `StorageFormat::Awq{..}`.
 pub fn storage_format_for_weight(
     program: &Program,
+    fuf: &Fuf,
     id: WeightId,
     model: &ModelParams,
 ) -> StorageFormat {
@@ -250,6 +264,38 @@ pub fn storage_format_for_weight(
         if dotted.ends_with(excl) {
             return StorageFormat::Dense;
         }
+    }
+
+    // Tied lm_head: no on-disk `lm_head.*`; the codegen FieldLoad
+    // shares the embedding buffer as a dense LinearLayer.
+    if dotted == "lm_head" && model.tie_word_embeddings {
+        return StorageFormat::Dense;
+    }
+
+    // AWQ metadata applies to matmul weights only — the qweight/
+    // scales/qzeros triple produces a 4-bit packed weight that the
+    // marlin GEMM kernel consumes. Weights that never reach a Gemm
+    // tile (Embedding, RmsNorm, biases) have no AWQ representation
+    // on disk and must stay Dense.
+    let mut reached_by_gemm = false;
+    for node in &fuf.nodes {
+        if node.op != OpKind::Gemm {
+            continue;
+        }
+        for input in &node.inputs {
+            if let FufInput::Weight { id: wid, .. } = input
+                && *wid == id
+            {
+                reached_by_gemm = true;
+                break;
+            }
+        }
+        if reached_by_gemm {
+            break;
+        }
+    }
+    if !reached_by_gemm {
+        return StorageFormat::Dense;
     }
 
     match qc.method {

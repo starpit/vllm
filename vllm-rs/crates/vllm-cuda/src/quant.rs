@@ -170,6 +170,11 @@ impl QuantConfig {
     pub fn is_fp8(&self) -> bool {
         matches!(self, Self::Fp8(_))
     }
+
+    /// Whether this is an AWQ quantized model.
+    pub fn is_awq(&self) -> bool {
+        matches!(self, Self::Awq(_))
+    }
 }
 
 // ---------------------------------------------------------------------------

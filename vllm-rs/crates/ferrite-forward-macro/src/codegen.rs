@@ -84,12 +84,31 @@ enum FieldLoad {
     /// the `LinearLayer` from the already-loaded embedding field
     /// whose name is carried here.
     LinearTiedToEmbedding(syn::Ident),
+    /// AWQ-packed INT4 linear. `group_size` is read from the
+    /// model's `quantization_config.group_size`. Emits
+    /// `MarlinLinear::load_awq(gw, prefix, group_size, workspace,
+    /// device_id)` against the ambient `__marlin_ws` / `__device_id`
+    /// bindings that [`emit_weights_struct`] plants at the top of
+    /// `Weights::load` when any AWQ accessor is present.
+    AwqLinear { prefix: String, group_size: u32 },
+    /// AWQ fused linear (QKV, gate/up) — AWQ qweight/scales/qzeros
+    /// all concat along dim N, so the fused accessor collapses to
+    /// one `MarlinLinear`. Emits `MarlinLinear::load_awq_concat`.
+    AwqLinearConcat {
+        prefixes: Vec<String>,
+        group_size: u32,
+    },
 }
 
 /// Distill a `WeightAccessor` into its field-load plan. Uses the
 /// accessor's declared `rust_type` + `source_weights` and the
 /// model's config (for `rms_norm_eps` / `tie_word_embeddings`).
-fn plan_field_load(accessor: &WeightAccessor, program: &Program, model: &ModelParams) -> FieldLoad {
+fn plan_field_load(
+    accessor: &WeightAccessor,
+    program: &Program,
+    fuf: &Fuf,
+    model: &ModelParams,
+) -> FieldLoad {
     let ty = accessor.rust_type.to_string().replace(' ', "");
     let is_embedding =
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
@@ -97,12 +116,59 @@ fn plan_field_load(accessor: &WeightAccessor, program: &Program, model: &ModelPa
         ty.ends_with("::RmsNorm") || ty == "RmsNorm" || ty.ends_with("layers::RmsNorm");
     let is_linear =
         ty.ends_with("::LinearLayer") || ty == "LinearLayer" || ty.ends_with("layers::LinearLayer");
+    let is_marlin = ty.ends_with("::MarlinLinear")
+        || ty == "MarlinLinear"
+        || ty.ends_with("layers::MarlinLinear");
 
     let prefixes: Vec<String> = accessor
         .source_weights
         .iter()
         .map(|(id, idx)| safetensors_prefix(program, *id, *idx))
         .collect();
+
+    if is_marlin {
+        // AWQ accessors are always emitted by a quant-aware impl
+        // whose sources are `StorageFormat::Awq { group_size, .. }`.
+        // The `group_size` must agree across every source of a fused
+        // accessor (HF's fused-QKV/gate-up layers share one
+        // group_size); mismatch is a data-integrity error in the
+        // upstream HF repo and we panic at macro-expansion time
+        // rather than silently emit a wrong loader.
+        let mut group_size: Option<u32> = None;
+        for (wid, _idx) in &accessor.source_weights {
+            let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
+            match fmt {
+                crate::quantization::StorageFormat::Awq { group_size: g, .. } => match group_size {
+                    None => group_size = Some(g),
+                    Some(existing) if existing == g => {}
+                    Some(existing) => panic!(
+                        "accessor `{}` fuses sources with mismatched AWQ group_size \
+                             (saw {existing} then {g})",
+                        accessor.name,
+                    ),
+                },
+                other => panic!(
+                    "accessor `{}` declared `MarlinLinear` but source weight resolves to \
+                     non-Awq storage ({other:?}) — solver picked a Marlin impl for a dense \
+                     weight, which is a matcher bug",
+                    accessor.name,
+                ),
+            }
+        }
+        let group_size =
+            group_size.expect("MarlinLinear accessor declares at least one source weight");
+        if prefixes.len() == 1 {
+            return FieldLoad::AwqLinear {
+                prefix: prefixes.into_iter().next().unwrap(),
+                group_size,
+            };
+        } else {
+            return FieldLoad::AwqLinearConcat {
+                prefixes,
+                group_size,
+            };
+        }
+    }
 
     if is_embedding {
         assert_eq!(
@@ -179,17 +245,10 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
 }
 
 fn tie_word_embeddings(model: &ModelParams) -> bool {
-    // HF convention: if set, lm_head reuses embed_tokens.weight; no
-    // separate `lm_head.weight` tensor in safetensors.
-    let Ok(s) = std::fs::read_to_string(&model.source_path) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
-        return false;
-    };
-    v.get("tie_word_embeddings")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false)
+    // `ModelParams::tie_word_embeddings` is populated by the config
+    // loader from the HF JSON; read directly rather than re-parsing
+    // the file here.
+    model.tie_word_embeddings
 }
 
 /// Aggregate every unique WeightAccessor across every workload
@@ -250,21 +309,31 @@ fn emit_weights_struct(
         Err(err) => return err,
     };
 
-    // Storage-format guard: every `LinearLayer` / `Embedding` /
-    // `RmsNorm` FieldLoad today produces dense bf16 safetensors
-    // reads. Any source weight whose storage isn't `Dense` would
-    // silently mis-load; enforce the invariant at macro-expansion
-    // time so new quant formats can't slip through without a
-    // matching FieldLoad arm + kernel wiring.
+    // Storage-format guard: a given accessor's `rust_type` must be
+    // compatible with every one of its source weights' storage
+    // formats. The allowed pairs today:
+    //   `LinearLayer`  ↔ `Dense`
+    //   `Embedding`    ↔ `Dense`
+    //   `RmsNorm`      ↔ `Dense`
+    //   `MarlinLinear` ↔ `Awq { .. }`
     //
-    // When a quant-aware Impl lands (e.g. an AWQ QKV fusion), the
-    // Impl will declare a new accessor `rust_type` — the new type
-    // gets its own allowed-format set in this guard. Until then,
-    // the dense-only invariant is the correct floor.
+    // Any other pair means the solver picked an impl whose
+    // declared accessor type doesn't match the bits on disk — a
+    // matcher bug. Fail at macro-expansion time so new quant
+    // formats can't slip through without a matching FieldLoad arm.
     for a in &accessors {
+        let ty = a.rust_type.to_string().replace(' ', "");
+        let accessor_is_marlin = ty.ends_with("::MarlinLinear")
+            || ty == "MarlinLinear"
+            || ty.ends_with("layers::MarlinLinear");
         for (wid, _idx) in &a.source_weights {
-            let fmt = crate::quantization::storage_format_for_weight(program, *wid, model);
-            if fmt != crate::quantization::StorageFormat::Dense {
+            let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
+            let ok = matches!(
+                (&fmt, accessor_is_marlin),
+                (crate::quantization::StorageFormat::Dense, false)
+                    | (crate::quantization::StorageFormat::Awq { .. }, true),
+            );
+            if !ok {
                 let path = program.weights.path(*wid);
                 let dotted = path
                     .iter()
@@ -272,12 +341,11 @@ fn emit_weights_struct(
                     .collect::<Vec<_>>()
                     .join(".");
                 let msg = format!(
-                    "model `{stem}`: weight `{dotted}` has non-dense storage ({fmt:?}) \
-                     but accessor `{name}` (type `{ty}`) has no matching loader. \
-                     Add a quant-aware Impl + FieldLoad arm for this format.",
+                    "model `{stem}`: weight `{dotted}` has storage ({fmt:?}) that \
+                     doesn't match accessor `{name}` (type `{ty}`). Add a quant-aware \
+                     Impl + FieldLoad arm for this pair.",
                     stem = model.source_stem,
                     name = a.name,
-                    ty = a.rust_type.to_string().replace(' ', ""),
                 );
                 return quote! { compile_error!(#msg); };
             }
@@ -297,11 +365,21 @@ fn emit_weights_struct(
     // matters. `accessors` iterates BTreeMap-sorted — which puts
     // `embed_tokens` before `lm_head` alphabetically, so the tied
     // case works without a special sort.
+    let plans: Vec<FieldLoad> = accessors
+        .iter()
+        .map(|a| plan_field_load(a, program, fuf, model))
+        .collect();
+    let any_awq = plans.iter().any(|p| {
+        matches!(
+            p,
+            FieldLoad::AwqLinear { .. } | FieldLoad::AwqLinearConcat { .. }
+        )
+    });
     let lets: Vec<TokenStream> = accessors
         .iter()
-        .map(|a| {
+        .zip(plans.iter())
+        .map(|(a, plan)| {
             let name = &a.name;
-            let plan = plan_field_load(a, program, model);
             match plan {
                 FieldLoad::Embedding(prefix) => quote! {
                     let #name = ::ferrite_kernels::layers::Embedding::load(gw, #prefix)?;
@@ -332,9 +410,54 @@ fn emit_weights_struct(
                         )
                     );
                 },
+                FieldLoad::AwqLinear { prefix, group_size } => {
+                    let group_size = *group_size as usize;
+                    quote! {
+                        let #name = ::ferrite_kernels::layers::MarlinLinear::load_awq(
+                            gw,
+                            #prefix,
+                            #group_size,
+                            __marlin_ws,
+                            __device_id,
+                        )?;
+                    }
+                }
+                FieldLoad::AwqLinearConcat {
+                    prefixes,
+                    group_size,
+                } => {
+                    let group_size = *group_size as usize;
+                    quote! {
+                        let #name = ::ferrite_kernels::layers::MarlinLinear::load_awq_concat(
+                            gw,
+                            &[ #(#prefixes),* ],
+                            #group_size,
+                            __marlin_ws,
+                            __device_id,
+                        )?;
+                    }
+                }
             }
         })
         .collect();
+
+    // Shared-per-model Marlin prelude: one workspace allocation
+    // (GpuTensor is `Copy` — each MarlinLinear captures the same
+    // buffer by value), one device-id query. Only planted when at
+    // least one accessor resolves to an AWQ FieldLoad; dense models
+    // skip it so their `Weights::load` body is byte-for-byte
+    // identical to before this commit.
+    let awq_prelude: TokenStream = if any_awq {
+        quote! {
+            let __device = unsafe { ::ferrite_cuda_core::driver::current_device()? };
+            let __device_id: i32 = __device as i32;
+            let __num_sm = unsafe { ::ferrite_cuda_core::driver::device_get_num_sm(__device)? };
+            let __marlin_ws =
+                ::ferrite_kernels::layers_quant::alloc_marlin_workspace(__num_sm, stream)?;
+        }
+    } else {
+        quote! {}
+    };
 
     // `Self { a, b, c }` shorthand — fields are the just-bound
     // locals, in the same order we declared the struct fields.
@@ -362,6 +485,7 @@ fn emit_weights_struct(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
             ) -> ::anyhow::Result<Self> {
+                #awq_prelude
                 #(#lets)*
                 Ok(Self {
                     #(#field_shorthand),*

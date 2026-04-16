@@ -29,6 +29,7 @@ use std::collections::HashMap;
 
 use crate::cfg::{BlockId, BoolPredResolved, Cfg, Instr, Terminator};
 use crate::classified::{Expr, ExternKind, LocalId, OpKind, WeightId};
+use crate::quantization::StorageFormat;
 use crate::shape::{Inferred, Shape};
 
 // ── Types ─────────────────────────────────────────────────────────
@@ -44,7 +45,18 @@ pub enum FufInput {
     Tile { id: TileId, slot: u8 },
     /// Reference to a weight, optionally indexed by a concrete
     /// unrolled integer (the former loop variable).
-    Weight { id: WeightId, index: Option<u64> },
+    ///
+    /// `storage` is the bits-on-disk format resolved at macro time
+    /// from the model's `quantization_config` (see
+    /// [`crate::quantization::storage_format_for_weight`] for the
+    /// full resolver rules). `fuf::unroll` always emits `Dense`; the
+    /// per-model [`Fuf::annotate_storage_formats`] pass overwrites
+    /// it for quantized models before the solver runs.
+    Weight {
+        id: WeightId,
+        index: Option<u64>,
+        storage: StorageFormat,
+    },
     /// Reference to a non-weight extern, optionally indexed.
     Extern {
         kind: ExternKind,
@@ -85,6 +97,48 @@ impl Fuf {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Populate the `storage` field on every `FufInput::Weight` by
+    /// running [`crate::quantization::storage_format_for_weight`]
+    /// over the model's config. `fuf::unroll` emits every Weight
+    /// input as [`StorageFormat::Dense`]; this pass overwrites them
+    /// for quantized models before the solver runs.
+    ///
+    /// Called once per model in the macro drive between unroll and
+    /// solve. The resolver's rules (modules_to_not_convert,
+    /// tie_word_embeddings, Gemm-only) are the single source of
+    /// truth — codegen's `FieldLoad` planner consults the same
+    /// function, so matcher gating stays in lockstep with loader
+    /// emission.
+    pub fn annotate_storage_formats(
+        &mut self,
+        program: &crate::classified::Program,
+        model: &crate::config::ModelParams,
+    ) {
+        // Resolver reads immutable `self`; precompute per (WeightId,
+        // index) pair, then write the results back. `storage_format_for_weight`
+        // doesn't depend on `index`, so key on `WeightId` alone.
+        use std::collections::HashMap;
+        let mut cache: HashMap<WeightId, StorageFormat> = HashMap::new();
+        for node in &self.nodes {
+            for input in &node.inputs {
+                if let FufInput::Weight { id, .. } = input {
+                    cache.entry(*id).or_insert_with(|| {
+                        crate::quantization::storage_format_for_weight(program, self, *id, model)
+                    });
+                }
+            }
+        }
+        for node in &mut self.nodes {
+            for input in &mut node.inputs {
+                if let FufInput::Weight { id, storage, .. } = input
+                    && let Some(fmt) = cache.get(id)
+                {
+                    *storage = fmt.clone();
+                }
+            }
+        }
     }
 }
 
@@ -384,7 +438,14 @@ impl<'a> Unroller<'a> {
             Expr::Weight { id, index } => {
                 let index = index.map(|lid| self.loop_var_value(lid)).transpose()?;
                 let shape = self.inferred.weights.get(id).cloned().unwrap_or_default();
-                Ok((FufInput::Weight { id: *id, index }, shape))
+                Ok((
+                    FufInput::Weight {
+                        id: *id,
+                        index,
+                        storage: StorageFormat::Dense,
+                    },
+                    shape,
+                ))
             }
             Expr::Call { op, args } => {
                 // Nested call — promote it to its own tile. Compute

@@ -41,6 +41,19 @@ pub unsafe fn device_get(ordinal: i32) -> Result<CUdevice> {
     Ok(dev)
 }
 
+/// Get the CUDA device currently attached to the calling thread's
+/// primary context. The returned handle is suitable for passing into
+/// [`device_get_num_sm`] / [`device_get_sm_version`] and for use as
+/// the `device_id` argument to Marlin kernels.
+///
+/// Requires the caller to have already entered a CUDA context
+/// (`ctx_create` / `ctx_set_current`); errors if no context is current.
+pub unsafe fn current_device() -> Result<CUdevice> {
+    let mut dev: CUdevice = 0;
+    check(sys::cuCtxGetDevice(&mut dev))?;
+    Ok(dev)
+}
+
 /// Get the number of streaming multiprocessors on a device.
 pub unsafe fn device_get_num_sm(device: CUdevice) -> Result<i32> {
     let mut value = 0i32;

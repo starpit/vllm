@@ -138,7 +138,7 @@ impl<'a> EmitCtx<'a> {
                     .unwrap_or_else(|| format_ident!("__missing_tile_{}_{}", id.0, slot));
                 quote! { (*#ident).as_view() }
             }
-            FufInput::Weight { id, index } => {
+            FufInput::Weight { id, index, .. } => {
                 let name = weight_field_name(self.program, *id, *index);
                 quote! { wm.#name }
             }

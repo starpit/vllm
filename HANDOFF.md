@@ -696,13 +696,48 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
-**Four correctness goldens green via ferrite-forward.** Dense-bf16
-Llama (SmolLM2-135M), Qwen2 (Qwen2.5-0.5B), Gemma2 (Gemma2-2B), and
-Granite (Granite-3.3-2B) all pass `test_cuda_correctness_*` through
-their `*Ferrite` variants (verified by `loaded ... via ferrite-forward`
-log lines on each; for Granite, also confirmed by diffing against
-`FERRITE_DISABLE=1` — both paths produce identical output down to
-the same tolerated prompt-1 position-2 top-N divergence).
+**AWQ Llama/Qwen2 ferrite end-to-end landed.** Dense-bf16 + AWQ
+Llama/Qwen2 both route through `#[forward]`-emitted code. The
+solver picks `Marlin*Impl` for any Gemm whose weight resolves to
+`StorageFormat::Awq { .. }` via the FUF-level annotation pass; the
+codegen-emitted `Weights::load` body allocates one marlin workspace
+at the top when any AWQ accessor is present, and the per-accessor
+FieldLoad routes to `MarlinLinear::load_awq` / `load_awq_concat`.
+Proven equivalent to the hand-written Marlin path by the existing
+`test_cuda_marlin_awq_*` tests (now running through ferrite after
+the `cuda_worker.rs` gate relaxed to `!is_quantized() || is_awq()`).
+
+**Four dense correctness goldens still green via ferrite-forward.**
+Dense-bf16 SmolLM2-135M, Qwen2.5-0.5B, Gemma2-2B, Granite-3.3-2B
+all pass `test_cuda_correctness_*` through their `*Ferrite` variants
+(verified by `loaded ... via ferrite-forward` log lines on each; for
+Granite, also confirmed by diffing against `FERRITE_DISABLE=1` —
+both paths produce identical output down to the same tolerated
+prompt-1 position-2 top-N divergence).
+
+**`test_cuda_correctness_llama_3_2_1b_awq` is NOT yet added** because
+the underlying Marlin path is numerically broken on this branch —
+ferrite and `FERRITE_DISABLE=1` produce identical garbage tokens
+(`"iesel!!!!!!!!!!!!!!!"` on Qwen2.5-0.5B-Instruct-AWQ with a chat
+prompt, for example). Same behavior on GPTQ (`"Hello!!!!!!!!!!!!!!!"`
+on `Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4`), so the bug is shared
+between AWQ and GPTQ code paths — either `marlin_gemm` itself or
+the wiring around `MarlinLinear::forward`. Dense bf16 Qwen2.5-0.5B
+produces coherent output (`"Sure, I can help you with that..."`),
+proving this is quant-specific.
+
+Evidence the ferrite AWQ path is correct despite the end-to-end
+garbage: both paths go through
+`ferrite_kernels::layers_quant::MarlinLinear::load_awq{,_concat}`
+verbatim, and the generated `Weights::load` emits
+`MarlinLinear::forward(x, &mut device.caching, device.compute_stream)`
+which matches the hand-written-path call shape. The golden JSON
+(`crates/vllm-e2e/testdata/golden/llama_3_2_1b_awq.json`,
+generated against Python vLLM via `scripts/generate_golden_refs.py`)
+is committed and will unblock the correctness test the moment the
+Marlin path is fixed. Next session: diagnose the shared Marlin
+correctness bug, then drop in the one-line test body described in
+`e_correctness.rs`'s comment.
 
 **Prompt-7 root cause was NOT in the kernels.** The prior session's
 "shared CUDA kernel drift" theory was wrong. Per-layer hidden-state
@@ -868,34 +903,47 @@ tackle in roughly this order.
    memory-bound tail (rmsnorm, silu, add, rope, elementwise) so
    nothing fuses into `__global__` megakernels. Port the device
    bodies + add the emission arm.
-2. **Quantized Linear — AWQ in progress; GPTQ/FP8/BnB untouched.**
-   Preparation landed (commits `999076179`, `974e9a4c8` — see the
-   dedicated **"Quantization path (in progress)"** section below
-   for the compiler-native plan and the concrete Commit 3
-   checklist). Runtime `match qconfig` on load is an anti-pattern
-   here — see the "Runtime polymorphism for quant" failure
-   pattern above.
-3. **QK-norm** (Qwen3, Gemma3) — `qk_norm_inplace` +
+2. **Marlin numerical bug (blocks AWQ/GPTQ correctness golden).**
+   AWQ and GPTQ both produce incoherent output via `marlin_gemm`
+   on this branch (ferrite and `FERRITE_DISABLE=1` agree: same
+   garbage tokens for the same AWQ model, proving the bug isn't
+   in the dispatch glue). Dense bf16 on the same arch works. The
+   compiler-side AWQ integration is proven equivalent to the
+   hand-written path via `test_cuda_marlin_awq_*`; the end-to-end
+   golden lands as a one-liner in `e_correctness.rs` once marlin
+   produces the coherent output Python vLLM's golden captures.
+3. **GPTQ / FP8 / BnB quant plumbing** — analogous commits to the
+   AWQ Commit 3 just landed. Each new format needs: parser arm in
+   `quantization::QuantizationConfig::parse`, new `StorageFormat`
+   variant (GPTQ shares Marlin with AWQ so it reuses `MarlinLinear`
+   via a parallel loader), the corresponding `Marlin*Impl` /
+   `Fp8*Impl` / `Bnb*Impl` matchers gated on that storage format,
+   `FieldLoad` arm emitting the right loader, `is_*()` helper on
+   `QuantConfig` + gate lift in `cuda_worker.rs`, a new u8 value
+   assigned in `ferrite_forward_macro::quant_discriminator` +
+   `ferrite_quant_kind`. See commit `<this commit>` for the AWQ
+   template; each format lands as one atomic commit.
+4. **QK-norm** (Qwen3, Gemma3) — `qk_norm_inplace` +
    `rotary_embedding_q_only` path. Needs a `FusedQkvQkNormRopeImpl`.
-4. **Gemma3** — another alternating-attention architecture, but
+5. **Gemma3** — another alternating-attention architecture, but
    with a 5:1 local/global ratio. Should reuse the DSL
    `if layer % sliding_window_pattern == 0 { ... }` construct
-   now that it exists. Gemma3 also needs QK-norm (see gap #3)
+   now that it exists. Gemma3 also needs QK-norm (see gap #4)
    and different RoPE scaling. Diff should hit only
    `ferrite-models/src/gemma3.rs` + `model_architectures/gemma3/*.json`
    + any net-new kernels — NOT the compiler.
-5. **MoE (Mixtral, Qwen2-MoE)** — needs a DSL construct for
+6. **MoE (Mixtral, Qwen2-MoE)** — needs a DSL construct for
    `for each of top-k experts run sub-body`. Generic language
    extension, not an MoE-specific branch.
-6. **MLA (DeepSeek-V2)** — new `attention_mla` op + kernel +
+7. **MLA (DeepSeek-V2)** — new `attention_mla` op + kernel +
    Shape signature; compiler stays out of MLA.
-7. **PP weight-load plumbing** — ferrite's backbone forward is
+8. **PP weight-load plumbing** — ferrite's backbone forward is
    in place, but `cuda_worker.rs` still refuses to load
    `ferrite_models::<arch>::Weights` when `use_pp` (dense Weights
    type doesn't know about layer ranges). Extend `Weights::load`
    to accept a layer range so PP intermediate ranks can only
    materialise their owned layers.
-8. **Chat-completion double-BOS fix** — `crates/vllm-serve/src/engine.rs:2857`
+9. **Chat-completion double-BOS fix** — `crates/vllm-serve/src/engine.rs:2857`
    does `tok.encode(&text, true)` after rendering a chat template
    that already emits `<bos>` / `<|begin_of_text|>` literally.
    Flip to `false`. Pre-existing bug, surfaced while diagnosing
@@ -1004,14 +1052,49 @@ tackle in roughly this order.
   golden. Ferrite and `FERRITE_DISABLE=1` paths produce identical
   output down to the same tolerated prompt-1 position-2 top-N
   divergence.
+- **AWQ Llama + Qwen2 (Commit 3)** — compiler-native quant slice.
+  `FufInput::Weight { id, index, storage: StorageFormat }` carries
+  per-weight format; `Fuf::annotate_storage_formats(program, model)`
+  populates it after unroll using the HF `quantization_config` +
+  `tie_word_embeddings` + the Gemm-only-consumer rule. Dense impls
+  (`GemmRefImpl`, `CutlassGemmImpl`, `CutlassGemvImpl`,
+  `FusedGateUpSiluMulImpl`, `FusedGateUpGeluMulImpl`,
+  `FusedQkvRopeCacheImpl`, `FusedQkvRopePrefillImpl`) gate
+  `matches()` to reject non-Dense storage; new `MarlinGemmImpl`,
+  `MarlinFusedGateUpSiluMulImpl`, `MarlinFusedQkvRopeCacheImpl`,
+  `MarlinFusedQkvRopePrefillImpl` claim Awq storage instead and
+  declare `rust_type = MarlinLinear`. Codegen adds
+  `FieldLoad::AwqLinear { prefix, group_size }` +
+  `FieldLoad::AwqLinearConcat { prefixes, group_size }` routed by
+  accessor rust_type; the `Weights::load` body emits a one-shot
+  `alloc_marlin_workspace` + `current_device` + `device_get_num_sm`
+  prelude when any AWQ accessor is present. Arch-level dispatcher's
+  match tuple gains `quant_kind: u8` (Dense=0, Awq=1) so
+  dense/AWQ Llama-3.2-1B no longer share a fingerprint — see
+  `ferrite_forward_macro::quant_discriminator` and
+  `cuda_worker::ferrite_quant_kind`. `cuda_worker.rs` gate lifted
+  to `!is_quantized() || is_awq()` for LlamaFerrite + Qwen2Ferrite.
+  `model_architectures/llama/llama-3.2-1b-awq.json` +
+  `model_architectures/qwen2/qwen2.5-0.5b-awq.json` committed.
+  Existing `test_cuda_marlin_awq_{server_starts,completion,chat}`
+  now route through the ferrite path (cuda_worker logs
+  `loaded Qwen2 via ferrite-forward`) and all three pass.
+  `testdata/golden/llama_3_2_1b_awq.json` committed
+  (Python-vLLM-generated) but the correctness golden test is NOT
+  added yet — blocked on the shared Marlin numerical bug (AWQ and
+  GPTQ both produce garbage on this branch; `FERRITE_DISABLE=1`
+  reproduces the same garbage, confirming it's pre-existing). The
+  golden JSON is byte-for-byte reusable once marlin is fixed.
 
 ## Quantization path (in progress)
 
-Preparation for ferrite-forward quant is landed; the next session
-finishes the AWQ end-to-end slice. The compiler-native plan —
-agreed after considerable back-and-forth on the record in this
-session — is what the next context must start from. Do not
-re-litigate it.
+AWQ Llama / Qwen2 slice landed (see "Landed since the correctness
+fix" above). Remaining AWQ work is the correctness golden test,
+which is blocked on the Marlin numerical bug in gap #2. GPTQ /
+FP8 / BnB / FP8-block still need their own commits — the AWQ
+slice's shape (`StorageFormat::<Format>`, `<Format>*Impl`,
+`FieldLoad::<Format>Linear`, u8 discriminator slot, `is_<format>()`
+helper, gate lift) is the template.
 
 ### Core principle
 
@@ -1084,120 +1167,23 @@ pub fn load(gw, stream) -> Result<Self> {
      AWQ smoke tests on Qwen2.5-0.5B-AWQ (`test_cuda_marlin_awq_*`
      in `e1_basic_serving.rs`) pass unchanged.
 
-### What's left (Commit 3 — AWQ Llama end-to-end)
+### Commit 3 — landed
 
-This is a single atomic commit per the "commit complete" rule.
-Split only if a sub-piece truly lands with its consumer.
-
-1. **Per-format Impls in `ferrite-forward-macro/src/impl_lib.rs`.**
-   Following the existing pattern of the dense fused impls —
-   `FusedQkvRopeCacheImpl` (line ~2700), `FusedQkvRopePrefillImpl`
-   (line ~3100), `FusedGateUpSiluMulImpl` (line ~1200):
-   - `MarlinGemmImpl` — singleton Gemm. `matches()` accepts when
-     the source weight's storage is `Awq{..}`. Declares
-     `rust_type: ::ferrite_kernels::layers::MarlinLinear`.
-     `emit_call` emits `(w).forward(x, &mut device.caching,
-     device.compute_stream)` — note: `MarlinLinear::forward`
-     takes `(x, alloc, stream)`, NO cublas handle (compare to
-     `LinearLayer::forward`'s signature).
-   - `MarlinFusedQkvRopeCacheImpl` / `MarlinFusedQkvRopePrefillImpl`
-     — mirror the dense variants but `required_weights` declares
-     `rust_type: MarlinLinear` for the fused QKV accessor, and
-     `emit_call` calls `MarlinLinear::forward`. The packed output
-     shape `[M, q_size + 2*kv_size]` is the same as dense — feed
-     it into `fused_qkv_rope_cache` unchanged.
-   - `MarlinFusedGateUpSiluMulImpl` — same pattern for gate/up
-     fusion. AWQ also collapses two weights into one
-     `MarlinLinear` at load time.
-   - Existing dense impls (`GemmRefImpl`, `FusedQkvRope*Impl`,
-     `FusedGateUpSiluMulImpl`) need their `matches()` to REJECT
-     Awq source weights. Otherwise the solver sees both
-     `GemmRefImpl` and `MarlinGemmImpl` as candidates for an AWQ
-     Gemm tile, and the cost-comparison would be between two
-     impls emitting incompatible code. Simplest fix: add a
-     storage-format predicate early in each dense impl's
-     `matches()` that bails when the source weight isn't
-     `StorageFormat::Dense`. The `matches()` signature currently
-     takes `(fuf, seed, profile)` — need to thread the per-model
-     `ModelParams` + `Program` (or a pre-computed
-     weight-format map) through `solver::solve` into the
-     matcher. Smallest path: extend `MatchCtx` / add a
-     `WeightFormatResolver` arg.
-   - Register all four in `starter_library()`.
-2. **`FieldLoad` arms in `codegen.rs`.** Add:
-   - `FieldLoad::AwqLinear { prefix: String, group_size: u32 }`
-     → emits `MarlinLinear::load_awq(gw, prefix, group_size, __marlin_ws, __device_id)?`.
-   - `FieldLoad::AwqLinearConcat { prefixes: Vec<String>, group_size: u32 }`
-     → emits `MarlinLinear::load_awq_concat(gw, &[prefixes…], group_size, __marlin_ws, __device_id)?`.
-   - Extend `plan_field_load` to detect `rust_type: MarlinLinear`
-     + consult storage format to set `group_size` from the
-     `QuantizationConfig::Awq`.
-   - Relax the storage-format guard in `emit_weights_struct`:
-     when the accessor's `rust_type` is `MarlinLinear`, allow
-     `StorageFormat::Awq` source weights. The guard's current
-     shape is the right place to land the relaxation — one if-arm
-     per accessor-type/format pair.
-3. **Workspace + device_id emission in the `Weights::load` body.**
-   `emit_weights_struct`: if any FieldLoad in the accessor list
-   is AWQ-flavored, emit three top-of-body bindings before the
-   per-accessor `let`s:
-   ```rust
-   let __device_id: i32 = /* ferrite_cuda_core driver query */;
-   let __num_sm: i32 = /* ferrite_cuda_core driver query */;
-   let __marlin_ws = ferrite_kernels::layers_quant::alloc_marlin_workspace(
-       __num_sm, stream,
-   )?;
-   ```
-   Helpers for the driver queries: check `ferrite-cuda-core/src/driver.rs`
-   for existing `current_device_id()` / `num_sms(device)`; if
-   missing, add thin wrappers over `cudarc::driver::result::device::*`.
-   Don't add arguments to the `Weights::load` signature — the
-   caller in `cuda_worker.rs` must stay uniform across dense and
-   AWQ models.
-4. **AWQ model config.** Add
-   `model_architectures/llama/llama-3.2-1b-awq.json` — copy the
-   dense `llama-3.2-1b.json` and append:
-   ```json
-   "quantization_config": {
-     "quant_method": "awq", "bits": 4, "group_size": 128,
-     "zero_point": true, "version": "gemm",
-     "modules_to_not_convert": ["lm_head"]
-   }
-   ```
-   HF's AWQ Llama-3.2-1B repos (e.g. `TheBloke/...` or the
-   `hugging-quants` org) ship configs in this shape; pick a
-   real HF repo whose config matches the committed one so the
-   golden test below has weights to load.
-5. **Lift the `cuda_worker.rs` AWQ gate for `LlamaFerrite`.** The
-   current gate (lines ~5221-5226 of `crates/vllm-executor/src/cuda_worker.rs`
-   in prior sessions — verify line numbers) filters
-   `!qconfig.is_quantized() && !use_tp && !use_pp` to ferrite.
-   Replace with `!qconfig.is_bnb4bit() && !qconfig.is_fp8() &&
-   (!qconfig.is_quantized() || qconfig.is_awq()) && !use_tp &&
-   !use_pp` so AWQ routes to `LlamaFerrite` while the other
-   quant formats still take the hand-written path. The
-   `QuantConfig::Awq(_) | Gptq(_) | None | ...` enum already
-   exists in `vllm-cuda::quant`.
-6. **Marlin golden.** Add `test_cuda_correctness_llama_3_2_1b_awq`
-   under `crates/vllm-e2e/tests/e_correctness.rs`, using a real HF
-   AWQ repo as the model source. Diff against `FERRITE_DISABLE=1`
-   (hand-written AWQ path) — same methodology as
-   `test_cuda_correctness_granite_3_3_2b`. The ferrite path
-   produces tokens via `MarlinLinear::load_awq_concat` (fused
-   QKV, fused gate/up) + `MarlinLinear::forward` per GEMM; the
-   hand-written path produces tokens via the same underlying
-   `MarlinLinear::load_awq_concat` helper (commit `974e9a4c8`
-   wired the delegation) so the two should match byte-for-byte
-   modulo the dense/ferrite tolerance window already used by the
-   Granite golden.
+See the "Landed since the correctness fix" bullet describing the
+AWQ Llama + Qwen2 end-to-end slice for exactly what shipped and
+what's still blocked (the correctness golden test, waiting on the
+shared Marlin numerical bug). The design notes below stay current.
 
 ### Pitfalls to dodge (from this session's back-and-forth)
 
 - **Don't add a `FusedLinear` enum.** We removed the one I added
   in this session's first attempt. See the "Runtime polymorphism
   for quant" failure pattern above.
-- **Don't change `Weights::load`'s signature.** Workspace +
-  device_id are emitted inline by codegen, not threaded through.
+- **Don't thread workspace / device_id through `Weights::load`.**
+  They're emitted inline by codegen. The arch-level dispatcher
+  gained one new arg (`quant_kind: u8`) so dense and AWQ variants
+  of the same shape can be disambiguated at runtime — that's the
+  *only* signature extension, and it's format-agnostic.
 - **Don't invent an arch-level "quant config" arg.** Per-model
   storage formats are already in each `ModelParams`.
 - **Don't re-fork the marlin repack logic.** The single source of

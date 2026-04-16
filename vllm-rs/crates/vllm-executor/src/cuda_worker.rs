@@ -965,6 +965,19 @@ impl CudaModel {
 // Config helpers: HfModelConfig → vllm-cuda configs
 // ---------------------------------------------------------------------------
 
+/// Map a runtime `QuantConfig` to the ferrite-forward arch-level
+/// dispatcher's quant-kind discriminator. Must match the values
+/// assigned in `ferrite_forward_macro::quant_discriminator` (0 =
+/// Dense/None, 1 = AWQ). Only the quant families ferrite handles
+/// today need a non-zero value; others fall back to 0 because they
+/// never route through the ferrite path anyway (cuda_worker gate).
+fn ferrite_quant_kind(qconfig: &vllm_cuda::quant::QuantConfig) -> u8 {
+    match qconfig {
+        vllm_cuda::quant::QuantConfig::Awq(_) => 1,
+        _ => 0,
+    }
+}
+
 fn llama_config_from_hf(
     hf: &HfModelConfig,
 ) -> ExecutorResult<vllm_cuda::model::llama::LlamaConfig> {
@@ -5218,9 +5231,14 @@ impl Worker for CudaWorker {
                 // known-good reference against which the ferrite
                 // output can be diffed per-layer.
                 let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
+                // Ferrite handles dense bf16/fp16 and AWQ. bnb4bit /
+                // fp8 / gptq still take the hand-written path — their
+                // FieldLoad arms haven't landed yet. TP + PP also
+                // stay on the hand-written path (PP weight-load range
+                // support is pending).
                 if !qconfig.is_bnb4bit()
                     && !qconfig.is_fp8()
-                    && !qconfig.is_quantized()
+                    && (!qconfig.is_quantized() || qconfig.is_awq())
                     && !use_tp
                     && !use_pp
                     && !disable_ferrite
@@ -5236,6 +5254,7 @@ impl Worker for CudaWorker {
                         config.num_kv_heads as u64,
                         config.head_dim as u64,
                         config.vocab_size as u64,
+                        ferrite_quant_kind(&qconfig),
                     )
                     .map_err(|e| {
                         ExecutorError::WorkerInit(format!("Llama ferrite-forward load: {e}"))
@@ -5371,9 +5390,14 @@ impl Worker for CudaWorker {
                 // corresponding Impls land.
                 let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
                 let llama_cfg = &qwen2_config.0;
+                // Ferrite handles dense + AWQ; quant / TP / PP else.
+                // Qwen2's QKV bias rides through `MarlinLinear`'s
+                // optional bias field (added after the marlin GEMM
+                // via `bias_add_inplace`), same result as the dense
+                // cuBLAS-fused path.
                 if !qconfig.is_bnb4bit()
                     && !qconfig.is_fp8()
-                    && !qconfig.is_quantized()
+                    && (!qconfig.is_quantized() || qconfig.is_awq())
                     && !use_tp
                     && !use_pp
                     && !disable_ferrite
@@ -5389,6 +5413,7 @@ impl Worker for CudaWorker {
                         llama_cfg.num_kv_heads as u64,
                         llama_cfg.head_dim as u64,
                         llama_cfg.vocab_size as u64,
+                        ferrite_quant_kind(&qconfig),
                     )
                     .map_err(|e| {
                         ExecutorError::WorkerInit(format!("Qwen2 ferrite-forward load: {e}"))
@@ -5529,6 +5554,7 @@ impl Worker for CudaWorker {
                         config.num_kv_heads as u64,
                         config.head_dim as u64,
                         config.vocab_size as u64,
+                        ferrite_quant_kind(&qconfig),
                     )
                     .map_err(|e| {
                         ExecutorError::WorkerInit(format!("Gemma2 ferrite-forward load: {e}"))
@@ -5709,6 +5735,7 @@ impl Worker for CudaWorker {
                         config.num_kv_heads as u64,
                         config.head_dim as u64,
                         config.vocab_size as u64,
+                        ferrite_quant_kind(&qconfig),
                     )
                     .map_err(|e| {
                         ExecutorError::WorkerInit(format!("Granite ferrite-forward load: {e}"))

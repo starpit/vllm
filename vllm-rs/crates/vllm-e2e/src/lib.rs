@@ -138,6 +138,10 @@ impl TestModels {
 
     // AWQ quantized models (CPU, not MLX)
     pub const QWEN2_0_5B_AWQ: &str = "Qwen/Qwen2.5-0.5B-Instruct-AWQ";
+    // AWQ Llama-3.2-1B — exercises ferrite-forward's MarlinGemm +
+    // MarlinFusedQkvRope* + MarlinFusedGateUpSiluMul impls. The repo's
+    // `quantization_config` matches `model_architectures/llama/llama-3.2-1b-awq.json`.
+    pub const LLAMA_3_2_1B_AWQ: &str = "AMead10/Llama-3.2-1B-Instruct-AWQ";
 
     // Gemma2 GPTQ quantized models (ungated)
     pub const GEMMA2_2B_GPTQ_INT4: &str = "qilowoq/gemma-2-2B-it-4Bit-GPTQ";

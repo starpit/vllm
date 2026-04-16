@@ -52,6 +52,13 @@ pub struct ModelParams {
     /// per-weight storage format via
     /// [`crate::quantization::storage_format_for_weight`].
     pub quantization: Option<QuantizationConfig>,
+    /// HF's `tie_word_embeddings` flag. When `true`, `lm_head`
+    /// shares its weight buffer with `embed_tokens` and has no
+    /// on-disk `lm_head.*` tensors — the codegen FieldLoad plan
+    /// falls back to [`crate::codegen::FieldLoad::LinearTiedToEmbedding`]
+    /// and the quant resolver keeps `lm_head` dense even under an
+    /// AWQ config whose `modules_to_not_convert` doesn't list it.
+    pub tie_word_embeddings: bool,
 }
 
 /// Errors produced while loading configs.
@@ -109,7 +116,18 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
         .collect();
-    paths.sort();
+    // Sort by file stem, not full PathBuf. `PathBuf::cmp` compares
+    // byte-by-byte including the extension, which puts
+    // `llama-3.2-1b-awq.json` before `llama-3.2-1b.json` (hyphen
+    // 0x2D < dot 0x2E). Stem-sort keeps the natural
+    // `llama-3.2-1b, llama-3.2-1b-awq` ordering and keeps every
+    // existing config's position unchanged.
+    paths.sort_by(|a, b| {
+        a.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .cmp(b.file_stem().and_then(|s| s.to_str()).unwrap_or(""))
+    });
     paths.iter().map(|p| load_file(p)).collect()
 }
 
@@ -146,6 +164,10 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
             source: e,
         }
     })?;
+    let tie_word_embeddings = json
+        .get("tie_word_embeddings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     Ok(ModelParams {
         name,
@@ -154,6 +176,7 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
         bounds,
         scalars,
         quantization,
+        tie_word_embeddings,
     })
 }
 
@@ -257,8 +280,10 @@ mod tests {
         let dir = repo_model_archs().join("llama");
         let configs = load_dir(&dir).expect("load llama configs");
 
-        // 9 Llama configs (405B gated, skipped) + smollm2-135m.
-        assert_eq!(configs.len(), 10, "expected 10 Llama configs");
+        // 9 Llama configs (405B gated, skipped) + smollm2-135m +
+        // llama-3.2-1b-awq (AWQ config committed for the Commit 3
+        // end-to-end slice).
+        assert_eq!(configs.len(), 11, "expected 11 Llama configs");
 
         // Ground-truth check on llama-3.2-1b. Published values:
         //   num_hidden_layers = 16
@@ -289,7 +314,7 @@ mod tests {
     fn load_real_qwen2_configs() {
         let dir = repo_model_archs().join("qwen2");
         let configs = load_dir(&dir).expect("load qwen2 configs");
-        assert_eq!(configs.len(), 11, "expected 11 Qwen2 configs");
+        assert_eq!(configs.len(), 12, "expected 12 Qwen2 configs");
 
         // Ground-truth check on Qwen2-0.5B:
         //   num_hidden_layers    = 24

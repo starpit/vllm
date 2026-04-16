@@ -36,6 +36,10 @@ MODELS = {
     "smollm_135m": "HuggingFaceTB/SmolLM2-135M-Instruct",
     "gemma2_2b": "unsloth/gemma-2-2b-it",
     "granite_3_3_2b": "ibm-granite/granite-3.3-2b-instruct",
+    # AWQ — exercises the ferrite-forward MarlinLinear / marlin_gemm path.
+    # Both FERRITE_ENABLED and FERRITE_DISABLE=1 runs should match this
+    # golden within the same top-N tolerance used for dense correctness tests.
+    "llama_3_2_1b_awq": "AMead10/Llama-3.2-1B-Instruct-AWQ",
 }
 
 MAX_TOKENS = 32

@@ -22,7 +22,8 @@ use quote::quote;
 
 use crate::classified::{OpKind, Program, WeightId};
 use crate::emit::{EmitCtx, weight_field_name};
-use crate::fuf::{Fuf, FufInput, TileId};
+use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+use crate::quantization::StorageFormat;
 use crate::shape::{Dim, Shape};
 use crate::target::TargetProfile;
 
@@ -348,7 +349,7 @@ pub fn default_required_weights(
     for &tid in claimed_tiles {
         let node = fuf.get(tid);
         for input in &node.inputs {
-            if let FufInput::Weight { id, index } = input {
+            if let FufInput::Weight { id, index, .. } = input {
                 let name = weight_field_name(program, *id, *index);
                 if !seen.insert(name.to_string()) {
                     continue;
@@ -409,8 +410,9 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// a subgraph that includes `seed`, `None` otherwise.
     ///
     /// The matcher is procedural Rust: it inspects `fuf`, walks
-    /// neighbors of `seed`, and decides whether the local
-    /// structure matches the impl's expected pattern.
+    /// neighbors of `seed`, and decides whether the local structure
+    /// matches the impl's expected pattern. Quant-aware impls gate
+    /// on weight storage via [`Fuf::storage_format_of`].
     fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo>;
 
     /// Predicted wall-clock cost in microseconds for one
@@ -704,7 +706,18 @@ macro_rules! trivial_impl {
                 seed: TileId,
                 _profile: &TargetProfile,
             ) -> Option<MatchInfo> {
-                single_tile_match(fuf, seed, $op)
+                let info = single_tile_match(fuf, seed, $op)?;
+                // Reference impls consume the weight as a dense
+                // `LinearLayer` / `Embedding` / `RmsNorm`. A non-Dense
+                // weight input means a quant-aware impl must cover
+                // this tile — bail so the solver doesn't pick a dense
+                // kernel on AWQ bits.
+                if let Some(s) = weight_storage_of(fuf.get(seed))
+                    && !matches!(s, StorageFormat::Dense)
+                {
+                    return None;
+                }
+                Some(info)
             }
             fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
                 ($cost)(m, ctx)
@@ -1098,6 +1111,19 @@ pub fn starter_library() -> ImplementationLibrary {
         }));
     }
     lib.push(Box::new(CutlassGemvImpl));
+
+    // ── Marlin (AWQ) impls ──────────────────────────────────────
+    //
+    // Active only on models whose `quantization_config` resolves at
+    // least one weight to `StorageFormat::Awq { .. }`. Each matcher
+    // gates on AWQ storage, so they're no-ops on dense models — the
+    // dense fused impls claim the same patterns for `Dense`
+    // weights. Registered after the Cutlass zoo so they land with
+    // the rest of the matmul kernels.
+    lib.push(Box::new(MarlinGemmImpl));
+    lib.push(Box::new(MarlinFusedGateUpSiluMulImpl));
+    lib.push(Box::new(MarlinFusedQkvRopeCacheImpl));
+    lib.push(Box::new(MarlinFusedQkvRopePrefillImpl));
     lib
 }
 
@@ -1124,6 +1150,19 @@ pub fn starter_library() -> ImplementationLibrary {
 #[derive(Debug, Default)]
 pub struct FusedGateUpSiluMulImpl;
 
+/// The [`StorageFormat`] of the first weight input of `node`, or
+/// `None` if the node has no weight inputs. Every Gemm tile in the
+/// FUF carries exactly one `FufInput::Weight`; non-Gemm tiles return
+/// `None`. Dense and quant-aware impls alike read this to decide
+/// whether the kernel they emit (cuBLAS / cutlass vs. Marlin) can
+/// legally consume the weight's storage.
+fn weight_storage_of(node: &FufNode) -> Option<&StorageFormat> {
+    node.inputs.iter().find_map(|i| match i {
+        FufInput::Weight { storage, .. } => Some(storage),
+        _ => None,
+    })
+}
+
 /// Return the `(TileId, slot)` of a node's first `FufInput::Tile`
 /// input. For Gemm this identifies the activation (the weight input
 /// is a `FufInput::Weight`).
@@ -1139,7 +1178,7 @@ fn first_tile_input(node: &crate::fuf::FufNode) -> Option<(TileId, u8)> {
 /// call; we don't care about position, just "which weight flows in".
 fn first_weight_ref(node: &crate::fuf::FufNode) -> Option<(WeightId, Option<u64>)> {
     node.inputs.iter().find_map(|i| match i {
-        FufInput::Weight { id, index } => Some((*id, *index)),
+        FufInput::Weight { id, index, .. } => Some((*id, *index)),
         _ => None,
     })
 }
@@ -1180,6 +1219,10 @@ impl Implementation for FusedGateUpSiluMulImpl {
         // larger-claim-preferred sort in solver.rs:solve_one.
         let gate_gemm = fuf.get(seed);
         if gate_gemm.op != OpKind::Gemm {
+            return None;
+        }
+        // Dense kernel: reject AWQ storage.
+        if !matches!(weight_storage_of(gate_gemm), Some(StorageFormat::Dense)) {
             return None;
         }
 
@@ -1413,6 +1456,10 @@ impl Implementation for FusedGateUpGeluMulImpl {
         // 4-tile claim before the DP greedy-claims the Gelu.
         let gate_gemm = fuf.get(seed);
         if gate_gemm.op != OpKind::Gemm {
+            return None;
+        }
+        // Dense kernel: reject AWQ storage.
+        if !matches!(weight_storage_of(gate_gemm), Some(StorageFormat::Dense)) {
             return None;
         }
         let gelu_node = fuf
@@ -2054,7 +2101,7 @@ impl Implementation for FusedAddRmsNormImpl {
             .inputs
             .iter()
             .find_map(|i| match i {
-                FufInput::Weight { id, index } => Some((*id, *index)),
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
                 _ => None,
             })
             .expect("RmsNorm has a weight input");
@@ -2261,7 +2308,7 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
             .inputs
             .iter()
             .find_map(|i| match i {
-                FufInput::Weight { id, index } => Some((*id, *index)),
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
                 _ => None,
             })
             .expect("scalar-offset Add has a Weight input");
@@ -2355,7 +2402,7 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
             .inputs
             .iter()
             .find_map(|i| match i {
-                FufInput::Weight { id, index } => Some((*id, *index)),
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
                 _ => None,
             })
             .expect("scalar-offset Add has a Weight input");
@@ -2530,7 +2577,7 @@ impl Implementation for ScalarOffsetRmsNormImpl {
             .inputs
             .iter()
             .find_map(|i| match i {
-                FufInput::Weight { id, index } => Some((*id, *index)),
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
                 _ => None,
             })
             .expect("ScalarOffsetRmsNorm's Add has a Weight input");
@@ -2574,7 +2621,7 @@ impl Implementation for ScalarOffsetRmsNormImpl {
             .inputs
             .iter()
             .find_map(|i| match i {
-                FufInput::Weight { id, index } => Some((*id, *index)),
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
                 _ => None,
             })
             .expect("ScalarOffsetRmsNorm's Add has a Weight input");
@@ -2657,6 +2704,10 @@ impl Implementation for FusedQkvRopeCacheImpl {
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let seed_node = fuf.get(seed);
         if seed_node.op != OpKind::Gemm {
+            return None;
+        }
+        // Dense kernel: reject AWQ storage on the seed.
+        if !matches!(weight_storage_of(seed_node), Some(StorageFormat::Dense)) {
             return None;
         }
 
@@ -3787,6 +3838,10 @@ impl Implementation for CutlassGemmImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        // Dense kernel: reject AWQ storage.
+        if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
+            return None;
+        }
         if gemm_is_fusion_partner(fuf, seed) {
             return None;
         }
@@ -3882,6 +3937,10 @@ impl Implementation for CutlassGemvImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        // Dense kernel: reject AWQ storage.
+        if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
+            return None;
+        }
         if gemm_is_fusion_partner(fuf, seed) {
             return None;
         }
@@ -3946,6 +4005,696 @@ impl Implementation for CutlassGemvImpl {
     }
 }
 
+// ── Marlin* impls ────────────────────────────────────────────────
+//
+// Quant-aware mirrors of `GemmRefImpl`, `FusedGateUpSiluMulImpl`,
+// `FusedQkvRopeCacheImpl`, and `FusedQkvRopePrefillImpl`. Each one:
+//   - Structural match identical to its dense sibling (walks the
+//     same tile pattern off the seed).
+//   - Weight storage gate **inverted**: requires every participating
+//     Gemm's weight input to be `StorageFormat::Awq { .. }`, not
+//     `Dense`. The dense variants already reject Awq storage, so
+//     the solver picks exactly one family per model.
+//   - `required_weights` declares the packed accessor with
+//     `rust_type = MarlinLinear`. AWQ qweight/scales/qzeros all
+//     concat along dim N, so the fused QKV / fused gate-up case
+//     collapses to **one** `MarlinLinear` — same shape the dense
+//     fused accessor uses (one `LinearLayer`).
+//   - `emit_call` invokes `MarlinLinear::forward(x, alloc, stream)`.
+//     No cublas handle — marlin's kernel owns the matmul.
+
+/// Does `tile` have a Gemm + AWQ-storage weight? Quant-aware impls
+/// gate on this at the seed and at every fused Gemm they claim.
+fn is_awq_gemm(fuf: &Fuf, tile: TileId) -> bool {
+    let node = fuf.get(tile);
+    node.op == OpKind::Gemm && matches!(weight_storage_of(node), Some(StorageFormat::Awq { .. }))
+}
+
+/// Singleton Marlin GEMM — the AWQ counterpart of `GemmRefImpl`.
+#[derive(Debug, Default)]
+pub struct MarlinGemmImpl;
+
+impl Implementation for MarlinGemmImpl {
+    fn name(&self) -> &'static str {
+        "marlin_gemm"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        if !is_awq_gemm(fuf, seed) {
+            return None;
+        }
+        // Same fusion-partner guard as CutlassGemmImpl: don't
+        // singleton-claim a Gemm whose output feeds a fused
+        // downstream (RopeAppend / Silu / Mul / Gelu) — those
+        // claims belong to `MarlinFusedQkvRope*Impl` /
+        // `MarlinFusedGateUpSiluMulImpl`.
+        if gemm_is_fusion_partner(fuf, seed) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // No CSV baseline for marlin today — reuse the cuBLAS
+        // analytical estimate. Parity with the future
+        // `cost_<target>.csv` lookup will land alongside the marlin
+        // calibration sweep.
+        cost_gemm(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Same single-weight accessor as the dense default, but
+        // typed `MarlinLinear` so codegen routes the FieldLoad
+        // through `MarlinLinear::load_awq`.
+        let tile = claimed_tiles[0];
+        let (wid, index) = first_weight_ref(fuf.get(tile)).expect("Gemm has a weight input");
+        let name = weight_field_name(program, wid, index);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
+            source_weights: vec![(wid, index)],
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let x = ctx.input_expr(tile, 0);
+        let w = ctx.input_expr(tile, 1);
+        quote! {
+            let #out = unsafe {
+                (#w).forward(
+                    #x,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+/// Marlin fused gate/up + SwiGLU — the AWQ counterpart of
+/// `FusedGateUpSiluMulImpl`. AWQ metadata concats along dim N, so
+/// the fused accessor is a single `MarlinLinear` (not two).
+#[derive(Debug, Default)]
+pub struct MarlinFusedGateUpSiluMulImpl;
+
+impl Implementation for MarlinFusedGateUpSiluMulImpl {
+    fn name(&self) -> &'static str {
+        "marlin_fused_gate_up_silu_mul"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Mirror of `FusedGateUpSiluMulImpl.matches`; see that impl
+        // for the pattern-walking rationale. The only structural
+        // change is the storage gate: BOTH Gemms must be AWQ.
+        let gate_gemm = fuf.get(seed);
+        if !is_awq_gemm(fuf, seed) {
+            return None;
+        }
+        let silu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Silu && consumes_tile(n, seed))?;
+        let silu_id = silu_node.id;
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, silu_id))?;
+        let mul_id = mul_node.id;
+        let up_gemm_id = mul_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != silu_id => Some(*id),
+            _ => None,
+        })?;
+        if !is_awq_gemm(fuf, up_gemm_id) {
+            return None;
+        }
+        if first_tile_input(gate_gemm)? != first_tile_input(fuf.get(up_gemm_id))? {
+            return None;
+        }
+        let mut claimed = [seed, up_gemm_id, silu_id, mul_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        let activation_tile = first_tile_input(gate_gemm)?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation_tile],
+            boundary_outputs: vec![mul_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedGateUpSiluMulImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Fused accessor covers gate + up; declared `MarlinLinear`
+        // so codegen emits `MarlinLinear::load_awq_concat`.
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Structurally identical to `FusedGateUpSiluMulImpl::emit_call`
+        // but the fused MarlinLinear's `.forward` takes `(x, alloc,
+        // stream)` — no cublas handle.
+        let silu_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Silu)
+            .expect("fused gate/up/silu/mul claim must contain Silu");
+        let mul_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
+            .expect("fused gate/up/silu/mul claim must contain Mul");
+        let (gate_id, _) =
+            first_tile_input(ctx.fuf.get(silu_id)).expect("silu has a tile input — the gate gemm");
+        let up_id = ctx
+            .claimed_tiles
+            .iter()
+            .copied()
+            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
+            .expect("claim contains a second Gemm — the up gemm");
+
+        let activation = ctx.input_expr(gate_id, 0);
+
+        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
+        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
+        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let mul_out = ctx.output_ident(mul_id, 0);
+        let intermediate = ctx.bound("intermediate_size") as usize;
+
+        quote! {
+            let #mul_out = unsafe {
+                let gate_up = (#weight_expr).forward(
+                    #activation,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                ::ferrite_kernels::kernels::silu_and_mul_fused(
+                    *gate_up,
+                    #intermediate,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+/// Marlin fused QKV + RoPE + cache-write (decode) — the AWQ
+/// counterpart of `FusedQkvRopeCacheImpl`.
+#[derive(Debug, Default)]
+pub struct MarlinFusedQkvRopeCacheImpl;
+
+impl Implementation for MarlinFusedQkvRopeCacheImpl {
+    fn name(&self) -> &'static str {
+        "marlin_fused_qkv_rope_cache"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Mirror of `FusedQkvRopeCacheImpl.matches`; diffs are the
+        // storage gate (Q/K/V must all be AWQ) and a bail path that
+        // uses the same `is_awq_gemm` helper.
+        let seed_node = fuf.get(seed);
+        if !is_awq_gemm(fuf, seed) {
+            return None;
+        }
+
+        let rope_node = fuf.nodes.iter().find(|n| {
+            if n.op != OpKind::RopeAppend || n.inputs.len() < 3 {
+                return false;
+            }
+            let qkv: Vec<TileId> = n
+                .inputs
+                .iter()
+                .take(3)
+                .filter_map(|i| match i {
+                    FufInput::Tile { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            if qkv.len() != 3 {
+                return false;
+            }
+            if !qkv.contains(&seed) {
+                return false;
+            }
+            if qkv.iter().any(|t| !is_awq_gemm(fuf, *t)) {
+                return false;
+            }
+            let act = first_tile_input(fuf.get(qkv[0]));
+            act.is_some() && qkv.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
+        })?;
+        let rope_id = rope_node.id;
+
+        let qkv_ids: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        let mut claimed: Vec<TileId> = qkv_ids
+            .iter()
+            .copied()
+            .chain(std::iter::once(rope_id))
+            .collect();
+        claimed.sort();
+
+        let _ = seed_node;
+        let activation = first_tile_input(fuf.get(qkv_ids[0]))?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation],
+            boundary_outputs: vec![rope_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedQkvRopeCacheImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Same alias declaration as the dense variant: rotated Q is
+        // the only OwnedTensor; K/V are paged-cache views.
+        let rope_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim contains RopeAppend");
+        vec![((rope_id, 0), None)]
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Mirror of `FusedQkvRopeCacheImpl::emit_call` with the
+        // cuBLAS-shaped `(#w).forward(#x, &mut device.cublas, ...)`
+        // replaced by `(#w).forward(#x, &mut device.caching, stream)`
+        // (MarlinLinear owns the matmul internally). The FP8 KV
+        // branch stays — it's orthogonal to the weight format.
+        let rope_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim must contain a RopeAppend");
+        let rope_node = ctx.fuf.get(rope_id);
+
+        let qkv_ids: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
+        let gate_gemm_id = qkv_ids[0];
+        let activation = ctx.input_expr(gate_gemm_id, 0);
+
+        let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
+            .iter()
+            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+            .collect();
+        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let num_q_heads = ctx.bound("num_attention_heads") as usize;
+        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+        let head_dim = ctx.bound("head_dim") as usize;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
+            as usize;
+
+        let q_out = ctx.output_ident(rope_id, 0);
+        let k_out = ctx.output_ident(rope_id, 1);
+        let v_out = ctx.output_ident(rope_id, 2);
+
+        quote! {
+            let #q_out = unsafe {
+                let qkv_packed = (#weight_expr).forward(
+                    #activation,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                if ctx.kv_cache.is_fp8() {
+                    ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
+                        *qkv_packed,
+                        *ctx.positions,
+                        ctx.rotary.cos_sin_cache,
+                        *ctx.slot_mapping,
+                        *ctx.kv_cache.k_cache(#layer),
+                        *ctx.kv_cache.v_cache(#layer),
+                        ctx.kv_cache.k_scale_ptr(#layer),
+                        ctx.kv_cache.v_scale_ptr(#layer),
+                        #q_size,
+                        #kv_size,
+                        #num_q_heads,
+                        #head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                } else {
+                    ::ferrite_kernels::kernels::fused_qkv_rope_cache(
+                        *qkv_packed,
+                        *ctx.positions,
+                        ctx.rotary.cos_sin_cache,
+                        *ctx.slot_mapping,
+                        *ctx.kv_cache.k_cache(#layer),
+                        *ctx.kv_cache.v_cache(#layer),
+                        #q_size,
+                        #kv_size,
+                        #num_q_heads,
+                        #head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                }
+            };
+            let #k_out = ctx.kv_cache.k_cache(#layer);
+            let #v_out = ctx.kv_cache.v_cache(#layer);
+        }
+    }
+}
+
+/// Marlin fused QKV + RoPE (prefill, contiguous K/V) — the AWQ
+/// counterpart of `FusedQkvRopePrefillImpl`.
+#[derive(Debug, Default)]
+pub struct MarlinFusedQkvRopePrefillImpl;
+
+impl Implementation for MarlinFusedQkvRopePrefillImpl {
+    fn name(&self) -> &'static str {
+        "marlin_fused_qkv_rope_prefill"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        // Same pattern as the cache variant — delegate so the
+        // matcher lives in one place.
+        MarlinFusedQkvRopeCacheImpl.matches(fuf, seed, profile)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        MarlinFusedQkvRopeCacheImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        MarlinFusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Mirror of `FusedQkvRopePrefillImpl::emit_call` with
+        // `MarlinLinear::forward(x, alloc, stream)` replacing the
+        // cuBLAS call.
+        let rope_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim must contain a RopeAppend");
+        let rope_node = ctx.fuf.get(rope_id);
+
+        let qkv_ids: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qkv_ids.len(), 3, "rope has three tile inputs (q, k, v)");
+        let activation = ctx.input_expr(qkv_ids[0], 0);
+
+        let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
+            .iter()
+            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm has a weight"))
+            .collect();
+        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let num_q_heads = ctx.bound("num_attention_heads") as usize;
+        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+        let head_dim = ctx.bound("head_dim") as usize;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
+            as usize;
+
+        let q_out = ctx.output_ident(rope_id, 0);
+        let k_out = ctx.output_ident(rope_id, 1);
+        let v_out = ctx.output_ident(rope_id, 2);
+
+        quote! {
+            let (#q_out, #k_out, #v_out) = unsafe {
+                let qkv_packed = (#weight_expr).forward(
+                    #activation,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                ::ferrite_kernels::kernels::fused_qkv_rope(
+                    *qkv_packed,
+                    *ctx.positions,
+                    ctx.rotary.cos_sin_cache,
+                    #q_size,
+                    #kv_size,
+                    #num_q_heads,
+                    #num_kv_heads,
+                    #head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+            unsafe {
+                ::ferrite_kernels::attention_helpers::write_kv_cache(
+                    (#k_out).view(),
+                    (#v_out).view(),
+                    ctx.slot_mapping,
+                    ctx.kv_cache,
+                    #layer,
+                    device.compute_stream,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3988,6 +4737,7 @@ mod tests {
             bounds,
             scalars,
             quantization: None,
+            tie_word_embeddings: false,
         };
 
         let scale = attention_scale_for(&model);
@@ -4146,6 +4896,7 @@ mod tests {
                         FufInput::Weight {
                             id: WeightId(0),
                             index: None,
+                            storage: crate::quantization::StorageFormat::Dense,
                         },
                     ],
                     outputs: vec![vec![Dim::Lit(1), Dim::Lit(16)]],

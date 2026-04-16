@@ -7630,8 +7630,23 @@ pub unsafe fn marlin_gemm(
     let out = alloc.alloc_tensor(&[size_m, size_n], a.dtype());
 
     // FP32 reduction buffer — matches Python vLLM's USE_FP32_REDUCE_DEFAULT=True.
-    // Partial sums across K-splits are accumulated in f32 for numerical accuracy.
-    let c_tmp = alloc.alloc_tensor(&[size_m, size_n], DType::F32);
+    // Partial sums across K-splits are accumulated in f32 for numerical
+    // accuracy. The kernel indexes via `locks_off * c_size` where
+    // `locks_off` can reach `sms` and `c_size = tb_m * tb_n * f32` per
+    // compilation unit, so the allocation has to reach the worst-case
+    // `sms * max_m_block_size * max_thread_n` floats (Python vLLM's
+    // `marlin.cu` uses this exact formula; `max_thread_n = 256` matches
+    // `marlin.cuh`). Undersizing this buffer silently corrupts reductions
+    // and produces NaN logits — which is exactly the AWQ/GPTQ bug we had
+    // until this line ran `sms * max_m_block_size * 256`.
+    const MAX_THREAD_N: usize = 256;
+    let sms = unsafe {
+        ferrite_cuda_core::driver::device_get_num_sm(device_id as cudarc::driver::sys::CUdevice)
+            .expect("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT) succeeds") as usize
+    };
+    let max_m_block_size = (size_m.div_ceil(16) * 16).min(64);
+    let c_tmp_size = sms * max_m_block_size * MAX_THREAD_N;
+    let c_tmp = alloc.alloc_tensor(&[c_tmp_size], DType::F32);
 
     // When has_act_order, the C++ permute_cols_kernel writes column-permuted
     // activations into a_tmp before GEMM. Same shape/dtype as input `a`.

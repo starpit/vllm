@@ -115,15 +115,23 @@ pub fn marlin_permute_scales(scales: &mut [u16], size_k: usize, size_n: usize, g
 }
 
 /// Unpack packed INT4 columns: `[rows, cols/pack_factor]` u32 → `[rows, cols]` u8.
+///
+/// Matches Python vLLM's `quant_utils.unpack_cols` convention: consecutive
+/// output columns `[pack_factor*p .. pack_factor*p + pack_factor]` are
+/// packed into input column `p`'s low-to-high nibbles. (Our earlier
+/// implementation used a strided layout — `b * (cols/pack_factor) + p` —
+/// which silently corrupted the AWQ → Marlin zero-point pipeline since
+/// AutoAWQ stores qzeros in Python's convention.)
 pub fn unpack_cols_4bit(packed: &[u32], rows: usize, cols: usize) -> Vec<u8> {
     let pack_factor = 8; // 32 / 4
     assert_eq!(packed.len(), rows * (cols / pack_factor));
+    assert_eq!(cols % pack_factor, 0);
     let mut out = vec![0u8; rows * cols];
     for r in 0..rows {
         for p in 0..cols / pack_factor {
             let val = packed[r * (cols / pack_factor) + p];
-            for b in 0..pack_factor {
-                out[r * cols + b * (cols / pack_factor) + p] = ((val >> (4 * b)) & 0xF) as u8;
+            for i in 0..pack_factor {
+                out[r * cols + pack_factor * p + i] = ((val >> (4 * i)) & 0xF) as u8;
             }
         }
     }
@@ -131,6 +139,8 @@ pub fn unpack_cols_4bit(packed: &[u32], rows: usize, cols: usize) -> Vec<u8> {
 }
 
 /// Pack INT4 columns: `[rows, cols]` u8 → `[rows, cols/pack_factor]` u32.
+///
+/// Inverse of [`unpack_cols_4bit`]; matches Python vLLM's `pack_cols`.
 pub fn pack_cols_4bit(unpacked: &[u8], rows: usize, cols: usize) -> Vec<u32> {
     let pack_factor = 8;
     assert_eq!(unpacked.len(), rows * cols);
@@ -139,8 +149,8 @@ pub fn pack_cols_4bit(unpacked: &[u8], rows: usize, cols: usize) -> Vec<u32> {
     for r in 0..rows {
         for p in 0..cols / pack_factor {
             let mut val = 0u32;
-            for b in 0..pack_factor {
-                val |= (unpacked[r * cols + b * (cols / pack_factor) + p] as u32) << (4 * b);
+            for i in 0..pack_factor {
+                val |= (unpacked[r * cols + pack_factor * p + i] as u32) << (4 * i);
             }
             out[r * (cols / pack_factor) + p] = val;
         }

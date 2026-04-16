@@ -83,14 +83,12 @@ async fn test_cuda_correctness_granite_3_3_2b() {
     run_correctness_test(TestModels::GRANITE, "granite_3_3_2b").await;
 }
 
-// NOTE: no `test_cuda_correctness_llama_3_2_1b_awq` here yet —
-// blocked on a pre-existing numerical bug in the hand-written
-// Marlin path (AWQ and GPTQ both produce garbage tokens despite
-// dense bf16 Llama / Qwen2 producing coherent output). The golden
-// JSON (`testdata/golden/llama_3_2_1b_awq.json`) is already
-// generated and committed, so the test body is one line away from
-// being added once the Marlin fix lands. See HANDOFF.md for the
-// diagnostic evidence. The existing `test_cuda_marlin_awq_completion`
-// already routes through the ferrite Marlin path (after Commit 3
-// lifted the cuda_worker gate) and passes the non-empty smoke
-// check, covering the compiler-side correctness.
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_llama_3_2_1b_awq() {
+    // AWQ Llama-3.2-1B via the ferrite-forward Marlin* impl family +
+    // the `ferrite_kernels::layers_quant` AWQ→Marlin loader. Golden
+    // generated from Python vLLM on `AMead10/Llama-3.2-1B-Instruct-AWQ`.
+    run_correctness_test(TestModels::LLAMA_3_2_1B_AWQ, "llama_3_2_1b_awq").await;
+}

@@ -523,6 +523,24 @@ pub trait Implementation: fmt::Debug + Send + Sync {
             })
             .collect()
     }
+
+    /// Upstream tile-output `(tile, slot)`s that this impl's
+    /// `emit_call` *moves* (consumes) into one of its own output
+    /// bindings. After such a subgraph, the upstream local is no
+    /// longer accessible — the codegen drop pass must not schedule
+    /// a `drop(...)` for it.
+    ///
+    /// Distinct from `output_alias`: an alias keeps the upstream
+    /// alive and shares its memory; a consume transfers ownership.
+    /// In-place kernels like `scale_inplace` (ScalarMul) and
+    /// `tanh_softcap_inplace` (TanhSoftCap) follow the consume
+    /// pattern — the kernel mutates the buffer, and the impl
+    /// rebinds the moved `OwnedTensor` as its output.
+    ///
+    /// Default: empty (no upstream is consumed).
+    fn consumes_input_tiles(&self, _claimed_tiles: &[TileId], _fuf: &Fuf) -> Vec<(TileId, u8)> {
+        Vec::new()
+    }
 }
 
 /// The library: all available implementations for some target.
@@ -1651,6 +1669,23 @@ impl Implementation for ScalarMulImpl {
         false
     }
 
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        // The kernel mutates the upstream buffer in place and the
+        // emit moves it into the output binding — codegen must not
+        // schedule a drop for the upstream local.
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let src = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("ScalarMul has a Tile input");
+        vec![src]
+    }
+
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
         let tile = ctx.primary();
         let out = ctx.output_ident(tile, 0);
@@ -1759,6 +1794,24 @@ impl Implementation for TanhSoftCapImpl {
 
     fn is_compute_bound(&self) -> bool {
         false
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        // The kernel mutates the upstream buffer in place; the emit
+        // moves the upstream OwnedTensor into the output binding so
+        // the function can return it. Codegen must not schedule a
+        // drop for the upstream local.
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let src = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("tanh_softcap input is a tile");
+        vec![src]
     }
 
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
@@ -2214,6 +2267,42 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
             rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
             source_weights: vec![(weight_id, weight_idx)],
         }]
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Same alias relationships as `FusedAddRmsNormImpl`: the
+        // residual_out aliases the residual upstream's buffer (post
+        // in-place add) and the rmsnorm_out aliases the delta
+        // upstream's buffer (post in-place norm).
+        let residual_add_id = *claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
+            })
+            .expect("claim contains a residual-stream Add");
+        let rmsnorm_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("claim contains a RmsNorm");
+        let add_node = fuf.get(residual_add_id);
+        let delta_src = match add_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("residual Add input 0 (delta) must be a Tile"),
+        };
+        let residual_src = match add_node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("residual Add input 1 (residual) must be a Tile"),
+        };
+        vec![
+            ((rmsnorm_id, 0), Some(delta_src)),
+            ((residual_add_id, 0), Some(residual_src)),
+        ]
     }
 
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {

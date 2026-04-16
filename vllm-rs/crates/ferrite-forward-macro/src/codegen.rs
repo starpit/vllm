@@ -389,15 +389,24 @@ fn compute_drops_after(
     // alias: (tile, slot) → Some(upstream) means this output is a
     // TensorView aliasing upstream's OwnedTensor; None means this
     // output IS the owner. Outputs absent are untracked.
+    //
+    // consumed: upstream (tile, slot)s that some impl moves into its
+    // own output binding — the upstream local is no longer accessible
+    // after that subgraph, so we must never emit a `drop()` for it.
     let mut alias: HashMap<(TileId, u8), Option<(TileId, u8)>> = HashMap::new();
+    let mut consumed: HashSet<(TileId, u8)> = HashSet::new();
     for wave in &loop_ir.waves {
         for (sg, imp_id) in &wave.subgraphs {
             if Some(*sg) == skip_subgraph {
                 continue;
             }
             let claimed = sfuf.tiles_in_subgraph(*sg);
-            for (k, v) in lib.get(*imp_id).output_alias(&claimed, fuf) {
+            let imp = lib.get(*imp_id);
+            for (k, v) in imp.output_alias(&claimed, fuf) {
                 alias.insert(k, v);
+            }
+            for upstream in imp.consumes_input_tiles(&claimed, fuf) {
+                consumed.insert(upstream);
             }
         }
     }
@@ -455,6 +464,11 @@ fn compute_drops_after(
     let mut plan: DropPlan = HashMap::new();
     for (owner, sg) in last_use {
         if protected.contains(&owner) {
+            continue;
+        }
+        // If some impl moves this owner into its own output, the
+        // owner local is gone after that subgraph — don't drop it.
+        if consumed.contains(&owner) {
             continue;
         }
         plan.entry(sg).or_default().push(owner);

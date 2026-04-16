@@ -599,9 +599,24 @@ ferrite-models          DSL bodies: llama.rs (`#[forward] fn llama`)
 
 ## Commit history — `git log --oneline` on the worktree branch
 
-The most recent session's work (correctness fix + Qwen2
-migration + cutlass + fp8 branch + PP backbone + Step G delete)
-is on `worktree-ferrite-forward`:
+Most recent session (Gemma2 acid test: DSL `if/else`, config-driven
+attention scalars, Gelu/TanhSoftCap/SlidingAttention Impls, Gemma2
+DSL body + configs, Gemma `(1+w)` as DSL `w + 1.0`, vllm-executor
+wiring, embed-scale + sliding-branch fix, gemma2_2b golden):
+
+```
+9bcec3611  testdata: gemma2_2b golden from Python vLLM
+2e733be50  ferrite-forward: fix Gemma2 correctness — embed scale, sliding layer flip
+031f7c9a9  vllm-executor: wire Gemma2Ferrite through cuda_worker
+992acd9ad  ferrite-forward: Gemma `(1+w)` rmsnorm as DSL `w + 1.0`
+b4887a38c  ferrite-forward: Gemma2 DSL body + configs + end-to-end tests
+0494b62c5  ferrite-forward: Gelu, TanhSoftCap, SlidingAttention Impls
+037d46034  ferrite-forward: config-driven attention scale + softcap
+b7efd02e4  ferrite-forward: DSL `if`/`else` for compile-time layer-indexed dispatch
+```
+
+Prior session (correctness fix + Qwen2 migration + cutlass + fp8
+branch + PP backbone + Step G delete):
 
 ```
 838669d5f  relax dp_assigns test budget for cutlass zoo
@@ -618,23 +633,57 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
-**Correctness: FIXED.** `test_cuda_correctness_smollm_135m` now
-passes end-to-end through ferrite. Root cause: the attention
-impls emitted a 3D `[num_tokens, num_q_heads, head_dim]`
-OwnedTensor as the tile output; the downstream `oproj = gemm(attn, ...)`
-fed it straight into `LinearLayer::forward`, whose
-`debug_assert_eq!(x.ndim(), 2)` masked the bug in debug and was
-compiled out in release. cuBLAS then took `a.dim(0)/a.dim(1)` as
-`(M, K)`, so `K=num_q_heads` instead of `num_q_heads*head_dim` —
-silent garbage logits. Hand-written path did an explicit
-`.view().reshape(&[num_tokens, q_size])` before o_proj; ferrite
-didn't. Fix reshapes the OwnedTensor in-place via
-`OwnedTensor::reshape` in `AttentionViaCacheImpl::emit_call` and
-`AttentionPrefillContiguousImpl::emit_call`.
+**Gemma2 landed, with one known-fail golden test.** Dense-bf16
+Gemma2-2B / 9B / 27B compile end-to-end through `#[forward]`.
+`CudaModel::Gemma2Ferrite` in `cuda_worker.rs` parallels LlamaFerrite
+and Qwen2Ferrite. `vllm chat unsloth/gemma-2-2b-it` produces
+coherent output (e.g. the Rayleigh-scattering answer for "why is
+the sky blue?"). Compiler itself is architecture-agnostic — zero
+"gemma" strings below the parser.
 
-Remaining warnings on the smollm test are expected bf16 drift at
-position ≥ 10 with the diverged token still in each side's
-top-N.
+**Known failure: `test_cuda_correctness_gemma2_2b`** hard-fails on
+prompt 7 (translation prompt with apostrophe-quoted inner text).
+Engine enters a loop generating the prompt text verbatim. Prompts
+0-6 soft-fail at position 0 with "both in top-N" warnings (normal
+bf16 divergence, tolerated). Prompt 7's failure is specific to
+that prompt's numerics.
+
+Debug findings ruled out as the cause:
+- Not ferrite-vs-hand-written drift: ferrite IS loading
+  (logs: "CudaWorker: loaded Gemma2 via ferrite-forward"). Both
+  ferrite and hand-written produce logprobs within bf16 noise of
+  each other on Gemma2; both diverge from Python vLLM the same
+  way.
+- Not CUDA graphs: `--enforce-eager` reproduces.
+- Not final-logit softcap: our pre-softcap logits correlate r=0.11
+  with Python's pre-softcap logits. Divergence is upstream of
+  softcap.
+- Not embed scale / sliding-layer flip: both already fixed in
+  commit `2e733be50`, sky-blue prompt works.
+
+Evidence points to per-layer numeric drift in a shared CUDA kernel
+(most likely flash-attn with Gemma's softcap+sliding combo, or
+cuBLAS gemm with Gemma2's unusual hidden/head_dim ratios) that
+both the ferrite and hand-written paths hit via FFI into
+`crates/vllm-cuda/csrc/`. The fix applies to both paths once found.
+
+Path forward: per-layer tensor dump harness comparing against
+Python vLLM running the same model on the same prompt. `vllm-rs`
+has `cpu_golden.rs` infrastructure to build on. ~4-8 hours to
+instrument and narrow down the first-diverging kernel call. See
+gap #9 in Remaining Gaps below.
+
+SmolLM and Qwen2 golden tests still pass — ferrite's
+infrastructure and the Llama-family / Qwen2-family numerics are
+intact.
+
+### Prior correctness fix (kept for context)
+
+The SmolLM correctness fix from the previous session remains.
+Root cause was a 3D→2D reshape missing at the Attention output
+before o_proj; `AttentionViaCacheImpl` and
+`AttentionPrefillContiguousImpl` now reshape in-place via
+`OwnedTensor::reshape`.
 
 ### Landed since the correctness fix
 
@@ -687,6 +736,60 @@ sessions don't re-port them.
    `cpu_golden.rs` moved to `ferrite-forward/src/cpu_golden.rs`
    (rayon stripped; it's reference code, not a perf path).
    `target_profiles/cost_*.csv` preserves the calibrated sweeps.
+7. **Gemma2 — full architecture port via DSL extensions.** The
+   acid test passed for generality: the compiler stays arch-agnostic.
+   Landed:
+   - **Compile-time DSL conditional**: `if <ivar> % N == M { ... }
+     else { ... }` / `if <ivar> < N { ... }`. Parses to a constrained
+     `BoolExpr` (Modulo / Less with literal-or-sym bounds); folds at
+     CFG-build to concrete `u64`s; evaluates per-iteration at unroll
+     time; arms must bind the same set of names (merge_carry in the
+     classifier). Also unblocks DeepSeek-V3's dense-prefix, Jamba
+     hybrid-SSM layers, and any future architecture with non-uniform
+     layers. See commit `b7efd02e4`.
+   - **Config-driven attention params**: `ModelParams.scalars:
+     BTreeMap<String, f64>` mirrors `bounds` for non-integer JSON
+     fields. `AttentionViaCacheImpl`/`AttentionPrefillContiguousImpl`
+     / their sliding variants read `query_pre_attn_scalar` (→
+     softmax scale) and `attn_logit_softcapping` (→ softcap) per
+     model; Llama/Qwen2 configs don't set them so their behavior is
+     byte-identical to before. See commit `037d46034`.
+   - **New OpKinds + Impls** (generic, capability-named):
+     `Gelu` with `FusedGateUpGeluMulImpl` (mirrors SwiGLU fusion
+     but calls `gelu_and_mul_fused`); `TanhSoftCap` with singleton
+     Impl reading `final_logit_softcapping`; `SlidingAttention`
+     (same shape sig as Attention) with `SlidingAttentionViaCacheImpl`
+     / `SlidingAttentionPrefillContiguousImpl` passing
+     `window_size_left` from `sliding_window` config. See commit
+     `0494b62c5`.
+   - **Gemma2 DSL body + configs**: `ferrite-models/src/gemma2.rs`
+     with 4-norm layers, alternating sliding/full attention via
+     `if layer % sliding_window_pattern == 0`, GELU MLP, final
+     softcap. `model_architectures/gemma2/{2b,9b,27b}.json`. 2B
+     = 551 tiles / 238 waves; 9B = 887/382; 27B = 971/418. See
+     commits `b4887a38c`, `2e733be50`.
+   - **Gemma `(1+w)` rmsnorm via DSL `w + 1.0`** (honest math,
+     not a load-time hack). New `Expr::ScalarLit(f64)` / `Expr::Add`
+     lowers to a scalar-Add tile fused into rmsnorm by two new
+     Impls: `ScalarOffsetRmsNormImpl` (standalone) and
+     `FusedAddRmsNormWithOffsetImpl` (3-tile residual-Add +
+     scalar-Add + RmsNorm). Kernel gained `weight_offset: f32`
+     parameter; `rms_norm_with_offset` / `fused_add_rms_norm_inplace_with_offset`
+     are new thin wrappers — existing callers unchanged.
+     Load-time weight mutation is NOT needed. See commit `992acd9ad`.
+   - **Embed scale via DSL `sqrt(hidden_size)`**. New
+     `Expr::SqrtBound(Ident)` parsed from `sqrt(<bound_name>)`,
+     folded at CFG-build to a concrete `f64`. `Expr::Mul` admits
+     tile×scalar; new `ScalarMulImpl` emits `scale_inplace`. Gemma2
+     body: `hidden_states = embed(...) * sqrt(hidden_size)`.
+   - **Gemma2Ferrite wiring**: `Gemma2FerriteModel` struct +
+     `CudaModel::Gemma2Ferrite` variant + 7 match arms in
+     `cuda_worker.rs`. Model-selector ferrite-gate identical to
+     Llama/Qwen2. See commit `031f7c9a9`.
+   - **Golden test**: `test_cuda_correctness_gemma2_2b` added;
+     generator script extended. Golden JSON committed. Known-fail
+     on prompt 7 per "Next session starts here". See commit
+     `9bcec3611`.
 
 ### Remaining gaps vs. prior ferrite
 
@@ -711,15 +814,20 @@ tackle in roughly this order.
 3. **QK-norm** (Qwen3, Gemma3) — `qk_norm_inplace` +
    `rotary_embedding_q_only` path. Needs a `FusedQkvQkNormRopeImpl`.
 4. **Granite multipliers** — `embedding_multiplier`,
-   `residual_multiplier`, `logits_scaling`. DSL doesn't express
-   `scale_inplace`; either add a `scale` op + Impl or bake the
-   scalar into fused norm/gemm Impls.
-5. **Sliding-window / Gemma2** — alternating sliding-window
-   attention by layer, pre+post norms, approximate GELU, query
-   scaling, logit soft-capping. The Gemma2 diff should hit
-   only the model crate + new op Impls per the "Gemma2 acid
-   test" invariant; if anything in the compiler itself needs
-   surgery, the design is wrong.
+   `residual_multiplier`, `logits_scaling`. The DSL now expresses
+   scalar multiply via `<tile> * <scalar>` (landed with Gemma2's
+   embed scale — see `ScalarMulImpl` + gap #7 above). For Granite
+   specifically: the three multipliers are config-driven
+   constants; add them to the model's JSON as scalars, read via
+   `Expr::ScalarLit` + possibly a new `Expr::BoundScalar(Ident)`
+   analogous to `SqrtBound` for `config_value * something`.
+5. **Gemma3** — another alternating-attention architecture, but
+   with a 5:1 local/global ratio. Should reuse the DSL
+   `if layer % sliding_window_pattern == 0 { ... }` construct
+   now that it exists. Gemma3 also needs QK-norm (see gap #3)
+   and different RoPE scaling. Diff should hit only
+   `ferrite-models/src/gemma3.rs` + `model_architectures/gemma3/*.json`
+   + any net-new kernels — NOT the compiler.
 6. **MoE (Mixtral, Qwen2-MoE)** — needs a DSL construct for
    `for each of top-k experts run sub-body`. Generic language
    extension, not an MoE-specific branch.
@@ -731,15 +839,32 @@ tackle in roughly this order.
    type doesn't know about layer ranges). Extend `Weights::load`
    to accept a layer range so PP intermediate ranks can only
    materialise their owned layers.
-9. **Per-layer golden diff harness** — not needed to unblock
-   any live bug (static-analysis fix + cutlass costs cover the
-   present regressions), but still worth rebuilding for future
-   regression work. Recover `gen_golden.rs` from `a13577f75^`,
-   add a `DUMP_GOLDEN=<path>` env-var hook on
-   `LlamaForCausalLM::forward`, emit a `forward_with_snapshots`
-   variant from the macro, and diff per-subgraph. `cpu_golden.rs`
-   already lives in `ferrite-forward/src/cpu_golden.rs` — use
-   it for the CPU-reference side.
+9. **Per-layer tensor-dump debug harness** — unblocks the
+   `test_cuda_correctness_gemma2_2b` prompt-7 failure documented
+   in "Next session starts here". Build: a Python script that
+   runs HF/vLLM Gemma2-2B on the failing prompt and dumps
+   `hidden_states` after each decoder layer to `.npy`; a Rust
+   equivalent that loads via ferrite, runs one forward, and
+   saves matching dumps. Offline diff finds the first layer where
+   our output meaningfully differs from Python's. Then narrow
+   to the specific kernel call responsible. Relevant shared CUDA
+   kernels at `crates/vllm-cuda/csrc/{layernorm,pos_encoding,activation}_kernels.cu`;
+   compare against `/home/moosevan/vllm/csrc/*` for semantic
+   drift. `cpu_golden.rs` lives at `ferrite-forward/src/cpu_golden.rs`
+   for reference-CPU implementations. Debugging approach:
+   - Ferrite's `forward_backbone` skips only the TERMINAL tile;
+     for Gemma2 that's `tanh_softcap`, so backbone returns
+     pre-softcap logits (post-lm_head). To dump pre-lm_head
+     hidden states, temporarily remove `capped = tanh_softcap(logits)`
+     from `ferrite-models/src/gemma2.rs` so the terminal becomes
+     `gemm` and backbone returns `normed`.
+   - Python reference: `AutoModelForCausalLM.from_pretrained(...,
+     torch_dtype=bf16)` + module forward hooks on each
+     `model.layers[i]`.
+   - Already verified: our post-softcap logits correlate r=0.11
+     with Python's (nearly independent). The drift accumulates
+     across layers; find the first layer where it exceeds bf16
+     noise.
 
 ### Already landed — do not redo
 
@@ -781,6 +906,39 @@ tackle in roughly this order.
 - Legacy crates deleted: `ferrite-macros`, `ferrite-solver`,
   `ferrite-test-harness` (Step G). `cpu_golden.rs` preserved
   under `ferrite-forward/src/cpu_golden.rs`.
+- DSL compile-time conditionals: `if ivar % N == M { ... }` /
+  `if ivar < N { ... }`. Constrained predicate enum, folded
+  per-iteration at unroll time. Both arms must bind the same
+  names (merge-carry in classifier).
+- DSL `Expr::ScalarLit(f64)` + `Expr::Add` / `Expr::Mul` admitting
+  tile×scalar. New impls `ScalarOffsetRmsNormImpl`,
+  `FusedAddRmsNormWithOffsetImpl`, `ScalarMulImpl`.
+- DSL `sqrt(<bound_name>)` folds at CFG-build to a concrete f64
+  scalar. Used by Gemma2's `embed(...) * sqrt(hidden_size)`.
+- `ModelParams.scalars: BTreeMap<String, f64>` captures every
+  non-integer number in config.json. `EmitCtx::scalar("key")`
+  reads them; Impls read by HF convention name.
+- Attention scale/softcap: `AttentionViaCacheImpl`,
+  `AttentionPrefillContiguousImpl`, and both sliding variants
+  read `query_pre_attn_scalar` / `attn_logit_softcapping` via
+  the scalars map. Llama/Qwen2 (no such fields) fall back to
+  `1/sqrt(head_dim)` / `0.0` — byte-identical prior behavior.
+- Gemma2 op Impls: `OpKind::Gelu` + `FusedGateUpGeluMulImpl`;
+  `OpKind::TanhSoftCap` + singleton Impl; `OpKind::SlidingAttention`
+  + `SlidingAttentionViaCacheImpl` / `SlidingAttentionPrefillContiguousImpl`.
+- `weight_offset: f32` added to `rms_norm_kernel` / `fused_add_rms_norm_kernel`
+  in `crates/vllm-cuda/csrc/layernorm_kernels.cu`. New Rust wrappers
+  `rms_norm_with_offset` / `fused_add_rms_norm_inplace_with_offset`;
+  existing `rms_norm` / `fused_add_rms_norm_inplace` signatures
+  unchanged (zero-offset wrappers). Gemma `(1+w)` flows in via
+  these.
+- Gemma2 DSL body (`ferrite-models/src/gemma2.rs`) and configs
+  (`model_architectures/gemma2/{2b,9b,27b}.json`). All three
+  sizes compile end-to-end through `#[forward]`.
+- `CudaModel::Gemma2Ferrite` variant in `cuda_worker.rs` with
+  seven match arms and model-selector ferrite-gate. Dense-bf16
+  Gemma2 now routes through ferrite; quant / TP / PP keep the
+  hand-written path.
 
 ## Last note
 

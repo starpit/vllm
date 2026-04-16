@@ -88,6 +88,19 @@ pub fn generate_megakernel(wave_idx: usize, phases: &[DevicePhase]) -> Generated
     writeln!(src, "    extern __shared__ char smem[];").unwrap();
     writeln!(src).unwrap();
 
+    // Destructure params struct into local variables so kernel_body
+    // lines can reference bare names (p0_out, p1_input, etc.).
+    for phase in phases {
+        for field in &phase.internal_fields {
+            // field is e.g. "__nv_bfloat16* p0_out" — extract the name (last token)
+            let name = field.split_whitespace().last().unwrap_or("");
+            // Strip leading * for pointer fields
+            let name = name.trim_start_matches('*');
+            writeln!(src, "    auto {name} = p.{name};").unwrap();
+        }
+    }
+    writeln!(src).unwrap();
+
     for (i, phase) in phases.iter().enumerate() {
         if i > 0 {
             writeln!(src, "    cg::this_grid().sync();").unwrap();
@@ -193,6 +206,9 @@ mod tests {
         assert!(result.cuda_source.contains("megakernel_ops.cuh"));
         assert!(result.cuda_source.contains("cg::this_grid().sync()"));
         assert!(result.cuda_source.contains("cudaLaunchCooperativeKernel"));
+        // Params struct is destructured into locals for kernel body
+        assert!(result.cuda_source.contains("auto p0_out = p.p0_out;"));
+        assert!(result.cuda_source.contains("auto p1_scalar = p.p1_scalar;"));
         assert_eq!(result.flat_params.len(), 6); // 3 + 3
     }
 

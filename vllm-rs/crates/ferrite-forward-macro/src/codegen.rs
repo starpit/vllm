@@ -720,6 +720,17 @@ fn generate_megakernel_labeled(
     writeln!(src, "    extern __shared__ char smem[];").unwrap();
     writeln!(src).unwrap();
 
+    // Destructure params struct into local variables so kernel_body
+    // lines can reference bare names (p0_out, p1_input, etc.).
+    for phase in phases {
+        for field in &phase.internal_fields {
+            let name = field.split_whitespace().last().unwrap_or("");
+            let name = name.trim_start_matches('*');
+            writeln!(src, "    auto {name} = p.{name};").unwrap();
+        }
+    }
+    writeln!(src).unwrap();
+
     for (i, phase) in phases.iter().enumerate() {
         if i > 0 {
             writeln!(src, "    cg::this_grid().sync();").unwrap();

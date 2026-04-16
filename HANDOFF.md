@@ -36,9 +36,9 @@
 - **Method**: port the working old ferrite verbatim, detoxifying
   as you port. Do not rewrite mechanisms that already work.
 - **Current state, honest version**: scaffolding AND correctness
-  both green. Dense-bf16 Llama, Qwen2, Gemma2, and Granite all route
-  through ferrite via `CudaModel::{Llama,Qwen2,Gemma2,Granite}Ferrite`
-  in `cuda_worker.rs`. Decode attention uses the
+  both green. Dense-bf16 Llama, Qwen2, Gemma2, Granite, and Qwen3 all
+  route through ferrite via `CudaModel::Ferrite(Box<FerriteModel>)` in
+  `cuda_worker.rs` (collapsed from the per-arch `*Ferrite` variants). Decode attention uses the
   `attention_decode_from_cache` wrapper (so span rotation + fp8 KV
   light up automatically); fused-QKV emit has a runtime
   `is_fp8()` branch. Backbone-only forward is emitted alongside
@@ -162,14 +162,13 @@ golden still fails after Step D landed. Kept here for reference.
 
 ### Step E — Wiring to vllm-cuda + vllm chat (PARTIALLY DONE)
 
-Dispatch wired up: vllm-executor routes dense-bf16 Llama to
-`CudaModel::LlamaFerrite` which calls
-`ferrite_models::llama::forward(&weights, &ctx, device,
-num_tokens)`. The old `LlamaSolver`/`Qwen2Solver` variants are
-deleted; old `ferrite_macros::forward!{}` in
-`vllm-cuda/src/model/{llama,qwen2}.rs` removed. Qwen2 stays on
-hand-written `Qwen2ForCausalLM` until Step C lands its bias-fused
-QKV impl.
+Dispatch wired up: vllm-executor routes dense-bf16 arches through
+`CudaModel::Ferrite(Box<FerriteModel>)` which calls
+`dyn FerriteWeights::forward(ctx, device, num_tokens)`. The old
+`LlamaSolver`/`Qwen2Solver` variants are deleted; old
+`ferrite_macros::forward!{}` in `vllm-cuda/src/model/{llama,qwen2}.rs`
+removed. Per-arch `CudaModel::*Ferrite` variants collapsed to one
+`CudaModel::Ferrite` as of `30661e397`.
 
 **Correctness is NOT yet achieved.** `vllm chat --model=<llama>`
 runs through the ferrite path but produces garbage tokens (e.g.
@@ -670,8 +669,9 @@ ferrite-cuda-core       GpuTensor / TensorView / OwnedTensor /
                         CachingAllocator / CUstream / GpuDevice
 ferrite-cuda-builder    build pipeline for .cu sources (cached
                         under ~/.cudaforge)
-ferrite-models          DSL bodies: llama.rs (`#[forward] fn llama`)
-                        + qwen2.rs (`#[forward] fn qwen2`)
+ferrite-models          DSL bodies: llama.rs, qwen2.rs, gemma2.rs,
+                        granite.rs, qwen3.rs — each `#[forward] fn`
+                        + `inventory::submit!` auto-registration
 ```
 
 `ferrite-cuda-core/src/tensor.rs` carries an unsafe
@@ -680,7 +680,16 @@ ferrite-models          DSL bodies: llama.rs (`#[forward] fn llama`)
 
 ## Commit history — `git log --oneline` on the worktree branch
 
-Most recent session (AWQ quant — preparation only; no ferrite-forward
+Most recent session (Phase A+B refactor: auto-registry + fingerprint
+sniff, collapse per-arch `CudaModel::*Ferrite` variants to one
+`CudaModel::Ferrite(Box<FerriteModel>)`, delete `quant_discriminator` /
+`DISPATCH_FIELDS` / `collect_dispatch_bounds` / `ferrite_quant_kind`):
+
+```
+30661e397  ferrite: auto-registry + fingerprint sniff; collapse CudaModel::*Ferrite
+```
+
+Prior session (AWQ quant — preparation only; no ferrite-forward
 AWQ codegen yet, but the data model and the runtime loader are in
 place so the next session can emit AWQ loads directly — see
 "## Quantization path (in progress)" below):
@@ -741,9 +750,72 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
+**Phase A+B refactor landed (commit `30661e397`): auto-registry +
+fingerprint sniff; per-arch CudaModel variants collapsed.**
+
+This session eliminated all per-arch boilerplate from `cuda_worker.rs`
+and the `Weights::load` signature. Key changes:
+
+1. **`ferrite_forward::FerriteWeights` trait + `inventory` auto-registration.**
+   Each `#[forward]` proc-macro expansion now emits
+   `inventory::submit!(FerriteWeightsRegistration { ... })` alongside
+   the generated module. The registration carries `hf_arches: &[&str]`
+   (harvested from `ModelParams.architectures`, populated from
+   config.json) and a `fingerprint_matches(gw) -> bool` + `load(gw,
+   stream)` pair. `ferrite_forward::try_load(gw, stream, arch_hint)`
+   iterates the global registry, finds the entry whose `hf_arches`
+   contains `arch_hint` AND whose `fingerprint_matches(gw)` returns
+   true, and calls its `load`. **Zero per-arch edits in
+   `cuda_worker.rs` to add a new model or quant format.**
+
+2. **`Weights::load` signature simplified.** The arch-level generated
+   `Weights::load` no longer takes 7 bounds args + `quant_kind`. It
+   takes `(gw, stream)` and auto-detects the right compiled variant
+   via `fingerprint_matches(gw)` per variant (dense vs AWQ vs future
+   formats).
+
+3. **Deleted: `quant_discriminator`, `DISPATCH_FIELDS`,
+   `collect_dispatch_bounds`, `ferrite_quant_kind`.** All per-arch
+   dispatch plumbing that threaded config values from `cuda_worker.rs`
+   into the generated code is gone. The fingerprint check replaces it.
+
+4. **`CudaModel::Ferrite(Box<FerriteModel>)`** replaces the five
+   per-arch variants (`LlamaFerrite`, `Qwen2Ferrite`,
+   `Gemma2Ferrite`, `GraniteFerrite`, `Qwen3Ferrite`). One variant,
+   one `forward` match arm, one `hidden_states` match arm.
+
+5. **`FerriteModel { weights: Box<dyn FerriteWeights>, rotary }`**
+   replaces the per-arch model structs (`LlamaFerriteModel`,
+   `Qwen2FerriteModel`, etc.).
+
+6. **Ferrite try-first block hoisted above the arch-string match**
+   in `cuda_worker.rs`. The `try_load` call runs before any
+   `match arch_string { ... }` arm, so a new arch that only exists
+   in `ferrite-models` needs zero `cuda_worker` edits.
+
+7. **`extern crate ferrite_models as _;`** in `cuda_worker.rs` (or
+   the crate that links it). Required to prevent the linker from
+   garbage-collecting the `inventory` registrations — without it,
+   the static constructors from `ferrite_models` are never linked in
+   and `try_load` sees an empty registry.
+
+8. **`ModelParams` now has `architectures: Vec<String>`** populated
+   from config.json. The `#[forward]` macro harvests this for the
+   `hf_arches` list in the inventory registration.
+
+**Adding a new quant format** now requires: `StorageFormat` variant +
+parser arm + Impl(s) gated on that format + `FieldLoad` arm + `is_*()`
+on `QuantConfig` + gate line in `ferrite_eligible`. Zero
+`cuda_worker.rs` per-arch edits.
+
+**Adding a new arch** now requires: one DSL file in `ferrite-models` +
+`pub mod` line. Zero `cuda_worker.rs` edits.
+
+### Prior session: Qwen3 landed
+
 **Qwen3 landed — six correctness goldens green (SmolLM2-135M,
 Qwen2.5-0.5B, Gemma2-2B, Granite-3.3-2B, Qwen3-0.6B, Llama-3.2-1B-AWQ).**
-This session closed the cuBLAS warmup regression from the prior
+That session closed the cuBLAS warmup regression from the prior
 handoff. Three distinct bugs, all in the singleton RopeAppend path
 the prior session introduced for Qwen3's QK-norm pattern:
 
@@ -809,14 +881,16 @@ What landed this session:
 - `ReshapeRefImpl::emit_call` + `reshape_dim_token` helper — config
   bounds fold to integer literals; `num_tokens` emits
   `(*ctx.input_ids).dim(0)` (authoritative runtime source).
-- `vllm-executor/src/cuda_worker.rs`: `Qwen3FerriteModel` struct,
-  `CudaModel::Qwen3Ferrite` variant, a dedicated `"Qwen3ForCausalLM"`
-  arm in `load_model` that routes dense bf16 to ferrite. Quant / TP /
-  PP / `FERRITE_DISABLE` return a hard `WorkerInit` error — the
-  hand-written `LlamaForCausalLM` would silently drop the
-  `q_norm` / `k_norm` tensors. The GGUF loader's
-  `LlamaForCausalLM`-family arm dropped `Qwen3ForCausalLM` for the
-  same reason.
+- `vllm-executor/src/cuda_worker.rs`: Qwen3 routes through the
+  unified `CudaModel::Ferrite(Box<FerriteModel>)` path (the
+  per-arch `Qwen3FerriteModel` / `CudaModel::Qwen3Ferrite` were
+  collapsed in `30661e397`). The `ferrite_eligible` gate checks
+  dense bf16 for Qwen3. Quant / TP / PP / `FERRITE_DISABLE` fall
+  through to the hand-written path — but the hand-written
+  `LlamaForCausalLM` would silently drop the `q_norm` / `k_norm`
+  tensors, so Qwen3 returns a hard `WorkerInit` error in that case.
+  The GGUF loader's `LlamaForCausalLM`-family arm dropped
+  `Qwen3ForCausalLM` for the same reason.
 - `crates/vllm-e2e/tests/e_correctness.rs::test_cuda_correctness_qwen3_0_6b`
   + `crates/vllm-e2e/testdata/golden/qwen3_0_6b.json` (generated via
   `~/vllm/.venv/bin/python` driving `scripts/generate_golden_refs.py`
@@ -972,9 +1046,8 @@ fusions" subsection of "Failure patterns." That session fixed it:
 
 Accessor names are unchanged (`source_weights` stays at the 3 Gemm
 weights; bias rides through `load_dense_concat`'s auto-detect path
-as a packed `LinearLayer` field). No changes to
-`cuda_worker.rs::Qwen2Ferrite` needed. All four correctness
-goldens still pass.
+as a packed `LinearLayer` field). No changes to `cuda_worker.rs`
+needed. All four correctness goldens still pass.
 
 **Four correctness goldens green via ferrite-forward.** Dense-bf16
 Llama (SmolLM2-135M), Qwen2 (Qwen2.5-0.5B), Gemma2 (Gemma2-2B), and
@@ -1044,10 +1117,10 @@ sessions don't re-port them.
    inside `LinearLayer::forward`. The `FusedQkvRopeCache` /
    `FusedQkvRopePrefill` matchers walk through the BiasAdd
    wrappers so the packed cuBLAS `gemm_bias` epilog still runs in
-   one launch. `CudaModel::Qwen2Ferrite` in `cuda_worker.rs`
-   parallels `LlamaFerrite` and carries all the accessor / forward
-   arms. Dense-bf16 Qwen2 now routes through ferrite; quant / TP /
-   PP keep the hand-written path.
+   one launch. Qwen2 routes through `CudaModel::Ferrite` (originally
+   wired as `Qwen2Ferrite`, collapsed in `30661e397`). Dense-bf16
+   Qwen2 now routes through ferrite; quant / TP / PP keep the
+   hand-written path.
 2. **Cutlass GEMM zoo + CSV costs** — `target_profiles/cost_*.csv`
    holds the three calibrated sweeps (L4/SM89, L40S/SM89,
    H100/SM90). `TargetProfile` auto-loads `cost_<name>.csv`
@@ -1076,10 +1149,9 @@ sessions don't re-port them.
    skips the terminal lm_head subgraph and DtoD-clones the
    penultimate tile's output into a fresh `OwnedTensor`.
    Arch-level `forward_backbone` dispatches over the Weights
-   enum. `LlamaFerrite::hidden_states` /
-   `Qwen2Ferrite::hidden_states` call it. Loader still gates
-   ferrite off for `use_pp` — backbone is ready for when that
-   flips.
+   enum. `FerriteModel::hidden_states` calls it via the unified
+   `CudaModel::Ferrite` path. Loader still gates ferrite off for
+   `use_pp` — backbone is ready for when that flips.
 6. **Delete legacy (Step G)** — `ferrite-macros`, `ferrite-solver`,
    `ferrite-test-harness` are gone (~73k lines deleted).
    `cpu_golden.rs` moved to `ferrite-forward/src/cpu_golden.rs`
@@ -1131,10 +1203,9 @@ sessions don't re-port them.
      folded at CFG-build to a concrete `f64`. `Expr::Mul` admits
      tile×scalar; new `ScalarMulImpl` emits `scale_inplace`. Gemma2
      body: `hidden_states = embed(...) * sqrt(hidden_size)`.
-   - **Gemma2Ferrite wiring**: `Gemma2FerriteModel` struct +
-     `CudaModel::Gemma2Ferrite` variant + 7 match arms in
-     `cuda_worker.rs`. Model-selector ferrite-gate identical to
-     Llama/Qwen2. See commit `031f7c9a9`.
+   - **Gemma2 wiring**: originally `Gemma2FerriteModel` +
+     `CudaModel::Gemma2Ferrite` (commit `031f7c9a9`), now collapsed
+     into the unified `CudaModel::Ferrite` path (`30661e397`).
    - **Golden test**: `test_cuda_correctness_gemma2_2b` added;
      generator script extended. Golden JSON committed. Known-fail
      on prompt 7 per "Next session starts here". See commit
@@ -1159,11 +1230,12 @@ tackle in roughly this order.
    via a parallel loader), the corresponding `Marlin*Impl` /
    `Fp8*Impl` / `Bnb*Impl` matchers gated on that storage format,
    `FieldLoad` arm emitting the right loader, `is_*()` helper on
-   `QuantConfig` + gate lift in `cuda_worker.rs`, a new u8 value
-   assigned in `ferrite_forward_macro::quant_discriminator` +
-   `ferrite_quant_kind`. The AWQ slice (Commit 3) is the template;
-   each format lands as one atomic commit. GPTQ-Marlin will
-   benefit automatically from the Commit 4 Marlin bug fixes.
+   `QuantConfig` + gate line in `ferrite_eligible`. The AWQ slice
+   (Commit 3) is the template; each format lands as one atomic
+   commit. GPTQ-Marlin will benefit automatically from the Commit 4
+   Marlin bug fixes. **No per-arch `cuda_worker` edits needed** —
+   the auto-registry + fingerprint-sniff mechanism (commit
+   `30661e397`) handles format dispatch automatically.
 3. **QK-norm** (Qwen3, Gemma3) — `qk_norm_inplace` +
    `rotary_embedding_q_only` path. Needs a `FusedQkvQkNormRopeImpl`.
 4. **Gemma3** — another alternating-attention architecture, but
@@ -1200,9 +1272,11 @@ tackle in roughly this order.
 - FUF/SFUF/LOOP IRs + `schedule_workloads` + `cost::refresh_predicted_us`.
 - DP solver (ported from `ferrite-solver/src/lowering/solver/dp.rs`).
 - Codegen delegates to `Implementation::emit_call`.
-- Arch-level `Weights` enum + `Weights::load` + `forward` dispatcher
-  emission. Caller integration = two calls (`load` at startup,
-  `forward` per step).
+- Arch-level `Weights` enum + `Weights::load(gw, stream)` +
+  `forward` dispatcher emission. `Weights::load` auto-detects the
+  right compiled variant via `fingerprint_matches(gw)` — no bounds
+  args or `quant_kind` parameter. Caller integration = two calls
+  (`load` at startup, `forward` per step).
 - `ForwardCtx` runtime-args bundle in `ferrite-forward`.
 - `include_str!` rebuild-on-change for every JSON the macro reads.
 - `#[forward]` derives `models_dir` from the carrier fn name by
@@ -1213,13 +1287,17 @@ tackle in roughly this order.
   mapping to the nearest-lower compiled bucket.
 - Step D: decode/prefill attention variant split via
   `WorkloadConstraint`.
-- vllm-executor wiring: `CudaModel::LlamaFerrite` variant,
+- vllm-executor wiring: `CudaModel::Ferrite(Box<FerriteModel>)`
+  (collapsed from per-arch `*Ferrite` variants as of `30661e397`).
   `LlamaForCausalLM::Model`-via-`forward!{}` and
   `Qwen2ForCausalLM::Model`-via-`forward!{}` invocations deleted,
-  `ferrite_macros` dep dropped from vllm-cuda.
+  `ferrite_macros` dep dropped from vllm-cuda. Ferrite try-first
+  block hoisted above the arch-string match — new arches need zero
+  `cuda_worker` edits.
 - SmolLM2-135M config in `model_architectures/llama/`.
-- Dense-bf16 Llama + Qwen2 both on the ferrite path (LlamaFerrite
-  / Qwen2Ferrite variants). Quant / TP / PP still hand-written.
+- Dense-bf16 Llama, Qwen2, Gemma2, Granite, Qwen3 all on the
+  ferrite path via `CudaModel::Ferrite`. Quant / TP / PP still
+  hand-written.
 - SmolLM-135M ferrite correctness: attention output 3D→2D reshape
   in `AttentionViaCacheImpl` / `AttentionPrefillContiguousImpl`.
 - Cutlass GEMM zoo (16 tile variants + gemv) with CSV-backed cost
@@ -1230,7 +1308,7 @@ tackle in roughly this order.
 - Arch-level `forward_backbone` dispatcher emitted alongside
   `forward`; per-bucket `forward_backbone_m_<N>` skips the
   terminal lm_head subgraph. `cuda_worker.rs::hidden_states` uses
-  it for both Llama and Qwen2 ferrite variants.
+  it via the unified `CudaModel::Ferrite` path.
 - Legacy crates deleted: `ferrite-macros`, `ferrite-solver`,
   `ferrite-test-harness` (Step G). `cpu_golden.rs` preserved
   under `ferrite-forward/src/cpu_golden.rs`.
@@ -1263,10 +1341,10 @@ tackle in roughly this order.
 - Gemma2 DSL body (`ferrite-models/src/gemma2.rs`) and configs
   (`model_architectures/gemma2/{2b,9b,27b}.json`). All three
   sizes compile end-to-end through `#[forward]`.
-- `CudaModel::Gemma2Ferrite` variant in `cuda_worker.rs` with
-  seven match arms and model-selector ferrite-gate. Dense-bf16
-  Gemma2 now routes through ferrite; quant / TP / PP keep the
-  hand-written path.
+- Gemma2 routes through `CudaModel::Ferrite` (originally wired as
+  `Gemma2Ferrite`, collapsed in `30661e397`). Dense-bf16 Gemma2
+  now routes through ferrite; quant / TP / PP keep the hand-written
+  path.
 - DSL `scalar(<name>)` / `recip_scalar(<name>)` folds at CFG-build
   to `ScalarLit` using `ModelParams.scalars` (non-integer config.json
   fields). `recip` form returns `1.0 / value`. Parallels `SqrtBound`
@@ -1284,15 +1362,32 @@ tackle in roughly this order.
   before each residual add, logits×recip_scalar(logits_scaling).
   All three compile to 685 tiles / 365 waves; configs verified
   against upstream HF `config.json` verbatim.
-- `CudaModel::GraniteFerrite` variant in `cuda_worker.rs` with
-  seven match arms. Model-selector ferrite-gate on the existing
-  `GraniteForCausalLM` arm — quant / TP / PP keep the hand-written
-  Granite (which still sits inside the `LlamaForCausalLM` branch
-  with post-load multiplier assignment).
+- Granite routes through `CudaModel::Ferrite` (originally wired as
+  `GraniteFerrite`, collapsed in `30661e397`). Quant / TP / PP keep
+  the hand-written Granite (which still sits inside the
+  `LlamaForCausalLM` branch with post-load multiplier assignment).
 - `test_cuda_correctness_granite_3_3_2b` + `granite_3_3_2b.json`
   golden. Ferrite and `FERRITE_DISABLE=1` paths produce identical
   output down to the same tolerated prompt-1 position-2 top-N
   divergence.
+- **Phase A+B refactor (commit `30661e397`)** — auto-registry +
+  fingerprint sniff. `ferrite_forward::FerriteWeights` trait +
+  `ferrite_forward::try_load(gw, stream, arch_hint)` using `inventory`
+  crate for auto-registration. Each `#[forward]` emits
+  `inventory::submit!`. `CudaModel::*Ferrite` (5 variants) collapsed
+  to `CudaModel::Ferrite(Box<FerriteModel>)`. Per-arch model structs
+  (`LlamaFerriteModel`, etc.) collapsed to
+  `FerriteModel { weights: Box<dyn FerriteWeights>, rotary }`.
+  `Weights::load` takes `(gw, stream)` only — auto-detects via
+  `fingerprint_matches(gw)`. Deleted: `quant_discriminator`,
+  `DISPATCH_FIELDS`, `collect_dispatch_bounds`, `ferrite_quant_kind`.
+  `extern crate ferrite_models as _;` required to prevent linker gc
+  of inventory registrations. `ModelParams.architectures: Vec<String>`
+  populated from config.json, used by the macro for the `hf_arches`
+  list. New arch = one file + `pub mod` line, zero `cuda_worker`
+  edits. New quant format = `StorageFormat` + parser + Impl +
+  `FieldLoad` + `is_*()` + `ferrite_eligible` gate, zero per-arch
+  `cuda_worker` edits.
 - **AWQ Llama + Qwen2 (Commit 3)** — compiler-native quant slice.
   `FufInput::Weight { id, index, storage: StorageFormat }` carries
   per-weight format; `Fuf::annotate_storage_formats(program, model)`
@@ -1309,17 +1404,18 @@ tackle in roughly this order.
   `FieldLoad::AwqLinearConcat { prefixes, group_size }` routed by
   accessor rust_type; the `Weights::load` body emits a one-shot
   `alloc_marlin_workspace` + `current_device` + `device_get_num_sm`
-  prelude when any AWQ accessor is present. Arch-level dispatcher's
-  match tuple gains `quant_kind: u8` (Dense=0, Awq=1) so
-  dense/AWQ Llama-3.2-1B no longer share a fingerprint — see
-  `ferrite_forward_macro::quant_discriminator` and
-  `cuda_worker::ferrite_quant_kind`. `cuda_worker.rs` gate lifted
-  to `!is_quantized() || is_awq()` for LlamaFerrite + Qwen2Ferrite.
+  prelude when any AWQ accessor is present. Dense/AWQ Llama-3.2-1B
+  no longer share a fingerprint — each compiled variant has its own
+  `fingerprint_matches(gw)` that checks actual safetensors key
+  presence (e.g. AWQ variant looks for `*.qweight` keys). The old
+  `quant_discriminator` / `ferrite_quant_kind` / `DISPATCH_FIELDS`
+  machinery is deleted as of `30661e397`. `ferrite_eligible` gate
+  lifted to `!is_quantized() || is_awq()` for ferrite-routed arches.
   `model_architectures/llama/llama-3.2-1b-awq.json` +
   `model_architectures/qwen2/qwen2.5-0.5b-awq.json` committed.
   Existing `test_cuda_marlin_awq_{server_starts,completion,chat}`
   now route through the ferrite path (cuda_worker logs
-  `loaded Qwen2 via ferrite-forward`) and all three pass.
+  `loaded ... via ferrite-forward`) and all three pass.
   `testdata/golden/llama_3_2_1b_awq.json` committed
   (Python-vLLM-generated) but the correctness golden test is NOT
   added yet — blocked on the shared Marlin numerical bug (AWQ and
@@ -1334,8 +1430,11 @@ fix" above). Remaining AWQ work is the correctness golden test,
 which is blocked on the Marlin numerical bug in gap #2. GPTQ /
 FP8 / BnB / FP8-block still need their own commits — the AWQ
 slice's shape (`StorageFormat::<Format>`, `<Format>*Impl`,
-`FieldLoad::<Format>Linear`, u8 discriminator slot, `is_<format>()`
-helper, gate lift) is the template.
+`FieldLoad::<Format>Linear`, `is_<format>()` helper on `QuantConfig`,
+gate line in `ferrite_eligible`) is the template. The old
+`u8 discriminator` / `quant_discriminator` / `ferrite_quant_kind`
+machinery is deleted — `fingerprint_matches(gw)` handles format
+dispatch automatically.
 
 ### Core principle
 
@@ -1352,9 +1451,11 @@ No `load_auto` helper. Marlin is a compute kernel, not a format
 version }` (or Gptq / Fp8 / …); marlin is one of several possible
 kernels that accept 4-bit INT storage.
 
-The emitted `Weights::load(gw, stream)` signature stays unchanged
-from the dense version — if a given model has AWQ accessors, the
-generated body allocates the marlin workspace inline:
+The emitted `Weights::load(gw, stream)` signature takes only `(gw,
+stream)` — no bounds args, no `quant_kind`. The right compiled variant
+is selected via `fingerprint_matches(gw)` at the arch level (see
+Phase A+B refactor, commit `30661e397`). If a given model has AWQ
+accessors, the generated body allocates the marlin workspace inline:
 
 ```rust
 pub fn load(gw, stream) -> Result<Self> {
@@ -1421,10 +1522,10 @@ shared Marlin numerical bug). The design notes below stay current.
   in this session's first attempt. See the "Runtime polymorphism
   for quant" failure pattern above.
 - **Don't thread workspace / device_id through `Weights::load`.**
-  They're emitted inline by codegen. The arch-level dispatcher
-  gained one new arg (`quant_kind: u8`) so dense and AWQ variants
-  of the same shape can be disambiguated at runtime — that's the
-  *only* signature extension, and it's format-agnostic.
+  They're emitted inline by codegen. The old `quant_kind: u8`
+  dispatch arg is deleted — `fingerprint_matches(gw)` auto-detects
+  which compiled variant (dense vs AWQ vs future) matches the
+  actual safetensors on disk.
 - **Don't invent an arch-level "quant config" arg.** Per-model
   storage formats are already in each `ModelParams`.
 - **Don't re-fork the marlin repack logic.** The single source of

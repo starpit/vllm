@@ -124,6 +124,10 @@ pub enum CfgError {
         /// Names we did have, for diagnostics.
         available: Vec<String>,
     },
+    UnknownScalar {
+        name: String,
+        available: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for CfgError {
@@ -136,6 +140,13 @@ impl std::fmt::Display for CfgError {
                      Available: {available:?}",
                 )
             }
+            Self::UnknownScalar { name, available } => {
+                write!(
+                    f,
+                    "config scalar `{name}` not in this model's config.json. \
+                     Available: {available:?}",
+                )
+            }
         }
     }
 }
@@ -145,7 +156,7 @@ impl std::error::Error for CfgError {}
 // ── Builder ──────────────────────────────────────────────────────
 
 pub fn build_cfg(program: &Program, params: &ModelParams) -> Result<Cfg, CfgError> {
-    let mut builder = CfgBuilder::new(&params.bounds);
+    let mut builder = CfgBuilder::new(&params.bounds, &params.scalars);
     let entry = builder.alloc_block();
     let exit = builder.alloc_block();
     builder.lower_stmts(&program.statements, entry, exit)?;
@@ -158,6 +169,7 @@ pub fn build_cfg(program: &Program, params: &ModelParams) -> Result<Cfg, CfgErro
 
 struct CfgBuilder<'a> {
     bounds: &'a BTreeMap<String, u64>,
+    scalars: &'a BTreeMap<String, f64>,
     blocks: Vec<Block>,
     /// One-per-block open instruction buffer: instrs accumulate
     /// into the indexed block's `instrs` field when we commit.
@@ -165,9 +177,10 @@ struct CfgBuilder<'a> {
 }
 
 impl<'a> CfgBuilder<'a> {
-    fn new(bounds: &'a BTreeMap<String, u64>) -> Self {
+    fn new(bounds: &'a BTreeMap<String, u64>, scalars: &'a BTreeMap<String, f64>) -> Self {
         Self {
             bounds,
+            scalars,
             blocks: Vec::new(),
             open: BTreeMap::new(),
         }
@@ -209,6 +222,17 @@ impl<'a> CfgBuilder<'a> {
                     CfgError::UnknownBound { name, available }
                 })?;
                 Ok(Expr::ScalarLit((v as f64).sqrt()))
+            }
+            Expr::ConfigScalar { name: ident, recip } => {
+                let name = ident.to_string();
+                let v = self.scalars.get(&name).copied().ok_or_else(|| {
+                    let available: Vec<String> = self.scalars.keys().cloned().collect();
+                    CfgError::UnknownScalar {
+                        name: name.clone(),
+                        available,
+                    }
+                })?;
+                Ok(Expr::ScalarLit(if *recip { 1.0 / v } else { v }))
             }
             Expr::Call { op, args } => {
                 let args = args

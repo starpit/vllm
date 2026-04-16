@@ -329,4 +329,9 @@ pub enum Expr {
     /// CFG builder resolves this to `ScalarLit(bounds[name].sqrt())`
     /// per-model (so the value becomes concrete before the FUF).
     SqrtBound(Ident),
+    /// `scalar(<name>)` / `recip_scalar(<name>)` — unresolved
+    /// compile-time scalar read from `ModelParams.scalars`. CFG
+    /// builder folds to `ScalarLit(scalars[name])` (or its
+    /// reciprocal) per-model.
+    ConfigScalar { name: Ident, recip: bool },
 }

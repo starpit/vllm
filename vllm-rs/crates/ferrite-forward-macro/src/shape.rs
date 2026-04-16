@@ -938,6 +938,7 @@ impl InferCtx {
                 // available, but shape inference runs before that.
                 Ok(Shape::new())
             }
+            Expr::ConfigScalar { .. } => Ok(Shape::new()),
         }
     }
 }

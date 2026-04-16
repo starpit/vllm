@@ -75,3 +75,10 @@ async fn test_cuda_correctness_smollm_135m() {
 async fn test_cuda_correctness_gemma2_2b() {
     run_correctness_test(TestModels::GEMMA2, "gemma2_2b").await;
 }
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_granite_3_3_2b() {
+    run_correctness_test(TestModels::GRANITE, "granite_3_3_2b").await;
+}

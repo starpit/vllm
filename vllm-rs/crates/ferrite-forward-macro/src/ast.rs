@@ -92,4 +92,10 @@ pub enum Expr {
     /// (where per-model bounds are known). Used e.g. by Gemma's
     /// embedding scale `embed(ids, w) * sqrt(hidden_size)`.
     SqrtBound(Ident),
+    /// `scalar(<name>)` / `recip_scalar(<name>)` — a compile-time
+    /// scalar read from `ModelParams.scalars` (non-integer top-level
+    /// fields of the model's `config.json`). Resolved at CFG-build
+    /// time. `recip == true` folds to `1.0 / scalars[name]`, used
+    /// for divisors like Granite's `logits_scaling`.
+    ConfigScalar { name: Ident, recip: bool },
 }

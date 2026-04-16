@@ -309,6 +309,10 @@ impl Ctx {
             }
             ast::Expr::ScalarLit(v) => Ok(Expr::ScalarLit(*v)),
             ast::Expr::SqrtBound(ident) => Ok(Expr::SqrtBound(ident.clone())),
+            ast::Expr::ConfigScalar { name, recip } => Ok(Expr::ConfigScalar {
+                name: name.clone(),
+                recip: *recip,
+            }),
         }
     }
 

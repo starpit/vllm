@@ -17,5 +17,6 @@
 //! per-arch Impl addition is required.
 
 pub mod gemma2;
+pub mod granite;
 pub mod llama;
 pub mod qwen2;

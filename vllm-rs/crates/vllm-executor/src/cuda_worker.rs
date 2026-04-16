@@ -129,6 +129,19 @@ pub struct Gemma2FerriteModel {
     pub rotary: vllm_cuda::rotary::RotaryCache,
 }
 
+/// Same as `LlamaFerriteModel` but over Granite (IBM) — the DSL
+/// body in `ferrite_models::granite` is Llama's math plus four
+/// scalar multipliers read from config: `embedding_multiplier`,
+/// `residual_multiplier`, `attention_multiplier`, `logits_scaling`.
+/// `attention_multiplier` is picked up by the attention impls via
+/// `attention_scale_for`; the other three ride through `scalar(...)`
+/// / `recip_scalar(...)` in the DSL and lower to `ScalarMulImpl`
+/// kernel calls. Nothing Granite-specific lives in the compiler.
+pub struct GraniteFerriteModel {
+    pub weights: ferrite_models::granite::Weights,
+    pub rotary: vllm_cuda::rotary::RotaryCache,
+}
+
 /// Supported model architectures in the vllm-cuda backend.
 enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
@@ -146,6 +159,9 @@ enum CudaModel {
     /// `ferrite_models::gemma2`. Same boxing rationale as
     /// `LlamaFerrite`.
     Gemma2Ferrite(Box<Gemma2FerriteModel>),
+    /// Granite (IBM) via `ferrite_models::granite`. Same boxing
+    /// rationale as `LlamaFerrite`.
+    GraniteFerrite(Box<GraniteFerriteModel>),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
     Mixtral(vllm_cuda::model::mixtral::MixtralForCausalLM),
     Qwen2Moe(vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM),
@@ -165,6 +181,7 @@ impl CudaModel {
             Self::Qwen2Ferrite(m) => m.weights.num_hidden_layers() as usize,
             Self::Gemma2(m) => m.model.layers.len(),
             Self::Gemma2Ferrite(m) => m.weights.num_hidden_layers() as usize,
+            Self::GraniteFerrite(m) => m.weights.num_hidden_layers() as usize,
             Self::Gemma3(m) => m.model.layers.len(),
             Self::Mixtral(m) => m.model.layers.len(),
             Self::Qwen2Moe(m) => m.model.layers.len(),
@@ -186,6 +203,7 @@ impl CudaModel {
             Self::Qwen2Ferrite(m) => m.weights.num_key_value_heads() as usize,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma2Ferrite(m) => m.weights.num_key_value_heads() as usize,
+            Self::GraniteFerrite(m) => m.weights.num_key_value_heads() as usize,
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Mixtral(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
@@ -205,6 +223,7 @@ impl CudaModel {
             Self::Qwen2Ferrite(m) => m.weights.head_dim() as usize,
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
             Self::Gemma2Ferrite(m) => m.weights.head_dim() as usize,
+            Self::GraniteFerrite(m) => m.weights.head_dim() as usize,
             Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
             Self::Mixtral(m) => m.model.layers[0].self_attn.head_dim,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.head_dim,
@@ -224,6 +243,7 @@ impl CudaModel {
             Self::Qwen2Ferrite(m) => m.weights.vocab_size() as usize,
             Self::Gemma2(m) => m.lm_head.out_features(),
             Self::Gemma2Ferrite(m) => m.weights.vocab_size() as usize,
+            Self::GraniteFerrite(m) => m.weights.vocab_size() as usize,
             Self::Gemma3(m) => m.lm_head.out_features(),
             Self::Mixtral(m) => m.lm_head.out_features(),
             Self::Qwen2Moe(m) => m.lm_head.out_features(),
@@ -254,6 +274,7 @@ impl CudaModel {
             Self::Qwen2Ferrite(m) => m.weights.hidden_size() as usize,
             Self::Gemma2(m) => m.lm_head.in_features(),
             Self::Gemma2Ferrite(m) => m.weights.hidden_size() as usize,
+            Self::GraniteFerrite(m) => m.weights.hidden_size() as usize,
             Self::Gemma3(m) => m.lm_head.in_features(),
             Self::Mixtral(m) => m.lm_head.in_features(),
             Self::Qwen2Moe(m) => m.lm_head.in_features(),
@@ -399,6 +420,22 @@ impl CudaModel {
                     rotary: &m.rotary,
                 };
                 ferrite_models::gemma2::forward_backbone(&m.weights, &ctx, device, num_tokens)
+            },
+            Self::GraniteFerrite(m) => unsafe {
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    rotary: &m.rotary,
+                };
+                ferrite_models::granite::forward_backbone(&m.weights, &ctx, device, num_tokens)
             },
             Self::Gemma3(m) => unsafe {
                 m.model.forward(
@@ -649,6 +686,33 @@ impl CudaModel {
                     rotary: &m.rotary,
                 };
                 let logits = ferrite_models::gemma2::forward(&m.weights, &ctx, device, num_tokens);
+                match last_token_indices {
+                    Some(idx) if idx.dim(0) < num_tokens as usize => {
+                        vllm_cuda::kernels::embedding_gather(
+                            logits.as_gpu_tensor(),
+                            *idx,
+                            &mut device.caching,
+                            device.compute_stream,
+                        )
+                    }
+                    _ => logits,
+                }
+            },
+            Self::GraniteFerrite(m) => unsafe {
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    rotary: &m.rotary,
+                };
+                let logits = ferrite_models::granite::forward(&m.weights, &ctx, device, num_tokens);
                 match last_token_indices {
                     Some(idx) if idx.dim(0) < num_tokens as usize => {
                         vllm_cuda::kernels::embedding_gather(
@@ -5619,26 +5683,91 @@ impl Worker for CudaWorker {
             }
             "GraniteForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
-                let mut m = if qconfig.is_bnb4bit() {
-                    let bnb_cfg = match &qconfig {
-                        vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
-                        _ => unreachable!(),
-                    };
-                    vllm_cuda::model::llama::LlamaForCausalLM::load_bnb4bit(
+                // Ferrite-gate: dense-bf16 Granite without quant / TP /
+                // PP routes through `#[forward]`-emitted code. The
+                // three scalar multipliers (embedding/residual/logits)
+                // are read from config via the DSL's `scalar(...)` /
+                // `recip_scalar(...)`; `attention_multiplier` is picked
+                // up by the attention impls via `attention_scale_for`.
+                // No runtime state plumbing beyond the rotary cache.
+                let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
+                if !qconfig.is_bnb4bit()
+                    && !qconfig.is_fp8()
+                    && !qconfig.is_quantized()
+                    && !use_tp
+                    && !use_pp
+                    && !disable_ferrite
+                {
+                    let stream = device.compute_stream;
+                    let ferrite_weights = ferrite_models::granite::Weights::load(
                         &mut weights,
-                        &config,
-                        dtype,
-                        bnb_cfg,
-                        device,
+                        stream,
+                        config.num_hidden_layers as u64,
+                        config.hidden_size as u64,
+                        config.intermediate_size as u64,
+                        config.num_attention_heads as u64,
+                        config.num_kv_heads as u64,
+                        config.head_dim as u64,
+                        config.vocab_size as u64,
                     )
-                } else if qconfig.is_fp8() {
-                    let fp8_cfg = match &qconfig {
-                        vllm_cuda::quant::QuantConfig::Fp8(c) => c,
-                        _ => unreachable!(),
-                    };
-                    if fp8_cfg.weight_block_size.is_some() {
-                        if use_tp {
-                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block_tp(
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!("Granite ferrite-forward load: {e}"))
+                    })?;
+                    let rotary = unsafe {
+                        vllm_cuda::rotary::RotaryCache::new(
+                            config.head_dim,
+                            config.max_position_embeddings,
+                            config.rope_theta,
+                            config.llama3_rope_scaling.as_ref(),
+                            dtype,
+                            device,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
+                    info!("CudaWorker: loaded Granite via ferrite-forward");
+                    CudaModel::GraniteFerrite(Box::new(GraniteFerriteModel {
+                        weights: ferrite_weights,
+                        rotary,
+                    }))
+                } else {
+                    let mut m = if qconfig.is_bnb4bit() {
+                        let bnb_cfg = match &qconfig {
+                            vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                            _ => unreachable!(),
+                        };
+                        vllm_cuda::model::llama::LlamaForCausalLM::load_bnb4bit(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            bnb_cfg,
+                            device,
+                        )
+                    } else if qconfig.is_fp8() {
+                        let fp8_cfg = match &qconfig {
+                            vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                            _ => unreachable!(),
+                        };
+                        if fp8_cfg.weight_block_size.is_some() {
+                            if use_tp {
+                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block_tp(
+                                    &mut weights,
+                                    &config,
+                                    dtype,
+                                    config.rms_norm_eps,
+                                    tp,
+                                    device,
+                                )
+                            } else {
+                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                                    &mut weights,
+                                    &config,
+                                    dtype,
+                                    config.rms_norm_eps,
+                                    device,
+                                )
+                            }
+                        } else if use_tp {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_tp(
                                 &mut weights,
                                 &config,
                                 dtype,
@@ -5647,7 +5776,7 @@ impl Worker for CudaWorker {
                                 device,
                             )
                         } else {
-                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
                                 &mut weights,
                                 &config,
                                 dtype,
@@ -5655,84 +5784,69 @@ impl Worker for CudaWorker {
                                 device,
                             )
                         }
-                    } else if use_tp {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_tp(
+                    } else if qconfig.is_quantized() {
+                        vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
                             &mut weights,
                             &config,
                             dtype,
-                            config.rms_norm_eps,
+                            &qconfig,
+                            device,
+                        )
+                    } else if use_tp {
+                        vllm_cuda::model::llama::LlamaForCausalLM::load_tp(
+                            &mut weights,
+                            &config,
+                            dtype,
                             tp,
                             device,
                         )
                     } else {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
+                        vllm_cuda::model::llama::LlamaForCausalLM::load(
                             &mut weights,
                             &config,
                             dtype,
-                            config.rms_norm_eps,
                             device,
                         )
                     }
-                } else if qconfig.is_quantized() {
-                    vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        &qconfig,
-                        device,
-                    )
-                } else if use_tp {
-                    vllm_cuda::model::llama::LlamaForCausalLM::load_tp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        tp,
-                        device,
-                    )
-                } else {
-                    vllm_cuda::model::llama::LlamaForCausalLM::load(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerInit(format!("GraniteForCausalLM load: {e}")))?;
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!("GraniteForCausalLM load: {e}"))
+                    })?;
 
-                // Parse Granite-specific multipliers from config.json extras.
-                let extra = &hf_config.extra;
-                let embedding_multiplier = extra
-                    .get("embedding_multiplier")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0) as f32;
-                let residual_multiplier = extra
-                    .get("residual_multiplier")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0) as f32;
-                let logits_scaling = extra
-                    .get("logits_scaling")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0) as f32;
-                let attention_multiplier = extra
-                    .get("attention_multiplier")
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v as f32)
-                    .unwrap_or(1.0 / (config.head_dim as f32).sqrt());
+                    // Parse Granite-specific multipliers from config.json extras.
+                    let extra = &hf_config.extra;
+                    let embedding_multiplier = extra
+                        .get("embedding_multiplier")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0) as f32;
+                    let residual_multiplier = extra
+                        .get("residual_multiplier")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0) as f32;
+                    let logits_scaling = extra
+                        .get("logits_scaling")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0) as f32;
+                    let attention_multiplier = extra
+                        .get("attention_multiplier")
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .unwrap_or(1.0 / (config.head_dim as f32).sqrt());
 
-                // Apply multipliers.
-                m.model.embedding_multiplier = embedding_multiplier;
-                m.logits_scaling = logits_scaling;
-                for layer in &mut m.model.layers {
-                    layer.residual_multiplier = residual_multiplier;
-                    layer.self_attn.scale = attention_multiplier;
-                }
+                    // Apply multipliers.
+                    m.model.embedding_multiplier = embedding_multiplier;
+                    m.logits_scaling = logits_scaling;
+                    for layer in &mut m.model.layers {
+                        layer.residual_multiplier = residual_multiplier;
+                        layer.self_attn.scale = attention_multiplier;
+                    }
 
-                info!(
-                    "Granite multipliers: embedding={embedding_multiplier}, \
+                    info!(
+                        "Granite multipliers: embedding={embedding_multiplier}, \
                      residual={residual_multiplier}, attention={attention_multiplier}, \
                      logits_scaling={logits_scaling}"
-                );
-                CudaModel::Llama(m)
+                    );
+                    CudaModel::Llama(m)
+                } // close else { legacy }
             }
             "MixtralForCausalLM" => {
                 let config = mixtral_config_from_hf(&hf_config)?;

@@ -444,6 +444,10 @@ impl<'a> Unroller<'a> {
                 "Expr::SqrtBound should have been folded to Expr::ScalarLit by \
                  cfg.rs::fold_scalars before reaching the unroller"
             ),
+            Expr::ConfigScalar { .. } => unreachable!(
+                "Expr::ConfigScalar should have been folded to Expr::ScalarLit by \
+                 cfg.rs::fold_scalars before reaching the unroller"
+            ),
         }
     }
 

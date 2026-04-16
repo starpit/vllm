@@ -896,12 +896,16 @@ fn cost_gemm(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     }
 }
 
-/// Softmax scale for one attention call. Reads
-/// `query_pre_attn_scalar` from the model config when present
-/// (Gemma2's query pre-attention scaling), else falls back to the
-/// standard `1 / sqrt(head_dim)` (Llama, Qwen2, Qwen3, ...). The
-/// HF convention is `scale = query_pre_attn_scalar.powf(-0.5)`.
+/// Softmax scale for one attention call. Priority order:
+///   1. Granite's `attention_multiplier` — a direct override (no
+///      transform); the HF config already stores the final scale.
+///   2. Gemma2's `query_pre_attn_scalar` — convention is
+///      `scale = query_pre_attn_scalar.powf(-0.5)`.
+///   3. Fallback `1 / sqrt(head_dim)` for Llama / Qwen2 / Qwen3.
 pub(crate) fn attention_scale_for(model: &crate::config::ModelParams) -> f32 {
+    if let Some(s) = model.scalars.get("attention_multiplier") {
+        return *s as f32;
+    }
     match model.scalars.get("query_pre_attn_scalar") {
         Some(q) => (*q as f32).powf(-0.5),
         None => {

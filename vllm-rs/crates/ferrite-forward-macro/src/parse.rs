@@ -325,6 +325,29 @@ pub fn parse_expr(expr: &SynExpr) -> ParseResult<Expr> {
                 };
                 return Ok(Expr::SqrtBound(ident));
             }
+            if op == "scalar" || op == "recip_scalar" {
+                if c.args.len() != 1 {
+                    return Err(syn::Error::new(
+                        op.span(),
+                        "`scalar(<name>)` / `recip_scalar(<name>)` takes exactly one argument",
+                    ));
+                }
+                let ident = match &c.args[0] {
+                    SynExpr::Path(p) if p.path.get_ident().is_some() => {
+                        p.path.get_ident().unwrap().clone()
+                    }
+                    other => {
+                        return Err(syn::Error::new(
+                            other.span(),
+                            "`scalar(...)` / `recip_scalar(...)` argument must be a config key identifier",
+                        ));
+                    }
+                };
+                return Ok(Expr::ConfigScalar {
+                    name: ident,
+                    recip: op == "recip_scalar",
+                });
+            }
             let args = c
                 .args
                 .iter()

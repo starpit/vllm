@@ -32,6 +32,7 @@ mod codegen;
 mod concurrency;
 mod config;
 mod cost;
+mod cuda_codegen;
 mod emit;
 mod fuf;
 mod impl_lib;
@@ -255,7 +256,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         .map_err(|e| syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem)))?;
         let d_solve = t_solve.elapsed();
 
-        let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
+        let loops = schedule::schedule_workloads(&model_fuf, &sfufs, &library);
 
         // Post-scheduler: recompute each bucket's `predicted_us`
         // with per-wave contention applied via ConcurrencyModel.

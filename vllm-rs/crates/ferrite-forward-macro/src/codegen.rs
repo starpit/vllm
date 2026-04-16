@@ -39,7 +39,7 @@ use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
 use crate::emit::{EmitCtx, LocalMap};
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
+use crate::impl_lib::{DevicePhase, ImplId, ImplementationLibrary, WeightAccessor};
 use crate::schedule::{Loop, WorkloadLoops};
 use crate::solver::{Assignment, SubgraphId, WorkloadAssignments};
 
@@ -480,6 +480,279 @@ fn compute_drops_after(
     plan
 }
 
+/// Context for megakernel emission — bundles the many parameters
+/// needed by `try_emit_megakernel`.
+struct MegakernelEmitCtx<'a> {
+    sfuf: &'a Assignment,
+    fuf: &'a Fuf,
+    program: &'a Program,
+    model: &'a ModelParams,
+    lib: &'a ImplementationLibrary,
+    locals: &'a LocalMap,
+    drops: &'a DropPlan,
+    num_tokens: u64,
+}
+
+/// Try to emit a megakernel launch for a group of ≥2 DC subgraphs.
+///
+/// Calls `device_phase` on each subgraph's impl. If all return `Some`,
+/// generates the `.cu` source (written to the megakernel cache), emits
+/// an `extern "C"` FFI declaration and the Rust call site.
+///
+/// Returns `Some(tokens)` on success, `None` if any impl can't provide
+/// a device phase (caller should fall back to individual `emit_call`).
+fn try_emit_megakernel(
+    dc_group: &[(&SubgraphId, &ImplId)],
+    mctx: &MegakernelEmitCtx,
+    mega_idx: &mut usize,
+) -> Option<Vec<TokenStream>> {
+    if dc_group.len() < 2 {
+        return None;
+    }
+
+    // Collect DevicePhases + Rust param expressions for each subgraph.
+    let mut phases: Vec<DevicePhase> = Vec::new();
+    let mut rust_exprs: Vec<Vec<proc_macro2::TokenStream>> = Vec::new();
+
+    for (idx, (sg, imp_id)) in dc_group.iter().enumerate() {
+        let claimed = mctx.sfuf.tiles_in_subgraph(**sg);
+        let ctx = EmitCtx {
+            fuf: mctx.fuf,
+            program: mctx.program,
+            model: mctx.model,
+            claimed_tiles: &claimed,
+            locals: mctx.locals,
+        };
+        let imp = mctx.lib.get(**imp_id);
+        let (phase, exprs) = imp.device_phase(idx, &ctx)?;
+        phases.push(phase);
+        rust_exprs.push(exprs);
+    }
+
+    // Generate the .cu source and write to megakernel cache.
+    let wave_label = format!("m{}_w{}", mctx.num_tokens, *mega_idx);
+    *mega_idx += 1;
+    let generated = generate_megakernel_labeled(&wave_label, &phases);
+
+    // Write .cu to cache directory (best-effort; build.rs picks it up).
+    // Mirrors the path used by ferrite-cuda-builder/build.rs:
+    // ~/.cache/cudaforge/megakernels/ (Linux/Mac).
+    if let Ok(home) = std::env::var("HOME") {
+        let mega_dir = std::path::PathBuf::from(home).join(".cache/cudaforge/megakernels");
+        let _ = std::fs::create_dir_all(&mega_dir);
+        let cu_path = mega_dir.join(format!("{}.cu", generated.launch_fn_name));
+        let _ = std::fs::write(&cu_path, &generated.cuda_source);
+    }
+
+    // Emit Rust code: extern "C" declaration + param setup + call.
+    let launch_fn = format_ident!("{}", generated.launch_fn_name);
+    let mut tokens = Vec::new();
+
+    // Build the extern "C" parameter list.
+    let extern_params: Vec<TokenStream> = generated
+        .flat_params
+        .iter()
+        .map(|(c_type, name)| {
+            let name_ident = format_ident!("{}", name);
+            let ty = c_type_to_rust(c_type);
+            quote! { #name_ident: #ty }
+        })
+        .collect();
+
+    tokens.push(quote! {
+        extern "C" {
+            fn #launch_fn(
+                #(#extern_params,)*
+                __grid_x: i32,
+                __block_x: i32,
+                __smem_bytes: usize,
+                __stream: u64,
+            ) -> i32;
+        }
+    });
+
+    // Emit param bindings from Rust expressions.
+    for (phase, exprs) in phases.iter().zip(rust_exprs.iter()) {
+        for ((c_type, name), expr) in phase.flat_params.iter().zip(exprs.iter()) {
+            let name_ident = format_ident!("{}", name);
+            let ty = c_type_to_rust(c_type);
+            tokens.push(quote! {
+                let #name_ident: #ty = #expr;
+            });
+        }
+    }
+
+    // Emit the launch call.
+    let param_idents: Vec<proc_macro2::Ident> = generated
+        .flat_params
+        .iter()
+        .map(|(_, name)| format_ident!("{}", name))
+        .collect();
+
+    tokens.push(quote! {
+        {
+            let __stream_raw = device.stream().raw() as u64;
+            // TODO: compute grid/block from phase requirements
+            let __grid_x = 1i32;
+            let __block_x = 256i32;
+            let __smem_bytes = 0usize;
+            let __ret = unsafe {
+                #launch_fn(
+                    #(#param_idents,)*
+                    __grid_x,
+                    __block_x,
+                    __smem_bytes,
+                    __stream_raw,
+                )
+            };
+            assert_eq!(__ret, 0, "megakernel launch failed");
+        }
+    });
+
+    // Emit drops for each subgraph in the group.
+    for (sg, _) in dc_group {
+        if let Some(owners) = mctx.drops.get(sg) {
+            for (t, s) in owners {
+                let ident = &mctx.locals[&(*t, *s)];
+                tokens.push(quote! { drop(#ident); });
+            }
+        }
+    }
+
+    Some(tokens)
+}
+
+/// Map a C type string to a Rust FFI type.
+fn c_type_to_rust(c_type: &str) -> TokenStream {
+    match c_type {
+        "void*" => quote! { *mut ::core::ffi::c_void },
+        "const void*" => quote! { *const ::core::ffi::c_void },
+        "int" => quote! { i32 },
+        "float" => quote! { f32 },
+        "double" => quote! { f64 },
+        "size_t" | "uint64_t" => quote! { u64 },
+        "int64_t" => quote! { i64 },
+        _ => {
+            let ty_ident = format_ident!("{}", c_type);
+            quote! { #ty_ident }
+        }
+    }
+}
+
+/// Like `generate_megakernel` but with a string label instead of
+/// numeric wave_idx, for disambiguation across workload buckets.
+fn generate_megakernel_labeled(
+    label: &str,
+    phases: &[DevicePhase],
+) -> crate::cuda_codegen::GeneratedMegakernel {
+    assert!(
+        phases.len() >= 2,
+        "megakernel requires at least 2 phases (got {})",
+        phases.len()
+    );
+
+    use std::fmt::Write;
+
+    let launch_fn_name = format!("megakernel_{label}_launch");
+    let params_struct_name = format!("Megakernel_{label}_Params");
+    let kernel_name = format!("megakernel_{label}");
+
+    let mut src = String::new();
+    writeln!(src, "// Auto-generated megakernel for {label}").unwrap();
+    writeln!(
+        src,
+        "// DO NOT EDIT — regenerate via the forward! proc macro."
+    )
+    .unwrap();
+    writeln!(src).unwrap();
+    writeln!(src, "#include <cuda_bf16.h>").unwrap();
+    writeln!(src, "#include <cooperative_groups.h>").unwrap();
+    writeln!(src, "#include \"megakernel_ops.cuh\"").unwrap();
+    writeln!(src).unwrap();
+
+    // Emit per-phase preambles (CUTLASS includes, type aliases, etc.)
+    for phase in phases {
+        for line in &phase.preamble {
+            writeln!(src, "{line}").unwrap();
+        }
+    }
+    if phases.iter().any(|p| !p.preamble.is_empty()) {
+        writeln!(src).unwrap();
+    }
+
+    let mut all_flat: Vec<(String, String)> = Vec::new();
+    for phase in phases {
+        all_flat.extend(phase.flat_params.iter().cloned());
+    }
+
+    writeln!(src, "struct {params_struct_name} {{").unwrap();
+    for (i, phase) in phases.iter().enumerate() {
+        writeln!(src, "    // Phase {i}").unwrap();
+        for field in &phase.internal_fields {
+            writeln!(src, "    {field};").unwrap();
+        }
+    }
+    writeln!(src, "}};").unwrap();
+    writeln!(src).unwrap();
+
+    writeln!(
+        src,
+        "extern \"C\" __global__ void {kernel_name}({params_struct_name} p) {{"
+    )
+    .unwrap();
+    writeln!(src, "    namespace cg = cooperative_groups;").unwrap();
+    writeln!(src, "    extern __shared__ char smem[];").unwrap();
+    writeln!(src).unwrap();
+
+    for (i, phase) in phases.iter().enumerate() {
+        if i > 0 {
+            writeln!(src, "    cg::this_grid().sync();").unwrap();
+            writeln!(src).unwrap();
+        }
+        writeln!(src, "    // Phase {i}").unwrap();
+        for line in &phase.kernel_body {
+            writeln!(src, "    {line}").unwrap();
+        }
+        writeln!(src).unwrap();
+    }
+
+    writeln!(src, "}}").unwrap();
+    writeln!(src).unwrap();
+
+    writeln!(src, "extern \"C\" int {launch_fn_name}(").unwrap();
+    for (c_type, name) in &all_flat {
+        writeln!(src, "    {c_type} {name},").unwrap();
+    }
+    writeln!(src, "    int __grid_x, int __block_x,").unwrap();
+    writeln!(src, "    size_t __smem_bytes,").unwrap();
+    writeln!(src, "    uint64_t __stream)").unwrap();
+    writeln!(src, "{{").unwrap();
+    writeln!(src, "    {params_struct_name} params;").unwrap();
+    for phase in phases {
+        for line in &phase.params_build {
+            writeln!(src, "    {line}").unwrap();
+        }
+    }
+    writeln!(src).unwrap();
+    writeln!(src, "    dim3 grid(__grid_x);").unwrap();
+    writeln!(src, "    dim3 block(__block_x);").unwrap();
+    writeln!(src, "    void* args[] = {{ &params }};").unwrap();
+    writeln!(src, "    return cudaLaunchCooperativeKernel(").unwrap();
+    writeln!(src, "        (void*){kernel_name},").unwrap();
+    writeln!(
+        src,
+        "        grid, block, args, __smem_bytes, (cudaStream_t)__stream);"
+    )
+    .unwrap();
+    writeln!(src, "}}").unwrap();
+
+    crate::cuda_codegen::GeneratedMegakernel {
+        cuda_source: src,
+        launch_fn_name,
+        flat_params: all_flat,
+    }
+}
+
 /// Emit one per-workload-bucket forward fn.
 fn emit_forward_for_bucket(
     fuf: &Fuf,
@@ -506,12 +779,30 @@ fn emit_forward_for_bucket(
     }
     let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, None, &protected);
 
-    // Walk waves in order; each subgraph's bound impl emits its own
-    // kernel invocation. Codegen stays mechanical — no per-op match
-    // lives here. After each subgraph, drop any tile-local owners
-    // whose last cross-subgraph use was here.
+    // Walk waves in order. Megakernel waves (is_megakernel=true)
+    // attempt to emit a single cooperative kernel launch; non-mega
+    // waves emit individual `emit_call` per subgraph.
+    let mctx = MegakernelEmitCtx {
+        sfuf,
+        fuf,
+        program,
+        model,
+        lib,
+        locals: &locals,
+        drops: &drops,
+        num_tokens,
+    };
     let mut body: Vec<TokenStream> = Vec::new();
+    let mut mega_idx = 0usize;
     for wave in &loop_ir.waves {
+        if wave.is_megakernel {
+            let dc_group: Vec<(&SubgraphId, &ImplId)> =
+                wave.subgraphs.iter().map(|(sg, id)| (sg, id)).collect();
+            if let Some(mega_tokens) = try_emit_megakernel(&dc_group, &mctx, &mut mega_idx) {
+                body.extend(mega_tokens);
+                continue;
+            }
+        }
         for (sg, imp_id) in &wave.subgraphs {
             let claimed = sfuf.tiles_in_subgraph(*sg);
             let ctx = EmitCtx {
@@ -630,8 +921,33 @@ fn emit_forward_backbone_for_bucket(
     protected.insert(backbone_out);
     let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, Some(terminal_sg), &protected);
 
+    let mctx = MegakernelEmitCtx {
+        sfuf,
+        fuf,
+        program,
+        model,
+        lib,
+        locals: &locals,
+        drops: &drops,
+        num_tokens,
+    };
     let mut body: Vec<TokenStream> = Vec::new();
+    let mut mega_idx = 0usize;
     for wave in &loop_ir.waves {
+        if wave.is_megakernel {
+            let dc_group: Vec<(&SubgraphId, &ImplId)> = wave
+                .subgraphs
+                .iter()
+                .filter(|(sg, _)| *sg != terminal_sg)
+                .map(|(sg, id)| (sg, id))
+                .collect();
+            if dc_group.len() >= 2
+                && let Some(mega_tokens) = try_emit_megakernel(&dc_group, &mctx, &mut mega_idx)
+            {
+                body.extend(mega_tokens);
+                continue;
+            }
+        }
         for (sg, imp_id) in &wave.subgraphs {
             if *sg == terminal_sg {
                 continue;

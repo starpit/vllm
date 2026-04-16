@@ -427,3 +427,276 @@ __device__ void dc_silu_and_mul(
         o[i] = static_cast<T>(gv * uv);
     }
 }
+
+// ── GELU-and-Mul (device-callable) ────────────────────────────────
+//
+// out[i] = gelu_tanh(gate[i]) * up[i], where gate and up are
+// packed as [gate|up] in a [num_rows, 2*d] tensor.
+// One CTA per row.
+
+__device__ __forceinline__ float dc_gelu_tanh(float x) {
+    constexpr float BETA = 0.7978845608028654f;  // sqrt(2/pi)
+    constexpr float KAPPA = 0.044715f;
+    float x3 = x * x * x;
+    float inner = BETA * (x + KAPPA * x3);
+    return 0.5f * x * (1.0f + tanhf(inner));
+}
+
+template <typename T>
+__device__ void dc_gelu_and_mul(
+    T* __restrict__ out,
+    const T* __restrict__ input,  // [num_rows, 2*d]
+    int d,
+    int num_rows)
+{
+    const int row = blockIdx.x;
+    if (row >= num_rows) return;
+
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
+    const T* gate = input + row * 2 * d;
+    const T* up = gate + d;
+    T* o = out + row * d;
+
+    const int num_vecs = d / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float gbuf[VEC_SIZE], ubuf[VEC_SIZE], obuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&gate[vi * VEC_SIZE]), gbuf);
+        unpack_vec<T>(vec_load(&up[vi * VEC_SIZE]), ubuf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            obuf[j] = dc_gelu_tanh(gbuf[j]) * ubuf[j];
+        }
+        vec_store(&o[vi * VEC_SIZE], pack_vec<T>(obuf));
+    }
+    for (int i = tail_start + threadIdx.x; i < d; i += blockDim.x) {
+        float gv = dc_gelu_tanh(static_cast<float>(gate[i]));
+        float uv = static_cast<float>(up[i]);
+        o[i] = static_cast<T>(gv * uv);
+    }
+}
+
+// ── Scalar multiply inplace (device-callable) ─────────────────────
+//
+// x[i] *= scalar.  One CTA processes the whole row.
+// Used for embedding scaling (e.g. Gemma sqrt(hidden_size)).
+
+template <typename T>
+__device__ void dc_scalar_mul_inplace(
+    T* __restrict__ x,
+    float scalar,
+    int n,
+    int num_rows)
+{
+    // Grid-stride over total elements = num_rows * n.
+    const int total = num_rows * n;
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+    const int num_vecs = total / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+
+    for (int vi = tid; vi < num_vecs; vi += stride) {
+        float buf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&x[vi * VEC_SIZE]), buf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            buf[j] *= scalar;
+        }
+        vec_store(&x[vi * VEC_SIZE], pack_vec<T>(buf));
+    }
+    for (int i = tail_start + tid; i < total; i += stride) {
+        x[i] = static_cast<T>(static_cast<float>(x[i]) * scalar);
+    }
+}
+
+// ── Tanh softcap inplace (device-callable) ────────────────────────
+//
+// x[i] = cap * tanh(x[i] / cap).  Grid-stride over all elements.
+// Used for Gemma2 final logit softcapping.
+
+template <typename T>
+__device__ void dc_tanh_softcap_inplace(
+    T* __restrict__ x,
+    float inv_cap,
+    float cap,
+    int n)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        float v = static_cast<float>(x[i]) * inv_cap;
+        x[i] = static_cast<T>(cap * tanhf(v));
+    }
+}
+
+// ── RMS Norm with weight offset (device-callable) ─────────────────
+//
+// out[row] = (1 + weight) * input[row] * rsqrt(mean(input[row]^2) + eps)
+// The (1+w) convention is Gemma's norm weight format.
+// Same as dc_rms_norm but adds 1.0 to the weight.
+
+template <typename T>
+__device__ void dc_rms_norm_with_offset(
+    T* __restrict__ out,
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    float eps,
+    float weight_offset,
+    int hidden_size,
+    int num_rows,
+    char* smem)
+{
+    const int row = blockIdx.x;
+    if (row >= num_rows) return;
+
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
+    const T* x = input + row * hidden_size;
+    T* y = out + row * hidden_size;
+
+    const int num_vecs = hidden_size / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+
+    // Pass 1: sum of squares.
+    float ss = 0.0f;
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float buf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&x[vi * VEC_SIZE]), buf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            ss += buf[j] * buf[j];
+        }
+    }
+    for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = static_cast<float>(x[i]);
+        ss += v * v;
+    }
+    ss = dc_block_reduce_sum(ss);
+
+    float* s_inv_rms = reinterpret_cast<float*>(smem);
+    if (threadIdx.x == 0) {
+        *s_inv_rms = rsqrtf(ss / hidden_size + eps);
+    }
+    __syncthreads();
+
+    float inv_rms = *s_inv_rms;
+
+    // Pass 2: normalize with offset weight.
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float xbuf[VEC_SIZE], wbuf[VEC_SIZE], obuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&x[vi * VEC_SIZE]), xbuf);
+        unpack_vec<T>(vec_load(&weight[vi * VEC_SIZE]), wbuf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            obuf[j] = xbuf[j] * inv_rms * (wbuf[j] + weight_offset);
+        }
+        vec_store(&y[vi * VEC_SIZE], pack_vec<T>(obuf));
+    }
+    for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = static_cast<float>(x[i]) * inv_rms;
+        y[i] = static_cast<T>(v * (static_cast<float>(weight[i]) + weight_offset));
+    }
+}
+
+// ── Fused Add + RMS Norm with weight offset (device-callable) ─────
+//
+// residual += input; input = (weight_offset + weight) * residual * rsqrt(...)
+// Gemma2 uses weight_offset=1.0 for its (1+w) convention.
+
+template <typename T>
+__device__ void dc_fused_add_rms_norm_with_offset(
+    T* __restrict__ input,
+    T* __restrict__ residual,
+    const T* __restrict__ weight,
+    float eps,
+    float weight_offset,
+    int hidden_size,
+    int num_rows,
+    char* smem)
+{
+    const int row = blockIdx.x;
+    if (row >= num_rows) return;
+
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
+    T* x = input + row * hidden_size;
+    T* r = residual + row * hidden_size;
+
+    const int num_vecs = hidden_size / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+
+    float ss = 0.0f;
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float xbuf[VEC_SIZE], rbuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&x[vi * VEC_SIZE]), xbuf);
+        unpack_vec<T>(vec_load(&r[vi * VEC_SIZE]), rbuf);
+        float sbuf[VEC_SIZE];
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            sbuf[j] = xbuf[j] + rbuf[j];
+            ss += sbuf[j] * sbuf[j];
+        }
+        vec_store(&r[vi * VEC_SIZE], pack_vec<T>(sbuf));
+    }
+    for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float xv = static_cast<float>(x[i]);
+        float rv = static_cast<float>(r[i]);
+        float sv = xv + rv;
+        r[i] = static_cast<T>(sv);
+        ss += sv * sv;
+    }
+    ss = dc_block_reduce_sum(ss);
+
+    float* s_inv_rms = reinterpret_cast<float*>(smem);
+    if (threadIdx.x == 0) {
+        *s_inv_rms = rsqrtf(ss / hidden_size + eps);
+    }
+    __syncthreads();
+
+    float inv_rms = *s_inv_rms;
+
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float rbuf[VEC_SIZE], wbuf[VEC_SIZE], obuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&r[vi * VEC_SIZE]), rbuf);
+        unpack_vec<T>(vec_load(&weight[vi * VEC_SIZE]), wbuf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            obuf[j] = rbuf[j] * inv_rms * (wbuf[j] + weight_offset);
+        }
+        vec_store(&x[vi * VEC_SIZE], pack_vec<T>(obuf));
+    }
+    for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float rv = static_cast<float>(r[i]) * inv_rms;
+        x[i] = static_cast<T>(rv * (static_cast<float>(weight[i]) + weight_offset));
+    }
+}
+
+// ── Fused QKV + RoPE + KV cache write (device-callable, prefill) ──
+//
+// Prefill variant: processes multiple tokens. Same logic as decode
+// dc_fused_qkv_rope_cache but with num_rows > 1 and contiguous
+// output rather than paged cache writes.
+// Note: uses the same dc_fused_qkv_rope_cache function above —
+// it already handles num_rows > 1 correctly.
+
+// (No new function needed — dc_fused_qkv_rope_cache already works
+// for both decode and prefill since it uses num_rows as the bound.
+// The prefill DC impl just passes num_tokens > 1.)
+
+// ── TK Attention Decode (device-callable stub) ────────────────────
+//
+// ThunderKittens wgmma-based attention for sm90+.  The actual
+// persistent-kernel integration requires embedding the TK runner's
+// device-side dispatch.  For now we provide a stub that the
+// megakernel generator references — the real implementation lands
+// with the TK runtime FFI.
+
+// NOTE: TK attention is inherently a persistent kernel that manages
+// its own warp scheduling.  It cannot be trivially wrapped in a
+// megakernel phase like elementwise ops.  The megakernel codegen
+// treats TK attention as a "boundary" phase that gets its own
+// cooperative launch rather than being inlined as a __device__ call.
+// This is NOT a limitation — it's by design: TK attention occupies
+// all SMs and uses mbarrier-based warpgroup scheduling internally.

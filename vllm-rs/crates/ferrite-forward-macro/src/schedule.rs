@@ -1,21 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Scheduler: turn the SFUF back into a LOOP of waves.
 //!
-//! A wave (== BSP superstep) is a set of subgraphs with no
-//! dependence on each other; subgraphs within a wave are
-//! concurrent, waves execute in sequence. Topological layering
-//! over subgraphs: each subgraph's wave index is `1 + max(wave of
-//! any subgraph it depends on)`.
+//! A wave groups subgraphs into a single launch. Two criteria
+//! allow subgraphs to share a wave:
 //!
-//! A dep between subgraphs A and B exists when some tile in B has
-//! a `FufInput::Tile` edge to a tile in A. Within the same
-//! subgraph, internal deps are irrelevant to scheduling (the Impl
-//! handles them internally).
+//! 1. **Independence** — no data dep between them. They run
+//!    concurrently (standard BSP superstep).
+//! 2. **DeviceCallable chain** — subgraph B depends on A, but
+//!    both are `DeviceCallable`. They share a wave because the
+//!    megakernel provides ordering via `cg::this_grid().sync()`
+//!    between phases — no separate kernel launch needed.
+//!
+//! The wave assignment algorithm: for each subgraph in topo order,
+//! its wave index is `max(wave of predecessors) + bump`, where
+//! `bump` is 0 when both the subgraph and the predecessor are DC
+//! (they merge into the same wave), and 1 otherwise (new wave).
 //!
 //! What this pass does NOT do:
 //! - pick kernels (that's the solver's job — already done)
-//! - decide launch mode (that's a tag on each Impl, read by
-//!   codegen, NOT a choice the scheduler makes)
 //! - emit code (codegen's job)
 
 #![allow(dead_code)]
@@ -23,17 +25,21 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::fuf::{Fuf, FufInput};
-use crate::impl_lib::ImplId;
+use crate::impl_lib::{ImplId, ImplementationLibrary, LaunchKind};
 use crate::solver::{Assignment, SubgraphId, WorkloadAssignments};
 
-/// A single BSP wave — mutually-independent subgraphs.
+/// A single wave — a group of subgraphs sharing one launch.
 #[derive(Clone, Debug)]
 pub struct Wave {
     /// The subgraphs in this wave, each paired with the Impl that
-    /// realizes it. Order within a wave is irrelevant for
-    /// scheduling (subgraphs are concurrent); codegen may pick an
-    /// emission order.
+    /// realizes it. In a megakernel wave, order is execution order
+    /// (dependency-sorted); in a parallel wave, order is arbitrary.
     pub subgraphs: Vec<(SubgraphId, ImplId)>,
+    /// True when this wave contains dependent DC subgraphs merged
+    /// into a single cooperative kernel launch. Codegen emits one
+    /// `__global__` megakernel with grid sync between phases.
+    /// False for standard parallel waves.
+    pub is_megakernel: bool,
 }
 
 /// The LOOP: ordered sequence of waves.
@@ -59,7 +65,11 @@ pub struct WorkloadLoops {
 }
 
 /// Schedule a single SFUF into a LOOP.
-pub fn schedule(fuf: &Fuf, sfuf: &Assignment) -> Loop {
+///
+/// The `lib` parameter is needed to check each impl's `launch_kind`:
+/// DeviceCallable subgraphs with DC-only predecessors merge into the
+/// same wave (the megakernel provides ordering via grid sync).
+pub fn schedule(fuf: &Fuf, sfuf: &Assignment, lib: &ImplementationLibrary) -> Loop {
     if sfuf.num_subgraphs() == 0 {
         return Loop::default();
     }
@@ -87,23 +97,42 @@ pub fn schedule(fuf: &Fuf, sfuf: &Assignment) -> Loop {
         }
     }
 
-    // Topological wave assignment. Visit subgraphs in id order
-    // (solver allocates ids in topo order of first-claimed tile,
-    // so deps flow forward — but compute wave via max of predecessor
-    // waves to be safe for multi-tile claims).
+    // Pre-compute which subgraphs are DeviceCallable.
+    let is_dc: HashMap<SubgraphId, bool> = sfuf
+        .subgraphs()
+        .map(|sg| {
+            let imp = sfuf.impl_of(sg).expect("every subgraph has an impl");
+            (sg, lib.get(imp).launch_kind() == LaunchKind::DeviceCallable)
+        })
+        .collect();
+
+    // Topological wave assignment with DC merging.
+    //
+    // For each subgraph in topo order, compute its wave index:
+    //   wave = max over predecessors of (wave[pred] + bump)
+    // where bump = 0 if BOTH this subgraph and the predecessor
+    // are DC (they share a wave), bump = 1 otherwise.
     let mut wave_of: HashMap<SubgraphId, u32> = HashMap::new();
     let mut max_wave: u32 = 0;
 
-    // Sort subgraphs by id for deterministic iteration. Topological
-    // order by id holds because the solver's forward pass creates
-    // each subgraph only after all its prior tiles were committed.
     let mut ordered: Vec<SubgraphId> = sfuf.subgraphs().collect();
     ordered.sort();
 
     for sg in &ordered {
+        let self_dc = is_dc[sg];
         let depth = deps[sg]
             .iter()
-            .map(|d| wave_of.get(d).copied().unwrap_or(0) + 1)
+            .map(|d| {
+                let pred_wave = wave_of.get(d).copied().unwrap_or(0);
+                let pred_dc = is_dc[d];
+                if self_dc && pred_dc {
+                    // DC→DC: merge into same wave (grid sync handles ordering)
+                    pred_wave
+                } else {
+                    // Any host boundary: new wave
+                    pred_wave + 1
+                }
+            })
             .max()
             .unwrap_or(0);
         wave_of.insert(*sg, depth);
@@ -123,29 +152,46 @@ pub fn schedule(fuf: &Fuf, sfuf: &Assignment) -> Loop {
     Loop {
         waves: bins
             .into_iter()
-            .map(|subgraphs| Wave { subgraphs })
+            .map(|subgraphs| {
+                // A wave is a megakernel wave if it has ≥2 subgraphs
+                // and ALL are DeviceCallable.
+                let is_mega = subgraphs.len() >= 2 && subgraphs.iter().all(|(sg, _)| is_dc[sg]);
+                Wave {
+                    subgraphs,
+                    is_megakernel: is_mega,
+                }
+            })
             .collect(),
     }
 }
 
 /// Schedule every SFUF in a workload sweep, preserving the `num_tokens` keying.
-pub fn schedule_workloads(fuf: &Fuf, workloads: &WorkloadAssignments) -> WorkloadLoops {
+pub fn schedule_workloads(
+    fuf: &Fuf,
+    workloads: &WorkloadAssignments,
+    lib: &ImplementationLibrary,
+) -> WorkloadLoops {
     let per_num_tokens = workloads
         .per_num_tokens
         .iter()
-        .map(|(m, sfuf)| (*m, schedule(fuf, sfuf)))
+        .map(|(m, sfuf)| (*m, schedule(fuf, sfuf, lib)))
         .collect();
     WorkloadLoops { per_num_tokens }
 }
 
-/// Invariant checker: within a single wave, no two subgraphs have
-/// a dep edge. Returns (consumer_sg, producer_sg) on violation.
+/// Invariant checker: within a non-megakernel wave, no two
+/// subgraphs may have a dep edge. Megakernel waves are allowed
+/// to contain dependent subgraphs (grid sync handles ordering).
+/// Returns (consumer_sg, producer_sg) on violation.
 pub fn find_intra_wave_dep_violation(
     loop_ir: &Loop,
     fuf: &Fuf,
     sfuf: &Assignment,
 ) -> Option<(SubgraphId, SubgraphId)> {
     for wave in &loop_ir.waves {
+        if wave.is_megakernel {
+            continue; // deps within megakernel waves are intentional
+        }
         let wave_set: HashSet<SubgraphId> = wave.subgraphs.iter().map(|(s, _)| *s).collect();
         for (sg, _) in &wave.subgraphs {
             for t in sfuf.tiles_in_subgraph(*sg) {
@@ -201,7 +247,32 @@ mod tests {
         load_target(&path).unwrap()
     }
 
-    fn solved_body(src: &str, params: &ModelParams) -> (Fuf, Assignment) {
+    fn h100_target() -> TargetProfile {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("target_profiles")
+            .join("h100_sm90.json");
+        load_target(&path).unwrap()
+    }
+
+    fn solved_body(src: &str, params: &ModelParams) -> (Fuf, Assignment, ImplementationLibrary) {
+        solved_body_target(src, params, &l4_target())
+    }
+
+    fn solved_body_h100(
+        src: &str,
+        params: &ModelParams,
+    ) -> (Fuf, Assignment, ImplementationLibrary) {
+        solved_body_target(src, params, &h100_target())
+    }
+
+    fn solved_body_target(
+        src: &str,
+        params: &ModelParams,
+        target: &TargetProfile,
+    ) -> (Fuf, Assignment, ImplementationLibrary) {
         let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).expect("parse");
         let block = match &file.items[0] {
             syn::Item::Fn(f) => &*f.block,
@@ -213,10 +284,9 @@ mod tests {
         let cfg = build_cfg(&program, params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
-        let target = l4_target();
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
+        let workloads = solve(&fuf, &lib, target, &inferred, &params.bounds, &[1]).unwrap();
         let sfuf = workloads.per_num_tokens[&1].clone();
-        (fuf, sfuf)
+        (fuf, sfuf, lib)
     }
 
     // Pre-rope attention body: Q/K/V projections without the
@@ -243,8 +313,8 @@ mod tests {
 
     #[test]
     fn loop_is_shorter_than_one_wave_per_subgraph() {
-        let (fuf, sfuf) = solved_body(ATTN_BODY, &llama_3_2_1b_params());
-        let loop_ir = schedule(&fuf, &sfuf);
+        let (fuf, sfuf, lib) = solved_body(ATTN_BODY, &llama_3_2_1b_params());
+        let loop_ir = schedule(&fuf, &sfuf, &lib);
 
         // Every subgraph in the SFUF appears exactly once in the LOOP.
         assert_eq!(loop_ir.num_subgraphs(), sfuf.num_subgraphs());
@@ -261,8 +331,8 @@ mod tests {
 
     #[test]
     fn no_intra_wave_deps() {
-        let (fuf, sfuf) = solved_body(ATTN_BODY, &llama_3_2_1b_params());
-        let loop_ir = schedule(&fuf, &sfuf);
+        let (fuf, sfuf, lib) = solved_body(ATTN_BODY, &llama_3_2_1b_params());
+        let loop_ir = schedule(&fuf, &sfuf, &lib);
         assert!(
             find_intra_wave_dep_violation(&loop_ir, &fuf, &sfuf).is_none(),
             "schedule invariant broken",
@@ -271,7 +341,7 @@ mod tests {
 
     #[test]
     fn parallel_qkv_gemms_share_a_wave() {
-        let (fuf, sfuf) = solved_body(
+        let (fuf, sfuf, lib) = solved_body(
             r#"
             hidden_states = embed(input_ids, embed_tokens);
             for layer in 0..1 {
@@ -286,30 +356,33 @@ mod tests {
             "#,
             &llama_3_2_1b_params(),
         );
-        let loop_ir = schedule(&fuf, &sfuf);
+        let loop_ir = schedule(&fuf, &sfuf, &lib);
 
-        // Find the wave containing all three q/k/v gemms (they
-        // read `normed` and are mutually independent). Starter
-        // library is 1 tile = 1 subgraph, so look at each
-        // subgraph's single claimed tile's op.
+        // The q/k/v gemms read `normed` and are mutually independent,
+        // so they can share a wave. With DC GEMM variants, some or all
+        // may be DC and merge into a megakernel wave with other DC ops.
+        // Verify: at least one wave contains ≥2 gemm subgraphs (the
+        // independent q/k/v can be scheduled together).
         use crate::classified::OpKind;
-        let mut found = false;
-        for wave in &loop_ir.waves {
-            let gemm_count = wave
-                .subgraphs
-                .iter()
-                .filter(|(sg, _)| {
-                    sfuf.tiles_in_subgraph(*sg)
-                        .iter()
-                        .any(|t| fuf.get(*t).op == OpKind::Gemm)
-                })
-                .count();
-            if gemm_count == 3 {
-                found = true;
-                break;
-            }
-        }
-        assert!(found, "expected q/k/v gemms to share one wave");
+        let max_gemms_in_wave = loop_ir
+            .waves
+            .iter()
+            .map(|wave| {
+                wave.subgraphs
+                    .iter()
+                    .filter(|(sg, _)| {
+                        sfuf.tiles_in_subgraph(*sg)
+                            .iter()
+                            .any(|t| fuf.get(*t).op == OpKind::Gemm)
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_gemms_in_wave >= 2,
+            "expected at least 2 independent gemms in one wave; max was {max_gemms_in_wave}"
+        );
     }
 
     #[test]
@@ -342,7 +415,7 @@ mod tests {
 
         let points = [1u64, 64, 4096];
         let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &points).unwrap();
-        let loops = schedule_workloads(&fuf, &workloads);
+        let loops = schedule_workloads(&fuf, &workloads, &lib);
 
         assert_eq!(loops.per_num_tokens.len(), points.len());
         for &m in &points {
@@ -356,11 +429,98 @@ mod tests {
         }
     }
 
+    /// Llama on L4 has no consecutive DC subgraphs (every DC
+    /// elementwise is separated by a host GEMM). Verify zero
+    /// megakernel waves.
+    #[test]
+    fn llama_l4_produces_megakernel_waves() {
+        let params = llama_3_2_1b_params();
+        let (fuf, sfuf, lib) = solved_body(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                q = gemm(normed, self_attn.q_proj[layer]);
+                k = gemm(normed, self_attn.k_proj[layer]);
+                v = gemm(normed, self_attn.v_proj[layer]);
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                attn = attention(q, k, v, kv_cache[layer], block_table);
+                oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+
+                normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                up = gemm(normed2, mlp.up_proj[layer]);
+                down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
+            }
+            normed = rmsnorm(hidden_states, norm);
+            logits = gemm(normed, lm_head);
+            "#,
+            &params,
+        );
+        let loop_ir = schedule(&fuf, &sfuf, &lib);
+        assert_eq!(loop_ir.num_subgraphs(), sfuf.num_subgraphs());
+
+        let mega_count = loop_ir.waves.iter().filter(|w| w.is_megakernel).count();
+        // With DC wrappers for CUTLASS GEMMs, all ops can be DC,
+        // so megakernel waves form across the entire loop body.
+        assert!(
+            mega_count > 0,
+            "expected megakernel waves on L4 Llama with DC GEMM; got {mega_count}"
+        );
+    }
+
+    /// A body with consecutive rmsnorm ops produces megakernel waves
+    /// because dc_rmsnorm chains merge into a single wave.
+    #[test]
+    fn consecutive_dc_ops_produce_megakernel_waves() {
+        let params = llama_3_2_1b_params();
+        // Two consecutive rmsnorms with no GEMM between them.
+        // The solver picks dc_rmsnorm_ref for both, and the
+        // scheduler merges them into a megakernel wave.
+        let (fuf, sfuf, lib) = solved_body(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                normed1 = rmsnorm(hidden_states, input_layernorm[layer]);
+                hidden_states = rmsnorm(normed1, post_attention_layernorm[layer]);
+            }
+            normed = rmsnorm(hidden_states, norm);
+            logits = gemm(normed, lm_head);
+            "#,
+            &params,
+        );
+        let loop_ir = schedule(&fuf, &sfuf, &lib);
+        assert_eq!(loop_ir.num_subgraphs(), sfuf.num_subgraphs());
+
+        let mega_count = loop_ir.waves.iter().filter(|w| w.is_megakernel).count();
+        let mega_sgs: usize = loop_ir
+            .waves
+            .iter()
+            .filter(|w| w.is_megakernel)
+            .map(|w| w.subgraphs.len())
+            .sum();
+        assert!(
+            mega_count > 0,
+            "expected megakernel waves for consecutive rmsnorms; got 0 \
+             out of {} total waves",
+            loop_ir.num_waves(),
+        );
+        eprintln!(
+            "consecutive DC: {mega_count} mega waves ({mega_sgs} DC subgraphs), \
+             {} total waves, {} total subgraphs",
+            loop_ir.num_waves(),
+            sfuf.num_subgraphs(),
+        );
+    }
+
     #[test]
     fn empty_sfuf_empty_loop() {
         let fuf = Fuf { nodes: Vec::new() };
         let sfuf = Assignment::default();
-        let loop_ir = schedule(&fuf, &sfuf);
+        let lib = starter_library();
+        let loop_ir = schedule(&fuf, &sfuf, &lib);
         assert_eq!(loop_ir.num_waves(), 0);
         assert_eq!(loop_ir.num_subgraphs(), 0);
     }

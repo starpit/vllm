@@ -138,6 +138,34 @@ pub enum LaunchKind {
     DeviceCallable,
 }
 
+/// One phase inside a megakernel `.cu` file. Each DeviceCallable
+/// impl that participates in a megakernel provides this via
+/// [`Implementation::device_phase`].
+///
+/// The generated `.cu` has three sections per phase:
+/// 1. `flat_params` — the `extern "C"` launch wrapper's signature
+/// 2. `kernel_body` — CUDA lines inside the `__global__` kernel
+/// 3. `params_build` — launch wrapper lines copying flat→internal
+/// 4. `internal_fields` — fields in the internal params struct
+///
+/// Phase index `idx` is assigned by codegen (0, 1, 2, …). Param
+/// names use the `p{idx}_` prefix so they don't collide across phases.
+#[derive(Clone, Debug)]
+pub struct DevicePhase {
+    /// `(c_type, name)` pairs for the `extern "C"` flat param list.
+    pub flat_params: Vec<(String, String)>,
+    /// Lines inside the `__global__` kernel body for this phase.
+    pub kernel_body: Vec<String>,
+    /// Lines in the launch wrapper that copy flat args into the
+    /// internal params struct.
+    pub params_build: Vec<String>,
+    /// Field declarations inside the internal params struct.
+    pub internal_fields: Vec<String>,
+    /// Lines emitted before the params struct (includes, typedefs).
+    /// Used by CUTLASS GEMM to emit `using DeviceGemm_p{idx} = ...`.
+    pub preamble: Vec<String>,
+}
+
 /// Synchronization mechanism that conveys data between two
 /// implementations on a producer→consumer dependency edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -540,6 +568,21 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// Default: empty (no upstream is consumed).
     fn consumes_input_tiles(&self, _claimed_tiles: &[TileId], _fuf: &Fuf) -> Vec<(TileId, u8)> {
         Vec::new()
+    }
+
+    /// Device-phase descriptor for megakernel `.cu` generation.
+    ///
+    /// Returns `Some(DevicePhase)` for DeviceCallable impls that can
+    /// participate in a megakernel. `idx` is the 0-based phase index
+    /// within the megakernel; param names use the `p{idx}_` prefix.
+    ///
+    /// Returns `None` for HostCallable impls (the default).
+    ///
+    /// Additionally returns the Rust-side `TokenStream` expressions
+    /// that populate each flat param at the call site, parallel to
+    /// `DevicePhase::flat_params`.
+    fn device_phase(&self, _idx: usize, _ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>)> {
+        None
     }
 }
 
@@ -1122,22 +1165,41 @@ pub fn starter_library() -> ImplementationLibrary {
         ScalarOffsetRmsNormImpl,
     ))));
     lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        ScalarMulImpl,
+    ))));
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        TanhSoftCapImpl,
+    ))));
+    // DC fused ops — host impls use cuBLAS, but the DC version's
+    // device_phase() emits CUTLASS device-side GEMMs for megakernel
+    // embedding. The DeviceCallableWrapper just changes launch_kind
+    // and adjusts cost; the .cu codegen reads device_phase().
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
         FusedGateUpSiluMulImpl,
     ))));
     lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
         FusedGateUpGeluMulImpl,
     ))));
     lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
-        ScalarMulImpl,
-    ))));
-    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
-        TanhSoftCapImpl,
-    ))));
-    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
         FusedQkvRopeCacheImpl,
     ))));
     lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
         FusedQkvRopePrefillImpl,
+    ))));
+    // DC CUTLASS GEMM — every tile variant, embeddable in megakernels.
+    // CUTLASS GemmUniversal::invoke() is a __device__ function.
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+            CutlassGemmImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            },
+        ))));
+    }
+    // DC CUTLASS GEMV for BS=1 decode.
+    lib.push(Box::new(DeviceCallableWrapper::new(Box::new(
+        CutlassGemvImpl,
     ))));
 
     lib
@@ -3866,7 +3928,7 @@ impl Implementation for DeviceCallableWrapper {
         // DC impls save one kernel launch by running inside an
         // enclosing megakernel. Subtract the launch overhead so
         // the greedy DP prefers DC over standalone for cheap ops.
-        (self.inner.cost_us(m, ctx) - ctx.profile.launch_overhead_us).max(0.01)
+        (self.inner.cost_us(m, ctx) - ctx.profile.launch_overhead_us).max(0.0)
     }
 
     fn resources(&self, m: &MatchInfo) -> Resources {
@@ -3932,6 +3994,646 @@ impl Implementation for DeviceCallableWrapper {
 
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
         self.inner.emit_call(ctx)
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        self.inner.consumes_input_tiles(claimed_tiles, fuf)
+    }
+
+    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>)> {
+        dc_device_phase(self.inner.name(), idx, ctx)
+    }
+}
+
+/// Generate the CUDA-side [`DevicePhase`] and Rust-side param
+/// expressions for a DC-wrapped impl, keyed by the inner impl's
+/// name. The set of wrappable ops is bounded by what
+/// `megakernel_ops.cuh` provides `__device__` functions for.
+fn dc_device_phase(
+    inner_name: &str,
+    idx: usize,
+    ctx: &EmitCtx,
+) -> Option<(DevicePhase, Vec<TokenStream>)> {
+    let p = format!("p{idx}");
+    match inner_name {
+        "rmsnorm_ref" => {
+            let tile = ctx.primary();
+            let x = ctx.input_expr(tile, 0);
+            let w = ctx.input_expr(tile, 1);
+            let out = ctx.output_ident(tile, 0);
+            let hidden_size = ctx.bound("hidden_size") as i32;
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_out")),
+                        ("const void*".into(), format!("{p}_input")),
+                        ("const void*".into(), format!("{p}_weight")),
+                        ("float".into(), format!("{p}_eps")),
+                        ("int".into(), format!("{p}_hidden_size")),
+                        ("int".into(), format!("{p}_num_tokens")),
+                    ],
+                    kernel_body: vec![format!(
+                        "dc_rms_norm<__nv_bfloat16>({p}_out, {p}_input, {p}_weight, {p}_eps, {p}_hidden_size, {p}_num_tokens, smem);"
+                    )],
+                    params_build: vec![
+                        format!("params.{p}_out = (__nv_bfloat16*){p}_out;"),
+                        format!("params.{p}_input = (const __nv_bfloat16*){p}_input;"),
+                        format!("params.{p}_weight = (const __nv_bfloat16*){p}_weight;"),
+                        format!("params.{p}_eps = {p}_eps;"),
+                        format!("params.{p}_hidden_size = {p}_hidden_size;"),
+                        format!("params.{p}_num_tokens = {p}_num_tokens;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_out"),
+                        format!("const __nv_bfloat16* {p}_input"),
+                        format!("const __nv_bfloat16* {p}_weight"),
+                        format!("float {p}_eps"),
+                        format!("int {p}_hidden_size"),
+                        format!("int {p}_num_tokens"),
+                    ],
+                    preamble: vec![],
+                },
+                vec![
+                    // Rust expressions parallel to flat_params:
+                    // out ptr (allocated), input ptr, weight ptr, eps, hidden_size, num_tokens
+                    {
+                        let hs = hidden_size;
+                        quote! {
+                            let #out = device.caching.alloc_tensor(
+                                &[ctx.num_tokens as usize, #hs as usize],
+                                ::ferrite_cuda_core::DType::BF16,
+                            );
+                            #out.raw_ptr() as *mut ::core::ffi::c_void
+                        }
+                    },
+                    quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
+                    quote! { (#w).weight.raw_ptr() as *const ::core::ffi::c_void },
+                    quote! { (#w).eps },
+                    quote! { #hidden_size },
+                    quote! { ctx.num_tokens as i32 },
+                ],
+            ))
+        }
+        "fused_add_rms_norm" => {
+            // dc_fused_add_rms_norm<T>(input, residual, weight, eps, hidden_size, num_rows, smem)
+            // In-place: residual += input; input = norm(residual) * w
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_input")),
+                        ("void*".into(), format!("{p}_residual")),
+                        ("const void*".into(), format!("{p}_weight")),
+                        ("float".into(), format!("{p}_eps")),
+                        ("int".into(), format!("{p}_hidden_size")),
+                        ("int".into(), format!("{p}_num_tokens")),
+                    ],
+                    kernel_body: vec![format!(
+                        "dc_fused_add_rms_norm<__nv_bfloat16>({p}_input, {p}_residual, {p}_weight, {p}_eps, {p}_hidden_size, {p}_num_tokens, smem);"
+                    )],
+                    params_build: vec![
+                        format!("params.{p}_input = (__nv_bfloat16*){p}_input;"),
+                        format!("params.{p}_residual = (__nv_bfloat16*){p}_residual;"),
+                        format!("params.{p}_weight = (const __nv_bfloat16*){p}_weight;"),
+                        format!("params.{p}_eps = {p}_eps;"),
+                        format!("params.{p}_hidden_size = {p}_hidden_size;"),
+                        format!("params.{p}_num_tokens = {p}_num_tokens;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_input"),
+                        format!("__nv_bfloat16* {p}_residual"),
+                        format!("const __nv_bfloat16* {p}_weight"),
+                        format!("float {p}_eps"),
+                        format!("int {p}_hidden_size"),
+                        format!("int {p}_num_tokens"),
+                    ],
+                    preamble: vec![],
+                },
+                vec![
+                    // input (delta) — mutated in place to hold normed output
+                    quote! { todo!("fused_add_rms_norm: delta ptr") },
+                    // residual — mutated in place (residual += delta)
+                    quote! { todo!("fused_add_rms_norm: residual ptr") },
+                    // weight
+                    quote! { todo!("fused_add_rms_norm: weight ptr") },
+                    // eps
+                    quote! { todo!("fused_add_rms_norm: eps") },
+                    // hidden_size
+                    quote! { todo!("fused_add_rms_norm: hidden_size") },
+                    // num_tokens
+                    quote! { todo!("fused_add_rms_norm: num_tokens") },
+                ],
+            ))
+        }
+        "fused_add_rms_norm_with_offset" => {
+            // dc_fused_add_rms_norm_with_offset<T>(input, residual, weight, eps, weight_offset, hidden_size, num_rows, smem)
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_input")),
+                        ("void*".into(), format!("{p}_residual")),
+                        ("const void*".into(), format!("{p}_weight")),
+                        ("float".into(), format!("{p}_eps")),
+                        ("float".into(), format!("{p}_weight_offset")),
+                        ("int".into(), format!("{p}_hidden_size")),
+                        ("int".into(), format!("{p}_num_tokens")),
+                    ],
+                    kernel_body: vec![format!(
+                        "dc_fused_add_rms_norm_with_offset<__nv_bfloat16>({p}_input, {p}_residual, {p}_weight, {p}_eps, {p}_weight_offset, {p}_hidden_size, {p}_num_tokens, smem);"
+                    )],
+                    params_build: vec![
+                        format!("params.{p}_input = (__nv_bfloat16*){p}_input;"),
+                        format!("params.{p}_residual = (__nv_bfloat16*){p}_residual;"),
+                        format!("params.{p}_weight = (const __nv_bfloat16*){p}_weight;"),
+                        format!("params.{p}_eps = {p}_eps;"),
+                        format!("params.{p}_weight_offset = {p}_weight_offset;"),
+                        format!("params.{p}_hidden_size = {p}_hidden_size;"),
+                        format!("params.{p}_num_tokens = {p}_num_tokens;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_input"),
+                        format!("__nv_bfloat16* {p}_residual"),
+                        format!("const __nv_bfloat16* {p}_weight"),
+                        format!("float {p}_eps"),
+                        format!("float {p}_weight_offset"),
+                        format!("int {p}_hidden_size"),
+                        format!("int {p}_num_tokens"),
+                    ],
+                    preamble: vec![],
+                },
+                vec![
+                    quote! { todo!("fused_add_rms_norm_with_offset: delta ptr") },
+                    quote! { todo!("fused_add_rms_norm_with_offset: residual ptr") },
+                    quote! { todo!("fused_add_rms_norm_with_offset: weight ptr") },
+                    quote! { todo!("fused_add_rms_norm_with_offset: eps") },
+                    quote! { todo!("fused_add_rms_norm_with_offset: weight_offset") },
+                    quote! { todo!("fused_add_rms_norm_with_offset: hidden_size") },
+                    quote! { todo!("fused_add_rms_norm_with_offset: num_tokens") },
+                ],
+            ))
+        }
+        "scalar_offset_rms_norm" => {
+            // dc_rms_norm_with_offset<T>(out, input, weight, eps, weight_offset, hidden_size, num_rows, smem)
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_out")),
+                        ("const void*".into(), format!("{p}_input")),
+                        ("const void*".into(), format!("{p}_weight")),
+                        ("float".into(), format!("{p}_eps")),
+                        ("float".into(), format!("{p}_weight_offset")),
+                        ("int".into(), format!("{p}_hidden_size")),
+                        ("int".into(), format!("{p}_num_tokens")),
+                    ],
+                    kernel_body: vec![format!(
+                        "dc_rms_norm_with_offset<__nv_bfloat16>({p}_out, {p}_input, {p}_weight, {p}_eps, {p}_weight_offset, {p}_hidden_size, {p}_num_tokens, smem);"
+                    )],
+                    params_build: vec![
+                        format!("params.{p}_out = (__nv_bfloat16*){p}_out;"),
+                        format!("params.{p}_input = (const __nv_bfloat16*){p}_input;"),
+                        format!("params.{p}_weight = (const __nv_bfloat16*){p}_weight;"),
+                        format!("params.{p}_eps = {p}_eps;"),
+                        format!("params.{p}_weight_offset = {p}_weight_offset;"),
+                        format!("params.{p}_hidden_size = {p}_hidden_size;"),
+                        format!("params.{p}_num_tokens = {p}_num_tokens;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_out"),
+                        format!("const __nv_bfloat16* {p}_input"),
+                        format!("const __nv_bfloat16* {p}_weight"),
+                        format!("float {p}_eps"),
+                        format!("float {p}_weight_offset"),
+                        format!("int {p}_hidden_size"),
+                        format!("int {p}_num_tokens"),
+                    ],
+                    preamble: vec![],
+                },
+                vec![
+                    quote! { todo!("scalar_offset_rms_norm: out ptr") },
+                    quote! { todo!("scalar_offset_rms_norm: input ptr") },
+                    quote! { todo!("scalar_offset_rms_norm: weight ptr") },
+                    quote! { todo!("scalar_offset_rms_norm: eps") },
+                    quote! { todo!("scalar_offset_rms_norm: weight_offset") },
+                    quote! { todo!("scalar_offset_rms_norm: hidden_size") },
+                    quote! { todo!("scalar_offset_rms_norm: num_tokens") },
+                ],
+            ))
+        }
+        "scalar_mul_inplace" => {
+            // dc_scalar_mul_inplace<T>(x, scalar, n, num_rows)
+            // In-place: x *= scalar
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_x")),
+                        ("float".into(), format!("{p}_scalar")),
+                        ("int".into(), format!("{p}_n")),
+                        ("int".into(), format!("{p}_num_rows")),
+                    ],
+                    kernel_body: vec![format!(
+                        "dc_scalar_mul_inplace<__nv_bfloat16>({p}_x, {p}_scalar, {p}_n, {p}_num_rows);"
+                    )],
+                    params_build: vec![
+                        format!("params.{p}_x = (__nv_bfloat16*){p}_x;"),
+                        format!("params.{p}_scalar = {p}_scalar;"),
+                        format!("params.{p}_n = {p}_n;"),
+                        format!("params.{p}_num_rows = {p}_num_rows;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_x"),
+                        format!("float {p}_scalar"),
+                        format!("int {p}_n"),
+                        format!("int {p}_num_rows"),
+                    ],
+                    preamble: vec![],
+                },
+                vec![
+                    quote! { todo!("scalar_mul_inplace: x ptr") },
+                    quote! { todo!("scalar_mul_inplace: scalar") },
+                    quote! { todo!("scalar_mul_inplace: n") },
+                    quote! { todo!("scalar_mul_inplace: num_rows") },
+                ],
+            ))
+        }
+        "tanh_softcap_inplace" => {
+            // dc_tanh_softcap_inplace<T>(x, inv_cap, cap, n)
+            // In-place: x[i] = cap * tanh(x[i] / cap)
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_x")),
+                        ("float".into(), format!("{p}_inv_cap")),
+                        ("float".into(), format!("{p}_cap")),
+                        ("int".into(), format!("{p}_n")),
+                    ],
+                    kernel_body: vec![format!(
+                        "dc_tanh_softcap_inplace<__nv_bfloat16>({p}_x, {p}_inv_cap, {p}_cap, {p}_n);"
+                    )],
+                    params_build: vec![
+                        format!("params.{p}_x = (__nv_bfloat16*){p}_x;"),
+                        format!("params.{p}_inv_cap = {p}_inv_cap;"),
+                        format!("params.{p}_cap = {p}_cap;"),
+                        format!("params.{p}_n = {p}_n;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_x"),
+                        format!("float {p}_inv_cap"),
+                        format!("float {p}_cap"),
+                        format!("int {p}_n"),
+                    ],
+                    preamble: vec![],
+                },
+                vec![
+                    quote! { todo!("tanh_softcap_inplace: x ptr") },
+                    quote! { todo!("tanh_softcap_inplace: inv_cap") },
+                    quote! { todo!("tanh_softcap_inplace: cap") },
+                    quote! { todo!("tanh_softcap_inplace: n") },
+                ],
+            ))
+        }
+        name if name.starts_with("cutlass_") && !name.contains("gemv") => {
+            // Parse cutlass_{M}x{N}_s{S}
+            let (tile_m, tile_n, stages) = parse_cutlass_tile_name(name)?;
+            let (warp_m, warp_n) = warp_shape_for_tb(tile_m, tile_n);
+            let tb_k = 32u32;
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_C")),
+                        ("const void*".into(), format!("{p}_A")),
+                        ("const void*".into(), format!("{p}_B")),
+                        ("int".into(), format!("{p}_M")),
+                        ("int".into(), format!("{p}_N")),
+                        ("int".into(), format!("{p}_K")),
+                        ("float".into(), format!("{p}_alpha")),
+                        ("float".into(), format!("{p}_beta")),
+                    ],
+                    kernel_body: vec![
+                        format!("// CUTLASS GEMM kernel-level invocation"),
+                        format!("GemmKernel_p{idx}()({p}_gemm_params,"),
+                        format!(
+                            "    *reinterpret_cast<typename GemmKernel_p{idx}::SharedStorage*>(smem));"
+                        ),
+                    ],
+                    params_build: vec![
+                        format!("// Build CUTLASS kernel params from flat args via device::Gemm"),
+                        format!("{{"),
+                        format!("    typename DeviceGemm_p{idx}::Arguments args("),
+                        format!("        {{{p}_M, {p}_N, {p}_K}},"),
+                        format!("        {{(cutlass::bfloat16_t const*){p}_A, {p}_K}},"),
+                        format!("        {{(cutlass::bfloat16_t const*){p}_B, {p}_K}},"),
+                        format!("        {{(cutlass::bfloat16_t*){p}_C, {p}_N}},"),
+                        format!("        {{(cutlass::bfloat16_t*){p}_C, {p}_N}},"),
+                        format!("        {{{p}_alpha, {p}_beta}}"),
+                        format!("    );"),
+                        format!("    DeviceGemm_p{idx} gemm_op;"),
+                        format!("    gemm_op.initialize(args, nullptr);"),
+                        format!("    static_assert("),
+                        format!(
+                            "        sizeof(DeviceGemm_p{idx}) >= sizeof(typename GemmKernel_p{idx}::Params),"
+                        ),
+                        format!("        \"DeviceGemm layout assumption violated\");"),
+                        format!("    params.{p}_gemm_params = *reinterpret_cast<"),
+                        format!("        typename GemmKernel_p{idx}::Params const*>(&gemm_op);"),
+                        format!("}}"),
+                    ],
+                    internal_fields: vec![format!(
+                        "typename GemmKernel_p{idx}::Params {p}_gemm_params"
+                    )],
+                    preamble: vec![
+                        format!("#include <cutlass/cutlass.h>"),
+                        format!("#include <cutlass/gemm/device/gemm.h>"),
+                        format!("#include <cutlass/epilogue/thread/linear_combination.h>"),
+                        format!("// Phase {idx}: CUTLASS GEMM {tile_m}x{tile_n} s{stages}"),
+                        format!("using DeviceGemm_p{idx} = cutlass::gemm::device::Gemm<"),
+                        format!("    cutlass::bfloat16_t, cutlass::layout::RowMajor,"),
+                        format!("    cutlass::bfloat16_t, cutlass::layout::ColumnMajor,"),
+                        format!("    cutlass::bfloat16_t, cutlass::layout::RowMajor,"),
+                        format!("    float,"),
+                        format!("    cutlass::arch::OpClassTensorOp,"),
+                        format!("    cutlass::arch::Sm80,"),
+                        format!("    cutlass::gemm::GemmShape<{tile_m}, {tile_n}, {tb_k}>,"),
+                        format!("    cutlass::gemm::GemmShape<{warp_m}, {warp_n}, {tb_k}>,"),
+                        format!("    cutlass::gemm::GemmShape<16, 8, 16>,"),
+                        format!("    cutlass::epilogue::thread::LinearCombination<"),
+                        format!("        cutlass::bfloat16_t, 8, float, float>,"),
+                        format!(
+                            "    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,"
+                        ),
+                        format!("    {stages}"),
+                        format!(">;"),
+                        format!(
+                            "using GemmKernel_p{idx} = typename DeviceGemm_p{idx}::GemmKernel;"
+                        ),
+                    ],
+                },
+                vec![
+                    // C (output) ptr
+                    quote! { todo!("cutlass_gemm: C ptr") },
+                    // A (input) ptr
+                    quote! { todo!("cutlass_gemm: A ptr") },
+                    // B (weight) ptr
+                    quote! { todo!("cutlass_gemm: B ptr") },
+                    // M
+                    quote! { todo!("cutlass_gemm: M") },
+                    // N
+                    quote! { todo!("cutlass_gemm: N") },
+                    // K
+                    quote! { todo!("cutlass_gemm: K") },
+                    // alpha
+                    quote! { 1.0f32 },
+                    // beta
+                    quote! { 0.0f32 },
+                ],
+            ))
+        }
+        "cutlass_gemv" => Some((
+            DevicePhase {
+                flat_params: vec![
+                    ("void*".into(), format!("{p}_out")),
+                    ("const void*".into(), format!("{p}_x")),
+                    ("const void*".into(), format!("{p}_W")),
+                    ("int".into(), format!("{p}_N")),
+                    ("int".into(), format!("{p}_K")),
+                    ("float".into(), format!("{p}_alpha")),
+                    ("float".into(), format!("{p}_beta")),
+                ],
+                kernel_body: vec![format!(
+                    "dc_gemv({p}_out, {p}_x, {p}_W, {p}_N, {p}_K, {p}_alpha, {p}_beta, {p}_N);"
+                )],
+                params_build: vec![
+                    format!("params.{p}_out = (__nv_bfloat16*){p}_out;"),
+                    format!("params.{p}_x = (const __nv_bfloat16*){p}_x;"),
+                    format!("params.{p}_W = (const __nv_bfloat16*){p}_W;"),
+                    format!("params.{p}_N = {p}_N;"),
+                    format!("params.{p}_K = {p}_K;"),
+                    format!("params.{p}_alpha = {p}_alpha;"),
+                    format!("params.{p}_beta = {p}_beta;"),
+                ],
+                internal_fields: vec![
+                    format!("__nv_bfloat16* {p}_out"),
+                    format!("const __nv_bfloat16* {p}_x"),
+                    format!("const __nv_bfloat16* {p}_W"),
+                    format!("int {p}_N"),
+                    format!("int {p}_K"),
+                    format!("float {p}_alpha"),
+                    format!("float {p}_beta"),
+                ],
+                preamble: vec![],
+            },
+            vec![
+                quote! { todo!("cutlass_gemv: out ptr") },
+                quote! { todo!("cutlass_gemv: x ptr") },
+                quote! { todo!("cutlass_gemv: W ptr") },
+                quote! { todo!("cutlass_gemv: N") },
+                quote! { todo!("cutlass_gemv: K") },
+                quote! { 1.0f32 },
+                quote! { 0.0f32 },
+            ],
+        )),
+        "fused_qkv_rope_cache" => Some((
+            DevicePhase {
+                flat_params: vec![
+                    ("void*".into(), format!("{p}_q_out")),
+                    ("void*".into(), format!("{p}_key_cache")),
+                    ("void*".into(), format!("{p}_value_cache")),
+                    ("const void*".into(), format!("{p}_qkv")),
+                    ("const void*".into(), format!("{p}_positions")),
+                    ("const void*".into(), format!("{p}_cos_sin_cache")),
+                    ("const void*".into(), format!("{p}_slot_mapping")),
+                    ("int".into(), format!("{p}_q_size")),
+                    ("int".into(), format!("{p}_kv_size")),
+                    ("int".into(), format!("{p}_head_dim")),
+                    ("int".into(), format!("{p}_num_tokens")),
+                ],
+                kernel_body: vec![
+                    format!("dc_fused_qkv_rope_cache({p}_q_out, {p}_key_cache, {p}_value_cache,"),
+                    format!("    {p}_qkv, {p}_positions, {p}_cos_sin_cache, {p}_slot_mapping,"),
+                    format!("    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"),
+                ],
+                params_build: vec![
+                    format!("params.{p}_q_out = (__nv_bfloat16*){p}_q_out;"),
+                    format!("params.{p}_key_cache = (__nv_bfloat16*){p}_key_cache;"),
+                    format!("params.{p}_value_cache = (__nv_bfloat16*){p}_value_cache;"),
+                    format!("params.{p}_qkv = (const __nv_bfloat16*){p}_qkv;"),
+                    format!("params.{p}_positions = (const uint32_t*){p}_positions;"),
+                    format!("params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"),
+                    format!("params.{p}_slot_mapping = (const int64_t*){p}_slot_mapping;"),
+                    format!("params.{p}_q_size = {p}_q_size;"),
+                    format!("params.{p}_kv_size = {p}_kv_size;"),
+                    format!("params.{p}_head_dim = {p}_head_dim;"),
+                    format!("params.{p}_num_tokens = {p}_num_tokens;"),
+                ],
+                internal_fields: vec![
+                    format!("__nv_bfloat16* {p}_q_out"),
+                    format!("__nv_bfloat16* {p}_key_cache"),
+                    format!("__nv_bfloat16* {p}_value_cache"),
+                    format!("const __nv_bfloat16* {p}_qkv"),
+                    format!("const uint32_t* {p}_positions"),
+                    format!("const __nv_bfloat16* {p}_cos_sin_cache"),
+                    format!("const int64_t* {p}_slot_mapping"),
+                    format!("int {p}_q_size"),
+                    format!("int {p}_kv_size"),
+                    format!("int {p}_head_dim"),
+                    format!("int {p}_num_tokens"),
+                ],
+                preamble: vec![],
+            },
+            vec![
+                quote! { todo!("fused_qkv_rope_cache: q_out ptr") },
+                quote! { todo!("fused_qkv_rope_cache: key_cache ptr") },
+                quote! { todo!("fused_qkv_rope_cache: value_cache ptr") },
+                quote! { todo!("fused_qkv_rope_cache: qkv ptr") },
+                quote! { todo!("fused_qkv_rope_cache: positions ptr") },
+                quote! { todo!("fused_qkv_rope_cache: cos_sin_cache ptr") },
+                quote! { todo!("fused_qkv_rope_cache: slot_mapping ptr") },
+                quote! { todo!("fused_qkv_rope_cache: q_size") },
+                quote! { todo!("fused_qkv_rope_cache: kv_size") },
+                quote! { todo!("fused_qkv_rope_cache: head_dim") },
+                quote! { todo!("fused_qkv_rope_cache: num_tokens") },
+            ],
+        )),
+        "fused_qkv_rope_prefill" => Some((
+            DevicePhase {
+                flat_params: vec![
+                    ("void*".into(), format!("{p}_q_out")),
+                    ("void*".into(), format!("{p}_k_out")),
+                    ("void*".into(), format!("{p}_v_out")),
+                    ("const void*".into(), format!("{p}_qkv")),
+                    ("const void*".into(), format!("{p}_positions")),
+                    ("const void*".into(), format!("{p}_cos_sin_cache")),
+                    ("int".into(), format!("{p}_q_size")),
+                    ("int".into(), format!("{p}_kv_size")),
+                    ("int".into(), format!("{p}_head_dim")),
+                    ("int".into(), format!("{p}_num_tokens")),
+                ],
+                kernel_body: vec![
+                    format!("dc_fused_qkv_rope_prefill({p}_q_out, {p}_k_out, {p}_v_out,"),
+                    format!("    {p}_qkv, {p}_positions, {p}_cos_sin_cache,"),
+                    format!("    {p}_q_size, {p}_kv_size, {p}_head_dim, {p}_num_tokens, smem);"),
+                ],
+                params_build: vec![
+                    format!("params.{p}_q_out = (__nv_bfloat16*){p}_q_out;"),
+                    format!("params.{p}_k_out = (__nv_bfloat16*){p}_k_out;"),
+                    format!("params.{p}_v_out = (__nv_bfloat16*){p}_v_out;"),
+                    format!("params.{p}_qkv = (const __nv_bfloat16*){p}_qkv;"),
+                    format!("params.{p}_positions = (const uint32_t*){p}_positions;"),
+                    format!("params.{p}_cos_sin_cache = (const __nv_bfloat16*){p}_cos_sin_cache;"),
+                    format!("params.{p}_q_size = {p}_q_size;"),
+                    format!("params.{p}_kv_size = {p}_kv_size;"),
+                    format!("params.{p}_head_dim = {p}_head_dim;"),
+                    format!("params.{p}_num_tokens = {p}_num_tokens;"),
+                ],
+                internal_fields: vec![
+                    format!("__nv_bfloat16* {p}_q_out"),
+                    format!("__nv_bfloat16* {p}_k_out"),
+                    format!("__nv_bfloat16* {p}_v_out"),
+                    format!("const __nv_bfloat16* {p}_qkv"),
+                    format!("const uint32_t* {p}_positions"),
+                    format!("const __nv_bfloat16* {p}_cos_sin_cache"),
+                    format!("int {p}_q_size"),
+                    format!("int {p}_kv_size"),
+                    format!("int {p}_head_dim"),
+                    format!("int {p}_num_tokens"),
+                ],
+                preamble: vec![],
+            },
+            vec![
+                quote! { todo!("fused_qkv_rope_prefill: q_out ptr") },
+                quote! { todo!("fused_qkv_rope_prefill: k_out ptr") },
+                quote! { todo!("fused_qkv_rope_prefill: v_out ptr") },
+                quote! { todo!("fused_qkv_rope_prefill: qkv ptr") },
+                quote! { todo!("fused_qkv_rope_prefill: positions ptr") },
+                quote! { todo!("fused_qkv_rope_prefill: cos_sin_cache ptr") },
+                quote! { todo!("fused_qkv_rope_prefill: q_size") },
+                quote! { todo!("fused_qkv_rope_prefill: kv_size") },
+                quote! { todo!("fused_qkv_rope_prefill: head_dim") },
+                quote! { todo!("fused_qkv_rope_prefill: num_tokens") },
+            ],
+        )),
+        "fused_gate_up_silu_mul" | "fused_gate_up_gelu_mul" => {
+            // These fused ops contain 2 GEMMs (gate + up) + activation + mul.
+            // In the megakernel, the GEMM portions use CUTLASS device calls
+            // and the activation/mul are elementwise device functions.
+            // For now, the device phase treats the entire fused op as a single
+            // compound phase with its own device function in megakernel_ops.cuh.
+            let fn_name = if inner_name == "fused_gate_up_silu_mul" {
+                "dc_fused_gate_up_silu_mul"
+            } else {
+                "dc_fused_gate_up_gelu_mul"
+            };
+            Some((
+                DevicePhase {
+                    flat_params: vec![
+                        ("void*".into(), format!("{p}_out")),
+                        ("const void*".into(), format!("{p}_input")),
+                        ("const void*".into(), format!("{p}_gate_weight")),
+                        ("const void*".into(), format!("{p}_up_weight")),
+                        ("int".into(), format!("{p}_M")),
+                        ("int".into(), format!("{p}_N")),
+                        ("int".into(), format!("{p}_K")),
+                    ],
+                    kernel_body: vec![
+                        format!("{fn_name}({p}_out, {p}_input, {p}_gate_weight, {p}_up_weight,"),
+                        format!("    {p}_M, {p}_N, {p}_K, smem);"),
+                    ],
+                    params_build: vec![
+                        format!("params.{p}_out = (__nv_bfloat16*){p}_out;"),
+                        format!("params.{p}_input = (const __nv_bfloat16*){p}_input;"),
+                        format!("params.{p}_gate_weight = (const __nv_bfloat16*){p}_gate_weight;"),
+                        format!("params.{p}_up_weight = (const __nv_bfloat16*){p}_up_weight;"),
+                        format!("params.{p}_M = {p}_M;"),
+                        format!("params.{p}_N = {p}_N;"),
+                        format!("params.{p}_K = {p}_K;"),
+                    ],
+                    internal_fields: vec![
+                        format!("__nv_bfloat16* {p}_out"),
+                        format!("const __nv_bfloat16* {p}_input"),
+                        format!("const __nv_bfloat16* {p}_gate_weight"),
+                        format!("const __nv_bfloat16* {p}_up_weight"),
+                        format!("int {p}_M"),
+                        format!("int {p}_N"),
+                        format!("int {p}_K"),
+                    ],
+                    preamble: vec![],
+                },
+                vec![
+                    quote! { todo!("fused_gate_up: out ptr") },
+                    quote! { todo!("fused_gate_up: input ptr") },
+                    quote! { todo!("fused_gate_up: gate_weight ptr") },
+                    quote! { todo!("fused_gate_up: up_weight ptr") },
+                    quote! { todo!("fused_gate_up: M") },
+                    quote! { todo!("fused_gate_up: N") },
+                    quote! { todo!("fused_gate_up: K") },
+                ],
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a CUTLASS tile name like "cutlass_64x128_s3" into (tile_m, tile_n, stages).
+fn parse_cutlass_tile_name(name: &str) -> Option<(u32, u32, u32)> {
+    let rest = name.strip_prefix("cutlass_")?;
+    let (dims, stages_part) = rest.rsplit_once("_s")?;
+    let (m_str, n_str) = dims.split_once('x')?;
+    Some((
+        m_str.parse().ok()?,
+        n_str.parse().ok()?,
+        stages_part.parse().ok()?,
+    ))
+}
+
+/// Map threadblock shape to warp shape (matching cutlass_standalone_gemm.cu).
+fn warp_shape_for_tb(tile_m: u32, tile_n: u32) -> (u32, u32) {
+    match (tile_m, tile_n) {
+        (64, 64) => (32, 32),
+        (64, 128) => (32, 64),
+        (128, 64) => (64, 32),
+        (128, 128) => (64, 32),
+        (128, 256) => (64, 64),
+        (256, 64) => (64, 32),
+        (256, 128) => (64, 32),
+        _ => (tile_m / 2, tile_n / 2),
     }
 }
 

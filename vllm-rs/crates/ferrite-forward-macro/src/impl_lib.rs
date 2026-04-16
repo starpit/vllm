@@ -1142,9 +1142,13 @@ pub fn starter_library() -> ImplementationLibrary {
     }
     lib.push(Box::new(CutlassGemvImpl));
 
-    // ── TK attention (sm90+ DeviceCallable) ──
-    // Native wgmma-based attention for Hopper megakernels.
-    // target_compatible gates on compute_capability >= 90.
+    // ── TK (ThunderKittens) natively DeviceCallable ops (sm90+) ──
+    // Each TK impl runs as a phase inside the megakernel cooperative
+    // kernel using kittens warp::mma / register tile types. Cost is
+    // cuBLAS-calibrated minus launch_overhead → solver always prefers
+    // TK DC over standalone cuBLAS, enabling 100% megakernel.
+    lib.push(Box::new(TkGemmImpl));
+    lib.push(Box::new(TkGemvImpl));
     lib.push(Box::new(TkAttentionDecodeImpl));
     lib.push(Box::new(TkAttentionPrefillImpl));
 
@@ -4108,20 +4112,62 @@ fn dc_device_phase(
                     ],
                     preamble: vec![],
                 },
-                vec![
-                    // input (delta) — mutated in place to hold normed output
-                    quote! { todo!("fused_add_rms_norm: delta ptr") },
-                    // residual — mutated in place (residual += delta)
-                    quote! { todo!("fused_add_rms_norm: residual ptr") },
-                    // weight
-                    quote! { todo!("fused_add_rms_norm: weight ptr") },
-                    // eps
-                    quote! { todo!("fused_add_rms_norm: eps") },
-                    // hidden_size
-                    quote! { todo!("fused_add_rms_norm: hidden_size") },
-                    // num_tokens
-                    quote! { todo!("fused_add_rms_norm: num_tokens") },
-                ],
+                {
+                    // FusedAddRmsNorm claims Add + RmsNorm. Find each tile.
+                    let add_id = *ctx
+                        .claimed_tiles
+                        .iter()
+                        .find(|t| ctx.fuf.get(**t).op == OpKind::Add)
+                        .expect("fused_add_rms_norm: claim contains Add");
+                    let rmsnorm_id = *ctx
+                        .claimed_tiles
+                        .iter()
+                        .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+                        .expect("fused_add_rms_norm: claim contains RmsNorm");
+                    // Delta and residual are the Add's tile inputs.
+                    let delta = ctx
+                        .input_tile_ident(add_id, 0)
+                        .expect("Add input 0 is a tile");
+                    let residual = ctx
+                        .input_tile_ident(add_id, 1)
+                        .expect("Add input 1 is a tile");
+                    // Weight from the RmsNorm tile.
+                    let rmsnorm_node = ctx.fuf.get(rmsnorm_id);
+                    let (wid, widx) = rmsnorm_node
+                        .inputs
+                        .iter()
+                        .find_map(|i| match i {
+                            FufInput::Weight { id, index } => Some((*id, *index)),
+                            _ => None,
+                        })
+                        .expect("RmsNorm has weight");
+                    let wname = weight_field_name(ctx.program, wid, widx);
+                    let w = ctx.weight_accessor(&wname);
+                    let hidden_size = ctx.bound("hidden_size") as i32;
+                    // Output aliases — in-place mutation.
+                    let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
+                    let add_out = ctx.output_ident(add_id, 0);
+                    vec![
+                        // delta (input/output — mutated in place to normed output)
+                        quote! {
+                            let #rmsnorm_out = unsafe { (*#delta).as_view() };
+                            (*#delta).raw_ptr() as *mut ::core::ffi::c_void
+                        },
+                        // residual (mutated in place: residual += delta)
+                        quote! {
+                            let #add_out = unsafe { (*#residual).as_view() };
+                            (*#residual).raw_ptr() as *mut ::core::ffi::c_void
+                        },
+                        // weight
+                        quote! { (#w).weight.raw_ptr() as *const ::core::ffi::c_void },
+                        // eps
+                        quote! { (#w).eps },
+                        // hidden_size
+                        quote! { #hidden_size },
+                        // num_tokens
+                        quote! { ctx.num_tokens as i32 },
+                    ]
+                },
             ))
         }
         "fused_add_rms_norm_with_offset" => {
@@ -4366,24 +4412,41 @@ fn dc_device_phase(
                         ),
                     ],
                 },
-                vec![
-                    // C (output) ptr
-                    quote! { todo!("cutlass_gemm: C ptr") },
-                    // A (input) ptr
-                    quote! { todo!("cutlass_gemm: A ptr") },
-                    // B (weight) ptr
-                    quote! { todo!("cutlass_gemm: B ptr") },
-                    // M
-                    quote! { todo!("cutlass_gemm: M") },
-                    // N
-                    quote! { todo!("cutlass_gemm: N") },
-                    // K
-                    quote! { todo!("cutlass_gemm: K") },
-                    // alpha
-                    quote! { 1.0f32 },
-                    // beta
-                    quote! { 0.0f32 },
-                ],
+                {
+                    let tile = ctx.primary();
+                    let x = ctx.input_expr(tile, 0);
+                    let w = ctx.input_expr(tile, 1);
+                    let out = ctx.output_ident(tile, 0);
+                    vec![
+                        // C (output) — alloc [M, N]
+                        {
+                            quote! {
+                                let __w_dense = (#w).dense_weight();
+                                let __n = __w_dense.dims()[0] as usize;
+                                let __k = __w_dense.dims()[1] as usize;
+                                let #out = device.caching.alloc_tensor(
+                                    &[ctx.num_tokens as usize, __n],
+                                    ::ferrite_cuda_core::DType::BF16,
+                                );
+                                #out.raw_ptr() as *mut ::core::ffi::c_void
+                            }
+                        },
+                        // A (activation input)
+                        quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
+                        // B (weight)
+                        quote! { __w_dense.raw_ptr() as *const ::core::ffi::c_void },
+                        // M
+                        quote! { ctx.num_tokens as i32 },
+                        // N
+                        quote! { __n as i32 },
+                        // K
+                        quote! { __k as i32 },
+                        // alpha
+                        quote! { 1.0f32 },
+                        // beta
+                        quote! { 0.0f32 },
+                    ]
+                },
             ))
         }
         "cutlass_gemv" => Some((
@@ -4420,15 +4483,37 @@ fn dc_device_phase(
                 ],
                 preamble: vec![],
             },
-            vec![
-                quote! { todo!("cutlass_gemv: out ptr") },
-                quote! { todo!("cutlass_gemv: x ptr") },
-                quote! { todo!("cutlass_gemv: W ptr") },
-                quote! { todo!("cutlass_gemv: N") },
-                quote! { todo!("cutlass_gemv: K") },
-                quote! { 1.0f32 },
-                quote! { 0.0f32 },
-            ],
+            {
+                let tile = ctx.primary();
+                let x = ctx.input_expr(tile, 0);
+                let w = ctx.input_expr(tile, 1);
+                let out = ctx.output_ident(tile, 0);
+                vec![
+                    // out — alloc [1, N]
+                    {
+                        quote! {
+                            let __w_dense = (#w).dense_weight();
+                            let __n = __w_dense.dims()[0] as usize;
+                            let __k = __w_dense.dims()[1] as usize;
+                            let #out = device.caching.alloc_tensor(
+                                &[1, __n],
+                                ::ferrite_cuda_core::DType::BF16,
+                            );
+                            #out.raw_ptr() as *mut ::core::ffi::c_void
+                        }
+                    },
+                    // x (activation)
+                    quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
+                    // W (weight)
+                    quote! { __w_dense.raw_ptr() as *const ::core::ffi::c_void },
+                    // N
+                    quote! { __n as i32 },
+                    // K
+                    quote! { __k as i32 },
+                    quote! { 1.0f32 },
+                    quote! { 0.0f32 },
+                ]
+            },
         )),
         "fused_qkv_rope_cache" => Some((
             DevicePhase {
@@ -4949,6 +5034,342 @@ impl Implementation for CutlassGemvImpl {
                 )
             };
         }
+    }
+}
+
+// ── TK GEMM / GEMV (natively DeviceCallable, sm90+) ─────────────
+//
+// ThunderKittens-based GEMM and GEMV using kittens `warp::mma` /
+// `warpgroup::mma_AB` for tensor-core compute. These are natively
+// DeviceCallable — they run as phases inside the megakernel's
+// `__global__` cooperative kernel, NOT as standalone launches.
+//
+// Cost model: cuBLAS calibrated cost minus launch_overhead.
+// On H100 (sm90), TK wgmma GEMM matches cuBLAS throughput. The
+// net savings come from eliminating one kernel launch per GEMM.
+// This guarantees the solver prefers TK over standalone cuBLAS
+// for every GEMM/GEMV, enabling a 100% DeviceCallable megakernel.
+//
+// The device_phase() emits calls to `dc_tk_gemm` / `dc_tk_gemv`
+// functions in `megakernel_tk_ops.cuh`, which use kittens
+// register/shared types and warp::mma internally.
+
+#[derive(Debug)]
+pub struct TkGemmImpl;
+
+impl Implementation for TkGemmImpl {
+    fn name(&self) -> &'static str {
+        "tk_gemm"
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.compute_capability >= 90 && profile.cost_table.has_kernel("cublas")
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        // M >= 2 (prefill). M=1 is GEMV territory → TkGemvImpl.
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        if gemm_is_fusion_partner(fuf, seed) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let node = ctx.fuf.get(m.claimed_tiles[0]);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, node) else {
+            return f64::INFINITY;
+        };
+        // TK wgmma GEMM matches cuBLAS throughput on sm90.
+        // Subtract launch_overhead because this runs inside a megakernel.
+        let base = ctx
+            .profile
+            .cost_us_for("cublas", mm, nn, kk)
+            .unwrap_or_else(|| {
+                // No CSV row for this shape — fall back to analytical model.
+                let flops = 2.0 * mm as f64 * nn as f64 * kk as f64;
+                let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+                if peak == 0.0 || flops == 0.0 {
+                    0.0
+                } else {
+                    (flops / peak) * 1e6
+                }
+            });
+        (base - ctx.profile.launch_overhead_us).max(0.0)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[
+            Handoff::Mbarrier,
+            Handoff::SyncThreads,
+            Handoff::Internal,
+            Handoff::StreamOrder,
+        ];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[
+            Handoff::Mbarrier,
+            Handoff::SyncThreads,
+            Handoff::Internal,
+            Handoff::StreamOrder,
+        ];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Standalone fallback: use cuBLAS (same as GemmRefImpl).
+        emit_gemm(ctx)
+    }
+
+    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>)> {
+        let p = format!("p{idx}");
+        let tile = ctx.primary();
+        let x = ctx.input_expr(tile, 0);
+        let w = ctx.input_expr(tile, 1);
+        let out = ctx.output_ident(tile, 0);
+        Some((
+            DevicePhase {
+                flat_params: vec![
+                    ("void*".into(), format!("{p}_out")),
+                    ("const void*".into(), format!("{p}_A")),
+                    ("const void*".into(), format!("{p}_B")),
+                    ("int".into(), format!("{p}_M")),
+                    ("int".into(), format!("{p}_N")),
+                    ("int".into(), format!("{p}_K")),
+                ],
+                kernel_body: vec![format!(
+                    "dc_tk_gemm({p}_out, {p}_A, {p}_B, {p}_M, {p}_N, {p}_K, smem);"
+                )],
+                params_build: vec![
+                    format!("params.{p}_out = (__nv_bfloat16*){p}_out;"),
+                    format!("params.{p}_A = (const __nv_bfloat16*){p}_A;"),
+                    format!("params.{p}_B = (const __nv_bfloat16*){p}_B;"),
+                    format!("params.{p}_M = {p}_M;"),
+                    format!("params.{p}_N = {p}_N;"),
+                    format!("params.{p}_K = {p}_K;"),
+                ],
+                internal_fields: vec![
+                    format!("__nv_bfloat16* {p}_out"),
+                    format!("const __nv_bfloat16* {p}_A"),
+                    format!("const __nv_bfloat16* {p}_B"),
+                    format!("int {p}_M"),
+                    format!("int {p}_N"),
+                    format!("int {p}_K"),
+                ],
+                preamble: vec![],
+            },
+            vec![
+                // out — alloc [M, N]
+                {
+                    quote! {
+                        let __w_dense = (#w).dense_weight();
+                        let __n = __w_dense.dims()[0] as usize;
+                        let __k = __w_dense.dims()[1] as usize;
+                        let #out = device.caching.alloc_tensor(
+                            &[ctx.num_tokens as usize, __n],
+                            ::ferrite_cuda_core::DType::BF16,
+                        );
+                        #out.raw_ptr() as *mut ::core::ffi::c_void
+                    }
+                },
+                // A (activation input)
+                quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
+                // B (weight, [N, K] row-major)
+                quote! { __w_dense.raw_ptr() as *const ::core::ffi::c_void },
+                // M
+                quote! { ctx.num_tokens as i32 },
+                // N
+                quote! { __n as i32 },
+                // K
+                quote! { __k as i32 },
+            ],
+        ))
+    }
+}
+
+/// TK GEMV — natively DeviceCallable for M=1 decode.
+///
+/// Uses a cooperative grid where each CTA computes a slice of the
+/// output vector. Kittens warp::mma with M padded to 16 gives
+/// tensor-core throughput even at M=1.
+#[derive(Debug)]
+pub struct TkGemvImpl;
+
+impl Implementation for TkGemvImpl {
+    fn name(&self) -> &'static str {
+        "tk_gemv"
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.compute_capability >= 90 && profile.cost_table.has_kernel("cublas")
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        if gemm_is_fusion_partner(fuf, seed) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let node = ctx.fuf.get(m.claimed_tiles[0]);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, node) else {
+            return f64::INFINITY;
+        };
+        // TK cooperative GEMV: all CTAs collaborate on one M=1 GEMV.
+        // Cost model: cuBLAS minus launch_overhead.
+        let base = ctx
+            .profile
+            .cost_us_for("cublas", mm, nn, kk)
+            .unwrap_or_else(|| {
+                let flops = 2.0 * mm as f64 * nn as f64 * kk as f64;
+                let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+                if peak == 0.0 || flops == 0.0 {
+                    0.0
+                } else {
+                    (flops / peak) * 1e6
+                }
+            });
+        (base - ctx.profile.launch_overhead_us).max(0.0)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[
+            Handoff::Mbarrier,
+            Handoff::SyncThreads,
+            Handoff::Internal,
+            Handoff::StreamOrder,
+        ];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[
+            Handoff::Mbarrier,
+            Handoff::SyncThreads,
+            Handoff::Internal,
+            Handoff::StreamOrder,
+        ];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Standalone fallback: use cuBLAS (same as GemmRefImpl).
+        emit_gemm(ctx)
+    }
+
+    fn device_phase(&self, idx: usize, ctx: &EmitCtx) -> Option<(DevicePhase, Vec<TokenStream>)> {
+        let p = format!("p{idx}");
+        let tile = ctx.primary();
+        let x = ctx.input_expr(tile, 0);
+        let w = ctx.input_expr(tile, 1);
+        let out = ctx.output_ident(tile, 0);
+        Some((
+            DevicePhase {
+                flat_params: vec![
+                    ("void*".into(), format!("{p}_out")),
+                    ("const void*".into(), format!("{p}_x")),
+                    ("const void*".into(), format!("{p}_W")),
+                    ("int".into(), format!("{p}_N")),
+                    ("int".into(), format!("{p}_K")),
+                ],
+                kernel_body: vec![format!(
+                    "dc_tk_gemv({p}_out, {p}_x, {p}_W, {p}_N, {p}_K, smem);"
+                )],
+                params_build: vec![
+                    format!("params.{p}_out = (__nv_bfloat16*){p}_out;"),
+                    format!("params.{p}_x = (const __nv_bfloat16*){p}_x;"),
+                    format!("params.{p}_W = (const __nv_bfloat16*){p}_W;"),
+                    format!("params.{p}_N = {p}_N;"),
+                    format!("params.{p}_K = {p}_K;"),
+                ],
+                internal_fields: vec![
+                    format!("__nv_bfloat16* {p}_out"),
+                    format!("const __nv_bfloat16* {p}_x"),
+                    format!("const __nv_bfloat16* {p}_W"),
+                    format!("int {p}_N"),
+                    format!("int {p}_K"),
+                ],
+                preamble: vec![],
+            },
+            vec![
+                // out — alloc [1, N]
+                {
+                    quote! {
+                        let __w_dense = (#w).dense_weight();
+                        let __n = __w_dense.dims()[0] as usize;
+                        let __k = __w_dense.dims()[1] as usize;
+                        let #out = device.caching.alloc_tensor(
+                            &[1, __n],
+                            ::ferrite_cuda_core::DType::BF16,
+                        );
+                        #out.raw_ptr() as *mut ::core::ffi::c_void
+                    }
+                },
+                // x (activation)
+                quote! { (#x).raw_ptr() as *const ::core::ffi::c_void },
+                // W (weight, [N, K] row-major)
+                quote! { __w_dense.raw_ptr() as *const ::core::ffi::c_void },
+                // N
+                quote! { __n as i32 },
+                // K
+                quote! { __k as i32 },
+            ],
+        ))
     }
 }
 

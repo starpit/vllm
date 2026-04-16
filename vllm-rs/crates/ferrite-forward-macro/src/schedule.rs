@@ -515,6 +515,80 @@ mod tests {
         );
     }
 
+    /// On H100 (sm90), TK GEMM/GEMV are natively DeviceCallable and
+    /// cost less than cuBLAS (cuBLAS_cost - launch_overhead). Combined
+    /// with DC wrappers for elementwise ops and TK attention, this
+    /// means EVERY op in the LLaMA decoder layer is DeviceCallable.
+    /// The scheduler should produce 100% megakernel waves.
+    #[test]
+    fn h100_llama_100_percent_megakernel() {
+        let params = llama_3_2_1b_params();
+        let (fuf, sfuf, lib) = solved_body_h100(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                q = gemm(normed, self_attn.q_proj[layer]);
+                k = gemm(normed, self_attn.k_proj[layer]);
+                v = gemm(normed, self_attn.v_proj[layer]);
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                attn = attention(q, k, v, kv_cache[layer], block_table);
+                oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+
+                normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                up = gemm(normed2, mlp.up_proj[layer]);
+                down = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(down, hidden_states);
+            }
+            normed = rmsnorm(hidden_states, norm);
+            logits = gemm(normed, lm_head);
+            "#,
+            &params,
+        );
+        let loop_ir = schedule(&fuf, &sfuf, &lib);
+
+        // Count non-megakernel subgraphs. embed_ref is the only
+        // acceptable standalone — it's a gather lookup that runs once
+        // before the loop body. All GEMM/GEMV/elementwise/attention
+        // ops must be DeviceCallable.
+        let non_mega_sgs: Vec<_> = loop_ir
+            .waves
+            .iter()
+            .filter(|w| !w.is_megakernel)
+            .flat_map(|w| &w.subgraphs)
+            .collect();
+        let non_embed: Vec<_> = non_mega_sgs
+            .iter()
+            .filter(|sg| lib.get(sg.1).name() != "embed_ref")
+            .collect();
+
+        assert!(
+            non_embed.is_empty(),
+            "H100 LLaMA: all non-embed ops should be DeviceCallable, \
+             but {} standalone subgraphs remain: {:?}",
+            non_embed.len(),
+            non_embed
+                .iter()
+                .map(|sg| format!("impl={}", lib.get(sg.1).name()))
+                .collect::<Vec<_>>(),
+        );
+
+        let mega_count = loop_ir.waves.iter().filter(|w| w.is_megakernel).count();
+        let total = sfuf.num_subgraphs();
+        let mega_sgs: usize = loop_ir
+            .waves
+            .iter()
+            .filter(|w| w.is_megakernel)
+            .map(|w| w.subgraphs.len())
+            .sum();
+        eprintln!(
+            "H100 megakernel: {mega_sgs}/{total} subgraphs in {mega_count} mega waves \
+             (embed is standalone)"
+        );
+    }
+
     #[test]
     fn empty_sfuf_empty_loop() {
         let fuf = Fuf { nodes: Vec::new() };

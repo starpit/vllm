@@ -268,10 +268,12 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     // ── Per-model × per-workload pipeline ─────────────────────────
     let mut per_model_ts: Vec<proc_macro2::TokenStream> = Vec::new();
     // Collected per-model identifying shape for the arch-level
-    // Weights enum's `load` dispatch. Each entry = (model_ident,
-    // bounds-tuple literals in the fixed order below, quant-kind
-    // discriminator from [`quant_discriminator`]).
-    let mut arch_dispatch_arms: Vec<(Ident, Vec<u64>, u8)> = Vec::new();
+    // Weights enum's accessor methods. `bounds` supplies the
+    // per-variant accessor values (`num_hidden_layers()` etc.); the
+    // runtime `load` dispatch uses each variant's compile-emitted
+    // `fingerprint_matches(gw)` instead of a bounds match-tuple, so
+    // no quant-discriminator / extra field per entry is needed.
+    let mut arch_dispatch_arms: Vec<(Ident, Vec<u64>)> = Vec::new();
 
     for model in &models {
         let model_cfg = cfg::build_cfg(&classified, model)
@@ -336,8 +338,6 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             waves = max_waves,
             solve_ms = d_solve.as_millis(),
         );
-        let _ = arch_name;
-
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
         let codegen_items =
             codegen::emit_model(&classified, model, &model_fuf, &sfufs, &loops, &library);
@@ -349,14 +349,21 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             }
         });
 
-        arch_dispatch_arms.push((
-            model.name.clone(),
-            collect_dispatch_bounds(model),
-            quant_discriminator(model),
-        ));
+        arch_dispatch_arms.push((model.name.clone(), collect_dispatch_bounds(model)));
     }
 
-    let arch_dispatch_ts = emit_arch_dispatcher(&arch_dispatch_arms);
+    // Union of HF `architectures: [..]` strings across every compiled
+    // model — the set of `arch_hint` values `ferrite_forward::try_load`
+    // will route to this arch. Deduped + sorted for determinism.
+    let mut hf_arches: Vec<String> = models
+        .iter()
+        .flat_map(|m| m.architectures.iter().cloned())
+        .collect();
+    hf_arches.sort();
+    hf_arches.dedup();
+
+    let arch_ident = Ident::new(&arch_name, carrier.sig.ident.span());
+    let arch_dispatch_ts = emit_arch_dispatcher(&arch_ident, &hf_arches, &arch_dispatch_arms);
 
     // Emit items INLINE at the carrier's scope (no wrapping mod).
     // The carrier fn itself is consumed — it was only a host for
@@ -390,30 +397,6 @@ const DISPATCH_FIELDS: &[&str] = &[
     "vocab_size",
 ];
 
-/// Quant-format discriminator for the arch-level `Weights::load`
-/// fingerprint. Plain bounds (`num_hidden_layers`, `hidden_size`, …)
-/// don't distinguish a dense Llama-3.2-1B from an AWQ one — the two
-/// have identical shapes. The runtime caller already knows its
-/// `QuantConfig` variant, so the dispatcher extends its match tuple
-/// with this discriminator.
-///
-/// Values assigned:
-/// - 0 → Dense (no `quantization_config`)
-/// - 1 → AWQ
-///
-/// New variants (GPTQ / Fp8 / BnB / FP8-block) pick the next
-/// unused small integer when they land; the choice is purely an
-/// in-dispatcher numeric protocol between the macro and the caller.
-fn quant_discriminator(model: &config::ModelParams) -> u8 {
-    use crate::quantization::QuantMethod;
-    match &model.quantization {
-        None => 0,
-        Some(qc) => match qc.method {
-            QuantMethod::Awq { .. } => 1,
-        },
-    }
-}
-
 fn collect_dispatch_bounds(model: &config::ModelParams) -> Vec<u64> {
     DISPATCH_FIELDS
         .iter()
@@ -430,9 +413,24 @@ fn collect_dispatch_bounds(model: &config::ModelParams) -> Vec<u64> {
 }
 
 /// Arch-level dispatcher: an enum over every compiled variant plus
-/// a `load` that fingerprints the runtime config and a `forward`
-/// that delegates to the matched variant's per-model forward.
-fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>, u8)]) -> proc_macro2::TokenStream {
+/// a `load` that auto-detects the right variant by walking each
+/// variant's compile-emitted `fingerprint_matches(gw)` until one
+/// claims the runtime `GpuWeights`. Accessor methods
+/// (`num_hidden_layers`, …) delegate to per-variant constants baked
+/// from each model's config.json.
+///
+/// Also emits the auto-registration with
+/// [`ferrite_forward::try_load`]: an `impl FerriteWeights for Weights`
+/// that routes the trait methods to the just-emitted accessors +
+/// `forward` / `forward_backbone`, and an `inventory::submit!` block
+/// carrying the union of HF `architectures` strings this arch
+/// claims. The top-level loader walks the inventory at runtime; no
+/// hand-written per-arch entry anywhere in the caller's codebase.
+fn emit_arch_dispatcher(
+    arch_ident: &Ident,
+    hf_arches: &[String],
+    arms: &[(Ident, Vec<u64>)],
+) -> proc_macro2::TokenStream {
     if arms.is_empty() {
         return quote! {};
     }
@@ -443,32 +441,36 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>, u8)]) -> proc_macro2::TokenStr
     // would create ambiguity between e.g. `llama32` and `llama_3_2`.
     let variants: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _, _)| {
+        .map(|(model_ident, _)| {
             let variant_ident = pascal_case(model_ident);
             quote! { #variant_ident(#model_ident::Weights) }
         })
         .collect();
 
-    let load_arms: Vec<proc_macro2::TokenStream> = arms
+    // Auto-detect `load` body: try each variant's
+    // `fingerprint_matches` in declaration order; first match wins.
+    // Variants that share a fingerprint (e.g. two Llama configs that
+    // agree on every bound AND quant flag — today only rope params
+    // would differ) resolve to the earliest declared — a known
+    // limitation; authors with that collision should drop one of
+    // the colliding configs from `model_architectures/`.
+    let try_fingerprint_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, bounds, quant_kind)| {
+        .map(|(model_ident, _)| {
             let variant_ident = pascal_case(model_ident);
-            let bound_lits: Vec<proc_macro2::Literal> = bounds
-                .iter()
-                .map(|b| proc_macro2::Literal::u64_unsuffixed(*b))
-                .collect();
-            let qk_lit = proc_macro2::Literal::u8_unsuffixed(*quant_kind);
             quote! {
-                (#(#bound_lits),*, #qk_lit) => Ok(Self::#variant_ident(
-                    #model_ident::Weights::load(gw, stream)?,
-                )),
+                if #model_ident::Weights::fingerprint_matches(gw) {
+                    return Ok(Self::#variant_ident(
+                        #model_ident::Weights::load(gw, stream)?,
+                    ));
+                }
             }
         })
         .collect();
 
     let forward_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _, _)| {
+        .map(|(model_ident, _)| {
             let variant_ident = pascal_case(model_ident);
             quote! {
                 Weights::#variant_ident(w) => unsafe {
@@ -479,7 +481,7 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>, u8)]) -> proc_macro2::TokenStr
         .collect();
     let forward_backbone_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _, _)| {
+        .map(|(model_ident, _)| {
             let variant_ident = pascal_case(model_ident);
             quote! {
                 Weights::#variant_ident(w) => unsafe {
@@ -500,7 +502,7 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>, u8)]) -> proc_macro2::TokenStr
             let method_name = Ident::new(field, Span::call_site());
             let arms_ts: Vec<proc_macro2::TokenStream> = arms
                 .iter()
-                .map(|(model_ident, bounds, _)| {
+                .map(|(model_ident, bounds)| {
                     let variant_ident = pascal_case(model_ident);
                     let idx = DISPATCH_FIELDS
                         .iter()
@@ -524,16 +526,12 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>, u8)]) -> proc_macro2::TokenStr
         })
         .collect();
 
-    let fields: Vec<proc_macro2::TokenStream> = DISPATCH_FIELDS
+    // Literals the auto-emitted `FerriteWeights` impl + inventory
+    // registration reference.
+    let arch_name_lit = proc_macro2::Literal::string(&arch_ident.to_string());
+    let hf_arch_lits: Vec<proc_macro2::Literal> = hf_arches
         .iter()
-        .map(|k| {
-            let id = Ident::new(k, Span::call_site());
-            quote! { #id: u64 }
-        })
-        .collect();
-    let field_names: Vec<Ident> = DISPATCH_FIELDS
-        .iter()
-        .map(|k| Ident::new(k, Span::call_site()))
+        .map(|s| proc_macro2::Literal::string(s))
         .collect();
 
     quote! {
@@ -548,30 +546,23 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>, u8)]) -> proc_macro2::TokenStr
         impl Weights {
             #(#accessor_methods)*
 
-            /// Auto-detect the compiled variant from the runtime
-            /// HF-config fields, load weights (streaming concat for
-            /// fused accessors), and return the enum-wrapped result.
+            /// Auto-detect the compiled variant by sniffing the
+            /// runtime `GpuWeights` against each variant's compile-
+            /// baked fingerprint (embedding shape + last-layer
+            /// tensor presence + quant suffix), then load.
             ///
-            /// `quant_kind` is the macro's internal discriminator for
-            /// the model's `quantization_config` (0 = Dense, 1 = AWQ;
-            /// see `ferrite_forward_macro::quant_discriminator`). The
-            /// caller derives it from its runtime `QuantConfig`.
-            ///
-            /// Errors if no compiled variant's fingerprint matches.
-            #[allow(clippy::too_many_arguments)]
+            /// Errors if no compiled variant matches — caller is
+            /// expected to fall through to a non-ferrite path.
             pub fn load(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
-                #(#fields),*,
-                quant_kind: u8,
             ) -> ::anyhow::Result<Self> {
-                match (#(#field_names),*, quant_kind) {
-                    #(#load_arms)*
-                    shape => ::anyhow::bail!(
-                        "no compiled variant matches config fingerprint {:?}",
-                        shape,
-                    ),
-                }
+                #(#try_fingerprint_arms)*
+                ::anyhow::bail!(
+                    "no compiled ferrite variant matched this GpuWeights \
+                     (inspect tensor names; expected model.embed_tokens.weight \
+                     shape + matching model.layers.N.self_attn.q_proj.{{,q}}weight)"
+                )
             }
         }
 
@@ -612,6 +603,56 @@ fn emit_arch_dispatcher(arms: &[(Ident, Vec<u64>, u8)]) -> proc_macro2::TokenStr
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
             match w {
                 #(#forward_backbone_arms)*
+            }
+        }
+
+        // ── Auto-registration with ferrite_forward::try_load ──────
+        //
+        // `FerriteWeights` impl routes trait methods to the just-
+        // emitted accessors + `forward` / `forward_backbone`.
+        // `inventory::submit!` adds this arch to the global registry.
+        // No hand-written central list anywhere.
+
+        #[cfg(feature = "cuda")]
+        impl ::ferrite_forward::FerriteWeights for Weights {
+            fn arch_name(&self) -> &'static str { #arch_name_lit }
+            fn num_hidden_layers(&self) -> u64 { self.num_hidden_layers() }
+            fn hidden_size(&self) -> u64 { self.hidden_size() }
+            fn intermediate_size(&self) -> u64 { self.intermediate_size() }
+            fn num_attention_heads(&self) -> u64 { self.num_attention_heads() }
+            fn num_key_value_heads(&self) -> u64 { self.num_key_value_heads() }
+            fn head_dim(&self) -> u64 { self.head_dim() }
+            fn vocab_size(&self) -> u64 { self.vocab_size() }
+
+            unsafe fn forward(
+                &self,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                num_tokens: u64,
+            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                unsafe { forward(self, ctx, device, num_tokens) }
+            }
+
+            unsafe fn forward_backbone(
+                &self,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                num_tokens: u64,
+            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                unsafe { forward_backbone(self, ctx, device, num_tokens) }
+            }
+        }
+
+        #[cfg(feature = "cuda")]
+        ::ferrite_forward::inventory::submit! {
+            ::ferrite_forward::FerriteArchRegistration {
+                arch_name: #arch_name_lit,
+                hf_arches: &[#(#hf_arch_lits),*],
+                try_load: |gw, stream| {
+                    Weights::load(gw, stream)
+                        .map(|w| ::std::boxed::Box::new(w)
+                            as ::std::boxed::Box<dyn ::ferrite_forward::FerriteWeights>)
+                },
             }
         }
     }

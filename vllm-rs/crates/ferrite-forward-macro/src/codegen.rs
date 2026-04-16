@@ -296,6 +296,78 @@ fn collect_accessors(
     Ok(by_name.into_values().map(|(a, _)| a).collect())
 }
 
+/// Emit a `fingerprint_matches(gw)` method body — the per-variant
+/// check the arch-level dispatcher uses to auto-detect which
+/// compiled model a runtime `GpuWeights` corresponds to. All values
+/// are baked at macro-expansion time from `model.bounds` +
+/// `model.quantization`; the runtime cost is a handful of
+/// `gw.contains` / `gw.tensor_info` lookups.
+///
+/// Checks:
+/// 1. **Embedding shape** matches `(vocab_size, hidden_size)` from
+///    config.json. Rules out arches with a different width or vocab.
+/// 2. **Last-layer tensor present** (`model.layers.{N-1}.self_attn.q_proj.<suffix>`)
+///    where `suffix` is `qweight` for AWQ, `weight` for dense.
+/// 3. **Next-layer tensor absent** (same name with layer `N`). Rules
+///    out larger compiled variants with the same suffix.
+/// 4. **Opposite-suffix tensor absent**. Rules out the other quant
+///    twin of the same shape (dense vs AWQ of the same model).
+fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
+    let num_hidden_layers = *model
+        .bounds
+        .get("num_hidden_layers")
+        .unwrap_or_else(|| panic!("model `{}` missing `num_hidden_layers`", model.source_stem));
+    let hidden_size = *model
+        .bounds
+        .get("hidden_size")
+        .unwrap_or_else(|| panic!("model `{}` missing `hidden_size`", model.source_stem));
+    let vocab_size = *model
+        .bounds
+        .get("vocab_size")
+        .unwrap_or_else(|| panic!("model `{}` missing `vocab_size`", model.source_stem));
+
+    let (suffix, opposite_suffix) = if model.quantization.is_some() {
+        ("qweight", "weight")
+    } else {
+        ("weight", "qweight")
+    };
+
+    let last_layer = num_hidden_layers.saturating_sub(1);
+    let last_tensor = format!("model.layers.{last_layer}.self_attn.q_proj.{suffix}");
+    let one_past_tensor = format!("model.layers.{num_hidden_layers}.self_attn.q_proj.{suffix}");
+    let opposite_tensor = format!("model.layers.0.self_attn.q_proj.{opposite_suffix}");
+
+    let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
+    let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size as usize);
+
+    quote! {
+        /// Return `true` iff the tensors in `gw` match this
+        /// variant's compile-time fingerprint. See
+        /// `emit_fingerprint_check` in the macro for the rules.
+        pub fn fingerprint_matches(
+            gw: &::ferrite_cuda_core::weights::GpuWeights,
+        ) -> bool {
+            match gw.tensor_info("model.embed_tokens.weight") {
+                Some((shape, _))
+                    if shape.len() >= 2
+                        && shape[0] == #vocab_lit
+                        && shape[1] == #hidden_lit => {}
+                _ => return false,
+            }
+            if !gw.contains(#last_tensor) {
+                return false;
+            }
+            if gw.contains(#one_past_tensor) {
+                return false;
+            }
+            if gw.contains(#opposite_tensor) {
+                return false;
+            }
+            true
+        }
+    }
+}
+
 /// Emit the `Weights` struct definition + its `load` method.
 fn emit_weights_struct(
     program: &Program,
@@ -462,6 +534,7 @@ fn emit_weights_struct(
     // `Self { a, b, c }` shorthand — fields are the just-bound
     // locals, in the same order we declared the struct fields.
     let field_shorthand: Vec<&syn::Ident> = accessors.iter().map(|a| &a.name).collect();
+    let fingerprint_method = emit_fingerprint_check(model);
 
     quote! {
         /// Every weight the emitted forward needs, already packed
@@ -476,6 +549,8 @@ fn emit_weights_struct(
 
         #[cfg(feature = "cuda")]
         impl Weights {
+            #fingerprint_method
+
             /// Read every field from an open `GpuWeights` (a
             /// safetensors view). Fused accessors stream their
             /// source weights directly into one packed GPU buffer

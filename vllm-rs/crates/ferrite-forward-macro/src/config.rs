@@ -59,6 +59,13 @@ pub struct ModelParams {
     /// and the quant resolver keeps `lm_head` dense even under an
     /// AWQ config whose `modules_to_not_convert` doesn't list it.
     pub tie_word_embeddings: bool,
+    /// HF `architectures: [..]` strings from this model's
+    /// `config.json`. The macro unions these across every compiled
+    /// model in an arch directory to produce the `hf_arches` list
+    /// baked into the arch's
+    /// [`ferrite_forward::FerriteArchRegistration`] registration,
+    /// driving the runtime `try_load(..., arch_hint)` dispatch.
+    pub architectures: Vec<String>,
 }
 
 /// Errors produced while loading configs.
@@ -172,6 +179,15 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
         .get("tie_word_embeddings")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let architectures: Vec<String> = json
+        .get("architectures")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
 
     Ok(ModelParams {
         name,
@@ -181,6 +197,7 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
         scalars,
         quantization,
         tie_word_embeddings,
+        architectures,
     })
 }
 

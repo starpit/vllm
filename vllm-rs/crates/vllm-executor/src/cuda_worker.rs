@@ -7,6 +7,13 @@
 //!
 //! This worker is gated behind the `cuda-backend` feature flag.
 
+// Force the linker to keep `ferrite_models` — its `#[forward]`
+// modules register with `inventory::submit!` for auto-discovery by
+// `ferrite_forward::try_load`. Without this, the linker gc's the
+// crate (no direct symbol references after the Phase B collapse)
+// and the inventory comes up empty.
+extern crate ferrite_models as _;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -104,79 +111,30 @@ pub struct CudaWorkerConfig {
 ///
 /// Only populated when `VLLM_FERRITE=1` at load time; otherwise a
 /// dense-bf16 Llama routes to `CudaModel::LlamaSolver` as before.
-pub struct LlamaFerriteModel {
-    pub weights: ferrite_models::llama::Weights,
-    pub rotary: vllm_cuda::rotary::RotaryCache,
-}
-
-/// Same as `LlamaFerriteModel` but over Qwen2/Qwen2.5 — the DSL
-/// body in `ferrite_models::qwen2` is identical to Llama's; the bias
-/// on Qwen2's QKV projections is transparent to the compiler and
-/// handled at weight-load time.
-pub struct Qwen2FerriteModel {
-    pub weights: ferrite_models::qwen2::Weights,
-    pub rotary: vllm_cuda::rotary::RotaryCache,
-}
-
-/// Same as `LlamaFerriteModel` but over Gemma2 — the DSL body in
-/// `ferrite_models::gemma2` expresses Gemma's four-norm-per-layer
-/// structure, alternating sliding/full attention, GELU MLP,
-/// `(1 + w)` rmsnorm convention (as `w + 1.0` in the DSL, folded
-/// to the kernel's `weight_offset` param), and final logit
-/// softcap. Nothing Gemma-specific lives in the compiler.
-pub struct Gemma2FerriteModel {
-    pub weights: ferrite_models::gemma2::Weights,
-    pub rotary: vllm_cuda::rotary::RotaryCache,
-}
-
-/// Same as `LlamaFerriteModel` but over Granite (IBM) — the DSL
-/// body in `ferrite_models::granite` is Llama's math plus four
-/// scalar multipliers read from config: `embedding_multiplier`,
-/// `residual_multiplier`, `attention_multiplier`, `logits_scaling`.
-/// `attention_multiplier` is picked up by the attention impls via
-/// `attention_scale_for`; the other three ride through `scalar(...)`
-/// / `recip_scalar(...)` in the DSL and lower to `ScalarMulImpl`
-/// kernel calls. Nothing Granite-specific lives in the compiler.
-pub struct GraniteFerriteModel {
-    pub weights: ferrite_models::granite::Weights,
-    pub rotary: vllm_cuda::rotary::RotaryCache,
-}
-
-/// Same as `LlamaFerriteModel` but over Qwen3 dense — the DSL body
-/// in `ferrite_models::qwen3` adds per-head `rmsnorm(q, q_norm)` /
-/// `rmsnorm(k, k_norm)` between QKV gemms and rope_append; shape
-/// inference's reshape-recovery synthesizes the per-head view tiles,
-/// and `RopeAppendRefImpl` claims the standalone rope_append (the
-/// fused QKV-rope impls can't, since per-head norms break the
-/// gemm→rope adjacency they require). No QKV bias (unlike Qwen2).
-pub struct Qwen3FerriteModel {
-    pub weights: ferrite_models::qwen3::Weights,
+/// Any ferrite-compiled model, loaded through
+/// [`ferrite_forward::try_load`]. The trait object erases the arch;
+/// accessors + forward/backbone go through the `FerriteWeights`
+/// vtable. One struct covers every registered arch (llama, qwen2,
+/// qwen3, gemma2, granite, and any future arch that lands a
+/// `#[forward]` module) — adding a new arch requires zero lines
+/// here.
+pub struct FerriteModel {
+    pub weights: Box<dyn ferrite_forward::FerriteWeights>,
     pub rotary: vllm_cuda::rotary::RotaryCache,
 }
 
 /// Supported model architectures in the vllm-cuda backend.
 enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
-    /// Dense-bf16 Llama via the `#[forward]`-emitted forward in
-    /// `ferrite_models::llama`. Boxed because the ferrite `Weights`
-    /// enum has many large variants (one per compiled model config)
-    /// and inlining would inflate every `CudaModel` instance.
-    LlamaFerrite(Box<LlamaFerriteModel>),
     Qwen2(vllm_cuda::model::qwen2::Qwen2ForCausalLM),
-    /// Dense-bf16 Qwen2/2.5 via `ferrite_models::qwen2`. Same
-    /// boxing rationale as `LlamaFerrite`.
-    Qwen2Ferrite(Box<Qwen2FerriteModel>),
     Gemma2(vllm_cuda::model::gemma2::Gemma2ForCausalLM),
-    /// Gemma2 via the `#[forward]`-emitted forward in
-    /// `ferrite_models::gemma2`. Same boxing rationale as
-    /// `LlamaFerrite`.
-    Gemma2Ferrite(Box<Gemma2FerriteModel>),
-    /// Granite (IBM) via `ferrite_models::granite`. Same boxing
-    /// rationale as `LlamaFerrite`.
-    GraniteFerrite(Box<GraniteFerriteModel>),
-    /// Dense-bf16 Qwen3 via `ferrite_models::qwen3`. Same boxing
-    /// rationale as `LlamaFerrite`.
-    Qwen3Ferrite(Box<Qwen3FerriteModel>),
+    /// Any ferrite-compiled arch. Populated by
+    /// `ferrite_forward::try_load(gw, stream, hf_arch_name)` —
+    /// one variant covers every registered `#[forward]` module
+    /// (llama / qwen2 / qwen3 / gemma2 / granite / …). Boxed
+    /// because the per-arch `Weights` enum has one variant per
+    /// compiled model config and can be large.
+    Ferrite(Box<FerriteModel>),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
     Mixtral(vllm_cuda::model::mixtral::MixtralForCausalLM),
     Qwen2Moe(vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM),
@@ -191,13 +149,9 @@ impl CudaModel {
     fn num_layers(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers.len(),
-            Self::LlamaFerrite(m) => m.weights.num_hidden_layers() as usize,
             Self::Qwen2(m) => m.0.model.layers.len(),
-            Self::Qwen2Ferrite(m) => m.weights.num_hidden_layers() as usize,
             Self::Gemma2(m) => m.model.layers.len(),
-            Self::Gemma2Ferrite(m) => m.weights.num_hidden_layers() as usize,
-            Self::GraniteFerrite(m) => m.weights.num_hidden_layers() as usize,
-            Self::Qwen3Ferrite(m) => m.weights.num_hidden_layers() as usize,
+            Self::Ferrite(m) => m.weights.num_hidden_layers() as usize,
             Self::Gemma3(m) => m.model.layers.len(),
             Self::Mixtral(m) => m.model.layers.len(),
             Self::Qwen2Moe(m) => m.model.layers.len(),
@@ -214,13 +168,9 @@ impl CudaModel {
     fn num_kv_heads(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers[0].self_attn.num_kv_heads,
-            Self::LlamaFerrite(m) => m.weights.num_key_value_heads() as usize,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.num_kv_heads,
-            Self::Qwen2Ferrite(m) => m.weights.num_key_value_heads() as usize,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
-            Self::Gemma2Ferrite(m) => m.weights.num_key_value_heads() as usize,
-            Self::GraniteFerrite(m) => m.weights.num_key_value_heads() as usize,
-            Self::Qwen3Ferrite(m) => m.weights.num_key_value_heads() as usize,
+            Self::Ferrite(m) => m.weights.num_key_value_heads() as usize,
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Mixtral(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
@@ -235,13 +185,9 @@ impl CudaModel {
     fn head_dim(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers[0].self_attn.head_dim,
-            Self::LlamaFerrite(m) => m.weights.head_dim() as usize,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.head_dim,
-            Self::Qwen2Ferrite(m) => m.weights.head_dim() as usize,
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
-            Self::Gemma2Ferrite(m) => m.weights.head_dim() as usize,
-            Self::GraniteFerrite(m) => m.weights.head_dim() as usize,
-            Self::Qwen3Ferrite(m) => m.weights.head_dim() as usize,
+            Self::Ferrite(m) => m.weights.head_dim() as usize,
             Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
             Self::Mixtral(m) => m.model.layers[0].self_attn.head_dim,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.head_dim,
@@ -256,13 +202,9 @@ impl CudaModel {
     fn vocab_size(&self) -> usize {
         match self {
             Self::Llama(m) => m.lm_head.out_features(),
-            Self::LlamaFerrite(m) => m.weights.vocab_size() as usize,
             Self::Qwen2(m) => m.0.lm_head.out_features(),
-            Self::Qwen2Ferrite(m) => m.weights.vocab_size() as usize,
             Self::Gemma2(m) => m.lm_head.out_features(),
-            Self::Gemma2Ferrite(m) => m.weights.vocab_size() as usize,
-            Self::GraniteFerrite(m) => m.weights.vocab_size() as usize,
-            Self::Qwen3Ferrite(m) => m.weights.vocab_size() as usize,
+            Self::Ferrite(m) => m.weights.vocab_size() as usize,
             Self::Gemma3(m) => m.lm_head.out_features(),
             Self::Mixtral(m) => m.lm_head.out_features(),
             Self::Qwen2Moe(m) => m.lm_head.out_features(),
@@ -288,13 +230,9 @@ impl CudaModel {
     fn hidden_size(&self) -> usize {
         match self {
             Self::Llama(m) => m.lm_head.in_features(),
-            Self::LlamaFerrite(m) => m.weights.hidden_size() as usize,
             Self::Qwen2(m) => m.0.lm_head.in_features(),
-            Self::Qwen2Ferrite(m) => m.weights.hidden_size() as usize,
             Self::Gemma2(m) => m.lm_head.in_features(),
-            Self::Gemma2Ferrite(m) => m.weights.hidden_size() as usize,
-            Self::GraniteFerrite(m) => m.weights.hidden_size() as usize,
-            Self::Qwen3Ferrite(m) => m.weights.hidden_size() as usize,
+            Self::Ferrite(m) => m.weights.hidden_size() as usize,
             Self::Gemma3(m) => m.lm_head.in_features(),
             Self::Mixtral(m) => m.lm_head.in_features(),
             Self::Qwen2Moe(m) => m.lm_head.in_features(),
@@ -358,29 +296,6 @@ impl CudaModel {
                     device,
                 )
             },
-            // LlamaFerrite uses the compiler-emitted
-            // `forward_backbone` which walks every solver-picked
-            // subgraph except the terminal lm_head gemm and returns
-            // a freshly-allocated clone of the final rmsnorm's output.
-            // Currently only exercised by the test-harness / future
-            // PP intermediate ranks (the loader still gates ferrite
-            // off when `use_pp`).
-            Self::LlamaFerrite(m) => unsafe {
-                let num_tokens = input_ids.dim(0) as u64;
-                let ctx = ferrite_forward::ForwardCtx {
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    rotary: &m.rotary,
-                };
-                ferrite_models::llama::forward_backbone(&m.weights, &ctx, device, num_tokens)
-            },
             Self::Qwen2(m) => unsafe {
                 m.0.model.forward(
                     input_ids,
@@ -394,22 +309,6 @@ impl CudaModel {
                     kv_cache,
                     device,
                 )
-            },
-            Self::Qwen2Ferrite(m) => unsafe {
-                let num_tokens = input_ids.dim(0) as u64;
-                let ctx = ferrite_forward::ForwardCtx {
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    rotary: &m.rotary,
-                };
-                ferrite_models::qwen2::forward_backbone(&m.weights, &ctx, device, num_tokens)
             },
             Self::Gemma2(m) => unsafe {
                 m.model.forward(
@@ -425,7 +324,12 @@ impl CudaModel {
                     device,
                 )
             },
-            Self::Gemma2Ferrite(m) => unsafe {
+            // Ferrite arches all share this shape: build `ForwardCtx`
+            // from the argument bag, dispatch through the
+            // `FerriteWeights` trait's `forward_backbone` vtable. The
+            // trait impl inside each arch's compiled module routes
+            // to the per-arch `forward_backbone(&weights, &ctx, ...)`.
+            Self::Ferrite(m) => unsafe {
                 let num_tokens = input_ids.dim(0) as u64;
                 let ctx = ferrite_forward::ForwardCtx {
                     input_ids,
@@ -439,39 +343,7 @@ impl CudaModel {
                     kv_cache,
                     rotary: &m.rotary,
                 };
-                ferrite_models::gemma2::forward_backbone(&m.weights, &ctx, device, num_tokens)
-            },
-            Self::GraniteFerrite(m) => unsafe {
-                let num_tokens = input_ids.dim(0) as u64;
-                let ctx = ferrite_forward::ForwardCtx {
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    rotary: &m.rotary,
-                };
-                ferrite_models::granite::forward_backbone(&m.weights, &ctx, device, num_tokens)
-            },
-            Self::Qwen3Ferrite(m) => unsafe {
-                let num_tokens = input_ids.dim(0) as u64;
-                let ctx = ferrite_forward::ForwardCtx {
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    rotary: &m.rotary,
-                };
-                ferrite_models::qwen3::forward_backbone(&m.weights, &ctx, device, num_tokens)
+                m.weights.forward_backbone(&ctx, device, num_tokens)
             },
             Self::Gemma3(m) => unsafe {
                 m.model.forward(
@@ -610,46 +482,6 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
-            Self::LlamaFerrite(m) => unsafe {
-                // Build the ambient runtime args bundle the emitted
-                // forward takes. The bundling is intentional — the
-                // macro-emitted fn's argument shape stays stable as
-                // new kernels start needing new runtime state.
-                let num_tokens = input_ids.dim(0) as u64;
-                let ctx = ferrite_forward::ForwardCtx {
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    rotary: &m.rotary,
-                };
-                let logits = ferrite_models::llama::forward(&m.weights, &ctx, device, num_tokens);
-                // Selective last-token gather for prefill. The
-                // ferrite DSL currently ends with `logits = gemm(..,
-                // lm_head)` which runs lm_head over ALL num_tokens
-                // rows — so we gather AFTER the matmul (correct,
-                // wasteful). A future ferrite-level optimization
-                // would expose a gather op in the DSL so the user
-                // can place it before lm_head. Until then,
-                // `embedding_gather` over logits does the job:
-                // output[i] = logits[indices[i]].
-                match last_token_indices {
-                    Some(idx) if idx.dim(0) < num_tokens as usize => {
-                        vllm_cuda::kernels::embedding_gather(
-                            logits.as_gpu_tensor(),
-                            *idx,
-                            &mut device.caching,
-                            device.compute_stream,
-                        )
-                    }
-                    _ => logits,
-                }
-            },
             Self::Qwen2(m) => unsafe {
                 m.forward(
                     input_ids,
@@ -664,33 +496,6 @@ impl CudaModel {
                     device,
                     last_token_indices,
                 )
-            },
-            Self::Qwen2Ferrite(m) => unsafe {
-                let num_tokens = input_ids.dim(0) as u64;
-                let ctx = ferrite_forward::ForwardCtx {
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    rotary: &m.rotary,
-                };
-                let logits = ferrite_models::qwen2::forward(&m.weights, &ctx, device, num_tokens);
-                match last_token_indices {
-                    Some(idx) if idx.dim(0) < num_tokens as usize => {
-                        vllm_cuda::kernels::embedding_gather(
-                            logits.as_gpu_tensor(),
-                            *idx,
-                            &mut device.caching,
-                            device.compute_stream,
-                        )
-                    }
-                    _ => logits,
-                }
             },
             Self::Gemma2(m) => unsafe {
                 m.forward(
@@ -707,7 +512,18 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
-            Self::Gemma2Ferrite(m) => unsafe {
+            // Every ferrite-compiled arch routes through the
+            // `FerriteWeights` trait's `forward` vtable. The per-arch
+            // macro-emitted impl delegates to that arch's specialized
+            // `forward(&weights, &ctx, device, num_tokens)`.
+            //
+            // Selective last-token gather for prefill: the ferrite
+            // DSL currently ends with `logits = gemm(.., lm_head)`
+            // which runs lm_head over ALL num_tokens rows — so we
+            // gather AFTER the matmul (correct, wasteful). A future
+            // ferrite-level optimization would expose a gather op
+            // in the DSL so the user can place it before lm_head.
+            Self::Ferrite(m) => unsafe {
                 let num_tokens = input_ids.dim(0) as u64;
                 let ctx = ferrite_forward::ForwardCtx {
                     input_ids,
@@ -721,61 +537,7 @@ impl CudaModel {
                     kv_cache,
                     rotary: &m.rotary,
                 };
-                let logits = ferrite_models::gemma2::forward(&m.weights, &ctx, device, num_tokens);
-                match last_token_indices {
-                    Some(idx) if idx.dim(0) < num_tokens as usize => {
-                        vllm_cuda::kernels::embedding_gather(
-                            logits.as_gpu_tensor(),
-                            *idx,
-                            &mut device.caching,
-                            device.compute_stream,
-                        )
-                    }
-                    _ => logits,
-                }
-            },
-            Self::GraniteFerrite(m) => unsafe {
-                let num_tokens = input_ids.dim(0) as u64;
-                let ctx = ferrite_forward::ForwardCtx {
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    rotary: &m.rotary,
-                };
-                let logits = ferrite_models::granite::forward(&m.weights, &ctx, device, num_tokens);
-                match last_token_indices {
-                    Some(idx) if idx.dim(0) < num_tokens as usize => {
-                        vllm_cuda::kernels::embedding_gather(
-                            logits.as_gpu_tensor(),
-                            *idx,
-                            &mut device.caching,
-                            device.compute_stream,
-                        )
-                    }
-                    _ => logits,
-                }
-            },
-            Self::Qwen3Ferrite(m) => unsafe {
-                let num_tokens = input_ids.dim(0) as u64;
-                let ctx = ferrite_forward::ForwardCtx {
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    rotary: &m.rotary,
-                };
-                let logits = ferrite_models::qwen3::forward(&m.weights, &ctx, device, num_tokens);
+                let logits = m.weights.forward(&ctx, device, num_tokens);
                 match last_token_indices {
                     Some(idx) if idx.dim(0) < num_tokens as usize => {
                         vllm_cuda::kernels::embedding_gather(
@@ -1027,19 +789,6 @@ impl CudaModel {
 // ---------------------------------------------------------------------------
 // Config helpers: HfModelConfig → vllm-cuda configs
 // ---------------------------------------------------------------------------
-
-/// Map a runtime `QuantConfig` to the ferrite-forward arch-level
-/// dispatcher's quant-kind discriminator. Must match the values
-/// assigned in `ferrite_forward_macro::quant_discriminator` (0 =
-/// Dense/None, 1 = AWQ). Only the quant families ferrite handles
-/// today need a non-zero value; others fall back to 0 because they
-/// never route through the ferrite path anyway (cuda_worker gate).
-fn ferrite_quant_kind(qconfig: &vllm_cuda::quant::QuantConfig) -> u8 {
-    match qconfig {
-        vllm_cuda::quant::QuantConfig::Awq(_) => 1,
-        _ => 0,
-    }
-}
 
 fn llama_config_from_hf(
     hf: &HfModelConfig,
@@ -5284,47 +5033,33 @@ impl Worker for CudaWorker {
             None
         };
 
-        let model = match arch.as_str() {
-            // Qwen3 dense — Llama math + per-head Q/K rmsnorm before
-            // RoPE (no QKV bias). Routes through ferrite-forward for
-            // dense bf16; quant / TP / PP not yet wired (the
-            // hand-written `LlamaForCausalLM` would silently drop the
-            // q_norm / k_norm tensors and produce garbage). Surface as
-            // a hard `WorkerInit` error in those cases until a
-            // dedicated quant Qwen3 path lands.
-            "Qwen3ForCausalLM" => {
+        // ── Try ferrite first (all supported arches in one shot).
+        //
+        // `ferrite_forward::try_load` walks every `#[forward]`-
+        // registered arch; first whose `hf_arches` list contains
+        // `arch.as_str()` wins. Auto-registered via
+        // `inventory::submit!` at macro expansion — adding a new
+        // arch to ferrite-models touches zero lines here.
+        let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
+        let ferrite_eligible = !qconfig.is_bnb4bit()
+            && !qconfig.is_fp8()
+            && (!qconfig.is_quantized() || qconfig.is_awq())
+            && !use_tp
+            && !use_pp
+            && !disable_ferrite;
+        let ferrite_loaded: Option<CudaModel> = if ferrite_eligible {
+            let stream = device.compute_stream;
+            if let Some(ferrite_weights) =
+                ferrite_forward::try_load(&mut weights, stream, arch.as_str())
+                    .map_err(|e| ExecutorError::WorkerInit(format!("ferrite-forward load: {e}")))?
+            {
+                // Rotary cache is uniform across ferrite arches — the
+                // params come from the same HF config fields for every
+                // decoder-only transformer. Build once using the
+                // llama-shaped config helper (safe: Gemma2 etc have no
+                // `rope_scaling` of type `llama3`, so the helper
+                // returns `None` for the scaling).
                 let config = llama_config_from_hf(&hf_config)?;
-                let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
-                if qconfig.is_bnb4bit()
-                    || qconfig.is_fp8()
-                    || qconfig.is_quantized()
-                    || use_tp
-                    || use_pp
-                    || disable_ferrite
-                {
-                    return Err(ExecutorError::WorkerInit(
-                        "Qwen3 dense: only bf16/fp16 ferrite-forward path is supported \
-                         (quant / TP / PP / FERRITE_DISABLE require the hand-written \
-                         model, which doesn't yet handle Qwen3's per-head q_norm/k_norm)"
-                            .into(),
-                    ));
-                }
-                let stream = device.compute_stream;
-                let ferrite_weights = ferrite_models::qwen3::Weights::load(
-                    &mut weights,
-                    stream,
-                    config.num_hidden_layers as u64,
-                    config.hidden_size as u64,
-                    config.intermediate_size as u64,
-                    config.num_attention_heads as u64,
-                    config.num_kv_heads as u64,
-                    config.head_dim as u64,
-                    config.vocab_size as u64,
-                    ferrite_quant_kind(&qconfig),
-                )
-                .map_err(|e| {
-                    ExecutorError::WorkerInit(format!("Qwen3 ferrite-forward load: {e}"))
-                })?;
                 let rotary = unsafe {
                     vllm_cuda::rotary::RotaryCache::new(
                         config.head_dim,
@@ -5336,92 +5071,82 @@ impl Worker for CudaWorker {
                     )
                 }
                 .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
-                info!("CudaWorker: loaded Qwen3 via ferrite-forward");
-                CudaModel::Qwen3Ferrite(Box::new(Qwen3FerriteModel {
+                info!(
+                    "CudaWorker: loaded {} via ferrite-forward ({})",
+                    arch,
+                    ferrite_weights.arch_name(),
+                );
+                Some(CudaModel::Ferrite(Box::new(FerriteModel {
                     weights: ferrite_weights,
                     rotary,
-                }))
+                })))
+            } else {
+                None
             }
-            "LlamaForCausalLM" | "MistralForCausalLM" | "Phi3ForCausalLM" => {
-                let config = llama_config_from_hf(&hf_config)?;
-                // Dense bf16/fp16 path: ferrite-forward emits the
-                // specialized Weights + forward for each compiled
-                // config. Weights::load fingerprints the runtime HF
-                // config against every compiled model and picks the
-                // matching variant; RotaryCache is built separately
-                // until the ferrite DSL grows to own it too.
-                //
-                // `FERRITE_DISABLE=1` routes dense through the
-                // hand-written `LlamaForCausalLM` instead — a
-                // known-good reference against which the ferrite
-                // output can be diffed per-layer.
-                let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
-                // Ferrite handles dense bf16/fp16 and AWQ. bnb4bit /
-                // fp8 / gptq still take the hand-written path — their
-                // FieldLoad arms haven't landed yet. TP + PP also
-                // stay on the hand-written path (PP weight-load range
-                // support is pending).
-                if !qconfig.is_bnb4bit()
-                    && !qconfig.is_fp8()
-                    && (!qconfig.is_quantized() || qconfig.is_awq())
-                    && !use_tp
-                    && !use_pp
-                    && !disable_ferrite
-                {
-                    let stream = device.compute_stream;
-                    let ferrite_weights = ferrite_models::llama::Weights::load(
-                        &mut weights,
-                        stream,
-                        config.num_hidden_layers as u64,
-                        config.hidden_size as u64,
-                        config.intermediate_size as u64,
-                        config.num_attention_heads as u64,
-                        config.num_kv_heads as u64,
-                        config.head_dim as u64,
-                        config.vocab_size as u64,
-                        ferrite_quant_kind(&qconfig),
-                    )
-                    .map_err(|e| {
-                        ExecutorError::WorkerInit(format!("Llama ferrite-forward load: {e}"))
-                    })?;
-                    let rotary = unsafe {
-                        vllm_cuda::rotary::RotaryCache::new(
-                            config.head_dim,
-                            config.max_position_embeddings,
-                            config.rope_theta,
-                            config.llama3_rope_scaling.as_ref(),
-                            dtype,
-                            device,
-                        )
-                    }
-                    .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
-                    info!("CudaWorker: loaded Llama via ferrite-forward");
-                    CudaModel::LlamaFerrite(Box::new(LlamaFerriteModel {
-                        weights: ferrite_weights,
-                        rotary,
-                    }))
-                } else {
-                    // Legacy quant/TP/PP paths.
-                    let m = if qconfig.is_bnb4bit() {
-                        let bnb_cfg = match &qconfig {
-                            vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
-                            _ => unreachable!(),
-                        };
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_bnb4bit(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            bnb_cfg,
-                            device,
-                        )
-                    } else if qconfig.is_fp8() {
-                        let fp8_cfg = match &qconfig {
-                            vllm_cuda::quant::QuantConfig::Fp8(c) => c,
-                            _ => unreachable!(),
-                        };
-                        if fp8_cfg.weight_block_size.is_some() {
-                            if use_tp {
-                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block_tp(
+        } else {
+            None
+        };
+        let model = if let Some(m) = ferrite_loaded {
+            m
+        } else {
+            match arch.as_str() {
+                // Qwen3 dense — Llama math + per-head Q/K rmsnorm before
+                // RoPE (no QKV bias). Only bf16/fp16 ferrite-forward is
+                // supported; quant / TP / PP / FERRITE_DISABLE would
+                // silently drop the q_norm / k_norm tensors (the hand-
+                // written `LlamaForCausalLM` doesn't handle them) — hard
+                // error here until a dedicated path lands.
+                "Qwen3ForCausalLM" => {
+                    return Err(ExecutorError::WorkerInit(
+                        "Qwen3 dense: only bf16/fp16 ferrite-forward path is supported \
+                     (quant / TP / PP / FERRITE_DISABLE require the hand-written \
+                     model, which doesn't yet handle Qwen3's per-head q_norm/k_norm)"
+                            .into(),
+                    ));
+                }
+                "LlamaForCausalLM" | "MistralForCausalLM" | "Phi3ForCausalLM" => {
+                    let config = llama_config_from_hf(&hf_config)?;
+                    // ferrite-forward already handled dense + AWQ above.
+                    // This arm is the hand-written quant/TP/PP fallback.
+                    {
+                        let m = if qconfig.is_bnb4bit() {
+                            let bnb_cfg = match &qconfig {
+                                vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                                _ => unreachable!(),
+                            };
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_bnb4bit(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                bnb_cfg,
+                                device,
+                            )
+                        } else if qconfig.is_fp8() {
+                            let fp8_cfg = match &qconfig {
+                                vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                                _ => unreachable!(),
+                            };
+                            if fp8_cfg.weight_block_size.is_some() {
+                                if use_tp {
+                                    vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block_tp(
+                                        &mut weights,
+                                        &config,
+                                        dtype,
+                                        config.rms_norm_eps,
+                                        tp,
+                                        device,
+                                    )
+                                } else {
+                                    vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                                        &mut weights,
+                                        &config,
+                                        dtype,
+                                        config.rms_norm_eps,
+                                        device,
+                                    )
+                                }
+                            } else if use_tp {
+                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_tp(
                                     &mut weights,
                                     &config,
                                     dtype,
@@ -5430,7 +5155,7 @@ impl Worker for CudaWorker {
                                     device,
                                 )
                             } else {
-                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
                                     &mut weights,
                                     &config,
                                     dtype,
@@ -5438,148 +5163,96 @@ impl Worker for CudaWorker {
                                     device,
                                 )
                             }
-                        } else if use_tp {
-                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_tp(
+                        } else if qconfig.is_quantized() {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
                                 &mut weights,
                                 &config,
                                 dtype,
-                                config.rms_norm_eps,
+                                &qconfig,
+                                device,
+                            )
+                        } else if use_tp && use_pp {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_tp_pp(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                tp,
+                                pp_config.unwrap(),
+                                device,
+                            )
+                        } else if use_pp {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_pp(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                pp_config.unwrap(),
+                                device,
+                            )
+                        } else if use_tp {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_tp(
+                                &mut weights,
+                                &config,
+                                dtype,
                                 tp,
                                 device,
                             )
                         } else {
-                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
+                            vllm_cuda::model::llama::LlamaForCausalLM::load(
                                 &mut weights,
                                 &config,
                                 dtype,
-                                config.rms_norm_eps,
                                 device,
                             )
                         }
-                    } else if qconfig.is_quantized() {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            &qconfig,
-                            device,
-                        )
-                    } else if use_tp && use_pp {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_tp_pp(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            tp,
-                            pp_config.unwrap(),
-                            device,
-                        )
-                    } else if use_pp {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_pp(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            pp_config.unwrap(),
-                            device,
-                        )
-                    } else if use_tp {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_tp(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            tp,
-                            device,
-                        )
-                    } else {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            device,
-                        )
-                    }
-                    .map_err(|e| {
-                        ExecutorError::WorkerInit(format!("LlamaForCausalLM load: {e}"))
-                    })?;
-                    CudaModel::Llama(m)
-                } // close the else { legacy } block
-            }
-            "Qwen2ForCausalLM" | "Qwen2_5ForCausalLM" => {
-                let llama_config = llama_config_from_hf(&hf_config)?;
-                let qwen2_config =
-                    vllm_cuda::model::qwen2::Qwen2Config::from_llama_config(llama_config);
-                // Dense bf16 Qwen2 goes through ferrite-forward
-                // (same DSL body as Llama; the bias on Qwen2's QKV
-                // projections rides through the fused weight
-                // accessor). Quantized / TP / PP variants stay on
-                // the hand-written `Qwen2ForCausalLM` until their
-                // corresponding Impls land.
-                let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
-                let llama_cfg = &qwen2_config.0;
-                // Ferrite handles dense + AWQ; quant / TP / PP else.
-                // Qwen2's QKV bias rides through `MarlinLinear`'s
-                // optional bias field (added after the marlin GEMM
-                // via `bias_add_inplace`), same result as the dense
-                // cuBLAS-fused path.
-                if !qconfig.is_bnb4bit()
-                    && !qconfig.is_fp8()
-                    && (!qconfig.is_quantized() || qconfig.is_awq())
-                    && !use_tp
-                    && !use_pp
-                    && !disable_ferrite
-                {
-                    let stream = device.compute_stream;
-                    let ferrite_weights = ferrite_models::qwen2::Weights::load(
-                        &mut weights,
-                        stream,
-                        llama_cfg.num_hidden_layers as u64,
-                        llama_cfg.hidden_size as u64,
-                        llama_cfg.intermediate_size as u64,
-                        llama_cfg.num_attention_heads as u64,
-                        llama_cfg.num_kv_heads as u64,
-                        llama_cfg.head_dim as u64,
-                        llama_cfg.vocab_size as u64,
-                        ferrite_quant_kind(&qconfig),
-                    )
-                    .map_err(|e| {
-                        ExecutorError::WorkerInit(format!("Qwen2 ferrite-forward load: {e}"))
-                    })?;
-                    let rotary = unsafe {
-                        vllm_cuda::rotary::RotaryCache::new(
-                            llama_cfg.head_dim,
-                            llama_cfg.max_position_embeddings,
-                            llama_cfg.rope_theta,
-                            llama_cfg.llama3_rope_scaling.as_ref(),
-                            dtype,
-                            device,
-                        )
-                    }
-                    .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
-                    info!("CudaWorker: loaded Qwen2 via ferrite-forward");
-                    CudaModel::Qwen2Ferrite(Box::new(Qwen2FerriteModel {
-                        weights: ferrite_weights,
-                        rotary,
-                    }))
-                } else {
-                    let m = if qconfig.is_bnb4bit() {
-                        let bnb_cfg = match &qconfig {
-                            vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
-                            _ => unreachable!(),
-                        };
-                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_bnb4bit(
-                            &mut weights,
-                            &qwen2_config,
-                            dtype,
-                            bnb_cfg,
-                            device,
-                        )
-                    } else if qconfig.is_fp8() {
-                        let fp8_cfg = match &qconfig {
-                            vllm_cuda::quant::QuantConfig::Fp8(c) => c,
-                            _ => unreachable!(),
-                        };
-                        if fp8_cfg.weight_block_size.is_some() {
-                            if use_tp {
-                                vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_block_tp(
+                        .map_err(|e| {
+                            ExecutorError::WorkerInit(format!("LlamaForCausalLM load: {e}"))
+                        })?;
+                        CudaModel::Llama(m)
+                    } // close the else { legacy } block
+                }
+                "Qwen2ForCausalLM" | "Qwen2_5ForCausalLM" => {
+                    let llama_config = llama_config_from_hf(&hf_config)?;
+                    let qwen2_config =
+                        vllm_cuda::model::qwen2::Qwen2Config::from_llama_config(llama_config);
+                    // ferrite-forward already handled dense + AWQ above.
+                    // This arm is the hand-written quant/TP/PP fallback.
+                    {
+                        let m = if qconfig.is_bnb4bit() {
+                            let bnb_cfg = match &qconfig {
+                                vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                                _ => unreachable!(),
+                            };
+                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_bnb4bit(
+                                &mut weights,
+                                &qwen2_config,
+                                dtype,
+                                bnb_cfg,
+                                device,
+                            )
+                        } else if qconfig.is_fp8() {
+                            let fp8_cfg = match &qconfig {
+                                vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                                _ => unreachable!(),
+                            };
+                            if fp8_cfg.weight_block_size.is_some() {
+                                if use_tp {
+                                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_block_tp(
+                                        &mut weights,
+                                        &qwen2_config,
+                                        dtype,
+                                        tp,
+                                        device,
+                                    )
+                                } else {
+                                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8(
+                                        &mut weights,
+                                        &qwen2_config,
+                                        dtype,
+                                        device,
+                                    )
+                                }
+                            } else if use_tp {
+                                vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_tp(
                                     &mut weights,
                                     &qwen2_config,
                                     dtype,
@@ -5594,8 +5267,33 @@ impl Worker for CudaWorker {
                                     device,
                                 )
                             }
+                        } else if qconfig.is_quantized() {
+                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_quantized(
+                                &mut weights,
+                                &qwen2_config,
+                                dtype,
+                                &qconfig,
+                                device,
+                            )
+                        } else if use_tp && use_pp {
+                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp_pp(
+                                &mut weights,
+                                &qwen2_config,
+                                dtype,
+                                tp,
+                                pp_config.unwrap(),
+                                device,
+                            )
+                        } else if use_pp {
+                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_pp(
+                                &mut weights,
+                                &qwen2_config,
+                                dtype,
+                                pp_config.unwrap(),
+                                device,
+                            )
                         } else if use_tp {
-                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_tp(
+                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp(
                                 &mut weights,
                                 &qwen2_config,
                                 dtype,
@@ -5603,119 +5301,78 @@ impl Worker for CudaWorker {
                                 device,
                             )
                         } else {
-                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8(
+                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load(
                                 &mut weights,
                                 &qwen2_config,
                                 dtype,
                                 device,
                             )
                         }
-                    } else if qconfig.is_quantized() {
-                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_quantized(
-                            &mut weights,
-                            &qwen2_config,
-                            dtype,
-                            &qconfig,
-                            device,
-                        )
-                    } else if use_tp && use_pp {
-                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp_pp(
-                            &mut weights,
-                            &qwen2_config,
-                            dtype,
-                            tp,
-                            pp_config.unwrap(),
-                            device,
-                        )
-                    } else if use_pp {
-                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_pp(
-                            &mut weights,
-                            &qwen2_config,
-                            dtype,
-                            pp_config.unwrap(),
-                            device,
-                        )
-                    } else if use_tp {
-                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp(
-                            &mut weights,
-                            &qwen2_config,
-                            dtype,
-                            tp,
-                            device,
-                        )
-                    } else {
-                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load(
-                            &mut weights,
-                            &qwen2_config,
-                            dtype,
-                            device,
-                        )
-                    }
-                    .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 load: {e}")))?;
-                    CudaModel::Qwen2(m)
-                } // close else { legacy }
-            }
-            "Gemma2ForCausalLM" => {
-                let config = gemma2_config_from_hf(&hf_config)?;
-                // Ferrite-gate: dense-bf16 Gemma2 without quant / TP /
-                // PP routes through `#[forward]`-emitted code. Gate
-                // identical to Llama/Qwen2 above.
-                let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
-                if !qconfig.is_bnb4bit()
-                    && !qconfig.is_fp8()
-                    && !qconfig.is_quantized()
-                    && !use_tp
-                    && !use_pp
-                    && !disable_ferrite
-                {
-                    let stream = device.compute_stream;
-                    let ferrite_weights = ferrite_models::gemma2::Weights::load(
-                        &mut weights,
-                        stream,
-                        config.num_hidden_layers as u64,
-                        config.hidden_size as u64,
-                        config.intermediate_size as u64,
-                        config.num_attention_heads as u64,
-                        config.num_kv_heads as u64,
-                        config.head_dim as u64,
-                        config.vocab_size as u64,
-                        ferrite_quant_kind(&qconfig),
-                    )
-                    .map_err(|e| {
-                        ExecutorError::WorkerInit(format!("Gemma2 ferrite-forward load: {e}"))
-                    })?;
-                    let rotary = unsafe {
-                        vllm_cuda::rotary::RotaryCache::new(
-                            config.head_dim,
-                            config.max_position_embeddings,
-                            config.rope_theta,
-                            None, // Gemma2 uses plain RoPE
-                            dtype,
-                            device,
-                        )
-                    }
-                    .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
-                    info!("CudaWorker: loaded Gemma2 via ferrite-forward");
-                    CudaModel::Gemma2Ferrite(Box::new(Gemma2FerriteModel {
-                        weights: ferrite_weights,
-                        rotary,
-                    }))
-                } else {
-                    let m = if qconfig.is_bnb4bit() {
-                        let bnb_cfg = match &qconfig {
-                            vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
-                            _ => unreachable!(),
-                        };
-                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_bnb4bit(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            bnb_cfg,
-                            device,
-                        )
-                    } else if qconfig.is_fp8() {
-                        if use_tp {
-                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8_tp(
+                        .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 load: {e}")))?;
+                        CudaModel::Qwen2(m)
+                    } // close else { legacy }
+                }
+                "Gemma2ForCausalLM" => {
+                    let config = gemma2_config_from_hf(&hf_config)?;
+                    // ferrite-forward already handled dense above.
+                    // This arm is the hand-written quant/TP/PP fallback.
+                    {
+                        let m = if qconfig.is_bnb4bit() {
+                            let bnb_cfg = match &qconfig {
+                                vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                                _ => unreachable!(),
+                            };
+                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_bnb4bit(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                bnb_cfg,
+                                device,
+                            )
+                        } else if qconfig.is_fp8() {
+                            if use_tp {
+                                vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8_tp(
+                                    &mut weights,
+                                    &config,
+                                    dtype,
+                                    tp,
+                                    device,
+                                )
+                            } else {
+                                vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8(
+                                    &mut weights,
+                                    &config,
+                                    dtype,
+                                    device,
+                                )
+                            }
+                        } else if qconfig.is_quantized() {
+                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_quantized(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                &qconfig,
+                                device,
+                            )
+                        } else if use_tp && use_pp {
+                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp_pp(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                tp,
+                                pp_config.unwrap(),
+                                device,
+                            )
+                        } else if use_pp {
+                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_pp(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                pp_config.unwrap(),
+                                device,
+                            )
+                        } else if use_tp {
+                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp(
                                 &mut weights,
                                 &config,
                                 dtype,
@@ -5723,185 +5380,120 @@ impl Worker for CudaWorker {
                                 device,
                             )
                         } else {
-                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8(
+                            vllm_cuda::model::gemma2::Gemma2ForCausalLM::load(
                                 &mut weights,
                                 &config,
                                 dtype,
                                 device,
                             )
                         }
-                    } else if qconfig.is_quantized() {
-                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_quantized(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            &qconfig,
-                            device,
-                        )
-                    } else if use_tp && use_pp {
-                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp_pp(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            tp,
-                            pp_config.unwrap(),
-                            device,
-                        )
-                    } else if use_pp {
-                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_pp(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            pp_config.unwrap(),
-                            device,
-                        )
-                    } else if use_tp {
-                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            tp,
-                            device,
-                        )
-                    } else {
-                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load(
-                            &mut weights,
-                            &config,
-                            dtype,
-                            device,
-                        )
-                    }
-                    .map_err(|e| ExecutorError::WorkerInit(format!("Gemma2 load: {e}")))?;
-                    CudaModel::Gemma2(m)
-                } // close else { legacy }
-            }
-            "Gemma3ForCausalLM" | "Gemma3ForConditionalGeneration" => {
-                // For Gemma3ForConditionalGeneration (multimodal), resolve the
-                // nested text_config so we get the text backbone parameters.
-                let effective_hf = if arch == "Gemma3ForConditionalGeneration" {
-                    if let Some(tc) = hf_config.extra.get("text_config") {
-                        serde_json::from_value::<HfModelConfig>(tc.clone()).map_err(|e| {
-                            ExecutorError::WorkerInit(format!(
-                                "failed to parse Gemma3 text_config: {e}"
-                            ))
-                        })?
+                        .map_err(|e| ExecutorError::WorkerInit(format!("Gemma2 load: {e}")))?;
+                        CudaModel::Gemma2(m)
+                    } // close else { legacy }
+                }
+                "Gemma3ForCausalLM" | "Gemma3ForConditionalGeneration" => {
+                    // For Gemma3ForConditionalGeneration (multimodal), resolve the
+                    // nested text_config so we get the text backbone parameters.
+                    let effective_hf = if arch == "Gemma3ForConditionalGeneration" {
+                        if let Some(tc) = hf_config.extra.get("text_config") {
+                            serde_json::from_value::<HfModelConfig>(tc.clone()).map_err(|e| {
+                                ExecutorError::WorkerInit(format!(
+                                    "failed to parse Gemma3 text_config: {e}"
+                                ))
+                            })?
+                        } else {
+                            hf_config.clone()
+                        }
                     } else {
                         hf_config.clone()
+                    };
+                    let config = gemma3_config_from_hf(&effective_hf)?;
+                    // Multimodal model: strip "language_model." prefix from weights.
+                    if arch == "Gemma3ForConditionalGeneration" {
+                        weights.strip_prefix("language_model.");
                     }
-                } else {
-                    hf_config.clone()
-                };
-                let config = gemma3_config_from_hf(&effective_hf)?;
-                // Multimodal model: strip "language_model." prefix from weights.
-                if arch == "Gemma3ForConditionalGeneration" {
-                    weights.strip_prefix("language_model.");
-                }
-                let m = if use_tp && use_pp {
-                    vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_tp_pp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        tp,
-                        pp_config.unwrap(),
-                        device,
-                    )
-                } else if use_pp {
-                    vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_pp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        pp_config.unwrap(),
-                        device,
-                    )
-                } else if use_tp {
-                    vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_tp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        tp,
-                        device,
-                    )
-                } else {
-                    vllm_cuda::model::gemma3::Gemma3ForCausalLM::load(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerInit(format!("Gemma3 load: {e}")))?;
-                CudaModel::Gemma3(m)
-            }
-            "GraniteForCausalLM" => {
-                let config = llama_config_from_hf(&hf_config)?;
-                // Ferrite-gate: dense-bf16 Granite without quant / TP /
-                // PP routes through `#[forward]`-emitted code. The
-                // three scalar multipliers (embedding/residual/logits)
-                // are read from config via the DSL's `scalar(...)` /
-                // `recip_scalar(...)`; `attention_multiplier` is picked
-                // up by the attention impls via `attention_scale_for`.
-                // No runtime state plumbing beyond the rotary cache.
-                let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
-                if !qconfig.is_bnb4bit()
-                    && !qconfig.is_fp8()
-                    && !qconfig.is_quantized()
-                    && !use_tp
-                    && !use_pp
-                    && !disable_ferrite
-                {
-                    let stream = device.compute_stream;
-                    let ferrite_weights = ferrite_models::granite::Weights::load(
-                        &mut weights,
-                        stream,
-                        config.num_hidden_layers as u64,
-                        config.hidden_size as u64,
-                        config.intermediate_size as u64,
-                        config.num_attention_heads as u64,
-                        config.num_kv_heads as u64,
-                        config.head_dim as u64,
-                        config.vocab_size as u64,
-                        ferrite_quant_kind(&qconfig),
-                    )
-                    .map_err(|e| {
-                        ExecutorError::WorkerInit(format!("Granite ferrite-forward load: {e}"))
-                    })?;
-                    let rotary = unsafe {
-                        vllm_cuda::rotary::RotaryCache::new(
-                            config.head_dim,
-                            config.max_position_embeddings,
-                            config.rope_theta,
-                            config.llama3_rope_scaling.as_ref(),
-                            dtype,
-                            device,
-                        )
-                    }
-                    .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
-                    info!("CudaWorker: loaded Granite via ferrite-forward");
-                    CudaModel::GraniteFerrite(Box::new(GraniteFerriteModel {
-                        weights: ferrite_weights,
-                        rotary,
-                    }))
-                } else {
-                    let mut m = if qconfig.is_bnb4bit() {
-                        let bnb_cfg = match &qconfig {
-                            vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
-                            _ => unreachable!(),
-                        };
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_bnb4bit(
+                    let m = if use_tp && use_pp {
+                        vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_tp_pp(
                             &mut weights,
                             &config,
                             dtype,
-                            bnb_cfg,
+                            tp,
+                            pp_config.unwrap(),
                             device,
                         )
-                    } else if qconfig.is_fp8() {
-                        let fp8_cfg = match &qconfig {
-                            vllm_cuda::quant::QuantConfig::Fp8(c) => c,
-                            _ => unreachable!(),
-                        };
-                        if fp8_cfg.weight_block_size.is_some() {
-                            if use_tp {
-                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block_tp(
+                    } else if use_pp {
+                        vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_pp(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            pp_config.unwrap(),
+                            device,
+                        )
+                    } else if use_tp {
+                        vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_tp(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            tp,
+                            device,
+                        )
+                    } else {
+                        vllm_cuda::model::gemma3::Gemma3ForCausalLM::load(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerInit(format!("Gemma3 load: {e}")))?;
+                    CudaModel::Gemma3(m)
+                }
+                "GraniteForCausalLM" => {
+                    let config = llama_config_from_hf(&hf_config)?;
+                    // ferrite-forward already handled dense above. This
+                    // arm is the hand-written quant/TP/PP fallback;
+                    // Granite's scalar multipliers (embedding/residual/
+                    // logits) are applied post-load to the inner Llama
+                    // weights.
+                    {
+                        let mut m = if qconfig.is_bnb4bit() {
+                            let bnb_cfg = match &qconfig {
+                                vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                                _ => unreachable!(),
+                            };
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_bnb4bit(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                bnb_cfg,
+                                device,
+                            )
+                        } else if qconfig.is_fp8() {
+                            let fp8_cfg = match &qconfig {
+                                vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                                _ => unreachable!(),
+                            };
+                            if fp8_cfg.weight_block_size.is_some() {
+                                if use_tp {
+                                    vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block_tp(
+                                        &mut weights,
+                                        &config,
+                                        dtype,
+                                        config.rms_norm_eps,
+                                        tp,
+                                        device,
+                                    )
+                                } else {
+                                    vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                                        &mut weights,
+                                        &config,
+                                        dtype,
+                                        config.rms_norm_eps,
+                                        device,
+                                    )
+                                }
+                            } else if use_tp {
+                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_tp(
                                     &mut weights,
                                     &config,
                                     dtype,
@@ -5910,7 +5502,7 @@ impl Worker for CudaWorker {
                                     device,
                                 )
                             } else {
-                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                                vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
                                     &mut weights,
                                     &config,
                                     dtype,
@@ -5918,34 +5510,92 @@ impl Worker for CudaWorker {
                                     device,
                                 )
                             }
-                        } else if use_tp {
-                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_tp(
+                        } else if qconfig.is_quantized() {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
                                 &mut weights,
                                 &config,
                                 dtype,
-                                config.rms_norm_eps,
+                                &qconfig,
+                                device,
+                            )
+                        } else if use_tp {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_tp(
+                                &mut weights,
+                                &config,
+                                dtype,
                                 tp,
                                 device,
                             )
                         } else {
-                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
+                            vllm_cuda::model::llama::LlamaForCausalLM::load(
                                 &mut weights,
                                 &config,
                                 dtype,
-                                config.rms_norm_eps,
                                 device,
                             )
                         }
-                    } else if qconfig.is_quantized() {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
+                        .map_err(|e| {
+                            ExecutorError::WorkerInit(format!("GraniteForCausalLM load: {e}"))
+                        })?;
+
+                        // Parse Granite-specific multipliers from config.json extras.
+                        let extra = &hf_config.extra;
+                        let embedding_multiplier = extra
+                            .get("embedding_multiplier")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1.0)
+                            as f32;
+                        let residual_multiplier = extra
+                            .get("residual_multiplier")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1.0)
+                            as f32;
+                        let logits_scaling = extra
+                            .get("logits_scaling")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1.0) as f32;
+                        let attention_multiplier = extra
+                            .get("attention_multiplier")
+                            .and_then(|v| v.as_f64())
+                            .map(|v| v as f32)
+                            .unwrap_or(1.0 / (config.head_dim as f32).sqrt());
+
+                        // Apply multipliers.
+                        m.model.embedding_multiplier = embedding_multiplier;
+                        m.logits_scaling = logits_scaling;
+                        for layer in &mut m.model.layers {
+                            layer.residual_multiplier = residual_multiplier;
+                            layer.self_attn.scale = attention_multiplier;
+                        }
+
+                        info!(
+                            "Granite multipliers: embedding={embedding_multiplier}, \
+                     residual={residual_multiplier}, attention={attention_multiplier}, \
+                     logits_scaling={logits_scaling}"
+                        );
+                        CudaModel::Llama(m)
+                    } // close else { legacy }
+                }
+                "MixtralForCausalLM" => {
+                    let config = mixtral_config_from_hf(&hf_config)?;
+                    let m = if qconfig.is_quantized() && !qconfig.is_fp8() && !qconfig.is_bnb4bit()
+                    {
+                        vllm_cuda::model::mixtral::MixtralForCausalLM::load_quantized(
                             &mut weights,
                             &config,
                             dtype,
                             &qconfig,
                             device,
                         )
+                    } else if qconfig.is_fp8() {
+                        vllm_cuda::model::mixtral::MixtralForCausalLM::load_fp8(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
                     } else if use_tp {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_tp(
+                        vllm_cuda::model::mixtral::MixtralForCausalLM::load_tp(
                             &mut weights,
                             &config,
                             dtype,
@@ -5953,262 +5603,192 @@ impl Worker for CudaWorker {
                             device,
                         )
                     } else {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load(
+                        vllm_cuda::model::mixtral::MixtralForCausalLM::load(
                             &mut weights,
                             &config,
                             dtype,
                             device,
                         )
                     }
-                    .map_err(|e| {
-                        ExecutorError::WorkerInit(format!("GraniteForCausalLM load: {e}"))
-                    })?;
-
-                    // Parse Granite-specific multipliers from config.json extras.
-                    let extra = &hf_config.extra;
-                    let embedding_multiplier = extra
-                        .get("embedding_multiplier")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.0) as f32;
-                    let residual_multiplier = extra
-                        .get("residual_multiplier")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.0) as f32;
-                    let logits_scaling = extra
-                        .get("logits_scaling")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.0) as f32;
-                    let attention_multiplier = extra
-                        .get("attention_multiplier")
-                        .and_then(|v| v.as_f64())
-                        .map(|v| v as f32)
-                        .unwrap_or(1.0 / (config.head_dim as f32).sqrt());
-
-                    // Apply multipliers.
-                    m.model.embedding_multiplier = embedding_multiplier;
-                    m.logits_scaling = logits_scaling;
-                    for layer in &mut m.model.layers {
-                        layer.residual_multiplier = residual_multiplier;
-                        layer.self_attn.scale = attention_multiplier;
-                    }
-
-                    info!(
-                        "Granite multipliers: embedding={embedding_multiplier}, \
-                     residual={residual_multiplier}, attention={attention_multiplier}, \
-                     logits_scaling={logits_scaling}"
-                    );
-                    CudaModel::Llama(m)
-                } // close else { legacy }
-            }
-            "MixtralForCausalLM" => {
-                let config = mixtral_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_quantized() && !qconfig.is_fp8() && !qconfig.is_bnb4bit() {
-                    vllm_cuda::model::mixtral::MixtralForCausalLM::load_quantized(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        &qconfig,
-                        device,
-                    )
-                } else if qconfig.is_fp8() {
-                    vllm_cuda::model::mixtral::MixtralForCausalLM::load_fp8(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
-                } else if use_tp {
-                    vllm_cuda::model::mixtral::MixtralForCausalLM::load_tp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        tp,
-                        device,
-                    )
-                } else {
-                    vllm_cuda::model::mixtral::MixtralForCausalLM::load(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
+                    .map_err(|e| ExecutorError::WorkerInit(format!("Mixtral load: {e}")))?;
+                    CudaModel::Mixtral(m)
                 }
-                .map_err(|e| ExecutorError::WorkerInit(format!("Mixtral load: {e}")))?;
-                CudaModel::Mixtral(m)
-            }
-            "Qwen2MoeForCausalLM" => {
-                let config = qwen2_moe_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_quantized() && !qconfig.is_fp8() && !qconfig.is_bnb4bit() {
-                    vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_quantized(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        &qconfig,
-                        device,
-                    )
-                } else if qconfig.is_fp8() {
-                    vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_fp8(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
-                } else if use_tp {
-                    vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_tp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        tp,
-                        device,
-                    )
-                } else {
-                    vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2MoE load: {e}")))?;
-                CudaModel::Qwen2Moe(m)
-            }
-            "Qwen3MoeForCausalLM" => {
-                let config = qwen2_moe_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_quantized() && !qconfig.is_fp8() && !qconfig.is_bnb4bit() {
-                    vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_quantized(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        &qconfig,
-                        device,
-                    )
-                } else if qconfig.is_fp8() {
-                    let fp8_cfg = match &qconfig {
-                        vllm_cuda::quant::QuantConfig::Fp8(c) => c,
-                        _ => unreachable!(),
-                    };
-                    if fp8_cfg.weight_block_size.is_some() {
-                        let tp_opt = if use_tp { Some(tp) } else { None };
-                        vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8_block(
+                "Qwen2MoeForCausalLM" => {
+                    let config = qwen2_moe_config_from_hf(&hf_config)?;
+                    let m = if qconfig.is_quantized() && !qconfig.is_fp8() && !qconfig.is_bnb4bit()
+                    {
+                        vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_quantized(
                             &mut weights,
                             &config,
                             dtype,
-                            tp_opt,
+                            &qconfig,
+                            device,
+                        )
+                    } else if qconfig.is_fp8() {
+                        vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_fp8(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
+                    } else if use_tp {
+                        vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_tp(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            tp,
                             device,
                         )
                     } else {
-                        vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8(
+                        vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load(
                             &mut weights,
                             &config,
                             dtype,
                             device,
                         )
                     }
-                } else if use_tp {
-                    vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_tp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        tp,
-                        device,
-                    )
-                } else {
-                    vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
+                    .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2MoE load: {e}")))?;
+                    CudaModel::Qwen2Moe(m)
                 }
-                .map_err(|e| ExecutorError::WorkerInit(format!("Qwen3MoE load: {e}")))?;
-                CudaModel::Qwen3Moe(m)
-            }
-            "Qwen3NextForCausalLM" => {
-                let config = qwen3_next_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::qwen3_next::Qwen3NextForCausalLM::load(
-                    &mut weights,
-                    &config,
-                    dtype,
-                    device,
-                )
-                .map_err(|e| ExecutorError::WorkerInit(format!("Qwen3Next load: {e}")))?;
-                self.qwen3_next_config = Some(config);
-                CudaModel::Qwen3Next(m)
-            }
-            "DeepseekV2ForCausalLM" | "DeepSeekV3ForCausalLM" => {
-                let config = deepseek_v2_config_from_hf(&hf_config)?;
-                let m = if use_tp {
-                    vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM::load_tp(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        tp,
-                        device,
-                    )
-                } else {
-                    vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM::load(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
+                "Qwen3MoeForCausalLM" => {
+                    let config = qwen2_moe_config_from_hf(&hf_config)?;
+                    let m = if qconfig.is_quantized() && !qconfig.is_fp8() && !qconfig.is_bnb4bit()
+                    {
+                        vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_quantized(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            &qconfig,
+                            device,
+                        )
+                    } else if qconfig.is_fp8() {
+                        let fp8_cfg = match &qconfig {
+                            vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                            _ => unreachable!(),
+                        };
+                        if fp8_cfg.weight_block_size.is_some() {
+                            let tp_opt = if use_tp { Some(tp) } else { None };
+                            vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8_block(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                tp_opt,
+                                device,
+                            )
+                        } else {
+                            vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                device,
+                            )
+                        }
+                    } else if use_tp {
+                        vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_tp(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            tp,
+                            device,
+                        )
+                    } else {
+                        vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerInit(format!("Qwen3MoE load: {e}")))?;
+                    CudaModel::Qwen3Moe(m)
                 }
-                .map_err(|e| ExecutorError::WorkerInit(format!("DeepSeekV2 load: {e}")))?;
-                CudaModel::DeepSeekV2(m)
-            }
-            "CohereForCausalLM" => {
-                let config = commandr_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_bnb4bit() {
-                    let bnb_cfg = match &qconfig {
-                        vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
-                        _ => unreachable!(),
-                    };
-                    vllm_cuda::model::commandr::CommandRForCausalLM::load_bnb4bit(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        bnb_cfg,
-                        device,
-                    )
-                } else if qconfig.is_fp8() {
-                    vllm_cuda::model::commandr::CommandRForCausalLM::load_fp8(
+                "Qwen3NextForCausalLM" => {
+                    let config = qwen3_next_config_from_hf(&hf_config)?;
+                    let m = vllm_cuda::model::qwen3_next::Qwen3NextForCausalLM::load(
                         &mut weights,
                         &config,
                         dtype,
                         device,
                     )
-                } else {
-                    vllm_cuda::model::commandr::CommandRForCausalLM::load(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
+                    .map_err(|e| ExecutorError::WorkerInit(format!("Qwen3Next load: {e}")))?;
+                    self.qwen3_next_config = Some(config);
+                    CudaModel::Qwen3Next(m)
                 }
-                .map_err(|e| ExecutorError::WorkerInit(format!("CommandR load: {e}")))?;
-                CudaModel::CommandR(m)
-            }
-            "ModernBertModel" | "ModernBertForMaskedLM" => {
-                let config = modernbert_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::modernbert::ModernBertModel::load(
-                    &mut weights,
-                    &config,
-                    dtype,
-                    device,
-                )
-                .map_err(|e| ExecutorError::WorkerInit(format!("ModernBert load: {e}")))?;
-                CudaModel::ModernBert(m)
-            }
-            _ => {
-                return Err(ExecutorError::WorkerInit(format!(
-                    "unsupported architecture for cuda-backend: {arch}. \
+                "DeepseekV2ForCausalLM" | "DeepSeekV3ForCausalLM" => {
+                    let config = deepseek_v2_config_from_hf(&hf_config)?;
+                    let m = if use_tp {
+                        vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM::load_tp(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            tp,
+                            device,
+                        )
+                    } else {
+                        vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM::load(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerInit(format!("DeepSeekV2 load: {e}")))?;
+                    CudaModel::DeepSeekV2(m)
+                }
+                "CohereForCausalLM" => {
+                    let config = commandr_config_from_hf(&hf_config)?;
+                    let m = if qconfig.is_bnb4bit() {
+                        let bnb_cfg = match &qconfig {
+                            vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                            _ => unreachable!(),
+                        };
+                        vllm_cuda::model::commandr::CommandRForCausalLM::load_bnb4bit(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            bnb_cfg,
+                            device,
+                        )
+                    } else if qconfig.is_fp8() {
+                        vllm_cuda::model::commandr::CommandRForCausalLM::load_fp8(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
+                    } else {
+                        vllm_cuda::model::commandr::CommandRForCausalLM::load(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerInit(format!("CommandR load: {e}")))?;
+                    CudaModel::CommandR(m)
+                }
+                "ModernBertModel" | "ModernBertForMaskedLM" => {
+                    let config = modernbert_config_from_hf(&hf_config)?;
+                    let m = vllm_cuda::model::modernbert::ModernBertModel::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                    .map_err(|e| ExecutorError::WorkerInit(format!("ModernBert load: {e}")))?;
+                    CudaModel::ModernBert(m)
+                }
+                _ => {
+                    return Err(ExecutorError::WorkerInit(format!(
+                        "unsupported architecture for cuda-backend: {arch}. \
                      Supported: LlamaForCausalLM, MistralForCausalLM, Qwen3ForCausalLM, \
                      Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM, \
                      Gemma3ForConditionalGeneration, GraniteForCausalLM, MixtralForCausalLM, \
                      Qwen2MoeForCausalLM, Qwen3MoeForCausalLM, CohereForCausalLM, \
                      Qwen3NextForCausalLM, DeepseekV2ForCausalLM, DeepSeekV3ForCausalLM, \
                      ModernBertModel"
-                )));
+                    )));
+                }
             }
         };
 

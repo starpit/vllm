@@ -22,6 +22,7 @@ ferrite-forward-macro = { path = "../ferrite-forward-macro" }
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 anyhow = { workspace = true }
+inventory = { workspace = true }
 # Optional deps used only by the `probe-weights` bin under the
 # `probe` feature. `ureq` is a blocking HTTP client we use for
 # Range-request header-only reads of safetensors (avoiding the

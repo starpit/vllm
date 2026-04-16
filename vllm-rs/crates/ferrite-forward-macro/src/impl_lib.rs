@@ -5585,6 +5585,7 @@ mod tests {
             scalars,
             quantization: None,
             tie_word_embeddings: false,
+            architectures: Vec::new(),
         };
 
         let scale = attention_scale_for(&model);

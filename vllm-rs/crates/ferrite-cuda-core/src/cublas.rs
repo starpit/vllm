@@ -530,8 +530,8 @@ impl CublasHandle {
         );
         check(status).unwrap_or_else(|_| {
             panic!(
-                "cublasGemmEx failed for GEMM [M={}, K={}, N={}] {:?}",
-                k.m, k.k, k.n, k.dtype,
+                "cublasGemmEx failed for GEMM [M={}, K={}, N={}] {:?} status={} trans={}",
+                k.m, k.k, k.n, k.dtype, status as u32, k.weight_trans,
             )
         });
     }

@@ -25,18 +25,20 @@
 - **End-state proof**: `timeout 60 vllm chat --model=<small-llama>`
   produces coherent output through the new compiler at perf parity
   with the existing path. Correctness is **proven** for SmolLM-135M,
-  Qwen2.5-0.5B, and Gemma2-2B (`test_cuda_correctness_smollm_135m`,
-  `test_cuda_correctness_qwen2_0_5b`, `test_cuda_correctness_gemma2_2b`
-  — all three pass via the `*Ferrite` paths, run via
-  `cargo test -p vllm-e2e --features e2e,cuda --release --test
-  e_correctness -- --ignored --test-threads=1`). Perf: cutlass tile
-  zoo + CSV-driven selection landed in commit `b43bb85b9`.
+  Qwen2.5-0.5B, Gemma2-2B, and Granite-3.3-2B
+  (`test_cuda_correctness_smollm_135m`,
+  `test_cuda_correctness_qwen2_0_5b`, `test_cuda_correctness_gemma2_2b`,
+  `test_cuda_correctness_granite_3_3_2b` — all four pass via the
+  `*Ferrite` paths, run via `cargo test -p vllm-e2e --features
+  e2e,cuda --release --test e_correctness -- --ignored
+  --test-threads=1`). Perf: cutlass tile zoo + CSV-driven selection
+  landed in commit `b43bb85b9`.
 - **Method**: port the working old ferrite verbatim, detoxifying
   as you port. Do not rewrite mechanisms that already work.
 - **Current state, honest version**: scaffolding AND correctness
-  both green. Dense-bf16 Llama, Qwen2, and Gemma2 all route through
-  ferrite via `CudaModel::{Llama,Qwen2,Gemma2}Ferrite` in
-  `cuda_worker.rs`. Decode attention uses the
+  both green. Dense-bf16 Llama, Qwen2, Gemma2, and Granite all route
+  through ferrite via `CudaModel::{Llama,Qwen2,Gemma2,Granite}Ferrite`
+  in `cuda_worker.rs`. Decode attention uses the
   `attention_decode_from_cache` wrapper (so span rotation + fp8 KV
   light up automatically); fused-QKV emit has a runtime
   `is_fp8()` branch. Backbone-only forward is emitted alongside
@@ -600,7 +602,16 @@ ferrite-models          DSL bodies: llama.rs (`#[forward] fn llama`)
 
 ## Commit history — `git log --oneline` on the worktree branch
 
-Most recent session (Gemma2 prompt-7 root-caused: missing BOS in
+Most recent session (Granite port end-to-end: `scalar(<name>)` /
+`recip_scalar(<name>)` DSL, `attention_multiplier` override,
+Granite DSL body + 3 configs, GraniteFerrite cuda_worker wiring,
+granite_3_3_2b golden):
+
+```
+2adc521a5  ferrite-forward: Granite end-to-end via scalar() / recip_scalar() DSL
+```
+
+Prior session (Gemma2 prompt-7 root-caused: missing BOS in
 /v1/completions tokenization, not the suspected per-layer kernel
 drift):
 
@@ -642,10 +653,13 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
-**Three correctness goldens green via ferrite-forward.** Dense-bf16
-Llama (SmolLM2-135M), Qwen2 (Qwen2.5-0.5B), and Gemma2 (Gemma2-2B)
-all pass `test_cuda_correctness_*` through their `*Ferrite` variants
-(verified by `loaded ... via ferrite-forward` log lines on each).
+**Four correctness goldens green via ferrite-forward.** Dense-bf16
+Llama (SmolLM2-135M), Qwen2 (Qwen2.5-0.5B), Gemma2 (Gemma2-2B), and
+Granite (Granite-3.3-2B) all pass `test_cuda_correctness_*` through
+their `*Ferrite` variants (verified by `loaded ... via ferrite-forward`
+log lines on each; for Granite, also confirmed by diffing against
+`FERRITE_DISABLE=1` — both paths produce identical output down to
+the same tolerated prompt-1 position-2 top-N divergence).
 
 **Prompt-7 root cause was NOT in the kernels.** The prior session's
 "shared CUDA kernel drift" theory was wrong. Per-layer hidden-state
@@ -821,33 +835,25 @@ tackle in roughly this order.
    `is_quantized()`.
 3. **QK-norm** (Qwen3, Gemma3) — `qk_norm_inplace` +
    `rotary_embedding_q_only` path. Needs a `FusedQkvQkNormRopeImpl`.
-4. **Granite multipliers** — `embedding_multiplier`,
-   `residual_multiplier`, `logits_scaling`. The DSL now expresses
-   scalar multiply via `<tile> * <scalar>` (landed with Gemma2's
-   embed scale — see `ScalarMulImpl` + gap #7 above). For Granite
-   specifically: the three multipliers are config-driven
-   constants; add them to the model's JSON as scalars, read via
-   `Expr::ScalarLit` + possibly a new `Expr::BoundScalar(Ident)`
-   analogous to `SqrtBound` for `config_value * something`.
-5. **Gemma3** — another alternating-attention architecture, but
+4. **Gemma3** — another alternating-attention architecture, but
    with a 5:1 local/global ratio. Should reuse the DSL
    `if layer % sliding_window_pattern == 0 { ... }` construct
    now that it exists. Gemma3 also needs QK-norm (see gap #3)
    and different RoPE scaling. Diff should hit only
    `ferrite-models/src/gemma3.rs` + `model_architectures/gemma3/*.json`
    + any net-new kernels — NOT the compiler.
-6. **MoE (Mixtral, Qwen2-MoE)** — needs a DSL construct for
+5. **MoE (Mixtral, Qwen2-MoE)** — needs a DSL construct for
    `for each of top-k experts run sub-body`. Generic language
    extension, not an MoE-specific branch.
-7. **MLA (DeepSeek-V2)** — new `attention_mla` op + kernel +
+6. **MLA (DeepSeek-V2)** — new `attention_mla` op + kernel +
    Shape signature; compiler stays out of MLA.
-8. **PP weight-load plumbing** — ferrite's backbone forward is
+7. **PP weight-load plumbing** — ferrite's backbone forward is
    in place, but `cuda_worker.rs` still refuses to load
    `ferrite_models::<arch>::Weights` when `use_pp` (dense Weights
    type doesn't know about layer ranges). Extend `Weights::load`
    to accept a layer range so PP intermediate ranks can only
    materialise their owned layers.
-9. **Chat-completion double-BOS fix** — `crates/vllm-serve/src/engine.rs:2857`
+8. **Chat-completion double-BOS fix** — `crates/vllm-serve/src/engine.rs:2857`
    does `tok.encode(&text, true)` after rendering a chat template
    that already emits `<bos>` / `<|begin_of_text|>` literally.
    Flip to `false`. Pre-existing bug, surfaced while diagnosing
@@ -930,6 +936,32 @@ tackle in roughly this order.
   seven match arms and model-selector ferrite-gate. Dense-bf16
   Gemma2 now routes through ferrite; quant / TP / PP keep the
   hand-written path.
+- DSL `scalar(<name>)` / `recip_scalar(<name>)` folds at CFG-build
+  to `ScalarLit` using `ModelParams.scalars` (non-integer config.json
+  fields). `recip` form returns `1.0 / value`. Parallels `SqrtBound`
+  but reads the scalars map instead of bounds. Used by Granite for
+  embedding / residual / logits multipliers.
+- `attention_scale_for()` prong: if the model config has
+  `attention_multiplier`, use it as the direct softmax scale (no
+  transform). Priority: Granite's `attention_multiplier` →
+  Gemma2's `query_pre_attn_scalar.powf(-0.5)` → fallback
+  `1/sqrt(head_dim)`. Llama/Qwen2/Gemma2 behavior unchanged (none
+  carry `attention_multiplier`).
+- Granite DSL body (`ferrite-models/src/granite.rs`) and configs
+  (`model_architectures/granite/granite-3.{1-2b,1-8b,3-2b}-instruct.json`).
+  Llama math + embed×embedding_multiplier, oproj/down×residual_multiplier
+  before each residual add, logits×recip_scalar(logits_scaling).
+  All three compile to 685 tiles / 365 waves; configs verified
+  against upstream HF `config.json` verbatim.
+- `CudaModel::GraniteFerrite` variant in `cuda_worker.rs` with
+  seven match arms. Model-selector ferrite-gate on the existing
+  `GraniteForCausalLM` arm — quant / TP / PP keep the hand-written
+  Granite (which still sits inside the `LlamaForCausalLM` branch
+  with post-load multiplier assignment).
+- `test_cuda_correctness_granite_3_3_2b` + `granite_3_3_2b.json`
+  golden. Ferrite and `FERRITE_DISABLE=1` paths produce identical
+  output down to the same tolerated prompt-1 position-2 top-N
+  divergence.
 
 ## Last note
 

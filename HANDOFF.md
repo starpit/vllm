@@ -24,24 +24,25 @@
   (both now deleted; see commit `5b9fd90ef`).
 - **End-state proof**: `timeout 60 vllm chat --model=<small-llama>`
   produces coherent output through the new compiler at perf parity
-  with the existing path. Correctness is **proven** for SmolLM-135M
-  and Qwen2.5-0.5B (`test_cuda_correctness_smollm_135m`,
-  `test_cuda_correctness_qwen2_0_5b` — both ignored tests, run via
+  with the existing path. Correctness is **proven** for SmolLM-135M,
+  Qwen2.5-0.5B, and Gemma2-2B (`test_cuda_correctness_smollm_135m`,
+  `test_cuda_correctness_qwen2_0_5b`, `test_cuda_correctness_gemma2_2b`
+  — all three pass via the `*Ferrite` paths, run via
   `cargo test -p vllm-e2e --features e2e,cuda --release --test
   e_correctness -- --ignored --test-threads=1`). Perf: cutlass tile
   zoo + CSV-driven selection landed in commit `b43bb85b9`.
 - **Method**: port the working old ferrite verbatim, detoxifying
   as you port. Do not rewrite mechanisms that already work.
 - **Current state, honest version**: scaffolding AND correctness
-  both green. Dense-bf16 Llama and Qwen2 both route through
-  ferrite via `CudaModel::LlamaFerrite` / `CudaModel::Qwen2Ferrite`
-  in `cuda_worker.rs`. Decode attention uses the
+  both green. Dense-bf16 Llama, Qwen2, and Gemma2 all route through
+  ferrite via `CudaModel::{Llama,Qwen2,Gemma2}Ferrite` in
+  `cuda_worker.rs`. Decode attention uses the
   `attention_decode_from_cache` wrapper (so span rotation + fp8 KV
   light up automatically); fused-QKV emit has a runtime
   `is_fp8()` branch. Backbone-only forward is emitted alongside
   the full forward for PP intermediate ranks. Quant / TP / PP /
-  MoE / MLA / Gemma2 models still route to the hand-written path
-  for the reasons enumerated in the "Remaining gaps" section.
+  MoE / MLA models still route to the hand-written path for the
+  reasons enumerated in the "Remaining gaps" section.
   The **library is still a tiny fraction of the old one**: 9
   Impls vs. the old library's ~1,400 kernel variants. Cost model
   is analytical estimates vs. the old CSV lookup against 55k
@@ -599,7 +600,15 @@ ferrite-models          DSL bodies: llama.rs (`#[forward] fn llama`)
 
 ## Commit history — `git log --oneline` on the worktree branch
 
-Most recent session (Gemma2 acid test: DSL `if/else`, config-driven
+Most recent session (Gemma2 prompt-7 root-caused: missing BOS in
+/v1/completions tokenization, not the suspected per-layer kernel
+drift):
+
+```
+e2669d635  vllm-serve: prepend BOS by default on /v1/completions tokenization
+```
+
+Prior session (Gemma2 acid test: DSL `if/else`, config-driven
 attention scalars, Gelu/TanhSoftCap/SlidingAttention Impls, Gemma2
 DSL body + configs, Gemma `(1+w)` as DSL `w + 1.0`, vllm-executor
 wiring, embed-scale + sliding-branch fix, gemma2_2b golden):
@@ -633,49 +642,48 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
-**Gemma2 landed, with one known-fail golden test.** Dense-bf16
-Gemma2-2B / 9B / 27B compile end-to-end through `#[forward]`.
-`CudaModel::Gemma2Ferrite` in `cuda_worker.rs` parallels LlamaFerrite
-and Qwen2Ferrite. `vllm chat unsloth/gemma-2-2b-it` produces
-coherent output (e.g. the Rayleigh-scattering answer for "why is
-the sky blue?"). Compiler itself is architecture-agnostic — zero
-"gemma" strings below the parser.
+**Three correctness goldens green via ferrite-forward.** Dense-bf16
+Llama (SmolLM2-135M), Qwen2 (Qwen2.5-0.5B), and Gemma2 (Gemma2-2B)
+all pass `test_cuda_correctness_*` through their `*Ferrite` variants
+(verified by `loaded ... via ferrite-forward` log lines on each).
 
-**Known failure: `test_cuda_correctness_gemma2_2b`** hard-fails on
-prompt 7 (translation prompt with apostrophe-quoted inner text).
-Engine enters a loop generating the prompt text verbatim. Prompts
-0-6 soft-fail at position 0 with "both in top-N" warnings (normal
-bf16 divergence, tolerated). Prompt 7's failure is specific to
-that prompt's numerics.
+**Prompt-7 root cause was NOT in the kernels.** The prior session's
+"shared CUDA kernel drift" theory was wrong. Per-layer hidden-state
+dumps comparing our hand-written Gemma2 path against HF transformers
+eager showed `r ≥ 0.9998` agreement at every checkpoint — embed,
+all 26 layers, final norm, lm_head, post-softcap. The actual bug:
 
-Debug findings ruled out as the cause:
-- Not ferrite-vs-hand-written drift: ferrite IS loading
-  (logs: "CudaWorker: loaded Gemma2 via ferrite-forward"). Both
-  ferrite and hand-written produce logprobs within bf16 noise of
-  each other on Gemma2; both diverge from Python vLLM the same
-  way.
-- Not CUDA graphs: `--enforce-eager` reproduces.
-- Not final-logit softcap: our pre-softcap logits correlate r=0.11
-  with Python's pre-softcap logits. Divergence is upstream of
-  softcap.
-- Not embed scale / sliding-layer flip: both already fixed in
-  commit `2e733be50`, sky-blue prompt works.
+- `crates/vllm-serve/src/engine.rs::tokenize_completion_prompts`
+  hardcoded `add_special_tokens=false`, so `/v1/completions`
+  tokenized prompts WITHOUT BOS (22 tokens for prompt 7 vs 23
+  in the golden). Python vLLM defaults to `add_special_tokens=True`;
+  the golden was generated that way, so we were silently comparing
+  WITH-BOS reference output against WITHOUT-BOS engine output.
+- For prompts 0-6 the BOS/no-BOS divergence stayed inside the
+  top-20 tolerance window. Prompt 7's first-token prediction crossed
+  the boundary: HF eager WITHOUT-BOS picked `'\n\n\n'`, golden
+  (Python vLLM WITH-BOS) picked `'\n\n'`.
+- Fix in commit `e2669d635`: added `add_special_tokens: bool`
+  field to `CompletionRequest` defaulting to `true`, plumbed
+  through to `tokenize_text(...)`. Direct struct constructors in
+  `engine.rs` (test fixtures), `llm.rs` (in-process LLM API),
+  and `spans.rs` (span query builder) updated to set `true`.
 
-Evidence points to per-layer numeric drift in a shared CUDA kernel
-(most likely flash-attn with Gemma's softcap+sliding combo, or
-cuBLAS gemm with Gemma2's unusual hidden/head_dim ratios) that
-both the ferrite and hand-written paths hit via FFI into
-`crates/vllm-cuda/csrc/`. The fix applies to both paths once found.
+**Bonus pre-existing bug found, NOT yet fixed.** The chat path
+(`crates/vllm-serve/src/engine.rs:2857`) does
+`tok.encode(&text, true)` AFTER rendering a chat template that
+literally emits `<bos>` (Gemma2) or `<|begin_of_text|>` (Llama3)
+into the string — so chat completions have been double-BOS'ing
+forever. Verified with HF tokenizer: Gemma2 chat template + true
+encode gives `[2, 2, 106, ...]` (two BOS); + false gives `[2, 106, ...]`.
+Python vLLM uses `add_special_tokens=False` for the chat path for
+exactly this reason. Fix: flip line 2857 to `false`. Not done in
+this session because every chat e2e test will measurably change
+its first-token logits and need a wider validation pass.
 
-Path forward: per-layer tensor dump harness comparing against
-Python vLLM running the same model on the same prompt. `vllm-rs`
-has `cpu_golden.rs` infrastructure to build on. ~4-8 hours to
-instrument and narrow down the first-diverging kernel call. See
-gap #9 in Remaining Gaps below.
-
-SmolLM and Qwen2 golden tests still pass — ferrite's
-infrastructure and the Llama-family / Qwen2-family numerics are
-intact.
+`spans.rs:191, 324, 1449` correctly use `false` (template-rendered
+text). `examples/src/chat.rs:51` and `examples/src/lib.rs:491`
+also use `false`. So only the chat HTTP handler needs the fix.
 
 ### Prior correctness fix (kept for context)
 
@@ -839,32 +847,15 @@ tackle in roughly this order.
    type doesn't know about layer ranges). Extend `Weights::load`
    to accept a layer range so PP intermediate ranks can only
    materialise their owned layers.
-9. **Per-layer tensor-dump debug harness** — unblocks the
-   `test_cuda_correctness_gemma2_2b` prompt-7 failure documented
-   in "Next session starts here". Build: a Python script that
-   runs HF/vLLM Gemma2-2B on the failing prompt and dumps
-   `hidden_states` after each decoder layer to `.npy`; a Rust
-   equivalent that loads via ferrite, runs one forward, and
-   saves matching dumps. Offline diff finds the first layer where
-   our output meaningfully differs from Python's. Then narrow
-   to the specific kernel call responsible. Relevant shared CUDA
-   kernels at `crates/vllm-cuda/csrc/{layernorm,pos_encoding,activation}_kernels.cu`;
-   compare against `/home/moosevan/vllm/csrc/*` for semantic
-   drift. `cpu_golden.rs` lives at `ferrite-forward/src/cpu_golden.rs`
-   for reference-CPU implementations. Debugging approach:
-   - Ferrite's `forward_backbone` skips only the TERMINAL tile;
-     for Gemma2 that's `tanh_softcap`, so backbone returns
-     pre-softcap logits (post-lm_head). To dump pre-lm_head
-     hidden states, temporarily remove `capped = tanh_softcap(logits)`
-     from `ferrite-models/src/gemma2.rs` so the terminal becomes
-     `gemm` and backbone returns `normed`.
-   - Python reference: `AutoModelForCausalLM.from_pretrained(...,
-     torch_dtype=bf16)` + module forward hooks on each
-     `model.layers[i]`.
-   - Already verified: our post-softcap logits correlate r=0.11
-     with Python's (nearly independent). The drift accumulates
-     across layers; find the first layer where it exceeds bf16
-     noise.
+9. **Chat-completion double-BOS fix** — `crates/vllm-serve/src/engine.rs:2857`
+   does `tok.encode(&text, true)` after rendering a chat template
+   that already emits `<bos>` / `<|begin_of_text|>` literally.
+   Flip to `false`. Pre-existing bug, surfaced while diagnosing
+   the prompt-7 completion-path BOS issue (commit `e2669d635`).
+   Validation cost: every chat-completion e2e test will see its
+   first-token logits shift, so plan for re-running goldens and
+   possibly regenerating any chat-mode goldens that were tracking
+   the double-BOS behavior.
 
 ### Already landed — do not redo
 

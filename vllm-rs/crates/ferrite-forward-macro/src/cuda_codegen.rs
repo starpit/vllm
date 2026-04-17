@@ -439,85 +439,88 @@ pub fn generate_tk_megakernel(
     }
     writeln!(src, "    uint64_t __stream)").unwrap();
     writeln!(src, "{{").unwrap();
-    // gl<> deletes its default constructor, so we can't write `globals_t g;`.
-    // Use aligned storage + reinterpret_cast instead — globals_t is a POD-like
-    // bag of pointers and scalars that gets passed by value to the kernel.
-    writeln!(src, "    alignas({globals_typedef}) char __g_buf[sizeof({globals_typedef})];").unwrap();
-    writeln!(src, "    memset(__g_buf, 0, sizeof(__g_buf));").unwrap();
-    writeln!(src, "    auto& g = *reinterpret_cast<{globals_typedef}*>(__g_buf);").unwrap();
+    // Construct globals_t using proper gl constructors so TMA descriptors
+    // are created via cuTensorMapEncodeTiled. We use a factory function
+    // to avoid the deleted default constructor.
+    //
+    // gl<T, B, D, R, C, TMA...> ctor: gl(T* data, make_arg_t<B>, make_arg_t<D>, make_arg_t<R>, make_arg_t<C>)
+    // where make_arg_t<N> = nullptr_t for compile-time dims, size_t for runtime dims (-1).
+    writeln!(src, "    using G = {globals_typedef};").unwrap();
     writeln!(src).unwrap();
-    // Fill globals from flat params — each kittens::gl field needs
-    // raw_ptr + dynamic dimensions set.
-    writeln!(src, "    // VM state").unwrap();
-    writeln!(src, "    g.Bar.raw_ptr = (uint*)bar_ptr;").unwrap();
-    writeln!(src, "    g.Bar.depth_internal = bar_depth;").unwrap();
-    writeln!(src, "    g.Bar.rows_internal = bar_rows;").unwrap();
-    writeln!(src, "    g.instructions.raw_ptr = (int*)instructions_ptr;").unwrap();
-    writeln!(src, "    g.instructions.depth_internal = instructions_depth;").unwrap();
-    writeln!(src, "    g.instructions.rows_internal = instructions_rows;").unwrap();
-    writeln!(src, "    g.timings.raw_ptr = (int*)timings_ptr;").unwrap();
-    writeln!(src, "    g.timings.depth_internal = instructions_depth;").unwrap();
-    writeln!(src, "    g.timings.rows_internal = instructions_rows;").unwrap();
+    // VM state: barriers gl<uint, 1, -1, -1, N> — no TMA descs
+    // instructions/timings gl<int, 1, -1, -1, 32/128> — no TMA descs
+    writeln!(src, "    typename G::barriers Bar_(").unwrap();
+    writeln!(src, "        (uint*)bar_ptr, nullptr, (size_t)bar_depth, (size_t)bar_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::instruction_layout instructions_(").unwrap();
+    writeln!(src, "        (int*)instructions_ptr, nullptr, (size_t)instructions_depth, (size_t)instructions_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::timing_layout timings_(").unwrap();
+    writeln!(src, "        (int*)timings_ptr, nullptr, (size_t)instructions_depth, (size_t)instructions_rows, nullptr);").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "    // Weights").unwrap();
-    writeln!(src, "    g.qkv_weights.raw_ptr = (__nv_bfloat16*)qkv_weights_ptr;").unwrap();
-    writeln!(src, "    g.qkv_weights.depth_internal = qkv_weights_depth;").unwrap();
-    writeln!(src, "    g.qkv_weights.rows_internal = qkv_weights_rows;").unwrap();
-    writeln!(src, "    g.attn_norm_weights.raw_ptr = (__nv_bfloat16*)attn_norm_weights_ptr;").unwrap();
-    writeln!(src, "    g.attn_norm_weights.rows_internal = attn_norm_weights_rows;").unwrap();
-    writeln!(src, "    g.o_weights.raw_ptr = (__nv_bfloat16*)o_weights_ptr;").unwrap();
-    writeln!(src, "    g.o_weights.depth_internal = o_weights_depth;").unwrap();
-    writeln!(src, "    g.o_weights.rows_internal = o_weights_rows;").unwrap();
-    writeln!(src, "    g.mlp_norm_weights.raw_ptr = (__nv_bfloat16*)mlp_norm_weights_ptr;").unwrap();
-    writeln!(src, "    g.mlp_norm_weights.rows_internal = mlp_norm_weights_rows;").unwrap();
-    writeln!(src, "    g.up_weights.raw_ptr = (__nv_bfloat16*)up_weights_ptr;").unwrap();
-    writeln!(src, "    g.up_weights.depth_internal = up_weights_depth;").unwrap();
-    writeln!(src, "    g.up_weights.rows_internal = up_weights_rows;").unwrap();
-    writeln!(src, "    g.gate_weights.raw_ptr = (__nv_bfloat16*)gate_weights_ptr;").unwrap();
-    writeln!(src, "    g.gate_weights.depth_internal = gate_weights_depth;").unwrap();
-    writeln!(src, "    g.gate_weights.rows_internal = gate_weights_rows;").unwrap();
-    writeln!(src, "    g.down_weights.raw_ptr = (__nv_bfloat16*)down_weights_ptr;").unwrap();
-    writeln!(src, "    g.down_weights.depth_internal = down_weights_depth;").unwrap();
-    writeln!(src, "    g.down_weights.rows_internal = down_weights_rows;").unwrap();
-    writeln!(src, "    g.lm_head_norm_weights.raw_ptr = (__nv_bfloat16*)lm_head_norm_weights_ptr;").unwrap();
-    writeln!(src, "    g.lm_head_norm_weights.rows_internal = lm_head_norm_weights_rows;").unwrap();
-    writeln!(src, "    g.lm_head_weights.raw_ptr = (__nv_bfloat16*)lm_head_weights_ptr;").unwrap();
-    writeln!(src, "    g.lm_head_weights.depth_internal = lm_head_weights_depth;").unwrap();
-    writeln!(src, "    g.lm_head_weights.rows_internal = lm_head_weights_rows;").unwrap();
+    // Weights: gl<bf16, 1, -1, -1, hidden_dim, st_bf<...>> — TMA descs created by ctor
+    writeln!(src, "    typename G::weights_t qkv_w_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)qkv_weights_ptr, nullptr, (size_t)qkv_weights_depth, (size_t)qkv_weights_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::norm_weights_t attn_norm_w_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)attn_norm_weights_ptr, nullptr, nullptr, (size_t)attn_norm_weights_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::weights_t o_w_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)o_weights_ptr, nullptr, (size_t)o_weights_depth, (size_t)o_weights_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::norm_weights_t mlp_norm_w_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)mlp_norm_weights_ptr, nullptr, nullptr, (size_t)mlp_norm_weights_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::weights_t up_w_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)up_weights_ptr, nullptr, (size_t)up_weights_depth, (size_t)up_weights_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::weights_t gate_w_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)gate_weights_ptr, nullptr, (size_t)gate_weights_depth, (size_t)gate_weights_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::weights_big_indim_t down_w_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)down_weights_ptr, nullptr, (size_t)down_weights_depth, (size_t)down_weights_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::norm_weights_t lm_head_norm_w_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)lm_head_norm_weights_ptr, nullptr, nullptr, (size_t)lm_head_norm_weights_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::weights_t lm_head_w_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)lm_head_weights_ptr, nullptr, (size_t)lm_head_weights_depth, (size_t)lm_head_weights_rows, nullptr);").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "    // KV cache").unwrap();
-    writeln!(src, "    g.k_cache.raw_ptr = (__nv_bfloat16*)k_cache_ptr;").unwrap();
-    writeln!(src, "    g.k_cache.batch_internal = k_cache_batch;").unwrap();
-    writeln!(src, "    g.k_cache.depth_internal = k_cache_depth;").unwrap();
-    writeln!(src, "    g.k_cache.rows_internal = k_cache_rows;").unwrap();
-    writeln!(src, "    g.v_cache.raw_ptr = (__nv_bfloat16*)v_cache_ptr;").unwrap();
-    writeln!(src, "    g.v_cache.batch_internal = v_cache_batch;").unwrap();
-    writeln!(src, "    g.v_cache.depth_internal = v_cache_depth;").unwrap();
-    writeln!(src, "    g.v_cache.rows_internal = v_cache_rows;").unwrap();
+    // KV cache: gl<bf16, -1, -1, -1, head_dim, sv_bf<...>, tma::descriptor<...>>
+    writeln!(src, "    typename G::kv_cache_t k_cache_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)k_cache_ptr, (size_t)k_cache_batch, (size_t)k_cache_depth, (size_t)k_cache_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::kv_cache_t v_cache_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)v_cache_ptr, (size_t)v_cache_batch, (size_t)v_cache_depth, (size_t)v_cache_rows, nullptr);").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "    // RoPE tables").unwrap();
-    writeln!(src, "    g.rope_cos.raw_ptr = (float*)rope_cos_ptr;").unwrap();
-    writeln!(src, "    g.rope_cos.rows_internal = rope_rows;").unwrap();
-    writeln!(src, "    g.rope_sin.raw_ptr = (float*)rope_sin_ptr;").unwrap();
-    writeln!(src, "    g.rope_sin.rows_internal = rope_rows;").unwrap();
+    // RoPE: gl<float, 1, 1, -1, head_dim, sv_fl<head_dim>>
+    writeln!(src, "    typename G::rope_table_t rope_cos_(").unwrap();
+    writeln!(src, "        (float*)rope_cos_ptr, nullptr, nullptr, (size_t)rope_rows, nullptr);").unwrap();
+    writeln!(src, "    typename G::rope_table_t rope_sin_(").unwrap();
+    writeln!(src, "        (float*)rope_sin_ptr, nullptr, nullptr, (size_t)rope_rows, nullptr);").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "    // Activation buffers").unwrap();
-    writeln!(src, "    g.hidden_states.raw_ptr = (__nv_bfloat16*)hidden_states_ptr;").unwrap();
-    writeln!(src, "    g.q_post_rope.raw_ptr = (__nv_bfloat16*)q_post_rope_ptr;").unwrap();
-    writeln!(src, "    g.attn_out.raw_ptr = (__nv_bfloat16*)attn_out_ptr;").unwrap();
-    writeln!(src, "    g.attn_lse_intermediates.raw_ptr = (float*)attn_lse_ptr;").unwrap();
-    writeln!(src, "    g.attn_lse_intermediates.cols_internal = attn_lse_rows;").unwrap();
-    writeln!(src, "    g.attn_out_intermediates.raw_ptr = (float*)attn_out_intermediates_ptr;").unwrap();
-    writeln!(src, "    g.attn_out_intermediates.rows_internal = attn_out_intermediates_rows;").unwrap();
-    writeln!(src, "    g.silu_out.raw_ptr = (__nv_bfloat16*)silu_out_ptr;").unwrap();
-    writeln!(src, "    g.logits.raw_ptr = (__nv_bfloat16*)logits_ptr;").unwrap();
-    writeln!(src, "    g.logits.cols_internal = logits_cols;").unwrap();
+    // Activation buffers: gl<bf16, 1, 1, 1, hidden_dim, ...> — all compile-time
+    writeln!(src, "    typename G::activations_t hidden_states_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)hidden_states_ptr, nullptr, nullptr, nullptr, nullptr);").unwrap();
+    writeln!(src, "    typename G::activations_t q_post_rope_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)q_post_rope_ptr, nullptr, nullptr, nullptr, nullptr);").unwrap();
+    writeln!(src, "    typename G::activations_t attn_out_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)attn_out_ptr, nullptr, nullptr, nullptr, nullptr);").unwrap();
+    // attn_lse: gl<float, 1, 1, num_heads, -1, sv_fl<...>> — cols is runtime
+    writeln!(src, "    typename G::attn_lse_intermediates_t attn_lse_(").unwrap();
+    writeln!(src, "        (float*)attn_lse_ptr, nullptr, nullptr, nullptr, (size_t)attn_lse_rows);").unwrap();
+    // attn_out_intermediates: gl<float, 1, num_heads, -1, head_dim, sv_fl<head_dim>>
+    writeln!(src, "    typename G::attn_out_intermediates_t attn_out_int_(").unwrap();
+    writeln!(src, "        (float*)attn_out_intermediates_ptr, nullptr, nullptr, (size_t)attn_out_intermediates_rows, nullptr);").unwrap();
+    // silu_out: gl<bf16, 1, 1, 1, intermediate_dim, ...> — all compile-time
+    writeln!(src, "    typename G::activations_big_indim_t silu_out_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)silu_out_ptr, nullptr, nullptr, nullptr, nullptr);").unwrap();
+    // logits: gl<bf16, 1, 1, 1, -1, sv_bf<...>> — cols is runtime
+    writeln!(src, "    typename G::logits_t logits_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)logits_ptr, nullptr, nullptr, nullptr, (size_t)logits_cols);").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "    // Scalars").unwrap();
-    writeln!(src, "    g.pos_id = pos_id;").unwrap();
-    writeln!(src, "    g.attn_scale = attn_scale;").unwrap();
-    writeln!(src, "    g.rms_norm_eps = rms_norm_eps;").unwrap();
-    writeln!(src, "    g.skip_attn_reduction = skip_attn_reduction;").unwrap();
+    // Aggregate into globals_t via designated-init-style aggregate.
+    // globals_t is an aggregate (no user-declared ctors besides deleted default).
+    // Use brace-enclosed init matching field declaration order.
+    writeln!(src, "    {globals_typedef} g {{").unwrap();
+    writeln!(src, "        Bar_, instructions_, timings_,").unwrap();
+    writeln!(src, "        qkv_w_, attn_norm_w_, o_w_, mlp_norm_w_,").unwrap();
+    writeln!(src, "        up_w_, gate_w_, down_w_, lm_head_norm_w_, lm_head_w_,").unwrap();
+    writeln!(src, "        k_cache_, v_cache_,").unwrap();
+    writeln!(src, "        rope_cos_, rope_sin_,").unwrap();
+    writeln!(src, "        hidden_states_, q_post_rope_, attn_out_,").unwrap();
+    writeln!(src, "        attn_lse_, attn_out_int_, silu_out_, logits_,").unwrap();
+    writeln!(src, "        pos_id, attn_scale, rms_norm_eps, (bool)skip_attn_reduction").unwrap();
+    writeln!(src, "    }};").unwrap();
     writeln!(src).unwrap();
     writeln!(src, "    // Launch").unwrap();
     writeln!(src, "    dim3 grid = g.grid();").unwrap();

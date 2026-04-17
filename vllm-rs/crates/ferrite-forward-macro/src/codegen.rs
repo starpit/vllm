@@ -1154,7 +1154,7 @@ fn try_emit_tk_forward(
                 // VM state
                 __bar_buf as u64,                              // bar_ptr
                 __num_layers as i32,                           // bar_depth
-                (__num_heads + 2 * __num_kv_heads) as i32,     // bar_rows
+                10i32,                                         // bar_rows (10 opcode slots per layer, matching Python)
                 __inst_buf as u64,                             // instructions_ptr
                 __num_sms as i32,                              // instructions_depth
                 __max_inst_per_sm as i32,                      // instructions_rows
@@ -1185,15 +1185,18 @@ fn try_emit_tk_forward(
                 __num_layers as i32,                           // mlp_norm_weights_rows
                 __lm_head_norm_ptr,                            // lm_head_norm_weights_ptr
                 1i32,                                          // lm_head_norm_weights_rows
-                // KV cache (stacked)
+                // KV cache (stacked): gl<bf16, -1, -1, -1, head_dim>
+                // Layout: [num_layers, total_kv_tokens, kv_heads, head_dim]
+                // where total_kv_tokens = kv_num_blocks * kv_block_size
+                // TMA coord {layer_idx, block_idx, kv_head_idx, 0} — block_idx is tile index
                 __k_stacked as u64,                            // k_cache_ptr
-                (__num_kv_heads as i32),                       // k_cache_batch
-                (__kv_num_blocks as i32),                      // k_cache_depth
-                (__kv_block_size as i32),                      // k_cache_rows
+                (__num_layers as i32),                         // k_cache_batch = num_layers
+                ((__kv_num_blocks * __kv_block_size) as i32),  // k_cache_depth = total tokens
+                (__num_kv_heads as i32),                       // k_cache_rows = kv_heads
                 __v_stacked as u64,                            // v_cache_ptr
-                (__num_kv_heads as i32),                       // v_cache_batch
-                (__kv_num_blocks as i32),                      // v_cache_depth
-                (__kv_block_size as i32),                      // v_cache_rows
+                (__num_layers as i32),                         // v_cache_batch = num_layers
+                ((__kv_num_blocks * __kv_block_size) as i32),  // v_cache_depth = total tokens
+                (__num_kv_heads as i32),                       // v_cache_rows = kv_heads
                 // RoPE
                 __rope_cos_ptr,                                // rope_cos_ptr
                 __rope_sin_ptr,                                // rope_sin_ptr

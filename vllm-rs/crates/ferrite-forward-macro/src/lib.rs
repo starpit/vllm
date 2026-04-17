@@ -442,9 +442,9 @@ fn emit_arch_dispatcher(
             let variant_ident = pascal_case(model_ident);
             quote! {
                 if #model_ident::Weights::fingerprint_matches(gw) {
-                    return Ok(Self::#variant_ident(
+                    return Ok(Some(Self::#variant_ident(
                         #model_ident::Weights::load(gw, stream)?,
-                    ));
+                    )));
                 }
             }
         })
@@ -533,18 +533,20 @@ fn emit_arch_dispatcher(
             /// baked fingerprint (embedding shape + last-layer
             /// tensor presence + quant suffix), then load.
             ///
-            /// Errors if no compiled variant matches — caller is
-            /// expected to fall through to a non-ferrite path.
+            /// Returns `Ok(Some(..))` on a variant hit, `Ok(None)`
+            /// when no compiled variant's fingerprint accepted the
+            /// live `GpuWeights` (caller falls back to a hand-written
+            /// path), or `Err(..)` only when a matched variant's
+            /// `Weights::load` itself failed (I/O, shape mismatch
+            /// inside a loader). A fingerprint miss is not an error —
+            /// ferrite's job is to cover the storage formats it
+            /// compiled for, not every format on disk.
             pub fn load(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
-            ) -> ::anyhow::Result<Self> {
+            ) -> ::anyhow::Result<Option<Self>> {
                 #(#try_fingerprint_arms)*
-                ::anyhow::bail!(
-                    "no compiled ferrite variant matched this GpuWeights \
-                     (inspect tensor names; expected model.embed_tokens.weight \
-                     shape + matching model.layers.N.self_attn.q_proj.{{,q}}weight)"
-                )
+                Ok(None)
             }
         }
 
@@ -631,9 +633,10 @@ fn emit_arch_dispatcher(
                 arch_name: #arch_name_lit,
                 hf_arches: &[#(#hf_arch_lits),*],
                 try_load: |gw, stream| {
-                    Weights::load(gw, stream)
-                        .map(|w| ::std::boxed::Box::new(w)
+                    Weights::load(gw, stream).map(|opt| {
+                        opt.map(|w| ::std::boxed::Box::new(w)
                             as ::std::boxed::Box<dyn ::ferrite_forward::FerriteWeights>)
+                    })
                 },
             }
         }

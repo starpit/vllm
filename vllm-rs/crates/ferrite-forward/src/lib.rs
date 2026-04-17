@@ -100,18 +100,26 @@ mod dispatcher {
         /// model's `config.json` `architectures: [..]` field.
         pub hf_arches: &'static [&'static str],
         /// Try to load the arch's compiled variants. Internally
-        /// iterates per-variant fingerprint sniffs; returns
-        /// `Err(..)` if arch was matched but no variant matched
-        /// the live `GpuWeights`.
-        pub try_load: fn(&mut GpuWeights, CUstream) -> ::anyhow::Result<Box<dyn FerriteWeights>>,
+        /// iterates per-variant fingerprint sniffs. Returns
+        /// `Ok(Some(..))` on a variant hit, `Ok(None)` when the arch
+        /// matched by name but no compiled variant's fingerprint
+        /// sniff accepted the live `GpuWeights` (caller should fall
+        /// back to a hand-written path), or `Err(..)` only on a
+        /// genuine load failure (I/O, shape mismatch inside a matched
+        /// variant, …).
+        pub try_load:
+            fn(&mut GpuWeights, CUstream) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>>,
     }
 
     inventory::collect!(FerriteArchRegistration);
 
     /// Top-level ferrite loader. Walks every `#[forward]`-registered
     /// arch; the first whose `hf_arches` list contains `arch_hint`
-    /// wins and loads. Returns `Ok(None)` if no registered arch
-    /// claims `arch_hint` — caller falls through to hand-written.
+    /// wins and attempts to load. Returns `Ok(None)` when either
+    /// (a) no registered arch claims `arch_hint`, or (b) the arch
+    /// matched by name but no compiled variant's fingerprint sniff
+    /// accepted the live `GpuWeights`. Both cases let the caller
+    /// fall back to the hand-written path without hard-failing.
     pub fn try_load(
         gw: &mut GpuWeights,
         stream: CUstream,
@@ -119,7 +127,7 @@ mod dispatcher {
     ) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>> {
         for reg in inventory::iter::<FerriteArchRegistration>() {
             if reg.hf_arches.iter().any(|a| *a == arch_hint) {
-                return (reg.try_load)(gw, stream).map(Some);
+                return (reg.try_load)(gw, stream);
             }
         }
         Ok(None)

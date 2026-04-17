@@ -338,9 +338,9 @@ mod tests {
 
         // 9 Llama configs (405B gated, skipped) + smollm2-135m +
         // smollm2-360m (second size gives `probe-weights` cross-size
-        // disambiguation) + llama-3.2-1b-awq (AWQ end-to-end slice
-        // committed on this branch).
-        assert_eq!(configs.len(), 12, "expected 12 Llama configs");
+        // disambiguation) + llama-3.2-1b-awq (AWQ end-to-end slice) +
+        // tinyllama-1.1b-gptq-desc-act (first desc_act=true GPTQ).
+        assert_eq!(configs.len(), 13, "expected 13 Llama configs");
 
         // Ground-truth check on llama-3.2-1b. Published values:
         //   num_hidden_layers = 16
@@ -371,7 +371,7 @@ mod tests {
     fn load_real_qwen2_configs() {
         let dir = repo_model_archs().join("qwen2");
         let configs = load_dir(&dir).expect("load qwen2 configs");
-        assert_eq!(configs.len(), 12, "expected 12 Qwen2 configs");
+        assert_eq!(configs.len(), 13, "expected 13 Qwen2 configs");
 
         // Ground-truth check on Qwen2-0.5B:
         //   num_hidden_layers    = 24

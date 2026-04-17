@@ -1,4 +1,5 @@
-#pragma once
+#ifndef LLAMA_CUH_INCLUDED
+#define LLAMA_CUH_INCLUDED
 
 #include "kittens.cuh"
 #include "megakernel.cuh"
@@ -195,3 +196,5 @@ struct o_proj;
 
 template <typename config = config, typename globals = llama_1b_globals>
 struct rms_upgate_silu;
+
+#endif // LLAMA_CUH_INCLUDED

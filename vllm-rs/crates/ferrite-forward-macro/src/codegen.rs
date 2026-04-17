@@ -527,6 +527,13 @@ fn try_emit_tk_forward(
     let head_dim = get("head_dim").unwrap_or(hidden_dim / num_attention_heads);
     let vocab_size = get("vocab_size")?;
 
+    // The vendored attention_partial.cu only supports head_dim=64 and GQA_RATIO=4.
+    // Skip TK for incompatible models — they'll use the BSP megakernel instead.
+    let gqa_ratio = num_attention_heads / num_kv_heads;
+    if head_dim != 64 || gqa_ratio != 4 {
+        return None;
+    }
+
     let dims = TkModelDims {
         num_layers,
         hidden_dim,
@@ -823,20 +830,6 @@ fn try_emit_tk_forward(
         .collect();
 
     let tokens = quote! {
-        // One-time weight stacking statics (persistent GPU allocs).
-        static __TK_INIT: ::std::sync::Once = ::std::sync::Once::new();
-        static __TK_QKV: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-        static __TK_O: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-        static __TK_GATE: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-        static __TK_UP: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-        static __TK_DOWN: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-        static __TK_ATTN_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-        static __TK_MLP_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-
-        unsafe extern "C" {
-            fn #launch_fn(#(#extern_params,)* __stream: u64) -> i32;
-        }
-
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn #fn_name(
@@ -845,6 +838,20 @@ fn try_emit_tk_forward(
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
             use ::std::sync::atomic::Ordering;
+
+            // One-time weight stacking statics (persistent GPU allocs).
+            static __TK_INIT: ::std::sync::Once = ::std::sync::Once::new();
+            static __TK_QKV: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+            static __TK_O: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+            static __TK_GATE: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+            static __TK_UP: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+            static __TK_DOWN: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+            static __TK_ATTN_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+            static __TK_MLP_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+
+            unsafe extern "C" {
+                fn #launch_fn(#(#extern_params,)* __stream: u64) -> i32;
+            }
 
             let __stream = device.compute_stream;
             let __num_layers: usize = #num_layers_usize;
@@ -945,7 +952,7 @@ fn try_emit_tk_forward(
             // ── Embedding gather: input_ids → hidden_states ──
             let __hidden_states = ::ferrite_kernels::kernels::embedding_gather(
                 wm.#embed_ident.weight,
-                (*ctx.input_ids).into_inner(),
+                *ctx.input_ids,
                 &mut device.caching,
                 __stream,
             );
@@ -1069,15 +1076,15 @@ fn try_emit_tk_forward(
                 __rope_sin_ptr,                                // rope_sin_ptr
                 __rope_rows,                                   // rope_rows
                 // Activation buffers
-                __hidden_states.as_ref().raw_ptr() as u64,     // hidden_states_ptr
-                __q_post_rope.as_ref().raw_ptr() as u64,       // q_post_rope_ptr
-                __attn_out.as_ref().raw_ptr() as u64,          // attn_out_ptr
-                __attn_lse.as_ref().raw_ptr() as u64,          // attn_lse_ptr
+                __hidden_states.raw_ptr() as u64,     // hidden_states_ptr
+                __q_post_rope.raw_ptr() as u64,       // q_post_rope_ptr
+                __attn_out.raw_ptr() as u64,          // attn_out_ptr
+                __attn_lse.raw_ptr() as u64,          // attn_lse_ptr
                 __attn_lse_rows as i32,                        // attn_lse_rows
-                __attn_out_int.as_ref().raw_ptr() as u64,      // attn_out_intermediates_ptr
+                __attn_out_int.raw_ptr() as u64,      // attn_out_intermediates_ptr
                 __num_sms as i32,                              // attn_out_intermediates_rows
-                __silu_out.as_ref().raw_ptr() as u64,          // silu_out_ptr
-                __logits.as_ref().raw_ptr() as u64,            // logits_ptr
+                __silu_out.raw_ptr() as u64,          // silu_out_ptr
+                __logits.raw_ptr() as u64,            // logits_ptr
                 __vocab as i32,                                // logits_cols
                 // Scalars
                 __pos_id,                                      // pos_id
@@ -1266,6 +1273,7 @@ fn c_type_to_rust(c_type: &str) -> TokenStream {
         "void*" => quote! { *mut ::core::ffi::c_void },
         "const void*" => quote! { *const ::core::ffi::c_void },
         "int" => quote! { i32 },
+        "unsigned int" => quote! { u32 },
         "float" => quote! { f32 },
         "double" => quote! { f64 },
         "size_t" | "uint64_t" => quote! { u64 },

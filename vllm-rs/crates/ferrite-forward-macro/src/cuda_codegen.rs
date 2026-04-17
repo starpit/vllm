@@ -217,6 +217,7 @@ pub fn generate_tk_megakernel(
     writeln!(src, "// Auto-generated TK megakernel for {model_name}").unwrap();
     writeln!(src, "// DO NOT EDIT — regenerate via the forward! proc macro.").unwrap();
     writeln!(src).unwrap();
+    writeln!(src, "#include <cstring>").unwrap();
     writeln!(src, "#include \"kittens.cuh\"").unwrap();
     writeln!(src, "#include \"megakernel.cuh\"").unwrap();
     writeln!(src).unwrap();
@@ -381,6 +382,22 @@ pub fn generate_tk_megakernel(
     writeln!(src).unwrap();
 
     // ── Op includes ──
+    // Prevent llama.cuh from being included by the op .cu files — our generated
+    // code already defines config, globals_t, and the forward declarations.
+    writeln!(src, "#define LLAMA_CUH_INCLUDED").unwrap();
+    // The ops use LLAMA_1B_* macros for compile-time template args (tile sizes).
+    writeln!(src, "#define LLAMA_1B_NUM_LAYERS {}", d.num_layers).unwrap();
+    writeln!(src, "#define LLAMA_1B_HIDDEN_DIM {}", d.hidden_dim).unwrap();
+    writeln!(src, "#define LLAMA_1B_INTERMEDIATE_DIM {}", d.intermediate_dim).unwrap();
+    writeln!(src, "#define LLAMA_1B_HEAD_DIM {}", d.head_dim).unwrap();
+    writeln!(src, "#define LLAMA_1B_NUM_ATTENTION_HEADS {}", d.num_attention_heads).unwrap();
+    writeln!(src, "#define LLAMA_1B_NUM_KV_HEADS {}", d.num_kv_heads).unwrap();
+    writeln!(src, "#define LLAMA_1B_KV_BLOCK_SIZE {}", d.kv_block_size).unwrap();
+    writeln!(src, "#define LLAMA_1B_MATVEC_BLOCK_SIZE {}", d.matvec_block_size).unwrap();
+    writeln!(src, "#define LLAMA_1B_LM_HEAD_BLOCK_SIZE 32").unwrap();
+    writeln!(src, "#define LLAMA_1B_VOCAB_SIZE 128256").unwrap(); // TODO: make configurable
+    // The ops hardcode `llama_1b_globals` — alias it to our model-specific globals.
+    writeln!(src, "using llama_1b_globals = {globals_typedef};").unwrap();
     writeln!(src, "// Op implementations from vendored Megakernels").unwrap();
     writeln!(src, "#include \"rms_matvec_rope_append.cu\"").unwrap();
     writeln!(src, "#include \"attention_partial.cu\"").unwrap();
@@ -422,7 +439,12 @@ pub fn generate_tk_megakernel(
     }
     writeln!(src, "    uint64_t __stream)").unwrap();
     writeln!(src, "{{").unwrap();
-    writeln!(src, "    {globals_typedef} g;").unwrap();
+    // gl<> deletes its default constructor, so we can't write `globals_t g;`.
+    // Use aligned storage + reinterpret_cast instead — globals_t is a POD-like
+    // bag of pointers and scalars that gets passed by value to the kernel.
+    writeln!(src, "    alignas({globals_typedef}) char __g_buf[sizeof({globals_typedef})];").unwrap();
+    writeln!(src, "    memset(__g_buf, 0, sizeof(__g_buf));").unwrap();
+    writeln!(src, "    auto& g = *reinterpret_cast<{globals_typedef}*>(__g_buf);").unwrap();
     writeln!(src).unwrap();
     // Fill globals from flat params — each kittens::gl field needs
     // raw_ptr + dynamic dimensions set.
@@ -480,7 +502,7 @@ pub fn generate_tk_megakernel(
     writeln!(src, "    g.q_post_rope.raw_ptr = (__nv_bfloat16*)q_post_rope_ptr;").unwrap();
     writeln!(src, "    g.attn_out.raw_ptr = (__nv_bfloat16*)attn_out_ptr;").unwrap();
     writeln!(src, "    g.attn_lse_intermediates.raw_ptr = (float*)attn_lse_ptr;").unwrap();
-    writeln!(src, "    g.attn_lse_intermediates.rows_internal = attn_lse_rows;").unwrap();
+    writeln!(src, "    g.attn_lse_intermediates.cols_internal = attn_lse_rows;").unwrap();
     writeln!(src, "    g.attn_out_intermediates.raw_ptr = (float*)attn_out_intermediates_ptr;").unwrap();
     writeln!(src, "    g.attn_out_intermediates.rows_internal = attn_out_intermediates_rows;").unwrap();
     writeln!(src, "    g.silu_out.raw_ptr = (__nv_bfloat16*)silu_out_ptr;").unwrap();

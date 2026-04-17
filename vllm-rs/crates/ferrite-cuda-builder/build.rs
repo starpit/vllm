@@ -393,31 +393,78 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     }
 
     // Build TK megakernels (sm90+ only, requires ThunderKittens + KVM runtime).
+    // The vendored ops only support specific model configs (head_dim, GQA ratio).
+    // Build each .cu individually and collect only those that succeed.
     if !tk_cus.is_empty() && arch_num >= 90 {
-        let mut tk_builder = cudaforge::KernelBuilder::new();
-        tk_builder = tk_builder
-            .out_dir(cache_dir)
-            .source_files(tk_cus.clone())
-            .include_path("../../crates/vllm-cuda/csrc")
-            .include_path("../../third_party/ThunderKittens")
-            .include_path("../../third_party/Megakernels/include")
-            .include_path("../../third_party/Megakernels/demos/low-latency-llama")
-            .with_cutlass(Some(CUTLASS_COMMIT));
-        tk_builder
-            .arg("-std=c++20")
-            .arg("-O3")
-            .arg("--use_fast_math")
-            .arg("--expt-extended-lambda")
-            .arg("--expt-relaxed-constexpr")
-            .arg("-DNDEBUG")
-            .arg("-DKITTENS_HOPPER")
-            .arg("-Xcompiler=-fPIC")
-            .arg("-Xcompiler=-fno-strict-aliasing")
-            .arg("-Xcompiler=-Wno-psabi")
-            .arg(&format!("-arch=sm_{arch}a"))
-            .arg("-lineinfo")
-            .build_lib(format!("{cache_dir}/libtk_megakernels.a"))
-            .expect("failed to build TK megakernel .cu files");
+        let mut ok_cus: Vec<String> = Vec::new();
+        for cu in &tk_cus {
+            let mut tk_builder = cudaforge::KernelBuilder::new();
+            tk_builder = tk_builder
+                .out_dir(cache_dir)
+                .source_files(vec![cu.clone()])
+                .include_path("../../crates/vllm-cuda/csrc")
+                .include_path("../../third_party/ThunderKittens")
+                .include_path("../../third_party/Megakernels/include")
+                .include_path("../../third_party/Megakernels/demos/low-latency-llama")
+                .with_cutlass(Some(CUTLASS_COMMIT));
+            let obj_name = std::path::Path::new(cu)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let lib_path = format!("{cache_dir}/lib{obj_name}.a");
+            let result = tk_builder
+                .arg("-std=c++20")
+                .arg("-O3")
+                .arg("--use_fast_math")
+                .arg("--expt-extended-lambda")
+                .arg("--expt-relaxed-constexpr")
+                .arg("-DNDEBUG")
+                .arg("-DKITTENS_HOPPER")
+                .arg("-Xcompiler=-fPIC")
+                .arg("-Xcompiler=-fno-strict-aliasing")
+                .arg("-Xcompiler=-Wno-psabi")
+                // cudaforge auto-adds -gencode=arch=compute_90a,code=sm_90a
+                .arg("-lineinfo")
+                .build_lib(&lib_path);
+            match result {
+                Ok(()) => {
+                    println!("cargo:warning=TK megakernel OK: {obj_name}");
+                    ok_cus.push(lib_path);
+                }
+                Err(e) => {
+                    println!("cargo:warning=TK megakernel SKIPPED (incompatible config): {obj_name}: {e}");
+                }
+            }
+        }
+        // Merge successful .a files into a single libtk_megakernels.a
+        if !ok_cus.is_empty() {
+            let tk_lib = format!("{cache_dir}/libtk_megakernels.a");
+            let _ = std::fs::remove_file(&tk_lib);
+            let mut ar = std::process::Command::new("ar");
+            ar.arg("rcs").arg(&tk_lib);
+            for lib in &ok_cus {
+                // Extract objects from each individual .a and add to merged archive
+                let extract_dir = format!("{cache_dir}/tk_extract");
+                let _ = std::fs::create_dir_all(&extract_dir);
+                let _ = std::process::Command::new("ar")
+                    .arg("x")
+                    .arg(lib)
+                    .current_dir(&extract_dir)
+                    .status();
+                // Add all .o files from extraction
+                if let Ok(entries) = std::fs::read_dir(&extract_dir) {
+                    for entry in entries.flatten() {
+                        if entry.path().extension().is_some_and(|e| e == "o") {
+                            ar.arg(entry.path());
+                        }
+                    }
+                }
+            }
+            ar.status().expect("failed to create libtk_megakernels.a");
+            // Cleanup
+            let _ = std::fs::remove_dir_all(format!("{cache_dir}/tk_extract"));
+        }
     }
 
     for cu in &megakernel_cus {

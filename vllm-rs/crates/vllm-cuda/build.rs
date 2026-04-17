@@ -31,6 +31,10 @@ fn cuda_link() {
     if mk_lib.exists() {
         println!("cargo:rustc-link-lib=static=megakernels");
     }
+    let tk_lib = std::path::Path::new(&cache_str).join("libtk_megakernels.a");
+    if tk_lib.exists() {
+        println!("cargo:rustc-link-lib=static=tk_megakernels");
+    }
 
     println!("cargo:rustc-link-lib=static=vllm_kernels");
     println!("cargo:rustc-link-lib=static=ggml_kernels");

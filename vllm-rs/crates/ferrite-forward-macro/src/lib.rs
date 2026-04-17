@@ -36,6 +36,7 @@ mod cuda_codegen;
 mod emit;
 mod fuf;
 mod impl_lib;
+mod instruction;
 mod parse;
 mod schedule;
 mod shape;
@@ -300,7 +301,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
 
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
         let codegen_items =
-            codegen::emit_model(&classified, model, &model_fuf, &sfufs, &loops, &library);
+            codegen::emit_model(&classified, model, &target_profile, &model_fuf, &sfufs, &loops, &library);
         let model_mod = &model.name;
         per_model_ts.push(quote! {
             pub mod #model_mod {

@@ -42,6 +42,7 @@ use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{DevicePhase, ImplId, ImplementationLibrary, WeightAccessor};
 use crate::schedule::{Loop, WorkloadLoops};
 use crate::solver::{Assignment, SubgraphId, WorkloadAssignments};
+use crate::target::TargetProfile;
 
 // ── Weights struct + loader emission ─────────────────────────────
 
@@ -487,10 +488,631 @@ struct MegakernelEmitCtx<'a> {
     fuf: &'a Fuf,
     program: &'a Program,
     model: &'a ModelParams,
+    target: &'a TargetProfile,
     lib: &'a ImplementationLibrary,
     locals: &'a LocalMap,
     drops: &'a DropPlan,
     num_tokens: u64,
+}
+
+/// Try to emit a TK megakernel for the entire forward pass (SM90+).
+///
+/// Generates a single `.cu` file using the KVM runtime with vendored
+/// ThunderKittens ops. Returns the complete forward function body
+/// as a TokenStream, or `None` if TK emission isn't applicable.
+#[allow(clippy::too_many_arguments)]
+fn try_emit_tk_forward(
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    loop_ir: &Loop,
+    program: &Program,
+    model: &ModelParams,
+    target: &TargetProfile,
+    lib: &ImplementationLibrary,
+    _locals: &LocalMap,
+    num_tokens: u64,
+) -> Option<TokenStream> {
+    use crate::cuda_codegen::{TkModelDims, generate_tk_megakernel};
+    use crate::instruction::{build_instruction_schedule, assign_to_sms, INSTRUCTION_WORDS};
+
+    // Extract model dimensions from ModelParams bounds.
+    let get = |key: &str| -> Option<u32> {
+        model.bounds.get(key).map(|v| *v as u32)
+    };
+    let num_layers = get("num_hidden_layers")?;
+    let hidden_dim = get("hidden_size")?;
+    let intermediate_dim = get("intermediate_size")?;
+    let num_attention_heads = get("num_attention_heads")?;
+    let num_kv_heads = get("num_key_value_heads").unwrap_or(num_attention_heads);
+    let head_dim = get("head_dim").unwrap_or(hidden_dim / num_attention_heads);
+    let vocab_size = get("vocab_size")?;
+
+    let dims = TkModelDims {
+        num_layers,
+        hidden_dim,
+        intermediate_dim,
+        head_dim,
+        num_attention_heads,
+        num_kv_heads,
+        kv_block_size: 16,
+        matvec_block_size: 16,
+        vocab_size,
+        sm_count: target.num_sms,
+    };
+
+    let model_name = model.source_stem.replace(['-', '.'], "_");
+    let generated = generate_tk_megakernel(&model_name, &dims);
+
+    // Write .cu to cache directory.
+    if let Ok(home) = std::env::var("HOME") {
+        let mega_dir = std::path::PathBuf::from(home).join(".cache/cudaforge/megakernels");
+        let _ = std::fs::create_dir_all(&mega_dir);
+        let cu_path = mega_dir.join(format!("{}.cu", generated.launch_fn_name));
+        let _ = std::fs::write(&cu_path, &generated.cuda_source);
+    }
+
+    // Build instruction schedule from all megakernel subgraphs.
+    let all_sgs: Vec<(crate::solver::SubgraphId, crate::impl_lib::ImplId)> = loop_ir
+        .waves
+        .iter()
+        .filter(|w| w.is_megakernel)
+        .flat_map(|w| w.subgraphs.iter().cloned())
+        .collect();
+
+    if all_sgs.is_empty() {
+        return None;
+    }
+
+    let schedule = build_instruction_schedule(fuf, sfuf, lib, &all_sgs);
+    let per_sm = assign_to_sms(&schedule.instructions, target.num_sms as usize);
+
+    // Serialize instruction tensor: [num_sms][max_instructions_per_sm][INSTRUCTION_WORDS]
+    let max_per_sm = per_sm.iter().map(|v| v.len()).max().unwrap_or(0);
+    let total_words = target.num_sms as usize * max_per_sm * INSTRUCTION_WORDS;
+
+    // Build the instruction data as a compile-time constant.
+    let inst_data: Vec<u32> = {
+        let mut data = vec![0u32; total_words];
+        for (sm, insts) in per_sm.iter().enumerate() {
+            for (i, inst) in insts.iter().enumerate() {
+                let words = inst.serialize(0); // subgraph ordinal TBD
+                let offset = (sm * max_per_sm + i) * INSTRUCTION_WORDS;
+                data[offset..offset + INSTRUCTION_WORDS].copy_from_slice(&words);
+            }
+        }
+        data
+    };
+
+    let num_barriers = schedule.num_barriers;
+    let inst_data_tokens: Vec<proc_macro2::TokenStream> = inst_data
+        .iter()
+        .map(|w| quote! { #w })
+        .collect();
+    let total_words_lit = total_words;
+    let num_barriers_lit = num_barriers;
+
+    // ── Classify weight accessors by TK role ──
+    //
+    // Walk ALL subgraphs (not just megakernel) to discover every weight
+    // accessor. Classify each by examining the source weight paths in
+    // the Program's weight table.
+    let all_wave_sgs: Vec<(crate::solver::SubgraphId, crate::impl_lib::ImplId)> = loop_ir
+        .waves
+        .iter()
+        .flat_map(|w| w.subgraphs.iter().cloned())
+        .collect();
+
+    let mut qkv_fields: Vec<(usize, syn::Ident)> = Vec::new();
+    let mut o_fields: Vec<(usize, syn::Ident)> = Vec::new();
+    let mut gate_up_fields: Vec<(usize, syn::Ident)> = Vec::new();
+    let mut down_fields: Vec<(usize, syn::Ident)> = Vec::new();
+    let mut attn_norm_fields: Vec<(usize, syn::Ident)> = Vec::new();
+    let mut mlp_norm_fields: Vec<(usize, syn::Ident)> = Vec::new();
+    let mut embed_field: Option<syn::Ident> = None;
+    let mut lm_head_field: Option<syn::Ident> = None;
+    let mut lm_head_norm_field: Option<syn::Ident> = None;
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (sg_id, imp_id) in &all_wave_sgs {
+        let tiles = sfuf.tiles_in_subgraph(*sg_id);
+        let imp = lib.get(*imp_id);
+        for wa in imp.required_weights(&tiles, fuf, program) {
+            let name_str = wa.name.to_string();
+            if !seen_names.insert(name_str) {
+                continue;
+            }
+
+            // Classify by source weight paths.
+            let mut role = "";
+            let mut layer_idx: Option<usize> = None;
+
+            for (wid, _) in &wa.source_weights {
+                let path = program.weights.path(*wid);
+                let parts: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+                let joined = parts.join(".");
+
+                // Extract layer index from "layers.N" pattern.
+                for (i, seg) in parts.iter().enumerate() {
+                    if i > 0 && parts[i - 1] == "layers"
+                        && let Ok(idx) = seg.parse::<usize>()
+                    {
+                        layer_idx = Some(idx);
+                    }
+                }
+
+                if joined.contains("q_proj")
+                    || joined.contains("k_proj")
+                    || joined.contains("v_proj")
+                {
+                    role = "qkv";
+                } else if joined.contains("o_proj") {
+                    role = "o";
+                } else if joined.contains("gate_proj") || joined.contains("up_proj") {
+                    role = "gate_up";
+                } else if joined.contains("down_proj") {
+                    role = "down";
+                } else if joined.contains("input_layernorm") {
+                    role = "attn_norm";
+                } else if joined.contains("post_attention_layernorm") {
+                    role = "mlp_norm";
+                } else if !joined.contains("layers") {
+                    if joined.contains("embed") {
+                        role = "embed";
+                    } else if joined.contains("lm_head") {
+                        role = "lm_head";
+                    } else if joined.ends_with("norm") {
+                        role = "lm_head_norm";
+                    }
+                }
+            }
+
+            match role {
+                "qkv" => qkv_fields.push((layer_idx.unwrap_or(0), wa.name.clone())),
+                "o" => o_fields.push((layer_idx.unwrap_or(0), wa.name.clone())),
+                "gate_up" => gate_up_fields.push((layer_idx.unwrap_or(0), wa.name.clone())),
+                "down" => down_fields.push((layer_idx.unwrap_or(0), wa.name.clone())),
+                "attn_norm" => attn_norm_fields.push((layer_idx.unwrap_or(0), wa.name.clone())),
+                "mlp_norm" => mlp_norm_fields.push((layer_idx.unwrap_or(0), wa.name.clone())),
+                "embed" => embed_field = Some(wa.name.clone()),
+                "lm_head" => lm_head_field = Some(wa.name.clone()),
+                "lm_head_norm" => lm_head_norm_field = Some(wa.name.clone()),
+                _ => {}
+            }
+        }
+    }
+
+    // Sort per-layer fields by layer index.
+    qkv_fields.sort_by_key(|(l, _)| *l);
+    o_fields.sort_by_key(|(l, _)| *l);
+    gate_up_fields.sort_by_key(|(l, _)| *l);
+    down_fields.sort_by_key(|(l, _)| *l);
+    attn_norm_fields.sort_by_key(|(l, _)| *l);
+    mlp_norm_fields.sort_by_key(|(l, _)| *l);
+
+    // If we can't find all required weight roles, fall back to BSP.
+    let embed_ident = embed_field?;
+    let lm_head_ident = lm_head_field?;
+    let lm_head_norm_ident = lm_head_norm_field?;
+
+    if qkv_fields.len() != num_layers as usize
+        || o_fields.len() != num_layers as usize
+        || down_fields.len() != num_layers as usize
+        || attn_norm_fields.len() != num_layers as usize
+        || mlp_norm_fields.len() != num_layers as usize
+    {
+        return None; // incomplete weight set for TK
+    }
+
+    // ── Build per-layer D2D copy statements (compile-time unrolled) ──
+
+    let num_layers_usize = num_layers as usize;
+    let hidden_usize = hidden_dim as usize;
+    let intermediate_usize = intermediate_dim as usize;
+    let head_dim_usize = head_dim as usize;
+    let num_heads_usize = num_attention_heads as usize;
+    let num_kv_heads_usize = num_kv_heads as usize;
+    let vocab_usize = vocab_size as usize;
+    let num_sms_usize = target.num_sms as usize;
+    let qkv_out_dim = (num_attention_heads + 2 * num_kv_heads) * head_dim;
+    let qkv_out_usize = qkv_out_dim as usize;
+
+    // QKV weight stacking: each layer's fused QKV → contiguous buffer.
+    let qkv_copy_stmts: Vec<TokenStream> = qkv_fields.iter().enumerate().map(|(i, (_, field))| {
+        quote! {
+            ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                __tk_qkv_buf.add(#i * __qkv_per_layer),
+                wm.#field.dense_weight().raw_ptr(),
+                __qkv_per_layer,
+                __stream,
+            ).expect("qkv stack");
+        }
+    }).collect();
+
+    // O-proj weight stacking.
+    let o_copy_stmts: Vec<TokenStream> = o_fields.iter().enumerate().map(|(i, (_, field))| {
+        quote! {
+            ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                __tk_o_buf.add(#i * __o_per_layer),
+                wm.#field.dense_weight().raw_ptr(),
+                __o_per_layer,
+                __stream,
+            ).expect("o stack");
+        }
+    }).collect();
+
+    // Gate + Up: fused gate_up accessor has [gate|up] concatenated.
+    // Split into separate gate and up buffers.
+    let gate_up_copy_stmts: Vec<TokenStream> = if gate_up_fields.len() == num_layers as usize {
+        gate_up_fields.iter().enumerate().map(|(i, (_, field))| {
+            quote! {
+                {
+                    let __fused_ptr = wm.#field.dense_weight().raw_ptr();
+                    // Gate = first intermediate_dim rows.
+                    ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                        __tk_gate_buf.add(#i * __gate_per_layer),
+                        __fused_ptr,
+                        __gate_per_layer,
+                        __stream,
+                    ).expect("gate stack");
+                    // Up = second intermediate_dim rows.
+                    ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                        __tk_up_buf.add(#i * __gate_per_layer),
+                        __fused_ptr.add(__gate_per_layer),
+                        __gate_per_layer,
+                        __stream,
+                    ).expect("up stack");
+                }
+            }
+        }).collect()
+    } else {
+        return None; // need fused gate+up for every layer
+    };
+
+    // Down-proj weight stacking.
+    let down_copy_stmts: Vec<TokenStream> = down_fields.iter().enumerate().map(|(i, (_, field))| {
+        quote! {
+            ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                __tk_down_buf.add(#i * __down_per_layer),
+                wm.#field.dense_weight().raw_ptr(),
+                __down_per_layer,
+                __stream,
+            ).expect("down stack");
+        }
+    }).collect();
+
+    // Attn norm weight stacking.
+    let attn_norm_copy_stmts: Vec<TokenStream> = attn_norm_fields.iter().enumerate().map(|(i, (_, field))| {
+        quote! {
+            ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                __tk_attn_norm_buf.add(#i * __norm_per_layer),
+                wm.#field.weight.raw_ptr(),
+                __norm_per_layer,
+                __stream,
+            ).expect("attn_norm stack");
+        }
+    }).collect();
+
+    // MLP norm weight stacking.
+    let mlp_norm_copy_stmts: Vec<TokenStream> = mlp_norm_fields.iter().enumerate().map(|(i, (_, field))| {
+        quote! {
+            ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                __tk_mlp_norm_buf.add(#i * __norm_per_layer),
+                wm.#field.weight.raw_ptr(),
+                __norm_per_layer,
+                __stream,
+            ).expect("mlp_norm stack");
+        }
+    }).collect();
+
+    // First attn norm accessor — used to read rms_norm_eps.
+    let first_attn_norm = &attn_norm_fields[0].1;
+
+    // ── Emit Rust code ──
+
+    let launch_fn = format_ident!("{}", generated.launch_fn_name);
+    let fn_name = format_ident!("forward_m_{}", num_tokens);
+
+    let extern_params: Vec<TokenStream> = generated
+        .flat_params
+        .iter()
+        .map(|(c_type, name)| {
+            let name_ident = format_ident!("{}", name);
+            let ty = c_type_to_rust(c_type);
+            quote! { #name_ident: #ty }
+        })
+        .collect();
+
+    let tokens = quote! {
+        // One-time weight stacking statics (persistent GPU allocs).
+        static __TK_INIT: ::std::sync::Once = ::std::sync::Once::new();
+        static __TK_QKV: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        static __TK_O: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        static __TK_GATE: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        static __TK_UP: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        static __TK_DOWN: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        static __TK_ATTN_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        static __TK_MLP_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+
+        unsafe extern "C" {
+            fn #launch_fn(#(#extern_params,)* __stream: u64) -> i32;
+        }
+
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn #fn_name(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            use ::std::sync::atomic::Ordering;
+
+            let __stream = device.compute_stream;
+            let __num_layers: usize = #num_layers_usize;
+            let __hidden: usize = #hidden_usize;
+            let __intermediate: usize = #intermediate_usize;
+            let __head_dim: usize = #head_dim_usize;
+            let __num_heads: usize = #num_heads_usize;
+            let __num_kv_heads: usize = #num_kv_heads_usize;
+            let __qkv_out: usize = #qkv_out_usize;
+            let __vocab: usize = #vocab_usize;
+            let __num_sms: usize = #num_sms_usize;
+
+            // ── One-time weight stacking (persistent GPU allocs) ──
+            __TK_INIT.call_once(|| {
+                // QKV: [num_layers, qkv_out, hidden] bf16
+                let __qkv_per_layer = __qkv_out * __hidden * 2;
+                let __qkv_total = __num_layers * __qkv_per_layer;
+                let __tk_qkv_buf = ::ferrite_cuda_core::driver::mem_alloc(__qkv_total)
+                    .expect("tk qkv alloc");
+                #(#qkv_copy_stmts)*
+                __TK_QKV.store(__tk_qkv_buf as u64, Ordering::Relaxed);
+
+                // O: [num_layers, hidden, hidden] bf16
+                let __o_per_layer = __hidden * __hidden * 2;
+                let __o_total = __num_layers * __o_per_layer;
+                let __tk_o_buf = ::ferrite_cuda_core::driver::mem_alloc(__o_total)
+                    .expect("tk o alloc");
+                #(#o_copy_stmts)*
+                __TK_O.store(__tk_o_buf as u64, Ordering::Relaxed);
+
+                // Gate + Up: split from fused [gate|up]
+                let __gate_per_layer = __intermediate * __hidden * 2;
+                let __gate_total = __num_layers * __gate_per_layer;
+                let __tk_gate_buf = ::ferrite_cuda_core::driver::mem_alloc(__gate_total)
+                    .expect("tk gate alloc");
+                let __tk_up_buf = ::ferrite_cuda_core::driver::mem_alloc(__gate_total)
+                    .expect("tk up alloc");
+                #(#gate_up_copy_stmts)*
+                __TK_GATE.store(__tk_gate_buf as u64, Ordering::Relaxed);
+                __TK_UP.store(__tk_up_buf as u64, Ordering::Relaxed);
+
+                // Down: [num_layers, hidden, intermediate] bf16
+                let __down_per_layer = __hidden * __intermediate * 2;
+                let __down_total = __num_layers * __down_per_layer;
+                let __tk_down_buf = ::ferrite_cuda_core::driver::mem_alloc(__down_total)
+                    .expect("tk down alloc");
+                #(#down_copy_stmts)*
+                __TK_DOWN.store(__tk_down_buf as u64, Ordering::Relaxed);
+
+                // Attn norm: [num_layers, hidden] bf16
+                let __norm_per_layer = __hidden * 2;
+                let __norm_total = __num_layers * __norm_per_layer;
+                let __tk_attn_norm_buf = ::ferrite_cuda_core::driver::mem_alloc(__norm_total)
+                    .expect("tk attn_norm alloc");
+                #(#attn_norm_copy_stmts)*
+                __TK_ATTN_NORM.store(__tk_attn_norm_buf as u64, Ordering::Relaxed);
+
+                // MLP norm: [num_layers, hidden] bf16
+                let __tk_mlp_norm_buf = ::ferrite_cuda_core::driver::mem_alloc(__norm_total)
+                    .expect("tk mlp_norm alloc");
+                #(#mlp_norm_copy_stmts)*
+                __TK_MLP_NORM.store(__tk_mlp_norm_buf as u64, Ordering::Relaxed);
+
+                // Sync stacking copies.
+                ::ferrite_cuda_core::driver::stream_synchronize(__stream)
+                    .expect("tk weight stack sync");
+            });
+
+            let __qkv_ptr = __TK_QKV.load(Ordering::Relaxed) as u64;
+            let __o_ptr = __TK_O.load(Ordering::Relaxed) as u64;
+            let __gate_ptr = __TK_GATE.load(Ordering::Relaxed) as u64;
+            let __up_ptr = __TK_UP.load(Ordering::Relaxed) as u64;
+            let __down_ptr = __TK_DOWN.load(Ordering::Relaxed) as u64;
+            let __attn_norm_ptr = __TK_ATTN_NORM.load(Ordering::Relaxed) as u64;
+            let __mlp_norm_ptr = __TK_MLP_NORM.load(Ordering::Relaxed) as u64;
+            let __lm_head_norm_ptr = wm.#lm_head_norm_ident.weight.raw_ptr() as u64;
+            let __lm_head_ptr = wm.#lm_head_ident.dense_weight().raw_ptr() as u64;
+
+            // ── Upload instruction tensor to device ──
+            static INST_DATA: &[u32] = &[#(#inst_data_tokens),*];
+            let __inst_bytes = #total_words_lit * 4;
+            let __inst_buf = device.caching.alloc(__inst_bytes);
+            ::ferrite_cuda_core::driver::memcpy_htod_async(
+                __inst_buf, INST_DATA.as_ptr() as *const u8, __inst_bytes,
+                __stream,
+            ).expect("instruction upload failed");
+
+            // ── Allocate and zero barrier counters ──
+            let __bar_bytes = #num_barriers_lit * 4;
+            let __bar_buf = device.caching.alloc(__bar_bytes);
+            ::ferrite_cuda_core::driver::memset_d8(
+                __bar_buf, 0, __bar_bytes, __stream,
+            ).expect("barrier memset failed");
+
+            // ── Timing buffer (unused but required by KVM) ──
+            let __timing_buf = device.caching.alloc(128 * 4);
+
+            // ── Embedding gather: input_ids → hidden_states ──
+            let __hidden_states = ::ferrite_kernels::kernels::embedding_gather(
+                wm.#embed_ident.weight,
+                (*ctx.input_ids).into_inner(),
+                &mut device.caching,
+                __stream,
+            );
+
+            // ── Activation buffers ──
+            let __q_post_rope = device.caching.alloc_tensor(
+                &[1, __num_heads * __head_dim],
+                ::ferrite_cuda_core::DType::BF16,
+            );
+            let __attn_out = device.caching.alloc_tensor(
+                &[1, __hidden],
+                ::ferrite_cuda_core::DType::BF16,
+            );
+            let __attn_lse_rows = ((__num_sms + 15) / 16) * 16;
+            let __attn_lse = device.caching.alloc_tensor(
+                &[__num_heads, __attn_lse_rows],
+                ::ferrite_cuda_core::DType::F32,
+            );
+            let __attn_out_int = device.caching.alloc_tensor(
+                &[__num_heads, __num_sms, __head_dim],
+                ::ferrite_cuda_core::DType::F32,
+            );
+            let __silu_out = device.caching.alloc_tensor(
+                &[1, __intermediate],
+                ::ferrite_cuda_core::DType::BF16,
+            );
+            let __logits = device.caching.alloc_tensor(
+                &[1, __vocab],
+                ::ferrite_cuda_core::DType::BF16,
+            );
+
+            // ── KV cache: stack per-layer caches into contiguous buffers ──
+            let __kv_num_blocks = (*ctx.kv_cache.k_cache(0)).dim(0);
+            let __kv_block_size = (*ctx.kv_cache.k_cache(0)).dim(1);
+            let __k_per_layer = __kv_num_blocks * __kv_block_size * __num_kv_heads * __head_dim * 2;
+            let __k_total = __num_layers * __k_per_layer;
+            let __k_stacked = device.caching.alloc(__k_total);
+            let __v_stacked = device.caching.alloc(__k_total);
+            for __layer in 0..__num_layers {
+                ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                    __k_stacked.add(__layer * __k_per_layer),
+                    (*ctx.kv_cache.k_cache(__layer)).raw_ptr(),
+                    __k_per_layer,
+                    __stream,
+                ).expect("k cache stack");
+                ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                    __v_stacked.add(__layer * __k_per_layer),
+                    (*ctx.kv_cache.v_cache(__layer)).raw_ptr(),
+                    __k_per_layer,
+                    __stream,
+                ).expect("v cache stack");
+            }
+
+            // ── RoPE tables (separate cos, sin as f32) ──
+            let __rope_cos_ptr = ctx.rotary.cos_cache.raw_ptr() as u64;
+            let __rope_sin_ptr = ctx.rotary.sin_cache.raw_ptr() as u64;
+            let __rope_rows = ctx.rotary.cos_cache.dim(0) as i32;
+
+            // ── Scalars ──
+            let __pos_id: u32 = {
+                let mut __val = 0u32;
+                ::ferrite_cuda_core::driver::memcpy_dtoh_async(
+                    &mut __val as *mut u32 as *mut u8,
+                    (*ctx.positions).raw_ptr(),
+                    4,
+                    __stream,
+                ).expect("pos read");
+                ::ferrite_cuda_core::driver::stream_synchronize(__stream)
+                    .expect("pos sync");
+                __val
+            };
+            let __attn_scale: f32 = 1.0 / (__head_dim as f32).sqrt();
+            let __rms_norm_eps: f32 = wm.#first_attn_norm.eps;
+
+            // ── Launch TK megakernel ──
+            let __stream_u64 = __stream as u64;
+            let __ret = #launch_fn(
+                // VM state
+                __bar_buf as u64,                              // bar_ptr
+                __num_layers as i32,                           // bar_depth
+                (__num_heads + 2 * __num_kv_heads) as i32,     // bar_rows
+                __inst_buf as u64,                             // instructions_ptr
+                __timing_buf as u64,                           // timings_ptr
+                // Weights (stacked across layers)
+                __qkv_ptr,                                     // qkv_weights_ptr
+                __num_layers as i32,                           // qkv_weights_depth
+                (__qkv_out as i32),                            // qkv_weights_rows
+                __o_ptr,                                       // o_weights_ptr
+                __num_layers as i32,                           // o_weights_depth
+                __hidden as i32,                               // o_weights_rows
+                __up_ptr,                                      // up_weights_ptr
+                __num_layers as i32,                           // up_weights_depth
+                __intermediate as i32,                         // up_weights_rows
+                __gate_ptr,                                    // gate_weights_ptr
+                __num_layers as i32,                           // gate_weights_depth
+                __intermediate as i32,                         // gate_weights_rows
+                __lm_head_ptr,                                 // lm_head_weights_ptr
+                1i32,                                          // lm_head_weights_depth
+                (__vocab as i32),                               // lm_head_weights_rows
+                __down_ptr,                                    // down_weights_ptr
+                __num_layers as i32,                           // down_weights_depth
+                __hidden as i32,                               // down_weights_rows
+                // Norm weights (stacked across layers)
+                __attn_norm_ptr,                               // attn_norm_weights_ptr
+                __num_layers as i32,                           // attn_norm_weights_rows
+                __mlp_norm_ptr,                                // mlp_norm_weights_ptr
+                __num_layers as i32,                           // mlp_norm_weights_rows
+                __lm_head_norm_ptr,                            // lm_head_norm_weights_ptr
+                1i32,                                          // lm_head_norm_weights_rows
+                // KV cache (stacked)
+                __k_stacked as u64,                            // k_cache_ptr
+                (__num_kv_heads as i32),                       // k_cache_batch
+                (__kv_num_blocks as i32),                      // k_cache_depth
+                (__kv_block_size as i32),                      // k_cache_rows
+                __v_stacked as u64,                            // v_cache_ptr
+                (__num_kv_heads as i32),                       // v_cache_batch
+                (__kv_num_blocks as i32),                      // v_cache_depth
+                (__kv_block_size as i32),                      // v_cache_rows
+                // RoPE
+                __rope_cos_ptr,                                // rope_cos_ptr
+                __rope_sin_ptr,                                // rope_sin_ptr
+                __rope_rows,                                   // rope_rows
+                // Activation buffers
+                __hidden_states.as_ref().raw_ptr() as u64,     // hidden_states_ptr
+                __q_post_rope.as_ref().raw_ptr() as u64,       // q_post_rope_ptr
+                __attn_out.as_ref().raw_ptr() as u64,          // attn_out_ptr
+                __attn_lse.as_ref().raw_ptr() as u64,          // attn_lse_ptr
+                __attn_lse_rows as i32,                        // attn_lse_rows
+                __attn_out_int.as_ref().raw_ptr() as u64,      // attn_out_intermediates_ptr
+                __num_sms as i32,                              // attn_out_intermediates_rows
+                __silu_out.as_ref().raw_ptr() as u64,          // silu_out_ptr
+                __logits.as_ref().raw_ptr() as u64,            // logits_ptr
+                __vocab as i32,                                // logits_cols
+                // Scalars
+                __pos_id,                                      // pos_id
+                __attn_scale,                                  // attn_scale
+                __rms_norm_eps,                                // rms_norm_eps
+                0i32,                                          // skip_attn_reduction
+                // Stream
+                __stream_u64,
+            );
+            assert_eq!(__ret, 0, "TK megakernel launch failed (CUDA error {})", __ret);
+
+            // ── Copy KV cache back from stacked buffer ──
+            // The TK kernel writes new K/V tokens during rms_qkv_rope_append.
+            // Copy updated caches back to the per-layer KvCachePool tensors.
+            for __layer in 0..__num_layers {
+                ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                    (*ctx.kv_cache.k_cache(__layer)).raw_ptr(),
+                    __k_stacked.add(__layer * __k_per_layer),
+                    __k_per_layer,
+                    __stream,
+                ).expect("k cache writeback");
+                ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                    (*ctx.kv_cache.v_cache(__layer)).raw_ptr(),
+                    __v_stacked.add(__layer * __k_per_layer),
+                    __k_per_layer,
+                    __stream,
+                ).expect("v cache writeback");
+            }
+
+            // Return logits.
+            __logits
+        }
+    };
+
+    Some(tokens)
 }
 
 /// Try to emit a megakernel launch for a group of ≥2 DC subgraphs.
@@ -788,12 +1410,14 @@ fn generate_megakernel_labeled(
 }
 
 /// Emit one per-workload-bucket forward fn.
+#[allow(clippy::too_many_arguments)]
 fn emit_forward_for_bucket(
     fuf: &Fuf,
     sfuf: &Assignment,
     loop_ir: &Loop,
     program: &Program,
     model: &ModelParams,
+    target: &TargetProfile,
     lib: &ImplementationLibrary,
     num_tokens: u64,
 ) -> TokenStream {
@@ -803,6 +1427,18 @@ fn emit_forward_for_bucket(
         for slot in 0..node.outputs.len().max(1) as u8 {
             locals.insert((node.id, slot), format_ident!("t_{}_{}", node.id.0, slot));
         }
+    }
+
+    // SM90+ (Hopper/Blackwell): try TK megakernel path.
+    // This replaces the entire wave-by-wave BSP emission with a
+    // single kernel using the KVM runtime (warp-specialized, TMA
+    // pipelined, per-SM static instruction queues).
+    if target.compute_capability >= 90
+        && let Some(tk_tokens) = try_emit_tk_forward(
+            fuf, sfuf, loop_ir, program, model, target, lib, &locals, num_tokens,
+        )
+    {
+        return tk_tokens;
     }
 
     // Forward returns the last tile's slot-0 output — its owner must
@@ -821,6 +1457,7 @@ fn emit_forward_for_bucket(
         fuf,
         program,
         model,
+        target,
         lib,
         locals: &locals,
         drops: &drops,
@@ -900,12 +1537,14 @@ fn emit_forward_for_bucket(
 ///
 /// The emitted fn's signature mirrors `forward_m_<N>` exactly except
 /// for the name and semantic return value.
+#[allow(clippy::too_many_arguments)]
 fn emit_forward_backbone_for_bucket(
     fuf: &Fuf,
     sfuf: &Assignment,
     loop_ir: &Loop,
     program: &Program,
     model: &ModelParams,
+    target: &TargetProfile,
     lib: &ImplementationLibrary,
     num_tokens: u64,
 ) -> TokenStream {
@@ -961,6 +1600,7 @@ fn emit_forward_backbone_for_bucket(
         fuf,
         program,
         model,
+        target,
         lib,
         locals: &locals,
         drops: &drops,
@@ -1054,6 +1694,7 @@ fn emit_forward_backbone_for_bucket(
 pub fn emit_model(
     program: &Program,
     model: &ModelParams,
+    target: &TargetProfile,
     fuf: &Fuf,
     sfufs: &WorkloadAssignments,
     loops: &WorkloadLoops,
@@ -1069,7 +1710,7 @@ pub fn emit_model(
                 .per_num_tokens
                 .get(m)
                 .expect("schedule populated every key");
-            emit_forward_for_bucket(fuf, sfuf, loop_ir, program, model, lib, *m)
+            emit_forward_for_bucket(fuf, sfuf, loop_ir, program, model, target, lib, *m)
         })
         .collect();
     let backbone_fns: Vec<TokenStream> = sfufs
@@ -1080,7 +1721,7 @@ pub fn emit_model(
                 .per_num_tokens
                 .get(m)
                 .expect("schedule populated every key");
-            emit_forward_backbone_for_bucket(fuf, sfuf, loop_ir, program, model, lib, *m)
+            emit_forward_backbone_for_bucket(fuf, sfuf, loop_ir, program, model, target, lib, *m)
         })
         .collect();
 

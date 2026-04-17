@@ -359,28 +359,66 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     };
 
     // The megakernel .cu files include megakernel_ops.cuh from vllm-cuda/csrc.
+    // TK megakernels (SM90+) additionally include kittens.cuh and the KVM runtime.
     const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
 
-    let mut mk_builder = cudaforge::KernelBuilder::new();
-    mk_builder = mk_builder
-        .out_dir(cache_dir)
-        .source_files(megakernel_cus.clone())
-        .include_path("../../crates/vllm-cuda/csrc")
-        .with_cutlass(Some(CUTLASS_COMMIT));
-    mk_builder
-        .arg(std_flag)
-        .arg("-O3")
-        .arg("--use_fast_math")
-        .arg("--expt-extended-lambda")
-        .arg("--expt-relaxed-constexpr")
-        .arg("-DNDEBUG")
-        .arg("-Xcompiler=-fPIC")
-        .arg("-Xcompiler=-fno-strict-aliasing")
-        .arg("-Xcompiler=-Wno-psabi")
-        .arg(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
-        .arg("-lineinfo")
-        .build_lib(format!("{cache_dir}/libmegakernels.a"))
-        .expect("failed to build megakernel .cu files");
+    // Separate TK megakernels (files containing "tk_megakernel") from BSP ones.
+    let (tk_cus, bsp_cus): (Vec<String>, Vec<String>) = megakernel_cus
+        .iter()
+        .cloned()
+        .partition(|f| f.contains("tk_megakernel"));
+
+    // Build BSP megakernels (sm89+).
+    if !bsp_cus.is_empty() {
+        let mut mk_builder = cudaforge::KernelBuilder::new();
+        mk_builder = mk_builder
+            .out_dir(cache_dir)
+            .source_files(bsp_cus.clone())
+            .include_path("../../crates/vllm-cuda/csrc")
+            .with_cutlass(Some(CUTLASS_COMMIT));
+        mk_builder
+            .arg(std_flag)
+            .arg("-O3")
+            .arg("--use_fast_math")
+            .arg("--expt-extended-lambda")
+            .arg("--expt-relaxed-constexpr")
+            .arg("-DNDEBUG")
+            .arg("-Xcompiler=-fPIC")
+            .arg("-Xcompiler=-fno-strict-aliasing")
+            .arg("-Xcompiler=-Wno-psabi")
+            .arg(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+            .arg("-lineinfo")
+            .build_lib(format!("{cache_dir}/libmegakernels.a"))
+            .expect("failed to build BSP megakernel .cu files");
+    }
+
+    // Build TK megakernels (sm90+ only, requires ThunderKittens + KVM runtime).
+    if !tk_cus.is_empty() && arch_num >= 90 {
+        let mut tk_builder = cudaforge::KernelBuilder::new();
+        tk_builder = tk_builder
+            .out_dir(cache_dir)
+            .source_files(tk_cus.clone())
+            .include_path("../../crates/vllm-cuda/csrc")
+            .include_path("../../third_party/ThunderKittens")
+            .include_path("../../third_party/Megakernels/include")
+            .include_path("../../third_party/Megakernels/demos/low-latency-llama")
+            .with_cutlass(Some(CUTLASS_COMMIT));
+        tk_builder
+            .arg("-std=c++20")
+            .arg("-O3")
+            .arg("--use_fast_math")
+            .arg("--expt-extended-lambda")
+            .arg("--expt-relaxed-constexpr")
+            .arg("-DNDEBUG")
+            .arg("-DKITTENS_HOPPER")
+            .arg("-Xcompiler=-fPIC")
+            .arg("-Xcompiler=-fno-strict-aliasing")
+            .arg("-Xcompiler=-Wno-psabi")
+            .arg(&format!("-arch=sm_{arch}a"))
+            .arg("-lineinfo")
+            .build_lib(format!("{cache_dir}/libtk_megakernels.a"))
+            .expect("failed to build TK megakernel .cu files");
+    }
 
     for cu in &megakernel_cus {
         rerun_files.push(cu.clone());

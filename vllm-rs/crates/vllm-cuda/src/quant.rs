@@ -175,6 +175,11 @@ impl QuantConfig {
     pub fn is_awq(&self) -> bool {
         matches!(self, Self::Awq(_))
     }
+
+    /// Whether this is a GPTQ quantized model.
+    pub fn is_gptq(&self) -> bool {
+        matches!(self, Self::Gptq(_))
+    }
 }
 
 // ---------------------------------------------------------------------------

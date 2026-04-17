@@ -10,9 +10,10 @@
 //! format. This module only handles the first half — what the
 //! weights ARE.
 //!
-//! Today's coverage: `Dense` (no `quantization_config` present) and
-//! `Awq` (AutoAWQ's `quant_method: "awq"` shape, with optional
-//! `modules_to_not_convert`). GPTQ / FP8 / BnB / FP8-block land here
+//! Today's coverage: `Dense` (no `quantization_config` present),
+//! `Awq` (AutoAWQ's `quant_method: "awq"` shape), and `Gptq`
+//! (GPTQ-for-LLMs / AutoGPTQ's `quant_method: "gptq"` shape). Both
+//! honor `modules_to_not_convert`. FP8 / BnB / FP8-block land here
 //! as they're wired up; each added variant must ship together with
 //! its parser + per-format FieldLoad arm + at least one solver-
 //! accepting Impl that emits the matching kernel call.
@@ -43,6 +44,22 @@ pub enum StorageFormat {
         group_size: u32,
         zero_point: bool,
         version: AwqVersion,
+    },
+    /// GPTQ-for-LLMs / AutoGPTQ INT4 weights. `bits` (4 today for
+    /// the ferrite path), `group_size` (scales per group-of-K rows,
+    /// -1 → per-channel collapses to one group), `desc_act` (when
+    /// `true`, the on-disk weights carry a `.g_idx` tensor encoding
+    /// the activation-order permutation — the loader reads it and
+    /// hands sort_indices to the Marlin repack kernel), `sym`
+    /// (symmetric vs asymmetric quantization — AutoGPTQ's default
+    /// is symmetric, in which case zero points are baked into the
+    /// GPTQ uint4b8 scalar type and the `.qzeros` tensor is
+    /// discarded at load).
+    Gptq {
+        bits: u32,
+        group_size: u32,
+        desc_act: bool,
+        sym: bool,
     },
 }
 
@@ -80,6 +97,12 @@ pub enum QuantMethod {
         group_size: u32,
         zero_point: bool,
         version: AwqVersion,
+    },
+    Gptq {
+        bits: u32,
+        group_size: u32,
+        desc_act: bool,
+        sym: bool,
     },
 }
 
@@ -146,6 +169,7 @@ impl QuantizationConfig {
 
         let method = match method_str {
             "awq" => parse_awq(obj)?,
+            "gptq" => parse_gptq(obj)?,
             other => return Err(ParseError::UnsupportedMethod(other.to_string())),
         };
 
@@ -224,6 +248,57 @@ fn parse_awq(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMe
     })
 }
 
+fn parse_gptq(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMethod, ParseError> {
+    let bits = obj
+        .get("bits")
+        .and_then(|v| v.as_u64())
+        .ok_or(ParseError::BadField {
+            field: "bits",
+            reason: "missing or not a u64",
+        })? as u32;
+    if bits != 4 {
+        return Err(ParseError::BadField {
+            field: "bits",
+            reason: "GPTQ ferrite path only handles 4-bit today",
+        });
+    }
+    // `group_size` in AutoGPTQ is i64: positive integer for grouped, -1
+    // for per-channel. The Marlin kernel collapses per-channel to a
+    // single group internally; accept and pass through as 0 so the
+    // loader routes it through `scale_perm_single`.
+    let group_size_i64 =
+        obj.get("group_size")
+            .and_then(|v| v.as_i64())
+            .ok_or(ParseError::BadField {
+                field: "group_size",
+                reason: "missing or not an i64",
+            })?;
+    let group_size: u32 = match group_size_i64 {
+        -1 => 0,
+        n if n > 0 => n as u32,
+        _ => {
+            return Err(ParseError::BadField {
+                field: "group_size",
+                reason: "must be -1 (per-channel) or > 0",
+            });
+        }
+    };
+    let desc_act = obj
+        .get("desc_act")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // AutoGPTQ defaults `sym` to `true`. When symmetric, zero points are
+    // baked into Marlin's `uint4b8` scalar type and the on-disk `.qzeros`
+    // tensor is consumed and discarded at load.
+    let sym = obj.get("sym").and_then(|v| v.as_bool()).unwrap_or(true);
+    Ok(QuantMethod::Gptq {
+        bits,
+        group_size,
+        desc_act,
+        sym,
+    })
+}
+
 /// Resolve the storage format of a single weight by matching its
 /// dotted path against the model's `quantization_config`.
 ///
@@ -265,11 +340,11 @@ pub fn storage_format_for_weight(
         return StorageFormat::Dense;
     }
 
-    // AWQ metadata applies to matmul weights only — the qweight/
-    // scales/qzeros triple produces a 4-bit packed weight that the
-    // marlin GEMM kernel consumes. Weights that never reach a Gemm
-    // tile (Embedding, RmsNorm, biases) have no AWQ representation
-    // on disk and must stay Dense.
+    // AWQ/GPTQ metadata applies to matmul weights only — the
+    // qweight/scales/[qzeros|g_idx] triple produces a 4-bit packed
+    // weight that the marlin GEMM kernel consumes. Weights that
+    // never reach a Gemm tile (Embedding, RmsNorm, biases) have no
+    // quantized representation on disk and must stay Dense.
     let mut reached_by_gemm = false;
     for node in &fuf.nodes {
         if node.op != OpKind::Gemm {
@@ -302,6 +377,17 @@ pub fn storage_format_for_weight(
             group_size,
             zero_point,
             version,
+        },
+        QuantMethod::Gptq {
+            bits,
+            group_size,
+            desc_act,
+            sym,
+        } => StorageFormat::Gptq {
+            bits,
+            group_size,
+            desc_act,
+            sym,
         },
     }
 }
@@ -380,10 +466,102 @@ mod tests {
     #[test]
     fn rejects_unknown_method() {
         let v = json(
-            r#"{"quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128}}"#,
+            r#"{"quantization_config": {"quant_method": "fp8", "activation_scheme": "dynamic"}}"#,
         );
         let err = QuantizationConfig::parse(&v).unwrap_err();
-        assert!(matches!(err, ParseError::UnsupportedMethod(ref s) if s == "gptq"));
+        assert!(matches!(err, ParseError::UnsupportedMethod(ref s) if s == "fp8"));
+    }
+
+    #[test]
+    fn parses_gptq_defaults() {
+        // `desc_act` and `sym` default per AutoGPTQ: `sym = true`,
+        // `desc_act = false`.
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "gptq",
+                    "bits": 4,
+                    "group_size": 128
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().expect("some");
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Gptq {
+                bits: 4,
+                group_size: 128,
+                desc_act: false,
+                sym: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_gptq_desc_act_asym() {
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "gptq",
+                    "bits": 4,
+                    "group_size": 128,
+                    "desc_act": true,
+                    "sym": false
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().unwrap();
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Gptq {
+                desc_act: true,
+                sym: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_gptq_per_channel_group_size_neg_one() {
+        // AutoGPTQ uses `group_size: -1` to mean per-channel; we
+        // collapse that to `group_size: 0` so the loader picks
+        // `scale_perm_single` on the Marlin side.
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "gptq",
+                    "bits": 4,
+                    "group_size": -1
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().unwrap();
+        assert!(matches!(qc.method, QuantMethod::Gptq { group_size: 0, .. }));
+    }
+
+    #[test]
+    fn rejects_gptq_bad_group_size() {
+        let v = json(
+            r#"{"quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 0}}"#,
+        );
+        assert!(matches!(
+            QuantizationConfig::parse(&v),
+            Err(ParseError::BadField {
+                field: "group_size",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_non_4bit_gptq() {
+        let v = json(
+            r#"{"quantization_config": {"quant_method": "gptq", "bits": 8, "group_size": 128}}"#,
+        );
+        assert!(matches!(
+            QuantizationConfig::parse(&v),
+            Err(ParseError::BadField { field: "bits", .. })
+        ));
     }
 
     #[test]

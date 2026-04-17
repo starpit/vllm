@@ -41,6 +41,11 @@ MODELS = {
     # Both FERRITE_ENABLED and FERRITE_DISABLE=1 runs should match this
     # golden within the same top-N tolerance used for dense correctness tests.
     "llama_3_2_1b_awq": "AMead10/Llama-3.2-1B-Instruct-AWQ",
+    # GPTQ symmetric INT4 — exercises the ferrite-forward GPTQ → Marlin
+    # path via `MarlinLinear::load_gptq` / `load_gptq_concat`. Same
+    # storage-vs-compute split as AWQ: the kernel is identical post-
+    # repack; only the loader differs.
+    "qwen2_0_5b_gptq": "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4",
 }
 
 MAX_TOKENS = 32

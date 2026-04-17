@@ -4807,22 +4807,30 @@ impl Implementation for CutlassGemvImpl {
 //   - Structural match identical to its dense sibling (walks the
 //     same tile pattern off the seed).
 //   - Weight storage gate **inverted**: requires every participating
-//     Gemm's weight input to be `StorageFormat::Awq { .. }`, not
-//     `Dense`. The dense variants already reject Awq storage, so
-//     the solver picks exactly one family per model.
+//     Gemm's weight input to be Marlin-consumable (AWQ or GPTQ),
+//     not `Dense`. The dense variants already reject quant storage,
+//     so the solver picks exactly one family per model.
 //   - `required_weights` declares the packed accessor with
-//     `rust_type = MarlinLinear`. AWQ qweight/scales/qzeros all
-//     concat along dim N, so the fused QKV / fused gate-up case
-//     collapses to **one** `MarlinLinear` — same shape the dense
-//     fused accessor uses (one `LinearLayer`).
+//     `rust_type = MarlinLinear`. AWQ and GPTQ both concat their
+//     qweight/scales/(qzeros|g_idx) along the N axis, so the fused
+//     QKV / fused gate-up case collapses to **one** `MarlinLinear`
+//     — same shape the dense fused accessor uses (one `LinearLayer`).
 //   - `emit_call` invokes `MarlinLinear::forward(x, alloc, stream)`.
 //     No cublas handle — marlin's kernel owns the matmul.
 
-/// Does `tile` have a Gemm + AWQ-storage weight? Quant-aware impls
-/// gate on this at the seed and at every fused Gemm they claim.
-fn is_awq_gemm(fuf: &Fuf, tile: TileId) -> bool {
+/// Does `tile` have a Gemm with a Marlin-consumable storage (AWQ or
+/// GPTQ)? Quant-aware impls gate on this at the seed and at every
+/// fused Gemm they claim. The Marlin kernel is agnostic to the
+/// source format after repack — AWQ's uint4 and GPTQ's uint4b8 are
+/// both first-class `b_type_id`s in the kernel — so any impl that
+/// emits `MarlinLinear::forward` accepts either storage.
+fn is_marlin_gemm(fuf: &Fuf, tile: TileId) -> bool {
     let node = fuf.get(tile);
-    node.op == OpKind::Gemm && matches!(weight_storage_of(node), Some(StorageFormat::Awq { .. }))
+    node.op == OpKind::Gemm
+        && matches!(
+            weight_storage_of(node),
+            Some(StorageFormat::Awq { .. } | StorageFormat::Gptq { .. })
+        )
 }
 
 /// Singleton Marlin GEMM — the AWQ counterpart of `GemmRefImpl`.
@@ -4840,7 +4848,7 @@ impl Implementation for MarlinGemmImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
-        if !is_awq_gemm(fuf, seed) {
+        if !is_marlin_gemm(fuf, seed) {
             return None;
         }
         // Same fusion-partner guard as CutlassGemmImpl: don't
@@ -4900,7 +4908,8 @@ impl Implementation for MarlinGemmImpl {
     ) -> Vec<WeightAccessor> {
         // Same single-weight accessor as the dense default, but
         // typed `MarlinLinear` so codegen routes the FieldLoad
-        // through `MarlinLinear::load_awq`.
+        // through `MarlinLinear::load_awq` or `load_gptq` per the
+        // source weight's storage format.
         let tile = claimed_tiles[0];
         let (wid, index) = first_weight_ref(fuf.get(tile)).expect("Gemm has a weight input");
         let name = weight_field_name(program, wid, index);
@@ -4948,7 +4957,7 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
         // for the pattern-walking rationale. The only structural
         // change is the storage gate: BOTH Gemms must be AWQ.
         let gate_gemm = fuf.get(seed);
-        if !is_awq_gemm(fuf, seed) {
+        if !is_marlin_gemm(fuf, seed) {
             return None;
         }
         let silu_node = fuf
@@ -4965,7 +4974,7 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
             FufInput::Tile { id, .. } if *id != silu_id => Some(*id),
             _ => None,
         })?;
-        if !is_awq_gemm(fuf, up_gemm_id) {
+        if !is_marlin_gemm(fuf, up_gemm_id) {
             return None;
         }
         if first_tile_input(gate_gemm)? != first_tile_input(fuf.get(up_gemm_id))? {
@@ -5023,7 +5032,8 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         // Fused accessor covers gate + up; declared `MarlinLinear`
-        // so codegen emits `MarlinLinear::load_awq_concat`.
+        // so codegen emits `MarlinLinear::load_awq_concat` or
+        // `load_gptq_concat` depending on storage format.
         let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
             .iter()
             .filter_map(|t| {
@@ -5114,14 +5124,15 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         // Mirror of `FusedQkvRopeCacheImpl.matches`; diffs are the
-        // storage gate (Q/K/V must all be AWQ) on top of the
-        // BiasAdd-aware unwrap. Bias is handled at the kernel
-        // boundary: `MarlinLinear::forward` applies `bias_add_inplace`
-        // after `marlin_gemm` when `self.bias.is_some()`, and
-        // `MarlinLinear::load_awq_concat` packs per-prefix `.bias`
-        // tensors into the fused LinearLayer automatically.
+        // storage gate (Q/K/V must all be Marlin-consumable — AWQ
+        // or GPTQ) on top of the BiasAdd-aware unwrap. Bias is
+        // handled at the kernel boundary: `MarlinLinear::forward`
+        // applies `bias_add_inplace` after `marlin_gemm` when
+        // `self.bias.is_some()`, and the `load_{awq,gptq}_concat`
+        // loaders pack per-prefix `.bias` tensors into the fused
+        // LinearLayer automatically.
         let seed_node = fuf.get(seed);
-        if !is_awq_gemm(fuf, seed) {
+        if !is_marlin_gemm(fuf, seed) {
             return None;
         }
 
@@ -5158,7 +5169,7 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
             if !gemms.contains(&seed) {
                 return false;
             }
-            if gemms.iter().any(|t| !is_awq_gemm(fuf, *t)) {
+            if gemms.iter().any(|t| !is_marlin_gemm(fuf, *t)) {
                 return false;
             }
             let act = first_tile_input(fuf.get(gemms[0]));

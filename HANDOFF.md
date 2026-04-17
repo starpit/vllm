@@ -1223,19 +1223,19 @@ tackle in roughly this order.
    memory-bound tail (rmsnorm, silu, add, rope, elementwise) so
    nothing fuses into `__global__` megakernels. Port the device
    bodies + add the emission arm.
-2. **GPTQ / FP8 / BnB quant plumbing** — analogous commits to the
-   AWQ Commit 3 just landed. Each new format needs: parser arm in
-   `quantization::QuantizationConfig::parse`, new `StorageFormat`
-   variant (GPTQ shares Marlin with AWQ so it reuses `MarlinLinear`
-   via a parallel loader), the corresponding `Marlin*Impl` /
-   `Fp8*Impl` / `Bnb*Impl` matchers gated on that storage format,
-   `FieldLoad` arm emitting the right loader, `is_*()` helper on
-   `QuantConfig` + gate line in `ferrite_eligible`. The AWQ slice
-   (Commit 3) is the template; each format lands as one atomic
-   commit. GPTQ-Marlin will benefit automatically from the Commit 4
-   Marlin bug fixes. **No per-arch `cuda_worker` edits needed** —
-   the auto-registry + fingerprint-sniff mechanism (commit
-   `30661e397`) handles format dispatch automatically.
+2. **FP8 / BnB quant plumbing** — analogous commits to the AWQ +
+   GPTQ slices that just landed. Each new format needs: parser arm
+   in `quantization::QuantizationConfig::parse`, new `StorageFormat`
+   variant, the corresponding `Fp8*Impl` / `Bnb*Impl` matchers
+   gated on that storage format, `FieldLoad` arm emitting the
+   right loader, `is_*()` helper on `QuantConfig` + gate line in
+   `ferrite_eligible`. The AWQ/GPTQ slices are the template; each
+   format lands as one atomic commit. **No per-arch `cuda_worker`
+   edits needed** — the auto-registry + fingerprint-sniff mechanism
+   (commit `30661e397`) handles format dispatch automatically.
+   GPTQ compressed-tensors (weight_packed layout) is not yet
+   wired — see "Compressed-tensors caveat" in the Quantization
+   path section below.
 3. **QK-norm** (Qwen3, Gemma3) — `qk_norm_inplace` +
    `rotary_embedding_q_only` path. Needs a `FusedQkvQkNormRopeImpl`.
 4. **Gemma3** — another alternating-attention architecture, but
@@ -1546,14 +1546,32 @@ shared Marlin numerical bug). The design notes below stay current.
 
 ### Follow-ons (new commits, not Commit 3)
 
-- **GPTQ-marlin.** Extend the parser with `quant_method: "gptq"`,
-  add a `StorageFormat::Gptq` variant, add `MarlinLinear::load_gptq{,_concat}`
-  in `ferrite-kernels::layers_quant` (mirroring the current AWQ
-  pair — GPTQ adds `g_idx` / `desc_act` handling per the GPTQ
-  loader still in `vllm-cuda::weights_quant`). Same Impls accept
-  GPTQ storage — Marlin doesn't care which INT4 format fed it
-  after repack. Keep impls distinct per storage format so the
-  solver can pick cost-aware in the future.
+- **GPTQ-marlin — LANDED.** Parser extended with `quant_method: "gptq"`,
+  `StorageFormat::Gptq { bits, group_size, desc_act, sym }`, and
+  `MarlinLinear::load_gptq` / `load_gptq_concat` in
+  `ferrite-kernels::layers_quant`. `FieldLoad::AwqLinear{,Concat}`
+  were unified into one `FieldLoad::MarlinLinear { prefixes, format:
+  MarlinFormat, group_size }` arm since both formats emit the same
+  `MarlinLinear::forward` call post-repack; only the loader fn name
+  and a `desc_act` flag vary. `is_awq_gemm` → `is_marlin_gemm` now
+  accepts either storage. Fingerprint gained a qweight-shape gate
+  (`[K, N/8]` = AWQ, `[K/8, N]` = GPTQ) so two variants of the same
+  arch+width-but-different-method (e.g. `qwen2.5-0.5b-awq` vs
+  `qwen2.5-0.5b-gptq`) coexist cleanly. Gate: `ferrite_eligible`
+  admits `is_gptq()` in addition to `is_awq()`. Golden test
+  `test_cuda_correctness_qwen2_0_5b_gptq` passes against a
+  Python-vLLM-generated golden on `Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4`
+  (symmetric, desc_act=false, group_size=128).
+
+  **Compressed-tensors caveat.** `QuantConfig::Gptq` is also the
+  parse target for vLLM compressed-tensors INT4 (weight_packed
+  layout with transposed on-disk weights). Ferrite's GPTQ loader
+  reads `.qweight`, not `.weight_packed`, so a CT model would pass
+  the `ferrite_eligible` gate, hit the fingerprint's qweight-shape
+  check, fail to match any variant, and surface a hard error at the
+  arch-level `Weights::load` bail. Workaround: `FERRITE_DISABLE=1`.
+  Proper fix (future commit): add `StorageFormat::CompressedTensors`
+  or teach the loader to sniff `weight_packed` and transpose.
 - **FP8.** `MarlinLinear::forward` isn't the path — FP8 uses
   `Fp8Linear::forward` which calls `cutlass_scaled_mm`. The FP8
   fused-QKV case is the one where `FusedLinear::Split` was

@@ -82,19 +82,35 @@ enum FieldLoad {
     /// the `LinearLayer` from the already-loaded embedding field
     /// whose name is carried here.
     LinearTiedToEmbedding(syn::Ident),
-    /// AWQ-packed INT4 linear. `group_size` is read from the
-    /// model's `quantization_config.group_size`. Emits
-    /// `MarlinLinear::load_awq(gw, prefix, group_size, workspace,
-    /// device_id)` against the ambient `__marlin_ws` / `__device_id`
-    /// bindings that [`emit_weights_struct`] plants at the top of
-    /// `Weights::load` when any AWQ accessor is present.
-    AwqLinear { prefix: String, group_size: u32 },
-    /// AWQ fused linear (QKV, gate/up) — AWQ qweight/scales/qzeros
-    /// all concat along dim N, so the fused accessor collapses to
-    /// one `MarlinLinear`. Emits `MarlinLinear::load_awq_concat`.
-    AwqLinearConcat {
+    /// 4-bit packed INT4 linear that feeds a Marlin GEMM. Single-
+    /// source (one prefix) or fused (multiple prefixes concat along
+    /// dim N → one wider `MarlinLinear`). `format` selects the
+    /// on-disk convention (AWQ vs GPTQ); only the loader fn name
+    /// and a couple of storage-specific args (`desc_act` for GPTQ)
+    /// vary, so a single arm emits both. Emits
+    /// `MarlinLinear::load_{awq,gptq}[_concat]` against the
+    /// ambient `__marlin_ws` / `__device_id` bindings that
+    /// [`emit_weights_struct`] plants at the top of `Weights::load`
+    /// when any Marlin accessor is present.
+    MarlinLinear {
         prefixes: Vec<String>,
+        format: MarlinFormat,
         group_size: u32,
+    },
+}
+
+/// Per-storage-format parameters carried on a [`FieldLoad::MarlinLinear`].
+/// `group_size` lives on the outer struct because both formats share
+/// it; the enum captures the storage-specific bits.
+#[derive(Clone, Copy, Debug)]
+enum MarlinFormat {
+    Awq,
+    Gptq {
+        /// Mirrors `quantization_config.desc_act`. `true` ⇒ loader
+        /// reads `.g_idx`, argsort-permutes, and hands sort_indices
+        /// to `gptq_repack_into` so same-group columns are
+        /// contiguous post-repack.
+        desc_act: bool,
     },
 }
 
@@ -125,47 +141,85 @@ fn plan_field_load(
         .collect();
 
     if is_marlin {
-        // AWQ accessors are always emitted by a quant-aware impl
-        // whose sources are `StorageFormat::Awq { group_size, .. }`.
-        // The `group_size` must agree across every source of a fused
-        // accessor (HF's fused-QKV/gate-up layers share one
-        // group_size); mismatch is a data-integrity error in the
-        // upstream HF repo and we panic at macro-expansion time
+        // Marlin accessors are always emitted by a quant-aware impl
+        // whose sources resolve to an AWQ or GPTQ storage format.
+        // Group size + format must agree across every source of a
+        // fused accessor (HF's fused-QKV/gate-up layers share one
+        // quantization); mismatch is a data-integrity error in the
+        // upstream HF repo, so we panic at macro-expansion time
         // rather than silently emit a wrong loader.
-        let mut group_size: Option<u32> = None;
+        let mut resolved: Option<(MarlinFormat, u32)> = None;
         for (wid, _idx) in &accessor.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
-            match fmt {
-                crate::quantization::StorageFormat::Awq { group_size: g, .. } => match group_size {
-                    None => group_size = Some(g),
-                    Some(existing) if existing == g => {}
-                    Some(existing) => panic!(
-                        "accessor `{}` fuses sources with mismatched AWQ group_size \
-                             (saw {existing} then {g})",
-                        accessor.name,
-                    ),
-                },
+            let (mf, g) = match fmt {
+                crate::quantization::StorageFormat::Awq { group_size: g, .. } => {
+                    (MarlinFormat::Awq, g)
+                }
+                crate::quantization::StorageFormat::Gptq {
+                    group_size: g,
+                    desc_act,
+                    ..
+                } => (MarlinFormat::Gptq { desc_act }, g),
                 other => panic!(
                     "accessor `{}` declared `MarlinLinear` but source weight resolves to \
-                     non-Awq storage ({other:?}) — solver picked a Marlin impl for a dense \
-                     weight, which is a matcher bug",
+                     non-quantized storage ({other:?}) — solver picked a Marlin impl for a \
+                     dense weight, which is a matcher bug",
                     accessor.name,
                 ),
+            };
+            match &resolved {
+                None => resolved = Some((mf, g)),
+                Some((existing_mf, existing_g)) => {
+                    // Format mismatch (one source Awq, another Gptq)
+                    // would require two different loaders for one
+                    // fused accessor — HF never mixes formats within
+                    // a single MergedColumnParallelLinear.
+                    let format_match = matches!(
+                        (existing_mf, &mf),
+                        (MarlinFormat::Awq, MarlinFormat::Awq)
+                            | (MarlinFormat::Gptq { .. }, MarlinFormat::Gptq { .. })
+                    );
+                    if !format_match {
+                        panic!(
+                            "accessor `{}` fuses sources with mismatched Marlin formats \
+                                 ({existing_mf:?} vs {mf:?})",
+                            accessor.name,
+                        );
+                    }
+                    if *existing_g != g {
+                        panic!(
+                            "accessor `{}` fuses sources with mismatched group_size \
+                                 (saw {existing_g} then {g})",
+                            accessor.name,
+                        );
+                    }
+                    // desc_act also has to agree across sources —
+                    // `.g_idx` is shared at the K axis, so fused-QKV
+                    // sub-weights either all carry it or none do.
+                    if let (
+                        MarlinFormat::Gptq {
+                            desc_act: existing_desc_act,
+                        },
+                        MarlinFormat::Gptq { desc_act },
+                    ) = (existing_mf, &mf)
+                        && *existing_desc_act != *desc_act
+                    {
+                        panic!(
+                            "accessor `{}` fuses GPTQ sources with mismatched desc_act \
+                                 (saw {existing_desc_act} then {desc_act})",
+                            accessor.name,
+                        );
+                    }
+                }
             }
         }
-        let group_size =
-            group_size.expect("MarlinLinear accessor declares at least one source weight");
-        if prefixes.len() == 1 {
-            return FieldLoad::AwqLinear {
-                prefix: prefixes.into_iter().next().unwrap(),
-                group_size,
-            };
-        } else {
-            return FieldLoad::AwqLinearConcat {
-                prefixes,
-                group_size,
-            };
-        }
+        let (format, group_size) =
+            resolved.expect("MarlinLinear accessor declares at least one source weight");
+        return FieldLoad::MarlinLinear {
+            prefixes,
+            format,
+            group_size,
+        };
     }
 
     if is_embedding {
@@ -305,11 +359,21 @@ fn collect_accessors(
 /// 1. **Embedding shape** matches `(vocab_size, hidden_size)` from
 ///    config.json. Rules out arches with a different width or vocab.
 /// 2. **Last-layer tensor present** (`model.layers.{N-1}.self_attn.q_proj.<suffix>`)
-///    where `suffix` is `qweight` for AWQ, `weight` for dense.
+///    where `suffix` is `qweight` for AWQ/GPTQ, `weight` for dense.
 /// 3. **Next-layer tensor absent** (same name with layer `N`). Rules
 ///    out larger compiled variants with the same suffix.
-/// 4. **Opposite-suffix tensor absent**. Rules out the other quant
-///    twin of the same shape (dense vs AWQ of the same model).
+/// 4. **Opposite-suffix tensor absent**. Rules out the other
+///    dense-vs-quant twin (GPTQ vs AWQ share the qweight suffix —
+///    they're distinguished by check #5).
+/// 5. **Quant-format shape check**. When the compiled variant is
+///    AWQ or GPTQ, the `qweight` shape discriminates:
+///    `[K, N/8]` is AWQ, `[K/8, N]` is GPTQ. For the q_proj
+///    specifically both dims are `hidden_size`, so checking
+///    `shape[0] == hidden_size` (AWQ) vs `shape[0] == hidden_size/8`
+///    (GPTQ) is enough. Without this check a GPTQ model would
+///    fingerprint-match an AWQ variant of the same arch+width and
+///    the emitted `load_awq` loader would panic in
+///    `awq_to_marlin_zero_points`.
 fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
     let num_hidden_layers = *model
         .bounds
@@ -338,6 +402,34 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
     let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size as usize);
 
+    // Per-format qweight-shape gate. AWQ and GPTQ both live at
+    // `.qweight` but transpose their packing — so this gate is the
+    // only way to distinguish two compiled variants of the same
+    // arch+size that differ only in quantization method.
+    let qweight_shape_gate: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(crate::quantization::QuantMethod::Awq { .. }) => {
+            let k_lit = hidden_lit.clone();
+            quote! {
+                match gw.tensor_info(#last_tensor) {
+                    Some((shape, _))
+                        if shape.len() == 2 && shape[0] == #k_lit => {}
+                    _ => return false,
+                }
+            }
+        }
+        Some(crate::quantization::QuantMethod::Gptq { .. }) => {
+            let k_packed = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize / 8);
+            quote! {
+                match gw.tensor_info(#last_tensor) {
+                    Some((shape, _))
+                        if shape.len() == 2 && shape[0] == #k_packed => {}
+                    _ => return false,
+                }
+            }
+        }
+        None => quote! {},
+    };
+
     quote! {
         /// Return `true` iff the tensors in `gw` match this
         /// variant's compile-time fingerprint. See
@@ -361,6 +453,7 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
             if gw.contains(#opposite_tensor) {
                 return false;
             }
+            #qweight_shape_gate
             true
         }
     }
@@ -385,7 +478,7 @@ fn emit_weights_struct(
     //   `LinearLayer`  ↔ `Dense`
     //   `Embedding`    ↔ `Dense`
     //   `RmsNorm`      ↔ `Dense`
-    //   `MarlinLinear` ↔ `Awq { .. }`
+    //   `MarlinLinear` ↔ `Awq { .. }` | `Gptq { .. }`
     //
     // Any other pair means the solver picked an impl whose
     // declared accessor type doesn't match the bits on disk — a
@@ -401,7 +494,8 @@ fn emit_weights_struct(
             let ok = matches!(
                 (&fmt, accessor_is_marlin),
                 (crate::quantization::StorageFormat::Dense, false)
-                    | (crate::quantization::StorageFormat::Awq { .. }, true),
+                    | (crate::quantization::StorageFormat::Awq { .. }, true)
+                    | (crate::quantization::StorageFormat::Gptq { .. }, true),
             );
             if !ok {
                 let dotted = program.weights.path(*wid).join(".");
@@ -434,12 +528,9 @@ fn emit_weights_struct(
         .iter()
         .map(|a| plan_field_load(a, program, fuf, model))
         .collect();
-    let any_awq = plans.iter().any(|p| {
-        matches!(
-            p,
-            FieldLoad::AwqLinear { .. } | FieldLoad::AwqLinearConcat { .. }
-        )
-    });
+    let any_marlin = plans
+        .iter()
+        .any(|p| matches!(p, FieldLoad::MarlinLinear { .. }));
     let lets: Vec<TokenStream> = accessors
         .iter()
         .zip(plans.iter())
@@ -475,31 +566,62 @@ fn emit_weights_struct(
                         )
                     );
                 },
-                FieldLoad::AwqLinear { prefix, group_size } => {
-                    let group_size = *group_size as usize;
-                    quote! {
-                        let #name = ::ferrite_kernels::layers::MarlinLinear::load_awq(
-                            gw,
-                            #prefix,
-                            #group_size,
-                            __marlin_ws,
-                            __device_id,
-                        )?;
-                    }
-                }
-                FieldLoad::AwqLinearConcat {
+                FieldLoad::MarlinLinear {
                     prefixes,
+                    format,
                     group_size,
                 } => {
                     let group_size = *group_size as usize;
-                    quote! {
-                        let #name = ::ferrite_kernels::layers::MarlinLinear::load_awq_concat(
-                            gw,
-                            &[ #(#prefixes),* ],
-                            #group_size,
-                            __marlin_ws,
-                            __device_id,
-                        )?;
+                    let single = prefixes.len() == 1;
+                    match (format, single) {
+                        (MarlinFormat::Awq, true) => {
+                            let prefix = &prefixes[0];
+                            quote! {
+                                let #name = ::ferrite_kernels::layers::MarlinLinear::load_awq(
+                                    gw,
+                                    #prefix,
+                                    #group_size,
+                                    __marlin_ws,
+                                    __device_id,
+                                )?;
+                            }
+                        }
+                        (MarlinFormat::Awq, false) => quote! {
+                            let #name = ::ferrite_kernels::layers::MarlinLinear::load_awq_concat(
+                                gw,
+                                &[ #(#prefixes),* ],
+                                #group_size,
+                                __marlin_ws,
+                                __device_id,
+                            )?;
+                        },
+                        (MarlinFormat::Gptq { desc_act }, true) => {
+                            let prefix = &prefixes[0];
+                            let desc_act = *desc_act;
+                            quote! {
+                                let #name = ::ferrite_kernels::layers::MarlinLinear::load_gptq(
+                                    gw,
+                                    #prefix,
+                                    #group_size,
+                                    #desc_act,
+                                    __marlin_ws,
+                                    __device_id,
+                                )?;
+                            }
+                        }
+                        (MarlinFormat::Gptq { desc_act }, false) => {
+                            let desc_act = *desc_act;
+                            quote! {
+                                let #name = ::ferrite_kernels::layers::MarlinLinear::load_gptq_concat(
+                                    gw,
+                                    &[ #(#prefixes),* ],
+                                    #group_size,
+                                    #desc_act,
+                                    __marlin_ws,
+                                    __device_id,
+                                )?;
+                            }
+                        }
                     }
                 }
             }
@@ -509,10 +631,10 @@ fn emit_weights_struct(
     // Shared-per-model Marlin prelude: one workspace allocation
     // (GpuTensor is `Copy` — each MarlinLinear captures the same
     // buffer by value), one device-id query. Only planted when at
-    // least one accessor resolves to an AWQ FieldLoad; dense models
-    // skip it so their `Weights::load` body is byte-for-byte
-    // identical to before this commit.
-    let awq_prelude: TokenStream = if any_awq {
+    // least one accessor resolves to a Marlin FieldLoad (AWQ or
+    // GPTQ); dense models skip it so their `Weights::load` body is
+    // byte-for-byte identical to before quantization landed.
+    let marlin_prelude: TokenStream = if any_marlin {
         quote! {
             let __device = unsafe { ::ferrite_cuda_core::driver::current_device()? };
             let __device_id: i32 = __device as i32;
@@ -553,7 +675,7 @@ fn emit_weights_struct(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
             ) -> ::anyhow::Result<Self> {
-                #awq_prelude
+                #marlin_prelude
                 #(#lets)*
                 Ok(Self {
                     #(#field_shorthand),*

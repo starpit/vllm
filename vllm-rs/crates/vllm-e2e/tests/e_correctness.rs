@@ -96,6 +96,20 @@ async fn test_cuda_correctness_llama_3_2_1b_awq() {
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
+async fn test_cuda_correctness_qwen2_0_5b_gptq() {
+    // GPTQ Qwen2.5-0.5B via the ferrite-forward Marlin* impl family
+    // + `ferrite_kernels::layers_quant::MarlinLinear::load_gptq` /
+    // `load_gptq_concat`. Golden generated from Python vLLM on
+    // `Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4` (symmetric, desc_act=false,
+    // group_size=128). Both FERRITE_ENABLED and FERRITE_DISABLE=1
+    // runs should match within the same top-N tolerance the other
+    // goldens use.
+    run_correctness_test(TestModels::QWEN2_0_5B_GPTQ_INT4, "qwen2_0_5b_gptq").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn test_cuda_correctness_qwen3_0_6b() {
     run_correctness_test(TestModels::QWEN3_0_6B_CUDA, "qwen3_0_6b").await;
 }

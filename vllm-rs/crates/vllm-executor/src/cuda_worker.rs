@@ -6938,9 +6938,13 @@ impl CudaWorker {
             && let Some(ref mut device) = self.device
         {
             // Collect info from InputBatch upfront (immutable borrow ends here).
-            let (req_ids, block_tables, _tokens_in_pool) = self.input_batch.fast_path_info();
+            let (req_ids, block_tables, tokens_in_pool) = self.input_batch.fast_path_info();
             let out_req_ids: Vec<String> = req_ids.to_vec();
             let token_counts = self.input_batch.fast_path_token_counts();
+            // Max seqlen_k for this step = max(tokens_already_in_cache + 1).
+            // The +1 accounts for the token we're about to decode (written
+            // to cache by the fused QKV+rope+cache kernel before attention).
+            let fast_max_seqlen_k = tokens_in_pool.iter().copied().max().unwrap_or(0) + 1;
 
             // Check all-greedy and no-logprobs/grammar without prepare_inputs.
             let all_greedy_fast = out_req_ids.iter().all(|rid| {
@@ -6979,7 +6983,14 @@ impl CudaWorker {
                 // Graph launch — GPU self-updates positions, slot_mapping, seqused_k.
                 let runner = self.graph_runner.as_ref().unwrap();
                 let replay_out = unsafe {
-                    runner.replay_decode_fast(graph_bs, None, new_bt, block_size, device)
+                    runner.replay_decode_fast(
+                        graph_bs,
+                        None,
+                        new_bt,
+                        block_size,
+                        fast_max_seqlen_k,
+                        device,
+                    )
                 }
                 .map_err(|e| {
                     ExecutorError::WorkerExecution(format!("super fast replay_decode_fast: {e}"))
@@ -7501,6 +7512,7 @@ impl CudaWorker {
                         &cu_seqlens_q,
                         &seqused_k,
                         &block_table,
+                        self.config.block_size,
                         device,
                         false,
                     )
@@ -7829,11 +7841,16 @@ impl CudaWorker {
                     None
                 };
 
+                let max_seqlen_k_step = meta.seq_lens.iter().copied().max().unwrap_or(0);
                 let runner = self.graph_runner.as_ref().unwrap();
                 unsafe {
                     runner.replay_decode_fast(
-                        graph_bs, None, // input_ids already scattered by previous graph
-                        new_bt, block_size, device,
+                        graph_bs,
+                        None, // input_ids already scattered by previous graph
+                        new_bt,
+                        block_size,
+                        max_seqlen_k_step,
+                        device,
                     )
                 }
                 .map_err(|e| {
@@ -7895,6 +7912,7 @@ impl CudaWorker {
                         stg.cu_seqlens_q.slice::<i32>(graph_bs + 1),
                         stg.seqused_k.slice::<i32>(graph_bs),
                         bt,
+                        block_size,
                         device,
                         skip_input_ids,
                     )
@@ -7953,6 +7971,7 @@ impl CudaWorker {
                         &cu_seqlens_q,
                         &seqused_k,
                         &block_table,
+                        block_size,
                         device,
                         skip_input_ids,
                     )
@@ -8068,6 +8087,7 @@ impl CudaWorker {
                     ids.leak()
                 };
 
+                let max_seqlen_k_step = meta.seq_lens.iter().copied().max().unwrap_or(0);
                 let runner = self.graph_runner.as_ref().unwrap();
                 unsafe {
                     runner.replay_decode_fast(
@@ -8075,6 +8095,7 @@ impl CudaWorker {
                         Some(input_ids_slice),
                         new_bt,
                         block_size,
+                        max_seqlen_k_step,
                         device,
                     )
                 }
@@ -8132,6 +8153,7 @@ impl CudaWorker {
                         stg.cu_seqlens_q.slice::<i32>(graph_bs + 1),
                         stg.seqused_k.slice::<i32>(graph_bs),
                         bt,
+                        block_size,
                         device,
                         false,
                     )
@@ -8187,6 +8209,7 @@ impl CudaWorker {
                         &cu_seqlens_q,
                         &seqused_k,
                         &block_table,
+                        block_size,
                         device,
                         false,
                     )
@@ -8263,6 +8286,7 @@ impl CudaWorker {
                         meta.seq_lens[0],
                         &block_table,
                         last_token_idx,
+                        block_size,
                         device,
                     )
                 }

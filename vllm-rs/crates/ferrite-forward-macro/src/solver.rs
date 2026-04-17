@@ -110,11 +110,76 @@ impl Assignment {
     }
 }
 
-/// Result of a full workload sweep: one SFUF per caller-supplied
-/// `num_tokens` value, keyed by that value.
+/// A single point in the solver's workload sweep grid.
+///
+/// Historically the sweep was 1-D (only `num_tokens`). Attention
+/// impls whose cost depends on the KV-cache span — notably
+/// FlashInfer's persistent runner, which widens its decode advantage
+/// as `sk` grows — add a second axis. Non-attention impls (GEMM,
+/// RoPE, RMSNorm) declare `WorkloadConstraint::Any` or
+/// `::NumTokensRange` and are `sk_bucket`-insensitive; the codegen
+/// coalesces identical-assignment `(num_tokens, sk_bucket)` pairs so
+/// only attention tiles actually force distinct compiled forwards.
+///
+/// `sk_bucket == 0` is the sentinel "sk axis unused" point used by
+/// legacy 1-D callers (unit tests and any model file that doesn't
+/// declare `sk_buckets = [..]`). Impls that require a concrete sk
+/// range (`WorkloadConstraint::NumTokensAndSkRange`) simply never
+/// match at `sk_bucket == 0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkloadPoint {
+    pub num_tokens: u64,
+    pub sk_bucket: u64,
+}
+
+impl WorkloadPoint {
+    /// Legacy num-tokens-only point, with `sk_bucket = 0`.
+    pub fn num_tokens_only(num_tokens: u64) -> Self {
+        Self {
+            num_tokens,
+            sk_bucket: 0,
+        }
+    }
+}
+
+/// Result of a full workload sweep: one SFUF per `(num_tokens,
+/// sk_bucket)` point. For 1-D callers (legacy tests, models that
+/// don't declare `sk_buckets`) every entry has `sk_bucket = 0` and
+/// the map is effectively keyed on `num_tokens`.
 #[derive(Clone, Debug, Default)]
 pub struct WorkloadAssignments {
-    pub per_num_tokens: BTreeMap<u64, Assignment>,
+    pub per_workload: BTreeMap<WorkloadPoint, Assignment>,
+}
+
+impl WorkloadAssignments {
+    /// Lookup by num_tokens only, picking the first matching
+    /// sk_bucket in sorted order. Convenience for 1-D callers and
+    /// invariants that care only about coverage, not sk dispatch.
+    pub fn get_nt(&self, num_tokens: u64) -> Option<&Assignment> {
+        self.per_workload
+            .iter()
+            .find_map(|(wp, a)| (wp.num_tokens == num_tokens).then_some(a))
+    }
+
+    /// Mutable variant of [`get_nt`].
+    pub fn get_nt_mut(&mut self, num_tokens: u64) -> Option<&mut Assignment> {
+        self.per_workload
+            .iter_mut()
+            .find_map(|(wp, a)| (wp.num_tokens == num_tokens).then_some(a))
+    }
+
+    /// Distinct num_tokens values present in the sweep, sorted.
+    pub fn num_tokens_points(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self
+            .per_workload
+            .keys()
+            .map(|wp| wp.num_tokens)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        v.sort();
+        v
+    }
 }
 
 #[derive(Debug)]
@@ -126,7 +191,7 @@ pub enum SolveError {
     UnclaimedTile {
         tile: TileId,
         op: OpKind,
-        num_tokens: u64,
+        point: WorkloadPoint,
     },
     /// An Impl's cost function returned None despite having a
     /// match and passing applicability filters. Means either (a)
@@ -136,32 +201,30 @@ pub enum SolveError {
         tile: TileId,
         op: OpKind,
         impl_id: ImplId,
-        num_tokens: u64,
+        point: WorkloadPoint,
     },
 }
 
 impl std::fmt::Display for SolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnclaimedTile {
-                tile,
-                op,
-                num_tokens,
-            } => write!(
+            Self::UnclaimedTile { tile, op, point } => write!(
                 f,
-                "no Impl in the library matched tile {} op {:?} at num_tokens={num_tokens}",
-                tile.0, op
+                "no Impl in the library matched tile {} op {:?} at \
+                 num_tokens={} sk_bucket={}",
+                tile.0, op, point.num_tokens, point.sk_bucket
             ),
             Self::UnreachableCost {
                 tile,
                 op,
                 impl_id,
-                num_tokens,
+                point,
             } => write!(
                 f,
-                "impl {} could not cost tile {} op {:?} at num_tokens={num_tokens} \
-                 (cost_fn returned None despite invariant that shapes are closed)",
-                impl_id.0, tile.0, op
+                "impl {} could not cost tile {} op {:?} at \
+                 num_tokens={} sk_bucket={} (cost_fn returned None \
+                 despite invariant that shapes are closed)",
+                impl_id.0, tile.0, op, point.num_tokens, point.sk_bucket
             ),
         }
     }
@@ -169,9 +232,10 @@ impl std::fmt::Display for SolveError {
 
 impl std::error::Error for SolveError {}
 
-/// Solve each `num_tokens` point independently. `bounds` supplies
-/// every symbolic bound except `num_tokens`; the solver overwrites
-/// it per point.
+/// Solve each `(num_tokens, sk_bucket)` point independently.
+/// `bounds` supplies every symbolic bound except `num_tokens` and
+/// `sk_bucket`; the solver overwrites both per point. Empty
+/// `sk_points` defaults to `&[0]` — the 1-D legacy sweep.
 pub fn solve(
     fuf: &Fuf,
     lib: &ImplementationLibrary,
@@ -179,30 +243,51 @@ pub fn solve(
     inferred: &Inferred,
     bounds: &BTreeMap<String, u64>,
     num_tokens_points: &[u64],
+    sk_points: &[u64],
 ) -> Result<WorkloadAssignments, SolveError> {
     use rayon::prelude::*;
 
-    // Each workload point is an independent solve: the DP table and
-    // matches_at vector are rebuilt from scratch per `num_tokens`
-    // (workload constraints and per-impl costs vary with it). Running
-    // them in parallel drops the total from `Σ per-workload` to
-    // `max(per-workload)` on well-parallel hardware.
-    let solved: Vec<Result<(u64, Assignment), SolveError>> = num_tokens_points
-        .par_iter()
-        .map(|&m| {
-            let mut scratch = bounds.clone();
-            scratch.insert("num_tokens".into(), m);
-            solve_one(fuf, lib, target, inferred, &scratch, m).map(|a| (m, a))
+    // Empty sk_points = legacy 1-D sweep. `sk_bucket = 0` is the
+    // sentinel "sk axis unused"; FI impls with a real sk range
+    // simply won't match at sk_bucket = 0.
+    let sk_effective: Vec<u64> = if sk_points.is_empty() {
+        vec![0]
+    } else {
+        sk_points.to_vec()
+    };
+
+    let points: Vec<WorkloadPoint> = num_tokens_points
+        .iter()
+        .flat_map(|&m| {
+            sk_effective.iter().map(move |&sk| WorkloadPoint {
+                num_tokens: m,
+                sk_bucket: sk,
+            })
         })
         .collect();
 
-    let mut per_num_tokens: BTreeMap<u64, Assignment> = BTreeMap::new();
+    // Each workload point is an independent solve: the DP table and
+    // matches_at vector are rebuilt from scratch per point (workload
+    // constraints and per-impl costs vary with both axes). Running
+    // them in parallel drops the total from `Σ per-workload` to
+    // `max(per-workload)` on well-parallel hardware.
+    let solved: Vec<Result<(WorkloadPoint, Assignment), SolveError>> = points
+        .par_iter()
+        .map(|&wp| {
+            let mut scratch = bounds.clone();
+            scratch.insert("num_tokens".into(), wp.num_tokens);
+            scratch.insert("sk_bucket".into(), wp.sk_bucket);
+            solve_one(fuf, lib, target, inferred, &scratch, wp).map(|a| (wp, a))
+        })
+        .collect();
+
+    let mut per_workload: BTreeMap<WorkloadPoint, Assignment> = BTreeMap::new();
     for result in solved {
-        let (m, a) = result?;
-        per_num_tokens.insert(m, a);
+        let (wp, a) = result?;
+        per_workload.insert(wp, a);
     }
 
-    Ok(WorkloadAssignments { per_num_tokens })
+    Ok(WorkloadAssignments { per_workload })
 }
 
 /// One pass of the DP over the whole FUF at a single workload
@@ -213,8 +298,10 @@ fn solve_one(
     target: &TargetProfile,
     inferred: &Inferred,
     bounds: &BTreeMap<String, u64>,
-    num_tokens: u64,
+    point: WorkloadPoint,
 ) -> Result<Assignment, SolveError> {
+    let num_tokens = point.num_tokens;
+    let sk_bucket = point.sk_bucket;
     let n = fuf.len();
     if n == 0 {
         return Ok(Assignment {
@@ -246,7 +333,10 @@ fn solve_one(
             if !imp.target_compatible(target) {
                 continue;
             }
-            if !imp.workload_constraint().accepts(num_tokens as u32) {
+            if !imp
+                .workload_constraint()
+                .accepts(num_tokens as u32, sk_bucket)
+            {
                 continue;
             }
             let Some(info) = imp.matches(fuf, node.id, target) else {
@@ -258,7 +348,7 @@ fn solve_one(
                     tile: node.id,
                     op: node.op,
                     impl_id: imp_id,
-                    num_tokens,
+                    point,
                 });
             }
             matches_at[i].push((imp_id, info, cost));
@@ -394,7 +484,7 @@ fn solve_one(
             return Err(SolveError::UnclaimedTile {
                 tile: fuf.nodes[i].id,
                 op: fuf.nodes[i].op,
-                num_tokens,
+                point,
             });
         }
         // Every tile has candidates but the DP still failed — means
@@ -403,7 +493,7 @@ fn solve_one(
         return Err(SolveError::UnclaimedTile {
             tile: fuf.nodes[0].id,
             op: fuf.nodes[0].op,
-            num_tokens,
+            point,
         });
     }
 
@@ -599,15 +689,22 @@ mod tests {
         let bounds = params.bounds.clone();
 
         let t0 = std::time::Instant::now();
-        let workloads =
-            solve(&fuf, &lib, &target, &inferred, &bounds, &WORKLOAD_POINTS).expect("solve");
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &bounds,
+            &WORKLOAD_POINTS,
+            &[],
+        )
+        .expect("solve");
         let elapsed_ms = t0.elapsed().as_millis();
 
-        assert_eq!(workloads.per_num_tokens.len(), WORKLOAD_POINTS.len());
+        assert_eq!(workloads.per_workload.len(), WORKLOAD_POINTS.len());
         for &m in &WORKLOAD_POINTS {
             let sfuf = workloads
-                .per_num_tokens
-                .get(&m)
+                .get_nt(m)
                 .unwrap_or_else(|| panic!("no sfuf for m={m}"));
             assert!(
                 sfuf.is_cover_complete(fuf.len()),
@@ -664,12 +761,14 @@ mod tests {
             &inferred,
             &params.bounds,
             &[1, 512, 4096],
+            &[],
         )
         .unwrap();
 
         let nl = params.bounds["num_hidden_layers"] as usize;
 
-        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+        for (wp, sfuf) in workloads.per_workload.iter() {
+            let m = wp.num_tokens;
             // Count subgraphs that claim 4 tiles of kinds {Gemm,
             // Gemm, Silu, Mul} with shared activation on the Gemms.
             let mut fused_count = 0;
@@ -719,12 +818,14 @@ mod tests {
             &inferred,
             &params.bounds,
             &[1, 512, 4096],
+            &[],
         )
         .unwrap();
 
         let nl = params.bounds["num_hidden_layers"] as usize;
 
-        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+        for (wp, sfuf) in workloads.per_workload.iter() {
+            let m = wp.num_tokens;
             let mut fused_count = 0;
             for sg in sfuf.subgraphs() {
                 let tiles = sfuf.tiles_in_subgraph(sg);
@@ -769,8 +870,8 @@ mod tests {
         let (fuf, inferred) = build(LLAMA_BODY, &params);
         let lib = starter_library();
         let target = l4_target();
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
-        let sfuf = &workloads.per_num_tokens[&1];
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let sfuf = workloads.get_nt(1).unwrap();
         // First QKV-fused subgraph.
         let qkv_sg = sfuf
             .subgraphs()
@@ -809,12 +910,14 @@ mod tests {
             &inferred,
             &params.bounds,
             &[1, 512, 4096],
+            &[],
         )
         .unwrap();
 
         let nl = params.bounds["num_hidden_layers"] as usize;
 
-        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+        for (wp, sfuf) in workloads.per_workload.iter() {
+            let m = wp.num_tokens;
             let mut fused_pair_count = 0;
             let mut singleton_rmsnorm_count = 0;
             for sg in sfuf.subgraphs() {
@@ -875,13 +978,14 @@ mod tests {
             &inferred,
             &params.bounds,
             &[1, 512, 4096],
+            &[],
         )
         .unwrap();
 
         // Pick a SwiGLU-fused subgraph in the first bucket, record
         // its declared accessor name, then verify the same name
         // shows up exactly once in every other bucket's SFUF too.
-        let first_sfuf = workloads.per_num_tokens.values().next().unwrap();
+        let first_sfuf = workloads.per_workload.values().next().unwrap();
         let first_sg = first_sfuf
             .subgraphs()
             .find(|sg| {
@@ -941,9 +1045,9 @@ mod tests {
         let target = l4_target();
         let bounds = params.bounds.clone();
 
-        let workloads = solve(&fuf, &lib, &target, &inferred, &bounds, &[1, 4096]).unwrap();
-        let decode_us = workloads.per_num_tokens[&1].predicted_us;
-        let prefill_us = workloads.per_num_tokens[&4096].predicted_us;
+        let workloads = solve(&fuf, &lib, &target, &inferred, &bounds, &[1, 4096], &[]).unwrap();
+        let decode_us = workloads.get_nt(1).unwrap().predicted_us;
+        let prefill_us = workloads.get_nt(4096).unwrap().predicted_us;
         assert!(
             prefill_us > decode_us * 10.0,
             "prefill ({prefill_us}) should dwarf decode ({decode_us})",
@@ -962,7 +1066,7 @@ mod tests {
         let target = l4_target();
         let bounds = params.bounds.clone();
 
-        let err = solve(&fuf, &lib, &target, &inferred, &bounds, &[1]).unwrap_err();
+        let err = solve(&fuf, &lib, &target, &inferred, &bounds, &[1], &[]).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1051,7 +1155,7 @@ mod tests {
             multi_tile: None,
         }));
 
-        let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap_err();
+        let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap_err();
         assert!(
             matches!(err, SolveError::UnreachableCost { .. }),
             "expected UnreachableCost, got {err:?}",
@@ -1074,11 +1178,11 @@ mod tests {
         }));
 
         // At M=1 it's fine.
-        let ok = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
-        assert!(ok.per_num_tokens[&1].is_cover_complete(fuf.len()));
+        let ok = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        assert!(ok.get_nt(1).unwrap().is_cover_complete(fuf.len()));
 
         // At M=4096 it's excluded; no other impl; UnclaimedTile.
-        let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[4096]).unwrap_err();
+        let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[4096], &[]).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1129,8 +1233,8 @@ mod tests {
             multi_tile: Some(matches_double_add),
         }));
 
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
-        let sfuf = &workloads.per_num_tokens[&1];
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let sfuf = workloads.get_nt(1).unwrap();
 
         // 1 embed + 4 adds; fused double-add claims pairs.
         // Expected: 1 embed + 2 fused = 3 subgraphs.
@@ -1210,10 +1314,20 @@ mod tests {
         let lib = starter_library();
         let target = l4_target();
 
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1, 512]).unwrap();
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512],
+            &[],
+        )
+        .unwrap();
         let nl = params.bounds["num_hidden_layers"] as usize;
 
-        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+        for (wp, sfuf) in workloads.per_workload.iter() {
+            let m = wp.num_tokens;
             let mut fused = 0;
             for sg in sfuf.subgraphs() {
                 let tiles = sfuf.tiles_in_subgraph(sg);
@@ -1248,9 +1362,19 @@ mod tests {
 
         // Decode (m=1) and prefill (m=512) should both split the
         // picks across the two Attention kinds correctly.
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1, 512]).unwrap();
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512],
+            &[],
+        )
+        .unwrap();
 
-        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+        for (wp, sfuf) in workloads.per_workload.iter() {
+            let m = wp.num_tokens;
             let expected_impl_for_decode = ("attention_via_cache", "sliding_attention_via_cache");
             let expected_impl_for_prefill = (
                 "attention_prefill_contiguous",
@@ -1284,9 +1408,19 @@ mod tests {
         let (fuf, inferred) = build(GEMMA_LIKE_BODY, &params);
         let lib = starter_library();
         let target = l4_target();
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1, 512]).unwrap();
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512],
+            &[],
+        )
+        .unwrap();
 
-        for (&m, sfuf) in workloads.per_num_tokens.iter() {
+        for (wp, sfuf) in workloads.per_workload.iter() {
+            let m = wp.num_tokens;
             let softcap_subgraphs: Vec<_> = sfuf
                 .subgraphs()
                 .filter(|sg| {
@@ -1313,7 +1447,159 @@ mod tests {
         let target = l4_target();
         let bounds = params.bounds.clone();
 
-        let workloads = solve(&fuf, &lib, &target, &inferred, &bounds, &[]).unwrap();
-        assert!(workloads.per_num_tokens.is_empty());
+        let workloads = solve(&fuf, &lib, &target, &inferred, &bounds, &[], &[]).unwrap();
+        assert!(workloads.per_workload.is_empty());
+    }
+
+    // ── sk axis regression tests ──────────────────────────────────────
+    //
+    // These verify the 2-D workload grid works end-to-end: product
+    // sweep, sk_bucket threaded into bounds and CostCtx, and coverage
+    // holds for every (num_tokens, sk_bucket) pair.
+
+    #[test]
+    fn sk_axis_product_sweep_covers_every_pair() {
+        let params = llama_params("llama-3.2-1b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+
+        let num_tokens = [1u64, 512];
+        let sk_buckets = [128u64, 2048, 8192];
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &num_tokens,
+            &sk_buckets,
+        )
+        .unwrap();
+
+        assert_eq!(
+            workloads.per_workload.len(),
+            num_tokens.len() * sk_buckets.len(),
+            "product sweep should produce one entry per (m, sk) pair"
+        );
+
+        // Every (m, sk) pair must have full coverage, same as the 1-D
+        // sweep invariant.
+        for &m in &num_tokens {
+            for &sk in &sk_buckets {
+                let wp = WorkloadPoint {
+                    num_tokens: m,
+                    sk_bucket: sk,
+                };
+                let sfuf = workloads
+                    .per_workload
+                    .get(&wp)
+                    .unwrap_or_else(|| panic!("no sfuf for {:?}", wp));
+                assert!(
+                    sfuf.is_cover_complete(fuf.len()),
+                    "cover incomplete at {:?}",
+                    wp
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flashinfer_impls_picked_for_llama_3_2_1b_when_csv_has_rows() {
+        // End-to-end solver regression: with the calibrated L4 CSV
+        // (which has `flashinfer_attn_bf16_h64_nosoftcap_q32_k8` rows
+        // for every calibrated (M, sk) cell), the solver must choose
+        // `flashinfer_attention_{decode,prefill}` over
+        // `attention_via_cache` / `attention_prefill_contiguous` at
+        // the workload points where FI's calibrated cost beats FA2.
+        // At (M=1, sk=2048) the FI decode row is ~4.6× faster than
+        // FA2 on L4; at (M=512, sk=2048) FI prefill is within a
+        // margin of FA2 and the solver may pick either — we assert
+        // only on the decode case where FI is unambiguously cheaper.
+        let params = llama_params("llama-3.2-1b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512],
+            &[128, 2048],
+        )
+        .unwrap();
+
+        let mut decode_fi_count = 0;
+        let mut prefill_fi_count = 0;
+        let mut attention_tiles_at_m1_sk2048 = 0;
+        for (wp, sfuf) in workloads.per_workload.iter() {
+            for sg in sfuf.subgraphs() {
+                let tiles = sfuf.tiles_in_subgraph(sg);
+                if tiles.len() != 1 {
+                    continue;
+                }
+                if fuf.get(tiles[0]).op != OpKind::Attention {
+                    continue;
+                }
+                let name = lib.get(sfuf.impl_of(sg).unwrap()).name();
+                if wp.num_tokens == 1 && wp.sk_bucket == 2048 {
+                    attention_tiles_at_m1_sk2048 += 1;
+                    assert_eq!(
+                        name, "flashinfer_attention_decode",
+                        "FI decode must win over FA2 at (M=1, sk=2048) on calibrated L4",
+                    );
+                    decode_fi_count += 1;
+                } else if wp.num_tokens == 512 && name == "flashinfer_attention_prefill" {
+                    prefill_fi_count += 1;
+                }
+            }
+        }
+        assert!(
+            attention_tiles_at_m1_sk2048 >= 16,
+            "llama-3.2-1b has 16 attention layers — every one must be reachable at (M=1, sk=2048); got {attention_tiles_at_m1_sk2048}",
+        );
+        assert!(
+            decode_fi_count >= 16,
+            "all 16 attention layers must bind FI decode at (M=1, sk=2048); got {decode_fi_count}",
+        );
+        // Prefill outcome is workload-dependent and the CSV margin is
+        // tight — not asserting a specific count, just recording it
+        // so the test is a useful observability signal if this ever
+        // changes. (At the time of writing, prefill_fi_count > 0
+        // at (M=512, sk=2048) on L4.)
+        let _ = prefill_fi_count;
+    }
+
+    #[test]
+    fn sk_axis_unused_is_backward_compatible() {
+        // Passing `&[]` for sk_points must produce exactly the
+        // pre-sk-axis behavior: one Assignment per num_tokens,
+        // keyed on WorkloadPoint { num_tokens, sk_bucket: 0 }.
+        let params = llama_params("llama-3.2-1b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+
+        let m_points = [1u64, 64, 512];
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &m_points,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(workloads.per_workload.len(), m_points.len());
+        for &m in &m_points {
+            let wp = WorkloadPoint::num_tokens_only(m);
+            assert!(workloads.per_workload.contains_key(&wp));
+            assert_eq!(wp.sk_bucket, 0);
+        }
     }
 }

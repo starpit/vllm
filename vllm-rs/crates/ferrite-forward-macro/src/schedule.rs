@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::fuf::{Fuf, FufInput};
 use crate::impl_lib::ImplId;
-use crate::solver::{Assignment, SubgraphId, WorkloadAssignments};
+use crate::solver::{Assignment, SubgraphId, WorkloadAssignments, WorkloadPoint};
 
 /// A single BSP wave — mutually-independent subgraphs.
 #[derive(Clone, Debug)]
@@ -52,10 +52,11 @@ impl Loop {
     }
 }
 
-/// One LOOP per workload point, keyed by `num_tokens`.
+/// One LOOP per workload point, keyed by `(num_tokens, sk_bucket)`
+/// via [`WorkloadPoint`]. 1-D sweeps use `sk_bucket = 0`.
 #[derive(Clone, Debug, Default)]
 pub struct WorkloadLoops {
-    pub per_num_tokens: BTreeMap<u64, Loop>,
+    pub per_workload: BTreeMap<WorkloadPoint, Loop>,
 }
 
 /// Schedule a single SFUF into a LOOP.
@@ -128,14 +129,15 @@ pub fn schedule(fuf: &Fuf, sfuf: &Assignment) -> Loop {
     }
 }
 
-/// Schedule every SFUF in a workload sweep, preserving the `num_tokens` keying.
+/// Schedule every SFUF in a workload sweep, preserving the
+/// `(num_tokens, sk_bucket)` keying.
 pub fn schedule_workloads(fuf: &Fuf, workloads: &WorkloadAssignments) -> WorkloadLoops {
-    let per_num_tokens = workloads
-        .per_num_tokens
+    let per_workload = workloads
+        .per_workload
         .iter()
-        .map(|(m, sfuf)| (*m, schedule(fuf, sfuf)))
+        .map(|(wp, sfuf)| (*wp, schedule(fuf, sfuf)))
         .collect();
-    WorkloadLoops { per_num_tokens }
+    WorkloadLoops { per_workload }
 }
 
 /// Invariant checker: within a single wave, no two subgraphs have
@@ -219,8 +221,8 @@ mod tests {
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
         let target = l4_target();
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
-        let sfuf = workloads.per_num_tokens[&1].clone();
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let sfuf = workloads.get_nt(1).unwrap().clone();
         (fuf, sfuf)
     }
 
@@ -351,16 +353,18 @@ mod tests {
         let target = l4_target();
 
         let points = [1u64, 64, 4096];
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &points).unwrap();
+        let workloads =
+            solve(&fuf, &lib, &target, &inferred, &params.bounds, &points, &[]).unwrap();
         let loops = schedule_workloads(&fuf, &workloads);
 
-        assert_eq!(loops.per_num_tokens.len(), points.len());
+        assert_eq!(loops.per_workload.len(), points.len());
         for &m in &points {
+            let wp = WorkloadPoint::num_tokens_only(m);
             let loop_ir = loops
-                .per_num_tokens
-                .get(&m)
+                .per_workload
+                .get(&wp)
                 .unwrap_or_else(|| panic!("no loop at m={m}"));
-            let sfuf = &workloads.per_num_tokens[&m];
+            let sfuf = workloads.get_nt(m).unwrap();
             assert_eq!(loop_ir.num_subgraphs(), sfuf.num_subgraphs());
             assert!(find_intra_wave_dep_violation(loop_ir, &fuf, sfuf).is_none());
         }

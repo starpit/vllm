@@ -17,3 +17,5 @@ ferrite-models = { path = "../ferrite-models" }
 [build-dependencies]
 cudaforge = { version = "=0.1.4", path = "../../third_party/cudaforge", optional = true }
 dirs = "6"
+# FlashInfer per-tuple shim is rendered at build time from `templates/`.
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }

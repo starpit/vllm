@@ -51,6 +51,14 @@ struct ForwardArgs {
     target: LitStr,
     /// Discrete `num_tokens` points to solve at. Non-empty.
     workloads: Vec<u64>,
+    /// Discrete `sk_bucket` (KV-cache span in tokens) points to solve
+    /// at. Optional — when absent, the solver sweeps only the
+    /// `num_tokens` axis with `sk_bucket = 0` (the sentinel "sk
+    /// axis unused"). Declare this for models where attention
+    /// dispatch wants to pick different kernels at different KV
+    /// spans — e.g. FlashInfer decode wins on long sk, FA2 wins at
+    /// small prefill.
+    sk_buckets: Vec<u64>,
     /// Span used for error reporting when a required arg is
     /// missing.
     span: Span,
@@ -61,6 +69,21 @@ impl Parse for ForwardArgs {
         let span = input.span();
         let mut target: Option<LitStr> = None;
         let mut workloads: Option<Vec<u64>> = None;
+        let mut sk_buckets: Option<Vec<u64>> = None;
+
+        fn parse_u64_list(input: ParseStream) -> syn::Result<Vec<u64>> {
+            let list;
+            syn::bracketed!(list in input);
+            let mut pts = Vec::new();
+            while !list.is_empty() {
+                let n: LitInt = list.parse()?;
+                pts.push(n.base10_parse::<u64>()?);
+                if !list.is_empty() {
+                    list.parse::<Token![,]>()?;
+                }
+            }
+            Ok(pts)
+        }
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -68,19 +91,8 @@ impl Parse for ForwardArgs {
 
             match key.to_string().as_str() {
                 "target" => target = Some(input.parse()?),
-                "workloads" => {
-                    let list;
-                    syn::bracketed!(list in input);
-                    let mut pts = Vec::new();
-                    while !list.is_empty() {
-                        let n: LitInt = list.parse()?;
-                        pts.push(n.base10_parse::<u64>()?);
-                        if !list.is_empty() {
-                            list.parse::<Token![,]>()?;
-                        }
-                    }
-                    workloads = Some(pts);
-                }
+                "workloads" => workloads = Some(parse_u64_list(input)?),
+                "sk_buckets" => sk_buckets = Some(parse_u64_list(input)?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -100,10 +112,17 @@ impl Parse for ForwardArgs {
         if workloads.is_empty() {
             return Err(syn::Error::new(span, "#[forward] `workloads` is empty"));
         }
+        // Default: 1-D sweep. `sk_bucket = 0` is the sentinel value
+        // that non-sk-constrained impls (Any / NumTokensRange) accept
+        // unconditionally; FI impls with a real sk range won't match,
+        // so they can't be picked unless the model declares a real
+        // sk_buckets list.
+        let sk_buckets = sk_buckets.unwrap_or_default();
 
         Ok(Self {
             target,
             workloads,
+            sk_buckets,
             span,
         })
     }
@@ -285,6 +304,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             &inferred,
             &model.bounds,
             &args.workloads,
+            &args.sk_buckets,
         )
         .map_err(|e| syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem)))?;
         let d_solve = t_solve.elapsed();
@@ -300,15 +320,31 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         );
 
         let max_waves = loops
-            .per_num_tokens
+            .per_workload
             .values()
             .map(|l| l.num_waves())
             .max()
             .unwrap_or(0);
+        // Per-workload breakdown. When the model doesn't declare
+        // `sk_buckets`, every entry has `sk_bucket = 0` and we print
+        // a concise `M=m→<cost>` line. When it does declare them,
+        // we print `M=m sk=sk→<cost>` to keep the two axes visible.
+        let sk_axis_active = sfufs.per_workload.keys().any(|wp| wp.sk_bucket != 0);
         let per_m: String = sfufs
-            .per_num_tokens
+            .per_workload
             .iter()
-            .map(|(&m, a)| format!(" M={m}→{}", fmt_us(a.predicted_us)))
+            .map(|(wp, a)| {
+                if sk_axis_active {
+                    format!(
+                        " M={}sk={}→{}",
+                        wp.num_tokens,
+                        wp.sk_bucket,
+                        fmt_us(a.predicted_us)
+                    )
+                } else {
+                    format!(" M={}→{}", wp.num_tokens, fmt_us(a.predicted_us))
+                }
+            })
             .collect();
         eprintln!(
             "  ferrite · {variant:<18} · {tiles:>4} tiles · {waves:>3} waves · {solve_ms:>3} ms ·{per_m}",
@@ -682,12 +718,22 @@ fn emit_model_stub_items(
 ) -> proc_macro2::TokenStream {
     let num_tiles = fuf.len();
     let mut workload_ts: Vec<proc_macro2::TokenStream> = Vec::new();
-    for (m, sfuf) in &sfufs.per_num_tokens {
+    for (wp, sfuf) in &sfufs.per_workload {
         let loop_ir = loops
-            .per_num_tokens
-            .get(m)
+            .per_workload
+            .get(wp)
             .expect("schedule_workloads populates every key");
-        let wl_mod = Ident::new(&format!("m_{m}"), Span::call_site());
+        // Module name: `m_{m}` in the legacy 1-D sweep (sk_bucket=0),
+        // `m_{m}_sk_{sk}` in a 2-D sweep. Integration tests can look
+        // up either by name.
+        let wl_mod = if wp.sk_bucket == 0 {
+            Ident::new(&format!("m_{}", wp.num_tokens), Span::call_site())
+        } else {
+            Ident::new(
+                &format!("m_{}_sk_{}", wp.num_tokens, wp.sk_bucket),
+                Span::call_site(),
+            )
+        };
         let num_subgraphs = sfuf.num_subgraphs();
         let num_waves = loop_ir.num_waves();
         let predicted_us = sfuf.predicted_us;

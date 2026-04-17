@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ferrite-cost-sweep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Calibration sweep that emits kernel,M,N,K,cost_us rows for the ferrite solver's TargetProfile"
+
+# Single binary, no library surface. Cost-sweep is a one-off calibration
+# tool run per (GPU × kernel library) — nothing else depends on it.
+#
+# `cuda` is required: the binary links `libvllm_kernels.a` +
+# `libcutlass_standalone_gemm.a` + `libvllm_flash_attn.a` +
+# `libflashinfer_attn.a` produced by `ferrite-cuda-builder`.
+[[bin]]
+name = "gpu_cost_sweep"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = [
+    "ferrite-cuda-core/cuda",
+    "ferrite-kernels/cuda",
+    "ferrite-cuda-builder/cuda",
+]
+
+[dependencies]
+# ferrite-cuda-builder is a build-only trigger: depending on it from a
+# binary ensures the static .a libs exist in the cudaforge cache before
+# the linker runs. No code is imported from it.
+ferrite-cuda-builder = { path = "../ferrite-cuda-builder" }
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+cudarc = { workspace = true, features = ["cublas", "dynamic-linking", "cuda-version-from-build-system"] }
+
+[build-dependencies]
+# `dirs::cache_dir()` resolves the cudaforge cache path the kernel
+# builder populates. Same pattern as vllm-cuda/build.rs.
+dirs = "5"

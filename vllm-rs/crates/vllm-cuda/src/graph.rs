@@ -362,6 +362,11 @@ impl CudaGraphRunner {
     }
 
     /// Replay a captured CUDA graph.
+    ///
+    /// `block_size` is the paged-KV block (page) size, used to drive the
+    /// FlashInfer scheduler's replan when an FI plan is resident. Pass 0
+    /// to skip the replan (harmless when no FI plan exists; mandatory
+    /// for FP8 graphs where `max_seqlen_k` isn't a single scalar).
     pub unsafe fn replay(
         &self,
         batch_size: usize,
@@ -371,6 +376,7 @@ impl CudaGraphRunner {
         cu_seqlens_q: &[i32],
         seqused_k: &[i32],
         block_table: &[i32],
+        block_size: usize,
         device: &mut GpuDevice,
         skip_input_ids_h2d: bool,
     ) -> Result<ReplayOutput> {
@@ -436,6 +442,31 @@ impl CudaGraphRunner {
 
         device.sync_transfer_to_compute()?;
 
+        // Re-run the FlashInfer scheduler with this step's seqlen_k.
+        // No-op when no FI plan is resident on this worker (models that
+        // don't declare `sk_buckets`). The replan is issued on the
+        // compute stream so its H2D memcpy completes before the replayed
+        // FI kernels read from `int_ws_d`.
+        if block_size > 0 {
+            let max_seqlen_k = seqused_k.iter().copied().max().unwrap_or(0) as usize;
+            // FI's `seq_len` is TOTAL Q tokens across the batch. For a
+            // decode graph at batch_size=N each req contributes 1 token,
+            // so total_q = N. Passing 1 here made the captured kernel's
+            // grid schedule for a single Q token while the runtime Q had
+            // N tokens — the kernel then read out-of-bounds scheduling
+            // entries, corrupting memory state that surfaced as the
+            // cublas INTERNAL_ERROR on the next GEMM of the same forward.
+            let total_q = batch_size;
+            unsafe {
+                ferrite_kernels::attention_helpers::replan_fi_for_decode(
+                    total_q,
+                    max_seqlen_k,
+                    block_size,
+                    device.compute_stream,
+                );
+            }
+        }
+
         // No allocator reset needed — graph uses baked-in addresses.
         driver::graph_launch(graph.exec, device.compute_stream)?;
 
@@ -450,12 +481,18 @@ impl CudaGraphRunner {
     }
 
     /// Fast replay for steady-state decode: update metadata on GPU.
+    ///
+    /// `max_seqlen_k` is the host-side maximum of the current step's per-req
+    /// KV lengths. The graph runner only has GPU-side `seqused_k` at this
+    /// point (incremented via `update_decode_metadata_gpu`), so the caller
+    /// must supply the host-side max for the FlashInfer replan call.
     pub unsafe fn replay_decode_fast(
         &self,
         batch_size: usize,
         input_ids: Option<&[u32]>,
         new_block_table: Option<&[i32]>,
         block_size: usize,
+        max_seqlen_k: usize,
         device: &mut GpuDevice,
     ) -> Result<ReplayOutput> {
         let graph = self
@@ -506,6 +543,20 @@ impl CudaGraphRunner {
                 batch_size,
                 stream,
             );
+        }
+
+        // Re-run the FlashInfer scheduler with the host-side max_seqlen_k
+        // the caller supplied. No-op for workers without an active FI plan.
+        // total_q = batch_size for decode (each req contributes 1 token).
+        if max_seqlen_k > 0 {
+            unsafe {
+                ferrite_kernels::attention_helpers::replan_fi_for_decode(
+                    batch_size,
+                    max_seqlen_k,
+                    block_size,
+                    stream,
+                );
+            }
         }
 
         driver::graph_launch(graph.exec, stream)?;
@@ -795,6 +846,7 @@ impl PrefillGraphRunner {
         seq_len: usize,
         block_table: &[i32],
         last_token_idx: u32,
+        block_size: usize,
         device: &mut GpuDevice,
     ) -> Result<PrefillReplayOutput> {
         let graph = self
@@ -859,6 +911,20 @@ impl PrefillGraphRunner {
         )?;
 
         device.sync_transfer_to_compute()?;
+
+        // Prefill-path FI replan: seq_len is the full prompt length; for
+        // fresh prefill max_seqlen_k == seq_len.
+        if block_size > 0 {
+            unsafe {
+                ferrite_kernels::attention_helpers::replan_fi_for_decode(
+                    seq_len,
+                    seq_len,
+                    block_size,
+                    device.compute_stream,
+                );
+            }
+        }
+
         driver::graph_launch(graph.exec, device.compute_stream)?;
 
         let logits = GpuTensor::new(self.shared_logits.ptr(), &[1, self.vocab_size], self.dtype);

@@ -95,9 +95,10 @@ pub fn refresh_predicted_us(
     bounds: &BTreeMap<String, u64>,
 ) {
     let mut scratch = bounds.clone();
-    for (&m, sfuf) in sfufs.per_num_tokens.iter_mut() {
-        scratch.insert("num_tokens".into(), m);
-        let Some(loop_ir) = loops.per_num_tokens.get(&m) else {
+    for (wp, sfuf) in sfufs.per_workload.iter_mut() {
+        scratch.insert("num_tokens".into(), wp.num_tokens);
+        scratch.insert("sk_bucket".into(), wp.sk_bucket);
+        let Some(loop_ir) = loops.per_workload.get(wp) else {
             continue;
         };
         sfuf.predicted_us = loop_cost_us(fuf, sfuf, loop_ir, lib, target, &scratch);
@@ -191,10 +192,11 @@ mod tests {
         let lib = starter_library();
         let target = l4_target();
 
-        let sfufs = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1]).unwrap();
-        let sfuf = &sfufs.per_num_tokens[&1];
+        let sfufs = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let sfuf = sfufs.get_nt(1).unwrap();
         let loops = schedule_workloads(&fuf, &sfufs);
-        let loop_ir = &loops.per_num_tokens[&1];
+        let wp1 = crate::solver::WorkloadPoint::num_tokens_only(1);
+        let loop_ir = &loops.per_workload[&wp1];
 
         let mut scratch = params.bounds.clone();
         scratch.insert("num_tokens".into(), 1);
@@ -238,14 +240,24 @@ mod tests {
         let lib = starter_library();
         let target = l4_target();
 
-        let sfufs = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1, 512]).unwrap();
+        let sfufs = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512],
+            &[],
+        )
+        .unwrap();
         let loops = schedule_workloads(&fuf, &sfufs);
 
         let mut scratch = params.bounds.clone();
         for &m in &[1u64, 512] {
             scratch.insert("num_tokens".into(), m);
-            let sfuf = &sfufs.per_num_tokens[&m];
-            let loop_ir = &loops.per_num_tokens[&m];
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(m);
+            let sfuf = sfufs.get_nt(m).unwrap();
+            let loop_ir = &loops.per_workload[&wp];
             let first = loop_cost_us(&fuf, sfuf, loop_ir, &lib, &target, &scratch);
             for _ in 0..20 {
                 let again = loop_cost_us(&fuf, sfuf, loop_ir, &lib, &target, &scratch);
@@ -279,18 +291,27 @@ mod tests {
         let lib = starter_library();
         let target = l4_target();
 
-        let mut sfufs = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1, 512]).unwrap();
-        let before: BTreeMap<u64, f64> = sfufs
-            .per_num_tokens
+        let mut sfufs = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 512],
+            &[],
+        )
+        .unwrap();
+        let before: BTreeMap<crate::solver::WorkloadPoint, f64> = sfufs
+            .per_workload
             .iter()
-            .map(|(m, sf)| (*m, sf.predicted_us))
+            .map(|(wp, sf)| (*wp, sf.predicted_us))
             .collect();
         let loops = schedule_workloads(&fuf, &sfufs);
         refresh_predicted_us(&fuf, &mut sfufs, &loops, &lib, &target, &params.bounds);
-        for (&m, sf) in sfufs.per_num_tokens.iter() {
+        for (wp, sf) in sfufs.per_workload.iter() {
             assert!(sf.predicted_us.is_finite() && sf.predicted_us > 0.0);
             // On serial chain the refresh shouldn't move the number.
-            assert!((before[&m] - sf.predicted_us).abs() < 1e-6);
+            assert!((before[wp] - sf.predicted_us).abs() < 1e-6);
         }
     }
 }

@@ -1947,12 +1947,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-cost-sweep"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "dirs 5.0.1",
+ "ferrite-cuda-builder",
+ "ferrite-cuda-core",
+ "ferrite-kernels",
+]
+
+[[package]]
 name = "ferrite-cuda-builder"
 version = "0.1.0"
 dependencies = [
  "cudaforge",
  "dirs 6.0.0",
  "ferrite-models",
+ "minijinja",
 ]
 
 [[package]]

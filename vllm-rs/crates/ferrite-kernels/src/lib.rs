@@ -18,6 +18,8 @@ pub mod attention_helpers;
 #[cfg(feature = "cuda")]
 pub mod cutlass;
 #[cfg(feature = "cuda")]
+pub mod flashinfer;
+#[cfg(feature = "cuda")]
 pub mod forward_output;
 #[cfg(feature = "cuda")]
 pub mod ggml;

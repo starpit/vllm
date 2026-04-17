@@ -11,6 +11,7 @@
 
 use std::cell::Cell;
 
+use crate::flashinfer::{self, FlashInferConfig, FlashInferPlanCache};
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
@@ -729,4 +730,207 @@ where
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// FlashInfer attention
+// ---------------------------------------------------------------------------
+
+/// Process-global FlashInfer plan cache.
+///
+/// Intentionally NOT `thread_local!`: vllm's executor captures the forward
+/// pass on one worker thread (where [`flashinfer_attention`] builds the
+/// plan) but runs graph replay (and our pre-replay
+/// [`replan_fi_for_decode`]) on a different thread. A per-thread cache
+/// splits that state and the replan call finds a null handle at replay.
+///
+/// The plan handle is opaque CUDA state; the FI shim doesn't hold any
+/// locks of its own, so a Mutex around the cache is sufficient. Lock
+/// contention is minimal — each forward step briefly holds it during
+/// (1) build/replan, (2) 16 per-layer set_io+run pairs, and (3) the
+/// pre-replay replan.
+static FI_PLAN_CACHE: std::sync::Mutex<FlashInferPlanCache> =
+    std::sync::Mutex::new(FlashInferPlanCache::new());
+
+/// Round `max_seqlen_k` up to the nearest bucket used by the solver-calibrated
+/// FI cost table. Matches `SK_BUCKETS` in ferrite-forward-macro.
+///
+/// The bucket is used as a plan-cache key: changing sk_bucket tears down the
+/// previous plan and rebuilds workspaces. Keeping the mapping monotonic
+/// ensures that a decode sweep from sk=128 → 8192 rebuilds at bucket
+/// boundaries, not on every token.
+pub fn sk_bucket_for(max_seqlen_k: usize) -> u32 {
+    const BUCKETS: &[u32] = &[128, 256, 512, 1024, 2048, 4096, 8192];
+    for &b in BUCKETS {
+        if (max_seqlen_k as u32) <= b {
+            return b;
+        }
+    }
+    // Beyond the largest bucket — round up to next power-of-two to keep the
+    // plan-cache key stable across similar lengths.
+    (max_seqlen_k as u32).next_power_of_two()
+}
+
+/// Run one layer of FlashInfer paged attention. Called from
+/// `FlashInferAttentionDecodeImpl` / `…PrefillImpl` codegen.
+///
+/// Expects `cu_seqlens_q.dim(0) == 2` (batch_size=1) — the unified shim is
+/// single-sequence-only. When this precondition doesn't hold the caller
+/// must use the FA2 fallback instead.
+///
+/// `cfg` selects the compiled tuple; if the tuple is not in
+/// `FLASHINFER_CONFIG_SET` (see `ferrite-cuda-builder`), this returns
+/// `None` and the caller must fall back.
+///
+/// `sk_bucket` is the monotonic ceiling of `max_seqlen_k` — see
+/// [`sk_bucket_for`]. Changing it invalidates the cached plan.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flashinfer_attention(
+    q: TensorView<'_>,
+    _cu_seqlens_q: TensorView<'_>,
+    _seqused_k: TensorView<'_>,
+    block_table: TensorView<'_>,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    scale: f32,
+    softcap: f32,
+    kv_cache: &KvCachePool,
+    layer_idx: usize,
+    num_sm: i32,
+    cfg: FlashInferConfig,
+    sk_bucket: u32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> Option<OwnedTensor> {
+    debug_assert_eq!(
+        q.ndim(),
+        3,
+        "FlashInfer expects Q shape [seq_len, num_qo_heads, head_dim]"
+    );
+    debug_assert_eq!(q.dim(2) as u32, cfg.head_dim, "Q head_dim != cfg.head_dim");
+
+    let seq_len = q.dim(0);
+    let num_qo_heads = q.dim(1);
+    let num_kv_heads = kv_cache.num_kv_heads;
+    let head_dim = kv_cache.head_dim;
+    let page_size = kv_cache.block_size;
+    let num_pages = max_seqlen_k.div_ceil(page_size);
+
+    if std::env::var("FI_TRACE").is_ok() && layer_idx == 0 {
+        eprintln!(
+            "[FI] L0 seq_len={} max_k={} scale={} softcap={} num_qo={} num_kv={} hd={} ps={} np={}",
+            seq_len, max_seqlen_k, scale, softcap,
+            num_qo_heads, num_kv_heads, head_dim, page_size, num_pages
+        );
+    }
+
+    let o = alloc.alloc_tensor(&[seq_len, num_qo_heads, head_dim], q.dtype());
+    let (float_ws, int_ws) = flashinfer::workspace_bytes(num_sm, head_dim, num_kv_heads);
+
+    // block_table is [batch_size, max_pages]; batch=1 → row 0 is the kv_indices
+    // array. Shim reads exactly `num_pages` entries.
+    let kv_indices_ptr = block_table.raw_ptr() as *const i32;
+    let k_layer = kv_cache.k_cache(layer_idx);
+    let v_layer = kv_cache.v_cache(layer_idx);
+
+    {
+        let mut cache = FI_PLAN_CACHE.lock().expect("FI_PLAN_CACHE poisoned");
+        let built = unsafe {
+            cache
+                .ensure(
+                    cfg,
+                    max_seqlen_q as u32,
+                    sk_bucket,
+                    q.raw_ptr() as *const core::ffi::c_void,
+                    k_layer.raw_ptr() as *const core::ffi::c_void,
+                    v_layer.raw_ptr() as *const core::ffi::c_void,
+                    kv_indices_ptr,
+                    o.as_gpu_tensor().raw_ptr() as *mut core::ffi::c_void,
+                    max_seqlen_k as i32,
+                    num_qo_heads as i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                    page_size as i32,
+                    num_pages as i32,
+                    num_sm,
+                    float_ws,
+                    int_ws,
+                    scale,
+                    softcap,
+                    stream,
+                )
+                .is_some()
+        };
+        if !built {
+            tracing::error!(
+                ?cfg,
+                sk_bucket,
+                "FlashInfer plan build failed — falling back"
+            );
+            return None;
+        }
+        // Re-run the scheduler with the current step's (seqlen_k, num_pages).
+        // The captured memcpy inside TwoStageHolisticPlanWithNumSm reads from
+        // pinned int_ws_h — at graph replay, the pre-launch `replan_fi_for_decode`
+        // updates int_ws_h with that step's scheduling before the captured
+        // memcpy re-executes, so int_ws_d ends up with fresh data.
+        unsafe {
+            let rc = cache.replan(
+                seq_len as i32,
+                max_seqlen_k as i32,
+                num_pages as i32,
+                stream,
+            );
+            if rc != 0 {
+                tracing::error!(rc, "fi_replan returned nonzero");
+            }
+        }
+
+        unsafe {
+            cache.set_io(
+                q.raw_ptr() as *const core::ffi::c_void,
+                k_layer.raw_ptr() as *const core::ffi::c_void,
+                v_layer.raw_ptr() as *const core::ffi::c_void,
+                kv_indices_ptr,
+                o.as_gpu_tensor().raw_ptr() as *mut core::ffi::c_void,
+            );
+            let rc = cache.run(stream);
+            if rc != 0 {
+                tracing::error!(rc, "fi_run returned nonzero");
+            }
+        }
+    }
+    Some(o)
+}
+
+/// Re-plan the thread-local FI plan cache for the current decode step.
+/// Call this BEFORE `graph_launch` at each decode step so the replayed
+/// FI kernels read fresh scheduling data from `int_ws_d`. The H2D
+/// memcpy issued here lands on `stream` and completes before any
+/// subsequent graph kernel launch on the same stream.
+///
+/// No-op when no FI plan has been built (models without `sk_buckets`).
+///
+/// # Safety
+/// `stream` must be the compute stream used by the graph runner.
+pub unsafe fn replan_fi_for_decode(
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    page_size: usize,
+    stream: CUstream,
+) {
+    let num_pages = max_seqlen_k.div_ceil(page_size) as i32;
+    let mut cache = FI_PLAN_CACHE.lock().expect("FI_PLAN_CACHE poisoned");
+    unsafe {
+        cache.replan(max_seqlen_q as i32, max_seqlen_k as i32, num_pages, stream);
+    }
+}
+
+/// Drop the global FlashInfer plan cache. Call on worker teardown to
+/// free the planner's `cudaMalloc`ed workspaces deterministically.
+pub fn reset_fi_plan_cache() {
+    FI_PLAN_CACHE
+        .lock()
+        .expect("FI_PLAN_CACHE poisoned")
+        .clear();
 }

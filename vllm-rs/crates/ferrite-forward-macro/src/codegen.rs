@@ -456,7 +456,7 @@ fn collect_accessors(
     let mut by_name: BTreeMap<String, (WeightAccessor, String)> = BTreeMap::new();
     let mut conflicts: Vec<String> = Vec::new();
 
-    for sfuf in sfufs.per_num_tokens.values() {
+    for sfuf in sfufs.per_workload.values() {
         for sg in sfuf.subgraphs() {
             let imp_id = sfuf
                 .impl_of(sg)
@@ -1218,7 +1218,6 @@ fn compute_drops_after(
     plan
 }
 
-/// Emit one per-workload-bucket forward fn.
 /// Allocate the stable local-binding ident per tile-output slot
 /// used by every per-bucket emission.
 fn build_local_map(fuf: &Fuf) -> LocalMap {
@@ -1296,7 +1295,7 @@ fn emit_forward_for_bucket(
     program: &Program,
     model: &ModelParams,
     lib: &ImplementationLibrary,
-    num_tokens: u64,
+    wp: crate::solver::WorkloadPoint,
 ) -> TokenStream {
     let locals = build_local_map(fuf);
 
@@ -1320,7 +1319,7 @@ fn emit_forward_for_bucket(
         })
         .unwrap_or_else(|| quote! { unreachable!("empty FUF") });
 
-    let fn_name = format_ident!("forward_m_{}", num_tokens);
+    let fn_name = bucket_fn_ident("forward_m", wp);
     quote! {
         /// Forward pass for this model × workload bucket. Walks
         /// the solver-picked kernels in wavefront order.
@@ -1348,12 +1347,13 @@ fn emit_forward_backbone_for_bucket(
     program: &Program,
     model: &ModelParams,
     lib: &ImplementationLibrary,
-    num_tokens: u64,
+    wp: crate::solver::WorkloadPoint,
 ) -> TokenStream {
     let locals = build_local_map(fuf);
 
     let Some(last_node) = fuf.nodes.last() else {
-        let fn_name = format_ident!("forward_backbone_m_{}", num_tokens);
+        // Empty FUF: degenerate, emit a stub that panics.
+        let fn_name = bucket_fn_ident("forward_backbone_m", wp);
         return quote! {
             #[cfg(feature = "cuda")]
             #[allow(clippy::too_many_arguments)]
@@ -1393,7 +1393,7 @@ fn emit_forward_backbone_for_bucket(
         &protected,
     );
 
-    let fn_name = format_ident!("forward_backbone_m_{}", num_tokens);
+    let fn_name = bucket_fn_ident("forward_backbone_m", wp);
     quote! {
         /// Backbone-only forward (no lm_head). Returns the output
         /// that would have been the final gemm's input — a freshly-
@@ -1430,6 +1430,18 @@ fn emit_forward_backbone_for_bucket(
     }
 }
 
+/// Ident for a per-workload-bucket forward fn. Name is
+/// `<prefix>_<m>` when `sk_bucket == 0` (legacy 1-D sweep) and
+/// `<prefix>_<m>_sk_<sk>` otherwise. Preserves the pre-sk naming
+/// for models that don't opt into an sk axis.
+fn bucket_fn_ident(prefix: &str, wp: crate::solver::WorkloadPoint) -> proc_macro2::Ident {
+    if wp.sk_bucket == 0 {
+        format_ident!("{}_{}", prefix, wp.num_tokens)
+    } else {
+        format_ident!("{}_{}_sk_{}", prefix, wp.num_tokens, wp.sk_bucket)
+    }
+}
+
 /// Emit the full per-model module body: Weights struct + loader,
 /// one forward fn per workload bucket, and a dispatching wrapper.
 pub fn emit_model(
@@ -1443,50 +1455,51 @@ pub fn emit_model(
 ) -> TokenStream {
     let weights = emit_weights_struct(program, fuf, sfufs, lib, model, manifest);
 
-    // Group buckets by SFUF signature (sorted subgraph → impl).
+    // Group workload points by SFUF signature (sorted subgraph → impl).
     // Buckets with identical impl picks produce byte-identical fn
-    // bodies, so we emit the full body ONCE at the canonical bucket
-    // and emit the duplicates as thin `#[inline(always)]` shims that
+    // bodies, so we emit the full body ONCE at the canonical point and
+    // emit the duplicates as thin `#[inline(always)]` shims that
     // delegate to the canonical fn. Public API (every
-    // `forward_m_<M>` / `forward_backbone_m_<M>` name a user might
-    // take a fn-pointer to) is preserved. Measured: most models
-    // collapse 5 buckets → 2 unique SFUFs, cutting the `quote!`
-    // work and the rustc-visible emitted body volume roughly in
-    // half on those models.
-    let bucket_points: Vec<u64> = sfufs.per_num_tokens.keys().copied().collect();
-    let mut sfuf_to_canonical: HashMap<Vec<(u32, u32)>, u64> = HashMap::new();
-    let mut bucket_canonical: Vec<u64> = Vec::with_capacity(bucket_points.len());
-    for (&m, sfuf) in sfufs.per_num_tokens.iter() {
+    // `forward_m_<M>[_sk_<SK>]` / `forward_backbone_m_<M>[_sk_<SK>]`
+    // name a user might take a fn-pointer to) is preserved. Measured:
+    // most models collapse 5 buckets → 2 unique SFUFs, cutting the
+    // `quote!` work and the rustc-visible emitted body volume roughly
+    // in half on those models. Extended to 2-D here: dedup runs over
+    // `(num_tokens, sk_bucket)` points too, so models with `sk_buckets`
+    // declared get the same compile-time win.
+    let bucket_points: Vec<crate::solver::WorkloadPoint> =
+        sfufs.per_workload.keys().copied().collect();
+    let mut sfuf_to_canonical: HashMap<Vec<(u32, u32)>, crate::solver::WorkloadPoint> =
+        HashMap::new();
+    let mut bucket_canonical: Vec<crate::solver::WorkloadPoint> =
+        Vec::with_capacity(bucket_points.len());
+    for wp in &bucket_points {
+        let sfuf = &sfufs.per_workload[wp];
         let mut sig: Vec<(u32, u32)> = sfuf.impls.iter().map(|(sg, imp)| (sg.0, imp.0)).collect();
         sig.sort();
-        let canonical = *sfuf_to_canonical.entry(sig).or_insert(m);
+        let canonical = *sfuf_to_canonical.entry(sig).or_insert(*wp);
         bucket_canonical.push(canonical);
     }
 
-    // Per-bucket fn emission. Canonical buckets get the full
-    // `__body_m_<N>` + `forward_m_<N>` + `forward_backbone_m_<N>`
-    // trio via `emit_canonical_bucket_fns`; duplicate buckets get
-    // thin `#[inline(always)]` shim wrappers that delegate to the
-    // canonical fn, so the `forward_m_<M>` / `forward_backbone_m_<M>`
-    // public API is preserved for every compiled workload point.
     let mut bucket_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
     let mut backbone_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
-    for (i, (m, sfuf)) in sfufs.per_num_tokens.iter().enumerate() {
+    for (i, wp) in bucket_points.iter().enumerate() {
+        let sfuf = &sfufs.per_workload[wp];
         let canonical = bucket_canonical[i];
-        if canonical == *m {
+        if canonical == *wp {
             let loop_ir = loops
-                .per_num_tokens
-                .get(m)
+                .per_workload
+                .get(wp)
                 .expect("schedule populated every key");
             bucket_fns.push(emit_forward_for_bucket(
-                fuf, sfuf, loop_ir, program, model, lib, *m,
+                fuf, sfuf, loop_ir, program, model, lib, *wp,
             ));
             backbone_fns.push(emit_forward_backbone_for_bucket(
-                fuf, sfuf, loop_ir, program, model, lib, *m,
+                fuf, sfuf, loop_ir, program, model, lib, *wp,
             ));
         } else {
-            let fwd_name = format_ident!("forward_m_{}", m);
-            let fwd_target = format_ident!("forward_m_{}", canonical);
+            let fwd_name = bucket_fn_ident("forward_m", *wp);
+            let fwd_target = bucket_fn_ident("forward_m", canonical);
             bucket_fns.push(quote! {
                 #[cfg(feature = "cuda")]
                 #[allow(clippy::too_many_arguments)]
@@ -1499,8 +1512,8 @@ pub fn emit_model(
                     unsafe { #fwd_target(wm, ctx, device) }
                 }
             });
-            let bb_name = format_ident!("forward_backbone_m_{}", m);
-            let bb_target = format_ident!("forward_backbone_m_{}", canonical);
+            let bb_name = bucket_fn_ident("forward_backbone_m", *wp);
+            let bb_target = bucket_fn_ident("forward_backbone_m", canonical);
             backbone_fns.push(quote! {
                 #[cfg(feature = "cuda")]
                 #[allow(clippy::too_many_arguments)]
@@ -1516,55 +1529,105 @@ pub fn emit_model(
         }
     }
 
-    // match num_tokens dispatch. Each compiled bucket `m_k` covers
-    // the inclusive range `[m_k, m_{k+1} - 1]`; the last bucket
-    // covers `m_last..=u64::MAX`. Runtime num_tokens that don't
-    // exactly equal a compiled point get the specialization for
-    // the largest compiled bucket ≤ num_tokens — correct
-    // (kernels work at any M) if suboptimal for cost. The user
-    // compiles more buckets if they want tighter cost fits.
-    let match_arms: Vec<TokenStream> = bucket_points
-        .iter()
-        .enumerate()
-        .map(|(i, &m)| {
-            let fn_name = format_ident!("forward_m_{}", m);
-            let lo = proc_macro2::Literal::u64_unsuffixed(m);
-            if i + 1 == bucket_points.len() {
-                // last bucket: cover m..=u64::MAX
-                quote! { #lo.. => unsafe { #fn_name(wm, ctx, device) }, }
+    // `sk_axis_active` is true when the model declared `sk_buckets`;
+    // otherwise all workload points have `sk_bucket == 0` and we
+    // emit the pre-sk 1-D dispatch verbatim (no nested match, no
+    // runtime `ctx.max_seqlen_k` lookup).
+    let sk_axis_active = sfufs.per_workload.keys().any(|wp| wp.sk_bucket != 0);
+
+    let num_tokens_points: Vec<u64> = sfufs.num_tokens_points();
+
+    // Per-num_tokens set of sk buckets (sorted). Used to build both
+    // the per-m inner match (sk → bucket fn) and the outer match
+    // arm ranges.
+    let mut sk_by_m: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for wp in sfufs.per_workload.keys() {
+        sk_by_m.entry(wp.num_tokens).or_default().push(wp.sk_bucket);
+    }
+    for v in sk_by_m.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+
+    // Build one outer match arm per compiled num_tokens. For
+    // `sk_axis_active == false`, the arm is `lo..=hi => unsafe {
+    // forward_m_<m>(...) }`. For `sk_axis_active == true`, the arm
+    // is `lo..=hi => match sk_bucket { lo..=hi => forward_m_<m>_sk_<sk>(...), ... }`.
+    let build_match_arms = |prefix: &str| -> (Vec<TokenStream>, Option<TokenStream>) {
+        let arms: Vec<TokenStream> = num_tokens_points
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| {
+                let lo = proc_macro2::Literal::u64_unsuffixed(m);
+                let range_tokens = if i + 1 == num_tokens_points.len() {
+                    quote! { #lo.. }
+                } else {
+                    let next = num_tokens_points[i + 1];
+                    let hi = proc_macro2::Literal::u64_unsuffixed(next - 1);
+                    quote! { #lo..=#hi }
+                };
+                if sk_axis_active {
+                    let sk_buckets = &sk_by_m[&m];
+                    let sk_arms: Vec<TokenStream> = sk_buckets
+                        .iter()
+                        .enumerate()
+                        .map(|(j, &sk)| {
+                            let wp = crate::solver::WorkloadPoint {
+                                num_tokens: m,
+                                sk_bucket: sk,
+                            };
+                            let fn_name = bucket_fn_ident(prefix, wp);
+                            let sk_lo = proc_macro2::Literal::u64_unsuffixed(sk);
+                            if j + 1 == sk_buckets.len() {
+                                quote! { #sk_lo.. => unsafe { #fn_name(wm, ctx, device) }, }
+                            } else {
+                                let next_sk = sk_buckets[j + 1];
+                                let sk_hi = proc_macro2::Literal::u64_unsuffixed(next_sk - 1);
+                                quote! { #sk_lo..=#sk_hi => unsafe { #fn_name(wm, ctx, device) }, }
+                            }
+                        })
+                        .collect();
+                    let fallback_wp = crate::solver::WorkloadPoint {
+                        num_tokens: m,
+                        sk_bucket: sk_buckets[0],
+                    };
+                    let fallback_name = bucket_fn_ident(prefix, fallback_wp);
+                    quote! {
+                        #range_tokens => {
+                            let sk_bucket_runtime = ctx.max_seqlen_k as u64;
+                            match sk_bucket_runtime {
+                                #(#sk_arms)*
+                                _ => unsafe { #fallback_name(wm, ctx, device) },
+                            }
+                        },
+                    }
+                } else {
+                    let wp = crate::solver::WorkloadPoint::num_tokens_only(m);
+                    let fn_name = bucket_fn_ident(prefix, wp);
+                    quote! { #range_tokens => unsafe { #fn_name(wm, ctx, device) }, }
+                }
+            })
+            .collect();
+        let fallback_arm = num_tokens_points.first().map(|&m| {
+            if sk_axis_active {
+                let sk_buckets = &sk_by_m[&m];
+                let wp = crate::solver::WorkloadPoint {
+                    num_tokens: m,
+                    sk_bucket: sk_buckets[0],
+                };
+                let fn_name = bucket_fn_ident(prefix, wp);
+                quote! { _ => unsafe { #fn_name(wm, ctx, device) }, }
             } else {
-                let next = bucket_points[i + 1];
-                let hi = proc_macro2::Literal::u64_unsuffixed(next - 1);
-                quote! { #lo..=#hi => unsafe { #fn_name(wm, ctx, device) }, }
+                let wp = crate::solver::WorkloadPoint::num_tokens_only(m);
+                let fn_name = bucket_fn_ident(prefix, wp);
+                quote! { _ => unsafe { #fn_name(wm, ctx, device) }, }
             }
-        })
-        .collect();
-    let backbone_match_arms: Vec<TokenStream> = bucket_points
-        .iter()
-        .enumerate()
-        .map(|(i, &m)| {
-            let fn_name = format_ident!("forward_backbone_m_{}", m);
-            let lo = proc_macro2::Literal::u64_unsuffixed(m);
-            if i + 1 == bucket_points.len() {
-                quote! { #lo.. => unsafe { #fn_name(wm, ctx, device) }, }
-            } else {
-                let next = bucket_points[i + 1];
-                let hi = proc_macro2::Literal::u64_unsuffixed(next - 1);
-                quote! { #lo..=#hi => unsafe { #fn_name(wm, ctx, device) }, }
-            }
-        })
-        .collect();
-    // Below the smallest compiled bucket (e.g. num_tokens=0 if
-    // someone somehow passes it): fall through to the smallest
-    // bucket. Realistically unreachable.
-    let fallback_arm = bucket_points.first().map(|&m| {
-        let fn_name = format_ident!("forward_m_{}", m);
-        quote! { _ => unsafe { #fn_name(wm, ctx, device) }, }
-    });
-    let backbone_fallback_arm = bucket_points.first().map(|&m| {
-        let fn_name = format_ident!("forward_backbone_m_{}", m);
-        quote! { _ => unsafe { #fn_name(wm, ctx, device) }, }
-    });
+        });
+        (arms, fallback_arm)
+    };
+
+    let (match_arms, fallback_arm) = build_match_arms("forward_m");
+    let (backbone_match_arms, backbone_fallback_arm) = build_match_arms("forward_backbone_m");
 
     quote! {
         #weights
@@ -1572,9 +1635,13 @@ pub fn emit_model(
         #(#bucket_fns)*
         #(#backbone_fns)*
 
-        /// Dispatch on `num_tokens`. Each compiled bucket covers
-        /// an inclusive range starting at its compiled point; the
-        /// largest bucket covers everything above.
+        /// Dispatch on `(num_tokens, sk_bucket)`. Outer match is on
+        /// `num_tokens`; inner match (when the model's `#[forward]`
+        /// declared `sk_buckets`) picks the kernel specialized for
+        /// the current KV-cache span. Runtime points that don't
+        /// exactly equal a compiled point get the specialization for
+        /// the largest compiled bucket ≤ runtime — correct (kernels
+        /// work at any value) if potentially suboptimal for cost.
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
@@ -1589,10 +1656,8 @@ pub fn emit_model(
             }
         }
 
-        /// Backbone-only dispatch (no lm_head). See
-        /// [`forward_backbone_m_*`] for what each bucket skips and
-        /// the shape of the returned tensor (per the DSL, a
-        /// freshly-allocated `[num_tokens, hidden_size]` `OwnedTensor`).
+        /// Backbone-only dispatch (no lm_head). Same 2-axis
+        /// dispatch structure as [`forward`].
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_backbone(

@@ -22,6 +22,7 @@ use ferrite_forward::forward;
 #[forward(
     target = "../../../target_profiles/l4_sm89.json",
     workloads = [1, 8, 64, 512, 4096],
+    sk_buckets = [128, 512, 2048, 8192],
 )]
 fn granite() {
     hidden_states = embed(input_ids, embed_tokens) * scalar(embedding_multiplier);

@@ -7,6 +7,12 @@
 // the (slow) kernel build as a distinct layer that only invalidates when
 // .cu source files change, independent of Rust source changes.
 
+// Reuse the same config module the lib crate exports so that symbol
+// names emitted downstream match what this build.rs renders.
+#[cfg(feature = "cuda")]
+#[path = "src/flashinfer_config.rs"]
+mod flashinfer_config;
+
 fn main() {
     #[cfg(feature = "cuda")]
     cuda_build();
@@ -158,6 +164,11 @@ fn cuda_build() {
     // 5. FlashAttention-2 paged kernels
     build_flash_attention(&cache_str, &mut rerun_files);
 
+    // 5b. FlashInfer per-tuple paged-attention shims. Rendered at build
+    //     time from `templates/` into `$OUT_DIR/flashinfer_inst/` and
+    //     compiled into `libflashinfer_attn.a`.
+    build_flashinfer_attention(&cache_str, &mut rerun_files);
+
     // 6. CUTLASS standalone GEMM launchers (128×128 + 64×64 for solver dispatch)
     build_cutlass_standalone_gemm(&cache_str, &mut rerun_files);
 
@@ -303,6 +314,96 @@ fn build_flash_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("-fPIC")
         .build_lib(format!("{}/libvllm_flash_attn.a", cache_dir))
         .expect("Failed to build flash attention");
+}
+
+#[cfg(feature = "cuda")]
+fn build_flashinfer_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
+    use flashinfer_config::FLASHINFER_CONFIG_SET;
+    use minijinja::{Environment, context};
+
+    // Upstream FlashInfer commit the shim + forked planner were written
+    // against. Bumping this requires re-reading upstream's
+    //   csrc/batch_attention_customize_config.jinja
+    //   include/flashinfer/attention/scheduler.cuh  (fork source)
+    // and reconciling the template text under `templates/`.
+    const FLASHINFER_COMMIT: &str = "08ab45d67705b301ee66e63c6999c934c72dd41c";
+    const CONFIG_TEMPLATE: &str = include_str!("templates/batch_attention_config.inc.j2");
+    const SHIM_TEMPLATE: &str = include_str!("templates/flashinfer_shim.cu.j2");
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
+    let inst_dir = std::path::Path::new(&out_dir).join("flashinfer_inst");
+    std::fs::create_dir_all(&inst_dir).expect("create flashinfer_inst dir");
+
+    let mut env = Environment::new();
+    env.add_template("cfg", CONFIG_TEMPLATE)
+        .expect("add config template");
+    env.add_template("shim", SHIM_TEMPLATE)
+        .expect("add shim template");
+
+    let mut cu_files: Vec<String> = Vec::new();
+    for cfg in FLASHINFER_CONFIG_SET {
+        let suffix = cfg.sym_suffix();
+        let cfg_filename = format!("config_{}.inc", suffix);
+        let cu_filename = format!("flashinfer_shim_{}.cu", suffix);
+
+        let cfg_body = env
+            .get_template("cfg")
+            .unwrap()
+            .render(context! {
+                dtype_cpp => cfg.dtype.cpp_ty(),
+                head_dim => cfg.head_dim,
+                flashinfer_commit => FLASHINFER_COMMIT,
+            })
+            .expect("render config .inc");
+        std::fs::write(inst_dir.join(&cfg_filename), cfg_body).expect("write config .inc");
+
+        let shim_body = env
+            .get_template("shim")
+            .unwrap()
+            .render(context! {
+                sym_suffix => suffix,
+                use_logits_soft_cap => cfg.use_logits_soft_cap,
+                config_inc_filename => cfg_filename,
+                flashinfer_commit => FLASHINFER_COMMIT,
+            })
+            .expect("render shim .cu");
+        let cu_path = inst_dir.join(&cu_filename);
+        std::fs::write(&cu_path, shim_body).expect("write shim .cu");
+        cu_files.push(cu_path.to_string_lossy().into_owned());
+    }
+
+    // Template sources — re-render on edit. The rendered files under
+    // $OUT_DIR are NOT added; they're regenerated every build and the
+    // cudaforge per-object cache avoids recompilation when their content
+    // is byte-identical.
+    rerun_files.push("src/flashinfer_config.rs".to_string());
+    rerun_files.push("templates/batch_attention_config.inc.j2".to_string());
+    rerun_files.push("templates/flashinfer_shim.cu.j2".to_string());
+
+    cudaforge::KernelBuilder::new()
+        .out_dir(cache_dir)
+        .source_files(cu_files)
+        .include_path(inst_dir.to_string_lossy().as_ref())
+        .with_git_dependency(
+            "flashinfer",
+            "https://github.com/flashinfer-ai/flashinfer.git",
+            FLASHINFER_COMMIT,
+            vec!["include"],
+            /*recurse_submodules=*/ false,
+        )
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("-U__CUDA_NO_HALF_OPERATORS__")
+        .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+        .arg("-U__CUDA_NO_HALF2_OPERATORS__")
+        .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
+        .arg("--expt-relaxed-constexpr")
+        .arg("--expt-extended-lambda")
+        .arg("--use_fast_math")
+        .arg("-Xcompiler")
+        .arg("-fPIC")
+        .build_lib(format!("{}/libflashinfer_attn.a", cache_dir))
+        .expect("Failed to build flashinfer_attn");
 }
 
 #[cfg(feature = "cuda")]

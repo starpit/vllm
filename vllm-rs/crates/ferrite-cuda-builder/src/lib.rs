@@ -9,3 +9,8 @@
 
 // Re-export ferrite-models so downstream crates get the build ordering.
 pub use ferrite_models;
+
+// Per-tuple FlashInfer config set — symbol-name source of truth shared
+// with `build.rs` (via `#[path]`) and consumed downstream by
+// ferrite-kernels / ferrite-forward-macro when emitting FI call sites.
+pub mod flashinfer_config;

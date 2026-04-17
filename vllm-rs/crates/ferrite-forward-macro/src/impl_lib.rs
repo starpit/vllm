@@ -67,6 +67,16 @@ impl CostCtx<'_> {
             .copied()
             .expect("solver must set num_tokens in bounds before costing")
     }
+
+    /// Convenience: read `sk_bucket` (the discretized KV-cache length
+    /// axis) from bounds. Returns 0 when the caller has not swept an
+    /// sk axis — legacy 1-D workload points. Impls that don't care
+    /// about `sk` ignore this; impls whose cost depends on `sk`
+    /// (e.g. FlashInfer attention) read it here and the solver's 2-D
+    /// sweep produces one Assignment per (num_tokens, sk_bucket).
+    pub fn sk_bucket(&self) -> u64 {
+        self.bounds.get("sk_bucket").copied().unwrap_or(0)
+    }
 }
 
 /// Stable identifier for one [`Implementation`] in the
@@ -270,25 +280,43 @@ impl MatchInfo {
 ///
 /// Distinct from `target_compatible` (about GPU capability). A
 /// `WorkloadConstraint` expresses correctness requirements on the
-/// workload itself — e.g. "this GEMV kernel only handles M=1".
+/// workload itself — e.g. "this GEMV kernel only handles M=1", or
+/// "this FlashInfer decode kernel wins only when the KV-cache span
+/// (`sk`) is large".
 ///
-/// Correctness, not cost: if `accepts(num_tokens)` returns false,
-/// the impl must NOT be picked at that workload regardless of its
-/// cost. Data, not closures — so the ILP backend can linearize
+/// Correctness, not cost: if `accepts(num_tokens, sk_bucket)` returns
+/// false, the impl must NOT be picked at that workload regardless of
+/// its cost. Data, not closures — so the ILP backend can linearize
 /// each variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkloadConstraint {
-    /// Valid for any `num_tokens` value.
+    /// Valid for any `(num_tokens, sk_bucket)` value.
     Any,
-    /// Valid only when `num_tokens` falls in this inclusive range.
+    /// Valid only when `num_tokens` falls in this inclusive range;
+    /// unconstrained on `sk_bucket`.
     NumTokensRange { min: u32, max: u32 },
+    /// Valid only when BOTH `num_tokens` and `sk_bucket` fall in
+    /// their respective inclusive ranges.
+    NumTokensAndSkRange {
+        num_tokens: (u32, u32),
+        sk_bucket: (u64, u64),
+    },
 }
 
 impl WorkloadConstraint {
-    pub fn accepts(&self, num_tokens: u32) -> bool {
+    pub fn accepts(&self, num_tokens: u32, sk_bucket: u64) -> bool {
         match self {
             Self::Any => true,
             Self::NumTokensRange { min, max } => num_tokens >= *min && num_tokens <= *max,
+            Self::NumTokensAndSkRange {
+                num_tokens: (m_min, m_max),
+                sk_bucket: (sk_min, sk_max),
+            } => {
+                num_tokens >= *m_min
+                    && num_tokens <= *m_max
+                    && sk_bucket >= *sk_min
+                    && sk_bucket <= *sk_max
+            }
         }
     }
 }
@@ -985,6 +1013,36 @@ fn sliding_window_left_tokens(ctx: &EmitCtx) -> TokenStream {
     quote! { #w }
 }
 
+/// Build the `fa2_attn_bf16_h{h}` kernel name for calibrated FA2 cost
+/// lookup. FA2 handles any `(num_qo_heads, num_kv_heads)` at runtime,
+/// so the cost table is keyed only on the compile-time specialization
+/// dim (`head_dim`). Keep in sync with the row names emitted by
+/// `ferrite-cost-sweep/src/attention_sweep.rs`.
+fn fa2_attn_csv_name(head_dim: u32) -> String {
+    format!("fa2_attn_bf16_h{head_dim}")
+}
+
+/// Calibrated FA2 attention cost (via CSV), falling back to the
+/// analytic `cost_attention` when no row matches. Used by
+/// `AttentionViaCacheImpl` / `AttentionPrefillContiguousImpl` (and
+/// their sliding variants) so the solver's FA2 vs FI tiebreak runs on
+/// real measured timings instead of the ~0 µs the analytic formula
+/// returns at M=1 (where `flops = 4*1*1*d` underflows the TFLOPS
+/// budget). Without this, FI can never beat FA2 at decode even when
+/// the calibrated CSV shows it's 4.6× faster.
+fn cost_attention_calibrated(m: &MatchInfo, ctx: &CostCtx) -> f64 {
+    let Some(head_dim) = ctx.bounds.get("head_dim").copied() else {
+        return cost_attention(m, ctx);
+    };
+    let name = fa2_attn_csv_name(head_dim as u32);
+    let nt = ctx.num_tokens() as u32;
+    let sk = ctx.sk_bucket() as u32;
+    match ctx.profile.cost_us_for(&name, nt, sk, head_dim as u32) {
+        Some(cost) => cost,
+        None => cost_attention(m, ctx),
+    }
+}
+
 fn cost_attention(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     // Rough: 4 * T^2 * D.
     let node = ctx.fuf.get(m.claimed_tiles[0]);
@@ -1325,6 +1383,28 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(Bnb4FusedGateUpGeluMulImpl));
     lib.push(Box::new(Bnb4FusedQkvRopeCacheImpl));
     lib.push(Box::new(Bnb4FusedQkvRopePrefillImpl));
+
+    // FlashInfer paged attention — one Decode + one Prefill Impl per
+    // tuple in FLASHINFER_CONFIG_SET (see `ferrite-cuda-builder`). Each
+    // variant's `target_compatible` gates on whether the calibrated CSV
+    // has a row for its (head_dim, softcap) family, so targets without
+    // the FlashInfer tuple (either uncompiled or uncalibrated) silently
+    // fall back to the FA2 attention Impls above. Keep in sync with
+    // `FLASHINFER_CONFIG_SET` — adding a tuple there without mirroring
+    // it here leaves the Impl unreachable; removing a tuple without
+    // mirroring leaves the Impl with no matching extern symbols.
+    for &head_dim in &[64u32, 128, 256] {
+        for &use_softcap in &[false, true] {
+            lib.push(Box::new(FlashInferAttentionDecodeImpl {
+                head_dim,
+                use_logits_soft_cap: use_softcap,
+            }));
+            lib.push(Box::new(FlashInferAttentionPrefillImpl {
+                head_dim,
+                use_logits_soft_cap: use_softcap,
+            }));
+        }
+    }
     lib
 }
 
@@ -4322,7 +4402,10 @@ impl Implementation for AttentionViaCacheImpl {
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        cost_attention(m, ctx)
+        // Use the calibrated `fa2_attn_...` CSV row when present so
+        // the FI-vs-FA2 tiebreak runs on real timings; falls back to
+        // the analytic `cost_attention` formula when no row matches.
+        cost_attention_calibrated(m, ctx)
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {
@@ -4942,9 +5025,11 @@ impl Implementation for AttentionPrefillContiguousImpl {
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        // Same quadratic-in-seqlen cost as the paged decode variant
-        // for now — both call FA2 underneath.
-        cost_attention(m, ctx)
+        // Same calibrated FA2 CSV row as the paged decode variant —
+        // the FA2 sweep emits one cost per (h, q, k, M, sk) cell and
+        // doesn't distinguish decode/prefill. Falls back to the
+        // analytic formula when no row matches.
+        cost_attention_calibrated(m, ctx)
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {
@@ -7374,6 +7459,398 @@ impl Implementation for Bnb4FusedQkvRopePrefillImpl {
     }
 }
 
+// ── FlashInfer attention Impls ───────────────────────────────────
+//
+// Alternative to `AttentionViaCacheImpl` (decode) and
+// `AttentionPrefillContiguousImpl` (prefill). Reads Q from the DSL
+// tile's slot 0 and K/V from the paged cache written by the upstream
+// fused QKV-rope tile, same as the FA2 variants, but dispatches
+// through FlashInfer's persistent batch-attention kernel when the
+// target has a calibrated CSV row for this `(head_dim, softcap,
+// num_q_heads, num_kv_heads)` tuple. When the FFI tuple isn't
+// compiled in, the emitted code falls back to the matching FA2 path.
+//
+// One Impl pair (Decode + Prefill) is registered per tuple in
+// `FLASHINFER_CONFIG_SET`; the solver's 2-D `(num_tokens, sk_bucket)`
+// sweep picks whichever wins per cell based on the calibrated costs.
+// Without CSV data the prefix-gated `target_compatible` rejects the
+// FI Impls and the non-FI attention Impls cover the workload.
+
+/// Finite sk_bucket range the attention sweep calibrates. Matches
+/// `ATTN_SK_BUCKETS` in `ferrite-kernels::attention_helpers` and the
+/// `SK_VALUES` grid in `ferrite-cost-sweep::attention_sweep`. Changing
+/// either end requires re-sweeping the target CSV.
+const FI_SK_BUCKET_MIN: u64 = 128;
+const FI_SK_BUCKET_MAX: u64 = 8192;
+
+/// Build the CSV kernel name the FI Impls look up for a given
+/// `(head_dim, softcap)` tuple. `(num_q_heads, num_kv_heads)` is a
+/// runtime parameter of the compiled FI kernel — the same shim
+/// handles any GQA ratio — so the cost table is keyed only on the
+/// compile-time specialization dims. Must match the row names the
+/// attention sweep emits — keep in sync with
+/// `ferrite-cost-sweep/src/attention_sweep.rs`.
+fn fi_csv_name(head_dim: u32, use_logits_soft_cap: bool) -> String {
+    let softcap_tok = if use_logits_soft_cap {
+        "softcap"
+    } else {
+        "nosoftcap"
+    };
+    format!("flashinfer_attn_bf16_h{head_dim}_{softcap_tok}")
+}
+
+/// Shared cost lookup — identical between Decode and Prefill Impls:
+/// the FI plan builds the same work for both, and both variants live
+/// in the same CSV row family (disambiguated at solver time by the
+/// workload constraint on `num_tokens`).
+fn fi_cost_us(head_dim: u32, use_logits_soft_cap: bool, ctx: &CostCtx) -> f64 {
+    // Fast reject when the model's head_dim doesn't match the baked
+    // tuple — every FI variant walks every Attention tile; only one's
+    // head_dim matches any given model. `UNCALIBRATED_COST_US` (finite
+    // sentinel) rather than `INFINITY` so the DP's non-finite-cost
+    // guard (`SolveError::UnreachableCost`) doesn't fire.
+    let Some(model_head_dim) = ctx.bounds.get("head_dim").copied() else {
+        return UNCALIBRATED_COST_US;
+    };
+    if model_head_dim as u32 != head_dim {
+        return UNCALIBRATED_COST_US;
+    }
+    let name = fi_csv_name(head_dim, use_logits_soft_cap);
+    let nt = ctx.num_tokens() as u32;
+    let sk = ctx.sk_bucket() as u32;
+    ctx.profile
+        .cost_us_for(&name, nt, sk, head_dim)
+        .unwrap_or(UNCALIBRATED_COST_US)
+}
+
+/// Emit the FlashInfer call + its FA2 fallback for the decode path.
+/// Factored so both the Decode Impl's `emit_call` and any future
+/// sliding-window FI variant can share the body.
+fn emit_fi_decode_body(ctx: &EmitCtx, head_dim: u32, use_logits_soft_cap: bool) -> TokenStream {
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let node = ctx.fuf.get(tile);
+
+    let q_expr = ctx.input_expr(tile, 0);
+    let layer =
+        node.inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Extern {
+                    kind: crate::classified::ExternKind::KvCache,
+                    index: Some(layer),
+                } => Some(*layer),
+                _ => None,
+            })
+            .expect("Attention has a kv_cache extern with a concrete layer index") as usize;
+
+    let scale_tokens = attention_scale_tokens(ctx);
+    let softcap_tokens = attention_softcap_tokens(ctx);
+    let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
+
+    // FlashInferConfig literal baked from the Impl's state. The
+    // emitted `dtype` is always `Bf16` — the only dtype currently in
+    // FLASHINFER_CONFIG_SET (Fp16 is a placeholder; see
+    // `ferrite-cuda-builder::flashinfer_config`).
+    quote! {
+        let mut #out = unsafe {
+            let fi_cfg = ::ferrite_kernels::flashinfer::FlashInferConfig {
+                dtype: ::ferrite_kernels::flashinfer::FiDType::Bf16,
+                head_dim: #head_dim,
+                use_logits_soft_cap: #use_logits_soft_cap,
+            };
+            let sk_bucket = ::ferrite_kernels::attention_helpers::sk_bucket_for(
+                ctx.max_seqlen_k,
+            );
+            let fi = ::ferrite_kernels::attention_helpers::flashinfer_attention(
+                #q_expr,
+                ctx.cu_seqlens_q,
+                ctx.seqused_k,
+                ctx.block_table,
+                ctx.max_seqlen_q,
+                ctx.max_seqlen_k,
+                #scale_tokens,
+                #softcap_tokens,
+                ctx.kv_cache,
+                #layer,
+                device.num_sm,
+                fi_cfg,
+                sk_bucket,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            match fi {
+                Some(t) => t,
+                None => {
+                    // FA2 fallback — mirrors `AttentionViaCacheImpl`.
+                    let has_spans = !ctx.kv_cache.block_unrotated_gpu().is_null();
+                    let (cos_sin_ptr, rotary_dim) = if has_spans {
+                        (
+                            ctx.rotary.cos_sin_cache.raw_ptr() as *const u8,
+                            ctx.rotary.cos_sin_cache.dim(1),
+                        )
+                    } else {
+                        (::std::ptr::null::<u8>(), 0)
+                    };
+                    ::ferrite_kernels::attention_helpers::attention_decode_from_cache(
+                        #q_expr,
+                        ctx.cu_seqlens_q,
+                        ctx.seqused_k,
+                        ctx.block_table,
+                        ctx.max_seqlen_q,
+                        ctx.max_seqlen_k,
+                        #scale_tokens,
+                        #softcap_tokens,
+                        -1,
+                        ctx.kv_cache,
+                        #layer,
+                        device.num_sm,
+                        &mut device.caching,
+                        device.compute_stream,
+                        cos_sin_ptr,
+                        rotary_dim,
+                        false,
+                    )
+                }
+            }
+        };
+        unsafe {
+            let nt = (*#out).dim(0);
+            let dt = (*#out).dtype();
+            #out.reshape(&[nt, #q_size], dt);
+        }
+    }
+}
+
+/// Prefill counterpart. Differs from the decode body in the FA2
+/// fallback path: reads K/V from the DSL tile's slots 1/2 (the
+/// contiguous outputs of `FusedQkvRopePrefillImpl`) and calls
+/// `flash_attn_contiguous` instead of the paged decode helper. The
+/// FlashInfer call is identical — the shim is paged-only and reads
+/// the same cache `FusedQkvRopePrefillImpl` writes.
+fn emit_fi_prefill_body(ctx: &EmitCtx, head_dim: u32, use_logits_soft_cap: bool) -> TokenStream {
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let node = ctx.fuf.get(tile);
+
+    let q_expr = ctx.input_expr(tile, 0);
+    let k_expr = ctx.input_expr(tile, 1);
+    let v_expr = ctx.input_expr(tile, 2);
+    let layer =
+        node.inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Extern {
+                    kind: crate::classified::ExternKind::KvCache,
+                    index: Some(layer),
+                } => Some(*layer),
+                _ => None,
+            })
+            .expect("Attention has a kv_cache extern with a concrete layer index") as usize;
+
+    let scale_tokens = attention_scale_tokens(ctx);
+    let softcap_tokens = attention_softcap_tokens(ctx);
+    let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
+
+    quote! {
+        let mut #out = unsafe {
+            let fi_cfg = ::ferrite_kernels::flashinfer::FlashInferConfig {
+                dtype: ::ferrite_kernels::flashinfer::FiDType::Bf16,
+                head_dim: #head_dim,
+                use_logits_soft_cap: #use_logits_soft_cap,
+            };
+            let sk_bucket = ::ferrite_kernels::attention_helpers::sk_bucket_for(
+                ctx.max_seqlen_k,
+            );
+            let fi = ::ferrite_kernels::attention_helpers::flashinfer_attention(
+                #q_expr,
+                ctx.cu_seqlens_q,
+                ctx.seqused_k,
+                ctx.block_table,
+                ctx.max_seqlen_q,
+                ctx.max_seqlen_k,
+                #scale_tokens,
+                #softcap_tokens,
+                ctx.kv_cache,
+                #layer,
+                device.num_sm,
+                fi_cfg,
+                sk_bucket,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            match fi {
+                Some(t) => t,
+                None => {
+                    // FA2 fallback — mirrors `AttentionPrefillContiguousImpl`.
+                    ::ferrite_kernels::kernels::flash_attn_contiguous(
+                        *#q_expr,
+                        *#k_expr,
+                        *#v_expr,
+                        *ctx.cu_seqlens_q,
+                        *ctx.cu_seqlens_q,
+                        ctx.max_seqlen_q,
+                        ctx.max_seqlen_k,
+                        #scale_tokens,
+                        true,
+                        #softcap_tokens,
+                        -1,
+                        &mut device.caching,
+                        device.compute_stream,
+                        ::std::ptr::null::<u8>(),
+                        0,
+                        false,
+                    )
+                }
+            }
+        };
+        unsafe {
+            let nt = (*#out).dim(0);
+            let dt = (*#out).dtype();
+            #out.reshape(&[nt, #q_size], dt);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FlashInferAttentionDecodeImpl {
+    pub head_dim: u32,
+    pub use_logits_soft_cap: bool,
+}
+
+impl Implementation for FlashInferAttentionDecodeImpl {
+    fn name(&self) -> &'static str {
+        // Variant-level identification happens through the CSV row
+        // name; a single name is enough for the solver's diagnostics.
+        "flashinfer_attention_decode"
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // O(1) membership check on the fully-qualified FI kernel name.
+        // A row-less target (no sweep data for this head_dim × softcap)
+        // silently falls back to FA2 via the `None` emit-call branch.
+        profile
+            .cost_table
+            .has_kernel(&fi_csv_name(self.head_dim, self.use_logits_soft_cap))
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensAndSkRange {
+            num_tokens: (1, 1),
+            sk_bucket: (FI_SK_BUCKET_MIN, FI_SK_BUCKET_MAX),
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::Attention)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        fi_cost_us(self.head_dim, self.use_logits_soft_cap, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        emit_fi_decode_body(ctx, self.head_dim, self.use_logits_soft_cap)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FlashInferAttentionPrefillImpl {
+    pub head_dim: u32,
+    pub use_logits_soft_cap: bool,
+}
+
+impl Implementation for FlashInferAttentionPrefillImpl {
+    fn name(&self) -> &'static str {
+        "flashinfer_attention_prefill"
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile
+            .cost_table
+            .has_kernel(&fi_csv_name(self.head_dim, self.use_logits_soft_cap))
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensAndSkRange {
+            num_tokens: (2, u32::MAX),
+            sk_bucket: (FI_SK_BUCKET_MIN, FI_SK_BUCKET_MAX),
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::Attention)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        fi_cost_us(self.head_dim, self.use_logits_soft_cap, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        emit_fi_prefill_body(ctx, self.head_dim, self.use_logits_soft_cap)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7508,12 +7985,24 @@ mod tests {
 
     #[test]
     fn workload_constraint_accepts_inside_range() {
+        // NumTokensRange ignores sk_bucket.
         let c = WorkloadConstraint::NumTokensRange { min: 1, max: 8 };
-        assert!(c.accepts(1));
-        assert!(c.accepts(8));
-        assert!(!c.accepts(9));
-        assert!(!c.accepts(0));
-        assert!(WorkloadConstraint::Any.accepts(4096));
+        assert!(c.accepts(1, 0));
+        assert!(c.accepts(8, 4096));
+        assert!(!c.accepts(9, 0));
+        assert!(!c.accepts(0, 0));
+        // Any accepts all.
+        assert!(WorkloadConstraint::Any.accepts(4096, 8192));
+        // NumTokensAndSkRange gates on both axes.
+        let s = WorkloadConstraint::NumTokensAndSkRange {
+            num_tokens: (1, 1),
+            sk_bucket: (1024, 8192),
+        };
+        assert!(s.accepts(1, 1024));
+        assert!(s.accepts(1, 8192));
+        assert!(!s.accepts(1, 512)); // below sk range
+        assert!(!s.accepts(1, 16384)); // above sk range
+        assert!(!s.accepts(2, 4096)); // num_tokens outside
     }
 
     #[test]
@@ -7608,5 +8097,189 @@ mod tests {
             imp.matches(&fuf, t1, &profile).is_none(),
             "cutlass must not match a Gemm whose output feeds RopeAppend",
         );
+    }
+    // ── FlashInfer attention Impls ───────────────────────────────
+
+    /// Build a minimal `TargetProfile` with only the cost rows we
+    /// want, for testing Impl gating without committing a CSV.
+    fn synthetic_profile(rows: &[(&str, u32, u32, u32, f64)]) -> crate::target::TargetProfile {
+        let mut cost_table = crate::target::CostTable::new();
+        for (k, m, n, k_, cost) in rows {
+            cost_table.insert(*k, *m, *n, *k_, *cost);
+        }
+        crate::target::TargetProfile {
+            name: "synthetic".to_string(),
+            source_path: std::path::PathBuf::from("synthetic"),
+            compute_capability: 89,
+            num_sms: 58,
+            peak_tflops_fp16: 121.0,
+            memory_bandwidth_gbps: 300.0,
+            shared_memory_per_sm_kb: 100,
+            cost_table,
+        }
+    }
+
+    #[test]
+    fn starter_library_registers_twelve_flashinfer_variants() {
+        // Six tuples in `FLASHINFER_CONFIG_SET` × {Decode, Prefill} Impls.
+        // If this count drifts, either the config set or the registration
+        // loop changed without the mirror being updated — a silent way to
+        // leave the Impl chain broken.
+        let lib = starter_library();
+        let fi_decode = lib
+            .iter_enumerated()
+            .filter(|(_, i)| i.name() == "flashinfer_attention_decode")
+            .count();
+        let fi_prefill = lib
+            .iter_enumerated()
+            .filter(|(_, i)| i.name() == "flashinfer_attention_prefill")
+            .count();
+        assert_eq!(fi_decode, 6, "expected 6 decode variants");
+        assert_eq!(fi_prefill, 6, "expected 6 prefill variants");
+    }
+
+    #[test]
+    fn flashinfer_decode_workload_constraint_is_m_eq_1_and_calibrated_sk_range() {
+        let imp = FlashInferAttentionDecodeImpl {
+            head_dim: 128,
+            use_logits_soft_cap: false,
+        };
+        let c = imp.workload_constraint();
+        assert!(c.accepts(1, 128)); // decode at lowest bucket
+        assert!(c.accepts(1, 8192)); // decode at highest bucket
+        assert!(!c.accepts(1, 64)); // below calibrated range
+        assert!(!c.accepts(1, 16384)); // above calibrated range
+        assert!(!c.accepts(2, 2048)); // prefill M outside decode range
+    }
+
+    #[test]
+    fn flashinfer_prefill_workload_constraint_is_m_ge_2_and_calibrated_sk_range() {
+        let imp = FlashInferAttentionPrefillImpl {
+            head_dim: 64,
+            use_logits_soft_cap: true,
+        };
+        let c = imp.workload_constraint();
+        assert!(c.accepts(2, 128));
+        assert!(c.accepts(4096, 8192));
+        assert!(!c.accepts(1, 2048)); // decode M not in prefill range
+        assert!(!c.accepts(2, 64)); // below calibrated sk
+    }
+
+    #[test]
+    fn flashinfer_target_compatible_gated_by_csv_prefix() {
+        // Empty profile — no rows of any kind.
+        let empty = synthetic_profile(&[]);
+        let imp = FlashInferAttentionDecodeImpl {
+            head_dim: 128,
+            use_logits_soft_cap: false,
+        };
+        assert!(
+            !imp.target_compatible(&empty),
+            "FI decode must be rejected when CSV has no matching rows"
+        );
+
+        // Profile with a row for a DIFFERENT head_dim — still must reject.
+        let other = synthetic_profile(&[("flashinfer_attn_bf16_h64_nosoftcap", 1, 2048, 64, 5.0)]);
+        assert!(
+            !imp.target_compatible(&other),
+            "FI decode (h=128) must be rejected when only h=64 rows exist"
+        );
+
+        // Profile with a matching row — accept. The kernel name is
+        // keyed only on (head_dim, softcap) — `(q, k)` is runtime.
+        let matching =
+            synthetic_profile(&[("flashinfer_attn_bf16_h128_nosoftcap", 1, 2048, 128, 3.0)]);
+        assert!(
+            imp.target_compatible(&matching),
+            "FI decode must accept when a matching-head_dim row exists"
+        );
+
+        // Softcap-matching requires exact softcap token.
+        let imp_cap = FlashInferAttentionDecodeImpl {
+            head_dim: 128,
+            use_logits_soft_cap: true,
+        };
+        assert!(
+            !imp_cap.target_compatible(&matching),
+            "FI decode(softcap=true) must not accept a nosoftcap-only CSV",
+        );
+    }
+
+    #[test]
+    fn flashinfer_cost_us_finite_on_hit_and_uncalibrated_on_mismatch() {
+        use crate::fuf::{Fuf, FufNode};
+        use crate::shape::Dim;
+
+        // Synthetic profile with one FlashInfer decode row at (m=1,
+        // sk=2048, head_dim=128). Name is head_dim/softcap-only — the
+        // kernel handles any (q, k) at runtime.
+        let profile =
+            synthetic_profile(&[("flashinfer_attn_bf16_h128_nosoftcap", 1, 2048, 128, 6.5)]);
+
+        // Minimal FUF: one Attention tile. `fi_cost_us` ignores the
+        // tile's shape entirely (the cost comes from the CSV lookup),
+        // so we don't need realistic QKV tile plumbing.
+        let t0 = TileId(0);
+        let fuf = Fuf {
+            nodes: vec![FufNode {
+                id: t0,
+                op: OpKind::Attention,
+                inputs: vec![],
+                outputs: vec![vec![Dim::Lit(1), Dim::Lit(128)]],
+            }],
+        };
+        let mi = MatchInfo {
+            claimed_tiles: vec![t0],
+            boundary_inputs: vec![],
+            boundary_outputs: vec![t0],
+        };
+
+        // Matching model bounds (h=128, q=32, k=8) → hit.
+        let mut bounds: BTreeMap<String, u64> = BTreeMap::new();
+        bounds.insert("head_dim".into(), 128);
+        bounds.insert("num_attention_heads".into(), 32);
+        bounds.insert("num_key_value_heads".into(), 8);
+        bounds.insert("num_tokens".into(), 1);
+        bounds.insert("sk_bucket".into(), 2048);
+        let ctx = CostCtx {
+            fuf: &fuf,
+            profile: &profile,
+            bounds: &bounds,
+        };
+        let imp = FlashInferAttentionDecodeImpl {
+            head_dim: 128,
+            use_logits_soft_cap: false,
+        };
+        let cost = imp.cost_us(&mi, &ctx);
+        assert_eq!(cost, 6.5);
+
+        // Mismatching head_dim — Impl baked for h=128, model has h=64.
+        // All reject paths must stay finite (UNCALIBRATED_COST_US) so
+        // the DP's `!cost.is_finite()` guard doesn't trip; FA2 with a
+        // real calibrated cost still wins the tiebreak.
+        bounds.insert("head_dim".into(), 64);
+        let ctx_bad = CostCtx {
+            fuf: &fuf,
+            profile: &profile,
+            bounds: &bounds,
+        };
+        let cost_bad = imp.cost_us(&mi, &ctx_bad);
+        assert!(cost_bad.is_finite());
+        assert_eq!(cost_bad, UNCALIBRATED_COST_US);
+
+        // Different (q, k) combo at the SAME head_dim — the kernel
+        // handles GQA ratio at runtime, so the same calibrated row
+        // serves every model at h=128. This is what makes FI general
+        // across models (Llama q32/k8, Qwen q28/k4, etc.).
+        bounds.insert("head_dim".into(), 128);
+        bounds.insert("num_attention_heads".into(), 28);
+        bounds.insert("num_key_value_heads".into(), 4);
+        let ctx_other_qk = CostCtx {
+            fuf: &fuf,
+            profile: &profile,
+            bounds: &bounds,
+        };
+        let cost_other_qk = imp.cost_us(&mi, &ctx_other_qk);
+        assert_eq!(cost_other_qk, 6.5);
     }
 }

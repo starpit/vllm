@@ -267,12 +267,6 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
 
     // ── Per-model × per-workload pipeline ─────────────────────────
     let mut per_model_ts: Vec<proc_macro2::TokenStream> = Vec::new();
-    // Collected per-model identifying shape for the arch-level
-    // Weights enum's accessor methods. `bounds` supplies the
-    // per-variant accessor values (`num_hidden_layers()` etc.); the
-    // runtime `load` dispatch uses each variant's compile-emitted
-    // `fingerprint_matches(gw)` instead of a bounds match-tuple, so
-    // no quant-discriminator / extra field per entry is needed.
     let mut arch_dispatch_arms: Vec<(Ident, Vec<u64>)> = Vec::new();
 
     for model in &models {
@@ -281,9 +275,6 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         let mut model_fuf = fuf::unroll(&model_cfg, &inferred).map_err(|e| {
             syn::Error::new(args.span, format!("unroll [{}]: {e}", model.source_stem))
         })?;
-        // Annotate per-weight storage format in-place so matchers
-        // can pattern-match on `FufInput::Weight { storage, .. }`.
-        // No-op for dense models.
         model_fuf.annotate_storage_formats(&classified, model);
 
         let t_solve = std::time::Instant::now();
@@ -299,12 +290,6 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         let d_solve = t_solve.elapsed();
 
         let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
-
-        // Post-scheduler: recompute each bucket's `predicted_us`
-        // with per-wave contention applied via ConcurrencyModel.
-        // On the current all-HostCallback serial-chain library this
-        // doesn't change the number, but the machinery stays ready
-        // for DeviceCallable + megakernel waves.
         cost::refresh_predicted_us(
             &model_fuf,
             &mut sfufs,
@@ -314,12 +299,6 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             &model.bounds,
         );
 
-        // Per-model compile banner.  Shows the concrete model variant,
-        // FUF tile count, scheduler wave count (max across buckets —
-        // parallelism depth), solve wall-clock, and a per-M breakdown
-        // of predicted post-contention cost. The per-M breakdown makes
-        // the decode→prefill curve visible without digging into
-        // Assignment::predicted_us.
         let max_waves = loops
             .per_num_tokens
             .values()
@@ -341,7 +320,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
         let codegen_items =
             codegen::emit_model(&classified, model, &model_fuf, &sfufs, &loops, &library);
-        let model_mod = &model.name;
+        let model_mod = Ident::new(&model.name, Span::call_site());
         per_model_ts.push(quote! {
             pub mod #model_mod {
                 #stub_items
@@ -349,7 +328,10 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             }
         });
 
-        arch_dispatch_arms.push((model.name.clone(), collect_dispatch_bounds(model)));
+        arch_dispatch_arms.push((
+            Ident::new(&model.name, Span::call_site()),
+            collect_dispatch_bounds(model),
+        ));
     }
 
     // Union of HF `architectures: [..]` strings across every compiled

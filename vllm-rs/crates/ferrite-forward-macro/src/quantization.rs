@@ -19,8 +19,6 @@
 
 #![allow(dead_code)]
 
-use syn::Ident;
-
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput};
@@ -254,12 +252,7 @@ pub fn storage_format_for_weight(
         return StorageFormat::Dense;
     };
 
-    let path = program.weights.path(id);
-    let dotted: String = path
-        .iter()
-        .map(Ident::to_string)
-        .collect::<Vec<_>>()
-        .join(".");
+    let dotted: String = program.weights.path(id).join(".");
     for excl in &qc.modules_to_not_convert {
         if dotted.ends_with(excl) {
             return StorageFormat::Dense;

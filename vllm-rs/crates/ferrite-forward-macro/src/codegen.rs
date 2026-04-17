@@ -57,9 +57,7 @@ use crate::solver::{Assignment, SubgraphId, WorkloadAssignments};
 /// `model.` prefix) can override via a future per-arch conventions
 /// mechanism; this covers Llama, Qwen2, Mistral, Gemma2.
 fn safetensors_prefix(program: &Program, id: WeightId, index: Option<u64>) -> String {
-    let path = program.weights.path(id);
-    let dotted: Vec<String> = path.iter().map(|s| s.to_string()).collect();
-    let joined = dotted.join(".");
+    let joined = program.weights.path(id).join(".");
     match (index, joined.as_str()) {
         (_, "lm_head") => "lm_head".to_string(),
         (Some(l), _) => format!("model.layers.{l}.{joined}"),
@@ -406,12 +404,7 @@ fn emit_weights_struct(
                     | (crate::quantization::StorageFormat::Awq { .. }, true),
             );
             if !ok {
-                let path = program.weights.path(*wid);
-                let dotted = path
-                    .iter()
-                    .map(syn::Ident::to_string)
-                    .collect::<Vec<_>>()
-                    .join(".");
+                let dotted = program.weights.path(*wid).join(".");
                 let msg = format!(
                     "model `{stem}`: weight `{dotted}` has storage ({fmt:?}) that \
                      doesn't match accessor `{name}` (type `{ty}`). Add a quant-aware \
@@ -714,45 +707,51 @@ fn compute_drops_after(
 }
 
 /// Emit one per-workload-bucket forward fn.
-fn emit_forward_for_bucket(
-    fuf: &Fuf,
-    sfuf: &Assignment,
-    loop_ir: &Loop,
-    program: &Program,
-    model: &ModelParams,
-    lib: &ImplementationLibrary,
-    num_tokens: u64,
-) -> TokenStream {
-    // Allocate a stable local-binding ident per tile-output slot.
+/// Allocate the stable local-binding ident per tile-output slot
+/// used by every per-bucket emission.
+fn build_local_map(fuf: &Fuf) -> LocalMap {
     let mut locals: LocalMap = HashMap::new();
     for node in &fuf.nodes {
         for slot in 0..node.outputs.len().max(1) as u8 {
             locals.insert((node.id, slot), format_ident!("t_{}_{}", node.id.0, slot));
         }
     }
+    locals
+}
 
-    // Forward returns the last tile's slot-0 output — its owner must
-    // not be dropped before the function returns.
-    let mut protected: HashSet<(TileId, u8)> = HashSet::new();
-    if let Some(last) = fuf.nodes.last() {
-        protected.insert((last.id, 0));
-    }
-    let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, None, &protected);
-
-    // Walk waves in order; each subgraph's bound impl emits its own
-    // kernel invocation. Codegen stays mechanical — no per-op match
-    // lives here. After each subgraph, drop any tile-local owners
-    // whose last cross-subgraph use was here.
+/// Emit the wave walk for one bucket, optionally skipping a single
+/// subgraph (the terminal lm_head) and with a caller-chosen
+/// `protected` set for drop analysis. Shared by:
+/// - the `forward_m_<N>` full-body emission (skip=None, protect
+///   last tile),
+/// - the `__body_m_<N>` helper emission (skip=terminal, protect
+///   backbone tile).
+#[allow(clippy::too_many_arguments)]
+fn emit_wave_walk(
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    loop_ir: &Loop,
+    program: &Program,
+    model: &ModelParams,
+    lib: &ImplementationLibrary,
+    locals: &LocalMap,
+    skip_subgraph: Option<SubgraphId>,
+    protected: &HashSet<(TileId, u8)>,
+) -> Vec<TokenStream> {
+    let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, skip_subgraph, protected);
     let mut body: Vec<TokenStream> = Vec::new();
     for wave in &loop_ir.waves {
         for (sg, imp_id) in &wave.subgraphs {
+            if Some(*sg) == skip_subgraph {
+                continue;
+            }
             let claimed = sfuf.tiles_in_subgraph(*sg);
             let ctx = EmitCtx {
                 fuf,
                 program,
                 model,
                 claimed_tiles: &claimed,
-                locals: &locals,
+                locals,
             };
             body.push(lib.get(*imp_id).emit_call(&ctx));
             if let Some(owners) = drops.get(sg) {
@@ -763,6 +762,41 @@ fn emit_forward_for_bucket(
             }
         }
     }
+    body
+}
+
+/// Emit a backbone-only per-bucket forward that runs every subgraph
+/// EXCEPT the terminal one (assumed to be the `logits = gemm(normed,
+/// lm_head)` call at the end of every causal-LM DSL body). Returns a
+/// fresh-allocated clone of the subgraph output that would have been
+/// the lm_head's input — typically the final rmsnorm's output.
+///
+/// Used by pipeline-parallelism intermediate ranks, which consume
+/// backbone hidden-states from one rank and hand them to the next
+/// without ever running lm_head.
+///
+/// The emitted fn's signature mirrors `forward_m_<N>` exactly except
+/// for the name and semantic return value.
+fn emit_forward_for_bucket(
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    loop_ir: &Loop,
+    program: &Program,
+    model: &ModelParams,
+    lib: &ImplementationLibrary,
+    num_tokens: u64,
+) -> TokenStream {
+    let locals = build_local_map(fuf);
+
+    // Forward returns the last tile's slot-0 output — its owner must
+    // not be dropped before the function returns.
+    let mut protected: HashSet<(TileId, u8)> = HashSet::new();
+    if let Some(last) = fuf.nodes.last() {
+        protected.insert((last.id, 0));
+    }
+    let body = emit_wave_walk(
+        fuf, sfuf, loop_ir, program, model, lib, &locals, None, &protected,
+    );
 
     // The forward's return value: the last tile's output.
     let last_output = fuf
@@ -795,18 +829,6 @@ fn emit_forward_for_bucket(
     }
 }
 
-/// Emit a backbone-only per-bucket forward that runs every subgraph
-/// EXCEPT the terminal one (assumed to be the `logits = gemm(normed,
-/// lm_head)` call at the end of every causal-LM DSL body). Returns a
-/// fresh-allocated clone of the subgraph output that would have been
-/// the lm_head's input — typically the final rmsnorm's output.
-///
-/// Used by pipeline-parallelism intermediate ranks, which consume
-/// backbone hidden-states from one rank and hand them to the next
-/// without ever running lm_head.
-///
-/// The emitted fn's signature mirrors `forward_m_<N>` exactly except
-/// for the name and semantic return value.
 fn emit_forward_backbone_for_bucket(
     fuf: &Fuf,
     sfuf: &Assignment,
@@ -816,17 +838,9 @@ fn emit_forward_backbone_for_bucket(
     lib: &ImplementationLibrary,
     num_tokens: u64,
 ) -> TokenStream {
-    let mut locals: LocalMap = HashMap::new();
-    for node in &fuf.nodes {
-        for slot in 0..node.outputs.len().max(1) as u8 {
-            locals.insert((node.id, slot), format_ident!("t_{}_{}", node.id.0, slot));
-        }
-    }
+    let locals = build_local_map(fuf);
 
-    // The terminal tile — the DSL's last op, expected to be the
-    // lm_head gemm. Skip the subgraph that claims it.
     let Some(last_node) = fuf.nodes.last() else {
-        // Empty FUF: degenerate, emit a stub that panics.
         let fn_name = format_ident!("forward_backbone_m_{}", num_tokens);
         return quote! {
             #[cfg(feature = "cuda")]
@@ -844,9 +858,6 @@ fn emit_forward_backbone_for_bucket(
         .subgraph_of(last_node.id)
         .expect("terminal tile must be in a subgraph");
 
-    // The backbone output is whatever tile feeds the terminal tile's
-    // first input slot — for a DSL that ends in `gemm(normed, lm_head)`
-    // that's the final `normed` (post-final-rmsnorm) tile.
     let backbone_out: (crate::fuf::TileId, u8) = match last_node.inputs.first() {
         Some(FufInput::Tile { id, slot }) => (*id, *slot),
         _ => panic!(
@@ -856,36 +867,19 @@ fn emit_forward_backbone_for_bucket(
     };
     let backbone_ident = locals[&backbone_out].clone();
 
-    // Backbone returns a clone of `backbone_out`; its underlying
-    // owner (resolved via the alias chain in `compute_drops_after`)
-    // must survive until after that clone runs at end of fn.
     let mut protected: HashSet<(TileId, u8)> = HashSet::new();
     protected.insert(backbone_out);
-    let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, Some(terminal_sg), &protected);
-
-    let mut body: Vec<TokenStream> = Vec::new();
-    for wave in &loop_ir.waves {
-        for (sg, imp_id) in &wave.subgraphs {
-            if *sg == terminal_sg {
-                continue;
-            }
-            let claimed = sfuf.tiles_in_subgraph(*sg);
-            let ctx = EmitCtx {
-                fuf,
-                program,
-                model,
-                claimed_tiles: &claimed,
-                locals: &locals,
-            };
-            body.push(lib.get(*imp_id).emit_call(&ctx));
-            if let Some(owners) = drops.get(sg) {
-                for (t, s) in owners {
-                    let ident = &locals[&(*t, *s)];
-                    body.push(quote! { drop(#ident); });
-                }
-            }
-        }
-    }
+    let body = emit_wave_walk(
+        fuf,
+        sfuf,
+        loop_ir,
+        program,
+        model,
+        lib,
+        &locals,
+        Some(terminal_sg),
+        &protected,
+    );
 
     let fn_name = format_ident!("forward_backbone_m_{}", num_tokens);
     quote! {
@@ -905,12 +899,6 @@ fn emit_forward_backbone_for_bucket(
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
             #(#body)*
-            // Clone the backbone tile's output. It may be bound as
-            // either an `OwnedTensor` (singleton impl output) or a
-            // `TensorView` alias on an upstream buffer (fused-impl
-            // output). `(*_).as_view()` works uniformly — both Deref
-            // to `GpuTensor`, and `GpuTensor::as_view` yields a
-            // fresh `TensorView`.
             let __bb_view = unsafe { (*#backbone_ident).as_view() };
             let __bb_shape_u32: &[u32] = __bb_view.shape();
             let __bb_shape: ::std::vec::Vec<usize> =
@@ -942,28 +930,78 @@ pub fn emit_model(
 ) -> TokenStream {
     let weights = emit_weights_struct(program, fuf, sfufs, lib, model);
 
-    let bucket_fns: Vec<TokenStream> = sfufs
-        .per_num_tokens
-        .iter()
-        .map(|(m, sfuf)| {
+    // Group buckets by SFUF signature (sorted subgraph → impl).
+    // Buckets with identical impl picks produce byte-identical fn
+    // bodies, so we emit the full body ONCE at the canonical bucket
+    // and emit the duplicates as thin `#[inline(always)]` shims that
+    // delegate to the canonical fn. Public API (every
+    // `forward_m_<M>` / `forward_backbone_m_<M>` name a user might
+    // take a fn-pointer to) is preserved. Measured: most models
+    // collapse 5 buckets → 2 unique SFUFs, cutting the `quote!`
+    // work and the rustc-visible emitted body volume roughly in
+    // half on those models.
+    let bucket_points: Vec<u64> = sfufs.per_num_tokens.keys().copied().collect();
+    let mut sfuf_to_canonical: HashMap<Vec<(u32, u32)>, u64> = HashMap::new();
+    let mut bucket_canonical: Vec<u64> = Vec::with_capacity(bucket_points.len());
+    for (&m, sfuf) in sfufs.per_num_tokens.iter() {
+        let mut sig: Vec<(u32, u32)> = sfuf.impls.iter().map(|(sg, imp)| (sg.0, imp.0)).collect();
+        sig.sort();
+        let canonical = *sfuf_to_canonical.entry(sig).or_insert(m);
+        bucket_canonical.push(canonical);
+    }
+
+    // Per-bucket fn emission. Canonical buckets get the full
+    // `__body_m_<N>` + `forward_m_<N>` + `forward_backbone_m_<N>`
+    // trio via `emit_canonical_bucket_fns`; duplicate buckets get
+    // thin `#[inline(always)]` shim wrappers that delegate to the
+    // canonical fn, so the `forward_m_<M>` / `forward_backbone_m_<M>`
+    // public API is preserved for every compiled workload point.
+    let mut bucket_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
+    let mut backbone_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
+    for (i, (m, sfuf)) in sfufs.per_num_tokens.iter().enumerate() {
+        let canonical = bucket_canonical[i];
+        if canonical == *m {
             let loop_ir = loops
                 .per_num_tokens
                 .get(m)
                 .expect("schedule populated every key");
-            emit_forward_for_bucket(fuf, sfuf, loop_ir, program, model, lib, *m)
-        })
-        .collect();
-    let backbone_fns: Vec<TokenStream> = sfufs
-        .per_num_tokens
-        .iter()
-        .map(|(m, sfuf)| {
-            let loop_ir = loops
-                .per_num_tokens
-                .get(m)
-                .expect("schedule populated every key");
-            emit_forward_backbone_for_bucket(fuf, sfuf, loop_ir, program, model, lib, *m)
-        })
-        .collect();
+            bucket_fns.push(emit_forward_for_bucket(
+                fuf, sfuf, loop_ir, program, model, lib, *m,
+            ));
+            backbone_fns.push(emit_forward_backbone_for_bucket(
+                fuf, sfuf, loop_ir, program, model, lib, *m,
+            ));
+        } else {
+            let fwd_name = format_ident!("forward_m_{}", m);
+            let fwd_target = format_ident!("forward_m_{}", canonical);
+            bucket_fns.push(quote! {
+                #[cfg(feature = "cuda")]
+                #[allow(clippy::too_many_arguments)]
+                #[inline(always)]
+                pub unsafe fn #fwd_name(
+                    wm: &Weights,
+                    ctx: &::ferrite_forward::ForwardCtx,
+                    device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                    unsafe { #fwd_target(wm, ctx, device) }
+                }
+            });
+            let bb_name = format_ident!("forward_backbone_m_{}", m);
+            let bb_target = format_ident!("forward_backbone_m_{}", canonical);
+            backbone_fns.push(quote! {
+                #[cfg(feature = "cuda")]
+                #[allow(clippy::too_many_arguments)]
+                #[inline(always)]
+                pub unsafe fn #bb_name(
+                    wm: &Weights,
+                    ctx: &::ferrite_forward::ForwardCtx,
+                    device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                    unsafe { #bb_target(wm, ctx, device) }
+                }
+            });
+        }
+    }
 
     // match num_tokens dispatch. Each compiled bucket `m_k` covers
     // the inclusive range `[m_k, m_{k+1} - 1]`; the last bucket
@@ -972,7 +1010,6 @@ pub fn emit_model(
     // the largest compiled bucket ≤ num_tokens — correct
     // (kernels work at any M) if suboptimal for cost. The user
     // compiles more buckets if they want tighter cost fits.
-    let bucket_points: Vec<u64> = sfufs.per_num_tokens.keys().copied().collect();
     let match_arms: Vec<TokenStream> = bucket_points
         .iter()
         .enumerate()

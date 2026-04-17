@@ -22,17 +22,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use proc_macro2::Span;
-use syn::Ident;
-
 use crate::quantization::QuantizationConfig;
 
 /// One model's parameters, loaded from one `config.json`.
 #[derive(Clone, Debug)]
 pub struct ModelParams {
-    /// File stem, normalized to a valid Rust identifier. Used as
-    /// the prefix/suffix of the generated forward fn.
-    pub name: Ident,
+    /// File stem, normalized to a valid Rust identifier. Stored as
+    /// `String` (not `Ident`) so `ModelParams` is `Send + Sync` —
+    /// the macro drive parallelizes per-model work and `Ident`
+    /// wraps rustc's thread-local bridge.
+    pub name: String,
     /// Original file stem (pre-normalization) and the path it was
     /// loaded from. For diagnostics.
     pub source_stem: String,
@@ -273,7 +272,7 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
 /// Normalize a file stem into a valid Rust identifier:
 ///   - replace runs of non-alphanumeric chars with `_`
 ///   - prepend `m_` if the result starts with a digit.
-fn stem_to_ident(stem: &str) -> Result<Ident, &'static str> {
+fn stem_to_ident(stem: &str) -> Result<String, &'static str> {
     if stem.is_empty() {
         return Err("empty stem");
     }
@@ -298,7 +297,7 @@ fn stem_to_ident(stem: &str) -> Result<Ident, &'static str> {
     if final_.is_empty() {
         return Err("stem normalizes to empty identifier");
     }
-    Ok(Ident::new(&final_, Span::call_site()))
+    Ok(final_)
 }
 
 #[cfg(test)]

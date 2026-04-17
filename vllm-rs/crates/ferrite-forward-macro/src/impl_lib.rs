@@ -5578,7 +5578,7 @@ mod tests {
         scalars.insert("query_pre_attn_scalar".to_string(), 256.0);
         scalars.insert("attn_logit_softcapping".to_string(), 50.0);
         let model = crate::config::ModelParams {
-            name: syn::Ident::new("gemma2_test", proc_macro2::Span::call_site()),
+            name: "gemma2_test".to_string(),
             source_stem: "gemma2_test".into(),
             source_path: std::path::PathBuf::new(),
             bounds,

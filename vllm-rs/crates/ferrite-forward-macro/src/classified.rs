@@ -206,11 +206,17 @@ impl LocalTable {
     }
 }
 
-/// Side table: `WeightId` → dotted path segments.
+/// Side table: `WeightId` → dotted path segments (plain strings).
+///
+/// Path segments are stringified at intern time — `proc_macro2::Ident`
+/// wraps rustc's thread-local symbol bridge, so reading an Ident off
+/// the main thread (e.g. via `Ident::to_string`) panics. Storing
+/// `Vec<String>` keeps the classified program Send-safe for the
+/// macro's per-model rayon loop.
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable {
     /// Invariant: paths are unique (interning).
-    entries: Vec<Vec<Ident>>,
+    entries: Vec<Vec<String>>,
 }
 
 impl WeightTable {
@@ -220,9 +226,16 @@ impl WeightTable {
 
     /// Insert a path, returning the assigned `WeightId`. Idempotent:
     /// two calls with paths of equal string segments return the same id.
+    /// Accepts `Vec<Ident>` and stringifies — call this from the main
+    /// thread during classify, while the proc-macro bridge is live.
     pub fn intern(&mut self, path: Vec<Ident>) -> WeightId {
+        let path: Vec<String> = path.iter().map(|i| i.to_string()).collect();
+        self.intern_str(path)
+    }
+
+    pub fn intern_str(&mut self, path: Vec<String>) -> WeightId {
         for (i, existing) in self.entries.iter().enumerate() {
-            if idents_eq(existing, &path) {
+            if existing == &path {
                 return WeightId(i as u32);
             }
         }
@@ -231,7 +244,7 @@ impl WeightTable {
         id
     }
 
-    pub fn path(&self, id: WeightId) -> &[Ident] {
+    pub fn path(&self, id: WeightId) -> &[String] {
         &self.entries[id.0 as usize]
     }
 
@@ -247,17 +260,13 @@ impl WeightTable {
     #[cfg(test)]
     pub fn path_for_test(&self, segments: &[&str]) -> Option<WeightId> {
         self.entries.iter().enumerate().find_map(|(i, p)| {
-            if p.len() == segments.len() && p.iter().zip(segments).all(|(id, s)| id == s) {
+            if p.len() == segments.len() && p.iter().zip(segments).all(|(s, t)| s == t) {
                 Some(WeightId(i as u32))
             } else {
                 None
             }
         })
     }
-}
-
-fn idents_eq(a: &[Ident], b: &[Ident]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(l, r)| l == r)
 }
 
 /// A statement in the classified program.

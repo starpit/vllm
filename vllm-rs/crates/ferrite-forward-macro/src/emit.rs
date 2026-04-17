@@ -175,9 +175,7 @@ impl<'a> EmitCtx<'a> {
 /// `embed_tokens`. Shared with `WeightBundle` trait emission so
 /// the accessor names match what `emit_call` calls.
 pub fn weight_field_name(program: &Program, id: WeightId, index: Option<u64>) -> syn::Ident {
-    let path = program.weights.path(id);
-    let dotted: Vec<String> = path.iter().map(|s| s.to_string()).collect();
-    let stem = dotted.join("_");
+    let stem = program.weights.path(id).join("_");
     let ident = match index {
         Some(i) => format!("{stem}_{i}"),
         None => stem,

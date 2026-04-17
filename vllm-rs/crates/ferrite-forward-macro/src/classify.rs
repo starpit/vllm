@@ -492,7 +492,7 @@ mod tests {
                             Expr::Weight { id, index: None } => {
                                 let path = p.weights.path(*id);
                                 assert_eq!(path.len(), 1);
-                                assert_eq!(path[0].to_string(), "embed_tokens");
+                                assert_eq!(path[0], "embed_tokens");
                             }
                             other => panic!("expected weight, got {other:?}"),
                         }
@@ -559,7 +559,7 @@ mod tests {
             } => match &args[0] {
                 Expr::Weight { id, index: None } => {
                     let path = p.weights.path(*id);
-                    assert_eq!(path[0].to_string(), "mystery_var");
+                    assert_eq!(path[0], "mystery_var");
                 }
                 other => panic!("expected bare-ident weight, got {other:?}"),
             },

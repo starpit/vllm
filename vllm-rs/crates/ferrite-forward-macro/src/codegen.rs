@@ -513,7 +513,7 @@ fn try_emit_tk_forward(
     num_tokens: u64,
 ) -> Option<TokenStream> {
     use crate::cuda_codegen::{TkModelDims, generate_tk_megakernel};
-    use crate::instruction::{build_instruction_schedule, assign_to_sms, INSTRUCTION_WORDS};
+    // KVM instruction generation is now inline — no longer uses instruction.rs primitives.
 
     // Extract model dimensions from ModelParams bounds.
     let get = |key: &str| -> Option<u32> {
@@ -558,45 +558,159 @@ fn try_emit_tk_forward(
         let _ = std::fs::write(&cu_path, &generated.cuda_source);
     }
 
-    // Build instruction schedule from all megakernel subgraphs.
-    let all_sgs: Vec<(crate::solver::SubgraphId, crate::impl_lib::ImplId)> = loop_ir
-        .waves
-        .iter()
-        .filter(|w| w.is_megakernel)
-        .flat_map(|w| w.subgraphs.iter().cloned())
-        .collect();
+    // Build KVM-format instruction schedule.
+    //
+    // The KVM controller expects composite fused opcodes (1-7) matching the
+    // ThunderKittens ops. Each instruction is 32 ints (INSTRUCTION_WIDTH=32).
+    // Instructions are organized as [num_sms][max_instructions_per_sm][32].
+    // The controller loops `rows()` times; opcode 0 = NoOp (skip).
+    //
+    // We generate instructions matching the Python scheduler in
+    // Megakernels/demos/latency/scheduler.py.
+    const KVM_INST_WIDTH: usize = 32;
+    let sm_count = target.num_sms as usize;
+    let block_size = 16usize; // matvec_block_size for all ops
 
-    if all_sgs.is_empty() {
-        return None;
+    // Helper: serialize an instruction into a 32-word array (opcode + fields, zero-padded).
+    fn serialize_kvm_inst(words: &[i32]) -> [i32; 32] {
+        let mut out = [0i32; 32];
+        for (i, &w) in words.iter().enumerate() {
+            out[i] = w;
+        }
+        out
     }
 
-    let schedule = build_instruction_schedule(fuf, sfuf, lib, &all_sgs);
-    let per_sm = assign_to_sms(&schedule.instructions, target.num_sms as usize);
+    // Per-layer instruction generation, then round-robin assignment to SMs.
+    let mut all_instructions: Vec<[i32; 32]> = Vec::new();
 
-    // Serialize instruction tensor: [num_sms][max_instructions_per_sm][INSTRUCTION_WORDS]
+    for layer in 0..num_layers as i32 {
+        // ── Op 1: RMS_QKV_MatVecRopeAppend ──
+        // Distribute qkv_outdim / block_size blocks proportionally across SMs.
+        let qkv_outdim = (num_attention_heads + 2 * num_kv_heads) * head_dim;
+        let num_qkv_blocks = qkv_outdim as usize / block_size;
+        let blocks_per_sm = num_qkv_blocks as f64 / sm_count as f64;
+        for sm_idx in 0..sm_count {
+            let start = (sm_idx as f64 * blocks_per_sm).round() as i32;
+            let end = ((sm_idx + 1) as f64 * blocks_per_sm).round() as i32;
+            all_instructions.push(serialize_kvm_inst(&[1, layer, start, end]));
+        }
+
+        // ── Op 2: PartialAttention ──
+        // For skip_attn_reduction mode: 1 partial per kv_head.
+        let num_partials = 1i32;
+        for kv_head_idx in 0..num_kv_heads as i32 {
+            for partial_idx in 0..num_partials {
+                all_instructions.push(serialize_kvm_inst(&[
+                    2, layer, kv_head_idx, num_partials, partial_idx,
+                ]));
+            }
+        }
+
+        // ── Op 4: O_ProjResidual ──
+        // One instruction per output block (hidden_dim / block_size blocks).
+        let num_o_blocks = hidden_dim as usize / block_size;
+        for o_block_idx in 0..num_o_blocks as i32 {
+            all_instructions.push(serialize_kvm_inst(&[
+                4, layer, o_block_idx, o_block_idx + 1, 0,
+            ]));
+        }
+
+        // ── Op 5: LayerNormDoubleMatVecSiLU (upgate) ──
+        // Distribute intermediate_dim / block_size blocks round-robin across SMs.
+        let num_up_blocks = intermediate_dim as usize / block_size;
+        for sm_idx in 0..sm_count {
+            let mut block_idxs: Vec<i32> = Vec::new();
+            let mut idx = sm_idx;
+            while idx < num_up_blocks {
+                block_idxs.push(idx as i32);
+                idx += sm_count;
+            }
+            if !block_idxs.is_empty() {
+                // Serialization: opcode, layer_idx, len(block_idxs), block_idxs...
+                let mut words = vec![5i32, layer, block_idxs.len() as i32];
+                words.extend_from_slice(&block_idxs);
+                all_instructions.push(serialize_kvm_inst(&words));
+            }
+        }
+
+        // ── Op 6: DownProjResidual ──
+        // num_col_splits = intermediate_dim / hidden_dim; distribute jobs across SMs.
+        let num_down_blocks = hidden_dim as usize / block_size;
+        let num_col_splits = intermediate_dim as usize / hidden_dim as usize;
+        let mut jobs: Vec<(usize, usize)> = Vec::new();
+        for col_idx in 0..num_col_splits {
+            for down_block_idx in 0..num_down_blocks {
+                jobs.push((col_idx, down_block_idx));
+            }
+        }
+        let mut num_assigned = 0usize;
+        for sm_idx in 0..sm_count {
+            let jobs_left = jobs.len() - num_assigned;
+            let sms_left = sm_count - sm_idx;
+            let jobs_per_sm = jobs_left as f64 / sms_left as f64;
+            let jobs_for_this_sm = jobs_per_sm.round() as usize;
+            if jobs_for_this_sm == 0 { continue; }
+            let raw_sliced = &jobs[num_assigned..num_assigned + jobs_for_this_sm];
+            // Only take jobs with same col_idx as first job in slice.
+            let col_idx = raw_sliced[0].0;
+            let sliced: Vec<_> = raw_sliced.iter()
+                .take_while(|j| j.0 == col_idx)
+                .collect();
+            let start_block = sliced[0].1 as i32;
+            let end_block = start_block + sliced.len() as i32;
+            all_instructions.push(serialize_kvm_inst(&[
+                6, layer, start_block, end_block, col_idx as i32,
+            ]));
+            num_assigned += sliced.len();
+        }
+    }
+
+    // ── Op 7: RMS_LM_Head ──
+    let num_logit_blocks = vocab_size as usize / block_size;
+    let blocks_per_sm_lm = num_logit_blocks as f64 / sm_count as f64;
+    for sm_idx in 0..sm_count {
+        let start = (sm_idx as f64 * blocks_per_sm_lm).round() as i32;
+        let end = ((sm_idx + 1) as f64 * blocks_per_sm_lm).round() as i32;
+        all_instructions.push(serialize_kvm_inst(&[7, start, end]));
+    }
+
+    // Round-robin assign to SMs.
+    let mut per_sm: Vec<Vec<[i32; 32]>> = vec![Vec::new(); sm_count];
+    for (i, inst) in all_instructions.iter().enumerate() {
+        per_sm[i % sm_count].push(*inst);
+    }
+
+    // Pad all SM queues to the same length with NoOp (opcode 0).
     let max_per_sm = per_sm.iter().map(|v| v.len()).max().unwrap_or(0);
-    let total_words = target.num_sms as usize * max_per_sm * INSTRUCTION_WORDS;
+    for queue in &mut per_sm {
+        while queue.len() < max_per_sm {
+            queue.push([0i32; 32]);
+        }
+    }
 
-    // Build the instruction data as a compile-time constant.
+    // Serialize instruction tensor: [num_sms][max_per_sm][32]
+    let total_words = sm_count * max_per_sm * KVM_INST_WIDTH;
     let inst_data: Vec<u32> = {
         let mut data = vec![0u32; total_words];
-        for (sm, insts) in per_sm.iter().enumerate() {
-            for (i, inst) in insts.iter().enumerate() {
-                let words = inst.serialize(0); // subgraph ordinal TBD
-                let offset = (sm * max_per_sm + i) * INSTRUCTION_WORDS;
-                data[offset..offset + INSTRUCTION_WORDS].copy_from_slice(&words);
+        for (sm, queue) in per_sm.iter().enumerate() {
+            for (i, inst) in queue.iter().enumerate() {
+                let offset = (sm * max_per_sm + i) * KVM_INST_WIDTH;
+                for (j, &w) in inst.iter().enumerate() {
+                    data[offset + j] = w as u32;
+                }
             }
         }
         data
     };
 
-    let num_barriers = schedule.num_barriers;
+    let num_barriers = num_layers as usize * 10 * (num_attention_heads + 2 * num_kv_heads) as usize;
     let inst_data_tokens: Vec<proc_macro2::TokenStream> = inst_data
         .iter()
         .map(|w| quote! { #w })
         .collect();
     let total_words_lit = total_words;
     let num_barriers_lit = num_barriers;
+    let max_per_sm_lit = max_per_sm;
 
     // ── Classify weight accessors by TK role ──
     //
@@ -866,6 +980,8 @@ fn try_emit_tk_forward(
 
             // ── One-time weight stacking (persistent GPU allocs) ──
             __TK_INIT.call_once(|| {
+                ::tracing::info!("TK megakernel: initializing weight stacking for {} layers, hidden={}, sms={}",
+                    __num_layers, __hidden, __num_sms);
                 // QKV: [num_layers, qkv_out, hidden] bf16
                 let __qkv_per_layer = __qkv_out * __hidden * 2;
                 let __qkv_total = __num_layers * __qkv_per_layer;
@@ -931,6 +1047,7 @@ fn try_emit_tk_forward(
             let __lm_head_ptr = wm.#lm_head_ident.dense_weight().raw_ptr() as u64;
 
             // ── Upload instruction tensor to device ──
+            let __max_inst_per_sm: usize = #max_per_sm_lit;
             static INST_DATA: &[u32] = &[#(#inst_data_tokens),*];
             let __inst_bytes = #total_words_lit * 4;
             let __inst_buf = device.caching.alloc(__inst_bytes);
@@ -946,8 +1063,12 @@ fn try_emit_tk_forward(
                 __bar_buf, 0, __bar_bytes, __stream,
             ).expect("barrier memset failed");
 
-            // ── Timing buffer (unused but required by KVM) ──
-            let __timing_buf = device.caching.alloc(128 * 4);
+            // ── Timing buffer (required by KVM: [num_sms][max_inst_per_sm][128]) ──
+            let __timing_bytes = __num_sms * __max_inst_per_sm * 128 * 4;
+            let __timing_buf = device.caching.alloc(__timing_bytes);
+            ::ferrite_cuda_core::driver::memset_d8(
+                __timing_buf, 0, __timing_bytes, __stream,
+            ).expect("timing memset failed");
 
             // ── Embedding gather: input_ids → hidden_states ──
             let __hidden_states = ::ferrite_kernels::kernels::embedding_gather(
@@ -1035,6 +1156,8 @@ fn try_emit_tk_forward(
                 __num_layers as i32,                           // bar_depth
                 (__num_heads + 2 * __num_kv_heads) as i32,     // bar_rows
                 __inst_buf as u64,                             // instructions_ptr
+                __num_sms as i32,                              // instructions_depth
+                __max_inst_per_sm as i32,                      // instructions_rows
                 __timing_buf as u64,                           // timings_ptr
                 // Weights (stacked across layers)
                 __qkv_ptr,                                     // qkv_weights_ptr
@@ -1090,7 +1213,7 @@ fn try_emit_tk_forward(
                 __pos_id,                                      // pos_id
                 __attn_scale,                                  // attn_scale
                 __rms_norm_eps,                                // rms_norm_eps
-                0i32,                                          // skip_attn_reduction
+                1i32,                                          // skip_attn_reduction (=true, 1 partition)
                 // Stream
                 __stream_u64,
             );

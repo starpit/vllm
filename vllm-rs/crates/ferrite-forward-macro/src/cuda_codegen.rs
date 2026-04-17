@@ -453,7 +453,11 @@ pub fn generate_tk_megakernel(
     writeln!(src, "    g.Bar.depth_internal = bar_depth;").unwrap();
     writeln!(src, "    g.Bar.rows_internal = bar_rows;").unwrap();
     writeln!(src, "    g.instructions.raw_ptr = (int*)instructions_ptr;").unwrap();
+    writeln!(src, "    g.instructions.depth_internal = instructions_depth;").unwrap();
+    writeln!(src, "    g.instructions.rows_internal = instructions_rows;").unwrap();
     writeln!(src, "    g.timings.raw_ptr = (int*)timings_ptr;").unwrap();
+    writeln!(src, "    g.timings.depth_internal = instructions_depth;").unwrap();
+    writeln!(src, "    g.timings.rows_internal = instructions_rows;").unwrap();
     writeln!(src).unwrap();
     writeln!(src, "    // Weights").unwrap();
     writeln!(src, "    g.qkv_weights.raw_ptr = (__nv_bfloat16*)qkv_weights_ptr;").unwrap();
@@ -556,6 +560,8 @@ fn build_tk_flat_params() -> Vec<(String, String)> {
     p.push(dim("bar_depth"));
     p.push(dim("bar_rows"));
     p.push(ptr("instructions_ptr"));
+    p.push(dim("instructions_depth"));
+    p.push(dim("instructions_rows"));
     p.push(ptr("timings_ptr"));
 
     // Weight tensors (ptr + dynamic dims for each -1 template arg)

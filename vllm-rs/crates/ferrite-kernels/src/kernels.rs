@@ -960,7 +960,6 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Fused QK-norm + RoPE (per-head RMS norm on Q/K then RoPE rotation)
     fn qk_norm_rope_f32(
         query: *mut f32,
         key: *mut f32,
@@ -970,6 +969,8 @@ unsafe extern "C" {
         sin_cache: *const f32,
         positions: *const u32,
         epsilon: f32,
+        q_weight_offset: f32,
+        k_weight_offset: f32,
         num_q_heads: c_int,
         num_kv_heads: c_int,
         head_dim: c_int,
@@ -985,6 +986,8 @@ unsafe extern "C" {
         sin_cache: *const u16,
         positions: *const u32,
         epsilon: f32,
+        q_weight_offset: f32,
+        k_weight_offset: f32,
         num_q_heads: c_int,
         num_kv_heads: c_int,
         head_dim: c_int,
@@ -1000,6 +1003,8 @@ unsafe extern "C" {
         sin_cache: *const u16,
         positions: *const u32,
         epsilon: f32,
+        q_weight_offset: f32,
+        k_weight_offset: f32,
         num_q_heads: c_int,
         num_kv_heads: c_int,
         head_dim: c_int,
@@ -5884,18 +5889,14 @@ pub unsafe fn qk_norm_rope_inplace(
     num_kv_heads: usize,
     head_dim: usize,
     epsilon: f32,
+    q_weight_offset: f32,
+    k_weight_offset: f32,
     stream: CUstream,
 ) {
     let num_tokens = positions.dim(0);
     let half_dim = head_dim / 2;
     let elem_size = query.dtype().size_bytes();
 
-    // cos_sin_cache layout: [max_pos, head_dim] where each row is [cos_0..cos_{half}, sin_0..sin_{half}].
-    // The kernel expects separate cos and sin pointers. Since cos is at offset 0 and sin at offset
-    // half_dim within each row, and the kernel accesses cos_cache[pos * head_dim + i] for i < half_dim
-    // and sin_cache[pos * head_dim + i] for i < half_dim, we can pass:
-    //   cos_cache = base pointer (stride head_dim per position)
-    //   sin_cache = base pointer + half_dim * elem_size (same stride)
     let cos_ptr = cos_sin_cache.raw_ptr();
     let sin_ptr = cos_ptr.add(half_dim * elem_size);
 
@@ -5909,6 +5910,8 @@ pub unsafe fn qk_norm_rope_inplace(
             sin_ptr as *const u16,
             positions.as_ptr() as *const u32,
             epsilon,
+            q_weight_offset,
+            k_weight_offset,
             num_q_heads as c_int,
             num_kv_heads as c_int,
             head_dim as c_int,
@@ -5924,6 +5927,8 @@ pub unsafe fn qk_norm_rope_inplace(
             sin_ptr as *const u16,
             positions.as_ptr() as *const u32,
             epsilon,
+            q_weight_offset,
+            k_weight_offset,
             num_q_heads as c_int,
             num_kv_heads as c_int,
             head_dim as c_int,
@@ -5939,6 +5944,8 @@ pub unsafe fn qk_norm_rope_inplace(
             sin_ptr as *const f32,
             positions.as_ptr() as *const u32,
             epsilon,
+            q_weight_offset,
+            k_weight_offset,
             num_q_heads as c_int,
             num_kv_heads as c_int,
             head_dim as c_int,
@@ -8141,6 +8148,8 @@ unsafe extern "C" {
         q_weight: *const f32,
         k_weight: *const f32,
         epsilon: f32,
+        q_weight_offset: f32,
+        k_weight_offset: f32,
         num_q_heads: c_int,
         num_kv_heads: c_int,
         head_dim: c_int,
@@ -8153,6 +8162,8 @@ unsafe extern "C" {
         q_weight: *const u16,
         k_weight: *const u16,
         epsilon: f32,
+        q_weight_offset: f32,
+        k_weight_offset: f32,
         num_q_heads: c_int,
         num_kv_heads: c_int,
         head_dim: c_int,
@@ -8165,6 +8176,8 @@ unsafe extern "C" {
         q_weight: *const u16,
         k_weight: *const u16,
         epsilon: f32,
+        q_weight_offset: f32,
+        k_weight_offset: f32,
         num_q_heads: c_int,
         num_kv_heads: c_int,
         head_dim: c_int,
@@ -8177,7 +8190,9 @@ unsafe extern "C" {
 ///
 /// Q: `[num_tokens, num_q_heads, head_dim]`
 /// K: `[num_tokens, num_kv_heads, head_dim]`
-/// Weights use GemmaRMSNorm convention (weight applied as-is; caller should add +1 if needed).
+/// Weights use GemmaRMSNorm convention: `weight_offset` is added to
+/// each weight element (`0.0` for plain weights, `1.0` for Gemma's
+/// `(1+w)` convention).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn qk_norm_inplace(
     query: GpuTensor,
@@ -8188,6 +8203,8 @@ pub unsafe fn qk_norm_inplace(
     num_kv_heads: usize,
     head_dim: usize,
     epsilon: f32,
+    q_weight_offset: f32,
+    k_weight_offset: f32,
     stream: CUstream,
 ) {
     let num_tokens = query.dim(0) as c_int;
@@ -8198,6 +8215,8 @@ pub unsafe fn qk_norm_inplace(
             q_weight.as_ptr(),
             k_weight.as_ptr(),
             epsilon,
+            q_weight_offset,
+            k_weight_offset,
             num_q_heads as c_int,
             num_kv_heads as c_int,
             head_dim as c_int,
@@ -8210,6 +8229,8 @@ pub unsafe fn qk_norm_inplace(
             q_weight.as_ptr() as *const u16,
             k_weight.as_ptr() as *const u16,
             epsilon,
+            q_weight_offset,
+            k_weight_offset,
             num_q_heads as c_int,
             num_kv_heads as c_int,
             head_dim as c_int,
@@ -8222,6 +8243,8 @@ pub unsafe fn qk_norm_inplace(
             q_weight.as_ptr() as *const u16,
             k_weight.as_ptr() as *const u16,
             epsilon,
+            q_weight_offset,
+            k_weight_offset,
             num_q_heads as c_int,
             num_kv_heads as c_int,
             head_dim as c_int,

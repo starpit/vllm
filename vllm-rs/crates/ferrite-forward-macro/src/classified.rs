@@ -36,6 +36,10 @@ pub enum ExternKind {
     InputIds,
     Positions,
     Rotary,
+    /// Alternate rotary cache for architectures with dual RoPE bases
+    /// (e.g. Gemma3's `rope_local_base_freq` for sliding-attention
+    /// layers). Lives on the Weights struct, not ForwardCtx.
+    RotaryLocal,
     BlockTable,
     KvCache,
 }
@@ -47,6 +51,7 @@ impl ExternKind {
             "input_ids" => Some(Self::InputIds),
             "positions" => Some(Self::Positions),
             "rotary" => Some(Self::Rotary),
+            "rotary_local" => Some(Self::RotaryLocal),
             "block_table" => Some(Self::BlockTable),
             "kv_cache" => Some(Self::KvCache),
             _ => None,
@@ -336,6 +341,12 @@ pub enum Bound {
 pub enum BoolPred {
     /// `ivar % divisor == remainder`.
     Modulo {
+        ivar: LocalId,
+        divisor: Bound,
+        remainder: Bound,
+    },
+    /// `ivar % divisor != remainder`.
+    NotModulo {
         ivar: LocalId,
         divisor: Bound,
         remainder: Bound,

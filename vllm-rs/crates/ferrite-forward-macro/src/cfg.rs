@@ -98,6 +98,12 @@ pub enum BoolPredResolved {
         divisor: u64,
         remainder: u64,
     },
+    /// `ivar % divisor != remainder`.
+    NotModulo {
+        ivar: LocalId,
+        divisor: u64,
+        remainder: u64,
+    },
     /// `ivar < bound`.
     Less { ivar: LocalId, bound: u64 },
 }
@@ -376,6 +382,15 @@ impl<'a> CfgBuilder<'a> {
                 divisor,
                 remainder,
             } => Ok(BoolPredResolved::Modulo {
+                ivar: *ivar,
+                divisor: self.resolve_bound(divisor)?,
+                remainder: self.resolve_bound(remainder)?,
+            }),
+            BoolPred::NotModulo {
+                ivar,
+                divisor,
+                remainder,
+            } => Ok(BoolPredResolved::NotModulo {
                 ivar: *ivar,
                 divisor: self.resolve_bound(divisor)?,
                 remainder: self.resolve_bound(remainder)?,

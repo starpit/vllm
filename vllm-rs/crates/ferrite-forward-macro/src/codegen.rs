@@ -731,6 +731,68 @@ fn emit_weights_struct(
     let field_shorthand: Vec<&syn::Ident> = accessors.iter().map(|a| &a.name).collect();
     let fingerprint_method = emit_fingerprint_check(model);
 
+    // Detect whether this arch uses `rotary_local` (dual-rotary,
+    // e.g. Gemma3). If so, emit a `rotary_local: RotaryCache` field
+    // on Weights + its construction in `load`. The global rotary
+    // stays on ForwardCtx; only the local one lives here.
+    let uses_rotary_local = fuf.nodes.iter().any(|n| {
+        n.inputs.iter().any(|i| {
+            matches!(
+                i,
+                crate::fuf::FufInput::Extern {
+                    kind: crate::classified::ExternKind::RotaryLocal,
+                    ..
+                }
+            )
+        })
+    });
+
+    let rotary_local_field: TokenStream = if uses_rotary_local {
+        quote! { pub rotary_local: ::ferrite_kernels::rotary::RotaryCache, }
+    } else {
+        quote! {}
+    };
+
+    let rotary_local_load: TokenStream = if uses_rotary_local {
+        let head_dim = *model
+            .bounds
+            .get("head_dim")
+            .expect("model must have head_dim for RotaryLocal") as usize;
+        let max_pos = *model
+            .bounds
+            .get("max_position_embeddings")
+            .expect("model must have max_position_embeddings for RotaryLocal")
+            as usize;
+        let local_theta = model
+            .scalars
+            .get("rope_local_base_freq")
+            .copied()
+            .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
+            .or_else(|| model.scalars.get("rope_theta").copied())
+            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+            .expect("model must have rope_local_base_freq for RotaryLocal");
+        quote! {
+            let rotary_local = unsafe {
+                ::ferrite_kernels::rotary::RotaryCache::new_from_stream(
+                    #head_dim,
+                    #max_pos,
+                    #local_theta,
+                    None,
+                    ::ferrite_cuda_core::dtype::DType::BF16,
+                    stream,
+                )
+            }?;
+        }
+    } else {
+        quote! {}
+    };
+
+    let rotary_local_init: TokenStream = if uses_rotary_local {
+        quote! { rotary_local, }
+    } else {
+        quote! {}
+    };
+
     quote! {
         /// Every weight the emitted forward needs, already packed
         /// exactly how the solver-picked Impls want to see it.
@@ -740,6 +802,7 @@ fn emit_weights_struct(
         #[cfg(feature = "cuda")]
         pub struct Weights {
             #(#fields)*
+            #rotary_local_field
         }
 
         #[cfg(feature = "cuda")]
@@ -757,8 +820,10 @@ fn emit_weights_struct(
             ) -> ::anyhow::Result<Self> {
                 #marlin_prelude
                 #(#lets)*
+                #rotary_local_load
                 Ok(Self {
-                    #(#field_shorthand),*
+                    #(#field_shorthand,)*
+                    #rotary_local_init
                 })
             }
         }

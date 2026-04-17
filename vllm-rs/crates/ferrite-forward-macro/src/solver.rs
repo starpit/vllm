@@ -293,10 +293,10 @@ fn solve_one(
     // its seed position. Bit 0 = seed; bit j = seed + j. Candidates
     // whose claim exceeds K bits or reaches backward in topo order
     // are dropped (with the matches_at[i] entry removed) — they'd
-    // be invariant violations for this DP. Today's library has max
-    // forward spread ~4 so K=8 is plenty of headroom.
-    const K: usize = 8;
-    type ClaimMask = u8;
+    // be invariant violations for this DP. FusedQkvQkNormRopeCacheImpl
+    // spans up to 12 tiles per layer (Gemma3 QK-norm chain), so K=16.
+    const K: usize = 16;
+    type ClaimMask = u16;
 
     let candidates: Vec<Vec<Candidate>> = matches_at
         .iter()
@@ -469,7 +469,7 @@ struct Candidate {
     imp_id: ImplId,
     /// Bit `j` set ⇒ position `seed + j` is claimed. Bit 0 (seed)
     /// is always set by construction.
-    mask: u8,
+    mask: u16,
     cost: f64,
 }
 
@@ -478,7 +478,7 @@ struct Candidate {
 #[derive(Debug, Clone, Copy)]
 struct DpEntry {
     cost: f64,
-    choice: Option<(ImplId, u8)>,
+    choice: Option<(ImplId, u16)>,
 }
 
 /// Resolve each tile input's shape for the cost function.

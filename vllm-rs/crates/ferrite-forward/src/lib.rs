@@ -80,7 +80,13 @@ mod dispatcher {
             num_tokens: u64,
         ) -> OwnedTensor;
 
-        /// Backbone-only forward (skips lm_head). Same safety.
+        /// Backbone-only forward (skips lm_head).
+        ///
+        /// # Safety
+        /// Same as [`Self::forward`] — caller guarantees `ctx`
+        /// tensors and `device` outlive the returned `OwnedTensor`
+        /// and that kernel launches on `device.compute_stream` have
+        /// completed before the output is read on another stream.
         unsafe fn forward_backbone(
             &self,
             ctx: &ForwardCtx,
@@ -126,7 +132,7 @@ mod dispatcher {
         arch_hint: &str,
     ) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>> {
         for reg in inventory::iter::<FerriteArchRegistration>() {
-            if reg.hf_arches.iter().any(|a| *a == arch_hint) {
+            if reg.hf_arches.contains(&arch_hint) {
                 return (reg.try_load)(gw, stream);
             }
         }

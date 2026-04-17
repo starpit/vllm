@@ -213,21 +213,21 @@ fn extract_bounds(json: &serde_json::Value) -> BTreeMap<String, u64> {
         .unwrap_or_default()
 }
 
-/// Every top-level *non-integer* number field becomes a scalar.
-/// (Integer fields go to `bounds` via [`extract_bounds`]; `as_u64`
-/// is checked first so an integer like `42` doesn't double-count
-/// into `scalars` as `42.0`.)
+/// Every top-level number field (int OR float) becomes a scalar.
+/// Integer fields also go to `bounds` via [`extract_bounds`] — they
+/// double-count into both tables because some HF configs write
+/// scale-type fields as integer literals (e.g. Gemma3's
+/// `query_pre_attn_scalar: 256`, `rope_theta: 1000000`), while
+/// other configs write them as floats (Gemma2 uses `256.0`,
+/// `10000.0`). Readers of physics-scale values (softmax scales,
+/// rope thetas, norm epsilons) look in `scalars`; readers of
+/// shape-determining values look in `bounds`. Both views must
+/// agree on integer-valued scale fields.
 fn extract_scalars(json: &serde_json::Value) -> BTreeMap<String, f64> {
     json.as_object()
         .map(|obj| {
             obj.iter()
-                .filter_map(|(k, v)| {
-                    if v.as_u64().is_some() {
-                        None
-                    } else {
-                        v.as_f64().map(|n| (k.clone(), n))
-                    }
-                })
+                .filter_map(|(k, v)| v.as_f64().map(|n| (k.clone(), n)))
                 .collect()
         })
         .unwrap_or_default()
@@ -266,6 +266,12 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
         && let Some(&heads) = bounds.get("num_attention_heads")
     {
         bounds.insert("num_key_value_heads".to_string(), heads);
+    }
+    if !bounds.contains_key("sliding_window_global_remainder")
+        && let Some(&p) = bounds.get("sliding_window_pattern")
+        && p > 0
+    {
+        bounds.insert("sliding_window_global_remainder".to_string(), p - 1);
     }
 }
 
@@ -428,13 +434,15 @@ mod tests {
         .unwrap();
         let cfg = load_file(&tmp.join("m.json")).unwrap();
 
-        // Integers go to bounds, not scalars.
+        // Integers go to bounds AND to scalars (as f64). Floats go to
+        // scalars only. This double-entry for integers is required so
+        // readers of scale-type fields find values regardless of how
+        // the upstream HF config formatted them.
         assert_eq!(cfg.bounds.get("num_hidden_layers"), Some(&16));
         assert_eq!(cfg.bounds.get("hidden_size"), Some(&2048));
-        assert!(!cfg.scalars.contains_key("num_hidden_layers"));
-        assert!(!cfg.scalars.contains_key("hidden_size"));
+        assert_eq!(cfg.scalars.get("num_hidden_layers"), Some(&16.0));
+        assert_eq!(cfg.scalars.get("hidden_size"), Some(&2048.0));
 
-        // Non-integer numbers go to scalars.
         assert_eq!(cfg.scalars.get("rms_norm_eps"), Some(&0.000001));
         assert_eq!(cfg.scalars.get("query_pre_attn_scalar"), Some(&256.0));
         assert_eq!(cfg.scalars.get("attn_logit_softcapping"), Some(&50.0));

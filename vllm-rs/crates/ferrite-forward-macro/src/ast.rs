@@ -50,6 +50,12 @@ pub enum BoolExpr {
         divisor: BoundExpr,
         remainder: BoundExpr,
     },
+    /// `ivar % divisor != remainder`.
+    NotModulo {
+        ivar: Ident,
+        divisor: BoundExpr,
+        remainder: BoundExpr,
+    },
     /// `ivar < bound`.
     Less { ivar: Ident, bound: BoundExpr },
 }

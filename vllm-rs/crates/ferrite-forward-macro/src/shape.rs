@@ -651,6 +651,7 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
         // consumes them via their ExternKind tag rather than via
         // shape.
         ExternKind::Rotary => vec![],
+        ExternKind::RotaryLocal => vec![],
         ExternKind::BlockTable => vec![],
         ExternKind::KvCache => vec![],
     }
@@ -709,7 +710,18 @@ pub fn infer(
     // a reshape-recoverable factor relationship and, if so, records
     // a hint.
     let mut reshape_hints: Vec<ReshapeHint> = Vec::new();
-    for (wid, shape) in cx.weights.clone().iter() {
+    // Sort by WeightId so projections (encountered earlier in the DSL)
+    // are anchored before norms. Without this, HashMap iteration order
+    // can anchor a per-head norm weight (q_norm: [head_dim]) before
+    // its associated projection (q_proj: [hidden, heads*head_dim]),
+    // setting the norm dim to head_dim via unification — then the
+    // projection anchoring hits a Mismatch(head_dim, heads*head_dim)
+    // that detect_reshape_hint can't recover (wrong direction).
+    let mut weight_ids: Vec<_> = cx.weights.keys().copied().collect();
+    weight_ids.sort_by_key(|w| w.0);
+    for wid in &weight_ids {
+        let shape = cx.weights.get(wid).cloned().unwrap();
+        let shape = &shape;
         let path: Vec<String> = program
             .weights
             .path(*wid)
@@ -946,6 +958,68 @@ fn find_consumer_activation(
     locals: &HashMap<LocalId, Shape>,
     wid: WeightId,
 ) -> Option<(LocalId, Shape, Option<LocalId>)> {
+    fn expr_has_weight(e: &Expr, wid: WeightId) -> bool {
+        match e {
+            Expr::Weight { id, .. } => *id == wid,
+            Expr::Add { lhs, rhs, .. } | Expr::Mul { lhs, rhs, .. } => {
+                expr_has_weight(lhs, wid) || expr_has_weight(rhs, wid)
+            }
+            Expr::Call { args, .. } => args.iter().any(|a| expr_has_weight(a, wid)),
+            _ => false,
+        }
+    }
+
+    /// If the weight is inside an `Add(Weight, Scalar)` or similar
+    /// intermediary (Gemma's `w + 1.0`), find the producing stmt's
+    /// target local and then look for the Call that consumes it.
+    fn find_through_intermediary(
+        stmts: &[Stmt],
+        locals: &HashMap<LocalId, Shape>,
+        intermediary_local: LocalId,
+    ) -> Option<(LocalId, Shape, Option<LocalId>)> {
+        for s in stmts {
+            match s {
+                Stmt::Assign { value, target } => {
+                    if let Expr::Call { args, .. } = value
+                        && args
+                            .iter()
+                            .any(|a| matches!(a, Expr::Local(id) if *id == intermediary_local))
+                    {
+                        let activation = args.iter().find_map(|a| match a {
+                            Expr::Local(id) if *id != intermediary_local => Some(*id),
+                            _ => None,
+                        })?;
+                        let shape = locals.get(&activation)?.clone();
+                        return Some((activation, shape, Some(*target)));
+                    }
+                }
+                Stmt::For { body, .. } => {
+                    if let Some(hit) = find_through_intermediary(body, locals, intermediary_local) {
+                        return Some(hit);
+                    }
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    if let Some(hit) =
+                        find_through_intermediary(then_body, locals, intermediary_local)
+                    {
+                        return Some(hit);
+                    }
+                    if let Some(hit) =
+                        find_through_intermediary(else_body, locals, intermediary_local)
+                    {
+                        return Some(hit);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn walk(
         stmts: &[Stmt],
         locals: &HashMap<LocalId, Shape>,
@@ -954,33 +1028,40 @@ fn find_consumer_activation(
         for s in stmts {
             match s {
                 Stmt::Assign { value, target } => {
-                    if let Expr::Call { args, .. } = value {
-                        let has_weight = args
+                    if let Expr::Call { args, .. } = value
+                        && args.iter().any(|a| expr_has_weight(a, wid))
+                    {
+                        if let Some((activation, shape)) = args
                             .iter()
-                            .any(|a| matches!(a, Expr::Weight { id, .. } if *id == wid));
-                        if has_weight {
-                            let activation = args.iter().find_map(|a| match a {
+                            .find_map(|a| match a {
                                 Expr::Local(id) => Some(*id),
                                 _ => None,
-                            })?;
-                            let shape = locals.get(&activation)?.clone();
+                            })
+                            .and_then(|a| locals.get(&a).map(|s| (a, s.clone())))
+                        {
                             return Some((activation, shape, Some(*target)));
                         }
+                        if let Some(hit) = find_through_intermediary(stmts, locals, *target) {
+                            return Some(hit);
+                        }
+                    }
+                    if expr_has_weight(value, wid)
+                        && !matches!(value, Expr::Call { .. })
+                        && let Some(hit) = find_through_intermediary(stmts, locals, *target)
+                    {
+                        return Some(hit);
                     }
                 }
                 Stmt::AssignTuple { value, .. } => {
-                    if let Expr::Call { args, .. } = value {
-                        let has_weight = args
-                            .iter()
-                            .any(|a| matches!(a, Expr::Weight { id, .. } if *id == wid));
-                        if has_weight {
-                            let activation = args.iter().find_map(|a| match a {
-                                Expr::Local(id) => Some(*id),
-                                _ => None,
-                            })?;
-                            let shape = locals.get(&activation)?.clone();
-                            return Some((activation, shape, None));
-                        }
+                    if let Expr::Call { args, .. } = value
+                        && args.iter().any(|a| expr_has_weight(a, wid))
+                    {
+                        let activation = args.iter().find_map(|a| match a {
+                            Expr::Local(id) => Some(*id),
+                            _ => None,
+                        })?;
+                        let shape = locals.get(&activation)?.clone();
+                        return Some((activation, shape, None));
                     }
                 }
                 Stmt::For { body, .. } => {

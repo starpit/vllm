@@ -321,6 +321,19 @@ impl<'a> Unroller<'a> {
                 }
                 Ok(v % *divisor == *remainder)
             }
+            BoolPredResolved::NotModulo {
+                ivar,
+                divisor,
+                remainder,
+            } => {
+                let v = self.loop_var_value(*ivar)?;
+                if *divisor == 0 {
+                    return Err(UnrollError::UnsupportedCfgShape(
+                        "`if ivar % 0 != ...` is undefined".into(),
+                    ));
+                }
+                Ok(v % *divisor != *remainder)
+            }
             BoolPredResolved::Less { ivar, bound } => {
                 let v = self.loop_var_value(*ivar)?;
                 Ok(v < *bound)

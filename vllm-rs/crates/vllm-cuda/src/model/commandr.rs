@@ -155,6 +155,8 @@ impl CommandRAttention {
                     attn.num_kv_heads,
                     attn.head_dim,
                     attn.qk_norm_eps,
+                    0.0,
+                    0.0,
                     device.compute_stream,
                 );
                 kernels::rotary_embedding_q_only(

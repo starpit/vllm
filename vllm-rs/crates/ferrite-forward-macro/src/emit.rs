@@ -146,6 +146,7 @@ impl<'a> EmitCtx<'a> {
                 ExternKind::InputIds => quote! { ctx.input_ids },
                 ExternKind::Positions => quote! { ctx.positions },
                 ExternKind::Rotary => quote! { ctx.rotary },
+                ExternKind::RotaryLocal => quote! { wm.rotary_local },
                 ExternKind::BlockTable => quote! { ctx.block_table },
                 ExternKind::KvCache => quote! { ctx.kv_cache },
             },

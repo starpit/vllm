@@ -944,6 +944,8 @@ impl Qwen3NextFullAttention {
                 num_kv_heads,
                 head_dim,
                 self.inner.qk_norm_eps,
+                0.0,
+                0.0,
                 stream,
             );
         }

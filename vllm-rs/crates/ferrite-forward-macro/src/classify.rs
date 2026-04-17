@@ -224,6 +224,26 @@ impl Ctx {
                     remainder: self.classify_bound(remainder),
                 })
             }
+            ast::BoolExpr::NotModulo {
+                ivar,
+                divisor,
+                remainder,
+            } => {
+                let ivar_id = self.lookup_local(ivar).ok_or_else(|| {
+                    syn::Error::new(
+                        ivar.span(),
+                        format!(
+                            "`if` condition must reference an enclosing loop variable; \
+                             `{ivar}` is not in scope",
+                        ),
+                    )
+                })?;
+                Ok(BoolPred::NotModulo {
+                    ivar: ivar_id,
+                    divisor: self.classify_bound(divisor),
+                    remainder: self.classify_bound(remainder),
+                })
+            }
             ast::BoolExpr::Less { ivar, bound } => {
                 let ivar_id = self.lookup_local(ivar).ok_or_else(|| {
                     syn::Error::new(

@@ -65,6 +65,28 @@ impl RotaryCache {
         dtype: DType,
         device: &GpuDevice,
     ) -> Result<Self> {
+        Self::new_from_stream(
+            head_dim,
+            max_pos,
+            rope_theta,
+            llama3_scaling,
+            dtype,
+            device.compute_stream,
+        )
+    }
+
+    /// Build the cos/sin cache on GPU using an explicit CUDA stream.
+    ///
+    /// # Safety
+    /// Requires valid CUDA context and stream.
+    pub unsafe fn new_from_stream(
+        head_dim: usize,
+        max_pos: usize,
+        rope_theta: f64,
+        llama3_scaling: Option<&Llama3RopeScaling>,
+        dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
         let rotary_dim = head_dim; // full rotary for LLaMA
         let half = rotary_dim / 2;
 
@@ -111,13 +133,8 @@ impl RotaryCache {
             DType::F32 => {
                 let host = ferrite_cuda_core::driver::mem_alloc_host(nbytes)?;
                 std::ptr::copy_nonoverlapping(cache.as_ptr() as *const u8, host, nbytes);
-                ferrite_cuda_core::driver::memcpy_htod_async(
-                    gpu_ptr,
-                    host,
-                    nbytes,
-                    device.compute_stream,
-                )?;
-                ferrite_cuda_core::driver::stream_synchronize(device.compute_stream)?;
+                ferrite_cuda_core::driver::memcpy_htod_async(gpu_ptr, host, nbytes, stream)?;
+                ferrite_cuda_core::driver::stream_synchronize(stream)?;
                 ferrite_cuda_core::driver::mem_free_host(host)?;
             }
             DType::F16 => {
@@ -125,13 +142,8 @@ impl RotaryCache {
                     cache.iter().map(|&v| half::f16::from_f32(v)).collect();
                 let host = ferrite_cuda_core::driver::mem_alloc_host(nbytes)?;
                 std::ptr::copy_nonoverlapping(f16_data.as_ptr() as *const u8, host, nbytes);
-                ferrite_cuda_core::driver::memcpy_htod_async(
-                    gpu_ptr,
-                    host,
-                    nbytes,
-                    device.compute_stream,
-                )?;
-                ferrite_cuda_core::driver::stream_synchronize(device.compute_stream)?;
+                ferrite_cuda_core::driver::memcpy_htod_async(gpu_ptr, host, nbytes, stream)?;
+                ferrite_cuda_core::driver::stream_synchronize(stream)?;
                 ferrite_cuda_core::driver::mem_free_host(host)?;
             }
             DType::BF16 => {
@@ -139,13 +151,8 @@ impl RotaryCache {
                     cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
                 let host = ferrite_cuda_core::driver::mem_alloc_host(nbytes)?;
                 std::ptr::copy_nonoverlapping(bf16_data.as_ptr() as *const u8, host, nbytes);
-                ferrite_cuda_core::driver::memcpy_htod_async(
-                    gpu_ptr,
-                    host,
-                    nbytes,
-                    device.compute_stream,
-                )?;
-                ferrite_cuda_core::driver::stream_synchronize(device.compute_stream)?;
+                ferrite_cuda_core::driver::memcpy_htod_async(gpu_ptr, host, nbytes, stream)?;
+                ferrite_cuda_core::driver::stream_synchronize(stream)?;
                 ferrite_cuda_core::driver::mem_free_host(host)?;
             }
             _ => anyhow::bail!("unsupported dtype for RoPE cache: {:?}", dtype),
@@ -154,13 +161,8 @@ impl RotaryCache {
         let cos_sin_cache = GpuTensor::new(gpu_ptr, &[max_pos, rotary_dim], dtype);
 
         // Build separate cos/sin caches for FA2 fused RoPE (needs contiguous buffers).
-        let (cos_cache, sin_cache) = Self::build_separate_cos_sin(
-            &cache,
-            max_pos,
-            rotary_dim,
-            dtype,
-            device.compute_stream,
-        )?;
+        let (cos_cache, sin_cache) =
+            Self::build_separate_cos_sin(&cache, max_pos, rotary_dim, dtype, stream)?;
 
         Ok(Self {
             cos_sin_cache,

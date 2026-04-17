@@ -153,3 +153,10 @@ async fn test_cuda_correctness_qwen2_0_5b_gptq() {
 async fn test_cuda_correctness_qwen3_0_6b() {
     run_correctness_test(TestModels::QWEN3_0_6B_CUDA, "qwen3_0_6b").await;
 }
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_gemma3_1b() {
+    run_correctness_test(TestModels::GEMMA3_1B_IT_CUDA, "gemma3_1b").await;
+}

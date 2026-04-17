@@ -56,6 +56,8 @@ __global__ void qk_norm_rope_kernel(
     const T* __restrict__ sin_cache,    // [max_pos, head_dim]
     const uint32_t* __restrict__ positions,  // [num_tokens]
     float epsilon,
+    float q_weight_offset,
+    float k_weight_offset,
     int num_q_heads,
     int num_kv_heads,
     int head_dim)
@@ -72,12 +74,15 @@ __global__ void qk_norm_rope_kernel(
     // Pointer to the head vector and weight.
     T* head_ptr;
     const T* weight;
+    float w_offset;
     if (is_q) {
         head_ptr = query + (token_idx * num_q_heads + local_head) * head_dim;
         weight = q_weight;
+        w_offset = q_weight_offset;
     } else {
         head_ptr = key + (token_idx * num_kv_heads + local_head) * head_dim;
         weight = k_weight;
+        w_offset = k_weight_offset;
     }
 
     // Dynamic shared memory for normalized values.
@@ -97,10 +102,11 @@ __global__ void qk_norm_rope_kernel(
     }
     __syncthreads();
 
-    // Pass 2: normalize with weight, store to shared memory.
+    // Pass 2: normalize with weight (+ optional offset for Gemma's
+    // (1+w) convention), store to shared memory.
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         float v = static_cast<float>(head_ptr[i]) * s_inv_rms;
-        smem[i] = v * static_cast<float>(weight[i]);
+        smem[i] = v * (static_cast<float>(weight[i]) + w_offset);
     }
     __syncthreads();
 
@@ -131,6 +137,8 @@ __global__ void qk_norm_kernel(
     const T* __restrict__ q_weight,     // [head_dim]
     const T* __restrict__ k_weight,     // [head_dim]
     float epsilon,
+    float q_weight_offset,
+    float k_weight_offset,
     int num_q_heads,
     int num_kv_heads,
     int head_dim)
@@ -143,12 +151,15 @@ __global__ void qk_norm_kernel(
 
     T* head_ptr;
     const T* weight;
+    float w_offset;
     if (is_q) {
         head_ptr = query + (token_idx * num_q_heads + local_head) * head_dim;
         weight = q_weight;
+        w_offset = q_weight_offset;
     } else {
         head_ptr = key + (token_idx * num_kv_heads + local_head) * head_dim;
         weight = k_weight;
+        w_offset = k_weight_offset;
     }
 
     // Compute sum of squares for RMS norm.
@@ -165,10 +176,10 @@ __global__ void qk_norm_kernel(
     }
     __syncthreads();
 
-    // Normalize and write back (with GemmaRMSNorm weight).
+    // Normalize and write back (with weight + optional offset).
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         float v = static_cast<float>(head_ptr[i]) * s_inv_rms;
-        head_ptr[i] = static_cast<T>(v * static_cast<float>(weight[i]));
+        head_ptr[i] = static_cast<T>(v * (static_cast<float>(weight[i]) + w_offset));
     }
 }
 
@@ -202,6 +213,7 @@ void qk_norm_rope_f32(
     const float* cos_cache, const float* sin_cache,
     const uint32_t* positions,
     float epsilon,
+    float q_weight_offset, float k_weight_offset,
     int num_q_heads, int num_kv_heads,
     int head_dim, int num_tokens,
     cudaStream_t stream)
@@ -212,7 +224,8 @@ void qk_norm_rope_f32(
     qk_norm_rope_kernel<float><<<grid, threads, smem_bytes, stream>>>(
         query, key, q_weight, k_weight,
         cos_cache, sin_cache, positions,
-        epsilon, num_q_heads, num_kv_heads, head_dim);
+        epsilon, q_weight_offset, k_weight_offset,
+        num_q_heads, num_kv_heads, head_dim);
 }
 
 void qk_norm_rope_f16(
@@ -221,6 +234,7 @@ void qk_norm_rope_f16(
     const __half* cos_cache, const __half* sin_cache,
     const uint32_t* positions,
     float epsilon,
+    float q_weight_offset, float k_weight_offset,
     int num_q_heads, int num_kv_heads,
     int head_dim, int num_tokens,
     cudaStream_t stream)
@@ -231,7 +245,8 @@ void qk_norm_rope_f16(
     qk_norm_rope_kernel<__half><<<grid, threads, smem_bytes, stream>>>(
         query, key, q_weight, k_weight,
         cos_cache, sin_cache, positions,
-        epsilon, num_q_heads, num_kv_heads, head_dim);
+        epsilon, q_weight_offset, k_weight_offset,
+        num_q_heads, num_kv_heads, head_dim);
 }
 
 void qk_norm_rope_bf16(
@@ -240,6 +255,7 @@ void qk_norm_rope_bf16(
     const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
     const uint32_t* positions,
     float epsilon,
+    float q_weight_offset, float k_weight_offset,
     int num_q_heads, int num_kv_heads,
     int head_dim, int num_tokens,
     cudaStream_t stream)
@@ -250,7 +266,8 @@ void qk_norm_rope_bf16(
     qk_norm_rope_kernel<__nv_bfloat16><<<grid, threads, smem_bytes, stream>>>(
         query, key, q_weight, k_weight,
         cos_cache, sin_cache, positions,
-        epsilon, num_q_heads, num_kv_heads, head_dim);
+        epsilon, q_weight_offset, k_weight_offset,
+        num_q_heads, num_kv_heads, head_dim);
 }
 
 // QK-norm only (no RoPE)
@@ -259,6 +276,7 @@ void qk_norm_f32(
     float* query, float* key,
     const float* q_weight, const float* k_weight,
     float epsilon,
+    float q_weight_offset, float k_weight_offset,
     int num_q_heads, int num_kv_heads,
     int head_dim, int num_tokens,
     cudaStream_t stream)
@@ -267,13 +285,15 @@ void qk_norm_f32(
     int threads = (head_dim < 1024) ? head_dim : 1024;
     qk_norm_kernel<float><<<grid, threads, 0, stream>>>(
         query, key, q_weight, k_weight,
-        epsilon, num_q_heads, num_kv_heads, head_dim);
+        epsilon, q_weight_offset, k_weight_offset,
+        num_q_heads, num_kv_heads, head_dim);
 }
 
 void qk_norm_f16(
     __half* query, __half* key,
     const __half* q_weight, const __half* k_weight,
     float epsilon,
+    float q_weight_offset, float k_weight_offset,
     int num_q_heads, int num_kv_heads,
     int head_dim, int num_tokens,
     cudaStream_t stream)
@@ -282,13 +302,15 @@ void qk_norm_f16(
     int threads = (head_dim < 1024) ? head_dim : 1024;
     qk_norm_kernel<__half><<<grid, threads, 0, stream>>>(
         query, key, q_weight, k_weight,
-        epsilon, num_q_heads, num_kv_heads, head_dim);
+        epsilon, q_weight_offset, k_weight_offset,
+        num_q_heads, num_kv_heads, head_dim);
 }
 
 void qk_norm_bf16(
     __nv_bfloat16* query, __nv_bfloat16* key,
     const __nv_bfloat16* q_weight, const __nv_bfloat16* k_weight,
     float epsilon,
+    float q_weight_offset, float k_weight_offset,
     int num_q_heads, int num_kv_heads,
     int head_dim, int num_tokens,
     cudaStream_t stream)
@@ -297,7 +319,8 @@ void qk_norm_bf16(
     int threads = (head_dim < 1024) ? head_dim : 1024;
     qk_norm_kernel<__nv_bfloat16><<<grid, threads, 0, stream>>>(
         query, key, q_weight, k_weight,
-        epsilon, num_q_heads, num_kv_heads, head_dim);
+        epsilon, q_weight_offset, k_weight_offset,
+        num_q_heads, num_kv_heads, head_dim);
 }
 
 // Sigmoid-mul

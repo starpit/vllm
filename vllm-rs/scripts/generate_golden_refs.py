@@ -62,6 +62,10 @@ MODELS = {
     # before the same repack / permute pipeline AutoGPTQ goes
     # through. Same uint4b8 bits end-to-end.
     "tinyllama_1b_w4a16_ct": "nm-testing/TinyLlama-1.1B-Chat-v1.0-W4A16-e2e",
+    # Unsloth mirror — `google/gemma-3-1b-it` is gated. Match this to
+    # `TestModels::GEMMA3_1B_IT_CUDA` so engine + golden run on the same
+    # weights.
+    "gemma3_1b": "unsloth/gemma-3-1b-it",
 }
 
 MAX_TOKENS = 32

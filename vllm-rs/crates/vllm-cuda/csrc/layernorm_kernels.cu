@@ -124,6 +124,10 @@ __global__ void fused_add_rms_norm_kernel(
     const int tail_start = num_vecs * VEC_SIZE;
 
     // Pass 1: Fused add + variance computation with vectorized loads/stores.
+    // Match Python GemmaRMSNorm._forward_static_with_residual: `x = x + residual`
+    // on bf16 tensors rounds each sum to bf16 BEFORE the `.float()` upcast, so
+    // variance is computed from bf16-precision values. Round-trip through T
+    // to quantize the sum before squaring.
     float ss = 0.0f;
     for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
         float ibuf[VEC_SIZE], rbuf[VEC_SIZE];
@@ -131,15 +135,16 @@ __global__ void fused_add_rms_norm_kernel(
         unpack_vec<T>(vec_load(&res[vi * VEC_SIZE]), rbuf);
         #pragma unroll
         for (int j = 0; j < VEC_SIZE; j++) {
-            rbuf[j] += ibuf[j];
+            rbuf[j] = static_cast<float>(static_cast<T>(rbuf[j] + ibuf[j]));
             ss += rbuf[j] * rbuf[j];
         }
         vec_store(&res[vi * VEC_SIZE], pack_vec<T>(rbuf));
     }
     // Scalar tail.
     for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
-        float r = static_cast<float>(res[i]) + static_cast<float>(inp[i]);
-        res[i] = static_cast<T>(r);
+        T r_t = static_cast<T>(static_cast<float>(res[i]) + static_cast<float>(inp[i]));
+        res[i] = r_t;
+        float r = static_cast<float>(r_t);
         ss += r * r;
     }
     ss = block_reduce_sum(ss);

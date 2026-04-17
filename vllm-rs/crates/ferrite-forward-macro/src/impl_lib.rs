@@ -20,7 +20,7 @@ use std::fmt;
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use crate::classified::{OpKind, Program, WeightId};
+use crate::classified::{ExternKind, OpKind, Program, WeightId};
 use crate::emit::{EmitCtx, weight_field_name};
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
@@ -1254,9 +1254,22 @@ pub fn starter_library() -> ImplementationLibrary {
     // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
     lib.push(Box::new(FusedQkvRopeCacheImpl));
     lib.push(Box::new(FusedQkvRopePrefillImpl));
-    // Singleton fallback claims standalone RopeAppend tiles when the
-    // QKV fusions can't (e.g. Qwen3 with per-head Q/K rmsnorm tiles
-    // sitting between the QKV gemms and rope_append). Emits
+    // FusedQkvQkNormRopeCacheImpl (three-gemm + fused qk_norm_rope +
+    // cache) is staged in this crate but intentionally NOT registered.
+    // The 3-gemm emit_call produces incorrect numerics on Qwen3/Gemma3
+    // (attention output diverges from golden at prompt 0 position 0).
+    // Root cause is unresolved: possibly Q/K/V ordering, reshape
+    // layout, or the interaction between the per-arch rotary cache
+    // and the kernel's expected layout. Until the correctness issue
+    // is tracked down, Qwen3/Gemma3 go through singletons
+    // (GemmRef + ReshapeRef + RmsNormRef + RopeAppendRef) which IS
+    // correctness-green.
+    //
+    // The singleton path is correctness-equivalent to what Qwen3 shipped
+    // with originally; the fused impl is a perf optimization that
+    // stays scoped to a future session with a proper numerics bringup.
+    //
+    // Singleton fallback claims standalone RopeAppend tiles. Emits
     // `rotary_embedding_inplace` + `reshape_and_cache`.
     lib.push(Box::new(RopeAppendRefImpl));
     // Matching attention pair — decode reads from cache, prefill
@@ -1795,7 +1808,31 @@ fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
         .any(|i| matches!(i, FufInput::Tile { id, .. } if *id == producer))
 }
 
-// ── FusedGateUpGeluMulImpl ───────────────────────────────────────
+/// Return the `cos_sin_cache` TokenStream for a rope-related tile.
+/// Checks whether the tile (or any tile in `claimed`) carries an
+/// `ExternKind::RotaryLocal` input; if so emits `wm.rotary_local`
+/// (arch-specific field on the Weights struct), otherwise
+/// `ctx.rotary` (from ForwardCtx).
+fn rotary_cos_sin_tokens(fuf: &Fuf, claimed: &[TileId]) -> TokenStream {
+    let uses_local = claimed.iter().any(|&tid| {
+        fuf.get(tid).inputs.iter().any(|i| {
+            matches!(
+                i,
+                FufInput::Extern {
+                    kind: ExternKind::RotaryLocal,
+                    ..
+                }
+            )
+        })
+    });
+    if uses_local {
+        quote! { wm.rotary_local.cos_sin_cache }
+    } else {
+        quote! { ctx.rotary.cos_sin_cache }
+    }
+}
+
+// ── FusedGateUpGeluMulImpl ───���──────────────────────────────���────
 //
 // Structural mirror of [`FusedGateUpSiluMulImpl`] for the GELU
 // variant of the gate/up MLP fusion. Claims the
@@ -3444,6 +3481,8 @@ impl Implementation for FusedQkvRopeCacheImpl {
             quote! {}
         };
 
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
         quote! {
             // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
             // then fused RoPE + paged-cache write. The packed QKV
@@ -3463,7 +3502,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        #rotary_cos_sin,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -3480,7 +3519,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        #rotary_cos_sin,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -3497,6 +3536,738 @@ impl Implementation for FusedQkvRopeCacheImpl {
             // symmetry with the FUF's tuple output shape; not read by
             // any downstream tile once `AttentionViaCacheImpl` takes
             // its input from the cache directly.
+            let #k_out = ctx.kv_cache.k_cache(#layer);
+            let #v_out = ctx.kv_cache.v_cache(#layer);
+        }
+    }
+}
+
+// ── FusedQkvQkNormRopeCacheImpl ─────────────────────────────────
+//
+// Multi-tile impl claiming the entire QKV + per-head QK-norm + RoPE
+// + paged-cache-write chain produced by Qwen3 and Gemma3:
+//
+//   Gemm(q) ─→ [Add(w,1.0) →] [Reshape →] RmsNorm → [Reshape →] ─┐
+//   Gemm(k) ─→ [Add(w,1.0) →] [Reshape →] RmsNorm → [Reshape →] ─┤
+//   Gemm(v) ─────────────────────────────────────────────────────────┤
+//                                                      RopeAppend ←─┘
+//
+// The three Gemms share the same activation. The Q and K paths flow
+// through optional Add (Gemma3's `weight + 1.0`), optional Reshape
+// (split [T, heads*head_dim] → [T*heads, head_dim]), RmsNorm
+// (per-head norm), optional Reshape (flatten back), then into the
+// RopeAppend. The V path feeds RopeAppend directly.
+//
+// Emits:
+//   1. Packed cuBLAS QKV GEMM (same as FusedQkvRopeCacheImpl)
+//   2. `qk_norm_rope_inplace` — fused QK-norm + RoPE in one launch
+//   3. `reshape_and_cache` — write K/V to the paged cache
+//
+// Seeds on Gemm (upstream in topo order). Whichever of the three
+// Q/K/V Gemms seeds first wins; the other two are swallowed by the
+// same claim.
+
+#[derive(Debug, Default)]
+pub struct FusedQkvQkNormRopeCacheImpl;
+
+/// Walk from a Gemm tile through the optional `Add → Reshape →
+/// RmsNorm → Reshape` chain and return the chain's endpoint tile
+/// (the last tile before RopeAppend) plus all intermediate tiles
+/// encountered. Returns `None` if the chain doesn't match.
+///
+/// Chain shapes (all valid):
+///   Gemm → RmsNorm                         (Qwen3, no scalar offset, no reshape)
+///   Gemm → Add → RmsNorm                   (Gemma3, scalar offset, no reshape)
+///   Gemm → Reshape → RmsNorm → Reshape     (with reshape, no scalar offset)
+///   Gemm → Add → Reshape → RmsNorm → Reshape (with reshape + scalar offset)
+fn walk_qk_norm_chain(fuf: &Fuf, gemm_id: TileId) -> Option<(TileId, Vec<TileId>, Option<TileId>)> {
+    // Returns (endpoint_tile, intermediates_excluding_gemm, add_tile_if_any)
+    //
+    // The data chain is: Gemm → [Reshape(split)] → RmsNorm → [Reshape(flatten)]
+    // The Add(Weight, Scalar) for Gemma's `w + 1.0` feeds RmsNorm's
+    // weight slot (slot 1), NOT the activation path. It's a side input
+    // that we claim but don't walk through.
+    let mut cursor = gemm_id;
+    let mut intermediates: Vec<TileId> = Vec::new();
+    let mut add_tile: Option<TileId> = None;
+
+    // Step 1: optional Reshape (split to per-head)
+    if let Some(reshape_node) = fuf
+        .nodes
+        .iter()
+        .find(|n| n.op == OpKind::Reshape && consumes_tile(n, cursor))
+    {
+        let has_rmsnorm_downstream = fuf.nodes.iter().any(|n| {
+            n.op == OpKind::RmsNorm
+                && matches!(n.inputs.first(), Some(FufInput::Tile { id, .. }) if *id == reshape_node.id)
+        });
+        if has_rmsnorm_downstream {
+            intermediates.push(reshape_node.id);
+            cursor = reshape_node.id;
+        }
+    }
+
+    // Step 2: required RmsNorm consuming cursor at slot 0
+    let rmsnorm_node = fuf.nodes.iter().find(|n| {
+        n.op == OpKind::RmsNorm
+            && matches!(n.inputs.first(), Some(FufInput::Tile { id, .. }) if *id == cursor)
+    })?;
+    intermediates.push(rmsnorm_node.id);
+
+    // Check if RmsNorm's weight slot (slot 1) is an Add(Weight, Scalar)
+    // tile — that's the Gemma `(1+w)` offset. If so, claim the Add.
+    if let Some(FufInput::Tile {
+        id: weight_tile, ..
+    }) = rmsnorm_node.inputs.get(1)
+    {
+        let wt_node = fuf.get(*weight_tile);
+        if wt_node.op == OpKind::Add
+            && wt_node
+                .inputs
+                .iter()
+                .any(|i| matches!(i, FufInput::Scalar(_)))
+            && wt_node
+                .inputs
+                .iter()
+                .any(|i| matches!(i, FufInput::Weight { .. }))
+        {
+            add_tile = Some(*weight_tile);
+            intermediates.push(*weight_tile);
+        }
+    }
+    if rmsnorm_node.inputs.len() < 2 {
+        return None;
+    }
+
+    cursor = rmsnorm_node.id;
+    match &rmsnorm_node.inputs[1] {
+        FufInput::Tile { id, .. } => {
+            // Must be our Add tile (scalar-offset path).
+            if add_tile != Some(*id) {
+                return None;
+            }
+        }
+        FufInput::Weight { .. } => {
+            // Direct weight — fine (Qwen3 path, no scalar offset).
+        }
+        _ => return None,
+    }
+
+    // Step 4: optional Reshape (flatten back to [T, heads*head_dim])
+    if let Some(reshape_node) = fuf
+        .nodes
+        .iter()
+        .find(|n| n.op == OpKind::Reshape && consumes_tile(n, cursor))
+    {
+        intermediates.push(reshape_node.id);
+        cursor = reshape_node.id;
+    }
+
+    Some((cursor, intermediates, add_tile))
+}
+
+/// True if this RopeAppend tile's Q and K inputs flow through a
+/// `Gemm → [Add →] [Reshape →] RmsNorm → [Reshape →]` chain from
+/// three shared-activation Gemms — the pattern
+/// `FusedQkvQkNormRopeCacheImpl` claims. Used by `RopeAppendRefImpl`
+/// to defer when this larger fusion would match.
+fn rope_append_has_qk_norm_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
+    let node = fuf.get(rope_tile);
+    if node.op != OpKind::RopeAppend || node.inputs.len() < 3 {
+        return false;
+    }
+    let qkv_raw: Vec<TileId> = node
+        .inputs
+        .iter()
+        .take(3)
+        .filter_map(|i| match i {
+            FufInput::Tile { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    if qkv_raw.len() != 3 {
+        return false;
+    }
+
+    // Q and K must come through QK-norm chains; V must be a Gemm.
+    let q_input = qkv_raw[0];
+    let k_input = qkv_raw[1];
+    let v_id = qkv_raw[2];
+
+    // V must be a Gemm directly.
+    if fuf.get(v_id).op != OpKind::Gemm {
+        return false;
+    }
+
+    // Find the Gemm at the root of Q and K chains by walking backwards.
+    // The chain endpoint feeds into RopeAppend; we need the Gemm root.
+    // Walk backwards from q_input: could be Reshape → RmsNorm → [Reshape →] [Add →] Gemm
+    let q_gemm = find_gemm_root_of_norm_chain(fuf, q_input);
+    let k_gemm = find_gemm_root_of_norm_chain(fuf, k_input);
+
+    let (Some(q_gemm), Some(k_gemm)) = (q_gemm, k_gemm) else {
+        return false;
+    };
+
+    // All three Gemms must share the same activation.
+    let q_act = first_tile_input(fuf.get(q_gemm));
+    let k_act = first_tile_input(fuf.get(k_gemm));
+    let v_act = first_tile_input(fuf.get(v_id));
+    q_act.is_some() && q_act == k_act && q_act == v_act
+}
+
+/// Walk backwards from a tile that is the endpoint of a QK-norm chain
+/// (Reshape or RmsNorm) back through the chain to find the root Gemm.
+fn find_gemm_root_of_norm_chain(fuf: &Fuf, endpoint: TileId) -> Option<TileId> {
+    let mut cursor = endpoint;
+
+    // If cursor is a Reshape, step back
+    if fuf.get(cursor).op == OpKind::Reshape {
+        cursor = first_tile_input(fuf.get(cursor))?.0;
+    }
+    // Now should be RmsNorm
+    if fuf.get(cursor).op != OpKind::RmsNorm {
+        return None;
+    }
+    // RmsNorm slot 0 is the tensor input
+    cursor = first_tile_input(fuf.get(cursor))?.0;
+
+    // Optional Reshape (split)
+    if fuf.get(cursor).op == OpKind::Reshape {
+        cursor = first_tile_input(fuf.get(cursor))?.0;
+    }
+    // Optional Add(Weight, Scalar)
+    if fuf.get(cursor).op == OpKind::Add {
+        // The Add should have a Tile input from a Gemm
+        cursor = first_tile_input(fuf.get(cursor))?.0;
+    }
+
+    if fuf.get(cursor).op == OpKind::Gemm {
+        Some(cursor)
+    } else {
+        None
+    }
+}
+
+impl Implementation for FusedQkvQkNormRopeCacheImpl {
+    fn name(&self) -> &'static str {
+        "fused_qkv_qk_norm_rope_cache"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        // Handles all workload points; downstream `AttentionViaCacheImpl`
+        // (M=1) and `AttentionPrefillContiguousImpl` (M>=2) pick up via
+        // their own WorkloadConstraint gating.
+        WorkloadConstraint::Any
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let seed_node = fuf.get(seed);
+        if seed_node.op != OpKind::Gemm {
+            return None;
+        }
+        if !matches!(weight_storage_of(seed_node), Some(StorageFormat::Dense)) {
+            return None;
+        }
+
+        // Find a RopeAppend whose Q and K inputs flow through QK-norm
+        // chains from Gemms sharing the same activation as the seed,
+        // and whose V input is a Gemm also sharing that activation.
+        let rope_node = fuf.nodes.iter().find(|n| {
+            if n.op != OpKind::RopeAppend || n.inputs.len() < 3 {
+                return false;
+            }
+            let qkv_raw: Vec<TileId> = n
+                .inputs
+                .iter()
+                .take(3)
+                .filter_map(|i| match i {
+                    FufInput::Tile { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            if qkv_raw.len() != 3 {
+                return false;
+            }
+
+            let v_id = qkv_raw[2];
+            if fuf.get(v_id).op != OpKind::Gemm {
+                return false;
+            }
+
+            // Walk forward from each Gemm to verify the QK-norm chain
+            // exists. We need to find which Gemms root the Q and K
+            // chains.
+            let q_gemm = find_gemm_root_of_norm_chain(fuf, qkv_raw[0]);
+            let k_gemm = find_gemm_root_of_norm_chain(fuf, qkv_raw[1]);
+
+            let (Some(q_gemm), Some(k_gemm)) = (q_gemm, k_gemm) else {
+                return false;
+            };
+
+            let gemms = [q_gemm, k_gemm, v_id];
+            if !gemms.contains(&seed) {
+                return false;
+            }
+
+            let act = first_tile_input(fuf.get(gemms[0]));
+            act.is_some() && gemms.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
+        })?;
+
+        let rope_id = rope_node.id;
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        let v_id = qkv_raw[2];
+        let q_gemm = find_gemm_root_of_norm_chain(fuf, qkv_raw[0]).expect("validated in find");
+        let k_gemm = find_gemm_root_of_norm_chain(fuf, qkv_raw[1]).expect("validated in find");
+
+        // Walk the Q and K chains forward to collect all intermediate tiles.
+        let (_, q_chain, _) = walk_qk_norm_chain(fuf, q_gemm).expect("Q chain must be valid");
+        let (_, k_chain, _) = walk_qk_norm_chain(fuf, k_gemm).expect("K chain must be valid");
+
+        let mut claimed: Vec<TileId> = Vec::with_capacity(16);
+        claimed.push(q_gemm);
+        claimed.push(k_gemm);
+        claimed.push(v_id);
+        claimed.extend_from_slice(&q_chain);
+        claimed.extend_from_slice(&k_chain);
+        claimed.push(rope_id);
+        claimed.sort();
+        claimed.dedup();
+
+        let activation = first_tile_input(fuf.get(q_gemm))?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation],
+            boundary_outputs: vec![rope_id],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let m = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let num_q_heads = ctx.bounds.get("num_attention_heads").copied().unwrap_or(0) as f64;
+        let num_kv_heads = ctx.bounds.get("num_key_value_heads").copied().unwrap_or(0) as f64;
+        let head_dim = ctx.bounds.get("head_dim").copied().unwrap_or(0) as f64;
+        let n = (num_q_heads + 2.0 * num_kv_heads) * head_dim;
+
+        let flops = 2.0 * m * n * hidden;
+        let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+        let gemm_us = if peak > 0.0 && flops > 0.0 {
+            (flops / peak) * 1e6
+        } else {
+            0.0
+        };
+
+        // QK-norm + RoPE + cache write: bandwidth-bound.
+        // Read packed Q+K for norm, write normalized Q+K, then RoPE +
+        // cache write (same as FusedQkvRopeCacheImpl plus the norm r/w).
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let q_kv_bytes = m * (num_q_heads + num_kv_heads) * head_dim * BYTES_PER_ELEM;
+        // norm reads + writes Q and K (2x), plus rope + cache write
+        let rope_bytes = 3.0 * m * n * BYTES_PER_ELEM;
+        let norm_rope_cache_us = if bw_gb > 0.0 {
+            ((2.0 * q_kv_bytes + rope_bytes) / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+
+        gemm_us + norm_rope_cache_us
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        let rope_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim contains RopeAppend");
+        vec![((rope_id, 0), None)]
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // The `qk_norm_rope_inplace` kernel requires Q/K as
+        // contiguous `[T, num_heads, head_dim]` tensors. A packed
+        // cuBLAS QKV output `[T, q_size + 2*kv_size]` has strided
+        // Q/K across tokens, so slicing won't give usable inputs.
+        // Instead we declare three SEPARATE `LinearLayer`
+        // accessors (one per Gemm) and let `emit_call` run three
+        // GEMMs — each producing a contiguous output.
+        //
+        // Identify the RopeAppend tile so we can figure out the
+        // Q/K/V role of each Gemm. Rope's tile inputs [0,1,2] are
+        // qkv_raw; Q and K flow through the norm chain, V is a
+        // Gemm directly.
+        let rope_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim must contain a RopeAppend");
+        let rope_node = fuf.get(rope_id);
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
+
+        let v_gemm = qkv_raw[2];
+        let q_gemm = find_gemm_root_of_norm_chain(fuf, qkv_raw[0])
+            .expect("Q norm chain validated at match time");
+        let k_gemm = find_gemm_root_of_norm_chain(fuf, qkv_raw[1])
+            .expect("K norm chain validated at match time");
+
+        // 1. Three separate LinearLayer accessors (Q, K, V).
+        let mut accessors: Vec<WeightAccessor> = Vec::with_capacity(5);
+        for &gemm_id in &[q_gemm, k_gemm, v_gemm] {
+            let (wid, widx) = first_weight_ref(fuf.get(gemm_id)).expect("gemm has a weight input");
+            let name = weight_field_name(program, wid, widx);
+            accessors.push(WeightAccessor {
+                name,
+                rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+                source_weights: vec![(wid, widx)],
+            });
+        }
+
+        // 2. Two RmsNorm weights for q_norm and k_norm.
+        //
+        // The weight source depends on whether the chain has a
+        // scalar-offset Add: if so, the RmsNorm tile's weight slot
+        // (slot 1) is a Tile input pointing at the Add, and the
+        // actual Weight ref lives on the Add's inputs. Otherwise the
+        // RmsNorm's slot 1 is a direct Weight input.
+        let rmsnorm_ids: Vec<TileId> = claimed_tiles
+            .iter()
+            .filter(|t| fuf.get(**t).op == OpKind::RmsNorm)
+            .copied()
+            .collect();
+        assert_eq!(
+            rmsnorm_ids.len(),
+            2,
+            "FusedQkvQkNormRopeCacheImpl claim must have exactly 2 RmsNorm tiles"
+        );
+
+        for &rmsnorm_id in &rmsnorm_ids {
+            let rmsnorm_node = fuf.get(rmsnorm_id);
+            let (weight_id, weight_idx) = match &rmsnorm_node.inputs[1] {
+                FufInput::Tile { id, .. } => {
+                    // Scalar-offset path: the Add tile carries the weight.
+                    let add_node = fuf.get(*id);
+                    add_node
+                        .inputs
+                        .iter()
+                        .find_map(|i| match i {
+                            FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                            _ => None,
+                        })
+                        .expect("scalar-offset Add has a Weight input")
+                }
+                FufInput::Weight { id, index, .. } => (*id, *index),
+                _ => panic!("RmsNorm slot 1 must be Tile (Add) or Weight"),
+            };
+            let name = weight_field_name(program, weight_id, weight_idx);
+            accessors.push(WeightAccessor {
+                name,
+                rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
+                source_weights: vec![(weight_id, weight_idx)],
+            });
+        }
+
+        accessors
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Identify the RopeAppend tile.
+        let rope_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim must contain a RopeAppend");
+        let rope_node = ctx.fuf.get(rope_id);
+
+        // Find the three Gemms and identify Q/K/V roles.
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
+
+        let v_id = qkv_raw[2];
+        let q_gemm = find_gemm_root_of_norm_chain(ctx.fuf, qkv_raw[0])
+            .expect("Q norm chain validated at match time");
+        let k_gemm = find_gemm_root_of_norm_chain(ctx.fuf, qkv_raw[1])
+            .expect("K norm chain validated at match time");
+
+        // Walk Q and K chains to get Add tiles (for weight offsets).
+        let (_, _, q_add) = walk_qk_norm_chain(ctx.fuf, q_gemm).expect("Q chain valid");
+        let (_, _, k_add) = walk_qk_norm_chain(ctx.fuf, k_gemm).expect("K chain valid");
+
+        // Determine weight offsets from Add tiles.
+        let q_weight_offset: f32 = q_add
+            .map(|add_id| {
+                ctx.fuf
+                    .get(add_id)
+                    .inputs
+                    .iter()
+                    .find_map(|i| match i {
+                        FufInput::Scalar(v) => Some(*v as f32),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0)
+            })
+            .unwrap_or(0.0);
+        let k_weight_offset: f32 = k_add
+            .map(|add_id| {
+                ctx.fuf
+                    .get(add_id)
+                    .inputs
+                    .iter()
+                    .find_map(|i| match i {
+                        FufInput::Scalar(v) => Some(*v as f32),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0)
+            })
+            .unwrap_or(0.0);
+
+        let activation = ctx.input_expr(q_gemm, 0);
+
+        // Three separate LinearLayer accessors (Q, K, V) — matching
+        // the accessors declared in `required_weights`. A packed
+        // QKV gemm produces strided Q/K/V views that the
+        // `qk_norm_rope_inplace` kernel can't consume; three
+        // separate gemms each produce contiguous outputs.
+        let (q_wid, q_widx) = first_weight_ref(ctx.fuf.get(q_gemm)).expect("Q gemm has a weight");
+        let (k_wid, k_widx) = first_weight_ref(ctx.fuf.get(k_gemm)).expect("K gemm has a weight");
+        let (v_wid, v_widx) = first_weight_ref(ctx.fuf.get(v_id)).expect("V gemm has a weight");
+        let q_weight_name = weight_field_name(ctx.program, q_wid, q_widx);
+        let k_weight_name = weight_field_name(ctx.program, k_wid, k_widx);
+        let v_weight_name = weight_field_name(ctx.program, v_wid, v_widx);
+        let q_weight_expr = ctx.weight_accessor(&q_weight_name);
+        let k_weight_expr = ctx.weight_accessor(&k_weight_name);
+        let v_weight_expr = ctx.weight_accessor(&v_weight_name);
+
+        // RmsNorm weight accessors — ordered Q then K by topo order
+        // of their RmsNorm tiles within the claim.
+        let rmsnorm_ids: Vec<TileId> = ctx
+            .claimed_tiles
+            .iter()
+            .filter(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+            .copied()
+            .collect();
+        assert_eq!(rmsnorm_ids.len(), 2);
+
+        // Determine which RmsNorm is Q's and which is K's by checking
+        // which chain each belongs to.
+        let q_rmsnorm = rmsnorm_ids
+            .iter()
+            .find(|&&id| {
+                let (_, q_chain, _) = walk_qk_norm_chain(ctx.fuf, q_gemm).unwrap();
+                q_chain.contains(&id)
+            })
+            .expect("Q rmsnorm in claim");
+        let k_rmsnorm = rmsnorm_ids
+            .iter()
+            .find(|&&id| {
+                let (_, k_chain, _) = walk_qk_norm_chain(ctx.fuf, k_gemm).unwrap();
+                k_chain.contains(&id)
+            })
+            .expect("K rmsnorm in claim");
+
+        // Build accessor expressions for the two norm weights.
+        let q_norm_weight_ref = {
+            let rmsnorm_node = ctx.fuf.get(*q_rmsnorm);
+            match &rmsnorm_node.inputs[1] {
+                FufInput::Tile { id, .. } => {
+                    let add_node = ctx.fuf.get(*id);
+                    let (wid, widx) = add_node
+                        .inputs
+                        .iter()
+                        .find_map(|i| match i {
+                            FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                            _ => None,
+                        })
+                        .expect("Add has Weight input");
+                    weight_field_name(ctx.program, wid, widx)
+                }
+                FufInput::Weight { id, index, .. } => weight_field_name(ctx.program, *id, *index),
+                _ => panic!("RmsNorm slot 1 must be Tile or Weight"),
+            }
+        };
+        let k_norm_weight_ref = {
+            let rmsnorm_node = ctx.fuf.get(*k_rmsnorm);
+            match &rmsnorm_node.inputs[1] {
+                FufInput::Tile { id, .. } => {
+                    let add_node = ctx.fuf.get(*id);
+                    let (wid, widx) = add_node
+                        .inputs
+                        .iter()
+                        .find_map(|i| match i {
+                            FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                            _ => None,
+                        })
+                        .expect("Add has Weight input");
+                    weight_field_name(ctx.program, wid, widx)
+                }
+                FufInput::Weight { id, index, .. } => weight_field_name(ctx.program, *id, *index),
+                _ => panic!("RmsNorm slot 1 must be Tile or Weight"),
+            }
+        };
+        let q_norm_expr = ctx.weight_accessor(&q_norm_weight_ref);
+        let k_norm_expr = ctx.weight_accessor(&k_norm_weight_ref);
+
+        // Config-derived kernel args.
+        let num_q_heads = ctx.bound("num_attention_heads") as usize;
+        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+        let head_dim = ctx.bound("head_dim") as usize;
+
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
+            as usize;
+
+        let q_out = ctx.output_ident(rope_id, 0);
+        let k_out = ctx.output_ident(rope_id, 1);
+        let v_out = ctx.output_ident(rope_id, 2);
+
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
+        quote! {
+            // Three separate cuBLAS GEMMs producing contiguous Q, K, V
+            // OwnedTensors (shape [num_tokens, *_size]). The
+            // `qk_norm_rope_inplace` kernel requires contiguous Q/K
+            // at [T, num_heads, head_dim]; slicing a packed QKV
+            // output would leave Q/K strided across tokens.
+            let mut #q_out = unsafe {
+                let nt = (*ctx.input_ids).dim(0) as usize;
+                let q = (#q_weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                let k = (#k_weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                let v = (#v_weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+
+                // 3D views on the contiguous OwnedTensors: the
+                // `qk_norm_rope_inplace` and `reshape_and_cache`
+                // kernels read dim(0)/dim(1)/dim(2) as
+                // `[num_tokens, num_heads, head_dim]`.
+                let q_view = (*q).reshape(&[nt, #num_q_heads, #head_dim]);
+                let k_view = (*k).reshape(&[nt, #num_kv_heads, #head_dim]);
+                let v_view = (*v).reshape(&[nt, #num_kv_heads, #head_dim]);
+
+                // Fused QK-norm + RoPE in one kernel launch —
+                // operates in-place on the Q and K storage.
+                ::ferrite_kernels::kernels::qk_norm_rope_inplace(
+                    q_view,
+                    k_view,
+                    (#q_norm_expr).weight,
+                    (#k_norm_expr).weight,
+                    #rotary_cos_sin,
+                    *ctx.positions,
+                    #num_q_heads,
+                    #num_kv_heads,
+                    #head_dim,
+                    (#q_norm_expr).eps,
+                    #q_weight_offset,
+                    #k_weight_offset,
+                    device.compute_stream,
+                );
+
+                // Write K/V to the paged cache. K and V storage is
+                // freed when the OwnedTensors drop at end of scope.
+                ::ferrite_kernels::kernels::reshape_and_cache(
+                    k_view,
+                    v_view,
+                    *ctx.kv_cache.k_cache(#layer),
+                    *ctx.kv_cache.v_cache(#layer),
+                    *ctx.slot_mapping,
+                    ctx.kv_cache.block_size,
+                    device.compute_stream,
+                );
+
+                q
+            };
+            // Reshape Q's OwnedTensor in-place to [T, num_q_heads,
+            // head_dim] — the layout AttentionViaCacheImpl /
+            // AttentionPrefillContiguousImpl expect downstream.
+            unsafe {
+                let nt = (*#q_out).dim(0);
+                let dt = (*#q_out).dtype();
+                #q_out.reshape(&[nt, #num_q_heads, #head_dim], dt);
+            }
+            // K/V aliases: paged-cache layer slices. The contiguous
+            // K/V OwnedTensors produced above have already been
+            // committed to the cache and dropped at end of the unsafe
+            // block; downstream attention reads from the paged cache.
             let #k_out = ctx.kv_cache.k_cache(#layer);
             let #v_out = ctx.kv_cache.v_cache(#layer);
         }
@@ -3613,6 +4384,8 @@ impl Implementation for AttentionViaCacheImpl {
         // q_size for the [num_tokens, q_size] reshape o_proj needs.
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
         quote! {
             // Decode paged attention. Delegates to the
             // `attention_decode_from_cache` helper which:
@@ -3625,8 +4398,8 @@ impl Implementation for AttentionViaCacheImpl {
                 let has_spans = !ctx.kv_cache.block_unrotated_gpu().is_null();
                 let (cos_sin_ptr, rotary_dim) = if has_spans {
                     (
-                        ctx.rotary.cos_sin_cache.raw_ptr() as *const u8,
-                        ctx.rotary.cos_sin_cache.dim(1),
+                        #rotary_cos_sin.raw_ptr() as *const u8,
+                        #rotary_cos_sin.dim(1),
                     )
                 } else {
                     (::std::ptr::null::<u8>(), 0)
@@ -3739,6 +4512,10 @@ impl Implementation for RopeAppendRefImpl {
         if rope_append_has_fused_qkv_upstream(fuf, seed) {
             return None;
         }
+        // Note: deferral to FusedQkvQkNormRopeCacheImpl is OFF because
+        // that impl is not registered in starter_library (correctness
+        // bug, see comment there). Singletons must claim the Qwen3/
+        // Gemma3 RopeAppend tiles unconditionally.
         Some(MatchInfo {
             claimed_tiles: vec![seed],
             boundary_inputs: qkv,
@@ -3863,6 +4640,8 @@ impl Implementation for RopeAppendRefImpl {
         let k_out = ctx.output_ident(rope_id, 1);
         let v_out = ctx.output_ident(rope_id, 2);
 
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
         quote! {
             unsafe {
                 // RoPE runs against the flat 2D `[T, heads*head_dim]`
@@ -3872,7 +4651,7 @@ impl Implementation for RopeAppendRefImpl {
                     *#q_upstream,
                     *#k_upstream,
                     *ctx.positions,
-                    ctx.rotary.cos_sin_cache,
+                    #rotary_cos_sin,
                     #head_dim,
                     device.compute_stream,
                 );
@@ -4072,6 +4851,8 @@ impl Implementation for FusedQkvRopePrefillImpl {
             quote! {}
         };
 
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
         quote! {
             // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
             // then RoPE-split into contiguous Q/K/V. The packed QKV
@@ -4092,7 +4873,7 @@ impl Implementation for FusedQkvRopePrefillImpl {
                 ::ferrite_kernels::kernels::fused_qkv_rope(
                     *qkv_packed,
                     *ctx.positions,
-                    ctx.rotary.cos_sin_cache,
+                    #rotary_cos_sin,
                     #q_size,
                     #kv_size,
                     #num_q_heads,
@@ -4330,13 +5111,15 @@ impl Implementation for SlidingAttentionViaCacheImpl {
         let window_tokens = sliding_window_left_tokens(ctx);
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
         quote! {
             let mut #out = unsafe {
                 let has_spans = !ctx.kv_cache.block_unrotated_gpu().is_null();
                 let (cos_sin_ptr, rotary_dim) = if has_spans {
                     (
-                        ctx.rotary.cos_sin_cache.raw_ptr() as *const u8,
-                        ctx.rotary.cos_sin_cache.dim(1),
+                        #rotary_cos_sin.raw_ptr() as *const u8,
+                        #rotary_cos_sin.dim(1),
                     )
                 } else {
                     (::std::ptr::null::<u8>(), 0)
@@ -5515,6 +6298,8 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
         let k_out = ctx.output_ident(rope_id, 1);
         let v_out = ctx.output_ident(rope_id, 2);
 
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
         quote! {
             let #q_out = unsafe {
                 let qkv_packed = (#weight_expr).forward(
@@ -5526,7 +6311,7 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        #rotary_cos_sin,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -5543,7 +6328,7 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        #rotary_cos_sin,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -5689,6 +6474,8 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
         let k_out = ctx.output_ident(rope_id, 1);
         let v_out = ctx.output_ident(rope_id, 2);
 
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
         quote! {
             let (#q_out, #k_out, #v_out) = unsafe {
                 let qkv_packed = (#weight_expr).forward(
@@ -5699,7 +6486,7 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
                 ::ferrite_kernels::kernels::fused_qkv_rope(
                     *qkv_packed,
                     *ctx.positions,
-                    ctx.rotary.cos_sin_cache,
+                    #rotary_cos_sin,
                     #q_size,
                     #kv_size,
                     #num_q_heads,

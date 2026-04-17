@@ -274,6 +274,8 @@ impl LlamaAttention {
                     self.num_kv_heads,
                     self.head_dim,
                     self.qk_norm_eps,
+                    0.0,
+                    0.0,
                     device.compute_stream,
                 );
                 kernels::rotary_embedding_q_only(

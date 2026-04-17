@@ -189,6 +189,27 @@ fn parse_bool_expr(expr: &SynExpr) -> ParseResult<BoolExpr> {
                     remainder,
                 })
             }
+            BinOp::Ne(_) => {
+                let (ivar, divisor) = match unwrap_parens(&b.left) {
+                    SynExpr::Binary(inner) if matches!(inner.op, BinOp::Rem(_)) => {
+                        let ivar = parse_ivar(&inner.left)?;
+                        let divisor = parse_bound(unwrap_parens(&inner.right))?;
+                        (ivar, divisor)
+                    }
+                    other => {
+                        return Err(syn::Error::new(
+                            other.span(),
+                            "left of `!=` in an `if` condition must be `ivar % <bound>`",
+                        ));
+                    }
+                };
+                let remainder = parse_bound(unwrap_parens(&b.right))?;
+                Ok(BoolExpr::NotModulo {
+                    ivar,
+                    divisor,
+                    remainder,
+                })
+            }
             BinOp::Lt(_) => {
                 let ivar = parse_ivar(&b.left)?;
                 let bound = parse_bound(unwrap_parens(&b.right))?;
@@ -196,13 +217,14 @@ fn parse_bool_expr(expr: &SynExpr) -> ParseResult<BoolExpr> {
             }
             _ => Err(syn::Error::new(
                 b.op.span(),
-                "only `%`+`==` and `<` are supported in `if` conditions; \
-                 shapes: `ivar % N == M` or `ivar < N`",
+                "only `%`+`==`, `%`+`!=`, and `<` are supported in `if` conditions; \
+                 shapes: `ivar % N == M`, `ivar % N != M`, or `ivar < N`",
             )),
         },
         other => Err(syn::Error::new(
             other.span(),
-            "`if` condition must be `ivar % <bound> == <bound>` or `ivar < <bound>`",
+            "`if` condition must be `ivar % <bound> == <bound>`, \
+             `ivar % <bound> != <bound>`, or `ivar < <bound>`",
         )),
     }
 }

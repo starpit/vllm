@@ -121,6 +121,21 @@ async fn test_cuda_correctness_tinyllama_1b_gptq_desc_act() {
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
+async fn test_cuda_correctness_tinyllama_1b_w4a16_ct() {
+    // Compressed-tensors INT4 (Neural Magic pack-quantized) —
+    // exercises `GptqLayout::WeightPacked` in
+    // `MarlinLinear::load_gptq[_concat]`: `.weight_packed [N, K/8]`
+    // + `.weight_scale [N, num_groups]` sniffed off disk, CPU-
+    // transposed to AutoGPTQ-native `[K/8, N]` / `[num_groups, N]`,
+    // then the same uint4b8 `gptq_repack_into` + Marlin kernel
+    // everything else uses. Golden generated from Python vLLM on
+    // `nm-testing/TinyLlama-1.1B-Chat-v1.0-W4A16-e2e`.
+    run_correctness_test(TestModels::TINYLLAMA_1B_W4A16_CT, "tinyllama_1b_w4a16_ct").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn test_cuda_correctness_qwen2_0_5b_gptq() {
     // GPTQ Qwen2.5-0.5B via the ferrite-forward Marlin* impl family
     // + `ferrite_kernels::layers_quant::MarlinLinear::load_gptq` /

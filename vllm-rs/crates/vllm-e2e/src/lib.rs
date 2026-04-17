@@ -148,6 +148,10 @@ impl TestModels {
 
     // GPTQ with desc_act (activation ordering) — tests g_idx sort + perm pipeline
     pub const TINYLLAMA_1B_GPTQ_DESC_ACT: &str = "TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ";
+    // Compressed-tensors INT4 — Neural Magic / RedHatAI pack-quantized
+    // layout. Same uint4b8 bits as GPTQ; loader sniffs `.weight_packed`
+    // + `.weight_scale` and transposes before the shared Marlin repack.
+    pub const TINYLLAMA_1B_W4A16_CT: &str = "nm-testing/TinyLlama-1.1B-Chat-v1.0-W4A16-e2e";
 
     // BitsAndBytes quantized models (MLX dequant-at-load or CPU)
     pub const LLAMA_3_2_1B_BNB_4BIT: &str = "unsloth/Llama-3.2-1B-Instruct-bnb-4bit";

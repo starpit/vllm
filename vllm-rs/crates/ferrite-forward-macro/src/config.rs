@@ -339,8 +339,9 @@ mod tests {
         // 9 Llama configs (405B gated, skipped) + smollm2-135m +
         // smollm2-360m (second size gives `probe-weights` cross-size
         // disambiguation) + llama-3.2-1b-awq (AWQ end-to-end slice) +
-        // tinyllama-1.1b-gptq-desc-act (first desc_act=true GPTQ).
-        assert_eq!(configs.len(), 13, "expected 13 Llama configs");
+        // tinyllama-1.1b-gptq-desc-act (first desc_act=true GPTQ) +
+        // tinyllama-1.1b-w4a16-ct (compressed-tensors INT4 slice).
+        assert_eq!(configs.len(), 14, "expected 14 Llama configs");
 
         // Ground-truth check on llama-3.2-1b. Published values:
         //   num_hidden_layers = 16

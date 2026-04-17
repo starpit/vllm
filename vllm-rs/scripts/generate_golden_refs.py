@@ -54,6 +54,14 @@ MODELS = {
     # sort_indices → gptq_repack_into perm path that Qwen2.5-0.5B and
     # Gemma2-2B don't reach (both ship desc_act=false).
     "tinyllama_1b_gptq_desc_act": "TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ",
+    # Compressed-tensors INT4 (Neural Magic / RedHatAI pack format) —
+    # exercises the `GptqLayout::WeightPacked` branch of the shared
+    # `MarlinLinear::load_gptq` / `load_gptq_concat` loaders. The
+    # loader sniffs `.weight_packed` + `.weight_scale`, transposes
+    # them back to AutoGPTQ-native `[K/8, N]` / `[num_groups, N]`
+    # before the same repack / permute pipeline AutoGPTQ goes
+    # through. Same uint4b8 bits end-to-end.
+    "tinyllama_1b_w4a16_ct": "nm-testing/TinyLlama-1.1B-Chat-v1.0-W4A16-e2e",
 }
 
 MAX_TOKENS = 32

@@ -55,12 +55,41 @@ pub enum StorageFormat {
     /// is symmetric, in which case zero points are baked into the
     /// GPTQ uint4b8 scalar type and the `.qzeros` tensor is
     /// discarded at load).
+    ///
+    /// `layout` selects between AutoGPTQ's native on-disk layout
+    /// (`.qweight [K/8, N]`, `.scales [num_groups, N]`) and
+    /// compressed-tensors' repack (`.weight_packed [N, K/8]`,
+    /// `.weight_scale [N, num_groups]`). Same uint4b8 bits either
+    /// way; the difference is tensor names + axis order, which the
+    /// loader transposes back to GPTQ-native before repack.
     Gptq {
         bits: u32,
         group_size: u32,
         desc_act: bool,
         sym: bool,
+        layout: GptqLayout,
     },
+}
+
+/// GPTQ on-disk layout — decides which tensor names + axis order the
+/// loader reads, and which fingerprint variant the compiled code
+/// sniffs at runtime.
+///
+/// Both layouts hold the same INT4 packing (uint4b8 for symmetric).
+/// `Qweight` is AutoGPTQ's native format. `WeightPacked` is Neural
+/// Magic / RedHatAI's compressed-tensors repack — same bits, shapes
+/// transposed to `[N, K/8]` / `[N, num_groups]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GptqLayout {
+    /// AutoGPTQ native: `.qweight` at `[K/8, N]`, `.scales` at
+    /// `[num_groups, N]`, optional `.qzeros` (consumed+discarded for
+    /// symmetric), optional `.g_idx` (for `desc_act`).
+    Qweight,
+    /// compressed-tensors: `.weight_packed` at `[N, K/8]`,
+    /// `.weight_scale` at `[N, num_groups]`, transposed before
+    /// `gptq_repack_into` so the downstream kernel call is identical.
+    /// CT doesn't emit `.g_idx` (it doesn't use activation ordering).
+    WeightPacked,
 }
 
 /// AutoAWQ's on-disk weight packing. The loader's repack behavior
@@ -103,6 +132,7 @@ pub enum QuantMethod {
         group_size: u32,
         desc_act: bool,
         sym: bool,
+        layout: GptqLayout,
     },
 }
 
@@ -170,11 +200,16 @@ impl QuantizationConfig {
         let method = match method_str {
             "awq" => parse_awq(obj)?,
             "gptq" => parse_gptq(obj)?,
+            "compressed-tensors" => parse_compressed_tensors(obj)?,
             other => return Err(ParseError::UnsupportedMethod(other.to_string())),
         };
 
+        // AWQ/GPTQ carry `modules_to_not_convert`; compressed-tensors
+        // carries the same list under `ignore`. Either field is
+        // accepted — whichever the upstream repo shipped.
         let modules_to_not_convert = obj
             .get("modules_to_not_convert")
+            .or_else(|| obj.get("ignore"))
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
@@ -296,7 +331,77 @@ fn parse_gptq(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantM
         group_size,
         desc_act,
         sym,
+        layout: GptqLayout::Qweight,
     })
+}
+
+/// Parse `quantization_config.quant_method == "compressed-tensors"`.
+///
+/// Neural Magic / RedHatAI's compressed-tensors format is a union of
+/// several storage formats selected by the tuple
+/// `(config_groups[*].weights.type, num_bits)`. Today ferrite handles
+/// only the INT4 group (`"int"` / `4`), which maps directly to GPTQ's
+/// uint4b8 packing on disk — just with `.weight_packed` /
+/// `.weight_scale` tensor names and `[N, K/8]` / `[N, num_groups]`
+/// shapes that the loader transposes back. FP8 groups (`"float"` /
+/// `8`) land in a later slice via their own `QuantMethod` variant.
+///
+/// Activation ordering (`desc_act`) is never used by compressed-
+/// tensors, so we pin it to `false`. Zero-point handling piggybacks
+/// on `symmetric` exactly like true GPTQ.
+fn parse_compressed_tensors(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<QuantMethod, ParseError> {
+    let config_groups =
+        obj.get("config_groups")
+            .and_then(|v| v.as_object())
+            .ok_or(ParseError::BadField {
+                field: "config_groups",
+                reason: "missing or not an object",
+            })?;
+    let group = config_groups.values().next().ok_or(ParseError::BadField {
+        field: "config_groups",
+        reason: "empty — no quantization group declared",
+    })?;
+    let weights = group.get("weights").ok_or(ParseError::BadField {
+        field: "config_groups.*.weights",
+        reason: "missing weights spec",
+    })?;
+
+    let weight_type = weights.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let weight_bits =
+        weights
+            .get("num_bits")
+            .and_then(|v| v.as_u64())
+            .ok_or(ParseError::BadField {
+                field: "config_groups.*.weights.num_bits",
+                reason: "missing or not a u64",
+            })? as u32;
+
+    // INT4 → GPTQ-compatible uint4b8 packing (compressed-tensors
+    // repack layout). FP8 + other formats land in later slices.
+    if weight_type == "int" && weight_bits == 4 {
+        let group_size = weights
+            .get("group_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(128) as u32;
+        let sym = weights
+            .get("symmetric")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        return Ok(QuantMethod::Gptq {
+            bits: 4,
+            group_size,
+            desc_act: false,
+            sym,
+            layout: GptqLayout::WeightPacked,
+        });
+    }
+
+    Err(ParseError::UnsupportedMethod(format!(
+        "compressed-tensors weights type={weight_type:?} num_bits={weight_bits} \
+         (ferrite today handles only INT4; FP8 and other types land in follow-on slices)",
+    )))
 }
 
 /// Resolve the storage format of a single weight by matching its
@@ -350,7 +455,9 @@ pub fn storage_format_for_weight(
     // untied and not listed in `modules_to_not_convert`. Safetensors
     // ship it as dense `lm_head.weight`. Without this rule, the
     // compiler emits a `load_gptq` on `lm_head` that can't find
-    // `.qweight` and the model fails to load.
+    // `.qweight` and the model fails to load. Covers both AutoGPTQ
+    // native and compressed-tensors INT4 (both fall through the
+    // `QuantMethod::Gptq` arm regardless of on-disk layout).
     if dotted == "lm_head" && matches!(qc.method, QuantMethod::Gptq { .. }) {
         return StorageFormat::Dense;
     }
@@ -398,11 +505,13 @@ pub fn storage_format_for_weight(
             group_size,
             desc_act,
             sym,
+            layout,
         } => StorageFormat::Gptq {
             bits,
             group_size,
             desc_act,
             sym,
+            layout,
         },
     }
 }
@@ -490,7 +599,8 @@ mod tests {
     #[test]
     fn parses_gptq_defaults() {
         // `desc_act` and `sym` default per AutoGPTQ: `sym = true`,
-        // `desc_act = false`.
+        // `desc_act = false`. `layout` is AutoGPTQ's native `.qweight`
+        // for any `quant_method: "gptq"`.
         let v = json(
             r#"{
                 "quantization_config": {
@@ -508,6 +618,7 @@ mod tests {
                 group_size: 128,
                 desc_act: false,
                 sym: true,
+                layout: GptqLayout::Qweight,
             }
         ));
     }
@@ -531,6 +642,7 @@ mod tests {
             QuantMethod::Gptq {
                 desc_act: true,
                 sym: false,
+                layout: GptqLayout::Qweight,
                 ..
             }
         ));
@@ -552,6 +664,65 @@ mod tests {
         );
         let qc = QuantizationConfig::parse(&v).unwrap().unwrap();
         assert!(matches!(qc.method, QuantMethod::Gptq { group_size: 0, .. }));
+    }
+
+    #[test]
+    fn parses_compressed_tensors_int4() {
+        // Neural Magic / RedHatAI compressed-tensors INT4: honored
+        // as GPTQ with `layout: WeightPacked`. `ignore` is CT's
+        // `modules_to_not_convert` spelling.
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "ignore": ["lm_head"],
+                    "config_groups": {
+                        "group_0": {
+                            "weights": {
+                                "type": "int",
+                                "num_bits": 4,
+                                "group_size": 128,
+                                "symmetric": true
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().expect("some");
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Gptq {
+                bits: 4,
+                group_size: 128,
+                desc_act: false,
+                sym: true,
+                layout: GptqLayout::WeightPacked,
+            }
+        ));
+        assert_eq!(qc.modules_to_not_convert, vec!["lm_head".to_string()]);
+    }
+
+    #[test]
+    fn rejects_compressed_tensors_non_int4() {
+        // FP8 + other CT variants are not yet supported — reject so
+        // they don't silently fall into the INT4 path.
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "config_groups": {
+                        "g": {
+                            "weights": {"type": "float", "num_bits": 8}
+                        }
+                    }
+                }
+            }"#,
+        );
+        assert!(matches!(
+            QuantizationConfig::parse(&v),
+            Err(ParseError::UnsupportedMethod(_))
+        ));
     }
 
     #[test]

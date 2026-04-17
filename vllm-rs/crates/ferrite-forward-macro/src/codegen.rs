@@ -99,6 +99,22 @@ enum FieldLoad {
     },
 }
 
+/// Emit the `GptqLayout` token stream that selects the loader's
+/// on-disk branch (native `.qweight` vs compressed-tensors
+/// `.weight_packed`). Used by both the single and concat GPTQ
+/// FieldLoad arms; the generated `MarlinLinear::load_gptq{,_concat}`
+/// consume it directly.
+fn gptq_layout_ts(layout: crate::quantization::GptqLayout) -> TokenStream {
+    match layout {
+        crate::quantization::GptqLayout::Qweight => {
+            quote! { ::ferrite_kernels::layers_quant::GptqLayout::Qweight }
+        }
+        crate::quantization::GptqLayout::WeightPacked => {
+            quote! { ::ferrite_kernels::layers_quant::GptqLayout::WeightPacked }
+        }
+    }
+}
+
 /// Per-storage-format parameters carried on a [`FieldLoad::MarlinLinear`].
 /// `group_size` lives on the outer struct because both formats share
 /// it; the enum captures the storage-specific bits.
@@ -111,6 +127,15 @@ enum MarlinFormat {
         /// to `gptq_repack_into` so same-group columns are
         /// contiguous post-repack.
         desc_act: bool,
+        /// On-disk layout — `Qweight` for AutoGPTQ native
+        /// (`.qweight [K/8, N]` + `.scales [num_groups, N]`) or
+        /// `WeightPacked` for compressed-tensors repack
+        /// (`.weight_packed [N, K/8]` + `.weight_scale [N,
+        /// num_groups]`). The loader transposes CT tensors before
+        /// `gptq_repack_into`, so the downstream kernel path is
+        /// identical regardless of which layout this variant came
+        /// from.
+        layout: crate::quantization::GptqLayout,
     },
 }
 
@@ -158,8 +183,9 @@ fn plan_field_load(
                 crate::quantization::StorageFormat::Gptq {
                     group_size: g,
                     desc_act,
+                    layout,
                     ..
-                } => (MarlinFormat::Gptq { desc_act }, g),
+                } => (MarlinFormat::Gptq { desc_act, layout }, g),
                 other => panic!(
                     "accessor `{}` declared `MarlinLinear` but source weight resolves to \
                      non-quantized storage ({other:?}) — solver picked a Marlin impl for a \
@@ -193,22 +219,35 @@ fn plan_field_load(
                             accessor.name,
                         );
                     }
-                    // desc_act also has to agree across sources —
-                    // `.g_idx` is shared at the K axis, so fused-QKV
-                    // sub-weights either all carry it or none do.
+                    // desc_act and on-disk layout have to agree
+                    // across sources — `.g_idx` is shared at the K
+                    // axis, so fused-QKV sub-weights either all
+                    // carry it or none do; a mixed AutoGPTQ /
+                    // compressed-tensors fusion would be an upstream
+                    // packaging error that would produce garbage
+                    // after the repack.
                     if let (
                         MarlinFormat::Gptq {
                             desc_act: existing_desc_act,
+                            layout: existing_layout,
                         },
-                        MarlinFormat::Gptq { desc_act },
+                        MarlinFormat::Gptq { desc_act, layout },
                     ) = (existing_mf, &mf)
-                        && *existing_desc_act != *desc_act
                     {
-                        panic!(
-                            "accessor `{}` fuses GPTQ sources with mismatched desc_act \
-                                 (saw {existing_desc_act} then {desc_act})",
-                            accessor.name,
-                        );
+                        if *existing_desc_act != *desc_act {
+                            panic!(
+                                "accessor `{}` fuses GPTQ sources with mismatched desc_act \
+                                     (saw {existing_desc_act} then {desc_act})",
+                                accessor.name,
+                            );
+                        }
+                        if *existing_layout != *layout {
+                            panic!(
+                                "accessor `{}` fuses GPTQ sources with mismatched layouts \
+                                     ({existing_layout:?} vs {layout:?})",
+                                accessor.name,
+                            );
+                        }
                     }
                 }
             }
@@ -388,10 +427,20 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
         .get("vocab_size")
         .unwrap_or_else(|| panic!("model `{}` missing `vocab_size`", model.source_stem));
 
-    let (suffix, opposite_suffix) = if model.quantization.is_some() {
-        ("qweight", "weight")
-    } else {
-        ("weight", "qweight")
+    // Pick the on-disk tensor suffix per compiled variant's
+    // `quantization_config`. AutoGPTQ + AWQ both ship `.qweight`;
+    // compressed-tensors INT4 ships `.weight_packed` with the axes
+    // transposed. Dense ships `.weight`. The `opposite_suffix` is
+    // the negative check — if a compiled dense variant sees
+    // `.qweight`, that's a quant model in disguise and the
+    // fingerprint should miss.
+    let (suffix, opposite_suffix) = match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(crate::quantization::QuantMethod::Gptq {
+            layout: crate::quantization::GptqLayout::WeightPacked,
+            ..
+        }) => ("weight_packed", "weight"),
+        Some(_) => ("qweight", "weight"),
+        None => ("weight", "qweight"),
     };
 
     let last_layer = num_hidden_layers.saturating_sub(1);
@@ -402,10 +451,19 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
     let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size as usize);
 
-    // Per-format qweight-shape gate. AWQ and GPTQ both live at
-    // `.qweight` but transpose their packing — so this gate is the
-    // only way to distinguish two compiled variants of the same
-    // arch+size that differ only in quantization method.
+    // Per-format qweight-shape gate. AWQ/GPTQ/CT all pack 4-bit
+    // weights but into different axis orders — this gate is the
+    // only way to distinguish compiled variants of the same
+    // arch+size that differ only in quantization method/layout.
+    //
+    //   AWQ            `.qweight`       [K, N/8]     → shape[0] == hidden
+    //   GPTQ  native   `.qweight`       [K/8, N]     → shape[0] == hidden/8
+    //   GPTQ  CT       `.weight_packed` [N, K/8]     → shape[0] == hidden (== N for q_proj, N==K)
+    //
+    // For q_proj specifically `N == K == hidden_size`, so the AWQ
+    // and CT gates coincide on `shape[0] == hidden_size`. The
+    // `suffix` picked above (`qweight` vs `weight_packed`) is what
+    // makes them disjoint — a CT model doesn't ship `.qweight`.
     let qweight_shape_gate: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
         Some(crate::quantization::QuantMethod::Awq { .. }) => {
             let k_lit = hidden_lit.clone();
@@ -417,12 +475,30 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
                 }
             }
         }
-        Some(crate::quantization::QuantMethod::Gptq { .. }) => {
+        Some(crate::quantization::QuantMethod::Gptq {
+            layout: crate::quantization::GptqLayout::Qweight,
+            ..
+        }) => {
             let k_packed = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize / 8);
             quote! {
                 match gw.tensor_info(#last_tensor) {
                     Some((shape, _))
                         if shape.len() == 2 && shape[0] == #k_packed => {}
+                    _ => return false,
+                }
+            }
+        }
+        Some(crate::quantization::QuantMethod::Gptq {
+            layout: crate::quantization::GptqLayout::WeightPacked,
+            ..
+        }) => {
+            // compressed-tensors `.weight_packed` is [N, K/8]. For
+            // q_proj N == hidden_size, so shape[0] == hidden.
+            let n_lit = hidden_lit.clone();
+            quote! {
+                match gw.tensor_info(#last_tensor) {
+                    Some((shape, _))
+                        if shape.len() == 2 && shape[0] == #n_lit => {}
                     _ => return false,
                 }
             }
@@ -595,28 +671,32 @@ fn emit_weights_struct(
                                 __device_id,
                             )?;
                         },
-                        (MarlinFormat::Gptq { desc_act }, true) => {
+                        (MarlinFormat::Gptq { desc_act, layout }, true) => {
                             let prefix = &prefixes[0];
                             let desc_act = *desc_act;
+                            let layout_ts = gptq_layout_ts(*layout);
                             quote! {
                                 let #name = ::ferrite_kernels::layers::MarlinLinear::load_gptq(
                                     gw,
                                     #prefix,
                                     #group_size,
                                     #desc_act,
+                                    #layout_ts,
                                     __marlin_ws,
                                     __device_id,
                                 )?;
                             }
                         }
-                        (MarlinFormat::Gptq { desc_act }, false) => {
+                        (MarlinFormat::Gptq { desc_act, layout }, false) => {
                             let desc_act = *desc_act;
+                            let layout_ts = gptq_layout_ts(*layout);
                             quote! {
                                 let #name = ::ferrite_kernels::layers::MarlinLinear::load_gptq_concat(
                                     gw,
                                     &[ #(#prefixes),* ],
                                     #group_size,
                                     #desc_act,
+                                    #layout_ts,
                                     __marlin_ws,
                                     __device_id,
                                 )?;

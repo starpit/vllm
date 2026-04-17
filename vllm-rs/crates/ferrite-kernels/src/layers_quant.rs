@@ -17,10 +17,15 @@
 //! time from `quantization_config.quant_method`; there's no runtime
 //! AWQ-vs-GPTQ branch in the generated loader.
 //!
-//! Compressed-tensors (the vLLM `compressed-tensors` pack format
-//! that mirrors GPTQ packing on a transposed layout) stays in
-//! `vllm-cuda::weights_quant` until ferrite grows its own
-//! `StorageFormat::CompressedTensors` variant.
+//! Compressed-tensors INT4 (Neural Magic / RedHatAI's INT4 pack
+//! format that mirrors GPTQ's uint4b8 packing on a transposed
+//! layout) is consumed through the same [`MarlinLinear::load_gptq`]
+//! / [`MarlinLinear::load_gptq_concat`] entry points — the caller
+//! passes [`GptqLayout::WeightPacked`] to select the `.weight_packed`
+//! / `.weight_scale` on-disk tensor names, and the loader
+//! transposes both back to GPTQ-native `[K/8, N]` / `[num_groups,
+//! N]` before `gptq_repack_into`. Everything past the transpose is
+//! bit-identical to AutoGPTQ.
 
 use anyhow::Result;
 use cudarc::driver::sys::CUstream;
@@ -32,6 +37,28 @@ use ferrite_cuda_core::tensor::GpuTensor;
 use ferrite_cuda_core::weights::GpuWeights;
 
 use crate::layers::MarlinLinear;
+
+/// GPTQ on-disk layout passed by ferrite-forward-emitted
+/// `Weights::load` bodies to [`MarlinLinear::load_gptq`] /
+/// [`MarlinLinear::load_gptq_concat`].
+///
+/// Both variants end up at the same `gptq_repack_into` kernel with
+/// the same `[K/8, N]` uint4b8 packed weight on GPU; the only thing
+/// the layout selects is which tensor names the loader reads from
+/// `GpuWeights` (and whether it transposes the bytes on the CPU
+/// before upload).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GptqLayout {
+    /// AutoGPTQ native: `.qweight [K/8, N]`, `.scales [num_groups,
+    /// N]`, optional `.qzeros` + `.g_idx`.
+    Qweight,
+    /// compressed-tensors INT4: `.weight_packed [N, K/8]`,
+    /// `.weight_scale [N, num_groups]`. No `.qzeros`, no `.g_idx`
+    /// (CT INT4 is always symmetric + never uses activation
+    /// ordering). The optional `.weight_shape` tensor is consumed
+    /// and discarded.
+    WeightPacked,
+}
 
 // ---------------------------------------------------------------------------
 // Marlin workspace
@@ -224,8 +251,31 @@ pub fn awq_to_marlin_zero_points(
 }
 
 // ---------------------------------------------------------------------------
-// CPU concat helpers used by fused loaders
+// CPU concat / transpose helpers used by fused loaders
 // ---------------------------------------------------------------------------
+
+/// Transpose a 2D CPU tensor `[rows, cols]` → `[cols, rows]` with
+/// element size `elem_size` bytes. Used by compressed-tensors INT4
+/// to flip `.weight_packed [N, K/8]` → `[K/8, N]` (GPTQ-native) and
+/// `.weight_scale [N, num_groups]` → `[num_groups, N]` before the
+/// shared repack / permute pipeline takes over.
+pub fn transpose_2d_cpu(data: &[u8], rows: usize, cols: usize, elem_size: usize) -> Vec<u8> {
+    assert_eq!(
+        data.len(),
+        rows * cols * elem_size,
+        "transpose_2d_cpu: data size mismatch (rows={rows} cols={cols} elem={elem_size})",
+    );
+    let mut out = vec![0u8; rows * cols * elem_size];
+    let row_bytes = cols * elem_size;
+    for r in 0..rows {
+        for c in 0..cols {
+            let src = r * row_bytes + c * elem_size;
+            let dst = c * rows * elem_size + r * elem_size;
+            out[dst..dst + elem_size].copy_from_slice(&data[src..src + elem_size]);
+        }
+    }
+    out
+}
 
 /// Concatenate multiple 2D CPU tensors along dim 1 (output/N).
 /// All tensors must share dim 0 and dtype; row-interleaves the bytes.
@@ -604,18 +654,28 @@ impl MarlinLinear {
         prefix: &str,
         group_size: usize,
         desc_act: bool,
+        layout: GptqLayout,
         workspace: GpuTensor,
         device_id: i32,
     ) -> Result<Self> {
         let stream = weights.stream();
 
-        let qw_name = format!("{prefix}.qweight");
+        // Pick the on-disk tensor names per layout. The GPTQ path
+        // reads `.qweight` directly; compressed-tensors repacks into
+        // `.weight_packed` with transposed axes.
+        let qw_name = match layout {
+            GptqLayout::Qweight => format!("{prefix}.qweight"),
+            GptqLayout::WeightPacked => format!("{prefix}.weight_packed"),
+        };
         let (qw_shape, _qw_dtype) = weights
             .tensor_info(&qw_name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {qw_name}"))?;
-        // GPTQ: [K/8, N]
-        let size_k = qw_shape[0] * 8;
-        let size_n = qw_shape[1];
+        let (size_k, size_n) = match layout {
+            // AutoGPTQ: [K/8, N]
+            GptqLayout::Qweight => (qw_shape[0] * 8, qw_shape[1]),
+            // compressed-tensors: [N, K/8]
+            GptqLayout::WeightPacked => (qw_shape[1] * 8, qw_shape[0]),
+        };
         let num_groups = if group_size > 0 {
             size_k / group_size
         } else {
@@ -624,6 +684,7 @@ impl MarlinLinear {
 
         // GPTQ symmetric stores zero points on disk as a formality.
         // Python vLLM never passes them to Marlin — consume and drop.
+        // compressed-tensors INT4 symmetric skips `.qzeros` entirely.
         let qzeros_name = format!("{prefix}.qzeros");
         if weights.contains(&qzeros_name) {
             let _ = weights.take(&qzeros_name);
@@ -631,6 +692,8 @@ impl MarlinLinear {
 
         // Handle g_idx for desc_act (activation ordering) BEFORE
         // repack — repack needs `perm` (sort_indices) on GPU.
+        // compressed-tensors never uses desc_act (parser pins it to
+        // `false`), so this branch is a no-op for that layout.
         let g_idx_name = format!("{prefix}.g_idx");
         let (g_idx_gpu, sort_indices_gpu, has_act_order) = if desc_act
             && weights.contains(&g_idx_name)
@@ -677,7 +740,29 @@ impl MarlinLinear {
         };
 
         // Upload qweight → GPU, repack GPTQ → Marlin, free original.
-        let qweight_gpu = weights.take(&qw_name)?;
+        // For compressed-tensors we CPU-transpose from [N, K/8] to
+        // [K/8, N] on the way up so the repack kernel sees GPTQ-
+        // native axes. `.weight_shape` (if present) is consumed and
+        // discarded.
+        let qweight_gpu = match layout {
+            GptqLayout::Qweight => weights.take(&qw_name)?,
+            GptqLayout::WeightPacked => {
+                let (qw_bytes, shape_ct, qw_dtype) = weights.take_cpu(&qw_name)?;
+                let n = shape_ct[0];
+                let k_packed = shape_ct[1];
+                let transposed = transpose_2d_cpu(&qw_bytes, n, k_packed, qw_dtype.size_bytes());
+                let shape_name = format!("{prefix}.weight_shape");
+                if weights.contains(&shape_name) {
+                    let _ = weights.take_cpu(&shape_name);
+                }
+                let nbytes = transposed.len();
+                let ptr = unsafe { driver::mem_alloc(nbytes)? };
+                unsafe {
+                    driver::memcpy_htod_async(ptr, transposed.as_ptr(), nbytes, stream)?;
+                }
+                unsafe { GpuTensor::new(ptr, &[k_packed, n], qw_dtype) }
+            }
+        };
         let num_u32 = size_k * size_n / 8;
         let repack_nbytes = num_u32 * std::mem::size_of::<u32>();
         let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
@@ -693,15 +778,35 @@ impl MarlinLinear {
                 stream,
             );
             driver::stream_synchronize(stream)?;
-            weights.unrecord_alloc(qweight_gpu.raw_ptr());
+            // `weights.take` records the alloc; CT path's raw
+            // `mem_alloc` above does not. Only unrecord when the
+            // loader took ownership through `GpuWeights`.
+            if matches!(layout, GptqLayout::Qweight) {
+                weights.unrecord_alloc(qweight_gpu.raw_ptr());
+            }
             driver::mem_free(qweight_gpu.raw_ptr())?;
         }
         let qweight_marlin = unsafe { GpuTensor::new(repack_ptr, &[num_u32], DType::U32) };
 
-        // Scales: CPU-load → Marlin permute → upload.
-        let scales_name = format!("{prefix}.scales");
-        let (scales_bytes, _scales_shape, scales_dtype) = weights.take_cpu(&scales_name)?;
-        let mut scales_u16: Vec<u16> = scales_bytes
+        // Scales: CPU-load → Marlin permute → upload. CT stores
+        // `.weight_scale` at `[N, num_groups]` — transpose to match
+        // AutoGPTQ's `[num_groups, N]` before the permute.
+        let (scales_bytes_raw, scales_dtype) = match layout {
+            GptqLayout::Qweight => {
+                let scales_name = format!("{prefix}.scales");
+                let (bytes, _shape, dtype) = weights.take_cpu(&scales_name)?;
+                (bytes, dtype)
+            }
+            GptqLayout::WeightPacked => {
+                let ct_scales = format!("{prefix}.weight_scale");
+                let (bytes, shape, dtype) = weights.take_cpu(&ct_scales)?;
+                let sc_n = shape[0];
+                let sc_groups = shape[1];
+                let transposed = transpose_2d_cpu(&bytes, sc_n, sc_groups, dtype.size_bytes());
+                (transposed, dtype)
+            }
+        };
+        let mut scales_u16: Vec<u16> = scales_bytes_raw
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
@@ -766,6 +871,7 @@ impl MarlinLinear {
         prefixes: &[&str],
         group_size: usize,
         desc_act: bool,
+        layout: GptqLayout,
         workspace: GpuTensor,
         device_id: i32,
     ) -> Result<Self> {
@@ -782,21 +888,55 @@ impl MarlinLinear {
         let mut bias_dtype: Option<DType> = None;
 
         for (i, prefix) in prefixes.iter().enumerate() {
-            let qw_name = format!("{prefix}.qweight");
-            qw_parts.push(weights.take_cpu(&qw_name)?);
+            match layout {
+                GptqLayout::Qweight => {
+                    let qw_name = format!("{prefix}.qweight");
+                    qw_parts.push(weights.take_cpu(&qw_name)?);
 
-            let scales_name = format!("{prefix}.scales");
-            sc_parts.push(weights.take_cpu(&scales_name)?);
+                    let scales_name = format!("{prefix}.scales");
+                    sc_parts.push(weights.take_cpu(&scales_name)?);
+                }
+                GptqLayout::WeightPacked => {
+                    // compressed-tensors: `.weight_packed [N, K/8]` →
+                    // transpose to `[K/8, N]` to match GPTQ-native
+                    // before concat-along-dim-1. Same transpose on
+                    // `.weight_scale [N, num_groups]` → `[num_groups,
+                    // N]`.
+                    let qw_name = format!("{prefix}.weight_packed");
+                    let (qw_bytes, qw_shape, qw_dtype) = weights.take_cpu(&qw_name)?;
+                    let n = qw_shape[0];
+                    let k_packed = qw_shape[1];
+                    let transposed =
+                        transpose_2d_cpu(&qw_bytes, n, k_packed, qw_dtype.size_bytes());
+                    qw_parts.push((transposed, vec![k_packed, n], qw_dtype));
+
+                    let sc_name = format!("{prefix}.weight_scale");
+                    let (sc_bytes, sc_shape, sc_dtype) = weights.take_cpu(&sc_name)?;
+                    let sc_n = sc_shape[0];
+                    let sc_groups = sc_shape[1];
+                    let sc_transposed =
+                        transpose_2d_cpu(&sc_bytes, sc_n, sc_groups, sc_dtype.size_bytes());
+                    sc_parts.push((sc_transposed, vec![sc_groups, sc_n], sc_dtype));
+
+                    let shape_name = format!("{prefix}.weight_shape");
+                    if weights.contains(&shape_name) {
+                        let _ = weights.take_cpu(&shape_name);
+                    }
+                }
+            }
 
             // Symmetric GPTQ: consume-and-discard `.qzeros` if
             // present. Marlin's `uint4b8` bakes in the bias=8 zp.
+            // compressed-tensors INT4 symmetric doesn't ship qzeros.
             let qzeros_name = format!("{prefix}.qzeros");
             if weights.contains(&qzeros_name) {
                 let _ = weights.take_cpu(&qzeros_name);
             }
 
             // `.g_idx` shared across fused sub-weights — read from
-            // first prefix, consume from the rest.
+            // first prefix, consume from the rest. CT doesn't use
+            // activation ordering; `desc_act` is pinned to `false`
+            // by the parser, so this branch is inert for CT.
             let g_idx_name = format!("{prefix}.g_idx");
             if weights.contains(&g_idx_name) {
                 if i == 0 && desc_act {

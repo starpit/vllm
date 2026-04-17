@@ -1289,16 +1289,18 @@ pub fn starter_library() -> ImplementationLibrary {
     }
     lib.push(Box::new(CutlassGemvImpl));
 
-    // ── Marlin (AWQ) impls ──────────────────────────────────────
+    // ── Marlin (AWQ / GPTQ) impls ───────────────────────────────
     //
     // Active only on models whose `quantization_config` resolves at
-    // least one weight to `StorageFormat::Awq { .. }`. Each matcher
-    // gates on AWQ storage, so they're no-ops on dense models — the
-    // dense fused impls claim the same patterns for `Dense`
-    // weights. Registered after the Cutlass zoo so they land with
-    // the rest of the matmul kernels.
+    // least one weight to a Marlin-consumable storage format
+    // (`StorageFormat::Awq { .. }` or `StorageFormat::Gptq { .. }`).
+    // Each matcher gates on quant storage, so they're no-ops on
+    // dense models — the dense fused impls claim the same patterns
+    // for `Dense` weights. Registered after the Cutlass zoo so they
+    // land with the rest of the matmul kernels.
     lib.push(Box::new(MarlinGemmImpl));
     lib.push(Box::new(MarlinFusedGateUpSiluMulImpl));
+    lib.push(Box::new(MarlinFusedGateUpGeluMulImpl));
     lib.push(Box::new(MarlinFusedQkvRopeCacheImpl));
     lib.push(Box::new(MarlinFusedQkvRopePrefillImpl));
     lib
@@ -5094,6 +5096,174 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
                     device.compute_stream,
                 );
                 ::ferrite_kernels::kernels::silu_and_mul_fused(
+                    *gate_up,
+                    #intermediate,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+/// Marlin fused gate/up GELU mul — the Marlin counterpart of
+/// [`FusedGateUpGeluMulImpl`] for Gemma2-style MLPs. Same 4-tile
+/// (gate_gemm, up_gemm, Gelu, Mul) pattern as the Silu variant;
+/// the diff is the activation op. Emits one `MarlinLinear::forward`
+/// on a fused gate+up accessor, followed by
+/// `gelu_and_mul_fused` — exactly what the dense GELU path does,
+/// but reading from a MarlinLinear instead of a dense LinearLayer.
+#[derive(Debug, Default)]
+pub struct MarlinFusedGateUpGeluMulImpl;
+
+impl Implementation for MarlinFusedGateUpGeluMulImpl {
+    fn name(&self) -> &'static str {
+        "marlin_fused_gate_up_gelu_mul"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Mirror of `FusedGateUpGeluMulImpl.matches`; the only
+        // structural change is the storage gate: BOTH Gemms must be
+        // Marlin-consumable (AWQ or GPTQ).
+        let gate_gemm = fuf.get(seed);
+        if !is_marlin_gemm(fuf, seed) {
+            return None;
+        }
+        let gelu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Gelu && consumes_tile(n, seed))?;
+        let gelu_id = gelu_node.id;
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, gelu_id))?;
+        let mul_id = mul_node.id;
+        let up_gemm_id = mul_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != gelu_id => Some(*id),
+            _ => None,
+        })?;
+        if !is_marlin_gemm(fuf, up_gemm_id) {
+            return None;
+        }
+        if first_tile_input(gate_gemm)? != first_tile_input(fuf.get(up_gemm_id))? {
+            return None;
+        }
+        let mut claimed = [seed, up_gemm_id, gelu_id, mul_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        let activation_tile = first_tile_input(gate_gemm)?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation_tile],
+            boundary_outputs: vec![mul_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedGateUpGeluMulImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        // Structurally identical to `FusedGateUpGeluMulImpl::emit_call`
+        // and to the Silu Marlin variant; only the activation kernel
+        // name changes.
+        let gelu_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gelu)
+            .expect("fused gate/up/gelu/mul claim must contain Gelu");
+        let mul_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
+            .expect("fused gate/up/gelu/mul claim must contain Mul");
+        let (gate_id, _) =
+            first_tile_input(ctx.fuf.get(gelu_id)).expect("gelu has a tile input — the gate gemm");
+        let up_id = ctx
+            .claimed_tiles
+            .iter()
+            .copied()
+            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
+            .expect("claim contains a second Gemm — the up gemm");
+
+        let activation = ctx.input_expr(gate_id, 0);
+
+        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
+        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
+        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let mul_out = ctx.output_ident(mul_id, 0);
+        let intermediate = ctx.bound("intermediate_size") as usize;
+
+        quote! {
+            let #mul_out = unsafe {
+                let gate_up = (#weight_expr).forward(
+                    #activation,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                ::ferrite_kernels::kernels::gelu_and_mul_fused(
                     *gate_up,
                     #intermediate,
                     &mut device.caching,

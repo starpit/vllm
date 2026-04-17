@@ -96,6 +96,31 @@ async fn test_cuda_correctness_llama_3_2_1b_awq() {
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
+async fn test_cuda_correctness_gemma2_2b_gptq() {
+    // GPTQ Gemma2-2B via ferrite — exercises MarlinFusedGateUpGeluMulImpl
+    // (new, landed alongside this test) on top of the alternating
+    // sliding/full attention + softcap stack. Golden generated from
+    // Python vLLM on `qilowoq/gemma-2-2B-it-4Bit-GPTQ`.
+    run_correctness_test(TestModels::GEMMA2_2B_GPTQ_INT4, "gemma2_2b_gptq").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_tinyllama_1b_gptq_desc_act() {
+    // GPTQ TinyLlama-1.1B-Chat-v0.3 — exercises the desc_act=true
+    // code path (g_idx argsort + sort_indices → gptq_repack_into perm)
+    // that Qwen2.5-0.5B-GPTQ and Gemma2-2B-GPTQ skip (both desc_act=false).
+    run_correctness_test(
+        TestModels::TINYLLAMA_1B_GPTQ_DESC_ACT,
+        "tinyllama_1b_gptq_desc_act",
+    )
+    .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn test_cuda_correctness_qwen2_0_5b_gptq() {
     // GPTQ Qwen2.5-0.5B via the ferrite-forward Marlin* impl family
     // + `ferrite_kernels::layers_quant::MarlinLinear::load_gptq` /

@@ -46,6 +46,14 @@ MODELS = {
     # storage-vs-compute split as AWQ: the kernel is identical post-
     # repack; only the loader differs.
     "qwen2_0_5b_gptq": "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4",
+    # Gemma2 GPTQ — same loader, different arch (alternating
+    # sliding/full attention + GELU MLP + softcap). Proves ferrite's
+    # GPTQ plumbing is arch-agnostic.
+    "gemma2_2b_gptq": "qilowoq/gemma-2-2B-it-4Bit-GPTQ",
+    # TinyLlama GPTQ desc_act=true — exercises the g_idx argsort +
+    # sort_indices → gptq_repack_into perm path that Qwen2.5-0.5B and
+    # Gemma2-2B don't reach (both ship desc_act=false).
+    "tinyllama_1b_gptq_desc_act": "TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ",
 }
 
 MAX_TOKENS = 32

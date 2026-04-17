@@ -311,12 +311,18 @@ fn parse_gptq(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantM
 ///    Gemm at the lm_head tile shares the embedding buffer via
 ///    [`crate::codegen::FieldLoad::LinearTiedToEmbedding`] and must
 ///    stay dense.
-/// 4. The weight is never consumed by a `Gemm` tile in the FUF. AWQ
-///    metadata only applies to matmul weights (qweight/scales/qzeros
-///    triples). `Embedding`, `RmsNorm`, biases, etc. stay `Dense`.
+/// 4. The weight is `lm_head` AND the quant method is GPTQ —
+///    AutoGPTQ's convention is that `lm_head` is never quantized
+///    (safetensors ship it as plain `lm_head.weight` dense). This
+///    applies whether or not `modules_to_not_convert` was set
+///    explicitly; AutoGPTQ simply skips lm_head unconditionally.
+/// 5. The weight is never consumed by a `Gemm` tile in the FUF.
+///    Quant metadata only applies to matmul weights
+///    (qweight/scales/qzeros/g_idx triples). `Embedding`, `RmsNorm`,
+///    biases, etc. stay `Dense`.
 ///
 /// Otherwise the method's parameters (bits/group_size/…) are carried
-/// through into `StorageFormat::Awq{..}`.
+/// through into `StorageFormat::Awq{..}` or `StorageFormat::Gptq{..}`.
 pub fn storage_format_for_weight(
     program: &Program,
     fuf: &Fuf,
@@ -337,6 +343,15 @@ pub fn storage_format_for_weight(
     // Tied lm_head: no on-disk `lm_head.*`; the codegen FieldLoad
     // shares the embedding buffer as a dense LinearLayer.
     if dotted == "lm_head" && model.tie_word_embeddings {
+        return StorageFormat::Dense;
+    }
+
+    // AutoGPTQ convention: `lm_head` is never quantized, even when
+    // untied and not listed in `modules_to_not_convert`. Safetensors
+    // ship it as dense `lm_head.weight`. Without this rule, the
+    // compiler emits a `load_gptq` on `lm_head` that can't find
+    // `.qweight` and the model fails to load.
+    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Gptq { .. }) {
         return StorageFormat::Dense;
     }
 

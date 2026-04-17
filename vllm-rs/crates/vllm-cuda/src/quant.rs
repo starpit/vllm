@@ -445,7 +445,12 @@ fn parse_raw_config(raw: RawQuantConfig) -> Result<QuantConfig> {
         }
     }
 
-    let method = raw.quant_method.as_deref().unwrap_or("");
+    // AutoGPTQ's native `quantize_config.json` often omits the
+    // `quant_method` field (it's implicitly GPTQ — that's the file's
+    // format). AWQ's `quant_config.json` always sets
+    // `quant_method: "awq"`. So an absent/empty method defaults to
+    // GPTQ for parity with Python vLLM's detection.
+    let method = raw.quant_method.as_deref().unwrap_or("gptq");
     match method {
         "awq" => Ok(QuantConfig::Awq(AwqConfig {
             bits: raw.bits,

@@ -232,3 +232,20 @@ async fn test_cuda_correctness_command_r_1l() {
     // checkpoints are gated.
     run_correctness_test(TestModels::COMMAND_R_1L_CUDA, "command_r_1l").await;
 }
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_mistral_7b_instruct_v0_3() {
+    // Mistral-7B-Instruct-v0.3 via ferrite — dense bf16, `sliding_window=null`.
+    // Exercises `ferrite-models/src/mistral.rs` (structurally identical
+    // to llama.rs) against the per-arch manifest under
+    // `vllm-rs/model_architectures/mistral/` (v0.2 / v0.3 / Nemo). The
+    // Nemo config in that manifest is what broke the
+    // `hidden_size == num_attention_heads * head_dim` coincidence, so
+    // `self_attn.o_proj` / `q_proj` / `v_proj` / `k_proj` resolve
+    // through `head_dim * num_(attention|key_value)_heads` rather than
+    // `hidden_size`. Golden generated from Python vLLM on
+    // `unsloth/mistral-7b-instruct-v0.3`.
+    run_correctness_test(TestModels::MISTRAL, "mistral_7b_instruct_v0_3").await;
+}

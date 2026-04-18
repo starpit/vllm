@@ -78,6 +78,11 @@ MODELS = {
     # Trained weights → real logprob signal, token-equivalence test
     # catches actual math bugs.
     "command_r_1l": "Citaman/command-r-1-layer",
+    # Mistral-7B-Instruct-v0.3 — dense bf16, `sliding_window=null`.
+    # Matches `TestModels::MISTRAL`. First Mistral-arch golden;
+    # exercises the non-sliding branch of ferrite-models/src/mistral.rs
+    # against Python vLLM's `MistralForCausalLM`.
+    "mistral_7b_instruct_v0_3": "unsloth/mistral-7b-instruct-v0.3",
 }
 
 MAX_TOKENS = 32

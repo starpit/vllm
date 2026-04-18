@@ -21,5 +21,6 @@ pub mod gemma2;
 pub mod gemma3;
 pub mod granite;
 pub mod llama;
+pub mod mistral;
 pub mod qwen2;
 pub mod qwen3;

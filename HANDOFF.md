@@ -24,23 +24,26 @@
   (both now deleted; see commit `5b9fd90ef`).
 - **End-state proof**: `timeout 60 vllm chat --model=<small-llama>`
   produces coherent output through the new compiler at perf parity
-  with the existing path. Correctness is **proven** for 12 golden
+  with the existing path. Correctness is **proven** for 13 golden
   tests via `cargo test -p vllm-e2e --features e2e,cuda --release
   --test e_correctness -- --ignored --test-threads=1`:
   SmolLM-135M, Qwen2.5-0.5B, Gemma2-2B, Granite-3.3-2B, Qwen3-0.6B,
   Gemma3-1B (dense; one prompt's golden hacked, see follow-ups);
-  Command-R-1L (dense Cohere); Llama-3.2-1B-AWQ (AWQ);
-  Qwen2.5-0.5B-GPTQ, Gemma2-2B-GPTQ, TinyLlama-1.1B-GPTQ-desc-act
-  (GPTQ native); TinyLlama-1.1B-W4A16-e2e (compressed-tensors INT4
-  — `GptqLayout::WeightPacked`); Qwen3-0.6B-bnb-4bit (BitsAndBytes
-  NF4, loosened late-divergence threshold for bnb's different
-  dequant-GEMM accumulation order). Perf: cutlass tile zoo +
-  CSV-driven selection landed in commit `b43bb85b9`.
+  Command-R-1L (dense Cohere); Mistral-7B-Instruct-v0.3 (dense
+  Mistral — non-sliding variants v0.2/v0.3/Nemo; v0.1/Zephyr
+  `sliding_window=4096` still hand-written, see follow-ups);
+  Llama-3.2-1B-AWQ (AWQ); Qwen2.5-0.5B-GPTQ, Gemma2-2B-GPTQ,
+  TinyLlama-1.1B-GPTQ-desc-act (GPTQ native); TinyLlama-1.1B-W4A16-e2e
+  (compressed-tensors INT4 — `GptqLayout::WeightPacked`);
+  Qwen3-0.6B-bnb-4bit (BitsAndBytes NF4, loosened late-divergence
+  threshold for bnb's different dequant-GEMM accumulation order).
+  Perf: cutlass tile zoo + CSV-driven selection landed in commit
+  `b43bb85b9`.
 - **Method**: port the working old ferrite verbatim, detoxifying
   as you port. Do not rewrite mechanisms that already work.
 - **Current state, honest version**: scaffolding AND correctness
   both green. Dense-bf16 Llama, Qwen2, Gemma2, Granite, Qwen3,
-  Gemma3, and Command-R all route through ferrite via
+  Gemma3, Command-R, and Mistral all route through ferrite via
   `CudaModel::Ferrite(Box<FerriteModel>)` in
   `cuda_worker.rs` (collapsed from the per-arch `*Ferrite` variants). Decode attention uses the
   `attention_decode_from_cache` wrapper (so span rotation + fp8 KV
@@ -813,6 +816,76 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 ```
 
 ## Next session starts here
+
+**Mistral bringup landed clean — zero DSL extensions needed.** The
+body at `ferrite-models/src/mistral.rs` is a verbatim copy of
+`llama.rs` math; every structural difference from Llama is handled by
+existing machinery (bounds, auto-registry, shape inference).
+`test_cuda_correctness_mistral_7b_instruct_v0_3` green on
+`unsloth/mistral-7b-instruct-v0.3` against a Python-vLLM golden on
+the standard 8 prompts. One late-divergence warning at prompt 4 /
+position 2 (`"In"` vs `"Title"`, both in each other's top-N) within
+the threshold=10 tolerance every golden runs under. Total correctness
+goldens now: 13 — dense + quant combined (see TL;DR).
+
+**What landed for Mistral**:
+
+- **No new `OpKind` variants, no new Impls, no codegen changes.**
+  The DSL body reuses Llama's verbs only. Every per-model difference
+  (`rope_theta` in `{1e4, 1e6}`, `vocab_size` in `{32000, 32768,
+  131072}`, `tie_word_embeddings=false`, layer count) rides on
+  existing bound plumbing + the weights manifest.
+- **`ferrite-models/src/mistral.rs`** — `#[forward] fn mistral()
+  { ... }` identical math to `llama()`, with a scope-docstring
+  explaining why sliding Mistral (v0.1, Zephyr) is out of scope.
+  Added `pub mod mistral;` to lib.rs.
+- **`model_architectures/mistral/`** — probe-weights generated
+  `mistral-7b-v0.2.json` + `mistral-7b-instruct-v0.3.json` +
+  `mistral-nemo-instruct-2407.json` + `weights.json`. All three have
+  `sliding_window: null`, so no sliding-window DSL knob is needed;
+  rope_theta baked per-size from config (1e6 for 7B-v0.2/v0.3/Nemo).
+- **Probe set deliberately includes Mistral-Nemo** (`hidden_size=5120,
+  head_dim=128, heads=32`), which breaks the 7B coincidence
+  `hidden_size == num_attention_heads * head_dim` (4096 = 32 × 128).
+  Without Nemo in the cross-size probe, the formula picker would
+  have collapsed `self_attn.{q,o,v,k}_proj`'s
+  `head_dim * num_{attention,key_value}_heads` dim to the shorter
+  `hidden_size` form (valid on 7B, WRONG on Nemo). With Nemo in the
+  set, only the `head_dim * …` form resolves consistently across
+  sizes and survives `pick_formula_for_dim`. This is the
+  disambiguation mechanism the probe-weights design was built around;
+  Mistral is the first arch where it actually mattered for
+  correctness.
+- **`vllm-e2e/tests/e_correctness.rs`** — added
+  `test_cuda_correctness_mistral_7b_instruct_v0_3` pointing at
+  `TestModels::MISTRAL` (`unsloth/mistral-7b-instruct-v0.3`).
+- **`scripts/generate_golden_refs.py`** — added
+  `"mistral_7b_instruct_v0_3"` entry.
+
+Zero `cuda_worker.rs` edits — auto-registry from `30661e397` held
+up with no changes across the new arch.
+
+**Solver topology matches Llama at equivalent depth** (build
+observations from compile log):
+
+| Model | Tiles | Waves | Llama-equivalent |
+|---|---|---|---|
+| mistral-7b-v0.2 | 483 | 227 | llama-2-7b / llama-3-8b (32 layers) |
+| mistral-7b-instruct-v0.3 | 483 | 227 | same |
+| mistral-nemo-instruct-2407 | 603 | 283 | llama-2-13b (40 layers) |
+
+This is the strongest possible structural signal that the body is
+doing Llama math: the DP-chosen wave counts match the Llama bodies
+one-for-one at the same config depth.
+
+**Out of scope this commit (explicit deferral, not oversight)**:
+`sliding_window=4096` Mistral (v0.1 + Zephyr-7b-beta) routes to the
+hand-written path via `Ok(None)` fingerprint miss. Landing it would
+require either (a) a new bound-gated sliding primitive in the DSL
+(`if sliding_window > 0 { sliding_attention(...) }` — closed grammar
+doesn't admit `>` predicates today), or (b) a split arch
+(`mistral_sliding` subdir with its own DSL body). Neither has a
+`TestModels` consumer yet; revisit when one lands.
 
 **Command-R (CohereForCausalLM) bringup landed clean.** ferrite
 correctness golden passes against Python vLLM on real bf16-trained

@@ -60,6 +60,28 @@ pub enum GptqLayout {
     WeightPacked,
 }
 
+/// Unified runtime quant-format spec. Ferrite-forward-emitted
+/// `Weights::load_with(gw, stream, storage: MarlinFormat)` threads
+/// the variant's knobs through a single [`MarlinLinear::load`] /
+/// [`MarlinLinear::load_concat`] call per accessor. Dispatch on
+/// storage happens inside the kernel crate — every AWQ/GPTQ/CT
+/// variant in the same equivalence class shares one emitted load
+/// body, with `MarlinFormat` as the only thing that differs per-
+/// variant (a const the variant's one-line `load()` wrapper passes
+/// to the canonical `load_with`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarlinFormat {
+    /// AutoAWQ 4-bit — `.qweight [K, N/8]` + `.qzeros` + `.scales`.
+    Awq { group_size: u32 },
+    /// AutoGPTQ / compressed-tensors 4-bit uint4b8. `layout` selects
+    /// the on-disk tensor names + transpose.
+    Gptq {
+        group_size: u32,
+        desc_act: bool,
+        layout: GptqLayout,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Marlin workspace
 // ---------------------------------------------------------------------------
@@ -335,6 +357,72 @@ pub fn fuse_bias_parts(
 // ---------------------------------------------------------------------------
 
 impl MarlinLinear {
+    /// Unified runtime-dispatched loader. Dispatches to
+    /// [`Self::load_awq`] / [`Self::load_gptq`] based on the
+    /// variant's `MarlinFormat`. Ferrite-forward-emitted
+    /// `Weights::load_with(gw, stream, storage)` calls this with a
+    /// single static shape per accessor regardless of quant
+    /// method, so the emitted load-body compiles to a single
+    /// canonical function per (arch, size, Impl-family)
+    /// equivalence class — one rustc-optimized copy shared by
+    /// every AWQ/GPTQ/CT variant in that class.
+    pub fn load(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        storage: MarlinFormat,
+        workspace: GpuTensor,
+        device_id: i32,
+    ) -> Result<Self> {
+        match storage {
+            MarlinFormat::Awq { group_size } => {
+                Self::load_awq(weights, prefix, group_size as usize, workspace, device_id)
+            }
+            MarlinFormat::Gptq {
+                group_size,
+                desc_act,
+                layout,
+            } => Self::load_gptq(
+                weights,
+                prefix,
+                group_size as usize,
+                desc_act,
+                layout,
+                workspace,
+                device_id,
+            ),
+        }
+    }
+
+    /// Unified fused-accessor loader — dispatches to
+    /// `load_awq_concat` / `load_gptq_concat` on `MarlinFormat`.
+    /// Same shared-body rationale as [`Self::load`].
+    pub fn load_concat(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        storage: MarlinFormat,
+        workspace: GpuTensor,
+        device_id: i32,
+    ) -> Result<Self> {
+        match storage {
+            MarlinFormat::Awq { group_size } => {
+                Self::load_awq_concat(weights, prefixes, group_size as usize, workspace, device_id)
+            }
+            MarlinFormat::Gptq {
+                group_size,
+                desc_act,
+                layout,
+            } => Self::load_gptq_concat(
+                weights,
+                prefixes,
+                group_size as usize,
+                desc_act,
+                layout,
+                workspace,
+                device_id,
+            ),
+        }
+    }
+
     /// Load one AWQ-packed INT4 weight and repack to Marlin's tiled layout.
     ///
     /// Reads `{prefix}.qweight` / `.scales` / `.qzeros` (optional `.bias`)

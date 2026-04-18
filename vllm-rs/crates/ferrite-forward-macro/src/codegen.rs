@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::Ident;
 
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
@@ -668,10 +669,52 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
         None => quote! {},
     };
 
+    // GPTQ-Qweight desc_act disambiguation. With overlay fan-out we
+    // synthesize BOTH `gptq-sym` (desc_act=false) and
+    // `gptq-sym-desc_act` (desc_act=true) variants per dense base —
+    // both have the same `.qweight [K/8, N]` shape gate above. The
+    // `.g_idx` tensor is what the runtime actually needs to
+    // disambiguate: AutoGPTQ ships it iff desc_act=true (it encodes
+    // the activation-order permutation the loader passes to
+    // `gptq_repack_into`). desc_act=false repos either omit `.g_idx`
+    // or carry it inert; we treat presence as the signal that
+    // selects the desc_act=true variant. Without this disambiguation
+    // the alphabetically-earlier `gptq-sym` would win for a
+    // desc_act=true repo, threading `desc_act=false` through
+    // `MarlinFormat::Gptq` and producing garbage weights.
+    let g_idx_disambiguation: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(crate::quantization::QuantMethod::Gptq {
+            desc_act,
+            layout: crate::quantization::GptqLayout::Qweight,
+            ..
+        }) => {
+            let g_idx_tensor = "model.layers.0.self_attn.q_proj.g_idx";
+            if *desc_act {
+                quote! {
+                    if !gw.contains(#g_idx_tensor) {
+                        return false;
+                    }
+                }
+            } else {
+                quote! {
+                    if gw.contains(#g_idx_tensor) {
+                        return false;
+                    }
+                }
+            }
+        }
+        _ => quote! {},
+    };
+
     quote! {
         /// Return `true` iff the tensors in `gw` match this
         /// variant's compile-time fingerprint. See
         /// `emit_fingerprint_check` in the macro for the rules.
+        /// Emitted as a free fn (not `Weights::fingerprint_matches`
+        /// method) so shim variants can alias `Weights` to a
+        /// canonical sibling while still carrying a variant-
+        /// specific fingerprint check.
+        #[cfg(feature = "cuda")]
         pub fn fingerprint_matches(
             gw: &::ferrite_cuda_core::weights::GpuWeights,
         ) -> bool {
@@ -701,12 +744,24 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
                 return false;
             }
             #qweight_shape_gate
+            #g_idx_disambiguation
             true
         }
     }
 }
 
-/// Emit the `Weights` struct definition + its `load` method.
+/// `emit_weights_struct` has two modes. `Canonical` defines its own
+/// `pub struct Weights { ... }`; `Shim { canonical }` aliases the
+/// struct to the canonical sibling module's Weights (for cross-
+/// variant forward-fn dedup) while still emitting this variant's
+/// own `load` + `fingerprint_matches` bodies.
+pub(crate) enum WeightsEmitMode<'a> {
+    Canonical,
+    Shim { canonical: &'a Ident },
+}
+
+/// Emit the `Weights` struct definition (or alias) + its `load` +
+/// `fingerprint_matches` free fns.
 fn emit_weights_struct(
     program: &Program,
     fuf: &Fuf,
@@ -714,6 +769,7 @@ fn emit_weights_struct(
     lib: &ImplementationLibrary,
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
+    mode: WeightsEmitMode<'_>,
 ) -> TokenStream {
     let accessors = match collect_accessors(program, fuf, sfufs, lib) {
         Ok(a) => a,
@@ -846,65 +902,37 @@ fn emit_weights_struct(
                         )
                     );
                 },
-                FieldLoad::MarlinLinear {
-                    prefixes,
-                    format,
-                    group_size,
-                } => {
-                    let group_size = *group_size as usize;
+                FieldLoad::MarlinLinear { prefixes, .. } => {
+                    // Every Marlin accessor emits the SAME call
+                    // shape regardless of AWQ/GPTQ/CT: the runtime
+                    // `MarlinFormat` discriminator is threaded in
+                    // from `load_with`'s `marlin_storage` param.
+                    // That's what lets cross-variant load-body
+                    // dedup collapse AWQ/GPTQ/CT variants of the
+                    // same (arch, size) to one canonical `load_with`
+                    // body — only the `marlin_storage` const each
+                    // variant's one-line `load` passes differs.
                     let single = prefixes.len() == 1;
-                    match (format, single) {
-                        (MarlinFormat::Awq, true) => {
-                            let prefix = &prefixes[0];
-                            quote! {
-                                let #name = ::ferrite_kernels::layers::MarlinLinear::load_awq(
-                                    gw,
-                                    #prefix,
-                                    #group_size,
-                                    __marlin_ws,
-                                    __device_id,
-                                )?;
-                            }
-                        }
-                        (MarlinFormat::Awq, false) => quote! {
-                            let #name = ::ferrite_kernels::layers::MarlinLinear::load_awq_concat(
+                    if single {
+                        let prefix = &prefixes[0];
+                        quote! {
+                            let #name = ::ferrite_kernels::layers::MarlinLinear::load(
                                 gw,
-                                &[ #(#prefixes),* ],
-                                #group_size,
+                                #prefix,
+                                marlin_storage,
                                 __marlin_ws,
                                 __device_id,
                             )?;
-                        },
-                        (MarlinFormat::Gptq { desc_act, layout }, true) => {
-                            let prefix = &prefixes[0];
-                            let desc_act = *desc_act;
-                            let layout_ts = gptq_layout_ts(*layout);
-                            quote! {
-                                let #name = ::ferrite_kernels::layers::MarlinLinear::load_gptq(
-                                    gw,
-                                    #prefix,
-                                    #group_size,
-                                    #desc_act,
-                                    #layout_ts,
-                                    __marlin_ws,
-                                    __device_id,
-                                )?;
-                            }
                         }
-                        (MarlinFormat::Gptq { desc_act, layout }, false) => {
-                            let desc_act = *desc_act;
-                            let layout_ts = gptq_layout_ts(*layout);
-                            quote! {
-                                let #name = ::ferrite_kernels::layers::MarlinLinear::load_gptq_concat(
-                                    gw,
-                                    &[ #(#prefixes),* ],
-                                    #group_size,
-                                    #desc_act,
-                                    #layout_ts,
-                                    __marlin_ws,
-                                    __device_id,
-                                )?;
-                            }
+                    } else {
+                        quote! {
+                            let #name = ::ferrite_kernels::layers::MarlinLinear::load_concat(
+                                gw,
+                                &[ #(#prefixes),* ],
+                                marlin_storage,
+                                __marlin_ws,
+                                __device_id,
+                            )?;
                         }
                     }
                 }
@@ -1079,41 +1107,151 @@ fn emit_weights_struct(
         quote! {}
     };
 
-    quote! {
-        /// Every weight the emitted forward needs, already packed
-        /// exactly how the solver-picked Impls want to see it.
-        ///
-        /// Construct via [`Self::load`]. Hand the resulting struct
-        /// to [`forward`] by reference.
-        #[cfg(feature = "cuda")]
-        pub struct Weights {
-            #(#fields)*
-            #rotary_local_field
-        }
+    // Struct definition vs type alias per emit mode.
+    let weights_def: TokenStream = match &mode {
+        WeightsEmitMode::Canonical => quote! {
+            /// Every weight the emitted forward needs, already
+            /// packed exactly how the solver-picked Impls want to
+            /// see it. Construct via the sibling free `load` fn.
+            #[cfg(feature = "cuda")]
+            pub struct Weights {
+                #(#fields)*
+                #rotary_local_field
+            }
+        },
+        WeightsEmitMode::Shim { canonical } => quote! {
+            /// This variant's emitted forward + load bodies are
+            /// byte-identical to the canonical sibling's (same
+            /// solver-picked `Impl` set → same emit, and Marlin
+            /// quant format threads through at runtime via
+            /// `load_with`'s `marlin_storage` param). We share
+            /// the canonical's `Weights` via type alias; per-
+            /// variant state is just `load` (a one-liner
+            /// calling `canonical::load_with(MY_MARLIN_FORMAT)`)
+            /// and `fingerprint_matches`.
+            #[cfg(feature = "cuda")]
+            pub type Weights = super::#canonical::Weights;
+        },
+    };
+    let weights_ctor: TokenStream = match &mode {
+        WeightsEmitMode::Canonical => quote! { Weights },
+        WeightsEmitMode::Shim { canonical } => quote! { super::#canonical::Weights },
+    };
 
-        #[cfg(feature = "cuda")]
-        impl Weights {
+    let marlin_fmt = marlin_format_literal(model);
+
+    // Canonical emits the full `load_with(marlin_storage)` body +
+    // a thin `load()` wrapper that passes this variant's Marlin
+    // format literal. Shim variants skip `load_with` entirely —
+    // they just thread their own MarlinFormat into the canonical
+    // sibling's `load_with`. rustc doesn't re-monomorphize the
+    // shim's one-line delegation body, so the expensive load
+    // compile work (N_layers × N_accessors lines) runs ONCE per
+    // equivalence class.
+    match &mode {
+        WeightsEmitMode::Canonical => quote! {
+            #weights_def
+
             #fingerprint_method
 
             /// Read every field from an open `GpuWeights` (a
-            /// safetensors view). Fused accessors stream their
-            /// source weights directly into one packed GPU buffer
-            /// without intermediate allocation.
+            /// safetensors view). The canonical per-equivalence-
+            /// class load body, parameterized on
+            /// `marlin_storage` so AWQ/GPTQ/CT variants share
+            /// one compiled copy. Non-Marlin equivalence classes
+            /// ignore the param; it's still threaded for uniform
+            /// signature across `load_with` across archs.
+            #[cfg(feature = "cuda")]
             #[allow(clippy::too_many_lines, unused_variables)]
-            pub fn load(
+            pub fn load_with(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
-            ) -> ::anyhow::Result<Self> {
+                marlin_storage: ::ferrite_kernels::layers_quant::MarlinFormat,
+            ) -> ::anyhow::Result<Weights> {
                 #marlin_prelude
                 #bnb4_prelude
                 #(#lets)*
                 #rotary_local_load
-                Ok(Self {
+                Ok(#weights_ctor {
                     #(#field_shorthand,)*
                     #rotary_local_init
                 })
             }
+
+            /// Variant-facing entry point. Threads this compiled
+            /// variant's `MarlinFormat` into the shared
+            /// `load_with` body. rustc inlines this wrapper
+            /// trivially; no codegen overhead.
+            #[cfg(feature = "cuda")]
+            #[inline]
+            pub fn load(
+                gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
+                stream: ::ferrite_cuda_core::CUstream,
+            ) -> ::anyhow::Result<Weights> {
+                load_with(gw, stream, #marlin_fmt)
+            }
+        },
+        WeightsEmitMode::Shim { canonical } => quote! {
+            #weights_def
+
+            #fingerprint_method
+
+            /// Shim loader — single-line call-through to the
+            /// canonical sibling's `load_with` with this
+            /// variant's `MarlinFormat` threaded in. No body
+            /// emit; rustc compiles the canonical's `load_with`
+            /// once and every shim in the equivalence class
+            /// shares it.
+            #[cfg(feature = "cuda")]
+            #[inline]
+            pub fn load(
+                gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
+                stream: ::ferrite_cuda_core::CUstream,
+            ) -> ::anyhow::Result<Weights> {
+                super::#canonical::load_with(gw, stream, #marlin_fmt)
+            }
+        },
+    }
+}
+
+/// Emit the `MarlinFormat` const this variant's `load` passes into
+/// the (canonical or shared) `load_with` body. For non-Marlin
+/// variants (dense / BNB4 / FP8 later) the value is still a valid
+/// `MarlinFormat` — the `load_with` body just doesn't reference
+/// `marlin_storage`, so the const is never read.
+fn marlin_format_literal(model: &ModelParams) -> TokenStream {
+    use crate::quantization::QuantMethod;
+    match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(QuantMethod::Awq { group_size, .. }) => {
+            let gs = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            quote! {
+                ::ferrite_kernels::layers_quant::MarlinFormat::Awq { group_size: #gs }
+            }
         }
+        Some(QuantMethod::Gptq {
+            group_size,
+            desc_act,
+            layout,
+            ..
+        }) => {
+            let gs = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let da = *desc_act;
+            let layout_ts = gptq_layout_ts(*layout);
+            quote! {
+                ::ferrite_kernels::layers_quant::MarlinFormat::Gptq {
+                    group_size: #gs,
+                    desc_act: #da,
+                    layout: #layout_ts,
+                }
+            }
+        }
+        // Dense / BNB4 / other: emit a placeholder; `load_with` in
+        // those equivalence classes never reads the param. Keeping
+        // a non-unit value here means the emitted const is well-
+        // typed regardless of arch / quant family.
+        _ => quote! {
+            ::ferrite_kernels::layers_quant::MarlinFormat::Awq { group_size: 128 }
+        },
     }
 }
 
@@ -1486,6 +1624,17 @@ fn bucket_fn_ident(prefix: &str, wp: crate::solver::WorkloadPoint) -> proc_macro
 
 /// Emit the full per-model module body: Weights struct + loader,
 /// one forward fn per workload bucket, and a dispatching wrapper.
+///
+/// When `canonical_override` is `Some(ident)`, this variant is a
+/// shim for that canonical sibling — emit `pub type Weights =
+/// super::<ident>::Weights;` instead of a fresh struct, emit the
+/// variant-specific `load` + `fingerprint_matches` bodies
+/// (loaders differ per quant preset, fingerprints differ per
+/// tensor-suffix gate), and `pub use` the canonical's forward +
+/// forward_backbone + per-bucket forward_m_<N> fns. rustc doesn't
+/// re-monomorphize `pub use` re-exports, so the canonical fn body
+/// is optimized ONCE regardless of how many variants share it.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_model(
     program: &Program,
     model: &ModelParams,
@@ -1494,8 +1643,20 @@ pub fn emit_model(
     loops: &WorkloadLoops,
     lib: &ImplementationLibrary,
     manifest: &crate::weights_manifest::WeightsManifest,
+    canonical_override: Option<&Ident>,
 ) -> TokenStream {
-    let weights = emit_weights_struct(program, fuf, sfufs, lib, model, manifest);
+    if let Some(canonical) = canonical_override {
+        return emit_shim_model(program, fuf, sfufs, lib, model, manifest, canonical);
+    }
+    let weights = emit_weights_struct(
+        program,
+        fuf,
+        sfufs,
+        lib,
+        model,
+        manifest,
+        WeightsEmitMode::Canonical,
+    );
 
     // Group workload points by SFUF signature (sorted subgraph → impl).
     // Buckets with identical impl picks produce byte-identical fn
@@ -1721,3 +1882,73 @@ pub fn emit_model(
 /// being deleted from downstream call sites.
 #[allow(dead_code)]
 fn _unused(_: OpKind) {}
+
+/// Emit a shim variant module: one whose forward-fn bodies are
+/// byte-identical to a canonical sibling's. Instead of re-emitting
+/// the bodies (which rustc would LLVM-optimize independently per
+/// variant, compounding release-build time multiplicatively), we:
+///
+/// - `pub type Weights = super::<canonical>::Weights;` — share the
+///   same struct layout; variants in the same equivalence class
+///   end up wrapping the same concrete type at the arch-dispatcher
+///   level, which is fine for `enum Outer { V1(T), V2(T) }`.
+/// - `pub fn fingerprint_matches` — VARIANT-specific. The
+///   tensor-suffix gate (e.g. dense `.weight` vs AWQ `.qweight` vs
+///   CT `.weight_packed` vs BNB4 `.weight.absmax`) differs per
+///   variant, so each ships its own sniff.
+/// - `pub fn load` — VARIANT-specific. The loader calls
+///   `MarlinLinear::load_awq` vs `load_gptq` vs
+///   `Bnb4bitLinear::load` etc. depending on the variant's
+///   `quantization_config`, but constructs the same canonical
+///   `Weights` struct at the end (same accessor shapes across the
+///   equivalence class).
+/// - `pub use super::<canonical>::{forward, forward_backbone,
+///   forward_m_<N>, forward_backbone_m_<N>, ...};` — no fn-body
+///   re-emit. rustc doesn't re-monomorphize `pub use` paths, so
+///   the canonical's release-optimized forward is called directly
+///   through this module without additional LLVM work.
+fn emit_shim_model(
+    program: &Program,
+    fuf: &Fuf,
+    sfufs: &WorkloadAssignments,
+    lib: &ImplementationLibrary,
+    model: &ModelParams,
+    manifest: &crate::weights_manifest::WeightsManifest,
+    canonical: &Ident,
+) -> TokenStream {
+    let weights = emit_weights_struct(
+        program,
+        fuf,
+        sfufs,
+        lib,
+        model,
+        manifest,
+        WeightsEmitMode::Shim { canonical },
+    );
+
+    // Per-bucket fn names the canonical emits. We re-export each
+    // by name so downstream code that takes a fn pointer to
+    // `<shim>::forward_m_64` resolves through to the canonical's
+    // compiled body without any additional fn-pointer indirection.
+    let mut bucket_names: Vec<Ident> = Vec::new();
+    for wp in sfufs.per_workload.keys() {
+        bucket_names.push(bucket_fn_ident("forward_m", *wp));
+        bucket_names.push(bucket_fn_ident("forward_backbone_m", *wp));
+    }
+    // Deterministic order for build reproducibility.
+    bucket_names.sort_by_key(|a| a.to_string());
+    bucket_names.dedup_by(|a, b| a == b);
+
+    quote! {
+        #weights
+
+        // Top-level dispatchers + per-bucket fns all live on the
+        // canonical sibling; re-export by name so `<shim>::forward`
+        // and `<shim>::forward_m_64` both resolve transparently to
+        // the canonical's compiled body.
+        #[cfg(feature = "cuda")]
+        pub use super::#canonical::{forward, forward_backbone};
+        #[cfg(feature = "cuda")]
+        pub use super::#canonical::{#(#bucket_names),*};
+    }
+}

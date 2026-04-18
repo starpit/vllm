@@ -8207,6 +8207,7 @@ mod tests {
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
+            extra_tracked_paths: Vec::new(),
         };
 
         let scale = attention_scale_for(&model);

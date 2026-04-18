@@ -3,7 +3,6 @@
     "LlamaForCausalLM"
   ],
   "attention_bias": false,
-  "attention_dropout": 0.0,
   "bos_token_id": 1,
   "eos_token_id": 2,
   "head_dim": 64,
@@ -17,20 +16,13 @@
   "num_attention_heads": 32,
   "num_hidden_layers": 22,
   "num_key_value_heads": 4,
-  "pad_token_id": 0,
   "pretraining_tp": 1,
-  "quantization_config": {
-    "bits": 4,
-    "group_size": 128,
-    "quant_method": "gptq",
-    "desc_act": true,
-    "sym": true
-  },
   "rms_norm_eps": 1e-05,
+  "rope_scaling": null,
   "rope_theta": 10000.0,
   "tie_word_embeddings": false,
-  "torch_dtype": "float16",
-  "transformers_version": "4.34.0.dev0",
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.35.0",
   "use_cache": true,
-  "vocab_size": 32003
+  "vocab_size": 32000
 }

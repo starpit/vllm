@@ -1,0 +1,3 @@
+{
+  "quantizations": ["bnb-nf4-dq"]
+}

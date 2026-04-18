@@ -65,6 +65,14 @@ pub struct ModelParams {
     /// [`ferrite_forward::FerriteArchRegistration`] registration,
     /// driving the runtime `try_load(..., arch_hint)` dispatch.
     pub architectures: Vec<String>,
+    /// Extra JSON files that contributed to this variant's final
+    /// config — the quantization preset and per-size override
+    /// files that the loader deep-merged onto the dense base.
+    /// Empty for dense variants; populated for synthesized
+    /// `<size>-<preset>` variants. The `#[forward]` macro adds
+    /// each to its `include_str!` tracking list so cargo rebuilds
+    /// on any overlay/override edit, not just on dense-base edits.
+    pub extra_tracked_paths: Vec<PathBuf>,
 }
 
 /// Errors produced while loading configs.
@@ -87,6 +95,10 @@ pub enum ConfigError {
         path: PathBuf,
         source: crate::quantization::ParseError,
     },
+    BadQuantizations {
+        path: PathBuf,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -101,19 +113,41 @@ impl std::fmt::Display for ConfigError {
             Self::Quantization { path, source } => {
                 write!(f, "quantization_config in {}: {source}", path.display())
             }
+            Self::BadQuantizations { path, reason } => {
+                write!(f, "{}: {reason}", path.display())
+            }
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
 
-/// Load every `*.json` file in `dir` as a `ModelParams`. Results
-/// are sorted alphabetically by file stem for build determinism.
+/// Load every `*.json` file in `dir` as a `ModelParams`, then
+/// synthesize additional `<size>-<preset>` variants for every
+/// `quantizations.json`-declared preset × dense base. Dense bases,
+/// preset overlays, and optional `<size>-<preset>.overrides.json`
+/// files are deep-merged at load time.
+///
+/// Files skipped from the dense-base scan:
+/// - `weights.json` — per-arch shape manifest, loaded separately.
+/// - `quantizations.json` — preset declaration list.
+/// - `*.overrides.json` — per-(size, preset) drift overrides
+///   applied during synthesis.
+///
+/// Overlay presets are looked up under `<dir>/../quantizations/`
+/// (sibling of the arch directory). Each preset's JSON fragment
+/// deep-merges onto the base — typically just
+/// `{quantization_config: {...}}`, but any top-level field is
+/// allowed.
+///
+/// Results are sorted alphabetically by file stem for build
+/// determinism; synthesized variants appear after their base.
 pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
     if !dir.is_dir() {
         return Err(ConfigError::NotADirectory(dir.to_path_buf()));
     }
-    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+
+    let all_json: Vec<PathBuf> = fs::read_dir(dir)
         .map_err(|source| ConfigError::Io {
             path: dir.to_path_buf(),
             source,
@@ -121,28 +155,120 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-        // `weights.json` is the per-arch shape manifest loaded by
-        // `weights_manifest::load_or_empty`, not a model config.
-        // Filter it out of the per-model scan.
-        .filter(|p| p.file_name().and_then(|s| s.to_str()) != Some("weights.json"))
         .collect();
-    // Sort by file stem, not full PathBuf. `PathBuf::cmp` compares
-    // byte-by-byte including the extension, which puts
-    // `llama-3.2-1b-awq.json` before `llama-3.2-1b.json` (hyphen
-    // 0x2D < dot 0x2E). Stem-sort keeps the natural
-    // `llama-3.2-1b, llama-3.2-1b-awq` ordering and keeps every
-    // existing config's position unchanged.
-    paths.sort_by(|a, b| {
+
+    let is_overrides = |p: &Path| {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.ends_with(".overrides.json"))
+            .unwrap_or(false)
+    };
+
+    let mut base_paths: Vec<PathBuf> = all_json
+        .iter()
+        .filter(|p| {
+            let name = p.file_name().and_then(|s| s.to_str());
+            !matches!(name, Some("weights.json") | Some("quantizations.json")) && !is_overrides(p)
+        })
+        .cloned()
+        .collect();
+    base_paths.sort_by(|a, b| {
         a.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .cmp(b.file_stem().and_then(|s| s.to_str()).unwrap_or(""))
     });
-    paths.iter().map(|p| load_file(p)).collect()
+
+    let mut out: Vec<ModelParams> = Vec::new();
+    // Remember each base's raw JSON so we can deep-merge overlays
+    // onto it without re-reading and without copying the ModelParams
+    // structure (synthesized variants have different bounds/quant
+    // and need to re-parse from the merged raw JSON).
+    let mut base_raw: Vec<(PathBuf, String, serde_json::Value)> = Vec::new();
+    for p in &base_paths {
+        let (raw, json) = read_json_file(p)?;
+        let stem = stem_of(p)?;
+        let model = model_params_from_json(&json, &stem, p, Vec::new())?;
+        base_raw.push((p.clone(), stem, json));
+        out.push(model);
+        let _ = raw;
+    }
+
+    // Overlay synthesis. Each arch's `quantizations.json` is a flat
+    // list of preset names; every listed preset fans out across
+    // every dense base in the arch to produce one compiled variant
+    // per `(size, preset)` pair. Per-HF-repo drift (e.g.
+    // TinyLlama-GPTQ's vocab_size=32003 vs the dense base's 32000)
+    // lands as `<size>-<preset>.overrides.json` files that deep-
+    // merge last.
+    //
+    // Universal fan-out is only compile-affordable because codegen
+    // does cross-variant forward-fn deduplication — variants with
+    // identical Impl-set signatures share one emitted body. Without
+    // that dedup, N sizes × M presets quickly blow up release-build
+    // LLVM work.
+    let quantizations_path = dir.join("quantizations.json");
+    if quantizations_path.exists() {
+        let (_, qjson) = read_json_file(&quantizations_path)?;
+        let presets: Vec<String> = qjson
+            .get("quantizations")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| ConfigError::BadQuantizations {
+                path: quantizations_path.clone(),
+                reason: "expected `{\"quantizations\": [\"<preset>\", ...]}` string array",
+            })?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+
+        // Presets live at `<arch_parent>/quantizations/<preset>.json`.
+        let preset_root = dir
+            .parent()
+            .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?
+            .join("quantizations");
+
+        for preset_name in &presets {
+            let preset_path = preset_root.join(format!("{preset_name}.json"));
+            let (_, preset_json) = read_json_file(&preset_path)?;
+
+            for (base_path, base_stem, base_json) in &base_raw {
+                let variant_stem = format!("{base_stem}-{preset_name}");
+                let override_path = dir.join(format!("{variant_stem}.overrides.json"));
+
+                let mut merged = base_json.clone();
+                deep_merge(&mut merged, &preset_json);
+                let mut extra_tracked = vec![preset_path.clone()];
+                if override_path.exists() {
+                    let (_, override_json) = read_json_file(&override_path)?;
+                    deep_merge(&mut merged, &override_json);
+                    extra_tracked.push(override_path);
+                }
+
+                let variant =
+                    model_params_from_json(&merged, &variant_stem, base_path, extra_tracked)?;
+                out.push(variant);
+            }
+        }
+    }
+
+    // Keep the final list sorted by stem so emitted
+    // arch-dispatcher arm order stays deterministic across
+    // `quantizations.json` edits.
+    out.sort_by(|a, b| a.source_stem.cmp(&b.source_stem));
+    Ok(out)
 }
 
-/// Load a single config.json.
+/// Load a single config.json as a dense-base ModelParams.
 pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
+    let (_, json) = read_json_file(path)?;
+    let stem = stem_of(path)?;
+    model_params_from_json(&json, &stem, path, Vec::new())
+}
+
+/// Read + parse a JSON file, returning the raw string (for
+/// diagnostics) and the parsed `Value`. Centralized so
+/// `ConfigError::{Io, Json}` always carry the right path.
+fn read_json_file(path: &Path) -> Result<(String, serde_json::Value), ConfigError> {
     let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
@@ -152,25 +278,46 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
             path: path.to_path_buf(),
             source,
         })?;
+    Ok((contents, json))
+}
 
-    let source_stem = path
-        .file_stem()
+/// Extract a `Path::file_stem` as a String, erroring if it's
+/// missing or non-UTF-8 (neither should happen on real disks;
+/// guards against the `*.json.bak` / `~` editor-swap case).
+fn stem_of(path: &Path) -> Result<String, ConfigError> {
+    path.file_stem()
         .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
         .ok_or_else(|| ConfigError::BadStem {
             path: path.to_path_buf(),
             reason: "file has no stem or non-UTF-8 stem",
-        })?
-        .to_string();
-    let name = stem_to_ident(&source_stem).map_err(|reason| ConfigError::BadStem {
-        path: path.to_path_buf(),
+        })
+}
+
+/// Build a `ModelParams` from an already-parsed JSON value (possibly
+/// the result of deep-merging a dense base with a quantization
+/// preset + per-size overrides). `source_stem` is the variant name
+/// that ends up on the generated Weights enum variant + inventory
+/// registration. `source_path` points at the dense base for
+/// synthesized variants; `extra_tracked_paths` carries the preset +
+/// override files so the `#[forward]` macro can `include_str!` them
+/// for cargo change detection.
+fn model_params_from_json(
+    json: &serde_json::Value,
+    source_stem: &str,
+    source_path: &Path,
+    extra_tracked_paths: Vec<PathBuf>,
+) -> Result<ModelParams, ConfigError> {
+    let name = stem_to_ident(source_stem).map_err(|reason| ConfigError::BadStem {
+        path: source_path.to_path_buf(),
         reason,
     })?;
-    let mut bounds = extract_bounds(&json);
+    let mut bounds = extract_bounds(json);
     derive_implicit_bounds(&mut bounds);
-    let scalars = extract_scalars(&json);
-    let quantization = crate::quantization::QuantizationConfig::parse(&json).map_err(|e| {
+    let scalars = extract_scalars(json);
+    let quantization = crate::quantization::QuantizationConfig::parse(json).map_err(|e| {
         ConfigError::Quantization {
-            path: path.to_path_buf(),
+            path: source_path.to_path_buf(),
             source: e,
         }
     })?;
@@ -190,14 +337,35 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
 
     Ok(ModelParams {
         name,
-        source_stem,
-        source_path: path.to_path_buf(),
+        source_stem: source_stem.to_string(),
+        source_path: source_path.to_path_buf(),
         bounds,
         scalars,
         quantization,
         tie_word_embeddings,
         architectures,
+        extra_tracked_paths,
     })
+}
+
+/// Recursive deep-merge of JSON objects. When both sides agree on
+/// a key whose value is an object, merge keys recursively; else
+/// the overlay wins at that leaf. Used to stack a dense base with
+/// a quantization preset (+ optional per-size overrides) into one
+/// final variant JSON.
+fn deep_merge(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    use serde_json::Value;
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                let entry = base_map.entry(k.clone()).or_insert(Value::Null);
+                deep_merge(entry, v);
+            }
+        }
+        (slot, overlay_val) => {
+            *slot = overlay_val.clone();
+        }
+    }
 }
 
 /// Every top-level integer field becomes a bound. Anything else
@@ -342,12 +510,18 @@ mod tests {
         let dir = repo_model_archs().join("llama");
         let configs = load_dir(&dir).expect("load llama configs");
 
-        // 9 Llama configs (405B gated, skipped) + smollm2-135m +
-        // smollm2-360m (second size gives `probe-weights` cross-size
-        // disambiguation) + llama-3.2-1b-awq (AWQ end-to-end slice) +
-        // tinyllama-1.1b-gptq-desc-act (first desc_act=true GPTQ) +
-        // tinyllama-1.1b-w4a16-ct (compressed-tensors INT4 slice).
-        assert_eq!(configs.len(), 14, "expected 14 Llama configs");
+        // 12 dense bases (9 Llama + 2 smollm2 + 1 tinyllama) ×
+        // (1 dense + 4 quant presets from `quantizations.json`:
+        //  awq-gemm, gptq-sym, gptq-sym-desc_act, ct-int4-sym) = 60.
+        // Individual sizes don't always have real HF repos in every
+        // preset (e.g. Llama-2-70B-AWQ exists, Llama-2-7B-CT doesn't
+        // per say), but the compiler emits variants for all of them
+        // so fingerprint dispatch stays open-set at runtime.
+        assert_eq!(
+            configs.len(),
+            60,
+            "expected 60 Llama variants (12 bases × 5 variants)"
+        );
 
         // Ground-truth check on llama-3.2-1b. Published values:
         //   num_hidden_layers = 16
@@ -378,7 +552,12 @@ mod tests {
     fn load_real_qwen2_configs() {
         let dir = repo_model_archs().join("qwen2");
         let configs = load_dir(&dir).expect("load qwen2 configs");
-        assert_eq!(configs.len(), 13, "expected 13 Qwen2 configs");
+        // 11 dense × (1 dense + 2 presets: awq-gemm, gptq-sym) = 33.
+        assert_eq!(
+            configs.len(),
+            33,
+            "expected 33 Qwen2 variants (11 bases × 3 variants)"
+        );
 
         // Ground-truth check on Qwen2-0.5B:
         //   num_hidden_layers    = 24

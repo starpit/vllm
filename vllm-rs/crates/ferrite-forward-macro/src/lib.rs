@@ -139,6 +139,68 @@ impl Parse for ForwardArgs {
 /// an error naming every directory it checked.
 /// Format a microsecond value adaptively for human scanning:
 /// `<1000µs` as `Nµs`, `<100ms` as `N.Xms`, else `Nms`.
+/// Cross-variant forward-fn dedup. Returns a map `variant_idx →
+/// canonical_module_ident`, where `canonical_module_ident` is the
+/// module name of the variant chosen to carry the full emitted
+/// forward-fn bodies for its equivalence class. Variants whose
+/// canonical is themselves emit full bodies; others emit shims.
+///
+/// The key — what makes two variants' forward fn bodies
+/// byte-identical — is:
+/// 1. The arch's DSL (always shared within a `#[forward]` call).
+/// 2. The variant's integer `bounds` (baked as literals in
+///    `ctx.bound(...)` and the unroll trip counts).
+/// 3. The variant's float `scalars` (baked as literals in
+///    `attention_scale_for` / similar).
+/// 4. The SFUF per workload point (which `Impl` runs at each
+///    subgraph → whose `emit_call` output lands in the body).
+///
+/// Among AWQ / GPTQ / CT variants of the same dense base, items
+/// 1-3 are identical and item 4 collapses because they all resolve
+/// to `Marlin*Impl`. Dense + BNB4 stay separate because their
+/// `Impl` picks differ from Marlin's and from each other's.
+///
+/// Canonical selection: the variant with the earliest
+/// `source_stem` in the equivalence class wins. Deterministic
+/// across macro re-expansions so cargo's incremental cache stays
+/// stable.
+fn compute_canonical_variants(
+    solved: &[impl HasSolvedSig],
+) -> std::collections::HashMap<usize, Ident> {
+    let mut by_sig: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, sm) in solved.iter().enumerate() {
+        by_sig.entry(sm.dedup_signature()).or_default().push(i);
+    }
+
+    let mut out: std::collections::HashMap<usize, Ident> = std::collections::HashMap::new();
+    for members in by_sig.values() {
+        // Pick the member with the alphabetically-earliest stem as
+        // canonical. All other members point to it.
+        let mut ordered = members.clone();
+        ordered.sort_by_key(|&i| solved[i].source_stem().to_string());
+        let canonical_idx = ordered[0];
+        let canonical_ident = Ident::new(
+            solved[canonical_idx].model_name(),
+            proc_macro2::Span::call_site(),
+        );
+        for &idx in &ordered {
+            out.insert(idx, canonical_ident.clone());
+        }
+    }
+    out
+}
+
+/// Trait over the per-variant fields `compute_canonical_variants`
+/// needs; implemented inline on the `SolvedModel` wrapper inside
+/// `forward_impl`. Keeps the helper callable without plumbing the
+/// concrete `SolvedModel` type through.
+trait HasSolvedSig {
+    fn dedup_signature(&self) -> String;
+    fn source_stem(&self) -> &str;
+    fn model_name(&self) -> &str;
+}
+
 fn fmt_us(us: f64) -> String {
     if us < 1000.0 {
         format!("{us:.0}µs")
@@ -273,20 +335,103 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     // and cargo rebuilds the caller when any of them change. Works
     // on stable; no build.rs or nightly feature required.
     let mut tracked: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut tracked_paths: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
     for m in &models {
-        let p = m.source_path.to_string_lossy().into_owned();
-        let lit = syn::LitStr::new(&p, proc_macro2::Span::call_site());
-        tracked.push(quote! { const _: &str = include_str!(#lit); });
+        tracked_paths.insert(m.source_path.clone());
+        for extra in &m.extra_tracked_paths {
+            tracked_paths.insert(extra.clone());
+        }
     }
-    {
-        let p = target_path.to_string_lossy().into_owned();
-        let lit = syn::LitStr::new(&p, proc_macro2::Span::call_site());
+    // Arch-level metadata files: the weights manifest and the
+    // quantization preset declaration. They influence compiled
+    // output (manifest shapes, synthesized variant set) without
+    // being per-variant source paths.
+    let quantizations_path = models_dir.join("quantizations.json");
+    if quantizations_path.exists() {
+        tracked_paths.insert(quantizations_path);
+    }
+    // De-dupe before emitting; multiple variants share preset /
+    // override paths and the target profile belongs to every
+    // variant.
+    tracked_paths.insert(target_path.clone());
+    for p in &tracked_paths {
+        let s = p.to_string_lossy().into_owned();
+        let lit = syn::LitStr::new(&s, proc_macro2::Span::call_site());
         tracked.push(quote! { const _: &str = include_str!(#lit); });
     }
 
     // ── Per-model × per-workload pipeline ─────────────────────────
-    let mut per_model_ts: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut arch_dispatch_arms: Vec<(Ident, Vec<u64>)> = Vec::new();
+    //
+    // Two passes: solve every variant first (gather fuf + sfufs + loops
+    // per variant), then group variants whose emitted forward-fn
+    // bodies would be byte-identical and emit each group's canonical
+    // variant in full. Non-canonical variants emit `pub use`
+    // re-exports of the canonical's forward fns + their own variant-
+    // specific `Weights` type alias / `load` / `fingerprint_matches`.
+    //
+    // The dedup key captures every input that flows into the emitted
+    // forward fn body: model bounds (baked as int literals in emit),
+    // scalars (baked as float literals), and the SFUF-per-workload-
+    // point (which Impl runs at each subgraph → which `emit_call`
+    // output ends up in the body). Two variants that share this
+    // tuple compile to byte-identical forward fns — across AWQ /
+    // GPTQ / CT of the same (arch, size), for instance, because
+    // they all resolve to the same `Marlin*Impl` family and the
+    // quant knobs (`desc_act`, `sym`, etc.) only change the
+    // per-variant `load`, never the forward.
+    struct SolvedModel<'a> {
+        model: &'a config::ModelParams,
+        fuf: fuf::Fuf,
+        sfufs: solver::WorkloadAssignments,
+        loops: schedule::WorkloadLoops,
+        stub_items: proc_macro2::TokenStream,
+    }
+
+    impl HasSolvedSig for SolvedModel<'_> {
+        fn dedup_signature(&self) -> String {
+            let mut parts: Vec<String> = Vec::new();
+            // Bounds get baked as integer literals in the emitted
+            // forward body (`ctx.bound("hidden_size")` expands to the
+            // concrete number at macro expansion). Variants with
+            // differing bounds produce different literal output.
+            for (k, v) in &self.model.bounds {
+                parts.push(format!("b:{k}={v}"));
+            }
+            // Scalars get baked as float literals (attention_scale_for,
+            // softcap). Same reasoning.
+            for (k, v) in &self.model.scalars {
+                parts.push(format!("s:{k}={v}"));
+            }
+            // `tie_word_embeddings` routes lm_head through
+            // `FieldLoad::LinearTiedToEmbedding` (no safetensors
+            // read) vs `FieldLoad::LinearDense` — two different
+            // bodies, so variants with different tie settings
+            // can't share a compiled `load_with`.
+            parts.push(format!("t:{}", self.model.tie_word_embeddings));
+            // SFUF per (num_tokens, sk_bucket) point: which Impl runs
+            // at each subgraph. Identical SFUFs → each impl's
+            // `emit_call` produces identical output at identical
+            // positions in the body.
+            let mut wps: Vec<_> = self.sfufs.per_workload.iter().collect();
+            wps.sort_by_key(|(wp, _)| (wp.num_tokens, wp.sk_bucket));
+            for (wp, sf) in wps {
+                let mut impls: Vec<(u32, u32)> =
+                    sf.impls.iter().map(|(sg, i)| (sg.0, i.0)).collect();
+                impls.sort();
+                parts.push(format!("w:{}-{}-{:?}", wp.num_tokens, wp.sk_bucket, impls));
+            }
+            parts.join("|")
+        }
+        fn source_stem(&self) -> &str {
+            &self.model.source_stem
+        }
+        fn model_name(&self) -> &str {
+            &self.model.name
+        }
+    }
+
+    let mut solved: Vec<SolvedModel<'_>> = Vec::with_capacity(models.len());
 
     for model in &models {
         let model_cfg = cfg::build_cfg(&classified, model)
@@ -325,10 +470,6 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             .map(|l| l.num_waves())
             .max()
             .unwrap_or(0);
-        // Per-workload breakdown. When the model doesn't declare
-        // `sk_buckets`, every entry has `sk_bucket = 0` and we print
-        // a concise `M=m→<cost>` line. When it does declare them,
-        // we print `M=m sk=sk→<cost>` to keep the two axes visible.
         let sk_axis_active = sfufs.per_workload.keys().any(|wp| wp.sk_bucket != 0);
         let per_m: String = sfufs
             .per_workload
@@ -347,23 +488,59 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             })
             .collect();
         eprintln!(
-            "  ferrite · {variant:<18} · {tiles:>4} tiles · {waves:>3} waves · {solve_ms:>3} ms ·{per_m}",
+            "  ferrite · {variant:<30} · {tiles:>4} tiles · {waves:>3} waves · {solve_ms:>3} ms ·{per_m}",
             variant = model.source_stem,
             tiles = model_fuf.len(),
             waves = max_waves,
             solve_ms = d_solve.as_millis(),
         );
+
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
+
+        solved.push(SolvedModel {
+            model,
+            fuf: model_fuf,
+            sfufs,
+            loops,
+            stub_items,
+        });
+    }
+
+    // Cross-variant forward-fn dedup. Key each variant by its
+    // (bounds, scalars, SFUF-per-workload-point) tuple and pick the
+    // earliest-by-source_stem variant in each equivalence class as
+    // the canonical. Non-canonical variants emit thin shims that
+    // `pub use` the canonical's forward fns (one-line re-exports —
+    // rustc doesn't re-monomorphize them, so LLVM optimization work
+    // scales with `#distinct equivalence classes`, not
+    // `#variants`).
+    let canonical_for: std::collections::HashMap<usize, Ident> =
+        compute_canonical_variants(&solved);
+
+    let mut per_model_ts: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut arch_dispatch_arms: Vec<(Ident, Vec<u64>)> = Vec::new();
+
+    for (idx, sm) in solved.iter().enumerate() {
+        let model_mod = Ident::new(&sm.model.name, Span::call_site());
+        let canonical_ident = &canonical_for[&idx];
+        let is_canonical = *canonical_ident == model_mod;
+        let canonical_override = if is_canonical {
+            None
+        } else {
+            Some(canonical_ident.clone())
+        };
+
         let codegen_items = codegen::emit_model(
             &classified,
-            model,
-            &model_fuf,
-            &sfufs,
-            &loops,
+            sm.model,
+            &sm.fuf,
+            &sm.sfufs,
+            &sm.loops,
             &library,
             &manifest,
+            canonical_override.as_ref(),
         );
-        let model_mod = Ident::new(&model.name, Span::call_site());
+        let stub_items = &sm.stub_items;
         per_model_ts.push(quote! {
             pub mod #model_mod {
                 #stub_items
@@ -371,10 +548,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             }
         });
 
-        arch_dispatch_arms.push((
-            Ident::new(&model.name, Span::call_site()),
-            collect_dispatch_bounds(model),
-        ));
+        arch_dispatch_arms.push((model_mod, collect_dispatch_bounds(sm.model)));
     }
 
     // Union of HF `architectures: [..]` strings across every compiled
@@ -484,9 +658,9 @@ fn emit_arch_dispatcher(
         .map(|(model_ident, _)| {
             let variant_ident = pascal_case(model_ident);
             quote! {
-                if #model_ident::Weights::fingerprint_matches(gw) {
+                if #model_ident::fingerprint_matches(gw) {
                     return Ok(Some(Self::#variant_ident(
-                        #model_ident::Weights::load(gw, stream)?,
+                        #model_ident::load(gw, stream)?,
                     )));
                 }
             }

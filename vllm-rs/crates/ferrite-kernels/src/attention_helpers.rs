@@ -819,8 +819,15 @@ pub unsafe fn flashinfer_attention(
     if std::env::var("FI_TRACE").is_ok() && layer_idx == 0 {
         eprintln!(
             "[FI] L0 seq_len={} max_k={} scale={} softcap={} num_qo={} num_kv={} hd={} ps={} np={}",
-            seq_len, max_seqlen_k, scale, softcap,
-            num_qo_heads, num_kv_heads, head_dim, page_size, num_pages
+            seq_len,
+            max_seqlen_k,
+            scale,
+            softcap,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            num_pages
         );
     }
 

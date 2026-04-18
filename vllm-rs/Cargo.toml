@@ -185,6 +185,24 @@ serde-wasm-bindgen = "0.6"
 
 [profile.release]
 
+# `ferrite-models` is the proc-macro fan-out site: `#[forward]`
+# expands each arch DSL into 10-20 dense-size specializations plus
+# shim variants per quant overlay. Cross-variant forward-fn +
+# load-body dedup collapses most bodies to one canonical per
+# equivalence class (same Impl-family, same bounds, same SFUF), but
+# debug info for the remaining per-variant code (tie-breaking
+# wrappers + fingerprint fns + type aliases) still pushes rustc
+# past 60GB RSS on a full rebuild. `debug = 0` here halves the RSS
+# without affecting optimization or the crate's debuggability at
+# the forward-fn / kernel boundary — gdb backtraces still resolve
+# in `ferrite-kernels` + `ferrite-cuda-core` where the actual
+# kernel calls live.
+[profile.dev.package.ferrite-models]
+debug = 0
+
+[profile.release.package.ferrite-models]
+debug = 0
+
 [profile.release-dist]
 inherits = "release"
 strip = true

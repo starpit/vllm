@@ -1,0 +1,3 @@
+{
+  "quantizations": ["awq-gemm", "gptq-sym"]
+}

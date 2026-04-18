@@ -227,9 +227,29 @@ pub fn load_golden_refs(model_key: &str) -> GoldenReference {
 /// is NOT in the top-N are downgraded to warnings rather than hard failures. The first
 /// `MIN_EXACT_MATCH` positions must match exactly.
 pub fn check_logprobs_close(golden: &GoldenResult, engine: &EngineOutput, prompt_idx: usize) {
-    /// At or after this position, top-N cross-check failures become warnings
-    /// (bf16 noise accumulates enough to push tokens outside top-N).
-    const LATE_DIVERGENCE_THRESHOLD: usize = 10;
+    check_logprobs_close_with_threshold(golden, engine, prompt_idx, 10);
+}
+
+/// Variant with a configurable `late_divergence_threshold`. Use
+/// lower values (e.g. 3) for quantization formats with heavier
+/// numerical drift from Python vLLM's reference — BNB4 in
+/// particular accumulates enough top-N-window shift within a few
+/// decode steps that a strict 10-position exact-match bar isn't
+/// physically achievable against `bitsandbytes.matmul_4bit` (a
+/// fused-dequant-GEMM that accumulates in a different order than
+/// ferrite's dequant-then-cuBLAS-GEMM, beyond the ULP-level bf16
+/// noise AWQ/GPTQ see).
+pub fn check_logprobs_close_with_threshold(
+    golden: &GoldenResult,
+    engine: &EngineOutput,
+    prompt_idx: usize,
+    late_divergence_threshold: usize,
+) {
+    let late_divergence_threshold = late_divergence_threshold;
+    // Shadow the former `const` with the runtime value to keep the
+    // body below identical to the pre-existing implementation.
+    #[allow(non_snake_case)]
+    let LATE_DIVERGENCE_THRESHOLD: usize = late_divergence_threshold;
 
     let min_len = golden.output_tokens.len().min(engine.output_tokens.len());
 

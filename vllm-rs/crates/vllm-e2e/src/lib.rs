@@ -156,6 +156,11 @@ impl TestModels {
     // BitsAndBytes quantized models (MLX dequant-at-load or CPU)
     pub const LLAMA_3_2_1B_BNB_4BIT: &str = "unsloth/Llama-3.2-1B-Instruct-bnb-4bit";
     pub const TINYLLAMA_1B_BNB_8BIT: &str = "Jiqing/TinyLlama-1.1B-Chat-v1.0-bnb-8bit";
+    // BNB NF4 (4-bit, double-quant) — exercises ferrite-forward's
+    // Bnb4bitLinear::load{,_concat} + Bnb4GemmImpl / fused gate-up
+    // silu / fused QKV-rope path on Qwen3 (QK-norm variant). Unsloth
+    // repo matches parity.csv's verified BNB4 checkpoint.
+    pub const QWEN3_0_6B_BNB_4BIT: &str = "unsloth/Qwen3-0.6B-bnb-4bit";
 
     // GGUF quantized models (CPU, not MLX)
     pub const GEMMA3_270M_GGUF: &str = "unsloth/gemma-3-270m-it-qat-GGUF";

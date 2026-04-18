@@ -62,6 +62,12 @@ MODELS = {
     # before the same repack / permute pipeline AutoGPTQ goes
     # through. Same uint4b8 bits end-to-end.
     "tinyllama_1b_w4a16_ct": "nm-testing/TinyLlama-1.1B-Chat-v1.0-W4A16-e2e",
+    # BNB4 NF4 (double-quant) — exercises `Bnb4bitLinear::load` +
+    # the singleton + fused BNB4 impl family. Qwen3's per-head
+    # QK-norm forces the singleton path for attention-side gemms
+    # (the QKV-fused matcher can't walk through rmsnorm), while the
+    # MLP gate/up still fuses via `Bnb4FusedGateUpSiluMulImpl`.
+    "qwen3_0_6b_bnb_4bit": "unsloth/Qwen3-0.6B-bnb-4bit",
     # Unsloth mirror — `google/gemma-3-1b-it` is gated. Match this to
     # `TestModels::GEMMA3_1B_IT_CUDA` so engine + golden run on the same
     # weights.

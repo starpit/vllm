@@ -776,7 +776,10 @@ fn eval_dim_to_u64(
     eval_closed_dim(&walked, bounds)
 }
 
-fn eval_closed_dim(d: &Dim, bounds: &std::collections::BTreeMap<String, u64>) -> Option<u64> {
+pub(crate) fn eval_closed_dim(
+    d: &Dim,
+    bounds: &std::collections::BTreeMap<String, u64>,
+) -> Option<u64> {
     match d {
         Dim::Lit(n) => Some(*n),
         Dim::Bound(name) => bounds.get(name).copied(),

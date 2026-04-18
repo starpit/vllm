@@ -318,8 +318,15 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             solve_ms = d_solve.as_millis(),
         );
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
-        let codegen_items =
-            codegen::emit_model(&classified, model, &model_fuf, &sfufs, &loops, &library);
+        let codegen_items = codegen::emit_model(
+            &classified,
+            model,
+            &model_fuf,
+            &sfufs,
+            &loops,
+            &library,
+            &manifest,
+        );
         let model_mod = Ident::new(&model.name, Span::call_site());
         per_model_ts.push(quote! {
             pub mod #model_mod {

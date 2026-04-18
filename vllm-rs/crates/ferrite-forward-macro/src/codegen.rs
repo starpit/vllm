@@ -97,6 +97,22 @@ enum FieldLoad {
         format: MarlinFormat,
         group_size: u32,
     },
+    /// BitsAndBytes 4-bit packed linear. Single prefix
+    /// (`Bnb4bitLinear::load`) or fused across several
+    /// (`Bnb4bitLinear::load_concat` — packed nibbles + absmax
+    /// byte-concat along the N axis). Consumes the shared
+    /// `__bnb_code` + `__bnb_scratch` bindings the
+    /// [`emit_weights_struct`] prelude plants when any BNB4
+    /// accessor is present.
+    Bnb4Linear {
+        prefixes: Vec<String>,
+        /// Per-shard output dims — `sum()` is the fused
+        /// `out_features` the loader hands to `Bnb4bitLinear`.
+        /// Single-prefix loads carry one entry.
+        out_features_per_shard: Vec<u32>,
+        in_features: u32,
+        blocksize: u32,
+    },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -147,6 +163,7 @@ fn plan_field_load(
     program: &Program,
     fuf: &Fuf,
     model: &ModelParams,
+    manifest: &crate::weights_manifest::WeightsManifest,
 ) -> FieldLoad {
     let ty = accessor.rust_type.to_string().replace(' ', "");
     let is_embedding =
@@ -158,6 +175,9 @@ fn plan_field_load(
     let is_marlin = ty.ends_with("::MarlinLinear")
         || ty == "MarlinLinear"
         || ty.ends_with("layers::MarlinLinear");
+    let is_bnb4 = ty.ends_with("::Bnb4bitLinear")
+        || ty == "Bnb4bitLinear"
+        || ty.ends_with("layers::Bnb4bitLinear");
 
     let prefixes: Vec<String> = accessor
         .source_weights
@@ -258,6 +278,87 @@ fn plan_field_load(
             prefixes,
             format,
             group_size,
+        };
+    }
+
+    if is_bnb4 {
+        // Each source weight's manifest shape evaluated against the
+        // arch's bounds gives `[out_features, in_features]`. Fused
+        // BNB4 concats along N, so every shard must agree on
+        // `in_features`; the loader takes `out_features_per_shard`
+        // + one shared `in_features`. Mismatched in_features is an
+        // upstream repo bug — panic at macro-expansion time.
+        let (mut out_per_shard, mut in_features, mut blocksize) =
+            (Vec::<u32>::new(), None::<u32>, None::<u32>);
+        for (wid, _idx) in &accessor.source_weights {
+            let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
+            let bs = match fmt {
+                crate::quantization::StorageFormat::Bnb4 { blocksize: bs, .. } => bs,
+                other => panic!(
+                    "accessor `{}` declared `Bnb4bitLinear` but source weight resolves to \
+                     non-BNB4 storage ({other:?}) — matcher bug",
+                    accessor.name,
+                ),
+            };
+            if let Some(existing) = blocksize
+                && existing != bs
+            {
+                panic!(
+                    "accessor `{}` fuses BNB4 sources with mismatched blocksize \
+                         ({existing} then {bs})",
+                    accessor.name,
+                );
+            }
+            blocksize = Some(bs);
+
+            let segments = program.weights.path(*wid);
+            let dotted = segments.join(".");
+            let shape = manifest.lookup(segments).unwrap_or_else(|| {
+                panic!(
+                    "accessor `{}`: weight `{dotted}` missing from weights manifest; \
+                     required for BNB4 out_features/in_features evaluation",
+                    accessor.name,
+                )
+            });
+            if shape.len() != 2 {
+                panic!(
+                    "accessor `{}`: BNB4 source weight `{dotted}` has shape len \
+                     {} (expected 2 for a matmul)",
+                    accessor.name,
+                    shape.len(),
+                );
+            }
+            let in_f =
+                crate::shape::eval_closed_dim(&shape[0], &model.bounds).unwrap_or_else(|| {
+                    panic!(
+                        "accessor `{}`: can't resolve in_features for `{dotted}`",
+                        accessor.name
+                    )
+                }) as u32;
+            let out_f =
+                crate::shape::eval_closed_dim(&shape[1], &model.bounds).unwrap_or_else(|| {
+                    panic!(
+                        "accessor `{}`: can't resolve out_features for `{dotted}`",
+                        accessor.name
+                    )
+                }) as u32;
+            if let Some(existing) = in_features
+                && existing != in_f
+            {
+                panic!(
+                    "accessor `{}` fuses BNB4 sources with mismatched in_features \
+                         ({existing} then {in_f})",
+                    accessor.name,
+                );
+            }
+            in_features = Some(in_f);
+            out_per_shard.push(out_f);
+        }
+        return FieldLoad::Bnb4Linear {
+            prefixes,
+            out_features_per_shard: out_per_shard,
+            in_features: in_features.expect("at least one source weight"),
+            blocksize: blocksize.expect("at least one source weight"),
         };
     }
 
@@ -430,8 +531,11 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
     // Pick the on-disk tensor suffix per compiled variant's
     // `quantization_config`. AutoGPTQ + AWQ both ship `.qweight`;
     // compressed-tensors INT4 ships `.weight_packed` with the axes
-    // transposed. Dense ships `.weight`. The `opposite_suffix` is
-    // the negative check — if a compiled dense variant sees
+    // transposed. Dense ships `.weight`. bitsandbytes ships U8
+    // `.weight` alongside a sibling `.weight.absmax` that's unique
+    // to its storage layout — use that as the positive sniff so
+    // it's disjoint from dense bf16 `.weight`. The `opposite_suffix`
+    // is the negative check: if a compiled dense variant sees
     // `.qweight`, that's a quant model in disguise and the
     // fingerprint should miss.
     let (suffix, opposite_suffix) = match model.quantization.as_ref().map(|qc| &qc.method) {
@@ -439,6 +543,7 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
             layout: crate::quantization::GptqLayout::WeightPacked,
             ..
         }) => ("weight_packed", "weight"),
+        Some(crate::quantization::QuantMethod::Bnb4 { .. }) => ("weight.absmax", "qweight"),
         Some(_) => ("qweight", "weight"),
         None => ("weight", "qweight"),
     };
@@ -447,6 +552,17 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
     let last_tensor = format!("model.layers.{last_layer}.self_attn.q_proj.{suffix}");
     let one_past_tensor = format!("model.layers.{num_hidden_layers}.self_attn.q_proj.{suffix}");
     let opposite_tensor = format!("model.layers.0.self_attn.q_proj.{opposite_suffix}");
+    // BNB4 checkpoints ship the U8-packed nibbles at `.weight`
+    // (same suffix as dense bf16 weights) with a sibling
+    // `.weight.absmax` that's unique to bitsandbytes. Dense + AWQ
+    // + GPTQ + CT variants must reject when absmax is present; the
+    // BNB4 variant itself uses `.weight.absmax` as the positive
+    // sniff and doesn't need the rejection.
+    let bnb4_exclusion = matches!(
+        model.quantization.as_ref().map(|qc| &qc.method),
+        Some(crate::quantization::QuantMethod::Bnb4 { .. })
+    );
+    let bnb4_marker_tensor = "model.layers.0.self_attn.q_proj.weight.absmax";
 
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
     let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size as usize);
@@ -503,6 +619,15 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
                 }
             }
         }
+        Some(crate::quantization::QuantMethod::Bnb4 { .. }) => {
+            // bitsandbytes fingerprint sniffs the `.weight.absmax`
+            // sibling itself — presence is sufficient to distinguish
+            // from dense bf16 `.weight`. No shape check: absmax
+            // length varies with blocksize (64 default) and is
+            // per-model, not worth baking into the compile-time
+            // fingerprint.
+            quote! {}
+        }
         None => quote! {},
     };
 
@@ -529,6 +654,15 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
             if gw.contains(#opposite_tensor) {
                 return false;
             }
+            // BNB4 marker exclusion — reject dense/AWQ/GPTQ/CT
+            // fingerprints when the checkpoint ships BNB4's
+            // `.weight.absmax` sibling. The BNB4 variant itself
+            // keys off this tensor in its suffix-based checks
+            // above, so this exclusion runs only for non-BNB4
+            // variants.
+            if !#bnb4_exclusion && gw.contains(#bnb4_marker_tensor) {
+                return false;
+            }
             #qweight_shape_gate
             true
         }
@@ -542,6 +676,7 @@ fn emit_weights_struct(
     sfufs: &WorkloadAssignments,
     lib: &ImplementationLibrary,
     model: &ModelParams,
+    manifest: &crate::weights_manifest::WeightsManifest,
 ) -> TokenStream {
     let accessors = match collect_accessors(program, fuf, sfufs, lib) {
         Ok(a) => a,
@@ -551,10 +686,11 @@ fn emit_weights_struct(
     // Storage-format guard: a given accessor's `rust_type` must be
     // compatible with every one of its source weights' storage
     // formats. The allowed pairs today:
-    //   `LinearLayer`  ↔ `Dense`
-    //   `Embedding`    ↔ `Dense`
-    //   `RmsNorm`      ↔ `Dense`
-    //   `MarlinLinear` ↔ `Awq { .. }` | `Gptq { .. }`
+    //   `LinearLayer`   ↔ `Dense`
+    //   `Embedding`     ↔ `Dense`
+    //   `RmsNorm`       ↔ `Dense`
+    //   `MarlinLinear`  ↔ `Awq { .. }` | `Gptq { .. }`
+    //   `Bnb4bitLinear` ↔ `Bnb4 { .. }`
     //
     // Any other pair means the solver picked an impl whose
     // declared accessor type doesn't match the bits on disk — a
@@ -565,13 +701,17 @@ fn emit_weights_struct(
         let accessor_is_marlin = ty.ends_with("::MarlinLinear")
             || ty == "MarlinLinear"
             || ty.ends_with("layers::MarlinLinear");
+        let accessor_is_bnb4 = ty.ends_with("::Bnb4bitLinear")
+            || ty == "Bnb4bitLinear"
+            || ty.ends_with("layers::Bnb4bitLinear");
         for (wid, _idx) in &a.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
             let ok = matches!(
-                (&fmt, accessor_is_marlin),
-                (crate::quantization::StorageFormat::Dense, false)
-                    | (crate::quantization::StorageFormat::Awq { .. }, true)
-                    | (crate::quantization::StorageFormat::Gptq { .. }, true),
+                (&fmt, accessor_is_marlin, accessor_is_bnb4),
+                (crate::quantization::StorageFormat::Dense, false, false)
+                    | (crate::quantization::StorageFormat::Awq { .. }, true, false)
+                    | (crate::quantization::StorageFormat::Gptq { .. }, true, false)
+                    | (crate::quantization::StorageFormat::Bnb4 { .. }, false, true),
             );
             if !ok {
                 let dotted = program.weights.path(*wid).join(".");
@@ -602,11 +742,33 @@ fn emit_weights_struct(
     // case works without a special sort.
     let plans: Vec<FieldLoad> = accessors
         .iter()
-        .map(|a| plan_field_load(a, program, fuf, model))
+        .map(|a| plan_field_load(a, program, fuf, model, manifest))
         .collect();
     let any_marlin = plans
         .iter()
         .any(|p| matches!(p, FieldLoad::MarlinLinear { .. }));
+    let any_bnb4 = plans
+        .iter()
+        .any(|p| matches!(p, FieldLoad::Bnb4Linear { .. }));
+    // `max(out_features * in_features)` across every BNB4 accessor
+    // — sizes the per-model shared dequant scratch buffer. Zero
+    // when the model has no BNB4 accessors (the prelude block is
+    // then elided entirely).
+    let bnb4_max_elements: usize = plans
+        .iter()
+        .filter_map(|p| match p {
+            FieldLoad::Bnb4Linear {
+                out_features_per_shard,
+                in_features,
+                ..
+            } => {
+                let total_out: usize = out_features_per_shard.iter().map(|o| *o as usize).sum();
+                Some(total_out * (*in_features as usize))
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
     let lets: Vec<TokenStream> = accessors
         .iter()
         .zip(plans.iter())
@@ -704,6 +866,46 @@ fn emit_weights_struct(
                         }
                     }
                 }
+                FieldLoad::Bnb4Linear {
+                    prefixes,
+                    out_features_per_shard,
+                    in_features,
+                    blocksize,
+                } => {
+                    let in_features = *in_features as usize;
+                    let blocksize = *blocksize as usize;
+                    let outs: Vec<proc_macro2::Literal> = out_features_per_shard
+                        .iter()
+                        .map(|o| proc_macro2::Literal::usize_unsuffixed(*o as usize))
+                        .collect();
+                    if prefixes.len() == 1 {
+                        let prefix = &prefixes[0];
+                        let out = &outs[0];
+                        quote! {
+                            let #name = ::ferrite_kernels::layers::Bnb4bitLinear::load(
+                                gw,
+                                #prefix,
+                                __bnb_code,
+                                __bnb_scratch,
+                                #out,
+                                #in_features,
+                                #blocksize,
+                            )?;
+                        }
+                    } else {
+                        quote! {
+                            let #name = ::ferrite_kernels::layers::Bnb4bitLinear::load_concat(
+                                gw,
+                                &[ #(#prefixes),* ],
+                                __bnb_code,
+                                __bnb_scratch,
+                                &[ #(#outs),* ],
+                                #in_features,
+                                #blocksize,
+                            )?;
+                        }
+                    }
+                }
             }
         })
         .collect();
@@ -721,6 +923,48 @@ fn emit_weights_struct(
             let __num_sm = unsafe { ::ferrite_cuda_core::driver::device_get_num_sm(__device)? };
             let __marlin_ws =
                 ::ferrite_kernels::layers_quant::alloc_marlin_workspace(__num_sm, stream)?;
+        }
+    } else {
+        quote! {}
+    };
+
+    // Shared-per-model BNB4 prelude: upload the NF4/FP4 LUT once
+    // (16-entry f32 table) and allocate a single dequant scratch
+    // buffer sized to `max(out*in)` across every BNB4 accessor.
+    // Every `Bnb4bitLinear` on this device captures both tensors by
+    // value (`GpuTensor: Copy`). Elided when the model has no BNB4.
+    //
+    // Compute dtype for the shared dequant scratch comes from
+    // `embed_tokens.weight` — guaranteed present on every arch and
+    // always stored in the model's compute dtype (never BNB-packed,
+    // per bitsandbytes' default `llm_int8_skip_modules`). Reading
+    // it off disk keeps bf16-compute and fp16-compute checkpoints
+    // both correct without a config scrape.
+    let bnb4_prelude: TokenStream = if any_bnb4 {
+        let max_elements = proc_macro2::Literal::usize_unsuffixed(bnb4_max_elements);
+        let code_expr = match model.quantization.as_ref().map(|qc| &qc.method) {
+            Some(crate::quantization::QuantMethod::Bnb4 {
+                quant_type: crate::quantization::BnbQuantType::NF4,
+                ..
+            }) => quote! { ::ferrite_kernels::layers_quant::NF4_CODE },
+            Some(crate::quantization::QuantMethod::Bnb4 {
+                quant_type: crate::quantization::BnbQuantType::FP4,
+                ..
+            }) => quote! { ::ferrite_kernels::layers_quant::FP4_CODE },
+            _ => unreachable!("any_bnb4 implies QuantMethod::Bnb4"),
+        };
+        quote! {
+            let __bnb_code =
+                ::ferrite_kernels::layers_quant::upload_bnb_code(&#code_expr, stream)?;
+            let __bnb_dtype = gw
+                .tensor_info("model.embed_tokens.weight")
+                .map(|(_, dt)| dt)
+                .unwrap_or(::ferrite_cuda_core::dtype::DType::BF16);
+            let __bnb_scratch = ::ferrite_kernels::layers_quant::alloc_bnb_dequant_scratch(
+                #max_elements,
+                __bnb_dtype,
+                stream,
+            )?;
         }
     } else {
         quote! {}
@@ -819,6 +1063,7 @@ fn emit_weights_struct(
                 stream: ::ferrite_cuda_core::CUstream,
             ) -> ::anyhow::Result<Self> {
                 #marlin_prelude
+                #bnb4_prelude
                 #(#lets)*
                 #rotary_local_load
                 Ok(Self {
@@ -1194,8 +1439,9 @@ pub fn emit_model(
     sfufs: &WorkloadAssignments,
     loops: &WorkloadLoops,
     lib: &ImplementationLibrary,
+    manifest: &crate::weights_manifest::WeightsManifest,
 ) -> TokenStream {
-    let weights = emit_weights_struct(program, fuf, sfufs, lib, model);
+    let weights = emit_weights_struct(program, fuf, sfufs, lib, model, manifest);
 
     // Group buckets by SFUF signature (sorted subgraph → impl).
     // Buckets with identical impl picks produce byte-identical fn

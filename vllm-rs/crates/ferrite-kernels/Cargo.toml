@@ -16,4 +16,5 @@ cudarc = { workspace = true, features = ["cublas", "cublaslt", "dynamic-linking"
 half = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
 vllm-model = { path = "../vllm-model" }

@@ -11,7 +11,10 @@
 
 #![cfg(feature = "e2e")]
 
-use vllm_e2e::assertions::{check_logprobs_close, extract_engine_output, load_golden_refs};
+use vllm_e2e::assertions::{
+    check_logprobs_close, check_logprobs_close_with_threshold, extract_engine_output,
+    load_golden_refs,
+};
 use vllm_e2e::{Client, TestModels, TestServer};
 use vllm_serve::protocol::{CompletionPrompt, CompletionRequest};
 
@@ -26,6 +29,26 @@ fn completion_request(prompt: &str, max_tokens: u32, logprobs: u32) -> Completio
 }
 
 async fn run_correctness_test(model: &str, golden_key: &str) {
+    run_correctness_test_with_threshold(model, golden_key, 10).await
+}
+
+/// BNB4 variant — the fused-dequant-GEMM in
+/// `bitsandbytes.matmul_4bit` accumulates in a different order than
+/// ferrite's dequant-to-scratch → cuBLAS-GEMM pipeline. Same
+/// `code[nibble] * absmax[block]` math per-weight, but the dot-
+/// product accumulation order along K differs between the two
+/// kernels. Over 28 layers × per-token the noise is enough to push
+/// token-candidates outside a top-20 window within a few decode
+/// steps. Loosen the threshold so top-N exits at position >= 3 are
+/// warnings instead of hard fails — the full golden still catches
+/// gross regressions (e.g. wrong tensor shape, wrong absmax
+/// ordering) because the first 3 tokens and the top-N sets
+/// themselves still line up.
+async fn run_correctness_test_with_threshold(
+    model: &str,
+    golden_key: &str,
+    late_divergence_threshold: usize,
+) {
     let golden = load_golden_refs(golden_key);
 
     let server = TestServer::builder(model)
@@ -47,7 +70,12 @@ async fn run_correctness_test(model: &str, golden_key: &str) {
         assert!(!resp.choices.is_empty(), "prompt {i}: no choices returned");
 
         let engine_output = extract_engine_output(&resp.choices[0]);
-        check_logprobs_close(golden_result, &engine_output, i);
+        check_logprobs_close_with_threshold(
+            golden_result,
+            &engine_output,
+            i,
+            late_divergence_threshold,
+        );
     }
 }
 
@@ -152,6 +180,34 @@ async fn test_cuda_correctness_qwen2_0_5b_gptq() {
 #[ignore]
 async fn test_cuda_correctness_qwen3_0_6b() {
     run_correctness_test(TestModels::QWEN3_0_6B_CUDA, "qwen3_0_6b").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_qwen3_0_6b_bnb_4bit() {
+    // BNB4 NF4 Qwen3-0.6B — exercises ferrite-forward's
+    // `Bnb4bitLinear::load[_concat]` + `Bnb4GemmImpl` /
+    // `Bnb4FusedGateUpSiluMulImpl` / `Bnb4FusedQkvRope*Impl` path.
+    // Qwen3's per-head QK-norm prevents the fused QKV matcher from
+    // claiming q/k/v gemms adjacent to RopeAppend, so this also
+    // covers the Bnb4GemmImpl singleton path for leftover gemms
+    // (`gemm_is_fusion_partner` deference is intentionally off for
+    // BNB4). Golden generated from Python vLLM on
+    // `unsloth/Qwen3-0.6B-bnb-4bit`.
+    //
+    // Threshold=3: `bitsandbytes.matmul_4bit` accumulates dequant-
+    // GEMM fused per-block; our path dequants to scratch then
+    // cuBLAS-GEMMs. Same math per-weight, different K-axis
+    // accumulation order — top-N-window drift exceeds bf16 noise
+    // and crosses the window within 3-5 decode steps. The
+    // threshold=3 comparison still catches tensor-shape / absmax-
+    // ordering / wrong-kernel regressions (prefill must produce
+    // matching first-3 tokens) while tolerating the known
+    // accumulation-order divergence that's endemic to BNB4 cross-
+    // implementation comparison.
+    run_correctness_test_with_threshold(TestModels::QWEN3_0_6B_BNB_4BIT, "qwen3_0_6b_bnb_4bit", 3)
+        .await;
 }
 
 #[cfg(feature = "cuda")]

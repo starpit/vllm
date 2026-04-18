@@ -1316,6 +1316,15 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(MarlinFusedGateUpGeluMulImpl));
     lib.push(Box::new(MarlinFusedQkvRopeCacheImpl));
     lib.push(Box::new(MarlinFusedQkvRopePrefillImpl));
+
+    // ── BitsAndBytes 4-bit (NF4 / FP4) impls ────────────────────
+    // Gated per-matches on `StorageFormat::Bnb4 { .. }`; stay
+    // dormant on dense / Marlin-consumable models.
+    lib.push(Box::new(Bnb4GemmImpl));
+    lib.push(Box::new(Bnb4FusedGateUpSiluMulImpl));
+    lib.push(Box::new(Bnb4FusedGateUpGeluMulImpl));
+    lib.push(Box::new(Bnb4FusedQkvRopeCacheImpl));
+    lib.push(Box::new(Bnb4FusedQkvRopePrefillImpl));
     lib
 }
 
@@ -5618,6 +5627,15 @@ fn is_marlin_gemm(fuf: &Fuf, tile: TileId) -> bool {
         )
 }
 
+/// BitsAndBytes 4-bit counterpart of [`is_marlin_gemm`]. A Gemm
+/// whose weight resolves to `StorageFormat::Bnb4 { .. }` — the
+/// Bnb4bit impl family claims these; Marlin + dense impls reject
+/// them via their own storage gates.
+fn is_bnb4_gemm(fuf: &Fuf, tile: TileId) -> bool {
+    let node = fuf.get(tile);
+    node.op == OpKind::Gemm && matches!(weight_storage_of(node), Some(StorageFormat::Bnb4 { .. }))
+}
+
 /// Singleton Marlin GEMM — the AWQ counterpart of `GemmRefImpl`.
 #[derive(Debug, Default)]
 pub struct MarlinGemmImpl;
@@ -6487,6 +6505,852 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
                     *qkv_packed,
                     *ctx.positions,
                     #rotary_cos_sin,
+                    #q_size,
+                    #kv_size,
+                    #num_q_heads,
+                    #num_kv_heads,
+                    #head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+            unsafe {
+                ::ferrite_kernels::attention_helpers::write_kv_cache(
+                    (#k_out).view(),
+                    (#v_out).view(),
+                    ctx.slot_mapping,
+                    ctx.kv_cache,
+                    #layer,
+                    device.compute_stream,
+                );
+            }
+        }
+    }
+}
+
+// ── BitsAndBytes 4-bit (NF4 / FP4) impl family ────────────────────
+//
+// Mirror of the Marlin* family but for `StorageFormat::Bnb4`. The
+// structural matchers are byte-identical to the Marlin variants
+// (same `(Gemm, Gemm, Silu, Mul)` / `(Gemm, Gemm, Gelu, Mul)` /
+// `(Gemm, Gemm, Gemm, RopeAppend)` claim patterns); the only diffs
+// are (a) the storage gate (`is_bnb4_gemm` instead of
+// `is_marlin_gemm`), (b) the declared accessor `rust_type`
+// (`Bnb4bitLinear`), and (c) the `emit_call` binding
+// (`(#w).forward(x, &mut device.cublas, &mut device.caching,
+// stream)` — BNB4's forward takes cuBLAS because the kernel does
+// a dequant-then-cuBLAS-matmul, unlike Marlin's fused-matmul path).
+//
+// The kernel-side loader (`Bnb4bitLinear::load{,_concat}`) handles
+// byte-concat of packed nibbles + absmax across fused shards, so a
+// fused QKV / gate-up lands as a single `Bnb4bitLinear` just like
+// the Marlin fused accessors do.
+
+/// Singleton Bnb4 GEMM — BNB4 counterpart of `MarlinGemmImpl`.
+#[derive(Debug, Default)]
+pub struct Bnb4GemmImpl;
+
+impl Implementation for Bnb4GemmImpl {
+    fn name(&self) -> &'static str {
+        "bnb4_gemm"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        if !is_bnb4_gemm(fuf, seed) {
+            return None;
+        }
+        // Unlike Marlin + dense paths, BNB4 has no cutlass-shaped
+        // singleton impl that would compete with the fused variants
+        // at the same seed — so we skip `gemm_is_fusion_partner`
+        // deference. If the fused BNB4 Impl (QKV-rope, gate-up-silu,
+        // gate-up-gelu) matches, the DP picks it over this singleton
+        // by claim-size. If it doesn't (e.g. Qwen3's per-head QK-norm
+        // breaks the `(Gemm, Gemm, Gemm, RopeAppend)` adjacency for
+        // q/k but not v), this singleton claims the leftover Gemms
+        // rather than leaving them `UnclaimedTile`.
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        cost_gemm(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let tile = claimed_tiles[0];
+        let (wid, index) = first_weight_ref(fuf.get(tile)).expect("Gemm has a weight input");
+        let name = weight_field_name(program, wid, index);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
+            source_weights: vec![(wid, index)],
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let x = ctx.input_expr(tile, 0);
+        let w = ctx.input_expr(tile, 1);
+        quote! {
+            let #out = unsafe {
+                (#w).forward(
+                    #x,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+/// Fused gate/up + SwiGLU for BNB4. BNB4 byte-concats nibbles +
+/// absmax across gate + up on load (`load_concat`), so this emits
+/// one `Bnb4bitLinear::forward` on the fused weight followed by
+/// `silu_and_mul_fused`.
+#[derive(Debug, Default)]
+pub struct Bnb4FusedGateUpSiluMulImpl;
+
+impl Implementation for Bnb4FusedGateUpSiluMulImpl {
+    fn name(&self) -> &'static str {
+        "bnb4_fused_gate_up_silu_mul"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let gate_gemm = fuf.get(seed);
+        if !is_bnb4_gemm(fuf, seed) {
+            return None;
+        }
+        let silu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Silu && consumes_tile(n, seed))?;
+        let silu_id = silu_node.id;
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, silu_id))?;
+        let mul_id = mul_node.id;
+        let up_gemm_id = mul_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != silu_id => Some(*id),
+            _ => None,
+        })?;
+        if !is_bnb4_gemm(fuf, up_gemm_id) {
+            return None;
+        }
+        if first_tile_input(gate_gemm)? != first_tile_input(fuf.get(up_gemm_id))? {
+            return None;
+        }
+        let mut claimed = [seed, up_gemm_id, silu_id, mul_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        let activation_tile = first_tile_input(gate_gemm)?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation_tile],
+            boundary_outputs: vec![mul_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedGateUpSiluMulImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let silu_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Silu)
+            .expect("fused gate/up/silu/mul claim must contain Silu");
+        let mul_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
+            .expect("fused gate/up/silu/mul claim must contain Mul");
+        let (gate_id, _) =
+            first_tile_input(ctx.fuf.get(silu_id)).expect("silu has a tile input — the gate gemm");
+        let up_id = ctx
+            .claimed_tiles
+            .iter()
+            .copied()
+            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
+            .expect("claim contains a second Gemm — the up gemm");
+
+        let activation = ctx.input_expr(gate_id, 0);
+
+        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
+        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
+        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let mul_out = ctx.output_ident(mul_id, 0);
+        let intermediate = ctx.bound("intermediate_size") as usize;
+
+        quote! {
+            let #mul_out = unsafe {
+                let gate_up = (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                ::ferrite_kernels::kernels::silu_and_mul_fused(
+                    *gate_up,
+                    #intermediate,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+/// Fused gate/up + GELU for BNB4 — Gemma2-style MLP.
+#[derive(Debug, Default)]
+pub struct Bnb4FusedGateUpGeluMulImpl;
+
+impl Implementation for Bnb4FusedGateUpGeluMulImpl {
+    fn name(&self) -> &'static str {
+        "bnb4_fused_gate_up_gelu_mul"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let gate_gemm = fuf.get(seed);
+        if !is_bnb4_gemm(fuf, seed) {
+            return None;
+        }
+        let gelu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Gelu && consumes_tile(n, seed))?;
+        let gelu_id = gelu_node.id;
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, gelu_id))?;
+        let mul_id = mul_node.id;
+        let up_gemm_id = mul_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != gelu_id => Some(*id),
+            _ => None,
+        })?;
+        if !is_bnb4_gemm(fuf, up_gemm_id) {
+            return None;
+        }
+        if first_tile_input(gate_gemm)? != first_tile_input(fuf.get(up_gemm_id))? {
+            return None;
+        }
+        let mut claimed = [seed, up_gemm_id, gelu_id, mul_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        let activation_tile = first_tile_input(gate_gemm)?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation_tile],
+            boundary_outputs: vec![mul_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedGateUpGeluMulImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let gelu_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gelu)
+            .expect("fused gate/up/gelu/mul claim must contain Gelu");
+        let mul_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
+            .expect("fused gate/up/gelu/mul claim must contain Mul");
+        let (gate_id, _) =
+            first_tile_input(ctx.fuf.get(gelu_id)).expect("gelu has a tile input — the gate gemm");
+        let up_id = ctx
+            .claimed_tiles
+            .iter()
+            .copied()
+            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
+            .expect("claim contains a second Gemm — the up gemm");
+
+        let activation = ctx.input_expr(gate_id, 0);
+
+        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
+        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
+        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let mul_out = ctx.output_ident(mul_id, 0);
+        let intermediate = ctx.bound("intermediate_size") as usize;
+
+        quote! {
+            let #mul_out = unsafe {
+                let gate_up = (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                ::ferrite_kernels::kernels::gelu_and_mul_fused(
+                    *gate_up,
+                    #intermediate,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+/// Fused QKV + RoPE (decode, M=1) for BNB4. Mirrors
+/// `MarlinFusedQkvRopeCacheImpl` but emits the BNB4 matmul path.
+#[derive(Debug, Default)]
+pub struct Bnb4FusedQkvRopeCacheImpl;
+
+impl Implementation for Bnb4FusedQkvRopeCacheImpl {
+    fn name(&self) -> &'static str {
+        "bnb4_fused_qkv_rope_cache"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let seed_node = fuf.get(seed);
+        if !is_bnb4_gemm(fuf, seed) {
+            return None;
+        }
+
+        let rope_node = fuf.nodes.iter().find(|n| {
+            if n.op != OpKind::RopeAppend || n.inputs.len() < 3 {
+                return false;
+            }
+            let qkv_raw: Vec<TileId> = n
+                .inputs
+                .iter()
+                .take(3)
+                .filter_map(|i| match i {
+                    FufInput::Tile { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            if qkv_raw.len() != 3 {
+                return false;
+            }
+            let resolved: Option<Vec<(TileId, Option<TileId>)>> = qkv_raw
+                .iter()
+                .map(|t| unwrap_gemm_through_bias(fuf, *t))
+                .collect();
+            let Some(resolved) = resolved else {
+                return false;
+            };
+            let biased = resolved[0].1.is_some();
+            if resolved.iter().any(|r| r.1.is_some() != biased) {
+                return false;
+            }
+            let gemms: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
+            if !gemms.contains(&seed) {
+                return false;
+            }
+            if gemms.iter().any(|t| !is_bnb4_gemm(fuf, *t)) {
+                return false;
+            }
+            let act = first_tile_input(fuf.get(gemms[0]));
+            act.is_some() && gemms.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
+        })?;
+        let rope_id = rope_node.id;
+
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| unwrap_gemm_through_bias(fuf, *t).expect("validated in find"))
+            .collect();
+
+        let mut claimed: Vec<TileId> = Vec::with_capacity(7);
+        for (g, b) in &resolved {
+            claimed.push(*g);
+            if let Some(b) = b {
+                claimed.push(*b);
+            }
+        }
+        claimed.push(rope_id);
+        claimed.sort();
+
+        let _ = seed_node;
+        let activation = first_tile_input(fuf.get(resolved[0].0))?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation],
+            boundary_outputs: vec![rope_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedQkvRopeCacheImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        let rope_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim contains RopeAppend");
+        vec![((rope_id, 0), None)]
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
+            source_weights: sources,
+        }]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let rope_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim must contain a RopeAppend");
+        let rope_node = ctx.fuf.get(rope_id);
+
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| {
+                unwrap_gemm_through_bias(ctx.fuf, *t)
+                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+        let q_gemm_id = resolved[0].0;
+        let activation = ctx.input_expr(q_gemm_id, 0);
+
+        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
+            .iter()
+            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
+            .collect();
+        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let num_q_heads = ctx.bound("num_attention_heads") as usize;
+        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+        let head_dim = ctx.bound("head_dim") as usize;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
+            as usize;
+
+        let q_out = ctx.output_ident(rope_id, 0);
+        let k_out = ctx.output_ident(rope_id, 1);
+        let v_out = ctx.output_ident(rope_id, 2);
+
+        quote! {
+            let #q_out = unsafe {
+                let qkv_packed = (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                if ctx.kv_cache.is_fp8() {
+                    ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
+                        *qkv_packed,
+                        *ctx.positions,
+                        ctx.rotary.cos_sin_cache,
+                        *ctx.slot_mapping,
+                        *ctx.kv_cache.k_cache(#layer),
+                        *ctx.kv_cache.v_cache(#layer),
+                        ctx.kv_cache.k_scale_ptr(#layer),
+                        ctx.kv_cache.v_scale_ptr(#layer),
+                        #q_size,
+                        #kv_size,
+                        #num_q_heads,
+                        #head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                } else {
+                    ::ferrite_kernels::kernels::fused_qkv_rope_cache(
+                        *qkv_packed,
+                        *ctx.positions,
+                        ctx.rotary.cos_sin_cache,
+                        *ctx.slot_mapping,
+                        *ctx.kv_cache.k_cache(#layer),
+                        *ctx.kv_cache.v_cache(#layer),
+                        #q_size,
+                        #kv_size,
+                        #num_q_heads,
+                        #head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                }
+            };
+            let #k_out = ctx.kv_cache.k_cache(#layer);
+            let #v_out = ctx.kv_cache.v_cache(#layer);
+        }
+    }
+}
+
+/// Fused QKV + RoPE (prefill, contiguous K/V) for BNB4.
+#[derive(Debug, Default)]
+pub struct Bnb4FusedQkvRopePrefillImpl;
+
+impl Implementation for Bnb4FusedQkvRopePrefillImpl {
+    fn name(&self) -> &'static str {
+        "bnb4_fused_qkv_rope_prefill"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        Bnb4FusedQkvRopeCacheImpl.matches(fuf, seed, profile)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        Bnb4FusedQkvRopeCacheImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        Bnb4FusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let rope_id = *ctx
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("claim must contain a RopeAppend");
+        let rope_node = ctx.fuf.get(rope_id);
+
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| unwrap_gemm_through_bias(ctx.fuf, *t).expect("claim-time validated"))
+            .collect();
+        let q_gemm_id = resolved[0].0;
+        let activation = ctx.input_expr(q_gemm_id, 0);
+
+        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
+            .iter()
+            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
+            .collect();
+        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
+        let weight_expr = ctx.weight_accessor(&fused_name);
+
+        let num_q_heads = ctx.bound("num_attention_heads") as usize;
+        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
+        let head_dim = ctx.bound("head_dim") as usize;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
+            as usize;
+
+        let q_out = ctx.output_ident(rope_id, 0);
+        let k_out = ctx.output_ident(rope_id, 1);
+        let v_out = ctx.output_ident(rope_id, 2);
+
+        quote! {
+            let (#q_out, #k_out, #v_out) = unsafe {
+                let qkv_packed = (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                ::ferrite_kernels::kernels::fused_qkv_rope(
+                    *qkv_packed,
+                    *ctx.positions,
+                    ctx.rotary.cos_sin_cache,
                     #q_size,
                     #kv_size,
                     #num_q_heads,

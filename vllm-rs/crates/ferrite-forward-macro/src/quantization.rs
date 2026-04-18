@@ -69,6 +69,17 @@ pub enum StorageFormat {
         sym: bool,
         layout: GptqLayout,
     },
+    /// BitsAndBytes 4-bit weights — `.weight` is U8 packed nibbles
+    /// with a sibling `.absmax` / `.quant_state.bitsandbytes__nf4` /
+    /// `.nested_absmax` / `.nested_quant_map` metadata. `quant_type`
+    /// picks the NF4 / FP4 LUT; `blocksize` is the default scale
+    /// granularity (the actual blocksize is read from the per-tensor
+    /// quant_state JSON at load time — this is the fallback when
+    /// it's absent).
+    Bnb4 {
+        quant_type: BnbQuantType,
+        blocksize: u32,
+    },
 }
 
 /// GPTQ on-disk layout — decides which tensor names + axis order the
@@ -103,6 +114,16 @@ pub enum AwqVersion {
     Marlin,
 }
 
+/// BitsAndBytes 4-bit code table. NF4 = 16 quantiles of N(0,1)
+/// rescaled to [-1, 1]; FP4 = E2M1 float values. Picked at macro-
+/// expansion time from `bnb_4bit_quant_type` and folded into the
+/// `Weights::load` prelude's `upload_bnb_code` call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BnbQuantType {
+    NF4,
+    FP4,
+}
+
 /// Top-level `quantization_config` section of HF's `config.json`,
 /// when present.
 #[derive(Clone, Debug)]
@@ -133,6 +154,10 @@ pub enum QuantMethod {
         desc_act: bool,
         sym: bool,
         layout: GptqLayout,
+    },
+    Bnb4 {
+        quant_type: BnbQuantType,
+        blocksize: u32,
     },
 }
 
@@ -201,6 +226,7 @@ impl QuantizationConfig {
             "awq" => parse_awq(obj)?,
             "gptq" => parse_gptq(obj)?,
             "compressed-tensors" => parse_compressed_tensors(obj)?,
+            "bitsandbytes" => parse_bitsandbytes(obj)?,
             other => return Err(ParseError::UnsupportedMethod(other.to_string())),
         };
 
@@ -404,6 +430,52 @@ fn parse_compressed_tensors(
     )))
 }
 
+/// Parse `quantization_config.quant_method == "bitsandbytes"`.
+///
+/// bitsandbytes ships 4-bit weights as U8-packed nibbles with a
+/// sibling absmax tensor (double-quantized via a 256-entry
+/// lookup table) + a per-tensor JSON `quant_state.bitsandbytes__nf4`
+/// blob carrying the block size. Today ferrite handles only the
+/// 4-bit path — `load_in_8bit` hits `UnsupportedMethod` so the bnb
+/// 8-bit slice stays unimplemented rather than silently downgrading.
+fn parse_bitsandbytes(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<QuantMethod, ParseError> {
+    let load_4bit = obj
+        .get("load_in_4bit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !load_4bit {
+        return Err(ParseError::UnsupportedMethod(
+            "bitsandbytes with load_in_4bit=false (8-bit not yet supported)".to_string(),
+        ));
+    }
+    let qt = obj
+        .get("bnb_4bit_quant_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("nf4");
+    let quant_type = match qt {
+        "fp4" => BnbQuantType::FP4,
+        "nf4" => BnbQuantType::NF4,
+        other => {
+            return Err(ParseError::BadField {
+                field: "bnb_4bit_quant_type",
+                reason: match other {
+                    "nf4" | "fp4" => unreachable!(),
+                    _ => "unrecognized bnb quant_type (want nf4 / fp4)",
+                },
+            });
+        }
+    };
+    // bitsandbytes' blocksize default is 64. Per-tensor quant_state
+    // JSON on disk overrides this at load time; the bound here is
+    // only the compile-time fallback.
+    Ok(QuantMethod::Bnb4 {
+        quant_type,
+        blocksize: 64,
+    })
+}
+
 /// Resolve the storage format of a single weight by matching its
 /// dotted path against the model's `quantization_config`.
 ///
@@ -462,6 +534,14 @@ pub fn storage_format_for_weight(
         return StorageFormat::Dense;
     }
 
+    // bitsandbytes convention: `lm_head` is likewise never
+    // quantized. unsloth / official bitsandbytes checkpoints ship
+    // `lm_head.weight` as plain bf16/fp16 alongside all the
+    // 4-bit-packed decoder layers.
+    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Bnb4 { .. }) {
+        return StorageFormat::Dense;
+    }
+
     // AWQ/GPTQ metadata applies to matmul weights only — the
     // qweight/scales/[qzeros|g_idx] triple produces a 4-bit packed
     // weight that the marlin GEMM kernel consumes. Weights that
@@ -512,6 +592,13 @@ pub fn storage_format_for_weight(
             desc_act,
             sym,
             layout,
+        },
+        QuantMethod::Bnb4 {
+            quant_type,
+            blocksize,
+        } => StorageFormat::Bnb4 {
+            quant_type,
+            blocksize,
         },
     }
 }
@@ -716,6 +803,66 @@ mod tests {
                             "weights": {"type": "float", "num_bits": 8}
                         }
                     }
+                }
+            }"#,
+        );
+        assert!(matches!(
+            QuantizationConfig::parse(&v),
+            Err(ParseError::UnsupportedMethod(_))
+        ));
+    }
+
+    #[test]
+    fn parses_bitsandbytes_nf4() {
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": true,
+                    "bnb_4bit_quant_type": "nf4",
+                    "bnb_4bit_use_double_quant": true,
+                    "llm_int8_skip_modules": ["lm_head"]
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().expect("some");
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Bnb4 {
+                quant_type: BnbQuantType::NF4,
+                blocksize: 64,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_bitsandbytes_fp4() {
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": true,
+                    "bnb_4bit_quant_type": "fp4"
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().unwrap();
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Bnb4 {
+                quant_type: BnbQuantType::FP4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_bitsandbytes_8bit() {
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": false
                 }
             }"#,
         );

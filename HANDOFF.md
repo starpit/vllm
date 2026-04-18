@@ -817,6 +817,94 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
+**Quant overlay mechanism landed (commit `85391247b`).** Replaces the
+per-(arch, size, quant) full-JSON variants with a layered overlay
+that fans every preset across every dense base:
+
+- **Dense base**: `model_architectures/<arch>/<size>.json` (no
+  `quantization_config`).
+- **Universal preset**: `model_architectures/quantizations/<preset>.json`
+  — one file per quant flavor, shared across all arches. Today:
+  `awq-gemm`, `gptq-sym`, `gptq-sym-desc_act`, `ct-int4-sym`,
+  `bnb-nf4-dq`.
+- **Per-arch enable list**: `<arch>/quantizations.json` — flat array
+  of preset names, e.g. `["awq-gemm", "gptq-sym",
+  "gptq-sym-desc_act", "ct-int4-sym"]` for llama. Loader synthesizes
+  one `<size>-<preset>` variant per (size × preset) by deep-merging
+  preset onto dense base.
+- **Per-repo drift escape hatch**: optional
+  `<arch>/<size>-<preset>.overrides.json` for fields where a real
+  HF repo diverges from the dense base (e.g. TinyLlama-v0.3-GPTQ has
+  `vocab_size: 32003` vs dense 32000 — the override file carries
+  exactly those three fields, nothing more).
+
+The proc-macro tracks all three layers in `extra_tracked_paths` so a
+preset edit re-fires codegen across every arch that opts in.
+
+**Cross-variant dedup keys on (bounds + scalars + tie_word_embeddings
++ SFUF-per-workload-point).** Equivalent variants (same arch, same
+solver picks, only loader differs) collapse to one canonical
+`forward` body via `pub use super::<canonical>::{forward, forward_*}`
+in shim modules. The shim still emits its own `Weights::load` +
+`fingerprint_matches` since those are inherently per-variant.
+
+**`MarlinLinear` gained a runtime `MarlinFormat` enum** so AWQ/GPTQ
+variants share one load body too. Each variant emits a const
+`MY_MARLIN_FORMAT: MarlinFormat = …` and a thin `load(gw, stream)`
+wrapper that calls `load_with(gw, stream, MY_MARLIN_FORMAT)`. The
+canonical `load_with` body is shared; per-variant routing happens via
+the const. This collapsed the load-side body explosion that fingerprint
++ forward-fn dedup alone couldn't reach.
+
+**`g_idx` fingerprint disambiguation.** GPTQ desc_act=true vs false
+produce identical tensor shapes; only `.g_idx`'s presence
+distinguishes them. `fingerprint_matches` now emits a presence-or-
+absence check on the `g_idx` tensor of the canonical layer, so the
+right variant routes at runtime even though the bound-set is
+otherwise identical.
+
+**`ferrite-models` `debug = 0` profile override.** Without this,
+rustc OOMs at ~60GB RSS during full-fan-out compile of the dense +
+quant variant matrix. The `.cargo` profile overrides (both `dev`
+and `release`) drop debug info on the macro-fan-out crate only;
+ferrite-kernels and ferrite-cuda-core retain full debug info, so
+gdb backtraces still resolve at the kernel boundary.
+
+**Goldens green**: `test_cuda_correctness_tinyllama_1b_w4a16_e2e`
+(compressed-tensors INT4) +
+`test_cuda_correctness_tinyllama_1b_gptq_desc_act` (GPTQ desc_act
+with vocab override) both pass post-overlay.
+
+**Flashinfer-side test issues to be aware of (NOT touched by this
+commit; pre-existing on the branch)**:
+
+- `crates/ferrite-kernels/src/flashinfer.rs` has three pre-existing
+  clippy lints under `-D warnings`: an unused `sk_bucket: u32`
+  parameter at line 332, plus two `doc_lazy_continuation` warnings
+  at lines 321–322. They block any `cargo clippy --features cuda
+  -- -D warnings` run that touches `ferrite-kernels`. Fix is
+  trivial (rename to `_sk_bucket` if intentionally unused, indent
+  the doc list continuation lines) but out of scope for the overlay
+  commit since the file isn't in its diff.
+- Several non-overlay correctness goldens have shown top-N
+  divergence in recent runs that smells like flashinfer drift, not
+  overlay regression (the same models passed before the flashinfer
+  integration landed in `a00bed90a`): AWQ Llama, Qwen2-GPTQ, and
+  Qwen3-dense have all reported single-token top-N misses at
+  positions ≥ 1 in spot checks. These need re-baselining with a
+  flashinfer-on Python golden before being called regressions —
+  the existing goldens were generated pre-flashinfer.
+
+**FP8 trio still pending** (tasks #2/#3/#4): per-tensor static,
+per-tensor dynamic-activation, and 128×128 blockwise. The overlay
+mechanism is ready to absorb them — each one needs a
+`quantizations/fp8-*.json` preset + per-arch opt-in, plus the
+`StorageFormat::Fp8 { … }` parser arm, `Fp8Linear` FieldLoad arm,
+and `is_fp8()` gate on `ferrite_eligible`. No new fan-out machinery
+required.
+
+---
+
 **Mistral bringup landed clean — zero DSL extensions needed.** The
 body at `ferrite-models/src/mistral.rs` is a verbatim copy of
 `llama.rs` math; every structural difference from Llama is handled by
@@ -2177,18 +2265,14 @@ shared Marlin numerical bug). The design notes below stay current.
     of the g_idx argsort + sort_indices → `gptq_repack_into` perm
     pipeline.
 
-  *Compressed-tensors caveat (still open).* `QuantConfig::Gptq` is
-  also the parse target for vLLM compressed-tensors INT4
-  (weight_packed layout, transposed on-disk). Ferrite's GPTQ loader
-  reads `.qweight`, not `.weight_packed`, so a CT model passes
-  `ferrite_eligible`, misses every variant's qweight-shape
-  fingerprint, and bails. Workaround: `FERRITE_DISABLE=1`. Proper
-  fix (future commit): add `StorageFormat::CompressedTensors` or
-  teach the loader to sniff `weight_packed` and transpose. The real
-  architectural fix — making arch-level `Weights::load` return
-  `Ok(None)` on fingerprint miss instead of `bail!` so the caller
-  falls back to the hand-written path — is also open; it removes
-  the hard-failure footgun entirely.
+  *Compressed-tensors — RESOLVED.* `GptqLayout::WeightPacked` arm
+  on `MarlinLinear::load_gptq{,_concat}` reads `.weight_packed` /
+  `.weight_scale` and transposes on the fly; the `ct-int4-sym`
+  preset selects it. Golden:
+  `test_cuda_correctness_tinyllama_1b_w4a16_e2e`. The arch-level
+  `Weights::load` → `Ok(None)` fallback also landed (task #6) — a
+  fingerprint miss now falls back to the hand-written path
+  silently instead of `bail!`ing.
 - **FP8.** `MarlinLinear::forward` isn't the path — FP8 uses
   `Fp8Linear::forward` which calls `cutlass_scaled_mm`. The FP8
   fused-QKV case is the one where `FusedLinear::Split` was

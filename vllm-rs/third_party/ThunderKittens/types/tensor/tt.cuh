@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief The ThunderKittens tensor memory tile struct.
+ * @brief The ThunderKittens tensor memory struct.
  */
 
 #pragma once
@@ -11,15 +11,11 @@
 
 // these are helper structs for type inference
 namespace kittens {
-
-constexpr int MAX_TENSOR_ROWS = 128;
-constexpr int MAX_TENSOR_COLS = 512;
-
 namespace ducks {
 /**
  * @namespace tt
  * 
- * @brief The namespace where concepts and abstract types for tensor tiles live.
+ * @brief The namespace where concepts and abstract types for shared tiles live.
  */
 namespace tt {
 /**
@@ -36,33 +32,30 @@ struct identifier {};
 template<typename T> concept all = requires {
     typename T::identifier; // Checks if T::identifier exists
 } && std::is_same_v<typename T::identifier, identifier>; // Checks if T::identifier is ducks::tt::identifier
-template<typename T> concept half = all<T> && T::rows == MAX_TENSOR_ROWS / 2;
-template<typename T> concept full = all<T> && T::rows == MAX_TENSOR_ROWS;
+template<typename T> concept half = all<T> && T::rows ==  64;
+template<typename T> concept full = all<T> && T::rows == 128;
 } // namespace tt
 } // namespace ducks
 
 /**
- * @brief Tensor memory tile structure for various data types and layouts.
+ * @brief Shared memory tile structure for various data types and layouts.
  *
- * @tparam _T The data type of the elements in the tile. Not packed!
+ * @tparam T The data type of the elements in the tile. Not packed!
  * @tparam _rows The height of the tile.
  * @tparam _cols The width of the tile.
  */
 template<typename _T, int _rows, int _cols>
 struct tt {
-    using identifier = ducks::tt::identifier; ///< Type identifier for tensor memory tile.
+    using identifier = ducks::tt::identifier; ///< Type identifier for shared memory tile.
     using T = base_types::packing<_T>::unpacked_type;
     using T2 = base_types::packing<_T>::packed_type;
     using dtype = T; ///< Data type of the elements in the tile.
 
     static constexpr int rows    = _rows;
     static constexpr int cols    = _cols;
-
-    static_assert(rows / (4 / sizeof(T)) <= MAX_TENSOR_ROWS, "Row dimension must be less than or equal to MAX_TENSOR_ROWS");
-    static_assert(cols / (4 / sizeof(T)) <= MAX_TENSOR_COLS, "Column dimension must be less than or equal to MAX_TENSOR_COLS");
-    static_assert(rows % kittens::BASE_TILE_DIM == 0, "Row dimension must be divisible by the 16");
-    static_assert(cols % kittens::BASE_TILE_DIM == 0, "Column dimension must be divisible by the 16");
-
+    static constexpr int height  = rows / kittens::TILE_ROW_DIM<T>;
+    static constexpr int width   = cols / kittens::TILE_COL_DIM<T>;
+    
     uint32_t addr;
 
     __device__ inline tt() : addr(0) {}
@@ -77,12 +70,14 @@ struct tt {
 #endif
         return TT(addr + (row_offset<<16) + col_offset/(4/(uint32_t)sizeof(T)));
     }
-    template<ducks::tt::all TT>  __device__ inline TT subtile(int col_offset) const {
-        return TT(addr + col_offset/(4/(uint32_t)sizeof(T)));
-    }
     template<int transpose> __device__ inline uint32_t chunk_addr(int chunk) const {
         if constexpr (transpose) {
-            static_assert(!transpose, "Transposed TMEM chunk addressing is not supported due to Blackwell tensor-core limitations.");
+            if constexpr (std::is_same_v<T, bf16> || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3> || std::is_same_v<T, fp8e5m2>) {
+                return addr + ((16 * chunk) << 16);
+            }
+            else {
+                static_assert(sizeof(T) == 999, "Currently unsupported type for input to an mma.");
+            }
         }
         else {
             if constexpr (std::is_same_v<T, bf16> || std::is_same_v<T, half>) {
@@ -95,31 +90,8 @@ struct tt {
                 static_assert(sizeof(T) == 999, "Currently unsupported type for input to an mma.");
             }
         }
-    }
+    } 
+
 };
-
-/* ----------  WRAPPERS FOR PRETTINESS  ---------- */
-
-template<int _height, int _width> using tt_bf = tt<bf16, _height, _width>;
-template<int _height, int _width> using tt_hf = tt<half, _height, _width>;
-template<int _height, int _width> using tt_fl = tt<float, _height, _width>;
-template<int _height, int _width> using tt_fp8e4m3 = tt<fp8e4m3, _height, _width>;
-template<int _height, int _width> using tt_fp8e5m2 = tt<fp8e5m2, _height, _width>;
-template<int _height, int _width> using tt_fp8e8m0 = tt<fp8e8m0, _height, _width>;
-template<int _height, int _width> using tt_fp4e2m1_2 = tt<fp4e2m1_2, _height, _width>;
-template<int _width> using half_tt_bf = tt<bf16, MAX_TENSOR_ROWS / 2, _width>;
-template<int _width> using half_tt_hf = tt<half, MAX_TENSOR_ROWS / 2, _width>;
-template<int _width> using half_tt_fl = tt<float, MAX_TENSOR_ROWS / 2, _width>;
-template<int _width> using half_tt_fp8e4m3 = tt<fp8e4m3, MAX_TENSOR_ROWS / 2, _width>;
-template<int _width> using half_tt_fp8e5m2 = tt<fp8e5m2, MAX_TENSOR_ROWS / 2, _width>;
-template<int _width> using half_tt_fp8e8m0 = tt<fp8e8m0, MAX_TENSOR_ROWS / 2, _width>;
-template<int _width> using half_tt_fp4e2m1_2 = tt<fp4e2m1_2, MAX_TENSOR_ROWS / 2, _width>;
-template<int _width> using full_tt_bf = tt<bf16, MAX_TENSOR_ROWS, _width>;
-template<int _width> using full_tt_hf = tt<half, MAX_TENSOR_ROWS, _width>;
-template<int _width> using full_tt_fl = tt<float, MAX_TENSOR_ROWS, _width>;
-template<int _width> using full_tt_fp8e4m3 = tt<fp8e4m3, MAX_TENSOR_ROWS, _width>;
-template<int _width> using full_tt_fp8e5m2 = tt<fp8e5m2, MAX_TENSOR_ROWS, _width>;
-template<int _width> using full_tt_fp8e8m0 = tt<fp8e8m0, MAX_TENSOR_ROWS, _width>;
-template<int _width> using full_tt_fp4e2m1_2 = tt<fp4e2m1_2, MAX_TENSOR_ROWS, _width>;
 
 } // namespace kittens

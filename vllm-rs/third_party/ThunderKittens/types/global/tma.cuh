@@ -1,8 +1,12 @@
 #pragma once
 
+#include <cuda.h>
+#include <iostream>
+#include <assert.h>
+#include <functional> // for std::hash
+#include <unordered_map>
 #include "../../common/common.cuh"
 #include "../shared/shared.cuh"
-#include "util.cuh"
 
 namespace kittens {
 namespace detail {
@@ -18,21 +22,17 @@ namespace tma {
 * map based on the provided source tensor pointer and the layout specified by the ST template parameter.
 *
 * @tparam ST The source tensor type, which must be TMA-compatible.
-* @tparam axis The first axis (0, 1, or 2; default is 2)
+* @tparam blocks_height The number of tiles present on the height axis in global memory.
+* @tparam blocks_width The number of tiles present on the width axis in global memory. Defaults to 1.
 * @param tma_map Pointer to the CUtensorMap object to be initialized.
 * @param src Pointer to the source tensor data in global memory.
 */
 template<ducks::st::all ST, int axis>
-__host__ static inline void create_tensor_map(
-    CUtensorMap *tma_map, const typename ST::dtype *src, int batch, int depth, int rows, int cols
-) {
+__host__ static inline void create_tensor_map(CUtensorMap *tma_map, const typename ST::dtype *src, int batch, int depth, int rows, int cols) {
     using dtype = typename ST::dtype;
     static_assert(axis==0 || axis==1 || axis==2, "axis must be 0, 1, or 2");
-#ifdef KITTENS_BLACKWELL
-    static_assert(!(std::is_same_v<dtype, fp4e2m1_2> && axis != 2), "Axes 0 and 1 are not yet supported for FP4 type");
-#endif
-
-    constexpr uint32_t  tma_dim = ST::swizzle ? 5 : 4;
+    
+    constexpr uint32_t  tma_dim = 5; // Always use all 5D
     void *global_addr = (void*)(src);
 
     constexpr CUtensorMapDataType     tma_format      = (
@@ -41,21 +41,17 @@ __host__ static inline void create_tensor_map(
         std::is_same_v<dtype, float> ? CU_TENSOR_MAP_DATA_TYPE_FLOAT32 :
         std::is_same_v<dtype, fp8e4m3> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
         std::is_same_v<dtype, fp8e5m2> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
-#ifdef KITTENS_BLACKWELL
-        std::is_same_v<dtype, fp8e8m0> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
-        std::is_same_v<dtype, fp4e2m1_2> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
-#endif
         CUtensorMapDataType(-1)
     );
     constexpr CUtensorMapInterleave   tma_interleave  = CU_TENSOR_MAP_INTERLEAVE_NONE;
     constexpr CUtensorMapL2promotion  tma_l2Promotion = CU_TENSOR_MAP_L2_PROMOTION_NONE;
     constexpr CUtensorMapFloatOOBfill tma_oobFill     = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
-    constexpr CUtensorMapSwizzle      tma_swizzle     = ST::swizzle ? (
+    constexpr CUtensorMapSwizzle      tma_swizzle     = (
         ST::swizzle_bytes == 32  ? CU_TENSOR_MAP_SWIZZLE_32B  :
         ST::swizzle_bytes == 64  ? CU_TENSOR_MAP_SWIZZLE_64B  :
         ST::swizzle_bytes == 128 ? CU_TENSOR_MAP_SWIZZLE_128B : 
         CU_TENSOR_MAP_SWIZZLE_NONE
-    ) : CU_TENSOR_MAP_SWIZZLE_NONE;
+    );
 
     uint64_t gmem_shape [5] = {0, 0, 0, 0, 0};
     uint64_t gmem_stride[4] = {0, 0, 0, 0};
@@ -65,69 +61,50 @@ __host__ static inline void create_tensor_map(
     constexpr uint64_t shared_tile_height = ST::rows; 
     constexpr uint64_t shared_tile_width  = ST::cols;
 
-    // TMA expects the global and shared shapes to be in elements.
     constexpr int swizzle_elements = ST::swizzle_bytes / sizeof(dtype);
 
-    if constexpr (ST::swizzle) {
-        if constexpr (axis == 2) {
-            gmem_shape[0] = swizzle_elements;
-            gmem_shape[1] = (uint64_t)rows;
-            gmem_shape[2] = (uint64_t)(cols+swizzle_elements-1) / swizzle_elements; // round up, note this can potentially screw up out of bounds access handling :/
-            gmem_shape[3] = (uint64_t)depth;
-            gmem_shape[4] = (uint64_t)batch;
-    
-            gmem_stride[0] = (uint64_t)cols * sizeof(dtype); // 2 FP4 elements per col, but sizeof(fp4) = 0.5, so these cancel out
-            gmem_stride[1] = ST::swizzle_bytes;
-            gmem_stride[2] = (uint64_t)rows * cols * sizeof(dtype); // see above
-            gmem_stride[3] = (uint64_t)depth * rows * cols * sizeof(dtype); // see above
-        }
-        else if constexpr (axis == 1) {
-            gmem_shape[0] = swizzle_elements;
-            gmem_shape[1] = (uint64_t)depth;
-            gmem_shape[2] = (uint64_t)(cols+swizzle_elements-1) / swizzle_elements; // round up, note this can potentially screw up out of bounds access handling :/
-            gmem_shape[3] = (uint64_t)rows;
-            gmem_shape[4] = (uint64_t)batch;
-    
-            gmem_stride[0] = (uint64_t)rows * cols * sizeof(dtype);
-            gmem_stride[1] = ST::swizzle_bytes;
-            gmem_stride[2] = (uint64_t)cols * sizeof(dtype);
-            gmem_stride[3] = (uint64_t)depth * rows * cols * sizeof(dtype);
-    
-        }
-        else {
-            gmem_shape[0] = swizzle_elements;
-            gmem_shape[1] = (uint64_t)batch;
-            gmem_shape[2] = (uint64_t)(cols+swizzle_elements-1) / swizzle_elements; // round up, note this can potentially screw up out of bounds access handling :/
-            gmem_shape[3] = (uint64_t)rows;
-            gmem_shape[4] = (uint64_t)depth;
-    
-            gmem_stride[0] = (uint64_t)depth * rows * cols * sizeof(dtype);
-            gmem_stride[1] = ST::swizzle_bytes;
-            gmem_stride[2] = (uint64_t)cols * sizeof(dtype);
-            gmem_stride[3] = (uint64_t)rows * cols * sizeof(dtype);
-        }
-        smem_shape[0] = swizzle_elements;
-        smem_shape[1] = shared_tile_height;
-        smem_shape[2] = shared_tile_width / swizzle_elements;
-        smem_shape[3] = 1;
-        smem_shape[4] = 1;
-    } else {
-        static_assert(axis == 2, "For non-swizzled tiles, only axis 2 is supported.");
-
-        gmem_shape[0] = (uint64_t)cols;
+    if constexpr (axis == 2) {
+        gmem_shape[0] = swizzle_elements;
         gmem_shape[1] = (uint64_t)rows;
-        gmem_shape[2] = (uint64_t)depth;
-        gmem_shape[3] = (uint64_t)batch;
+        gmem_shape[2] = (uint64_t)(cols+swizzle_elements-1) / swizzle_elements; // round up, note this can potentially screw up out of bounds access handling :/
+        gmem_shape[3] = (uint64_t)depth;
+        gmem_shape[4] = (uint64_t)batch;
 
         gmem_stride[0] = (uint64_t)cols * sizeof(dtype);
-        gmem_stride[1] = (uint64_t)rows * cols * sizeof(dtype);
-        gmem_stride[2] = (uint64_t)depth * rows * cols * sizeof(dtype);
-
-        smem_shape[0] = shared_tile_width;
-        smem_shape[1] = shared_tile_height;
-        smem_shape[2] = 1;
-        smem_shape[3] = 1;
+        gmem_stride[1] = ST::swizzle_bytes;
+        gmem_stride[2] = (uint64_t)rows * cols * sizeof(dtype);
+        gmem_stride[3] = (uint64_t)depth * rows * cols * sizeof(dtype);
     }
+    else if constexpr (axis == 1) {
+        gmem_shape[0] = swizzle_elements;
+        gmem_shape[1] = (uint64_t)depth;
+        gmem_shape[2] = (uint64_t)(cols+swizzle_elements-1) / swizzle_elements; // round up, note this can potentially screw up out of bounds access handling :/
+        gmem_shape[3] = (uint64_t)rows;
+        gmem_shape[4] = (uint64_t)batch;
+
+        gmem_stride[0] = (uint64_t)rows * cols * sizeof(dtype);
+        gmem_stride[1] = ST::swizzle_bytes;
+        gmem_stride[2] = (uint64_t)cols * sizeof(dtype);
+        gmem_stride[3] = (uint64_t)depth * rows * cols * sizeof(dtype);
+
+    }
+    else {
+        gmem_shape[0] = swizzle_elements;
+        gmem_shape[1] = (uint64_t)batch;
+        gmem_shape[2] = (uint64_t)(cols+swizzle_elements-1) / swizzle_elements; // round up, note this can potentially screw up out of bounds access handling :/
+        gmem_shape[3] = (uint64_t)rows;
+        gmem_shape[4] = (uint64_t)depth;
+
+        gmem_stride[0] = (uint64_t)depth * rows * cols * sizeof(dtype);
+        gmem_stride[1] = ST::swizzle_bytes;
+        gmem_stride[2] = (uint64_t)cols * sizeof(dtype);
+        gmem_stride[3] = (uint64_t)rows * cols * sizeof(dtype);
+    }
+    smem_shape[0] = swizzle_elements;
+    smem_shape[1] = shared_tile_height;
+    smem_shape[2] = shared_tile_width / swizzle_elements;
+    smem_shape[3] = 1;
+    smem_shape[4] = 1;
 
     // ensure that the global address is always 16-byte aligned 
     assert((reinterpret_cast<uint64_t>(global_addr) & 0b1111) == 0);
@@ -177,17 +154,7 @@ __host__ static inline void create_tensor_map(
     const char *error_string;
     CUresult res = cuGetErrorString(result, &error_string);
     if (result != CUDA_SUCCESS) {
-        std::string error_msg = format_tma_error(
-            "tile", error_string,
-            batch, depth, rows, cols,
-            tma_map, tma_format, tma_dim, global_addr,
-            gmem_shape_ptr, gmem_stride_ptr,
-            smem_shape_ptr, smem_stride_ptr,
-            5, 4, 5, 5,
-            tma_interleave, tma_swizzle, tma_l2Promotion, tma_oobFill,
-            "ST::rows: " + std::to_string(ST::rows) + "\n  ST::cols: " + std::to_string(ST::cols)
-        );
-        throw std::runtime_error(error_msg);
+        std::cerr << "Error in tile TMA descriptor creation: " << error_string << std::endl;
     }
 }
 
@@ -199,6 +166,8 @@ __host__ static inline void create_tensor_map(
 * map based on the provided source tensor pointer and the layout specified by the ST template parameter.
 *
 * @tparam ST The source tensor type, which must be TMA-compatible.
+* @tparam blocks_height The number of tiles present on the height axis in global memory.
+* @tparam blocks_width The number of tiles present on the width axis in global memory. Defaults to 1.
 * @param src Pointer to the source tensor data in global memory.
 * @returns Pointer to the CUtensorMap object to be initialized.
 */
@@ -214,6 +183,18 @@ __host__ static inline CUtensorMap* allocate_and_create_tensor_map(const typenam
 
 /* ----------   Create vector tensor map descriptor (HOST)  ---------- */
 
+// First, we need a template system to determine how to divide up a long shared vector into multiple subvectors.
+// We have to do this because the first dimension for TMA is limited to 256 elements.
+// Our goal is to find the largest multiple of 16 that is <= 256 and divides the vector length evenly.
+
+template<typename SV, int D=16> struct find_vector_divider {
+    static constexpr int value = (SV::length % (16*D) == 0 && (SV::length < 256 || ((16*D)*sizeof(typename SV::dtype)) % 128 == 0)) ?
+        16*D : find_vector_divider<SV, D-1>::value;
+};
+template<typename SV> struct find_vector_divider<SV, 1> { static constexpr int value = 16; }; // base case
+template<typename SV> constexpr int sv_tma_dim1 = find_vector_divider<SV>::value; // inner dim
+template<typename SV> constexpr int sv_tma_dim2 = (SV::length / sv_tma_dim1<SV>);
+
 /**
 * @brief Creates a tensor map for the given source vector.
 *
@@ -222,7 +203,7 @@ __host__ static inline CUtensorMap* allocate_and_create_tensor_map(const typenam
 * map based on the provided source tensor pointer and the layout specified by the SV template parameter.
 *
 * @tparam SV The source tensor type, which must be TMA-compatible.
-* @tparam axis The first axis (0, 1, or 2; default is 2)
+* @tparam num_vectors The number of vectors present in global memory.
 * @param tma_map Pointer to the CUtensorMap object to be initialized.
 * @param src Pointer to the source tensor data in global memory.
 */
@@ -243,10 +224,6 @@ __host__ static inline void create_tensor_map(CUtensorMap *tma_map, const typena
         std::is_same_v<dtype, float> ? CU_TENSOR_MAP_DATA_TYPE_FLOAT32 :
         std::is_same_v<dtype, fp8e4m3> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
         std::is_same_v<dtype, fp8e5m2> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
-#ifdef KITTENS_BLACKWELL
-        std::is_same_v<dtype, fp8e8m0> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
-        std::is_same_v<dtype, fp4e2m1_2> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
-#endif
         CUtensorMapDataType(-1)
     );
     constexpr CUtensorMapInterleave   tma_interleave  = CU_TENSOR_MAP_INTERLEAVE_NONE;
@@ -290,17 +267,7 @@ __host__ static inline void create_tensor_map(CUtensorMap *tma_map, const typena
     const char *error_string;
     CUresult res = cuGetErrorString(result, &error_string);
     if (result != CUDA_SUCCESS) {
-        std::string error_msg = format_tma_error(
-            "vector", error_string,
-            batch, depth, rows, cols,
-            tma_map, tma_format, tma_dim, global_addr,
-            gmem_shape_ptr, gmem_stride_ptr,
-            smem_shape_ptr, smem_stride_ptr,
-            4, 3, 4, 4,
-            tma_interleave, swizzle, tma_l2Promotion, tma_oobFill,
-            "SV::length: " + std::to_string(SV::length)
-        );
-        throw std::runtime_error(error_msg);
+        std::cerr << "Error in vector TMA descriptor creation: " << error_string << std::endl;
     }
 };
 

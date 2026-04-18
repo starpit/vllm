@@ -1,13 +1,11 @@
-/**
- * @file
- * @brief Tensor Memory Accelerator (TMA) operations targetting ThunderKittens vector types.
- */
-
 #pragma once
 
 #include "../../../../common/common.cuh"
 #include "../../../../types/types.cuh"
-#include "../../util/util.cuh"
+#include "../util/util.cuh"
+
+#include <cuda.h>
+#include <iostream>
 
 // This is a macro that helps us define default cache policy versions of each function.
 #define __KITTENS_TMA_DEFINE_DEFAULT_LOAD_CACHE_VEC__(function_name) \
@@ -17,8 +15,8 @@ __device__ static inline void function_name(SV &dst, const GL &src, const COORD 
 }
 #define __KITTENS_TMA_DEFINE_PGL_DEFAULT_LOAD_CACHE_VEC__(function_name) \
 template<ducks::sv::all SV, ducks::pgl::all PGL, ducks::coord::vec COORD=coord<SV>> \
-__device__ static inline void function_name(SV &dst, const PGL &src, const COORD &idx) { \
-    function_name<cache_policy::NORMAL>(dst, src, idx); \
+__device__ static inline void function_name(SV &dst, const PGL &src, const COORD &idx, const int dev_idx) { \
+    function_name<cache_policy::NORMAL>(dst, src, idx, dev_idx); \
 }
 #define __KITTENS_TMA_DEFINE_DEFAULT_STORE_CACHE_VEC__(function_name) \
 template<ducks::sv::all SV, ducks::gl::all GL, ducks::coord::vec COORD=coord<SV>> \
@@ -27,8 +25,8 @@ __device__ static inline void function_name(const GL &dst, const SV &src, const 
 }
 #define __KITTENS_TMA_DEFINE_PGL_DEFAULT_STORE_CACHE_VEC__(function_name) \
 template<ducks::sv::all SV, ducks::pgl::all PGL, ducks::coord::vec COORD=coord<SV>> \
-__device__ static inline void function_name(const PGL &dst, const SV &src, const COORD &idx) { \
-    function_name<cache_policy::NORMAL>(dst, src, idx); \
+__device__ static inline void function_name(const PGL &dst, const SV &src, const COORD &idx, const int dev_idx) { \
+    function_name<cache_policy::NORMAL>(dst, src, idx, dev_idx); \
 }
 #define __KITTENS_TMA_DEFINE_SEMAPHORE_CACHE_VEC__(function_name) \
 template<ducks::sv::all SV, ducks::gl::all GL, ducks::coord::vec COORD=coord<SV>> \
@@ -37,8 +35,8 @@ __device__ static inline void function_name(SV &dst, const GL &src, const COORD 
 }
 #define __KITTENS_TMA_DEFINE_PGL_SEMAPHORE_CACHE_VEC__(function_name) \
 template<ducks::sv::all SV, ducks::pgl::all PGL, ducks::coord::vec COORD=coord<SV>> \
-__device__ static inline void function_name(SV &dst, const PGL &src, const COORD &idx, semaphore& bar) { \
-    function_name<cache_policy::NORMAL>(dst, src, idx, bar); \
+__device__ static inline void function_name(SV &dst, const PGL &src, const COORD &idx, semaphore& bar, const int dev_idx) { \
+    function_name<cache_policy::NORMAL>(dst, src, idx, bar, dev_idx); \
 }
 #define __KITTENS_TMA_DEFINE_CLUSTER_SEMAPHORE_CACHE_VEC__(function_name) \
 template<ducks::sv::all SV, ducks::gl::all GL, ducks::coord::vec COORD=coord<SV>> \
@@ -47,8 +45,8 @@ __device__ static inline void function_name(SV &dst, const GL &src, const COORD 
 }
 #define __KITTENS_TMA_DEFINE_PGL_CLUSTER_SEMAPHORE_CACHE_VEC__(function_name) \
 template<ducks::sv::all SV, ducks::pgl::all PGL, ducks::coord::vec COORD=coord<SV>> \
-__device__ static inline void function_name(SV &dst, const PGL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) { \
-    function_name<cache_policy::NORMAL>(dst, src, idx, bar, cluster_mask, dst_mbar_cta); \
+__device__ static inline void function_name(SV &dst, const PGL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, const int dev_idx, int dst_mbar_cta=-1) { \
+    function_name<cache_policy::NORMAL>(dst, src, idx, bar, cluster_mask, dst_mbar_cta, dev_idx); \
 }
 
 
@@ -275,9 +273,9 @@ __device__ static inline void store_async(const GL &dst, const SV &src, const CO
 __KITTENS_TMA_DEFINE_DEFAULT_STORE_CACHE_VEC__(store_async)
 
 template<cache_policy policy, ducks::sv::all SV, ducks::pgl::all PGL, ducks::coord::vec COORD=coord<SV>>
-__device__ static inline void store_async(const PGL &dst, const SV &src, const COORD &idx) {
+__device__ static inline void store_async(const PGL &dst, const SV &src, const COORD &idx, const int dev_idx) {
     coord<> unit_coord = idx.template unit_coord<-1, 3>();
-    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst.template get_tma<SV, -1>());
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst.template get_tma<SV, -1>(dev_idx));
     uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
     for(int i = 0; i < ::kittens::detail::tma::sv_tma_dim2<SV>; i++) {
         coord<> tma_coord = unit_coord;
@@ -305,9 +303,9 @@ __device__ static inline void store_add_async(const GL &dst, const SV &src, cons
 __KITTENS_TMA_DEFINE_DEFAULT_STORE_CACHE_VEC__(store_add_async)
 
 template<cache_policy policy, ducks::sv::all SV, ducks::pgl::all PGL, ducks::coord::vec COORD=coord<SV>>
-__device__ static inline void store_add_async(const PGL &dst, const SV &src, const COORD &idx) {
+__device__ static inline void store_add_async(const PGL &dst, const SV &src, const COORD &idx, const int dev_idx) {
     coord<> unit_coord = idx.template unit_coord<-1, 3>();
-    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst.template get_tma<SV, -1>());
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst.template get_tma<SV, -1>(dev_idx));
     uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
     for(int i = 0; i < ::kittens::detail::tma::sv_tma_dim2<SV>; i++) {
         coord<> tma_coord = unit_coord;
@@ -336,10 +334,10 @@ __device__ static inline void store_min_async(const GL &dst, const SV &src, cons
 __KITTENS_TMA_DEFINE_DEFAULT_STORE_CACHE_VEC__(store_min_async)
 
 template<cache_policy policy, ducks::sv::all SV, ducks::pgl::all PGL, ducks::coord::vec COORD=coord<SV>>
-__device__ static inline void store_min_async(const PGL &dst, const SV &src, const COORD &idx) {
+__device__ static inline void store_min_async(const PGL &dst, const SV &src, const COORD &idx, const int dev_idx) {
     static_assert(!std::is_same_v<typename SV::dtype, float>, "TMA does not support async min/max reductions for fp32 types.");
     coord<> unit_coord = idx.template unit_coord<-1, 3>();
-    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst.template get_tma<SV, -1>());
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst.template get_tma<SV, -1>(dev_idx));
     uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
     for(int i = 0; i < ::kittens::detail::tma::sv_tma_dim2<SV>; i++) {
         coord<> tma_coord = unit_coord;
@@ -368,10 +366,10 @@ __device__ static inline void store_max_async(const GL &dst, const SV &src, cons
 __KITTENS_TMA_DEFINE_DEFAULT_STORE_CACHE_VEC__(store_max_async)
 
 template<cache_policy policy, ducks::sv::all SV, ducks::pgl::all PGL, ducks::coord::vec COORD=coord<SV>>
-__device__ static inline void store_max_async(const PGL &dst, const SV &src, const COORD &idx) {
+__device__ static inline void store_max_async(const PGL &dst, const SV &src, const COORD &idx, const int dev_idx) {
     static_assert(!std::is_same_v<typename SV::dtype, float>, "TMA does not support async min/max reductions for fp32 types.");
     coord<> unit_coord = idx.template unit_coord<-1, 3>();
-    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst.template get_tma<SV, -1>());
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst.template get_tma<SV, -1>(dev_idx));
     uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
     for(int i = 0; i < ::kittens::detail::tma::sv_tma_dim2<SV>; i++) {
         coord<> tma_coord = unit_coord;

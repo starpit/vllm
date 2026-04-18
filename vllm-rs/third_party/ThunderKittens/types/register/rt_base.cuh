@@ -5,6 +5,8 @@
  
 #pragma once
 
+#include <type_traits>
+
 #include "../../common/common.cuh"
 #include "rt_layout.cuh"
 #include "rv_layout.cuh"
@@ -33,7 +35,7 @@ struct identifier {};
 /**
  * @brief Basic tile structure for computation in registers.
  *
- * @tparam _T The data type used for the matrix elements.
+ * @tparam T2 The packed data type used for the matrix elements.
  * @tparam _layout The layout of the base tile, either row-major or column-major.
  *
  * This type is a primarily utility for building larger inline templates
@@ -49,21 +51,17 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     using T2 = kittens::base_types::packing<_T>::packed_type;
     using dtype = T2; ///< Data type of the matrix elements
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+    #ifdef KITTENS_HOPPER
     static_assert(
-        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2> || std::is_same_v<dtype, fp8e4m3_4> || std::is_same_v<dtype, fp8e5m2_4>
-#if defined(KITTENS_BLACKWELL)
-        || std::is_same_v<dtype, fp8e8m0_4> || std::is_same_v<dtype, fp4e2m1_4>
-#endif
-        ,
+        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2> || std::is_same_v<dtype, fp8e4m3_4> || std::is_same_v<dtype, fp8e5m2_4>,
         "rt_base was provided an unsupported type."
     );
-#else
+    #else
     static_assert(
         std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2>,
         "rt_base was provided an unsupported type."
     );
-#endif
+    #endif
 
     static constexpr int tile_size_row        = kittens::TILE_ROW_DIM<T>; // < Tile size is a constant 16 for everyone
     static constexpr int tile_size_col        = kittens::TILE_COL_DIM<T>;
@@ -98,8 +96,8 @@ namespace rt_base {
 */
 template<typename T> concept all = requires {
     typename T::identifier; // Checks if T::identifier exists
-} && std::is_same_v<typename T::identifier, identifier>; // Checks if T::identifier is ducks::rt_base::identifier
-} // namespace rt_base
+} && std::is_same_v<typename T::identifier, identifier>; // Checks if T::identifier is ducks::rt::identifier
+} // namespace rt
 } // namespace ducks
 
 /* ----------  WRAPPERS FOR PRETTINESS  ---------- */
@@ -107,12 +105,8 @@ template<typename T> concept all = requires {
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fl = rt_base<float, L>;
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_bf = rt_base<bf16, L>;
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_hf = rt_base<half, L>;
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#ifdef KITTENS_HOPPER
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fp8e4m3 = rt_base<fp8e4m3, L>;
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fp8e5m2 = rt_base<fp8e5m2, L>;
-#endif
-#ifdef KITTENS_BLACKWELL
-template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fp8e8m0 = rt_base<fp8e8m0, L>;
-template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fp4e2m1_2 = rt_base<fp4e2m1_2, L>;
 #endif
 }

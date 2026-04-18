@@ -1,7 +1,8 @@
 /**
  * @file
- * @brief Functions for a group scope to call tile cluster-wide TMA functions.
+ * @brief Functions for a group scope to call tile TMA cluster functions.
  */
+
 
 #ifdef KITTENS_BLACKWELL
 template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>

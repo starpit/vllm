@@ -4,14 +4,14 @@
  */
 
 // All compilation targets can use the warp-scope MMA operations.
-#include "warp.cuh"
+#include "warp/warp.cuh"
 
 // Hopper has its own warpgroup-scope MMA operations.
-#if defined(KITTENS_HOPPER)
-#include "warpgroup.cuh"
+#ifdef KITTENS_HOPPER
+#include "warpgroup/warpgroup.cuh"
 #endif
 
-// Blackwell has its own MMA operations (Tensor Core Generation 5).
+// Blackwell has its own tensor-scope MMA operations.
 #ifdef KITTENS_BLACKWELL
-#include "tcgen05.cuh"
+#include "tensor/tensor.cuh"
 #endif

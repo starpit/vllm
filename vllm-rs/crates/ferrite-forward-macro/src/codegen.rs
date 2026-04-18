@@ -527,10 +527,13 @@ fn try_emit_tk_forward(
     let head_dim = get("head_dim").unwrap_or(hidden_dim / num_attention_heads);
     let vocab_size = get("vocab_size")?;
 
-    // The vendored attention_partial.cu only supports head_dim=64 and GQA_RATIO=4.
-    // Skip TK for incompatible models — they'll use the BSP megakernel instead.
-    let gqa_ratio = num_attention_heads / num_kv_heads;
-    if head_dim != 64 || gqa_ratio != 4 {
+    // Throughput ops require head_dim=128 and all matmul dims divisible by 256
+    // (matmul_out_block_size=256, INPUT_PIPELINE_STAGES=4, tile_size=64 → 64*4=256).
+    if head_dim != 128 {
+        return None;
+    }
+    let qkv_dim = (num_attention_heads + 2 * num_kv_heads) * head_dim;
+    if hidden_dim % 256 != 0 || intermediate_dim % 256 != 0 || qkv_dim % 256 != 0 || vocab_size % 256 != 0 {
         return None;
     }
 
@@ -541,10 +544,14 @@ fn try_emit_tk_forward(
         head_dim,
         num_attention_heads,
         num_kv_heads,
-        kv_block_size: 16,
-        matvec_block_size: 16,
+        kv_page_size: 128,
+        prefill_kv_block_size: 128,
+        decode_kv_block_size: 16,
+        matmul_out_block_size: 256,
+        matmul_batch_block_size: 128,
         vocab_size,
         sm_count: target.num_sms,
+        num_devices: 1,
     };
 
     let model_name = model.source_stem.replace(['-', '.'], "_");
@@ -557,160 +564,6 @@ fn try_emit_tk_forward(
         let cu_path = mega_dir.join(format!("{}.cu", generated.launch_fn_name));
         let _ = std::fs::write(&cu_path, &generated.cuda_source);
     }
-
-    // Build KVM-format instruction schedule.
-    //
-    // The KVM controller expects composite fused opcodes (1-7) matching the
-    // ThunderKittens ops. Each instruction is 32 ints (INSTRUCTION_WIDTH=32).
-    // Instructions are organized as [num_sms][max_instructions_per_sm][32].
-    // The controller loops `rows()` times; opcode 0 = NoOp (skip).
-    //
-    // We generate instructions matching the Python scheduler in
-    // Megakernels/demos/latency/scheduler.py.
-    const KVM_INST_WIDTH: usize = 32;
-    let sm_count = target.num_sms as usize;
-    let block_size = 16usize; // matvec_block_size for all ops
-
-    // Helper: serialize an instruction into a 32-word array (opcode + fields, zero-padded).
-    fn serialize_kvm_inst(words: &[i32]) -> [i32; 32] {
-        let mut out = [0i32; 32];
-        for (i, &w) in words.iter().enumerate() {
-            out[i] = w;
-        }
-        out
-    }
-
-    // Per-layer instruction generation, then round-robin assignment to SMs.
-    let mut all_instructions: Vec<[i32; 32]> = Vec::new();
-
-    for layer in 0..num_layers as i32 {
-        // ── Op 1: RMS_QKV_MatVecRopeAppend ──
-        // Distribute qkv_outdim / block_size blocks proportionally across SMs.
-        let qkv_outdim = (num_attention_heads + 2 * num_kv_heads) * head_dim;
-        let num_qkv_blocks = qkv_outdim as usize / block_size;
-        let blocks_per_sm = num_qkv_blocks as f64 / sm_count as f64;
-        for sm_idx in 0..sm_count {
-            let start = (sm_idx as f64 * blocks_per_sm).round() as i32;
-            let end = ((sm_idx + 1) as f64 * blocks_per_sm).round() as i32;
-            all_instructions.push(serialize_kvm_inst(&[1, layer, start, end]));
-        }
-
-        // ── Op 2: PartialAttention ──
-        // For skip_attn_reduction mode: 1 partial per kv_head.
-        let num_partials = 1i32;
-        for kv_head_idx in 0..num_kv_heads as i32 {
-            for partial_idx in 0..num_partials {
-                all_instructions.push(serialize_kvm_inst(&[
-                    2, layer, kv_head_idx, num_partials, partial_idx,
-                ]));
-            }
-        }
-
-        // ── Op 4: O_ProjResidual ──
-        // One instruction per output block (hidden_dim / block_size blocks).
-        let num_o_blocks = hidden_dim as usize / block_size;
-        for o_block_idx in 0..num_o_blocks as i32 {
-            all_instructions.push(serialize_kvm_inst(&[
-                4, layer, o_block_idx, o_block_idx + 1, 0,
-            ]));
-        }
-
-        // ── Op 5: LayerNormDoubleMatVecSiLU (upgate) ──
-        // Distribute intermediate_dim / block_size blocks round-robin across SMs.
-        let num_up_blocks = intermediate_dim as usize / block_size;
-        for sm_idx in 0..sm_count {
-            let mut block_idxs: Vec<i32> = Vec::new();
-            let mut idx = sm_idx;
-            while idx < num_up_blocks {
-                block_idxs.push(idx as i32);
-                idx += sm_count;
-            }
-            if !block_idxs.is_empty() {
-                // Serialization: opcode, layer_idx, len(block_idxs), block_idxs...
-                let mut words = vec![5i32, layer, block_idxs.len() as i32];
-                words.extend_from_slice(&block_idxs);
-                all_instructions.push(serialize_kvm_inst(&words));
-            }
-        }
-
-        // ── Op 6: DownProjResidual ──
-        // num_col_splits = intermediate_dim / hidden_dim; distribute jobs across SMs.
-        let num_down_blocks = hidden_dim as usize / block_size;
-        let num_col_splits = intermediate_dim as usize / hidden_dim as usize;
-        let mut jobs: Vec<(usize, usize)> = Vec::new();
-        for col_idx in 0..num_col_splits {
-            for down_block_idx in 0..num_down_blocks {
-                jobs.push((col_idx, down_block_idx));
-            }
-        }
-        let mut num_assigned = 0usize;
-        for sm_idx in 0..sm_count {
-            let jobs_left = jobs.len() - num_assigned;
-            let sms_left = sm_count - sm_idx;
-            let jobs_per_sm = jobs_left as f64 / sms_left as f64;
-            let jobs_for_this_sm = jobs_per_sm.round() as usize;
-            if jobs_for_this_sm == 0 { continue; }
-            let raw_sliced = &jobs[num_assigned..num_assigned + jobs_for_this_sm];
-            // Only take jobs with same col_idx as first job in slice.
-            let col_idx = raw_sliced[0].0;
-            let sliced: Vec<_> = raw_sliced.iter()
-                .take_while(|j| j.0 == col_idx)
-                .collect();
-            let start_block = sliced[0].1 as i32;
-            let end_block = start_block + sliced.len() as i32;
-            all_instructions.push(serialize_kvm_inst(&[
-                6, layer, start_block, end_block, col_idx as i32,
-            ]));
-            num_assigned += sliced.len();
-        }
-    }
-
-    // ── Op 7: RMS_LM_Head ──
-    let num_logit_blocks = vocab_size as usize / block_size;
-    let blocks_per_sm_lm = num_logit_blocks as f64 / sm_count as f64;
-    for sm_idx in 0..sm_count {
-        let start = (sm_idx as f64 * blocks_per_sm_lm).round() as i32;
-        let end = ((sm_idx + 1) as f64 * blocks_per_sm_lm).round() as i32;
-        all_instructions.push(serialize_kvm_inst(&[7, start, end]));
-    }
-
-    // Round-robin assign to SMs.
-    let mut per_sm: Vec<Vec<[i32; 32]>> = vec![Vec::new(); sm_count];
-    for (i, inst) in all_instructions.iter().enumerate() {
-        per_sm[i % sm_count].push(*inst);
-    }
-
-    // Pad all SM queues to the same length with NoOp (opcode 0).
-    let max_per_sm = per_sm.iter().map(|v| v.len()).max().unwrap_or(0);
-    for queue in &mut per_sm {
-        while queue.len() < max_per_sm {
-            queue.push([0i32; 32]);
-        }
-    }
-
-    // Serialize instruction tensor: [num_sms][max_per_sm][32]
-    let total_words = sm_count * max_per_sm * KVM_INST_WIDTH;
-    let inst_data: Vec<u32> = {
-        let mut data = vec![0u32; total_words];
-        for (sm, queue) in per_sm.iter().enumerate() {
-            for (i, inst) in queue.iter().enumerate() {
-                let offset = (sm * max_per_sm + i) * KVM_INST_WIDTH;
-                for (j, &w) in inst.iter().enumerate() {
-                    data[offset + j] = w as u32;
-                }
-            }
-        }
-        data
-    };
-
-    let num_barriers = num_layers as usize * 10 * (num_attention_heads + 2 * num_kv_heads) as usize;
-    let inst_data_tokens: Vec<proc_macro2::TokenStream> = inst_data
-        .iter()
-        .map(|w| quote! { #w })
-        .collect();
-    let total_words_lit = total_words;
-    let num_barriers_lit = num_barriers;
-    let max_per_sm_lit = max_per_sm;
 
     // ── Classify weight accessors by TK role ──
     //
@@ -836,6 +689,9 @@ fn try_emit_tk_forward(
     let num_sms_usize = target.num_sms as usize;
     let qkv_out_dim = (num_attention_heads + 2 * num_kv_heads) * head_dim;
     let qkv_out_usize = qkv_out_dim as usize;
+    let matmul_batch_block_size_usize = dims.matmul_batch_block_size as usize;
+    let matmul_out_block_size_usize = dims.matmul_out_block_size as usize;
+    let kv_page_size_usize = dims.kv_page_size as usize;
 
     // QKV weight stacking: each layer's fused QKV → contiguous buffer.
     let qkv_copy_stmts: Vec<TokenStream> = qkv_fields.iter().enumerate().map(|(i, (_, field))| {
@@ -953,16 +809,6 @@ fn try_emit_tk_forward(
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
             use ::std::sync::atomic::Ordering;
 
-            // One-time weight stacking statics (persistent GPU allocs).
-            static __TK_INIT: ::std::sync::Once = ::std::sync::Once::new();
-            static __TK_QKV: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-            static __TK_O: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-            static __TK_GATE: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-            static __TK_UP: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-            static __TK_DOWN: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-            static __TK_ATTN_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-            static __TK_MLP_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-
             unsafe extern "C" {
                 fn #launch_fn(#(#extern_params,)* __stream: u64) -> i32;
             }
@@ -977,63 +823,75 @@ fn try_emit_tk_forward(
             let __qkv_out: usize = #qkv_out_usize;
             let __vocab: usize = #vocab_usize;
             let __num_sms: usize = #num_sms_usize;
+            let __matmul_batch_bs: usize = #matmul_batch_block_size_usize;
+            let __matmul_out_bs: usize = #matmul_out_block_size_usize;
+            let __kv_page_size: usize = #kv_page_size_usize;
 
             // ── One-time weight stacking (persistent GPU allocs) ──
             __TK_INIT.call_once(|| {
-                ::tracing::info!("TK megakernel: initializing weight stacking for {} layers, hidden={}, sms={}",
+                ::tracing::info!("TK megakernel (throughput): initializing weight stacking for {} layers, hidden={}, sms={}",
                     __num_layers, __hidden, __num_sms);
-                // QKV: [num_layers, qkv_out, hidden] bf16
                 let __qkv_per_layer = __qkv_out * __hidden * 2;
                 let __qkv_total = __num_layers * __qkv_per_layer;
+                eprintln!("[TK] allocating QKV: {} bytes", __qkv_total);
                 let __tk_qkv_buf = ::ferrite_cuda_core::driver::mem_alloc(__qkv_total)
                     .expect("tk qkv alloc");
+                eprintln!("[TK] copying QKV weights...");
                 #(#qkv_copy_stmts)*
                 __TK_QKV.store(__tk_qkv_buf as u64, Ordering::Relaxed);
+                eprintln!("[TK] QKV done");
 
-                // O: [num_layers, hidden, hidden] bf16
                 let __o_per_layer = __hidden * __hidden * 2;
                 let __o_total = __num_layers * __o_per_layer;
+                eprintln!("[TK] allocating O: {} bytes", __o_total);
                 let __tk_o_buf = ::ferrite_cuda_core::driver::mem_alloc(__o_total)
                     .expect("tk o alloc");
+                eprintln!("[TK] copying O weights...");
                 #(#o_copy_stmts)*
                 __TK_O.store(__tk_o_buf as u64, Ordering::Relaxed);
+                eprintln!("[TK] O done");
 
-                // Gate + Up: split from fused [gate|up]
                 let __gate_per_layer = __intermediate * __hidden * 2;
                 let __gate_total = __num_layers * __gate_per_layer;
+                eprintln!("[TK] allocating gate+up: {} bytes each", __gate_total);
                 let __tk_gate_buf = ::ferrite_cuda_core::driver::mem_alloc(__gate_total)
                     .expect("tk gate alloc");
                 let __tk_up_buf = ::ferrite_cuda_core::driver::mem_alloc(__gate_total)
                     .expect("tk up alloc");
+                eprintln!("[TK] copying gate+up weights...");
                 #(#gate_up_copy_stmts)*
                 __TK_GATE.store(__tk_gate_buf as u64, Ordering::Relaxed);
                 __TK_UP.store(__tk_up_buf as u64, Ordering::Relaxed);
+                eprintln!("[TK] gate+up done");
 
-                // Down: [num_layers, hidden, intermediate] bf16
                 let __down_per_layer = __hidden * __intermediate * 2;
                 let __down_total = __num_layers * __down_per_layer;
+                eprintln!("[TK] allocating down: {} bytes", __down_total);
                 let __tk_down_buf = ::ferrite_cuda_core::driver::mem_alloc(__down_total)
                     .expect("tk down alloc");
+                eprintln!("[TK] copying down weights...");
                 #(#down_copy_stmts)*
                 __TK_DOWN.store(__tk_down_buf as u64, Ordering::Relaxed);
+                eprintln!("[TK] down done");
 
-                // Attn norm: [num_layers, hidden] bf16
                 let __norm_per_layer = __hidden * 2;
                 let __norm_total = __num_layers * __norm_per_layer;
+                eprintln!("[TK] allocating norms: {} bytes", __norm_total);
                 let __tk_attn_norm_buf = ::ferrite_cuda_core::driver::mem_alloc(__norm_total)
                     .expect("tk attn_norm alloc");
                 #(#attn_norm_copy_stmts)*
                 __TK_ATTN_NORM.store(__tk_attn_norm_buf as u64, Ordering::Relaxed);
 
-                // MLP norm: [num_layers, hidden] bf16
                 let __tk_mlp_norm_buf = ::ferrite_cuda_core::driver::mem_alloc(__norm_total)
                     .expect("tk mlp_norm alloc");
                 #(#mlp_norm_copy_stmts)*
                 __TK_MLP_NORM.store(__tk_mlp_norm_buf as u64, Ordering::Relaxed);
+                eprintln!("[TK] norms done");
 
-                // Sync stacking copies.
+                eprintln!("[TK] stream_synchronize...");
                 ::ferrite_cuda_core::driver::stream_synchronize(__stream)
                     .expect("tk weight stack sync");
+                eprintln!("[TK] weight stacking complete");
             });
 
             let __qkv_ptr = __TK_QKV.load(Ordering::Relaxed) as u64;
@@ -1046,69 +904,150 @@ fn try_emit_tk_forward(
             let __lm_head_norm_ptr = wm.#lm_head_norm_ident.weight.raw_ptr() as u64;
             let __lm_head_ptr = wm.#lm_head_ident.dense_weight().raw_ptr() as u64;
 
-            // ── Upload instruction tensor to device ──
-            let __max_inst_per_sm: usize = #max_per_sm_lit;
-            static INST_DATA: &[u32] = &[#(#inst_data_tokens),*];
-            let __inst_bytes = #total_words_lit * 4;
+            // ── Batch size and padding ──
+            let __num_tokens = (*ctx.input_ids).dim(0);
+            // Pad batch_size up to matmul_batch_block_size.
+            let __batch_size = ((__num_tokens + __matmul_batch_bs - 1) / __matmul_batch_bs) * __matmul_batch_bs;
+            let __batch_size = __batch_size.max(__matmul_batch_bs); // at least 1 block
+
+            // ── Detect prefill vs decode for KV metadata + instruction generation ──
+            let __is_prefill = ctx.max_seqlen_q > 1;
+            let (__num_prefill_tokens_val, __prefill_meta, __decode_meta, __prefill_seq_info);
+            if __is_prefill {
+                let pm = ::ferrite_forward::tk_paged_kv::build_prefill_metadata(
+                    ctx, __kv_page_size, __stream,
+                );
+                __num_prefill_tokens_val = pm.num_prefill_tokens as i32;
+                __prefill_seq_info = Some(pm.seq_info.clone());
+                __prefill_meta = Some(pm);
+                __decode_meta = None;
+            } else {
+                let dm = ::ferrite_forward::tk_paged_kv::build_decode_metadata(
+                    ctx, __kv_page_size, __stream,
+                );
+                __num_prefill_tokens_val = 0i32;
+                __prefill_seq_info = None;
+                __prefill_meta = None;
+                __decode_meta = Some(dm);
+            }
+            let __empty_buf = device.caching.alloc(4);
+            ::ferrite_cuda_core::driver::memset_d8(__empty_buf, 0, 4, __stream)
+                .expect("empty buf");
+
+            // ── Runtime instruction generation (work-stealing, throughput scheduler) ──
+            let __inst_data = ::ferrite_forward::tk_instructions::build_throughput_instructions(
+                __batch_size,
+                __num_tokens,
+                __num_layers,
+                __num_heads,
+                __num_kv_heads,
+                __head_dim,
+                __hidden,
+                __intermediate,
+                __vocab,
+                __matmul_batch_bs,
+                __matmul_out_bs,
+                __prefill_seq_info.as_ref(),
+            );
+            let __total_instructions = __inst_data.len() / 32;
+            let __inst_bytes = __inst_data.len() * 4;
             let __inst_buf = device.caching.alloc(__inst_bytes);
             ::ferrite_cuda_core::driver::memcpy_htod_async(
-                __inst_buf, INST_DATA.as_ptr() as *const u8, __inst_bytes,
+                __inst_buf, __inst_data.as_ptr() as *const u8, __inst_bytes,
                 __stream,
             ).expect("instruction upload failed");
 
-            // ── Allocate and zero barrier counters ──
-            let __bar_bytes = #num_barriers_lit * 4;
+            // ── Global instruction index (atomic counter for work-stealing) ──
+            let __gii_buf = device.caching.alloc(4);
+            ::ferrite_cuda_core::driver::memset_d8(
+                __gii_buf, 0, 4, __stream,
+            ).expect("global_inst_idx memset failed");
+
+            // ── Barrier counters ──
+            // Barriers: gl<uint, -1,-1,-1,-1> accessed as {layer, opcode-1, batch_block, col}
+            // where col can be intermediate/output/qkv block index (gate_silu, up_matmul, qkv)
+            let __num_batch_blocks = __batch_size / __matmul_batch_bs;
+            let __num_qkv_blocks = __qkv_out / __matmul_out_bs;
+            let __num_output_blocks = __hidden / __matmul_out_bs;
+            let __num_intermediate_blocks = __intermediate / __matmul_out_bs;
+            let __bar_b = __num_layers;
+            let __bar_d = 13; // number of opcodes
+            let __bar_r = __num_batch_blocks.max(1);
+            let __bar_c = __num_intermediate_blocks.max(__num_output_blocks).max(__num_qkv_blocks).max(2);
+            let __bar_bytes = __bar_b * __bar_d * __bar_r * __bar_c * 4;
             let __bar_buf = device.caching.alloc(__bar_bytes);
             ::ferrite_cuda_core::driver::memset_d8(
                 __bar_buf, 0, __bar_bytes, __stream,
             ).expect("barrier memset failed");
 
-            // ── Timing buffer (required by KVM: [num_sms][max_inst_per_sm][128]) ──
-            let __timing_bytes = __num_sms * __max_inst_per_sm * 128 * 4;
+            // ── Timing buffer: [1, total_instructions, 128] ──
+            let __timing_bytes = __total_instructions * 128 * 4;
             let __timing_buf = device.caching.alloc(__timing_bytes);
             ::ferrite_cuda_core::driver::memset_d8(
                 __timing_buf, 0, __timing_bytes, __stream,
             ).expect("timing memset failed");
 
             // ── Embedding gather: input_ids → hidden_states ──
-            let __hidden_states = ::ferrite_kernels::kernels::embedding_gather(
+            let __hidden_states_raw = ::ferrite_kernels::kernels::embedding_gather(
                 wm.#embed_ident.weight,
                 *ctx.input_ids,
                 &mut device.caching,
                 __stream,
             );
+            // Pad hidden_states to batch_size if needed.
+            let __hidden_states = if __batch_size > __num_tokens {
+                let __padded = device.caching.alloc_tensor(
+                    &[__batch_size, __hidden],
+                    ::ferrite_cuda_core::DType::BF16,
+                );
+                ::ferrite_cuda_core::driver::memset_d8(
+                    __padded.raw_ptr(), 0, __batch_size * __hidden * 2, __stream,
+                ).expect("hidden pad zero");
+                ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                    __padded.raw_ptr(), __hidden_states_raw.raw_ptr(),
+                    __num_tokens * __hidden * 2, __stream,
+                ).expect("hidden pad copy");
+                __padded
+            } else {
+                __hidden_states_raw
+            };
 
-            // ── Activation buffers ──
+            // ── Activation buffers (batch_size-dependent) ──
+            let __rms_rope_int = device.caching.alloc_tensor(
+                &[__batch_size, __hidden],
+                ::ferrite_cuda_core::DType::BF16,
+            );
+            let __rms_gate_int = device.caching.alloc_tensor(
+                &[__batch_size, __hidden],
+                ::ferrite_cuda_core::DType::BF16,
+            );
             let __q_post_rope = device.caching.alloc_tensor(
-                &[1, __num_heads * __head_dim],
+                &[__batch_size, __num_heads * __head_dim],
                 ::ferrite_cuda_core::DType::BF16,
             );
             let __attn_out = device.caching.alloc_tensor(
-                &[1, __hidden],
+                &[__batch_size, __hidden],
                 ::ferrite_cuda_core::DType::BF16,
             );
-            let __attn_lse_rows = ((__num_sms + 15) / 16) * 16;
-            let __attn_lse = device.caching.alloc_tensor(
-                &[__num_heads, __attn_lse_rows],
-                ::ferrite_cuda_core::DType::F32,
-            );
-            let __attn_out_int = device.caching.alloc_tensor(
-                &[__num_heads, __num_sms, __head_dim],
-                ::ferrite_cuda_core::DType::F32,
-            );
             let __silu_out = device.caching.alloc_tensor(
-                &[1, __intermediate],
+                &[__batch_size, __intermediate],
+                ::ferrite_cuda_core::DType::BF16,
+            );
+            let __rms_lm_int = device.caching.alloc_tensor(
+                &[__batch_size, __hidden],
                 ::ferrite_cuda_core::DType::BF16,
             );
             let __logits = device.caching.alloc_tensor(
-                &[1, __vocab],
+                &[__batch_size, __vocab],
                 ::ferrite_cuda_core::DType::BF16,
             );
 
-            // ── KV cache: stack per-layer caches into contiguous buffers ──
+            // ── KV cache: pass paged tensors directly (NO D2D stacking!) ──
+            // KV pool layout: [num_blocks, page_size, kv_heads, head_dim] per layer.
+            // Stack across layers: [num_layers * num_blocks, page_size, kv_heads, head_dim].
             let __kv_num_blocks = (*ctx.kv_cache.k_cache(0)).dim(0);
-            let __kv_block_size = (*ctx.kv_cache.k_cache(0)).dim(1);
-            let __k_per_layer = __kv_num_blocks * __kv_block_size * __num_kv_heads * __head_dim * 2;
+            let __kv_page_dim = (*ctx.kv_cache.k_cache(0)).dim(1);
+            let __k_per_layer = __kv_num_blocks * __kv_page_dim * __num_kv_heads * __head_dim * 2;
             let __k_total = __num_layers * __k_per_layer;
             let __k_stacked = device.caching.alloc(__k_total);
             let __v_stacked = device.caching.alloc(__k_total);
@@ -1127,38 +1066,32 @@ fn try_emit_tk_forward(
                 ).expect("v cache stack");
             }
 
-            // ── RoPE tables (separate cos, sin as f32) ──
+            // ── RoPE tables ──
             let __rope_cos_ptr = ctx.rotary.cos_cache.raw_ptr() as u64;
             let __rope_sin_ptr = ctx.rotary.sin_cache.raw_ptr() as u64;
             let __rope_rows = ctx.rotary.cos_cache.dim(0) as i32;
 
+            // (Paged KV metadata built above, before instruction generation.)
+
             // ── Scalars ──
-            let __pos_id: u32 = {
-                let mut __val = 0u32;
-                ::ferrite_cuda_core::driver::memcpy_dtoh_async(
-                    &mut __val as *mut u32 as *mut u8,
-                    (*ctx.positions).raw_ptr(),
-                    4,
-                    __stream,
-                ).expect("pos read");
-                ::ferrite_cuda_core::driver::stream_synchronize(__stream)
-                    .expect("pos sync");
-                __val
-            };
             let __attn_scale: f32 = 1.0 / (__head_dim as f32).sqrt();
             let __rms_norm_eps: f32 = wm.#first_attn_norm.eps;
+            let __num_pages_total = __kv_num_blocks as i32;
 
             // ── Launch TK megakernel ──
             let __stream_u64 = __stream as u64;
             let __ret = #launch_fn(
-                // VM state
+                // Barriers pgl
                 __bar_buf as u64,                              // bar_ptr
-                __num_layers as i32,                           // bar_depth
-                10i32,                                         // bar_rows (10 opcode slots per layer, matching Python)
+                __bar_b as i32,                                // bar_b
+                __bar_d as i32,                                // bar_d
+                __bar_r as i32,                                // bar_r
+                __bar_c as i32,                                // bar_c
+                // Instructions (work-stealing)
                 __inst_buf as u64,                             // instructions_ptr
-                __num_sms as i32,                              // instructions_depth
-                __max_inst_per_sm as i32,                      // instructions_rows
+                __total_instructions as i32,                   // total_instructions
                 __timing_buf as u64,                           // timings_ptr
+                __gii_buf as u64,                              // global_inst_idx_ptr
                 // Weights (stacked across layers)
                 __qkv_ptr,                                     // qkv_weights_ptr
                 __num_layers as i32,                           // qkv_weights_depth
@@ -1178,53 +1111,66 @@ fn try_emit_tk_forward(
                 __down_ptr,                                    // down_weights_ptr
                 __num_layers as i32,                           // down_weights_depth
                 __hidden as i32,                               // down_weights_rows
-                // Norm weights (stacked across layers)
+                // Norm weights
                 __attn_norm_ptr,                               // attn_norm_weights_ptr
                 __num_layers as i32,                           // attn_norm_weights_rows
                 __mlp_norm_ptr,                                // mlp_norm_weights_ptr
                 __num_layers as i32,                           // mlp_norm_weights_rows
                 __lm_head_norm_ptr,                            // lm_head_norm_weights_ptr
                 1i32,                                          // lm_head_norm_weights_rows
-                // KV cache (stacked): gl<bf16, -1, -1, -1, head_dim>
-                // Layout: [num_layers, total_kv_tokens, kv_heads, head_dim]
-                // where total_kv_tokens = kv_num_blocks * kv_block_size
-                // TMA coord {layer_idx, block_idx, kv_head_idx, 0} — block_idx is tile index
+                // KV cache (stacked)
                 __k_stacked as u64,                            // k_cache_ptr
-                (__num_layers as i32),                         // k_cache_batch = num_layers
-                ((__kv_num_blocks * __kv_block_size) as i32),  // k_cache_depth = total tokens
-                (__num_kv_heads as i32),                       // k_cache_rows = kv_heads
+                (__num_layers * __kv_num_blocks) as i32,       // k_cache_batch
+                __kv_page_dim as i32,                          // k_cache_depth
                 __v_stacked as u64,                            // v_cache_ptr
-                (__num_layers as i32),                         // v_cache_batch = num_layers
-                ((__kv_num_blocks * __kv_block_size) as i32),  // v_cache_depth = total tokens
-                (__num_kv_heads as i32),                       // v_cache_rows = kv_heads
+                (__num_layers * __kv_num_blocks) as i32,       // v_cache_batch
+                __kv_page_dim as i32,                          // v_cache_depth
                 // RoPE
                 __rope_cos_ptr,                                // rope_cos_ptr
                 __rope_sin_ptr,                                // rope_sin_ptr
                 __rope_rows,                                   // rope_rows
                 // Activation buffers
                 __hidden_states.raw_ptr() as u64,     // hidden_states_ptr
+                __rms_rope_int.raw_ptr() as u64,      // rms_rope_intermediates_ptr
+                __rms_gate_int.raw_ptr() as u64,      // rms_gate_intermediates_ptr
                 __q_post_rope.raw_ptr() as u64,       // q_post_rope_ptr
+                (__num_heads * __head_dim) as i32,             // q_post_rope_cols
                 __attn_out.raw_ptr() as u64,          // attn_out_ptr
-                __attn_lse.raw_ptr() as u64,          // attn_lse_ptr
-                __attn_lse_rows as i32,                        // attn_lse_rows
-                __attn_out_int.raw_ptr() as u64,      // attn_out_intermediates_ptr
-                __num_sms as i32,                              // attn_out_intermediates_rows
                 __silu_out.raw_ptr() as u64,          // silu_out_ptr
+                __rms_lm_int.raw_ptr() as u64,        // rms_lm_head_intermediates_ptr
                 __logits.raw_ptr() as u64,            // logits_ptr
                 __vocab as i32,                                // logits_cols
+                // Paged KV metadata
+                (*ctx.positions).raw_ptr() as u64,             // position_ids_ptr
+                (*ctx.slot_mapping).raw_ptr() as u64,          // kv_append_indices_ptr
+                // Prefill metadata
+                if let Some(ref pm) = __prefill_meta { pm.qo_indptr_gpu as u64 } else { __empty_buf as u64 },
+                if let Some(ref pm) = __prefill_meta { pm.qo_indptr_len as i32 } else { 0i32 },
+                if let Some(ref pm) = __prefill_meta { pm.kv_indptr_gpu as u64 } else { __empty_buf as u64 },
+                if let Some(ref pm) = __prefill_meta { pm.kv_indptr_len as i32 } else { 0i32 },
+                if let Some(ref pm) = __prefill_meta { pm.kv_indices_gpu as u64 } else { __empty_buf as u64 },
+                if let Some(ref pm) = __prefill_meta { pm.kv_indices_len as i32 } else { 0i32 },
+                if let Some(ref pm) = __prefill_meta { pm.kv_last_page_len_gpu as u64 } else { __empty_buf as u64 },
+                if let Some(ref pm) = __prefill_meta { pm.kv_last_page_len_len as i32 } else { 0i32 },
+                // Decode metadata
+                if let Some(ref dm) = __decode_meta { dm.kv_indptr_gpu as u64 } else { __empty_buf as u64 },
+                if let Some(ref dm) = __decode_meta { dm.kv_indptr_len as i32 } else { 0i32 },
+                if let Some(ref dm) = __decode_meta { dm.kv_indices_gpu as u64 } else { __empty_buf as u64 },
+                if let Some(ref dm) = __decode_meta { dm.kv_indices_len as i32 } else { 0i32 },
+                if let Some(ref dm) = __decode_meta { dm.kv_last_page_len_gpu as u64 } else { __empty_buf as u64 },
+                if let Some(ref dm) = __decode_meta { dm.kv_last_page_len_len as i32 } else { 0i32 },
                 // Scalars
-                __pos_id,                                      // pos_id
                 __attn_scale,                                  // attn_scale
                 __rms_norm_eps,                                // rms_norm_eps
-                1i32,                                          // skip_attn_reduction (=true, 1 partition)
+                __num_pages_total,                             // num_pages
+                __batch_size as i32,                           // batch_size
+                __num_prefill_tokens_val,                      // num_prefill_tokens
                 // Stream
                 __stream_u64,
             );
             assert_eq!(__ret, 0, "TK megakernel launch failed (CUDA error {})", __ret);
 
             // ── Copy KV cache back from stacked buffer ──
-            // The TK kernel writes new K/V tokens during rms_qkv_rope_append.
-            // Copy updated caches back to the per-layer KvCachePool tensors.
             for __layer in 0..__num_layers {
                 ::ferrite_cuda_core::driver::memcpy_dtod_async(
                     (*ctx.kv_cache.k_cache(__layer)).raw_ptr(),
@@ -1240,8 +1186,20 @@ fn try_emit_tk_forward(
                 ).expect("v cache writeback");
             }
 
-            // Return logits.
-            __logits
+            // Slice logits to actual num_tokens (drop padding).
+            if __batch_size > __num_tokens {
+                let __out = device.caching.alloc_tensor(
+                    &[__num_tokens, __vocab],
+                    ::ferrite_cuda_core::DType::BF16,
+                );
+                ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                    __out.raw_ptr(), __logits.raw_ptr(),
+                    __num_tokens * __vocab * 2, __stream,
+                ).expect("logits slice");
+                __out
+            } else {
+                __logits
+            }
         }
     };
 
@@ -1912,6 +1870,26 @@ pub fn emit_model(
 
     quote! {
         #weights
+
+        // Module-level statics shared across all bucket forward fns.
+        // Using module scope ensures weight stacking runs exactly once
+        // regardless of which workload bucket is hit first.
+        #[cfg(feature = "cuda")]
+        static __TK_INIT: ::std::sync::Once = ::std::sync::Once::new();
+        #[cfg(feature = "cuda")]
+        static __TK_QKV: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        #[cfg(feature = "cuda")]
+        static __TK_O: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        #[cfg(feature = "cuda")]
+        static __TK_GATE: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        #[cfg(feature = "cuda")]
+        static __TK_UP: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        #[cfg(feature = "cuda")]
+        static __TK_DOWN: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        #[cfg(feature = "cuda")]
+        static __TK_ATTN_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+        #[cfg(feature = "cuda")]
+        static __TK_MLP_NORM: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
 
         #(#bucket_fns)*
         #(#backbone_fns)*

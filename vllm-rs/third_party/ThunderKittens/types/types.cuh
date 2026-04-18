@@ -9,7 +9,7 @@
 #include "shared/shared.cuh"
 #include "global/global.cuh"
 #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
-#include "system/system.cuh"
+#include "device/device.cuh"
 #endif
 #ifdef KITTENS_BLACKWELL
 #include "tensor/tensor.cuh"

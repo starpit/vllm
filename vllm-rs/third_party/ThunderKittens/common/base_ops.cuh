@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <cuda_bf16.h>
+#include <limits>
 #include "base_types.cuh"
 
 namespace kittens {
@@ -92,7 +94,7 @@ template<> __device__ inline half_2 exp::op<half_2>(const half_2 &x) { return h2
  *
  * @tparam T The data type of the input and output values.
  * @param x[in] The input value.
- * @return The exponential of the input value, in base 2.
+ * @return The exponential of the input value.
  */
 struct exp2 {
     template<typename T> static __device__ inline T op(const T &x) { return exp2f(x); }
@@ -373,9 +375,9 @@ template<> __device__ inline float2 fma_AxBtC::op<float2>(const float2 &a, const
  * This is particularly useful for attention mechanisms in neural networks.
  *
  * @tparam T The data type of the input and output values.
- * @param a[in] The first multiplicand.
- * @param b[in] The addend.
- * @param c[in] The second multiplicand.
+ * @param a[in] The first input value.
+ * @param b[in] The third input value to be added.
+ * @param c[in] The second input value.
  * @return The result of the fused multiply-add operation.
  */
 struct fma_AxCtB { // this is the one needed for attention

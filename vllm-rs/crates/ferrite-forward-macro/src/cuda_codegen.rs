@@ -161,16 +161,21 @@ pub fn generate_megakernel(wave_idx: usize, phases: &[DevicePhase]) -> Generated
     }
 }
 
-// ── TK megakernel codegen ────────────────────────────────────────
+// ── TK megakernel codegen (throughput branch) ───────────────────
 //
-// Emits a `.cu` following the exact KVM pattern (llama.cu + llama.cuh):
-//   1. kittens.cuh + megakernel.cuh includes
-//   2. Model-specific `config` struct + `globals_t` template
-//   3. Op includes + aliases
-//   4. extern "C" launch wrapper
+// Emits a `.cu` that includes the vendored cross-gpu-llama ops from
+// `third_party/Megakernels/demos/cross-gpu-llama/`. The generated
+// file overrides model dimension #defines, includes llama.cuh for
+// config + globals_t, includes all 12 op .cu files, and provides
+// an `extern "C"` launch wrapper that constructs the globals_t
+// aggregate from flat C params and launches the megakernel.
 //
-// The ops, config struct, and globals_t are taken directly from the
-// vendored Megakernels repo (`third_party/Megakernels/`).
+// Key differences from the old latency-demo codegen:
+// - 13 ops (not 7), matmul-based (not matvec), M>1 support
+// - Work-stealing (ENABLE_GLOBAL_WORK_QUEUE=true)
+// - Paged KV cache with indptr/indices/last_page_len
+// - pgl types for barriers, activations (num_devices template param)
+// - Runtime instruction generation (batch_size varies per call)
 
 /// Model dimensions needed to instantiate the TK megakernel.
 #[derive(Clone, Debug)]
@@ -181,10 +186,14 @@ pub struct TkModelDims {
     pub head_dim: u32,
     pub num_attention_heads: u32,
     pub num_kv_heads: u32,
-    pub kv_block_size: u32,
-    pub matvec_block_size: u32,
+    pub kv_page_size: u32,
+    pub prefill_kv_block_size: u32,
+    pub decode_kv_block_size: u32,
+    pub matmul_out_block_size: u32,
+    pub matmul_batch_block_size: u32,
     pub vocab_size: u32,
     pub sm_count: u32,
+    pub num_devices: u32,
 }
 
 /// Generated TK megakernel CUDA source + metadata.
@@ -196,241 +205,89 @@ pub struct GeneratedTkMegakernel {
     pub flat_params: Vec<(String, String)>,
 }
 
-/// Generate a `.cu` source for a TK megakernel following the KVM pattern.
+/// Generate a `.cu` source for a TK megakernel using the throughput branch
+/// ops from `third_party/Megakernels/demos/cross-gpu-llama/`.
 ///
 /// This emits:
-/// - The fixed `config` struct (16 consumer warps, static scheduling)
-/// - A `globals_t` template instantiated with model dimensions
-/// - Op includes and aliases matching the vendored Llama ops
-/// - An `extern "C"` launch wrapper that fills `globals_t` from flat
-///   C params and calls `mk<config, globals, ops...>`
+/// - Model dimension `#define` overrides
+/// - `#include "llama.cuh"` for config + globals_t
+/// - All 12 op `.cu` includes
+/// - Op aliases and `mk<>` instantiation
+/// - An `extern "C"` launch wrapper that constructs globals_t from
+///   flat C params (including pgl wrappers for single-GPU)
 pub fn generate_tk_megakernel(
     model_name: &str,
     dims: &TkModelDims,
 ) -> GeneratedTkMegakernel {
     let launch_fn_name = format!("tk_megakernel_{model_name}_launch");
-    let globals_typedef = format!("{model_name}_globals");
+    let d = dims;
 
     let mut src = String::new();
 
     // ── Header ──
-    writeln!(src, "// Auto-generated TK megakernel for {model_name}").unwrap();
+    writeln!(src, "// Auto-generated TK megakernel (throughput) for {model_name}").unwrap();
     writeln!(src, "// DO NOT EDIT — regenerate via the forward! proc macro.").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "#include <cstring>").unwrap();
+
+    // ── Override model dimension #defines BEFORE including llama.cuh ──
+    // llama.cuh defines defaults (70B); we override for our model.
+    writeln!(src, "#define LLAMA_NUM_LAYERS {}", d.num_layers).unwrap();
+    writeln!(src, "#define LLAMA_HIDDEN_DIM {}", d.hidden_dim).unwrap();
+    writeln!(src, "#define LLAMA_INTERMEDIATE_DIM {}", d.intermediate_dim).unwrap();
+    writeln!(src, "#define LLAMA_HEAD_DIM {}", d.head_dim).unwrap();
+    writeln!(src, "#define LLAMA_NUM_ATTENTION_HEADS {}", d.num_attention_heads).unwrap();
+    writeln!(src, "#define LLAMA_NUM_KV_HEADS {}", d.num_kv_heads).unwrap();
+    writeln!(src, "#define LLAMA_KV_PAGE_SIZE {}", d.kv_page_size).unwrap();
+    writeln!(src, "#define LLAMA_PREFILL_KV_BLOCK_SIZE {}", d.prefill_kv_block_size).unwrap();
+    writeln!(src, "#define LLAMA_DECODE_KV_BLOCK_SIZE {}", d.decode_kv_block_size).unwrap();
+    writeln!(src, "#define LLAMA_MATMUL_OUT_BLOCK_SIZE {}", d.matmul_out_block_size).unwrap();
+    writeln!(src, "#define LLAMA_MATMUL_BATCH_BLOCK_SIZE {}", d.matmul_batch_block_size).unwrap();
+    writeln!(src, "#define SM_COUNT {}", d.sm_count).unwrap();
+    writeln!(src, "#define LLAMA_NUM_DEVICES {}", d.num_devices).unwrap();
+    writeln!(src).unwrap();
+
+    // ── Precompiled header deps (kittens + megakernel must precede all ops) ──
     writeln!(src, "#include \"kittens.cuh\"").unwrap();
     writeln!(src, "#include \"megakernel.cuh\"").unwrap();
     writeln!(src).unwrap();
 
-    // ── Opcodes (matching llama.cuh) ──
-    writeln!(src, "#define OPCODE_RMS_QKV_MatVecRopeAppend 1").unwrap();
-    writeln!(src, "#define OPCODE_PartialAttention 2").unwrap();
-    writeln!(src, "#define OPCODE_AttentionReduction 3").unwrap();
-    writeln!(src, "#define OPCODE_O_ProjResidual 4").unwrap();
-    writeln!(src, "#define OPCODE_RMS_DoubleMatVecSiLU 5").unwrap();
-    writeln!(src, "#define OPCODE_DownProjResidual 6").unwrap();
-    writeln!(src, "#define OPCODE_RMS_LM_Head 7").unwrap();
+    // ── Op includes (order mirrors llama.cu from the vendored cross-gpu-llama) ──
+    writeln!(src, "#include \"attention_decode.cu\"").unwrap();
+    writeln!(src, "#include \"attention_prefill.cu\"").unwrap();
+    writeln!(src, "#include \"batched_rms_norm.cu\"").unwrap();
+    writeln!(src, "#include \"gate_silu.cu\"").unwrap();
+    writeln!(src, "#include \"inc_barriers.cu\"").unwrap();
+    writeln!(src, "#include \"llama.cuh\"").unwrap();
+    writeln!(src, "#include \"lm_head.cu\"").unwrap();
+    writeln!(src, "#include \"matmul_adds.cu\"").unwrap();
+    writeln!(src, "#include \"qkv_rope_append.cu\"").unwrap();
+    writeln!(src, "#include \"up_matmul.cu\"").unwrap();
+    writeln!(src, "#include \"all_device_barrier.cu\"").unwrap();
     writeln!(src).unwrap();
 
-    // ── Config struct (matching KVM) ──
-    writeln!(src, "struct config {{").unwrap();
-    writeln!(src, "    static constexpr int INSTRUCTION_PIPELINE_STAGES = 2;").unwrap();
-    writeln!(src, "    static constexpr int INSTRUCTION_PIPELINE_STAGES_BITS = 1;").unwrap();
-    writeln!(src, "    static constexpr int INSTRUCTION_WIDTH = 32;").unwrap();
-    writeln!(src, "    using instruction_t = int[INSTRUCTION_WIDTH];").unwrap();
-    writeln!(src, "    static constexpr int TIMING_WIDTH = 128;").unwrap();
-    writeln!(src, "    using timing_t = int[TIMING_WIDTH];").unwrap();
-    writeln!(src, "    static constexpr int DYNAMIC_SEMAPHORES = 32;").unwrap();
-    writeln!(src, "    static constexpr bool ENABLE_GLOBAL_WORK_QUEUE = false;").unwrap();
-    writeln!(src, "    static constexpr int GLOBAL_WORK_QUEUE_PARTITIONS = 1;").unwrap();
-    writeln!(src, "    static constexpr int NUM_CONSUMER_WARPS = 16;").unwrap();
-    writeln!(src, "    static constexpr int NUM_WARPS = 4 + NUM_CONSUMER_WARPS;").unwrap();
-    writeln!(src, "    static constexpr int NUM_THREADS = NUM_WARPS * ::kittens::WARP_THREADS;").unwrap();
-    writeln!(src, "    static constexpr int NUM_BLOCKS = 1;").unwrap();
-    writeln!(src, "    static constexpr int CLUSTER_BLOCKS = 1;").unwrap();
-    writeln!(src, "    static constexpr int MAX_SHARED_MEMORY = ::kittens::MAX_SHARED_MEMORY;").unwrap();
-    writeln!(src, "    static constexpr int SCRATCH_BYTES = 4096;").unwrap();
-    writeln!(src, "    static constexpr int STATIC_SHARED_MEMORY =").unwrap();
-    writeln!(src, "        512 + INSTRUCTION_PIPELINE_STAGES *").unwrap();
-    writeln!(src, "                  (SCRATCH_BYTES + (INSTRUCTION_WIDTH + TIMING_WIDTH) * 4 +").unwrap();
-    writeln!(src, "                   DYNAMIC_SEMAPHORES * 8);").unwrap();
-    writeln!(src, "    static constexpr int DYNAMIC_SHARED_MEMORY =").unwrap();
-    writeln!(src, "        MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;").unwrap();
-    writeln!(src, "    static constexpr int PAGE_SIZE = 16384;").unwrap();
-    writeln!(src, "    static constexpr int NUM_PAGES = DYNAMIC_SHARED_MEMORY / PAGE_SIZE;").unwrap();
-    writeln!(src, "    static constexpr bool TIMING_RECORD_ENABLED = false;").unwrap();
-    writeln!(src, "    static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;").unwrap();
-    writeln!(src, "    static constexpr int CONSUMER_REGISTERS = 104;").unwrap();
-    writeln!(src, "    static constexpr int NON_CONSUMER_REGISTERS = 64;").unwrap();
-    writeln!(src, "}};").unwrap();
-    writeln!(src).unwrap();
-
-    // ── globals_t ──
-    let d = dims;
-    writeln!(src, "template <int _num_layers, int _hidden_dim, int _intermediate_dim,").unwrap();
-    writeln!(src, "          int _head_dim, int _num_attention_heads, int _num_kv_heads,").unwrap();
-    writeln!(src, "          int _kv_block_size, int _matvec_block_size, int _sm_count>").unwrap();
-    writeln!(src, "struct globals_t {{").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    constexpr static int num_layers = _num_layers;").unwrap();
-    writeln!(src, "    constexpr static int matvec_block_size = _matvec_block_size;").unwrap();
-    writeln!(src, "    constexpr static int kv_block_size = _kv_block_size;").unwrap();
-    writeln!(src, "    constexpr static int head_dim = _head_dim;").unwrap();
-    writeln!(src, "    constexpr static int hidden_dim = _hidden_dim;").unwrap();
-    writeln!(src, "    constexpr static int intermediate_dim = _intermediate_dim;").unwrap();
-    writeln!(src, "    constexpr static int num_attention_heads = _num_attention_heads;").unwrap();
-    writeln!(src, "    constexpr static int num_kv_heads = _num_kv_heads;").unwrap();
-    writeln!(src, "    constexpr static int sm_count = _sm_count;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    using instruction_layout = megakernel::instruction_layout<config>;").unwrap();
-    writeln!(src, "    using timing_layout = megakernel::timing_layout<config>;").unwrap();
-    writeln!(src).unwrap();
-    // Type aliases for kittens global layouts
-    writeln!(src, "    using weights_t =").unwrap();
-    writeln!(src, "        kittens::gl<kittens::bf16, 1, -1, -1, hidden_dim,").unwrap();
-    writeln!(src, "           kittens::st_bf<matvec_block_size, 512>>;").unwrap();
-    writeln!(src, "    using weights_big_indim_t =").unwrap();
-    writeln!(src, "        kittens::gl<kittens::bf16, 1, -1, -1, intermediate_dim,").unwrap();
-    writeln!(src, "           kittens::st_bf<matvec_block_size, 512>>;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    using activations_t = kittens::gl<kittens::bf16, 1, 1, 1, hidden_dim,").unwrap();
-    writeln!(src, "        kittens::sv_bf<hidden_dim>, kittens::sv_bf<head_dim>, kittens::sv_bf<matvec_block_size>>;").unwrap();
-    writeln!(src, "    using activations_big_indim_t =").unwrap();
-    writeln!(src, "        kittens::gl<kittens::bf16, 1, 1, 1, intermediate_dim, kittens::sv_bf<intermediate_dim>,").unwrap();
-    writeln!(src, "           kittens::sv_bf<hidden_dim>, kittens::sv_bf<matvec_block_size>>;").unwrap();
-    writeln!(src, "    using logits_t = kittens::gl<kittens::bf16, 1, 1, 1, -1, kittens::sv_bf<matvec_block_size>>;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    using norm_weights_t = kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim,").unwrap();
-    writeln!(src, "        kittens::sv_bf<hidden_dim>, kittens::sv_bf<matvec_block_size>>;").unwrap();
-    writeln!(src, "    using rope_table_t = kittens::gl<float, 1, 1, -1, head_dim, kittens::sv_fl<head_dim>>;").unwrap();
-    writeln!(src, "    using kv_cache_t = kittens::gl<kittens::bf16, -1, -1, -1, head_dim,").unwrap();
-    writeln!(src, "        kittens::sv_bf<matvec_block_size>,").unwrap();
-    writeln!(src, "        kittens::tma::descriptor<kittens::st_bf<kv_block_size, head_dim>, 1>>;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    using attn_out_intermediates_t =").unwrap();
-    writeln!(src, "        kittens::gl<float, 1, num_attention_heads, -1, head_dim, kittens::sv_fl<head_dim>>;").unwrap();
-    writeln!(src, "    using attn_lse_intermediates_t = kittens::gl<float, 1, 1, num_attention_heads, -1,").unwrap();
-    writeln!(src, "        kittens::sv_fl<((sm_count + 15) / 16) * 16>>;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    using barriers =").unwrap();
-    writeln!(src, "        kittens::gl<uint, 1, -1, -1, num_attention_heads + 2 * num_kv_heads>;").unwrap();
-    writeln!(src).unwrap();
-    // Fields
-    writeln!(src, "    barriers Bar;").unwrap();
-    writeln!(src, "    instruction_layout instructions;").unwrap();
-    writeln!(src, "    timing_layout timings;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    weights_t qkv_weights;").unwrap();
-    writeln!(src, "    norm_weights_t attn_norm_weights;").unwrap();
-    writeln!(src, "    weights_t o_weights;").unwrap();
-    writeln!(src, "    norm_weights_t mlp_norm_weights;").unwrap();
-    writeln!(src, "    weights_t up_weights;").unwrap();
-    writeln!(src, "    weights_t gate_weights;").unwrap();
-    writeln!(src, "    weights_big_indim_t down_weights;").unwrap();
-    writeln!(src, "    norm_weights_t lm_head_norm_weights;").unwrap();
-    writeln!(src, "    weights_t lm_head_weights;").unwrap();
-    writeln!(src, "    kv_cache_t k_cache;").unwrap();
-    writeln!(src, "    kv_cache_t v_cache;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    rope_table_t rope_cos;").unwrap();
-    writeln!(src, "    rope_table_t rope_sin;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    activations_t hidden_states;").unwrap();
-    writeln!(src, "    activations_t q_post_rope;").unwrap();
-    writeln!(src, "    activations_t attn_out;").unwrap();
-    writeln!(src, "    attn_lse_intermediates_t attn_lse_intermediates;").unwrap();
-    writeln!(src, "    attn_out_intermediates_t attn_out_intermediates;").unwrap();
-    writeln!(src, "    activations_big_indim_t silu_out;").unwrap();
-    writeln!(src, "    logits_t logits;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    unsigned int pos_id;").unwrap();
-    writeln!(src, "    float attn_scale;").unwrap();
-    writeln!(src, "    float rms_norm_eps;").unwrap();
-    writeln!(src, "    bool skip_attn_reduction;").unwrap();
-    writeln!(src).unwrap();
-    writeln!(src, "    dim3 grid() {{ return dim3(sm_count); }}").unwrap();
-    writeln!(src, "    dim3 block() {{ return dim3(config::NUM_THREADS); }}").unwrap();
-    writeln!(src, "    int dynamic_shared_memory() {{ return config::DYNAMIC_SHARED_MEMORY; }}").unwrap();
-    writeln!(src, "}};").unwrap();
-    writeln!(src).unwrap();
-
-    // ── Typedef instantiation ──
-    writeln!(
-        src,
-        "typedef globals_t<{}, {}, {}, {}, {}, {}, {}, {}, {}> {globals_typedef};",
-        d.num_layers, d.hidden_dim, d.intermediate_dim, d.head_dim,
-        d.num_attention_heads, d.num_kv_heads, d.kv_block_size,
-        d.matvec_block_size, d.sm_count,
-    ).unwrap();
-    writeln!(src).unwrap();
-
-    // ── Forward declarations for ops ──
-    writeln!(src, "template <typename config = config, typename globals = {globals_typedef}>").unwrap();
-    writeln!(src, "struct attention_partial;").unwrap();
-    writeln!(src, "template <typename config = config, typename globals = {globals_typedef}>").unwrap();
-    writeln!(src, "struct attention_reduction;").unwrap();
-    writeln!(src, "template <typename config = config, typename globals = {globals_typedef}>").unwrap();
-    writeln!(src, "struct rms_qkv_rope_append;").unwrap();
-    writeln!(src, "template <typename config = config, typename globals = {globals_typedef}>").unwrap();
-    writeln!(src, "struct downproj;").unwrap();
-    writeln!(src, "template <typename config = config, typename globals = {globals_typedef}>").unwrap();
-    writeln!(src, "struct o_proj;").unwrap();
-    writeln!(src, "template <typename config = config, typename globals = {globals_typedef}>").unwrap();
-    writeln!(src, "struct rms_upgate_silu;").unwrap();
-    writeln!(src, "template <typename config = config, typename globals = {globals_typedef}>").unwrap();
-    writeln!(src, "struct rms_lm_head;").unwrap();
-    writeln!(src).unwrap();
-
-    // ── Op includes ──
-    // Prevent llama.cuh from being included by the op .cu files — our generated
-    // code already defines config, globals_t, and the forward declarations.
-    writeln!(src, "#define LLAMA_CUH_INCLUDED").unwrap();
-    // The ops use LLAMA_1B_* macros for compile-time template args (tile sizes).
-    writeln!(src, "#define LLAMA_1B_NUM_LAYERS {}", d.num_layers).unwrap();
-    writeln!(src, "#define LLAMA_1B_HIDDEN_DIM {}", d.hidden_dim).unwrap();
-    writeln!(src, "#define LLAMA_1B_INTERMEDIATE_DIM {}", d.intermediate_dim).unwrap();
-    writeln!(src, "#define LLAMA_1B_HEAD_DIM {}", d.head_dim).unwrap();
-    writeln!(src, "#define LLAMA_1B_NUM_ATTENTION_HEADS {}", d.num_attention_heads).unwrap();
-    writeln!(src, "#define LLAMA_1B_NUM_KV_HEADS {}", d.num_kv_heads).unwrap();
-    writeln!(src, "#define LLAMA_1B_KV_BLOCK_SIZE {}", d.kv_block_size).unwrap();
-    writeln!(src, "#define LLAMA_1B_MATVEC_BLOCK_SIZE {}", d.matvec_block_size).unwrap();
-    writeln!(src, "#define LLAMA_1B_LM_HEAD_BLOCK_SIZE 32").unwrap();
-    writeln!(src, "#define LLAMA_1B_VOCAB_SIZE 128256").unwrap(); // TODO: make configurable
-    // The ops hardcode `llama_1b_globals` — alias it to our model-specific globals.
-    writeln!(src, "using llama_1b_globals = {globals_typedef};").unwrap();
-    writeln!(src, "// Op implementations from vendored Megakernels").unwrap();
-    writeln!(src, "#include \"rms_matvec_rope_append.cu\"").unwrap();
-    writeln!(src, "#include \"attention_partial.cu\"").unwrap();
-    writeln!(src, "#include \"attention_reduction.cu\"").unwrap();
-    writeln!(src, "#include \"matvec_adds.cu\"").unwrap();
-    writeln!(src, "#include \"upgate.cu\"").unwrap();
-    writeln!(src, "#include \"rms_lm_head.cu\"").unwrap();
-    writeln!(src).unwrap();
-
-    // ── Op aliases ──
+    // ── Namespaces and op aliases ──
     writeln!(src, "using namespace kittens;").unwrap();
     writeln!(src, "using namespace megakernel;").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "using rms_qkv_rope_append_op = rms_qkv_rope_append<config, {globals_typedef}>;").unwrap();
-    writeln!(src, "using attention_partial_op = attention_partial<config, {globals_typedef}>;").unwrap();
-    writeln!(src, "using attention_reduction_op = attention_reduction<config, {globals_typedef}>;").unwrap();
-    writeln!(src, "using o_proj_op = o_proj<config, {globals_typedef}>;").unwrap();
-    writeln!(src, "using rms_upgate_silu_op = rms_upgate_silu<config, {globals_typedef}>;").unwrap();
-    writeln!(src, "using downproj_op = downproj<config, {globals_typedef}>;").unwrap();
-    writeln!(src, "using rms_lm_head_op = rms_lm_head<config, {globals_typedef}>;").unwrap();
-    writeln!(src).unwrap();
 
-    // ── Kernel type alias ──
-    writeln!(src, "using kernel_t = decltype(&mk<config, {globals_typedef},").unwrap();
-    writeln!(src, "    attention_partial_op, attention_reduction_op,").unwrap();
-    writeln!(src, "    rms_qkv_rope_append_op, downproj_op,").unwrap();
-    writeln!(src, "    o_proj_op, rms_upgate_silu_op, rms_lm_head_op>);").unwrap();
+    writeln!(src, "struct ops {{").unwrap();
+    writeln!(src, "    using attn_norm_op = attn_norm<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using qkv_rope_append_op = qkv_rope_append<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using attention_prefill_op = attention_prefill<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using attention_decode_op = attention_decode<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using o_proj_op = o_proj<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using mlp_norm_op = mlp_norm<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using gate_silu_op = gate_silu<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using up_matmul_op = up_matmul<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using downproj_op = downproj<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using lm_head_norm_op = lm_head_norm<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using lm_head_op = lm_head<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using barrier_inc_op = barrier_inc<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "    using all_device_barrier_op = all_device_barrier<llama_config, llama_70b_globals>;").unwrap();
+    writeln!(src, "}};").unwrap();
     writeln!(src).unwrap();
 
     // ── extern "C" launch wrapper ──
-    //
-    // Takes flat C params (raw pointers + scalars), fills a globals_t
-    // struct, and launches the kernel. This is what the Rust FFI calls.
     let flat_params = build_tk_flat_params();
 
     writeln!(src, "extern \"C\" int {launch_fn_name}(").unwrap();
@@ -439,24 +296,39 @@ pub fn generate_tk_megakernel(
     }
     writeln!(src, "    uint64_t __stream)").unwrap();
     writeln!(src, "{{").unwrap();
-    // Construct globals_t using proper gl constructors so TMA descriptors
-    // are created via cuTensorMapEncodeTiled. We use a factory function
-    // to avoid the deleted default constructor.
-    //
-    // gl<T, B, D, R, C, TMA...> ctor: gl(T* data, make_arg_t<B>, make_arg_t<D>, make_arg_t<R>, make_arg_t<C>)
-    // where make_arg_t<N> = nullptr_t for compile-time dims, size_t for runtime dims (-1).
-    writeln!(src, "    using G = {globals_typedef};").unwrap();
+    writeln!(src, "    using G = llama_70b_globals;").unwrap();
     writeln!(src).unwrap();
-    // VM state: barriers gl<uint, 1, -1, -1, N> — no TMA descs
-    // instructions/timings gl<int, 1, -1, -1, 32/128> — no TMA descs
-    writeln!(src, "    typename G::barriers Bar_(").unwrap();
-    writeln!(src, "        (uint*)bar_ptr, nullptr, (size_t)bar_depth, (size_t)bar_rows, nullptr);").unwrap();
+
+    if dims.num_devices > 1 {
+        // Multi-GPU: construct pgl types with device arrays
+        writeln!(src, "    int dev_ids[{}] = {{}};", dims.num_devices).unwrap();
+        writeln!(src, "    // TODO: fill dev_ids for multi-GPU").unwrap();
+        writeln!(src).unwrap();
+
+        // Barriers
+        writeln!(src, "    uint* bar_ptrs[{0}]; bar_ptrs[0] = (uint*)bar_ptr;", dims.num_devices).unwrap();
+        writeln!(src, "    typename G::barriers Bar_(dev_ids, bar_ptrs, (size_t)bar_b, (size_t)bar_d, (size_t)bar_r, (size_t)bar_c);").unwrap();
+    } else {
+        // Single-GPU: gl_as_pgl inherits gl constructor — direct ptr + args
+        writeln!(src, "    typename G::barriers Bar_(").unwrap();
+        writeln!(src, "        (uint*)bar_ptr, (size_t)bar_b, (size_t)bar_d, (size_t)bar_r, (size_t)bar_c);").unwrap();
+    }
+    writeln!(src).unwrap();
+
+    // Instructions/timings: plain gl (not pgl)
+    // instruction_layout = gl<int, 1, 1, -1, 32> (ENABLE_GLOBAL_WORK_QUEUE=true)
+    // b=1(nullptr), d=1(nullptr), r=-1(size_t), c=32(nullptr)
     writeln!(src, "    typename G::instruction_layout instructions_(").unwrap();
-    writeln!(src, "        (int*)instructions_ptr, nullptr, (size_t)instructions_depth, (size_t)instructions_rows, nullptr);").unwrap();
+    writeln!(src, "        (int*)instructions_ptr, nullptr, nullptr, (size_t)total_instructions, nullptr);").unwrap();
     writeln!(src, "    typename G::timing_layout timings_(").unwrap();
-    writeln!(src, "        (int*)timings_ptr, nullptr, (size_t)instructions_depth, (size_t)instructions_rows, nullptr);").unwrap();
+    writeln!(src, "        (int*)timings_ptr, nullptr, nullptr, (size_t)total_instructions, nullptr);").unwrap();
     writeln!(src).unwrap();
-    // Weights: gl<bf16, 1, -1, -1, hidden_dim, st_bf<...>> — TMA descs created by ctor
+
+    // global_instruction_index: gl<int, 1,1,1,1> — all compile-time
+    writeln!(src, "    gl<int, 1, 1, 1, 1> global_instruction_index_((int*)global_inst_idx_ptr, nullptr, nullptr, nullptr, nullptr);").unwrap();
+    writeln!(src).unwrap();
+
+    // ── Weights: gl<bf16, 1, -1, -1, hidden_dim, st_bf<256,64>> ──
     writeln!(src, "    typename G::weights_t qkv_w_(").unwrap();
     writeln!(src, "        (__nv_bfloat16*)qkv_weights_ptr, nullptr, (size_t)qkv_weights_depth, (size_t)qkv_weights_rows, nullptr);").unwrap();
     writeln!(src, "    typename G::norm_weights_t attn_norm_w_(").unwrap();
@@ -476,70 +348,144 @@ pub fn generate_tk_megakernel(
     writeln!(src, "    typename G::weights_t lm_head_w_(").unwrap();
     writeln!(src, "        (__nv_bfloat16*)lm_head_weights_ptr, nullptr, (size_t)lm_head_weights_depth, (size_t)lm_head_weights_rows, nullptr);").unwrap();
     writeln!(src).unwrap();
-    // KV cache: gl<bf16, -1, -1, -1, head_dim, sv_bf<...>, tma::descriptor<...>>
+
+    // ── KV cache: gl with dual TMA descriptors ──
     writeln!(src, "    typename G::kv_cache_t k_cache_(").unwrap();
-    writeln!(src, "        (__nv_bfloat16*)k_cache_ptr, (size_t)k_cache_batch, (size_t)k_cache_depth, (size_t)k_cache_rows, nullptr);").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)k_cache_ptr, (size_t)k_cache_batch, (size_t)k_cache_depth, nullptr, nullptr);").unwrap();
     writeln!(src, "    typename G::kv_cache_t v_cache_(").unwrap();
-    writeln!(src, "        (__nv_bfloat16*)v_cache_ptr, (size_t)v_cache_batch, (size_t)v_cache_depth, (size_t)v_cache_rows, nullptr);").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)v_cache_ptr, (size_t)v_cache_batch, (size_t)v_cache_depth, nullptr, nullptr);").unwrap();
     writeln!(src).unwrap();
-    // RoPE: gl<float, 1, 1, -1, head_dim, sv_fl<head_dim>>
+
+    // ── RoPE: gl<float, 1, 1, -1, head_dim> ──
     writeln!(src, "    typename G::rope_table_t rope_cos_(").unwrap();
     writeln!(src, "        (float*)rope_cos_ptr, nullptr, nullptr, (size_t)rope_rows, nullptr);").unwrap();
     writeln!(src, "    typename G::rope_table_t rope_sin_(").unwrap();
     writeln!(src, "        (float*)rope_sin_ptr, nullptr, nullptr, (size_t)rope_rows, nullptr);").unwrap();
     writeln!(src).unwrap();
-    // Activation buffers: gl<bf16, 1, 1, 1, hidden_dim, ...> — all compile-time
-    writeln!(src, "    typename G::activations_t hidden_states_(").unwrap();
-    writeln!(src, "        (__nv_bfloat16*)hidden_states_ptr, nullptr, nullptr, nullptr, nullptr);").unwrap();
-    writeln!(src, "    typename G::activations_t q_post_rope_(").unwrap();
-    writeln!(src, "        (__nv_bfloat16*)q_post_rope_ptr, nullptr, nullptr, nullptr, nullptr);").unwrap();
-    writeln!(src, "    typename G::activations_t attn_out_(").unwrap();
-    writeln!(src, "        (__nv_bfloat16*)attn_out_ptr, nullptr, nullptr, nullptr, nullptr);").unwrap();
-    // attn_lse: gl<float, 1, 1, num_heads, -1, sv_fl<...>> — cols is runtime
-    writeln!(src, "    typename G::attn_lse_intermediates_t attn_lse_(").unwrap();
-    writeln!(src, "        (float*)attn_lse_ptr, nullptr, nullptr, nullptr, (size_t)attn_lse_rows);").unwrap();
-    // attn_out_intermediates: gl<float, 1, num_heads, -1, head_dim, sv_fl<head_dim>>
-    writeln!(src, "    typename G::attn_out_intermediates_t attn_out_int_(").unwrap();
-    writeln!(src, "        (float*)attn_out_intermediates_ptr, nullptr, nullptr, (size_t)attn_out_intermediates_rows, nullptr);").unwrap();
-    // silu_out: gl<bf16, 1, 1, 1, intermediate_dim, ...> — all compile-time
-    writeln!(src, "    typename G::activations_big_indim_t silu_out_(").unwrap();
-    writeln!(src, "        (__nv_bfloat16*)silu_out_ptr, nullptr, nullptr, nullptr, nullptr);").unwrap();
-    // logits: gl<bf16, 1, 1, 1, -1, sv_bf<...>> — cols is runtime
-    writeln!(src, "    typename G::logits_t logits_(").unwrap();
-    writeln!(src, "        (__nv_bfloat16*)logits_ptr, nullptr, nullptr, nullptr, (size_t)logits_cols);").unwrap();
+
+    // ── Activations ──
+    if dims.num_devices > 1 {
+        // Multi-GPU: pgl constructor (dev_ids, ptrs, args...)
+        writeln!(src, "    __nv_bfloat16* hs_ptrs[{0}]; hs_ptrs[0] = (__nv_bfloat16*)hidden_states_ptr;", dims.num_devices).unwrap();
+        writeln!(src, "    typename G::activations_parallel_t hidden_states_(dev_ids, hs_ptrs, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+        writeln!(src).unwrap();
+        writeln!(src, "    __nv_bfloat16* rms_rope_ptrs[{0}]; rms_rope_ptrs[0] = (__nv_bfloat16*)rms_rope_intermediates_ptr;", dims.num_devices).unwrap();
+        writeln!(src, "    typename G::activations_parallel_mc_t rms_rope_intermediates_(dev_ids, rms_rope_ptrs, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+        writeln!(src).unwrap();
+        writeln!(src, "    __nv_bfloat16* rms_gate_ptrs[{0}]; rms_gate_ptrs[0] = (__nv_bfloat16*)rms_gate_intermediates_ptr;", dims.num_devices).unwrap();
+        writeln!(src, "    typename G::activations_parallel_mc_t rms_gate_intermediates_(dev_ids, rms_gate_ptrs, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+    } else {
+        // Single-GPU: gl_as_pgl inherits gl constructor (ptr, args...)
+        writeln!(src, "    typename G::activations_parallel_t hidden_states_(").unwrap();
+        writeln!(src, "        (__nv_bfloat16*)hidden_states_ptr, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+        writeln!(src).unwrap();
+        writeln!(src, "    typename G::activations_parallel_mc_t rms_rope_intermediates_(").unwrap();
+        writeln!(src, "        (__nv_bfloat16*)rms_rope_intermediates_ptr, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+        writeln!(src).unwrap();
+        writeln!(src, "    typename G::activations_parallel_mc_t rms_gate_intermediates_(").unwrap();
+        writeln!(src, "        (__nv_bfloat16*)rms_gate_intermediates_ptr, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+    }
     writeln!(src).unwrap();
-    // Aggregate into globals_t via designated-init-style aggregate.
-    // globals_t is an aggregate (no user-declared ctors besides deleted default).
-    // Use brace-enclosed init matching field declaration order.
-    writeln!(src, "    {globals_typedef} g {{").unwrap();
-    writeln!(src, "        Bar_, instructions_, timings_,").unwrap();
+
+    // q_post_rope: gl<bf16, 1,1,-1,-1>
+    writeln!(src, "    typename G::activations_t q_post_rope_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)q_post_rope_ptr, nullptr, nullptr, (size_t)batch_size, (size_t)q_post_rope_cols);").unwrap();
+    writeln!(src).unwrap();
+
+    // attn_out: parallel type
+    if dims.num_devices > 1 {
+        writeln!(src, "    __nv_bfloat16* attn_out_ptrs[{0}]; attn_out_ptrs[0] = (__nv_bfloat16*)attn_out_ptr;", dims.num_devices).unwrap();
+        writeln!(src, "    typename G::activations_parallel_t attn_out_(dev_ids, attn_out_ptrs, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+    } else {
+        writeln!(src, "    typename G::activations_parallel_t attn_out_(").unwrap();
+        writeln!(src, "        (__nv_bfloat16*)attn_out_ptr, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+    }
+    writeln!(src).unwrap();
+
+    // silu_out: gl<bf16, 1,1,-1, intermediate_dim/num_devices>
+    writeln!(src, "    typename G::activations_big_indim_t silu_out_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)silu_out_ptr, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+    writeln!(src).unwrap();
+
+    // rms_lm_head_intermediates
+    writeln!(src, "#ifdef LLAMA_BROADCAST_LM_HEAD_NORM").unwrap();
+    if dims.num_devices > 1 {
+        writeln!(src, "    __nv_bfloat16* rms_lm_ptrs[{0}]; rms_lm_ptrs[0] = (__nv_bfloat16*)rms_lm_head_intermediates_ptr;", dims.num_devices).unwrap();
+        writeln!(src, "    typename G::activations_parallel_mc_t rms_lm_head_intermediates_(dev_ids, rms_lm_ptrs, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+    } else {
+        writeln!(src, "    typename G::activations_parallel_mc_t rms_lm_head_intermediates_(").unwrap();
+        writeln!(src, "        (__nv_bfloat16*)rms_lm_head_intermediates_ptr, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+    }
+    writeln!(src, "#else").unwrap();
+    writeln!(src, "    typename G::activations_t rms_lm_head_intermediates_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)rms_lm_head_intermediates_ptr, nullptr, nullptr, (size_t)batch_size, nullptr);").unwrap();
+    writeln!(src, "#endif").unwrap();
+    writeln!(src).unwrap();
+
+    // logits: gl<bf16, 1,1,-1,-1>
+    writeln!(src, "    typename G::logits_t logits_(").unwrap();
+    writeln!(src, "        (__nv_bfloat16*)logits_ptr, nullptr, nullptr, (size_t)batch_size, (size_t)logits_cols);").unwrap();
+    writeln!(src).unwrap();
+
+    // ── int32 vectors ──
+    writeln!(src, "    typename G::int32_vector_t position_ids_((int*)position_ids_ptr, nullptr, nullptr, nullptr, (size_t)batch_size);").unwrap();
+    writeln!(src, "    typename G::int32_vector_t kv_append_indices_((int*)kv_append_indices_ptr, nullptr, nullptr, nullptr, (size_t)batch_size);").unwrap();
+    writeln!(src).unwrap();
+    writeln!(src, "    typename G::int32_vector_t prefill_qo_indptr_((int*)prefill_qo_indptr_ptr, nullptr, nullptr, nullptr, (size_t)prefill_qo_indptr_len);").unwrap();
+    writeln!(src, "    typename G::int32_vector_t prefill_kv_indptr_((int*)prefill_kv_indptr_ptr, nullptr, nullptr, nullptr, (size_t)prefill_kv_indptr_len);").unwrap();
+    writeln!(src, "    typename G::int32_vector_t prefill_kv_indices_((int*)prefill_kv_indices_ptr, nullptr, nullptr, nullptr, (size_t)prefill_kv_indices_len);").unwrap();
+    writeln!(src, "    typename G::int32_vector_t prefill_kv_last_page_len_((int*)prefill_kv_last_page_len_ptr, nullptr, nullptr, nullptr, (size_t)prefill_kv_last_page_len_len);").unwrap();
+    writeln!(src, "    typename G::int32_vector_t decode_kv_indptr_((int*)decode_kv_indptr_ptr, nullptr, nullptr, nullptr, (size_t)decode_kv_indptr_len);").unwrap();
+    writeln!(src, "    typename G::int32_vector_t decode_kv_indices_((int*)decode_kv_indices_ptr, nullptr, nullptr, nullptr, (size_t)decode_kv_indices_len);").unwrap();
+    writeln!(src, "    typename G::int32_vector_t decode_kv_last_page_len_((int*)decode_kv_last_page_len_ptr, nullptr, nullptr, nullptr, (size_t)decode_kv_last_page_len_len);").unwrap();
+    writeln!(src).unwrap();
+
+    // ── Aggregate globals_t (field order must match llama.cuh) ──
+    writeln!(src, "    G g {{").unwrap();
+    writeln!(src, "        Bar_, instructions_, timings_, global_instruction_index_,").unwrap();
     writeln!(src, "        qkv_w_, attn_norm_w_, o_w_, mlp_norm_w_,").unwrap();
-    writeln!(src, "        up_w_, gate_w_, down_w_, lm_head_norm_w_, lm_head_w_,").unwrap();
+    writeln!(src, "        up_w_, gate_w_, down_w_,").unwrap();
+    writeln!(src, "        lm_head_norm_w_, lm_head_w_,").unwrap();
     writeln!(src, "        k_cache_, v_cache_,").unwrap();
     writeln!(src, "        rope_cos_, rope_sin_,").unwrap();
-    writeln!(src, "        hidden_states_, q_post_rope_, attn_out_,").unwrap();
-    writeln!(src, "        attn_lse_, attn_out_int_, silu_out_, logits_,").unwrap();
-    writeln!(src, "        pos_id, attn_scale, rms_norm_eps, (bool)skip_attn_reduction").unwrap();
+    writeln!(src, "        hidden_states_, rms_rope_intermediates_, rms_gate_intermediates_,").unwrap();
+    writeln!(src, "        q_post_rope_, attn_out_, silu_out_,").unwrap();
+    writeln!(src, "        rms_lm_head_intermediates_, logits_,").unwrap();
+    writeln!(src, "        position_ids_, kv_append_indices_,").unwrap();
+    writeln!(src, "        prefill_qo_indptr_, prefill_kv_indptr_, prefill_kv_indices_, prefill_kv_last_page_len_,").unwrap();
+    writeln!(src, "        decode_kv_indptr_, decode_kv_indices_, decode_kv_last_page_len_,").unwrap();
+    writeln!(src, "        attn_scale, rms_norm_eps, num_pages, batch_size, num_prefill_tokens,").unwrap();
+    writeln!(src, "        0  // dev_idx = 0 for single-GPU").unwrap();
     writeln!(src, "    }};").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "    // Launch").unwrap();
+
+    // ── Launch ──
     writeln!(src, "    dim3 grid = g.grid();").unwrap();
     writeln!(src, "    dim3 block = g.block();").unwrap();
     writeln!(src, "    int smem = g.dynamic_shared_memory();").unwrap();
     writeln!(src, "    cudaStream_t stream = (cudaStream_t)__stream;").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "    cudaFuncSetAttribute(").unwrap();
-    writeln!(src, "        (void*)mk<config, {globals_typedef},").unwrap();
-    writeln!(src, "            attention_partial_op, attention_reduction_op,").unwrap();
-    writeln!(src, "            rms_qkv_rope_append_op, downproj_op,").unwrap();
-    writeln!(src, "            o_proj_op, rms_upgate_silu_op, rms_lm_head_op>,").unwrap();
+    // Diagnostic: print key values to verify struct construction (stderr for immediate flush)
+    writeln!(src, "    fprintf(stderr, \"TK launch: sizeof(G)=%zu grid=%d block=%d smem=%d\\n\", sizeof(G), grid.x, block.x, smem);").unwrap();
+    writeln!(src, "    fprintf(stderr, \"  instructions: ptr=%p rows=%d batch_size=%d num_prefill=%d\\n\",").unwrap();
+    writeln!(src, "           (void*)g.instructions.raw_ptr, (int)g.instructions.rows(), g.batch_size, g.num_prefill_tokens);").unwrap();
+    writeln!(src, "    fprintf(stderr, \"  global_inst_idx: ptr=%p\\n\", (void*)g.global_instruction_index.raw_ptr);").unwrap();
+    writeln!(src, "    fprintf(stderr, \"  hidden_states: ptr=%p\\n\", (void*)g.hidden_states.raw_ptr);").unwrap();
+    writeln!(src, "    fprintf(stderr, \"  Bar: ptr=%p batch=%d depth=%d rows=%d cols=%d\\n\", (void*)g.Bar.raw_ptr, (int)g.Bar.batch(), (int)g.Bar.depth(), (int)g.Bar.rows(), (int)g.Bar.cols());").unwrap();
+    writeln!(src, "    fprintf(stderr, \"  k_cache: ptr=%p batch=%d depth=%d\\n\", (void*)g.k_cache.raw_ptr, (int)g.k_cache.batch(), (int)g.k_cache.depth());").unwrap();
+    writeln!(src, "    fprintf(stderr, \"  attn_scale=%f rms_eps=%f num_pages=%d dev_idx=%d\\n\", g.attn_scale, g.rms_norm_eps, g.num_pages, g.dev_idx);").unwrap();
+    writeln!(src).unwrap();
+    writeln!(src, "    auto kernel = mk<llama_config, llama_70b_globals,").unwrap();
+    writeln!(src, "        ops::attn_norm_op, ops::qkv_rope_append_op, ops::attention_decode_op,").unwrap();
+    writeln!(src, "        ops::attention_prefill_op, ops::o_proj_op, ops::mlp_norm_op,").unwrap();
+    writeln!(src, "        ops::gate_silu_op, ops::up_matmul_op, ops::downproj_op,").unwrap();
+    writeln!(src, "        ops::lm_head_norm_op, ops::lm_head_op, ops::barrier_inc_op,").unwrap();
+    writeln!(src, "        ops::all_device_barrier_op>;").unwrap();
+    writeln!(src).unwrap();
+    writeln!(src, "    cudaFuncSetAttribute((void*)kernel,").unwrap();
     writeln!(src, "        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);").unwrap();
     writeln!(src).unwrap();
-    writeln!(src, "    mk<config, {globals_typedef},").unwrap();
-    writeln!(src, "        attention_partial_op, attention_reduction_op,").unwrap();
-    writeln!(src, "        rms_qkv_rope_append_op, downproj_op,").unwrap();
-    writeln!(src, "        o_proj_op, rms_upgate_silu_op, rms_lm_head_op>").unwrap();
-    writeln!(src, "        <<<grid, block, smem, stream>>>(g);").unwrap();
+    writeln!(src, "    kernel<<<grid, block, smem, stream>>>(g);").unwrap();
     writeln!(src).unwrap();
     writeln!(src, "    return (int)cudaGetLastError();").unwrap();
     writeln!(src, "}}").unwrap();
@@ -551,23 +497,27 @@ pub fn generate_tk_megakernel(
     }
 }
 
-/// Build the flat parameter list for the TK launch wrapper.
+/// Build the flat parameter list for the throughput TK launch wrapper.
 /// Each entry is `(c_type, param_name)`.
 fn build_tk_flat_params() -> Vec<(String, String)> {
     let mut p = Vec::new();
     let ptr = |name: &str| ("uint64_t".to_string(), name.to_string());
     let dim = |name: &str| ("int".to_string(), name.to_string());
 
-    // VM state
+    // VM state: barriers pgl
     p.push(ptr("bar_ptr"));
-    p.push(dim("bar_depth"));
-    p.push(dim("bar_rows"));
-    p.push(ptr("instructions_ptr"));
-    p.push(dim("instructions_depth"));
-    p.push(dim("instructions_rows"));
-    p.push(ptr("timings_ptr"));
+    p.push(dim("bar_b"));
+    p.push(dim("bar_d"));
+    p.push(dim("bar_r"));
+    p.push(dim("bar_c"));
 
-    // Weight tensors (ptr + dynamic dims for each -1 template arg)
+    // Instructions (work-stealing: flat [1, total_instructions, 32])
+    p.push(ptr("instructions_ptr"));
+    p.push(dim("total_instructions"));
+    p.push(ptr("timings_ptr"));
+    p.push(ptr("global_inst_idx_ptr"));
+
+    // Weight tensors: gl<bf16, 1, -1, -1, hidden_dim, st_bf<256,64>>
     for name in &[
         "qkv_weights", "o_weights", "up_weights", "gate_weights", "lm_head_weights",
     ] {
@@ -575,21 +525,22 @@ fn build_tk_flat_params() -> Vec<(String, String)> {
         p.push(dim(&format!("{name}_depth")));
         p.push(dim(&format!("{name}_rows")));
     }
+    // down: gl<bf16, 1, -1, -1, intermediate_dim/num_devices, st_bf<256,64>>
     p.push(ptr("down_weights_ptr"));
     p.push(dim("down_weights_depth"));
     p.push(dim("down_weights_rows"));
 
+    // Norm weights: gl<bf16, 1, 1, -1, hidden_dim>
     for name in &["attn_norm_weights", "mlp_norm_weights", "lm_head_norm_weights"] {
         p.push(ptr(&format!("{name}_ptr")));
         p.push(dim(&format!("{name}_rows")));
     }
 
-    // KV cache
+    // KV cache: gl<bf16, -1, -1, num_kv_heads, head_dim>
     for name in &["k_cache", "v_cache"] {
         p.push(ptr(&format!("{name}_ptr")));
-        p.push(dim(&format!("{name}_batch")));
-        p.push(dim(&format!("{name}_depth")));
-        p.push(dim(&format!("{name}_rows")));
+        p.push(dim(&format!("{name}_batch")));  // num_layers * num_pages
+        p.push(dim(&format!("{name}_depth")));  // page_size
     }
 
     // RoPE
@@ -597,23 +548,44 @@ fn build_tk_flat_params() -> Vec<(String, String)> {
     p.push(ptr("rope_sin_ptr"));
     p.push(dim("rope_rows"));
 
-    // Activation buffers
+    // Activations (pgl wrappers — single ptr for num_devices=1)
     p.push(ptr("hidden_states_ptr"));
+    p.push(ptr("rms_rope_intermediates_ptr"));
+    p.push(ptr("rms_gate_intermediates_ptr"));
     p.push(ptr("q_post_rope_ptr"));
+    p.push(dim("q_post_rope_cols"));
     p.push(ptr("attn_out_ptr"));
-    p.push(ptr("attn_lse_ptr"));
-    p.push(dim("attn_lse_rows"));
-    p.push(ptr("attn_out_intermediates_ptr"));
-    p.push(dim("attn_out_intermediates_rows"));
     p.push(ptr("silu_out_ptr"));
+    p.push(ptr("rms_lm_head_intermediates_ptr"));
     p.push(ptr("logits_ptr"));
     p.push(dim("logits_cols"));
 
+    // Paged KV metadata (int32 vectors)
+    p.push(ptr("position_ids_ptr"));
+    p.push(ptr("kv_append_indices_ptr"));
+
+    p.push(ptr("prefill_qo_indptr_ptr"));
+    p.push(dim("prefill_qo_indptr_len"));
+    p.push(ptr("prefill_kv_indptr_ptr"));
+    p.push(dim("prefill_kv_indptr_len"));
+    p.push(ptr("prefill_kv_indices_ptr"));
+    p.push(dim("prefill_kv_indices_len"));
+    p.push(ptr("prefill_kv_last_page_len_ptr"));
+    p.push(dim("prefill_kv_last_page_len_len"));
+
+    p.push(ptr("decode_kv_indptr_ptr"));
+    p.push(dim("decode_kv_indptr_len"));
+    p.push(ptr("decode_kv_indices_ptr"));
+    p.push(dim("decode_kv_indices_len"));
+    p.push(ptr("decode_kv_last_page_len_ptr"));
+    p.push(dim("decode_kv_last_page_len_len"));
+
     // Scalars
-    p.push(("unsigned int".to_string(), "pos_id".to_string()));
     p.push(("float".to_string(), "attn_scale".to_string()));
     p.push(("float".to_string(), "rms_norm_eps".to_string()));
-    p.push(("int".to_string(), "skip_attn_reduction".to_string()));
+    p.push(dim("num_pages"));
+    p.push(dim("batch_size"));
+    p.push(dim("num_prefill_tokens"));
 
     p
 }
@@ -692,20 +664,25 @@ mod tests {
             head_dim: 64,
             num_attention_heads: 32,
             num_kv_heads: 8,
-            kv_block_size: 16,
-            matvec_block_size: 16,
+            kv_page_size: 128,
+            prefill_kv_block_size: 128,
+            decode_kv_block_size: 16,
+            matmul_out_block_size: 256,
+            matmul_batch_block_size: 128,
             vocab_size: 128256,
             sm_count: 132,
+            num_devices: 1,
         };
         let result = generate_tk_megakernel("llama_1b", &dims);
         assert_eq!(result.launch_fn_name, "tk_megakernel_llama_1b_launch");
-        assert!(result.cuda_source.contains("kittens.cuh"));
-        assert!(result.cuda_source.contains("megakernel.cuh"));
-        assert!(result.cuda_source.contains("ENABLE_GLOBAL_WORK_QUEUE = false"));
-        assert!(result.cuda_source.contains("NUM_CONSUMER_WARPS = 16"));
-        assert!(result.cuda_source.contains("globals_t<16, 2048, 8192, 64, 32, 8, 16, 16, 132>"));
-        assert!(result.cuda_source.contains("rms_qkv_rope_append_op"));
-        assert!(result.cuda_source.contains("mk<config, llama_1b_globals"));
+        assert!(result.cuda_source.contains("llama.cuh"));
+        assert!(result.cuda_source.contains("LLAMA_NUM_DEVICES 1"));
+        assert!(result.cuda_source.contains("LLAMA_NUM_LAYERS 16"));
+        assert!(result.cuda_source.contains("LLAMA_HIDDEN_DIM 2048"));
+        assert!(result.cuda_source.contains("qkv_rope_append_op"));
+        assert!(result.cuda_source.contains("attention_decode_op"));
+        assert!(result.cuda_source.contains("attention_prefill_op"));
+        assert!(result.cuda_source.contains("mk<llama_config, llama_70b_globals"));
         assert!(result.cuda_source.contains("extern \"C\" int tk_megakernel_llama_1b_launch"));
         assert!(!result.flat_params.is_empty());
     }

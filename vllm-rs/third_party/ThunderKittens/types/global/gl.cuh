@@ -8,7 +8,8 @@
 #include "../../common/common.cuh"
 #include "../shared/shared.cuh"
 #include "util.cuh"
-#if (defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)) && !defined(KITTENS_NO_HOST)
+#ifdef KITTENS_HOPPER
+#include <utility>
 #include "tma.cuh"
 #endif
 
@@ -25,7 +26,7 @@ struct dim {
 
 /* ----------   Associative dictionary for global layouts  ---------- */
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#ifdef KITTENS_HOPPER
 namespace ducks {
 namespace tma {
 namespace descriptor {
@@ -62,35 +63,30 @@ template<typename _T, int _axis=-9999> struct descriptor {
 namespace detail {
 template<typename... Args>
 struct descriptor_dict {
-#ifndef KITTENS_NO_HOST
     __host__ descriptor_dict() {}
     template<typename T> __host__ descriptor_dict(T _, int b, int d, int r, int c) {}
-#endif
     __host__ __device__ descriptor_dict(const descriptor_dict &other) {}
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#ifdef KITTENS_HOPPER
     template<typename T, int U> __device__ const CUtensorMap* get() const {
         static_assert(
             std::is_same_v<T, std::true_type> && std::is_same_v<T, std::false_type>,
             "SKILL ISSUE: Requested a TMA descriptor for a type not initialized in the global layout."
         );
-        return nullptr;
     }
 #endif
 };
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#ifdef KITTENS_HOPPER
 template<typename _T, typename... Args>
 struct descriptor_dict<_T, Args...> {
     static_assert(ducks::sv::all<_T> || ducks::st::all<_T> || ducks::tma::descriptor::all<_T>, "Must be a shared TK type to generate a TMA descriptor.");
     using DESC = kittens::tma::descriptor<_T>; // copy or initialize with a default value
     CUtensorMap tma_desc;
     descriptor_dict<Args...> other_descs;
-#ifndef KITTENS_NO_HOST
     __host__ descriptor_dict() {}
     __host__ descriptor_dict(typename DESC::T::dtype *data, int b, int d, int r, int c): other_descs(data, b, d, r, c) {
         kittens::detail::tma::create_tensor_map<typename DESC::T, DESC::axis>(&tma_desc, data, b, d, r, c);
     }
-#endif
     __host__ __device__ inline descriptor_dict(const descriptor_dict &other) :
         tma_desc(other.tma_desc), other_descs(other.other_descs) {}
     template<typename U, int axis> __device__ inline const CUtensorMap* get() const {
@@ -111,9 +107,6 @@ struct identifier {};
 
 template<typename _T, int b, int d, int r, int c, typename... TMA_Types>
 struct gl {
-#ifdef KITTENS_BLACKWELL
-    static_assert(!std::is_same_v<_T, fp4e2m1>, "For FP4 types, you must use a packed type (i.e., fp4e2m1_2 or fp4e2m1_4).");
-#endif
     using identifier = ducks::gl::identifier;
 
     using T     = base_types::packing<_T>::unpacked_type;
@@ -129,12 +122,6 @@ struct gl {
     ducks::gl::make_dim_t<r> rows_internal;
     ducks::gl::make_dim_t<c> cols_internal;
 
-#ifdef KITTENS_NO_HOST
-    __device__ constexpr int batch() const { if constexpr (b > 0) return b; else return batch_internal; }
-    __device__ constexpr int depth() const { if constexpr (d > 0) return d; else return depth_internal; }
-    __device__ constexpr int rows()  const { if constexpr (r > 0) return r; else return rows_internal; }
-    __device__ constexpr int cols()  const { if constexpr (c > 0) return c; else return cols_internal; }
-#else
     template <int B=__b__> __device__ __host__ static constexpr std::enable_if_t<(B > 0), int> batch() { return B; }
     template <int B=__b__> __device__ __host__ std::enable_if_t<(B == -1), int> batch() const { return batch_internal; }
     template <int D=__d__> __device__ __host__ static constexpr std::enable_if_t<(D > 0), int> depth() { return D; }
@@ -143,13 +130,9 @@ struct gl {
     template <int R=__r__> __device__ __host__ std::enable_if_t<(R == -1), int> rows() const { return rows_internal; }
     template <int C=__c__> __device__ __host__ static constexpr std::enable_if_t<(C > 0), int> cols() { return C; }
     template <int C=__c__> __device__ __host__ std::enable_if_t<(C == -1), int> cols() const { return cols_internal; }
-#endif
-    __device__ __host__ inline size_t numel() const { return static_cast<size_t>(batch()) * depth() * rows() * cols(); }
 
     detail::descriptor_dict<TMA_Types...> tma_descs;
 
-    __host__ __device__ gl() = delete;
-#ifndef KITTENS_NO_HOST
     __host__ inline gl(T *_data,
                         ducks::gl::make_arg_t<b> _batch,
                         ducks::gl::make_arg_t<d> _depth,
@@ -158,20 +141,15 @@ struct gl {
             raw_ptr(_data), batch_internal(_batch), depth_internal(_depth), rows_internal(_rows), cols_internal(_cols) {
         tma_descs = detail::descriptor_dict<TMA_Types...>(raw_ptr, batch_internal, depth_internal, rows_internal, cols_internal);
     }
-#endif
     __host__ __device__ inline gl(const gl &other) :
             raw_ptr(other.raw_ptr), batch_internal(other.batch_internal), depth_internal(other.depth_internal), rows_internal(other.rows_internal), cols_internal(other.cols_internal), tma_descs(other.tma_descs) {}
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#ifdef KITTENS_HOPPER
     template<typename U, int axis> __device__ inline const CUtensorMap* get_tma() const {
         return tma_descs.template get<U, axis>();
     }
-    template<typename U, int axis=2> __device__ inline void prefetch_tma() const {
-        const CUtensorMap *tma_desc = tma_descs.template get<U, axis>();
-        asm volatile ("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(tma_desc)) : "memory"); // must be called by a single thread
-    }
 #endif
     __device__ inline T& operator[](const coord<ducks::default_type> &idx) const { // yes I am abusing the const qualifier here a bit.
-        return raw_ptr[(((size_t)idx.b*depth() + idx.d)*rows() + idx.r)*cols() + idx.c];
+        return raw_ptr[((idx.b*depth() + idx.d)*rows() + idx.r)*cols() + idx.c];
     }
     template<int axis> __device__ inline size_t shape() const {
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
@@ -182,9 +160,9 @@ struct gl {
     }
     template<int axis> __device__ inline size_t stride() const { 
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
-        if      constexpr (axis==0) { return (size_t)depth()*rows()*cols(); }
-        else if constexpr (axis==1) { return (size_t)rows()*cols(); }
-        else if constexpr (axis==2) { return (size_t)cols(); }
+        if      constexpr (axis==0) { return depth()*rows()*cols(); }
+        else if constexpr (axis==1) { return rows()*cols(); }
+        else if constexpr (axis==2) { return cols(); }
         else if constexpr (axis==3) { return 1; }
     }
 };
@@ -208,15 +186,13 @@ template<typename T> concept all = requires {
 }
 }
 
-#ifndef KITTENS_NO_HOST
-
 // Structs for initializing global layouts automatically.
 // struct unsafe_gl {
 //     uint64_t data;
 //     int b, d, r, c;
 //     unsafe_gl(uint64_t data, int b, int d, int r, int c) : data(data), b(b), d(d), r(r), c(c) {}
 // };
-template<int N> __host__ auto make_unsafe_gl_arg(int param) { // typename std::conditional_t<(N < 0), std::nullptr_t, int>
+template<int N> auto make_unsafe_gl_arg(int param) { // typename std::conditional_t<(N < 0), std::nullptr_t, int>
     if constexpr (N > 0) { return nullptr; }
     else                 { return param;   }
 }
@@ -244,6 +220,36 @@ template<ducks::gl::all GL, bool safe=true> __host__ inline GL make_gl(uint64_t 
     );
 }
 
-#endif // KITTENS_NO_HOST
+namespace ducks {
+namespace gl_array {
+struct identifier {};
+template<typename T> concept all = requires {
+    typename T::identifier;
+} && std::is_same_v<typename T::identifier, identifier>;
+}
+}
+
+/*
+    Basically a lightweight PGL; useful for cross-device access without multimem instructions
+    (only because C++ doesn't allow returning C-style arrays as R-values)
+*/
+template<ducks::gl::all _GL, size_t _N>
+struct gl_array {
+    using identifier = ducks::gl_array::identifier;
+    using GL = _GL;
+    static constexpr int N = _N;
+
+    GL gls[N];
+
+    __host__ inline gl_array(uint64_t _data_ptr[N], int _batch, int _depth, int _rows, int _cols) : 
+        gl_array(std::make_index_sequence<N>{}, _data_ptr, _batch, _depth, _rows, _cols) { }
+
+    template<size_t... I> __host__ inline gl_array(std::index_sequence<I...>,
+            uint64_t _data_ptr[N], int _batch, int _depth, int _rows, int _cols) : 
+        gls{make_gl<GL>(_data_ptr[I], _batch, _depth, _rows, _cols)...} { }
+
+    __host__ __device__ GL& operator[](size_t i) { return gls[i]; }
+    __host__ __device__ const GL& operator[](size_t i) const { return gls[i]; }
+};
 
 } // namespace kittens

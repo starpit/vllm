@@ -8,6 +8,9 @@
 pub use ferrite_forward_macro::forward;
 
 pub mod cpu_golden;
+pub mod tk_instructions;
+#[cfg(feature = "cuda")]
+pub mod tk_paged_kv;
 
 #[cfg(feature = "cuda")]
 mod ctx {

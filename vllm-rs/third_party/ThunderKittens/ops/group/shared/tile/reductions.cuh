@@ -17,10 +17,10 @@
 template<typename op, ducks::sv::all V, ducks::st::all T, bool reset>
 __device__ static inline void row_reduce(V &row_accum, const T &src, const V &src_accum) {
     using dtype = typename V::dtype;
-    for (int row = laneid(); row < T::rows; row += GROUP_THREADS) {
+    for (int row = laneid(); row < src.rows; row += GROUP_THREADS) {
         dtype accum = src[{row, 0}];
         #pragma unroll
-        for (int col = 1; col < T::cols; col++) {
+        for (int col = 1; col < src.cols; col++) {
             accum = op::template op<dtype>(accum, src[{row, col}]);
         }
         if (reset) {
@@ -45,10 +45,10 @@ __device__ static inline void row_reduce(V &row_accum, const T &src, const V &sr
 template<typename op, ducks::sv::all V, ducks::st::all T, bool reset>
 __device__ static inline void col_reduce(V &col_accum, const T &src, const V &src_accum) {
     using dtype = typename V::dtype;
-    for (int col = laneid(); col < T::cols; col += GROUP_THREADS) {
+    for (int col = laneid(); col < src.cols; col += GROUP_THREADS) {
         dtype accum = src[{0, col}];
         #pragma unroll
-        for (int row = 1; row < T::rows; row++) {
+        for (int row = 1; row < src.rows; row++) {
             accum = op::template op<dtype>(accum, src[{row, col}]);
         }
         if (reset) {
@@ -166,7 +166,7 @@ __device__ static inline void row_prod(V &row_accum, const T &src, const V &src_
 /**
  * @brief Store the maximum of each column of the src shared matrix in the col_accum shared vector.
  *
- * @tparam V The shared vector type for the column accumulator.
+ * @tparam V The shared vector type for the row accumulator.
  * @tparam T The shared matrix type.
  * @param[out] col_accum The accumulator where the result of the reduction is stored.
  * @param[in] src The source matrix on which to perform the reduction.
@@ -178,7 +178,7 @@ __device__ static inline void col_max(V &col_accum, const T &src)  {
 /**
  * @brief Store the minimum of each column of the src shared matrix in the col_accum shared vector.
  *
- * @tparam V The shared vector type for the column accumulator.
+ * @tparam V The shared vector type for the row accumulator.
  * @tparam T The shared matrix type.
  * @param[out] col_accum The accumulator where the result of the reduction is stored.
  * @param[in] src The source matrix on which to perform the reduction.
@@ -190,7 +190,7 @@ __device__ static inline void col_min(V &col_accum, const T &src)  {
 /**
  * @brief Store the sum of each column of the src shared matrix in the col_accum shared vector.
  *
- * @tparam V The shared vector type for the column accumulator.
+ * @tparam V The shared vector type for the row accumulator.
  * @tparam T The shared matrix type.
  * @param[out] col_accum The accumulator where the result of the reduction is stored.
  * @param[in] src The source matrix on which to perform the reduction.
@@ -202,7 +202,7 @@ __device__ static inline void col_sum(V &col_accum, const T &src)  {
 /**
  * @brief Store the product of each column of the src shared matrix in the col_accum shared vector.
  *
- * @tparam V The shared vector type for the column accumulator.
+ * @tparam V The shared vector type for the row accumulator.
  * @tparam T The shared matrix type.
  * @param[out] col_accum The accumulator where the result of the reduction is stored.
  * @param[in] src The source matrix on which to perform the reduction.
@@ -215,7 +215,7 @@ __device__ static inline void col_prod(V &col_accum, const T &src) {
 /**
  * @brief Store the maximum of each column of the src shared matrix, as well as the src_accum shared vector, in the col_accum shared vector.
  *
- * @tparam V The shared vector type for the column accumulator.
+ * @tparam V The shared vector type for the row accumulator.
  * @tparam T The shared matrix type.
  * @param[out] col_accum The accumulator where the result of the reduction is stored.
  * @param[in] src The source matrix on which to perform the reduction.
@@ -228,8 +228,8 @@ __device__ static inline void col_max(V &col_accum, const T &src, const V &src_a
 /**
  * @brief Store the minimum of each column of the src shared matrix, as well as the src_accum shared vector, in the col_accum shared vector.
  *
- * @tparam V The shared vector type for the column accumulator.
- * @tparam T The shared matrix type.
+ * @tparam V The shared vector type for the row accumulator.
+ * @tparam T The matrix type.
  * @param[out] col_accum The accumulator where the result of the reduction is stored.
  * @param[in] src The source matrix on which to perform the reduction.
  * @param[in] src_accum The initial value of the accumulator, used when accumulating onto an existing value.
@@ -241,7 +241,7 @@ __device__ static inline void col_min(V &col_accum, const T &src, const V &src_a
 /**
  * @brief Store the sum of each column of the src shared tile, as well as the src_accum row vector, in the col_accum shared vector.
  *
- * @tparam V The shared vector type for the column accumulator.
+ * @tparam V The shared vector type for the row accumulator.
  * @tparam T The shared matrix type.
  * @param[out] col_accum The accumulator where the result of the reduction is stored.
  * @param[in] src The source matrix on which to perform the reduction.
@@ -254,7 +254,7 @@ __device__ static inline void col_sum(V &col_accum, const T &src, const V &src_a
 /**
  * @brief Store the product of each column of the src shared tile, as well as the src_accum row vector, in the col_accum shared vector.
  *
- * @tparam V The shared vector type for the column accumulator.
+ * @tparam V The shared vector type for the row accumulator.
  * @tparam T The shared matrix type.
  * @param[out] col_accum The accumulator where the result of the reduction is stored.
  * @param[in] src The source matrix on which to perform the reduction.

@@ -5,6 +5,6 @@
 
 #pragma once
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#ifdef KITTENS_HOPPER
 #include "tma.cuh"
 #endif

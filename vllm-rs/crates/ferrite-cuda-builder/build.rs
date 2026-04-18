@@ -405,7 +405,7 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
                 .include_path("../../crates/vllm-cuda/csrc")
                 .include_path("../../third_party/ThunderKittens")
                 .include_path("../../third_party/Megakernels/include")
-                .include_path("../../third_party/Megakernels/demos/low-latency-llama")
+                .include_path("../../third_party/Megakernels/demos/cross-gpu-llama")
                 .with_cutlass(Some(CUTLASS_COMMIT));
             let obj_name = std::path::Path::new(cu)
                 .file_stem()
@@ -420,6 +420,7 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
                 .arg("--expt-extended-lambda")
                 .arg("--expt-relaxed-constexpr")
                 .arg("-DNDEBUG")
+                .arg("-DPRINT_DEADLOCKS")
                 .arg("-DKITTENS_HOPPER")
                 .arg("-Xcompiler=-fPIC")
                 .arg("-Xcompiler=-fno-strict-aliasing")

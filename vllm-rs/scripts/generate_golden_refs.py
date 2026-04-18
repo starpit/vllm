@@ -72,6 +72,12 @@ MODELS = {
     # `TestModels::GEMMA3_1B_IT_CUDA` so engine + golden run on the same
     # weights.
     "gemma3_1b": "unsloth/gemma-3-1b-it",
+    # CommandR (CohereForCausalLM) — 1-layer trim of real v01 by
+    # Citaman (mergekit). Full v01 dims (hidden=8192, head_dim=128,
+    # vocab=256000), single decoder layer → ~5GB bf16, fits L4.
+    # Trained weights → real logprob signal, token-equivalence test
+    # catches actual math bugs.
+    "command_r_1l": "Citaman/command-r-1-layer",
 }
 
 MAX_TOKENS = 32
@@ -82,6 +88,12 @@ OUTPUT_DIR = Path(__file__).parent.parent / "crates" / "vllm-e2e" / "testdata" /
 
 def generate_for_model(model_id: str, output_key: str):
     print(f"Loading {model_id}...")
+    # tiny-random-cohere ships fp32 weights; our engine auto-casts to
+    # bf16. With initializer_range=0.02 the bf16 mantissa loss flips
+    # argmax in the uniform-logits random-init regime — force Python
+    # vLLM to bf16 so both engines see the same precision. Other test
+    # models all carry native bf16 in their config, so the default path
+    # already matches.
     llm = LLM(model=model_id, max_model_len=2048)
     tokenizer = llm.get_tokenizer()
 

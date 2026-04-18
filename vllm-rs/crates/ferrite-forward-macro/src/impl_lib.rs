@@ -401,6 +401,9 @@ pub fn rust_type_for_weight_consumed_by(op: OpKind) -> TokenStream {
     match op {
         OpKind::Embed => quote! { ::ferrite_kernels::layers::Embedding },
         OpKind::RmsNorm => quote! { ::ferrite_kernels::layers::RmsNorm },
+        // Cohere-flavored full LayerNorm (weight only, no bias). The
+        // `eps` rides on the wrapper struct, same shape as RmsNorm.
+        OpKind::LayerNorm => quote! { ::ferrite_kernels::layers::CohereLayerNorm },
         OpKind::Gemm => quote! { ::ferrite_kernels::layers::LinearLayer },
         // Ops that don't consume weights in the DSL's typical
         // patterns. If the DSL routes a weight into one of these
@@ -838,6 +841,28 @@ fn emit_rmsnorm(ctx: &EmitCtx) -> TokenStream {
     }
 }
 
+fn emit_layernorm(ctx: &EmitCtx) -> TokenStream {
+    // kernels::cohere_layer_norm(input, weight, eps, alloc, stream) -> OwnedTensor.
+    // Cohere's LayerNorm subtracts the mean (unlike RmsNorm) and has
+    // weight only (no bias). Same call shape as `emit_rmsnorm`,
+    // different kernel.
+    let tile = ctx.primary();
+    let out = ctx.output_ident(tile, 0);
+    let x = ctx.input_expr(tile, 0);
+    let w = ctx.input_expr(tile, 1);
+    quote! {
+        let #out = unsafe {
+            ::ferrite_kernels::kernels::cohere_layer_norm(
+                *(#x),
+                (#w).weight,
+                (#w).eps,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+    }
+}
+
 fn emit_gemm(ctx: &EmitCtx) -> TokenStream {
     // `gemm()` in the DSL is strict matmul. Bias is a separate
     // `bias_add` tile and is claimed by its own Impl (e.g.
@@ -1087,6 +1112,14 @@ trivial_impl!(
     false
 );
 trivial_impl!(
+    LayerNormRefImpl,
+    OpKind::LayerNorm,
+    "layer_norm_ref",
+    elementwise_cost,
+    emit_layernorm,
+    false
+);
+trivial_impl!(
     GemmRefImpl,
     OpKind::Gemm,
     "gemm_ref",
@@ -1274,6 +1307,7 @@ pub fn starter_library() -> ImplementationLibrary {
     let mut lib = ImplementationLibrary::new();
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
+    lib.push(Box::new(LayerNormRefImpl));
     lib.push(Box::new(GemmRefImpl));
     lib.push(Box::new(AttentionViaCacheImpl));
     // Reshape is a metadata-only view op synthesized by shape
@@ -1294,6 +1328,10 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(FusedGateUpSiluMulImpl));
     lib.push(Box::new(FusedGateUpGeluMulImpl));
     lib.push(Box::new(FusedAddRmsNormImpl));
+    // Singleton fallback for residual `Add`s whose downstream is not
+    // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
+    // adds before any LayerNorm. Emits `add_inplace`.
+    lib.push(Box::new(AddRefImpl));
     // Gemma-style 3-tile fusion: residual-Add + scalar-offset-Add
     // + RmsNorm. Claimed by the DP in preference to the 2-tile
     // FusedAddRmsNorm + standalone ScalarOffset because it's a
@@ -2399,6 +2437,155 @@ impl Implementation for TanhSoftCapImpl {
     }
 }
 
+// ── AddRefImpl ───────────────────────────────────────────────────
+//
+// Singleton fallback for `OpKind::Add` tiles whose downstream is
+// neither `RmsNorm` (claimed by `FusedAddRmsNormImpl`) nor
+// `RmsNorm`-with-scalar-offset (claimed by
+// `FusedAddRmsNormWithOffsetImpl`). Necessary for arches whose
+// residual stream isn't immediately followed by the next layer's
+// pre-norm — Cohere's parallel attn+MLP topology adds the attn
+// output and the MLP output into the residual as two separate
+// `add(...)` statements with no intervening norm.
+//
+// Both Add inputs must be tiles (not weights/scalars/externs); the
+// scalar-offset case is left to `ScalarOffsetRmsNormImpl`. Emits
+// `add_inplace(residual, delta)` mutating the slot-1 (residual)
+// buffer; the Add's output is bound as a TensorView alias of that
+// same buffer. Convention matches `FusedAddRmsNormImpl`: slot 0 is
+// the new contribution, slot 1 is the residual.
+
+#[derive(Debug, Default)]
+pub struct AddRefImpl;
+
+impl Implementation for AddRefImpl {
+    fn name(&self) -> &'static str {
+        "add_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::Add || node.inputs.len() != 2 {
+            return None;
+        }
+        // Both inputs must be Tiles. ScalarOffset Adds (Weight + Scalar)
+        // are claimed by `ScalarOffsetRmsNormImpl`; mixed Tile+Weight
+        // shouldn't occur for residual adds.
+        let slot_a = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        let slot_b = match &node.inputs[1] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        // Defer to the (Add, RmsNorm) fusion when the downstream is a
+        // RmsNorm consuming this Add's output. Cohere's LayerNorm has
+        // no fusion impl yet, so we DO claim Adds whose downstream is
+        // a LayerNorm (the layer-end residuals before the next layer's
+        // pre-norm). When a `FusedAddCohereLayerNormImpl` lands, mirror
+        // this gate.
+        let downstream_is_rmsnorm = fuf
+            .nodes
+            .iter()
+            .any(|n| n.op == OpKind::RmsNorm && consumes_tile(n, seed));
+        if downstream_is_rmsnorm {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![slot_a, slot_b],
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Read residual + delta, write residual: 3 reads/writes per
+        // element, bandwidth-bound.
+        let m = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 3.0 * m * hidden * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Output aliases the slot-1 input (the residual) since
+        // `add_inplace` mutates that buffer directly.
+        let add_id = claimed_tiles[0];
+        let node = fuf.get(add_id);
+        let residual_src = match node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((add_id, 0), residual_src)]
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let add_id = ctx.primary();
+        let out = ctx.output_ident(add_id, 0);
+        // slot 0 = delta (new contribution), slot 1 = residual (mutated).
+        let delta_upstream = ctx
+            .input_tile_ident(add_id, 0)
+            .expect("Add input 0 (delta) is a Tile");
+        let residual_upstream = ctx
+            .input_tile_ident(add_id, 1)
+            .expect("Add input 1 (residual) is a Tile");
+        quote! {
+            unsafe {
+                ::ferrite_kernels::kernels::add_inplace(
+                    *#residual_upstream,
+                    *#delta_upstream,
+                    device.compute_stream,
+                );
+            }
+            // The Add's logical output is the post-mutation residual
+            // buffer — bind as a TensorView alias so downstream tiles
+            // read it without an extra copy.
+            let #out = unsafe { (*#residual_upstream).as_view() };
+        }
+    }
+}
+
 // ── FusedAddRmsNormImpl ──────────────────────────────────────────
 //
 // Multi-tile impl claiming `(Add, RmsNorm)` where the RmsNorm's
@@ -3183,6 +3370,25 @@ fn rope_kv_cache_layer(node: &crate::fuf::FufNode) -> Option<u64> {
     })
 }
 
+/// True for either rope-append flavor — the NeoX-style `RopeAppend`
+/// or the Cohere-style `RopeAppendInterleaved`. Used by the QKV+rope
+/// fusion matchers and the singleton fallback so a single impl claims
+/// both flavors and dispatches to the right kernel at emit time.
+fn is_rope_append_op(op: OpKind) -> bool {
+    matches!(op, OpKind::RopeAppend | OpKind::RopeAppendInterleaved)
+}
+
+/// True iff the layer at `layer` uses the interleaved rope flavor,
+/// determined by finding the layer's rope-append tile in the FUF and
+/// inspecting its `OpKind`. Used by the singleton attention impls so
+/// the FA-2 call sees `is_rotary_interleaved=true` whenever the layer
+/// upstream rope wrote interleaved-pattern Q/K to the cache.
+fn layer_rope_is_interleaved(fuf: &Fuf, layer: u64) -> bool {
+    fuf.nodes
+        .iter()
+        .any(|n| n.op == OpKind::RopeAppendInterleaved && rope_kv_cache_layer(n) == Some(layer))
+}
+
 /// Resolve a tile to `(gemm_tile, maybe_bias_add_tile)`:
 /// - `(g, None)`    if `tile` is directly a `Gemm`.
 /// - `(g, Some(b))` if `tile` is a `BiasAdd` whose first tile input
@@ -3222,7 +3428,7 @@ fn unwrap_gemm_through_bias(fuf: &Fuf, tile: TileId) -> Option<(TileId, Option<T
 /// is broken by intervening ops (Qwen3's per-head Q/K rmsnorms).
 fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
     let node = fuf.get(rope_tile);
-    if node.op != OpKind::RopeAppend || node.inputs.len() < 3 {
+    if !is_rope_append_op(node.op) || node.inputs.len() < 3 {
         return false;
     }
     let qkv_raw: Vec<TileId> = node
@@ -3297,7 +3503,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
         // surface it as UnclaimedTile rather than silently do the
         // wrong thing.
         let rope_node = fuf.nodes.iter().find(|n| {
-            if n.op != OpKind::RopeAppend || n.inputs.len() < 3 {
+            if !is_rope_append_op(n.op) || n.inputs.len() < 3 {
                 return false;
             }
             let qkv_raw: Vec<TileId> = n
@@ -3444,7 +3650,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
         // allocator — so they're absent from the map (untracked).
         let rope_id = *claimed_tiles
             .iter()
-            .find(|t| fuf.get(**t).op == OpKind::RopeAppend)
+            .find(|t| is_rope_append_op(fuf.get(**t).op))
             .expect("claim contains RopeAppend");
         vec![((rope_id, 0), None)]
     }
@@ -3485,15 +3691,16 @@ impl Implementation for FusedQkvRopeCacheImpl {
     }
 
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Identify the RopeAppend tile. The three Gemm tiles come via
-        // `unwrap_gemm_through_bias` on the rope's first three tile
-        // inputs — which strips an optional BiasAdd wrapper.
+        // Identify the rope tile (NeoX or interleaved). The three Gemm
+        // tiles come via `unwrap_gemm_through_bias` on the rope's first
+        // three tile inputs — which strips an optional BiasAdd wrapper.
         let rope_id = *ctx
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+            .find(|t| is_rope_append_op(ctx.fuf.get(**t).op))
             .expect("claim must contain a RopeAppend");
         let rope_node = ctx.fuf.get(rope_id);
+        let interleaved = rope_node.op == OpKind::RopeAppendInterleaved;
 
         let qkv_raw: Vec<TileId> = rope_node
             .inputs
@@ -3572,21 +3779,30 @@ impl Implementation for FusedQkvRopeCacheImpl {
 
         let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
 
-        quote! {
-            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
-            // then fused RoPE + paged-cache write. The packed QKV
-            // buffer drops as soon as the rope-cache kernel returns.
-            //
-            // FP8 KV-cache path branches at runtime: the cache dtype
-            // is a per-model property known only at load time.
-            let #q_out = unsafe {
-                #bias_assert
-                let qkv_packed = (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
+        // Pick the rope-flavor kernel at emit time. Cohere's interleaved
+        // pairing has its own fused-cache kernel; the FP8 path doesn't
+        // currently have an interleaved variant, so an interleaved arch
+        // with FP8 KV would need that kernel added (no live arch hits
+        // this combo today).
+        let cache_call = if interleaved {
+            quote! {
+                ::ferrite_kernels::kernels::fused_qkv_interleaved_rope_cache(
+                    *qkv_packed,
+                    *ctx.positions,
+                    #rotary_cos_sin,
+                    *ctx.slot_mapping,
+                    *ctx.kv_cache.k_cache(#layer),
+                    *ctx.kv_cache.v_cache(#layer),
+                    #q_size,
+                    #kv_size,
+                    #num_q_heads,
+                    #head_dim,
                     &mut device.caching,
                     device.compute_stream,
-                );
+                )
+            }
+        } else {
+            quote! {
                 if ctx.kv_cache.is_fp8() {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
@@ -3620,6 +3836,25 @@ impl Implementation for FusedQkvRopeCacheImpl {
                         device.compute_stream,
                     )
                 }
+            }
+        };
+
+        quote! {
+            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
+            // then fused RoPE + paged-cache write. The packed QKV
+            // buffer drops as soon as the rope-cache kernel returns.
+            //
+            // FP8 KV-cache path branches at runtime: the cache dtype
+            // is a per-model property known only at load time.
+            let #q_out = unsafe {
+                #bias_assert
+                let qkv_packed = (#weight_expr).forward(
+                    #activation,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                #cache_call
             };
             // K/V aliases: the paged-cache layer slices. Bound for
             // symmetry with the FUF's tuple output shape; not read by
@@ -4477,6 +4712,11 @@ impl Implementation for AttentionViaCacheImpl {
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
         let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+        // Discover the rope flavor used at this layer so FA-2's
+        // span-rotation path uses the right element pairing on
+        // unrotated KV blocks. Determined statically from the layer's
+        // rope tile in the FUF.
+        let interleaved_lit = layer_rope_is_interleaved(ctx.fuf, layer as u64);
 
         quote! {
             // Decode paged attention. Delegates to the
@@ -4513,7 +4753,7 @@ impl Implementation for AttentionViaCacheImpl {
                     device.compute_stream,
                     cos_sin_ptr,
                     rotary_dim,
-                    false, // is_rotary_interleaved
+                    #interleaved_lit, // is_rotary_interleaved (rope flavor at this layer)
                 )
             };
             // Flatten [num_tokens, num_q_heads, head_dim] → [num_tokens, q_size]
@@ -4572,7 +4812,7 @@ impl Implementation for RopeAppendRefImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let node = fuf.get(seed);
-        if node.op != OpKind::RopeAppend {
+        if !is_rope_append_op(node.op) {
             return None;
         }
         // Boundary inputs: q, k, v upstream tiles (slots 0, 1, 2 of
@@ -4700,6 +4940,7 @@ impl Implementation for RopeAppendRefImpl {
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
         let rope_id = ctx.primary();
         let node = ctx.fuf.get(rope_id);
+        let interleaved = node.op == OpKind::RopeAppendInterleaved;
 
         let q_upstream = ctx
             .input_tile_ident(rope_id, 0)
@@ -4734,11 +4975,22 @@ impl Implementation for RopeAppendRefImpl {
 
         let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
 
-        quote! {
-            unsafe {
-                // RoPE runs against the flat 2D `[T, heads*head_dim]`
-                // layout — rotary_embedding_inplace reads dim(0)/dim(1)
-                // to derive tokens × total dim.
+        // Interleaved arches (Cohere) pair adjacent (2i, 2i+1) elements
+        // for rotation; NeoX arches pair (i, i + half_dim). Same kernel
+        // signature, different math — branch at emit time.
+        let rope_call = if interleaved {
+            quote! {
+                ::ferrite_kernels::kernels::rotary_embedding_interleaved_inplace(
+                    *#q_upstream,
+                    *#k_upstream,
+                    *ctx.positions,
+                    #rotary_cos_sin,
+                    #head_dim,
+                    device.compute_stream,
+                );
+            }
+        } else {
+            quote! {
                 ::ferrite_kernels::kernels::rotary_embedding_inplace(
                     *#q_upstream,
                     *#k_upstream,
@@ -4747,6 +4999,15 @@ impl Implementation for RopeAppendRefImpl {
                     #head_dim,
                     device.compute_stream,
                 );
+            }
+        };
+
+        quote! {
+            unsafe {
+                // RoPE runs against the flat 2D `[T, heads*head_dim]`
+                // layout — rotary_embedding_*_inplace reads dim(0)/dim(1)
+                // to derive tokens × total dim.
+                #rope_call
                 let nt = (*#k_upstream).dim(0);
                 let k_3d = (*#k_upstream)
                     .as_view()
@@ -4880,9 +5141,10 @@ impl Implementation for FusedQkvRopePrefillImpl {
         let rope_id = *ctx
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
+            .find(|t| is_rope_append_op(ctx.fuf.get(**t).op))
             .expect("claim must contain a RopeAppend");
         let rope_node = ctx.fuf.get(rope_id);
+        let interleaved = rope_node.op == OpKind::RopeAppendInterleaved;
 
         // Resolve rope's three tile inputs to underlying Gemms, stripping
         // optional BiasAdd wrappers (matches `FusedQkvRopeCacheImpl`).
@@ -4945,6 +5207,39 @@ impl Implementation for FusedQkvRopePrefillImpl {
 
         let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
 
+        // Cohere-style interleaved pairing has its own split-rope kernel.
+        let split_call = if interleaved {
+            quote! {
+                ::ferrite_kernels::kernels::fused_qkv_interleaved_rope(
+                    *qkv_packed,
+                    *ctx.positions,
+                    #rotary_cos_sin,
+                    #q_size,
+                    #kv_size,
+                    #num_q_heads,
+                    #num_kv_heads,
+                    #head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            }
+        } else {
+            quote! {
+                ::ferrite_kernels::kernels::fused_qkv_rope(
+                    *qkv_packed,
+                    *ctx.positions,
+                    #rotary_cos_sin,
+                    #q_size,
+                    #kv_size,
+                    #num_q_heads,
+                    #num_kv_heads,
+                    #head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            }
+        };
+
         quote! {
             // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
             // then RoPE-split into contiguous Q/K/V. The packed QKV
@@ -4962,18 +5257,7 @@ impl Implementation for FusedQkvRopePrefillImpl {
                     &mut device.caching,
                     device.compute_stream,
                 );
-                ::ferrite_kernels::kernels::fused_qkv_rope(
-                    *qkv_packed,
-                    *ctx.positions,
-                    #rotary_cos_sin,
-                    #q_size,
-                    #kv_size,
-                    #num_q_heads,
-                    #num_kv_heads,
-                    #head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
+                #split_call
             };
             // Commit rotated K/V into the paged cache at slot_mapping
             // so subsequent decode steps read the correct values.
@@ -5065,6 +5349,7 @@ impl Implementation for AttentionPrefillContiguousImpl {
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
         let tile = ctx.primary();
         let out = ctx.output_ident(tile, 0);
+        let node = ctx.fuf.get(tile);
 
         // Q, K, V from the DSL's `attention(q, k, v, ...)` — slots
         // 0/1/2 are the upstream rope-append tile's three outputs.
@@ -5077,6 +5362,19 @@ impl Implementation for AttentionPrefillContiguousImpl {
         let scale_tokens = attention_scale_tokens(ctx);
         let softcap_tokens = attention_softcap_tokens(ctx);
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
+        // Flag is harmless when rotary_dim=0 (no fused RoPE in FA2 on
+        // the prefill path), but pass the right value for consistency
+        // and for any future prefill path that does fused RoPE.
+        let layer = node.inputs.iter().find_map(|i| match i {
+            FufInput::Extern {
+                kind: crate::classified::ExternKind::KvCache,
+                index: Some(layer),
+            } => Some(*layer),
+            _ => None,
+        });
+        let interleaved_lit = layer
+            .map(|l| layer_rope_is_interleaved(ctx.fuf, l))
+            .unwrap_or(false);
 
         quote! {
             let mut #out = unsafe {
@@ -5103,7 +5401,7 @@ impl Implementation for AttentionPrefillContiguousImpl {
                     device.compute_stream,
                     ::std::ptr::null::<u8>(),
                     0,     // rotary_dim
-                    false, // is_rotary_interleaved
+                    #interleaved_lit, // is_rotary_interleaved (rope flavor at this layer)
                 )
             };
             // Flatten [num_tokens, num_q_heads, head_dim] → [num_tokens, q_size]
@@ -5206,6 +5504,7 @@ impl Implementation for SlidingAttentionViaCacheImpl {
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
         let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+        let interleaved_lit = layer_rope_is_interleaved(ctx.fuf, layer as u64);
 
         quote! {
             let mut #out = unsafe {
@@ -5235,7 +5534,7 @@ impl Implementation for SlidingAttentionViaCacheImpl {
                     device.compute_stream,
                     cos_sin_ptr,
                     rotary_dim,
-                    false, // is_rotary_interleaved
+                    #interleaved_lit, // is_rotary_interleaved (rope flavor at this layer)
                 )
             };
             unsafe {
@@ -5313,6 +5612,7 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
         let tile = ctx.primary();
         let out = ctx.output_ident(tile, 0);
+        let node = ctx.fuf.get(tile);
 
         let q_expr = ctx.input_expr(tile, 0);
         let k_expr = ctx.input_expr(tile, 1);
@@ -5322,6 +5622,17 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
         let softcap_tokens = attention_softcap_tokens(ctx);
         let window_tokens = sliding_window_left_tokens(ctx);
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
+        // Flag is moot here (rotary_dim=0); pass for consistency.
+        let layer = node.inputs.iter().find_map(|i| match i {
+            FufInput::Extern {
+                kind: crate::classified::ExternKind::KvCache,
+                index: Some(layer),
+            } => Some(*layer),
+            _ => None,
+        });
+        let interleaved_lit = layer
+            .map(|l| layer_rope_is_interleaved(ctx.fuf, l))
+            .unwrap_or(false);
 
         quote! {
             let mut #out = unsafe {
@@ -5341,7 +5652,7 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
                     device.compute_stream,
                     ::std::ptr::null::<u8>(),
                     0,     // rotary_dim
-                    false, // is_rotary_interleaved
+                    #interleaved_lit, // is_rotary_interleaved (rope flavor at this layer)
                 )
             };
             unsafe {
@@ -5459,6 +5770,7 @@ fn output_feeds_op(fuf: &Fuf, tile: TileId, op: OpKind) -> bool {
 /// fusion-partner op (Silu/Mul/RopeAppend/BiasAdd).
 fn gemm_is_fusion_partner(fuf: &Fuf, seed: TileId) -> bool {
     output_feeds_op(fuf, seed, OpKind::RopeAppend)
+        || output_feeds_op(fuf, seed, OpKind::RopeAppendInterleaved)
         || output_feeds_op(fuf, seed, OpKind::Silu)
         || output_feeds_op(fuf, seed, OpKind::Mul)
         || output_feeds_op(fuf, seed, OpKind::BiasAdd)

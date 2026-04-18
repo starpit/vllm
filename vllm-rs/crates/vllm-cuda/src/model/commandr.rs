@@ -169,7 +169,12 @@ impl CommandRAttention {
                 );
                 (q, k, v)
             } else if max_seqlen_q == 1 {
-                // Decode: store K unrotated, FA2 rotates with interleaved layout.
+                // Decode: rotate BOTH Q AND K (interleaved layout), then write
+                // ROTATED K to cache. Mirrors Llama's path; the previous
+                // Q-only-rotate + FA2-in-kernel-K-rotate approach was broken
+                // because FA2's in-kernel rotation only fires for span blocks
+                // (when `block_unrotated_gpu` flags are set). With no spans
+                // active, K stayed unrotated when read by attention.
                 let (q, k, v) = kernels::split_qkv(
                     *qkv.view(),
                     attn.q_size,
@@ -182,17 +187,18 @@ impl CommandRAttention {
                 );
                 drop(qkv);
 
-                // Apply interleaved RoPE to Q only — K stays unrotated.
-                kernels::rotary_embedding_interleaved_q_only(
+                // Rotate Q and K in-place with interleaved (2i, 2i+1) pairing.
+                // 2D layout `[T, heads*head_dim]` — kernel reads dim(0)/dim(1).
+                kernels::rotary_embedding_interleaved_inplace(
                     q.as_gpu_tensor(),
+                    k.as_gpu_tensor(),
                     *positions,
                     rotary.cos_sin_cache,
-                    attn.num_q_heads,
                     attn.head_dim,
                     device.compute_stream,
                 );
 
-                // Write unrotated K and V to cache.
+                // Write ROTATED K and V to cache.
                 crate::attention_helpers::write_kv_cache(
                     k.view(),
                     v.view(),
@@ -204,8 +210,18 @@ impl CommandRAttention {
                 drop(k);
                 drop(v);
 
-                // FA2 with fused interleaved RoPE on cached K.
-                let rotary_dim = rotary.cos_sin_cache.dim(1);
+                // K is pre-rotated → null cos_sin_cache (no in-kernel rotation
+                // needed). Spans path stays handled by passing the real ptr
+                // when spans are active, identical to Llama's pattern.
+                let has_spans = !kv_cache.block_unrotated_gpu().is_null();
+                let (cos_sin_ptr, rotary_dim) = if has_spans {
+                    (
+                        rotary.cos_sin_cache.raw_ptr() as *const u8,
+                        rotary.cos_sin_cache.dim(1),
+                    )
+                } else {
+                    (std::ptr::null::<u8>(), 0)
+                };
                 let attn_output = crate::attention_helpers::attention_decode_from_cache(
                     q.view(),
                     cu_seqlens_q,
@@ -221,9 +237,9 @@ impl CommandRAttention {
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
-                    rotary.cos_sin_cache.raw_ptr() as *const u8,
+                    cos_sin_ptr,
                     rotary_dim,
-                    true, // interleaved RoPE
+                    true, // interleaved RoPE flavor (only consumed by spans path)
                 );
                 drop(q);
 
@@ -237,8 +253,9 @@ impl CommandRAttention {
                 drop(attn_output);
                 return result;
             } else {
-                // Prefill: split QKV, apply interleaved RoPE to Q only, store K
-                // unrotated. FA2 rotates cached K with interleaved layout.
+                // Prefill: rotate BOTH Q AND K (interleaved), then write
+                // ROTATED K to cache, then run attention with null cos_sin_ptr.
+                // Same fix as the decode path above.
                 let (q, k, v) = kernels::split_qkv(
                     *qkv.view(),
                     attn.q_size,
@@ -251,7 +268,17 @@ impl CommandRAttention {
                 );
                 drop(qkv);
 
-                // Write unrotated K/V to cache first.
+                // Rotate Q and K in-place with interleaved layout BEFORE caching.
+                kernels::rotary_embedding_interleaved_inplace(
+                    q.as_gpu_tensor(),
+                    k.as_gpu_tensor(),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    attn.head_dim,
+                    device.compute_stream,
+                );
+
+                // Write ROTATED K/V to cache.
                 crate::attention_helpers::write_kv_cache(
                     k.view(),
                     v.view(),
@@ -261,17 +288,9 @@ impl CommandRAttention {
                     device.compute_stream,
                 );
 
-                // Only rotate Q — FA2 fused interleaved RoPE rotates K.
-                kernels::rotary_embedding_interleaved_q_only(
-                    q.as_gpu_tensor(),
-                    *positions,
-                    rotary.cos_sin_cache,
-                    attn.num_q_heads,
-                    attn.head_dim,
-                    device.compute_stream,
-                );
-
-                let rotary_dim = rotary.cos_sin_cache.dim(1);
+                // K pre-rotated → null cos_sin_cache for the contiguous prefill
+                // path. Spans only matter for paged decode, so `has_spans`
+                // doesn't need consulting here.
                 let attn_output = crate::attention_helpers::attention_standard(
                     q.view(),
                     k.view(),
@@ -287,9 +306,9 @@ impl CommandRAttention {
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
-                    rotary.cos_sin_cache.raw_ptr() as *const u8,
-                    rotary_dim,
-                    true, // interleaved RoPE
+                    std::ptr::null::<u8>(),
+                    0,
+                    true, // interleaved RoPE flavor (unused when rotary_dim=0)
                 );
                 drop(q);
                 drop(k);

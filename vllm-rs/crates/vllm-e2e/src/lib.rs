@@ -175,6 +175,16 @@ impl TestModels {
 
     pub const SMOLLM_135M_CUDA: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
     pub const QWEN2_0_5B_CUDA: &str = "Qwen/Qwen2.5-0.5B";
+    // CommandR (CohereForCausalLM) — single-layer trim of the real
+    // `CohereForAI/c4ai-command-r-v01` 35B checkpoint by Citaman
+    // (mergekit slice). Full v01 dims preserved: hidden_size=8192,
+    // head_dim=128, 64 q-heads / 64 kv-heads (no GQA), no QK norm,
+    // rope_theta=8e6, vocab_size=256000, logit_scale=0.0625, tied
+    // embeddings. ~5GB bf16 — fits on a single L4. Trained weights →
+    // logprobs have real signal (not uniform noise), so the token-
+    // equivalence test catches actual math bugs. The full 35B doesn't
+    // fit on L4 and Cohere's smaller official checkpoints are gated.
+    pub const COMMAND_R_1L_CUDA: &str = "Citaman/command-r-1-layer";
     // MoE models for CUDA — safetensors BF16
     // Mixtral: ~0.8B total params (~1.5GB BF16), MixtralForCausalLM
     pub const MIXTRAL_SMALL_CUDA: &str = "if001/small_mixtral_ja_llm_jp_tk";

@@ -138,13 +138,46 @@ fn main() -> Result<()> {
         // Trusting the structural signal rather than the config's
         // `tie_word_embeddings` flag avoids breakage on forks
         // (e.g. unsloth) that re-serialize configs and drop fields.
-        let _ = cfg;
         if !tensors.contains_key("lm_head")
             && let Some(embed_shape) = tensors.get("embed_tokens").cloned()
             && embed_shape.len() == 2
         {
             tensors.insert("lm_head".to_string(), vec![embed_shape[1], embed_shape[0]]);
+            // Tied embedding implied by missing lm_head on disk. Some
+            // upstream configs (Cohere's tiny-random mirror) omit
+            // `tie_word_embeddings` even though the safetensors clearly
+            // ties them — without this stamp, codegen's tied-load arm
+            // wouldn't fire and the runtime would `not found:
+            // lm_head.weight`. Inject the flag into the saved per-model
+            // config so the macro reads `true` from disk.
+            //
+            // Locate the matching saved config and rewrite it. This is
+            // the *committed* JSON in `model_architectures/<arch>/`,
+            // not just an in-memory edit — the macro reads from disk
+            // at expansion time.
+            let saved_path = configs
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, p, _)| p.clone())
+                .unwrap_or_else(|| arch_dir.join(format!("{name}.json")));
+            if let Ok(bytes) = fs::read(&saved_path)
+                && let Ok(mut v) = serde_json::from_slice::<Value>(&bytes)
+                && let Some(obj) = v.as_object_mut()
+                && !obj.contains_key("tie_word_embeddings")
+            {
+                obj.insert(
+                    "tie_word_embeddings".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                let pretty = serde_json::to_string_pretty(&v).unwrap() + "\n";
+                let _ = fs::write(&saved_path, pretty);
+                eprintln!(
+                    "  injected tie_word_embeddings=true into {} (lm_head missing on disk)",
+                    saved_path.display(),
+                );
+            }
         }
+        let _ = cfg;
         per_size.push(SizeProbe {
             repo: repo.clone(),
             bounds: bounds_from_config(cfg),

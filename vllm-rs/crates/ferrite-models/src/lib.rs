@@ -16,6 +16,7 @@
 //! automatically. No DSL-level `bias_add` op is needed, and no
 //! per-arch Impl addition is required.
 
+pub mod commandr;
 pub mod gemma2;
 pub mod gemma3;
 pub mod granite;

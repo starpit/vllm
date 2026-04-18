@@ -345,8 +345,15 @@ pub fn apply_signature(
     match op {
         OpKind::Embed => sig_embed(solver, inputs),
         OpKind::RmsNorm => sig_rmsnorm(solver, inputs),
+        // LayerNorm has identical shape constraints to RmsNorm —
+        // `(x: [..., H], w: [H]) -> [..., H]`. Same signature reused.
+        OpKind::LayerNorm => sig_rmsnorm(solver, inputs),
         OpKind::Gemm => sig_gemm(solver, inputs),
         OpKind::RopeAppend => sig_rope_append(solver, inputs),
+        // Same q/k/v constraints as `rope_append`; the distinction is
+        // in the picked kernel (interleaved pair vs. NeoX), not in
+        // the type signature.
+        OpKind::RopeAppendInterleaved => sig_rope_append(solver, inputs),
         OpKind::Attention => sig_attention(solver, inputs),
         // Same q/k/v constraints as `attention`; the distinction is
         // in the picked kernel (window-masked vs. dense), not in
@@ -613,8 +620,10 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
     match op {
         OpKind::Embed => &[(1, 2)],
         OpKind::RmsNorm => &[(1, 1)],
+        OpKind::LayerNorm => &[(1, 1)],
         OpKind::Gemm => &[(1, 2)],
         OpKind::RopeAppend => &[],
+        OpKind::RopeAppendInterleaved => &[],
         OpKind::Attention => &[],
         OpKind::SlidingAttention => &[],
         OpKind::Silu => &[],
@@ -1308,15 +1317,14 @@ impl InferCtx {
                 Ok(())
             }
             Stmt::AssignTuple { targets, value } => {
-                // The DSL's only tuple-returning op is rope_append.
-                // Its signature already constrained q/k/v, and its
+                // The DSL's only tuple-returning ops are the rope-append
+                // family (`rope_append` and `rope_append_interleaved`).
+                // Their signatures already constrained q/k/v, and their
                 // output is q's shape. We bind each target to the
                 // corresponding input's shape (which the signature
                 // already unified with the heads-layout).
-                if let Expr::Call {
-                    op: OpKind::RopeAppend,
-                    args,
-                } = value
+                if let Expr::Call { op, args } = value
+                    && matches!(op, OpKind::RopeAppend | OpKind::RopeAppendInterleaved)
                 {
                     // q/k/v are args 0/1/2. Their shapes were set
                     // by the Gemm ops that produced them.
@@ -1331,15 +1339,16 @@ impl InferCtx {
                         .iter()
                         .map(|a| self.expr_shape(a))
                         .collect::<Result<_, _>>()?;
-                    apply_signature(&mut self.solver, OpKind::RopeAppend, &all_input_shapes)?;
+                    apply_signature(&mut self.solver, *op, &all_input_shapes)?;
                     // Now bind targets to the post-unification
                     // shapes. (Since rope_append is shape-preserving,
                     // target shapes equal input shapes.)
                     if targets.len() != 3 {
                         return Err(ShapeError::BadArgs {
-                            op: OpKind::RopeAppend,
+                            op: *op,
                             reason: format!(
-                                "rope_append returns 3 values, got {} targets",
+                                "{} returns 3 values, got {} targets",
+                                op.as_str(),
                                 targets.len()
                             ),
                         });
@@ -1354,7 +1363,7 @@ impl InferCtx {
                             Expr::Call { op, .. } => *op,
                             _ => OpKind::Add, // placeholder
                         },
-                        reason: "only rope_append returns a tuple".into(),
+                        reason: "only rope_append / rope_append_interleaved return a tuple".into(),
                     })
                 }
             }

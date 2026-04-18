@@ -97,6 +97,12 @@ mod dispatcher {
 
     /// One registration per `#[forward] fn <arch>()`. The macro
     /// emits an `inventory::submit!` block that constructs this.
+    /// `try_load` function-pointer signature — extracted as a type
+    /// alias so the registration struct doesn't trip clippy's
+    /// `type_complexity` lint.
+    pub type ArchTryLoadFn =
+        fn(&mut GpuWeights, CUstream) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>>;
+
     pub struct FerriteArchRegistration {
         /// The arch's identifier — `"llama"`, `"qwen2"`, … — from
         /// the carrier fn name. Used in logs.
@@ -113,8 +119,7 @@ mod dispatcher {
         /// back to a hand-written path), or `Err(..)` only on a
         /// genuine load failure (I/O, shape mismatch inside a matched
         /// variant, …).
-        pub try_load:
-            fn(&mut GpuWeights, CUstream) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>>,
+        pub try_load: ArchTryLoadFn,
     }
 
     inventory::collect!(FerriteArchRegistration);

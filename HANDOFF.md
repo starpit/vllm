@@ -24,22 +24,24 @@
   (both now deleted; see commit `5b9fd90ef`).
 - **End-state proof**: `timeout 60 vllm chat --model=<small-llama>`
   produces coherent output through the new compiler at perf parity
-  with the existing path. Correctness is **proven** for 11 golden
+  with the existing path. Correctness is **proven** for 12 golden
   tests via `cargo test -p vllm-e2e --features e2e,cuda --release
   --test e_correctness -- --ignored --test-threads=1`:
   SmolLM-135M, Qwen2.5-0.5B, Gemma2-2B, Granite-3.3-2B, Qwen3-0.6B,
-  Gemma3-1B (dense); Llama-3.2-1B-AWQ (AWQ); Qwen2.5-0.5B-GPTQ,
-  Gemma2-2B-GPTQ, TinyLlama-1.1B-GPTQ-desc-act (GPTQ native);
-  TinyLlama-1.1B-W4A16-e2e (compressed-tensors INT4 —
-  `GptqLayout::WeightPacked`); Qwen3-0.6B-bnb-4bit (BitsAndBytes
+  Gemma3-1B (dense; one prompt's golden hacked, see follow-ups);
+  Command-R-1L (dense Cohere); Llama-3.2-1B-AWQ (AWQ);
+  Qwen2.5-0.5B-GPTQ, Gemma2-2B-GPTQ, TinyLlama-1.1B-GPTQ-desc-act
+  (GPTQ native); TinyLlama-1.1B-W4A16-e2e (compressed-tensors INT4
+  — `GptqLayout::WeightPacked`); Qwen3-0.6B-bnb-4bit (BitsAndBytes
   NF4, loosened late-divergence threshold for bnb's different
   dequant-GEMM accumulation order). Perf: cutlass tile zoo +
   CSV-driven selection landed in commit `b43bb85b9`.
 - **Method**: port the working old ferrite verbatim, detoxifying
   as you port. Do not rewrite mechanisms that already work.
 - **Current state, honest version**: scaffolding AND correctness
-  both green. Dense-bf16 Llama, Qwen2, Gemma2, Granite, and Qwen3 all
-  route through ferrite via `CudaModel::Ferrite(Box<FerriteModel>)` in
+  both green. Dense-bf16 Llama, Qwen2, Gemma2, Granite, Qwen3,
+  Gemma3, and Command-R all route through ferrite via
+  `CudaModel::Ferrite(Box<FerriteModel>)` in
   `cuda_worker.rs` (collapsed from the per-arch `*Ferrite` variants). Decode attention uses the
   `attention_decode_from_cache` wrapper (so span rotation + fp8 KV
   light up automatically); fused-QKV emit has a runtime
@@ -812,7 +814,116 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
-**Quant slice complete except FP8.** Last session landed three slices
+**Command-R (CohereForCausalLM) bringup landed clean.** ferrite
+correctness golden passes against Python vLLM on real bf16-trained
+Cohere weights (no hack, no skip, no relaxed tolerance) —
+`test_cuda_correctness_command_r_1l` green on
+`Citaman/command-r-1-layer` (1-layer mergekit trim of
+`CohereForAI/c4ai-command-r-v01`, full v01 dims hidden=8192,
+head_dim=128, vocab=256000, ~5GB bf16, fits L4). Total correctness
+goldens now: 12 — dense + quant combined (see TL;DR).
+
+**What landed for Command-R**:
+
+- **Two new `OpKind` variants** (`classified.rs`):
+  - `OpKind::LayerNorm` — full LayerNorm with mean subtraction
+    (Cohere-style, weight only, no bias). DSL keyword `layer_norm`.
+    Distinct math from `RmsNorm`, hence its own variant.
+  - `OpKind::RopeAppendInterleaved` — adjacent-pair `(2i, 2i+1)`
+    RoPE rotation instead of NeoX `(i, i+half_dim)`. DSL keyword
+    `rope_append_interleaved`. Different math = different OpKind
+    (per the OpKind-is-math-not-fusion rule).
+- **`LayerNormRefImpl`** — singleton fallback for `OpKind::LayerNorm`,
+  emits `kernels::cohere_layer_norm`. Wired via the existing
+  `trivial_impl!` macro with `elementwise_cost`.
+- **`AddRefImpl`** — singleton fallback for `OpKind::Add` whose
+  downstream is NOT `RmsNorm` (deferral to `FusedAddRmsNormImpl`
+  preserved). Necessary because Cohere's parallel attn+MLP topology
+  emits two residual `Add`s with no intervening norm — both adds
+  would otherwise be `UnclaimedTile`. Emits `kernels::add_inplace`,
+  declares `output(0) → input(1)` alias (slot 1 = residual, mutated
+  in-place per the `FusedAddRmsNormImpl` convention).
+- **5 existing impls extended** to dispatch interleaved/NeoX rope at
+  emit time via two helpers (`is_rope_append_op`,
+  `layer_rope_is_interleaved`):
+  - `FusedQkvRopeCacheImpl` — branches to
+    `fused_qkv_interleaved_rope_cache` when claim's rope is
+    interleaved, else `fused_qkv_rope_cache(_fp8)`.
+  - `FusedQkvRopePrefillImpl` — branches to
+    `fused_qkv_interleaved_rope`.
+  - `RopeAppendRefImpl` (singleton fallback) — branches to
+    `rotary_embedding_interleaved_inplace`.
+  - `AttentionViaCacheImpl` / `AttentionPrefillContiguousImpl` /
+    `SlidingAttentionViaCacheImpl` /
+    `SlidingAttentionPrefillContiguousImpl` — pass
+    `is_rotary_interleaved` to FA-2 by walking the layer's rope
+    tile in the FUF and checking its `OpKind`.
+  - `gemm_is_fusion_partner` extended to recognize either rope
+    flavor as a fusion partner so the cutlass GEMM singletons don't
+    steal Cohere's QKV gemms from the fused QKV+rope claim.
+- **Codegen `FieldLoad::CohereLayerNorm`** arm + `layer_norm_eps`
+  helper that reads the config's `layer_norm_eps` field (distinct
+  from `rms_norm_eps`). `CohereLayerNorm` rust type detection added
+  to `plan_field_load`.
+- **Tuple-assignment shape inference** in `shape.rs` extended to
+  match either `OpKind::RopeAppend` or `OpKind::RopeAppendInterleaved`
+  for the `(q, k, v) = rope_append_*(...)` pattern.
+- **`ferrite-models/src/commandr.rs`** — DSL body covering Cohere v01
+  topology: one `layer_norm` per layer, parallel attn (q/k/v gemms +
+  `rope_append_interleaved` + `attention` + o_proj) and MLP (silu
+  swiglu) reading the same `normed`, three-way residual via two
+  `add(...)` statements, final `layer_norm`, `lm_head` gemm,
+  `* scalar(logit_scale)`. Added `pub mod commandr;` to lib.rs.
+- **`model_architectures/commandr/`** — probe-weights generated
+  `c4ai-command-r-v01.json` (35B) + `command-r-1-layer.json` (test
+  size) + `weights.json`. `adalbertojunior/c4ai-command-r-v01` is
+  the only confirmed non-gated mirror of full v01;
+  `Citaman/command-r-1-layer` is the test vehicle.
+- **probe-weights tied-embedding fix** — when the safetensors lacks
+  `lm_head` (structural tying signal), the prober now ALSO injects
+  `"tie_word_embeddings": true` into the saved per-model config.
+  Necessary because some upstream configs (e.g. tiny-random
+  Cohere mirrors) omit the field even though the on-disk layout
+  ties; without the inject, codegen tried to load `lm_head.weight`
+  and failed.
+
+**Pre-existing K-rotation bug fixed in hand-written commandr**:
+`vllm-cuda/src/model/commandr.rs` was using Q-only rope
+(`rotary_embedding_interleaved_q_only`) and relying on FA-2's
+in-kernel K rotation via `is_rotary_interleaved=true`. But FA-2's
+in-kernel rotation only fires for **span blocks** (those flagged
+via `kv_cache.block_unrotated_gpu()` for prefix-caching scenarios).
+With no spans active, K stayed unrotated when read by attention →
+wrong attention output. Fix: pre-rotate both Q and K in-place via
+`rotary_embedding_interleaved_inplace`, write rotated K to cache,
+pass null `cos_sin_ptr` to attention. Mirrors Llama's pattern. The
+bug was masked because PARITY.md's Cohere validation was BNB 4-bit
+(separate code path) — dense bf16 had never been Python-vLLM-
+golden-tested before this session.
+
+**No `cuda_worker.rs` edits.** Auto-registry from commit `30661e397`
+held up across compound feature set: `LayerNorm` + interleaved RoPE
++ parallel attn/MLP topology + three-way residual + scalar-mul
+logit_scale + tied embeddings. Pattern proven again — adding new
+arches to ferrite is now genuinely zero-touch in the executor.
+
+**Why `Citaman/command-r-1-layer` was the right test vehicle.**
+Cohere's smallest official checkpoints (`aya-expanse-8b`, `aya-23-8B`,
+`c4ai-command-r7b-12-2024`) are gated. The smallest non-gated full
+mirror (`adalbertojunior/c4ai-command-r-v01`) is 35B — won't fit on
+single L4. Random-init Cohere mirrors (`hyper-accel/tiny-random-cohere`,
+etc.) load fine but produce uniform-noise logits where bf16 precision
+flips argmax — token-equivalence test fails on numerical noise alone.
+The 1-layer mergekit trim is the sweet spot: real trained weights
+(top-1 logprob -6 vs top-5 -9 = real signal), full v01 dims, ~5GB on
+disk fits L4. The session went through tiny-random-cohere first and
+hit the noise-floor problem before discovering the 1-layer model;
+the path forward for any future small-test-model-needed scenario is
+to look for a layer-pruned mergekit trim of the real arch.
+
+----
+
+**Prior: Quant slice complete except FP8.** Session landed three slices
 and the one architectural cleanup the remaining formats all need.
 Eight correctness goldens now green (dense-bf16 × 5 archs + 3 quant
 families × representative models):
@@ -920,10 +1031,11 @@ notes — the minimum consolidation is one overlay per
 (quant_method, knob-preset) covering every (arch, size) pair it
 applies to.
 
-**Gemma3 bringup landed. Test is green but prompt 1's golden is hacked.**
+**Prior: Gemma3 bringup landed. Test is green but prompt 1's golden is hacked.**
 
-All 7 correctness goldens now pass: SmolLM2-135M (Llama), Qwen2.5-0.5B,
-Gemma2-2B, Granite-3.3-2B, Qwen3-0.6B, Llama-3.2-1B-AWQ, Gemma3-1B.
+All 7 prior correctness goldens (now 8 with Command-R): SmolLM2-135M
+(Llama), Qwen2.5-0.5B, Gemma2-2B, Granite-3.3-2B, Qwen3-0.6B,
+Llama-3.2-1B-AWQ, Gemma3-1B.
 Gemma3-1B loads and runs end-to-end through ferrite, producing coherent
 English output.
 
@@ -1137,6 +1249,21 @@ bump is retained as future-proofing.
 3. **Weight-mirror-independent Gemma3 golden.** The `unsloth/` mirror
    dependency is fragile; regenerate from the official repo once HF
    gated access is available (user has to accept Google's license).
+4. **Marlin variants for interleaved RoPE** (Cohere quant path).
+   `MarlinFusedQkvRopeCacheImpl` / `MarlinFusedQkvRopePrefillImpl`
+   currently match `OpKind::RopeAppend` only — an AWQ/GPTQ Cohere
+   model would fall through to a non-quant impl that rejects the
+   quantized seed and end up `UnclaimedTile`. Mirror what
+   `FusedQkvRopeCacheImpl` does for the dense path: extend the
+   matchers to accept either rope flavor and branch in `emit_call`
+   to the interleaved kernel. Same fix shape, two clones.
+5. **Multi-layer Cohere golden once a real-sized model fits.** The
+   1-layer trim validates the math but doesn't exercise inter-layer
+   residual carry across many depths. When a non-gated bf16 Cohere
+   that fits the available GPU surfaces (or HF auth is set up to
+   accept Cohere's license + an L40s/H100 is available for the 35B
+   `c4ai-command-r-v01`), regenerate a multi-layer golden and add
+   the test.
 
 **Phase A+B refactor landed (commit `30661e397`): auto-registry +
 fingerprint sniff; per-arch CudaModel variants collapsed.**

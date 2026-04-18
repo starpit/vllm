@@ -67,8 +67,19 @@ impl ExternKind {
 pub enum OpKind {
     Embed,
     RmsNorm,
+    /// Full LayerNorm with mean subtraction (and weight; bias-free in
+    /// the variants seen so far): `y = w * (x - mean(x)) / sqrt(var(x) + eps)`.
+    /// Distinct math from `RmsNorm` (which omits the mean subtraction).
+    /// Used by Cohere's CommandR family.
+    LayerNorm,
     Gemm,
     RopeAppend,
+    /// RoPE that pairs adjacent elements `(2i, 2i+1)` for rotation
+    /// instead of NeoX's `(i, i + half_dim)`. Different element
+    /// pairing → genuinely different math, hence its own variant
+    /// rather than a flag on `RopeAppend`. Used by Cohere's CommandR
+    /// family.
+    RopeAppendInterleaved,
     Attention,
     /// Same signature as `Attention`; picked by the DSL body at
     /// sliding-window attention layers. The distinction is carried
@@ -122,8 +133,10 @@ impl OpKind {
         match name {
             "embed" => Some(Self::Embed),
             "rmsnorm" => Some(Self::RmsNorm),
+            "layer_norm" => Some(Self::LayerNorm),
             "gemm" => Some(Self::Gemm),
             "rope_append" => Some(Self::RopeAppend),
+            "rope_append_interleaved" => Some(Self::RopeAppendInterleaved),
             "attention" => Some(Self::Attention),
             "sliding_attention" => Some(Self::SlidingAttention),
             "silu" => Some(Self::Silu),
@@ -142,8 +155,10 @@ impl OpKind {
         match self {
             Self::Embed => "embed",
             Self::RmsNorm => "rmsnorm",
+            Self::LayerNorm => "layer_norm",
             Self::Gemm => "gemm",
             Self::RopeAppend => "rope_append",
+            Self::RopeAppendInterleaved => "rope_append_interleaved",
             Self::Attention => "attention",
             Self::SlidingAttention => "sliding_attention",
             Self::Silu => "silu",

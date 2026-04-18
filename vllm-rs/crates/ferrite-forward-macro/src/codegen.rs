@@ -73,6 +73,12 @@ enum FieldLoad {
     /// `RmsNorm::load(gw, prefix, eps)`. `eps` is baked in from the
     /// model config (`rms_norm_eps`).
     RmsNorm(String, f32),
+    /// `CohereLayerNorm::load(gw, prefix, eps)`. Same shape as
+    /// `RmsNorm` — single weight tensor + scalar eps — but the eps
+    /// source is the `layer_norm_eps` config field rather than
+    /// `rms_norm_eps`. Used for arches whose pre-attention norm is
+    /// a full LayerNorm with weight only (Cohere's CommandR family).
+    CohereLayerNorm(String, f32),
     /// `LinearLayer::load_dense(gw, prefix)`.
     LinearDense(String),
     /// `LinearLayer::load_dense_concat(gw, &[prefix0, prefix1, ...], stream)`.
@@ -170,6 +176,9 @@ fn plan_field_load(
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
     let is_rmsnorm =
         ty.ends_with("::RmsNorm") || ty == "RmsNorm" || ty.ends_with("layers::RmsNorm");
+    let is_cohere_layer_norm = ty.ends_with("::CohereLayerNorm")
+        || ty == "CohereLayerNorm"
+        || ty.ends_with("layers::CohereLayerNorm");
     let is_linear =
         ty.ends_with("::LinearLayer") || ty == "LinearLayer" || ty.ends_with("layers::LinearLayer");
     let is_marlin = ty.ends_with("::MarlinLinear")
@@ -381,6 +390,16 @@ fn plan_field_load(
         );
         let eps = rms_norm_eps(model);
         FieldLoad::RmsNorm(prefixes.into_iter().next().unwrap(), eps)
+    } else if is_cohere_layer_norm {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "CohereLayerNorm accessor `{}` with {} sources",
+            accessor.name,
+            prefixes.len()
+        );
+        let eps = layer_norm_eps(model);
+        FieldLoad::CohereLayerNorm(prefixes.into_iter().next().unwrap(), eps)
     } else if is_linear {
         // Tied-embedding special case: if this accessor is the
         // `lm_head` and the model's config.json has
@@ -431,6 +450,24 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
         return fallback;
     };
     v.get("rms_norm_eps")
+        .and_then(|x| x.as_f64())
+        .map(|x| x as f32)
+        .unwrap_or(fallback)
+}
+
+fn layer_norm_eps(model: &ModelParams) -> f32 {
+    // Cohere/CommandR config carries `layer_norm_eps` (full LayerNorm
+    // epsilon — distinct field from `rms_norm_eps`). Same JSON-read
+    // shape as `rms_norm_eps` since the integer-only bounds map
+    // doesn't capture floats.
+    let fallback: f32 = 1e-5;
+    let Ok(s) = std::fs::read_to_string(&model.source_path) else {
+        return fallback;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return fallback;
+    };
+    v.get("layer_norm_eps")
         .and_then(|x| x.as_f64())
         .map(|x| x as f32)
         .unwrap_or(fallback)
@@ -780,6 +817,11 @@ fn emit_weights_struct(
                 },
                 FieldLoad::RmsNorm(prefix, eps) => quote! {
                     let #name = ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?;
+                },
+                FieldLoad::CohereLayerNorm(prefix, eps) => quote! {
+                    let #name = ::ferrite_kernels::layers::CohereLayerNorm::load(
+                        gw, #prefix, #eps,
+                    )?;
                 },
                 FieldLoad::LinearDense(prefix) => quote! {
                     let #name = ::ferrite_kernels::layers::LinearLayer::load_dense(gw, #prefix)?;

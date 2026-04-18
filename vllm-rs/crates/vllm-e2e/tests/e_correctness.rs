@@ -216,3 +216,19 @@ async fn test_cuda_correctness_qwen3_0_6b_bnb_4bit() {
 async fn test_cuda_correctness_gemma3_1b() {
     run_correctness_test(TestModels::GEMMA3_1B_IT_CUDA, "gemma3_1b").await;
 }
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_command_r_1l() {
+    // CommandR (CohereForCausalLM) on the 1-layer trim of v01 by Citaman
+    // — real bf16 trained weights with the full v01 dims (hidden=8192,
+    // head_dim=128, vocab=256000), pruned to a single decoder layer.
+    // Trained weights produce differentiated logits, so the token-
+    // equivalence comparison catches real math bugs in the new ferrite
+    // ops (LayerNorm, RopeAppendInterleaved, AddRefImpl) and in the
+    // hand-written `vllm-cuda/src/model/commandr.rs` interleaved-RoPE
+    // path. Full 35B doesn't fit on L4; smaller official Cohere
+    // checkpoints are gated.
+    run_correctness_test(TestModels::COMMAND_R_1L_CUDA, "command_r_1l").await;
+}

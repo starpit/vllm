@@ -75,7 +75,7 @@ correctness or functionality.
 | 5 | **Qwen2 fused-QKV-with-bias** (LANDED) | `CublasFusedQkvGemmWithBiasImpl` | `FusedQkvRopeCacheImpl` + `FusedQkvRopePrefillImpl` matchers now walk through an optional `BiasAdd` wrapper on each rope input; claim grows 4→7 tiles when biased. `OpKind::BiasAdd` + `FusedGemmBiasImpl` for stray pairs. | Qwen2 DSL now says `bias_add` explicitly; solver absorbs it into the fused QKV kernel via cuBLAS `gemm_bias` epilog |
 | 6 | **Cublas / cutlass gemm+residual fusion** | `CublasGemmExWithResidualImpl`, `CutlassGemmWithResidualImpl` (424 variants) | 0 | Extra launches vs. fused |
 | 7 | **Cutlass gemm+silu+mul fusion** | `CutlassGemmSiluMulImpl` (424 variants) | `FusedGateUpSiluMulImpl` emits cuBLAS | Perf delta on SwiGLU MLP |
-| 8 | **Attention variant split** (LANDED) | `TkAttentionDecodeImpl`, `TkAttentionPrefillImpl`, `FlashInferStandaloneImpl`, `FlashInferStandardImpl` | `AttentionViaCacheImpl` + `FusedQkvRopeCacheImpl` for decode (M=1); `AttentionPrefillContiguousImpl` + `FusedQkvRopePrefillImpl` for prefill (M≥2); solver picks per `WorkloadConstraint`. Done in Step D commit `16ef52925`. | No longer a split issue — but did not fix `vllm chat` garbage output on its own |
+| 8 | **Attention variant split + FlashInfer** (LANDED) | Decode/prefill split + FI peer Impls | `AttentionViaCacheImpl` + `FusedQkvRopeCacheImpl` (decode M=1), `AttentionPrefillContiguousImpl` + `FusedQkvRopePrefillImpl` (prefill M≥2), plus `FlashInferAttentionDecodeImpl` / `FlashInferAttentionPrefillImpl` (one pair per `FLASHINFER_CONFIG_SET` tuple, solver-picked per calibrated CSV row). Opt-in via `sk_buckets = [..]` on `#[forward]`; active for Llama/Qwen2/Gemma2/Granite. | Landed |
 | 9 | **Prefill rope variant** | `VllmRsPrefillRopeCacheImpl` | 0 | Prefill KV-write path missing |
 | 10 | **Scheduled megakernel**\* (**HIGH PRIORITY**) | Full BSP persistent cooperative-launch kernel system: `kernel_library.rs`, `schedule.rs`, `templates/scheduled/megakernel.cu`, `SCHEDULED_MEGAKERNEL_HANDOFF.md` (~41 KB) | Nothing | Entire megakernel codegen path absent |
 | 11 | **Codegen: stream assignment, wave merging, cooperative-launch emission, graph capture** | All present in `ferrite-solver/src/lowering/backend/cuda_codegen.rs` | Sequential one-launch-per-subgraph only | DeviceCallable waves can't form megakernels |
@@ -161,6 +161,45 @@ Decode vs prefill impls now split via `WorkloadConstraint`:
 on contiguous K/V) for M≥2. Solver's DP picks per bucket.
 Necessary but **not sufficient** for correctness — the SmolLM
 golden still fails after Step D landed. Kept here for reference.
+
+### FlashInfer attention (LANDED)
+
+FlashInfer is wired up as a peer to the FA2 Impls above, solver-
+picked per calibrated `(head_dim, softcap) × (num_tokens, sk_bucket)`
+cost row. Landed pieces: minijinja-rendered per-tuple shim (6
+tuples in `FLASHINFER_CONFIG_SET` — bf16 × h ∈ {64, 128, 256} ×
+softcap on/off); FFI + process-global `Mutex<FlashInferPlanCache>`
+with replan fast-path; `FlashInferAttentionDecodeImpl` /
+`FlashInferAttentionPrefillImpl` in `impl_lib.rs`;
+`cost_attention_calibrated` so FA2 reads `fa2_attn_*` rows too and
+the tiebreak runs on measured µs; pre-graph-launch replan hook in
+`CudaGraphRunner::{replay, replay_decode_fast}` +
+`PrefillGraphRunner::replay`.
+
+Opt-in per model via `sk_buckets = [..]` on `#[forward]`. Currently
+active for Llama, Qwen2, Gemma2, Granite. Verified: all four produce
+"391" on 17×23 under default CUDA graphs on L4; Llama-3.2-1B decode
+is +1.3% tok/s vs FA2 at bs=1 input=512 (scales with context). On
+sm_89 the h=256 FI tuple is runtime-suppressed by the sweep's
+trial-launch guard (exceeds L4's 100 KB dynamic-smem budget) — the
+solver transparently falls back to FA2 for those rows.
+
+Calibration: `cargo run -p ferrite-cost-sweep --features cuda
+--release --bin gpu_cost_sweep > target_profiles/cost_<gpu>.csv`
+produces both the GEMM + attention rows. The committed L4 CSV has
+228 FA2 + 304 FI attention rows.
+
+Two bugs worth remembering for anyone editing this path:
+- **FI plan's `seq_len` is total Q tokens, not `max_seqlen_q`**. My
+  `last_replan` memo must key on `(seq_len, seqlen_k, num_pages)` —
+  dropping `seq_len` lets a prefill warmup's plan (seq_len=2048)
+  leak into a decode capture (seq_len=56), OOB reads, and the next
+  GEMM crashes with `CUBLAS_STATUS_EXECUTION_FAILED`.
+- **Per-vector tight H2D in the shim planner**, not one big
+  `num_allocated_bytes` memcpy. Each scheduling vector is slotted
+  at `max_total_num_works * sizeof(i32) = 256 KB`; the bulk memcpy
+  copied ~6 MB of padding per decode step, which dominated the FI
+  kernel win end-to-end.
 
 ### Step E — Wiring to vllm-cuda + vllm chat (PARTIALLY DONE)
 

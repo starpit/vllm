@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Region templates. For v1 there is one: `Attn(W)`. It covers
-//! FA2 prefill (`W = ∞`), Gemma3 local attention (`W = finite`),
-//! and paged-KV decode (same template, different load-address
-//! instantiation and domain axes — see `attn_region_decode`).
+//! Region templates — parametric stencil fragments that the lowering
+//! pass instantiates per subgraph. Each template declares its own
+//! iteration domain, entry scalars, nodes, and edges in terms of the
+//! frozen vocabulary (3 roles, 5 dep kinds); the megakernel emitter
+//! stitches instantiated templates together via `Megakernel.control`.
+//!
+//! Templates live here (not in the lowering pass) so they stay
+//! arch-neutral — per-arch lowering happens via `ArchMap` at emit
+//! time, not at template construction.
 
 use smallvec::smallvec;
 
@@ -473,5 +478,534 @@ pub fn attn_region_paged_decode(p: &PagedDecodeParams) -> Region {
         ],
         nodes,
         edges,
+    }
+}
+
+// ─── GEMM ───────────────────────────────────────────────────────
+//
+// Row-major tiled matmul: C[M,N] += A[M,K] · B[K,N].
+//
+// Domain: (m_tile, n_tile) parallel, k_tile serial (reduction).
+// Load A/B tiles pipelined over k; Compute accumulates across k;
+// Store fires at the end of the k loop, outside it. This is the
+// workhorse template for projections (qkv, o, gate, up, down,
+// lm_head) once lowering routes them here.
+
+#[derive(Debug, Clone, Copy)]
+pub struct GemmParams {
+    pub m_tile: u32,
+    pub n_tile: u32,
+    pub k_tile: u32,
+    pub pipe: u32,
+}
+
+pub fn gemm_region(p: &GemmParams) -> Region {
+    const M: AxisId = 0;
+    const N: AxisId = 1;
+    const K: AxisId = 2;
+    const NUM_M: ScalarId = 0;
+    const NUM_N: ScalarId = 1;
+    const NUM_K: ScalarId = 2;
+    const N_LOAD_A: NodeId = 0;
+    const N_LOAD_B: NodeId = 1;
+    const N_GEMM: NodeId = 2;
+    const N_STORE: NodeId = 3;
+
+    let m_stride = p.m_tile as u64;
+    let n_stride = p.n_tile as u64;
+    let k_stride = p.k_tile as u64;
+
+    let nodes = vec![
+        Node {
+            id: N_LOAD_A,
+            role: Role::Load,
+            op: FufOpRef { tag: "load_a_tile" },
+            addr: Some(LoadAddr {
+                terms: smallvec![
+                    AddrTerm::AxisStride {
+                        axis: M,
+                        stride: StrideExpr::Const(m_stride),
+                    },
+                    AddrTerm::AxisStride {
+                        axis: K,
+                        stride: StrideExpr::Const(k_stride),
+                    },
+                ],
+            }),
+        },
+        Node {
+            id: N_LOAD_B,
+            role: Role::Load,
+            op: FufOpRef { tag: "load_b_tile" },
+            addr: Some(LoadAddr {
+                terms: smallvec![
+                    AddrTerm::AxisStride {
+                        axis: K,
+                        stride: StrideExpr::Const(k_stride),
+                    },
+                    AddrTerm::AxisStride {
+                        axis: N,
+                        stride: StrideExpr::Const(n_stride),
+                    },
+                ],
+            }),
+        },
+        Node {
+            id: N_GEMM,
+            role: Role::Compute,
+            op: FufOpRef {
+                tag: "gemm_accumulate",
+            },
+            addr: None,
+        },
+        Node {
+            id: N_STORE,
+            role: Role::Store,
+            op: FufOpRef {
+                tag: "store_c_tile",
+            },
+            addr: Some(LoadAddr {
+                // K is reduced; Store addr omits it.
+                terms: smallvec![
+                    AddrTerm::AxisStride {
+                        axis: M,
+                        stride: StrideExpr::Const(m_stride),
+                    },
+                    AddrTerm::AxisStride {
+                        axis: N,
+                        stride: StrideExpr::Const(n_stride),
+                    },
+                ],
+            }),
+        },
+    ];
+
+    let p_depth = p.pipe as i32;
+    let edges = vec![
+        Edge {
+            src: N_LOAD_A,
+            dst: N_GEMM,
+            kind: DepKind::Pipeline,
+            vector: DepVector(smallvec![(K, -p_depth)]),
+        },
+        Edge {
+            src: N_LOAD_B,
+            dst: N_GEMM,
+            kind: DepKind::Pipeline,
+            vector: DepVector(smallvec![(K, -p_depth)]),
+        },
+        // Accumulation chain across k.
+        Edge {
+            src: N_GEMM,
+            dst: N_GEMM,
+            kind: DepKind::Raw,
+            vector: DepVector(smallvec![(K, -1)]),
+        },
+        Edge {
+            src: N_GEMM,
+            dst: N_STORE,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+    ];
+
+    Region {
+        id: 0,
+        name: "gemm",
+        domain: Domain {
+            axes: vec![
+                Axis {
+                    id: M,
+                    name: "m_tile",
+                    bound: Bound::RegionEntryScalar(NUM_M),
+                },
+                Axis {
+                    id: N,
+                    name: "n_tile",
+                    bound: Bound::RegionEntryScalar(NUM_N),
+                },
+                Axis {
+                    id: K,
+                    name: "k_tile",
+                    bound: Bound::RegionEntryScalar(NUM_K),
+                },
+            ],
+            predicates: vec![],
+        },
+        entry_scalars: vec![
+            ScalarBinding {
+                id: NUM_M,
+                name: "num_m_tiles",
+            },
+            ScalarBinding {
+                id: NUM_N,
+                name: "num_n_tiles",
+            },
+            ScalarBinding {
+                id: NUM_K,
+                name: "num_k_tiles",
+            },
+        ],
+        nodes,
+        edges,
+    }
+}
+
+// ─── RMSNorm ────────────────────────────────────────────────────
+//
+// Per-row normalization: y = x * weight / rms(x). Each CTA owns a
+// token tile; the hidden-dim reduction happens inside the Compute
+// node (warp-wide reduction via the intrinsic expansion). No serial
+// axis — this region is straight-line.
+
+#[derive(Debug, Clone, Copy)]
+pub struct RmsNormParams {
+    pub hidden_dim: u32,
+    pub token_tile: u32,
+}
+
+pub fn rmsnorm_region(p: &RmsNormParams) -> Region {
+    const TOKEN: AxisId = 0;
+    const NUM_TOKEN_TILES: ScalarId = 0;
+    const N_LOAD_X: NodeId = 0;
+    const N_LOAD_W: NodeId = 1;
+    const N_COMPUTE: NodeId = 2;
+    const N_STORE_Y: NodeId = 3;
+
+    let tile_stride = (p.hidden_dim as u64) * (p.token_tile as u64);
+
+    let nodes = vec![
+        Node {
+            id: N_LOAD_X,
+            role: Role::Load,
+            op: FufOpRef { tag: "load_x_row" },
+            addr: Some(LoadAddr {
+                terms: smallvec![AddrTerm::AxisStride {
+                    axis: TOKEN,
+                    stride: StrideExpr::Const(tile_stride),
+                }],
+            }),
+        },
+        Node {
+            id: N_LOAD_W,
+            role: Role::Load,
+            op: FufOpRef { tag: "load_weight" },
+            // Weight is invariant across token_tile — no axis terms.
+            // The scheduler hoists this to preamble naturally.
+            addr: Some(LoadAddr { terms: smallvec![] }),
+        },
+        Node {
+            id: N_COMPUTE,
+            role: Role::Compute,
+            op: FufOpRef {
+                tag: "rmsnorm_compute",
+            },
+            addr: None,
+        },
+        Node {
+            id: N_STORE_Y,
+            role: Role::Store,
+            op: FufOpRef { tag: "store_y_row" },
+            addr: Some(LoadAddr {
+                terms: smallvec![AddrTerm::AxisStride {
+                    axis: TOKEN,
+                    stride: StrideExpr::Const(tile_stride),
+                }],
+            }),
+        },
+    ];
+
+    let edges = vec![
+        Edge {
+            src: N_LOAD_X,
+            dst: N_COMPUTE,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        Edge {
+            src: N_LOAD_W,
+            dst: N_COMPUTE,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        Edge {
+            src: N_COMPUTE,
+            dst: N_STORE_Y,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+    ];
+
+    Region {
+        id: 0,
+        name: "rmsnorm",
+        domain: Domain {
+            axes: vec![Axis {
+                id: TOKEN,
+                name: "token_tile",
+                bound: Bound::RegionEntryScalar(NUM_TOKEN_TILES),
+            }],
+            predicates: vec![],
+        },
+        entry_scalars: vec![ScalarBinding {
+            id: NUM_TOKEN_TILES,
+            name: "num_token_tiles",
+        }],
+        nodes,
+        edges,
+    }
+}
+
+// ─── Elementwise residual add ───────────────────────────────────
+//
+// y = a + b, element-wise, per token-tile. Two loads, one compute,
+// one store, all straight-line. Exercises the minimum region shape:
+// one parallel axis, no serial axis, no pipeline depth.
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResidualAddParams {
+    pub hidden_dim: u32,
+    pub token_tile: u32,
+}
+
+pub fn residual_add_region(p: &ResidualAddParams) -> Region {
+    const TOKEN: AxisId = 0;
+    const NUM_TOKEN_TILES: ScalarId = 0;
+    const N_LOAD_A: NodeId = 0;
+    const N_LOAD_B: NodeId = 1;
+    const N_ADD: NodeId = 2;
+    const N_STORE: NodeId = 3;
+
+    let tile_stride = (p.hidden_dim as u64) * (p.token_tile as u64);
+    let row_addr = || LoadAddr {
+        terms: smallvec![AddrTerm::AxisStride {
+            axis: TOKEN,
+            stride: StrideExpr::Const(tile_stride),
+        }],
+    };
+
+    let nodes = vec![
+        Node {
+            id: N_LOAD_A,
+            role: Role::Load,
+            op: FufOpRef { tag: "load_a_row" },
+            addr: Some(row_addr()),
+        },
+        Node {
+            id: N_LOAD_B,
+            role: Role::Load,
+            op: FufOpRef { tag: "load_b_row" },
+            addr: Some(row_addr()),
+        },
+        Node {
+            id: N_ADD,
+            role: Role::Compute,
+            op: FufOpRef {
+                tag: "elementwise_add",
+            },
+            addr: None,
+        },
+        Node {
+            id: N_STORE,
+            role: Role::Store,
+            op: FufOpRef {
+                tag: "store_sum_row",
+            },
+            addr: Some(row_addr()),
+        },
+    ];
+
+    let edges = vec![
+        Edge {
+            src: N_LOAD_A,
+            dst: N_ADD,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        Edge {
+            src: N_LOAD_B,
+            dst: N_ADD,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        Edge {
+            src: N_ADD,
+            dst: N_STORE,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+    ];
+
+    Region {
+        id: 0,
+        name: "residual_add",
+        domain: Domain {
+            axes: vec![Axis {
+                id: TOKEN,
+                name: "token_tile",
+                bound: Bound::RegionEntryScalar(NUM_TOKEN_TILES),
+            }],
+            predicates: vec![],
+        },
+        entry_scalars: vec![ScalarBinding {
+            id: NUM_TOKEN_TILES,
+            name: "num_token_tiles",
+        }],
+        nodes,
+        edges,
+    }
+}
+
+#[cfg(test)]
+mod new_template_tests {
+    use super::*;
+    use crate::arch::{sm89_fa2, sm90_fa2};
+    use crate::ir;
+    use crate::schedule::{classify_axes, region_pipeline_depth, topo_order_within_iter};
+    use crate::wavefront::schedule_wavefront;
+
+    #[test]
+    fn gemm_region_validates_and_schedules() {
+        let r = gemm_region(&GemmParams {
+            m_tile: 128,
+            n_tile: 128,
+            k_tile: 32,
+            pipe: 3,
+        });
+        ir::validate(&r).expect("gemm region validates");
+        assert_eq!(r.nodes.len(), 4);
+        assert_eq!(r.edges.len(), 4);
+        assert_eq!(r.domain.axes.len(), 3);
+
+        // K is the serial (reduction) axis; M and N are parallel.
+        let classes = classify_axes(&r);
+        assert_eq!(classes.len(), 3);
+        assert_eq!(region_pipeline_depth(&r), 3);
+        let topo = topo_order_within_iter(&r);
+        assert_eq!(topo.len(), r.nodes.len());
+
+        // Schedule: preamble empty (all Loads mention serial K),
+        // body has 2 Pipeline loads + 1 Compute, epilogue has Store.
+        let sched = schedule_wavefront(&r, &sm90_fa2()).unwrap();
+        assert_eq!(sched.preamble.len(), 0);
+        assert_eq!(sched.body.len(), 3, "2 loads + 1 compute in body");
+        assert_eq!(sched.epilogue.len(), 1, "store at the end");
+        assert!(sched.serial_axis.is_some());
+        assert_eq!(sched.pipeline_depth, 3);
+    }
+
+    #[test]
+    fn rmsnorm_region_validates_and_schedules_straight_line() {
+        let r = rmsnorm_region(&RmsNormParams {
+            hidden_dim: 4096,
+            token_tile: 64,
+        });
+        ir::validate(&r).expect("rmsnorm region validates");
+        assert_eq!(r.nodes.len(), 4);
+        assert_eq!(r.domain.axes.len(), 1);
+        assert_eq!(region_pipeline_depth(&r), 0, "no Pipeline edges");
+
+        // Straight-line: no serial axis, preamble has loads, body has
+        // compute, epilogue has store.
+        let sched = schedule_wavefront(&r, &sm89_fa2()).unwrap();
+        assert!(sched.serial_axis.is_none());
+        assert_eq!(sched.preamble.len(), 2, "load_x + load_weight");
+        assert_eq!(sched.body.len(), 1, "rmsnorm_compute");
+        assert_eq!(sched.epilogue.len(), 1, "store_y_row");
+    }
+
+    #[test]
+    fn residual_add_region_validates_and_schedules_straight_line() {
+        let r = residual_add_region(&ResidualAddParams {
+            hidden_dim: 4096,
+            token_tile: 64,
+        });
+        ir::validate(&r).expect("residual_add region validates");
+        assert_eq!(r.nodes.len(), 4);
+        let sched = schedule_wavefront(&r, &sm89_fa2()).unwrap();
+        assert!(sched.serial_axis.is_none());
+        assert_eq!(sched.preamble.len(), 2);
+        assert_eq!(sched.body.len(), 1);
+        assert_eq!(sched.epilogue.len(), 1);
+    }
+
+    #[test]
+    fn heterogeneous_megakernel_composes_attn_gemm_rmsnorm_add() {
+        // Compose one of each template into a single Megakernel,
+        // wire them with Barrier ControlEdges, and make sure the
+        // emitter produces a single __global__ that references each
+        // region's body. Acts as the end-to-end sanity check that the
+        // new templates feed the megakernel emitter cleanly.
+        use crate::emit_mega::emit_megakernel;
+        use crate::ir::{ControlEdge, DepKind, Megakernel};
+
+        let mut rnorm = rmsnorm_region(&RmsNormParams {
+            hidden_dim: 4096,
+            token_tile: 64,
+        });
+        rnorm.id = 0;
+        let mut rgemm = gemm_region(&GemmParams {
+            m_tile: 128,
+            n_tile: 128,
+            k_tile: 32,
+            pipe: 3,
+        });
+        rgemm.id = 1;
+        let mut rattn = attn_region(&AttnParams {
+            window: Window::Infinite,
+            head_dim: 128,
+            tile_q: 128,
+            tile_k: 64,
+            num_head_groups: 8,
+            pipe: 3,
+        });
+        rattn.id = 2;
+        let mut radd = residual_add_region(&ResidualAddParams {
+            hidden_dim: 4096,
+            token_tile: 64,
+        });
+        radd.id = 3;
+
+        let mk = Megakernel {
+            regions: vec![rnorm, rgemm, rattn, radd],
+            control: vec![
+                ControlEdge {
+                    src: 0,
+                    dst: 1,
+                    kind: DepKind::Barrier,
+                },
+                ControlEdge {
+                    src: 1,
+                    dst: 2,
+                    kind: DepKind::Barrier,
+                },
+                ControlEdge {
+                    src: 2,
+                    dst: 3,
+                    kind: DepKind::Barrier,
+                },
+            ],
+        };
+
+        let src = emit_megakernel(&mk, &sm90_fa2()).expect("emit succeeds");
+
+        // Single kernel.
+        assert_eq!(src.matches("__global__ void ").count(), 1);
+        // All four region bodies present.
+        assert!(src.contains("region 0 (rmsnorm)"));
+        assert!(src.contains("region 1 (gemm)"));
+        assert!(src.contains("region 2 (fa2_prefill)"));
+        assert!(src.contains("region 3 (residual_add)"));
+        // Three inter-region barriers between them.
+        assert_eq!(
+            src.matches("inter-region barrier").count(),
+            3,
+            "one barrier per control edge"
+        );
+        // Entry scalar union: rmsnorm + gemm + attn + add contribute
+        // distinct names; they all show up in the kernel signature.
+        assert!(src.contains("uint32_t num_token_tiles"));
+        assert!(src.contains("uint32_t num_m_tiles"));
+        assert!(src.contains("uint32_t num_q_tiles"));
     }
 }

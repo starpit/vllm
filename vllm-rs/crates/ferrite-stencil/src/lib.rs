@@ -27,5 +27,8 @@ pub use ir::{
     ScalarBinding, ScalarId, SmemLookup, StrideExpr,
 };
 pub use schedule::{AxisKind, classify_axes, region_pipeline_depth, topo_order_within_iter};
-pub use template::{AttnParams, PagedDecodeParams, Window, attn_region, attn_region_paged_decode};
+pub use template::{
+    AttnParams, GemmParams, PagedDecodeParams, ResidualAddParams, RmsNormParams, Window,
+    attn_region, attn_region_paged_decode, gemm_region, residual_add_region, rmsnorm_region,
+};
 pub use wavefront::{Schedule, ScheduleError, Step, schedule_wavefront};

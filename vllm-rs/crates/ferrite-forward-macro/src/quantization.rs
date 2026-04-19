@@ -454,9 +454,57 @@ fn parse_compressed_tensors(
         });
     }
 
+    // FP8 float-quantized → same on-disk layout as `quant_method: "fp8"`.
+    // Neural Magic / RedHatAI FP8 checkpoints. The activation scheme is
+    // derived from `input_activations.dynamic`: `true` (or absent, the
+    // common case for per-token quantization) maps to `Dynamic`, `false`
+    // to `Static`. Blockwise scales carry a `weights.block_structure`
+    // `[bn, bk]` array (e.g., `[128, 128]` for DeepSeek-style blockwise).
+    if weight_type == "float" && weight_bits == 8 {
+        let scheme = match group
+            .get("input_activations")
+            .and_then(|v| v.get("dynamic"))
+            .and_then(|v| v.as_bool())
+        {
+            Some(false) => Fp8ActivationScheme::Static,
+            Some(true) | None => Fp8ActivationScheme::Dynamic,
+        };
+        let block_size = match weights.get("block_structure") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => {
+                let arr = v.as_array().ok_or(ParseError::BadField {
+                    field: "config_groups.*.weights.block_structure",
+                    reason: "must be a two-element array",
+                })?;
+                if arr.len() != 2 {
+                    return Err(ParseError::BadField {
+                        field: "config_groups.*.weights.block_structure",
+                        reason: "must have exactly two elements",
+                    });
+                }
+                let bn = arr[0].as_u64().ok_or(ParseError::BadField {
+                    field: "config_groups.*.weights.block_structure[0]",
+                    reason: "not a u64",
+                })? as u32;
+                let bk = arr[1].as_u64().ok_or(ParseError::BadField {
+                    field: "config_groups.*.weights.block_structure[1]",
+                    reason: "not a u64",
+                })? as u32;
+                if bn == 0 || bk == 0 {
+                    return Err(ParseError::BadField {
+                        field: "config_groups.*.weights.block_structure",
+                        reason: "block dimensions must be > 0",
+                    });
+                }
+                Some([bn, bk])
+            }
+        };
+        return Ok(QuantMethod::Fp8 { scheme, block_size });
+    }
+
     Err(ParseError::UnsupportedMethod(format!(
         "compressed-tensors weights type={weight_type:?} num_bits={weight_bits} \
-         (ferrite today handles only INT4; FP8 and other types land in follow-on slices)",
+         (ferrite handles INT4 and FP8 today; other types land in follow-on slices)",
     )))
 }
 
@@ -987,16 +1035,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_compressed_tensors_non_int4() {
-        // FP8 + other CT variants are not yet supported — reject so
-        // they don't silently fall into the INT4 path.
+    fn rejects_compressed_tensors_unsupported_type() {
+        // INT8 and other yet-unsupported CT variants reject so they
+        // don't silently fall into an unrelated path.
         let v = json(
             r#"{
                 "quantization_config": {
                     "quant_method": "compressed-tensors",
                     "config_groups": {
                         "g": {
-                            "weights": {"type": "float", "num_bits": 8}
+                            "weights": {"type": "int", "num_bits": 8}
                         }
                     }
                 }
@@ -1005,6 +1053,101 @@ mod tests {
         assert!(matches!(
             QuantizationConfig::parse(&v),
             Err(ParseError::UnsupportedMethod(_))
+        ));
+    }
+
+    #[test]
+    fn parses_compressed_tensors_fp8_dynamic_per_tensor() {
+        // RedHatAI / Neural Magic FP8-dynamic shape: `type: "float"`,
+        // `num_bits: 8`, `input_activations.dynamic: true`.
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "format": "float-quantized",
+                    "ignore": ["lm_head"],
+                    "config_groups": {
+                        "group_0": {
+                            "weights": {
+                                "type": "float",
+                                "num_bits": 8,
+                                "symmetric": true,
+                                "strategy": "channel"
+                            },
+                            "input_activations": {
+                                "type": "float",
+                                "num_bits": 8,
+                                "dynamic": true,
+                                "strategy": "token"
+                            },
+                            "targets": ["Linear"]
+                        }
+                    }
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().expect("some");
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Fp8 {
+                scheme: Fp8ActivationScheme::Dynamic,
+                block_size: None,
+            }
+        ));
+        assert_eq!(qc.modules_to_not_convert, vec!["lm_head".to_string()]);
+    }
+
+    #[test]
+    fn parses_compressed_tensors_fp8_static() {
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "config_groups": {
+                        "g": {
+                            "weights": {"type": "float", "num_bits": 8},
+                            "input_activations": {"type": "float", "num_bits": 8, "dynamic": false}
+                        }
+                    }
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().expect("some");
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Fp8 {
+                scheme: Fp8ActivationScheme::Static,
+                block_size: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_compressed_tensors_fp8_blockwise() {
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "config_groups": {
+                        "g": {
+                            "weights": {
+                                "type": "float",
+                                "num_bits": 8,
+                                "strategy": "block",
+                                "block_structure": [128, 128]
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().expect("some");
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Fp8 {
+                scheme: Fp8ActivationScheme::Dynamic,
+                block_size: Some([128, 128]),
+            }
         ));
     }
 

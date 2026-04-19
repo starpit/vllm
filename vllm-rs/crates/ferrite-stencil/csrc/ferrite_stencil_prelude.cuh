@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Ferrite Stencil megakernel prelude — SYNTACTIC placeholder.
+// Ferrite Stencil megakernel prelude.
 //
-// This header exists so `emit_megakernel`'s output parses cleanly
-// under nvcc. The bodies here are NOT real implementations — each
-// helper either returns a trivial default or calls `__trap()` to
-// ensure silent correctness regressions never ship. Real intrinsic
-// lowering (TMA descriptor setup, cp.async.bulk.tensor, wgmma.mma,
-// mbarrier PTX, fragment layouts, warp-shuffle reductions, …) lands
-// one helper at a time in follow-up commits, with this prelude as
-// the stable ABI.
+// Provides the type definitions (StencilFrag, Mbarrier), the
+// warpgroup-id macros the emitter references, and the helper
+// functions the generated kernel calls. Helpers with fixed
+// signatures (the cp.async / wgmma fence-commit-wait fences, the
+// cross-CTA `gbar_sync`) lower to real PTX; data-movement and
+// compute bodies (tma_load_2d / wgmma.mma_async / mma.sync /
+// stg_128) still trap until the emitter threads byte counts and
+// mma-fragment descriptors through — item 1 second wave.
 //
-// Scope decision: we prioritized compile-time validity of emitted
-// sources (so the pipeline has a closed loop up to nvcc) over
-// runtime correctness of the placeholders. The emitted code is
-// structurally correct and shape-complete; every helper is
-// explicitly unimplemented so the next commit has one clear target
-// at a time.
+// Anything still `__trap()` is ACTIVELY unimplemented; a kernel
+// that calls it will abort on the device rather than silently
+// produce wrong results. Landing real PTX for one helper at a time
+// is the discipline — this file is the stable ABI between the
+// emitter and nvcc.
 
 #pragma once
 
@@ -88,38 +87,128 @@ __device__ static StencilFrag operator-(const StencilFrag& x, const StencilFrag&
 // `C_frag`, `smem_a`, `bar_kv`, etc.).
 
 // ─── Load helpers ────────────────────────────────────────────────
-// UNIMPLEMENTED: TMA descriptor setup + cp.async.bulk.tensor.2d
-// on SM90; cp.async.ca.shared.global 16B transactions on SM89.
+// Data-movement bodies (tma_load_2d / tma_store_2d / cp_async_128)
+// still trap — their real PTX needs a byte count + stride walked
+// from the emitter, which the current variadic signature doesn't
+// carry. Item 1 second-wave commit wires those through. The
+// commit/wait fences below don't need extra info and land now.
 
 template <class... A> __device__ inline void tma_load_2d(A&&...) { __trap(); }
 template <class... A> __device__ inline void tma_store_2d(A&&...) { __trap(); }
 template <class... A> __device__ inline void cp_async_128(A&&...) { __trap(); }
 template <class... A> __device__ inline void generic_load(A&&...) { __trap(); }
 template <class... A> __device__ inline void generic_store(A&&...) { __trap(); }
-__device__ inline void cp_async_commit_group() { __trap(); }
-__device__ inline void cp_async_wait_group(uint32_t) { __trap(); }
+
+/// cp.async.commit_group — closes the current set of in-flight
+/// `cp.async` requests into a group that `cp.async.wait_group` can
+/// later drain. SM80+ (Ampere). On older archs this is a no-op so
+/// emitted SM89-path code still compiles cleanly.
+__device__ inline void cp_async_commit_group() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+#endif
+}
+
+/// cp.async.wait_group N — block until at most `N` pending
+/// `cp.async` groups remain. SM80+.
+__device__ inline void cp_async_wait_group(uint32_t depth) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" ::"r"(depth) : "memory");
+#else
+    (void)depth;
+#endif
+}
 
 // ─── Barrier / sync helpers ──────────────────────────────────────
-// UNIMPLEMENTED: mbarrier PTX, named semaphores, cross-CTA atomic-
-// counter spin-wait for g.Bar.
+// Mbarrier-with-pointer forms still trap until the region emitter
+// threads a real phase bit (Hopper's `mbarrier.try_wait.shared.b64`
+// takes a current phase + deadline). The no-arg `mbarrier_wait()`
+// used between regions lowers to a `__syncthreads` barrier — any
+// pending shared writes from this CTA finish before the next
+// region starts its loads. gbar_sync implements the Hopper-style
+// global counter spin-wait used for cross-CTA Barrier edges.
 
-__device__ inline void mbarrier_wait() { __trap(); }
+__device__ inline void mbarrier_wait() {
+    __syncthreads();
+}
 template <class T> __device__ inline void mbarrier_wait(T*) { __trap(); }
 template <class T> __device__ inline void mbarrier_arrive(T*) { __trap(); }
-__device__ inline void gbar_sync(uint32_t*) { __trap(); }
-__device__ inline void cluster_sync() { __trap(); }
+
+/// Cross-CTA global barrier. Every CTA calls with the same
+/// device-wide counter symbol (`&gbar_counter` in the emitted
+/// kernel). Implementation: each CTA elects thread 0, atomic-adds
+/// 1 to the counter, and spin-waits on the next multiple of
+/// `gridDim.x`. Works on any arch with atomicAdd (SM60+) — no
+/// hardware grid sync needed, in line with HazyResearch's
+/// `Megakernel`s pattern.
+__device__ inline void gbar_sync(uint32_t* counter) {
+    __syncthreads();
+    if (threadIdx.x == 0u && threadIdx.y == 0u && threadIdx.z == 0u) {
+        uint32_t num_ctas = gridDim.x * gridDim.y * gridDim.z;
+        uint32_t prev = atomicAdd(counter, 1u);
+        uint32_t target = (prev / num_ctas + 1u) * num_ctas;
+        while (atomicAdd(counter, 0u) < target) {
+            // Spin. Hopper (SM90) could use `st.async` + `red.async`
+            // to reduce traffic, but the atomicAdd-0 polling form
+            // works on every arch and matches the reference
+            // implementation in HazyResearch/ThunderKittens's
+            // megakernel.cuh.
+        }
+    }
+    __syncthreads();
+}
+
+/// cluster.sync — barrier across the current thread-block cluster
+/// (Hopper only). Emitted between regions when `ArchMap::barrier`
+/// picks `BarrierPrim::Cluster`.
+__device__ inline void cluster_sync() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.sync.aligned;\n" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
+
 // Named semaphore: placeholder accepting the literal + depth from
 // emitted sites; real impl would hash the name at compile time.
 struct _NamedSemDepth { int depth; };
 #define sem_wait(name, ...) do { (void)(name); __trap(); } while (0)
 
 // ─── Tensor-core compute helpers ─────────────────────────────────
-// UNIMPLEMENTED: wgmma on SM90; mma.sync m16n8k16 sweeps on SM89.
+// The compute bodies (wgmma.mma_async / mma.sync) still trap —
+// they need accumulator + smem descriptor plumbing from the emitter.
+// The wgmma fence / commit / wait fences don't take operands and
+// land as real PTX here. SM90+ only; on SM89 they stay no-ops so
+// the emitted SM89 code (which never calls them) still compiles.
 
-template <class... A> __device__ inline void wgmma_fence() { __trap(); }
+/// wgmma.fence.sync.aligned — aligns the consumer warpgroup's view
+/// of its accumulators before issuing `wgmma.mma_async`. Paired
+/// with wgmma_commit_group + wgmma_wait_group.
+__device__ inline void wgmma_fence() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#endif
+}
+
 template <class... A> __device__ inline void wgmma_mma_async(A&&...) { __trap(); }
-template <int N> __device__ inline void wgmma_wait_group() { __trap(); }
-__device__ inline void wgmma_commit_group() { __trap(); }
+
+/// wgmma.wait_group.sync.aligned N — block the warpgroup until at
+/// most N wgmma groups remain in-flight. Template N is inlined so
+/// the PTX immediate matches the group depth.
+template <int N> __device__ inline void wgmma_wait_group() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+#endif
+}
+
+/// wgmma.commit_group.sync.aligned — closes the current wgmma
+/// group so a subsequent `wait_group<N>` can fence on it.
+__device__ inline void wgmma_commit_group() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+#endif
+}
+
 template <class... A> __device__ inline void mma_sync_accumulate(A&&...) { __trap(); }
 template <class... A> __device__ inline void mma_accumulate(A&&...) { __trap(); }
 template <class... A> __device__ inline void stmatrix_smem(A&&...) { __trap(); }

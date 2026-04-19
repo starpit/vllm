@@ -33,6 +33,7 @@ use ferrite_stencil::{
     unary_inplace_region,
 };
 
+use crate::classified::ExternKind;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::ImplementationLibrary;
 use crate::solver::{Assignment, SubgraphId};
@@ -188,6 +189,7 @@ pub fn lower_assignment(
             .expect("subgraph with tiles has impl");
         let imp = library.get(impl_id);
         let mut region = lower_impl(imp.name(), &tiles, fuf, hints)?;
+        stamp_gmem_bindings(&mut region, imp.name(), fuf, &tiles);
         let rid = regions.len() as RegionId;
         region.id = rid;
         sg_to_rid.insert(sg, rid);
@@ -227,6 +229,7 @@ pub fn lower_assignment_partial(
         let imp = library.get(impl_id);
         match lower_impl(imp.name(), &tiles, fuf, hints) {
             Ok(mut region) => {
+                stamp_gmem_bindings(&mut region, imp.name(), fuf, &tiles);
                 let rid = regions.len() as RegionId;
                 region.id = rid;
                 sg_to_rid.insert(sg, rid);
@@ -488,6 +491,300 @@ fn lower_impl(
         })),
         other => Err(LowerError::UnsupportedImpl { name: other }),
     }
+}
+
+// ─── gmem bindings (STENCIL_IR_STATUS.md item 4b) ─────────────────
+//
+// After `lower_impl` instantiates a template's Region, we walk the
+// subgraph's FUF tile(s) to resolve each template canonical gmem name
+// (from `emit_ops::gmem_refs`) to an FUF-derived unique identity.
+// Effect: llama-3-8b's kernel signature grows from ~18 canonical
+// pointers to per-layer-per-tensor identities — each layer's Wqkv,
+// Wo, Wgate, Wup, Wdown, RMSnorm weights become distinct params, and
+// each attention region reads from the specific upstream tile output
+// its FUF edge points at. Identities dedupe on true FUF identity:
+// two regions sharing an upstream tile share the pointer.
+//
+// Single-tile subgraphs only (the overwhelming common case for the
+// Impls we ship templates for). Multi-tile subgraphs leave bindings
+// empty; their canonical names still work as before and can be
+// promoted in a follow-up when we hit an Impl that needs it.
+
+fn stamp_gmem_bindings(region: &mut Region, impl_name: &'static str, fuf: &Fuf, tiles: &[TileId]) {
+    // Collect external inputs = the subgraph's interface. Inputs that
+    // reference other tiles in the SAME subgraph are internal edges
+    // and don't appear as gmem pointers. For fused_qkv_rope_cache
+    // (4 tiles: gemm → rope → kv_write, plus an intermediate) we
+    // keep the upstream hidden-tile ref, the Wqkv weight, the rotary
+    // extern, and the kv_cache extern; the intra-subgraph tile
+    // connections drop out.
+    let subgraph_set: std::collections::HashSet<TileId> = tiles.iter().copied().collect();
+    let mut external_inputs: Vec<FufInput> = Vec::new();
+    for t in tiles {
+        let node = fuf.get(*t);
+        for inp in &node.inputs {
+            match inp {
+                FufInput::Tile { id, .. } if subgraph_set.contains(id) => continue,
+                _ => external_inputs.push(inp.clone()),
+            }
+        }
+    }
+    // Output tile: for multi-tile subgraphs the tile whose outputs
+    // flow outside the subgraph is typically the last-declared one
+    // (FUF unroll assigns TileIds in topo order). For single-tile
+    // subgraphs it's just that tile.
+    let output_tile_id = tiles.iter().map(|t| t.0).max().unwrap_or(0);
+    let bindings = bindings_for_impl(impl_name, &external_inputs, output_tile_id);
+    if std::env::var("FERRITE_STENCIL_4B_TRACE").is_ok() {
+        eprintln!(
+            "[4b] impl={} tiles={:?} ext_inputs={:?} -> bindings={:?}",
+            impl_name,
+            tiles.iter().map(|t| t.0).collect::<Vec<_>>(),
+            external_inputs.iter().map(input_brief).collect::<Vec<_>>(),
+            bindings,
+        );
+    }
+    region.gmem_bindings = bindings;
+}
+
+fn input_brief(input: &FufInput) -> String {
+    match input {
+        FufInput::Tile { id, slot } => format!("tile({},{})", id.0, slot),
+        FufInput::Weight { id, index, .. } => match index {
+            Some(i) => format!("weight({},{})", id.0, i),
+            None => format!("weight({},_)", id.0),
+        },
+        FufInput::Extern { kind, index } => {
+            format!(
+                "extern({:?},{})",
+                kind,
+                index.map_or("_".to_string(), |i| i.to_string())
+            )
+        }
+        FufInput::Scalar(v) => format!("scalar({})", v),
+    }
+}
+
+/// Per-Impl map of template canonical gmem names → FUF-derived
+/// identities. The Impl name decides the FUF input layout (which slot
+/// is A vs B, where the weight lives, whether there's a Rotary extern,
+/// etc.). Output tensors identify via `t{tile_id}_{slot}` so
+/// downstream regions that read from this tile get matching pointer
+/// names.
+fn bindings_for_impl(
+    impl_name: &'static str,
+    external_inputs: &[FufInput],
+    output_tile_id: u32,
+) -> Vec<(&'static str, &'static str)> {
+    let own_output =
+        |slot: u8| -> &'static str { leak_str(format!("t{}_{}", output_tile_id, slot)) };
+    // Pick the `i`-th non-weight-non-extern external input — typically
+    // a FufInput::Tile from upstream (the "data" input, e.g. hidden
+    // state flowing into this subgraph). Used for A/X style mappings.
+    let data_input = |i: usize| -> Option<&'static str> {
+        external_inputs
+            .iter()
+            .filter(|inp| matches!(inp, FufInput::Tile { .. } | FufInput::Scalar(_)))
+            .nth(i)
+            .map(|inp| leak_str(fuf_input_identity(inp)))
+    };
+    let find_extern = |want: ExternKind| -> Option<&'static str> {
+        external_inputs.iter().find_map(|inp| match inp {
+            FufInput::Extern { kind, index } if *kind == want => Some(leak_str(format!(
+                "x_{}_{}",
+                extern_name(*kind),
+                index.unwrap_or(0)
+            ))),
+            _ => None,
+        })
+    };
+    let find_weight = |nth: usize| -> Option<&'static str> {
+        let mut count = 0usize;
+        for inp in external_inputs {
+            if let FufInput::Weight { id, index, .. } = inp {
+                if count == nth {
+                    return Some(leak_str(match index {
+                        Some(i) => format!("w{}_{}", id.0, i),
+                        None => format!("w{}", id.0),
+                    }));
+                }
+                count += 1;
+            }
+        }
+        None
+    };
+
+    let mut b = Vec::new();
+    match impl_name {
+        "attention_prefill_contiguous" | "sliding_attention_prefill_contiguous" => {
+            if let Some(q) = data_input(0) {
+                b.push(("Q_gmem", q));
+            }
+            if let Some(k) = data_input(1) {
+                b.push(("K_gmem", k));
+            }
+            if let Some(v) = data_input(2) {
+                b.push(("V_gmem", v));
+            }
+            b.push(("O_gmem", own_output(0)));
+        }
+        "attention_via_cache" | "flashinfer_attention_decode" | "sliding_attention_via_cache" => {
+            if let Some(q) = data_input(0) {
+                b.push(("Q_gmem", q));
+            }
+            // K/V come from the paged KV cache; both canonical names
+            // share the KvCache extern pointer — the runtime handles
+            // the k vs v offset per page.
+            if let Some(kv) = find_extern(ExternKind::KvCache) {
+                b.push(("K_gmem", kv));
+                b.push(("V_gmem", kv));
+            }
+            b.push(("O_gmem", own_output(0)));
+        }
+        "fused_gemm_bias" | "gemm_ref" | "cutlass_gemv" | "marlin_gemm" | "bnb4_gemm" => {
+            if let Some(a) = data_input(0) {
+                b.push(("A_gmem", a));
+            }
+            if let Some(w) = find_weight(0) {
+                b.push(("B_gmem", w));
+            }
+            b.push(("C_gmem", own_output(0)));
+        }
+        "fused_add_rms_norm"
+        | "fused_add_rms_norm_with_offset"
+        | "scalar_offset_rms_norm"
+        | "rmsnorm_ref"
+        | "layer_norm_ref" => {
+            if let Some(x) = data_input(0) {
+                b.push(("X_gmem", x));
+            }
+            if let Some(w) = find_weight(0) {
+                b.push(("W_gmem", w));
+            }
+            b.push(("Y_gmem", own_output(0)));
+        }
+        "add_ref" => {
+            if let Some(a) = data_input(0) {
+                b.push(("A_gmem", a));
+            }
+            if let Some(b1) = data_input(1) {
+                b.push(("B_gmem", b1));
+            }
+            b.push(("Sum_gmem", own_output(0)));
+        }
+        "fused_qkv_rope_cache"
+        | "fused_qkv_qk_norm_rope_cache"
+        | "marlin_fused_qkv_rope_cache"
+        | "bnb4_fused_qkv_rope_cache"
+        | "rope_append_ref" => {
+            if let Some(x) = data_input(0) {
+                b.push(("X_gmem", x));
+            }
+            if let Some(w) = find_weight(0) {
+                b.push(("Wqkv_gmem", w));
+            }
+            if let Some(r) = find_extern(ExternKind::Rotary) {
+                b.push(("RopeCoef_gmem", r));
+            }
+            b.push(("Q_gmem", own_output(0)));
+            b.push(("K_gmem", own_output(1)));
+            b.push(("V_gmem", own_output(2)));
+            if let Some(kv) = find_extern(ExternKind::KvCache) {
+                b.push(("K_cache_gmem", kv));
+                b.push(("V_cache_gmem", kv));
+            }
+        }
+        "fused_qkv_rope_prefill"
+        | "marlin_fused_qkv_rope_prefill"
+        | "bnb4_fused_qkv_rope_prefill" => {
+            if let Some(x) = data_input(0) {
+                b.push(("X_gmem", x));
+            }
+            if let Some(w) = find_weight(0) {
+                b.push(("Wqkv_gmem", w));
+            }
+            if let Some(r) = find_extern(ExternKind::Rotary) {
+                b.push(("RopeCoef_gmem", r));
+            }
+            b.push(("Q_gmem", own_output(0)));
+            b.push(("K_gmem", own_output(1)));
+            b.push(("V_gmem", own_output(2)));
+        }
+        "fused_gate_up_silu_mul"
+        | "fused_gate_up_gelu_mul"
+        | "marlin_fused_gate_up_silu_mul"
+        | "marlin_fused_gate_up_gelu_mul"
+        | "bnb4_fused_gate_up_silu_mul"
+        | "bnb4_fused_gate_up_gelu_mul" => {
+            if let Some(x) = data_input(0) {
+                b.push(("X_gmem", x));
+            }
+            if let Some(wg) = find_weight(0) {
+                b.push(("Wgate_gmem", wg));
+            }
+            if let Some(wu) = find_weight(1) {
+                b.push(("Wup_gmem", wu));
+            }
+            b.push(("Inter_gmem", own_output(0)));
+        }
+        "scalar_mul_inplace" | "tanh_softcap_inplace" => {
+            // Unary in-place: the template reads X_gmem but has no
+            // paired store_*_gmem tag, so there's only one gmem name
+            // to bind. The output tensor identity is the same
+            // pointer — in-place writes stay in place.
+            if let Some(x) = data_input(0) {
+                b.push(("X_gmem", x));
+            }
+        }
+        "embed_ref" => {
+            if let Some(ids) = find_extern(ExternKind::InputIds) {
+                b.push(("TokenIds_gmem", ids));
+            }
+            if let Some(w) = find_weight(0) {
+                b.push(("Embed_gmem", w));
+            }
+            b.push(("Y_gmem", own_output(0)));
+        }
+        _ => {} // Unknown Impl: canonical names stay (backward-compat).
+    }
+    b
+}
+
+fn fuf_input_identity(input: &FufInput) -> String {
+    match input {
+        FufInput::Tile { id, slot } => format!("t{}_{}", id.0, slot),
+        FufInput::Weight { id, index, .. } => match index {
+            Some(i) => format!("w{}_{}", id.0, i),
+            None => format!("w{}", id.0),
+        },
+        FufInput::Extern { kind, index } => {
+            format!("x_{}_{}", extern_name(*kind), index.unwrap_or(0))
+        }
+        // Scalar inline constants never appear as gmem pointers — they
+        // go in kernel body expressions. An input slot holding a
+        // scalar is a template/Impl mismatch; produce a distinct-enough
+        // placeholder so identity dedupes don't collide.
+        FufInput::Scalar(v) => format!("s_{:x}", v.to_bits()),
+    }
+}
+
+fn extern_name(kind: ExternKind) -> &'static str {
+    match kind {
+        ExternKind::InputIds => "input_ids",
+        ExternKind::Positions => "positions",
+        ExternKind::Rotary => "rotary",
+        ExternKind::RotaryLocal => "rotary_local",
+        ExternKind::BlockTable => "block_table",
+        ExternKind::KvCache => "kv_cache",
+    }
+}
+
+/// Move a freshly-built identity string into a 'static slot. Called
+/// only at proc-macro time (lowering runs once per user-macro
+/// invocation), so the leak is one-shot and bounded by the model's
+/// tensor count.
+fn leak_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
 }
 
 #[cfg(test)]
@@ -1124,5 +1421,219 @@ mod tests {
                 t
             );
         }
+    }
+
+    // ── gmem binding stamping (item 4b) ────────────────────────────
+
+    #[test]
+    fn stamps_attention_inputs_and_output_identities() {
+        // Build a FUF where an attention tile has three upstream tile
+        // inputs (Q, K, V slots) — stamping should bind each canonical
+        // gmem name to the corresponding FufInput identity, plus the
+        // output O_gmem to `t{attn_tile}_0`.
+        use ferrite_stencil::ir;
+        let dummy = |id: u32| FufNode {
+            id: TileId(id),
+            op: OpKind::Attention,
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let fuf = Fuf {
+            nodes: vec![
+                dummy(0),
+                dummy(1),
+                dummy(2),
+                dummy(3),
+                dummy(4),
+                FufNode {
+                    id: TileId(5),
+                    op: OpKind::Attention,
+                    inputs: vec![
+                        FufInput::Tile {
+                            id: TileId(2),
+                            slot: 0,
+                        },
+                        FufInput::Tile {
+                            id: TileId(2),
+                            slot: 1,
+                        },
+                        FufInput::Tile {
+                            id: TileId(2),
+                            slot: 2,
+                        },
+                    ],
+                    outputs: vec![],
+                },
+            ],
+        };
+        let mut region = super::attn_region(&ferrite_stencil::AttnParams {
+            window: ferrite_stencil::Window::Infinite,
+            head_dim: 128,
+            tile_q: 128,
+            tile_k: 64,
+            num_head_groups: 8,
+            pipe: 3,
+        });
+        stamp_gmem_bindings(
+            &mut region,
+            "attention_prefill_contiguous",
+            &fuf,
+            &[TileId(5)],
+        );
+        let b = &region.gmem_bindings;
+        assert!(b.iter().any(|(c, id)| *c == "Q_gmem" && *id == "t2_0"));
+        assert!(b.iter().any(|(c, id)| *c == "K_gmem" && *id == "t2_1"));
+        assert!(b.iter().any(|(c, id)| *c == "V_gmem" && *id == "t2_2"));
+        assert!(b.iter().any(|(c, id)| *c == "O_gmem" && *id == "t5_0"));
+        ir::validate(&region).unwrap();
+    }
+
+    #[test]
+    fn stamps_multi_tile_fused_qkv_rope_cache() {
+        // Simulate the 4-tile fused_qkv_rope_cache shape llama uses:
+        // tile 10 (gemm X⋅Wqkv), tile 11 (rope+split), tile 12 (kv cache
+        // write), tile 13 (trailing). External inputs = X (upstream
+        // tile 9), Wqkv weight, Rotary extern, KvCache extern.
+        // Intra-subgraph tile-tile edges must be dropped.
+        use crate::quantization::StorageFormat;
+        let dummy = |id: u32| FufNode {
+            id: TileId(id),
+            op: OpKind::Attention,
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let fuf = Fuf {
+            nodes: vec![
+                dummy(0),
+                dummy(1),
+                dummy(2),
+                dummy(3),
+                dummy(4),
+                dummy(5),
+                dummy(6),
+                dummy(7),
+                dummy(8),
+                FufNode {
+                    id: TileId(9),
+                    op: OpKind::RmsNorm,
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(10),
+                    op: OpKind::Gemm,
+                    inputs: vec![
+                        FufInput::Tile {
+                            id: TileId(9),
+                            slot: 0,
+                        },
+                        FufInput::Weight {
+                            id: crate::classified::WeightId(42),
+                            index: Some(5),
+                            storage: StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(11),
+                    op: OpKind::RopeAppend,
+                    inputs: vec![
+                        FufInput::Tile {
+                            id: TileId(10),
+                            slot: 0,
+                        },
+                        FufInput::Extern {
+                            kind: ExternKind::Rotary,
+                            index: None,
+                        },
+                    ],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(12),
+                    op: OpKind::Attention,
+                    inputs: vec![
+                        FufInput::Tile {
+                            id: TileId(11),
+                            slot: 1,
+                        },
+                        FufInput::Extern {
+                            kind: ExternKind::KvCache,
+                            index: Some(5),
+                        },
+                    ],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(13),
+                    op: OpKind::Attention,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(12),
+                        slot: 0,
+                    }],
+                    outputs: vec![],
+                },
+            ],
+        };
+        let mut region = super::qkv_rope_region(&ferrite_stencil::QkvRopeParams {
+            hidden_dim: 4096,
+            head_dim: 128,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            token_tile: 64,
+            k_tile: 32,
+            pipe: 3,
+            writes_kv_cache: true,
+        });
+        stamp_gmem_bindings(
+            &mut region,
+            "fused_qkv_rope_cache",
+            &fuf,
+            &[TileId(10), TileId(11), TileId(12), TileId(13)],
+        );
+        let b = &region.gmem_bindings;
+        // X comes from upstream tile 9 (not in subgraph).
+        assert!(b.iter().any(|(c, id)| *c == "X_gmem" && *id == "t9_0"));
+        // Wqkv identified by weight id + layer index.
+        assert!(b.iter().any(|(c, id)| *c == "Wqkv_gmem" && *id == "w42_5"));
+        // Rotary extern.
+        assert!(
+            b.iter()
+                .any(|(c, id)| *c == "RopeCoef_gmem" && *id == "x_rotary_0")
+        );
+        // KvCache extern (layer-scoped by index).
+        assert!(
+            b.iter()
+                .any(|(c, id)| *c == "K_cache_gmem" && *id == "x_kv_cache_5")
+        );
+        assert!(
+            b.iter()
+                .any(|(c, id)| *c == "V_cache_gmem" && *id == "x_kv_cache_5")
+        );
+        // Output tile_id = max in subgraph = 13; slots 0/1/2 = Q/K/V.
+        assert!(b.iter().any(|(c, id)| *c == "Q_gmem" && *id == "t13_0"));
+        assert!(b.iter().any(|(c, id)| *c == "K_gmem" && *id == "t13_1"));
+        assert!(b.iter().any(|(c, id)| *c == "V_gmem" && *id == "t13_2"));
+    }
+
+    #[test]
+    fn unknown_impl_leaves_bindings_empty() {
+        let fuf = singleton_attention_fuf();
+        let mut region = super::attn_region(&ferrite_stencil::AttnParams {
+            window: ferrite_stencil::Window::Infinite,
+            head_dim: 128,
+            tile_q: 128,
+            tile_k: 64,
+            num_head_groups: 8,
+            pipe: 3,
+        });
+        stamp_gmem_bindings(
+            &mut region,
+            "some_impl_not_in_the_table",
+            &fuf,
+            &[TileId(0)],
+        );
+        assert!(region.gmem_bindings.is_empty());
     }
 }

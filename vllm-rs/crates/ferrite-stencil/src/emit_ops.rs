@@ -659,6 +659,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "gemm_accumulate" => Some(generic_gemm(ctx, "C_frag", "smem_a", "smem_b")),
         "store_c_tile" => Some(generic_store(
             ctx,
+            "C_gmem",
             ctx.gmem("C_gmem"),
             "C_frag",
             "m_tile",
@@ -680,6 +681,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "rmsnorm_compute" => Some(rmsnorm_compute(ctx)),
         "store_y_row" => Some(generic_store(
             ctx,
+            "Y_gmem",
             ctx.gmem("Y_gmem"),
             "Y_frag",
             "token_tile",
@@ -700,6 +702,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "elementwise_add" => Some(elementwise_add(ctx)),
         "store_sum_row" => Some(generic_store(
             ctx,
+            "Sum_gmem",
             ctx.gmem("Sum_gmem"),
             "sum_frag",
             "token_tile",
@@ -723,6 +726,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "apply_rope" => Some(apply_rope(ctx)),
         "store_q_row" => Some(generic_store(
             ctx,
+            "Q_gmem",
             ctx.gmem("Q_gmem"),
             "Q_frag",
             "token_tile",
@@ -730,6 +734,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         )),
         "store_k_row" => Some(generic_store(
             ctx,
+            "K_gmem",
             ctx.gmem("K_gmem"),
             "K_frag",
             "token_tile",
@@ -737,6 +742,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         )),
         "store_v_row" => Some(generic_store(
             ctx,
+            "V_gmem",
             ctx.gmem("V_gmem"),
             "V_frag",
             "token_tile",
@@ -764,6 +770,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "silu_mul_fuse" => Some(silu_mul_fuse(ctx)),
         "store_inter_tile" => Some(generic_store(
             ctx,
+            "Inter_gmem",
             ctx.gmem("Inter_gmem"),
             "Inter_frag",
             "token_tile",
@@ -781,6 +788,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "load_embed_row" => Some(embed_gather(ctx)),
         "store_embed_row" => Some(generic_store(
             ctx,
+            "Y_gmem",
             ctx.gmem("Y_gmem"),
             "Embed_frag",
             "token_tile",
@@ -1192,6 +1200,7 @@ fn generic_gemm(ctx: &ExpandCtx<'_>, acc: &str, smem_a: &str, smem_b: &str) -> S
 /// in the non-attention templates.
 fn generic_store(
     ctx: &ExpandCtx<'_>,
+    gmem_canonical: &str,
     gmem: &str,
     frag: &str,
     row_axis: &str,
@@ -1203,16 +1212,19 @@ fn generic_store(
     writeln!(
         s,
         "  // {}: {}[{}, {}] ← {}",
-        gmem, gmem, row_axis, col_axis, frag
+        gmem_canonical, gmem, row_axis, col_axis, frag
     )
     .unwrap();
     match ctx.arch_name {
         "sm90_fa2" => {
+            // Barrier name stays on the canonical so it matches
+            // `local_refs`' `bar_<canonical>_ready` declaration — the
+            // identity drives the data address only.
             writeln!(s, "  if (wg == CONSUMER_WG) {{").unwrap();
             writeln!(s, "    stmatrix_smem(smem_out, {});", frag).unwrap();
-            writeln!(s, "    mbarrier_arrive(&bar_{}_ready);", gmem).unwrap();
+            writeln!(s, "    mbarrier_arrive(&bar_{}_ready);", gmem_canonical).unwrap();
             writeln!(s, "  }} else if (wg == STORER_WG) {{").unwrap();
-            writeln!(s, "    mbarrier_wait(&bar_{}_ready);", gmem).unwrap();
+            writeln!(s, "    mbarrier_wait(&bar_{}_ready);", gmem_canonical).unwrap();
             writeln!(
                 s,
                 "    tma_store_2d({}, smem_out, {}, {});",
@@ -1865,8 +1877,13 @@ mod tests {
             gmem_bindings: &[("C_gmem", "layer_7_Wo_C")],
         };
         let s = expand("store_c_tile", &ctx).unwrap();
+        // Data address uses the identity; the mbarrier keeps the
+        // canonical name so local_refs' `bar_C_gmem_ready`
+        // declaration still resolves.
         assert!(s.contains("tma_store_2d(layer_7_Wo_C, smem_out, m_tile, n_tile)"));
-        assert!(!s.contains("C_gmem"));
+        assert!(s.contains("bar_C_gmem_ready"));
+        // C_gmem must not appear as the tma_store's data pointer.
+        assert!(!s.contains("tma_store_2d(C_gmem"));
     }
 
     #[test]

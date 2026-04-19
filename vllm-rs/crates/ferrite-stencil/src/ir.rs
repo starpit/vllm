@@ -148,6 +148,19 @@ pub struct Region {
     pub entry_scalars: Vec<ScalarBinding>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    /// Maps canonical gmem names (from `emit_ops::gmem_refs`) to
+    /// per-region unique FUF-derived identities. Populated by the
+    /// lowering pass after walking tile inputs/outputs — e.g., an
+    /// attention Region in layer 5 binds `"Q_gmem"` to something like
+    /// `"t123_0"` (tile 123, slot 0 = Q output of the previous
+    /// qkv_rope). Two regions that share an upstream tile share the
+    /// identity; every other case gets a distinct pointer in the
+    /// kernel signature.
+    ///
+    /// Empty = legacy behavior: the emitter uses canonical names
+    /// directly. Pre-item-4 regions (all templates today) leave this
+    /// empty; item 4b populates it. STENCIL_IR_STATUS.md item 4.
+    pub gmem_bindings: Vec<(&'static str, &'static str)>,
 }
 
 #[derive(Debug, Clone)]

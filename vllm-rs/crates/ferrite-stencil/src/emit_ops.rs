@@ -35,6 +35,12 @@ pub struct ExpandCtx<'a> {
     /// `Some("kv_tile")`, GEMM/qkv/gate_up_silu = `Some("k_tile")`,
     /// rmsnorm/embed/unary = `None`.
     pub serial_axis: Option<&'static str>,
+    /// Region's canonical→identity map from `Region.gmem_bindings`.
+    /// Each expansion calls `ctx.gmem(canonical)` to substitute the
+    /// per-region identity; when empty (pre-item-4b regions) the
+    /// canonical name returns unchanged and the emitted body matches
+    /// legacy output. Item 4 in STENCIL_IR_STATUS.md.
+    pub gmem_bindings: &'a [(&'static str, &'static str)],
 }
 
 impl<'a> ExpandCtx<'a> {
@@ -49,6 +55,20 @@ impl<'a> ExpandCtx<'a> {
     /// default keeps the emission legal if the region lacks one.
     pub fn ser(&self) -> &'static str {
         self.serial_axis.unwrap_or("0u")
+    }
+    /// Resolve a canonical gmem name against the region's bindings.
+    /// Returns the per-region identity when present, otherwise the
+    /// canonical name — pre-item-4b regions carry no bindings and the
+    /// emitted source stays identical to the legacy form. O(N) scan
+    /// over bindings; N is at most the region's distinct tensor
+    /// count (≤ 8 in every template today).
+    pub fn gmem(&self, canonical: &'static str) -> &'static str {
+        for (c, id) in self.gmem_bindings {
+            if *c == canonical {
+                return id;
+            }
+        }
+        canonical
     }
 }
 
@@ -623,24 +643,64 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "store_o_tile" => Some(store_o_tile(ctx)),
         // ── GEMM (+ quant variants share this) ──
         "load_a_tile" => Some(generic_pipeline_load(
-            ctx, "smem_a", "A_gmem", "m_tile", "k_tile",
+            ctx,
+            "smem_a",
+            ctx.gmem("A_gmem"),
+            "m_tile",
+            "k_tile",
         )),
         "load_b_tile" => Some(generic_pipeline_load(
-            ctx, "smem_b", "B_gmem", "k_tile", "n_tile",
+            ctx,
+            "smem_b",
+            ctx.gmem("B_gmem"),
+            "k_tile",
+            "n_tile",
         )),
         "gemm_accumulate" => Some(generic_gemm(ctx, "C_frag", "smem_a", "smem_b")),
-        "store_c_tile" => Some(generic_store(ctx, "C_gmem", "C_frag", "m_tile", "n_tile")),
+        "store_c_tile" => Some(generic_store(
+            ctx,
+            ctx.gmem("C_gmem"),
+            "C_frag",
+            "m_tile",
+            "n_tile",
+        )),
         // ── RMSNorm / LayerNorm / Add ──
-        "load_x_row" => Some(generic_preamble_load(ctx, "smem_x", "X_gmem", "token_tile")),
-        "load_weight" => Some(generic_preamble_load(ctx, "smem_w", "W_gmem", "token_tile")),
+        "load_x_row" => Some(generic_preamble_load(
+            ctx,
+            "smem_x",
+            ctx.gmem("X_gmem"),
+            "token_tile",
+        )),
+        "load_weight" => Some(generic_preamble_load(
+            ctx,
+            "smem_w",
+            ctx.gmem("W_gmem"),
+            "token_tile",
+        )),
         "rmsnorm_compute" => Some(rmsnorm_compute(ctx)),
-        "store_y_row" => Some(generic_store(ctx, "Y_gmem", "Y_frag", "token_tile", "0u")),
-        "load_a_row" => Some(generic_preamble_load(ctx, "smem_a", "A_gmem", "token_tile")),
-        "load_b_row" => Some(generic_preamble_load(ctx, "smem_b", "B_gmem", "token_tile")),
+        "store_y_row" => Some(generic_store(
+            ctx,
+            ctx.gmem("Y_gmem"),
+            "Y_frag",
+            "token_tile",
+            "0u",
+        )),
+        "load_a_row" => Some(generic_preamble_load(
+            ctx,
+            "smem_a",
+            ctx.gmem("A_gmem"),
+            "token_tile",
+        )),
+        "load_b_row" => Some(generic_preamble_load(
+            ctx,
+            "smem_b",
+            ctx.gmem("B_gmem"),
+            "token_tile",
+        )),
         "elementwise_add" => Some(elementwise_add(ctx)),
         "store_sum_row" => Some(generic_store(
             ctx,
-            "Sum_gmem",
+            ctx.gmem("Sum_gmem"),
             "sum_frag",
             "token_tile",
             "0u",
@@ -649,7 +709,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "load_wqkv_tile" => Some(generic_pipeline_load(
             ctx,
             "smem_wqkv",
-            "Wqkv_gmem",
+            ctx.gmem("Wqkv_gmem"),
             "head_tile",
             "k_tile",
         )),
@@ -657,45 +717,45 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "load_rope_coef" => Some(generic_preamble_load(
             ctx,
             "smem_rope",
-            "RopeCoef_gmem",
+            ctx.gmem("RopeCoef_gmem"),
             "token_tile",
         )),
         "apply_rope" => Some(apply_rope(ctx)),
         "store_q_row" => Some(generic_store(
             ctx,
-            "Q_gmem",
+            ctx.gmem("Q_gmem"),
             "Q_frag",
             "token_tile",
             "head_tile",
         )),
         "store_k_row" => Some(generic_store(
             ctx,
-            "K_gmem",
+            ctx.gmem("K_gmem"),
             "K_frag",
             "token_tile",
             "head_tile",
         )),
         "store_v_row" => Some(generic_store(
             ctx,
-            "V_gmem",
+            ctx.gmem("V_gmem"),
             "V_frag",
             "token_tile",
             "head_tile",
         )),
-        "store_k_cache" => Some(generic_cache_store(ctx, "K_cache_gmem", "K_frag")),
-        "store_v_cache" => Some(generic_cache_store(ctx, "V_cache_gmem", "V_frag")),
+        "store_k_cache" => Some(generic_cache_store(ctx, ctx.gmem("K_cache_gmem"), "K_frag")),
+        "store_v_cache" => Some(generic_cache_store(ctx, ctx.gmem("V_cache_gmem"), "V_frag")),
         // ── Gate + Up + SiLU/GeLU + Mul (MLP input) ──
         "load_wgate_tile" => Some(generic_pipeline_load(
             ctx,
             "smem_wgate",
-            "Wgate_gmem",
+            ctx.gmem("Wgate_gmem"),
             "inter_tile",
             "k_tile",
         )),
         "load_wup_tile" => Some(generic_pipeline_load(
             ctx,
             "smem_wup",
-            "Wup_gmem",
+            ctx.gmem("Wup_gmem"),
             "inter_tile",
             "k_tile",
         )),
@@ -704,7 +764,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "silu_mul_fuse" => Some(silu_mul_fuse(ctx)),
         "store_inter_tile" => Some(generic_store(
             ctx,
-            "Inter_gmem",
+            ctx.gmem("Inter_gmem"),
             "Inter_frag",
             "token_tile",
             "inter_tile",
@@ -721,7 +781,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "load_embed_row" => Some(embed_gather(ctx)),
         "store_embed_row" => Some(generic_store(
             ctx,
-            "Y_gmem",
+            ctx.gmem("Y_gmem"),
             "Embed_frag",
             "token_tile",
             "0u",
@@ -737,26 +797,28 @@ fn load_q_tile(ctx: &ExpandCtx<'_>) -> String {
     // tensor` with an mbarrier arrive; on SM89 it's a cp.async.ca
     // loop over the tile's elements. Row axis varies by template: FA2
     // uses `q_tile`, paged decode uses `b` — both resolve through
-    // `ctx.parallel_axes`.
+    // `ctx.parallel_axes`. Gmem pointer name resolves per-region via
+    // `ctx.gmem()` so each layer's Q tensor gets its own identity.
     let row = ctx.par(0);
     let col = ctx.par(1);
+    let q = ctx.gmem("Q_gmem");
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
-    writeln!(s, "  // load_q_tile: Q[{}, {}, :, :] → smem", row, col).unwrap();
+    writeln!(s, "  // load_q_tile: {}[{}, {}, :, :] → smem", q, row, col).unwrap();
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
-            writeln!(s, "    tma_load_2d(smem_q, Q_gmem, {}, {});", row, col).unwrap();
+            writeln!(s, "    tma_load_2d(smem_q, {}, {}, {});", q, row, col).unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_q);").unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
-            writeln!(s, "  cp_async_128(smem_q, Q_gmem, {}, {});", row, col).unwrap();
+            writeln!(s, "  cp_async_128(smem_q, {}, {}, {});", q, row, col).unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
         }
         other => {
             writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
-            writeln!(s, "  generic_load(smem_q, Q_gmem, {}, {});", row, col).unwrap();
+            writeln!(s, "  generic_load(smem_q, {}, {}, {});", q, row, col).unwrap();
         }
     }
     // Suppress "unused" for iter_offset / pipeline_depth; both matter
@@ -777,7 +839,12 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
     debug_assert!(ctx.iter_offset > 0, "pipeline-source load must be +P");
     let p = ctx.pipeline_depth;
     let buf = format!("smem_{}", which);
-    let gmem = format!("{}_gmem", which.to_uppercase());
+    let gmem_canonical: &'static str = match which {
+        "k" => "K_gmem",
+        "v" => "V_gmem",
+        _ => unreachable!("load_kv_tile only takes \"k\" or \"v\""),
+    };
+    let gmem = ctx.gmem(gmem_canonical);
     let ser = ctx.ser();
     let col = ctx.par(1);
     let mut s = String::new();
@@ -947,14 +1014,10 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
     debug_assert_eq!(ctx.iter_offset, 0, "store nodes carry no iter_offset");
     let row = ctx.par(0);
     let col = ctx.par(1);
+    let o = ctx.gmem("O_gmem");
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
-    writeln!(
-        s,
-        "  // store_o_tile: O_gmem[{}, {}] ← O_frag / l",
-        row, col
-    )
-    .unwrap();
+    writeln!(s, "  // store_o_tile: {}[{}, {}] ← O_frag / l", o, row, col).unwrap();
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == CONSUMER_WG) {{").unwrap();
@@ -963,12 +1026,12 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
             writeln!(s, "    mbarrier_arrive(&bar_o_ready);").unwrap();
             writeln!(s, "  }} else if (wg == STORER_WG) {{").unwrap();
             writeln!(s, "    mbarrier_wait(&bar_o_ready);").unwrap();
-            writeln!(s, "    tma_store_2d(O_gmem, smem_o, {}, {});", row, col).unwrap();
+            writeln!(s, "    tma_store_2d({}, smem_o, {}, {});", o, row, col).unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
             writeln!(s, "  O_frag = O_frag * rcp(l);").unwrap();
-            writeln!(s, "  stg_128(O_gmem, O_frag, {}, {});", row, col).unwrap();
+            writeln!(s, "  stg_128({}, O_frag, {}, {});", o, row, col).unwrap();
         }
         other => {
             writeln!(
@@ -977,7 +1040,7 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
                 other
             )
             .unwrap();
-            writeln!(s, "  generic_store(O_gmem, O_frag, l, {}, {});", row, col).unwrap();
+            writeln!(s, "  generic_store({}, O_frag, l, {}, {});", o, row, col).unwrap();
         }
     }
     let _ = ctx.pipeline_depth;
@@ -1273,26 +1336,30 @@ fn silu_mul_fuse(ctx: &ExpandCtx<'_>) -> String {
 /// Embedding lookup: gather row from embed_table using token_ids.
 /// One Load, no Compute — this is pure data movement.
 fn embed_gather(ctx: &ExpandCtx<'_>) -> String {
+    let row_axis = ctx.par(0);
+    let embed = ctx.gmem("Embed_gmem");
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
-    writeln!(s, "  // Embed_frag = embed_table[token_ids[token_tile]];").unwrap();
+    writeln!(s, "  // Embed_frag = {}[token_ids[{}]];", embed, row_axis).unwrap();
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
-            writeln!(s, "    uint32_t row = token_ids[token_tile];").unwrap();
+            writeln!(s, "    uint32_t row = token_ids[{}];", row_axis).unwrap();
             writeln!(
                 s,
-                "    tma_load_2d(Embed_frag, Embed_gmem + row * hidden_stride);"
+                "    tma_load_2d(Embed_frag, {} + row * hidden_stride);",
+                embed
             )
             .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_embed);").unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
-            writeln!(s, "  uint32_t row = token_ids[token_tile];").unwrap();
+            writeln!(s, "  uint32_t row = token_ids[{}];", row_axis).unwrap();
             writeln!(
                 s,
-                "  cp_async_128(Embed_frag, Embed_gmem + row * hidden_stride);"
+                "  cp_async_128(Embed_frag, {} + row * hidden_stride);",
+                embed
             )
             .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
@@ -1325,6 +1392,7 @@ mod tests {
             pipeline_depth: 3,
             parallel_axes: FA2_PAR,
             serial_axis: FA2_SER,
+            gmem_bindings: &[],
         }
     }
 
@@ -1353,6 +1421,7 @@ mod tests {
             pipeline_depth: 3,
             parallel_axes: FA2_PAR,
             serial_axis: FA2_SER,
+            gmem_bindings: &[],
         }
     }
 
@@ -1460,6 +1529,7 @@ mod tests {
             pipeline_depth: 3,
             parallel_axes: &["m_tile", "n_tile"],
             serial_axis: Some("k_tile"),
+            gmem_bindings: &[],
         }
     }
 
@@ -1519,8 +1589,19 @@ mod tests {
 
     #[test]
     fn embed_gather_indexes_through_token_ids() {
+        // embed_region has a single parallel axis `token_tile`; the
+        // `token_ids[<axis>]` gather reads from it, not from the FA2
+        // default we use elsewhere in the file.
         for arch in ["sm90_fa2", "sm89_fa2"] {
-            let s = expand("load_embed_row", &ctx(arch)).unwrap();
+            let embed_ctx = ExpandCtx {
+                arch_name: arch,
+                iter_offset: 0,
+                pipeline_depth: 3,
+                parallel_axes: &["token_tile"],
+                serial_axis: None,
+                gmem_bindings: &[],
+            };
+            let s = expand("load_embed_row", &embed_ctx).unwrap();
             assert!(s.contains("uint32_t row = token_ids[token_tile]"));
             assert!(s.contains("Embed_gmem + row * hidden_stride"));
         }
@@ -1667,6 +1748,7 @@ mod tests {
             pipeline_depth: 3,
             parallel_axes: &["b", "head_group"],
             serial_axis: Some("kv_tile"),
+            gmem_bindings: &[],
         };
         let s = expand("load_q_tile", &ctx).unwrap();
         assert!(s.contains("tma_load_2d(smem_q, Q_gmem, b, head_group)"));
@@ -1681,6 +1763,7 @@ mod tests {
             pipeline_depth: 3,
             parallel_axes: &["b", "head_group"],
             serial_axis: Some("kv_tile"),
+            gmem_bindings: &[],
         };
         let s = expand("store_o_tile", &ctx).unwrap();
         assert!(s.contains("tma_store_2d(O_gmem, smem_o, b, head_group)"));
@@ -1697,6 +1780,7 @@ mod tests {
             pipeline_depth: 3,
             parallel_axes: FA2_PAR,
             serial_axis: Some("kv_tile"),
+            gmem_bindings: &[],
         };
         assert!(
             expand("qk_matmul", &fa2)
@@ -1710,12 +1794,79 @@ mod tests {
             pipeline_depth: 3,
             parallel_axes: FA2_PAR,
             serial_axis: Some("kv_chunk"),
+            gmem_bindings: &[],
         };
         assert!(
             expand("qk_matmul", &renamed)
                 .unwrap()
                 .contains("uint32_t slot = kv_chunk % PIPE;")
         );
+    }
+
+    // ── gmem bindings resolver (item 4a) ──────────────────────────
+
+    #[test]
+    fn gmem_resolver_returns_canonical_when_unbound() {
+        let ctx = ExpandCtx {
+            arch_name: "sm90_fa2",
+            iter_offset: 0,
+            pipeline_depth: 3,
+            parallel_axes: FA2_PAR,
+            serial_axis: FA2_SER,
+            gmem_bindings: &[],
+        };
+        assert_eq!(ctx.gmem("Q_gmem"), "Q_gmem");
+        assert_eq!(ctx.gmem("Wqkv_gmem"), "Wqkv_gmem");
+    }
+
+    #[test]
+    fn gmem_resolver_substitutes_when_bound() {
+        let ctx = ExpandCtx {
+            arch_name: "sm90_fa2",
+            iter_offset: 0,
+            pipeline_depth: 3,
+            parallel_axes: FA2_PAR,
+            serial_axis: FA2_SER,
+            gmem_bindings: &[("Q_gmem", "layer_5_Q"), ("Wqkv_gmem", "layer_5_Wqkv")],
+        };
+        assert_eq!(ctx.gmem("Q_gmem"), "layer_5_Q");
+        assert_eq!(ctx.gmem("Wqkv_gmem"), "layer_5_Wqkv");
+        // Unbound fall through to canonical.
+        assert_eq!(ctx.gmem("O_gmem"), "O_gmem");
+    }
+
+    #[test]
+    fn load_q_tile_uses_bound_identity_in_body() {
+        // With bindings populated, the emitted body references the
+        // identity (not the canonical) everywhere `Q_gmem` appeared.
+        let ctx = ExpandCtx {
+            arch_name: "sm90_fa2",
+            iter_offset: 0,
+            pipeline_depth: 3,
+            parallel_axes: FA2_PAR,
+            serial_axis: FA2_SER,
+            gmem_bindings: &[("Q_gmem", "t42_0")],
+        };
+        let s = expand("load_q_tile", &ctx).unwrap();
+        assert!(s.contains("tma_load_2d(smem_q, t42_0, q_tile, head_group)"));
+        assert!(!s.contains("Q_gmem"));
+    }
+
+    #[test]
+    fn store_c_tile_threads_identity_through_generic_store() {
+        // Covers the generic_store path where emit_ops::expand calls
+        // ctx.gmem at the call site, not inside the helper.
+        let ctx = ExpandCtx {
+            arch_name: "sm90_fa2",
+            iter_offset: 0,
+            pipeline_depth: 3,
+            parallel_axes: &["m_tile", "n_tile"],
+            serial_axis: Some("k_tile"),
+            gmem_bindings: &[("C_gmem", "layer_7_Wo_C")],
+        };
+        let s = expand("store_c_tile", &ctx).unwrap();
+        assert!(s.contains("tma_store_2d(layer_7_Wo_C, smem_out, m_tile, n_tile)"));
+        assert!(!s.contains("C_gmem"));
     }
 
     #[test]
@@ -1728,6 +1879,7 @@ mod tests {
             pipeline_depth: 3,
             parallel_axes: &["m_tile", "n_tile"],
             serial_axis: Some("k_tile"),
+            gmem_bindings: &[],
         };
         let s = expand("gemm_accumulate", &gemm_ctx).unwrap();
         assert!(s.contains("uint32_t slot = k_tile % PIPE;"));

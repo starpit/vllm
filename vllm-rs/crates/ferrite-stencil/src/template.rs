@@ -278,6 +278,7 @@ pub fn attn_region(p: &AttnParams) -> Region {
         entry_scalars,
         nodes,
         edges,
+        gmem_bindings: Vec::new(),
     }
 }
 
@@ -498,6 +499,7 @@ pub fn attn_region_paged_decode(p: &PagedDecodeParams) -> Region {
         entry_scalars,
         nodes,
         edges,
+        gmem_bindings: Vec::new(),
     }
 }
 
@@ -668,6 +670,7 @@ pub fn gemm_region(p: &GemmParams) -> Region {
         ],
         nodes,
         edges,
+        gmem_bindings: Vec::new(),
     }
 }
 
@@ -773,6 +776,7 @@ pub fn rmsnorm_region(p: &RmsNormParams) -> Region {
         }],
         nodes,
         edges,
+        gmem_bindings: Vec::new(),
     }
 }
 
@@ -873,6 +877,7 @@ pub fn residual_add_region(p: &ResidualAddParams) -> Region {
         }],
         nodes,
         edges,
+        gmem_bindings: Vec::new(),
     }
 }
 
@@ -954,6 +959,7 @@ pub fn embed_region(p: &EmbedParams) -> Region {
         }],
         nodes,
         edges,
+        gmem_bindings: Vec::new(),
     }
 }
 
@@ -1042,6 +1048,7 @@ pub fn unary_inplace_region(p: &UnaryInplaceParams) -> Region {
         }],
         nodes,
         edges,
+        gmem_bindings: Vec::new(),
     }
 }
 
@@ -1330,6 +1337,7 @@ pub fn qkv_rope_region(p: &QkvRopeParams) -> Region {
         ],
         nodes,
         edges,
+        gmem_bindings: Vec::new(),
     }
 }
 
@@ -1576,6 +1584,7 @@ pub fn gate_up_silu_mul_region(p: &GateUpSiluMulParams) -> Region {
         ],
         nodes,
         edges,
+        gmem_bindings: Vec::new(),
     }
 }
 

@@ -140,12 +140,17 @@ fn collect_params(mega: &Megakernel) -> ParamSet {
         }
     }
 
+    // Resolve each (canonical) gmem ref through the region's bindings
+    // so per-layer identities (populated by item 4b) become distinct
+    // params. Pre-4b regions carry empty bindings, and the canonical
+    // name flows through unchanged — signature matches legacy output.
     let mut gmem_access: BTreeMap<&'static str, GmemAccess> = BTreeMap::new();
     for r in &mega.regions {
         for n in &r.nodes {
             for &(name, access) in gmem_refs(n.op.tag) {
+                let identity = resolve_gmem(&r.gmem_bindings, name);
                 gmem_access
-                    .entry(name)
+                    .entry(identity)
                     .and_modify(|e| *e = e.union(access))
                     .or_insert(access);
             }
@@ -154,6 +159,23 @@ fn collect_params(mega: &Megakernel) -> ParamSet {
     let gmem: Vec<(&'static str, GmemAccess)> = gmem_access.into_iter().collect();
 
     ParamSet { scalars, gmem }
+}
+
+/// Look up `canonical` in `bindings`; return the identity when
+/// bound, else `canonical` unchanged. Mirror of
+/// `ExpandCtx::gmem` — the signature emitter needs the same
+/// substitution so kernel params match what the expansion bodies
+/// reference.
+fn resolve_gmem(
+    bindings: &[(&'static str, &'static str)],
+    canonical: &'static str,
+) -> &'static str {
+    for (c, id) in bindings {
+        if *c == canonical {
+            return id;
+        }
+    }
+    canonical
 }
 
 /// Kahn's algorithm over `Megakernel.control`. When `control` is
@@ -354,6 +376,7 @@ fn write_wg_dispatch(out: &mut String, arch: &ArchMap) {
         entry_scalars: vec![],
         nodes: vec![],
         edges: vec![],
+        gmem_bindings: Vec::new(),
     };
     let units = [
         (Role::Load, (arch.role)(Role::Load, &dummy)),
@@ -621,6 +644,7 @@ fn write_step(
         pipeline_depth,
         parallel_axes,
         serial_axis,
+        gmem_bindings: &region.gmem_bindings,
     };
     if let Some(body) = expand_op(node.op.tag, &ctx) {
         for line in body.lines() {
@@ -801,6 +825,86 @@ mod tests {
             !src.contains("const bf16* __restrict__ Q_gmem"),
             "Q_gmem must not carry the const qualifier",
         );
+    }
+
+    #[test]
+    fn gmem_bindings_populate_per_region_identities_in_signature() {
+        // Two GEMM regions, each bound to a distinct identity for
+        // (A, B, C). Pre-4b this is what item 4 needs for real models:
+        // layer 3's Wqkv and layer 7's Wqkv become separate params.
+        // Unbound regions still show canonical names — mixed behavior
+        // is deliberately supported during the 4a→4b transition.
+        use crate::template::{GemmParams, gemm_region};
+        let params = GemmParams {
+            m_tile: 128,
+            n_tile: 128,
+            k_tile: 32,
+            pipe: 3,
+        };
+        let mut r0 = gemm_region(&params);
+        r0.id = 0;
+        r0.gmem_bindings = vec![
+            ("A_gmem", "layer_3_X"),
+            ("B_gmem", "layer_3_Wqkv"),
+            ("C_gmem", "layer_3_QKV"),
+        ];
+        let mut r1 = gemm_region(&params);
+        r1.id = 1;
+        r1.gmem_bindings = vec![
+            ("A_gmem", "layer_7_X"),
+            ("B_gmem", "layer_7_Wqkv"),
+            ("C_gmem", "layer_7_QKV"),
+        ];
+        let mk = Megakernel {
+            regions: vec![r0, r1],
+            control: vec![ControlEdge {
+                src: 0,
+                dst: 1,
+                kind: DepKind::Barrier,
+            }],
+        };
+        let src = emit_megakernel(&mk, &sm90_fa2()).unwrap();
+        // Six distinct gmem pointers in the signature, not two.
+        assert!(src.contains("const bf16* __restrict__ layer_3_X"));
+        assert!(src.contains("const bf16* __restrict__ layer_3_Wqkv"));
+        assert!(src.contains("bf16* __restrict__ layer_3_QKV"));
+        assert!(src.contains("const bf16* __restrict__ layer_7_X"));
+        assert!(src.contains("const bf16* __restrict__ layer_7_Wqkv"));
+        assert!(src.contains("bf16* __restrict__ layer_7_QKV"));
+        // No canonical pointer types appear in the signature when
+        // every region is bound. (Mbarrier names like
+        // `bar_C_gmem_ready` still contain the canonical tag — those
+        // are region-local handshake objects, not gmem pointers; item
+        // 4 doesn't rename them.)
+        assert!(!src.contains("__restrict__ A_gmem"));
+        assert!(!src.contains("__restrict__ B_gmem"));
+        assert!(!src.contains("__restrict__ C_gmem"));
+    }
+
+    #[test]
+    fn empty_gmem_bindings_produce_canonical_signature() {
+        // Pre-4b: every template leaves `gmem_bindings` empty; the
+        // emitter must produce the same signature it did before item
+        // 4a landed. This is the backward-compat guarantee that lets
+        // the lowering pass populate bindings one subgraph at a time.
+        use crate::template::{GemmParams, gemm_region};
+        let params = GemmParams {
+            m_tile: 128,
+            n_tile: 128,
+            k_tile: 32,
+            pipe: 3,
+        };
+        let mut r0 = gemm_region(&params);
+        r0.id = 0;
+        assert!(r0.gmem_bindings.is_empty());
+        let mk = Megakernel {
+            regions: vec![r0],
+            control: vec![],
+        };
+        let src = emit_megakernel(&mk, &sm90_fa2()).unwrap();
+        assert!(src.contains("const bf16* __restrict__ A_gmem"));
+        assert!(src.contains("const bf16* __restrict__ B_gmem"));
+        assert!(src.contains("bf16* __restrict__ C_gmem"));
     }
 
     #[test]

@@ -217,6 +217,7 @@ fn emit_step(
         pipeline_depth,
         parallel_axes,
         serial_axis,
+        gmem_bindings: &region.gmem_bindings,
     };
     if let Some(body) = expand_op(node.op.tag, &expand_ctx) {
         // Indent every line of the expansion.

@@ -856,6 +856,294 @@ pub fn residual_add_region(p: &ResidualAddParams) -> Region {
     }
 }
 
+// ─── QKV + RoPE ────────────────────────────────────────────────
+//
+// Fused op covering the qkv projection + RoPE rotation + (optional)
+// KV cache write at the entry of every attention block. Shape:
+// hidden_x[token, hidden] → q[token, num_q, head_dim],
+// k/v[token, num_kv, head_dim] or a KV cache append.
+//
+// Domain: (token_tile, head_tile) parallel, k_tile serial (reduction
+// over hidden for the projection GEMMs). Three Load streams (x,
+// Wqkv, rope_coef) feed the Compute; Stores emit the three outputs.
+// The RoPE rotation is a Compute step after the projection — the
+// template carries it as a separate node so the emitter can see
+// where the post-process fires; the exact intrinsic sequence lives
+// in emit_ops per arch.
+//
+// Quantized variants (marlin_/bnb4_) share this stencil; they only
+// differ in the Load_w address expansion, which is emit_ops's job.
+
+#[derive(Debug, Clone, Copy)]
+pub struct QkvRopeParams {
+    pub hidden_dim: u32,
+    pub head_dim: u32,
+    pub num_q_heads: u32,
+    pub num_kv_heads: u32,
+    pub token_tile: u32,
+    pub k_tile: u32,
+    pub pipe: u32,
+    /// When true, the template emits K/V stores as writes into the
+    /// paged KV cache (via an indexed gather on block_table); when
+    /// false, they are direct stores. Runtime-visible difference only
+    /// at emit_ops expansion; the region shape is identical.
+    pub writes_kv_cache: bool,
+}
+
+pub fn qkv_rope_region(p: &QkvRopeParams) -> Region {
+    const TOKEN: AxisId = 0;
+    const HEAD: AxisId = 1;
+    const K: AxisId = 2;
+    const NUM_TOKEN_TILES: ScalarId = 0;
+    const NUM_HEAD_TILES: ScalarId = 1;
+    const NUM_K_TILES: ScalarId = 2;
+    const N_LOAD_X: NodeId = 0;
+    const N_LOAD_W: NodeId = 1;
+    const N_QKV_GEMM: NodeId = 2;
+    const N_LOAD_ROPE: NodeId = 3;
+    const N_APPLY_ROPE: NodeId = 4;
+    const N_STORE_Q: NodeId = 5;
+    const N_STORE_K: NodeId = 6;
+    const N_STORE_V: NodeId = 7;
+
+    let token_stride = (p.hidden_dim as u64) * (p.token_tile as u64);
+    let head_stride = p.head_dim as u64;
+    let k_stride = p.k_tile as u64;
+
+    let store_tag_k = if p.writes_kv_cache {
+        "store_k_cache"
+    } else {
+        "store_k_row"
+    };
+    let store_tag_v = if p.writes_kv_cache {
+        "store_v_cache"
+    } else {
+        "store_v_row"
+    };
+
+    let nodes = vec![
+        Node {
+            id: N_LOAD_X,
+            role: Role::Load,
+            op: FufOpRef { tag: "load_x_row" },
+            addr: Some(LoadAddr {
+                terms: smallvec![
+                    AddrTerm::AxisStride {
+                        axis: TOKEN,
+                        stride: StrideExpr::Const(token_stride),
+                    },
+                    AddrTerm::AxisStride {
+                        axis: K,
+                        stride: StrideExpr::Const(k_stride),
+                    },
+                ],
+            }),
+        },
+        Node {
+            id: N_LOAD_W,
+            role: Role::Load,
+            op: FufOpRef {
+                tag: "load_wqkv_tile",
+            },
+            addr: Some(LoadAddr {
+                terms: smallvec![
+                    AddrTerm::AxisStride {
+                        axis: HEAD,
+                        stride: StrideExpr::Const(head_stride),
+                    },
+                    AddrTerm::AxisStride {
+                        axis: K,
+                        stride: StrideExpr::Const(k_stride),
+                    },
+                ],
+            }),
+        },
+        Node {
+            id: N_QKV_GEMM,
+            role: Role::Compute,
+            op: FufOpRef { tag: "qkv_matmul" },
+            addr: None,
+        },
+        Node {
+            id: N_LOAD_ROPE,
+            role: Role::Load,
+            op: FufOpRef {
+                tag: "load_rope_coef",
+            },
+            // Cos/sin tables are per-token (same across heads). Live
+            // in the preamble; no serial-axis dep.
+            addr: Some(LoadAddr {
+                terms: smallvec![AddrTerm::AxisStride {
+                    axis: TOKEN,
+                    stride: StrideExpr::Const((p.head_dim as u64) / 2),
+                }],
+            }),
+        },
+        Node {
+            id: N_APPLY_ROPE,
+            role: Role::Compute,
+            op: FufOpRef { tag: "apply_rope" },
+            addr: None,
+        },
+        Node {
+            id: N_STORE_Q,
+            role: Role::Store,
+            op: FufOpRef { tag: "store_q_row" },
+            addr: Some(LoadAddr {
+                // Per-head output; K is reduced out.
+                terms: smallvec![
+                    AddrTerm::AxisStride {
+                        axis: TOKEN,
+                        stride: StrideExpr::Const(token_stride),
+                    },
+                    AddrTerm::AxisStride {
+                        axis: HEAD,
+                        stride: StrideExpr::Const(head_stride),
+                    },
+                ],
+            }),
+        },
+        Node {
+            id: N_STORE_K,
+            role: Role::Store,
+            op: FufOpRef { tag: store_tag_k },
+            addr: Some(LoadAddr {
+                terms: smallvec![
+                    AddrTerm::AxisStride {
+                        axis: TOKEN,
+                        stride: StrideExpr::Const(token_stride),
+                    },
+                    AddrTerm::AxisStride {
+                        axis: HEAD,
+                        stride: StrideExpr::Const(head_stride),
+                    },
+                ],
+            }),
+        },
+        Node {
+            id: N_STORE_V,
+            role: Role::Store,
+            op: FufOpRef { tag: store_tag_v },
+            addr: Some(LoadAddr {
+                terms: smallvec![
+                    AddrTerm::AxisStride {
+                        axis: TOKEN,
+                        stride: StrideExpr::Const(token_stride),
+                    },
+                    AddrTerm::AxisStride {
+                        axis: HEAD,
+                        stride: StrideExpr::Const(head_stride),
+                    },
+                ],
+            }),
+        },
+    ];
+
+    let p_depth = p.pipe as i32;
+    let edges = vec![
+        // Pipeline loads on K into the projection GEMM.
+        Edge {
+            src: N_LOAD_X,
+            dst: N_QKV_GEMM,
+            kind: DepKind::Pipeline,
+            vector: DepVector(smallvec![(K, -p_depth)]),
+        },
+        Edge {
+            src: N_LOAD_W,
+            dst: N_QKV_GEMM,
+            kind: DepKind::Pipeline,
+            vector: DepVector(smallvec![(K, -p_depth)]),
+        },
+        // Accumulation chain on K.
+        Edge {
+            src: N_QKV_GEMM,
+            dst: N_QKV_GEMM,
+            kind: DepKind::Raw,
+            vector: DepVector(smallvec![(K, -1)]),
+        },
+        // rope_coef feeds apply_rope same-iter.
+        Edge {
+            src: N_LOAD_ROPE,
+            dst: N_APPLY_ROPE,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        // Projection result feeds RoPE.
+        Edge {
+            src: N_QKV_GEMM,
+            dst: N_APPLY_ROPE,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        // Stores pull from the rotated fragment.
+        Edge {
+            src: N_APPLY_ROPE,
+            dst: N_STORE_Q,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        Edge {
+            src: N_APPLY_ROPE,
+            dst: N_STORE_K,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        // V doesn't get RoPE'd; pull it straight from the projection.
+        Edge {
+            src: N_QKV_GEMM,
+            dst: N_STORE_V,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+    ];
+
+    // Suppress unused-warnings for params that matter at emit time
+    // but not in the template (num_q_heads, num_kv_heads inform the
+    // intrinsic expansion's per-head layout, not the stencil shape).
+    let _ = (p.num_q_heads, p.num_kv_heads);
+
+    Region {
+        id: 0,
+        name: "qkv_rope",
+        domain: Domain {
+            axes: vec![
+                Axis {
+                    id: TOKEN,
+                    name: "token_tile",
+                    bound: Bound::RegionEntryScalar(NUM_TOKEN_TILES),
+                },
+                Axis {
+                    id: HEAD,
+                    name: "head_tile",
+                    bound: Bound::RegionEntryScalar(NUM_HEAD_TILES),
+                },
+                Axis {
+                    id: K,
+                    name: "k_tile",
+                    bound: Bound::RegionEntryScalar(NUM_K_TILES),
+                },
+            ],
+            predicates: vec![],
+        },
+        entry_scalars: vec![
+            ScalarBinding {
+                id: NUM_TOKEN_TILES,
+                name: "num_token_tiles",
+            },
+            ScalarBinding {
+                id: NUM_HEAD_TILES,
+                name: "num_head_tiles",
+            },
+            ScalarBinding {
+                id: NUM_K_TILES,
+                name: "num_k_tiles",
+            },
+        ],
+        nodes,
+        edges,
+    }
+}
+
 #[cfg(test)]
 mod new_template_tests {
     use super::*;
@@ -912,6 +1200,66 @@ mod new_template_tests {
         assert_eq!(sched.preamble.len(), 2, "load_x + load_weight");
         assert_eq!(sched.body.len(), 1, "rmsnorm_compute");
         assert_eq!(sched.epilogue.len(), 1, "store_y_row");
+    }
+
+    #[test]
+    fn qkv_rope_region_validates_and_schedules() {
+        let r = qkv_rope_region(&QkvRopeParams {
+            hidden_dim: 4096,
+            head_dim: 128,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            token_tile: 64,
+            k_tile: 32,
+            pipe: 3,
+            writes_kv_cache: true,
+        });
+        ir::validate(&r).expect("qkv_rope region validates");
+        assert_eq!(r.nodes.len(), 8, "x, wqkv, gemm, rope_coef, rope, q, k, v");
+        assert_eq!(r.domain.axes.len(), 3);
+        assert_eq!(region_pipeline_depth(&r), 3);
+
+        let sched = schedule_wavefront(&r, &sm90_fa2()).unwrap();
+        assert!(sched.serial_axis.is_some(), "K reduces serially");
+        // load_rope_coef doesn't mention the serial axis → preamble.
+        assert_eq!(sched.preamble.len(), 1);
+        // Body: load_x + load_wqkv (pipeline) + qkv_matmul + apply_rope.
+        assert_eq!(sched.body.len(), 4);
+        // Three Stores (q, k, v) in the epilogue.
+        assert_eq!(sched.epilogue.len(), 3);
+    }
+
+    #[test]
+    fn qkv_rope_without_cache_uses_plain_store_tags() {
+        let r_cache = qkv_rope_region(&QkvRopeParams {
+            hidden_dim: 4096,
+            head_dim: 128,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            token_tile: 64,
+            k_tile: 32,
+            pipe: 3,
+            writes_kv_cache: true,
+        });
+        let r_plain = qkv_rope_region(&QkvRopeParams {
+            writes_kv_cache: false,
+            ..QkvRopeParams {
+                hidden_dim: 4096,
+                head_dim: 128,
+                num_q_heads: 32,
+                num_kv_heads: 8,
+                token_tile: 64,
+                k_tile: 32,
+                pipe: 3,
+                writes_kv_cache: true,
+            }
+        });
+        let cache_tags: Vec<&str> = r_cache.nodes.iter().map(|n| n.op.tag).collect();
+        let plain_tags: Vec<&str> = r_plain.nodes.iter().map(|n| n.op.tag).collect();
+        assert!(cache_tags.contains(&"store_k_cache"));
+        assert!(cache_tags.contains(&"store_v_cache"));
+        assert!(plain_tags.contains(&"store_k_row"));
+        assert!(plain_tags.contains(&"store_v_row"));
     }
 
     #[test]

@@ -26,9 +26,9 @@
 use std::collections::{HashMap, HashSet};
 
 use ferrite_stencil::{
-    AttnParams, ControlEdge, DepKind, GemmParams, Megakernel, PagedDecodeParams, Region, RegionId,
-    ResidualAddParams, RmsNormParams, Window, attn_region, attn_region_paged_decode, gemm_region,
-    residual_add_region, rmsnorm_region,
+    AttnParams, ControlEdge, DepKind, GemmParams, Megakernel, PagedDecodeParams, QkvRopeParams,
+    Region, RegionId, ResidualAddParams, RmsNormParams, Window, attn_region,
+    attn_region_paged_decode, gemm_region, qkv_rope_region, residual_add_region, rmsnorm_region,
 };
 
 use crate::fuf::{Fuf, FufInput, TileId};
@@ -339,6 +339,54 @@ fn lower_impl(
         "add_ref" => Ok(residual_add_region(&ResidualAddParams {
             hidden_dim: hints.hidden_dim,
             token_tile: hints.token_tile,
+        })),
+        // ── QKV projection + RoPE (prefill writes-out-direct; cache
+        //    variant writes into the paged KV cache). qk_norm variant
+        //    shares the same stencil shape — the extra norm lives in
+        //    the Compute node's expansion, not the region template.
+        //    Quantized variants (marlin_, bnb4_) all lower to the same
+        //    stencil; the Load addressing differs only at emit_ops.
+        "fused_qkv_rope_cache"
+        | "fused_qkv_qk_norm_rope_cache"
+        | "marlin_fused_qkv_rope_cache"
+        | "bnb4_fused_qkv_rope_cache" => Ok(qkv_rope_region(&QkvRopeParams {
+            hidden_dim: hints.hidden_dim,
+            head_dim: hints.head_dim,
+            num_q_heads: hints.num_head_groups.saturating_mul(1).max(1),
+            num_kv_heads: 1,
+            token_tile: hints.token_tile,
+            k_tile: hints.gemm_k_tile,
+            pipe: hints.pipe,
+            writes_kv_cache: true,
+        })),
+        "fused_qkv_rope_prefill"
+        | "marlin_fused_qkv_rope_prefill"
+        | "bnb4_fused_qkv_rope_prefill" => Ok(qkv_rope_region(&QkvRopeParams {
+            hidden_dim: hints.hidden_dim,
+            head_dim: hints.head_dim,
+            num_q_heads: hints.num_head_groups.saturating_mul(1).max(1),
+            num_kv_heads: 1,
+            token_tile: hints.token_tile,
+            k_tile: hints.gemm_k_tile,
+            pipe: hints.pipe,
+            writes_kv_cache: false,
+        })),
+        // ── RoPE append only (no projection): tiny variant of the
+        //    qkv_rope region with projection-GEMM nodes elided. For
+        //    now share the full template — the emit_ops expansion
+        //    for a qkv projection whose weights are Wq=I / Wk=I /
+        //    Wv=I degenerates to a pass-through, and that's what the
+        //    intrinsic should do for rope_append. Refinement into a
+        //    dedicated, smaller template lands if this proves costly.
+        "rope_append_ref" => Ok(qkv_rope_region(&QkvRopeParams {
+            hidden_dim: hints.hidden_dim,
+            head_dim: hints.head_dim,
+            num_q_heads: hints.num_head_groups.saturating_mul(1).max(1),
+            num_kv_heads: 1,
+            token_tile: hints.token_tile,
+            k_tile: hints.gemm_k_tile,
+            pipe: hints.pipe,
+            writes_kv_cache: true,
         })),
         other => Err(LowerError::UnsupportedImpl { name: other }),
     }

@@ -98,6 +98,491 @@ pub fn gmem_refs(tag: &str) -> &'static [(&'static str, GmemAccess)] {
     }
 }
 
+/// Region-local declaration a tag contributes. The emitter unions the
+/// `local_refs` of every node in a region, dedupes by name (widening
+/// `SmemPlain` to `SmemRing` when both forms appear), and emits the
+/// declarations at the top of the region's `{}` scope. Item 2 in
+/// STENCIL_IR_STATUS.md: regions used to share file-scope placeholders,
+/// which is correctness-breaking once multiple GEMM/norm regions
+/// coexist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalKind {
+    /// `__shared__ StencilFrag name;` — single staging buffer.
+    SmemPlain,
+    /// `__shared__ StencilFrag name[PIPE];` — P-deep ring for
+    /// pipeline-source loads (consumer reads slot `k`, loader writes
+    /// slot `k + P`).
+    SmemRing,
+    /// `StencilFrag name;` — per-thread register fragment. Real
+    /// lowering swaps for concrete mma accumulator types.
+    Frag,
+    /// `struct { StencilFrag q, k, v; } name;` — QKV trifecta held
+    /// together so the RoPE compute can address its parts.
+    FragQkv,
+    /// `__shared__ Mbarrier name;` — single mbarrier for a plain
+    /// preamble load.
+    MbarrierPlain,
+    /// `__shared__ Mbarrier name[PIPE];` — P-deep mbarrier ring.
+    MbarrierRing,
+    /// `float name = <init>;` — per-thread register scalar with an
+    /// initializer. FA2's online softmax uses m/l this way.
+    FloatInit(&'static str),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LocalRef {
+    pub name: &'static str,
+    pub kind: LocalKind,
+}
+
+/// Names + kinds of every region-local that the expansion for `tag`
+/// references. Compute-only tags still declare the fragments they
+/// read+write (e.g. `gemm_accumulate` declares `C_frag`); Load/Store
+/// tags declare their smem staging buffers and mbarriers.
+pub fn local_refs(tag: &str) -> &'static [LocalRef] {
+    use LocalKind::*;
+    match tag {
+        // ── Attention (FA2) ──
+        "load_q_tile" => &[
+            LocalRef {
+                name: "smem_q",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_q",
+                kind: MbarrierPlain,
+            },
+        ],
+        "load_k_tile" => &[
+            LocalRef {
+                name: "smem_k",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "bar_kv",
+                kind: MbarrierRing,
+            },
+        ],
+        "load_v_tile" => &[
+            LocalRef {
+                name: "smem_v",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "bar_kv",
+                kind: MbarrierRing,
+            },
+        ],
+        "qk_matmul" => &[LocalRef {
+            name: "S_frag",
+            kind: Frag,
+        }],
+        "softmax_update" => &[
+            LocalRef {
+                name: "P_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "O_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "m",
+                kind: FloatInit("-INFINITY"),
+            },
+            LocalRef {
+                name: "l",
+                kind: FloatInit("0.0f"),
+            },
+        ],
+        "pv_matmul" => &[
+            LocalRef {
+                name: "O_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "bar_kv_consumed",
+                kind: MbarrierRing,
+            },
+        ],
+        "store_o_tile" => &[
+            LocalRef {
+                name: "smem_o",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_o_ready",
+                kind: MbarrierPlain,
+            },
+        ],
+        // ── GEMM (quant variants share) ──
+        "load_a_tile" => &[
+            LocalRef {
+                name: "smem_a",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "bar_smem_a",
+                kind: MbarrierRing,
+            },
+        ],
+        "load_b_tile" => &[
+            LocalRef {
+                name: "smem_b",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "bar_smem_b",
+                kind: MbarrierRing,
+            },
+        ],
+        "gemm_accumulate" => &[LocalRef {
+            name: "C_frag",
+            kind: Frag,
+        }],
+        "store_c_tile" => &[
+            LocalRef {
+                name: "C_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_out",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_C_gmem_ready",
+                kind: MbarrierPlain,
+            },
+        ],
+        // ── RMSNorm / add (preamble-loaded rows, one staging buffer) ──
+        "load_x_row" => &[
+            LocalRef {
+                name: "smem_x",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_smem_x",
+                kind: MbarrierPlain,
+            },
+        ],
+        "load_weight" => &[
+            LocalRef {
+                name: "smem_w",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_smem_w",
+                kind: MbarrierPlain,
+            },
+        ],
+        "rmsnorm_compute" => &[LocalRef {
+            name: "Y_frag",
+            kind: Frag,
+        }],
+        "store_y_row" => &[
+            LocalRef {
+                name: "Y_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_out",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_Y_gmem_ready",
+                kind: MbarrierPlain,
+            },
+        ],
+        "load_a_row" => &[
+            LocalRef {
+                name: "smem_a",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_smem_a",
+                kind: MbarrierPlain,
+            },
+        ],
+        "load_b_row" => &[
+            LocalRef {
+                name: "smem_b",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_smem_b",
+                kind: MbarrierPlain,
+            },
+        ],
+        "elementwise_add" => &[LocalRef {
+            name: "sum_frag",
+            kind: Frag,
+        }],
+        "store_sum_row" => &[
+            LocalRef {
+                name: "sum_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_out",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_Sum_gmem_ready",
+                kind: MbarrierPlain,
+            },
+        ],
+        // ── QKV + RoPE ──
+        "load_wqkv_tile" => &[
+            LocalRef {
+                name: "smem_wqkv",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "bar_smem_wqkv",
+                kind: MbarrierRing,
+            },
+        ],
+        "qkv_matmul" => &[
+            LocalRef {
+                name: "QKV_frag",
+                kind: FragQkv,
+            },
+            // generic_gemm indexes both operands as `[slot]`; even
+            // though load_x_row declares smem_x as plain for the
+            // preamble load, the ring widening ensures the compute's
+            // `smem_x[slot]` parses. Runtime correctness (plain buffer
+            // loaded once but indexed per-slot) is item 1's problem.
+            LocalRef {
+                name: "smem_x",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "smem_wqkv",
+                kind: SmemRing,
+            },
+        ],
+        "load_rope_coef" => &[
+            LocalRef {
+                name: "smem_rope",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_smem_rope",
+                kind: MbarrierPlain,
+            },
+        ],
+        "apply_rope" => &[
+            LocalRef {
+                name: "Q_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "K_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "V_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "QKV_frag",
+                kind: FragQkv,
+            },
+        ],
+        "store_q_row" => &[
+            LocalRef {
+                name: "Q_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_out",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_Q_gmem_ready",
+                kind: MbarrierPlain,
+            },
+        ],
+        "store_k_row" => &[
+            LocalRef {
+                name: "K_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_out",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_K_gmem_ready",
+                kind: MbarrierPlain,
+            },
+        ],
+        "store_v_row" => &[
+            LocalRef {
+                name: "V_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_out",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_V_gmem_ready",
+                kind: MbarrierPlain,
+            },
+        ],
+        "store_k_cache" => &[LocalRef {
+            name: "K_frag",
+            kind: Frag,
+        }],
+        "store_v_cache" => &[LocalRef {
+            name: "V_frag",
+            kind: Frag,
+        }],
+        // ── Gate + Up + SiLU/GeLU + Mul (MLP input) ──
+        "load_wgate_tile" => &[
+            LocalRef {
+                name: "smem_wgate",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "bar_smem_wgate",
+                kind: MbarrierRing,
+            },
+        ],
+        "load_wup_tile" => &[
+            LocalRef {
+                name: "smem_wup",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "bar_smem_wup",
+                kind: MbarrierRing,
+            },
+        ],
+        "gate_gemm_accumulate" => &[
+            LocalRef {
+                name: "Gate_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_x",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "smem_wgate",
+                kind: SmemRing,
+            },
+        ],
+        "up_gemm_accumulate" => &[
+            LocalRef {
+                name: "Up_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_x",
+                kind: SmemRing,
+            },
+            LocalRef {
+                name: "smem_wup",
+                kind: SmemRing,
+            },
+        ],
+        "silu_mul_fuse" => &[
+            LocalRef {
+                name: "Inter_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "Gate_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "Up_frag",
+                kind: Frag,
+            },
+        ],
+        "store_inter_tile" => &[
+            LocalRef {
+                name: "Inter_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_out",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_Inter_gmem_ready",
+                kind: MbarrierPlain,
+            },
+        ],
+        // ── Unary in-place (scalar_mul, tanh_softcap) ──
+        "scalar_mul" | "tanh_softcap" => &[LocalRef {
+            name: "X_frag",
+            kind: Frag,
+        }],
+        // ── Embedding lookup ──
+        "load_embed_row" => &[
+            LocalRef {
+                name: "Embed_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "bar_embed",
+                kind: MbarrierPlain,
+            },
+        ],
+        "store_embed_row" => &[
+            LocalRef {
+                name: "Embed_frag",
+                kind: Frag,
+            },
+            LocalRef {
+                name: "smem_out",
+                kind: SmemPlain,
+            },
+            LocalRef {
+                name: "bar_Y_gmem_ready",
+                kind: MbarrierPlain,
+            },
+        ],
+        _ => &[],
+    }
+}
+
+impl LocalKind {
+    /// Widen one declaration against another for the same name.
+    /// `SmemPlain` + `SmemRing` → `SmemRing`: the ring storage
+    /// subsumes plain since scalar loads decay to slot 0. Same rule for
+    /// mbarriers. Conflicting kinds (e.g. `SmemPlain` vs `Frag` under
+    /// one name) are caller bugs — we return the left operand as a
+    /// deterministic choice rather than panicking during emission.
+    pub fn widen(self, other: Self) -> Self {
+        use LocalKind::*;
+        match (self, other) {
+            (SmemPlain, SmemRing) | (SmemRing, SmemPlain) => SmemRing,
+            (MbarrierPlain, MbarrierRing) | (MbarrierRing, MbarrierPlain) => MbarrierRing,
+            (a, b) if a == b => a,
+            (a, _) => a,
+        }
+    }
+
+    /// The C++ declaration template. `name` is substituted; ring
+    /// depths are always `PIPE` (the prelude's compile-time macro).
+    pub fn decl(self, name: &str) -> String {
+        use LocalKind::*;
+        match self {
+            SmemPlain => format!("__shared__ StencilFrag {};", name),
+            SmemRing => format!("__shared__ StencilFrag {}[PIPE];", name),
+            Frag => format!("StencilFrag {};", name),
+            FragQkv => format!("struct {{ StencilFrag q, k, v; }} {};", name),
+            MbarrierPlain => format!("__shared__ Mbarrier {};", name),
+            MbarrierRing => format!("__shared__ Mbarrier {}[PIPE];", name),
+            FloatInit(init) => format!("float {} = {};", name, init),
+        }
+    }
+}
+
 /// Try to expand `(tag, arch)` into concrete CUDA pseudocode. Returns
 /// `None` when no entry exists yet; callers fall back to the stub
 /// `tag();` line.
@@ -1018,5 +1503,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── local_refs + LocalKind::widen / decl ──────────────────────
+
+    #[test]
+    fn load_q_tile_declares_plain_smem_and_mbarrier() {
+        let refs = local_refs("load_q_tile");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].name, "smem_q");
+        assert_eq!(refs[0].kind, LocalKind::SmemPlain);
+        assert_eq!(refs[1].name, "bar_q");
+        assert_eq!(refs[1].kind, LocalKind::MbarrierPlain);
+    }
+
+    #[test]
+    fn load_k_and_v_share_bar_kv_ring() {
+        let k = local_refs("load_k_tile");
+        let v = local_refs("load_v_tile");
+        // Both declare a ring mbarrier `bar_kv` — collect_locals
+        // dedupes by name so one `bar_kv[PIPE]` is emitted per region.
+        assert!(
+            k.iter()
+                .any(|r| r.name == "bar_kv" && r.kind == LocalKind::MbarrierRing)
+        );
+        assert!(
+            v.iter()
+                .any(|r| r.name == "bar_kv" && r.kind == LocalKind::MbarrierRing)
+        );
+    }
+
+    #[test]
+    fn softmax_update_carries_float_accumulators_with_inits() {
+        let refs = local_refs("softmax_update");
+        let m = refs.iter().find(|r| r.name == "m").unwrap();
+        assert_eq!(m.kind, LocalKind::FloatInit("-INFINITY"));
+        let l = refs.iter().find(|r| r.name == "l").unwrap();
+        assert_eq!(l.kind, LocalKind::FloatInit("0.0f"));
+    }
+
+    #[test]
+    fn local_kind_widen_promotes_plain_to_ring() {
+        use LocalKind::*;
+        assert_eq!(SmemPlain.widen(SmemRing), SmemRing);
+        assert_eq!(SmemRing.widen(SmemPlain), SmemRing);
+        assert_eq!(MbarrierPlain.widen(MbarrierRing), MbarrierRing);
+        assert_eq!(MbarrierRing.widen(MbarrierPlain), MbarrierRing);
+        // Same-kind is idempotent.
+        assert_eq!(SmemRing.widen(SmemRing), SmemRing);
+        assert_eq!(Frag.widen(Frag), Frag);
+    }
+
+    #[test]
+    fn local_kind_decl_renders_expected_cpp() {
+        assert_eq!(
+            LocalKind::SmemPlain.decl("smem_x"),
+            "__shared__ StencilFrag smem_x;"
+        );
+        assert_eq!(
+            LocalKind::SmemRing.decl("smem_a"),
+            "__shared__ StencilFrag smem_a[PIPE];"
+        );
+        assert_eq!(LocalKind::Frag.decl("C_frag"), "StencilFrag C_frag;");
+        assert_eq!(
+            LocalKind::FragQkv.decl("QKV_frag"),
+            "struct { StencilFrag q, k, v; } QKV_frag;"
+        );
+        assert_eq!(
+            LocalKind::MbarrierPlain.decl("bar_q"),
+            "__shared__ Mbarrier bar_q;"
+        );
+        assert_eq!(
+            LocalKind::MbarrierRing.decl("bar_kv"),
+            "__shared__ Mbarrier bar_kv[PIPE];"
+        );
+        assert_eq!(
+            LocalKind::FloatInit("-INFINITY").decl("m"),
+            "float m = -INFINITY;"
+        );
+    }
+
+    #[test]
+    fn qkv_matmul_carries_ring_smem_operands() {
+        // qkv_matmul indexes `smem_x[slot]` and `smem_wqkv[slot]` via
+        // generic_gemm. Its local_refs declare both as SmemRing so
+        // that in a region that also contains `load_x_row`
+        // (SmemPlain), widening produces a single ring declaration.
+        let refs = local_refs("qkv_matmul");
+        assert!(
+            refs.iter()
+                .any(|r| r.name == "smem_x" && r.kind == LocalKind::SmemRing)
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.name == "smem_wqkv" && r.kind == LocalKind::SmemRing)
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.name == "QKV_frag" && r.kind == LocalKind::FragQkv)
+        );
     }
 }

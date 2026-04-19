@@ -24,7 +24,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 
 use crate::arch::{ArchMap, BarrierPrim, HardwareUnit};
-use crate::emit_ops::{ExpandCtx, GmemAccess, expand as expand_op, gmem_refs};
+use crate::emit_ops::{
+    ExpandCtx, GmemAccess, LocalKind, expand as expand_op, gmem_refs, local_refs,
+};
 use crate::ir::{Axis, Bound, DepKind, Megakernel, Region, RegionId, Role};
 use crate::wavefront::{Schedule, ScheduleError, Step, schedule_wavefront};
 
@@ -432,12 +434,23 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
     )
     .unwrap();
 
+    // Open a region-scoped block so region-local declarations (smem
+    // buffers, register fragments, mbarriers, FA2's online-softmax
+    // scalars) don't stomp on sibling regions. Matches
+    // STENCIL_IR_STATUS.md item 2: prior revisions declared everything
+    // file-scope via the prelude, so two GEMM regions would share one
+    // `C_frag` and one `smem_a` / `smem_b`.
+    let mut indent = String::from("  ");
+    writeln!(out, "{}{{", indent).unwrap();
+    indent.push_str("  ");
+    let locals = collect_locals(region);
+    write_region_locals(out, &indent, &locals);
+
     // Parallel axes become for-loops *inside* the persistent CTA: the
     // host-side per-SM scheduler assigns which (q_tile, head_group) this
     // SM owns, but from the emitter's POV the kernel iterates its full
     // domain. Cross-CTA distribution is a wrapper concern, not this
     // commit's — what matters here is that every domain point runs.
-    let mut indent = String::from("  ");
     for ax in &sched.parallel_axes {
         let axis = region.axis(*ax);
         writeln!(
@@ -492,6 +505,50 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
         let axis = region.axis(*ax);
         indent.truncate(indent.len() - 2);
         writeln!(out, "{}}}  // end {}", indent, axis.name).unwrap();
+    }
+
+    // Close the region scope block.
+    indent.truncate(indent.len() - 2);
+    writeln!(out, "{}}}  // end region {}", indent, region.id).unwrap();
+}
+
+/// Walk the region's nodes, union their `local_refs` by name, and
+/// return a deterministically-ordered list for emission. `SmemPlain`
+/// widens to `SmemRing` (and the same for mbarriers) when both forms
+/// appear under the same identifier in one region — the ring is a
+/// superset, plain loads decay into slot 0.
+fn collect_locals(region: &Region) -> Vec<(&'static str, LocalKind)> {
+    let mut map: BTreeMap<&'static str, LocalKind> = BTreeMap::new();
+    for n in &region.nodes {
+        for lr in local_refs(n.op.tag) {
+            map.entry(lr.name)
+                .and_modify(|e| *e = e.widen(lr.kind))
+                .or_insert(lr.kind);
+        }
+    }
+    // Group by kind (smem → frag → mbarrier → float) for readable
+    // emission, then by name for determinism across compiler runs.
+    let mut v: Vec<(&'static str, LocalKind)> = map.into_iter().collect();
+    v.sort_by_key(|(name, kind)| (local_kind_order(*kind), *name));
+    v
+}
+
+fn local_kind_order(k: LocalKind) -> u8 {
+    match k {
+        LocalKind::SmemPlain | LocalKind::SmemRing => 0,
+        LocalKind::Frag | LocalKind::FragQkv => 1,
+        LocalKind::MbarrierPlain | LocalKind::MbarrierRing => 2,
+        LocalKind::FloatInit(_) => 3,
+    }
+}
+
+fn write_region_locals(out: &mut String, indent: &str, locals: &[(&'static str, LocalKind)]) {
+    if locals.is_empty() {
+        return;
+    }
+    writeln!(out, "{}// region-local declarations", indent).unwrap();
+    for (name, kind) in locals {
+        writeln!(out, "{}{}", indent, kind.decl(name)).unwrap();
     }
 }
 
@@ -748,5 +805,108 @@ mod tests {
             Err(EmitError::UnknownRegionInControl(42)) => {}
             other => panic!("expected UnknownRegionInControl(42), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn each_region_gets_its_own_scope_block_with_locals() {
+        // Two attention regions in one megakernel — each region opens
+        // its own `{}` scope that declares its fragments + smem +
+        // mbarriers + float accumulators. Previously these were file-
+        // scope statics in the prelude and both regions stomped on
+        // the same S_frag / O_frag / m / l.
+        let mk = two_region_mega();
+        let src = emit_megakernel(&mk, &sm90_fa2()).expect("emit succeeds");
+        // The scope open+close annotations appear for each region.
+        assert!(src.contains("// end region 0"));
+        assert!(src.contains("// end region 1"));
+        // FA2 fragment declarations appear inside each region block
+        // (not at file scope).
+        assert_eq!(src.matches("StencilFrag S_frag;").count(), 2);
+        assert_eq!(src.matches("StencilFrag O_frag;").count(), 2);
+        // Float accumulators with their initializers, one set per
+        // region.
+        assert_eq!(src.matches("float m = -INFINITY;").count(), 2);
+        assert_eq!(src.matches("float l = 0.0f;").count(), 2);
+        // Smem staging buffers / rings declared region-locally.
+        assert!(src.contains("__shared__ StencilFrag smem_q;"));
+        assert!(src.contains("__shared__ StencilFrag smem_k[PIPE];"));
+        assert!(src.contains("__shared__ StencilFrag smem_v[PIPE];"));
+        assert!(src.contains("__shared__ StencilFrag smem_o;"));
+        // Mbarriers for the kv pipeline ring and the o handshake.
+        assert!(src.contains("__shared__ Mbarrier bar_kv[PIPE];"));
+        assert!(src.contains("__shared__ Mbarrier bar_kv_consumed[PIPE];"));
+        assert!(src.contains("__shared__ Mbarrier bar_o_ready;"));
+    }
+
+    #[test]
+    fn smem_plain_widens_to_ring_when_compute_indexes_slot() {
+        // qkv_rope has `load_x_row` (SmemPlain) and `qkv_matmul`
+        // (SmemRing via generic_gemm's `smem_x[slot]`). The union
+        // must promote to the ring form so the `[slot]` indexing
+        // parses; collect_locals' widening rule is the single place
+        // that enforces this.
+        use crate::template::{QkvRopeParams, qkv_rope_region};
+        let mut r = qkv_rope_region(&QkvRopeParams {
+            hidden_dim: 4096,
+            head_dim: 128,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            token_tile: 64,
+            k_tile: 32,
+            pipe: 3,
+            writes_kv_cache: false,
+        });
+        r.id = 0;
+        let mk = Megakernel {
+            regions: vec![r],
+            control: vec![],
+        };
+        let src = emit_megakernel(&mk, &sm90_fa2()).unwrap();
+        // Promoted to ring (not plain) because qkv_matmul indexes slot.
+        assert!(src.contains("__shared__ StencilFrag smem_x[PIPE];"));
+        // QKV trifecta keeps its compound shape.
+        assert!(src.contains("struct { StencilFrag q, k, v; } QKV_frag;"));
+    }
+
+    #[test]
+    fn disjoint_gemm_regions_declare_independent_locals() {
+        // Two distinct GEMM regions composed into one megakernel —
+        // each must declare its own C_frag / smem_a / smem_b.
+        // Previously the file-scope placeholder made them share one
+        // accumulator across regions.
+        use crate::template::{GemmParams, gemm_region};
+        let params = GemmParams {
+            m_tile: 128,
+            n_tile: 128,
+            k_tile: 32,
+            pipe: 3,
+        };
+        let mut r0 = gemm_region(&params);
+        r0.id = 0;
+        let mut r1 = gemm_region(&params);
+        r1.id = 1;
+        let mk = Megakernel {
+            regions: vec![r0, r1],
+            control: vec![ControlEdge {
+                src: 0,
+                dst: 1,
+                kind: DepKind::Barrier,
+            }],
+        };
+        let src = emit_megakernel(&mk, &sm90_fa2()).unwrap();
+        // One C_frag per region — not one for the whole kernel.
+        assert_eq!(src.matches("StencilFrag C_frag;").count(), 2);
+        assert_eq!(
+            src.matches("__shared__ StencilFrag smem_a[PIPE];").count(),
+            2
+        );
+        assert_eq!(
+            src.matches("__shared__ StencilFrag smem_b[PIPE];").count(),
+            2
+        );
+        assert_eq!(
+            src.matches("__shared__ Mbarrier bar_C_gmem_ready;").count(),
+            2
+        );
     }
 }

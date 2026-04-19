@@ -517,7 +517,14 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             let hints = lower_to_stencil::LowerHints::from_model_bounds(&model.bounds);
             let report =
                 lower_to_stencil::lower_assignment_partial(&model_fuf, first, &library, &hints);
-            let arch = if target_profile.compute_capability >= 90 {
+            // Always run the megakernel emitter against the SM90 ArchMap
+            // so we see the megakernel shape for every real-model FUF,
+            // regardless of the active target arch. This is what
+            // validates the end-to-end pipeline (FUF → Megakernel →
+            // scheduled + emitted megakernel source). SM89 and earlier
+            // still land on the existing per-op codegen for runtime.
+            let sm90 = ferrite_stencil::sm90_fa2();
+            let arch_sched = if target_profile.compute_capability >= 90 {
                 ferrite_stencil::sm90_fa2()
             } else {
                 ferrite_stencil::sm89_fa2()
@@ -525,7 +532,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             let mut scheduled = 0usize;
             let mut schedule_err: Option<String> = None;
             for region in &report.mk.regions {
-                match ferrite_stencil::schedule_wavefront(region, &arch) {
+                match ferrite_stencil::schedule_wavefront(region, &arch_sched) {
                     Ok(_) => scheduled += 1,
                     Err(e) => {
                         schedule_err = Some(format!("{}: {:?}", region.name, e));
@@ -533,15 +540,36 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                     }
                 }
             }
+            let mega_status = match ferrite_stencil::emit_megakernel(&report.mk, &sm90) {
+                Ok(src) => {
+                    // Dump to a per-variant path for hand inspection.
+                    // Keep under /tmp so we don't pollute the workspace.
+                    let dir = "/tmp/ferrite-stencil";
+                    let path = format!("{}/{}-sm90.cu", dir, model.source_stem);
+                    let _ = std::fs::create_dir_all(dir);
+                    let write_note = match std::fs::write(&path, &src) {
+                        Ok(()) => format!(" · {path}"),
+                        Err(e) => format!(" · write_err={e}"),
+                    };
+                    format!(
+                        "mega {lines}L/{edges}e{note}",
+                        lines = src.lines().count(),
+                        edges = report.mk.control.len(),
+                        note = write_note,
+                    )
+                }
+                Err(e) => format!("mega emit_err={e:?}"),
+            };
             eprintln!(
-                "  ferrite stencil · {variant:<30} · {scheduled}/{total} regions scheduled \
-                 on {arch} · h={head_dim} g={groups} · {skipped} subgraphs skipped{err}",
+                "  ferrite stencil · {variant:<30} · {scheduled}/{total} regions on {arch} · \
+                 h={head_dim} g={groups} · {skipped} skipped · {mega}{err}",
                 variant = model.source_stem,
                 total = report.mk.regions.len(),
-                arch = arch.name,
+                arch = arch_sched.name,
                 head_dim = hints.head_dim,
                 groups = hints.num_head_groups,
                 skipped = report.skipped.len(),
+                mega = mega_status,
                 err = match &schedule_err {
                     Some(s) => format!(" · err={s}"),
                     None => String::new(),

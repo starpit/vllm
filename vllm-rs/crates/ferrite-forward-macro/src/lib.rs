@@ -35,6 +35,7 @@ mod cost;
 mod emit;
 mod fuf;
 mod impl_lib;
+mod lower_to_stencil;
 mod parse;
 mod quantization;
 mod schedule;

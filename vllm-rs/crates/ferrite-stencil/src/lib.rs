@@ -11,6 +11,7 @@
 pub mod arch;
 pub mod ir;
 pub mod print;
+pub mod schedule;
 pub mod template;
 
 pub use arch::{ArchMap, BarrierPrim, HardwareUnit, sm89_fa2, sm90_fa2};
@@ -19,4 +20,5 @@ pub use ir::{
     Edge, FufOpRef, LoadAddr, Megakernel, Node, NodeId, Predicate, Region, RegionId, Role,
     ScalarBinding, ScalarId, SmemLookup, StrideExpr,
 };
+pub use schedule::{AxisKind, classify_axes, region_pipeline_depth, topo_order_within_iter};
 pub use template::{AttnParams, PagedDecodeParams, Window, attn_region, attn_region_paged_decode};

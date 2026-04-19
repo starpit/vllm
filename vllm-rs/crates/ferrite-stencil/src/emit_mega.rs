@@ -769,7 +769,7 @@ mod tests {
 
         // Per-region body is real: load_q expansion from emit_ops,
         // pipeline-source K/V slot rotation, mbarrier on raw edges.
-        assert!(src.contains("tma_load_2d(smem_q, Q_gmem"));
+        assert!(src.contains("tma_load_2d<SMEM_Q_BYTES>(smem_q, Q_gmem"));
         assert!(src.contains("uint32_t slot = (kv_tile + 3) % 3;"));
 
         // Region 0 is Infinite so it has no `window_in_tiles` scalar;
@@ -948,7 +948,7 @@ mod tests {
         assert!(src.contains("region 1 (fa2_prefill)"));
         assert!(src.contains("gbar_sync(&gbar_counter);"));
         // SM89 per-region intrinsics: cp.async instead of TMA.
-        assert!(src.contains("cp_async_128(smem_q, Q_gmem"));
+        assert!(src.contains("cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem"));
     }
 
     #[test]

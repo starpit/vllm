@@ -299,21 +299,21 @@ mod tests {
         assert!(src.contains("for (uint32_t kv_tile = 0;"));
         // Preamble now expands load_q_tile into a TMA + mbarrier
         // arrive guarded on the loader warpgroup (see emit_ops).
-        assert!(src.contains("tma_load_2d(smem_q, Q_gmem"));
+        assert!(src.contains("tma_load_2d<SMEM_Q_BYTES>(smem_q, Q_gmem"));
         assert!(src.contains("if (wg == LOADER_WG)"));
         // Pipeline-source loads expand into ring-buffer slot rotation
         // and per-slot mbarrier arrives.
         assert!(src.contains("uint32_t slot = (kv_tile + 3) % 3;"));
-        assert!(src.contains("tma_load_2d(smem_k[slot], K_gmem"));
-        assert!(src.contains("tma_load_2d(smem_v[slot], V_gmem"));
+        assert!(src.contains("tma_load_2d<SMEM_K_BYTES>(smem_k[slot], K_gmem"));
+        assert!(src.contains("tma_load_2d<SMEM_V_BYTES>(smem_v[slot], V_gmem"));
         assert!(src.contains("mbarrier_arrive(&bar_kv[slot]);"));
         // Barriers: pipeline edges → NamedSem, raw edges → Mbarrier.
         assert!(src.contains("sem_wait(\"kv_arrived\", depth=3);"));
         assert!(src.contains("mbarrier_wait();"));
         // Epilogue store expands to staged TMA (consumer normalizes,
         // storer does the TMA).
-        assert!(src.contains("stmatrix_smem(smem_o, O_frag)"));
-        assert!(src.contains("tma_store_2d(O_gmem, smem_o"));
+        assert!(src.contains("stmatrix_smem<SMEM_O_BYTES>(smem_o, O_frag)"));
+        assert!(src.contains("tma_store_2d<SMEM_O_BYTES>(O_gmem, smem_o"));
     }
 
     #[test]
@@ -331,9 +331,9 @@ mod tests {
         // Same structural bones regardless of arch.
         assert!(src.contains("for (uint32_t kv_tile = 0;"));
         // SM89 load_q_tile expands to cp.async.
-        assert!(src.contains("cp_async_128(smem_q, Q_gmem"));
+        assert!(src.contains("cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem"));
         // store_o_tile on SM89 is a direct STG.
-        assert!(src.contains("stg_128(O_gmem, O_frag"));
+        assert!(src.contains("stg_128<SMEM_O_BYTES>(O_gmem, O_frag"));
     }
 
     #[test]

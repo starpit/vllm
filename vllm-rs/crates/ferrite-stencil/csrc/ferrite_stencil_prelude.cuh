@@ -87,17 +87,23 @@ __device__ static StencilFrag operator-(const StencilFrag& x, const StencilFrag&
 // `C_frag`, `smem_a`, `bar_kv`, etc.).
 
 // ─── Load helpers ────────────────────────────────────────────────
-// Data-movement bodies (tma_load_2d / tma_store_2d / cp_async_128)
-// still trap — their real PTX needs a byte count + stride walked
-// from the emitter, which the current variadic signature doesn't
-// carry. Item 1 second-wave commit wires those through. The
-// commit/wait fences below don't need extra info and land now.
+// Data-movement bodies still trap — the real PTX lands in the next
+// commit. What this commit does is fix the *shape*: each helper now
+// takes a non-type template parameter `BYTES` giving the tile size
+// in bytes, so the emitted call sites can say
+// `cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem, row, col)` — same byte
+// constant the region-scope smem decl uses (`bf16 smem_q[SMEM_Q_BYTES
+// / 2]`). When BYTES is 0 the trap body is unchanged (embed-row /
+// cache-store sites pass bare for now — they have no region-scope
+// smem local to name). The real cp.async / TMA / stg PTX that follows
+// inspects BYTES at compile time to decide the per-thread offset /
+// vector width.
 
-template <class... A> __device__ inline void tma_load_2d(A&&...) { __trap(); }
-template <class... A> __device__ inline void tma_store_2d(A&&...) { __trap(); }
-template <class... A> __device__ inline void cp_async_128(A&&...) { __trap(); }
-template <class... A> __device__ inline void generic_load(A&&...) { __trap(); }
-template <class... A> __device__ inline void generic_store(A&&...) { __trap(); }
+template <uint32_t BYTES = 0, class... A> __device__ inline void tma_load_2d(A&&...) { __trap(); }
+template <uint32_t BYTES = 0, class... A> __device__ inline void tma_store_2d(A&&...) { __trap(); }
+template <uint32_t BYTES = 0, class... A> __device__ inline void cp_async_128(A&&...) { __trap(); }
+template <uint32_t BYTES = 0, class... A> __device__ inline void generic_load(A&&...) { __trap(); }
+template <uint32_t BYTES = 0, class... A> __device__ inline void generic_store(A&&...) { __trap(); }
 
 /// cp.async.commit_group — closes the current set of in-flight
 /// `cp.async` requests into a group that `cp.async.wait_group` can
@@ -211,8 +217,8 @@ __device__ inline void wgmma_commit_group() {
 
 template <class... A> __device__ inline void mma_sync_accumulate(A&&...) { __trap(); }
 template <class... A> __device__ inline void mma_accumulate(A&&...) { __trap(); }
-template <class... A> __device__ inline void stmatrix_smem(A&&...) { __trap(); }
-template <class... A> __device__ inline void stg_128(A&&...) { __trap(); }
+template <uint32_t BYTES = 0, class... A> __device__ inline void stmatrix_smem(A&&...) { __trap(); }
+template <uint32_t BYTES = 0, class... A> __device__ inline void stg_128(A&&...) { __trap(); }
 
 // ─── Softmax / elementwise primitives ───────────────────────────
 // UNIMPLEMENTED: warp-shuffle reductions, exp2 fragment passes.

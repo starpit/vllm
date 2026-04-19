@@ -838,20 +838,36 @@ fn load_q_tile(ctx: &ExpandCtx<'_>) -> String {
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
     writeln!(s, "  // load_q_tile: {}[{}, {}, :, :] → smem", q, row, col).unwrap();
+    let q_bytes = bytes_symbol("smem_q");
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
-            writeln!(s, "    tma_load_2d(smem_q, {}, {}, {});", q, row, col).unwrap();
+            writeln!(
+                s,
+                "    tma_load_2d<{}>(smem_q, {}, {}, {});",
+                q_bytes, q, row, col
+            )
+            .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_q);").unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
-            writeln!(s, "  cp_async_128(smem_q, {}, {}, {});", q, row, col).unwrap();
+            writeln!(
+                s,
+                "  cp_async_128<{}>(smem_q, {}, {}, {});",
+                q_bytes, q, row, col
+            )
+            .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
         }
         other => {
             writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
-            writeln!(s, "  generic_load(smem_q, {}, {}, {});", q, row, col).unwrap();
+            writeln!(
+                s,
+                "  generic_load<{}>(smem_q, {}, {}, {});",
+                q_bytes, q, row, col
+            )
+            .unwrap();
         }
     }
     // Suppress "unused" for iter_offset / pipeline_depth; both matter
@@ -894,13 +910,14 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
         ser, ctx.iter_offset, p
     )
     .unwrap();
+    let buf_bytes = bytes_symbol(&buf);
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
             writeln!(
                 s,
-                "    tma_load_2d({}[slot], {}, {} + {}, {});",
-                buf, gmem, ser, ctx.iter_offset, col,
+                "    tma_load_2d<{}>({}[slot], {}, {} + {}, {});",
+                buf_bytes, buf, gmem, ser, ctx.iter_offset, col,
             )
             .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_kv[slot]);").unwrap();
@@ -909,8 +926,8 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
         "sm89_fa2" => {
             writeln!(
                 s,
-                "  cp_async_128({}[slot], {}, {} + {}, {});",
-                buf, gmem, ser, ctx.iter_offset, col,
+                "  cp_async_128<{}>({}[slot], {}, {} + {}, {});",
+                buf_bytes, buf, gmem, ser, ctx.iter_offset, col,
             )
             .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
@@ -919,8 +936,8 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
             writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
             writeln!(
                 s,
-                "  generic_load({}[slot], {}, {} + {}, {});",
-                buf, gmem, ser, ctx.iter_offset, col,
+                "  generic_load<{}>({}[slot], {}, {} + {}, {});",
+                buf_bytes, buf, gmem, ser, ctx.iter_offset, col,
             )
             .unwrap();
         }
@@ -1051,20 +1068,31 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
     writeln!(s, "  // store_o_tile: {}[{}, {}] ← O_frag / l", o, row, col).unwrap();
+    let o_bytes = bytes_symbol("smem_o");
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == CONSUMER_WG) {{").unwrap();
             writeln!(s, "    O_frag = O_frag * rcp(l);").unwrap();
-            writeln!(s, "    stmatrix_smem(smem_o, O_frag);").unwrap();
+            writeln!(s, "    stmatrix_smem<{}>(smem_o, O_frag);", o_bytes).unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_o_ready);").unwrap();
             writeln!(s, "  }} else if (wg == STORER_WG) {{").unwrap();
             writeln!(s, "    mbarrier_wait(&bar_o_ready);").unwrap();
-            writeln!(s, "    tma_store_2d({}, smem_o, {}, {});", o, row, col).unwrap();
+            writeln!(
+                s,
+                "    tma_store_2d<{}>({}, smem_o, {}, {});",
+                o_bytes, o, row, col
+            )
+            .unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
             writeln!(s, "  O_frag = O_frag * rcp(l);").unwrap();
-            writeln!(s, "  stg_128({}, O_frag, {}, {});", o, row, col).unwrap();
+            writeln!(
+                s,
+                "  stg_128<{}>({}, O_frag, {}, {});",
+                o_bytes, o, row, col
+            )
+            .unwrap();
         }
         other => {
             writeln!(
@@ -1073,7 +1101,12 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
                 other
             )
             .unwrap();
-            writeln!(s, "  generic_store({}, O_frag, l, {}, {});", o, row, col).unwrap();
+            writeln!(
+                s,
+                "  generic_store<{}>({}, O_frag, l, {}, {});",
+                o_bytes, o, row, col
+            )
+            .unwrap();
         }
     }
     let _ = ctx.pipeline_depth;
@@ -1117,13 +1150,14 @@ fn generic_pipeline_load(
         row_axis, ctx.iter_offset, p
     )
     .unwrap();
+    let smem_bytes = bytes_symbol(smem);
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
             writeln!(
                 s,
-                "    tma_load_2d({}[slot], {}, {} + {}, {});",
-                smem, gmem, row_axis, ctx.iter_offset, col_axis,
+                "    tma_load_2d<{}>({}[slot], {}, {} + {}, {});",
+                smem_bytes, smem, gmem, row_axis, ctx.iter_offset, col_axis,
             )
             .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_{}[slot]);", smem).unwrap();
@@ -1132,8 +1166,8 @@ fn generic_pipeline_load(
         "sm89_fa2" => {
             writeln!(
                 s,
-                "  cp_async_128({}[slot], {}, {} + {}, {});",
-                smem, gmem, row_axis, ctx.iter_offset, col_axis,
+                "  cp_async_128<{}>({}[slot], {}, {} + {}, {});",
+                smem_bytes, smem, gmem, row_axis, ctx.iter_offset, col_axis,
             )
             .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
@@ -1142,8 +1176,8 @@ fn generic_pipeline_load(
             writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
             writeln!(
                 s,
-                "  generic_load({}[slot], {}, {} + {}, {});",
-                smem, gmem, row_axis, ctx.iter_offset, col_axis,
+                "  generic_load<{}>({}[slot], {}, {} + {}, {});",
+                smem_bytes, smem, gmem, row_axis, ctx.iter_offset, col_axis,
             )
             .unwrap();
         }
@@ -1159,15 +1193,26 @@ fn generic_preamble_load(ctx: &ExpandCtx<'_>, smem: &str, gmem: &str, axis: &str
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
     writeln!(s, "  // {}: {}[{}] → {}", gmem, gmem, axis, smem).unwrap();
+    let smem_bytes = bytes_symbol(smem);
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
-            writeln!(s, "    tma_load_2d({}, {}, {});", smem, gmem, axis).unwrap();
+            writeln!(
+                s,
+                "    tma_load_2d<{}>({}, {}, {});",
+                smem_bytes, smem, gmem, axis
+            )
+            .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_{});", smem).unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
-            writeln!(s, "  cp_async_128({}, {}, {});", smem, gmem, axis).unwrap();
+            writeln!(
+                s,
+                "  cp_async_128<{}>({}, {}, {});",
+                smem_bytes, smem, gmem, axis
+            )
+            .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
         }
         other => {
@@ -1240,20 +1285,21 @@ fn generic_store(
         gmem_canonical, gmem, row_axis, col_axis, frag
     )
     .unwrap();
+    let out_bytes = bytes_symbol("smem_out");
     match ctx.arch_name {
         "sm90_fa2" => {
             // Barrier name stays on the canonical so it matches
             // `local_refs`' `bar_<canonical>_ready` declaration — the
             // identity drives the data address only.
             writeln!(s, "  if (wg == CONSUMER_WG) {{").unwrap();
-            writeln!(s, "    stmatrix_smem(smem_out, {});", frag).unwrap();
+            writeln!(s, "    stmatrix_smem<{}>(smem_out, {});", out_bytes, frag).unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_{}_ready);", gmem_canonical).unwrap();
             writeln!(s, "  }} else if (wg == STORER_WG) {{").unwrap();
             writeln!(s, "    mbarrier_wait(&bar_{}_ready);", gmem_canonical).unwrap();
             writeln!(
                 s,
-                "    tma_store_2d({}, smem_out, {}, {});",
-                gmem, row_axis, col_axis,
+                "    tma_store_2d<{}>({}, smem_out, {}, {});",
+                out_bytes, gmem, row_axis, col_axis,
             )
             .unwrap();
             writeln!(s, "  }}").unwrap();
@@ -1261,8 +1307,8 @@ fn generic_store(
         "sm89_fa2" => {
             writeln!(
                 s,
-                "  stg_128({}, {}, {}, {});",
-                gmem, frag, row_axis, col_axis,
+                "  stg_128<{}>({}, {}, {}, {});",
+                out_bytes, gmem, frag, row_axis, col_axis,
             )
             .unwrap();
         }
@@ -1436,7 +1482,7 @@ mod tests {
     #[test]
     fn load_q_tile_sm90_uses_tma_and_mbarrier_arrive() {
         let s = expand("load_q_tile", &ctx("sm90_fa2")).unwrap();
-        assert!(s.contains("tma_load_2d(smem_q, Q_gmem"));
+        assert!(s.contains("tma_load_2d<SMEM_Q_BYTES>(smem_q, Q_gmem"));
         assert!(s.contains("mbarrier_arrive(&bar_q)"));
         // Loader-wg guard is present.
         assert!(s.contains("if (wg == LOADER_WG)"));
@@ -1445,7 +1491,7 @@ mod tests {
     #[test]
     fn load_q_tile_sm89_uses_cp_async() {
         let s = expand("load_q_tile", &ctx("sm89_fa2")).unwrap();
-        assert!(s.contains("cp_async_128(smem_q, Q_gmem"));
+        assert!(s.contains("cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem"));
         assert!(s.contains("cp_async_commit_group"));
         // No warpgroup guard on SM89 (AllWarps).
         assert!(!s.contains("LOADER_WG"));
@@ -1466,19 +1512,19 @@ mod tests {
     fn load_kv_tile_sm90_rotates_slot_and_arrives_on_bar_kv() {
         let k = expand("load_k_tile", &pipe_ctx("sm90_fa2")).unwrap();
         assert!(k.contains("uint32_t slot = (kv_tile + 3) % 3;"));
-        assert!(k.contains("tma_load_2d(smem_k[slot], K_gmem, kv_tile + 3"));
+        assert!(k.contains("tma_load_2d<SMEM_K_BYTES>(smem_k[slot], K_gmem, kv_tile + 3"));
         assert!(k.contains("mbarrier_arrive(&bar_kv[slot]);"));
         assert!(k.contains("if (wg == LOADER_WG)"));
 
         let v = expand("load_v_tile", &pipe_ctx("sm90_fa2")).unwrap();
-        assert!(v.contains("tma_load_2d(smem_v[slot], V_gmem"));
+        assert!(v.contains("tma_load_2d<SMEM_V_BYTES>(smem_v[slot], V_gmem"));
     }
 
     #[test]
     fn load_kv_tile_sm89_uses_cp_async_into_ring_slot() {
         let k = expand("load_k_tile", &pipe_ctx("sm89_fa2")).unwrap();
         assert!(k.contains("uint32_t slot = (kv_tile + 3) % 3;"));
-        assert!(k.contains("cp_async_128(smem_k[slot], K_gmem, kv_tile + 3"));
+        assert!(k.contains("cp_async_128<SMEM_K_BYTES>(smem_k[slot], K_gmem, kv_tile + 3"));
         assert!(k.contains("cp_async_commit_group"));
         assert!(!k.contains("LOADER_WG"));
     }
@@ -1535,17 +1581,17 @@ mod tests {
         let s = expand("store_o_tile", &ctx("sm90_fa2")).unwrap();
         assert!(s.contains("if (wg == CONSUMER_WG)"));
         assert!(s.contains("O_frag = O_frag * rcp(l)"));
-        assert!(s.contains("stmatrix_smem(smem_o, O_frag)"));
+        assert!(s.contains("stmatrix_smem<SMEM_O_BYTES>(smem_o, O_frag)"));
         assert!(s.contains("mbarrier_arrive(&bar_o_ready)"));
         assert!(s.contains("} else if (wg == STORER_WG)"));
-        assert!(s.contains("tma_store_2d(O_gmem, smem_o, q_tile, head_group)"));
+        assert!(s.contains("tma_store_2d<SMEM_O_BYTES>(O_gmem, smem_o, q_tile, head_group)"));
     }
 
     #[test]
     fn store_o_sm89_uses_direct_stg() {
         let s = expand("store_o_tile", &ctx("sm89_fa2")).unwrap();
         assert!(s.contains("O_frag = O_frag * rcp(l)"));
-        assert!(s.contains("stg_128(O_gmem, O_frag, q_tile, head_group)"));
+        assert!(s.contains("stg_128<SMEM_O_BYTES>(O_gmem, O_frag, q_tile, head_group)"));
         assert!(!s.contains("STORER_WG"));
     }
 
@@ -1581,13 +1627,13 @@ mod tests {
     fn load_a_tile_sm89_uses_cp_async_into_slot() {
         let s = expand("load_a_tile", &pipe_ctx_nonzero("sm89_fa2")).unwrap();
         assert!(s.contains("uint32_t slot = (m_tile + 3) % 3;"));
-        assert!(s.contains("cp_async_128(smem_a[slot], A_gmem"));
+        assert!(s.contains("cp_async_128<SMEM_A_BYTES>(smem_a[slot], A_gmem"));
     }
 
     #[test]
     fn store_c_tile_sm89_uses_stg() {
         let s = expand("store_c_tile", &ctx("sm89_fa2")).unwrap();
-        assert!(s.contains("stg_128(C_gmem, C_frag, m_tile, n_tile)"));
+        assert!(s.contains("stg_128<SMEM_OUT_BYTES>(C_gmem, C_frag, m_tile, n_tile)"));
     }
 
     #[test]
@@ -1788,8 +1834,8 @@ mod tests {
             gmem_bindings: &[],
         };
         let s = expand("load_q_tile", &ctx).unwrap();
-        assert!(s.contains("tma_load_2d(smem_q, Q_gmem, b, head_group)"));
-        assert!(!s.contains("tma_load_2d(smem_q, Q_gmem, q_tile"));
+        assert!(s.contains("tma_load_2d<SMEM_Q_BYTES>(smem_q, Q_gmem, b, head_group)"));
+        assert!(!s.contains("tma_load_2d<SMEM_Q_BYTES>(smem_q, Q_gmem, q_tile"));
     }
 
     #[test]
@@ -1803,7 +1849,7 @@ mod tests {
             gmem_bindings: &[],
         };
         let s = expand("store_o_tile", &ctx).unwrap();
-        assert!(s.contains("tma_store_2d(O_gmem, smem_o, b, head_group)"));
+        assert!(s.contains("tma_store_2d<SMEM_O_BYTES>(O_gmem, smem_o, b, head_group)"));
     }
 
     #[test]
@@ -1885,7 +1931,7 @@ mod tests {
             gmem_bindings: &[("Q_gmem", "t42_0")],
         };
         let s = expand("load_q_tile", &ctx).unwrap();
-        assert!(s.contains("tma_load_2d(smem_q, t42_0, q_tile, head_group)"));
+        assert!(s.contains("tma_load_2d<SMEM_Q_BYTES>(smem_q, t42_0, q_tile, head_group)"));
         assert!(!s.contains("Q_gmem"));
     }
 
@@ -1905,7 +1951,7 @@ mod tests {
         // Data address uses the identity; the mbarrier keeps the
         // canonical name so local_refs' `bar_C_gmem_ready`
         // declaration still resolves.
-        assert!(s.contains("tma_store_2d(layer_7_Wo_C, smem_out, m_tile, n_tile)"));
+        assert!(s.contains("tma_store_2d<SMEM_OUT_BYTES>(layer_7_Wo_C, smem_out, m_tile, n_tile)"));
         assert!(s.contains("bar_C_gmem_ready"));
         // C_gmem must not appear as the tma_store's data pointer.
         assert!(!s.contains("tma_store_2d(C_gmem"));

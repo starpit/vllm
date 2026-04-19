@@ -25,7 +25,7 @@ use std::fmt::Write;
 
 use crate::arch::{ArchMap, BarrierPrim, HardwareUnit};
 use crate::emit_ops::{ExpandCtx, GmemAccess, expand as expand_op, gmem_refs};
-use crate::ir::{Bound, DepKind, Megakernel, Region, RegionId, Role};
+use crate::ir::{Axis, Bound, DepKind, Megakernel, Region, RegionId, Role};
 use crate::wavefront::{Schedule, ScheduleError, Step, schedule_wavefront};
 
 #[derive(Debug)]
@@ -102,21 +102,38 @@ pub fn emit_megakernel(mega: &Megakernel, arch: &ArchMap) -> Result<String, Emit
 /// Kernel param summary: both signature emission and the host
 /// launcher consume this so they can't drift out of sync.
 struct ParamSet {
-    /// Deduped scalar (u32) param names, in declaration order.
-    scalars: Vec<&'static str>,
+    /// Deduped scalars. `indexed=true` means some region uses the
+    /// scalar via `Bound::IndexedScalar` — the param must be a
+    /// pointer type (one entry per index), not a plain `uint32_t`.
+    scalars: Vec<(&'static str, bool)>,
     /// Deduped gmem tensor params: (name, read-access-kind). Sorted by
     /// name for stable output across compiler runs.
     gmem: Vec<(&'static str, GmemAccess)>,
 }
 
 fn collect_params(mega: &Megakernel) -> ParamSet {
+    // First pass: identify which scalar names are consumed via
+    // `Bound::IndexedScalar` in any region. Those need pointer type.
+    let mut indexed: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    for r in &mega.regions {
+        for a in &r.domain.axes {
+            if let Bound::IndexedScalar(sid, _) = a.bound
+                && let Some(name) = r.entry_scalars.iter().find(|s| s.id == sid).map(|s| s.name)
+            {
+                indexed.insert(name);
+            }
+        }
+        // Also scan address terms / predicates — conservative for now.
+        let _ = |_: &Axis| (); // silence unused import warning path
+    }
+
     let mut scalar_seen: std::collections::BTreeSet<&'static str> =
         std::collections::BTreeSet::new();
-    let mut scalars: Vec<&'static str> = Vec::new();
+    let mut scalars: Vec<(&'static str, bool)> = Vec::new();
     for r in &mega.regions {
         for s in &r.entry_scalars {
             if scalar_seen.insert(s.name) {
-                scalars.push(s.name);
+                scalars.push((s.name, indexed.contains(s.name)));
             }
         }
     }
@@ -198,6 +215,18 @@ fn write_header(out: &mut String, mega: &Megakernel, arch: &ArchMap) {
         "// of Megakernel.control; inter-region edges lower to ArchMap::barrier."
     )
     .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "#include <cuda_runtime.h>").unwrap();
+    writeln!(out, "#include <cuda_bf16.h>").unwrap();
+    writeln!(out, "#include <cstdint>").unwrap();
+    writeln!(
+        out,
+        "// The helpers + ambient state below resolve through the stencil prelude:"
+    )
+    .unwrap();
+    writeln!(out, "#include \"ferrite_stencil_prelude.cuh\"").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "typedef __nv_bfloat16 bf16;").unwrap();
     // Global g.Bar counter used by inter-region Barrier edges. Host
     // zeros it once per launch. `gbar_sync(&gbar_counter)` arrives +
     // spin-waits for the cross-CTA fence (Megakernel-style — see
@@ -210,8 +239,13 @@ fn write_signature(out: &mut String, params: &ParamSet) {
     let total = params.scalars.len() + params.gmem.len();
     let comma = |i: usize| if i + 1 < total { "," } else { "" };
     let mut idx = 0usize;
-    for name in &params.scalars {
-        writeln!(out, "    uint32_t {}{}", name, comma(idx)).unwrap();
+    for (name, indexed) in &params.scalars {
+        let ty = if *indexed {
+            "const uint32_t* __restrict__"
+        } else {
+            "uint32_t"
+        };
+        writeln!(out, "    {} {}{}", ty, name, comma(idx)).unwrap();
         idx += 1;
     }
     for (name, access) in &params.gmem {
@@ -246,8 +280,13 @@ fn write_launcher(out: &mut String, params: &ParamSet) {
     let total = params.scalars.len() + params.gmem.len();
     let comma = |i: usize| if i + 1 < total { "," } else { "" };
     let mut idx = 0usize;
-    for name in &params.scalars {
-        writeln!(out, "    uint32_t {}{}", name, comma(idx)).unwrap();
+    for (name, indexed) in &params.scalars {
+        let ty = if *indexed {
+            "const uint32_t* __restrict__"
+        } else {
+            "uint32_t"
+        };
+        writeln!(out, "    {} {}{}", ty, name, comma(idx)).unwrap();
         idx += 1;
     }
     for (name, access) in &params.gmem {
@@ -286,7 +325,7 @@ fn write_launcher(out: &mut String, params: &ParamSet) {
     writeln!(out).unwrap();
     writeln!(out, "    mega_kernel<<<grid, block, 0, stream>>>(").unwrap();
     let mut idx = 0usize;
-    for name in &params.scalars {
+    for (name, _) in &params.scalars {
         writeln!(out, "        {}{}", name, comma(idx)).unwrap();
         idx += 1;
     }

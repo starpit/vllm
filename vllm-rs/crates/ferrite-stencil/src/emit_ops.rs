@@ -124,13 +124,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "load_x_row" => Some(generic_preamble_load(ctx, "smem_x", "X_gmem", "token_tile")),
         "load_weight" => Some(generic_preamble_load(ctx, "smem_w", "W_gmem", "token_tile")),
         "rmsnorm_compute" => Some(rmsnorm_compute(ctx)),
-        "store_y_row" => Some(generic_store(
-            ctx,
-            "Y_gmem",
-            "Y_frag",
-            "token_tile",
-            "/*hidden*/",
-        )),
+        "store_y_row" => Some(generic_store(ctx, "Y_gmem", "Y_frag", "token_tile", "0u")),
         "load_a_row" => Some(generic_preamble_load(ctx, "smem_a", "A_gmem", "token_tile")),
         "load_b_row" => Some(generic_preamble_load(ctx, "smem_b", "B_gmem", "token_tile")),
         "elementwise_add" => Some(elementwise_add(ctx)),
@@ -139,7 +133,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
             "Sum_gmem",
             "sum_frag",
             "token_tile",
-            "/*hidden*/",
+            "0u",
         )),
         // ── QKV + RoPE ──
         "load_wqkv_tile" => Some(generic_pipeline_load(
@@ -220,7 +214,7 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
             "Y_gmem",
             "Embed_frag",
             "token_tile",
-            "/*hidden*/",
+            "0u",
         )),
         _ => None,
     }
@@ -668,14 +662,14 @@ fn generic_cache_store(ctx: &ExpandCtx<'_>, gmem: &str, frag: &str) -> String {
             writeln!(s, "  if (wg == STORER_WG) {{").unwrap();
             writeln!(
                 s,
-                "    tma_store_2d({}[page, slot, head_tile], {});",
+                "    tma_store_2d({}, {}, page, slot, head_tile);",
                 gmem, frag,
             )
             .unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
-            writeln!(s, "  stg_128({}[page, slot, head_tile], {});", gmem, frag,).unwrap();
+            writeln!(s, "  stg_128({}, {}, page, slot, head_tile);", gmem, frag).unwrap();
         }
         _ => {}
     }

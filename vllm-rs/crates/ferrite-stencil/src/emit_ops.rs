@@ -33,6 +33,8 @@ pub struct ExpandCtx<'a> {
 pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
     match tag {
         "load_q_tile" => Some(load_q_tile(ctx)),
+        "load_k_tile" => Some(load_kv_tile(ctx, "k")),
+        "load_v_tile" => Some(load_kv_tile(ctx, "v")),
         _ => None,
     }
 }
@@ -69,6 +71,67 @@ fn load_q_tile(ctx: &ExpandCtx<'_>) -> String {
     s
 }
 
+/// Pipeline-source loads for K and V. Distinguished from `load_q_tile`
+/// by two things: (a) they run inside the serial loop, so the smem
+/// destination rotates through a `P`-deep ring (`slot = (kv_tile + P)
+/// % P`, where `P = pipeline_depth` and the `+P` matches the
+/// `iter_offset` the scheduler stamped on the step); (b) they arrive
+/// on a per-slot mbarrier / cp.async group so the consumer at iter
+/// `kv_tile` can wait on its corresponding slot.
+fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
+    debug_assert!(ctx.iter_offset > 0, "pipeline-source load must be +P");
+    let p = ctx.pipeline_depth;
+    let buf = format!("smem_{}", which);
+    let gmem = format!("{}_gmem", which.to_uppercase());
+    let mut s = String::new();
+    writeln!(s, "{{").unwrap();
+    writeln!(
+        s,
+        "  // load_{}_tile: {}[kv_tile + {}, head_group, :, :] → {}[slot]",
+        which, gmem, ctx.iter_offset, buf,
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  uint32_t slot = (kv_tile + {}) % {};",
+        ctx.iter_offset, p
+    )
+    .unwrap();
+    match ctx.arch_name {
+        "sm90_fa2" => {
+            writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
+            writeln!(
+                s,
+                "    tma_load_2d({}[slot], {}, kv_tile + {}, head_group);",
+                buf, gmem, ctx.iter_offset,
+            )
+            .unwrap();
+            writeln!(s, "    mbarrier_arrive(&bar_kv[slot]);").unwrap();
+            writeln!(s, "  }}").unwrap();
+        }
+        "sm89_fa2" => {
+            writeln!(
+                s,
+                "  cp_async_128({}[slot], {}, kv_tile + {}, head_group);",
+                buf, gmem, ctx.iter_offset,
+            )
+            .unwrap();
+            writeln!(s, "  cp_async_commit_group();").unwrap();
+        }
+        other => {
+            writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
+            writeln!(
+                s,
+                "  generic_load({}[slot], {}, kv_tile + {}, head_group);",
+                buf, gmem, ctx.iter_offset,
+            )
+            .unwrap();
+        }
+    }
+    write!(s, "}}").unwrap();
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +160,35 @@ mod tests {
         assert!(s.contains("cp_async_commit_group"));
         // No warpgroup guard on SM89 (AllWarps).
         assert!(!s.contains("LOADER_WG"));
+    }
+
+    fn pipe_ctx(arch: &'static str) -> ExpandCtx<'static> {
+        ExpandCtx {
+            arch_name: arch,
+            iter_offset: 3,
+            pipeline_depth: 3,
+        }
+    }
+
+    #[test]
+    fn load_kv_tile_sm90_rotates_slot_and_arrives_on_bar_kv() {
+        let k = expand("load_k_tile", &pipe_ctx("sm90_fa2")).unwrap();
+        assert!(k.contains("uint32_t slot = (kv_tile + 3) % 3;"));
+        assert!(k.contains("tma_load_2d(smem_k[slot], K_gmem, kv_tile + 3"));
+        assert!(k.contains("mbarrier_arrive(&bar_kv[slot]);"));
+        assert!(k.contains("if (wg == LOADER_WG)"));
+
+        let v = expand("load_v_tile", &pipe_ctx("sm90_fa2")).unwrap();
+        assert!(v.contains("tma_load_2d(smem_v[slot], V_gmem"));
+    }
+
+    #[test]
+    fn load_kv_tile_sm89_uses_cp_async_into_ring_slot() {
+        let k = expand("load_k_tile", &pipe_ctx("sm89_fa2")).unwrap();
+        assert!(k.contains("uint32_t slot = (kv_tile + 3) % 3;"));
+        assert!(k.contains("cp_async_128(smem_k[slot], K_gmem, kv_tile + 3"));
+        assert!(k.contains("cp_async_commit_group"));
+        assert!(!k.contains("LOADER_WG"));
     }
 
     #[test]

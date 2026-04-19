@@ -257,9 +257,12 @@ mod tests {
         // arrive guarded on the loader warpgroup (see emit_ops).
         assert!(src.contains("tma_load_2d(smem_q, Q_gmem"));
         assert!(src.contains("if (wg == LOADER_WG)"));
-        // Pipeline-source loads tagged with +P.
-        assert!(src.contains("load_k_tile(/* iter + 3 */);"));
-        assert!(src.contains("load_v_tile(/* iter + 3 */);"));
+        // Pipeline-source loads expand into ring-buffer slot rotation
+        // and per-slot mbarrier arrives.
+        assert!(src.contains("uint32_t slot = (kv_tile + 3) % 3;"));
+        assert!(src.contains("tma_load_2d(smem_k[slot], K_gmem"));
+        assert!(src.contains("tma_load_2d(smem_v[slot], V_gmem"));
+        assert!(src.contains("mbarrier_arrive(&bar_kv[slot]);"));
         // Barriers: pipeline edges → NamedSem, raw edges → Mbarrier.
         assert!(src.contains("sem_wait(\"kv_arrived\", depth=3);"));
         assert!(src.contains("mbarrier_wait();"));

@@ -560,9 +560,20 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 }
                 Err(e) => format!("mega emit_err={e:?}"),
             };
+            // Summarize skipped-impl names (unique, sorted) so the
+            // next un-templated Impl is visible without grep.
+            let mut skipped_names: Vec<&'static str> =
+                report.skipped.iter().map(|(_, n)| *n).collect();
+            skipped_names.sort_unstable();
+            skipped_names.dedup();
+            let skipped_summary = if skipped_names.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", skipped_names.join(","))
+            };
             eprintln!(
                 "  ferrite stencil · {variant:<30} · {scheduled}/{total} regions on {arch} · \
-                 h={head_dim} g={groups} · {skipped} skipped · {mega}{err}",
+                 h={head_dim} g={groups} · {skipped} skipped{skipped_summary} · {mega}{err}",
                 variant = model.source_stem,
                 total = report.mk.regions.len(),
                 arch = arch_sched.name,

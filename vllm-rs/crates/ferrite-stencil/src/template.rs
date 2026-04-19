@@ -42,6 +42,9 @@ pub struct PagedDecodeParams {
     /// Page size in tokens; gather lookup resolves page-base addresses
     /// per `kv_tile / blocks_per_tile`.
     pub tokens_per_page: u32,
+    /// `Window::Finite(W)` adds a sliding-window predicate; `Infinite`
+    /// emits none. Matches the same mechanism attn_region uses.
+    pub window: Window,
 }
 
 // Axis ids — fixed for the Attn template.
@@ -440,6 +443,34 @@ pub fn attn_region_paged_decode(p: &PagedDecodeParams) -> Region {
         },
     ];
 
+    // Sliding-window predicate — kv_tile ≤ window_in_tiles — mirrors
+    // the prefill attn_region's finite-window handling (design §4.2).
+    // For `Window::Infinite` we emit nothing; const-prop at the
+    // lowering layer would drop it anyway.
+    let mut predicates: Vec<Predicate> = Vec::new();
+    let mut entry_scalars = vec![
+        ScalarBinding {
+            id: NUM_BATCHES,
+            name: "num_batches",
+        },
+        ScalarBinding {
+            id: NUM_KV_TILES_PER_B,
+            name: "num_kv_tiles_per_b",
+        },
+    ];
+    if let Window::Finite(_) = p.window {
+        const WINDOW_TILES_DECODE: ScalarId = 2;
+        predicates.push(Predicate {
+            coeffs: smallvec![(KV_TILE, 1)],
+            offset: AffineOffset::RegionEntry(WINDOW_TILES_DECODE),
+            op: CmpOp::Le,
+        });
+        entry_scalars.push(ScalarBinding {
+            id: WINDOW_TILES_DECODE,
+            name: "window_in_tiles",
+        });
+    }
+
     Region {
         id: 1,
         name: "paged_decode",
@@ -462,20 +493,9 @@ pub fn attn_region_paged_decode(p: &PagedDecodeParams) -> Region {
                     bound: Bound::Const(p.num_head_groups),
                 },
             ],
-            // Indexed-scalar bound carries per-sequence length; no
-            // extra predicate needed here. Causal is trivial at M=1.
-            predicates: vec![],
+            predicates,
         },
-        entry_scalars: vec![
-            ScalarBinding {
-                id: NUM_BATCHES,
-                name: "num_batches",
-            },
-            ScalarBinding {
-                id: NUM_KV_TILES_PER_B,
-                name: "num_kv_tiles_per_b",
-            },
-        ],
+        entry_scalars,
         nodes,
         edges,
     }
@@ -839,6 +859,94 @@ pub fn residual_add_region(p: &ResidualAddParams) -> Region {
     Region {
         id: 0,
         name: "residual_add",
+        domain: Domain {
+            axes: vec![Axis {
+                id: TOKEN,
+                name: "token_tile",
+                bound: Bound::RegionEntryScalar(NUM_TOKEN_TILES),
+            }],
+            predicates: vec![],
+        },
+        entry_scalars: vec![ScalarBinding {
+            id: NUM_TOKEN_TILES,
+            name: "num_token_tiles",
+        }],
+        nodes,
+        edges,
+    }
+}
+
+// ─── Unary in-place element-wise ──────────────────────────────
+//
+// Smallest possible region: one Load, one Compute, one Store; a
+// single parallel axis over token tiles. Parameterized on the
+// compute-op tag so a single template serves scalar_mul_inplace,
+// tanh_softcap_inplace, and other tag-only variants of the same
+// shape. The activation-vs-multiply choice lives at emit_ops, not
+// here.
+
+#[derive(Debug, Clone, Copy)]
+pub struct UnaryInplaceParams {
+    pub hidden_dim: u32,
+    pub token_tile: u32,
+    /// FUF op tag that identifies the compute. Flows into the
+    /// emitted node and picks its intrinsic expansion in emit_ops.
+    pub op_tag: &'static str,
+}
+
+pub fn unary_inplace_region(p: &UnaryInplaceParams) -> Region {
+    const TOKEN: AxisId = 0;
+    const NUM_TOKEN_TILES: ScalarId = 0;
+    const N_LOAD: NodeId = 0;
+    const N_COMPUTE: NodeId = 1;
+    const N_STORE: NodeId = 2;
+
+    let tile_stride = (p.hidden_dim as u64) * (p.token_tile as u64);
+    let row_addr = || LoadAddr {
+        terms: smallvec![AddrTerm::AxisStride {
+            axis: TOKEN,
+            stride: StrideExpr::Const(tile_stride),
+        }],
+    };
+
+    let nodes = vec![
+        Node {
+            id: N_LOAD,
+            role: Role::Load,
+            op: FufOpRef { tag: "load_x_row" },
+            addr: Some(row_addr()),
+        },
+        Node {
+            id: N_COMPUTE,
+            role: Role::Compute,
+            op: FufOpRef { tag: p.op_tag },
+            addr: None,
+        },
+        Node {
+            id: N_STORE,
+            role: Role::Store,
+            op: FufOpRef { tag: "store_y_row" },
+            addr: Some(row_addr()),
+        },
+    ];
+    let edges = vec![
+        Edge {
+            src: N_LOAD,
+            dst: N_COMPUTE,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        Edge {
+            src: N_COMPUTE,
+            dst: N_STORE,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+    ];
+
+    Region {
+        id: 0,
+        name: "unary_inplace",
         domain: Domain {
             axes: vec![Axis {
                 id: TOKEN,
@@ -1446,6 +1554,46 @@ mod new_template_tests {
         assert_eq!(sched.preamble.len(), 2, "load_x + load_weight");
         assert_eq!(sched.body.len(), 1, "rmsnorm_compute");
         assert_eq!(sched.epilogue.len(), 1, "store_y_row");
+    }
+
+    #[test]
+    fn unary_inplace_region_validates_and_carries_op_tag() {
+        let r = unary_inplace_region(&UnaryInplaceParams {
+            hidden_dim: 4096,
+            token_tile: 64,
+            op_tag: "scalar_mul",
+        });
+        ir::validate(&r).expect("unary_inplace validates");
+        assert_eq!(r.nodes.len(), 3);
+        // The parameterized op tag flows through to the Compute node.
+        assert_eq!(r.nodes[1].op.tag, "scalar_mul");
+        let sched = schedule_wavefront(&r, &sm89_fa2()).unwrap();
+        assert!(sched.serial_axis.is_none());
+        assert_eq!(sched.preamble.len(), 1);
+        assert_eq!(sched.body.len(), 1);
+        assert_eq!(sched.epilogue.len(), 1);
+    }
+
+    #[test]
+    fn paged_decode_with_finite_window_emits_predicate() {
+        let r = attn_region_paged_decode(&PagedDecodeParams {
+            head_dim: 128,
+            tile_k: 64,
+            num_head_groups: 8,
+            pipe: 3,
+            tokens_per_page: 256,
+            window: Window::Finite(4096),
+        });
+        ir::validate(&r).expect("sliding paged decode validates");
+        assert_eq!(
+            r.domain.predicates.len(),
+            1,
+            "sliding window adds one predicate"
+        );
+        assert!(
+            r.entry_scalars.iter().any(|s| s.name == "window_in_tiles"),
+            "window_in_tiles scalar present under Finite window"
+        );
     }
 
     #[test]

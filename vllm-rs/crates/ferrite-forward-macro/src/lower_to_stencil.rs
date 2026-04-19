@@ -27,9 +27,9 @@ use std::collections::{HashMap, HashSet};
 
 use ferrite_stencil::{
     AttnParams, ControlEdge, DepKind, GateUpSiluMulParams, GemmParams, Megakernel,
-    PagedDecodeParams, QkvRopeParams, Region, RegionId, ResidualAddParams, RmsNormParams, Window,
-    attn_region, attn_region_paged_decode, gate_up_silu_mul_region, gemm_region, qkv_rope_region,
-    residual_add_region, rmsnorm_region,
+    PagedDecodeParams, QkvRopeParams, Region, RegionId, ResidualAddParams, RmsNormParams,
+    UnaryInplaceParams, Window, attn_region, attn_region_paged_decode, gate_up_silu_mul_region,
+    gemm_region, qkv_rope_region, residual_add_region, rmsnorm_region, unary_inplace_region,
 };
 
 use crate::fuf::{Fuf, FufInput, TileId};
@@ -318,6 +318,15 @@ fn lower_impl(
             num_head_groups: hints.num_head_groups,
             pipe: hints.pipe,
             tokens_per_page: hints.tokens_per_page,
+            window: Window::Infinite,
+        })),
+        "sliding_attention_via_cache" => Ok(attn_region_paged_decode(&PagedDecodeParams {
+            head_dim: hints.head_dim,
+            tile_k: hints.tile_k,
+            num_head_groups: hints.num_head_groups,
+            pipe: hints.pipe,
+            tokens_per_page: hints.tokens_per_page,
+            window: Window::Finite(4096),
         })),
         "sliding_attention_prefill_contiguous" => Ok(attn_region(&AttnParams {
             window: Window::Finite(4096),
@@ -331,7 +340,7 @@ fn lower_impl(
         // All lower to the same gemm_region stencil; the difference is
         // the Load's addressing for quantized weights, which belongs in
         // emit_ops's per-tag expansion, not in the region template.
-        "fused_gemm_bias" | "cutlass_gemv" | "marlin_gemm" | "bnb4_gemm" => {
+        "fused_gemm_bias" | "gemm_ref" | "cutlass_gemv" | "marlin_gemm" | "bnb4_gemm" => {
             Ok(gemm_region(&GemmParams {
                 m_tile: hints.gemm_m_tile,
                 n_tile: hints.gemm_n_tile,
@@ -342,12 +351,14 @@ fn lower_impl(
         // ── RMSNorm (with and without a fused residual add) ──
         // The residual-add fuses in at the Compute node's expansion; the
         // stencil shape (1 parallel axis, straight-line) is identical.
-        "fused_add_rms_norm" | "fused_add_rms_norm_with_offset" | "scalar_offset_rms_norm" => {
-            Ok(rmsnorm_region(&RmsNormParams {
-                hidden_dim: hints.hidden_dim,
-                token_tile: hints.token_tile,
-            }))
-        }
+        "fused_add_rms_norm"
+        | "fused_add_rms_norm_with_offset"
+        | "scalar_offset_rms_norm"
+        | "rmsnorm_ref"
+        | "layer_norm_ref" => Ok(rmsnorm_region(&RmsNormParams {
+            hidden_dim: hints.hidden_dim,
+            token_tile: hints.token_tile,
+        })),
         // ── Element-wise add (standalone, not fused with a norm) ──
         "add_ref" => Ok(residual_add_region(&ResidualAddParams {
             hidden_dim: hints.hidden_dim,
@@ -416,6 +427,18 @@ fn lower_impl(
             inter_tile: hints.inter_tile,
             k_tile: hints.gemm_k_tile,
             pipe: hints.pipe,
+        })),
+        // ── Unary in-place ops (single Load → Compute → Store). Same
+        //    stencil shape; the op tag picks the intrinsic expansion.
+        "scalar_mul_inplace" => Ok(unary_inplace_region(&UnaryInplaceParams {
+            hidden_dim: hints.hidden_dim,
+            token_tile: hints.token_tile,
+            op_tag: "scalar_mul",
+        })),
+        "tanh_softcap_inplace" => Ok(unary_inplace_region(&UnaryInplaceParams {
+            hidden_dim: hints.hidden_dim,
+            token_tile: hints.token_tile,
+            op_tag: "tanh_softcap",
         })),
         other => Err(LowerError::UnsupportedImpl { name: other }),
     }

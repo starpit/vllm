@@ -27,6 +27,7 @@ fn decode_params() -> PagedDecodeParams {
         num_head_groups: 8,
         pipe: 3,
         tokens_per_page: 256,
+        window: Window::Infinite,
     }
 }
 

@@ -306,6 +306,7 @@ mod tests {
             num_head_groups: 8,
             pipe: 3,
             tokens_per_page: 256,
+            window: crate::template::Window::Infinite,
         });
         let arch = sm90_fa2();
         let sched = schedule_wavefront(&region, &arch).unwrap();

@@ -7,7 +7,7 @@
 //! touch.
 
 use ferrite_stencil::ir::{self, AddrTerm, Bound, DepKind, Role};
-use ferrite_stencil::{PagedDecodeParams, attn_region_paged_decode, print, sm90_fa2};
+use ferrite_stencil::{PagedDecodeParams, Window, attn_region_paged_decode, print, sm90_fa2};
 
 fn params() -> PagedDecodeParams {
     PagedDecodeParams {
@@ -16,6 +16,7 @@ fn params() -> PagedDecodeParams {
         num_head_groups: 8,
         pipe: 3,
         tokens_per_page: 256,
+        window: Window::Infinite,
     }
 }
 

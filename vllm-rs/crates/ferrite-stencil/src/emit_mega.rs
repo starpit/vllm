@@ -75,10 +75,11 @@ pub fn emit_megakernel(mega: &Megakernel, arch: &ArchMap) -> Result<String, Emit
         .collect::<Result<Vec<Schedule>, _>>()?;
 
     let order = topo_regions(mega)?;
+    let params = collect_params(mega);
 
     let mut out = String::new();
     write_header(&mut out, mega, arch);
-    write_signature(&mut out, mega);
+    write_signature(&mut out, &params);
     write_wg_dispatch(&mut out, arch);
 
     for (i, rid) in order.iter().enumerate() {
@@ -94,7 +95,46 @@ pub fn emit_megakernel(mega: &Megakernel, arch: &ArchMap) -> Result<String, Emit
     }
 
     writeln!(out, "}}  // end mega_kernel").unwrap();
+    write_launcher(&mut out, &params);
     Ok(out)
+}
+
+/// Kernel param summary: both signature emission and the host
+/// launcher consume this so they can't drift out of sync.
+struct ParamSet {
+    /// Deduped scalar (u32) param names, in declaration order.
+    scalars: Vec<&'static str>,
+    /// Deduped gmem tensor params: (name, read-access-kind). Sorted by
+    /// name for stable output across compiler runs.
+    gmem: Vec<(&'static str, GmemAccess)>,
+}
+
+fn collect_params(mega: &Megakernel) -> ParamSet {
+    let mut scalar_seen: std::collections::BTreeSet<&'static str> =
+        std::collections::BTreeSet::new();
+    let mut scalars: Vec<&'static str> = Vec::new();
+    for r in &mega.regions {
+        for s in &r.entry_scalars {
+            if scalar_seen.insert(s.name) {
+                scalars.push(s.name);
+            }
+        }
+    }
+
+    let mut gmem_access: BTreeMap<&'static str, GmemAccess> = BTreeMap::new();
+    for r in &mega.regions {
+        for n in &r.nodes {
+            for &(name, access) in gmem_refs(n.op.tag) {
+                gmem_access
+                    .entry(name)
+                    .and_modify(|e| *e = e.union(access))
+                    .or_insert(access);
+            }
+        }
+    }
+    let gmem: Vec<(&'static str, GmemAccess)> = gmem_access.into_iter().collect();
+
+    ParamSet { scalars, gmem }
 }
 
 /// Kahn's algorithm over `Megakernel.control`. When `control` is
@@ -165,57 +205,98 @@ fn write_header(out: &mut String, mega: &Megakernel, arch: &ArchMap) {
     writeln!(out, "__device__ uint32_t gbar_counter;").unwrap();
 }
 
-fn write_signature(out: &mut String, mega: &Megakernel) {
+fn write_signature(out: &mut String, params: &ParamSet) {
     writeln!(out, "__global__ void mega_kernel(").unwrap();
-
-    // Entry scalars: dedupe by name across all regions. Regions that
-    // share a name (e.g. both use `num_q_tiles`) share the parameter.
-    let mut scalar_seen: std::collections::BTreeSet<&'static str> =
-        std::collections::BTreeSet::new();
-    let mut scalar_params: Vec<&'static str> = Vec::new();
-    for r in &mega.regions {
-        for s in &r.entry_scalars {
-            if scalar_seen.insert(s.name) {
-                scalar_params.push(s.name);
-            }
-        }
+    let total = params.scalars.len() + params.gmem.len();
+    let comma = |i: usize| if i + 1 < total { "," } else { "" };
+    let mut idx = 0usize;
+    for name in &params.scalars {
+        writeln!(out, "    uint32_t {}{}", name, comma(idx)).unwrap();
+        idx += 1;
     }
-
-    // Gmem pointers: union every tag's gmem_refs across every node of
-    // every region. A tensor read AND written anywhere in the
-    // megakernel must be mutable (no const qualifier); a tensor only
-    // ever read takes the const qualifier. Dedupe keeps the signature
-    // honest — the real plumbing that maps these to FUF-level tensors
-    // comes with the runtime launcher; this commit lands the shape.
-    let mut gmem_access: BTreeMap<&'static str, GmemAccess> = BTreeMap::new();
-    for r in &mega.regions {
-        for n in &r.nodes {
-            for &(name, access) in gmem_refs(n.op.tag) {
-                gmem_access
-                    .entry(name)
-                    .and_modify(|e| *e = e.union(access))
-                    .or_insert(access);
-            }
-        }
-    }
-
-    let total_params = scalar_params.len() + gmem_access.len();
-    let mut param_idx = 0usize;
-    let comma = |i: usize| if i + 1 < total_params { "," } else { "" };
-
-    for name in &scalar_params {
-        writeln!(out, "    uint32_t {}{}", name, comma(param_idx)).unwrap();
-        param_idx += 1;
-    }
-    for (name, access) in &gmem_access {
-        let qual = match access {
-            GmemAccess::Read => "const bf16* __restrict__",
-            GmemAccess::Write | GmemAccess::ReadWrite => "bf16* __restrict__",
-        };
-        writeln!(out, "    {} {}{}", qual, name, comma(param_idx)).unwrap();
-        param_idx += 1;
+    for (name, access) in &params.gmem {
+        let qual = gmem_qualifier(*access);
+        writeln!(out, "    {} {}{}", qual, name, comma(idx)).unwrap();
+        idx += 1;
     }
     writeln!(out, ") {{").unwrap();
+}
+
+fn gmem_qualifier(access: GmemAccess) -> &'static str {
+    match access {
+        GmemAccess::Read => "const bf16* __restrict__",
+        GmemAccess::Write | GmemAccess::ReadWrite => "bf16* __restrict__",
+    }
+}
+
+/// Host-side launcher — zeroes `gbar_counter`, queries SM count, and
+/// kicks off the megakernel with `grid = #SMs`, `block = 640` (20
+/// warps = persistent-CTA layout per design §5). Signature mirrors
+/// the kernel's: same scalar + gmem pointer list. Wrapping in
+/// `extern "C"` so Rust FFI can call it without name mangling.
+fn write_launcher(out: &mut String, params: &ParamSet) {
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "// ── Host launcher ──────────────────────────────────────"
+    )
+    .unwrap();
+    writeln!(out, "extern \"C\" cudaError_t launch_mega_kernel(").unwrap();
+    writeln!(out, "    cudaStream_t stream,").unwrap();
+    let total = params.scalars.len() + params.gmem.len();
+    let comma = |i: usize| if i + 1 < total { "," } else { "" };
+    let mut idx = 0usize;
+    for name in &params.scalars {
+        writeln!(out, "    uint32_t {}{}", name, comma(idx)).unwrap();
+        idx += 1;
+    }
+    for (name, access) in &params.gmem {
+        let qual = gmem_qualifier(*access);
+        writeln!(out, "    {} {}{}", qual, name, comma(idx)).unwrap();
+        idx += 1;
+    }
+    writeln!(out, ") {{").unwrap();
+    writeln!(
+        out,
+        "    // Zero g.Bar once per launch; regions arrive + spin-wait."
+    )
+    .unwrap();
+    writeln!(out, "    uint32_t zero = 0;").unwrap();
+    writeln!(
+        out,
+        "    cudaError_t err = cudaMemcpyToSymbolAsync(gbar_counter, &zero,"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        sizeof(uint32_t), 0, cudaMemcpyHostToDevice, stream);"
+    )
+    .unwrap();
+    writeln!(out, "    if (err != cudaSuccess) return err;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // 1 CTA per SM × 20 warps × 32 threads = 640.").unwrap();
+    writeln!(out, "    int sm_count = 0;").unwrap();
+    writeln!(
+        out,
+        "    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);"
+    )
+    .unwrap();
+    writeln!(out, "    dim3 grid((unsigned)sm_count);").unwrap();
+    writeln!(out, "    dim3 block(640u);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    mega_kernel<<<grid, block, 0, stream>>>(").unwrap();
+    let mut idx = 0usize;
+    for name in &params.scalars {
+        writeln!(out, "        {}{}", name, comma(idx)).unwrap();
+        idx += 1;
+    }
+    for (name, _) in &params.gmem {
+        writeln!(out, "        {}{}", name, comma(idx)).unwrap();
+        idx += 1;
+    }
+    writeln!(out, "    );").unwrap();
+    writeln!(out, "    return cudaGetLastError();").unwrap();
+    writeln!(out, "}}").unwrap();
 }
 
 fn write_wg_dispatch(out: &mut String, arch: &ArchMap) {
@@ -504,6 +585,24 @@ mod tests {
         assert!(src.contains("bf16* __restrict__ O_gmem"));
         // Global g.Bar counter is declared above the kernel.
         assert!(src.contains("__device__ uint32_t gbar_counter;"));
+    }
+
+    #[test]
+    fn launcher_mirrors_kernel_signature() {
+        let mk = two_region_mega();
+        let src = emit_megakernel(&mk, &sm90_fa2()).unwrap();
+        // Launcher present under extern "C" for FFI.
+        assert!(src.contains("extern \"C\" cudaError_t launch_mega_kernel("));
+        // Zeroes g.Bar counter once per launch.
+        assert!(src.contains("cudaMemcpyToSymbolAsync(gbar_counter"));
+        // 1 CTA per SM × 20 warps = 640 threads.
+        assert!(src.contains("cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount"));
+        assert!(src.contains("dim3 grid((unsigned)sm_count);"));
+        assert!(src.contains("dim3 block(640u);"));
+        // Same param list, forwarded to the kernel.
+        assert!(src.contains("mega_kernel<<<grid, block, 0, stream>>>("));
+        assert!(src.contains("    num_q_tiles"));
+        assert!(src.contains("    Q_gmem"));
     }
 
     #[test]

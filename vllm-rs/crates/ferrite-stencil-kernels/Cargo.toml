@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ferrite-stencil-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust launch wrappers for CUDA kernels produced by the ferrite-stencil emitter"
+
+[features]
+default = []
+cuda = [
+    "ferrite-cuda-builder/cuda",
+    "dep:cudarc",
+]
+
+[dependencies]
+# Build-time trigger: ensures the static .a libs exist in the cudaforge
+# cache before this crate's link step runs. No Rust symbols imported.
+ferrite-cuda-builder = { path = "../ferrite-cuda-builder" }
+cudarc = { workspace = true, features = ["dynamic-linking", "cuda-version-from-build-system"], optional = true }
+half = { workspace = true }
+
+[build-dependencies]
+# Used by build.rs to resolve `~/.cache/cudaforge/vllm-cuda/`.
+dirs = "5"

@@ -38,6 +38,7 @@ members = [
     "crates/ferrite-forward-macro",
     "crates/ferrite-cost-sweep",
     "crates/ferrite-stencil",
+    "crates/ferrite-stencil-kernels",
 ]
 exclude = []
 

@@ -2147,6 +2147,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-stencil-kernels"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "dirs 5.0.1",
+ "ferrite-cuda-builder",
+ "half",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

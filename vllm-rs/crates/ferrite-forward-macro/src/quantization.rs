@@ -80,6 +80,31 @@ pub enum StorageFormat {
         quant_type: BnbQuantType,
         blocksize: u32,
     },
+    /// FP8 (E4M3) quantized weights — `.weight` is `float8_e4m3fn`
+    /// `[N, K]` with a sibling `.weight_scale` (per-tensor `[1]`,
+    /// per-channel `[N]` or `[N, 1]`, or per-block `[ceil(N/bn),
+    /// ceil(K/bk)]` for blockwise). `scheme` selects how activation
+    /// quantization happens at forward time; `block_size` picks
+    /// per-tensor (`None`) vs. blockwise scales. Matches Python
+    /// vLLM's `Fp8Config` / `Fp8LinearMethod`.
+    Fp8 {
+        scheme: Fp8ActivationScheme,
+        /// `Some([bn, bk])` for blockwise (DeepSeek `[128, 128]`);
+        /// `None` for per-tensor / per-channel scales.
+        block_size: Option<[u32; 2]>,
+    },
+}
+
+/// FP8 activation quantization scheme. Matches
+/// `vllm_cuda::quant::Fp8ActivationScheme` one-for-one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fp8ActivationScheme {
+    /// Per-token activation scale computed at forward time
+    /// (`scaled_fp8_quant_dynamic`). Default on SM89+.
+    Dynamic,
+    /// Pre-calibrated per-tensor `input_scale` baked into the
+    /// checkpoint (`scaled_fp8_quant_static`).
+    Static,
 }
 
 /// GPTQ on-disk layout — decides which tensor names + axis order the
@@ -159,6 +184,10 @@ pub enum QuantMethod {
         quant_type: BnbQuantType,
         blocksize: u32,
     },
+    Fp8 {
+        scheme: Fp8ActivationScheme,
+        block_size: Option<[u32; 2]>,
+    },
 }
 
 /// Errors from [`QuantizationConfig::parse`]. All variants preserve
@@ -227,6 +256,7 @@ impl QuantizationConfig {
             "gptq" => parse_gptq(obj)?,
             "compressed-tensors" => parse_compressed_tensors(obj)?,
             "bitsandbytes" => parse_bitsandbytes(obj)?,
+            "fp8" => parse_fp8(obj)?,
             other => return Err(ParseError::UnsupportedMethod(other.to_string())),
         };
 
@@ -476,6 +506,72 @@ fn parse_bitsandbytes(
     })
 }
 
+/// Parse `quantization_config.quant_method == "fp8"`.
+///
+/// Matches Python vLLM's `Fp8Config.from_config()` / HF `neuralmagic` /
+/// `RedHatAI` FP8 checkpoint schemas. Fields:
+/// - `activation_scheme`: `"dynamic"` (default, per-token at runtime) or
+///   `"static"` (pre-calibrated per-tensor `input_scale` in the
+///   safetensors).
+/// - `weight_block_size`: optional `[bn, bk]` two-element array. Present
+///   on DeepSeek-style block-quantized checkpoints (typically
+///   `[128, 128]`); absent on per-tensor / per-channel checkpoints.
+///
+/// Other Python `Fp8Config` fields (`is_checkpoint_fp8_serialized`,
+/// `ignored_layers`) are load-time concerns: the fingerprint + the
+/// `modules_to_not_convert` / `ignore` list handle them. This parser
+/// only pulls the shape-bearing knobs the solver and codegen need.
+fn parse_fp8(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMethod, ParseError> {
+    let scheme = match obj
+        .get("activation_scheme")
+        .and_then(|v| v.as_str())
+        .unwrap_or("dynamic")
+    {
+        "dynamic" => Fp8ActivationScheme::Dynamic,
+        "static" => Fp8ActivationScheme::Static,
+        other => {
+            return Err(ParseError::BadField {
+                field: "activation_scheme",
+                reason: match other {
+                    "dynamic" | "static" => unreachable!(),
+                    _ => "unrecognized FP8 activation_scheme (want dynamic / static)",
+                },
+            });
+        }
+    };
+    let block_size = match obj.get("weight_block_size") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let arr = v.as_array().ok_or(ParseError::BadField {
+                field: "weight_block_size",
+                reason: "must be a two-element array",
+            })?;
+            if arr.len() != 2 {
+                return Err(ParseError::BadField {
+                    field: "weight_block_size",
+                    reason: "must have exactly two elements",
+                });
+            }
+            let bn = arr[0].as_u64().ok_or(ParseError::BadField {
+                field: "weight_block_size[0]",
+                reason: "not a u64",
+            })? as u32;
+            let bk = arr[1].as_u64().ok_or(ParseError::BadField {
+                field: "weight_block_size[1]",
+                reason: "not a u64",
+            })? as u32;
+            if bn == 0 || bk == 0 {
+                return Err(ParseError::BadField {
+                    field: "weight_block_size",
+                    reason: "block dimensions must be > 0",
+                });
+            }
+            Some([bn, bk])
+        }
+    };
+    Ok(QuantMethod::Fp8 { scheme, block_size })
+}
+
 /// Resolve the storage format of a single weight by matching its
 /// dotted path against the model's `quantization_config`.
 ///
@@ -542,6 +638,15 @@ pub fn storage_format_for_weight(
         return StorageFormat::Dense;
     }
 
+    // FP8 convention: `lm_head` is never quantized. neuralmagic /
+    // RedHatAI FP8 checkpoints ship `lm_head.weight` as BF16/F16
+    // alongside the FP8 decoder layers. Same rationale as GPTQ —
+    // the output projection is tied or kept high-precision for
+    // sampling quality.
+    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Fp8 { .. }) {
+        return StorageFormat::Dense;
+    }
+
     // AWQ/GPTQ metadata applies to matmul weights only — the
     // qweight/scales/[qzeros|g_idx] triple produces a 4-bit packed
     // weight that the marlin GEMM kernel consumes. Weights that
@@ -600,6 +705,7 @@ pub fn storage_format_for_weight(
             quant_type,
             blocksize,
         },
+        QuantMethod::Fp8 { scheme, block_size } => StorageFormat::Fp8 { scheme, block_size },
     }
 }
 
@@ -676,11 +782,101 @@ mod tests {
 
     #[test]
     fn rejects_unknown_method() {
-        let v = json(
-            r#"{"quantization_config": {"quant_method": "fp8", "activation_scheme": "dynamic"}}"#,
-        );
+        let v = json(r#"{"quantization_config": {"quant_method": "smoothquant"}}"#);
         let err = QuantizationConfig::parse(&v).unwrap_err();
-        assert!(matches!(err, ParseError::UnsupportedMethod(ref s) if s == "fp8"));
+        assert!(matches!(err, ParseError::UnsupportedMethod(ref s) if s == "smoothquant"));
+    }
+
+    #[test]
+    fn parses_fp8_dynamic_per_tensor() {
+        // Default activation_scheme is "dynamic"; absent
+        // `weight_block_size` → per-tensor.
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "activation_scheme": "dynamic"
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().expect("some");
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Fp8 {
+                scheme: Fp8ActivationScheme::Dynamic,
+                block_size: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_fp8_static_per_tensor() {
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "activation_scheme": "static",
+                    "ignored_layers": ["lm_head"]
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().unwrap();
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Fp8 {
+                scheme: Fp8ActivationScheme::Static,
+                block_size: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_fp8_block_128x128() {
+        // DeepSeek-V3 style blockwise FP8.
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "activation_scheme": "dynamic",
+                    "weight_block_size": [128, 128]
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().unwrap();
+        assert!(matches!(
+            qc.method,
+            QuantMethod::Fp8 {
+                scheme: Fp8ActivationScheme::Dynamic,
+                block_size: Some([128, 128]),
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_fp8_bad_block_size() {
+        let v =
+            json(r#"{"quantization_config": {"quant_method": "fp8", "weight_block_size": [128]}}"#);
+        assert!(matches!(
+            QuantizationConfig::parse(&v),
+            Err(ParseError::BadField {
+                field: "weight_block_size",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_fp8_unknown_activation_scheme() {
+        let v = json(
+            r#"{"quantization_config": {"quant_method": "fp8", "activation_scheme": "channelwise"}}"#,
+        );
+        assert!(matches!(
+            QuantizationConfig::parse(&v),
+            Err(ParseError::BadField {
+                field: "activation_scheme",
+                ..
+            })
+        ));
     }
 
     #[test]

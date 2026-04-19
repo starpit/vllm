@@ -666,6 +666,15 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
             // fingerprint.
             quote! {}
         }
+        Some(crate::quantization::QuantMethod::Fp8 { .. }) => {
+            // FP8 fingerprint sniffs `.weight_scale` on the first
+            // q_proj — presence + shape distinguishes FP8 from every
+            // other variant. The `bnb4_exclusion` block below also
+            // rejects when `.weight.absmax` is present so FP8
+            // doesn't fingerprint-match a BNB4 checkpoint of the
+            // same arch+size.
+            quote! {}
+        }
         None => quote! {},
     };
 

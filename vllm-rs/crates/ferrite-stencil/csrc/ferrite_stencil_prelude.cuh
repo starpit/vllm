@@ -87,23 +87,79 @@ __device__ static StencilFrag operator-(const StencilFrag& x, const StencilFrag&
 // `C_frag`, `smem_a`, `bar_kv`, etc.).
 
 // ─── Load helpers ────────────────────────────────────────────────
-// Data-movement bodies still trap — the real PTX lands in the next
-// commit. What this commit does is fix the *shape*: each helper now
-// takes a non-type template parameter `BYTES` giving the tile size
-// in bytes, so the emitted call sites can say
-// `cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem, row, col)` — same byte
-// constant the region-scope smem decl uses (`bf16 smem_q[SMEM_Q_BYTES
-// / 2]`). When BYTES is 0 the trap body is unchanged (embed-row /
-// cache-store sites pass bare for now — they have no region-scope
-// smem local to name). The real cp.async / TMA / stg PTX that follows
-// inspects BYTES at compile time to decide the per-thread offset /
-// vector width.
+// Real PTX now for `cp_async_128<BYTES>` — the helper each warpgroup
+// calls to stage a `BYTES`-sized gmem tile into a shared-memory
+// destination. TMA + STG variants still trap; they need a tensor-map
+// descriptor (TMA) or a concrete fragment register layout (STG), both
+// of which are follow-up commits.
+//
+// Call shape emitted by emit_ops:
+//     cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem + (q_tile * 16384u + head_group * 128u));
+// — a tile-base pointer (not axis indices). `emit_addr::render`
+// produces the offset from the Node's `LoadAddr.terms`. The helper
+// does NOT know the layout; it copies BYTES contiguous bytes into
+// the smem buffer.
 
 template <uint32_t BYTES = 0, class... A> __device__ inline void tma_load_2d(A&&...) { __trap(); }
 template <uint32_t BYTES = 0, class... A> __device__ inline void tma_store_2d(A&&...) { __trap(); }
-template <uint32_t BYTES = 0, class... A> __device__ inline void cp_async_128(A&&...) { __trap(); }
 template <uint32_t BYTES = 0, class... A> __device__ inline void generic_load(A&&...) { __trap(); }
 template <uint32_t BYTES = 0, class... A> __device__ inline void generic_store(A&&...) { __trap(); }
+
+/// cp.async.ca.shared.global 16B loop. Each warpgroup (128 threads)
+/// cooperatively stages a BYTES-sized tile into smem — thread `tid ∈
+/// [0, 128)` issues `BYTES / (128 * 16)` cp.async's (rounded up) at
+/// 16-byte stride, so the full warpgroup covers the whole tile with
+/// coalesced issues.
+///
+/// BYTES=0 is the "bare" call form (embed-row, cache-store — sites
+/// that haven't been updated to name a smem local). Those keep
+/// trapping so a runtime hit is loud, not silent.
+///
+/// BYTES must be a multiple of 16 — cp.async.ca accepts 4 / 8 / 16,
+/// and every real region tile (smem_q / smem_k / smem_x / …) is sized
+/// as a bf16 array whose byte count rounds to 16. A static_assert
+/// catches any future tile_consts entry that forgets this.
+///
+/// SM80+ only; on SM89 this is the runtime form used by the generic
+/// cp.async path (the "sm89_fa2" arch map). On SM90a+ the real target
+/// is TMA; cp_async_128 is a fallback for ops where the TMA
+/// descriptor plumbing hasn't landed (and a stepping stone for
+/// correctness testing — cp.async works on H100 too).
+template <uint32_t BYTES>
+__device__ inline void cp_async_128(bf16* smem, const bf16* gmem) {
+#if __CUDA_ARCH__ >= 800
+    if constexpr (BYTES == 0) {
+        // Bare call from a not-yet-updated emit_ops site (embed-row /
+        // cache-store). Trap so we notice at runtime rather than
+        // silently eliding a required load.
+        __trap();
+    } else {
+        static_assert(BYTES % 16u == 0u,
+                      "cp_async_128 BYTES must be a multiple of 16 (cp.async 16B issues)");
+        constexpr uint32_t CHUNKS = BYTES / 16u;
+        constexpr uint32_t THREADS = 128u;
+        uint32_t tid = threadIdx.x & (THREADS - 1u);
+        uint32_t smem_base = __cvta_generic_to_shared(smem);
+        uintptr_t gmem_base = reinterpret_cast<uintptr_t>(gmem);
+        #pragma unroll
+        for (uint32_t i = tid; i < CHUNKS; i += THREADS) {
+            uint32_t offset = i * 16u;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                         :: "r"(smem_base + offset), "l"(gmem_base + offset) : "memory");
+        }
+    }
+#else
+    (void)smem; (void)gmem;
+    __trap();
+#endif
+}
+
+/// Fall-through overload for sites that haven't been updated to the
+/// `(smem, gmem_base_ptr)` shape — embed-row (bare), cache-store (bare).
+/// Keeps trapping so future runtime hits are loud. The prelude accepts
+/// the call via pack so emit_ops doesn't need a second helper name.
+template <uint32_t BYTES = 0, class... A>
+__device__ inline void cp_async_128(A&&...) { __trap(); }
 
 /// cp.async.commit_group — closes the current set of in-flight
 /// `cp.async` requests into a group that `cp.async.wait_group` can

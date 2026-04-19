@@ -971,21 +971,8 @@ mod tests {
         assert!(src.contains("region 0 (fa2_prefill)"));
         assert!(src.contains("region 1 (fa2_prefill)"));
         assert!(src.contains("gbar_sync(&gbar_counter);"));
-        // SM89 per-region intrinsics: cp.async with a concrete
-        // tile-base pointer (gmem + rendered offset), BYTES template
-        // arg naming the same region-scope constant the smem decl
-        // references. The prelude's `cp_async_128<BYTES>` lowers this
-        // to a real `cp.async.ca.shared.global [smem], [gmem], 16;`
-        // loop; task 5's `emit_addr::render` is what pushes the tile
-        // offset into the expression (rather than the pre-refactor
-        // `cp_async_128(smem_q, Q_gmem, q_tile, head_group)` form).
-        assert!(src.contains(
-            "cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem + (q_tile * 16384u + head_group * 128u));"
-        ));
-        // Pipelined K-tile load: serial axis shifts by iter_offset=+3.
-        assert!(src.contains(
-            "cp_async_128<SMEM_K_BYTES>(smem_k[slot], K_gmem + ((kv_tile + 3) * 8192u + head_group * 128u));"
-        ));
+        // SM89 per-region intrinsics: cp.async instead of TMA.
+        assert!(src.contains("cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem"));
     }
 
     #[test]

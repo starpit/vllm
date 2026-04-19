@@ -17,10 +17,12 @@
 use std::fmt::Write;
 
 use crate::arch::{ArchMap, BarrierPrim, HardwareUnit};
+use crate::emit_ops::{ExpandCtx, expand as expand_op};
 use crate::ir::{Bound, Region, Role};
 use crate::wavefront::{Schedule, Step};
 
 pub fn emit_kernel_sketch(region: &Region, schedule: &Schedule, arch: &ArchMap) -> String {
+    let pipeline_depth = schedule.pipeline_depth;
     let mut out = String::new();
     writeln!(
         out,
@@ -76,7 +78,7 @@ pub fn emit_kernel_sketch(region: &Region, schedule: &Schedule, arch: &ArchMap) 
     // Preamble.
     writeln!(out, "  // ── preamble ────────────────────────────────").unwrap();
     for step in &schedule.preamble {
-        emit_step(&mut out, region, arch, step, "  ");
+        emit_step(&mut out, region, arch, step, "  ", pipeline_depth);
     }
 
     // Body: serial loop or straight-line.
@@ -98,20 +100,20 @@ pub fn emit_kernel_sketch(region: &Region, schedule: &Schedule, arch: &ArchMap) 
         )
         .unwrap();
         for step in &schedule.body {
-            emit_step(&mut out, region, arch, step, "    ");
+            emit_step(&mut out, region, arch, step, "    ", pipeline_depth);
         }
         writeln!(out, "  }}").unwrap();
     } else {
         writeln!(out, "  // ── body (no serial axis) ───────────────").unwrap();
         for step in &schedule.body {
-            emit_step(&mut out, region, arch, step, "  ");
+            emit_step(&mut out, region, arch, step, "  ", pipeline_depth);
         }
     }
 
     // Epilogue.
     writeln!(out, "  // ── epilogue ────────────────────────────────").unwrap();
     for step in &schedule.epilogue {
-        emit_step(&mut out, region, arch, step, "  ");
+        emit_step(&mut out, region, arch, step, "  ", pipeline_depth);
     }
 
     writeln!(out, "}}").unwrap();
@@ -155,13 +157,32 @@ fn emit_role_prelude(out: &mut String, region: &Region, arch: &ArchMap) {
     }
 }
 
-fn emit_step(out: &mut String, region: &Region, arch: &ArchMap, step: &Step, indent: &str) {
+fn emit_step(
+    out: &mut String,
+    region: &Region,
+    arch: &ArchMap,
+    step: &Step,
+    indent: &str,
+    pipeline_depth: u32,
+) {
     let node = region.node(step.node);
     // Fence-before: render each barrier primitive as a CUDA-ish stub.
     for bp in &step.barriers_before {
         writeln!(out, "{}{}", indent, fmt_barrier(bp)).unwrap();
     }
-    let _ = arch; // reserved for per-arch role-guard emission in a later commit.
+    let expand_ctx = ExpandCtx {
+        arch_name: arch.name,
+        iter_offset: step.iter_offset,
+        pipeline_depth,
+    };
+    if let Some(body) = expand_op(node.op.tag, &expand_ctx) {
+        // Indent every line of the expansion.
+        for line in body.lines() {
+            writeln!(out, "{}{}", indent, line).unwrap();
+        }
+        return;
+    }
+    // Fallback stub: tag is not in the expansion table yet.
     if step.iter_offset != 0 {
         writeln!(
             out,
@@ -232,8 +253,10 @@ mod tests {
         assert!(src.contains("Store → storer (1 warpgroups)"));
         // Serial loop header.
         assert!(src.contains("for (uint32_t kv_tile = 0;"));
-        // Preamble has load_q (no iter_offset).
-        assert!(src.contains("load_q_tile();  // Load"));
+        // Preamble now expands load_q_tile into a TMA + mbarrier
+        // arrive guarded on the loader warpgroup (see emit_ops).
+        assert!(src.contains("tma_load_2d(smem_q, Q_gmem"));
+        assert!(src.contains("if (wg == LOADER_WG)"));
         // Pipeline-source loads tagged with +P.
         assert!(src.contains("load_k_tile(/* iter + 3 */);"));
         assert!(src.contains("load_v_tile(/* iter + 3 */);"));
@@ -258,7 +281,9 @@ mod tests {
         assert!(!src.contains("wg = threadIdx.x"));
         // Same structural bones regardless of arch.
         assert!(src.contains("for (uint32_t kv_tile = 0;"));
-        assert!(src.contains("load_q_tile();  // Load"));
+        // SM89 load_q_tile expands to cp.async.
+        assert!(src.contains("cp_async_128(smem_q, Q_gmem"));
+        // store_o_tile still stubs (not yet in the expansion table).
         assert!(src.contains("store_o_tile();  // Store"));
     }
 

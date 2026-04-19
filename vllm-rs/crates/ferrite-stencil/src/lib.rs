@@ -10,6 +10,7 @@
 
 pub mod arch;
 pub mod emit;
+pub mod emit_ops;
 pub mod ir;
 pub mod print;
 pub mod schedule;

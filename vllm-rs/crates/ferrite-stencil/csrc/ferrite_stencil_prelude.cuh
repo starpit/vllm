@@ -158,20 +158,15 @@ template <class T> __device__ inline StencilFrag exp2f_frag_g(const T&) { return
 #define row_sum(x) row_sum_g((x))
 #define exp2f_frag(x) exp2f_frag_g((x))
 
-// Axis-name file-scope placeholders. Each for-loop shadows the
-// matching identifier, so inside a loop the real iteration variable
-// wins; expansions that reference an axis *outside* their own
-// region's loop (e.g. load_q_tile emitted inside paged_decode which
-// iterates `b`, not `q_tile`) fall through to these zero-valued
-// placeholders. Real lowering will thread axis names through
-// `ExpandCtx` so mismatched references become impossible.
-namespace ferrite_axis_aliases {
-__device__ static uint32_t q_tile = 0, kv_tile = 0, head_group = 0, head_tile = 0;
-__device__ static uint32_t m_tile = 0, n_tile = 0, k_tile = 0;
-__device__ static uint32_t token_tile = 0, inter_tile = 0;
-__device__ static uint32_t b = 0, page = 0, slot = 0, row = 0;
-}  // namespace ferrite_axis_aliases
-using namespace ferrite_axis_aliases;
+// Axis-name file-scope placeholders lived here pre-item-3 — when an
+// expansion referenced an axis the hosting region didn't own (e.g.
+// `load_q_tile` emitting `q_tile` inside `paged_decode` which
+// iterates `b`), the reference fell through to `q_tile = 0` in this
+// namespace. Item 3 threaded real axis names through `ExpandCtx`, so
+// every axis identifier in the emitted body now resolves to an
+// in-scope loop variable. No compatibility shim needed — if you see
+// an "undeclared identifier" from nvcc, the fix is to extend
+// emit_ops's axis lookup, not to re-add a placeholder here.
 
 // ─── Ambient strides / indices ───────────────────────────────────
 // Emitted bodies reference `hidden_stride` as loop-invariant context.

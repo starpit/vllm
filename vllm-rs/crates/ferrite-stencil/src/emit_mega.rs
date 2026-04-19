@@ -446,6 +446,18 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
     let locals = collect_locals(region);
     write_region_locals(out, &indent, &locals);
 
+    // Resolve this region's axis names once — expansions thread them
+    // through ExpandCtx (item 3) so hard-coded `q_tile` / `kv_tile`
+    // don't drop out into file-scope placeholders for templates that
+    // use different axis names (paged decode uses `b` for the batch
+    // axis, not `q_tile`).
+    let parallel_axis_names: Vec<&'static str> = sched
+        .parallel_axes
+        .iter()
+        .map(|id| region.axis(*id).name)
+        .collect();
+    let serial_axis_name: Option<&'static str> = sched.serial_axis.map(|id| region.axis(id).name);
+
     // Parallel axes become for-loops *inside* the persistent CTA: the
     // host-side per-SM scheduler assigns which (q_tile, head_group) this
     // SM owns, but from the emitter's POV the kernel iterates its full
@@ -468,7 +480,16 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
 
     writeln!(out, "{}// preamble", indent).unwrap();
     for step in &sched.preamble {
-        write_step(out, region, arch, step, &indent, sched.pipeline_depth);
+        write_step(
+            out,
+            region,
+            arch,
+            step,
+            &indent,
+            sched.pipeline_depth,
+            &parallel_axis_names,
+            serial_axis_name,
+        );
     }
 
     if let Some(serial) = sched.serial_axis {
@@ -486,18 +507,45 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
         let mut body_indent = indent.clone();
         body_indent.push_str("  ");
         for step in &sched.body {
-            write_step(out, region, arch, step, &body_indent, sched.pipeline_depth);
+            write_step(
+                out,
+                region,
+                arch,
+                step,
+                &body_indent,
+                sched.pipeline_depth,
+                &parallel_axis_names,
+                serial_axis_name,
+            );
         }
         writeln!(out, "{}}}  // end {}", indent, ax.name).unwrap();
     } else {
         for step in &sched.body {
-            write_step(out, region, arch, step, &indent, sched.pipeline_depth);
+            write_step(
+                out,
+                region,
+                arch,
+                step,
+                &indent,
+                sched.pipeline_depth,
+                &parallel_axis_names,
+                serial_axis_name,
+            );
         }
     }
 
     writeln!(out, "{}// epilogue", indent).unwrap();
     for step in &sched.epilogue {
-        write_step(out, region, arch, step, &indent, sched.pipeline_depth);
+        write_step(
+            out,
+            region,
+            arch,
+            step,
+            &indent,
+            sched.pipeline_depth,
+            &parallel_axis_names,
+            serial_axis_name,
+        );
     }
 
     // Close parallel-axis loops in reverse order.
@@ -552,6 +600,7 @@ fn write_region_locals(out: &mut String, indent: &str, locals: &[(&'static str, 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_step(
     out: &mut String,
     region: &Region,
@@ -559,6 +608,8 @@ fn write_step(
     step: &Step,
     indent: &str,
     pipeline_depth: u32,
+    parallel_axes: &[&'static str],
+    serial_axis: Option<&'static str>,
 ) {
     let node = region.node(step.node);
     for bp in &step.barriers_before {
@@ -568,6 +619,8 @@ fn write_step(
         arch_name: arch.name,
         iter_offset: step.iter_offset,
         pipeline_depth,
+        parallel_axes,
+        serial_axis,
     };
     if let Some(body) = expand_op(node.op.tag, &ctx) {
         for line in body.lines() {

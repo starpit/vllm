@@ -25,6 +25,31 @@ pub struct ExpandCtx<'a> {
     /// `0` for non-pipelined nodes.
     pub iter_offset: i32,
     pub pipeline_depth: u32,
+    /// Region's parallel-axis names in outer-to-inner order (the
+    /// `sched.parallel_axes` resolved against `region.axis(id).name`).
+    /// FA2 = `["q_tile", "head_group"]`, paged decode = `["b",
+    /// "head_group"]`, GEMM = `["m_tile", "n_tile"]`, qkv_rope =
+    /// `["token_tile", "head_tile"]`, rmsnorm = `["token_tile"]`.
+    pub parallel_axes: &'a [&'static str],
+    /// Region's serial (reduction) axis name. FA2/paged-decode =
+    /// `Some("kv_tile")`, GEMM/qkv/gate_up_silu = `Some("k_tile")`,
+    /// rmsnorm/embed/unary = `None`.
+    pub serial_axis: Option<&'static str>,
+}
+
+impl<'a> ExpandCtx<'a> {
+    /// `parallel_axes[i]` or a stable placeholder when the region has
+    /// fewer axes than the tag expects. Returns `"0u"` so the emitted
+    /// address is still legal C++ even if a tag is mis-applied.
+    pub fn par(&self, i: usize) -> &'static str {
+        self.parallel_axes.get(i).copied().unwrap_or("0u")
+    }
+    /// `serial_axis.unwrap_or("0u")`. Serial-use tags (qk_matmul,
+    /// pv_matmul, generic_gemm slot calc) assume one exists; the
+    /// default keeps the emission legal if the region lacks one.
+    pub fn ser(&self) -> &'static str {
+        self.serial_axis.unwrap_or("0u")
+    }
 }
 
 /// How a tag touches a gmem tensor: read-only, write-only, or both.
@@ -707,27 +732,31 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
 
 fn load_q_tile(ctx: &ExpandCtx<'_>) -> String {
     // `load_q_tile` runs in the preamble (no iter_offset). It reads
-    // the Q tile for this CTA's (q_tile, head_group) coordinate into
-    // smem once. On SM90 this is a single TMA `cp.async.bulk.tensor`
-    // with an mbarrier arrive; on SM89 it's a cp.async.ca loop over
-    // the tile's elements.
+    // the Q tile for this CTA's (parallel[0], parallel[1]) coordinate
+    // into smem once. On SM90 this is a single TMA `cp.async.bulk.
+    // tensor` with an mbarrier arrive; on SM89 it's a cp.async.ca
+    // loop over the tile's elements. Row axis varies by template: FA2
+    // uses `q_tile`, paged decode uses `b` — both resolve through
+    // `ctx.parallel_axes`.
+    let row = ctx.par(0);
+    let col = ctx.par(1);
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
-    writeln!(s, "  // load_q_tile: Q[q_tile, head_group, :, :] → smem").unwrap();
+    writeln!(s, "  // load_q_tile: Q[{}, {}, :, :] → smem", row, col).unwrap();
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
-            writeln!(s, "    tma_load_2d(smem_q, Q_gmem, q_tile, head_group);").unwrap();
+            writeln!(s, "    tma_load_2d(smem_q, Q_gmem, {}, {});", row, col).unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_q);").unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
-            writeln!(s, "  cp_async_128(smem_q, Q_gmem, q_tile, head_group);").unwrap();
+            writeln!(s, "  cp_async_128(smem_q, Q_gmem, {}, {});", row, col).unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
         }
         other => {
             writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
-            writeln!(s, "  generic_load(smem_q, Q_gmem, q_tile, head_group);").unwrap();
+            writeln!(s, "  generic_load(smem_q, Q_gmem, {}, {});", row, col).unwrap();
         }
     }
     // Suppress "unused" for iter_offset / pipeline_depth; both matter
@@ -749,18 +778,20 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
     let p = ctx.pipeline_depth;
     let buf = format!("smem_{}", which);
     let gmem = format!("{}_gmem", which.to_uppercase());
+    let ser = ctx.ser();
+    let col = ctx.par(1);
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
     writeln!(
         s,
-        "  // load_{}_tile: {}[kv_tile + {}, head_group, :, :] → {}[slot]",
-        which, gmem, ctx.iter_offset, buf,
+        "  // load_{}_tile: {}[{} + {}, {}, :, :] → {}[slot]",
+        which, gmem, ser, ctx.iter_offset, col, buf,
     )
     .unwrap();
     writeln!(
         s,
-        "  uint32_t slot = (kv_tile + {}) % {};",
-        ctx.iter_offset, p
+        "  uint32_t slot = ({} + {}) % {};",
+        ser, ctx.iter_offset, p
     )
     .unwrap();
     match ctx.arch_name {
@@ -768,8 +799,8 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
             writeln!(
                 s,
-                "    tma_load_2d({}[slot], {}, kv_tile + {}, head_group);",
-                buf, gmem, ctx.iter_offset,
+                "    tma_load_2d({}[slot], {}, {} + {}, {});",
+                buf, gmem, ser, ctx.iter_offset, col,
             )
             .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_kv[slot]);").unwrap();
@@ -778,8 +809,8 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
         "sm89_fa2" => {
             writeln!(
                 s,
-                "  cp_async_128({}[slot], {}, kv_tile + {}, head_group);",
-                buf, gmem, ctx.iter_offset,
+                "  cp_async_128({}[slot], {}, {} + {}, {});",
+                buf, gmem, ser, ctx.iter_offset, col,
             )
             .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
@@ -788,8 +819,8 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
             writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
             writeln!(
                 s,
-                "  generic_load({}[slot], {}, kv_tile + {}, head_group);",
-                buf, gmem, ctx.iter_offset,
+                "  generic_load({}[slot], {}, {} + {}, {});",
+                buf, gmem, ser, ctx.iter_offset, col,
             )
             .unwrap();
         }
@@ -831,23 +862,30 @@ fn compute_guarded(ctx: &ExpandCtx<'_>, body: &str) -> String {
 /// sweep over head_dim / k.
 fn qk_matmul(ctx: &ExpandCtx<'_>) -> String {
     debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let ser = ctx.ser();
     let body = match ctx.arch_name {
-        "sm90_fa2" => concat!(
-            "// S_frag = Q_tile @ K_tile^T\n",
-            "uint32_t slot = kv_tile % PIPE;\n",
-            "wgmma_fence();\n",
-            "wgmma_mma_async(S_frag, smem_q, smem_k[slot]);\n",
-            "wgmma_commit_group();\n",
-            "wgmma_wait_group<0>();\n",
+        "sm90_fa2" => format!(
+            concat!(
+                "// S_frag = Q_tile @ K_tile^T\n",
+                "uint32_t slot = {ser} % PIPE;\n",
+                "wgmma_fence();\n",
+                "wgmma_mma_async(S_frag, smem_q, smem_k[slot]);\n",
+                "wgmma_commit_group();\n",
+                "wgmma_wait_group<0>();\n",
+            ),
+            ser = ser,
         ),
-        "sm89_fa2" => concat!(
-            "// S_frag = Q_tile @ K_tile^T (tiled mma.sync over head_dim)\n",
-            "uint32_t slot = kv_tile % PIPE;\n",
-            "mma_sync_accumulate(S_frag, smem_q, smem_k[slot]);\n",
+        "sm89_fa2" => format!(
+            concat!(
+                "// S_frag = Q_tile @ K_tile^T (tiled mma.sync over head_dim)\n",
+                "uint32_t slot = {ser} % PIPE;\n",
+                "mma_sync_accumulate(S_frag, smem_q, smem_k[slot]);\n",
+            ),
+            ser = ser,
         ),
-        _ => "mma_accumulate(S_frag, smem_q, smem_k);\n",
+        _ => "mma_accumulate(S_frag, smem_q, smem_k);\n".to_string(),
     };
-    compute_guarded(ctx, body)
+    compute_guarded(ctx, &body)
 }
 
 /// Online softmax rescale: update per-row (m, l); rescale the O
@@ -872,25 +910,32 @@ fn softmax_update(ctx: &ExpandCtx<'_>) -> String {
 /// `qk_matmul`, pipelining into the V slot.
 fn pv_matmul(ctx: &ExpandCtx<'_>) -> String {
     debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let ser = ctx.ser();
     let body = match ctx.arch_name {
-        "sm90_fa2" => concat!(
-            "// O_frag += P_frag @ V_tile\n",
-            "uint32_t slot = kv_tile % PIPE;\n",
-            "wgmma_fence();\n",
-            "wgmma_mma_async(O_frag, P_frag, smem_v[slot]);\n",
-            "wgmma_commit_group();\n",
-            "wgmma_wait_group<0>();\n",
-            "// release the kv slot back to the loader\n",
-            "mbarrier_arrive(&bar_kv_consumed[slot]);\n",
+        "sm90_fa2" => format!(
+            concat!(
+                "// O_frag += P_frag @ V_tile\n",
+                "uint32_t slot = {ser} % PIPE;\n",
+                "wgmma_fence();\n",
+                "wgmma_mma_async(O_frag, P_frag, smem_v[slot]);\n",
+                "wgmma_commit_group();\n",
+                "wgmma_wait_group<0>();\n",
+                "// release the kv slot back to the loader\n",
+                "mbarrier_arrive(&bar_kv_consumed[slot]);\n",
+            ),
+            ser = ser,
         ),
-        "sm89_fa2" => concat!(
-            "// O_frag += P_frag @ V_tile\n",
-            "uint32_t slot = kv_tile % PIPE;\n",
-            "mma_sync_accumulate(O_frag, P_frag, smem_v[slot]);\n",
+        "sm89_fa2" => format!(
+            concat!(
+                "// O_frag += P_frag @ V_tile\n",
+                "uint32_t slot = {ser} % PIPE;\n",
+                "mma_sync_accumulate(O_frag, P_frag, smem_v[slot]);\n",
+            ),
+            ser = ser,
         ),
-        _ => "mma_accumulate(O_frag, P_frag, smem_v);\n",
+        _ => "mma_accumulate(O_frag, P_frag, smem_v);\n".to_string(),
     };
-    compute_guarded(ctx, body)
+    compute_guarded(ctx, &body)
 }
 
 /// Final store: divide O_frag by l, write to gmem at (q_tile, head_group).
@@ -900,11 +945,14 @@ fn pv_matmul(ctx: &ExpandCtx<'_>) -> String {
 /// writes directly to gmem with STG.
 fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
     debug_assert_eq!(ctx.iter_offset, 0, "store nodes carry no iter_offset");
+    let row = ctx.par(0);
+    let col = ctx.par(1);
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
     writeln!(
         s,
-        "  // store_o_tile: O_gmem[q_tile, head_group] ← O_frag / l"
+        "  // store_o_tile: O_gmem[{}, {}] ← O_frag / l",
+        row, col
     )
     .unwrap();
     match ctx.arch_name {
@@ -915,12 +963,12 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
             writeln!(s, "    mbarrier_arrive(&bar_o_ready);").unwrap();
             writeln!(s, "  }} else if (wg == STORER_WG) {{").unwrap();
             writeln!(s, "    mbarrier_wait(&bar_o_ready);").unwrap();
-            writeln!(s, "    tma_store_2d(O_gmem, smem_o, q_tile, head_group);").unwrap();
+            writeln!(s, "    tma_store_2d(O_gmem, smem_o, {}, {});", row, col).unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
             writeln!(s, "  O_frag = O_frag * rcp(l);").unwrap();
-            writeln!(s, "  stg_128(O_gmem, O_frag, q_tile, head_group);").unwrap();
+            writeln!(s, "  stg_128(O_gmem, O_frag, {}, {});", row, col).unwrap();
         }
         other => {
             writeln!(
@@ -929,7 +977,7 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
                 other
             )
             .unwrap();
-            writeln!(s, "  generic_store(O_gmem, O_frag, l, q_tile, head_group);").unwrap();
+            writeln!(s, "  generic_store(O_gmem, O_frag, l, {}, {});", row, col).unwrap();
         }
     }
     let _ = ctx.pipeline_depth;
@@ -1040,16 +1088,22 @@ fn generic_preamble_load(ctx: &ExpandCtx<'_>, smem: &str, gmem: &str, axis: &str
 /// through a `P`-deep ring via `slot = k_tile % PIPE`.
 fn generic_gemm(ctx: &ExpandCtx<'_>, acc: &str, smem_a: &str, smem_b: &str) -> String {
     debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    // Serial axis drives the slot rotation. Templates that host GEMM
+    // accumulate tags consistently name it `k_tile`, but paged-decode
+    // variants / future regions could pick a different reduction axis
+    // — using `ctx.ser()` keeps us honest either way.
+    let ser = ctx.ser();
     let body = match ctx.arch_name {
         "sm90_fa2" => format!(
             concat!(
                 "// {acc} += {a} @ {b}\n",
-                "uint32_t slot = k_tile % PIPE;\n",
+                "uint32_t slot = {ser} % PIPE;\n",
                 "wgmma_fence();\n",
                 "wgmma_mma_async({acc}, {a}[slot], {b}[slot]);\n",
                 "wgmma_commit_group();\n",
                 "wgmma_wait_group<0>();\n",
             ),
+            ser = ser,
             acc = acc,
             a = smem_a,
             b = smem_b,
@@ -1057,9 +1111,10 @@ fn generic_gemm(ctx: &ExpandCtx<'_>, acc: &str, smem_a: &str, smem_b: &str) -> S
         "sm89_fa2" => format!(
             concat!(
                 "// {acc} += {a} @ {b} (tiled mma.sync)\n",
-                "uint32_t slot = k_tile % PIPE;\n",
+                "uint32_t slot = {ser} % PIPE;\n",
                 "mma_sync_accumulate({acc}, {a}[slot], {b}[slot]);\n",
             ),
+            ser = ser,
             acc = acc,
             a = smem_a,
             b = smem_b,
@@ -1255,11 +1310,21 @@ fn embed_gather(ctx: &ExpandCtx<'_>) -> String {
 mod tests {
     use super::*;
 
+    /// FA2-style axis layout: `["q_tile", "head_group"]` parallel +
+    /// `Some("kv_tile")` serial. Used by the bulk of the expansion
+    /// tests below; attention-specific tags already hardcoded these
+    /// names, so keeping them here preserves the existing assertions
+    /// while exercising the threading path.
+    const FA2_PAR: &[&str] = &["q_tile", "head_group"];
+    const FA2_SER: Option<&str> = Some("kv_tile");
+
     fn ctx(arch: &'static str) -> ExpandCtx<'static> {
         ExpandCtx {
             arch_name: arch,
             iter_offset: 0,
             pipeline_depth: 3,
+            parallel_axes: FA2_PAR,
+            serial_axis: FA2_SER,
         }
     }
 
@@ -1286,6 +1351,8 @@ mod tests {
             arch_name: arch,
             iter_offset: 3,
             pipeline_depth: 3,
+            parallel_axes: FA2_PAR,
+            serial_axis: FA2_SER,
         }
     }
 
@@ -1385,10 +1452,14 @@ mod tests {
     // ── New-tag expansions ────────────────────────────────────────
 
     fn pipe_ctx_nonzero(arch: &'static str) -> ExpandCtx<'static> {
+        // GEMM-style axis layout for the A/B/C pipeline load tests:
+        // parallel = (m_tile, n_tile), serial = k_tile.
         ExpandCtx {
             arch_name: arch,
             iter_offset: 3,
             pipeline_depth: 3,
+            parallel_axes: &["m_tile", "n_tile"],
+            serial_axis: Some("k_tile"),
         }
     }
 
@@ -1581,6 +1652,85 @@ mod tests {
             LocalKind::FloatInit("-INFINITY").decl("m"),
             "float m = -INFINITY;"
         );
+    }
+
+    // ── Axis-name threading (item 3) ──────────────────────────────
+
+    #[test]
+    fn load_q_tile_paged_decode_uses_b_axis_not_q_tile() {
+        // paged_decode's parallel axes are (b, head_group). load_q_tile
+        // hard-coded `q_tile` in prior revisions; item 3 routes it
+        // through `ctx.par(0)` so paged decode emits `b`.
+        let ctx = ExpandCtx {
+            arch_name: "sm90_fa2",
+            iter_offset: 0,
+            pipeline_depth: 3,
+            parallel_axes: &["b", "head_group"],
+            serial_axis: Some("kv_tile"),
+        };
+        let s = expand("load_q_tile", &ctx).unwrap();
+        assert!(s.contains("tma_load_2d(smem_q, Q_gmem, b, head_group)"));
+        assert!(!s.contains("tma_load_2d(smem_q, Q_gmem, q_tile"));
+    }
+
+    #[test]
+    fn store_o_tile_paged_decode_uses_b_axis() {
+        let ctx = ExpandCtx {
+            arch_name: "sm90_fa2",
+            iter_offset: 0,
+            pipeline_depth: 3,
+            parallel_axes: &["b", "head_group"],
+            serial_axis: Some("kv_tile"),
+        };
+        let s = expand("store_o_tile", &ctx).unwrap();
+        assert!(s.contains("tma_store_2d(O_gmem, smem_o, b, head_group)"));
+    }
+
+    #[test]
+    fn qk_matmul_slot_calc_follows_serial_axis() {
+        // Same tag, two regions, two slot calcs — FA2 uses kv_tile,
+        // but a theoretical kv_tile-renamed region would get the
+        // correct name.
+        let fa2 = ExpandCtx {
+            arch_name: "sm90_fa2",
+            iter_offset: 0,
+            pipeline_depth: 3,
+            parallel_axes: FA2_PAR,
+            serial_axis: Some("kv_tile"),
+        };
+        assert!(
+            expand("qk_matmul", &fa2)
+                .unwrap()
+                .contains("uint32_t slot = kv_tile % PIPE;")
+        );
+
+        let renamed = ExpandCtx {
+            arch_name: "sm90_fa2",
+            iter_offset: 0,
+            pipeline_depth: 3,
+            parallel_axes: FA2_PAR,
+            serial_axis: Some("kv_chunk"),
+        };
+        assert!(
+            expand("qk_matmul", &renamed)
+                .unwrap()
+                .contains("uint32_t slot = kv_chunk % PIPE;")
+        );
+    }
+
+    #[test]
+    fn generic_gemm_slot_calc_follows_region_serial_axis() {
+        // GEMM regions use k_tile as the serial axis — threading
+        // shows up in gemm_accumulate too.
+        let gemm_ctx = ExpandCtx {
+            arch_name: "sm90_fa2",
+            iter_offset: 0,
+            pipeline_depth: 3,
+            parallel_axes: &["m_tile", "n_tile"],
+            serial_axis: Some("k_tile"),
+        };
+        let s = expand("gemm_accumulate", &gemm_ctx).unwrap();
+        assert!(s.contains("uint32_t slot = k_tile % PIPE;"));
     }
 
     #[test]

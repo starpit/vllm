@@ -49,12 +49,14 @@ pub fn emit_kernel_sketch(region: &Region, schedule: &Schedule, arch: &ArchMap) 
     writeln!(out, ") {{").unwrap();
 
     // Grid: parallel axes. Serial axis becomes an in-kernel for-loop.
-    let grid_axes: Vec<&str> = schedule
+    let parallel_axis_names: Vec<&'static str> = schedule
         .parallel_axes
         .iter()
         .map(|a| region.axis(*a).name)
         .collect();
-    writeln!(out, "  // grid: ({}).", grid_axes.join(", ")).unwrap();
+    let serial_axis_name: Option<&'static str> =
+        schedule.serial_axis.map(|id| region.axis(id).name);
+    writeln!(out, "  // grid: ({}).", parallel_axis_names.join(", ")).unwrap();
     for (i, a) in schedule.parallel_axes.iter().enumerate() {
         let ax = region.axis(*a);
         writeln!(
@@ -78,7 +80,16 @@ pub fn emit_kernel_sketch(region: &Region, schedule: &Schedule, arch: &ArchMap) 
     // Preamble.
     writeln!(out, "  // ── preamble ────────────────────────────────").unwrap();
     for step in &schedule.preamble {
-        emit_step(&mut out, region, arch, step, "  ", pipeline_depth);
+        emit_step(
+            &mut out,
+            region,
+            arch,
+            step,
+            "  ",
+            pipeline_depth,
+            &parallel_axis_names,
+            serial_axis_name,
+        );
     }
 
     // Body: serial loop or straight-line.
@@ -100,20 +111,47 @@ pub fn emit_kernel_sketch(region: &Region, schedule: &Schedule, arch: &ArchMap) 
         )
         .unwrap();
         for step in &schedule.body {
-            emit_step(&mut out, region, arch, step, "    ", pipeline_depth);
+            emit_step(
+                &mut out,
+                region,
+                arch,
+                step,
+                "    ",
+                pipeline_depth,
+                &parallel_axis_names,
+                serial_axis_name,
+            );
         }
         writeln!(out, "  }}").unwrap();
     } else {
         writeln!(out, "  // ── body (no serial axis) ───────────────").unwrap();
         for step in &schedule.body {
-            emit_step(&mut out, region, arch, step, "  ", pipeline_depth);
+            emit_step(
+                &mut out,
+                region,
+                arch,
+                step,
+                "  ",
+                pipeline_depth,
+                &parallel_axis_names,
+                serial_axis_name,
+            );
         }
     }
 
     // Epilogue.
     writeln!(out, "  // ── epilogue ────────────────────────────────").unwrap();
     for step in &schedule.epilogue {
-        emit_step(&mut out, region, arch, step, "  ", pipeline_depth);
+        emit_step(
+            &mut out,
+            region,
+            arch,
+            step,
+            "  ",
+            pipeline_depth,
+            &parallel_axis_names,
+            serial_axis_name,
+        );
     }
 
     writeln!(out, "}}").unwrap();
@@ -157,6 +195,7 @@ fn emit_role_prelude(out: &mut String, region: &Region, arch: &ArchMap) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_step(
     out: &mut String,
     region: &Region,
@@ -164,6 +203,8 @@ fn emit_step(
     step: &Step,
     indent: &str,
     pipeline_depth: u32,
+    parallel_axes: &[&'static str],
+    serial_axis: Option<&'static str>,
 ) {
     let node = region.node(step.node);
     // Fence-before: render each barrier primitive as a CUDA-ish stub.
@@ -174,6 +215,8 @@ fn emit_step(
         arch_name: arch.name,
         iter_offset: step.iter_offset,
         pipeline_depth,
+        parallel_axes,
+        serial_axis,
     };
     if let Some(body) = expand_op(node.op.tag, &expand_ctx) {
         // Indent every line of the expansion.

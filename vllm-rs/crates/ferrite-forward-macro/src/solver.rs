@@ -266,18 +266,74 @@ pub fn solve(
         })
         .collect();
 
+    // ── Precompute workload-invariant match info per (tile, impl). ──
+    //
+    // `target_compatible` and `matches` don't depend on `num_tokens`
+    // or `sk_bucket` — only on target + FUF structure. Before the
+    // 2-D sweep landed, solving ran 5 points per model and the
+    // redundant enumeration didn't matter; at 20 points it burns
+    // ~N_points× extra work through `matches()` (which walks tile
+    // inputs). Cache once per model, reuse across every point.
+    //
+    // `match_cache[i]` = list of `(impl_id, match_info)` for tile
+    // `fuf.nodes[i]`, filtered by target-compat and whose
+    // `matches()` returned Some. Per-point work then only re-checks
+    // `workload_constraint` + computes `cost_us`, avoiding the
+    // expensive structural match.
+    let t_cache = std::time::Instant::now();
+    let match_cache: Vec<Vec<(ImplId, MatchInfo)>> = fuf
+        .nodes
+        .par_iter()
+        .map(|node| {
+            let mut out = Vec::new();
+            for (imp_id, imp) in lib.iter_enumerated() {
+                if !imp.target_compatible(target) {
+                    continue;
+                }
+                if let Some(info) = imp.matches(fuf, node.id, target) {
+                    out.push((imp_id, info));
+                }
+            }
+            out
+        })
+        .collect();
+    let d_cache = t_cache.elapsed();
+
     // Each workload point is an independent solve: the DP table and
     // matches_at vector are rebuilt from scratch per point (workload
     // constraints and per-impl costs vary with both axes). Running
     // them in parallel drops the total from `Σ per-workload` to
     // `max(per-workload)` on well-parallel hardware.
+    //
+    // Per-phase timing is summed across workers via atomic counters
+    // so the macro driver (lib.rs) can print a breakdown per model
+    // and we can stop guessing where time is going.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let ns_phase1 = AtomicU64::new(0);
+    let ns_phase2 = AtomicU64::new(0);
+    let ns_phase3 = AtomicU64::new(0);
+    let ns_phase4 = AtomicU64::new(0);
+
     let solved: Vec<Result<(WorkloadPoint, Assignment), SolveError>> = points
         .par_iter()
         .map(|&wp| {
             let mut scratch = bounds.clone();
             scratch.insert("num_tokens".into(), wp.num_tokens);
             scratch.insert("sk_bucket".into(), wp.sk_bucket);
-            solve_one(fuf, lib, target, inferred, &scratch, wp).map(|a| (wp, a))
+            solve_one(
+                fuf,
+                lib,
+                target,
+                inferred,
+                &scratch,
+                wp,
+                &match_cache,
+                &ns_phase1,
+                &ns_phase2,
+                &ns_phase3,
+                &ns_phase4,
+            )
+            .map(|a| (wp, a))
         })
         .collect();
 
@@ -287,11 +343,24 @@ pub fn solve(
         per_workload.insert(wp, a);
     }
 
+    eprintln!(
+        "    solve-profile: tiles={} impls={} points={} | cache={}ms p1(cost+filter)={}ms p2(mask)={}ms p3(dp)={}ms p4(reconstruct)={}ms",
+        fuf.len(),
+        lib.len(),
+        points.len(),
+        d_cache.as_millis(),
+        ns_phase1.load(Ordering::Relaxed) / 1_000_000,
+        ns_phase2.load(Ordering::Relaxed) / 1_000_000,
+        ns_phase3.load(Ordering::Relaxed) / 1_000_000,
+        ns_phase4.load(Ordering::Relaxed) / 1_000_000,
+    );
+
     Ok(WorkloadAssignments { per_workload })
 }
 
 /// One pass of the DP over the whole FUF at a single workload
 /// point. Returns the SFUF.
+#[allow(clippy::too_many_arguments)]
 fn solve_one(
     fuf: &Fuf,
     lib: &ImplementationLibrary,
@@ -299,7 +368,13 @@ fn solve_one(
     inferred: &Inferred,
     bounds: &BTreeMap<String, u64>,
     point: WorkloadPoint,
+    match_cache: &[Vec<(ImplId, MatchInfo)>],
+    ns_phase1: &std::sync::atomic::AtomicU64,
+    ns_phase2: &std::sync::atomic::AtomicU64,
+    ns_phase3: &std::sync::atomic::AtomicU64,
+    ns_phase4: &std::sync::atomic::AtomicU64,
 ) -> Result<Assignment, SolveError> {
+    use std::sync::atomic::Ordering as AtomicOrdering;
     let num_tokens = point.num_tokens;
     let sk_bucket = point.sk_bucket;
     let n = fuf.len();
@@ -311,15 +386,8 @@ fn solve_one(
         });
     }
 
-    // ── Phase 1: precompute candidate matches per tile ──
-    //
-    // For each tile (in topological order), enumerate every library
-    // Impl whose target/workload filters admit this context. Call
-    // matches() at this seed tile; if it returns Some, cost the
-    // match. Unlike greedy, the DP considers all candidates at each
-    // position — no need to sort for optimality. We still sort by
-    // claim size descending for nicer tiebreak determinism during
-    // reconstruction.
+    let t_p1 = std::time::Instant::now();
+    // ── Phase 1: per-point filter + cost evaluation ──
     let mut matches_at: Vec<Vec<(ImplId, MatchInfo, f64)>> = vec![Vec::new(); n];
 
     let ctx = CostCtx {
@@ -329,29 +397,24 @@ fn solve_one(
     };
 
     for (i, node) in fuf.nodes.iter().enumerate() {
-        for (imp_id, imp) in lib.iter_enumerated() {
-            if !imp.target_compatible(target) {
-                continue;
-            }
+        for (imp_id, info) in &match_cache[i] {
+            let imp = lib.get(*imp_id);
             if !imp
                 .workload_constraint()
                 .accepts(num_tokens as u32, sk_bucket)
             {
                 continue;
             }
-            let Some(info) = imp.matches(fuf, node.id, target) else {
-                continue;
-            };
-            let cost = imp.cost_us(&info, &ctx);
+            let cost = imp.cost_us(info, &ctx);
             if !cost.is_finite() {
                 return Err(SolveError::UnreachableCost {
                     tile: node.id,
                     op: node.op,
-                    impl_id: imp_id,
+                    impl_id: *imp_id,
                     point,
                 });
             }
-            matches_at[i].push((imp_id, info, cost));
+            matches_at[i].push((*imp_id, info.clone(), cost));
         }
 
         // Sort: claim size DESCENDING, then cost ASCENDING.
@@ -376,7 +439,9 @@ fn solve_one(
         });
     }
     let _ = inferred; // no longer used here — shapes come via ctx.fuf
+    ns_phase1.fetch_add(t_p1.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
 
+    let t_p2 = std::time::Instant::now();
     // ── Phase 2: convert candidate claim_tiles to bitmasks ──
     //
     // Each candidate's claim_tiles becomes a K-bit mask relative to
@@ -418,66 +483,105 @@ fn solve_one(
                 .collect()
         })
         .collect();
+    ns_phase2.fetch_add(t_p2.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
 
-    // ── Phase 3: DP backward fill ──
+    let t_p3 = std::time::Instant::now();
+    // ── Phase 3: sparse FORWARD DP ──
     //
-    // dp[i][cs] = min cost from position i onward given claim_state cs.
-    // f64::INFINITY for infeasible states. Storage: (n+1) × 2^K.
-    let state_count: usize = 1 << K;
-    let infeasible = DpEntry {
-        cost: f64::INFINITY,
-        choice: None,
-    };
-    let mut dp: Vec<Vec<DpEntry>> = vec![vec![infeasible; state_count]; n + 1];
+    // Old formulation: dense backward-DP with `dp[i][cs]` a
+    // `Vec<Vec<DpEntry>>` of size `(n+1) × 2^K`. At K=16 (bumped
+    // for Gemma3's 12-tile QK-norm fusion) that's 65 536 states
+    // per position — a 972-tile FUF meant iterating 64M cells
+    // per solve × 20 workload points × 33 models = tens of
+    // billions of iterations plus ~1.5 GB of Vec allocation per
+    // solve. Measured: 174 seconds of Phase 3 alone for a single
+    // gemma2-27b solve set. That's the compile-time pain.
+    //
+    // New formulation: forward DP with sparse state. Start from
+    // `dp[0]={0: 0.0}` and propagate only REACHABLE states.
+    // Each reachable cell records a back-pointer `(prev_cs,
+    // choice)` so we can reconstruct the picked sequence. Most
+    // positions have only a handful of reachable claim_states
+    // (bounded by the product of candidate-count × claim-spread
+    // up to that position), so memory + time collapse from
+    // `2^K × n` to roughly `candidates × n`.
+    //
+    // Correctness: identical optimal-plan guarantee as backward
+    // DP — we cover the same transition graph, just visit only
+    // reachable nodes. Tie-breaking (min cost) is preserved.
+    #[derive(Clone, Copy)]
+    struct SparseCell {
+        cost: f64,
+        /// claim_state at position `i-1` that produced this cell
+        /// (via the transition at position i-1).
+        prev_cs: ClaimMask,
+        /// Candidate chosen AT position `i-1` to arrive here.
+        /// `None` means position i-1 was a pass-through (its
+        /// tile was pre-claimed by an earlier multi-tile impl).
+        choice: Option<(ImplId, ClaimMask)>,
+    }
 
-    // Base: reaching the end with no pending claims is the only
-    // feasible terminal state.
-    dp[n][0] = DpEntry {
-        cost: 0.0,
-        choice: None,
-    };
+    let mut dp: Vec<HashMap<ClaimMask, SparseCell>> = vec![HashMap::new(); n + 1];
+    dp[0].insert(
+        0,
+        SparseCell {
+            cost: 0.0,
+            prev_cs: 0,
+            choice: None,
+        },
+    );
 
-    for i in (0..n).rev() {
-        for cs in 0u32..(state_count as u32) {
-            let cs_mask = cs as ClaimMask;
-            let next_cs = (cs_mask >> 1) as usize;
+    let update =
+        |cell_map: &mut HashMap<ClaimMask, SparseCell>, key: ClaimMask, cand: SparseCell| {
+            let better = match cell_map.get(&key) {
+                Some(ex) => ex.cost > cand.cost,
+                None => true,
+            };
+            if better {
+                cell_map.insert(key, cand);
+            }
+        };
 
-            if cs_mask & 1 != 0 {
+    for i in 0..n {
+        // Snapshot `dp[i]` to avoid borrow conflicts while writing
+        // `dp[i+1]` in the same iteration. `dp[i]` is small
+        // (sparse), so cloning its (key, cost) pairs is cheap.
+        let at_i: Vec<(ClaimMask, f64)> = dp[i].iter().map(|(k, c)| (*k, c.cost)).collect();
+        for (cs, cost) in at_i {
+            if cs & 1 != 0 {
                 // Tile i is pre-claimed — pass through.
-                let next = &dp[i + 1][next_cs];
-                if next.cost.is_finite() {
-                    dp[i][cs as usize] = DpEntry {
-                        cost: next.cost,
+                let new_cs = cs >> 1;
+                update(
+                    &mut dp[i + 1],
+                    new_cs,
+                    SparseCell {
+                        cost,
+                        prev_cs: cs,
                         choice: None,
-                    };
-                }
-                continue;
-            }
-
-            // Tile i is unclaimed — try each candidate.
-            let mut best = infeasible;
-            for cand in &candidates[i] {
-                if cand.mask & cs_mask != 0 {
-                    continue; // conflict with pending claims
-                }
-                let new_cs = ((cs_mask | cand.mask) >> 1) as usize;
-                let next = &dp[i + 1][new_cs];
-                if !next.cost.is_finite() {
-                    continue;
-                }
-                let total = cand.cost + next.cost;
-                if total < best.cost {
-                    best = DpEntry {
-                        cost: total,
-                        choice: Some((cand.imp_id, cand.mask)),
-                    };
+                    },
+                );
+            } else {
+                for cand in &candidates[i] {
+                    if cand.mask & cs != 0 {
+                        continue; // conflict with pending claims
+                    }
+                    let new_cs = (cs | cand.mask) >> 1;
+                    let new_cost = cost + cand.cost;
+                    update(
+                        &mut dp[i + 1],
+                        new_cs,
+                        SparseCell {
+                            cost: new_cost,
+                            prev_cs: cs,
+                            choice: Some((cand.imp_id, cand.mask)),
+                        },
+                    );
                 }
             }
-            dp[i][cs as usize] = best;
         }
     }
 
-    if !dp[0][0].cost.is_finite() {
+    let Some(terminal) = dp[n].get(&0).copied() else {
         // No feasible plan for this workload. Emit the specific
         // tile where we ran out of candidates.
         if let Some((i, _)) = candidates.iter().enumerate().find(|(_, c)| c.is_empty()) {
@@ -487,42 +591,47 @@ fn solve_one(
                 point,
             });
         }
-        // Every tile has candidates but the DP still failed — means
-        // the bitmask K is too small for some multi-tile claim.
-        // Bump K if this ever fires.
+        // Every tile has candidates but no feasible terminal state
+        // — K is too small or some multi-tile claim is unreachable.
         return Err(SolveError::UnclaimedTile {
             tile: fuf.nodes[0].id,
             op: fuf.nodes[0].op,
             point,
         });
+    };
+    ns_phase3.fetch_add(t_p3.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+
+    let t_p4 = std::time::Instant::now();
+    // ── Phase 4: reconstruct from forward DP back-pointers. ──
+    //
+    // Walk dp[n] → dp[n-1] → … → dp[0], recovering the choice
+    // made at each position. `terminal` is the cell at dp[n][0];
+    // `terminal.prev_cs` is the claim-state at dp[n-1] that led
+    // here, and `terminal.choice` is the candidate picked at
+    // position n-1 (or None for pass-through).
+    let mut choices_at: Vec<Option<(ImplId, ClaimMask)>> = vec![None; n];
+    let mut cell = terminal;
+    for i in (0..n).rev() {
+        choices_at[i] = cell.choice;
+        if i > 0 {
+            cell = dp[i][&cell.prev_cs];
+        }
     }
 
-    // ── Phase 4: forward reconstruction ──
-    //
-    // Walk from (position 0, claim_state 0) following stored choices.
-    // Allocate subgraph ids in visitation order.
+    // Walk forward, allocating subgraph ids in visitation order.
     let mut assignment = Assignment::default();
     let mut next_sg: u32 = 0;
-    let mut cs: ClaimMask = 0;
     let mut total = 0.0_f64;
 
     for i in 0..n {
-        let entry = dp[i][cs as usize];
-        let (imp_id, mask) = match entry.choice {
+        let (imp_id, mask) = match choices_at[i] {
             Some(c) => c,
-            None => {
-                // Pass-through; tile was pre-claimed.
-                cs >>= 1;
-                continue;
-            }
+            None => continue, // pass-through
         };
 
         let sg = SubgraphId(next_sg);
         next_sg += 1;
 
-        // Mark all tiles claimed by this impl, and recover the
-        // per-impl cost. We stored imp_id + mask; look up the cost
-        // again from the matching candidate for determinism.
         let cand = candidates[i]
             .iter()
             .find(|c| c.imp_id == imp_id && c.mask == mask)
@@ -538,8 +647,6 @@ fn solve_one(
         }
         assignment.impls.insert(sg, imp_id);
         total += cand.cost;
-
-        cs = (cs | mask) >> 1;
     }
 
     // Invariant: every tile is claimed.
@@ -550,6 +657,7 @@ fn solve_one(
     );
 
     assignment.predicted_us = total;
+    ns_phase4.fetch_add(t_p4.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     Ok(assignment)
 }
 
@@ -561,14 +669,6 @@ struct Candidate {
     /// is always set by construction.
     mask: u16,
     cost: f64,
-}
-
-/// DP table entry: best cost and the choice that achieved it (or
-/// `None` if this position was passed through — pre-claimed).
-#[derive(Debug, Clone, Copy)]
-struct DpEntry {
-    cost: f64,
-    choice: Option<(ImplId, u16)>,
 }
 
 /// Resolve each tile input's shape for the cost function.

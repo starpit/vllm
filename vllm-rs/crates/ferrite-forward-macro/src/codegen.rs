@@ -38,9 +38,9 @@ use syn::Ident;
 
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
-use crate::emit::{EmitCtx, LocalMap};
+use crate::emit::{EmitCtx, EmitMode, LocalMap};
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
+use crate::impl_lib::{ImplId, ImplementationLibrary, WeightAccessor};
 use crate::schedule::{Loop, WorkloadLoops};
 use crate::solver::{Assignment, SubgraphId, WorkloadAssignments};
 
@@ -1410,6 +1410,341 @@ fn build_local_map(fuf: &Fuf) -> LocalMap {
     locals
 }
 
+/// Per-model library of deduplicated kernel-call fragments.
+///
+/// Each entry is a private `unsafe fn __frag_<N>(...)` emitted
+/// inside the model's module. The forward body (and the backbone
+/// body) replaces its inline kernel calls with one-line
+/// `let (t_a, t_b) = unsafe { __frag_N(tile_inputs, weight_refs,
+/// wm, ctx, device) };` dispatches against this library. Two
+/// subgraphs whose abstract-mode emit_call output stringifies
+/// identically share a fragment — the critical win is layer-level
+/// sharing inside a single model (one rmsnorm body emitted once,
+/// called N times for an N-layer transformer).
+///
+/// Fragment fn body = `emit_call` output in `EmitMode::Abstract`
+/// mode, where tile/weight references are replaced by fn-param
+/// idents (`input_<i>`, `w_<i>`). Extern references like
+/// `wm.rotary_local` / `ctx.input_ids` stay verbatim and are
+/// resolved via the `wm` / `ctx` params the fragment takes;
+/// they're consistent across call sites within a model, so they
+/// don't defeat dedup.
+#[derive(Default)]
+struct FragmentLibrary {
+    /// Stringified abstract-body signature → fragment index.
+    by_sig: HashMap<String, usize>,
+    /// Fragment fn tokens, in insertion order. Index matches the
+    /// N in `__frag_N`.
+    fns: Vec<TokenStream>,
+}
+
+/// Diagnostic counters for dedup effectiveness. Reset after each
+/// per-model emit_model print so the output shows per-model stats.
+static CALL_SITE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static INLINE_FALLBACK_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl FragmentLibrary {
+    fn into_fns(self) -> Vec<TokenStream> {
+        self.fns
+    }
+}
+
+/// Decide whether a subgraph's emit can be pulled out into a
+/// reusable fragment fn.
+///
+/// Inlineable-only cases (returns `false`):
+/// - `output_alias` reports any output that borrows from an
+///   upstream tile — the fragment would need to return a
+///   `TensorView<'a>` tied to a caller-owned OwnedTensor, and
+///   lifting that through a fn boundary adds lifetime noise with
+///   no win.
+/// - `consumes_input_tiles` is non-empty — the fragment would
+///   need to take the upstream tile by value, changing ownership
+///   in the call site in ways the drop-pass already assumes. Easier
+///   to leave these inline.
+fn can_fragmentize(
+    imp: &dyn crate::impl_lib::Implementation,
+    claimed: &[TileId],
+    fuf: &Fuf,
+) -> bool {
+    // Output aliasing stays inline. An aliasing output is a
+    // `TensorView<'a>` that borrows an upstream OwnedTensor;
+    // returning that through a fn boundary means the fragment fn
+    // declares a lifetime tied to a consumed input, and the outer
+    // bucket body must preserve that borrow across downstream
+    // subgraph calls. Tractable but deferred.
+    if !imp
+        .output_alias(claimed, fuf)
+        .iter()
+        .all(|(_, src)| src.is_none())
+    {
+        return false;
+    }
+    // Multi-output tiles (e.g. rope_append producing q/k/v) need a
+    // tuple return + multi-binding call site; handle later. For now
+    // leave them inline.
+    for &t in claimed {
+        if fuf.get(t).outputs.len() > 1 {
+            return false;
+        }
+    }
+    // Multi-tile subgraphs (fused kernels claiming > 1 tile) need
+    // the fragment to emit bindings for every internal tile's
+    // output, then return the subgraph's last tile's output.
+    // Supported, but check claimed.len() is at least 1.
+    //
+    // Note: `consumes_input_tiles()` is NOT a bar to fragmentizing.
+    // Consumed boundary inputs are lifted to fragment fn params
+    // typed `OwnedTensor` (by value) vs `TensorView<'_>` (by view)
+    // — see `emit_subgraph`.
+    !claimed.is_empty()
+}
+
+/// Emit one subgraph. Uses the fragment library when the subgraph's
+/// impl is "clean" (no aliased / consumed outputs); falls back to
+/// inline emission otherwise.
+#[allow(clippy::too_many_arguments)]
+fn emit_subgraph(
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    program: &Program,
+    model: &ModelParams,
+    lib: &ImplementationLibrary,
+    sg: SubgraphId,
+    imp_id: ImplId,
+    locals: &LocalMap,
+    library: &mut FragmentLibrary,
+) -> TokenStream {
+    let imp = lib.get(imp_id);
+    let claimed = sfuf.tiles_in_subgraph(sg);
+
+    if !can_fragmentize(imp, &claimed, fuf) {
+        INLINE_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ctx = EmitCtx {
+            fuf,
+            program,
+            model,
+            claimed_tiles: &claimed,
+            locals,
+            mode: EmitMode::Concrete,
+        };
+        return imp.emit_call(&ctx);
+    }
+    CALL_SITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Collect boundary tile inputs (inputs whose producer is not
+    // in claimed_tiles), in the order they appear across claimed
+    // tiles' input lists. Dedupe — the same boundary output can
+    // feed multiple claimed tiles but only one fn param.
+    //
+    // Split into VIEWED (kernel only reads) vs CONSUMED (impl's
+    // `consumes_input_tiles()` moves the upstream owner into its
+    // own output — in-place kernels like add_rmsnorm). Viewed
+    // become `TensorView<'_>` fn params; consumed become
+    // `OwnedTensor` fn params (by value).
+    let consumed_set: HashSet<(TileId, u8)> = imp
+        .consumes_input_tiles(&claimed, fuf)
+        .into_iter()
+        .collect();
+    let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+    let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+    let mut consumed_params_ordered: Vec<(TileId, u8)> = Vec::new();
+    let mut seen_boundary: HashSet<(TileId, u8)> = HashSet::new();
+    for &t in &claimed {
+        let node = fuf.get(t);
+        for input in &node.inputs {
+            if let FufInput::Tile { id, slot } = input
+                && !claimed_set.contains(id)
+                && seen_boundary.insert((*id, *slot))
+            {
+                if consumed_set.contains(&(*id, *slot)) {
+                    consumed_params_ordered.push((*id, *slot));
+                } else {
+                    tile_params_ordered.push((*id, *slot));
+                }
+            }
+        }
+    }
+
+    // Weight accessors as declared by the impl. Each becomes one
+    // fragment param of the accessor's `rust_type`.
+    let accessors: Vec<WeightAccessor> = imp.required_weights(&claimed, fuf, program);
+
+    // Build the abstract EmitCtx: tile/weight params replace
+    // concrete `locals[..]` / `wm.<field>` references.
+    let mut tile_params: HashMap<(TileId, u8), syn::Ident> = HashMap::new();
+    let mut tile_param_idents: Vec<syn::Ident> = Vec::with_capacity(tile_params_ordered.len());
+    for (i, &(id, slot)) in tile_params_ordered.iter().enumerate() {
+        let p = format_ident!("input_{}", i);
+        tile_params.insert((id, slot), p.clone());
+        tile_param_idents.push(p);
+    }
+    let mut consumed_params: HashMap<(TileId, u8), syn::Ident> = HashMap::new();
+    let mut consumed_param_idents: Vec<syn::Ident> =
+        Vec::with_capacity(consumed_params_ordered.len());
+    for (i, &(id, slot)) in consumed_params_ordered.iter().enumerate() {
+        let p = format_ident!("consumed_{}", i);
+        consumed_params.insert((id, slot), p.clone());
+        consumed_param_idents.push(p);
+    }
+    let mut weight_params: HashMap<(WeightId, Option<u64>), syn::Ident> = HashMap::new();
+    let mut weight_params_by_name: HashMap<String, syn::Ident> = HashMap::new();
+    let mut weight_param_idents: Vec<syn::Ident> = Vec::with_capacity(accessors.len());
+    for (i, acc) in accessors.iter().enumerate() {
+        let p = format_ident!("w_{}", i);
+        for &(wid, idx) in &acc.source_weights {
+            weight_params.insert((wid, idx), p.clone());
+        }
+        weight_params_by_name.insert(acc.name.to_string(), p.clone());
+        weight_param_idents.push(p);
+    }
+
+    let abstract_ctx = EmitCtx {
+        fuf,
+        program,
+        model,
+        claimed_tiles: &claimed,
+        locals,
+        mode: EmitMode::Abstract {
+            tile_params,
+            consumed_params,
+            weight_params,
+            weight_params_by_name,
+        },
+    };
+    let abstract_body = imp.emit_call(&abstract_ctx);
+
+    // Fragment return value: the LAST claimed tile's slot-0
+    // output. `output_ident` in Abstract mode returns
+    // `__out_<claimed_pos>_<slot>`, so the return ident is
+    // `__out_<claimed.len()-1>_0`. Multi-output subgraphs are
+    // filtered out by `can_fragmentize`; fused multi-tile subgraphs
+    // return the last tile's output (matches how the solver
+    // committed the subgraph — topological final).
+    let out_tile = *claimed.last().expect("non-empty claimed");
+    let out_slot: u8 = 0;
+    let out_claimed_pos = claimed.len() - 1;
+
+    // Signature. The abstract body string captures the kernel call
+    // shape; adding input/weight/output counts distinguishes
+    // fragments that happen to stringify the same but differ in
+    // param arity (defensive).
+    let weight_types_str: String = accessors
+        .iter()
+        .map(|a| a.rust_type.to_string())
+        .collect::<Vec<_>>()
+        .join("|");
+    let sig = format!(
+        "ti={}|ci={}|wt={}|body={}",
+        tile_params_ordered.len(),
+        consumed_params_ordered.len(),
+        weight_types_str,
+        abstract_body,
+    );
+
+    // Intern the fragment. On miss, build and push the fn tokens.
+    let frag_idx = if let Some(&idx) = library.by_sig.get(&sig) {
+        idx
+    } else {
+        let idx = library.fns.len();
+        let frag_name = format_ident!("__frag_{}", idx);
+
+        let tile_param_decls: Vec<TokenStream> = tile_param_idents
+            .iter()
+            .map(|p| {
+                quote! {
+                    #p: ::ferrite_cuda_core::TensorView<'_>
+                }
+            })
+            .collect();
+        let consumed_param_decls: Vec<TokenStream> = consumed_param_idents
+            .iter()
+            .map(|p| {
+                quote! {
+                    #p: ::ferrite_cuda_core::alloc::OwnedTensor
+                }
+            })
+            .collect();
+        let weight_param_decls: Vec<TokenStream> = accessors
+            .iter()
+            .zip(weight_param_idents.iter())
+            .map(|(acc, p)| {
+                let ty = &acc.rust_type;
+                quote! { #p: & #ty }
+            })
+            .collect();
+
+        let return_ident = format_ident!("__out_{}_{}", out_claimed_pos, out_slot);
+        let fn_tokens = quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(clippy::too_many_arguments, unused_mut, unused_variables, non_snake_case)]
+            unsafe fn #frag_name(
+                #(#tile_param_decls,)*
+                #(#consumed_param_decls,)*
+                #(#weight_param_decls,)*
+                wm: &Weights,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                #abstract_body
+                #return_ident
+            }
+        };
+        library.by_sig.insert(sig, idx);
+        library.fns.push(fn_tokens);
+        idx
+    };
+
+    // Call site. Viewed tile args are wrapped `(*local).as_view()`
+    // (TensorView, Copy); consumed tile args are passed by move
+    // (the upstream local becomes inaccessible, which the drop
+    // pass already accounts for via `consumes_input_tiles`).
+    // Weight args go through the accessor's field name on `wm` —
+    // for fused accessors that's the fused field, for singletons
+    // it's the per-weight field.
+    let frag_name = format_ident!("__frag_{}", frag_idx);
+    let input_args: Vec<TokenStream> = tile_params_ordered
+        .iter()
+        .map(|&(id, slot)| {
+            let local = &locals[&(id, slot)];
+            quote! { (*#local).as_view() }
+        })
+        .collect();
+    let consumed_args: Vec<TokenStream> = consumed_params_ordered
+        .iter()
+        .map(|&(id, slot)| {
+            let local = &locals[&(id, slot)];
+            quote! { #local }
+        })
+        .collect();
+    let weight_args: Vec<TokenStream> = accessors
+        .iter()
+        .map(|acc| {
+            let name = &acc.name;
+            quote! { &wm.#name }
+        })
+        .collect();
+
+    let out_local = locals
+        .get(&(out_tile, out_slot))
+        .cloned()
+        .expect("output local for claimed tile must exist");
+
+    quote! {
+        let #out_local = unsafe {
+            #frag_name(
+                #(#input_args,)*
+                #(#consumed_args,)*
+                #(#weight_args,)*
+                wm,
+                ctx,
+                device,
+            )
+        };
+    }
+}
+
 /// Emit the wave walk for one bucket, optionally skipping a single
 /// subgraph (the terminal lm_head) and with a caller-chosen
 /// `protected` set for drop analysis. Shared by:
@@ -1428,6 +1763,7 @@ fn emit_wave_walk(
     locals: &LocalMap,
     skip_subgraph: Option<SubgraphId>,
     protected: &HashSet<(TileId, u8)>,
+    library: &mut FragmentLibrary,
 ) -> Vec<TokenStream> {
     let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, skip_subgraph, protected);
     let mut body: Vec<TokenStream> = Vec::new();
@@ -1436,15 +1772,9 @@ fn emit_wave_walk(
             if Some(*sg) == skip_subgraph {
                 continue;
             }
-            let claimed = sfuf.tiles_in_subgraph(*sg);
-            let ctx = EmitCtx {
-                fuf,
-                program,
-                model,
-                claimed_tiles: &claimed,
-                locals,
-            };
-            body.push(lib.get(*imp_id).emit_call(&ctx));
+            body.push(emit_subgraph(
+                fuf, sfuf, program, model, lib, *sg, *imp_id, locals, library,
+            ));
             if let Some(owners) = drops.get(sg) {
                 for (t, s) in owners {
                     let ident = &locals[&(*t, *s)];
@@ -1468,6 +1798,7 @@ fn emit_wave_walk(
 ///
 /// The emitted fn's signature mirrors `forward_m_<N>` exactly except
 /// for the name and semantic return value.
+#[allow(clippy::too_many_arguments)]
 fn emit_forward_for_bucket(
     fuf: &Fuf,
     sfuf: &Assignment,
@@ -1476,6 +1807,7 @@ fn emit_forward_for_bucket(
     model: &ModelParams,
     lib: &ImplementationLibrary,
     wp: crate::solver::WorkloadPoint,
+    library: &mut FragmentLibrary,
 ) -> TokenStream {
     let locals = build_local_map(fuf);
 
@@ -1486,7 +1818,7 @@ fn emit_forward_for_bucket(
         protected.insert((last.id, 0));
     }
     let body = emit_wave_walk(
-        fuf, sfuf, loop_ir, program, model, lib, &locals, None, &protected,
+        fuf, sfuf, loop_ir, program, model, lib, &locals, None, &protected, library,
     );
 
     // The forward's return value: the last tile's output.
@@ -1520,6 +1852,7 @@ fn emit_forward_for_bucket(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_forward_backbone_for_bucket(
     fuf: &Fuf,
     sfuf: &Assignment,
@@ -1528,6 +1861,7 @@ fn emit_forward_backbone_for_bucket(
     model: &ModelParams,
     lib: &ImplementationLibrary,
     wp: crate::solver::WorkloadPoint,
+    library: &mut FragmentLibrary,
 ) -> TokenStream {
     let locals = build_local_map(fuf);
 
@@ -1571,6 +1905,7 @@ fn emit_forward_backbone_for_bucket(
         &locals,
         Some(terminal_sg),
         &protected,
+        library,
     );
 
     let fn_name = bucket_fn_ident("forward_backbone_m", wp);
@@ -1684,6 +2019,12 @@ pub fn emit_model(
         bucket_canonical.push(canonical);
     }
 
+    // Per-model fragment library. `emit_forward_for_bucket` and
+    // `emit_forward_backbone_for_bucket` both feed into it; the
+    // resulting unique fn bodies get spliced into the emitted
+    // module alongside the forward dispatchers.
+    let mut fragment_library = FragmentLibrary::default();
+
     let mut bucket_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
     let mut backbone_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
     for (i, wp) in bucket_points.iter().enumerate() {
@@ -1695,10 +2036,24 @@ pub fn emit_model(
                 .get(wp)
                 .expect("schedule populated every key");
             bucket_fns.push(emit_forward_for_bucket(
-                fuf, sfuf, loop_ir, program, model, lib, *wp,
+                fuf,
+                sfuf,
+                loop_ir,
+                program,
+                model,
+                lib,
+                *wp,
+                &mut fragment_library,
             ));
             backbone_fns.push(emit_forward_backbone_for_bucket(
-                fuf, sfuf, loop_ir, program, model, lib, *wp,
+                fuf,
+                sfuf,
+                loop_ir,
+                program,
+                model,
+                lib,
+                *wp,
+                &mut fragment_library,
             ));
         } else {
             let fwd_name = bucket_fn_ident("forward_m", *wp);
@@ -1832,8 +2187,26 @@ pub fn emit_model(
     let (match_arms, fallback_arm) = build_match_arms("forward_m");
     let (backbone_match_arms, backbone_fallback_arm) = build_match_arms("forward_backbone_m");
 
+    // Per-model fragment library: each unique kernel-call body
+    // emitted once as `__frag_<N>`. Forward/backbone bodies are a
+    // sequence of one-line `let t_X = unsafe { __frag_N(...) };`
+    // dispatches against this library, so multi-layer transformers
+    // stop emitting the same rmsnorm / gemm / silu etc body once
+    // per layer.
+    let fragment_fns = fragment_library.into_fns();
+    eprintln!(
+        "    codegen-profile: {} fragments emitted, {} call sites, {} inline-fallback sites",
+        fragment_fns.len(),
+        CALL_SITE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        INLINE_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    CALL_SITE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    INLINE_FALLBACK_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+
     quote! {
         #weights
+
+        #(#fragment_fns)*
 
         #(#bucket_fns)*
         #(#backbone_fns)*

@@ -19,4 +19,4 @@ pub use ir::{
     Edge, FufOpRef, LoadAddr, Megakernel, Node, NodeId, Predicate, Region, RegionId, Role,
     ScalarBinding, ScalarId, SmemLookup, StrideExpr,
 };
-pub use template::{AttnParams, Window, attn_region};
+pub use template::{AttnParams, PagedDecodeParams, Window, attn_region, attn_region_paged_decode};

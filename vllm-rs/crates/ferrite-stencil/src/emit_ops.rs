@@ -32,6 +32,7 @@ pub struct ExpandCtx<'a> {
 /// `tag();` line.
 pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
     match tag {
+        // ── Attention (FA2 + paged decode) ──
         "load_q_tile" => Some(load_q_tile(ctx)),
         "load_k_tile" => Some(load_kv_tile(ctx, "k")),
         "load_v_tile" => Some(load_kv_tile(ctx, "v")),
@@ -39,6 +40,117 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "softmax_update" => Some(softmax_update(ctx)),
         "pv_matmul" => Some(pv_matmul(ctx)),
         "store_o_tile" => Some(store_o_tile(ctx)),
+        // ── GEMM (+ quant variants share this) ──
+        "load_a_tile" => Some(generic_pipeline_load(
+            ctx, "smem_a", "A_gmem", "m_tile", "k_tile",
+        )),
+        "load_b_tile" => Some(generic_pipeline_load(
+            ctx, "smem_b", "B_gmem", "k_tile", "n_tile",
+        )),
+        "gemm_accumulate" => Some(generic_gemm(ctx, "C_frag", "smem_a", "smem_b")),
+        "store_c_tile" => Some(generic_store(ctx, "C_gmem", "C_frag", "m_tile", "n_tile")),
+        // ── RMSNorm / LayerNorm / Add ──
+        "load_x_row" => Some(generic_preamble_load(ctx, "smem_x", "X_gmem", "token_tile")),
+        "load_weight" => Some(generic_preamble_load(ctx, "smem_w", "W_gmem", "token_tile")),
+        "rmsnorm_compute" => Some(rmsnorm_compute(ctx)),
+        "store_y_row" => Some(generic_store(
+            ctx,
+            "Y_gmem",
+            "Y_frag",
+            "token_tile",
+            "/*hidden*/",
+        )),
+        "load_a_row" => Some(generic_preamble_load(ctx, "smem_a", "A_gmem", "token_tile")),
+        "load_b_row" => Some(generic_preamble_load(ctx, "smem_b", "B_gmem", "token_tile")),
+        "elementwise_add" => Some(elementwise_add(ctx)),
+        "store_sum_row" => Some(generic_store(
+            ctx,
+            "Sum_gmem",
+            "sum_frag",
+            "token_tile",
+            "/*hidden*/",
+        )),
+        // ── QKV + RoPE ──
+        "load_wqkv_tile" => Some(generic_pipeline_load(
+            ctx,
+            "smem_wqkv",
+            "Wqkv_gmem",
+            "head_tile",
+            "k_tile",
+        )),
+        "qkv_matmul" => Some(generic_gemm(ctx, "QKV_frag", "smem_x", "smem_wqkv")),
+        "load_rope_coef" => Some(generic_preamble_load(
+            ctx,
+            "smem_rope",
+            "RopeCoef_gmem",
+            "token_tile",
+        )),
+        "apply_rope" => Some(apply_rope(ctx)),
+        "store_q_row" => Some(generic_store(
+            ctx,
+            "Q_gmem",
+            "Q_frag",
+            "token_tile",
+            "head_tile",
+        )),
+        "store_k_row" => Some(generic_store(
+            ctx,
+            "K_gmem",
+            "K_frag",
+            "token_tile",
+            "head_tile",
+        )),
+        "store_v_row" => Some(generic_store(
+            ctx,
+            "V_gmem",
+            "V_frag",
+            "token_tile",
+            "head_tile",
+        )),
+        "store_k_cache" => Some(generic_cache_store(ctx, "K_cache_gmem", "K_frag")),
+        "store_v_cache" => Some(generic_cache_store(ctx, "V_cache_gmem", "V_frag")),
+        // ── Gate + Up + SiLU/GeLU + Mul (MLP input) ──
+        "load_wgate_tile" => Some(generic_pipeline_load(
+            ctx,
+            "smem_wgate",
+            "Wgate_gmem",
+            "inter_tile",
+            "k_tile",
+        )),
+        "load_wup_tile" => Some(generic_pipeline_load(
+            ctx,
+            "smem_wup",
+            "Wup_gmem",
+            "inter_tile",
+            "k_tile",
+        )),
+        "gate_gemm_accumulate" => Some(generic_gemm(ctx, "Gate_frag", "smem_x", "smem_wgate")),
+        "up_gemm_accumulate" => Some(generic_gemm(ctx, "Up_frag", "smem_x", "smem_wup")),
+        "silu_mul_fuse" => Some(silu_mul_fuse(ctx)),
+        "store_inter_tile" => Some(generic_store(
+            ctx,
+            "Inter_gmem",
+            "Inter_frag",
+            "token_tile",
+            "inter_tile",
+        )),
+        // ── Unary in-place ──
+        "scalar_mul" => Some(generic_unary(ctx, "scalar_mul", "X_frag", "X_frag * scale")),
+        "tanh_softcap" => Some(generic_unary(
+            ctx,
+            "tanh_softcap",
+            "X_frag",
+            "cap * __tanhf(X_frag * rcp_cap)",
+        )),
+        // ── Embedding lookup ──
+        "load_embed_row" => Some(embed_gather(ctx)),
+        "store_embed_row" => Some(generic_store(
+            ctx,
+            "Y_gmem",
+            "Embed_frag",
+            "token_tile",
+            "/*hidden*/",
+        )),
         _ => None,
     }
 }
@@ -275,6 +387,320 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
     s
 }
 
+// ─── Generic expansion helpers for non-attention tags ──────────
+//
+// Each helper renders a small CUDA-pseudocode block that mirrors the
+// per-arch patterns of the FA2 expansions above (TMA + mbarrier on
+// SM90; cp.async.ca + cp.async_commit on SM89). Bodies are
+// pseudocode — `wgmma_mma_async`, `mma_sync_accumulate`, etc. — not
+// yet real intrinsic calls; the intent is to render the shape of the
+// kernel so the megakernel composition is reviewable. Real intrinsic
+// lowering lands once the runtime launch glue can compile the output.
+
+/// Pipelined load into a `P`-deep ring slot. Same shape pattern as
+/// load_kv_tile but parameterized on the smem/gmem buffer names and
+/// the axis labels the caller uses. One call per Load node in a
+/// pipeline-edge region.
+fn generic_pipeline_load(
+    ctx: &ExpandCtx<'_>,
+    smem: &str,
+    gmem: &str,
+    row_axis: &str,
+    col_axis: &str,
+) -> String {
+    let p = ctx.pipeline_depth;
+    let mut s = String::new();
+    writeln!(s, "{{").unwrap();
+    writeln!(
+        s,
+        "  // {}: {}[{} + {}] → {}[slot]",
+        gmem, gmem, row_axis, ctx.iter_offset, smem,
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  uint32_t slot = ({} + {}) % {};",
+        row_axis, ctx.iter_offset, p
+    )
+    .unwrap();
+    match ctx.arch_name {
+        "sm90_fa2" => {
+            writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
+            writeln!(
+                s,
+                "    tma_load_2d({}[slot], {}, {} + {}, {});",
+                smem, gmem, row_axis, ctx.iter_offset, col_axis,
+            )
+            .unwrap();
+            writeln!(s, "    mbarrier_arrive(&bar_{}[slot]);", smem).unwrap();
+            writeln!(s, "  }}").unwrap();
+        }
+        "sm89_fa2" => {
+            writeln!(
+                s,
+                "  cp_async_128({}[slot], {}, {} + {}, {});",
+                smem, gmem, row_axis, ctx.iter_offset, col_axis,
+            )
+            .unwrap();
+            writeln!(s, "  cp_async_commit_group();").unwrap();
+        }
+        other => {
+            writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
+            writeln!(
+                s,
+                "  generic_load({}[slot], {}, {} + {}, {});",
+                smem, gmem, row_axis, ctx.iter_offset, col_axis,
+            )
+            .unwrap();
+        }
+    }
+    write!(s, "}}").unwrap();
+    s
+}
+
+/// Straight-line preamble load: no ring slot, no pipeline semantics.
+/// Used by region templates whose Load nodes don't sit on a Pipeline
+/// edge (rmsnorm, elementwise ops, rope coefficients).
+fn generic_preamble_load(ctx: &ExpandCtx<'_>, smem: &str, gmem: &str, axis: &str) -> String {
+    let mut s = String::new();
+    writeln!(s, "{{").unwrap();
+    writeln!(s, "  // {}: {}[{}] → {}", gmem, gmem, axis, smem).unwrap();
+    match ctx.arch_name {
+        "sm90_fa2" => {
+            writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
+            writeln!(s, "    tma_load_2d({}, {}, {});", smem, gmem, axis).unwrap();
+            writeln!(s, "    mbarrier_arrive(&bar_{});", smem).unwrap();
+            writeln!(s, "  }}").unwrap();
+        }
+        "sm89_fa2" => {
+            writeln!(s, "  cp_async_128({}, {}, {});", smem, gmem, axis).unwrap();
+            writeln!(s, "  cp_async_commit_group();").unwrap();
+        }
+        other => {
+            writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
+        }
+    }
+    let _ = (ctx.iter_offset, ctx.pipeline_depth);
+    write!(s, "}}").unwrap();
+    s
+}
+
+/// Accumulating GEMM inside a serial-K loop. `acc` accumulates in
+/// registers across `k_tile` iterations; smem_a / smem_b rotate
+/// through a `P`-deep ring via `slot = k_tile % PIPE`.
+fn generic_gemm(ctx: &ExpandCtx<'_>, acc: &str, smem_a: &str, smem_b: &str) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let body = match ctx.arch_name {
+        "sm90_fa2" => format!(
+            concat!(
+                "// {acc} += {a} @ {b}\n",
+                "uint32_t slot = k_tile % PIPE;\n",
+                "wgmma_fence();\n",
+                "wgmma_mma_async({acc}, {a}[slot], {b}[slot]);\n",
+                "wgmma_commit_group();\n",
+                "wgmma_wait_group<0>();\n",
+            ),
+            acc = acc,
+            a = smem_a,
+            b = smem_b,
+        ),
+        "sm89_fa2" => format!(
+            concat!(
+                "// {acc} += {a} @ {b} (tiled mma.sync)\n",
+                "uint32_t slot = k_tile % PIPE;\n",
+                "mma_sync_accumulate({acc}, {a}[slot], {b}[slot]);\n",
+            ),
+            acc = acc,
+            a = smem_a,
+            b = smem_b,
+        ),
+        _ => format!("mma_accumulate({}, {}, {});\n", acc, smem_a, smem_b),
+    };
+    compute_guarded(ctx, &body)
+}
+
+/// Final store of a fragment: SM90 stages through smem + TMA store,
+/// SM89 emits STG.128 directly. One helper across every store_* tag
+/// in the non-attention templates.
+fn generic_store(
+    ctx: &ExpandCtx<'_>,
+    gmem: &str,
+    frag: &str,
+    row_axis: &str,
+    col_axis: &str,
+) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "store nodes carry no iter_offset");
+    let mut s = String::new();
+    writeln!(s, "{{").unwrap();
+    writeln!(
+        s,
+        "  // {}: {}[{}, {}] ← {}",
+        gmem, gmem, row_axis, col_axis, frag
+    )
+    .unwrap();
+    match ctx.arch_name {
+        "sm90_fa2" => {
+            writeln!(s, "  if (wg == CONSUMER_WG) {{").unwrap();
+            writeln!(s, "    stmatrix_smem(smem_out, {});", frag).unwrap();
+            writeln!(s, "    mbarrier_arrive(&bar_{}_ready);", gmem).unwrap();
+            writeln!(s, "  }} else if (wg == STORER_WG) {{").unwrap();
+            writeln!(s, "    mbarrier_wait(&bar_{}_ready);", gmem).unwrap();
+            writeln!(
+                s,
+                "    tma_store_2d({}, smem_out, {}, {});",
+                gmem, row_axis, col_axis,
+            )
+            .unwrap();
+            writeln!(s, "  }}").unwrap();
+        }
+        "sm89_fa2" => {
+            writeln!(
+                s,
+                "  stg_128({}, {}, {}, {});",
+                gmem, frag, row_axis, col_axis,
+            )
+            .unwrap();
+        }
+        other => {
+            writeln!(
+                s,
+                "  // unknown arch {} — fall back to generic store",
+                other
+            )
+            .unwrap();
+        }
+    }
+    let _ = ctx.pipeline_depth;
+    write!(s, "}}").unwrap();
+    s
+}
+
+/// KV cache store — same signal shape as generic_store but through a
+/// paged-KV address computation (block_table gather).
+fn generic_cache_store(ctx: &ExpandCtx<'_>, gmem: &str, frag: &str) -> String {
+    let mut s = String::new();
+    writeln!(s, "{{").unwrap();
+    writeln!(
+        s,
+        "  // {}: KV cache slot (token_tile → block_table lookup) ← {}",
+        gmem, frag,
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  uint32_t page = block_table[token_tile / blocks_per_tile];"
+    )
+    .unwrap();
+    writeln!(s, "  uint32_t slot = token_tile % blocks_per_tile;").unwrap();
+    match ctx.arch_name {
+        "sm90_fa2" => {
+            writeln!(s, "  if (wg == STORER_WG) {{").unwrap();
+            writeln!(
+                s,
+                "    tma_store_2d({}[page, slot, head_tile], {});",
+                gmem, frag,
+            )
+            .unwrap();
+            writeln!(s, "  }}").unwrap();
+        }
+        "sm89_fa2" => {
+            writeln!(s, "  stg_128({}[page, slot, head_tile], {});", gmem, frag,).unwrap();
+        }
+        _ => {}
+    }
+    let _ = (ctx.iter_offset, ctx.pipeline_depth);
+    write!(s, "}}").unwrap();
+    s
+}
+
+/// Element-wise unary op. `expr` is the per-lane expression (e.g.
+/// `X_frag * scale` for scalar_mul).
+fn generic_unary(ctx: &ExpandCtx<'_>, tag: &str, frag: &str, expr: &str) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let body = format!("// {tag}: {frag} = {expr};\n{frag} = {expr};\n");
+    compute_guarded(ctx, &body)
+}
+
+/// Warp-/wg-wide RMSNorm: rms = rsqrt(mean(x·x) + ε); y = x * rms * w.
+/// Reduction internals are intrinsic-level (shuffle / shared-memory);
+/// pseudocode here.
+fn rmsnorm_compute(ctx: &ExpandCtx<'_>) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let body = concat!(
+        "// Y_frag = X_row * rsqrt(mean(X_row^2) + eps) * W_row\n",
+        "float sumsq = warp_reduce_sum_of_squares(smem_x);\n",
+        "float rms   = rsqrtf(sumsq / hidden_dim + eps);\n",
+        "Y_frag      = frag_mul(frag_mul(smem_x, smem_w), rms);\n",
+    );
+    compute_guarded(ctx, body)
+}
+
+/// Element-wise add of two preloaded rows.
+fn elementwise_add(ctx: &ExpandCtx<'_>) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let body = "// sum_frag = smem_a + smem_b\nsum_frag = frag_add(smem_a, smem_b);\n";
+    compute_guarded(ctx, body)
+}
+
+/// Apply rotary position embedding to the (Q, K) projections. V
+/// passes through unchanged.
+fn apply_rope(ctx: &ExpandCtx<'_>) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let body = concat!(
+        "// Apply RoPE in-place to Q_frag and K_frag using smem_rope.\n",
+        "Q_frag = rope_rotate(QKV_frag.q, smem_rope);\n",
+        "K_frag = rope_rotate(QKV_frag.k, smem_rope);\n",
+        "V_frag = QKV_frag.v;\n",
+    );
+    compute_guarded(ctx, body)
+}
+
+/// SiLU on gate, then multiply by up. One compute guard around both.
+fn silu_mul_fuse(ctx: &ExpandCtx<'_>) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let body = concat!(
+        "// Inter_frag = silu(Gate_frag) * Up_frag\n",
+        "Inter_frag = frag_mul(silu(Gate_frag), Up_frag);\n",
+    );
+    compute_guarded(ctx, body)
+}
+
+/// Embedding lookup: gather row from embed_table using token_ids.
+/// One Load, no Compute — this is pure data movement.
+fn embed_gather(ctx: &ExpandCtx<'_>) -> String {
+    let mut s = String::new();
+    writeln!(s, "{{").unwrap();
+    writeln!(s, "  // Embed_frag = embed_table[token_ids[token_tile]];").unwrap();
+    match ctx.arch_name {
+        "sm90_fa2" => {
+            writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
+            writeln!(s, "    uint32_t row = token_ids[token_tile];").unwrap();
+            writeln!(
+                s,
+                "    tma_load_2d(Embed_frag, Embed_gmem + row * hidden_stride);"
+            )
+            .unwrap();
+            writeln!(s, "    mbarrier_arrive(&bar_embed);").unwrap();
+            writeln!(s, "  }}").unwrap();
+        }
+        "sm89_fa2" => {
+            writeln!(s, "  uint32_t row = token_ids[token_tile];").unwrap();
+            writeln!(
+                s,
+                "  cp_async_128(Embed_frag, Embed_gmem + row * hidden_stride);"
+            )
+            .unwrap();
+            writeln!(s, "  cp_async_commit_group();").unwrap();
+        }
+        other => {
+            writeln!(s, "  // unknown arch {}", other).unwrap();
+        }
+    }
+    let _ = (ctx.iter_offset, ctx.pipeline_depth);
+    write!(s, "}}").unwrap();
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +830,128 @@ mod tests {
     fn unknown_tag_returns_none() {
         assert!(expand("not_a_real_op", &ctx("sm89_fa2")).is_none());
         assert!(expand("paged_gather_kv", &ctx("sm90_fa2")).is_none());
+    }
+
+    // ── New-tag expansions ────────────────────────────────────────
+
+    fn pipe_ctx_nonzero(arch: &'static str) -> ExpandCtx<'static> {
+        ExpandCtx {
+            arch_name: arch,
+            iter_offset: 3,
+            pipeline_depth: 3,
+        }
+    }
+
+    #[test]
+    fn gemm_accumulate_sm90_uses_wgmma() {
+        let s = expand("gemm_accumulate", &ctx("sm90_fa2")).unwrap();
+        assert!(s.contains("wgmma_mma_async(C_frag, smem_a[slot], smem_b[slot])"));
+        assert!(s.contains("CONSUMER_WG"));
+    }
+
+    #[test]
+    fn load_a_tile_sm89_uses_cp_async_into_slot() {
+        let s = expand("load_a_tile", &pipe_ctx_nonzero("sm89_fa2")).unwrap();
+        assert!(s.contains("uint32_t slot = (m_tile + 3) % 3;"));
+        assert!(s.contains("cp_async_128(smem_a[slot], A_gmem"));
+    }
+
+    #[test]
+    fn store_c_tile_sm89_uses_stg() {
+        let s = expand("store_c_tile", &ctx("sm89_fa2")).unwrap();
+        assert!(s.contains("stg_128(C_gmem, C_frag, m_tile, n_tile)"));
+    }
+
+    #[test]
+    fn rmsnorm_compute_has_reduce_and_rsqrt() {
+        for arch in ["sm90_fa2", "sm89_fa2"] {
+            let s = expand("rmsnorm_compute", &ctx(arch)).unwrap();
+            assert!(s.contains("warp_reduce_sum_of_squares"));
+            assert!(s.contains("rsqrtf"));
+            assert!(s.contains("Y_frag"));
+        }
+    }
+
+    #[test]
+    fn apply_rope_rotates_q_and_k_not_v() {
+        let s = expand("apply_rope", &ctx("sm90_fa2")).unwrap();
+        assert!(s.contains("Q_frag = rope_rotate(QKV_frag.q"));
+        assert!(s.contains("K_frag = rope_rotate(QKV_frag.k"));
+        // V passes through unrotated.
+        assert!(s.contains("V_frag = QKV_frag.v"));
+    }
+
+    #[test]
+    fn silu_mul_fuse_applies_silu_to_gate_and_mul_up() {
+        let s = expand("silu_mul_fuse", &ctx("sm90_fa2")).unwrap();
+        assert!(s.contains("silu(Gate_frag)"));
+        assert!(s.contains("frag_mul(silu(Gate_frag), Up_frag)"));
+    }
+
+    #[test]
+    fn scalar_mul_and_tanh_softcap_expand_to_inline_expr() {
+        let m = expand("scalar_mul", &ctx("sm89_fa2")).unwrap();
+        assert!(m.contains("X_frag = X_frag * scale"));
+        let t = expand("tanh_softcap", &ctx("sm89_fa2")).unwrap();
+        assert!(t.contains("__tanhf(X_frag * rcp_cap)"));
+    }
+
+    #[test]
+    fn embed_gather_indexes_through_token_ids() {
+        for arch in ["sm90_fa2", "sm89_fa2"] {
+            let s = expand("load_embed_row", &ctx(arch)).unwrap();
+            assert!(s.contains("uint32_t row = token_ids[token_tile]"));
+            assert!(s.contains("Embed_gmem + row * hidden_stride"));
+        }
+    }
+
+    #[test]
+    fn all_new_template_tags_have_expansions() {
+        // Every tag the new region templates emit should expand, not
+        // fall through to the stub. Guards against silently shipping
+        // regions whose bodies render as `tag();`.
+        let required = [
+            "load_a_tile",
+            "load_b_tile",
+            "gemm_accumulate",
+            "store_c_tile",
+            "load_x_row",
+            "load_weight",
+            "rmsnorm_compute",
+            "store_y_row",
+            "load_a_row",
+            "load_b_row",
+            "elementwise_add",
+            "store_sum_row",
+            "load_wqkv_tile",
+            "qkv_matmul",
+            "load_rope_coef",
+            "apply_rope",
+            "store_q_row",
+            "store_k_row",
+            "store_v_row",
+            "store_k_cache",
+            "store_v_cache",
+            "load_wgate_tile",
+            "load_wup_tile",
+            "gate_gemm_accumulate",
+            "up_gemm_accumulate",
+            "silu_mul_fuse",
+            "store_inter_tile",
+            "scalar_mul",
+            "tanh_softcap",
+            "load_embed_row",
+            "store_embed_row",
+        ];
+        for tag in required {
+            for arch in ["sm90_fa2", "sm89_fa2"] {
+                assert!(
+                    expand(tag, &ctx(arch)).is_some(),
+                    "tag {} on arch {} has no expansion",
+                    tag,
+                    arch,
+                );
+            }
+        }
     }
 }

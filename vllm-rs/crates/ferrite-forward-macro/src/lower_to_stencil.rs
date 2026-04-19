@@ -23,13 +23,15 @@
 
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
+
 use ferrite_stencil::{
-    AttnParams, GemmParams, Megakernel, PagedDecodeParams, Region, ResidualAddParams,
-    RmsNormParams, Window, attn_region, attn_region_paged_decode, gemm_region, residual_add_region,
-    rmsnorm_region,
+    AttnParams, ControlEdge, DepKind, GemmParams, Megakernel, PagedDecodeParams, Region, RegionId,
+    ResidualAddParams, RmsNormParams, Window, attn_region, attn_region_paged_decode, gemm_region,
+    residual_add_region, rmsnorm_region,
 };
 
-use crate::fuf::{Fuf, TileId};
+use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::ImplementationLibrary;
 use crate::solver::{Assignment, SubgraphId};
 
@@ -160,6 +162,7 @@ pub fn lower_assignment(
     subgraphs.sort();
 
     let mut regions: Vec<Region> = Vec::new();
+    let mut sg_to_rid: HashMap<SubgraphId, RegionId> = HashMap::new();
 
     for sg in subgraphs {
         let tiles = assignment.tiles_in_subgraph(sg);
@@ -170,14 +173,16 @@ pub fn lower_assignment(
             .impl_of(sg)
             .expect("subgraph with tiles has impl");
         let imp = library.get(impl_id);
-        let region = lower_impl(imp.name(), &tiles, fuf, hints)?;
+        let mut region = lower_impl(imp.name(), &tiles, fuf, hints)?;
+        let rid = regions.len() as RegionId;
+        region.id = rid;
+        sg_to_rid.insert(sg, rid);
         regions.push(region);
     }
 
-    Ok(Megakernel {
-        regions,
-        control: Vec::new(),
-    })
+    let control = derive_control_edges(fuf, assignment, &sg_to_rid);
+
+    Ok(Megakernel { regions, control })
 }
 
 /// Tolerant variant: lowers every supported subgraph, records the
@@ -190,6 +195,7 @@ pub fn lower_assignment_partial(
     hints: &LowerHints,
 ) -> LowerReport {
     let mut regions: Vec<Region> = Vec::new();
+    let mut sg_to_rid: HashMap<SubgraphId, RegionId> = HashMap::new();
     let mut skipped: Vec<(SubgraphId, &'static str)> = Vec::new();
     let mut supported = 0usize;
 
@@ -206,7 +212,10 @@ pub fn lower_assignment_partial(
         };
         let imp = library.get(impl_id);
         match lower_impl(imp.name(), &tiles, fuf, hints) {
-            Ok(region) => {
+            Ok(mut region) => {
+                let rid = regions.len() as RegionId;
+                region.id = rid;
+                sg_to_rid.insert(sg, rid);
                 regions.push(region);
                 supported += 1;
             }
@@ -217,14 +226,61 @@ pub fn lower_assignment_partial(
         }
     }
 
+    // Skipped subgraphs have no region, so ControlEdges touching them
+    // are dropped (there's nothing to synchronize to/from). Telemetry
+    // lives on `skipped` — the megakernel is simply incomplete until
+    // every subgraph gets a region template.
+    let control = derive_control_edges(fuf, assignment, &sg_to_rid);
+
     LowerReport {
-        mk: Megakernel {
-            regions,
-            control: Vec::new(),
-        },
+        mk: Megakernel { regions, control },
         supported_subgraphs: supported,
         skipped,
     }
+}
+
+/// Walk the FUF's per-tile input edges; every `FufInput::Tile` that
+/// crosses a subgraph boundary becomes one `ControlEdge` (deduped on
+/// (src_region, dst_region)). DepKind::Barrier is the conservative
+/// default — refinement (e.g. AtomicReduce for associative reductions)
+/// lands once the lowering has enough FUF info to tell them apart.
+fn derive_control_edges(
+    fuf: &Fuf,
+    assignment: &Assignment,
+    sg_to_rid: &HashMap<SubgraphId, RegionId>,
+) -> Vec<ControlEdge> {
+    let mut seen: HashSet<(RegionId, RegionId)> = HashSet::new();
+    let mut out: Vec<ControlEdge> = Vec::new();
+    for node in &fuf.nodes {
+        let Some(dst_sg) = assignment.subgraph_of(node.id) else {
+            continue;
+        };
+        let Some(&dst_rid) = sg_to_rid.get(&dst_sg) else {
+            continue;
+        };
+        for input in &node.inputs {
+            let FufInput::Tile { id: src_tile, .. } = input else {
+                continue;
+            };
+            let Some(src_sg) = assignment.subgraph_of(*src_tile) else {
+                continue;
+            };
+            if src_sg == dst_sg {
+                continue;
+            }
+            let Some(&src_rid) = sg_to_rid.get(&src_sg) else {
+                continue;
+            };
+            if seen.insert((src_rid, dst_rid)) {
+                out.push(ControlEdge {
+                    src: src_rid,
+                    dst: dst_rid,
+                    kind: DepKind::Barrier,
+                });
+            }
+        }
+    }
+    out
 }
 
 fn lower_impl(
@@ -503,6 +559,116 @@ mod tests {
             assert_eq!(r.name, "rmsnorm", "{}", name);
             ir::validate(&r).expect("rmsnorm region validates");
         }
+    }
+
+    #[test]
+    fn populates_control_edges_from_fuf_deps() {
+        // FUF with two tiles: tile1 consumes tile0's output. Both map
+        // onto distinct subgraphs with an attention Impl (any impl that
+        // has a region template works for this test). Expect one
+        // ControlEdge(0 → 1, Barrier) in the emitted Megakernel.
+        use crate::impl_lib::AttentionPrefillContiguousImpl;
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Attention,
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Attention,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(0),
+                        slot: 0,
+                    }],
+                    outputs: vec![],
+                },
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let impl_id = lib.push(Box::new(AttentionPrefillContiguousImpl));
+        let mut cover = HashMap::new();
+        cover.insert(TileId(0), SubgraphId(0));
+        cover.insert(TileId(1), SubgraphId(1));
+        let mut impls = HashMap::new();
+        impls.insert(SubgraphId(0), impl_id);
+        impls.insert(SubgraphId(1), impl_id);
+        let assignment = Assignment {
+            cover,
+            impls,
+            predicted_us: 0.0,
+        };
+
+        let mk = lower_assignment(&fuf, &assignment, &lib, &LowerHints::default()).unwrap();
+        assert_eq!(mk.regions.len(), 2);
+        assert_eq!(mk.regions[0].id, 0);
+        assert_eq!(mk.regions[1].id, 1);
+        assert_eq!(mk.control.len(), 1, "one inter-subgraph edge");
+        assert_eq!(mk.control[0].src, 0);
+        assert_eq!(mk.control[0].dst, 1);
+        assert!(matches!(
+            mk.control[0].kind,
+            ferrite_stencil::DepKind::Barrier
+        ));
+    }
+
+    #[test]
+    fn dedupes_multiple_tile_edges_between_same_subgraphs() {
+        // Two tiles in SG1 each depend on the same tile in SG0 → still
+        // one ControlEdge. Dedupe is (src_region, dst_region)-keyed.
+        use crate::impl_lib::AttentionPrefillContiguousImpl;
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Attention,
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Attention,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(0),
+                        slot: 0,
+                    }],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(2),
+                    op: OpKind::Attention,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(0),
+                        slot: 0,
+                    }],
+                    outputs: vec![],
+                },
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let impl_id = lib.push(Box::new(AttentionPrefillContiguousImpl));
+        let mut cover = HashMap::new();
+        cover.insert(TileId(0), SubgraphId(0));
+        cover.insert(TileId(1), SubgraphId(1));
+        cover.insert(TileId(2), SubgraphId(1));
+        let mut impls = HashMap::new();
+        impls.insert(SubgraphId(0), impl_id);
+        impls.insert(SubgraphId(1), impl_id);
+        let assignment = Assignment {
+            cover,
+            impls,
+            predicted_us: 0.0,
+        };
+
+        let mk = lower_assignment(&fuf, &assignment, &lib, &LowerHints::default()).unwrap();
+        assert_eq!(mk.regions.len(), 2);
+        assert_eq!(
+            mk.control.len(),
+            1,
+            "(0,1) edge deduped across two tile-tile edges"
+        );
     }
 
     #[test]

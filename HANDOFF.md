@@ -886,14 +886,17 @@ commit; pre-existing on the branch)**:
   trivial (rename to `_sk_bucket` if intentionally unused, indent
   the doc list continuation lines) but out of scope for the overlay
   commit since the file isn't in its diff.
-- Several non-overlay correctness goldens have shown top-N
-  divergence in recent runs that smells like flashinfer drift, not
-  overlay regression (the same models passed before the flashinfer
-  integration landed in `a00bed90a`): AWQ Llama, Qwen2-GPTQ, and
-  Qwen3-dense have all reported single-token top-N misses at
-  positions ≥ 1 in spot checks. These need re-baselining with a
-  flashinfer-on Python golden before being called regressions —
-  the existing goldens were generated pre-flashinfer.
+- **Goldens were generated with FA2, engine now runs FlashInfer.**
+  Expected numeric divergence, not a regression. AWQ Llama,
+  Qwen2-GPTQ, and Qwen3-dense have all reported single-token
+  top-N misses at positions ≥ 1 in spot checks. Fix is to
+  re-baseline goldens against Python vLLM with
+  `VLLM_ATTENTION_BACKEND=FLASHINFER` (or
+  `FLASHINFER_VLLM_V1` on V1) — `scripts/generate_golden_refs.py`
+  needs no code change, just the env var at invocation. Don't
+  bug-hunt; FA2 vs FI is different attention math and the
+  existing top-N tolerance was never designed to absorb a full
+  backend swap.
 
 **FP8 trio still pending** (tasks #2/#3/#4): per-tensor static,
 per-tensor dynamic-activation, and 128×128 blockwise. The overlay

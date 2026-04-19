@@ -10,9 +10,9 @@ Dated 2026-04-19. Companion to `STENCIL_IR_DESIGN.md` (vocabulary freeze) and `S
 
 ## Where we are
 
-**Every real-model FUF (Llama/Gemma2/Gemma3/Qwen2/Qwen3/Mistral/Granite/CommandR, full-precision + marlin + bnb4 + gptq variants) now lowers to a complete SM90 megakernel source file.** Llama-3-8B: 227 regions / 290 control edges / ~6.6k lines of generated CUDA. Qwen3-0.6B: 339 regions / 450 edges / ~8.2k lines. Gemma-3-12B: 676 regions / 675 edges / ~15.3k lines. Every build writes per-variant `.cu` into `/tmp/ferrite-stencil/<variant>-sm90.cu` for inspection.
+**Every real-model FUF (Llama/Gemma2/Gemma3/Qwen2/Qwen3/Mistral/Granite/CommandR, full-precision + marlin + bnb4 + gptq variants) now lowers to a complete SM90 megakernel source file AND compiles cleanly via nvcc.** Llama-3-8B: 227 regions / 290 control edges / ~14k lines → 187 KB object file. Qwen3-0.6B: 339 regions / 450 edges / ~16k lines → 227 KB. Gemma-3-12B: 676 regions / 675 edges / ~32k lines → 409 KB. Gemma-3-27B → 516 KB. Every build writes `/tmp/ferrite-stencil/<variant>-sm90.cu`; `nvcc -arch=sm_89 -I csrc -c <file>.cu` produces a linkable object.
 
-The pipeline runs end-to-end at compile time, with real content (no stubs, no pseudocode fallbacks) for every op the solver currently picks across those model crates.
+The pipeline runs FUF → Stencil IR → Megakernel → emitted source → nvcc → object file, end-to-end, on real models. Helpers are trap-bodied placeholders (`__trap()`) — running the object would abort on the device; real PTX lowering lands one helper at a time.
 
 ## What's landed (continuing from step 3b)
 
@@ -30,8 +30,11 @@ Ten commits on `worktree-ff2` extending the Stencil IR toward the goal of "FUF �
 | `8b857c4aa` | `unary_inplace_region` (parametric on op tag), sliding-window support on paged decode, reference variants routed through existing templates. Telemetry grows `[impl,…]` summary of skipped impl names. | Llama-3-8B hits 1 skipped. |
 | `340bf771b` | `embed_region` (gather-only, no Compute), `flashinfer_attention_decode` routed to paged decode, `derive_control_edges` transitively traverses skipped (reshape_ref) subgraphs so dep chains stay intact. | 0 skipped on every supported model; reshape_ref stays skipped but the closure preserves A → B edges through it. |
 | `42474b51c` | Full `emit_ops` intrinsic expansions for all 31 non-attention tags (pipelined/preamble loads, gemm accumulate, generic stores, cache stores, rmsnorm_compute, elementwise_add, apply_rope, silu_mul_fuse, unary ops, embed gather). | 38 lib + 7 integration stencil tests green. Emitted kernels render real TMA/wgmma/cp.async/mma.sync bodies, no `tag();` stubs. |
+| `7e6dcf8b9` | Gmem pointer plumbing: `emit_ops::gmem_refs` per-tag access table + union into signature. `const bf16* __restrict__` for read-only tensors, mutable for anything read+written (e.g. Q_gmem, written by qkv_rope and read by attention). `__device__ uint32_t gbar_counter;` emitted above the kernel. | Llama-3-8B signature: 8 scalars + 18 gmem pointers. |
+| `ec41b8fc4` | Persistent-CTA launcher emitted alongside the kernel. `extern "C" launch_mega_kernel(stream, scalars..., gmem_ptrs...)` zeroes `gbar_counter`, queries `multiProcessorCount`, launches with `grid=#SMs`, `block=640` (20 warps). Same param list as the kernel — no marshaling divergence. |
+| `c3fee7188` | **Emitted megakernel compiles cleanly via nvcc.** New `csrc/ferrite_stencil_prelude.cuh` (220 lines) providing typedefs (bf16, Mbarrier, StencilFrag), warpgroup-id constants, smem/fragment placeholders, and templated `__trap()`-bodied helpers for every intrinsic (tma_load_2d, cp_async_128, wgmma_mma_async, mma_sync_accumulate, row_max, silu, frag_mul, apply_rope, …). Emitter adds `#include` preamble, IndexedScalar bounds flow as `const uint32_t*`, fixed a few C++23-incompatible subscript patterns. **Verified: `nvcc -arch=sm_89 -I csrc -c <variant>.cu` produces linkable objects for llama-3-8b (187 KB), qwen3-0.6b (227 KB), gemma-3-12b-it (409 KB), gemma-3-27b-it (516 KB), c4ai-command-r (214 KB), gemma2-2b (173 KB), and others.** Placeholders trap at runtime — real PTX lowers one helper at a time. |
 
-Cumulative: **ferrite-stencil 38 lib + 7 integration green · forward-macro lowering 14 green.**
+Cumulative: **ferrite-stencil 40 lib + 7 integration green · forward-macro lowering 14 green · nvcc-compilable `.o` for every supported model variant.**
 
 ## Pipeline that now exists
 
@@ -56,9 +59,10 @@ Each region still schedules through `schedule_wavefront`; `emit_megakernel` call
   - `src/wavefront.rs` — preamble/body/epilogue scheduler
   - `src/emit_mega.rs` — **the megakernel emitter** (main entry: `emit_megakernel`)
   - `src/emit.rs` — per-region sketch emitter (used by snapshot tests; `emit_mega` is the real target)
-  - `src/emit_ops.rs` — per-tag intrinsic expansion table (31 non-attention + 7 attention tags populated)
+  - `src/emit_ops.rs` — per-tag intrinsic expansion table (31 non-attention + 7 attention tags populated) + `gmem_refs` for signature-time pointer plumbing
   - `src/print.rs` — round-trip printer (used by tests, not by emitter)
-  - `csrc/stencil_prelude_sm89.cuh` — SM89 prelude helpers (unused by `emit_mega` today; scaffolding from the earlier per-region 3b path)
+  - `csrc/ferrite_stencil_prelude.cuh` — **the megakernel prelude**. `__trap()`-bodied placeholders for every helper the emitter references; typedefs (bf16, Mbarrier, StencilFrag), warpgroup-id constants, ambient smem/fragment state. This is what turns the emitted `.cu` into a linkable object.
+  - `csrc/stencil_prelude_sm89.cuh` — older per-region-kernel prelude (unused by `emit_mega`; scaffolding from the 3b path)
   - `csrc/stencil_smoke_sm89.cu` — 3b hand-written smoke kernel (off-critical-path; kept for reference)
 - Launch wrappers + GPU tests (off-critical-path): `vllm-rs/crates/ferrite-stencil-kernels/` — 3b launcher. Not wired to `emit_megakernel`.
 - Lowering: `vllm-rs/crates/ferrite-forward-macro/src/lower_to_stencil.rs`
@@ -68,17 +72,24 @@ Each region still schedules through `schedule_wavefront`; `emit_megakernel` call
 
 ## What's left to reach the finish line
 
-The design doc's finish line is *efficient megakernel execution from the FUF* — comm/compute overlap, cross-subtile parallelism, real SM90 utilization, one launch per forward. To get there from here:
+The design doc's finish line is *efficient megakernel execution from the FUF* — comm/compute overlap, cross-subtile parallelism, real SM90 utilization, one launch per forward. From today's state:
 
-1. **Real intrinsic lowering.** `emit_ops` emits pseudocode (`wgmma_mma_async`, `tma_load_2d`, `cp_async_128`, `mma_sync_accumulate`, …). These need to become actual PTX + mbarrier/TMA descriptor setup that `nvcc` can compile. Biggest chunk. Probably a prelude header (similar in spirit to the 3b `stencil_prelude_sm89.cuh` but rewritten for the SM90 path, since that's the target).
-2. **gmem pointer plumbing in the kernel signature.** Today the signature ends with `/* gmem pointer plumbing: TODO */`. Need to walk every region's `FufOpRef` back to the FUF inputs/outputs and emit one `const bf16*` / `bf16*` per unique tensor, deduped by name. Impacts the launcher.
-3. **Launcher glue** — a persistent-CTA runtime wrapper that calls the emitted `mega_kernel(scalars, ptrs)` exactly once per forward, with grid sized to `#SMs` and block sized to `20 warps = 640 threads`. Plus `g.Bar` storage alloc + zero.
-4. **SM89 solver policy** — on SM89 targets the solver should naturally pick conventional per-op impls; the megakernel path is SM90+. Document and lock in — today we always emit SM90 source for inspection, which is fine as telemetry but shouldn't be the runtime path on SM89.
-5. **Tile calibration** — `LowerHints.gemm_{m,n,k}_tile` / `token_tile` / `inter_tile` are `Default` values. Pull them from per-Impl calibrated sizes once those live on the `Implementation` trait (and route `fused_gate_up_silu_mul`'s tile sizes separately from `fused_gemm_bias`'s).
-6. **Real shape walking** — `num_q_heads` and `num_kv_heads` passed to `qkv_rope_region` currently default to 1; the template shape is unaffected but the resource mapping at emit time wants the real head counts. Plumb from `bounds`.
-7. **Compile + ad-hoc H100 run.** First proof the emitted source compiles under `nvcc` for SM90 and launches without crashing. Correctness vs hand-written comes after. (No H100 in L4 CI; this is an ad-hoc run the user triggers.)
+1. **Real PTX bodies in the prelude.** Every helper in `ferrite_stencil_prelude.cuh` is a `__trap()` placeholder. Replacing them with real PTX is the bulk of the remaining work — one helper at a time, keeping the prelude as stable ABI between emitter and compilable source. Rough order of impact:
+   - `cp_async_128` + `cp_async_commit_group` + `cp_async_wait_group` (SM89 path, unblocks L4 testing)
+   - `mma_sync_accumulate` (SM89 mma.sync m16n8k16)
+   - `stg_128` / `tma_store_2d` (writeback)
+   - `tma_load_2d` + `mbarrier_arrive` / `mbarrier_wait` (SM90 TMA path)
+   - `wgmma_mma_async` + fence/commit/wait (SM90 compute)
+   - `gbar_sync` (cross-CTA atomic counter + spin-wait)
+   - Fragment helpers: `row_max`, `row_sum`, `exp2f_frag`, `warp_reduce_sum_of_squares`, `silu`, `rope_rotate`
+2. **Fragment type + smem allocation design.** Placeholders treat every fragment as opaque `StencilFrag`; real lowering needs concrete mma fragments (register layouts, accumulator types), plus a region-local smem-allocation pass so multiple GEMM regions don't collide on `smem_a` / `smem_b` / `C_frag`. Currently every region shares the same file-scope placeholders.
+3. **Axis-name threading through `ExpandCtx`.** Today expansions hard-code axis names (`q_tile`, `head_group`, …) regardless of the region they're emitted inside; paged decode's `b` axis falls through to a file-scope `b=0` placeholder. Passing axis names per-region at emit time fixes this without touching the vocabulary.
+4. **FUF-level tensor naming.** The signature uses tag-level names (`Q_gmem`, `A_gmem`, …) deduped globally — multiple GEMM regions share one `A_gmem` pointer, which is wrong at runtime (each layer has its own weights). Needs to walk back from region Node → FufOpRef → FUF inputs/outputs to get per-region unique names, then dedupe on actual tensor identity.
+5. **Tile calibration + real shape walking.** `LowerHints` tile fields are `Default`-valued; `num_q_heads` / `num_kv_heads` default to 1 for qkv_rope. Pull from per-Impl calibrated sizes and `bounds`.
+6. **SM89 solver policy.** Document that on SM89 targets the solver picks conventional per-op impls; megakernel path is SM90+. Today we emit SM90 source for inspection regardless — fine as telemetry, but the runtime branch should split.
+7. **Ad-hoc H100 run.** First proof the kernel launches. Needs (1) far enough along that `__trap()` isn't hit immediately. Correctness vs Python vLLM comes after.
 
-Items 1 + 2 + 3 are the blocking set for a first runtime trial. 4–7 are follow-on.
+Items 1–4 are the remaining substantive work before a first runtime trial. 5–7 are follow-on.
 
 ## Sketch → reality divergences worth knowing
 

@@ -161,6 +161,17 @@ pub struct Region {
     /// directly. Pre-item-4 regions (all templates today) leave this
     /// empty; item 4b populates it. STENCIL_IR_STATUS.md item 4.
     pub gmem_bindings: Vec<(&'static str, &'static str)>,
+    /// Per-smem-local compile-time byte counts. Each entry is
+    /// `(local_name, bytes)` — e.g. `("smem_q", 32768)` for a 128×128
+    /// bf16 tile. The emitter derives a `{LOCAL_UPPER}_BYTES`
+    /// constexpr symbol, emits `constexpr uint32_t SMEM_Q_BYTES = 32768u;`
+    /// at the top of the region scope, and smem declarations reference
+    /// it (`__shared__ bf16 smem_q[SMEM_Q_BYTES / 2];`). The symbol is
+    /// also the non-type template argument for `cp_async_128<BYTES>` /
+    /// `tma_load_2d<BYTES>` / `stg_128<BYTES>` call sites — letting the
+    /// data-movement prelude helpers drop their trap bodies for real
+    /// PTX. STENCIL_IR_STATUS.md item 1 (Phase B second wave).
+    pub tile_consts: Vec<(&'static str, u32)>,
 }
 
 #[derive(Debug, Clone)]

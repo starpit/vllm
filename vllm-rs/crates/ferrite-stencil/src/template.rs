@@ -252,6 +252,15 @@ pub fn attn_region(p: &AttnParams) -> Region {
         });
     }
 
+    let q_bytes = p.tile_q * p.head_dim * 2;
+    let kv_bytes = p.tile_k * p.head_dim * 2;
+    let tile_consts = vec![
+        ("smem_q", q_bytes),
+        ("smem_k", kv_bytes),
+        ("smem_v", kv_bytes),
+        ("smem_o", q_bytes),
+    ];
+
     Region {
         id: 0,
         name: "fa2_prefill",
@@ -279,6 +288,7 @@ pub fn attn_region(p: &AttnParams) -> Region {
         nodes,
         edges,
         gmem_bindings: Vec::new(),
+        tile_consts,
     }
 }
 
@@ -472,6 +482,17 @@ pub fn attn_region_paged_decode(p: &PagedDecodeParams) -> Region {
         });
     }
 
+    // Decode: tile_q is implicit 1 (M=1 per batch). Q/O staging holds
+    // one row per head-group; K/V are tile_k × head_dim bf16.
+    let q_bytes = p.head_dim * 2;
+    let kv_bytes = p.tile_k * p.head_dim * 2;
+    let tile_consts = vec![
+        ("smem_q", q_bytes),
+        ("smem_k", kv_bytes),
+        ("smem_v", kv_bytes),
+        ("smem_o", q_bytes),
+    ];
+
     Region {
         id: 1,
         name: "paged_decode",
@@ -500,6 +521,7 @@ pub fn attn_region_paged_decode(p: &PagedDecodeParams) -> Region {
         nodes,
         edges,
         gmem_bindings: Vec::new(),
+        tile_consts,
     }
 }
 
@@ -671,6 +693,11 @@ pub fn gemm_region(p: &GemmParams) -> Region {
         nodes,
         edges,
         gmem_bindings: Vec::new(),
+        tile_consts: vec![
+            ("smem_a", p.m_tile * p.k_tile * 2),
+            ("smem_b", p.k_tile * p.n_tile * 2),
+            ("smem_out", p.m_tile * p.n_tile * 2),
+        ],
     }
 }
 
@@ -777,6 +804,12 @@ pub fn rmsnorm_region(p: &RmsNormParams) -> Region {
         nodes,
         edges,
         gmem_bindings: Vec::new(),
+        tile_consts: vec![
+            ("smem_x", p.hidden_dim * p.token_tile * 2),
+            // RMSNorm weight is 1-D [hidden_dim]; no token axis.
+            ("smem_w", p.hidden_dim * 2),
+            ("smem_out", p.hidden_dim * p.token_tile * 2),
+        ],
     }
 }
 
@@ -878,6 +911,11 @@ pub fn residual_add_region(p: &ResidualAddParams) -> Region {
         nodes,
         edges,
         gmem_bindings: Vec::new(),
+        tile_consts: vec![
+            ("smem_a", p.hidden_dim * p.token_tile * 2),
+            ("smem_b", p.hidden_dim * p.token_tile * 2),
+            ("smem_out", p.hidden_dim * p.token_tile * 2),
+        ],
     }
 }
 
@@ -960,6 +998,10 @@ pub fn embed_region(p: &EmbedParams) -> Region {
         nodes,
         edges,
         gmem_bindings: Vec::new(),
+        // Embed lookup: load_embed_row stages gather hits in Embed_frag
+        // (register), but store_embed_row shares the common `smem_out`
+        // staging-buffer pattern for its final row write.
+        tile_consts: vec![("smem_out", p.hidden_dim * p.token_tile * 2)],
     }
 }
 
@@ -1031,6 +1073,7 @@ pub fn unary_inplace_region(p: &UnaryInplaceParams) -> Region {
         },
     ];
 
+    let row_bytes = p.hidden_dim * p.token_tile * 2;
     Region {
         id: 0,
         name: "unary_inplace",
@@ -1049,6 +1092,9 @@ pub fn unary_inplace_region(p: &UnaryInplaceParams) -> Region {
         nodes,
         edges,
         gmem_bindings: Vec::new(),
+        // Unary in-place: one row staging in, one row staging out
+        // (store_y_row uses smem_out). Same row bytes for both.
+        tile_consts: vec![("smem_x", row_bytes), ("smem_out", row_bytes)],
     }
 }
 
@@ -1338,6 +1384,17 @@ pub fn qkv_rope_region(p: &QkvRopeParams) -> Region {
         nodes,
         edges,
         gmem_bindings: Vec::new(),
+        // QKV+RoPE locals:
+        //   smem_x    : projection input row staging (token × k_tile bf16),
+        //   smem_wqkv : weight tile staging (head_dim × k_tile bf16),
+        //   smem_rope : cos/sin tables, half head_dim per token_tile,
+        //   smem_out  : store-side staging (one token_tile × head_dim row).
+        tile_consts: vec![
+            ("smem_x", p.token_tile * p.k_tile * 2),
+            ("smem_wqkv", p.head_dim * p.k_tile * 2),
+            ("smem_rope", p.token_tile * p.head_dim),
+            ("smem_out", p.token_tile * p.head_dim * 2),
+        ],
     }
 }
 
@@ -1585,6 +1642,16 @@ pub fn gate_up_silu_mul_region(p: &GateUpSiluMulParams) -> Region {
         nodes,
         edges,
         gmem_bindings: Vec::new(),
+        // Gate+Up+SiLU+Mul locals:
+        //   smem_x              : x row staging (token × k_tile bf16),
+        //   smem_wgate, smem_wup: weight tile staging per projection,
+        //   smem_out            : fused-output staging (token × inter bf16).
+        tile_consts: vec![
+            ("smem_x", p.token_tile * p.k_tile * 2),
+            ("smem_wgate", p.inter_tile * p.k_tile * 2),
+            ("smem_wup", p.inter_tile * p.k_tile * 2),
+            ("smem_out", p.token_tile * p.inter_tile * 2),
+        ],
     }
 }
 

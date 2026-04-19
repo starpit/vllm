@@ -30,6 +30,8 @@ The target is **one persistent `__global__` per model forward on SM90a+**, in th
 
 **Phase A — correctness shape — complete.** Per-region scoped smem/frag/mbarriers (item 2), axis names threaded through `ExpandCtx` (item 3), and per-layer FUF tensor identities in the kernel signature (item 4). Llama-3-8B's signature carries ~230 per-tensor pointers (`w{id}_{layer}`, `t{tile}_{slot}`, `x_{kind}_{index}`) instead of 18 canonical names — each layer's Wqkv/Wo/Wgate/Wup/RMSnorm is its own parameter.
 
+**Phase B — byte-count plumbing landed.** Every region now emits region-scope `constexpr uint32_t SMEM_{LOCAL}_BYTES = …u;` constants from `Region.tile_consts` (populated by each template from its tile params), and smem declarations reference them: `__shared__ bf16 smem_q[SMEM_Q_BYTES / 2]` instead of the opaque `__shared__ StencilFrag smem_q`. The same symbols are what the next commit threads into `cp_async_128<BYTES>` / `stg_128<BYTES>` / `tma_load_2d<BYTES>` template args, which is the step that lets the data-movement helpers drop their trap bodies for real PTX.
+
 **Phase B — real PTX — first wave landed.** 8 fixed-signature helpers compile to real PTX (guarded by `__CUDA_ARCH__`):
 
 | Helper | PTX | Arch |
@@ -158,6 +160,7 @@ The cp.async / wgmma fence/commit/wait calls are real PTX now. The data-movement
 | `85f51b403` | **Item 4a** — `Region.gmem_bindings` + `ExpandCtx::gmem` resolver | +6 → 59 lib |
 | `344505683` | **Item 4b** — `lower_impl` stamps FUF tensor identities | +3 → 17 lowering |
 | `a9a1a8b59` | **Item 1 first wave** — real PTX for 8 fixed-sig sync helpers | — |
+| HEAD+1 | **Item 1 second wave bootstrap** — `Region.tile_consts` + `SMEM_{LOCAL}_BYTES` constexpr + `bf16[BYTES / 2]` smem decls | 59 lib |
 
 Cumulative at HEAD: **ferrite-stencil 59 lib + 7 integration · forward-macro lowering 17 · sm_89 + sm_90a nvcc-compilable objects for every supported model variant.**
 

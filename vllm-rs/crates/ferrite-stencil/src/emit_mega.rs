@@ -377,6 +377,7 @@ fn write_wg_dispatch(out: &mut String, arch: &ArchMap) {
         nodes: vec![],
         edges: vec![],
         gmem_bindings: Vec::new(),
+        tile_consts: Vec::new(),
     };
     let units = [
         (Role::Load, (arch.role)(Role::Load, &dummy)),
@@ -466,6 +467,11 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
     let mut indent = String::from("  ");
     writeln!(out, "{}{{", indent).unwrap();
     indent.push_str("  ");
+    // Region-scope compile-time tile sizes — emitted before the smem
+    // decls reference them (`__shared__ bf16 smem_q[SMEM_Q_BYTES / 2];`).
+    // Same constants feed `cp_async_128<BYTES>` / `tma_load_2d<BYTES>` /
+    // `stg_128<BYTES>` template args at the data-movement call sites.
+    write_region_tile_consts(out, &indent, &region.tile_consts);
     let locals = collect_locals(region);
     write_region_locals(out, &indent, &locals);
 
@@ -620,6 +626,29 @@ fn write_region_locals(out: &mut String, indent: &str, locals: &[(&'static str, 
     writeln!(out, "{}// region-local declarations", indent).unwrap();
     for (name, kind) in locals {
         writeln!(out, "{}{}", indent, kind.decl(name)).unwrap();
+    }
+}
+
+/// Emit `constexpr uint32_t {SYMBOL} = {bytes}u;` lines for each
+/// `(local_name, bytes)` in `tile_consts`. Symbols match
+/// `emit_ops::bytes_symbol(local_name)`. Keeps smem decls and
+/// data-movement call sites referring to the same compile-time
+/// constant, so a future change to a tile size only needs to update
+/// the template that populated `tile_consts`.
+fn write_region_tile_consts(out: &mut String, indent: &str, tile_consts: &[(&'static str, u32)]) {
+    if tile_consts.is_empty() {
+        return;
+    }
+    writeln!(out, "{}// region-local tile byte counts", indent).unwrap();
+    for (name, bytes) in tile_consts {
+        writeln!(
+            out,
+            "{}constexpr uint32_t {} = {}u;",
+            indent,
+            crate::emit_ops::bytes_symbol(name),
+            bytes,
+        )
+        .unwrap();
     }
 }
 
@@ -985,10 +1014,14 @@ mod tests {
         assert_eq!(src.matches("float m = -INFINITY;").count(), 2);
         assert_eq!(src.matches("float l = 0.0f;").count(), 2);
         // Smem staging buffers / rings declared region-locally.
-        assert!(src.contains("__shared__ StencilFrag smem_q;"));
-        assert!(src.contains("__shared__ StencilFrag smem_k[PIPE];"));
-        assert!(src.contains("__shared__ StencilFrag smem_v[PIPE];"));
-        assert!(src.contains("__shared__ StencilFrag smem_o;"));
+        // Backing storage is bf16[BYTES / 2] now, and each region
+        // emits a matching `constexpr uint32_t *_BYTES = …;` line.
+        assert!(src.contains("constexpr uint32_t SMEM_Q_BYTES = "));
+        assert!(src.contains("constexpr uint32_t SMEM_K_BYTES = "));
+        assert!(src.contains("__shared__ bf16 smem_q[SMEM_Q_BYTES / 2];"));
+        assert!(src.contains("__shared__ bf16 smem_k[PIPE][SMEM_K_BYTES / 2];"));
+        assert!(src.contains("__shared__ bf16 smem_v[PIPE][SMEM_V_BYTES / 2];"));
+        assert!(src.contains("__shared__ bf16 smem_o[SMEM_O_BYTES / 2];"));
         // Mbarriers for the kv pipeline ring and the o handshake.
         assert!(src.contains("__shared__ Mbarrier bar_kv[PIPE];"));
         assert!(src.contains("__shared__ Mbarrier bar_kv_consumed[PIPE];"));
@@ -1020,7 +1053,7 @@ mod tests {
         };
         let src = emit_megakernel(&mk, &sm90_fa2()).unwrap();
         // Promoted to ring (not plain) because qkv_matmul indexes slot.
-        assert!(src.contains("__shared__ StencilFrag smem_x[PIPE];"));
+        assert!(src.contains("__shared__ bf16 smem_x[PIPE][SMEM_X_BYTES / 2];"));
         // QKV trifecta keeps its compound shape.
         assert!(src.contains("struct { StencilFrag q, k, v; } QKV_frag;"));
     }
@@ -1054,13 +1087,19 @@ mod tests {
         // One C_frag per region — not one for the whole kernel.
         assert_eq!(src.matches("StencilFrag C_frag;").count(), 2);
         assert_eq!(
-            src.matches("__shared__ StencilFrag smem_a[PIPE];").count(),
+            src.matches("__shared__ bf16 smem_a[PIPE][SMEM_A_BYTES / 2];")
+                .count(),
             2
         );
         assert_eq!(
-            src.matches("__shared__ StencilFrag smem_b[PIPE];").count(),
+            src.matches("__shared__ bf16 smem_b[PIPE][SMEM_B_BYTES / 2];")
+                .count(),
             2
         );
+        // Each region also emits its own `constexpr uint32_t
+        // SMEM_A_BYTES = …;` line so a megakernel with multiple GEMM
+        // regions carries one per region, not a single file-scope copy.
+        assert_eq!(src.matches("constexpr uint32_t SMEM_A_BYTES = ").count(), 2);
         assert_eq!(
             src.matches("__shared__ Mbarrier bar_C_gmem_ready;").count(),
             2

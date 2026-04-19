@@ -152,11 +152,13 @@ pub fn gmem_refs(tag: &str) -> &'static [(&'static str, GmemAccess)] {
 /// coexist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalKind {
-    /// `__shared__ StencilFrag name;` — single staging buffer.
+    /// `__shared__ bf16 name[{SYMBOL} / 2];` — single staging buffer
+    /// sized from `Region.tile_consts` (the emitter writes a matching
+    /// `constexpr uint32_t {SYMBOL} = …;` at region-scope entrance).
     SmemPlain,
-    /// `__shared__ StencilFrag name[PIPE];` — P-deep ring for
+    /// `__shared__ bf16 name[PIPE][{SYMBOL} / 2];` — P-deep ring for
     /// pipeline-source loads (consumer reads slot `k`, loader writes
-    /// slot `k + P`).
+    /// slot `k + P`). Each slot is `{SYMBOL}` bytes of bf16.
     SmemRing,
     /// `StencilFrag name;` — per-thread register fragment. Real
     /// lowering swaps for concrete mma accumulator types.
@@ -614,11 +616,26 @@ impl LocalKind {
 
     /// The C++ declaration template. `name` is substituted; ring
     /// depths are always `PIPE` (the prelude's compile-time macro).
+    /// `SmemPlain` / `SmemRing` size in bytes comes from a region-scope
+    /// `constexpr uint32_t {LOCAL_UPPER}_BYTES = …;` line that the
+    /// emitter writes from `Region.tile_consts` (see
+    /// `emit_mega::write_region_tile_consts`). Declaring the backing
+    /// storage as `bf16 …[BYTES / 2]` (rather than the opaque
+    /// `StencilFrag`) is what lets the data-movement prelude helpers
+    /// index a concrete smem address.
     pub fn decl(self, name: &str) -> String {
         use LocalKind::*;
         match self {
-            SmemPlain => format!("__shared__ StencilFrag {};", name),
-            SmemRing => format!("__shared__ StencilFrag {}[PIPE];", name),
+            SmemPlain => format!(
+                "__shared__ bf16 {name}[{sym} / 2];",
+                name = name,
+                sym = bytes_symbol(name),
+            ),
+            SmemRing => format!(
+                "__shared__ bf16 {name}[PIPE][{sym} / 2];",
+                name = name,
+                sym = bytes_symbol(name),
+            ),
             Frag => format!("StencilFrag {};", name),
             FragQkv => format!("struct {{ StencilFrag q, k, v; }} {};", name),
             MbarrierPlain => format!("__shared__ Mbarrier {};", name),
@@ -626,6 +643,14 @@ impl LocalKind {
             FloatInit(init) => format!("float {} = {};", name, init),
         }
     }
+}
+
+/// `bytes_symbol("smem_q") == "SMEM_Q_BYTES"`. The emitter and decl
+/// derive this the same way, so a region's `tile_consts` (which is
+/// indexed by the smem local's lower-case name) stays in sync with
+/// the `constexpr uint32_t` lines the emitter writes at region scope.
+pub fn bytes_symbol(local_name: &str) -> String {
+    format!("{}_BYTES", local_name.to_uppercase())
 }
 
 /// Try to expand `(tag, arch)` into concrete CUDA pseudocode. Returns
@@ -1722,11 +1747,11 @@ mod tests {
     fn local_kind_decl_renders_expected_cpp() {
         assert_eq!(
             LocalKind::SmemPlain.decl("smem_x"),
-            "__shared__ StencilFrag smem_x;"
+            "__shared__ bf16 smem_x[SMEM_X_BYTES / 2];"
         );
         assert_eq!(
             LocalKind::SmemRing.decl("smem_a"),
-            "__shared__ StencilFrag smem_a[PIPE];"
+            "__shared__ bf16 smem_a[PIPE][SMEM_A_BYTES / 2];"
         );
         assert_eq!(LocalKind::Frag.decl("C_frag"), "StencilFrag C_frag;");
         assert_eq!(

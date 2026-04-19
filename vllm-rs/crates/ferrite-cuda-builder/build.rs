@@ -179,6 +179,13 @@ fn cuda_build() {
     //    The dependency on ferrite-models ensures those .cu files exist by now.
     build_megakernels(&cache_str, &mut rerun_files);
 
+    // 8. ferrite-stencil kernels. v1 = a smoke kernel that exercises the
+    //    SM89 prelude header (`stencil_prelude_sm89.cuh`) so nvcc catches
+    //    regressions in the helpers the emitter references. Step 3b of
+    //    the stencil plan swaps this for a hand-picked FA2 reference;
+    //    step 3c cuts over to the emitter's generated source.
+    build_stencil_kernels(&cache_str, &mut rerun_files);
+
     for f in &rerun_files {
         let path = std::path::Path::new(f);
         if let Ok(canonical) = path.canonicalize() {
@@ -489,6 +496,38 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     for cu in &megakernel_cus {
         rerun_files.push(cu.clone());
     }
+}
+
+#[cfg(feature = "cuda")]
+fn build_stencil_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
+    // SM89 only at step 3a; SM90 variant lands at step 3e. We gate on
+    // the detected arch so the build doesn't fail on H100 machines
+    // until the SM90 prelude is in tree.
+    let arch = detect_cuda_arch();
+    let arch_num: u32 = arch.parse().unwrap_or(89);
+    if arch_num >= 90 {
+        return;
+    }
+
+    let sources = ["../../crates/ferrite-stencil/csrc/stencil_smoke_sm89.cu".to_string()];
+    let watch = ["../../crates/ferrite-stencil/csrc/stencil_prelude_sm89.cuh".to_string()];
+
+    cudaforge::KernelBuilder::new()
+        .out_dir(cache_dir)
+        .source_files(sources.iter().cloned())
+        .watch(watch.iter().cloned())
+        .include_path("../../crates/ferrite-stencil/csrc")
+        .arg("-O3")
+        .arg("--use_fast_math")
+        .arg("-std=c++17")
+        .arg("-Xcompiler=-fPIC")
+        .arg(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+        .arg("-lineinfo")
+        .build_lib(format!("{cache_dir}/libstencil_kernels.a"))
+        .expect("failed to build ferrite-stencil kernels");
+
+    rerun_files.extend(sources.iter().cloned());
+    rerun_files.extend(watch.iter().cloned());
 }
 
 #[cfg(feature = "cuda")]

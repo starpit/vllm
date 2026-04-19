@@ -211,6 +211,9 @@ fn emit_step(
     for bp in &step.barriers_before {
         writeln!(out, "{}{}", indent, fmt_barrier(bp)).unwrap();
     }
+    // Sketch emitter doesn't render addresses — the output is stub
+    // pseudocode for snapshot review, not compilable CUDA. Pass
+    // `None` so expansions fall back to the legacy `row, col` form.
     let expand_ctx = ExpandCtx {
         arch_name: arch.name,
         iter_offset: step.iter_offset,
@@ -218,6 +221,7 @@ fn emit_step(
         parallel_axes,
         serial_axis,
         gmem_bindings: &region.gmem_bindings,
+        node_addr: None,
     };
     if let Some(body) = expand_op(node.op.tag, &expand_ctx) {
         // Indent every line of the expansion.

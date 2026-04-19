@@ -41,6 +41,21 @@ pub struct ExpandCtx<'a> {
     /// canonical name returns unchanged and the emitted body matches
     /// legacy output. Item 4 in STENCIL_IR_STATUS.md.
     pub gmem_bindings: &'a [(&'static str, &'static str)],
+    /// Pre-rendered C++ offset expression for the Load/Store node
+    /// currently being expanded — e.g. `"q_tile * 16384u + head_group
+    /// * 128u"`. Data-movement call sites emit `gmem + ({node_addr})`
+    /// so the helper receives a concrete tile-base pointer without
+    /// needing to know the tensor layout. Computed by `emit_mega`
+    /// from `node.addr` + `step.iter_offset` + the region's serial
+    /// axis (so pipelined loads shift the serial axis). See
+    /// `emit_addr::render`.
+    ///
+    /// `None` for Compute nodes (no `addr`), for unit tests that
+    /// construct `ExpandCtx` by hand without threading a node, and
+    /// for the sketch emitter (which still emits stubs). Expansions
+    /// must treat `None` as a fall-through to the legacy `row, col`
+    /// form so those paths stay compilable.
+    pub node_addr: Option<&'a str>,
 }
 
 impl<'a> ExpandCtx<'a> {
@@ -69,6 +84,21 @@ impl<'a> ExpandCtx<'a> {
             }
         }
         canonical
+    }
+    /// Tile-base pointer expression: `{gmem} + ({node_addr})` when a
+    /// pre-rendered address is present, else just `{gmem}`. The data-
+    /// movement call sites pass this as the gmem argument so the
+    /// helper receives a concrete tile pointer instead of the tensor
+    /// base + axis indices the pre-refactor emit form used.
+    ///
+    /// When `node_addr` is `None` (sketch emitter, hand-built test
+    /// contexts), the caller falls back to the legacy form with raw
+    /// axes — see each expansion's match on this return value.
+    pub fn tile_ptr(&self, gmem: &str) -> String {
+        match self.node_addr {
+            Some(addr) => format!("{} + ({})", gmem, addr),
+            None => gmem.to_string(),
+        }
     }
 }
 
@@ -839,13 +869,26 @@ fn load_q_tile(ctx: &ExpandCtx<'_>) -> String {
     writeln!(s, "{{").unwrap();
     writeln!(s, "  // load_q_tile: {}[{}, {}, :, :] → smem", q, row, col).unwrap();
     let q_bytes = bytes_symbol("smem_q");
+    let q_tile_ptr = ctx.tile_ptr(q);
+    let legacy_suffix = format!(", {}, {}", row, col);
+    // `tile_ptr` carries the per-node offset — when the full emitter
+    // pipeline ran `emit_addr::render` on this node's `LoadAddr`, the
+    // call collapses to `(smem_q, Q_gmem + (q_tile * 16384u + …))`.
+    // When `ctx.node_addr` is `None` (sketch emitter, hand-built test
+    // ctx) we fall back to the legacy `(smem_q, Q_gmem, row, col)`
+    // shape so those paths keep compiling.
+    let addr_args = if ctx.node_addr.is_some() {
+        String::new()
+    } else {
+        legacy_suffix
+    };
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
             writeln!(
                 s,
-                "    tma_load_2d<{}>(smem_q, {}, {}, {});",
-                q_bytes, q, row, col
+                "    tma_load_2d<{}>(smem_q, {}{});",
+                q_bytes, q_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_q);").unwrap();
@@ -854,8 +897,8 @@ fn load_q_tile(ctx: &ExpandCtx<'_>) -> String {
         "sm89_fa2" => {
             writeln!(
                 s,
-                "  cp_async_128<{}>(smem_q, {}, {}, {});",
-                q_bytes, q, row, col
+                "  cp_async_128<{}>(smem_q, {}{});",
+                q_bytes, q_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
@@ -864,8 +907,8 @@ fn load_q_tile(ctx: &ExpandCtx<'_>) -> String {
             writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
             writeln!(
                 s,
-                "  generic_load<{}>(smem_q, {}, {}, {});",
-                q_bytes, q, row, col
+                "  generic_load<{}>(smem_q, {}{});",
+                q_bytes, q_tile_ptr, addr_args,
             )
             .unwrap();
         }
@@ -911,13 +954,20 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
     )
     .unwrap();
     let buf_bytes = bytes_symbol(&buf);
+    let buf_tile_ptr = ctx.tile_ptr(gmem);
+    let legacy_suffix = format!(", {} + {}, {}", ser, ctx.iter_offset, col);
+    let addr_args = if ctx.node_addr.is_some() {
+        String::new()
+    } else {
+        legacy_suffix
+    };
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
             writeln!(
                 s,
-                "    tma_load_2d<{}>({}[slot], {}, {} + {}, {});",
-                buf_bytes, buf, gmem, ser, ctx.iter_offset, col,
+                "    tma_load_2d<{}>({}[slot], {}{});",
+                buf_bytes, buf, buf_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_kv[slot]);").unwrap();
@@ -926,8 +976,8 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
         "sm89_fa2" => {
             writeln!(
                 s,
-                "  cp_async_128<{}>({}[slot], {}, {} + {}, {});",
-                buf_bytes, buf, gmem, ser, ctx.iter_offset, col,
+                "  cp_async_128<{}>({}[slot], {}{});",
+                buf_bytes, buf, buf_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
@@ -936,8 +986,8 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
             writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
             writeln!(
                 s,
-                "  generic_load<{}>({}[slot], {}, {} + {}, {});",
-                buf_bytes, buf, gmem, ser, ctx.iter_offset, col,
+                "  generic_load<{}>({}[slot], {}{});",
+                buf_bytes, buf, buf_tile_ptr, addr_args,
             )
             .unwrap();
         }
@@ -1069,6 +1119,13 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
     writeln!(s, "{{").unwrap();
     writeln!(s, "  // store_o_tile: {}[{}, {}] ← O_frag / l", o, row, col).unwrap();
     let o_bytes = bytes_symbol("smem_o");
+    let o_tile_ptr = ctx.tile_ptr(o);
+    let legacy_suffix = format!(", {}, {}", row, col);
+    let addr_args = if ctx.node_addr.is_some() {
+        String::new()
+    } else {
+        legacy_suffix
+    };
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == CONSUMER_WG) {{").unwrap();
@@ -1079,8 +1136,8 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
             writeln!(s, "    mbarrier_wait(&bar_o_ready);").unwrap();
             writeln!(
                 s,
-                "    tma_store_2d<{}>({}, smem_o, {}, {});",
-                o_bytes, o, row, col
+                "    tma_store_2d<{}>({}, smem_o{});",
+                o_bytes, o_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "  }}").unwrap();
@@ -1089,8 +1146,8 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
             writeln!(s, "  O_frag = O_frag * rcp(l);").unwrap();
             writeln!(
                 s,
-                "  stg_128<{}>({}, O_frag, {}, {});",
-                o_bytes, o, row, col
+                "  stg_128<{}>({}, O_frag{});",
+                o_bytes, o_tile_ptr, addr_args,
             )
             .unwrap();
         }
@@ -1103,8 +1160,8 @@ fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
             .unwrap();
             writeln!(
                 s,
-                "  generic_store<{}>({}, O_frag, l, {}, {});",
-                o_bytes, o, row, col
+                "  generic_store<{}>({}, O_frag, l{});",
+                o_bytes, o_tile_ptr, addr_args,
             )
             .unwrap();
         }
@@ -1151,13 +1208,20 @@ fn generic_pipeline_load(
     )
     .unwrap();
     let smem_bytes = bytes_symbol(smem);
+    let smem_tile_ptr = ctx.tile_ptr(gmem);
+    let legacy_suffix = format!(", {} + {}, {}", row_axis, ctx.iter_offset, col_axis);
+    let addr_args = if ctx.node_addr.is_some() {
+        String::new()
+    } else {
+        legacy_suffix
+    };
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
             writeln!(
                 s,
-                "    tma_load_2d<{}>({}[slot], {}, {} + {}, {});",
-                smem_bytes, smem, gmem, row_axis, ctx.iter_offset, col_axis,
+                "    tma_load_2d<{}>({}[slot], {}{});",
+                smem_bytes, smem, smem_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_{}[slot]);", smem).unwrap();
@@ -1166,8 +1230,8 @@ fn generic_pipeline_load(
         "sm89_fa2" => {
             writeln!(
                 s,
-                "  cp_async_128<{}>({}[slot], {}, {} + {}, {});",
-                smem_bytes, smem, gmem, row_axis, ctx.iter_offset, col_axis,
+                "  cp_async_128<{}>({}[slot], {}{});",
+                smem_bytes, smem, smem_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
@@ -1176,8 +1240,8 @@ fn generic_pipeline_load(
             writeln!(s, "  // unknown arch {} — fall back to generic load", other).unwrap();
             writeln!(
                 s,
-                "  generic_load<{}>({}[slot], {}, {} + {}, {});",
-                smem_bytes, smem, gmem, row_axis, ctx.iter_offset, col_axis,
+                "  generic_load<{}>({}[slot], {}{});",
+                smem_bytes, smem, smem_tile_ptr, addr_args,
             )
             .unwrap();
         }
@@ -1194,13 +1258,20 @@ fn generic_preamble_load(ctx: &ExpandCtx<'_>, smem: &str, gmem: &str, axis: &str
     writeln!(s, "{{").unwrap();
     writeln!(s, "  // {}: {}[{}] → {}", gmem, gmem, axis, smem).unwrap();
     let smem_bytes = bytes_symbol(smem);
+    let smem_tile_ptr = ctx.tile_ptr(gmem);
+    let legacy_suffix = format!(", {}", axis);
+    let addr_args = if ctx.node_addr.is_some() {
+        String::new()
+    } else {
+        legacy_suffix
+    };
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
             writeln!(
                 s,
-                "    tma_load_2d<{}>({}, {}, {});",
-                smem_bytes, smem, gmem, axis
+                "    tma_load_2d<{}>({}, {}{});",
+                smem_bytes, smem, smem_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "    mbarrier_arrive(&bar_{});", smem).unwrap();
@@ -1209,8 +1280,8 @@ fn generic_preamble_load(ctx: &ExpandCtx<'_>, smem: &str, gmem: &str, axis: &str
         "sm89_fa2" => {
             writeln!(
                 s,
-                "  cp_async_128<{}>({}, {}, {});",
-                smem_bytes, smem, gmem, axis
+                "  cp_async_128<{}>({}, {}{});",
+                smem_bytes, smem, smem_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "  cp_async_commit_group();").unwrap();
@@ -1286,6 +1357,13 @@ fn generic_store(
     )
     .unwrap();
     let out_bytes = bytes_symbol("smem_out");
+    let out_tile_ptr = ctx.tile_ptr(gmem);
+    let legacy_suffix = format!(", {}, {}", row_axis, col_axis);
+    let addr_args = if ctx.node_addr.is_some() {
+        String::new()
+    } else {
+        legacy_suffix
+    };
     match ctx.arch_name {
         "sm90_fa2" => {
             // Barrier name stays on the canonical so it matches
@@ -1298,8 +1376,8 @@ fn generic_store(
             writeln!(s, "    mbarrier_wait(&bar_{}_ready);", gmem_canonical).unwrap();
             writeln!(
                 s,
-                "    tma_store_2d<{}>({}, smem_out, {}, {});",
-                out_bytes, gmem, row_axis, col_axis,
+                "    tma_store_2d<{}>({}, smem_out{});",
+                out_bytes, out_tile_ptr, addr_args,
             )
             .unwrap();
             writeln!(s, "  }}").unwrap();
@@ -1307,8 +1385,8 @@ fn generic_store(
         "sm89_fa2" => {
             writeln!(
                 s,
-                "  stg_128<{}>({}, {}, {}, {});",
-                out_bytes, gmem, frag, row_axis, col_axis,
+                "  stg_128<{}>({}, {}{});",
+                out_bytes, out_tile_ptr, frag, addr_args,
             )
             .unwrap();
         }
@@ -1343,19 +1421,32 @@ fn generic_cache_store(ctx: &ExpandCtx<'_>, gmem: &str, frag: &str) -> String {
     )
     .unwrap();
     writeln!(s, "  uint32_t slot = token_tile % blocks_per_tile;").unwrap();
+    // Cache-store gmem already carries the paged-KV offset through
+    // `AxisDivGather` — the rendered `node_addr` is `block_table[…] *
+    // stride + …`. Template bytes = one tile of KV cache staging. When
+    // the legacy path runs (no node_addr), fall back to the old
+    // `(gmem, frag, page, slot, head_tile)` form so the sketch emitter
+    // output still reflects the paged-KV structure.
+    let cache_tile_ptr = ctx.tile_ptr(gmem);
+    let legacy_suffix = ", page, slot, head_tile".to_string();
+    let addr_args = if ctx.node_addr.is_some() {
+        String::new()
+    } else {
+        legacy_suffix
+    };
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == STORER_WG) {{").unwrap();
             writeln!(
                 s,
-                "    tma_store_2d({}, {}, page, slot, head_tile);",
-                gmem, frag,
+                "    tma_store_2d({}, {}{});",
+                cache_tile_ptr, frag, addr_args,
             )
             .unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
-            writeln!(s, "  stg_128({}, {}, page, slot, head_tile);", gmem, frag).unwrap();
+            writeln!(s, "  stg_128({}, {}{});", cache_tile_ptr, frag, addr_args,).unwrap();
         }
         _ => {}
     }
@@ -1424,27 +1515,42 @@ fn embed_gather(ctx: &ExpandCtx<'_>) -> String {
     let mut s = String::new();
     writeln!(s, "{{").unwrap();
     writeln!(s, "  // Embed_frag = {}[token_ids[{}]];", embed, row_axis).unwrap();
+    // `AxisDivGather { divisor: 1, table: "token_ids", stride:
+    // hidden_dim }` at the IR level renders as
+    // `token_ids[token_tile / 1u] * <hidden_dim>`. The real emitter
+    // carries that through `ctx.node_addr`. Legacy path (None) keeps
+    // the hand-written `embed + row * hidden_stride` form the sketch
+    // emitter shows — semantically identical.
+    let embed_tile_ptr = ctx.tile_ptr(embed);
     match ctx.arch_name {
         "sm90_fa2" => {
             writeln!(s, "  if (wg == LOADER_WG) {{").unwrap();
-            writeln!(s, "    uint32_t row = token_ids[{}];", row_axis).unwrap();
-            writeln!(
-                s,
-                "    tma_load_2d(Embed_frag, {} + row * hidden_stride);",
-                embed
-            )
-            .unwrap();
+            if ctx.node_addr.is_some() {
+                writeln!(s, "    tma_load_2d(Embed_frag, {});", embed_tile_ptr).unwrap();
+            } else {
+                writeln!(s, "    uint32_t row = token_ids[{}];", row_axis).unwrap();
+                writeln!(
+                    s,
+                    "    tma_load_2d(Embed_frag, {} + row * hidden_stride);",
+                    embed
+                )
+                .unwrap();
+            }
             writeln!(s, "    mbarrier_arrive(&bar_embed);").unwrap();
             writeln!(s, "  }}").unwrap();
         }
         "sm89_fa2" => {
-            writeln!(s, "  uint32_t row = token_ids[{}];", row_axis).unwrap();
-            writeln!(
-                s,
-                "  cp_async_128(Embed_frag, {} + row * hidden_stride);",
-                embed
-            )
-            .unwrap();
+            if ctx.node_addr.is_some() {
+                writeln!(s, "  cp_async_128(Embed_frag, {});", embed_tile_ptr).unwrap();
+            } else {
+                writeln!(s, "  uint32_t row = token_ids[{}];", row_axis).unwrap();
+                writeln!(
+                    s,
+                    "  cp_async_128(Embed_frag, {} + row * hidden_stride);",
+                    embed
+                )
+                .unwrap();
+            }
             writeln!(s, "  cp_async_commit_group();").unwrap();
         }
         other => {
@@ -1476,6 +1582,7 @@ mod tests {
             parallel_axes: FA2_PAR,
             serial_axis: FA2_SER,
             gmem_bindings: &[],
+            node_addr: None,
         }
     }
 
@@ -1505,6 +1612,7 @@ mod tests {
             parallel_axes: FA2_PAR,
             serial_axis: FA2_SER,
             gmem_bindings: &[],
+            node_addr: None,
         }
     }
 
@@ -1613,6 +1721,7 @@ mod tests {
             parallel_axes: &["m_tile", "n_tile"],
             serial_axis: Some("k_tile"),
             gmem_bindings: &[],
+            node_addr: None,
         }
     }
 
@@ -1683,6 +1792,7 @@ mod tests {
                 parallel_axes: &["token_tile"],
                 serial_axis: None,
                 gmem_bindings: &[],
+                node_addr: None,
             };
             let s = expand("load_embed_row", &embed_ctx).unwrap();
             assert!(s.contains("uint32_t row = token_ids[token_tile]"));
@@ -1832,6 +1942,7 @@ mod tests {
             parallel_axes: &["b", "head_group"],
             serial_axis: Some("kv_tile"),
             gmem_bindings: &[],
+            node_addr: None,
         };
         let s = expand("load_q_tile", &ctx).unwrap();
         assert!(s.contains("tma_load_2d<SMEM_Q_BYTES>(smem_q, Q_gmem, b, head_group)"));
@@ -1847,6 +1958,7 @@ mod tests {
             parallel_axes: &["b", "head_group"],
             serial_axis: Some("kv_tile"),
             gmem_bindings: &[],
+            node_addr: None,
         };
         let s = expand("store_o_tile", &ctx).unwrap();
         assert!(s.contains("tma_store_2d<SMEM_O_BYTES>(O_gmem, smem_o, b, head_group)"));
@@ -1864,6 +1976,7 @@ mod tests {
             parallel_axes: FA2_PAR,
             serial_axis: Some("kv_tile"),
             gmem_bindings: &[],
+            node_addr: None,
         };
         assert!(
             expand("qk_matmul", &fa2)
@@ -1878,6 +1991,7 @@ mod tests {
             parallel_axes: FA2_PAR,
             serial_axis: Some("kv_chunk"),
             gmem_bindings: &[],
+            node_addr: None,
         };
         assert!(
             expand("qk_matmul", &renamed)
@@ -1897,6 +2011,7 @@ mod tests {
             parallel_axes: FA2_PAR,
             serial_axis: FA2_SER,
             gmem_bindings: &[],
+            node_addr: None,
         };
         assert_eq!(ctx.gmem("Q_gmem"), "Q_gmem");
         assert_eq!(ctx.gmem("Wqkv_gmem"), "Wqkv_gmem");
@@ -1911,6 +2026,7 @@ mod tests {
             parallel_axes: FA2_PAR,
             serial_axis: FA2_SER,
             gmem_bindings: &[("Q_gmem", "layer_5_Q"), ("Wqkv_gmem", "layer_5_Wqkv")],
+            node_addr: None,
         };
         assert_eq!(ctx.gmem("Q_gmem"), "layer_5_Q");
         assert_eq!(ctx.gmem("Wqkv_gmem"), "layer_5_Wqkv");
@@ -1929,6 +2045,7 @@ mod tests {
             parallel_axes: FA2_PAR,
             serial_axis: FA2_SER,
             gmem_bindings: &[("Q_gmem", "t42_0")],
+            node_addr: None,
         };
         let s = expand("load_q_tile", &ctx).unwrap();
         assert!(s.contains("tma_load_2d<SMEM_Q_BYTES>(smem_q, t42_0, q_tile, head_group)"));
@@ -1946,6 +2063,7 @@ mod tests {
             parallel_axes: &["m_tile", "n_tile"],
             serial_axis: Some("k_tile"),
             gmem_bindings: &[("C_gmem", "layer_7_Wo_C")],
+            node_addr: None,
         };
         let s = expand("store_c_tile", &ctx).unwrap();
         // Data address uses the identity; the mbarrier keeps the
@@ -1968,6 +2086,7 @@ mod tests {
             parallel_axes: &["m_tile", "n_tile"],
             serial_axis: Some("k_tile"),
             gmem_bindings: &[],
+            node_addr: None,
         };
         let s = expand("gemm_accumulate", &gemm_ctx).unwrap();
         assert!(s.contains("uint32_t slot = k_tile % PIPE;"));

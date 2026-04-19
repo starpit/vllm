@@ -10,6 +10,7 @@
 
 pub mod arch;
 pub mod emit;
+pub mod emit_addr;
 pub mod emit_mega;
 pub mod emit_ops;
 pub mod ir;

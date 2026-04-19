@@ -518,6 +518,7 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
             sched.pipeline_depth,
             &parallel_axis_names,
             serial_axis_name,
+            sched.serial_axis,
         );
     }
 
@@ -545,6 +546,7 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
                 sched.pipeline_depth,
                 &parallel_axis_names,
                 serial_axis_name,
+                sched.serial_axis,
             );
         }
         writeln!(out, "{}}}  // end {}", indent, ax.name).unwrap();
@@ -559,6 +561,7 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
                 sched.pipeline_depth,
                 &parallel_axis_names,
                 serial_axis_name,
+                sched.serial_axis,
             );
         }
     }
@@ -574,6 +577,7 @@ fn write_region(out: &mut String, region: &Region, sched: &Schedule, arch: &Arch
             sched.pipeline_depth,
             &parallel_axis_names,
             serial_axis_name,
+            sched.serial_axis,
         );
     }
 
@@ -662,11 +666,21 @@ fn write_step(
     pipeline_depth: u32,
     parallel_axes: &[&'static str],
     serial_axis: Option<&'static str>,
+    serial_axis_id: Option<crate::ir::AxisId>,
 ) {
     let node = region.node(step.node);
     for bp in &step.barriers_before {
         writeln!(out, "{}{}", indent, barrier_stmt(bp)).unwrap();
     }
+    // Pre-render the tile offset expression for Load/Store nodes so
+    // data-movement expansions can emit `gmem + ({node_addr})`
+    // instead of the pre-refactor `gmem, row, col` form. Compute
+    // nodes (no `addr`) pass `None` through — expansions that don't
+    // touch gmem never look at `ctx.node_addr`.
+    let node_addr = node
+        .addr
+        .as_ref()
+        .map(|addr| crate::emit_addr::render(region, addr, step.iter_offset, serial_axis_id));
     let ctx = ExpandCtx {
         arch_name: arch.name,
         iter_offset: step.iter_offset,
@@ -674,6 +688,7 @@ fn write_step(
         parallel_axes,
         serial_axis,
         gmem_bindings: &region.gmem_bindings,
+        node_addr: node_addr.as_deref(),
     };
     if let Some(body) = expand_op(node.op.tag, &ctx) {
         for line in body.lines() {
@@ -769,7 +784,16 @@ mod tests {
 
         // Per-region body is real: load_q expansion from emit_ops,
         // pipeline-source K/V slot rotation, mbarrier on raw edges.
-        assert!(src.contains("tma_load_2d<SMEM_Q_BYTES>(smem_q, Q_gmem"));
+        // Address-expression refactor (task 5): Q gmem is offset
+        // by the rendered `LoadAddr`, not handed row/col axes.
+        assert!(src.contains(
+            "tma_load_2d<SMEM_Q_BYTES>(smem_q, Q_gmem + (q_tile * 16384u + head_group * 128u));"
+        ));
+        // K-tile load is pipelined (+3 on the serial axis) AND sits on
+        // the serial `kv_tile` axis, so the address shifts.
+        assert!(src.contains(
+            "tma_load_2d<SMEM_K_BYTES>(smem_k[slot], K_gmem + ((kv_tile + 3) * 8192u + head_group * 128u));"
+        ));
         assert!(src.contains("uint32_t slot = (kv_tile + 3) % 3;"));
 
         // Region 0 is Infinite so it has no `window_in_tiles` scalar;

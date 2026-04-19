@@ -328,8 +328,17 @@ pub fn attn_region_paged_decode(p: &PagedDecodeParams) -> Region {
                     AddrTerm::AxisDivGather {
                         axis: KV_TILE,
                         divisor: blocks_per_tile.max(1),
+                        // Flat block_table for now — `b` folds in once
+                        // the ambient-scalar plumbing (status doc item
+                        // 6) makes `block_table` a per-batch base via a
+                        // kernel param. Rendering `block_table[b][...]`
+                        // here would require the prelude's block_table
+                        // symbol to be pointer-to-pointer, which
+                        // `generic_cache_store`'s single-level usage
+                        // doesn't accept. Keeping both paths on a flat
+                        // uint32_t* array until item 6 lands.
                         table: SmemLookup {
-                            source: "block_table[b]",
+                            source: "block_table",
                         },
                         stride: StrideExpr::Const(page_stride),
                     },

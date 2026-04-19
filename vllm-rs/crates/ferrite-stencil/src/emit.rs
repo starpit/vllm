@@ -266,8 +266,10 @@ mod tests {
         // Barriers: pipeline edges → NamedSem, raw edges → Mbarrier.
         assert!(src.contains("sem_wait(\"kv_arrived\", depth=3);"));
         assert!(src.contains("mbarrier_wait();"));
-        // Epilogue store.
-        assert!(src.contains("store_o_tile();  // Store"));
+        // Epilogue store expands to staged TMA (consumer normalizes,
+        // storer does the TMA).
+        assert!(src.contains("stmatrix_smem(smem_o, O_frag)"));
+        assert!(src.contains("tma_store_2d(O_gmem, smem_o"));
     }
 
     #[test]
@@ -286,8 +288,8 @@ mod tests {
         assert!(src.contains("for (uint32_t kv_tile = 0;"));
         // SM89 load_q_tile expands to cp.async.
         assert!(src.contains("cp_async_128(smem_q, Q_gmem"));
-        // store_o_tile still stubs (not yet in the expansion table).
-        assert!(src.contains("store_o_tile();  // Store"));
+        // store_o_tile on SM89 is a direct STG.
+        assert!(src.contains("stg_128(O_gmem, O_frag"));
     }
 
     #[test]

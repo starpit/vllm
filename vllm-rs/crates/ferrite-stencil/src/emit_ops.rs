@@ -35,6 +35,10 @@ pub fn expand(tag: &str, ctx: &ExpandCtx<'_>) -> Option<String> {
         "load_q_tile" => Some(load_q_tile(ctx)),
         "load_k_tile" => Some(load_kv_tile(ctx, "k")),
         "load_v_tile" => Some(load_kv_tile(ctx, "v")),
+        "qk_matmul" => Some(qk_matmul(ctx)),
+        "softmax_update" => Some(softmax_update(ctx)),
+        "pv_matmul" => Some(pv_matmul(ctx)),
+        "store_o_tile" => Some(store_o_tile(ctx)),
         _ => None,
     }
 }
@@ -132,6 +136,145 @@ fn load_kv_tile(ctx: &ExpandCtx<'_>, which: &str) -> String {
     s
 }
 
+/// Guard a block on the consumer warpgroup on SM90, or run it on
+/// AllWarps elsewhere. The compute ops all run on the consumer;
+/// centralising the dispatch keeps the per-op bodies focused on the
+/// math.
+fn compute_guarded(ctx: &ExpandCtx<'_>, body: &str) -> String {
+    let mut s = String::new();
+    writeln!(s, "{{").unwrap();
+    match ctx.arch_name {
+        "sm90_fa2" => {
+            writeln!(s, "  if (wg == CONSUMER_WG) {{").unwrap();
+            for line in body.lines() {
+                writeln!(s, "    {}", line).unwrap();
+            }
+            writeln!(s, "  }}").unwrap();
+        }
+        _ => {
+            for line in body.lines() {
+                writeln!(s, "  {}", line).unwrap();
+            }
+        }
+    }
+    write!(s, "}}").unwrap();
+    s
+}
+
+/// S_frag = Q_tile @ K_tile^T, accumulating into registers.
+///
+/// On SM90 the consumer issues a single `wgmma.mma_async` across the
+/// warpgroup; the smem-K slot corresponds to the iter's current kv
+/// tile. On SM89 every warp participates in a tiled `mma.sync`
+/// sweep over head_dim / k.
+fn qk_matmul(ctx: &ExpandCtx<'_>) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let body = match ctx.arch_name {
+        "sm90_fa2" => concat!(
+            "// S_frag = Q_tile @ K_tile^T\n",
+            "uint32_t slot = kv_tile % PIPE;\n",
+            "wgmma_fence();\n",
+            "wgmma_mma_async(S_frag, smem_q, smem_k[slot]);\n",
+            "wgmma_commit_group();\n",
+            "wgmma_wait_group<0>();\n",
+        ),
+        "sm89_fa2" => concat!(
+            "// S_frag = Q_tile @ K_tile^T (tiled mma.sync over head_dim)\n",
+            "uint32_t slot = kv_tile % PIPE;\n",
+            "mma_sync_accumulate(S_frag, smem_q, smem_k[slot]);\n",
+        ),
+        _ => "mma_accumulate(S_frag, smem_q, smem_k);\n",
+    };
+    compute_guarded(ctx, body)
+}
+
+/// Online softmax rescale: update per-row (m, l); rescale the O
+/// accumulator by exp(m_old - m_new); produce P_frag = exp(S - m_new).
+/// Same math on both archs; SM90 still guards on the consumer wg so
+/// only one warpgroup touches the accumulators.
+fn softmax_update(ctx: &ExpandCtx<'_>) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let body = concat!(
+        "// online softmax: (m, l, O) ← update(S_frag)\n",
+        "float m_new = row_max(S_frag, m);\n",
+        "float scale = exp2f(m - m_new);\n",
+        "P_frag = exp2f_frag(S_frag - m_new);\n",
+        "l      = scale * l + row_sum(P_frag);\n",
+        "O_frag = scale * O_frag;  // rescale prior accumulator\n",
+        "m      = m_new;\n",
+    );
+    compute_guarded(ctx, body)
+}
+
+/// O_frag += P_frag @ V_tile. Same warpgroup/warp split as
+/// `qk_matmul`, pipelining into the V slot.
+fn pv_matmul(ctx: &ExpandCtx<'_>) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "compute nodes carry no iter_offset");
+    let body = match ctx.arch_name {
+        "sm90_fa2" => concat!(
+            "// O_frag += P_frag @ V_tile\n",
+            "uint32_t slot = kv_tile % PIPE;\n",
+            "wgmma_fence();\n",
+            "wgmma_mma_async(O_frag, P_frag, smem_v[slot]);\n",
+            "wgmma_commit_group();\n",
+            "wgmma_wait_group<0>();\n",
+            "// release the kv slot back to the loader\n",
+            "mbarrier_arrive(&bar_kv_consumed[slot]);\n",
+        ),
+        "sm89_fa2" => concat!(
+            "// O_frag += P_frag @ V_tile\n",
+            "uint32_t slot = kv_tile % PIPE;\n",
+            "mma_sync_accumulate(O_frag, P_frag, smem_v[slot]);\n",
+        ),
+        _ => "mma_accumulate(O_frag, P_frag, smem_v);\n",
+    };
+    compute_guarded(ctx, body)
+}
+
+/// Final store: divide O_frag by l, write to gmem at (q_tile, head_group).
+///
+/// On SM90 the consumer stages the fragment into smem and signals the
+/// storer warpgroup, which performs a TMA store; on SM89 the consumer
+/// writes directly to gmem with STG.
+fn store_o_tile(ctx: &ExpandCtx<'_>) -> String {
+    debug_assert_eq!(ctx.iter_offset, 0, "store nodes carry no iter_offset");
+    let mut s = String::new();
+    writeln!(s, "{{").unwrap();
+    writeln!(
+        s,
+        "  // store_o_tile: O_gmem[q_tile, head_group] ← O_frag / l"
+    )
+    .unwrap();
+    match ctx.arch_name {
+        "sm90_fa2" => {
+            writeln!(s, "  if (wg == CONSUMER_WG) {{").unwrap();
+            writeln!(s, "    O_frag = O_frag * rcp(l);").unwrap();
+            writeln!(s, "    stmatrix_smem(smem_o, O_frag);").unwrap();
+            writeln!(s, "    mbarrier_arrive(&bar_o_ready);").unwrap();
+            writeln!(s, "  }} else if (wg == STORER_WG) {{").unwrap();
+            writeln!(s, "    mbarrier_wait(&bar_o_ready);").unwrap();
+            writeln!(s, "    tma_store_2d(O_gmem, smem_o, q_tile, head_group);").unwrap();
+            writeln!(s, "  }}").unwrap();
+        }
+        "sm89_fa2" => {
+            writeln!(s, "  O_frag = O_frag * rcp(l);").unwrap();
+            writeln!(s, "  stg_128(O_gmem, O_frag, q_tile, head_group);").unwrap();
+        }
+        other => {
+            writeln!(
+                s,
+                "  // unknown arch {} — fall back to generic store",
+                other
+            )
+            .unwrap();
+            writeln!(s, "  generic_store(O_gmem, O_frag, l, q_tile, head_group);").unwrap();
+        }
+    }
+    let _ = ctx.pipeline_depth;
+    write!(s, "}}").unwrap();
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,8 +335,74 @@ mod tests {
     }
 
     #[test]
+    fn qk_matmul_sm90_uses_wgmma_under_consumer_guard() {
+        let s = expand("qk_matmul", &ctx("sm90_fa2")).unwrap();
+        assert!(s.contains("if (wg == CONSUMER_WG)"));
+        assert!(s.contains("wgmma_mma_async(S_frag, smem_q, smem_k[slot])"));
+        assert!(s.contains("wgmma_commit_group"));
+        assert!(s.contains("wgmma_wait_group<0>"));
+    }
+
+    #[test]
+    fn qk_matmul_sm89_uses_mma_sync_no_wg_guard() {
+        let s = expand("qk_matmul", &ctx("sm89_fa2")).unwrap();
+        assert!(s.contains("mma_sync_accumulate(S_frag, smem_q, smem_k[slot])"));
+        assert!(!s.contains("CONSUMER_WG"));
+        assert!(!s.contains("wgmma"));
+    }
+
+    #[test]
+    fn softmax_update_emits_online_rescale() {
+        for arch in ["sm90_fa2", "sm89_fa2"] {
+            let s = expand("softmax_update", &ctx(arch)).unwrap();
+            assert!(s.contains("m_new = row_max(S_frag, m)"));
+            assert!(s.contains("scale = exp2f(m - m_new)"));
+            assert!(s.contains("l      = scale * l + row_sum(P_frag)"));
+            assert!(s.contains("O_frag = scale * O_frag"));
+        }
+        // SM90 guards it on consumer wg; SM89 does not.
+        assert!(
+            expand("softmax_update", &ctx("sm90_fa2"))
+                .unwrap()
+                .contains("CONSUMER_WG")
+        );
+        assert!(
+            !expand("softmax_update", &ctx("sm89_fa2"))
+                .unwrap()
+                .contains("CONSUMER_WG")
+        );
+    }
+
+    #[test]
+    fn pv_matmul_sm90_releases_kv_slot_to_loader() {
+        let s = expand("pv_matmul", &ctx("sm90_fa2")).unwrap();
+        assert!(s.contains("wgmma_mma_async(O_frag, P_frag, smem_v[slot])"));
+        // Consumer signals the loader that the kv slot is free again.
+        assert!(s.contains("mbarrier_arrive(&bar_kv_consumed[slot])"));
+    }
+
+    #[test]
+    fn store_o_sm90_splits_consumer_staging_and_storer_tma() {
+        let s = expand("store_o_tile", &ctx("sm90_fa2")).unwrap();
+        assert!(s.contains("if (wg == CONSUMER_WG)"));
+        assert!(s.contains("O_frag = O_frag * rcp(l)"));
+        assert!(s.contains("stmatrix_smem(smem_o, O_frag)"));
+        assert!(s.contains("mbarrier_arrive(&bar_o_ready)"));
+        assert!(s.contains("} else if (wg == STORER_WG)"));
+        assert!(s.contains("tma_store_2d(O_gmem, smem_o, q_tile, head_group)"));
+    }
+
+    #[test]
+    fn store_o_sm89_uses_direct_stg() {
+        let s = expand("store_o_tile", &ctx("sm89_fa2")).unwrap();
+        assert!(s.contains("O_frag = O_frag * rcp(l)"));
+        assert!(s.contains("stg_128(O_gmem, O_frag, q_tile, head_group)"));
+        assert!(!s.contains("STORER_WG"));
+    }
+
+    #[test]
     fn unknown_tag_returns_none() {
-        assert!(expand("qk_matmul", &ctx("sm90_fa2")).is_none());
         assert!(expand("not_a_real_op", &ctx("sm89_fa2")).is_none());
+        assert!(expand("paged_gather_kv", &ctx("sm90_fa2")).is_none());
     }
 }

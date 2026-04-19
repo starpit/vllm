@@ -504,6 +504,52 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             solve_ms = d_solve.as_millis(),
         );
 
+        // Parallel stencil path: lower the first workload point's
+        // Assignment into a Megakernel and schedule each region on
+        // the arch-appropriate `ArchMap`. This does not affect the
+        // emitted code — it's a sanity pass that proves the stencil
+        // pipeline (FUF → Megakernel → Schedule) runs on real-model
+        // FUFs every time the macro expands. Unsupported impls are
+        // skipped; telemetry reports counts so the parallel path
+        // becomes observable without blocking on templates for every
+        // Impl.
+        if let Some((_wp, first)) = sfufs.per_workload.iter().next() {
+            let report = lower_to_stencil::lower_assignment_partial(
+                &model_fuf,
+                first,
+                &library,
+                &lower_to_stencil::LowerHints::default(),
+            );
+            let arch = if target_profile.compute_capability >= 90 {
+                ferrite_stencil::sm90_fa2()
+            } else {
+                ferrite_stencil::sm89_fa2()
+            };
+            let mut scheduled = 0usize;
+            let mut schedule_err: Option<String> = None;
+            for region in &report.mk.regions {
+                match ferrite_stencil::schedule_wavefront(region, &arch) {
+                    Ok(_) => scheduled += 1,
+                    Err(e) => {
+                        schedule_err = Some(format!("{}: {:?}", region.name, e));
+                        break;
+                    }
+                }
+            }
+            eprintln!(
+                "  ferrite stencil · {variant:<30} · {scheduled}/{total} regions scheduled \
+                 on {arch} · {skipped} subgraphs skipped{err}",
+                variant = model.source_stem,
+                total = report.mk.regions.len(),
+                arch = arch.name,
+                skipped = report.skipped.len(),
+                err = match &schedule_err {
+                    Some(s) => format!(" · err={s}"),
+                    None => String::new(),
+                },
+            );
+        }
+
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
 
         solved.push(SolvedModel {

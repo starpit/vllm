@@ -32,6 +32,20 @@ use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::ImplementationLibrary;
 use crate::solver::{Assignment, SubgraphId};
 
+/// Outcome of a tolerant pass over an `Assignment`: every subgraph
+/// whose Impl has a region template is lowered; every subgraph whose
+/// Impl does not is skipped (not an error). Used by the parallel
+/// wire-up in `lib.rs` so the new pipeline runs on real models
+/// without blocking on templates for every non-attention Impl.
+#[derive(Debug)]
+pub struct LowerReport {
+    pub mk: Megakernel,
+    pub supported_subgraphs: usize,
+    /// Subgraphs that had no region template, with the offending
+    /// impl name for telemetry.
+    pub skipped: Vec<(SubgraphId, &'static str)>,
+}
+
 /// Hardware-facing tile/pipe parameters the lowering can't yet
 /// infer from the FUF. Pass-through for v1; later commits will
 /// derive these from FUF shapes + solver cost hints.
@@ -113,6 +127,53 @@ pub fn lower_assignment(
         regions,
         control: Vec::new(),
     })
+}
+
+/// Tolerant variant: lowers every supported subgraph, records the
+/// rest as skipped. Used by the macro drive while non-attention
+/// region templates are still being written.
+pub fn lower_assignment_partial(
+    fuf: &Fuf,
+    assignment: &Assignment,
+    library: &ImplementationLibrary,
+    hints: &LowerHints,
+) -> LowerReport {
+    let mut regions: Vec<Region> = Vec::new();
+    let mut skipped: Vec<(SubgraphId, &'static str)> = Vec::new();
+    let mut supported = 0usize;
+
+    let mut subgraphs: Vec<SubgraphId> = assignment.subgraphs().collect();
+    subgraphs.sort();
+
+    for sg in subgraphs {
+        let tiles = assignment.tiles_in_subgraph(sg);
+        if tiles.is_empty() {
+            continue;
+        }
+        let Some(impl_id) = assignment.impl_of(sg) else {
+            continue;
+        };
+        let imp = library.get(impl_id);
+        match lower_impl(imp.name(), &tiles, fuf, hints) {
+            Ok(region) => {
+                regions.push(region);
+                supported += 1;
+            }
+            Err(LowerError::UnsupportedImpl { name }) => {
+                skipped.push((sg, name));
+            }
+            Err(_) => {}
+        }
+    }
+
+    LowerReport {
+        mk: Megakernel {
+            regions,
+            control: Vec::new(),
+        },
+        supported_subgraphs: supported,
+        skipped,
+    }
 }
 
 fn lower_impl(
@@ -327,6 +388,109 @@ mod tests {
         assert_eq!(ferrite_stencil::region_pipeline_depth(r), 3);
         let order = ferrite_stencil::topo_order_within_iter(r);
         assert_eq!(order.len(), r.nodes.len());
+    }
+
+    #[test]
+    fn partial_lowering_skips_unsupported_subgraphs() {
+        // Assignment mixes one supported (attention) and one unsupported
+        // (fake gemm) subgraph. Partial lowering should lower the
+        // attention one and record the other as skipped.
+        use crate::impl_lib::Implementation;
+
+        #[derive(Debug, Default)]
+        struct FakeGemm;
+        impl Implementation for FakeGemm {
+            fn name(&self) -> &'static str {
+                "gemm_rowmajor"
+            }
+            fn target_compatible(&self, _: &crate::target::TargetProfile) -> bool {
+                true
+            }
+            fn workload_constraint(&self) -> crate::impl_lib::WorkloadConstraint {
+                crate::impl_lib::WorkloadConstraint::Any
+            }
+            fn matches(
+                &self,
+                _: &Fuf,
+                _: TileId,
+                _: &crate::target::TargetProfile,
+            ) -> Option<crate::impl_lib::MatchInfo> {
+                None
+            }
+            fn cost_us(&self, _: &crate::impl_lib::MatchInfo, _: &crate::impl_lib::CostCtx) -> f64 {
+                0.0
+            }
+            fn resources(&self, _: &crate::impl_lib::MatchInfo) -> crate::impl_lib::Resources {
+                crate::impl_lib::Resources::ZERO
+            }
+            fn launch_kind(&self) -> crate::impl_lib::LaunchKind {
+                crate::impl_lib::LaunchKind::HostCallback
+            }
+            fn supported_input_handoffs(&self) -> &[crate::impl_lib::Handoff] {
+                &[]
+            }
+            fn supported_output_handoffs(&self) -> &[crate::impl_lib::Handoff] {
+                &[]
+            }
+            fn input_layouts(
+                &self,
+                _: &crate::impl_lib::MatchInfo,
+            ) -> Vec<crate::impl_lib::Layout> {
+                vec![]
+            }
+            fn output_layouts(
+                &self,
+                _: &crate::impl_lib::MatchInfo,
+            ) -> Vec<crate::impl_lib::Layout> {
+                vec![]
+            }
+            fn is_compute_bound(&self) -> bool {
+                false
+            }
+            fn emit_call(&self, _: &crate::emit::EmitCtx) -> proc_macro2::TokenStream {
+                proc_macro2::TokenStream::new()
+            }
+        }
+
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Attention,
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Attention,
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let attn_id = lib.push(Box::new(AttentionPrefillContiguousImpl));
+        let gemm_id = lib.push(Box::new(FakeGemm));
+        let sg_attn = SubgraphId(0);
+        let sg_gemm = SubgraphId(1);
+        let mut cover = HashMap::new();
+        cover.insert(TileId(0), sg_attn);
+        cover.insert(TileId(1), sg_gemm);
+        let mut impls = HashMap::new();
+        impls.insert(sg_attn, attn_id);
+        impls.insert(sg_gemm, gemm_id);
+        let assignment = Assignment {
+            cover,
+            impls,
+            predicted_us: 0.0,
+        };
+
+        let report = lower_assignment_partial(&fuf, &assignment, &lib, &LowerHints::default());
+        assert_eq!(report.supported_subgraphs, 1);
+        assert_eq!(report.mk.regions.len(), 1);
+        assert_eq!(report.mk.regions[0].name, "fa2_prefill");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].1, "gemm_rowmajor");
     }
 
     #[test]

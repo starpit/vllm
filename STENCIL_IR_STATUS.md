@@ -10,7 +10,7 @@ Dated 2026-04-19. Companion to `STENCIL_IR_DESIGN.md` (vocabulary freeze) and `S
 
 ## What's landed
 
-Six commits on `worktree-ff2` on top of `500a4ca4c`:
+Seven commits on `worktree-ff2` on top of `500a4ca4c`:
 
 | Commit | Layer | Tests |
 |---|---|---|
@@ -20,6 +20,7 @@ Six commits on `worktree-ff2` on top of `500a4ca4c`:
 | `d77532c4b` | FUF→Stencil lowering v1 in `ferrite-forward-macro::lower_to_stencil` | 4 |
 | `216d03354` | Wavefront scheduler: preamble / body / epilogue, Pipeline iter_offset, arch-specific barriers | 7 |
 | `cbd0e88dd` | Capstone end-to-end: FUF + Assignment → Megakernel → Schedule | 1 |
+| _pending_   | Parallel wire-up into `forward!` drive: tolerant `lower_assignment_partial` + per-variant telemetry line; runs on every real-model expansion | 6 |
 
 28 tests green through `cargo clippy -p ferrite-stencil --tests -- -D warnings` and same for `ferrite-forward-macro`. Run:
 
@@ -57,12 +58,11 @@ Each `Step` in the schedule carries `node: NodeId`, `iter_offset: i32` (+P for p
 
 ## What's deferred (priority order)
 
-### 1. Wire lowering into the macro drive
-`lower_assignment` exists but isn't called. Current codegen path in `ferrite-forward-macro/src/lib.rs:445-533` goes `solver → schedule → codegen::emit_model` emitting kernel launches per Impl. Plugging stencil in means either:
-- **(a) parallel path**: add a `Megakernel` pass after `schedule::schedule()` that runs *alongside* the existing emitter, gated by a feature flag. Stencil output goes through a new emitter module. Preserves the working path.
-- **(b) replace**: migrate `emit_model` to read `Megakernel` + `Schedule`. Bigger blast radius.
+### 1. Wire lowering into the macro drive — **parallel pass landed; emitter still TODO**
+`lower_assignment_partial` is now called inside the per-model loop in `lib.rs` right after the existing `ferrite · …` telemetry line. It lowers the first workload point's `Assignment`, picks `sm90_fa2` or `sm89_fa2` from `target_profile.compute_capability`, schedules every region, and prints a `ferrite stencil · <variant> · X/Y regions scheduled on <arch> · N subgraphs skipped` line. Verified on llama-{2,3}-{7,13,70}b × every quant variant — 100% region scheduling success, 0 errors. **Does not yet feed codegen**; the skipped subgraphs are all non-attention impls (gemm, rmsnorm, silu, rope, …) with no region template.
 
-Prefer (a) for the first wire-up. Emitter doesn't need to produce PTX — just ordered kernel-launch calls that match what the current per-Impl `emit_call` produces for attention.
+Remaining work on this axis:
+- **(b) replace codegen path**: migrate `emit_model` to read `Megakernel` + `Schedule`. Requires every Impl the library ships to have a region template — i.e. blocked on deferred item #5 and friends. Pre-req before this is worth attempting: bridge back from `FufOpRef.tag: &'static str` to a concrete `TileId` so the emitter knows which kernel launch each step corresponds to (see hazards below).
 
 ### 2. Real shape inference to replace `LowerHints`
 `LowerHints { head_dim, num_head_groups, tile_q, tile_k, pipe, tokens_per_page }` is pass-through today. The right source:

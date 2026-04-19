@@ -26,9 +26,10 @@
 use std::collections::{HashMap, HashSet};
 
 use ferrite_stencil::{
-    AttnParams, ControlEdge, DepKind, GemmParams, Megakernel, PagedDecodeParams, QkvRopeParams,
-    Region, RegionId, ResidualAddParams, RmsNormParams, Window, attn_region,
-    attn_region_paged_decode, gemm_region, qkv_rope_region, residual_add_region, rmsnorm_region,
+    AttnParams, ControlEdge, DepKind, GateUpSiluMulParams, GemmParams, Megakernel,
+    PagedDecodeParams, QkvRopeParams, Region, RegionId, ResidualAddParams, RmsNormParams, Window,
+    attn_region, attn_region_paged_decode, gate_up_silu_mul_region, gemm_region, qkv_rope_region,
+    residual_add_region, rmsnorm_region,
 };
 
 use crate::fuf::{Fuf, FufInput, TileId};
@@ -70,6 +71,10 @@ pub struct LowerHints {
     // reaches here via `from_model_bounds`; token_tile is pass-through.
     pub hidden_dim: u32,
     pub token_tile: u32,
+    // MLP: intermediate dim and the inter-axis tile. `intermediate_dim`
+    // comes from bounds["intermediate_size"] via from_model_bounds.
+    pub intermediate_dim: u32,
+    pub inter_tile: u32,
 }
 
 impl Default for LowerHints {
@@ -86,6 +91,8 @@ impl Default for LowerHints {
             gemm_k_tile: 32,
             hidden_dim: 4096,
             token_tile: 64,
+            intermediate_dim: 14336,
+            inter_tile: 128,
         }
     }
 }
@@ -116,10 +123,16 @@ impl LowerHints {
             .copied()
             .map(|v| v as u32)
             .unwrap_or(default.hidden_dim);
+        let intermediate_dim = bounds
+            .get("intermediate_size")
+            .copied()
+            .map(|v| v as u32)
+            .unwrap_or(default.intermediate_dim);
         Self {
             head_dim,
             num_head_groups,
             hidden_dim,
+            intermediate_dim,
             ..default
         }
     }
@@ -387,6 +400,22 @@ fn lower_impl(
             k_tile: hints.gemm_k_tile,
             pipe: hints.pipe,
             writes_kv_cache: true,
+        })),
+        // ── Gate+Up+SiLU/GeLU+Mul (MLP input; silu and gelu share
+        //    stencil shape — activation picks at emit_ops). Quantized
+        //    variants pass through unchanged.
+        "fused_gate_up_silu_mul"
+        | "fused_gate_up_gelu_mul"
+        | "marlin_fused_gate_up_silu_mul"
+        | "marlin_fused_gate_up_gelu_mul"
+        | "bnb4_fused_gate_up_silu_mul"
+        | "bnb4_fused_gate_up_gelu_mul" => Ok(gate_up_silu_mul_region(&GateUpSiluMulParams {
+            hidden_dim: hints.hidden_dim,
+            intermediate_dim: hints.intermediate_dim,
+            token_tile: hints.token_tile,
+            inter_tile: hints.inter_tile,
+            k_tile: hints.gemm_k_tile,
+            pipe: hints.pipe,
         })),
         other => Err(LowerError::UnsupportedImpl { name: other }),
     }

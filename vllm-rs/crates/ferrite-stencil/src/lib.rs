@@ -28,8 +28,8 @@ pub use ir::{
 };
 pub use schedule::{AxisKind, classify_axes, region_pipeline_depth, topo_order_within_iter};
 pub use template::{
-    AttnParams, GemmParams, PagedDecodeParams, QkvRopeParams, ResidualAddParams, RmsNormParams,
-    Window, attn_region, attn_region_paged_decode, gemm_region, qkv_rope_region,
-    residual_add_region, rmsnorm_region,
+    AttnParams, GateUpSiluMulParams, GemmParams, PagedDecodeParams, QkvRopeParams,
+    ResidualAddParams, RmsNormParams, Window, attn_region, attn_region_paged_decode,
+    gate_up_silu_mul_region, gemm_region, qkv_rope_region, residual_add_region, rmsnorm_region,
 };
 pub use wavefront::{Schedule, ScheduleError, Step, schedule_wavefront};

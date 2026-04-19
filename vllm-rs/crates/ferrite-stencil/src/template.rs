@@ -1144,6 +1144,252 @@ pub fn qkv_rope_region(p: &QkvRopeParams) -> Region {
     }
 }
 
+// ─── Gate + Up + SiLU/GeLU + Mul (MLP input) ───────────────────
+//
+// Fused op at the MLP's entry:
+//   gate = Wgate · x
+//   up   = Wup   · x
+//   out  = activation(gate) * up
+// where activation is silu or gelu — identical stencil shape, the
+// intrinsic expansion picks the activation.
+//
+// Two parallel projection chains (gate_gemm, up_gemm) share the x
+// input and meet at the silu_mul Compute; a single Store emits the
+// fused output. This is where the design doc's "multiple Compute
+// nodes feeding a single Store through Raw same-iter edges" pattern
+// gets its stress test.
+
+#[derive(Debug, Clone, Copy)]
+pub struct GateUpSiluMulParams {
+    pub hidden_dim: u32,
+    pub intermediate_dim: u32,
+    pub token_tile: u32,
+    pub inter_tile: u32,
+    pub k_tile: u32,
+    pub pipe: u32,
+}
+
+pub fn gate_up_silu_mul_region(p: &GateUpSiluMulParams) -> Region {
+    const TOKEN: AxisId = 0;
+    const INTER: AxisId = 1;
+    const K: AxisId = 2;
+    const NUM_TOKEN_TILES: ScalarId = 0;
+    const NUM_INTER_TILES: ScalarId = 1;
+    const NUM_K_TILES: ScalarId = 2;
+    const N_LOAD_X: NodeId = 0;
+    const N_LOAD_WG: NodeId = 1;
+    const N_LOAD_WU: NodeId = 2;
+    const N_GATE_GEMM: NodeId = 3;
+    const N_UP_GEMM: NodeId = 4;
+    const N_SILU_MUL: NodeId = 5;
+    const N_STORE: NodeId = 6;
+
+    let token_stride = (p.hidden_dim as u64) * (p.token_tile as u64);
+    let inter_stride = (p.intermediate_dim as u64) * (p.inter_tile as u64);
+    let k_stride = p.k_tile as u64;
+
+    // All three loads share the same axis shape: x is [token, k],
+    // Wgate/Wup are [inter, k]. Separate functions to keep addresses
+    // explicit in the template for the reader.
+    let x_addr = LoadAddr {
+        terms: smallvec![
+            AddrTerm::AxisStride {
+                axis: TOKEN,
+                stride: StrideExpr::Const(token_stride),
+            },
+            AddrTerm::AxisStride {
+                axis: K,
+                stride: StrideExpr::Const(k_stride),
+            },
+        ],
+    };
+    let w_addr = || LoadAddr {
+        terms: smallvec![
+            AddrTerm::AxisStride {
+                axis: INTER,
+                stride: StrideExpr::Const(inter_stride),
+            },
+            AddrTerm::AxisStride {
+                axis: K,
+                stride: StrideExpr::Const(k_stride),
+            },
+        ],
+    };
+
+    let nodes = vec![
+        Node {
+            id: N_LOAD_X,
+            role: Role::Load,
+            op: FufOpRef { tag: "load_x_row" },
+            addr: Some(x_addr),
+        },
+        Node {
+            id: N_LOAD_WG,
+            role: Role::Load,
+            op: FufOpRef {
+                tag: "load_wgate_tile",
+            },
+            addr: Some(w_addr()),
+        },
+        Node {
+            id: N_LOAD_WU,
+            role: Role::Load,
+            op: FufOpRef {
+                tag: "load_wup_tile",
+            },
+            addr: Some(w_addr()),
+        },
+        Node {
+            id: N_GATE_GEMM,
+            role: Role::Compute,
+            op: FufOpRef {
+                tag: "gate_gemm_accumulate",
+            },
+            addr: None,
+        },
+        Node {
+            id: N_UP_GEMM,
+            role: Role::Compute,
+            op: FufOpRef {
+                tag: "up_gemm_accumulate",
+            },
+            addr: None,
+        },
+        Node {
+            id: N_SILU_MUL,
+            role: Role::Compute,
+            op: FufOpRef {
+                tag: "silu_mul_fuse",
+            },
+            addr: None,
+        },
+        Node {
+            id: N_STORE,
+            role: Role::Store,
+            op: FufOpRef {
+                tag: "store_inter_tile",
+            },
+            addr: Some(LoadAddr {
+                // K is reduced; output addr uses token and inter.
+                terms: smallvec![
+                    AddrTerm::AxisStride {
+                        axis: TOKEN,
+                        stride: StrideExpr::Const(token_stride),
+                    },
+                    AddrTerm::AxisStride {
+                        axis: INTER,
+                        stride: StrideExpr::Const(inter_stride),
+                    },
+                ],
+            }),
+        },
+    ];
+
+    let p_depth = p.pipe as i32;
+    let edges = vec![
+        // Pipeline: all three loads feed their respective GEMMs on
+        // k-lag P. load_x splits to both GEMMs.
+        Edge {
+            src: N_LOAD_X,
+            dst: N_GATE_GEMM,
+            kind: DepKind::Pipeline,
+            vector: DepVector(smallvec![(K, -p_depth)]),
+        },
+        Edge {
+            src: N_LOAD_X,
+            dst: N_UP_GEMM,
+            kind: DepKind::Pipeline,
+            vector: DepVector(smallvec![(K, -p_depth)]),
+        },
+        Edge {
+            src: N_LOAD_WG,
+            dst: N_GATE_GEMM,
+            kind: DepKind::Pipeline,
+            vector: DepVector(smallvec![(K, -p_depth)]),
+        },
+        Edge {
+            src: N_LOAD_WU,
+            dst: N_UP_GEMM,
+            kind: DepKind::Pipeline,
+            vector: DepVector(smallvec![(K, -p_depth)]),
+        },
+        // Accumulation chains (one per GEMM).
+        Edge {
+            src: N_GATE_GEMM,
+            dst: N_GATE_GEMM,
+            kind: DepKind::Raw,
+            vector: DepVector(smallvec![(K, -1)]),
+        },
+        Edge {
+            src: N_UP_GEMM,
+            dst: N_UP_GEMM,
+            kind: DepKind::Raw,
+            vector: DepVector(smallvec![(K, -1)]),
+        },
+        // Both projections feed the fuse node.
+        Edge {
+            src: N_GATE_GEMM,
+            dst: N_SILU_MUL,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        Edge {
+            src: N_UP_GEMM,
+            dst: N_SILU_MUL,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+        // Fuse output to store.
+        Edge {
+            src: N_SILU_MUL,
+            dst: N_STORE,
+            kind: DepKind::Raw,
+            vector: DepVector::default(),
+        },
+    ];
+
+    Region {
+        id: 0,
+        name: "gate_up_silu_mul",
+        domain: Domain {
+            axes: vec![
+                Axis {
+                    id: TOKEN,
+                    name: "token_tile",
+                    bound: Bound::RegionEntryScalar(NUM_TOKEN_TILES),
+                },
+                Axis {
+                    id: INTER,
+                    name: "inter_tile",
+                    bound: Bound::RegionEntryScalar(NUM_INTER_TILES),
+                },
+                Axis {
+                    id: K,
+                    name: "k_tile",
+                    bound: Bound::RegionEntryScalar(NUM_K_TILES),
+                },
+            ],
+            predicates: vec![],
+        },
+        entry_scalars: vec![
+            ScalarBinding {
+                id: NUM_TOKEN_TILES,
+                name: "num_token_tiles",
+            },
+            ScalarBinding {
+                id: NUM_INTER_TILES,
+                name: "num_inter_tiles",
+            },
+            ScalarBinding {
+                id: NUM_K_TILES,
+                name: "num_k_tiles",
+            },
+        ],
+        nodes,
+        edges,
+    }
+}
+
 #[cfg(test)]
 mod new_template_tests {
     use super::*;
@@ -1200,6 +1446,35 @@ mod new_template_tests {
         assert_eq!(sched.preamble.len(), 2, "load_x + load_weight");
         assert_eq!(sched.body.len(), 1, "rmsnorm_compute");
         assert_eq!(sched.epilogue.len(), 1, "store_y_row");
+    }
+
+    #[test]
+    fn gate_up_silu_mul_region_validates_and_schedules() {
+        let r = gate_up_silu_mul_region(&GateUpSiluMulParams {
+            hidden_dim: 4096,
+            intermediate_dim: 14336,
+            token_tile: 64,
+            inter_tile: 128,
+            k_tile: 32,
+            pipe: 3,
+        });
+        ir::validate(&r).expect("gate_up_silu_mul validates");
+        assert_eq!(
+            r.nodes.len(),
+            7,
+            "load_x, load_wg, load_wu, gate_gemm, up_gemm, silu_mul, store"
+        );
+        assert_eq!(r.domain.axes.len(), 3);
+        assert_eq!(region_pipeline_depth(&r), 3);
+        let sched = schedule_wavefront(&r, &sm90_fa2()).unwrap();
+        assert!(sched.serial_axis.is_some());
+        assert_eq!(sched.preamble.len(), 0);
+        assert_eq!(
+            sched.body.len(),
+            6,
+            "3 loads + 2 gemms + 1 silu_mul inside serial k-loop"
+        );
+        assert_eq!(sched.epilogue.len(), 1, "store_inter_tile");
     }
 
     #[test]

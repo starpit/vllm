@@ -24,8 +24,9 @@
 #![allow(dead_code)]
 
 use ferrite_stencil::{
-    AttnParams, Megakernel, PagedDecodeParams, Region, Window, attn_region,
-    attn_region_paged_decode,
+    AttnParams, GemmParams, Megakernel, PagedDecodeParams, Region, ResidualAddParams,
+    RmsNormParams, Window, attn_region, attn_region_paged_decode, gemm_region, residual_add_region,
+    rmsnorm_region,
 };
 
 use crate::fuf::{Fuf, TileId};
@@ -51,12 +52,22 @@ pub struct LowerReport {
 /// derive these from FUF shapes + solver cost hints.
 #[derive(Clone, Copy, Debug)]
 pub struct LowerHints {
+    // Attention.
     pub head_dim: u32,
     pub num_head_groups: u32,
     pub tile_q: u32,
     pub tile_k: u32,
     pub pipe: u32,
     pub tokens_per_page: u32,
+    // GEMM tile dims — picked once per lowering for all projections.
+    // Refined per-Impl once calibrated tile sizes land on the Impl.
+    pub gemm_m_tile: u32,
+    pub gemm_n_tile: u32,
+    pub gemm_k_tile: u32,
+    // Token-wise element-wise ops (rmsnorm, residual add). `hidden_dim`
+    // reaches here via `from_model_bounds`; token_tile is pass-through.
+    pub hidden_dim: u32,
+    pub token_tile: u32,
 }
 
 impl Default for LowerHints {
@@ -68,6 +79,11 @@ impl Default for LowerHints {
             tile_k: 64,
             pipe: 3,
             tokens_per_page: 256,
+            gemm_m_tile: 128,
+            gemm_n_tile: 128,
+            gemm_k_tile: 32,
+            hidden_dim: 4096,
+            token_tile: 64,
         }
     }
 }
@@ -93,9 +109,15 @@ impl LowerHints {
             (Some(q), Some(kv)) if kv > 0 => ((q / kv).max(1)) as u32,
             _ => default.num_head_groups,
         };
+        let hidden_dim = bounds
+            .get("hidden_size")
+            .copied()
+            .map(|v| v as u32)
+            .unwrap_or(default.hidden_dim);
         Self {
             head_dim,
             num_head_groups,
+            hidden_dim,
             ..default
         }
     }
@@ -212,6 +234,7 @@ fn lower_impl(
     hints: &LowerHints,
 ) -> Result<Region, LowerError> {
     match impl_name {
+        // ── Attention ──
         "attention_prefill_contiguous" => Ok(attn_region(&AttnParams {
             window: Window::Infinite,
             head_dim: hints.head_dim,
@@ -227,7 +250,6 @@ fn lower_impl(
             pipe: hints.pipe,
             tokens_per_page: hints.tokens_per_page,
         })),
-        // Sliding-window prefill is the same Attn(W=finite) shape.
         "sliding_attention_prefill_contiguous" => Ok(attn_region(&AttnParams {
             window: Window::Finite(4096),
             head_dim: hints.head_dim,
@@ -235,6 +257,32 @@ fn lower_impl(
             tile_k: hints.tile_k,
             num_head_groups: hints.num_head_groups,
             pipe: hints.pipe,
+        })),
+        // ── GEMM-class (full-precision + quantized variants) ──
+        // All lower to the same gemm_region stencil; the difference is
+        // the Load's addressing for quantized weights, which belongs in
+        // emit_ops's per-tag expansion, not in the region template.
+        "fused_gemm_bias" | "cutlass_gemv" | "marlin_gemm" | "bnb4_gemm" => {
+            Ok(gemm_region(&GemmParams {
+                m_tile: hints.gemm_m_tile,
+                n_tile: hints.gemm_n_tile,
+                k_tile: hints.gemm_k_tile,
+                pipe: hints.pipe,
+            }))
+        }
+        // ── RMSNorm (with and without a fused residual add) ──
+        // The residual-add fuses in at the Compute node's expansion; the
+        // stencil shape (1 parallel axis, straight-line) is identical.
+        "fused_add_rms_norm" | "fused_add_rms_norm_with_offset" | "scalar_offset_rms_norm" => {
+            Ok(rmsnorm_region(&RmsNormParams {
+                hidden_dim: hints.hidden_dim,
+                token_tile: hints.token_tile,
+            }))
+        }
+        // ── Element-wise add (standalone, not fused with a norm) ──
+        "add_ref" => Ok(residual_add_region(&ResidualAddParams {
+            hidden_dim: hints.hidden_dim,
+            token_tile: hints.token_tile,
         })),
         other => Err(LowerError::UnsupportedImpl { name: other }),
     }
@@ -417,6 +465,63 @@ mod tests {
         assert_eq!(ferrite_stencil::region_pipeline_depth(r), 3);
         let order = ferrite_stencil::topo_order_within_iter(r);
         assert_eq!(order.len(), r.nodes.len());
+    }
+
+    #[test]
+    fn lowers_gemm_impls_to_gemm_region() {
+        use ferrite_stencil::ir;
+        let fuf = Fuf { nodes: vec![] };
+        let hints = LowerHints::default();
+        for name in [
+            "fused_gemm_bias",
+            "cutlass_gemv",
+            "marlin_gemm",
+            "bnb4_gemm",
+        ] {
+            let r = lower_impl(name, &[], &fuf, &hints)
+                .unwrap_or_else(|e| panic!("{} should lower: {:?}", name, e));
+            assert_eq!(r.name, "gemm", "{}", name);
+            ir::validate(&r).expect("gemm region validates");
+            // gemm has M, N, K axes; K is the serial accumulation axis.
+            assert_eq!(r.domain.axes.len(), 3);
+            assert_eq!(r.nodes.len(), 4);
+        }
+    }
+
+    #[test]
+    fn lowers_rmsnorm_impls_to_rmsnorm_region() {
+        use ferrite_stencil::ir;
+        let fuf = Fuf { nodes: vec![] };
+        let hints = LowerHints::default();
+        for name in [
+            "fused_add_rms_norm",
+            "fused_add_rms_norm_with_offset",
+            "scalar_offset_rms_norm",
+        ] {
+            let r = lower_impl(name, &[], &fuf, &hints)
+                .unwrap_or_else(|e| panic!("{} should lower: {:?}", name, e));
+            assert_eq!(r.name, "rmsnorm", "{}", name);
+            ir::validate(&r).expect("rmsnorm region validates");
+        }
+    }
+
+    #[test]
+    fn lowers_add_ref_to_residual_add_region() {
+        use ferrite_stencil::ir;
+        let fuf = Fuf { nodes: vec![] };
+        let hints = LowerHints::default();
+        let r = lower_impl("add_ref", &[], &fuf, &hints).expect("add_ref lowers");
+        assert_eq!(r.name, "residual_add");
+        ir::validate(&r).expect("residual_add region validates");
+    }
+
+    #[test]
+    fn hints_from_bounds_derives_hidden_size() {
+        use std::collections::BTreeMap;
+        let mut b = BTreeMap::new();
+        b.insert("hidden_size".into(), 8192);
+        let h = LowerHints::from_model_bounds(&b);
+        assert_eq!(h.hidden_dim, 8192);
     }
 
     #[test]

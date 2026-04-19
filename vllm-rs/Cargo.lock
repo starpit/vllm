@@ -2139,6 +2139,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-stencil"
+version = "0.1.0"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

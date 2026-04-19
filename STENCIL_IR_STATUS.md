@@ -4,15 +4,102 @@ Dated 2026-04-19. Companion to `STENCIL_IR_DESIGN.md` (vocabulary freeze) and `S
 
 ## Read order for a fresh session
 
-1. `STENCIL_IR_DESIGN.md` — vocabulary (3 roles, 5 dep kinds, 3 clarifications). Frozen.
-2. `STENCIL_IR_SKETCH.md` — §11 struct sketch that preceded the crate. Largely realised; see divergences at the bottom of this doc.
-3. This doc — current state + next steps.
+1. **This doc** — current state + next steps. Start here.
+2. `STENCIL_IR_DESIGN.md` — vocabulary (3 roles, 5 dep kinds, 3 clarifications). Frozen. Only needed when the work touches vocabulary.
+3. `STENCIL_IR_SKETCH.md` — §11 struct sketch that preceded the crate. Largely realised; see divergences at the bottom of this doc. Only needed for IR-type archaeology.
+
+## The goal — don't get this wrong
+
+The target is **one persistent `__global__` per model forward on SM90+**, in the HazyResearch Megakernels sense: 1 CTA per SM, 20 warps = 5 warpgroups (loader / consumer×3 / storer), compile-time instruction sequence (no runtime VM — we codegen the topo order), `g.Bar` between regions, cross-region `smem` reuse. Regions stay distinct (Gemma3 alternates Attn(W=∞) / Attn(W=4096) per-layer — that's *why* Region exists); the megakernel is a statically scheduled composition of them, not a fused single stencil.
+
+**On SM89 and earlier**, the megakernel path is not the runtime path. The solver naturally picks conventional per-op impls; the stencil IR happens to lower cleanly there too as a side-effect, and we emit SM90 `.cu` files at build time *for inspection*, but the plan is not to run megakernel on SM89.
+
+### Anti-patterns this session burned cycles on
+
+- Don't read "Region" as "per-impl kernel wrapper"; it's a parametric chunk of computation that the megakernel composes.
+- Don't chase the old 3a/3b SM89 smoke-kernel path — that's per-region-kernel scaffolding, off-critical-path. Keep for reference, don't extend.
+- Don't write scalar single-thread placeholder helpers as if they were progress; either the prelude helper does real work or it `__trap()`s honestly.
+- Don't conflate "megakernel" with kernel fusion. It's static scheduling, not region-body fusion.
+- Don't declare ambient identifiers (`Q_frag`, `smem_q`, …) in the emitter output — they come from the prelude.
 
 ## Where we are
 
 **Every real-model FUF (Llama/Gemma2/Gemma3/Qwen2/Qwen3/Mistral/Granite/CommandR, full-precision + marlin + bnb4 + gptq variants) now lowers to a complete SM90 megakernel source file AND compiles cleanly via nvcc.** Llama-3-8B: 227 regions / 290 control edges / ~14k lines → 187 KB object file. Qwen3-0.6B: 339 regions / 450 edges / ~16k lines → 227 KB. Gemma-3-12B: 676 regions / 675 edges / ~32k lines → 409 KB. Gemma-3-27B → 516 KB. Every build writes `/tmp/ferrite-stencil/<variant>-sm90.cu`; `nvcc -arch=sm_89 -I csrc -c <file>.cu` produces a linkable object.
 
 The pipeline runs FUF → Stencil IR → Megakernel → emitted source → nvcc → object file, end-to-end, on real models. Helpers are trap-bodied placeholders (`__trap()`) — running the object would abort on the device; real PTX lowering lands one helper at a time.
+
+## First 5 minutes (verify the claim)
+
+From the worktree root (`vllm-rs/`):
+
+```bash
+# 1. Tests all green (40 lib + 7 integration on stencil; 14 on lowering).
+cargo test -p ferrite-stencil --lib | tail -3
+cargo test -p ferrite-stencil --tests | tail -3
+cargo test -p ferrite-forward-macro --lib lower_to_stencil | tail -3
+
+# 2. Regenerate the megakernel .cu files for a model crate; watch the
+#    telemetry line — "N/N regions on sm89_fa2 · 0 skipped · mega <L>L/<E>e · <path>".
+touch crates/ferrite-model-llama/src/lib.rs
+cargo check -p ferrite-model-llama 2>&1 | grep "ferrite stencil · llama-3-8b "
+
+# 3. Compile the generated megakernel with nvcc. Expect a ~190KB .o,
+#    warnings OK (default-ctor __device__ attr), no errors.
+/usr/local/cuda-12.9/bin/nvcc -arch=sm_89 \
+    -I crates/ferrite-stencil/csrc \
+    -c /tmp/ferrite-stencil/llama-3-8b-sm90.cu \
+    -o /tmp/llama-3-8b.o
+ls -l /tmp/llama-3-8b.o
+```
+
+If any of these fails before your first edit, stop and investigate — don't start adding features on top of a broken foundation.
+
+## What an emitted kernel looks like
+
+Peek at `/tmp/ferrite-stencil/llama-3-8b-sm90.cu`. Structural shape:
+
+```cuda
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+#include "ferrite_stencil_prelude.cuh"
+typedef __nv_bfloat16 bf16;
+__device__ uint32_t gbar_counter;
+
+__global__ void mega_kernel(
+    uint32_t num_token_tiles, uint32_t num_head_tiles, ...,
+    const bf16* __restrict__ A_gmem, const bf16* __restrict__ B_gmem, bf16* __restrict__ C_gmem,
+    const bf16* __restrict__ Embed_gmem, ... /* 18 pointers total */
+) {
+  uint32_t wg = threadIdx.x / 128u;
+  // ═══ region 0 (rmsnorm) pipeline_depth=0 ═══
+  for (uint32_t token_tile = 0; token_tile < num_token_tiles; ++token_tile) { ... }
+  // ─── inter-region barrier: region 0 → region 1 (Barrier) ───
+  gbar_sync(&gbar_counter);
+  // ═══ region 1 (qkv_rope) pipeline_depth=3 ═══
+  for (uint32_t token_tile = 0; ...) for (uint32_t head_tile = 0; ...) {
+    for (uint32_t k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
+      { uint32_t slot = (head_tile + 3) % 3;
+        if (wg == LOADER_WG) { tma_load_2d(smem_wqkv[slot], ...); mbarrier_arrive(&bar_smem_wqkv[slot]); } }
+      ...
+      { if (wg == CONSUMER_WG) { wgmma_fence(); wgmma_mma_async(QKV_frag, smem_x[slot], smem_wqkv[slot]); ... } }
+    }
+    ...
+  }
+  // ═══ region 2 (fa2_prefill) pipeline_depth=3 ═══
+  ...
+}  // end mega_kernel
+
+extern "C" cudaError_t launch_mega_kernel(cudaStream_t stream, ...) {
+    uint32_t zero = 0;
+    cudaMemcpyToSymbolAsync(gbar_counter, &zero, ...);
+    int sm_count = 0; cudaDeviceGetAttribute(&sm_count, ...);
+    mega_kernel<<<dim3((unsigned)sm_count), dim3(640u), 0, stream>>>(...);
+    return cudaGetLastError();
+}
+```
+
+The placeholders (`tma_load_2d`, `wgmma_mma_async`, `mbarrier_arrive`, `gbar_sync`, `StencilFrag`, `smem_wqkv[]`, `bar_smem_*`, `CONSUMER_WG`, …) all resolve through `csrc/ferrite_stencil_prelude.cuh`. Their bodies are `__trap()` — the object links but aborts on launch. Real PTX goes in the prelude, one helper at a time; the emitter stays put.
 
 ## What's landed (continuing from step 3b)
 
@@ -74,7 +161,15 @@ Each region still schedules through `schedule_wavefront`; `emit_megakernel` call
 
 The design doc's finish line is *efficient megakernel execution from the FUF* — comm/compute overlap, cross-subtile parallelism, real SM90 utilization, one launch per forward. From today's state:
 
-1. **Real PTX bodies in the prelude.** Every helper in `ferrite_stencil_prelude.cuh` is a `__trap()` placeholder. Replacing them with real PTX is the bulk of the remaining work — one helper at a time, keeping the prelude as stable ABI between emitter and compilable source. Rough order of impact:
+### The first next step
+
+**Pick one: fix per-region smem/fragment collision (item 2) OR replace one trap-bodied helper with real PTX (item 1).** Both are concrete. Item 2 is the bigger correctness win — until it's fixed, multiple GEMM regions will all try to write the same `C_frag` / `smem_a` / `smem_b`. Item 1 is the smaller mechanical cut — pick the leftmost helper from the list below, write the real PTX, run `nvcc -c` to confirm it still compiles. Repeat.
+
+Don't try to do both at once, and don't re-plan the whole arc before starting. Commit the smallest meaningful slice, watch tests + nvcc stay green, move.
+
+### All remaining items
+
+1. **Real PTX bodies in the prelude.** Every helper in `ferrite_stencil_prelude.cuh` is a `__trap()` placeholder. Replacing them with real PTX is the bulk of the remaining work — one helper at a time, keeping the prelude as stable ABI between emitter and compilable source. Order of impact (leftmost first):
    - `cp_async_128` + `cp_async_commit_group` + `cp_async_wait_group` (SM89 path, unblocks L4 testing)
    - `mma_sync_accumulate` (SM89 mma.sync m16n8k16)
    - `stg_128` / `tma_store_2d` (writeback)
@@ -82,7 +177,7 @@ The design doc's finish line is *efficient megakernel execution from the FUF* �
    - `wgmma_mma_async` + fence/commit/wait (SM90 compute)
    - `gbar_sync` (cross-CTA atomic counter + spin-wait)
    - Fragment helpers: `row_max`, `row_sum`, `exp2f_frag`, `warp_reduce_sum_of_squares`, `silu`, `rope_rotate`
-2. **Fragment type + smem allocation design.** Placeholders treat every fragment as opaque `StencilFrag`; real lowering needs concrete mma fragments (register layouts, accumulator types), plus a region-local smem-allocation pass so multiple GEMM regions don't collide on `smem_a` / `smem_b` / `C_frag`. Currently every region shares the same file-scope placeholders.
+2. **Fragment type + smem allocation design.** Placeholders treat every fragment as opaque `StencilFrag`; real lowering needs concrete mma fragments (register layouts, accumulator types), plus a region-local smem-allocation pass so multiple GEMM regions don't collide on `smem_a` / `smem_b` / `C_frag`. Currently every region shares the same file-scope placeholders — correctness-breaking, not just cosmetic.
 3. **Axis-name threading through `ExpandCtx`.** Today expansions hard-code axis names (`q_tile`, `head_group`, …) regardless of the region they're emitted inside; paged decode's `b` axis falls through to a file-scope `b=0` placeholder. Passing axis names per-region at emit time fixes this without touching the vocabulary.
 4. **FUF-level tensor naming.** The signature uses tag-level names (`Q_gmem`, `A_gmem`, …) deduped globally — multiple GEMM regions share one `A_gmem` pointer, which is wrong at runtime (each layer has its own weights). Needs to walk back from region Node → FufOpRef → FUF inputs/outputs to get per-region unique names, then dedupe on actual tensor identity.
 5. **Tile calibration + real shape walking.** `LowerHints` tile fields are `Default`-valued; `num_q_heads` / `num_kv_heads` default to 1 for qkv_rope. Pull from per-Impl calibrated sizes and `bounds`.
@@ -90,6 +185,32 @@ The design doc's finish line is *efficient megakernel execution from the FUF* �
 7. **Ad-hoc H100 run.** First proof the kernel launches. Needs (1) far enough along that `__trap()` isn't hit immediately. Correctness vs Python vLLM comes after.
 
 Items 1–4 are the remaining substantive work before a first runtime trial. 5–7 are follow-on.
+
+## Common commands
+
+```bash
+# Run the full pipeline on a model crate (regenerates all its .cu files).
+touch crates/ferrite-model-<arch>/src/lib.rs
+cargo check -p ferrite-model-<arch>  2>&1 | grep "ferrite stencil"
+# Archs: llama, gemma2, gemma3, qwen2, qwen3, mistral, granite, commandr
+
+# Recompile one emitted megakernel. -arch=sm_89 is fine even for sm90_fa2
+# output — the prelude traps are arch-neutral, the compile is what matters.
+/usr/local/cuda-12.9/bin/nvcc -arch=sm_89 \
+    -I crates/ferrite-stencil/csrc \
+    -c /tmp/ferrite-stencil/<variant>-sm90.cu \
+    -o /tmp/<variant>.o
+
+# Stencil crate tests, lowering tests, integration tests, clippy.
+cargo test -p ferrite-stencil --lib
+cargo test -p ferrite-stencil --tests
+cargo test -p ferrite-forward-macro --lib lower_to_stencil
+cargo fmt -p ferrite-stencil -p ferrite-forward-macro
+cargo clippy -p ferrite-stencil     --lib -- -D warnings
+cargo clippy -p ferrite-forward-macro --lib -- -D warnings
+```
+
+Never mix `cargo` commands from outside `vllm-rs/` — `cargo` from the worktree root won't find the workspace manifest.
 
 ## Sketch → reality divergences worth knowing
 

@@ -10,25 +10,27 @@ Dated 2026-04-19. Companion to `STENCIL_IR_DESIGN.md` (vocabulary freeze) and `S
 
 ## What's landed
 
-Nine commits on `worktree-ff2` on top of `500a4ca4c`:
+Sixteen commits on `worktree-ff2` on top of `500a4ca4c`:
 
 | Commit | Layer | Tests |
 |---|---|---|
 | `6e0435c44` | `ferrite-stencil` crate: IR types + FA2 prefill template + SM90/SM89 ArchMap + print round-trip | 5 |
-| `685d24950` | Paged-KV decode instantiation of same Attn template (gather addr, per-sequence bound) | 6 |
+| `685d24950` | Paged-KV decode instantiation of same Attn template | 6 |
 | `11054159e` | Arch-neutral primitives: `classify_axes` / `region_pipeline_depth` / `topo_order_within_iter` | 5 |
 | `d77532c4b` | FUF→Stencil lowering v1 in `ferrite-forward-macro::lower_to_stencil` | 4 |
-| `216d03354` | Wavefront scheduler: preamble / body / epilogue, Pipeline iter_offset, arch-specific barriers | 7 |
-| `cbd0e88dd` | Capstone end-to-end: FUF + Assignment → Megakernel → Schedule | 1 |
-| `8f10848db` | Parallel wire-up into `forward!` drive: tolerant `lower_assignment_partial` + per-variant telemetry line; runs on every real-model expansion | 6 |
-| `e31388fe7` | `LowerHints::from_model_bounds` — derive `head_dim` + `num_head_groups` from config, bake into telemetry (`h=… g=…`) | 7 |
-| _pending_   | `emit::emit_kernel_sketch` — (Region, Schedule, ArchMap) → CUDA-shaped source; structure real, bodies stub | 3 |
+| `216d03354` | Wavefront scheduler: preamble / body / epilogue, Pipeline iter_offset | 7 |
+| `cbd0e88dd` | Capstone: FUF + Assignment → Megakernel → Schedule | 1 |
+| `8f10848db` | Parallel wire-up into `forward!` drive: `lower_assignment_partial` + telemetry | 6 |
+| `e31388fe7` | `LowerHints::from_model_bounds` — `head_dim` + `num_head_groups` from config | 7 |
+| `f3d05e2da` | **Emitter step 1**: `emit::emit_kernel_sketch` — (Region, Schedule, ArchMap) → CUDA-shaped text skeleton | 3 |
+| `4c1ce5ba5` | **Emitter step 2** — expansion scaffolding + `load_q_tile` (TMA on SM90, cp.async on SM89) | 3 |
+| `17778e22c` | `load_k_tile` + `load_v_tile` expansions (pipeline sources with `slot = (kv_tile + P) % P`) | 2 |
+| `547e5b501` | `qk_matmul` + `softmax_update` + `pv_matmul` + `store_o_tile` expansions — full FA2 kernel visible end-to-end | 6 |
+| `7ef155ff4` | STENCIL_IR_STATUS.md — write out step 3 plan (build integration) | — |
+| `5b7cd9872` | **Step 3a**: SM89 prelude header + smoke kernel + `build_stencil_kernels` in `ferrite-cuda-builder/build.rs` | — |
+| `e3a58bd0b` | **Step 3b**: end-to-end FA2 correctness — new `ferrite-stencil-kernels` crate, `launch_smoke_sm89`, CPU-reference test (1 passed on L4) | 1 |
 
-28 tests green through `cargo clippy -p ferrite-stencil --tests -- -D warnings` and same for `ferrite-forward-macro`. Run:
-
-```
-cd vllm-rs && cargo test -p ferrite-stencil && cargo test -p ferrite-forward-macro --lib lower_to_stencil
-```
+Stencil-crate unit tests: `cargo test -p ferrite-stencil` → 35 green. Forward-macro lowering tests: `cargo test -p ferrite-forward-macro --lib lower_to_stencil` → 7 green. GPU correctness: `cargo test -p ferrite-stencil-kernels --features cuda --release -- --test-threads=1` → 1 green (requires L4 / sm89).
 
 ## Pipeline that now exists
 
@@ -51,6 +53,15 @@ Each `Step` in the schedule carries `node: NodeId`, `iter_offset: i32` (+P for p
   - `src/schedule.rs` — arch-neutral primitives
   - `src/wavefront.rs` — preamble/body/epilogue scheduler
   - `src/print.rs` — round-trip printer (used by tests, not by emitter)
+  - `src/emit.rs` — `emit_kernel_sketch(region, schedule, arch) -> String` top-level sketch emitter
+  - `src/emit_ops.rs` — per-op `expand(tag, &ExpandCtx) -> Option<String>` table; all 7 FA2 ops populated
+  - `csrc/stencil_prelude_sm89.cuh` — `__device__` inline helpers (`cp_async_128`, `mma_sync_accumulate`, `row_max`, `exp2f_frag`, `stg_128`, …); scalar reference impls, upgraded at 3d
+  - `csrc/stencil_smoke_sm89.cu` — real-FA2 smoke kernel (SEQ_Q=8, SEQ_K=16, HD=8) exercising every prelude helper; host-side `ferrite_stencil_smoke_sm89_launch`
+- Launch wrappers + GPU tests: `vllm-rs/crates/ferrite-stencil-kernels/`
+  - `src/ffi.rs` — `extern "C"` decl + safe `launch_smoke_sm89`
+  - `tests/fa2_smoke.rs` — CPU-reference correctness test, 1 passed at atol=5e-2 on L4
+  - `build.rs` — mirrors `ferrite-cost-sweep/build.rs` link pattern
+- Build: `vllm-rs/crates/ferrite-cuda-builder/build.rs::build_stencil_kernels` — compiles stencil `.cu` into `~/.cache/cudaforge/vllm-cuda/libstencil_kernels.a` (gated arch ≤ 89 until 3e)
 - Lowering: `vllm-rs/crates/ferrite-forward-macro/src/lower_to_stencil.rs`
 - FUF producer pointers (read-only from stencil's POV):
   - `ferrite-forward-macro/src/fuf.rs` — `Fuf`, `FufNode`, `TileId`, `FufInput`
@@ -62,10 +73,10 @@ Each `Step` in the schedule carries `node: NodeId`, `iter_offset: i32` (+P for p
 
 *Efficient megakernel execution from the FUF* — i.e. comm/compute overlap, cross-subtile parallelism, good SM utilization. The plumbing above (IR, templates, scheduler, lowering, parallel wire-up) is *pre-emitter*; none of it produces running code. The critical path from here is the emitter.
 
-Emitter plan (sketched, not committed):
-1. ✅ **sketch-level emission** (`emit::emit_kernel_sketch`): round-trippable CUDA-shaped text with real signature / grid / role dispatch / pipeline loop / barrier prims. Not compilable.
-2. ✅ **intrinsic expansion** (`emit_ops::expand`): all 7 FA2 ops (`load_q/k/v_tile`, `qk_matmul`, `softmax_update`, `pv_matmul`, `store_o_tile`) render concrete pseudocode per (tag, arch). Helpers (`tma_load_2d`, `wgmma_mma_async`, `cp_async_128`, `stg_128`, …) still symbolic.
-3. **build integration & first running kernel** — detailed plan below.
+Emitter plan:
+1. ✅ **sketch-level emission** (`emit::emit_kernel_sketch`): round-trippable CUDA-shaped text skeleton.
+2. ✅ **intrinsic expansion** (`emit_ops::expand`): all 7 FA2 ops render concrete pseudocode per (tag, arch).
+3. **build integration & first running kernel** — in progress: 3a + 3b done (smoke kernel compiles and passes CPU-reference correctness on L4), 3c–3f below.
 4. **multi-region composition**: populate `Megakernel.control` in the lowering (QKV+RoPE → FA2 → O_proj), emit as a persistent megakernel with inter-region barriers.
 5. **region templates for non-attention ops** to actually compose. Only needed once step 4 is wired; until then they're dead weight.
 
@@ -91,23 +102,26 @@ Emitter plan (sketched, not committed):
 
 **Sub-commits**:
 
-- **3a — prelude + first compiling generated .cu**
-  Write `stencil_prelude_sm89.cuh` (vanilla impl — no cp.async yet, just straight gmem→smem copies and `__syncthreads`). Add `ferrite-stencil-kernels` crate with `build.rs` that writes a *hand-picked* kernel source (borrowed from an existing FA2 reference) with the prelude included, compiles it. Unit test: link against the crate, verify the symbol resolves. No end-to-end correctness yet. **Deliverable**: nvcc compiles something the emitter will eventually produce.
+- **3a ✅ (`5b7cd9872`)** — prelude + first compiling generated .cu.
+  `csrc/stencil_prelude_sm89.cuh` + `csrc/stencil_smoke_sm89.cu` compile through `ferrite-cuda-builder/build.rs::build_stencil_kernels` into `libstencil_kernels.a`.
 
-- **3b — hand-written launch wrapper + CPU-reference integration test**
-  Add a Rust `launch::fa2_prefill_sm89(stream, q, k, v, o, m, n, d, …)` that calls the 3a kernel. Integration test: generate tiny random Q/K/V in pinned host memory, copy to device, launch, copy O back, compare against a CPU scalar FA2 reference implemented in the test. Tight rtol/atol for bf16. **Deliverable**: proof that launching a stencil-layout kernel through our glue is correct.
+- **3b ✅ (`e3a58bd0b`)** — launch wrapper + CPU-reference integration test.
+  `ferrite-stencil-kernels` crate with `launch_smoke_sm89` + a CPU-reference test that passes at atol=5e-2 on the L4.
 
-- **3c — cut over to generated source**
-  Replace the hand-picked kernel source in 3a with `emit_kernel_sketch(attn_region(...), schedule_wavefront(...), sm89_fa2())`. Prelude stays identical. 3b's test must still pass — any delta surfaces in the diff of generated vs hand-picked source, reviewed at commit time. **Deliverable**: the emitter's output runs correctly end-to-end on GPU.
+- **3c — cut over to generated source.** *(next)*
+  The `stencil_smoke_sm89.cu` body was hand-written from the prelude helpers in 3b. In 3c we keep the *same host-side launcher + extern signature*, but swap the kernel body for whatever `emit_kernel_sketch(attn_region(…), schedule_wavefront(…), sm89_fa2())` renders. Two things have to line up for the sketch to compile as-is:
+  1. **Emitter output uses prelude-visible names only.** Right now it emits calls like `cp_async_128(smem_k[slot], K_gmem, kv_tile + 3, head_group)` — the prelude header exposes templates with that name, but the positional args, the indexing expressions (`smem_k[slot]` not `smem_k`), and the axis names (`q_tile`, `head_group`, `kv_tile`) are emitter conventions that need to be bridged. Either (a) extend the prelude so those call shapes compile, or (b) add a post-process pass in the emitter that lowers axis names + buffer names to the prelude's vocabulary. (b) is probably cleaner.
+  2. **Shape mismatch.** 3b hard-codes `SEQ_Q=8, SEQ_K=16, HD=8`; the emitter's template is parameterized on `tile_q / tile_k / head_dim / num_head_groups`. Either bake the 3b constants into a concrete Region instance (small `LowerHints{head_dim:8, num_head_groups:1, tile_q:8, tile_k:8, pipe:1}`) or teach the build step to compile one emitted .cu per profile. Start with a single profile that matches 3b so the existing test passes unchanged.
+  Proposed commit shape: add `build_stencil_kernels` rendering logic — for each `(arch, profile)` tuple, call `emit_kernel_sketch(...)` at build time, wrap in a `extern "C" void <sym>_launch(...)` shim (reusing the launcher scaffolding in 3b), write to `$OUT_DIR/<sym>.cu`, and feed that path to cudaforge. Hand-written `stencil_smoke_sm89.cu` shrinks to the launcher shim only; its kernel body is now the emitter's output. Same test, zero tolerance delta. **Deliverable**: the `fa2_smoke` test passes with the kernel body generated by `emit_kernel_sketch` rather than hand-written.
 
-- **3d — add cp.async for overlap**
-  Upgrade the prelude to use real `cp.async.ca` intrinsics (behind a feature flag or a compile-time constant in the prelude header). Scheduler already emits `cp_async_wait_group(depth)` — should Just Work once the prelude reads cp.async-commit/wait macros. Verify 3b's correctness test still passes; add a microbench comparing to the non-pipelined path. **Deliverable**: first measurable perf datapoint from generated kernels.
+- **3d — add cp.async for overlap.**
+  Upgrade the SM89 prelude to use real `cp.async.ca` intrinsics (the emitter already calls `cp_async_commit_group` / `cp_async_wait_group`). Verify `fa2_smoke` still passes; add a microbench comparing pipelined vs non-pipelined. **Deliverable**: first measurable perf datapoint from generated kernels.
 
-- **3e — SM90 prelude + TMA/wgmma**
-  Add `stencil_prelude_sm90.cuh` with TMA descriptor setup and wgmma macros. Parameterize `ferrite-stencil-kernels/build.rs` to compile one SM89 + one SM90 profile. Integration test on H100 is gated (no H100 in the L4 CI); run it ad-hoc. **Deliverable**: SM90 compiles and the H100 path has at least one green run.
+- **3e — SM90 prelude + TMA/wgmma.**
+  Add `stencil_prelude_sm90.cuh` with TMA descriptor setup and wgmma macros. Parameterize `build_stencil_kernels` to compile one SM89 + one SM90 profile. SM90 run is ad-hoc (no H100 in L4 CI). **Deliverable**: SM90 compiles; H100 has at least one green run.
 
-- **3f — wire generated kernel into the Impl dispatch**
-  Swap `AttentionPrefillContiguousImpl::emit_call` to emit a call into `ferrite-stencil-kernels::launch::…` for the shape profiles that have generated kernels. Keep the old launch path as fallback for shapes outside the generated set. Gate behind a feature flag (`ferrite-stencil-kernels`) so we can A/B correctness via `vllm chat` (per `feedback_no_run_chat`). **Deliverable**: a coherent `vllm chat` run that routes attention through a generated kernel, end-to-end.
+- **3f — wire generated kernel into the Impl dispatch.**
+  Swap `AttentionPrefillContiguousImpl::emit_call` to emit a call into `ferrite-stencil-kernels::launch::…` for shape profiles with generated kernels. Keep old launch as fallback. Gate on a feature flag so `vllm chat` can A/B correctness (per `feedback_no_run_chat`). **Deliverable**: a coherent `vllm chat` run routing attention through a generated kernel end-to-end.
 
 **Known hazards**:
 - nvcc build time is long (minutes, per `feedback_cuda_compile`); keep the profile set minimal until 3f.

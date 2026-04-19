@@ -2004,6 +2004,7 @@ dependencies = [
 name = "ferrite-forward-macro"
 version = "0.1.0"
 dependencies = [
+ "prettyplease",
  "proc-macro2",
  "quote",
  "rayon",

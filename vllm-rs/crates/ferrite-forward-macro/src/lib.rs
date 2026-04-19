@@ -41,6 +41,7 @@ mod schedule;
 mod shape;
 mod solver;
 mod target;
+mod viz_dump;
 mod weights_manifest;
 
 // ── Attribute argument parsing ────────────────────────────────────
@@ -524,6 +525,34 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     // `#variants`).
     let canonical_for: std::collections::HashMap<usize, Ident> =
         compute_canonical_variants(&solved);
+
+    // Env-gated viz JSON dump. No-op unless `FERRITE_VIZ_OUT` is set;
+    // schema lives in `viz_dump`. Placed after `canonical_for` so the
+    // dump can dedupe alias variants down to a `{name, canonical}`
+    // stub (saves ~10× on Llama).
+    {
+        let mut hf: Vec<String> = models
+            .iter()
+            .flat_map(|m| m.architectures.iter().cloned())
+            .collect();
+        hf.sort();
+        hf.dedup();
+        let canonical_names: Vec<String> = (0..solved.len())
+            .map(|i| canonical_for[&i].to_string())
+            .collect();
+        viz_dump::dump_now(
+            &arch_name,
+            &hf,
+            &classified,
+            &library,
+            &carrier.block,
+            solved.iter().map(|s| s.model),
+            solved.iter().map(|s| &s.fuf),
+            solved.iter().map(|s| &s.sfufs),
+            solved.iter().map(|s| &s.loops),
+            &canonical_names,
+        );
+    }
 
     let mut per_model_ts: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut arch_dispatch_arms: Vec<(Ident, Vec<u64>)> = Vec::new();

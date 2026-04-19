@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  code,
+  pre {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+  }
+}
+
+/* React Flow dark tweaks */
+.react-flow__node {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  white-space: pre-line;
+  text-align: left;
+  line-height: 1.25;
+}
+.react-flow__edge-path {
+  stroke: #3a3a44;
+}
+.react-flow__handle {
+  background: #6e6e7a;
+}
+
+/* Card flip 3D */
+.flip-perspective {
+  perspective: 1600px;
+}
+.flip-card {
+  transform-style: preserve-3d;
+  transition: transform 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.flip-face {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+.flip-back {
+  transform: rotateY(180deg);
+}

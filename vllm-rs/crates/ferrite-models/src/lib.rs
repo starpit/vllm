@@ -1,26 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(clippy::missing_safety_doc)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-#![allow(clippy::unnecessary_cast)]
-#![allow(clippy::too_many_arguments)]
-//! Ferrite model architectures. Each module carries one DSL body
-//! via `#[forward]`; the compiler fans out per-model specializations
-//! across `model_architectures/<arch>/*.json`.
+//! Ferrite model architectures — umbrella crate. Each architecture
+//! lives in its own `ferrite-model-<arch>` crate so cargo can compile
+//! the `#[forward]` invocations in parallel. This umbrella pulls them
+//! all in and re-exports their top-level modules so downstream
+//! consumers can keep using `ferrite_models::<arch>::…` paths.
 //!
-//! Qwen2's body is identical to Llama's — the bias on Qwen2's QKV
-//! projections is handled at weight-load time by
-//! `LinearLayer::load_dense_concat`, which auto-detects per-source
-//! `.bias` tensors and packs them into the fused `LinearLayer`;
-//! `Linear::forward` then lights up `cublas.gemm_bias`'s epilog
-//! automatically. No DSL-level `bias_add` op is needed, and no
-//! per-arch Impl addition is required.
+//! The `extern crate … as _` lines force the linker to keep each
+//! per-arch crate even if nothing in the umbrella's public API
+//! references a symbol from it — the `#[forward]`-emitted
+//! `inventory::submit!` registrations must end up in the final binary.
 
-pub mod commandr;
-pub mod gemma2;
-pub mod gemma3;
-pub mod granite;
-pub mod llama;
-pub mod mistral;
-pub mod qwen2;
-pub mod qwen3;
+extern crate ferrite_model_commandr as _keep_commandr;
+extern crate ferrite_model_gemma2 as _keep_gemma2;
+extern crate ferrite_model_gemma3 as _keep_gemma3;
+extern crate ferrite_model_granite as _keep_granite;
+extern crate ferrite_model_llama as _keep_llama;
+extern crate ferrite_model_mistral as _keep_mistral;
+extern crate ferrite_model_qwen2 as _keep_qwen2;
+extern crate ferrite_model_qwen3 as _keep_qwen3;
+
+pub use ferrite_model_commandr as commandr;
+pub use ferrite_model_gemma2 as gemma2;
+pub use ferrite_model_gemma3 as gemma3;
+pub use ferrite_model_granite as granite;
+pub use ferrite_model_llama as llama;
+pub use ferrite_model_mistral as mistral;
+pub use ferrite_model_qwen2 as qwen2;
+pub use ferrite_model_qwen3 as qwen3;

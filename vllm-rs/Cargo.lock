@@ -2025,7 +2025,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrite-models"
+name = "ferrite-model-commandr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2033,6 +2033,97 @@ dependencies = [
  "ferrite-forward",
  "ferrite-kernels",
  "tracing",
+]
+
+[[package]]
+name = "ferrite-model-gemma2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-model-gemma3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-model-granite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-model-llama"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-model-mistral"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-model-qwen2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-model-qwen3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-models"
+version = "0.1.0"
+dependencies = [
+ "ferrite-model-commandr",
+ "ferrite-model-gemma2",
+ "ferrite-model-gemma3",
+ "ferrite-model-granite",
+ "ferrite-model-llama",
+ "ferrite-model-mistral",
+ "ferrite-model-qwen2",
+ "ferrite-model-qwen3",
 ]
 
 [[package]]

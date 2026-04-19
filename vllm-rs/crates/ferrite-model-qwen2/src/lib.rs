@@ -1,27 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Qwen3 — Llama math plus per-head RMS norm on Q and K (between the
-//! QKV projections and RoPE). No QKV bias (unlike Qwen2). The per-head
-//! norm weights `self_attn.q_norm` / `self_attn.k_norm` are declared
-//! in `model_architectures/qwen3/weights.json` at shape `[head_dim]`;
-//! shape inference sees the inferred `[T, heads*head_dim]` activation
-//! vs. the declared `[head_dim]` weight and synthesizes the view
-//! reshape tiles to bridge them.
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::too_many_arguments)]
+//! Qwen2 / Qwen2.5 — same math as Llama except the QKV projections
+//! carry a learned bias term. The bias is explicit in the DSL as a
+//! `bias_add` tile; the solver's `FusedQkvRopeCacheImpl` /
+//! `FusedQkvRopePrefillImpl` claim the `(Gemm, BiasAdd) × 3 + RopeAppend`
+//! pattern and emit cuBLAS `gemm_bias` on the packed weight — so the
+//! bias rides through one fused kernel launch, not a separate add.
+//!
+//! One `#[forward]` body per architecture; per-model configs fan out
+//! via `model_architectures/qwen2/*.json`.
 
 use ferrite_forward::forward;
 
 #[forward(
     target = "../../../target_profiles/l4_sm89.json",
     workloads = [1, 8, 64, 512, 4096],
+    sk_buckets = [128, 512, 2048, 8192],
 )]
-fn qwen3() {
+fn qwen2() {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {
         normed = rmsnorm(hidden_states, input_layernorm[layer]);
         q = gemm(normed, self_attn.q_proj[layer]);
-        q = rmsnorm(q, self_attn.q_norm[layer]);
+        q = bias_add(q, self_attn.q_proj.bias[layer]);
         k = gemm(normed, self_attn.k_proj[layer]);
-        k = rmsnorm(k, self_attn.k_norm[layer]);
+        k = bias_add(k, self_attn.k_proj.bias[layer]);
         v = gemm(normed, self_attn.v_proj[layer]);
+        v = bias_add(v, self_attn.v_proj.bias[layer]);
         (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
         attn = attention(q, k, v, kv_cache[layer], block_table);
         oproj = gemm(attn, self_attn.o_proj[layer]);

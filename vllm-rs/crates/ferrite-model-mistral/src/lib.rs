@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::too_many_arguments)]
 //! Mistral — structurally identical to Llama (RMSNorm, SwiGLU MLP,
 //! GQA, RoPE, no projection biases). The body below is a verbatim
 //! copy of `llama.rs`.

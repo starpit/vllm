@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::too_many_arguments)]
 //! LLaMA — the math. The `#[forward]` attribute macro reads the
 //! body below, finds `model_architectures/llama/` by walking up
 //! from this crate, and for every config JSON in it emits

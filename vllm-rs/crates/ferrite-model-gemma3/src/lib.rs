@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::too_many_arguments)]
 //! Gemma3 — Gemma2 structure plus per-head QK norms and dual RoPE bases.
 //!
 //! Differences from Gemma2:

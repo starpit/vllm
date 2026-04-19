@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-model-mistral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite Mistral architecture (one #[forward] body)"
+
+[features]
+default = []
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
+
+[dependencies]
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-forward = { path = "../ferrite-forward" }
+anyhow = { workspace = true }
+tracing = { workspace = true }

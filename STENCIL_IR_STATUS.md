@@ -20,7 +20,8 @@ Seven commits on `worktree-ff2` on top of `500a4ca4c`:
 | `d77532c4b` | FUF→Stencil lowering v1 in `ferrite-forward-macro::lower_to_stencil` | 4 |
 | `216d03354` | Wavefront scheduler: preamble / body / epilogue, Pipeline iter_offset, arch-specific barriers | 7 |
 | `cbd0e88dd` | Capstone end-to-end: FUF + Assignment → Megakernel → Schedule | 1 |
-| _pending_   | Parallel wire-up into `forward!` drive: tolerant `lower_assignment_partial` + per-variant telemetry line; runs on every real-model expansion | 6 |
+| `8f10848db` | Parallel wire-up into `forward!` drive: tolerant `lower_assignment_partial` + per-variant telemetry line; runs on every real-model expansion | 6 |
+| _pending_   | `LowerHints::from_model_bounds` — derive `head_dim` + `num_head_groups` from config, bake into telemetry (`h=… g=…`) | 7 |
 
 28 tests green through `cargo clippy -p ferrite-stencil --tests -- -D warnings` and same for `ferrite-forward-macro`. Run:
 
@@ -64,11 +65,14 @@ Each `Step` in the schedule carries `node: NodeId`, `iter_offset: i32` (+P for p
 Remaining work on this axis:
 - **(b) replace codegen path**: migrate `emit_model` to read `Megakernel` + `Schedule`. Requires every Impl the library ships to have a region template — i.e. blocked on deferred item #5 and friends. Pre-req before this is worth attempting: bridge back from `FufOpRef.tag: &'static str` to a concrete `TileId` so the emitter knows which kernel launch each step corresponds to (see hazards below).
 
-### 2. Real shape inference to replace `LowerHints`
-`LowerHints { head_dim, num_head_groups, tile_q, tile_k, pipe, tokens_per_page }` is pass-through today. The right source:
-- `head_dim`, `num_head_groups` — from the FUF Attention tile's input (slot 0 = Q) output shape via upstream tile lookup (Q tile has shape `[..., num_heads * head_dim]` after `FusedQkvRopePrefillImpl`).
+### 2. Real shape inference to replace `LowerHints` — **partial: bounds-derived fields landed**
+`LowerHints::from_model_bounds(&model.bounds)` now fills `head_dim` (from `bounds["head_dim"]`) and `num_head_groups` (= `num_attention_heads / num_key_value_heads`, clamped ≥ 1). Wired into the macro drive; telemetry shows `h=<dim> g=<groups>` per variant. Verified against llama-{2,3,3.2}-* — MHA → g=1, GQA matches expected ratios.
+
+Still pass-through:
 - `tile_q`, `tile_k`, `pipe` — from per-impl cost-model tuning; lives on the Impl itself, not the FUF. Add accessors on `AttentionPrefillContiguousImpl` etc. that return the tile dims the kernel was calibrated for.
 - `tokens_per_page` — from `KvCachePool` config, an extern reachable via `FufInput::Extern { kind: ExternKind::KvCache, .. }`.
+
+Observation surfaced by the telemetry: variants with `head_dim=64` (smollm2, llama-3.2-1b) show `0/0` regions scheduled — their attention tiles are claimed by an Impl whose name doesn't match the three we template (`attention_prefill_contiguous`, `attention_via_cache`, `sliding_attention_prefill_contiguous`). Worth digging into before declaring deferred item #1's parallel path "covers the set"; `sliding_attention_via_cache` (impl_lib.rs:5433) is a likely culprit.
 
 ### 3. Explicit prologue steps in `Schedule`
 Currently `Schedule` declares `pipeline_depth: P` but the prologue Vec is empty. The emitter needs either the empty vec + P (it unrolls the prologue itself) or the expanded `P * |body-loads|` steps here. Pick one; sketch already says inline expansion is fine.

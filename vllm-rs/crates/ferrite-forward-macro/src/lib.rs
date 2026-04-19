@@ -514,12 +514,9 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         // becomes observable without blocking on templates for every
         // Impl.
         if let Some((_wp, first)) = sfufs.per_workload.iter().next() {
-            let report = lower_to_stencil::lower_assignment_partial(
-                &model_fuf,
-                first,
-                &library,
-                &lower_to_stencil::LowerHints::default(),
-            );
+            let hints = lower_to_stencil::LowerHints::from_model_bounds(&model.bounds);
+            let report =
+                lower_to_stencil::lower_assignment_partial(&model_fuf, first, &library, &hints);
             let arch = if target_profile.compute_capability >= 90 {
                 ferrite_stencil::sm90_fa2()
             } else {
@@ -538,10 +535,12 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             }
             eprintln!(
                 "  ferrite stencil · {variant:<30} · {scheduled}/{total} regions scheduled \
-                 on {arch} · {skipped} subgraphs skipped{err}",
+                 on {arch} · h={head_dim} g={groups} · {skipped} subgraphs skipped{err}",
                 variant = model.source_stem,
                 total = report.mk.regions.len(),
                 arch = arch.name,
+                head_dim = hints.head_dim,
+                groups = hints.num_head_groups,
                 skipped = report.skipped.len(),
                 err = match &schedule_err {
                     Some(s) => format!(" · err={s}"),

@@ -72,6 +72,35 @@ impl Default for LowerHints {
     }
 }
 
+impl LowerHints {
+    /// Pull the two bounds-derivable fields (`head_dim`,
+    /// `num_head_groups` = num_q_heads / num_kv_heads) off the
+    /// model's bounds table. The remaining fields — `tile_q`,
+    /// `tile_k`, `pipe`, `tokens_per_page` — still come from
+    /// `Default`; they belong on the Impl (tile tuning) and on the
+    /// KvCachePool config respectively. See `STENCIL_IR_STATUS.md`
+    /// item #2 for the remaining work.
+    pub fn from_model_bounds(bounds: &std::collections::BTreeMap<String, u64>) -> Self {
+        let default = Self::default();
+        let head_dim = bounds
+            .get("head_dim")
+            .copied()
+            .map(|v| v as u32)
+            .unwrap_or(default.head_dim);
+        let num_q = bounds.get("num_attention_heads").copied();
+        let num_kv = bounds.get("num_key_value_heads").copied();
+        let num_head_groups = match (num_q, num_kv) {
+            (Some(q), Some(kv)) if kv > 0 => ((q / kv).max(1)) as u32,
+            _ => default.num_head_groups,
+        };
+        Self {
+            head_dim,
+            num_head_groups,
+            ..default
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum LowerError {
     UnsupportedImpl { name: &'static str },
@@ -388,6 +417,34 @@ mod tests {
         assert_eq!(ferrite_stencil::region_pipeline_depth(r), 3);
         let order = ferrite_stencil::topo_order_within_iter(r);
         assert_eq!(order.len(), r.nodes.len());
+    }
+
+    #[test]
+    fn hints_from_bounds_derives_head_dim_and_gqa_groups() {
+        use std::collections::BTreeMap;
+
+        // Llama-2-7B: MHA, 32 Q heads = 32 KV heads → groups = 1.
+        let mut mha = BTreeMap::new();
+        mha.insert("head_dim".into(), 128);
+        mha.insert("num_attention_heads".into(), 32);
+        mha.insert("num_key_value_heads".into(), 32);
+        let h = LowerHints::from_model_bounds(&mha);
+        assert_eq!(h.head_dim, 128);
+        assert_eq!(h.num_head_groups, 1);
+
+        // Llama-3-70B: GQA 64 Q / 8 KV → groups = 8.
+        let mut gqa = BTreeMap::new();
+        gqa.insert("head_dim".into(), 128);
+        gqa.insert("num_attention_heads".into(), 64);
+        gqa.insert("num_key_value_heads".into(), 8);
+        let h = LowerHints::from_model_bounds(&gqa);
+        assert_eq!(h.num_head_groups, 8);
+
+        // Missing bounds fall back to Default without panicking.
+        let empty = BTreeMap::new();
+        let h = LowerHints::from_model_bounds(&empty);
+        assert_eq!(h.head_dim, LowerHints::default().head_dim);
+        assert_eq!(h.num_head_groups, LowerHints::default().num_head_groups);
     }
 
     #[test]

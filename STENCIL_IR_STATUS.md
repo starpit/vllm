@@ -10,7 +10,7 @@ Dated 2026-04-19. Companion to `STENCIL_IR_DESIGN.md` (vocabulary freeze) and `S
 
 ## What's landed
 
-Seven commits on `worktree-ff2` on top of `500a4ca4c`:
+Nine commits on `worktree-ff2` on top of `500a4ca4c`:
 
 | Commit | Layer | Tests |
 |---|---|---|
@@ -21,7 +21,8 @@ Seven commits on `worktree-ff2` on top of `500a4ca4c`:
 | `216d03354` | Wavefront scheduler: preamble / body / epilogue, Pipeline iter_offset, arch-specific barriers | 7 |
 | `cbd0e88dd` | Capstone end-to-end: FUF + Assignment → Megakernel → Schedule | 1 |
 | `8f10848db` | Parallel wire-up into `forward!` drive: tolerant `lower_assignment_partial` + per-variant telemetry line; runs on every real-model expansion | 6 |
-| _pending_   | `LowerHints::from_model_bounds` — derive `head_dim` + `num_head_groups` from config, bake into telemetry (`h=… g=…`) | 7 |
+| `e31388fe7` | `LowerHints::from_model_bounds` — derive `head_dim` + `num_head_groups` from config, bake into telemetry (`h=… g=…`) | 7 |
+| _pending_   | `emit::emit_kernel_sketch` — (Region, Schedule, ArchMap) → CUDA-shaped source; structure real, bodies stub | 3 |
 
 28 tests green through `cargo clippy -p ferrite-stencil --tests -- -D warnings` and same for `ferrite-forward-macro`. Run:
 
@@ -56,6 +57,17 @@ Each `Step` in the schedule carries `node: NodeId`, `iter_offset: i32` (+P for p
   - `ferrite-forward-macro/src/classified.rs` — `OpKind` (attention is one variant)
   - `ferrite-forward-macro/src/solver.rs` — `Assignment`, `SubgraphId`, `WorkloadAssignments`
   - `ferrite-forward-macro/src/impl_lib.rs` — `Implementation` trait; attention impls at ~5288, 4615
+
+## Finish-line target
+
+*Efficient megakernel execution from the FUF* — i.e. comm/compute overlap, cross-subtile parallelism, good SM utilization. The plumbing above (IR, templates, scheduler, lowering, parallel wire-up) is *pre-emitter*; none of it produces running code. The critical path from here is the emitter.
+
+Emitter plan (sketched, not committed):
+1. ✅ **sketch-level emission** (`emit::emit_kernel_sketch`, this commit): round-trippable CUDA-shaped text with real signature / grid / role dispatch / pipeline loop / barrier prims. Not compilable.
+2. **intrinsic expansion**: replace stub `op()` lines with the real wgmma / tma / cp.async sequence per op tag. Per-op emission tables live in `ferrite-stencil` and are arch-keyed.
+3. **build integration**: a generated `.cu` file per region dropped into `ferrite-kernels`, compiled by existing nvcc path; launch glue emitted as Rust via the existing proc-macro drive.
+4. **multi-region composition**: populate `Megakernel.control` in the lowering (QKV+RoPE → FA2 → O_proj), emit as a persistent megakernel with inter-region barriers.
+5. **region templates for non-attention ops** to actually compose. Only needed once step 4 is wired; until then they're dead weight.
 
 ## What's deferred (priority order)
 

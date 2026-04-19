@@ -328,4 +328,45 @@ mod tests {
         let order = ferrite_stencil::topo_order_within_iter(r);
         assert_eq!(order.len(), r.nodes.len());
     }
+
+    #[test]
+    fn end_to_end_lower_and_schedule_on_sm90() {
+        // Capstone: prove lowering's output feeds the wavefront
+        // scheduler, so the whole pipeline from solver Assignment to
+        // per-CTA preamble/body/epilogue works without a hand-authored
+        // Region in the middle.
+        let fuf = singleton_attention_fuf();
+        let mut lib = ImplementationLibrary::new();
+        let impl_id = lib.push(Box::new(AttentionPrefillContiguousImpl));
+        let assignment = singleton_assignment(impl_id);
+        let mk = lower_assignment(&fuf, &assignment, &lib, &LowerHints::default()).unwrap();
+
+        let region = &mk.regions[0];
+        let sched = ferrite_stencil::schedule_wavefront(region, &ferrite_stencil::sm90_fa2())
+            .expect("schedule succeeds on lowered region");
+
+        assert_eq!(sched.pipeline_depth, 3);
+        assert_eq!(sched.preamble.len(), 1, "preamble = load_q");
+        assert_eq!(sched.body.len(), 5, "body = load_k, load_v, qk, sm, pv");
+        assert_eq!(sched.epilogue.len(), 1, "epilogue = store_o");
+
+        let tag = |n: u16| region.nodes[n as usize].op.tag;
+        assert_eq!(tag(sched.preamble[0].node), "load_q_tile");
+        assert_eq!(tag(sched.epilogue[0].node), "store_o_tile");
+
+        // Pipeline loads in body carry iter_offset = P.
+        for step in &sched.body {
+            let t = tag(step.node);
+            let expected = if t == "load_k_tile" || t == "load_v_tile" {
+                3
+            } else {
+                0
+            };
+            assert_eq!(
+                step.iter_offset, expected,
+                "step {} iter_offset mismatch",
+                t
+            );
+        }
+    }
 }

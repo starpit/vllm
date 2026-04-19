@@ -876,6 +876,87 @@ pub fn residual_add_region(p: &ResidualAddParams) -> Region {
     }
 }
 
+// ─── Embedding lookup ──────────────────────────────────────────
+//
+// Gather from embed_table[vocab, hidden] indexed by token_ids.
+// Expressed as one Load (gather via AxisDivGather with divisor=1 —
+// the table term is `token_ids[token_tile]`) directly flowing into
+// one Store. No Compute node: embedding lookup is pure data movement.
+
+#[derive(Debug, Clone, Copy)]
+pub struct EmbedParams {
+    pub hidden_dim: u32,
+    pub token_tile: u32,
+}
+
+pub fn embed_region(p: &EmbedParams) -> Region {
+    const TOKEN: AxisId = 0;
+    const NUM_TOKEN_TILES: ScalarId = 0;
+    const N_LOAD: NodeId = 0;
+    const N_STORE: NodeId = 1;
+
+    let hidden_stride = p.hidden_dim as u64;
+    let tile_stride = hidden_stride * (p.token_tile as u64);
+
+    let nodes = vec![
+        Node {
+            id: N_LOAD,
+            role: Role::Load,
+            op: FufOpRef {
+                tag: "load_embed_row",
+            },
+            addr: Some(LoadAddr {
+                terms: smallvec![AddrTerm::AxisDivGather {
+                    axis: TOKEN,
+                    divisor: 1,
+                    table: SmemLookup {
+                        source: "token_ids",
+                    },
+                    stride: StrideExpr::Const(hidden_stride),
+                }],
+            }),
+        },
+        Node {
+            id: N_STORE,
+            role: Role::Store,
+            op: FufOpRef {
+                tag: "store_embed_row",
+            },
+            addr: Some(LoadAddr {
+                terms: smallvec![AddrTerm::AxisStride {
+                    axis: TOKEN,
+                    stride: StrideExpr::Const(tile_stride),
+                }],
+            }),
+        },
+    ];
+    let edges = vec![Edge {
+        src: N_LOAD,
+        dst: N_STORE,
+        kind: DepKind::Raw,
+        vector: DepVector::default(),
+    }];
+
+    Region {
+        id: 0,
+        name: "embed",
+        domain: Domain {
+            axes: vec![Axis {
+                id: TOKEN,
+                name: "token_tile",
+                bound: Bound::RegionEntryScalar(NUM_TOKEN_TILES),
+            }],
+            predicates: vec![],
+        },
+        entry_scalars: vec![ScalarBinding {
+            id: NUM_TOKEN_TILES,
+            name: "num_token_tiles",
+        }],
+        nodes,
+        edges,
+    }
+}
+
 // ─── Unary in-place element-wise ──────────────────────────────
 //
 // Smallest possible region: one Load, one Compute, one Store; a
@@ -1554,6 +1635,23 @@ mod new_template_tests {
         assert_eq!(sched.preamble.len(), 2, "load_x + load_weight");
         assert_eq!(sched.body.len(), 1, "rmsnorm_compute");
         assert_eq!(sched.epilogue.len(), 1, "store_y_row");
+    }
+
+    #[test]
+    fn embed_region_validates_as_load_to_store_no_compute() {
+        let r = embed_region(&EmbedParams {
+            hidden_dim: 4096,
+            token_tile: 64,
+        });
+        ir::validate(&r).expect("embed region validates");
+        // No Compute node: gather-only region.
+        assert_eq!(r.nodes.len(), 2);
+        assert!(r.nodes.iter().all(|n| !matches!(n.role, Role::Compute)));
+        let sched = schedule_wavefront(&r, &sm89_fa2()).unwrap();
+        assert!(sched.serial_axis.is_none());
+        assert_eq!(sched.preamble.len(), 1, "load_embed_row in preamble");
+        assert_eq!(sched.body.len(), 0);
+        assert_eq!(sched.epilogue.len(), 1, "store_embed_row in epilogue");
     }
 
     #[test]

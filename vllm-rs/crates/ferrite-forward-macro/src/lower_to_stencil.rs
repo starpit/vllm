@@ -26,10 +26,11 @@
 use std::collections::{HashMap, HashSet};
 
 use ferrite_stencil::{
-    AttnParams, ControlEdge, DepKind, GateUpSiluMulParams, GemmParams, Megakernel,
+    AttnParams, ControlEdge, DepKind, EmbedParams, GateUpSiluMulParams, GemmParams, Megakernel,
     PagedDecodeParams, QkvRopeParams, Region, RegionId, ResidualAddParams, RmsNormParams,
-    UnaryInplaceParams, Window, attn_region, attn_region_paged_decode, gate_up_silu_mul_region,
-    gemm_region, qkv_rope_region, residual_add_region, rmsnorm_region, unary_inplace_region,
+    UnaryInplaceParams, Window, attn_region, attn_region_paged_decode, embed_region,
+    gate_up_silu_mul_region, gemm_region, qkv_rope_region, residual_add_region, rmsnorm_region,
+    unary_inplace_region,
 };
 
 use crate::fuf::{Fuf, FufInput, TileId};
@@ -252,18 +253,27 @@ pub fn lower_assignment_partial(
     }
 }
 
-/// Walk the FUF's per-tile input edges; every `FufInput::Tile` that
-/// crosses a subgraph boundary becomes one `ControlEdge` (deduped on
+/// Walk the FUF's per-tile input edges; every dep that crosses a
+/// subgraph boundary becomes one `ControlEdge` (deduped on
 /// (src_region, dst_region)). DepKind::Barrier is the conservative
-/// default — refinement (e.g. AtomicReduce for associative reductions)
-/// lands once the lowering has enough FUF info to tell them apart.
+/// default.
+///
+/// If a subgraph on the dep path has no region (its Impl wasn't
+/// templated — e.g. `reshape_ref`, which is purely structural), the
+/// walker traverses through it and attributes the edge to the
+/// nearest regioned ancestor. Otherwise reshape-only subgraphs would
+/// silently break the dep chain between every region they connect.
 fn derive_control_edges(
     fuf: &Fuf,
     assignment: &Assignment,
     sg_to_rid: &HashMap<SubgraphId, RegionId>,
 ) -> Vec<ControlEdge> {
+    // Tile index for O(1) lookups during the BFS.
+    let tile_to_node: HashMap<TileId, &crate::fuf::FufNode> =
+        fuf.nodes.iter().map(|n| (n.id, n)).collect();
     let mut seen: HashSet<(RegionId, RegionId)> = HashSet::new();
     let mut out: Vec<ControlEdge> = Vec::new();
+
     for node in &fuf.nodes {
         let Some(dst_sg) = assignment.subgraph_of(node.id) else {
             continue;
@@ -271,25 +281,47 @@ fn derive_control_edges(
         let Some(&dst_rid) = sg_to_rid.get(&dst_sg) else {
             continue;
         };
+
+        // BFS back through inputs. If we hit a regioned ancestor,
+        // emit the edge and stop walking that path; if we hit a
+        // skipped-subgraph ancestor, keep walking through its inputs.
+        let mut stack: Vec<TileId> = Vec::new();
+        let mut visited: HashSet<TileId> = HashSet::new();
         for input in &node.inputs {
-            let FufInput::Tile { id: src_tile, .. } = input else {
+            if let FufInput::Tile { id, .. } = input {
+                stack.push(*id);
+            }
+        }
+        while let Some(src_tile) = stack.pop() {
+            if !visited.insert(src_tile) {
                 continue;
-            };
-            let Some(src_sg) = assignment.subgraph_of(*src_tile) else {
+            }
+            let Some(src_sg) = assignment.subgraph_of(src_tile) else {
                 continue;
             };
             if src_sg == dst_sg {
                 continue;
             }
-            let Some(&src_rid) = sg_to_rid.get(&src_sg) else {
-                continue;
-            };
-            if seen.insert((src_rid, dst_rid)) {
-                out.push(ControlEdge {
-                    src: src_rid,
-                    dst: dst_rid,
-                    kind: DepKind::Barrier,
-                });
+            if let Some(&src_rid) = sg_to_rid.get(&src_sg) {
+                if seen.insert((src_rid, dst_rid)) {
+                    out.push(ControlEdge {
+                        src: src_rid,
+                        dst: dst_rid,
+                        kind: DepKind::Barrier,
+                    });
+                }
+                // Regioned ancestor — the edge stops here; we don't
+                // traverse further back, because upstream deps belong
+                // to the ancestor's own inbound edges.
+            } else {
+                // Skipped ancestor — walk through it.
+                if let Some(anc) = tile_to_node.get(&src_tile) {
+                    for input in &anc.inputs {
+                        if let FufInput::Tile { id, .. } = input {
+                            stack.push(*id);
+                        }
+                    }
+                }
             }
         }
     }
@@ -312,14 +344,23 @@ fn lower_impl(
             num_head_groups: hints.num_head_groups,
             pipe: hints.pipe,
         })),
-        "attention_via_cache" => Ok(attn_region_paged_decode(&PagedDecodeParams {
-            head_dim: hints.head_dim,
-            tile_k: hints.tile_k,
-            num_head_groups: hints.num_head_groups,
-            pipe: hints.pipe,
-            tokens_per_page: hints.tokens_per_page,
-            window: Window::Infinite,
-        })),
+        // `flashinfer_attention_decode` has the same stencil shape as
+        // `attention_via_cache` — paged-KV decode. The Impl name
+        // differs only because the current runtime dispatches a
+        // pre-built FlashInfer kernel for it; from the Stencil IR's
+        // POV they're the same region, and whether the emitted
+        // megakernel inlines the compute or calls FlashInfer is an
+        // emit_ops / resource-mapping concern, not a template one.
+        "attention_via_cache" | "flashinfer_attention_decode" => {
+            Ok(attn_region_paged_decode(&PagedDecodeParams {
+                head_dim: hints.head_dim,
+                tile_k: hints.tile_k,
+                num_head_groups: hints.num_head_groups,
+                pipe: hints.pipe,
+                tokens_per_page: hints.tokens_per_page,
+                window: Window::Infinite,
+            }))
+        }
         "sliding_attention_via_cache" => Ok(attn_region_paged_decode(&PagedDecodeParams {
             head_dim: hints.head_dim,
             tile_k: hints.tile_k,
@@ -439,6 +480,11 @@ fn lower_impl(
             hidden_dim: hints.hidden_dim,
             token_tile: hints.token_tile,
             op_tag: "tanh_softcap",
+        })),
+        // ── Embedding lookup (gather-only; no Compute). ──
+        "embed_ref" => Ok(embed_region(&EmbedParams {
+            hidden_dim: hints.hidden_dim,
+            token_tile: hints.token_tile,
         })),
         other => Err(LowerError::UnsupportedImpl { name: other }),
     }
@@ -712,6 +758,124 @@ mod tests {
             mk.control[0].kind,
             ferrite_stencil::DepKind::Barrier
         ));
+    }
+
+    #[test]
+    fn control_edges_traverse_skipped_subgraphs() {
+        // FUF: A → S (skipped impl: no region template) → B. Both
+        // A and B have regioned subgraphs. Expect a direct A → B
+        // ControlEdge — the skipped S must not silently break the
+        // dep chain, since that'd misrepresent the megakernel.
+        use crate::impl_lib::{AttentionPrefillContiguousImpl, Implementation};
+
+        #[derive(Debug, Default)]
+        struct SkippedImpl;
+        impl Implementation for SkippedImpl {
+            fn name(&self) -> &'static str {
+                "reshape_ref"
+            }
+            fn target_compatible(&self, _: &crate::target::TargetProfile) -> bool {
+                true
+            }
+            fn workload_constraint(&self) -> crate::impl_lib::WorkloadConstraint {
+                crate::impl_lib::WorkloadConstraint::Any
+            }
+            fn matches(
+                &self,
+                _: &Fuf,
+                _: TileId,
+                _: &crate::target::TargetProfile,
+            ) -> Option<crate::impl_lib::MatchInfo> {
+                None
+            }
+            fn cost_us(&self, _: &crate::impl_lib::MatchInfo, _: &crate::impl_lib::CostCtx) -> f64 {
+                0.0
+            }
+            fn resources(&self, _: &crate::impl_lib::MatchInfo) -> crate::impl_lib::Resources {
+                crate::impl_lib::Resources::ZERO
+            }
+            fn launch_kind(&self) -> crate::impl_lib::LaunchKind {
+                crate::impl_lib::LaunchKind::HostCallback
+            }
+            fn supported_input_handoffs(&self) -> &[crate::impl_lib::Handoff] {
+                &[]
+            }
+            fn supported_output_handoffs(&self) -> &[crate::impl_lib::Handoff] {
+                &[]
+            }
+            fn input_layouts(
+                &self,
+                _: &crate::impl_lib::MatchInfo,
+            ) -> Vec<crate::impl_lib::Layout> {
+                vec![]
+            }
+            fn output_layouts(
+                &self,
+                _: &crate::impl_lib::MatchInfo,
+            ) -> Vec<crate::impl_lib::Layout> {
+                vec![]
+            }
+            fn is_compute_bound(&self) -> bool {
+                false
+            }
+            fn emit_call(&self, _: &crate::emit::EmitCtx) -> proc_macro2::TokenStream {
+                proc_macro2::TokenStream::new()
+            }
+        }
+
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Attention,
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Attention,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(0),
+                        slot: 0,
+                    }],
+                    outputs: vec![],
+                },
+                FufNode {
+                    id: TileId(2),
+                    op: OpKind::Attention,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(1),
+                        slot: 0,
+                    }],
+                    outputs: vec![],
+                },
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let attn_id = lib.push(Box::new(AttentionPrefillContiguousImpl));
+        let skip_id = lib.push(Box::new(SkippedImpl));
+        let mut cover = HashMap::new();
+        cover.insert(TileId(0), SubgraphId(0));
+        cover.insert(TileId(1), SubgraphId(1));
+        cover.insert(TileId(2), SubgraphId(2));
+        let mut impls = HashMap::new();
+        impls.insert(SubgraphId(0), attn_id);
+        impls.insert(SubgraphId(1), skip_id);
+        impls.insert(SubgraphId(2), attn_id);
+        let assignment = Assignment {
+            cover,
+            impls,
+            predicted_us: 0.0,
+        };
+
+        let report = lower_assignment_partial(&fuf, &assignment, &lib, &LowerHints::default());
+        assert_eq!(report.mk.regions.len(), 2, "A and B; S skipped");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].1, "reshape_ref");
+        // Direct A → B edge through S.
+        assert_eq!(report.mk.control.len(), 1);
+        assert_eq!(report.mk.control[0].src, 0);
+        assert_eq!(report.mk.control[0].dst, 1);
     }
 
     #[test]

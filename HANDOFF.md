@@ -817,6 +817,110 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
+**FP8 trio in progress — step 1 landed (commit `081a5e99c`).**
+`StorageFormat::Fp8 { scheme, block_size }` + `QuantMethod::Fp8`
++ `Fp8ActivationScheme::{Dynamic, Static}` + the `"fp8"` parser
+arm now live in `ferrite-forward-macro::quantization`, with
+`lm_head → Dense` carve-out and 5 new parser tests. No arch
+opts in yet, so `compile_error!` on non-Dense doesn't fire.
+
+**Remaining FP8 work, priority-ordered (the three HANDOFF
+"tasks #2/#3/#4" — dynamic / static / blockwise):**
+
+1. **Port `Fp8Linear::{load,load_concat}` + `Fp8BlockLinear::{load,load_concat}`
+   into `ferrite-kernels::layers_quant`**, thin the current
+   `vllm-cuda::weights_quant::{load_fp8_linear, load_fused_fp8_linear,
+   load_fp8_block_linear, load_fused_fp8_block_linear}` to 2-line
+   delegators (mirrors commit `974e9a4c8`'s AWQ refactor).
+   Helpers to port alongside: `ensure_f32_scale` (BF16/F16 → F32
+   scale). All FP8 kernels (`fp8_quantize_weight_bf16_raw`,
+   `fp8_requantize_weight_rows`, `scaled_fp8_quant_{dynamic,static}`,
+   `cutlass_scaled_mm{,_with_bias}`) are already in
+   `ferrite-kernels::kernels`.
+
+2. **Slice 1 — FP8 dynamic per-tensor end-to-end green golden.**
+   Target: `RedHatAI/Qwen2.5-0.5B-FP8-dynamic` (~500MB, fits L4,
+   `TestModels::QWEN2_0_5B_FP8` already defined). Concretely:
+   - `model_architectures/quantizations/fp8-dynamic-per-tensor.json`
+     preset (`{"quantization_config": {"quant_method": "fp8",
+     "activation_scheme": "dynamic"}}`).
+   - Note: RedHatAI FP8 checkpoints use
+     `quant_method: "compressed-tensors"` with `"type": "float"` /
+     `num_bits: 8` in `config_groups`; extend
+     `parse_compressed_tensors` with an FP8 branch that returns a
+     `QuantMethod::Fp8 { scheme, block_size }` (mirroring how the
+     INT4 branch returns `QuantMethod::Gptq { layout: WeightPacked }`).
+   - `qwen2/quantizations.json` adds `"fp8-dynamic-per-tensor"`.
+   - `FieldLoad::Fp8Linear { prefixes, out_features_per_shard,
+     in_features, has_input_scale }` arm in `codegen.rs` (maps
+     accessor type `ferrite_kernels::layers::Fp8Linear` ↔
+     `StorageFormat::Fp8`). Emits
+     `Fp8Linear::load(gw, prefix, output_dtype)?` or
+     `Fp8Linear::load_concat(gw, prefixes, output_dtype)?`. FP8
+     fingerprint gate in `qweight_shape_gate`:
+     `gw.tensor_info("model.layers.0.self_attn.q_proj.weight_scale").is_some()`.
+   - `ferrite_eligible`: admit `is_fp8()`.
+   - `Fp8GemmImpl` singleton in `impl_lib.rs` (mirrors
+     `Bnb4GemmImpl`, storage gate `is_fp8_gemm`, emits
+     `fp8_layer.forward(x, &mut device.cublas, alloc, stream)`).
+   - Probe-weights regen via
+     `cargo run -p ferrite-forward --bin probe-weights --
+     --model RedHatAI/Qwen2.5-0.5B-FP8-dynamic --out
+     model_architectures/qwen2/qwen2.5-0.5b-fp8-dynamic-per-tensor.json`.
+   - Golden: add `"qwen2_0_5b_fp8_dynamic"` entry to
+     `scripts/generate_golden_refs.py`, regen under
+     `VLLM_ATTENTION_BACKEND=FLASHINFER` (to avoid the
+     FA2-vs-FI-baked-goldens drift noted above).
+   - E2E test: `test_cuda_correctness_qwen2_0_5b_fp8_dynamic` in
+     `vllm-e2e/tests/e_correctness.rs`.
+   - **Fused QKV is ONE `Fp8Linear` via `load_concat`**, not a
+     split pattern — the hand-written loader already merges
+     per-tensor scales via `requantize_with_max_scale`. So
+     `FusedQkvRopeCacheImpl` / `Prefill` need FP8 peers
+     (`Fp8FusedQkvRopeCacheImpl`, `Fp8FusedQkvRopePrefillImpl`)
+     emitting `fp8_qkv.forward(...)` + rope + write-cache, same
+     claim shape as the dense variants. Perf-critical; if
+     skipped, singleton `Fp8GemmImpl` still produces a correct
+     result via three separate Fp8 gemms.
+   - Likewise `Fp8FusedGateUpSiluMulImpl` +
+     `Fp8FusedGateUpGeluMulImpl` for the MLP gate/up path.
+
+3. **Slice 2 — FP8 static per-tensor.** Model candidate:
+   `neuralmagic/Qwen2.5-0.5B-Instruct-FP8` (if published) or
+   similarly-sized static checkpoint; search HF for
+   `activation_scheme: "static"` on a Qwen2/Llama < 2B. Adds
+   `fp8-static-per-tensor.json` preset (same as dynamic but
+   `"activation_scheme": "static"`). `Fp8Linear::load` already
+   reads `.input_scale` when present — no loader change. Impl
+   matchers distinguish via `StorageFormat::Fp8 { scheme: Static,
+   .. }` if needed (static/dynamic share the same forward path,
+   so likely one set of Impls covers both).
+
+4. **Slice 3 — FP8 128×128 blockwise.** Uses `Fp8BlockLinear`
+   (already in `ferrite-kernels::layers`). Model candidate: small
+   DeepSeek-V2-Lite or Qwen3-like with `weight_block_size: [128,
+   128]`. Adds `fp8-block-128x128.json` preset + `FieldLoad::
+   Fp8BlockLinear { prefixes, block_size }` arm + `Fp8BlockGemmImpl`
+   (emits `fp8_block_layer.forward(...)` → `cutlass_scaled_mm_blockwise`).
+   Distinct kernel path; cannot share Impls with per-tensor.
+
+**Don't trip on these:**
+- `vllm-cuda::weights_quant::load_fused_fp8_linear` handles both
+  online (BF16→FP8 at load) and serialized (already-FP8) paths.
+  Port both — the Qwen2 model ships serialized, but Llama FP8
+  ships online-quant.
+- Scale merging for fused QKV is lossy (max-scale +
+  `fp8_requantize_weight_rows`). Matches Python vLLM's
+  `requantize_with_max_scale`. Do NOT try to keep per-shard
+  scales — the cutlass kernel takes one scalar `b_scale`.
+- Goldens must be generated against
+  `VLLM_ATTENTION_BACKEND=FLASHINFER` since ferrite now runs FI
+  by default on Qwen2/Llama. Generating under default FA2 will
+  drift at late positions (see "Flashinfer-side test issues"
+  section below).
+
+---
+
 **Quant overlay mechanism landed (commit `85391247b`).** Replaces the
 per-(arch, size, quant) full-JSON variants with a layered overlay
 that fans every preset across every dense base:

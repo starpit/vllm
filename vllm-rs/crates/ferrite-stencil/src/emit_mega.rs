@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 
 use crate::arch::{ArchMap, BarrierPrim, HardwareUnit};
-use crate::emit_ops::{ExpandCtx, expand as expand_op};
+use crate::emit_ops::{ExpandCtx, GmemAccess, expand as expand_op, gmem_refs};
 use crate::ir::{Bound, DepKind, Megakernel, Region, RegionId, Role};
 use crate::wavefront::{Schedule, ScheduleError, Step, schedule_wavefront};
 
@@ -158,34 +158,63 @@ fn write_header(out: &mut String, mega: &Megakernel, arch: &ArchMap) {
         "// of Megakernel.control; inter-region edges lower to ArchMap::barrier."
     )
     .unwrap();
+    // Global g.Bar counter used by inter-region Barrier edges. Host
+    // zeros it once per launch. `gbar_sync(&gbar_counter)` arrives +
+    // spin-waits for the cross-CTA fence (Megakernel-style — see
+    // STENCIL_IR_DESIGN.md §5).
+    writeln!(out, "__device__ uint32_t gbar_counter;").unwrap();
 }
 
 fn write_signature(out: &mut String, mega: &Megakernel) {
     writeln!(out, "__global__ void mega_kernel(").unwrap();
-    // Entry scalars: dedupe by name across all regions. Each region's
-    // scalars flow in as kernel parameters; regions that share a name
-    // (e.g. both use `num_q_tiles`) share the parameter.
-    let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
-    let mut first = true;
+
+    // Entry scalars: dedupe by name across all regions. Regions that
+    // share a name (e.g. both use `num_q_tiles`) share the parameter.
+    let mut scalar_seen: std::collections::BTreeSet<&'static str> =
+        std::collections::BTreeSet::new();
+    let mut scalar_params: Vec<&'static str> = Vec::new();
     for r in &mega.regions {
         for s in &r.entry_scalars {
-            if seen.insert(s.name) {
-                if !first {
-                    writeln!(out, ",").unwrap();
-                }
-                write!(out, "    uint32_t {}", s.name).unwrap();
-                first = false;
+            if scalar_seen.insert(s.name) {
+                scalar_params.push(s.name);
             }
         }
     }
-    if !first {
-        writeln!(out).unwrap();
+
+    // Gmem pointers: union every tag's gmem_refs across every node of
+    // every region. A tensor read AND written anywhere in the
+    // megakernel must be mutable (no const qualifier); a tensor only
+    // ever read takes the const qualifier. Dedupe keeps the signature
+    // honest — the real plumbing that maps these to FUF-level tensors
+    // comes with the runtime launcher; this commit lands the shape.
+    let mut gmem_access: BTreeMap<&'static str, GmemAccess> = BTreeMap::new();
+    for r in &mega.regions {
+        for n in &r.nodes {
+            for &(name, access) in gmem_refs(n.op.tag) {
+                gmem_access
+                    .entry(name)
+                    .and_modify(|e| *e = e.union(access))
+                    .or_insert(access);
+            }
+        }
     }
-    writeln!(
-        out,
-        "    /* gmem pointer plumbing: TODO — one ptr per gmem tensor referenced */"
-    )
-    .unwrap();
+
+    let total_params = scalar_params.len() + gmem_access.len();
+    let mut param_idx = 0usize;
+    let comma = |i: usize| if i + 1 < total_params { "," } else { "" };
+
+    for name in &scalar_params {
+        writeln!(out, "    uint32_t {}{}", name, comma(param_idx)).unwrap();
+        param_idx += 1;
+    }
+    for (name, access) in &gmem_access {
+        let qual = match access {
+            GmemAccess::Read => "const bf16* __restrict__",
+            GmemAccess::Write | GmemAccess::ReadWrite => "bf16* __restrict__",
+        };
+        writeln!(out, "    {} {}{}", qual, name, comma(param_idx)).unwrap();
+        param_idx += 1;
+    }
     writeln!(out, ") {{").unwrap();
 }
 
@@ -465,6 +494,65 @@ mod tests {
         assert!(src.contains("uint32_t num_q_tiles"));
         assert!(src.contains("uint32_t num_kv_tiles"));
         assert!(src.contains("uint32_t window_in_tiles"));
+
+        // Gmem pointer plumbing: attention tags touch Q/K/V (read) +
+        // O (write). Signature should carry all four with proper const
+        // qualifiers.
+        assert!(src.contains("const bf16* __restrict__ Q_gmem"));
+        assert!(src.contains("const bf16* __restrict__ K_gmem"));
+        assert!(src.contains("const bf16* __restrict__ V_gmem"));
+        assert!(src.contains("bf16* __restrict__ O_gmem"));
+        // Global g.Bar counter is declared above the kernel.
+        assert!(src.contains("__device__ uint32_t gbar_counter;"));
+    }
+
+    #[test]
+    fn gmem_access_union_promotes_to_mutable() {
+        // A tag set that both reads and writes Q_gmem (attention reads
+        // load_q_tile, qkv_rope writes store_q_row) must drop the
+        // const qualifier — both stencils agree on the name so dedupe
+        // hoists to a single mutable ptr.
+        use crate::template::{QkvRopeParams, qkv_rope_region};
+
+        let mut r_attn = attn_region(&AttnParams {
+            window: Window::Infinite,
+            head_dim: 128,
+            tile_q: 128,
+            tile_k: 64,
+            num_head_groups: 8,
+            pipe: 3,
+        });
+        r_attn.id = 0;
+        let mut r_qkv = qkv_rope_region(&QkvRopeParams {
+            hidden_dim: 4096,
+            head_dim: 128,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            token_tile: 64,
+            k_tile: 32,
+            pipe: 3,
+            writes_kv_cache: false,
+        });
+        r_qkv.id = 1;
+        let mk = Megakernel {
+            regions: vec![r_attn, r_qkv],
+            control: vec![ControlEdge {
+                src: 1,
+                dst: 0,
+                kind: DepKind::Barrier,
+            }],
+        };
+        let src = emit_megakernel(&mk, &sm90_fa2()).unwrap();
+        // Q_gmem is Read by attention, Write by qkv_rope → ReadWrite,
+        // so no `const`.
+        assert!(
+            src.contains("bf16* __restrict__ Q_gmem"),
+            "Q_gmem must be mutable when read + written",
+        );
+        assert!(
+            !src.contains("const bf16* __restrict__ Q_gmem"),
+            "Q_gmem must not carry the const qualifier",
+        );
     }
 
     #[test]

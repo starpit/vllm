@@ -27,6 +27,77 @@ pub struct ExpandCtx<'a> {
     pub pipeline_depth: u32,
 }
 
+/// How a tag touches a gmem tensor: read-only, write-only, or both.
+/// Consumed by `emit_megakernel` to decide whether the kernel param
+/// needs the `const` qualifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GmemAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl GmemAccess {
+    pub fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ReadWrite, _) | (_, Self::ReadWrite) => Self::ReadWrite,
+            (Self::Read, Self::Write) | (Self::Write, Self::Read) => Self::ReadWrite,
+            (Self::Read, Self::Read) => Self::Read,
+            (Self::Write, Self::Write) => Self::Write,
+        }
+    }
+}
+
+/// Gmem tensor names + access kinds each tag touches. Companion to
+/// `expand`: the emitter uses this to assemble the kernel signature
+/// (one pointer param per unique tensor) while `expand` emits the
+/// body that references them. Compute-only tags return an empty
+/// slice — they work on register fragments, not gmem.
+pub fn gmem_refs(tag: &str) -> &'static [(&'static str, GmemAccess)] {
+    use GmemAccess::*;
+    match tag {
+        // ── Attention (FA2 + paged decode) ──
+        "load_q_tile" => &[("Q_gmem", Read)],
+        "load_k_tile" => &[("K_gmem", Read)],
+        "load_v_tile" => &[("V_gmem", Read)],
+        "store_o_tile" => &[("O_gmem", Write)],
+        // ── GEMM ──
+        "load_a_tile" => &[("A_gmem", Read)],
+        "load_b_tile" => &[("B_gmem", Read)],
+        "store_c_tile" => &[("C_gmem", Write)],
+        // ── Norm / elementwise (row-wise; load_x_row etc. use the
+        //    same name across regions because the region's regional
+        //    gmem context lives in emit_mega, not here). ──
+        "load_x_row" => &[("X_gmem", Read)],
+        "load_weight" => &[("W_gmem", Read)],
+        "store_y_row" => &[("Y_gmem", Write)],
+        "load_a_row" => &[("A_gmem", Read)],
+        "load_b_row" => &[("B_gmem", Read)],
+        "store_sum_row" => &[("Sum_gmem", Write)],
+        // ── QKV + RoPE ──
+        "load_wqkv_tile" => &[("Wqkv_gmem", Read)],
+        "load_rope_coef" => &[("RopeCoef_gmem", Read)],
+        "store_q_row" => &[("Q_gmem", Write)],
+        "store_k_row" => &[("K_gmem", Write)],
+        "store_v_row" => &[("V_gmem", Write)],
+        "store_k_cache" => &[("K_cache_gmem", Write)],
+        "store_v_cache" => &[("V_cache_gmem", Write)],
+        // ── Gate + Up + SiLU/GeLU + Mul ──
+        "load_wgate_tile" => &[("Wgate_gmem", Read)],
+        "load_wup_tile" => &[("Wup_gmem", Read)],
+        "store_inter_tile" => &[("Inter_gmem", Write)],
+        // ── Embedding lookup ──
+        "load_embed_row" => &[
+            ("Embed_gmem", Read),
+            // Indirection index lives in gmem as well (token_ids[]).
+            ("TokenIds_gmem", Read),
+        ],
+        "store_embed_row" => &[("Y_gmem", Write)],
+        // Compute-only tags: no gmem touch.
+        _ => &[],
+    }
+}
+
 /// Try to expand `(tag, arch)` into concrete CUDA pseudocode. Returns
 /// `None` when no entry exists yet; callers fall back to the stub
 /// `tag();` line.

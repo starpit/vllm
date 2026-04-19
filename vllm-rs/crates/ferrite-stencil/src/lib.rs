@@ -10,6 +10,7 @@
 
 pub mod arch;
 pub mod emit;
+pub mod emit_mega;
 pub mod emit_ops;
 pub mod ir;
 pub mod print;
@@ -19,6 +20,7 @@ pub mod wavefront;
 
 pub use arch::{ArchMap, BarrierPrim, HardwareUnit, sm89_fa2, sm90_fa2};
 pub use emit::emit_kernel_sketch;
+pub use emit_mega::{EmitError as MegaEmitError, emit_megakernel};
 pub use ir::{
     AddrTerm, AffineOffset, Axis, AxisId, Bound, CmpOp, ControlEdge, DepKind, DepVector, Domain,
     Edge, FufOpRef, LoadAddr, Megakernel, Node, NodeId, Predicate, Region, RegionId, Role,

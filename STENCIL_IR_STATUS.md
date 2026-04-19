@@ -30,7 +30,7 @@ The target is **one persistent `__global__` per model forward on SM90a+**, in th
 
 **Phase A — correctness shape — complete.** Per-region scoped smem/frag/mbarriers (item 2), axis names threaded through `ExpandCtx` (item 3), and per-layer FUF tensor identities in the kernel signature (item 4). Llama-3-8B's signature carries ~230 per-tensor pointers (`w{id}_{layer}`, `t{tile}_{slot}`, `x_{kind}_{index}`) instead of 18 canonical names — each layer's Wqkv/Wo/Wgate/Wup/RMSnorm is its own parameter.
 
-**Phase B — byte-count plumbing landed.** Every region now emits region-scope `constexpr uint32_t SMEM_{LOCAL}_BYTES = …u;` constants from `Region.tile_consts` (populated by each template from its tile params), and smem declarations reference them: `__shared__ bf16 smem_q[SMEM_Q_BYTES / 2]` instead of the opaque `__shared__ StencilFrag smem_q`. The same symbols are what the next commit threads into `cp_async_128<BYTES>` / `stg_128<BYTES>` / `tma_load_2d<BYTES>` template args, which is the step that lets the data-movement helpers drop their trap bodies for real PTX.
+**Phase B — byte-count plumbing + templated call sites landed.** Every region emits region-scope `constexpr uint32_t SMEM_{LOCAL}_BYTES = …u;` constants from `Region.tile_consts` (populated by each template from its tile params), and smem declarations reference them: `__shared__ bf16 smem_q[SMEM_Q_BYTES / 2]` instead of the opaque `__shared__ StencilFrag smem_q`. Every smem-targeted `cp_async_128 / tma_load_2d / tma_store_2d / stg_128 / stmatrix_smem` call now carries the matching `<SMEM_*_BYTES>` template arg. Helper bodies still trap — the prelude signatures got the non-type template parameter (`uint32_t BYTES = 0`) but the bodies are unchanged. What's not yet bridged is the *address* half: call sites still pass raw axis indices (`q_tile, head_group`), and a real cp.async needs a concrete `gmem + tile_offset` pointer. That refactor is what task 3 below demands.
 
 **Phase B — real PTX — first wave landed.** 8 fixed-signature helpers compile to real PTX (guarded by `__CUDA_ARCH__`):
 
@@ -48,7 +48,7 @@ The target is **one persistent `__global__` per model forward on SM90a+**, in th
 `gbar_sync` is the HazyResearch-style global barrier — no hardware grid-sync, just atomic-counter spin-wait. Thread 0 of each CTA elects, increments, spins, and re-enters via `__syncthreads`.
 
 **Still trapping** (these are the real work):
-- Data movement: `cp_async_128`, `tma_load_2d`, `tma_store_2d`, `stg_128` — need byte counts + strides from emitter.
+- Data movement: `cp_async_128<BYTES>`, `tma_load_2d<BYTES>`, `tma_store_2d<BYTES>`, `stg_128<BYTES>` — byte counts are threaded; what's missing is the *address* — call sites need to emit `gmem + tile_offset_expr` (walked from `LoadAddr.terms`) so the helper body copies the right tile, not the whole tensor.
 - Tensor-core compute: `wgmma_mma_async`, `mma_sync_accumulate` — need accumulator fragments + smem descriptors.
 - Smem store: `stmatrix_smem` — needs smem address + fragment layout.
 - Pointer-form mbarriers: `mbarrier_wait(bar*)`, `mbarrier_arrive(bar*)` — need phase-bit plumbing per barrier.
@@ -116,21 +116,32 @@ __global__ void mega_kernel(
   uint32_t wg = threadIdx.x / 128u;
   // ═══ region 0 (embed) pipeline_depth=0 ═══
   {
-    __shared__ StencilFrag smem_out;
+    constexpr uint32_t SMEM_OUT_BYTES = 8192u;
+    __shared__ bf16 smem_out[SMEM_OUT_BYTES / 2];
     StencilFrag Embed_frag;
     __shared__ Mbarrier bar_embed;
     __shared__ Mbarrier bar_Y_gmem_ready;
     for (uint32_t token_tile = 0; token_tile < num_token_tiles; ++token_tile) {
-      // preamble: tma_load_2d(Embed_frag, w0 + row * hidden_stride);
-      // body: stmatrix_smem + tma_store_2d → t0_0
+      // preamble: cp_async_128(Embed_frag, w0 + row * hidden_stride);  (still bare — no smem_embed yet)
+      // body: stmatrix_smem<SMEM_OUT_BYTES>(smem_out, Embed_frag);
+      //       tma_store_2d<SMEM_OUT_BYTES>(t0_0, smem_out, token_tile, 0u);
     }
   }  // end region 0
   gbar_sync(&gbar_counter);
   // ═══ region 1 (rmsnorm) pipeline_depth=0 ═══
   {
-    __shared__ StencilFrag smem_x, smem_w, smem_out;
+    constexpr uint32_t SMEM_X_BYTES = 8192u;
+    constexpr uint32_t SMEM_W_BYTES = 8192u;  // weight is 1-D [hidden_dim]
+    constexpr uint32_t SMEM_OUT_BYTES = 8192u;
+    __shared__ bf16 smem_x[SMEM_X_BYTES / 2];
+    __shared__ bf16 smem_w[SMEM_W_BYTES / 2];
+    __shared__ bf16 smem_out[SMEM_OUT_BYTES / 2];
     StencilFrag Y_frag;
-    // ... reads t0_0 (embed output), w1_0 (rmsnorm weight), writes t1_0
+    // tma_load_2d<SMEM_X_BYTES>(smem_x, t0_0, token_tile);
+    // tma_load_2d<SMEM_W_BYTES>(smem_w, w1_0, token_tile);
+    // …rmsnorm_compute…
+    // stmatrix_smem<SMEM_OUT_BYTES>(smem_out, Y_frag);
+    // tma_store_2d<SMEM_OUT_BYTES>(t1_0, smem_out, token_tile, 0u);
   }  // end region 1
   // ... 225 more regions ...
 }  // end mega_kernel
@@ -144,7 +155,7 @@ extern "C" cudaError_t launch_mega_kernel(cudaStream_t, /* same param list */) {
 }
 ```
 
-The cp.async / wgmma fence/commit/wait calls are real PTX now. The data-movement placeholders (`tma_load_2d`, `cp_async_128`, `wgmma_mma_async`, `stg_128`, `stmatrix_smem`) and the pointer-form mbarriers still trap. Running the object aborts on the first trap; the bookkeeping around it (gbar_sync between regions, wgmma fences in attention) is real.
+The cp.async / wgmma fence/commit/wait calls are real PTX now. The data-movement placeholders (`tma_load_2d<BYTES>`, `cp_async_128<BYTES>`, `wgmma_mma_async`, `stg_128<BYTES>`, `stmatrix_smem<BYTES>`) and the pointer-form mbarriers still trap — but the byte-count template arg is threaded, so the next commit only needs to (a) compute a concrete `gmem + offset` at each call site by walking `LoadAddr.terms`, and (b) emit the real cp.async loop in the prelude. Running the object still aborts on the first data-movement trap; the bookkeeping around it (gbar_sync between regions, wgmma fences in attention) is real.
 
 ## What's landed
 
@@ -160,9 +171,10 @@ The cp.async / wgmma fence/commit/wait calls are real PTX now. The data-movement
 | `85f51b403` | **Item 4a** — `Region.gmem_bindings` + `ExpandCtx::gmem` resolver | +6 → 59 lib |
 | `344505683` | **Item 4b** — `lower_impl` stamps FUF tensor identities | +3 → 17 lowering |
 | `a9a1a8b59` | **Item 1 first wave** — real PTX for 8 fixed-sig sync helpers | — |
-| HEAD+1 | **Item 1 second wave bootstrap** — `Region.tile_consts` + `SMEM_{LOCAL}_BYTES` constexpr + `bf16[BYTES / 2]` smem decls | 59 lib |
+| `32e0690a0` | **Item 1 second wave — byte plumbing** — `Region.tile_consts` + `SMEM_{LOCAL}_BYTES` constexpr + `bf16[BYTES / 2]` smem decls | 59 lib |
+| `843498fc9` | **Item 1 second wave — templated call sites** — `cp_async_128<BYTES>(…)` etc. at every smem-targeted call; prelude helpers grow `<uint32_t BYTES = 0>` template param | 59 lib |
 
-Cumulative at HEAD: **ferrite-stencil 59 lib + 7 integration · forward-macro lowering 17 · sm_89 + sm_90a nvcc-compilable objects for every supported model variant.**
+Cumulative at HEAD: **ferrite-stencil 59 lib + 7 integration · forward-macro lowering 17 · sm_89 + sm_90a nvcc-compilable objects for every supported model variant · smem decls are concrete `bf16[BYTES/2]` arrays · data-movement call sites carry `<BYTES>` template args.**
 
 ## Pipeline that now exists
 
@@ -213,15 +225,21 @@ The design doc's finish line is *efficient megakernel execution from the FUF* �
 
 ### The first next step
 
-**Pick a concrete `StencilFrag` representation and thread byte counts + smem descriptors from the emitter.** This single commitment unblocks every remaining trap-bodied helper — load/store/compute all need either the byte count (cp.async, TMA, stg) or the accumulator/smem descriptor (wgmma, mma.sync, stmatrix). Don't land one real-PTX helper at a time first: you'd need to redo them once the shape is pinned.
+**Thread a concrete gmem tile offset into every data-movement call site**, so the prelude helpers can drop the trap body for real cp.async / TMA / stg PTX. Byte-count plumbing is already done (commits `32e0690a0` + `843498fc9`); what remains is the *address* half.
 
-Concretely, the commit looks like:
-- Replace opaque `StencilFrag` with a concrete per-thread fragment type. For the 128×128 wgmma accumulator that SM90a's `wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16` produces, that's a `float[64]` per thread (4-per-thread × 16 reg pairs) on the consumer warpgroup; for cp_async smem tiles it's `__nv_bfloat162` vectors. Pick the minimum that works for GEMM + attention and commit.
-- Extend `local_refs` with byte-count / stride info per `SmemPlain` / `SmemRing` so the emitter can declare `__shared__ bf16 smem_x[TILE_BYTES / 2]` with the right shape and call `cp_async_128<TILE_BYTES>(smem_x, X_gmem, row, col)`.
-- Update the data-movement helpers in the prelude to take the byte count as a non-type template parameter and issue the real cp.async / TMA / stg PTX.
-- Pointer-form `mbarrier_wait(bar*)` / `mbarrier_arrive(bar*)` need phase-bit plumbing — add a `phase: uint64_t*` alongside each mbarrier declaration in `local_refs`.
+The shape:
+- Each `Node` with `role ∈ {Load, Store}` carries a `LoadAddr` with `SmallVec<AddrTerm>`. `AddrTerm::AxisStride { axis, stride }` is the common case — the tile offset in source elements is `Σ axis * stride` over every term.
+- Add `fn addr_expr(region: &Region, node: &Node) -> String` in `emit_mega.rs` (or a new `emit_addr.rs`) that walks `node.addr.as_ref().expect(...)` and renders `"q_tile * 16384u + head_group * 16384u"` style expressions. `AxisModStride` adds `% modulus`; `AxisDivGather` renders `{table}[axis / divisor]` using the SmemLookup's source name.
+- Rewrite every data-movement expansion in `emit_ops.rs` to emit `cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem + {addr_expr})` instead of `cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem, q_tile, head_group)`. The axes go away from the call; they live inside the expression.
+- Prelude helpers drop axes from their signature: `template <uint32_t BYTES> __device__ void cp_async_128(bf16* smem, const bf16* gmem)`. Body loops `BYTES / 16` cp.async.ca.shared.global [smem + tid*16 + i*16*128], [gmem + tid*16 + i*16*128], 16 issues per thread (tid = threadIdx.x % 128).
 
-This is substantially larger than a single Phase A commit — expect 500-800 LOC across emitter + prelude + tests. It's the next natural unit because the payoff is a kernel that **actually moves data** past region 0.
+Concretely one commit drops the trap for `cp_async_128`, a second does `stg_128`, a third does TMA (which needs an extra `CUtensorMap*` descriptor threaded as a kernel param). Each commit is mechanical once the address-expression refactor lands.
+
+Expected LOC: 200-300 for the address refactor + 100 per real-PTX helper. Test churn is moderate — every snapshot assertion that currently includes axes in the call site needs updating to the `gmem + offset` form.
+
+Edge cases to watch:
+- **Cache stores**: `generic_cache_store` (store_k_cache / store_v_cache) does a block_table gather. `AddrTerm::AxisDivGather` covers it, but the gather-table name needs to be a kernel param, not a file-scope `__device__` placeholder. See item 6 below — ambient-scalar plumbing lands alongside this naturally.
+- **Embedding**: `embed_gather` uses `token_ids[row]` as an indirection. The load targets `Embed_frag` (a register, not a smem local — per the current template), so `cp_async_128` is semantically wrong there. Fix: add a `smem_embed` staging buffer to `embed_region`'s `tile_consts` + `local_refs("load_embed_row")`, and lower `embed_gather` through the normal smem staging path.
 
 ### All remaining items
 

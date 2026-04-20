@@ -817,69 +817,66 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
-**FP8 Slice-1 (dynamic per-tensor) AND Slice-2 (static per-tensor)
-both land end-to-end. Coherent inference on every arch
-(qwen2, llama, qwen3, gemma2, gemma3, granite, mistral) for
-dynamic; four arches covered by goldens for static (qwen2-1.5b,
-llama-3.2-1b, gemma2-2b, mistral-7b-v0.3). The remaining three
-(qwen3-0.6b, gemma3-1b, granite-3.1-2b) have no upstream static
-FP8 checkpoints at those sizes — compiler still emits the
-variants, so any future repo dispatches automatically. Strict
-golden parity vs Python is loose: tests run at threshold=1
-(position-0 must match, decode drift accepted) because of an
-unidentified ULP-level rounding difference in the cutlass
-scaled_mm wrapper. See "FP8 Slice-1: known kernel drift" section
-below; same drift applies to Slice-2.**
+**All three FP8 correctness slices are green end-to-end. Slice-1
+(dynamic per-tensor, seven arches), Slice-2 (static per-tensor, four
+arches with upstream checkpoints), and Slice-3 (blockwise 128×128,
+Qwen3-0.6B) all produce coherent output through ferrite-forward at
+`threshold=1`. The compiler emits every combination across the seven
+FP8-enabled arches (qwen2, llama, qwen3, gemma2, gemma3, granite,
+mistral) so any future FP8 repo for one of those arches dispatches
+automatically. Thresholds stay at `1` pending the cutlass
+`kGemm` vs `kGemmSplitKParallel` fix described below.**
 
-**What landed this session (commits `63f70cf69`, `3cce87dd4`):**
-- `63f70cf69`: finished the rotary `ctx→wm` move in the three FP8
-  fused-QKV Impls (`Fp8FusedQkvRopeCacheImpl` fp8+bf16 branches,
-  `Fp8FusedQkvRopePrefillImpl`) that commit 4fb16e3fa missed.
-  Every `ferrite-model-*` crate exercising an FP8 variant was
-  unbuildable before this — check this commit FIRST if the macro
-  errors with `E0609: no field 'rotary' on type '&ForwardCtx<'_>'`.
-- `3cce87dd4`: FP8 Slice-2 (static per-tensor):
-  - `fp8-static-per-tensor.json` preset in both
-    `model_architectures/quantizations/` and
-    `vllm-rs/model_architectures/quantizations/`.
-  - Fan-out via `quantizations.json` on all seven FP8 arches.
-  - Codegen fingerprint disambiguator: static variants
-    positive-check `model.layers.0.self_attn.q_proj.input_scale`,
-    dynamic variants negative-check it (mirrors the GPTQ
-    `g_idx` desc_act pattern). Lives in `emit_fingerprint_check`.
-  - Four goldens + four `test_cuda_correctness_*_fp8_static`
-    tests at `threshold=1` — all pass.
-  - Static/dynamic share all FP8 Impls (match on
-    `StorageFormat::Fp8 { .. }` with `_` scheme). The actual
-    branch lives inside `Fp8Linear::forward` on
-    `input_scale.is_some()` — no new Impls required.
+**What landed this session (commit `9e9f0c297`):**
+- FP8 Slice-3 (blockwise 128×128) end-to-end.
+  - `model_architectures/quantizations/fp8-block-128x128.json` +
+    mirror under `vllm-rs/model_architectures/quantizations/`.
+    Ships `quant_method: "fp8"` + `weight_block_size: [128, 128]`;
+    a `compressed-tensors` repo with
+    `block_structure: [128, 128]` fingerprint-matches the same
+    preset via the existing `parse_compressed_tensors` FP8 branch.
+  - `qwen3/quantizations.json` opts in; Qwen3-0.6B/1.7B/4B/8B
+    all solve clean against the block variant.
+  - `FieldLoad::Fp8BlockLinear { prefixes }` codegen arm emits
+    `Fp8BlockLinear::{load,load_concat}(gw, prefix, __fp8_dtype)?`
+    (shares the `__fp8_dtype` prelude with per-tensor).
+  - Storage-vs-accessor admission widened:
+    `Fp8 { block_size: None }` ↔ `Fp8Linear`,
+    `Fp8 { block_size: Some(_) }` ↔ `Fp8BlockLinear` (exclusive).
+  - `block_disambiguation` fingerprint check: block positive-checks
+    `.weight_scale_inv` OR 2-D `.weight_scale` with `shape[1] > 1`;
+    per-tensor rejects either signal.
+  - The existing six `Fp8*Impl` matchers are reused — each
+    impl's `required_weights` calls new helper
+    `fp8_accessor_type_for(fuf, gemm_tile)` to pick
+    `Fp8BlockLinear` vs `Fp8Linear` at emit time. Both accessor
+    types expose identical forward signatures, so no emit_call
+    changes.
+  - `TestModels::QWEN3_0_6B_FP8_BLOCK` +
+    `test_cuda_correctness_qwen3_0_6b_fp8_block` at threshold=1;
+    golden regen via the script's auto `_fp8` branch (enforce_eager
+    + FLASHINFER backend). 8/8 prompts coherent; late-divergence
+    warnings stay within mutual top-N.
+
+**Previous session (`63f70cf69`, `3cce87dd4`): FP8 Slice-1 + Slice-2
+(per-tensor dynamic/static).** See the "FP8 Slice-1: what landed"
+section below for details; the Slice-2 preset + fingerprint
+disambiguation on `.input_scale` landed alongside it.
 
 **Open follow-up work:**
 
-0. **Remaining FP8 slices:**
-   - **Legacy quant_method-fp8 preset** (online BF16→FP8 quant at
-     load). `parse_fp8` already exists; `Fp8Linear::load` already
-     branches on dtype. Just needs a preset file + a target
-     model. Arguably redundant with Slice-1: the existing
-     `fp8-dynamic-per-tensor.json` preset already matches, and
-     any repo that ships `quant_method: "fp8"` + BF16 weights
-     would dispatch through it and hit the online-quant branch
-     of `Fp8Linear::load`. Only wire this up if a concrete repo
-     shows up that doesn't fingerprint-match today.
-   - **Slice 3 — FP8 128×128 blockwise.** Distinct kernel path
-     (`cutlass_scaled_mm_blockwise`). Needs
-     `fp8-block-128x128.json` preset + `FieldLoad::Fp8BlockLinear
-     { prefixes, block_size }` codegen arm +
-     `Fp8BlockGemmImpl` singleton + its fused peers.
-     `Fp8BlockLinear::{load, load_concat}` already in
-     `ferrite-kernels::layers_quant`; parser already emits
-     `StorageFormat::Fp8 { block_size: Some([128, 128]), .. }`.
-     Fingerprint disambiguator will need a third arm keying off
-     the 2-D `.weight_scale_inv` shape (block scales are
-     `[ceil(N/128), ceil(K/128)]` vs per-tensor `[1]` vs
-     per-channel `[N, 1]`). Target: small DeepSeek-V2-Lite or
-     similar with `weight_block_size: [128, 128]` in
-     `quantization_config`.
+0. **FP8 perf follow-ups (not correctness).**
+   - `Fp8BlockLinear::forward` currently dequantizes FP8→BF16 per
+     block then does cuBLAS GEMM. Correctness-complete but slower
+     than a native block-scaled FP8 kernel. Port CUTLASS
+     `cutlass_scaled_mm_blockwise` or deep_gemm (Hopper+) from
+     `vllm/csrc/quantization/cutlass_w8a8/` to close the gap.
+   - **Legacy `quant_method: "fp8"` preset** (online BF16→FP8 at
+     load). `parse_fp8` + `Fp8Linear::load` already handle it; a
+     BF16 repo shipping `quant_method: "fp8"` would dispatch via
+     the existing `fp8-dynamic-per-tensor` preset today.
+     Wire up a dedicated preset only if a concrete repo shows up
+     that doesn't fingerprint-match.
 
 1. **Identify and fix the cutlass `kGemm` vs `kGemmSplitKParallel`
    mismatch.** vllm uses `kGemmSplitKParallel` with `split_k_factor=1`.

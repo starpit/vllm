@@ -265,23 +265,35 @@ ff2's `emit_kittens.rs` / `emit_mega.rs` get ported to consume v2 Regions. Most 
 
 Each step leaves the codebase correct and buildable. Parallel old/new paths during migration.
 
-1. **Extract `ferrite-stencil-ir` crate** — IR types only (`Axis`, `Domain`, `Node`, `Edge`, `Region`, `RegionGraph`). Reuse ff2 shapes where they apply, drop megakernel-emitter code. Zero behavior change. `~1 day`.
+1. ✅ **Extract `ferrite-stencil-ir` crate** — IR types only (`Axis`, `Domain`, `Node`, `Edge`, `Region`, `RegionGraph`). Reuse ff2 shapes where they apply, drop megakernel-emitter code. Zero behavior change. *Landed 2026-04-20 (commit `aef01d8ca`).*
 
-2. **Sub-tiling pass** — walks FUF, annotates each op with its axis set + dep vectors per §5. Prints the sub-tiled graph for inspection. No consumers yet — pure augmentation of FUF. `~3-5 days`.
+2. ✅ **Sub-tiling pass** — walks FUF, annotates each op with its axis set + dep vectors per §5. Prints the sub-tiled graph for inspection. No consumers yet — pure augmentation of FUF. *Landed 2026-04-20 (commit `aef01d8ca`). Module: `ferrite-forward-macro/src/subtile.rs`. 8 unit tests.*
 
-3. **Region formation** — after the existing solver picks Impls, group into Regions per §6.1. Emit `RegionGraph` struct. Again: no consumers yet; diff the Region count vs per-layer-subgraph count to verify Region formation is correct. `~2-3 days`.
+3. ✅ **Region formation** — after the existing solver picks Impls, group into Regions per §6.1. Emit `RegionGraph` struct. Again: no consumers yet; diff the Region count vs per-layer-subgraph count to verify Region formation is correct. *Landed 2026-04-20 (commit `aef01d8ca`). Module: `ferrite-forward-macro/src/region_formation.rs`. 4 unit tests.*
 
-4. **Periodicity detection + literal lifting** — implement §6.2. Detect repeat groups; verify on llama, qwen2, qwen3, mistral, phi3. Log detected period length and compare to `num_hidden_layers`. `~3-5 days`.
+4. ✅ **Periodicity detection — measurement.** Canonical-hash + group regions; build a CollapsePlan describing what a post-collapse graph would look like. *Landed 2026-04-20 (commit `aef01d8ca`). Modules: `periodicity.rs` + `periodicity_plan.rs`. 8 unit tests. **Literal lifting not yet needed** — today's Region nodes carry only op tags + roles; no per-layer literals bake in until codegen hangs addresses or entry scalars off the IR.*
 
-5. **Solver pivot** — behind feature flag per §7. A/B against existing solver. Promote when clean. `~3-5 days`.
+   Measured on real llama FUFs:
 
-6. **Rust codegen pivot** — replace today's `codegen::emit_model` with a Region-driven emitter. One fragment body per (Region, Impl); call sites wrap in outer iteration loops. Verify with `vllm chat` on one model per arch family. `~1 week`.
+   | Model | Layers | Regions | Classes | Collapse | Control edges |
+   |---|---|---|---|---|---|
+   | llama-2-7b  | 32 | 227 | 8 | **28.4×** | 290 → 10 |
+   | llama-2-13b | 40 | 283 | 8 | **35.4×** | 362 → 10 |
+   | llama-2-70b | 80 | 563 | 8 | **70.4×** | 722 → 10 |
 
-7. **Delete the old path** — once every architecture runs through the new emitter and passes golden tests.
+5. ✅ **Class → Impl consistency checker.** Confirms the load-bearing invariant for codegen: every Region in a periodic class picks the same solver Impl. *Landed 2026-04-20 (commit `420a71690`). Module: `class_impl.rs`. 3 unit tests. `form_regions` now returns `FormedRegions { graph, region_subgraphs }`.*
 
-8. **(Deferred)** Port ff2's megakernel emitter to consume v2 Regions. Not on critical path of the compile-time fix.
+   **Real-FUF result**: all llama variants clean. **23 of 218 non-llama variants flag heterogeneous impls** (1–2 classes each, patterns like `[ImplId(3), ImplId(37)]` repeating). See §13 for follow-up.
 
-Total critical path: ~3-4 weeks of focused work for a ~10–30× compile-time speedup. Everything afterward (step 8) is pure upside.
+   Note: the "solver pivot" in §7 turned out to be a verification problem, not a search re-architecture. Today's solver already picks Impls per-subgraph and the question is whether those picks are class-uniform. They mostly are; a few edge cases (§13) need either solver constraint or codegen tolerance.
+
+6. ⏳ **Rust codegen pivot** — replace today's `codegen::emit_model` with a Region-driven emitter. One fragment body per (Region, Impl); call sites wrap in outer iteration loops. Verify with `vllm chat` on one model per arch family. **This is where the compile-time win lands on-disk.** Depends on step 5's invariant — either restrict codegen to the consistent variants or tolerate heterogeneity (see §13).
+
+7. ⏳ **Delete the old path** — once every architecture runs through the new emitter and passes golden tests.
+
+8. ⏳ **(Deferred)** Port ff2's megakernel emitter to consume v2 Regions. Not on critical path of the compile-time fix.
+
+Critical-path remaining: step 6 (~1 week) + step 7 (~2 days) = ~1.5 weeks for the ~10–30× compile-time speedup. Step 8 is pure upside.
 
 ## 10. Open questions
 
@@ -311,3 +323,50 @@ Red flags that would tell us this refactor is the wrong move:
 - Rust codegen with outer loops produces runtime regressions vs unrolled bodies (means LLVM can't vectorize / const-prop through the loop as well as it did through unrolling). *Measurable via nsys on one model*.
 
 None of these are show-stoppers without investigation, but each is worth measuring at the relevant staging step rather than discovering at integration.
+
+## 13. Status & handoff (2026-04-20)
+
+**Branch**: `worktree-ff3`. Two commits on top of `0ab1aad98`:
+- `aef01d8ca` — IR + subtile + region_formation + periodicity + CollapsePlan
+- `420a71690` — class→impl consistency checker + FormedRegions refactor
+
+**What builds**: everything. `cargo build -p ferrite-models --release` exercises all 218 model variants through the full pipeline. Stencil diagnostic prints alongside each variant's ferrite line (see "stencil · N regions → N classes" entries).
+
+**Code map**:
+- `vllm-rs/crates/ferrite-stencil-ir/` — IR types. 249 lines. Lowering-agnostic (the name).
+- `vllm-rs/crates/ferrite-forward-macro/src/subtile.rs` — FUF → tile-parametric annotation. Axis vocabulary + per-op rules + Gemm role inference.
+- `.../src/region_formation.rs` — subgraphs → Regions + control edges. Emits `FormedRegions { graph, region_subgraphs }`.
+- `.../src/periodicity.rs` — canonical hashing + class grouping + summary stats.
+- `.../src/periodicity_plan.rs` — measured post-collapse shape (`CollapsePlan`).
+- `.../src/class_impl.rs` — class→Impl consistency check, strict + tolerant resolvers.
+- `.../src/lib.rs` — pipeline wired into the macro drive (search for `stencil ·`). Diagnostic only; does not affect emitted code.
+
+**Test coverage**: 162 unit tests total across the crate; 23 new ones cover the stencil pipeline. All pass. `cargo clippy --all-targets -- -D warnings` clean.
+
+### Open items for the next session
+
+**(A) Investigate the 23 heterogeneous-impl variants.** Likely one structural cause. Suspects:
+- Gemma3 alternates local (sliding) / global attention per layer — but subtile.rs gives `SlidingAttention` a different OpKind tag than `Attention`, so they *should* land in different classes. Worth confirming the canonical hash actually distinguishes them on real Gemma3 FUFs.
+- Qwen3's first-layer QK-norm inserts reshape tiles that might make layer-0's attention Region differ structurally from layer-1+. If so, layer-0 is its own class (period 1) and layer-1+ is another class (period N-1) — *already consistent*, not a real problem.
+- Some prefill vs decode split that I'm only seeing because I picked `sfufs.per_workload.iter().next()` nondeterministically.
+
+Quick path: print a heterogeneous variant's per-class op-tag sequence + member RegionIds + per-member ImplIds. One variant should expose the pattern.
+
+**(B) Step 6 — Rust codegen pivot.** Biggest work item. Structure:
+1. Move fragment emission to be class-indexed rather than subgraph-indexed. Today `codegen.rs::emit_model`'s `FragmentLibrary` dedups by stringified abstract body; post-pivot, dedup happens structurally at Region-formation time via `canonical_hash`. The library keying changes from string → `class_idx`.
+2. Emit one fragment body per (class, workload_point, Impl). Call site wraps in `for _repeat in 0..PERIOD { ... }` over the class's period.
+3. Per-iteration state (layer index, kv_cache slot) needs to flow as a loop variable into the fragment. **This is where §6.2 "literal lifting" becomes real** — the Impl's `emit_call` must replace baked layer literals with the loop variable. Bounded to 3–5 impls (`FusedQkvRope*`, `AttentionViaCache*`, `RopeAppendRef*`, `SlidingAttention*`).
+
+Suggested approach: keep today's unrolled emitter as the default; gate the pivot behind `--cfg stencil_codegen` or an env var so A/B comparison is easy. Land per-family: do llama first (all variants clean per step 5), validate with `vllm chat`, then extend to archs that pass consistency, tackle heterogeneous ones last.
+
+**(C) Delete the per-subgraph fragment dedup string machinery** once step 6 is confirmed. `FragmentLibrary::by_sig` keyed on `"ti=...|ci=...|wt=...|body=..."` becomes redundant — the new `class_idx` is the dedup key.
+
+### Red flags to watch for
+
+- If the class-consistent subset (currently 195 variants) ships before all 218, the emitter needs to fall back to the old per-subgraph path for the stragglers. Don't let the code duplicate emit logic across two passes — parameterize one emitter over "per-class vs per-subgraph."
+- Runtime perf — if codegen can no longer bake the layer index as a literal, `ctx.kv_cache.k_cache(layer)` becomes an indirect indexed fetch. Trivial cost next to kernel launch latency, but measure once on llama-2-7b via `vllm bench latency` before calling it done.
+- `vllm chat` (with `timeout`, per your memory) is the correctness gate. Type checks and unit tests don't prove inference correctness.
+
+### If the scope feels wrong
+
+The measurements in step 4's table are the anchor. Any time compile time feels intractable again, check whether the regression is from reintroducing per-layer work (unrolling, per-layer literals in abstract bodies, per-layer fragment keys) or from somewhere else. The refactor is only valuable if the N_layers factor stays collapsed.

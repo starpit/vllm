@@ -8191,7 +8191,7 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        wm.rotary.cos_sin_cache,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -8208,7 +8208,7 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        wm.rotary.cos_sin_cache,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -8351,7 +8351,7 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
                 ::ferrite_kernels::kernels::fused_qkv_rope(
                     *qkv_packed,
                     *ctx.positions,
-                    ctx.rotary.cos_sin_cache,
+                    wm.rotary.cos_sin_cache,
                     #q_size,
                     #kv_size,
                     #num_q_heads,

@@ -348,6 +348,21 @@ pub struct WeightAccessor {
     /// weight object with the declared `rust_type` that stands in
     /// for the listed sources.
     pub source_weights: Vec<(WeightId, Option<u64>)>,
+    /// `Some((stem, idx))` marks this accessor as a per-iteration
+    /// member of a family identified by `stem`. The per-layer
+    /// `emit_weights_struct` pass collapses every accessor sharing
+    /// a `stem` (with matching type + FieldLoad shape, consecutive
+    /// indices from 0) into a single `pub #stem: [#ty; N]` array
+    /// field. Read sites then emit `wm.#stem[#idx]` instead of
+    /// `wm.#stem_#idx`. `None` → stays a flat field.
+    ///
+    /// Populated by `default_required_weights` when the single
+    /// source weight carries a `Some(index)`. Fused impls that
+    /// declare their own accessors through a custom
+    /// `required_weights` typically leave this `None` (the fused
+    /// ident is stable across layers only in the `_<idx>` suffix,
+    /// not as a clean stem).
+    pub family: Option<(syn::Ident, u64)>,
 }
 
 impl fmt::Debug for WeightAccessor {
@@ -356,6 +371,10 @@ impl fmt::Debug for WeightAccessor {
             .field("name", &self.name.to_string())
             .field("rust_type", &self.rust_type.to_string())
             .field("source_weights", &self.source_weights)
+            .field(
+                "family",
+                &self.family.as_ref().map(|(s, i)| (s.to_string(), *i)),
+            )
             .finish()
     }
 }
@@ -382,10 +401,12 @@ pub fn default_required_weights(
                 if !seen.insert(name.to_string()) {
                     continue;
                 }
+                let family = index.map(|i| (weight_field_name(program, *id, None), i));
                 out.push(WeightAccessor {
                     name,
                     rust_type: rust_type_for_weight_consumed_by(node.op),
                     source_weights: vec![(*id, *index)],
+                    family,
                 });
             }
         }
@@ -1631,6 +1652,7 @@ impl Implementation for FusedGemmBiasImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -2015,6 +2037,7 @@ impl Implementation for FusedGateUpSiluMulImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -2431,6 +2454,7 @@ impl Implementation for FusedGateUpGeluMulImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -3328,6 +3352,7 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
             source_weights: vec![(weight_id, weight_idx)],
+            family: weight_idx.map(|i| (weight_field_name(program, weight_id, None), i)),
         }]
     }
 
@@ -3597,6 +3622,7 @@ impl Implementation for ScalarOffsetRmsNormImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
             source_weights: vec![(weight_id, weight_idx)],
+            family: weight_idx.map(|i| (weight_field_name(program, weight_id, None), i)),
         }]
     }
 
@@ -4011,6 +4037,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -4627,6 +4654,7 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
                 name,
                 rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
                 source_weights: vec![(wid, widx)],
+                family: widx.map(|i| (weight_field_name(program, wid, None), i)),
             });
         }
 
@@ -4671,6 +4699,7 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
                 name,
                 rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
                 source_weights: vec![(weight_id, weight_idx)],
+                family: weight_idx.map(|i| (weight_field_name(program, weight_id, None), i)),
             });
         }
 
@@ -6829,6 +6858,7 @@ impl Implementation for MarlinGemmImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
             source_weights: vec![(wid, index)],
+            family: index.map(|i| (weight_field_name(program, wid, None), i)),
         }]
     }
 
@@ -6962,6 +6992,7 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -7130,6 +7161,7 @@ impl Implementation for MarlinFusedGateUpGeluMulImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -7361,6 +7393,7 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -7732,6 +7765,7 @@ impl Implementation for Bnb4GemmImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
             source_weights: vec![(wid, index)],
+            family: index.map(|i| (weight_field_name(program, wid, None), i)),
         }]
     }
 
@@ -7839,6 +7873,7 @@ impl Implementation for Fp8GemmImpl {
             name,
             rust_type,
             source_weights: vec![(wid, index)],
+            family: index.map(|i| (weight_field_name(program, wid, None), i)),
         }]
     }
 
@@ -7978,6 +8013,7 @@ impl Implementation for Fp8FusedGemmBiasImpl {
             name,
             rust_type,
             source_weights: vec![(wid, index)],
+            family: index.map(|i| (weight_field_name(program, wid, None), i)),
         }]
     }
 
@@ -8123,6 +8159,7 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
             name,
             rust_type,
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -8283,6 +8320,7 @@ impl Implementation for Bnb4FusedGateUpSiluMulImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -8440,6 +8478,7 @@ impl Implementation for Bnb4FusedGateUpGeluMulImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -8603,6 +8642,7 @@ impl Implementation for Fp8FusedGateUpGeluMulImpl {
             name,
             rust_type,
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -8835,6 +8875,7 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
             name,
             rust_type,
             source_weights: sources,
+            family: None,
         }]
     }
 
@@ -9248,6 +9289,7 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
             source_weights: sources,
+            family: None,
         }]
     }
 

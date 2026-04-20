@@ -1063,10 +1063,10 @@ fn emit_weights_struct(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     mode: WeightsEmitMode<'_>,
-) -> TokenStream {
+) -> (TokenStream, crate::emit::WeightLayout) {
     let accessors = match collect_accessors(program, fuf, sfufs, lib) {
         Ok(a) => a,
-        Err(err) => return err,
+        Err(err) => return (err, crate::emit::WeightLayout::new()),
     };
 
     // Storage-format guard: a given accessor's `rust_type` must be
@@ -1159,16 +1159,129 @@ fn emit_weights_struct(
                     stem = model.source_stem,
                     name = a.name,
                 );
-                return quote! { compile_error!(#msg); };
+                return (
+                    quote! { compile_error!(#msg); },
+                    crate::emit::WeightLayout::new(),
+                );
             }
         }
     }
 
-    let fields = accessors.iter().map(|a| {
-        let name = &a.name;
-        let ty = &a.rust_type;
-        quote! { pub #name: #ty, }
-    });
+    // Detect array-collapsible families. Two accessors are in the
+    // same family iff they share a `family.stem`, their `rust_type`
+    // stringifies the same, AND their `FieldLoad` plan shares a
+    // std::mem::discriminant. A family qualifies for array collapse
+    // only when its members' `family.idx` values form exactly
+    // `0..N` for some `N` ≥ 1 — any gap or duplicate falls back to
+    // flat fields. `plans` is computed a few lines below, so we do
+    // detection in two stages: first partition by stem+type, then
+    // (after `plans`) filter on discriminant uniformity + index
+    // coverage.
+    let plans_for_family: Vec<FieldLoad> = accessors
+        .iter()
+        .map(|a| plan_field_load(a, program, fuf, model, manifest))
+        .collect();
+
+    // `family_of[i] = Some(group_idx)` when accessor i participates
+    // in a qualifying family; None means "stays a flat field".
+    let mut family_groups: Vec<WeightFamilyGroup> = Vec::new();
+    let mut family_of: Vec<Option<usize>> = vec![None; accessors.len()];
+    {
+        // Group accessor indices by their declared family stem.
+        let mut by_stem: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, a) in accessors.iter().enumerate() {
+            if let Some((stem, _)) = &a.family {
+                by_stem.entry(stem.to_string()).or_default().push(i);
+            }
+        }
+        for (stem_str, indices) in by_stem {
+            if indices.len() < 2 {
+                continue;
+            }
+            let first = &accessors[indices[0]];
+            let first_ty = first.rust_type.to_string();
+            let first_disc = std::mem::discriminant(&plans_for_family[indices[0]]);
+            let type_ok = indices
+                .iter()
+                .all(|&i| accessors[i].rust_type.to_string() == first_ty);
+            let disc_ok = indices
+                .iter()
+                .all(|&i| std::mem::discriminant(&plans_for_family[i]) == first_disc);
+            if !type_ok || !disc_ok {
+                continue;
+            }
+            // Collect (idx, accessor_pos) pairs, sort by idx,
+            // require the idx sequence == 0..len.
+            let mut pairs: Vec<(u64, usize)> = indices
+                .iter()
+                .map(|&i| (accessors[i].family.as_ref().unwrap().1, i))
+                .collect();
+            pairs.sort_by_key(|(idx, _)| *idx);
+            let consecutive = pairs
+                .iter()
+                .enumerate()
+                .all(|(k, (idx, _))| *idx as usize == k);
+            if !consecutive {
+                continue;
+            }
+            let group_idx = family_groups.len();
+            let members_accessor_positions: Vec<usize> =
+                pairs.iter().map(|(_, pos)| *pos).collect();
+            for &pos in &members_accessor_positions {
+                family_of[pos] = Some(group_idx);
+            }
+            let stem_ident = first.family.as_ref().unwrap().0.clone();
+            family_groups.push(WeightFamilyGroup {
+                stem: stem_ident,
+                rust_type: first.rust_type.clone(),
+                len: members_accessor_positions.len(),
+                member_accessor_positions: members_accessor_positions,
+                _stem_str: stem_str,
+            });
+        }
+    }
+
+    // Build the read-rewrite layout: family members map to
+    // `#stem[#idx usize]`; orphans are absent (caller falls back
+    // to the flat ident).
+    let mut weight_layout = crate::emit::WeightLayout::new();
+    for group in &family_groups {
+        let stem = &group.stem;
+        for (idx_in_group, &acc_pos) in group.member_accessor_positions.iter().enumerate() {
+            let flat_name = accessors[acc_pos].name.to_string();
+            let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx_in_group);
+            weight_layout.insert_array_access(&flat_name, quote! { #stem[#idx_lit] });
+        }
+    }
+
+    // Emit struct fields: one `pub #stem: [#ty; N]` per family
+    // group, one `pub #name: #ty` per orphan. Orphans keep their
+    // ordering relative to `accessors`; families emit once at
+    // their first member's position so deterministic struct order
+    // is preserved across rebuilds.
+    let mut emitted_family: Vec<bool> = vec![false; family_groups.len()];
+    let mut fields_vec: Vec<TokenStream> = Vec::with_capacity(accessors.len());
+    for (i, a) in accessors.iter().enumerate() {
+        match family_of[i] {
+            Some(g) => {
+                if !emitted_family[g] {
+                    emitted_family[g] = true;
+                    let group = &family_groups[g];
+                    let stem = &group.stem;
+                    let ty = &group.rust_type;
+                    let n = group.len;
+                    let n_lit = proc_macro2::Literal::usize_unsuffixed(n);
+                    fields_vec.push(quote! { pub #stem: [#ty; #n_lit], });
+                }
+            }
+            None => {
+                let name = &a.name;
+                let ty = &a.rust_type;
+                fields_vec.push(quote! { pub #name: #ty, });
+            }
+        }
+    }
+    let fields = fields_vec.iter();
 
     // Emit each field as its own let-binding in the load body.
     // This lets later loaders reference earlier ones (e.g. a tied
@@ -1177,10 +1290,7 @@ fn emit_weights_struct(
     // matters. `accessors` iterates BTreeMap-sorted — which puts
     // `embed_tokens` before `lm_head` alphabetically, so the tied
     // case works without a special sort.
-    let plans: Vec<FieldLoad> = accessors
-        .iter()
-        .map(|a| plan_field_load(a, program, fuf, model, manifest))
-        .collect();
+    let plans = plans_for_family;
     let any_marlin = plans
         .iter()
         .any(|p| matches!(p, FieldLoad::MarlinLinear { .. }));
@@ -1527,9 +1637,42 @@ fn emit_weights_struct(
         }
     };
 
-    // `Self { a, b, c }` shorthand — fields are the just-bound
-    // locals, in the same order we declared the struct fields.
-    let field_shorthand: Vec<&syn::Ident> = accessors.iter().map(|a| &a.name).collect();
+    // Array-assembly prelude: for each family group, consume the
+    // per-layer `let #member_flat_name = ...` bindings produced by
+    // `lets` into a `let #stem = [#m0, #m1, …, #m_{N-1}];` array
+    // binding. Placed between `lets` and the `Self { .. }`
+    // constructor so the constructor can reference `#stem` via
+    // shorthand without also carrying the flat names.
+    let family_array_assemblies: Vec<TokenStream> = family_groups
+        .iter()
+        .map(|group| {
+            let stem = &group.stem;
+            let member_idents: Vec<&syn::Ident> = group
+                .member_accessor_positions
+                .iter()
+                .map(|&i| &accessors[i].name)
+                .collect();
+            quote! { let #stem = [ #(#member_idents),* ]; }
+        })
+        .collect();
+
+    // `Self { … }` shorthand — one entry per array family (using
+    // the family stem) plus one per orphan (using the flat name),
+    // emitted in `accessors` order so the struct definition and
+    // the constructor stay in lockstep.
+    let mut seen_family: Vec<bool> = vec![false; family_groups.len()];
+    let field_shorthand: Vec<syn::Ident> = accessors
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| match family_of[i] {
+            Some(g) if !seen_family[g] => {
+                seen_family[g] = true;
+                Some(family_groups[g].stem.clone())
+            }
+            Some(_) => None,
+            None => Some(a.name.clone()),
+        })
+        .collect();
     let fingerprint_method = emit_fingerprint_check(model, manifest);
 
     // Detect whether this arch uses `rotary_local` (dual-rotary,
@@ -1847,7 +1990,7 @@ fn emit_weights_struct(
     // shim's one-line delegation body, so the expensive load
     // compile work (N_layers × N_accessors lines) runs ONCE per
     // equivalence class.
-    match &mode {
+    let tokens = match &mode {
         WeightsEmitMode::Canonical => quote! {
             #weights_def
 
@@ -1873,6 +2016,7 @@ fn emit_weights_struct(
                 #bnb4_prelude
                 #fp8_prelude
                 #(#lets)*
+                #(#family_array_assemblies)*
                 #rotary_load
                 #rotary_local_load
                 Ok(#weights_ctor {
@@ -1919,7 +2063,30 @@ fn emit_weights_struct(
                 super::#canonical::load_with(gw, stream, max_model_len, #marlin_fmt)
             }
         },
-    }
+    };
+    (tokens, weight_layout)
+}
+
+/// A set of accessors whose flat fields `<stem>_<0..N>` collapse
+/// to one `pub #stem: [#ty; N]` array field on the emitted
+/// `Weights` struct. Detected by
+/// [`emit_weights_struct`]'s family-partitioning pass using each
+/// accessor's `family` tag plus type/`FieldLoad`-discriminant
+/// uniformity; read sites consult the accompanying
+/// [`WeightLayout`](crate::emit::WeightLayout) to rewrite
+/// `wm.<flat_name>` into `wm.<stem>[<idx>]`.
+struct WeightFamilyGroup {
+    stem: syn::Ident,
+    rust_type: TokenStream,
+    len: usize,
+    /// Positions into the shared `accessors` Vec, sorted by
+    /// `family.idx` so array assembly order is deterministic and
+    /// `layout[member_i] = #stem[#i]` matches.
+    member_accessor_positions: Vec<usize>,
+    /// Kept for debug-print/diag purposes only; the stem ident is
+    /// the authoritative form used in emitted code.
+    #[allow(dead_code)]
+    _stem_str: String,
 }
 
 /// Emit the `MarlinFormat` const this variant's `load` passes into
@@ -2303,6 +2470,7 @@ fn emit_subgraph(
     locals: &LocalMap,
     library: &mut FragmentLibrary,
     _stencil: &StencilBundle,
+    weight_layout: &crate::emit::WeightLayout,
 ) -> TokenStream {
     let imp = lib.get(imp_id);
     let claimed = sfuf.tiles_in_subgraph(sg);
@@ -2316,6 +2484,7 @@ fn emit_subgraph(
             claimed_tiles: &claimed,
             locals,
             mode: EmitMode::Concrete,
+            weight_layout: Some(weight_layout),
         };
         return imp.emit_call(&ctx);
     }
@@ -2400,6 +2569,12 @@ fn emit_subgraph(
             weight_params,
             weight_params_by_name,
         },
+        // Abstract mode short-circuits weight reads through the
+        // fragment's `w_N` params before the layout is ever
+        // consulted, so the layout is functionally unused here.
+        // Still thread it for symmetry with Concrete and to keep
+        // future fragment-local rewrites straightforward.
+        weight_layout: Some(weight_layout),
     };
     let abstract_body = imp.emit_call(&abstract_ctx);
 
@@ -2509,8 +2684,8 @@ fn emit_subgraph(
     let weight_args: Vec<TokenStream> = accessors
         .iter()
         .map(|acc| {
-            let name = &acc.name;
-            quote! { &wm.#name }
+            let access = weight_layout.access_tokens(&acc.name);
+            quote! { &wm.#access }
         })
         .collect();
 
@@ -2553,6 +2728,7 @@ fn emit_wave_walk(
     protected: &HashSet<(TileId, u8)>,
     library: &mut FragmentLibrary,
     stencil: &StencilBundle,
+    weight_layout: &crate::emit::WeightLayout,
 ) -> Vec<TokenStream> {
     let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, skip_subgraph, protected);
     let mut body: Vec<TokenStream> = Vec::new();
@@ -2562,7 +2738,17 @@ fn emit_wave_walk(
                 continue;
             }
             body.push(emit_subgraph(
-                fuf, sfuf, program, model, lib, *sg, *imp_id, locals, library, stencil,
+                fuf,
+                sfuf,
+                program,
+                model,
+                lib,
+                *sg,
+                *imp_id,
+                locals,
+                library,
+                stencil,
+                weight_layout,
             ));
             if let Some(owners) = drops.get(sg) {
                 for (t, s) in owners {
@@ -2597,6 +2783,7 @@ fn emit_forward_for_bucket(
     lib: &ImplementationLibrary,
     wp: crate::solver::WorkloadPoint,
     library: &mut FragmentLibrary,
+    weight_layout: &crate::emit::WeightLayout,
 ) -> TokenStream {
     let locals = build_local_map(fuf);
 
@@ -2608,7 +2795,18 @@ fn emit_forward_for_bucket(
     }
     let stencil = StencilBundle::compute(fuf, sfuf);
     let body = emit_wave_walk(
-        fuf, sfuf, loop_ir, program, model, lib, &locals, None, &protected, library, &stencil,
+        fuf,
+        sfuf,
+        loop_ir,
+        program,
+        model,
+        lib,
+        &locals,
+        None,
+        &protected,
+        library,
+        &stencil,
+        weight_layout,
     );
 
     // The forward's return value: the last tile's output.
@@ -2668,6 +2866,7 @@ fn emit_forward_backbone_for_bucket(
     lib: &ImplementationLibrary,
     wp: crate::solver::WorkloadPoint,
     library: &mut FragmentLibrary,
+    weight_layout: &crate::emit::WeightLayout,
 ) -> TokenStream {
     let locals = build_local_map(fuf);
 
@@ -2714,6 +2913,7 @@ fn emit_forward_backbone_for_bucket(
         &protected,
         library,
         &stencil,
+        weight_layout,
     );
 
     let fn_name = bucket_fn_ident("forward_backbone_m", wp);
@@ -2808,7 +3008,7 @@ pub fn emit_model(
     if let Some(canonical) = canonical_override {
         return emit_shim_model(program, fuf, sfufs, lib, model, manifest, canonical);
     }
-    let weights = emit_weights_struct(
+    let (weights, weight_layout) = emit_weights_struct(
         program,
         fuf,
         sfufs,
@@ -2869,6 +3069,7 @@ pub fn emit_model(
                 lib,
                 *wp,
                 &mut fragment_library,
+                &weight_layout,
             ));
             backbone_fns.push(emit_forward_backbone_for_bucket(
                 fuf,
@@ -2879,6 +3080,7 @@ pub fn emit_model(
                 lib,
                 *wp,
                 &mut fragment_library,
+                &weight_layout,
             ));
         } else {
             let fwd_name = bucket_fn_ident("forward_m", *wp);
@@ -3114,7 +3316,7 @@ fn emit_shim_model(
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical: &Ident,
 ) -> TokenStream {
-    let weights = emit_weights_struct(
+    let (weights, _weight_layout) = emit_weights_struct(
         program,
         fuf,
         sfufs,

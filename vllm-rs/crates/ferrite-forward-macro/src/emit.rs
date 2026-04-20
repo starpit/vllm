@@ -107,6 +107,13 @@ pub struct EmitCtx<'a> {
     /// Defaults to Concrete when `EmitCtx` is built via the old
     /// field-literal style.
     pub mode: EmitMode,
+    /// Per-model rewrite map for `wm.<field>` access expressions —
+    /// `None` means "every accessor is a flat field" (today's
+    /// pre-6.1 behavior). `Some(..)` means the emitter may have
+    /// collapsed some accessors into `[T; N]` array fields on
+    /// `Weights`, and read sites must consult the layout to pick
+    /// the right access form.
+    pub weight_layout: Option<&'a WeightLayout>,
 }
 
 impl<'a> EmitCtx<'a> {
@@ -150,8 +157,14 @@ impl<'a> EmitCtx<'a> {
         // Field access on the emitted `Weights` struct. No trait
         // indirection — the compiler generates both the struct
         // definition and the `Weights::load` method, so the caller
-        // never writes weight-bookkeeping code.
-        quote! { wm.#name }
+        // never writes weight-bookkeeping code. Consult the layout
+        // to pick array-indexed access for accessors folded into
+        // family fields; orphans fall back to the flat ident.
+        let access = match self.weight_layout {
+            Some(layout) => layout.access_tokens(name),
+            None => quote! { #name },
+        };
+        quote! { wm.#access }
     }
 
     /// Read a model-wide integer bound (e.g. `intermediate_size`,
@@ -278,7 +291,11 @@ impl<'a> EmitCtx<'a> {
                     return quote! { #param };
                 }
                 let name = weight_field_name(self.program, *id, *index);
-                quote! { wm.#name }
+                let access = match self.weight_layout {
+                    Some(layout) => layout.access_tokens(&name),
+                    None => quote! { #name },
+                };
+                quote! { wm.#access }
             }
             FufInput::Extern { kind, .. } => match kind {
                 ExternKind::InputIds => quote! { ctx.input_ids },
@@ -339,4 +356,46 @@ pub fn weight_field_name(program: &Program, id: WeightId, index: Option<u64>) ->
         None => stem,
     };
     format_ident!("{}", ident)
+}
+
+/// Per-model lookup mapping each emitted accessor's flat name
+/// (e.g. `self_attn_q_proj_3`) to the Rust expression that reads
+/// it off the `Weights` struct — either the flat ident (today's
+/// default) or an array-indexed access (`self_attn_q_proj[3usize]`)
+/// when the accessor belongs to a family that
+/// [`emit_weights_struct`](crate::codegen) collapsed into a
+/// single `pub #stem: [#ty; N]` field.
+///
+/// Callers splat the returned tokens after `wm.` — they never see
+/// the leading `wm.` themselves, so the same helper works for
+/// both the outer `Weights` struct and any future fragment-local
+/// references.
+#[derive(Default, Debug, Clone)]
+pub struct WeightLayout {
+    /// Flat accessor name → field-access postfix tokens. Missing key
+    /// means "use the flat ident verbatim"; the lookup helpers
+    /// synthesize that fallback.
+    access: HashMap<String, TokenStream>,
+}
+
+impl WeightLayout {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `flat_name` should be rewritten to `postfix`
+    /// (e.g. `self_attn_q_proj[3usize]`) at every read site.
+    pub fn insert_array_access(&mut self, flat_name: &str, postfix: TokenStream) {
+        self.access.insert(flat_name.to_string(), postfix);
+    }
+
+    /// Tokens to splat after `wm.` to access `flat_name`. Falls
+    /// back to the bare flat ident when no array rewrite was
+    /// recorded — preserves today's behavior for orphans.
+    pub fn access_tokens(&self, flat_name: &syn::Ident) -> TokenStream {
+        if let Some(tokens) = self.access.get(&flat_name.to_string()) {
+            return tokens.clone();
+        }
+        quote! { #flat_name }
+    }
 }

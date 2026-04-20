@@ -2158,6 +2158,85 @@ impl FragmentLibrary {
     }
 }
 
+/// Per-workload stencil analysis — the class-structure view of the
+/// SFUF that the Rust codegen pivot (STENCIL_IR_V2_DESIGN.md §8.1)
+/// consumes.
+///
+/// One bundle per workload bucket. Carries enough to rewrite
+/// per-subgraph emission into per-class emission:
+/// - `class_of`: SubgraphId → class_idx, so `emit_subgraph` can look
+///   up its class in O(1).
+/// - `class_impl_id`: class_idx → `Some(impl_id)` when every member
+///   of the class picked the same impl (homogeneous — the codegen
+///   pivot collapses to one fragment + loop); `None` when impls
+///   differ (heterogeneous — Qwen3 A.2 case, falls back to
+///   per-subgraph emission).
+/// - `class_members`: class_idx → `Vec<SubgraphId>` in period order,
+///   source of the loop bound and per-iteration state (layer index,
+///   kv_cache slot).
+///
+/// Computed but not yet consumed — plumbing first (task 1 of
+/// STENCIL_IR_V2_DESIGN.md §9 step 6). The downstream emission
+/// rewrites (tasks 2-4) read this bundle instead of stringifying
+/// abstract bodies for dedup.
+#[derive(Debug, Clone)]
+struct StencilBundle {
+    /// SubgraphId → class_idx. Every subgraph the assignment knows
+    /// about is present. Built from `periodicity::group_regions` +
+    /// `region_formation::form_regions`.
+    class_of: HashMap<SubgraphId, usize>,
+    /// class_idx → homogeneous impl (or `None` if heterogeneous).
+    /// Parallel to `class_members`.
+    class_impl_id: Vec<Option<ImplId>>,
+    /// class_idx → subgraphs in the class, in Region-id order
+    /// (matches the order periodicity hashing groups them). The
+    /// length of this vec is the `repeat` axis bound for the class.
+    class_members: Vec<Vec<SubgraphId>>,
+}
+
+impl StencilBundle {
+    fn compute(fuf: &Fuf, sfuf: &Assignment) -> Self {
+        let st = crate::subtile::subtile(fuf);
+        let fr = crate::region_formation::form_regions(&st, sfuf);
+        let classes = crate::periodicity::group_regions(&fr.graph);
+        let report = crate::class_impl::check_class_impls(&classes, &fr.region_subgraphs, sfuf);
+
+        let mut class_of: HashMap<SubgraphId, usize> = HashMap::new();
+        let mut class_members: Vec<Vec<SubgraphId>> = Vec::with_capacity(classes.len());
+        for (idx, class) in classes.iter().enumerate() {
+            let mut members: Vec<SubgraphId> = Vec::with_capacity(class.members.len());
+            for &rid in &class.members {
+                let sg = fr.region_subgraphs[rid as usize];
+                class_of.insert(sg, idx);
+                members.push(sg);
+            }
+            class_members.push(members);
+        }
+
+        let class_impl_id: Vec<Option<ImplId>> = report
+            .per_class
+            .iter()
+            .map(|picks| match picks.len() {
+                1 => Some(picks[0]),
+                _ => None,
+            })
+            .collect();
+
+        StencilBundle {
+            class_of,
+            class_impl_id,
+            class_members,
+        }
+    }
+
+    /// Count of classes whose members share one impl. Diagnostic
+    /// only — useful to confirm the bundle matches the lib.rs
+    /// stencil print.
+    fn homogeneous_count(&self) -> usize {
+        self.class_impl_id.iter().filter(|p| p.is_some()).count()
+    }
+}
+
 /// Decide whether a subgraph's emit can be pulled out into a
 /// reusable fragment fn.
 ///
@@ -2223,6 +2302,7 @@ fn emit_subgraph(
     imp_id: ImplId,
     locals: &LocalMap,
     library: &mut FragmentLibrary,
+    _stencil: &StencilBundle,
 ) -> TokenStream {
     let imp = lib.get(imp_id);
     let claimed = sfuf.tiles_in_subgraph(sg);
@@ -2472,6 +2552,7 @@ fn emit_wave_walk(
     skip_subgraph: Option<SubgraphId>,
     protected: &HashSet<(TileId, u8)>,
     library: &mut FragmentLibrary,
+    stencil: &StencilBundle,
 ) -> Vec<TokenStream> {
     let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, skip_subgraph, protected);
     let mut body: Vec<TokenStream> = Vec::new();
@@ -2481,7 +2562,7 @@ fn emit_wave_walk(
                 continue;
             }
             body.push(emit_subgraph(
-                fuf, sfuf, program, model, lib, *sg, *imp_id, locals, library,
+                fuf, sfuf, program, model, lib, *sg, *imp_id, locals, library, stencil,
             ));
             if let Some(owners) = drops.get(sg) {
                 for (t, s) in owners {
@@ -2525,8 +2606,9 @@ fn emit_forward_for_bucket(
     if let Some(last) = fuf.nodes.last() {
         protected.insert((last.id, 0));
     }
+    let stencil = StencilBundle::compute(fuf, sfuf);
     let body = emit_wave_walk(
-        fuf, sfuf, loop_ir, program, model, lib, &locals, None, &protected, library,
+        fuf, sfuf, loop_ir, program, model, lib, &locals, None, &protected, library, &stencil,
     );
 
     // The forward's return value: the last tile's output.
@@ -2619,6 +2701,7 @@ fn emit_forward_backbone_for_bucket(
 
     let mut protected: HashSet<(TileId, u8)> = HashSet::new();
     protected.insert(backbone_out);
+    let stencil = StencilBundle::compute(fuf, sfuf);
     let body = emit_wave_walk(
         fuf,
         sfuf,
@@ -2630,6 +2713,7 @@ fn emit_forward_backbone_for_bucket(
         Some(terminal_sg),
         &protected,
         library,
+        &stencil,
     );
 
     let fn_name = bucket_fn_ident("forward_backbone_m", wp);

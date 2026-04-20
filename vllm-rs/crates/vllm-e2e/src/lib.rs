@@ -317,6 +317,13 @@ impl TestModels {
     pub const GEMMA2_2B_FP8_STATIC: &str = "RedHatAI/gemma-2-2b-it-FP8";
     pub const MISTRAL_7B_V03_FP8_STATIC: &str = "RedHatAI/Mistral-7B-Instruct-v0.3-FP8";
 
+    // FP8 blockwise-per-128×128 (Slice 3) — DeepSeek-V3-style block
+    // quantization: weights FP8 `[N, K]` with 2-D scale tensor
+    // `[ceil(N/128), ceil(K/128)]`. Runtime path uses
+    // `Fp8BlockLinear::forward` (dequant to BF16 then cuBLAS GEMM —
+    // a native block-scaled FP8 GEMM kernel is a perf follow-up).
+    pub const QWEN3_0_6B_FP8_BLOCK: &str = "RedHatAI/Qwen3-0.6B-FP8-BLOCK";
+
     // FP8 MoE models (CUDA-backend, SM89+)
     // 2-layer Mixtral 8x7B FP8 (~3GB) — small enough for single L40S
     pub const MIXTRAL_8X7B_FP8_2L: &str = "fxmarty/Mixtral-8x7B-Instruct-v0.1-FP8-KV-2-layers";

@@ -12,8 +12,7 @@
 #![cfg(feature = "e2e")]
 
 use vllm_e2e::assertions::{
-    check_logprobs_close_with_threshold, extract_engine_output,
-    load_golden_refs,
+    check_logprobs_close_with_threshold, extract_engine_output, load_golden_refs,
 };
 use vllm_e2e::{Client, TestModels, TestServer};
 use vllm_serve::protocol::{CompletionPrompt, CompletionRequest};
@@ -289,6 +288,27 @@ async fn test_cuda_correctness_qwen3_0_6b_fp8_dynamic() {
     // qwen3_0_6b_bnb_4bit.
     run_correctness_test_with_threshold(TestModels::QWEN3_0_6B_FP8, "qwen3_0_6b_fp8_dynamic", 1)
         .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_qwen3_0_6b_fp8_block() {
+    // FP8 blockwise-128×128 Qwen3-0.6B — Slice-3 end-to-end. Same
+    // Qwen3 topology as `qwen3_0_6b_fp8_dynamic` (singleton FP8 path
+    // for QKV with per-head QK-norm + fused gate/up SwiGLU), but the
+    // accessor type on each weight is `Fp8BlockLinear` (2-D block
+    // scale) in place of `Fp8Linear` (scalar weight scale). Runtime
+    // forward dequantizes FP8→BF16 per block then does cuBLAS GEMM;
+    // a native block-scaled FP8 GEMM is a perf follow-up. Threshold
+    // loosened to `1` for the same cutlass-drift reason as the
+    // per-tensor FP8 slices.
+    run_correctness_test_with_threshold(
+        TestModels::QWEN3_0_6B_FP8_BLOCK,
+        "qwen3_0_6b_fp8_block",
+        1,
+    )
+    .await;
 }
 
 #[cfg(feature = "cuda")]

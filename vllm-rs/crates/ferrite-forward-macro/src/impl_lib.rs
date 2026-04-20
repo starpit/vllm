@@ -6054,6 +6054,22 @@ fn is_fp8_gemm(fuf: &Fuf, tile: TileId) -> bool {
     node.op == OpKind::Gemm && matches!(weight_storage_of(node), Some(StorageFormat::Fp8 { .. }))
 }
 
+/// Pick the accessor Rust type for an FP8 GEMM — `Fp8BlockLinear`
+/// for blockwise (DeepSeek-style 128×128), `Fp8Linear` for per-tensor
+/// / per-channel. Both expose the same `forward(x, cublas, alloc,
+/// stream) -> OwnedTensor` signature, so every `emit_call` body above
+/// stays identical; only the `required_weights` rust_type and the
+/// generated `Weights::load` call differ between the two storages.
+fn fp8_accessor_type_for(fuf: &Fuf, gemm_tile: TileId) -> TokenStream {
+    match weight_storage_of(fuf.get(gemm_tile)) {
+        Some(StorageFormat::Fp8 {
+            block_size: Some(_),
+            ..
+        }) => quote! { ::ferrite_kernels::layers::Fp8BlockLinear },
+        _ => quote! { ::ferrite_kernels::layers::Fp8Linear },
+    }
+}
+
 /// Singleton Marlin GEMM — the AWQ counterpart of `GemmRefImpl`.
 #[derive(Debug, Default)]
 pub struct MarlinGemmImpl;
@@ -7143,9 +7159,10 @@ impl Implementation for Fp8GemmImpl {
         let tile = claimed_tiles[0];
         let (wid, index) = first_weight_ref(fuf.get(tile)).expect("Gemm has a weight input");
         let name = weight_field_name(program, wid, index);
+        let rust_type = fp8_accessor_type_for(fuf, tile);
         vec![WeightAccessor {
             name,
-            rust_type: quote! { ::ferrite_kernels::layers::Fp8Linear },
+            rust_type,
             source_weights: vec![(wid, index)],
         }]
     }
@@ -7281,9 +7298,10 @@ impl Implementation for Fp8FusedGemmBiasImpl {
             .expect("claim contains Gemm");
         let (wid, index) = first_weight_ref(fuf.get(gemm_id)).expect("Gemm has a weight input");
         let name = weight_field_name(program, wid, index);
+        let rust_type = fp8_accessor_type_for(fuf, gemm_id);
         vec![WeightAccessor {
             name,
-            rust_type: quote! { ::ferrite_kernels::layers::Fp8Linear },
+            rust_type,
             source_weights: vec![(wid, index)],
         }]
     }
@@ -7421,9 +7439,14 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
             })
             .collect();
         let name = fused_accessor_name(program, &sources);
+        let gemm_tile = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("claim contains at least one Gemm");
+        let rust_type = fp8_accessor_type_for(fuf, gemm_tile);
         vec![WeightAccessor {
             name,
-            rust_type: quote! { ::ferrite_kernels::layers::Fp8Linear },
+            rust_type,
             source_weights: sources,
         }]
     }
@@ -7896,9 +7919,14 @@ impl Implementation for Fp8FusedGateUpGeluMulImpl {
             })
             .collect();
         let name = fused_accessor_name(program, &sources);
+        let gemm_tile = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("claim contains at least one Gemm");
+        let rust_type = fp8_accessor_type_for(fuf, gemm_tile);
         vec![WeightAccessor {
             name,
-            rust_type: quote! { ::ferrite_kernels::layers::Fp8Linear },
+            rust_type,
             source_weights: sources,
         }]
     }
@@ -8123,9 +8151,14 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
             })
             .collect();
         let name = fused_accessor_name(program, &sources);
+        let gemm_tile = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("claim contains at least one Gemm");
+        let rust_type = fp8_accessor_type_for(fuf, gemm_tile);
         vec![WeightAccessor {
             name,
-            rust_type: quote! { ::ferrite_kernels::layers::Fp8Linear },
+            rust_type,
             source_weights: sources,
         }]
     }

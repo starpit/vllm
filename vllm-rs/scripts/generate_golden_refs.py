@@ -116,6 +116,13 @@ MODELS = {
     "llama_3_2_1b_fp8_static": "RedHatAI/Llama-3.2-1B-Instruct-FP8",
     "gemma2_2b_fp8_static": "RedHatAI/gemma-2-2b-it-FP8",
     "mistral_7b_v03_fp8_static": "RedHatAI/Mistral-7B-Instruct-v0.3-FP8",
+    # FP8 blockwise-128×128 (Slice 3). Weights are FP8 `[N, K]` with a
+    # 2-D per-block scale tensor `[ceil(N/128), ceil(K/128)]`; ferrite
+    # routes these via `Fp8BlockLinear`. Need `enforce_eager=True`
+    # like the per-tensor FP8 entries above (CUDA-graph FP8 is
+    # nondeterministic across runs) — the factory override below
+    # keys off the `_fp8` suffix which matches block too.
+    "qwen3_0_6b_fp8_block": "RedHatAI/Qwen3-0.6B-FP8-BLOCK",
     # Phi-3-mini-4k-instruct — `Phi3ForCausalLM`, dense bf16, MHA,
     # no LongRoPE. Matches `TestModels::PHI3_MINI_4K_CUDA`. First
     # ferrite arch with packed on-disk weights (`qkv_proj`,

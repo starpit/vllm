@@ -826,6 +826,26 @@ wrapper. See "FP8 Slice-1: known kernel drift" section below.**
 
 **Open follow-up work (this session left unfinished):**
 
+0. **Remaining FP8 slices** (see "Earlier in-progress notes" lines
+   1165–1190 below for full details):
+   - **Legacy quant_method-fp8 preset** (online BF16→FP8 quant at
+     load). `parse_fp8` already exists; `Fp8Linear::load` already
+     branches on dtype. Just needs a preset file + a target
+     model.
+   - **Slice 2 — FP8 static per-tensor.** `activation_scheme:
+     "static"` checkpoints. `Fp8Linear::load` already reads
+     `.input_scale`. Add `fp8-static-per-tensor.json` preset, find
+     a target (e.g., neuralmagic/*-FP8 with static scheme), opt
+     in per-arch, generate goldens.
+   - **Slice 3 — FP8 128×128 blockwise.** Distinct kernel path
+     (`cutlass_scaled_mm_blockwise`). Needs
+     `fp8-block-128x128.json` preset + `FieldLoad::Fp8BlockLinear
+     { prefixes, block_size }` arm + `Fp8BlockGemmImpl` singleton.
+     `Fp8BlockLinear::{load, load_concat}` already in
+     `ferrite-kernels::layers_quant`. Target: small
+     DeepSeek-V2-Lite or similar with `weight_block_size: [128,
+     128]`.
+
 1. **Identify and fix the cutlass `kGemm` vs `kGemmSplitKParallel`
    mismatch.** vllm uses `kGemmSplitKParallel` with `split_k_factor=1`.
    Ferrite uses `kGemm` because switching crashes flashattention with

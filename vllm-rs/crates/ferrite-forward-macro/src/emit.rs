@@ -196,8 +196,15 @@ impl<'a> EmitCtx<'a> {
         if let Some(tokens) = &self.repeat_var {
             return tokens.clone();
         }
-        let lit = proc_macro2::Literal::u64_unsuffixed(concrete);
-        quote! { #lit }
+        // Match today's unrolled emission byte-for-byte: every
+        // existing site that bakes a layer index does
+        // `let layer = …expect(..) as usize; quote!{ #layer }`,
+        // which flows through `ToTokens for usize` and produces a
+        // `5usize`-suffixed literal. Emit the same so a 6.2.b lift
+        // that routes a site through `layer_expr` stays a byte-
+        // identical rewrite until `repeat_var` flips to `Some(..)`.
+        let as_usize = concrete as usize;
+        quote! { #as_usize }
     }
 
     /// Read a model-wide integer bound (e.g. `intermediate_size`,

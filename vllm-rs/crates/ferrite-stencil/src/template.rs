@@ -263,7 +263,7 @@ pub fn attn_region(p: &AttnParams) -> Region {
 
     Region {
         id: 0,
-        name: "fa2_prefill",
+        name: "attn_prefill",
         domain: Domain {
             axes: vec![
                 Axis {
@@ -1948,7 +1948,7 @@ mod new_template_tests {
         // All four region bodies present.
         assert!(src.contains("region 0 (rmsnorm)"));
         assert!(src.contains("region 1 (gemm)"));
-        assert!(src.contains("region 2 (fa2_prefill)"));
+        assert!(src.contains("region 2 (attn_prefill)"));
         assert!(src.contains("region 3 (residual_add)"));
         // Three inter-region barriers between them.
         assert_eq!(

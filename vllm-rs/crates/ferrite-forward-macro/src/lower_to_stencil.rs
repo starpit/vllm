@@ -837,7 +837,7 @@ mod tests {
 
         assert_eq!(mk.regions.len(), 1);
         let r = &mk.regions[0];
-        assert_eq!(r.name, "fa2_prefill");
+        assert_eq!(r.name, "attn_prefill");
         assert_eq!(r.nodes.len(), 7);
         ir::validate(r).expect("lowered region validates");
 
@@ -1377,7 +1377,7 @@ mod tests {
         let report = lower_assignment_partial(&fuf, &assignment, &lib, &LowerHints::default());
         assert_eq!(report.supported_subgraphs, 1);
         assert_eq!(report.mk.regions.len(), 1);
-        assert_eq!(report.mk.regions[0].name, "fa2_prefill");
+        assert_eq!(report.mk.regions[0].name, "attn_prefill");
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].1, "gemm_rowmajor");
     }

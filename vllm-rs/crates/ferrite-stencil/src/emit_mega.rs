@@ -775,8 +775,8 @@ mod tests {
         assert!(src.contains("Store → storer (1 warpgroups)"));
 
         // Both regions composed into the same __global__.
-        assert!(src.contains("region 0 (fa2_prefill)"));
-        assert!(src.contains("region 1 (fa2_prefill)"));
+        assert!(src.contains("region 0 (attn_prefill)"));
+        assert!(src.contains("region 1 (attn_prefill)"));
 
         // Inter-region barrier lowered from the ControlEdge.
         assert!(src.contains("inter-region barrier: region 0 → region 1 (Barrier)"));
@@ -968,8 +968,8 @@ mod tests {
         assert!(!src.contains("threadIdx.x / 128u"));
         assert!(src.contains("AllWarps"));
         // Regions still composed, inter-region barrier still there.
-        assert!(src.contains("region 0 (fa2_prefill)"));
-        assert!(src.contains("region 1 (fa2_prefill)"));
+        assert!(src.contains("region 0 (attn_prefill)"));
+        assert!(src.contains("region 1 (attn_prefill)"));
         assert!(src.contains("gbar_sync(&gbar_counter);"));
         // SM89 per-region intrinsics: cp.async instead of TMA.
         assert!(src.contains("cp_async_128<SMEM_Q_BYTES>(smem_q, Q_gmem"));
@@ -997,8 +997,8 @@ mod tests {
         let mut mk = two_region_mega();
         mk.control.clear();
         let src = emit_megakernel(&mk, &sm90_fa2()).expect("emit succeeds");
-        let r0_pos = src.find("region 0 (fa2_prefill)").unwrap();
-        let r1_pos = src.find("region 1 (fa2_prefill)").unwrap();
+        let r0_pos = src.find("region 0 (attn_prefill)").unwrap();
+        let r1_pos = src.find("region 1 (attn_prefill)").unwrap();
         assert!(r0_pos < r1_pos, "declaration order preserved");
         assert!(src.contains("gbar_sync(&gbar_counter);"));
     }

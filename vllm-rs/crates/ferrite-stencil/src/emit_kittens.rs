@@ -75,7 +75,7 @@ pub fn emit_kittens(mega: &Megakernel) -> String {
             "gemm" => write_gemm_region(&mut out, region),
             "gate_up_silu_mul" => write_gate_up_silu_mul_region(&mut out, region),
             "qkv_rope" => write_qkv_rope_region(&mut out, region),
-            "fa2_prefill" => write_attn_prefill_region(&mut out, region),
+            "attn_prefill" => write_attn_prefill_region(&mut out, region),
             "paged_decode" => write_attn_paged_decode_region(&mut out, region),
             _ => write_stub_region(&mut out, region),
         }
@@ -1091,215 +1091,158 @@ fn write_qkv_rope_region(out: &mut String, _region: &Region) {
     writeln!(out).unwrap();
 }
 
-/// FA2 prefill attention. `O = softmax(Q @ K^T / sqrt(d)) @ V` with
-/// online-softmax rescaling over KV tiles.
+/// Prefill attention — Hopper WGMMA + TMA with online softmax.
 ///
-/// This commit emits the STRUCTURE — Q load, KV loop with Q@K^T,
-/// online softmax update, P@V accumulator, O store — using kittens
-/// register-tile primitives (`rt_fl<16, TILE_K>` for S, `rt_fl<16,
-/// HEAD_DIM>` for O). The online softmax bookkeeping is minimal
-/// (running max + running sum, rescale O on max update) but works
-/// only for non-causal, non-sliding windows; full FA2 semantics
-/// (causal mask, sliding window, numerically stable exp) land in a
-/// follow-on once this shape is wired end-to-end.
+/// Delegates to `kittens_ferrite_attn::attn_prefill_body<HEAD_DIM,
+/// is_causal>(g)` — a verbatim `__device__` port of ThunderKittens'
+/// `fwd_attend_ker` from `kernels/attention/mha_h100/mha_h100.cu`.
+/// All the real attention logic (running max / sum rescale, pipelined
+/// K/V TMA loads, WGMMA Q@K^T and P@V, causal mask branch, log-sum-
+/// exp epilogue) lives in the TK port; this region's emit just wires
+/// the globals struct + a __global__ wrapper that invokes the body.
 ///
-/// Reference: `~/Megakernels/demos/cross-gpu-llama/attention_prefill.cu`
-/// for the production-quality FA2 pattern.
+/// TILE shapes come from `kittens_ferrite_attn::fwd_attend_ker_tile_dims`
+/// (D=64 or 128). Launcher needs `head_dim ∈ {64, 128}`; other dims
+/// return `cudaErrorInvalidValue`.
 fn write_attn_prefill_region(out: &mut String, _region: &Region) {
-    writeln!(out, "// ── region: fa2_prefill ──").unwrap();
-    writeln!(out, "template<int HEAD_DIM, int TILE_Q, int TILE_K>").unwrap();
-    writeln!(out, "struct fa2_prefill_globals {{").unwrap();
-    writeln!(out, "    using q_tile_t = st_bf<TILE_Q, HEAD_DIM>;").unwrap();
-    writeln!(out, "    using k_tile_t = st_bf<TILE_K, HEAD_DIM>;").unwrap();
-    writeln!(out, "    using v_tile_t = st_bf<TILE_K, HEAD_DIM>;").unwrap();
-    writeln!(out, "    using o_tile_t = st_bf<TILE_Q, HEAD_DIM>;").unwrap();
+    writeln!(out, "// ── region: attn_prefill ──").unwrap();
     writeln!(
         out,
-        "    using q_gl_t = gl<bf16, -1, -1, -1, -1, q_tile_t>;"
+        "// __device__ body: kittens_ferrite_attn::attn_prefill_body<D, is_causal>(g)",
     )
     .unwrap();
     writeln!(
         out,
-        "    using k_gl_t = gl<bf16, -1, -1, -1, -1, k_tile_t>;"
+        "// (ported from ThunderKittens' fwd_attend_ker in mha_h100.cu).",
     )
     .unwrap();
-    writeln!(
-        out,
-        "    using v_gl_t = gl<bf16, -1, -1, -1, -1, v_tile_t>;"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    using o_gl_t = gl<bf16, -1, -1, -1, -1, o_tile_t>;"
-    )
-    .unwrap();
-    writeln!(out, "    q_gl_t Q;").unwrap();
-    writeln!(out, "    k_gl_t K;").unwrap();
-    writeln!(out, "    v_gl_t V;").unwrap();
-    writeln!(out, "    o_gl_t O;").unwrap();
-    writeln!(out, "    uint32_t num_kv_tiles;").unwrap();
-    writeln!(out, "    float scale;").unwrap();
-    writeln!(out, "}};").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "template<int HEAD_DIM, int TILE_Q, int TILE_K>").unwrap();
-    writeln!(out, "__global__ __launch_bounds__(128, 1)").unwrap();
+    // __global__ wrapper that the Rust launcher below invokes. When
+    // this region lowers into the top-level mega_kernel, the body is
+    // called inline instead.
+    writeln!(out, "template<int D, bool is_causal>").unwrap();
     writeln!(
         out,
-        "void fa2_prefill_kernel(const __grid_constant__ fa2_prefill_globals<HEAD_DIM, TILE_Q, TILE_K> g) {{",
+        "__global__ __launch_bounds__(kittens_ferrite_attn::NUM_WORKERS * kittens::WARP_THREADS, 1)",
     )
     .unwrap();
-    writeln!(out, "    const int q_tile = blockIdx.x;").unwrap();
-    writeln!(out, "    const int head_group = blockIdx.y;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    __shared__ st_bf<TILE_Q, HEAD_DIM> q_s;").unwrap();
-    writeln!(out, "    __shared__ st_bf<TILE_K, HEAD_DIM> k_s;").unwrap();
-    writeln!(out, "    __shared__ st_bf<TILE_K, HEAD_DIM> v_s;").unwrap();
-    writeln!(out, "    __shared__ st_bf<TILE_Q, HEAD_DIM> o_s;").unwrap();
-    writeln!(out, "    __shared__ semaphore sem_q, sem_k, sem_v;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
-    writeln!(out, "        init_semaphore(sem_q, 1);").unwrap();
-    writeln!(out, "        init_semaphore(sem_k, 1);").unwrap();
-    writeln!(out, "        init_semaphore(sem_v, 1);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    // Load Q once (preamble).").unwrap();
-    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
-    writeln!(out, "        tma::expect(sem_q, q_s);").unwrap();
     writeln!(
         out,
-        "        tma::load_async(q_s, g.Q, {{0, 0, (int)q_tile, (int)head_group}}, sem_q);",
+        "void mega_kernel_attn_prefill(const __grid_constant__ kittens_ferrite_attn::fwd_globals<D> g) {{",
     )
     .unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    wait(sem_q, 0);").unwrap();
-    writeln!(out).unwrap();
-    // FA2 accumulator state: O, running row max m, running row sum l.
-    // Per-warp rt_fl<16, HEAD_DIM> O accumulator; m/l are per-row
-    // scalars scattered across the warp's register file.
-    writeln!(out, "    rt_fl<16, HEAD_DIM> o_acc;").unwrap();
-    writeln!(out, "    kittens::warpgroup::zero(o_acc);").unwrap();
-    writeln!(out).unwrap();
     writeln!(
         out,
-        "    for (uint32_t kv_tile = 0; kv_tile < g.num_kv_tiles; ++kv_tile) {{"
+        "    kittens_ferrite_attn::attn_prefill_body<D, is_causal>(g);",
     )
     .unwrap();
-    writeln!(out, "        if (threadIdx.x == 0) {{").unwrap();
-    writeln!(out, "            tma::expect(sem_k, k_s);").unwrap();
-    writeln!(
-        out,
-        "            tma::load_async(k_s, g.K, {{0, 0, (int)kv_tile, (int)head_group}}, sem_k);",
-    )
-    .unwrap();
-    writeln!(out, "            tma::expect(sem_v, v_s);").unwrap();
-    writeln!(
-        out,
-        "            tma::load_async(v_s, g.V, {{0, 0, (int)kv_tile, (int)head_group}}, sem_v);",
-    )
-    .unwrap();
-    writeln!(out, "        }}").unwrap();
-    writeln!(out, "        wait(sem_k, kv_tile & 1);").unwrap();
-    writeln!(out, "        wait(sem_v, kv_tile & 1);").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "        // S = Q @ K^T").unwrap();
-    writeln!(out, "        rt_fl<16, TILE_K> s_acc;").unwrap();
-    writeln!(out, "        kittens::warpgroup::zero(s_acc);").unwrap();
-    writeln!(out, "        kittens::warpgroup::mma_ABt(s_acc, q_s, k_s);").unwrap();
-    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "        // Scale + (TODO: FA2 online softmax).").unwrap();
-    writeln!(
-        out,
-        "        kittens::warpgroup::mul(s_acc, s_acc, g.scale);",
-    )
-    .unwrap();
-    writeln!(out, "        kittens::warpgroup::exp(s_acc, s_acc);").unwrap();
-    writeln!(out, "        // TODO: row-max + row-sum rescale of o_acc.").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "        // O += S @ V  (S cast bf16, V as B tile).").unwrap();
-    writeln!(out, "        rt_bf<16, TILE_K> s_bf;").unwrap();
-    writeln!(out, "        kittens::warpgroup::copy(s_bf, s_acc);").unwrap();
-    writeln!(out, "        kittens::warpgroup::mma_AB(o_acc, s_bf, v_s);").unwrap();
-    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    // Store O. (TODO: divide by running sum l.)").unwrap();
-    writeln!(out, "    kittens::warpgroup::store(o_s, o_acc);").unwrap();
-    writeln!(out, "    kittens::warpgroup::sync(0);").unwrap();
-    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
-    writeln!(
-        out,
-        "        tma::store_async(g.O, o_s, {{0, 0, (int)q_tile, (int)head_group}});",
-    )
-    .unwrap();
-    writeln!(out, "        tma::store_async_wait();").unwrap();
-    writeln!(out, "    }}").unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
+    // Rust-side launcher. Mirrors the parameters TK's attention_forward
+    // assembles in mha_h100.cu (lines 716-753 for D=64, 755-792 for
+    // D=128). Caller supplies raw bf16/fp32 pointers + dims + causal
+    // flag; we package into `fwd_globals` and launch.
     writeln!(
         out,
-        "extern \"C\" cudaError_t launch_fa2_prefill(cudaStream_t stream,",
+        "extern \"C\" cudaError_t launch_attn_prefill(cudaStream_t stream,",
     )
     .unwrap();
     writeln!(
         out,
-        "    const bf16* Q, const bf16* K, const bf16* V, bf16* O,",
+        "    const bf16* Q, const bf16* K, const bf16* V, bf16* O, float* L,",
     )
     .unwrap();
     writeln!(
         out,
-        "    uint32_t num_tokens, uint32_t num_heads, uint32_t head_dim, uint32_t seq_len, float scale) {{",
-    )
-    .unwrap();
-    writeln!(out, "    constexpr int HEAD_DIM = 128;").unwrap();
-    writeln!(out, "    constexpr int TILE_Q = 64;").unwrap();
-    // TILE_K=16 (WGMMA k-atom) keeps q_s + k_s + v_s + o_s under the
-    // 48 KB static cap. Larger KV tiles need dynamic shared via
-    // `kittens::shared_allocator`; follow-on optimization.
-    writeln!(out, "    constexpr int TILE_K = 16;").unwrap();
-    writeln!(
-        out,
-        "    if (head_dim != HEAD_DIM || num_tokens % TILE_Q != 0 || seq_len % TILE_K != 0) return cudaErrorInvalidValue;",
+        "    uint32_t batch, uint32_t qo_heads, uint32_t kv_heads,",
     )
     .unwrap();
     writeln!(
         out,
-        "    using globals_t = fa2_prefill_globals<HEAD_DIM, TILE_Q, TILE_K>;",
+        "    uint32_t seq_len, uint32_t head_dim, int is_causal) {{",
     )
     .unwrap();
-    writeln!(out, "    globals_t g{{").unwrap();
+    writeln!(out, "    using namespace kittens_ferrite_attn;").unwrap();
     writeln!(
         out,
-        "        {{const_cast<bf16*>(Q), (size_t)1, (size_t)1, (size_t)num_tokens, (size_t)(num_heads * head_dim)}},",
+        "    if (head_dim != 64 && head_dim != 128) return cudaErrorInvalidValue;",
     )
     .unwrap();
+    writeln!(out, "    int hr = (int)(qo_heads / kv_heads);").unwrap();
     writeln!(
         out,
-        "        {{const_cast<bf16*>(K), (size_t)1, (size_t)1, (size_t)seq_len,    (size_t)(num_heads * head_dim)}},",
+        "    auto mem_size = kittens::MAX_SHARED_MEMORY - 1024;",
     )
     .unwrap();
-    writeln!(
-        out,
-        "        {{const_cast<bf16*>(V), (size_t)1, (size_t)1, (size_t)seq_len,    (size_t)(num_heads * head_dim)}},",
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "        {{O, (size_t)1, (size_t)1, (size_t)num_tokens, (size_t)(num_heads * head_dim)}},",
-    )
-    .unwrap();
-    writeln!(out, "        seq_len / TILE_K,").unwrap();
-    writeln!(out, "        scale,").unwrap();
-    writeln!(out, "    }};").unwrap();
-    writeln!(out, "    dim3 grid(num_tokens / TILE_Q, num_heads);").unwrap();
-    writeln!(
-        out,
-        "    fa2_prefill_kernel<HEAD_DIM, TILE_Q, TILE_K><<<grid, 128, 0, stream>>>(g);",
-    )
-    .unwrap();
-    writeln!(out, "    return cudaGetLastError();").unwrap();
+    writeln!(out, "    dim3 block((uint32_t)(32 * NUM_WORKERS));",).unwrap();
+    writeln!(out).unwrap();
+    // Per head_dim + is_causal combo, cuda Func setAttribute + launch.
+    // Laid out as nested if/else rather than a dispatch table so the
+    // is_causal branch doesn't go through a function pointer.
+    for d in &[64, 128] {
+        writeln!(out, "    if (head_dim == {d}) {{").unwrap();
+        writeln!(out, "        using globals = fwd_globals<{d}>;").unwrap();
+        writeln!(out, "        globals g{{").unwrap();
+        writeln!(
+            out,
+            "            {{const_cast<bf16*>(Q), (size_t)batch, (size_t)qo_heads, (size_t)seq_len, (size_t){d}}},",
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            {{const_cast<bf16*>(K), (size_t)batch, (size_t)kv_heads, (size_t)seq_len, (size_t){d}}},",
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            {{const_cast<bf16*>(V), (size_t)batch, (size_t)kv_heads, (size_t)seq_len, (size_t){d}}},",
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            {{L, (size_t)batch, (size_t)qo_heads, (size_t)1, (size_t)seq_len}},",
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            {{O, (size_t)batch, (size_t)qo_heads, (size_t)seq_len, (size_t){d}}},",
+        )
+        .unwrap();
+        writeln!(out, "            (int)seq_len,").unwrap();
+        writeln!(out, "            hr,").unwrap();
+        writeln!(out, "        }};").unwrap();
+        writeln!(
+            out,
+            "        dim3 grid(seq_len / (CONSUMER_WARPGROUPS * kittens::TILE_ROW_DIM<bf16> * 4), qo_heads, batch);",
+        )
+        .unwrap();
+        writeln!(out, "        if (is_causal) {{").unwrap();
+        writeln!(
+            out,
+            "            cudaFuncSetAttribute(mega_kernel_attn_prefill<{d}, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mem_size);",
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            mega_kernel_attn_prefill<{d}, true><<<grid, block, mem_size, stream>>>(g);",
+        )
+        .unwrap();
+        writeln!(out, "        }} else {{").unwrap();
+        writeln!(
+            out,
+            "            cudaFuncSetAttribute(mega_kernel_attn_prefill<{d}, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mem_size);",
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            mega_kernel_attn_prefill<{d}, false><<<grid, block, mem_size, stream>>>(g);",
+        )
+        .unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "        return cudaGetLastError();").unwrap();
+        writeln!(out, "    }}").unwrap();
+    }
+    writeln!(out, "    return cudaErrorInvalidValue;").unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
 }
@@ -1307,7 +1250,7 @@ fn write_attn_prefill_region(out: &mut String, _region: &Region) {
 /// Paged-KV decode attention (M=1). Simplified variant of FA2 prefill:
 /// Q has one row per CTA (not a tile), KV is read via block_table
 /// indirection. This commit emits the shape with a simplified
-/// TODO-tagged softmax, same as `fa2_prefill`; the block_table gather
+/// TODO-tagged softmax, same as `attn_prefill`; the block_table gather
 /// is not yet wired — the launcher passes a raw KV pointer for now.
 fn write_attn_paged_decode_region(out: &mut String, _region: &Region) {
     writeln!(out, "// ── region: paged_decode ──").unwrap();

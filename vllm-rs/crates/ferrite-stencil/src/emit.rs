@@ -276,7 +276,7 @@ mod tests {
     use crate::template::{AttnParams, Window, attn_region};
     use crate::wavefront::schedule_wavefront;
 
-    fn fa2_prefill_region() -> Region {
+    fn attn_prefill_region() -> Region {
         attn_region(&AttnParams {
             window: Window::Infinite,
             head_dim: 128,
@@ -289,12 +289,12 @@ mod tests {
 
     #[test]
     fn sm90_sketch_has_warpgroup_roles_and_pipeline_loop() {
-        let region = fa2_prefill_region();
+        let region = attn_prefill_region();
         let arch = sm90_fa2();
         let sched = schedule_wavefront(&region, &arch).unwrap();
         let src = emit_kernel_sketch(&region, &sched, &arch);
 
-        assert!(src.contains("__global__ void fa2_prefill_kernel("));
+        assert!(src.contains("__global__ void attn_prefill_kernel("));
         assert!(src.contains("wg = threadIdx.x / 128u"));
         assert!(src.contains("Load → loader (1 warpgroups)"));
         assert!(src.contains("Compute → consumer (3 warpgroups)"));
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn sm89_sketch_is_all_warps_with_cp_async() {
-        let region = fa2_prefill_region();
+        let region = attn_prefill_region();
         let arch = sm89_fa2();
         let sched = schedule_wavefront(&region, &arch).unwrap();
         let src = emit_kernel_sketch(&region, &sched, &arch);

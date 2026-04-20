@@ -93,7 +93,7 @@ fn snapshot_sm90_print() {
     // Not a strict golden — just asserts key lines so the printed
     // shape is visible in test output.
     let expected_substrings = [
-        "region fa2_prefill (arch=sm90_fa2)",
+        "region attn_prefill (arch=sm90_fa2)",
         "q_tile : 0..num_q_tiles",
         "kv_tile : 0..num_kv_tiles",
         "head_group : 0..8",

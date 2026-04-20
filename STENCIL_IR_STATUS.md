@@ -72,6 +72,40 @@ Every ported region nvcc-compiles cleanly on sm_90a with the build flags above; 
 
 Legacy `emit_mega.rs` path (hand-rolled prelude helpers, sm_89 cp.async.ca, `bf16[BYTES/2]` smem decls, `gmem + (q_tile * 16384u + …)` address expressions): still present, still nvcc-compiles for all 8 model variants, but scheduled for deletion once kittens path covers every region and vllm chat runs.
 
+## What landed this session (2026-04-20)
+
+**All 9 stencil regions have kittens-based `emit_kittens` match arms** (7 correct, 2 with numeric TODOs, 1 empty stub). Every region that emits real primitives compiles on sm_90a with `nvcc -DKITTENS_HOPPER -gencode=arch=compute_90a,code=sm_90a -std=c++20 --expt-extended-lambda --expt-relaxed-constexpr -I $THUNDERKITTENS_ROOT/include`.
+
+**Build integration** (ferrite-cuda-builder + vllm-cuda):
+- `#[forward]` macro writes `~/.cache/cudaforge/kittens/<model>.cu` per model.
+- `build_kittens_kernels` in ferrite-cuda-builder/build.rs compiles them into `libkittens_kernels.a` on sm_90a+ (env var `THUNDERKITTENS_ROOT` or fallback `~/ThunderKittens`).
+- `vllm-cuda/build.rs` conditionally links the .a when present; lower arches skip.
+
+**Rust FFI** (`ferrite_stencil_kernels::kittens`): one `unsafe extern "C"` decl + safe wrapper per `launch_<region>` — `rmsnorm`, `residual_add`, `unary_inplace`, `embed`, `gemm`, `gate_up_silu_mul`, `qkv_rope`, `fa2_prefill`. Gated on `kittens_linked` cfg (build.rs sets it iff the .a is present in the cache).
+
+**H100 smoke tests** (`crates/ferrite-stencil-kernels/tests/kittens_smoke.rs`):
+- `rmsnorm_matches_cpu_reference` — compares kernel output against CPU reference on deterministic input.
+- `gemm_matches_cpu_reference` — M=64, N=128, K=64 WGMMA path validated against CPU f32 gemm.
+
+Run on H100:
+```
+cd /path/to/ThunderKittens && ls include/  # verify TK present
+THUNDERKITTENS_ROOT=$(pwd) cargo test \
+    -p ferrite-stencil-kernels --features cuda \
+    --test kittens_smoke --release -- --test-threads=1
+```
+
+## Still missing for `vllm chat` coherent output on H100
+
+Path is partially wired — kittens kernels build + Rust FFI exists — but the forward still routes through the non-kittens HostCallable path (existing hand-written CUDA kernels). To actually serve inference through the kittens megakernel:
+
+1. **Forward-path routing** (task 10). Add kittens impls to `ferrite-forward-macro::impl_lib` so the solver picks them on sm_90a. Each impl: launcher fn, cost model, applicability check, tensor-layout constraints. ~8600-line `impl_lib.rs` extension; one new impl entry per region type.
+2. **FA2 online softmax** (fa2_prefill region). Current emit omits running max/sum rescale — kernel runs but produces numerically wrong output.
+3. **RoPE rotation** (qkv_rope region). Current emit stores matmul output unrotated.
+4. **Paged-KV decode** (paged_decode region). Currently an empty stub; needs block_table gather + M=1 register-vector attention.
+5. **Hidden-dim dispatch**. Every emit currently hardcodes `D=4096`. Need a dispatch table over the dims we support (4096, 3072, 2048, 1024, 896) per model.
+6. **Validation**. Run `timeout 60 vllm chat --model=<small-llama>` on H100 through the kittens path, compare output vs reference.
+
 ## Next three things (in order)
 
 1. **Port `qkv_rope_region`.** Three parallel WGMMAs (Wq, Wk, Wv) sharing X. RoPE rotation on Q and K via `kittens::warp::mul/add` on register tiles with cos/sin loaded from `g.rope_cos` / `g.rope_sin`. V stored direct; K stored to paged KV cache via `AxisDivGather` on `block_table`. See `~/Megakernels/demos/cross-gpu-llama/qkv_rope_append.cu` for the reference pattern.

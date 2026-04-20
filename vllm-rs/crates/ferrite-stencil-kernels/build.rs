@@ -30,6 +30,20 @@ fn cuda_link() {
 
     println!("cargo:rustc-link-lib=static=stencil_kernels");
 
+    // Kittens megakernel .a only exists on sm_90a+ builds where
+    // ferrite-cuda-builder compiled it. When present, link it and
+    // set the `kittens_linked` cfg so tests can gate the FFI calls
+    // on it; when absent, skip both so the crate still builds on
+    // sm_89 dev boxes.
+    let kittens_lib = std::path::Path::new(&cache_str).join("libkittens_kernels.a");
+    if kittens_lib.exists() {
+        println!("cargo:rustc-link-lib=static=kittens_kernels");
+        println!("cargo:rustc-cfg=kittens_linked");
+    }
+    // Declare the cfg to rustc so `cfg(kittens_linked)` doesn't
+    // trigger "unexpected_cfgs" on newer rustc.
+    println!("cargo:rustc-check-cfg=cfg(kittens_linked)");
+
     println!("cargo:rustc-link-lib=static=cudart_static");
     println!("cargo:rustc-link-lib=dylib=rt");
     println!("cargo:rustc-link-lib=dylib=dl");

@@ -615,6 +615,9 @@ fn build_kittens_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .out_dir(cache_dir)
         .source_files(kittens_cus.clone())
         .include_path(&tk_include)
+        // Our own csrc dir — hosts kittens_attn.cuh (the __device__
+        // port of TK's fwd_attend_ker) that emit_kittens references.
+        .include_path("../../crates/ferrite-stencil/csrc")
         .arg("-DKITTENS_HOPPER")
         .arg("-DNDEBUG")
         .arg("-std=c++20")

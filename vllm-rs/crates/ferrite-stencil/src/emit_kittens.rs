@@ -100,6 +100,12 @@ fn write_header(out: &mut String) {
     writeln!(out).unwrap();
     writeln!(out, "#define KITTENS_HOPPER").unwrap();
     writeln!(out, "#include \"kittens.cuh\"").unwrap();
+    // `__device__` FA2 port of ThunderKittens' `fwd_attend_ker` —
+    // callable from our megakernel as
+    // `kittens_ferrite_attn::attn_prefill_body<D, is_causal>(g)`.
+    // Lives in `crates/ferrite-stencil/csrc/kittens_attn.cuh`; the
+    // builder adds that dir to nvcc's include path.
+    writeln!(out, "#include \"kittens_attn.cuh\"").unwrap();
     writeln!(out, "#include <cuda_runtime.h>").unwrap();
     writeln!(out, "#include <cstdint>").unwrap();
     writeln!(out).unwrap();

@@ -542,7 +542,12 @@ fn build_kittens_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     // both require Hopper.
     let arch = detect_cuda_arch();
     let arch_num: u32 = arch.parse().unwrap_or(89);
+    eprintln!("ferrite-cuda-builder: kittens build — detected arch={arch} (num={arch_num})");
     if arch_num < 90 {
+        eprintln!(
+            "ferrite-cuda-builder: arch<90 ({arch_num}), skipping libkittens_kernels.a. \
+             Set CUDA_ARCH=90 if this is an H100.",
+        );
         return;
     }
 

@@ -817,34 +817,69 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
-**FP8 Slice-1 across 7 arches lands end-to-end. Coherent inference
-on every arch (qwen2, llama, qwen3, gemma2, gemma3, granite, mistral).
-Strict golden parity vs Python is loose: tests run at threshold=1
+**FP8 Slice-1 (dynamic per-tensor) AND Slice-2 (static per-tensor)
+both land end-to-end. Coherent inference on every arch
+(qwen2, llama, qwen3, gemma2, gemma3, granite, mistral) for
+dynamic; four arches covered by goldens for static (qwen2-1.5b,
+llama-3.2-1b, gemma2-2b, mistral-7b-v0.3). The remaining three
+(qwen3-0.6b, gemma3-1b, granite-3.1-2b) have no upstream static
+FP8 checkpoints at those sizes — compiler still emits the
+variants, so any future repo dispatches automatically. Strict
+golden parity vs Python is loose: tests run at threshold=1
 (position-0 must match, decode drift accepted) because of an
-unidentified ULP-level rounding difference in the cutlass scaled_mm
-wrapper. See "FP8 Slice-1: known kernel drift" section below.**
+unidentified ULP-level rounding difference in the cutlass
+scaled_mm wrapper. See "FP8 Slice-1: known kernel drift" section
+below; same drift applies to Slice-2.**
 
-**Open follow-up work (this session left unfinished):**
+**What landed this session (commits `63f70cf69`, `3cce87dd4`):**
+- `63f70cf69`: finished the rotary `ctx→wm` move in the three FP8
+  fused-QKV Impls (`Fp8FusedQkvRopeCacheImpl` fp8+bf16 branches,
+  `Fp8FusedQkvRopePrefillImpl`) that commit 4fb16e3fa missed.
+  Every `ferrite-model-*` crate exercising an FP8 variant was
+  unbuildable before this — check this commit FIRST if the macro
+  errors with `E0609: no field 'rotary' on type '&ForwardCtx<'_>'`.
+- `3cce87dd4`: FP8 Slice-2 (static per-tensor):
+  - `fp8-static-per-tensor.json` preset in both
+    `model_architectures/quantizations/` and
+    `vllm-rs/model_architectures/quantizations/`.
+  - Fan-out via `quantizations.json` on all seven FP8 arches.
+  - Codegen fingerprint disambiguator: static variants
+    positive-check `model.layers.0.self_attn.q_proj.input_scale`,
+    dynamic variants negative-check it (mirrors the GPTQ
+    `g_idx` desc_act pattern). Lives in `emit_fingerprint_check`.
+  - Four goldens + four `test_cuda_correctness_*_fp8_static`
+    tests at `threshold=1` — all pass.
+  - Static/dynamic share all FP8 Impls (match on
+    `StorageFormat::Fp8 { .. }` with `_` scheme). The actual
+    branch lives inside `Fp8Linear::forward` on
+    `input_scale.is_some()` — no new Impls required.
 
-0. **Remaining FP8 slices** (see "Earlier in-progress notes" lines
-   1165–1190 below for full details):
+**Open follow-up work:**
+
+0. **Remaining FP8 slices:**
    - **Legacy quant_method-fp8 preset** (online BF16→FP8 quant at
      load). `parse_fp8` already exists; `Fp8Linear::load` already
      branches on dtype. Just needs a preset file + a target
-     model.
-   - **Slice 2 — FP8 static per-tensor.** `activation_scheme:
-     "static"` checkpoints. `Fp8Linear::load` already reads
-     `.input_scale`. Add `fp8-static-per-tensor.json` preset, find
-     a target (e.g., neuralmagic/*-FP8 with static scheme), opt
-     in per-arch, generate goldens.
+     model. Arguably redundant with Slice-1: the existing
+     `fp8-dynamic-per-tensor.json` preset already matches, and
+     any repo that ships `quant_method: "fp8"` + BF16 weights
+     would dispatch through it and hit the online-quant branch
+     of `Fp8Linear::load`. Only wire this up if a concrete repo
+     shows up that doesn't fingerprint-match today.
    - **Slice 3 — FP8 128×128 blockwise.** Distinct kernel path
      (`cutlass_scaled_mm_blockwise`). Needs
      `fp8-block-128x128.json` preset + `FieldLoad::Fp8BlockLinear
-     { prefixes, block_size }` arm + `Fp8BlockGemmImpl` singleton.
+     { prefixes, block_size }` codegen arm +
+     `Fp8BlockGemmImpl` singleton + its fused peers.
      `Fp8BlockLinear::{load, load_concat}` already in
-     `ferrite-kernels::layers_quant`. Target: small
-     DeepSeek-V2-Lite or similar with `weight_block_size: [128,
-     128]`.
+     `ferrite-kernels::layers_quant`; parser already emits
+     `StorageFormat::Fp8 { block_size: Some([128, 128]), .. }`.
+     Fingerprint disambiguator will need a third arm keying off
+     the 2-D `.weight_scale_inv` shape (block scales are
+     `[ceil(N/128), ceil(K/128)]` vs per-tensor `[1]` vs
+     per-channel `[N, 1]`). Target: small DeepSeek-V2-Lite or
+     similar with `weight_block_size: [128, 128]` in
+     `quantization_config`.
 
 1. **Identify and fix the cutlass `kGemm` vs `kGemmSplitKParallel`
    mismatch.** vllm uses `kGemmSplitKParallel` with `split_k_factor=1`.

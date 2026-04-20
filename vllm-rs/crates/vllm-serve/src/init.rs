@@ -290,6 +290,7 @@ fn create_worker(
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             calculate_kv_scales: config.calculate_kv_scales,
             eos_token_ids: vec![],
+            max_model_len: config.max_model_len,
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -633,6 +634,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                     .parse()
                     .unwrap_or(CudaGraphMode::Auto),
                 eos_token_ids: vec![],
+                max_model_len: config.max_model_len,
             })
             .collect();
 
@@ -1112,6 +1114,7 @@ fn initialize_stack_multinode(
                 .parse()
                 .unwrap_or(CudaGraphMode::Auto),
             eos_token_ids: vec![],
+            max_model_len: config.max_model_len,
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -1383,6 +1386,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
             .parse()
             .unwrap_or(CudaGraphMode::Auto),
         eos_token_ids: vec![],
+        max_model_len: config.max_model_len,
     };
 
     let mut worker = CudaWorker::new(cuda_config);
@@ -1533,6 +1537,7 @@ fn initialize_stack_tp_pp(
                         .parse()
                         .unwrap_or(CudaGraphMode::Auto),
                     eos_token_ids: vec![],
+                    max_model_len: config.max_model_len,
                 }
             })
             .collect();
@@ -1888,6 +1893,7 @@ fn initialize_stack_tp(
                     .parse()
                     .unwrap_or(CudaGraphMode::Auto),
                 eos_token_ids: vec![],
+                max_model_len: config.max_model_len,
             })
             .collect();
 
@@ -2280,6 +2286,7 @@ fn initialize_stack_external(
                 .parse()
                 .unwrap_or(CudaGraphMode::Auto),
             eos_token_ids: vec![],
+            max_model_len: config.max_model_len,
         };
 
         let mut worker = CudaWorker::new(cuda_config);

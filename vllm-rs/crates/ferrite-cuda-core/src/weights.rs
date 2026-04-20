@@ -888,6 +888,151 @@ impl GpuWeights {
         self.tensors.contains_key(name)
     }
 
+    /// Synthesize N virtual per-slice entries from a packed safetensors
+    /// source by taking an even row-wise split.
+    ///
+    /// `packed_prefix` is the full dotted path to the packed tensor (its
+    /// `.weight` is at `{packed_prefix}.weight`; `.bias` is optional and
+    /// split the same way). `split_targets` lists the sibling suffixes
+    /// under the shared parent; each becomes a new entry at
+    /// `{grandparent}.{target}.weight` whose `CpuTensorRef` points at the
+    /// matching row range within the original mmap (no data is copied).
+    /// The packed entry itself is removed on success.
+    ///
+    /// Returns `Ok(true)` when the split happened, `Ok(false)` when the
+    /// packed tensor does not exist (caller should propagate the
+    /// downstream `weight not found` error the normal way).
+    ///
+    /// Even-split convenience wrapper around
+    /// `synthesize_packed_row_split_sizes`. Only valid when `total_rows`
+    /// is divisible by `split_targets.len()` — e.g. MHA `qkv_proj`
+    /// (`num_attention_heads == num_key_value_heads`) and every
+    /// `gate_up_proj`. GQA checkpoints must go through the sized
+    /// variant with explicit per-slice row counts.
+    pub fn synthesize_packed_row_split(
+        &mut self,
+        packed_prefix: &str,
+        split_targets: &[&str],
+    ) -> Result<bool> {
+        let packed_weight_name = format!("{packed_prefix}.weight");
+        if !self.tensors.contains_key(&packed_weight_name) {
+            return Ok(false);
+        }
+        let n = split_targets.len();
+        if n == 0 {
+            anyhow::bail!("synthesize_packed_row_split: empty split_targets");
+        }
+        let total_rows = self.tensors[&packed_weight_name].shape[0];
+        if !total_rows.is_multiple_of(n) {
+            anyhow::bail!(
+                "packed source `{packed_weight_name}` rows ({total_rows}) not divisible by {n} slices; \
+                 GQA-packed qkv needs `synthesize_packed_row_split_sizes` with explicit per-slice row counts",
+            );
+        }
+        let rows_per_slice = total_rows / n;
+        let sized: Vec<(&str, usize)> =
+            split_targets.iter().map(|t| (*t, rows_per_slice)).collect();
+        self.synthesize_packed_row_split_sizes(packed_prefix, &sized)
+    }
+
+    /// Sized-split sibling of `synthesize_packed_row_split`. Takes
+    /// per-slice row counts so GQA-packed qkv (q and kv slices differ
+    /// in output dim) and any other non-even split can be materialized.
+    ///
+    /// `split_targets` is `&[(suffix, rows)]`; the sum of `rows` must
+    /// equal the packed tensor's first dim. Bias, if present on the
+    /// packed parent, is split the same way.
+    ///
+    /// Used by ferrite-forward's manifest-driven `__packed_splits__`
+    /// prelude (codegen emits one call per layer × packed-prefix before
+    /// any `Weights::load` field read). No-op when the packed tensor
+    /// isn't present — returns `Ok(false)` so non-packed checkpoints
+    /// (Llama, Mistral, …) fall through unharmed.
+    pub fn synthesize_packed_row_split_sizes(
+        &mut self,
+        packed_prefix: &str,
+        split_targets: &[(&str, usize)],
+    ) -> Result<bool> {
+        let packed_weight_name = format!("{packed_prefix}.weight");
+        if !self.tensors.contains_key(&packed_weight_name) {
+            return Ok(false);
+        }
+        let grandparent = packed_prefix
+            .rsplit_once('.')
+            .map(|(p, _)| p)
+            .ok_or_else(|| anyhow::anyhow!("packed prefix has no parent: {packed_prefix}"))?;
+
+        if split_targets.is_empty() {
+            anyhow::bail!("synthesize_packed_row_split_sizes: empty split_targets");
+        }
+
+        let packed_weight = self.tensors.remove(&packed_weight_name).expect("contains");
+        if packed_weight.shape.len() != 2 {
+            anyhow::bail!(
+                "packed source `{packed_weight_name}` has rank {}, expected 2",
+                packed_weight.shape.len(),
+            );
+        }
+        let total_rows = packed_weight.shape[0];
+        let hidden = packed_weight.shape[1];
+        let sum_rows: usize = split_targets.iter().map(|(_, r)| *r).sum();
+        if sum_rows != total_rows {
+            anyhow::bail!(
+                "packed source `{packed_weight_name}` rows ({total_rows}) != sum of split sizes ({sum_rows}) \
+                 across {:?}",
+                split_targets
+                    .iter()
+                    .map(|(s, r)| format!("{s}={r}"))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let elem = packed_weight.dtype.size_bytes();
+
+        let mut row_offset = 0usize;
+        for (target, rows) in split_targets {
+            let slice_bytes = rows * hidden * elem;
+            let vname = format!("{grandparent}.{target}.weight");
+            let entry = CpuTensorRef {
+                mmap: packed_weight.mmap.clone(),
+                data_offset: packed_weight.data_offset + row_offset * hidden * elem,
+                size_bytes: slice_bytes,
+                shape: vec![*rows, hidden],
+                dtype: packed_weight.dtype,
+                owned: packed_weight.owned.clone(),
+            };
+            self.tensors.insert(vname, entry);
+            row_offset += rows;
+        }
+
+        let packed_bias_name = format!("{packed_prefix}.bias");
+        if let Some(packed_bias) = self.tensors.remove(&packed_bias_name) {
+            if packed_bias.shape.len() != 1 || packed_bias.shape[0] != total_rows {
+                anyhow::bail!(
+                    "packed bias `{packed_bias_name}` shape {:?} inconsistent with weight rows {total_rows}",
+                    packed_bias.shape,
+                );
+            }
+            let belem = packed_bias.dtype.size_bytes();
+            let mut row_offset = 0usize;
+            for (target, rows) in split_targets {
+                let bslice_bytes = rows * belem;
+                let vname = format!("{grandparent}.{target}.bias");
+                let entry = CpuTensorRef {
+                    mmap: packed_bias.mmap.clone(),
+                    data_offset: packed_bias.data_offset + row_offset * belem,
+                    size_bytes: bslice_bytes,
+                    shape: vec![*rows],
+                    dtype: packed_bias.dtype,
+                    owned: packed_bias.owned.clone(),
+                };
+                self.tensors.insert(vname, entry);
+                row_offset += rows;
+            }
+        }
+
+        Ok(true)
+    }
+
     /// Number of loaded tensors.
     pub fn len(&self) -> usize {
         self.tensors.len()

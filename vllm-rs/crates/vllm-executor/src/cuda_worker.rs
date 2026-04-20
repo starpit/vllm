@@ -96,6 +96,12 @@ pub struct CudaWorkerConfig {
     pub calculate_kv_scales: bool,
     /// EOS token IDs for seal-pad processor (from model config).
     pub eos_token_ids: Vec<u32>,
+    /// Runtime `max_model_len` (CLI `--max-model-len`). `None` falls
+    /// back to `hf_config.max_position_embeddings` at load time.
+    /// Threaded into ferrite's `try_load` so Phi-3 LongRoPE can
+    /// decide `use_long_rope = max_model_len > original_max_pos`
+    /// the same way Python vLLM does at init time.
+    pub max_model_len: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +126,6 @@ pub struct CudaWorkerConfig {
 /// here.
 pub struct FerriteModel {
     pub weights: Box<dyn ferrite_forward::FerriteWeights>,
-    pub rotary: vllm_cuda::rotary::RotaryCache,
 }
 
 /// Supported model architectures in the vllm-cuda backend.
@@ -341,7 +346,6 @@ impl CudaModel {
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
-                    rotary: &m.rotary,
                 };
                 m.weights.forward_backbone(&ctx, device, num_tokens)
             },
@@ -535,7 +539,6 @@ impl CudaModel {
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
-                    rotary: &m.rotary,
                 };
                 let logits = m.weights.forward(&ctx, device, num_tokens);
                 match last_token_indices {
@@ -5051,28 +5054,43 @@ impl Worker for CudaWorker {
             && !disable_ferrite;
         let ferrite_loaded: Option<CudaModel> = if ferrite_eligible {
             let stream = device.compute_stream;
+            // Thread a minimal HF-config view into ferrite so per-
+            // variant `fingerprint_matches` can disambiguate
+            // checkpoints that share tensor shapes but differ in
+            // config-only fields (Phi-3-mini-4k vs Phi-3.5-mini-128k
+            // — same weights, different `max_position_embeddings` +
+            // `rope_scaling.type`). Ferrite owns the rest.
+            let hf_fp = ferrite_forward::HfFingerprint {
+                max_position_embeddings: hf_config.max_position_embeddings.map(|v| v as u64),
+                rope_scaling_type: hf_config
+                    .extra
+                    .get("rope_scaling")
+                    .and_then(|rs| rs.get("rope_type").or_else(|| rs.get("type")))
+                    .and_then(|v| v.as_str()),
+                rope_scaling_hash: hf_config
+                    .extra
+                    .get("rope_scaling")
+                    .map(ferrite_forward::hash_json_value),
+            };
+            // Runtime `max_model_len` — matches the serve-level
+            // resolution (CLI `--max-model-len` ∨ HF
+            // `max_position_embeddings` ∨ 4096) so Phi-3 LongRoPE's
+            // `use_long_rope = max_model_len > original_max_pos`
+            // flag agrees with Python vLLM at init time.
+            let max_model_len = self
+                .config
+                .max_model_len
+                .or(hf_config.max_position_embeddings)
+                .unwrap_or(4096);
             if let Some(ferrite_weights) =
-                ferrite_forward::try_load(&mut weights, stream, arch.as_str())
+                ferrite_forward::try_load(&mut weights, stream, arch.as_str(), max_model_len, hf_fp)
                     .map_err(|e| ExecutorError::WorkerInit(format!("ferrite-forward load: {e}")))?
             {
-                // Rotary cache is uniform across ferrite arches — the
-                // params come from the same HF config fields for every
-                // decoder-only transformer. Build once using the
-                // llama-shaped config helper (safe: Gemma2 etc have no
-                // `rope_scaling` of type `llama3`, so the helper
-                // returns `None` for the scaling).
-                let config = llama_config_from_hf(&hf_config)?;
-                let rotary = unsafe {
-                    vllm_cuda::rotary::RotaryCache::new(
-                        config.head_dim,
-                        config.max_position_embeddings,
-                        config.rope_theta,
-                        config.llama3_rope_scaling.as_ref(),
-                        dtype,
-                        device,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerInit(format!("rotary build: {e}")))?;
+                // Ferrite owns rotary construction: the emitted
+                // `Weights::load` built the RotaryCache (plus any
+                // dual-rotary arch-local variant) inline from the
+                // manifest's bounds/scalars/rope_scaling. Nothing
+                // for the executor to do.
                 info!(
                     "CudaWorker: loaded {} via ferrite-forward ({})",
                     arch,
@@ -5080,7 +5098,6 @@ impl Worker for CudaWorker {
                 );
                 Some(CudaModel::Ferrite(Box::new(FerriteModel {
                     weights: ferrite_weights,
-                    rotary,
                 })))
             } else {
                 None

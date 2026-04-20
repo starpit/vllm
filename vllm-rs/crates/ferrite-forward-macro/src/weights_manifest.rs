@@ -23,9 +23,22 @@ use crate::shape::{Dim, Shape, canonical_mul};
 
 /// Parsed `weights.json`. Keys are dotted weight paths (e.g.
 /// `"self_attn.q_proj"`), values are symbolic shapes (`Vec<Dim>`).
+///
+/// An optional `__packed_splits__` top-level key declares checkpoints
+/// that ship fused tensors on disk (e.g. Phi-3's `self_attn.qkv_proj.weight`,
+/// `mlp.gate_up_proj.weight`) instead of the per-slice logical tensors
+/// the DSL references. Each entry maps the packed prefix (unindexed —
+/// the codegen fans over `model.layers.{L}.…`) to an ordered list of
+/// target paths; each target must itself appear in `entries`, and its
+/// first-dim shape formula is the per-slice row count. At load time the
+/// codegen-emitted prelude calls
+/// [`GpuWeights::synthesize_packed_row_split_sizes`] per (layer, packed
+/// prefix), splitting the mmap into virtual siblings before any
+/// `Linear::load` runs.
 #[derive(Debug, Default, Clone)]
 pub struct WeightsManifest {
     pub entries: BTreeMap<String, Shape>,
+    pub packed_splits: BTreeMap<String, Vec<String>>,
 }
 
 impl WeightsManifest {
@@ -54,7 +67,10 @@ impl WeightsManifest {
             let shape: Shape = dims.iter().map(|d| parse_dim(d).unwrap()).collect();
             out.insert((*path).to_string(), shape);
         }
-        Self { entries: out }
+        Self {
+            entries: out,
+            packed_splits: BTreeMap::new(),
+        }
     }
 
     /// The convention set the original `weight_conventions.rs` table
@@ -162,7 +178,35 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
         reason: "expected a JSON object".into(),
     })?;
     let mut entries: BTreeMap<String, Shape> = BTreeMap::new();
+    let mut packed_splits: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (k, v) in obj {
+        if k == "__packed_splits__" {
+            let map = v.as_object().ok_or_else(|| ManifestError::BadShape {
+                path: path.to_path_buf(),
+                weight: k.clone(),
+                reason: "`__packed_splits__` must be an object".into(),
+            })?;
+            for (packed, targets_v) in map {
+                let arr = targets_v
+                    .as_array()
+                    .ok_or_else(|| ManifestError::BadShape {
+                        path: path.to_path_buf(),
+                        weight: packed.clone(),
+                        reason: "packed-split value must be an array of target paths".into(),
+                    })?;
+                let mut targets = Vec::with_capacity(arr.len());
+                for (i, item) in arr.iter().enumerate() {
+                    let s = item.as_str().ok_or_else(|| ManifestError::BadShape {
+                        path: path.to_path_buf(),
+                        weight: packed.clone(),
+                        reason: format!("target {i} is not a string"),
+                    })?;
+                    targets.push(s.to_string());
+                }
+                packed_splits.insert(packed.clone(), targets);
+            }
+            continue;
+        }
         let shape = parse_shape(v).map_err(|reason| ManifestError::BadShape {
             path: path.to_path_buf(),
             weight: k.clone(),
@@ -170,7 +214,10 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
         })?;
         entries.insert(k.clone(), shape);
     }
-    Ok(WeightsManifest { entries })
+    Ok(WeightsManifest {
+        entries,
+        packed_splits,
+    })
 }
 
 /// Parse a JSON shape value — must be an array of strings, each

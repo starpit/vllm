@@ -1948,9 +1948,10 @@ fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
 
 /// Return the `cos_sin_cache` TokenStream for a rope-related tile.
 /// Checks whether the tile (or any tile in `claimed`) carries an
-/// `ExternKind::RotaryLocal` input; if so emits `wm.rotary_local`
-/// (arch-specific field on the Weights struct), otherwise
-/// `ctx.rotary` (from ForwardCtx).
+/// `ExternKind::RotaryLocal` input; if so emits `wm.rotary_local`,
+/// otherwise `wm.rotary`. Both are macro-emitted fields on the
+/// per-arch `Weights` struct — ferrite owns rotary end-to-end and
+/// `ForwardCtx` carries no rotary.
 fn rotary_cos_sin_tokens(fuf: &Fuf, claimed: &[TileId]) -> TokenStream {
     let uses_local = claimed.iter().any(|&tid| {
         fuf.get(tid).inputs.iter().any(|i| {
@@ -1966,7 +1967,7 @@ fn rotary_cos_sin_tokens(fuf: &Fuf, claimed: &[TileId]) -> TokenStream {
     if uses_local {
         quote! { wm.rotary_local.cos_sin_cache }
     } else {
-        quote! { ctx.rotary.cos_sin_cache }
+        quote! { wm.rotary.cos_sin_cache }
     }
 }
 
@@ -8603,7 +8604,7 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        wm.rotary.cos_sin_cache,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -8620,7 +8621,7 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        wm.rotary.cos_sin_cache,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -8763,7 +8764,7 @@ impl Implementation for Bnb4FusedQkvRopePrefillImpl {
                 ::ferrite_kernels::kernels::fused_qkv_rope(
                     *qkv_packed,
                     *ctx.positions,
-                    ctx.rotary.cos_sin_cache,
+                    wm.rotary.cos_sin_cache,
                     #q_size,
                     #kv_size,
                     #num_q_heads,
@@ -8914,8 +8915,8 @@ fn emit_fi_decode_body(ctx: &EmitCtx, head_dim: u32, use_logits_soft_cap: bool) 
                     let has_spans = !ctx.kv_cache.block_unrotated_gpu().is_null();
                     let (cos_sin_ptr, rotary_dim) = if has_spans {
                         (
-                            ctx.rotary.cos_sin_cache.raw_ptr() as *const u8,
-                            ctx.rotary.cos_sin_cache.dim(1),
+                            wm.rotary.cos_sin_cache.raw_ptr() as *const u8,
+                            wm.rotary.cos_sin_cache.dim(1),
                         )
                     } else {
                         (::std::ptr::null::<u8>(), 0)
@@ -9224,6 +9225,8 @@ mod tests {
             tie_word_embeddings: false,
             architectures: Vec::new(),
             extra_tracked_paths: Vec::new(),
+            rope_scaling: None,
+            rope_scaling_hash: None,
         };
 
         let scale = attention_scale_for(&model);

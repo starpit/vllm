@@ -245,7 +245,6 @@ pub fn check_logprobs_close_with_threshold(
     prompt_idx: usize,
     late_divergence_threshold: usize,
 ) {
-    let late_divergence_threshold = late_divergence_threshold;
     // Shadow the former `const` with the runtime value to keep the
     // body below identical to the pre-existing implementation.
     #[allow(non_snake_case)]

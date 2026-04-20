@@ -409,6 +409,14 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             // bodies, so variants with different tie settings
             // can't share a compiled `load_with`.
             parts.push(format!("t:{}", self.model.tie_word_embeddings));
+            // `rope_scaling` (short/long_factor, type, orig_max) is
+            // baked into `RotaryCache::new_*` as literal arguments in
+            // `load_with`. Two variants with identical bounds +
+            // scalars but different `rope_scaling` (Phi-4-mini-instruct
+            // vs Phi-4-mini-reasoning: all-1.0 short_factor vs the
+            // non-trivial vector) MUST NOT share a canonical — the
+            // shim would bake the canonical's rotary for both.
+            parts.push(format!("r:{}", self.model.rope_scaling_hash.unwrap_or(0)));
             // SFUF per (num_tokens, sk_bucket) point: which Impl runs
             // at each subgraph. Identical SFUFs → each impl's
             // `emit_call` produces identical output at identical
@@ -658,9 +666,9 @@ fn emit_arch_dispatcher(
         .map(|(model_ident, _)| {
             let variant_ident = pascal_case(model_ident);
             quote! {
-                if #model_ident::fingerprint_matches(gw) {
+                if #model_ident::fingerprint_matches(gw, hf) {
                     return Ok(Some(Self::#variant_ident(
-                        #model_ident::load(gw, stream)?,
+                        #model_ident::load(gw, stream, max_model_len)?,
                     )));
                 }
             }
@@ -761,6 +769,8 @@ fn emit_arch_dispatcher(
             pub fn load(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
+                max_model_len: usize,
+                hf: ::ferrite_forward::HfFingerprint<'_>,
             ) -> ::anyhow::Result<Option<Self>> {
                 #(#try_fingerprint_arms)*
                 Ok(None)
@@ -849,8 +859,8 @@ fn emit_arch_dispatcher(
             ::ferrite_forward::FerriteArchRegistration {
                 arch_name: #arch_name_lit,
                 hf_arches: &[#(#hf_arch_lits),*],
-                try_load: |gw, stream| {
-                    Weights::load(gw, stream).map(|opt| {
+                try_load: |gw, stream, max_model_len, hf| {
+                    Weights::load(gw, stream, max_model_len, hf).map(|opt| {
                         opt.map(|w| ::std::boxed::Box::new(w)
                             as ::std::boxed::Box<dyn ::ferrite_forward::FerriteWeights>)
                     })

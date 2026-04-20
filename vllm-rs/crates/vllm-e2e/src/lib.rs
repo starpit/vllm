@@ -76,10 +76,90 @@ impl TestModels {
     #[cfg(feature = "cuda")]
     pub const PHI3_5: &str = "unsloth/Phi-3.5-mini-instruct";
 
+    // Phi-3-mini-4k-instruct — `Phi3ForCausalLM`, dense bf16, MHA
+    // (32 q-heads == 32 kv-heads), no LongRoPE (`rope_scaling: null`,
+    // max_position_embeddings=4096). First ferrite arch with packed
+    // on-disk weights (`self_attn.qkv_proj.weight` + `mlp.gate_up_proj.weight`);
+    // the loader slices them back into the five logical tensors the
+    // DSL body references.
+    #[cfg(feature = "cuda")]
+    pub const PHI3_MINI_4K_CUDA: &str = "microsoft/Phi-3-mini-4k-instruct";
+
+    // Phi-3-medium-4k-instruct — `Phi3ForCausalLM`, dense bf16, GQA
+    // (40 q-heads, 10 kv-heads, head_dim=128, hidden=5120,
+    // intermediate=17920, 40 layers). `rope_scaling: null`,
+    // max_position_embeddings=4096 — no LongRoPE. On-disk packed
+    // `self_attn.qkv_proj.weight` (`[5120+2*1280, 5120]`) is a GQA
+    // split, which the manifest-driven `__packed_splits__` prelude
+    // handles by emitting per-slice row counts from the manifest.
+    #[cfg(feature = "cuda")]
+    pub const PHI3_MEDIUM_4K_CUDA: &str = "microsoft/Phi-3-medium-4k-instruct";
+
+    // Phi-3.5-mini-instruct — `Phi3ForCausalLM`, dense bf16, MHA
+    // (same shapes as Phi-3-mini-4k: hidden=3072, heads=32, kv=32,
+    // head_dim=96, 32 layers, intermediate=8192) BUT
+    // max_position_embeddings=131072 with LongRoPE (su-scaling):
+    // `rope_scaling: { type: "longrope", short_factor: [48 floats],
+    // long_factor: [48 floats], original_max_position_embeddings=4096 }`.
+    // Points at microsoft's official repo — the unsloth mirror that
+    // the pre-existing `PHI3_5` const uses has been re-exported as
+    // `LlamaForCausalLM` with LongRoPE stripped, which is useless for
+    // testing this path.
+    #[cfg(feature = "cuda")]
+    pub const PHI3_5_MINI_CUDA: &str = "microsoft/Phi-3.5-mini-instruct";
+
     #[cfg(feature = "metal")]
     pub const PHI4: &str = "mlx-community/Unsloth-Phi-4-mini-instruct-4bit";
     #[cfg(feature = "cuda")]
     pub const PHI4: &str = "unsloth/Phi-4-mini-instruct";
+
+    // Phi-4-mini-instruct — `Phi3ForCausalLM`, dense bf16, GQA
+    // (hidden=3072, heads=24, kv=8, head_dim=128, 32 layers,
+    // intermediate=8192), `partial_rotary_factor=0.75` ⇒ rotary_dim=96
+    // with LongRoPE (su-scaling; factor vectors are length
+    // rotary_dim/2 = 48, not head_dim/2 = 64). `tie_word_embeddings=true`
+    // (first in the Phi-3 family). Points at microsoft's official
+    // repo to mirror PHI3_MINI_4K_CUDA / PHI3_5_MINI_CUDA; `PHI4`
+    // above points at unsloth (still Phi3ForCausalLM + longrope +
+    // partial_rotary, verified).
+    #[cfg(feature = "cuda")]
+    pub const PHI4_MINI_CUDA: &str = "microsoft/Phi-4-mini-instruct";
+
+    // Phi-3-mini-128k-instruct — same shapes as mini-4k (MHA, no
+    // partial rotary) but max_pos=131072 with LongRoPE. Config-drop
+    // on top of the phi3.5-mini-style rotary path.
+    #[cfg(feature = "cuda")]
+    pub const PHI3_MINI_128K_CUDA: &str = "microsoft/Phi-3-mini-128k-instruct";
+
+    // Phi-3-medium-128k-instruct — GQA (40 q, 10 kv, head_dim=128,
+    // hidden=5120) + LongRoPE. 14B bf16; won't fit on L4, golden
+    // must be generated on an A100 / H100.
+    #[cfg(feature = "cuda")]
+    pub const PHI3_MEDIUM_128K_CUDA: &str = "microsoft/Phi-3-medium-128k-instruct";
+
+    // Phi-4 (the full 14B, not mini) — GQA 40/10, head_dim=128,
+    // hidden=5120, no rope_scaling, no partial rotary. 14B bf16;
+    // won't fit on L4.
+    #[cfg(feature = "cuda")]
+    pub const PHI4_FULL_CUDA: &str = "microsoft/Phi-4";
+
+    // Phi-4-reasoning — same shape as Phi-4 but
+    // `partial_rotary_factor=1.0` (normalized to full rotary in the
+    // codegen) and max_pos=32768. 14B bf16; A100-class required.
+    #[cfg(feature = "cuda")]
+    pub const PHI4_REASONING_CUDA: &str = "microsoft/Phi-4-reasoning";
+
+    // Phi-4-reasoning-plus — same as reasoning (identical shapes +
+    // config discriminators). Dedup may collapse the forward fn with
+    // Phi-4-reasoning's.
+    #[cfg(feature = "cuda")]
+    pub const PHI4_REASONING_PLUS_CUDA: &str = "microsoft/Phi-4-reasoning-plus";
+
+    // Phi-4-mini-reasoning — identical config shape to
+    // Phi-4-mini-instruct (GQA 24/8, partial=0.75, longrope, tied
+    // lm_head). Fits on L4.
+    #[cfg(feature = "cuda")]
+    pub const PHI4_MINI_REASONING_CUDA: &str = "microsoft/Phi-4-mini-reasoning";
 
     #[cfg(feature = "metal")]
     pub const MISTRAL: &str = "mlx-community/Mistral-7B-Instruct-v0.3-4bit";

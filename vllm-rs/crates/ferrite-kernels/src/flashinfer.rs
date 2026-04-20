@@ -317,9 +317,9 @@ impl FlashInferPlanCache {
     }
 
     /// Ensure workspaces are allocated for `cfg`. Only rebuilds (plan_delete
-    /// + plan_new) when the config changes or on first call. Does NOT run the
-    /// scheduler — callers MUST follow up with [`Self::replan`] (once per
-    /// forward step) then [`Self::set_io`] + [`Self::run`] per layer.
+    ///     + plan_new) when the config changes or on first call. Does NOT run the
+    ///     scheduler — callers MUST follow up with [`Self::replan`] (once per
+    ///     forward step) then [`Self::set_io`] + [`Self::run`] per layer.
     ///
     /// # Safety
     /// All pointer args must be valid at the time of the call if a rebuild
@@ -329,7 +329,7 @@ impl FlashInferPlanCache {
         &mut self,
         cfg: FlashInferConfig,
         num_tokens: u32,
-        sk_bucket: u32,
+        _sk_bucket: u32,
         q: *const c_void,
         k: *const c_void,
         v: *const c_void,

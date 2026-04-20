@@ -16,6 +16,7 @@ extern crate ferrite_model_gemma3 as _keep_gemma3;
 extern crate ferrite_model_granite as _keep_granite;
 extern crate ferrite_model_llama as _keep_llama;
 extern crate ferrite_model_mistral as _keep_mistral;
+extern crate ferrite_model_phi3 as _keep_phi3;
 extern crate ferrite_model_qwen2 as _keep_qwen2;
 extern crate ferrite_model_qwen3 as _keep_qwen3;
 
@@ -25,5 +26,6 @@ pub use ferrite_model_gemma3 as gemma3;
 pub use ferrite_model_granite as granite;
 pub use ferrite_model_llama as llama;
 pub use ferrite_model_mistral as mistral;
+pub use ferrite_model_phi3 as phi3;
 pub use ferrite_model_qwen2 as qwen2;
 pub use ferrite_model_qwen3 as qwen3;

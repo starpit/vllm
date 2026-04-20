@@ -73,6 +73,49 @@ pub struct ModelParams {
     /// each to its `include_str!` tracking list so cargo rebuilds
     /// on any overlay/override edit, not just on dense-base edits.
     pub extra_tracked_paths: Vec<PathBuf>,
+    /// Parsed `rope_scaling` subobject, if present. Drives the
+    /// `RotaryCache` constructor picked in the emitted `Weights::load`.
+    /// `None` = no scaling (standard `new_from_stream` with plain
+    /// base freqs).
+    pub rope_scaling: Option<RopeScaling>,
+    /// Deterministic content hash of the raw `rope_scaling` JSON
+    /// subobject, baked into this variant's `fingerprint_matches`.
+    /// Discriminates checkpoints that share `type` +
+    /// `max_position_embeddings` but differ in `short_factor` /
+    /// `long_factor` — e.g. Phi-3.5-mini vs Phi-3-mini-128k,
+    /// Phi-4-mini-instruct vs Phi-4-mini-reasoning. `None` when the
+    /// config has no `rope_scaling`.
+    pub rope_scaling_hash: Option<u64>,
+}
+
+/// Arch-agnostic rope-scaling flavor parsed from `config.json`.
+/// Integer-valued `original_max_position_embeddings` is kept as
+/// `u64` so both `bounds` readers and the rotary kernels (which
+/// want `usize`) can consume it without ambiguity.
+#[derive(Clone, Debug)]
+pub enum RopeScaling {
+    /// `rope_scaling.type == "llama3"` — frequency-bucketed scaling
+    /// used by Llama-3.x. All fields come from `rope_scaling.*`.
+    Llama3 {
+        factor: f64,
+        low_freq_factor: f64,
+        high_freq_factor: f64,
+        original_max_position_embeddings: u64,
+    },
+    /// `rope_scaling.type == "longrope"` or `"su"` — Phi-3 LongRoPE
+    /// (su-scaling). Factor vectors have length `rotary_dim/2`.
+    /// `short_mscale` / `long_mscale` default to the Phi-3 paper
+    /// formula when omitted from the config — Python vLLM's
+    /// `Phi3LongRoPEScaledRotaryEmbedding.__init__` materializes
+    /// the default from `scaling_factor = sqrt(1 + ln(max_pos/orig_max) / ln(orig_max))`
+    /// when the caller passes `None`.
+    LongRope {
+        short_factor: Vec<f64>,
+        long_factor: Vec<f64>,
+        original_max_position_embeddings: u64,
+        short_mscale: f64,
+        long_mscale: f64,
+    },
 }
 
 /// Errors produced while loading configs.
@@ -334,6 +377,8 @@ fn model_params_from_json(
                 .collect()
         })
         .unwrap_or_default();
+    let rope_scaling = extract_rope_scaling(json);
+    let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);
 
     Ok(ModelParams {
         name,
@@ -345,7 +390,145 @@ fn model_params_from_json(
         tie_word_embeddings,
         architectures,
         extra_tracked_paths,
+        rope_scaling,
+        rope_scaling_hash,
     })
+}
+
+/// Macro-side mirror of `ferrite_forward::hash_json_value` — the
+/// macro can't depend on `ferrite-forward` (cycle), so the same
+/// function body is duplicated here. Changes MUST stay in lockstep:
+/// the manifest hash baked at compile time only matches the
+/// runtime hash if both hashers agree bit-for-bit.
+fn hash_json_value(v: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn recurse<H: Hasher>(v: &serde_json::Value, h: &mut H) {
+        match v {
+            serde_json::Value::Null => 0u8.hash(h),
+            serde_json::Value::Bool(b) => {
+                1u8.hash(h);
+                b.hash(h);
+            }
+            serde_json::Value::Number(n) => {
+                2u8.hash(h);
+                let f = n.as_f64().unwrap_or(0.0);
+                f.to_bits().hash(h);
+            }
+            serde_json::Value::String(s) => {
+                3u8.hash(h);
+                s.hash(h);
+            }
+            serde_json::Value::Array(arr) => {
+                4u8.hash(h);
+                arr.len().hash(h);
+                for v in arr {
+                    recurse(v, h);
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                5u8.hash(h);
+                let mut keys: Vec<&String> = obj.keys().collect();
+                keys.sort();
+                keys.len().hash(h);
+                for k in keys {
+                    k.hash(h);
+                    recurse(&obj[k], h);
+                }
+            }
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    recurse(v, &mut h);
+    h.finish()
+}
+
+/// Parse the `rope_scaling` subobject into a [`RopeScaling`]. Returns
+/// `None` when the key is absent or the `type`/`rope_type` is neither
+/// `llama3`, `longrope`, nor `su`. Integer-ish fields are extracted
+/// via `as_u64` / `as_f64` so HF configs that write `4096` or `4096.0`
+/// both parse. `attention_factor` falls back to the Phi-3 paper
+/// formula when the config omits it.
+fn extract_rope_scaling(json: &serde_json::Value) -> Option<RopeScaling> {
+    let rs = json.get("rope_scaling")?;
+    let rope_type = rs
+        .get("rope_type")
+        .or_else(|| rs.get("type"))
+        .and_then(|v| v.as_str())?;
+    match rope_type {
+        "llama3" => {
+            let factor = rs.get("factor").and_then(|v| v.as_f64())?;
+            let low_freq_factor = rs
+                .get("low_freq_factor")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            let high_freq_factor = rs
+                .get("high_freq_factor")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(4.0);
+            let original_max_position_embeddings = rs
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8192);
+            Some(RopeScaling::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings,
+            })
+        }
+        "longrope" | "su" => {
+            let parse_factors = |key: &str| -> Option<Vec<f64>> {
+                rs.get(key)?
+                    .as_array()?
+                    .iter()
+                    .map(|v| v.as_f64())
+                    .collect()
+            };
+            let short_factor = parse_factors("short_factor")?;
+            let long_factor = parse_factors("long_factor")?;
+            let original_max_position_embeddings = rs
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    json.get("original_max_position_embeddings")
+                        .and_then(|v| v.as_u64())
+                })
+                .unwrap_or(4096);
+            let max_pos = json
+                .get("max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4096);
+            // Python vLLM's `Phi3LongRoPEScaledRotaryEmbedding.__init__`:
+            //   scale = max_pos / orig_max
+            //   scaling_factor = 1.0 if scale <= 1.0 else sqrt(1 + log(scale)/log(orig_max))
+            //   short_mscale = short_mscale or scaling_factor
+            //   long_mscale  = long_mscale  or scaling_factor
+            let scaling_factor = {
+                let scale = max_pos as f64 / original_max_position_embeddings as f64;
+                if scale <= 1.0 {
+                    1.0
+                } else {
+                    (1.0 + scale.ln() / (original_max_position_embeddings as f64).ln()).sqrt()
+                }
+            };
+            let short_mscale = rs
+                .get("short_mscale")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(scaling_factor);
+            let long_mscale = rs
+                .get("long_mscale")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(scaling_factor);
+            Some(RopeScaling::LongRope {
+                short_factor,
+                long_factor,
+                original_max_position_embeddings,
+                short_mscale,
+                long_mscale,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Recursive deep-merge of JSON objects. When both sides agree on

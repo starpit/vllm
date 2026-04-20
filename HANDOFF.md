@@ -1114,6 +1114,112 @@ Four commits previously on `worktree-ferrite-forward`:
   for the `FieldLoad::Fp8Linear` codegen arm below, else
   `compile_error!` fires on the storage/accessor mismatch check.
 
+----
+
+**Phi-3/Phi-4 family status (post-rotary-refactor).** The ferrite
+rotary refactor (this commit) brought 10 `Phi3ForCausalLM` manifests
+into the compiler. L4 test matrix:
+
+| Variant                          | L4 golden | L4 test | Notes |
+|---|---|---|---|
+| Phi-3-mini-4k-instruct           | ✅        | ✅       | dense MHA, no scaling |
+| Phi-3-mini-128k-instruct         | ✅        | ❌       | **Unresolved divergence** — see "phi3-mini-128k investigation" |
+| Phi-3.5-mini-instruct            | ✅        | ✅       | MHA + LongRoPE |
+| Phi-3-medium-4k-instruct         | ✅ (A100) | OOM     | 14B; A100-generated golden committed earlier |
+| Phi-3-medium-128k-instruct       | ❌ (need A100) | OOM | 14B GQA + LongRoPE |
+| Phi-4-mini-instruct              | ✅        | ✅       | GQA + partial (0.75) + LongRoPE + tied |
+| Phi-4-mini-reasoning             | ✅        | ✅       | same shape as phi4-mini-instruct |
+| Phi-4                            | ❌ (need A100) | OOM | 14B GQA, no scaling |
+| Phi-4-reasoning                  | ❌ (need A100) | OOM | 14B GQA + `partial=1.0` (normalized to full rotary) |
+| Phi-4-reasoning-plus             | ❌ (need A100) | OOM | same shape as phi4-reasoning |
+
+**Generate missing goldens on A100:**
+```bash
+python scripts/generate_golden_refs.py \
+  phi3_medium_128k_instruct phi4 phi4_reasoning phi4_reasoning_plus
+```
+Each is 14B × bf16 ≈ 28 GiB weights. `generate_golden_refs.py` uses
+`max_model_len=2048` so KV cache needs ≈ 1 GiB — fits A100 40 GB.
+
+### Rotary refactor
+
+Phi-3's LongRoPE path was rewritten to match Python vLLM's
+`Phi3LongRoPEScaledRotaryEmbedding`
+(`vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.py`)
+1:1. Line-by-line audit landed:
+
+- **f32 throughout** the inv_freq + cache build (was f64). Mirrors
+  Python's `torch.float = float32` default. Final cast to bf16.
+- **Global `use_long_rope`** (not per-position switchover). Matches
+  Python: `use_long_rope = max_model_len > original_max_position_embeddings`.
+  Set at cache-build time; either `short_factor + short_mscale` OR
+  `long_factor + long_mscale` is baked for all positions, never
+  both. Previous per-position behavior was ferrite's invention and
+  matched Python only by coincidence on variants whose
+  `short_factor ≈ [1.0, ...]` (Phi-3.5-mini, Phi-4-mini-instruct).
+- **Separate `short_mscale` and `long_mscale`** (was one
+  `attention_factor`). Both default to the Phi-3 paper formula
+  `sqrt(1 + ln(max_pos/orig_max) / ln(orig_max))` when the config
+  omits them — same as Python.
+- **`max_model_len` threaded through** `try_load` → `Weights::load`
+  → `load_with` → `RotaryCache::new_longrope_from_stream` /
+  `new_partial_longrope_from_stream`. Resolved in `cuda_worker` as
+  `config.max_model_len.or(hf_config.max_position_embeddings).unwrap_or(4096)`
+  — same logic `vllm-serve/src/init.rs:432` uses.
+- **Test harness pins `--max-model-len=2048`** so the runtime
+  matches `generate_golden_refs.py`'s `LLM(..., max_model_len=2048)`
+  at `use_long_rope = 2048 > 4096 = False` (short path). Production
+  is unchanged — a user running `vllm serve microsoft/Phi-3-mini-128k-instruct`
+  gets max_model_len=131072 and ferrite's LONG-factor path, matching
+  Python at runtime.
+
+### phi3-mini-128k investigation (unresolved)
+
+Symptoms: on L4 with `--max-model-len=2048` pinned, prompt 4
+position 1 diverges — golden continues "In your narrative…",
+engine generates "Include the following elements…". Only 1 matched
+token.
+
+Ruled out (all verified):
+- Rotary cache values: bit-identical to Python's
+  `Phi3LongRoPEScaledRotaryEmbedding._compute_cos_sin_cache` at f32
+  precision for positions 0..10 (computed directly in Python + Rust,
+  compared).
+- Manifest vs HF-config `rope_scaling` subobject: bit-identical
+  (verified via `json.dumps(sort_keys=True)`).
+- Variant dispatch: `fingerprint_matches` bakes a unique
+  `rope_scaling_hash` per variant; no collisions with phi3-5-mini
+  (12929797932180859911 vs 1748216527533305547 in the emitted
+  code).
+- Cross-variant dedup: `dedup_signature` includes
+  `rope_scaling_hash`, so phi3-mini-128k's `Weights::load_with`
+  bakes its own short_factor=[1.1, 1.1, 1.3, …], not phi3-5-mini's.
+- Tokenizer: identical `tokenizer_config.json` to phi3-mini-4k
+  (same chat_template, add_bos, bos/eos). phi3-5-mini's template
+  differs but we load each model's own.
+- kernel: `pos_encoding_kernels.cu` is NeoX-style, identical math
+  to Python's `rotate_neox` (verified line-by-line).
+
+Still on the table:
+- Attention backend numerics (Python uses FLASH_ATTN;
+  ferrite picks from its solver).
+- Weight-load packing: `__packed_splits__` prelude handles
+  `qkv_proj` the same for all phi3 variants; phi3-mini-4k passes
+  with identical logic.
+- Golden regeneration at a larger `max_model_len` (exercises
+  long_factor path — currently unvalidated at L4 scale per
+  original Phi-3.5 handoff gotcha).
+
+Next session: add an eprintln in the emitted `Weights::load` that
+prints the first 8 bf16 cos values of the rotary cache, compare
+against Python's short_cache[0][:8] for phi3-mini-128k. If they
+agree, the divergence is NOT rotary — chase attention or weight
+loading. If they disagree, we have a concrete numerical target.
+
+----
+
+**FP8 continuation (below).**
+
 No arch opts in yet, so `compile_error!` on non-Dense FP8 doesn't
 fire. 24/24 parser tests + release build + fmt + clippy clean on
 touched crates.

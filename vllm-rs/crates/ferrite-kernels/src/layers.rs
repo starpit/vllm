@@ -18,6 +18,30 @@ use ferrite_cuda_core::nccl::NcclGroup;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// Packed-source fallback (Phi-3 family): on a missing `.weight`, detect
+// the conventional packed parent (`qkv_proj` for q/k/v; `gate_up_proj` for
+// gate/up) and ask `GpuWeights` to synthesize the per-slice virtual
+// entries before the take. Idempotent — if the sibling has already been
+// synthesized (by a prior call for q_proj, say), the packed parent is
+// already gone and this is a no-op.
+// ---------------------------------------------------------------------------
+
+fn try_synthesize_packed_slice(weights: &mut GpuWeights, prefix: &str) -> Result<()> {
+    let (parent, suffix) = match prefix.rsplit_once('.') {
+        Some(split) => split,
+        None => return Ok(()),
+    };
+    let (packed_suffix, targets): (&str, &[&str]) = match suffix {
+        "q_proj" | "k_proj" | "v_proj" => ("qkv_proj", &["q_proj", "k_proj", "v_proj"]),
+        "gate_proj" | "up_proj" => ("gate_up_proj", &["gate_proj", "up_proj"]),
+        _ => return Ok(()),
+    };
+    let packed_prefix = format!("{parent}.{packed_suffix}");
+    weights.synthesize_packed_row_split(&packed_prefix, targets)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Linear
 // ---------------------------------------------------------------------------
 
@@ -43,9 +67,23 @@ impl Linear {
     }
 
     /// Load from `GpuWeights` by prefix (e.g. "model.layers.0.self_attn.q_proj").
+    ///
+    /// Packed-source fallback: some checkpoints (Phi-3 family) ship
+    /// `self_attn.qkv_proj.weight` and `mlp.gate_up_proj.weight` in place
+    /// of the per-slice `q_proj`/`k_proj`/`v_proj` and `gate_proj`/`up_proj`
+    /// tensors the DSL body references. When `{prefix}.weight` is missing,
+    /// this function detects the packed-source convention by `prefix`'s
+    /// last path segment and asks `GpuWeights` to synthesize virtual
+    /// per-slice entries (even row-wise split) before the take. The
+    /// split is recoverable — later sibling calls reuse the synthesized
+    /// entries, so the packed tensor is walked once.
     pub fn load(weights: &mut GpuWeights, prefix: &str) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
         let bias_name = format!("{prefix}.bias");
+
+        if !weights.contains(&weight_name) {
+            try_synthesize_packed_slice(weights, prefix)?;
+        }
 
         let weight = weights.take(&weight_name)?;
         let bias = if weights.contains(&bias_name) {
@@ -563,6 +601,15 @@ impl LinearLayer {
     ) -> Result<Self> {
         if prefixes.is_empty() {
             anyhow::bail!("load_dense_concat: empty prefix list");
+        }
+
+        // Packed-source fallback: if any source .weight is missing, it
+        // may live under a packed parent (qkv_proj / gate_up_proj).
+        // Mirrors the fallback in `Linear::load`.
+        for p in prefixes {
+            if !weights.contains(&format!("{p}.weight")) {
+                try_synthesize_packed_slice(weights, p)?;
+            }
         }
 
         // First pass: resolve shapes/dtype from CPU-side metadata.

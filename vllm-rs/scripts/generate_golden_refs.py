@@ -15,6 +15,7 @@ Python vLLM's output.
 """
 
 import json
+import sys
 from pathlib import Path
 
 from vllm import LLM, SamplingParams
@@ -99,6 +100,43 @@ MODELS = {
     "gemma3_1b_fp8_dynamic": "RedHatAI/gemma-3-1b-it-FP8-dynamic",
     "granite_3_1_2b_fp8_dynamic": "RedHatAI/granite-3.1-2b-instruct-FP8-dynamic",
     "mistral_7b_v03_fp8_dynamic": "nm-testing/Mistral-7B-Instruct-v0.3-FP8-Dynamic",
+    # Phi-3-mini-4k-instruct — `Phi3ForCausalLM`, dense bf16, MHA,
+    # no LongRoPE. Matches `TestModels::PHI3_MINI_4K_CUDA`. First
+    # ferrite arch with packed on-disk weights (`qkv_proj`,
+    # `gate_up_proj`); exercises `LinearLayer::load_dense`'s
+    # packed-split fallback.
+    "phi3_mini_4k_instruct": "microsoft/Phi-3-mini-4k-instruct",
+    # Phi-3-medium-4k-instruct — `Phi3ForCausalLM`, dense bf16, GQA
+    # (40 q-heads, 10 kv-heads, head_dim=128, hidden=5120). Matches
+    # `TestModels::PHI3_MEDIUM_4K_CUDA`. Exercises the manifest-driven
+    # `__packed_splits__` prelude with unequal per-slice row counts.
+    "phi3_medium_4k_instruct": "microsoft/Phi-3-medium-4k-instruct",
+    # Phi-3.5-mini-instruct — `Phi3ForCausalLM`, dense bf16, MHA, same
+    # shapes as Phi-3-mini-4k but max_position_embeddings=131072 with
+    # LongRoPE. Matches `TestModels::PHI3_5_MINI_CUDA`. Short prompts
+    # keep positions < 4096 (short_factor regime).
+    "phi3_5_mini_instruct": "microsoft/Phi-3.5-mini-instruct",
+    # Phi-4-mini-instruct — `Phi3ForCausalLM`, dense bf16 GQA
+    # (24 q-heads, 8 kv-heads, head_dim=128), `partial_rotary_factor=0.75`
+    # ⇒ rotary_dim=96 combined with LongRoPE (factor vectors length
+    # rotary_dim/2 = 48) and `tie_word_embeddings=true`. Matches
+    # `TestModels::PHI4_MINI_CUDA`. Fits L4 at bf16 (≈3.8B × 2 ≈ 7.6 GB).
+    "phi4_mini_instruct": "microsoft/Phi-4-mini-instruct",
+    # Phi-3-mini-128k — MHA + LongRoPE (same-shape variant of
+    # mini-4k / 3.5-mini; disambiguated via max_position_embeddings).
+    "phi3_mini_128k_instruct": "microsoft/Phi-3-mini-128k-instruct",
+    # Phi-3-medium-128k — GQA 40/10 + LongRoPE. 14B bf16, A100-class.
+    "phi3_medium_128k_instruct": "microsoft/Phi-3-medium-128k-instruct",
+    # Phi-4 (14B, not mini) — GQA 40/10, no scaling. A100-class.
+    "phi4": "microsoft/Phi-4",
+    # Phi-4-reasoning — GQA 40/10, `partial_rotary_factor=1.0`
+    # (normalized to full rotary). A100-class.
+    "phi4_reasoning": "microsoft/Phi-4-reasoning",
+    # Phi-4-reasoning-plus — same shape as Phi-4-reasoning. A100-class.
+    "phi4_reasoning_plus": "microsoft/Phi-4-reasoning-plus",
+    # Phi-4-mini-reasoning — GQA 24/8, partial=0.75, longrope, tied
+    # (identical shape to Phi-4-mini-instruct). Fits on L4.
+    "phi4_mini_reasoning": "microsoft/Phi-4-mini-reasoning",
 }
 
 MAX_TOKENS = 32
@@ -184,8 +222,12 @@ def generate_for_model(model_id: str, output_key: str):
 
 
 def main():
-    for key, model_id in MODELS.items():
-        generate_for_model(model_id, key)
+    # Optional CLI args: one or more golden keys to regenerate. Defaults to all.
+    selected = sys.argv[1:] if len(sys.argv) > 1 else list(MODELS.keys())
+    for key in selected:
+        if key not in MODELS:
+            raise SystemExit(f"unknown golden key: {key}. known: {sorted(MODELS)}")
+        generate_for_model(MODELS[key], key)
     print("Done!")
 
 

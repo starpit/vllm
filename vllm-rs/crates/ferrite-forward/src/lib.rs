@@ -9,17 +9,76 @@ pub use ferrite_forward_macro::forward;
 
 pub mod cpu_golden;
 
+/// Deterministic hash of a `serde_json::Value` for `HfFingerprint`
+/// content discrimination. Canonicalizes object key order and
+/// hashes numbers as f64 bits so manifest-time and runtime produce
+/// the same output regardless of how the JSON was parsed.
+///
+/// Used to distinguish checkpoints whose `rope_scaling` has the same
+/// `type` + `max_position_embeddings` but different `short_factor` /
+/// `long_factor` vectors (Phi-3.5-mini vs Phi-3-mini-128k,
+/// Phi-4-mini-instruct vs Phi-4-mini-reasoning). The macro's
+/// `emit_fingerprint_check` bakes the manifest's hash as a `u64`
+/// literal; the executor passes the live HF config's hash via
+/// `HfFingerprint::rope_scaling_hash`.
+pub fn hash_json_value(v: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn recurse<H: Hasher>(v: &serde_json::Value, h: &mut H) {
+        match v {
+            serde_json::Value::Null => 0u8.hash(h),
+            serde_json::Value::Bool(b) => {
+                1u8.hash(h);
+                b.hash(h);
+            }
+            serde_json::Value::Number(n) => {
+                2u8.hash(h);
+                // Canonicalize as f64 bits so `10000` vs `10000.0`
+                // produce the same hash across JSON parsers.
+                let f = n.as_f64().unwrap_or(0.0);
+                f.to_bits().hash(h);
+            }
+            serde_json::Value::String(s) => {
+                3u8.hash(h);
+                s.hash(h);
+            }
+            serde_json::Value::Array(arr) => {
+                4u8.hash(h);
+                arr.len().hash(h);
+                for v in arr {
+                    recurse(v, h);
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                5u8.hash(h);
+                let mut keys: Vec<&String> = obj.keys().collect();
+                keys.sort();
+                keys.len().hash(h);
+                for k in keys {
+                    k.hash(h);
+                    recurse(&obj[k], h);
+                }
+            }
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    recurse(v, &mut h);
+    h.finish()
+}
+
 #[cfg(feature = "cuda")]
 mod ctx {
     use ferrite_cuda_core::tensor::TensorView;
     use ferrite_kernels::kv_cache::KvCachePool;
-    use ferrite_kernels::rotary::RotaryCache;
 
     /// Ambient runtime args the emitted forward fn needs. The
     /// caller builds a `ForwardCtx` per forward call and passes
     /// it in. Fields are the union of what any ported kernel
     /// needs at invocation time; new kernels can reference new
-    /// fields, which is the extension point.
+    /// fields, which is the extension point. RoPE caches live on
+    /// the emitted per-arch `Weights` struct (both global `rotary`
+    /// and Gemma3's `rotary_local`), built inside `Weights::load`
+    /// from manifest-driven bounds/scalars/rope_scaling — not
+    /// threaded through here.
     pub struct ForwardCtx<'a> {
         pub input_ids: TensorView<'a>,
         pub positions: TensorView<'a>,
@@ -30,7 +89,6 @@ mod ctx {
         pub max_seqlen_q: usize,
         pub max_seqlen_k: usize,
         pub kv_cache: &'a KvCachePool,
-        pub rotary: &'a RotaryCache,
     }
 }
 #[cfg(feature = "cuda")]
@@ -95,13 +153,45 @@ mod dispatcher {
         ) -> OwnedTensor;
     }
 
+    /// Minimal HF-config view threaded into `try_load` so per-variant
+    /// `fingerprint_matches` can disambiguate checkpoints that share
+    /// on-disk tensor shapes but differ in config-only fields.
+    /// Phi-3-mini-4k (`max_position_embeddings=4096`, `rope_scaling=null`)
+    /// and Phi-3.5-mini-128k (`131072`, `{type:"longrope", …}`) have
+    /// identical weight shapes; without the config view the
+    /// alphabetically-earlier variant's fingerprint wins and its
+    /// (manifest-baked) RoPE cache gets used for the wrong model.
+    ///
+    /// Kept as a struct of plain `Option<primitive>` so ferrite
+    /// stays decoupled from the caller's full HF-config parser —
+    /// add fields here only when a future arch truly needs them to
+    /// disambiguate.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct HfFingerprint<'a> {
+        pub max_position_embeddings: Option<u64>,
+        pub rope_scaling_type: Option<&'a str>,
+        /// Deterministic hash of the full `rope_scaling` JSON
+        /// subobject (or `None` when the checkpoint has no
+        /// rope_scaling). Discriminates checkpoints that share
+        /// `type` + `max_position_embeddings` but differ in
+        /// `short_factor` / `long_factor` values — e.g.
+        /// Phi-3.5-mini vs Phi-3-mini-128k, Phi-4-mini-instruct
+        /// vs Phi-4-mini-reasoning. Computed with
+        /// [`crate::hash_json_value`].
+        pub rope_scaling_hash: Option<u64>,
+    }
+
     /// One registration per `#[forward] fn <arch>()`. The macro
     /// emits an `inventory::submit!` block that constructs this.
     /// `try_load` function-pointer signature — extracted as a type
     /// alias so the registration struct doesn't trip clippy's
     /// `type_complexity` lint.
-    pub type ArchTryLoadFn =
-        fn(&mut GpuWeights, CUstream) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>>;
+    pub type ArchTryLoadFn = fn(
+        &mut GpuWeights,
+        CUstream,
+        usize, // max_model_len — runtime value (CLI --max-model-len or HF config fallback)
+        HfFingerprint<'_>,
+    ) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>>;
 
     pub struct FerriteArchRegistration {
         /// The arch's identifier — `"llama"`, `"qwen2"`, … — from
@@ -135,10 +225,12 @@ mod dispatcher {
         gw: &mut GpuWeights,
         stream: CUstream,
         arch_hint: &str,
+        max_model_len: usize,
+        hf: HfFingerprint<'_>,
     ) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>> {
         for reg in inventory::iter::<FerriteArchRegistration>() {
             if reg.hf_arches.contains(&arch_hint) {
-                return (reg.try_load)(gw, stream);
+                return (reg.try_load)(gw, stream, max_model_len, hf);
             }
         }
         Ok(None)
@@ -146,7 +238,7 @@ mod dispatcher {
 }
 
 #[cfg(feature = "cuda")]
-pub use dispatcher::{FerriteArchRegistration, FerriteWeights, try_load};
+pub use dispatcher::{FerriteArchRegistration, FerriteWeights, HfFingerprint, try_load};
 
 /// Re-export `inventory` so the `#[forward]`-macro-emitted
 /// `inventory::submit!` block resolves without the consuming crate

@@ -580,7 +580,10 @@ fn collect_accessors(
 ///    fingerprint-match an AWQ variant of the same arch+width and
 ///    the emitted `load_awq` loader would panic in
 ///    `awq_to_marlin_zero_points`.
-fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
+fn emit_fingerprint_check(
+    model: &ModelParams,
+    manifest: &crate::weights_manifest::WeightsManifest,
+) -> TokenStream {
     let num_hidden_layers = *model
         .bounds
         .get("num_hidden_layers")
@@ -616,9 +619,22 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
     };
 
     let last_layer = num_hidden_layers.saturating_sub(1);
-    let last_tensor = format!("model.layers.{last_layer}.self_attn.q_proj.{suffix}");
-    let one_past_tensor = format!("model.layers.{num_hidden_layers}.self_attn.q_proj.{suffix}");
-    let opposite_tensor = format!("model.layers.0.self_attn.q_proj.{opposite_suffix}");
+    // Packed-source archs (Phi-3 family) ship `self_attn.qkv_proj.weight`
+    // on disk instead of the per-slice `self_attn.q_proj.weight` that
+    // the default fingerprint looks for. Detect via manifest's
+    // `__packed_splits__` section: if the arch declares
+    // `self_attn.qkv_proj` as a packed parent, sniff THAT tensor
+    // instead — without this, the fingerprint misses and ferrite
+    // falls back to the hand-written path even when it has a
+    // compiled variant for this arch.
+    let fp_leaf: &str = if manifest.packed_splits.contains_key("self_attn.qkv_proj") {
+        "self_attn.qkv_proj"
+    } else {
+        "self_attn.q_proj"
+    };
+    let last_tensor = format!("model.layers.{last_layer}.{fp_leaf}.{suffix}");
+    let one_past_tensor = format!("model.layers.{num_hidden_layers}.{fp_leaf}.{suffix}");
+    let opposite_tensor = format!("model.layers.0.{fp_leaf}.{opposite_suffix}");
     // BNB4 checkpoints ship the U8-packed nibbles at `.weight`
     // (same suffix as dense bf16 weights) with a sibling
     // `.weight.absmax` that's unique to bitsandbytes. Dense + AWQ
@@ -644,6 +660,77 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
 
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
     let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size as usize);
+
+    // HF-config disambiguator: variants of the same arch that share
+    // on-disk tensor shapes (Phi-3-mini-4k vs Phi-3.5-mini-128k) only
+    // differ in `max_position_embeddings` and `rope_scaling.type`.
+    // Bake the manifest's values here and reject at fingerprint time
+    // when the caller-supplied `HfFingerprint` contradicts them.
+    // `None` in the runtime view is permissive (caller didn't supply
+    // the hint); a `Some(x)` that disagrees with the manifest's
+    // compile-time literal is a hard reject.
+    let max_pos_lit = model
+        .bounds
+        .get("max_position_embeddings")
+        .map(|&v| proc_macro2::Literal::u64_unsuffixed(v));
+    let max_pos_check: TokenStream = match max_pos_lit {
+        Some(lit) => quote! {
+            if let Some(mp) = hf.max_position_embeddings
+                && mp != #lit
+            {
+                return false;
+            }
+        },
+        None => quote! {},
+    };
+    let rope_scaling_expected: Option<&'static str> = match &model.rope_scaling {
+        Some(crate::config::RopeScaling::Llama3 { .. }) => Some("llama3"),
+        Some(crate::config::RopeScaling::LongRope { .. }) => Some("longrope"),
+        None => None,
+    };
+    let rope_scaling_check: TokenStream = match rope_scaling_expected {
+        Some(kind) => quote! {
+            // Manifest declares a non-trivial scaling; reject a
+            // checkpoint whose HF config has a different (or absent)
+            // rope_scaling.type.
+            match hf.rope_scaling_type {
+                Some(t) if t == #kind => {}
+                None => {} // permissive when caller didn't supply it
+                Some(_) => return false,
+            }
+        },
+        None => quote! {
+            // Manifest has no scaling; reject a checkpoint whose HF
+            // config declares one (longrope / llama3). The
+            // alphabetically-earlier variant's fingerprint would
+            // otherwise win for a scaled checkpoint and bake the
+            // wrong RoPE into its Weights.
+            if hf.rope_scaling_type.is_some() {
+                return false;
+            }
+        },
+    };
+
+    // Content-hash discriminator: reject checkpoints whose
+    // `rope_scaling` JSON (factor vectors included) doesn't
+    // bit-identically match the manifest's. Discriminates
+    // Phi-3.5-mini vs Phi-3-mini-128k, Phi-4-mini-instruct vs
+    // Phi-4-mini-reasoning, etc. — same type + max_pos, different
+    // short/long_factor values. Permissive when the executor
+    // didn't compute the hash (`None`), strict otherwise.
+    let rope_scaling_hash_check: TokenStream = match model.rope_scaling_hash {
+        Some(hash) => {
+            let lit = proc_macro2::Literal::u64_unsuffixed(hash);
+            quote! {
+                if let Some(h) = hf.rope_scaling_hash
+                    && h != #lit
+                {
+                    return false;
+                }
+            }
+        }
+        None => quote! {},
+    };
 
     // Per-format qweight-shape gate. AWQ/GPTQ/CT all pack 4-bit
     // weights but into different axis orders — this gate is the
@@ -766,6 +853,7 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
         #[cfg(feature = "cuda")]
         pub fn fingerprint_matches(
             gw: &::ferrite_cuda_core::weights::GpuWeights,
+            hf: ::ferrite_forward::HfFingerprint<'_>,
         ) -> bool {
             match gw.tensor_info("model.embed_tokens.weight") {
                 Some((shape, _))
@@ -802,6 +890,9 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
             }
             #qweight_shape_gate
             #g_idx_disambiguation
+            #max_pos_check
+            #rope_scaling_check
+            #rope_scaling_hash_check
             true
         }
     }
@@ -1161,10 +1252,91 @@ fn emit_weights_struct(
         quote! {}
     };
 
+    // Manifest-driven packed-tensor splits: archs whose checkpoints
+    // ship fused qkv / gate_up under a single on-disk name declare
+    // `__packed_splits__` in their `weights.json` (e.g. Phi-3 family).
+    // For each (packed_prefix → [target …]) entry, we emit one call
+    // per transformer layer that synthesizes the per-slice virtual
+    // entries before any `FieldLoad`. Row counts come from looking up
+    // each target in the manifest and evaluating the first dim against
+    // `model.bounds`. The helper is a no-op when the packed parent
+    // isn't present, so models without packed checkpoints are unaffected
+    // even if they share the manifest (none do today).
+    let packed_splits_prelude: TokenStream = if manifest.packed_splits.is_empty() {
+        quote! {}
+    } else {
+        let num_hidden_layers = *model.bounds.get("num_hidden_layers").unwrap_or_else(|| {
+            panic!(
+                "model `{}` has `__packed_splits__` but no `num_hidden_layers` bound",
+                model.source_stem,
+            )
+        }) as usize;
+        let mut calls: Vec<TokenStream> = Vec::new();
+        for (packed_prefix, targets) in &manifest.packed_splits {
+            let mut sized: Vec<(String, u64)> = Vec::with_capacity(targets.len());
+            for target in targets {
+                let shape = manifest.entries.get(target).unwrap_or_else(|| panic!(
+                    "model `{}`: __packed_splits__ target `{target}` not declared in manifest entries",
+                    model.source_stem,
+                ));
+                // Manifest convention is `[in_features, out_features]`
+                // (Gemm expects `K = x.last == w.first`), so the
+                // on-disk safetensors row count — what
+                // `synthesize_packed_row_split_sizes` needs — is
+                // `shape.last()`, the out dim. For a 1-D tensor (norm
+                // weight), there's no "in" vs "out"; we still take the
+                // sole dim, though packed-split targets are always 2-D
+                // projection matrices in practice.
+                let rows_dim = shape.last().unwrap_or_else(|| {
+                    panic!(
+                        "model `{}`: __packed_splits__ target `{target}` has empty shape",
+                        model.source_stem,
+                    )
+                });
+                let rows =
+                    crate::shape::eval_closed_dim(rows_dim, &model.bounds).unwrap_or_else(|| {
+                        panic!(
+                            "model `{}`: __packed_splits__ target `{target}` out-dim `{:?}` \
+                         did not resolve against bounds",
+                            model.source_stem, rows_dim,
+                        )
+                    });
+                // The helper takes the leaf suffix under the shared
+                // grandparent (e.g. "q_proj" under "self_attn"); strip
+                // the parent prefix if the target shares one with the
+                // packed prefix (the common case), else pass the full
+                // dotted suffix — `synthesize_packed_row_split_sizes`
+                // joins grandparent + suffix either way.
+                let packed_parent = packed_prefix.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+                let suffix = target
+                    .strip_prefix(&format!("{packed_parent}."))
+                    .unwrap_or(target)
+                    .to_string();
+                sized.push((suffix, rows));
+            }
+            let pairs: Vec<TokenStream> = sized
+                .iter()
+                .map(|(suffix, rows)| {
+                    let rows_lit = proc_macro2::Literal::usize_unsuffixed(*rows as usize);
+                    quote! { (#suffix, #rows_lit) }
+                })
+                .collect();
+            calls.push(quote! {
+                for __l in 0..#num_hidden_layers {
+                    let __pp = ::std::format!("model.layers.{}.{}", __l, #packed_prefix);
+                    gw.synthesize_packed_row_split_sizes(&__pp, &[ #(#pairs),* ])?;
+                }
+            });
+        }
+        quote! {
+            #(#calls)*
+        }
+    };
+
     // `Self { a, b, c }` shorthand — fields are the just-bound
     // locals, in the same order we declared the struct fields.
     let field_shorthand: Vec<&syn::Ident> = accessors.iter().map(|a| &a.name).collect();
-    let fingerprint_method = emit_fingerprint_check(model);
+    let fingerprint_method = emit_fingerprint_check(model, manifest);
 
     // Detect whether this arch uses `rotary_local` (dual-rotary,
     // e.g. Gemma3). If so, emit a `rotary_local: RotaryCache` field
@@ -1228,6 +1400,217 @@ fn emit_weights_struct(
         quote! {}
     };
 
+    // Primary `rotary: RotaryCache` field. Ferrite owns rotary end-
+    // to-end: `ForwardCtx` carries no rotary, the emitted forward
+    // reads `wm.rotary`, and this block picks the right
+    // `RotaryCache` constructor at macro-expansion time from the
+    // manifest. Four cases cross-join `partial_rotary_factor` (None
+    // ⇒ full head_dim, Some(f) ⇒ rotary_dim = f * head_dim) with
+    // `rope_scaling` (None / Llama3 / LongRope).
+    let uses_rotary = fuf.nodes.iter().any(|n| {
+        n.inputs.iter().any(|i| {
+            matches!(
+                i,
+                crate::fuf::FufInput::Extern {
+                    kind: crate::classified::ExternKind::Rotary,
+                    ..
+                }
+            )
+        })
+    });
+
+    let rotary_field: TokenStream = if uses_rotary {
+        quote! { pub rotary: ::ferrite_kernels::rotary::RotaryCache, }
+    } else {
+        quote! {}
+    };
+
+    let rotary_load: TokenStream = if uses_rotary {
+        let head_dim = *model
+            .bounds
+            .get("head_dim")
+            .expect("model must have head_dim for Rotary") as usize;
+        let max_pos = *model
+            .bounds
+            .get("max_position_embeddings")
+            .expect("model must have max_position_embeddings for Rotary")
+            as usize;
+        // HF's implicit default when `rope_theta` is omitted (e.g.
+        // `llama-2-70b.json`). Matches transformers' LlamaConfig.
+        let rope_theta = model
+            .scalars
+            .get("rope_theta")
+            .copied()
+            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+            .unwrap_or(10000.0);
+        // `partial_rotary_factor == 1.0` is the full-rotary identity;
+        // route it through `new_from_stream` instead of
+        // `new_partial_from_stream` with `rotary_dim == head_dim`
+        // so models that spell this out (Phi-4-reasoning) don't
+        // exercise the partial-rotary kernel path unnecessarily.
+        let partial = model
+            .scalars
+            .get("partial_rotary_factor")
+            .copied()
+            .filter(|&f| (f - 1.0).abs() > 1e-9);
+        let rotary_dim_lit: Option<TokenStream> = partial.map(|f| {
+            let rd = f * head_dim as f64;
+            assert!(
+                (rd - rd.round()).abs() < 1e-9,
+                "partial_rotary_factor {f} * head_dim {head_dim} = {rd} is not integer",
+            );
+            let rd = rd.round() as usize;
+            quote! { #rd }
+        });
+        let scaling = model.rope_scaling.clone();
+        let body = match (rotary_dim_lit, scaling) {
+            (None, None) => quote! {
+                ::ferrite_kernels::rotary::RotaryCache::new_from_stream(
+                    #head_dim,
+                    #max_pos,
+                    #rope_theta,
+                    None,
+                    ::ferrite_cuda_core::dtype::DType::BF16,
+                    stream,
+                )
+            },
+            (
+                None,
+                Some(crate::config::RopeScaling::Llama3 {
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_position_embeddings,
+                }),
+            ) => {
+                let orig = original_max_position_embeddings as usize;
+                quote! {
+                    ::ferrite_kernels::rotary::RotaryCache::new_from_stream(
+                        #head_dim,
+                        #max_pos,
+                        #rope_theta,
+                        Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
+                            factor: #factor,
+                            low_freq_factor: #low_freq_factor,
+                            high_freq_factor: #high_freq_factor,
+                            original_max_position_embeddings: #orig,
+                        }),
+                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        stream,
+                    )
+                }
+            }
+            (
+                None,
+                Some(crate::config::RopeScaling::LongRope {
+                    short_factor,
+                    long_factor,
+                    original_max_position_embeddings,
+                    short_mscale,
+                    long_mscale,
+                }),
+            ) => {
+                let orig = original_max_position_embeddings as usize;
+                quote! {
+                    ::ferrite_kernels::rotary::RotaryCache::new_longrope_from_stream(
+                        #head_dim,
+                        #max_pos,
+                        max_model_len,
+                        #rope_theta,
+                        &::ferrite_kernels::rotary::LongRopeScaling {
+                            short_factor: vec![ #(#short_factor),* ],
+                            long_factor: vec![ #(#long_factor),* ],
+                            original_max_position_embeddings: #orig,
+                            short_mscale: #short_mscale,
+                            long_mscale: #long_mscale,
+                        },
+                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        stream,
+                    )
+                }
+            }
+            (Some(rotary_dim), None) => quote! {
+                ::ferrite_kernels::rotary::RotaryCache::new_partial_from_stream(
+                    #head_dim,
+                    #rotary_dim,
+                    #max_pos,
+                    #rope_theta,
+                    None,
+                    ::ferrite_cuda_core::dtype::DType::BF16,
+                    stream,
+                )
+            },
+            (
+                Some(rotary_dim),
+                Some(crate::config::RopeScaling::Llama3 {
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_position_embeddings,
+                }),
+            ) => {
+                let orig = original_max_position_embeddings as usize;
+                quote! {
+                    ::ferrite_kernels::rotary::RotaryCache::new_partial_from_stream(
+                        #head_dim,
+                        #rotary_dim,
+                        #max_pos,
+                        #rope_theta,
+                        Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
+                            factor: #factor,
+                            low_freq_factor: #low_freq_factor,
+                            high_freq_factor: #high_freq_factor,
+                            original_max_position_embeddings: #orig,
+                        }),
+                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        stream,
+                    )
+                }
+            }
+            (
+                Some(rotary_dim),
+                Some(crate::config::RopeScaling::LongRope {
+                    short_factor,
+                    long_factor,
+                    original_max_position_embeddings,
+                    short_mscale,
+                    long_mscale,
+                }),
+            ) => {
+                let orig = original_max_position_embeddings as usize;
+                quote! {
+                    ::ferrite_kernels::rotary::RotaryCache::new_partial_longrope_from_stream(
+                        #head_dim,
+                        #rotary_dim,
+                        #max_pos,
+                        max_model_len,
+                        #rope_theta,
+                        &::ferrite_kernels::rotary::LongRopeScaling {
+                            short_factor: vec![ #(#short_factor),* ],
+                            long_factor: vec![ #(#long_factor),* ],
+                            original_max_position_embeddings: #orig,
+                            short_mscale: #short_mscale,
+                            long_mscale: #long_mscale,
+                        },
+                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        stream,
+                    )
+                }
+            }
+        };
+        quote! {
+            let rotary = unsafe { #body }?;
+        }
+    } else {
+        quote! {}
+    };
+
+    let rotary_init: TokenStream = if uses_rotary {
+        quote! { rotary, }
+    } else {
+        quote! {}
+    };
+
     // Struct definition vs type alias per emit mode.
     let weights_def: TokenStream = match &mode {
         WeightsEmitMode::Canonical => quote! {
@@ -1237,6 +1620,7 @@ fn emit_weights_struct(
             #[cfg(feature = "cuda")]
             pub struct Weights {
                 #(#fields)*
+                #rotary_field
                 #rotary_local_field
             }
         },
@@ -1283,19 +1667,23 @@ fn emit_weights_struct(
             /// ignore the param; it's still threaded for uniform
             /// signature across `load_with` across archs.
             #[cfg(feature = "cuda")]
-            #[allow(clippy::too_many_lines, unused_variables)]
+            #[allow(clippy::too_many_lines, clippy::not_unsafe_ptr_arg_deref, unused_variables)]
             pub fn load_with(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
+                max_model_len: usize,
                 marlin_storage: ::ferrite_kernels::layers_quant::MarlinFormat,
             ) -> ::anyhow::Result<Weights> {
+                #packed_splits_prelude
                 #marlin_prelude
                 #bnb4_prelude
                 #fp8_prelude
                 #(#lets)*
+                #rotary_load
                 #rotary_local_load
                 Ok(#weights_ctor {
                     #(#field_shorthand,)*
+                    #rotary_init
                     #rotary_local_init
                 })
             }
@@ -1306,11 +1694,13 @@ fn emit_weights_struct(
             /// trivially; no codegen overhead.
             #[cfg(feature = "cuda")]
             #[inline]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
             pub fn load(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
+                max_model_len: usize,
             ) -> ::anyhow::Result<Weights> {
-                load_with(gw, stream, #marlin_fmt)
+                load_with(gw, stream, max_model_len, #marlin_fmt)
             }
         },
         WeightsEmitMode::Shim { canonical } => quote! {
@@ -1326,11 +1716,13 @@ fn emit_weights_struct(
             /// shares it.
             #[cfg(feature = "cuda")]
             #[inline]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
             pub fn load(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
+                max_model_len: usize,
             ) -> ::anyhow::Result<Weights> {
-                super::#canonical::load_with(gw, stream, #marlin_fmt)
+                super::#canonical::load_with(gw, stream, max_model_len, #marlin_fmt)
             }
         },
     }

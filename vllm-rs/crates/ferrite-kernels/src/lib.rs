@@ -48,4 +48,4 @@ pub use layers::{
 #[cfg(feature = "cuda")]
 pub use layers_moe::{MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
 #[cfg(feature = "cuda")]
-pub use rotary::{Llama3RopeScaling, LlamaConfig, RotaryCache};
+pub use rotary::{Llama3RopeScaling, LlamaConfig, LongRopeScaling, RotaryCache};

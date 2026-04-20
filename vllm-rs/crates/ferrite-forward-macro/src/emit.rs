@@ -283,7 +283,7 @@ impl<'a> EmitCtx<'a> {
             FufInput::Extern { kind, .. } => match kind {
                 ExternKind::InputIds => quote! { ctx.input_ids },
                 ExternKind::Positions => quote! { ctx.positions },
-                ExternKind::Rotary => quote! { ctx.rotary },
+                ExternKind::Rotary => quote! { wm.rotary },
                 ExternKind::RotaryLocal => quote! { wm.rotary_local },
                 ExternKind::BlockTable => quote! { ctx.block_table },
                 ExternKind::KvCache => quote! { ctx.kv_cache },

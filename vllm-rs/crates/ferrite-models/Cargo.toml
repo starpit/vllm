@@ -14,6 +14,7 @@ cuda = [
     "ferrite-model-granite/cuda",
     "ferrite-model-llama/cuda",
     "ferrite-model-mistral/cuda",
+    "ferrite-model-phi3/cuda",
     "ferrite-model-qwen2/cuda",
     "ferrite-model-qwen3/cuda",
 ]
@@ -25,5 +26,6 @@ ferrite-model-gemma3 = { path = "../ferrite-model-gemma3" }
 ferrite-model-granite = { path = "../ferrite-model-granite" }
 ferrite-model-llama = { path = "../ferrite-model-llama" }
 ferrite-model-mistral = { path = "../ferrite-model-mistral" }
+ferrite-model-phi3 = { path = "../ferrite-model-phi3" }
 ferrite-model-qwen2 = { path = "../ferrite-model-qwen2" }
 ferrite-model-qwen3 = { path = "../ferrite-model-qwen3" }

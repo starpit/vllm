@@ -51,7 +51,14 @@ async fn run_correctness_test_with_threshold(
 ) {
     let golden = load_golden_refs(golden_key);
 
+    // Pin `--max-model-len=2048` to match `generate_golden_refs.py`'s
+    // `LLM(..., max_model_len=2048)`. Matters for LongRoPE models
+    // (Phi-3-mini-128k, Phi-3.5-mini, Phi-4-mini-*) — Python vLLM
+    // sets a GLOBAL `use_long_rope = max_model_len > orig_max`
+    // at init time, so both sides must agree on `max_model_len` or
+    // they pick different factor sets. No-op for non-LongRoPE.
     let server = TestServer::builder(model)
+        .with_args(&["--max-model-len", "2048"])
         .start()
         .await
         .expect("server should start");
@@ -378,4 +385,130 @@ async fn test_cuda_correctness_mistral_7b_instruct_v0_3() {
     // `hidden_size`. Golden generated from Python vLLM on
     // `unsloth/mistral-7b-instruct-v0.3`.
     run_correctness_test(TestModels::MISTRAL, "mistral_7b_instruct_v0_3").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi3_mini_4k_instruct() {
+    // Phi-3-mini-4k-instruct via ferrite — dense bf16, MHA, no
+    // LongRoPE (max_position_embeddings=4096, `rope_scaling: null`).
+    // Exercises the packed-weight fallback in `LinearLayer::load_dense`:
+    // the safetensors ship `self_attn.qkv_proj.weight` + `mlp.gate_up_proj.weight`
+    // rather than the five logical tensors the DSL references, so
+    // the loader slices each packed source into q/k/v (3-way even
+    // split on MHA) and gate/up (2-way even split) before the
+    // per-field load calls run. Math body is verbatim Llama/Mistral.
+    // Golden generated from Python vLLM on `microsoft/Phi-3-mini-4k-instruct`.
+    run_correctness_test(TestModels::PHI3_MINI_4K_CUDA, "phi3_mini_4k_instruct").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi3_medium_4k_instruct() {
+    // Phi-3-medium-4k-instruct via ferrite — dense bf16, GQA (40 q,
+    // 10 kv, head_dim=128, 40 layers, intermediate=17920). Exercises
+    // the manifest-driven `__packed_splits__` prelude:
+    // `self_attn.qkv_proj.weight` on disk is `[5120+2*1280, 5120]`
+    // (GQA-unequal rows), which the even-split helper rejects. The
+    // sized-split variant resolves each slice's row count by looking
+    // up the target path in `phi3/weights.json`, evaluating the
+    // last-dim formula (out_features) against this size's bounds.
+    // Math body is verbatim Llama/Mistral/Phi-3-mini.
+    run_correctness_test(TestModels::PHI3_MEDIUM_4K_CUDA, "phi3_medium_4k_instruct").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi3_5_mini_instruct() {
+    // Phi-3.5-mini-instruct via ferrite — dense bf16, MHA, same
+    // tensor shapes as Phi-3-mini-4k but max_position_embeddings=131072
+    // with LongRoPE (su-scaling). Exercises
+    // `RotaryCache::new_longrope_from_stream`: per-position
+    // `short_factor` (pos < 4096) vs `long_factor` (pos >= 4096)
+    // inverse-frequency selection, with `attention_factor` baked into
+    // the cos/sin values. Golden uses short prompts (≤32 output
+    // tokens), so this test primarily validates the `short_factor`
+    // path + overall load wiring; `long_factor` correctness needs a
+    // >4k-context prompt and isn't covered here.
+    run_correctness_test(TestModels::PHI3_5_MINI_CUDA, "phi3_5_mini_instruct").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi4_mini_instruct() {
+    // Phi-4-mini-instruct via ferrite — dense bf16 GQA (24 Q heads,
+    // 8 KV heads, head_dim=128), `partial_rotary_factor=0.75` ⇒
+    // rotary_dim=96 (tail 32 dims pass through unrotated) + LongRoPE
+    // (su-scaling) with factor vectors of length rotary_dim/2 = 48.
+    // Exercises `RotaryCache::new_partial_longrope_from_stream`
+    // (combined partial + LongRoPE) and the tied-lm_head path.
+    // Short prompts keep positions < original_max=4096 so only the
+    // short_factor leg is validated here; long_factor + GQA-packed
+    // qkv split are regression-tested jointly against Python vLLM.
+    run_correctness_test(TestModels::PHI4_MINI_CUDA, "phi4_mini_instruct").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi3_mini_128k_instruct() {
+    // Phi-3-mini-128k — MHA + LongRoPE. `run_correctness_test`
+    // pins `--max-model-len=2048` to match the golden's
+    // `LLM(..., max_model_len=2048)`, so Python's
+    // `use_long_rope = max_model_len > original_max_position_embeddings`
+    // stays false on both sides and both use `short_factor`.
+    run_correctness_test(TestModels::PHI3_MINI_128K_CUDA, "phi3_mini_128k_instruct").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi3_medium_128k_instruct() {
+    // Phi-3-medium-128k — GQA (40/10) + LongRoPE. 14B bf16 = 28 GiB,
+    // doesn't fit on L4; golden generated on A100 per follow-up.
+    run_correctness_test(
+        TestModels::PHI3_MEDIUM_128K_CUDA,
+        "phi3_medium_128k_instruct",
+    )
+    .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi4_full() {
+    // Phi-4 (full 14B) — GQA 40/10, no rope_scaling, no partial.
+    // 14B bf16; requires A100-class for the golden.
+    run_correctness_test(TestModels::PHI4_FULL_CUDA, "phi4").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi4_reasoning() {
+    // Phi-4-reasoning — partial_rotary_factor=1.0 (normalized to
+    // full rotary in codegen), max_pos=32768. 14B bf16; A100-class.
+    run_correctness_test(TestModels::PHI4_REASONING_CUDA, "phi4_reasoning").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi4_reasoning_plus() {
+    // Phi-4-reasoning-plus — same config shape as Phi-4-reasoning;
+    // forward fn likely dedups to one canonical. 14B bf16; A100-class.
+    run_correctness_test(TestModels::PHI4_REASONING_PLUS_CUDA, "phi4_reasoning_plus").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_phi4_mini_reasoning() {
+    // Phi-4-mini-reasoning — identical shape to Phi-4-mini-instruct
+    // (GQA 24/8, partial=0.75, longrope, tied). Fits on L4.
+    run_correctness_test(TestModels::PHI4_MINI_REASONING_CUDA, "phi4_mini_reasoning").await;
 }

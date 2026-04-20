@@ -237,7 +237,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
         let plan = plan_collapse(&rg, &classes);
         assert!(!plan.is_periodic);
@@ -259,7 +259,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1], &[2], &[3], &[4], &[5]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
         let plan = plan_collapse(&rg, &classes);
         assert!(plan.is_periodic);
@@ -282,7 +282,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
         // Sanity: before collapse there's one barrier R0 → R1.
         assert_eq!(rg.control.len(), 1);
@@ -307,7 +307,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1], &[2]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
         let plan = plan_collapse(&rg, &classes);
         assert_eq!(plan.classes.len(), 2);

@@ -41,17 +41,28 @@ use crate::fuf::{Fuf, FufInput, TileId};
 use crate::solver::{Assignment, SubgraphId};
 use crate::subtile::{SubtiledFuf, TileAxis};
 
+/// Output of `form_regions`: the `RegionGraph` + a back-map from
+/// each `RegionId` to the `SubgraphId` that produced it. Consumers
+/// that need the source `SubgraphId` (e.g. to look up the solver's
+/// `ImplId`) index into `region_subgraphs` by `RegionId as usize`.
+#[derive(Debug, Clone)]
+pub struct FormedRegions {
+    pub graph: RegionGraph,
+    pub region_subgraphs: Vec<SubgraphId>,
+}
+
 /// Form a `RegionGraph` from a sub-tiled FUF + solver Assignment.
 ///
 /// Emits one Region per subgraph in the Assignment. Subgraphs are
 /// processed in sorted `SubgraphId` order for determinism.
-pub fn form_regions(st: &SubtiledFuf<'_>, assignment: &Assignment) -> RegionGraph {
+pub fn form_regions(st: &SubtiledFuf<'_>, assignment: &Assignment) -> FormedRegions {
     // Sort subgraphs for deterministic Region ordering.
     let mut subgraphs: Vec<SubgraphId> = assignment.subgraphs().collect();
     subgraphs.sort();
 
     let mut regions: Vec<Region> = Vec::with_capacity(subgraphs.len());
     let mut sg_to_rid: HashMap<SubgraphId, RegionId> = HashMap::new();
+    let mut region_subgraphs: Vec<SubgraphId> = Vec::with_capacity(subgraphs.len());
 
     for sg in &subgraphs {
         let tiles = assignment.tiles_in_subgraph(*sg);
@@ -60,12 +71,16 @@ pub fn form_regions(st: &SubtiledFuf<'_>, assignment: &Assignment) -> RegionGrap
         }
         let rid = regions.len() as RegionId;
         sg_to_rid.insert(*sg, rid);
+        region_subgraphs.push(*sg);
         regions.push(form_one_region(rid, st, &tiles));
     }
 
     let control = derive_control_edges(st.fuf, assignment, &sg_to_rid);
 
-    RegionGraph { regions, control }
+    FormedRegions {
+        graph: RegionGraph { regions, control },
+        region_subgraphs,
+    }
 }
 
 /// Build a single Region from its claimed tiles.
@@ -324,7 +339,7 @@ mod tests {
         let fuf = fuf_from_ops(vec![(OpKind::RmsNorm, vec![])]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         assert_eq!(rg.regions.len(), 1);
         assert_eq!(rg.regions[0].domain.axes.len(), 1);
         assert_eq!(rg.regions[0].domain.axes[0].name, "tile_t");
@@ -343,7 +358,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         assert_eq!(rg.regions.len(), 2);
         assert_eq!(rg.control.len(), 1);
         assert_eq!(rg.control[0].src, 0);
@@ -368,7 +383,7 @@ mod tests {
         let st = subtile(&fuf);
         // sg 0: embed; sg 1: fused MLP block (tiles 1..=5); sg 2: add.
         let a = assignment_from_groups(&[&[0], &[1, 2, 3, 4, 5], &[6]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         assert_eq!(rg.regions.len(), 3);
 
         let mlp = &rg.regions[1];
@@ -398,7 +413,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         let attn = &rg.regions[1];
         let names: Vec<&str> = attn.domain.axes.iter().map(|a| a.name).collect();
         assert!(names.contains(&"head_group"));

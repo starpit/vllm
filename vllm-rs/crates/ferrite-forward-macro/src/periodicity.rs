@@ -233,7 +233,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1], &[2]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
         // Embed is its own class; the two rmsnorms share a class.
         assert_eq!(classes.len(), 2);
@@ -256,7 +256,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1], &[2]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
         assert_eq!(classes.len(), 3);
         assert!(classes.iter().all(|c| c.period() == 1));
@@ -290,7 +290,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1], &[2], &[3], &[4], &[5]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
         // Three unique patterns, each period 2.
         assert_eq!(classes.len(), 3);
@@ -315,7 +315,7 @@ mod tests {
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1], &[2], &[3]]);
-        let rg = form_regions(&st, &a);
+        let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
         let sum = summarize(&classes);
         assert_eq!(sum.total_regions, 4);

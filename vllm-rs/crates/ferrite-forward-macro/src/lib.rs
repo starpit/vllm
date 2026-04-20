@@ -26,6 +26,7 @@ use syn::{Ident, ItemFn, LitInt, LitStr, Token, parse_macro_input};
 
 mod ast;
 mod cfg;
+mod class_impl;
 mod classified;
 mod classify;
 mod codegen;
@@ -515,17 +516,20 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         // collapse factor lands on real transformer graphs.
         if let Some((_wp, sfuf)) = sfufs.per_workload.iter().next() {
             let st = subtile::subtile(&model_fuf);
-            let rg = region_formation::form_regions(&st, sfuf);
-            let classes = periodicity::group_regions(&rg);
-            let plan = periodicity_plan::plan_collapse(&rg, &classes);
+            let fr = region_formation::form_regions(&st, sfuf);
+            let rg = &fr.graph;
+            let classes = periodicity::group_regions(rg);
+            let plan = periodicity_plan::plan_collapse(rg, &classes);
             let sum = periodicity::summarize(&classes);
+            let impl_report = class_impl::check_class_impls(&classes, &fr.region_subgraphs, sfuf);
             let factor = if plan.classes.is_empty() {
                 0.0
             } else {
                 rg.regions.len() as f64 / plan.classes.len() as f64
             };
+            let consistent = impl_report.inconsistent_classes.is_empty();
             eprintln!(
-                "    stencil · {regions:>4} regions → {classes:>3} classes ({factor:.1}× collapse) · control {ctrl_orig:>4} → {ctrl_new:>3} · max_period {max_period:>3}",
+                "    stencil · {regions:>4} regions → {classes:>3} classes ({factor:.1}× collapse) · control {ctrl_orig:>4} → {ctrl_new:>3} · max_period {max_period:>3} · class_impls_consistent={consistent}",
                 regions = rg.regions.len(),
                 classes = plan.classes.len(),
                 factor = factor,
@@ -533,6 +537,11 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 ctrl_new = plan.control.len(),
                 max_period = sum.max_period,
             );
+            if !consistent {
+                for (class_idx, picks) in &impl_report.inconsistent_classes {
+                    eprintln!("      class {class_idx} has heterogeneous impls: {picks:?}",);
+                }
+            }
         }
 
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);

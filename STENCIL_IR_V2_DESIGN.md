@@ -347,6 +347,15 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 **Measurement after the hash fix**: distribution of class counts shifted from a tight 8/10 to 12/15/17/18/22 across 218 variants. Collapse factor for llama / mistral drops from ~28× to ~19×; still well-collapsed and every class is now impl-consistent. Pre-fix 23 heterogeneous variants → 2 remaining (both Qwen3; see A.2).
 
+### Quick-start for next session
+
+Entry point: **6.1 Weights-struct per-layer arrays** (§13 item B below). Zero design work left — the implementation sketch in B.6.1 is ready to type against. Files to touch:
+- `vllm-rs/crates/ferrite-forward-macro/src/impl_lib.rs` — add `family: Option<(syn::Ident, u64)>` to `WeightAccessor` (line ~337); populate in `default_required_weights` (line ~370).
+- `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs::emit_weights_struct` (line ~1050) — group accessors by family after `collect_accessors`; emit array fields + constructor array assembly.
+- `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs::emit_subgraph` — call-site weight-arg block (line ~2420) branches on `acc.family`.
+
+Validation after 6.1: `cargo build -p ferrite-models --release` should still produce identical emitted forward fns (verify via `cargo expand` diff on llama-2-7b). No runtime or compile-time change expected yet — the win comes with 6.2's loop emission.
+
 ### Open items for the next session
 
 **(A) Heterogeneous-impl variants — finished except for two edge cases.**

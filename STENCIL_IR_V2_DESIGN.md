@@ -372,10 +372,27 @@ Practical consequence: 6.2.b is bigger than the sub-step list suggested. Before 
 Sub-steps inside 6.2.b (land each on its own commit):
 
 1. ✅ **`layer_expr` suffix fix** (commit `b1b4df294`) — emits a `usize`-suffixed literal when `repeat_var` is None so the dormant helper is a drop-in rewrite at every `let layer = … as usize; quote!{..#layer..}` site. No behavior change; unlocks sub-step 2.
+
+2. ✅ **`class_edges` + Δrepeat diagnostic** (commit `f0b937488`) — `StencilBundle::class_edges` walks subgraph tile-inputs, classifies each by `(consumer_class, consumer_iter, producer_class, producer_iter)`. `summarize_class_edges` prints a per-SFUF histogram alongside the `stencil ·` line. Measured on llama-2-7b: 232 intra-iter edges, 185 Δ=1 carries, `non_uniform_pairs=0`. Also surfaced the period-mismatch complication below.
+
+3. ✅ **Literal lifts in 11 impls** (commit `d5cd90f6f`) — every `emit_call` site that baked a concrete layer index (9 RopeAppend-based impls + 2 Attention-via-cache impls, including fp8 / bnb4 / marlin variants) now routes through `ctx.layer_expr(layer_u64)`. `cargo expand` on llama-2-13b is byte-identical pre/post lift; `repeat_var = None` everywhere.
+
+**Period mismatch — the complication surfaced by step 2.** llama-2-7b has 12 classes with two periods (32 and 31). The `neg=[(9[31]<-4[32]: [-1]), …]` readout means class 9 (31 members) is missing one boundary layer relative to class 4 (32 members). A single shared `for __repeat in 0..32` can't call every class's fragment at `__repeat`-indexed args because the period-31 class's iter numbering is shifted. Options:
+
+- **(p1)** Guard-inside-loop: `for __repeat in 0..max_period { class_full_frag(__repeat); if __repeat >= 1 { class_short_frag(__repeat - 1); } … }`. Requires per-class `(offset, period)` metadata; LLVM sees a guarded call but the guard is a constant check post-monomorphization, likely optimised out.
+- **(p2)** Peel boundary iters unrolled outside the loop. Interior layers run the common period; layer 0 and/or layer N-1 go unrolled before/after. Loop body is simpler; code volume shrinks less for the peeled iterations.
+- **(p3)** Require all periodic classes to share max_period; fall back to today's unrolled emit for variants that don't. Simple but gives up the win on any model with boundary-special classes.
+
+Pick (p1) — it's the only option that handles arbitrary period mixtures without leaking complexity into the callers. Need to determine each class's `offset` by inspecting the first member's position relative to a reference class (any pair of Δ=0 edges disambiguates).
 2. **Literal lifting in 3–5 impls** (`FusedQkvRopeCacheImpl`, `AttentionViaCacheImpl`, `RopeAppendRef`, `SlidingAttentionImpl`, plus fp8/interleaved variants). Route every site that baked `layer` into quote through `ctx.layer_expr(layer_u64)`. `repeat_var` stays `None` so `cargo expand` on llama-2-13b is byte-identical pre/post lift (that's the gate).
-3. **Class-loop emit in `emit_wave_walk`** — when a bucket's schedule exposes a contiguous run of periodic class members, emit one `for __repeat in 0..#N { … }` loop wrapping fragments indexed by `__repeat`. Gate behind `FERRITE_STENCIL_CODEGEN=1` so the default build remains today's unrolled path until llama-2-7b passes `vllm chat` under the new path.
-4. **Heterogeneous tolerance** for the 2 Qwen3 variants (A.2). Emit two fragments keyed `(class_idx, impl_id)`, dispatch via a baked `const TABLE: [u8; N]`.
-5. **Validation + flip default** — `vllm chat` (with `timeout`) on llama-2-7b (correctness gate), `vllm bench latency` delta ≤ ~1% (runtime gate), `cargo build -p vllm-cli --features cuda --release` wall-time delta (compile-time gate). Flip `FERRITE_STENCIL_CODEGEN=1` to the default only after all arches green.
+4. ⏳ **Collapsed-mode emitter** behind `FERRITE_STENCIL_CODEGEN=1` — walks `CollapsePlan` + `StencilBundle` + `class_edges` to emit:
+   - Pre-loop: period-1 classes + first-member-only classes topologically before the loop body (embed + any layer-0-only boundary classes).
+   - `let mut` for each loop-carried data edge (Δrepeat ≠ 0), initialised from the pre-loop or a default.
+   - `for __repeat in 0..max_period { ... }` with periodic classes in intra-iteration topo order; each call is `if __repeat >= class_offset && __repeat < class_offset + class_period { frag_N(iter = __repeat - class_offset) }` — per (p1) above.
+   - Post-loop: period-1 classes + last-member-only boundary classes topologically after.
+   - Reuses 6.1's `WeightLayout` (weight indexing) and 6.2.a's `repeat_var = Some(__repeat)` (kv_cache slot indexing) — both already in place.
+5. ⏳ **Heterogeneous tolerance** for the 2 Qwen3 variants (A.2). Emit two fragments keyed `(class_idx, impl_id)`, dispatch via a baked `const TABLE: [u8; N]`.
+6. ⏳ **Validation + flip default** — `vllm chat` (with `timeout`) on llama-2-7b (correctness gate), `vllm bench latency` delta ≤ ~1% (runtime gate), `cargo build -p vllm-cli --features cuda --release` wall-time delta (compile-time gate). Flip `FERRITE_STENCIL_CODEGEN=1` to the default only after all arches green.
 
 ### Open items for the next session
 

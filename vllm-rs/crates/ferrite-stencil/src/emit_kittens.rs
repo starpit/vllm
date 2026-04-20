@@ -116,13 +116,14 @@ fn write_header(out: &mut String) {
 /// `warp::store`, warp-wide reduction via `warp::sum` writing a
 /// scalar.
 fn write_rmsnorm_region(out: &mut String, _region: &Region) {
-    writeln!(out, "// ── region: rmsnorm ──").unwrap();
+    writeln!(
+        out,
+        "// ── region: rmsnorm (__device__ body, not __global__) ──"
+    )
+    .unwrap();
     writeln!(out, "template<int D>").unwrap();
     writeln!(out, "struct rmsnorm_globals {{").unwrap();
     writeln!(out, "    using vec_t = sv_bf<D>;").unwrap();
-    // All runtime dims (-1) so the gl constructor takes `size_t` for
-    // every axis. Compile-time `D` lives in the attached `vec_t` TMA
-    // descriptor; mirrors TK's layernorm.cu pattern.
     writeln!(out, "    using x_gl_t = gl<bf16, -1, -1, -1, -1, vec_t>;").unwrap();
     writeln!(out, "    using w_gl_t = gl<bf16, -1, -1, -1, -1, vec_t>;").unwrap();
     writeln!(out, "    x_gl_t x;").unwrap();
@@ -131,16 +132,16 @@ fn write_rmsnorm_region(out: &mut String, _region: &Region) {
     writeln!(out, "    float eps;").unwrap();
     writeln!(out, "}};").unwrap();
     writeln!(out).unwrap();
+    // Region body — `__device__`, not `__global__`. The `__global__
+    // mega_kernel` below calls this. Warp-id + block-id context is
+    // consumed from the enclosing launch.
     writeln!(out, "template<int D>").unwrap();
-    writeln!(out, "__global__ __launch_bounds__(32, 1)").unwrap();
     writeln!(
         out,
-        "void rmsnorm_kernel(const __grid_constant__ rmsnorm_globals<D> g) {{",
+        "static __device__ void rmsnorm_body(const rmsnorm_globals<D>& g) {{",
     )
     .unwrap();
     writeln!(out, "    const int token = blockIdx.x;").unwrap();
-    // `__shared__` aggregates must be default-constructible through a
-    // shared_allocator. For the minimum PoC, use static shared.
     writeln!(out, "    __shared__ sv_bf<D> x_s;").unwrap();
     writeln!(out, "    __shared__ sv_bf<D> w_s;").unwrap();
     writeln!(out, "    __shared__ sv_bf<D> sq_s;").unwrap();
@@ -164,6 +165,20 @@ fn write_rmsnorm_region(out: &mut String, _region: &Region) {
     writeln!(out, "    warp::sync();").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    warp::store(g.y, x_s, {{token, 0, 0, 0}});").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    // Top-level megakernel: ONE `__global__` per emit_kittens output.
+    // This scaffolding invokes `rmsnorm_body` as the sole region today;
+    // subsequent commits grow it to dispatch every region in the
+    // stencil IR's wavefront order.
+    writeln!(out, "template<int D>").unwrap();
+    writeln!(out, "__global__ __launch_bounds__(32, 1)").unwrap();
+    writeln!(
+        out,
+        "void mega_kernel_rmsnorm(const __grid_constant__ rmsnorm_globals<D> g) {{",
+    )
+    .unwrap();
+    writeln!(out, "    rmsnorm_body<D>(g);").unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
     // Host launcher — generic over D via an inner helper. Callers pass
@@ -209,7 +224,7 @@ fn write_rmsnorm_region(out: &mut String, _region: &Region) {
     writeln!(out, "    }};").unwrap();
     writeln!(
         out,
-        "    rmsnorm_kernel<D><<<dim3(num_tokens), dim3(32), 0, stream>>>(g);",
+        "    mega_kernel_rmsnorm<D><<<dim3(num_tokens), dim3(32), 0, stream>>>(g);",
     )
     .unwrap();
     writeln!(out, "    return cudaGetLastError();").unwrap();
@@ -1356,7 +1371,10 @@ mod tests {
 
         // kernel with __grid_constant__ globals param
         assert!(src.contains("__global__ __launch_bounds__(32, 1)"));
-        assert!(src.contains("void rmsnorm_kernel(const __grid_constant__ rmsnorm_globals<D> g)"),);
+        assert!(src.contains("static __device__ void rmsnorm_body(const rmsnorm_globals<D>& g)"),);
+        assert!(
+            src.contains("void mega_kernel_rmsnorm(const __grid_constant__ rmsnorm_globals<D> g)"),
+        );
 
         // kittens primitives in the body
         assert!(src.contains("warp::load(x_s, g.x"));

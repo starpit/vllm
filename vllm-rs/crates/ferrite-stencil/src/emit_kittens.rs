@@ -59,6 +59,7 @@ pub fn emit_kittens(mega: &Megakernel) -> String {
             "unary_inplace" => write_unary_inplace_region(&mut out, region),
             "embed" => write_embed_region(&mut out, region),
             "gemm" => write_gemm_region(&mut out, region),
+            "gate_up_silu_mul" => write_gate_up_silu_mul_region(&mut out, region),
             _ => write_stub_region(&mut out, region),
         }
     }
@@ -569,6 +570,198 @@ fn write_gemm_region(out: &mut String, _region: &Region) {
     writeln!(out, "    }};").unwrap();
     writeln!(out, "    dim3 grid(M / 64, N / TN);").unwrap();
     writeln!(out, "    gemm_kernel<TN, TK><<<grid, 128, 0, stream>>>(g);",).unwrap();
+    writeln!(out, "    return cudaGetLastError();").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// Gate+Up+SiLU+Mul region: `Inter = silu(X @ Wgate) * (X @ Wup)`.
+/// Two parallel GEMMs sharing the X operand, epilogue-fused as
+/// `silu(gate) * up`. Single-warpgroup straight-line.
+fn write_gate_up_silu_mul_region(out: &mut String, _region: &Region) {
+    writeln!(out, "// ── region: gate_up_silu_mul ──").unwrap();
+    writeln!(out, "template<int TN, int TK>").unwrap();
+    writeln!(out, "struct gate_up_silu_mul_globals {{").unwrap();
+    writeln!(out, "    static constexpr int TM = 64;").unwrap();
+    writeln!(out, "    using x_tile_t = st_bf<TM, TK>;").unwrap();
+    writeln!(out, "    using w_tile_t = st_bf<TK, TN>;").unwrap();
+    writeln!(out, "    using out_tile_t = st_bf<TM, TN>;").unwrap();
+    writeln!(
+        out,
+        "    using x_gl_t = gl<bf16, -1, -1, -1, -1, x_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using w_gl_t = gl<bf16, -1, -1, -1, -1, w_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using out_gl_t = gl<bf16, -1, -1, -1, -1, out_tile_t>;"
+    )
+    .unwrap();
+    writeln!(out, "    x_gl_t X;").unwrap();
+    writeln!(out, "    w_gl_t Wgate;").unwrap();
+    writeln!(out, "    w_gl_t Wup;").unwrap();
+    writeln!(out, "    out_gl_t Inter;").unwrap();
+    writeln!(out, "    uint32_t num_k_tiles;").unwrap();
+    writeln!(out, "}};").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "template<int TN, int TK>").unwrap();
+    writeln!(out, "__global__ __launch_bounds__(128, 1)").unwrap();
+    writeln!(
+        out,
+        "void gate_up_silu_mul_kernel(const __grid_constant__ gate_up_silu_mul_globals<TN, TK> g) {{"
+    )
+    .unwrap();
+    writeln!(out, "    constexpr int TM = 64;").unwrap();
+    writeln!(out, "    const int token_tile = blockIdx.x;").unwrap();
+    writeln!(out, "    const int inter_tile = blockIdx.y;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    __shared__ st_bf<TM, TK> x_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TK, TN> wg_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TK, TN> wu_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TM, TN> out_s;").unwrap();
+    writeln!(out, "    __shared__ semaphore sem_x, sem_wg, sem_wu;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(out, "        init_semaphore(sem_x, 1);").unwrap();
+    writeln!(out, "        init_semaphore(sem_wg, 1);").unwrap();
+    writeln!(out, "        init_semaphore(sem_wu, 1);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    rt_fl<16, TN> gate_acc;").unwrap();
+    writeln!(out, "    rt_fl<16, TN> up_acc;").unwrap();
+    writeln!(out, "    kittens::warpgroup::zero(gate_acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::zero(up_acc);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    for (uint32_t k_tile = 0; k_tile < g.num_k_tiles; ++k_tile) {{"
+    )
+    .unwrap();
+    writeln!(out, "        if (threadIdx.x == 0) {{").unwrap();
+    writeln!(out, "            tma::expect(sem_x, x_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(x_s, g.X, {{0, 0, (int)token_tile, (int)k_tile}}, sem_x);",
+    )
+    .unwrap();
+    writeln!(out, "            tma::expect(sem_wg, wg_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(wg_s, g.Wgate, {{0, 0, (int)k_tile, (int)inter_tile}}, sem_wg);",
+    )
+    .unwrap();
+    writeln!(out, "            tma::expect(sem_wu, wu_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(wu_s, g.Wup, {{0, 0, (int)k_tile, (int)inter_tile}}, sem_wu);",
+    )
+    .unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        wait(sem_x, k_tile & 1);").unwrap();
+    writeln!(out, "        wait(sem_wg, k_tile & 1);").unwrap();
+    writeln!(out, "        wait(sem_wu, k_tile & 1);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "        kittens::warpgroup::mma_AB(gate_acc, x_s, wg_s);"
+    )
+    .unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
+    writeln!(
+        out,
+        "        kittens::warpgroup::mma_AB(up_acc, x_s, wu_s);"
+    )
+    .unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    // Epilogue: silu(gate) * up.
+    // silu(x) = x / (1 + exp(-x)). Follows Megakernels gate_silu.cu —
+    // buf = exp(-gate); buf += 1; gate = gate / buf; then gate *= up.
+    writeln!(out, "    rt_fl<16, TN> buf;").unwrap();
+    writeln!(out, "    kittens::warpgroup::copy(buf, gate_acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::mul(buf, buf, -1.f);").unwrap();
+    writeln!(out, "    kittens::warpgroup::exp(buf, buf);").unwrap();
+    writeln!(out, "    kittens::warpgroup::add(buf, buf, 1.f);").unwrap();
+    writeln!(out, "    kittens::warpgroup::div(gate_acc, gate_acc, buf);").unwrap();
+    writeln!(
+        out,
+        "    kittens::warpgroup::mul(gate_acc, gate_acc, up_acc);"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    kittens::warpgroup::store(out_s, gate_acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::sync(0);").unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(
+        out,
+        "        tma::store_async(g.Inter, out_s, {{0, 0, (int)token_tile, (int)inter_tile}});",
+    )
+    .unwrap();
+    writeln!(out, "        tma::store_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "extern \"C\" cudaError_t launch_gate_up_silu_mul(cudaStream_t stream,",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    const bf16* X, const bf16* Wgate, const bf16* Wup, bf16* Inter,",
+    )
+    .unwrap();
+    writeln!(out, "    uint32_t M, uint32_t N, uint32_t K) {{").unwrap();
+    // Two weight tiles (wgate + wup) double the smem vs gemm. TN=64
+    // keeps static shared under the default 48 KB cap; larger tiles
+    // need `cudaFuncSetAttribute(…, MaxDynamicSharedMemorySize, …)`.
+    writeln!(out, "    constexpr int TN = 64;").unwrap();
+    writeln!(out, "    constexpr int TK = 64;").unwrap();
+    writeln!(
+        out,
+        "    if (M % 64 != 0 || N % TN != 0 || K % TK != 0) return cudaErrorInvalidValue;",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using globals_t = gate_up_silu_mul_globals<TN, TK>;"
+    )
+    .unwrap();
+    writeln!(out, "    globals_t g{{").unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(X),     (size_t)1, (size_t)1, (size_t)M, (size_t)K}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(Wgate), (size_t)1, (size_t)1, (size_t)K, (size_t)N}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(Wup),   (size_t)1, (size_t)1, (size_t)K, (size_t)N}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{Inter,                    (size_t)1, (size_t)1, (size_t)M, (size_t)N}},",
+    )
+    .unwrap();
+    writeln!(out, "        K / TK").unwrap();
+    writeln!(out, "    }};").unwrap();
+    writeln!(out, "    dim3 grid(M / 64, N / TN);").unwrap();
+    writeln!(
+        out,
+        "    gate_up_silu_mul_kernel<TN, TK><<<grid, 128, 0, stream>>>(g);",
+    )
+    .unwrap();
     writeln!(out, "    return cudaGetLastError();").unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();

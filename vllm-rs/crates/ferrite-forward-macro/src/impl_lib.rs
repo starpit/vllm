@@ -8179,6 +8179,12 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
         let k_out = ctx.output_ident(rope_id, 1);
         let v_out = ctx.output_ident(rope_id, 2);
 
+        // Rotary cos/sin now lives on the per-arch Weights struct
+        // (`wm.rotary` / `wm.rotary_local`), not on `ForwardCtx`.
+        // Pick the right one based on the claimed tiles' extern
+        // inputs, same pattern the non-FP8 impls use.
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
         quote! {
             let #q_out = unsafe {
                 let qkv_packed = (#weight_expr).forward(
@@ -8191,7 +8197,7 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        #rotary_cos_sin,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -8208,7 +8214,7 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache(
                         *qkv_packed,
                         *ctx.positions,
-                        ctx.rotary.cos_sin_cache,
+                        #rotary_cos_sin,
                         *ctx.slot_mapping,
                         *ctx.kv_cache.k_cache(#layer),
                         *ctx.kv_cache.v_cache(#layer),
@@ -8340,6 +8346,10 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
         let k_out = ctx.output_ident(rope_id, 1);
         let v_out = ctx.output_ident(rope_id, 2);
 
+        // Rotary cos/sin is on `wm.rotary` / `wm.rotary_local` now —
+        // ForwardCtx no longer carries it.
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
         quote! {
             let (#q_out, #k_out, #v_out) = unsafe {
                 let qkv_packed = (#weight_expr).forward(
@@ -8351,7 +8361,7 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
                 ::ferrite_kernels::kernels::fused_qkv_rope(
                     *qkv_packed,
                     *ctx.positions,
-                    ctx.rotary.cos_sin_cache,
+                    #rotary_cos_sin,
                     #q_size,
                     #kv_size,
                     #num_q_heads,

@@ -2935,6 +2935,17 @@ fn emit_wave_walk(
 ///
 /// The emitted fn's signature mirrors `forward_m_<N>` exactly except
 /// for the name and semantic return value.
+/// `true` when `FERRITE_STENCIL_CODEGEN=1` is set in the build env.
+///
+/// Toggle for the 6.2.b.5 collapsed-mode emitter. Off by default; on
+/// routes `emit_forward_for_bucket` through `emit_forward_collapsed_bucket`.
+/// The collapsed emitter is the load-bearing piece of STENCIL_IR_V2_DESIGN.md
+/// §9 step 6 — one fragment per class, per-iteration dispatch via
+/// `for __repeat in 0..max_period { … }` with guards for period mismatch.
+fn stencil_codegen_enabled() -> bool {
+    std::env::var("FERRITE_STENCIL_CODEGEN").ok().as_deref() == Some("1")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_forward_for_bucket(
     fuf: &Fuf,
@@ -2947,6 +2958,19 @@ fn emit_forward_for_bucket(
     library: &mut FragmentLibrary,
     weight_layout: &crate::emit::WeightLayout,
 ) -> TokenStream {
+    if stencil_codegen_enabled() {
+        return emit_forward_collapsed_bucket(
+            fuf,
+            sfuf,
+            loop_ir,
+            program,
+            model,
+            lib,
+            wp,
+            library,
+            weight_layout,
+        );
+    }
     let locals = build_local_map(fuf);
 
     // Forward returns the last tile's slot-0 output — its owner must
@@ -3014,6 +3038,70 @@ fn emit_forward_for_bucket(
             );
             #(#body)*
             #last_output
+        }
+    }
+}
+
+/// STENCIL_IR_V2_DESIGN.md §9 step 6.2.b.5 — class-driven forward emission.
+///
+/// Entry point when `FERRITE_STENCIL_CODEGEN=1`. Walks the StencilBundle's
+/// classes (not wavefronts, not subgraphs) and emits:
+/// - pre-loop: period-1 classes + any class whose members are all iter=0
+///   before the periodic loop window (embed, layer-0-only boundaries);
+/// - loop: `for __repeat in 0..max_period { … }` with per-class guards
+///   `if __repeat >= offset && __repeat < offset + period` (§13 p1);
+/// - post-loop: period-1 classes + last-member-only classes (final norm,
+///   lm_head).
+///
+/// Inside the loop, each class's representative body is emitted once via
+/// `emit_subgraph` in abstract mode with `repeat_var = Some(__repeat)` so
+/// every `ctx.layer_expr(c)` resolves to `#repeat_var + offset`. Weight
+/// accesses read through 6.1's `WeightLayout` family arrays indexed by
+/// `__repeat`. Loop-carried inter-class edges (Δrepeat ≠ 0 — the residual
+/// stream per §13) land in `let mut` bindings hoisted above the loop.
+///
+/// Status: **stub** (6.2.b.5a). This fn intentionally bails out loudly
+/// rather than silently falling back to the unrolled emitter — per
+/// `feedback_stencil_is_the_model`, we commit to driving codegen from the
+/// collapsed IR, not from the unrolled FUF. Subsequent commits fill in
+/// the real body; this one reserves the dispatch site and the env flag.
+#[allow(clippy::too_many_arguments)]
+fn emit_forward_collapsed_bucket(
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    _loop_ir: &Loop,
+    _program: &Program,
+    _model: &ModelParams,
+    _lib: &ImplementationLibrary,
+    wp: crate::solver::WorkloadPoint,
+    _library: &mut FragmentLibrary,
+    _weight_layout: &crate::emit::WeightLayout,
+) -> TokenStream {
+    let stencil = StencilBundle::compute(fuf, sfuf);
+    let num_classes = stencil.class_members.len();
+    let max_period = stencil
+        .class_members
+        .iter()
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0);
+    let homogeneous = stencil.homogeneous_count();
+    let msg = format!(
+        "FERRITE_STENCIL_CODEGEN collapsed-mode emitter not yet implemented \
+         (classes={}, homogeneous={}, max_period={}); see STENCIL_IR_V2_DESIGN.md §13 6.2.b.5",
+        num_classes, homogeneous, max_period,
+    );
+    let fn_name = bucket_fn_ident("forward_m", wp);
+    quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments, unused_mut, unused_variables)]
+        pub unsafe fn #fn_name(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            let _ = (wm, ctx, device);
+            unimplemented!(#msg)
         }
     }
 }

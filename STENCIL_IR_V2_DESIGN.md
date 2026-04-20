@@ -326,11 +326,13 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 ## 13. Status & handoff (2026-04-20)
 
-**Branch**: `worktree-ff3`. Four commits on top of `0ab1aad98`:
+**Branch**: `worktree-ff3`. Six commits on top of `0ab1aad98`:
 - `aef01d8ca` — IR + subtile + region_formation + periodicity + CollapsePlan
 - `420a71690` — class→impl consistency checker + FormedRegions refactor
 - `5f3e96cd5` — neighbor-aware canonical hash; 23 → 2 heterogeneous variants
 - `db9c13847` — `StencilBundle` plumbed through emit_wave_walk / emit_subgraph. Scaffolding only; no emission change.
+- `6323d514e` — **6.1 landed**: per-layer arrays on Weights + `WeightLayout` read rewrite. `cargo expand` on llama-2-13b shows `input_layernorm: [RmsNorm; 40]`, `mlp_down_proj: [LinearLayer; 40]`, etc. collapse to array fields. Fused qkv/gate_up accessors stay flat (stems embed sibling layer idxs) — deferred follow-up.
+- `61dd42ed9` — **6.2.a landed**: `repeat_var: Option<TokenStream>` + `layer_expr(u64)` helper on EmitCtx. Both construction sites set `None`, so emitted code is byte-identical; the field is dormant until 6.2.b wires loop emission.
 
 **What builds**: everything. `cargo build -p ferrite-models --release` exercises all 218 model variants through the full pipeline. Stencil diagnostic prints alongside each variant's ferrite line (see "stencil · N regions → N classes" entries).
 
@@ -349,12 +351,23 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 ### Quick-start for next session
 
-Entry point: **6.1 Weights-struct per-layer arrays** (§13 item B below). Zero design work left — the implementation sketch in B.6.1 is ready to type against. Files to touch:
-- `vllm-rs/crates/ferrite-forward-macro/src/impl_lib.rs` — add `family: Option<(syn::Ident, u64)>` to `WeightAccessor` (line ~337); populate in `default_required_weights` (line ~370).
-- `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs::emit_weights_struct` (line ~1050) — group accessors by family after `collect_accessors`; emit array fields + constructor array assembly.
-- `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs::emit_subgraph` — call-site weight-arg block (line ~2420) branches on `acc.family`.
+Entry point: **6.2.b class-loop emission** (§13 item B below). 6.1 + 6.2.a have landed; the IR + plumbing is in place. The remaining work is the actual loop-emission rewrite — this is the critical-path win.
 
-Validation after 6.1: `cargo build -p ferrite-models --release` should still produce identical emitted forward fns (verify via `cargo expand` diff on llama-2-7b). No runtime or compile-time change expected yet — the win comes with 6.2's loop emission.
+Before writing code, validate two empirical questions:
+
+1. **Schedule contiguity**: is today's wave schedule layer-serial (all of layer 0's waves, then layer 1's, …) or does it interleave across layers? If serial, option (a) from §B.6.2 works directly: emit a class loop at the first wave mentioning any member, skip members in later waves. If interleaved, plan on re-planning the schedule over collapsed Regions (bigger refactor of `schedule.rs`).
+
+   Quick check: pick llama-2-7b, print the subgraph-ids visited per wave in `emit_wave_walk`, see whether they cluster by layer. Expected layer-serial per the "283 waves across 40 layers, avg 7 waves/layer" stencil output, but confirm before committing to option (a).
+
+2. **`layer_expr` suffix parity**: today's emit bakes `#layer` with `layer: usize` → `quote!` produces a `5usize`-suffixed literal via `ToTokens for usize`. 6.2.a's `layer_expr` produces `u64_unsuffixed` tokens. Before lifting in impls, make `layer_expr` match `usize::to_tokens` byte-for-byte (return `quote! { #concrete_usize }`) so the pre-pivot unrolled path stays byte-identical. Two impl sites use `layer as u64` in non-quote positions (`impl_lib.rs:4760`, `:5548`); those need a separate concrete-u64 binding preserved alongside the TokenStream.
+
+Sub-steps inside 6.2.b (land each on its own commit):
+
+1. **`layer_expr` suffix fix** — match `usize::to_tokens` so the dormant helper is a drop-in for every existing `let layer = rope_kv_cache_layer(..) as usize; quote!{..#layer..}` site.
+2. **Literal lifting in 3–5 impls** (`FusedQkvRopeCacheImpl`, `AttentionViaCacheImpl`, `RopeAppendRef`, `SlidingAttentionImpl`, plus fp8/interleaved variants). Route every site that baked `layer` into quote through `ctx.layer_expr(layer_u64)`. `repeat_var` stays `None` so `cargo expand` on llama-2-13b is byte-identical pre/post lift (that's the gate).
+3. **Class-loop emit in `emit_wave_walk`** — when a bucket's schedule exposes a contiguous run of periodic class members, emit one `for __repeat in 0..#N { … }` loop wrapping fragments indexed by `__repeat`. Gate behind `FERRITE_STENCIL_CODEGEN=1` so the default build remains today's unrolled path until llama-2-7b passes `vllm chat` under the new path.
+4. **Heterogeneous tolerance** for the 2 Qwen3 variants (A.2). Emit two fragments keyed `(class_idx, impl_id)`, dispatch via a baked `const TABLE: [u8; N]`.
+5. **Validation + flip default** — `vllm chat` (with `timeout`) on llama-2-7b (correctness gate), `vllm bench latency` delta ≤ ~1% (runtime gate), `cargo build -p vllm-cli --features cuda --release` wall-time delta (compile-time gate). Flip `FERRITE_STENCIL_CODEGEN=1` to the default only after all arches green.
 
 ### Open items for the next session
 
@@ -380,7 +393,9 @@ Validation after 6.1: `cargo build -p ferrite-models --release` should still pro
   3. In the loader body, keep the per-layer `let #name = …` lines (unchanged from today — they're what actually load each layer's weight), and at the Self{} constructor append array assembly: `let #stem = [#stem_0, #stem_1, …, #stem_{N-1}];` then `#stem,` in the constructor (replacing the N flat field shorthands). For ungrouped accessors, today's path unchanged.
   4. Accessor data model: add `family: Option<(Ident /* stem */, u64 /* index */)>` to `WeightAccessor`, populated at `default_required_weights` time when the source weight has `Some(index)`. Call-site weight-arg emission in `emit_subgraph` reads this: when `family.is_some()` and we're emitting a class loop, `&wm.#stem[#loop_var]`; else today's `&wm.#name`.
 
-- **6.2 ⏳ Class-loop call sites + literal lifting.** Once 6.1 lands:
+- **6.2.a ✅ `repeat_var` plumbing (commit `61dd42ed9`).** `EmitCtx` gains `repeat_var: Option<TokenStream>` + `layer_expr(concrete: u64) -> TokenStream`. Both today's ctx constructions (Concrete inline-fallback + Abstract fragment body) set `None`; `layer_expr(c)` returns `c`'s literal tokens in that case, matching pre-pivot emission. Dormant until 6.2.b flips `repeat_var` to the loop ident.
+
+- **6.2.b ⏳ Class-loop call sites + literal lifting.** Once 6.1 + 6.2.a land:
   - Rewrite `emit_wave_walk` to walk classes instead of subgraphs where possible: for each homogeneous class that intersects this bucket's wave schedule, emit one fragment body (abstract-emit via the class representative) and a call site `for __repeat in 0..#period { __frag_N(args_indexed_by___repeat); }`. Heterogeneous classes (Qwen3 A.2) fall back to per-subgraph emission — the bundle's `class_impl_id[c] == None` flag gates this.
   - Tension with today's wave scheduler: waves interleave subgraphs across layers for parallelism (wave W may have layer 0's attn + layer 1's mlp). A class's members are therefore not contiguous in the emission order. Solutions:
     (a) Emit the class loop at the first wave that mentions any class member; skip class members in later waves. Loses wave-parallelism across classes but preserves wave-parallelism within. Simplest.

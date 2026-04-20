@@ -416,6 +416,13 @@ pub struct WeightLayout {
     /// means "use the flat ident verbatim"; the lookup helpers
     /// synthesize that fallback.
     access: HashMap<String, TokenStream>,
+    /// Flat accessor name → family stem ident. Populated for family
+    /// members only (i.e. the same set of names as the `[stem[idx]]`
+    /// entries in `access`). Lets `access_tokens_with_repeat` rewrite
+    /// a member to `stem[#repeat_var]` at call sites emitted inside
+    /// a class loop — the collapsed-codegen path in
+    /// STENCIL_IR_V2_DESIGN.md §13 6.2.b.5.
+    family_stem: HashMap<String, syn::Ident>,
 }
 
 impl WeightLayout {
@@ -429,6 +436,15 @@ impl WeightLayout {
         self.access.insert(flat_name.to_string(), postfix);
     }
 
+    /// Record `flat_name`'s family stem alongside its per-layer
+    /// literal access. Callers that want class-loop rewrites call
+    /// both `insert_array_access` and `insert_family_stem` — the
+    /// pre-pivot (unrolled) path only reads `access`, so the stem
+    /// map is dormant until a collapsed emitter asks for it.
+    pub fn insert_family_stem(&mut self, flat_name: &str, stem: syn::Ident) {
+        self.family_stem.insert(flat_name.to_string(), stem);
+    }
+
     /// Tokens to splat after `wm.` to access `flat_name`. Falls
     /// back to the bare flat ident when no array rewrite was
     /// recorded — preserves today's behavior for orphans.
@@ -437,5 +453,34 @@ impl WeightLayout {
             return tokens.clone();
         }
         quote! { #flat_name }
+    }
+
+    /// Like `access_tokens`, but when `repeat` is `Some(tokens)` and
+    /// `flat_name` belongs to a weight family, emit `stem[#tokens]`
+    /// instead of the per-layer literal form. Non-family (orphan)
+    /// names ignore `repeat` and emit the flat ident as usual —
+    /// orphans don't repeat, so a class loop has nothing to index.
+    ///
+    /// When `repeat` is `None` this delegates to `access_tokens`
+    /// verbatim, keeping the unrolled emission path byte-identical.
+    pub fn access_tokens_with_repeat(
+        &self,
+        flat_name: &syn::Ident,
+        repeat: Option<&TokenStream>,
+    ) -> TokenStream {
+        if let Some(repeat_tokens) = repeat
+            && let Some(stem) = self.family_stem.get(&flat_name.to_string())
+        {
+            return quote! { #stem[#repeat_tokens] };
+        }
+        self.access_tokens(flat_name)
+    }
+
+    /// `true` when `flat_name` was recorded as a family member via
+    /// `insert_family_stem`. Collapsed emitters use this to decide
+    /// whether a weight-access site can be lifted into a class loop
+    /// (family) vs. must be hoisted to pre/post-loop (orphan).
+    pub fn is_family_member(&self, flat_name: &syn::Ident) -> bool {
+        self.family_stem.contains_key(&flat_name.to_string())
     }
 }

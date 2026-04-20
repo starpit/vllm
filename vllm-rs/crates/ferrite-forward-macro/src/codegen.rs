@@ -1251,6 +1251,7 @@ fn emit_weights_struct(
             let flat_name = accessors[acc_pos].name.to_string();
             let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx_in_group);
             weight_layout.insert_array_access(&flat_name, quote! { #stem[#idx_lit] });
+            weight_layout.insert_family_stem(&flat_name, stem.clone());
         }
     }
 

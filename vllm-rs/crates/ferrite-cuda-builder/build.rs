@@ -78,6 +78,9 @@ fn cuda_build() {
         .include_path("../../crates/vllm-cuda/csrc")
         .arg("-O3")
         .arg("--use_fast_math")
+        .arg("--expt-extended-lambda")
+        .arg("--expt-relaxed-constexpr")
+        .arg("-std=c++17")
         .build_lib(format!("{}/libvllm_kernels.a", cache_str))
         .expect("Failed to build vllm_kernels");
 

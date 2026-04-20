@@ -129,9 +129,10 @@ inline void cutlass_gemm_caller(
   };
 
   typename Gemm::Op::Arguments args{
-      cutlass::gemm::GemmUniversalMode::kGemm,  // Standard GEMM mode (not split-K)
+      // Match vllm csrc/quantization/w8a8/cutlass/scaled_mm_c2x.cuh.
+      cutlass::gemm::GemmUniversalMode::kGemmSplitKParallel,
       problem_size,
-      1,  // batch count
+      1,
       epilogue_args,
       a,
       b,

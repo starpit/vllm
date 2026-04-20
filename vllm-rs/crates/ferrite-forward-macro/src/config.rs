@@ -511,16 +511,16 @@ mod tests {
         let configs = load_dir(&dir).expect("load llama configs");
 
         // 12 dense bases (9 Llama + 2 smollm2 + 1 tinyllama) ×
-        // (1 dense + 4 quant presets from `quantizations.json`:
-        //  awq-gemm, gptq-sym, gptq-sym-desc_act, ct-int4-sym) = 60.
-        // Individual sizes don't always have real HF repos in every
-        // preset (e.g. Llama-2-70B-AWQ exists, Llama-2-7B-CT doesn't
-        // per say), but the compiler emits variants for all of them
-        // so fingerprint dispatch stays open-set at runtime.
+        // (1 dense + 5 quant presets from `quantizations.json`:
+        //  awq-gemm, gptq-sym, gptq-sym-desc_act, ct-int4-sym,
+        //  fp8-dynamic-per-tensor) = 72. Individual sizes don't
+        // always have real HF repos in every preset, but the
+        // compiler emits variants for all of them so fingerprint
+        // dispatch stays open-set at runtime.
         assert_eq!(
             configs.len(),
-            60,
-            "expected 60 Llama variants (12 bases × 5 variants)"
+            72,
+            "expected 72 Llama variants (12 bases × 6 variants)"
         );
 
         // Ground-truth check on llama-3.2-1b. Published values:
@@ -552,11 +552,12 @@ mod tests {
     fn load_real_qwen2_configs() {
         let dir = repo_model_archs().join("qwen2");
         let configs = load_dir(&dir).expect("load qwen2 configs");
-        // 11 dense × (1 dense + 2 presets: awq-gemm, gptq-sym) = 33.
+        // 11 dense × (1 dense + 3 presets: awq-gemm, gptq-sym,
+        // fp8-dynamic-per-tensor) = 44.
         assert_eq!(
             configs.len(),
-            33,
-            "expected 33 Qwen2 variants (11 bases × 3 variants)"
+            44,
+            "expected 44 Qwen2 variants (11 bases × 4 variants)"
         );
 
         // Ground-truth check on Qwen2-0.5B:

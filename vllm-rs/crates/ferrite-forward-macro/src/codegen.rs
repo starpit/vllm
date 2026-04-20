@@ -120,6 +120,14 @@ enum FieldLoad {
         in_features: u32,
         blocksize: u32,
     },
+    /// FP8 E4M3 linear. Single prefix (`Fp8Linear::load`) or fused
+    /// across several (`Fp8Linear::load_concat` — max-scale merge,
+    /// per Python vLLM's `requantize_with_max_scale`). The loader
+    /// reads shapes + scale layout from the on-disk tensors so it
+    /// handles per-tensor dynamic, per-channel, and online-quant
+    /// (BF16 checkpoint) paths from the same arm. `output_dtype`
+    /// is threaded in via the `__fp8_dtype` prelude binding.
+    Fp8Linear { prefixes: Vec<String> },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -188,6 +196,8 @@ fn plan_field_load(
     let is_bnb4 = ty.ends_with("::Bnb4bitLinear")
         || ty == "Bnb4bitLinear"
         || ty.ends_with("layers::Bnb4bitLinear");
+    let is_fp8 =
+        ty.ends_with("::Fp8Linear") || ty == "Fp8Linear" || ty.ends_with("layers::Fp8Linear");
 
     let prefixes: Vec<String> = accessor
         .source_weights
@@ -370,6 +380,24 @@ fn plan_field_load(
             in_features: in_features.expect("at least one source weight"),
             blocksize: blocksize.expect("at least one source weight"),
         };
+    }
+
+    if is_fp8 {
+        // FP8 sources must all resolve to `StorageFormat::Fp8`.
+        // Shapes + scale layout are sniffed by the loader at runtime
+        // (per-tensor scalar vs per-channel [N,1] vs online BF16→FP8
+        // quant), so no macro-time dim math needed.
+        for (wid, _idx) in &accessor.source_weights {
+            let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
+            if !matches!(fmt, crate::quantization::StorageFormat::Fp8 { .. }) {
+                panic!(
+                    "accessor `{}` declared `Fp8Linear` but source weight resolves to \
+                     non-FP8 storage ({fmt:?}) — matcher bug",
+                    accessor.name,
+                );
+            }
+        }
+        return FieldLoad::Fp8Linear { prefixes };
     }
 
     if is_embedding {
@@ -582,6 +610,7 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
             ..
         }) => ("weight_packed", "weight"),
         Some(crate::quantization::QuantMethod::Bnb4 { .. }) => ("weight.absmax", "qweight"),
+        Some(crate::quantization::QuantMethod::Fp8 { .. }) => ("weight_scale", "qweight"),
         Some(_) => ("qweight", "weight"),
         None => ("weight", "qweight"),
     };
@@ -601,6 +630,17 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
         Some(crate::quantization::QuantMethod::Bnb4 { .. })
     );
     let bnb4_marker_tensor = "model.layers.0.self_attn.q_proj.weight.absmax";
+    // FP8 checkpoints ship `.weight` (FP8E4M3 bytes — same suffix
+    // as dense bf16) alongside a sibling `.weight_scale`. Dense /
+    // AWQ / GPTQ / CT / BNB4 variants must reject when
+    // `.weight_scale` is present; the FP8 variant itself keys off
+    // this tensor in its suffix-based checks and doesn't need the
+    // rejection.
+    let fp8_exclusion = matches!(
+        model.quantization.as_ref().map(|qc| &qc.method),
+        Some(crate::quantization::QuantMethod::Fp8 { .. })
+    );
+    let fp8_marker_tensor = "model.layers.0.self_attn.q_proj.weight_scale";
 
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
     let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size as usize);
@@ -752,6 +792,14 @@ fn emit_fingerprint_check(model: &ModelParams) -> TokenStream {
             if !#bnb4_exclusion && gw.contains(#bnb4_marker_tensor) {
                 return false;
             }
+            // FP8 marker exclusion — reject dense/AWQ/GPTQ/CT/BNB4
+            // fingerprints when the checkpoint ships FP8's
+            // `.weight_scale` sibling. The FP8 variant itself keys
+            // off `.weight_scale` as its positive suffix, so this
+            // exclusion runs only for non-FP8 variants.
+            if !#fp8_exclusion && gw.contains(#fp8_marker_tensor) {
+                return false;
+            }
             #qweight_shape_gate
             #g_idx_disambiguation
             true
@@ -793,6 +841,7 @@ fn emit_weights_struct(
     //   `RmsNorm`       ↔ `Dense`
     //   `MarlinLinear`  ↔ `Awq { .. }` | `Gptq { .. }`
     //   `Bnb4bitLinear` ↔ `Bnb4 { .. }`
+    //   `Fp8Linear`     ↔ `Fp8 { .. }`
     //
     // Any other pair means the solver picked an impl whose
     // declared accessor type doesn't match the bits on disk — a
@@ -806,14 +855,38 @@ fn emit_weights_struct(
         let accessor_is_bnb4 = ty.ends_with("::Bnb4bitLinear")
             || ty == "Bnb4bitLinear"
             || ty.ends_with("layers::Bnb4bitLinear");
+        let accessor_is_fp8 =
+            ty.ends_with("::Fp8Linear") || ty == "Fp8Linear" || ty.ends_with("layers::Fp8Linear");
         for (wid, _idx) in &a.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
             let ok = matches!(
-                (&fmt, accessor_is_marlin, accessor_is_bnb4),
-                (crate::quantization::StorageFormat::Dense, false, false)
-                    | (crate::quantization::StorageFormat::Awq { .. }, true, false)
-                    | (crate::quantization::StorageFormat::Gptq { .. }, true, false)
-                    | (crate::quantization::StorageFormat::Bnb4 { .. }, false, true),
+                (&fmt, accessor_is_marlin, accessor_is_bnb4, accessor_is_fp8),
+                (
+                    crate::quantization::StorageFormat::Dense,
+                    false,
+                    false,
+                    false
+                ) | (
+                    crate::quantization::StorageFormat::Awq { .. },
+                    true,
+                    false,
+                    false
+                ) | (
+                    crate::quantization::StorageFormat::Gptq { .. },
+                    true,
+                    false,
+                    false
+                ) | (
+                    crate::quantization::StorageFormat::Bnb4 { .. },
+                    false,
+                    true,
+                    false
+                ) | (
+                    crate::quantization::StorageFormat::Fp8 { .. },
+                    false,
+                    false,
+                    true
+                ),
             );
             if !ok {
                 let dotted = program.weights.path(*wid).join(".");
@@ -852,6 +925,9 @@ fn emit_weights_struct(
     let any_bnb4 = plans
         .iter()
         .any(|p| matches!(p, FieldLoad::Bnb4Linear { .. }));
+    let any_fp8 = plans
+        .iter()
+        .any(|p| matches!(p, FieldLoad::Fp8Linear { .. }));
     // `max(out_features * in_features)` across every BNB4 accessor
     // — sizes the per-model shared dequant scratch buffer. Zero
     // when the model has no BNB4 accessors (the prelude block is
@@ -941,6 +1017,26 @@ fn emit_weights_struct(
                                 marlin_storage,
                                 __marlin_ws,
                                 __device_id,
+                            )?;
+                        }
+                    }
+                }
+                FieldLoad::Fp8Linear { prefixes } => {
+                    if prefixes.len() == 1 {
+                        let prefix = &prefixes[0];
+                        quote! {
+                            let #name = ::ferrite_kernels::layers::Fp8Linear::load(
+                                gw,
+                                #prefix,
+                                __fp8_dtype,
+                            )?;
+                        }
+                    } else {
+                        quote! {
+                            let #name = ::ferrite_kernels::layers::Fp8Linear::load_concat(
+                                gw,
+                                &[ #(#prefixes),* ],
+                                __fp8_dtype,
                             )?;
                         }
                     }
@@ -1044,6 +1140,22 @@ fn emit_weights_struct(
                 __bnb_dtype,
                 stream,
             )?;
+        }
+    } else {
+        quote! {}
+    };
+
+    // Shared-per-model FP8 prelude: read the compute dtype from
+    // `embed_tokens.weight` (always present, always in compute dtype
+    // — never FP8-quantized) and hand it to every `Fp8Linear::load`.
+    // Matches the pattern used by the BNB4 prelude for its dequant
+    // scratch allocation. Elided when no FP8 accessors are present.
+    let fp8_prelude: TokenStream = if any_fp8 {
+        quote! {
+            let __fp8_dtype = gw
+                .tensor_info("model.embed_tokens.weight")
+                .map(|(_, dt)| dt)
+                .unwrap_or(::ferrite_cuda_core::dtype::DType::BF16);
         }
     } else {
         quote! {}
@@ -1179,6 +1291,7 @@ fn emit_weights_struct(
             ) -> ::anyhow::Result<Weights> {
                 #marlin_prelude
                 #bnb4_prelude
+                #fp8_prelude
                 #(#lets)*
                 #rotary_local_load
                 Ok(#weights_ctor {

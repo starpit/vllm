@@ -216,6 +216,15 @@ impl TestModels {
     // FP8 quantized models (CUDA-backend, SM89+)
     pub const QWEN2_0_5B_FP8: &str = "RedHatAI/Qwen2.5-0.5B-FP8-dynamic";
     pub const LLAMA_3_1_8B_FP8: &str = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8";
+    // FP8 dynamic-per-tensor (W8A8, weights channel-strategy,
+    // activations token-strategy dynamic) — the class covered by
+    // Slice 1 of the ferrite FP8 rollout.
+    pub const LLAMA_3_2_1B_FP8: &str = "RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic";
+    pub const QWEN3_0_6B_FP8: &str = "RedHatAI/Qwen3-0.6B-FP8-dynamic";
+    pub const GEMMA2_2B_FP8: &str = "espressor/google.gemma-2-2b-it_W8A8_FP8";
+    pub const GEMMA3_1B_FP8: &str = "RedHatAI/gemma-3-1b-it-FP8-dynamic";
+    pub const GRANITE_3_1_2B_FP8: &str = "RedHatAI/granite-3.1-2b-instruct-FP8-dynamic";
+    pub const MISTRAL_7B_V03_FP8: &str = "nm-testing/Mistral-7B-Instruct-v0.3-FP8-Dynamic";
 
     // FP8 MoE models (CUDA-backend, SM89+)
     // 2-layer Mixtral 8x7B FP8 (~3GB) — small enough for single L40S

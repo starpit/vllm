@@ -5041,11 +5041,11 @@ impl Worker for CudaWorker {
         // `inventory::submit!` at macro expansion — adding a new
         // arch to ferrite-models touches zero lines here.
         let disable_ferrite = std::env::var("FERRITE_DISABLE").ok().as_deref() == Some("1");
-        let ferrite_eligible = !qconfig.is_fp8()
-            && (!qconfig.is_quantized()
-                || qconfig.is_awq()
-                || qconfig.is_gptq()
-                || qconfig.is_bnb4bit())
+        let ferrite_eligible = (!qconfig.is_quantized()
+            || qconfig.is_awq()
+            || qconfig.is_gptq()
+            || qconfig.is_bnb4bit()
+            || qconfig.is_fp8())
             && !use_tp
             && !use_pp
             && !disable_ferrite;

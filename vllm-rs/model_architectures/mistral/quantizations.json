@@ -1,0 +1,3 @@
+{
+  "quantizations": ["fp8-dynamic-per-tensor"]
+}

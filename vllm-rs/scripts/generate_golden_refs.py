@@ -83,6 +83,22 @@ MODELS = {
     # exercises the non-sliding branch of ferrite-models/src/mistral.rs
     # against Python vLLM's `MistralForCausalLM`.
     "mistral_7b_instruct_v0_3": "unsloth/mistral-7b-instruct-v0.3",
+    # FP8 dynamic-per-tensor — exercises the ferrite-forward
+    # `Fp8GemmImpl` / `Fp8FusedGemmBiasImpl` / `Fp8FusedGateUpSiluMulImpl` /
+    # `Fp8FusedGateUpGeluMulImpl` / `Fp8FusedQkvRope{Cache,Prefill}Impl`
+    # family + `Fp8Linear::{load, load_concat}`. All six checkpoints
+    # below ship FP8E4M3 weights with BF16 `.weight_scale [N, 1]`
+    # (channel-strategy) + dynamic per-token activation quant — the
+    # W8A8 class covered by Slice 1 of the FP8 rollout. Each exercises
+    # a different arch's DSL body: SwiGLU vs GELU MLP, QK-norm'd vs
+    # plain QKV rope, short vs long `num_hidden_layers`.
+    "qwen2_0_5b_fp8_dynamic": "RedHatAI/Qwen2.5-0.5B-FP8-dynamic",
+    "llama_3_2_1b_fp8_dynamic": "RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic",
+    "qwen3_0_6b_fp8_dynamic": "RedHatAI/Qwen3-0.6B-FP8-dynamic",
+    "gemma2_2b_fp8_dynamic": "espressor/google.gemma-2-2b-it_W8A8_FP8",
+    "gemma3_1b_fp8_dynamic": "RedHatAI/gemma-3-1b-it-FP8-dynamic",
+    "granite_3_1_2b_fp8_dynamic": "RedHatAI/granite-3.1-2b-instruct-FP8-dynamic",
+    "mistral_7b_v03_fp8_dynamic": "nm-testing/Mistral-7B-Instruct-v0.3-FP8-Dynamic",
 }
 
 MAX_TOKENS = 32
@@ -99,7 +115,21 @@ def generate_for_model(model_id: str, output_key: str):
     # vLLM to bf16 so both engines see the same precision. Other test
     # models all carry native bf16 in their config, so the default path
     # already matches.
-    llm = LLM(model=model_id, max_model_len=2048)
+    #
+    # `enforce_eager=True` disables CUDA graph capture. Graph replay
+    # introduces nondeterminism in FP8 paths (verified: two Llama FP8
+    # runs with graphs diverge within a few tokens; two runs with
+    # enforce_eager=True produce bit-identical output). FP8 goldens
+    # MUST be generated with enforce_eager=True so ferrite's
+    # deterministic output has a stable reference to compare against.
+    # Non-FP8 goldens (dense, AWQ, GPTQ, BNB4) use the default graphs
+    # path — their numerics are already stable enough that graph
+    # nondeterminism stays below the top-N tolerance.
+    is_fp8 = "fp8" in output_key.lower()
+    kwargs = {"model": model_id, "max_model_len": 2048}
+    if is_fp8:
+        kwargs["enforce_eager"] = True
+    llm = LLM(**kwargs)
     tokenizer = llm.get_tokenizer()
 
     sampling_params = SamplingParams(

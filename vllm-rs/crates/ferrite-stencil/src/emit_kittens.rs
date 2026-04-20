@@ -52,7 +52,19 @@ use crate::ir::{Megakernel, Region};
 pub fn emit_kittens(mega: &Megakernel) -> String {
     let mut out = String::new();
     write_header(&mut out);
+    // Dedup by region-template name. A Megakernel carries many
+    // regions that all share a template (a Llama forward has 32+
+    // `rmsnorm` regions, dozens of `gemm`, etc.); each one maps to
+    // the same emitted `struct <name>_globals` + `<name>_kernel` +
+    // `launch_<name>`, so the template body is emitted once.
+    // Per-region instance parameters (gmem_bindings, tile_consts)
+    // flow through `globals_t` at launch time — the kernel body
+    // doesn't embed them.
+    let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
     for region in &mega.regions {
+        if !seen.insert(region.name) {
+            continue;
+        }
         match region.name {
             "rmsnorm" => write_rmsnorm_region(&mut out, region),
             "residual_add" => write_residual_add_region(&mut out, region),

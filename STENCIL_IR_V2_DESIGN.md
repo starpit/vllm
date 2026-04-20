@@ -377,6 +377,86 @@ Sub-steps inside 6.2.b (land each on its own commit):
 
 3. ✅ **Literal lifts in 11 impls** (commit `d5cd90f6f`) — every `emit_call` site that baked a concrete layer index (9 RopeAppend-based impls + 2 Attention-via-cache impls, including fp8 / bnb4 / marlin variants) now routes through `ctx.layer_expr(layer_u64)`. `cargo expand` on llama-2-13b is byte-identical pre/post lift; `repeat_var = None` everywhere.
 
+### 6.2.b.5 — Collapsed emitter (in progress)
+
+Split into sub-commits, each dormant-by-default (off unless
+`FERRITE_STENCIL_CODEGEN=1`):
+
+- ✅ **6.2.b.5a** (commit `e14a3f282`) — `FERRITE_STENCIL_CODEGEN=1` env
+  flag + `emit_forward_collapsed_bucket` stub. Off by default; on
+  produces `unimplemented!()` with diagnostic counts. No silent
+  fallback to the unrolled path — per `feedback_stencil_is_the_model`,
+  codegen reads the collapsed IR or fails loudly.
+- ✅ **6.2.b.5b** (commit `1f49b381a`) — `WeightLayout::
+  access_tokens_with_repeat` + `insert_family_stem` +
+  `is_family_member`. Dormant API to rewrite `stem[3usize]` →
+  `stem[#__repeat]` at class-loop call sites. Populated at family-
+  detection time alongside the existing `insert_array_access` call.
+- ✅ **6.2.b.5c** (commit `b7fcc7f2b`) — `ClassSchedule` analysis:
+  intra-iter class DAG from Δrepeat=0 edges, Kahn topo sort,
+  `pre_loop` / `periodic` / `post_loop` partition, loop-carried
+  edge list (Δrepeat ≥ 1), and `uniform_period` / `uniform_pairs`
+  / `homogeneous_periodic` precondition flags. Pure analysis.
+- ✅ **6.2.b.5d** (commit `877db48e0`) — per-class boundary-input
+  provenance. For each periodic class's rep, classifies each
+  boundary input as `IntraIter` / `LoopCarry` / `PreLoop`. Detects
+  the residual-stream shape (rep's slot fed by a pre-loop producer
+  at iter 0; iter 1's matching positional slot fed by a periodic
+  producer at Δrepeat=1) and pairs them into a single carry. `None`
+  return when the graph violates collapsing preconditions.
+
+**Remaining — next session starts here:**
+
+- ⏳ **6.2.b.5e — actual emission.** Consume `ClassSchedule` +
+  `class_input_provenance` + `WeightLayout::access_tokens_with_repeat`
+  to emit the bucket body:
+  - **Pre-loop**: for each class in `sched.pre_loop`, emit its
+    single member via today's `emit_subgraph` (concrete mode,
+    `repeat_var = None`). Bind to today's `locals[&(tile_id, slot)]`.
+  - **Carry hoist**: for each periodic class's `LoopCarry` slots,
+    emit `let mut __carry_C_I = <pre_loop_init_sg's local>;` before
+    the loop. One carry per (consumer_class, slot).
+  - **Loop body**: `for __repeat in 0..sched.max_period { … }`.
+    Inside, for each class in `sched.periodic` in schedule order:
+    1. Resolve its boundary tile inputs via the provenance slots:
+       `IntraIter` → `(*__cN_out).as_view()` (iter-local binding);
+       `LoopCarry` → `(*__carry_C_I).as_view()`;
+       `PreLoop` → `(*locals[...]).as_view()`.
+    2. Resolve weight args via `access_tokens_with_repeat(..,
+       Some(&quote!(__repeat)))`.
+    3. Intern the fragment via today's `FragmentLibrary` (abstract
+       body is unchanged — it's already written against `input_i`
+       / `w_i` params).
+    4. Emit `let __cC_out = unsafe { __frag_N(…); };` where C is
+       the class index.
+    5. For each periodic consumer whose `LoopCarry.producer_class`
+       is this class: emit `__carry_C_I = __cC_out;` (or clone).
+  - **Post-loop**: `sched.post_loop` classes. The last periodic
+    class's output or the last post-loop class's output becomes
+    the fn's return value.
+
+- ⏳ **Refusal path**: when any of `sched.uniform_period`,
+  `sched.uniform_pairs`, `sched.homogeneous_periodic`, or
+  `provenance.is_some()` is false, `unimplemented!()` with a
+  precise per-variant reason. Subsequent sub-steps (period-mismatch
+  guards p1, Qwen3 A.2 heterogeneous tolerance) lift each refusal.
+
+- ⏳ **Period-mismatch (p1)**: for variants with `uniform_period=false`
+  (llama-2-7b has one period-31 class alongside period-32), emit
+  per-class `(offset, period)` guards inside the loop:
+  `if __repeat >= offset && __repeat < offset + period { … }`.
+  Compute offsets from class iter-0's position relative to the
+  reference (max-period) class.
+
+- ⏳ **Heterogeneous tolerance (A.2)**: for the two Qwen3 variants,
+  emit N fragments per class keyed `(class_idx, impl_id)`, dispatch
+  via `const TABLE: [u8; P]` built from `class_impl_id`.
+
+- ⏳ **Validation**: `vllm chat` on llama-2-7b (correctness),
+  `vllm bench latency` delta ≤ ~1% (runtime), `cargo build -p
+  vllm-cli --features cuda --release` wall-time delta (compile-time
+  win measurement). Then flip default on.
+
 **Period mismatch — the complication surfaced by step 2.** llama-2-7b has 12 classes with two periods (32 and 31). The `neg=[(9[31]<-4[32]: [-1]), …]` readout means class 9 (31 members) is missing one boundary layer relative to class 4 (32 members). A single shared `for __repeat in 0..32` can't call every class's fragment at `__repeat`-indexed args because the period-31 class's iter numbering is shifted. Options:
 
 - **(p1)** Guard-inside-loop: `for __repeat in 0..max_period { class_full_frag(__repeat); if __repeat >= 1 { class_short_frag(__repeat - 1); } … }`. Requires per-class `(offset, period)` metadata; LLVM sees a guarded call but the guard is a constant check post-monomorphization, likely optimised out.
@@ -385,7 +465,7 @@ Sub-steps inside 6.2.b (land each on its own commit):
 
 Pick (p1) — it's the only option that handles arbitrary period mixtures without leaking complexity into the callers. Need to determine each class's `offset` by inspecting the first member's position relative to a reference class (any pair of Δ=0 edges disambiguates).
 2. **Literal lifting in 3–5 impls** (`FusedQkvRopeCacheImpl`, `AttentionViaCacheImpl`, `RopeAppendRef`, `SlidingAttentionImpl`, plus fp8/interleaved variants). Route every site that baked `layer` into quote through `ctx.layer_expr(layer_u64)`. `repeat_var` stays `None` so `cargo expand` on llama-2-13b is byte-identical pre/post lift (that's the gate).
-4. ⏳ **Collapsed-mode emitter** behind `FERRITE_STENCIL_CODEGEN=1` — walks `CollapsePlan` + `StencilBundle` + `class_edges` to emit:
+4. 🔄 **Collapsed-mode emitter** behind `FERRITE_STENCIL_CODEGEN=1` — walks `CollapsePlan` + `StencilBundle` + `class_edges` to emit:
    - Pre-loop: period-1 classes + first-member-only classes topologically before the loop body (embed + any layer-0-only boundary classes).
    - `let mut` for each loop-carried data edge (Δrepeat ≠ 0), initialised from the pre-loop or a default.
    - `for __repeat in 0..max_period { ... }` with periodic classes in intra-iteration topo order; each call is `if __repeat >= class_offset && __repeat < class_offset + class_period { frag_N(iter = __repeat - class_offset) }` — per (p1) above.

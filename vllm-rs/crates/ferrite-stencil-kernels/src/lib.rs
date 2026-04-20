@@ -12,9 +12,13 @@
 
 #![cfg_attr(not(feature = "cuda"), allow(unused))]
 
-#[cfg(feature = "cuda")]
+// Legacy sm_89 smoke-kernel FFI. Only compiled when the .a is
+// linked (builder produced libstencil_kernels.a — sm_89 only).
+// On sm_90a+ builds, the sm_89 .a is skipped and this module is
+// cfg'd out so the crate still builds.
+#[cfg(all(feature = "cuda", stencil_linked))]
 mod ffi;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", stencil_linked))]
 pub use ffi::*;
 
 /// Kittens-based megakernel FFI (sm_90a+). See `kittens` for the

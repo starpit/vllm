@@ -11,7 +11,7 @@
 //!   cargo test -p ferrite-stencil-kernels --features cuda \
 //!     -- --test-threads=1
 
-#![cfg(feature = "cuda")]
+#![cfg(all(feature = "cuda", stencil_linked))]
 
 use cudarc::driver::result;
 use cudarc::driver::sys;

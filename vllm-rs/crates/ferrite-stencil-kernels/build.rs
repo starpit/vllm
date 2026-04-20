@@ -28,7 +28,16 @@ fn cuda_link() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-link-search={}", cache_str);
 
-    println!("cargo:rustc-link-lib=static=stencil_kernels");
+    // Stencil smoke kernel .a is sm_89-only (the legacy 3b smoke
+    // kernel; emit_kittens is the sm_90a+ path). Link conditionally
+    // so the crate still builds on H100 where ferrite-cuda-builder
+    // early-returned without producing the .a.
+    let stencil_lib = std::path::Path::new(&cache_str).join("libstencil_kernels.a");
+    if stencil_lib.exists() {
+        println!("cargo:rustc-link-lib=static=stencil_kernels");
+        println!("cargo:rustc-cfg=stencil_linked");
+    }
+    println!("cargo:rustc-check-cfg=cfg(stencil_linked)");
 
     // Kittens megakernel .a only exists on sm_90a+ builds where
     // ferrite-cuda-builder compiled it. When present, link it and

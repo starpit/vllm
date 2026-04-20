@@ -2725,6 +2725,245 @@ impl StencilBundle {
             homogeneous_periodic,
         }
     }
+
+    /// Classify the boundary tile inputs of every periodic class's
+    /// representative subgraph by provenance — where each input
+    /// comes from in the *collapsed* graph model, which the emitter
+    /// needs to wire the right token expression to each fragment
+    /// call's input slot.
+    ///
+    /// Three categories per (class, boundary_tile_input):
+    ///
+    /// - `IntraIter { producer_class }`: producer is a periodic
+    ///   class in the same iteration (Δrepeat = 0). Emitter reads
+    ///   the iter-local binding for `producer_class`.
+    /// - `LoopCarry { producer_class, pre_loop_init_sg }`: producer
+    ///   is periodic with Δrepeat = 1 (or more — rejected for now).
+    ///   At iter 0 the value comes from `pre_loop_init_sg`'s output
+    ///   (a pre-loop class); at iter I > 0 from the previous
+    ///   iteration's `producer_class` output. Emitter hoists a
+    ///   `let mut` initialised from the pre-loop sg, passes `&mut`
+    ///   into the call, writes the producer's new output after the
+    ///   producer's call in the same iteration.
+    /// - `PreLoop { producer_sg }`: producer is a period-1 class;
+    ///   its OwnedTensor lives in the outer scope. Emitter reads
+    ///   the today-style `locals[&(id, slot)]` binding.
+    ///
+    /// Returns `None` when the model's shape violates a precondition
+    /// the emitter can't yet handle (non-uniform producer-class
+    /// pairing, Δrepeat > 1, producer class not in any partition).
+    /// The caller (`emit_forward_collapsed_bucket`) treats `None` as
+    /// "fall through to unimplemented!()" with an explanatory panic.
+    fn class_input_provenance(
+        &self,
+        sched: &ClassSchedule,
+        fuf: &Fuf,
+        sfuf: &Assignment,
+    ) -> Option<Vec<ClassInputs>> {
+        let mut out: Vec<ClassInputs> = Vec::with_capacity(sched.periodic.len());
+        let pre_loop_set: BTreeSet<usize> = sched.pre_loop.iter().copied().collect();
+        let periodic_set: BTreeSet<usize> = sched.periodic.iter().copied().collect();
+
+        for &consumer_class in &sched.periodic {
+            let rep_sg = *self.class_members[consumer_class].first()?;
+            let rep_claimed = sfuf.tiles_in_subgraph(rep_sg);
+            let claimed_set: BTreeSet<TileId> = rep_claimed.iter().copied().collect();
+
+            // Walk rep's boundary tile inputs in the same order
+            // `emit_subgraph` uses so slot indices line up with the
+            // fragment's `input_i` params.
+            let mut seen: BTreeSet<(TileId, u8)> = BTreeSet::new();
+            let mut slots: Vec<InputSlot> = Vec::new();
+            for &t in &rep_claimed {
+                let node = fuf.get(t);
+                for input in &node.inputs {
+                    let FufInput::Tile { id, slot } = input else {
+                        continue;
+                    };
+                    if claimed_set.contains(id) {
+                        continue;
+                    }
+                    if !seen.insert((*id, *slot)) {
+                        continue;
+                    }
+                    let producer_sg = sfuf.subgraph_of(*id)?;
+                    let producer_class = *self.class_of.get(&producer_sg)?;
+                    let producer_iter = self.iter_of(producer_sg);
+
+                    let origin = if pre_loop_set.contains(&producer_class) {
+                        // Pre-loop (period-1) producer. Consumer's
+                        // iter-0 input reads this local directly. We
+                        // model this as a LoopCarry iff the same
+                        // consumer slot is also fed by a periodic
+                        // producer at iter 1+ (residual stream); as
+                        // a plain PreLoop otherwise (constant ref).
+                        //
+                        // Detect the paired periodic producer by
+                        // looking at iter 1 of the consumer's class.
+                        paired_periodic_for_slot(
+                            self,
+                            sfuf,
+                            fuf,
+                            consumer_class,
+                            &rep_claimed,
+                            *id,
+                            *slot,
+                        )
+                        .map(|pc| InputOrigin::LoopCarry {
+                            producer_class: pc,
+                            pre_loop_init_sg: producer_sg,
+                        })
+                        .unwrap_or(InputOrigin::PreLoop { producer_sg })
+                    } else if periodic_set.contains(&producer_class) {
+                        // Same-iter periodic producer (Δ=0). Anything
+                        // else (Δ>0) is suspicious: the consumer's
+                        // iter-0 sg would be reading from a producer
+                        // at iter -1+ which doesn't exist.
+                        if producer_iter != 0 {
+                            return None;
+                        }
+                        InputOrigin::IntraIter { producer_class }
+                    } else {
+                        // Post-loop producer feeding a periodic
+                        // consumer — cyclic, reject.
+                        return None;
+                    };
+                    slots.push(InputSlot {
+                        producer_tile: *id,
+                        producer_slot: *slot,
+                        origin,
+                    });
+                }
+            }
+
+            out.push(ClassInputs {
+                consumer_class,
+                rep_sg,
+                slots,
+            });
+        }
+        Some(out)
+    }
+}
+
+/// Find the periodic producer class paired with a pre-loop producer
+/// for the same consumer-slot — i.e. the class that feeds the same
+/// boundary input at iter ≥ 1. This is how the residual stream's
+/// "iter-0 from embed, iter ≥ 1 from residual_add" pattern is
+/// detected and collapsed to one `let mut` carry variable.
+///
+/// Walks the consumer's iter-1 subgraph's claimed tiles, matches by
+/// *positional* boundary-input index: the iter-1 sg's Nth boundary
+/// tile input, if it points into a periodic class with Δrepeat=1,
+/// is the carry producer.
+fn paired_periodic_for_slot(
+    bundle: &StencilBundle,
+    sfuf: &Assignment,
+    fuf: &Fuf,
+    consumer_class: usize,
+    rep_claimed: &[TileId],
+    target_id: TileId,
+    target_slot: u8,
+) -> Option<usize> {
+    let members = bundle.class_members.get(consumer_class)?;
+    if members.len() < 2 {
+        return None;
+    }
+    // Position of (target_id, target_slot) in the rep's boundary
+    // inputs (same dedup order `class_input_provenance` uses above).
+    let mut target_pos: Option<usize> = None;
+    {
+        let claimed_set: BTreeSet<TileId> = rep_claimed.iter().copied().collect();
+        let mut seen: BTreeSet<(TileId, u8)> = BTreeSet::new();
+        let mut i = 0usize;
+        'outer: for &t in rep_claimed {
+            for input in &fuf.get(t).inputs {
+                let FufInput::Tile { id, slot } = input else {
+                    continue;
+                };
+                if claimed_set.contains(id) {
+                    continue;
+                }
+                if !seen.insert((*id, *slot)) {
+                    continue;
+                }
+                if *id == target_id && *slot == target_slot {
+                    target_pos = Some(i);
+                    break 'outer;
+                }
+                i += 1;
+            }
+        }
+    }
+    let target_pos = target_pos?;
+
+    // Walk iter-1's boundary inputs, find the one at the same
+    // positional index, look up its producer class.
+    let iter1_sg = members[1];
+    let iter1_claimed = sfuf.tiles_in_subgraph(iter1_sg);
+    let claimed_set: BTreeSet<TileId> = iter1_claimed.iter().copied().collect();
+    let mut seen: BTreeSet<(TileId, u8)> = BTreeSet::new();
+    let mut i = 0usize;
+    for &t in &iter1_claimed {
+        for input in &fuf.get(t).inputs {
+            let FufInput::Tile { id, slot } = input else {
+                continue;
+            };
+            if claimed_set.contains(id) {
+                continue;
+            }
+            if !seen.insert((*id, *slot)) {
+                continue;
+            }
+            if i == target_pos {
+                let producer_sg = sfuf.subgraph_of(*id)?;
+                let pc = *bundle.class_of.get(&producer_sg)?;
+                // Must be a periodic class (period ≥ 2).
+                if bundle.class_members[pc].len() < 2 {
+                    return None;
+                }
+                return Some(pc);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Boundary inputs of one periodic class's representative, tagged
+/// by provenance. See `StencilBundle::class_input_provenance`.
+#[derive(Debug, Clone)]
+struct ClassInputs {
+    consumer_class: usize,
+    rep_sg: SubgraphId,
+    slots: Vec<InputSlot>,
+}
+
+#[derive(Debug, Clone)]
+struct InputSlot {
+    producer_tile: TileId,
+    producer_slot: u8,
+    origin: InputOrigin,
+}
+
+#[derive(Debug, Clone)]
+enum InputOrigin {
+    /// Producer is a periodic class in the same iteration. Emitter
+    /// reads the iter-local binding for `producer_class`.
+    IntraIter { producer_class: usize },
+    /// Producer is periodic with Δrepeat=1 — the residual-stream
+    /// shape. Iter-0 initial value comes from `pre_loop_init_sg`'s
+    /// OwnedTensor; subsequent iters use the previous iter's
+    /// `producer_class` output. Emitter uses one `let mut` carry
+    /// variable per (consumer_class, input_slot).
+    LoopCarry {
+        producer_class: usize,
+        pre_loop_init_sg: SubgraphId,
+    },
+    /// Producer is a period-1 class; its OwnedTensor lives in the
+    /// outer (bucket-fn) scope. Emitter reads the today-style
+    /// `locals[&(id, slot)]` binding.
+    PreLoop { producer_sg: SubgraphId },
 }
 
 /// Decide whether a subgraph's emit can be pulled out into a
@@ -3249,12 +3488,32 @@ fn emit_forward_collapsed_bucket(
 ) -> TokenStream {
     let stencil = StencilBundle::compute(fuf, sfuf);
     let sched = stencil.schedule(fuf, sfuf);
+    let provenance = stencil.class_input_provenance(&sched, fuf, sfuf);
+    let (intra_slots, carry_slots, preloop_slots, provenance_ok) = match &provenance {
+        Some(v) => {
+            let mut intra = 0usize;
+            let mut carry = 0usize;
+            let mut preloop = 0usize;
+            for ci in v {
+                for s in &ci.slots {
+                    match s.origin {
+                        InputOrigin::IntraIter { .. } => intra += 1,
+                        InputOrigin::LoopCarry { .. } => carry += 1,
+                        InputOrigin::PreLoop { .. } => preloop += 1,
+                    }
+                }
+            }
+            (intra, carry, preloop, true)
+        }
+        None => (0, 0, 0, false),
+    };
     let num_classes = stencil.class_members.len();
     let homogeneous = stencil.homogeneous_count();
     let msg = format!(
         "FERRITE_STENCIL_CODEGEN collapsed-mode emitter not yet implemented \
          (classes={}, homogeneous={}, pre={} periodic={} post={} max_period={} \
-         uniform_period={} uniform_pairs={} homogeneous_periodic={} carried_edges={}); \
+         uniform_period={} uniform_pairs={} homogeneous_periodic={} carried_edges={} \
+         provenance_ok={} intra_slots={} carry_slots={} preloop_slots={}); \
          see STENCIL_IR_V2_DESIGN.md §13 6.2.b.5",
         num_classes,
         homogeneous,
@@ -3266,6 +3525,10 @@ fn emit_forward_collapsed_bucket(
         sched.uniform_pairs,
         sched.homogeneous_periodic,
         sched.carried.len(),
+        provenance_ok,
+        intra_slots,
+        carry_slots,
+        preloop_slots,
     );
     let fn_name = bucket_fn_ident("forward_m", wp);
     quote! {

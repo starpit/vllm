@@ -55,6 +55,9 @@ pub fn emit_kittens(mega: &Megakernel) -> String {
     for region in &mega.regions {
         match region.name {
             "rmsnorm" => write_rmsnorm_region(&mut out, region),
+            "residual_add" => write_residual_add_region(&mut out, region),
+            "unary_inplace" => write_unary_inplace_region(&mut out, region),
+            "embed" => write_embed_region(&mut out, region),
             _ => write_stub_region(&mut out, region),
         }
     }
@@ -181,6 +184,229 @@ fn write_rmsnorm_region(out: &mut String, _region: &Region) {
     writeln!(
         out,
         "    rmsnorm_kernel<D><<<dim3(num_tokens), dim3(32), 0, stream>>>(g);",
+    )
+    .unwrap();
+    writeln!(out, "    return cudaGetLastError();").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// Residual add: `y = a + b`, per-token, element-wise. One warp per
+/// token (blockIdx.x = token idx). Shape mirrors rmsnorm; no reduction.
+fn write_residual_add_region(out: &mut String, _region: &Region) {
+    writeln!(out, "// ── region: residual_add ──").unwrap();
+    writeln!(out, "template<int D>").unwrap();
+    writeln!(out, "struct residual_add_globals {{").unwrap();
+    writeln!(out, "    using vec_t = sv_bf<D>;").unwrap();
+    writeln!(out, "    using gl_t = gl<bf16, -1, -1, -1, -1, vec_t>;").unwrap();
+    writeln!(out, "    gl_t a;").unwrap();
+    writeln!(out, "    gl_t b;").unwrap();
+    writeln!(out, "    gl_t y;").unwrap();
+    writeln!(out, "}};").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "template<int D>").unwrap();
+    writeln!(out, "__global__ __launch_bounds__(32, 1)").unwrap();
+    writeln!(
+        out,
+        "void residual_add_kernel(const __grid_constant__ residual_add_globals<D> g) {{"
+    )
+    .unwrap();
+    writeln!(out, "    const int token = blockIdx.x;").unwrap();
+    writeln!(out, "    __shared__ sv_bf<D> a_s;").unwrap();
+    writeln!(out, "    __shared__ sv_bf<D> b_s;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::load(a_s, g.a, {{token, 0, 0, 0}});").unwrap();
+    writeln!(out, "    warp::load(b_s, g.b, {{token, 0, 0, 0}});").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::add(a_s, a_s, b_s);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::store(g.y, a_s, {{token, 0, 0, 0}});").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "extern \"C\" cudaError_t launch_residual_add(cudaStream_t stream,",
+    )
+    .unwrap();
+    writeln!(out, "    const bf16* a, const bf16* b, bf16* y,").unwrap();
+    writeln!(out, "    uint32_t num_tokens, uint32_t hidden_dim) {{").unwrap();
+    writeln!(out, "    constexpr int D = 4096;").unwrap();
+    writeln!(
+        out,
+        "    if (hidden_dim != D) return cudaErrorInvalidValue;",
+    )
+    .unwrap();
+    writeln!(out, "    using globals_t = residual_add_globals<D>;").unwrap();
+    writeln!(out, "    globals_t g{{").unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(a), (size_t)num_tokens, (size_t)1, (size_t)1, (size_t)D}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(b), (size_t)num_tokens, (size_t)1, (size_t)1, (size_t)D}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{y, (size_t)num_tokens, (size_t)1, (size_t)1, (size_t)D}},",
+    )
+    .unwrap();
+    writeln!(out, "    }};").unwrap();
+    writeln!(
+        out,
+        "    residual_add_kernel<D><<<dim3(num_tokens), dim3(32), 0, stream>>>(g);",
+    )
+    .unwrap();
+    writeln!(out, "    return cudaGetLastError();").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// Unary in-place: `y = f(x)` where `f` is `scalar_mul` or
+/// `tanh_softcap`. The compute tag picks the op; this emit is a
+/// placeholder that uses `scalar_mul` unconditionally — the op-tag
+/// discriminator lands once we plumb Region's compute-node tag
+/// through to the kittens emit.
+fn write_unary_inplace_region(out: &mut String, _region: &Region) {
+    writeln!(out, "// ── region: unary_inplace ──").unwrap();
+    writeln!(out, "template<int D>").unwrap();
+    writeln!(out, "struct unary_inplace_globals {{").unwrap();
+    writeln!(out, "    using vec_t = sv_bf<D>;").unwrap();
+    writeln!(out, "    using gl_t = gl<bf16, -1, -1, -1, -1, vec_t>;").unwrap();
+    writeln!(out, "    gl_t x;").unwrap();
+    writeln!(out, "    gl_t y;").unwrap();
+    writeln!(out, "    bf16 scale;").unwrap();
+    writeln!(out, "}};").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "template<int D>").unwrap();
+    writeln!(out, "__global__ __launch_bounds__(32, 1)").unwrap();
+    writeln!(
+        out,
+        "void unary_inplace_kernel(const __grid_constant__ unary_inplace_globals<D> g) {{"
+    )
+    .unwrap();
+    writeln!(out, "    const int token = blockIdx.x;").unwrap();
+    writeln!(out, "    __shared__ sv_bf<D> x_s;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::load(x_s, g.x, {{token, 0, 0, 0}});").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::mul(x_s, x_s, g.scale);").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::store(g.y, x_s, {{token, 0, 0, 0}});").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "extern \"C\" cudaError_t launch_unary_inplace(cudaStream_t stream,",
+    )
+    .unwrap();
+    writeln!(out, "    const bf16* x, bf16* y, float scale,").unwrap();
+    writeln!(out, "    uint32_t num_tokens, uint32_t hidden_dim) {{").unwrap();
+    writeln!(out, "    constexpr int D = 4096;").unwrap();
+    writeln!(
+        out,
+        "    if (hidden_dim != D) return cudaErrorInvalidValue;",
+    )
+    .unwrap();
+    writeln!(out, "    using globals_t = unary_inplace_globals<D>;").unwrap();
+    writeln!(out, "    globals_t g{{").unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(x), (size_t)num_tokens, (size_t)1, (size_t)1, (size_t)D}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{y, (size_t)num_tokens, (size_t)1, (size_t)1, (size_t)D}},",
+    )
+    .unwrap();
+    writeln!(out, "        __float2bfloat16(scale),").unwrap();
+    writeln!(out, "    }};").unwrap();
+    writeln!(
+        out,
+        "    unary_inplace_kernel<D><<<dim3(num_tokens), dim3(32), 0, stream>>>(g);",
+    )
+    .unwrap();
+    writeln!(out, "    return cudaGetLastError();").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// Embed: gather one row from the embedding table using `token_ids`.
+/// `token_ids[tok_idx]` is the vocab row; emit `y[tok_idx] =
+/// embed_table[token_ids[tok_idx]]`. Single warp per output token.
+fn write_embed_region(out: &mut String, _region: &Region) {
+    writeln!(out, "// ── region: embed ──").unwrap();
+    writeln!(out, "template<int D>").unwrap();
+    writeln!(out, "struct embed_globals {{").unwrap();
+    writeln!(out, "    using vec_t = sv_bf<D>;").unwrap();
+    writeln!(out, "    using gl_t = gl<bf16, -1, -1, -1, -1, vec_t>;",).unwrap();
+    writeln!(out, "    gl_t embed;").unwrap();
+    writeln!(out, "    gl_t y;").unwrap();
+    writeln!(out, "    const uint32_t* token_ids;").unwrap();
+    writeln!(out, "}};").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "template<int D>").unwrap();
+    writeln!(out, "__global__ __launch_bounds__(32, 1)").unwrap();
+    writeln!(
+        out,
+        "void embed_kernel(const __grid_constant__ embed_globals<D> g) {{"
+    )
+    .unwrap();
+    writeln!(out, "    const int token = blockIdx.x;").unwrap();
+    writeln!(out, "    const int row = (int)g.token_ids[token];").unwrap();
+    writeln!(out, "    __shared__ sv_bf<D> vec_s;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::load(vec_s, g.embed, {{row, 0, 0, 0}});").unwrap();
+    writeln!(out, "    warp::sync();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    warp::store(g.y, vec_s, {{token, 0, 0, 0}});").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "extern \"C\" cudaError_t launch_embed(cudaStream_t stream,",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    const bf16* embed, bf16* y, const uint32_t* token_ids,",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    uint32_t num_tokens, uint32_t hidden_dim, uint32_t vocab_size) {{",
+    )
+    .unwrap();
+    writeln!(out, "    constexpr int D = 4096;").unwrap();
+    writeln!(
+        out,
+        "    if (hidden_dim != D) return cudaErrorInvalidValue;",
+    )
+    .unwrap();
+    writeln!(out, "    using globals_t = embed_globals<D>;").unwrap();
+    writeln!(out, "    globals_t g{{").unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(embed), (size_t)vocab_size, (size_t)1, (size_t)1, (size_t)D}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{y, (size_t)num_tokens, (size_t)1, (size_t)1, (size_t)D}},",
+    )
+    .unwrap();
+    writeln!(out, "        token_ids,").unwrap();
+    writeln!(out, "    }};").unwrap();
+    writeln!(
+        out,
+        "    embed_kernel<D><<<dim3(num_tokens), dim3(32), 0, stream>>>(g);",
     )
     .unwrap();
     writeln!(out, "    return cudaGetLastError();").unwrap();

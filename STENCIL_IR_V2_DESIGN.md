@@ -457,6 +457,89 @@ Split into sub-commits, each dormant-by-default (off unless
   vllm-cli --features cuda --release` wall-time delta (compile-time
   win measurement). Then flip default on.
 
+### Fresh-context starter pack for 6.2.b.5e
+
+**Where the code goes**
+- `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs ::
+  emit_forward_collapsed_bucket` is the stub to replace. Grep
+  `FERRITE_STENCIL_CODEGEN` for the env-gate site.
+- The parallel backbone-emitter `emit_forward_backbone_for_bucket`
+  needs the same treatment (add `emit_forward_backbone_collapsed_bucket`
+  and mirror the env gate). Backbone skips the terminal subgraph
+  (lm_head) and returns the backbone hidden-state; post-loop is
+  simpler there.
+- New helpers probably land in `codegen.rs` alongside
+  `emit_subgraph` rather than a new module — they share too much
+  machinery (`FragmentLibrary`, `can_fragmentize`, abstract-body
+  interning) for a crate boundary to pay off.
+
+**Reuse, don't rewrite**
+- Fragment *bodies* are byte-identical to the unrolled path. Class-
+  loop mode only changes the CALL SITE: which tokens feed `input_i`
+  args and which feed `w_i` args. Intern via today's
+  `FragmentLibrary::by_sig` so a class rep shares its fragment with
+  every other member — the whole point of the collapse.
+- Abstract-mode `EmitCtx` already exists. The only new twist is
+  `repeat_var = Some(quote!{__repeat})` when emitting inside the
+  loop, so every `ctx.layer_expr(_)` inside the body resolves to
+  `__repeat` (usize). Concrete `emit_call` already respects this —
+  see commit `b1b4df294` (6.2.b.1).
+
+**First target**: llama-2-7b (period=32/31 mix → need p1 guards).
+Actually: start with llama-2-13b or mistral-7b-v0.3 where
+`uniform_period=true` and no p1-guards are needed; those variants
+exercise the carry hoist + intra-iter + pre-loop provenance
+without the period-mismatch complication. Llama-2-7b's
+period-mismatch goes in the p1 sub-step AFTER 5e is green.
+
+**Precondition gate** (reject everything else via
+`unimplemented!()` with a specific reason string — do NOT silently
+fall through to the unrolled path, memory says don't retreat):
+- `sched.uniform_period`, `sched.uniform_pairs`,
+  `sched.homogeneous_periodic` all true;
+- `stencil.class_input_provenance(...).is_some()`;
+- No consumed inputs on any periodic class's rep (check via
+  `imp.consumes_input_tiles(claimed, fuf)` — if non-empty, refuse).
+
+The combined filter is small enough to inline as a `fn
+collapse_eligible(fuf, sfuf, sched, prov, lib) -> Result<(), String>`
+returning the refusal reason as a string literal baked into the
+`unimplemented!()` message.
+
+**Known hazards / not-yet-handled in 5e**
+- **Consumed inputs** (e.g. `add_rmsnorm`'s in-place `OwnedTensor`
+  move). A fragment that consumes its input takes the upstream
+  OwnedTensor by value — in a loop, the upstream is either an
+  iter-local (fine: moves once per iter) or a `__carry` var (not
+  fine: can't move out of a mutable that needs to survive to the
+  next iter). For 5e, refuse any periodic class whose rep impl
+  returns non-empty `consumes_input_tiles`. Follow-up sub-step
+  handles these (either by disabling the consume on the repeated
+  in-place impl or by carrying via a temporary).
+- **Multi-output tiles** already refused by `can_fragmentize`; the
+  unrolled path inlines them. Class-loop should do the same
+  (refuse periodic classes with multi-output tiles for now).
+- **Drops.** Today's `compute_drops_after` walks waves. In the
+  loop, drops of iter-local bindings happen for free at loop-body
+  scope exit (Rust scope). Pre-loop / post-loop drops can reuse
+  the existing pass by passing a wave list that covers only those
+  partitions, OR just skip drop emission in 5e (memory pressure
+  is a follow-up concern, not correctness). Default: skip drops in
+  5e, revisit once perf is measured.
+- **Return value.** `fuf.nodes.last()` is the final tile (today's
+  lm_head output). That tile's subgraph's class is almost always
+  a post-loop class (lm_head is period-1). Emit the last post-loop
+  class normally; its output local is the fn return. If the last
+  tile somehow lands in a periodic class (pathological), refuse.
+
+**Scope of 5e (what a passing commit looks like)**
+One model variant (llama-3.2-1b or mistral-7b-v0.3) compiles with
+`FERRITE_STENCIL_CODEGEN=1`, produces a `forward_m_N` that type-
+checks, and — after `vllm chat` with `timeout` per memory —
+produces coherent output. Every other variant hits
+`unimplemented!()` with a specific refusal reason. Don't try to
+green-light all 218 in one commit.
+
 **Period mismatch — the complication surfaced by step 2.** llama-2-7b has 12 classes with two periods (32 and 31). The `neg=[(9[31]<-4[32]: [-1]), …]` readout means class 9 (31 members) is missing one boundary layer relative to class 4 (32 members). A single shared `for __repeat in 0..32` can't call every class's fragment at `__repeat`-indexed args because the period-31 class's iter numbering is shifted. Options:
 
 - **(p1)** Guard-inside-loop: `for __repeat in 0..max_period { class_full_frag(__repeat); if __repeat >= 1 { class_short_frag(__repeat - 1); } … }`. Requires per-class `(offset, period)` metadata; LLVM sees a guarded call but the guard is a constant check post-monomorphization, likely optimised out.

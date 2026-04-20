@@ -52,19 +52,21 @@ use crate::ir::{Megakernel, Region};
 pub fn emit_kittens(mega: &Megakernel) -> String {
     let mut out = String::new();
     write_header(&mut out);
-    // Dedup by region-template name. A Megakernel carries many
-    // regions that all share a template (a Llama forward has 32+
-    // `rmsnorm` regions, dozens of `gemm`, etc.); each one maps to
-    // the same emitted `struct <name>_globals` + `<name>_kernel` +
-    // `launch_<name>`, so the template body is emitted once.
-    // Per-region instance parameters (gmem_bindings, tile_consts)
-    // flow through `globals_t` at launch time — the kernel body
-    // doesn't embed them.
+    // Dedup by region-template name AND wrap each body in
+    // `#ifndef KITTENS_<NAME>_EMITTED / #define / ... / #endif` so
+    // duplicate emissions are idempotent even if a stale cached .cu
+    // carried an older emit with repeats. Belt AND suspenders:
+    // - Rust-side dedup via the `seen` set skips the outer call.
+    // - C preprocessor guards skip any duplicates that made it
+    //   through anyway (stale cache from before the dedup fix).
     let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
     for region in &mega.regions {
         if !seen.insert(region.name) {
             continue;
         }
+        let guard = region_guard_macro(region.name);
+        writeln!(out, "#ifndef {guard}").unwrap();
+        writeln!(out, "#define {guard}").unwrap();
         match region.name {
             "rmsnorm" => write_rmsnorm_region(&mut out, region),
             "residual_add" => write_residual_add_region(&mut out, region),
@@ -77,8 +79,15 @@ pub fn emit_kittens(mega: &Megakernel) -> String {
             "paged_decode" => write_attn_paged_decode_region(&mut out, region),
             _ => write_stub_region(&mut out, region),
         }
+        writeln!(out, "#endif // {guard}").unwrap();
     }
     out
+}
+
+/// `region_guard_macro("rmsnorm") == "KITTENS_RMSNORM_EMITTED"`.
+/// Uppercase + underscore for C preprocessor idiom.
+fn region_guard_macro(name: &str) -> String {
+    format!("KITTENS_{}_EMITTED", name.to_uppercase())
 }
 
 fn write_header(out: &mut String) {

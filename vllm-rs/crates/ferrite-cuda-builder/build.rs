@@ -539,14 +539,20 @@ fn build_stencil_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
 #[cfg(feature = "cuda")]
 fn build_kittens_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     // SM90a+ only — kittens::tma::load_async + warpgroup::mma_async
-    // both require Hopper.
+    // both require Hopper. Loud diagnostics via `cargo:warning=` so
+    // "why didn't kittens_kernels build" is visible without -v.
     let arch = detect_cuda_arch();
     let arch_num: u32 = arch.parse().unwrap_or(89);
-    eprintln!("ferrite-cuda-builder: kittens build — detected arch={arch} (num={arch_num})");
+    println!("cargo:warning=ferrite-cuda-builder: kittens arch={arch} (num={arch_num})");
+    // Re-run build.rs when the CUDA_ARCH env var changes so switching
+    // between sm89/sm90 boxes invalidates the cache.
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=THUNDERKITTENS_ROOT");
     if arch_num < 90 {
-        eprintln!(
-            "ferrite-cuda-builder: arch<90 ({arch_num}), skipping libkittens_kernels.a. \
-             Set CUDA_ARCH=90 if this is an H100.",
+        println!(
+            "cargo:warning=ferrite-cuda-builder: arch<90 ({arch_num}), skipping \
+             libkittens_kernels.a. Set CUDA_ARCH=90 to force it on if nvidia-smi \
+             isn't reporting compute_cap correctly.",
         );
         return;
     }
@@ -569,10 +575,16 @@ fn build_kittens_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         vec![]
     };
 
+    println!(
+        "cargo:warning=ferrite-cuda-builder: found {} kittens .cu files in {:?}",
+        kittens_cus.len(),
+        kittens_cache,
+    );
     if kittens_cus.is_empty() {
-        eprintln!(
-            "ferrite-cuda-builder: no kittens .cu files in {:?}; skipping libkittens_kernels.a",
-            kittens_cache,
+        println!(
+            "cargo:warning=ferrite-cuda-builder: no kittens .cu files; skipping \
+             libkittens_kernels.a. Touch a ferrite-model-* lib.rs to force the \
+             `#[forward]` macro to regenerate the .cu cache.",
         );
         return;
     }
@@ -589,6 +601,9 @@ fn build_kittens_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
             .into_owned()
     });
     let tk_include = format!("{tk_root}/include");
+    println!(
+        "cargo:warning=ferrite-cuda-builder: ThunderKittens include = {tk_include}",
+    );
     if !std::path::Path::new(&tk_include).exists() {
         panic!(
             "ThunderKittens not found at {tk_include}. Set THUNDERKITTENS_ROOT \
@@ -613,6 +628,10 @@ fn build_kittens_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("-gencode=arch=compute_90a,code=sm_90a")
         .build_lib(format!("{cache_dir}/libkittens_kernels.a"))
         .expect("failed to build kittens-based megakernel .cu files");
+
+    println!(
+        "cargo:warning=ferrite-cuda-builder: wrote {cache_dir}/libkittens_kernels.a",
+    );
 
     for cu in &kittens_cus {
         rerun_files.push(cu.clone());

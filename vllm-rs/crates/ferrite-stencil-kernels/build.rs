@@ -45,9 +45,14 @@ fn cuda_link() {
     // on it; when absent, skip both so the crate still builds on
     // sm_89 dev boxes.
     let kittens_lib = std::path::Path::new(&cache_str).join("libkittens_kernels.a");
+    println!(
+        "cargo:warning=ferrite-stencil-kernels: checking {kittens_lib:?} exists={}",
+        kittens_lib.exists(),
+    );
     if kittens_lib.exists() {
         println!("cargo:rustc-link-lib=static=kittens_kernels");
         println!("cargo:rustc-cfg=kittens_linked");
+        println!("cargo:warning=ferrite-stencil-kernels: kittens_linked cfg set");
     }
     // Declare the cfg to rustc so `cfg(kittens_linked)` doesn't
     // trigger "unexpected_cfgs" on newer rustc.

@@ -30,7 +30,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -2402,6 +2402,159 @@ impl StencilBundle {
     fn homogeneous_count(&self) -> usize {
         self.class_impl_id.iter().filter(|p| p.is_some()).count()
     }
+
+    /// Iteration index of `sg` within its own class — the position
+    /// in `class_members[class_of[sg]]`. Matches the `__repeat`
+    /// value that the collapsed-mode emitter will bind for this
+    /// subgraph's iteration.
+    fn iter_of(&self, sg: SubgraphId) -> usize {
+        let class = *self
+            .class_of
+            .get(&sg)
+            .expect("every subgraph is in some class");
+        self.class_members[class]
+            .iter()
+            .position(|&s| s == sg)
+            .expect("class_members is a permutation of subgraphs")
+    }
+
+    /// Tile-input edges between subgraphs, classified by
+    /// (consumer_class, producer_class, Δrepeat). The emitter uses
+    /// this to (a) topo-sort classes within one iteration
+    /// (Δrepeat = 0 edges), (b) materialise loop-carried state for
+    /// intra-class-pair edges with Δrepeat ≠ 0, (c) hoist pre-loop
+    /// inputs when the producer class is period-1 and its only
+    /// member lives outside the loop.
+    ///
+    /// Walks every claimed tile's inputs — O(total tile-input
+    /// count). Returns a flat edge list so the caller can bucket
+    /// any way it likes; higher-level summaries (per class-pair
+    /// Δrepeat table, non-uniform pair detection) layer on top.
+    fn class_edges(&self, fuf: &Fuf, sfuf: &Assignment) -> Vec<ClassEdge> {
+        let mut edges: Vec<ClassEdge> = Vec::new();
+        for (&consumer_sg, &consumer_class) in &self.class_of {
+            let consumer_iter = self.iter_of(consumer_sg);
+            for consumer_tile in sfuf.tiles_in_subgraph(consumer_sg) {
+                for input in &fuf.get(consumer_tile).inputs {
+                    let FufInput::Tile {
+                        id: producer_tile, ..
+                    } = input
+                    else {
+                        continue;
+                    };
+                    let Some(producer_sg) = sfuf.subgraph_of(*producer_tile) else {
+                        continue;
+                    };
+                    if producer_sg == consumer_sg {
+                        continue;
+                    }
+                    let Some(&producer_class) = self.class_of.get(&producer_sg) else {
+                        continue;
+                    };
+                    let producer_iter = self.iter_of(producer_sg);
+                    edges.push(ClassEdge {
+                        consumer_class,
+                        consumer_iter,
+                        producer_class,
+                        producer_iter,
+                        consumer_sg,
+                        producer_sg,
+                    });
+                }
+            }
+        }
+        edges
+    }
+}
+
+/// One tile-input edge between two subgraphs in distinct classes,
+/// tagged with each side's iteration index. `Δrepeat` (the number
+/// of outer-loop iterations separating consumer from producer) is
+/// `consumer_iter - producer_iter`; `= 0` for intra-iteration edges
+/// (topo within one loop body), `> 0` for loop-carried edges
+/// (previous iteration's result), `< 0` would indicate a
+/// back-edge that the loop can't respect without restructuring —
+/// should never occur for a well-formed forward pass.
+#[derive(Debug, Clone, Copy)]
+struct ClassEdge {
+    consumer_class: usize,
+    consumer_iter: usize,
+    producer_class: usize,
+    producer_iter: usize,
+    consumer_sg: SubgraphId,
+    producer_sg: SubgraphId,
+}
+
+impl ClassEdge {
+    fn delta_repeat(&self) -> i64 {
+        self.consumer_iter as i64 - self.producer_iter as i64
+    }
+}
+
+/// Diagnostic summary of the class-edge structure for one SFUF:
+/// how many distinct Δrepeat values appear, histogram of edge
+/// counts per Δrepeat, and count of class pairs with non-uniform
+/// Δrepeat (shouldn't happen for well-formed forwards). Format
+/// intended to land next to the `stencil ·` line in build output.
+pub(crate) fn summarize_class_edges(fuf: &Fuf, sfuf: &Assignment) -> String {
+    let bundle = StencilBundle::compute(fuf, sfuf);
+    let edges = bundle.class_edges(fuf, sfuf);
+
+    // Histogram of Δrepeat.
+    let mut histo: BTreeMap<i64, usize> = BTreeMap::new();
+    for e in &edges {
+        *histo.entry(e.delta_repeat()).or_insert(0) += 1;
+    }
+
+    // Non-uniform class pairs: a pair (consumer_class,
+    // producer_class) is uniform iff every member pair with an
+    // edge shares one Δrepeat. Non-uniform means the collapse is
+    // lossy for that pair — codegen has to fall back to unrolled
+    // emission for it (or refuse the collapse for that edge).
+    let mut pair_deltas: BTreeMap<(usize, usize), BTreeSet<i64>> = BTreeMap::new();
+    for e in &edges {
+        pair_deltas
+            .entry((e.consumer_class, e.producer_class))
+            .or_default()
+            .insert(e.delta_repeat());
+    }
+    let non_uniform_pairs = pair_deltas.values().filter(|set| set.len() > 1).count();
+
+    let histo_str: String = histo
+        .iter()
+        .map(|(d, n)| format!("Δ{d}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // When any negative Δ shows up, it means a consumer at iter i
+    // reads from a producer at iter > i — either the class member
+    // ordering is inconsistent between two classes (grouping bug)
+    // or there's a non-affine pattern in the forward. Either way,
+    // surface the offending pair(s) so we can inspect.
+    let suspicious: Vec<((usize, usize), Vec<i64>)> = pair_deltas
+        .iter()
+        .filter(|(_, ds)| ds.iter().any(|d| *d < 0))
+        .map(|(pair, ds)| (*pair, ds.iter().copied().collect()))
+        .collect();
+    let suspicious_str: String = if suspicious.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = suspicious
+            .iter()
+            .map(|((c, p), ds)| {
+                let c_period = bundle.class_members[*c].len();
+                let p_period = bundle.class_members[*p].len();
+                format!("({c}[{c_period}]<-{p}[{p_period}]: {ds:?})")
+            })
+            .collect();
+        format!(" neg=[{}]", list.join(", "))
+    };
+    format!(
+        "edges={total} pairs={pairs} {histo} non_uniform_pairs={non_uniform_pairs}{suspicious_str}",
+        total = edges.len(),
+        pairs = pair_deltas.len(),
+        histo = histo_str,
+    )
 }
 
 /// Decide whether a subgraph's emit can be pulled out into a

@@ -542,6 +542,12 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                     eprintln!("      class {class_idx} has heterogeneous impls: {picks:?}",);
                 }
             }
+            // Δrepeat structure — verify the loop-carried deps
+            // look affine (one delta per class pair) and count
+            // intra- vs cross-iteration edges. Feeds the
+            // collapsed-mode emitter's loop-carry decision.
+            let deps = codegen::summarize_class_edges(&model_fuf, sfuf);
+            eprintln!("    stencil-deps · {deps}");
         }
 
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);

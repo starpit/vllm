@@ -1,6 +1,29 @@
 # Stencil IR — status & handoff
 
-Dated 2026-04-19 (updated mid-day). Companion to `STENCIL_IR_DESIGN.md` (vocabulary freeze) and `STENCIL_IR_SKETCH.md` (struct shapes). This doc is the "what landed, what's next, where to look" layer; the other two stay untouched.
+Dated 2026-04-20. Companion to `STENCIL_IR_DESIGN.md` (vocabulary freeze) and `STENCIL_IR_SKETCH.md` (struct shapes). This doc is the "what landed, what's next, where to look" layer; the other two stay untouched.
+
+## THE PLAN (load-bearing — re-read before touching anything)
+
+**The compiler emits CUDA that uses ThunderKittens primitives directly.** Static wavefront schedule from the stencil IR. No VM. No Megakernels-style op structs (controller / loader / launcher / consumer / storer). No runtime instruction fetch. Just a straight-line `__global__` that calls `kittens::tma::load_async` / `kittens::warpgroup::mma` / `kittens::warp::store` / `kittens::semaphore` in the order the stencil's wavefront scheduler produces.
+
+**Reference for how-to-use-kittens**: `~/Megakernels/demos/cross-gpu-llama/` (throughput branch of `~/Megakernels`). Their op-struct bodies show how to compose kittens primitives for real matmul-shape LLM ops. We port the shape, *not* the VM scaffolding.
+
+**Goal**: `vllm chat --model=<small-llama>` produces coherent output on H100 through this emit path.
+
+**Build flags** (copy into `build.rs` when the integration lands):
+
+```
+nvcc -DKITTENS_HOPPER -gencode=arch=compute_90a,code=sm_90a \
+     -std=c++20 --extended-lambda --expt-relaxed-constexpr -O3 \
+     -I ~/ThunderKittens/include
+```
+
+### Wrong turns to not re-take
+
+- **Writing raw PTX in the stencil prelude** (`cp.async.ca` / hand-rolled `tma_load_2d`). Today's `emit_mega.rs` is that direction. It's the *prior* direction, kept as reference; `emit_kittens.rs` replaces it. When every region lowers cleanly through emit_kittens and vllm chat runs end-to-end, `emit_mega.rs` + `csrc/ferrite_stencil_prelude.cuh` get deleted.
+- **sm89 cp.async helpers for the real runtime path**. Runtime target is sm_90a. sm89 lowering is off-critical-path per design §6.
+- **Inflated estimates from hand-writing every primitive**. Kittens gives us TMA, WGMMA, stmatrix, mbarriers, fragment math for free. We don't reinvent them.
+- **Option-shopping in mid-commit**. When a wrinkle surfaces, pick one interpretation consistent with the plan and keep going. Don't pause to redesign.
 
 ## Read order for a fresh session
 
@@ -24,7 +47,40 @@ The target is **one persistent `__global__` per model forward on SM90a+**, in th
 - Don't try to land real PTX for a variadic helper (`cp_async_128`, `tma_load_2d`, `wgmma_mma_async`, `stg_128`) without first picking a concrete `StencilFrag` type and passing byte counts / smem descriptors from the emitter. The variadic signatures today absorb anything; they trap honestly. The honest next step is a shape commitment, not another trap-to-real-PTX tweak.
 - Don't target `-arch=sm_90` for the megakernel. Use `-gencode=arch=compute_90a,code=sm_90a` (or just `-arch=sm_90a`). `wgmma.fence` / `wgmma.commit_group` / `wgmma.wait_group` / TMA are all sm_90a-only.
 
-## Where we are
+## Where we are (kittens path)
+
+**`emit_kittens.rs` has 6 of 9 region templates ported to a kittens-based `.cu` emit.** Each emits:
+- A `globals_t` struct with `kittens::gl<>` members for every gmem tensor, all runtime dims (`-1`), compile-time tile shapes baked into the attached TMA descriptor type.
+- A `__global__ __launch_bounds__(…)` kernel that takes `const __grid_constant__ globals_t g`, declares `__shared__` kittens tiles/vecs/mbarriers, and calls `kittens::tma::load_async` / `warp::load` / `warpgroup::mma_AB` / `warpgroup::store` / `tma::store_async` in static order.
+- An `extern "C" cudaError_t launch_<region>(...)` host wrapper that constructs `kittens::gl` from raw pointers + dims and launches.
+
+Region coverage:
+
+| Region | Status | Kernel primitives |
+|---|---|---|
+| `rmsnorm` | ✓ commit `f91bf20d7` | `warp::load/mul/sum/store`, `sv_bf<D>` |
+| `residual_add` | ✓ commit `cec725bdb` | `warp::load/add/store`, `sv_bf<D>` |
+| `unary_inplace` | ✓ commit `cec725bdb` | `warp::load/mul/store` (scalar_mul placeholder) |
+| `embed` | ✓ commit `cec725bdb` | `warp::load/store` with token_ids gather |
+| `gemm` | ✓ commit `960a064ea` | `warpgroup::mma_AB` on `rt_fl<16, TN>`, `tma::load_async` with `semaphore`, `warpgroup::store` + `tma::store_async` |
+| `gate_up_silu_mul` | ✓ commit `7594c09ed` | two parallel `warpgroup::mma_AB`, SiLU via `copy/mul/exp/add/div` on `rt_fl`, TN=64 for shared-mem budget |
+| `qkv_rope` | not ported | matmul + RoPE rotation + KV cache append — complex, 3 outputs from 1 X |
+| `attn_region` (FA2 prefill) | not ported | tiled attention + online softmax (hardest) |
+| `attn_region_paged_decode` | not ported | M=1 decode attention + paged-KV gather |
+
+Every ported region nvcc-compiles cleanly on sm_90a with the build flags above; object sizes 14 KB (header only) → 160 KB (4 mem-bound regions together). GEMM + gate_up_silu_mul emit real `wgmma.mma_async` + `tma::load_async`/`store_async` PTX.
+
+Legacy `emit_mega.rs` path (hand-rolled prelude helpers, sm_89 cp.async.ca, `bf16[BYTES/2]` smem decls, `gmem + (q_tile * 16384u + …)` address expressions): still present, still nvcc-compiles for all 8 model variants, but scheduled for deletion once kittens path covers every region and vllm chat runs.
+
+## Next three things (in order)
+
+1. **Port `qkv_rope_region`.** Three parallel WGMMAs (Wq, Wk, Wv) sharing X. RoPE rotation on Q and K via `kittens::warp::mul/add` on register tiles with cos/sin loaded from `g.rope_cos` / `g.rope_sin`. V stored direct; K stored to paged KV cache via `AxisDivGather` on `block_table`. See `~/Megakernels/demos/cross-gpu-llama/qkv_rope_append.cu` for the reference pattern.
+2. **Port `attn_region` + `attn_region_paged_decode`.** FA2 online softmax using kittens register-tile primitives (`row_max`, `row_sum`, `exp2` in `base_ops`). Tiled over kv_tile with pipelined loads. Reference: `~/Megakernels/demos/cross-gpu-llama/attention_prefill.cu` + `attention_decode.cu`.
+3. **Integration (task-8 / task-9 / task-10).** `build.rs` in `vllm-cuda` or a new `ferrite-kittens-builder` crate nvcc's the per-model emitted `.cu` into a `.a` with deterministic symbol names; Rust FFI bindings for each `launch_<region>`; cuda_worker routes sm90a forwards through megakernel dispatch instead of the HostCallable path.
+
+Do NOT return to the raw-PTX `emit_mega.rs` path, CUtensorMap plumbing by hand, or stride-fix commits against the legacy emit — those are dead-ends we already verified don't get us closer to the goal.
+
+## Legacy (`emit_mega.rs`) status
 
 **Every real-model FUF (Llama/Gemma2/Gemma3/Qwen2/Qwen3/Mistral/Granite/CommandR, full-precision + marlin + bnb4 + gptq variants) now lowers to a complete SM90a megakernel source file AND compiles cleanly via nvcc on both `-arch=sm_89` and `-gencode=arch=compute_90a,code=sm_90a`.** Llama-3-8B: 227 regions / 290 control edges / ~18 k lines → 595 KB (sm_89) / 446 KB (sm_90a). Qwen3-0.6B → 878 KB / 663 KB. Gemma-3-12B → 1.7 MB / 1.3 MB. Every build writes `/tmp/ferrite-stencil/<variant>-sm90.cu`.
 

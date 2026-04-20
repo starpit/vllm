@@ -246,9 +246,13 @@ mod tests {
 
     #[test]
     fn layer_blocks_collapse_to_canonical() {
-        // Two "layer blocks" each (rmsnorm, gemm, add) — the
-        // same toy shape as the periodicity test. Three unique
-        // classes, each period 2.
+        // Four stacked layer blocks of (rmsnorm, gemm, add). With
+        // the neighbor-aware canonical hash, interior layers (1, 2)
+        // share per-position neighborhoods while boundary layers
+        // (0, 3) split off. Each position yields one period-2
+        // interior class + two period-1 boundary classes. Plan's
+        // `is_periodic` remains true as long as any class has period
+        // > 1.
         let fuf = fuf_from_ops(vec![
             (OpKind::RmsNorm, vec![]),
             (OpKind::Gemm, vec![tile_in(0)]),
@@ -256,42 +260,88 @@ mod tests {
             (OpKind::RmsNorm, vec![tile_in(2)]),
             (OpKind::Gemm, vec![tile_in(3)]),
             (OpKind::Add, vec![tile_in(4), tile_in(2)]),
+            (OpKind::RmsNorm, vec![tile_in(5)]),
+            (OpKind::Gemm, vec![tile_in(6)]),
+            (OpKind::Add, vec![tile_in(7), tile_in(5)]),
+            (OpKind::RmsNorm, vec![tile_in(8)]),
+            (OpKind::Gemm, vec![tile_in(9)]),
+            (OpKind::Add, vec![tile_in(10), tile_in(8)]),
         ]);
         let st = subtile(&fuf);
-        let a = assignment_from_groups(&[&[0], &[1], &[2], &[3], &[4], &[5]]);
+        let a = assignment_from_groups(&[
+            &[0],
+            &[1],
+            &[2],
+            &[3],
+            &[4],
+            &[5],
+            &[6],
+            &[7],
+            &[8],
+            &[9],
+            &[10],
+            &[11],
+        ]);
         let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
         let plan = plan_collapse(&rg, &classes);
         assert!(plan.is_periodic);
-        assert_eq!(plan.classes.len(), 3);
-        for c in &plan.classes {
-            assert_eq!(c.period, 2);
-        }
-        // Every original Region belongs to some class.
-        assert_eq!(plan.region_to_class.len(), 6);
+        assert_eq!(plan.region_to_class.len(), 12);
+        // At least one class must have period > 1 for the plan to
+        // report `is_periodic`; see periodicity.rs
+        // `four_layer_interior_collapses` for the detailed class
+        // breakdown (Gemm collapses to period 4, Add interior to
+        // period 2, RmsNorm interior to period 3).
+        assert!(plan.classes.iter().any(|c| c.period > 1));
     }
 
     #[test]
     fn intra_class_control_edges_drop() {
-        // One class of two identical rmsnorm Regions with an
-        // (artificial) barrier edge between them. The collapsed
-        // plan should drop the self-loop.
+        // A fanout: embed produces two rmsnorm Regions that share
+        // neighborhood (up=[Embed], down=[]) → one period-2 class.
+        // Manually splice a barrier between the two sibling Regions
+        // in the RegionGraph so we can test that same-class barriers
+        // drop when collapsed. (form_regions only emits barriers for
+        // FUF dataflow, and none cross between our siblings.)
         let fuf = fuf_from_ops(vec![
-            (OpKind::RmsNorm, vec![]),
+            (OpKind::Embed, vec![]),
+            (OpKind::RmsNorm, vec![tile_in(0)]),
             (OpKind::RmsNorm, vec![tile_in(0)]),
         ]);
         let st = subtile(&fuf);
-        let a = assignment_from_groups(&[&[0], &[1]]);
-        let rg = form_regions(&st, &a).graph;
+        let a = assignment_from_groups(&[&[0], &[1], &[2]]);
+        let mut rg = form_regions(&st, &a).graph;
+        // Splice an artificial barrier between the two sibling
+        // rmsnorm Regions. Their neighborhoods are unchanged for
+        // grouping (we group first, then extend control), so they
+        // stay in one class.
         let classes = group_regions(&rg);
-        // Sanity: before collapse there's one barrier R0 → R1.
-        assert_eq!(rg.control.len(), 1);
+        let rms_class = classes
+            .iter()
+            .find(|c| c.period() == 2)
+            .expect("fanout rmsnorms share a class");
+        let (a_rid, b_rid) = (rms_class.members[0], rms_class.members[1]);
+        rg.control.push(ferrite_stencil_ir::ControlEdge {
+            src: a_rid,
+            dst: b_rid,
+            kind: DepKind::Barrier,
+        });
         let plan = plan_collapse(&rg, &classes);
-        // Both Regions are in the same class → the single barrier
-        // is a self-loop on the class and drops out.
-        assert_eq!(plan.classes.len(), 1);
-        assert_eq!(plan.classes[0].period, 2);
-        assert_eq!(plan.control.len(), 0);
+        // embed is its own class (period 1); the rmsnorm pair is
+        // one class of period 2; the intra-class barrier drops.
+        assert_eq!(plan.classes.len(), 2);
+        let p2 = plan
+            .classes
+            .iter()
+            .find(|c| c.period == 2)
+            .expect("the rmsnorm class");
+        assert_eq!(p2.period, 2);
+        // Remaining control edges are the embed→rmsnorm cross-class
+        // pair (deduplicated to one), not the intra-class self-loop.
+        assert!(
+            plan.control.iter().all(|ce| ce.src_class != ce.dst_class),
+            "no intra-class self-loops survive"
+        );
     }
 
     #[test]

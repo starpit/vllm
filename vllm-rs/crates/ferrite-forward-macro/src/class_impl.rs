@@ -169,12 +169,10 @@ mod tests {
 
     #[test]
     fn consistent_class_has_single_impl() {
-        // Two rmsnorms, both claimed by Impl 7. Same class, same
-        // impl → consistent.
-        let fuf = fuf_from_ops(vec![
-            (OpKind::RmsNorm, vec![]),
-            (OpKind::RmsNorm, vec![tile_in(0)]),
-        ]);
+        // Two independent rmsnorms (no producer/consumer) share a
+        // class under the neighbor-aware hash; both claimed by
+        // Impl 7 → consistent.
+        let fuf = fuf_from_ops(vec![(OpKind::RmsNorm, vec![]), (OpKind::RmsNorm, vec![])]);
         let st = subtile(&fuf);
         let a = assignment_with_impls(&[(&[0], 7), (&[1], 7)]);
         let fr = form_regions(&st, &a);
@@ -187,12 +185,9 @@ mod tests {
 
     #[test]
     fn heterogeneous_class_flagged() {
-        // Two rmsnorms — structurally identical (same class) but
-        // claimed by different impls. Report flags the class.
-        let fuf = fuf_from_ops(vec![
-            (OpKind::RmsNorm, vec![]),
-            (OpKind::RmsNorm, vec![tile_in(0)]),
-        ]);
+        // Two independent rmsnorms in the same class but claimed
+        // by different impls. Report flags the class.
+        let fuf = fuf_from_ops(vec![(OpKind::RmsNorm, vec![]), (OpKind::RmsNorm, vec![])]);
         let st = subtile(&fuf);
         let a = assignment_with_impls(&[(&[0], 7), (&[1], 9)]);
         let fr = form_regions(&st, &a);
@@ -206,10 +201,13 @@ mod tests {
 
     #[test]
     fn resolve_strict_returns_picks_in_class_order() {
+        // Two rmsnorms fanning out from a shared embed — both have
+        // up=[Embed], down=[] so they share a class under the
+        // neighbor-aware hash.
         let fuf = fuf_from_ops(vec![
             (OpKind::Embed, vec![]),
             (OpKind::RmsNorm, vec![tile_in(0)]),
-            (OpKind::RmsNorm, vec![tile_in(1)]),
+            (OpKind::RmsNorm, vec![tile_in(0)]),
         ]);
         let st = subtile(&fuf);
         let a = assignment_with_impls(&[(&[0], 3), (&[1], 5), (&[2], 5)]);

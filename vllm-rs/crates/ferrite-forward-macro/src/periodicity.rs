@@ -61,12 +61,31 @@ impl RegionClass {
 /// are returned sorted by representative `RegionId` for
 /// determinism.
 pub fn group_regions(rg: &RegionGraph) -> Vec<RegionClass> {
+    // Precompute 1-hop neighbor signatures. Intra-Region structure
+    // alone (op tags + role + edges) does not distinguish two bare
+    // `Gemm` Regions that live in different positions of a
+    // transformer layer (e.g. attention-output vs MLP-down): both
+    // are a single `Gemm` node over (tile_t, tile_d_out) with no
+    // intra-Region edges. Their ambient role differs — attn-O
+    // consumes an `Attention` Region, MLP-down consumes a `Mul`
+    // (SiLU fusion). Mixing those two into one class was the root
+    // cause of every heterogeneous-impl variant observed in the
+    // class→impl consistency check.
+    //
+    // Using control-edge neighbors as a discriminator is cheap
+    // (one pass over `rg.control`) and preserves layer-periodicity:
+    // every layer's attn-O has the same (Attention → Gemm → Add)
+    // neighborhood, every layer's MLP-down has the same (Mul →
+    // Gemm → Add) neighborhood, so each splits into its own class
+    // with period = num_layers.
+    let neighbor_sigs = compute_neighbor_sigs(rg);
+
     // BTreeMap keyed on hash so iteration is deterministic. Ties on
     // hash (extremely unlikely, but possible) end up in the same
     // bucket — that's semantically what we want.
     let mut buckets: BTreeMap<u64, Vec<RegionId>> = BTreeMap::new();
     for r in &rg.regions {
-        let h = canonical_hash(r);
+        let h = canonical_hash_with_neighbors(r, &neighbor_sigs[r.id as usize]);
         buckets.entry(h).or_default().push(r.id);
     }
     let mut classes: Vec<RegionClass> = buckets
@@ -81,7 +100,7 @@ pub fn group_regions(rg: &RegionGraph) -> Vec<RegionClass> {
     classes
 }
 
-/// Canonical hash of one Region. Covers:
+/// Canonical hash of one Region's intra-structure. Covers:
 /// - Region.name
 /// - Axis names (stable order = the order they appear on the
 ///   Region, which `form_one_region` populates first-seen per
@@ -90,23 +109,73 @@ pub fn group_regions(rg: &RegionGraph) -> Vec<RegionClass> {
 /// - Edge sequence: (src, dst, kind) sorted
 ///
 /// Exposed for debugging / tests; callers generally want
-/// `group_regions`.
+/// `group_regions`, which additionally mixes in the 1-hop neighbor
+/// signature for discrimination (see `canonical_hash_with_neighbors`).
 pub fn canonical_hash(r: &Region) -> u64 {
     let mut h = DefaultHasher::new();
-    r.name.hash(&mut h);
+    hash_intra(r, &mut h);
+    h.finish()
+}
+
+fn hash_intra(r: &Region, h: &mut DefaultHasher) {
+    r.name.hash(h);
     for axis in &r.domain.axes {
-        axis.name.hash(&mut h);
+        axis.name.hash(h);
     }
     for node in &r.nodes {
-        node.op.tag.hash(&mut h);
-        (node.role as u8).hash(&mut h);
+        node.op.tag.hash(h);
+        (node.role as u8).hash(h);
     }
-    // Edges: deterministic order is established by `form_one_region`
-    // (sort by (src, dst)), so hashing in order is safe.
     for e in &r.edges {
-        e.src.hash(&mut h);
-        e.dst.hash(&mut h);
-        (e.kind as u8).hash(&mut h);
+        e.src.hash(h);
+        e.dst.hash(h);
+        (e.kind as u8).hash(h);
+    }
+}
+
+/// Sorted op-tags of a Region's direct control-edge neighbors.
+/// Deterministic (sorted), layer-invariant (neighbor ops are the
+/// same across layer copies of one pattern), and cheap.
+#[derive(Debug, Clone, Default)]
+pub struct NeighborSig {
+    pub upstream: Vec<&'static str>,
+    pub downstream: Vec<&'static str>,
+}
+
+fn compute_neighbor_sigs(rg: &RegionGraph) -> Vec<NeighborSig> {
+    let mut out: Vec<NeighborSig> = (0..rg.regions.len())
+        .map(|_| NeighborSig::default())
+        .collect();
+    for ce in &rg.control {
+        let src_name = rg.regions[ce.src as usize].name;
+        let dst_name = rg.regions[ce.dst as usize].name;
+        out[ce.dst as usize].upstream.push(src_name);
+        out[ce.src as usize].downstream.push(dst_name);
+    }
+    for sig in &mut out {
+        sig.upstream.sort();
+        sig.downstream.sort();
+    }
+    out
+}
+
+/// Canonical hash including the Region's 1-hop neighbor signature.
+/// This is the hash `group_regions` actually uses. The neighbor
+/// signature splits classes that are intra-identical but live in
+/// structurally-different positions of the outer graph (e.g. the
+/// two bare-Gemm Regions per transformer layer).
+pub fn canonical_hash_with_neighbors(r: &Region, sig: &NeighborSig) -> u64 {
+    let mut h = DefaultHasher::new();
+    hash_intra(r, &mut h);
+    // Separator bytes so e.g. upstream=[a,b] + downstream=[] hashes
+    // distinctly from upstream=[a] + downstream=[b].
+    0xAAu8.hash(&mut h);
+    for s in &sig.upstream {
+        s.hash(&mut h);
+    }
+    0xBBu8.hash(&mut h);
+    for s in &sig.downstream {
+        s.hash(&mut h);
     }
     h.finish()
 }
@@ -224,24 +293,46 @@ mod tests {
 
     #[test]
     fn identical_regions_collapse() {
-        // Two independent rmsnorm tiles in separate subgraphs.
-        // Same canonical pattern → one class of period 2.
-        let fuf = fuf_from_ops(vec![
-            (OpKind::Embed, vec![]),
-            (OpKind::RmsNorm, vec![tile_in(0)]),
-            (OpKind::RmsNorm, vec![tile_in(1)]),
-        ]);
+        // Two fully-independent rmsnorm tiles (no producer / consumer).
+        // Same intra-structure AND same (empty) neighbor signature →
+        // one class of period 2. Chaining the rmsnorms linearly would
+        // *not* collapse them under the current hash because a linear
+        // chain's boundary vs interior positions have different 1-hop
+        // neighbor op-tags (see `boundary_positions_split_from_interior`).
+        let fuf = fuf_from_ops(vec![(OpKind::RmsNorm, vec![]), (OpKind::RmsNorm, vec![])]);
         let st = subtile(&fuf);
-        let a = assignment_from_groups(&[&[0], &[1], &[2]]);
+        let a = assignment_from_groups(&[&[0], &[1]]);
         let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
-        // Embed is its own class; the two rmsnorms share a class.
-        assert_eq!(classes.len(), 2);
-        let rmsnorm_class = classes
-            .iter()
-            .find(|c| c.period() == 2)
-            .expect("two rmsnorms collapse");
-        assert_eq!(rmsnorm_class.period(), 2);
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].period(), 2);
+    }
+
+    #[test]
+    fn boundary_positions_split_from_interior() {
+        // Linear chain: rms → rms → rms → rms. Intra-structure is
+        // identical for all four, but neighbors differ:
+        //   tile 0: up=[]         down=[RmsNorm]
+        //   tile 1: up=[RmsNorm]  down=[RmsNorm]
+        //   tile 2: up=[RmsNorm]  down=[RmsNorm]
+        //   tile 3: up=[RmsNorm]  down=[]
+        // Expect three classes: {0}, {1, 2}, {3}. This is the
+        // load-bearing behavior that splits attn-O from MLP-down
+        // in a real transformer.
+        let fuf = fuf_from_ops(vec![
+            (OpKind::RmsNorm, vec![]),
+            (OpKind::RmsNorm, vec![tile_in(0)]),
+            (OpKind::RmsNorm, vec![tile_in(1)]),
+            (OpKind::RmsNorm, vec![tile_in(2)]),
+        ]);
+        let st = subtile(&fuf);
+        let a = assignment_from_groups(&[&[0], &[1], &[2], &[3]]);
+        let rg = form_regions(&st, &a).graph;
+        let classes = group_regions(&rg);
+        assert_eq!(classes.len(), 3);
+        let mut periods: Vec<usize> = classes.iter().map(|c| c.period()).collect();
+        periods.sort();
+        assert_eq!(periods, vec![1, 1, 2]);
     }
 
     #[test]
@@ -264,22 +355,15 @@ mod tests {
 
     #[test]
     fn repeated_layer_blocks_collapse_proportionally() {
-        // Simulate a tiny 3-layer "transformer" at the Region
-        // level: each layer is (rmsnorm, gemm, add). Six tiles
-        // make two full layer blocks; the block pattern should
-        // appear as one class of period 3 (one per layer,
-        // representing rmsnorm / gemm / add). Wait — that's
-        // three classes each of period 3 for two layers? Let's
-        // restructure:
-        //
-        // tiles 0..3: layer 0 — rmsnorm, gemm-o-ish, add
-        // tiles 3..6: layer 1 — rmsnorm, gemm-o-ish, add
-        //
-        // Six singleton subgraphs. Classes:
-        //   RmsNorm-only Region: members {R0, R3} — period 2
-        //   Gemm Region:         members {R1, R4} — period 2
-        //   Add Region:          members {R2, R5} — period 2
-        // Embed optional — we drop it to keep counts tidy.
+        // Three stacked "layer blocks" each (rmsnorm, gemm, add).
+        // Nine tiles span three layer blocks; after the neighbor-
+        // signature split, boundary copies (layer 0 and layer 2)
+        // separate from the interior copy (layer 1). Each original
+        // op position yields: two period-1 boundary classes + one
+        // period-1 interior class. With three layers → 3 positions
+        // × 3 classes = 9 classes total. The test proves the pass
+        // runs; the interior class count is what scales with layer
+        // count on a real transformer (period = num_layers − 2).
         let fuf = fuf_from_ops(vec![
             (OpKind::RmsNorm, vec![]),                   // 0
             (OpKind::Gemm, vec![tile_in(0)]),            // 1
@@ -287,31 +371,87 @@ mod tests {
             (OpKind::RmsNorm, vec![tile_in(2)]),         // 3
             (OpKind::Gemm, vec![tile_in(3)]),            // 4
             (OpKind::Add, vec![tile_in(4), tile_in(2)]), // 5
+            (OpKind::RmsNorm, vec![tile_in(5)]),         // 6
+            (OpKind::Gemm, vec![tile_in(6)]),            // 7
+            (OpKind::Add, vec![tile_in(7), tile_in(5)]), // 8
         ]);
         let st = subtile(&fuf);
-        let a = assignment_from_groups(&[&[0], &[1], &[2], &[3], &[4], &[5]]);
+        let a = assignment_from_groups(&[&[0], &[1], &[2], &[3], &[4], &[5], &[6], &[7], &[8]]);
         let rg = form_regions(&st, &a).graph;
         let classes = group_regions(&rg);
-        // Three unique patterns, each period 2.
-        assert_eq!(classes.len(), 3);
-        for c in &classes {
-            assert_eq!(
-                c.period(),
-                2,
-                "class {:x} has {} members",
-                c.canonical_hash,
-                c.period()
-            );
-        }
+        // Every original Region is in exactly one class.
+        let total: usize = classes.iter().map(|c| c.period()).sum();
+        assert_eq!(total, 9);
+        // Expected: 6 classes.
+        //   RmsNorm: {R0} (head), {R3, R6} (interior)          → 2
+        //   Gemm:    {R1, R4, R7} (upstream Rms, downstream Add) → 1
+        //   Add:     {R2} (up includes Rms-shortcut), {R5}, {R8} → 3
+        assert_eq!(classes.len(), 6);
+    }
+
+    #[test]
+    fn four_layer_interior_collapses() {
+        // Same structure as above but four layers. Interior copies
+        // (layers 1 and 2) share identical neighborhoods per position
+        // and merge → three period-2 classes + six period-1 boundary
+        // classes = 9 total. Confirms the collapse factor grows with
+        // layer count even under the stricter hash.
+        let fuf = fuf_from_ops(vec![
+            (OpKind::RmsNorm, vec![]),                    // 0
+            (OpKind::Gemm, vec![tile_in(0)]),             // 1
+            (OpKind::Add, vec![tile_in(1), tile_in(0)]),  // 2
+            (OpKind::RmsNorm, vec![tile_in(2)]),          // 3
+            (OpKind::Gemm, vec![tile_in(3)]),             // 4
+            (OpKind::Add, vec![tile_in(4), tile_in(2)]),  // 5
+            (OpKind::RmsNorm, vec![tile_in(5)]),          // 6
+            (OpKind::Gemm, vec![tile_in(6)]),             // 7
+            (OpKind::Add, vec![tile_in(7), tile_in(5)]),  // 8
+            (OpKind::RmsNorm, vec![tile_in(8)]),          // 9
+            (OpKind::Gemm, vec![tile_in(9)]),             // 10
+            (OpKind::Add, vec![tile_in(10), tile_in(8)]), // 11
+        ]);
+        let st = subtile(&fuf);
+        let a = assignment_from_groups(&[
+            &[0],
+            &[1],
+            &[2],
+            &[3],
+            &[4],
+            &[5],
+            &[6],
+            &[7],
+            &[8],
+            &[9],
+            &[10],
+            &[11],
+        ]);
+        let rg = form_regions(&st, &a).graph;
+        let classes = group_regions(&rg);
+        let total: usize = classes.iter().map(|c| c.period()).sum();
+        assert_eq!(total, 12);
+        // Expected classes: 6 total.
+        //   RmsNorm: {R0} head, {R3,R6,R9} interior (period 3)
+        //   Gemm:    {R1,R4,R7,R10} (period 4 — every Gemm has
+        //            up=[Rms], down=[Add], independent of position)
+        //   Add:     {R2} head (up=[Gemm,Rms]), {R5,R8} interior
+        //            (period 2, up=[Add,Gemm]), {R11} tail (down=[])
+        assert_eq!(classes.len(), 6);
+        let mut periods: Vec<usize> = classes.iter().map(|c| c.period()).collect();
+        periods.sort();
+        assert_eq!(periods, vec![1, 1, 1, 2, 3, 4]);
     }
 
     #[test]
     fn summary_reports_counts() {
+        // Four fully-independent rmsnorms — same intra-structure
+        // and same (empty) neighborhood → one class of period 4.
+        // A linear-chain variant would split into boundary +
+        // interior classes; see `boundary_positions_split_from_interior`.
         let fuf = fuf_from_ops(vec![
             (OpKind::RmsNorm, vec![]),
-            (OpKind::RmsNorm, vec![tile_in(0)]),
-            (OpKind::RmsNorm, vec![tile_in(1)]),
-            (OpKind::RmsNorm, vec![tile_in(2)]),
+            (OpKind::RmsNorm, vec![]),
+            (OpKind::RmsNorm, vec![]),
+            (OpKind::RmsNorm, vec![]),
         ]);
         let st = subtile(&fuf);
         let a = assignment_from_groups(&[&[0], &[1], &[2], &[3]]);

@@ -283,9 +283,9 @@ Each step leaves the codebase correct and buildable. Parallel old/new paths duri
 
 5. ✅ **Class → Impl consistency checker.** Confirms the load-bearing invariant for codegen: every Region in a periodic class picks the same solver Impl. *Landed 2026-04-20 (commit `420a71690`). Module: `class_impl.rs`. 3 unit tests. `form_regions` now returns `FormedRegions { graph, region_subgraphs }`.*
 
-   **Real-FUF result**: all llama variants clean. **23 of 218 non-llama variants flag heterogeneous impls** (1–2 classes each, patterns like `[ImplId(3), ImplId(37)]` repeating). See §13 for follow-up.
+   Initial result flagged **23 of 218 variants heterogeneous** (`[ImplId(3), ImplId(37)]` and similar GemmRef-vs-tuned pairs repeating). Root cause turned out to be the canonical hash being too coarse: two bare `Gemm` Regions per transformer layer (attention-output O and MLP-down) both serialize to the same intra-Region structure (one Gemm node, one axis set, zero edges) and so collapse into one class despite having different shapes and different optimal kernels. **Fix**: extend the canonical hash with a 1-hop neighbor signature (sorted op-tags of upstream + downstream Regions via control edges) so attn-O (upstream = `Attention`) splits from MLP-down (upstream = `Mul`). Diagnostic + fix landed in a follow-up commit; see §13.
 
-   Note: the "solver pivot" in §7 turned out to be a verification problem, not a search re-architecture. Today's solver already picks Impls per-subgraph and the question is whether those picks are class-uniform. They mostly are; a few edge cases (§13) need either solver constraint or codegen tolerance.
+   Note: the "solver pivot" in §7 turned out to be a verification problem, not a search re-architecture. Today's solver already picks Impls per-subgraph and the question is whether those picks are class-uniform. With the neighbor-aware hash they are — except for a small structural edge case in Qwen3 (§13 item A.2) that legitimately cannot be split by op-tag topology alone.
 
 6. ⏳ **Rust codegen pivot** — replace today's `codegen::emit_model` with a Region-driven emitter. One fragment body per (Region, Impl); call sites wrap in outer iteration loops. Verify with `vllm chat` on one model per arch family. **This is where the compile-time win lands on-disk.** Depends on step 5's invariant — either restrict codegen to the consistent variants or tolerate heterogeneity (see §13).
 
@@ -326,9 +326,10 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 ## 13. Status & handoff (2026-04-20)
 
-**Branch**: `worktree-ff3`. Two commits on top of `0ab1aad98`:
+**Branch**: `worktree-ff3`. Three commits on top of `0ab1aad98`:
 - `aef01d8ca` — IR + subtile + region_formation + periodicity + CollapsePlan
 - `420a71690` — class→impl consistency checker + FormedRegions refactor
+- *(this commit)* — neighbor-aware canonical hash; 23 → 2 heterogeneous variants
 
 **What builds**: everything. `cargo build -p ferrite-models --release` exercises all 218 model variants through the full pipeline. Stencil diagnostic prints alongside each variant's ferrite line (see "stencil · N regions → N classes" entries).
 
@@ -341,23 +342,26 @@ None of these are show-stoppers without investigation, but each is worth measuri
 - `.../src/class_impl.rs` — class→Impl consistency check, strict + tolerant resolvers.
 - `.../src/lib.rs` — pipeline wired into the macro drive (search for `stencil ·`). Diagnostic only; does not affect emitted code.
 
-**Test coverage**: 162 unit tests total across the crate; 23 new ones cover the stencil pipeline. All pass. `cargo clippy --all-targets -- -D warnings` clean.
+**Test coverage**: 161 unit tests total across the crate (added `boundary_positions_split_from_interior` + `four_layer_interior_collapses`; rewrote four tests whose synthetic linear chains no longer collapse under the stricter hash). All pass. `cargo clippy --all-targets -- -D warnings` clean.
+
+**Measurement after the hash fix**: distribution of class counts shifted from a tight 8/10 to 12/15/17/18/22 across 218 variants. Collapse factor for llama / mistral drops from ~28× to ~19×; still well-collapsed and every class is now impl-consistent. Pre-fix 23 heterogeneous variants → 2 remaining (both Qwen3; see A.2).
 
 ### Open items for the next session
 
-**(A) Investigate the 23 heterogeneous-impl variants.** Likely one structural cause. Suspects:
-- Gemma3 alternates local (sliding) / global attention per layer — but subtile.rs gives `SlidingAttention` a different OpKind tag than `Attention`, so they *should* land in different classes. Worth confirming the canonical hash actually distinguishes them on real Gemma3 FUFs.
-- Qwen3's first-layer QK-norm inserts reshape tiles that might make layer-0's attention Region differ structurally from layer-1+. If so, layer-0 is its own class (period 1) and layer-1+ is another class (period N-1) — *already consistent*, not a real problem.
-- Some prefill vs decode split that I'm only seeing because I picked `sfufs.per_workload.iter().next()` nondeterministically.
+**(A) Heterogeneous-impl variants — finished except for two edge cases.**
 
-Quick path: print a heterogeneous variant's per-class op-tag sequence + member RegionIds + per-member ImplIds. One variant should expose the pattern.
+*A.1 Resolved (21 of 23)*: the common pattern was two bare-Gemm Regions per layer (attention-O, MLP-down) sharing a class. 1-hop neighbor-signature hash splits them. Landed.
+
+*A.2 Still flagged: qwen3-1.7b, qwen3-8b.* Same heterogeneity pair `[ImplId(3), ImplId(37)]` = GemmRef vs CutlassGemv. Dump: two per-layer Regions `rep_ops=["Gemm"] · period=56` (or 72 for 8b), both with `up=[RmsNorm] down=[Reshape]`. These are Qwen3's Q and K projections — both produced by a per-head RmsNorm (the QK-norm) and both consumed by a Reshape before the RoPE fusion. The entire op-tag chain `Gemm → Reshape → RmsNorm → RopeAppend → Attention` is identical. **They are genuinely indistinguishable by op-tag topology alone.** Distinguishing them would require shape information in the IR, which §5.2 explicitly forbids to keep the IR tile-size-invariant.
+
+   Resolution: this is the case the step-6 codegen pivot needs to handle via *heterogeneity tolerance* (not solver constraint). A class that picks two impls emits two fragment bodies keyed by `(class_idx, impl_id)`; the call site dispatches per-iteration using a small indirection table the solver already has (`region_subgraphs[rid] → impl_id`). Cost: two fragments instead of one for that class only. Every other class in the variant keeps its single-fragment collapse.
 
 **(B) Step 6 — Rust codegen pivot.** Biggest work item. Structure:
-1. Move fragment emission to be class-indexed rather than subgraph-indexed. Today `codegen.rs::emit_model`'s `FragmentLibrary` dedups by stringified abstract body; post-pivot, dedup happens structurally at Region-formation time via `canonical_hash`. The library keying changes from string → `class_idx`.
+1. Move fragment emission to be class-indexed rather than subgraph-indexed. Today `codegen.rs::emit_model`'s `FragmentLibrary` dedups by stringified abstract body; post-pivot, dedup happens structurally at Region-formation time via `canonical_hash_with_neighbors`. The library keying changes from string → `class_idx` (or `(class_idx, impl_id)` for the A.2 heterogeneity case).
 2. Emit one fragment body per (class, workload_point, Impl). Call site wraps in `for _repeat in 0..PERIOD { ... }` over the class's period.
 3. Per-iteration state (layer index, kv_cache slot) needs to flow as a loop variable into the fragment. **This is where §6.2 "literal lifting" becomes real** — the Impl's `emit_call` must replace baked layer literals with the loop variable. Bounded to 3–5 impls (`FusedQkvRope*`, `AttentionViaCache*`, `RopeAppendRef*`, `SlidingAttention*`).
 
-Suggested approach: keep today's unrolled emitter as the default; gate the pivot behind `--cfg stencil_codegen` or an env var so A/B comparison is easy. Land per-family: do llama first (all variants clean per step 5), validate with `vllm chat`, then extend to archs that pass consistency, tackle heterogeneous ones last.
+Suggested approach: keep today's unrolled emitter as the default; gate the pivot behind `--cfg stencil_codegen` or an env var so A/B comparison is easy. Land per-family: do llama first (all variants clean per step 5), validate with `vllm chat`, then extend to archs that pass consistency, tackle Qwen3 with the A.2 tolerance path.
 
 **(C) Delete the per-subgraph fragment dedup string machinery** once step 6 is confirmed. `FragmentLibrary::by_sig` keyed on `"ti=...|ci=...|wt=...|body=..."` becomes redundant — the new `class_idx` is the dedup key.
 

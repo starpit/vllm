@@ -4097,9 +4097,18 @@ impl Implementation for FusedQkvRopeCacheImpl {
         let _ = hidden; // reserved for future checks
 
         // Layer index — captured by the DSL's `kv_cache[layer]`.
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
+        // Concrete per-iteration layer index (needed for
+        // analyses that read the underlying FUF, e.g.
+        // `layer_rope_is_interleaved`) plus its tokenised form.
+        // The latter routes through `ctx.layer_expr` so when the
+        // class-loop emitter sets `repeat_var = Some(__repeat)`
+        // the `#layer` interpolations below become loop-variable
+        // references instead of baked literals. `repeat_var =
+        // None` (today's unrolled path) keeps the output byte-
+        // identical to the pre-lift emission.
+        let layer_u64 = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         // Output idents:
         //   q_out = rope.slot 0 (rotated Q, OwnedTensor returned by kernel)
@@ -4856,9 +4865,18 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
         let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
         let head_dim = ctx.bound("head_dim") as usize;
 
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
+        // Concrete per-iteration layer index (needed for
+        // analyses that read the underlying FUF, e.g.
+        // `layer_rope_is_interleaved`) plus its tokenised form.
+        // The latter routes through `ctx.layer_expr` so when the
+        // class-loop emitter sets `repeat_var = Some(__repeat)`
+        // the `#layer` interpolations below become loop-variable
+        // references instead of baked literals. `repeat_var =
+        // None` (today's unrolled path) keeps the output byte-
+        // identical to the pre-lift emission.
+        let layer_u64 = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);
@@ -5041,7 +5059,7 @@ impl Implementation for AttentionViaCacheImpl {
         let q_expr = ctx.input_expr(tile, 0);
 
         // Layer index — from the `kv_cache[layer]` extern input.
-        let layer = node
+        let layer_u64 = node
             .inputs
             .iter()
             .find_map(|i| match i {
@@ -5051,8 +5069,8 @@ impl Implementation for AttentionViaCacheImpl {
                 } => Some(*layer),
                 _ => None,
             })
-            .expect("Attention has a kv_cache extern with a concrete layer index")
-            as usize;
+            .expect("Attention has a kv_cache extern with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         // Softmax scale: config-driven. Gemma2 sets
         // `query_pre_attn_scalar` (softmax scale = that^-0.5); Llama/
@@ -5069,7 +5087,7 @@ impl Implementation for AttentionViaCacheImpl {
         // span-rotation path uses the right element pairing on
         // unrotated KV blocks. Determined statically from the layer's
         // rope tile in the FUF.
-        let interleaved_lit = layer_rope_is_interleaved(ctx.fuf, layer as u64);
+        let interleaved_lit = layer_rope_is_interleaved(ctx.fuf, layer_u64);
 
         quote! {
             // Decode paged attention. Delegates to the
@@ -5538,9 +5556,18 @@ impl Implementation for FusedQkvRopePrefillImpl {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
+        // Concrete per-iteration layer index (needed for
+        // analyses that read the underlying FUF, e.g.
+        // `layer_rope_is_interleaved`) plus its tokenised form.
+        // The latter routes through `ctx.layer_expr` so when the
+        // class-loop emitter sets `repeat_var = Some(__repeat)`
+        // the `#layer` interpolations below become loop-variable
+        // references instead of baked literals. `repeat_var =
+        // None` (today's unrolled path) keeps the output byte-
+        // identical to the pre-lift emission.
+        let layer_u64 = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);
@@ -5838,7 +5865,7 @@ impl Implementation for SlidingAttentionViaCacheImpl {
         let out = ctx.output_ident(tile, 0);
         let node = ctx.fuf.get(tile);
         let q_expr = ctx.input_expr(tile, 0);
-        let layer = node
+        let layer_u64 = node
             .inputs
             .iter()
             .find_map(|i| match i {
@@ -5848,8 +5875,8 @@ impl Implementation for SlidingAttentionViaCacheImpl {
                 } => Some(*layer),
                 _ => None,
             })
-            .expect("SlidingAttention has a kv_cache extern with a concrete layer index")
-            as usize;
+            .expect("SlidingAttention has a kv_cache extern with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         let scale_tokens = attention_scale_tokens(ctx);
         let softcap_tokens = attention_softcap_tokens(ctx);
@@ -5857,7 +5884,7 @@ impl Implementation for SlidingAttentionViaCacheImpl {
         let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
 
         let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-        let interleaved_lit = layer_rope_is_interleaved(ctx.fuf, layer as u64);
+        let interleaved_lit = layer_rope_is_interleaved(ctx.fuf, layer_u64);
 
         quote! {
             let mut #out = unsafe {
@@ -7450,9 +7477,18 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
+        // Concrete per-iteration layer index (needed for
+        // analyses that read the underlying FUF, e.g.
+        // `layer_rope_is_interleaved`) plus its tokenised form.
+        // The latter routes through `ctx.layer_expr` so when the
+        // class-loop emitter sets `repeat_var = Some(__repeat)`
+        // the `#layer` interpolations below become loop-variable
+        // references instead of baked literals. `repeat_var =
+        // None` (today's unrolled path) keeps the output byte-
+        // identical to the pre-lift emission.
+        let layer_u64 = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);
@@ -7626,9 +7662,18 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
+        // Concrete per-iteration layer index (needed for
+        // analyses that read the underlying FUF, e.g.
+        // `layer_rope_is_interleaved`) plus its tokenised form.
+        // The latter routes through `ctx.layer_expr` so when the
+        // class-loop emitter sets `repeat_var = Some(__repeat)`
+        // the `#layer` interpolations below become loop-variable
+        // references instead of baked literals. `repeat_var =
+        // None` (today's unrolled path) keeps the output byte-
+        // identical to the pre-lift emission.
+        let layer_u64 = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);
@@ -8920,9 +8965,18 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
+        // Concrete per-iteration layer index (needed for
+        // analyses that read the underlying FUF, e.g.
+        // `layer_rope_is_interleaved`) plus its tokenised form.
+        // The latter routes through `ctx.layer_expr` so when the
+        // class-loop emitter sets `repeat_var = Some(__repeat)`
+        // the `#layer` interpolations below become loop-variable
+        // references instead of baked literals. `repeat_var =
+        // None` (today's unrolled path) keeps the output byte-
+        // identical to the pre-lift emission.
+        let layer_u64 = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);
@@ -9081,9 +9135,18 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
+        // Concrete per-iteration layer index (needed for
+        // analyses that read the underlying FUF, e.g.
+        // `layer_rope_is_interleaved`) plus its tokenised form.
+        // The latter routes through `ctx.layer_expr` so when the
+        // class-loop emitter sets `repeat_var = Some(__repeat)`
+        // the `#layer` interpolations below become loop-variable
+        // references instead of baked literals. `repeat_var =
+        // None` (today's unrolled path) keeps the output byte-
+        // identical to the pre-lift emission.
+        let layer_u64 = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);
@@ -9334,9 +9397,18 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
+        // Concrete per-iteration layer index (needed for
+        // analyses that read the underlying FUF, e.g.
+        // `layer_rope_is_interleaved`) plus its tokenised form.
+        // The latter routes through `ctx.layer_expr` so when the
+        // class-loop emitter sets `repeat_var = Some(__repeat)`
+        // the `#layer` interpolations below become loop-variable
+        // references instead of baked literals. `repeat_var =
+        // None` (today's unrolled path) keeps the output byte-
+        // identical to the pre-lift emission.
+        let layer_u64 = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);
@@ -9495,9 +9567,18 @@ impl Implementation for Bnb4FusedQkvRopePrefillImpl {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
+        // Concrete per-iteration layer index (needed for
+        // analyses that read the underlying FUF, e.g.
+        // `layer_rope_is_interleaved`) plus its tokenised form.
+        // The latter routes through `ctx.layer_expr` so when the
+        // class-loop emitter sets `repeat_var = Some(__repeat)`
+        // the `#layer` interpolations below become loop-variable
+        // references instead of baked literals. `repeat_var =
+        // None` (today's unrolled path) keeps the output byte-
+        // identical to the pre-lift emission.
+        let layer_u64 = rope_kv_cache_layer(rope_node)
+            .expect("RopeAppend has a KvCache extern input with a concrete layer index");
+        let layer = ctx.layer_expr(layer_u64);
 
         let q_out = ctx.output_ident(rope_id, 0);
         let k_out = ctx.output_ident(rope_id, 1);

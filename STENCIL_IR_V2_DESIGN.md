@@ -405,11 +405,33 @@ Split into sub-commits, each dormant-by-default (off unless
   producer at Δrepeat=1) and pairs them into a single carry. `None`
   return when the graph violates collapsing preconditions.
 
+- ✅ **6.2.b.5e** — actual emission landed. `emit_forward_collapsed_bucket`
+  now consumes `ClassSchedule` + `class_input_provenance` +
+  `WeightLayout::access_tokens_with_repeat` and produces a real bucket
+  body (pre-loop subgraphs → carry hoists → `for __repeat in 0..max_period`
+  with per-class `__cC_out` bindings + fragment intern + end-of-iter
+  carry/last updates → post-loop shadow bindings → last-tile return).
+  Happy path exercised: `commandr`'s 3 variants emit a real (degenerate,
+  no-periodic, empty-loop) collapsed body under `FERRITE_STENCIL_CODEGEN=1`.
+  Every other variant hits `unimplemented!()` with a specific refusal
+  reason; `cargo check -p ferrite-models --features cuda` is clean across
+  all 218 variants. Runtime validation (`vllm chat`) deferred until p1
+  lifts the period-mismatch gate.
+
+  **Key observation measured 2026-04-20**: every real llama / mistral /
+  gemma / qwen / granite / phi3 variant trips `uniform_period=false`
+  because the SFUF has a period-(N-1) class alongside the period-N
+  classes (residual-add boundary class; see `neg=[(9[39]<-4[40]: [-1])]`
+  in llama-2-13b's stencil-deps). The §13 design note called out
+  llama-2-13b / mistral-7b-v0.3 as "uniform_period=true" targets — that
+  is inaccurate. **p1 (period-mismatch guards) is mandatory for any
+  non-trivial variant**, not an optional follow-up.
+
 **Remaining — next session starts here:**
 
-- ⏳ **6.2.b.5e — actual emission.** Consume `ClassSchedule` +
-  `class_input_provenance` + `WeightLayout::access_tokens_with_repeat`
-  to emit the bucket body:
+- 5e code path that is no longer needed (the fully-implemented
+  emission): none — the emitter is done. Remaining sub-steps lift
+  refusal reasons.
   - **Pre-loop**: for each class in `sched.pre_loop`, emit its
     single member via today's `emit_subgraph` (concrete mode,
     `repeat_var = None`). Bind to today's `locals[&(tile_id, slot)]`.

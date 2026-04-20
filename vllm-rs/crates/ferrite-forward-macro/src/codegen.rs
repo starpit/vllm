@@ -3454,81 +3454,96 @@ fn emit_forward_for_bucket(
 /// STENCIL_IR_V2_DESIGN.md §9 step 6.2.b.5 — class-driven forward emission.
 ///
 /// Entry point when `FERRITE_STENCIL_CODEGEN=1`. Walks the StencilBundle's
-/// classes (not wavefronts, not subgraphs) and emits:
-/// - pre-loop: period-1 classes + any class whose members are all iter=0
-///   before the periodic loop window (embed, layer-0-only boundaries);
-/// - loop: `for __repeat in 0..max_period { … }` with per-class guards
-///   `if __repeat >= offset && __repeat < offset + period` (§13 p1);
-/// - post-loop: period-1 classes + last-member-only classes (final norm,
-///   lm_head).
+/// classes and emits:
+/// - pre-loop: period-1 classes topo-before any periodic class (emitted
+///   via the existing `emit_subgraph` in concrete mode, binding to
+///   `locals[&(tile, slot)]`);
+/// - loop-carry hoist: `let mut __carry_P = <pre_loop_init_sg local>;`
+///   per distinct LoopCarry producer class P;
+/// - dedicated-last hoist: `let mut __last_C: Option<OwnedTensor> = None;`
+///   per periodic class C consumed post-loop but not already a carry
+///   producer;
+/// - loop: `for __repeat in 0..max_period { … }` — each periodic class
+///   emits a `let __cC_out = unsafe { __frag_N(...) };` binding whose
+///   inputs resolve via the class's `ClassInputs` provenance (IntraIter
+///   → `__cPC_out`; LoopCarry → `__carry_P`; PreLoop → `locals[…]`) and
+///   whose weight args thread `__repeat` through `access_tokens_with_repeat`.
+///   The fragment body itself uses `repeat_var = Some(repeat)` so
+///   `ctx.layer_expr` inside it resolves to the fragment's `repeat: usize`
+///   param — passed `__repeat` at the call site. At the bottom of the
+///   body, each carry producer class writes `__carry_P = __cP_out;` and
+///   each dedicated-last class writes `__last_C = Some(__cC_out);`.
+/// - post-loop: periodic classes consumed post-loop bind their local
+///   `t_<tile>_<slot>` idents to the final-iter values (`__carry_P` by
+///   move for carry producers, `__last_C.take().unwrap()` for dedicated
+///   lasts); then each post-loop class emits via `emit_subgraph` normally.
 ///
-/// Inside the loop, each class's representative body is emitted once via
-/// `emit_subgraph` in abstract mode with `repeat_var = Some(__repeat)` so
-/// every `ctx.layer_expr(c)` resolves to `#repeat_var + offset`. Weight
-/// accesses read through 6.1's `WeightLayout` family arrays indexed by
-/// `__repeat`. Loop-carried inter-class edges (Δrepeat ≠ 0 — the residual
-/// stream per §13) land in `let mut` bindings hoisted above the loop.
-///
-/// Status: **stub** (6.2.b.5a). This fn intentionally bails out loudly
-/// rather than silently falling back to the unrolled emitter — per
-/// `feedback_stencil_is_the_model`, we commit to driving codegen from the
-/// collapsed IR, not from the unrolled FUF. Subsequent commits fill in
-/// the real body; this one reserves the dispatch site and the env flag.
+/// Refusal: any precondition failure returns a per-variant
+/// `unimplemented!(<reason>)` body. Per `feedback_stencil_is_the_model`,
+/// we never silently fall back to the unrolled path.
 #[allow(clippy::too_many_arguments)]
 fn emit_forward_collapsed_bucket(
     fuf: &Fuf,
     sfuf: &Assignment,
     _loop_ir: &Loop,
-    _program: &Program,
-    _model: &ModelParams,
-    _lib: &ImplementationLibrary,
+    program: &Program,
+    model: &ModelParams,
+    lib: &ImplementationLibrary,
     wp: crate::solver::WorkloadPoint,
-    _library: &mut FragmentLibrary,
-    _weight_layout: &crate::emit::WeightLayout,
+    library: &mut FragmentLibrary,
+    weight_layout: &crate::emit::WeightLayout,
 ) -> TokenStream {
     let stencil = StencilBundle::compute(fuf, sfuf);
     let sched = stencil.schedule(fuf, sfuf);
     let provenance = stencil.class_input_provenance(&sched, fuf, sfuf);
-    let (intra_slots, carry_slots, preloop_slots, provenance_ok) = match &provenance {
-        Some(v) => {
-            let mut intra = 0usize;
-            let mut carry = 0usize;
-            let mut preloop = 0usize;
-            for ci in v {
-                for s in &ci.slots {
-                    match s.origin {
-                        InputOrigin::IntraIter { .. } => intra += 1,
-                        InputOrigin::LoopCarry { .. } => carry += 1,
-                        InputOrigin::PreLoop { .. } => preloop += 1,
-                    }
-                }
-            }
-            (intra, carry, preloop, true)
-        }
-        None => (0, 0, 0, false),
-    };
-    let num_classes = stencil.class_members.len();
-    let homogeneous = stencil.homogeneous_count();
+
+    match try_emit_collapsed_bucket(
+        &stencil,
+        &sched,
+        provenance.as_deref(),
+        fuf,
+        sfuf,
+        program,
+        model,
+        lib,
+        wp,
+        library,
+        weight_layout,
+    ) {
+        Ok(tokens) => tokens,
+        Err(reason) => emit_collapsed_refusal(wp, &stencil, &sched, provenance.as_deref(), &reason),
+    }
+}
+
+/// Build the `unimplemented!(<reason>)` body returned when
+/// `try_emit_collapsed_bucket` rejects a variant. The reason string is
+/// baked into the emitted `unimplemented!` so any runtime dispatch
+/// surfaces the precise precondition that tripped.
+fn emit_collapsed_refusal(
+    wp: crate::solver::WorkloadPoint,
+    stencil: &StencilBundle,
+    sched: &ClassSchedule,
+    provenance: Option<&[ClassInputs]>,
+    reason: &str,
+) -> TokenStream {
+    let provenance_ok = provenance.is_some();
     let msg = format!(
-        "FERRITE_STENCIL_CODEGEN collapsed-mode emitter not yet implemented \
-         (classes={}, homogeneous={}, pre={} periodic={} post={} max_period={} \
-         uniform_period={} uniform_pairs={} homogeneous_periodic={} carried_edges={} \
-         provenance_ok={} intra_slots={} carry_slots={} preloop_slots={}); \
+        "FERRITE_STENCIL_CODEGEN collapsed-mode emitter refused: {reason} \
+         (classes={cls}, homogeneous={hom}, pre={pre} periodic={per} post={post} \
+         max_period={mp} uniform_period={up} uniform_pairs={upa} \
+         homogeneous_periodic={hp} carried_edges={ce} provenance_ok={pov}); \
          see STENCIL_IR_V2_DESIGN.md §13 6.2.b.5",
-        num_classes,
-        homogeneous,
-        sched.pre_loop.len(),
-        sched.periodic.len(),
-        sched.post_loop.len(),
-        sched.max_period,
-        sched.uniform_period,
-        sched.uniform_pairs,
-        sched.homogeneous_periodic,
-        sched.carried.len(),
-        provenance_ok,
-        intra_slots,
-        carry_slots,
-        preloop_slots,
+        cls = stencil.class_members.len(),
+        hom = stencil.homogeneous_count(),
+        pre = sched.pre_loop.len(),
+        per = sched.periodic.len(),
+        post = sched.post_loop.len(),
+        mp = sched.max_period,
+        up = sched.uniform_period,
+        upa = sched.uniform_pairs,
+        hp = sched.homogeneous_periodic,
+        ce = sched.carried.len(),
+        pov = provenance_ok,
     );
     let fn_name = bucket_fn_ident("forward_m", wp);
     quote! {
@@ -3543,6 +3558,564 @@ fn emit_forward_collapsed_bucket(
             unimplemented!(#msg)
         }
     }
+}
+
+fn carry_var_ident(producer_class: usize) -> syn::Ident {
+    format_ident!("__carry_c{}", producer_class)
+}
+
+fn last_var_ident(class: usize) -> syn::Ident {
+    format_ident!("__last_c{}", class)
+}
+
+fn class_out_ident(class: usize) -> syn::Ident {
+    format_ident!("__c{}_out", class)
+}
+
+/// Core collapsed-emit body. Returns `Err(reason)` when the variant
+/// violates a precondition; on success, returns the full
+/// `pub unsafe fn forward_m_<N>(…) -> OwnedTensor { … }` token stream.
+#[allow(clippy::too_many_arguments)]
+fn try_emit_collapsed_bucket(
+    stencil: &StencilBundle,
+    sched: &ClassSchedule,
+    provenance: Option<&[ClassInputs]>,
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    program: &Program,
+    model: &ModelParams,
+    lib: &ImplementationLibrary,
+    wp: crate::solver::WorkloadPoint,
+    library: &mut FragmentLibrary,
+    weight_layout: &crate::emit::WeightLayout,
+) -> Result<TokenStream, String> {
+    // ── preconditions ────────────────────────────────────────────
+    if !sched.uniform_period {
+        return Err("uniform_period=false (periodic classes differ in member count)".into());
+    }
+    if !sched.uniform_pairs {
+        return Err("uniform_pairs=false (a class pair has non-uniform Δrepeat edges)".into());
+    }
+    if !sched.homogeneous_periodic {
+        return Err("homogeneous_periodic=false (a periodic class has heterogeneous impls)".into());
+    }
+    let Some(provenance) = provenance else {
+        return Err("provenance=None (boundary inputs cross partitions unexpectedly)".into());
+    };
+
+    // Every periodic class's rep must be fragmentizable, have no
+    // consumed input tiles, no multi-output tiles (5e scope).
+    for &c in &sched.periodic {
+        let rep = *stencil
+            .class_members
+            .get(c)
+            .and_then(|m| m.first())
+            .ok_or_else(|| format!("periodic class {c} has no members"))?;
+        let imp_id = stencil
+            .class_impl_id
+            .get(c)
+            .copied()
+            .flatten()
+            .ok_or_else(|| format!("class {c} has no homogeneous impl"))?;
+        let imp = lib.get(imp_id);
+        let claimed = sfuf.tiles_in_subgraph(rep);
+        if !imp.consumes_input_tiles(&claimed, fuf).is_empty() {
+            return Err(format!("class {c} rep impl consumes input tiles"));
+        }
+        for &t in &claimed {
+            if fuf.get(t).outputs.len() > 1 {
+                return Err(format!("class {c} has multi-output tile (slot>0)"));
+            }
+        }
+        if !can_fragmentize(imp, &claimed, fuf) {
+            return Err(format!("class {c} rep not fragmentizable"));
+        }
+    }
+
+    // Pre/post loop classes must be period-1 (analysis already does
+    // this but assert defensively).
+    for &c in sched.pre_loop.iter().chain(sched.post_loop.iter()) {
+        if stencil.class_members[c].len() != 1 {
+            return Err(format!("pre/post_loop class {c} has period > 1"));
+        }
+    }
+
+    // ── identify loop-carry producer classes ─────────────────────
+    let mut carry_inits: BTreeMap<usize, SubgraphId> = BTreeMap::new();
+    for ci in provenance {
+        for s in &ci.slots {
+            if let InputOrigin::LoopCarry {
+                producer_class,
+                pre_loop_init_sg,
+            } = s.origin
+            {
+                let entry = carry_inits
+                    .entry(producer_class)
+                    .or_insert(pre_loop_init_sg);
+                if *entry != pre_loop_init_sg {
+                    return Err(format!(
+                        "carry producer class {producer_class} has conflicting pre-loop inits"
+                    ));
+                }
+            }
+        }
+    }
+    let carry_producers: BTreeSet<usize> = carry_inits.keys().copied().collect();
+
+    // ── find post-loop consumers of periodic classes ─────────────
+    // For each periodic producer class P referenced by a post-loop
+    // subgraph's boundary input, record the (tile, slot) that the
+    // post-loop side refers to. One tile-id per class (refuse > 1).
+    let periodic_set: BTreeSet<usize> = sched.periodic.iter().copied().collect();
+    let mut post_refs: BTreeMap<usize, (TileId, u8)> = BTreeMap::new();
+    for &c in &sched.post_loop {
+        let sg = stencil.class_members[c][0];
+        let claimed = sfuf.tiles_in_subgraph(sg);
+        let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+        for &t in &claimed {
+            for input in &fuf.get(t).inputs {
+                if let FufInput::Tile { id, slot } = input {
+                    if claimed_set.contains(id) {
+                        continue;
+                    }
+                    let Some(producer_sg) = sfuf.subgraph_of(*id) else {
+                        continue;
+                    };
+                    let Some(&pc) = stencil.class_of.get(&producer_sg) else {
+                        continue;
+                    };
+                    if !periodic_set.contains(&pc) {
+                        continue;
+                    }
+                    if let Some(prev) = post_refs.get(&pc) {
+                        if *prev != (*id, *slot) {
+                            return Err(format!(
+                                "periodic class {pc} referenced by post-loop from multiple tiles"
+                            ));
+                        }
+                    } else {
+                        post_refs.insert(pc, (*id, *slot));
+                    }
+                }
+            }
+        }
+    }
+    let post_loop_exports: BTreeSet<usize> = post_refs.keys().copied().collect();
+    let dedicated_last: BTreeSet<usize> = post_loop_exports
+        .difference(&carry_producers)
+        .copied()
+        .collect();
+
+    // Final tile: must live in a pre_loop or post_loop class. A
+    // periodic-class final tile would need the emitter to expose the
+    // last iter's output as the fn return, which 5e doesn't model.
+    let last_tile = fuf.nodes.last().ok_or_else(|| "empty FUF".to_string())?.id;
+    let last_sg = sfuf
+        .subgraph_of(last_tile)
+        .ok_or_else(|| "last tile has no subgraph".to_string())?;
+    let last_class = *stencil
+        .class_of
+        .get(&last_sg)
+        .ok_or_else(|| "last subgraph has no class".to_string())?;
+    if periodic_set.contains(&last_class) {
+        return Err(format!(
+            "final tile lives in periodic class {last_class} — needs post-loop path"
+        ));
+    }
+
+    // ── emission ────────────────────────────────────────────────
+    let locals = build_local_map(fuf);
+    let mut body: Vec<TokenStream> = Vec::new();
+
+    // Pre-loop classes via today's emit_subgraph. Binds
+    // `let t_<tile>_<slot> = …;` into the enclosing scope.
+    for &c in &sched.pre_loop {
+        let sg = stencil.class_members[c][0];
+        let imp_id = sfuf
+            .impl_of(sg)
+            .ok_or_else(|| format!("pre_loop sg {sg:?} has no impl"))?;
+        body.push(emit_subgraph(
+            fuf,
+            sfuf,
+            program,
+            model,
+            lib,
+            sg,
+            imp_id,
+            &locals,
+            library,
+            stencil,
+            weight_layout,
+        ));
+    }
+
+    // Carry hoists. Reuses the pre-loop's local for the init sg.
+    for &pc in &carry_producers {
+        let init_sg = carry_inits[&pc];
+        let init_tiles = sfuf.tiles_in_subgraph(init_sg);
+        let init_tile = *init_tiles
+            .last()
+            .ok_or_else(|| format!("carry init sg {init_sg:?} has no tiles"))?;
+        let init_local = locals
+            .get(&(init_tile, 0))
+            .cloned()
+            .ok_or_else(|| "carry init local missing".to_string())?;
+        let carry = carry_var_ident(pc);
+        body.push(quote! {
+            let mut #carry: ::ferrite_cuda_core::alloc::OwnedTensor = #init_local;
+        });
+    }
+
+    // Dedicated-last hoists: Option<OwnedTensor>, filled each iter.
+    for &c in &dedicated_last {
+        let last = last_var_ident(c);
+        body.push(quote! {
+            let mut #last: ::std::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> = None;
+        });
+    }
+
+    // ── loop body ───────────────────────────────────────────────
+    let prov_by_class: HashMap<usize, &ClassInputs> = provenance
+        .iter()
+        .map(|ci| (ci.consumer_class, ci))
+        .collect();
+
+    let mut loop_body: Vec<TokenStream> = Vec::new();
+    for &c in &sched.periodic {
+        let ci = prov_by_class
+            .get(&c)
+            .copied()
+            .ok_or_else(|| format!("class {c} missing provenance entry"))?;
+        let call = emit_class_loop_call(
+            c,
+            ci,
+            stencil,
+            fuf,
+            sfuf,
+            program,
+            model,
+            lib,
+            &locals,
+            library,
+            weight_layout,
+            &carry_producers,
+        )?;
+        loop_body.push(call);
+    }
+
+    // End-of-iter updates: carries + dedicated lasts. Each MOVES the
+    // class's __cC_out into its sink — safe because all intra-iter
+    // consumers have already pulled views earlier in the body.
+    for &pc in &carry_producers {
+        let carry = carry_var_ident(pc);
+        let c_out = class_out_ident(pc);
+        loop_body.push(quote! { #carry = #c_out; });
+    }
+    for &c in &dedicated_last {
+        let last = last_var_ident(c);
+        let c_out = class_out_ident(c);
+        loop_body.push(quote! { #last = Some(#c_out); });
+    }
+
+    let max_period = sched.max_period;
+    let max_period_lit = proc_macro2::Literal::usize_unsuffixed(max_period);
+    body.push(quote! {
+        for __repeat in 0usize..#max_period_lit {
+            #(#loop_body)*
+        }
+    });
+
+    // Post-loop: bind each referenced periodic class's final-iter
+    // value to the local ident the post-loop sg expects. Moves out
+    // of __carry_P (single-use) or .take() from __last_C.
+    for (&pc, &(tile, slot)) in &post_refs {
+        let local = locals
+            .get(&(tile, slot))
+            .cloned()
+            .ok_or_else(|| format!("post_ref tile {tile:?} slot {slot} missing local"))?;
+        if carry_producers.contains(&pc) {
+            let carry = carry_var_ident(pc);
+            body.push(quote! {
+                let #local: ::ferrite_cuda_core::alloc::OwnedTensor = #carry;
+            });
+        } else {
+            let last = last_var_ident(pc);
+            body.push(quote! {
+                let #local: ::ferrite_cuda_core::alloc::OwnedTensor =
+                    #last.take().expect("periodic class last output");
+            });
+        }
+    }
+
+    for &c in &sched.post_loop {
+        let sg = stencil.class_members[c][0];
+        let imp_id = sfuf
+            .impl_of(sg)
+            .ok_or_else(|| format!("post_loop sg {sg:?} has no impl"))?;
+        body.push(emit_subgraph(
+            fuf,
+            sfuf,
+            program,
+            model,
+            lib,
+            sg,
+            imp_id,
+            &locals,
+            library,
+            stencil,
+            weight_layout,
+        ));
+    }
+
+    let last_output = {
+        let id = locals
+            .get(&(last_tile, 0))
+            .cloned()
+            .ok_or_else(|| "last tile local missing".to_string())?;
+        quote! { #id }
+    };
+
+    let fn_name = bucket_fn_ident("forward_m", wp);
+    Ok(quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments, unused_mut, unused_variables)]
+        pub unsafe fn #fn_name(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            #(#body)*
+            #last_output
+        }
+    })
+}
+
+/// Emit one periodic class's call inside the `for __repeat` loop:
+/// interns the fragment body (abstract mode with `repeat_var =
+/// Some(repeat)`, plus an extra `repeat: usize` fn param) and emits
+/// `let __cC_out = unsafe { __frag_N(…inputs…, __repeat, wm, ctx, device) };`
+/// where input args come from the class's `ClassInputs` provenance
+/// (IntraIter → `(*__cPC_out).as_view()`, LoopCarry → `(*__carry_P).as_view()`,
+/// PreLoop → `(*locals[&(id,slot)]).as_view()`) and weight args thread
+/// `__repeat` through `access_tokens_with_repeat`.
+#[allow(clippy::too_many_arguments)]
+fn emit_class_loop_call(
+    consumer_class: usize,
+    class_inputs: &ClassInputs,
+    stencil: &StencilBundle,
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    program: &Program,
+    model: &ModelParams,
+    lib: &ImplementationLibrary,
+    locals: &LocalMap,
+    library: &mut FragmentLibrary,
+    weight_layout: &crate::emit::WeightLayout,
+    carry_producers: &BTreeSet<usize>,
+) -> Result<TokenStream, String> {
+    let rep_sg = class_inputs.rep_sg;
+    let imp_id = stencil.class_impl_id[consumer_class]
+        .ok_or_else(|| format!("class {consumer_class} not homogeneous"))?;
+    let imp = lib.get(imp_id);
+    let claimed = sfuf.tiles_in_subgraph(rep_sg);
+    let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+
+    // Boundary tile-input ordering must match `class_input_provenance`'s
+    // dedup order so slot N in `class_inputs.slots` aligns with the
+    // Nth `input_i` fragment param.
+    let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+    let mut seen: HashSet<(TileId, u8)> = HashSet::new();
+    for &t in &claimed {
+        for input in &fuf.get(t).inputs {
+            if let FufInput::Tile { id, slot } = input
+                && !claimed_set.contains(id)
+                && seen.insert((*id, *slot))
+            {
+                tile_params_ordered.push((*id, *slot));
+            }
+        }
+    }
+    if tile_params_ordered.len() != class_inputs.slots.len() {
+        return Err(format!(
+            "class {consumer_class}: boundary input count mismatch (emit={}, provenance={})",
+            tile_params_ordered.len(),
+            class_inputs.slots.len()
+        ));
+    }
+
+    let accessors: Vec<WeightAccessor> = imp.required_weights(&claimed, fuf, program);
+
+    // Build the abstract EmitCtx with `repeat_var = Some(repeat)` so
+    // every `ctx.layer_expr` inside the fragment body refers to the
+    // fragment's `repeat: usize` param (passed `__repeat` at the call
+    // site). Tile/weight references go through the fragment fn-params
+    // as usual.
+    let mut tile_params: HashMap<(TileId, u8), syn::Ident> = HashMap::new();
+    let mut tile_param_idents: Vec<syn::Ident> = Vec::with_capacity(tile_params_ordered.len());
+    for (i, &(id, slot)) in tile_params_ordered.iter().enumerate() {
+        let p = format_ident!("input_{}", i);
+        tile_params.insert((id, slot), p.clone());
+        tile_param_idents.push(p);
+    }
+    let mut weight_params: HashMap<(WeightId, Option<u64>), syn::Ident> = HashMap::new();
+    let mut weight_params_by_name: HashMap<String, syn::Ident> = HashMap::new();
+    let mut weight_param_idents: Vec<syn::Ident> = Vec::with_capacity(accessors.len());
+    for (i, acc) in accessors.iter().enumerate() {
+        let p = format_ident!("w_{}", i);
+        for &(wid, idx) in &acc.source_weights {
+            weight_params.insert((wid, idx), p.clone());
+        }
+        weight_params_by_name.insert(acc.name.to_string(), p.clone());
+        weight_param_idents.push(p);
+    }
+
+    let repeat_ident = format_ident!("repeat");
+    let abstract_ctx = EmitCtx {
+        fuf,
+        program,
+        model,
+        claimed_tiles: &claimed,
+        locals,
+        mode: EmitMode::Abstract {
+            tile_params,
+            consumed_params: HashMap::new(),
+            weight_params,
+            weight_params_by_name,
+        },
+        weight_layout: Some(weight_layout),
+        repeat_var: Some(quote! { #repeat_ident }),
+    };
+    let abstract_body = imp.emit_call(&abstract_ctx);
+
+    let out_claimed_pos = claimed.len() - 1;
+    let out_slot: u8 = 0;
+    let return_ident = format_ident!("__out_{}_{}", out_claimed_pos, out_slot);
+
+    // Sig includes `collapsed` tag + extra repeat param so collapsed
+    // fragments never collide with the unrolled path's interned fns.
+    let weight_types_str: String = accessors
+        .iter()
+        .map(|a| a.rust_type.to_string())
+        .collect::<Vec<_>>()
+        .join("|");
+    let sig = format!(
+        "collapsed|ti={}|ci=0|wt={}|body={}",
+        tile_params_ordered.len(),
+        weight_types_str,
+        abstract_body,
+    );
+
+    let frag_idx = if let Some(&idx) = library.by_sig.get(&sig) {
+        idx
+    } else {
+        let idx = library.fns.len();
+        let frag_name = format_ident!("__frag_{}", idx);
+
+        let tile_param_decls: Vec<TokenStream> = tile_param_idents
+            .iter()
+            .map(|p| quote! { #p: ::ferrite_cuda_core::TensorView<'_> })
+            .collect();
+        let weight_param_decls: Vec<TokenStream> = accessors
+            .iter()
+            .zip(weight_param_idents.iter())
+            .map(|(acc, p)| {
+                let ty = &acc.rust_type;
+                quote! { #p: & #ty }
+            })
+            .collect();
+
+        let fn_tokens = quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(clippy::too_many_arguments, unused_mut, unused_variables, non_snake_case)]
+            unsafe fn #frag_name(
+                #(#tile_param_decls,)*
+                #(#weight_param_decls,)*
+                #repeat_ident: usize,
+                wm: &Weights,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                #abstract_body
+                #return_ident
+            }
+        };
+        library.by_sig.insert(sig, idx);
+        library.fns.push(fn_tokens);
+        idx
+    };
+    CALL_SITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Call site: assemble input args per provenance slot.
+    let mut input_args: Vec<TokenStream> = Vec::with_capacity(class_inputs.slots.len());
+    for (i, slot) in class_inputs.slots.iter().enumerate() {
+        // Positional alignment: slot i of provenance == (id, slot) of
+        // tile_params_ordered[i]. Assert to catch any divergence.
+        if (slot.producer_tile, slot.producer_slot) != tile_params_ordered[i] {
+            return Err(format!(
+                "class {consumer_class}: provenance slot {i} mismatch (prov=({:?},{}), emit=({:?},{}))",
+                slot.producer_tile,
+                slot.producer_slot,
+                tile_params_ordered[i].0,
+                tile_params_ordered[i].1,
+            ));
+        }
+        let arg = match &slot.origin {
+            InputOrigin::IntraIter { producer_class } => {
+                let c_out = class_out_ident(*producer_class);
+                quote! { (*#c_out).as_view() }
+            }
+            InputOrigin::LoopCarry { producer_class, .. } => {
+                if !carry_producers.contains(producer_class) {
+                    return Err(format!(
+                        "class {consumer_class}: carry refers to class {producer_class} missing from carry set"
+                    ));
+                }
+                let carry = carry_var_ident(*producer_class);
+                quote! { (*#carry).as_view() }
+            }
+            InputOrigin::PreLoop { producer_sg } => {
+                let init_tiles = sfuf.tiles_in_subgraph(*producer_sg);
+                let init_tile = *init_tiles
+                    .last()
+                    .ok_or_else(|| format!("PreLoop producer sg {producer_sg:?} has no tiles"))?;
+                let local = locals
+                    .get(&(init_tile, slot.producer_slot))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "PreLoop producer local for ({init_tile:?}, {}) missing",
+                            slot.producer_slot
+                        )
+                    })?;
+                quote! { (*#local).as_view() }
+            }
+        };
+        input_args.push(arg);
+    }
+
+    let repeat_tokens = quote! { __repeat };
+    let weight_args: Vec<TokenStream> = accessors
+        .iter()
+        .map(|acc| {
+            let access = weight_layout.access_tokens_with_repeat(&acc.name, Some(&repeat_tokens));
+            quote! { &wm.#access }
+        })
+        .collect();
+
+    let frag_name = format_ident!("__frag_{}", frag_idx);
+    let c_out = class_out_ident(consumer_class);
+    Ok(quote! {
+        let #c_out = unsafe {
+            #frag_name(
+                #(#input_args,)*
+                #(#weight_args,)*
+                __repeat,
+                wm,
+                ctx,
+                device,
+            )
+        };
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

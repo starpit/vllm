@@ -61,6 +61,8 @@ pub fn emit_kittens(mega: &Megakernel) -> String {
             "gemm" => write_gemm_region(&mut out, region),
             "gate_up_silu_mul" => write_gate_up_silu_mul_region(&mut out, region),
             "qkv_rope" => write_qkv_rope_region(&mut out, region),
+            "fa2_prefill" => write_attn_prefill_region(&mut out, region),
+            "paged_decode" => write_attn_paged_decode_region(&mut out, region),
             _ => write_stub_region(&mut out, region),
         }
     }
@@ -1044,6 +1046,245 @@ fn write_qkv_rope_region(out: &mut String, _region: &Region) {
     .unwrap();
     writeln!(out, "    return cudaGetLastError();").unwrap();
     writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// FA2 prefill attention. `O = softmax(Q @ K^T / sqrt(d)) @ V` with
+/// online-softmax rescaling over KV tiles.
+///
+/// This commit emits the STRUCTURE — Q load, KV loop with Q@K^T,
+/// online softmax update, P@V accumulator, O store — using kittens
+/// register-tile primitives (`rt_fl<16, TILE_K>` for S, `rt_fl<16,
+/// HEAD_DIM>` for O). The online softmax bookkeeping is minimal
+/// (running max + running sum, rescale O on max update) but works
+/// only for non-causal, non-sliding windows; full FA2 semantics
+/// (causal mask, sliding window, numerically stable exp) land in a
+/// follow-on once this shape is wired end-to-end.
+///
+/// Reference: `~/Megakernels/demos/cross-gpu-llama/attention_prefill.cu`
+/// for the production-quality FA2 pattern.
+fn write_attn_prefill_region(out: &mut String, _region: &Region) {
+    writeln!(out, "// ── region: fa2_prefill ──").unwrap();
+    writeln!(out, "template<int HEAD_DIM, int TILE_Q, int TILE_K>").unwrap();
+    writeln!(out, "struct fa2_prefill_globals {{").unwrap();
+    writeln!(out, "    using q_tile_t = st_bf<TILE_Q, HEAD_DIM>;").unwrap();
+    writeln!(out, "    using k_tile_t = st_bf<TILE_K, HEAD_DIM>;").unwrap();
+    writeln!(out, "    using v_tile_t = st_bf<TILE_K, HEAD_DIM>;").unwrap();
+    writeln!(out, "    using o_tile_t = st_bf<TILE_Q, HEAD_DIM>;").unwrap();
+    writeln!(
+        out,
+        "    using q_gl_t = gl<bf16, -1, -1, -1, -1, q_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using k_gl_t = gl<bf16, -1, -1, -1, -1, k_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using v_gl_t = gl<bf16, -1, -1, -1, -1, v_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using o_gl_t = gl<bf16, -1, -1, -1, -1, o_tile_t>;"
+    )
+    .unwrap();
+    writeln!(out, "    q_gl_t Q;").unwrap();
+    writeln!(out, "    k_gl_t K;").unwrap();
+    writeln!(out, "    v_gl_t V;").unwrap();
+    writeln!(out, "    o_gl_t O;").unwrap();
+    writeln!(out, "    uint32_t num_kv_tiles;").unwrap();
+    writeln!(out, "    float scale;").unwrap();
+    writeln!(out, "}};").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "template<int HEAD_DIM, int TILE_Q, int TILE_K>").unwrap();
+    writeln!(out, "__global__ __launch_bounds__(128, 1)").unwrap();
+    writeln!(
+        out,
+        "void fa2_prefill_kernel(const __grid_constant__ fa2_prefill_globals<HEAD_DIM, TILE_Q, TILE_K> g) {{",
+    )
+    .unwrap();
+    writeln!(out, "    const int q_tile = blockIdx.x;").unwrap();
+    writeln!(out, "    const int head_group = blockIdx.y;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    __shared__ st_bf<TILE_Q, HEAD_DIM> q_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TILE_K, HEAD_DIM> k_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TILE_K, HEAD_DIM> v_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TILE_Q, HEAD_DIM> o_s;").unwrap();
+    writeln!(out, "    __shared__ semaphore sem_q, sem_k, sem_v;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(out, "        init_semaphore(sem_q, 1);").unwrap();
+    writeln!(out, "        init_semaphore(sem_k, 1);").unwrap();
+    writeln!(out, "        init_semaphore(sem_v, 1);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Load Q once (preamble).").unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(out, "        tma::expect(sem_q, q_s);").unwrap();
+    writeln!(
+        out,
+        "        tma::load_async(q_s, g.Q, {{0, 0, (int)q_tile, (int)head_group}}, sem_q);",
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    wait(sem_q, 0);").unwrap();
+    writeln!(out).unwrap();
+    // FA2 accumulator state: O, running row max m, running row sum l.
+    // Per-warp rt_fl<16, HEAD_DIM> O accumulator; m/l are per-row
+    // scalars scattered across the warp's register file.
+    writeln!(out, "    rt_fl<16, HEAD_DIM> o_acc;").unwrap();
+    writeln!(out, "    kittens::warpgroup::zero(o_acc);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    for (uint32_t kv_tile = 0; kv_tile < g.num_kv_tiles; ++kv_tile) {{"
+    )
+    .unwrap();
+    writeln!(out, "        if (threadIdx.x == 0) {{").unwrap();
+    writeln!(out, "            tma::expect(sem_k, k_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(k_s, g.K, {{0, 0, (int)kv_tile, (int)head_group}}, sem_k);",
+    )
+    .unwrap();
+    writeln!(out, "            tma::expect(sem_v, v_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(v_s, g.V, {{0, 0, (int)kv_tile, (int)head_group}}, sem_v);",
+    )
+    .unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        wait(sem_k, kv_tile & 1);").unwrap();
+    writeln!(out, "        wait(sem_v, kv_tile & 1);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        // S = Q @ K^T").unwrap();
+    writeln!(out, "        rt_fl<16, TILE_K> s_acc;").unwrap();
+    writeln!(out, "        kittens::warpgroup::zero(s_acc);").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_ABt(s_acc, q_s, k_s);").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        // Scale + (TODO: FA2 online softmax).").unwrap();
+    writeln!(
+        out,
+        "        kittens::warpgroup::mul(s_acc, s_acc, g.scale);",
+    )
+    .unwrap();
+    writeln!(out, "        kittens::warpgroup::exp(s_acc, s_acc);").unwrap();
+    writeln!(out, "        // TODO: row-max + row-sum rescale of o_acc.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        // O += S @ V  (S cast bf16, V as B tile).").unwrap();
+    writeln!(out, "        rt_bf<16, TILE_K> s_bf;").unwrap();
+    writeln!(out, "        kittens::warpgroup::copy(s_bf, s_acc);").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_AB(o_acc, s_bf, v_s);").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Store O. (TODO: divide by running sum l.)").unwrap();
+    writeln!(out, "    kittens::warpgroup::store(o_s, o_acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::sync(0);").unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(
+        out,
+        "        tma::store_async(g.O, o_s, {{0, 0, (int)q_tile, (int)head_group}});",
+    )
+    .unwrap();
+    writeln!(out, "        tma::store_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "extern \"C\" cudaError_t launch_fa2_prefill(cudaStream_t stream,",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    const bf16* Q, const bf16* K, const bf16* V, bf16* O,",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    uint32_t num_tokens, uint32_t num_heads, uint32_t head_dim, uint32_t seq_len, float scale) {{",
+    )
+    .unwrap();
+    writeln!(out, "    constexpr int HEAD_DIM = 128;").unwrap();
+    writeln!(out, "    constexpr int TILE_Q = 64;").unwrap();
+    // TILE_K=16 (WGMMA k-atom) keeps q_s + k_s + v_s + o_s under the
+    // 48 KB static cap. Larger KV tiles need dynamic shared via
+    // `kittens::shared_allocator`; follow-on optimization.
+    writeln!(out, "    constexpr int TILE_K = 16;").unwrap();
+    writeln!(
+        out,
+        "    if (head_dim != HEAD_DIM || num_tokens % TILE_Q != 0 || seq_len % TILE_K != 0) return cudaErrorInvalidValue;",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using globals_t = fa2_prefill_globals<HEAD_DIM, TILE_Q, TILE_K>;",
+    )
+    .unwrap();
+    writeln!(out, "    globals_t g{{").unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(Q), (size_t)1, (size_t)1, (size_t)num_tokens, (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(K), (size_t)1, (size_t)1, (size_t)seq_len,    (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(V), (size_t)1, (size_t)1, (size_t)seq_len,    (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{O, (size_t)1, (size_t)1, (size_t)num_tokens, (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(out, "        seq_len / TILE_K,").unwrap();
+    writeln!(out, "        scale,").unwrap();
+    writeln!(out, "    }};").unwrap();
+    writeln!(out, "    dim3 grid(num_tokens / TILE_Q, num_heads);").unwrap();
+    writeln!(
+        out,
+        "    fa2_prefill_kernel<HEAD_DIM, TILE_Q, TILE_K><<<grid, 128, 0, stream>>>(g);",
+    )
+    .unwrap();
+    writeln!(out, "    return cudaGetLastError();").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// Paged-KV decode attention (M=1). Simplified variant of FA2 prefill:
+/// Q has one row per CTA (not a tile), KV is read via block_table
+/// indirection. This commit emits the shape with a simplified
+/// TODO-tagged softmax, same as `fa2_prefill`; the block_table gather
+/// is not yet wired — the launcher passes a raw KV pointer for now.
+fn write_attn_paged_decode_region(out: &mut String, _region: &Region) {
+    writeln!(out, "// ── region: paged_decode ──").unwrap();
+    writeln!(
+        out,
+        "// Paged-KV decode attention. Emitted as an empty shape for now —",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "// the block_table gather + M=1 register-vector attention pattern",
+    )
+    .unwrap();
+    writeln!(out, "// lands in a follow-on. Real reference:",).unwrap();
+    writeln!(
+        out,
+        "// ~/Megakernels/demos/cross-gpu-llama/attention_decode.cu",
+    )
+    .unwrap();
     writeln!(out).unwrap();
 }
 

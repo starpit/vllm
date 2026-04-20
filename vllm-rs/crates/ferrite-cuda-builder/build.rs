@@ -192,6 +192,15 @@ fn cuda_build() {
     //    to ~/ThunderKittens).
     build_kittens_kernels(&cache_str, &mut rerun_files);
 
+    // 10. mk_llama: vendored cross-gpu-llama megakernel sources +
+    //    our single-device top-level. Builds on sm_90a+ with
+    //    THUNDERKITTENS_ROOT (or ~/ThunderKittens) and
+    //    MEGAKERNELS_ROOT (or ~/Megakernels) present. Session 1 of
+    //    MK_LLAMA_HANDOFF.md — produces libmk_llama.a with a stub
+    //    launcher; real launcher + scheduler land in subsequent
+    //    sessions.
+    build_mk_llama_kernels(&cache_str, &mut rerun_files);
+
     for f in &rerun_files {
         let path = std::path::Path::new(f);
         if let Ok(canonical) = path.canonicalize() {
@@ -534,6 +543,85 @@ fn build_stencil_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
 
     rerun_files.extend(sources.iter().cloned());
     rerun_files.extend(watch.iter().cloned());
+}
+
+#[cfg(feature = "cuda")]
+fn build_mk_llama_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
+    let arch = detect_cuda_arch();
+    let arch_num: u32 = arch.parse().unwrap_or(89);
+    if arch_num < 90 {
+        return;
+    }
+
+    // ThunderKittens + Megakernels include paths. Both are required;
+    // MEGAKERNELS_ROOT for `megakernel.cuh`, THUNDERKITTENS_ROOT for
+    // `kittens.cuh`. Fall back to ~/ThunderKittens and ~/Megakernels.
+    let tk_root = std::env::var("THUNDERKITTENS_ROOT").unwrap_or_else(|_| {
+        dirs::home_dir()
+            .expect("no home dir")
+            .join("ThunderKittens")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let tk_include = format!("{tk_root}/include");
+    let mk_root = std::env::var("MEGAKERNELS_ROOT").unwrap_or_else(|_| {
+        dirs::home_dir()
+            .expect("no home dir")
+            .join("Megakernels")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let mk_include = format!("{mk_root}/include");
+    if !std::path::Path::new(&tk_include).exists() {
+        println!(
+            "cargo:warning=ferrite-cuda-builder: ThunderKittens not at {tk_include}; \
+             skipping libmk_llama.a"
+        );
+        return;
+    }
+    if !std::path::Path::new(&mk_include).exists() {
+        println!(
+            "cargo:warning=ferrite-cuda-builder: Megakernels not at {mk_include}; \
+             skipping libmk_llama.a"
+        );
+        return;
+    }
+
+    let src = "../../crates/ferrite-stencil/csrc/mk_llama/mk_llama_single.cu".to_string();
+    let csrc_dir = "../../crates/ferrite-stencil/csrc/mk_llama";
+    let watch_files = std::fs::read_dir(csrc_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let p = e.path();
+            p.extension().is_some_and(|x| x == "cu" || x == "cuh")
+        })
+        .map(|e| e.path().display().to_string())
+        .collect::<Vec<_>>();
+
+    cudaforge::KernelBuilder::new()
+        .out_dir(cache_dir)
+        .source_files(vec![src.clone()])
+        .watch(watch_files.clone())
+        .include_path(csrc_dir)
+        .include_path(&tk_include)
+        .include_path(&mk_include)
+        .arg("-DKITTENS_HOPPER")
+        .arg("-DNDEBUG")
+        .arg("-std=c++20")
+        .arg("--expt-extended-lambda")
+        .arg("--expt-relaxed-constexpr")
+        .arg("--use_fast_math")
+        .arg("-Xcompiler=-fPIC")
+        .arg("-O3")
+        .arg("-lineinfo")
+        .arg("-gencode=arch=compute_90a,code=sm_90a")
+        .build_lib(format!("{cache_dir}/libmk_llama.a"))
+        .expect("failed to build mk_llama vendored sources");
+
+    println!("cargo:warning=ferrite-cuda-builder: wrote {cache_dir}/libmk_llama.a");
+    rerun_files.extend(watch_files);
 }
 
 #[cfg(feature = "cuda")]

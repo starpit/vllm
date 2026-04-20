@@ -135,13 +135,17 @@ struct globals_t {
     using activations_t = kittens::gl<kittens::bf16, 1, 1, -1, -1, kittens::sv_bf<hidden_dim>, kittens::st_bf<16, 128>,
                                       kittens::st_bf<64, 64>, kittens::sv_bf<head_dim>, kittens::st_bf<16, 64>>;
 
+    // Original cross-gpu-llama used pgl<GL, NUM_DEVICES, MULTICAST,
+    // NEEDS_INIT, TMA_Types...> (5-arg signature on older TK). Current
+    // TK pgl is `<GL, NUM_DEVICES, MULTICAST, TMA_Types...>` (no
+    // NEEDS_INIT bool). Adapted by dropping the second bool.
     using activations_parallel_t =
         kittens::pgl<kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>,
                                  kittens::sv_bf<hidden_dim>, kittens::st_bf<64, 256>, kittens::sv_bf<head_dim>>,
-                     num_devices, false, false>;
+                     num_devices, false>;
 
     using activations_parallel_mc_t =
-        kittens::pgl<kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>>, num_devices, true, true,
+        kittens::pgl<kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>>, num_devices, true,
                      kittens::sv_bf<hidden_dim>>;
 
     using activations_big_indim_t =
@@ -160,8 +164,7 @@ struct globals_t {
                                    // kittens::tma::descriptor<kittens::st_bf<16, 128>, 0>,
                                    kittens::sv_bf<head_dim>>;
 
-    using barriers = kittens::pgl<kittens::gl<uint, -1, -1, -1, -1>, num_devices,
-                                  false>;  // no need to initialize multicast
+    using barriers = kittens::pgl<kittens::gl<uint, -1, -1, -1, -1>, num_devices, false>;
 
     // vm stuff
     barriers Bar;

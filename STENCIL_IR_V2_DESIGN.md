@@ -329,7 +329,7 @@ None of these are show-stoppers without investigation, but each is worth measuri
 **Branch**: `worktree-ff3`. Three commits on top of `0ab1aad98`:
 - `aef01d8ca` — IR + subtile + region_formation + periodicity + CollapsePlan
 - `420a71690` — class→impl consistency checker + FormedRegions refactor
-- *(this commit)* — neighbor-aware canonical hash; 23 → 2 heterogeneous variants
+- `5f3e96cd5` — neighbor-aware canonical hash; 23 → 2 heterogeneous variants
 
 **What builds**: everything. `cargo build -p ferrite-models --release` exercises all 218 model variants through the full pipeline. Stencil diagnostic prints alongside each variant's ferrite line (see "stencil · N regions → N classes" entries).
 
@@ -367,7 +367,7 @@ Suggested approach: keep today's unrolled emitter as the default; gate the pivot
 
 ### Red flags to watch for
 
-- If the class-consistent subset (currently 195 variants) ships before all 218, the emitter needs to fall back to the old per-subgraph path for the stragglers. Don't let the code duplicate emit logic across two passes — parameterize one emitter over "per-class vs per-subgraph."
+- If the class-consistent subset (currently 216 of 218 variants) ships before the two Qwen3 stragglers land via A.2's `(class_idx, impl_id)` tolerance, the emitter needs to fall back to the old per-subgraph path for them. Don't let the code duplicate emit logic across two passes — parameterize one emitter over "per-class vs per-subgraph."
 - Runtime perf — if codegen can no longer bake the layer index as a literal, `ctx.kv_cache.k_cache(layer)` becomes an indirect indexed fetch. Trivial cost next to kernel launch latency, but measure once on llama-2-7b via `vllm bench latency` before calling it done.
 - `vllm chat` (with `timeout`, per your memory) is the correctness gate. Type checks and unit tests don't prove inference correctness.
 

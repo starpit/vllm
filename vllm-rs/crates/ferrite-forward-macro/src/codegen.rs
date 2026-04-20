@@ -2558,6 +2558,175 @@ pub(crate) fn summarize_class_edges(fuf: &Fuf, sfuf: &Assignment) -> String {
     )
 }
 
+/// Class-level emission schedule derived from a `StencilBundle`.
+///
+/// The collapsed emitter (STENCIL_IR_V2_DESIGN.md §13 6.2.b.5) walks
+/// this instead of the wave schedule. Per §13:
+///
+/// - `pre_loop`: period-1 classes whose member produces data the
+///   periodic group consumes. Emitted ahead of the `for __repeat`
+///   loop. Typically the embed / initial-residual path.
+/// - `periodic`: classes with period ≥ 2, in intra-iter topological
+///   order (Δrepeat=0 edges only). Emitted inside one
+///   `for __repeat in 0..max_period` loop body with per-class
+///   `(offset, period)` guards when periods differ.
+/// - `post_loop`: period-1 classes downstream of the periodic group.
+///   Emitted after the loop. Typically the final rmsnorm + lm_head.
+/// - `carried`: edges with Δrepeat ≥ 1 — the loop-carried state
+///   (residual stream, kv cache rewinds). Each entry becomes a
+///   `let mut` declared before the loop, read at the top of the
+///   body, written at the bottom.
+///
+/// Analysis-only. No emission, no token output. Consumed by the
+/// collapsed emitter in a follow-up commit.
+#[derive(Debug, Clone)]
+struct ClassSchedule {
+    pre_loop: Vec<usize>,
+    periodic: Vec<usize>,
+    post_loop: Vec<usize>,
+    carried: Vec<ClassEdge>,
+    /// Max period across `periodic` classes — the loop bound.
+    /// `0` when `periodic` is empty (degenerate forward, no repeat).
+    max_period: usize,
+    /// `true` iff every class in `periodic` shares `max_period`.
+    /// When `false`, the emitter needs per-class guards (§13 p1).
+    uniform_period: bool,
+    /// `true` iff every edge that crosses classes is uniform per
+    /// class pair (matches `summarize_class_edges` non_uniform_pairs
+    /// == 0). The collapsed emitter refuses non-uniform pairs today.
+    uniform_pairs: bool,
+    /// `true` iff every periodic class picked one impl across its
+    /// members — i.e. `class_impl_id[c].is_some()` for every c in
+    /// `periodic`. Heterogeneous periodic classes (Qwen3 §A.2) need
+    /// the impl-table dispatch deferred to 6.2.b.5e.
+    homogeneous_periodic: bool,
+}
+
+impl StencilBundle {
+    /// Compute the class-level emission schedule.
+    ///
+    /// Steps:
+    /// 1. Build an intra-iter class DAG from Δrepeat=0 edges.
+    /// 2. Kahn-topo-sort. Stable by class index on ties.
+    /// 3. Split period-1 classes at the boundary of the periodic
+    ///    group: a period-1 class appearing before any periodic
+    ///    member in topo order is `pre_loop`; after, `post_loop`.
+    /// 4. Collect Δrepeat ≥ 1 edges as `carried`.
+    /// 5. Flag period uniformity + pair uniformity + homogeneity.
+    fn schedule(&self, fuf: &Fuf, sfuf: &Assignment) -> ClassSchedule {
+        let n = self.class_members.len();
+        let edges = self.class_edges(fuf, sfuf);
+
+        // Intra-iter adjacency (Δrepeat=0). `pred_count[c]` is how
+        // many distinct producer classes c depends on at Δ=0.
+        let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+        let mut succs: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+        for e in &edges {
+            if e.delta_repeat() == 0 && e.consumer_class != e.producer_class {
+                preds[e.consumer_class].insert(e.producer_class);
+                succs[e.producer_class].insert(e.consumer_class);
+            }
+        }
+
+        // Kahn's algorithm. Ties broken by class index for
+        // determinism across rebuilds.
+        let mut in_deg: Vec<usize> = preds.iter().map(|p| p.len()).collect();
+        let mut ready: BTreeSet<usize> = (0..n).filter(|&c| in_deg[c] == 0).collect();
+        let mut topo: Vec<usize> = Vec::with_capacity(n);
+        while let Some(&c) = ready.iter().next() {
+            ready.remove(&c);
+            topo.push(c);
+            for &s in &succs[c] {
+                in_deg[s] -= 1;
+                if in_deg[s] == 0 {
+                    ready.insert(s);
+                }
+            }
+        }
+        // If topo is short, the Δ=0 subgraph has a cycle — can't
+        // legally collapse. Fall through with whatever we got; the
+        // caller's `uniform_pairs` check surfaces the problem.
+        if topo.len() != n {
+            for c in 0..n {
+                if !topo.contains(&c) {
+                    topo.push(c);
+                }
+            }
+        }
+
+        // Partition: first find the topo index of the earliest and
+        // latest periodic class. Period-1 classes topo-before the
+        // earliest periodic go pre-loop; topo-after the latest go
+        // post-loop; in-between period-1 classes also go pre-loop
+        // (they don't depend on loop output, just on pre-loop or
+        // other period-1 classes, and emitting them pre-loop keeps
+        // the loop body minimal).
+        let periods: Vec<usize> = self.class_members.iter().map(|m| m.len()).collect();
+        let first_periodic_topo = topo.iter().position(|&c| periods[c] >= 2);
+        let last_periodic_topo = topo.iter().rposition(|&c| periods[c] >= 2);
+
+        let mut pre_loop: Vec<usize> = Vec::new();
+        let mut periodic: Vec<usize> = Vec::new();
+        let mut post_loop: Vec<usize> = Vec::new();
+        for (pos, &c) in topo.iter().enumerate() {
+            if periods[c] >= 2 {
+                periodic.push(c);
+                continue;
+            }
+            match (first_periodic_topo, last_periodic_topo) {
+                (Some(first), Some(last)) => {
+                    if pos < first {
+                        pre_loop.push(c);
+                    } else if pos > last {
+                        post_loop.push(c);
+                    } else {
+                        // Period-1 class interleaved with periodic
+                        // group. Hoist to pre_loop — its outputs
+                        // feed inside the loop as constants, and it
+                        // doesn't itself need to run per-iteration.
+                        pre_loop.push(c);
+                    }
+                }
+                // No periodic classes at all — everything is pre-loop.
+                _ => pre_loop.push(c),
+            }
+        }
+
+        let carried: Vec<ClassEdge> = edges
+            .iter()
+            .filter(|e| e.delta_repeat() >= 1)
+            .copied()
+            .collect();
+
+        let max_period = periodic.iter().map(|&c| periods[c]).max().unwrap_or(0);
+        let uniform_period = periodic.iter().all(|&c| periods[c] == max_period);
+
+        // Pair-uniformity: each (consumer_class, producer_class)
+        // pair emits exactly one Δrepeat across its edges.
+        let mut pair_deltas: BTreeMap<(usize, usize), BTreeSet<i64>> = BTreeMap::new();
+        for e in &edges {
+            pair_deltas
+                .entry((e.consumer_class, e.producer_class))
+                .or_default()
+                .insert(e.delta_repeat());
+        }
+        let uniform_pairs = pair_deltas.values().all(|set| set.len() == 1);
+
+        let homogeneous_periodic = periodic.iter().all(|&c| self.class_impl_id[c].is_some());
+
+        ClassSchedule {
+            pre_loop,
+            periodic,
+            post_loop,
+            carried,
+            max_period,
+            uniform_period,
+            uniform_pairs,
+            homogeneous_periodic,
+        }
+    }
+}
+
 /// Decide whether a subgraph's emit can be pulled out into a
 /// reusable fragment fn.
 ///
@@ -3079,18 +3248,24 @@ fn emit_forward_collapsed_bucket(
     _weight_layout: &crate::emit::WeightLayout,
 ) -> TokenStream {
     let stencil = StencilBundle::compute(fuf, sfuf);
+    let sched = stencil.schedule(fuf, sfuf);
     let num_classes = stencil.class_members.len();
-    let max_period = stencil
-        .class_members
-        .iter()
-        .map(|m| m.len())
-        .max()
-        .unwrap_or(0);
     let homogeneous = stencil.homogeneous_count();
     let msg = format!(
         "FERRITE_STENCIL_CODEGEN collapsed-mode emitter not yet implemented \
-         (classes={}, homogeneous={}, max_period={}); see STENCIL_IR_V2_DESIGN.md §13 6.2.b.5",
-        num_classes, homogeneous, max_period,
+         (classes={}, homogeneous={}, pre={} periodic={} post={} max_period={} \
+         uniform_period={} uniform_pairs={} homogeneous_periodic={} carried_edges={}); \
+         see STENCIL_IR_V2_DESIGN.md §13 6.2.b.5",
+        num_classes,
+        homogeneous,
+        sched.pre_loop.len(),
+        sched.periodic.len(),
+        sched.post_loop.len(),
+        sched.max_period,
+        sched.uniform_period,
+        sched.uniform_pairs,
+        sched.homogeneous_periodic,
+        sched.carried.len(),
     );
     let fn_name = bucket_fn_ident("forward_m", wp);
     quote! {

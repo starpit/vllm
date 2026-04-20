@@ -2386,6 +2386,16 @@ fn emit_forward_for_bucket(
         .unwrap_or_else(|| quote! { unreachable!("empty FUF") });
 
     let fn_name = bucket_fn_ident("forward_m", wp);
+
+    let impl_names: String = loop_ir
+        .waves
+        .iter()
+        .flat_map(|w| w.subgraphs.iter())
+        .map(|(_, imp_id)| lib.get(*imp_id).name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let impl_names_lit = proc_macro2::Literal::string(&impl_names);
+
     quote! {
         /// Forward pass for this model × workload bucket. Walks
         /// the solver-picked kernels in wavefront order.
@@ -2400,6 +2410,12 @@ fn emit_forward_for_bucket(
             ctx: &::ferrite_forward::ForwardCtx,
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            ::tracing::debug!(
+                m = ctx.input_ids.shape()[0],
+                sk = ctx.max_seqlen_k,
+                impls = #impl_names_lit,
+                "ferrite forward"
+            );
             #(#body)*
             #last_output
         }
@@ -2463,6 +2479,17 @@ fn emit_forward_backbone_for_bucket(
     );
 
     let fn_name = bucket_fn_ident("forward_backbone_m", wp);
+
+    let bb_impl_names: String = loop_ir
+        .waves
+        .iter()
+        .flat_map(|w| w.subgraphs.iter())
+        .filter(|(sg, _)| Some(*sg) != Some(terminal_sg))
+        .map(|(_, imp_id)| lib.get(*imp_id).name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bb_impl_names_lit = proc_macro2::Literal::string(&bb_impl_names);
+
     quote! {
         /// Backbone-only forward (no lm_head). Returns the output
         /// that would have been the final gemm's input — a freshly-
@@ -2479,6 +2506,12 @@ fn emit_forward_backbone_for_bucket(
             ctx: &::ferrite_forward::ForwardCtx,
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            ::tracing::debug!(
+                m = ctx.input_ids.shape()[0],
+                sk = ctx.max_seqlen_k,
+                impls = #bb_impl_names_lit,
+                "ferrite forward_backbone"
+            );
             #(#body)*
             let __bb_view = unsafe { (*#backbone_ident).as_view() };
             let __bb_shape_u32: &[u32] = __bb_view.shape();

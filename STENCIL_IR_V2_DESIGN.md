@@ -326,10 +326,11 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 ## 13. Status & handoff (2026-04-20)
 
-**Branch**: `worktree-ff3`. Three commits on top of `0ab1aad98`:
+**Branch**: `worktree-ff3`. Four commits on top of `0ab1aad98`:
 - `aef01d8ca` — IR + subtile + region_formation + periodicity + CollapsePlan
 - `420a71690` — class→impl consistency checker + FormedRegions refactor
 - `5f3e96cd5` — neighbor-aware canonical hash; 23 → 2 heterogeneous variants
+- `db9c13847` — `StencilBundle` plumbed through emit_wave_walk / emit_subgraph. Scaffolding only; no emission change.
 
 **What builds**: everything. `cargo build -p ferrite-models --release` exercises all 218 model variants through the full pipeline. Stencil diagnostic prints alongside each variant's ferrite line (see "stencil · N regions → N classes" entries).
 
@@ -356,12 +357,33 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
    Resolution: this is the case the step-6 codegen pivot needs to handle via *heterogeneity tolerance* (not solver constraint). A class that picks two impls emits two fragment bodies keyed by `(class_idx, impl_id)`; the call site dispatches per-iteration using a small indirection table the solver already has (`region_subgraphs[rid] → impl_id`). Cost: two fragments instead of one for that class only. Every other class in the variant keeps its single-fragment collapse.
 
-**(B) Step 6 — Rust codegen pivot.** Biggest work item. Structure:
-1. Move fragment emission to be class-indexed rather than subgraph-indexed. Today `codegen.rs::emit_model`'s `FragmentLibrary` dedups by stringified abstract body; post-pivot, dedup happens structurally at Region-formation time via `canonical_hash_with_neighbors`. The library keying changes from string → `class_idx` (or `(class_idx, impl_id)` for the A.2 heterogeneity case).
-2. Emit one fragment body per (class, workload_point, Impl). Call site wraps in `for _repeat in 0..PERIOD { ... }` over the class's period.
-3. Per-iteration state (layer index, kv_cache slot) needs to flow as a loop variable into the fragment. **This is where §6.2 "literal lifting" becomes real** — the Impl's `emit_call` must replace baked layer literals with the loop variable. Bounded to 3–5 impls (`FusedQkvRope*`, `AttentionViaCache*`, `RopeAppendRef*`, `SlidingAttention*`).
+**(B) Step 6 — Rust codegen pivot.** Biggest work item. Sub-step status:
 
-Suggested approach: keep today's unrolled emitter as the default; gate the pivot behind `--cfg stencil_codegen` or an env var so A/B comparison is easy. Land per-family: do llama first (all variants clean per step 5), validate with `vllm chat`, then extend to archs that pass consistency, tackle Qwen3 with the A.2 tolerance path.
+- **6.0 ✅ Plumbing (commit `db9c13847`)**: `StencilBundle` computed per workload bucket inside `emit_forward_for_bucket` / `emit_forward_backbone_for_bucket`; carries `class_of: HashMap<SubgraphId, usize>`, `class_impl_id: Vec<Option<ImplId>>` (None = heterogeneous), `class_members: Vec<Vec<SubgraphId>>`. Threaded through `emit_wave_walk` → `emit_subgraph` via an ignored `_stencil` param. Not yet consumed — next sub-steps read it.
+
+- **6.1 ⏳ Weights-struct per-layer arrays.** The big load-bearing piece. Today `emit_weights_struct` (codegen.rs line ~1050) emits one `pub attn_norm_0: RmsNorm, pub attn_norm_1: RmsNorm, …` field per layer and a matching per-field `let` in `load_with`. Call sites emit `&wm.attn_norm_3`. For a `for repeat in 0..N { … }` loop, we need `&wm.attn_norm[repeat]`. Three options considered (2026-04-20 discussion):
+  - (1) **True arrays** in struct + loader builds `[RmsNorm; N]`. Cleanest; changes three build-up vecs (`fields`, `lets`, `field_shorthand`) + the constructor shape. Loader body stays per-layer — array assembly is `let attn_norm = [attn_norm_0, attn_norm_1, …];` after the existing per-layer lets, with the flat lets consumed into it.
+  - (2) **Accessor methods** — keep flat fields, add `fn attn_norms(&self) -> [&RmsNorm; N]` per family. Minimal loader change; LLVM should inline. Less clean but bounded.
+  - (3) **Inline `match repeat { … }`** at call site. No struct change. Biggest LLVM-visible cost — loses most of the compile-time win and risks runtime regression per §12.
+  User preference expressed: "cleanest" → (1). Implementation sketch:
+  1. After `collect_accessors`, run a family-detection pass: group accessors whose `name` matches `<stem>_<N>` for consecutive `N = 0..num_hidden_layers`, identical `rust_type`, and identical `FieldLoad` plan shape (same variant + identical structure modulo prefix index).
+  2. For each family emit `pub #stem: [#ty; N]` in the struct; skip the per-layer flat fields.
+  3. In the loader body, keep the per-layer `let #name = …` lines (unchanged from today — they're what actually load each layer's weight), and at the Self{} constructor append array assembly: `let #stem = [#stem_0, #stem_1, …, #stem_{N-1}];` then `#stem,` in the constructor (replacing the N flat field shorthands). For ungrouped accessors, today's path unchanged.
+  4. Accessor data model: add `family: Option<(Ident /* stem */, u64 /* index */)>` to `WeightAccessor`, populated at `default_required_weights` time when the source weight has `Some(index)`. Call-site weight-arg emission in `emit_subgraph` reads this: when `family.is_some()` and we're emitting a class loop, `&wm.#stem[#loop_var]`; else today's `&wm.#name`.
+
+- **6.2 ⏳ Class-loop call sites + literal lifting.** Once 6.1 lands:
+  - Rewrite `emit_wave_walk` to walk classes instead of subgraphs where possible: for each homogeneous class that intersects this bucket's wave schedule, emit one fragment body (abstract-emit via the class representative) and a call site `for __repeat in 0..#period { __frag_N(args_indexed_by___repeat); }`. Heterogeneous classes (Qwen3 A.2) fall back to per-subgraph emission — the bundle's `class_impl_id[c] == None` flag gates this.
+  - Tension with today's wave scheduler: waves interleave subgraphs across layers for parallelism (wave W may have layer 0's attn + layer 1's mlp). A class's members are therefore not contiguous in the emission order. Solutions:
+    (a) Emit the class loop at the first wave that mentions any class member; skip class members in later waves. Loses wave-parallelism across classes but preserves wave-parallelism within. Simplest.
+    (b) Re-plan waves to group-by-class — bigger refactor of schedule.rs.
+    (a) first; reassess if runtime regresses.
+  - Literal lifting: `#layer` inside `impl_lib.rs` is baked from `node.inputs` via `rope_kv_cache_layer(…)`. To accept a loop variable, the impl's `emit_call` needs a way to receive an override. Add a new field on `EmitCtx`: `repeat_var: Option<TokenStream>`. When `Some(tokens)`, emit_call substitutes `#tokens` for the concrete layer literal wherever it's derived from a `KvCache(layer)` input. Affected impls (per grep for `k_cache(#layer)` / `k_cache(#layer)` in impl_lib.rs): `FusedQkvRopeCacheImpl` (incl. `_fp8` + `_interleaved`), `AttentionViaCacheImpl`, `RopeAppendRef`, `SlidingAttentionImpl`. 3-5 impls, bounded.
+
+- **6.3 ⏳ Validation.** `vllm chat` on llama-2-7b (correctness gate, `timeout` wrapper per memory), `vllm bench latency` delta ≤ ~1% (runtime gate). Compare `cargo build -p vllm-cli --features cuda --release` wall time pre/post pivot.
+
+- **6.4 ⏳ Heterogeneous tolerance (Qwen3 A.2).** Emit N fragments keyed `(class_idx, impl_id)`; call site dispatches `match __repeat_impl_table[__repeat] { ImplId(3) => __frag_A(...), ImplId(37) => __frag_B(...) }`. Table filled from `stencil.class_members` + `assignment.impl_of(sg)` at macro time — baked into a `const TABLE: [u8; N]`.
+
+Suggested gating: `--cfg stencil_codegen` or `FERRITE_STENCIL_CODEGEN=1` env var. Keep today's unrolled emitter as default until 6.3 on llama is green; flip the default when all arches green.
 
 **(C) Delete the per-subgraph fragment dedup string machinery** once step 6 is confirmed. `FragmentLibrary::by_sig` keyed on `"ti=...|ci=...|wt=...|body=..."` becomes redundant — the new `class_idx` is the dedup key.
 

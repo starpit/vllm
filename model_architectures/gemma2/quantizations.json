@@ -1,3 +1,7 @@
 {
-  "quantizations": ["gptq-sym", "fp8-dynamic-per-tensor"]
+  "quantizations": [
+    "gptq-sym",
+    "fp8-dynamic-per-tensor",
+    "fp8-static-per-tensor"
+  ]
 }

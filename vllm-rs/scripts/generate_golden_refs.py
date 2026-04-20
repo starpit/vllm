@@ -100,6 +100,22 @@ MODELS = {
     "gemma3_1b_fp8_dynamic": "RedHatAI/gemma-3-1b-it-FP8-dynamic",
     "granite_3_1_2b_fp8_dynamic": "RedHatAI/granite-3.1-2b-instruct-FP8-dynamic",
     "mistral_7b_v03_fp8_dynamic": "nm-testing/Mistral-7B-Instruct-v0.3-FP8-Dynamic",
+    # FP8 static-per-tensor (Slice 2) — pre-calibrated `input_scale`
+    # baked into the checkpoint. Same kernels as dynamic; the
+    # `Fp8Linear::forward` branch on `input_scale` presence selects
+    # the `cutlass_scaled_mm` static epilogue instead of the
+    # per-token dynamic quant kernel. Fingerprint disambiguation
+    # keys off the on-disk `.input_scale` tensor to pick between the
+    # two compiled variants. `gemma-2-2b-it-FP8` and
+    # `Llama-3.2-1B-Instruct-FP8` ship the compressed-tensors shape
+    # (`quant_method: "compressed-tensors"`, `dynamic: false`);
+    # `Qwen2-1.5B-Instruct-FP8` and `Mistral-7B-Instruct-v0.3-FP8`
+    # ship the native `quant_method: "fp8"` shape — parser handles
+    # both.
+    "qwen2_1_5b_fp8_static": "RedHatAI/Qwen2-1.5B-Instruct-FP8",
+    "llama_3_2_1b_fp8_static": "RedHatAI/Llama-3.2-1B-Instruct-FP8",
+    "gemma2_2b_fp8_static": "RedHatAI/gemma-2-2b-it-FP8",
+    "mistral_7b_v03_fp8_static": "RedHatAI/Mistral-7B-Instruct-v0.3-FP8",
     # Phi-3-mini-4k-instruct — `Phi3ForCausalLM`, dense bf16, MHA,
     # no LongRoPE. Matches `TestModels::PHI3_MINI_4K_CUDA`. First
     # ferrite arch with packed on-disk weights (`qkv_proj`,
@@ -167,6 +183,10 @@ def generate_for_model(model_id: str, output_key: str):
     kwargs = {"model": model_id, "max_model_len": 2048}
     if is_fp8:
         kwargs["enforce_eager"] = True
+        # Ferrite defaults to FlashInfer for FP8; match that in the
+        # golden so the top-N comparison isn't backend-skewed.
+        # Replaces the retired `VLLM_ATTENTION_BACKEND` env var.
+        kwargs["attention_backend"] = "FLASHINFER"
     llm = LLM(**kwargs)
     tokenizer = llm.get_tokenizer()
 

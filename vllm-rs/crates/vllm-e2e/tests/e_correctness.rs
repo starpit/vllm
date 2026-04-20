@@ -12,7 +12,7 @@
 #![cfg(feature = "e2e")]
 
 use vllm_e2e::assertions::{
-    check_logprobs_close, check_logprobs_close_with_threshold, extract_engine_output,
+    check_logprobs_close_with_threshold, extract_engine_output,
     load_golden_refs,
 };
 use vllm_e2e::{Client, TestModels, TestServer};
@@ -342,6 +342,73 @@ async fn test_cuda_correctness_mistral_7b_v03_fp8_dynamic() {
     run_correctness_test_with_threshold(
         TestModels::MISTRAL_7B_V03_FP8,
         "mistral_7b_v03_fp8_dynamic",
+        1,
+    )
+    .await;
+}
+
+// FP8 static-per-tensor (Slice 2) — same Impl family as the
+// dynamic tests above; the on-disk `.input_scale` tensor drives the
+// fingerprint disambiguation between the two variants, and
+// `Fp8Linear::forward` branches on `input_scale.is_some()` to use
+// the pre-calibrated static CUTLASS scaled_mm epilogue instead of
+// the per-token dynamic quant kernel. Same threshold=1 rationale:
+// position-0 must match (catches loading / shape / dispatch bugs)
+// while the shared cutlass-mode ULP drift eventually flips argmax.
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_qwen2_1_5b_fp8_static() {
+    // `RedHatAI/Qwen2-1.5B-Instruct-FP8`: `quant_method: "fp8"` +
+    // `activation_scheme: "static"`. Exercises the native-FP8
+    // parser arm (vs compressed-tensors).
+    run_correctness_test_with_threshold(
+        TestModels::QWEN2_1_5B_FP8_STATIC,
+        "qwen2_1_5b_fp8_static",
+        1,
+    )
+    .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_llama_3_2_1b_fp8_static() {
+    // `RedHatAI/Llama-3.2-1B-Instruct-FP8`: compressed-tensors
+    // `type: "float"`, `num_bits: 8`, `input_activations.dynamic: false`.
+    // Exercises the CT parser arm mapping to `Fp8 { scheme: Static }`.
+    run_correctness_test_with_threshold(
+        TestModels::LLAMA_3_2_1B_FP8_STATIC,
+        "llama_3_2_1b_fp8_static",
+        1,
+    )
+    .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_gemma2_2b_fp8_static() {
+    // `RedHatAI/gemma-2-2b-it-FP8`: compressed-tensors per-tensor
+    // static on top of Gemma2's GELU MLP + softcap + alternating
+    // sliding/full attention.
+    run_correctness_test_with_threshold(
+        TestModels::GEMMA2_2B_FP8_STATIC,
+        "gemma2_2b_fp8_static",
+        1,
+    )
+    .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_mistral_7b_v03_fp8_static() {
+    // `RedHatAI/Mistral-7B-Instruct-v0.3-FP8`: native `quant_method:
+    // "fp8"` static. 7B dense Mistral through the static-FP8 path.
+    run_correctness_test_with_threshold(
+        TestModels::MISTRAL_7B_V03_FP8_STATIC,
+        "mistral_7b_v03_fp8_static",
         1,
     )
     .await;

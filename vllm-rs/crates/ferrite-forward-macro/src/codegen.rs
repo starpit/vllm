@@ -842,6 +842,45 @@ fn emit_fingerprint_check(
         _ => quote! {},
     };
 
+    // FP8 `activation_scheme` disambiguation. Overlay fan-out may
+    // synthesize both `fp8-dynamic-per-tensor` and
+    // `fp8-static-per-tensor` variants for a single dense base; they
+    // share the same `.weight_scale` suffix gate above. The on-disk
+    // signal that actually distinguishes them is the per-projection
+    // `.input_scale` tensor — neuralmagic / RedHatAI static FP8
+    // checkpoints carry it (it's the pre-calibrated per-tensor
+    // activation scale), dynamic checkpoints omit it. Without this
+    // disambiguation the alphabetically-earlier dynamic variant
+    // would win for a static checkpoint and `Fp8Linear::forward`
+    // would fall into the per-token dynamic-quant path instead of
+    // the pre-calibrated static path.
+    let input_scale_disambiguation: TokenStream =
+        match model.quantization.as_ref().map(|qc| &qc.method) {
+            Some(crate::quantization::QuantMethod::Fp8 {
+                scheme: crate::quantization::Fp8ActivationScheme::Static,
+                block_size: None,
+            }) => {
+                let input_scale_tensor = "model.layers.0.self_attn.q_proj.input_scale";
+                quote! {
+                    if !gw.contains(#input_scale_tensor) {
+                        return false;
+                    }
+                }
+            }
+            Some(crate::quantization::QuantMethod::Fp8 {
+                scheme: crate::quantization::Fp8ActivationScheme::Dynamic,
+                block_size: None,
+            }) => {
+                let input_scale_tensor = "model.layers.0.self_attn.q_proj.input_scale";
+                quote! {
+                    if gw.contains(#input_scale_tensor) {
+                        return false;
+                    }
+                }
+            }
+            _ => quote! {},
+        };
+
     quote! {
         /// Return `true` iff the tensors in `gw` match this
         /// variant's compile-time fingerprint. See
@@ -890,6 +929,7 @@ fn emit_fingerprint_check(
             }
             #qweight_shape_gate
             #g_idx_disambiguation
+            #input_scale_disambiguation
             #max_pos_check
             #rope_scaling_check
             #rope_scaling_hash_check

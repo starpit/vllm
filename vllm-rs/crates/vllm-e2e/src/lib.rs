@@ -306,6 +306,17 @@ impl TestModels {
     pub const GRANITE_3_1_2B_FP8: &str = "RedHatAI/granite-3.1-2b-instruct-FP8-dynamic";
     pub const MISTRAL_7B_V03_FP8: &str = "nm-testing/Mistral-7B-Instruct-v0.3-FP8-Dynamic";
 
+    // FP8 static-per-tensor (Slice 2) — pre-calibrated per-tensor
+    // `input_scale` baked into the checkpoint. Ferrite's
+    // `Fp8Linear::forward` branches on `input_scale` presence to
+    // select the static CUTLASS epilogue. Four arches covered by
+    // available HF repos; others (qwen3-0.6b, gemma3-1b, granite-3.1-2b)
+    // lack small-size static-FP8 checkpoints upstream.
+    pub const QWEN2_1_5B_FP8_STATIC: &str = "RedHatAI/Qwen2-1.5B-Instruct-FP8";
+    pub const LLAMA_3_2_1B_FP8_STATIC: &str = "RedHatAI/Llama-3.2-1B-Instruct-FP8";
+    pub const GEMMA2_2B_FP8_STATIC: &str = "RedHatAI/gemma-2-2b-it-FP8";
+    pub const MISTRAL_7B_V03_FP8_STATIC: &str = "RedHatAI/Mistral-7B-Instruct-v0.3-FP8";
+
     // FP8 MoE models (CUDA-backend, SM89+)
     // 2-layer Mixtral 8x7B FP8 (~3GB) — small enough for single L40S
     pub const MIXTRAL_8X7B_FP8_2L: &str = "fxmarty/Mixtral-8x7B-Instruct-v0.1-FP8-KV-2-layers";

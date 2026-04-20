@@ -1,3 +1,7 @@
 {
-  "quantizations": ["bnb-nf4-dq", "fp8-dynamic-per-tensor"]
+  "quantizations": [
+    "bnb-nf4-dq",
+    "fp8-dynamic-per-tensor",
+    "fp8-static-per-tensor"
+  ]
 }

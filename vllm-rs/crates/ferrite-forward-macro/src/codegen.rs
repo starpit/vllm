@@ -2485,6 +2485,7 @@ fn emit_subgraph(
             locals,
             mode: EmitMode::Concrete,
             weight_layout: Some(weight_layout),
+            repeat_var: None,
         };
         return imp.emit_call(&ctx);
     }
@@ -2575,6 +2576,14 @@ fn emit_subgraph(
         // Still thread it for symmetry with Concrete and to keep
         // future fragment-local rewrites straightforward.
         weight_layout: Some(weight_layout),
+        // Fragment bodies are per-class, shape-stable; baking the
+        // concrete layer literal here would defeat the whole
+        // point, so every `ctx.layer_expr(_)` in the abstract
+        // body goes through the loop variable whenever this ctx
+        // is used for class-loop emission. 6.2.a keeps the old
+        // unrolled path hot, so None here matches today's
+        // behavior — 6.2.b wires a real Some(repeat_var).
+        repeat_var: None,
     };
     let abstract_body = imp.emit_call(&abstract_ctx);
 

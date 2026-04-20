@@ -114,6 +114,19 @@ pub struct EmitCtx<'a> {
     /// `Weights`, and read sites must consult the layout to pick
     /// the right access form.
     pub weight_layout: Option<&'a WeightLayout>,
+    /// When `Some(tokens)`, this `EmitCtx` is emitting from inside
+    /// a class-loop (`for __repeat in 0..#N`) and every per-
+    /// iteration literal — today's concrete `k_cache(#layer)` /
+    /// `v_cache(#layer)` arguments and any weight-array indexer —
+    /// must substitute `#tokens` for the concrete integer it
+    /// would otherwise bake in. Impls that consume this via
+    /// [`EmitCtx::layer_expr`] get the right tokens without
+    /// knowing whether they're inside a loop.
+    ///
+    /// `None` is today's default: every per-layer literal is
+    /// baked as a u64 constant, matching the pre-pivot emission
+    /// that has been the runtime default since the macro existed.
+    pub repeat_var: Option<TokenStream>,
 }
 
 impl<'a> EmitCtx<'a> {
@@ -165,6 +178,26 @@ impl<'a> EmitCtx<'a> {
             None => quote! { #name },
         };
         quote! { wm.#access }
+    }
+
+    /// Tokens for a per-layer literal given its concrete u64 value.
+    ///
+    /// Returns `self.repeat_var` if set (meaning: we're inside a
+    /// class-loop body, so the concrete index is irrelevant — every
+    /// iteration re-evaluates against the loop variable). Otherwise
+    /// stringifies `concrete` as a `u64` literal — what today's
+    /// unrolled emitter has always done.
+    ///
+    /// Used by impls that reach into `ctx.kv_cache.k_cache(#layer)`
+    /// / `ctx.kv_cache.v_cache(#layer)` or similar, so a single
+    /// `emit_call` body can serve both the unrolled and the
+    /// class-loop lowerings without knowing which pass is running.
+    pub fn layer_expr(&self, concrete: u64) -> TokenStream {
+        if let Some(tokens) = &self.repeat_var {
+            return tokens.clone();
+        }
+        let lit = proc_macro2::Literal::u64_unsuffixed(concrete);
+        quote! { #lit }
     }
 
     /// Read a model-wide integer bound (e.g. `intermediate_size`,

@@ -186,6 +186,12 @@ fn cuda_build() {
     //    step 3c cuts over to the emitter's generated source.
     build_stencil_kernels(&cache_str, &mut rerun_files);
 
+    // 9. Kittens-based megakernel. Written by ferrite-forward-macro
+    //    to ~/.cache/cudaforge/kittens/<model>.cu. Compiled on sm_90a+
+    //    against ThunderKittens (env var THUNDERKITTENS_ROOT; falls back
+    //    to ~/ThunderKittens).
+    build_kittens_kernels(&cache_str, &mut rerun_files);
+
     for f in &rerun_files {
         let path = std::path::Path::new(f);
         if let Ok(canonical) = path.canonicalize() {
@@ -528,6 +534,85 @@ fn build_stencil_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
 
     rerun_files.extend(sources.iter().cloned());
     rerun_files.extend(watch.iter().cloned());
+}
+
+#[cfg(feature = "cuda")]
+fn build_kittens_kernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
+    // SM90a+ only — kittens::tma::load_async + warpgroup::mma_async
+    // both require Hopper.
+    let arch = detect_cuda_arch();
+    let arch_num: u32 = arch.parse().unwrap_or(89);
+    if arch_num < 90 {
+        return;
+    }
+
+    // Inputs: per-model .cu files written by the `#[forward]` macro
+    // in ferrite-forward-macro (calls ferrite_stencil::emit_kittens).
+    let kittens_cache = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("cudaforge/kittens");
+
+    let kittens_cus: Vec<String> = if kittens_cache.exists() {
+        std::fs::read_dir(&kittens_cache)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "cu"))
+            .map(|e| e.path().display().to_string())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    if kittens_cus.is_empty() {
+        eprintln!(
+            "ferrite-cuda-builder: no kittens .cu files in {:?}; skipping libkittens_kernels.a",
+            kittens_cache,
+        );
+        return;
+    }
+
+    // ThunderKittens include path. Respect THUNDERKITTENS_ROOT env
+    // var; fall back to ~/ThunderKittens. Fail the build with a
+    // clear message if neither works — TK is a hard dependency on
+    // sm_90a+, not optional.
+    let tk_root = std::env::var("THUNDERKITTENS_ROOT").unwrap_or_else(|_| {
+        dirs::home_dir()
+            .expect("no home dir")
+            .join("ThunderKittens")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let tk_include = format!("{tk_root}/include");
+    if !std::path::Path::new(&tk_include).exists() {
+        panic!(
+            "ThunderKittens not found at {tk_include}. Set THUNDERKITTENS_ROOT \
+             or clone https://github.com/HazyResearch/ThunderKittens to ~/ThunderKittens.",
+        );
+    }
+
+    cudaforge::KernelBuilder::new()
+        .out_dir(cache_dir)
+        .source_files(kittens_cus.clone())
+        .include_path(&tk_include)
+        .arg("-DKITTENS_HOPPER")
+        .arg("-DNDEBUG")
+        .arg("-std=c++20")
+        .arg("--expt-extended-lambda")
+        .arg("--expt-relaxed-constexpr")
+        .arg("--use_fast_math")
+        .arg("-Xcompiler=-fPIC")
+        .arg("-O3")
+        .arg("-lineinfo")
+        // SM_90a (the 'a' variant) — wgmma / TMA are sm_90a-only.
+        .arg("-gencode=arch=compute_90a,code=sm_90a")
+        .build_lib(format!("{cache_dir}/libkittens_kernels.a"))
+        .expect("failed to build kittens-based megakernel .cu files");
+
+    for cu in &kittens_cus {
+        rerun_files.push(cu.clone());
+    }
+    rerun_files.push(tk_include);
 }
 
 #[cfg(feature = "cuda")]

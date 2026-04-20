@@ -2003,6 +2003,7 @@ dependencies = [
 name = "ferrite-forward-macro"
 version = "0.1.0"
 dependencies = [
+ "dirs 5.0.1",
  "ferrite-stencil",
  "proc-macro2",
  "quote",

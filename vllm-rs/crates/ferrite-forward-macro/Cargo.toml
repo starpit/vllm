@@ -14,6 +14,7 @@ proc-macro2 = "1"
 serde_json = { workspace = true }
 rayon = { workspace = true }
 ferrite-stencil = { path = "../ferrite-stencil" }
+dirs = "5"
 
 [dev-dependencies]
 trybuild = "1"

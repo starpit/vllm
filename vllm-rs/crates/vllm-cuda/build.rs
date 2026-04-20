@@ -32,6 +32,14 @@ fn cuda_link() {
         println!("cargo:rustc-link-lib=static=megakernels");
     }
 
+    // Kittens-based megakernel .a (sm_90a+). Only present when the
+    // builder ran on H100+ hardware with THUNDERKITTENS_ROOT set.
+    // Skip link on lower arches so the build still succeeds there.
+    let kittens_lib = std::path::Path::new(&cache_str).join("libkittens_kernels.a");
+    if kittens_lib.exists() {
+        println!("cargo:rustc-link-lib=static=kittens_kernels");
+    }
+
     println!("cargo:rustc-link-lib=static=vllm_kernels");
     println!("cargo:rustc-link-lib=static=ggml_kernels");
     println!("cargo:rustc-link-lib=static=marlin_kernels");

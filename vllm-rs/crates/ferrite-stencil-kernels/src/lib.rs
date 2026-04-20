@@ -16,3 +16,10 @@
 mod ffi;
 #[cfg(feature = "cuda")]
 pub use ffi::*;
+
+/// Kittens-based megakernel FFI (sm_90a+). See `ffi_kittens` for the
+/// one-wrapper-per-region surface. These symbols only resolve when
+/// `libkittens_kernels.a` was compiled (builder detected sm_90a+ and
+/// `THUNDERKITTENS_ROOT` was set); callers must gate on runtime cc.
+#[cfg(feature = "cuda")]
+pub mod kittens;

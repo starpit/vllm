@@ -560,6 +560,24 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 }
                 Err(e) => format!("mega emit_err={e:?}"),
             };
+            // Kittens-based emit. Written to the cudaforge cache dir so
+            // `ferrite-cuda-builder`'s build.rs can compile it into
+            // `libkittens_kernels.a`. This is the real runtime megakernel
+            // path on sm_90a; `emit_megakernel` is kept for reference
+            // until it's fully replaced.
+            {
+                let kittens_src = ferrite_stencil::emit_kittens::emit_kittens(&report.mk);
+                let cache_dir = dirs::cache_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("cudaforge/kittens");
+                let _ = std::fs::create_dir_all(&cache_dir);
+                let cache_path = cache_dir.join(format!("{}.cu", model.source_stem));
+                let _ = std::fs::write(&cache_path, &kittens_src);
+                // Also dump to /tmp for hand inspection.
+                let inspect_path =
+                    format!("/tmp/ferrite-stencil/{}-kittens.cu", model.source_stem,);
+                let _ = std::fs::write(&inspect_path, &kittens_src);
+            }
             // Summarize skipped-impl names (unique, sorted) so the
             // next un-templated Impl is visible without grep.
             let mut skipped_names: Vec<&'static str> =

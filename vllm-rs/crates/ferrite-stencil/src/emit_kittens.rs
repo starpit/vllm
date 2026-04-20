@@ -58,6 +58,7 @@ pub fn emit_kittens(mega: &Megakernel) -> String {
             "residual_add" => write_residual_add_region(&mut out, region),
             "unary_inplace" => write_unary_inplace_region(&mut out, region),
             "embed" => write_embed_region(&mut out, region),
+            "gemm" => write_gemm_region(&mut out, region),
             _ => write_stub_region(&mut out, region),
         }
     }
@@ -409,6 +410,165 @@ fn write_embed_region(out: &mut String, _region: &Region) {
         "    embed_kernel<D><<<dim3(num_tokens), dim3(32), 0, stream>>>(g);",
     )
     .unwrap();
+    writeln!(out, "    return cudaGetLastError();").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// GEMM region: `C = A @ B`, tiled WGMMA over (m_tile, n_tile, k_tile).
+/// Single-warpgroup kernel — loader, WGMMA, and storer all fused into
+/// the same 4 warps. Not pipelined; later optimization can split into
+/// producer/consumer warpgroups for the 2-3x compute/load overlap
+/// Megakernels gets.
+///
+/// Tile dims are compile-time template params (`TM=64`, `TN=128`,
+/// `TK=64` for the bf16 m64n128k16 WGMMA variant). Total matrix dims
+/// are runtime — the kernel walks `K/TK` inner iterations per
+/// (m_tile, n_tile) block, accumulating into a `rt_fl<TM, TN>`
+/// register tile.
+fn write_gemm_region(out: &mut String, _region: &Region) {
+    writeln!(out, "// ── region: gemm ──").unwrap();
+    // WGMMA m64n*k16 bf16 fixes TM=64 per warpgroup. TN is the cols
+    // tiled per CTA; TK is the k-chunk per load (WGMMA's k=16 runs
+    // inside a TK-wide tile, so TK must be a multiple of 16). Single
+    // warpgroup (4 warps = 128 threads) does loader + mma + store —
+    // no producer/consumer split; pipelining is a later optimization.
+    writeln!(out, "template<int TN, int TK>").unwrap();
+    writeln!(out, "struct gemm_globals {{").unwrap();
+    writeln!(out, "    static constexpr int TM = 64;").unwrap();
+    writeln!(out, "    using a_tile_t = st_bf<TM, TK>;").unwrap();
+    writeln!(out, "    using b_tile_t = st_bf<TK, TN>;").unwrap();
+    writeln!(out, "    using c_tile_t = st_bf<TM, TN>;").unwrap();
+    // A: [M, K] row-major. B: [K, N]. C: [M, N]. All runtime dims so
+    // we can reuse the same emit for any tensor shape the stencil IR
+    // decides to drive.
+    writeln!(
+        out,
+        "    using a_gl_t = gl<bf16, -1, -1, -1, -1, a_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using b_gl_t = gl<bf16, -1, -1, -1, -1, b_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using c_gl_t = gl<bf16, -1, -1, -1, -1, c_tile_t>;"
+    )
+    .unwrap();
+    writeln!(out, "    a_gl_t A;").unwrap();
+    writeln!(out, "    b_gl_t B;").unwrap();
+    writeln!(out, "    c_gl_t C;").unwrap();
+    writeln!(out, "    uint32_t num_k_tiles;").unwrap();
+    writeln!(out, "}};").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "template<int TN, int TK>").unwrap();
+    // 128 threads = one warpgroup (4 warps × 32). warpgroup::mma
+    // requires a full warpgroup; accumulator is per-warp rt_fl<16, TN>
+    // — 4 warps × 16 rows cover TM=64.
+    writeln!(out, "__global__ __launch_bounds__(128, 1)").unwrap();
+    writeln!(
+        out,
+        "void gemm_kernel(const __grid_constant__ gemm_globals<TN, TK> g) {{"
+    )
+    .unwrap();
+    writeln!(out, "    constexpr int TM = 64;").unwrap();
+    writeln!(out, "    const int m_tile = blockIdx.x;").unwrap();
+    writeln!(out, "    const int n_tile = blockIdx.y;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    __shared__ st_bf<TM, TK> a_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TK, TN> b_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TM, TN> c_s;").unwrap();
+    writeln!(out, "    __shared__ semaphore sem_a, sem_b;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(out, "        init_semaphore(sem_a, 1);").unwrap();
+    writeln!(out, "        init_semaphore(sem_b, 1);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    rt_fl<16, TN> acc;").unwrap();
+    writeln!(out, "    kittens::warpgroup::zero(acc);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    for (uint32_t k_tile = 0; k_tile < g.num_k_tiles; ++k_tile) {{"
+    )
+    .unwrap();
+    writeln!(out, "        if (threadIdx.x == 0) {{").unwrap();
+    writeln!(out, "            tma::expect(sem_a, a_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(a_s, g.A, {{0, 0, (int)m_tile, (int)k_tile}}, sem_a);",
+    )
+    .unwrap();
+    writeln!(out, "            tma::expect(sem_b, b_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(b_s, g.B, {{0, 0, (int)k_tile, (int)n_tile}}, sem_b);",
+    )
+    .unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        wait(sem_a, k_tile & 1);").unwrap();
+    writeln!(out, "        wait(sem_b, k_tile & 1);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_AB(acc, a_s, b_s);").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    kittens::warpgroup::store(c_s, acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::sync(0);").unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(
+        out,
+        "        tma::store_async(g.C, c_s, {{0, 0, (int)m_tile, (int)n_tile}});",
+    )
+    .unwrap();
+    writeln!(out, "        tma::store_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    // Host launcher for a single GEMM shape — picks TM/TN/TK at compile
+    // time (bf16 WGMMA m64n128k16 natural tiles). A per-shape dispatch
+    // lands once the scheduler tells us which tile sizes to use.
+    writeln!(
+        out,
+        "extern \"C\" cudaError_t launch_gemm(cudaStream_t stream,",
+    )
+    .unwrap();
+    writeln!(out, "    const bf16* A, const bf16* B, bf16* C,").unwrap();
+    writeln!(out, "    uint32_t M, uint32_t N, uint32_t K) {{").unwrap();
+    writeln!(out, "    constexpr int TM = 64;").unwrap();
+    writeln!(out, "    constexpr int TN = 128;").unwrap();
+    writeln!(out, "    constexpr int TK = 64;").unwrap();
+    writeln!(out, "    (void)TM;").unwrap();
+    writeln!(
+        out,
+        "    if (M % 64 != 0 || N % TN != 0 || K % TK != 0) return cudaErrorInvalidValue;",
+    )
+    .unwrap();
+    writeln!(out, "    using globals_t = gemm_globals<TN, TK>;").unwrap();
+    writeln!(out, "    globals_t g{{").unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(A), (size_t)1, (size_t)1, (size_t)M, (size_t)K}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(B), (size_t)1, (size_t)1, (size_t)K, (size_t)N}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{C, (size_t)1, (size_t)1, (size_t)M, (size_t)N}},",
+    )
+    .unwrap();
+    writeln!(out, "        K / TK").unwrap();
+    writeln!(out, "    }};").unwrap();
+    writeln!(out, "    dim3 grid(M / 64, N / TN);").unwrap();
+    writeln!(out, "    gemm_kernel<TN, TK><<<grid, 128, 0, stream>>>(g);",).unwrap();
     writeln!(out, "    return cudaGetLastError();").unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();

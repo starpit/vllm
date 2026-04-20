@@ -36,10 +36,14 @@ mod emit;
 mod fuf;
 mod impl_lib;
 mod parse;
+mod periodicity;
+mod periodicity_plan;
 mod quantization;
+mod region_formation;
 mod schedule;
 mod shape;
 mod solver;
+mod subtile;
 mod target;
 mod viz_dump;
 mod weights_manifest;
@@ -503,6 +507,33 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             waves = max_waves,
             solve_ms = d_solve.as_millis(),
         );
+
+        // Stencil pipeline instrumentation (STENCIL_IR_V2_DESIGN.md steps 2-4).
+        // Runs the sub-tile → region-formation → periodicity pipeline on
+        // every SFUF at the first workload point for diagnostic printing.
+        // Zero effect on emitted code — pure measurement of where the
+        // collapse factor lands on real transformer graphs.
+        if let Some((_wp, sfuf)) = sfufs.per_workload.iter().next() {
+            let st = subtile::subtile(&model_fuf);
+            let rg = region_formation::form_regions(&st, sfuf);
+            let classes = periodicity::group_regions(&rg);
+            let plan = periodicity_plan::plan_collapse(&rg, &classes);
+            let sum = periodicity::summarize(&classes);
+            let factor = if plan.classes.is_empty() {
+                0.0
+            } else {
+                rg.regions.len() as f64 / plan.classes.len() as f64
+            };
+            eprintln!(
+                "    stencil · {regions:>4} regions → {classes:>3} classes ({factor:.1}× collapse) · control {ctrl_orig:>4} → {ctrl_new:>3} · max_period {max_period:>3}",
+                regions = rg.regions.len(),
+                classes = plan.classes.len(),
+                factor = factor,
+                ctrl_orig = rg.control.len(),
+                ctrl_new = plan.control.len(),
+                max_period = sum.max_period,
+            );
+        }
 
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
 

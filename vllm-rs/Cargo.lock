@@ -2004,11 +2004,13 @@ dependencies = [
 name = "ferrite-forward-macro"
 version = "0.1.0"
 dependencies = [
+ "ferrite-stencil-ir",
  "prettyplease",
  "proc-macro2",
  "quote",
  "rayon",
  "serde_json",
+ "smallvec",
  "syn",
  "trybuild",
 ]
@@ -2138,6 +2140,13 @@ dependencies = [
  "ferrite-model-phi3",
  "ferrite-model-qwen2",
  "ferrite-model-qwen3",
+]
+
+[[package]]
+name = "ferrite-stencil-ir"
+version = "0.1.0"
+dependencies = [
+ "smallvec",
 ]
 
 [[package]]

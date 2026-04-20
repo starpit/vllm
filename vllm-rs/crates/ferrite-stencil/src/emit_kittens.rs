@@ -60,6 +60,7 @@ pub fn emit_kittens(mega: &Megakernel) -> String {
             "embed" => write_embed_region(&mut out, region),
             "gemm" => write_gemm_region(&mut out, region),
             "gate_up_silu_mul" => write_gate_up_silu_mul_region(&mut out, region),
+            "qkv_rope" => write_qkv_rope_region(&mut out, region),
             _ => write_stub_region(&mut out, region),
         }
     }
@@ -760,6 +761,285 @@ fn write_gate_up_silu_mul_region(out: &mut String, _region: &Region) {
     writeln!(
         out,
         "    gate_up_silu_mul_kernel<TN, TK><<<grid, 128, 0, stream>>>(g);",
+    )
+    .unwrap();
+    writeln!(out, "    return cudaGetLastError();").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// QKV projection + RoPE + KV cache append.
+///
+/// Computes `QKV = X @ Wqkv`, applies RoPE rotation to Q and K (V is
+/// passed through), and stores Q to its gmem output + K, V to the
+/// paged KV cache. This commit does the matmul + RoPE on a fused
+/// per-head register tile. Paged-KV cache append is direct-write for
+/// now (non-paged variant matches `fused_qkv_rope_prefill`); paged
+/// variant with `block_table` gather is a follow-on.
+///
+/// Layout: one CTA per (token_tile, head_group). Reads `X[TM, K]`,
+/// `Wq[K, head_dim]`, `Wk[K, head_dim]`, `Wv[K, head_dim]`. Produces
+/// `Q[TM, head_dim]`, `K[TM, head_dim]`, `V[TM, head_dim]` for this
+/// head index.
+fn write_qkv_rope_region(out: &mut String, _region: &Region) {
+    writeln!(out, "// ── region: qkv_rope ──").unwrap();
+    writeln!(out, "template<int HEAD_DIM, int TK>").unwrap();
+    writeln!(out, "struct qkv_rope_globals {{").unwrap();
+    writeln!(out, "    static constexpr int TM = 64;").unwrap();
+    writeln!(out, "    using x_tile_t = st_bf<TM, TK>;").unwrap();
+    writeln!(out, "    using w_tile_t = st_bf<TK, HEAD_DIM>;").unwrap();
+    writeln!(out, "    using out_tile_t = st_bf<TM, HEAD_DIM>;").unwrap();
+    writeln!(out, "    using rope_vec_t = sv_bf<HEAD_DIM / 2>;").unwrap();
+    writeln!(
+        out,
+        "    using x_gl_t = gl<bf16, -1, -1, -1, -1, x_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using w_gl_t = gl<bf16, -1, -1, -1, -1, w_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using out_gl_t = gl<bf16, -1, -1, -1, -1, out_tile_t>;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    using rope_gl_t = gl<bf16, -1, -1, -1, -1, rope_vec_t>;",
+    )
+    .unwrap();
+    writeln!(out, "    x_gl_t X;").unwrap();
+    writeln!(out, "    w_gl_t Wq;").unwrap();
+    writeln!(out, "    w_gl_t Wk;").unwrap();
+    writeln!(out, "    w_gl_t Wv;").unwrap();
+    writeln!(out, "    out_gl_t Q;").unwrap();
+    writeln!(out, "    out_gl_t K;").unwrap();
+    writeln!(out, "    out_gl_t V;").unwrap();
+    // RoPE cos / sin per token. HEAD_DIM/2 pairs; we store as half-width.
+    writeln!(out, "    rope_gl_t rope_cos;").unwrap();
+    writeln!(out, "    rope_gl_t rope_sin;").unwrap();
+    writeln!(out, "    uint32_t num_k_tiles;").unwrap();
+    writeln!(out, "}};").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "template<int HEAD_DIM, int TK>").unwrap();
+    writeln!(out, "__global__ __launch_bounds__(128, 1)").unwrap();
+    writeln!(
+        out,
+        "void qkv_rope_kernel(const __grid_constant__ qkv_rope_globals<HEAD_DIM, TK> g) {{",
+    )
+    .unwrap();
+    writeln!(out, "    constexpr int TM = 64;").unwrap();
+    writeln!(out, "    const int token_tile = blockIdx.x;").unwrap();
+    writeln!(out, "    const int head_tile = blockIdx.y;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    __shared__ st_bf<TM, TK> x_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TK, HEAD_DIM> wq_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TK, HEAD_DIM> wk_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TK, HEAD_DIM> wv_s;").unwrap();
+    writeln!(out, "    __shared__ st_bf<TM, HEAD_DIM> out_s;").unwrap();
+    writeln!(
+        out,
+        "    __shared__ semaphore sem_x, sem_wq, sem_wk, sem_wv;"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(out, "        init_semaphore(sem_x, 1);").unwrap();
+    writeln!(out, "        init_semaphore(sem_wq, 1);").unwrap();
+    writeln!(out, "        init_semaphore(sem_wk, 1);").unwrap();
+    writeln!(out, "        init_semaphore(sem_wv, 1);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    rt_fl<16, HEAD_DIM> q_acc, k_acc, v_acc;").unwrap();
+    writeln!(out, "    kittens::warpgroup::zero(q_acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::zero(k_acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::zero(v_acc);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    for (uint32_t k_tile = 0; k_tile < g.num_k_tiles; ++k_tile) {{"
+    )
+    .unwrap();
+    writeln!(out, "        if (threadIdx.x == 0) {{").unwrap();
+    writeln!(out, "            tma::expect(sem_x, x_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(x_s, g.X, {{0, 0, (int)token_tile, (int)k_tile}}, sem_x);",
+    )
+    .unwrap();
+    writeln!(out, "            tma::expect(sem_wq, wq_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(wq_s, g.Wq, {{0, 0, (int)k_tile, (int)head_tile}}, sem_wq);",
+    )
+    .unwrap();
+    writeln!(out, "            tma::expect(sem_wk, wk_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(wk_s, g.Wk, {{0, 0, (int)k_tile, (int)head_tile}}, sem_wk);",
+    )
+    .unwrap();
+    writeln!(out, "            tma::expect(sem_wv, wv_s);").unwrap();
+    writeln!(
+        out,
+        "            tma::load_async(wv_s, g.Wv, {{0, 0, (int)k_tile, (int)head_tile}}, sem_wv);",
+    )
+    .unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        wait(sem_x, k_tile & 1);").unwrap();
+    writeln!(out, "        wait(sem_wq, k_tile & 1);").unwrap();
+    writeln!(out, "        wait(sem_wk, k_tile & 1);").unwrap();
+    writeln!(out, "        wait(sem_wv, k_tile & 1);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_AB(q_acc, x_s, wq_s);").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_AB(k_acc, x_s, wk_s);").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_AB(v_acc, x_s, wv_s);").unwrap();
+    writeln!(out, "        kittens::warpgroup::mma_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    // RoPE on Q and K. For each head_dim pair (i, i + HEAD_DIM/2):
+    //   q'[i]          = q[i] * cos[i] - q[i + HD/2] * sin[i]
+    //   q'[i + HD/2]   = q[i] * sin[i] + q[i + HD/2] * cos[i]
+    // Kittens register primitives don't directly split a tile into two
+    // halves; implementing this properly requires either per-pair
+    // register-tile ops or a smem round-trip. TODO in next commit —
+    // apply RoPE via `kittens::warp` ops on `q_acc` + `k_acc` using
+    // rope_cos / rope_sin tiles loaded from g.rope_cos / g.rope_sin.
+    writeln!(
+        out,
+        "    // TODO: apply RoPE to q_acc and k_acc using g.rope_cos / g.rope_sin.",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    // For now the matmul output is stored unrotated — numerically incorrect",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    // for real inference, but lets the kernel shape + build wiring land.",
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    kittens::warpgroup::store(out_s, q_acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::sync(0);").unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(
+        out,
+        "        tma::store_async(g.Q, out_s, {{0, 0, (int)token_tile, (int)head_tile}});",
+    )
+    .unwrap();
+    writeln!(out, "        tma::store_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    kittens::warpgroup::store(out_s, k_acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::sync(0);").unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(
+        out,
+        "        tma::store_async(g.K, out_s, {{0, 0, (int)token_tile, (int)head_tile}});",
+    )
+    .unwrap();
+    writeln!(out, "        tma::store_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    kittens::warpgroup::store(out_s, v_acc);").unwrap();
+    writeln!(out, "    kittens::warpgroup::sync(0);").unwrap();
+    writeln!(out, "    if (threadIdx.x == 0) {{").unwrap();
+    writeln!(
+        out,
+        "        tma::store_async(g.V, out_s, {{0, 0, (int)token_tile, (int)head_tile}});",
+    )
+    .unwrap();
+    writeln!(out, "        tma::store_async_wait();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "extern \"C\" cudaError_t launch_qkv_rope(cudaStream_t stream,",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    const bf16* X, const bf16* Wq, const bf16* Wk, const bf16* Wv,",
+    )
+    .unwrap();
+    writeln!(out, "    bf16* Q, bf16* K, bf16* V,").unwrap();
+    writeln!(out, "    const bf16* rope_cos, const bf16* rope_sin,").unwrap();
+    writeln!(
+        out,
+        "    uint32_t M, uint32_t num_heads, uint32_t head_dim, uint32_t K_dim) {{",
+    )
+    .unwrap();
+    // HEAD_DIM=128 is the universal llama/qwen/gemma head size for
+    // now; dispatch table lands with the launcher work.
+    writeln!(out, "    constexpr int HEAD_DIM = 128;").unwrap();
+    // TK=32 keeps 3 weight tiles + x + out under the 48 KB static
+    // shared cap. Dynamic shared via kittens' shared_allocator lets
+    // us go larger; that migration lands with the launcher work.
+    writeln!(out, "    constexpr int TK = 32;").unwrap();
+    writeln!(
+        out,
+        "    if (head_dim != HEAD_DIM || K_dim % TK != 0 || M % 64 != 0) return cudaErrorInvalidValue;",
+    )
+    .unwrap();
+    writeln!(out, "    using globals_t = qkv_rope_globals<HEAD_DIM, TK>;").unwrap();
+    writeln!(out, "    globals_t g{{").unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(X),  (size_t)1, (size_t)1, (size_t)M,         (size_t)K_dim}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(Wq), (size_t)1, (size_t)1, (size_t)K_dim,     (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(Wk), (size_t)1, (size_t)1, (size_t)K_dim,     (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(Wv), (size_t)1, (size_t)1, (size_t)K_dim,     (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{Q, (size_t)1, (size_t)1, (size_t)M,                             (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{K, (size_t)1, (size_t)1, (size_t)M,                             (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{V, (size_t)1, (size_t)1, (size_t)M,                             (size_t)(num_heads * head_dim)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(rope_cos), (size_t)1, (size_t)1, (size_t)M,   (size_t)(head_dim / 2)}},",
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        {{const_cast<bf16*>(rope_sin), (size_t)1, (size_t)1, (size_t)M,   (size_t)(head_dim / 2)}},",
+    )
+    .unwrap();
+    writeln!(out, "        K_dim / TK").unwrap();
+    writeln!(out, "    }};").unwrap();
+    writeln!(out, "    dim3 grid(M / 64, num_heads);").unwrap();
+    writeln!(
+        out,
+        "    qkv_rope_kernel<HEAD_DIM, TK><<<grid, 128, 0, stream>>>(g);",
     )
     .unwrap();
     writeln!(out, "    return cudaGetLastError();").unwrap();

@@ -2390,10 +2390,215 @@ impl StencilBundle {
             })
             .collect();
 
-        StencilBundle {
+        let bundle = StencilBundle {
             class_of,
             class_impl_id,
             class_members,
+        };
+        bundle.refine_by_edge_pattern(fuf, sfuf)
+    }
+
+    /// Iteratively split classes whose members observe different
+    /// Δrepeat patterns to a shared class — the precise condition
+    /// that drives `non_uniform_pairs` in the edge summary.
+    ///
+    /// Targeted refinement: the region-level 1-hop neighbour hash
+    /// in `group_regions` over-collapses some patterns (e.g. two
+    /// residual Add tiles per transformer layer, or two per-layer
+    /// RmsNorms, hashing to one class with period `2 × num_layers`).
+    /// That over-collapse shows up as at least one class-pair
+    /// (C, P) with multiple distinct Δrepeat values. For each such
+    /// pair, C's members (or P's) must be distinguishable by Δ,
+    /// otherwise the pair couldn't carry multiple Δs.
+    ///
+    /// Per-member signature: for every non-uniform pair touching
+    /// the member's class, the sorted multiset of
+    /// `(role [0=consumer-of-pair, 1=producer-of-pair], Δrepeat)`.
+    /// Uniform pairs are excluded from the signature — splitting on
+    /// those would fracture legitimate residual-stream classes
+    /// whose only asymmetry is "iter 0 reads pre-loop, iter ≥1
+    /// reads a carry", which the emitter's LoopCarry + PreLoop
+    /// provenance already handles.
+    ///
+    /// Partition-refinement: each iteration splits a class by
+    /// signature (monotone); stop when no split happens.
+    /// Re-computation of edges + pair uniformity after each split
+    /// is necessary because a class split may turn a previously-
+    /// non-uniform pair uniform (removing it from the signature)
+    /// or reveal fresh non-uniformity as producer classes
+    /// redistribute.
+    #[allow(clippy::type_complexity)]
+    fn refine_by_edge_pattern(mut self, fuf: &Fuf, sfuf: &Assignment) -> Self {
+        loop {
+            let edges = self.class_edges(fuf, sfuf);
+
+            // Collect distinct Δs per (consumer_class, producer_class)
+            // pair — the raw data the emitter's `uniform_pairs` check
+            // runs on. Pairs with |Δ set| ≥ 2 are the refinement
+            // offenders.
+            let mut pair_deltas: BTreeMap<(usize, usize), BTreeSet<i64>> = BTreeMap::new();
+            for e in &edges {
+                pair_deltas
+                    .entry((e.consumer_class, e.producer_class))
+                    .or_default()
+                    .insert(e.delta_repeat());
+            }
+            let non_uniform_pairs: BTreeSet<(usize, usize)> = pair_deltas
+                .iter()
+                .filter(|(_, deltas)| deltas.len() >= 2)
+                .map(|(k, _)| *k)
+                .collect();
+            if non_uniform_pairs.is_empty() {
+                break self;
+            }
+
+            // Per-member signature: for each non-uniform pair the
+            // member participates in, `(pair_index, role, edge_count)`.
+            // Role 0 = member is the consumer side of the pair, 1 =
+            // producer side. We count edges per (pair, role) rather
+            // than carrying Δrepeat directly: Δ-based signatures
+            // cascade-atomise when a producer class's split is what
+            // will eventually make the consumer's Δs uniform (e.g.
+            // qwen3's period-56 class 6 feeds period-28 class 7 with
+            // one edge per consumer at unique Δs — splitting by Δ on
+            // the consumer side over-splits it into 28 groups; the
+            // right fix is to split the producer first by "has edge
+            // / no edge" to the consumer, then the consumer's Δs
+            // naturally become uniform on re-compute).
+            //
+            // The edge-count signature still discriminates cleanly
+            // for the motivating case: for producer class P whose
+            // members' out-edges to consumer C are interleaved, half
+            // have count=1 and half have count=0 → 2 sub-classes.
+            // Once P splits, the next iteration re-evaluates and
+            // typically converges fast.
+            let pair_index: BTreeMap<(usize, usize), usize> = non_uniform_pairs
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (*k, i))
+                .collect();
+
+            // Per-member-index-within-class. `iter_of` recomputes
+            // from `class_members` order, which is what we set
+            // below, so it's the right invariant for this
+            // refinement pass.
+            let iter_of: HashMap<SubgraphId, usize> = self
+                .class_of
+                .keys()
+                .map(|&sg| (sg, self.iter_of(sg)))
+                .collect();
+
+            // Precompute period-ratio for each non-uniform pair
+            // where p_period % c_period == 0: this splits
+            // downsampling-style producer classes by
+            // (producer_iter % ratio). For qwen3's 56→28 pair it
+            // yields 2 sub-classes of 28 each, matching the
+            // within-period position (e.g. Q-norm vs K-norm).
+            let pair_ratio: BTreeMap<usize, usize> = non_uniform_pairs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &(c, p))| {
+                    let cp = self.class_members[c].len();
+                    let pp = self.class_members[p].len();
+                    if cp > 0 && pp > 0 && pp.is_multiple_of(cp) && pp / cp >= 2 {
+                        Some((i, pp / cp))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Signature value per (member, pair, role) is a (count,
+            // mod_group) tuple. `mod_group = 0` for roles where the
+            // ratio doesn't apply (consumer side, or non-integer-
+            // ratio pair). Producer side with an applicable ratio
+            // gets `member_iter % ratio`, so downsampling patterns
+            // split by within-period position even when every
+            // producer has the same edge count.
+            let mut sigs: HashMap<SubgraphId, BTreeMap<(usize, u8), (u32, u32)>> = HashMap::new();
+            for e in &edges {
+                let pair = (e.consumer_class, e.producer_class);
+                let Some(&pi) = pair_index.get(&pair) else {
+                    continue;
+                };
+                // Consumer side — no mod split.
+                {
+                    let entry = sigs
+                        .entry(e.consumer_sg)
+                        .or_default()
+                        .entry((pi, 0))
+                        .or_insert((0, 0));
+                    entry.0 += 1;
+                }
+                // Producer side — add mod_group when applicable.
+                let mod_group = pair_ratio
+                    .get(&pi)
+                    .map(|&r| (iter_of[&e.producer_sg] % r) as u32)
+                    .unwrap_or(0);
+                {
+                    let entry = sigs
+                        .entry(e.producer_sg)
+                        .or_default()
+                        .entry((pi, 1))
+                        .or_insert((0, mod_group));
+                    entry.0 += 1;
+                    // If two edges disagree on mod_group (shouldn't
+                    // happen — mod_group depends only on the
+                    // producer's own iter), keep the first.
+                }
+            }
+
+            // Group each class's members by signature. More than one
+            // group = split.
+            let mut new_members: Vec<Vec<SubgraphId>> = Vec::new();
+            let mut any_split = false;
+            for members in &self.class_members {
+                let mut groups: BTreeMap<Vec<((usize, u8), (u32, u32))>, Vec<SubgraphId>> =
+                    BTreeMap::new();
+                for &sg in members {
+                    let sig: Vec<((usize, u8), (u32, u32))> = sigs
+                        .get(&sg)
+                        .map(|m| m.iter().map(|(k, v)| (*k, *v)).collect())
+                        .unwrap_or_default();
+                    groups.entry(sig).or_default().push(sg);
+                }
+                if groups.len() > 1 {
+                    any_split = true;
+                }
+                for (_sig, g) in groups {
+                    new_members.push(g);
+                }
+            }
+            if !any_split {
+                break self;
+            }
+
+            // Sort new classes by the minimum SubgraphId in each for
+            // deterministic iteration.
+            new_members.sort_by_key(|m| m.iter().copied().min().unwrap_or(SubgraphId(u32::MAX)));
+
+            // Rebuild class_of + class_impl_id.
+            let mut new_class_of: HashMap<SubgraphId, usize> = HashMap::new();
+            let mut new_class_impl_id: Vec<Option<ImplId>> = Vec::with_capacity(new_members.len());
+            for (idx, members) in new_members.iter().enumerate() {
+                let mut impls: Vec<ImplId> =
+                    members.iter().filter_map(|&sg| sfuf.impl_of(sg)).collect();
+                impls.sort();
+                impls.dedup();
+                new_class_impl_id.push(if impls.len() == 1 {
+                    Some(impls[0])
+                } else {
+                    None
+                });
+                for &sg in members {
+                    new_class_of.insert(sg, idx);
+                }
+            }
+            self = StencilBundle {
+                class_of: new_class_of,
+                class_impl_id: new_class_impl_id,
+                class_members: new_members,
+            };
         }
     }
 

@@ -353,11 +353,67 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 **What's landed**: 6.1, 6.2.a, 6.2.b.1–4, 6.2.b.5a–e (collapsed
 emitter), 6.2.b.5f (p1 period-mismatch offsets), 6.2.b.5g (multi-
-output periodic classes). `cargo check -p ferrite-models
---features cuda` with `FERRITE_STENCIL_CODEGEN=1` is clean across
-all 218 variants; collapsed path fires on 3 commandr variants
-(degenerate empty-loop). Every other variant hits `unimplemented!()`
-with a specific refusal reason.
+output periodic classes), 6.2.b.5j (edge-pattern-driven class
+refinement — see below). `cargo check -p ferrite-models --features
+cuda` with `FERRITE_STENCIL_CODEGEN=1` is clean across all 218
+variants; collapsed path fires on 3 commandr variants (degenerate
+empty-loop). Every other variant hits `unimplemented!()` with a
+specific refusal reason.
+
+**6.2.b.5j — edge-pattern class refinement (landed 2026-04-21).**
+The region-level 1-hop neighbour hash over-collapses patterns like
+"two residual-Add tiles per transformer layer" (post-attention +
+post-MLP) into one class of period `2 × num_layers`. The
+over-collapse surfaces as `non_uniform_pairs=true` in the stencil
+edge summary: the same class-pair (C, P) carries multiple distinct
+Δrepeat values because members of C feed different producer-iter
+offsets of P.
+
+Fix lives in `StencilBundle::refine_by_edge_pattern` — iterative
+partition refinement driven by the actual edge non-uniformity:
+
+1. Compute class-pair Δ histograms; pairs with |Δ-set| ≥ 2 are
+   "non-uniform offenders".
+2. Per-member signature touches ONLY the non-uniform pair edges
+   (uniform pairs contribute nothing — splitting on them would
+   fracture legitimate residual-stream classes whose only asymmetry
+   is "iter 0 reads pre-loop, iter ≥1 reads a carry", which the
+   emitter's LoopCarry + PreLoop provenance already handles).
+3. Signature is `(pair_index, role, edge_count, iter_mod_ratio)`:
+   - `edge_count` splits producers where half have an outgoing edge
+     to a consumer class and half don't (the binary case).
+   - `iter_mod_ratio` is `producer_iter mod (p_period / c_period)`,
+     active when the pair has integer period ratio ≥ 2. Splits the
+     downsampling pattern where a period-`2N` producer feeds a
+     period-`N` consumer with per-iter Δs spanning a range — every
+     consumer at iter L reads producer at iter `2L + offset`, so
+     producers split cleanly by iter parity (ratio=2) or mod-N
+     (ratio=N).
+4. Re-compute edges + re-classify after each split; stop when no
+   class splits. `class_impl_id` is re-derived on the new members.
+
+Measured impact on the `non_uniform_pairs` count:
+
+| Arch     | Before 5j | After 5j | Max period |
+|----------|-----------|----------|------------|
+| llama    | 0         | 0        | 40         |
+| mistral  | 0         | 0        | 32         |
+| phi3     | 0         | 0        | 32         |
+| qwen2    | 0         | 0        | 24         |
+| commandr | 0         | 0        | 40         |
+| gemma2   | **7**     | **0**    | 92         |
+| granite  | **4**     | **0**    | 80         |
+| qwen3    | **3**     | **1**    | 56         |
+| gemma3   | (was N)   | **1**    | 96         |
+
+gemma2 + granite now clear the `uniform_pairs` gate (new refusal:
+post-loop multi-tile on the same class, a separate downstream
+issue). qwen3 + gemma3 have **one** residual non-uniform pair each
+that the current (count, iter_mod_ratio) signature misses — likely
+a non-integer-ratio pair or a per-head QK-norm-style interleave
+that needs a further signature refinement.
+
+**Remaining follow-ups after 5j:**
 
 **Where to start — two independent follow-ups, pick one**:
 
@@ -391,8 +447,12 @@ with a specific refusal reason.
      inlined. Then `timeout 60 vllm chat` (per
      `feedback_no_run_chat`) on llama-3.2-1B to sanity-check.
 
-2. **6.2.b.5h — richer offset solver** (unlocks gemma2, gemma3,
-   granite, qwen3). Refusal reason today: `offsets_consistent=false`.
+2. **6.2.b.5h — richer offset solver** — *deprecated as a 5h task*.
+   Diagnostic showed these arches trip `non_uniform_pairs=true`, not
+   just `offsets_consistent=false`; the BFS-over-offsets recipe in
+   the handoff can't solve non-uniform-Δ pairs. Replaced by 5j (see
+   below). This section retained for the offset-BFS recipe only in
+   case a different arch surfaces a pure offset issue.
    Fix path:
    - Today's offset rule (`offset = max_period - period`) assumes
      short classes "start late, end aligned with max." Gemma /

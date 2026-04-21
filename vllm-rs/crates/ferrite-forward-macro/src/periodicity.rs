@@ -72,12 +72,13 @@ pub fn group_regions(rg: &RegionGraph) -> Vec<RegionClass> {
     // cause of every heterogeneous-impl variant observed in the
     // class→impl consistency check.
     //
-    // Using control-edge neighbors as a discriminator is cheap
-    // (one pass over `rg.control`) and preserves layer-periodicity:
-    // every layer's attn-O has the same (Attention → Gemm → Add)
-    // neighborhood, every layer's MLP-down has the same (Mul →
-    // Gemm → Add) neighborhood, so each splits into its own class
-    // with period = num_layers.
+    // Note: for patterns that share op-tag neighbours but sit at
+    // different within-layer offsets (two residual-Add tiles per
+    // transformer layer — post-attention + post-MLP), 1-hop is too
+    // coarse. Those over-collapses show up as `non_uniform_pairs`
+    // in the stencil edge analysis and are fixed by a second,
+    // edge-pattern-based refinement pass in
+    // `StencilBundle::compute` — see `refine_by_edge_pattern`.
     let neighbor_sigs = compute_neighbor_sigs(rg);
 
     // BTreeMap keyed on hash so iteration is deterministic. Ties on

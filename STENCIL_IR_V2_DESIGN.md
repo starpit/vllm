@@ -397,15 +397,115 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 **Measurement after the hash fix**: distribution of class counts shifted from a tight 8/10 to 12/15/17/18/22 across 218 variants. Collapse factor for llama / mistral drops from ~28× to ~19×; still well-collapsed and every class is now impl-consistent. Pre-fix 23 heterogeneous variants → 2 remaining (both Qwen3; see A.2).
 
-### Quick-start for next session (2026-04-21)
+### Quick-start for next session (2026-04-21, evening)
 
-**What's landed**: 6.1, 6.2.a, 6.2.b.1–4, 6.2.b.5a–e (collapsed
+## ⚡ TEST-DRIVEN METHODOLOGY — READ THIS FIRST ⚡
+
+**Every hypothesis about the collapsed emitter lands as a test in
+`codegen.rs::tests` BEFORE the fix touches production code.** This
+isn't a nicety — it's load-bearing. The previous working mode
+(edit codegen → `cargo check -p ferrite-models --features cuda` →
+wait minutes → `cargo expand` → grep 50k-line output) burned ~5
+minutes per experiment. That loop has been replaced:
+
+```bash
+cargo test -p ferrite-forward-macro --lib codegen::tests
+# 35 green, 1 ignored red, ~0.3s
+```
+
+**The test fixtures drive the full pipeline** — DSL → classify →
+infer → CFG → unroll → solve → StencilBundle → ClassSchedule →
+provenance → try_emit_collapsed_bucket — against hand-written
+llama-style bodies. A codegen change that regresses any shape
+shows up immediately in the test list, with a specific failing
+assertion pointing at the broken invariant. No more "it compiles,
+ship it" followed by debugging from rustc error messages against
+a 218-variant fleet.
+
+**Workflow for 5i.5 (and every sub-step after):**
+
+1. **Formulate the hypothesis as a test first.** Even if the
+   test will fail. Especially if the test will fail — that's the
+   spec. Look at `chain_vs_cascade::far_decoder_has_uncovered_carry_producer`:
+   it *currently passes* because the cascade exists; after 5i.5,
+   it should *fail* because the cascade is closed. The test's
+   assertion is the spec for what "done" looks like.
+
+2. **Before every codegen change, ask: "what test catches this
+   if I break it?"** If the answer is "full fleet rebuild", add
+   the test first. Even trivial predicates (like `is_aliased_emittable`'s
+   return for a specific impl) deserve a pin in `ident` /
+   `stencil_bundle` / `provenance_kinds`.
+
+3. **Red tests (the `#[ignore]` kind) are spec, not aspiration.**
+   `emission_red::far_decoder_emits_successfully` must stay
+   ignored until 5i.5 + 5m both land. When you remove the
+   `#[ignore]`, you've shipped. When you can't make the red
+   test pass, the scope was wrong — revise the spec, don't
+   weaken the test.
+
+4. **Match every diagnostic with a test.** The
+   `chain_vs_cascade` module was born from a diagnostic run
+   that printed `alias_through_carries = {(2, 1, 0), (3, 0, 0)}`
+   — a surprising finding (the chain closes across classes, not
+   within). The surprise became two tests. If you find something
+   surprising while debugging, *write the test before the fix*
+   so you never lose the insight.
+
+5. **Keep fixtures small.** `FAR_SIMPLE_BODY` / `MINIMAL_BODY`
+   run in <50 ms each. Resist building a "full llama" synthetic
+   fixture — it's slower and captures less. Use the existing
+   `FAR_DECODER_BODY` when you specifically need llama's shape.
+
+**Test module map** (`crates/ferrite-forward-macro/src/codegen.rs`,
+`#[cfg(test)] mod tests`):
+
+- `fixture::solve_body(src) -> Solved` — the one-line entry point
+  that takes a DSL string and returns `(Fuf, Assignment, Program,
+  ModelParams, ImplementationLibrary)`. Three constants: `MINIMAL_BODY`,
+  `FAR_SIMPLE_BODY`, `FAR_DECODER_BODY`.
+- `ident` — `class_out_ident`, `carry_var_ident`, `last_var_ident`
+  format pins. 5i.1's per-export convention.
+- `stencil_bundle` / `minimal` — coarse-grained structure pins
+  (aliased class count, max_period, provenance length).
+- `schedule` / `schedule_partitions` — ClassSchedule partition
+  membership + 5i.3 re-route behavior.
+- `provenance` / `provenance_kinds` — all three origin kinds
+  present; init-ful + init-less carries both exist; producer
+  class sanity.
+- `alias_flow` / `chain_vs_cascade` — the cascade analysis. The
+  two tests here are the primary 5i.5 spec: FAR_SIMPLE closes,
+  FAR_DECODER doesn't.
+- `refusal` — refusal message pins (5i.4 cascade, 5m not-owned,
+  upstream sanity).
+- `aliased_empty` — body with no aliased classes produces no
+  cascade.
+- `emission_red` — two green tests (FAR_SIMPLE emits; alias srcs
+  classified correctly) + one ignored red test (FAR_DECODER
+  emits — the 5i.5 acceptance gate).
+
+## What's landed
+
+6.1, 6.2.a, 6.2.b.1–4, 6.2.b.5a–e (collapsed
 emitter), 6.2.b.5f (p1 period-mismatch offsets), 6.2.b.5g (multi-
 output periodic classes), 6.2.b.5j (edge-pattern-driven class
-refinement), 6.2.b.5i.1 (per-export key refactor), **6.2.b.5i.2
-(aliased-inline emission for periodic classes — full + short,
-alias-through-carry bypass, init-less-carry unwrap prelude;
-2026-04-21)**. `cargo check -p ferrite-models --features cuda` with
+refinement), 6.2.b.5i.1 (per-export key refactor), 6.2.b.5i.2
+(aliased-inline emission for periodic classes), 6.2.b.5i.3
+(period-1 aliased re-route), **6.2.b.5i.4 (post-loop aliased
+export lift, 2026-04-21)** + extensive test fixtures
+(2026-04-21).
+
+**6.2.b.5i.4 specifically**: post-loop consumers of short aliased
+periodic classes now lift exports via the hoisted `Option<GpuTensor>`
+— `let #local = unsafe { __cC_out_P_S.as_ref().expect(..).as_view() };`
+produces a `TensorView<'_>` that downstream `emit_subgraph` reads
+through `(*#local).as_view()` (TensorView: Deref<GpuTensor>). Full-
+period aliased classes post-loop still refuse (per-iter TensorView
+bindings don't outlive the loop scope).
+
+5i.4 also exposed a cascade that the old class-10 post-loop
+refusal had been masking. A narrow guard now refuses it with a
+specific message — see below. `cargo check -p ferrite-models --features cuda` with
 `FERRITE_STENCIL_CODEGEN=1` is clean across all 218 variants;
 collapsed path fires on 3 commandr variants (degenerate empty-loop).
 llama / mistral / phi3 / qwen2 now refuse at a narrower gate:
@@ -417,76 +517,124 @@ projection of layer N-1) live in periodic classes. Other fleets
 unchanged (gemma*/granite: `offsets_consistent=false`; qwen3:
 `uniform_pairs=false`).
 
-**5i.1 + 5i.2 landed — what remains:**
+## Next concrete step — 5i.5 (the cascade fix)
 
-5i.1 is the §14.1 per-export refactor: every `(class, slot)` key in
-the collapsed emitter's bookkeeping is now `(class, pos, slot)`, and
-`InputOrigin::{IntraIter, LoopCarry}` carry `producer_pos: u8`
-resolved at provenance-build time. Idents renamed:
-`__cC_out_<pos>_<slot>`, `__carry_cC_p<pos>_s<slot>`,
-`__last_cC_p<pos>_s<slot>`.
+**What 5i.5 must accomplish** (encoded as the ignored red test
+`codegen::tests::emission_red::far_decoder_emits_successfully`):
+make `try_emit_collapsed_bucket` produce a valid TokenStream for
+the full llama decoder body. Today it refuses with either:
 
-5i.2 is §14.2 aliased-inline emission: `is_aliased_emittable(imp,
-claimed, fuf)` gates the `FusedAddRmsNormImpl` /
-`FusedAddRmsNormWithOffsetImpl` / `AddRefImpl` family;
-`emit_aliased_class_inline` inlines their `emit_call` directly
-inside the loop body with a LocalMap that redirects boundary tile
-idents to the collapsed-path per-export idents (carry vars /
-intra-iter class outputs / pre-loop locals). Handles both full and
-short (offset>0 or period<max) aliased classes: full emits
-`let __cC_out_P_S = (*...).as_view()` inline (TensorView is Copy and
-derefs to GpuTensor, so downstream `(*#c_out).as_view()` reads work
-uniformly); short hoists `Option<GpuTensor>` outside the loop,
-guards the inline body on `__repeat >= offset && __repeat <
-offset+period`, and writes `__cC_out_P_S = Some(tmp.as_raw())` to
-feed later-iter consumers. Init-less LoopCarry boundaries
-(`Option<OwnedTensor>` hoist, shifted-carry p1 shape) are handled
-via a prelude that unwraps into a `TensorView<'_>` alias bound
-locally. Alias-through-carry: for each `output_alias` entry
-targeting a LoopCarry boundary whose producer is in
-`carry_producers`, the end-of-iter `__carry = __cC_out_P_S` reassign
-is skipped — the in-place kernel already mutated the carry's
-backing buffer.
+- `class N pos P slot S referenced downstream but not owned
+  (output_alias untracked or aliased) — 5g scope refuses` (5m, 153
+  llama variants) — precedes cascade in emission, so must be fixed
+  first OR in tandem.
+- `aliased class N pos P slot S is a carry producer but its alias
+  doesn't route through a LoopCarry boundary — cross-iter tracking
+  of the aliased upstream OwnedTensor not yet supported (5i.5
+  scope)` (cascade, 183 llama variants).
 
-**Remaining llama-fleet refusal: pre/post_loop aliased deps.** The
-5j edge-refinement peels one FusedAddRmsNorm instance (typically
-layer 0's pre-attn or layer N-1's pre-MLP) into its own period-1
-class, which the scheduler routes to `sched.pre_loop` or
-`sched.post_loop`. That emission path (`emit_subgraph` → Concrete
-inline fallback for aliased impls) resolves boundary idents via the
-default `t_<tile>_<slot>` LocalMap, which only works if the
-dependency subgraph was already emitted in the enclosing scope. For
-the peeled instance, its boundary tiles (layer-0 attention output;
-layer-(N-1) `down` projection output) come from periodic classes
-that fire in the loop body — so the pre_loop emit references
-unbound idents. 5i.2 refuses cleanly with a specific message.
+Both gates must clear before llama emits. 5i.5 targets the
+cascade; 5m is independent.
 
-Next session picks up at **pre/post-loop aliased lifting** — the
-remaining gate for the llama fleet. The peeled period-1 FAR
-instance's boundary inputs (layer-0 attention output, layer-(N-1)
-`down` projection) must either: (a) get promoted into the loop as
-an "iter-0-only" or "iter-(N-1)-only" guarded emission, or (b)
-change the refinement to not peel them (merge back with the
-periodic class and accept iter-R guards on both the FAR and its
-in-loop peers). Option (a) keeps the periodicity detection as-is
-and adds a separate lowering; option (b) unifies under the periodic
-path (one fewer refusal in a common shape). Both paths need a
-boundary-tile-aware resolver for pre/post-loop aliased classes
-instead of the today's "if dep crosses partition, refuse".
+**Why the cascade happens** (the spec, encoded in tests):
 
-**Alternative viable follow-up**: unify the pre/post-loop aliased
-lowering with the periodic path by allowing a period-1 aliased
-class to live in `sched.periodic` (guarded as a short class:
-offset=fixed, period=1). The existing short-aliased emit handles
-period=1 fine (`if __repeat >= offset && __repeat < offset+1`). The
-mechanical change is in `StencilBundle::schedule` / `ClassSchedule`
-construction — don't route period-1 aliased classes to pre_loop /
-post_loop, route them to periodic with their natural offset. That
-may also fix the corresponding issue on gemma/qwen if they have
-peeled aliased instances.
+A cascade key is `(aliased_class C, pos, slot)` where:
+- `(C, pos, slot) ∈ carry_producers` — some consumer reads C's
+  export via LoopCarry;
+- `(C, pos, slot) ∉ alias_through_carries` — no aliased downstream
+  closes the chain by mutating the carry buffer in place.
 
-**⚠️ Open correctness question for next session — weight indexing
-on short-period classes.** `emit_fragment_call_expr` (fragment path)
+When the consumer is *another aliased class*, its alias walk
+inserts C's key into `alias_through_carries` (the in-place kernel
+mutates the carry) and no cascade fires. When the consumer is
+*non-aliased* (llama: c8's rmsnorm_out → c2 QKV Gemm), the key
+stays uncovered — and the end-of-iter update `__carry = __cC_out`
+fails (GpuTensor-view RHS vs OwnedTensor LHS, *and* the GpuTensor
+aliases a per-iter-fresh upstream OwnedTensor that's already
+dead).
+
+This shape is pinned in two tests:
+- `chain_vs_cascade::far_simple_carry_producers_all_alias_through`
+  (FAR_SIMPLE, currently green — pure aliased chain).
+- `chain_vs_cascade::far_decoder_has_uncovered_carry_producer`
+  (FAR_DECODER, currently green — demonstrates the cascade
+  exists). **When 5i.5 lands, this test's assertion flips** and
+  `uncovered` becomes empty.
+
+**The fix plan (probably)**:
+
+For each cascade key `(C, pos, slot)` where the alias src's
+boundary provenance is IntraIter or PreLoop (pinned by
+`emission_red::aliased_nonloopcarry_srcs_are_intraiter_or_preloop`):
+
+1. Create a new carry var `__alias_carry_cC_pP_sS` alongside the
+   existing `__carry_cC_pP_sS`. The new one holds the OwnedTensor
+   backing the aliased output — NOT the carry'd class's own
+   OwnedTensor (which doesn't exist for aliased classes).
+2. Initialize it from the alias src:
+   - IntraIter producer → the upstream class's OwnedTensor at end
+     of iter (move into `__alias_carry`).
+   - PreLoop producer → the pre-loop local directly.
+3. Skip the old `__carry = __cC_out` update. The consumer reads
+   `__alias_carry` instead of `__carry`.
+
+Or alternatively: rewire the consumer's LoopCarry provenance so
+`producer_class` is the alias src's producer (not the aliased
+class). Then `carry_producers` points at a non-aliased class
+whose output IS an OwnedTensor. Less code-generation change,
+more provenance-walker change. Both paths need the same
+spec: every cascade key becomes handled.
+
+**Before writing code**:
+
+```bash
+cargo test -p ferrite-forward-macro --lib codegen::tests \
+    -- --include-ignored
+```
+
+Expected today: 35 green, 1 failing (`far_decoder_emits_successfully`).
+The ONE failure is the gate. When it turns green, 5i.5 is done
+— and it won't turn green unless 5m also lands, so 5i.5 in
+isolation may leave the red test red while another test
+(`chain_vs_cascade::far_decoder_has_uncovered_carry_producer`
+flipping to expect-empty) moves to green. Either way the test
+suite tells you where you are.
+
+**Add tests BEFORE touching codegen** when you:
+- Hypothesize about a new shape ("gemma's post-loop multi-tile
+  also has X"). Build a fixture first.
+- Read a confusing diagnostic ("why is key Y in the set?"). Pin
+  it in `chain_vs_cascade` style.
+- Plan a code change ("I'll rewire `carry_producers` keys").
+  Add a test asserting the old shape AND one asserting the new
+  shape. The `#[ignore]` on the new one becomes your TODO list.
+
+**Test-suite note**: `cargo test -p ferrite-forward-macro --lib`
+(whole crate) has 2 pre-existing failures (`config::tests::
+load_real_llama_configs`, `…_qwen2_configs`) asserting on
+variant-count totals — unrelated to codegen, skip or update
+separately. Filter to `codegen::tests` to avoid them.
+
+## Other open follow-ups
+
+**5m — referenced-downstream-not-owned** (153 llama, 100 qwen2,
+21 phi3, 18 mistral, 1 commandr): pre-existing from 5g scope.
+A non-aliased periodic class has an export whose `output_alias`
+entry is not recognized as owned by the 5g ownership walk —
+typically `rope_append`'s K/V paged-cache views at pos 3 slot 1.
+Fix scope lives in `class_owned_exports` + the 5g precondition
+walk at codegen.rs:4430-4438. Independent of 5i.5.
+
+**5k — post-loop multi-tile** (gemma2 / granite): `class N slot 0
+referenced by post-loop from multiple tiles`. Moderate scope.
+
+**5l — finer refinement signature** (qwen3 / gemma3):
+`uniform_pairs=false` (1 residual non-uniform pair). 5j's
+signature misses a shape — likely non-integer period ratio or
+per-head QK-norm interleave.
+
+**⚠️ Open correctness question — weight indexing on short-period
+classes.** `emit_fragment_call_expr` (fragment path)
 passes `repeat_tokens = (__repeat - offset)` and relies on
 `access_tokens_with_repeat` to produce `stem[(__repeat - offset)]`.
 `emit_aliased_class_inline` (5i.2 path) passes
@@ -505,38 +653,42 @@ indeed buggy here, the two paths should converge on `stem[__repeat]`
 5f's `(__repeat - offset)` convention is the piece to fix, not
 5i.2's.
 
-**Pointers for 5i.2 (all in
-`vllm-rs/crates/ferrite-forward-macro/src/`):**
-- `impl_lib.rs` — `FusedAddRmsNormImpl` (`fn output_alias` at
-  ~2757), `FusedAddRmsNormWithOffsetImpl` (~3048), `AddRefImpl`
-  (multi-claimed alias family; grep `AddRef`). These three are the
-  target aliased impls.
-- `codegen.rs` — `build_local_map` (grep for the fn), `emit_subgraph`
-  (the Concrete-mode reference for inline emission),
-  `try_emit_collapsed_bucket` (where to integrate the new path). The
-  abstract-body convention emits `__out_<claim_pos>_<slot>` bindings
-  for every claimed tile's output; the 5i.2 shim `let __cC_out_P_S
-  = t_<rep_claim[pos].id>_<slot>.as_view();` re-names those for
-  downstream IntraIter consumers.
-- `emit.rs` — `EmitMode::Concrete`, `WeightLayout::
-  access_tokens_with_repeat` (call with `Some(&quote!(__repeat))`
-  inside the loop body).
+## Pointers — where to look
 
-**Test-suite note**: `cargo test -p ferrite-forward-macro` has 2
-pre-existing failures (`config::tests::load_real_llama_configs`,
-`…_qwen2_configs`) asserting on variant-count totals — the fleet
-grew past the hard-coded expected counts. Unrelated to codegen; skip
-or update those asserts separately.
+All under `vllm-rs/crates/ferrite-forward-macro/src/`:
 
-**Current refusal distribution (post-5i.3, 2026-04-21):**
+- `codegen.rs::try_emit_collapsed_bucket` (~line 4119) — the main
+  refusal orchestrator. Walks `aliased_classes`, builds
+  `carry_producers` + `alias_through_carries`, runs the 5i.4 cascade
+  guard (~line 4499), emits loop body + post-loop. Start here.
+- `codegen.rs::emit_aliased_class_inline` (~line 5259) — inline
+  emission for aliased FAR/AddRef family. LocalMap override,
+  prelude for Option-carry unwrap, short-class guarded body.
+- `codegen.rs::class_input_provenance` (~line 3140) — where
+  `InputOrigin::{IntraIter, LoopCarry, PreLoop}` gets set. 5i.5
+  may want to add a 4th variant or re-tag some carries.
+- `codegen.rs::tests` (~line 6099, end of file) — the 35+1 test
+  module. Every new hypothesis goes here first.
+- `impl_lib.rs::FusedAddRmsNormImpl` (~line 2647) — canonical
+  aliased impl. `output_alias` (both src=Some, aliases to the
+  claimed tiles' inputs) and `emit_call` (in-place kernel).
+- `emit.rs::EmitCtx` / `WeightLayout::access_tokens_with_repeat`
+  — how weight indexing threads through `__repeat`.
+
+## Refusal distribution (post-5i.4, 2026-04-21)
 
 | Arch fleet | Refusal reason | Next-step path |
 |---|---|---|
-| llama / mistral / phi3 / qwen2 / commandr (rest) — 183 variants | `aliased class N pos P slot S referenced post-loop — unsupported` | **5i.4** — teach `try_emit_collapsed_bucket` (post-loop ownership walk + ref collection) that an aliased-emittable class re-routed into `periodic` at offset `max_period-1` owns its exports at that final __repeat, so post-loop consumers can pick them up via the existing per-export post-ref binding |
-| llama / mistral / phi3 / qwen2 / commandr (rest) — 153 variants | `class 2 pos 3 slot 1 referenced downstream but not owned (output_alias untracked or aliased) — 5g scope refuses` | **5m** — pre-existing, newly exposed; a non-aliased periodic class has an export whose `output_alias` entry is not recognised as owned by the 5g ownership walk. Independent of 5i. |
+| llama / mistral / phi3 / qwen2 / commandr (rest) — **183** | `aliased class N pos P slot S is a carry producer but its alias doesn't route through a LoopCarry boundary — 5i.5 scope` | **5i.5 (this session's target)** — cross-iter track the aliased upstream OwnedTensor. Red test: `emission_red::far_decoder_emits_successfully` + flip of `chain_vs_cascade::far_decoder_has_uncovered_carry_producer` |
+| llama / mistral / phi3 / qwen2 / commandr (rest) — **153** | `class 2 pos 3 slot 1 referenced downstream but not owned (output_alias untracked or aliased) — 5g scope refuses` | **5m** — multi-output tile (rope_append K/V) tracking in `class_owned_exports`. Independent of 5i.5; both needed for full llama unlock |
 | gemma2 / granite | `class N slot 0 referenced by post-loop from multiple tiles` | **5k** (post-loop multi-tile export) — moderate |
 | qwen3 / gemma3 | `uniform_pairs=false` (1 residual pair each) | **5l** (finer refinement signature) — signature tuning |
 | commandr (3 variants) | ✅ happy path (degenerate empty loop) | — |
+
+Note: 5i.4 didn't flip any fleet green — it refined the refusal
+reason on the llama fleet from post-loop-unsupported to the
+specific cascade shape so 5i.5 has a precise target. Fleet
+unlocks start when 5m + 5i.5 both land.
 
 **6.2.b.5i.3 — period-1 aliased re-route (landed 2026-04-21).**
 `StencilBundle::schedule` now takes `lib: &ImplementationLibrary`

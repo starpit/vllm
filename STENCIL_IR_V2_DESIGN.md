@@ -447,6 +447,29 @@ key the rmsnorm export (pos=1) separately from the add export
 - Validation: `cargo expand -p ferrite-model-llama --features
   cuda`; `timeout 60 vllm chat` against a small llama variant.
 
+**Pointers for 5i.2 (all in
+`vllm-rs/crates/ferrite-forward-macro/src/`):**
+- `impl_lib.rs` — `FusedAddRmsNormImpl` (`fn output_alias` at
+  ~2757), `FusedAddRmsNormWithOffsetImpl` (~3048), `AddRefImpl`
+  (multi-claimed alias family; grep `AddRef`). These three are the
+  target aliased impls.
+- `codegen.rs` — `build_local_map` (grep for the fn), `emit_subgraph`
+  (the Concrete-mode reference for inline emission),
+  `try_emit_collapsed_bucket` (where to integrate the new path). The
+  abstract-body convention emits `__out_<claim_pos>_<slot>` bindings
+  for every claimed tile's output; the 5i.2 shim `let __cC_out_P_S
+  = t_<rep_claim[pos].id>_<slot>.as_view();` re-names those for
+  downstream IntraIter consumers.
+- `emit.rs` — `EmitMode::Concrete`, `WeightLayout::
+  access_tokens_with_repeat` (call with `Some(&quote!(__repeat))`
+  inside the loop body).
+
+**Test-suite note**: `cargo test -p ferrite-forward-macro` has 2
+pre-existing failures (`config::tests::load_real_llama_configs`,
+`…_qwen2_configs`) asserting on variant-count totals — the fleet
+grew past the hard-coded expected counts. Unrelated to codegen; skip
+or update those asserts separately.
+
 **Current refusal distribution (post-5j, 2026-04-21):**
 
 | Arch fleet | Refusal reason | Next-step path |

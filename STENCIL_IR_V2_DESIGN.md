@@ -385,6 +385,7 @@ None of these are show-stoppers without investigation, but each is worth measuri
 - `428eb491b` — **6.2.b.5i.5 landed (2026-04-22)**: LoopCarry-alias redirect closes the FAR cascade. `alias_carry_redirect: BTreeMap<(class,pos,slot), (class,pos,slot)>` threaded through `carry_inits` + `emit_fragment_call_expr` + `emit_aliased_class_inline`. Verified red→green with the new `FAR_CASCADE_BODY` fixture: disable `resolve_carry` ⇒ `emit_red::far_cascade_*` fail with the "5i.5 scope" refusal; restore ⇒ green.
 - **6.2.b.5m landed (2026-04-22)**: side-effect exports recognised in `try_emit_collapsed_bucket`. `FusedQkvRopeCacheImpl`'s K/V paged-cache slots (absent from `output_alias`) are now classified as side-effect: stripped from `referenced_exports`/`class_returned_exports` (fragment doesn't return them) and filtered from both `tile_params_ordered` + `class_inputs.slots` in `emit_fragment_call_expr` (fragment signature omits them). Decode `AttentionViaCacheImpl` already ignores slots 1/2 in `emit_call`; it reads K/V via `ctx.kv_cache`. New narrow fixture `ROPE_ONLY_BODY` + test `emission_red::rope_only_emits_successfully`; the existing `emission_red::far_decoder_emits_successfully` acceptance gate flips green. Verified red→green by toggling the side-effect block off.
 - **6.2.b.5m follow-up (same commit): aliased-class `__last_` hoist fix.** Landing 5m exposed a latent bug: `dedicated_last` (post-loop-referenced, non-carry-producing class exports) was hoisting `Option<OwnedTensor>` for *every* class in the set, including aliased ones — but 5i.4's aliased post-loop path hoists `Option<GpuTensor>` separately, and the dedicated_last populate site `Some(#c_out.take().expect(..))` then tried to move a `GpuTensor` into `Option<OwnedTensor>`. A pure `syn::parse2` emission test doesn't catch this (parses fine, fails `rustc` typecheck). `forward_m_*` emission for llama post-5m surfaced 338 `E0308 expected OwnedTensor, found GpuTensor` errors; skipping aliased classes in both the hoist loop (~line 4807) and the populate loop (~line 5031) closes it. New pin `emission_red::far_decoder_no_owned_gpu_mismatch_on_aliased_last` scans emitted tokens for `__last_cC_p…` idents of aliased classes (red when skip is off, green when on). 39 codegen tests pass, 2 ignored (diagnostic dumps). **Fleet check: `FERRITE_STENCIL_CODEGEN=1 cargo check -p ferrite-models --features cuda` now completes cleanly end-to-end.**
+- **6.2.b.5n landed (2026-04-22 evening): short-period fragment-path weight indexing fix.** `emit_fragment_call_expr`'s `repeat_tokens` construction replaced with `fragment_repeat_tokens()` helper returning `quote! { __repeat }` unconditionally (pre-fix form `(__repeat - offset)` was off by `offset` for any class at nonzero offset — the fragment's `repeat: usize` drives both `access_tokens_with_repeat`'s `stem[repeat_tokens]` and `ctx.layer_expr` inside the body; both want the global layer). `consumer_offset` param dropped from `emit_fragment_call_expr` (only usage was the buggy branch; caller still uses `offset` for the short-class guard `if __repeat >= offset && __repeat < offset + period`). **Diagnostic finding**: on llama-3.2-1b FAR_DECODER, all short classes (c8/c9 period=15 offset=1; c10 period=1 offset=15; c5 period=1 offset=0) are `FusedAddRmsNorm`-family (aliased), routed through `emit_aliased_class_inline` which already used `__repeat`. So the fragment path's buggy branch was **latent** on the llama/mistral/phi3/qwen2 fleet — no runtime divergence possible. Fix is defensive against future fixtures with non-aliased short classes. Two new pins: unit `emission_red::fragment_repeat_tokens_is_bare_global_loop_var` (direct helper test) and integration `emission_red::far_decoder_emission_has_no_repeat_subtraction` (token-text grep for `__repeat -`). Verified red→green by temporarily reverting `fragment_repeat_tokens()` to `quote! { (__repeat - 1usize) }` — both tests fail; restore → both green. 41 codegen tests pass (was 39), 2 ignored. `FERRITE_STENCIL_CODEGEN=1 cargo check -p ferrite-models --features cuda` clean across all 218 variants.
 
 **What builds**: everything. `cargo build -p ferrite-models --release` exercises all 218 model variants through the full pipeline. Stencil diagnostic prints alongside each variant's ferrite line (see "stencil · N regions → N classes" entries).
 
@@ -406,7 +407,7 @@ None of these are show-stoppers without investigation, but each is worth measuri
 **Orientation — run these first, in order (~5 seconds total):**
 
 ```bash
-# 1. Confirm the post-5m baseline: 39 green, 2 ignored diagnostics.
+# 1. Confirm the post-5n baseline: 41 green, 2 ignored diagnostics.
 cargo test -p ferrite-forward-macro --lib codegen::tests
 
 # 2. Skim the top-of-branch commits so the 5i.5 / 5m mental model
@@ -801,25 +802,40 @@ more than one tile position. Moderate scope; orthogonal to
 signature misses a shape — likely non-integer period ratio or
 per-head QK-norm interleave.
 
-**⚠️ Open correctness question — weight indexing on short-period
-classes.** `emit_fragment_call_expr` (fragment path)
-passes `repeat_tokens = (__repeat - offset)` and relies on
-`access_tokens_with_repeat` to produce `stem[(__repeat - offset)]`.
-`emit_aliased_class_inline` (5i.2 path) passes
-`repeat_tokens = __repeat` verbatim. Neither has been exercised at
-runtime on a short-period class (every llama variant still refuses
-pre-emission). For Pattern-B-style short classes where the rep's
-baked `weight_idx == offset` (e.g. offset=1, rep reads `input_ln[1]`,
-member at iter R reads `input_ln[R]`), **`stem[__repeat]` is the
-correct access** (matches the member's natural weight index) and
-`stem[__repeat - offset]` is off by `offset`. Before declaring the
-llama fleet green on `vllm chat`, verify the short-class weight
-access produces the right tensor — first-token log-prob vs the
-unrolled path is the cheapest check. If the fragment path is
-indeed buggy here, the two paths should converge on `stem[__repeat]`
-(or `stem[__repeat + (rep_layer_idx - offset)]` generically) and
-5f's `(__repeat - offset)` convention is the piece to fix, not
-5i.2's.
+**✅ Closed correctness question — weight indexing on short-period
+classes (2026-04-22 evening).** `emit_fragment_call_expr` previously
+passed `repeat_tokens = (__repeat - offset)` into the fragment's
+`repeat: usize` param (and the call-site's `stem[repeat_tokens]`
+weight rewrite). The two paths now converge on `__repeat`:
+`emit_fragment_call_expr` calls the new helper
+`fragment_repeat_tokens()` (returns `quote! { __repeat }`
+unconditionally) and `emit_aliased_class_inline` still passes
+`__repeat` verbatim. A member of a period-`P` offset-`O` class fires
+at iter `__repeat = O+m` reading global layer `O+m`, so `__repeat`
+is the correct form for both uses on short and full classes alike.
+
+**Empirical note from the landing diagnostic:** all short classes in
+FAR_DECODER_BODY (llama-3.2-1b, 16 layers) are
+`FusedAddRmsNormImpl`-family (aliased), so they route through
+`emit_aliased_class_inline` (which already used `__repeat`). The
+fragment path's buggy branch was latent — never reached by any
+shipping fleet — so no runtime divergence was observed. Fix is
+defensive: `vllm chat` correctness was already intact on the llama
+fleet; the helper pin makes it remain so when a future fixture
+introduces a non-aliased short class.
+
+Red→green proof (commit landing this fix): new unit test
+`fragment_repeat_tokens_is_bare_global_loop_var` asserts the helper
+returns `"__repeat"`; new pin
+`far_decoder_emission_has_no_repeat_subtraction` asserts the
+FAR_DECODER token stream never contains `__repeat -`. Both fail
+when the helper is temporarily reverted to
+`quote! { (__repeat - 1usize) }`; both pass when restored.
+
+The `consumer_offset: usize` parameter was removed from
+`emit_fragment_call_expr` (the only reason it was threaded in). The
+`offset` at the caller is still used for short-class guard emission
+(`if __repeat >= offset && __repeat < offset + period`).
 
 ## Pointers — where to look
 

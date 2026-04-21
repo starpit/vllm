@@ -4914,7 +4914,6 @@ fn try_emit_collapsed_bucket(
         let fragment_expr = emit_fragment_call_expr(
             c,
             ci,
-            offset,
             returned,
             stencil,
             fuf,
@@ -5164,6 +5163,30 @@ fn try_emit_collapsed_bucket(
     })
 }
 
+/// Tokens bound to the fragment's `repeat: usize` param at the call
+/// site. Always `__repeat` — the global loop index.
+///
+/// A class covering global layers `[O..O+P)` has members firing at
+/// iters `__repeat = O, O+1, ..., O+P-1` with matching global layers.
+/// The fragment body uses its `repeat` param for (a) kv_cache layer
+/// dispatch (via `ctx.layer_expr`) and (b) weight array indexing (via
+/// `access_tokens_with_repeat` at the call site, which rewrites
+/// `stem[repeat_tokens]`). Both want the global layer — i.e. `__repeat`
+/// — so stripping the offset (the pre-fix `(__repeat - offset)` form)
+/// would index both at `0..P` and miss the `offset`.
+///
+/// Pinned as a standalone helper so the spec is directly testable —
+/// the offset-stripping shape was a latent bug that current llama /
+/// mistral / phi3 / qwen2 fixtures never exercised (their short
+/// classes are all FusedAddRmsNorm-family and route through
+/// `emit_aliased_class_inline`, which always uses `__repeat`). Any
+/// future fixture with a non-aliased short class would have tripped
+/// it at runtime. See STENCIL_IR_V2_DESIGN.md §13 "Open correctness
+/// question — weight indexing on short-period classes."
+fn fragment_repeat_tokens() -> TokenStream {
+    quote! { __repeat }
+}
+
 /// Emit the bare `unsafe { __frag_N(…inputs…, repeat, wm, ctx, device) }`
 /// call expression for one periodic class. The caller wraps this in
 /// `let __cC_out = …` (full class — runs every iter) or
@@ -5171,11 +5194,14 @@ fn try_emit_collapsed_bucket(
 ///
 /// Interns the fragment body in abstract mode with `repeat_var =
 /// Some(repeat)` + an extra `repeat: usize` param. At the call site
-/// `repeat` is bound to `__repeat - offset(consumer_class)` — the
-/// class-local iter — so the fragment's `ctx.layer_expr` + weight
-/// access read the right per-class element without baking the offset
-/// into the fragment body. Offset 0 emits just `__repeat` verbatim
-/// (byte-identical to 6.2.b.5e for uniform-period variants).
+/// `repeat` is bound to `__repeat` — the global layer index — so
+/// the fragment's `ctx.layer_expr` + `access_tokens_with_repeat`
+/// weight rewrite both resolve to the currently-firing member's
+/// global layer. Members of a period-`P` class at offset `O` fire
+/// at iters `O..O+P` with matching global layers `O..O+P`, so
+/// `__repeat` is the correct index on both short and full classes.
+/// See STENCIL_IR_V2_DESIGN.md §13 "Open correctness question —
+/// weight indexing on short-period classes."
 ///
 /// Input args come from the class's `ClassInputs` provenance:
 /// - `IntraIter` → `(*__cPC_out).as_view()` (full producer) or
@@ -5187,7 +5213,6 @@ fn try_emit_collapsed_bucket(
 fn emit_fragment_call_expr(
     consumer_class: usize,
     class_inputs: &ClassInputs,
-    consumer_offset: usize,
     returned_exports: &[(u8, u8)],
     stencil: &StencilBundle,
     fuf: &Fuf,
@@ -5479,15 +5504,7 @@ fn emit_fragment_call_expr(
         input_args.push(arg);
     }
 
-    // Class-local repeat expression: `__repeat - offset`, or just
-    // `__repeat` when offset is 0 (keeps the uniform-period emission
-    // byte-identical to 6.2.b.5e).
-    let repeat_tokens: TokenStream = if consumer_offset == 0 {
-        quote! { __repeat }
-    } else {
-        let off_lit = proc_macro2::Literal::usize_unsuffixed(consumer_offset);
-        quote! { (__repeat - #off_lit) }
-    };
+    let repeat_tokens: TokenStream = fragment_repeat_tokens();
 
     let weight_args: Vec<TokenStream> = accessors
         .iter()
@@ -8097,6 +8114,84 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// Spec pin for `fragment_repeat_tokens`: the fragment's
+        /// `repeat: usize` param is always bound to the bare global
+        /// loop var `__repeat`, never to a class-local expression
+        /// like `(__repeat - offset)`.
+        ///
+        /// Red→green proof: replace `quote! { __repeat }` in
+        /// `fragment_repeat_tokens` with the pre-fix form
+        /// `quote! { (__repeat - 1usize) }` and this test fails
+        /// with `expected "__repeat", got "(__repeat - 1usize)"`.
+        ///
+        /// See STENCIL_IR_V2_DESIGN.md §13 "Open correctness
+        /// question" — a class covering global layers `[O..O+P)` has
+        /// each member fire at iter `__repeat = O+m` reading layer
+        /// `O+m`, so `repeat_tokens = __repeat` is the correct
+        /// binding for both weight-array access (via
+        /// `access_tokens_with_repeat`'s `stem[repeat_tokens]`
+        /// rewrite) and `ctx.layer_expr` inside the fragment body.
+        #[test]
+        fn fragment_repeat_tokens_is_bare_global_loop_var() {
+            let toks = fragment_repeat_tokens();
+            assert_eq!(
+                toks.to_string(),
+                "__repeat",
+                "fragment_repeat_tokens must bind the fragment's \
+                 `repeat: usize` param to the bare global loop var"
+            );
+        }
+
+        /// Regression pin: the FAR decoder's emitted bucket never
+        /// subtracts from `__repeat` in any fragment-arg or
+        /// call-site position. Today's fixtures don't exercise a
+        /// non-aliased short class (every short class in FAR_DECODER
+        /// is FusedAddRmsNorm-family, routed through
+        /// `emit_aliased_class_inline`, which already uses
+        /// `__repeat`). This test pins the invariant so a future
+        /// fixture that adds a non-aliased short class catches a
+        /// regression immediately rather than at `vllm chat`.
+        ///
+        /// The emitted bucket does use `__repeat` in guards like
+        /// `if __repeat >= offset && __repeat < offset + period` —
+        /// those do NOT subtract. Only the pre-fix form
+        /// `(__repeat - offset)` as a fragment arg would introduce
+        /// `__repeat -` and fire this pin.
+        #[test]
+        fn far_decoder_emission_has_no_repeat_subtraction() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let tokens = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            )
+            .expect("FAR_DECODER must emit post-5m");
+            let text = tokens.to_string();
+            assert!(
+                !text.contains("__repeat -"),
+                "emitted FAR_DECODER bucket contains a `__repeat -` \
+                 subtraction — the pre-fix class-local offset \
+                 stripping leaked back in. Every fragment-arg bound \
+                 to the fragment's `repeat: usize` param must be the \
+                 bare global loop var. (Guards use \
+                 `__repeat >= offset`, not subtraction.)"
+            );
         }
     }
 }

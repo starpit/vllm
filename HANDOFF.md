@@ -1024,6 +1024,60 @@ disambiguation on `.input_scale` landed alongside it.
    FP8 MMA template falls into a `CUTLASS_NOT_IMPLEMENTED()` brkpt.
    Build with `PATH=/usr/local/cuda-12.9/bin:$PATH CUDA_HOME=/usr/local/cuda-12.9`
    or set as default.
+5. **`fp8_exclusion` × any new quant that ships `.weight_scale`.**
+   The fingerprint's FP8 marker tensor is
+   `model.layers.0.self_attn.q_proj.weight_scale`. Dense / AWQ /
+   native-GPTQ / BNB4 variants reject when it's present. But CT-
+   INT4 (`GptqLayout::WeightPacked`) ALSO ships `.weight_scale`
+   as the group-scale — it's excluded from the fp8 rejection at
+   `codegen.rs:696-713` (post-`9ef35d6f5`). Any future quant
+   format that ships the same tensor name needs to be added to
+   the `fp8_exclusion` tuple the same way, or it'll never
+   fingerprint-match.
+6. **CUDA-graph vs eager drift hypothesis for item 1b.** Python
+   goldens are generated with `enforce_eager=True` (per
+   `scripts/generate_golden_refs.py` — FP8 CUDA-graph capture
+   produces nondeterministic output across runs). Ferrite runs
+   with graphs on. This **structurally explains** "position 0
+   matches, positions 1+ diverge" — prefill runs once without
+   graph, each decode step is a captured replay. Before chasing
+   further wrapper-level theories, test with ferrite's graph
+   capture disabled on a failing FP8 prompt; if drift
+   disappears, the real fix is regenerating goldens with graph
+   mode ON or confirming ferrite's graph capture is semantically
+   graph-determinism-safe.
+7. **Scale-value comparison not done.** The quant *kernel* audit
+   confirmed byte-equivalence, but nobody compared the f32
+   `scale` tensor ferrite emits per-token against Python's on
+   the same input. Top suspect if #6 falls through — a different
+   formula (`amax / FP8_MAX` vs `amax.reciprocal() * FP8_MAX`
+   clamp) silently shifts every activation.
+8. **Python `cutlass_scaled_mm` Triton fallback.** `_custom_ops.py:763`
+   falls back to `triton_scaled_mm` when
+   `b.shape[0] % 16 != 0 || b.shape[1] % 16 != 0`. For the
+   current seven FP8 arches no layer hits this (all K/N are
+   multiples of 16), but a future arch with unusual head count
+   or MLP intermediate would silently compare ferrite-CUTLASS
+   to Python-Triton — not a numerics match. Worth checking
+   per-layer shapes before adding new FP8 arches.
+9. **Static-scaled FP8 group-shape kernel not ported.** Upstream
+   `scaled_fp8_quant_kernel_strided_group_shape`
+   (`vllm/csrc/quantization/w8a8/fp8/common.cu:13-78`) is only
+   reachable by `static_scaled_fp8_quant` with `group`,
+   `per_channel`, or `per_token` scale shapes. No current preset
+   wires it. First repo shipping static-group-shape FP8 will
+   need the kernel ported + the calling path plumbed.
+10. **Qwen3/Gemma3 × FP8 QK-norm path uses singletons.**
+    `FusedQkvQkNormRopeCacheImpl` exists at
+    `impl_lib.rs:3907` but is intentionally unregistered
+    (known numerics bug per `impl_lib.rs:1353-1366`). Qwen3-FP8
+    works today via singleton chain (Gemm → Reshape → RmsNorm →
+    Reshape → RopeAppend), same as dense Qwen3. A dedicated
+    `Fp8FusedQkvQkNormRope*Impl` (and Marlin/BNB4 counterparts)
+    would close this but isn't needed for correctness — just
+    perf. See `FusedQkvQkNormRopeCacheImpl::emit_call` for the
+    reference implementation once the dense numerics bug is
+    resolved.
 
 ## FP8 Slice-1: what landed
 

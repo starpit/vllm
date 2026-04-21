@@ -372,15 +372,17 @@ Red flags that would tell us this refactor is the wrong move:
 
 None of these are show-stoppers without investigation, but each is worth measuring at the relevant staging step rather than discovering at integration.
 
-## 13. Status & handoff (2026-04-20)
+## 13. Status & handoff (2026-04-22)
 
-**Branch**: `worktree-ff3`. Six commits on top of `0ab1aad98`:
+**Branch**: `worktree-ff3` (rebased onto `worktree-ferrite-forward` 2026-04-22). Eight top-of-branch commits:
 - `aef01d8ca` — IR + subtile + region_formation + periodicity + CollapsePlan
 - `420a71690` — class→impl consistency checker + FormedRegions refactor
 - `5f3e96cd5` — neighbor-aware canonical hash; 23 → 2 heterogeneous variants
 - `db9c13847` — `StencilBundle` plumbed through emit_wave_walk / emit_subgraph. Scaffolding only; no emission change.
 - `6323d514e` — **6.1 landed**: per-layer arrays on Weights + `WeightLayout` read rewrite. `cargo expand` on llama-2-13b shows `input_layernorm: [RmsNorm; 40]`, `mlp_down_proj: [LinearLayer; 40]`, etc. collapse to array fields. Fused qkv/gate_up accessors stay flat (stems embed sibling layer idxs) — deferred follow-up.
 - `61dd42ed9` — **6.2.a landed**: `repeat_var: Option<TokenStream>` + `layer_expr(u64)` helper on EmitCtx. Both construction sites set `None`, so emitted code is byte-identical; the field is dormant until 6.2.b wires loop emission.
+- (5i.1 … 5i.4 mid-chain commits — see `git log`)
+- `428eb491b` — **6.2.b.5i.5 landed (2026-04-22)**: LoopCarry-alias redirect closes the FAR cascade. `alias_carry_redirect: BTreeMap<(class,pos,slot), (class,pos,slot)>` threaded through `carry_inits` + `emit_fragment_call_expr` + `emit_aliased_class_inline`. Verified red→green with the new `FAR_CASCADE_BODY` fixture: disable `resolve_carry` ⇒ `emit_red::far_cascade_*` fail with the "5i.5 scope" refusal; restore ⇒ green. 38 codegen tests pass, 3 ignored (2 diagnostics + the 5i.5+5m acceptance gate which still requires 5m).
 
 **What builds**: everything. `cargo build -p ferrite-models --release` exercises all 218 model variants through the full pipeline. Stencil diagnostic prints alongside each variant's ferrite line (see "stencil · N regions → N classes" entries).
 
@@ -397,7 +399,7 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 **Measurement after the hash fix**: distribution of class counts shifted from a tight 8/10 to 12/15/17/18/22 across 218 variants. Collapse factor for llama / mistral drops from ~28× to ~19×; still well-collapsed and every class is now impl-consistent. Pre-fix 23 heterogeneous variants → 2 remaining (both Qwen3; see A.2).
 
-### Quick-start for next session (2026-04-21, evening)
+### Quick-start for next session (2026-04-22, morning)
 
 ## ⚡ TEST-DRIVEN METHODOLOGY — READ THIS FIRST ⚡
 
@@ -410,8 +412,31 @@ minutes per experiment. That loop has been replaced:
 
 ```bash
 cargo test -p ferrite-forward-macro --lib codegen::tests
-# 35 green, 1 ignored red, ~0.3s
+# 38 green, 3 ignored (2 diagnostics + 5i.5+5m acceptance gate), ~0.3s
 ```
+
+**Red→green discipline (the 5i.5 model, commit `428eb491b`):**
+A landed fix MUST come with a test that was red before the fix
+and green after. Not "a test whose replica-logic matches the new
+spec" — an actual test against production code that differs in
+outcome based on production behavior. The 5i.5 proof:
+
+1. Built `FAR_CASCADE_BODY` — a llama-shape DSL fixture that
+   exercises the cascade without triggering the 5m gate that
+   would refuse earlier.
+2. Wrote `emission_red::far_cascade_emission_is_structurally_sound`
+   asserting `try_emit_collapsed_bucket` returns `Ok(tokens)` and
+   the tokens parse as `syn::File`.
+3. Verified the test fails PRE-FIX by stubbing `resolve_carry` to
+   return its raw input (disabling the redirect) — test panicked
+   with "5i.5 scope" refusal.
+4. Restored `resolve_carry` to consult the redirect — test green.
+5. Committed the fix; the test stands as a regression gate.
+
+**DO NOT run `cargo check -p ferrite-models --features cuda` as
+verification.** If a change might regress a fleet shape, a unit
+test against that shape is the fix. Fleet-check is a slow
+diagnostic-of-last-resort, not part of the loop.
 
 **The test fixtures drive the full pipeline** — DSL → classify →
 infer → CFG → unroll → solve → StencilBundle → ClassSchedule →
@@ -491,11 +516,35 @@ emitter), 6.2.b.5f (p1 period-mismatch offsets), 6.2.b.5g (multi-
 output periodic classes), 6.2.b.5j (edge-pattern-driven class
 refinement), 6.2.b.5i.1 (per-export key refactor), 6.2.b.5i.2
 (aliased-inline emission for periodic classes), 6.2.b.5i.3
-(period-1 aliased re-route), **6.2.b.5i.4 (post-loop aliased
-export lift, 2026-04-21)** + extensive test fixtures
-(2026-04-21).
+(period-1 aliased re-route), 6.2.b.5i.4 (post-loop aliased
+export lift), **6.2.b.5i.5 (LoopCarry-alias redirect, commit
+`428eb491b`, 2026-04-22)** + extensive test fixtures.
 
-**6.2.b.5i.4 specifically**: post-loop consumers of short aliased
+**6.2.b.5i.5 specifically** (the cascade fix): when aliased class C's
+`output_alias` for export `(pos, slot)` points at a boundary input
+whose provenance is `LoopCarry { producer_class: Y, producer_pos:
+Ypos, .. }`, C's in-place kernel mutates the OwnedTensor backing Y's
+carry var. An `alias_carry_redirect: BTreeMap<(C,pos,slot),
+(Y,Ypos,Yslot)>` is built once after `aliased_classes`; the
+`resolve_carry` closure applies it in (a) `carry_inits` construction
+(aliased keys never enter `carry_producers`) and (b) LoopCarry read
+sites in `emit_fragment_call_expr` + `emit_aliased_class_inline`
+(reads resolve to the underlying `__carry_cY_pYpos_sYslot` ident).
+
+Scope narrowly covers LoopCarry-aliased exports. PreLoop-alias-to-
+carry-producer remains refused by the existing guard (separate
+follow-up; hasn't surfaced as a blocker in shipping fleets since
+no shipping architecture puts a PreLoop source on an aliased
+export that is itself carry-producing).
+
+Red→green TDD proof via `FAR_CASCADE_BODY` fixture (llama-shape +
+silu + mul, minus rope_append/attention so 5m doesn't mask the
+cascade): with `resolve_carry` stubbed to identity, `emission_red::
+far_cascade_emission_is_structurally_sound` + `emission_red::
+far_cascade_carry_update_does_not_move_gpu_tensor` both panic with
+"5i.5 scope" refusal; restoring the redirect makes them green.
+
+**6.2.b.5i.4 (prior)**: post-loop consumers of short aliased
 periodic classes now lift exports via the hoisted `Option<GpuTensor>`
 — `let #local = unsafe { __cC_out_P_S.as_ref().expect(..).as_view() };`
 produces a `TensorView<'_>` that downstream `emit_subgraph` reads
@@ -503,127 +552,128 @@ through `(*#local).as_view()` (TensorView: Deref<GpuTensor>). Full-
 period aliased classes post-loop still refuse (per-iter TensorView
 bindings don't outlive the loop scope).
 
-5i.4 also exposed a cascade that the old class-10 post-loop
-refusal had been masking. A narrow guard now refuses it with a
-specific message — see below. `cargo check -p ferrite-models --features cuda` with
-`FERRITE_STENCIL_CODEGEN=1` is clean across all 218 variants;
-collapsed path fires on 3 commandr variants (degenerate empty-loop).
-llama / mistral / phi3 / qwen2 now refuse at a narrower gate:
-`pre/post_loop class N aliased impl depends on class M in a
-forbidden partition` — the layer-0 and/or layer-N-1 FusedAddRmsNorm
-that the refinement peels into pre_loop/post_loop classes whose
-boundary inputs (the attention output of layer 0, or the `down`
-projection of layer N-1) live in periodic classes. Other fleets
-unchanged (gemma*/granite: `offsets_consistent=false`; qwen3:
-`uniform_pairs=false`).
+**Post-5i.5 fleet state (2026-04-22)**: cascade gate cleared for
+the llama/mistral/phi3/qwen2 fleets. Per-variant refusal now surfaces
+the NEXT blocker: 5m (`class N pos P slot S referenced downstream but
+not owned (output_alias untracked or aliased) — 5g scope refuses`).
+5m is the acceptance-gate prerequisite for llama; full FAR_DECODER
+emission unblocks when 5m lands.
 
-## Next concrete step — 5i.5 (the cascade fix)
+## Next concrete step — 5m (referenced-downstream-not-owned)
 
-**What 5i.5 must accomplish** (encoded as the ignored red test
-`codegen::tests::emission_red::far_decoder_emits_successfully`):
-make `try_emit_collapsed_bucket` produce a valid TokenStream for
-the full llama decoder body. Today it refuses with either:
+**What 5m must accomplish** (acceptance gate: the ignored red test
+`codegen::tests::emission_red::far_decoder_emits_successfully` flips
+green — 5i.5 already cleared the cascade, so 5m is the LAST refusal
+blocking full llama decoder emission).
 
-- `class N pos P slot S referenced downstream but not owned
-  (output_alias untracked or aliased) — 5g scope refuses` (5m, 153
-  llama variants) — precedes cascade in emission, so must be fixed
-  first OR in tandem.
-- `aliased class N pos P slot S is a carry producer but its alias
-  doesn't route through a LoopCarry boundary — cross-iter tracking
-  of the aliased upstream OwnedTensor not yet supported (5i.5
-  scope)` (cascade, 183 llama variants).
-
-Both gates must clear before llama emits. 5i.5 targets the
-cascade; 5m is independent.
-
-**Why the cascade happens** (the spec, encoded in tests):
-
-A cascade key is `(aliased_class C, pos, slot)` where:
-- `(C, pos, slot) ∈ carry_producers` — some consumer reads C's
-  export via LoopCarry;
-- `(C, pos, slot) ∉ alias_through_carries` — no aliased downstream
-  closes the chain by mutating the carry buffer in place.
-
-When the consumer is *another aliased class*, its alias walk
-inserts C's key into `alias_through_carries` (the in-place kernel
-mutates the carry) and no cascade fires. When the consumer is
-*non-aliased* (llama: c8's rmsnorm_out → c2 QKV Gemm), the key
-stays uncovered — and the end-of-iter update `__carry = __cC_out`
-fails (GpuTensor-view RHS vs OwnedTensor LHS, *and* the GpuTensor
-aliases a per-iter-fresh upstream OwnedTensor that's already
-dead).
-
-This shape is pinned in two tests:
-- `chain_vs_cascade::far_simple_carry_producers_all_alias_through`
-  (FAR_SIMPLE, currently green — pure aliased chain).
-- `chain_vs_cascade::far_decoder_has_uncovered_carry_producer`
-  (FAR_DECODER, currently green — demonstrates the cascade
-  exists). **When 5i.5 lands, this test's assertion flips** and
-  `uncovered` becomes empty.
-
-**The fix plan (probably)**:
-
-For each cascade key `(C, pos, slot)` where the alias src's
-boundary provenance is IntraIter or PreLoop (pinned by
-`emission_red::aliased_nonloopcarry_srcs_are_intraiter_or_preloop`):
-
-1. Create a new carry var `__alias_carry_cC_pP_sS` alongside the
-   existing `__carry_cC_pP_sS`. The new one holds the OwnedTensor
-   backing the aliased output — NOT the carry'd class's own
-   OwnedTensor (which doesn't exist for aliased classes).
-2. Initialize it from the alias src:
-   - IntraIter producer → the upstream class's OwnedTensor at end
-     of iter (move into `__alias_carry`).
-   - PreLoop producer → the pre-loop local directly.
-3. Skip the old `__carry = __cC_out` update. The consumer reads
-   `__alias_carry` instead of `__carry`.
-
-Or alternatively: rewire the consumer's LoopCarry provenance so
-`producer_class` is the alias src's producer (not the aliased
-class). Then `carry_producers` points at a non-aliased class
-whose output IS an OwnedTensor. Less code-generation change,
-more provenance-walker change. Both paths need the same
-spec: every cascade key becomes handled.
-
-**Before writing code**:
-
-```bash
-cargo test -p ferrite-forward-macro --lib codegen::tests \
-    -- --include-ignored
+**The refusal today** (line ~4517 in codegen.rs):
 ```
+class N pos P slot S referenced downstream but not owned
+(output_alias untracked or aliased) — 5g scope refuses
+```
+Concretely for FAR_DECODER at nt=1: `class 2 pos 3 slot 1`. Class 2
+is the (QKV Gemm + RopeAppend) subgraph; pos 3 slot 1 = the
+rope_append tile's K paged-cache view output. The 5g ownership walk
+(`class_owned_exports` at codegen.rs:4430-4438) only counts
+`output_alias` entries with `src=None` as "owned"; rope_append emits
+those slots with `src=Some(kv_cache_view)` — structurally an alias
+into the kv_cache, not an OwnedTensor. The fragment-path emission
+wouldn't be able to return them as OwnedTensor anyway, BUT they're
+written in-place by the kernel and don't need to be returned — they
+only need to be *acknowledged* as "legitimately referenced but
+side-effecting, not OwnedTensor-owned".
 
-Expected today: 35 green, 1 failing (`far_decoder_emits_successfully`).
-The ONE failure is the gate. When it turns green, 5i.5 is done
-— and it won't turn green unless 5m also lands, so 5i.5 in
-isolation may leave the red test red while another test
-(`chain_vs_cascade::far_decoder_has_uncovered_carry_producer`
-flipping to expect-empty) moves to green. Either way the test
-suite tells you where you are.
+**Fleet breakdown (post-5i.5)**:
 
-**Add tests BEFORE touching codegen** when you:
-- Hypothesize about a new shape ("gemma's post-loop multi-tile
-  also has X"). Build a fixture first.
-- Read a confusing diagnostic ("why is key Y in the set?"). Pin
-  it in `chain_vs_cascade` style.
-- Plan a code change ("I'll rewire `carry_producers` keys").
-  Add a test asserting the old shape AND one asserting the new
-  shape. The `#[ignore]` on the new one becomes your TODO list.
+| Arch fleet | Refusal today | Count | Next step |
+|---|---|---|---|
+| llama / mistral / phi3 / qwen2 | `class 2 pos 3 slot 1 referenced downstream but not owned — 5g scope refuses` | 153 llama + 100 qwen2 + 21 phi3 + 18 mistral | **5m (this session)** |
+| commandr (subset) | 1 variant on 5m; 3 variants green happy-path (empty loop) | 4 | 5m for the one; rest done |
+| gemma2 / granite | `offsets_consistent=false` | — | 5h (richer offset solver) |
+| qwen3 / gemma3 | `uniform_pairs=false` | — | 5l (finer refinement signature) |
 
-**Test-suite note**: `cargo test -p ferrite-forward-macro --lib`
-(whole crate) has 2 pre-existing failures (`config::tests::
-load_real_llama_configs`, `…_qwen2_configs`) asserting on
-variant-count totals — unrelated to codegen, skip or update
-separately. Filter to `codegen::tests` to avoid them.
+**Fix-plan sketch**:
+
+The rope_append K/V views aren't truly "downstream consumed" as
+tensor values — they're consumed implicitly via the kv_cache data
+structure which the attention tile reads separately. So the fix is
+probably one of:
+
+1. **Teach `class_owned_exports` to recognize the kv_cache-alias
+   pattern** — an `output_alias` entry with `src=Some(_)` whose src
+   is NOT a claimed-tile input AND whose semantics is "in-place
+   write to a kv_cache view" should be classified as "side-effect
+   export, no fragment return value needed". The fragment still
+   emits the write (via `emit_call`'s existing machinery) but
+   doesn't include the slot in `returned_exports`.
+
+2. **Prune `referenced_exports[c]` for kv_cache write slots** —
+   downstream consumers that read K/V from the kv_cache via
+   `attention(kv_cache[layer])` resolve the read at the cache
+   level, not as a tile-output LoopCarry/IntraIter edge. If the
+   provenance walker currently inserts these as LoopCarry/IntraIter
+   edges pointing at rope_append's slot 1 / slot 2, that's the
+   miscategorization. Trace the provenance from the attention class
+   back to verify.
+
+Option (1) is probably lighter-touch: one new case in
+`class_owned_exports`, no provenance-walker changes. Option (2) is
+more invasive but structurally cleaner.
+
+**Test-driven methodology (MANDATORY — per `feedback_unit_tests_not_
+cargo_check` in memory)**:
+
+1. Start by writing a fixture/test that reproduces the 5m refusal.
+   `FAR_DECODER_BODY` already triggers it at nt=1 — verify with:
+   ```bash
+   cargo test -p ferrite-forward-macro --lib \
+       codegen::tests::emission_red::far_decoder_emits_successfully \
+       -- --include-ignored --nocapture
+   ```
+   Expected: panics with the 5m message. That's the RED test to
+   make green.
+
+2. If you need a scope-narrowed fixture (5m without the full llama
+   complexity), mirror the FAR_CASCADE_BODY approach from 5i.5:
+   strip down to the minimal ops that still hit the gate. A
+   `ROPE_ONLY_BODY` — embed → for layer: rope_append(...) —
+   probably suffices. Add to the `fixture` module.
+
+3. Before every codegen change, ask "what test catches this if I
+   break it?" — if no existing test covers the shape, add one
+   FIRST. Never run `cargo check -p ferrite-models --features
+   cuda` as verification; it's a minutes-long fleet rebuild and
+   tells you nothing structural. Use `cargo test -p
+   ferrite-forward-macro --lib codegen::tests` (0.3s).
+
+4. Red→green proof: after the fix lands, temporarily revert it
+   (comment out the new case in `class_owned_exports`) and confirm
+   the test goes red; restore and confirm green. Same pattern that
+   proved 5i.5 in commit `428eb491b`.
+
+**Expected terminal state**:
+- `emission_red::far_decoder_emits_successfully` removes its
+  `#[ignore]` and is green — the full llama decoder emits.
+- 36+ codegen tests pass; no regressions.
+- Fleet `cargo check -p ferrite-models --features cuda` with
+  `FERRITE_STENCIL_CODEGEN=1` clean across llama/mistral/phi3/qwen2
+  variants. (Still separate: 5h for gemma/granite, 5l for
+  qwen3/gemma3, 5k for post-loop multi-tile.)
+
+**Pointers**:
+- `codegen.rs::class_owned_exports` — the ownership walk. Currently
+  strict about `src=None`; needs a recognizer for the kv_cache
+  alias pattern.
+- `codegen.rs::try_emit_collapsed_bucket` ~line 4517 — where the
+  refusal message lives.
+- `impl_lib.rs::FusedQkvRopeCacheImpl`, `RopeAppendRef`, and the
+  multi-output `_fp8` / `_interleaved` variants — concrete `emit_
+  call` + `output_alias` shape for rope_append. Source of truth
+  for what "kv_cache alias" looks like structurally.
+- `emit.rs::WeightLayout` — probably irrelevant for 5m but handy
+  reference for how emission threads through the macro.
 
 ## Other open follow-ups
-
-**5m — referenced-downstream-not-owned** (153 llama, 100 qwen2,
-21 phi3, 18 mistral, 1 commandr): pre-existing from 5g scope.
-A non-aliased periodic class has an export whose `output_alias`
-entry is not recognized as owned by the 5g ownership walk —
-typically `rope_append`'s K/V paged-cache views at pos 3 slot 1.
-Fix scope lives in `class_owned_exports` + the 5g precondition
-walk at codegen.rs:4430-4438. Independent of 5i.5.
 
 **5k — post-loop multi-tile** (gemma2 / granite): `class N slot 0
 referenced by post-loop from multiple tiles`. Moderate scope.
@@ -675,20 +725,21 @@ All under `vllm-rs/crates/ferrite-forward-macro/src/`:
 - `emit.rs::EmitCtx` / `WeightLayout::access_tokens_with_repeat`
   — how weight indexing threads through `__repeat`.
 
-## Refusal distribution (post-5i.4, 2026-04-21)
+## Refusal distribution (post-5i.5, 2026-04-22)
 
 | Arch fleet | Refusal reason | Next-step path |
 |---|---|---|
-| llama / mistral / phi3 / qwen2 / commandr (rest) — **183** | `aliased class N pos P slot S is a carry producer but its alias doesn't route through a LoopCarry boundary — 5i.5 scope` | **5i.5 (this session's target)** — cross-iter track the aliased upstream OwnedTensor. Red test: `emission_red::far_decoder_emits_successfully` + flip of `chain_vs_cascade::far_decoder_has_uncovered_carry_producer` |
-| llama / mistral / phi3 / qwen2 / commandr (rest) — **153** | `class 2 pos 3 slot 1 referenced downstream but not owned (output_alias untracked or aliased) — 5g scope refuses` | **5m** — multi-output tile (rope_append K/V) tracking in `class_owned_exports`. Independent of 5i.5; both needed for full llama unlock |
+| llama / mistral / phi3 / qwen2 / commandr (rest) — **~292** | `class N pos P slot S referenced downstream but not owned (output_alias untracked or aliased) — 5g scope refuses` | **5m (next session's target)** — rope_append K/V kv_cache-alias recognition in `class_owned_exports`. Last gate before `emission_red::far_decoder_emits_successfully` flips green. |
 | gemma2 / granite | `class N slot 0 referenced by post-loop from multiple tiles` | **5k** (post-loop multi-tile export) — moderate |
 | qwen3 / gemma3 | `uniform_pairs=false` (1 residual pair each) | **5l** (finer refinement signature) — signature tuning |
 | commandr (3 variants) | ✅ happy path (degenerate empty loop) | — |
 
-Note: 5i.4 didn't flip any fleet green — it refined the refusal
-reason on the llama fleet from post-loop-unsupported to the
-specific cascade shape so 5i.5 has a precise target. Fleet
-unlocks start when 5m + 5i.5 both land.
+Note: 5i.5 cleared the cascade gate for 183 llama-fleet variants.
+Those now refuse at the 5m gate (already dominant on llama);
+combined with the pre-existing 153 variants that refused at 5m,
+the llama fleet's remaining refusal count is driven entirely by 5m.
+Full fleet unlock (full FAR_DECODER emission via `vllm chat`) lands
+when 5m + weight-indexing verification both complete.
 
 **6.2.b.5i.3 — period-1 aliased re-route (landed 2026-04-21).**
 `StencilBundle::schedule` now takes `lib: &ImplementationLibrary`

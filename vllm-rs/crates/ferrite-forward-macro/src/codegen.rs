@@ -4265,6 +4265,77 @@ fn try_emit_collapsed_bucket(
         alias_carry_redirect.get(&k).copied().unwrap_or(k)
     };
 
+    // ── preloop-init for aliased carry-producing exports ────────────
+    //
+    // When aliased class C's `output_alias[(pos, slot)]` has
+    // `src = Some((src_tile, src_slot))` whose boundary-input origin
+    // is `PreLoop { producer_sg }`, and (C, pos, slot) is itself a
+    // carry producer read by a downstream aliased class via
+    // alias-through-carry: the carry needs a pre-loop init from
+    // `producer_sg`, and C's inline emission must route the src
+    // boundary local to the carry var so its in-place kernel mutates
+    // the carry buffer directly (no separate ownership).
+    //
+    // Without this, the pre-loop hoist emits `Option<OwnedTensor>
+    // = None` that nothing ever writes — any downstream reader
+    // panics with "aliased inline: init-less carry read before
+    // producer fired" at iter ≥ 1. Discovered on llama-3.2-3b
+    // chat (2026-04-22 evening).
+    //
+    // Key by (C, pos, slot); value is the (src_sg, src_tile,
+    // src_slot) tuple so `emit_aliased_class_inline` can both
+    // (a) look up the src's pre-loop local for carry-init and
+    // (b) override `inline_locals[(src_tile, src_slot)]` to point
+    // at `carry_var_ident(C, pos, slot)`.
+    let alias_preloop_inits: BTreeMap<(usize, u8, u8), (SubgraphId, TileId, u8)> = {
+        let mut m: BTreeMap<(usize, u8, u8), (SubgraphId, TileId, u8)> = BTreeMap::new();
+        for &c in &aliased_classes {
+            let rep = stencil.class_members[c][0];
+            let claimed = sfuf.tiles_in_subgraph(rep);
+            let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+            let imp_id =
+                stencil.class_impl_id[c].ok_or_else(|| format!("class {c} has no impl"))?;
+            let imp = lib.get(imp_id);
+            let aliases = imp.output_alias(&claimed, fuf);
+            let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+            let mut seen: HashSet<(TileId, u8)> = HashSet::new();
+            for &t in &claimed {
+                for input in &fuf.get(t).inputs {
+                    if let FufInput::Tile { id, slot } = input
+                        && !claimed_set.contains(id)
+                        && seen.insert((*id, *slot))
+                    {
+                        tile_params_ordered.push((*id, *slot));
+                    }
+                }
+            }
+            let Some(ci) = provenance.iter().find(|ci| ci.consumer_class == c) else {
+                continue;
+            };
+            for ((out_tile, out_slot), src) in aliases.iter() {
+                let Some(pos) = claimed.iter().position(|x| x == out_tile) else {
+                    continue;
+                };
+                let Some((src_tile, src_slot)) = src else {
+                    continue;
+                };
+                let Some(bidx) = tile_params_ordered
+                    .iter()
+                    .position(|(t, s)| t == src_tile && s == src_slot)
+                else {
+                    continue;
+                };
+                let s = &ci.slots[bidx];
+                let InputOrigin::PreLoop { producer_sg } = &s.origin else {
+                    continue;
+                };
+                let key = (c, pos as u8, *out_slot);
+                m.insert(key, (*producer_sg, *src_tile, *src_slot));
+            }
+        }
+        m
+    };
+
     // Pre/post loop classes must be period-1 (analysis already does
     // this but assert defensively). An aliased-emittable pre/post-loop
     // class is emitted via `emit_subgraph`'s Concrete inline fallback,
@@ -4374,6 +4445,24 @@ fn try_emit_collapsed_bucket(
                 }
             }
         }
+    }
+    // Overlay: aliased carry producers whose alias src is PreLoop
+    // get their carry initialized from that PreLoop subgraph. Only
+    // applies when the (c, pos, slot) key is already a carry
+    // producer (some downstream reads it via LoopCarry) AND no prior
+    // `Some(_)` init was already merged in from a consumer's
+    // `pre_loop_init_sg`. The `c7` case in FAR_DECODER — where a
+    // downstream consumer *does* provide `pre_loop_init_sg` — keeps
+    // its existing init; the `c5` case — where no consumer provided
+    // one — picks up the aliased-class's PreLoop alias src here.
+    for (&key, &(sg, _, _)) in &alias_preloop_inits {
+        if !carry_inits.contains_key(&key) {
+            continue;
+        }
+        if carry_inits[&key].is_some() {
+            continue;
+        }
+        carry_inits.insert(key, Some(sg));
     }
     let carry_producers: BTreeSet<(usize, u8, u8)> = carry_inits.keys().copied().collect();
 
@@ -4903,6 +4992,7 @@ fn try_emit_collapsed_bucket(
                 &short_classes,
                 &aliased_classes,
                 &alias_carry_redirect,
+                &alias_preloop_inits,
             )?;
             loop_body.push(tokens);
             continue;
@@ -5007,12 +5097,24 @@ fn try_emit_collapsed_bucket(
     // Keyed per (producer_class, producer_pos, producer_slot) — each
     // carried export reads its own `__cC_out_P_S` binding.
     for &(pc, pos, slot) in &carry_producers {
-        // Alias-through-carry: the in-place kernel for this carry's
-        // producing class already mutated the carry's backing buffer
-        // during its emit_call, so the end-of-iter reassignment is
-        // both redundant and a type mismatch (`__cC_out_P_S:
-        // TensorView` vs `__carry: OwnedTensor`).
-        if alias_through_carries.contains(&(pc, pos, slot)) {
+        // Alias-through-carry skip applies only when the producer
+        // class is itself aliased. Aliased classes' outputs are
+        // `TensorView` (or `Option<GpuTensor>` for short aliased),
+        // neither assignable to `__carry: Option<OwnedTensor>`. The
+        // in-place kernel mutated the carry buffer during its own
+        // emit_call (for aliased-emittable producers whose alias src
+        // routes to the carry — the `alias_preloop_inits` /
+        // `alias_carry_redirect` machinery — or via a downstream
+        // alias-through consumer's mutation).
+        //
+        // For NON-aliased producers (e.g. a standalone Gemm in
+        // `alias_through_carries` because some downstream aliased
+        // consumer's LoopCarry alias src pointed at it), the producer
+        // emits a fresh `OwnedTensor` each iter; the normal
+        // `__carry = __cC_out` update must run or the carry goes
+        // stale (c7-in-llama shape, pre-fix: "__carry_c7 never
+        // updates" → wrong data on every iter ≥ 2).
+        if alias_through_carries.contains(&(pc, pos, slot)) && aliased_classes.contains(&pc) {
             continue;
         }
         let carry = carry_var_ident(pc, pos, slot);
@@ -5571,6 +5673,7 @@ fn emit_aliased_class_inline(
     short_classes: &BTreeSet<usize>,
     _aliased_classes: &BTreeSet<usize>,
     alias_carry_redirect: &BTreeMap<(usize, u8, u8), (usize, u8, u8)>,
+    alias_preloop_inits: &BTreeMap<(usize, u8, u8), (SubgraphId, TileId, u8)>,
 ) -> Result<TokenStream, String> {
     let rep_sg = class_inputs.rep_sg;
     let imp_id =
@@ -5611,8 +5714,44 @@ fn emit_aliased_class_inline(
     // `TensorView<'_>` ident that derefs to `GpuTensor` uniformly.
     let mut inline_locals: LocalMap = locals.clone();
     let mut prelude: Vec<TokenStream> = Vec::new();
+
+    // Build a reverse map: (src_tile, src_slot) → (pos, slot) for this
+    // class's alias-preloop-init exports. When iterating boundary
+    // inputs below, any boundary tile matching one of these src pairs
+    // gets its inline_local override routed to the carry var (so
+    // the in-place kernel mutates the carry buffer).
+    //
+    // Only emit the override when the corresponding carry_var is
+    // actually hoisted — i.e. (c, pos, slot) ∈ carry_producers. An
+    // `alias_preloop_inits` entry may exist for an export nobody
+    // reads via LoopCarry (e.g. commandr's shape), in which case
+    // no carry var exists and the override would emit a dangling
+    // ident. Fall back to the normal PreLoop resolution for those.
+    let preloop_override: HashMap<(TileId, u8), (u8, u8)> = alias_preloop_inits
+        .iter()
+        .filter_map(|(&(cc, pos, slot), &(_sg, src_tile, src_slot))| {
+            if cc != c {
+                return None;
+            }
+            if !carry_producers.contains(&(c, pos, slot)) {
+                return None;
+            }
+            Some(((src_tile, src_slot), (pos, slot)))
+        })
+        .collect();
+
     for (i, slot) in class_inputs.slots.iter().enumerate() {
         let (btile, bslot) = tile_params_ordered[i];
+        // Preloop-init override: this boundary input is the alias src
+        // of a carry-producing export; route it to `__carry_cC_pP_sS`
+        // so emit_call's in-place kernel mutates the carry buffer.
+        // The carry's pre-loop hoist is a direct OwnedTensor from
+        // the same PreLoop subgraph, so `*#carry_ident` typechecks
+        // identically to `*#preloop_local`.
+        if let Some(&(pos, sl)) = preloop_override.get(&(btile, bslot)) {
+            inline_locals.insert((btile, bslot), carry_var_ident(c, pos, sl));
+            continue;
+        }
         let repl = match &slot.origin {
             InputOrigin::IntraIter {
                 producer_class,
@@ -5672,11 +5811,17 @@ fn emit_aliased_class_inline(
                     // work uniformly. The `unsafe` is required by
                     // `GpuTensor::as_view`.
                     let view = format_ident!("__carry_view_c{}_p{}_s{}", key.0, key.1, key.2);
+                    let expect_msg = proc_macro2::Literal::string(&format!(
+                        "aliased class c{c} boundary_input[{i}] (tile={btile:?} slot={bslot}) \
+                         reads init-less carry from producer c{} p{} s{} \
+                         before producer fired at __repeat={{}}",
+                        key.0, key.1, key.2,
+                    ));
                     prelude.push(quote! {
                         let #view = unsafe {
                             #carry
                                 .as_ref()
-                                .expect("aliased inline: init-less carry read before producer fired")
+                                .unwrap_or_else(|| panic!(#expect_msg, __repeat))
                                 .as_view()
                         };
                     });
@@ -8041,17 +8186,36 @@ mod tests {
                     if let InputOrigin::LoopCarry {
                         producer_class,
                         producer_pos,
-                        ..
+                        pre_loop_init_sg,
                     } = slot.origin
                     {
                         carry_producers.insert((producer_class, producer_pos, slot.producer_slot));
+                        let consumer_offset = sched.class_offsets[ci.consumer_class];
+                        let consumer_period = stencil.class_members[ci.consumer_class].len();
+                        let producer_offset = sched.class_offsets[producer_class];
+                        let producer_period = stencil.class_members[producer_class].len();
+                        let consumer_lo = consumer_offset;
+                        let consumer_hi = consumer_offset + consumer_period;
+                        let producer_lo_plus_one = producer_offset + 1;
+                        let producer_hi_plus_one = producer_offset + producer_period + 1;
+                        let coverage_gap_lo =
+                            consumer_lo < producer_lo_plus_one && pre_loop_init_sg.is_none();
+                        let coverage_gap_hi = consumer_hi > producer_hi_plus_one;
                         eprintln!(
-                            "  consumer=c{} reads LoopCarry from c{} pos={} slot={} (producer_tile={:?})",
+                            "  consumer=c{} (iters [{}..{})) reads LoopCarry from c{} pos={} slot={} (producer fires [{}..{}) → carry populated for [{}..{})) init={:?} gap_lo={} gap_hi={}",
                             ci.consumer_class,
+                            consumer_lo,
+                            consumer_hi,
                             producer_class,
                             producer_pos,
                             slot.producer_slot,
-                            slot.producer_tile
+                            producer_offset,
+                            producer_offset + producer_period,
+                            producer_lo_plus_one,
+                            producer_hi_plus_one,
+                            pre_loop_init_sg,
+                            coverage_gap_lo,
+                            coverage_gap_hi,
                         );
                     }
                 }
@@ -8191,6 +8355,111 @@ mod tests {
                  to the fragment's `repeat: usize` param must be the \
                  bare global loop var. (Guards use \
                  `__repeat >= offset`, not subtraction.)"
+            );
+        }
+
+        /// Structural pin against the 5i.5 alias-through-carry
+        /// initialization gap.
+        ///
+        /// **Bug this test guards against** (discovered via runtime
+        /// panic `aliased inline: init-less carry read before producer
+        /// fired` on llama-3.2-3b): when an aliased class's alias
+        /// source is `LoopCarry { producer_class: Y, .. }`, 5i.5 adds
+        /// `(Y, pos, slot)` to `alias_through_carries` and the
+        /// end-of-iter carry update loop skips it (correct — the
+        /// aliased class's in-place kernel mutated the carry's
+        /// backing OwnedTensor during its emit_call, so the textual
+        /// reassignment would be redundant and type-mismatched). But
+        /// the pre-loop hoist emits
+        /// `let mut __carry_cY_pP_sS: Option<OwnedTensor> = None;` and
+        /// **no `Some(...)` ever gets written into it**. Any consumer
+        /// reading that carry via `.as_ref().expect(...)` panics at
+        /// iter ≥ 1. For FAR_DECODER this fires on (c5,0,0) and
+        /// (c7,0,0).
+        ///
+        /// The invariant: every hoisted `__carry_c.._p.._s..:
+        /// Option<OwnedTensor> = None` must have at least one
+        /// corresponding `__carry_c.._p.._s.. = ` write somewhere in
+        /// the emitted bucket body.
+        ///
+        /// Red pre-fix, green post-fix. The fix must arrange for
+        /// every alias-through-carry to either (a) get a pre-loop
+        /// `Some(...)` init from the aliased class's alias src's
+        /// upstream producer, or (b) not be skipped so the end-of-iter
+        /// update runs.
+        #[test]
+        fn far_decoder_no_orphan_initless_carries() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let tokens = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            )
+            .expect("FAR_DECODER must emit");
+            let text = tokens.to_string();
+
+            // Collect `__carry_cN_pP_sS` idents initialized to
+            // `Option::None`. The token stream is space-separated,
+            // so we can scan linearly.
+            let hoist_markers: Vec<String> = text
+                .split("let mut ")
+                .skip(1)
+                .filter_map(|tail| {
+                    let ident = tail.split_whitespace().next()?;
+                    if !ident.starts_with("__carry_c") {
+                        return None;
+                    }
+                    // Only init-less hoists — `= None` (with any
+                    // whitespace around the type annotation). Look
+                    // for `None` as a standalone token after `=`.
+                    if !tail.contains("= None") {
+                        return None;
+                    }
+                    Some(ident.to_string())
+                })
+                .collect();
+            // No init-less hoists at all is fine — it means every
+            // carry has a pre-loop init (the post-fix FAR_DECODER
+            // state). The invariant we pin is "every init-less hoist
+            // has a subsequent assignment" — vacuously true when
+            // there are none.
+
+            // For each hoist, look for an assignment `#ident =`
+            // anywhere else in the stream. If none exists, it's a
+            // runtime panic waiting to happen.
+            let orphans: Vec<String> = hoist_markers
+                .iter()
+                .filter(|ident| {
+                    // Assignment signature in the space-separated
+                    // stream: `<ident> = `. Hoist site is already
+                    // matched by `let mut <ident> = None`, so we look
+                    // for a second `<ident> =` occurrence.
+                    let pattern = format!("{ident} = ");
+                    text.matches(&pattern).count() < 2
+                })
+                .cloned()
+                .collect();
+            assert!(
+                orphans.is_empty(),
+                "init-less carries hoisted as Option<OwnedTensor> = None but never \
+                 assigned anywhere in the loop: {orphans:?}. \
+                 These are runtime panics (aliased inline: init-less carry read \
+                 before producer fired) — 5i.5 alias_through_carries skip logic \
+                 removed the end-of-iter write but never added a replacement init."
             );
         }
     }

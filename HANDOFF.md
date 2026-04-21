@@ -822,6 +822,14 @@ landed in `ffa3dba0e` as a zero-compiler-change test add.** Previous sessions'
 FP8 state (all three slices green) still holds; the details and follow-ups
 for FP8 live below.
 
+**FP8 threshold=5 investigation status (April 2026):** Item #6 (CUDA-graph
+vs eager) was tested end-to-end and **falsified as sole cause** —
+graphs-off still fails threshold=5, though graphs contribute a real
+secondary drift. Item **#1c (workspace allocator)** is now the primary
+lead for closing #1b, with #7 (per-token scale-value comparison) as the
+fallback. See #6 for the A/B artifacts and #1b for the updated
+suspect list.
+
 **What landed in `ffa3dba0e`:**
 - `test_cuda_correctness_gemma2_2b_awq` against
   `solidrust/dolphin-2.9.4-gemma2-2b-AWQ` (dolphin-2.9.4 fine-tune,
@@ -996,7 +1004,10 @@ disambiguation on `.input_scale` landed alongside it.
     ferrite-forward Impls. Prime suspects: tile selection differs
     from vllm's sm89 dispatch CSV; or epilogue EVT assembly differs;
     or the workspace-aliasing hazard in item 1c occasionally corrupts
-    the partial-sum buffer.
+    the partial-sum buffer. **Primary lead = #1c** (workspace
+    allocator); graph-capture hypothesis #6 was tested and falsified
+    as sole cause (see #6 for the A/B results — it contributes a
+    secondary drift but graphs-off still fails threshold=5).
 1c. **Harden CUTLASS workspace allocation** (latent hazard, not
     confirmed symptom). `scaled_mm_c2x.cuh:156,169` uses
     `cudaMallocAsync`/`cudaFreeAsync` on the device's **default
@@ -1049,18 +1060,24 @@ disambiguation on `.input_scale` landed alongside it.
    format that ships the same tensor name needs to be added to
    the `fp8_exclusion` tuple the same way, or it'll never
    fingerprint-match.
-6. **CUDA-graph vs eager drift hypothesis for item 1b.** Python
-   goldens are generated with `enforce_eager=True` (per
-   `scripts/generate_golden_refs.py` — FP8 CUDA-graph capture
-   produces nondeterministic output across runs). Ferrite runs
-   with graphs on. This **structurally explains** "position 0
-   matches, positions 1+ diverge" — prefill runs once without
-   graph, each decode step is a captured replay. Before chasing
-   further wrapper-level theories, test with ferrite's graph
-   capture disabled on a failing FP8 prompt; if drift
-   disappears, the real fix is regenerating goldens with graph
-   mode ON or confirming ferrite's graph capture is semantically
-   graph-determinism-safe.
+6. ~~**CUDA-graph vs eager drift hypothesis for item 1b.**~~
+   **TESTED — falsified as sole cause** (A/B in worktree
+   `/home/moosevan/vllm/.claude/worktrees/fp8-graph-exp`, branch
+   `exp/fp8-graph`, uncommitted tests `..._thr5_graphs_on` /
+   `..._thr5_graphs_off` in `vllm-rs/crates/vllm-e2e/tests/e_correctness.rs`;
+   logs at `/tmp/fp8-graphs-{on,off}.log`).
+   - Graphs-ON: prompt 0 fails at pos 4 (" be" → " handle").
+   - Graphs-OFF: prompt 0 reaches pos 27 (top-N warning, no hard
+     fail); prompt 1 fails at pos 1 (" figures" → " milestones").
+   - **Conclusion**: wrapper-level drift is real and sufficient on
+     its own to fail threshold=5 even with graphs off. Graph-replay
+     contributes a secondary, additive drift (shortens prompt 0's
+     agreement window from ~27 tokens to ~4) but is not the root
+     cause. Regenerating goldens with graphs ON would flatten the
+     secondary contribution but would not fix threshold=5.
+   - **Next lead for 1b is #1c** (workspace allocator) — see item
+     1b's pointer. Scale-value comparison (#7) is the fallback if
+     #1c lands clean and drift persists.
 7. **Scale-value comparison not done.** The quant *kernel* audit
    confirmed byte-equivalence, but nobody compared the f32
    `scale` tensor ferrite emits per-token against Python's on

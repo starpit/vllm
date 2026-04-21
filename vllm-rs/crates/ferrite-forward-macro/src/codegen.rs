@@ -4483,6 +4483,72 @@ fn try_emit_collapsed_bucket(
         referenced_exports[pc].insert((pos, slot));
     }
 
+    // ── side-effect exports (5m) ─────────────────────────────────
+    //
+    // Some impls produce output tile slots that are intentionally
+    // NOT tracked as returnable tensors — e.g. `FusedQkvRopeCacheImpl`'s
+    // K/V slots, which write through paged-cache views owned by the
+    // kv_cache pool rather than the caching allocator. The impl's
+    // `output_alias` map omits these slots entirely. Downstream
+    // consumers (decode `AttentionViaCacheImpl`) read the values
+    // through the kv_cache extern, not through the tile edge; their
+    // `emit_call` ignores slots 1/2 of the rope tile. But the FUF
+    // still records `Tile{id: rope, slot: 1/2}` as boundary inputs
+    // for serialization, and the provenance walker faithfully inserts
+    // them into `referenced_exports`.
+    //
+    // Result pre-fix: the 5g ownership walk refuses because the rope
+    // class's output_alias declares only slot 0, and slots 1/2 aren't
+    // expressible as OwnedTensor fragment returns anyway.
+    //
+    // Fix: recognize `(producer_class, pos, slot)` triples that are
+    // referenced by some consumer but ABSENT from the producer impl's
+    // output_alias as side-effect exports. These:
+    //   1. Stay out of the 5g ownership check (legitimately unowned).
+    //   2. Stay out of `class_returned_exports` (fragment doesn't
+    //      return them).
+    //   3. Are filtered from consumer fragments' `tile_params_ordered`
+    //      and matching `class_inputs.slots` — the consumer's
+    //      `emit_call` never references them, so the fragment
+    //      signature simply omits the arg.
+    //
+    // Scope: only non-aliased (fragmentizable) periodic classes;
+    // aliased-emittable classes have their own ownership story above.
+    let class_tracked_exports: Vec<BTreeSet<(u8, u8)>> = (0..n_classes)
+        .map(|c| {
+            if !periodic_set.contains(&c) || aliased_classes.contains(&c) {
+                return BTreeSet::new();
+            }
+            let Some(&rep) = stencil.class_members[c].first() else {
+                return BTreeSet::new();
+            };
+            let Some(imp_id) = stencil.class_impl_id[c] else {
+                return BTreeSet::new();
+            };
+            let imp = lib.get(imp_id);
+            let claimed = sfuf.tiles_in_subgraph(rep);
+            imp.output_alias(&claimed, fuf)
+                .into_iter()
+                .filter_map(|((t, s), _)| {
+                    claimed.iter().position(|x| *x == t).map(|p| (p as u8, s))
+                })
+                .collect()
+        })
+        .collect();
+    let mut side_effect_exports: BTreeSet<(usize, u8, u8)> = BTreeSet::new();
+    for &c in &sched.periodic {
+        if aliased_classes.contains(&c) {
+            continue;
+        }
+        let refs = referenced_exports[c].clone();
+        for (pos, slot) in refs {
+            if !class_tracked_exports[c].contains(&(pos, slot)) {
+                side_effect_exports.insert((c, pos, slot));
+                referenced_exports[c].remove(&(pos, slot));
+            }
+        }
+    }
+
     for &c in &sched.periodic {
         if aliased_classes.contains(&c) {
             // Aliased-emittable classes expose every `output_alias`
@@ -4851,6 +4917,7 @@ fn try_emit_collapsed_bucket(
             &carries_with_init,
             &class_returned_exports,
             &alias_carry_redirect,
+            &side_effect_exports,
         )?;
         let call = match (is_short, returned.len()) {
             // Full class, zero referenced exports: fragment returns `()`.
@@ -5117,6 +5184,7 @@ fn emit_fragment_call_expr(
     carries_with_init: &BTreeSet<(usize, u8, u8)>,
     class_returned_exports: &[Vec<(u8, u8)>],
     alias_carry_redirect: &BTreeMap<(usize, u8, u8), (usize, u8, u8)>,
+    side_effect_exports: &BTreeSet<(usize, u8, u8)>,
 ) -> Result<TokenStream, String> {
     let rep_sg = class_inputs.rep_sg;
     let imp_id = stencil.class_impl_id[consumer_class]
@@ -5124,6 +5192,27 @@ fn emit_fragment_call_expr(
     let imp = lib.get(imp_id);
     let claimed = sfuf.tiles_in_subgraph(rep_sg);
     let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+
+    // 5m filter: drop boundary entries whose producer export is a
+    // side-effect (e.g. rope_append's K/V slots, absent from
+    // `output_alias`). The consumer's `emit_call` never references
+    // these slots (decode attention reads K/V via the kv_cache
+    // extern); the fragment signature omits the corresponding
+    // `input_i` param. The filter must apply symmetrically to
+    // `class_inputs.slots` (below) so provenance stays aligned.
+    let is_side_effect_boundary = |id: TileId, slot: u8| -> bool {
+        let Some(producer_sg) = sfuf.subgraph_of(id) else {
+            return false;
+        };
+        let Some(&producer_class) = stencil.class_of.get(&producer_sg) else {
+            return false;
+        };
+        let prod_claim = sfuf.tiles_in_subgraph(producer_sg);
+        let Some(producer_pos) = prod_claim.iter().position(|&x| x == id) else {
+            return false;
+        };
+        side_effect_exports.contains(&(producer_class, producer_pos as u8, slot))
+    };
 
     // Boundary tile-input ordering must match `class_input_provenance`'s
     // dedup order so slot N in `class_inputs.slots` aligns with the
@@ -5135,16 +5224,26 @@ fn emit_fragment_call_expr(
             if let FufInput::Tile { id, slot } = input
                 && !claimed_set.contains(id)
                 && seen.insert((*id, *slot))
+                && !is_side_effect_boundary(*id, *slot)
             {
                 tile_params_ordered.push((*id, *slot));
             }
         }
     }
-    if tile_params_ordered.len() != class_inputs.slots.len() {
+    // Symmetric 5m filter on provenance slots — drop entries whose
+    // producer export is a side-effect. Must match the filter applied
+    // to `tile_params_ordered` above so positional alignment is
+    // preserved.
+    let filtered_input_slots: Vec<&InputSlot> = class_inputs
+        .slots
+        .iter()
+        .filter(|s| !is_side_effect_boundary(s.producer_tile, s.producer_slot))
+        .collect();
+    if tile_params_ordered.len() != filtered_input_slots.len() {
         return Err(format!(
             "class {consumer_class}: boundary input count mismatch (emit={}, provenance={})",
             tile_params_ordered.len(),
-            class_inputs.slots.len()
+            filtered_input_slots.len()
         ));
     }
 
@@ -5283,8 +5382,8 @@ fn emit_fragment_call_expr(
     CALL_SITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Call site: assemble input args per provenance slot.
-    let mut input_args: Vec<TokenStream> = Vec::with_capacity(class_inputs.slots.len());
-    for (i, slot) in class_inputs.slots.iter().enumerate() {
+    let mut input_args: Vec<TokenStream> = Vec::with_capacity(filtered_input_slots.len());
+    for (i, slot) in filtered_input_slots.iter().copied().enumerate() {
         // Positional alignment: slot i of provenance == (id, slot) of
         // tile_params_ordered[i]. Assert to catch any divergence.
         if (slot.producer_tile, slot.producer_slot) != tile_params_ordered[i] {
@@ -6338,6 +6437,40 @@ mod tests {
             final_norm = rmsnorm(hidden_states, norm);
             output = gemm(final_norm, lm_head);
         "#;
+
+        /// Narrow 5m fixture: QKV gemms + rope_append + attention +
+        /// o_proj, looped; no FAR, no MLP. Strips the body to the
+        /// minimum that still surfaces the 5m refusal (rope_append's
+        /// K/V paged-cache views are referenced by the downstream
+        /// attention tile's boundary inputs, but absent from
+        /// `FusedQkvRopeCacheImpl::output_alias` — the fragment can't
+        /// return them as OwnedTensor, and the 5g ownership walk
+        /// refuses).
+        ///
+        /// Picked by DP as:
+        ///   - one pre_loop embed class,
+        ///   - one periodic class (tags=["Gemm","Gemm","Gemm","RopeAppend"])
+        ///     with `FusedQkvRopeCacheImpl` claiming all four tiles,
+        ///   - one periodic Attention class,
+        ///   - one periodic o_proj Gemm class,
+        ///   - post_loop final rmsnorm + lm_head Gemm.
+        ///
+        /// The attention class's `Tile{id: rope, slot: 1/2}` boundary
+        /// inputs produce the 5m refusal at `class <rope-class> pos 3
+        /// slot 1 referenced downstream but not owned`.
+        pub const ROPE_ONLY_BODY: &str = r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                q = gemm(hidden_states, self_attn.q_proj[layer]);
+                k = gemm(hidden_states, self_attn.k_proj[layer]);
+                v = gemm(hidden_states, self_attn.v_proj[layer]);
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                attn = attention(q, k, v, kv_cache[layer], block_table);
+                hidden_states = gemm(attn, self_attn.o_proj[layer]);
+            }
+            final_norm = rmsnorm(hidden_states, norm);
+            output = gemm(final_norm, lm_head);
+        "#;
     }
 
     // ── stencil_bundle ──────────────────────────────────────────
@@ -6692,92 +6825,12 @@ mod tests {
     mod refusal {
         use super::*;
 
-        /// End-to-end: `emit_forward_collapsed_bucket` on a FAR
-        /// decoder refuses at one of the two known gates — 5m's
-        /// `class N pos P slot S referenced downstream but not
-        /// owned` (fires first for bodies with multi-output tiles
-        /// like rope_append whose paged-cache K/V slots aren't
-        /// tracked as owned) or the 5i.4 cascade. On the live
-        /// llama fleet (2026-04-21) 153 variants hit 5m and 183
-        /// hit the cascade — which one this fixture trips depends
-        /// on exact op topology.
-        ///
-        /// Either refusal proves the collapsed emitter currently
-        /// rejects the decoder. When 5m or 5i.5 lands, one of
-        /// these pinned substrings will flip — split this test
-        /// into a single-refusal assertion at that point.
-        #[test]
-        fn far_decoder_refuses_at_known_gate() {
-            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
-            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
-            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
-            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
-            let mut lib_frag = FragmentLibrary::default();
-            let wl = crate::emit::WeightLayout::new();
-            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
-            let res = try_emit_collapsed_bucket(
-                &stencil,
-                &sched,
-                prov.as_deref(),
-                &s.fuf,
-                &s.sfuf,
-                &s.program,
-                &s.model,
-                &s.lib,
-                wp,
-                &mut lib_frag,
-                &wl,
-            );
-            let err = res.expect_err("FAR decoder should refuse under current codegen");
-            let is_5m = err.contains("referenced downstream but not owned");
-            let is_cascade =
-                err.contains("carry producer") && err.contains("doesn't route through a LoopCarry");
-            assert!(
-                is_5m || is_cascade,
-                "expected 5m or 5i.4 cascade refusal, got: {err}"
-            );
-        }
-
-        /// The refusal is specifically on an aliased class — not
-        /// on offsets / provenance / uniform_pairs. If the first
-        /// failing precondition migrates to one of those, it
-        /// means something upstream regressed and we're no longer
-        /// testing the cascade at all.
-        #[test]
-        fn far_decoder_refusal_is_cascade_not_upstream() {
-            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
-            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
-            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
-            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
-            let mut lib_frag = FragmentLibrary::default();
-            let wl = crate::emit::WeightLayout::new();
-            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
-            let res = try_emit_collapsed_bucket(
-                &stencil,
-                &sched,
-                prov.as_deref(),
-                &s.fuf,
-                &s.sfuf,
-                &s.program,
-                &s.model,
-                &s.lib,
-                wp,
-                &mut lib_frag,
-                &wl,
-            );
-            let err = res.expect_err("still refusing");
-            for upstream in [
-                "offsets_consistent=false",
-                "uniform_pairs=false",
-                "homogeneous_periodic=false",
-                "provenance=None",
-            ] {
-                assert!(
-                    !err.contains(upstream),
-                    "refusal reason regressed to upstream '{upstream}': {err}"
-                );
-            }
-        }
+        // Historical notes: `far_decoder_refuses_at_known_gate` +
+        // `far_decoder_refusal_is_cascade_not_upstream` pinned the
+        // pre-5m state where FAR_DECODER_BODY tripped either the
+        // 5m ownership gate or the 5i.4 cascade. Both land, both
+        // removed — `emission_red::far_decoder_emits_successfully`
+        // is the canonical post-5m regression gate now.
 
         /// Body with no aliased classes (MINIMAL_BODY) → cascade
         /// refusal can't fire by construction (cascade guard only
@@ -6817,21 +6870,23 @@ mod tests {
         /// Every refusal message should fit the
         /// `emit_collapsed_refusal` format — a prefix + the
         /// diagnostic suffix (classes=, homogeneous=, …).
-        /// Covers the full output path from `try_emit_collapsed_bucket`
-        /// through `emit_collapsed_refusal`.
+        /// Calls `emit_collapsed_refusal` directly with a synthetic
+        /// reason string so the test remains meaningful regardless
+        /// of which live fixtures currently refuse (post-5m, none
+        /// of our in-module fixtures do; 5h/5l on the real fleet
+        /// still does).
         #[test]
         fn refusal_message_has_diagnostic_suffix() {
-            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
-            let tokens = emit_forward_collapsed_bucket(
-                &s.fuf,
-                &s.sfuf,
-                &crate::schedule::schedule(&s.fuf, &s.sfuf),
-                &s.program,
-                &s.model,
-                &s.lib,
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let tokens = emit_collapsed_refusal(
                 crate::solver::WorkloadPoint::num_tokens_only(1),
-                &mut FragmentLibrary::default(),
-                &crate::emit::WeightLayout::new(),
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                "synthetic reason for diagnostic-suffix format test",
             );
             let text = tokens.to_string();
             // Fields are embedded in a string literal inside
@@ -7439,13 +7494,12 @@ mod tests {
             assert!(!tokens.is_empty(), "emitted stream should be non-empty");
         }
 
-        /// GOAL (5i.5 + 5m): Full FAR decoder emits successfully.
-        /// This requires 5i.5 (cascade fix) AND 5m (referenced-
-        /// downstream-not-owned — rope_append multi-output
-        /// tracking). Landing order doesn't matter; both pieces
-        /// must exist before this flips green.
+        /// Acceptance gate for 5i.5 + 5m: full FAR decoder emits
+        /// successfully. 5i.5 closed the LoopCarry-alias cascade;
+        /// 5m recognises rope_append's untracked K/V slots as
+        /// side-effect exports. Was `#[ignore]`-red until both
+        /// landed; kept as the canonical post-5m regression gate.
         #[test]
-        #[ignore = "red test for 5i.5 + 5m — remove once both land"]
         fn far_decoder_emits_successfully() {
             let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
             let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
@@ -7719,6 +7773,47 @@ mod tests {
             let tokens =
                 res.unwrap_or_else(|e| panic!("FAR_CASCADE should emit post-5i.5; refused: {e}"));
             // Wrap in a dummy module so the emitted fn is a valid top-level.
+            let wrapped = quote::quote! { mod _t { #tokens } };
+            syn::parse2::<syn::File>(wrapped)
+                .expect("emitted tokens must parse as a well-formed Rust file");
+        }
+
+        /// 5m red→green gate (narrow). ROPE_ONLY_BODY strips the body
+        /// to `qkv + rope_append + attention + o_proj` so the 5m
+        /// refusal is isolated from FAR / MLP noise. Pre-5m this
+        /// fails with the specific "class N pos 3 slot 1 referenced
+        /// downstream but not owned (output_alias untracked or
+        /// aliased) — 5g scope refuses" message; post-5m this emits
+        /// a well-formed TokenStream that parses as a Rust file.
+        ///
+        /// Verified red→green: revert the 5m fix in
+        /// `try_emit_collapsed_bucket` (the side-effect-export
+        /// recognizer) and this test panics with the 5g refusal;
+        /// restore it and the test passes.
+        #[test]
+        fn rope_only_emits_successfully() {
+            let s = fixture::solve_body(fixture::ROPE_ONLY_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let res = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            );
+            let tokens =
+                res.unwrap_or_else(|e| panic!("ROPE_ONLY should emit post-5m; refused: {e}"));
             let wrapped = quote::quote! { mod _t { #tokens } };
             syn::parse2::<syn::File>(wrapped)
                 .expect("emitted tokens must parse as a well-formed Rust file");

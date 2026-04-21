@@ -360,6 +360,15 @@ variants; collapsed path fires on 3 commandr variants (degenerate
 empty-loop). Every other variant hits `unimplemented!()` with a
 specific refusal reason.
 
+**Current refusal distribution (post-5j, 2026-04-21):**
+
+| Arch fleet | Refusal reason | Next-step path |
+|---|---|---|
+| llama / mistral / phi3 / qwen2 / commandr (rest) | `class N rep not fragmentizable` | **5i** (aliased-output inline) — **needs per-export refactor first** |
+| gemma2 / granite | `class N slot 0 referenced by post-loop from multiple tiles` | **5k** (post-loop multi-tile export) — moderate |
+| qwen3 / gemma3 | `uniform_pairs=false` (1 residual pair each) | **5l** (finer refinement signature) — signature tuning |
+| commandr (3 variants) | ✅ happy path (degenerate empty loop) | — |
+
 **6.2.b.5j — edge-pattern class refinement (landed 2026-04-21).**
 The region-level 1-hop neighbour hash over-collapses patterns like
 "two residual-Add tiles per transformer layer" (post-attention +
@@ -654,33 +663,11 @@ Split into sub-commits, each dormant-by-default (off unless
   cuda` with `FERRITE_STENCIL_CODEGEN=1` green across all 218.
   fmt + clippy clean.
 
-- ⏳ **6.2.b.5i — aliased-output impls in collapsed mode.** The new
-  blocker for llama/mistral/phi3/qwen2/commandr is the
-  FusedAddRmsNorm-family impls whose `output_alias` points back at
-  their upstream tiles (the residual buffer is mutated in-place).
-  `can_fragmentize_collapsed` refuses these because lifting an
-  aliased `TensorView<'_>` through a fragment fn boundary needs a
-  lifetime parameter tied to the aliased input. Three options:
-  - (a) Emit these classes inline inside the loop body (concrete
-    mode, `repeat_var = Some(__repeat)`), bypassing the fragment
-    intern — same mechanism as today's unrolled-path
-    `can_fragmentize=false` fallback, just threaded through the
-    class-loop scope. Single-pass, keeps aliasing correct via Rust
-    borrow rules. Bindings like `t_<id>_<slot>` from
-    `build_local_map` would need loop-local renaming — the
-    current map is globally unique per FUF, but per-iteration the
-    alias chain should reference the loop-local tile ids. Probably
-    the cleanest option.
-  - (b) Give fragment fns lifetime parameters. The fragment returns
-    `TensorView<'a>` tied to a consumed `'a OwnedTensor` input.
-    Ugly, but localised to `emit_fragment_call_expr`.
-  - (c) Rewrite the affected impls (AddInplace, FusedAddRmsNorm,
-    FusedAddRmsNormWithOffset) to return a fresh OwnedTensor. Loses
-    the in-place optimisation; not free.
-
-  Pick (a). The rest of the loop body machinery is already in
-  place; this is an emission-path change, not a precondition
-  lift.
+- ⏳ **6.2.b.5i — aliased-output impls in collapsed mode.** Blocks
+  llama / mistral / phi3 / qwen2 / commandr. Deeper than the earlier
+  handoff suggested — analysis 2026-04-21 found the emitter's
+  bookkeeping can't express the aliased-output pattern without a
+  per-export refactor of 5g first. See §14 (5i preflight).
 
 - ⏳ **6.2.b.5h — richer offset solver.** gemma / granite / qwen3
   trip `offsets_consistent=false` under the period-derived rule. BFS
@@ -886,3 +873,210 @@ Suggested gating: `--cfg stencil_codegen` or `FERRITE_STENCIL_CODEGEN=1` env var
 ### If the scope feels wrong
 
 The measurements in step 4's table are the anchor. Any time compile time feels intractable again, check whether the regression is from reintroducing per-layer work (unrolling, per-layer literals in abstract bodies, per-layer fragment keys) or from somewhere else. The refactor is only valuable if the N_layers factor stays collapsed.
+
+## 14. 5i preflight — per-export refactor + inline aliased emission
+
+5i targets the llama fleet (llama / mistral / phi3 / qwen2 /
+commandr). Blocker in those arches is the `FusedAddRmsNormImpl` /
+`FusedAddRmsNormWithOffsetImpl` / `AddRefImpl` family: their
+`output_alias` points back at upstream tiles (residual buffer
+mutated in place), and the fragment fn mechanism can't return a
+`TensorView<'_>` aliased to a consumed input without a lifetime
+parameter. So the emission path has to be INLINE inside the loop
+body (Concrete mode with `repeat_var = Some(__repeat)`) rather
+than going through `emit_fragment_call_expr`.
+
+**What makes this non-trivial beyond "emit concrete inline":**
+
+The canonical multi-export aliased impl is `FusedAddRmsNormImpl`:
+
+- Claims 2 tiles: `(Add, RmsNorm)`. `claimed` is sorted by TileId,
+  so rep-local position 0 = Add, position 1 = RmsNorm.
+- `output_alias` returns 2 entries, both src=Some(_):
+  `((rmsnorm_id, 0), Some(delta_src))` — rmsnorm_out aliases
+  the attention-output Gemm's OwnedTensor (IntraIter producer).
+  `((add_id, 0), Some(residual_src))` — add_out aliases the
+  upstream residual OwnedTensor (the loop carry).
+- Downstream consumers, by provenance slot:
+  - QKV-fusion Gemm reads `(rmsnorm_id, 0)` via `IntraIter`.
+  - Next iter's `FusedAddRmsNormImpl` reads `(add_id, 0)` via
+    `LoopCarry`.
+
+Both exports land on slot=0 but on DIFFERENT claimed tiles. The
+current 5g scheme keys everything by `(class, slot)` only —
+`referenced_slots[c]: BTreeSet<u8>`, `class_out_ident(c, slot)`,
+`carry_var_ident(c, slot)`, `post_refs: BTreeMap<(class, slot),
+(tile, slot)>`. Those two distinct exports collide on `(8, 0)`.
+Collapsing them into one breaks the carry routing: the carry's
+underlying OwnedTensor is the RESIDUAL buffer (backing add_out),
+but `__cC_out_0` under 5g's last-claimed-tile scheme names the
+RmsNorm output (backing delta, which is a completely different
+OwnedTensor from another upstream class).
+
+### 14.1 Per-export refactor (prereq)
+
+Generalize every `(class, slot: u8)` key to `(class,
+claimed_pos: u8, slot: u8)` — effectively indexing each export by
+its `(position_in_claim, output_slot)` pair within the class's
+rep subgraph. Single-tile classes keep `claimed_pos = 0` and
+behave identically to 5g today. Multi-tile classes (FusedAddRms-
+Norm, maybe future fused impls) get proper disambiguation.
+
+Specific rename scope in `codegen.rs`:
+
+- `class_owned_slots(c) -> BTreeSet<u8>` →
+  `class_owned_exports(c) -> BTreeSet<(u8, u8)>`. Walks
+  `output_alias` over ALL claimed tiles (not just last) and
+  includes src=None entries as owned, src=Some entries
+  separately as alias-emittable (for 5i).
+- `referenced_slots: Vec<BTreeSet<u8>>` →
+  `referenced_exports: Vec<BTreeSet<(u8, u8)>>`. Built from
+  provenance walking: for each consumer slot's
+  `(producer_tile, producer_slot)` where producer_class = C,
+  look up `producer_tile`'s position in C's rep claim and
+  insert `(pos, producer_slot)`.
+- `class_out_ident(c, slot)` → `class_out_ident(c, pos, slot)`
+  → `__cC_out_<pos>_<slot>`. Similarly `carry_var_ident`,
+  `last_var_ident`.
+- `carry_inits`, `carry_producers`, `carries_with_init`,
+  `dedicated_last`, `post_refs`, `post_loop_exports` — all
+  keyed by `(class, pos, slot)`.
+- `emit_fragment_call_expr`:
+  - `returned_slots: &[u8]` → `returned_exports: &[(u8, u8)]`.
+  - Return ident uses `format_ident!("__out_{}_{}", pos,
+    slot)` — already does this, just threaded through a tuple
+    of arbitrary length.
+  - IntraIter consumer reader: given `InputSlot {
+    producer_tile, producer_slot, origin: IntraIter{pc} }`,
+    look up `producer_tile` in class pc's rep claim to get
+    `pos`, then read `class_out_ident(pc, pos,
+    producer_slot)`. Needs a per-class reverse map
+    `class_tile_to_pos: HashMap<(class, TileId), u8>`.
+  - LoopCarry reader: similar — `carry_var_ident(pc, pos,
+    producer_slot)`.
+- `class_input_provenance`: the `paired_periodic_for_slot`
+  helper returns just `Some(producer_class)`. Extend so it
+  also returns the specific `(producer_tile_pos_in_iter_1's_
+  claim, producer_slot)` that the iter-1 positional match
+  points at — that's the export pos+slot that the carry
+  carries. Current key (class, slot) is lossy; needed for
+  keying `carry_inits` by (class, pos, slot).
+
+**Hazards during rename:**
+
+- `paired_periodic_for_slot` currently walks iter-1's boundary
+  inputs by positional index in the consumer's claim. To
+  extract the producer's claim position, it needs to resolve
+  iter-1's matching boundary producer → that producer's
+  `SubgraphId` → that sg's claim → the producing tile's
+  position. Not hard but extra plumbing.
+- `post_refs` today has a "refuses > 1 distinct (tile, slot)
+  per (class, slot)" check. After the rename, `(class, pos,
+  slot)` is unique — that check becomes trivially true (by
+  construction), but the new constraint is "one tile_id per
+  (class, pos) across all iters" which is a different
+  invariant worth stating explicitly.
+- The "commandr happy path" (3 variants, empty loop) doesn't
+  exercise any of this — the refactor is invisible there.
+  Llama variants stay at `unimplemented!("class N rep not
+  fragmentizable")` until 5i's inline emission lands on top of
+  the refactor, so the refactor alone is a no-op at the
+  refusal-count level. That's OK; it unblocks 5i.
+
+### 14.2 Inline aliased emission (5i proper, after the refactor)
+
+Once per-export is in place:
+
+1. Add `is_aliased_emittable(imp, claimed, fuf) -> bool` —
+   true iff every `output_alias` entry has src=Some(_)
+   pointing at a BOUNDARY input tile (not another claimed
+   tile), AND `consumes_input_tiles` is empty. `AddRefImpl`,
+   `FusedAddRmsNormImpl`, `FusedAddRmsNormWithOffsetImpl` all
+   qualify; `AddInplaceImpl` has non-empty
+   `consumes_input_tiles` so stays refused.
+2. In `try_emit_collapsed_bucket`'s per-class precondition
+   walk, replace the hard refusal for non-fragmentizable with:
+   `can_fragmentize_collapsed(...) || is_aliased_emittable(...)`
+   → otherwise refuse with a specific reason.
+3. New helper `emit_aliased_class_inline(c, sched, stencil,
+   fuf, sfuf, ...)`:
+   - Build a custom `LocalMap` starting from today's
+     `build_local_map(fuf)` (provides per-tile `t_<id>_<slot>`
+     names — iter-local via Rust shadowing inside the loop
+     body).
+   - Override boundary-input entries to point at the
+     provenance-resolved idents:
+     - `IntraIter{pc}` → `class_out_ident(pc, prod_pos,
+       prod_slot)`.
+     - `LoopCarry{pc, init}` → `carry_var_ident(pc, prod_pos,
+       prod_slot)`.
+     - `PreLoop{sg}` → the pre-loop sg's local ident.
+   - Emit with `EmitCtx { mode: Concrete, repeat_var:
+     Some(quote!{__repeat}), locals: &inline_locals, ... }`.
+     The impl's `emit_call` produces `let t_<rep_tile>_<slot>
+     = (*<boundary_ident>).as_view();` bindings that stay in
+     scope for the rest of the iteration.
+   - After the body, expose each referenced export via a shim:
+     `let __cC_out_<pos>_<slot>: ::ferrite_cuda_core::TensorView<'_>
+     = t_<claim[pos].id>_<slot>;`. Downstream `IntraIter`
+     consumers read these via `(*__cC_out_P_S).as_view()` —
+     `TensorView: Deref` makes the pattern type-check
+     identically to the OwnedTensor case.
+4. **Alias-through carries.** For each `(class, pos, slot)` in
+   `carry_producers` where the producing class is aliased-
+   emittable AND its alias src points to a boundary input
+   resolved as `LoopCarry`: skip the end-of-iter `__carry =
+   __cC_out_P_S` assignment. The in-place kernel call already
+   mutated the carry's underlying OwnedTensor. Track this in
+   a new `BTreeSet<(usize, u8, u8)> alias_through_carries`
+   populated during emission.
+5. For llama: class 8 (FusedAddRmsNorm pre-attn) and whichever
+   class is FusedAddRmsNorm pre-MLP both become
+   aliased-emittable. Their emission inlines inside the
+   `for __repeat in 0..N { … }` body, the residual carry sits
+   outside as `let mut __carry_c8_0_0 = <embed_output>;`, and
+   the kernel mutates it each iter. rmsnorm_out is exposed as
+   `__cC_out_<rmsnorm_pos>_0` and consumed intra-iter by the
+   QKV Gemm fragment.
+
+### 14.3 Validation for 5i
+
+- `cargo check -p ferrite-models --features cuda` with
+  `FERRITE_STENCIL_CODEGEN=1` stays clean across all 218
+  variants.
+- `FERRITE_STENCIL_CODEGEN=1 cargo expand -p
+  ferrite-model-llama --features cuda` on one llama variant
+  shows a real `for __repeat in 0..N { … }` body with
+  (a) fragment calls for non-aliased classes,
+  (b) inlined `fused_add_rms_norm_inplace` with the carry var
+  passed by `*` deref,
+  (c) TensorView shim bindings for downstream consumers.
+- `timeout 60 vllm chat --model=<small-llama>` through the
+  collapsed path produces coherent output (see
+  `feedback_no_run_chat`). Compare against the unrolled
+  path's output on the same prompt — the first-token log-prob
+  should match bit-for-bit (deterministic kernels) since the
+  collapsed codegen is a pure loop rewrite with no
+  numerical changes.
+
+### 14.4 Estimated scope
+
+- Per-export refactor (§14.1): ~150-200 LoC diff concentrated
+  in `codegen.rs`, plus `paired_periodic_for_slot` extension.
+  Mostly mechanical; the tricky bits are the `InputOrigin`
+  shape change (needs to carry producer_pos) and the
+  `class_input_provenance` rewrite to thread the pos through
+  iter-1 positional matching.
+- Inline aliased emission (§14.2): ~100 LoC new helper +
+  ~50 LoC integration in `try_emit_collapsed_bucket` +
+  ~30 LoC for alias-through carry detection.
+- Validation (§14.3): ~1h `vllm chat` loop, probably one
+  correctness bug to chase.
+
+Total: ~1 session for a careful landing; probably 1.5 if the
+inline emission surfaces a secondary issue (e.g., drop ordering
+in the loop body, which today's design comment waves off but
+might actually matter once aliased bindings compound). Not
+something to combine with 5k (post-loop multi-tile) or 5l
+(finer refinement signature) in the same commit — those touch
+adjacent but distinct machinery.

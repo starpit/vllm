@@ -6047,3 +6047,583 @@ fn emit_shim_model(
         pub use super::#canonical::{#(#bucket_names),*};
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────
+//
+// These tests exercise the collapsed-emitter pipeline against
+// hand-written llama-style DSL bodies. They hit the real solver
+// + StencilBundle + ClassSchedule + class_input_provenance +
+// try_emit_collapsed_bucket path without building a full model
+// crate — iteration is sub-second vs. minute-scale per-arch
+// `cargo check -p ferrite-models`.
+//
+// Layering:
+//   - `fixture::...` helpers drive DSL → solved FUF.
+//   - `stencil_bundle::*` tests lock class-count / aliased-class
+//     membership for a given body shape.
+//   - `schedule::*` tests lock pre_loop / periodic / post_loop
+//     partitioning (including 5i.3 period-1 aliased re-route).
+//   - `provenance::*` tests lock InputOrigin tagging — especially
+//     the IntraIter vs LoopCarry split for aliased-class boundary
+//     inputs (the (8,1,0) cascade input).
+//   - `alias_flow::*` tests lock `alias_through_carries` membership
+//     + the 5i.4 cascade refusal condition.
+//   - `refusal::*` tests lock the `emit_forward_collapsed_bucket`
+//     refusal-message shape end-to-end.
+//
+// Every hypothesis we form about a shape/refusal/fix MUST land here
+// as a test before the fix touches codegen.rs — per the 2026-04-21
+// "every hypothesis needs a test" directive.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cfg::build_cfg;
+    use crate::classify::classify;
+    use crate::config::{self, ModelParams};
+    use crate::fuf::unroll;
+    use crate::impl_lib::starter_library;
+    use crate::parse::parse_block;
+    use crate::shape::infer;
+    use crate::solver::solve;
+    use crate::target::{TargetProfile, load_file as load_target};
+    use std::path::PathBuf;
+
+    /// Inputs a test needs past the DSL: solved FUF + SFUF at
+    /// num_tokens=1, plus the pieces downstream passes read.
+    struct Solved {
+        fuf: Fuf,
+        sfuf: Assignment,
+        program: Program,
+        model: ModelParams,
+        lib: ImplementationLibrary,
+    }
+
+    mod fixture {
+        use super::*;
+
+        pub fn llama_3_2_1b_params() -> ModelParams {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("..")
+                .join("model_architectures")
+                .join("llama")
+                .join("llama-3.2-1b.json");
+            config::load_file(&path).expect("load llama-3.2-1b config")
+        }
+
+        pub fn l4_target() -> TargetProfile {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("..")
+                .join("target_profiles")
+                .join("l4_sm89.json");
+            load_target(&path).expect("load l4_sm89 target")
+        }
+
+        /// Classify DSL, infer shapes, build CFG, unroll, solve.
+        /// Returns the full bundle a test module needs.
+        pub fn solve_body(src: &str) -> Solved {
+            let model = llama_3_2_1b_params();
+            let file: syn::File =
+                syn::parse_str(&format!("fn _c() {{ {src} }}")).expect("parse DSL carrier");
+            let block = match &file.items[0] {
+                syn::Item::Fn(f) => &*f.block,
+                _ => unreachable!(),
+            };
+            let ast = parse_block(block).expect("parse DSL");
+            let program = classify(&ast).expect("classify");
+            let inferred = infer(
+                &program,
+                &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+                &std::collections::BTreeMap::new(),
+            )
+            .expect("infer shapes");
+            let cfg = build_cfg(&program, &model).expect("build cfg");
+            let fuf = unroll(&cfg, &inferred).expect("unroll");
+            let lib = starter_library();
+            let target = l4_target();
+            let workloads =
+                solve(&fuf, &lib, &target, &inferred, &model.bounds, &[1], &[]).expect("solve");
+            let sfuf = workloads.get_nt(1).expect("nt=1 solved").clone();
+            Solved {
+                fuf,
+                sfuf,
+                program,
+                model,
+                lib,
+            }
+        }
+
+        /// Llama decoder body — N layers of pre-attn-LN + QKV + rope +
+        /// attn + o_proj + residual-add-post-attn-LN (FAR) + gate/up +
+        /// silu·mul + down + residual-add + final norm + lm_head.
+        ///
+        /// Produces the classic FAR topology: `FusedAddRmsNormImpl`
+        /// claims (Add, RmsNorm) pairs at the pre-MLP and post-MLP
+        /// boundaries. With 5i.3 re-route, the peeled period-1
+        /// instances move into `sched.periodic` at offset 0 (iter-0
+        /// peel) / offset max_period-1 (iter-(N-1) peel).
+        pub const FAR_DECODER_BODY: &str = r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                q = gemm(normed, self_attn.q_proj[layer]);
+                k = gemm(normed, self_attn.k_proj[layer]);
+                v = gemm(normed, self_attn.v_proj[layer]);
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                attn = attention(q, k, v, kv_cache[layer], block_table);
+                oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+                normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                up = gemm(normed2, mlp.up_proj[layer]);
+                d = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(d, hidden_states);
+            }
+            final_norm = rmsnorm(hidden_states, norm);
+            output = gemm(final_norm, lm_head);
+        "#;
+    }
+
+    // ── stencil_bundle ──────────────────────────────────────────
+
+    mod stencil_bundle {
+        use super::*;
+
+        /// FAR decoder body has at least one aliased class
+        /// (FusedAddRmsNormImpl). Sanity gate — if this breaks, the
+        /// starter library no longer picks FAR and every downstream
+        /// test gets vacuously true.
+        #[test]
+        fn far_decoder_has_aliased_fused_add_rms_norm() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+
+            let mut aliased_count = 0;
+            for c in 0..stencil.class_members.len() {
+                let Some(imp_id) = stencil.class_impl_id[c] else {
+                    continue;
+                };
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                if is_aliased_emittable(imp, &claimed, &s.fuf) {
+                    aliased_count += 1;
+                }
+            }
+            assert!(
+                aliased_count >= 2,
+                "FAR decoder should have ≥2 aliased classes \
+                 (pre-MLP + post-MLP FAR instances); saw {aliased_count}"
+            );
+        }
+
+        /// All aliased classes in the FAR decoder are homogeneous
+        /// (every member picks the same impl). Heterogeneity here
+        /// would route through A.2's per-impl dispatch, not the 5i
+        /// path — and pre-5j we measured llama as homogeneous, so
+        /// this is a regression gate on the class-edge refinement.
+        #[test]
+        fn far_decoder_aliased_classes_homogeneous() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            for c in 0..stencil.class_members.len() {
+                assert!(
+                    stencil.class_impl_id[c].is_some(),
+                    "class {c} heterogeneous — FAR decoder should be uniform"
+                );
+            }
+        }
+    }
+
+    // ── schedule ────────────────────────────────────────────────
+
+    mod schedule {
+        use super::*;
+
+        /// After 5i.3 re-route, peeled period-1 aliased classes
+        /// (iter-0 pre-MLP FAR peel; iter-(N-1) post-MLP FAR peel)
+        /// live in `sched.periodic` with offset=0 and
+        /// offset=max_period-1 respectively. Pre-5i.3 they sat in
+        /// pre_loop / post_loop and tripped the forbidden-partition
+        /// refusal.
+        #[test]
+        fn period_one_aliased_classes_routed_to_periodic() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+
+            // At least one period-1 aliased class should be in
+            // periodic (the iter-0 or iter-(N-1) peel).
+            let mut period1_aliased_in_periodic = 0;
+            for &c in &sched.periodic {
+                if stencil.class_members[c].len() != 1 {
+                    continue;
+                }
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous");
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                if is_aliased_emittable(imp, &claimed, &s.fuf) {
+                    period1_aliased_in_periodic += 1;
+                }
+            }
+            assert!(
+                period1_aliased_in_periodic >= 1,
+                "5i.3 re-route should have moved ≥1 period-1 aliased \
+                 class into sched.periodic; saw {period1_aliased_in_periodic}"
+            );
+        }
+
+        /// A re-routed period-1 aliased class's offset is either 0
+        /// (iter-0 peel) or `max_period - 1` (last-iter peel) —
+        /// never something in between. If this ever fires with an
+        /// interior offset, the re-route derived a feasible offset
+        /// for a case we haven't modelled.
+        #[test]
+        fn rerouted_period_one_offsets_at_loop_boundaries() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+
+            for &c in &sched.periodic {
+                if stencil.class_members[c].len() != 1 {
+                    continue;
+                }
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous");
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                if !is_aliased_emittable(imp, &claimed, &s.fuf) {
+                    continue;
+                }
+                let off = sched.class_offsets[c];
+                assert!(
+                    off == 0 || off == sched.max_period - 1,
+                    "class {c}: re-routed period-1 aliased offset={off}, \
+                     expected 0 or {} (max_period-1)",
+                    sched.max_period - 1,
+                );
+            }
+        }
+
+        /// `offsets_consistent` holds for the FAR decoder — a
+        /// pre-5h precondition. If this breaks, either the offset
+        /// solver regressed or a new shape was introduced that 5h
+        /// needs to handle.
+        #[test]
+        fn far_decoder_offsets_consistent() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            assert!(
+                sched.offsets_consistent,
+                "FAR decoder must have offsets_consistent=true under 5i.3"
+            );
+        }
+    }
+
+    // ── provenance ──────────────────────────────────────────────
+
+    mod provenance {
+        use super::*;
+
+        /// `class_input_provenance` returns Some for the FAR
+        /// decoder — i.e. every periodic class's boundary inputs
+        /// classify cleanly as IntraIter / LoopCarry / PreLoop
+        /// under 5i.3 offsets. None here means the emitter's
+        /// upstream analysis gave up before codegen could run.
+        #[test]
+        fn far_decoder_provenance_ok() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            assert!(
+                prov.is_some(),
+                "FAR decoder provenance should classify all boundary inputs"
+            );
+        }
+    }
+
+    // ── alias_flow ──────────────────────────────────────────────
+    //
+    // These tests replicate the `alias_through_carries` derivation
+    // inline (not yet pub, and pinning it here doubles as a spec
+    // pin). The (8,1,0)-style cascade depends on this set's
+    // membership.
+
+    mod alias_flow {
+        use super::*;
+
+        /// Replica of the `alias_through_carries` build in
+        /// `try_emit_collapsed_bucket`. Returns the (producer_class,
+        /// producer_pos, producer_slot) keys for which an aliased
+        /// class's in-place kernel mutates the carry's backing
+        /// buffer — the end-of-iter carry update is redundant on
+        /// these.
+        fn derive_alias_through_carries(
+            stencil: &StencilBundle,
+            fuf: &Fuf,
+            sfuf: &Assignment,
+            lib: &ImplementationLibrary,
+            aliased_classes: &BTreeSet<usize>,
+            provenance: &[ClassInputs],
+        ) -> BTreeSet<(usize, u8, u8)> {
+            let mut out: BTreeSet<(usize, u8, u8)> = BTreeSet::new();
+            for &c in aliased_classes {
+                let rep = stencil.class_members[c][0];
+                let claimed = sfuf.tiles_in_subgraph(rep);
+                let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous aliased");
+                let imp = lib.get(imp_id);
+                let aliases = imp.output_alias(&claimed, fuf);
+                let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+                let mut seen: HashSet<(TileId, u8)> = HashSet::new();
+                for &t in &claimed {
+                    for input in &fuf.get(t).inputs {
+                        if let FufInput::Tile { id, slot } = input
+                            && !claimed_set.contains(id)
+                            && seen.insert((*id, *slot))
+                        {
+                            tile_params_ordered.push((*id, *slot));
+                        }
+                    }
+                }
+                let ci = provenance
+                    .iter()
+                    .find(|ci| ci.consumer_class == c)
+                    .expect("aliased class has provenance");
+                for ((_out, _outs), src) in aliases.iter() {
+                    let Some((src_tile, src_slot)) = src else {
+                        continue;
+                    };
+                    let Some(bidx) = tile_params_ordered
+                        .iter()
+                        .position(|(t, s)| t == src_tile && s == src_slot)
+                    else {
+                        continue;
+                    };
+                    let s = &ci.slots[bidx];
+                    if let InputOrigin::LoopCarry {
+                        producer_class,
+                        producer_pos,
+                        ..
+                    } = &s.origin
+                    {
+                        out.insert((*producer_class, *producer_pos, s.producer_slot));
+                    }
+                }
+            }
+            out
+        }
+
+        /// Replica of the `carry_producers` derivation — every
+        /// (producer_class, pos, slot) that some periodic consumer
+        /// reads via LoopCarry.
+        fn derive_carry_producers(provenance: &[ClassInputs]) -> BTreeSet<(usize, u8, u8)> {
+            let mut out = BTreeSet::new();
+            for ci in provenance {
+                for s in &ci.slots {
+                    if let InputOrigin::LoopCarry {
+                        producer_class,
+                        producer_pos,
+                        ..
+                    } = s.origin
+                    {
+                        out.insert((producer_class, producer_pos, s.producer_slot));
+                    }
+                }
+            }
+            out
+        }
+
+        fn derive_aliased_classes(
+            stencil: &StencilBundle,
+            sfuf: &Assignment,
+            fuf: &Fuf,
+            lib: &ImplementationLibrary,
+            sched: &ClassSchedule,
+        ) -> BTreeSet<usize> {
+            let mut out = BTreeSet::new();
+            for &c in &sched.periodic {
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous");
+                let imp = lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = sfuf.tiles_in_subgraph(rep);
+                if is_aliased_emittable(imp, &claimed, fuf) {
+                    out.insert(c);
+                }
+            }
+            out
+        }
+
+        /// The FAR decoder exposes at least one
+        /// (producer_class, producer_pos, producer_slot) that's a
+        /// carry producer but NOT an alias-through-carry —
+        /// precisely the (8,1,0)-style cascade the 5i.4 guard
+        /// catches. If this ever returns empty, either the
+        /// cascade is fixed (5i.5 landed) or the provenance walk
+        /// stopped tagging LoopCarry for aliased intermediates.
+        #[test]
+        fn far_decoder_has_cascade_carry_producer() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("provenance ok");
+            let aliased = derive_aliased_classes(&stencil, &s.sfuf, &s.fuf, &s.lib, &sched);
+            let alias_through =
+                derive_alias_through_carries(&stencil, &s.fuf, &s.sfuf, &s.lib, &aliased, &prov);
+            let carry_producers = derive_carry_producers(&prov);
+
+            // The cascade: an aliased class C whose export (pos,
+            // slot) is consumed via LoopCarry AND is NOT backed by
+            // the alias chain.
+            let mut cascade_keys: Vec<(usize, u8, u8)> = Vec::new();
+            for &c in &aliased {
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous");
+                let imp = s.lib.get(imp_id);
+                let aliases = imp.output_alias(&claimed, &s.fuf);
+                for ((out_tile, out_slot), _src) in aliases.iter() {
+                    let Some(pos) = claimed.iter().position(|x| x == out_tile) else {
+                        continue;
+                    };
+                    let key = (c, pos as u8, *out_slot);
+                    if carry_producers.contains(&key) && !alias_through.contains(&key) {
+                        cascade_keys.push(key);
+                    }
+                }
+            }
+            assert!(
+                !cascade_keys.is_empty(),
+                "FAR decoder should expose the 5i.4 cascade shape \
+                 (aliased class's export is a LoopCarry producer but not \
+                 alias-through-carry); cascade_keys={cascade_keys:?}"
+            );
+        }
+
+        /// Symmetric positive: the pre-MLP FAR peel's residual
+        /// alias IS captured in alias_through_carries. If this
+        /// ever empties, the in-place residual buffer isn't being
+        /// recognised as the carry's backing storage — and every
+        /// FAR variant would double-free at runtime (end-of-iter
+        /// update would copy the GpuTensor view back over the
+        /// OwnedTensor carry).
+        #[test]
+        fn far_decoder_residual_aliased_through_carry() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("provenance ok");
+            let aliased = derive_aliased_classes(&stencil, &s.sfuf, &s.fuf, &s.lib, &sched);
+            let alias_through =
+                derive_alias_through_carries(&stencil, &s.fuf, &s.sfuf, &s.lib, &aliased, &prov);
+            assert!(
+                !alias_through.is_empty(),
+                "FAR decoder should have ≥1 alias-through-carry key (the \
+                 residual stream); saw empty set"
+            );
+        }
+    }
+
+    // ── refusal ─────────────────────────────────────────────────
+
+    mod refusal {
+        use super::*;
+
+        /// End-to-end: `emit_forward_collapsed_bucket` on a FAR
+        /// decoder refuses at one of the two known gates — 5m's
+        /// `class N pos P slot S referenced downstream but not
+        /// owned` (fires first for bodies with multi-output tiles
+        /// like rope_append whose paged-cache K/V slots aren't
+        /// tracked as owned) or the 5i.4 cascade. On the live
+        /// llama fleet (2026-04-21) 153 variants hit 5m and 183
+        /// hit the cascade — which one this fixture trips depends
+        /// on exact op topology.
+        ///
+        /// Either refusal proves the collapsed emitter currently
+        /// rejects the decoder. When 5m or 5i.5 lands, one of
+        /// these pinned substrings will flip — split this test
+        /// into a single-refusal assertion at that point.
+        #[test]
+        fn far_decoder_refuses_at_known_gate() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let res = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            );
+            let err = res.expect_err("FAR decoder should refuse under current codegen");
+            let is_5m = err.contains("referenced downstream but not owned");
+            let is_cascade =
+                err.contains("carry producer") && err.contains("doesn't route through a LoopCarry");
+            assert!(
+                is_5m || is_cascade,
+                "expected 5m or 5i.4 cascade refusal, got: {err}"
+            );
+        }
+
+        /// The refusal is specifically on an aliased class — not
+        /// on offsets / provenance / uniform_pairs. If the first
+        /// failing precondition migrates to one of those, it
+        /// means something upstream regressed and we're no longer
+        /// testing the cascade at all.
+        #[test]
+        fn far_decoder_refusal_is_cascade_not_upstream() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let res = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            );
+            let err = res.expect_err("still refusing");
+            for upstream in [
+                "offsets_consistent=false",
+                "uniform_pairs=false",
+                "homogeneous_periodic=false",
+                "provenance=None",
+            ] {
+                assert!(
+                    !err.contains(upstream),
+                    "refusal reason regressed to upstream '{upstream}': {err}"
+                );
+            }
+        }
+    }
+}

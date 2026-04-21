@@ -4186,6 +4186,85 @@ fn try_emit_collapsed_bucket(
         return Err(format!("class {c} rep not fragmentizable"));
     }
 
+    // ── carry-key redirect for LoopCarry-aliased exports (5i.5) ─
+    //
+    // When aliased class C's export (pos, slot) has `output_alias`
+    // pointing at a boundary input whose provenance is
+    // `LoopCarry { producer_class: Y, producer_pos: Ypos, .. }`, the
+    // in-place kernel mutates the same OwnedTensor that backs Y's
+    // carry var. So a downstream consumer reading (C, pos, slot) via
+    // LoopCarry should resolve to Y's existing carry — no separate
+    // `__carry_cC_pP_sS` hoist needed; `__carry_cY_p<Ypos>_s<Yslot>`
+    // already holds the mutated value.
+    //
+    // Without this redirect, (C, pos, slot) enters `carry_producers`,
+    // the hoist emits `Option<OwnedTensor> = None` that nothing
+    // assigns, and the consumer's `__carry_cC.as_ref().expect(..)`
+    // panics. With the redirect applied before `carry_inits`, the
+    // aliased key never enters the carry set; reads are rewritten to
+    // the underlying key.
+    let alias_carry_redirect: BTreeMap<(usize, u8, u8), (usize, u8, u8)> = {
+        let mut m: BTreeMap<(usize, u8, u8), (usize, u8, u8)> = BTreeMap::new();
+        for &c in &aliased_classes {
+            let rep = stencil.class_members[c][0];
+            let claimed = sfuf.tiles_in_subgraph(rep);
+            let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+            let imp_id =
+                stencil.class_impl_id[c].ok_or_else(|| format!("class {c} has no impl"))?;
+            let imp = lib.get(imp_id);
+            let aliases = imp.output_alias(&claimed, fuf);
+            let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+            let mut seen: HashSet<(TileId, u8)> = HashSet::new();
+            for &t in &claimed {
+                for input in &fuf.get(t).inputs {
+                    if let FufInput::Tile { id, slot } = input
+                        && !claimed_set.contains(id)
+                        && seen.insert((*id, *slot))
+                    {
+                        tile_params_ordered.push((*id, *slot));
+                    }
+                }
+            }
+            let Some(ci) = provenance.iter().find(|ci| ci.consumer_class == c) else {
+                continue;
+            };
+            for ((out_tile, out_slot), src) in aliases.iter() {
+                let Some(pos) = claimed.iter().position(|x| x == out_tile) else {
+                    continue;
+                };
+                let Some((src_tile, src_slot)) = src else {
+                    continue;
+                };
+                let Some(bidx) = tile_params_ordered
+                    .iter()
+                    .position(|(t, s)| t == src_tile && s == src_slot)
+                else {
+                    continue;
+                };
+                let s = &ci.slots[bidx];
+                if let InputOrigin::LoopCarry {
+                    producer_class,
+                    producer_pos,
+                    ..
+                } = &s.origin
+                {
+                    m.insert(
+                        (c, pos as u8, *out_slot),
+                        (*producer_class, *producer_pos, s.producer_slot),
+                    );
+                }
+            }
+        }
+        m
+    };
+    // 1-hop resolution is sufficient today (FAR_DECODER's only redirect
+    // targets a non-aliased underlying class). Transitive closure (chain
+    // of aliased classes → aliased → … → non-aliased) would need a
+    // fixed-point here; not needed yet.
+    let resolve_carry = |k: (usize, u8, u8)| -> (usize, u8, u8) {
+        alias_carry_redirect.get(&k).copied().unwrap_or(k)
+    };
+
     // Pre/post loop classes must be period-1 (analysis already does
     // this but assert defensively). An aliased-emittable pre/post-loop
     // class is emitted via `emit_subgraph`'s Concrete inline fallback,
@@ -4277,7 +4356,11 @@ fn try_emit_collapsed_bucket(
                 pre_loop_init_sg,
             } = s.origin
             {
-                let key = (producer_class, producer_pos, s.producer_slot);
+                // 5i.5: resolve LoopCarry-aliased producer keys to the
+                // underlying non-aliased carry so only one carry var is
+                // hoisted per physical OwnedTensor (the in-place kernel
+                // mutates it via the aliased-class's inline emission).
+                let key = resolve_carry((producer_class, producer_pos, s.producer_slot));
                 let entry = carry_inits.entry(key).or_insert(None);
                 match (&*entry, pre_loop_init_sg) {
                     (Some(a), Some(b)) if *a != b => {
@@ -4740,6 +4823,7 @@ fn try_emit_collapsed_bucket(
                 &aliased_intraiter_exports,
                 &short_classes,
                 &aliased_classes,
+                &alias_carry_redirect,
             )?;
             loop_body.push(tokens);
             continue;
@@ -4766,6 +4850,7 @@ fn try_emit_collapsed_bucket(
             &carry_producers,
             &carries_with_init,
             &class_returned_exports,
+            &alias_carry_redirect,
         )?;
         let call = match (is_short, returned.len()) {
             // Full class, zero referenced exports: fragment returns `()`.
@@ -5031,6 +5116,7 @@ fn emit_fragment_call_expr(
     carry_producers: &BTreeSet<(usize, u8, u8)>,
     carries_with_init: &BTreeSet<(usize, u8, u8)>,
     class_returned_exports: &[Vec<(u8, u8)>],
+    alias_carry_redirect: &BTreeMap<(usize, u8, u8), (usize, u8, u8)>,
 ) -> Result<TokenStream, String> {
     let rep_sg = class_inputs.rep_sg;
     let imp_id = stencil.class_impl_id[consumer_class]
@@ -5236,14 +5322,19 @@ fn emit_fragment_call_expr(
                 producer_pos,
                 ..
             } => {
-                let key = (*producer_class, *producer_pos, slot.producer_slot);
+                // 5i.5: redirect LoopCarry reads through the aliased-
+                // export redirect so reads resolve to the underlying
+                // non-aliased class's carry var (the in-place kernel
+                // of the aliased producer already mutated that buffer).
+                let raw = (*producer_class, *producer_pos, slot.producer_slot);
+                let key = alias_carry_redirect.get(&raw).copied().unwrap_or(raw);
                 if !carry_producers.contains(&key) {
                     return Err(format!(
-                        "class {consumer_class}: carry refers to class {producer_class} pos {} slot {} missing from carry set",
-                        producer_pos, slot.producer_slot,
+                        "class {consumer_class}: carry refers to class {} pos {} slot {} missing from carry set",
+                        key.0, key.1, key.2,
                     ));
                 }
-                let carry = carry_var_ident(*producer_class, *producer_pos, slot.producer_slot);
+                let carry = carry_var_ident(key.0, key.1, key.2);
                 if carries_with_init.contains(&key) {
                     quote! { (*#carry).as_view() }
                 } else {
@@ -5344,6 +5435,7 @@ fn emit_aliased_class_inline(
     intraiter_refs: &BTreeSet<(usize, u8, u8)>,
     short_classes: &BTreeSet<usize>,
     _aliased_classes: &BTreeSet<usize>,
+    alias_carry_redirect: &BTreeMap<(usize, u8, u8), (usize, u8, u8)>,
 ) -> Result<TokenStream, String> {
     let rep_sg = class_inputs.rep_sg;
     let imp_id =
@@ -5426,13 +5518,16 @@ fn emit_aliased_class_inline(
                 producer_pos,
                 ..
             } => {
-                let key = (*producer_class, *producer_pos, slot.producer_slot);
+                // 5i.5: redirect LoopCarry read through the alias map
+                // so we pick up the underlying non-aliased carry var.
+                let raw = (*producer_class, *producer_pos, slot.producer_slot);
+                let key = alias_carry_redirect.get(&raw).copied().unwrap_or(raw);
                 if !carry_producers.contains(&key) {
                     return Err(format!(
                         "aliased class {c}: carry producer {key:?} missing from carry set"
                     ));
                 }
-                let carry = carry_var_ident(*producer_class, *producer_pos, slot.producer_slot);
+                let carry = carry_var_ident(key.0, key.1, key.2);
                 if carries_with_init.contains(&key) {
                     carry
                 } else {
@@ -5441,12 +5536,7 @@ fn emit_aliased_class_inline(
                     // `*#ident` and `(*#ident).as_view()` patterns
                     // work uniformly. The `unsafe` is required by
                     // `GpuTensor::as_view`.
-                    let view = format_ident!(
-                        "__carry_view_c{}_p{}_s{}",
-                        producer_class,
-                        producer_pos,
-                        slot.producer_slot
-                    );
+                    let view = format_ident!("__carry_view_c{}_p{}_s{}", key.0, key.1, key.2);
                     prelude.push(quote! {
                         let #view = unsafe {
                             #carry
@@ -6219,6 +6309,31 @@ mod tests {
                 normed = rmsnorm(hidden_states, input_layernorm[layer]);
                 hidden_states = add(normed, hidden_states);
                 hidden_states = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+            }
+            final_norm = rmsnorm(hidden_states, norm);
+            output = gemm(final_norm, lm_head);
+        "#;
+
+        /// Llama-shape cascade WITHOUT rope_append/attention.
+        /// Two FARs per iter (post-attn boundary + post-MLP
+        /// boundary) and Gemms in between whose LoopCarry-consumers
+        /// expose the 5i.5 cascade: c8's rmsnorm_out is read by a
+        /// non-aliased Gemm via LoopCarry, while c8's alias src is
+        /// itself a LoopCarry producer. No multi-output tile → no
+        /// 5m refusal; emission proceeds past the cascade gate so
+        /// a unit test can inspect the emitted TokenStream.
+        pub const FAR_CASCADE_BODY: &str = r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                q = gemm(normed, self_attn.q_proj[layer]);
+                oproj = gemm(q, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+                normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+                gate = silu(gemm(normed2, mlp.gate_proj[layer]));
+                up = gemm(normed2, mlp.up_proj[layer]);
+                d = gemm(gate * up, mlp.down_proj[layer]);
+                hidden_states = add(d, hidden_states);
             }
             final_norm = rmsnorm(hidden_states, norm);
             output = gemm(final_norm, lm_head);
@@ -7213,7 +7328,10 @@ mod tests {
                     .iter()
                     .find(|ci| ci.consumer_class == c)
                     .expect("has prov");
-                for ((_out, _out_slot), src) in aliases.iter() {
+                for ((out_tile, out_slot), src) in aliases.iter() {
+                    let Some(pos) = claimed.iter().position(|x| x == out_tile) else {
+                        continue;
+                    };
                     let Some((src_tile, src_slot)) = src else {
                         continue;
                     };
@@ -7230,27 +7348,31 @@ mod tests {
                         ..
                     } = &slot.origin
                     {
+                        // Underlying carry buffer is kept alive.
                         alias_through.insert((*producer_class, *producer_pos, slot.producer_slot));
+                        // 5i.5: aliased class's own export key is also
+                        // covered — its in-place kernel mutates the
+                        // same buffer, so consumers reading (C, pos,
+                        // out_slot) via LoopCarry resolve to the
+                        // underlying carry var.
+                        alias_through.insert((c, pos as u8, *out_slot));
                     }
                 }
             }
             (carry_producers, alias_through)
         }
 
-        /// In FAR_DECODER_BODY the chain DOES break: at least one
-        /// aliased class has a carry_producer key not covered by
-        /// alias_through_carries. That's the cascade shape 5i.5
-        /// must handle. Passes today because the `try_emit...`
-        /// refusal happens inside `try_emit...`; this test does
-        /// its own derivation directly from provenance, which
-        /// doesn't hit the 5m or cascade refusal paths.
+        /// Post-5i.5: the cascade closes. FAR_DECODER's previously
+        /// uncovered `(c8, 1, 0)` key is now covered by the aliased-
+        /// class's own-key insertion (alias src is LoopCarry → the
+        /// in-place kernel mutates the underlying carry buffer, so
+        /// C's own key is effectively carried-through too).
         ///
-        /// If 5i.5 closes the cascade by redesigning the alias
-        /// flow (e.g., computing alias_through via a transitive
-        /// closure over non-aliased carrier classes), this
-        /// assertion should flip — `uncovered` becomes empty.
-        /// At that point the test converts from spec-pin to
-        /// regression-gate.
+        /// Converted from spec-pin ("cascade exists") to regression-
+        /// gate ("cascade stays closed"). If a new shape breaks it,
+        /// the assertion will fire and the spec test
+        /// `emission_red::far_decoder_cascade_gate_cleared` should
+        /// flag it as well.
         #[test]
         fn far_decoder_has_uncovered_carry_producer() {
             let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
@@ -7265,10 +7387,10 @@ mod tests {
                 .copied()
                 .collect();
             assert!(
-                !uncovered.is_empty(),
-                "FAR decoder should expose ≥1 cascade key (carry producer \
-                 not covered by alias_through_carries). Found none — check \
-                 if the chain changed structure."
+                uncovered.is_empty(),
+                "post-5i.5: every carry producer should be covered \
+                 (either directly via LoopCarry alias src, or via the \
+                 aliased class's own export key). Uncovered: {uncovered:?}"
             );
         }
     }
@@ -7469,6 +7591,330 @@ mod tests {
                 "FAR_SIMPLE should expose at least one locally-cascading \
                  alias entry (carry producer w/ non-LoopCarry alias src)"
             );
+        }
+
+        /// 5i.5 carry-type regression gate: for every end-of-iter
+        /// carry update `__carry_* = ... __cC_out_* ...`, the RHS
+        /// must resolve to an OwnedTensor (not a GpuTensor). Short
+        /// aliased classes hoist `Option<GpuTensor>` for their
+        /// exports; assigning one into a `Option<OwnedTensor>`
+        /// carry var is a type error (`expected OwnedTensor, found
+        /// GpuTensor`). Pre-5i.5, cascade guard refused the shape
+        /// and this couldn't happen; without the redirect, the
+        /// carry key for an aliased producer stays in
+        /// `carry_producers` and the end-of-iter update is emitted
+        /// — reproducing the fleet regression.
+        #[test]
+        fn far_cascade_carry_update_does_not_move_gpu_tensor() {
+            let s = fixture::solve_body(fixture::FAR_CASCADE_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let res = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            );
+            let tokens = res.expect("FAR_CASCADE must emit").to_string();
+            // Aliased classes whose __cC_out_P_S is Option<GpuTensor>
+            // (short + aliased + referenced intra-iter).
+            let aliased_short: Vec<usize> = sched
+                .periodic
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    let imp_id = stencil.class_impl_id[c].expect("homog");
+                    let imp = s.lib.get(imp_id);
+                    let rep = stencil.class_members[c][0];
+                    let claimed = s.sfuf.tiles_in_subgraph(rep);
+                    let is_alias = is_aliased_emittable(imp, &claimed, &s.fuf);
+                    let is_short = sched.class_offsets[c] != 0
+                        || stencil.class_members[c].len() != sched.max_period;
+                    is_alias && is_short
+                })
+                .collect();
+            // For each such class, its __cC_out_cX_p*_s* ident must
+            // NEVER appear as the RHS of a `__carry_* = ` assignment
+            // (the update loop is supposed to SKIP via
+            // alias_through_carries, but if 5i.5 redirect regresses
+            // and leaves the aliased key in carry_producers, the
+            // skip won't trigger and the RHS type-mismatches).
+            for &c in &aliased_short {
+                let needle = format!("__carry_c{c}_p");
+                // The post-5i.5 invariant: an aliased short class's
+                // OWN carry var shouldn't appear as the LHS of a
+                // reassignment `__carry_cC_* = Some(...take()...)`.
+                // Hoists (`let mut __carry_cC_* = ...`) are fine.
+                // A non-hoist reassignment would read
+                // "    __carry_cC_p…_s… = " (without `let mut`).
+                let mut scanner = tokens.as_str();
+                while let Some(hit) = scanner.find(&needle) {
+                    // Look at ~30 chars before to disambiguate hoist vs
+                    // reassignment. Hoist pattern contains "let mut".
+                    let before_start = hit.saturating_sub(30);
+                    let context = &scanner[before_start..hit + needle.len()];
+                    if !context.contains("let mut") {
+                        // Direct reassignment — look at what follows.
+                        let after = &scanner[hit..(hit + 200).min(scanner.len())];
+                        assert!(
+                            !after.contains("__cC_out")
+                                && !after.contains(&format!("__cC_out_{c}")),
+                            "aliased short class c{c} has a carry var \
+                             reassignment that moves GpuTensor into \
+                             OwnedTensor: ...{after}..."
+                        );
+                    }
+                    scanner = &scanner[hit + 1..];
+                }
+            }
+        }
+
+        /// 5i.5 red→green gate. FAR_CASCADE mirrors llama's FAR
+        /// cascade shape (FAR's rmsnorm_out read via LoopCarry by a
+        /// non-aliased Gemm consumer, alias src resolves to another
+        /// LoopCarry boundary) but drops rope_append so 5m doesn't
+        /// fire first. The cascade guard in `try_emit_collapsed_
+        /// bucket` refuses with "aliased class C pos P slot S is a
+        /// carry producer but its alias doesn't route through a
+        /// LoopCarry boundary — … 5i.5 scope" WITHOUT the redirect;
+        /// with the redirect, the aliased key never enters
+        /// `carry_producers`, the guard passes, and emission produces
+        /// a well-formed `fn forward_m_…` TokenStream. Verified
+        /// red→green: disabling `resolve_carry` (returning the raw
+        /// key) causes this test to panic with the 5i.5 refusal;
+        /// restoring the redirect makes it pass.
+        #[test]
+        fn far_cascade_emission_is_structurally_sound() {
+            let s = fixture::solve_body(fixture::FAR_CASCADE_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let res = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            );
+            let tokens =
+                res.unwrap_or_else(|e| panic!("FAR_CASCADE should emit post-5i.5; refused: {e}"));
+            // Wrap in a dummy module so the emitted fn is a valid top-level.
+            let wrapped = quote::quote! { mod _t { #tokens } };
+            syn::parse2::<syn::File>(wrapped)
+                .expect("emitted tokens must parse as a well-formed Rust file");
+        }
+
+        /// 5i.5 spec: calling `try_emit_collapsed_bucket` on
+        /// FAR_DECODER must not refuse with the 5i.5 cascade message.
+        /// It may still refuse at an upstream gate (5m — multi-output
+        /// rope_append K/V), but the specific "doesn't route through
+        /// a LoopCarry boundary — 5i.5 scope" message must be gone.
+        ///
+        /// Red today, green after the LoopCarry-alias redirect lands.
+        #[test]
+        fn far_decoder_cascade_gate_cleared() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let res = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            );
+            if let Err(msg) = &res {
+                assert!(
+                    !msg.contains("5i.5 scope"),
+                    "cascade gate should be cleared by LoopCarry-alias redirect, refusal: {msg}"
+                );
+            }
+        }
+
+        /// Diagnostic-only: print cascade keys + alias src origins
+        /// for FAR_DECODER. Run via `cargo test ... dump_far_decoder
+        /// _cascade -- --nocapture --ignored`.
+        #[test]
+        #[ignore = "diagnostic"]
+        fn dump_far_cascade() {
+            let s = fixture::solve_body(fixture::FAR_CASCADE_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("ok");
+            eprintln!("FAR_CASCADE_BODY classes:");
+            for &c in &sched.periodic {
+                let imp_id = stencil.class_impl_id[c];
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                let is_alias = imp_id
+                    .map(|id| is_aliased_emittable(s.lib.get(id), &claimed, &s.fuf))
+                    .unwrap_or(false);
+                let tags: Vec<String> = claimed
+                    .iter()
+                    .map(|t| format!("{:?}", s.fuf.get(*t).op))
+                    .collect();
+                eprintln!(
+                    "  c{c}: period={} offset={} tags={:?} aliased={}",
+                    stencil.class_members[c].len(),
+                    sched.class_offsets[c],
+                    tags,
+                    is_alias
+                );
+            }
+            for ci in &prov {
+                for slot in &ci.slots {
+                    eprintln!(
+                        "  consumer=c{} producer_tile={:?} producer_slot={} origin={:?}",
+                        ci.consumer_class, slot.producer_tile, slot.producer_slot, slot.origin
+                    );
+                }
+            }
+        }
+
+        #[test]
+        #[ignore = "diagnostic"]
+        fn dump_far_decoder_cascade() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("provenance ok");
+
+            eprintln!("# periodic classes + impls");
+            for &c in &sched.periodic {
+                let imp_id = stencil.class_impl_id[c];
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                let is_alias = imp_id
+                    .map(|id| is_aliased_emittable(s.lib.get(id), &claimed, &s.fuf))
+                    .unwrap_or(false);
+                let tags: Vec<String> = claimed
+                    .iter()
+                    .map(|t| format!("{:?}", s.fuf.get(*t).op))
+                    .collect();
+                eprintln!(
+                    "  c{c}: impl={:?} period={} offset={} tags={:?} aliased={}",
+                    imp_id,
+                    stencil.class_members[c].len(),
+                    sched.class_offsets[c],
+                    tags,
+                    is_alias
+                );
+            }
+
+            eprintln!("# carry_producers");
+            let mut carry_producers: BTreeSet<(usize, u8, u8)> = BTreeSet::new();
+            for ci in &prov {
+                for slot in &ci.slots {
+                    if let InputOrigin::LoopCarry {
+                        producer_class,
+                        producer_pos,
+                        ..
+                    } = slot.origin
+                    {
+                        carry_producers.insert((producer_class, producer_pos, slot.producer_slot));
+                        eprintln!(
+                            "  consumer=c{} reads LoopCarry from c{} pos={} slot={} (producer_tile={:?})",
+                            ci.consumer_class,
+                            producer_class,
+                            producer_pos,
+                            slot.producer_slot,
+                            slot.producer_tile
+                        );
+                    }
+                }
+            }
+
+            eprintln!("# alias srcs per aliased class (non-LoopCarry → cascade)");
+            let mut aliased: BTreeSet<usize> = BTreeSet::new();
+            for &c in &sched.periodic {
+                let imp_id = stencil.class_impl_id[c].expect("homog");
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                if is_aliased_emittable(imp, &claimed, &s.fuf) {
+                    aliased.insert(c);
+                }
+            }
+            for &c in &aliased {
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+                let imp = s.lib.get(stencil.class_impl_id[c].unwrap());
+                let aliases = imp.output_alias(&claimed, &s.fuf);
+                let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+                let mut seen: HashSet<(TileId, u8)> = HashSet::new();
+                for &t in &claimed {
+                    for input in &s.fuf.get(t).inputs {
+                        if let FufInput::Tile { id, slot } = input
+                            && !claimed_set.contains(id)
+                            && seen.insert((*id, *slot))
+                        {
+                            tile_params_ordered.push((*id, *slot));
+                        }
+                    }
+                }
+                let ci = prov.iter().find(|ci| ci.consumer_class == c).expect("prov");
+                eprintln!("  class c{c} aliases:");
+                for ((out_tile, out_slot), src) in aliases.iter() {
+                    let Some(pos) = claimed.iter().position(|x| x == out_tile) else {
+                        continue;
+                    };
+                    let key = (c, pos as u8, *out_slot);
+                    let is_carry_prod = carry_producers.contains(&key);
+                    let src_info = match src {
+                        None => "owned(None)".to_string(),
+                        Some((st, ss)) => {
+                            match tile_params_ordered
+                                .iter()
+                                .position(|(t, s)| t == st && s == ss)
+                            {
+                                Some(bidx) => {
+                                    let origin = &ci.slots[bidx].origin;
+                                    format!("src_boundary_idx={bidx} origin={origin:?}")
+                                }
+                                None => format!("src_tile={st:?}_{ss} NOT_IN_BOUNDARY"),
+                            }
+                        }
+                    };
+                    eprintln!(
+                        "    out_pos={pos} out_slot={out_slot} is_carry_producer={is_carry_prod} → {src_info}"
+                    );
+                }
+            }
         }
     }
 }

@@ -817,10 +817,19 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
-**Quant×arch coverage expansion landed in commit `9ef35d6f5`.** Five
-new e2e correctness tests green, plus targeted compiler/loader fixes
-the cells required. Previous sessions' FP8 state (all three slices
-green) still holds; the details and follow-ups for FP8 live below.
+**Quant×arch coverage expansion landed in commit `9ef35d6f5`; gemma2×AWQ
+landed in `ffa3dba0e` as a zero-compiler-change test add.** Previous sessions'
+FP8 state (all three slices green) still holds; the details and follow-ups
+for FP8 live below.
+
+**What landed in `ffa3dba0e`:**
+- `test_cuda_correctness_gemma2_2b_awq` against
+  `solidrust/dolphin-2.9.4-gemma2-2b-AWQ` (dolphin-2.9.4 fine-tune,
+  instruct-formatted). Pure plumbing: `TestModels::GEMMA2_2B_AWQ`
+  const + test fn + generate-golden entry + golden JSON. No codegen /
+  loader changes. The repo ships both `embed_tokens.weight` and
+  `lm_head.weight` materialized, so the existing `LinearTiedToEmbedding`
+  alias works. Default threshold=10.
 
 **What landed in `9ef35d6f5`:**
 
@@ -889,14 +898,20 @@ Arch preset opt-ins added (no-op when no repo fingerprint-matches):
   by any of the Marlin-singleton deference edits. Likely a
   Marlin kernel issue in the act-order / null-logprob path
   independent of this session's work.
-- **Gemma2 × AWQ:** the `RichardErkhov/google_-_gemma-2-2b-it-awq`
-  checkpoint omits `model.embed_tokens.weight` (Gemma2 ships it
-  via `lm_head.weight` when `tie_word_embeddings=true`). Ferrite's
-  loader doesn't alias `lm_head.weight` → `embed_tokens.weight`
-  for quant variants, so the load fails at fingerprint-time.
-  Dropped from the commit; real fix is either a tie-embedding
-  alias in the generated `Weights::load` or swapping to a repo
-  with an explicit `embed_tokens.weight`.
+- ~~**Gemma2 × AWQ:**~~ **LANDED** in commit `ffa3dba0e`
+  via the "swap to a repo with an explicit `embed_tokens.weight`"
+  branch. `solidrust/dolphin-2.9.4-gemma2-2b-AWQ` (dolphin fine-tune,
+  instruct-formatted) materializes both `embed_tokens.weight` and
+  `lm_head.weight` explicitly, so the existing
+  `LinearTiedToEmbedding` path works unchanged. Test
+  `test_cuda_correctness_gemma2_2b_awq` at default threshold=10
+  passes — one mid-sequence top-N-window divergence on prompt 1
+  (both tokens in each other's top-N), three pos>=10 late-divergence
+  warnings (expected bf16 noise). `RichardErkhov/google_-_gemma-2-2b-it-awq`
+  still won't load (ships only `lm_head.weight`); the tie-embedding-
+  alias fix in `Weights::load` + fingerprint is deferred as a lower-
+  priority defensiveness item — no known use case needs it now that
+  the e2e cell is covered by a cleaner checkpoint.
 
 **Prior-session FP8 state (all three slices green; commit `9e9f0c297`):**
 

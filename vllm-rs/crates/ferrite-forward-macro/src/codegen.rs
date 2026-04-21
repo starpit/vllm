@@ -2857,8 +2857,18 @@ pub fn emit_model(
             .iter()
             .enumerate()
             .map(|(i, &m)| {
-                let lo = proc_macro2::Literal::u64_unsuffixed(m);
-                let range_tokens = if i + 1 == num_tokens_points.len() {
+                // M=1 must be an exclusive range: the solver may pick
+                // M=1-only kernels (cutlass_gemv) that fail at M>1.
+                // Start the *next* bucket at 2 so M=2..next routes there.
+                let lo = if i > 0 && num_tokens_points[0] == 1 && num_tokens_points[i - 1] == 1 {
+                    proc_macro2::Literal::u64_unsuffixed(2)
+                } else {
+                    proc_macro2::Literal::u64_unsuffixed(m)
+                };
+                let range_tokens = if m == 1 {
+                    let one = proc_macro2::Literal::u64_unsuffixed(1);
+                    quote! { #one..=#one }
+                } else if i + 1 == num_tokens_points.len() {
                     quote! { #lo.. }
                 } else {
                     let next = num_tokens_points[i + 1];

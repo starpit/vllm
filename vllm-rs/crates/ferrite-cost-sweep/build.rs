@@ -37,7 +37,13 @@ fn cuda_link() {
     // produced by ferrite-cuda-builder's build.rs; the dependency
     // edge in Cargo.toml forces that crate's build to run first.
     println!("cargo:rustc-link-lib=static=vllm_kernels");
+    println!("cargo:rustc-link-lib=static=ggml_kernels");
+    println!("cargo:rustc-link-lib=static=marlin_kernels");
+    println!("cargo:rustc-link-lib=static=marlin_moe_kernels");
+    println!("cargo:rustc-link-lib=static=cutlass_scaled_mm");
     println!("cargo:rustc-link-lib=static=cutlass_standalone_gemm");
+    println!("cargo:rustc-link-lib=static=cutlass_gemm_silu_mul");
+    println!("cargo:rustc-link-lib=static=cutlass_gemm_bias");
     println!("cargo:rustc-link-lib=static=vllm_flash_attn");
     println!("cargo:rustc-link-lib=static=flashinfer_attn");
 

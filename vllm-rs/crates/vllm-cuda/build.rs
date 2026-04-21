@@ -38,6 +38,8 @@ fn cuda_link() {
     println!("cargo:rustc-link-lib=static=marlin_moe_kernels");
     println!("cargo:rustc-link-lib=static=cutlass_scaled_mm");
     println!("cargo:rustc-link-lib=static=cutlass_standalone_gemm");
+    println!("cargo:rustc-link-lib=static=cutlass_gemm_silu_mul");
+    println!("cargo:rustc-link-lib=static=cutlass_gemm_bias");
     println!("cargo:rustc-link-lib=static=vllm_flash_attn");
     println!("cargo:rustc-link-lib=static=flashinfer_attn");
 

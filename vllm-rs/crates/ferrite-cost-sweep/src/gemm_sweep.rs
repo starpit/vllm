@@ -24,7 +24,8 @@ use ferrite_kernels::cutlass::{
     cutlass_gemm_64x64_s4_launch, cutlass_gemm_64x128_s3_launch, cutlass_gemm_64x128_s4_launch,
     cutlass_gemm_128x64_s3_launch, cutlass_gemm_128x64_s4_launch, cutlass_gemm_128x128_s3_launch,
     cutlass_gemm_128x128_s4_launch, cutlass_gemm_128x256_s3_launch, cutlass_gemm_256x64_s3_launch,
-    cutlass_gemm_256x64_s4_launch, cutlass_gemv_launch,
+    cutlass_gemm_256x64_s4_launch, cutlass_gemm_bias_launch, cutlass_gemm_silu_mul_launch,
+    cutlass_gemv_launch,
 };
 
 use crate::util::{bench_kernel, gpu_alloc_zeros};
@@ -74,27 +75,62 @@ unsafe extern "C" {
 const WARMUP: u32 = 5;
 const ITERS: u32 = 5;
 
-/// Shapes covering LLaMA 1B → 70B for the four per-layer GEMMs
-/// (QKV, O, gate, up, down). Columns are `(N, K)` so every shape
-/// runs across the full `M` axis below.
+/// Shapes covering the four per-layer GEMMs (QKV, O, gate|up, down)
+/// across every arch in `ferrite-models`. Columns are `(N, K)`.
+///
+/// Without the small-hidden block, CutlassGemmImpl gets
+/// `UNCALIBRATED_COST_US` on SmolLM-135M / Qwen2-0.5B / Qwen3-0.6B
+/// shapes while GemmRefImpl falls back to an analytical cuBLAS cost
+/// — guaranteeing cuBLAS wins on small arches regardless of kernel
+/// reality. Every Gemm tile the test goldens exercise needs a row
+/// here.
 const NK_SHAPES: &[(u32, u32)] = &[
-    // Small models (1B–3B)
+    // ── Tiny models (hidden < 1k) ──
+    // SmolLM-135M: hidden=576, intermediate=1536, qkv_size=(576+2*192)=960.
+    (576, 576),
+    (960, 576),
+    (1536, 576),
+    (576, 1536),
+    (3072, 576),
+    // SmolLM-360M: hidden=960, intermediate=2560, qkv_size=(960+2*320)=1600.
+    (960, 960),
+    (1600, 960),
+    (2560, 960),
+    (960, 2560),
+    (5120, 960),
+    // ── Small models (1–2B) ──
+    // Qwen2-0.5B: hidden=896, intermediate=4864, qkv=(896+2*128)=1152.
+    (896, 896),
+    (1152, 896),
+    (4864, 896),
+    (896, 4864),
+    (9728, 896),
+    // Qwen3-0.6B: hidden=1024, intermediate=3072, qkv=(2048+2*1024)=4096.
+    (1024, 1024),
+    (4096, 1024),
+    (3072, 1024),
+    (1024, 3072),
+    (6144, 1024),
+    // Granite 3.1-2B / gemma2-2b-ish: hidden=2048 already below.
+    // ── Medium-small (1B–3B, hidden=2048–3072) ──
     (2048, 2048),
     (3072, 2048),
     (3072, 3072),
     (4608, 3072),
+    (5632, 2048),
+    (2048, 5632),
     (8192, 2048),
     (8192, 3072),
     (2048, 8192),
     (3072, 8192),
-    // Medium models (7B–13B)
+    // ── 7B–13B (hidden=4096) ──
     (4096, 4096),
     (6144, 4096),
     (11008, 4096),
     (14336, 4096),
     (4096, 11008),
     (4096, 14336),
-    // Large models (30B–70B)
+    // ── 30B–70B (hidden=8192) ──
     (8192, 8192),
     (10240, 8192),
     (28672, 8192),
@@ -231,6 +267,50 @@ fn bench_one_shape(
         "cutlass_256x64_s4"  => cutlass_gemm_256x64_s4_launch,
     );
 
+    // ── CUTLASS tile zoo, beta=1.0 residual-add variant ──
+    //
+    // Same kernel family, but `beta=1.0` — epilogue aux-reads `C` then
+    // writes `alpha*A*B + beta*C` back. Measured separately because
+    // the extra `[M, N]` read adds a real BW cost the DP needs to
+    // account for when comparing `CutlassGemmAddImpl` against the
+    // alternative `(singleton gemm + fused_add_rms_norm)` path on
+    // residual-stream chains.
+    //
+    // `c` is pre-populated (zeros here; the measurement is stable
+    // regardless of residual contents since the epilogue's work is
+    // bounded by shape, not value).
+    macro_rules! bench_cutlass_add {
+        ($($name:literal => $fn:ident),* $(,)?) => {
+            $(
+                let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                    $fn(
+                        c as *mut u16, a as *const u16, b as *const u16,
+                        m_i, n_i, k_i, 1.0, 1.0, stream as u64,
+                    );
+                }) - launch_overhead_us).max(0.0);
+                println!(concat!($name, ",{},{},{},{:.1}"), m, n, k, us);
+            )*
+        };
+    }
+    bench_cutlass_add!(
+        "cutlass_32x64_s3_add"   => cutlass_gemm_32x64_s3_launch,
+        "cutlass_32x64_s4_add"   => cutlass_gemm_32x64_s4_launch,
+        "cutlass_32x128_s3_add"  => cutlass_gemm_32x128_s3_launch,
+        "cutlass_32x128_s4_add"  => cutlass_gemm_32x128_s4_launch,
+        "cutlass_32x256_s3_add"  => cutlass_gemm_32x256_s3_launch,
+        "cutlass_64x64_s3_add"   => cutlass_gemm_64x64_s3_launch,
+        "cutlass_64x64_s4_add"   => cutlass_gemm_64x64_s4_launch,
+        "cutlass_64x128_s3_add"  => cutlass_gemm_64x128_s3_launch,
+        "cutlass_64x128_s4_add"  => cutlass_gemm_64x128_s4_launch,
+        "cutlass_128x64_s3_add"  => cutlass_gemm_128x64_s3_launch,
+        "cutlass_128x64_s4_add"  => cutlass_gemm_128x64_s4_launch,
+        "cutlass_128x128_s3_add" => cutlass_gemm_128x128_s3_launch,
+        "cutlass_128x128_s4_add" => cutlass_gemm_128x128_s4_launch,
+        "cutlass_128x256_s3_add" => cutlass_gemm_128x256_s3_launch,
+        "cutlass_256x64_s3_add"  => cutlass_gemm_256x64_s3_launch,
+        "cutlass_256x64_s4_add"  => cutlass_gemm_256x64_s4_launch,
+    );
+
     // ── GEMV (M=1 only) ──
     // SIMT kernel specialised for batch-1 decode.
     if m == 1 {
@@ -251,19 +331,61 @@ fn bench_one_shape(
         println!("cutlass_gemv,{m},{n},{k},{us:.1}");
     }
 
-    // Note on omitted kernels:
-    //   cutlass_gemm_silu_mul was in the old sweep — dropped here
-    //   because no live Impl picks it (the MLP gate×up×silu fusion
-    //   uses `silu_and_mul_fused_bf16` after a separate packed
-    //   gate+up GEMM, see `FusedGateUpSiluMulImpl`). If a future
-    //   Impl lands that picks the epilogue-fused variant, add its
-    //   extern decl + bench block here and rebuild its source in
-    //   ferrite-cuda-builder/build.rs.
+    // ── CUTLASS fused Gate+Up+Silu+Mul (EVT epilogue) ──
+    //
+    // Picked by `CutlassFusedGateUpSiluMulImpl` at emit time. The
+    // measurement here covers ONLY the gate GEMM + silu+mul epilogue;
+    // the up-projection GEMM is a separate standalone cutlass call
+    // whose cost is captured by the tile zoo rows above. `cost_us`
+    // sums both halves from the CSV at solver time.
+    //
+    // Kernel signature: d[M,N] = silu(a @ b_gate^T) * c_up, where
+    // N = intermediate_size (the gate width), K = hidden_size.
+    // For sweep purposes we reuse the outer loop's (N, K) — MLP
+    // shapes populate correct rows, non-MLP shapes are dead but
+    // harmless (matcher rejects them).
+    let c_up = gpu_alloc_zeros((m * n) as usize * 2);
+    let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
+        cutlass_gemm_silu_mul_launch(
+            c as *mut u16,
+            a as *const u16,
+            b as *const u16,
+            c_up as *mut u16,
+            m_i,
+            n_i,
+            k_i,
+            stream as u64,
+        );
+    }) - launch_overhead_us)
+        .max(0.0);
+    println!("cutlass_fused_gate_up_silu_mul,{m},{n},{k},{us:.1}");
+
+    // ── CUTLASS fused GEMM + bias (EVT row-broadcast) ──
+    //
+    // Picked by `CutlassFusedGemmBiasImpl`. Kernel writes
+    // D[M,N] = A @ B^T + bias[N] in one launch; bias is [N] bf16.
+    let bias_n = gpu_alloc_zeros(n as usize * 2);
+    let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
+        cutlass_gemm_bias_launch(
+            c as *mut u16,
+            a as *const u16,
+            b as *const u16,
+            bias_n as *const u16,
+            m_i,
+            n_i,
+            k_i,
+            stream as u64,
+        );
+    }) - launch_overhead_us)
+        .max(0.0);
+    println!("cutlass_fused_gemm_bias,{m},{n},{k},{us:.1}");
 
     unsafe {
         sys::cuMemFree_v2(a);
         sys::cuMemFree_v2(b);
         sys::cuMemFree_v2(c);
+        sys::cuMemFree_v2(c_up);
+        sys::cuMemFree_v2(bias_n);
     }
 }
 

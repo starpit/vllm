@@ -613,10 +613,47 @@ llama variant done, also chase the open correctness note in
 emission but doesn't validate the emitted code's weight lookups
 against the unrolled-path reference.
 
-**Test-driven methodology — unchanged** (the ⚡ section above
-still applies). Before every codegen change, add the red test
-first. Don't run `cargo check -p ferrite-models --features cuda`
-as verification.
+**Test-driven methodology (MANDATORY — per `feedback_unit_tests_not_
+cargo_check` in memory, and the ⚡ section above). Same discipline
+5i.5 and 5m both landed under:**
+
+1. Start by writing a fixture/test that reproduces the chosen
+   refusal. For 5h/5l pick a fleet member that trips the gate
+   today (gemma2 variant for 5h; qwen3 for 5l), solve it through
+   `fixture::solve_body`, run `try_emit_collapsed_bucket`, and
+   assert the specific refusal substring. That's the pin — it
+   starts GREEN (refusal present) and flips RED once the fix
+   lands if you mis-shaped it, or just gets removed if the gate
+   fully clears.
+
+2. If the full fleet fixture is too noisy, mirror the
+   `FAR_CASCADE_BODY` (5i.5) / `ROPE_ONLY_BODY` (5m) approach:
+   strip the DSL down to the minimal ops that still trip the
+   gate, name it `<STEP>_ONLY_BODY`, add to the `fixture`
+   module. Write a second red test against the narrow fixture
+   that asserts emission succeeds — that's the RED test the
+   fix flips GREEN.
+
+3. Before every codegen change, ask "what test catches this if
+   I break it?" — if no existing test covers the shape, add one
+   FIRST. Never run `cargo check -p ferrite-models --features
+   cuda` as verification; it's a minutes-long fleet rebuild and
+   tells you nothing structural. Use `cargo test -p
+   ferrite-forward-macro --lib codegen::tests` (~0.3s).
+
+4. Red→green proof: after the fix lands, temporarily toggle it
+   off (a one-line `if false { … }` around the new block, or
+   stub the new helper to return a no-op) and confirm the test
+   goes red; restore and confirm green. Same pattern that proved
+   5i.5 (commit `428eb491b`) and 5m (commit `3c97cce3e`).
+
+5. When the step lands, remove any pre-step pins that are now
+   obsolete (they carried their own "split when X lands" note in
+   the 5i.5/5m pattern). Retarget format-only tests to call
+   `emit_collapsed_refusal` with a synthetic reason rather than
+   to keep a fixture pinned for refusal. Update §13 of this doc
+   with the "What N specifically did" paragraph and the
+   red→green proof summary.
 
 **Expected terminal state**:
 - `emission_red::far_decoder_emits_successfully` removes its

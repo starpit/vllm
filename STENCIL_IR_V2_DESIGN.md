@@ -427,11 +427,55 @@ Split into sub-commits, each dormant-by-default (off unless
   is inaccurate. **p1 (period-mismatch guards) is mandatory for any
   non-trivial variant**, not an optional follow-up.
 
+- ✅ **6.2.b.5f — p1 period-mismatch offsets.** Lifts the
+  `uniform_period=false` refusal. Each periodic class gets an
+  `offset = max_period - period(class)` entry on `ClassSchedule`;
+  `offsets_consistent` validates every periodic class-pair edge
+  against the offsets (intra-iter: `offset_diff = -Δ`; carry-1:
+  `offset_diff = -Δ + 1`). Provenance accepts shifted producer_iter
+  (`O_C - O_P` for intra-iter; `O_C - O_P - 1` for carry-without-
+  pre-loop-init — a new LoopCarry variant with `pre_loop_init_sg:
+  Option<SubgraphId>`). Emission: "short" classes (offset > 0 or
+  period < max_period) hoist `let mut __cC_out: Option<OwnedTensor>
+  = None;` outside the loop and guard the fragment call inside; full
+  classes keep today's straight OwnedTensor + `let` form
+  (byte-identical to 6.2.b.5e for the uniform case). Call site passes
+  `__repeat - offset` as the fragment's `repeat: usize` param, with
+  weight args similarly offset-shifted. Init-less carries use
+  `Option<OwnedTensor>` with `None` init; `.as_ref()` reads.
+
+  **Measured impact (2026-04-21)**: llama / mistral / phi3 / qwen2
+  now refuse at `class 2 has multi-output tile` instead of
+  `uniform_period=false`. Offset model fits these arches cleanly.
+  gemma2 / gemma3 / granite / qwen3 refuse at
+  `offsets_consistent=false` — the "short classes start late" rule
+  (`offset = max_period - period`) doesn't cover their shape; a
+  richer offset solver is needed (probably BFS over class-pair edges
+  with Δ-based constraint propagation). commandr stays at 3 / 10
+  variants hitting the happy path (empty-loop degenerate, no periodic
+  classes).
+
 **Remaining — next session starts here:**
 
-- 5e code path that is no longer needed (the fully-implemented
-  emission): none — the emitter is done. Remaining sub-steps lift
-  refusal reasons.
+- ⏳ **6.2.b.5g — multi-output periodic classes.** Today's
+  fragment-intern path refuses any periodic class whose rep has a
+  multi-output tile (rope_append producing q/k/v; and similar).
+  Fragment return is a single `OwnedTensor`; multi-output needs
+  either (a) tuple return + multi-binding call site, or (b) a per-
+  slot `__cC_out_<slot>` hoist and emit-inline-in-loop path that
+  binds each slot as a separate iter-scoped variable. Option (a) is
+  the least invasive: return `(OwnedTensor, ..., OwnedTensor)` from
+  the fragment; at the call site `let (__cC_out_0, __cC_out_1, ...)
+  = unsafe { __frag_N(...); };`. Downstream consumers read the
+  matching slot binding. Short multi-output classes need the same
+  Option-wrapped per-slot hoist.
+
+- ⏳ **6.2.b.5h — richer offset solver.** gemma / granite / qwen3
+  trip `offsets_consistent=false` under the period-derived rule. BFS
+  over the class-pair edge graph, pinning one max-period class to
+  offset 0 and propagating `offset(B) = offset(A) - Δ + carry_delta`
+  for each edge (carry_delta ∈ {0, 1}). Infeasibility → refuse with
+  a specific reason; feasibility → emit as today.
   - **Pre-loop**: for each class in `sched.pre_loop`, emit its
     single member via today's `emit_subgraph` (concrete mode,
     `repeat_var = None`). Bind to today's `locals[&(tile_id, slot)]`.

@@ -2589,7 +2589,7 @@ struct ClassSchedule {
     /// `0` when `periodic` is empty (degenerate forward, no repeat).
     max_period: usize,
     /// `true` iff every class in `periodic` shares `max_period`.
-    /// When `false`, the emitter needs per-class guards (§13 p1).
+    /// Informational; the p1 path handles `false` via offsets.
     uniform_period: bool,
     /// `true` iff every edge that crosses classes is uniform per
     /// class pair (matches `summarize_class_edges` non_uniform_pairs
@@ -2600,6 +2600,28 @@ struct ClassSchedule {
     /// `periodic`. Heterogeneous periodic classes (Qwen3 §A.2) need
     /// the impl-table dispatch deferred to 6.2.b.5e.
     homogeneous_periodic: bool,
+    /// Per-class offset in the global `__repeat` axis (`0..max_period`).
+    /// For periodic class C with `period = class_members[C].len()`:
+    /// `offset(C) + period(C) ≤ max_period`; C's iter `i` runs at
+    /// global `__repeat = offset(C) + i`. For non-periodic classes
+    /// (pre_loop / post_loop) the entry is `0` and unused.
+    ///
+    /// Assigned via `max_period - period(C)` under the assumption that
+    /// short periodic classes start late and end aligned with
+    /// `max_period` — matches llama/mistral's observed Δ=-1 boundary
+    /// pattern (`(9[39]<-4[40]: [-1])`). The validator
+    /// [`StencilBundle::validate_class_offsets`] checks every periodic
+    /// class-pair edge's Δ against these offsets; failures bubble up
+    /// as an emitter refusal rather than silently miscompiling.
+    class_offsets: Vec<usize>,
+    /// `true` iff every periodic class-pair edge's observed Δ is
+    /// consistent with `class_offsets` under either intra-iter
+    /// (`offset_diff = -Δ`) or carry-1 (`offset_diff = -Δ + 1`)
+    /// interpretation. When `false`, the collapsed emitter refuses —
+    /// offsets derived from period alone can't explain the edge
+    /// structure (likely a class that starts early instead of late,
+    /// which p1's simple offset rule doesn't model).
+    offsets_consistent: bool,
 }
 
 impl StencilBundle {
@@ -2714,6 +2736,45 @@ impl StencilBundle {
 
         let homogeneous_periodic = periodic.iter().all(|&c| self.class_impl_id[c].is_some());
 
+        // Offset assignment — one slot per class; only the periodic
+        // entries carry signal. `max_period - period(C)` places short
+        // classes late in the global __repeat window so their final
+        // iter aligns with max_period's final iter (matches llama's
+        // Δ=-1 boundary-class shape).
+        let periodic_set: BTreeSet<usize> = periodic.iter().copied().collect();
+        let mut class_offsets: Vec<usize> = vec![0; n];
+        for &c in &periodic {
+            class_offsets[c] = max_period.saturating_sub(periods[c]);
+        }
+
+        // Validate: each edge between two periodic classes is
+        // explainable as intra-iter (offset_diff = -Δ) or carry-1
+        // (offset_diff = -Δ + 1) under the assigned offsets. Edges
+        // to/from non-periodic classes are ignored (post-loop reads
+        // the periodic class's final-iter output via __carry / __last
+        // separately; pre-loop doesn't participate in offset
+        // propagation).
+        let mut offsets_consistent = true;
+        for e in &edges {
+            if !periodic_set.contains(&e.consumer_class)
+                || !periodic_set.contains(&e.producer_class)
+            {
+                continue;
+            }
+            if e.consumer_class == e.producer_class {
+                continue;
+            }
+            let diff =
+                class_offsets[e.consumer_class] as i64 - class_offsets[e.producer_class] as i64;
+            let d = e.delta_repeat();
+            let intra_ok = diff == -d;
+            let carry_ok = diff == -d + 1;
+            if !intra_ok && !carry_ok {
+                offsets_consistent = false;
+                break;
+            }
+        }
+
         ClassSchedule {
             pre_loop,
             periodic,
@@ -2723,6 +2784,8 @@ impl StencilBundle {
             uniform_period,
             uniform_pairs,
             homogeneous_periodic,
+            class_offsets,
+            offsets_consistent,
         }
     }
 
@@ -2811,18 +2874,39 @@ impl StencilBundle {
                         )
                         .map(|pc| InputOrigin::LoopCarry {
                             producer_class: pc,
-                            pre_loop_init_sg: producer_sg,
+                            pre_loop_init_sg: Some(producer_sg),
                         })
                         .unwrap_or(InputOrigin::PreLoop { producer_sg })
                     } else if periodic_set.contains(&producer_class) {
-                        // Same-iter periodic producer (Δ=0). Anything
-                        // else (Δ>0) is suspicious: the consumer's
-                        // iter-0 sg would be reading from a producer
-                        // at iter -1+ which doesn't exist.
-                        if producer_iter != 0 {
+                        // Periodic producer under shifted-offset semantics
+                        // (p1). For consumer's rep (iter 0, global
+                        // __repeat = offset(C)), producer's iter at that
+                        // __repeat is `offset(C) - offset(P)` (intra-iter)
+                        // or one less (carry — producer ran at __repeat
+                        // = offset(C) - 1). Pick the branch that matches
+                        // the observed iter_of(producer_sg); reject if
+                        // neither. A shifted-carry has no natural
+                        // pre-loop init because consumer starts strictly
+                        // after producer (`offset(C) > offset(P)`); the
+                        // LoopCarry variant with `pre_loop_init_sg =
+                        // None` plumbs that case to the emitter, which
+                        // then hoists an `Option<OwnedTensor>` carry var
+                        // init None rather than a straight `OwnedTensor`.
+                        let c_off = sched.class_offsets[consumer_class] as i64;
+                        let p_off = sched.class_offsets[producer_class] as i64;
+                        let intra_expected = c_off - p_off;
+                        let carry_expected = intra_expected - 1;
+                        let observed = producer_iter as i64;
+                        if observed == intra_expected && intra_expected >= 0 {
+                            InputOrigin::IntraIter { producer_class }
+                        } else if observed == carry_expected && carry_expected >= 0 {
+                            InputOrigin::LoopCarry {
+                                producer_class,
+                                pre_loop_init_sg: None,
+                            }
+                        } else {
                             return None;
                         }
-                        InputOrigin::IntraIter { producer_class }
                     } else {
                         // Post-loop producer feeding a periodic
                         // consumer — cyclic, reject.
@@ -2951,14 +3035,20 @@ enum InputOrigin {
     /// Producer is a periodic class in the same iteration. Emitter
     /// reads the iter-local binding for `producer_class`.
     IntraIter { producer_class: usize },
-    /// Producer is periodic with Δrepeat=1 — the residual-stream
-    /// shape. Iter-0 initial value comes from `pre_loop_init_sg`'s
-    /// OwnedTensor; subsequent iters use the previous iter's
-    /// `producer_class` output. Emitter uses one `let mut` carry
-    /// variable per (consumer_class, input_slot).
+    /// Producer is periodic with a carry-1 relationship. Consumer
+    /// at global __repeat = R reads producer's output at __repeat =
+    /// R - 1. Two shapes:
+    /// - `Some(sg)`: iter-0 initial value comes from
+    ///   `pre_loop_init_sg`'s OwnedTensor (the residual-stream shape
+    ///   — consumer is at offset 0 and its iter-0 reads pre-loop).
+    /// - `None`: shifted-carry (p1) — consumer is at offset > 0 and
+    ///   its iter-0 reads the previous __repeat's producer output
+    ///   which already ran within the loop. No pre-loop init; the
+    ///   emitter hoists an `Option<OwnedTensor>` carry variable
+    ///   initialized `None` and populated before consumer reads.
     LoopCarry {
         producer_class: usize,
-        pre_loop_init_sg: SubgraphId,
+        pre_loop_init_sg: Option<SubgraphId>,
     },
     /// Producer is a period-1 class; its OwnedTensor lives in the
     /// outer (bucket-fn) scope. Emitter reads the today-style
@@ -3530,9 +3620,9 @@ fn emit_collapsed_refusal(
     let msg = format!(
         "FERRITE_STENCIL_CODEGEN collapsed-mode emitter refused: {reason} \
          (classes={cls}, homogeneous={hom}, pre={pre} periodic={per} post={post} \
-         max_period={mp} uniform_period={up} uniform_pairs={upa} \
-         homogeneous_periodic={hp} carried_edges={ce} provenance_ok={pov}); \
-         see STENCIL_IR_V2_DESIGN.md §13 6.2.b.5",
+         max_period={mp} uniform_period={up} offsets_consistent={oc} \
+         uniform_pairs={upa} homogeneous_periodic={hp} carried_edges={ce} \
+         provenance_ok={pov}); see STENCIL_IR_V2_DESIGN.md §13 6.2.b.5",
         cls = stencil.class_members.len(),
         hom = stencil.homogeneous_count(),
         pre = sched.pre_loop.len(),
@@ -3540,6 +3630,7 @@ fn emit_collapsed_refusal(
         post = sched.post_loop.len(),
         mp = sched.max_period,
         up = sched.uniform_period,
+        oc = sched.offsets_consistent,
         upa = sched.uniform_pairs,
         hp = sched.homogeneous_periodic,
         ce = sched.carried.len(),
@@ -3590,8 +3681,10 @@ fn try_emit_collapsed_bucket(
     weight_layout: &crate::emit::WeightLayout,
 ) -> Result<TokenStream, String> {
     // ── preconditions ────────────────────────────────────────────
-    if !sched.uniform_period {
-        return Err("uniform_period=false (periodic classes differ in member count)".into());
+    if !sched.offsets_consistent {
+        return Err("offsets_consistent=false (periodic class-pair edges not \
+             explainable under period-derived offsets)"
+            .into());
     }
     if !sched.uniform_pairs {
         return Err("uniform_pairs=false (a class pair has non-uniform Δrepeat edges)".into());
@@ -3641,7 +3734,18 @@ fn try_emit_collapsed_bucket(
     }
 
     // ── identify loop-carry producer classes ─────────────────────
-    let mut carry_inits: BTreeMap<usize, SubgraphId> = BTreeMap::new();
+    //
+    // Per producer_class P, the init source is the UNION of what
+    // consumers declare: any consumer with `Some(sg)` pins the init
+    // to that sg (residual-stream shape — consumer at offset 0 reads
+    // pre-loop at iter 0); consumers with `None` are shifted-carry
+    // (consumer at offset > 0 reads prev __repeat's value which has
+    // already been written inside the loop). When all consumers are
+    // `None`, the init is `None` and the emitter hoists an
+    // `Option<OwnedTensor>` carry var. When mixed, the `Some` wins
+    // — shifted consumers don't read the init (they start late), so
+    // the pre-loop sg is the only source that materializes.
+    let mut carry_inits: BTreeMap<usize, Option<SubgraphId>> = BTreeMap::new();
     for ci in provenance {
         for s in &ci.slots {
             if let InputOrigin::LoopCarry {
@@ -3649,13 +3753,15 @@ fn try_emit_collapsed_bucket(
                 pre_loop_init_sg,
             } = s.origin
             {
-                let entry = carry_inits
-                    .entry(producer_class)
-                    .or_insert(pre_loop_init_sg);
-                if *entry != pre_loop_init_sg {
-                    return Err(format!(
-                        "carry producer class {producer_class} has conflicting pre-loop inits"
-                    ));
+                let entry = carry_inits.entry(producer_class).or_insert(None);
+                match (&*entry, pre_loop_init_sg) {
+                    (Some(a), Some(b)) if *a != b => {
+                        return Err(format!(
+                            "carry producer class {producer_class} has conflicting pre-loop inits"
+                        ));
+                    }
+                    (None, Some(_)) => *entry = pre_loop_init_sg,
+                    _ => {}
                 }
             }
         }
@@ -3749,21 +3855,39 @@ fn try_emit_collapsed_bucket(
         ));
     }
 
-    // Carry hoists. Reuses the pre-loop's local for the init sg.
+    // Carry hoists. A carry with pre-loop init is an OwnedTensor
+    // (today's residual-stream shape, byte-identical to 6.2.b.5e).
+    // A carry without init (shifted-carry — all consumers are short
+    // and start after the producer) is `Option<OwnedTensor>` init
+    // `None`; the producer populates it before any consumer reads.
+    let carries_with_init: BTreeSet<usize> = carry_inits
+        .iter()
+        .filter_map(|(&pc, init)| init.is_some().then_some(pc))
+        .collect();
     for &pc in &carry_producers {
-        let init_sg = carry_inits[&pc];
-        let init_tiles = sfuf.tiles_in_subgraph(init_sg);
-        let init_tile = *init_tiles
-            .last()
-            .ok_or_else(|| format!("carry init sg {init_sg:?} has no tiles"))?;
-        let init_local = locals
-            .get(&(init_tile, 0))
-            .cloned()
-            .ok_or_else(|| "carry init local missing".to_string())?;
         let carry = carry_var_ident(pc);
-        body.push(quote! {
-            let mut #carry: ::ferrite_cuda_core::alloc::OwnedTensor = #init_local;
-        });
+        match carry_inits[&pc] {
+            Some(init_sg) => {
+                let init_tiles = sfuf.tiles_in_subgraph(init_sg);
+                let init_tile = *init_tiles
+                    .last()
+                    .ok_or_else(|| format!("carry init sg {init_sg:?} has no tiles"))?;
+                let init_local = locals
+                    .get(&(init_tile, 0))
+                    .cloned()
+                    .ok_or_else(|| "carry init local missing".to_string())?;
+                body.push(quote! {
+                    let mut #carry: ::ferrite_cuda_core::alloc::OwnedTensor = #init_local;
+                });
+            }
+            None => {
+                body.push(quote! {
+                    let mut #carry: ::std::option::Option<
+                        ::ferrite_cuda_core::alloc::OwnedTensor,
+                    > = None;
+                });
+            }
+        }
     }
 
     // Dedicated-last hoists: Option<OwnedTensor>, filled each iter.
@@ -3775,10 +3899,35 @@ fn try_emit_collapsed_bucket(
     }
 
     // ── loop body ───────────────────────────────────────────────
+    let max_period = sched.max_period;
     let prov_by_class: HashMap<usize, &ClassInputs> = provenance
         .iter()
         .map(|ci| (ci.consumer_class, ci))
         .collect();
+
+    // Per-class shape: "full" = offset 0 + period == max_period (runs
+    // every iter; straight OwnedTensor binding, today's form).
+    // "short" = offset > 0 OR period < max_period (guarded call with
+    // Option<OwnedTensor> hoisted above the loop so cross-iter reads
+    // resolve to the most-recent Some). Full emission is byte-
+    // identical to 6.2.b.5e for uniform variants (commandr-style).
+    let short_classes: BTreeSet<usize> = sched
+        .periodic
+        .iter()
+        .copied()
+        .filter(|&c| sched.class_offsets[c] != 0 || stencil.class_members[c].len() != max_period)
+        .collect();
+
+    // Short-class Option hoists live OUTSIDE the loop so consumers in
+    // later iters still see the Some assigned in earlier iters (for
+    // carry-target moves + post-loop reads). Re-assigned on each
+    // guarded firing; `.take()` at carry/last update sites.
+    for &c in &short_classes {
+        let out = class_out_ident(c);
+        body.push(quote! {
+            let mut #out: ::std::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> = None;
+        });
+    }
 
     let mut loop_body: Vec<TokenStream> = Vec::new();
     for &c in &sched.periodic {
@@ -3786,9 +3935,13 @@ fn try_emit_collapsed_bucket(
             .get(&c)
             .copied()
             .ok_or_else(|| format!("class {c} missing provenance entry"))?;
-        let call = emit_class_loop_call(
+        let offset = sched.class_offsets[c];
+        let period = stencil.class_members[c].len();
+        let is_short = short_classes.contains(&c);
+        let fragment_expr = emit_fragment_call_expr(
             c,
             ci,
+            offset,
             stencil,
             fuf,
             sfuf,
@@ -3798,26 +3951,77 @@ fn try_emit_collapsed_bucket(
             &locals,
             library,
             weight_layout,
+            &short_classes,
             &carry_producers,
+            &carries_with_init,
         )?;
+        let out = class_out_ident(c);
+        let call = if is_short {
+            let offset_lit = proc_macro2::Literal::usize_unsuffixed(offset);
+            let period_lit = proc_macro2::Literal::usize_unsuffixed(period);
+            quote! {
+                if __repeat >= #offset_lit && __repeat < #offset_lit + #period_lit {
+                    #out = ::std::option::Option::Some(#fragment_expr);
+                }
+            }
+        } else {
+            quote! { let #out = #fragment_expr; }
+        };
         loop_body.push(call);
     }
 
-    // End-of-iter updates: carries + dedicated lasts. Each MOVES the
-    // class's __cC_out into its sink — safe because all intra-iter
-    // consumers have already pulled views earlier in the body.
+    // End-of-iter updates: carries + dedicated lasts. Four shapes
+    // from the cross of (producer full vs short) × (carry has init vs
+    // not). The assignment moves/unwraps accordingly; guards on short
+    // producers keep the update limited to iters where the producer
+    // ran, while init-less carries wrap the assigned value in `Some`
+    // so their `Option<OwnedTensor>` type stays consistent.
     for &pc in &carry_producers {
         let carry = carry_var_ident(pc);
         let c_out = class_out_ident(pc);
-        loop_body.push(quote! { #carry = #c_out; });
+        let has_init = carries_with_init.contains(&pc);
+        let short = short_classes.contains(&pc);
+        let rhs = match (short, has_init) {
+            (false, true) => quote! { #c_out },
+            (false, false) => quote! { ::std::option::Option::Some(#c_out) },
+            (true, true) => quote! { #c_out.take().expect("short-class carry producer") },
+            (true, false) => quote! { #c_out.take() },
+        };
+        let update = quote! { #carry = #rhs; };
+        if short {
+            let offset = sched.class_offsets[pc];
+            let period = stencil.class_members[pc].len();
+            let off_lit = proc_macro2::Literal::usize_unsuffixed(offset);
+            let per_lit = proc_macro2::Literal::usize_unsuffixed(period);
+            loop_body.push(quote! {
+                if __repeat >= #off_lit && __repeat < #off_lit + #per_lit {
+                    #update
+                }
+            });
+        } else {
+            loop_body.push(update);
+        }
     }
     for &c in &dedicated_last {
         let last = last_var_ident(c);
         let c_out = class_out_ident(c);
-        loop_body.push(quote! { #last = Some(#c_out); });
+        if short_classes.contains(&c) {
+            let offset = sched.class_offsets[c];
+            let period = stencil.class_members[c].len();
+            let off_lit = proc_macro2::Literal::usize_unsuffixed(offset);
+            let per_lit = proc_macro2::Literal::usize_unsuffixed(period);
+            loop_body.push(quote! {
+                if __repeat >= #off_lit && __repeat < #off_lit + #per_lit {
+                    #last = ::std::option::Option::Some(
+                        #c_out.take().expect("short-class dedicated-last"),
+                    );
+                }
+            });
+        } else {
+            loop_body.push(quote! { #last = ::std::option::Option::Some(#c_out); });
+        }
     }
 
-    let max_period = sched.max_period;
     let max_period_lit = proc_macro2::Literal::usize_unsuffixed(max_period);
     body.push(quote! {
         for __repeat in 0usize..#max_period_lit {
@@ -3835,8 +4039,13 @@ fn try_emit_collapsed_bucket(
             .ok_or_else(|| format!("post_ref tile {tile:?} slot {slot} missing local"))?;
         if carry_producers.contains(&pc) {
             let carry = carry_var_ident(pc);
+            let rhs = if carries_with_init.contains(&pc) {
+                quote! { #carry }
+            } else {
+                quote! { #carry.take().expect("init-less carry final") }
+            };
             body.push(quote! {
-                let #local: ::ferrite_cuda_core::alloc::OwnedTensor = #carry;
+                let #local: ::ferrite_cuda_core::alloc::OwnedTensor = #rhs;
             });
         } else {
             let last = last_var_ident(pc);
@@ -3890,18 +4099,30 @@ fn try_emit_collapsed_bucket(
     })
 }
 
-/// Emit one periodic class's call inside the `for __repeat` loop:
-/// interns the fragment body (abstract mode with `repeat_var =
-/// Some(repeat)`, plus an extra `repeat: usize` fn param) and emits
-/// `let __cC_out = unsafe { __frag_N(…inputs…, __repeat, wm, ctx, device) };`
-/// where input args come from the class's `ClassInputs` provenance
-/// (IntraIter → `(*__cPC_out).as_view()`, LoopCarry → `(*__carry_P).as_view()`,
-/// PreLoop → `(*locals[&(id,slot)]).as_view()`) and weight args thread
-/// `__repeat` through `access_tokens_with_repeat`.
+/// Emit the bare `unsafe { __frag_N(…inputs…, repeat, wm, ctx, device) }`
+/// call expression for one periodic class. The caller wraps this in
+/// `let __cC_out = …` (full class — runs every iter) or
+/// `if guard { __cC_out = Some(…); }` (short class — p1 offset/period).
+///
+/// Interns the fragment body in abstract mode with `repeat_var =
+/// Some(repeat)` + an extra `repeat: usize` param. At the call site
+/// `repeat` is bound to `__repeat - offset(consumer_class)` — the
+/// class-local iter — so the fragment's `ctx.layer_expr` + weight
+/// access read the right per-class element without baking the offset
+/// into the fragment body. Offset 0 emits just `__repeat` verbatim
+/// (byte-identical to 6.2.b.5e for uniform-period variants).
+///
+/// Input args come from the class's `ClassInputs` provenance:
+/// - `IntraIter` → `(*__cPC_out).as_view()` (full producer) or
+///   `(*__cPC_out.as_ref().unwrap()).as_view()` (short producer).
+/// - `LoopCarry` → `(*__carry_P).as_view()` (producer class is in
+///   `carry_producers`).
+/// - `PreLoop` → `(*locals[&(tile, slot)]).as_view()`.
 #[allow(clippy::too_many_arguments)]
-fn emit_class_loop_call(
+fn emit_fragment_call_expr(
     consumer_class: usize,
     class_inputs: &ClassInputs,
+    consumer_offset: usize,
     stencil: &StencilBundle,
     fuf: &Fuf,
     sfuf: &Assignment,
@@ -3911,7 +4132,9 @@ fn emit_class_loop_call(
     locals: &LocalMap,
     library: &mut FragmentLibrary,
     weight_layout: &crate::emit::WeightLayout,
+    short_classes: &BTreeSet<usize>,
     carry_producers: &BTreeSet<usize>,
+    carries_with_init: &BTreeSet<usize>,
 ) -> Result<TokenStream, String> {
     let rep_sg = class_inputs.rep_sg;
     let imp_id = stencil.class_impl_id[consumer_class]
@@ -4062,7 +4285,11 @@ fn emit_class_loop_call(
         let arg = match &slot.origin {
             InputOrigin::IntraIter { producer_class } => {
                 let c_out = class_out_ident(*producer_class);
-                quote! { (*#c_out).as_view() }
+                if short_classes.contains(producer_class) {
+                    quote! { (*#c_out.as_ref().expect("short-class producer")).as_view() }
+                } else {
+                    quote! { (*#c_out).as_view() }
+                }
             }
             InputOrigin::LoopCarry { producer_class, .. } => {
                 if !carry_producers.contains(producer_class) {
@@ -4071,7 +4298,11 @@ fn emit_class_loop_call(
                     ));
                 }
                 let carry = carry_var_ident(*producer_class);
-                quote! { (*#carry).as_view() }
+                if carries_with_init.contains(producer_class) {
+                    quote! { (*#carry).as_view() }
+                } else {
+                    quote! { (*#carry.as_ref().expect("init-less carry read")).as_view() }
+                }
             }
             InputOrigin::PreLoop { producer_sg } => {
                 let init_tiles = sfuf.tiles_in_subgraph(*producer_sg);
@@ -4093,7 +4324,16 @@ fn emit_class_loop_call(
         input_args.push(arg);
     }
 
-    let repeat_tokens = quote! { __repeat };
+    // Class-local repeat expression: `__repeat - offset`, or just
+    // `__repeat` when offset is 0 (keeps the uniform-period emission
+    // byte-identical to 6.2.b.5e).
+    let repeat_tokens: TokenStream = if consumer_offset == 0 {
+        quote! { __repeat }
+    } else {
+        let off_lit = proc_macro2::Literal::usize_unsuffixed(consumer_offset);
+        quote! { (__repeat - #off_lit) }
+    };
+
     let weight_args: Vec<TokenStream> = accessors
         .iter()
         .map(|acc| {
@@ -4103,18 +4343,17 @@ fn emit_class_loop_call(
         .collect();
 
     let frag_name = format_ident!("__frag_{}", frag_idx);
-    let c_out = class_out_ident(consumer_class);
     Ok(quote! {
-        let #c_out = unsafe {
+        unsafe {
             #frag_name(
                 #(#input_args,)*
                 #(#weight_args,)*
-                __repeat,
+                #repeat_tokens,
                 wm,
                 ctx,
                 device,
             )
-        };
+        }
     })
 }
 

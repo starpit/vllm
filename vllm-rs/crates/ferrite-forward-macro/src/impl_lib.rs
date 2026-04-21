@@ -1308,15 +1308,17 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
     lib.push(Box::new(LayerNormRefImpl));
-    // A/B hook: setting `FERRITE_DISABLE_CUBLAS_GEMM=1` at proc-macro
-    // expansion time (i.e. when `forward!` runs during a build) drops
-    // `GemmRefImpl` from the library, forcing every singleton Gemm
-    // tile onto CUTLASS — tile zoo, SplitK, or GEMV. Fused impls that
-    // call cuBLAS internally are unaffected. Use this to benchmark
-    // "CUTLASS-only dispatch" vs the DP's default cost-driven mix.
-    if std::env::var_os("FERRITE_DISABLE_CUBLAS_GEMM").is_none() {
-        lib.push(Box::new(GemmRefImpl));
-    }
+    // A/B hook: setting `FERRITE_DISABLE_CUBLAS_GEMM=1` at build time
+    // drops `GemmRefImpl` from the library, forcing every singleton
+    // Gemm tile onto CUTLASS — tile zoo, SplitK, or GEMV. Fused impls
+    // that call cuBLAS internally are unaffected.
+    //
+    // The cfg path is driven by `build.rs` (see `rerun-if-env-changed`
+    // there). A plain `env::var()` read at proc-macro runtime won't
+    // invalidate downstream crates when the var changes, so the env
+    // toggle wouldn't reach emitted code.
+    #[cfg(not(disable_cublas_gemm))]
+    lib.push(Box::new(GemmRefImpl));
     lib.push(Box::new(AttentionViaCacheImpl));
     // Reshape is a metadata-only view op synthesized by shape
     // inference to bridge axis-factor mismatches (e.g. per-head QK-

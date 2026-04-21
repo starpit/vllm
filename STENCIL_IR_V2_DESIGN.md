@@ -1,22 +1,70 @@
 # Stencil IR v2 — design
 
-Status: design-before-code. Dated 2026-04-20. Supersedes the ff2 sketch in spirit; reuses the vocabulary (roles, dep kinds) but fixes the granularity and scope issues.
+Status: design-before-code (2026-04-20, §1 rewritten 2026-04-21 to
+correct the prior framing). Supersedes the ff2 sketch in spirit;
+reuses the vocabulary (roles, dep kinds) but fixes the granularity
+and scope issues.
 
-Sits between FUF (op-level math DAG, fully unrolled, const-propped) and codegen (Rust launch dispatch today; optional megakernel CUDA later). Purpose: make the solver, scheduler, and codegen operate on a **re-rolled, tile-parametric** graph so compile time scales with *distinct patterns*, not with *unrolled occurrences*.
+Sits between FUF (op-level math DAG, fully unrolled, const-propped) and codegen. Purpose: make Stencil IR **the compilation model** — the substrate the solver, scheduler, and codegen read from. The **Rust-launch lowering** is the first consumer (landing now); the **megakernel CUDA lowering** (SM90+ warp-group specialisation / TMA / WGMMA) is the real payoff and the reason Stencil IR exists.
 
 ## 1. Why this exists
 
-**Root cause of slow compilation**: FUF is fully unrolled across layers. Every downstream pass — solver, scheduler, codegen — fights the unrolling:
+**The goal is stencil-based compilation as the enabler for
+megakernels.** Everything in this doc supports that. The compile-
+time collapse (10-30× fewer fragments, smaller solver search) is a
+*side-effect* of the same refactor, not the destination.
 
-- Solver re-solves identical subgraph structure per layer (32× for llama).
-- Codegen emits ~487 fragments / 9630 call sites / 1920 inline fallbacks **per model variant**, most of which are identical-modulo-layer-index.
-- Incidental fragment dedup defeated by per-layer literals baked into abstract bodies (`ctx.kv_cache.k_cache(#layer)` etc.).
+Why the megakernel path needs this IR:
 
-**The fix is structural, not polish**: introduce an IR level where repetition is represented as *iteration domain* rather than *unrolled tiles*. Downstream passes then see a graph whose node count is O(distinct patterns), not O(distinct patterns × num_layers × …).
+- SM90+ warp-group kernels want Region-level semantics — tile the
+  iteration domain, annotate each node with a role (Load /
+  Compute / Store) so warp groups specialise, and express inter-
+  Region dep vectors so the wavefront scheduler can legally
+  overlap TMA load of tile `t+1` with WGMMA compute of tile `t`.
+  An unrolled-FUF emitter can't express any of those — it only
+  knows op-level math.
+- Shared-axis semantics across Region boundaries (design §3.1)
+  tell the scheduler where cross-Region pipelining is legal.
+  Without them, every Region boundary is a barrier; with them,
+  fused MLP / attention / residual chains become single
+  wavefronted kernels.
+- The ff2 megakernel prototypes (`emit_kittens.rs`, `emit_mega.rs`)
+  were DELETED on this branch — they consumed a less-structured
+  IR that had the same re-rolling issue. Porting them back
+  requires a stencil IR whose Regions carry the role/axis/dep-
+  vector info the SM90+ emitter needs.
 
-Non-goal polish (fragment layer-parameterization, proc-macro crate split, kernel api/impl split) gives ≤2× wins and leaves the fundamental quadratic-ish growth in place. This doc is for the 10–30× win.
+Why the Rust-launch lowering comes first:
 
-Secondary goal: the same IR is a better substrate for megakernel codegen (SM90+ warp specialization, TMA, WGMMA) than ff2's IR, because shared-axis semantics across Regions tell the wavefront scheduler where cross-Region pipelining is legal.
+- It's the current runtime on SM89 and below; correctness is
+  testable via `vllm chat` end-to-end, unlike the megakernel path
+  which needs SM90+ hardware + FlashInfer-class numerical
+  validation.
+- It shares the IR with the megakernel lowering — same Regions,
+  same classes, same periodicity detection. Landing Rust-launch
+  first proves the IR is sufficient before committing to the
+  emitter port.
+- It also retires the unrolled-FUF emitter (design §9 step 7).
+  **Stencil IR cannot be "the model" while a second emitter
+  reads the unrolled FUF in parallel** — two truths, two bugs.
+  Deleting the old path is the moment stencil IR actually
+  becomes the substrate.
+
+Compile-time collapse as side-effect:
+
+The unrolled FUF has `fragments ∝ distinct_patterns × num_layers`;
+Stencil IR makes it `∝ distinct_patterns`. For llama-2-7b that's
+the 32× layer factor falling out. Solver search space similarly
+drops from per-subgraph to per-pattern. This is measurable (see
+§9 step 4 table — 20–70× region collapse on real FUFs) and
+visible in wall-clock compile time once the flip-default lands.
+It's also the reason "stencil IR is the model" is falsifiable: if
+you still see per-layer work in the emitted code or the solver
+after the flip, the collapse is leaking.
+
+Non-goal polish (fragment layer-parameterization, proc-macro
+crate split, kernel api/impl split) buys ≤2× compile-time wins
+without moving toward megakernels. This doc is not for that.
 
 ## 2. Vocabulary
 
@@ -25,10 +73,10 @@ Three IR levels. Arch-specific concerns live in level 3.
 1. **FUF** — existing. Op-level math DAG, fully unrolled, const-propped.
 2. **Stencil IR (this doc)** — arch-neutral. N-D iteration domain, role-annotated nodes, typed dep edges, Region CFG with shared-axis semantics across Region boundaries.
 3. **Lowering** — per target:
-   - **Rust launch dispatch** (today's runtime on SM89 and below): each Region lowers to one kernel launch; the Region's axes become `for` loops in emitted Rust; roles collapse into a single launch that does Load+Compute+Store internally.
-   - **Megakernel CUDA** (deferred, SM90+): each Region lowers to a chunk of a `__global__`; shared axes across Regions enable cross-Region pipelining (TMA load of tile t+1 overlaps WGMMA compute of t); roles lower to warp-group specialization.
+   - **Rust launch dispatch** (first consumer, landing now): each Region lowers to one kernel launch; the Region's axes become `for` loops in emitted Rust; roles collapse into a single launch that does Load+Compute+Store internally. Lands first because SM89-and-below is the current runtime and correctness is testable via `vllm chat` against a reference.
+   - **Megakernel CUDA** (the actual goal, SM90+): each Region lowers to a chunk of a `__global__`; shared axes across Regions enable cross-Region pipelining (TMA load of tile t+1 overlaps WGMMA compute of t); roles lower to warp-group specialization. Builds on the Rust-launch path having proven the IR is sufficient.
 
-Same IR, two lowerings. Neither is on critical path of the other.
+Same IR, two lowerings. Neither blocks the other *technically*, but the staging lands Rust-launch first so the IR is validated before the CUDA emitter is ported.
 
 ### 2.1. Roles (frozen, 3)
 
@@ -287,13 +335,13 @@ Each step leaves the codebase correct and buildable. Parallel old/new paths duri
 
    Note: the "solver pivot" in §7 turned out to be a verification problem, not a search re-architecture. Today's solver already picks Impls per-subgraph and the question is whether those picks are class-uniform. With the neighbor-aware hash they are — except for a small structural edge case in Qwen3 (§13 item A.2) that legitimately cannot be split by op-tag topology alone.
 
-6. ⏳ **Rust codegen pivot** — replace today's `codegen::emit_model` with a Region-driven emitter. One fragment body per (Region, Impl); call sites wrap in outer iteration loops. Verify with `vllm chat` on one model per arch family. **This is where the compile-time win lands on-disk.** Depends on step 5's invariant — either restrict codegen to the consistent variants or tolerate heterogeneity (see §13).
+6. ⏳ **Rust-launch codegen pivot** — replace today's `codegen::emit_model` with a Region-driven emitter. One fragment body per (Region, Impl); call sites wrap in outer iteration loops. Verify with `vllm chat` on one model per arch family. Depends on step 5's invariant — either restrict codegen to the consistent variants or tolerate heterogeneity (see §13). First proof that Stencil IR is sufficient as a codegen substrate; the compile-time collapse lands on-disk as a side-effect.
 
-7. ⏳ **Delete the old path** — once every architecture runs through the new emitter and passes golden tests.
+7. ⏳ **Delete the old unrolled-FUF emitter** — once every architecture runs through the new emitter and passes golden tests. **This is the moment Stencil IR actually becomes "the model"** (before step 7, two emitters read two different IRs; after, there's one truth). Critical prerequisite for step 8 — the megakernel emitter has to read the same IR, and a live second emitter on unrolled FUF would encourage drift.
 
-8. ⏳ **(Deferred)** Port ff2's megakernel emitter to consume v2 Regions. Not on critical path of the compile-time fix.
+8. ⏳ **Megakernel CUDA emitter on v2 Regions** — the real payoff. Port ff2's kittens/mega emitters against Stencil IR: Region's sub-tile structure + role annotations + dep vectors drive warp-specialized `__global__` emission. Shared-axis semantics across Regions enable cross-Region wavefronting (next Region's Load overlaps this Region's Compute+Store). Scope unknown until the ff2 code is inspected post-delete; design expectation is "mechanical once IR stable." Not a side project — this is why the refactor happened.
 
-Critical-path remaining: step 6 (~1 week) + step 7 (~2 days) = ~1.5 weeks for the ~10–30× compile-time speedup. Step 8 is pure upside.
+Critical-path remaining: steps 6 → 7 ≈ 1-1.5 weeks for Rust-launch-by-default + old path deleted. Step 8 is the megakernel path, open-ended — probably weeks once step 7 lands and the ff2 emitter gets re-ported.
 
 ## 10. Open questions
 

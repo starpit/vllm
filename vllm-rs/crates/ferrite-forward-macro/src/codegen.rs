@@ -6185,6 +6185,44 @@ mod tests {
             final_norm = rmsnorm(hidden_states, norm);
             output = gemm(final_norm, lm_head);
         "#;
+
+        /// Minimal looped body: embed → for N: rmsnorm → final norm →
+        /// lm_head. One periodic class (RmsNorm) + pre_loop embed +
+        /// post_loop final norm + lm_head. No Add → no FAR → no
+        /// aliased classes. Smoke fixture for basic analysis passes.
+        pub const MINIMAL_BODY: &str = r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                hidden_states = rmsnorm(hidden_states, input_layernorm[layer]);
+            }
+            final_norm = rmsnorm(hidden_states, norm);
+            output = gemm(final_norm, lm_head);
+        "#;
+
+        // (NO_FAR_BODY removed: every tile-type available in the
+        // starter library that could follow an Add either forms the
+        // FAR fusion with a downstream RmsNorm anyway (cross-iter
+        // subgraphs), or refuses to claim at all (standalone Silu
+        // has no impl). Use MINIMAL_BODY — no Add at all — as the
+        // "no aliased classes" fixture instead. The hypothesis is
+        // the same: any body without a live Add→RmsNorm consumer
+        // chain produces zero aliased classes.)
+
+        /// FAR without rope_append / attention. Each iter has
+        /// `rmsnorm → add → rmsnorm`; the second rmsnorm consumes
+        /// the Add within the same subgraph, so FusedAddRmsNormImpl
+        /// claims the (Add, RmsNorm) pair. No multi-output tile →
+        /// no 5m refusal; isolates the 5i.4 cascade cleanly.
+        pub const FAR_SIMPLE_BODY: &str = r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                hidden_states = add(normed, hidden_states);
+                hidden_states = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+            }
+            final_norm = rmsnorm(hidden_states, norm);
+            output = gemm(final_norm, lm_head);
+        "#;
     }
 
     // ── stencil_bundle ──────────────────────────────────────────
@@ -6624,6 +6662,813 @@ mod tests {
                     "refusal reason regressed to upstream '{upstream}': {err}"
                 );
             }
+        }
+
+        /// Body with no aliased classes (MINIMAL_BODY) → cascade
+        /// refusal can't fire by construction (cascade guard only
+        /// walks aliased_classes). Either emits successfully or
+        /// refuses for a non-cascade reason.
+        #[test]
+        fn minimal_body_never_trips_cascade() {
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let res = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            );
+            if let Err(err) = res {
+                assert!(
+                    !(err.contains("carry producer")
+                        && err.contains("doesn't route through a LoopCarry")),
+                    "cascade refusal fired on a no-FAR body — impossible by construction: {err}"
+                );
+            }
+        }
+
+        /// Every refusal message should fit the
+        /// `emit_collapsed_refusal` format — a prefix + the
+        /// diagnostic suffix (classes=, homogeneous=, …).
+        /// Covers the full output path from `try_emit_collapsed_bucket`
+        /// through `emit_collapsed_refusal`.
+        #[test]
+        fn refusal_message_has_diagnostic_suffix() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let tokens = emit_forward_collapsed_bucket(
+                &s.fuf,
+                &s.sfuf,
+                &crate::schedule::schedule(&s.fuf, &s.sfuf),
+                &s.program,
+                &s.model,
+                &s.lib,
+                crate::solver::WorkloadPoint::num_tokens_only(1),
+                &mut FragmentLibrary::default(),
+                &crate::emit::WeightLayout::new(),
+            );
+            let text = tokens.to_string();
+            // Fields are embedded in a string literal inside
+            // `unimplemented!(...)` — no whitespace normalization,
+            // so `classes=` stays as-written.
+            for piece in [
+                "classes=",
+                "homogeneous=",
+                "pre=",
+                "periodic=",
+                "post=",
+                "max_period=",
+                "provenance_ok=",
+            ] {
+                assert!(
+                    text.contains(piece),
+                    "refusal diagnostic missing '{piece}': {text}"
+                );
+            }
+        }
+    }
+
+    // ── ident ───────────────────────────────────────────────────
+    //
+    // These pin the ident naming convention introduced in 5i.1's
+    // per-export refactor. Emitted code across the collapsed path
+    // greps for these exact names in downstream analysis / tests.
+
+    mod ident {
+        use super::*;
+
+        #[test]
+        fn class_out_ident_format() {
+            assert_eq!(
+                class_out_ident(5, 1, 0).to_string(),
+                "__c5_out_1_0",
+                "5i.1 renamed __cN_out to __cN_out_P_S — downstream greps \
+                 and provenance resolvers depend on this format"
+            );
+        }
+
+        #[test]
+        fn carry_var_ident_format() {
+            assert_eq!(carry_var_ident(8, 1, 0).to_string(), "__carry_c8_p1_s0",);
+        }
+
+        #[test]
+        fn last_var_ident_format() {
+            assert_eq!(last_var_ident(10, 1, 0).to_string(), "__last_c10_p1_s0",);
+        }
+    }
+
+    // ── coverage::minimal — MINIMAL_BODY sanity ─────────────────
+
+    mod minimal {
+        use super::*;
+
+        /// Minimal body: embed + for{rmsnorm} + final norm + lm_head.
+        /// After collapse, 1 periodic class (RmsNorm), pre_loop has
+        /// embed, post_loop has final norm + lm_head. No aliased.
+        #[test]
+        fn minimal_body_has_no_aliased_classes() {
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+
+            let mut aliased = 0;
+            for &c in &sched.periodic {
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous");
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                if is_aliased_emittable(imp, &claimed, &s.fuf) {
+                    aliased += 1;
+                }
+            }
+            assert_eq!(aliased, 0, "minimal body has no add→rmsnorm chain");
+        }
+
+        /// max_period is near num_hidden_layers (16 for
+        /// llama-3.2-1b). Some bodies produce max_period = N - 1
+        /// because one layer peels into pre/post_loop pre-5i.3;
+        /// this test just pins "close to N" as a regression gate.
+        #[test]
+        fn minimal_body_max_period_near_num_layers() {
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            assert!(
+                (15..=16).contains(&sched.max_period),
+                "expected max_period ≈ num_hidden_layers (=16), got {}",
+                sched.max_period
+            );
+        }
+
+        /// `class_input_provenance` is Some even for the simplest
+        /// looped body — if it ever returns None for a trivial
+        /// chain, the provenance walker regressed.
+        #[test]
+        fn minimal_body_provenance_ok() {
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            assert!(prov.is_some(), "trivial loop should classify cleanly");
+        }
+
+        /// `provenance.len()` equals `sched.periodic.len()` — every
+        /// periodic class gets exactly one entry. A mismatch means
+        /// the provenance walker skipped a class.
+        #[test]
+        fn provenance_length_matches_periodic_count() {
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("ok");
+            assert_eq!(prov.len(), sched.periodic.len());
+        }
+    }
+
+    // ── coverage::schedule_partitions ───────────────────────────
+
+    mod schedule_partitions {
+        use super::*;
+
+        /// Embed (period-1 pre-loop tile) lands in `sched.pre_loop`.
+        /// Pre-5i.3 ALL period-1 classes went here; post-5i.3 only
+        /// non-aliased ones stay. This checks the non-aliased branch
+        /// wasn't accidentally swept into the periodic re-route.
+        #[test]
+        fn embed_class_in_pre_loop() {
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+
+            // Embed is the first tile; find its class.
+            let embed_tile = s.fuf.nodes[0].id;
+            let embed_sg = s
+                .sfuf
+                .subgraph_of(embed_tile)
+                .expect("embed tile has a subgraph");
+            let embed_class = *stencil.class_of.get(&embed_sg).expect("embed classified");
+            assert!(
+                sched.pre_loop.contains(&embed_class),
+                "embed class {embed_class} should be in pre_loop, sched.pre_loop={:?}",
+                sched.pre_loop
+            );
+        }
+
+        /// lm_head (final Gemm) lands in `sched.post_loop`.
+        #[test]
+        fn lm_head_class_in_post_loop() {
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+
+            let last_tile = s.fuf.nodes.last().expect("non-empty FUF").id;
+            let last_sg = s
+                .sfuf
+                .subgraph_of(last_tile)
+                .expect("last tile has a subgraph");
+            let last_class = *stencil.class_of.get(&last_sg).expect("last classified");
+            assert!(
+                sched.post_loop.contains(&last_class),
+                "final tile class {last_class} should be in post_loop, sched.post_loop={:?}",
+                sched.post_loop
+            );
+        }
+
+        /// Non-aliased period-1 classes stay in pre_loop/post_loop
+        /// — the 5i.3 re-route is aliased-only. The minimal body's
+        /// embed + final-norm + lm_head are all non-aliased period-1,
+        /// none should end up in `sched.periodic`.
+        #[test]
+        fn non_aliased_period_one_stays_pre_post_loop() {
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            for &c in &sched.periodic {
+                if stencil.class_members[c].len() != 1 {
+                    continue;
+                }
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous");
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                assert!(
+                    is_aliased_emittable(imp, &claimed, &s.fuf),
+                    "non-aliased period-1 class {c} ended up in periodic — \
+                     5i.3 reroute should only touch aliased",
+                );
+            }
+        }
+
+        /// `sched.max_period >= 2` for any looped body —
+        /// we collapsed ≥2 iters. Regression gate on the periodicity
+        /// detection.
+        #[test]
+        fn far_decoder_max_period_exceeds_one() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            assert!(sched.max_period >= 2);
+        }
+
+        /// 5j edge-pattern refinement keeps `uniform_pairs=true`
+        /// for FAR decoder. Pre-5j we measured gemma2 at 7 +
+        /// granite at 4 non-uniform pairs; llama was already 0.
+        /// Regression gate — a refinement change that breaks
+        /// llama would trip here.
+        #[test]
+        fn far_decoder_uniform_pairs_true() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            assert!(sched.uniform_pairs, "5j refinement should keep uniform");
+        }
+
+        /// `homogeneous_periodic=true` for FAR decoder. A class
+        /// picking two impls trips this — meaning we'd need the
+        /// A.2 heterogeneous-tolerance path (Qwen3's Q/K split),
+        /// not the 5i collapsed one.
+        #[test]
+        fn far_decoder_homogeneous_periodic_true() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            assert!(sched.homogeneous_periodic);
+        }
+    }
+
+    // ── coverage::provenance_kinds ──────────────────────────────
+
+    mod provenance_kinds {
+        use super::*;
+
+        /// FAR decoder exercises all three provenance kinds.
+        /// IntraIter: QKV reads residual-add's LN output in same
+        /// iter. LoopCarry: interior FAR reads prior iter's
+        /// residual. PreLoop: iter-0 reads embed.
+        #[test]
+        fn far_decoder_hits_all_three_origin_kinds() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("provenance ok");
+            let (mut intra, mut carry, mut pre) = (false, false, false);
+            for ci in &prov {
+                for s in &ci.slots {
+                    match &s.origin {
+                        InputOrigin::IntraIter { .. } => intra = true,
+                        InputOrigin::LoopCarry { .. } => carry = true,
+                        InputOrigin::PreLoop { .. } => pre = true,
+                    }
+                }
+            }
+            assert!(intra, "expected ≥1 IntraIter origin in FAR decoder");
+            assert!(carry, "expected ≥1 LoopCarry origin (residual stream)");
+            assert!(pre, "expected ≥1 PreLoop origin");
+        }
+
+        /// The residual stream specifically: some class has a
+        /// LoopCarry origin whose `pre_loop_init_sg = Some(_)`
+        /// (init-with-preloop shape). Pre-5i.3 this was the only
+        /// carry shape; 5i.3 introduced init-less carries too.
+        /// Both should be present in a full llama body.
+        #[test]
+        fn far_decoder_has_carry_with_preloop_init() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("ok");
+            let has_preloop_init = prov.iter().any(|ci| {
+                ci.slots.iter().any(|s| {
+                    matches!(
+                        &s.origin,
+                        InputOrigin::LoopCarry {
+                            pre_loop_init_sg: Some(_),
+                            ..
+                        }
+                    )
+                })
+            });
+            assert!(
+                has_preloop_init,
+                "expected at least one carry with pre-loop init"
+            );
+        }
+
+        /// And an init-less carry (introduced by 5f/5i.3 for
+        /// shifted-offset periodic classes).
+        #[test]
+        fn far_decoder_has_initless_carry() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("ok");
+            let has_initless = prov.iter().any(|ci| {
+                ci.slots.iter().any(|s| {
+                    matches!(
+                        &s.origin,
+                        InputOrigin::LoopCarry {
+                            pre_loop_init_sg: None,
+                            ..
+                        }
+                    )
+                })
+            });
+            assert!(
+                has_initless,
+                "5i.3 re-route creates init-less carries when period-1 \
+                 aliased classes move into periodic"
+            );
+        }
+
+        /// `IntraIter.producer_class` references a class in
+        /// `sched.periodic`. If we ever emit IntraIter pointing at
+        /// a pre_loop class, the provenance walker misclassified.
+        #[test]
+        fn intraiter_producers_are_periodic() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("ok");
+            let periodic: BTreeSet<usize> = sched.periodic.iter().copied().collect();
+            for ci in &prov {
+                for slot in &ci.slots {
+                    if let InputOrigin::IntraIter { producer_class, .. } = &slot.origin {
+                        assert!(
+                            periodic.contains(producer_class),
+                            "IntraIter producer_class {producer_class} not in periodic"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// `LoopCarry.producer_class` also references a class in
+        /// `sched.periodic` (both self-carries and peer-carries
+        /// from a short periodic producer).
+        #[test]
+        fn loopcarry_producers_are_periodic() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("ok");
+            let periodic: BTreeSet<usize> = sched.periodic.iter().copied().collect();
+            for ci in &prov {
+                for slot in &ci.slots {
+                    if let InputOrigin::LoopCarry { producer_class, .. } = &slot.origin {
+                        assert!(
+                            periodic.contains(producer_class),
+                            "LoopCarry producer_class {producer_class} not in periodic"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ── coverage::aliased_empty ─────────────────────────────────
+
+    mod aliased_empty {
+        use super::*;
+
+        /// MINIMAL_BODY has no Add → FAR cannot claim → zero
+        /// aliased classes.
+        #[test]
+        fn minimal_body_has_no_aliased_classes_redundant_check() {
+            let s = fixture::solve_body(fixture::MINIMAL_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            for &c in &sched.periodic {
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous");
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                assert!(
+                    !is_aliased_emittable(imp, &claimed, &s.fuf),
+                    "unexpected aliased class {c} in NO_FAR body",
+                );
+            }
+        }
+    }
+
+    // ── chain_vs_cascade ────────────────────────────────────────
+    //
+    // 2026-04-21 finding (from diagnostic run on FAR_SIMPLE_BODY):
+    // `alias_through_carries` accumulates keys across aliased
+    // classes' alias walks — not just within a single class. So a
+    // chain of aliased classes (peel0 → interior → peelN-1), where
+    // each reads the previous via LoopCarry, has every transition
+    // captured and the cascade never fires. The cascade only
+    // triggers when a NON-aliased class reads an aliased class's
+    // rmsnorm_out via LoopCarry — which is llama's c8→c2 (QKV)
+    // shape but does NOT occur in our bare-FAR fixtures.
+    //
+    // That's why FAR_SIMPLE_BODY emits successfully under 5i.4
+    // while llama's decoder refuses.
+
+    mod chain_vs_cascade {
+        use super::*;
+
+        /// In FAR_SIMPLE_BODY the aliased chain closes cleanly:
+        /// every key in `carry_producers` also appears in
+        /// `alias_through_carries`. If this ever breaks, the
+        /// cascade appears in simple FAR bodies too, meaning
+        /// a refinement changed LoopCarry vs IntraIter
+        /// classification.
+        #[test]
+        fn far_simple_carry_producers_all_alias_through() {
+            let s = fixture::solve_body(fixture::FAR_SIMPLE_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("ok");
+            let (carry_producers, alias_through) = alias_flow_sets(&stencil, &sched, &s, &prov);
+            let uncovered: BTreeSet<_> = carry_producers
+                .difference(&alias_through)
+                .copied()
+                .collect();
+            assert!(
+                uncovered.is_empty(),
+                "FAR_SIMPLE should have every carry producer covered by \
+                 alias_through_carries (pure-aliased chain). Uncovered: {uncovered:?}"
+            );
+        }
+
+        type KeySet = BTreeSet<(usize, u8, u8)>;
+
+        fn alias_flow_sets(
+            stencil: &StencilBundle,
+            sched: &ClassSchedule,
+            s: &Solved,
+            prov: &[ClassInputs],
+        ) -> (KeySet, KeySet) {
+            let mut aliased: BTreeSet<usize> = BTreeSet::new();
+            for &c in &sched.periodic {
+                let imp_id = stencil.class_impl_id[c].expect("homog");
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                if is_aliased_emittable(imp, &claimed, &s.fuf) {
+                    aliased.insert(c);
+                }
+            }
+            let mut carry_producers: BTreeSet<(usize, u8, u8)> = BTreeSet::new();
+            for ci in prov {
+                for slot in &ci.slots {
+                    if let InputOrigin::LoopCarry {
+                        producer_class,
+                        producer_pos,
+                        ..
+                    } = slot.origin
+                    {
+                        carry_producers.insert((producer_class, producer_pos, slot.producer_slot));
+                    }
+                }
+            }
+            let mut alias_through: BTreeSet<(usize, u8, u8)> = BTreeSet::new();
+            for &c in &aliased {
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+                let imp_id = stencil.class_impl_id[c].expect("homog");
+                let imp = s.lib.get(imp_id);
+                let aliases = imp.output_alias(&claimed, &s.fuf);
+                let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+                let mut seen: HashSet<(TileId, u8)> = HashSet::new();
+                for &t in &claimed {
+                    for input in &s.fuf.get(t).inputs {
+                        if let FufInput::Tile { id, slot } = input
+                            && !claimed_set.contains(id)
+                            && seen.insert((*id, *slot))
+                        {
+                            tile_params_ordered.push((*id, *slot));
+                        }
+                    }
+                }
+                let ci = prov
+                    .iter()
+                    .find(|ci| ci.consumer_class == c)
+                    .expect("has prov");
+                for ((_out, _out_slot), src) in aliases.iter() {
+                    let Some((src_tile, src_slot)) = src else {
+                        continue;
+                    };
+                    let Some(bidx) = tile_params_ordered
+                        .iter()
+                        .position(|(t, s)| t == src_tile && s == src_slot)
+                    else {
+                        continue;
+                    };
+                    let slot = &ci.slots[bidx];
+                    if let InputOrigin::LoopCarry {
+                        producer_class,
+                        producer_pos,
+                        ..
+                    } = &slot.origin
+                    {
+                        alias_through.insert((*producer_class, *producer_pos, slot.producer_slot));
+                    }
+                }
+            }
+            (carry_producers, alias_through)
+        }
+
+        /// In FAR_DECODER_BODY the chain DOES break: at least one
+        /// aliased class has a carry_producer key not covered by
+        /// alias_through_carries. That's the cascade shape 5i.5
+        /// must handle. Passes today because the `try_emit...`
+        /// refusal happens inside `try_emit...`; this test does
+        /// its own derivation directly from provenance, which
+        /// doesn't hit the 5m or cascade refusal paths.
+        ///
+        /// If 5i.5 closes the cascade by redesigning the alias
+        /// flow (e.g., computing alias_through via a transitive
+        /// closure over non-aliased carrier classes), this
+        /// assertion should flip — `uncovered` becomes empty.
+        /// At that point the test converts from spec-pin to
+        /// regression-gate.
+        #[test]
+        fn far_decoder_has_uncovered_carry_producer() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("provenance ok");
+            let (carry_producers, alias_through) = alias_flow_sets(&stencil, &sched, &s, &prov);
+            let uncovered: BTreeSet<_> = carry_producers
+                .difference(&alias_through)
+                .copied()
+                .collect();
+            assert!(
+                !uncovered.is_empty(),
+                "FAR decoder should expose ≥1 cascade key (carry producer \
+                 not covered by alias_through_carries). Found none — check \
+                 if the chain changed structure."
+            );
+        }
+    }
+
+    // ── emission — RED tests for 5i.5 ───────────────────────────
+    //
+    // These fail today under 5i.4. Each maps a specific 5i.5 goal.
+    // Remove the `#[ignore]` once the corresponding piece lands.
+    // Running `cargo test -- --include-ignored` lets the 5i.5
+    // author measure progress continuously.
+
+    mod emission_red {
+        use super::*;
+
+        /// GREEN (not red!): FAR_SIMPLE_BODY emits successfully
+        /// under 5i.4. Proves 5i.4's post-loop lift works end to
+        /// end on single-FAR-per-iter bodies. The cascade guard
+        /// doesn't fire here because the chain of aliased
+        /// classes (peel0 → interior → peelN-1) closes cleanly
+        /// through alias_through_carries — see
+        /// `chain_vs_cascade::far_simple_carry_producers_all_alias_through`.
+        #[test]
+        fn far_simple_emits_successfully() {
+            let s = fixture::solve_body(fixture::FAR_SIMPLE_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let res = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            );
+            let tokens =
+                res.unwrap_or_else(|e| panic!("FAR_SIMPLE should emit under 5i.5; refused: {e}"));
+            assert!(!tokens.is_empty(), "emitted stream should be non-empty");
+        }
+
+        /// GOAL (5i.5 + 5m): Full FAR decoder emits successfully.
+        /// This requires 5i.5 (cascade fix) AND 5m (referenced-
+        /// downstream-not-owned — rope_append multi-output
+        /// tracking). Landing order doesn't matter; both pieces
+        /// must exist before this flips green.
+        #[test]
+        #[ignore = "red test for 5i.5 + 5m — remove once both land"]
+        fn far_decoder_emits_successfully() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let res = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            );
+            assert!(
+                res.is_ok(),
+                "FAR decoder should emit; refused: {:?}",
+                res.err()
+            );
+        }
+
+        /// GOAL (5i.5 structural guide): every aliased class's
+        /// non-LoopCarry alias src resolves to IntraIter or
+        /// PreLoop — the two data sources the 5i.5 fix can read
+        /// from to populate the cross-iter carry. If anything
+        /// else appears here, the fix plan needs revising.
+        ///
+        /// Iterates LOCAL alias entries (per-class), regardless of
+        /// whether the overall chain covers them — so this test
+        /// is meaningful on FAR_SIMPLE_BODY even though
+        /// FAR_SIMPLE's chain-level coverage is clean.
+        #[test]
+        fn aliased_nonloopcarry_srcs_are_intraiter_or_preloop() {
+            let s = fixture::solve_body(fixture::FAR_SIMPLE_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("ok");
+
+            // Build aliased_classes, carry_producers, alias_through_carries
+            // inline (replica of the emission derivation).
+            let mut aliased_classes: BTreeSet<usize> = BTreeSet::new();
+            for &c in &sched.periodic {
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous");
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                if is_aliased_emittable(imp, &claimed, &s.fuf) {
+                    aliased_classes.insert(c);
+                }
+            }
+            let mut carry_producers: BTreeSet<(usize, u8, u8)> = BTreeSet::new();
+            for ci in &prov {
+                for slot in &ci.slots {
+                    if let InputOrigin::LoopCarry {
+                        producer_class,
+                        producer_pos,
+                        ..
+                    } = slot.origin
+                    {
+                        carry_producers.insert((producer_class, producer_pos, slot.producer_slot));
+                    }
+                }
+            }
+
+            // For each aliased class's alias entries, find cascade
+            // keys (carry producer but alias not LoopCarry → not in
+            // alias_through_carries). Assert: for each cascade key,
+            // the alias src's boundary provenance is IntraIter.
+            let mut cascade_found = false;
+            for &c in &aliased_classes {
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+                let imp_id = stencil.class_impl_id[c].expect("homogeneous");
+                let imp = s.lib.get(imp_id);
+                let aliases = imp.output_alias(&claimed, &s.fuf);
+
+                let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+                let mut seen: HashSet<(TileId, u8)> = HashSet::new();
+                for &t in &claimed {
+                    for input in &s.fuf.get(t).inputs {
+                        if let FufInput::Tile { id, slot } = input
+                            && !claimed_set.contains(id)
+                            && seen.insert((*id, *slot))
+                        {
+                            tile_params_ordered.push((*id, *slot));
+                        }
+                    }
+                }
+
+                let ci = prov
+                    .iter()
+                    .find(|ci| ci.consumer_class == c)
+                    .expect("aliased has provenance");
+
+                for ((out_tile, out_slot), src) in aliases.iter() {
+                    let Some(pos) = claimed.iter().position(|x| x == out_tile) else {
+                        continue;
+                    };
+                    let key = (c, pos as u8, *out_slot);
+                    if !carry_producers.contains(&key) {
+                        continue;
+                    }
+                    let Some((src_tile, src_slot)) = src else {
+                        continue;
+                    };
+                    let Some(bidx) = tile_params_ordered
+                        .iter()
+                        .position(|(t, s)| t == src_tile && s == src_slot)
+                    else {
+                        continue;
+                    };
+                    let origin = &ci.slots[bidx].origin;
+                    if matches!(origin, InputOrigin::LoopCarry { .. }) {
+                        continue; // alias_through_carries covers these
+                    }
+                    // Non-LoopCarry alias src for a carry-producer
+                    // key: must be one of the two supported
+                    // data-source shapes for 5i.5.
+                    cascade_found = true;
+                    assert!(
+                        matches!(
+                            origin,
+                            InputOrigin::IntraIter { .. } | InputOrigin::PreLoop { .. }
+                        ),
+                        "aliased class {c} pos {pos} slot {out_slot} alias src \
+                         resolves to {origin:?}; 5i.5 must handle IntraIter + PreLoop \
+                         (LoopCarry would have gone to alias_through_carries)"
+                    );
+                }
+            }
+            assert!(
+                cascade_found,
+                "FAR_SIMPLE should expose at least one locally-cascading \
+                 alias entry (carry producer w/ non-LoopCarry alias src)"
+            );
         }
     }
 }

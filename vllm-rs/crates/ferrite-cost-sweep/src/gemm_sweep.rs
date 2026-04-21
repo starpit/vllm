@@ -21,11 +21,18 @@ use cudarc::driver::sys;
 use ferrite_kernels::cutlass::{
     cutlass_gemm_32x64_s3_launch, cutlass_gemm_32x64_s4_launch, cutlass_gemm_32x128_s3_launch,
     cutlass_gemm_32x128_s4_launch, cutlass_gemm_32x256_s3_launch, cutlass_gemm_64x64_s3_launch,
-    cutlass_gemm_64x64_s4_launch, cutlass_gemm_64x128_s3_launch, cutlass_gemm_64x128_s4_launch,
-    cutlass_gemm_128x64_s3_launch, cutlass_gemm_128x64_s4_launch, cutlass_gemm_128x128_s3_launch,
-    cutlass_gemm_128x128_s4_launch, cutlass_gemm_128x256_s3_launch, cutlass_gemm_256x64_s3_launch,
-    cutlass_gemm_256x64_s4_launch, cutlass_gemm_bias_launch, cutlass_gemm_silu_mul_launch,
-    cutlass_gemv_launch,
+    cutlass_gemm_64x64_s4_launch, cutlass_gemm_64x64_s4_sk2_launch,
+    cutlass_gemm_64x64_s4_sk4_launch, cutlass_gemm_64x64_s4_sk8_launch,
+    cutlass_gemm_64x128_s3_launch, cutlass_gemm_64x128_s4_launch,
+    cutlass_gemm_64x128_s4_sk2_launch, cutlass_gemm_64x128_s4_sk4_launch,
+    cutlass_gemm_64x128_s4_sk8_launch, cutlass_gemm_128x64_s3_launch,
+    cutlass_gemm_128x64_s4_launch, cutlass_gemm_128x64_s4_sk2_launch,
+    cutlass_gemm_128x64_s4_sk4_launch, cutlass_gemm_128x64_s4_sk8_launch,
+    cutlass_gemm_128x128_s3_launch, cutlass_gemm_128x128_s4_launch,
+    cutlass_gemm_128x128_s4_sk2_launch, cutlass_gemm_128x128_s4_sk4_launch,
+    cutlass_gemm_128x128_s4_sk8_launch, cutlass_gemm_128x256_s3_launch,
+    cutlass_gemm_256x64_s3_launch, cutlass_gemm_256x64_s4_launch, cutlass_gemm_bias_launch,
+    cutlass_gemm_silu_mul_launch, cutlass_gemv_launch,
 };
 
 use crate::util::{bench_kernel, gpu_alloc_zeros};
@@ -311,6 +318,48 @@ fn bench_one_shape(
         "cutlass_256x64_s4_add"  => cutlass_gemm_256x64_s4_launch,
     );
 
+    // ── CUTLASS SplitK parallel variants ──
+    //
+    // Narrow 4-tile × 3-split grid picked to cover tall-skinny
+    // small-N/large-K shapes where the standard tile zoo leaves
+    // cuBLAS winning (e.g. Qwen2-0.5B down_proj @ prefill).
+    //
+    // Each kernel needs an f32 scratch of `split_k × M × N × 4` bytes
+    // (GemmSplitKParallel contract). We allocate the largest at sk=8
+    // once and reuse it across splits — sizing matches the safe
+    // wrapper's `alloc.alloc_tensor(&[sk*M*N], F32)` at runtime.
+    let ws_bytes = 8usize * (m as usize) * (n as usize) * 4;
+    let splitk_ws = gpu_alloc_zeros(ws_bytes);
+    macro_rules! bench_cutlass_splitk {
+        ($($name:literal => $fn:ident),* $(,)?) => {
+            $(
+                let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                    $fn(
+                        c as *mut u16, a as *const u16, b as *const u16,
+                        m_i, n_i, k_i, 1.0, 0.0,
+                        splitk_ws as *mut u8,
+                        stream as u64,
+                    );
+                }) - launch_overhead_us).max(0.0);
+                println!(concat!($name, ",{},{},{},{:.1}"), m, n, k, us);
+            )*
+        };
+    }
+    bench_cutlass_splitk!(
+        "cutlass_64x64_s4_split2"   => cutlass_gemm_64x64_s4_sk2_launch,
+        "cutlass_64x64_s4_split4"   => cutlass_gemm_64x64_s4_sk4_launch,
+        "cutlass_64x64_s4_split8"   => cutlass_gemm_64x64_s4_sk8_launch,
+        "cutlass_64x128_s4_split2"  => cutlass_gemm_64x128_s4_sk2_launch,
+        "cutlass_64x128_s4_split4"  => cutlass_gemm_64x128_s4_sk4_launch,
+        "cutlass_64x128_s4_split8"  => cutlass_gemm_64x128_s4_sk8_launch,
+        "cutlass_128x64_s4_split2"  => cutlass_gemm_128x64_s4_sk2_launch,
+        "cutlass_128x64_s4_split4"  => cutlass_gemm_128x64_s4_sk4_launch,
+        "cutlass_128x64_s4_split8"  => cutlass_gemm_128x64_s4_sk8_launch,
+        "cutlass_128x128_s4_split2" => cutlass_gemm_128x128_s4_sk2_launch,
+        "cutlass_128x128_s4_split4" => cutlass_gemm_128x128_s4_sk4_launch,
+        "cutlass_128x128_s4_split8" => cutlass_gemm_128x128_s4_sk8_launch,
+    );
+
     // ── GEMV (M=1 only) ──
     // SIMT kernel specialised for batch-1 decode.
     if m == 1 {
@@ -386,6 +435,7 @@ fn bench_one_shape(
         sys::cuMemFree_v2(c);
         sys::cuMemFree_v2(c_up);
         sys::cuMemFree_v2(bias_n);
+        sys::cuMemFree_v2(splitk_ws);
     }
 }
 

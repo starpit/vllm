@@ -240,6 +240,161 @@ unsafe extern "C" {
         stream: u64,
     ) -> i32;
 
+    // ── SplitK parallel variants ──
+    //
+    // `cutlass_gemm_<WxH>_s<STAGES>_sk<SLICES>_launch`: same signature
+    // as the standard GEMM launchers plus a caller-owned `workspace`
+    // pointer. The kernel splits the K dim across `SLICES` CTAs and
+    // reduces via a separate reduction kernel.
+    //
+    // Workspace contract (GemmSplitKParallel): f32 scratch sized
+    // `SLICES × M × N × 4` bytes. The Rust safe wrapper allocates this
+    // via the ferrite CachingAllocator.
+    pub fn cutlass_gemm_64x64_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x64_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x64_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x128_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x128_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x128_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x64_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x64_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x64_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x128_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x128_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x128_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+
     pub fn cutlass_gemv_launch(
         c: *mut u16,
         a: *const u16,
@@ -349,7 +504,141 @@ pub unsafe fn cutlass_gemm(
             stream as u64,
         )
     };
-    assert_eq!(rc, 0, "cutlass_gemm {:?} M={m} N={n} K={k} returned {rc}", tile);
+    assert_eq!(
+        rc, 0,
+        "cutlass_gemm {:?} M={m} N={n} K={k} returned {rc}",
+        tile
+    );
+    out
+}
+
+/// SplitK tile variant — `(tile_m, tile_n, stages, split_k_slices)`.
+/// Backed by `cutlass::gemm::device::GemmSplitKParallel` in the .cu;
+/// the kernel launches a partial-GEMM grid followed by a reduction
+/// kernel. Workspace is managed statically inside the .cu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CutlassSplitKTile {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+    pub split_k: u32,
+}
+
+impl CutlassSplitKTile {
+    pub const fn new(tile_m: u32, tile_n: u32, stages: u32, split_k: u32) -> Self {
+        Self {
+            tile_m,
+            tile_n,
+            stages,
+            split_k,
+        }
+    }
+
+    /// CSV column name — `cutlass_WxH_sS_splitN`. Must match the
+    /// sweep's emitted row name and `CutlassGemmSplitKImpl::csv_name`.
+    pub fn csv_name(self) -> String {
+        format!(
+            "cutlass_{}x{}_s{}_split{}",
+            self.tile_m, self.tile_n, self.stages, self.split_k
+        )
+    }
+}
+
+/// SplitK launch fn type — adds a workspace pointer before stream.
+#[cfg(feature = "cuda")]
+type CutlassSplitKLaunchFn = unsafe extern "C" fn(
+    *mut u16,
+    *const u16,
+    *const u16,
+    i32,
+    i32,
+    i32,
+    f32,
+    f32,
+    *mut u8,
+    u64,
+) -> i32;
+
+#[cfg(feature = "cuda")]
+fn launch_fn_for_splitk(tile: CutlassSplitKTile) -> CutlassSplitKLaunchFn {
+    match (tile.tile_m, tile.tile_n, tile.stages, tile.split_k) {
+        (64, 64, 4, 2) => cutlass_gemm_64x64_s4_sk2_launch,
+        (64, 64, 4, 4) => cutlass_gemm_64x64_s4_sk4_launch,
+        (64, 64, 4, 8) => cutlass_gemm_64x64_s4_sk8_launch,
+        (64, 128, 4, 2) => cutlass_gemm_64x128_s4_sk2_launch,
+        (64, 128, 4, 4) => cutlass_gemm_64x128_s4_sk4_launch,
+        (64, 128, 4, 8) => cutlass_gemm_64x128_s4_sk8_launch,
+        (128, 64, 4, 2) => cutlass_gemm_128x64_s4_sk2_launch,
+        (128, 64, 4, 4) => cutlass_gemm_128x64_s4_sk4_launch,
+        (128, 64, 4, 8) => cutlass_gemm_128x64_s4_sk8_launch,
+        (128, 128, 4, 2) => cutlass_gemm_128x128_s4_sk2_launch,
+        (128, 128, 4, 4) => cutlass_gemm_128x128_s4_sk4_launch,
+        (128, 128, 4, 8) => cutlass_gemm_128x128_s4_sk8_launch,
+        other => panic!(
+            "cutlass splitk: unsupported tile {:?} — add its extern + csv entry",
+            other,
+        ),
+    }
+}
+
+/// SplitK GEMM: `C[M, N] = A[M, K] @ B[N, K]^T` with the K dim split
+/// across `split_k` CTAs, reduced in a second kernel. Same calling
+/// convention as [`cutlass_gemm`].
+///
+/// # Safety
+/// All inputs must be valid GPU BF16/FP16 memory with the shapes
+/// claimed by their `GpuTensor`. `stream` must be the live compute
+/// stream.
+#[cfg(feature = "cuda")]
+pub unsafe fn cutlass_gemm_splitk(
+    a: ferrite_cuda_core::tensor::GpuTensor,
+    b: ferrite_cuda_core::tensor::GpuTensor,
+    tile: CutlassSplitKTile,
+    alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
+    stream: cudarc::driver::sys::CUstream,
+) -> ferrite_cuda_core::alloc::OwnedTensor {
+    debug_assert_eq!(a.ndim(), 2);
+    debug_assert_eq!(b.ndim(), 2);
+    debug_assert_eq!(a.dim(1), b.dim(1), "splitK GEMM K mismatch");
+    let m = a.dim(0);
+    let n = b.dim(0);
+    let k = a.dim(1);
+    let out = alloc.alloc_tensor(&[m, n], a.dtype());
+
+    // GemmSplitKParallel workspace: partial-sum buffer of shape
+    // [split_k, M, N] in f32 (accumulator type). Allocated through
+    // the same caching allocator that owns every other scratch
+    // tensor in the forward — never cudaMalloc/Free per call.
+    let ws_elems = (tile.split_k as usize) * m * n;
+    let workspace = alloc.alloc_tensor(&[ws_elems], ferrite_cuda_core::DType::F32);
+
+    let launch = launch_fn_for_splitk(tile);
+    let rc = unsafe {
+        launch(
+            out.as_mut_ptr::<u16>(),
+            a.as_ptr::<u16>(),
+            b.as_ptr::<u16>(),
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            0.0,
+            workspace.as_mut_ptr::<u8>(),
+            stream as u64,
+        )
+    };
+    assert_eq!(
+        rc, 0,
+        "cutlass_gemm_splitk {:?} M={m} N={n} K={k} returned {rc}",
+        tile
+    );
+    // workspace dropped here → returned to caching pool. Safe because
+    // the forward runs on a single compute stream: any later alloc
+    // that recycles these bytes enqueues its kernel behind the splitK
+    // GEMM+reduce on the same stream (FIFO), so the bytes are read to
+    // completion before they're rewritten. Same discipline as
+    // `cutlass_gemm_silu_mul` dropping `up_out` post-launch.
+    drop(workspace);
     out
 }
 

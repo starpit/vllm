@@ -325,10 +325,11 @@ CUTLASS_GEMM_SWIZZLE( 64,  256,  32,    32,     64,     32,    2)
         void* C, const void* A, const void* B,                                      \
         int M, int N, int K,                                                        \
         float alpha, float beta,                                                    \
+        void* workspace,                                                            \
         uint64_t stream                                                             \
     ) {                                                                             \
         return run_gemm_splitk<GemmSplitK_##TB_M##x##TB_N##_k64_s##STAGES>(        \
-            C, A, B, M, N, K, alpha, beta, SLICES, (cudaStream_t)stream);           \
+            C, A, B, M, N, K, alpha, beta, SLICES, workspace, (cudaStream_t)stream); \
     }
 
 #define CUTLASS_SPLITK_K64(TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES, SLICES)    \
@@ -360,20 +361,11 @@ CUTLASS_GEMM( 32,  128,  32,    32,     64,     32,    3)
 // Uses GemmSplitKParallel which launches a GEMM grid + a reduction kernel.
 // The split_k_slices parameter controls how many CTAs share the K dim.
 
-// Persistent workspace for splitK — avoids cudaMalloc/Free per call.
-// 32 MiB covers all configs up to split_k=16 on 8192×8192 shapes.
-static void* g_splitk_workspace = nullptr;
-static size_t g_splitk_workspace_size = 0;
-
-static void* get_splitk_workspace(size_t needed) {
-    if (needed <= g_splitk_workspace_size) return g_splitk_workspace;
-    if (g_splitk_workspace) cudaFree(g_splitk_workspace);
-    // Round up to 32 MiB minimum to avoid repeated reallocs.
-    size_t alloc = (needed < 32 * 1024 * 1024) ? 32 * 1024 * 1024 : needed;
-    cudaMalloc(&g_splitk_workspace, alloc);
-    g_splitk_workspace_size = alloc;
-    return g_splitk_workspace;
-}
+// Workspace is supplied by the caller (ferrite's CachingAllocator).
+// Contract for GemmSplitKParallel: workspace size is
+//   split_k_slices * M * N * sizeof(ElementAccumulator)
+// Here ElementAccumulator = float → 4 bytes/elem. The Rust wrapper
+// computes the same formula when sizing its f32 scratch tensor.
 
 template <typename GemmSplitK>
 static int run_gemm_splitk(
@@ -381,6 +373,7 @@ static int run_gemm_splitk(
     int M, int N, int K,
     float alpha, float beta,
     int split_k_slices,
+    void* workspace,
     cudaStream_t stream
 ) {
     typename GemmSplitK::Arguments args(
@@ -397,9 +390,11 @@ static int run_gemm_splitk(
     auto status = op.can_implement(args);
     if (status != cutlass::Status::kSuccess) return -1;
 
-    size_t ws = GemmSplitK::get_workspace_size(args);
-    void* workspace = (ws > 0) ? get_splitk_workspace(ws) : nullptr;
-
+    // Caller sized workspace from the (split_k, M, N) contract above;
+    // CUTLASS's get_workspace_size matches this exactly for
+    // GemmSplitKParallel. A short-K or tiny-M/N edge case could return
+    // zero — the workspace pointer is then unused and ignored by
+    // initialize.
     status = op.initialize(args, workspace);
     if (status != cutlass::Status::kSuccess) return -2;
 
@@ -436,10 +431,11 @@ static int run_gemm_splitk(
         void* C, const void* A, const void* B,                                      \
         int M, int N, int K,                                                        \
         float alpha, float beta,                                                    \
+        void* workspace,                                                            \
         uint64_t stream                                                             \
     ) {                                                                             \
         return run_gemm_splitk<GemmSplitK_##TB_M##x##TB_N##_s##STAGES>(            \
-            C, A, B, M, N, K, alpha, beta, SLICES, (cudaStream_t)stream);           \
+            C, A, B, M, N, K, alpha, beta, SLICES, workspace, (cudaStream_t)stream); \
     }
 
 #define CUTLASS_SPLITK(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES, SLICES)  \

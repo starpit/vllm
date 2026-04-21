@@ -1414,6 +1414,20 @@ pub fn starter_library() -> ImplementationLibrary {
             stages: tile.2,
         }));
     }
+    // CUTLASS SplitK parallel — one Impl per (tile, split_k) tuple.
+    // Closes the small-N/large-K tall-skinny shape class where the
+    // standard tile zoo leaves cuBLAS winning. target_compatible
+    // gates on CSV row presence, so uncalibrated targets skip
+    // these variants silently.
+    for &(tm, tn, st, sk) in CUTLASS_SPLITK_ZOO {
+        lib.push(Box::new(CutlassGemmSplitKImpl {
+            tile_m: tm,
+            tile_n: tn,
+            stages: st,
+            split_k: sk,
+        }));
+    }
+
     lib.push(Box::new(CutlassGemvImpl));
 
     // ── Marlin (AWQ / GPTQ) impls ───────────────────────────────
@@ -6215,6 +6229,165 @@ impl Implementation for CutlassGemmImpl {
                     *(#x),
                     (#w).dense_weight(),
                     ::ferrite_kernels::cutlass::CutlassTile::new(#tile_m, #tile_n, #stages),
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
+// ── CutlassGemmSplitKImpl ────────────────────────────────────────
+//
+// Singleton Gemm impl backed by CUTLASS `GemmSplitKParallel` — the K
+// dim is split across `split_k` CTAs and reduced in a second kernel.
+// Closes the "tall-skinny large-K" shape class where the standard
+// tile zoo loses to cuBLAS (e.g. Qwen2-0.5B down_proj at prefill:
+// M≈4096, N=896, K=4864).
+//
+// Same `matches` predicates as `CutlassGemmImpl` (dense bf16 only,
+// not a fusion partner). Workload constraint excludes M=1 — GEMV
+// owns decode. Cost is a direct CSV lookup on
+// `cutlass_WxH_sS_splitN`; rows missing for a shape fall back to
+// `UNCALIBRATED_COST_US` so the DP ignores the variant there.
+//
+// Registered alongside `CutlassGemmImpl` in `starter_library`.
+
+/// The pure-SplitK tile variants exported by
+/// `vllm-cuda/csrc/cutlass_standalone_gemm.cu` and declared as
+/// externs in `ferrite-kernels::cutlass`. `(tile_m, tile_n, stages,
+/// split_k)`. Keep in sync with that FFI block.
+const CUTLASS_SPLITK_ZOO: &[(u32, u32, u32, u32)] = &[
+    (64, 64, 4, 2),
+    (64, 64, 4, 4),
+    (64, 64, 4, 8),
+    (64, 128, 4, 2),
+    (64, 128, 4, 4),
+    (64, 128, 4, 8),
+    (128, 64, 4, 2),
+    (128, 64, 4, 4),
+    (128, 64, 4, 8),
+    (128, 128, 4, 2),
+    (128, 128, 4, 4),
+    (128, 128, 4, 8),
+];
+
+#[derive(Debug, Clone)]
+pub struct CutlassGemmSplitKImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+    pub split_k: u32,
+}
+
+impl CutlassGemmSplitKImpl {
+    fn csv_name(&self) -> &'static str {
+        self.static_name()
+    }
+
+    fn static_name(&self) -> &'static str {
+        match (self.tile_m, self.tile_n, self.stages, self.split_k) {
+            (64, 64, 4, 2) => "cutlass_64x64_s4_split2",
+            (64, 64, 4, 4) => "cutlass_64x64_s4_split4",
+            (64, 64, 4, 8) => "cutlass_64x64_s4_split8",
+            (64, 128, 4, 2) => "cutlass_64x128_s4_split2",
+            (64, 128, 4, 4) => "cutlass_64x128_s4_split4",
+            (64, 128, 4, 8) => "cutlass_64x128_s4_split8",
+            (128, 64, 4, 2) => "cutlass_128x64_s4_split2",
+            (128, 64, 4, 4) => "cutlass_128x64_s4_split4",
+            (128, 64, 4, 8) => "cutlass_128x64_s4_split8",
+            (128, 128, 4, 2) => "cutlass_128x128_s4_split2",
+            (128, 128, 4, 4) => "cutlass_128x128_s4_split4",
+            (128, 128, 4, 8) => "cutlass_128x128_s4_split8",
+            _ => "cutlass_splitk_unknown",
+        }
+    }
+}
+
+impl Implementation for CutlassGemmSplitKImpl {
+    fn name(&self) -> &'static str {
+        self.static_name()
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        if gemm_is_fusion_partner(fuf, seed) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let node = ctx.fuf.get(m.claimed_tiles[0]);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, node) else {
+            return f64::INFINITY;
+        };
+        ctx.profile
+            .cost_us_for(self.csv_name(), mm, nn, kk)
+            .unwrap_or(UNCALIBRATED_COST_US)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::RegularLaunch
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let x = ctx.input_expr(tile, 0);
+        let w = ctx.input_expr(tile, 1);
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        let split_k = self.split_k;
+        quote! {
+            let #out = unsafe {
+                ::ferrite_kernels::cutlass::cutlass_gemm_splitk(
+                    *(#x),
+                    (#w).dense_weight(),
+                    ::ferrite_kernels::cutlass::CutlassSplitKTile::new(
+                        #tile_m, #tile_n, #stages, #split_k,
+                    ),
                     &mut device.caching,
                     device.compute_stream,
                 )

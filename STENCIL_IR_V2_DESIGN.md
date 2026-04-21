@@ -397,7 +397,7 @@ None of these are show-stoppers without investigation, but each is worth measuri
 - `.../src/class_impl.rs` — class→Impl consistency check, strict + tolerant resolvers.
 - `.../src/lib.rs` — pipeline wired into the macro drive (search for `stencil ·`). Diagnostic only; does not affect emitted code.
 
-**Test coverage**: ~200 unit tests total across the crate; 38 in `codegen::tests` (2 ignored diagnostic dumps). All codegen tests pass. `cargo clippy -p ferrite-forward-macro --all-targets -- -D warnings` clean. Pre-existing unrelated failures outside codegen: `solver::tests::add_rmsnorm_pairs_claimed_as_fused_subgraph`, `config::tests::load_real_{llama,qwen2}_configs` — verified unaffected by 5i.5 + 5m changes (reproduce on bare HEAD~).
+**Test coverage**: ~200 unit tests total across the crate; 39 in `codegen::tests` (2 ignored diagnostic dumps). All codegen tests pass. `cargo clippy -p ferrite-forward-macro --all-targets -- -D warnings` clean. Pre-existing unrelated failures outside codegen: `solver::tests::add_rmsnorm_pairs_claimed_as_fused_subgraph`, `config::tests::load_real_{llama,qwen2}_configs` — verified unaffected by 5i.5 + 5m changes (reproduce on bare HEAD~).
 
 **Measurement after the hash fix**: distribution of class counts shifted from a tight 8/10 to 12/15/17/18/22 across 218 variants. Collapse factor for llama / mistral drops from ~28× to ~19×; still well-collapsed and every class is now impl-consistent. Pre-fix 23 heterogeneous variants → 2 remaining (both Qwen3; see A.2).
 
@@ -406,12 +406,12 @@ None of these are show-stoppers without investigation, but each is worth measuri
 **Orientation — run these first, in order (~5 seconds total):**
 
 ```bash
-# 1. Confirm the post-5m baseline: 38 green, 2 ignored diagnostics.
+# 1. Confirm the post-5m baseline: 39 green, 2 ignored diagnostics.
 cargo test -p ferrite-forward-macro --lib codegen::tests
 
 # 2. Skim the top-of-branch commits so the 5i.5 / 5m mental model
 #    matches the code as it stands today.
-git log --oneline -6
+git log --oneline -8
 ```
 
 Then pick a step from the "Next concrete step" table below (5h,
@@ -430,7 +430,7 @@ minutes per experiment. That loop has been replaced:
 
 ```bash
 cargo test -p ferrite-forward-macro --lib codegen::tests
-# 38 green, 2 ignored (diagnostic dumps), ~0.3s
+# 39 green, 2 ignored (diagnostic dumps), ~0.3s
 ```
 
 **Red→green discipline (the 5i.5 model, commit `428eb491b`):**
@@ -451,19 +451,38 @@ outcome based on production behavior. The 5i.5 proof:
 4. Restored `resolve_carry` to consult the redirect — test green.
 5. Committed the fix; the test stands as a regression gate.
 
-**DO NOT run `cargo check -p ferrite-models --features cuda` as
-verification.** If a change might regress a fleet shape, a unit
-test against that shape is the fix. Fleet-check is a slow
-diagnostic-of-last-resort, not part of the loop.
+**DO NOT use `cargo check -p ferrite-models --features cuda` as
+your development loop.** If a change might regress a fleet
+shape, a unit test against that shape is the fix. Minutes-long
+rebuilds to get a single yes/no signal are the anti-pattern
+this methodology replaces.
+
+**DO run the fleet check ONCE at the end of a session that
+closed a refusal gate.** Lesson from the 5m landing (commits
+`3c97cce3e` + `b07831a85`): `syn::parse2::<syn::File>(tokens)`
+confirms the emitted code is well-formed Rust syntax. It does
+NOT confirm it typechecks. A `forward_m_*` that previously
+emitted `unimplemented!(..)` under a refusal suddenly emits
+real token streams once that refusal clears — and any latent
+bug in adjacent emission (OwnedTensor-vs-GpuTensor hoists,
+borrow-lifetime miscompile, unused-weight dead-code, etc.) will
+surface only under `rustc`'s full typecheck. The fleet check is
+the cheapest way to catch this before `vllm chat` does. Run it
+once; if it flags something, *pin the failure as a structural
+test* (the 5m follow-up did this via
+`far_decoder_no_owned_gpu_mismatch_on_aliased_last` — grep the
+token string for the bad ident pattern) so the 0.3s loop catches
+it next time.
 
 **The test fixtures drive the full pipeline** — DSL → classify →
 infer → CFG → unroll → solve → StencilBundle → ClassSchedule →
 provenance → try_emit_collapsed_bucket — against hand-written
 llama-style bodies. A codegen change that regresses any shape
 shows up immediately in the test list, with a specific failing
-assertion pointing at the broken invariant. No more "it compiles,
-ship it" followed by debugging from rustc error messages against
-a 218-variant fleet.
+assertion pointing at the broken invariant. The one thing this
+misses is the `rustc` typecheck pass, which is why the
+end-of-session fleet check is non-negotiable for a refusal-
+clearing step.
 
 **Workflow for 5i.5 (and every sub-step after):**
 
@@ -533,12 +552,20 @@ a 218-variant fleet.
   refusal pins were removed when their gates cleared.
 - `aliased_empty` — body with no aliased classes produces no
   cascade.
-- `emission_red` — the emission gates. Post-5m all three are green:
-  `far_simple_emits_successfully`, `rope_only_emits_successfully`
-  (5m narrow acceptance), `far_decoder_emits_successfully` (5i.5 +
-  5m combined acceptance), plus `far_cascade_emission_is_structurally_sound`
-  (5i.5 narrow) and `far_cascade_carry_update_does_not_move_gpu_tensor`.
-  Two `dump_*` diagnostic tests stay `#[ignore]`.
+- `emission_red` — the emission gates. Post-5m six tests green:
+  `far_simple_emits_successfully` (FAR without rope/attn),
+  `rope_only_emits_successfully` (5m narrow acceptance),
+  `far_decoder_emits_successfully` (5i.5 + 5m combined acceptance),
+  `far_cascade_emission_is_structurally_sound` (5i.5 narrow),
+  `far_cascade_carry_update_does_not_move_gpu_tensor` (5i.5
+  carry-type regression gate), and
+  `far_decoder_no_owned_gpu_mismatch_on_aliased_last` (5m
+  follow-up: structural pin that aliased classes don't hoist
+  `__last_cC_*: Option<OwnedTensor>` — catches the
+  OwnedTensor/GpuTensor mismatch fleet-check would otherwise
+  catch at the cost of several minutes). Two `dump_*` diagnostic
+  tests stay `#[ignore]`. `aliased_nonloopcarry_srcs_are_intraiter_or_preloop`
+  is a 5i.5 structural guide test, also green.
 
 ## What's landed
 
@@ -550,7 +577,8 @@ refinement), 6.2.b.5i.1 (per-export key refactor), 6.2.b.5i.2
 (period-1 aliased re-route), 6.2.b.5i.4 (post-loop aliased
 export lift), **6.2.b.5i.5 (LoopCarry-alias redirect, commit
 `428eb491b`, 2026-04-22)**, **6.2.b.5m (side-effect export
-recognizer, 2026-04-22)** + extensive test fixtures.
+recognizer, commits `3c97cce3e` + follow-up `b07831a85`,
+2026-04-22)** + extensive test fixtures.
 
 **6.2.b.5m specifically** (the kv_cache-alias fix): `FusedQkvRopeCacheImpl`
 lists only slot 0 (rotated Q) in its `output_alias`; slots 1 and 2
@@ -585,6 +613,25 @@ their own "split when 5m lands" notes); `refusal::refusal_message_has_diagnostic
 was retargeted to call `emit_collapsed_refusal` directly with a
 synthetic reason so its format assertions survive future fixture
 additions.
+
+**5m follow-up commit `b07831a85`: aliased-class `__last_` hoist
+fix.** The 5m main commit's emission tests were
+`syn::parse2`-only and missed a latent type mismatch that
+`FERRITE_STENCIL_CODEGEN=1 cargo check -p ferrite-models
+--features cuda` surfaced at 338 errors on llama alone. Root
+cause: `dedicated_last` (post-loop-referenced, non-carry-
+producing class exports) was hoisting `Option<OwnedTensor>` for
+*every* class, including aliased ones — but 5i.4's aliased
+post-loop path separately hoists `Option<GpuTensor>` for the
+same export, and the dedicated_last populate site then tried to
+`Some(gpu_tensor)` into `Option<OwnedTensor>`. Fix: skip aliased
+classes in both the hoist loop (~line 4807) and populate loop
+(~line 5031); the aliased-post-loop path at ~line 5067 already
+reads `__cC_out.as_ref().expect(..).as_view()` correctly. New
+structural pin `far_decoder_no_owned_gpu_mismatch_on_aliased_last`
+greps emitted tokens for `__last_cC_p…` of aliased classes —
+red when either skip is off, green when both on. Post-follow-up,
+the fleet check completes clean across all 218 variants.
 
 **6.2.b.5i.5 specifically** (the cascade fix): when aliased class C's
 `output_alias` for export `(pos, slot)` points at a boundary input
@@ -675,9 +722,21 @@ cargo_check` in memory, and the ⚡ section above). Same discipline
    off (a one-line `if false { … }` around the new block, or
    stub the new helper to return a no-op) and confirm the test
    goes red; restore and confirm green. Same pattern that proved
-   5i.5 (commit `428eb491b`) and 5m (commit `3c97cce3e`).
+   5i.5 (commit `428eb491b`) and 5m (commits `3c97cce3e` main +
+   `b07831a85` follow-up).
 
-5. When the step lands, remove any pre-step pins that are now
+5. **End-of-session fleet check (non-negotiable for a refusal-
+   clearing step).** Run `FERRITE_STENCIL_CODEGEN=1 cargo check
+   -p ferrite-models --features cuda` once. `syn::parse2` passes
+   on ill-typed token streams; only `rustc`'s typecheck catches
+   OwnedTensor/GpuTensor mismatches, lifetime bugs, and the like.
+   If it flags something, add a structural pin (token-string grep
+   for the bad ident pattern, as in
+   `far_decoder_no_owned_gpu_mismatch_on_aliased_last`) so the
+   0.3s unit-test loop catches it next time — then fix. Do not
+   commit a "step landed" claim before the fleet check is clean.
+
+6. When the step lands, remove any pre-step pins that are now
    obsolete (they carried their own "split when X lands" note in
    the 5i.5/5m pattern). Retarget format-only tests to call
    `emit_collapsed_refusal` with a synthetic reason rather than

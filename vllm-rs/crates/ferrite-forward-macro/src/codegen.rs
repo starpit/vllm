@@ -4496,13 +4496,63 @@ fn try_emit_collapsed_bucket(
         }
     }
 
-    // Aliased classes don't currently support post-loop consumption:
-    // their exports bind as `TensorView<'_>` which doesn't fit the
-    // `Option<OwnedTensor>` dedicated-last pattern.
+    // 5i.4 follow-up guard: if an aliased class C produces an export
+    // (pos, slot) that's read via LoopCarry by some downstream consumer
+    // (i.e. `(C, pos, slot)` ∈ carry_producers), the cross-iter
+    // continuation requires the export's backing OwnedTensor to live
+    // in the carry var. That only works when C's alias chain routes the
+    // export through one of its LoopCarry boundary inputs — captured by
+    // `alias_through_carries`, where the in-place kernel mutates the
+    // carry's underlying buffer. If the alias src instead points at a
+    // non-carry boundary (e.g. class 8's rmsnorm_out in FAR aliases the
+    // delta_upstream, which is typically another class's per-iter-fresh
+    // OwnedTensor), the end-of-iter `__carry = __cC_out` update is a
+    // type error (OwnedTensor vs GpuTensor) *and* semantically wrong
+    // (the backing buffer isn't the carry's OwnedTensor). Refuse
+    // specifically so this shape is visible in the refusal count
+    // instead of cascading to a raw rustc compile error.
+    for &c in &aliased_classes {
+        let rep = stencil.class_members[c][0];
+        let claimed = sfuf.tiles_in_subgraph(rep);
+        let imp_id = stencil.class_impl_id[c].ok_or_else(|| format!("class {c} has no impl"))?;
+        let imp = lib.get(imp_id);
+        let aliases = imp.output_alias(&claimed, fuf);
+        for ((out_tile, out_slot), _src) in aliases.iter() {
+            let Some(pos) = claimed.iter().position(|x| x == out_tile) else {
+                continue;
+            };
+            let key = (c, pos as u8, *out_slot);
+            if carry_producers.contains(&key) && !alias_through_carries.contains(&key) {
+                return Err(format!(
+                    "aliased class {c} pos {pos} slot {out_slot} is a carry producer but its alias \
+                     doesn't route through a LoopCarry boundary — cross-iter tracking of the \
+                     aliased upstream OwnedTensor not yet supported (5i.5 scope)"
+                ));
+            }
+        }
+    }
+
+    // Aliased post-loop exports (5i.4): a short-period aliased class
+    // hoists `let mut __cC_out_P_S: Option<GpuTensor> = None;` outside
+    // the loop (see `short_classes` hoist below); the guarded inline
+    // body assigns `Some(tmp.as_raw())` each firing. After the loop,
+    // post-loop consumers read `#local = <hoist>.as_ref().expect(..)
+    // .as_view()` → `TensorView<'_>`; downstream `(*#local).as_view()`
+    // works via `TensorView: Deref<Target = GpuTensor>`.
+    //
+    // A FULL aliased class (offset=0, period=max_period) only binds
+    // the per-iter TensorView inside the loop body — those die at
+    // scope exit and can't reach post-loop. Refuse those only.
     for &(c, pos, slot) in &dedicated_last {
-        if aliased_classes.contains(&c) {
+        if !aliased_classes.contains(&c) {
+            continue;
+        }
+        let is_short =
+            sched.class_offsets[c] != 0 || stencil.class_members[c].len() != sched.max_period;
+        if !is_short {
             return Err(format!(
-                "aliased class {c} pos {pos} slot {slot} referenced post-loop — unsupported"
+                "full-period aliased class {c} pos {pos} slot {slot} referenced post-loop — \
+                 per-iter TensorView bindings don't outlive the loop"
             ));
         }
     }
@@ -4862,7 +4912,26 @@ fn try_emit_collapsed_bucket(
             .get(&(tile, slot))
             .cloned()
             .ok_or_else(|| format!("post_ref tile {tile:?} slot {slot} missing local"))?;
-        if carry_producers.contains(&(pc, ppos, pslot)) {
+        if aliased_classes.contains(&pc) {
+            // 5i.4: short aliased class hoists `Option<GpuTensor>` outside
+            // the loop. Its guarded inline body populated `Some(tmp.as_raw())`
+            // at the class's scheduled iter; post-loop resolves `#local` to
+            // a `TensorView<'_>` borrow of that descriptor. Downstream
+            // `emit_subgraph` reads via `(*#local).as_view()` which goes
+            // through `TensorView: Deref<Target = GpuTensor>`.
+            let c_out = class_out_ident(pc, ppos, pslot);
+            let expect_msg = proc_macro2::Literal::string(&format!(
+                "aliased class {pc} pos {ppos} slot {pslot} post-loop read before producer fired"
+            ));
+            body.push(quote! {
+                let #local = unsafe {
+                    #c_out
+                        .as_ref()
+                        .expect(#expect_msg)
+                        .as_view()
+                };
+            });
+        } else if carry_producers.contains(&(pc, ppos, pslot)) {
             let carry = carry_var_ident(pc, ppos, pslot);
             let rhs = if carries_with_init.contains(&(pc, ppos, pslot)) {
                 quote! { #carry }

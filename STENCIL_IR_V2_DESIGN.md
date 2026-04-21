@@ -485,6 +485,26 @@ post_loop, route them to periodic with their natural offset. That
 may also fix the corresponding issue on gemma/qwen if they have
 peeled aliased instances.
 
+**⚠️ Open correctness question for next session — weight indexing
+on short-period classes.** `emit_fragment_call_expr` (fragment path)
+passes `repeat_tokens = (__repeat - offset)` and relies on
+`access_tokens_with_repeat` to produce `stem[(__repeat - offset)]`.
+`emit_aliased_class_inline` (5i.2 path) passes
+`repeat_tokens = __repeat` verbatim. Neither has been exercised at
+runtime on a short-period class (every llama variant still refuses
+pre-emission). For Pattern-B-style short classes where the rep's
+baked `weight_idx == offset` (e.g. offset=1, rep reads `input_ln[1]`,
+member at iter R reads `input_ln[R]`), **`stem[__repeat]` is the
+correct access** (matches the member's natural weight index) and
+`stem[__repeat - offset]` is off by `offset`. Before declaring the
+llama fleet green on `vllm chat`, verify the short-class weight
+access produces the right tensor — first-token log-prob vs the
+unrolled path is the cheapest check. If the fragment path is
+indeed buggy here, the two paths should converge on `stem[__repeat]`
+(or `stem[__repeat + (rep_layer_idx - offset)]` generically) and
+5f's `(__repeat - offset)` convention is the piece to fix, not
+5i.2's.
+
 **Pointers for 5i.2 (all in
 `vllm-rs/crates/ferrite-forward-macro/src/`):**
 - `impl_lib.rs` — `FusedAddRmsNormImpl` (`fn output_alias` at

@@ -396,11 +396,27 @@ None of these are show-stoppers without investigation, but each is worth measuri
 - `.../src/class_impl.rs` — class→Impl consistency check, strict + tolerant resolvers.
 - `.../src/lib.rs` — pipeline wired into the macro drive (search for `stencil ·`). Diagnostic only; does not affect emitted code.
 
-**Test coverage**: 161 unit tests total across the crate (added `boundary_positions_split_from_interior` + `four_layer_interior_collapses`; rewrote four tests whose synthetic linear chains no longer collapse under the stricter hash). All pass. `cargo clippy --all-targets -- -D warnings` clean.
+**Test coverage**: ~200 unit tests total across the crate; 38 in `codegen::tests` (2 ignored diagnostic dumps). All codegen tests pass. `cargo clippy -p ferrite-forward-macro --all-targets -- -D warnings` clean. Pre-existing unrelated failures outside codegen: `solver::tests::add_rmsnorm_pairs_claimed_as_fused_subgraph`, `config::tests::load_real_{llama,qwen2}_configs` — verified unaffected by 5i.5 + 5m changes (reproduce on bare HEAD~).
 
 **Measurement after the hash fix**: distribution of class counts shifted from a tight 8/10 to 12/15/17/18/22 across 218 variants. Collapse factor for llama / mistral drops from ~28× to ~19×; still well-collapsed and every class is now impl-consistent. Pre-fix 23 heterogeneous variants → 2 remaining (both Qwen3; see A.2).
 
-### Quick-start for next session (2026-04-22, morning)
+### Quick-start for next session (cold start, 2026-04-22 evening)
+
+**Orientation — run these first, in order (~5 seconds total):**
+
+```bash
+# 1. Confirm the post-5m baseline: 38 green, 2 ignored diagnostics.
+cargo test -p ferrite-forward-macro --lib codegen::tests
+
+# 2. Skim the top-of-branch commits so the 5i.5 / 5m mental model
+#    matches the code as it stands today.
+git log --oneline -6
+```
+
+Then pick a step from the "Next concrete step" table below (5h,
+5l, or 5k — or runtime verification on the llama fleet now that
+its emission path is clear). Read the ⚡ methodology section next
+— it's load-bearing for whichever step you pick.
 
 ## ⚡ TEST-DRIVEN METHODOLOGY — READ THIS FIRST ⚡
 
@@ -413,7 +429,7 @@ minutes per experiment. That loop has been replaced:
 
 ```bash
 cargo test -p ferrite-forward-macro --lib codegen::tests
-# 38 green, 3 ignored (2 diagnostics + 5i.5+5m acceptance gate), ~0.3s
+# 38 green, 2 ignored (diagnostic dumps), ~0.3s
 ```
 
 **Red→green discipline (the 5i.5 model, commit `428eb491b`):**
@@ -464,11 +480,15 @@ a 218-variant fleet.
    `stencil_bundle` / `provenance_kinds`.
 
 3. **Red tests (the `#[ignore]` kind) are spec, not aspiration.**
-   `emission_red::far_decoder_emits_successfully` must stay
-   ignored until 5i.5 + 5m both land. When you remove the
-   `#[ignore]`, you've shipped. When you can't make the red
-   test pass, the scope was wrong — revise the spec, don't
-   weaken the test.
+   The prior `#[ignore]` on
+   `emission_red::far_decoder_emits_successfully` was the 5i.5 + 5m
+   acceptance gate; both landed, the `#[ignore]` was removed, and
+   the test is now the permanent post-5m regression gate. When you
+   queue a new step (5h / 5l / 5k), add a fresh `#[ignore]`-red
+   test with the step name in the reason string and remove the
+   `#[ignore]` when you ship. When you can't make the red test
+   pass, the scope was wrong — revise the spec, don't weaken the
+   test.
 
 4. **Match every diagnostic with a test.** The
    `chain_vs_cascade` module was born from a diagnostic run
@@ -488,8 +508,12 @@ a 218-variant fleet.
 
 - `fixture::solve_body(src) -> Solved` — the one-line entry point
   that takes a DSL string and returns `(Fuf, Assignment, Program,
-  ModelParams, ImplementationLibrary)`. Three constants: `MINIMAL_BODY`,
-  `FAR_SIMPLE_BODY`, `FAR_DECODER_BODY`.
+  ModelParams, ImplementationLibrary)`. Five constants:
+  `MINIMAL_BODY` (smoke), `FAR_SIMPLE_BODY` (FAR without
+  rope/attn), `FAR_CASCADE_BODY` (llama-shape cascade minus
+  rope/attn — 5i.5's fixture), `ROPE_ONLY_BODY` (QKV + rope +
+  attn, no FAR — 5m's fixture), `FAR_DECODER_BODY` (full llama
+  decoder — the acceptance gate).
 - `ident` — `class_out_ident`, `carry_var_ident`, `last_var_ident`
   format pins. 5i.1's per-export convention.
 - `stencil_bundle` / `minimal` — coarse-grained structure pins
@@ -500,15 +524,20 @@ a 218-variant fleet.
   present; init-ful + init-less carries both exist; producer
   class sanity.
 - `alias_flow` / `chain_vs_cascade` — the cascade analysis. The
-  two tests here are the primary 5i.5 spec: FAR_SIMPLE closes,
-  FAR_DECODER doesn't.
-- `refusal` — refusal message pins (5i.4 cascade, 5m not-owned,
-  upstream sanity).
+  primary 5i.5 spec: FAR_SIMPLE closes, FAR_DECODER doesn't.
+- `refusal` — only a format pin remains
+  (`refusal_message_has_diagnostic_suffix` calls
+  `emit_collapsed_refusal` with a synthetic reason) +
+  `minimal_body_never_trips_cascade`. The pre-5m FAR_DECODER
+  refusal pins were removed when their gates cleared.
 - `aliased_empty` — body with no aliased classes produces no
   cascade.
-- `emission_red` — two green tests (FAR_SIMPLE emits; alias srcs
-  classified correctly) + one ignored red test (FAR_DECODER
-  emits — the 5i.5 acceptance gate).
+- `emission_red` — the emission gates. Post-5m all three are green:
+  `far_simple_emits_successfully`, `rope_only_emits_successfully`
+  (5m narrow acceptance), `far_decoder_emits_successfully` (5i.5 +
+  5m combined acceptance), plus `far_cascade_emission_is_structurally_sound`
+  (5i.5 narrow) and `far_cascade_carry_update_does_not_move_gpu_tensor`.
+  Two `dump_*` diagnostic tests stay `#[ignore]`.
 
 ## What's landed
 
@@ -655,32 +684,46 @@ cargo_check` in memory, and the ⚡ section above). Same discipline
    with the "What N specifically did" paragraph and the
    red→green proof summary.
 
-**Expected terminal state**:
-- `emission_red::far_decoder_emits_successfully` removes its
-  `#[ignore]` and is green — the full llama decoder emits.
-- 36+ codegen tests pass; no regressions.
+**Terminal state after 5m (current)**:
+- `emission_red::{far_decoder_emits_successfully,
+  rope_only_emits_successfully, far_simple_emits_successfully,
+  far_cascade_emission_is_structurally_sound}` all green.
+- 38 codegen tests pass (2 ignored diagnostic dumps); clippy clean.
 - Fleet `cargo check -p ferrite-models --features cuda` with
-  `FERRITE_STENCIL_CODEGEN=1` clean across llama/mistral/phi3/qwen2
-  variants. (Still separate: 5h for gemma/granite, 5l for
-  qwen3/gemma3, 5k for post-loop multi-tile.)
+  `FERRITE_STENCIL_CODEGEN=1` expected clean across
+  llama/mistral/phi3/qwen2 (emission path); **not yet verified
+  end-to-end this session** — next picker-up should run it
+  before any new codegen work.
+- Remaining fleet gates: 5h (gemma2/granite `offsets_consistent=false`),
+  5l (qwen3/gemma3 `uniform_pairs=false`), 5k (post-loop
+  multi-tile, surfaces on various bodies).
 
-**Pointers**:
-- `codegen.rs::class_owned_exports` — the ownership walk. Currently
-  strict about `src=None`; needs a recognizer for the kv_cache
-  alias pattern.
-- `codegen.rs::try_emit_collapsed_bucket` ~line 4517 — where the
-  refusal message lives.
-- `impl_lib.rs::FusedQkvRopeCacheImpl`, `RopeAppendRef`, and the
-  multi-output `_fp8` / `_interleaved` variants — concrete `emit_
-  call` + `output_alias` shape for rope_append. Source of truth
-  for what "kv_cache alias" looks like structurally.
-- `emit.rs::WeightLayout` — probably irrelevant for 5m but handy
-  reference for how emission threads through the macro.
+**Pointers — entry points for whoever picks up next**:
+- `codegen.rs::try_emit_collapsed_bucket` (~line 4119) — the main
+  refusal orchestrator. The 5m side-effect block lives near line
+  4484; the 5i.5 `alias_carry_redirect` above it. Upstream
+  preconditions (`offsets_consistent`, `uniform_pairs`,
+  `homogeneous_periodic`) refuse early — 5h/5l target those.
+- `codegen.rs::tests::fixture` (~line 6217) — where new
+  `<STEP>_ONLY_BODY` fixtures go. `solve_body` wraps the
+  full pipeline.
+- `codegen.rs::tests::emission_red` (~line 7405) — where
+  acceptance-gate tests go. Mirror the 5i.5 / 5m patterns.
+- `schedule.rs` — `offsets_consistent` + `uniform_pairs` +
+  `homogeneous_periodic` live here. 5h/5l work starts by
+  understanding *why* these flags come up false on the respective
+  fleets (run a `dump_` diagnostic against a gemma2 fixture).
+- `impl_lib.rs` — impl matchers, `output_alias`, `emit_call`.
+  Read the rope/attention impls if a step touches the kv_cache
+  alias pattern again.
 
 ## Other open follow-ups
 
-**5k — post-loop multi-tile** (gemma2 / granite): `class N slot 0
-referenced by post-loop from multiple tiles`. Moderate scope.
+**5k — post-loop multi-tile**: refusal text `class N slot 0
+referenced by post-loop from multiple tiles`. Surfaces on bodies
+where a periodic class's single output is read post-loop from
+more than one tile position. Moderate scope; orthogonal to
+5h/5l.
 
 **5l — finer refinement signature** (qwen3 / gemma3):
 `uniform_pairs=false` (1 residual non-uniform pair). 5j's
@@ -713,37 +756,60 @@ All under `vllm-rs/crates/ferrite-forward-macro/src/`:
 
 - `codegen.rs::try_emit_collapsed_bucket` (~line 4119) — the main
   refusal orchestrator. Walks `aliased_classes`, builds
-  `carry_producers` + `alias_through_carries`, runs the 5i.4 cascade
-  guard (~line 4499), emits loop body + post-loop. Start here.
+  `carry_producers` + `alias_through_carries`, runs the 5i.4
+  cascade guard, the 5i.5 `alias_carry_redirect`, and the 5m
+  side-effect-export filter. Emits loop body + post-loop.
+  Start here.
+- `codegen.rs::class_owned_exports` + the 5m side-effect block
+  in `try_emit_collapsed_bucket` — the ownership walk.
+  `output_alias` entries with `src=None` at the last tile are
+  owned; referenced pairs absent from `output_alias` entirely
+  are side-effects (5m); referenced pairs with `src=Some(_)`
+  are aliases (handled via the aliased-class path).
 - `codegen.rs::emit_aliased_class_inline` (~line 5259) — inline
   emission for aliased FAR/AddRef family. LocalMap override,
   prelude for Option-carry unwrap, short-class guarded body.
+- `codegen.rs::emit_fragment_call_expr` — consumer fragment
+  call-site emission. Applies the symmetric 5m side-effect
+  filter to `tile_params_ordered` + `class_inputs.slots`.
 - `codegen.rs::class_input_provenance` (~line 3140) — where
-  `InputOrigin::{IntraIter, LoopCarry, PreLoop}` gets set. 5i.5
-  may want to add a 4th variant or re-tag some carries.
-- `codegen.rs::tests` (~line 6099, end of file) — the 35+1 test
-  module. Every new hypothesis goes here first.
+  `InputOrigin::{IntraIter, LoopCarry, PreLoop}` gets set.
+- `codegen.rs::tests` (~line 6217 for `fixture`; ~line 7405 for
+  `emission_red`) — every new hypothesis goes here first.
+- `schedule.rs` — `offsets_consistent`, `uniform_pairs`,
+  `homogeneous_periodic`. The upstream precondition flags 5h/5l
+  target. Start reading here if you're picking up either.
 - `impl_lib.rs::FusedAddRmsNormImpl` (~line 2647) — canonical
   aliased impl. `output_alias` (both src=Some, aliases to the
   claimed tiles' inputs) and `emit_call` (in-place kernel).
+- `impl_lib.rs::FusedQkvRopeCacheImpl` (~line 3816) — canonical
+  side-effect impl (5m reference). `output_alias` lists only
+  slot 0 (rotated Q); slots 1/2 (K/V) are paged-cache views
+  written through the extern `ctx.kv_cache`.
 - `emit.rs::EmitCtx` / `WeightLayout::access_tokens_with_repeat`
-  — how weight indexing threads through `__repeat`.
+  — how weight indexing threads through `__repeat`. Relevant to
+  the open correctness note on short-period class weight lookup.
 
-## Refusal distribution (post-5i.5, 2026-04-22)
+## Refusal distribution (post-5m, 2026-04-22)
+
+Not re-measured this session. The 5i.5 + 5m pair was expected
+to clear the llama/mistral/phi3/qwen2 fleets (~292 variants);
+the picker-up for 5h/5l/5k should re-run the fleet check
+(`cargo check -p ferrite-models --features cuda` with
+`FERRITE_STENCIL_CODEGEN=1`) and update the table below before
+starting work. Previous (post-5i.5, pre-5m) distribution:
 
 | Arch fleet | Refusal reason | Next-step path |
 |---|---|---|
-| llama / mistral / phi3 / qwen2 / commandr (rest) — **~292** | `class N pos P slot S referenced downstream but not owned (output_alias untracked or aliased) — 5g scope refuses` | **5m (next session's target)** — rope_append K/V kv_cache-alias recognition in `class_owned_exports`. Last gate before `emission_red::far_decoder_emits_successfully` flips green. |
-| gemma2 / granite | `class N slot 0 referenced by post-loop from multiple tiles` | **5k** (post-loop multi-tile export) — moderate |
+| llama / mistral / phi3 / qwen2 / commandr (rest) — **~292** | pre-5m: `class N pos P slot S referenced downstream but not owned — 5g scope refuses` | **5m LANDED** (commit `3c97cce3e`). Expected clean on this slice after re-run; verify. |
+| gemma2 / granite | `class N slot 0 referenced by post-loop from multiple tiles` OR `offsets_consistent=false` | **5k** (post-loop multi-tile) and/or **5h** (richer offset solver). Table above gives the primary gate per fleet; pick based on whichever trips first in the re-run. |
 | qwen3 / gemma3 | `uniform_pairs=false` (1 residual pair each) | **5l** (finer refinement signature) — signature tuning |
 | commandr (3 variants) | ✅ happy path (degenerate empty loop) | — |
 
-Note: 5i.5 cleared the cascade gate for 183 llama-fleet variants.
-Those now refuse at the 5m gate (already dominant on llama);
-combined with the pre-existing 153 variants that refused at 5m,
-the llama fleet's remaining refusal count is driven entirely by 5m.
-Full fleet unlock (full FAR_DECODER emission via `vllm chat`) lands
-when 5m + weight-indexing verification both complete.
+Full fleet unlock (full FAR_DECODER emission via `vllm chat`)
+lands when the weight-indexing correctness note above is
+verified against the unrolled path on a short-period llama
+variant.
 
 **6.2.b.5i.3 — period-1 aliased re-route (landed 2026-04-21).**
 `StencilBundle::schedule` now takes `lib: &ImplementationLibrary`

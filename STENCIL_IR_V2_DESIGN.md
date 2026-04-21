@@ -352,8 +352,8 @@ None of these are show-stoppers without investigation, but each is worth measuri
 ### Quick-start for next session (2026-04-21)
 
 **What's landed**: 6.1, 6.2.a, 6.2.b.1–4, 6.2.b.5a–e (collapsed
-emitter), 6.2.b.5f (p1 period-mismatch offsets). Commits:
-`65b337b21` (5e) and `7b412df08` (5f). `cargo check -p ferrite-models
+emitter), 6.2.b.5f (p1 period-mismatch offsets), 6.2.b.5g (multi-
+output periodic classes). `cargo check -p ferrite-models
 --features cuda` with `FERRITE_STENCIL_CODEGEN=1` is clean across
 all 218 variants; collapsed path fires on 3 commandr variants
 (degenerate empty-loop). Every other variant hits `unimplemented!()`
@@ -361,33 +361,35 @@ with a specific refusal reason.
 
 **Where to start — two independent follow-ups, pick one**:
 
-1. **6.2.b.5g — multi-output periodic classes** (unlocks llama,
-   mistral, phi3, qwen2). Refusal reason today: `class N has
-   multi-output tile` (rope_append producing q/k/v; sometimes
-   gate/up fused). Fix path:
-   - Remove the multi-output check in
-     `try_emit_collapsed_bucket`'s precondition (and loosen
-     `can_fragmentize`).
-   - Teach `emit_fragment_call_expr` to emit a fragment that returns
-     a **tuple** `(OwnedTensor, ..., OwnedTensor)` when the class
-     has a multi-output tile. Call site: `let (__cC_out_0,
-     __cC_out_1, ...) = unsafe { __frag_N(...); };`. Abstract body
-     already binds `__out_0_0`, `__out_0_1`, ... via
-     `ctx.output_ident` — just return the tuple instead of
-     `__out_<last>_0`.
-   - Consumer arg resolution: `IntraIter` with multi-output
-     producer → `(*__cPC_out_<slot>).as_view()`; track the slot in
-     `InputOrigin::IntraIter` (add `producer_slot: u8`). Short
-     multi-output classes use `Option<OwnedTensor>` per slot.
-   - Carry / dedicated-last / post-loop code is slot-aware — most
-     llama residual carries are single-output (slot 0), so only
-     multi-output classes need per-slot handling.
-   - Validation: `FERRITE_STENCIL_CODEGEN=1 cargo expand -p
-     ferrite-model-llama --features cuda` should show `for
-     __repeat in 0usize..40` with `__cC_out_0` / `__cC_out_1` /
-     `__cC_out_2` per rope_append class. Then `vllm chat` on
-     llama-2-7b with `timeout` (per `feedback_no_run_chat`) to
-     sanity-check correctness.
+1. **6.2.b.5i — aliased-output impls in collapsed mode** (the gate
+   now blocking llama / mistral / phi3 / qwen2 / most commandr).
+   Refusal reason today: `class N rep not fragmentizable`. Root
+   cause: `FusedAddRmsNormImpl` (+ `FusedAddRmsNormWithOffsetImpl`,
+   `AddRefImpl`) alias **both** outputs to their upstream tiles
+   (`output_alias` returns entries with `src=Some(…)` — the residual
+   buffer is mutated in-place). `can_fragmentize_collapsed` refuses
+   because lifting a `TensorView<'_>` through a fragment fn needs a
+   lifetime parameter tied to a consumed input. Fix path:
+   - Extend `try_emit_collapsed_bucket` to emit aliased-output
+     classes INLINE inside the loop body instead of interning a
+     fragment. Use `EmitMode::Concrete` with
+     `repeat_var = Some(quote!{__repeat})` so `ctx.layer_expr`
+     resolves through the loop var. Wrap the emitted tokens in the
+     same full/short-class guard structure the fragment path uses.
+   - Loop-local tile idents: today's `build_local_map` allocates
+     globally-unique `t_<id>_<slot>` names for every tile in the
+     FUF. Inline emission inside a loop body wants iter-local
+     idents so the alias chain re-binds each iteration. The rep's
+     tile ids are sufficient (one set of names per class rep);
+     hoist a per-iter map that shadows `build_local_map` for the
+     tiles in the class's rep subgraph. Cross-iter carries still go
+     through `__carry_cC_sS`.
+   - Drops: inline alias chains rely on the Rust borrow rules for
+     cleanup. No explicit drop emission inside the body.
+   - Validation: llama-2-7b should expand to `for __repeat in
+     0usize..32 { … }` with the residual-add-rmsnorm emission
+     inlined. Then `timeout 60 vllm chat` (per
+     `feedback_no_run_chat`) on llama-3.2-1B to sanity-check.
 
 2. **6.2.b.5h — richer offset solver** (unlocks gemma2, gemma3,
    granite, qwen3). Refusal reason today: `offsets_consistent=false`.
@@ -410,9 +412,10 @@ with a specific refusal reason.
      gemma variant (`stencil-deps · ...` line already prints Δ
      histogram per-variant; inspect to understand the shape).
 
-   Neither fix blocks the other. 5g unlocks a bigger fleet (llama
-   family) so it's the obvious priority; 5h is necessary eventually
-   for full arch coverage.
+   Neither fix blocks the other. 5i unlocks the llama fleet which
+   all currently trip on aliased-output impls; 5h is necessary for
+   gemma / granite / qwen3. After 5g the fleets are cleanly split
+   by the refusal reason — pick either.
 
 **Before writing code**: open the failing expand output for the
 target arch (`FERRITE_STENCIL_CODEGEN=1 cargo expand -p
@@ -545,18 +548,79 @@ Split into sub-commits, each dormant-by-default (off unless
 
 **Remaining — next session starts here:**
 
-- ⏳ **6.2.b.5g — multi-output periodic classes.** Today's
-  fragment-intern path refuses any periodic class whose rep has a
-  multi-output tile (rope_append producing q/k/v; and similar).
-  Fragment return is a single `OwnedTensor`; multi-output needs
-  either (a) tuple return + multi-binding call site, or (b) a per-
-  slot `__cC_out_<slot>` hoist and emit-inline-in-loop path that
-  binds each slot as a separate iter-scoped variable. Option (a) is
-  the least invasive: return `(OwnedTensor, ..., OwnedTensor)` from
-  the fragment; at the call site `let (__cC_out_0, __cC_out_1, ...)
-  = unsafe { __frag_N(...); };`. Downstream consumers read the
-  matching slot binding. Short multi-output classes need the same
-  Option-wrapped per-slot hoist.
+- ✅ **6.2.b.5g — multi-output periodic classes landed.** The
+  precondition no longer bails on multi-output tiles. `InputOrigin`
+  already carried `producer_slot`, so the plumbing was adding a
+  second key everywhere the producer class showed up:
+  - `can_fragmentize_collapsed` — same as `can_fragmentize` minus
+    the multi-output bail. The unrolled path keeps the old gate (its
+    single-slot return ident can't express a multi-output tile).
+  - `class_out_ident(c, slot)` / `carry_var_ident(c, slot)` /
+    `last_var_ident(c, slot)` — per-slot idents (`__cC_out_S`,
+    `__carry_cC_sS`, `__last_cC_sS`).
+  - `carry_inits` + `carry_producers` + `post_refs` +
+    `dedicated_last` — all keyed by `(class, slot)` instead of
+    `class`.
+  - `referenced_slots[c]` computed per class by walking provenance
+    (IntraIter / LoopCarry.producer_slot) + post_refs. Must be a
+    subset of `class_owned_slots(c)` (output_alias entries with
+    src=None on the rep's last-claimed tile); violation refuses
+    with a precise `class {c} slot {s} referenced downstream but
+    not owned` message.
+  - Fragment return: `()` for 0 referenced slots, scalar
+    `OwnedTensor` for 1 (byte-identical to 5f for the common case),
+    tuple `(OwnedTensor, …)` for ≥2.
+  - Call site: full-class scalar `let #o0 = …;` / tuple
+    `let (#o0, #o1, …) = …;`; short-class per-slot
+    `Option<OwnedTensor>` hoist + guarded destructure-then-assign.
+
+  **Measured impact (2026-04-21)**: llama / mistral / phi3 / qwen2
+  / commandr (non-happy variants) now refuse at
+  `class N rep not fragmentizable` instead of multi-output. The new
+  gate is `FusedAddRmsNormImpl`-style impls that alias **both**
+  outputs to their upstream tiles (src=Some(_) in `output_alias`);
+  fragment ownership requires src=None and those can't be lifted
+  through a plain fragment fn without lifetime parameters.
+  gemma2/3/granite/qwen3 stay at `offsets_consistent=false`
+  (unchanged; 5h still needed). commandr's 3 happy-path variants
+  continue to emit the degenerate empty `for __repeat in 0..0 {}`
+  body (byte-identical to 5f).
+
+  Single-output classes keep emitting `let #o0 = unsafe { … };` —
+  same shape as 5f, only the ident renamed (`__cC_out` →
+  `__cC_out_0`). Since no non-commandr variant previously hit the
+  happy path, the rename has no pre-existing baseline to break.
+  161 unit tests pass; `cargo check -p ferrite-models --features
+  cuda` with `FERRITE_STENCIL_CODEGEN=1` green across all 218.
+  fmt + clippy clean.
+
+- ⏳ **6.2.b.5i — aliased-output impls in collapsed mode.** The new
+  blocker for llama/mistral/phi3/qwen2/commandr is the
+  FusedAddRmsNorm-family impls whose `output_alias` points back at
+  their upstream tiles (the residual buffer is mutated in-place).
+  `can_fragmentize_collapsed` refuses these because lifting an
+  aliased `TensorView<'_>` through a fragment fn boundary needs a
+  lifetime parameter tied to the aliased input. Three options:
+  - (a) Emit these classes inline inside the loop body (concrete
+    mode, `repeat_var = Some(__repeat)`), bypassing the fragment
+    intern — same mechanism as today's unrolled-path
+    `can_fragmentize=false` fallback, just threaded through the
+    class-loop scope. Single-pass, keeps aliasing correct via Rust
+    borrow rules. Bindings like `t_<id>_<slot>` from
+    `build_local_map` would need loop-local renaming — the
+    current map is globally unique per FUF, but per-iteration the
+    alias chain should reference the loop-local tile ids. Probably
+    the cleanest option.
+  - (b) Give fragment fns lifetime parameters. The fragment returns
+    `TensorView<'a>` tied to a consumed `'a OwnedTensor` input.
+    Ugly, but localised to `emit_fragment_call_expr`.
+  - (c) Rewrite the affected impls (AddInplace, FusedAddRmsNorm,
+    FusedAddRmsNormWithOffset) to return a fresh OwnedTensor. Loses
+    the in-place optimisation; not free.
+
+  Pick (a). The rest of the loop body machinery is already in
+  place; this is an emission-path change, not a precondition
+  lift.
 
 - ⏳ **6.2.b.5h — richer offset solver.** gemma / granite / qwen3
   trip `offsets_consistent=false` under the period-derived rule. BFS

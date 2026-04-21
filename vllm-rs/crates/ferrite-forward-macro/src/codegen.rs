@@ -3087,9 +3087,14 @@ fn can_fragmentize(
     {
         return false;
     }
-    // Multi-output tiles (e.g. rope_append producing q/k/v) need a
-    // tuple return + multi-binding call site; handle later. For now
-    // leave them inline.
+    // Multi-output tiles (rope_append producing q/k/v; FusedQkvRope*
+    // family) stay inline on the unrolled path — its single
+    // `__out_<pos>_<slot>` return ident only carries slot 0, and
+    // downstream consumers of slots >0 would have no local binding.
+    // The collapsed emitter handles multi-output via its own
+    // fragment builder (`emit_fragment_call_expr`) with per-slot
+    // idents + tuple return, so it calls `can_fragmentize_collapsed`
+    // below instead of this function.
     for &t in claimed {
         if fuf.get(t).outputs.len() > 1 {
             return false;
@@ -3104,6 +3109,25 @@ fn can_fragmentize(
     // Consumed boundary inputs are lifted to fragment fn params
     // typed `OwnedTensor` (by value) vs `TensorView<'_>` (by view)
     // — see `emit_subgraph`.
+    !claimed.is_empty()
+}
+
+/// Collapsed-mode fragmentization gate. Same as [`can_fragmentize`]
+/// without the multi-output bail — the collapsed path's
+/// `emit_fragment_call_expr` returns a tuple over referenced output
+/// slots and the call site destructures per-slot.
+fn can_fragmentize_collapsed(
+    imp: &dyn crate::impl_lib::Implementation,
+    claimed: &[TileId],
+    fuf: &Fuf,
+) -> bool {
+    if !imp
+        .output_alias(claimed, fuf)
+        .iter()
+        .all(|(_, src)| src.is_none())
+    {
+        return false;
+    }
     !claimed.is_empty()
 }
 
@@ -3651,16 +3675,51 @@ fn emit_collapsed_refusal(
     }
 }
 
-fn carry_var_ident(producer_class: usize) -> syn::Ident {
-    format_ident!("__carry_c{}", producer_class)
+fn carry_var_ident(producer_class: usize, slot: u8) -> syn::Ident {
+    format_ident!("__carry_c{}_s{}", producer_class, slot)
 }
 
-fn last_var_ident(class: usize) -> syn::Ident {
-    format_ident!("__last_c{}", class)
+fn last_var_ident(class: usize, slot: u8) -> syn::Ident {
+    format_ident!("__last_c{}_s{}", class, slot)
 }
 
-fn class_out_ident(class: usize) -> syn::Ident {
-    format_ident!("__c{}_out", class)
+fn class_out_ident(class: usize, slot: u8) -> syn::Ident {
+    format_ident!("__c{}_out_{}", class, slot)
+}
+
+/// Output slots of class `c`'s rep's last-claimed tile that the impl
+/// marks as an OwnedTensor (i.e. `output_alias` entry with `src=None`).
+/// Untracked slots (e.g. FusedQkvRopeCacheImpl's K/V paged-cache views)
+/// are absent from `output_alias` and excluded here — they can't be
+/// returned through the fragment fn boundary without lifetime plumbing.
+fn class_owned_slots(
+    stencil: &StencilBundle,
+    sfuf: &Assignment,
+    fuf: &Fuf,
+    lib: &ImplementationLibrary,
+    c: usize,
+) -> BTreeSet<u8> {
+    let Some(&rep) = stencil.class_members[c].first() else {
+        return BTreeSet::new();
+    };
+    let Some(imp_id) = stencil.class_impl_id[c] else {
+        return BTreeSet::new();
+    };
+    let imp = lib.get(imp_id);
+    let claimed = sfuf.tiles_in_subgraph(rep);
+    let Some(&last_tile) = claimed.last() else {
+        return BTreeSet::new();
+    };
+    imp.output_alias(&claimed, fuf)
+        .into_iter()
+        .filter_map(|((t, s), src)| {
+            if t == last_tile && src.is_none() {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Core collapsed-emit body. Returns `Err(reason)` when the variant
@@ -3696,8 +3755,12 @@ fn try_emit_collapsed_bucket(
         return Err("provenance=None (boundary inputs cross partitions unexpectedly)".into());
     };
 
-    // Every periodic class's rep must be fragmentizable, have no
-    // consumed input tiles, no multi-output tiles (5e scope).
+    // Every periodic class's rep must be fragmentizable + have no
+    // consumed input tiles. Multi-output tiles (rope_append producing
+    // q/k/v; fused QKV-rope family) are OK: the fragment returns a
+    // tuple over the slots actually referenced by downstream consumers,
+    // per-slot idents let call sites bind each. See `referenced_slots`
+    // + `owned_slots` computation below.
     for &c in &sched.periodic {
         let rep = *stencil
             .class_members
@@ -3715,12 +3778,7 @@ fn try_emit_collapsed_bucket(
         if !imp.consumes_input_tiles(&claimed, fuf).is_empty() {
             return Err(format!("class {c} rep impl consumes input tiles"));
         }
-        for &t in &claimed {
-            if fuf.get(t).outputs.len() > 1 {
-                return Err(format!("class {c} has multi-output tile (slot>0)"));
-            }
-        }
-        if !can_fragmentize(imp, &claimed, fuf) {
+        if !can_fragmentize_collapsed(imp, &claimed, fuf) {
             return Err(format!("class {c} rep not fragmentizable"));
         }
     }
@@ -3733,19 +3791,23 @@ fn try_emit_collapsed_bucket(
         }
     }
 
-    // ── identify loop-carry producer classes ─────────────────────
+    // ── identify loop-carry producer (class, slot) pairs ─────────
     //
-    // Per producer_class P, the init source is the UNION of what
-    // consumers declare: any consumer with `Some(sg)` pins the init
-    // to that sg (residual-stream shape — consumer at offset 0 reads
-    // pre-loop at iter 0); consumers with `None` are shifted-carry
-    // (consumer at offset > 0 reads prev __repeat's value which has
-    // already been written inside the loop). When all consumers are
-    // `None`, the init is `None` and the emitter hoists an
-    // `Option<OwnedTensor>` carry var. When mixed, the `Some` wins
-    // — shifted consumers don't read the init (they start late), so
-    // the pre-loop sg is the only source that materializes.
-    let mut carry_inits: BTreeMap<usize, Option<SubgraphId>> = BTreeMap::new();
+    // Per (producer_class P, producer_slot S), the init source is the
+    // UNION of what consumers declare: any consumer with `Some(sg)`
+    // pins the init to that sg (residual-stream shape — consumer at
+    // offset 0 reads pre-loop at iter 0); consumers with `None` are
+    // shifted-carry (consumer at offset > 0 reads prev __repeat's
+    // value which has already been written inside the loop). When all
+    // consumers are `None`, the init is `None` and the emitter hoists
+    // an `Option<OwnedTensor>` carry var. When mixed, the `Some` wins
+    // — shifted consumers don't read the init.
+    //
+    // Key by (class, slot) so multi-output producers can carry
+    // different slots independently. Today's residual stream is slot 0
+    // on a single-output class; future multi-output carries stay
+    // disentangled.
+    let mut carry_inits: BTreeMap<(usize, u8), Option<SubgraphId>> = BTreeMap::new();
     for ci in provenance {
         for s in &ci.slots {
             if let InputOrigin::LoopCarry {
@@ -3753,11 +3815,13 @@ fn try_emit_collapsed_bucket(
                 pre_loop_init_sg,
             } = s.origin
             {
-                let entry = carry_inits.entry(producer_class).or_insert(None);
+                let key = (producer_class, s.producer_slot);
+                let entry = carry_inits.entry(key).or_insert(None);
                 match (&*entry, pre_loop_init_sg) {
                     (Some(a), Some(b)) if *a != b => {
                         return Err(format!(
-                            "carry producer class {producer_class} has conflicting pre-loop inits"
+                            "carry producer class {producer_class} slot {} has conflicting pre-loop inits",
+                            s.producer_slot,
                         ));
                     }
                     (None, Some(_)) => *entry = pre_loop_init_sg,
@@ -3766,14 +3830,16 @@ fn try_emit_collapsed_bucket(
             }
         }
     }
-    let carry_producers: BTreeSet<usize> = carry_inits.keys().copied().collect();
+    let carry_producers: BTreeSet<(usize, u8)> = carry_inits.keys().copied().collect();
 
     // ── find post-loop consumers of periodic classes ─────────────
-    // For each periodic producer class P referenced by a post-loop
-    // subgraph's boundary input, record the (tile, slot) that the
-    // post-loop side refers to. One tile-id per class (refuse > 1).
+    // For each (periodic producer class P, slot S) referenced by a
+    // post-loop subgraph's boundary input, record the producing
+    // (tile, slot) that the post-loop side refers to. One tile-id per
+    // (class, slot) (refuse > 1 — positional uniqueness across the
+    // class's iterations is an invariant).
     let periodic_set: BTreeSet<usize> = sched.periodic.iter().copied().collect();
-    let mut post_refs: BTreeMap<usize, (TileId, u8)> = BTreeMap::new();
+    let mut post_refs: BTreeMap<(usize, u8), (TileId, u8)> = BTreeMap::new();
     for &c in &sched.post_loop {
         let sg = stencil.class_members[c][0];
         let claimed = sfuf.tiles_in_subgraph(sg);
@@ -3793,21 +3859,22 @@ fn try_emit_collapsed_bucket(
                     if !periodic_set.contains(&pc) {
                         continue;
                     }
-                    if let Some(prev) = post_refs.get(&pc) {
+                    let key = (pc, *slot);
+                    if let Some(prev) = post_refs.get(&key) {
                         if *prev != (*id, *slot) {
                             return Err(format!(
-                                "periodic class {pc} referenced by post-loop from multiple tiles"
+                                "periodic class {pc} slot {slot} referenced by post-loop from multiple tiles"
                             ));
                         }
                     } else {
-                        post_refs.insert(pc, (*id, *slot));
+                        post_refs.insert(key, (*id, *slot));
                     }
                 }
             }
         }
     }
-    let post_loop_exports: BTreeSet<usize> = post_refs.keys().copied().collect();
-    let dedicated_last: BTreeSet<usize> = post_loop_exports
+    let post_loop_exports: BTreeSet<(usize, u8)> = post_refs.keys().copied().collect();
+    let dedicated_last: BTreeSet<(usize, u8)> = post_loop_exports
         .difference(&carry_producers)
         .copied()
         .collect();
@@ -3828,6 +3895,55 @@ fn try_emit_collapsed_bucket(
             "final tile lives in periodic class {last_class} — needs post-loop path"
         ));
     }
+
+    // ── per-class output-slot inventory ──────────────────────────
+    //
+    // For each periodic class, compute:
+    //   - `referenced_slots[c]` = slots of class c's rep (last-claimed
+    //     tile) read by any downstream consumer: periodic IntraIter /
+    //     LoopCarry, or post-loop. These are what the fragment must
+    //     return.
+    //   - `owned_slots[c]` = slots whose impl tracks them as OwnedTensor
+    //     (src=None in `output_alias`). Untracked slots (e.g.
+    //     FusedQkvRope*'s K/V paged-cache views) can't be returned
+    //     through the fragment fn boundary, so a referenced slot that
+    //     isn't owned is a refusal.
+    let n_classes = stencil.class_members.len();
+    let mut referenced_slots: Vec<BTreeSet<u8>> = vec![BTreeSet::new(); n_classes];
+    for ci in provenance {
+        for s in &ci.slots {
+            match &s.origin {
+                InputOrigin::IntraIter { producer_class }
+                | InputOrigin::LoopCarry { producer_class, .. } => {
+                    referenced_slots[*producer_class].insert(s.producer_slot);
+                }
+                InputOrigin::PreLoop { .. } => {}
+            }
+        }
+    }
+    for &(pc, slot) in post_refs.keys() {
+        referenced_slots[pc].insert(slot);
+    }
+
+    for &c in &sched.periodic {
+        let owned = class_owned_slots(stencil, sfuf, fuf, lib, c);
+        for &s in &referenced_slots[c] {
+            if !owned.contains(&s) {
+                return Err(format!(
+                    "class {c} slot {s} referenced downstream but not owned (output_alias untracked or aliased) — 5g scope refuses"
+                ));
+            }
+        }
+    }
+
+    // Per-class ordered returned slot list (sorted), used to pick
+    // tuple-vs-scalar fragment return and to name the per-slot call-
+    // site bindings. Classes with no referenced slots still need a
+    // fragment call for side-effects (e.g. cache writes); emit them
+    // with unit return.
+    let class_returned_slots: Vec<Vec<u8>> = (0..n_classes)
+        .map(|c| referenced_slots[c].iter().copied().collect())
+        .collect();
 
     // ── emission ────────────────────────────────────────────────
     let locals = build_local_map(fuf);
@@ -3860,13 +3976,19 @@ fn try_emit_collapsed_bucket(
     // A carry without init (shifted-carry — all consumers are short
     // and start after the producer) is `Option<OwnedTensor>` init
     // `None`; the producer populates it before any consumer reads.
-    let carries_with_init: BTreeSet<usize> = carry_inits
+    //
+    // Keyed per (class, slot) so multi-output producers can carry a
+    // subset of their slots without forcing the others into the carry
+    // set. The init sg's output slot for slot-keyed carries matches
+    // the producer class's slot (the pre-loop init tile uses its slot
+    // 0 today; multi-output inits with slot > 0 are a future concern).
+    let carries_with_init: BTreeSet<(usize, u8)> = carry_inits
         .iter()
-        .filter_map(|(&pc, init)| init.is_some().then_some(pc))
+        .filter_map(|(&k, init)| init.is_some().then_some(k))
         .collect();
-    for &pc in &carry_producers {
-        let carry = carry_var_ident(pc);
-        match carry_inits[&pc] {
+    for &(pc, slot) in &carry_producers {
+        let carry = carry_var_ident(pc, slot);
+        match carry_inits[&(pc, slot)] {
             Some(init_sg) => {
                 let init_tiles = sfuf.tiles_in_subgraph(init_sg);
                 let init_tile = *init_tiles
@@ -3891,8 +4013,8 @@ fn try_emit_collapsed_bucket(
     }
 
     // Dedicated-last hoists: Option<OwnedTensor>, filled each iter.
-    for &c in &dedicated_last {
-        let last = last_var_ident(c);
+    for &(c, slot) in &dedicated_last {
+        let last = last_var_ident(c, slot);
         body.push(quote! {
             let mut #last: ::std::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> = None;
         });
@@ -3921,12 +4043,16 @@ fn try_emit_collapsed_bucket(
     // Short-class Option hoists live OUTSIDE the loop so consumers in
     // later iters still see the Some assigned in earlier iters (for
     // carry-target moves + post-loop reads). Re-assigned on each
-    // guarded firing; `.take()` at carry/last update sites.
+    // guarded firing; `.take()` at carry/last update sites. One hoist
+    // per (class, referenced_slot) — multi-output short classes get
+    // one Option per slot.
     for &c in &short_classes {
-        let out = class_out_ident(c);
-        body.push(quote! {
-            let mut #out: ::std::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> = None;
-        });
+        for &s in &class_returned_slots[c] {
+            let out = class_out_ident(c, s);
+            body.push(quote! {
+                let mut #out: ::std::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> = None;
+            });
+        }
     }
 
     let mut loop_body: Vec<TokenStream> = Vec::new();
@@ -3938,10 +4064,12 @@ fn try_emit_collapsed_bucket(
         let offset = sched.class_offsets[c];
         let period = stencil.class_members[c].len();
         let is_short = short_classes.contains(&c);
+        let returned = &class_returned_slots[c];
         let fragment_expr = emit_fragment_call_expr(
             c,
             ci,
             offset,
+            returned,
             stencil,
             fuf,
             sfuf,
@@ -3954,18 +4082,65 @@ fn try_emit_collapsed_bucket(
             &short_classes,
             &carry_producers,
             &carries_with_init,
+            &class_returned_slots,
         )?;
-        let out = class_out_ident(c);
-        let call = if is_short {
-            let offset_lit = proc_macro2::Literal::usize_unsuffixed(offset);
-            let period_lit = proc_macro2::Literal::usize_unsuffixed(period);
-            quote! {
-                if __repeat >= #offset_lit && __repeat < #offset_lit + #period_lit {
-                    #out = ::std::option::Option::Some(#fragment_expr);
+        let call = match (is_short, returned.len()) {
+            // Full class, zero referenced slots: fragment returns `()`.
+            // Emit as a plain statement.
+            (false, 0) => quote! { #fragment_expr; },
+            // Full class, single referenced slot: `let __cC_out_S = <expr>;`.
+            (false, 1) => {
+                let out = class_out_ident(c, returned[0]);
+                quote! { let #out = #fragment_expr; }
+            }
+            // Full class, multiple referenced slots: tuple destructure.
+            (false, _) => {
+                let outs: Vec<syn::Ident> =
+                    returned.iter().map(|&s| class_out_ident(c, s)).collect();
+                quote! { let ( #( #outs ),* ) = #fragment_expr; }
+            }
+            // Short class, zero referenced slots: guarded statement.
+            (true, 0) => {
+                let offset_lit = proc_macro2::Literal::usize_unsuffixed(offset);
+                let period_lit = proc_macro2::Literal::usize_unsuffixed(period);
+                quote! {
+                    if __repeat >= #offset_lit && __repeat < #offset_lit + #period_lit {
+                        #fragment_expr;
+                    }
                 }
             }
-        } else {
-            quote! { let #out = #fragment_expr; }
+            // Short class, single slot: assign the one Option inside
+            // the guard.
+            (true, 1) => {
+                let out = class_out_ident(c, returned[0]);
+                let offset_lit = proc_macro2::Literal::usize_unsuffixed(offset);
+                let period_lit = proc_macro2::Literal::usize_unsuffixed(period);
+                quote! {
+                    if __repeat >= #offset_lit && __repeat < #offset_lit + #period_lit {
+                        #out = ::std::option::Option::Some(#fragment_expr);
+                    }
+                }
+            }
+            // Short class, multiple slots: destructure to temp locals
+            // then assign each Option slot.
+            (true, _) => {
+                let tmps: Vec<syn::Ident> = (0..returned.len())
+                    .map(|i| format_ident!("__tmp_{}_{}", c, i))
+                    .collect();
+                let outs: Vec<syn::Ident> =
+                    returned.iter().map(|&s| class_out_ident(c, s)).collect();
+                let assigns = tmps.iter().zip(outs.iter()).map(|(t, o)| {
+                    quote! { #o = ::std::option::Option::Some(#t); }
+                });
+                let offset_lit = proc_macro2::Literal::usize_unsuffixed(offset);
+                let period_lit = proc_macro2::Literal::usize_unsuffixed(period);
+                quote! {
+                    if __repeat >= #offset_lit && __repeat < #offset_lit + #period_lit {
+                        let ( #( #tmps ),* ) = #fragment_expr;
+                        #( #assigns )*
+                    }
+                }
+            }
         };
         loop_body.push(call);
     }
@@ -3976,10 +4151,13 @@ fn try_emit_collapsed_bucket(
     // producers keep the update limited to iters where the producer
     // ran, while init-less carries wrap the assigned value in `Some`
     // so their `Option<OwnedTensor>` type stays consistent.
-    for &pc in &carry_producers {
-        let carry = carry_var_ident(pc);
-        let c_out = class_out_ident(pc);
-        let has_init = carries_with_init.contains(&pc);
+    //
+    // Keyed per (producer_class, producer_slot) — each carried slot
+    // reads its own `__cC_out_S` binding.
+    for &(pc, slot) in &carry_producers {
+        let carry = carry_var_ident(pc, slot);
+        let c_out = class_out_ident(pc, slot);
+        let has_init = carries_with_init.contains(&(pc, slot));
         let short = short_classes.contains(&pc);
         let rhs = match (short, has_init) {
             (false, true) => quote! { #c_out },
@@ -4002,9 +4180,9 @@ fn try_emit_collapsed_bucket(
             loop_body.push(update);
         }
     }
-    for &c in &dedicated_last {
-        let last = last_var_ident(c);
-        let c_out = class_out_ident(c);
+    for &(c, slot) in &dedicated_last {
+        let last = last_var_ident(c, slot);
+        let c_out = class_out_ident(c, slot);
         if short_classes.contains(&c) {
             let offset = sched.class_offsets[c];
             let period = stencil.class_members[c].len();
@@ -4029,17 +4207,18 @@ fn try_emit_collapsed_bucket(
         }
     });
 
-    // Post-loop: bind each referenced periodic class's final-iter
-    // value to the local ident the post-loop sg expects. Moves out
-    // of __carry_P (single-use) or .take() from __last_C.
-    for (&pc, &(tile, slot)) in &post_refs {
+    // Post-loop: bind each referenced periodic (class, slot)'s
+    // final-iter value to the local ident the post-loop sg expects.
+    // Moves out of __carry_cC_sS (single-use) or .take() from
+    // __last_cC_sS.
+    for (&(pc, pslot), &(tile, slot)) in &post_refs {
         let local = locals
             .get(&(tile, slot))
             .cloned()
             .ok_or_else(|| format!("post_ref tile {tile:?} slot {slot} missing local"))?;
-        if carry_producers.contains(&pc) {
-            let carry = carry_var_ident(pc);
-            let rhs = if carries_with_init.contains(&pc) {
+        if carry_producers.contains(&(pc, pslot)) {
+            let carry = carry_var_ident(pc, pslot);
+            let rhs = if carries_with_init.contains(&(pc, pslot)) {
                 quote! { #carry }
             } else {
                 quote! { #carry.take().expect("init-less carry final") }
@@ -4048,7 +4227,7 @@ fn try_emit_collapsed_bucket(
                 let #local: ::ferrite_cuda_core::alloc::OwnedTensor = #rhs;
             });
         } else {
-            let last = last_var_ident(pc);
+            let last = last_var_ident(pc, pslot);
             body.push(quote! {
                 let #local: ::ferrite_cuda_core::alloc::OwnedTensor =
                     #last.take().expect("periodic class last output");
@@ -4123,6 +4302,7 @@ fn emit_fragment_call_expr(
     consumer_class: usize,
     class_inputs: &ClassInputs,
     consumer_offset: usize,
+    returned_slots: &[u8],
     stencil: &StencilBundle,
     fuf: &Fuf,
     sfuf: &Assignment,
@@ -4133,8 +4313,9 @@ fn emit_fragment_call_expr(
     library: &mut FragmentLibrary,
     weight_layout: &crate::emit::WeightLayout,
     short_classes: &BTreeSet<usize>,
-    carry_producers: &BTreeSet<usize>,
-    carries_with_init: &BTreeSet<usize>,
+    carry_producers: &BTreeSet<(usize, u8)>,
+    carries_with_init: &BTreeSet<(usize, u8)>,
+    class_returned_slots: &[Vec<u8>],
 ) -> Result<TokenStream, String> {
     let rep_sg = class_inputs.rep_sg;
     let imp_id = stencil.class_impl_id[consumer_class]
@@ -4211,20 +4392,39 @@ fn emit_fragment_call_expr(
     let abstract_body = imp.emit_call(&abstract_ctx);
 
     let out_claimed_pos = claimed.len() - 1;
-    let out_slot: u8 = 0;
-    let return_ident = format_ident!("__out_{}_{}", out_claimed_pos, out_slot);
 
-    // Sig includes `collapsed` tag + extra repeat param so collapsed
-    // fragments never collide with the unrolled path's interned fns.
+    // Return shape follows `returned_slots`:
+    //   - 0 slots: `()` — fragment is called for side effects only
+    //     (e.g. multi-output producer with all slots unreferenced).
+    //   - 1 slot : single `OwnedTensor` (same signature as 5f).
+    //   - ≥2 slots: tuple of `OwnedTensor` in slot-ascending order.
+    // The abstract body already binds `__out_<pos>_<slot>` for every
+    // output of every claimed tile via `ctx.output_ident`, so the
+    // fragment body just references the chosen slots' idents.
+    let return_idents: Vec<syn::Ident> = returned_slots
+        .iter()
+        .map(|&s| format_ident!("__out_{}_{}", out_claimed_pos, s))
+        .collect();
+
+    // Sig includes `collapsed` tag + extra repeat param + returned
+    // slot set so collapsed fragments never collide with the unrolled
+    // path's interned fns or across classes with different return
+    // shapes even if their abstract bodies stringify the same.
     let weight_types_str: String = accessors
         .iter()
         .map(|a| a.rust_type.to_string())
         .collect::<Vec<_>>()
         .join("|");
+    let returned_str: String = returned_slots
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let sig = format!(
-        "collapsed|ti={}|ci=0|wt={}|body={}",
+        "collapsed|ti={}|ci=0|wt={}|ret={}|body={}",
         tile_params_ordered.len(),
         weight_types_str,
+        returned_str,
         abstract_body,
     );
 
@@ -4247,6 +4447,21 @@ fn emit_fragment_call_expr(
             })
             .collect();
 
+        let (return_ty, return_tail) = match return_idents.as_slice() {
+            [] => (quote! { () }, quote! { () }),
+            [one] => (
+                quote! { ::ferrite_cuda_core::alloc::OwnedTensor },
+                quote! { #one },
+            ),
+            many => {
+                let tys: Vec<TokenStream> = many
+                    .iter()
+                    .map(|_| quote! { ::ferrite_cuda_core::alloc::OwnedTensor })
+                    .collect();
+                (quote! { ( #( #tys ),* ) }, quote! { ( #( #many ),* ) })
+            }
+        };
+
         let fn_tokens = quote! {
             #[cfg(feature = "cuda")]
             #[allow(clippy::too_many_arguments, unused_mut, unused_variables, non_snake_case)]
@@ -4257,9 +4472,9 @@ fn emit_fragment_call_expr(
                 wm: &Weights,
                 ctx: &::ferrite_forward::ForwardCtx,
                 device: &mut ::ferrite_cuda_core::device::GpuDevice,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            ) -> #return_ty {
                 #abstract_body
-                #return_ident
+                #return_tail
             }
         };
         library.by_sig.insert(sig, idx);
@@ -4284,7 +4499,15 @@ fn emit_fragment_call_expr(
         }
         let arg = match &slot.origin {
             InputOrigin::IntraIter { producer_class } => {
-                let c_out = class_out_ident(*producer_class);
+                // Verify the producer class actually returns this
+                // slot (collected into class_returned_slots).
+                if !class_returned_slots[*producer_class].contains(&slot.producer_slot) {
+                    return Err(format!(
+                        "class {consumer_class}: IntraIter producer class {producer_class} does not return slot {}",
+                        slot.producer_slot,
+                    ));
+                }
+                let c_out = class_out_ident(*producer_class, slot.producer_slot);
                 if short_classes.contains(producer_class) {
                     quote! { (*#c_out.as_ref().expect("short-class producer")).as_view() }
                 } else {
@@ -4292,13 +4515,15 @@ fn emit_fragment_call_expr(
                 }
             }
             InputOrigin::LoopCarry { producer_class, .. } => {
-                if !carry_producers.contains(producer_class) {
+                let key = (*producer_class, slot.producer_slot);
+                if !carry_producers.contains(&key) {
                     return Err(format!(
-                        "class {consumer_class}: carry refers to class {producer_class} missing from carry set"
+                        "class {consumer_class}: carry refers to class {producer_class} slot {} missing from carry set",
+                        slot.producer_slot,
                     ));
                 }
-                let carry = carry_var_ident(*producer_class);
-                if carries_with_init.contains(producer_class) {
+                let carry = carry_var_ident(*producer_class, slot.producer_slot);
+                if carries_with_init.contains(&key) {
                     quote! { (*#carry).as_view() }
                 } else {
                     quote! { (*#carry.as_ref().expect("init-less carry read")).as_view() }

@@ -2840,7 +2840,15 @@ impl StencilBundle {
     ///    member in topo order is `pre_loop`; after, `post_loop`.
     /// 4. Collect Δrepeat ≥ 1 edges as `carried`.
     /// 5. Flag period uniformity + pair uniformity + homogeneity.
-    fn schedule(&self, fuf: &Fuf, sfuf: &Assignment) -> ClassSchedule {
+    /// 6. Re-route aliased-emittable period-1 classes into `periodic`
+    ///    with a natural offset derived from their class_edges
+    ///    (STENCIL_IR_V2_DESIGN.md §13 "alternative viable
+    ///    follow-up"). The peel 5j performs on llama-fleet produces
+    ///    period-1 FusedAddRmsNorm instances whose deps otherwise
+    ///    trip `try_emit_collapsed_bucket`'s forbidden-partition
+    ///    gate; `emit_aliased_class_inline` already handles
+    ///    short-aliased (period=1, offset=fixed) emission.
+    fn schedule(&self, fuf: &Fuf, sfuf: &Assignment, lib: &ImplementationLibrary) -> ClassSchedule {
         let n = self.class_members.len();
         let edges = self.class_edges(fuf, sfuf);
 
@@ -2946,11 +2954,118 @@ impl StencilBundle {
         // classes late in the global __repeat window so their final
         // iter aligns with max_period's final iter (matches llama's
         // Δ=-1 boundary-class shape).
-        let periodic_set: BTreeSet<usize> = periodic.iter().copied().collect();
+        let mut periodic_set: BTreeSet<usize> = periodic.iter().copied().collect();
         let mut class_offsets: Vec<usize> = vec![0; n];
         for &c in &periodic {
             class_offsets[c] = max_period.saturating_sub(periods[c]);
         }
+
+        // Re-route aliased-emittable period-1 classes from pre/post_loop
+        // into `periodic` with a natural offset derived from edges
+        // (STENCIL_IR_V2_DESIGN.md §13). `emit_aliased_class_inline`
+        // handles short-aliased (period=1, offset=fixed) emission via
+        // `if __repeat >= offset && __repeat < offset+1` guards. This
+        // lifts the llama-fleet refusal where 5j peels a
+        // FusedAddRmsNorm instance into a period-1 class whose dep
+        // crosses into `periodic` (the forbidden-partition case).
+        //
+        // Offset derivation: for each class_edges entry between C'
+        // (period-1) and P (periodic), solve `offset(C') = offset(P) +
+        // iter_of_P_member_on_that_edge` under intra-iter semantics.
+        // C' has a single member at iter 0, so Δ = consumer_iter -
+        // producer_iter collapses to ± the periodic-side iter index.
+        // If multiple edges agree on one offset in [0, max_period),
+        // accept and move C' into `periodic`. Inconsistent or absent
+        // → leave C' in its current partition (today's behaviour).
+        if max_period > 0 {
+            let mut rerouted: BTreeSet<usize> = BTreeSet::new();
+            for &c in pre_loop.iter().chain(post_loop.iter()) {
+                if periods[c] != 1 {
+                    continue;
+                }
+                let Some(imp_id) = self.class_impl_id[c] else {
+                    continue;
+                };
+                let Some(&rep_sg) = self.class_members[c].first() else {
+                    continue;
+                };
+                let imp = lib.get(imp_id);
+                let claimed = sfuf.tiles_in_subgraph(rep_sg);
+                if !is_aliased_emittable(imp, &claimed, fuf) {
+                    continue;
+                }
+                // Collect offset candidates from class_edges. For each
+                // edge between C' (period-1) and a periodic neighbour
+                // N at N-iter i, N's member fires at
+                // __repeat = offset(N) + i:
+                // - C' as PRODUCER: C' must have fired by that
+                //   __repeat (intra-iter or carry). Tightest: fire at
+                //   __repeat = min over producer-side edges — later
+                //   consumer iters carry forward.
+                // - C' as CONSUMER: C' reads the neighbour's output at
+                //   that __repeat. Tightest: fire at
+                //   __repeat = max over consumer-side edges — earlier
+                //   producer iters must have already fired (they have).
+                // A mixed-direction class takes max(max_consumer, min_producer);
+                // if max_consumer > min_producer, infeasible.
+                let mut min_producer_edge: Option<usize> = None;
+                let mut max_consumer_edge: Option<usize> = None;
+                let mut infeasible = false;
+                for e in &edges {
+                    let (other_class, other_iter, cp_is_consumer) = if e.consumer_class == c
+                        && periodic_set.contains(&e.producer_class)
+                    {
+                        (e.producer_class, e.producer_iter, true)
+                    } else if e.producer_class == c && periodic_set.contains(&e.consumer_class) {
+                        (e.consumer_class, e.consumer_iter, false)
+                    } else {
+                        continue;
+                    };
+                    let off_other = class_offsets[other_class];
+                    let off_candidate = off_other + other_iter;
+                    if off_candidate >= max_period {
+                        infeasible = true;
+                        break;
+                    }
+                    if cp_is_consumer {
+                        max_consumer_edge =
+                            Some(max_consumer_edge.map_or(off_candidate, |m| m.max(off_candidate)));
+                    } else {
+                        min_producer_edge =
+                            Some(min_producer_edge.map_or(off_candidate, |m| m.min(off_candidate)));
+                    }
+                }
+                if infeasible {
+                    continue;
+                }
+                let offset = match (max_consumer_edge, min_producer_edge) {
+                    (None, None) => continue,
+                    (Some(cmax), None) => cmax,
+                    (None, Some(pmin)) => pmin,
+                    (Some(cmax), Some(pmin)) => {
+                        if cmax > pmin {
+                            continue;
+                        }
+                        cmax.max(pmin)
+                    }
+                };
+                class_offsets[c] = offset;
+                rerouted.insert(c);
+            }
+            if !rerouted.is_empty() {
+                pre_loop.retain(|c| !rerouted.contains(c));
+                post_loop.retain(|c| !rerouted.contains(c));
+                for &c in &rerouted {
+                    periodic.push(c);
+                    periodic_set.insert(c);
+                }
+                // Re-sort `periodic` by offset then class-index to
+                // keep emission order deterministic and roughly
+                // topological in the __repeat axis.
+                periodic.sort_by_key(|&c| (class_offsets[c], c));
+            }
+        }
+        let periodic_set = periodic_set;
 
         // Validate: each edge between two periodic classes is
         // explainable as intra-iter (offset_diff = -Δ) or carry-1
@@ -3874,7 +3989,7 @@ fn emit_forward_collapsed_bucket(
     weight_layout: &crate::emit::WeightLayout,
 ) -> TokenStream {
     let stencil = StencilBundle::compute(fuf, sfuf);
-    let sched = stencil.schedule(fuf, sfuf);
+    let sched = stencil.schedule(fuf, sfuf, lib);
     let provenance = stencil.class_input_provenance(&sched, fuf, sfuf);
 
     match try_emit_collapsed_bucket(

@@ -528,14 +528,58 @@ pre-existing failures (`config::tests::load_real_llama_configs`,
 grew past the hard-coded expected counts. Unrelated to codegen; skip
 or update those asserts separately.
 
-**Current refusal distribution (post-5i.2, 2026-04-21):**
+**Current refusal distribution (post-5i.3, 2026-04-21):**
 
 | Arch fleet | Refusal reason | Next-step path |
 |---|---|---|
-| llama / mistral / phi3 / qwen2 / commandr (rest) | `pre/post_loop class N aliased impl depends on class M in a forbidden partition` | Re-route period-1 aliased classes into `sched.periodic` as short-aliased (offset=fixed, period=1) instead of peeling to pre_loop/post_loop |
+| llama / mistral / phi3 / qwen2 / commandr (rest) — 183 variants | `aliased class N pos P slot S referenced post-loop — unsupported` | **5i.4** — teach `try_emit_collapsed_bucket` (post-loop ownership walk + ref collection) that an aliased-emittable class re-routed into `periodic` at offset `max_period-1` owns its exports at that final __repeat, so post-loop consumers can pick them up via the existing per-export post-ref binding |
+| llama / mistral / phi3 / qwen2 / commandr (rest) — 153 variants | `class 2 pos 3 slot 1 referenced downstream but not owned (output_alias untracked or aliased) — 5g scope refuses` | **5m** — pre-existing, newly exposed; a non-aliased periodic class has an export whose `output_alias` entry is not recognised as owned by the 5g ownership walk. Independent of 5i. |
 | gemma2 / granite | `class N slot 0 referenced by post-loop from multiple tiles` | **5k** (post-loop multi-tile export) — moderate |
 | qwen3 / gemma3 | `uniform_pairs=false` (1 residual pair each) | **5l** (finer refinement signature) — signature tuning |
 | commandr (3 variants) | ✅ happy path (degenerate empty loop) | — |
+
+**6.2.b.5i.3 — period-1 aliased re-route (landed 2026-04-21).**
+`StencilBundle::schedule` now takes `lib: &ImplementationLibrary`
+and, after the baseline topo partition, looks at every period-1
+class in `pre_loop`/`post_loop`. If its impl is
+`is_aliased_emittable` (FAR / FARWithOffset / AddRef family), the
+scheduler derives an offset from the class's edges to periodic
+neighbours:
+
+- For each edge touching C' (period-1) and periodic N at N's iter
+  `i`, the candidate offset is `class_offsets[N] + i`.
+- C' as PRODUCER for N: tightest upper bound is
+  `min(producer_edge_candidates)` — C' fires once, and later
+  iters read via carry.
+- C' as CONSUMER from N: tightest lower bound is
+  `max(consumer_edge_candidates)` — every producer iter C' reads
+  must already have fired.
+- Mixed direction: feasible iff
+  `max_consumer ≤ min_producer`; picks `max(max_consumer, min_producer)`.
+
+If feasible, C' is moved into `periodic` with the derived offset.
+The existing `offsets_consistent` check passes unchanged: the
+derived offsets satisfy `diff == -Δ` for every touched edge.
+Provenance walks also go through the existing periodic branch
+without modification.
+
+Measured on llama fleet: refusal count held at 336 but shape
+changed from 336× `pre/post_loop class 5 aliased impl depends on
+class 4 in a forbidden partition` to 183× class-10 post-loop-
+unsupported + 153× class-2 downstream-not-owned (pre-existing,
+previously masked). The forbidden-partition gate is cleared.
+
+**Next concrete step (5i.4):** fix the class-10 post-loop
+refusal. Class 10 is the layer-(N-1) post-MLP FAR peel — offset
+= max_period-1, period=1, fires at the last loop iter. Its
+aliased output (the residual buffer) feeds the final rmsnorm
+(post-loop). Today's post-ref machinery refuses because it's
+keyed on non-aliased periodic classes. The fix is in
+`try_emit_collapsed_bucket`'s post-ref collection + emission:
+for aliased-emittable periodic classes, route the export through
+the same `__cC_out_P_S` TensorView alias that the inline body
+already materialises, and lift it into an outer `let` visible to
+post-loop consumers. Scope: ~50-80 LoC in codegen.rs.
 
 **6.2.b.5j — edge-pattern class refinement (landed 2026-04-21).**
 The region-level 1-hop neighbour hash over-collapses patterns like

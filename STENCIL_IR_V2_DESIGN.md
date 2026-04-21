@@ -349,9 +349,97 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 **Measurement after the hash fix**: distribution of class counts shifted from a tight 8/10 to 12/15/17/18/22 across 218 variants. Collapse factor for llama / mistral drops from ~28× to ~19×; still well-collapsed and every class is now impl-consistent. Pre-fix 23 heterogeneous variants → 2 remaining (both Qwen3; see A.2).
 
-### Quick-start for next session
+### Quick-start for next session (2026-04-21)
 
-Entry point: **6.2.b class-loop emission** (§13 item B below). 6.1 + 6.2.a have landed; the IR + plumbing is in place. The remaining work is the actual loop-emission rewrite — this is the critical-path win.
+**What's landed**: 6.1, 6.2.a, 6.2.b.1–4, 6.2.b.5a–e (collapsed
+emitter), 6.2.b.5f (p1 period-mismatch offsets). Commits:
+`65b337b21` (5e) and `7b412df08` (5f). `cargo check -p ferrite-models
+--features cuda` with `FERRITE_STENCIL_CODEGEN=1` is clean across
+all 218 variants; collapsed path fires on 3 commandr variants
+(degenerate empty-loop). Every other variant hits `unimplemented!()`
+with a specific refusal reason.
+
+**Where to start — two independent follow-ups, pick one**:
+
+1. **6.2.b.5g — multi-output periodic classes** (unlocks llama,
+   mistral, phi3, qwen2). Refusal reason today: `class N has
+   multi-output tile` (rope_append producing q/k/v; sometimes
+   gate/up fused). Fix path:
+   - Remove the multi-output check in
+     `try_emit_collapsed_bucket`'s precondition (and loosen
+     `can_fragmentize`).
+   - Teach `emit_fragment_call_expr` to emit a fragment that returns
+     a **tuple** `(OwnedTensor, ..., OwnedTensor)` when the class
+     has a multi-output tile. Call site: `let (__cC_out_0,
+     __cC_out_1, ...) = unsafe { __frag_N(...); };`. Abstract body
+     already binds `__out_0_0`, `__out_0_1`, ... via
+     `ctx.output_ident` — just return the tuple instead of
+     `__out_<last>_0`.
+   - Consumer arg resolution: `IntraIter` with multi-output
+     producer → `(*__cPC_out_<slot>).as_view()`; track the slot in
+     `InputOrigin::IntraIter` (add `producer_slot: u8`). Short
+     multi-output classes use `Option<OwnedTensor>` per slot.
+   - Carry / dedicated-last / post-loop code is slot-aware — most
+     llama residual carries are single-output (slot 0), so only
+     multi-output classes need per-slot handling.
+   - Validation: `FERRITE_STENCIL_CODEGEN=1 cargo expand -p
+     ferrite-model-llama --features cuda` should show `for
+     __repeat in 0usize..40` with `__cC_out_0` / `__cC_out_1` /
+     `__cC_out_2` per rope_append class. Then `vllm chat` on
+     llama-2-7b with `timeout` (per `feedback_no_run_chat`) to
+     sanity-check correctness.
+
+2. **6.2.b.5h — richer offset solver** (unlocks gemma2, gemma3,
+   granite, qwen3). Refusal reason today: `offsets_consistent=false`.
+   Fix path:
+   - Today's offset rule (`offset = max_period - period`) assumes
+     short classes "start late, end aligned with max." Gemma /
+     granite / qwen3 have classes that don't fit this rule —
+     likely classes that start early OR multiple classes offset by
+     different amounts that the simple rule can't disentangle.
+   - Replace `class_offsets` computation in
+     `StencilBundle::schedule` with a BFS-over-edge-graph solver:
+     pin one max-period class to offset 0, propagate via each
+     periodic-to-periodic edge:
+     `offset(consumer) = offset(producer) + (−Δ + carry_delta)`
+     where `carry_delta ∈ {0, 1}`. Pick `carry_delta` greedily
+     (try both when ambiguous, prefer 0 / intra-iter). Infeasible
+     → set `offsets_consistent=false` and the existing refusal
+     path fires.
+   - Diagnostic: dump the edge graph + attempted offsets for one
+     gemma variant (`stencil-deps · ...` line already prints Δ
+     histogram per-variant; inspect to understand the shape).
+
+   Neither fix blocks the other. 5g unlocks a bigger fleet (llama
+   family) so it's the obvious priority; 5h is necessary eventually
+   for full arch coverage.
+
+**Before writing code**: open the failing expand output for the
+target arch (`FERRITE_STENCIL_CODEGEN=1 cargo expand -p
+ferrite-model-<arch> --features cuda`) and find the specific
+refusal reason + the diagnostic counts (`classes=N homogeneous=M
+pre=X periodic=Y post=Z max_period=W uniform_period=..
+offsets_consistent=.. provenance_ok=..`) — the message is designed
+to tell you which gate tripped without needing to reproduce.
+
+**Code map** (for both follow-ups):
+- `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs` —
+  `emit_forward_collapsed_bucket`, `try_emit_collapsed_bucket`
+  (precondition gates + emission orchestration),
+  `emit_fragment_call_expr` (per-class call site + fragment
+  intern), `ClassSchedule` / `class_offsets` / `offsets_consistent`
+  / `class_input_provenance` (offset-aware from 5f).
+- `vllm-rs/crates/ferrite-forward-macro/src/emit.rs` — `EmitCtx`,
+  `EmitMode::Abstract`, `WeightLayout::access_tokens_with_repeat`.
+  Weight reads in Concrete mode currently use `access_tokens` (not
+  `_with_repeat`); if 5g ends up needing inline Concrete emission
+  inside the loop, extend the Weight branch to respect
+  `self.repeat_var`.
+- `vllm-rs/crates/ferrite-forward-macro/src/impl_lib.rs` —
+  multi-output impls (rope_append family, qkv_rope_cache, fused
+  gate_up_silu_mul). These emit multiple `let __out_<pos>_<slot> =
+  ...;` bindings in Abstract mode — 5g's tuple-return just picks
+  them up.
 
 Before writing code, validate two empirical questions:
 

@@ -383,7 +383,8 @@ None of these are show-stoppers without investigation, but each is worth measuri
 - `61dd42ed9` — **6.2.a landed**: `repeat_var: Option<TokenStream>` + `layer_expr(u64)` helper on EmitCtx. Both construction sites set `None`, so emitted code is byte-identical; the field is dormant until 6.2.b wires loop emission.
 - (5i.1 … 5i.4 mid-chain commits — see `git log`)
 - `428eb491b` — **6.2.b.5i.5 landed (2026-04-22)**: LoopCarry-alias redirect closes the FAR cascade. `alias_carry_redirect: BTreeMap<(class,pos,slot), (class,pos,slot)>` threaded through `carry_inits` + `emit_fragment_call_expr` + `emit_aliased_class_inline`. Verified red→green with the new `FAR_CASCADE_BODY` fixture: disable `resolve_carry` ⇒ `emit_red::far_cascade_*` fail with the "5i.5 scope" refusal; restore ⇒ green.
-- **6.2.b.5m landed (2026-04-22)**: side-effect exports recognised in `try_emit_collapsed_bucket`. `FusedQkvRopeCacheImpl`'s K/V paged-cache slots (absent from `output_alias`) are now classified as side-effect: stripped from `referenced_exports`/`class_returned_exports` (fragment doesn't return them) and filtered from both `tile_params_ordered` + `class_inputs.slots` in `emit_fragment_call_expr` (fragment signature omits them). Decode `AttentionViaCacheImpl` already ignores slots 1/2 in `emit_call`; it reads K/V via `ctx.kv_cache`. New narrow fixture `ROPE_ONLY_BODY` + test `emission_red::rope_only_emits_successfully`; the existing `emission_red::far_decoder_emits_successfully` acceptance gate flips green. Verified red→green by toggling the side-effect block off. 38 codegen tests pass, 2 ignored (diagnostic dumps).
+- **6.2.b.5m landed (2026-04-22)**: side-effect exports recognised in `try_emit_collapsed_bucket`. `FusedQkvRopeCacheImpl`'s K/V paged-cache slots (absent from `output_alias`) are now classified as side-effect: stripped from `referenced_exports`/`class_returned_exports` (fragment doesn't return them) and filtered from both `tile_params_ordered` + `class_inputs.slots` in `emit_fragment_call_expr` (fragment signature omits them). Decode `AttentionViaCacheImpl` already ignores slots 1/2 in `emit_call`; it reads K/V via `ctx.kv_cache`. New narrow fixture `ROPE_ONLY_BODY` + test `emission_red::rope_only_emits_successfully`; the existing `emission_red::far_decoder_emits_successfully` acceptance gate flips green. Verified red→green by toggling the side-effect block off.
+- **6.2.b.5m follow-up (same commit): aliased-class `__last_` hoist fix.** Landing 5m exposed a latent bug: `dedicated_last` (post-loop-referenced, non-carry-producing class exports) was hoisting `Option<OwnedTensor>` for *every* class in the set, including aliased ones — but 5i.4's aliased post-loop path hoists `Option<GpuTensor>` separately, and the dedicated_last populate site `Some(#c_out.take().expect(..))` then tried to move a `GpuTensor` into `Option<OwnedTensor>`. A pure `syn::parse2` emission test doesn't catch this (parses fine, fails `rustc` typecheck). `forward_m_*` emission for llama post-5m surfaced 338 `E0308 expected OwnedTensor, found GpuTensor` errors; skipping aliased classes in both the hoist loop (~line 4807) and the populate loop (~line 5031) closes it. New pin `emission_red::far_decoder_no_owned_gpu_mismatch_on_aliased_last` scans emitted tokens for `__last_cC_p…` idents of aliased classes (red when skip is off, green when on). 39 codegen tests pass, 2 ignored (diagnostic dumps). **Fleet check: `FERRITE_STENCIL_CODEGEN=1 cargo check -p ferrite-models --features cuda` now completes cleanly end-to-end.**
 
 **What builds**: everything. `cargo build -p ferrite-models --release` exercises all 218 model variants through the full pipeline. Stencil diagnostic prints alongside each variant's ferrite line (see "stencil · N regions → N classes" entries).
 
@@ -687,16 +688,27 @@ cargo_check` in memory, and the ⚡ section above). Same discipline
 **Terminal state after 5m (current)**:
 - `emission_red::{far_decoder_emits_successfully,
   rope_only_emits_successfully, far_simple_emits_successfully,
-  far_cascade_emission_is_structurally_sound}` all green.
-- 38 codegen tests pass (2 ignored diagnostic dumps); clippy clean.
-- Fleet `cargo check -p ferrite-models --features cuda` with
-  `FERRITE_STENCIL_CODEGEN=1` expected clean across
-  llama/mistral/phi3/qwen2 (emission path); **not yet verified
-  end-to-end this session** — next picker-up should run it
-  before any new codegen work.
-- Remaining fleet gates: 5h (gemma2/granite `offsets_consistent=false`),
-  5l (qwen3/gemma3 `uniform_pairs=false`), 5k (post-loop
-  multi-tile, surfaces on various bodies).
+  far_cascade_emission_is_structurally_sound,
+  far_decoder_no_owned_gpu_mismatch_on_aliased_last}` all green.
+- 39 codegen tests pass (2 ignored diagnostic dumps); clippy clean.
+- **Fleet check verified clean** this session:
+  `FERRITE_STENCIL_CODEGEN=1 cargo check -p ferrite-models
+  --features cuda` completes with no errors across all 218
+  model variants (llama/mistral/phi3/qwen2/qwen3/gemma2/gemma3/
+  granite/commandr). This includes the quant matrix (dense / AWQ /
+  GPTQ / CT-INT4 / BNB4 / FP8-per-tensor / FP8-block).
+- Runtime correctness NOT yet verified. `vllm chat` against a
+  llama / qwen2 / mistral / phi3 variant with stencil codegen
+  ON is the next functional test — the emission path is clean
+  but the open correctness note on short-period class weight
+  indexing (below) is still unresolved.
+- Remaining emission-path gates (distinct from runtime): 5h
+  (gemma2/granite `offsets_consistent=false`), 5l (qwen3/gemma3
+  `uniform_pairs=false`), 5k (post-loop multi-tile) — these were
+  refusing pre-5m and continue to refuse; 5m didn't address them.
+  Expected to surface as `unimplemented!(..)` bodies in the fleet
+  check, which typecheck fine (so the fleet "compiles" even though
+  those variants would panic at runtime).
 
 **Pointers — entry points for whoever picks up next**:
 - `codegen.rs::try_emit_collapsed_bucket` (~line 4119) — the main
@@ -792,24 +804,21 @@ All under `vllm-rs/crates/ferrite-forward-macro/src/`:
 
 ## Refusal distribution (post-5m, 2026-04-22)
 
-Not re-measured this session. The 5i.5 + 5m pair was expected
-to clear the llama/mistral/phi3/qwen2 fleets (~292 variants);
-the picker-up for 5h/5l/5k should re-run the fleet check
-(`cargo check -p ferrite-models --features cuda` with
-`FERRITE_STENCIL_CODEGEN=1`) and update the table below before
-starting work. Previous (post-5i.5, pre-5m) distribution:
+Fleet check (`FERRITE_STENCIL_CODEGEN=1 cargo check -p
+ferrite-models --features cuda`) verified clean end-to-end
+this session — every variant's `forward_m_*` either emits real
+kernel launches (5m-path-clear variants) or an `unimplemented!(..)`
+body (upstream-refused variants). Both typecheck. A picker-up
+for 5h/5l/5k should grep the refusal substrings out of `cargo
+expand -p ferrite-models --features cuda` to measure the
+remaining distribution; this was not recounted this session.
 
-| Arch fleet | Refusal reason | Next-step path |
+| Arch fleet | Expected state | Next-step path |
 |---|---|---|
-| llama / mistral / phi3 / qwen2 / commandr (rest) — **~292** | pre-5m: `class N pos P slot S referenced downstream but not owned — 5g scope refuses` | **5m LANDED** (commit `3c97cce3e`). Expected clean on this slice after re-run; verify. |
-| gemma2 / granite | `class N slot 0 referenced by post-loop from multiple tiles` OR `offsets_consistent=false` | **5k** (post-loop multi-tile) and/or **5h** (richer offset solver). Table above gives the primary gate per fleet; pick based on whichever trips first in the re-run. |
-| qwen3 / gemma3 | `uniform_pairs=false` (1 residual pair each) | **5l** (finer refinement signature) — signature tuning |
+| llama / mistral / phi3 / qwen2 (bulk) | emits real kernels | **runtime verification** via `vllm chat` — the open correctness note on short-period weight indexing applies |
+| gemma2 / granite | `unimplemented!(..)` on upstream gates | **5h** (`offsets_consistent=false`) primary; potentially **5k** on specific variants |
+| qwen3 / gemma3 | `unimplemented!(..)` | **5l** (`uniform_pairs=false`) |
 | commandr (3 variants) | ✅ happy path (degenerate empty loop) | — |
-
-Full fleet unlock (full FAR_DECODER emission via `vllm chat`)
-lands when the weight-indexing correctness note above is
-verified against the unrolled path on a short-period llama
-variant.
 
 **6.2.b.5i.3 — period-1 aliased re-route (landed 2026-04-21).**
 `StencilBundle::schedule` now takes `lib: &ImplementationLibrary`

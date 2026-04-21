@@ -4804,7 +4804,20 @@ fn try_emit_collapsed_bucket(
     }
 
     // Dedicated-last hoists: Option<OwnedTensor>, filled each iter.
+    //
+    // Aliased classes are skipped here: 5i.4 already hoists their
+    // export as `Option<GpuTensor>` (a view descriptor), and the
+    // post-loop binding at the bottom of this function reads them
+    // via `__cC_out_P_S.as_ref().expect(..).as_view()` to produce a
+    // `TensorView<'_>` that downstream `emit_subgraph` consumes.
+    // The dedicated_last Option<OwnedTensor> path would try to
+    // `Some(gpu_tensor)`-into-`Option<OwnedTensor>` at the populate
+    // site — a type error, and semantically wrong since the export
+    // isn't an OwnedTensor to begin with.
     for &(c, pos, slot) in &dedicated_last {
+        if aliased_classes.contains(&c) {
+            continue;
+        }
         let last = last_var_ident(c, pos, slot);
         body.push(quote! {
             let mut #last: ::std::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> = None;
@@ -5028,7 +5041,13 @@ fn try_emit_collapsed_bucket(
             loop_body.push(update);
         }
     }
+    // Mirror of the dedicated_last hoist above: skip aliased classes
+    // (5i.4 handles their post-loop read directly, without going
+    // through an Option<OwnedTensor> __last_ variable).
     for &(c, pos, slot) in &dedicated_last {
+        if aliased_classes.contains(&c) {
+            continue;
+        }
         let last = last_var_ident(c, pos, slot);
         let c_out = class_out_ident(c, pos, slot);
         if short_classes.contains(&c) {
@@ -7776,6 +7795,74 @@ mod tests {
             let wrapped = quote::quote! { mod _t { #tokens } };
             syn::parse2::<syn::File>(wrapped)
                 .expect("emitted tokens must parse as a well-formed Rust file");
+        }
+
+        /// Post-5m type-safety pin: for every aliased class that
+        /// appears in `dedicated_last`, the emitted body must NOT
+        /// hoist an `__last_cC_pP_sS: Option<OwnedTensor>` variable
+        /// or populate it. 5i.4's `Option<GpuTensor>` path handles
+        /// the post-loop read directly; the dedicated_last path
+        /// would construct `Some(gpu_tensor)` into an
+        /// `Option<OwnedTensor>` — a type mismatch that parses but
+        /// fails `rustc` typecheck (and therefore slipped past the
+        /// existing `syn::parse2`-only emission tests).
+        ///
+        /// Red→green: reverting either of the two
+        /// `if aliased_classes.contains(&c) { continue; }` skips
+        /// in the dedicated_last hoist / populate loops makes this
+        /// test fail. Flags the fleet regression that `vllm chat`
+        /// / `cargo check -p ferrite-models` would otherwise surface
+        /// minutes later — kept as a 0.3s pin against recurrence.
+        #[test]
+        fn far_decoder_no_owned_gpu_mismatch_on_aliased_last() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
+            let mut lib_frag = FragmentLibrary::default();
+            let wl = crate::emit::WeightLayout::new();
+            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+            let tokens = try_emit_collapsed_bucket(
+                &stencil,
+                &sched,
+                prov.as_deref(),
+                &s.fuf,
+                &s.sfuf,
+                &s.program,
+                &s.model,
+                &s.lib,
+                wp,
+                &mut lib_frag,
+                &wl,
+            )
+            .expect("FAR_DECODER must emit post-5m");
+            let text = tokens.to_string();
+            // Identify aliased classes so the assertion names exactly
+            // which `__last_cC_*` ident would indicate the bug.
+            let mut aliased_classes: Vec<usize> = Vec::new();
+            for &c in &sched.periodic {
+                let imp_id = stencil.class_impl_id[c].expect("homog");
+                let imp = s.lib.get(imp_id);
+                let rep = stencil.class_members[c][0];
+                let claimed = s.sfuf.tiles_in_subgraph(rep);
+                if is_aliased_emittable(imp, &claimed, &s.fuf) {
+                    aliased_classes.push(c);
+                }
+            }
+            assert!(
+                !aliased_classes.is_empty(),
+                "FAR_DECODER must have at least one aliased class — fixture regressed"
+            );
+            for c in aliased_classes {
+                let needle = format!("__last_c{c}_p");
+                assert!(
+                    !text.contains(&needle),
+                    "aliased class c{c} generated a `{needle}...` hoist / \
+                     populate; Option<OwnedTensor> + GpuTensor source is a \
+                     type mismatch. Skip aliased classes in the \
+                     dedicated_last loops."
+                );
+            }
         }
 
         /// 5m red→green gate (narrow). ROPE_ONLY_BODY strips the body

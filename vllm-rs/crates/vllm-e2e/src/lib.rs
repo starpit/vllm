@@ -242,6 +242,10 @@ impl TestModels {
     // silu / fused QKV-rope path on Qwen3 (QK-norm variant). Unsloth
     // repo matches parity.csv's verified BNB4 checkpoint.
     pub const QWEN3_0_6B_BNB_4BIT: &str = "unsloth/Qwen3-0.6B-bnb-4bit";
+    pub const QWEN2_0_5B_BNB_4BIT: &str = "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit";
+    pub const GEMMA2_2B_W4A16_CT: &str = "RedHatAI/gemma-2-2b-it-quantized.w4a16";
+    pub const GRANITE_3_1_2B_GPTQ: &str = "sroecker/granite-3.1-2b-instruct-gptq";
+    pub const GRANITE_3_2B_BNB_4BIT: &str = "unsloth/granite-3.2-2b-instruct-bnb-4bit";
 
     // GGUF quantized models (CPU, not MLX)
     pub const GEMMA3_270M_GGUF: &str = "unsloth/gemma-3-270m-it-qat-GGUF";

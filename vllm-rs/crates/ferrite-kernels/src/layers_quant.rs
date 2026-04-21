@@ -780,12 +780,35 @@ impl MarlinLinear {
 
         // Handle g_idx for desc_act (activation ordering) BEFORE
         // repack — repack needs `perm` (sort_indices) on GPU.
-        // compressed-tensors never uses desc_act (parser pins it to
-        // `false`), so this branch is a no-op for that layout.
-        let g_idx_name = format!("{prefix}.g_idx");
-        let (g_idx_gpu, sort_indices_gpu, has_act_order) = if desc_act
-            && weights.contains(&g_idx_name)
-        {
+        // AutoGPTQ ships `.g_idx`; compressed-tensors ships
+        // `.weight_g_idx` when the quantizer used `actorder: "group"`.
+        // Tensor presence drives the code path — the per-preset
+        // compile-time `desc_act` flag only governs whether we emit
+        // the act-order branch, not whether the actual checkpoint
+        // carries a permutation. Runtime tensor presence is the
+        // source of truth (matches Python vLLM's CT path, which
+        // builds `has_g_idx` from the live weights dict).
+        let g_idx_name = match layout {
+            GptqLayout::Qweight => format!("{prefix}.g_idx"),
+            GptqLayout::WeightPacked => format!("{prefix}.weight_g_idx"),
+        };
+        // For AutoGPTQ (`Qweight`), the compile-time `desc_act` flag
+        // is authoritative — distinct `gptq-sym` and `gptq-sym-desc_act`
+        // variants are synthesized, and the fingerprint's g_idx
+        // disambiguation picks exactly the variant whose desc_act
+        // matches the checkpoint. Runtime-detecting here would flip
+        // on `has_act_order` for desc_act=false variants that happen
+        // to ship an inert `.g_idx` tensor, breaking them.
+        //
+        // For compressed-tensors (`WeightPacked`), there's no per-
+        // preset `desc_act` knob (the preset file doesn't carry an
+        // `actorder` field — it varies per checkpoint), so tensor
+        // presence IS the source of truth.
+        let take_g_idx = match layout {
+            GptqLayout::Qweight => desc_act && weights.contains(&g_idx_name),
+            GptqLayout::WeightPacked => weights.contains(&g_idx_name),
+        };
+        let (g_idx_gpu, sort_indices_gpu, has_act_order) = if take_g_idx {
             let (g_idx_bytes, _g_idx_shape, _g_idx_dtype) = weights.take_cpu(&g_idx_name)?;
             let g_idx_i32: Vec<i32> = g_idx_bytes
                 .chunks_exact(4)
@@ -1022,12 +1045,23 @@ impl MarlinLinear {
             }
 
             // `.g_idx` shared across fused sub-weights — read from
-            // first prefix, consume from the rest. CT doesn't use
-            // activation ordering; `desc_act` is pinned to `false`
-            // by the parser, so this branch is inert for CT.
-            let g_idx_name = format!("{prefix}.g_idx");
-            if weights.contains(&g_idx_name) {
-                if i == 0 && desc_act {
+            // first prefix, consume from the rest. compressed-tensors
+            // ships the same info as `.weight_g_idx` when the config
+            // carries `actorder: "group"`; pick the right name per
+            // layout so the permutation lands in the repack.
+            let g_idx_name = match layout {
+                GptqLayout::Qweight => format!("{prefix}.g_idx"),
+                GptqLayout::WeightPacked => format!("{prefix}.weight_g_idx"),
+            };
+            // Same Qweight-vs-WeightPacked split as single-shot
+            // `load_gptq`: compile-time `desc_act` is authoritative
+            // for AutoGPTQ; runtime tensor presence for CT.
+            let take_g_idx = match layout {
+                GptqLayout::Qweight => desc_act && weights.contains(&g_idx_name),
+                GptqLayout::WeightPacked => weights.contains(&g_idx_name),
+            };
+            if take_g_idx {
+                if i == 0 {
                     let (g_bytes, _g_shape, _g_dtype) = weights.take_cpu(&g_idx_name)?;
                     g_idx_i32 = Some(
                         g_bytes
@@ -1415,9 +1449,12 @@ impl Bnb4bitLinear {
     /// sum(out_features_per_shard)` and a single shared dequant
     /// scratch / code LUT.
     ///
-    /// Bias is dropped on the fused path (fused QKV / gate_up rarely
-    /// carry bias; a future arch with biased fused BNB can lift
-    /// this).
+    /// Bias tensors (when present on any shard) are concatenated along
+    /// the N axis into a single `[sum(out_features_per_shard)]` bias on
+    /// the fused layer — mirrors `MarlinLinear::load_awq_concat`. Mixing
+    /// bias/no-bias across shards falls through with the biased shards
+    /// only (HF checkpoints never mix, so this is just parity with the
+    /// Marlin loader's tolerance).
     #[allow(clippy::too_many_arguments)]
     pub fn load_concat(
         weights: &mut GpuWeights,
@@ -1438,6 +1475,8 @@ impl Bnb4bitLinear {
 
         let mut all_packed: Vec<u8> = Vec::new();
         let mut all_absmax_f32: Vec<f32> = Vec::new();
+        let mut bias_parts: Vec<Vec<u8>> = Vec::new();
+        let mut bias_dtype: Option<DType> = None;
 
         for prefix in prefixes {
             let weight_name = format!("{prefix}.weight");
@@ -1490,6 +1529,18 @@ impl Bnb4bitLinear {
                     let _ = weights.take_cpu(name);
                 }
             }
+
+            // Bias is NOT part of BNB's 4-bit quantization; shipped as
+            // a regular `[N_shard]` tensor per-prefix alongside `.weight`.
+            // Concat along N so the fused layer carries one
+            // `[sum_N_shard]` bias — matches Python vLLM's per-shard
+            // `matmul_4bit` + single post-GEMM bias add.
+            let bias_name = format!("{prefix}.bias");
+            if weights.contains(&bias_name) {
+                let (b_data, _b_shape, b_dtype) = weights.take_cpu(&bias_name)?;
+                bias_parts.push(b_data);
+                bias_dtype = Some(b_dtype);
+            }
         }
 
         // Upload fused packed bytes.
@@ -1515,6 +1566,8 @@ impl Bnb4bitLinear {
         }
         let absmax_gpu = unsafe { GpuTensor::new(absmax_ptr, &[all_absmax_f32.len()], DType::F32) };
 
+        let bias = fuse_bias_parts(&bias_parts, bias_dtype, weights, stream)?;
+
         Ok(Self {
             packed_weight: packed_gpu,
             absmax: absmax_gpu,
@@ -1523,7 +1576,7 @@ impl Bnb4bitLinear {
             out_features: total_out_features,
             in_features,
             blocksize,
-            bias: None,
+            bias,
         })
     }
 }

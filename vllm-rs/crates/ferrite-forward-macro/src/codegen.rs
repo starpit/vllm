@@ -689,13 +689,21 @@ fn emit_fingerprint_check(
     let bnb4_marker_tensor = "model.layers.0.self_attn.q_proj.weight.absmax";
     // FP8 checkpoints ship `.weight` (FP8E4M3 bytes — same suffix
     // as dense bf16) alongside a sibling `.weight_scale`. Dense /
-    // AWQ / GPTQ / CT / BNB4 variants must reject when
+    // AWQ / native-GPTQ / BNB4 variants must reject when
     // `.weight_scale` is present; the FP8 variant itself keys off
     // this tensor in its suffix-based checks and doesn't need the
-    // rejection.
+    // rejection. Compressed-tensors INT4 (`GptqLayout::WeightPacked`)
+    // ALSO ships `.weight_scale` (as the group-scale tensor) — its
+    // own qweight-shape gate on `.weight_packed` already makes it
+    // disjoint from FP8, so skip the fp8 exclusion for it to avoid
+    // false-rejecting CT-INT4 checkpoints.
     let fp8_exclusion = matches!(
         model.quantization.as_ref().map(|qc| &qc.method),
         Some(crate::quantization::QuantMethod::Fp8 { .. })
+            | Some(crate::quantization::QuantMethod::Gptq {
+                layout: crate::quantization::GptqLayout::WeightPacked,
+                ..
+            })
     );
     let fp8_marker_tensor = "model.layers.0.self_attn.q_proj.weight_scale";
 

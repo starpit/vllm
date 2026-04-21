@@ -69,6 +69,16 @@ MODELS = {
     # (the QKV-fused matcher can't walk through rmsnorm), while the
     # MLP gate/up still fuses via `Bnb4FusedGateUpSiluMulImpl`.
     "qwen3_0_6b_bnb_4bit": "unsloth/Qwen3-0.6B-bnb-4bit",
+    # BNB4 NF4 Llama-3.2-1B — same NF4+double_quant format as the
+    # qwen3 entry, exercising the BNB4 Impl family on Llama's plain
+    # (no-QK-norm) QKV-rope fused path, so `Bnb4FusedQkvRope{Cache,Prefill}Impl`
+    # claims all three Q/K/V Gemms as one unit instead of falling to
+    # the singleton.
+    "llama_3_2_1b_bnb_4bit": "unsloth/Llama-3.2-1B-Instruct-bnb-4bit",
+    "qwen2_0_5b_bnb_4bit": "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit",
+    "gemma2_2b_w4a16_ct": "RedHatAI/gemma-2-2b-it-quantized.w4a16",
+    "granite_3_1_2b_gptq": "sroecker/granite-3.1-2b-instruct-gptq",
+    "granite_3_2b_bnb_4bit": "unsloth/granite-3.2-2b-instruct-bnb-4bit",
     # Unsloth mirror — `google/gemma-3-1b-it` is gated. Match this to
     # `TestModels::GEMMA3_1B_IT_CUDA` so engine + golden run on the same
     # weights.

@@ -6070,6 +6070,101 @@ fn fp8_accessor_type_for(fuf: &Fuf, gemm_tile: TileId) -> TokenStream {
     }
 }
 
+/// True if a `MarlinFusedQkvRope*Impl` would accept `seed` as one of
+/// its Q/K/V Gemms — i.e., there exists a `RopeAppend` whose first
+/// three tile inputs unwrap (optionally through `BiasAdd`) to three
+/// Marlin Gemms sharing one activation, and `seed` is one of them.
+/// Used by `MarlinGemmImpl` to defer without over-claiming.
+fn marlin_fused_qkv_rope_would_match(fuf: &Fuf, seed: TileId) -> bool {
+    fuf.nodes.iter().any(|n| {
+        if !is_rope_append_op(n.op) || n.inputs.len() < 3 {
+            return false;
+        }
+        let qkv_raw: Vec<TileId> = n
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        if qkv_raw.len() != 3 {
+            return false;
+        }
+        let Some(resolved): Option<Vec<(TileId, Option<TileId>)>> = qkv_raw
+            .iter()
+            .map(|t| unwrap_gemm_through_bias(fuf, *t))
+            .collect()
+        else {
+            return false;
+        };
+        let biased = resolved[0].1.is_some();
+        if resolved.iter().any(|r| r.1.is_some() != biased) {
+            return false;
+        }
+        let gemms: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
+        if !gemms.contains(&seed) {
+            return false;
+        }
+        if gemms.iter().any(|t| !is_marlin_gemm(fuf, *t)) {
+            return false;
+        }
+        let act = first_tile_input(fuf.get(gemms[0]));
+        act.is_some() && gemms.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
+    })
+}
+
+/// True if `MarlinFusedGateUpSiluMulImpl` (or the Gelu variant) would
+/// accept `seed` as gate or up gemm — `seed` is a Marlin Gemm whose
+/// output feeds `Silu` or `Gelu`, or whose output is the "up" half of
+/// a `(silu_or_gelu(gate) * up)` pair. Keeps the deference tight so
+/// non-SwiGLU/GELU `Mul` patterns (e.g. Granite's scalar multiplier)
+/// don't trigger it.
+fn marlin_fused_gate_up_would_match(fuf: &Fuf, seed: TileId) -> bool {
+    // gate gemm: output feeds Silu or Gelu which feeds Mul with a
+    // sibling gemm as the other input.
+    for n in &fuf.nodes {
+        if !matches!(n.op, OpKind::Silu | OpKind::Gelu) {
+            continue;
+        }
+        if !consumes_tile(n, seed) {
+            // seed isn't the gate; check if seed is the up gemm
+            // that feeds the Mul alongside this Silu/Gelu.
+            let act_id = n.id;
+            for m in &fuf.nodes {
+                if m.op != OpKind::Mul || !consumes_tile(m, act_id) {
+                    continue;
+                }
+                let up_is_seed = m.inputs.iter().any(|i| match i {
+                    FufInput::Tile { id, .. } => *id == seed && *id != act_id,
+                    _ => false,
+                });
+                if up_is_seed && is_marlin_gemm(fuf, seed) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        // seed feeds the Silu/Gelu — check that Silu/Gelu's output
+        // feeds a Mul paired with another Marlin Gemm.
+        let act_id = n.id;
+        let has_mul_pair = fuf.nodes.iter().any(|m| {
+            if m.op != OpKind::Mul || !consumes_tile(m, act_id) {
+                return false;
+            }
+            m.inputs.iter().any(|i| match i {
+                FufInput::Tile { id, .. } => *id != act_id && is_marlin_gemm(fuf, *id),
+                _ => false,
+            })
+        });
+        if has_mul_pair {
+            return true;
+        }
+    }
+    false
+}
+
 /// Singleton Marlin GEMM — the AWQ counterpart of `GemmRefImpl`.
 #[derive(Debug, Default)]
 pub struct MarlinGemmImpl;
@@ -6088,12 +6183,24 @@ impl Implementation for MarlinGemmImpl {
         if !is_marlin_gemm(fuf, seed) {
             return None;
         }
-        // Same fusion-partner guard as CutlassGemmImpl: don't
-        // singleton-claim a Gemm whose output feeds a fused
-        // downstream (RopeAppend / Silu / Mul / Gelu) — those
-        // claims belong to `MarlinFusedQkvRope*Impl` /
-        // `MarlinFusedGateUpSiluMulImpl`.
-        if gemm_is_fusion_partner(fuf, seed) {
+        // Precision-gate the fusion-partner deference. The old
+        // `gemm_is_fusion_partner` check deferred to any Gemm
+        // feeding RopeAppend/Silu/Mul/BiasAdd. That was too eager:
+        //   - Granite's `o_proj * scalar(residual_multiplier)` is
+        //     a `ScalarMul`, not the `silu(gate)*up` shape —
+        //     nothing would claim the pair, `UnclaimedTile`.
+        //   - Qwen3's per-head QK-norm interrupts the `(Gemm,
+        //     Gemm, Gemm, RopeAppend)` adjacency that
+        //     `MarlinFusedQkvRope*Impl` looks for — same orphan
+        //     outcome.
+        // Defer only when a fused sibling would actually match at
+        // this seed. `marlin_fused_qkv_rope_would_match` checks
+        // the exact `(Gemm, Gemm, Gemm, RopeAppend)` adjacency
+        // (optionally through `BiasAdd`); the gate-up check
+        // pattern-matches the `(Gemm, Gemm, Silu, Mul)` shape.
+        if marlin_fused_qkv_rope_would_match(fuf, seed)
+            || marlin_fused_gate_up_would_match(fuf, seed)
+        {
             return None;
         }
         Some(info)

@@ -1,5 +1,8 @@
 {
   "quantizations": [
+    "bnb-nf4-dq",
+    "ct-int4-sym",
+    "gptq-sym",
     "fp8-dynamic-per-tensor",
     "fp8-static-per-tensor"
   ]

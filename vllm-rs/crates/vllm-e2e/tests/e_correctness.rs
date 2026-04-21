@@ -219,6 +219,65 @@ async fn test_cuda_correctness_qwen3_0_6b_bnb_4bit() {
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
+async fn test_cuda_correctness_llama_3_2_1b_bnb_4bit() {
+    run_correctness_test_with_threshold(
+        TestModels::LLAMA_3_2_1B_BNB_4BIT,
+        "llama_3_2_1b_bnb_4bit",
+        3,
+    )
+    .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_qwen2_0_5b_bnb_4bit() {
+    run_correctness_test_with_threshold(TestModels::QWEN2_0_5B_BNB_4BIT, "qwen2_0_5b_bnb_4bit", 3)
+        .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_gemma2_2b_w4a16_ct() {
+    // Compressed-tensors INT4 on Gemma2 — this RedHatAI checkpoint
+    // has `actorder: null` so the Marlin repack runs without the
+    // act-order permutation, matching Python's CUTLASS path 1:1.
+    // (Actorder-group CT repos — e.g. qwen2/granite W4A16 — still
+    // produce coherent but drift-ful output; kept out of the
+    // golden suite until the deeper Marlin act-order path lands.)
+    run_correctness_test(TestModels::GEMMA2_2B_W4A16_CT, "gemma2_2b_w4a16_ct").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_granite_3_1_2b_gptq() {
+    // First GPTQ on Granite. Exercises `MarlinGemmImpl`'s
+    // precision-gated deference: Granite's `o_proj *
+    // scalar(residual_multiplier)` makes the o_proj gemm feed a
+    // `ScalarMul` (not the silu/up pair), which the old blanket
+    // `gemm_is_fusion_partner` wrongly punted on — nothing would
+    // have claimed it. The tighter deference lets the singleton
+    // claim here while still deferring on q/k/v → RopeAppend.
+    run_correctness_test(TestModels::GRANITE_3_1_2B_GPTQ, "granite_3_1_2b_gptq").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_granite_3_2b_bnb_4bit() {
+    run_correctness_test_with_threshold(
+        TestModels::GRANITE_3_2B_BNB_4BIT,
+        "granite_3_2b_bnb_4bit",
+        3,
+    )
+    .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn test_cuda_correctness_qwen2_0_5b_fp8_dynamic() {
     // FP8 dynamic-per-tensor Qwen2.5-0.5B — exercises
     // `Fp8FusedQkvRopeCacheImpl` (decode M=1) /

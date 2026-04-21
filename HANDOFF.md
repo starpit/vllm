@@ -878,27 +878,64 @@ disambiguation on `.input_scale` landed alongside it.
      Wire up a dedicated preset only if a concrete repo shows up
      that doesn't fingerprint-match.
 
-1. **Identify and fix the cutlass `kGemm` vs `kGemmSplitKParallel`
-   mismatch.** vllm uses `kGemmSplitKParallel` with `split_k_factor=1`.
-   Ferrite uses `kGemm` because switching crashes flashattention with
-   "unspecified launch failure" (root cause unidentified — same crash
-   on both CUDA 12.0 and 12.9 builds; suspect workspace lifetime or
-   reduction kernel scheduling). Fixing this likely closes most of
-   the remaining test failures.
-2. **Verify the verbatim activation-quant kernel port is byte-perfect
-   against vllm's source.** Current state ports
-   `dynamic_per_token_scaled_fp8_quant_kernel_strided` plus its
-   helpers (`vectorize_with_alignment`, `vectorize_read_with_alignment`,
-   `scaled_fp8_conversion`, `min_scaling_factor`, etc.) into
-   `vllm-rs/crates/vllm-cuda/csrc/fp8_quant_kernels.cu`. Header
-   dependencies are inlined; lines 22-330 of that file should diff
-   cleanly against vllm's `csrc/quantization/w8a8/fp8/common.cu` +
-   four header files. Verify line by line. The build flag
-   `--expt-extended-lambda` is required (added to
-   `ferrite-cuda-builder/build.rs`'s `build_vllm_kernels`).
-3. **Tighten test thresholds back toward 5/10** as kernel drift is
-   closed. Current `threshold=1` is the minimum that catches gross
-   loading/shape bugs while accepting the cutlass-mode drift.
+1. ~~**Identify and fix the cutlass `kGemm` vs `kGemmSplitKParallel`
+   mismatch.**~~ **DONE** (audit follow-up, post-`9e9f0c297`). Ferrite
+   is already on `kGemmSplitKParallel` — the flip landed in Slice-1
+   (`4ebaabd5b`, `scaled_mm_c2x.cuh:133`). The "switching crashes
+   flashattention" wording was historical prose that got copy-pasted
+   into the Slice-1 commit message even though the switch had already
+   landed; no crash reproduces under it now. The remaining threshold=1
+   drift cited by that commit is **ULP-level rounding** inside the
+   scaled_mm wrapper (flips argmax in tight softmax clusters at
+   decode positions 1+). See item 1b for the next-level investigation.
+1b. **ULP-level rounding drift in `cutlass_scaled_mm`** (new, replaces
+    the old #1). Tests at threshold=5 fail on 5/7 FP8-dynamic arches;
+    at threshold=1 all 7 pass. `FERRITE_DISABLE=1` (hand-written
+    path) shows the **same** drift on the same prompts, so the bug
+    lives in the shared CUTLASS C++ wrapper
+    (`ferrite_kernels::layers::Fp8Linear::forward` or
+    `vllm-rs/crates/vllm-cuda/csrc/cutlass_scaled_mm/`), not in
+    ferrite-forward Impls. Prime suspects: tile selection differs
+    from vllm's sm89 dispatch CSV; or epilogue EVT assembly differs;
+    or the workspace-aliasing hazard in item 1c occasionally corrupts
+    the partial-sum buffer.
+1c. **Harden CUTLASS workspace allocation** (latent hazard, not
+    confirmed symptom). `scaled_mm_c2x.cuh:156,169` uses
+    `cudaMallocAsync`/`cudaFreeAsync` on the device's **default
+    mempool** with no `ReleaseThreshold` configured anywhere in
+    ferrite-cuda-core. Upstream uses torch's caching allocator (holds
+    freed blocks indefinitely). Under `kGemmSplitKParallel`, CUTLASS
+    enqueues a partial-GEMM kernel + a reduction kernel on `stream`;
+    `cudaFreeAsync` is stream-ordered, but the default pool may
+    release pages to the OS as soon as the free node completes,
+    allowing a later allocator to reuse the VA range and alias.
+    Fix options: (a) `cudaMemPoolSetAttribute(pool,
+    cudaMemPoolAttrReleaseThreshold, UINT64_MAX)` during init, or
+    (b) route workspace through ferrite's `CachingAllocator` (the
+    right pattern — see the `TensorView`-vs-`OwnedTensor` memory
+    note). (b) is preferred; (a) is a one-line band-aid.
+2. ~~**Verify the verbatim activation-quant kernel port is byte-
+   perfect against vllm's source.**~~ **DONE**
+   (audit, post-`9e9f0c297`). Lines 22-330 of
+   `fp8_quant_kernels.cu` are byte-equivalent to upstream
+   (`csrc/quantization/w8a8/fp8/common.cu` + the 4 headers it
+   includes), modulo comments, namespace nesting, and the correctly-
+   dropped int8 / e4m3fnuz branches. Every helper matches:
+   `__NV_SATFINITE` + `__NV_E4M3` flags, clamp order, CUB reduction,
+   `vec_n_t`, `quant_type_max_v=448.0f`, `min_scaling_factor`,
+   `atomicMaxFloat`, `scaled_fp8_conversion`, both overloads of
+   `vectorize_with_alignment` / `vectorize_read_with_alignment`,
+   `segmented_max_reduction_strided`,
+   `scaled_fp8_quant_kernel_strided_dynamic`,
+   `dynamic_per_token_scaled_fp8_quant_kernel_strided`. **Not ported**
+   (out of current scope): upstream's
+   `scaled_fp8_quant_kernel_strided_group_shape` — only reachable from
+   static-scaled fp8 with group/per-channel/per-token scales, which
+   ferrite doesn't wire yet. Port it if/when that path lights up.
+3. **Tighten test thresholds back toward 5/10** as item 1b closes.
+   Current `threshold=1` is the minimum that catches gross loading /
+   shape bugs while accepting the ULP drift from the scaled_mm
+   wrapper.
 4. **CUDA 12.9 nvcc is required** for FP8 kernels — CUDA 12.0
    doesn't define `CUTLASS_ARCH_MMA_F32_SM89_SUPPORTED` and the
    FP8 MMA template falls into a `CUTLASS_NOT_IMPLEMENTED()` brkpt.

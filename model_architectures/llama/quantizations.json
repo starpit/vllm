@@ -1,6 +1,7 @@
 {
   "quantizations": [
     "awq-gemm",
+    "bnb-nf4-dq",
     "gptq-sym",
     "gptq-sym-desc_act",
     "ct-int4-sym",

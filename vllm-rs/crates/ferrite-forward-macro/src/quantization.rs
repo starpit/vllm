@@ -445,10 +445,21 @@ fn parse_compressed_tensors(
             .get("symmetric")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        // `actorder` carries compressed-tensors' version of desc_act.
+        // "null" / absent = no activation reordering (TinyLlama-W4A16-e2e);
+        // "group" / "weight" = activation-ordered, ships a non-identity
+        // `.weight_g_idx` tensor (RedHatAI/Qwen2.5-*-quantized.w4a16 and
+        // other desc_act=true-via-AutoGPTQ-then-repacked checkpoints).
+        // Without this the loader reads the permuted weight but skips
+        // the permutation → garbage output.
+        let desc_act = matches!(
+            weights.get("actorder").and_then(|v| v.as_str()),
+            Some("group") | Some("weight")
+        );
         return Ok(QuantMethod::Gptq {
             bits: 4,
             group_size,
-            desc_act: false,
+            desc_act,
             sym,
             layout: GptqLayout::WeightPacked,
         });

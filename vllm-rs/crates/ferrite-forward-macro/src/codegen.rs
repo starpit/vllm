@@ -8358,6 +8358,123 @@ mod tests {
             );
         }
 
+        /// Off-by-one-layer correctness bug pin (2026-04-23).
+        ///
+        /// **Runtime symptom**: `vllm chat` on llama-3.2-3b under
+        /// `FERRITE_STENCIL_CODEGEN=1` produces incoherent token
+        /// output (no panic). Root cause: `class_input_provenance`
+        /// misclassifies the QKV class's "normed" boundary input
+        /// as `LoopCarry { producer: c8 }` when it should be a
+        /// same-iter read with a pre-loop override for the iter-0
+        /// case.
+        ///
+        /// **Concrete trace** (FAR_DECODER, llama-3.2-1b):
+        /// - c2 = QKV+rope class (period=16, offset=0).
+        /// - c8 = pre-attn FAR (period=15, offset=1). Produces
+        ///   layer R's normed output at `__repeat=R`.
+        /// - c2@R reads "normed" for layer R's QKV. Semantically
+        ///   wants c8@R's rmsnorm_out (same `__repeat`).
+        /// - Current emitter classifies as LoopCarry Δ=1 → c2@R
+        ///   reads c8@(R-1) = layer (R-1)'s normed. **QKV at every
+        ///   layer runs on the previous layer's normed** = garbage.
+        ///
+        /// **Why the misclassification**: `paired_periodic_for_slot`
+        /// at line ~3274 walks member[0] (layer 0 QKV, reads pre-loop
+        /// standalone rmsnorm) and member[1] (layer 1 QKV, reads c8's
+        /// rmsnorm_out), pairs them as "pre-loop init at iter 0 +
+        /// periodic producer at iter ≥ 1", and wraps as LoopCarry.
+        /// The wrap doesn't check whether `offset(producer) >
+        /// offset(consumer)`. For c2 (offset 0) reading c8 (offset 1)
+        /// — where producer fires one `__repeat` AFTER consumer at
+        /// the minimum aligned iter, the right semantics are
+        /// IntraIter-same-iter (with producer forced to schedule
+        /// before consumer in loop body) plus a pre-loop override
+        /// for `__repeat < offset(producer)`.
+        ///
+        /// **Fix scope** (not landed yet): needs (a) new InputOrigin
+        /// variant or extended IntraIter w/ `pre_loop_init_sg`,
+        /// (b) provenance walker distinguishes by offset relation,
+        /// (c) schedule adds IntraIter edges so producer→consumer
+        /// ordering is enforced, (d) emitter guards the read as
+        /// `if __repeat < offset { pre_loop } else { intra_iter }`.
+        ///
+        /// This test is **#[ignore]-red** until the fix lands.
+        /// Remove the ignore when it should pass.
+        #[test]
+        #[ignore = "off-by-one-layer fix not yet landed — documented in test body"]
+        fn far_decoder_qkv_class_reads_far_same_iter() {
+            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
+            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
+            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
+            let prov = stencil
+                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
+                .expect("provenance ok");
+
+            // Locate the QKV+rope class (ops = [Gemm, Gemm, Gemm,
+            // RopeAppend], period = max_period) — this is c2 in
+            // today's emission.
+            let qkv_class = sched
+                .periodic
+                .iter()
+                .copied()
+                .find(|&c| {
+                    let rep = stencil.class_members[c][0];
+                    let claimed = s.sfuf.tiles_in_subgraph(rep);
+                    let ops: Vec<_> = claimed.iter().map(|t| s.fuf.get(*t).op).collect();
+                    ops.len() >= 4
+                        && matches!(ops[0], crate::classified::OpKind::Gemm)
+                        && matches!(ops[1], crate::classified::OpKind::Gemm)
+                        && matches!(ops[2], crate::classified::OpKind::Gemm)
+                        && matches!(ops[3], crate::classified::OpKind::RopeAppend)
+                })
+                .expect("QKV+rope class must exist in FAR_DECODER");
+            let ci = prov
+                .iter()
+                .find(|ci| ci.consumer_class == qkv_class)
+                .expect("QKV class has provenance entry");
+
+            // The "normed" boundary input — produced by a FAR class
+            // (Add, RmsNorm). Pattern: its origin must NOT be a
+            // LoopCarry Δ=1 from the pre-attn FAR class, because
+            // that means QKV reads layer (R-1)'s normed instead of
+            // layer R's. IntraIter semantics required.
+            let mut bad_slots: Vec<String> = Vec::new();
+            for (i, slot) in ci.slots.iter().enumerate() {
+                if let InputOrigin::LoopCarry {
+                    producer_class,
+                    pre_loop_init_sg: Some(_),
+                    ..
+                } = &slot.origin
+                {
+                    let pc = *producer_class;
+                    let prep = stencil.class_members[pc][0];
+                    let pclaimed = s.sfuf.tiles_in_subgraph(prep);
+                    let pops: Vec<_> = pclaimed.iter().map(|t| s.fuf.get(*t).op).collect();
+                    // Is producer a FAR (Add, RmsNorm)?
+                    let is_far = pops.len() == 2
+                        && matches!(pops[0], crate::classified::OpKind::Add)
+                        && matches!(pops[1], crate::classified::OpKind::RmsNorm);
+                    if is_far && sched.class_offsets[pc] > sched.class_offsets[qkv_class] {
+                        bad_slots.push(format!(
+                            "slot[{i}] origin=LoopCarry from FAR class c{pc} \
+                             (offset {} > consumer offset {}) — should be \
+                             IntraIter same-iter, not cross-iter",
+                            sched.class_offsets[pc], sched.class_offsets[qkv_class],
+                        ));
+                    }
+                }
+            }
+            assert!(
+                bad_slots.is_empty(),
+                "QKV class boundary inputs misclassified as LoopCarry from \
+                 later-offset FAR class — consumer ends up reading \
+                 previous layer's normed. Fix needed in \
+                 `class_input_provenance` to produce IntraIter w/ \
+                 pre-loop override when offset(producer) > offset(consumer). \
+                 Misclassifications: {bad_slots:?}"
+            );
+        }
+
         /// Structural pin against the 5i.5 alias-through-carry
         /// initialization gap.
         ///

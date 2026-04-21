@@ -349,7 +349,7 @@ pub unsafe fn cutlass_gemm(
             stream as u64,
         )
     };
-    debug_assert_eq!(rc, 0, "cutlass_gemm {:?} returned {}", tile, rc);
+    assert_eq!(rc, 0, "cutlass_gemm {:?} M={m} N={n} K={k} returned {rc}", tile);
     out
 }
 

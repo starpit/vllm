@@ -172,9 +172,11 @@ impl<'a> EmitCtx<'a> {
         // definition and the `Weights::load` method, so the caller
         // never writes weight-bookkeeping code. Consult the layout
         // to pick array-indexed access for accessors folded into
-        // family fields; orphans fall back to the flat ident.
+        // family fields; orphans fall back to the flat ident. When
+        // `repeat_var` is set (collapsed-path inline emission inside
+        // a class loop), family members rewrite to `stem[#repeat]`.
         let access = match self.weight_layout {
-            Some(layout) => layout.access_tokens(name),
+            Some(layout) => layout.access_tokens_with_repeat(name, self.repeat_var.as_ref()),
             None => quote! { #name },
         };
         quote! { wm.#access }
@@ -332,7 +334,9 @@ impl<'a> EmitCtx<'a> {
                 }
                 let name = weight_field_name(self.program, *id, *index);
                 let access = match self.weight_layout {
-                    Some(layout) => layout.access_tokens(&name),
+                    Some(layout) => {
+                        layout.access_tokens_with_repeat(&name, self.repeat_var.as_ref())
+                    }
                     None => quote! { #name },
                 };
                 quote! { wm.#access }

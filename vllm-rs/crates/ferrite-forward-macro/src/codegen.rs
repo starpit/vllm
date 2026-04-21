@@ -3365,6 +3365,38 @@ fn can_fragmentize_collapsed(
     !claimed.is_empty()
 }
 
+/// Collapsed-mode aliased-inline gate (§14.2). True when every
+/// `output_alias` entry points at a BOUNDARY input tile (not another
+/// claimed tile) and the impl doesn't consume any input. Such impls
+/// (`FusedAddRmsNormImpl`, `FusedAddRmsNormWithOffsetImpl`, `AddRefImpl`)
+/// can't be lifted through a fragment fn — their outputs are
+/// `TensorView<'_>` aliases that would need lifetime-tied fn signatures
+/// — so the collapsed emitter inlines their emit_call body directly
+/// inside the loop, with a custom local map redirecting the rep's
+/// boundary tile idents to the collapsed-path per-export idents (carry
+/// vars / intra-iter class outputs).
+fn is_aliased_emittable(
+    imp: &dyn crate::impl_lib::Implementation,
+    claimed: &[TileId],
+    fuf: &Fuf,
+) -> bool {
+    if claimed.is_empty() {
+        return false;
+    }
+    if !imp.consumes_input_tiles(claimed, fuf).is_empty() {
+        return false;
+    }
+    let aliases = imp.output_alias(claimed, fuf);
+    if aliases.is_empty() {
+        return false;
+    }
+    let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+    aliases.iter().all(|(_, src)| match src {
+        Some((src_tile, _)) => !claimed_set.contains(src_tile),
+        None => false,
+    })
+}
+
 /// Emit one subgraph. Uses the fragment library when the subgraph's
 /// impl is "clean" (no aliased / consumed outputs); falls back to
 /// inline emission otherwise.
@@ -3999,11 +4031,17 @@ fn try_emit_collapsed_bucket(
     };
 
     // Every periodic class's rep must be fragmentizable + have no
-    // consumed input tiles. Multi-output tiles (rope_append producing
-    // q/k/v; fused QKV-rope family) are OK: the fragment returns a
-    // tuple over the slots actually referenced by downstream consumers,
-    // per-export idents let call sites bind each. See `referenced_exports`
-    // + `owned_exports` computation below.
+    // consumed input tiles — OR qualify for the aliased-inline path
+    // (`is_aliased_emittable`, §14.2). Multi-output tiles (rope_append
+    // producing q/k/v; fused QKV-rope family) are OK on the fragment
+    // path: the fragment returns a tuple over the slots actually
+    // referenced by downstream consumers, per-export idents let call
+    // sites bind each. Aliased-emittable classes (FusedAddRmsNormImpl
+    // family) refuse fragmentization because their outputs are views
+    // that would need lifetime-tied fn signatures; the emitter inlines
+    // their emit_call instead and skips end-of-iter carry assignment
+    // for alias-through-carry outputs (see `alias_through_carries`).
+    let mut aliased_classes: BTreeSet<usize> = BTreeSet::new();
     for &c in &sched.periodic {
         let rep = *stencil
             .class_members
@@ -4018,19 +4056,83 @@ fn try_emit_collapsed_bucket(
             .ok_or_else(|| format!("class {c} has no homogeneous impl"))?;
         let imp = lib.get(imp_id);
         let claimed = sfuf.tiles_in_subgraph(rep);
+        let fragmentizable = imp.consumes_input_tiles(&claimed, fuf).is_empty()
+            && can_fragmentize_collapsed(imp, &claimed, fuf);
+        if fragmentizable {
+            continue;
+        }
+        if is_aliased_emittable(imp, &claimed, fuf) {
+            aliased_classes.insert(c);
+            continue;
+        }
         if !imp.consumes_input_tiles(&claimed, fuf).is_empty() {
             return Err(format!("class {c} rep impl consumes input tiles"));
         }
-        if !can_fragmentize_collapsed(imp, &claimed, fuf) {
-            return Err(format!("class {c} rep not fragmentizable"));
-        }
+        return Err(format!("class {c} rep not fragmentizable"));
     }
 
     // Pre/post loop classes must be period-1 (analysis already does
-    // this but assert defensively).
+    // this but assert defensively). An aliased-emittable pre/post-loop
+    // class is emitted via `emit_subgraph`'s Concrete inline fallback,
+    // which resolves boundary idents through the default
+    // `t_<tile>_<slot>` LocalMap. That only works if the producer
+    // subgraph has already been emitted in the enclosing scope:
+    // pre_loop classes need upstream producers in `pre_loop` (emitted
+    // before them); post_loop classes can also read from `periodic`
+    // (promoted to outer-scope lets by the per-export post-ref
+    // bindings) or `pre_loop` (emitted long before the loop). Refuse
+    // when a dependency crosses into the forbidden partition.
+    let pre_loop_set: BTreeSet<usize> = sched.pre_loop.iter().copied().collect();
+    let post_loop_set: BTreeSet<usize> = sched.post_loop.iter().copied().collect();
+    let periodic_set_pre: BTreeSet<usize> = sched.periodic.iter().copied().collect();
     for &c in sched.pre_loop.iter().chain(sched.post_loop.iter()) {
         if stencil.class_members[c].len() != 1 {
             return Err(format!("pre/post_loop class {c} has period > 1"));
+        }
+        let sg = stencil.class_members[c][0];
+        let imp_id = sfuf
+            .impl_of(sg)
+            .ok_or_else(|| format!("pre/post class {c} sg has no impl"))?;
+        let imp = lib.get(imp_id);
+        let claimed = sfuf.tiles_in_subgraph(sg);
+        if !is_aliased_emittable(imp, &claimed, fuf)
+            || can_fragmentize_collapsed(imp, &claimed, fuf)
+        {
+            continue;
+        }
+        let is_pre = pre_loop_set.contains(&c);
+        let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+        for &t in &claimed {
+            for input in &fuf.get(t).inputs {
+                if let FufInput::Tile { id, .. } = input
+                    && !claimed_set.contains(id)
+                {
+                    let Some(producer_sg) = sfuf.subgraph_of(*id) else {
+                        continue;
+                    };
+                    let Some(&producer_class) = stencil.class_of.get(&producer_sg) else {
+                        continue;
+                    };
+                    let ok = if is_pre {
+                        pre_loop_set.contains(&producer_class)
+                    } else {
+                        // post_loop can pull from pre_loop (outer lets
+                        // established long before) or periodic (post-
+                        // ref bindings land the final-iter value into
+                        // the enclosing scope). Another post_loop
+                        // class is OK if already emitted in schedule
+                        // order; accept conservatively.
+                        pre_loop_set.contains(&producer_class)
+                            || periodic_set_pre.contains(&producer_class)
+                            || post_loop_set.contains(&producer_class)
+                    };
+                    if !ok {
+                        return Err(format!(
+                            "pre/post_loop class {c} aliased impl depends on class {producer_class} in a forbidden partition"
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -4184,6 +4286,32 @@ fn try_emit_collapsed_bucket(
     }
 
     for &c in &sched.periodic {
+        if aliased_classes.contains(&c) {
+            // Aliased-emittable classes expose every `output_alias`
+            // entry (src=None OR src=Some) as `__cC_out_<pos>_<slot>`
+            // bindings. A referenced export is legal iff some alias
+            // entry targets the same (pos, slot).
+            let rep = stencil.class_members[c][0];
+            let claimed = sfuf.tiles_in_subgraph(rep);
+            let imp_id =
+                stencil.class_impl_id[c].ok_or_else(|| format!("class {c} has no impl"))?;
+            let imp = lib.get(imp_id);
+            let aliases = imp.output_alias(&claimed, fuf);
+            let exported: BTreeSet<(u8, u8)> = aliases
+                .iter()
+                .filter_map(|((t, s), _)| {
+                    claimed.iter().position(|x| x == t).map(|p| (p as u8, *s))
+                })
+                .collect();
+            for &(pos, slot) in &referenced_exports[c] {
+                if !exported.contains(&(pos, slot)) {
+                    return Err(format!(
+                        "aliased class {c} pos {pos} slot {slot} referenced but not listed in output_alias"
+                    ));
+                }
+            }
+            continue;
+        }
         let owned = class_owned_exports(stencil, sfuf, fuf, lib, c);
         for &(pos, slot) in &referenced_exports[c] {
             if !owned.contains(&(pos, slot)) {
@@ -4192,6 +4320,97 @@ fn try_emit_collapsed_bucket(
                 ));
             }
         }
+    }
+
+    // ── alias-through-carries ────────────────────────────────────
+    // For each aliased class c, walk `output_alias` entries that
+    // target a boundary input tile. If that boundary's provenance is
+    // a LoopCarry whose producer is in `carry_producers`, the inline
+    // kernel mutates the carry buffer in place — the end-of-iter
+    // `__carry = __cC_out_P_S` update is both redundant (the buffer
+    // already holds the next iter's value) and a type error
+    // (`__cC_out_P_S: TensorView<'_>` vs `__carry: OwnedTensor`).
+    // Track these for the carry-update loop to skip.
+    let mut alias_through_carries: BTreeSet<(usize, u8, u8)> = BTreeSet::new();
+    for &c in &aliased_classes {
+        let rep = stencil.class_members[c][0];
+        let claimed = sfuf.tiles_in_subgraph(rep);
+        let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+        let imp_id = stencil.class_impl_id[c].ok_or_else(|| format!("class {c} has no impl"))?;
+        let imp = lib.get(imp_id);
+        let aliases = imp.output_alias(&claimed, fuf);
+        // Rebuild the rep's boundary-input ordering to match provenance.
+        let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+        let mut seen: HashSet<(TileId, u8)> = HashSet::new();
+        for &t in &claimed {
+            for input in &fuf.get(t).inputs {
+                if let FufInput::Tile { id, slot } = input
+                    && !claimed_set.contains(id)
+                    && seen.insert((*id, *slot))
+                {
+                    tile_params_ordered.push((*id, *slot));
+                }
+            }
+        }
+        let ci = provenance
+            .iter()
+            .find(|ci| ci.consumer_class == c)
+            .ok_or_else(|| format!("aliased class {c} missing provenance entry"))?;
+        for ((_out_tile, _out_slot), src) in aliases.iter() {
+            let Some((src_tile, src_slot)) = src else {
+                continue;
+            };
+            let Some(bidx) = tile_params_ordered
+                .iter()
+                .position(|(t, s)| t == src_tile && s == src_slot)
+            else {
+                continue;
+            };
+            let s = &ci.slots[bidx];
+            if let InputOrigin::LoopCarry {
+                producer_class,
+                producer_pos,
+                ..
+            } = &s.origin
+            {
+                let key = (*producer_class, *producer_pos, s.producer_slot);
+                if carry_producers.contains(&key) {
+                    alias_through_carries.insert(key);
+                }
+            }
+        }
+    }
+
+    // Aliased classes don't currently support post-loop consumption:
+    // their exports bind as `TensorView<'_>` which doesn't fit the
+    // `Option<OwnedTensor>` dedicated-last pattern.
+    for &(c, pos, slot) in &dedicated_last {
+        if aliased_classes.contains(&c) {
+            return Err(format!(
+                "aliased class {c} pos {pos} slot {slot} referenced post-loop — unsupported"
+            ));
+        }
+    }
+
+    // Aliased exports only need `__cC_out_<pos>_<slot>` bindings for
+    // IntraIter or post-loop consumers. LoopCarry-only exports feed
+    // through `__carry_cC_p<pos>_s<slot>` (which the in-place kernel
+    // mutates via `alias_through_carries`), so we skip any per-iter
+    // __cC_out for them.
+    let mut aliased_intraiter_exports: BTreeSet<(usize, u8, u8)> = BTreeSet::new();
+    for ci in provenance {
+        for s in &ci.slots {
+            if let InputOrigin::IntraIter {
+                producer_class,
+                producer_pos,
+            } = &s.origin
+            {
+                aliased_intraiter_exports.insert((*producer_class, *producer_pos, s.producer_slot));
+            }
+        }
+    }
+    for &(pc, pos, slot) in post_refs.keys() {
+        aliased_intraiter_exports.insert((pc, pos, slot));
     }
 
     // Per-class ordered returned exports list (sorted by (pos, slot)),
@@ -4303,13 +4522,29 @@ fn try_emit_collapsed_bucket(
     // carry-target moves + post-loop reads). Re-assigned on each
     // guarded firing; `.take()` at carry/last update sites. One hoist
     // per (class, referenced_export) — multi-export short classes get
-    // one Option per (pos, slot).
+    // one Option per (pos, slot). Full aliased classes emit the
+    // `__cC_out_P_S: TensorView = ...` binding directly per iter (no
+    // hoist). Short aliased classes hoist `Option<GpuTensor>` (the
+    // raw descriptor the inline kernel aliases into) — only for
+    // IntraIter/post-loop consumers, since LoopCarry-only exports
+    // flow through the carry var and need no __cC_out.
     for &c in &short_classes {
+        let is_aliased = aliased_classes.contains(&c);
         for &(pos, slot) in &class_returned_exports[c] {
-            let out = class_out_ident(c, pos, slot);
-            body.push(quote! {
-                let mut #out: ::std::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> = None;
-            });
+            if is_aliased {
+                if !aliased_intraiter_exports.contains(&(c, pos, slot)) {
+                    continue;
+                }
+                let out = class_out_ident(c, pos, slot);
+                body.push(quote! {
+                    let mut #out: ::std::option::Option<::ferrite_cuda_core::GpuTensor> = None;
+                });
+            } else {
+                let out = class_out_ident(c, pos, slot);
+                body.push(quote! {
+                    let mut #out: ::std::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> = None;
+                });
+            }
         }
     }
 
@@ -4319,6 +4554,31 @@ fn try_emit_collapsed_bucket(
             .get(&c)
             .copied()
             .ok_or_else(|| format!("class {c} missing provenance entry"))?;
+        if aliased_classes.contains(&c) {
+            let is_short = short_classes.contains(&c);
+            let tokens = emit_aliased_class_inline(
+                c,
+                ci,
+                stencil,
+                fuf,
+                sfuf,
+                program,
+                model,
+                lib,
+                &locals,
+                weight_layout,
+                &carry_producers,
+                &carries_with_init,
+                is_short,
+                sched.class_offsets[c],
+                stencil.class_members[c].len(),
+                &aliased_intraiter_exports,
+                &short_classes,
+                &aliased_classes,
+            )?;
+            loop_body.push(tokens);
+            continue;
+        }
         let offset = sched.class_offsets[c];
         let period = stencil.class_members[c].len();
         let is_short = short_classes.contains(&c);
@@ -4418,6 +4678,14 @@ fn try_emit_collapsed_bucket(
     // Keyed per (producer_class, producer_pos, producer_slot) — each
     // carried export reads its own `__cC_out_P_S` binding.
     for &(pc, pos, slot) in &carry_producers {
+        // Alias-through-carry: the in-place kernel for this carry's
+        // producing class already mutated the carry's backing buffer
+        // during its emit_call, so the end-of-iter reassignment is
+        // both redundant and a type mismatch (`__cC_out_P_S:
+        // TensorView` vs `__carry: OwnedTensor`).
+        if alias_through_carries.contains(&(pc, pos, slot)) {
+            continue;
+        }
         let carry = carry_var_ident(pc, pos, slot);
         let c_out = class_out_ident(pc, pos, slot);
         let has_init = carries_with_init.contains(&(pc, pos, slot));
@@ -4847,6 +5115,254 @@ fn emit_fragment_call_expr(
                 ctx,
                 device,
             )
+        }
+    })
+}
+
+/// Aliased-inline emission for one periodic class (§14.2).
+///
+/// Aliased-emittable impls (`FusedAddRmsNormImpl` family) mutate their
+/// inputs in place and expose outputs as `TensorView<'_>` aliases — a
+/// shape fragment fns can't return without lifetime parameters. The
+/// collapsed emitter inlines the impl's `emit_call` directly inside
+/// the loop body, with a custom local map that redirects the rep's
+/// boundary tile idents to the collapsed-path per-export idents
+/// (carry vars / intra-iter class outputs / pre-loop locals).
+///
+/// The inline body typically expands to:
+///
+/// ```ignore
+/// unsafe { fused_add_rms_norm_inplace(*<delta_ident>, *<residual_ident>, ...); }
+/// let __cC_out_<rms_pos>_0 = unsafe { (*<delta_ident>).as_view() };
+/// let __cC_out_<add_pos>_0 = unsafe { (*<residual_ident>).as_view() };
+/// ```
+///
+/// Callers must have populated `carry_producers` / `carries_with_init`
+/// before invoking this helper — a LoopCarry-origin boundary whose
+/// producer key is absent from `carry_producers` is a refusal.
+#[allow(clippy::too_many_arguments)]
+fn emit_aliased_class_inline(
+    c: usize,
+    class_inputs: &ClassInputs,
+    stencil: &StencilBundle,
+    fuf: &Fuf,
+    sfuf: &Assignment,
+    program: &Program,
+    model: &ModelParams,
+    lib: &ImplementationLibrary,
+    locals: &LocalMap,
+    weight_layout: &crate::emit::WeightLayout,
+    carry_producers: &BTreeSet<(usize, u8, u8)>,
+    carries_with_init: &BTreeSet<(usize, u8, u8)>,
+    is_short: bool,
+    offset: usize,
+    period: usize,
+    intraiter_refs: &BTreeSet<(usize, u8, u8)>,
+    short_classes: &BTreeSet<usize>,
+    _aliased_classes: &BTreeSet<usize>,
+) -> Result<TokenStream, String> {
+    let rep_sg = class_inputs.rep_sg;
+    let imp_id =
+        stencil.class_impl_id[c].ok_or_else(|| format!("aliased class {c} not homogeneous"))?;
+    let imp = lib.get(imp_id);
+    let claimed = sfuf.tiles_in_subgraph(rep_sg);
+    let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+
+    // Boundary tile-input ordering must mirror what
+    // `class_input_provenance` produced so provenance.slots[i] aligns
+    // with tile_params_ordered[i].
+    let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
+    let mut seen: HashSet<(TileId, u8)> = HashSet::new();
+    for &t in &claimed {
+        for input in &fuf.get(t).inputs {
+            if let FufInput::Tile { id, slot } = input
+                && !claimed_set.contains(id)
+                && seen.insert((*id, *slot))
+            {
+                tile_params_ordered.push((*id, *slot));
+            }
+        }
+    }
+    if tile_params_ordered.len() != class_inputs.slots.len() {
+        return Err(format!(
+            "aliased class {c}: boundary input count mismatch (emit={}, provenance={})",
+            tile_params_ordered.len(),
+            class_inputs.slots.len()
+        ));
+    }
+
+    // Build the inline local map: overridden per-boundary idents plus
+    // per-claimed-tile output idents (`__cC_out_<pos>_<slot>`).
+    // Some origin kinds need a prelude unwrap before emit_call can
+    // consume the boundary via `*#ident` (Option<OwnedTensor> carries
+    // from period-mismatched consumers; Option<GpuTensor> from a
+    // short-aliased IntraIter producer). The prelude binds a
+    // `TensorView<'_>` ident that derefs to `GpuTensor` uniformly.
+    let mut inline_locals: LocalMap = locals.clone();
+    let mut prelude: Vec<TokenStream> = Vec::new();
+    for (i, slot) in class_inputs.slots.iter().enumerate() {
+        let (btile, bslot) = tile_params_ordered[i];
+        let repl = match &slot.origin {
+            InputOrigin::IntraIter {
+                producer_class,
+                producer_pos,
+            } => {
+                let c_out = class_out_ident(*producer_class, *producer_pos, slot.producer_slot);
+                if short_classes.contains(producer_class) {
+                    // Short producer: `__cN_out: Option<_>`. Unwrap
+                    // into a TensorView so emit_call's `*#ident`
+                    // pattern works uniformly. `.as_view()` is
+                    // available on both `&OwnedTensor` (via Deref)
+                    // and `&GpuTensor`.
+                    let view = format_ident!(
+                        "__intra_view_c{}_p{}_s{}",
+                        producer_class,
+                        producer_pos,
+                        slot.producer_slot
+                    );
+                    let expect_msg = proc_macro2::Literal::string(&format!(
+                        "aliased inline: short intra-iter producer c{} p{} s{} None",
+                        producer_class, producer_pos, slot.producer_slot
+                    ));
+                    prelude.push(quote! {
+                        let #view = unsafe {
+                            #c_out
+                                .as_ref()
+                                .expect(#expect_msg)
+                                .as_view()
+                        };
+                    });
+                    view
+                } else {
+                    c_out
+                }
+            }
+            InputOrigin::LoopCarry {
+                producer_class,
+                producer_pos,
+                ..
+            } => {
+                let key = (*producer_class, *producer_pos, slot.producer_slot);
+                if !carry_producers.contains(&key) {
+                    return Err(format!(
+                        "aliased class {c}: carry producer {key:?} missing from carry set"
+                    ));
+                }
+                let carry = carry_var_ident(*producer_class, *producer_pos, slot.producer_slot);
+                if carries_with_init.contains(&key) {
+                    carry
+                } else {
+                    // `__carry: Option<OwnedTensor>`. Unwrap into a
+                    // TensorView bound locally so emit_call's
+                    // `*#ident` and `(*#ident).as_view()` patterns
+                    // work uniformly. The `unsafe` is required by
+                    // `GpuTensor::as_view`.
+                    let view = format_ident!(
+                        "__carry_view_c{}_p{}_s{}",
+                        producer_class,
+                        producer_pos,
+                        slot.producer_slot
+                    );
+                    prelude.push(quote! {
+                        let #view = unsafe {
+                            #carry
+                                .as_ref()
+                                .expect("aliased inline: init-less carry read before producer fired")
+                                .as_view()
+                        };
+                    });
+                    view
+                }
+            }
+            InputOrigin::PreLoop { .. } => locals
+                .get(&(slot.producer_tile, slot.producer_slot))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "aliased class {c}: PreLoop local for ({:?}, {}) missing",
+                        slot.producer_tile, slot.producer_slot
+                    )
+                })?,
+        };
+        inline_locals.insert((btile, bslot), repl);
+    }
+
+    // Override each claimed tile's output slots to the right ident.
+    // Full class: map directly to `__cC_out_<pos>_<slot>` so emit_call's
+    // `let #out = ...` binds the per-iter TensorView that downstream
+    // IntraIter consumers read in the same iter body. Short class:
+    // map to per-iter temp idents `__alias_tmp_cC_p<P>_s<S>`; after
+    // the body we assign each IntraIter/post-loop-referenced export
+    // into the hoisted `Option<GpuTensor>` so reads outside the guard
+    // still resolve (existing short-class reader uses
+    // `.as_ref().expect(...).as_view()`, which works identically for
+    // `Option<GpuTensor>` and `Option<OwnedTensor>`).
+    let output_ident = |pos: u8, slot: u8| -> syn::Ident {
+        if is_short {
+            format_ident!("__alias_tmp_c{}_p{}_s{}", c, pos, slot)
+        } else {
+            class_out_ident(c, pos, slot)
+        }
+    };
+    for (pos, &t) in claimed.iter().enumerate() {
+        let node = fuf.get(t);
+        let nslots = node.outputs.len().max(1) as u8;
+        for s in 0..nslots {
+            inline_locals.insert((t, s), output_ident(pos as u8, s));
+        }
+    }
+
+    let repeat_tokens = quote! { __repeat };
+    let ctx = EmitCtx {
+        fuf,
+        program,
+        model,
+        claimed_tiles: &claimed,
+        locals: &inline_locals,
+        mode: EmitMode::Concrete,
+        weight_layout: Some(weight_layout),
+        repeat_var: Some(repeat_tokens),
+    };
+    let body = imp.emit_call(&ctx);
+    if !is_short {
+        return Ok(quote! {
+            #( #prelude )*
+            #body
+        });
+    }
+
+    // Short aliased: wrap in `if __repeat >= offset && __repeat < offset + period { .. }`
+    // and assign each intraiter-referenced export's temp TensorView
+    // into the hoisted `Option<GpuTensor>` (via `.as_raw()`).
+    let off_lit = proc_macro2::Literal::usize_unsuffixed(offset);
+    let per_lit = proc_macro2::Literal::usize_unsuffixed(period);
+    let mut assigns: Vec<TokenStream> = Vec::new();
+    for (pos, _t) in claimed.iter().enumerate() {
+        let pos_u8 = pos as u8;
+        // Every claimed tile has at least slot 0. Intraiter-referenced
+        // exports always target slot indices that appear in the impl's
+        // output_alias list; since aliased impls used today only
+        // expose slot 0 per claimed tile, iterating slot 0 covers
+        // every referenced export without needing an output_alias
+        // walk here. (If a future aliased impl exposes slot > 0, the
+        // referenced-export set will name that slot and the loop
+        // below will miss it — add an output_alias walk then.)
+        for s in 0u8..1 {
+            if !intraiter_refs.contains(&(c, pos_u8, s)) {
+                continue;
+            }
+            let tmp = output_ident(pos_u8, s);
+            let out = class_out_ident(c, pos_u8, s);
+            assigns.push(quote! {
+                #out = ::std::option::Option::Some(#tmp.as_raw());
+            });
+        }
+    }
+    Ok(quote! {
+        if __repeat >= #off_lit && __repeat < #off_lit + #per_lit {
+            #( #prelude )*
+            #body
+            #( #assigns )*
         }
     })
 }

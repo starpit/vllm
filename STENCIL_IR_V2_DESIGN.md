@@ -402,50 +402,88 @@ None of these are show-stoppers without investigation, but each is worth measuri
 **What's landed**: 6.1, 6.2.a, 6.2.b.1–4, 6.2.b.5a–e (collapsed
 emitter), 6.2.b.5f (p1 period-mismatch offsets), 6.2.b.5g (multi-
 output periodic classes), 6.2.b.5j (edge-pattern-driven class
-refinement), **6.2.b.5i.1 (per-export key refactor — prereq for 5i
-proper; commit `cc6a4c76c`, 2026-04-21)**. `cargo check -p
-ferrite-models --features cuda` with `FERRITE_STENCIL_CODEGEN=1` is
-clean across all 218 variants; collapsed path fires on 3 commandr
-variants (degenerate empty-loop). Every other variant hits
-`unimplemented!()` with a specific refusal reason.
+refinement), 6.2.b.5i.1 (per-export key refactor), **6.2.b.5i.2
+(aliased-inline emission for periodic classes — full + short,
+alias-through-carry bypass, init-less-carry unwrap prelude;
+2026-04-21)**. `cargo check -p ferrite-models --features cuda` with
+`FERRITE_STENCIL_CODEGEN=1` is clean across all 218 variants;
+collapsed path fires on 3 commandr variants (degenerate empty-loop).
+llama / mistral / phi3 / qwen2 now refuse at a narrower gate:
+`pre/post_loop class N aliased impl depends on class M in a
+forbidden partition` — the layer-0 and/or layer-N-1 FusedAddRmsNorm
+that the refinement peels into pre_loop/post_loop classes whose
+boundary inputs (the attention output of layer 0, or the `down`
+projection of layer N-1) live in periodic classes. Other fleets
+unchanged (gemma*/granite: `offsets_consistent=false`; qwen3:
+`uniform_pairs=false`).
 
-**5i.1 landed — what it did, what's next:**
+**5i.1 + 5i.2 landed — what remains:**
 
 5i.1 is the §14.1 per-export refactor: every `(class, slot)` key in
 the collapsed emitter's bookkeeping is now `(class, pos, slot)`, and
 `InputOrigin::{IntraIter, LoopCarry}` carry `producer_pos: u8`
 resolved at provenance-build time. Idents renamed:
 `__cC_out_<pos>_<slot>`, `__carry_cC_p<pos>_s<slot>`,
-`__last_cC_p<pos>_s<slot>`. No behavior change — commandr happy path
-stays byte-identical (empty loop emits no class idents at all).
-Every llama-fleet variant still refuses at `class N rep not
-fragmentizable`, same reason as before.
+`__last_cC_p<pos>_s<slot>`.
 
-Next session picks up at **§14.2 inline aliased emission** — the 5i
-proper work. The refactor has already plumbed producer_pos through
-every site that would have collided on `(class=8, slot=0)` in
-`FusedAddRmsNormImpl`'s two exports, so the new inline helper can
-key the rmsnorm export (pos=1) separately from the add export
-(pos=0, a carry target). Scope from §14.2:
+5i.2 is §14.2 aliased-inline emission: `is_aliased_emittable(imp,
+claimed, fuf)` gates the `FusedAddRmsNormImpl` /
+`FusedAddRmsNormWithOffsetImpl` / `AddRefImpl` family;
+`emit_aliased_class_inline` inlines their `emit_call` directly
+inside the loop body with a LocalMap that redirects boundary tile
+idents to the collapsed-path per-export idents (carry vars /
+intra-iter class outputs / pre-loop locals). Handles both full and
+short (offset>0 or period<max) aliased classes: full emits
+`let __cC_out_P_S = (*...).as_view()` inline (TensorView is Copy and
+derefs to GpuTensor, so downstream `(*#c_out).as_view()` reads work
+uniformly); short hoists `Option<GpuTensor>` outside the loop,
+guards the inline body on `__repeat >= offset && __repeat <
+offset+period`, and writes `__cC_out_P_S = Some(tmp.as_raw())` to
+feed later-iter consumers. Init-less LoopCarry boundaries
+(`Option<OwnedTensor>` hoist, shifted-carry p1 shape) are handled
+via a prelude that unwraps into a `TensorView<'_>` alias bound
+locally. Alias-through-carry: for each `output_alias` entry
+targeting a LoopCarry boundary whose producer is in
+`carry_producers`, the end-of-iter `__carry = __cC_out_P_S` reassign
+is skipped — the in-place kernel already mutated the carry's
+backing buffer.
 
-- `is_aliased_emittable(imp, claimed, fuf) -> bool` (every
-  `output_alias` entry has `src=Some` pointing at a boundary tile,
-  `consumes_input_tiles` is empty).
-- Extend `can_fragmentize_collapsed` path's precondition to also
-  accept alias-emittable classes.
-- `emit_aliased_class_inline` helper: Concrete mode with
-  `repeat_var = Some(__repeat)`, custom LocalMap that redirects
-  boundary-input idents (IntraIter/LoopCarry/PreLoop) to the
-  collapsed path's per-export idents, then `let __cC_out_P_S =
-  t_<claim[pos].id>_<slot>.as_view();` shim bindings to expose the
-  aliased OwnedTensor via TensorView.
-- Alias-through-carry: for each (class, pos, slot) in
-  carry_producers where the producing class is aliased-emittable and
-  its alias src points to that carry's underlying OwnedTensor, skip
-  the end-of-iter `__carry = __cC_out_P_S` — the in-place kernel
-  already mutated the carry's backing buffer.
-- Validation: `cargo expand -p ferrite-model-llama --features
-  cuda`; `timeout 60 vllm chat` against a small llama variant.
+**Remaining llama-fleet refusal: pre/post_loop aliased deps.** The
+5j edge-refinement peels one FusedAddRmsNorm instance (typically
+layer 0's pre-attn or layer N-1's pre-MLP) into its own period-1
+class, which the scheduler routes to `sched.pre_loop` or
+`sched.post_loop`. That emission path (`emit_subgraph` → Concrete
+inline fallback for aliased impls) resolves boundary idents via the
+default `t_<tile>_<slot>` LocalMap, which only works if the
+dependency subgraph was already emitted in the enclosing scope. For
+the peeled instance, its boundary tiles (layer-0 attention output;
+layer-(N-1) `down` projection output) come from periodic classes
+that fire in the loop body — so the pre_loop emit references
+unbound idents. 5i.2 refuses cleanly with a specific message.
+
+Next session picks up at **pre/post-loop aliased lifting** — the
+remaining gate for the llama fleet. The peeled period-1 FAR
+instance's boundary inputs (layer-0 attention output, layer-(N-1)
+`down` projection) must either: (a) get promoted into the loop as
+an "iter-0-only" or "iter-(N-1)-only" guarded emission, or (b)
+change the refinement to not peel them (merge back with the
+periodic class and accept iter-R guards on both the FAR and its
+in-loop peers). Option (a) keeps the periodicity detection as-is
+and adds a separate lowering; option (b) unifies under the periodic
+path (one fewer refusal in a common shape). Both paths need a
+boundary-tile-aware resolver for pre/post-loop aliased classes
+instead of the today's "if dep crosses partition, refuse".
+
+**Alternative viable follow-up**: unify the pre/post-loop aliased
+lowering with the periodic path by allowing a period-1 aliased
+class to live in `sched.periodic` (guarded as a short class:
+offset=fixed, period=1). The existing short-aliased emit handles
+period=1 fine (`if __repeat >= offset && __repeat < offset+1`). The
+mechanical change is in `StencilBundle::schedule` / `ClassSchedule`
+construction — don't route period-1 aliased classes to pre_loop /
+post_loop, route them to periodic with their natural offset. That
+may also fix the corresponding issue on gemma/qwen if they have
+peeled aliased instances.
 
 **Pointers for 5i.2 (all in
 `vllm-rs/crates/ferrite-forward-macro/src/`):**
@@ -470,11 +508,11 @@ pre-existing failures (`config::tests::load_real_llama_configs`,
 grew past the hard-coded expected counts. Unrelated to codegen; skip
 or update those asserts separately.
 
-**Current refusal distribution (post-5j, 2026-04-21):**
+**Current refusal distribution (post-5i.2, 2026-04-21):**
 
 | Arch fleet | Refusal reason | Next-step path |
 |---|---|---|
-| llama / mistral / phi3 / qwen2 / commandr (rest) | `class N rep not fragmentizable` | **5i** (aliased-output inline) — **needs per-export refactor first** |
+| llama / mistral / phi3 / qwen2 / commandr (rest) | `pre/post_loop class N aliased impl depends on class M in a forbidden partition` | Re-route period-1 aliased classes into `sched.periodic` as short-aliased (offset=fixed, period=1) instead of peeling to pre_loop/post_loop |
 | gemma2 / granite | `class N slot 0 referenced by post-loop from multiple tiles` | **5k** (post-loop multi-tile export) — moderate |
 | qwen3 / gemma3 | `uniform_pairs=false` (1 residual pair each) | **5l** (finer refinement signature) — signature tuning |
 | commandr (3 variants) | ✅ happy path (degenerate empty loop) | — |

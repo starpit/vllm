@@ -130,6 +130,23 @@ async fn test_cuda_correctness_llama_3_2_1b_awq() {
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
+async fn test_cuda_correctness_gemma2_2b_awq() {
+    // AWQ Gemma2-2B (dolphin-2.9.4 fine-tune) via the ferrite-forward
+    // Marlin* impl family on top of gemma2's alt sliding/full
+    // attention + softcap + fused-GELU-MLP stack. First AWQ × Gemma2
+    // e2e — parity.csv lists the combination as supported but only
+    // Qwen2.5-0.5B had verified coverage. solidrust's checkpoint
+    // materializes both `embed_tokens.weight` and `lm_head.weight`
+    // explicitly, sidestepping RichardErkhov's tied-embedding quirk
+    // (the same repo is the reason a ferrite-side `lm_head.weight →
+    // embed_tokens.weight` alias was considered but deferred; see
+    // HANDOFF.md).
+    run_correctness_test(TestModels::GEMMA2_2B_AWQ, "gemma2_2b_awq").await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn test_cuda_correctness_gemma2_2b_gptq() {
     // GPTQ Gemma2-2B via ferrite — exercises MarlinFusedGateUpGeluMulImpl
     // (new, landed alongside this test) on top of the alternating

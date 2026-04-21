@@ -226,6 +226,15 @@ impl TestModels {
 
     // Gemma2 GPTQ quantized models (ungated)
     pub const GEMMA2_2B_GPTQ_INT4: &str = "qilowoq/gemma-2-2B-it-4Bit-GPTQ";
+    // Gemma2 AWQ — dolphin fine-tune (instruct-formatted) of gemma-2-2b.
+    // solidrust's repo materializes both `embed_tokens.weight` and
+    // `lm_head.weight` explicitly, unlike RichardErkhov's
+    // `google_-_gemma-2-2b-it-awq` which ships only `lm_head.weight`
+    // and trips the fingerprint's `embed_tokens.weight` gate. Covers
+    // the AWQ × Gemma2 cell (alt sliding/full attention + softcap +
+    // GELU MLP) that parity.csv lists as supported but had no e2e
+    // coverage before.
+    pub const GEMMA2_2B_AWQ: &str = "solidrust/dolphin-2.9.4-gemma2-2b-AWQ";
 
     // GPTQ with desc_act (activation ordering) — tests g_idx sort + perm pipeline
     pub const TINYLLAMA_1B_GPTQ_DESC_ACT: &str = "TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ";

@@ -51,6 +51,14 @@ MODELS = {
     # sliding/full attention + GELU MLP + softcap). Proves ferrite's
     # GPTQ plumbing is arch-agnostic.
     "gemma2_2b_gptq": "qilowoq/gemma-2-2B-it-4Bit-GPTQ",
+    # Gemma2 AWQ — dolphin-2.9.4 fine-tune of gemma-2-2b, instruct-
+    # formatted. Exercises the Marlin AWQ path on the gemma2 stack
+    # (alt sliding/full attention, softcap, fused GELU MLP). This
+    # repo ships both `embed_tokens.weight` and `lm_head.weight`
+    # explicitly; RichardErkhov's gemma-2-2b-it-awq omits
+    # embed_tokens and trips the fingerprint gate, so we picked
+    # solidrust's materialization-friendly variant.
+    "gemma2_2b_awq": "solidrust/dolphin-2.9.4-gemma2-2b-AWQ",
     # TinyLlama GPTQ desc_act=true — exercises the g_idx argsort +
     # sort_indices → gptq_repack_into perm path that Qwen2.5-0.5B and
     # Gemma2-2B don't reach (both ship desc_act=false).

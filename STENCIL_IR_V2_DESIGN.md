@@ -402,11 +402,50 @@ None of these are show-stoppers without investigation, but each is worth measuri
 **What's landed**: 6.1, 6.2.a, 6.2.b.1–4, 6.2.b.5a–e (collapsed
 emitter), 6.2.b.5f (p1 period-mismatch offsets), 6.2.b.5g (multi-
 output periodic classes), 6.2.b.5j (edge-pattern-driven class
-refinement — see below). `cargo check -p ferrite-models --features
-cuda` with `FERRITE_STENCIL_CODEGEN=1` is clean across all 218
-variants; collapsed path fires on 3 commandr variants (degenerate
-empty-loop). Every other variant hits `unimplemented!()` with a
-specific refusal reason.
+refinement), **6.2.b.5i.1 (per-export key refactor — prereq for 5i
+proper; commit `cc6a4c76c`, 2026-04-21)**. `cargo check -p
+ferrite-models --features cuda` with `FERRITE_STENCIL_CODEGEN=1` is
+clean across all 218 variants; collapsed path fires on 3 commandr
+variants (degenerate empty-loop). Every other variant hits
+`unimplemented!()` with a specific refusal reason.
+
+**5i.1 landed — what it did, what's next:**
+
+5i.1 is the §14.1 per-export refactor: every `(class, slot)` key in
+the collapsed emitter's bookkeeping is now `(class, pos, slot)`, and
+`InputOrigin::{IntraIter, LoopCarry}` carry `producer_pos: u8`
+resolved at provenance-build time. Idents renamed:
+`__cC_out_<pos>_<slot>`, `__carry_cC_p<pos>_s<slot>`,
+`__last_cC_p<pos>_s<slot>`. No behavior change — commandr happy path
+stays byte-identical (empty loop emits no class idents at all).
+Every llama-fleet variant still refuses at `class N rep not
+fragmentizable`, same reason as before.
+
+Next session picks up at **§14.2 inline aliased emission** — the 5i
+proper work. The refactor has already plumbed producer_pos through
+every site that would have collided on `(class=8, slot=0)` in
+`FusedAddRmsNormImpl`'s two exports, so the new inline helper can
+key the rmsnorm export (pos=1) separately from the add export
+(pos=0, a carry target). Scope from §14.2:
+
+- `is_aliased_emittable(imp, claimed, fuf) -> bool` (every
+  `output_alias` entry has `src=Some` pointing at a boundary tile,
+  `consumes_input_tiles` is empty).
+- Extend `can_fragmentize_collapsed` path's precondition to also
+  accept alias-emittable classes.
+- `emit_aliased_class_inline` helper: Concrete mode with
+  `repeat_var = Some(__repeat)`, custom LocalMap that redirects
+  boundary-input idents (IntraIter/LoopCarry/PreLoop) to the
+  collapsed path's per-export idents, then `let __cC_out_P_S =
+  t_<claim[pos].id>_<slot>.as_view();` shim bindings to expose the
+  aliased OwnedTensor via TensorView.
+- Alias-through-carry: for each (class, pos, slot) in
+  carry_producers where the producing class is aliased-emittable and
+  its alias src points to that carry's underlying OwnedTensor, skip
+  the end-of-iter `__carry = __cC_out_P_S` — the in-place kernel
+  already mutated the carry's backing buffer.
+- Validation: `cargo expand -p ferrite-model-llama --features
+  cuda`; `timeout 60 vllm chat` against a small llama variant.
 
 **Current refusal distribution (post-5j, 2026-04-21):**
 

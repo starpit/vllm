@@ -817,7 +817,90 @@ af07c6066  reshape attention output to 2D (SmolLM correctness fix)
 
 ## Next session starts here
 
-**All three FP8 correctness slices are green end-to-end. Slice-1
+**Quant×arch coverage expansion landed in commit `9ef35d6f5`.** Five
+new e2e correctness tests green, plus targeted compiler/loader fixes
+the cells required. Previous sessions' FP8 state (all three slices
+green) still holds; the details and follow-ups for FP8 live below.
+
+**What landed in `9ef35d6f5`:**
+
+New green cells (all pass end-to-end; goldens in
+`vllm-rs/crates/vllm-e2e/testdata/golden/`):
+- llama-3.2-1B × bnb-nf4-dq (`unsloth/Llama-3.2-1B-Instruct-bnb-4bit`)
+- qwen2.5-0.5B × bnb-nf4-dq (`unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit`)
+- granite-3.1-2B × gptq-sym (`sroecker/granite-3.1-2b-instruct-gptq`)
+- granite-3.2-2B × bnb-nf4-dq (`unsloth/granite-3.2-2b-instruct-bnb-4bit`)
+- gemma-2-2B × ct-int4-sym (`RedHatAI/gemma-2-2b-it-quantized.w4a16`)
+
+Compiler/loader fixes:
+1. **`MarlinGemmImpl` precision-gated deference** —
+   `gemm_is_fusion_partner` was too eager (any Gemm feeding
+   RopeAppend/Silu/Mul/BiasAdd deferred regardless of whether a
+   fused sibling would actually match). Replaced with two targeted
+   helpers (`marlin_fused_qkv_rope_would_match` /
+   `marlin_fused_gate_up_would_match`) that replay the exact
+   adjacency checks the fused matchers use. Fixes granite's
+   `o_proj * scalar(residual_multiplier)` case where no fused
+   sibling matches (ScalarMul, not SwiGLU/GELU shape).
+2. **`Bnb4bitLinear::load_concat` bias concat** via
+   `fuse_bias_parts` — mirror of `MarlinLinear::load_awq_concat`.
+   Previous "bias dropped on fused path" shortcut silently
+   dropped qwen2's QKV bias → attention got unbiased Q/K/V →
+   random-token garbage.
+3. **Compressed-tensors INT4 loader + fingerprint fixes:**
+   - `parse_compressed_tensors` reads `actorder` field from
+     `config_groups.*.weights` subobject.
+   - `load_gptq` / `load_gptq_concat` use `.weight_g_idx` for
+     `GptqLayout::WeightPacked` (vs `.g_idx` for AutoGPTQ). The
+     presence check is runtime-only for CT (per-repo variance
+     isn't encoded at compile time) but kept gated on
+     compile-time `desc_act` for AutoGPTQ native to avoid
+     flipping `has_act_order` for inert `.g_idx` tensors.
+   - `fp8_exclusion` in `emit_fingerprint_check` (codegen.rs) now
+     also skips `Gptq { WeightPacked }` variants. CT-INT4 ships
+     `.weight_scale` (same tensor name as FP8); without the skip
+     the FP8 marker check false-rejected every CT-INT4 checkpoint.
+
+Arch preset opt-ins added (no-op when no repo fingerprint-matches):
+- llama: `bnb-nf4-dq`
+- qwen2: `bnb-nf4-dq`, `ct-int4-sym`
+- gemma2: `awq-gemm`, `ct-int4-sym`
+- granite: `bnb-nf4-dq`, `ct-int4-sym`, `gptq-sym`
+
+**Known follow-ups from this session (not landed):**
+- **CT-INT4 with `actorder: "group"`** (qwen2 /
+  granite `RedHatAI/*-quantized.w4a16`) now compiles and runs
+  end-to-end — output is coherent English but the token
+  distribution drifts from Python's CUTLASS reference enough
+  that top-20 windows don't overlap at position 0 (engine picks
+  " The", golden picks " It"). Structural plumbing (fingerprint
+  match, Marlin repack with `has_act_order=true`, sort_indices
+  permutation) is in place; the divergence probably sits in the
+  Marlin act-order runtime permute_cols path or an
+  `lda`/`size_k` plumbing detail. Fix lands when someone does a
+  bit-level weight-comparison between ferrite's post-load
+  repacked qweight and Python's after `process_weights_after_loading`.
+- **Llama-3.2-1B-AWQ + TinyLlama-1.1B-GPTQ-desc-act regression:**
+  both fail with `invalid type: null, expected f64` when the
+  test parses logprobs from the completion response — server
+  runs, NaN logprob serializes as JSON null, parser rejects.
+  Confirmed pre-existing on this worktree (reproduces on a clean
+  baseline with none of this session's changes), so not caused
+  by any of the Marlin-singleton deference edits. Likely a
+  Marlin kernel issue in the act-order / null-logprob path
+  independent of this session's work.
+- **Gemma2 × AWQ:** the `RichardErkhov/google_-_gemma-2-2b-it-awq`
+  checkpoint omits `model.embed_tokens.weight` (Gemma2 ships it
+  via `lm_head.weight` when `tie_word_embeddings=true`). Ferrite's
+  loader doesn't alias `lm_head.weight` → `embed_tokens.weight`
+  for quant variants, so the load fails at fingerprint-time.
+  Dropped from the commit; real fix is either a tie-embedding
+  alias in the generated `Weights::load` or swapping to a repo
+  with an explicit `embed_tokens.weight`.
+
+**Prior-session FP8 state (all three slices green; commit `9e9f0c297`):**
+
+All three FP8 correctness slices are green end-to-end. Slice-1
 (dynamic per-tensor, seven arches), Slice-2 (static per-tensor, four
 arches with upstream checkpoints), and Slice-3 (blockwise 128×128,
 Qwen3-0.6B) all produce coherent output through ferrite-forward at
@@ -825,7 +908,7 @@ Qwen3-0.6B) all produce coherent output through ferrite-forward at
 FP8-enabled arches (qwen2, llama, qwen3, gemma2, gemma3, granite,
 mistral) so any future FP8 repo for one of those arches dispatches
 automatically. Thresholds stay at `1` pending the cutlass
-`kGemm` vs `kGemmSplitKParallel` fix described below.**
+ULP-drift investigation (item 1b below).
 
 **What landed this session (commit `9e9f0c297`):**
 - FP8 Slice-3 (blockwise 128×128) end-to-end.

@@ -6,8 +6,34 @@
 //! Golden references are pre-generated JSON files in `testdata/golden/`.
 //! See `scripts/generate_golden_refs.py` to regenerate them.
 //!
-//! Run with:
-//!   cargo test -p vllm-e2e --features e2e,cuda --release --test e_correctness -- --ignored --test-threads=1
+//! # Running
+//!
+//! **Full suite (strict, ~25 min serial):**
+//! ```text
+//! cargo test -p vllm-e2e --features e2e,cuda --release --test e_correctness \
+//!     -- --ignored --test-threads=1
+//! ```
+//!
+//! **Fast iteration (parallel, ~2-4 min):** each test spawns its own
+//! `vllm serve` child process with its own CUDA context. Dropping
+//! `--test-threads=1` lets cargo run them concurrently on one GPU; bound
+//! each process's GPU claim with `VLLM_GPU_MEMORY_UTILIZATION` (the
+//! binary honours this env var). On a 24 GB L4, 0.12 ≈ 2.9 GB per server
+//! → 7-8 concurrent small-model goldens fit:
+//! ```text
+//! VLLM_GPU_MEMORY_UTILIZATION=0.12 cargo test -p vllm-e2e --features e2e,cuda \
+//!     --release --test e_correctness -- --ignored \
+//!     test_cuda_correctness_smollm_135m \
+//!     test_cuda_correctness_qwen2_0_5b \
+//!     test_cuda_correctness_qwen3_0_6b \
+//!     test_cuda_correctness_tinyllama_1b_w4a16_ct
+//! ```
+//!
+//! Parallel runs may flake on borderline numerical-noise cases
+//! (concurrent kernel streams perturb bf16 accumulation order enough to
+//! flip a token that's already within the top-N window). For
+//! commit-gating correctness, use the serial `--test-threads=1` command
+//! above; for day-to-day iteration, parallel is the right call.
 
 #![cfg(feature = "e2e")]
 

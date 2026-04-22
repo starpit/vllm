@@ -794,6 +794,93 @@ message improvements.
   new bucket. This unblocks the emitter's consumption of the
   schedule order — step 5 of the rewrite.
 
+- **In-loop-short reroute landed — `in_loop_short` + `derive_short_offset`
+  + category 16 extensions (2026-04-24).** Fifth stage of the rewrite
+  lands. `PartitionedSchedule` grows a fourth bucket that pulls period-1
+  classes interleaved with periodic classes in the Kahn order into
+  `in_loop_short: Vec<(class, offset)>`; offsets are derived from
+  the `BoundaryEdge` set (no `is_aliased_emittable` sampling, no
+  dependence on `class_edges`).
+  - `derive_short_offset(c, edges, domain, periodic_set) -> Option<usize>`
+    — pure function. `c` as consumer of periodic P at P-member m:
+    candidate `offsets[P] + m`; take MAX over consumer-side. `c` as
+    producer for periodic P at P-member m: candidate `offsets[P] + m`;
+    take MIN over producer-side. Mixed-direction feasible iff
+    `max_consumer ≤ min_producer`; pick `max(max_consumer, min_producer)`.
+    Infeasibility + out-of-range candidates → `None` → class falls
+    back to `post_loop` (degenerate; cat 16 flat_order invariant
+    surfaces the gap).
+  - `partition_schedule(sched, domain, edges)` — now takes edges
+    (signature change). Kahn walk does a first pass to find
+    `first_periodic_pos` + `last_periodic_pos`; a period-1 class
+    strictly between them goes to `in_loop_short` with the derived
+    offset; before/after goes to `pre_loop`/`post_loop` as before.
+  - `PartitionedSchedule.interior_classes: Vec<usize>` — the Kahn
+    interior preserving periodic/in_loop_short interleaving, used
+    by `flat_order()` so `pre_loop ++ interior ++ post_loop`
+    equals `schedule.order` verbatim.
+
+  Category 16 growth — now 9 tests (was 7):
+  - (a, b) updated to walk the four buckets.
+  - (c) `partition_order_is_consistent_with_schedule_order` — **RED→GREEN**.
+  - (d) `pre_loop_is_strict_prefix_and_post_loop_is_strict_suffix` — **RED→GREEN**.
+  - (c) at 3b scale — **RED→GREEN**.
+  - (e) NEW `in_loop_short_classes_are_interior_in_kahn_order` — every
+    `in_loop_short` class's Kahn position strictly between first and
+    last periodic. Green.
+  - (f) NEW `in_loop_short_offsets_are_in_bounds` — every offset is
+    `< max_period`. Green.
+  - (g) NEW `dump_in_loop_short` — `#[ignore]` diagnostic.
+
+  Plus four new unit tests in `stencil_pipeline::tests`:
+  `partition_period_one_interleaved_reroutes_to_in_loop_short`,
+  `partition_interleaved_without_edges_falls_back_to_post_loop`,
+  `partition_short_offset_mixed_feasibility`,
+  `partition_short_offset_infeasible_falls_back`.
+
+  Mountain state: **1093 passed, 161 failed, 3 ignored** (was
+  1047/164). Net: three cat 16 reds flipped green + two new greens +
+  one new ignored diagnostic; zero regression on the 161 pre-existing
+  reds (provenance-driven; addressed when the emitter consumes
+  `ReadPlan`).
+
+  Red→green proof (targeted stub): replace the `Some(offset)` arm in
+  `partition_schedule`'s interleaved path with `post_loop.push(c)` →
+  cat 16 (c) fires on both 1b and 3b with the exact pair of failing
+  orders (`[0,1,8,2,3,4,9,6,7,5,10,11]` vs
+  `[0,1,8,2,3,4,5,9,6,7,10,11]`); (d) fires naming the post_loop
+  mismatch `[7,10,11]` vs `[5,10,11]`. Restore → all three green.
+
+  Empirical dump (llama-1b fixture, `dump_in_loop_short --ignored
+  --nocapture`):
+  - `order = [0, 1, 8, 2, 3, 4, 5, 9, 6, 7, 10, 11]`
+  - `in_loop_short = [(c5, 0)]`, where c5 reads c4 (periodic) at c4
+    m=0 (max_consumer=0) and is read by c6 + c8 (periodic) at their
+    m=0 (min_producer=0). Self-consistent at offset 0 — c5 fires
+    inside the loop at `__repeat == 0`, gated by a single-iter
+    guard. Legacy schedule places c5 at offset 0 in `pre_loop`
+    instead; the new representation is explicit about the Kahn
+    dependence (c5 sits inside the loop body but guarded to one
+    iter), which is what the read-plan-consuming emitter wants.
+
+  **Next concrete step for next session**: step 5 of the rewrite —
+  the ReadPlan-consuming emitter. Outline unchanged from the
+  earlier handoff:
+  1. Replace `class_input_provenance` reads in
+     `emit_fragment_call_expr` + `emit_aliased_class_inline` with
+     lookups keyed on `(class, bp)` into the `classify_reads`
+     output.
+  2. Replace class ordering throughout `try_emit_collapsed_bucket`
+     with `PartitionedSchedule`'s `flat_order()`, routing
+     `in_loop_short` classes via one-iter guards inside the loop
+     body (analogous to the legacy aliased-emittable reroute but
+     driven by the `in_loop_short` bucket, no `is_aliased_emittable`
+     sampling).
+  3. The old `InputOrigin` enum + `alias_carry_redirect` sidecar
+     stay in place for one commit so the flip can be A/B'd; they
+     are deleted in the follow-up once every provenance-red test
+     clears.
+
 - `a4b38b236` — **invariant mountain scaled to 1229 tests (161 red)**.
   Cross-scale 1b/3b + 6 new categories. This commit is the
   forcing-function for the rewrite.

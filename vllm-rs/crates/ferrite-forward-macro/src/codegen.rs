@@ -10730,16 +10730,21 @@ mod tests {
                 let sched = schedule_from_edges(&edges, &domain)
                     .expect("fixture must have no Δ=0 cycle");
                 let n = t.stencil.class_members.len();
-                (partition_schedule(&sched, &domain), n)
+                (partition_schedule(&sched, &domain, &edges), n)
             }
 
-            /// (a) Every class appears in exactly one partition.
+            /// (a) Every class appears in exactly one partition
+            /// (pre_loop | periodic | in_loop_short | post_loop).
             #[test]
             fn every_class_in_exactly_one_partition() {
                 let t = load();
                 let (part, n) = compute_partition(&t);
                 let mut seen: BTreeSet<usize> = BTreeSet::new();
-                for &c in part.pre_loop.iter().chain(part.periodic.iter()).chain(part.post_loop.iter()) {
+                for &c in part.pre_loop.iter()
+                    .chain(part.periodic.iter())
+                    .chain(part.in_loop_short.iter().map(|(c, _)| c))
+                    .chain(part.post_loop.iter())
+                {
                     assert!(
                         seen.insert(c),
                         "class c{c} appears in multiple partitions",
@@ -10748,13 +10753,15 @@ mod tests {
                 for c in 0..n {
                     assert!(
                         seen.contains(&c),
-                        "class c{c} missing from all three partitions",
+                        "class c{c} missing from all four partitions",
                     );
                 }
                 assert_eq!(seen.len(), n);
             }
 
-            /// (b) Period uniformity across partitions.
+            /// (b) Period uniformity across buckets: `periodic` holds
+            /// only period>1; `pre_loop` / `in_loop_short` /
+            /// `post_loop` hold only period==1.
             #[test]
             fn partitions_match_period_classification() {
                 let t = load();
@@ -10766,18 +10773,22 @@ mod tests {
                         "c{c} in periodic but periods[c]={p} (expected > 1)",
                     );
                 }
-                for &c in part.pre_loop.iter().chain(part.post_loop.iter()) {
+                for &c in part.pre_loop.iter()
+                    .chain(part.in_loop_short.iter().map(|(c, _)| c))
+                    .chain(part.post_loop.iter())
+                {
                     let p = t.stencil.class_members[c].len();
                     assert_eq!(
                         p, 1,
-                        "c{c} in pre_loop/post_loop but periods[c]={p} (expected 1)",
+                        "c{c} in period-1 bucket but periods[c]={p} (expected 1)",
                     );
                 }
             }
 
-            /// (c) On the fixture, `pre_loop ++ periodic ++ post_loop`
-            /// reassembles `schedule.order` — no period-1 class
-            /// interleaves with periodic ones.
+            /// (c) `flat_order()` reassembles `schedule.order` —
+            /// `pre_loop ++ interior_classes ++ post_loop` equals
+            /// the Kahn order, where `interior_classes` preserves
+            /// the periodic/in_loop_short interleaving.
             #[test]
             fn partition_order_is_consistent_with_schedule_order() {
                 let t = load();
@@ -10789,13 +10800,13 @@ mod tests {
                 );
                 let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
                 let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
-                let part = partition_schedule(&sched, &domain);
+                let part = partition_schedule(&sched, &domain, &edges);
                 assert_eq!(
                     part.flat_order(),
                     sched.order,
                     "partition flat_order differs from schedule.order — \
-                     some period-1 class interleaves among periodic classes, \
-                     which the rewrite's first emitter consumer doesn't handle",
+                     an interleaved period-1 class has no derivable offset from \
+                     BoundaryEdges to periodic neighbours",
                 );
             }
 
@@ -10813,7 +10824,7 @@ mod tests {
                 );
                 let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
                 let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
-                let part = partition_schedule(&sched, &domain);
+                let part = partition_schedule(&sched, &domain, &edges);
                 let pre_len = part.pre_loop.len();
                 let post_len = part.post_loop.len();
                 let total = sched.order.len();
@@ -10829,13 +10840,140 @@ mod tests {
                 );
             }
 
+            /// (e) Every `in_loop_short` class has a Kahn position
+            /// strictly between the first and last periodic class
+            /// in `schedule.order`. Catches bookkeeping drift if a
+            /// pre_loop / post_loop class ever gets misclassified.
+            #[test]
+            fn in_loop_short_classes_are_interior_in_kahn_order() {
+                let t = load();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
+                let part = partition_schedule(&sched, &domain, &edges);
+                // Skip this check if no periodic classes exist.
+                let first_periodic_pos = sched
+                    .order
+                    .iter()
+                    .position(|&c| t.stencil.class_members[c].len() > 1);
+                let last_periodic_pos = sched
+                    .order
+                    .iter()
+                    .rposition(|&c| t.stencil.class_members[c].len() > 1);
+                let (Some(first), Some(last)) = (first_periodic_pos, last_periodic_pos) else {
+                    assert!(
+                        part.in_loop_short.is_empty(),
+                        "in_loop_short is non-empty without any periodic class",
+                    );
+                    return;
+                };
+                for &(c, _off) in &part.in_loop_short {
+                    let pos = sched
+                        .order
+                        .iter()
+                        .position(|&x| x == c)
+                        .unwrap_or_else(|| panic!("c{c} missing from schedule.order"));
+                    assert!(
+                        pos > first && pos < last,
+                        "c{c} in in_loop_short has Kahn pos {pos} outside \
+                         periodic interior ({first}, {last})",
+                    );
+                }
+            }
+
+            /// (g) Diagnostic dump — non-asserting, prints the
+            /// `in_loop_short` bucket for manual inspection.
+            /// Ignored by default; run with
+            /// `cargo test -p ferrite-forward-macro --lib \
+            ///   dump_in_loop_short -- --ignored --nocapture`.
+            #[test]
+            #[ignore]
+            fn dump_in_loop_short() {
+                let t = load();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
+                let part = partition_schedule(&sched, &domain, &edges);
+                let max_period = *domain.periods.iter().max().unwrap_or(&0);
+                eprintln!("llama-1b partition:");
+                eprintln!("  order       = {:?}", sched.order);
+                eprintln!("  pre_loop    = {:?}", part.pre_loop);
+                eprintln!("  periodic    = {:?}", part.periodic);
+                eprintln!("  in_loop_sh  = {:?}  (max_period = {max_period})",
+                          part.in_loop_short);
+                eprintln!("  post_loop   = {:?}", part.post_loop);
+                eprintln!("  interior    = {:?}", part.interior_classes);
+                eprintln!(
+                    "  legacy class_offsets = {:?}",
+                    t.sched.class_offsets,
+                );
+                eprintln!(
+                    "  periods      = {:?}",
+                    domain.periods,
+                );
+                eprintln!("  edges touching interleaved short classes:");
+                let short_set: BTreeSet<usize> =
+                    part.in_loop_short.iter().map(|(c, _)| *c).collect();
+                for e in &edges {
+                    if !short_set.contains(&e.consumer_class)
+                        && !short_set.contains(&e.producer_class)
+                    {
+                        continue;
+                    }
+                    eprintln!(
+                        "    cc={} cm={} bp={} | pc={} pm={} tile_pos={} slot={}",
+                        e.consumer_class, e.consumer_member, e.boundary_pos,
+                        e.producer_class, e.producer_member,
+                        e.producer_tile_pos, e.producer_slot,
+                    );
+                }
+            }
+
+            /// (f) Every `in_loop_short` offset is in
+            /// `[0, max_period)`. Catches a derive_short_offset bug
+            /// where the edge's `offsets[P] + m_P` overflows.
+            #[test]
+            fn in_loop_short_offsets_are_in_bounds() {
+                let t = load();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
+                let part = partition_schedule(&sched, &domain, &edges);
+                let max_period = *domain.periods.iter().max().unwrap_or(&0);
+                for &(c, off) in &part.in_loop_short {
+                    assert!(
+                        off < max_period,
+                        "c{c} in_loop_short offset {off} >= max_period {max_period}",
+                    );
+                }
+            }
+
             /// (a) at 3b scale.
             #[test]
             fn every_class_in_exactly_one_partition_3b() {
                 let t = load_3b();
                 let (part, n) = compute_partition(&t);
                 let mut seen: BTreeSet<usize> = BTreeSet::new();
-                for &c in part.pre_loop.iter().chain(part.periodic.iter()).chain(part.post_loop.iter()) {
+                for &c in part.pre_loop.iter()
+                    .chain(part.periodic.iter())
+                    .chain(part.in_loop_short.iter().map(|(c, _)| c))
+                    .chain(part.post_loop.iter())
+                {
                     assert!(seen.insert(c), "3b class c{c} appears in multiple partitions");
                 }
                 for c in 0..n {
@@ -10852,9 +10990,12 @@ mod tests {
                     let p = t.stencil.class_members[c].len();
                     assert!(p > 1, "3b c{c} in periodic but periods[c]={p}");
                 }
-                for &c in part.pre_loop.iter().chain(part.post_loop.iter()) {
+                for &c in part.pre_loop.iter()
+                    .chain(part.in_loop_short.iter().map(|(c, _)| c))
+                    .chain(part.post_loop.iter())
+                {
                     let p = t.stencil.class_members[c].len();
-                    assert_eq!(p, 1, "3b c{c} in pre/post_loop but periods[c]={p}");
+                    assert_eq!(p, 1, "3b c{c} in period-1 bucket but periods[c]={p}");
                 }
             }
 
@@ -10870,7 +11011,7 @@ mod tests {
                 );
                 let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
                 let sched = schedule_from_edges(&edges, &domain).expect("3b no cycle");
-                let part = partition_schedule(&sched, &domain);
+                let part = partition_schedule(&sched, &domain, &edges);
                 assert_eq!(
                     part.flat_order(),
                     sched.order,

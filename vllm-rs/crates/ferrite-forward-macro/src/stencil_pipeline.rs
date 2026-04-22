@@ -588,101 +588,252 @@ pub(crate) fn schedule_from_edges(
 
 // ─────────────────────────────────────────────────────────────────
 // Partition — project Schedule.order onto (pre_loop, periodic,
-// post_loop) using ClassDomain.periods.
+// in_loop_short, post_loop) using ClassDomain.periods + edges.
 //
-// This replaces the `pre_loop`/`periodic`/`post_loop` split that
-// today's `ClassSchedule` computes alongside its offset-sort. The
-// semantic is a pure function of (order, periods):
+// This replaces today's `ClassSchedule` pre/periodic/post split.
+// Four buckets, total function of (order, periods, edges):
 //
 //   - A class with `periods[c] > 1` is `periodic`, in Kahn order.
-//   - A class with `periods[c] == 1` that appears in `order` before
-//     every periodic class is `pre_loop`.
-//   - A class with `periods[c] == 1` that appears at or after the
-//     first periodic class is `post_loop`.
+//   - A class with `periods[c] == 1` whose Kahn position in
+//     `order` falls strictly BEFORE the first periodic class is
+//     `pre_loop`.
+//   - A class with `periods[c] == 1` whose Kahn position falls
+//     strictly AFTER the last periodic class is `post_loop`.
+//   - A class with `periods[c] == 1` whose Kahn position falls
+//     between periodic classes is `in_loop_short` — it fires
+//     INSIDE the loop body at a specific `__repeat` offset,
+//     guarded by `if __repeat == offset { … }`. The offset is
+//     derived from the `BoundaryEdge` set: for each edge between
+//     the short class and a periodic neighbour at the neighbour's
+//     member `m`, the candidate offset is `offsets[P] + m`. We
+//     take MAX over consumer-side edges (C must fire after every
+//     P-iter it reads) and MIN over producer-side edges (C must
+//     fire before every P-iter that reads its output). Mixed
+//     direction is feasible iff `max_consumer ≤ min_producer`.
 //
-// Reassembly invariant: `pre_loop ++ periodic ++ post_loop` —
-// NOT the concatenation of the three buckets preserving their
-// internal orders — equals `order` only when every period-1
-// class sits entirely before or entirely after every periodic
-// class in `order`. The existing fixtures satisfy this
-// (verified by category 16 `partition_order_is_consistent_with_schedule_order`);
-// architectures that interleave period-1 classes among periodic
-// ones would need a richer partition (or a period-1 reroute into
-// the loop body, analogous to today's aliased-emittable reroute).
-// That richer partition is not required for the rewrite's first
-// emitter consumer — it targets the llama-shape fixtures where
-// this invariant holds.
+// Reassembly invariant: `flat_order()` walks the Kahn interior
+// using the saved `interior_classes` and concatenates pre_loop +
+// interior + post_loop to rebuild `schedule.order` verbatim.
 //
-// Deliberate scope gap: this partition does NOT replicate the
-// legacy scheduler's "aliased-emittable period-1 reroute into
-// periodic with a derived offset." Aliased-emittable reroute is
-// an emission concern (handle it via `emit_aliased_class_inline`
-// with a runtime guard), not a scheduling concern. The rewrite
-// intends to express "emit this period-1 class at a specific
-// `__repeat` offset inside the loop" in the emitter's read-plan
-// consumer rather than by moving the class into `periodic`.
+// This mirrors the legacy `StencilBundle::schedule` aliased-
+// emittable reroute but is driven by the `BoundaryEdge` set (no
+// `is_aliased_emittable` sampling, no dependence on `class_edges`).
+// An interleaved period-1 class whose offset is underivable from
+// edges (no edges to/from any periodic class) falls back to
+// `post_loop` — degenerate, flagged by category 16 invariants
+// when it breaks `flat_order == order`.
 // ─────────────────────────────────────────────────────────────────
 
-/// Partition of `Schedule.order` by period.
+/// Partition of `Schedule.order` into four buckets by period +
+/// edge-derived offset.
 ///
-/// Parallel to `ClassSchedule`'s legacy `pre_loop` / `periodic` /
-/// `post_loop` vectors, derived purely from `Schedule.order` +
-/// `ClassDomain.periods`. The three Vecs together cover every class
-/// exactly once.
+/// - `pre_loop` / `post_loop` — period-1 classes outside the
+///   periodic loop window.
+/// - `periodic` — period>1 classes in Kahn order.
+/// - `in_loop_short` — period-1 classes interleaved with periodic,
+///   each with a `(class, offset)` pair where `offset` is the
+///   `__repeat` coordinate at which the class fires inside the
+///   loop body.
+/// - `interior_classes` — every class in the Kahn interior
+///   (periodic + in_loop_short) preserving their relative Kahn
+///   order. Used by `flat_order()` to reassemble `schedule.order`.
 #[derive(Debug, Clone)]
 pub(crate) struct PartitionedSchedule {
     pub pre_loop: Vec<usize>,
     pub periodic: Vec<usize>,
+    pub in_loop_short: Vec<(usize, usize)>,
     pub post_loop: Vec<usize>,
+    pub interior_classes: Vec<usize>,
 }
 
 impl PartitionedSchedule {
-    /// Concatenate the three buckets in order. For fixtures where
-    /// period-1 classes don't interleave among periodic ones, this
-    /// equals the input `Schedule.order`. Used by category 16's
-    /// `partition_order_is_consistent_with_schedule_order` anchor.
+    /// Rebuild `schedule.order` by walking `pre_loop`, then
+    /// `interior_classes` (which preserves the Kahn interleaving
+    /// of `periodic` and `in_loop_short`), then `post_loop`.
     #[allow(dead_code)]
     pub fn flat_order(&self) -> Vec<usize> {
-        let mut out =
-            Vec::with_capacity(self.pre_loop.len() + self.periodic.len() + self.post_loop.len());
+        let mut out = Vec::with_capacity(
+            self.pre_loop.len() + self.interior_classes.len() + self.post_loop.len(),
+        );
         out.extend(&self.pre_loop);
-        out.extend(&self.periodic);
+        out.extend(&self.interior_classes);
         out.extend(&self.post_loop);
         out
     }
+
+    /// Offset assigned to an `in_loop_short` class. Returns `None`
+    /// for classes not in `in_loop_short`.
+    #[allow(dead_code)]
+    pub fn short_offset(&self, class: usize) -> Option<usize> {
+        self.in_loop_short
+            .iter()
+            .find(|(c, _)| *c == class)
+            .map(|(_, off)| *off)
+    }
 }
 
-/// Project `schedule.order` onto (pre_loop, periodic, post_loop).
+/// Derive the `__repeat` offset at which a period-1 class `c`
+/// fires, from `BoundaryEdge`s between `c` and any periodic class.
 ///
-/// Walk `order` once; classify each class by its period. A period-1
-/// class goes to `pre_loop` iff no periodic class has been emitted
-/// yet; otherwise `post_loop`. Period>1 classes always go to
-/// `periodic` in Kahn order.
+/// Legacy semantics (mirroring `StencilBundle::schedule`'s aliased-
+/// emittable reroute but keyed on `BoundaryEdge` instead of
+/// `class_edges`):
 ///
-/// Complexity: O(n_classes).
+/// - `c` as CONSUMER of periodic `P` at P-member `m_P`: `c` must
+///   fire at or after `offsets[P] + m_P` so that P's output is
+///   available. Take the MAX over all consumer-side candidates.
+/// - `c` as PRODUCER for periodic `P` at P-member `m_P`: `c` must
+///   fire at or before `offsets[P] + m_P` so that every consumer
+///   iter can read `c`'s output (directly, or carried forward).
+///   Take the MIN over all producer-side candidates.
+/// - Mixed-direction feasibility: `max_consumer ≤ min_producer`.
+///   Picks `max(max_consumer, min_producer)` so both sides satisfy.
+///
+/// Returns `None` if the offset is underivable (no edges to any
+/// periodic class, or infeasible mixed-direction constraint, or a
+/// candidate falls outside `[0, max_period)`). Callers treat `None`
+/// as "leave the class in its current bucket" — the structural
+/// invariant tests flag the downstream emission gap.
+fn derive_short_offset(
+    c: usize,
+    edges: &[BoundaryEdge],
+    domain: &ClassDomain,
+    periodic_set: &BTreeSet<usize>,
+) -> Option<usize> {
+    let max_period = *domain.periods.iter().max().unwrap_or(&0);
+    if max_period == 0 {
+        return None;
+    }
+    let mut min_producer: Option<usize> = None;
+    let mut max_consumer: Option<usize> = None;
+    for e in edges {
+        let (other_class, other_member, c_is_consumer) =
+            if e.consumer_class == c && periodic_set.contains(&e.producer_class) {
+                (e.producer_class, e.producer_member, true)
+            } else if e.producer_class == c && periodic_set.contains(&e.consumer_class) {
+                (e.consumer_class, e.consumer_member, false)
+            } else {
+                continue;
+            };
+        let candidate = domain.offsets[other_class] + other_member;
+        if candidate >= max_period {
+            return None;
+        }
+        if c_is_consumer {
+            max_consumer = Some(max_consumer.map_or(candidate, |m| m.max(candidate)));
+        } else {
+            min_producer = Some(min_producer.map_or(candidate, |m| m.min(candidate)));
+        }
+    }
+    match (max_consumer, min_producer) {
+        (None, None) => None,
+        (Some(cmax), None) => Some(cmax),
+        (None, Some(pmin)) => Some(pmin),
+        (Some(cmax), Some(pmin)) => {
+            if cmax > pmin {
+                None
+            } else {
+                Some(cmax.max(pmin))
+            }
+        }
+    }
+}
+
+/// Project `schedule.order` onto four buckets with edge-derived
+/// `in_loop_short` offsets.
+///
+/// Walk `order` once, computing first / last periodic positions
+/// in a first pass, then classifying each class in a second pass.
+/// A period-1 class whose Kahn position is strictly between the
+/// first and last periodic positions goes to `in_loop_short` with
+/// the offset from `derive_short_offset`; if that derivation
+/// returns `None`, the class falls back to `post_loop` (degenerate;
+/// `flat_order != schedule.order` is the red invariant that
+/// surfaces the gap).
+///
+/// Complexity: O(n_classes + |edges|).
 #[allow(dead_code)]
-pub(crate) fn partition_schedule(schedule: &Schedule, domain: &ClassDomain) -> PartitionedSchedule {
-    let mut pre_loop: Vec<usize> = Vec::new();
-    let mut periodic: Vec<usize> = Vec::new();
-    let mut post_loop: Vec<usize> = Vec::new();
-    let mut seen_periodic = false;
-    for &c in &schedule.order {
+pub(crate) fn partition_schedule(
+    schedule: &Schedule,
+    domain: &ClassDomain,
+    edges: &[BoundaryEdge],
+) -> PartitionedSchedule {
+    // First pass: find the Kahn positions of the first and last
+    // periodic classes.
+    let mut first_periodic_pos: Option<usize> = None;
+    let mut last_periodic_pos: Option<usize> = None;
+    for (pos, &c) in schedule.order.iter().enumerate() {
         if c >= domain.periods.len() {
             continue;
         }
         if domain.periods[c] > 1 {
-            periodic.push(c);
-            seen_periodic = true;
-        } else if !seen_periodic {
-            pre_loop.push(c);
-        } else {
-            post_loop.push(c);
+            if first_periodic_pos.is_none() {
+                first_periodic_pos = Some(pos);
+            }
+            last_periodic_pos = Some(pos);
         }
     }
+
+    // Precompute the set of periodic classes for
+    // `derive_short_offset`.
+    let periodic_set: BTreeSet<usize> = schedule
+        .order
+        .iter()
+        .copied()
+        .filter(|&c| c < domain.periods.len() && domain.periods[c] > 1)
+        .collect();
+
+    let mut pre_loop: Vec<usize> = Vec::new();
+    let mut periodic: Vec<usize> = Vec::new();
+    let mut in_loop_short: Vec<(usize, usize)> = Vec::new();
+    let mut post_loop: Vec<usize> = Vec::new();
+    let mut interior_classes: Vec<usize> = Vec::new();
+
+    for (pos, &c) in schedule.order.iter().enumerate() {
+        if c >= domain.periods.len() {
+            continue;
+        }
+        let period = domain.periods[c];
+        if period > 1 {
+            periodic.push(c);
+            interior_classes.push(c);
+            continue;
+        }
+        // period == 1 path.
+        let before_first = match first_periodic_pos {
+            Some(fp) => pos < fp,
+            None => true, // no periodic class exists → everything pre_loop
+        };
+        let after_last = match last_periodic_pos {
+            Some(lp) => pos > lp,
+            None => false,
+        };
+        if before_first {
+            pre_loop.push(c);
+        } else if after_last {
+            post_loop.push(c);
+        } else {
+            // Interleaved: derive offset from edges; fall back to
+            // post_loop when underivable (structural flag caught by
+            // category 16 flat_order invariants).
+            match derive_short_offset(c, edges, domain, &periodic_set) {
+                Some(offset) => {
+                    in_loop_short.push((c, offset));
+                    interior_classes.push(c);
+                }
+                None => {
+                    post_loop.push(c);
+                }
+            }
+        }
+    }
+
     PartitionedSchedule {
         pre_loop,
         periodic,
+        in_loop_short,
         post_loop,
+        interior_classes,
     }
 }
 
@@ -1025,9 +1176,10 @@ mod tests {
             order: vec![0, 1, 2],
         };
         let domain = dom(vec![1, 1, 1]);
-        let part = partition_schedule(&sched, &domain);
+        let part = partition_schedule(&sched, &domain, &[]);
         assert_eq!(part.pre_loop, vec![0, 1, 2]);
         assert!(part.periodic.is_empty());
+        assert!(part.in_loop_short.is_empty());
         assert!(part.post_loop.is_empty());
     }
 
@@ -1039,27 +1191,64 @@ mod tests {
             order: vec![0, 1, 2, 3, 4],
         };
         let domain = dom(vec![1, 1, 16, 16, 1]);
-        let part = partition_schedule(&sched, &domain);
+        let part = partition_schedule(&sched, &domain, &[]);
         assert_eq!(part.pre_loop, vec![0, 1]);
         assert_eq!(part.periodic, vec![2, 3]);
+        assert!(part.in_loop_short.is_empty());
         assert_eq!(part.post_loop, vec![4]);
     }
 
     #[test]
-    fn partition_period_one_interleaved_goes_post_loop() {
-        // A period-1 class between two periodic classes lands in
-        // post_loop (the "at or after first periodic" rule). This is
-        // the scope gap described in the module header — a richer
-        // emitter consumer would need to handle this, but the rule
-        // itself is total and unambiguous.
+    fn partition_period_one_interleaved_reroutes_to_in_loop_short() {
+        // A period-1 class between two periodic classes is an
+        // aliased-emittable reroute candidate. With edges that
+        // identify the offset (c1 reads c0 at iter 5, so c1 fires
+        // at __repeat = 5 = offset(c0) + 5), c1 moves to
+        // `in_loop_short` with offset 5 and c3 (post the last
+        // periodic) stays in `post_loop`.
         let sched = Schedule {
             order: vec![0, 1, 2, 3],
         };
-        let domain = dom(vec![16, 1, 16, 1]);
-        let part = partition_schedule(&sched, &domain);
+        let periods = vec![16, 1, 16, 1];
+        // Offsets mirror today's "short classes start late" rule
+        // so that offsets[0]=0 and c1's derived offset is directly
+        // the consumer iter.
+        let offsets = vec![0, 0, 0, 0];
+        let class_members = vec![
+            (0..16).map(SubgraphId).collect::<Vec<_>>(),
+            vec![SubgraphId(100)],
+            (0..16).map(|i| SubgraphId(200 + i)).collect::<Vec<_>>(),
+            vec![SubgraphId(300)],
+        ];
+        let domain = ClassDomain { periods, offsets };
+        // Single edge: c1 consumes c0 at c0's member 5. Offset = 5.
+        let edges = vec![edge(1, 0, 0, 0, 5, 5, 50, 0, 0)];
+        let part = partition_schedule(&sched, &domain, &edges);
+        let _ = class_members; // silence unused (domain carries lengths)
         assert_eq!(part.pre_loop, Vec::<usize>::new());
         assert_eq!(part.periodic, vec![0, 2]);
-        assert_eq!(part.post_loop, vec![1, 3]);
+        assert_eq!(part.in_loop_short, vec![(1, 5)]);
+        assert_eq!(part.post_loop, vec![3]);
+        assert_eq!(part.interior_classes, vec![0, 1, 2]);
+        assert_eq!(part.flat_order(), sched.order);
+    }
+
+    #[test]
+    fn partition_interleaved_without_edges_falls_back_to_post_loop() {
+        // When offset is underivable (no edges to/from a periodic
+        // neighbour), the interleaved period-1 class degrades into
+        // `post_loop`. flat_order then differs from schedule.order
+        // — category 16 (c) is the red that catches this on the
+        // real fixture.
+        let sched = Schedule {
+            order: vec![0, 1, 2],
+        };
+        let domain = dom(vec![16, 1, 16]);
+        let part = partition_schedule(&sched, &domain, &[]);
+        assert!(part.in_loop_short.is_empty());
+        assert_eq!(part.periodic, vec![0, 2]);
+        assert_eq!(part.post_loop, vec![1]);
+        assert_ne!(part.flat_order(), sched.order);
     }
 
     #[test]
@@ -1068,12 +1257,13 @@ mod tests {
             order: vec![3, 1, 0, 4, 2],
         };
         let domain = dom(vec![1, 12, 1, 12, 1]);
-        let part = partition_schedule(&sched, &domain);
+        let part = partition_schedule(&sched, &domain, &[]);
         let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for &c in part
             .pre_loop
             .iter()
             .chain(part.periodic.iter())
+            .chain(part.in_loop_short.iter().map(|(c, _)| c))
             .chain(part.post_loop.iter())
         {
             assert!(seen.insert(c), "class {c} appeared twice");
@@ -1089,7 +1279,7 @@ mod tests {
             order: vec![0, 1, 2, 3, 4, 5],
         };
         let domain = dom(vec![1, 1, 8, 8, 1, 1]);
-        let part = partition_schedule(&sched, &domain);
+        let part = partition_schedule(&sched, &domain, &[]);
         assert_eq!(part.flat_order(), sched.order);
     }
 
@@ -1099,9 +1289,57 @@ mod tests {
             order: vec![0, 1, 2],
         };
         let domain = dom(vec![4, 4, 4]);
-        let part = partition_schedule(&sched, &domain);
+        let part = partition_schedule(&sched, &domain, &[]);
         assert!(part.pre_loop.is_empty());
         assert_eq!(part.periodic, vec![0, 1, 2]);
+        assert!(part.in_loop_short.is_empty());
         assert!(part.post_loop.is_empty());
+    }
+
+    #[test]
+    fn partition_short_offset_mixed_feasibility() {
+        // c1 is period-1 interleaved. c0 is periodic period-16;
+        // c1 consumes c0 at iter 3 (lower bound 3) AND produces
+        // for c0 at iter 10 (upper bound 10). Offset = max(3, 10 → from
+        // producer min) — wait: producer-side takes MIN (c1 must
+        // fire before iter 10), consumer-side takes MAX (c1 must
+        // fire after iter 3). Feasibility: 3 ≤ 10. Pick max(3,10)=10.
+        let sched = Schedule {
+            order: vec![0, 1, 2],
+        };
+        let domain = ClassDomain {
+            periods: vec![16, 1, 16],
+            offsets: vec![0, 0, 0],
+        };
+        let edges = vec![
+            // c1 consumes from c0 at m=3
+            edge(1, 0, 0, 0, 3, 3, 30, 0, 0),
+            // c0 at m=10 consumes from c1
+            edge(0, 10, 0, 1, 0, 1, 11, 0, 0),
+        ];
+        let part = partition_schedule(&sched, &domain, &edges);
+        assert_eq!(part.in_loop_short, vec![(1, 10)]);
+    }
+
+    #[test]
+    fn partition_short_offset_infeasible_falls_back() {
+        // c1 would need to fire AFTER iter 10 (consumer) but BEFORE
+        // iter 3 (producer). Infeasible → None → post_loop fallback.
+        let sched = Schedule {
+            order: vec![0, 1, 2],
+        };
+        let domain = ClassDomain {
+            periods: vec![16, 1, 16],
+            offsets: vec![0, 0, 0],
+        };
+        let edges = vec![
+            // c1 consumes c0 at m=10 → lower bound 10
+            edge(1, 0, 0, 0, 10, 10, 100, 0, 0),
+            // c0 at m=3 consumes from c1 → upper bound 3
+            edge(0, 3, 0, 1, 0, 1, 11, 0, 0),
+        ];
+        let part = partition_schedule(&sched, &domain, &edges);
+        assert!(part.in_loop_short.is_empty());
+        assert_eq!(part.post_loop, vec![1]);
     }
 }

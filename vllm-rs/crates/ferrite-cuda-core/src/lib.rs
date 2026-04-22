@@ -25,7 +25,7 @@ pub mod alloc;
 pub mod arena;
 #[cfg(feature = "cuda")]
 pub mod cpu_gpu_buf;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cublas")]
 pub mod cublas;
 #[cfg(feature = "cuda")]
 pub mod device;
@@ -38,7 +38,7 @@ pub mod weights;
 pub use alloc::{CachingAllocator, OwnedTensor, RawGpuAlloc, RawGpuMem};
 #[cfg(feature = "cuda")]
 pub use cpu_gpu_buf::{CpuGpuBuf, PinnedBuf};
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cublas")]
 pub use cublas::CublasHandle;
 #[cfg(feature = "cuda")]
 pub use device::GpuDevice;

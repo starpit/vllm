@@ -11,6 +11,8 @@ default = []
 # numeric pipeline observations (NUM_TILES etc) are available;
 # the emitted runtime types stay gated out.
 cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda"]
+# Enable cuBLAS support (currently required for most model paths).
+cublas = ["cuda", "ferrite-kernels/cublas", "ferrite-cuda-core/cublas"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the

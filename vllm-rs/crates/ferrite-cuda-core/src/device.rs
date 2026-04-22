@@ -5,6 +5,7 @@
 //! The `transfer_stream` handles async H2D/D2H copies for overlap.
 
 use crate::alloc::CachingAllocator;
+#[cfg(feature = "cublas")]
 use crate::cublas::CublasHandle;
 use crate::driver;
 use anyhow::Result;
@@ -16,13 +17,15 @@ use cudarc::driver::sys::{CUcontext, CUevent, CUstream};
 /// Memory management uses a caching allocator (like PyTorch's CUDACachingAllocator)
 /// — tensors are freed on drop and their blocks reused from a free list.
 ///
-/// The `cublas` field is `Option<CublasHandle>` to support cublas-free operation.
-/// When `None`, any code path requiring cuBLAS will fail explicitly.
+/// The `cublas` field is `Option<CublasHandle>` when the `cublas` feature is enabled,
+/// to support cublas-free operation. When `None`, any code path requiring cuBLAS will
+/// fail explicitly. When the `cublas` feature is disabled, the field is not present.
 pub struct GpuDevice {
     pub device_id: i32,
     pub ctx: CUcontext,
     pub compute_stream: CUstream,
     pub transfer_stream: CUstream,
+    #[cfg(feature = "cublas")]
     pub cublas: Option<CublasHandle>,
     /// Caching allocator — the ONLY allocator. Like PyTorch's CUDACachingAllocator.
     pub caching: CachingAllocator,
@@ -64,11 +67,15 @@ impl GpuDevice {
             let d2h_done = driver::event_create_disable_timing()?;
 
             let mut caching = CachingAllocator::new();
+            #[cfg(feature = "cublas")]
             let cublas = if with_cublas {
                 Some(CublasHandle::new(compute_stream, &mut caching)?)
             } else {
                 None
             };
+            #[cfg(not(feature = "cublas"))]
+            let _ = with_cublas; // Suppress unused variable warning
+            
             let num_sm = driver::device_get_num_sm(cu_device)?;
             let sm_version = driver::device_get_sm_version(cu_device)?;
 
@@ -77,7 +84,10 @@ impl GpuDevice {
                 device_id,
                 num_sm,
                 sm_version,
+                #[cfg(feature = "cublas")]
                 if with_cublas { "enabled" } else { "disabled" },
+                #[cfg(not(feature = "cublas"))]
+                "not compiled",
             );
 
             Ok(Self {
@@ -85,6 +95,7 @@ impl GpuDevice {
                 ctx,
                 compute_stream,
                 transfer_stream,
+                #[cfg(feature = "cublas")]
                 cublas,
                 caching,
                 transfer_done,

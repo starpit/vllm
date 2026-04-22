@@ -8,11 +8,12 @@ description = "GPU kernel wrappers and layer types for the ferrite inference fra
 [features]
 default = []
 cuda = ["ferrite-cuda-core/cuda"]
+cublas = ["cuda", "ferrite-cuda-core/cublas"]
 nccl = ["cuda", "ferrite-cuda-core/nccl"]
 
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
-cudarc = { workspace = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+cudarc = { workspace = true, features = ["dynamic-linking", "cuda-version-from-build-system"] }
 half = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

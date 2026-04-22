@@ -9,13 +9,15 @@ description = "Purpose-built CUDA tensor runtime for LLM inference — replaces 
 default = []
 # Enable CUDA runtime. Requires CUDA toolkit + nvcc.
 cuda = ["dep:cudarc", "dep:ferrite-cuda-builder", "ferrite-cuda-builder/cuda", "dep:hf-hub", "ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-models/cuda"]
+# Enable cuBLAS support (currently required for most model paths).
+cublas = ["cuda", "ferrite-cuda-core/cublas", "ferrite-kernels/cublas"]
 # Enable NCCL multi-GPU collective communication (requires libnccl).
 nccl = ["cuda", "cudarc/nccl", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl"]
 # Enable NVTX profiling annotations for nsys/Nsight traces.
 profiling = ["cuda", "cudarc/nvtx"]
 
 [dependencies]
-cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+cudarc = { workspace = true, optional = true, features = ["dynamic-linking", "cuda-version-from-build-system"] }
 ferrite-cuda-builder = { path = "../ferrite-cuda-builder", optional = true }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-kernels = { path = "../ferrite-kernels" }

@@ -6288,9 +6288,9 @@ impl Implementation for CutlassGemmFallbackImpl {
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
-        // M=1 is GEMV territory
+        // Accept all workloads as fallback (including M=1 GEMV)
         WorkloadConstraint::NumTokensRange {
-            min: 2,
+            min: 1,
             max: u32::MAX,
         }
     }

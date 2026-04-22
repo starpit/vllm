@@ -8344,6 +8344,26 @@ mod tests {
             pub fn consumer_global_iter(t: &Truth, consumer_class: usize, member_k: usize) -> i64 {
                 t.sched.class_offsets[consumer_class] as i64 + member_k as i64
             }
+
+            /// Build the `StencilPipeline` for this fixture. The
+            /// pipeline is the pure, piecewise-affine analyser — per
+            /// STENCIL_IR_V2_DESIGN.md §0 the principled source of
+            /// truth the emitter consumes, replacing the heuristic
+            /// `class_input_provenance` sampler.
+            ///
+            /// Failure (Δ=0 cycle) is a structural bug in the
+            /// fixture, not a test failure condition — panic is
+            /// correct.
+            pub fn pipeline(t: &Truth) -> crate::stencil_pipeline::StencilPipeline {
+                crate::stencil_pipeline::StencilPipeline::build(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                    &t.sched.class_offsets,
+                )
+                .expect("fixture must build without Δ=0 cycle")
+            }
         }
 
         // ──────────────────────────────────────────────────────────
@@ -8431,68 +8451,103 @@ mod tests {
                 }
             }
 
-            /// For each class C and boundary position i, every member
-            /// must read from the SAME producer class. If member[0]
-            /// reads class A and member[1] reads class B, the
-            /// periodicity pass merged subgraphs with different
-            /// upstream class chains — over-collapse.
+            /// For each class C and boundary position i, the
+            /// pipeline's `target_for(C, i, m)` returns a producer
+            /// that matches ground truth for every member m.
             ///
-            /// (This catches the c6 shape: member[0] reads c5,
-            /// member[1..] reads c9 — different producer classes.)
+            /// Where the legacy invariant required "uniform producer
+            /// class across members" — a condition that forbade
+            /// well-formed offset-gap shapes like c6 reading c5 at
+            /// m=0 and c9 at m>0 — the principled-compiler
+            /// replacement accepts per-member variance as long as
+            /// the `ReadPlan` resolves it structurally (one region
+            /// per distinct producer; every member in a region).
+            /// Retargeted per STENCIL_IR_V2_DESIGN.md §0.
             #[test]
             fn all_members_share_uniform_producer_class_per_boundary() {
                 let t = load();
-                for &c in &t.sched.periodic {
+                let pipe = pipeline(&t);
+                for &c in &pipe.partition.periodic {
                     let nb = boundary_count(&t, c);
                     for i in 0..nb {
-                        let mut producer_classes: BTreeSet<usize> = BTreeSet::new();
                         for k in 0..t.stencil.class_members[c].len() {
-                            let Some(gt) = boundary_truth(&t, c, k, i) else {
-                                continue;
+                            let Some(gt) = boundary_truth(&t, c, k, i) else { continue };
+                            let Some(tgt) = pipe.target_for(c, i, k) else {
+                                panic!("class c{c} boundary[{i}] m[{k}]: \
+                                        pipeline returned None — ReadPlan \
+                                        coverage gap");
                             };
-                            producer_classes.insert(gt.producer_class);
+                            let period_1 =
+                                t.stencil.class_members[gt.producer_class].len() == 1;
+                            match (tgt, period_1) {
+                                (crate::stencil_pipeline::DepTarget::PreLoop { producer_sg, .. }, true) =>
+                                    assert_eq!(producer_sg, gt.producer_sg,
+                                        "c{c} b[{i}] m[{k}]: PreLoop sg mismatch"),
+                                (crate::stencil_pipeline::DepTarget::Periodic { producer_class, .. }, false) =>
+                                    assert_eq!(producer_class, gt.producer_class,
+                                        "c{c} b[{i}] m[{k}]: producer_class mismatch"),
+                                _ => panic!("c{c} b[{i}] m[{k}]: period/target kind mismatch"),
+                            }
                         }
-                        assert!(
-                            producer_classes.len() <= 1,
-                            "class c{c} boundary[{i}]: members read from \
-                             different producer classes {{ {producer_classes:?} }}. \
-                             Over-collapse — periodicity pass merged subgraphs \
-                             with different upstream class chains. \
-                             (This is the c5-vs-c9 / c6 shape.)",
-                        );
                     }
                 }
             }
 
-            /// For each class C and boundary position i, every member
-            /// must read the same producer (pos_in_producer_claim,
-            /// slot) even when producer class is uniform. Drift here
-            /// means the periodicity pass lost alignment on multi-
-            /// tile producer claims.
+            /// For each class C and boundary position i, the
+            /// pipeline's `target_for(C, i, m)` names the same
+            /// (producer_tile, producer_slot) tuple as ground truth
+            /// for every member — the multi-tile producer alignment
+            /// invariant, now stated in terms of the ReadPlan's
+            /// DepTarget rather than the legacy per-boundary
+            /// `InputOrigin::producer_pos`. Retargeted per
+            /// STENCIL_IR_V2_DESIGN.md §0.
             #[test]
             fn all_members_share_uniform_producer_position_per_boundary() {
                 let t = load();
-                for &c in &t.sched.periodic {
+                let pipe = pipeline(&t);
+                for &c in &pipe.partition.periodic {
                     let nb = boundary_count(&t, c);
                     for i in 0..nb {
-                        let mut pp_slots: BTreeSet<(u8, u8)> = BTreeSet::new();
                         for k in 0..t.stencil.class_members[c].len() {
-                            let Some(gt) = boundary_truth(&t, c, k, i) else {
-                                continue;
+                            let Some(gt) = boundary_truth(&t, c, k, i) else { continue };
+                            let Some(tgt) = pipe.target_for(c, i, k) else { continue };
+                            let (tgt_tile, tgt_slot) = match tgt {
+                                crate::stencil_pipeline::DepTarget::PreLoop {
+                                    producer_tile,
+                                    producer_slot,
+                                    ..
+                                } => (producer_tile, producer_slot),
+                                crate::stencil_pipeline::DepTarget::Periodic {
+                                    producer_tile_pos,
+                                    producer_slot,
+                                    producer_class,
+                                    ..
+                                } => {
+                                    // producer_tile_pos is position in the
+                                    // producer class's rep claim; look up
+                                    // the actual TileId via ground truth's
+                                    // producer class's member at the same
+                                    // k-shifted index. For the uniformity
+                                    // invariant we compare (tile_pos, slot)
+                                    // between pipeline and ground truth.
+                                    let prod_claim = t.solved.sfuf.tiles_in_subgraph(gt.producer_sg);
+                                    let Some(gt_tile_pos) = prod_claim.iter()
+                                        .position(|&x| x == gt.producer_tile)
+                                        .map(|p| p as u8)
+                                    else { continue };
+                                    assert_eq!(
+                                        (producer_class, producer_tile_pos, producer_slot),
+                                        (gt.producer_class, gt_tile_pos, gt.producer_slot),
+                                        "c{c} b[{i}] m[{k}]: Periodic (class, \
+                                         tile_pos, slot) mismatch");
+                                    continue;
+                                }
                             };
-                            let prod_claim =
-                                t.solved.sfuf.tiles_in_subgraph(gt.producer_sg);
-                            let Some(prod_pos) =
-                                prod_claim.iter().position(|&x| x == gt.producer_tile)
-                            else { continue };
-                            pp_slots.insert((prod_pos as u8, gt.producer_slot));
+                            assert_eq!(
+                                (tgt_tile, tgt_slot),
+                                (gt.producer_tile, gt.producer_slot),
+                                "c{c} b[{i}] m[{k}]: PreLoop (tile, slot) mismatch");
                         }
-                        assert!(
-                            pp_slots.len() <= 1,
-                            "class c{c} boundary[{i}]: members read different \
-                             (producer_pos, producer_slot) tuples {{ {pp_slots:?} }}. \
-                             Multi-tile producer alignment broken.",
-                        );
                     }
                 }
             }
@@ -8510,107 +8565,76 @@ mod tests {
             use super::*;
             use super::truth::*;
 
-            /// Compiler's classification of a boundary input must
-            /// name a producer class that matches ground truth for
-            /// EVERY member of the consumer class (not just the rep).
+            /// Pipeline's `target_for(class, bp, member_k)` names a
+            /// producer class that matches ground truth for EVERY
+            /// member of the consumer class (not just the rep).
+            /// Retargeted from `class_input_provenance` per
+            /// STENCIL_IR_V2_DESIGN.md §13 (step 6b).
             #[test]
             fn origin_producer_class_matches_every_member() {
                 let t = load();
-                let prov = t.stencil
-                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
-                    .expect("provenance must succeed");
-                for ci in &prov {
-                    for (i, slot) in ci.slots.iter().enumerate() {
-                        let expected_producer_class = match &slot.origin {
-                            InputOrigin::IntraIter { producer_class, .. }
-                            | InputOrigin::LoopCarry { producer_class, .. }
-                            => Some(*producer_class),
-                            InputOrigin::PreLoop { .. } => None,
-                        };
-                        for k in 0..t.stencil.class_members[ci.consumer_class].len() {
-                            let Some(gt) = boundary_truth(&t, ci.consumer_class, k, i)
-                            else { continue };
-                            let is_preloop_in_ground_truth =
-                                t.sched.pre_loop.contains(&gt.producer_class);
-                            match (expected_producer_class, is_preloop_in_ground_truth) {
-                                (Some(expected), false) => assert_eq!(
-                                    gt.producer_class, expected,
-                                    "c{c} member[{k}] boundary[{i}]: ground truth \
-                                     producer_class={gt_pc}, compiler said {expected}. \
-                                     Member-sampling heuristic is leaking.",
-                                    c = ci.consumer_class,
-                                    gt_pc = gt.producer_class,
-                                ),
-                                (None, true) => {}  // both pre_loop, OK
-                                (Some(expected), true) => {
-                                    // ground truth for this member is pre_loop, but
-                                    // compiler produced a periodic producer. Valid
-                                    // only if the compiler ALSO provides a
-                                    // pre_loop_init for this boundary (offset-gap
-                                    // shape). The existing InputOrigin doesn't
-                                    // distinguish per-member, so this test fires
-                                    // whenever the mixing is happening — which is
-                                    // exactly the c2/c8 shape.
-                                    let has_preloop_init = matches!(
-                                        &slot.origin,
-                                        InputOrigin::LoopCarry {
-                                            pre_loop_init_sg: Some(_), ..
-                                        },
-                                    );
-                                    assert!(
-                                        has_preloop_init,
-                                        "c{c} member[{k}] boundary[{i}]: ground truth \
-                                         is PreLoop at this member but compiler emits \
-                                         Periodic({expected}) without a pre_loop_init. \
-                                         The offset-gap shape isn't tracked — \
-                                         consumer will read stale/wrong tensor at iter {k}.",
-                                        c = ci.consumer_class,
-                                    );
+                let pipe = pipeline(&t);
+                for &c in &pipe.partition.periodic {
+                    let period = t.stencil.class_members[c].len();
+                    let nbp = boundary_count(&t, c);
+                    for m in 0..period {
+                        for bp in 0..nbp {
+                            let Some(gt) = boundary_truth(&t, c, m, bp) else { continue };
+                            let Some(tgt) = pipe.target_for(c, bp, m) else { continue };
+                            let is_period_1 =
+                                t.stencil.class_members[gt.producer_class].len() == 1;
+                            match (tgt, is_period_1) {
+                                (crate::stencil_pipeline::DepTarget::PreLoop { producer_sg, .. }, true) => {
+                                    assert_eq!(producer_sg, gt.producer_sg,
+                                        "c{c} member[{m}] boundary[{bp}]: PreLoop sg mismatch");
                                 }
-                                (None, false) => panic!(
-                                    "c{c} member[{k}] boundary[{i}]: ground truth is \
-                                     periodic (class {gt_pc}), compiler said PreLoop.",
-                                    c = ci.consumer_class,
-                                    gt_pc = gt.producer_class,
-                                ),
+                                (crate::stencil_pipeline::DepTarget::Periodic { producer_class, .. }, false) => {
+                                    assert_eq!(producer_class, gt.producer_class,
+                                        "c{c} member[{m}] boundary[{bp}]: pipeline \
+                                         producer_class={producer_class}, ground truth={gt_pc}",
+                                        gt_pc = gt.producer_class);
+                                }
+                                (crate::stencil_pipeline::DepTarget::Periodic { producer_class, .. }, true) => panic!(
+                                    "c{c} member[{m}] boundary[{bp}]: ground truth \
+                                     period-1 (c{gt_pc}) but pipeline returned \
+                                     Periodic({producer_class})",
+                                    gt_pc = gt.producer_class),
+                                (crate::stencil_pipeline::DepTarget::PreLoop { .. }, false) => panic!(
+                                    "c{c} member[{m}] boundary[{bp}]: ground truth \
+                                     is periodic (c{gt_pc}), pipeline said PreLoop",
+                                    gt_pc = gt.producer_class),
                             }
                         }
                     }
                 }
             }
 
-            /// Compiler's Δ_global classification must match ground
-            /// truth per member. For IntraIter: 0. For LoopCarry: 1.
-            /// Any other value means the wrong variant was emitted.
+            /// Pipeline's `DepTarget::Periodic.delta_global` matches
+            /// ground truth per member. Retargeted from
+            /// `class_input_provenance` per STENCIL_IR_V2_DESIGN.md
+            /// §13 (step 6b).
             #[test]
             fn origin_delta_global_matches_every_member() {
                 let t = load();
-                let prov = t.stencil
-                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
-                    .expect("provenance must succeed");
-                for ci in &prov {
-                    for (i, slot) in ci.slots.iter().enumerate() {
-                        let expected_delta = match &slot.origin {
-                            InputOrigin::IntraIter { .. } => Some(0i64),
-                            InputOrigin::LoopCarry { .. } => Some(1i64),
-                            InputOrigin::PreLoop { .. } => None,
-                        };
-                        let Some(expected) = expected_delta else { continue };
-                        for k in 0..t.stencil.class_members[ci.consumer_class].len() {
-                            let Some(gt) = boundary_truth(&t, ci.consumer_class, k, i)
-                            else { continue };
-                            let cgi = consumer_global_iter(&t, ci.consumer_class, k);
-                            let actual = cgi - gt.producer_global_iter;
-                            if t.sched.pre_loop.contains(&gt.producer_class) {
-                                continue;  // pre_loop override iter
-                            }
-                            assert_eq!(
-                                actual, expected,
-                                "c{c} member[{k}] boundary[{i}]: ground truth \
-                                 Δ_global={actual}, compiler classification \
-                                 requires Δ_global={expected}. Wrong variant emitted.",
-                                c = ci.consumer_class,
-                            );
+                let pipe = pipeline(&t);
+                for &c in &pipe.partition.periodic {
+                    let period = t.stencil.class_members[c].len();
+                    let nbp = boundary_count(&t, c);
+                    for m in 0..period {
+                        for bp in 0..nbp {
+                            let Some(gt) = boundary_truth(&t, c, m, bp) else { continue };
+                            if t.stencil.class_members[gt.producer_class].len() == 1 { continue }
+                            let Some(tgt) = pipe.target_for(c, bp, m) else { continue };
+                            let crate::stencil_pipeline::DepTarget::Periodic { delta_global, .. } = tgt
+                            else {
+                                panic!("c{c} member[{m}] boundary[{bp}]: ground truth \
+                                        periodic, pipeline returned PreLoop");
+                            };
+                            let cgi = consumer_global_iter(&t, c, m);
+                            let expected = cgi - gt.producer_global_iter;
+                            assert_eq!(delta_global, expected,
+                                "c{c} member[{m}] boundary[{bp}]: ground truth \
+                                 Δ_global={expected}, pipeline returned {delta_global}");
                         }
                     }
                 }
@@ -8792,31 +8816,36 @@ mod tests {
             }
 
             /// For every boundary input with Δ_global=0, the producer
-            /// must schedule before the consumer in loop body order.
-            /// This is the "proper topo sort" requirement:
-            /// intra-iter deps drive ordering.
+            /// must schedule before the consumer in the pipeline's
+            /// topological `Schedule.order`. This is the "proper
+            /// topo sort" requirement: intra-iter deps drive
+            /// ordering. Retargeted from `t.sched.periodic`'s
+            /// offset-sort to the principled Kahn topo sort per
+            /// STENCIL_IR_V2_DESIGN.md §13.
             #[test]
             fn delta_0_edges_have_producer_before_consumer() {
                 let t = load();
-                let pos_of: HashMap<usize, usize> = t.sched.periodic
+                let pipe = pipeline(&t);
+                let pos_of: HashMap<usize, usize> = pipe
+                    .schedule
+                    .order
                     .iter()
                     .enumerate()
                     .map(|(idx, &c)| (c, idx))
                     .collect();
-                for &c in &t.sched.periodic {
+                for &c in &pipe.partition.periodic {
                     let c_idx = pos_of[&c];
                     let nb = boundary_count(&t, c);
                     for i in 0..nb {
                         for k in 0..t.stencil.class_members[c].len() {
                             let Some(gt) = boundary_truth(&t, c, k, i) else { continue };
-                            if !pos_of.contains_key(&gt.producer_class) { continue; }
+                            let Some(&p_idx) = pos_of.get(&gt.producer_class) else { continue };
                             let cgi = consumer_global_iter(&t, c, k);
                             let delta = cgi - gt.producer_global_iter;
                             if delta != 0 { continue; }
-                            let p_idx = pos_of[&gt.producer_class];
                             assert!(
                                 p_idx < c_idx,
-                                "c{c} (loop-body idx {c_idx}) reads c{gpc} \
+                                "c{c} (schedule idx {c_idx}) reads c{gpc} \
                                  (idx {p_idx}) at Δ_global=0 — producer must be \
                                  scheduled earlier in the loop body but isn't.",
                                 gpc = gt.producer_class,
@@ -9113,176 +9142,199 @@ mod tests {
         // - member_producer_is_consistent  (one per triple)
         // ──────────────────────────────────────────────────────────
         mod per_triple {
-            use super::*;
             use super::truth::*;
 
-            /// For (class, boundary, member), assert compiler's
-            /// provenance-reported producer_class matches ground
-            /// truth's producer_class (derived from the unrolled
-            /// DAG for THIS specific member — not sampled).
+            /// For (class, boundary, member), assert the pipeline's
+            /// `target_for(class, bp, member_k)` names a producer
+            /// matching ground-truth's producer for THIS specific
+            /// member — the principled piecewise-affine lookup, no
+            /// member[0] sampling. Retargeted from
+            /// `class_input_provenance` in step 6b of the rewrite
+            /// (STENCIL_IR_V2_DESIGN.md §13).
             fn check_producer_class(
                 class: usize,
                 boundary: usize,
                 member_k: usize,
             ) {
                 let t = load();
-                let prov = t
-                    .stencil
-                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
-                    .expect("provenance");
-                let ci = prov
-                    .iter()
-                    .find(|c| c.consumer_class == class)
-                    .expect("consumer class present");
-                let slot = ci
-                    .slots
-                    .get(boundary)
-                    .expect("boundary position in range");
+                let pipe = pipeline(&t);
                 let gt = boundary_truth(&t, class, member_k, boundary)
                     .expect("ground truth for member");
-                let is_preloop = t.sched.pre_loop.contains(&gt.producer_class);
-                match (&slot.origin, is_preloop) {
-                    (InputOrigin::PreLoop { producer_sg }, true) => {
+                let tgt = pipe
+                    .target_for(class, boundary, member_k)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "c{class} b[{boundary}] m[{member_k}]: pipeline \
+                             returned None — ReadPlan coverage gap",
+                        )
+                    });
+                let is_preloop =
+                    t.stencil.class_members[gt.producer_class].len() == 1;
+                match (tgt, is_preloop) {
+                    (
+                        crate::stencil_pipeline::DepTarget::PreLoop { producer_sg, .. },
+                        true,
+                    ) => {
                         assert_eq!(
-                            *producer_sg, gt.producer_sg,
+                            producer_sg, gt.producer_sg,
                             "c{class} b[{boundary}] m[{member_k}]: PreLoop sg mismatch",
                         );
                     }
-                    (InputOrigin::IntraIter { producer_class, .. }, false)
-                    | (InputOrigin::LoopCarry { producer_class, .. }, false) => {
+                    (
+                        crate::stencil_pipeline::DepTarget::Periodic {
+                            producer_class, ..
+                        },
+                        false,
+                    ) => {
                         assert_eq!(
-                            *producer_class, gt.producer_class,
-                            "c{class} b[{boundary}] m[{member_k}]: compiler \
-                             said producer_class={pc}, ground truth \
+                            producer_class, gt.producer_class,
+                            "c{class} b[{boundary}] m[{member_k}]: pipeline \
+                             said producer_class={producer_class}, ground truth \
                              producer_class={gt_pc}",
-                            pc = producer_class,
                             gt_pc = gt.producer_class,
                         );
                     }
-                    (InputOrigin::IntraIter { producer_class, .. }, true) => {
-                        // Ground truth says pre_loop at this member but
-                        // compiler emits IntraIter — a period-mismatch
-                        // read where iter 0 reads pre_loop and
-                        // iter >= offset(producer) reads periodic. The
-                        // current IntraIter variant has no pre_loop_init
-                        // field, so this is definitively wrong —
-                        // emitter will read the periodic producer's
-                        // output at iter 0 when producer hasn't fired.
-                        panic!(
-                            "c{class} b[{boundary}] m[{member_k}]: ground truth \
-                             is PreLoop (c{gt_pc}), compiler emits \
-                             IntraIter({pc}). Offset-gap shape not tracked.",
-                            pc = producer_class,
-                            gt_pc = gt.producer_class,
-                        );
-                    }
-                    (InputOrigin::LoopCarry { producer_class, pre_loop_init_sg, .. }, true) => {
-                        // Ground truth says pre_loop at this member and
-                        // compiler emits LoopCarry. Valid iff
-                        // pre_loop_init_sg covers iter 0 via a real
-                        // pre-loop source.
-                        assert!(
-                            pre_loop_init_sg.is_some(),
-                            "c{class} b[{boundary}] m[{member_k}]: ground truth \
-                             is PreLoop (c{gt_pc}), compiler emits LoopCarry({pc}) \
-                             without pre_loop_init_sg.",
-                            pc = producer_class,
-                            gt_pc = gt.producer_class,
-                        );
-                    }
-                    (InputOrigin::PreLoop { .. }, false) => {
-                        panic!(
-                            "c{class} b[{boundary}] m[{member_k}]: ground truth \
-                             is periodic (c{gt_pc}), compiler said PreLoop",
-                            gt_pc = gt.producer_class,
-                        );
-                    }
+                    (
+                        crate::stencil_pipeline::DepTarget::Periodic {
+                            producer_class, ..
+                        },
+                        true,
+                    ) => panic!(
+                        "c{class} b[{boundary}] m[{member_k}]: ground truth is \
+                         PreLoop (c{gt_pc}) but pipeline returned \
+                         Periodic({producer_class}) — classifier conflated \
+                         period-1 producer with periodic class",
+                        gt_pc = gt.producer_class,
+                    ),
+                    (
+                        crate::stencil_pipeline::DepTarget::PreLoop { .. },
+                        false,
+                    ) => panic!(
+                        "c{class} b[{boundary}] m[{member_k}]: ground truth is \
+                         periodic (c{gt_pc}), pipeline said PreLoop",
+                        gt_pc = gt.producer_class,
+                    ),
                 }
             }
 
-            /// For (class, boundary, member), assert compiler's
-            /// classification implies a Δ_global consistent with
-            /// ground truth. IntraIter ⇒ Δ_global = 0,
-            /// LoopCarry ⇒ Δ_global = 1.
+            /// For (class, boundary, member), assert the pipeline's
+            /// `DepTarget::Periodic.delta_global` equals the ground-
+            /// truth Δ_global. PreLoop producers carry no Δ semantics.
             fn check_delta_global(
                 class: usize,
                 boundary: usize,
                 member_k: usize,
             ) {
                 let t = load();
-                let prov = t
-                    .stencil
-                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
-                    .expect("provenance");
-                let ci = prov
-                    .iter()
-                    .find(|c| c.consumer_class == class)
-                    .expect("consumer class present");
-                let slot = ci.slots.get(boundary).expect("boundary in range");
-                let expected_delta = match &slot.origin {
-                    InputOrigin::IntraIter { .. } => Some(0i64),
-                    InputOrigin::LoopCarry { .. } => Some(1i64),
-                    InputOrigin::PreLoop { .. } => None,
-                };
-                let Some(expected) = expected_delta else { return };
+                let pipe = pipeline(&t);
                 let gt = boundary_truth(&t, class, member_k, boundary)
                     .expect("ground truth");
-                if t.sched.pre_loop.contains(&gt.producer_class) {
+                if t.stencil.class_members[gt.producer_class].len() == 1 {
                     return;
                 }
+                let tgt = pipe
+                    .target_for(class, boundary, member_k)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "c{class} b[{boundary}] m[{member_k}]: pipeline \
+                             returned None on a periodic producer",
+                        )
+                    });
+                let crate::stencil_pipeline::DepTarget::Periodic {
+                    delta_global, ..
+                } = tgt
+                else {
+                    panic!(
+                        "c{class} b[{boundary}] m[{member_k}]: ground truth \
+                         is periodic, pipeline returned PreLoop",
+                    );
+                };
                 let cgi = consumer_global_iter(&t, class, member_k);
-                let actual = cgi - gt.producer_global_iter;
+                let expected = cgi - gt.producer_global_iter;
                 assert_eq!(
-                    actual, expected,
+                    delta_global, expected,
                     "c{class} b[{boundary}] m[{member_k}]: ground truth \
-                     Δ_global={actual}, compiler's variant requires {expected}",
+                     Δ_global={expected}, pipeline returned Δ_global={delta_global}",
                 );
             }
 
-            /// For (class, boundary, member), assert this member's
-            /// ground-truth producer agrees with member[0]'s
-            /// producer (either both pre_loop, or same periodic
-            /// class, or the full offset-gap partition is covered).
-            /// Catches per-class over-collapse at member granularity.
+            /// For (class, boundary, member), assert the pipeline's
+            /// `target_for` names the per-member producer that ground
+            /// truth names — specifically, the class and the
+            /// producer_tile-pos/slot agree. Where the legacy
+            /// invariant required uniform-producer-per-class (a
+            /// too-strict condition that forbade well-formed offset-
+            /// gap shapes), the principled-compiler replacement
+            /// accepts per-member variance as long as the ReadPlan
+            /// resolves it structurally.
             fn check_member_consistent_with_rep(
                 class: usize,
                 boundary: usize,
                 member_k: usize,
             ) {
                 let t = load();
-                let gt_rep = boundary_truth(&t, class, 0, boundary)
-                    .expect("ground truth for rep");
+                let pipe = pipeline(&t);
                 let gt_k = boundary_truth(&t, class, member_k, boundary)
                     .expect("ground truth for member");
-                let rep_is_preloop = t.sched.pre_loop.contains(&gt_rep.producer_class);
-                let k_is_preloop = t.sched.pre_loop.contains(&gt_k.producer_class);
-                match (rep_is_preloop, k_is_preloop) {
-                    (true, true) => {
-                        // Both pre_loop — must be same sg.
+                let tgt = pipe
+                    .target_for(class, boundary, member_k)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "c{class} b[{boundary}] m[{member_k}]: pipeline \
+                             returned None — ReadPlan doesn't cover this member",
+                        )
+                    });
+                let k_is_preloop =
+                    t.stencil.class_members[gt_k.producer_class].len() == 1;
+                match (tgt, k_is_preloop) {
+                    (
+                        crate::stencil_pipeline::DepTarget::PreLoop {
+                            producer_sg,
+                            producer_tile,
+                            producer_slot,
+                        },
+                        true,
+                    ) => {
                         assert_eq!(
-                            gt_rep.producer_sg, gt_k.producer_sg,
-                            "c{class} b[{boundary}] m[{member_k}]: rep reads \
-                             pre_loop sg {rep_sg:?}, member reads {k_sg:?}",
-                            rep_sg = gt_rep.producer_sg,
-                            k_sg = gt_k.producer_sg,
+                            (producer_sg, producer_tile, producer_slot),
+                            (gt_k.producer_sg, gt_k.producer_tile, gt_k.producer_slot),
+                            "c{class} b[{boundary}] m[{member_k}]: PreLoop \
+                             (sg, tile, slot) mismatch with ground truth",
                         );
                     }
-                    (false, false) => {
-                        // Both periodic — producer_class must match.
+                    (
+                        crate::stencil_pipeline::DepTarget::Periodic {
+                            producer_class, ..
+                        },
+                        false,
+                    ) => {
                         assert_eq!(
-                            gt_rep.producer_class, gt_k.producer_class,
-                            "c{class} b[{boundary}] m[{member_k}]: rep reads \
-                             periodic c{rep_pc}, member reads c{k_pc}. \
-                             Class over-collapsed (different upstream \
-                             producer classes across members).",
-                            rep_pc = gt_rep.producer_class,
-                            k_pc = gt_k.producer_class,
+                            producer_class, gt_k.producer_class,
+                            "c{class} b[{boundary}] m[{member_k}]: \
+                             pipeline producer_class={producer_class}, \
+                             ground truth producer_class={gt_pc}",
+                            gt_pc = gt_k.producer_class,
                         );
                     }
-                    // Mixed pre/periodic = valid ONLY for offset-gap
-                    // shape (rep at offset 0 reads pre_loop,
-                    // members ≥ offset(P) read P periodic).
-                    (true, false) | (false, true) => {}
+                    (
+                        crate::stencil_pipeline::DepTarget::Periodic {
+                            producer_class, ..
+                        },
+                        true,
+                    ) => panic!(
+                        "c{class} b[{boundary}] m[{member_k}]: ground truth \
+                         is PreLoop (c{gt_pc}) but pipeline returned \
+                         Periodic({producer_class})",
+                        gt_pc = gt_k.producer_class,
+                    ),
+                    (
+                        crate::stencil_pipeline::DepTarget::PreLoop { .. },
+                        false,
+                    ) => panic!(
+                        "c{class} b[{boundary}] m[{member_k}]: ground truth \
+                         is periodic (c{gt_pc}) but pipeline returned PreLoop",
+                        gt_pc = gt_k.producer_class,
+                    ),
                 }
             }
 
@@ -9712,16 +9764,27 @@ mod tests {
             #[test]
             fn all_members_share_uniform_producer_class_per_boundary() {
                 let t = load_3b();
-                for &c in &t.sched.periodic {
+                let pipe = pipeline(&t);
+                for &c in &pipe.partition.periodic {
                     let nb = boundary_count(&t, c);
                     for i in 0..nb {
-                        let mut pcs: BTreeSet<usize> = BTreeSet::new();
                         for k in 0..t.stencil.class_members[c].len() {
                             let Some(gt) = boundary_truth(&t, c, k, i) else { continue };
-                            pcs.insert(gt.producer_class);
+                            let Some(tgt) = pipe.target_for(c, i, k) else {
+                                panic!("3b c{c} b[{i}] m[{k}]: ReadPlan gap");
+                            };
+                            let period_1 =
+                                t.stencil.class_members[gt.producer_class].len() == 1;
+                            match (tgt, period_1) {
+                                (crate::stencil_pipeline::DepTarget::PreLoop { producer_sg, .. }, true) =>
+                                    assert_eq!(producer_sg, gt.producer_sg,
+                                        "3b c{c} b[{i}] m[{k}]: PreLoop sg mismatch"),
+                                (crate::stencil_pipeline::DepTarget::Periodic { producer_class, .. }, false) =>
+                                    assert_eq!(producer_class, gt.producer_class,
+                                        "3b c{c} b[{i}] m[{k}]: producer_class mismatch"),
+                                _ => panic!("3b c{c} b[{i}] m[{k}]: kind mismatch"),
+                            }
                         }
-                        assert!(pcs.len() <= 1,
-                            "3b c{c} b[{i}]: different producer classes {pcs:?}");
                     }
                 }
             }
@@ -9811,70 +9874,65 @@ mod tests {
         // numbering as 1b (validated by cross_scale tests).
         // ──────────────────────────────────────────────────────────
         mod per_triple_3b {
-            use super::*;
             use super::truth::*;
 
             fn check_producer_class(class: usize, boundary: usize, member_k: usize) {
                 let t = load_3b();
-                let prov = t
-                    .stencil
-                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
-                    .expect("prov");
-                let ci = prov.iter().find(|c| c.consumer_class == class)
-                    .expect("consumer present");
-                let Some(slot) = ci.slots.get(boundary) else { return };
+                let pipe = pipeline(&t);
                 let Some(gt) = boundary_truth(&t, class, member_k, boundary) else { return };
-                let is_pre = t.sched.pre_loop.contains(&gt.producer_class);
-                match (&slot.origin, is_pre) {
-                    (InputOrigin::PreLoop { producer_sg }, true) => {
-                        assert_eq!(*producer_sg, gt.producer_sg);
-                    }
-                    (InputOrigin::IntraIter { producer_class, .. }, false)
-                    | (InputOrigin::LoopCarry { producer_class, .. }, false) => {
-                        assert_eq!(*producer_class, gt.producer_class,
-                            "3b c{class} b[{boundary}] m[{member_k}]: \
-                             producer_class mismatch");
-                    }
-                    (InputOrigin::IntraIter { producer_class, .. }, true) => {
-                        panic!(
-                            "3b c{class} b[{boundary}] m[{member_k}]: ground \
-                             truth PreLoop but compiler emits IntraIter({producer_class})"
-                        );
-                    }
-                    (InputOrigin::LoopCarry { pre_loop_init_sg, .. }, true) => {
-                        assert!(pre_loop_init_sg.is_some(),
-                            "3b c{class} b[{boundary}] m[{member_k}]: \
-                             LoopCarry without preloop init");
-                    }
-                    (InputOrigin::PreLoop { .. }, false) => {
-                        panic!("3b c{class} b[{boundary}] m[{member_k}]: \
-                            ground truth periodic but compiler PreLoop");
-                    }
+                let Some(tgt) = pipe.target_for(class, boundary, member_k) else { return };
+                let is_pre = t.stencil.class_members[gt.producer_class].len() == 1;
+                match (tgt, is_pre) {
+                    (
+                        crate::stencil_pipeline::DepTarget::PreLoop { producer_sg, .. },
+                        true,
+                    ) => assert_eq!(producer_sg, gt.producer_sg,
+                        "3b c{class} b[{boundary}] m[{member_k}]: PreLoop sg mismatch"),
+                    (
+                        crate::stencil_pipeline::DepTarget::Periodic {
+                            producer_class, ..
+                        },
+                        false,
+                    ) => assert_eq!(producer_class, gt.producer_class,
+                        "3b c{class} b[{boundary}] m[{member_k}]: \
+                         producer_class mismatch (pipeline={producer_class}, \
+                         ground_truth={gt_pc})",
+                        gt_pc = gt.producer_class),
+                    (
+                        crate::stencil_pipeline::DepTarget::Periodic {
+                            producer_class, ..
+                        },
+                        true,
+                    ) => panic!(
+                        "3b c{class} b[{boundary}] m[{member_k}]: ground truth \
+                         PreLoop but pipeline emits Periodic({producer_class})"
+                    ),
+                    (
+                        crate::stencil_pipeline::DepTarget::PreLoop { .. },
+                        false,
+                    ) => panic!(
+                        "3b c{class} b[{boundary}] m[{member_k}]: ground truth \
+                         periodic but pipeline PreLoop"
+                    ),
                 }
             }
 
             fn check_delta_global(class: usize, boundary: usize, member_k: usize) {
                 let t = load_3b();
-                let prov = t
-                    .stencil
-                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
-                    .expect("prov");
-                let ci = prov.iter().find(|c| c.consumer_class == class)
-                    .expect("consumer present");
-                let Some(slot) = ci.slots.get(boundary) else { return };
-                let expected = match &slot.origin {
-                    InputOrigin::IntraIter { .. } => Some(0i64),
-                    InputOrigin::LoopCarry { .. } => Some(1i64),
-                    InputOrigin::PreLoop { .. } => None,
-                };
-                let Some(expected) = expected else { return };
+                let pipe = pipeline(&t);
                 let Some(gt) = boundary_truth(&t, class, member_k, boundary) else { return };
-                if t.sched.pre_loop.contains(&gt.producer_class) { return }
+                if t.stencil.class_members[gt.producer_class].len() == 1 { return }
+                let Some(tgt) = pipe.target_for(class, boundary, member_k) else { return };
+                let crate::stencil_pipeline::DepTarget::Periodic { delta_global, .. } = tgt
+                else {
+                    panic!("3b c{class} b[{boundary}] m[{member_k}]: \
+                            ground truth periodic, pipeline returned PreLoop");
+                };
                 let cgi = consumer_global_iter(&t, class, member_k);
-                let actual = cgi - gt.producer_global_iter;
-                assert_eq!(actual, expected,
+                let expected = cgi - gt.producer_global_iter;
+                assert_eq!(delta_global, expected,
                     "3b c{class} b[{boundary}] m[{member_k}]: \
-                     Δ_global ground-truth={actual}, compiler wants {expected}");
+                     Δ_global ground-truth={expected}, pipeline returned {delta_global}");
             }
 
             macro_rules! triple_tests_3b {

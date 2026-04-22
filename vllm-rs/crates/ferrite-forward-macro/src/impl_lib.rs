@@ -1699,7 +1699,6 @@ impl Implementation for FusedGemmBiasImpl {
                 );
                 (#weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 )
@@ -2101,7 +2100,6 @@ impl Implementation for FusedGateUpSiluMulImpl {
             let #mul_out = unsafe {
                 let gate_up = (#weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -2503,7 +2501,6 @@ impl Implementation for FusedGateUpGeluMulImpl {
             let #gate_up_ident = unsafe {
                 (#weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 )
@@ -4215,7 +4212,6 @@ impl Implementation for FusedQkvRopeCacheImpl {
                 #bias_assert
                 let qkv_packed = (#weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -4888,19 +4884,16 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
                 let nt = (*ctx.input_ids).dim(0) as usize;
                 let q = (#q_weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
                 let k = (#k_weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
                 let v = (#v_weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -5618,7 +5611,6 @@ impl Implementation for FusedQkvRopePrefillImpl {
                 #bias_assert
                 let qkv_packed = (#weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -8828,7 +8820,6 @@ impl Implementation for Fp8FusedGateUpGeluMulImpl {
             let #mul_out = unsafe {
                 let gate_up = (#weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -9079,7 +9070,6 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
             let #q_out = unsafe {
                 let qkv_packed = (#weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -9240,7 +9230,6 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
             let (#q_out, #k_out, #v_out) = unsafe {
                 let qkv_packed = (#weight_expr).forward(
                     #activation,
-                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );

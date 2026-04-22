@@ -10,7 +10,6 @@ use std::time::Instant;
 use anyhow::Result;
 use tracing::info;
 use vllm_common::telemetry;
-use vllm_config::{CudaGraphConfig, CudaGraphMode};
 use vllm_serve::init::{VllmConfig, initialize_stack};
 use vllm_serve::server::{AppState, ServerConfig};
 
@@ -130,28 +129,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         master_port: args.master_port,
         disable_async_scheduling: args.disable_async_scheduling,
         runner: args.runner.clone(),
-        cuda_graph_config: if args.enforce_eager {
-            None
-        } else {
-            let parsed_mode =
-                CudaGraphMode::parse(&args.cuda_graph_mode).unwrap_or(CudaGraphMode::Auto);
-            let sizes = CudaGraphConfig::parse_sizes(&args.cuda_graph_sizes);
-            let capture_sizes = if sizes.is_empty() {
-                // "auto" → compute Python-matching sizes
-                CudaGraphConfig::auto_capture_sizes(args.max_num_seqs)
-            } else {
-                sizes
-            };
-            Some(CudaGraphConfig {
-                enabled: true,
-                mode: parsed_mode,
-                capture_sizes,
-                num_warmups: 2,
-            })
-        },
         enable_prefix_caching: !args.no_prefix_caching,
-        enforce_eager: args.enforce_eager,
-        cuda_graph_mode: args.cuda_graph_mode.clone(),
         max_num_batched_tokens: args.max_num_batched_tokens,
         cublas_autotune: args.cublas_autotune,
         kv_cache_dtype: args.kv_cache_dtype.clone(),

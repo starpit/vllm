@@ -12,7 +12,6 @@ use std::time::Instant;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use vllm_common::telemetry;
-use vllm_config::{CudaGraphConfig, CudaGraphMode};
 use vllm_serve::llm::{LLM, LLMBuilder};
 
 use crate::args::BenchStartupArgs;
@@ -41,18 +40,6 @@ fn create_llm(args: &BenchStartupArgs) -> Result<LLM> {
     }
     if let Some(ref gguf) = args.gguf_file {
         builder = builder.gguf_file(gguf);
-    }
-
-    if !args.enforce_eager {
-        let sizes = CudaGraphConfig::parse_sizes(&args.cuda_graph_sizes);
-        if !sizes.is_empty() {
-            builder = builder.cuda_graph_config(CudaGraphConfig {
-                enabled: true,
-                mode: CudaGraphMode::default(),
-                capture_sizes: sizes,
-                num_warmups: 3,
-            });
-        }
     }
 
     builder.build()

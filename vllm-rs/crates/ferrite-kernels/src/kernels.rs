@@ -3583,17 +3583,6 @@ pub unsafe fn flash_attn_paged_ext(
     // Python line 588: then compute window_size_right
     let window_size_right = if is_causal { 0 } else { -1_i32 };
 
-    // Detect if we're in CUDA graph capture mode.
-    // During capture, we disable seqlenq_ngroups_swapped and force num_splits=1
-    // to match Python vLLM's behavior — Python doesn't use do_swap at all and
-    // uses a fixed max_num_splits=1 during graph capture.
-    let is_graph_capture = {
-        let mut status = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-        let ret = cudarc::driver::sys::cuStreamIsCapturing(_stream, &mut status);
-        ret == cudarc::driver::sys::CUresult::CUDA_SUCCESS
-            && status == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
-    };
-
     // --- seqlenq_ngroups_swapped (matching Python flash_api.cpp lines 594-601) ---
     // GQA decode optimization: reshape Q from [B, H, D] to [B*ngroups, Hk, D]
     // so FA2 processes fewer heads with longer "sequences". The transpose
@@ -3730,13 +3719,7 @@ pub unsafe fn flash_attn_paged_ext(
 
     // Split-K heuristic: parallelize K blocks across SMs when there aren't
     // enough CTAs to fill the GPU.
-    // During graph capture, force num_splits=1 to match Python vLLM which uses
-    // flash_attn_max_num_splits_for_cuda_graph=1 during capture. The dynamic
-    // heuristic varies by batch size, causing different-sized split-K buffers
-    // per capture which wastes memory and can trigger allocation failures.
-    let num_splits = if is_graph_capture {
-        1
-    } else if num_sm > 0 {
+    let num_splits = if num_sm > 0 {
         num_splits_heuristic(
             batch_size * eff_num_heads * num_m_blocks,
             (num_sm as usize) * 2,

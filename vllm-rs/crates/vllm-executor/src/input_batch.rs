@@ -205,12 +205,11 @@ impl InputBatch {
         (&self.req_ids, &self.block_tables, &self.tokens_in_pool)
     }
 
-    /// Token counts for the super-fast graph path's `PendingCommit`.
-    ///
-    /// The super-fast path is always a pure decode batch (all q_len=1), so each
-    /// request contributes exactly 1 input token. This MUST return `vec![1; n]`,
-    /// NOT `tokens_in_pool` — using cumulative `tokens_in_pool` would cause
-    /// exponential growth when later passed to `commit_step` as `input_token_count`.
+    /// Token counts for the current decode batch: always `[1; n]` since every
+    /// request in a pure decode step contributes exactly 1 input token. This MUST
+    /// return `vec![1; n]`, NOT `tokens_in_pool` — using cumulative `tokens_in_pool`
+    /// would cause exponential growth when later passed to `commit_step` as
+    /// `input_token_count`.
     pub fn fast_path_token_counts(&self) -> Vec<usize> {
         vec![1; self.req_ids.len()]
     }

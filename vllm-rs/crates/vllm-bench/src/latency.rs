@@ -8,7 +8,6 @@ use std::time::Instant;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use vllm_common::telemetry;
-use vllm_config::{CudaGraphConfig, CudaGraphMode};
 use vllm_serve::llm::{LLM, LLMBuilder, Prompt, SamplingParams};
 
 use crate::args::BenchLatencyArgs;
@@ -26,8 +25,7 @@ fn create_llm(args: &BenchLatencyArgs, model: &str) -> Result<LLM> {
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
         .tensor_parallel_size(args.tensor_parallel_size)
-        .enable_prefix_caching(!args.no_prefix_caching)
-        .enforce_eager(args.enforce_eager);
+        .enable_prefix_caching(!args.no_prefix_caching);
 
     // Default max_num_batched_tokens to cover the full batch prefill in one
     // scheduler iteration, matching Python's auto-sizing behavior.
@@ -44,19 +42,6 @@ fn create_llm(args: &BenchLatencyArgs, model: &str) -> Result<LLM> {
     }
     if let Some(ref gguf) = args.gguf_file {
         builder = builder.gguf_file(gguf);
-    }
-
-    // Wire CUDA graph config unless --enforce-eager is set.
-    if !args.enforce_eager {
-        let sizes = CudaGraphConfig::parse_sizes(&args.cuda_graph_sizes);
-        if !sizes.is_empty() {
-            builder = builder.cuda_graph_config(CudaGraphConfig {
-                enabled: true,
-                mode: CudaGraphMode::default(),
-                capture_sizes: sizes,
-                num_warmups: 3,
-            });
-        }
     }
 
     builder.build()

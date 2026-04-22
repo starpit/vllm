@@ -13,9 +13,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tracing::info;
-#[cfg(feature = "cuda")]
-use vllm_config::CudaGraphMode;
-use vllm_config::{CudaGraphConfig, SchedulerConfig, SchedulerPolicy};
+use vllm_config::{SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
 use vllm_engine::engine_core::EngineCoreConfig;
 use vllm_executor::uniproc::UniProcExecutor;
@@ -82,18 +80,9 @@ pub struct VllmConfig {
     pub disable_async_scheduling: bool,
     /// Runner type: "generate" (default) or "pooling".
     pub runner: String,
-    /// CUDA graph configuration. When `Some`, CUDA graphs may be captured
-    /// for decode-step acceleration.
-    pub cuda_graph_config: Option<CudaGraphConfig>,
     /// Whether prefix caching is enabled (KV cache reuse for shared prompts).
     /// Default: true.
     pub enable_prefix_caching: bool,
-    /// Disable CUDA graph capture and run all steps eagerly.
-    /// Default: false.
-    pub enforce_eager: bool,
-    /// CUDA graph mode: controls piecewise vs monolithic graph capture.
-    /// Default: "full" (maintains current behavior).
-    pub cuda_graph_mode: String,
     /// Maximum number of tokens processed in a single scheduler iteration.
     /// None = auto (min(max_model_len, 8192)).
     pub max_num_batched_tokens: Option<usize>,
@@ -133,12 +122,9 @@ impl Default for VllmConfig {
             node_rank: 0,
             master_addr: "localhost".to_string(),
             master_port: 29500,
-            cuda_graph_mode: "auto".to_string(),
             disable_async_scheduling: false,
             runner: "generate".to_string(),
-            cuda_graph_config: None,
             enable_prefix_caching: true,
-            enforce_eager: true, // TODO: debug multi-turn — disable CUDA graphs to isolate
             max_num_batched_tokens: None,
             cublas_autotune: false,
             kv_cache_dtype: "auto".to_string(),
@@ -260,23 +246,7 @@ fn create_worker(
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id,
-            enforce_eager: config.enforce_eager,
-            cuda_graph_mode: config
-                .cuda_graph_mode
-                .parse()
-                .unwrap_or(CudaGraphMode::Auto),
-            // Default 1024 (not 8192 like Python). Our CudaWorker splits mixed
-            // batches into a decode CUDA-graph pass + a prefill eager pass.
-            // Smaller prefill chunks keep the eager pass fast (~25ms for 1024
-            // tokens) while decode runs through the captured graph (~5ms).
-            // Benchmarked: 1024 → 21.8 req/s vs 8192 → 12.1 req/s on Qwen2.5-3B.
-            // See PREFILL_DECODE_SPLIT.md for the full analysis.
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-            cuda_graph_sizes: config
-                .cuda_graph_config
-                .as_ref()
-                .map(|c| c.capture_sizes.clone())
-                .unwrap_or_default(),
             cublas_autotune: config.cublas_autotune,
             gpu_memory_utilization: config.gpu_memory_utilization,
             pooling_strategy: config.pooling_strategy.clone(),
@@ -610,13 +580,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 hf_token: config.hf_token.clone(),
                 block_size: config.block_size,
                 device_id: rank as i32,
-                enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                cuda_graph_sizes: config
-                    .cuda_graph_config
-                    .as_ref()
-                    .map(|c| c.capture_sizes.clone())
-                    .unwrap_or_default(),
                 cublas_autotune: config.cublas_autotune,
                 gpu_memory_utilization: config.gpu_memory_utilization,
                 pooling_strategy: config.pooling_strategy.clone(),
@@ -629,10 +593,6 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 lora_adapter: config.lora_adapter.clone(),
                 kv_cache_dtype: config.kv_cache_dtype.clone(),
                 calculate_kv_scales: config.calculate_kv_scales,
-                cuda_graph_mode: config
-                    .cuda_graph_mode
-                    .parse()
-                    .unwrap_or(CudaGraphMode::Auto),
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
             })
@@ -1090,13 +1050,7 @@ fn initialize_stack_multinode(
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id: 0,
-            enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-            cuda_graph_sizes: config
-                .cuda_graph_config
-                .as_ref()
-                .map(|c| c.capture_sizes.clone())
-                .unwrap_or_default(),
             cublas_autotune: config.cublas_autotune,
             gpu_memory_utilization: config.gpu_memory_utilization,
             pooling_strategy: config.pooling_strategy.clone(),
@@ -1109,10 +1063,6 @@ fn initialize_stack_multinode(
             lora_adapter: config.lora_adapter.clone(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             calculate_kv_scales: config.calculate_kv_scales,
-            cuda_graph_mode: config
-                .cuda_graph_mode
-                .parse()
-                .unwrap_or(CudaGraphMode::Auto),
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
         };
@@ -1362,13 +1312,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         hf_token: config.hf_token.clone(),
         block_size: config.block_size,
         device_id: 0, // Each node has 1 GPU at device 0.
-        enforce_eager: config.enforce_eager,
         max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-        cuda_graph_sizes: config
-            .cuda_graph_config
-            .as_ref()
-            .map(|c| c.capture_sizes.clone())
-            .unwrap_or_default(),
         cublas_autotune: config.cublas_autotune,
         gpu_memory_utilization: config.gpu_memory_utilization,
         pooling_strategy: config.pooling_strategy.clone(),
@@ -1381,10 +1325,6 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         calculate_kv_scales: config.calculate_kv_scales,
         pp_rank: 0,
         pp_size: 1,
-        cuda_graph_mode: config
-            .cuda_graph_mode
-            .parse()
-            .unwrap_or(CudaGraphMode::Auto),
         eos_token_ids: vec![],
         max_model_len: config.max_model_len,
     };
@@ -1513,13 +1453,7 @@ fn initialize_stack_tp_pp(
                     hf_token: config.hf_token.clone(),
                     block_size: config.block_size,
                     device_id: global_rank as i32,
-                    enforce_eager: config.enforce_eager,
                     max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-                    cuda_graph_sizes: config
-                        .cuda_graph_config
-                        .as_ref()
-                        .map(|c| c.capture_sizes.clone())
-                        .unwrap_or_default(),
                     cublas_autotune: config.cublas_autotune,
                     gpu_memory_utilization: config.gpu_memory_utilization,
                     pooling_strategy: config.pooling_strategy.clone(),
@@ -1532,10 +1466,6 @@ fn initialize_stack_tp_pp(
                     lora_adapter: config.lora_adapter.clone(),
                     kv_cache_dtype: config.kv_cache_dtype.clone(),
                     calculate_kv_scales: config.calculate_kv_scales,
-                    cuda_graph_mode: config
-                        .cuda_graph_mode
-                        .parse()
-                        .unwrap_or(CudaGraphMode::Auto),
                     eos_token_ids: vec![],
                     max_model_len: config.max_model_len,
                 }
@@ -1869,13 +1799,7 @@ fn initialize_stack_tp(
                 hf_token: config.hf_token.clone(),
                 block_size: config.block_size,
                 device_id: rank as i32,
-                enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                cuda_graph_sizes: config
-                    .cuda_graph_config
-                    .as_ref()
-                    .map(|c| c.capture_sizes.clone())
-                    .unwrap_or_default(),
                 cublas_autotune: config.cublas_autotune,
                 gpu_memory_utilization: config.gpu_memory_utilization,
                 pooling_strategy: config.pooling_strategy.clone(),
@@ -1888,10 +1812,6 @@ fn initialize_stack_tp(
                 lora_adapter: config.lora_adapter.clone(),
                 kv_cache_dtype: config.kv_cache_dtype.clone(),
                 calculate_kv_scales: config.calculate_kv_scales,
-                cuda_graph_mode: config
-                    .cuda_graph_mode
-                    .parse()
-                    .unwrap_or(CudaGraphMode::Auto),
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
             })
@@ -2262,13 +2182,7 @@ fn initialize_stack_external(
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id: local_rank as i32,
-            enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-            cuda_graph_sizes: config
-                .cuda_graph_config
-                .as_ref()
-                .map(|c| c.capture_sizes.clone())
-                .unwrap_or_default(),
             cublas_autotune: config.cublas_autotune,
             gpu_memory_utilization: config.gpu_memory_utilization,
             pooling_strategy: config.pooling_strategy.clone(),
@@ -2281,10 +2195,6 @@ fn initialize_stack_external(
             lora_adapter: config.lora_adapter.clone(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             calculate_kv_scales: config.calculate_kv_scales,
-            cuda_graph_mode: config
-                .cuda_graph_mode
-                .parse()
-                .unwrap_or(CudaGraphMode::Auto),
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
         };

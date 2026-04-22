@@ -32,7 +32,6 @@ use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
-use vllm_config::{CudaGraphConfig, CudaGraphMode};
 use vllm_serve::llm::{ChatMessage, LLM, LLMBuilder, SamplingParams};
 use vllm_serve::tokenizer::Tokenizer;
 
@@ -354,7 +353,6 @@ fn build_llm(args: &BenchLongbenchArgs) -> Result<LLM> {
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
         .tensor_parallel_size(args.tensor_parallel_size)
-        .enforce_eager(args.enforce_eager)
         .enable_prefix_caching(!args.no_prefix_caching);
 
     builder = builder.max_num_batched_tokens(8192);
@@ -367,17 +365,6 @@ fn build_llm(args: &BenchLongbenchArgs) -> Result<LLM> {
     }
     if let Some(ref gguf) = args.gguf_file {
         builder = builder.gguf_file(gguf);
-    }
-    if !args.enforce_eager {
-        let sizes = CudaGraphConfig::parse_sizes("auto");
-        if !sizes.is_empty() {
-            builder = builder.cuda_graph_config(CudaGraphConfig {
-                enabled: true,
-                mode: CudaGraphMode::default(),
-                capture_sizes: sizes,
-                num_warmups: 3,
-            });
-        }
     }
     builder.build()
 }

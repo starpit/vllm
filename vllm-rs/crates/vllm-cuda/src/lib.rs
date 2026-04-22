@@ -78,10 +78,6 @@ pub use ferrite_kernels::rotary;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "cuda")]
-pub mod graph;
-#[cfg(feature = "cuda")]
-pub mod graph_piece;
-#[cfg(feature = "cuda")]
 pub mod logits_processor;
 #[cfg(feature = "cuda")]
 pub mod model;

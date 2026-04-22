@@ -25,7 +25,6 @@ use anyhow::Result;
 
 use vllm_common::EngineCoreRequest;
 pub use vllm_common::SamplingParams;
-use vllm_config::CudaGraphConfig;
 use vllm_engine::core_client::{EngineCoreClient, InprocClient};
 
 use crate::chat_template::ChatTemplate;
@@ -314,15 +313,8 @@ impl LLMBuilder {
         self
     }
 
-    /// Disable CUDA graph capture and run all steps eagerly.
-    pub fn enforce_eager(mut self, eager: bool) -> Self {
-        self.config.enforce_eager = eager;
-        self
-    }
-
-    /// Set the CUDA graph configuration for decode acceleration.
-    pub fn cuda_graph_config(mut self, config: CudaGraphConfig) -> Self {
-        self.config.cuda_graph_config = Some(config);
+    /// Accepted for CLI compatibility; CUDA graphs are not used.
+    pub fn enforce_eager(self, _eager: bool) -> Self {
         self
     }
 

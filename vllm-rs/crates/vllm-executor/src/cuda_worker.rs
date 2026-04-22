@@ -20,15 +20,11 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 use vllm_common::SamplingParams;
 use vllm_common::engine_io::EmbeddingData;
-use vllm_config::CudaGraphMode;
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_cuda::OwnedTensor;
-use vllm_cuda::cpu_gpu_buf::PinnedBuf;
 use vllm_cuda::device::GpuDevice;
 use vllm_cuda::driver;
 use vllm_cuda::dtype::DType as GpuDType;
-use vllm_cuda::graph::{CudaGraphRunner, PrefillGraphRunner};
-use vllm_cuda::graph_piece::{GraphPieceType, PiecewiseGraphRunner};
 use vllm_cuda::kv_cache::KvCachePool;
 use vllm_cuda::logits_processor::{
     AllowedTokenIdsProcessor, BadWordsProcessor, BatchUpdate, GrammarMaskProcessor,
@@ -62,14 +58,8 @@ pub struct CudaWorkerConfig {
     pub block_size: usize,
     /// GPU device index.
     pub device_id: i32,
-    /// Skip CUDA graph capture (--enforce-eager).
-    pub enforce_eager: bool,
-    /// CUDA graph mode: controls piecewise vs monolithic graph capture.
-    pub cuda_graph_mode: CudaGraphMode,
     /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
     pub max_num_batched_tokens: usize,
-    /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
-    pub cuda_graph_sizes: Vec<usize>,
     /// Run cublasLt algorithm benchmarking during warmup (--cublas-autotune).
     pub cublas_autotune: bool,
     /// Fraction of GPU memory to use (0.0-1.0). Used to compute KV cache budget.
@@ -1482,105 +1472,8 @@ fn modernbert_config_from_hf(
 }
 
 // ---------------------------------------------------------------------------
-// Pinned host staging buffers
-// ---------------------------------------------------------------------------
-
-/// Pre-allocated pinned (page-locked) host buffers for CUDA graph replay.
-///
-/// Eliminates per-step heap Vec allocations and enables true async DMA
-/// (pageable memory forces the CUDA driver to stage through an internal
-/// pinned buffer, serializing the transfer).
-struct HostStaging {
-    /// `[max_batch]` u32 — input token IDs.
-    input_ids: PinnedBuf,
-    /// `[max_batch]` u32 — position indices.
-    positions: PinnedBuf,
-    /// `[max_batch]` i64 — KV cache slot mapping.
-    slot_mapping: PinnedBuf,
-    /// `[max_batch + 1]` i32 — cumulative query sequence lengths.
-    cu_seqlens_q: PinnedBuf,
-    /// `[max_batch]` i32 — per-sequence K lengths for paged FA2.
-    seqused_k: PinnedBuf,
-    /// `[max_batch * max_blocks_per_seq]` i32 — page table.
-    block_table: PinnedBuf,
-    /// Maximum blocks per sequence (computed from max_model_len / block_size).
-    max_blocks_per_seq: usize,
-    /// `[max_batch]` u32 — D2H token IDs from graph argmax (double-buffered).
-    ///
-    /// Two pinned buffers alternate per step so that the GPU can write to one
-    /// while the CPU reads from the other (deferred D2H pattern).
-    host_token_ids: [PinnedBuf; 2],
-    /// Which of the two `host_token_ids` buffers is current (0 or 1).
-    token_buf_idx: usize,
-    /// `[max_batch * 5]` f32 — packed sampling params (temps, top_ks, top_ps, min_ps, randoms).
-    sampling_packed: PinnedBuf,
-}
-
-impl HostStaging {
-    /// Allocate pinned staging buffers for up to `max_batch` decode requests.
-    ///
-    /// # Safety
-    /// Requires active CUDA context.
-    unsafe fn new(max_batch: usize, max_blocks_per_seq: usize) -> anyhow::Result<Self> {
-        Ok(Self {
-            input_ids: unsafe { PinnedBuf::new(max_batch * 4)? },
-            positions: unsafe { PinnedBuf::new(max_batch * 4)? },
-            slot_mapping: unsafe { PinnedBuf::new(max_batch * 8)? },
-            cu_seqlens_q: unsafe { PinnedBuf::new((max_batch + 1) * 4)? },
-            seqused_k: unsafe { PinnedBuf::new(max_batch * 4)? },
-            block_table: unsafe { PinnedBuf::new(max_batch * max_blocks_per_seq * 4)? },
-            max_blocks_per_seq,
-            host_token_ids: [unsafe { PinnedBuf::new(max_batch * 4)? }, unsafe {
-                PinnedBuf::new(max_batch * 4)?
-            }],
-            token_buf_idx: 0,
-            sampling_packed: unsafe { PinnedBuf::new(max_batch * 5 * 4)? },
-        })
-    }
-
-    /// Fill block_table pinned buffer from attention metadata block_ids.
-    /// Returns a slice of the pinned buffer with `graph_bs * max_blocks_per_seq` elements.
-    unsafe fn fill_block_table<'a>(
-        &'a self,
-        block_ids: &[Vec<usize>],
-        graph_bs: usize,
-    ) -> &'a [i32] {
-        let mbps = self.max_blocks_per_seq;
-        let n = graph_bs * mbps;
-        let bt = unsafe { self.block_table.slice_mut::<i32>(n) };
-        bt.fill(0);
-        for (i, blocks) in block_ids.iter().enumerate() {
-            for (j, &bid) in blocks.iter().enumerate() {
-                if j < mbps {
-                    bt[i * mbps + j] = bid as i32;
-                }
-            }
-        }
-        &bt[..n]
-    }
-}
-
-// ---------------------------------------------------------------------------
 // CudaWorker
 // ---------------------------------------------------------------------------
-
-/// Deferred commit from a previous decode step.
-///
-/// Stored when the greedy graph fast path defers D2H sync. The token IDs
-/// live in one of the double-buffered pinned host staging buffers. The
-/// commit is resolved at the start of the next `execute_model_inner` call.
-struct PendingCommit {
-    /// Which host_token_ids buffer index holds the deferred token IDs.
-    buf_idx: usize,
-    /// Number of real requests (not graph padding).
-    num_reqs: usize,
-    /// Per-request IDs (same order as the host buffer).
-    req_ids: Vec<String>,
-    /// Per-request token count before this step (for `commit_step`).
-    token_counts: Vec<usize>,
-    /// Per-request flag: true if request had speculative tokens.
-    has_spec_tokens: Vec<bool>,
-}
 
 /// A worker backed by the vllm-cuda runtime for zero-allocation GPU inference.
 pub struct CudaWorker {
@@ -1593,28 +1486,12 @@ pub struct CudaWorker {
     model_dtype: GpuDType,
     resolved_architecture: Option<String>,
     is_shutdown: bool,
-    /// CUDA graph runner for decode batches (monolithic mode).
-    graph_runner: Option<CudaGraphRunner>,
-    /// Piecewise CUDA graph runner (attention excluded from graphs).
-    piecewise_graph_runner: Option<PiecewiseGraphRunner>,
-    /// CUDA graph runner for single-sequence prefill batches.
-    prefill_graph_runner: Option<PrefillGraphRunner>,
-    /// Batch size of the last graph replay. When the batch composition is
-    /// unchanged, we can skip the input_ids H2D copy because the graph's
-    /// D2D scatter already placed argmax results into the persistent buffer.
-    last_graph_batch_size: Option<usize>,
-    /// True when persistent graph buffers contain valid metadata from a
-    /// previous replay (positions, slot_mapping, seqused_k). When true,
-    /// we use `replay_decode_fast()` which updates metadata on GPU instead
-    /// of building Vecs on CPU and doing H2D copies.
-    graph_metadata_valid: bool,
 
-    /// True when the model uses GGML quantized layers (disables CUDA graphs).
+    /// True when the model uses GGML quantized layers.
     uses_ggml: bool,
 
-    /// Pre-allocated pinned host staging buffers for graph replay.
-    /// Initialized after graph capture in `compile_or_warm_up_model`.
-    host_staging: Option<HostStaging>,
+    /// Staging buffer for packed sampling params (resized on demand).
+    sampling_staging: Vec<u8>,
 
     // Per-request state.
     token_buffers: HashMap<String, Vec<u32>>,
@@ -1631,10 +1508,6 @@ pub struct CudaWorker {
     pooling_strategy: vllm_model::embedding::PoolingStrategy,
     /// Whether executing in pooling mode (--runner pooling).
     is_pooling: bool,
-
-    /// Deferred D2H commit from the previous greedy graph step. Resolved at
-    /// the start of the next `execute_model_inner` call.
-    pending_commit: Option<PendingCommit>,
 
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(feature = "guided-decoding")]
@@ -1702,11 +1575,11 @@ pub struct CudaWorker {
 }
 
 // Safety: CudaWorker contains raw GPU pointers (via GpuDevice, model weights,
-// KV cache, PP buffers, CUDA graphs) and raw pointer fields in OwnedTensor /
-// RawGpuAlloc / RawGpuMem. All GPU resources are allocated on a single CUDA
-// context and accessed exclusively from the worker thread. Send is required
-// because the worker is created on the main thread and moved to its dedicated
-// worker thread via the executor's spawn.
+// KV cache, PP buffers) and raw pointer fields in OwnedTensor / RawGpuAlloc /
+// RawGpuMem. All GPU resources are allocated on a single CUDA context and
+// accessed exclusively from the worker thread. Send is required because the
+// worker is created on the main thread and moved to its dedicated worker thread
+// via the executor's spawn.
 unsafe impl Send for CudaWorker {}
 
 impl CudaWorker {
@@ -1738,13 +1611,8 @@ impl CudaWorker {
             model_dtype: GpuDType::BF16,
             resolved_architecture: None,
             is_shutdown: false,
-            graph_runner: None,
-            piecewise_graph_runner: None,
-            prefill_graph_runner: None,
-            last_graph_batch_size: None,
-            graph_metadata_valid: false,
             uses_ggml: false,
-            host_staging: None,
+            sampling_staging: Vec::new(),
             token_buffers: HashMap::new(),
             prompt_lengths: HashMap::new(),
             annotation_buffers: HashMap::new(),
@@ -1754,7 +1622,6 @@ impl CudaWorker {
             ctx_set_on_thread: false,
             pooling_strategy: vllm_model::embedding::PoolingStrategy::Last,
             is_pooling,
-            pending_commit: None,
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -2071,17 +1938,6 @@ impl CudaWorker {
     /// Expose the HF config after load_model.
     pub fn hf_config(&self) -> Option<&HfModelConfig> {
         self.hf_config.as_ref()
-    }
-
-    /// Maximum blocks per sequence: cdiv(max_model_len, block_size).
-    /// Matches Python's `BlockTables.__init__` computation.
-    fn max_blocks_per_seq(&self) -> usize {
-        let max_model_len = self
-            .hf_config
-            .as_ref()
-            .and_then(|c| c.max_position_embeddings)
-            .unwrap_or(131072);
-        max_model_len.div_ceil(self.config.block_size)
     }
 
     /// Expose the model directory after load_model.
@@ -2819,65 +2675,25 @@ impl CudaWorker {
         }
     }
 
-    /// D2H copy token IDs using pinned staging if available.
-    /// Enqueue async D2H + sync, returning token IDs. Uses the pinned double-
-    /// buffer at `buf_idx` when staging is available.
+    /// D2H copy token IDs using a plain heap Vec.
     fn d2h_token_ids_sync(
-        staging: Option<&HostStaging>,
-        buf_idx: usize,
         gpu_tensor: &GpuTensor,
         num_reqs: usize,
         device: &mut GpuDevice,
     ) -> ExecutorResult<Vec<u32>> {
-        if let Some(stg) = staging {
-            // Async D2H: compute→event→transfer_stream→D2H→event→sync event.
-            unsafe {
-                device.async_d2h(
-                    stg.host_token_ids[buf_idx].ptr(),
-                    gpu_tensor.raw_ptr() as *const u8,
-                    num_reqs * 4,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("async D2H token ids: {e}")))?;
-            device
-                .sync_d2h()
-                .map_err(|e| ExecutorError::WorkerExecution(format!("sync d2h: {e}")))?;
-            Ok(unsafe { stg.host_token_ids[buf_idx].slice::<u32>(num_reqs) }.to_vec())
-        } else {
-            let mut ids = vec![0u32; num_reqs];
-            unsafe {
-                device.async_d2h(
-                    ids.as_mut_ptr() as *mut u8,
-                    gpu_tensor.raw_ptr() as *const u8,
-                    num_reqs * 4,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("async D2H token ids: {e}")))?;
-            device
-                .sync_d2h()
-                .map_err(|e| ExecutorError::WorkerExecution(format!("sync d2h: {e}")))?;
-            Ok(ids)
-        }
-    }
-
-    /// Enqueue async D2H without sync. Returns the buffer index used.
-    /// Caller must sync via `device.sync_d2h()` before reading the buffer.
-    fn d2h_token_ids_async(
-        staging: &HostStaging,
-        buf_idx: usize,
-        gpu_tensor: &GpuTensor,
-        num_reqs: usize,
-        device: &GpuDevice,
-    ) -> ExecutorResult<()> {
+        let mut ids = vec![0u32; num_reqs];
         unsafe {
             device.async_d2h(
-                staging.host_token_ids[buf_idx].ptr(),
+                ids.as_mut_ptr() as *mut u8,
                 gpu_tensor.raw_ptr() as *const u8,
                 num_reqs * 4,
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("async D2H token ids: {e}")))?;
-        Ok(())
+        device
+            .sync_d2h()
+            .map_err(|e| ExecutorError::WorkerExecution(format!("sync d2h: {e}")))?;
+        Ok(ids)
     }
     /// Full GPU sampling pipeline: grammar mask → logit processors → sample → logprobs.
     /// No CPU fallback — everything stays on GPU, matching Python vLLM exactly.
@@ -2896,7 +2712,7 @@ impl CudaWorker {
         seal_pad_processor: &SealPadProcessor,
         logits_pipeline: Option<&LogitsProcessorPipeline>,
         seeded_rngs: &mut HashMap<String, rand::rngs::StdRng>,
-        host_staging: &Option<HostStaging>,
+        sampling_staging: &mut Vec<u8>,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
         prompt_lengths: &HashMap<String, usize>,
@@ -2924,7 +2740,6 @@ impl CudaWorker {
                 total_tokens,
                 prepared,
                 device,
-                host_staging,
                 input_batch,
                 token_buffers,
             );
@@ -2997,8 +2812,6 @@ impl CudaWorker {
                     num_reqs,
                     prepared,
                     device,
-                    host_staging,
-                    0,
                     input_batch,
                     token_buffers,
                     prompt_lengths,
@@ -3016,7 +2829,7 @@ impl CudaWorker {
                 // Pack [temps: f32, seeds: u32] — both 4 bytes, same stride.
                 let stride = num_reqs * 4;
                 let total_bytes = stride * 2;
-                let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
+                let packed_ptr = Self::get_sampling_packed_ptr_s(sampling_staging, total_bytes);
                 let temps_ptr = packed_ptr as *mut f32;
                 let seeds_ptr = unsafe { packed_ptr.add(stride) as *mut u32 };
                 for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
@@ -3056,7 +2869,7 @@ impl CudaWorker {
             } else {
                 let stride = num_reqs * 4;
                 let total_bytes = stride * 5;
-                let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
+                let packed_ptr = Self::get_sampling_packed_ptr_s(sampling_staging, total_bytes);
                 let temps_ptr = packed_ptr as *mut f32;
                 let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
                 let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
@@ -3123,8 +2936,6 @@ impl CudaWorker {
                 num_reqs,
                 prepared,
                 device,
-                host_staging,
-                0,
                 input_batch,
                 token_buffers,
                 prompt_lengths,
@@ -3223,7 +3034,7 @@ impl CudaWorker {
             // Full sampling on f32 logits.
             let stride = num_reqs * 4;
             let total_bytes = stride * 5;
-            let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
+            let packed_ptr = Self::get_sampling_packed_ptr_s(sampling_staging, total_bytes);
             let temps_ptr = packed_ptr as *mut f32;
             let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
             let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
@@ -3384,8 +3195,7 @@ impl CudaWorker {
         };
 
         // 8. D2H sampled tokens, commit, build output.
-        let host_ids =
-            Self::d2h_token_ids_sync(host_staging.as_ref(), 0, &token_ids_gpu, num_reqs, device)?;
+        let host_ids = Self::d2h_token_ids_sync(&token_ids_gpu, num_reqs, device)?;
 
         // Build discard mask for intermediate prefill chunks.
         let mut discard = vec![false; num_reqs];
@@ -3451,14 +3261,12 @@ impl CudaWorker {
         Ok(output)
     }
 
-    /// Get a pointer to pinned host memory for packing sampling parameters.
-    fn get_sampling_packed_ptr_s(host_staging: &Option<HostStaging>, min_bytes: usize) -> *mut u8 {
-        if let Some(stg) = host_staging {
-            debug_assert!(min_bytes <= stg.sampling_packed.capacity_bytes());
-            stg.sampling_packed.ptr()
-        } else {
-            vec![0u8; min_bytes].leak().as_mut_ptr()
+    /// Get a pointer to heap staging memory for packing sampling parameters.
+    fn get_sampling_packed_ptr_s(sampling_staging: &mut Vec<u8>, min_bytes: usize) -> *mut u8 {
+        if sampling_staging.len() < min_bytes {
+            sampling_staging.resize(min_bytes, 0);
         }
+        sampling_staging.as_mut_ptr()
     }
 
     /// Greedy rejection sampling for speculative decoding.
@@ -3479,7 +3287,6 @@ impl CudaWorker {
         total_tokens: usize,
         prepared: PreparedInputs,
         device: &mut GpuDevice,
-        _host_staging: &Option<HostStaging>,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
     ) -> ExecutorResult<ModelRunnerOutput> {
@@ -3518,9 +3325,7 @@ impl CudaWorker {
         })?;
 
         // 2. D2H all target argmax IDs.
-        // Bypass pinned staging — total_tokens (with drafts) may exceed staging capacity.
-        let all_target_ids =
-            Self::d2h_token_ids_sync(None, 0, &token_ids_gpu, total_tokens, device)?;
+        let all_target_ids = Self::d2h_token_ids_sync(&token_ids_gpu, total_tokens, device)?;
 
         // 3. Greedy rejection sampling per request.
         let num_reqs = prepared.req_inputs.len();
@@ -3576,19 +3381,11 @@ impl CudaWorker {
         num_reqs: usize,
         prepared: PreparedInputs,
         device: &mut GpuDevice,
-        host_staging: &Option<HostStaging>,
-        buf_idx: usize,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
         prompt_lengths: &HashMap<String, usize>,
     ) -> ExecutorResult<ModelRunnerOutput> {
-        let host_ids = Self::d2h_token_ids_sync(
-            host_staging.as_ref(),
-            buf_idx,
-            token_ids_gpu,
-            num_reqs,
-            device,
-        )?;
+        let host_ids = Self::d2h_token_ids_sync(token_ids_gpu, num_reqs, device)?;
         // Build discard mask: intermediate prefill chunks (seq_len after
         // this step < prompt_len) should not have their sampled tokens
         // appended to token_buffers. Matches Python's discard_request_mask.
@@ -3634,1277 +3431,6 @@ impl CudaWorker {
             }
         }
         Ok(output)
-    }
-    // -----------------------------------------------------------------------
-    // Piecewise CUDA Graph Execution
-    // -----------------------------------------------------------------------
-
-    /// Execute a single graph piece during capture.
-    unsafe fn execute_graph_piece(
-        &self,
-        piece_type: GraphPieceType,
-        buffers: &vllm_cuda::graph_piece::PersistentBuffers,
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<()> {
-        match piece_type {
-            GraphPieceType::Embedding => unsafe { self.execute_embedding_piece(buffers, device) },
-            GraphPieceType::LayerPreAttn(layer_idx) => unsafe {
-                self.execute_pre_attn_piece(layer_idx, buffers, device)
-            },
-            GraphPieceType::LayerPostAttn(layer_idx) => unsafe {
-                self.execute_post_attn_piece(layer_idx, buffers, device)
-            },
-            GraphPieceType::LmHead => unsafe { self.execute_lm_head_piece(buffers, device) },
-            GraphPieceType::Sampling => unsafe { self.execute_sampling_piece(buffers, device) },
-        }
-    }
-
-    /// Execute embedding piece: input_ids -> hidden_a
-    unsafe fn execute_embedding_piece(
-        &self,
-        buffers: &vllm_cuda::graph_piece::PersistentBuffers,
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<()> {
-        let batch_size = buffers.max_batch; // Use max_batch during capture
-        let input_ids = unsafe { buffers.input_tensors(batch_size).input_ids };
-
-        // Run embedding gather kernel (same as model forward — kernels::embedding_gather)
-        let hidden = match &self.model {
-            Some(CudaModel::Llama(m)) => unsafe {
-                vllm_cuda::kernels::embedding_gather(
-                    m.model.embed_tokens.weight,
-                    input_ids,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            },
-            Some(CudaModel::Qwen2(m)) => unsafe {
-                vllm_cuda::kernels::embedding_gather(
-                    m.0.model.embed_tokens.weight,
-                    input_ids,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            },
-            Some(CudaModel::Gemma2(m)) => {
-                let h = unsafe {
-                    vllm_cuda::kernels::embedding_gather(
-                        m.model.embed_tokens.weight,
-                        input_ids,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                };
-                // Gemma scaling: hidden *= sqrt(hidden_size)
-                unsafe {
-                    vllm_cuda::kernels::scale_inplace(
-                        h.as_gpu_tensor(),
-                        m.model.embed_scale,
-                        &device.cublas,
-                    )
-                };
-                h
-            }
-            Some(CudaModel::Gemma3(m)) => {
-                let h = unsafe {
-                    vllm_cuda::kernels::embedding_gather(
-                        m.model.embed_tokens.weight,
-                        input_ids,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                };
-                unsafe {
-                    vllm_cuda::kernels::scale_inplace(
-                        h.as_gpu_tensor(),
-                        m.model.embed_scale,
-                        &device.cublas,
-                    )
-                };
-                h
-            }
-            Some(CudaModel::Qwen3Moe(m)) => unsafe {
-                vllm_cuda::kernels::embedding_gather(
-                    m.model.embed_tokens.weight,
-                    input_ids,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            },
-            Some(CudaModel::Qwen2Moe(m)) => unsafe {
-                vllm_cuda::kernels::embedding_gather(
-                    m.model.embed_tokens.weight,
-                    input_ids,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            },
-            Some(CudaModel::Mixtral(m)) => unsafe {
-                vllm_cuda::kernels::embedding_gather(
-                    m.model.embed_tokens.weight,
-                    input_ids,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            },
-            _ => {
-                return Err(ExecutorError::WorkerExecution(
-                    "Model not initialized or unsupported".into(),
-                ));
-            }
-        };
-
-        // Copy to persistent buffer hidden_a
-        let hidden_bytes = batch_size * buffers.hidden_size * buffers.dtype.size_bytes();
-        unsafe {
-            driver::memcpy_dtod_async(
-                buffers.hidden_a.ptr(),
-                hidden.as_gpu_tensor().raw_ptr() as *const u8,
-                hidden_bytes,
-                device.compute_stream,
-            )
-        }
-        .map_err(|e| ExecutorError::WorkerExecution(format!("Embedding copy: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Execute pre-attention piece: hidden -> RMSNorm -> attn_input
-    ///
-    /// Layer 0: plain rms_norm(hidden_a) → attn_input, copy hidden_a → residual.
-    /// Layer N>0: fused_add_rms_norm(hidden_in, residual) → hidden_in becomes normed
-    ///            (→ attn_input), residual updated in-place.
-    unsafe fn execute_pre_attn_piece(
-        &self,
-        layer_idx: usize,
-        buffers: &vllm_cuda::graph_piece::PersistentBuffers,
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<()> {
-        let batch_size = buffers.max_batch;
-        let hidden_bytes = batch_size * buffers.hidden_size * buffers.dtype.size_bytes();
-
-        // Read from hidden_a or hidden_b (ping-pong)
-        let use_buffer_a = layer_idx.is_multiple_of(2);
-        let hidden_in = unsafe { buffers.hidden_tensor(batch_size, use_buffer_a) };
-        let residual = unsafe { buffers.residual_tensor(batch_size) };
-
-        // Get norm weight/eps for the current layer and architecture
-        let (norm_weight, norm_eps) = match &self.model {
-            Some(CudaModel::Llama(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                (layer.input_layernorm.weight, layer.input_layernorm.eps)
-            }
-            Some(CudaModel::Qwen2(m)) => {
-                let layer = &m.0.model.layers[layer_idx];
-                (layer.input_layernorm.weight, layer.input_layernorm.eps)
-            }
-            Some(CudaModel::Gemma2(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                (
-                    layer.input_layernorm.inner.weight,
-                    layer.input_layernorm.inner.eps,
-                )
-            }
-            Some(CudaModel::Gemma3(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                (
-                    layer.input_layernorm.inner.weight,
-                    layer.input_layernorm.inner.eps,
-                )
-            }
-            Some(CudaModel::Qwen3Moe(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                (layer.input_layernorm.weight, layer.input_layernorm.eps)
-            }
-            Some(CudaModel::Qwen2Moe(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                (layer.input_layernorm.weight, layer.input_layernorm.eps)
-            }
-            Some(CudaModel::Mixtral(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                (layer.input_layernorm.weight, layer.input_layernorm.eps)
-            }
-            _ => {
-                return Err(ExecutorError::WorkerExecution(
-                    "Model not initialized or unsupported".into(),
-                ));
-            }
-        };
-
-        if layer_idx == 0 {
-            // Layer 0: plain rms_norm, copy hidden → residual
-            let normed = unsafe {
-                vllm_cuda::kernels::rms_norm(
-                    hidden_in,
-                    norm_weight,
-                    norm_eps,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-            // Copy normed → attn_input
-            unsafe {
-                driver::memcpy_dtod_async(
-                    buffers.attn_input.ptr(),
-                    normed.as_gpu_tensor().raw_ptr() as *const u8,
-                    hidden_bytes,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("Pre-attn copy: {e}")))?;
-            // Copy hidden_in → residual (residual = original hidden before norm)
-            unsafe {
-                driver::memcpy_dtod_async(
-                    buffers.residual.ptr(),
-                    hidden_in.raw_ptr() as *const u8,
-                    hidden_bytes,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("Pre-attn residual init: {e}")))?;
-        } else {
-            // Layer N>0: fused_add_rms_norm(hidden_in, residual) → hidden_in = normed, residual updated
-            unsafe {
-                vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                    hidden_in,
-                    residual,
-                    norm_weight,
-                    norm_eps,
-                    device.compute_stream,
-                );
-            }
-            // Copy normed hidden_in → attn_input
-            unsafe {
-                driver::memcpy_dtod_async(
-                    buffers.attn_input.ptr(),
-                    hidden_in.raw_ptr() as *const u8,
-                    hidden_bytes,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("Pre-attn copy: {e}")))?;
-        }
-
-        Ok(())
-    }
-
-    /// Execute post-attention piece: attn_output + residual -> MLP -> next hidden
-    ///
-    /// LLaMA/Qwen2: fused_add_rms_norm(attn_out, residual) → normed, then MLP → next hidden.
-    /// Gemma2/3: post_attention_layernorm(attn_out), fused_add_rms_norm(normed, residual)
-    ///           via pre_feedforward_layernorm, MLP, post_feedforward_layernorm → next hidden.
-    unsafe fn execute_post_attn_piece(
-        &self,
-        layer_idx: usize,
-        buffers: &vllm_cuda::graph_piece::PersistentBuffers,
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<()> {
-        let batch_size = buffers.max_batch;
-        let attn_out = unsafe { buffers.attn_output_tensor(batch_size) };
-        let residual = unsafe { buffers.residual_tensor(batch_size) };
-
-        // Apply post-attention norm + MLP (architecture-specific)
-        let mlp_out = match &self.model {
-            Some(CudaModel::Llama(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                unsafe {
-                    // Fused add + RMSNorm: attn_out = normed, residual updated
-                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                        attn_out,
-                        residual,
-                        layer.post_attention_layernorm.weight,
-                        layer.post_attention_layernorm.eps,
-                        device.compute_stream,
-                    );
-                    layer.mlp.forward(TensorView::from_raw(attn_out), device)
-                }
-            }
-            Some(CudaModel::Qwen2(m)) => {
-                let layer = &m.0.model.layers[layer_idx];
-                unsafe {
-                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                        attn_out,
-                        residual,
-                        layer.post_attention_layernorm.weight,
-                        layer.post_attention_layernorm.eps,
-                        device.compute_stream,
-                    );
-                    layer.mlp.forward(TensorView::from_raw(attn_out), device)
-                }
-            }
-            Some(CudaModel::Gemma2(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                unsafe {
-                    // 3. post_attention_layernorm (standalone)
-                    let attn_normed = vllm_cuda::kernels::rms_norm(
-                        attn_out,
-                        layer.post_attention_layernorm.inner.weight,
-                        layer.post_attention_layernorm.inner.eps,
-                        &mut device.caching,
-                        device.compute_stream,
-                    );
-                    // 4. pre_feedforward_layernorm (fused residual add)
-                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                        *attn_normed,
-                        residual,
-                        layer.pre_feedforward_layernorm.inner.weight,
-                        layer.pre_feedforward_layernorm.inner.eps,
-                        device.compute_stream,
-                    );
-                    // 5. MLP
-                    let mlp_out = layer.mlp.forward(attn_normed.view(), device);
-                    // 6. post_feedforward_layernorm (standalone)
-                    vllm_cuda::kernels::rms_norm(
-                        *mlp_out,
-                        layer.post_feedforward_layernorm.inner.weight,
-                        layer.post_feedforward_layernorm.inner.eps,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                }
-            }
-            Some(CudaModel::Gemma3(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                unsafe {
-                    let attn_normed = vllm_cuda::kernels::rms_norm(
-                        attn_out,
-                        layer.post_attention_layernorm.inner.weight,
-                        layer.post_attention_layernorm.inner.eps,
-                        &mut device.caching,
-                        device.compute_stream,
-                    );
-                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                        *attn_normed,
-                        residual,
-                        layer.pre_feedforward_layernorm.inner.weight,
-                        layer.pre_feedforward_layernorm.inner.eps,
-                        device.compute_stream,
-                    );
-                    let mlp_out = layer.mlp.forward(attn_normed.view(), device);
-                    vllm_cuda::kernels::rms_norm(
-                        *mlp_out,
-                        layer.post_feedforward_layernorm.inner.weight,
-                        layer.post_feedforward_layernorm.inner.eps,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                }
-            }
-            Some(CudaModel::Qwen3Moe(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                unsafe {
-                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                        attn_out,
-                        residual,
-                        layer.post_attention_layernorm.weight,
-                        layer.post_attention_layernorm.eps,
-                        device.compute_stream,
-                    );
-                    layer.mlp.forward(TensorView::from_raw(attn_out), device)
-                }
-            }
-            Some(CudaModel::Qwen2Moe(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                unsafe {
-                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                        attn_out,
-                        residual,
-                        layer.post_attention_layernorm.weight,
-                        layer.post_attention_layernorm.eps,
-                        device.compute_stream,
-                    );
-                    layer.mlp.forward(TensorView::from_raw(attn_out), device)
-                }
-            }
-            Some(CudaModel::Mixtral(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                unsafe {
-                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                        attn_out,
-                        residual,
-                        layer.post_attention_layernorm.weight,
-                        layer.post_attention_layernorm.eps,
-                        device.compute_stream,
-                    );
-                    layer
-                        .block_sparse_moe
-                        .forward(TensorView::from_raw(attn_out), device)
-                }
-            }
-            _ => {
-                return Err(ExecutorError::WorkerExecution(
-                    "Model not initialized or unsupported".into(),
-                ));
-            }
-        };
-
-        // Copy to next buffer (ping-pong)
-        let use_buffer_a = layer_idx.is_multiple_of(2);
-        let next_buffer = if use_buffer_a {
-            buffers.hidden_b.ptr()
-        } else {
-            buffers.hidden_a.ptr()
-        };
-        let hidden_bytes = batch_size * buffers.hidden_size * buffers.dtype.size_bytes();
-        unsafe {
-            driver::memcpy_dtod_async(
-                next_buffer,
-                mlp_out.as_gpu_tensor().raw_ptr() as *const u8,
-                hidden_bytes,
-                device.compute_stream,
-            )
-        }
-        .map_err(|e| ExecutorError::WorkerExecution(format!("Post-attn copy: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Execute LM head piece: final hidden -> logits
-    ///
-    /// The final hidden state needs a fused_add_rms_norm with the residual (same as
-    /// pre-attn for layer N>0), then the final norm, then the LM head projection.
-    unsafe fn execute_lm_head_piece(
-        &self,
-        buffers: &vllm_cuda::graph_piece::PersistentBuffers,
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<()> {
-        let batch_size = buffers.max_batch;
-        let num_layers = buffers.num_layers;
-
-        // Read from final hidden buffer (after last post-attn piece wrote here)
-        let use_buffer_a = num_layers.is_multiple_of(2);
-        let hidden = unsafe { buffers.hidden_tensor(batch_size, use_buffer_a) };
-        let residual = unsafe { buffers.residual_tensor(batch_size) };
-
-        // Apply final norm + LM head
-        let logits = match &self.model {
-            Some(CudaModel::Llama(m)) => {
-                unsafe {
-                    // Fused add of last MLP output into residual, then final norm
-                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                        hidden,
-                        residual,
-                        m.model.norm.weight,
-                        m.model.norm.eps,
-                        device.compute_stream,
-                    );
-                    // hidden is now normed; project to vocab
-                    m.lm_head.forward(
-                        TensorView::from_raw(hidden),
-                        &mut device.cublas,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                }
-            }
-            Some(CudaModel::Qwen2(m)) => unsafe {
-                vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                    hidden,
-                    residual,
-                    m.0.model.norm.weight,
-                    m.0.model.norm.eps,
-                    device.compute_stream,
-                );
-                m.0.lm_head.forward(
-                    TensorView::from_raw(hidden),
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            },
-            Some(CudaModel::Gemma2(m)) => {
-                unsafe {
-                    // Gemma2: last layer output is post_feedforward_normed.
-                    // Need fused add into residual + final model norm.
-                    vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                        hidden,
-                        residual,
-                        m.model.norm.inner.weight,
-                        m.model.norm.inner.eps,
-                        device.compute_stream,
-                    );
-                    m.lm_head.forward(
-                        TensorView::from_raw(hidden),
-                        &mut device.cublas,
-                        &mut device.caching,
-                    )
-                }
-            }
-            Some(CudaModel::Gemma3(m)) => unsafe {
-                vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                    hidden,
-                    residual,
-                    m.model.norm.inner.weight,
-                    m.model.norm.inner.eps,
-                    device.compute_stream,
-                );
-                m.lm_head.forward(
-                    TensorView::from_raw(hidden),
-                    &mut device.cublas,
-                    &mut device.caching,
-                )
-            },
-            Some(CudaModel::Qwen3Moe(m)) => unsafe {
-                vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                    hidden,
-                    residual,
-                    m.model.norm.weight,
-                    m.model.norm.eps,
-                    device.compute_stream,
-                );
-                m.lm_head.forward(
-                    TensorView::from_raw(hidden),
-                    &mut device.cublas,
-                    &mut device.caching,
-                )
-            },
-            Some(CudaModel::Qwen2Moe(m)) => unsafe {
-                vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                    hidden,
-                    residual,
-                    m.model.norm.weight,
-                    m.model.norm.eps,
-                    device.compute_stream,
-                );
-                m.lm_head.forward(
-                    TensorView::from_raw(hidden),
-                    &mut device.cublas,
-                    &mut device.caching,
-                )
-            },
-            Some(CudaModel::Mixtral(m)) => unsafe {
-                vllm_cuda::kernels::fused_add_rms_norm_inplace(
-                    hidden,
-                    residual,
-                    m.model.norm.weight,
-                    m.model.norm.eps,
-                    device.compute_stream,
-                );
-                m.lm_head.forward(
-                    TensorView::from_raw(hidden),
-                    &mut device.cublas,
-                    &mut device.caching,
-                )
-            },
-            _ => {
-                return Err(ExecutorError::WorkerExecution(
-                    "Model not initialized or unsupported".into(),
-                ));
-            }
-        };
-
-        // Copy to logits buffer
-        let logits_bytes = batch_size * buffers.vocab_size * buffers.dtype.size_bytes();
-        unsafe {
-            driver::memcpy_dtod_async(
-                buffers.logits.ptr(),
-                logits.as_gpu_tensor().raw_ptr() as *const u8,
-                logits_bytes,
-                device.compute_stream,
-            )
-        }
-        .map_err(|e| ExecutorError::WorkerExecution(format!("LM head copy: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Execute sampling piece: logits -> token_ids
-    unsafe fn execute_sampling_piece(
-        &self,
-        buffers: &vllm_cuda::graph_piece::PersistentBuffers,
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<()> {
-        let batch_size = buffers.max_batch;
-        let logits = unsafe { buffers.logits_tensor(batch_size) };
-
-        // Argmax sampling
-        let token_ids = unsafe {
-            vllm_cuda::kernels::argmax_batched(logits, &mut device.caching, device.compute_stream)
-        };
-
-        // Copy to token_ids buffer
-        unsafe {
-            driver::memcpy_dtod_async(
-                buffers.token_ids.ptr(),
-                token_ids.as_gpu_tensor().raw_ptr() as *const u8,
-                batch_size * 4,
-                device.compute_stream,
-            )
-        }
-        .map_err(|e| ExecutorError::WorkerExecution(format!("Sampling copy: {e}")))?;
-
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Piecewise Graph Capture Helper
-    // -----------------------------------------------------------------------
-
-    /// Capture piecewise CUDA graphs for a set of batch sizes.
-    /// Called from compile_or_warm_up_model after releasing the model/kv_cache/device borrows.
-    fn capture_piecewise_graphs(
-        &mut self,
-        num_layers: usize,
-        hidden_size: usize,
-        vocab_size: usize,
-        dtype: vllm_cuda::dtype::DType,
-        max_bs: usize,
-        capture_sizes: &[usize],
-    ) {
-        info!("Capturing piecewise CUDA graphs (attention excluded from graphs)...");
-        match unsafe {
-            PiecewiseGraphRunner::new(max_bs, hidden_size, vocab_size, num_layers, dtype)
-        } {
-            Ok(mut piecewise_runner) => {
-                // SAFETY: execute_graph_piece reads self.model (shared) while
-                // capture_all_pieces mutably borrows self.device. These are disjoint
-                // fields, but the borrow checker can't verify that, so we use a raw
-                // pointer for the shared model access.
-                let self_ptr: *const Self = self;
-
-                for &bs in capture_sizes.iter().rev() {
-                    info!("Capturing piecewise graphs for batch_size={bs}...");
-                    let dev = self.device.as_mut().unwrap();
-                    // Fill buffers with valid dummy data before capture warmup.
-                    if let Err(e) = unsafe { piecewise_runner.fill_dummy_decode(bs, dev) } {
-                        tracing::warn!("Failed to fill dummy decode data for bs={bs}: {e}");
-                        break;
-                    }
-                    let result = unsafe {
-                        // Suppress NCCL during capture so collectives are NOT
-                        // baked into graphs. They run eagerly during replay.
-                        #[cfg(feature = "nccl")]
-                        let _nccl_guard = vllm_cuda::nccl::SuppressNcclGuard::new();
-                        piecewise_runner.capture_all_pieces(bs, dev, |piece_type, buffers, d| {
-                            (*self_ptr)
-                                .execute_graph_piece(piece_type, buffers, d)
-                                .map_err(|e| anyhow::anyhow!("{e}"))
-                        })
-                    };
-                    match result {
-                        Ok(()) => info!("Piecewise graphs captured for batch_size={bs}"),
-                        Err(e) => {
-                            tracing::warn!("Failed to capture piecewise graphs for bs={bs}: {e}");
-                            break;
-                        }
-                    }
-                }
-
-                if !piecewise_runner.captured_sizes().is_empty() {
-                    info!(
-                        "Piecewise CUDA graphs captured for batch sizes: {:?}",
-                        piecewise_runner.captured_sizes()
-                    );
-                    self.piecewise_graph_runner = Some(piecewise_runner);
-                } else {
-                    tracing::warn!(
-                        "No piecewise graphs captured, piecewise mode will be unavailable"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to create PiecewiseGraphRunner: {e}");
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Dynamic Attention Execution (Outside CUDA Graphs)
-    // -----------------------------------------------------------------------
-
-    /// Execute attention for a single layer. Called during piecewise replay
-    /// between pre-attn and post-attn graph pieces.
-    ///
-    /// FA2 handles split-K internally — no manual split-K optimization needed.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn execute_attention_layer(
-        &self,
-        layer_idx: usize,
-        attn_input: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<OwnedTensor> {
-        match &self.model {
-            Some(CudaModel::Llama(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                let rotary = &m.model.rotary;
-                Ok(unsafe {
-                    layer.self_attn.forward(
-                        TensorView::from_raw(attn_input),
-                        TensorView::from_raw(positions),
-                        TensorView::from_raw(slot_mapping),
-                        TensorView::from_raw(cu_seqlens_q),
-                        TensorView::from_raw(seqused_k),
-                        TensorView::from_raw(block_table),
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        kv_cache,
-                        rotary,
-                        device,
-                    )
-                })
-            }
-            Some(CudaModel::Qwen2(m)) => {
-                let layer = &m.0.model.layers[layer_idx];
-                let rotary = &m.0.model.rotary;
-                Ok(unsafe {
-                    layer.self_attn.forward(
-                        TensorView::from_raw(attn_input),
-                        TensorView::from_raw(positions),
-                        TensorView::from_raw(slot_mapping),
-                        TensorView::from_raw(cu_seqlens_q),
-                        TensorView::from_raw(seqused_k),
-                        TensorView::from_raw(block_table),
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        kv_cache,
-                        rotary,
-                        device,
-                    )
-                })
-            }
-            Some(CudaModel::Gemma2(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                let rotary = &m.model.rotary;
-                Ok(unsafe {
-                    layer.self_attn.forward(
-                        TensorView::from_raw(attn_input),
-                        TensorView::from_raw(positions),
-                        TensorView::from_raw(slot_mapping),
-                        TensorView::from_raw(cu_seqlens_q),
-                        TensorView::from_raw(seqused_k),
-                        TensorView::from_raw(block_table),
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        kv_cache,
-                        rotary,
-                        device,
-                    )
-                })
-            }
-            Some(CudaModel::Gemma3(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                let is_sliding = layer_idx < m.model.layer_is_sliding.len()
-                    && m.model.layer_is_sliding[layer_idx];
-                let rotary = if is_sliding {
-                    &m.model.rotary_local
-                } else {
-                    &m.model.rotary_global
-                };
-                Ok(unsafe {
-                    layer.self_attn.forward(
-                        TensorView::from_raw(attn_input),
-                        TensorView::from_raw(positions),
-                        TensorView::from_raw(slot_mapping),
-                        TensorView::from_raw(cu_seqlens_q),
-                        TensorView::from_raw(seqused_k),
-                        TensorView::from_raw(block_table),
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        kv_cache,
-                        rotary,
-                        device,
-                    )
-                })
-            }
-            Some(CudaModel::Qwen3Moe(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                let rotary = &m.model.rotary;
-                Ok(unsafe {
-                    layer.self_attn.forward(
-                        TensorView::from_raw(attn_input),
-                        TensorView::from_raw(positions),
-                        TensorView::from_raw(slot_mapping),
-                        TensorView::from_raw(cu_seqlens_q),
-                        TensorView::from_raw(seqused_k),
-                        TensorView::from_raw(block_table),
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        kv_cache,
-                        rotary,
-                        device,
-                    )
-                })
-            }
-            Some(CudaModel::Qwen2Moe(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                let rotary = &m.model.rotary;
-                Ok(unsafe {
-                    layer.self_attn.forward(
-                        TensorView::from_raw(attn_input),
-                        TensorView::from_raw(positions),
-                        TensorView::from_raw(slot_mapping),
-                        TensorView::from_raw(cu_seqlens_q),
-                        TensorView::from_raw(seqused_k),
-                        TensorView::from_raw(block_table),
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        kv_cache,
-                        rotary,
-                        device,
-                    )
-                })
-            }
-            Some(CudaModel::Mixtral(m)) => {
-                let layer = &m.model.layers[layer_idx];
-                let rotary = &m.model.rotary;
-                Ok(unsafe {
-                    layer.self_attn.forward(
-                        TensorView::from_raw(attn_input),
-                        TensorView::from_raw(positions),
-                        TensorView::from_raw(slot_mapping),
-                        TensorView::from_raw(cu_seqlens_q),
-                        TensorView::from_raw(seqused_k),
-                        TensorView::from_raw(block_table),
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        kv_cache,
-                        rotary,
-                        device,
-                    )
-                })
-            }
-            _ => Err(ExecutorError::WorkerExecution(
-                "Model not initialized or unsupported for attention".into(),
-            )),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Piecewise Replay Flow
-    // -----------------------------------------------------------------------
-
-    /// Copy input metadata to persistent buffers for piecewise execution.
-    ///
-    /// `PreparedInputs` holds CPU-side data. We H2D-copy into the persistent GPU
-    /// buffers whose pointers are baked into the captured graphs.
-    /// `graph_bs` is the padded batch size matching the captured graph.
-    unsafe fn copy_inputs_to_buffers(
-        prepared: &PreparedInputs,
-        buffers: &vllm_cuda::graph_piece::PersistentBuffers,
-        block_size: usize,
-        graph_bs: usize,
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<()> {
-        let meta = &prepared.attn_meta;
-        let batch_size = meta.num_reqs;
-
-        // ---- input_ids (u32, decode: 1 token per request) ----
-        // Pad to graph_bs with zeros (matching Python's persistent buffer approach).
-        {
-            let mut ids: Vec<u32> = prepared.flat_token_ids.to_vec();
-            ids.resize(graph_bs, 0);
-            unsafe {
-                driver::memcpy_htod_async(
-                    buffers.input_ids.ptr(),
-                    ids.as_ptr() as *const u8,
-                    graph_bs * 4,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("Copy input_ids: {e}")))?;
-        }
-
-        // ---- positions (u32) — last token position per request ----
-        {
-            let mut positions: Vec<u32> = prepared.flat_positions.to_vec();
-            positions.resize(graph_bs, 0);
-            unsafe {
-                driver::memcpy_htod_async(
-                    buffers.positions.ptr(),
-                    positions.as_ptr() as *const u8,
-                    graph_bs * 4,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("Copy positions: {e}")))?;
-        }
-
-        // ---- slot_mapping (i64) ----
-        {
-            let mut slot_mapping: Vec<i64> = Vec::with_capacity(graph_bs);
-            for i in 0..batch_size {
-                let tokens_before = meta.tokens_before[i];
-                let q_len = meta.q_lens[i];
-                let block_ids = &meta.block_ids[i];
-                let abs_pos = tokens_before + q_len - 1;
-                let block_idx = abs_pos / block_size;
-                let offset = abs_pos % block_size;
-                if block_idx < block_ids.len() {
-                    slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
-                } else {
-                    slot_mapping.push(-1i64);
-                }
-            }
-            // Pad with -1 (no write) for extra slots
-            slot_mapping.resize(graph_bs, -1i64);
-            unsafe {
-                driver::memcpy_htod_async(
-                    buffers.slot_mapping.ptr(),
-                    slot_mapping.as_ptr() as *const u8,
-                    graph_bs * 8,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("Copy slot_mapping: {e}")))?;
-        }
-
-        // ---- cu_seqlens_q (i32, length graph_bs+1) ----
-        // For decode: [0, 1, 2, ..., graph_bs]. Padded entries get q_len=1.
-        {
-            let mut cu_q: Vec<i32> = meta.query_start_loc.iter().map(|&x| x as i32).collect();
-            // Extend to graph_bs + 1 entries (each padded request has q_len=1)
-            let last = *cu_q.last().unwrap_or(&0);
-            for i in 0..(graph_bs - batch_size) {
-                cu_q.push(last + (i as i32) + 1);
-            }
-            unsafe {
-                driver::memcpy_htod_async(
-                    buffers.cu_seqlens_q.ptr(),
-                    cu_q.as_ptr() as *const u8,
-                    (graph_bs + 1) * 4,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("Copy cu_seqlens_q: {e}")))?;
-        }
-
-        // ---- seqused_k (i32) ----
-        // Padded entries get seqused_k=1 (minimal valid KV; reads from block 0).
-        {
-            let mut seqused: Vec<i32> = meta.seq_lens.iter().map(|&x| x as i32).collect();
-            seqused.resize(graph_bs, 1);
-            unsafe {
-                driver::memcpy_htod_async(
-                    buffers.seqused_k.ptr(),
-                    seqused.as_ptr() as *const u8,
-                    graph_bs * 4,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("Copy seqused_k: {e}")))?;
-        }
-
-        // ---- block_table (i32, [graph_bs, max_blocks_per_seq]) ----
-        {
-            let max_blocks = buffers.max_blocks_per_seq;
-            let mut block_table = vec![0i32; graph_bs * max_blocks];
-            for (i, blocks) in meta.block_ids.iter().enumerate() {
-                for (j, &bid) in blocks.iter().enumerate() {
-                    if j < max_blocks {
-                        block_table[i * max_blocks + j] = bid as i32;
-                    }
-                }
-            }
-            // Padded entries: block_table stays 0 (block 0 is valid memory).
-            unsafe {
-                driver::memcpy_htod_async(
-                    buffers.block_table.ptr(),
-                    block_table.as_ptr() as *const u8,
-                    graph_bs * max_blocks * 4,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("Copy block_table: {e}")))?;
-        }
-
-        Ok(())
-    }
-
-    /// Execute model using piecewise CUDA graphs with dynamic attention.
-    /// This is the main replay flow that orchestrates piece execution.
-    unsafe fn execute_model_piecewise(
-        &mut self,
-        prepared: &PreparedInputs,
-    ) -> ExecutorResult<Vec<u32>> {
-        // ---- Extract all read-only metadata we need before any &mut borrows ----
-        let actual_batch_size = prepared.attn_meta.num_reqs;
-        let max_seqlen_q = prepared.attn_meta.q_lens.iter().copied().max().unwrap_or(1);
-        let max_seqlen_k = prepared
-            .attn_meta
-            .seq_lens
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(1);
-
-        // Check runner exists and find the nearest captured graph size.
-        let (max_batch, num_layers, hidden_size, dtype_size, attn_output_ptr, batch_size) = {
-            let runner = self.piecewise_graph_runner.as_ref().ok_or_else(|| {
-                ExecutorError::WorkerExecution("Piecewise graph runner not initialized".into())
-            })?;
-            let b = &runner.buffers;
-            let graph_bs = runner
-                .nearest_graph_size(actual_batch_size)
-                .ok_or_else(|| {
-                    ExecutorError::WorkerExecution(format!(
-                        "No piecewise graph for batch_size={}",
-                        actual_batch_size
-                    ))
-                })?;
-            (
-                b.max_batch,
-                b.num_layers,
-                b.hidden_size,
-                b.dtype.size_bytes(),
-                b.attn_output.ptr(),
-                graph_bs,
-            )
-        };
-
-        if batch_size > max_batch {
-            return Err(ExecutorError::WorkerExecution(format!(
-                "Batch size {} exceeds max_batch {}",
-                batch_size, max_batch
-            )));
-        }
-
-        let kv_cache_block_size = self
-            .kv_cache
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerExecution("KV cache not initialized".into()))?
-            .block_size;
-
-        // ---- H2D copy inputs into persistent buffers ----
-        {
-            let device = self
-                .device
-                .as_mut()
-                .ok_or_else(|| ExecutorError::WorkerExecution("Device not initialized".into()))?;
-            let runner = self.piecewise_graph_runner.as_ref().unwrap();
-            unsafe {
-                Self::copy_inputs_to_buffers(
-                    prepared,
-                    &runner.buffers,
-                    kv_cache_block_size,
-                    batch_size,
-                    device,
-                )?;
-            }
-        }
-
-        // ---- Replay embedding piece ----
-        {
-            let device = self.device.as_mut().unwrap();
-            let runner = self.piecewise_graph_runner.as_ref().unwrap();
-            unsafe {
-                runner
-                    .replay_piece(batch_size, GraphPieceType::Embedding, device)
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("Embedding replay: {e}"))
-                    })?;
-            }
-        }
-
-        // ---- Execute all layers with dynamic attention ----
-        for layer_idx in 0..num_layers {
-            // Replay pre-attention piece (RMSNorm → attn_input buffer).
-            {
-                let device = self.device.as_mut().unwrap();
-                let runner = self.piecewise_graph_runner.as_ref().unwrap();
-                unsafe {
-                    runner
-                        .replay_piece(batch_size, GraphPieceType::LayerPreAttn(layer_idx), device)
-                        .map_err(|e| {
-                            ExecutorError::WorkerExecution(format!(
-                                "Layer {} pre-attn replay: {e}",
-                                layer_idx
-                            ))
-                        })?;
-                }
-            }
-
-            // Build GpuTensor views into persistent buffers for attention inputs.
-            // SAFETY: pointers are valid for the lifetime of PersistentBuffers.
-            let (
-                attn_input,
-                positions_t,
-                slot_mapping_t,
-                cu_seqlens_q_t,
-                seqused_k_t,
-                block_table_t,
-            ) = {
-                let runner = self.piecewise_graph_runner.as_ref().unwrap();
-                let b = &runner.buffers;
-                unsafe {
-                    (
-                        b.attn_input_tensor(batch_size),
-                        b.positions_tensor(batch_size),
-                        b.slot_mapping_tensor(batch_size),
-                        b.cu_seqlens_q_tensor(batch_size),
-                        b.seqused_k_tensor(batch_size),
-                        b.block_table_tensor(batch_size),
-                    )
-                }
-            };
-
-            // Execute attention dynamically (NOT captured in graph).
-            // SAFETY: device, kv_cache, and model are separate fields of self;
-            // we use raw pointers to satisfy the borrow checker while keeping
-            // all three accessible simultaneously.
-            let attn_output = unsafe {
-                let self_ptr: *const CudaWorker = self;
-                let device_ptr: *mut GpuDevice = self.device.as_mut().unwrap();
-                let kv_cache_ptr: *const KvCachePool = self.kv_cache.as_ref().unwrap();
-                (*self_ptr).execute_attention_layer(
-                    layer_idx,
-                    attn_input,
-                    positions_t,
-                    slot_mapping_t,
-                    cu_seqlens_q_t,
-                    seqused_k_t,
-                    block_table_t,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    &*kv_cache_ptr,
-                    &mut *device_ptr,
-                )?
-            };
-
-            // Copy attention output into the persistent attn_output buffer.
-            {
-                let device = self.device.as_mut().unwrap();
-                let attn_bytes = batch_size * hidden_size * dtype_size;
-                unsafe {
-                    driver::memcpy_dtod_async(
-                        attn_output_ptr,
-                        attn_output.as_gpu_tensor().raw_ptr() as *const u8,
-                        attn_bytes,
-                        device.compute_stream,
-                    )
-                }
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!(
-                        "Layer {} attn output copy: {e}",
-                        layer_idx
-                    ))
-                })?;
-            }
-
-            // Replay post-attention piece (residual add + MLP → next hidden buffer).
-            // NCCL all-reduce is suppressed inside the graph; run it eagerly after.
-            {
-                let device = self.device.as_mut().unwrap();
-                let runner = self.piecewise_graph_runner.as_ref().unwrap();
-                unsafe {
-                    #[cfg(feature = "nccl")]
-                    let _nccl_guard = vllm_cuda::nccl::SuppressNcclGuard::new();
-                    runner
-                        .replay_piece(batch_size, GraphPieceType::LayerPostAttn(layer_idx), device)
-                        .map_err(|e| {
-                            ExecutorError::WorkerExecution(format!(
-                                "Layer {} post-attn replay: {e}",
-                                layer_idx
-                            ))
-                        })?;
-                }
-            }
-
-            // Eager MLP all-reduce (TP): the PostAttn graph wrote the down_proj
-            // output (before all-reduce) into the next hidden buffer.
-            #[cfg(feature = "nccl")]
-            {
-                let use_buffer_a = (layer_idx + 1).is_multiple_of(2);
-                let runner = self.piecewise_graph_runner.as_ref().unwrap();
-                let hidden_buf = unsafe { runner.buffers.hidden_tensor(batch_size, use_buffer_a) };
-                match &self.model {
-                    Some(CudaModel::Llama(m)) => {
-                        if let Some(ref group) = m.model.layers[layer_idx].mlp.tp_group {
-                            unsafe {
-                                group
-                                    .all_reduce_inplace(hidden_buf)
-                                    .expect("piecewise MLP all_reduce failed");
-                            }
-                        }
-                    }
-                    Some(CudaModel::Qwen2(m)) => {
-                        if let Some(ref group) = m.0.model.layers[layer_idx].mlp.tp_group {
-                            unsafe {
-                                group
-                                    .all_reduce_inplace(hidden_buf)
-                                    .expect("piecewise MLP all_reduce failed");
-                            }
-                        }
-                    }
-                    _ => {} // Other models: no TP all-reduce needed
-                }
-            }
-        }
-
-        // ---- Replay LM head piece ----
-        {
-            let device = self.device.as_mut().unwrap();
-            let runner = self.piecewise_graph_runner.as_ref().unwrap();
-            unsafe {
-                #[cfg(feature = "nccl")]
-                let _nccl_guard = vllm_cuda::nccl::SuppressNcclGuard::new();
-                runner
-                    .replay_piece(batch_size, GraphPieceType::LmHead, device)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("LM head replay: {e}")))?;
-            }
-        }
-
-        // Eager all-gather logits (TP): the LmHead graph produced a vocab shard.
-        // Rearrange into full vocab logits in the persistent logits buffer.
-        #[cfg(feature = "nccl")]
-        {
-            let tp_group = match &self.model {
-                Some(CudaModel::Llama(m)) => m.tp_group.as_ref(),
-                Some(CudaModel::Qwen2(m)) => m.0.tp_group.as_ref(),
-                _ => None,
-            };
-            if let Some(group) = tp_group {
-                let runner = self.piecewise_graph_runner.as_ref().unwrap();
-                let device = self.device.as_mut().unwrap();
-                let logits_shard = unsafe { runner.buffers.logits_tensor(batch_size) };
-                let gathered =
-                    unsafe { group.all_gather_last_dim(logits_shard, &mut device.caching) };
-                // Copy gathered logits back into the persistent logits buffer.
-                let gathered_bytes = gathered.as_gpu_tensor().numel()
-                    * gathered.as_gpu_tensor().dtype().size_bytes();
-                unsafe {
-                    vllm_cuda::driver::memcpy_dtod_async(
-                        runner.buffers.logits.ptr(),
-                        gathered.as_gpu_tensor().raw_ptr() as *const u8,
-                        gathered_bytes,
-                        device.compute_stream,
-                    )
-                }
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("logits all-gather copy: {e}"))
-                })?;
-            }
-        }
-
-        // ---- Replay sampling piece ----
-        {
-            let device = self.device.as_mut().unwrap();
-            let runner = self.piecewise_graph_runner.as_ref().unwrap();
-            unsafe {
-                runner
-                    .replay_piece(batch_size, GraphPieceType::Sampling, device)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("Sampling replay: {e}")))?;
-            }
-        }
-
-        // ---- Extract output token IDs from persistent buffer via D2H copy ----
-        // Only copy actual_batch_size tokens (ignore padded slots).
-        let token_ids_gpu = {
-            let runner = self.piecewise_graph_runner.as_ref().unwrap();
-            let buffers = &runner.buffers;
-            // SAFETY: token_ids buffer is valid and was written by the sampling piece.
-            unsafe { GpuTensor::new(buffers.token_ids.ptr(), &[actual_batch_size], GpuDType::U32) }
-        };
-        let staging = self.host_staging.as_ref();
-        let device = self.device.as_mut().unwrap();
-        Self::d2h_token_ids_sync(staging, 0, &token_ids_gpu, actual_batch_size, device)
     }
 }
 
@@ -6170,353 +4696,11 @@ impl Worker for CudaWorker {
     }
 
     fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
-        if self.config.enforce_eager {
-            info!("CudaWorker: --enforce-eager set, skipping CUDA graph capture");
-            return Ok(());
-        }
-
-        if self.uses_ggml {
-            info!(
-                "CudaWorker: GGML model — skipping CUDA graph capture (incompatible with graph capture)"
-            );
-            return Ok(());
-        }
-
-        if self.qwen3_next_config.is_some() {
-            info!("CudaWorker: Qwen3Next — skipping CUDA graph capture (GDN recurrent state)");
-            return Ok(());
-        }
-
-        if self.kv_cache_is_fp8 {
-            info!(
-                "CudaWorker: FP8 KV cache — skipping CUDA graph capture (variable scratch buffer sizes)"
-            );
-            return Ok(());
-        }
-
-        let max_blocks_per_seq = self.max_blocks_per_seq();
-
-        let (mut model, mut kv_cache, mut device) =
-            match (&self.model, &self.kv_cache, &mut self.device) {
-                (Some(m), Some(kv), Some(d)) => (m, kv, d),
-                _ => return Ok(()), // Not fully initialized yet.
-            };
-
-        // Resolve Auto mode now that we know the SM version and TP config.
+        if self.config.cublas_autotune
+            && let Some(ref mut device) = self.device
         {
-            let resolved = self
-                .config
-                .cuda_graph_mode
-                .resolve(device.sm_version, self.config.tp_world_size);
-            info!(
-                "CudaWorker: resolved cuda_graph_mode {:?} → {:?} (SM{}, TP={})",
-                self.config.cuda_graph_mode, resolved, device.sm_version, self.config.tp_world_size
-            );
-            self.config.cuda_graph_mode = resolved;
-        }
-
-        // Encoder models don't support CUDA graph capture (no decode loop).
-        if matches!(model, CudaModel::ModernBert(_)) {
-            self.config.cuda_graph_mode = CudaGraphMode::None;
-            info!("CudaWorker: encoder model — disabling CUDA graphs");
-        }
-
-        unsafe { driver::ctx_set_current(device.ctx) }
-            .map_err(|e| ExecutorError::WorkerInit(format!("ctx_set_current: {e}")))?;
-
-        let vocab_size = model.vocab_size();
-
-        // Capture CUDA graphs for common decode batch sizes.
-        // During decode, every request has q_len=1, so shapes are deterministic.
-        let capture_sizes = if self.config.cuda_graph_sizes.is_empty() {
-            // Match Python vLLM's capture sizes: [1, 2, 4] + range(8, 256, 8) + range(256, 512+1, 16)
-            let mut sizes = vec![1, 2, 4];
-            let mut s = 8;
-            while s < 256 {
-                sizes.push(s);
-                s += 8;
-            }
-            while s <= 512 {
-                sizes.push(s);
-                s += 16;
-            }
-            sizes
-        } else {
-            self.config.cuda_graph_sizes.clone()
-        };
-        let max_bs = *capture_sizes.iter().max().unwrap();
-
-        // -----------------------------------------------------------------------
-        // 1. Capture Piecewise CUDA Graphs FIRST (matching Python vLLM order)
-        // -----------------------------------------------------------------------
-        // Piecewise capture runs individual pieces (embedding, norm, MLP, etc.)
-        // which populates cuBLAS plans and establishes memory patterns. This is
-        // the safe fallback — if monolithic capture fails later (e.g. illegal
-        // address from attention), piecewise graphs are already captured and the
-        // CUDA context is still healthy.
-        let should_capture_piecewise = matches!(
-            self.config.cuda_graph_mode,
-            CudaGraphMode::Piecewise | CudaGraphMode::FullAndPiecewise
-        );
-
-        if should_capture_piecewise && !capture_sizes.is_empty() {
-            let num_layers = model.num_layers();
-            let hidden_size = model.hidden_size();
-            let piecewise_max_bs = *capture_sizes.iter().max().unwrap();
-            let piecewise_capture_sizes = capture_sizes.clone();
-            let piecewise_vocab_size = vocab_size;
-            let piecewise_dtype = self.model_dtype;
-            // Release borrowed refs from self so capture_piecewise_graphs can take &mut self.
-            let _ = model;
-            let _ = kv_cache;
-            let _ = device;
-
-            self.capture_piecewise_graphs(
-                num_layers,
-                hidden_size,
-                piecewise_vocab_size,
-                piecewise_dtype,
-                piecewise_max_bs,
-                &piecewise_capture_sizes,
-            );
-
-            // Re-obtain borrows for monolithic capture below.
-            model = self.model.as_ref().unwrap();
-            kv_cache = self.kv_cache.as_ref().unwrap();
-            device = self.device.as_mut().unwrap();
-        }
-
-        // -----------------------------------------------------------------------
-        // 2. Capture Monolithic (Full) Decode CUDA Graphs
-        // -----------------------------------------------------------------------
-        // Monolithic graphs capture the entire forward pass (including attention)
-        // in a single CUDA graph — zero kernel launch overhead.
-        //
-        // MoE models are excluded: their per-layer kernel count (router +
-        // N expert GEMMs + shared experts + gating) exceeds the CUDA driver's
-        // undocumented graph node limit, causing CUDA_ERROR_ILLEGAL_ADDRESS that
-        // permanently poisons the CUDA context. This matches Python vLLM's
-        // approach of validating before capture rather than recovering after
-        // failure. Piecewise graphs handle MoE models with ~1-3% decode overhead.
-        let padded_max_seqlen_k: usize = 2048;
-        let mut monolithic_failed = false;
-
-        let model_supports_monolithic = !model.is_moe();
-        let should_capture_monolithic = model_supports_monolithic
-            && matches!(
-                self.config.cuda_graph_mode,
-                CudaGraphMode::Full
-                    | CudaGraphMode::FullAndPiecewise
-                    | CudaGraphMode::FullDecodeOnly
-            );
-
-        if !model_supports_monolithic {
-            info!(
-                "MoE model detected — skipping monolithic CUDA graph capture \
-                 (too many graph nodes for driver limit). Piecewise graphs will be used."
-            );
-        }
-
-        if !should_capture_monolithic {
-            // Skip to prefill graphs / cublas autotune.
-        } else {
-            let mut runner = unsafe {
-                CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype, max_blocks_per_seq)
-            }
-            .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
-
-            // FP8 KV cache: allocate persistent dequant buffers and cache scales.
-            if self.kv_cache_is_fp8 {
-                unsafe {
-                    runner
-                        .init_fp8_buffers(
-                            padded_max_seqlen_k,
-                            kv_cache.num_kv_heads,
-                            kv_cache.head_dim,
-                            self.model_dtype,
-                        )
-                        .map_err(|e| ExecutorError::WorkerInit(format!("init_fp8_buffers: {e}")))?;
-                    runner
-                        .cache_fp8_scales(kv_cache, device.compute_stream)
-                        .map_err(|e| ExecutorError::WorkerInit(format!("cache_fp8_scales: {e}")))?;
-                }
-            }
-
-            // Begin private pool for ALL graph captures (like PyTorch's shared graph pool).
-            // One pool is shared across all batch sizes so blocks are reused.
-            device.caching.begin_allocate_to_pool();
-
-            // Set FP8 graph context thread-local so attention helpers use pre-allocated path.
-            if let Some(ctx) = runner.fp8_graph_ctx() {
-                vllm_cuda::model::attention_helpers::set_fp8_graph_ctx(ctx);
-            }
-
-            // Capture largest batch sizes first (matching Python vLLM). The first
-            // capture establishes the pool's high-water mark; subsequent smaller
-            // captures reuse the same memory — preventing incremental pool growth
-            // that could OOM the driver.
-            for &bs in capture_sizes.iter().rev() {
-                info!("Capturing CUDA graph for batch_size={bs}...");
-                let kv_ref = kv_cache;
-                let model_ref = model;
-
-                let result = unsafe {
-                    runner.capture(bs, device, |inputs, dev| {
-                        model_ref.forward(
-                            TensorView::from_raw(inputs.input_ids),
-                            TensorView::from_raw(inputs.positions),
-                            TensorView::from_raw(inputs.slot_mapping),
-                            TensorView::from_raw(inputs.cu_seqlens_q),
-                            TensorView::from_raw(inputs.seqused_k),
-                            TensorView::from_raw(inputs.block_table),
-                            1, // max_seqlen_q = 1 for decode
-                            padded_max_seqlen_k,
-                            kv_ref,
-                            dev,
-                            None, // no last_token_indices (decode: all tokens are last)
-                        )
-                    })
-                };
-
-                match result {
-                    Ok(()) => info!("CUDA graph captured for batch_size={bs}"),
-                    Err(e) => {
-                        tracing::warn!("Failed to capture CUDA graph for bs={bs}: {e}");
-                        // Stop immediately — CUDA_ERROR_ILLEGAL_ADDRESS poisons the
-                        // entire CUDA context. Piecewise graphs are the fallback.
-                        monolithic_failed = true;
-                        break;
-                    }
-                }
-            }
-
-            // Clear FP8 graph context thread-local.
-            vllm_cuda::model::attention_helpers::clear_fp8_graph_ctx();
-
-            // End private pool after all captures. Blocks in the pool that are
-            // still free are effectively owned by the captured graphs.
-            device.caching.end_allocate_to_pool();
-
-            if monolithic_failed {
-                // Context is poisoned — discard any partially captured graphs.
-                // Don't attempt staging allocation. Piecewise is the fallback.
-                tracing::warn!(
-                    "Discarding monolithic graphs (context poisoned). \
-                 Piecewise graphs will handle all decode batches."
-                );
-            } else if !runner.captured_sizes().is_empty() {
-                info!(
-                    "CUDA graphs captured for batch sizes: {:?}",
-                    runner.captured_sizes()
-                );
-                // Allocate pinned host staging buffers sized for the largest captured graph.
-                let staging_max_bs = *runner.captured_sizes().last().unwrap();
-                match unsafe { HostStaging::new(staging_max_bs, max_blocks_per_seq) } {
-                    Ok(staging) => {
-                        info!(
-                            "Pinned host staging allocated for max_batch={}",
-                            staging_max_bs
-                        );
-                        self.host_staging = Some(staging);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to allocate pinned staging: {e}");
-                    }
-                }
-                self.graph_runner = Some(runner);
-            }
-        } // end should_capture_monolithic
-
-        // -----------------------------------------------------------------------
-        // 3. Capture Prefill CUDA Graphs
-        // -----------------------------------------------------------------------
-        // Skip if monolithic capture poisoned the CUDA context — prefill graphs
-        // use the same full forward pass and would also fail.
-        if monolithic_failed {
-            info!(
-                "Skipping prefill graph capture (CUDA context poisoned by monolithic failure). \
-                 Piecewise graphs available for decode; prefill runs eagerly."
-            );
-        }
-        // Encoder models don't use CUDA graphs at all — skip prefill capture.
-        let skip_prefill_graphs =
-            monolithic_failed || self.config.cuda_graph_mode == CudaGraphMode::None;
-        if skip_prefill_graphs && !monolithic_failed {
-            info!("Skipping prefill graph capture (CUDA graphs disabled).");
-        }
-        let max_prefill_tokens = self.config.max_num_batched_tokens;
-        let prefill_sizes: Vec<usize> = [128, 256, 512, 1024, 2048, 4096, 8192]
-            .iter()
-            .copied()
-            .filter(|&s| s <= max_prefill_tokens)
-            .collect();
-
-        if !prefill_sizes.is_empty() && !skip_prefill_graphs {
-            let max_prefill = *prefill_sizes.last().unwrap();
-            match unsafe {
-                PrefillGraphRunner::new(
-                    max_prefill,
-                    vocab_size,
-                    self.model_dtype,
-                    max_blocks_per_seq,
-                )
-            } {
-                Ok(mut prefill_runner) => {
-                    // Capture largest first (matching Python vLLM).
-                    for &num_tokens in prefill_sizes.iter().rev() {
-                        info!("Capturing prefill CUDA graph for num_tokens={num_tokens}...");
-                        let kv_ref = kv_cache;
-                        let model_ref = model;
-
-                        let result = unsafe {
-                            prefill_runner.capture(num_tokens, device, |inputs, dev| {
-                                model_ref.forward(
-                                    TensorView::from_raw(inputs.input_ids),
-                                    TensorView::from_raw(inputs.positions),
-                                    TensorView::from_raw(inputs.slot_mapping),
-                                    TensorView::from_raw(inputs.cu_seqlens_q),
-                                    TensorView::from_raw(inputs.seqused_k),
-                                    TensorView::from_raw(inputs.block_table),
-                                    num_tokens, // max_seqlen_q
-                                    num_tokens, // max_seqlen_k
-                                    kv_ref,
-                                    dev,
-                                    Some(TensorView::from_raw(inputs.last_token_indices)),
-                                )
-                            })
-                        };
-
-                        match result {
-                            Ok(()) => {
-                                info!("Prefill CUDA graph captured for num_tokens={num_tokens}")
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to capture prefill graph for {num_tokens}: {e}"
-                                );
-                                break;
-                            }
-                        }
-                    }
-
-                    if !prefill_runner.captured_sizes().is_empty() {
-                        info!(
-                            "Prefill CUDA graphs captured for token counts: {:?}",
-                            prefill_runner.captured_sizes()
-                        );
-                        self.prefill_graph_runner = Some(prefill_runner);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to create PrefillGraphRunner: {e}");
-                }
-            }
-        }
-
-        if self.config.cublas_autotune {
             unsafe { device.cublas.benchmark_plans() };
         }
-
         Ok(())
     }
 
@@ -6528,26 +4712,10 @@ impl Worker for CudaWorker {
 
         info!("CudaWorker: sleeping (level {level}) — freeing GPU memory");
 
-        // Flush any deferred D2H commit.
-        if self.pending_commit.take().is_some()
-            && let Some(ref dev) = self.device
-        {
-            let _ = dev.sync_d2h();
-        }
-
         // Save num_gpu_blocks for re-init on wake.
         if let Some(ref kv) = self.kv_cache {
             self.num_gpu_blocks_saved = kv.num_blocks;
         }
-
-        // Drop CUDA graphs (Drop impl frees GPU memory).
-        self.graph_runner = None;
-        self.prefill_graph_runner = None;
-        self.last_graph_batch_size = None;
-        self.graph_metadata_valid = false;
-
-        // Drop host staging (Drop impl frees pinned memory).
-        self.host_staging = None;
 
         // Drop KV cache (Drop impl frees GPU memory).
         self.kv_cache = None;
@@ -6607,7 +4775,7 @@ impl Worker for CudaWorker {
             self.initialize_cache(num_gpu_blocks, 0)?;
         }
 
-        // Re-capture CUDA graphs.
+        // Run cuBLAS autotune (if enabled).
         self.compile_or_warm_up_model()?;
 
         info!("CudaWorker: wake complete");
@@ -6615,12 +4783,6 @@ impl Worker for CudaWorker {
     }
 
     fn shutdown(&mut self) {
-        // Flush any deferred D2H commit before dropping the device.
-        if self.pending_commit.take().is_some()
-            && let Some(ref dev) = self.device
-        {
-            let _ = dev.sync_d2h();
-        }
         // Drop tracked weight allocations (RawGpuMem::Drop frees GPU memory).
         self.weight_gpu_allocs.clear();
         self.model = None;
@@ -6772,11 +4934,6 @@ impl CudaWorker {
                 .scheduled_cached_reqs
                 .resumed_req_ids
                 .is_empty();
-        if self.batch_changed {
-            // Batch composition changed — can't reuse persistent input_ids or metadata.
-            self.last_graph_batch_size = None;
-            self.graph_metadata_valid = false;
-        }
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
             self.prompt_lengths.remove(req_id);
@@ -6873,8 +5030,7 @@ impl CudaWorker {
             );
         }
 
-        // Update cached requests' block tables. Track if any changed.
-        let mut blocks_changed = !scheduler_output.scheduled_new_reqs.is_empty();
+        // Update cached requests' block tables.
         for (i, req_id) in scheduler_output
             .scheduled_cached_reqs
             .req_ids
@@ -6885,9 +5041,6 @@ impl CudaWorker {
                 scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
                 && let Some(group0) = new_blocks.first()
             {
-                if !group0.is_empty() {
-                    blocks_changed = true;
-                }
                 self.input_batch.update_blocks(req_id, group0.clone());
             }
         }
@@ -6911,188 +5064,8 @@ impl CudaWorker {
         }
 
         // ---------------------------------------------------------------
-        // Chunked prefill re-arm: detect cached requests that need
-        // more than 1 token (prefill continuation). Must happen before
-        // the super fast graph path, which would otherwise replay a
-        // decode graph instead of running the prefill eagerly.
-        // ---------------------------------------------------------------
-        let has_chunked_prefill =
-            scheduler_output
-                .scheduled_cached_reqs
-                .req_ids
-                .iter()
-                .any(|req_id| {
-                    let is_resumed = scheduler_output
-                        .scheduled_cached_reqs
-                        .resumed_req_ids
-                        .contains(req_id);
-                    let num_scheduled = scheduler_output
-                        .num_scheduled_tokens
-                        .get(req_id)
-                        .copied()
-                        .unwrap_or(0);
-                    is_resumed || num_scheduled > 1
-                });
-
-        // ---------------------------------------------------------------
-        // Super fast path: skip prepare_inputs entirely when the graph
-        // has valid metadata from the previous step. This avoids ~50μs
-        // of CPU work and, critically, lets us defer commit_step(N-1)
-        // to AFTER the graph launch so it overlaps with GPU execution.
-        // ---------------------------------------------------------------
-        let num_active = self.input_batch.num_active();
-        let fast_graph_bs = if self.graph_metadata_valid && !has_chunked_prefill {
-            self.graph_runner
-                .as_ref()
-                .and_then(|r| r.nearest_graph_size(num_active))
-                .filter(|&gbs| self.last_graph_batch_size == Some(gbs))
-        } else {
-            None
-        };
-
-        if let Some(graph_bs) = fast_graph_bs
-            && let Some(ref mut stg) = self.host_staging
-            && let Some(ref mut device) = self.device
-        {
-            // Collect info from InputBatch upfront (immutable borrow ends here).
-            let (req_ids, block_tables, tokens_in_pool) = self.input_batch.fast_path_info();
-            let out_req_ids: Vec<String> = req_ids.to_vec();
-            let token_counts = self.input_batch.fast_path_token_counts();
-            // Max seqlen_k for this step = max(tokens_already_in_cache + 1).
-            // The +1 accounts for the token we're about to decode (written
-            // to cache by the fused QKV+rope+cache kernel before attention).
-            let fast_max_seqlen_k = tokens_in_pool.iter().copied().max().unwrap_or(0) + 1;
-
-            // Check all-greedy and no-logprobs/grammar without prepare_inputs.
-            let all_greedy_fast = out_req_ids.iter().all(|rid| {
-                self.sampling_params_map
-                    .get(rid)
-                    .is_none_or(|p| p.temperature < 1e-6)
-            });
-            let any_needs_full = self.seal_pad_processor.is_active()
-                || out_req_ids.iter().any(|rid| {
-                    self.sampling_params_map
-                        .get(rid)
-                        .is_some_and(|p| p.logprobs.is_some())
-                        || {
-                            #[cfg(feature = "guided-decoding")]
-                            {
-                                self.grammar_states.contains_key(rid)
-                            }
-                            #[cfg(not(feature = "guided-decoding"))]
-                            {
-                                false
-                            }
-                        }
-                });
-
-            if all_greedy_fast && !any_needs_full {
-                let block_size = self.config.block_size;
-
-                // Block table update for the graph (only if blocks changed).
-                let new_bt = if blocks_changed {
-                    let bt = unsafe { stg.fill_block_table(block_tables, graph_bs) };
-                    Some(bt)
-                } else {
-                    None
-                };
-
-                // Graph launch — GPU self-updates positions, slot_mapping, seqused_k.
-                let runner = self.graph_runner.as_ref().unwrap();
-                let replay_out = unsafe {
-                    runner.replay_decode_fast(
-                        graph_bs,
-                        None,
-                        new_bt,
-                        block_size,
-                        fast_max_seqlen_k,
-                        device,
-                    )
-                }
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("super fast replay_decode_fast: {e}"))
-                })?;
-
-                // Async D2H — enqueue on transfer stream, don't block.
-                let buf_idx = stg.token_buf_idx;
-                Self::d2h_token_ids_async(stg, buf_idx, &replay_out.token_ids, num_active, device)?;
-
-                // NOW resolve the pending commit from the previous step.
-                // The GPU is running step N, so this CPU work overlaps with it.
-                if let Some(pending) = self.pending_commit.take() {
-                    device.sync_d2h().map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("pending sync_d2h: {e}"))
-                    })?;
-                    let prev_ids = unsafe {
-                        stg.host_token_ids[pending.buf_idx].slice::<u32>(pending.num_reqs)
-                    };
-                    for (i, &tok) in prev_ids.iter().enumerate().take(pending.num_reqs) {
-                        self.input_batch.commit_step(
-                            &pending.req_ids[i],
-                            &[tok],
-                            pending.token_counts[i],
-                            pending.has_spec_tokens[i],
-                        );
-                        if let Some(buf) = self.token_buffers.get_mut(&pending.req_ids[i]) {
-                            buf.push(tok);
-                        }
-                    }
-                }
-
-                self.pending_commit = Some(PendingCommit {
-                    buf_idx,
-                    num_reqs: num_active,
-                    req_ids: out_req_ids.clone(),
-                    token_counts,
-                    has_spec_tokens: vec![false; num_active],
-                });
-
-                // Toggle double-buffer.
-                stg.token_buf_idx ^= 1;
-
-                // Build deferred output.
-                let event_addr = device.d2h_done as usize;
-                let buf_addr = stg.host_token_ids[buf_idx].ptr() as usize;
-                let nr = num_active;
-                return Ok(ModelRunnerOutput::deferred(
-                    out_req_ids,
-                    Box::new(move || unsafe {
-                        driver::event_synchronize_raw(event_addr).expect("D2H event sync failed");
-                        std::slice::from_raw_parts(buf_addr as *const u32, nr).to_vec()
-                    }),
-                ));
-            }
-        }
-
-        // Resolve any deferred D2H commit from the previous step before
-        // prepare_inputs (which reads positions, tokens_in_pool, last_token_ids).
-        if let Some(pending) = self.pending_commit.take() {
-            if let Some(ref dev) = self.device {
-                dev.sync_d2h().map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("pending sync_d2h: {e}"))
-                })?;
-            }
-            if let Some(ref stg) = self.host_staging {
-                let host_ids =
-                    unsafe { stg.host_token_ids[pending.buf_idx].slice::<u32>(pending.num_reqs) };
-                for (i, &tok) in host_ids.iter().enumerate().take(pending.num_reqs) {
-                    self.input_batch.commit_step(
-                        &pending.req_ids[i],
-                        &[tok],
-                        pending.token_counts[i],
-                        pending.has_spec_tokens[i],
-                    );
-                    if let Some(buf) = self.token_buffers.get_mut(&pending.req_ids[i]) {
-                        buf.push(tok);
-                    }
-                }
-            }
-        }
-
-        // ---------------------------------------------------------------
-        // Preemption/resumption fixup — done AFTER pending_commit resolution
-        // so that token_buffers has the final token from the previous step
-        // before we rebuild the prefill sequence.
+        // Preemption/resumption fixup — done after batch state update so
+        // that token_buffers is up to date before rebuilding prefill sequences.
         //
         // Preempted requests: remove from InputBatch to stop zombie GPU writes
         // into blocks that have been freed and reallocated.  We keep
@@ -7100,9 +5073,7 @@ impl CudaWorker {
         // can be cleanly re-admitted.
         //
         // Resumed requests: re-add to InputBatch as a fresh prefill using the
-        // complete token sequence (prompt + all output tokens generated so
-        // far).  The pending_commit above has already appended the very last
-        // token to token_buffers, so the sequence is complete.
+        // complete token sequence (prompt + all output tokens generated so far).
         //
         // Matches Python gpu_model_runner._update_states: unscheduled requests
         // are removed, resumed requests are re-added via add_request.
@@ -7308,22 +5279,16 @@ impl CudaWorker {
             }
         }
 
-        // Compute once before the split borrow below (self is borrowed mutably for device).
-        let max_blocks_per_seq = self.max_blocks_per_seq();
-
         // Split borrows: model + kv_cache (shared) vs device (mutable).
         // Use direct field access so the borrow checker sees disjoint borrows.
-        // Note: gdn_pool_ref is deferred until after the piecewise path to avoid
-        // borrow conflicts with execute_model_piecewise(&mut self).
-        let (mut model, mut kv_cache, mut device) =
-            match (&self.model, &self.kv_cache, &mut self.device) {
-                (Some(m), Some(kv), Some(d)) => (m, kv, d),
-                _ => {
-                    return Err(ExecutorError::WorkerExecution(
-                        "model, KV cache, or device not initialized".into(),
-                    ));
-                }
-            };
+        let (model, kv_cache, device) = match (&self.model, &self.kv_cache, &mut self.device) {
+            (Some(m), Some(kv), Some(d)) => (m, kv, d),
+            _ => {
+                return Err(ExecutorError::WorkerExecution(
+                    "model, KV cache, or device not initialized".into(),
+                ));
+            }
+        };
         let num_reqs = prepared.req_inputs.len();
 
         // Build batch_req_ids for this step (used by processor updates after forward).
@@ -7402,1071 +5367,139 @@ impl CudaWorker {
 
         let vocab_size = model.vocab_size();
 
-        // Check if this is a pure decode batch (all q_len=1) and we have a graph.
-        // We allow padding to the nearest captured graph size (e.g. BS=3 → graph BS=4).
-        // PP last stage: skip CUDA graphs for now — use eager forward with forward_pp.
-        let is_decode = prepared.attn_meta.q_lens.iter().all(|&q| q == 1);
-        let graph_bs = if pp_active {
-            None // PP stages use eager forward only
-        } else if is_decode {
-            self.graph_runner
-                .as_ref()
-                .and_then(|r| r.nearest_graph_size(num_reqs))
-        } else {
-            None
-        };
-        let use_graph = graph_bs.is_some();
-
-        if is_decode && !use_graph {
-            tracing::debug!("CUDA graph miss: decode bs={num_reqs} has no matching graph");
-        }
-
-        // Check if all requests are greedy (temp < 1e-6). Used to decide
-        // whether to use the in-graph argmax fast path.
+        // Check if all requests are greedy (temp < 1e-6). Used for sampling dispatch.
         let all_greedy = prepared.req_inputs.iter().all(|r| {
             self.sampling_params_map
                 .get(&r.req_id)
                 .is_none_or(|p| p.temperature < 1e-6)
         });
 
-        // ---------------------------------------------------------------------------
-        // Mixed batch: split into decode (CUDA graph) + prefill (eager) passes.
-        // This avoids running the entire batch through the slow eager path when
-        // most requests are decode (q_len=1) but a few are prefill chunks.
-        // ---------------------------------------------------------------------------
-        let has_decode = prepared.attn_meta.q_lens.contains(&1);
-        let any_spec_in_batch = prepared
-            .req_inputs
-            .iter()
-            .any(|r| !r.spec_token_ids.is_empty());
-        let is_mixed = !is_decode && has_decode;
-        let decode_graph_bs = if pp_active {
-            None // PP stages use eager forward only
-        } else if is_mixed && !any_spec_in_batch {
-            self.graph_runner.as_ref().and_then(|r| {
-                let n_decode = prepared
-                    .attn_meta
-                    .q_lens
-                    .iter()
-                    .filter(|&&q| q == 1)
-                    .count();
-                r.nearest_graph_size(n_decode)
-            })
-        } else {
-            None
-        };
+        // Deferred: take gdn_pool_ref before the eager forward path.
+        let gdn_pool_ref = self.gdn_state_pool.as_ref();
 
-        if let Some(decode_graph_bs) = decode_graph_bs {
-            // Partition requests into decode (q_len=1) and prefill (q_len>1).
-            let mut decode_indices: Vec<usize> = Vec::new();
-            let mut prefill_indices: Vec<usize> = Vec::new();
-            for (i, &q) in prepared.attn_meta.q_lens.iter().enumerate() {
-                if q == 1 {
-                    decode_indices.push(i);
-                } else {
-                    prefill_indices.push(i);
+        // -----------------------------------------------------------------------
+        // Eager forward path — the only path.
+        // -----------------------------------------------------------------------
+        let (_logits_owned, logits) = {
+            // Caching allocator: no reset needed — tensors freed on drop.
+
+            let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
+            let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
+
+            let (slot_mapping, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, max_seqlen_k) =
+                Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
+
+            // For spec decode: skip last_token_indices so we get logits
+            // for ALL token positions (needed for rejection sampling).
+            // For normal batches: gather only the last token per request.
+            let any_spec_decode = prepared
+                .req_inputs
+                .iter()
+                .any(|r| !r.spec_token_ids.is_empty());
+
+            let last_token_indices = if any_spec_decode {
+                // Spec decode: need logits for all positions, not just last.
+                // Model returns [total_tokens, vocab_size].
+                None
+            } else if num_reqs < total_tokens {
+                let mut indices = Vec::with_capacity(num_reqs);
+                let mut offset = 0u32;
+                for req_slice in &prepared.req_inputs {
+                    indices.push(offset + req_slice.token_count as u32 - 1);
+                    offset += req_slice.token_count as u32;
                 }
-            }
-            let n_decode = decode_indices.len();
-            let n_prefill = prefill_indices.len();
-
-            // --- Decode pass: run through CUDA graph ---
-            // Build decode inputs from the subset of requests.
-            let decode_logits = {
-                let meta = &prepared.attn_meta;
-
-                let mut input_ids = Vec::with_capacity(decode_graph_bs);
-                let mut positions = Vec::with_capacity(decode_graph_bs);
-                let mut slot_mapping: Vec<i64> = Vec::with_capacity(decode_graph_bs);
-                let mut cu_seqlens_q: Vec<i32> = Vec::with_capacity(decode_graph_bs + 1);
-                let mut seqused_k: Vec<i32> = Vec::with_capacity(decode_graph_bs);
-                let mut block_table = vec![0i32; decode_graph_bs * max_blocks_per_seq];
-
-                cu_seqlens_q.push(0);
-                for (out_idx, &orig_idx) in decode_indices.iter().enumerate() {
-                    // Each decode request has exactly 1 token.
-                    let token_start = meta.query_start_loc[orig_idx];
-                    input_ids.push(prepared.flat_token_ids[token_start]);
-                    positions.push(prepared.flat_positions[token_start]);
-                    cu_seqlens_q.push((out_idx + 1) as i32);
-                    seqused_k.push(meta.seq_lens[orig_idx] as i32);
-
-                    // Slot mapping: compute physical slot for this decode token.
-                    let abs_pos = meta.tokens_before[orig_idx];
-                    let block_idx = abs_pos / block_size;
-                    let offset = abs_pos % block_size;
-                    let block_ids = &meta.block_ids[orig_idx];
-                    if block_idx < block_ids.len() {
-                        slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
-                    } else {
-                        slot_mapping.push(-1i64);
-                    }
-
-                    // Block table row.
-                    for (j, &bid) in block_ids.iter().enumerate() {
-                        if j < max_blocks_per_seq {
-                            block_table[out_idx * max_blocks_per_seq + j] = bid as i32;
-                        }
-                    }
-                }
-
-                // Pad to graph batch size.
-                input_ids.resize(decode_graph_bs, 0);
-                positions.resize(decode_graph_bs, 0);
-                slot_mapping.resize(decode_graph_bs, -1i64);
-                for _ in n_decode..decode_graph_bs {
-                    cu_seqlens_q.push(n_decode as i32);
-                }
-                seqused_k.resize(decode_graph_bs, 1);
-
-                let runner = self.graph_runner.as_ref().unwrap();
-                let replay_out = unsafe {
-                    runner.replay(
-                        decode_graph_bs,
-                        &input_ids,
-                        &positions,
-                        &slot_mapping,
-                        &cu_seqlens_q,
-                        &seqused_k,
-                        &block_table,
-                        self.config.block_size,
-                        device,
-                        false,
-                    )
-                }
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("mixed decode graph replay: {e}"))
-                })?;
-
-                // Slice to real decode requests (discard padding rows).
-                if decode_graph_bs > n_decode {
-                    replay_out.logits.narrow_dim0(0, n_decode)
-                } else {
-                    replay_out.logits
-                }
+                Some(Self::h2d_u32(&indices, device)?)
+            } else {
+                None
             };
 
-            // --- Prefill pass: run through eager forward ---
-            let prefill_logits = {
+            if matches!(model, CudaModel::Qwen3Next(_)) {
+                // Build GDN forward context.
+                let gdn_pool = gdn_pool_ref.unwrap();
                 let meta = &prepared.attn_meta;
 
-                // Build flat token/position arrays for prefill requests.
-                let mut pf_token_ids: Vec<u32> = Vec::new();
-                let mut pf_positions: Vec<u32> = Vec::new();
-                let mut pf_q_lens: Vec<usize> = Vec::new();
-                let mut pf_seq_lens: Vec<usize> = Vec::new();
-                let mut pf_block_ids: Vec<Vec<usize>> = Vec::new();
-                let mut pf_tokens_before: Vec<usize> = Vec::new();
-                let mut pf_query_start_loc: Vec<usize> = vec![0];
-
-                let mut pf_offset = 0usize;
-                for &orig_idx in &prefill_indices {
-                    let q_len = meta.q_lens[orig_idx];
-                    let token_start = meta.query_start_loc[orig_idx];
-                    pf_token_ids.extend_from_slice(
-                        &prepared.flat_token_ids[token_start..token_start + q_len],
-                    );
-                    pf_positions.extend_from_slice(
-                        &prepared.flat_positions[token_start..token_start + q_len],
-                    );
-                    pf_q_lens.push(q_len);
-                    pf_seq_lens.push(meta.seq_lens[orig_idx]);
-                    pf_block_ids.push(meta.block_ids[orig_idx].clone());
-                    pf_tokens_before.push(meta.tokens_before[orig_idx]);
-                    pf_offset += q_len;
-                    pf_query_start_loc.push(pf_offset);
-                }
-                let pf_total_tokens = pf_token_ids.len();
-
-                let pf_meta = vllm_model::AttentionMetadata::new(
-                    n_prefill,
-                    pf_total_tokens,
-                    pf_query_start_loc,
-                    pf_q_lens,
-                    pf_seq_lens,
-                    pf_block_ids,
-                    pf_tokens_before,
-                    vec![true; n_prefill],
-                    prefill_indices
-                        .iter()
-                        .map(|&i| meta.req_ids[i].clone())
-                        .collect(),
-                );
-
-                let gpu_input_ids = Self::h2d_u32(&pf_token_ids, device)?;
-                let gpu_positions = Self::h2d_u32(&pf_positions, device)?;
-
-                let (
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table_gpu,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                ) = Self::build_attention_tensors(&pf_meta, block_size, device)?;
-
-                // last_token_indices: for each prefill request, index of last token in flat array.
-                let last_token_indices = if n_prefill < pf_total_tokens {
-                    let mut indices = Vec::with_capacity(n_prefill);
-                    let mut off = 0u32;
-                    for &q in &pf_meta.q_lens {
-                        indices.push(off + q as u32 - 1);
-                        off += q as u32;
+                // Clear GDN state for sequences in prefill (query_len > 1).
+                for i in 0..meta.num_reqs {
+                    let qlen = meta.query_start_loc[i + 1] - meta.query_start_loc[i];
+                    if qlen > 1 {
+                        unsafe { gdn_pool.clear_slot(i, device.compute_stream) }.map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("GDN clear_slot: {e}"))
+                        })?;
                     }
-                    Some(Self::h2d_u32(&indices, device)?)
-                } else {
-                    None
-                };
+                }
 
-                unsafe {
-                    model.forward(
+                let (gdn_state_indices, gdn_cu_seqlens, num_seqs) =
+                    Self::build_gdn_tensors(meta, device)?;
+                let logits = unsafe {
+                    model.forward_qwen3_next(
                         gpu_input_ids.view(),
                         gpu_positions.view(),
                         slot_mapping.view(),
                         cu_seqlens_q.view(),
                         seqused_k.view(),
-                        block_table_gpu.view(),
+                        block_table.view(),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        gdn_pool,
+                        gdn_state_indices.view(),
+                        gdn_cu_seqlens.view(),
+                        num_seqs,
+                        device,
+                        last_token_indices.as_ref().map(|t| t.view()),
+                    )
+                };
+                let logits_gpu = *logits;
+                (Some(logits), logits_gpu)
+            } else if pp_active {
+                // PP last stage: use forward_pp with received intermediates.
+                let input_ids = if self.pp_config.unwrap().is_first_stage() {
+                    Some(gpu_input_ids.view())
+                } else {
+                    None
+                };
+                let result = unsafe {
+                    model.forward_pp(
+                        input_ids,
+                        pp_intermediate,
+                        gpu_positions.view(),
+                        slot_mapping.view(),
+                        cu_seqlens_q.view(),
+                        seqused_k.view(),
+                        block_table.view(),
                         max_seqlen_q,
                         max_seqlen_k,
                         kv_cache,
                         device,
                         last_token_indices.as_ref().map(|t| t.view()),
                     )
-                }
-            };
-
-            // --- Merge logits in original request order ---
-            // Allocate [num_reqs, vocab_size] and scatter decode/prefill logits.
-            let row_bytes = vocab_size * decode_logits.dtype().size_bytes();
-            let merged_owned = device
-                .caching
-                .alloc_tensor(&[num_reqs, vocab_size], decode_logits.dtype());
-            let merged = merged_owned.as_gpu_tensor();
-
-            // Copy decode logits into merged at their original positions.
-            for (src_row, &orig_idx) in decode_indices.iter().enumerate() {
-                let src = unsafe { decode_logits.raw_ptr().add(src_row * row_bytes) };
-                let dst = unsafe { merged.raw_ptr().add(orig_idx * row_bytes) };
-                unsafe { driver::memcpy_dtod_async(dst, src, row_bytes, device.compute_stream) }
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("mixed merge decode D2D: {e}"))
-                    })?;
-            }
-
-            // Copy prefill logits into merged at their original positions.
-            for (src_row, &orig_idx) in prefill_indices.iter().enumerate() {
-                let src = unsafe { prefill_logits.raw_ptr().add(src_row * row_bytes) };
-                let dst = unsafe { merged.raw_ptr().add(orig_idx * row_bytes) };
-                unsafe { driver::memcpy_dtod_async(dst, src, row_bytes, device.compute_stream) }
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("mixed merge prefill D2D: {e}"))
-                    })?;
-            }
-
-            // Invalidate graph metadata since we changed batch composition.
-            self.last_graph_batch_size = None;
-            self.graph_metadata_valid = false;
-
-            // Drop the sub-logits so their memory returns to the caching allocator.
-            // (decode_logits is a view into graph output — not owned. prefill_logits is
-            // an OwnedTensor from forward(). merged_owned keeps the merged allocation.)
-            let _ = decode_logits;
-            drop(prefill_logits);
-
-            // Fall through to sampling with merged logits.
-            let logits = merged;
-
-            // Update logits processors after forward, before sampling.
-            Self::update_logits_processors(
-                &LogitsUpdateCtx {
-                    batch_changed: self.batch_changed,
-                    num_reqs,
-                    sampling_params_map: &self.sampling_params_map,
-                    token_buffers: &self.token_buffers,
-                    batch_req_ids: &self.batch_req_ids,
-                },
-                self.logits_pipeline.as_mut(),
-                #[cfg(feature = "guided-decoding")]
-                &mut self.grammar_states,
-                &mut self.grammar_processor,
-                &mut self.allowed_token_ids_processor,
-                &mut self.seal_pad_processor,
-                device,
-            );
-
-            // GPU sampling for mixed prefill+decode merged logits.
-            return Self::gpu_sample_and_finalize(
-                &self.sampling_params_map,
-                #[cfg(feature = "guided-decoding")]
-                &mut self.grammar_states,
-                &self.grammar_processor,
-                &self.allowed_token_ids_processor,
-                &self.seal_pad_processor,
-                self.logits_pipeline.as_ref(),
-                &mut self.seeded_rngs,
-                &self.host_staging,
-                &mut self.input_batch,
-                &mut self.token_buffers,
-                &self.prompt_lengths,
-                logits,
-                prepared,
-                device,
-                all_greedy,
-                vocab_size,
-            );
-        }
-
-        // Check if any request needs logprobs, grammar, or logit processors
-        // (these require the full GPU sampling pipeline instead of in-graph argmax).
-        // Uses request-level state (sampling_params_map, grammar_states) rather than
-        // processor GPU state, since processors are updated after forward/graph replay.
-        let any_needs_full_sampling = prepared.req_inputs.iter().any(|r| {
-            self.sampling_params_map.get(&r.req_id).is_some_and(|p| {
-                p.logprobs.is_some()
-                    || p.logit_bias.is_some()
-                    || p.frequency_penalty != 0.0
-                    || p.presence_penalty != 0.0
-                    || p.repetition_penalty != 1.0
-                    || p.min_tokens > 0
-                    || p.bad_words_token_ids.is_some()
-                    || p.allowed_token_ids.is_some()
-                    || p.seal
-            })
-        }) || {
-            #[cfg(feature = "guided-decoding")]
-            {
-                !self.grammar_states.is_empty()
-            }
-            #[cfg(not(feature = "guided-decoding"))]
-            {
-                false
-            }
-        };
-
-        // -----------------------------------------------------------------------
-        // Runtime Mode Selection: Choose between Full and Piecewise CUDA graphs
-        // -----------------------------------------------------------------------
-        let use_piecewise = if use_graph {
-            // Determine if we should use piecewise mode for this batch
-            match self.config.cuda_graph_mode {
-                CudaGraphMode::None => false,
-                CudaGraphMode::Full => false,
-                CudaGraphMode::Piecewise => true,
-                // For pure decode batches, FullAndPiecewise uses full graphs.
-                // Piecewise is reserved for mixed/chunked-prefill batches (future).
-                CudaGraphMode::FullAndPiecewise => false,
-                CudaGraphMode::FullDecodeOnly => false,
-                CudaGraphMode::Auto => {
-                    unreachable!("Auto should be resolved in compile_or_warm_up_model")
-                }
-            }
-        } else {
-            false
-        };
-
-        // -----------------------------------------------------------------------
-        // Piecewise CUDA Graph Path: Dynamic attention with optimal split-K
-        // -----------------------------------------------------------------------
-        if use_piecewise && use_graph && all_greedy && !any_needs_full_sampling {
-            let graph_bs = graph_bs.unwrap();
-
-            // Validate piecewise runner is initialized
-            if self.piecewise_graph_runner.is_none() {
-                tracing::warn!(
-                    "Piecewise mode requested but runner not initialized, falling back to full mode"
-                );
-            } else {
-                tracing::debug!(
-                    "Using piecewise CUDA graph for decode batch size {}",
-                    num_reqs
-                );
-
-                // Drop borrowed fields before calling execute_model_piecewise, which needs &mut self.
-                let _ = model;
-                let _ = kv_cache;
-                let _ = device;
-
-                // Execute piecewise replay flow
-                let result = unsafe { self.execute_model_piecewise(&prepared) };
-
-                match result {
-                    Ok(host_ids) => {
-                        // Commit step and build output.
-                        for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
-                            let tok = host_ids[req_idx];
-                            self.input_batch.commit_step(
-                                &req_slice.req_id,
-                                &[tok],
-                                req_slice.token_count,
-                                !req_slice.spec_token_ids.is_empty(),
-                            );
-                            if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
-                                buf.push(tok);
-                            }
-                        }
-                        let req_ids: Vec<String> = prepared
-                            .req_inputs
-                            .iter()
-                            .map(|r| r.req_id.clone())
-                            .collect();
-                        self.input_batch.reclaim_buffers(prepared);
-                        // Success - return piecewise output
-                        self.last_graph_batch_size = Some(graph_bs);
-                        self.graph_metadata_valid = false; // Piecewise doesn't support fast path yet
-                        return Ok(ModelRunnerOutput::from_ordered(req_ids, host_ids));
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Piecewise execution failed: {}, falling back to full mode",
-                            e
-                        );
-                        // Fall through to full mode — re-obtain device borrow.
-                    }
-                }
-                // Re-obtain borrows for fallback paths.
-                model = self.model.as_ref().unwrap();
-                kv_cache = self.kv_cache.as_ref().unwrap();
-                device = self.device.as_mut().unwrap();
-            }
-        }
-
-        // Deferred: take gdn_pool_ref now that piecewise path (which needs &mut self) is done.
-        let gdn_pool_ref = self.gdn_state_pool.as_ref();
-
-        // -----------------------------------------------------------------------
-        // Full CUDA Graph Path: Monolithic graph with fixed split-K
-        // -----------------------------------------------------------------------
-        if use_graph && all_greedy && !any_needs_full_sampling {
-            // Fast path: CUDA graph with in-graph argmax. No separate sampling
-            // kernel launch — argmax + D2D scatter are captured in the graph.
-            let graph_bs = graph_bs.unwrap();
-            let meta = &prepared.attn_meta;
-            let staging = self.host_staging.as_ref();
-
-            let replay_out = if self.graph_metadata_valid
-                && self.last_graph_batch_size == Some(graph_bs)
-            {
-                // GPU-side metadata update: positions, slot_mapping, seqused_k
-                // are incremented on GPU in a single kernel. Only block_table is
-                // H2D-copied when blocks changed. input_ids were scattered by the
-                // previous graph replay's in-graph argmax.
-                let new_bt = if blocks_changed {
-                    let bt =
-                        unsafe { staging.unwrap().fill_block_table(&meta.block_ids, graph_bs) };
-                    Some(bt)
-                } else {
-                    None
                 };
-
-                let max_seqlen_k_step = meta.seq_lens.iter().copied().max().unwrap_or(0);
-                let runner = self.graph_runner.as_ref().unwrap();
-                unsafe {
-                    runner.replay_decode_fast(
-                        graph_bs,
-                        None, // input_ids already scattered by previous graph
-                        new_bt,
-                        block_size,
-                        max_seqlen_k_step,
-                        device,
-                    )
-                }
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("graph replay_decode_fast: {e}"))
-                })?
-            } else if let Some(stg) = staging {
-                // First step for this batch or batch composition changed:
-                // full H2D of all metadata via pinned staging buffers.
-                unsafe {
-                    let ids = stg.input_ids.slice_mut::<u32>(graph_bs);
-                    ids[..num_reqs].copy_from_slice(&prepared.flat_token_ids);
-                    ids[num_reqs..].fill(0);
-
-                    let pos = stg.positions.slice_mut::<u32>(graph_bs);
-                    pos[..num_reqs].copy_from_slice(&prepared.flat_positions);
-                    pos[num_reqs..].fill(0);
-
-                    let cu_q = stg.cu_seqlens_q.slice_mut::<i32>(graph_bs + 1);
-                    for (i, v) in cu_q[..=num_reqs].iter_mut().enumerate() {
-                        *v = i as i32;
+                let owned = match result {
+                    vllm_cuda::model::llama::ForwardOutput::Logits(t) => t,
+                    vllm_cuda::model::llama::ForwardOutput::Intermediate { .. } => {
+                        unreachable!("last PP stage should return Logits");
                     }
-                    cu_q[(num_reqs + 1)..].fill(num_reqs as i32);
-
-                    // seqused_k: per-sequence K lengths [graph_bs].
-                    let sk = stg.seqused_k.slice_mut::<i32>(graph_bs);
-                    for (i, &sl) in meta.seq_lens.iter().enumerate() {
-                        sk[i] = sl as i32;
-                    }
-                    // Padded slots: use 1 (dummy seqs with 1 K token).
-                    for s in &mut sk[num_reqs..] {
-                        *s = 1;
-                    }
-
-                    let sm = stg.slot_mapping.slice_mut::<i64>(graph_bs);
-                    for (i, slot) in sm[..num_reqs].iter_mut().enumerate() {
-                        let abs_pos = meta.tokens_before[i];
-                        let block_idx = abs_pos / block_size;
-                        let offset = abs_pos % block_size;
-                        let block_ids = &meta.block_ids[i];
-                        if block_idx < block_ids.len() {
-                            *slot = (block_ids[block_idx] * block_size + offset) as i64;
-                        } else {
-                            *slot = -1i64;
-                        }
-                    }
-                    sm[num_reqs..].fill(-1i64);
-
-                    let bt = stg.fill_block_table(&meta.block_ids, graph_bs);
-
-                    let skip_input_ids =
-                        self.last_graph_batch_size == Some(graph_bs) && num_reqs == graph_bs;
-
-                    let runner = self.graph_runner.as_ref().unwrap();
-                    runner.replay(
-                        graph_bs,
-                        stg.input_ids.slice::<u32>(graph_bs),
-                        stg.positions.slice::<u32>(graph_bs),
-                        stg.slot_mapping.slice::<i64>(graph_bs),
-                        stg.cu_seqlens_q.slice::<i32>(graph_bs + 1),
-                        stg.seqused_k.slice::<i32>(graph_bs),
-                        bt,
-                        block_size,
-                        device,
-                        skip_input_ids,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
-            } else {
-                // Fallback: no pinned staging (shouldn't happen but safe).
-                let mut input_ids = prepared.flat_token_ids.clone();
-                input_ids.resize(graph_bs, 0);
-                let mut positions = prepared.flat_positions.clone();
-                positions.resize(graph_bs, 0);
-
-                let mut cu_seqlens_q: Vec<i32> = (0..=num_reqs as i32).collect();
-                for _ in num_reqs..graph_bs {
-                    cu_seqlens_q.push(num_reqs as i32);
-                }
-
-                // seqused_k: per-sequence K lengths [graph_bs].
-                let mut seqused_k: Vec<i32> = meta.seq_lens.iter().map(|&sl| sl as i32).collect();
-                // Padded slots: use 1 (dummy seqs with 1 K token).
-                seqused_k.resize(graph_bs, 1);
-
-                let mut slot_mapping = Vec::with_capacity(graph_bs);
-                for i in 0..num_reqs {
-                    let abs_pos = meta.tokens_before[i];
-                    let block_idx = abs_pos / block_size;
-                    let offset = abs_pos % block_size;
-                    let block_ids = &meta.block_ids[i];
-                    if block_idx < block_ids.len() {
-                        slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
-                    } else {
-                        slot_mapping.push(-1i64);
-                    }
-                }
-                slot_mapping.resize(graph_bs, -1i64);
-
-                let mut block_table = vec![0i32; graph_bs * max_blocks_per_seq];
-                for (i, blocks) in meta.block_ids.iter().enumerate() {
-                    for (j, &bid) in blocks.iter().enumerate() {
-                        if j < max_blocks_per_seq {
-                            block_table[i * max_blocks_per_seq + j] = bid as i32;
-                        }
-                    }
-                }
-
-                let skip_input_ids =
-                    self.last_graph_batch_size == Some(graph_bs) && num_reqs == graph_bs;
-
-                let runner = self.graph_runner.as_ref().unwrap();
-                unsafe {
-                    runner.replay(
-                        graph_bs,
-                        &input_ids,
-                        &positions,
-                        &slot_mapping,
-                        &cu_seqlens_q,
-                        &seqused_k,
-                        &block_table,
-                        block_size,
-                        device,
-                        skip_input_ids,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
-            };
-
-            // Record that graph buffers now have valid metadata for next step.
-            self.last_graph_batch_size = Some(graph_bs);
-            self.graph_metadata_valid = true;
-
-            // Deferred D2H: enqueue async copy on transfer stream, return
-            // immediately without blocking on the GPU. The token IDs are
-            // resolved lazily by the main thread (via D2HResolver) and the
-            // commit_step is deferred to the start of the next execute_model.
-            if let Some(ref mut stg) = self.host_staging {
-                let buf_idx = stg.token_buf_idx;
-                Self::d2h_token_ids_async(stg, buf_idx, &replay_out.token_ids, num_reqs, device)?;
-
-                // Capture info needed for deferred commit_step.
-                let req_ids: Vec<String> = prepared
-                    .req_inputs
-                    .iter()
-                    .map(|r| r.req_id.clone())
-                    .collect();
-                let token_counts: Vec<usize> =
-                    prepared.req_inputs.iter().map(|r| r.token_count).collect();
-                let has_spec_tokens: Vec<bool> = prepared
-                    .req_inputs
-                    .iter()
-                    .map(|r| !r.spec_token_ids.is_empty())
-                    .collect();
-
-                self.input_batch.reclaim_buffers(prepared);
-
-                self.pending_commit = Some(PendingCommit {
-                    buf_idx,
-                    num_reqs,
-                    req_ids: req_ids.clone(),
-                    token_counts,
-                    has_spec_tokens,
-                });
-
-                // Toggle double-buffer for next step.
-                stg.token_buf_idx ^= 1;
-
-                // Build deferred output: the resolver closure syncs the D2H
-                // event and reads token IDs from the pinned host buffer.
-                // Cast raw pointers to usize for Send safety (pinned buffer
-                // and event outlive the closure — see PendingCommit safety doc).
-                let event_addr = device.d2h_done as usize;
-                let buf_addr = stg.host_token_ids[buf_idx].ptr() as usize;
-                return Ok(ModelRunnerOutput::deferred(
-                    req_ids,
-                    Box::new(move || unsafe {
-                        driver::event_synchronize_raw(event_addr).expect("D2H event sync failed");
-                        std::slice::from_raw_parts(buf_addr as *const u32, num_reqs).to_vec()
-                    }),
-                ));
-            }
-
-            // No pinned staging — fall back to synchronous D2H.
-            return Self::finalize_d2h_and_commit(
-                &replay_out.token_ids,
-                num_reqs,
-                prepared,
-                device,
-                &self.host_staging,
-                0,
-                &mut self.input_batch,
-                &mut self.token_buffers,
-                &self.prompt_lengths,
-            );
-        }
-
-        // Non-greedy graph path or eager path: need separate sampling.
-        // IMPORTANT: skip graph replay when any logits processor or grammar is
-        // active. CUDA graphs replay kernels at captured memory addresses —
-        // intermediate forward-pass buffers reuse the same addresses as during
-        // `_logits_owned` keeps the OwnedTensor alive for eager-forward paths
-        // so the GPU memory backing `logits` survives until sampling completes.
-        let (_logits_owned, logits) = if use_graph {
-            // CUDA graph replay (non-greedy: in-graph argmax result is
-            // discarded; we re-sample with temperature on the logits).
-            let graph_bs = graph_bs.unwrap();
-            let meta = &prepared.attn_meta;
-            let staging = self.host_staging.as_ref();
-
-            let replay_out = if self.graph_metadata_valid
-                && self.last_graph_batch_size == Some(graph_bs)
-            {
-                // Fast path: GPU-side metadata update (same as greedy).
-                // Only input_ids must be H2D'd (no in-graph argmax scatter for non-greedy).
-                let new_bt = if blocks_changed {
-                    let bt =
-                        unsafe { staging.unwrap().fill_block_table(&meta.block_ids, graph_bs) };
-                    Some(bt)
-                } else {
-                    None
                 };
-
-                // Must H2D input_ids since non-greedy doesn't use in-graph argmax scatter.
-                let input_ids_slice = if let Some(stg) = staging {
-                    unsafe {
-                        let ids = stg.input_ids.slice_mut::<u32>(graph_bs);
-                        ids[..num_reqs].copy_from_slice(&prepared.flat_token_ids);
-                        ids[num_reqs..].fill(0);
-                        stg.input_ids.slice::<u32>(graph_bs)
-                    }
-                } else {
-                    let mut ids = prepared.flat_token_ids.clone();
-                    ids.resize(graph_bs, 0);
-                    ids.leak()
+                let logits = *owned;
+                (Some(owned), logits)
+            } else {
+                let owned = unsafe {
+                    model.forward(
+                        gpu_input_ids.view(),
+                        gpu_positions.view(),
+                        slot_mapping.view(),
+                        cu_seqlens_q.view(),
+                        seqused_k.view(),
+                        block_table.view(),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        device,
+                        last_token_indices.as_ref().map(|t| t.view()),
+                    )
                 };
-
-                let max_seqlen_k_step = meta.seq_lens.iter().copied().max().unwrap_or(0);
-                let runner = self.graph_runner.as_ref().unwrap();
-                unsafe {
-                    runner.replay_decode_fast(
-                        graph_bs,
-                        Some(input_ids_slice),
-                        new_bt,
-                        block_size,
-                        max_seqlen_k_step,
-                        device,
-                    )
-                }
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("graph replay_decode_fast: {e}"))
-                })?
-            } else if let Some(stg) = staging {
-                // First step or batch composition changed: full H2D via pinned staging.
-                unsafe {
-                    let ids = stg.input_ids.slice_mut::<u32>(graph_bs);
-                    ids[..num_reqs].copy_from_slice(&prepared.flat_token_ids);
-                    ids[num_reqs..].fill(0);
-
-                    let pos = stg.positions.slice_mut::<u32>(graph_bs);
-                    pos[..num_reqs].copy_from_slice(&prepared.flat_positions);
-                    pos[num_reqs..].fill(0);
-
-                    let cu_q = stg.cu_seqlens_q.slice_mut::<i32>(graph_bs + 1);
-                    for (i, v) in cu_q[..=num_reqs].iter_mut().enumerate() {
-                        *v = i as i32;
-                    }
-                    cu_q[(num_reqs + 1)..].fill(num_reqs as i32);
-
-                    // seqused_k: per-sequence K lengths [graph_bs].
-                    let sk = stg.seqused_k.slice_mut::<i32>(graph_bs);
-                    for (i, &sl) in meta.seq_lens.iter().enumerate() {
-                        sk[i] = sl as i32;
-                    }
-                    for s in &mut sk[num_reqs..] {
-                        *s = 1;
-                    }
-
-                    let sm = stg.slot_mapping.slice_mut::<i64>(graph_bs);
-                    for (i, slot) in sm[..num_reqs].iter_mut().enumerate() {
-                        let abs_pos = meta.tokens_before[i];
-                        let block_idx = abs_pos / block_size;
-                        let offset = abs_pos % block_size;
-                        let block_ids = &meta.block_ids[i];
-                        if block_idx < block_ids.len() {
-                            *slot = (block_ids[block_idx] * block_size + offset) as i64;
-                        } else {
-                            *slot = -1i64;
-                        }
-                    }
-                    sm[num_reqs..].fill(-1i64);
-
-                    let bt = stg.fill_block_table(&meta.block_ids, graph_bs);
-
-                    let runner = self.graph_runner.as_ref().unwrap();
-                    runner.replay(
-                        graph_bs,
-                        stg.input_ids.slice::<u32>(graph_bs),
-                        stg.positions.slice::<u32>(graph_bs),
-                        stg.slot_mapping.slice::<i64>(graph_bs),
-                        stg.cu_seqlens_q.slice::<i32>(graph_bs + 1),
-                        stg.seqused_k.slice::<i32>(graph_bs),
-                        bt,
-                        block_size,
-                        device,
-                        false,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
-            } else {
-                // Fallback: no pinned staging.
-                let mut input_ids = prepared.flat_token_ids.clone();
-                input_ids.resize(graph_bs, 0);
-                let mut positions = prepared.flat_positions.clone();
-                positions.resize(graph_bs, 0);
-
-                let mut cu_seqlens_q: Vec<i32> = (0..=num_reqs as i32).collect();
-                for _ in num_reqs..graph_bs {
-                    cu_seqlens_q.push(num_reqs as i32);
-                }
-
-                // seqused_k: per-sequence K lengths [graph_bs].
-                let mut seqused_k: Vec<i32> = meta.seq_lens.iter().map(|&sl| sl as i32).collect();
-                // Padded slots: use 1 (dummy seqs with 1 K token).
-                seqused_k.resize(graph_bs, 1);
-
-                let mut slot_mapping = Vec::with_capacity(graph_bs);
-                for i in 0..num_reqs {
-                    let abs_pos = meta.tokens_before[i];
-                    let block_idx = abs_pos / block_size;
-                    let offset = abs_pos % block_size;
-                    let block_ids = &meta.block_ids[i];
-                    if block_idx < block_ids.len() {
-                        slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
-                    } else {
-                        slot_mapping.push(-1i64);
-                    }
-                }
-                slot_mapping.resize(graph_bs, -1i64);
-
-                let mut block_table = vec![0i32; graph_bs * max_blocks_per_seq];
-                for (i, blocks) in meta.block_ids.iter().enumerate() {
-                    for (j, &bid) in blocks.iter().enumerate() {
-                        if j < max_blocks_per_seq {
-                            block_table[i * max_blocks_per_seq + j] = bid as i32;
-                        }
-                    }
-                }
-
-                let runner = self.graph_runner.as_ref().unwrap();
-                unsafe {
-                    runner.replay(
-                        graph_bs,
-                        &input_ids,
-                        &positions,
-                        &slot_mapping,
-                        &cu_seqlens_q,
-                        &seqused_k,
-                        &block_table,
-                        block_size,
-                        device,
-                        false,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
-            };
-
-            // Track metadata validity for next step (works for non-greedy too).
-            self.last_graph_batch_size = Some(graph_bs);
-            self.graph_metadata_valid = true;
-
-            // Slice logits to only the real requests (discard padded rows).
-            let logits = if graph_bs > num_reqs {
-                replay_out.logits.narrow_dim0(0, num_reqs)
-            } else {
-                replay_out.logits
-            };
-            (None, logits)
-        } else {
-            // Non-decode path: try prefill graph, fall back to eager.
-            self.last_graph_batch_size = None;
-            self.graph_metadata_valid = false;
-
-            // Check if we can use a prefill graph: single request, fresh prefill
-            // (tokens_before == 0 means q_len == seq_len, so the model uses contiguous
-            // FA2 — not paged — which is safe to capture in a CUDA graph).
-            let meta = &prepared.attn_meta;
-            let use_prefill_graph = num_reqs == 1
-                && meta.tokens_before[0] == 0
-                && self
-                    .prefill_graph_runner
-                    .as_ref()
-                    .and_then(|r| r.nearest_graph_size(total_tokens))
-                    .is_some();
-
-            if use_prefill_graph {
-                let padded = self
-                    .prefill_graph_runner
-                    .as_ref()
-                    .unwrap()
-                    .nearest_graph_size(total_tokens)
-                    .unwrap();
-
-                // Build block_table padded to MAX_BLOCKS_PER_SEQ.
-                let mut block_table = vec![0i32; max_blocks_per_seq];
-                for (j, &bid) in meta.block_ids[0].iter().enumerate() {
-                    if j < max_blocks_per_seq {
-                        block_table[j] = bid as i32;
-                    }
-                }
-
-                // Build slot_mapping for real tokens.
-                let mut slot_mapping = Vec::with_capacity(total_tokens);
-                let block_ids = &meta.block_ids[0];
-                for t in 0..total_tokens {
-                    let abs_pos = meta.tokens_before[0] + t;
-                    let block_idx = abs_pos / block_size;
-                    let offset = abs_pos % block_size;
-                    if block_idx < block_ids.len() {
-                        slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
-                    } else {
-                        slot_mapping.push(-1i64);
-                    }
-                }
-
-                let last_token_idx = (total_tokens - 1) as u32;
-
-                let replay_out = unsafe {
-                    self.prefill_graph_runner.as_ref().unwrap().replay(
-                        padded,
-                        &prepared.flat_token_ids,
-                        &prepared.flat_positions,
-                        &slot_mapping,
-                        meta.seq_lens[0],
-                        &block_table,
-                        last_token_idx,
-                        block_size,
-                        device,
-                    )
-                }
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("prefill graph replay: {e}"))
-                })?;
-
-                (None, replay_out.logits)
-            } else {
-                // Eager forward path (multi-request prefill or uncaptured size).
-                // Caching allocator: no reset needed — tensors freed on drop.
-
-                // DEBUG: sync before forward to isolate errors from previous steps.
-                /* {
-                    let any_spec = prepared
-                        .req_inputs
-                        .iter()
-                        .any(|r| !r.spec_token_ids.is_empty());
-                    if any_spec {
-                        unsafe { vllm_cuda::driver::stream_synchronize(device.compute_stream) }
-                            .map_err(|e| {
-                                ExecutorError::WorkerExecution(format!(
-                                    "eager pre-forward sync (spec batch): {e}"
-                                ))
-                            })?;
-                        let meta = &prepared.attn_meta;
-                        tracing::warn!(
-                            "spec decode eager forward: num_reqs={}, total_tokens={}, q_lens={:?}, \
-                             seq_lens={:?}, tokens_before={:?}, block_ids_lens={:?}",
-                            meta.num_reqs,
-                            meta.total_tokens,
-                            meta.q_lens,
-                            meta.seq_lens,
-                            meta.tokens_before,
-                            meta.block_ids.iter().map(|b| b.len()).collect::<Vec<_>>(),
-                        );
-                    }
-                } */
-
-                let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
-                let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
-
-                let (
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                ) = Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
-
-                // For spec decode: skip last_token_indices so we get logits
-                // for ALL token positions (needed for rejection sampling).
-                // For normal batches: gather only the last token per request.
-                let any_spec_decode = prepared
-                    .req_inputs
-                    .iter()
-                    .any(|r| !r.spec_token_ids.is_empty());
-
-                let last_token_indices = if any_spec_decode {
-                    // Spec decode: need logits for all positions, not just last.
-                    // Model returns [total_tokens, vocab_size].
-                    None
-                } else if num_reqs < total_tokens {
-                    let mut indices = Vec::with_capacity(num_reqs);
-                    let mut offset = 0u32;
-                    for req_slice in &prepared.req_inputs {
-                        indices.push(offset + req_slice.token_count as u32 - 1);
-                        offset += req_slice.token_count as u32;
-                    }
-                    Some(Self::h2d_u32(&indices, device)?)
-                } else {
-                    None
-                };
-
-                if matches!(model, CudaModel::Qwen3Next(_)) {
-                    // Build GDN forward context.
-                    let gdn_pool = gdn_pool_ref.unwrap();
-                    let meta = &prepared.attn_meta;
-
-                    // Clear GDN state for sequences in prefill (query_len > 1).
-                    for i in 0..meta.num_reqs {
-                        let qlen = meta.query_start_loc[i + 1] - meta.query_start_loc[i];
-                        if qlen > 1 {
-                            unsafe { gdn_pool.clear_slot(i, device.compute_stream) }.map_err(
-                                |e| ExecutorError::WorkerExecution(format!("GDN clear_slot: {e}")),
-                            )?;
-                        }
-                    }
-
-                    let (gdn_state_indices, gdn_cu_seqlens, num_seqs) =
-                        Self::build_gdn_tensors(meta, device)?;
-                    let logits = unsafe {
-                        model.forward_qwen3_next(
-                            gpu_input_ids.view(),
-                            gpu_positions.view(),
-                            slot_mapping.view(),
-                            cu_seqlens_q.view(),
-                            seqused_k.view(),
-                            block_table.view(),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            gdn_pool,
-                            gdn_state_indices.view(),
-                            gdn_cu_seqlens.view(),
-                            num_seqs,
-                            device,
-                            last_token_indices.as_ref().map(|t| t.view()),
-                        )
-                    };
-                    let logits_gpu = *logits;
-                    (Some(logits), logits_gpu)
-                } else if pp_active {
-                    // PP last stage: use forward_pp with received intermediates.
-                    let input_ids = if self.pp_config.unwrap().is_first_stage() {
-                        Some(gpu_input_ids.view())
-                    } else {
-                        None
-                    };
-                    let result = unsafe {
-                        model.forward_pp(
-                            input_ids,
-                            pp_intermediate,
-                            gpu_positions.view(),
-                            slot_mapping.view(),
-                            cu_seqlens_q.view(),
-                            seqused_k.view(),
-                            block_table.view(),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            device,
-                            last_token_indices.as_ref().map(|t| t.view()),
-                        )
-                    };
-                    let owned = match result {
-                        vllm_cuda::model::llama::ForwardOutput::Logits(t) => t,
-                        vllm_cuda::model::llama::ForwardOutput::Intermediate { .. } => {
-                            unreachable!("last PP stage should return Logits");
-                        }
-                    };
-                    let logits = *owned;
-                    (Some(owned), logits)
-                } else {
-                    let owned = unsafe {
-                        model.forward(
-                            gpu_input_ids.view(),
-                            gpu_positions.view(),
-                            slot_mapping.view(),
-                            cu_seqlens_q.view(),
-                            seqused_k.view(),
-                            block_table.view(),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            device,
-                            last_token_indices.as_ref().map(|t| t.view()),
-                        )
-                    };
-                    let logits = *owned;
-                    (Some(owned), logits)
-                }
+                let logits = *owned;
+                (Some(owned), logits)
             }
         };
 
@@ -8491,9 +5524,7 @@ impl CudaWorker {
         // It will be dropped at the end of this function, returning memory to the
         // caching allocator.
 
-        // Update logits processors after forward/graph replay, before sampling.
-        // This ensures processor GPU tensor allocations don't collide with CUDA
-        // graph intermediate addresses.
+        // Update logits processors after forward, before sampling.
         Self::update_logits_processors(
             &LogitsUpdateCtx {
                 batch_changed: self.batch_changed,
@@ -8522,7 +5553,7 @@ impl CudaWorker {
             &self.seal_pad_processor,
             self.logits_pipeline.as_ref(),
             &mut self.seeded_rngs,
-            &self.host_staging,
+            &mut self.sampling_staging,
             &mut self.input_batch,
             &mut self.token_buffers,
             &self.prompt_lengths,

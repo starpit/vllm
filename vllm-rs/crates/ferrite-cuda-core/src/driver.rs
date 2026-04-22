@@ -276,52 +276,6 @@ pub unsafe fn event_elapsed(start: CUevent, end: CUevent) -> Result<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// CUDA graphs
-// ---------------------------------------------------------------------------
-
-/// Begin CUDA graph capture on a stream.
-pub unsafe fn stream_begin_capture(stream: CUstream) -> Result<()> {
-    check(sys::cuStreamBeginCapture_v2(
-        stream,
-        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-    ))
-}
-
-/// End capture and return a CUgraph.
-pub unsafe fn stream_end_capture(stream: CUstream) -> Result<sys::CUgraph> {
-    let mut graph: sys::CUgraph = std::ptr::null_mut();
-    check(sys::cuStreamEndCapture(stream, &mut graph))?;
-    Ok(graph)
-}
-
-/// Instantiate a captured graph for replay.
-pub unsafe fn graph_instantiate(graph: sys::CUgraph) -> Result<sys::CUgraphExec> {
-    let mut exec: sys::CUgraphExec = std::ptr::null_mut();
-    // Use cuGraphInstantiateWithFlags for newer CUDA (12+).
-    check(sys::cuGraphInstantiateWithFlags(
-        &mut exec,
-        graph,
-        sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64,
-    ))?;
-    Ok(exec)
-}
-
-/// Launch an instantiated graph on a stream.
-pub unsafe fn graph_launch(exec: sys::CUgraphExec, stream: CUstream) -> Result<()> {
-    check(sys::cuGraphLaunch(exec, stream))
-}
-
-/// Destroy a graph.
-pub unsafe fn graph_destroy(graph: sys::CUgraph) -> Result<()> {
-    check(sys::cuGraphDestroy(graph))
-}
-
-/// Destroy an instantiated graph.
-pub unsafe fn graph_exec_destroy(exec: sys::CUgraphExec) -> Result<()> {
-    check(sys::cuGraphExecDestroy(exec))
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -539,44 +493,6 @@ mod tests {
             mem_free(gpu).unwrap();
             stream_destroy(s1).unwrap();
             stream_destroy(s2).unwrap();
-        }
-    }
-
-    #[test]
-    fn test_graph_capture_memset() {
-        let _ctx = init_cuda();
-        unsafe {
-            let stream = stream_create().expect("stream");
-            let gpu = mem_alloc(256).expect("gpu");
-
-            // Begin capture.
-            stream_begin_capture(stream).expect("begin capture");
-
-            // Captured op: memset.
-            memset_d8(gpu, 0xAB, 256, stream).expect("memset during capture");
-
-            // End capture.
-            let graph = stream_end_capture(stream).expect("end capture");
-            assert!(!graph.is_null());
-
-            let exec = graph_instantiate(graph).expect("instantiate");
-
-            // Launch graph.
-            graph_launch(exec, stream).expect("launch");
-            stream_synchronize(stream).expect("sync");
-
-            // Verify.
-            let host = mem_alloc_host(256).expect("host");
-            memcpy_dtoh_async(host, gpu, 256, stream).expect("dtoh");
-            stream_synchronize(stream).expect("sync2");
-
-            assert_eq!(*host, 0xAB);
-
-            graph_exec_destroy(exec).unwrap();
-            graph_destroy(graph).unwrap();
-            mem_free_host(host).unwrap();
-            mem_free(gpu).unwrap();
-            stream_destroy(stream).unwrap();
         }
     }
 

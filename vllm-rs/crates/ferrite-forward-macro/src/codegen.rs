@@ -3992,10 +3992,28 @@ fn emit_forward_collapsed_bucket(
     let sched = stencil.schedule(fuf, sfuf, lib);
     let provenance = stencil.class_input_provenance(&sched, fuf, sfuf);
 
+    // Step 6b scaffolding (STENCIL_IR_V2_DESIGN.md §13): build the
+    // principled StencilPipeline alongside the legacy provenance.
+    // Threaded into try_emit_collapsed_bucket so follow-up commits
+    // can swap call-site lookups from `InputOrigin` to
+    // `DepTarget` per-boundary-per-member.
+    //
+    // A Δ=0 cycle here would be a structural refusal; today's
+    // fixtures build successfully (cat 17 `pipeline_builds_for_*`).
+    let pipeline = crate::stencil_pipeline::StencilPipeline::build(
+        fuf,
+        sfuf,
+        &stencil.class_of,
+        &stencil.class_members,
+        &sched.class_offsets,
+    )
+    .ok();
+
     match try_emit_collapsed_bucket(
         &stencil,
         &sched,
         provenance.as_deref(),
+        pipeline.as_ref(),
         fuf,
         sfuf,
         program,
@@ -4120,6 +4138,7 @@ fn try_emit_collapsed_bucket(
     stencil: &StencilBundle,
     sched: &ClassSchedule,
     provenance: Option<&[ClassInputs]>,
+    _pipeline: Option<&crate::stencil_pipeline::StencilPipeline>,
     fuf: &Fuf,
     sfuf: &Assignment,
     program: &Program,
@@ -6902,6 +6921,7 @@ mod tests {
                 &stencil,
                 &sched,
                 prov.as_deref(),
+                None,
                 &s.fuf,
                 &s.sfuf,
                 &s.program,
@@ -7533,6 +7553,7 @@ mod tests {
                 &stencil,
                 &sched,
                 prov.as_deref(),
+                None,
                 &s.fuf,
                 &s.sfuf,
                 &s.program,
@@ -7565,6 +7586,7 @@ mod tests {
                 &stencil,
                 &sched,
                 prov.as_deref(),
+                None,
                 &s.fuf,
                 &s.sfuf,
                 &s.program,
@@ -7724,6 +7746,7 @@ mod tests {
                 &stencil,
                 &sched,
                 prov.as_deref(),
+                None,
                 &s.fuf,
                 &s.sfuf,
                 &s.program,
@@ -7814,6 +7837,7 @@ mod tests {
                 &stencil,
                 &sched,
                 prov.as_deref(),
+                None,
                 &s.fuf,
                 &s.sfuf,
                 &s.program,
@@ -7860,6 +7884,7 @@ mod tests {
                 &stencil,
                 &sched,
                 prov.as_deref(),
+                None,
                 &s.fuf,
                 &s.sfuf,
                 &s.program,
@@ -7924,6 +7949,7 @@ mod tests {
                 &stencil,
                 &sched,
                 prov.as_deref(),
+                None,
                 &s.fuf,
                 &s.sfuf,
                 &s.program,
@@ -7960,6 +7986,7 @@ mod tests {
                 &stencil,
                 &sched,
                 prov.as_deref(),
+                None,
                 &s.fuf,
                 &s.sfuf,
                 &s.program,
@@ -8189,6 +8216,7 @@ mod tests {
                 &stencil,
                 &sched,
                 prov.as_deref(),
+                None,
                 &s.fuf,
                 &s.sfuf,
                 &s.program,
@@ -8903,7 +8931,7 @@ mod tests {
                 let wl = crate::emit::WeightLayout::new();
                 let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
                 let tokens = try_emit_collapsed_bucket(
-                    &t.stencil, &t.sched, prov.as_deref(),
+                    &t.stencil, &t.sched, prov.as_deref(), None,
                     &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
                     &t.solved.model, &t.solved.lib, wp,
                     &mut lib_frag, &wl,
@@ -9470,7 +9498,7 @@ mod tests {
                 }
                 let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
                 let tokens = try_emit_collapsed_bucket(
-                    &t.stencil, &t.sched, prov.as_deref(),
+                    &t.stencil, &t.sched, prov.as_deref(), None,
                     &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
                     &t.solved.model, &t.solved.lib, wp,
                     &mut lib_frag, &wl,
@@ -9822,7 +9850,7 @@ mod tests {
                 let wl = crate::emit::WeightLayout::new();
                 let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
                 try_emit_collapsed_bucket(
-                    &t.stencil, &t.sched, prov.as_deref(),
+                    &t.stencil, &t.sched, prov.as_deref(), None,
                     &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
                     &t.solved.model, &t.solved.lib, wp,
                     &mut lib_frag, &wl,
@@ -9840,7 +9868,7 @@ mod tests {
                 let wl = crate::emit::WeightLayout::new();
                 let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
                 let text = try_emit_collapsed_bucket(
-                    &t.stencil, &t.sched, prov.as_deref(),
+                    &t.stencil, &t.sched, prov.as_deref(), None,
                     &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
                     &t.solved.model, &t.solved.lib, wp,
                     &mut lib_frag, &wl,

@@ -587,6 +587,106 @@ pub(crate) fn schedule_from_edges(
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Partition — project Schedule.order onto (pre_loop, periodic,
+// post_loop) using ClassDomain.periods.
+//
+// This replaces the `pre_loop`/`periodic`/`post_loop` split that
+// today's `ClassSchedule` computes alongside its offset-sort. The
+// semantic is a pure function of (order, periods):
+//
+//   - A class with `periods[c] > 1` is `periodic`, in Kahn order.
+//   - A class with `periods[c] == 1` that appears in `order` before
+//     every periodic class is `pre_loop`.
+//   - A class with `periods[c] == 1` that appears at or after the
+//     first periodic class is `post_loop`.
+//
+// Reassembly invariant: `pre_loop ++ periodic ++ post_loop` —
+// NOT the concatenation of the three buckets preserving their
+// internal orders — equals `order` only when every period-1
+// class sits entirely before or entirely after every periodic
+// class in `order`. The existing fixtures satisfy this
+// (verified by category 16 `partition_order_is_consistent_with_schedule_order`);
+// architectures that interleave period-1 classes among periodic
+// ones would need a richer partition (or a period-1 reroute into
+// the loop body, analogous to today's aliased-emittable reroute).
+// That richer partition is not required for the rewrite's first
+// emitter consumer — it targets the llama-shape fixtures where
+// this invariant holds.
+//
+// Deliberate scope gap: this partition does NOT replicate the
+// legacy scheduler's "aliased-emittable period-1 reroute into
+// periodic with a derived offset." Aliased-emittable reroute is
+// an emission concern (handle it via `emit_aliased_class_inline`
+// with a runtime guard), not a scheduling concern. The rewrite
+// intends to express "emit this period-1 class at a specific
+// `__repeat` offset inside the loop" in the emitter's read-plan
+// consumer rather than by moving the class into `periodic`.
+// ─────────────────────────────────────────────────────────────────
+
+/// Partition of `Schedule.order` by period.
+///
+/// Parallel to `ClassSchedule`'s legacy `pre_loop` / `periodic` /
+/// `post_loop` vectors, derived purely from `Schedule.order` +
+/// `ClassDomain.periods`. The three Vecs together cover every class
+/// exactly once.
+#[derive(Debug, Clone)]
+pub(crate) struct PartitionedSchedule {
+    pub pre_loop: Vec<usize>,
+    pub periodic: Vec<usize>,
+    pub post_loop: Vec<usize>,
+}
+
+impl PartitionedSchedule {
+    /// Concatenate the three buckets in order. For fixtures where
+    /// period-1 classes don't interleave among periodic ones, this
+    /// equals the input `Schedule.order`. Used by category 16's
+    /// `partition_order_is_consistent_with_schedule_order` anchor.
+    #[allow(dead_code)]
+    pub fn flat_order(&self) -> Vec<usize> {
+        let mut out =
+            Vec::with_capacity(self.pre_loop.len() + self.periodic.len() + self.post_loop.len());
+        out.extend(&self.pre_loop);
+        out.extend(&self.periodic);
+        out.extend(&self.post_loop);
+        out
+    }
+}
+
+/// Project `schedule.order` onto (pre_loop, periodic, post_loop).
+///
+/// Walk `order` once; classify each class by its period. A period-1
+/// class goes to `pre_loop` iff no periodic class has been emitted
+/// yet; otherwise `post_loop`. Period>1 classes always go to
+/// `periodic` in Kahn order.
+///
+/// Complexity: O(n_classes).
+#[allow(dead_code)]
+pub(crate) fn partition_schedule(schedule: &Schedule, domain: &ClassDomain) -> PartitionedSchedule {
+    let mut pre_loop: Vec<usize> = Vec::new();
+    let mut periodic: Vec<usize> = Vec::new();
+    let mut post_loop: Vec<usize> = Vec::new();
+    let mut seen_periodic = false;
+    for &c in &schedule.order {
+        if c >= domain.periods.len() {
+            continue;
+        }
+        if domain.periods[c] > 1 {
+            periodic.push(c);
+            seen_periodic = true;
+        } else if !seen_periodic {
+            pre_loop.push(c);
+        } else {
+            post_loop.push(c);
+        }
+    }
+    PartitionedSchedule {
+        pre_loop,
+        periodic,
+        post_loop,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Unit tests — narrow, self-contained. Cross-cutting invariant
 // tests against fixtures live in `codegen::tests::invariants`.
 // ─────────────────────────────────────────────────────────────────
@@ -911,5 +1011,97 @@ mod tests {
             DepTarget::Periodic { .. }
         ));
         assert!(plan.region_at(16).is_none());
+    }
+
+    fn dom(periods: Vec<usize>) -> ClassDomain {
+        let offsets = vec![0usize; periods.len()];
+        ClassDomain { periods, offsets }
+    }
+
+    #[test]
+    fn partition_all_pre_loop_when_no_periodic() {
+        // All classes are period-1. Every one lands in pre_loop.
+        let sched = Schedule {
+            order: vec![0, 1, 2],
+        };
+        let domain = dom(vec![1, 1, 1]);
+        let part = partition_schedule(&sched, &domain);
+        assert_eq!(part.pre_loop, vec![0, 1, 2]);
+        assert!(part.periodic.is_empty());
+        assert!(part.post_loop.is_empty());
+    }
+
+    #[test]
+    fn partition_typical_shape() {
+        // order: [c0 (p=1), c1 (p=1), c2 (p=16), c3 (p=16), c4 (p=1)]
+        // expect: pre_loop=[0,1], periodic=[2,3], post_loop=[4].
+        let sched = Schedule {
+            order: vec![0, 1, 2, 3, 4],
+        };
+        let domain = dom(vec![1, 1, 16, 16, 1]);
+        let part = partition_schedule(&sched, &domain);
+        assert_eq!(part.pre_loop, vec![0, 1]);
+        assert_eq!(part.periodic, vec![2, 3]);
+        assert_eq!(part.post_loop, vec![4]);
+    }
+
+    #[test]
+    fn partition_period_one_interleaved_goes_post_loop() {
+        // A period-1 class between two periodic classes lands in
+        // post_loop (the "at or after first periodic" rule). This is
+        // the scope gap described in the module header — a richer
+        // emitter consumer would need to handle this, but the rule
+        // itself is total and unambiguous.
+        let sched = Schedule {
+            order: vec![0, 1, 2, 3],
+        };
+        let domain = dom(vec![16, 1, 16, 1]);
+        let part = partition_schedule(&sched, &domain);
+        assert_eq!(part.pre_loop, Vec::<usize>::new());
+        assert_eq!(part.periodic, vec![0, 2]);
+        assert_eq!(part.post_loop, vec![1, 3]);
+    }
+
+    #[test]
+    fn partition_every_class_appears_exactly_once() {
+        let sched = Schedule {
+            order: vec![3, 1, 0, 4, 2],
+        };
+        let domain = dom(vec![1, 12, 1, 12, 1]);
+        let part = partition_schedule(&sched, &domain);
+        let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for &c in part
+            .pre_loop
+            .iter()
+            .chain(part.periodic.iter())
+            .chain(part.post_loop.iter())
+        {
+            assert!(seen.insert(c), "class {c} appeared twice");
+        }
+        assert_eq!(seen.len(), 5);
+    }
+
+    #[test]
+    fn partition_flat_order_matches_schedule_when_no_interleave() {
+        // When period-1 classes sit cleanly around periodic ones,
+        // flat_order reassembles the schedule verbatim.
+        let sched = Schedule {
+            order: vec![0, 1, 2, 3, 4, 5],
+        };
+        let domain = dom(vec![1, 1, 8, 8, 1, 1]);
+        let part = partition_schedule(&sched, &domain);
+        assert_eq!(part.flat_order(), sched.order);
+    }
+
+    #[test]
+    fn partition_all_periodic() {
+        let sched = Schedule {
+            order: vec![0, 1, 2],
+        };
+        let domain = dom(vec![4, 4, 4]);
+        let part = partition_schedule(&sched, &domain);
+        assert!(part.pre_loop.is_empty());
+        assert_eq!(part.periodic, vec![0, 1, 2]);
+        assert!(part.post_loop.is_empty());
     }
 }

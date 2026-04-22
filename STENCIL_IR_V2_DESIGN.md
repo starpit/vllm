@@ -716,6 +716,84 @@ message improvements.
      are deleted in the follow-up once every provenance-red test
      clears.
 
+- **Partition landed — `partition_schedule` + category 16
+  (2026-04-24).** Fourth stage of the rewrite lands. Pure-period
+  projection of `Schedule.order` onto
+  `PartitionedSchedule { pre_loop, periodic, post_loop }`. Period>1
+  classes always go to `periodic` in Kahn order; period-1 classes
+  go to `pre_loop` before the first periodic class and `post_loop`
+  at or after it.
+  - `PartitionedSchedule` + `flat_order()` helper (concatenates the
+    three buckets, equal to `Schedule.order` iff no period-1 class
+    sits between two periodic ones).
+  - `partition_schedule(schedule, domain) -> PartitionedSchedule` —
+    pure function, O(n_classes).
+  - Explicit scope gap documented on the module header: this
+    partition does NOT replicate the legacy scheduler's aliased-
+    emittable period-1 reroute into `periodic` with a derived
+    offset. Aliased-emittable reroute is an emission concern
+    (runtime guard inside the loop body via
+    `emit_aliased_class_inline`), not a scheduling concern.
+
+  New invariant-mountain category 16 (`pipeline_partition`, 7 tests,
+  4 green + 3 red on llama at 1b + 3b scale) pins:
+  - (a) `every_class_in_exactly_one_partition` — partition covers
+    every class, no duplicates (green, 1b + 3b).
+  - (b) `partitions_match_period_classification` — `periodic`
+    contains only `periods[c] > 1`; `pre_loop` + `post_loop`
+    contain only period-1 (green, 1b + 3b).
+  - (c) `partition_order_is_consistent_with_schedule_order` —
+    `pre_loop ++ periodic ++ post_loop` reassembles
+    `Schedule.order` verbatim. **RED on llama (1b + 3b)**: class
+    c5 (the per-layer post-MLP FAR peel) is Kahn-placed at
+    `order[6]` between periodic c4 and c9, so flat_order differs
+    at position 6 (partition has c9 there; schedule has c5). This
+    is the forcing function for the next commit: either class
+    formation collapses aliased-emittable period-1 classes into
+    periodic (refactor of `periodicity.rs`), or the emitter's
+    first consumer handles "period-1 inside loop" explicitly
+    (analogous to legacy's reroute, but driven by edge structure
+    + is_aliased_emittable rather than sampled).
+  - (d) `pre_loop_is_strict_prefix_and_post_loop_is_strict_suffix`
+    — stricter restatement of (c); **RED on 1b** for the same
+    reason.
+
+  Plus six unit tests in `stencil_pipeline::tests` covering the
+  function in isolation (all period-1 → all pre_loop / typical
+  shape / period-1 interleaved → post_loop / every-class-once /
+  flat_order reassembly / all periodic).
+
+  Mountain state: **1047 passed, 164 failed** (was 1043/161). All
+  6 new unit tests green; 4 new invariant greens + 3 new invariant
+  reds, zero regression on the existing 161 reds. Full crate:
+  1263/167 (164 invariants + 3 pre-existing unrelated solver/config
+  failures per handoff, unchanged).
+
+  Red→green proof via targeted stub: replace `partition_schedule`
+  body with `PartitionedSchedule { pre_loop: vec![], periodic:
+  vec![], post_loop: vec![] }` → (a) fires with "class c0 missing
+  from all three partitions" at both 1b + 3b; (b) passes
+  vacuously; (c) and (d) fire with "flat_order is empty, expected
+  N-element order." Restoring the real body makes (a) + (b) green
+  and (c) + (d) stay red on the real fixture for the structural
+  reason described above. Stubbing `order` to `(0..n).collect()`
+  (ignoring Kahn constraints) produces a green (c) + (d) but
+  breaks cat 15's topological claim — confirming the reds are
+  genuinely about the llama fixture's class-formation shape, not
+  about partition_schedule's algorithm.
+
+  **Next concrete step for next session**: close the category 16
+  reds by introducing an `aliased_period_one_classes` extension
+  to `PartitionedSchedule` that pulls period-1 classes whose
+  Kahn position falls between periodic classes out of `post_loop`
+  and into a separate `in_loop_short` bucket, with a per-class
+  offset derived from the edge graph (mirroring legacy
+  `StencilBundle::schedule`'s aliased-emittable reroute but
+  driven by the new `BoundaryEdge` set, not class_edges). Cat
+  16 (c)/(d) then flip green when reassembly accounts for the
+  new bucket. This unblocks the emitter's consumption of the
+  schedule order — step 5 of the rewrite.
+
 - `a4b38b236` — **invariant mountain scaled to 1229 tests (161 red)**.
   Cross-scale 1b/3b + 6 new categories. This commit is the
   forcing-function for the rewrite.

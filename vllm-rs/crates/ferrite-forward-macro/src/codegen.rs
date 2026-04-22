@@ -10685,5 +10685,198 @@ mod tests {
                 }
             }
         }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 16 — schedule partition (pre_loop / periodic /
+        // post_loop from Schedule.order + ClassDomain.periods)
+        //
+        // `stencil_pipeline::partition_schedule` replaces today's
+        // ad-hoc `ClassSchedule` pre/periodic/post split with a pure
+        // function of (order, periods). Claims pinned here:
+        //  (a) Every class in `0..n` appears in exactly one of the
+        //      three buckets.
+        //  (b) `periodic` contains ONLY classes with `periods[c] > 1`.
+        //      `pre_loop` + `post_loop` contain ONLY period-1 classes.
+        //  (c) On the shipping fixture, period-1 classes don't
+        //      interleave with periodic ones, so
+        //      `pre_loop ++ periodic ++ post_loop` equals `order`
+        //      verbatim. Failure here means the fixture grew a
+        //      shape the emitter's first consumer (next commit)
+        //      doesn't yet handle — the test names the offending
+        //      class.
+        //  (d) `pre_loop` is a strict prefix of `order` and
+        //      `post_loop` is a strict suffix (stricter restatement
+        //      of (c); useful as a standalone red when (c) fires).
+        //
+        // All claims repeated at 3b (28-layer) scale.
+        // ──────────────────────────────────────────────────────────
+        mod pipeline_partition {
+            use super::*;
+            use super::truth::*;
+            use crate::stencil_pipeline::{
+                build_edge_dependences, class_domain, partition_schedule, schedule_from_edges,
+            };
+
+            fn compute_partition(
+                t: &Truth,
+            ) -> (crate::stencil_pipeline::PartitionedSchedule, usize) {
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain)
+                    .expect("fixture must have no Δ=0 cycle");
+                let n = t.stencil.class_members.len();
+                (partition_schedule(&sched, &domain), n)
+            }
+
+            /// (a) Every class appears in exactly one partition.
+            #[test]
+            fn every_class_in_exactly_one_partition() {
+                let t = load();
+                let (part, n) = compute_partition(&t);
+                let mut seen: BTreeSet<usize> = BTreeSet::new();
+                for &c in part.pre_loop.iter().chain(part.periodic.iter()).chain(part.post_loop.iter()) {
+                    assert!(
+                        seen.insert(c),
+                        "class c{c} appears in multiple partitions",
+                    );
+                }
+                for c in 0..n {
+                    assert!(
+                        seen.contains(&c),
+                        "class c{c} missing from all three partitions",
+                    );
+                }
+                assert_eq!(seen.len(), n);
+            }
+
+            /// (b) Period uniformity across partitions.
+            #[test]
+            fn partitions_match_period_classification() {
+                let t = load();
+                let (part, _n) = compute_partition(&t);
+                for &c in &part.periodic {
+                    let p = t.stencil.class_members[c].len();
+                    assert!(
+                        p > 1,
+                        "c{c} in periodic but periods[c]={p} (expected > 1)",
+                    );
+                }
+                for &c in part.pre_loop.iter().chain(part.post_loop.iter()) {
+                    let p = t.stencil.class_members[c].len();
+                    assert_eq!(
+                        p, 1,
+                        "c{c} in pre_loop/post_loop but periods[c]={p} (expected 1)",
+                    );
+                }
+            }
+
+            /// (c) On the fixture, `pre_loop ++ periodic ++ post_loop`
+            /// reassembles `schedule.order` — no period-1 class
+            /// interleaves with periodic ones.
+            #[test]
+            fn partition_order_is_consistent_with_schedule_order() {
+                let t = load();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
+                let part = partition_schedule(&sched, &domain);
+                assert_eq!(
+                    part.flat_order(),
+                    sched.order,
+                    "partition flat_order differs from schedule.order — \
+                     some period-1 class interleaves among periodic classes, \
+                     which the rewrite's first emitter consumer doesn't handle",
+                );
+            }
+
+            /// (d) Strict prefix / suffix shape: pre_loop occupies
+            /// positions `[0, pre_loop.len())` in `order`; post_loop
+            /// occupies `[order.len() - post_loop.len(), order.len())`.
+            #[test]
+            fn pre_loop_is_strict_prefix_and_post_loop_is_strict_suffix() {
+                let t = load();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
+                let part = partition_schedule(&sched, &domain);
+                let pre_len = part.pre_loop.len();
+                let post_len = part.post_loop.len();
+                let total = sched.order.len();
+                assert_eq!(
+                    &sched.order[..pre_len],
+                    part.pre_loop.as_slice(),
+                    "pre_loop is not a strict prefix of schedule.order",
+                );
+                assert_eq!(
+                    &sched.order[total - post_len..],
+                    part.post_loop.as_slice(),
+                    "post_loop is not a strict suffix of schedule.order",
+                );
+            }
+
+            /// (a) at 3b scale.
+            #[test]
+            fn every_class_in_exactly_one_partition_3b() {
+                let t = load_3b();
+                let (part, n) = compute_partition(&t);
+                let mut seen: BTreeSet<usize> = BTreeSet::new();
+                for &c in part.pre_loop.iter().chain(part.periodic.iter()).chain(part.post_loop.iter()) {
+                    assert!(seen.insert(c), "3b class c{c} appears in multiple partitions");
+                }
+                for c in 0..n {
+                    assert!(seen.contains(&c), "3b class c{c} missing from partitions");
+                }
+            }
+
+            /// (b) at 3b scale.
+            #[test]
+            fn partitions_match_period_classification_3b() {
+                let t = load_3b();
+                let (part, _n) = compute_partition(&t);
+                for &c in &part.periodic {
+                    let p = t.stencil.class_members[c].len();
+                    assert!(p > 1, "3b c{c} in periodic but periods[c]={p}");
+                }
+                for &c in part.pre_loop.iter().chain(part.post_loop.iter()) {
+                    let p = t.stencil.class_members[c].len();
+                    assert_eq!(p, 1, "3b c{c} in pre/post_loop but periods[c]={p}");
+                }
+            }
+
+            /// (c) at 3b scale.
+            #[test]
+            fn partition_order_is_consistent_with_schedule_order_3b() {
+                let t = load_3b();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain).expect("3b no cycle");
+                let part = partition_schedule(&sched, &domain);
+                assert_eq!(
+                    part.flat_order(),
+                    sched.order,
+                    "3b partition flat_order differs from schedule.order",
+                );
+            }
+        }
     }
 }

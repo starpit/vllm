@@ -9,15 +9,18 @@ description = "Worker/process management and distributed coordination for vLLM R
 default = []
 cuda = [
     "vllm-cuda/cuda",
-    "vllm-cuda/cublas",
     "cudarc",
     "dep:ferrite-forward",
     "dep:ferrite-models",
     "dep:ferrite-cuda-core",
     "ferrite-forward/cuda",
-    "ferrite-forward/cublas",
     "ferrite-models/cuda",
     "ferrite-cuda-core/cuda",
+]
+cublas = [
+    "cuda",
+    "vllm-cuda/cublas",
+    "ferrite-forward/cublas",
     "ferrite-cuda-core/cublas",
 ]
 nccl = ["cuda", "vllm-cuda/nccl"]

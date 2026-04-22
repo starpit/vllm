@@ -66,10 +66,10 @@ impl GpuDevice {
             let transfer_done = driver::event_create_disable_timing()?;
             let d2h_done = driver::event_create_disable_timing()?;
 
-            let mut caching = CachingAllocator::new();
+            let caching = CachingAllocator::new();
             #[cfg(feature = "cublas")]
             let cublas = if with_cublas {
-                Some(CublasHandle::new(compute_stream, &mut caching)?)
+                Some(CublasHandle::new(compute_stream, caching)?)
             } else {
                 None
             };
@@ -79,15 +79,17 @@ impl GpuDevice {
             let num_sm = driver::device_get_num_sm(cu_device)?;
             let sm_version = driver::device_get_sm_version(cu_device)?;
 
+            #[cfg(feature = "cublas")]
+            let cublas_status = if with_cublas { "enabled" } else { "disabled" };
+            #[cfg(not(feature = "cublas"))]
+            let cublas_status = "not compiled";
+
             tracing::info!(
                 "GpuDevice initialized: device={}, SMs={}, SM{}, cuBLAS={}",
                 device_id,
                 num_sm,
                 sm_version,
-                #[cfg(feature = "cublas")]
-                if with_cublas { "enabled" } else { "disabled" },
-                #[cfg(not(feature = "cublas"))]
-                "not compiled",
+                cublas_status,
             );
 
             Ok(Self {

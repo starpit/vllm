@@ -1,0 +1,57 @@
+# Makefile for testing cublas-free builds
+#
+# Usage:
+#   make -f Makefile.cublas-free check-cublas-free
+#   make -f Makefile.cublas-free build-cublas-free
+#   make -f Makefile.cublas-free test-cublas-free
+
+.PHONY: check-cublas-free build-cublas-free test-cublas-free clean
+
+# Check that core ferrite crates compile without cublas
+check-cublas-free:
+	@echo "==> Checking ferrite-cuda-core without cublas..."
+	cargo check -p ferrite-cuda-core --features cuda --no-default-features
+	@echo "==> Checking ferrite-kernels without cublas..."
+	cargo check -p ferrite-kernels --features cuda --no-default-features
+	@echo "==> Checking ferrite-forward without cublas..."
+	cargo check -p ferrite-forward --features cuda --no-default-features
+	@echo "==> Checking vllm-cuda without cublas..."
+	cargo check -p vllm-cuda --features cuda --no-default-features
+	@echo "==> Checking vllm-executor without cublas..."
+	cargo check -p vllm-executor --features cuda --no-default-features
+	@echo "==> All cublas-free checks passed!"
+
+# Build vllm CLI without cublas (but with CUDA)
+build-cublas-free:
+	@echo "==> Building vllm CLI with CUDA but without cuBLAS..."
+	cargo build -p vllm-cli --features cuda --no-default-features
+	@echo "==> Build complete! Binary at target/debug/vllm"
+
+# Build vllm CLI with cublas (for comparison)
+build-with-cublas:
+	@echo "==> Building vllm CLI with CUDA and cuBLAS..."
+	cargo build -p vllm-cli --features cuda,cublas --no-default-features
+	@echo "==> Build complete! Binary at target/debug/vllm"
+
+# Run tests for cublas-free crates
+test-cublas-free:
+	@echo "==> Testing ferrite-cuda-core without cublas..."
+	cargo test -p ferrite-cuda-core --features cuda --no-default-features
+	@echo "==> Testing ferrite-kernels without cublas..."
+	cargo test -p ferrite-kernels --features cuda --no-default-features
+	@echo "==> All cublas-free tests passed!"
+
+# Clean build artifacts
+clean:
+	cargo clean
+
+# Show feature status
+show-features:
+	@echo "==> ferrite-cuda-core features:"
+	@cargo tree -p ferrite-cuda-core --features cuda --no-default-features -e features | head -20
+	@echo ""
+	@echo "==> ferrite-kernels features:"
+	@cargo tree -p ferrite-kernels --features cuda --no-default-features -e features | head -20
+	@echo ""
+	@echo "==> vllm-executor features:"
+	@cargo tree -p vllm-executor --features cuda --no-default-features -e features | head -20

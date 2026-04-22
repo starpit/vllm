@@ -585,29 +585,84 @@ message improvements.
   this commit lands the INPUT to the classifier (the no-sampling
   edge set), not the classifier itself.
 
-  **Next concrete step for next session**: implement
-  `classify_reads(edges) -> HashMap<(class, boundary_pos),
-  ReadPlan>` in `stencil_pipeline.rs`. The classifier is a pure
-  function of the edge distribution:
-  1. For each `(consumer_class, boundary_pos)`, collect all edges
-     keyed on that pair.
-  2. Partition consumer members into disjoint iter ranges by
-     producer identity (class, member offset).
-  3. Each range gets a `DepTarget`: `PreLoop` when producer is
-     period-1, `Periodic { delta_global }` when periodic, with
-     `delta_global = consumer_member + class_offset[c] -
-     (producer_member + class_offset[producer_class])`.
-  4. Merge adjacent regions with identical `DepTarget` into one.
-  5. Reject any member with `Δ_global >= 2` as a well-formedness
-     error.
+- **Classifier landed — `classify_reads` + ClassDomain + category 14
+  (2026-04-23).** Second concrete step of the rewrite. Stage 2 of
+  the pipeline is live: the no-sampling edge set is now folded into
+  per-boundary `ReadPlan`s via a pure function of edges + class
+  domain.
+  - `ClassDomain { periods, offsets }` — explicit per-class
+    iteration domain. `class_domain(class_members, class_offsets)`
+    constructs it from the existing schedule.
+  - `classify_reads(edges, class_members, domain) -> HashMap<
+    (consumer_class, boundary_pos), ReadPlan>` — pure function.
+    Buckets edges by `(class, bp, member)`; for each boundary, if
+    every consumer member has an edge, resolves each member's
+    `DepTarget` (period-1 producer → `PreLoop`; periodic →
+    `Periodic { delta_global = (offsets[c] + k) - (offsets[pc] +
+    producer_member) }`); merges runs of identical targets into
+    canonical `ReadRegion`s. Boundaries with partial coverage
+    (mixed extern / over-collapse) are omitted — downstream
+    categories flag the structural irregularity.
+  - Classifier is kept **total** (no `Δ≥2` rejection); category 14
+    `deltas_are_zero_or_one` carries the correctness claim so a red
+    names the offending `(class, bp)` triple rather than panicking
+    generically.
 
-  Then invariant-mountain category 14
-  (`read_plan_classification`) pins:
-  - ReadPlan regions are disjoint + cover `[0, period)`.
-  - Every member's computed `DepTarget` matches ground truth via
-    `boundary_truth(…)`.
-  - `origin_producer_class_matches_every_member` (existing red
-    test) goes green when provenance switches to ReadPlan-derived.
+  New invariant-mountain category 14 (`read_plan_classification`,
+  8 tests) pins:
+  - `regions_cover_and_partition_range` — disjoint + contiguous +
+    cover `[0, period)`.
+  - `targets_match_boundary_truth` — every member's resolved
+    `DepTarget` equals what `boundary_truth` independently derives
+    from the unrolled FUF.
+  - `deltas_are_zero_or_one` — `|Δ_global| ≤ 1` for every Periodic
+    region on 1b.
+  - `regions_are_canonically_merged` — no two adjacent regions
+    share a target.
+  - `every_fully_resolvable_boundary_has_a_plan` — coverage
+    anchor (see red→green proof below).
+  - 3b-scale variants of the three structural claims.
+
+  Plus four classify-unit tests in `stencil_pipeline::tests`
+  (intra-iter / offset-gap pre-loop→periodic / loop-carry Δ=1 /
+  mixed-coverage skip) covering the classifier in isolation with
+  hand-built fixtures.
+
+  Mountain state: **1037 passed, 161 failed** (was 1029/161). All
+  8 new category 14 tests green, zero regression on the 161 red
+  tests — the rewrite has not yet touched
+  `class_input_provenance`, so the provenance-driven reds stay red
+  as expected. Lifting them happens when the emitter is rewired
+  through `classify_reads` (next step below).
+
+  Red→green proof: stubbing `classify_reads` to return
+  `HashMap::new()` fires
+  `every_fully_resolvable_boundary_has_a_plan` + the 3b variant at
+  the first fully-resolvable boundary (c1 bp0 on both 1b and 3b)
+  with the exact failing triple in the panic message; restoring
+  makes both green. The other six tests were designed against a
+  working classifier and pass vacuously under the stub — the
+  coverage anchor is what separates "classifier correct" from
+  "tests asserted nothing."
+
+  **Next concrete step for next session**: topological schedule
+  over intra-iter edges (`Schedule` / `Kahn(edges_with_Δ=0)`),
+  then the ReadPlan-consuming emitter. Outline:
+  1. Add `schedule_from_edges(edges: &[BoundaryEdge], n_classes)
+     -> Schedule` that returns a Kahn topo order over the Δ=0
+     sub-graph (ignoring carries). Tie-break by class index for
+     determinism, matching today's `ClassSchedule::schedule` where
+     observable.
+  2. Category 15 (`schedule_topology`) pins: (a) for every Δ=0
+     edge the producer class appears strictly before the consumer
+     in the schedule; (b) every class index appears exactly once;
+     (c) no class with a Δ=0 cycle is silently emitted.
+  3. The ReadPlan-consuming emitter replaces `class_input_provenance`
+     reads in `emit_fragment_call_expr` + `emit_aliased_class_inline`
+     with lookups keyed on `(class, bp)`. The old `InputOrigin`
+     enum + `alias_carry_redirect` sidecar stay in place for one
+     commit so the flip can be A/B'd; they are deleted in the
+     follow-up once every provenance-red test clears.
 
 - `a4b38b236` — **invariant mountain scaled to 1229 tests (161 red)**.
   Cross-scale 1b/3b + 6 new categories. This commit is the

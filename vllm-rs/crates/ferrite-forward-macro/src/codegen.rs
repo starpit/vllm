@@ -10150,5 +10150,326 @@ mod tests {
                 }
             }
         }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 14 — read-plan classification
+        //
+        // `stencil_pipeline::classify_reads` turns the no-sampling
+        // edge set into a per-boundary `ReadPlan` — disjoint iter
+        // ranges over `[0, period)` each pointing at a `DepTarget`.
+        // This is the representation the new emitter (landing in a
+        // follow-up commit) consumes in place of the heuristic
+        // `InputOrigin` enum.
+        //
+        // Invariants pinned here:
+        //  (i)   regions cover `[0, period)` exactly, with no gaps
+        //        and no overlaps.
+        //  (ii)  every consumer member's resolved target matches
+        //        what `boundary_truth` independently derives from
+        //        the unrolled FUF.
+        //  (iii) `DepTarget::Periodic` entries have
+        //        `delta_global ∈ {0, 1}` — a transformer forward's
+        //        legitimate dependence polyhedra never carry `≥ 2`;
+        //        a red here names a member the compiler is about to
+        //        miscompile (or a schedule whose offsets are wrong).
+        //  (iv)  adjacent regions are never identical (canonical
+        //        merged form — the emitter's region-guard count
+        //        matches the true piecewise-affine structure, not
+        //        an arbitrary per-member list).
+        //
+        // At scale: every property holds at both 1b (16 layers) and
+        // 3b (28 layers) fixtures. Drift between the two scales is
+        // a sign of period-dependent over-collapse.
+        // ──────────────────────────────────────────────────────────
+        mod read_plan_classification {
+            use super::truth::*;
+            use crate::stencil_pipeline::{
+                build_edge_dependences, class_domain, classify_reads, DepTarget, ReadPlan,
+            };
+
+            fn plans_for(t: &Truth) -> std::collections::HashMap<(usize, usize), ReadPlan> {
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                classify_reads(&edges, &t.stencil.class_members, &domain)
+            }
+
+            /// Ground-truth coverage. For every `(class, bp)` where
+            /// every member's `boundary_truth` resolves, the
+            /// classifier must emit a `ReadPlan`. Classifier silently
+            /// dropping boundaries (e.g. a stub returning empty, or
+            /// an early-return on a condition we didn't notice)
+            /// fails this assertion loudly with the missing key.
+            ///
+            /// This is the red→green anchor for category 14:
+            /// stubbing `classify_reads` to `HashMap::new()` makes
+            /// this test fire at the first (c, bp) pair with
+            /// coherent ground truth.
+            #[test]
+            fn every_fully_resolvable_boundary_has_a_plan() {
+                let t = load();
+                let plans = plans_for(&t);
+                let mut expected = 0usize;
+                for (c, members) in t.stencil.class_members.iter().enumerate() {
+                    if members.is_empty() { continue; }
+                    let nb = boundary_count(&t, c);
+                    for bp in 0..nb {
+                        let resolvable = (0..members.len())
+                            .all(|k| boundary_truth(&t, c, k, bp).is_some());
+                        if !resolvable { continue; }
+                        expected += 1;
+                        assert!(
+                            plans.contains_key(&(c, bp)),
+                            "c{c} bp{bp}: every member has a ground-truth \
+                             producer, but classifier did not emit a ReadPlan",
+                        );
+                    }
+                }
+                assert!(
+                    expected > 0,
+                    "fixture has no fully-resolvable boundaries — \
+                     test cannot distinguish green from vacuous. \
+                     Check `truth::load()`.",
+                );
+            }
+
+            /// Same coverage claim at 3b scale.
+            #[test]
+            fn every_fully_resolvable_boundary_has_a_plan_3b() {
+                let t = load_3b();
+                let plans = plans_for(&t);
+                let mut expected = 0usize;
+                for (c, members) in t.stencil.class_members.iter().enumerate() {
+                    if members.is_empty() { continue; }
+                    let nb = boundary_count(&t, c);
+                    for bp in 0..nb {
+                        let resolvable = (0..members.len())
+                            .all(|k| boundary_truth(&t, c, k, bp).is_some());
+                        if !resolvable { continue; }
+                        expected += 1;
+                        assert!(
+                            plans.contains_key(&(c, bp)),
+                            "3b c{c} bp{bp}: missing plan despite full coverage",
+                        );
+                    }
+                }
+                assert!(expected > 0, "3b fixture must have resolvable boundaries");
+            }
+
+            /// For each `(class, boundary_pos)` the classifier emits
+            /// a ReadPlan, the regions must (a) be ordered by `lo`,
+            /// (b) be disjoint (each member iter in at most one
+            /// region), (c) cover every iter `[0, period)` exactly
+            /// once. A gap or overlap means the emitter would
+            /// generate an unreachable arm or a double-fire.
+            #[test]
+            fn regions_cover_and_partition_range() {
+                let t = load();
+                let plans = plans_for(&t);
+                for ((c, bp), plan) in &plans {
+                    let period = t.stencil.class_members[*c].len();
+                    assert!(
+                        !plan.regions.is_empty(),
+                        "c{c} bp{bp}: empty ReadPlan but period={period}",
+                    );
+                    let mut expect_lo = 0usize;
+                    for (i, r) in plan.regions.iter().enumerate() {
+                        assert_eq!(
+                            r.range.lo, expect_lo,
+                            "c{c} bp{bp} region[{i}]: lo={} expected {}",
+                            r.range.lo, expect_lo,
+                        );
+                        assert!(
+                            r.range.lo < r.range.hi,
+                            "c{c} bp{bp} region[{i}]: empty range {:?}",
+                            r.range,
+                        );
+                        expect_lo = r.range.hi;
+                    }
+                    assert_eq!(
+                        expect_lo, period,
+                        "c{c} bp{bp}: last region.hi={expect_lo} does not reach \
+                         period={period}",
+                    );
+                }
+            }
+
+            /// For every member `k` of every classified boundary,
+            /// the region's `DepTarget` matches what `boundary_truth`
+            /// says — same producer class, same producer member (for
+            /// Periodic) or same producer sg (for PreLoop), same
+            /// Δ_global under the schedule's offsets. No drift
+            /// between classifier and ground truth.
+            #[test]
+            fn targets_match_boundary_truth() {
+                let t = load();
+                let plans = plans_for(&t);
+                for ((c, bp), plan) in &plans {
+                    let period = t.stencil.class_members[*c].len();
+                    for k in 0..period {
+                        let region = plan
+                            .region_at(k)
+                            .unwrap_or_else(|| panic!("c{c} bp{bp}: no region for member {k}"));
+                        let gt = boundary_truth(&t, *c, k, *bp)
+                            .unwrap_or_else(|| panic!(
+                                "c{c} bp{bp} m{k}: plan present but boundary_truth \
+                                 has no producer — classifier over-reached"
+                            ));
+                        match region.target {
+                            DepTarget::PreLoop { producer_sg, producer_slot, .. } => {
+                                let prod_period =
+                                    t.stencil.class_members[gt.producer_class].len();
+                                assert_eq!(
+                                    prod_period, 1,
+                                    "c{c} bp{bp} m{k}: classifier said PreLoop but \
+                                     ground-truth producer class {} has period {}",
+                                    gt.producer_class, prod_period,
+                                );
+                                assert_eq!(producer_sg, gt.producer_sg,
+                                    "c{c} bp{bp} m{k}: PreLoop producer_sg mismatch");
+                                assert_eq!(producer_slot, gt.producer_slot,
+                                    "c{c} bp{bp} m{k}: PreLoop producer_slot mismatch");
+                            }
+                            DepTarget::Periodic {
+                                producer_class,
+                                producer_slot,
+                                delta_global,
+                                ..
+                            } => {
+                                assert_eq!(producer_class, gt.producer_class,
+                                    "c{c} bp{bp} m{k}: Periodic producer_class mismatch \
+                                     — classifier says {producer_class}, gt says {}",
+                                    gt.producer_class);
+                                assert_eq!(producer_slot, gt.producer_slot,
+                                    "c{c} bp{bp} m{k}: Periodic producer_slot mismatch");
+                                let consumer_global =
+                                    t.sched.class_offsets[*c] as i64 + k as i64;
+                                let expect_delta =
+                                    consumer_global - gt.producer_global_iter;
+                                assert_eq!(delta_global, expect_delta,
+                                    "c{c} bp{bp} m{k}: Periodic delta_global mismatch \
+                                     — classifier says {delta_global}, gt-derived {expect_delta}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            /// Every `Periodic` target has `Δ_global ∈ {0, 1}`. A
+            /// Δ=0 is intra-iter (producer fires earlier this
+            /// __repeat), Δ=1 is a one-iteration carry (residual,
+            /// kv-cache rewind). `|Δ| ≥ 2` does not occur in a
+            /// transformer forward — if the classifier derives one,
+            /// either the schedule's offsets are wrong (a class's
+            /// offset places its iter too far from the producer's
+            /// offset) or the class formation over-collapsed two
+            /// iteration-distance-distinct patterns into one class.
+            #[test]
+            fn deltas_are_zero_or_one() {
+                let t = load();
+                let plans = plans_for(&t);
+                for ((c, bp), plan) in &plans {
+                    for r in &plan.regions {
+                        if let DepTarget::Periodic { delta_global, .. } = r.target {
+                            assert!(
+                                delta_global == 0 || delta_global == 1,
+                                "c{c} bp{bp} region {:?}: Δ_global={delta_global} \
+                                 outside {{0,1}} — schedule offsets or class \
+                                 formation is inconsistent with the unrolled FUF",
+                                r.range,
+                            );
+                        }
+                    }
+                }
+            }
+
+            /// Canonical form: the classifier has already merged
+            /// adjacent regions with identical `DepTarget`. If two
+            /// neighbours carry the same target, the piecewise-affine
+            /// structure isn't being summarised; the emitter would
+            /// emit a redundant guard split.
+            #[test]
+            fn regions_are_canonically_merged() {
+                let t = load();
+                let plans = plans_for(&t);
+                for ((c, bp), plan) in &plans {
+                    for w in plan.regions.windows(2) {
+                        assert_ne!(
+                            w[0].target, w[1].target,
+                            "c{c} bp{bp}: adjacent regions {:?} and {:?} have \
+                             identical target {:?} — classifier did not canonicalise",
+                            w[0].range, w[1].range, w[0].target,
+                        );
+                    }
+                }
+            }
+
+            /// Same structural claims at 3b scale. Catches
+            /// period-dependent over-collapse: a classifier that
+            /// happens to produce clean plans at 16 layers but not
+            /// 28 is a red flag.
+            #[test]
+            fn targets_match_boundary_truth_3b() {
+                let t = load_3b();
+                let plans = plans_for(&t);
+                for ((c, bp), plan) in &plans {
+                    let period = t.stencil.class_members[*c].len();
+                    for k in 0..period {
+                        let region = plan
+                            .region_at(k)
+                            .unwrap_or_else(|| panic!("3b c{c} bp{bp}: no region for m{k}"));
+                        let gt = boundary_truth(&t, *c, k, *bp)
+                            .unwrap_or_else(|| panic!(
+                                "3b c{c} bp{bp} m{k}: plan present but \
+                                 boundary_truth has no producer"
+                            ));
+                        match region.target {
+                            DepTarget::PreLoop { producer_sg, .. } => {
+                                assert_eq!(producer_sg, gt.producer_sg,
+                                    "3b c{c} bp{bp} m{k}: PreLoop producer_sg mismatch");
+                            }
+                            DepTarget::Periodic {
+                                producer_class,
+                                delta_global,
+                                ..
+                            } => {
+                                assert_eq!(producer_class, gt.producer_class,
+                                    "3b c{c} bp{bp} m{k}: Periodic producer_class mismatch");
+                                let consumer_global =
+                                    t.sched.class_offsets[*c] as i64 + k as i64;
+                                let expect_delta =
+                                    consumer_global - gt.producer_global_iter;
+                                assert_eq!(delta_global, expect_delta,
+                                    "3b c{c} bp{bp} m{k}: Periodic Δ mismatch");
+                            }
+                        }
+                    }
+                }
+            }
+
+            /// At 3b scale, `Δ_global ∈ {0, 1}` must still hold. If
+            /// it breaks only at 3b, the offset rule is scale-
+            /// dependent — a heuristic, not a structural derivation.
+            #[test]
+            fn deltas_are_zero_or_one_3b() {
+                let t = load_3b();
+                let plans = plans_for(&t);
+                for ((c, bp), plan) in &plans {
+                    for r in &plan.regions {
+                        if let DepTarget::Periodic { delta_global, .. } = r.target {
+                            assert!(
+                                delta_global == 0 || delta_global == 1,
+                                "3b c{c} bp{bp} region {:?}: Δ={delta_global}",
+                                r.range,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

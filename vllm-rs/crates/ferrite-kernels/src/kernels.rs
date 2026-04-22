@@ -3879,13 +3879,26 @@ unsafe extern "C" {
 ///
 /// * `x`: any contiguous tensor (F16, BF16, or F32)
 /// * `scale`: the scalar multiplier (always f32)
-/// * `cublas`: cuBLAS handle on the compute stream
-#[cfg(feature = "cublas")]
+/// * `cublas`: cuBLAS handle on the compute stream (or unit type when cublas disabled)
+///
+/// # Panics
+/// Panics if the `cublas` feature is not enabled.
 pub unsafe fn scale_inplace(
     x: GpuTensor,
     scale: f32,
+    #[cfg(feature = "cublas")]
     cublas: &ferrite_cuda_core::cublas::CublasHandle,
+    #[cfg(not(feature = "cublas"))]
+    _cublas: &(),
 ) {
+    #[cfg(not(feature = "cublas"))]
+    {
+        let _ = (x, scale);
+        panic!("scale_inplace requires the 'cublas' feature to be enabled");
+    }
+    
+    #[cfg(feature = "cublas")]
+    {
     use cudarc::cublas::sys::cudaDataType_t;
     let n = x.numel() as c_int;
     let x_type = match x.dtype() {
@@ -3908,6 +3921,7 @@ pub unsafe fn scale_inplace(
         status,
         cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
     );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2661,13 +2661,15 @@ impl Implementation for ScalarMulImpl {
         // output binding owns the mutated buffer.
         quote! {
             let #out = unsafe {
+                #[cfg(feature = "cublas")]
+                let cublas_handle = device.cublas.as_ref().expect("cuBLAS required for scale_inplace");
+                #[cfg(not(feature = "cublas"))]
+                let cublas_handle = &();
+                
                 ::ferrite_kernels::kernels::scale_inplace(
                     *#upstream,
                     #scale,
-                    device
-                        .cublas
-                        .as_ref()
-                        .expect("cuBLAS required for scale_inplace"),
+                    cublas_handle,
                 );
                 #upstream
             };

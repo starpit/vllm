@@ -3067,83 +3067,6 @@ impl StencilBundle {
         }
         let periodic_set = periodic_set;
 
-        // Topo-sort `periodic` respecting intra-iter edges
-        // (Δ_global = 0, i.e. `diff == -d` in the validator). When
-        // offset(producer) > offset(consumer), both fire at the same
-        // __repeat only after producer has fired that iter — so
-        // producer must emit BEFORE consumer in the loop body.
-        //
-        // Without this, consumer reads the producer's `__cC_out` at
-        // a point where producer hasn't populated it yet (for short
-        // producers: Option<_> = None → panic; for full producers:
-        // stale prior-iter value → wrong output). The pre-H1+H2
-        // state masked this because the misclassification as
-        // LoopCarry routed reads through `__carry` (end-of-iter
-        // updated), which didn't care about in-iter order but
-        // computed the wrong answer (off-by-one layer).
-        //
-        // Kahn's algorithm: count incoming intra-iter edges per
-        // periodic class, process zero-in-degree first, ties broken
-        // by (offset, class_idx) to preserve today's byte-layout for
-        // shapes with no intra-iter edges. Cyclic DAG falls back to
-        // the offset sort (should never happen if `offsets_consistent`
-        // holds — a cycle means Δ_global=0 in both directions, i.e.
-        // two classes fire at the same __repeat with circular dep,
-        // which means the FUF itself is cyclic — unsupported).
-        {
-            let mut in_degree: std::collections::HashMap<usize, usize> =
-                periodic.iter().map(|&c| (c, 0)).collect();
-            let mut edges_out: std::collections::HashMap<usize, Vec<usize>> =
-                std::collections::HashMap::new();
-            for e in &edges {
-                if !periodic_set.contains(&e.consumer_class)
-                    || !periodic_set.contains(&e.producer_class)
-                    || e.consumer_class == e.producer_class
-                {
-                    continue;
-                }
-                let diff =
-                    class_offsets[e.consumer_class] as i64 - class_offsets[e.producer_class] as i64;
-                let d = e.delta_repeat();
-                // Δ_global = d + diff. Intra-iter iff d + diff == 0
-                // i.e. diff == -d (matches the validator's
-                // `intra_ok`). Producer → Consumer edge in the
-                // intra-iter DAG.
-                if diff == -d {
-                    edges_out
-                        .entry(e.producer_class)
-                        .or_default()
-                        .push(e.consumer_class);
-                    *in_degree.entry(e.consumer_class).or_insert(0) += 1;
-                }
-            }
-            let mut ready: std::collections::BTreeSet<(usize, usize)> = periodic
-                .iter()
-                .filter(|&&c| in_degree[&c] == 0)
-                .map(|&c| (class_offsets[c], c))
-                .collect();
-            let mut sorted: Vec<usize> = Vec::with_capacity(periodic.len());
-            while let Some(&(off, c)) = ready.iter().next() {
-                ready.remove(&(off, c));
-                sorted.push(c);
-                if let Some(outs) = edges_out.get(&c) {
-                    for &next in outs {
-                        let entry = in_degree.get_mut(&next).expect("tracked");
-                        *entry -= 1;
-                        if *entry == 0 {
-                            ready.insert((class_offsets[next], next));
-                        }
-                    }
-                }
-            }
-            if sorted.len() == periodic.len() {
-                periodic = sorted;
-            }
-            // else: cycle in intra-iter DAG — keep the offset-sort
-            // order as a conservative fallback. `offsets_consistent`
-            // downstream will catch pathological cases.
-        }
-
         // Validate: each edge between two periodic classes is
         // explainable as intra-iter (offset_diff = -Δ) or carry-1
         // (offset_diff = -Δ + 1) under the assigned offsets. Edges
@@ -3251,25 +3174,16 @@ impl StencilBundle {
                     let producer_iter = self.iter_of(producer_sg);
 
                     let origin = if pre_loop_set.contains(&producer_class) {
-                        // Pre-loop producer for the REP's boundary.
-                        // Full-member classification derives the right
-                        // shape from the actual DAG (H1+H2 fix):
-                        // - All members read pre_loop uniformly →
-                        //   PreLoop (constant).
-                        // - Members 0..k read pre_loop, members k.. read
-                        //   a periodic producer P with uniform Δ → the
-                        //   offset-gap shape. Δ_global =
-                        //   delta_iter_in_class + offset(C) - offset(P)
-                        //   decides IntraIter vs LoopCarry.
-                        //   - Δ_global = 0 → IntraIter w/ pre_loop_init.
-                        //     Producer must fire before consumer in the
-                        //     loop body; pre-loop override guards iters
-                        //     where producer hasn't fired yet.
-                        //   - Δ_global = 1 → LoopCarry (true cross-iter).
-                        //   - else → refuse (unhandled period shape).
-                        // - Any other non-prefix-shaped result from the
-                        //   classifier → refuse (None propagates).
-                        let bc = classify_boundary_across_members(
+                        // Pre-loop (period-1) producer. Consumer's
+                        // iter-0 input reads this local directly. We
+                        // model this as a LoopCarry iff the same
+                        // consumer slot is also fed by a periodic
+                        // producer at iter 1+ (residual stream); as
+                        // a plain PreLoop otherwise (constant ref).
+                        //
+                        // Detect the paired periodic producer by
+                        // looking at iter 1 of the consumer's class.
+                        paired_periodic_for_slot(
                             self,
                             sfuf,
                             fuf,
@@ -3277,33 +3191,13 @@ impl StencilBundle {
                             &rep_claimed,
                             *id,
                             *slot,
-                            &pre_loop_set,
-                            &periodic_set,
-                        )?;
-                        match bc.periodic_producer {
-                            None => InputOrigin::PreLoop { producer_sg },
-                            Some((pc, prod_pos, _prod_slot)) => {
-                                let c_off = sched.class_offsets[consumer_class] as i64;
-                                let p_off = sched.class_offsets[pc] as i64;
-                                let delta_global = bc.delta_iter_in_class + c_off - p_off;
-                                let init_sg = bc.pre_loop_producer_sg.unwrap_or(producer_sg);
-                                if delta_global == 0 {
-                                    InputOrigin::IntraIter {
-                                        producer_class: pc,
-                                        producer_pos: prod_pos,
-                                        pre_loop_init_sg: Some(init_sg),
-                                    }
-                                } else if delta_global == 1 {
-                                    InputOrigin::LoopCarry {
-                                        producer_class: pc,
-                                        producer_pos: prod_pos,
-                                        pre_loop_init_sg: Some(init_sg),
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                        }
+                        )
+                        .map(|(pc, prod_pos, _prod_slot)| InputOrigin::LoopCarry {
+                            producer_class: pc,
+                            producer_pos: prod_pos,
+                            pre_loop_init_sg: Some(producer_sg),
+                        })
+                        .unwrap_or(InputOrigin::PreLoop { producer_sg })
                     } else if periodic_set.contains(&producer_class) {
                         // Periodic producer under shifted-offset semantics
                         // (p1). For consumer's rep (iter 0, global
@@ -3334,7 +3228,6 @@ impl StencilBundle {
                             InputOrigin::IntraIter {
                                 producer_class,
                                 producer_pos: prod_pos,
-                                pre_loop_init_sg: None,
                             }
                         } else if observed == carry_expected && carry_expected >= 0 {
                             InputOrigin::LoopCarry {
@@ -3368,209 +3261,6 @@ impl StencilBundle {
     }
 }
 
-/// Summary of a boundary input's producer across every member of
-/// the consumer class. Replaces the two-member heuristic in
-/// `paired_periodic_for_slot` with a full-member walk that catches
-/// non-uniform periodicity before it silently miscompiles.
-///
-/// - `periodic_producer`: `Some((class, pos, slot))` if every
-///   periodic member of the consumer class reads from the same
-///   periodic producer at the same Δ (`consumer_iter_in_class -
-///   producer_iter_in_class`). `None` if no periodic producer is
-///   seen, or the members disagree (different producer classes,
-///   different deltas, or mixed with pre-loop in un-prefix-shaped
-///   ways).
-/// - `delta_iter_in_class`: the uniform iter_in_class delta across
-///   the periodic members (only meaningful if
-///   `periodic_producer.is_some()`).
-/// - `pre_loop_covered_iters`: the set of consumer
-///   iter_in_class values whose boundary reads a pre-loop class.
-///   If non-empty, must form a contiguous prefix `[0..k)` of the
-///   consumer's class-local iters (the offset-gap shape — consumer
-///   fires before producer offset). Otherwise uniformity rejected.
-/// - `pre_loop_producer_sg`: the specific pre_loop SubgraphId
-///   feeding the covered iters. Must be identical across all
-///   pre-loop members (else rejected).
-#[derive(Debug, Clone)]
-struct BoundaryClassification {
-    periodic_producer: Option<(usize, u8, u8)>,
-    delta_iter_in_class: i64,
-    pre_loop_covered_iters: BTreeSet<usize>,
-    pre_loop_producer_sg: Option<SubgraphId>,
-}
-
-/// Full-member walk: for every member of `consumer_class`, locate
-/// the positional boundary input matching `rep_claimed`'s entry at
-/// (`target_id`, `target_slot`), and classify its producer.
-///
-/// Replaces `paired_periodic_for_slot`'s member[0]+member[1]-only
-/// heuristic. Silent miscompile mode: member[0] reads producer P,
-/// member[1] reads producer P too, but member[2..] read producer Q
-/// — the old walker returns P and consumers of that boundary ended
-/// up reading from the wrong class for N-2 layers. This walker
-/// enumerates all N and rejects if they disagree.
-///
-/// Correctness constraints enforced:
-/// 1. Every periodic member reads from the same periodic producer
-///    class + same (pos, slot) + same delta_iter_in_class. Mixed →
-///    `periodic_producer: None`.
-/// 2. Pre-loop readers (if any) all read the same SubgraphId. Mixed
-///    → also a refusal (returned via `None` in provenance caller).
-/// 3. Pre-loop readers form a contiguous prefix of consumer iters
-///    (offset-gap shape). Out-of-prefix pre-loop reads → rejected.
-#[allow(clippy::too_many_arguments)]
-fn classify_boundary_across_members(
-    bundle: &StencilBundle,
-    sfuf: &Assignment,
-    fuf: &Fuf,
-    consumer_class: usize,
-    rep_claimed: &[TileId],
-    target_id: TileId,
-    target_slot: u8,
-    pre_loop_set: &BTreeSet<usize>,
-    periodic_set: &BTreeSet<usize>,
-) -> Option<BoundaryClassification> {
-    let members = bundle.class_members.get(consumer_class)?;
-    if members.is_empty() {
-        return None;
-    }
-
-    // Locate target_pos in the rep's boundary ordering.
-    let target_pos = {
-        let claimed_set: BTreeSet<TileId> = rep_claimed.iter().copied().collect();
-        let mut seen: BTreeSet<(TileId, u8)> = BTreeSet::new();
-        let mut i = 0usize;
-        let mut found: Option<usize> = None;
-        'outer: for &t in rep_claimed {
-            for input in &fuf.get(t).inputs {
-                let FufInput::Tile { id, slot } = input else {
-                    continue;
-                };
-                if claimed_set.contains(id) {
-                    continue;
-                }
-                if !seen.insert((*id, *slot)) {
-                    continue;
-                }
-                if *id == target_id && *slot == target_slot {
-                    found = Some(i);
-                    break 'outer;
-                }
-                i += 1;
-            }
-        }
-        found?
-    };
-
-    // Walk each member; find its target_pos-th boundary input.
-    enum MemberProducer {
-        Periodic {
-            class: usize,
-            pos: u8,
-            slot: u8,
-            iter_in_class: usize,
-        },
-        PreLoop {
-            sg: SubgraphId,
-        },
-        Unknown,
-    }
-    let mut per_member: Vec<MemberProducer> = Vec::with_capacity(members.len());
-    for &member_sg in members {
-        let member_claimed = sfuf.tiles_in_subgraph(member_sg);
-        let claimed_set: BTreeSet<TileId> = member_claimed.iter().copied().collect();
-        let mut seen: BTreeSet<(TileId, u8)> = BTreeSet::new();
-        let mut i = 0usize;
-        let mut resolved: MemberProducer = MemberProducer::Unknown;
-        'find: for &t in &member_claimed {
-            for input in &fuf.get(t).inputs {
-                let FufInput::Tile { id, slot } = input else {
-                    continue;
-                };
-                if claimed_set.contains(id) {
-                    continue;
-                }
-                if !seen.insert((*id, *slot)) {
-                    continue;
-                }
-                if i == target_pos {
-                    let Some(prod_sg) = sfuf.subgraph_of(*id) else {
-                        break 'find;
-                    };
-                    let Some(&prod_class) = bundle.class_of.get(&prod_sg) else {
-                        break 'find;
-                    };
-                    if pre_loop_set.contains(&prod_class) {
-                        resolved = MemberProducer::PreLoop { sg: prod_sg };
-                    } else if periodic_set.contains(&prod_class) {
-                        let prod_claim = sfuf.tiles_in_subgraph(prod_sg);
-                        let Some(prod_pos_u) = prod_claim.iter().position(|&x| x == *id) else {
-                            break 'find;
-                        };
-                        let iter_in_class = bundle.iter_of(prod_sg);
-                        resolved = MemberProducer::Periodic {
-                            class: prod_class,
-                            pos: prod_pos_u as u8,
-                            slot: *slot,
-                            iter_in_class,
-                        };
-                    }
-                    break 'find;
-                }
-                i += 1;
-            }
-        }
-        per_member.push(resolved);
-    }
-
-    // Summarise. Pre-loop prefix + periodic suffix (standard
-    // residual-stream shape). Any deviation → refuse.
-    let mut pre_loop_prefix: BTreeSet<usize> = BTreeSet::new();
-    let mut pre_loop_sg: Option<SubgraphId> = None;
-    let mut periodic_info: Option<(usize, u8, u8, i64)> = None; // (class, pos, slot, delta_iter_in_class)
-    let mut saw_periodic = false;
-    for (k, mp) in per_member.iter().enumerate() {
-        match mp {
-            MemberProducer::PreLoop { sg } => {
-                if saw_periodic {
-                    return None;
-                }
-                match pre_loop_sg {
-                    None => pre_loop_sg = Some(*sg),
-                    Some(existing) if existing == *sg => {}
-                    Some(_) => return None,
-                }
-                pre_loop_prefix.insert(k);
-            }
-            MemberProducer::Periodic {
-                class,
-                pos,
-                slot,
-                iter_in_class,
-            } => {
-                saw_periodic = true;
-                let delta = k as i64 - *iter_in_class as i64;
-                match periodic_info {
-                    None => periodic_info = Some((*class, *pos, *slot, delta)),
-                    Some((c0, p0, s0, d0)) => {
-                        if c0 != *class || p0 != *pos || s0 != *slot || d0 != delta {
-                            return None;
-                        }
-                    }
-                }
-            }
-            MemberProducer::Unknown => return None,
-        }
-    }
-
-    Some(BoundaryClassification {
-        periodic_producer: periodic_info.map(|(c, p, s, _)| (c, p, s)),
-        delta_iter_in_class: periodic_info.map(|(_, _, _, d)| d).unwrap_or(0),
-        pre_loop_covered_iters: pre_loop_prefix,
-        pre_loop_producer_sg: pre_loop_sg,
-    })
-}
-
 /// Find the periodic producer class paired with a pre-loop producer
 /// for the same consumer-slot — i.e. the class that feeds the same
 /// boundary input at iter ≥ 1. This is how the residual stream's
@@ -3581,7 +3271,6 @@ fn classify_boundary_across_members(
 /// *positional* boundary-input index: the iter-1 sg's Nth boundary
 /// tile input, if it points into a periodic class with Δrepeat=1,
 /// is the carry producer.
-#[allow(dead_code)]
 fn paired_periodic_for_slot(
     bundle: &StencilBundle,
     sfuf: &Assignment,
@@ -3684,26 +3373,9 @@ enum InputOrigin {
     /// producer class rep's claim (sorted TileId order). Multi-tile
     /// claims (e.g. `FusedAddRmsNormImpl` claims `(Add, RmsNorm)` →
     /// pos 0 and 1) can export distinct outputs per position.
-    ///
-    /// `pre_loop_init_sg`:
-    /// - `None`: pure intra-iter dep. Producer fires at every
-    ///   `__repeat` the consumer fires at, so consumer's read always
-    ///   resolves to the producer's same-iter output.
-    /// - `Some(sg)`: offset-gap shape. Producer fires at
-    ///   `__repeat >= offset(producer) > offset(consumer)`, so for
-    ///   consumer's iters where producer hasn't fired yet, the
-    ///   emitter reads `sg`'s pre-loop local. Guard:
-    ///   `if __repeat < offset(producer) { pre_loop } else
-    ///   { intra_iter }`. Derived structurally via
-    ///   `classify_boundary_across_members` — when every consumer
-    ///   member reads the same periodic producer at global Δ=0 but
-    ///   the first k members read a uniform pre-loop local (because
-    ///   the periodic producer hasn't started firing yet), the
-    ///   pre-loop sg is threaded here so the emitter can guard.
     IntraIter {
         producer_class: usize,
         producer_pos: u8,
-        pre_loop_init_sg: Option<SubgraphId>,
     },
     /// Producer is periodic with a carry-1 relationship. Consumer
     /// at global __repeat = R reads producer's output at __repeat =
@@ -4884,7 +4556,6 @@ fn try_emit_collapsed_bucket(
                 InputOrigin::IntraIter {
                     producer_class,
                     producer_pos,
-                    ..
                 }
                 | InputOrigin::LoopCarry {
                     producer_class,
@@ -5135,7 +4806,6 @@ fn try_emit_collapsed_bucket(
             if let InputOrigin::IntraIter {
                 producer_class,
                 producer_pos,
-                ..
             } = &s.origin
             {
                 aliased_intraiter_exports.insert((*producer_class, *producer_pos, s.producer_slot));
@@ -5336,7 +5006,6 @@ fn try_emit_collapsed_bucket(
             ci,
             returned,
             stencil,
-            sched,
             fuf,
             sfuf,
             program,
@@ -5648,7 +5317,6 @@ fn emit_fragment_call_expr(
     class_inputs: &ClassInputs,
     returned_exports: &[(u8, u8)],
     stencil: &StencilBundle,
-    sched: &ClassSchedule,
     fuf: &Fuf,
     sfuf: &Assignment,
     program: &Program,
@@ -5678,62 +5346,44 @@ fn emit_fragment_call_expr(
     // extern); the fragment signature omits the corresponding
     // `input_i` param. The filter must apply symmetrically to
     // `class_inputs.slots` (below) so provenance stays aligned.
-    //
-    // The provenance `slot.origin` is the AUTHORITATIVE producer
-    // identity — it comes from the full-member classifier, which
-    // correctly identifies the periodic producer even when the REP
-    // tile's sg is in a pre-loop class (offset-gap shapes like the
-    // layer-0 QKV / c4 pattern in ROPE_ONLY). Using the origin here
-    // matches what `referenced_exports` + `side_effect_exports`
-    // were keyed on; using the rep tile's sg would miss the classifier's
-    // offset-gap resolution and leak side-effect slots into the IntraIter
-    // check downstream.
-    let slot_is_side_effect = |s: &InputSlot| -> bool {
-        match &s.origin {
-            InputOrigin::IntraIter {
-                producer_class,
-                producer_pos,
-                ..
-            }
-            | InputOrigin::LoopCarry {
-                producer_class,
-                producer_pos,
-                ..
-            } => side_effect_exports.contains(&(*producer_class, *producer_pos, s.producer_slot)),
-            InputOrigin::PreLoop { .. } => false,
-        }
+    let is_side_effect_boundary = |id: TileId, slot: u8| -> bool {
+        let Some(producer_sg) = sfuf.subgraph_of(id) else {
+            return false;
+        };
+        let Some(&producer_class) = stencil.class_of.get(&producer_sg) else {
+            return false;
+        };
+        let prod_claim = sfuf.tiles_in_subgraph(producer_sg);
+        let Some(producer_pos) = prod_claim.iter().position(|&x| x == id) else {
+            return false;
+        };
+        side_effect_exports.contains(&(producer_class, producer_pos as u8, slot))
     };
 
     // Boundary tile-input ordering must match `class_input_provenance`'s
     // dedup order so slot N in `class_inputs.slots` aligns with the
-    // Nth `input_i` fragment param. Apply the provenance-driven
-    // side-effect filter in lockstep — walk rep boundary inputs and
-    // drop the positional index iff the corresponding provenance
-    // slot is a side-effect.
+    // Nth `input_i` fragment param.
     let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
     let mut seen: HashSet<(TileId, u8)> = HashSet::new();
-    let mut pos_idx = 0usize;
     for &t in &claimed {
         for input in &fuf.get(t).inputs {
             if let FufInput::Tile { id, slot } = input
                 && !claimed_set.contains(id)
                 && seen.insert((*id, *slot))
+                && !is_side_effect_boundary(*id, *slot)
             {
-                let is_se = class_inputs
-                    .slots
-                    .get(pos_idx)
-                    .is_some_and(slot_is_side_effect);
-                if !is_se {
-                    tile_params_ordered.push((*id, *slot));
-                }
-                pos_idx += 1;
+                tile_params_ordered.push((*id, *slot));
             }
         }
     }
+    // Symmetric 5m filter on provenance slots — drop entries whose
+    // producer export is a side-effect. Must match the filter applied
+    // to `tile_params_ordered` above so positional alignment is
+    // preserved.
     let filtered_input_slots: Vec<&InputSlot> = class_inputs
         .slots
         .iter()
-        .filter(|s| !slot_is_side_effect(s))
+        .filter(|s| !is_side_effect_boundary(s.producer_tile, s.producer_slot))
         .collect();
     if tile_params_ordered.len() != filtered_input_slots.len() {
         return Err(format!(
@@ -5895,7 +5545,6 @@ fn emit_fragment_call_expr(
             InputOrigin::IntraIter {
                 producer_class,
                 producer_pos,
-                pre_loop_init_sg,
             } => {
                 // Verify the producer class actually returns this
                 // export (collected into class_returned_exports).
@@ -5907,42 +5556,10 @@ fn emit_fragment_call_expr(
                     ));
                 }
                 let c_out = class_out_ident(*producer_class, *producer_pos, slot.producer_slot);
-                let intra_read = if short_classes.contains(producer_class) {
+                if short_classes.contains(producer_class) {
                     quote! { (*#c_out.as_ref().expect("short-class producer")).as_view() }
                 } else {
                     quote! { (*#c_out).as_view() }
-                };
-                // Offset-gap shape: producer's offset > consumer's
-                // offset, so producer hasn't fired for the first
-                // `offset(producer)` iters. Those iters read the
-                // pre-loop producer's local; later iters read
-                // intra-iter. Emitted as a runtime guard.
-                match pre_loop_init_sg {
-                    None => intra_read,
-                    Some(sg) => {
-                        let producer_offset = sched.class_offsets[*producer_class];
-                        let off_lit = proc_macro2::Literal::usize_unsuffixed(producer_offset);
-                        let init_tiles = sfuf.tiles_in_subgraph(*sg);
-                        let init_tile = *init_tiles.last().ok_or_else(|| {
-                            format!("IntraIter pre_loop_init_sg {sg:?} has no tiles")
-                        })?;
-                        let init_local = locals
-                            .get(&(init_tile, slot.producer_slot))
-                            .cloned()
-                            .ok_or_else(|| {
-                                format!(
-                                    "IntraIter pre_loop_init local for ({init_tile:?}, {}) missing",
-                                    slot.producer_slot
-                                )
-                            })?;
-                        quote! {
-                            if __repeat < #off_lit {
-                                (*#init_local).as_view()
-                            } else {
-                                #intra_read
-                            }
-                        }
-                    }
                 }
             }
             InputOrigin::LoopCarry {
@@ -6139,19 +5756,8 @@ fn emit_aliased_class_inline(
             InputOrigin::IntraIter {
                 producer_class,
                 producer_pos,
-                pre_loop_init_sg,
             } => {
                 let c_out = class_out_ident(*producer_class, *producer_pos, slot.producer_slot);
-                // For the offset-gap shape, the aliased class must
-                // have offset ≥ offset(producer) — else consumer
-                // would fire with producer not yet having fired,
-                // and no intra-iter value exists at that iter. The
-                // class schedule's topo-sort (producer before
-                // consumer) and offset alignment together guarantee
-                // this. When pre_loop_init_sg is Some here, it
-                // means the outer aliased-class's guard already
-                // covers the offset gap; we can read unconditionally.
-                let _ = pre_loop_init_sg;
                 if short_classes.contains(producer_class) {
                     // Short producer: `__cN_out: Option<_>`. Unwrap
                     // into a TensorView so emit_call's `*#ident`
@@ -7321,18 +6927,13 @@ mod tests {
             out
         }
 
-        /// Post-H1+H2 (2026-04-23): the 5i.4 cascade shape is
-        /// structurally dissolved. With the full-member-walk
-        /// classifier, reads from aliased intermediates that used
-        /// to be tagged as LoopCarry Δ=1 (e.g. c2 reading c8's
-        /// rmsnorm_out) are now IntraIter same-iter under
-        /// offset-aware classification. The cascade no longer
-        /// exists, so this test asserts its ABSENCE (flipping from
-        /// the pre-H1+H2 positive assertion). If this ever starts
-        /// returning non-empty, either the classifier regressed to
-        /// unconditionally wrapping as LoopCarry, or a new
-        /// aliased-class shape surfaced that actually IS a true
-        /// cross-iter carry producer (would need re-scoping).
+        /// The FAR decoder exposes at least one
+        /// (producer_class, producer_pos, producer_slot) that's a
+        /// carry producer but NOT an alias-through-carry —
+        /// precisely the (8,1,0)-style cascade the 5i.4 guard
+        /// catches. If this ever returns empty, either the
+        /// cascade is fixed (5i.5 landed) or the provenance walk
+        /// stopped tagging LoopCarry for aliased intermediates.
         #[test]
         fn far_decoder_has_cascade_carry_producer() {
             let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
@@ -7367,13 +6968,10 @@ mod tests {
                 }
             }
             assert!(
-                cascade_keys.is_empty(),
-                "FAR decoder cascade shape should be dissolved by the \
-                 full-member-walk classifier (H1+H2 fix). Remaining \
-                 cascade keys: {cascade_keys:?}. If this fires, either \
-                 the classifier regressed to unconditional LoopCarry \
-                 wrapping or a genuinely-new cross-iter aliased-carry \
-                 shape appeared that needs explicit handling."
+                !cascade_keys.is_empty(),
+                "FAR decoder should expose the 5i.4 cascade shape \
+                 (aliased class's export is a LoopCarry producer but not \
+                 alias-through-carry); cascade_keys={cascade_keys:?}"
             );
         }
 
@@ -7748,18 +7346,11 @@ mod tests {
             let prov = stencil
                 .class_input_provenance(&sched, &s.fuf, &s.sfuf)
                 .expect("ok");
-            // Either an `IntraIter { pre_loop_init_sg: Some(_) }`
-            // (offset-gap same-iter read, post-H1+H2) or a
-            // `LoopCarry { pre_loop_init_sg: Some(_) }` (true
-            // cross-iter carry with an init).
             let has_preloop_init = prov.iter().any(|ci| {
                 ci.slots.iter().any(|s| {
                     matches!(
                         &s.origin,
-                        InputOrigin::IntraIter {
-                            pre_loop_init_sg: Some(_),
-                            ..
-                        } | InputOrigin::LoopCarry {
+                        InputOrigin::LoopCarry {
                             pre_loop_init_sg: Some(_),
                             ..
                         }
@@ -7768,7 +7359,7 @@ mod tests {
             });
             assert!(
                 has_preloop_init,
-                "expected at least one boundary with a pre-loop init"
+                "expected at least one carry with pre-loop init"
             );
         }
 
@@ -8767,77 +8358,6 @@ mod tests {
             );
         }
 
-        /// Diagnostic: dump every __carry_* ident occurrence.
-        #[test]
-        #[ignore = "diagnostic"]
-        fn dump_far_decoder_carries() {
-            let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
-            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
-            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
-            let prov = stencil.class_input_provenance(&sched, &s.fuf, &s.sfuf);
-            let mut lib_frag = FragmentLibrary::default();
-            let wl = crate::emit::WeightLayout::new();
-            let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
-            let tokens = try_emit_collapsed_bucket(
-                &stencil,
-                &sched,
-                prov.as_deref(),
-                &s.fuf,
-                &s.sfuf,
-                &s.program,
-                &s.model,
-                &s.lib,
-                wp,
-                &mut lib_frag,
-                &wl,
-            )
-            .expect("emit");
-            let text = tokens.to_string();
-            let toks: Vec<&str> = text.split_whitespace().collect();
-            for (i, w) in toks.iter().enumerate() {
-                if w.contains("__carry_c") {
-                    let lo = i.saturating_sub(4);
-                    let hi = (i + 9).min(toks.len());
-                    eprintln!("@{i}: {}", toks[lo..hi].join(" "));
-                }
-            }
-        }
-
-        /// Diagnostic: ROPE_ONLY classes + provenance.
-        #[test]
-        #[ignore = "diagnostic"]
-        fn dump_rope_only() {
-            let s = fixture::solve_body(fixture::ROPE_ONLY_BODY);
-            let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
-            let sched = stencil.schedule(&s.fuf, &s.sfuf, &s.lib);
-            let prov = stencil
-                .class_input_provenance(&sched, &s.fuf, &s.sfuf)
-                .expect("prov");
-            for &c in &sched.periodic {
-                let rep = stencil.class_members[c][0];
-                let claimed = s.sfuf.tiles_in_subgraph(rep);
-                let ops: Vec<_> = claimed
-                    .iter()
-                    .map(|t| format!("{:?}", s.fuf.get(*t).op))
-                    .collect();
-                eprintln!(
-                    "c{c}: period={} offset={} ops={:?}",
-                    stencil.class_members[c].len(),
-                    sched.class_offsets[c],
-                    ops
-                );
-            }
-            for ci in &prov {
-                eprintln!("c{}:", ci.consumer_class);
-                for slot in &ci.slots {
-                    eprintln!(
-                        "  (tile={:?}, slot={}) origin={:?}",
-                        slot.producer_tile, slot.producer_slot, slot.origin
-                    );
-                }
-            }
-        }
-
         /// Off-by-one-layer correctness bug pin (2026-04-23).
         ///
         /// **Runtime symptom**: `vllm chat` on llama-3.2-3b under
@@ -8878,12 +8398,10 @@ mod tests {
         /// ordering is enforced, (d) emitter guards the read as
         /// `if __repeat < offset { pre_loop } else { intra_iter }`.
         ///
-        /// Green as of the H1+H2 fix: `class_input_provenance`
-        /// replaces the two-member heuristic with a full-member
-        /// walk (`classify_boundary_across_members`) and
-        /// decides IntraIter vs LoopCarry based on the computed
-        /// Δ_global = delta_iter_in_class + offset(C) - offset(P).
+        /// This test is **#[ignore]-red** until the fix lands.
+        /// Remove the ignore when it should pass.
         #[test]
+        #[ignore = "off-by-one-layer fix not yet landed — documented in test body"]
         fn far_decoder_qkv_class_reads_far_same_iter() {
             let s = fixture::solve_body(fixture::FAR_DECODER_BODY);
             let stencil = StencilBundle::compute(&s.fuf, &s.sfuf);
@@ -9037,19 +8555,18 @@ mod tests {
             // has a subsequent assignment" — vacuously true when
             // there are none.
 
-            // For each hoist, look for an assignment `<ident> = `
-            // anywhere in the stream. The hoist site uses
-            // `let mut <ident> : Option < ... > = None;` — the
-            // ident is immediately followed by `:`, NOT `= `, so
-            // the hoist itself doesn't match `<ident> = `. Thus a
-            // single match of `<ident> = ` means exactly one
-            // assignment exists (the update); zero matches means
-            // orphan.
+            // For each hoist, look for an assignment `#ident =`
+            // anywhere else in the stream. If none exists, it's a
+            // runtime panic waiting to happen.
             let orphans: Vec<String> = hoist_markers
                 .iter()
                 .filter(|ident| {
+                    // Assignment signature in the space-separated
+                    // stream: `<ident> = `. Hoist site is already
+                    // matched by `let mut <ident> = None`, so we look
+                    // for a second `<ident> =` occurrence.
                     let pattern = format!("{ident} = ");
-                    text.matches(&pattern).count() < 1
+                    text.matches(&pattern).count() < 2
                 })
                 .cloned()
                 .collect();

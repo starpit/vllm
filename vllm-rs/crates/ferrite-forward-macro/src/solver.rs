@@ -192,6 +192,7 @@ pub enum SolveError {
         tile: TileId,
         op: OpKind,
         point: WorkloadPoint,
+        cublas_free_mode: bool,
     },
     /// An Impl's cost function returned None despite having a
     /// match and passing applicability filters. Means either (a)
@@ -208,12 +209,56 @@ pub enum SolveError {
 impl std::fmt::Display for SolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnclaimedTile { tile, op, point } => write!(
-                f,
-                "no Impl in the library matched tile {} op {:?} at \
-                 num_tokens={} sk_bucket={}",
-                tile.0, op, point.num_tokens, point.sk_bucket
-            ),
+            Self::UnclaimedTile { tile, op, point, cublas_free_mode } => {
+                write!(
+                    f,
+                    "no Impl in the library matched tile {} op {:?} at \
+                     num_tokens={} sk_bucket={}",
+                    tile.0, op, point.num_tokens, point.sk_bucket
+                )?;
+                
+                if *cublas_free_mode {
+                    write!(
+                        f,
+                        "\n\nRunning in cublas-free mode (cublas_free = true). "
+                    )?;
+                    
+                    match op {
+                        OpKind::Gemm => {
+                            write!(
+                                f,
+                                "Dense GEMM tile has no CUTLASS implementation for this shape/target.\n\
+                                 Possible causes:\n\
+                                 - Missing CUTLASS tile coverage in target profile CSV\n\
+                                 - Unsupported GEMM shape (M/N/K dimensions)\n\
+                                 - Target architecture lacks required CUTLASS kernels\n\
+                                 Suggestion: Check target profile has cutlass_gemm/cutlass_gemv/cutlass_gemm_splitk rows, \
+                                 or set cublas_free = false to allow cuBLAS fallback"
+                            )?;
+                        }
+                        OpKind::BiasAdd => {
+                            write!(
+                                f,
+                                "BiasAdd tile unclaimed — likely a (Gemm, BiasAdd) pair with no fused implementation.\n\
+                                 Possible causes:\n\
+                                 - Missing cutlass_fused_gemm_bias in target profile\n\
+                                 - CUTLASS GEMM claimed the Gemm but left BiasAdd orphaned\n\
+                                 Suggestion: Ensure target profile has cutlass_fused_gemm_bias row, \
+                                 or set cublas_free = false to allow cuBLAS gemm_bias fallback"
+                            )?;
+                        }
+                        _ => {
+                            write!(
+                                f,
+                                "This operation has no non-cuBLAS implementation.\n\
+                                 Suggestion: Set cublas_free = false to allow cuBLAS fallback, \
+                                 or file an issue if this operation should have CUTLASS coverage"
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            }
             Self::UnreachableCost {
                 tile,
                 op,
@@ -236,6 +281,9 @@ impl std::error::Error for SolveError {}
 /// `bounds` supplies every symbolic bound except `num_tokens` and
 /// `sk_bucket`; the solver overwrites both per point. Empty
 /// `sk_points` defaults to `&[0]` — the 1-D legacy sweep.
+///
+/// `cublas_free_mode`: when true, error messages include actionable
+/// suggestions for missing CUTLASS coverage.
 pub fn solve(
     fuf: &Fuf,
     lib: &ImplementationLibrary,
@@ -244,6 +292,7 @@ pub fn solve(
     bounds: &BTreeMap<String, u64>,
     num_tokens_points: &[u64],
     sk_points: &[u64],
+    cublas_free_mode: bool,
 ) -> Result<WorkloadAssignments, SolveError> {
     use rayon::prelude::*;
 
@@ -328,6 +377,7 @@ pub fn solve(
                 &scratch,
                 wp,
                 &match_cache,
+                cublas_free_mode,
                 &ns_phase1,
                 &ns_phase2,
                 &ns_phase3,
@@ -369,6 +419,7 @@ fn solve_one(
     bounds: &BTreeMap<String, u64>,
     point: WorkloadPoint,
     match_cache: &[Vec<(ImplId, MatchInfo)>],
+    cublas_free_mode: bool,
     ns_phase1: &std::sync::atomic::AtomicU64,
     ns_phase2: &std::sync::atomic::AtomicU64,
     ns_phase3: &std::sync::atomic::AtomicU64,
@@ -589,6 +640,7 @@ fn solve_one(
                 tile: fuf.nodes[i].id,
                 op: fuf.nodes[i].op,
                 point,
+                cublas_free_mode,
             });
         }
         // Every tile has candidates but no feasible terminal state
@@ -597,6 +649,7 @@ fn solve_one(
             tile: fuf.nodes[0].id,
             op: fuf.nodes[0].op,
             point,
+            cublas_free_mode,
         });
     };
     ns_phase3.fetch_add(t_p3.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -970,7 +1023,7 @@ mod tests {
         let (fuf, inferred) = build(LLAMA_BODY, &params);
         let lib = starter_library();
         let target = l4_target();
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[], false).unwrap();
         let sfuf = workloads.get_nt(1).unwrap();
         // First QKV-fused subgraph.
         let qkv_sg = sfuf
@@ -1145,7 +1198,7 @@ mod tests {
         let target = l4_target();
         let bounds = params.bounds.clone();
 
-        let workloads = solve(&fuf, &lib, &target, &inferred, &bounds, &[1, 4096], &[]).unwrap();
+        let workloads = solve(&fuf, &lib, &target, &inferred, &bounds, &[1, 4096], &[], false).unwrap();
         let decode_us = workloads.get_nt(1).unwrap().predicted_us;
         let prefill_us = workloads.get_nt(4096).unwrap().predicted_us;
         assert!(
@@ -1166,7 +1219,7 @@ mod tests {
         let target = l4_target();
         let bounds = params.bounds.clone();
 
-        let err = solve(&fuf, &lib, &target, &inferred, &bounds, &[1], &[]).unwrap_err();
+        let err = solve(&fuf, &lib, &target, &inferred, &bounds, &[1], &[], false).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1255,7 +1308,7 @@ mod tests {
             multi_tile: None,
         }));
 
-        let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap_err();
+        let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[], false).unwrap_err();
         assert!(
             matches!(err, SolveError::UnreachableCost { .. }),
             "expected UnreachableCost, got {err:?}",
@@ -1278,11 +1331,11 @@ mod tests {
         }));
 
         // At M=1 it's fine.
-        let ok = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let ok = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[], false).unwrap();
         assert!(ok.get_nt(1).unwrap().is_cover_complete(fuf.len()));
 
         // At M=4096 it's excluded; no other impl; UnclaimedTile.
-        let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[4096], &[]).unwrap_err();
+        let err = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[4096], &[], false).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1333,7 +1386,7 @@ mod tests {
             multi_tile: Some(matches_double_add),
         }));
 
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[], false).unwrap();
         let sfuf = workloads.get_nt(1).unwrap();
 
         // 1 embed + 4 adds; fused double-add claims pairs.
@@ -1547,7 +1600,7 @@ mod tests {
         let target = l4_target();
         let bounds = params.bounds.clone();
 
-        let workloads = solve(&fuf, &lib, &target, &inferred, &bounds, &[], &[]).unwrap();
+        let workloads = solve(&fuf, &lib, &target, &inferred, &bounds, &[], &[], false).unwrap();
         assert!(workloads.per_workload.is_empty());
     }
 

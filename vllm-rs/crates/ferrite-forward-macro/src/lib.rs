@@ -469,6 +469,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             &model.bounds,
             &args.workloads,
             &args.sk_buckets,
+            args.cublas_free,
         )
         .map_err(|e| syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem)))?;
         let d_solve = t_solve.elapsed();

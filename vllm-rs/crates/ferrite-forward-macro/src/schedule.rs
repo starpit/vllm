@@ -221,7 +221,7 @@ mod tests {
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
         let target = l4_target();
-        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let workloads = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[], false).unwrap();
         let sfuf = workloads.get_nt(1).unwrap().clone();
         (fuf, sfuf)
     }

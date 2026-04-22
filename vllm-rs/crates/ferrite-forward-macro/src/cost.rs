@@ -192,7 +192,7 @@ mod tests {
         let lib = starter_library();
         let target = l4_target();
 
-        let sfufs = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let sfufs = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[], false).unwrap();
         let sfuf = sfufs.get_nt(1).unwrap();
         let loops = schedule_workloads(&fuf, &sfufs);
         let wp1 = crate::solver::WorkloadPoint::num_tokens_only(1);

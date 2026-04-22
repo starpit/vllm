@@ -863,6 +863,7 @@ fn emit_layernorm(ctx: &EmitCtx) -> TokenStream {
     }
 }
 
+#[cfg(feature = "cublas")]
 fn emit_gemm(ctx: &EmitCtx) -> TokenStream {
     // `gemm()` in the DSL is strict matmul. Bias is a separate
     // `bias_add` tile and is claimed by its own Impl (e.g.
@@ -1123,6 +1124,7 @@ trivial_impl!(
     emit_layernorm,
     false
 );
+#[cfg(feature = "cublas")]
 trivial_impl!(
     GemmRefImpl,
     OpKind::Gemm,
@@ -1325,6 +1327,7 @@ pub fn starter_library_with_options(options: StarterLibraryOptions) -> Implement
     lib.push(Box::new(RmsNormRefImpl));
     lib.push(Box::new(LayerNormRefImpl));
     if options.allow_cublas_fallbacks {
+        #[cfg(feature = "cublas")]
         lib.push(Box::new(GemmRefImpl));
     }
     lib.push(Box::new(AttentionViaCacheImpl));

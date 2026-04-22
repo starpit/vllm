@@ -2005,6 +2005,7 @@ name = "ferrite-forward-macro"
 version = "0.1.0"
 dependencies = [
  "ferrite-stencil-ir",
+ "paste",
  "prettyplease",
  "proc-macro2",
  "quote",

@@ -9069,5 +9069,290 @@ mod tests {
                 assert!(per.is_disjoint(&post), "periodic ∩ post_loop non-empty");
             }
         }
+
+        // ──────────────────────────────────────────────────────────
+        // PER-TUPLE EXPANSION — one #[test] per (class, boundary,
+        // member) triple, covering the FAR_DECODER shape
+        // (llama-3.2-1b, 16 layers).
+        //
+        // The `per_triple!` macro emits a `#[test]` for every
+        // (class, boundary_position, member_k) triple in a given
+        // class. Each test asserts the compiler's provenance
+        // classification for that ONE triple matches ground truth
+        // derived from the unrolled FUF. When one fails, its name
+        // pinpoints the exact (class, boundary, member) that broke.
+        //
+        // The full FAR_DECODER sweep generates ~550 tests across:
+        // - origin_producer_class_matches  (one per triple)
+        // - origin_delta_global_matches    (one per triple)
+        // - member_producer_is_consistent  (one per triple)
+        // ──────────────────────────────────────────────────────────
+        mod per_triple {
+            use super::*;
+            use super::truth::*;
+
+            /// For (class, boundary, member), assert compiler's
+            /// provenance-reported producer_class matches ground
+            /// truth's producer_class (derived from the unrolled
+            /// DAG for THIS specific member — not sampled).
+            fn check_producer_class(
+                class: usize,
+                boundary: usize,
+                member_k: usize,
+            ) {
+                let t = load();
+                let prov = t
+                    .stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
+                    .expect("provenance");
+                let ci = prov
+                    .iter()
+                    .find(|c| c.consumer_class == class)
+                    .expect("consumer class present");
+                let slot = ci
+                    .slots
+                    .get(boundary)
+                    .expect("boundary position in range");
+                let gt = boundary_truth(&t, class, member_k, boundary)
+                    .expect("ground truth for member");
+                let is_preloop = t.sched.pre_loop.contains(&gt.producer_class);
+                match (&slot.origin, is_preloop) {
+                    (InputOrigin::PreLoop { producer_sg }, true) => {
+                        assert_eq!(
+                            *producer_sg, gt.producer_sg,
+                            "c{class} b[{boundary}] m[{member_k}]: PreLoop sg mismatch",
+                        );
+                    }
+                    (InputOrigin::IntraIter { producer_class, .. }, false)
+                    | (InputOrigin::LoopCarry { producer_class, .. }, false) => {
+                        assert_eq!(
+                            *producer_class, gt.producer_class,
+                            "c{class} b[{boundary}] m[{member_k}]: compiler \
+                             said producer_class={pc}, ground truth \
+                             producer_class={gt_pc}",
+                            pc = producer_class,
+                            gt_pc = gt.producer_class,
+                        );
+                    }
+                    (InputOrigin::IntraIter { producer_class, .. }, true) => {
+                        // Ground truth says pre_loop at this member but
+                        // compiler emits IntraIter — a period-mismatch
+                        // read where iter 0 reads pre_loop and
+                        // iter >= offset(producer) reads periodic. The
+                        // current IntraIter variant has no pre_loop_init
+                        // field, so this is definitively wrong —
+                        // emitter will read the periodic producer's
+                        // output at iter 0 when producer hasn't fired.
+                        panic!(
+                            "c{class} b[{boundary}] m[{member_k}]: ground truth \
+                             is PreLoop (c{gt_pc}), compiler emits \
+                             IntraIter({pc}). Offset-gap shape not tracked.",
+                            pc = producer_class,
+                            gt_pc = gt.producer_class,
+                        );
+                    }
+                    (InputOrigin::LoopCarry { producer_class, pre_loop_init_sg, .. }, true) => {
+                        // Ground truth says pre_loop at this member and
+                        // compiler emits LoopCarry. Valid iff
+                        // pre_loop_init_sg covers iter 0 via a real
+                        // pre-loop source.
+                        assert!(
+                            pre_loop_init_sg.is_some(),
+                            "c{class} b[{boundary}] m[{member_k}]: ground truth \
+                             is PreLoop (c{gt_pc}), compiler emits LoopCarry({pc}) \
+                             without pre_loop_init_sg.",
+                            pc = producer_class,
+                            gt_pc = gt.producer_class,
+                        );
+                    }
+                    (InputOrigin::PreLoop { .. }, false) => {
+                        panic!(
+                            "c{class} b[{boundary}] m[{member_k}]: ground truth \
+                             is periodic (c{gt_pc}), compiler said PreLoop",
+                            gt_pc = gt.producer_class,
+                        );
+                    }
+                }
+            }
+
+            /// For (class, boundary, member), assert compiler's
+            /// classification implies a Δ_global consistent with
+            /// ground truth. IntraIter ⇒ Δ_global = 0,
+            /// LoopCarry ⇒ Δ_global = 1.
+            fn check_delta_global(
+                class: usize,
+                boundary: usize,
+                member_k: usize,
+            ) {
+                let t = load();
+                let prov = t
+                    .stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
+                    .expect("provenance");
+                let ci = prov
+                    .iter()
+                    .find(|c| c.consumer_class == class)
+                    .expect("consumer class present");
+                let slot = ci.slots.get(boundary).expect("boundary in range");
+                let expected_delta = match &slot.origin {
+                    InputOrigin::IntraIter { .. } => Some(0i64),
+                    InputOrigin::LoopCarry { .. } => Some(1i64),
+                    InputOrigin::PreLoop { .. } => None,
+                };
+                let Some(expected) = expected_delta else { return };
+                let gt = boundary_truth(&t, class, member_k, boundary)
+                    .expect("ground truth");
+                if t.sched.pre_loop.contains(&gt.producer_class) {
+                    return;
+                }
+                let cgi = consumer_global_iter(&t, class, member_k);
+                let actual = cgi - gt.producer_global_iter;
+                assert_eq!(
+                    actual, expected,
+                    "c{class} b[{boundary}] m[{member_k}]: ground truth \
+                     Δ_global={actual}, compiler's variant requires {expected}",
+                );
+            }
+
+            /// For (class, boundary, member), assert this member's
+            /// ground-truth producer agrees with member[0]'s
+            /// producer (either both pre_loop, or same periodic
+            /// class, or the full offset-gap partition is covered).
+            /// Catches per-class over-collapse at member granularity.
+            fn check_member_consistent_with_rep(
+                class: usize,
+                boundary: usize,
+                member_k: usize,
+            ) {
+                let t = load();
+                let gt_rep = boundary_truth(&t, class, 0, boundary)
+                    .expect("ground truth for rep");
+                let gt_k = boundary_truth(&t, class, member_k, boundary)
+                    .expect("ground truth for member");
+                let rep_is_preloop = t.sched.pre_loop.contains(&gt_rep.producer_class);
+                let k_is_preloop = t.sched.pre_loop.contains(&gt_k.producer_class);
+                match (rep_is_preloop, k_is_preloop) {
+                    (true, true) => {
+                        // Both pre_loop — must be same sg.
+                        assert_eq!(
+                            gt_rep.producer_sg, gt_k.producer_sg,
+                            "c{class} b[{boundary}] m[{member_k}]: rep reads \
+                             pre_loop sg {rep_sg:?}, member reads {k_sg:?}",
+                            rep_sg = gt_rep.producer_sg,
+                            k_sg = gt_k.producer_sg,
+                        );
+                    }
+                    (false, false) => {
+                        // Both periodic — producer_class must match.
+                        assert_eq!(
+                            gt_rep.producer_class, gt_k.producer_class,
+                            "c{class} b[{boundary}] m[{member_k}]: rep reads \
+                             periodic c{rep_pc}, member reads c{k_pc}. \
+                             Class over-collapsed (different upstream \
+                             producer classes across members).",
+                            rep_pc = gt_rep.producer_class,
+                            k_pc = gt_k.producer_class,
+                        );
+                    }
+                    // Mixed pre/periodic = valid ONLY for offset-gap
+                    // shape (rep at offset 0 reads pre_loop,
+                    // members ≥ offset(P) read P periodic).
+                    (true, false) | (false, true) => {}
+                }
+            }
+
+            // ──────────────────────────────────────────────────
+            // Macro: generate 3 per-triple tests (producer class,
+            // delta global, member↔rep consistency). Test names
+            // encode (class, boundary, member) so failures point
+            // straight at the bad triple.
+            // ──────────────────────────────────────────────────
+            macro_rules! triple_tests {
+                ($mod:ident, class=$c:expr, boundary=$b:expr,
+                 members=[$($m:expr),* $(,)?]) => {
+                    mod $mod {
+                        use super::*;
+                        $(
+                            paste::paste! {
+                                #[test]
+                                fn [<producer_class_m $m>]() {
+                                    check_producer_class($c, $b, $m);
+                                }
+                                #[test]
+                                fn [<delta_global_m $m>]() {
+                                    check_delta_global($c, $b, $m);
+                                }
+                                #[test]
+                                fn [<member_consistent_m $m>]() {
+                                    check_member_consistent_with_rep($c, $b, $m);
+                                }
+                            }
+                        )*
+                    }
+                };
+            }
+
+            // ──────────────────────────────────────────────────
+            // FAR_DECODER (llama-3.2-1b, 16 layers) tuple sweep.
+            //
+            // Class shapes (from dump_far_decoder_provenance):
+            //   c2 (QKV+rope, period=16, offset=0): 1 boundary
+            //   c3 (Attention, period=16, offset=0): 3 boundaries (q,k,v)
+            //   c4 (o_proj, period=16, offset=0): 1 boundary
+            //   c5 (post-attn FAR peel, period=1, offset=0): 2 boundaries
+            //   c6 (MLP, period=16, offset=0): 1 boundary
+            //   c7 (MLP-down, period=16, offset=0): 1 boundary
+            //   c8 (pre-attn FAR, period=15, offset=1): 2 boundaries
+            //   c9 (post-attn FAR, period=15, offset=1): 2 boundaries
+            //   c10 (final FAR peel, period=1, offset=15): 2 boundaries
+            //
+            // Total triples enumerated below: ~176.
+            // Per-triple tests emitted: 176 × 3 = ~528.
+            // ──────────────────────────────────────────────────
+
+            // c2 — QKV+rope
+            triple_tests!(c2_b0, class=2, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+            // c3 — Attention (3 boundaries: q, k, v)
+            triple_tests!(c3_b0, class=3, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+            triple_tests!(c3_b1, class=3, boundary=1,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+            triple_tests!(c3_b2, class=3, boundary=2,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+            // c4 — o_proj
+            triple_tests!(c4_b0, class=4, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+            // c5 — post-attn FAR peel at iter 0 (period=1)
+            triple_tests!(c5_b0, class=5, boundary=0, members=[0]);
+            triple_tests!(c5_b1, class=5, boundary=1, members=[0]);
+
+            // c6 — MLP
+            triple_tests!(c6_b0, class=6, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+            // c7 — MLP-down
+            triple_tests!(c7_b0, class=7, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+            // c8 — pre-attn FAR (period=15, fires at __repeat 1..15)
+            triple_tests!(c8_b0, class=8, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+            triple_tests!(c8_b1, class=8, boundary=1,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+
+            // c9 — post-attn FAR (period=15)
+            triple_tests!(c9_b0, class=9, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+            triple_tests!(c9_b1, class=9, boundary=1,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+
+            // c10 — final FAR peel at iter 15 (period=1)
+            triple_tests!(c10_b0, class=10, boundary=0, members=[0]);
+            triple_tests!(c10_b1, class=10, boundary=1, members=[0]);
+        }
     }
 }

@@ -19,3 +19,4 @@ smallvec = { workspace = true }
 
 [dev-dependencies]
 trybuild = "1"
+paste = "1"

@@ -838,6 +838,104 @@ pub(crate) fn partition_schedule(
 }
 
 // ─────────────────────────────────────────────────────────────────
+// StencilPipeline — one bundle the emitter consumes as its sole
+// source of truth.
+//
+// The rewrite's step 6 replaces `class_input_provenance` (per-rep,
+// `InputOrigin`-typed, heuristic) + `ClassSchedule` (offset-sort
+// partition) with two lookups off this bundle:
+//
+//   - `boundary_plan(class, bp)` → the full ReadPlan for a class's
+//     boundary — used to emit region-guarded reads.
+//   - `target_for(class, bp, member_k)` → the DepTarget for one
+//     member's read — used to emit one fragment call-site's
+//     argument list.
+//
+// The bundle owns all four stages so downstream callers borrow
+// selectively. No emitter changes land in the commit that
+// introduces this type; the category 17 invariants prove the API
+// is TOTAL over the queries the emitter will make before the
+// emission rewire starts.
+// ─────────────────────────────────────────────────────────────────
+
+/// All four stages of the pipeline bundled for one fixture: edge
+/// enumeration, domain, topological schedule, partition, and the
+/// per-boundary ReadPlan map.
+///
+/// Built from `(fuf, sfuf, class_of, class_members, class_offsets)`
+/// via [`StencilPipeline::build`]. Returns `Err(ScheduleCycle)` iff
+/// the Δ_global=0 edge sub-graph has a cycle — the caller surfaces
+/// this as a structural refusal rather than silently emitting a
+/// partial order.
+#[derive(Debug, Clone)]
+pub(crate) struct StencilPipeline {
+    pub edges: Vec<BoundaryEdge>,
+    pub domain: ClassDomain,
+    pub schedule: Schedule,
+    pub partition: PartitionedSchedule,
+    pub plans: HashMap<(usize, usize), ReadPlan>,
+}
+
+impl StencilPipeline {
+    /// Compose every pipeline stage in order. Each stage is a pure
+    /// function of its predecessors' outputs — the whole bundle is
+    /// deterministic.
+    #[allow(dead_code)]
+    pub fn build(
+        fuf: &Fuf,
+        sfuf: &Assignment,
+        class_of: &HashMap<SubgraphId, usize>,
+        class_members: &[Vec<SubgraphId>],
+        class_offsets: &[usize],
+    ) -> Result<Self, ScheduleCycle> {
+        let edges = build_edge_dependences(fuf, sfuf, class_of, class_members);
+        let domain = class_domain(class_members, class_offsets);
+        let schedule = schedule_from_edges(&edges, &domain)?;
+        let partition = partition_schedule(&schedule, &domain, &edges);
+        let plans = classify_reads(&edges, class_members, &domain);
+        Ok(StencilPipeline {
+            edges,
+            domain,
+            schedule,
+            partition,
+            plans,
+        })
+    }
+
+    /// The ReadPlan for one `(consumer_class, boundary_pos)` pair,
+    /// or `None` if no plan exists — the classifier omits boundaries
+    /// whose members do not all have a dependence edge (raw externs
+    /// or over-collapsed shapes). Category 14 tracks boundaries that
+    /// SHOULD have a plan; category 17 tracks boundaries the emitter
+    /// will query.
+    #[allow(dead_code)]
+    pub fn boundary_plan(&self, class: usize, boundary_pos: usize) -> Option<&ReadPlan> {
+        self.plans.get(&(class, boundary_pos))
+    }
+
+    /// The `DepTarget` that one member's read of a boundary resolves
+    /// to. `None` iff no plan covers `(class, boundary_pos)` or
+    /// `member_k` lies outside the plan's covered range.
+    ///
+    /// This is the single lookup the emitter (step 6 follow-up) will
+    /// make for every boundary-input argument it emits, replacing
+    /// `class_input_provenance`'s per-slot `InputOrigin`. The
+    /// category 17 invariants pin the API as TOTAL over the
+    /// emitter's query set before the rewire lands.
+    #[allow(dead_code)]
+    pub fn target_for(
+        &self,
+        class: usize,
+        boundary_pos: usize,
+        member_k: usize,
+    ) -> Option<DepTarget> {
+        self.boundary_plan(class, boundary_pos)?
+            .region_at(member_k)
+            .map(|r| r.target)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Unit tests — narrow, self-contained. Cross-cutting invariant
 // tests against fixtures live in `codegen::tests::invariants`.
 // ─────────────────────────────────────────────────────────────────
@@ -1341,5 +1439,124 @@ mod tests {
         let part = partition_schedule(&sched, &domain, &edges);
         assert!(part.in_loop_short.is_empty());
         assert_eq!(part.post_loop, vec![1]);
+    }
+
+    /// Hand-built `StencilPipeline` with one periodic class that
+    /// reads a PreLoop producer at m=0 and a Periodic carry at m≥1.
+    /// `target_for` must return the right DepTarget at every
+    /// member_k and `None` past the end.
+    #[test]
+    fn pipeline_lookup_target_for() {
+        // Mirror of classify_reads_loop_carry_delta_one's shape
+        // (period-3 self-carry with pre-loop init at m=0).
+        let mut plans: HashMap<(usize, usize), ReadPlan> = HashMap::new();
+        plans.insert(
+            (1, 0),
+            ReadPlan {
+                consumer_class: 1,
+                boundary_pos: 0,
+                regions: vec![
+                    ReadRegion {
+                        range: IterRange { lo: 0, hi: 1 },
+                        target: DepTarget::PreLoop {
+                            producer_sg: SubgraphId(7),
+                            producer_tile: TileId(70),
+                            producer_slot: 0,
+                        },
+                    },
+                    ReadRegion {
+                        range: IterRange { lo: 1, hi: 3 },
+                        target: DepTarget::Periodic {
+                            producer_class: 1,
+                            producer_tile_pos: 0,
+                            producer_slot: 0,
+                            delta_global: 1,
+                        },
+                    },
+                ],
+            },
+        );
+        let pipe = StencilPipeline {
+            edges: vec![],
+            domain: ClassDomain {
+                periods: vec![1, 3],
+                offsets: vec![0, 0],
+            },
+            schedule: Schedule { order: vec![0, 1] },
+            partition: PartitionedSchedule {
+                pre_loop: vec![0],
+                periodic: vec![1],
+                in_loop_short: vec![],
+                post_loop: vec![],
+                interior_classes: vec![1],
+            },
+            plans,
+        };
+        assert!(matches!(
+            pipe.target_for(1, 0, 0),
+            Some(DepTarget::PreLoop { .. })
+        ));
+        assert!(matches!(
+            pipe.target_for(1, 0, 1),
+            Some(DepTarget::Periodic {
+                delta_global: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            pipe.target_for(1, 0, 2),
+            Some(DepTarget::Periodic {
+                delta_global: 1,
+                ..
+            })
+        ));
+        // Past the end of the plan.
+        assert!(pipe.target_for(1, 0, 3).is_none());
+        // Boundary_pos with no plan.
+        assert!(pipe.target_for(1, 1, 0).is_none());
+        // Class with no plan (pre-loop class c0 has no ReadPlan).
+        assert!(pipe.target_for(0, 0, 0).is_none());
+    }
+
+    /// `boundary_plan` returns the stored plan by key and `None`
+    /// otherwise.
+    #[test]
+    fn pipeline_lookup_boundary_plan() {
+        let mut plans: HashMap<(usize, usize), ReadPlan> = HashMap::new();
+        let expected = ReadPlan {
+            consumer_class: 2,
+            boundary_pos: 0,
+            regions: vec![ReadRegion {
+                range: IterRange { lo: 0, hi: 4 },
+                target: DepTarget::Periodic {
+                    producer_class: 5,
+                    producer_tile_pos: 0,
+                    producer_slot: 0,
+                    delta_global: 0,
+                },
+            }],
+        };
+        plans.insert((2, 0), expected);
+        let pipe = StencilPipeline {
+            edges: vec![],
+            domain: ClassDomain {
+                periods: vec![4, 4],
+                offsets: vec![0, 0],
+            },
+            schedule: Schedule { order: vec![0, 1] },
+            partition: PartitionedSchedule {
+                pre_loop: vec![],
+                periodic: vec![0, 1],
+                in_loop_short: vec![],
+                post_loop: vec![],
+                interior_classes: vec![0, 1],
+            },
+            plans,
+        };
+        let plan = pipe.boundary_plan(2, 0).expect("plan present");
+        assert_eq!(plan.consumer_class, 2);
+        assert_eq!(plan.regions.len(), 1);
+        assert!(pipe.boundary_plan(2, 1).is_none());
+        assert!(pipe.boundary_plan(999, 0).is_none());
     }
 }

@@ -863,23 +863,86 @@ message improvements.
     dependence (c5 sits inside the loop body but guarded to one
     iter), which is what the read-plan-consuming emitter wants.
 
-  **Next concrete step for next session**: step 5 of the rewrite —
-  the ReadPlan-consuming emitter. Outline unchanged from the
-  earlier handoff:
+- **Pipeline bundle landed — `StencilPipeline` + category 17
+  (2026-04-24).** Sixth stage of the rewrite lands — the
+  consumer-facing API the emitter will call in the follow-up
+  commit. Zero emission changes; pure scaffolding that pins the
+  contract before the rewire.
+  - `StencilPipeline { edges, domain, schedule, partition, plans }`
+    owns all four pipeline stages. `::build(fuf, sfuf, class_of,
+    class_members, class_offsets)` composes every stage in order;
+    returns `Err(ScheduleCycle)` iff the Δ=0 edge sub-graph has
+    a cycle.
+  - `boundary_plan(class, bp) -> Option<&ReadPlan>` — the per-
+    boundary lookup used to emit region-guarded reads.
+  - `target_for(class, bp, member_k) -> Option<DepTarget>` — the
+    per-member lookup the emitter will call for each boundary
+    argument on each fragment call-site, replacing
+    `class_input_provenance`'s per-slot `InputOrigin`.
+
+  New invariant-mountain category 17 (`pipeline_boundary_readiness`,
+  7 tests, all green on llama at 1b + 3b scale) pins:
+  - (a) `pipeline_builds_for_1b` / `_3b` — no Δ=0 cycle on the
+    real fixture; `::build` returns `Ok`.
+  - (b) `every_periodic_boundary_has_a_plan_1b` / `_3b` — for
+    every periodic class C in the partition, for every boundary
+    position of C's rep subgraph, `boundary_plan(C, bp)` returns
+    `Some`. Absence would crash the emitter at the call site.
+  - (c) `target_for_matches_truth_1b` / `_3b` — for every
+    periodic class's every member's every boundary,
+    `target_for(C, bp, m)` resolves to a producer whose `(tile,
+    slot)` (PreLoop case) or `(class, delta_global)` (Periodic
+    case) agrees with `boundary_truth`'s ground-truth walk of
+    the unrolled FUF. Raises cat 14's claim (plan targets are
+    correct) to the lookup-API contract the emitter consumes.
+  - (d) `target_for_past_end_returns_none` — unit property:
+    `target_for(C, 0, periods[C])` is `None`. Guards against a
+    silent off-by-one where the emitter loops past the end of
+    the class's members.
+
+  Plus two narrow unit tests in `stencil_pipeline::tests`
+  (`pipeline_lookup_target_for` / `pipeline_lookup_boundary_plan`)
+  exercising the two lookups on hand-built pipelines without the
+  FUF pipeline.
+
+  Mountain state: **1280 passed, 164 failed, 3 ignored** (was
+  1263/164/3 per the step-5 handoff). Net: +9 new green tests
+  (7 cat 17 invariants + 2 unit tests); 0 new reds; 0 regression
+  on the 161 pre-existing invariant reds + 3 unrelated pre-
+  existing solver/config failures.
+
+  Red→green proof (targeted stub on `StencilPipeline::build`):
+  replace `let plans = classify_reads(...)` with
+  `let plans = HashMap::new()` → cat 17 (b) + (c) fire on BOTH
+  1b and 3b with precise messages naming `c8 bp0` (both tests
+  print the first failing triple). (a) and (d) stay green under
+  the stub (build still succeeds; past-end lookup still returns
+  None vacuously). Restore → all 7 green.
+
+  **Next concrete step for next session**: step 6b — the actual
+  emission rewire, now against the pinned contract:
   1. Replace `class_input_provenance` reads in
      `emit_fragment_call_expr` + `emit_aliased_class_inline` with
-     lookups keyed on `(class, bp)` into the `classify_reads`
-     output.
+     `pipe.target_for(class, bp, member_k)` lookups. The
+     `PreLoop` variant maps to the pre-loop subgraph's local; the
+     `Periodic { delta_global: 0 }` variant maps to
+     `__cC_out_P_S`; `Periodic { delta_global: 1 }` maps to
+     `__carry_cC_P_S`. Any `|delta_global| ≥ 2` returned by the
+     lookup is a structural refusal (cat 14 already pins `≤ 1`
+     on the fixture).
   2. Replace class ordering throughout `try_emit_collapsed_bucket`
-     with `PartitionedSchedule`'s `flat_order()`, routing
-     `in_loop_short` classes via one-iter guards inside the loop
-     body (analogous to the legacy aliased-emittable reroute but
-     driven by the `in_loop_short` bucket, no `is_aliased_emittable`
-     sampling).
+     with `pipe.partition.flat_order()`, routing
+     `in_loop_short` classes via one-iter `if __repeat == offset`
+     guards inside the loop body (analogous to the legacy
+     aliased-emittable reroute but driven by the `in_loop_short`
+     bucket, no `is_aliased_emittable` sampling).
   3. The old `InputOrigin` enum + `alias_carry_redirect` sidecar
      stay in place for one commit so the flip can be A/B'd; they
      are deleted in the follow-up once every provenance-red test
      clears.
+  4. Watch the 161 invariant reds flip green as the rewire lands;
+     every remaining red after step 6b is a structural gap the
+     next piece of the pipeline needs to cover.
 
 - `a4b38b236` — **invariant mountain scaled to 1229 tests (161 red)**.
   Cross-scale 1b/3b + 6 new categories. This commit is the

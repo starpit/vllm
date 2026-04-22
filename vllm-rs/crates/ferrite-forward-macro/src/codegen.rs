@@ -11019,5 +11019,205 @@ mod tests {
                 );
             }
         }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 17 — Pipeline boundary readiness.
+        //
+        // The rewrite's emitter (step 6 follow-up commit) consumes
+        // `StencilPipeline` as its sole source of truth for boundary
+        // reads, replacing `class_input_provenance` +
+        // `ClassSchedule`. Before the emission rewire lands, these
+        // tests pin that the pipeline's API is TOTAL over the
+        // queries the emitter will make:
+        //
+        //   - `boundary_plan(c, bp)` returns `Some` for every
+        //     `(c ∈ partition.periodic, bp ∈ [0, boundary_count(rep_sg)))`.
+        //   - `target_for(c, bp, m)` returns a `DepTarget` matching
+        //     the ground-truth FUF walk for every member
+        //     `m ∈ [0, period(c))`.
+        //   - `target_for(c, bp, period(c))` returns `None` (member
+        //     index out of range).
+        //
+        // A red here is a direct emission blocker: if any lookup
+        // returns `None` on a query the emitter will make, collapsed
+        // emission either panics or silently drops an input.
+        //
+        // Category 14 already proves the `ReadPlan`s' structural
+        // correctness — this category raises the bar from "plans
+        // are shaped right" to "plans cover what the emitter
+        // needs". The distinction is load-bearing: a plan that
+        // correctly classifies every edge it sees is useless if
+        // the classifier omitted the boundary entirely.
+        // ──────────────────────────────────────────────────────────
+        mod pipeline_boundary_readiness {
+            use super::truth::*;
+            use crate::stencil_pipeline::{boundary_count, DepTarget, StencilPipeline};
+
+            fn build(t: &Truth) -> StencilPipeline {
+                StencilPipeline::build(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                    &t.sched.class_offsets,
+                )
+                .expect("fixture must build without Δ=0 cycle")
+            }
+
+            /// (a) Pipeline builds for 1b fixture (no Δ=0 cycle).
+            #[test]
+            fn pipeline_builds_for_1b() {
+                let t = load();
+                let _pipe = build(&t);
+            }
+
+            /// (a) Pipeline builds for 3b fixture (no Δ=0 cycle).
+            #[test]
+            fn pipeline_builds_for_3b() {
+                let t = load_3b();
+                let _pipe = build(&t);
+            }
+
+            /// (b) Every periodic class has a ReadPlan for every
+            /// boundary input of its rep subgraph — the query
+            /// surface the emitter will exercise when emitting one
+            /// fragment call-site per class.
+            fn every_periodic_boundary_has_a_plan_impl(t: &Truth, scale: &str) {
+                let pipe = build(t);
+                for &c in &pipe.partition.periodic {
+                    let rep_sg = *t
+                        .stencil
+                        .class_members
+                        .get(c)
+                        .and_then(|ms| ms.first())
+                        .unwrap_or_else(|| {
+                            panic!("{scale}: periodic class c{c} has no members")
+                        });
+                    let nbp = boundary_count(&t.solved.fuf, &t.solved.sfuf, rep_sg);
+                    for bp in 0..nbp {
+                        assert!(
+                            pipe.boundary_plan(c, bp).is_some(),
+                            "{scale}: periodic class c{c} boundary_pos {bp} \
+                             has no ReadPlan — emitter would have nothing to read",
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn every_periodic_boundary_has_a_plan_1b() {
+                every_periodic_boundary_has_a_plan_impl(&load(), "1b");
+            }
+
+            #[test]
+            fn every_periodic_boundary_has_a_plan_3b() {
+                every_periodic_boundary_has_a_plan_impl(&load_3b(), "3b");
+            }
+
+            /// (c) For every periodic class's every member's every
+            /// boundary, `target_for(class, bp, member_k)` resolves
+            /// to a producer that matches `boundary_truth` — the
+            /// ground-truth walk of the unrolled FUF.
+            ///
+            /// Category 14 already proves the ReadPlan's targets
+            /// match ground truth; this test drives at the lookup
+            /// API the emitter will call, closing the gap between
+            /// "plan has correct targets" and "lookup serves the
+            /// correct target to a caller". A red here means the
+            /// ReadPlan API's semantics (disjoint / contiguous /
+            /// contains) admit some member_k the emitter would
+            /// query but the plan fails to cover.
+            fn target_for_matches_truth_impl(t: &Truth, scale: &str) {
+                let pipe = build(t);
+                for &c in &pipe.partition.periodic {
+                    let period = t.stencil.class_members[c].len();
+                    let rep_sg = *t.stencil.class_members[c].first().unwrap();
+                    let nbp = boundary_count(&t.solved.fuf, &t.solved.sfuf, rep_sg);
+                    for m in 0..period {
+                        for bp in 0..nbp {
+                            let tgt = pipe.target_for(c, bp, m).unwrap_or_else(|| {
+                                panic!(
+                                    "{scale}: target_for(c{c}, bp{bp}, m{m}) = None \
+                                     — coverage gap on a query the emitter will make"
+                                )
+                            });
+                            let truth = boundary_truth(t, c, m, bp).unwrap_or_else(|| {
+                                panic!(
+                                    "{scale}: no ground-truth producer for \
+                                     (c{c}, m{m}, bp{bp}) — pipeline reported a \
+                                     target but FUF walk has none"
+                                )
+                            });
+                            match tgt {
+                                DepTarget::PreLoop {
+                                    producer_tile,
+                                    producer_slot,
+                                    ..
+                                } => {
+                                    assert_eq!(
+                                        (producer_tile, producer_slot),
+                                        (truth.producer_tile, truth.producer_slot),
+                                        "{scale}: (c{c}, m{m}, bp{bp}) PreLoop \
+                                         tile/slot mismatch (truth class {})",
+                                        truth.producer_class,
+                                    );
+                                }
+                                DepTarget::Periodic {
+                                    producer_class,
+                                    delta_global,
+                                    ..
+                                } => {
+                                    assert_eq!(
+                                        producer_class, truth.producer_class,
+                                        "{scale}: (c{c}, m{m}, bp{bp}) Periodic \
+                                         producer_class mismatch",
+                                    );
+                                    let consumer_global = consumer_global_iter(t, c, m);
+                                    let expected_delta =
+                                        consumer_global - truth.producer_global_iter;
+                                    assert_eq!(
+                                        delta_global, expected_delta,
+                                        "{scale}: (c{c}, m{m}, bp{bp}) Periodic \
+                                         delta_global mismatch",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn target_for_matches_truth_1b() {
+                target_for_matches_truth_impl(&load(), "1b");
+            }
+
+            #[test]
+            fn target_for_matches_truth_3b() {
+                target_for_matches_truth_impl(&load_3b(), "3b");
+            }
+
+            /// (d) `target_for` with `member_k == period` returns
+            /// `None`. Guards against a silent off-by-one where the
+            /// emitter loops past the end of the class's members.
+            /// Covers every periodic class on the 1b fixture.
+            #[test]
+            fn target_for_past_end_returns_none() {
+                let t = load();
+                let pipe = build(&t);
+                for &c in &pipe.partition.periodic {
+                    let period = t.stencil.class_members[c].len();
+                    let rep_sg = *t.stencil.class_members[c].first().unwrap();
+                    let nbp = boundary_count(&t.solved.fuf, &t.solved.sfuf, rep_sg);
+                    if nbp == 0 {
+                        continue;
+                    }
+                    assert!(
+                        pipe.target_for(c, 0, period).is_none(),
+                        "c{c}: target_for(member_k=period) must be None",
+                    );
+                }
+            }
+        }
     }
 }

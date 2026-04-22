@@ -596,7 +596,7 @@ impl Gemma3Model {
             &mut device.caching,
             device.compute_stream,
         );
-        kernels::scale_inplace(*hidden_states.view(), self.embed_scale, &device.cublas);
+        kernels::scale_inplace(*hidden_states.view(), self.embed_scale, device.cublas.as_ref().expect("cuBLAS required for scale_inplace"));
 
         let mut hidden_states: OwnedTensor = hidden_states;
         let mut residual: Option<OwnedTensor> = None;
@@ -713,7 +713,7 @@ impl Gemma3ForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
         )
     }
@@ -1271,7 +1271,7 @@ impl Gemma3Model {
                     &mut device.caching,
                     device.compute_stream,
                 );
-                kernels::scale_inplace(*hs.view(), self.embed_scale, &device.cublas);
+                kernels::scale_inplace(*hs.view(), self.embed_scale, device.cublas.as_ref().expect("cuBLAS required for scale_inplace"));
                 (hs, None)
             } else {
                 let (hs, res) = intermediate.expect("non-first PP stage requires intermediate");

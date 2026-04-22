@@ -57,13 +57,13 @@ impl LlamaMLP {
             // Quantized: separate gate + up GEMMs, then concat
             let gate_out = self.gate_up_proj.forward(
                 x,
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
                 device.compute_stream,
             );
             let up_out = up_proj.forward(
                 x,
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
                 device.compute_stream,
             );
@@ -81,7 +81,7 @@ impl LlamaMLP {
             // Dense: single fused gate+up GEMM
             self.gate_up_proj.forward(
                 x,
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -97,7 +97,7 @@ impl LlamaMLP {
 
         let result = self.down_proj.forward(
             activated.view(),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
             device.compute_stream,
         );
@@ -205,19 +205,19 @@ impl LlamaAttention {
             // Quantized: separate Q, K, V GEMMs → concat
             let q_out = self.qkv_proj.forward(
                 hidden_states,
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
                 device.compute_stream,
             );
             let k_out = k_proj.forward(
                 hidden_states,
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
                 device.compute_stream,
             );
             let v_out = v_proj.forward(
                 hidden_states,
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
                 device.compute_stream,
             );
@@ -243,7 +243,7 @@ impl LlamaAttention {
             // Dense: single fused QKV GEMM
             self.qkv_proj.forward(
                 hidden_states,
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -363,7 +363,7 @@ impl LlamaAttention {
                 let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
                 let result = self.o_proj.forward(
                     attn_flat,
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -449,7 +449,7 @@ impl LlamaAttention {
                 let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
                 let result = self.o_proj.forward(
                     attn_flat,
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -515,7 +515,7 @@ impl LlamaAttention {
         let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
         let result = self.o_proj.forward(
             attn_flat,
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
             device.compute_stream,
         );
@@ -632,7 +632,7 @@ impl LlamaDecoderLayer {
 
         // Granite: scale attention output.
         if self.residual_multiplier != 1.0 {
-            kernels::scale_inplace(*attn_output, self.residual_multiplier, &device.cublas);
+            kernels::scale_inplace(*attn_output, self.residual_multiplier, device.cublas.as_ref().expect("cuBLAS required for scale_inplace"));
         }
 
         // Post-attention norm: mutates attn_output buffer → post-normed,
@@ -654,7 +654,7 @@ impl LlamaDecoderLayer {
 
         // Granite: scale MLP output.
         if self.residual_multiplier != 1.0 {
-            kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);
+            kernels::scale_inplace(*mlp_output, self.residual_multiplier, device.cublas.as_ref().expect("cuBLAS required for scale_inplace"));
         }
 
         (mlp_output, residual)
@@ -824,7 +824,7 @@ impl LlamaForCausalLM {
         #[allow(unused_mut)]
         let mut logits = self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
             device.compute_stream,
         );
@@ -3592,7 +3592,7 @@ impl LlamaForCausalLM {
                 #[allow(unused_mut)]
                 let mut logits = self.lm_head.forward(
                     hs_view,
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 );

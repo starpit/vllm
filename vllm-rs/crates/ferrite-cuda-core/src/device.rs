@@ -10,17 +10,20 @@ use crate::driver;
 use anyhow::Result;
 use cudarc::driver::sys::{CUcontext, CUevent, CUstream};
 
-/// The GPU device runtime. Owns streams, cuBLAS handle, and caching allocator.
+/// The GPU device runtime. Owns streams, optional cuBLAS handle, and caching allocator.
 ///
 /// All model forward passes operate through this struct. One instance per GPU.
 /// Memory management uses a caching allocator (like PyTorch's CUDACachingAllocator)
 /// — tensors are freed on drop and their blocks reused from a free list.
+///
+/// The `cublas` field is `Option<CublasHandle>` to support cublas-free operation.
+/// When `None`, any code path requiring cuBLAS will fail explicitly.
 pub struct GpuDevice {
     pub device_id: i32,
     pub ctx: CUcontext,
     pub compute_stream: CUstream,
     pub transfer_stream: CUstream,
-    pub cublas: CublasHandle,
+    pub cublas: Option<CublasHandle>,
     /// Caching allocator — the ONLY allocator. Like PyTorch's CUDACachingAllocator.
     pub caching: CachingAllocator,
     /// Event for gating CPU reuse of pinned buffers after H2D transfer.
@@ -34,10 +37,22 @@ pub struct GpuDevice {
 }
 
 impl GpuDevice {
-    /// Initialize a GPU device.
+    /// Initialize a GPU device with cuBLAS support.
     ///
     /// Creates CUDA context, two streams, cuBLAS handle, and caching allocator.
     pub fn new(device_id: i32) -> Result<Self> {
+        Self::new_impl(device_id, true)
+    }
+
+    /// Initialize a GPU device without cuBLAS support.
+    ///
+    /// Creates CUDA context, two streams, and caching allocator, but no cuBLAS handle.
+    /// Any code path requiring cuBLAS will fail explicitly.
+    pub fn new_without_cublas(device_id: i32) -> Result<Self> {
+        Self::new_impl(device_id, false)
+    }
+
+    fn new_impl(device_id: i32, with_cublas: bool) -> Result<Self> {
         unsafe {
             driver::init()?;
             let cu_device = driver::device_get(device_id)?;
@@ -49,15 +64,20 @@ impl GpuDevice {
             let d2h_done = driver::event_create_disable_timing()?;
 
             let mut caching = CachingAllocator::new();
-            let cublas = CublasHandle::new(compute_stream, &mut caching)?;
+            let cublas = if with_cublas {
+                Some(CublasHandle::new(compute_stream, &mut caching)?)
+            } else {
+                None
+            };
             let num_sm = driver::device_get_num_sm(cu_device)?;
             let sm_version = driver::device_get_sm_version(cu_device)?;
 
             tracing::info!(
-                "GpuDevice initialized: device={}, SMs={}, SM{}",
+                "GpuDevice initialized: device={}, SMs={}, SM{}, cuBLAS={}",
                 device_id,
                 num_sm,
                 sm_version,
+                if with_cublas { "enabled" } else { "disabled" },
             );
 
             Ok(Self {
@@ -336,7 +356,11 @@ mod tests {
             let a = GpuTensor::new(gpu_a, &[2, 2], DType::F32);
             let b = GpuTensor::new(gpu_b, &[2, 2], DType::F32);
 
-            let c = dev.cublas.gemm(a, b, &mut dev.caching);
+            let c = dev
+                .cublas
+                .as_mut()
+                .expect("cuBLAS required for this test")
+                .gemm(a, b, &mut dev.caching);
 
             let host_c = driver::mem_alloc_host(16).unwrap();
             driver::memcpy_dtoh_async(host_c, c.as_gpu_tensor().raw_ptr(), 16, dev.compute_stream)

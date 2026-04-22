@@ -130,7 +130,7 @@ impl Qwen2MoeMlp {
 
                 let shared_out = shared_down.forward(
                     shared_activated.view(),
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                 );
                 drop(shared_activated);
@@ -138,7 +138,7 @@ impl Qwen2MoeMlp {
                 // Shared expert gate: sigmoid(gate(hidden_states)) * shared_out + moe_out
                 let gate_logits = shared_expert_gate.forward(
                     hidden_states,
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                 );
 
@@ -179,14 +179,14 @@ impl Qwen2MoeMlp {
 
                 let shared_out = shared_down.forward(
                     shared_activated.view(),
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                 );
                 drop(shared_activated);
 
                 let gate_logits = shared_expert_gate.forward(
                     hidden_states,
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                 );
 
@@ -1003,7 +1003,7 @@ impl Qwen2MoeForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
         )
     }

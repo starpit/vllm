@@ -237,7 +237,7 @@ impl SharedFusedMoELayer {
             // down_proj → [num_tokens, hidden]
             let shared_out = shared_down.forward(
                 shared_activated.view(),
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
             );
             drop(shared_activated);
@@ -625,7 +625,7 @@ impl Fp8SharedFusedMoELayer {
 
             let shared_out = shared_down.forward(
                 shared_activated.view(),
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
             );
             drop(shared_activated);
@@ -1157,7 +1157,7 @@ impl MarlinSharedFusedMoELayer {
         ) {
             let shared_gu = shared_gate_up.forward(
                 hidden_states,
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
                 stream,
             );
@@ -1171,7 +1171,7 @@ impl MarlinSharedFusedMoELayer {
 
             let shared_out = shared_down.forward(
                 shared_activated.view(),
-                &mut device.cublas,
+                device.cublas.as_mut(),
                 &mut device.caching,
                 stream,
             );

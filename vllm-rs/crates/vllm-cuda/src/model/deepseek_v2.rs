@@ -758,7 +758,7 @@ impl DeepSeekV2MoE {
 
         let shared_out = self.shared_down.forward(
             shared_activated.view(),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
         );
         drop(shared_activated);
@@ -872,7 +872,7 @@ impl DeepSeekV2Fp8MoE {
 
         let shared_out = self.shared_down.forward(
             shared_activated.view(),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
         );
         drop(shared_activated);
@@ -1419,7 +1419,7 @@ impl DeepSeekV2ForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
         )
     }

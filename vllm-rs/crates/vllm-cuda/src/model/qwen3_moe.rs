@@ -99,14 +99,14 @@ impl Qwen3MoeMlp {
 
                     let shared_out = shared_down_w.forward(
                         shared_activated.view(),
-                        &mut device.cublas,
+                        device.cublas.as_mut(),
                         &mut device.caching,
                     );
                     drop(shared_activated);
 
                     let gate_logits = shared_gate_w.forward(
                         hidden_states,
-                        &mut device.cublas,
+                        device.cublas.as_mut(),
                         &mut device.caching,
                     );
 
@@ -152,14 +152,14 @@ impl Qwen3MoeMlp {
 
                     let shared_out = shared_down_w.forward(
                         shared_activated.view(),
-                        &mut device.cublas,
+                        device.cublas.as_mut(),
                         &mut device.caching,
                     );
                     drop(shared_activated);
 
                     let gate_logits = shared_gate_w.forward(
                         hidden_states,
-                        &mut device.cublas,
+                        device.cublas.as_mut(),
                         &mut device.caching,
                     );
 
@@ -204,14 +204,14 @@ impl Qwen3MoeMlp {
 
                     let shared_out = shared_down_w.forward(
                         shared_activated.view(),
-                        &mut device.cublas,
+                        device.cublas.as_mut(),
                         &mut device.caching,
                     );
                     drop(shared_activated);
 
                     let gate_logits = shared_gate_w.forward(
                         hidden_states,
-                        &mut device.cublas,
+                        device.cublas.as_mut(),
                         &mut device.caching,
                     );
 
@@ -1345,7 +1345,7 @@ impl Qwen3MoeForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
         )
     }

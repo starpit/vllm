@@ -688,7 +688,7 @@ impl GdnWeights {
         // 7. Output projection on GPU.
         let result = self.out_proj.forward(
             proj_input.view().reshape(&[num_tokens, value_dim]),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
         );
         drop(proj_input);
@@ -852,7 +852,7 @@ impl Qwen3NextFullAttention {
         //    Where q_size = 2*true_q_size if attn_output_gate.
         let qkv = self.inner.qkv_proj.forward(
             hidden_states,
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
             stream,
         );
@@ -1464,7 +1464,7 @@ impl Qwen3NextForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
+            device.cublas.as_mut(),
             &mut device.caching,
             device.compute_stream,
         )

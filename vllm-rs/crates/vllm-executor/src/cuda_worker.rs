@@ -2740,7 +2740,10 @@ impl CudaWorker {
                     unsafe {
                         vllm_cuda::kernels::pool_mean_f32(
                             hidden_states,
-                            &device.cublas,
+                            device
+                                .cublas
+                                .as_ref()
+                                .expect("cuBLAS required for pool_mean_f32"),
                             &mut device.caching,
                             device.compute_stream,
                         )
@@ -3700,7 +3703,10 @@ impl CudaWorker {
                     vllm_cuda::kernels::scale_inplace(
                         h.as_gpu_tensor(),
                         m.model.embed_scale,
-                        &device.cublas,
+                        device
+                            .cublas
+                            .as_ref()
+                            .expect("cuBLAS required for scale_inplace"),
                     )
                 };
                 h
@@ -3718,7 +3724,10 @@ impl CudaWorker {
                     vllm_cuda::kernels::scale_inplace(
                         h.as_gpu_tensor(),
                         m.model.embed_scale,
-                        &device.cublas,
+                        device
+                            .cublas
+                            .as_ref()
+                            .expect("cuBLAS required for scale_inplace"),
                     )
                 };
                 h
@@ -4091,7 +4100,7 @@ impl CudaWorker {
                     // hidden is now normed; project to vocab
                     m.lm_head.forward(
                         TensorView::from_raw(hidden),
-                        &mut device.cublas,
+                        device.cublas.as_mut(),
                         &mut device.caching,
                         device.compute_stream,
                     )
@@ -4107,7 +4116,7 @@ impl CudaWorker {
                 );
                 m.0.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                     device.compute_stream,
                 )
@@ -4125,7 +4134,7 @@ impl CudaWorker {
                     );
                     m.lm_head.forward(
                         TensorView::from_raw(hidden),
-                        &mut device.cublas,
+                        device.cublas.as_mut(),
                         &mut device.caching,
                     )
                 }
@@ -4140,7 +4149,7 @@ impl CudaWorker {
                 );
                 m.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                 )
             },
@@ -4154,7 +4163,7 @@ impl CudaWorker {
                 );
                 m.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                 )
             },
@@ -4168,7 +4177,7 @@ impl CudaWorker {
                 );
                 m.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                 )
             },
@@ -4182,7 +4191,7 @@ impl CudaWorker {
                 );
                 m.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
+                    device.cublas.as_mut(),
                     &mut device.caching,
                 )
             },
@@ -6514,7 +6523,13 @@ impl Worker for CudaWorker {
         }
 
         if self.config.cublas_autotune {
-            unsafe { device.cublas.benchmark_plans() };
+            unsafe {
+                device
+                    .cublas
+                    .as_ref()
+                    .expect("cuBLAS required for cublas_autotune")
+                    .benchmark_plans()
+            };
         }
 
         Ok(())

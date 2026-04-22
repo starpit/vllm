@@ -480,19 +480,67 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 ## 13. Status & handoff (2026-04-24)
 
-### Mountain at 1259/2/3 — step 6b test-retarget landed (2026-04-24)
+### Mountain at 1261/0/3 — step 6b period-1 LoopCarry redirect landed (2026-04-25)
 
 **First 30 seconds of next session:**
 ```bash
 cd /home/moosevan/vllm/.claude/worktrees/ff3/vllm-rs
 cargo test -p ferrite-forward-macro --lib codegen::tests
-# Expected: 1259 passed / 2 failed / 3 ignored.
-# The 2 reds are `emission::no_orphan_initless_carry_idents` +
-# `scale_3b::no_orphan_initless_carry_idents` — they flip green
-# only when the emitter itself consumes pipe.target_for.
+# Expected: 1261 passed / 0 failed / 3 ignored (3 = diagnostic
+# dumps).
 ```
 
-Two commits landed this session:
+Latest commit (`d7035e6ae`) threaded `StencilPipeline` into
+`emit_fragment_call_expr` + `emit_aliased_class_inline` for the
+period-1 LoopCarry case — the exact shape the prior 2 orphan-
+carry reds pinned. Pipeline says `target_for` = `PreLoop` for
+period-1 producers; the rewire maps that to the existing
+`__cC_out_P_S: Option<GpuTensor>` hoist the in-loop-short
+aliased emission already assigns at `iter == offset`.
+**This is the first commit where emission is driven by
+`pipe.target_for` for any case, not just classifier-side
+verification.** Legacy `class_input_provenance` still drives all
+other boundary arg resolution — the next step(s) generalise the
+rewire across the rest of the LoopCarry + IntraIter surface.
+
+Three commits landed this session:
+
+0. **`d7035e6ae` — step 6b period-1 LoopCarry redirect (2026-04-25).**
+   The pipeline-driven half of step 6b lands for the period-1
+   producer case. Three scoped changes in `try_emit_collapsed_bucket`:
+   - Derive `period_one_carry_redirects` from `pipeline.domain.periods`
+     — set of `(producer_class, pos, slot)` keys where the class
+     has period 1. Filter `carry_inits` on this set so the orphan
+     `__carry_cC_pP_sS: Option<OwnedTensor> = None` hoist doesn't
+     fire for period-1 producers (the real producer of value is
+     the in-loop-short `__cC_out_P_S: Option<GpuTensor>` hoist).
+   - Augment `aliased_intraiter_exports` with the redirected
+     period-1 producers' exports so the `__cC_out_P_S` hoist
+     fires (previously skipped when every consumer was tagged
+     LoopCarry by the legacy classifier).
+   - Rewire the LoopCarry arm in `emit_fragment_call_expr` +
+     `emit_aliased_class_inline`: when the resolved key is in
+     `period_one_carry_redirects`, read via
+     `(*__cC_out.as_ref().expect(..)).as_view()` — the same
+     pattern the IntraIter-short path already uses. Prelude
+     unwrap in the aliased-inline case binds a local view ident
+     to satisfy `emit_call`'s `*#ident` protocol.
+
+   Mountain state: **1261 passed / 0 failed / 3 ignored** (was
+   1259/2/3). Both `no_orphan_initless_carry_idents` reds flipped
+   green at 1b and 3b; zero regression on the other 1259.
+   Red→green proof via stub (force `period_one_carry_redirects`
+   to empty): both reds fire with `"__carry_c5_p0_s0"`; restore →
+   green. Same ident at both scales because c5 (post-MLP FAR peel)
+   is period 1 at llama-3.2-1b (16 layers) and llama-3.2-3b (28).
+
+   Scope: uniform case only (every consumer of the period-1
+   producer sees the same target_for). The FAR_DECODER fixture's
+   non-uniform offset-gap shape (c6 reads c5 at m=0 / c9 at m>0)
+   still routes through legacy provenance — the next step
+   generalises the rewire across non-uniform regions. The old
+   `InputOrigin` enum + `alias_carry_redirect` sidecar stay in
+   place for A/B (design §13 step 3).
 
 1. **`7bbf61af8` — invariant test retarget to pipe.target_for.**
    The 161 invariant reds that pinned `class_input_provenance`'s
@@ -543,81 +591,68 @@ Two commits landed this session:
    the emitter's boundary-arg resolution starts consulting
    `target_for`.
 
-### Remaining red: the `__carry_c5_p0_s0` orphan
+### Step 6b remaining — generalise the rewire beyond period-1
 
-**Both remaining reds surface the same failing ident on the
-FAR_DECODER fixtures.** `emission::no_orphan_initless_carry_idents`
-reports `orphan init-less carries: ["__carry_c5_p0_s0"]`. c5 is
-period-1 and rerouted into `sched.periodic` by legacy's
-aliased-emittable path (fires inside the loop at `__repeat ==
-offset(c5)`). Today's `class_input_provenance` tags a consumer's
-c5-boundary as `LoopCarry { producer_class: 5, pre_loop_init_sg:
-None }` via the shifted-carry branch (`observed == carry_expected`).
-That hoists `let mut __carry_c5_p0_s0: Option<OwnedTensor> = None`,
-but nothing ever assigns it because c5 is not a true carry
-producer — it's a period-1 class whose single output is bound to
-`__c5_out_p0_s0` by `emit_aliased_class_inline` inside the loop
-body.
+The period-1 LoopCarry case landed (commit `d7035e6ae`). The
+remaining rewire surface, in rough escalation order:
 
-Pipeline says `target_for(consumer, bp, 0)` = `DepTarget::PreLoop(c5_sg)`
-(period 1 → PreLoop, correct). The fix requires:
-- `carry_inits` filtered to exclude entries where the producer
-  has period 1 (use pipeline instead of provenance).
-- `emit_fragment_call_expr` + `emit_aliased_class_inline` to
-  resolve period-1 periodic producers to the in-loop-short
-  binding (`__c5_out_p0_s0`) — which may need hoisting to a
-  scope visible across iters (5i.4's machinery exists for this
-  exact shape on the post-loop side; reuse for in-loop readers
-  at iter > 0).
+1. **Non-uniform offset-gap LoopCarry (c6 shape).** FAR_DECODER's
+   c6 reads c5 at member m=0 and c9 at m>0. Pipeline's
+   `classify_reads` emits a `ReadPlan` with two `ReadRegion`s —
+   one targeting `PreLoop(c5_sg)` for the m=0 region, one
+   targeting `Periodic { producer_class: 9, delta_global: 0 }`
+   (or 1) for m≥1. The emitter needs to handle this either by:
+   a) emitting a per-iter `if __repeat == 0 { arg = c5_binding }
+      else { arg = c9_binding }` at the fragment call site, or
+   b) splitting the fragment call into two guarded sub-calls
+      (one per region), each passing a uniform arg set.
+   Option (a) requires fragment fn params to accept a
+   `TensorView` bound from a match-expression (already legal
+   Rust). Option (b) is a larger codegen restructure; not
+   preferred. The invariant mountain's cat 14
+   `regions_cover_and_partition_range` + cat 17
+   `target_for_matches_truth` already pin the data the emitter
+   needs. No test today fires on the c6 shape's emission
+   correctness because provenance's legacy LoopCarry
+   classification happens to produce valid (if suboptimal)
+   emission — a latent correctness question worth pinning
+   before the rewire.
 
-This is the natural coupling between step 6b (emitter rewire)
-and step 4 (route class ordering through `pipe.partition`) in
-the task list: resolving a period-1-in-loop-short producer
-needs the partition bucket to know where its output lives.
+2. **IntraIter + PreLoop resolution via target_for.** Today the
+   emitter resolves IntraIter reads via `class_out_ident` and
+   PreLoop reads via a `locals` map keyed on `(tile, slot)`.
+   Both work today because the provenance walk is consistent
+   with the pipeline on these cases — but the pipeline is
+   authoritative and the provenance is legacy. Migrate the
+   IntraIter arm in `emit_fragment_call_expr` +
+   `emit_aliased_class_inline` to consult
+   `pipe.target_for(consumer_class, bp, member_k=0)` and
+   assert `Periodic { delta_global: 0 }` — any divergence from
+   legacy is a structural bug worth surfacing.
 
-### Step 6b remaining — emitter rewire to target_for
-
-The handoff-era plan (preserved verbatim below) is sound; the
-retarget half is done, emitter half is queued. The two pieces
-land together in the next session:
-
-1. Replace `class_input_provenance` reads in
-   `emit_fragment_call_expr` + `emit_aliased_class_inline` with
-   `pipe.target_for(class, bp, member_k)` lookups. The
-   `PreLoop` variant maps to the pre-loop subgraph's local; the
-   `Periodic { delta_global: 0 }` variant maps to
-   `__cC_out_P_S`; `Periodic { delta_global: 1 }` maps to
-   `__carry_cC_P_S`. Any `|delta_global| ≥ 2` returned by the
-   lookup is a structural refusal (cat 14 already pins `≤ 1`
-   on the fixture).
-2. Replace class ordering throughout `try_emit_collapsed_bucket`
-   with `pipe.partition.flat_order()`, routing
+3. **Class ordering via `pipe.partition.flat_order()`.** Replace
+   today's `sched.pre_loop / sched.periodic / sched.post_loop`
+   iteration with `pipe.partition.flat_order()`, routing
    `in_loop_short` classes via one-iter `if __repeat == offset`
    guards inside the loop body (analogous to the legacy
    aliased-emittable reroute but driven by the `in_loop_short`
-   bucket, no `is_aliased_emittable` sampling).
-3. The old `InputOrigin` enum + `alias_carry_redirect` sidecar
-   stay in place for one commit so the flip can be A/B'd; they
-   are deleted in the follow-up once every provenance-red test
-   clears.
-4. Watch the 2 invariant reds flip green as the rewire lands;
-   every remaining red after step 6b is a structural gap the
-   next piece of the pipeline needs to cover.
+   bucket, no `is_aliased_emittable` sampling). Cat 16 pins that
+   flat_order + schedule.order agree; the ordering change should
+   be token-identical on the uniform case.
 
-**Open design question surfaced by the retarget:** offset-gap
-shapes (c6 reads c5 at m=0 and c9 at m>0) have non-uniform
-target_for across members. The simple 3-way DepTarget → emit
-mapping above handles uniform targets; non-uniform targets need
-either per-member conditional arg binding or a refusal with a
-clear structural message. For the shipping fleet
-(llama-2-7b / mistral / phi3 / qwen2) the uniform case is the
-norm — the `FAR_DECODER_BODY` fixture at 1b/3b exposes the
-non-uniform case via c5 + c6. **A useful intermediate stopping
-point for the next session**: land the rewire for the uniform
-case + refuse non-uniform with a clear message. The refusal
-still flips the orphan-carry test if the uniform-case rewire
-correctly resolves period-1 producers (c5) to the
-`__c5_out_p0_s0` binding instead of the spurious carry.
+4. **Delete the sidecars.** Once every boundary arg resolution
+   is driven by `pipe.target_for`, delete `InputOrigin`,
+   `class_input_provenance`, `alias_carry_redirect`,
+   `alias_through_carries`, and `alias_preloop_inits`. Cat 0
+   in the mountain (the 1229-test structural property set) is
+   the proof that the pipeline alone suffices.
+
+**Recommended next session starting point**: step 2 (migrate the
+IntraIter + PreLoop arms). It's the smallest-scope change and
+the structural claim is directly pinned by cat 14/17. Step 1 is
+larger and benefits from step 2's scaffolding. Step 3 follows
+step 2 once every boundary arg resolution goes through
+`target_for`.
 
 ### Big-picture reset (2026-04-23)
 

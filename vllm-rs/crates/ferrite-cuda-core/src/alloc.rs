@@ -7,45 +7,12 @@
 //!   is smaller than a free block, the block is split and the remainder stays free
 //! - **Block coalescing**: When a block is freed, it merges with adjacent free blocks
 //! - **Two pools**: small (≤1 MB) and large (>1 MB), each with a sorted free set
-//! - **Private pools**: For CUDA graph capture (like PyTorch's beginAllocateToPool)
 
 use crate::driver;
 use crate::dtype::DType;
 use crate::tensor::{GpuTensor, TensorView};
-use cudarc::driver::sys as cuda_sys;
 use std::collections::BTreeSet;
 use std::ptr;
-
-// ---------------------------------------------------------------------------
-// Capture mode guard (matches PyTorch's CUDAStreamCaptureModeGuard)
-// ---------------------------------------------------------------------------
-
-/// RAII guard that switches the thread-local stream capture mode to RELAXED,
-/// restoring the previous mode on drop.
-///
-/// During CUDA graph capture, cudaMalloc is only allowed in relaxed mode.
-/// PyTorch uses the same pattern (CUDAStreamCaptureModeGuard) in its caching
-/// allocator to allow new segment allocations during capture.
-pub struct RelaxedCaptureModeGuard {
-    prev_mode: cuda_sys::CUstreamCaptureMode,
-}
-
-impl RelaxedCaptureModeGuard {
-    pub unsafe fn new() -> Self {
-        let mut mode = cuda_sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED;
-        // Exchange: sets relaxed, returns previous mode.
-        let _ = cuda_sys::cuThreadExchangeStreamCaptureMode(&mut mode);
-        Self { prev_mode: mode }
-    }
-}
-
-impl Drop for RelaxedCaptureModeGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = cuda_sys::cuThreadExchangeStreamCaptureMode(&mut self.prev_mode);
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Constants (matching PyTorch exactly)
@@ -158,9 +125,6 @@ pub struct CachingAllocator {
     all_blocks: Vec<*mut Block>,
     /// Active blocks keyed by ptr (for fast lookup on free).
     active_blocks: std::collections::HashMap<usize, *mut Block>,
-    /// Private pool redirect (for CUDA graph capture).
-    private_small_pool: Option<BlockPool>,
-    private_large_pool: Option<BlockPool>,
     /// Bytes currently live (allocated but not freed). Mirrors PyTorch's
     /// `allocated_bytes.all.current`.
     active_bytes: usize,
@@ -191,8 +155,6 @@ impl CachingAllocator {
             segments: Vec::new(),
             all_blocks: Vec::new(),
             active_blocks: std::collections::HashMap::new(),
-            private_small_pool: None,
-            private_large_pool: None,
             active_bytes: 0,
             peak_active_bytes: 0,
         }
@@ -215,44 +177,13 @@ impl CachingAllocator {
         self.peak_active_bytes
     }
 
-    /// Begin allocating to a private pool (for CUDA graph capture).
-    pub fn begin_allocate_to_pool(&mut self) {
-        assert!(
-            self.private_small_pool.is_none(),
-            "already allocating to a pool"
-        );
-        self.private_small_pool = Some(BlockPool::new(true));
-        self.private_large_pool = Some(BlockPool::new(false));
-    }
-
-    /// Stop allocating to the private pool, but keep the pools alive so their
-    /// blocks can be reused. This prevents memory leaks when CUDA graphs are
-    /// captured multiple times (e.g., for different batch sizes).
-    pub fn end_allocate_to_pool(&mut self) {
-        // Don't discard the private pools — keep them so blocks stay tracked
-        // and can be reused for future graph captures. Setting to None would
-        // leak all blocks allocated during capture.
-        // self.private_small_pool = None;
-        // self.private_large_pool = None;
-    }
-
-    pub fn is_pool_active(&self) -> bool {
-        self.private_small_pool.is_some()
-    }
-
     fn get_pool(&mut self, size: usize) -> &mut BlockPool {
         self.get_pool_by_flag(size <= K_SMALL_SIZE)
     }
 
     fn get_pool_by_flag(&mut self, is_small: bool) -> &mut BlockPool {
         if is_small {
-            if let Some(ref mut pp) = self.private_small_pool {
-                pp
-            } else {
-                &mut self.small_pool
-            }
-        } else if let Some(ref mut pp) = self.private_large_pool {
-            pp
+            &mut self.small_pool
         } else {
             &mut self.large_pool
         }
@@ -333,72 +264,17 @@ impl CachingAllocator {
             return block.ptr;
         }
 
-        // 2. Also try the main pools if using private pool.
-        if self.private_small_pool.is_some() {
-            let main_pool = if size <= K_SMALL_SIZE {
-                &mut self.small_pool
-            } else {
-                &mut self.large_pool
-            };
-            if let Some(block_ptr) = main_pool.find_best_fit(size) {
-                let block = unsafe { &mut *block_ptr };
-                main_pool.remove(block_ptr);
-
-                if Self::should_split(block, size) {
-                    let remaining_size = block.size - size;
-                    let remaining_ptr = unsafe { block.ptr.add(size) };
-
-                    let remaining = Box::into_raw(Box::new(Block {
-                        ptr: remaining_ptr,
-                        size: remaining_size,
-                        allocated: false,
-                        prev: block_ptr,
-                        next: block.next,
-                        pool_is_small: is_small,
-                    }));
-                    self.all_blocks.push(remaining);
-
-                    if !block.next.is_null() {
-                        unsafe { (*block.next).prev = remaining };
-                    }
-                    block.next = remaining;
-                    block.size = size;
-
-                    // Remainder stays in the same pool as the parent block.
-                    self.get_pool_by_flag(is_small).insert(remaining);
-                }
-
-                block.allocated = true;
-                self.active_blocks.insert(block.ptr as usize, block_ptr);
-                self.active_bytes += size;
-                if self.active_bytes > self.peak_active_bytes {
-                    self.peak_active_bytes = self.active_bytes;
-                }
-                return block.ptr;
-            }
-        }
-
-        // 3. Allocate a new segment from the CUDA driver.
-        //
-        // During CUDA graph capture, cudaMalloc is only allowed in relaxed
-        // capture mode. PyTorch does the same: CUDAStreamCaptureModeGuard
-        // switches to relaxed before allocating (CUDACachingAllocator.cpp:1177).
-        // The allocated VA is captured into the graph but the allocation itself
-        // is replayed as a no-op — safe as long as we never cudaFree before replay.
+        // 2. Allocate a new segment from the CUDA driver.
         let alloc_size = Self::get_allocation_size(size);
         tracing::debug!(
             "CachingAllocator: cudaMalloc {alloc_size} bytes for request of {size} bytes \
-             (small_free={}, large_free={}, private={}, segments={})",
+             (small_free={}, large_free={}, segments={})",
             self.small_pool.free_blocks.len(),
             self.large_pool.free_blocks.len(),
-            self.private_small_pool.is_some(),
             self.segments.len(),
         );
-        let segment_ptr = unsafe {
-            let _guard = RelaxedCaptureModeGuard::new();
-            driver::mem_alloc(alloc_size)
-        }
-        .expect("CachingAllocator: GPU OOM");
+        let segment_ptr =
+            unsafe { driver::mem_alloc(alloc_size) }.expect("CachingAllocator: GPU OOM");
         self.segments.push((segment_ptr, alloc_size));
 
         let block = Box::into_raw(Box::new(Block {
@@ -571,8 +447,6 @@ impl CachingAllocator {
         self.segments.clear();
         self.all_blocks.clear();
         self.active_blocks.clear();
-        self.private_small_pool = None;
-        self.private_large_pool = None;
         self.active_bytes = 0;
         self.peak_active_bytes = 0;
     }
@@ -1007,56 +881,6 @@ mod tests {
             assert_eq!(alloc.active_blocks.len(), 0); // removed by into_gpu_tensor
             let _ = gpu;
         }
-        #[test]
-        fn test_private_pool_blocks_not_leaked() {
-            init_cuda();
-            let mut alloc = CachingAllocator::new();
-
-            // Simulate CUDA graph capture: allocate to private pool.
-            alloc.begin_allocate_to_pool();
-
-            // Allocate some blocks during "graph capture".
-            let p1 = alloc.alloc(1024);
-            let p2 = alloc.alloc(2048);
-            assert!(!p1.is_null());
-            assert!(!p2.is_null());
-
-            // Track how many segments were allocated.
-            let segments_after_capture = alloc.segments.len();
-            assert!(segments_after_capture > 0);
-
-            // End pool allocation (simulating end of graph capture).
-            alloc.end_allocate_to_pool();
-
-            // BUG: Without the fix, the private pool blocks are lost (set to None).
-            // They're no longer tracked in any pool, causing a memory leak.
-            // The segments remain allocated but blocks can't be reused.
-
-            // Try to allocate again - this should reuse blocks from the private pool
-            // if they're still tracked, or allocate new segments if they were leaked.
-            let segments_before_realloc = alloc.segments.len();
-
-            // Allocate same sizes again - should reuse if private pool is kept.
-            let p3 = alloc.alloc(1024);
-            let p4 = alloc.alloc(2048);
-
-            // With the fix: no new segments needed (reuses private pool blocks).
-            // Without the fix: new segments allocated (private pool was discarded).
-            assert_eq!(
-                alloc.segments.len(),
-                segments_before_realloc,
-                "Private pool blocks should be reusable after end_allocate_to_pool()"
-            );
-
-            // Clean up.
-            unsafe {
-                alloc.free(p1, 1024);
-                alloc.free(p2, 2048);
-                alloc.free(p3, 1024);
-                alloc.free(p4, 2048);
-            }
-        }
-
         #[test]
         fn test_different_sizes_share_segment() {
             init_cuda();

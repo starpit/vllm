@@ -7,8 +7,7 @@
 //! shapes reuse it — eliminating ~20 API calls per GEMM.
 //!
 //! The workspace is bound to the handle via `cublasSetWorkspace()` at init,
-//! so cuBLAS never lazily allocates on the default stream — this is what
-//! makes CUDA graph capture work.
+//! so cuBLAS never lazily allocates on the default stream.
 
 use std::collections::HashMap;
 
@@ -36,8 +35,7 @@ struct PlanKey {
 }
 
 /// Maximum number of candidate algorithms to request from the cuBLAS heuristic.
-/// If the top-ranked algorithm fails at runtime (e.g. during CUDA graph capture),
-/// we fall back to the next candidate.
+/// If the top-ranked algorithm fails at runtime, we fall back to the next candidate.
 const MAX_ALGO_CANDIDATES: usize = 4;
 
 /// A cached cublasLt GEMM plan — holds pre-created descriptors and candidate algorithms.
@@ -115,9 +113,8 @@ impl CublasHandle {
     /// Create a new cuBLAS handle bound to `stream` with a pre-allocated workspace.
     ///
     /// Workspace is allocated from the caching allocator (not raw cudaMalloc)
-    /// so it participates in the graph-aware memory pool during CUDA graph
-    /// capture — matching PyTorch's CublasHandlePool.cpp:getNewWorkspace()
-    /// which allocates via CUDACachingAllocator::get()->allocate().
+    /// so it participates in the caching pool — matching PyTorch's
+    /// CublasHandlePool.cpp:getNewWorkspace().
     ///
     /// # Safety
     /// `stream` must be a valid non-default CUDA stream.
@@ -134,8 +131,6 @@ impl CublasHandle {
             sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
         ))?;
 
-        // Allocate workspace from the caching allocator so it's part of the
-        // graph-aware pool during CUDA graph capture.
         let workspace = alloc.alloc(CUBLAS_WORKSPACE_SIZE);
         check(sys::cublasSetWorkspace_v2(
             handle,
@@ -338,12 +333,7 @@ impl CublasHandle {
         self.plans.insert(key, plan);
     }
 
-    /// Execute a GEMM, handling both capture and non-capture paths.
-    ///
-    /// During CUDA graph capture, goes straight to cublasGemmEx without
-    /// creating cublasLt plans (plan creation via cublasLtMatmulAlgoGetHeuristic
-    /// can poison the capture). Outside capture, creates/caches cublasLt plans
-    /// for optimal algorithm selection.
+    /// Execute a GEMM using cublasLt with cached plans (falling back to cublasGemmEx).
     unsafe fn run_gemm(
         &mut self,
         key: PlanKey,
@@ -351,35 +341,6 @@ impl CublasHandle {
         b_ptr: *const std::ffi::c_void,
         out_ptr: *mut std::ffi::c_void,
     ) {
-        let _capture_guard = crate::alloc::RelaxedCaptureModeGuard::new();
-
-        let is_capturing = {
-            let mut status =
-                cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-            let ret = cudarc::driver::sys::cuStreamIsCapturing(self.stream, &mut status);
-            if ret == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                match status {
-                    cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE => true,
-                    cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED => {
-                        panic!(
-                            "CUDA graph capture already INVALIDATED before GEMM [M={}, K={}, N={}] {:?}",
-                            key.m, key.k, key.n, key.dtype,
-                        );
-                    }
-                    _ => false,
-                }
-            } else {
-                false
-            }
-        };
-
-        if is_capturing {
-            // Skip ensure_plan — cublasLtMatmulAlgoGetHeuristic can poison capture.
-            self.gemm_ex(&key, a_ptr, b_ptr, out_ptr);
-            return;
-        }
-
-        // Outside capture: use cublasLt with cached plans.
         self.ensure_plan(
             key.m,
             key.k,
@@ -393,7 +354,6 @@ impl CublasHandle {
     }
 
     /// Run a GEMM using cublasLt with fallback to cublasGemmEx.
-    /// Only called outside CUDA graph capture (capture path uses run_gemm directly).
     unsafe fn run_matmul_with_fallback(
         &self,
         plan: &GemmPlan,
@@ -449,7 +409,7 @@ impl CublasHandle {
             );
         }
 
-        // All cublasLt algorithms failed outside capture — fall back to cublasGemmEx.
+        // All cublasLt algorithms failed — fall back to cublasGemmEx.
         tracing::warn!(
             "cublasLtMatmul: all {} algos failed for GEMM [M={}, K={}, N={}] {:?}, \
              falling back to cublasGemmEx",
@@ -462,11 +422,7 @@ impl CublasHandle {
         self.gemm_ex(k, a_ptr, b_ptr, out_ptr);
     }
 
-    /// cublasGemmEx — always capture-safe.
-    ///
-    /// Uses CUBLAS_GEMM_DEFAULT which lets cuBLAS pick the algorithm
-    /// internally, matching PyTorch's default GEMM path.
-    /// Primary path during CUDA graph capture; fallback outside capture.
+    /// cublasGemmEx fallback using CUBLAS_GEMM_DEFAULT.
     unsafe fn gemm_ex(
         &self,
         k: &PlanKey,

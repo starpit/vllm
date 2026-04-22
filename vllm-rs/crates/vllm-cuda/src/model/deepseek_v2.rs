@@ -157,8 +157,9 @@ pub unsafe fn yarn_rotary_cache(
         .map(|i| {
             let freq = 1.0 / rope_theta.powf(2.0 * i as f64 / rope_dim as f64);
             let freq_inter = freq / factor;
-            // Blend: ramp[i]=0 → interpolated, ramp[i]=1 → original
-            freq_inter * (1.0 - ramp[i]) + freq * ramp[i]
+            // Blend: ramp[i]=0 → original (high-freq, small i), ramp[i]=1 → interpolated (low-freq, large i).
+            // Matches Python: inv_freq = interp*ramp + extrap*(1-ramp)
+            freq * (1.0 - ramp[i]) + freq_inter * ramp[i]
         })
         .collect();
 

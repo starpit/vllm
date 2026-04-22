@@ -266,6 +266,155 @@ impl SharedFusedMoELayer {
 }
 
 // ---------------------------------------------------------------------------
+// DeepSeekV2MoELayer
+// ---------------------------------------------------------------------------
+
+/// MoE layer for DeepSeek V2 / V3. Two differences from `SharedFusedMoELayer`:
+/// 1. Shared expert uses a **plain add** (no sigmoid gate).
+/// 2. Routed output is multiplied by `routed_scaling_factor` before the add.
+///
+/// Forward: `output = routed_scaling_factor * moe(x) + shared_expert(x)`
+pub struct DeepSeekV2MoELayer {
+    pub moe: FusedMoELayer,
+    /// Shared expert fused gate+up: `[2 * shared_inter, hidden_size]`.
+    pub shared_gate_up: crate::layers::Linear,
+    /// Shared expert down: `[hidden_size, shared_inter]`.
+    pub shared_down: crate::layers::Linear,
+    pub shared_intermediate_size: usize,
+    pub routed_scaling_factor: f32,
+}
+
+impl DeepSeekV2MoELayer {
+    /// Forward pass.
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let stream = device.compute_stream;
+
+        // Routed experts.
+        let moe_out = self.moe.forward(hidden_states, device);
+        if self.routed_scaling_factor != 1.0 {
+            kernels::scale_inplace(*moe_out.view(), self.routed_scaling_factor, &device.cublas);
+        }
+
+        // Shared expert: silu(gate_up) → down.
+        let shared_gu =
+            self.shared_gate_up
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+        let shared_activated = kernels::silu_and_mul_fused(
+            *shared_gu.view(),
+            self.shared_intermediate_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(shared_gu);
+        let shared_out = self.shared_down.forward(
+            shared_activated.view(),
+            &mut device.cublas,
+            &mut device.caching,
+        );
+        drop(shared_activated);
+
+        // output = moe_out + shared_out (no sigmoid gate).
+        kernels::add_inplace(*moe_out.view(), *shared_out.view(), stream);
+        drop(shared_out);
+        moe_out
+    }
+
+    /// Load from safetensors. `prefix` is the MLP prefix for this layer
+    /// (e.g. `model.layers.3.mlp`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        n_routed_experts: usize,
+        n_shared_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        hidden_size: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        use ferrite_cuda_core::driver;
+        use ferrite_cuda_core::tensor::GpuTensor;
+
+        let gate = crate::layers::Linear::load(gw, &format!("{prefix}.gate"))?;
+
+        let first_gate = format!("{prefix}.experts.0.gate_proj.weight");
+        let (_, dtype) = gw
+            .tensor_info(&first_gate)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {first_gate}"))?;
+        let elem = dtype.size_bytes();
+        let inter = moe_intermediate_size;
+
+        // Stack expert weights: w1 = [E, 2*inter, hidden], w2 = [E, hidden, inter].
+        let w1_bytes = n_routed_experts * 2 * inter * hidden_size * elem;
+        let w2_bytes = n_routed_experts * hidden_size * inter * elem;
+        let w1_ptr = unsafe { driver::mem_alloc(w1_bytes)? };
+        let w2_ptr = unsafe { driver::mem_alloc(w2_bytes)? };
+
+        for e in 0..n_routed_experts {
+            let gate_name = format!("{prefix}.experts.{e}.gate_proj.weight");
+            let up_name = format!("{prefix}.experts.{e}.up_proj.weight");
+            let down_name = format!("{prefix}.experts.{e}.down_proj.weight");
+            let expert_w1_off = e * 2 * inter * hidden_size * elem;
+            let gate_bytes = inter * hidden_size * elem;
+            let expert_w2_off = e * hidden_size * inter * elem;
+            unsafe {
+                gw.take_into(&gate_name, w1_ptr.add(expert_w1_off), stream)?;
+                gw.take_into(&up_name, w1_ptr.add(expert_w1_off + gate_bytes), stream)?;
+                gw.take_into(&down_name, w2_ptr.add(expert_w2_off), stream)?;
+            }
+        }
+
+        let w1 =
+            unsafe { GpuTensor::new(w1_ptr, &[n_routed_experts, 2 * inter, hidden_size], dtype) };
+        let w2 = unsafe { GpuTensor::new(w2_ptr, &[n_routed_experts, hidden_size, inter], dtype) };
+
+        let moe = FusedMoELayer {
+            gate,
+            w1,
+            w2,
+            num_experts: n_routed_experts,
+            top_k,
+            intermediate_size: inter,
+            hidden_size,
+            renormalize: norm_topk_prob,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        };
+
+        // Shared expert: concat gate_proj + up_proj → [2*shared_inter, hidden].
+        let shared_inter = n_shared_experts * moe_intermediate_size;
+        let shared_gate_name = format!("{prefix}.shared_experts.gate_proj.weight");
+        let shared_up_name = format!("{prefix}.shared_experts.up_proj.weight");
+        let gate_bytes = shared_inter * hidden_size * elem;
+        let shared_ptr = unsafe { driver::mem_alloc(2 * gate_bytes)? };
+        unsafe {
+            gw.take_into(&shared_gate_name, shared_ptr, stream)?;
+            gw.take_into(&shared_up_name, shared_ptr.add(gate_bytes), stream)?;
+        }
+        let shared_w =
+            unsafe { GpuTensor::new(shared_ptr, &[2 * shared_inter, hidden_size], dtype) };
+        let shared_gate_up = crate::layers::Linear::new(shared_w, None);
+
+        let shared_down =
+            crate::layers::Linear::load(gw, &format!("{prefix}.shared_experts.down_proj"))?;
+
+        Ok(Self {
+            moe,
+            shared_gate_up,
+            shared_down,
+            shared_intermediate_size: shared_inter,
+            routed_scaling_factor,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fp8FusedMoELayer (FP8 E4M3 quantized MoE)
 // ---------------------------------------------------------------------------
 

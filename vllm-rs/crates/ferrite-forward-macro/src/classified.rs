@@ -124,6 +124,24 @@ pub enum OpKind {
     /// `from_name` — add an entry there if a future pattern needs
     /// explicit user-written reshape.
     Reshape,
+    /// MLA kv_a split: decomposes `[T, kv_lora_rank + qk_rope_head_dim]`
+    /// into `(kv_latent: [T, kv_lora_rank], k_pe: [T, qk_rope_head_dim])`.
+    /// DSL form: `(kv_latent, k_pe) = mla_split(kv_a)`. Tuple-returning;
+    /// the 2-target binding is handled in `Stmt::AssignTuple`. Used
+    /// exclusively by DeepSeek V2/V3.
+    MlaSplit,
+    /// MLA full attention: applies interleaved RoPE to q_pe / k_pe, writes
+    /// compressed KV to paged cache, assembles full K and V from cached
+    /// kv_b + k_pe, runs flash attention, then slices the output to
+    /// `v_head_dim`. Consumes `q, kv_b, k_pe` plus externs
+    /// `(positions, rotary, kv_cache[layer], block_table)`. Output:
+    /// `[T, num_attention_heads * v_head_dim]`. Used by DeepSeek V2/V3.
+    MlaAttention,
+    /// DeepSeek V2/V3 MoE block: gate routing + top-K fused GEMM for
+    /// routed experts (scaled by `routed_scaling_factor`) plus shared
+    /// expert with a plain add (no sigmoid gate). DSL form:
+    /// `moe_out = deepseek_moe(x, moe[layer])`. Shape-preserving.
+    DeepSeekMoe,
 }
 
 impl OpKind {
@@ -147,6 +165,9 @@ impl OpKind {
             // `Reshape` is synthesized by shape inference, not DSL-
             // writable today. Intentionally not listed in `from_name`;
             // add the arm if a future pattern needs explicit reshape.
+            "mla_split" => Some(Self::MlaSplit),
+            "mla_attention" => Some(Self::MlaAttention),
+            "deepseek_moe" => Some(Self::DeepSeekMoe),
             _ => None,
         }
     }
@@ -168,6 +189,9 @@ impl OpKind {
             Self::BiasAdd => "bias_add",
             Self::Mul => "mul",
             Self::Reshape => "reshape",
+            Self::MlaSplit => "mla_split",
+            Self::MlaAttention => "mla_attention",
+            Self::DeepSeekMoe => "deepseek_moe",
         }
     }
 }

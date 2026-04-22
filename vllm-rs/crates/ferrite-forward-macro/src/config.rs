@@ -116,6 +116,16 @@ pub enum RopeScaling {
         short_mscale: f64,
         long_mscale: f64,
     },
+    /// `rope_scaling.type == "yarn"` — DeepSeek-V2 YaRN NTK-by-parts
+    /// interpolation with mscale correction.
+    Yarn {
+        factor: f64,
+        beta_fast: f64,
+        beta_slow: f64,
+        mscale: f64,
+        mscale_all_dim: f64,
+        original_max_position_embeddings: u64,
+    },
 }
 
 /// Errors produced while loading configs.
@@ -525,6 +535,28 @@ fn extract_rope_scaling(json: &serde_json::Value) -> Option<RopeScaling> {
                 original_max_position_embeddings,
                 short_mscale,
                 long_mscale,
+            })
+        }
+        "yarn" => {
+            let factor = rs.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let beta_fast = rs.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0);
+            let beta_slow = rs.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let mscale = rs.get("mscale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let mscale_all_dim = rs
+                .get("mscale_all_dim")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let original_max_position_embeddings = rs
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4096);
+            Some(RopeScaling::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                mscale,
+                mscale_all_dim,
+                original_max_position_embeddings,
             })
         }
         _ => None,

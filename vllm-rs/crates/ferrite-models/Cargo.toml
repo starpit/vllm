@@ -17,10 +17,12 @@ cuda = [
     "ferrite-model-phi3/cuda",
     "ferrite-model-qwen2/cuda",
     "ferrite-model-qwen3/cuda",
+    "ferrite-model-deepseek-v2/cuda",
 ]
 
 [dependencies]
 ferrite-model-commandr = { path = "../ferrite-model-commandr" }
+ferrite-model-deepseek-v2 = { path = "../ferrite-model-deepseek-v2" }
 ferrite-model-gemma2 = { path = "../ferrite-model-gemma2" }
 ferrite-model-gemma3 = { path = "../ferrite-model-gemma3" }
 ferrite-model-granite = { path = "../ferrite-model-granite" }

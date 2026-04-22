@@ -1473,6 +1473,13 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(Fp8FusedQkvRopeCacheImpl));
     lib.push(Box::new(Fp8FusedQkvRopePrefillImpl));
 
+    // ── DeepSeek MLA + MoE ops ───────────────────────────────────
+    // MLA split (kv_a → kv_latent + k_pe), full MLA attention
+    // sequence, and DeepSeekV2MoE (routed + shared expert).
+    lib.push(Box::new(MlaSplitRefImpl));
+    lib.push(Box::new(MlaAttentionImpl));
+    lib.push(Box::new(DeepSeekMoeRefImpl));
+
     // FlashInfer paged attention — one Decode + one Prefill Impl per
     // tuple in FLASHINFER_CONFIG_SET (see `ferrite-cuda-builder`). Each
     // variant's `target_compatible` gates on whether the calibrated CSV
@@ -10066,6 +10073,481 @@ impl Implementation for FlashInferAttentionPrefillImpl {
 
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
         emit_fi_prefill_body(ctx, self.head_dim, self.use_logits_soft_cap)
+    }
+}
+
+// ── MlaSplitRefImpl ──────────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::MlaSplit` — DeepSeek MLA's KV-A split.
+//
+// Input:  kv_a  [T, kv_lora_rank + qk_rope_head_dim]
+// Output 0: kv_latent  [T, kv_lora_rank]
+// Output 1: k_pe       [T, qk_rope_head_dim]
+//
+// Emits two alloc_tensor calls (one per output) then mla_split_kv_a.
+// Both outputs are OwnedTensors — no aliasing with upstream.
+
+#[derive(Debug, Default)]
+pub struct MlaSplitRefImpl;
+
+impl Implementation for MlaSplitRefImpl {
+    fn name(&self) -> &'static str {
+        "mla_split_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::MlaSplit)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let m = ctx.num_tokens() as f64;
+        let kv_lora_rank = ctx.bounds.get("kv_lora_rank").copied().unwrap_or(0) as f64;
+        let rope = ctx.bounds.get("qk_rope_head_dim").copied().unwrap_or(0) as f64;
+        let bytes = m * (kv_lora_rank + rope) * 2.0 * BYTES_PER_ELEM; // read + write
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let kv_a = ctx.input_expr(tile, 0);
+
+        let kv_lora_rank = ctx.bound("kv_lora_rank") as usize;
+        let rope_dim = ctx.bound("qk_rope_head_dim") as usize;
+
+        // MlaSplit has two outputs: (kv_latent, k_pe)
+        let kv_latent_out = ctx.output_ident(tile, 0);
+        let k_pe_out = ctx.output_ident(tile, 1);
+
+        quote! {
+            let (#kv_latent_out, #k_pe_out) = unsafe {
+                let kv_a_tv = #kv_a;
+                let nt = (*kv_a_tv).dim(0);
+                let dt = (*kv_a_tv).dtype();
+                let mut kv_latent = device.caching.alloc_tensor(&[nt, #kv_lora_rank], dt);
+                let mut k_pe = device.caching.alloc_tensor(&[nt, #rope_dim], dt);
+                ::ferrite_kernels::kernels::mla_split_kv_a(
+                    *kv_a_tv,
+                    *kv_latent.view(),
+                    *k_pe.view(),
+                    #kv_lora_rank,
+                    #rope_dim,
+                    device.compute_stream,
+                );
+                (kv_latent, k_pe)
+            };
+        }
+    }
+}
+
+// ── MlaAttentionImpl ─────────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::MlaAttention` — DeepSeek MLA full attention.
+//
+// DSL args: mla_attention(q, kv_b, k_pe, positions, rotary, kv_cache[layer], block_table)
+//   q    [T, num_heads * qk_head_dim]  (q_nope + q_pe interleaved per head)
+//   kv_b [T, num_heads * (nope_dim + v_head_dim)]
+//   k_pe [T, rope_dim]  (single head)
+//
+// Emits the full MLA sequence:
+//   1. mla_extract_q_pe (q → q_pe scratch)
+//   2. rotary_embedding_interleaved_inplace (q_pe + k_pe)
+//   3. mla_write_q_pe (rotated q_pe → back into q)
+//   4. mla_assemble_k (kv_b + k_pe → K)
+//   5. mla_assemble_v (kv_b → V zero-padded)
+//   6. write_kv_cache  (K, V → paged pool)
+//   7. attention_standard
+//   8. mla_slice_attn_output (qk_head_dim → v_head_dim)
+//
+// Output: [T, num_heads * v_head_dim]
+
+#[derive(Debug, Default)]
+pub struct MlaAttentionImpl;
+
+impl Implementation for MlaAttentionImpl {
+    fn name(&self) -> &'static str {
+        "mla_attention_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::MlaAttention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Use same analytic estimate as standard attention.
+        cost_attention(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let node = ctx.fuf.get(tile);
+
+        // DSL slots: 0=q, 1=kv_b, 2=k_pe
+        let q_expr = ctx.input_expr(tile, 0);
+        let kv_b_expr = ctx.input_expr(tile, 1);
+        let k_pe_expr = ctx.input_expr(tile, 2);
+
+        let layer = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Extern {
+                    kind: crate::classified::ExternKind::KvCache,
+                    index: Some(layer),
+                } => Some(*layer),
+                _ => None,
+            })
+            .expect("MlaAttention has a kv_cache extern with a concrete layer index")
+            as usize;
+
+        let num_heads = ctx.bound("num_attention_heads") as usize;
+        let qk_nope_head_dim = ctx.bound("qk_nope_head_dim") as usize;
+        let qk_rope_head_dim = ctx.bound("qk_rope_head_dim") as usize;
+        let v_head_dim = ctx.bound("v_head_dim") as usize;
+        let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+        // MLA softmax scale: 1/sqrt(qk_head_dim) * mscale_all_dim^2 for YaRN.
+        // Python's `DeepseekV2Attention.__init__` multiplies softmax_scale by
+        // yarn_get_mscale(factor, mscale_all_dim)^2 when mscale_all_dim != 0.
+        let base_scale: f32 = 1.0 / (qk_head_dim as f32).sqrt();
+        let scale: f32 = match &ctx.model.rope_scaling {
+            Some(crate::config::RopeScaling::Yarn {
+                factor,
+                mscale_all_dim,
+                ..
+            }) if *mscale_all_dim != 0.0 => {
+                let m = if *factor <= 1.0 {
+                    1.0_f64
+                } else {
+                    0.1 * mscale_all_dim * factor.ln() + 1.0
+                };
+                base_scale * (m * m) as f32
+            }
+            _ => base_scale,
+        };
+        // Rotary cos/sin cache lives on wm.rotary or wm.rotary_local —
+        // never on ctx. Use the same helper as all other rope impls.
+        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
+
+        quote! {
+            let mut #out = unsafe {
+                let q_tv = #q_expr;
+                let kv_b_tv = #kv_b_expr;
+                let k_pe_tv = #k_pe_expr;
+                let nt = (*q_tv).dim(0);
+                let dt = (*q_tv).dtype();
+
+                // 1. Extract q_pe: [T, num_heads * rope_dim]
+                let q_pe = device.caching.alloc_tensor(
+                    &[nt, #num_heads * #qk_rope_head_dim], dt,
+                );
+                ::ferrite_kernels::kernels::mla_extract_q_pe(
+                    *q_tv,
+                    *q_pe.view().reshape(&[nt, #num_heads * #qk_rope_head_dim]),
+                    #num_heads,
+                    #qk_head_dim,
+                    #qk_nope_head_dim,
+                    #qk_rope_head_dim,
+                    device.compute_stream,
+                );
+
+                // 2. Interleaved RoPE on q_pe + k_pe
+                ::ferrite_kernels::kernels::rotary_embedding_interleaved_inplace(
+                    *q_pe.view().reshape(&[nt, #num_heads * #qk_rope_head_dim]),
+                    *k_pe_tv,
+                    *ctx.positions,
+                    #rotary_cos_sin,
+                    #qk_rope_head_dim,
+                    device.compute_stream,
+                );
+
+                // 3. Write rotated q_pe back into q
+                ::ferrite_kernels::kernels::mla_write_q_pe(
+                    *q_pe.view().reshape(&[nt, #num_heads * #qk_rope_head_dim]),
+                    *q_tv,
+                    #num_heads,
+                    #qk_head_dim,
+                    #qk_nope_head_dim,
+                    #qk_rope_head_dim,
+                    device.compute_stream,
+                );
+                drop(q_pe);
+
+                // 4. Assemble K: [T, num_heads * qk_head_dim]
+                let k = device.caching.alloc_tensor(
+                    &[nt, #num_heads * #qk_head_dim], dt,
+                );
+                ::ferrite_kernels::kernels::mla_assemble_k(
+                    *kv_b_tv,
+                    *k_pe_tv,
+                    *k.view().reshape(&[nt, #num_heads * #qk_head_dim]),
+                    #num_heads,
+                    #qk_nope_head_dim,
+                    #qk_rope_head_dim,
+                    #v_head_dim,
+                    #qk_head_dim,
+                    device.compute_stream,
+                );
+
+                // 5. Assemble V (zero-padded): [T, num_heads * qk_head_dim]
+                let v = device.caching.alloc_tensor(
+                    &[nt, #num_heads * #qk_head_dim], dt,
+                );
+                ::ferrite_cuda_core::driver::memset_d8(
+                    (*v.view()).raw_ptr(),
+                    0,
+                    (*v.view()).size_bytes(),
+                    device.compute_stream,
+                ).expect("MLA: memset V");
+                ::ferrite_kernels::kernels::mla_assemble_v(
+                    *kv_b_tv,
+                    *v.view().reshape(&[nt, #num_heads * #qk_head_dim]),
+                    #num_heads,
+                    #qk_nope_head_dim,
+                    #v_head_dim,
+                    #qk_head_dim,
+                    device.compute_stream,
+                );
+
+                // 6. Write K, V to paged cache.
+                // Use view().reshape() — preserves the borrow lifetime of the
+                // OwnedTensor rather than the unsound (*x.view()).as_view() pattern.
+                // write_kv_cache takes TensorView<'_>, so pass the views directly.
+                let k_tv = k.view();
+                let k_3d = k_tv.reshape(&[nt, #num_heads, #qk_head_dim]);
+                let v_tv = v.view();
+                let v_3d = v_tv.reshape(&[nt, #num_heads, #qk_head_dim]);
+                ::ferrite_kernels::attention_helpers::write_kv_cache(
+                    k_3d,
+                    v_3d,
+                    ctx.slot_mapping,
+                    ctx.kv_cache,
+                    #layer,
+                    device.compute_stream,
+                );
+
+                // 7. attention_standard — all positional args are TensorView<'_>.
+                // q_tv is already TensorView, so reshape() directly.
+                let q_3d = q_tv.reshape(&[nt, #num_heads, #qk_head_dim]);
+                let attn = ::ferrite_kernels::attention_helpers::attention_standard(
+                    q_3d,
+                    k_3d,
+                    v_3d,
+                    ctx.cu_seqlens_q,
+                    ctx.seqused_k,
+                    ctx.block_table,
+                    ctx.max_seqlen_q,
+                    ctx.max_seqlen_k,
+                    #scale,
+                    ctx.kv_cache,
+                    #layer,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                    ::std::ptr::null(), // DeepSeek: no FA2 in-kernel RoPE
+                    0,
+                    false,
+                );
+                // NLL: k_tv/v_tv/k_3d/v_3d borrows of k/v end at last use above.
+                drop(k);
+                drop(v);
+
+                // 8. Slice attn output from qk_head_dim → v_head_dim.
+                // mla_slice_attn_output takes GpuTensor, so deref views with *.
+                let sliced = device.caching.alloc_tensor(
+                    &[nt, #num_heads * #v_head_dim], dt,
+                );
+                let attn_tv = attn.view();
+                let attn_flat = attn_tv.reshape(&[nt, #num_heads * #qk_head_dim]);
+                ::ferrite_kernels::kernels::mla_slice_attn_output(
+                    *attn_flat,
+                    *sliced.view(),
+                    #num_heads,
+                    #qk_head_dim,
+                    #v_head_dim,
+                    device.compute_stream,
+                );
+                drop(attn);
+                sliced
+            };
+        }
+    }
+}
+
+// ── DeepSeekMoeRefImpl ───────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::DeepSeekMoe` — DeepSeek MoE layer.
+//
+// DSL: moe_out = deepseek_moe(hidden_states, moe[layer])
+//
+// The `moe[layer]` weight resolves to a `DeepSeekV2MoELayer` struct.
+// Emits a direct call to `DeepSeekV2MoELayer::forward`.
+
+#[derive(Debug, Default)]
+pub struct DeepSeekMoeRefImpl;
+
+impl Implementation for DeepSeekMoeRefImpl {
+    fn name(&self) -> &'static str {
+        "deepseek_moe_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::DeepSeekMoe)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // The `moe[layer]` DSL weight maps to a DeepSeekV2MoELayer.
+        // Bypass `default_required_weights` which would assign LinearLayer type.
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for input in &node.inputs {
+            if let FufInput::Weight { id, index, .. } = input {
+                let name = weight_field_name(program, *id, *index);
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
+                out.push(WeightAccessor {
+                    name,
+                    rust_type: quote! {
+                        ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer
+                    },
+                    source_weights: vec![(*id, *index)],
+                });
+            }
+        }
+        out
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        // slot 0 = hidden_states (Tile), slot 1 = moe[layer] (Weight)
+        let x_expr = ctx.input_expr(tile, 0);
+        let moe_expr = ctx.input_expr(tile, 1);
+
+        quote! {
+            let mut #out = unsafe {
+                // forward takes TensorView<'_>; x_expr is already TensorView.
+                (#moe_expr).forward(#x_expr, device)
+            };
+        }
     }
 }
 

@@ -11,6 +11,7 @@
 //! `inventory::submit!` registrations must end up in the final binary.
 
 extern crate ferrite_model_commandr as _keep_commandr;
+extern crate ferrite_model_deepseek_v2 as _keep_deepseek_v2;
 extern crate ferrite_model_gemma2 as _keep_gemma2;
 extern crate ferrite_model_gemma3 as _keep_gemma3;
 extern crate ferrite_model_granite as _keep_granite;
@@ -21,6 +22,7 @@ extern crate ferrite_model_qwen2 as _keep_qwen2;
 extern crate ferrite_model_qwen3 as _keep_qwen3;
 
 pub use ferrite_model_commandr as commandr;
+pub use ferrite_model_deepseek_v2 as deepseek_v2;
 pub use ferrite_model_gemma2 as gemma2;
 pub use ferrite_model_gemma3 as gemma3;
 pub use ferrite_model_granite as granite;

@@ -61,6 +61,8 @@ fn safetensors_prefix(program: &Program, id: WeightId, index: Option<u64>) -> St
     let joined = program.weights.path(id).join(".");
     match (index, joined.as_str()) {
         (_, "lm_head") => "lm_head".to_string(),
+        // DeepSeek: the `moe` DSL name maps to `mlp` in HF safetensors.
+        (Some(l), "moe") => format!("model.layers.{l}.mlp"),
         (Some(l), _) => format!("model.layers.{l}.{joined}"),
         (None, _) => format!("model.{joined}"),
     }
@@ -134,6 +136,19 @@ enum FieldLoad {
     /// weight and 2-D block-scale shards along N). Shares the
     /// `__fp8_dtype` prelude binding with `FieldLoad::Fp8Linear`.
     Fp8BlockLinear { prefixes: Vec<String> },
+    /// DeepSeek V2/V3 MoE layer. One field per layer index; each
+    /// calls `DeepSeekV2MoELayer::load` with the per-arch constants
+    /// baked in as literals.
+    DeepSeekV2Moe {
+        prefix: String,
+        n_routed_experts: usize,
+        n_shared_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        hidden_size: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+    },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -187,6 +202,9 @@ fn plan_field_load(
     manifest: &crate::weights_manifest::WeightsManifest,
 ) -> FieldLoad {
     let ty = accessor.rust_type.to_string().replace(' ', "");
+    let is_deepseek_v2_moe = ty.ends_with("::DeepSeekV2MoELayer")
+        || ty == "DeepSeekV2MoELayer"
+        || ty.ends_with("layers_moe::DeepSeekV2MoELayer");
     let is_embedding =
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
     let is_rmsnorm =
@@ -439,6 +457,80 @@ fn plan_field_load(
             }
         }
         return FieldLoad::Fp8BlockLinear { prefixes };
+    }
+
+    if is_deepseek_v2_moe {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "DeepSeekV2MoELayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        // Read MoE params from the model config JSON.
+        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+        let n_routed_experts = v
+            .get("n_routed_experts")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model.bounds.get("n_routed_experts").copied().unwrap_or(64) as usize
+            });
+        let n_shared_experts = v
+            .get("n_shared_experts")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| model.bounds.get("n_shared_experts").copied().unwrap_or(2) as usize);
+        let top_k = v
+            .get("num_experts_per_tok")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("num_experts_per_tok")
+                    .copied()
+                    .unwrap_or(6) as usize
+            });
+        let moe_intermediate_size = v
+            .get("moe_intermediate_size")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("moe_intermediate_size")
+                    .copied()
+                    .unwrap_or(1536) as usize
+            });
+        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
+        let norm_topk_prob = v
+            .get("norm_topk_prob")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let routed_scaling_factor = v
+            .get("routed_scaling_factor")
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32)
+            .unwrap_or_else(|| {
+                model
+                    .scalars
+                    .get("routed_scaling_factor")
+                    .copied()
+                    .unwrap_or(1.0) as f32
+            });
+        return FieldLoad::DeepSeekV2Moe {
+            prefix,
+            n_routed_experts,
+            n_shared_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+            routed_scaling_factor,
+        };
     }
 
     if is_embedding {
@@ -735,6 +827,7 @@ fn emit_fingerprint_check(
     let rope_scaling_expected: Option<&'static str> = match &model.rope_scaling {
         Some(crate::config::RopeScaling::Llama3 { .. }) => Some("llama3"),
         Some(crate::config::RopeScaling::LongRope { .. }) => Some("longrope"),
+        Some(crate::config::RopeScaling::Yarn { .. }) => Some("yarn"),
         None => None,
     };
     let rope_scaling_check: TokenStream = match rope_scaling_expected {
@@ -1366,6 +1459,38 @@ fn emit_weights_struct(
                         }
                     }
                 }
+                FieldLoad::DeepSeekV2Moe {
+                    prefix,
+                    n_routed_experts,
+                    n_shared_experts,
+                    top_k,
+                    moe_intermediate_size,
+                    hidden_size,
+                    norm_topk_prob,
+                    routed_scaling_factor,
+                } => {
+                    let n_routed_experts = *n_routed_experts;
+                    let n_shared_experts = *n_shared_experts;
+                    let top_k = *top_k;
+                    let moe_intermediate_size = *moe_intermediate_size;
+                    let hidden_size = *hidden_size;
+                    let norm_topk_prob = *norm_topk_prob;
+                    let routed_scaling_factor = *routed_scaling_factor;
+                    quote! {
+                        let #name = ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer::load(
+                            gw,
+                            #prefix,
+                            #n_routed_experts,
+                            #n_shared_experts,
+                            #top_k,
+                            #moe_intermediate_size,
+                            #hidden_size,
+                            #norm_topk_prob,
+                            #routed_scaling_factor,
+                            stream,
+                        )?;
+                    }
+                }
             }
         })
         .collect();
@@ -1656,6 +1781,10 @@ fn emit_weights_struct(
             let rd = rd.round() as usize;
             quote! { #rd }
         });
+        // For YaRN (DeepSeek V2 MLA), the rope portion uses `qk_rope_head_dim`
+        // rather than the full `head_dim`. Pull it from bounds if present.
+        let yarn_rope_head_dim: Option<usize> =
+            model.bounds.get("qk_rope_head_dim").map(|&v| v as usize);
         let scaling = model.rope_scaling.clone();
         let body = match (rotary_dim_lit, scaling) {
             (None, None) => quote! {
@@ -1717,6 +1846,37 @@ fn emit_weights_struct(
                             original_max_position_embeddings: #orig,
                             short_mscale: #short_mscale,
                             long_mscale: #long_mscale,
+                        },
+                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        stream,
+                    )
+                }
+            }
+            (
+                _,
+                Some(crate::config::RopeScaling::Yarn {
+                    factor,
+                    beta_fast,
+                    beta_slow,
+                    mscale,
+                    mscale_all_dim,
+                    original_max_position_embeddings,
+                }),
+            ) => {
+                let orig = original_max_position_embeddings as usize;
+                let rope_hd = yarn_rope_head_dim.unwrap_or(head_dim);
+                quote! {
+                    ::ferrite_kernels::rotary::RotaryCache::new_yarn_from_stream(
+                        #rope_hd,
+                        #max_pos,
+                        #rope_theta,
+                        &::ferrite_kernels::rotary::YarnRopeScaling {
+                            factor: #factor,
+                            beta_fast: #beta_fast,
+                            beta_slow: #beta_slow,
+                            mscale: #mscale,
+                            mscale_all_dim: #mscale_all_dim,
+                            original_max_position_embeddings: #orig,
                         },
                         ::ferrite_cuda_core::dtype::DType::BF16,
                         stream,

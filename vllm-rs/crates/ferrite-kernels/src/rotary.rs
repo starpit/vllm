@@ -21,6 +21,62 @@ pub struct Llama3RopeScaling {
     pub original_max_position_embeddings: usize,
 }
 
+/// DeepSeek-V2 YaRN NTK-by-parts scaling parameters.
+/// Mirrors the `rope_scaling` subobject in the HF config JSON.
+#[derive(Debug, Clone)]
+pub struct YarnRopeScaling {
+    pub factor: f64,
+    pub beta_fast: f64,
+    pub beta_slow: f64,
+    pub mscale: f64,
+    pub mscale_all_dim: f64,
+    pub original_max_position_embeddings: usize,
+}
+
+fn yarn_get_mscale(scale: f64, mscale: f64) -> f64 {
+    if scale <= 1.0 {
+        1.0
+    } else {
+        0.1 * mscale * scale.ln() + 1.0
+    }
+}
+
+fn yarn_find_correction_range(
+    beta_fast: f64,
+    beta_slow: f64,
+    dim: usize,
+    base: f64,
+    original_max_pos: usize,
+) -> (f64, f64) {
+    let n_orig = original_max_pos as f64;
+    let low =
+        (n_orig / (beta_fast * 2.0 * std::f64::consts::PI)).ln() / (2.0 / dim as f64 * base.ln());
+    let high =
+        (n_orig / (beta_slow * 2.0 * std::f64::consts::PI)).ln() / (2.0 / dim as f64 * base.ln());
+    (
+        low.floor().max(0.0),
+        high.ceil().min(dim as f64 / 2.0 - 1.0),
+    )
+}
+
+fn yarn_linear_ramp_mask(low: f64, high: f64, dim: usize) -> Vec<f64> {
+    let len = dim / 2;
+    (0..len)
+        .map(|i| {
+            let t = i as f64;
+            if low >= high {
+                if t < low { 0.0 } else { 1.0 }
+            } else if t < low {
+                0.0
+            } else if t > high {
+                1.0
+            } else {
+                (t - low) / (high - low)
+            }
+        })
+        .collect()
+}
+
 /// Phi-3 / Phi-3.5 LongRoPE (su-scaling) parameters. Mirrors the
 /// fields Python vLLM's `Phi3LongRoPEScaledRotaryEmbedding`
 /// consumes 1:1 (see
@@ -388,6 +444,81 @@ impl RotaryCache {
             dtype,
             stream,
         )
+    }
+
+    /// Build a YaRN NTK-by-parts RoPE cos/sin cache for DeepSeek-V2 MLA.
+    ///
+    /// `rope_head_dim` is the head dimension of the rope portion only
+    /// (= `qk_rope_head_dim` = 64 for V2-Lite). The cache shape is
+    /// `[max_pos, rope_head_dim]` with cos in the first half and sin
+    /// in the second half.
+    ///
+    /// Bakes `yarn_get_mscale(factor, mscale)` into the cos/sin values so
+    /// the rotary kernel output is already mscale-corrected, matching
+    /// Python's `DeepseekScalingRotaryEmbedding` which multiplies the
+    /// rotary output by `self.mscale`.
+    ///
+    /// # Safety
+    /// Requires valid CUDA context and stream.
+    pub unsafe fn new_yarn_from_stream(
+        rope_head_dim: usize,
+        max_pos: usize,
+        rope_theta: f64,
+        yarn: &YarnRopeScaling,
+        dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let half = rope_head_dim / 2;
+        let factor = yarn.factor;
+        let (low, high) = yarn_find_correction_range(
+            yarn.beta_fast,
+            yarn.beta_slow,
+            rope_head_dim,
+            rope_theta,
+            yarn.original_max_position_embeddings,
+        );
+        let ramp = yarn_linear_ramp_mask(low, high, rope_head_dim);
+        // Python's DeepseekScalingRotaryEmbedding bakes
+        //   mscale = yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)
+        // into the cos/sin cache (mscale_all_dim^2 is handled separately in the attention
+        // softmax scale). For DeepSeek V2-Lite mscale==mscale_all_dim so this is 1.0.
+        let mscale_num = yarn_get_mscale(factor, yarn.mscale);
+        let mscale_den = if yarn.mscale_all_dim != 0.0 {
+            yarn_get_mscale(factor, yarn.mscale_all_dim)
+        } else {
+            1.0
+        };
+        let mscale = (mscale_num / mscale_den) as f32;
+
+        let inv_freqs: Vec<f64> = (0..half)
+            .map(|i| {
+                let freq = 1.0 / rope_theta.powf(2.0 * i as f64 / rope_head_dim as f64);
+                let freq_inter = freq / factor;
+                // ramp[i]=0 → original (high-freq, small i), ramp[i]=1 → interpolated (low-freq, large i).
+                // Matches Python: inv_freq = interp*ramp + extrap*(1-ramp)
+                freq * (1.0 - ramp[i]) + freq_inter * ramp[i]
+            })
+            .collect();
+
+        let mut cache = vec![0f32; max_pos * rope_head_dim];
+        for pos in 0..max_pos {
+            for i in 0..half {
+                let angle = pos as f64 * inv_freqs[i];
+                cache[pos * rope_head_dim + i] = angle.cos() as f32 * mscale;
+                cache[pos * rope_head_dim + half + i] = angle.sin() as f32 * mscale;
+            }
+        }
+
+        let cos_sin_cache = upload_combined_cos_sin(&cache, max_pos, rope_head_dim, dtype, stream)?;
+        let (cos_cache, sin_cache) =
+            Self::build_separate_cos_sin(&cache, max_pos, rope_head_dim, dtype, stream)?;
+
+        Ok(Self {
+            cos_sin_cache,
+            cos_cache,
+            sin_cache,
+            head_dim: rope_head_dim,
+        })
     }
 
     /// Build cos/sin cache with partial rotary dimension (rotary_dim < head_dim).

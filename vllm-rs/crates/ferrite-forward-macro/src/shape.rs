@@ -376,6 +376,9 @@ pub fn apply_signature(
                      Program::reshape_targets directly"
                 .into(),
         }),
+        OpKind::MlaSplit => sig_mla_split(solver, inputs),
+        OpKind::MlaAttention => sig_mla_attention(solver, inputs),
+        OpKind::DeepSeekMoe => sig_deepseek_moe(solver, inputs),
     }
 }
 
@@ -552,6 +555,57 @@ fn sig_attention(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeEr
     Ok(OpSig { output: q.clone() })
 }
 
+/// `mla_split(kv_a: [T, kv_lora_rank + qk_rope_head_dim])` → (used as
+/// single-output sig by `apply_signature`; actual 2-tuple binding happens
+/// in `Stmt::AssignTuple` which calls this path first for validation).
+/// Returns `kv_latent` shape `[T, kv_lora_rank]`.
+fn sig_mla_split(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::MlaSplit, inputs, 1)?;
+    let kv_a = &inputs[0];
+    if kv_a.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::MlaSplit,
+            reason: "kv_a must have rank >= 1".into(),
+        });
+    }
+    let t_dim = kv_a[0].clone();
+    Ok(OpSig {
+        output: vec![t_dim, Dim::Bound("kv_lora_rank".into())],
+    })
+}
+
+/// `mla_attention(q, kv_b, k_pe, positions, rotary, kv_cache, block_table)`
+/// → `[T, num_attention_heads * v_head_dim]`.
+/// The last 4 args are opaque externs (positions, rotary, kv_cache,
+/// block_table) with empty shapes; we only look at `q`'s token dim.
+fn sig_mla_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::MlaAttention, inputs, 7)?;
+    let q = &inputs[0];
+    if q.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::MlaAttention,
+            reason: "q must have rank >= 1".into(),
+        });
+    }
+    let out_dim = Dim::Mul(vec![
+        Dim::Bound("num_attention_heads".into()),
+        Dim::Bound("v_head_dim".into()),
+    ]);
+    Ok(OpSig {
+        output: vec![q[0].clone(), out_dim],
+    })
+}
+
+/// `deepseek_moe(x: [T, H], moe_weight)` → `[T, H]`. Shape-preserving;
+/// the second arg is a `DeepSeekV2MoELayer` struct (not a tensor) so it
+/// contributes an empty shape. Output = hidden_states shape.
+fn sig_deepseek_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::DeepSeekMoe, inputs, 2)?;
+    Ok(OpSig {
+        output: inputs[0].clone(),
+    })
+}
+
 /// Elementwise unary ops (silu, gelu, …) preserve shape.
 fn sig_unary_elementwise(
     _solver: &mut Solver,
@@ -633,6 +687,13 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::BiasAdd => &[(1, 1)],
         OpKind::Mul => &[],
         OpKind::Reshape => &[],
+        // MlaSplit takes 1 activation input; no tensor weight args.
+        OpKind::MlaSplit => &[],
+        // MlaAttention takes activation inputs + opaque externs; no tensor weight args.
+        OpKind::MlaAttention => &[],
+        // DeepSeekMoe's moe[layer] is a struct (not a tensor) at arg 1;
+        // weight_arg_ranks governs shape-rank assertion only, so we skip it.
+        OpKind::DeepSeekMoe => &[],
     }
 }
 
@@ -1357,13 +1418,43 @@ impl InferCtx {
                         self.locals.insert(*t, s.clone());
                     }
                     Ok(())
+                } else if let Expr::Call { op, args } = value
+                    && matches!(op, OpKind::MlaSplit)
+                {
+                    // `(kv_latent, k_pe) = mla_split(kv_a)`
+                    // kv_a: [T, kv_lora_rank + qk_rope_head_dim]
+                    // kv_latent: [T, kv_lora_rank]
+                    // k_pe: [T, qk_rope_head_dim]
+                    let kv_a_shape = self.expr_shape(&args[0])?;
+                    if targets.len() != 2 {
+                        return Err(ShapeError::BadArgs {
+                            op: *op,
+                            reason: format!(
+                                "mla_split returns 2 values, got {} targets",
+                                targets.len()
+                            ),
+                        });
+                    }
+                    let t_dim = kv_a_shape
+                        .first()
+                        .cloned()
+                        .unwrap_or(Dim::Bound("num_tokens".into()));
+                    self.locals.insert(
+                        targets[0],
+                        vec![t_dim.clone(), Dim::Bound("kv_lora_rank".into())],
+                    );
+                    self.locals.insert(
+                        targets[1],
+                        vec![t_dim, Dim::Bound("qk_rope_head_dim".into())],
+                    );
+                    Ok(())
                 } else {
                     Err(ShapeError::BadArgs {
                         op: match value {
                             Expr::Call { op, .. } => *op,
                             _ => OpKind::Add, // placeholder
                         },
-                        reason: "only rope_append / rope_append_interleaved return a tuple".into(),
+                        reason: "only rope_append, rope_append_interleaved, and mla_split return a tuple".into(),
                     })
                 }
             }

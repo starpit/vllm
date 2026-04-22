@@ -91,6 +91,12 @@ MODELS = {
     # `TestModels::GEMMA3_1B_IT_CUDA` so engine + golden run on the same
     # weights.
     "gemma3_1b": "unsloth/gemma-3-1b-it",
+    # DeepSeek-V2-Lite — `DeepseekV2ForCausalLM`, MLA + MoE (MLA=
+    # multi-latent attention with kv_lora_rank=512, q_lora_rank=null,
+    # qk_rope_head_dim=64 YaRN). Dense layer 0, MoE layers 1-26
+    # (64 routed experts + 2 shared, top-6). 15.7B total params,
+    # ~31 GB bf16. Fits single A100/L40S. max_model_len=2048.
+    "deepseek_v2_lite": "deepseek-ai/DeepSeek-V2-Lite",
     # CommandR (CohereForCausalLM) — 1-layer trim of real v01 by
     # Citaman (mergekit). Full v01 dims (hidden=8192, head_dim=128,
     # vocab=256000), single decoder layer → ~5GB bf16, fits L4.

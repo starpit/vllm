@@ -46,6 +46,6 @@ pub use layers::{
     RmsNorm, RowParallelLinear, VocabParallelEmbedding,
 };
 #[cfg(feature = "cuda")]
-pub use layers_moe::{MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
+pub use layers_moe::{DeepSeekV2MoELayer, MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
 #[cfg(feature = "cuda")]
-pub use rotary::{Llama3RopeScaling, LlamaConfig, LongRopeScaling, RotaryCache};
+pub use rotary::{Llama3RopeScaling, LlamaConfig, LongRopeScaling, RotaryCache, YarnRopeScaling};

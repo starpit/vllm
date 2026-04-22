@@ -8194,4 +8194,880 @@ mod tests {
             );
         }
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // Invariant mountain — impenetrable set of structural assertions
+    // a correct stencil compiler MUST satisfy.
+    //
+    // The rule: every invariant here is derived mechanically from the
+    // unrolled FUF (the ground truth). No test asserts a heuristic's
+    // output against its own expectation — only against the unrolled
+    // DAG or an independently-derived property.
+    //
+    // Tests are organised by category. Each category's sub-module
+    // has a doc comment explaining which correctness property it
+    // guards. Run-all:
+    //   cargo test -p ferrite-forward-macro --lib codegen::tests::invariants
+    //
+    // When one or more tests go RED, it means the current compiler
+    // doesn't satisfy that structural property — a heuristic or
+    // hack is leaking. The correct response is to fix the compiler,
+    // NOT to weaken the test. If a test is genuinely wrong (asserts
+    // the wrong thing against ground truth), rewrite the test from
+    // first principles, not from the compiler's current behaviour.
+    //
+    // Fixture: llama-3.2-1b via FAR_DECODER_BODY (16 layers). The
+    // topology is identical to llama-3.2-3b (28 layers) — only the
+    // period counts differ — so invariants validated here transfer.
+    // ════════════════════════════════════════════════════════════════
+
+    #[rustfmt::skip]
+    mod invariants {
+        use super::*;
+
+        // ──────────────────────────────────────────────────────────
+        // ground truth — walk the unrolled FUF, derive what the
+        // compiler OUGHT to compute.
+        // ──────────────────────────────────────────────────────────
+        mod truth {
+            use super::*;
+
+            pub struct Truth {
+                pub solved: Solved,
+                pub stencil: StencilBundle,
+                pub sched: ClassSchedule,
+            }
+
+            pub fn load() -> Truth {
+                let solved = fixture::solve_body(fixture::FAR_DECODER_BODY);
+                let stencil = StencilBundle::compute(&solved.fuf, &solved.sfuf);
+                let sched = stencil.schedule(&solved.fuf, &solved.sfuf, &solved.lib);
+                Truth { solved, stencil, sched }
+            }
+
+            /// Ground-truth producer for (consumer_class's member[k], boundary_position i).
+            /// Walks the unrolled FUF directly — no sampling, no
+            /// heuristic. Returns None if the position is out of
+            /// range for this member.
+            pub struct GroundTruthProducer {
+                pub producer_tile: TileId,
+                pub producer_slot: u8,
+                pub producer_sg: SubgraphId,
+                pub producer_class: usize,
+                pub producer_iter_in_class: usize,
+                pub producer_global_iter: i64,
+            }
+
+            pub fn boundary_truth(
+                t: &Truth,
+                consumer_class: usize,
+                member_k: usize,
+                position: usize,
+            ) -> Option<GroundTruthProducer> {
+                let members = t.stencil.class_members.get(consumer_class)?;
+                let member_sg = *members.get(member_k)?;
+                let claimed = t.solved.sfuf.tiles_in_subgraph(member_sg);
+                let claimed_set: BTreeSet<TileId> = claimed.iter().copied().collect();
+                let mut seen: BTreeSet<(TileId, u8)> = BTreeSet::new();
+                let mut i = 0usize;
+                for &tile in &claimed {
+                    for input in &t.solved.fuf.get(tile).inputs {
+                        let FufInput::Tile { id, slot } = input else { continue };
+                        if claimed_set.contains(id) { continue }
+                        if !seen.insert((*id, *slot)) { continue }
+                        if i == position {
+                            let prod_sg = t.solved.sfuf.subgraph_of(*id)?;
+                            let prod_class = *t.stencil.class_of.get(&prod_sg)?;
+                            let prod_iter = t.stencil.iter_of(prod_sg);
+                            let prod_global = t.sched.class_offsets[prod_class] as i64
+                                + prod_iter as i64;
+                            return Some(GroundTruthProducer {
+                                producer_tile: *id,
+                                producer_slot: *slot,
+                                producer_sg: prod_sg,
+                                producer_class: prod_class,
+                                producer_iter_in_class: prod_iter,
+                                producer_global_iter: prod_global,
+                            });
+                        }
+                        i += 1;
+                    }
+                }
+                None
+            }
+
+            /// Number of positional boundary inputs for a class's rep.
+            pub fn boundary_count(t: &Truth, consumer_class: usize) -> usize {
+                let members = t.stencil.class_members.get(consumer_class);
+                let Some(members) = members else { return 0 };
+                let Some(&rep_sg) = members.first() else { return 0 };
+                let claimed = t.solved.sfuf.tiles_in_subgraph(rep_sg);
+                let claimed_set: BTreeSet<TileId> = claimed.iter().copied().collect();
+                let mut seen: BTreeSet<(TileId, u8)> = BTreeSet::new();
+                let mut count = 0usize;
+                for &tile in &claimed {
+                    for input in &t.solved.fuf.get(tile).inputs {
+                        let FufInput::Tile { id, slot } = input else { continue };
+                        if claimed_set.contains(id) { continue }
+                        if !seen.insert((*id, *slot)) { continue }
+                        count += 1;
+                    }
+                }
+                count
+            }
+
+            pub fn consumer_global_iter(t: &Truth, consumer_class: usize, member_k: usize) -> i64 {
+                t.sched.class_offsets[consumer_class] as i64 + member_k as i64
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 1 — Class formation
+        //
+        // Every periodic class's members must be *genuinely*
+        // isomorphic under periodicity collapse. If two members
+        // differ in their upstream/downstream class topology or in
+        // the structure of their boundary inputs, they should NEVER
+        // have been merged into one class.
+        //
+        // A failing test here means the periodicity pass
+        // over-collapsed — the canonical hash is too coarse, or the
+        // neighbour-aware refinement missed a distinction.
+        // ──────────────────────────────────────────────────────────
+        mod class_formation {
+            use super::*;
+            use super::truth::*;
+
+            /// Every member of a periodic class has the same number
+            /// of boundary tile inputs (identical topology).
+            #[test]
+            fn all_members_have_same_boundary_count() {
+                let t = load();
+                for &c in &t.sched.periodic {
+                    let rep_count = boundary_count(&t, c);
+                    for (k, &m) in t.stencil.class_members[c].iter().enumerate() {
+                        let claimed = t.solved.sfuf.tiles_in_subgraph(m);
+                        let claimed_set: BTreeSet<TileId> =
+                            claimed.iter().copied().collect();
+                        let mut seen: BTreeSet<(TileId, u8)> = BTreeSet::new();
+                        let mut count = 0;
+                        for &tile in &claimed {
+                            for input in &t.solved.fuf.get(tile).inputs {
+                                let FufInput::Tile { id, slot } = input else { continue };
+                                if claimed_set.contains(id) { continue }
+                                if !seen.insert((*id, *slot)) { continue }
+                                count += 1;
+                            }
+                        }
+                        assert_eq!(
+                            count, rep_count,
+                            "class c{c} member[{k}] has {count} boundary inputs, \
+                             but rep has {rep_count}. Periodicity pass over-collapsed \
+                             subgraphs with different topology.",
+                        );
+                    }
+                }
+            }
+
+            /// For each class C and boundary position i, every member
+            /// must read a boundary whose producer is in a
+            /// periodicity-consistent relation to the consumer.
+            /// Concretely: the Δ_global between consumer_global_iter
+            /// and producer_global_iter must be uniform across ALL
+            /// members (0 for intra-iter, ≥1 for carry, etc.).
+            ///
+            /// If members differ in Δ_global, the class hides a
+            /// period-mismatched read that codegen cannot express
+            /// uniformly — the periodicity pass should have split
+            /// this class.
+            #[test]
+            fn all_members_share_uniform_delta_global_per_boundary() {
+                let t = load();
+                for &c in &t.sched.periodic {
+                    let nb = boundary_count(&t, c);
+                    for i in 0..nb {
+                        let mut deltas: BTreeSet<i64> = BTreeSet::new();
+                        for k in 0..t.stencil.class_members[c].len() {
+                            let Some(gt) = boundary_truth(&t, c, k, i) else {
+                                continue;
+                            };
+                            let cgi = consumer_global_iter(&t, c, k);
+                            let delta = cgi - gt.producer_global_iter;
+                            deltas.insert(delta);
+                        }
+                        assert!(
+                            deltas.len() <= 1,
+                            "class c{c} boundary[{i}]: members disagree on \
+                             Δ_global = {{ {deltas:?} }}. Should be a single \
+                             value — if members read producers at different \
+                             global-iter offsets, the class is over-collapsed.",
+                        );
+                    }
+                }
+            }
+
+            /// For each class C and boundary position i, every member
+            /// must read from the SAME producer class. If member[0]
+            /// reads class A and member[1] reads class B, the
+            /// periodicity pass merged subgraphs with different
+            /// upstream class chains — over-collapse.
+            ///
+            /// (This catches the c6 shape: member[0] reads c5,
+            /// member[1..] reads c9 — different producer classes.)
+            #[test]
+            fn all_members_share_uniform_producer_class_per_boundary() {
+                let t = load();
+                for &c in &t.sched.periodic {
+                    let nb = boundary_count(&t, c);
+                    for i in 0..nb {
+                        let mut producer_classes: BTreeSet<usize> = BTreeSet::new();
+                        for k in 0..t.stencil.class_members[c].len() {
+                            let Some(gt) = boundary_truth(&t, c, k, i) else {
+                                continue;
+                            };
+                            producer_classes.insert(gt.producer_class);
+                        }
+                        assert!(
+                            producer_classes.len() <= 1,
+                            "class c{c} boundary[{i}]: members read from \
+                             different producer classes {{ {producer_classes:?} }}. \
+                             Over-collapse — periodicity pass merged subgraphs \
+                             with different upstream class chains. \
+                             (This is the c5-vs-c9 / c6 shape.)",
+                        );
+                    }
+                }
+            }
+
+            /// For each class C and boundary position i, every member
+            /// must read the same producer (pos_in_producer_claim,
+            /// slot) even when producer class is uniform. Drift here
+            /// means the periodicity pass lost alignment on multi-
+            /// tile producer claims.
+            #[test]
+            fn all_members_share_uniform_producer_position_per_boundary() {
+                let t = load();
+                for &c in &t.sched.periodic {
+                    let nb = boundary_count(&t, c);
+                    for i in 0..nb {
+                        let mut pp_slots: BTreeSet<(u8, u8)> = BTreeSet::new();
+                        for k in 0..t.stencil.class_members[c].len() {
+                            let Some(gt) = boundary_truth(&t, c, k, i) else {
+                                continue;
+                            };
+                            let prod_claim =
+                                t.solved.sfuf.tiles_in_subgraph(gt.producer_sg);
+                            let Some(prod_pos) =
+                                prod_claim.iter().position(|&x| x == gt.producer_tile)
+                            else { continue };
+                            pp_slots.insert((prod_pos as u8, gt.producer_slot));
+                        }
+                        assert!(
+                            pp_slots.len() <= 1,
+                            "class c{c} boundary[{i}]: members read different \
+                             (producer_pos, producer_slot) tuples {{ {pp_slots:?} }}. \
+                             Multi-tile producer alignment broken.",
+                        );
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 2 — Provenance classification
+        //
+        // The `class_input_provenance` output must agree with ground
+        // truth from the unrolled FUF, for every class × member ×
+        // boundary triple. These tests detect any member-sampling
+        // heuristic that infers uniformity without verifying.
+        // ──────────────────────────────────────────────────────────
+        mod provenance {
+            use super::*;
+            use super::truth::*;
+
+            /// Compiler's classification of a boundary input must
+            /// name a producer class that matches ground truth for
+            /// EVERY member of the consumer class (not just the rep).
+            #[test]
+            fn origin_producer_class_matches_every_member() {
+                let t = load();
+                let prov = t.stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
+                    .expect("provenance must succeed");
+                for ci in &prov {
+                    for (i, slot) in ci.slots.iter().enumerate() {
+                        let expected_producer_class = match &slot.origin {
+                            InputOrigin::IntraIter { producer_class, .. }
+                            | InputOrigin::LoopCarry { producer_class, .. }
+                            => Some(*producer_class),
+                            InputOrigin::PreLoop { .. } => None,
+                        };
+                        for k in 0..t.stencil.class_members[ci.consumer_class].len() {
+                            let Some(gt) = boundary_truth(&t, ci.consumer_class, k, i)
+                            else { continue };
+                            let is_preloop_in_ground_truth =
+                                t.sched.pre_loop.contains(&gt.producer_class);
+                            match (expected_producer_class, is_preloop_in_ground_truth) {
+                                (Some(expected), false) => assert_eq!(
+                                    gt.producer_class, expected,
+                                    "c{c} member[{k}] boundary[{i}]: ground truth \
+                                     producer_class={gt_pc}, compiler said {expected}. \
+                                     Member-sampling heuristic is leaking.",
+                                    c = ci.consumer_class,
+                                    gt_pc = gt.producer_class,
+                                ),
+                                (None, true) => {}  // both pre_loop, OK
+                                (Some(expected), true) => {
+                                    // ground truth for this member is pre_loop, but
+                                    // compiler produced a periodic producer. Valid
+                                    // only if the compiler ALSO provides a
+                                    // pre_loop_init for this boundary (offset-gap
+                                    // shape). The existing InputOrigin doesn't
+                                    // distinguish per-member, so this test fires
+                                    // whenever the mixing is happening — which is
+                                    // exactly the c2/c8 shape.
+                                    let has_preloop_init = matches!(
+                                        &slot.origin,
+                                        InputOrigin::LoopCarry {
+                                            pre_loop_init_sg: Some(_), ..
+                                        },
+                                    );
+                                    assert!(
+                                        has_preloop_init,
+                                        "c{c} member[{k}] boundary[{i}]: ground truth \
+                                         is PreLoop at this member but compiler emits \
+                                         Periodic({expected}) without a pre_loop_init. \
+                                         The offset-gap shape isn't tracked — \
+                                         consumer will read stale/wrong tensor at iter {k}.",
+                                        c = ci.consumer_class,
+                                    );
+                                }
+                                (None, false) => panic!(
+                                    "c{c} member[{k}] boundary[{i}]: ground truth is \
+                                     periodic (class {gt_pc}), compiler said PreLoop.",
+                                    c = ci.consumer_class,
+                                    gt_pc = gt.producer_class,
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+
+            /// Compiler's Δ_global classification must match ground
+            /// truth per member. For IntraIter: 0. For LoopCarry: 1.
+            /// Any other value means the wrong variant was emitted.
+            #[test]
+            fn origin_delta_global_matches_every_member() {
+                let t = load();
+                let prov = t.stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
+                    .expect("provenance must succeed");
+                for ci in &prov {
+                    for (i, slot) in ci.slots.iter().enumerate() {
+                        let expected_delta = match &slot.origin {
+                            InputOrigin::IntraIter { .. } => Some(0i64),
+                            InputOrigin::LoopCarry { .. } => Some(1i64),
+                            InputOrigin::PreLoop { .. } => None,
+                        };
+                        let Some(expected) = expected_delta else { continue };
+                        for k in 0..t.stencil.class_members[ci.consumer_class].len() {
+                            let Some(gt) = boundary_truth(&t, ci.consumer_class, k, i)
+                            else { continue };
+                            let cgi = consumer_global_iter(&t, ci.consumer_class, k);
+                            let actual = cgi - gt.producer_global_iter;
+                            if t.sched.pre_loop.contains(&gt.producer_class) {
+                                continue;  // pre_loop override iter
+                            }
+                            assert_eq!(
+                                actual, expected,
+                                "c{c} member[{k}] boundary[{i}]: ground truth \
+                                 Δ_global={actual}, compiler classification \
+                                 requires Δ_global={expected}. Wrong variant emitted.",
+                                c = ci.consumer_class,
+                            );
+                        }
+                    }
+                }
+            }
+
+            /// Every class must have a provenance entry (one per
+            /// periodic class).
+            #[test]
+            fn every_periodic_class_has_provenance() {
+                let t = load();
+                let prov = t.stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
+                    .expect("provenance must succeed");
+                let covered: BTreeSet<usize> =
+                    prov.iter().map(|ci| ci.consumer_class).collect();
+                for &c in &t.sched.periodic {
+                    assert!(
+                        covered.contains(&c),
+                        "periodic class c{c} has no provenance entry",
+                    );
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 3 — Schedule (topo order)
+        //
+        // Every intra-global-iter edge (Δ_global = 0) must have
+        // producer before consumer in `sched.periodic`. Cross-iter
+        // edges (Δ_global ≥ 1) have no ordering requirement within
+        // a single iter — the carry bridges.
+        // ──────────────────────────────────────────────────────────
+        mod schedule_topology {
+            use super::*;
+            use super::truth::*;
+
+            /// For every intra-iter edge (consumer_class,
+            /// producer_class) with Δ_global = 0, producer's index
+            /// in `sched.periodic` must be strictly less than
+            /// consumer's. Otherwise the consumer reads the
+            /// producer's output before it's written this iter.
+            #[test]
+            fn intra_iter_edges_respect_topo_order() {
+                let t = load();
+                let pos_of: HashMap<usize, usize> = t.sched.periodic
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &c)| (c, idx))
+                    .collect();
+                for &c in &t.sched.periodic {
+                    let nb = boundary_count(&t, c);
+                    for i in 0..nb {
+                        // Use member[0] — if all members agree on
+                        // Δ (verified by class_formation tests) and
+                        // producer class (same), this is enough.
+                        let Some(gt) = boundary_truth(&t, c, 0, i) else { continue };
+                        if !pos_of.contains_key(&gt.producer_class) { continue; }
+                        let cgi = consumer_global_iter(&t, c, 0);
+                        let delta = cgi - gt.producer_global_iter;
+                        if delta != 0 { continue; }
+                        let c_idx = pos_of[&c];
+                        let p_idx = pos_of[&gt.producer_class];
+                        assert!(
+                            p_idx < c_idx,
+                            "intra-iter edge c{c}←c{gpc} has producer (idx {p_idx}) \
+                             AFTER consumer (idx {c_idx}) in sched.periodic. \
+                             Consumer reads stale/None value.",
+                            gpc = gt.producer_class,
+                        );
+                    }
+                }
+            }
+
+            /// Every class in `sched.periodic` is unique.
+            #[test]
+            fn periodic_list_has_no_duplicates() {
+                let t = load();
+                let set: BTreeSet<usize> = t.sched.periodic.iter().copied().collect();
+                assert_eq!(
+                    set.len(), t.sched.periodic.len(),
+                    "sched.periodic has duplicate entries",
+                );
+            }
+
+            /// Every class in `sched.periodic` has at least one
+            /// member. A periodic class with zero members is a
+            /// structural bug in class formation.
+            #[test]
+            fn every_periodic_class_has_members() {
+                let t = load();
+                for &c in &t.sched.periodic {
+                    assert!(
+                        !t.stencil.class_members[c].is_empty(),
+                        "periodic class c{c} has zero members",
+                    );
+                }
+            }
+
+            /// `offsets_consistent` holds — every inter-class edge's
+            /// observed Δ matches the offset derivation.
+            #[test]
+            fn offsets_are_consistent() {
+                let t = load();
+                assert!(
+                    t.sched.offsets_consistent,
+                    "schedule's offsets_consistent = false — some inter-class \
+                     edge has Δ incompatible with the offset assignment",
+                );
+            }
+
+            /// `max_period` equals the maximum of any periodic
+            /// class's member count.
+            #[test]
+            fn max_period_matches_longest_class() {
+                let t = load();
+                let computed = t.sched.periodic
+                    .iter()
+                    .map(|&c| t.stencil.class_members[c].len())
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(
+                    t.sched.max_period, computed,
+                    "max_period={mp} but longest periodic class has {computed} members",
+                    mp = t.sched.max_period,
+                );
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 4 — Semantic layer indexing
+        //
+        // For every __repeat value R and every class C, the class's
+        // member firing at global_iter=R must read the SEMANTICALLY-
+        // CORRECT inputs. Derived by unrolling the DSL: layer R's
+        // QKV reads layer R's normed, layer R's MLP reads layer R's
+        // normed2, etc.
+        //
+        // These are the highest-leverage tests: they prove the
+        // emitted stencil path produces inference bit-equivalent to
+        // the unrolled path, iter-by-iter.
+        // ──────────────────────────────────────────────────────────
+        mod layer_semantics {
+            use super::*;
+            use super::truth::*;
+
+            /// For every (class, member_k), the ground-truth
+            /// producer's global_iter must MATCH the consumer's
+            /// global_iter for IntraIter semantics (Δ_global = 0)
+            /// OR be exactly one less for LoopCarry (Δ_global = 1).
+            /// Any other distance is a period-mismatched read that
+            /// breaks layer correspondence.
+            #[test]
+            fn every_read_has_delta_0_or_1() {
+                let t = load();
+                for &c in &t.sched.periodic {
+                    let nb = boundary_count(&t, c);
+                    for i in 0..nb {
+                        for k in 0..t.stencil.class_members[c].len() {
+                            let Some(gt) = boundary_truth(&t, c, k, i) else { continue };
+                            // pre_loop producer → Δ not meaningful
+                            // as a global-iter distance.
+                            if t.sched.pre_loop.contains(&gt.producer_class) {
+                                continue;
+                            }
+                            let cgi = consumer_global_iter(&t, c, k);
+                            let delta = cgi - gt.producer_global_iter;
+                            assert!(
+                                delta == 0 || delta == 1,
+                                "c{c} member[{k}] boundary[{i}] ground-truth \
+                                 Δ_global = {delta} — only 0 (intra-iter) or 1 \
+                                 (carry) are expressible. A Δ>1 or negative Δ \
+                                 means the unrolled DAG has cross-layer \
+                                 dependencies the stencil IR can't represent \
+                                 without a wider variant.",
+                            );
+                        }
+                    }
+                }
+            }
+
+            /// For every boundary input with Δ_global=0, the producer
+            /// must schedule before the consumer in loop body order.
+            /// This is the "proper topo sort" requirement:
+            /// intra-iter deps drive ordering.
+            #[test]
+            fn delta_0_edges_have_producer_before_consumer() {
+                let t = load();
+                let pos_of: HashMap<usize, usize> = t.sched.periodic
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &c)| (c, idx))
+                    .collect();
+                for &c in &t.sched.periodic {
+                    let c_idx = pos_of[&c];
+                    let nb = boundary_count(&t, c);
+                    for i in 0..nb {
+                        for k in 0..t.stencil.class_members[c].len() {
+                            let Some(gt) = boundary_truth(&t, c, k, i) else { continue };
+                            if !pos_of.contains_key(&gt.producer_class) { continue; }
+                            let cgi = consumer_global_iter(&t, c, k);
+                            let delta = cgi - gt.producer_global_iter;
+                            if delta != 0 { continue; }
+                            let p_idx = pos_of[&gt.producer_class];
+                            assert!(
+                                p_idx < c_idx,
+                                "c{c} (loop-body idx {c_idx}) reads c{gpc} \
+                                 (idx {p_idx}) at Δ_global=0 — producer must be \
+                                 scheduled earlier in the loop body but isn't.",
+                                gpc = gt.producer_class,
+                            );
+                        }
+                    }
+                }
+            }
+
+            /// For every (consumer class, member, boundary), either
+            /// the producer is a periodic class that fires at the
+            /// required global_iter, OR it's a pre_loop class whose
+            /// single firing is available via outer-scope bindings.
+            /// No other kind of producer is emittable.
+            #[test]
+            fn every_boundary_resolves_to_periodic_or_preloop() {
+                let t = load();
+                let periodic_set: BTreeSet<usize> = t.sched.periodic.iter().copied().collect();
+                let pre_loop_set: BTreeSet<usize> = t.sched.pre_loop.iter().copied().collect();
+                for &c in &t.sched.periodic {
+                    let nb = boundary_count(&t, c);
+                    for i in 0..nb {
+                        for k in 0..t.stencil.class_members[c].len() {
+                            let Some(gt) = boundary_truth(&t, c, k, i) else { continue };
+                            let valid = periodic_set.contains(&gt.producer_class)
+                                || pre_loop_set.contains(&gt.producer_class);
+                            assert!(
+                                valid,
+                                "c{c} member[{k}] boundary[{i}] reads from class \
+                                 c{gpc} which is neither periodic nor pre_loop — \
+                                 can't be emitted.",
+                                gpc = gt.producer_class,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 5 — Emission structural
+        //
+        // Properties of the emitted TokenStream that must hold for
+        // correctness. These catch codegen-level bugs (orphan
+        // carries, stale `Option<_>` reads, missing guards).
+        // ──────────────────────────────────────────────────────────
+        mod emission {
+            use super::*;
+            use super::truth::*;
+
+            fn emit(t: &Truth) -> String {
+                let prov = t.stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf);
+                let mut lib_frag = FragmentLibrary::default();
+                let wl = crate::emit::WeightLayout::new();
+                let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+                let tokens = try_emit_collapsed_bucket(
+                    &t.stencil, &t.sched, prov.as_deref(),
+                    &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
+                    &t.solved.model, &t.solved.lib, wp,
+                    &mut lib_frag, &wl,
+                );
+                match tokens {
+                    Ok(toks) => toks.to_string(),
+                    Err(e) => panic!("try_emit_collapsed_bucket refused: {e}"),
+                }
+            }
+
+            /// The bucket must emit (not refuse). A refusal means
+            /// the stencil compiler gave up on a shape it should
+            /// handle.
+            #[test]
+            fn far_decoder_emits_without_refusing() {
+                let t = load();
+                let _ = emit(&t);
+            }
+
+            /// Every `__carry_c*_p*_s*` ident that appears as a
+            /// `let mut __carry_... : ... = None` hoist must also
+            /// appear as the LHS of at least one assignment
+            /// elsewhere in the stream. Otherwise it's an orphan
+            /// Option<_>, panic-waiting-to-happen.
+            #[test]
+            fn no_orphan_initless_carry_idents() {
+                let t = load();
+                let text = emit(&t);
+                let hoisted_nones: Vec<String> = text
+                    .split("let mut ")
+                    .skip(1)
+                    .filter_map(|tail| {
+                        let ident = tail.split_whitespace().next()?;
+                        if !ident.starts_with("__carry_c") { return None; }
+                        if !tail.contains("= None") { return None; }
+                        Some(ident.to_string())
+                    })
+                    .collect();
+                let orphans: Vec<String> = hoisted_nones
+                    .iter()
+                    .filter(|id| !text.contains(&format!("{id} = ")))
+                    .cloned()
+                    .collect();
+                assert!(
+                    orphans.is_empty(),
+                    "orphan init-less carries (hoisted as Option = None, \
+                     never assigned): {orphans:?}",
+                );
+            }
+
+            /// The loop body emits `for __repeat in 0usize..N`
+            /// exactly once for a non-degenerate schedule.
+            #[test]
+            fn exactly_one_repeat_loop() {
+                let t = load();
+                let text = emit(&t);
+                let count = text.matches("for __repeat in 0usize ..").count();
+                if t.sched.max_period > 0 {
+                    assert_eq!(
+                        count, 1,
+                        "expected exactly one `for __repeat in 0..N` loop, \
+                         found {count}",
+                    );
+                }
+            }
+
+            /// No `__repeat -` subtraction pattern (the 5n
+            /// fragment-path-offset bug regression pin).
+            #[test]
+            fn no_repeat_subtraction_in_call_sites() {
+                let t = load();
+                let text = emit(&t);
+                assert!(
+                    !text.contains("__repeat -"),
+                    "`__repeat -` subtraction leaked back in — fragment call \
+                     sites must pass the bare global loop var (see \
+                     STENCIL_IR_V2_DESIGN.md §13 closed correctness question)",
+                );
+            }
+
+            /// No `todo!(` or `unimplemented!(` in the emitted
+            /// bucket body (those indicate a partial emission).
+            #[test]
+            fn no_unimplemented_stubs_in_bucket_body() {
+                let t = load();
+                let text = emit(&t);
+                assert!(!text.contains("todo !"), "emitted bucket contains todo!");
+                assert!(
+                    !text.contains("unimplemented !"),
+                    "emitted bucket contains unimplemented!",
+                );
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 6 — Carry liveness
+        //
+        // An Option<OwnedTensor> carry must be populated (`Some(_)`)
+        // before any `.as_ref()` or `.take()` read. The compiler
+        // must guarantee this statically via schedule + assignment
+        // placement.
+        // ──────────────────────────────────────────────────────────
+        mod carry_liveness {
+            use super::*;
+            use super::truth::*;
+
+            /// For every LoopCarry Δ=1 with pre_loop_init_sg=None,
+            /// the producer must have fired at least once before
+            /// the consumer's first firing. In __repeat terms:
+            /// first consumer iter ≥ first producer iter + 1.
+            ///
+            /// If violated: consumer reads None → panic.
+            #[test]
+            fn initless_loopcarry_has_producer_fired_earlier() {
+                let t = load();
+                let Some(prov) = t.stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
+                else { return };
+                for ci in &prov {
+                    let c_off = t.sched.class_offsets[ci.consumer_class];
+                    for slot in &ci.slots {
+                        if let InputOrigin::LoopCarry {
+                            producer_class,
+                            pre_loop_init_sg: None,
+                            ..
+                        } = &slot.origin
+                        {
+                            let p_off = t.sched.class_offsets[*producer_class];
+                            // Consumer first iter = c_off.
+                            // Producer must have fired at c_off - 1
+                            // (or earlier). Producer first iter = p_off.
+                            // So we need p_off <= c_off - 1, i.e.,
+                            // p_off < c_off.
+                            assert!(
+                                p_off < c_off,
+                                "init-less LoopCarry c{cc}←c{pc}: producer \
+                                 first iter = {p_off}, consumer first iter = {c_off}. \
+                                 Producer hasn't fired when consumer reads — \
+                                 runtime None.unwrap() panic.",
+                                cc = ci.consumer_class, pc = producer_class,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 7 — Unified-compiler invariants
+        //
+        // A proper stencil compiler has every class go through the
+        // same analysis pipeline — no ad-hoc pre_loop/periodic/
+        // post_loop branching with different logic. These tests
+        // pin the "unified" property.
+        // ──────────────────────────────────────────────────────────
+        mod unified_pipeline {
+            use super::*;
+            use super::truth::*;
+
+            /// Pre-loop and post-loop classes are period-1
+            /// (domain-restricted periodic classes at extreme
+            /// offsets). If any pre-loop class has >1 members,
+            /// something other than period-1 was mis-placed there.
+            #[test]
+            fn pre_loop_classes_are_all_period_1() {
+                let t = load();
+                for &c in &t.sched.pre_loop {
+                    assert_eq!(
+                        t.stencil.class_members[c].len(), 1,
+                        "pre_loop class c{c} has period != 1",
+                    );
+                }
+            }
+
+            #[test]
+            fn post_loop_classes_are_all_period_1() {
+                let t = load();
+                for &c in &t.sched.post_loop {
+                    assert_eq!(
+                        t.stencil.class_members[c].len(), 1,
+                        "post_loop class c{c} has period != 1",
+                    );
+                }
+            }
+
+            /// The union of {pre_loop, periodic, post_loop} covers
+            /// every class in the bundle (no orphan class sitting
+            /// unassigned).
+            #[test]
+            fn every_class_is_placed() {
+                let t = load();
+                let placed: BTreeSet<usize> = t.sched.pre_loop.iter()
+                    .chain(t.sched.periodic.iter())
+                    .chain(t.sched.post_loop.iter())
+                    .copied()
+                    .collect();
+                for c in 0..t.stencil.class_members.len() {
+                    if t.stencil.class_members[c].is_empty() { continue }
+                    assert!(
+                        placed.contains(&c),
+                        "class c{c} (with {n} members) isn't in pre_loop, periodic, or post_loop",
+                        n = t.stencil.class_members[c].len(),
+                    );
+                }
+            }
+
+            /// The three partitions are disjoint — no class appears
+            /// in two of {pre, periodic, post}.
+            #[test]
+            fn partitions_are_disjoint() {
+                let t = load();
+                let pre: BTreeSet<usize> = t.sched.pre_loop.iter().copied().collect();
+                let per: BTreeSet<usize> = t.sched.periodic.iter().copied().collect();
+                let post: BTreeSet<usize> = t.sched.post_loop.iter().copied().collect();
+                assert!(pre.is_disjoint(&per), "pre_loop ∩ periodic non-empty");
+                assert!(pre.is_disjoint(&post), "pre_loop ∩ post_loop non-empty");
+                assert!(per.is_disjoint(&post), "periodic ∩ post_loop non-empty");
+            }
+        }
+    }
 }

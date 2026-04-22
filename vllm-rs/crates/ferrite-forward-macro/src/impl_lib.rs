@@ -2661,15 +2661,24 @@ impl Implementation for ScalarMulImpl {
         // output binding owns the mutated buffer.
         quote! {
             let #out = unsafe {
-                #[cfg(feature = "cublas")]
-                let cublas_handle = device.cublas.as_ref().expect("cuBLAS required for scale_inplace");
-                #[cfg(not(feature = "cublas"))]
-                let cublas_handle = &();
+                // Conditional cublas handle access - compiles to no-op when cublas disabled
+                macro_rules! get_cublas_for_scale {
+                    ($dev:expr) => {{
+                        #[cfg(feature = "cublas")]
+                        {
+                            $dev.cublas.as_ref().expect("cuBLAS required for scale_inplace")
+                        }
+                        #[cfg(not(feature = "cublas"))]
+                        {
+                            &()
+                        }
+                    }};
+                }
                 
                 ::ferrite_kernels::kernels::scale_inplace(
                     *#upstream,
                     #scale,
-                    cublas_handle,
+                    get_cublas_for_scale!(device),
                 );
                 #upstream
             };
@@ -8042,7 +8051,7 @@ impl Implementation for Fp8GemmImpl {
         let w = ctx.input_expr(tile, 1);
         quote! {
             let #out = unsafe {
-                (#w).forward(#x, None, &mut device.caching, device.compute_stream)
+                (#w).forward(#x, &mut device.caching, device.compute_stream)
             };
         }
     }
@@ -8347,7 +8356,7 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
         quote! {
             let #mul_out = unsafe {
                 let gate_up =
-                    (#weight_expr).forward(#activation, None, &mut device.caching, device.compute_stream);
+                    (#weight_expr).forward(#activation, &mut device.caching, device.compute_stream);
                 ::ferrite_kernels::kernels::silu_and_mul_fused(
                     *gate_up,
                     #intermediate,

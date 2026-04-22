@@ -6176,9 +6176,8 @@ impl Implementation for CutlassGemmImpl {
         if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
             return None;
         }
-        if gemm_is_fusion_partner(fuf, seed) {
-            return None;
-        }
+        // No fusion-partner rejection: the DP's feasibility analysis
+        // handles it (see CutlassGemvImpl::matches for the rationale).
         Some(info)
     }
 
@@ -6335,9 +6334,8 @@ impl Implementation for CutlassGemmSplitKImpl {
         if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
             return None;
         }
-        if gemm_is_fusion_partner(fuf, seed) {
-            return None;
-        }
+        // No fusion-partner rejection: the DP's feasibility analysis
+        // handles it (see CutlassGemvImpl::matches for the rationale).
         Some(info)
     }
 
@@ -6690,9 +6688,17 @@ impl Implementation for CutlassGemvImpl {
         if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
             return None;
         }
-        if gemm_is_fusion_partner(fuf, seed) {
-            return None;
-        }
+        // No fusion-partner rejection here — the DP's feasibility
+        // analysis handles it. For fusion-partner Gemms (gate/up/QKV)
+        // in models where a multi-tile fused impl exists (Qwen2/LLaMA),
+        // the downstream ops have no singleton impl, so the
+        // CutlassGemvImpl path is infeasible and the DP picks the fused
+        // impl. For models where the fused impl is unavailable (Qwen3
+        // v_proj at M=1: feeds rope_append but FusedQkvQkNormRopeCacheImpl
+        // is unregistered), this fallback is the only viable path:
+        // CutlassGemvImpl claims the Gemm and RopeAppendRefImpl claims
+        // the rope. GemmRefImpl (cuBLAS) was the prior fallback; this
+        // preserves correctness without cuBLAS.
         Some(info)
     }
 

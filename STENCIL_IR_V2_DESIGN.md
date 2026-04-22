@@ -7,6 +7,112 @@ and scope issues.
 
 Sits between FUF (op-level math DAG, fully unrolled, const-propped) and codegen. Purpose: make Stencil IR **the compilation model** — the substrate the solver, scheduler, and codegen read from. The **Rust-launch lowering** is the first consumer (landing now); the **megakernel CUDA lowering** (SM90+ warp-group specialisation / TMA / WGMMA) is the real payoff and the reason Stencil IR exists.
 
+## 0. READ THIS FIRST — the position (2026-04-23)
+
+**We are building a real stencil compiler. Not a bag of hacks.**
+
+Stencil compilers are not novel. Halide, TVM, Tiramisu, Polly, the
+polyhedral model — decades of prior art exist for exactly the
+problem we're solving (collapsed-loop emission over periodic
+dependence structures with piecewise-affine reads). When a
+question comes up about how to classify a boundary read, how to
+order operations within a loop body, how to handle mixed
+pre-loop/periodic sources — **the answer is in the literature, not
+invented locally**. Consult:
+
+- **Halide**'s `Func`/`Stage` + `compute_at` / `store_at` scheduling
+  language — see Ragan-Kelley's 2013 paper. The dependence
+  analysis + loop-nest generation is directly analogous to our
+  class-based periodicity collapse.
+- **TVM**'s `IterVar` / `Stage` / dependence-graph + `ScheduleNode`
+  infra. Specifically the dependence graph construction in
+  `src/tir/schedule/analysis/*` and the piecewise loop nest
+  generation.
+- **Polyhedral model**: integer iteration domains + affine
+  dependences + schedule trees. Pluto, isl, Polly. The framework
+  for our "a class has a firing domain, an edge has a dependence
+  distance, the schedule is an affine function" formulation.
+- **Tiramisu** for a gentler introduction to polyhedral scheduling
+  for deep-learning workloads.
+
+None of these use 2-member sampling, ad-hoc `LoopCarry` vs
+`IntraIter` enum variants, or hand-coded `alias_carry_redirect` +
+`alias_through_carries` + `alias_preloop_inits` sidecars. Those are
+artifacts of hunting bugs by patching cases as they surface. We
+will not continue down that road.
+
+### The rule
+
+**Every correctness decision in the compiler must be derived from a
+structural property of the iteration domain, the dependence
+polyhedra, or the schedule — not inferred from a sampled member, a
+pattern-matched shape, or a special-cased architecture.**
+
+*Optimisations* may use heuristics (which kernel to pick, how to
+break topologically-valid schedule ties). *Correctness* must be
+derivable from first principles. If a correctness claim can only be
+justified by "this works on llama because of the way members are
+laid out" — it's a heuristic and it will break on the next shape.
+
+### Test-driven development is mandatory
+
+The invariant mountain in `codegen::tests::invariants` (1229 tests
+at the scale of llama-1b + llama-3.2-3b, ~160 red today) encodes
+structural properties a correct stencil compiler MUST satisfy.
+Every red test is a concrete claim the current compiler fails.
+Fix the compiler, not the test. No test is weakened to match a
+broken compiler. If a test appears wrong, derive the assertion
+from the unrolled FUF (the ground truth) — not from what the
+compiler currently emits.
+
+When adding a new capability:
+
+1. Add invariant tests that encode the correctness property. Make
+   them red against current code.
+2. Rewrite the piece of the compiler that implements that
+   property. Iterate until the invariant tests go green.
+3. The invariant tests stay in the suite forever. Future work
+   can't silently regress them.
+
+When flipping `FERRITE_STENCIL_CODEGEN=1` to default: every single
+invariant test must be green on every shipping fixture. Runtime
+golden tests are the final gate, not the first.
+
+### What we are NOT doing
+
+- No more targeted "fix the c2 case" / "fix the c6 case" /
+  "fix the alias cascade" commits layered over each other. Every
+  prior "5i.5", "5m", "5o", "5n" commit touching provenance or
+  classification is being superseded by the unified rewrite.
+- No more enum variants added to `InputOrigin` to patch a
+  specific shape. `InputOrigin` is an artifact of the heuristic
+  design; the rewrite replaces it with a piecewise-affine
+  `ReadPlan` representation.
+- No more ad-hoc `alias_*_redirect` / `alias_through_carries` /
+  `alias_preloop_inits` sidecar maps. One unified alias analysis
+  derived from the dependence polyhedra.
+- No more schedule-by-offset-sort followed by edge-validation.
+  The schedule is a topological order over the intra-iter
+  dependence graph, period.
+
+### What we ARE doing
+
+1. Rewrite `class_input_provenance`, `ClassSchedule`, and
+   `try_emit_collapsed_bucket` as one coherent pipeline based on:
+   - Explicit integer iteration domains per class.
+   - Piecewise-affine dependence maps per (consumer, boundary).
+   - Schedule = topo sort over Δ_global=0 edges.
+   - Codegen = piecewise-region emission with runtime guards for
+     region boundaries.
+2. Keep the invariant mountain green at every commit.
+3. Extend the mountain as new properties are pinned — especially
+   cross-scale ones and shapes beyond llama.
+4. Only THEN flip the default flag.
+
+If tempted to patch a single case to unblock a runtime test, STOP
+and ask: "what structural property did I miss?" Add it to the
+mountain first.
+
 ## 1. Why this exists
 
 **The goal is stencil-based compilation as the enabler for
@@ -372,9 +478,91 @@ Red flags that would tell us this refactor is the wrong move:
 
 None of these are show-stoppers without investigation, but each is worth measuring at the relevant staging step rather than discovering at integration.
 
-## 13. Status & handoff (2026-04-22)
+## 13. Status & handoff (2026-04-23)
 
-**Branch**: `worktree-ff3` (rebased onto `worktree-ferrite-forward` 2026-04-22). Top-of-branch commits:
+### Big-picture reset (2026-04-23)
+
+Earlier commits in this branch (5i.5, 5m, 5n, 5o, H1+H2) were
+**patch-level fixes** that addressed specific bugs the earlier
+compiler exhibited, each layering a new sidecar (`alias_carry_redirect`,
+`alias_through_carries`, `alias_preloop_inits`, extended
+`InputOrigin::IntraIter { pre_loop_init_sg }`, etc.) on top of a
+fundamentally heuristic design. When these fixes failed to produce
+correct `vllm chat` output on llama-3.2-3b — garbage tokens, no
+panic — the underlying reason was that the entire provenance
+classifier was sampling `member[0]` + `member[1]` of each class
+and assuming the rest behave the same. That assumption fails on
+the c6 shape (MLP reads c5 for layer 0, c9 for layers 1..15) and
+the c2 shape (QKV reads standalone-rmsnorm layer 0, c8 layer 1..15
+via an offset-gap).
+
+**The position now: we are building a real stencil compiler.** Per
+§0, no heuristics in the correctness path. All correctness
+decisions derive from the iteration domain, the dependence
+polyhedra, and the schedule. Consult Halide / TVM / polyhedral
+prior art if unsure how a standard compiler handles a case.
+
+**The invariant mountain now encodes this.** `codegen::tests::invariants`
+has **1229 tests** (1066 green, 161 red, 2 diagnostic dumps):
+
+- 12 invariant categories (class formation, provenance, schedule
+  topology, layer semantics, emission, carry liveness, unified
+  pipeline, weight indexing, class edges coverage, cross-scale,
+  3b-parallel shape, 3b per-triple).
+- Two fixtures: llama-3.2-1b (16 layers) and llama-3.2-3b (28).
+- Per-`(class, boundary, member)` granularity — each failing test
+  names the exact triple that violates the invariant.
+
+**The 161 red tests are the forcing function.** Each one pins a
+structural property the current compiler fails. The plan is to
+rewrite `class_input_provenance` + `ClassSchedule` + emission as a
+unified piecewise-affine dependence pipeline that makes every red
+test green structurally, not by patching.
+
+**Reverted**: commits `6204b62ee` (H1+H2), `2a0516a7c` (red pin),
+`5872b313c` (5o). Those were patch-level hacks superseded by the
+test mountain + principled rewrite plan.
+
+**Surviving patch-level commits** (kept because they're genuine
+narrow fixes, not classification hacks): `5n` (fragment_repeat_tokens),
+`5m` (side-effect exports — the mechanism is correct, though its
+triggering path will be regenerated by the new pipeline), diagnostic
+message improvements.
+
+### Work remaining
+
+1. Replace `class_input_provenance`'s heuristic branches with a
+   piecewise-affine dependence analyser (enumerates every
+   (consumer_class, boundary_position, consumer_member) → producer
+   triple from the unrolled FUF; classifies by the distribution
+   across members).
+2. Replace `ClassSchedule`'s offset-sort with a topological sort
+   over the intra-global-iter dependence graph.
+3. Replace the alias-* sidecars with a single alias analysis
+   derived from each class's in-place kernel semantics and the
+   dependence polyhedra.
+4. Replace `InputOrigin`'s ad-hoc enum variants with a `ReadPlan`
+   that can express piecewise-region reads (e.g., "iters [0..1)
+   read pre-loop class X, iters [1..16) read periodic class Y
+   same-iter").
+5. Update the emitter to consume `ReadPlan`s and emit appropriate
+   runtime guards / local maps.
+6. All 161 red invariant tests go green as a side-effect of (1-5).
+7. Runtime verification via `vllm chat` + e2e goldens.
+8. Only then: flip `FERRITE_STENCIL_CODEGEN=1` to default.
+
+### Top-of-branch commits
+
+- `a4b38b236` — **invariant mountain scaled to 1229 tests (161 red)**.
+  Cross-scale 1b/3b + 6 new categories. This commit is the
+  forcing-function for the rewrite.
+- `e538e453f` — **per-triple macro expansion for 1b** (553 tests, 79 red).
+- `cd94c5058` — **invariant mountain seeded** (25 category-level
+  tests, 6 red).
+- `c35ce8416` / `dfc533bd0` / `d939d8241` — reverts of the patch-level
+  5o / pin / H1+H2 commits.
+
+**Branch**: `worktree-ff3`. Top-of-branch commits:
 - `aef01d8ca` — IR + subtile + region_formation + periodicity + CollapsePlan
 - `420a71690` — class→impl consistency checker + FormedRegions refactor
 - `5f3e96cd5` — neighbor-aware canonical hash; 23 → 2 heterogeneous variants
@@ -402,23 +590,65 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 **Measurement after the hash fix**: distribution of class counts shifted from a tight 8/10 to 12/15/17/18/22 across 218 variants. Collapse factor for llama / mistral drops from ~28× to ~19×; still well-collapsed and every class is now impl-consistent. Pre-fix 23 heterogeneous variants → 2 remaining (both Qwen3; see A.2).
 
-### Quick-start for next session (cold start, 2026-04-22 evening)
+### Quick-start for next session (cold start, 2026-04-23)
 
-**Orientation — run these first, in order (~5 seconds total):**
+**Read §0 first — it states the position. Then:**
 
 ```bash
-# 1. Confirm the post-5n baseline: 41 green, 2 ignored diagnostics.
-cargo test -p ferrite-forward-macro --lib codegen::tests
+# 1. Run the invariant mountain. Expected: ~1066 green, ~161 red.
+#    Red tests = structural failures the current compiler has.
+#    The rewrite's job is to make them green WITHOUT WEAKENING THEM.
+cargo test -p ferrite-forward-macro --lib codegen::tests::invariants
 
-# 2. Skim the top-of-branch commits so the 5i.5 / 5m mental model
-#    matches the code as it stands today.
-git log --oneline -8
+# 2. Skim recent commits so the reset-to-principled-compiler mental
+#    model matches the code as it stands.
+git log --oneline -15
 ```
 
-Then pick a step from the "Next concrete step" table below (5h,
-5l, or 5k — or runtime verification on the llama fleet now that
-its emission path is clear). Read the ⚡ methodology section next
-— it's load-bearing for whichever step you pick.
+**Do NOT** pick "5h / 5l / 5k" or any targeted step from older
+handoffs — those directions are dead. They were patch-level work.
+The only direction now is: build the piecewise-affine dependence
+analyser + topo-sort schedule + piecewise-region emitter that
+makes every red invariant green structurally.
+
+**Where to start the rewrite:**
+
+1. Build types for the new pipeline (no heuristic remnants):
+   - `ClassDomain` — explicit integer iteration domain per class
+     (set of global `__repeat` values where it fires).
+   - `EdgeDependence` — for every (consumer_class, boundary_pos)
+     pair, a map `consumer_member → Option<(producer_class,
+     producer_member, producer_global_iter)>` built by enumerating
+     the unrolled FUF's edges.
+   - `ReadPlan` — piecewise-affine read spec per boundary. Regions
+     are disjoint consumer-iter ranges, each pointing at either a
+     pre-loop sg's local or a periodic class's `__cC_out_P_S` at
+     Δ_global = 0 or 1.
+   - `Schedule` — topologically ordered class list respecting
+     `ReadPlan` Δ_global=0 edges.
+2. Implement `build_edge_dependences(fuf, sfuf, stencil, sched)` →
+   map. Enumerates EVERY edge, no sampling.
+3. Implement `classify_reads(edge_dependences) -> ReadPlan per
+   boundary`. Purely a function of the edge dependence distribution.
+4. Implement the schedule as `Kahn(intra_iter_edges)`.
+5. Re-implement the emitter to consume `ReadPlan`s.
+6. The existing `InputOrigin`/`class_input_provenance`/offset-
+   sort-schedule can be deleted once the new pipeline is feeding
+   the emitter. DO NOT try to keep both.
+7. Invariant tests should turn green as you land each piece.
+
+**Watch out for temptation to patch**: if a specific invariant is
+RED and you're tempted to patch a narrow case, STOP. The correct
+move is always to ask "what structural property does this test
+encode, and how does my pipeline derive it?" If the pipeline can't
+derive it, the pipeline is missing something — don't add a
+conditional, add a structural derivation.
+
+**If in doubt**: read a page of Halide or TVM source covering the
+equivalent analysis. These are solved problems.
+
+Read the ⚡ methodology section below next — it's load-bearing for
+how any rewrite commit lands (red test FIRST, then implementation).
 
 ## ⚡ TEST-DRIVEN METHODOLOGY — READ THIS FIRST ⚡
 

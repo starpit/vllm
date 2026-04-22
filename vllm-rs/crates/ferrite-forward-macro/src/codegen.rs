@@ -4138,7 +4138,7 @@ fn try_emit_collapsed_bucket(
     stencil: &StencilBundle,
     sched: &ClassSchedule,
     provenance: Option<&[ClassInputs]>,
-    _pipeline: Option<&crate::stencil_pipeline::StencilPipeline>,
+    pipeline: Option<&crate::stencil_pipeline::StencilPipeline>,
     fuf: &Fuf,
     sfuf: &Assignment,
     program: &Program,
@@ -4393,6 +4393,45 @@ fn try_emit_collapsed_bucket(
                 }
             }
         }
+    }
+    // ── step 6b: period-1 LoopCarry redirect (uniform case) ─────
+    //
+    // A producer class with period 1 fires exactly once (pre-loop at
+    // `iter == offset` for in-loop-short aliased classes, or genuinely
+    // pre-loop for non-rerouted period-1 classes). Consumers at iter
+    // > 0 structurally read its single value, not a per-iter carry —
+    // so a `__carry_cC_pP_sS: Option<OwnedTensor> = None` hoist is an
+    // orphan: nothing assigns it, and the `.as_ref().expect(..)` on
+    // read would panic on the first firing.
+    //
+    // The principled replacement (pipeline's `target_for`) returns
+    // `DepTarget::PreLoop(producer_sg)` for period-1 producers, which
+    // maps to the existing `__cC_out_P_S: Option<GpuTensor>` hoist the
+    // in-loop-short aliased emitter already assigns at iter == offset
+    // (5i.4 machinery). Reads resolve via the IntraIter-short pattern:
+    // `(*__cC_out.as_ref().expect(..)).as_view()`.
+    //
+    // Today's step: filter `carry_inits` on the period-1 predicate,
+    // extend `period_one_carry_redirects` so LoopCarry read sites can
+    // lift reads to `__cC_out`, and ensure the `__cC_out` hoist fires
+    // by augmenting `aliased_intraiter_exports` below.
+    //
+    // Scope: uniform case only. A boundary whose members mix period-1
+    // LoopCarry targets with other origins keeps legacy behavior for
+    // one commit; category 14 `deltas_are_zero_or_one` pins that the
+    // pipeline's own classifier never returns `|Δ| ≥ 2`, so the
+    // structural surface this handles is well-defined.
+    let period_one_carry_redirects: BTreeSet<(usize, u8, u8)> = if let Some(pipe) = pipeline {
+        carry_inits
+            .keys()
+            .filter(|&&(pc, _, _)| pipe.domain.periods.get(pc).copied() == Some(1))
+            .copied()
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    for key in &period_one_carry_redirects {
+        carry_inits.remove(key);
     }
     let carry_producers: BTreeSet<(usize, u8, u8)> = carry_inits.keys().copied().collect();
 
@@ -4745,6 +4784,15 @@ fn try_emit_collapsed_bucket(
     for &(pc, pos, slot) in post_refs.keys() {
         aliased_intraiter_exports.insert((pc, pos, slot));
     }
+    // Step 6b: period-1 LoopCarry-redirected producers also need the
+    // `__cC_out_P_S: Option<GpuTensor>` hoist so cross-iter readers
+    // (which the pipeline classifies as `PreLoop(producer_sg)`) can
+    // read `(*__cC_out.as_ref().expect(..)).as_view()`. The in-loop-
+    // short aliased emission at `iter == offset` is what assigns the
+    // Option; on the llama fixture this is c5 post-MLP FAR peel.
+    for &(pc, pos, slot) in &period_one_carry_redirects {
+        aliased_intraiter_exports.insert((pc, pos, slot));
+    }
 
     // Per-class ordered returned exports list (sorted by (pos, slot)),
     // used to pick tuple-vs-scalar fragment return and to name the
@@ -4922,6 +4970,7 @@ fn try_emit_collapsed_bucket(
                 &short_classes,
                 &aliased_classes,
                 &alias_carry_redirect,
+                &period_one_carry_redirects,
             )?;
             loop_body.push(tokens);
             continue;
@@ -4949,6 +4998,7 @@ fn try_emit_collapsed_bucket(
             &class_returned_exports,
             &alias_carry_redirect,
             &side_effect_exports,
+            &period_one_carry_redirects,
         )?;
         let call = match (is_short, returned.len()) {
             // Full class, zero referenced exports: fragment returns `()`.
@@ -5248,6 +5298,7 @@ fn emit_fragment_call_expr(
     class_returned_exports: &[Vec<(u8, u8)>],
     alias_carry_redirect: &BTreeMap<(usize, u8, u8), (usize, u8, u8)>,
     side_effect_exports: &BTreeSet<(usize, u8, u8)>,
+    period_one_carry_redirects: &BTreeSet<(usize, u8, u8)>,
 ) -> Result<TokenStream, String> {
     let rep_sg = class_inputs.rep_sg;
     let imp_id = stencil.class_impl_id[consumer_class]
@@ -5490,17 +5541,26 @@ fn emit_fragment_call_expr(
                 // of the aliased producer already mutated that buffer).
                 let raw = (*producer_class, *producer_pos, slot.producer_slot);
                 let key = alias_carry_redirect.get(&raw).copied().unwrap_or(raw);
-                if !carry_producers.contains(&key) {
-                    return Err(format!(
-                        "class {consumer_class}: carry refers to class {} pos {} slot {} missing from carry set",
-                        key.0, key.1, key.2,
-                    ));
-                }
-                let carry = carry_var_ident(key.0, key.1, key.2);
-                if carries_with_init.contains(&key) {
-                    quote! { (*#carry).as_view() }
+                // Step 6b: period-1 producer — pipeline says PreLoop.
+                // Lift this read to the in-loop-short `__cC_out_P_S:
+                // Option<GpuTensor>` the aliased emission assigns at
+                // `iter == offset`, same as an IntraIter-short read.
+                if period_one_carry_redirects.contains(&key) {
+                    let c_out = class_out_ident(key.0, key.1, key.2);
+                    quote! { (*#c_out.as_ref().expect("period-1 LoopCarry-redirected producer")).as_view() }
                 } else {
-                    quote! { (*#carry.as_ref().expect("init-less carry read")).as_view() }
+                    if !carry_producers.contains(&key) {
+                        return Err(format!(
+                            "class {consumer_class}: carry refers to class {} pos {} slot {} missing from carry set",
+                            key.0, key.1, key.2,
+                        ));
+                    }
+                    let carry = carry_var_ident(key.0, key.1, key.2);
+                    if carries_with_init.contains(&key) {
+                        quote! { (*#carry).as_view() }
+                    } else {
+                        quote! { (*#carry.as_ref().expect("init-less carry read")).as_view() }
+                    }
                 }
             }
             InputOrigin::PreLoop { producer_sg } => {
@@ -5590,6 +5650,7 @@ fn emit_aliased_class_inline(
     short_classes: &BTreeSet<usize>,
     _aliased_classes: &BTreeSet<usize>,
     alias_carry_redirect: &BTreeMap<(usize, u8, u8), (usize, u8, u8)>,
+    period_one_carry_redirects: &BTreeSet<(usize, u8, u8)>,
 ) -> Result<TokenStream, String> {
     let rep_sg = class_inputs.rep_sg;
     let imp_id =
@@ -5676,30 +5737,53 @@ fn emit_aliased_class_inline(
                 // so we pick up the underlying non-aliased carry var.
                 let raw = (*producer_class, *producer_pos, slot.producer_slot);
                 let key = alias_carry_redirect.get(&raw).copied().unwrap_or(raw);
-                if !carry_producers.contains(&key) {
-                    return Err(format!(
-                        "aliased class {c}: carry producer {key:?} missing from carry set"
+                // Step 6b: period-1 producer — read through the
+                // `__cC_out_P_S: Option<GpuTensor>` hoist (assigned at
+                // `iter == offset` by the producer's aliased emission)
+                // via the same unwrap prelude the IntraIter-short path
+                // uses.
+                if period_one_carry_redirects.contains(&key) {
+                    let c_out = class_out_ident(key.0, key.1, key.2);
+                    let view = format_ident!("__p1_view_c{}_p{}_s{}", key.0, key.1, key.2);
+                    let expect_msg = proc_macro2::Literal::string(&format!(
+                        "aliased inline: period-1 producer c{} p{} s{} read before it fired",
+                        key.0, key.1, key.2
                     ));
-                }
-                let carry = carry_var_ident(key.0, key.1, key.2);
-                if carries_with_init.contains(&key) {
-                    carry
-                } else {
-                    // `__carry: Option<OwnedTensor>`. Unwrap into a
-                    // TensorView bound locally so emit_call's
-                    // `*#ident` and `(*#ident).as_view()` patterns
-                    // work uniformly. The `unsafe` is required by
-                    // `GpuTensor::as_view`.
-                    let view = format_ident!("__carry_view_c{}_p{}_s{}", key.0, key.1, key.2);
                     prelude.push(quote! {
                         let #view = unsafe {
-                            #carry
+                            #c_out
                                 .as_ref()
-                                .expect("aliased inline: init-less carry read before producer fired")
+                                .expect(#expect_msg)
                                 .as_view()
                         };
                     });
                     view
+                } else {
+                    if !carry_producers.contains(&key) {
+                        return Err(format!(
+                            "aliased class {c}: carry producer {key:?} missing from carry set"
+                        ));
+                    }
+                    let carry = carry_var_ident(key.0, key.1, key.2);
+                    if carries_with_init.contains(&key) {
+                        carry
+                    } else {
+                        // `__carry: Option<OwnedTensor>`. Unwrap into a
+                        // TensorView bound locally so emit_call's
+                        // `*#ident` and `(*#ident).as_view()` patterns
+                        // work uniformly. The `unsafe` is required by
+                        // `GpuTensor::as_view`.
+                        let view = format_ident!("__carry_view_c{}_p{}_s{}", key.0, key.1, key.2);
+                        prelude.push(quote! {
+                            let #view = unsafe {
+                                #carry
+                                    .as_ref()
+                                    .expect("aliased inline: init-less carry read before producer fired")
+                                    .as_view()
+                            };
+                        });
+                        view
+                    }
                 }
             }
             InputOrigin::PreLoop { .. } => locals
@@ -8927,11 +9011,12 @@ mod tests {
             fn emit(t: &Truth) -> String {
                 let prov = t.stencil
                     .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf);
+                let pipe = pipeline(t);
                 let mut lib_frag = FragmentLibrary::default();
                 let wl = crate::emit::WeightLayout::new();
                 let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
                 let tokens = try_emit_collapsed_bucket(
-                    &t.stencil, &t.sched, prov.as_deref(), None,
+                    &t.stencil, &t.sched, prov.as_deref(), Some(&pipe),
                     &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
                     &t.solved.model, &t.solved.lib, wp,
                     &mut lib_frag, &wl,
@@ -9846,11 +9931,12 @@ mod tests {
                 let prov = t
                     .stencil
                     .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf);
+                let pipe = pipeline(&t);
                 let mut lib_frag = FragmentLibrary::default();
                 let wl = crate::emit::WeightLayout::new();
                 let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
                 try_emit_collapsed_bucket(
-                    &t.stencil, &t.sched, prov.as_deref(), None,
+                    &t.stencil, &t.sched, prov.as_deref(), Some(&pipe),
                     &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
                     &t.solved.model, &t.solved.lib, wp,
                     &mut lib_frag, &wl,
@@ -9864,11 +9950,12 @@ mod tests {
                 let prov = t
                     .stencil
                     .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf);
+                let pipe = pipeline(&t);
                 let mut lib_frag = FragmentLibrary::default();
                 let wl = crate::emit::WeightLayout::new();
                 let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
                 let text = try_emit_collapsed_bucket(
-                    &t.stencil, &t.sched, prov.as_deref(), None,
+                    &t.stencil, &t.sched, prov.as_deref(), Some(&pipe),
                     &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
                     &t.solved.model, &t.solved.lib, wp,
                     &mut lib_frag, &wl,

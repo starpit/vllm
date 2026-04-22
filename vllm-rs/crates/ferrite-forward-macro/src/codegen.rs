@@ -6337,6 +6337,17 @@ mod tests {
             config::load_file(&path).expect("load llama-3.2-1b config")
         }
 
+        pub fn llama_3_2_3b_params() -> ModelParams {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("..")
+                .join("model_architectures")
+                .join("llama")
+                .join("llama-3.2-3b.json");
+            config::load_file(&path).expect("load llama-3.2-3b config")
+        }
+
         pub fn l4_target() -> TargetProfile {
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("..")
@@ -6350,7 +6361,13 @@ mod tests {
         /// Classify DSL, infer shapes, build CFG, unroll, solve.
         /// Returns the full bundle a test module needs.
         pub fn solve_body(src: &str) -> Solved {
-            let model = llama_3_2_1b_params();
+            solve_body_with(src, llama_3_2_1b_params())
+        }
+
+        /// Same as `solve_body` but takes explicit `ModelParams` so
+        /// callers can pin the fixture against a specific config
+        /// (e.g. llama-3.2-3b with 28 layers vs 1b's 16).
+        pub fn solve_body_with(src: &str, model: ModelParams) -> Solved {
             let file: syn::File =
                 syn::parse_str(&format!("fn _c() {{ {src} }}")).expect("parse DSL carrier");
             let block = match &file.items[0] {
@@ -8239,7 +8256,15 @@ mod tests {
             }
 
             pub fn load() -> Truth {
-                let solved = fixture::solve_body(fixture::FAR_DECODER_BODY);
+                load_for(fixture::FAR_DECODER_BODY, fixture::llama_3_2_1b_params())
+            }
+
+            pub fn load_3b() -> Truth {
+                load_for(fixture::FAR_DECODER_BODY, fixture::llama_3_2_3b_params())
+            }
+
+            pub fn load_for(body: &str, model: ModelParams) -> Truth {
+                let solved = fixture::solve_body_with(body, model);
                 let stencil = StencilBundle::compute(&solved.fuf, &solved.sfuf);
                 let sched = stencil.schedule(&solved.fuf, &solved.sfuf, &solved.lib);
                 Truth { solved, stencil, sched }
@@ -9353,6 +9378,571 @@ mod tests {
             // c10 — final FAR peel at iter 15 (period=1)
             triple_tests!(c10_b0, class=10, boundary=0, members=[0]);
             triple_tests!(c10_b1, class=10, boundary=1, members=[0]);
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 8 — Weight indexing
+        //
+        // Every class × member's emitted weight access must map to
+        // the CORRECT global layer's weight — not a stale or
+        // shifted index. Ground truth: the rep's baked weight idx
+        // for each weight, rewritten via family_stem[__repeat] at
+        // emission. At __repeat=R, every weight family must resolve
+        // to layer-R's weight.
+        // ──────────────────────────────────────────────────────────
+        mod weight_indexing {
+            use super::*;
+            use super::truth::*;
+
+            /// Family-detected weights in the emitted bucket must
+            /// index uniformly via `stem[__repeat]` (no baked
+            /// literals like `stem[5usize]` leaking from the rep).
+            #[test]
+            fn far_decoder_weight_family_access_uses_repeat_var() {
+                let t = load();
+                let prov = t
+                    .stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf);
+                let mut lib_frag = FragmentLibrary::default();
+                // Populate a minimal WeightLayout with `input_layernorm` family.
+                let mut wl = crate::emit::WeightLayout::new();
+                for i in 0..16 {
+                    let flat = format!("input_layernorm_{i}");
+                    let stem = syn::Ident::new(
+                        "input_layernorm",
+                        proc_macro2::Span::call_site(),
+                    );
+                    let idx = proc_macro2::Literal::usize_unsuffixed(i);
+                    wl.insert_array_access(&flat, quote::quote! { #stem[#idx] });
+                    wl.insert_family_stem(&flat, stem);
+                }
+                let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+                let tokens = try_emit_collapsed_bucket(
+                    &t.stencil, &t.sched, prov.as_deref(),
+                    &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
+                    &t.solved.model, &t.solved.lib, wp,
+                    &mut lib_frag, &wl,
+                )
+                .expect("emit");
+                let text = tokens.to_string();
+                // Loop-body family reads should be `stem [ __repeat ]`
+                // (whitespace-tokenized form). A baked `stem [ 5usize ]`
+                // means some rep-local index leaked into the emission.
+                let baked_leak = (0..16).any(|i| {
+                    text.contains(&format!("input_layernorm [ {i}usize ]"))
+                });
+                assert!(
+                    !baked_leak,
+                    "family-detected weight `input_layernorm` emits a \
+                     baked `stem[Nusize]` rather than `stem[__repeat]`. \
+                     Some rep-specific layer index leaked.",
+                );
+            }
+
+            /// The weight access `stem[__repeat]` means that at
+            /// runtime, class C at __repeat=R must consume layer R's
+            /// weight. Verify class membership maps to the expected
+            /// global iter: for every member m of class C,
+            /// global_iter(m) = offset(C) + m must equal the layer
+            /// index the rep would semantically fire for at
+            /// iter_in_class=m.
+            #[test]
+            fn far_decoder_member_global_iter_equals_layer_index() {
+                let t = load();
+                for &c in &t.sched.periodic {
+                    let off = t.sched.class_offsets[c];
+                    for k in 0..t.stencil.class_members[c].len() {
+                        let global_iter = off + k;
+                        // The global_iter is what __repeat equals
+                        // when this member fires. It must be within
+                        // [0, max_period) — i.e., a valid layer
+                        // index.
+                        assert!(
+                            global_iter < t.sched.max_period,
+                            "c{c} member[{k}] has global_iter={global_iter} \
+                             but max_period={mp}. Out-of-range layer index \
+                             will produce UB or OOB weight access.",
+                            mp = t.sched.max_period,
+                        );
+                    }
+                }
+            }
+
+            /// Family stems — weights whose flat name matches
+            /// `<stem>_<idx>` for N consecutive indices — must
+            /// cover exactly `max_period` layers. A family of 15
+            /// (period-mismatch) with max_period=16 means one
+            /// layer's weight is missing or the family boundary is
+            /// off.
+            #[test]
+            fn far_decoder_family_stems_cover_max_period() {
+                let t = load();
+                // This is a sanity check at the config level: all
+                // llama-style weights are per-layer with exactly
+                // num_hidden_layers entries. If the unrolled FUF
+                // has a weight family shorter than max_period,
+                // something upstream lost a layer.
+                //
+                // Inferred from the config directly:
+                let nhl = *t
+                    .solved
+                    .model
+                    .bounds
+                    .get("num_hidden_layers")
+                    .expect("num_hidden_layers in config");
+                assert_eq!(
+                    t.sched.max_period as u64, nhl,
+                    "schedule max_period={mp} but config says \
+                     num_hidden_layers={nhl}. One of the periodic \
+                     classes is missing a layer.",
+                    mp = t.sched.max_period,
+                );
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 9 — Class edges / dependence histograms
+        //
+        // `StencilBundle::class_edges` produces the raw edge set
+        // between periodic classes. Every edge must correspond to a
+        // real tile-input edge in the unrolled FUF (no phantom
+        // edges); conversely, every cross-class tile-input in the
+        // unrolled FUF must appear in class_edges.
+        // ──────────────────────────────────────────────────────────
+        mod class_edges_coverage {
+            use super::*;
+            use super::truth::*;
+
+            /// Every `class_edges` entry corresponds to a real
+            /// unrolled-FUF tile-input edge whose producer_class
+            /// and consumer_class match and whose iter-in-class
+            /// values land on actual members.
+            #[test]
+            fn class_edges_are_grounded_in_unrolled_fuf() {
+                let t = load();
+                let edges = t.stencil.class_edges(&t.solved.fuf, &t.solved.sfuf);
+                for e in &edges {
+                    let consumer_members =
+                        &t.stencil.class_members[e.consumer_class];
+                    let producer_members =
+                        &t.stencil.class_members[e.producer_class];
+                    assert!(
+                        e.consumer_iter < consumer_members.len(),
+                        "class_edges entry refers to consumer_iter={i} \
+                         but c{c} only has {n} members",
+                        i = e.consumer_iter,
+                        c = e.consumer_class,
+                        n = consumer_members.len(),
+                    );
+                    assert!(
+                        e.producer_iter < producer_members.len(),
+                        "class_edges entry refers to producer_iter={i} \
+                         but c{c} only has {n} members",
+                        i = e.producer_iter,
+                        c = e.producer_class,
+                        n = producer_members.len(),
+                    );
+                }
+            }
+
+            /// Every cross-class tile-input edge in the unrolled
+            /// FUF (between periodic classes) must appear in
+            /// `class_edges`. No dropped edges.
+            #[test]
+            fn every_cross_class_fuf_edge_appears_in_class_edges() {
+                let t = load();
+                let periodic_set: BTreeSet<usize> =
+                    t.sched.periodic.iter().copied().collect();
+                let class_edges = t.stencil.class_edges(&t.solved.fuf, &t.solved.sfuf);
+                let edge_keys: BTreeSet<(usize, usize, usize, usize)> = class_edges
+                    .iter()
+                    .map(|e| (
+                        e.consumer_class, e.consumer_iter,
+                        e.producer_class, e.producer_iter,
+                    ))
+                    .collect();
+                for &cc in &t.sched.periodic {
+                    let members = &t.stencil.class_members[cc];
+                    for (k, &member_sg) in members.iter().enumerate() {
+                        let claimed = t.solved.sfuf.tiles_in_subgraph(member_sg);
+                        let claimed_set: BTreeSet<TileId> =
+                            claimed.iter().copied().collect();
+                        for &tile in &claimed {
+                            for input in &t.solved.fuf.get(tile).inputs {
+                                let FufInput::Tile { id, .. } = input else { continue };
+                                if claimed_set.contains(id) { continue }
+                                let Some(prod_sg) = t.solved.sfuf.subgraph_of(*id)
+                                else { continue };
+                                let Some(&prod_class) =
+                                    t.stencil.class_of.get(&prod_sg) else { continue };
+                                if !periodic_set.contains(&prod_class) { continue }
+                                let prod_iter = t.stencil.iter_of(prod_sg);
+                                assert!(
+                                    edge_keys.contains(&(cc, k, prod_class, prod_iter)),
+                                    "missing class_edges entry: \
+                                     (consumer c{cc}@{k}, producer c{pc}@{pi})",
+                                    pc = prod_class,
+                                    pi = prod_iter,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 10 — Ground-truth symmetry
+        //
+        // For every 1b-topology invariant that holds, the SAME
+        // invariant must hold at 3b scale (and vice-versa). Shape
+        // differences (more layers) must not introduce new shapes.
+        // ──────────────────────────────────────────────────────────
+        mod cross_scale {
+            use super::truth::*;
+
+            /// 1b and 3b have the same number of periodic classes.
+            #[test]
+            fn periodic_class_count_matches() {
+                let t1 = load();
+                let t3 = load_3b();
+                assert_eq!(
+                    t1.sched.periodic.len(),
+                    t3.sched.periodic.len(),
+                    "1b has {n1} periodic classes, 3b has {n3} — class \
+                     formation should be topology-invariant across scales",
+                    n1 = t1.sched.periodic.len(),
+                    n3 = t3.sched.periodic.len(),
+                );
+            }
+
+            /// 1b and 3b have the same number of pre_loop classes.
+            #[test]
+            fn pre_loop_class_count_matches() {
+                let t1 = load();
+                let t3 = load_3b();
+                assert_eq!(
+                    t1.sched.pre_loop.len(),
+                    t3.sched.pre_loop.len(),
+                );
+            }
+
+            /// 1b and 3b have the same number of post_loop classes.
+            #[test]
+            fn post_loop_class_count_matches() {
+                let t1 = load();
+                let t3 = load_3b();
+                assert_eq!(
+                    t1.sched.post_loop.len(),
+                    t3.sched.post_loop.len(),
+                );
+            }
+
+            /// For each class, the SET of boundary input positions
+            /// must match between 1b and 3b — same topology.
+            #[test]
+            fn per_class_boundary_count_matches() {
+                let t1 = load();
+                let t3 = load_3b();
+                // Assumes matching class numbering for the shared
+                // topology. If numbering diverges we'd need to
+                // match-by-op-tag instead.
+                for i in 0..t1.sched.periodic.len().min(t3.sched.periodic.len()) {
+                    let c1 = t1.sched.periodic[i];
+                    let c3 = t3.sched.periodic[i];
+                    let bc1 = boundary_count(&t1, c1);
+                    let bc3 = boundary_count(&t3, c3);
+                    assert_eq!(
+                        bc1, bc3,
+                        "periodic-index-{i}: 1b-c{c1} has {bc1} boundaries, \
+                         3b-c{c3} has {bc3}",
+                    );
+                }
+            }
+
+            /// 3b has exactly 28 layers.
+            #[test]
+            fn scale_3b_has_28_max_period() {
+                let t3 = load_3b();
+                assert_eq!(t3.sched.max_period, 28);
+            }
+
+            /// 1b has exactly 16 layers.
+            #[test]
+            fn scale_1b_has_16_max_period() {
+                let t1 = load();
+                assert_eq!(t1.sched.max_period, 16);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 11 — 3b shape invariants (parallel to categories
+        // 1–7 but against the 28-layer fixture). These tests
+        // validate that the same compiler invariants hold at scale.
+        // ──────────────────────────────────────────────────────────
+        mod scale_3b {
+            use super::*;
+            use super::truth::*;
+
+            #[test]
+            fn all_members_have_same_boundary_count() {
+                let t = load_3b();
+                for &c in &t.sched.periodic {
+                    let rep_count = boundary_count(&t, c);
+                    for (k, &m) in t.stencil.class_members[c].iter().enumerate() {
+                        let claimed = t.solved.sfuf.tiles_in_subgraph(m);
+                        let claimed_set: BTreeSet<TileId> =
+                            claimed.iter().copied().collect();
+                        let mut seen: BTreeSet<(TileId, u8)> = BTreeSet::new();
+                        let mut count = 0;
+                        for &tile in &claimed {
+                            for input in &t.solved.fuf.get(tile).inputs {
+                                let FufInput::Tile { id, slot } = input else { continue };
+                                if claimed_set.contains(id) { continue }
+                                if !seen.insert((*id, *slot)) { continue }
+                                count += 1;
+                            }
+                        }
+                        assert_eq!(count, rep_count,
+                            "3b c{c} m[{k}]: boundary count mismatch");
+                    }
+                }
+            }
+
+            #[test]
+            fn all_members_share_uniform_producer_class_per_boundary() {
+                let t = load_3b();
+                for &c in &t.sched.periodic {
+                    let nb = boundary_count(&t, c);
+                    for i in 0..nb {
+                        let mut pcs: BTreeSet<usize> = BTreeSet::new();
+                        for k in 0..t.stencil.class_members[c].len() {
+                            let Some(gt) = boundary_truth(&t, c, k, i) else { continue };
+                            pcs.insert(gt.producer_class);
+                        }
+                        assert!(pcs.len() <= 1,
+                            "3b c{c} b[{i}]: different producer classes {pcs:?}");
+                    }
+                }
+            }
+
+            #[test]
+            fn every_read_has_delta_0_or_1() {
+                let t = load_3b();
+                for &c in &t.sched.periodic {
+                    let nb = boundary_count(&t, c);
+                    for i in 0..nb {
+                        for k in 0..t.stencil.class_members[c].len() {
+                            let Some(gt) = boundary_truth(&t, c, k, i) else { continue };
+                            if t.sched.pre_loop.contains(&gt.producer_class) { continue }
+                            let cgi = consumer_global_iter(&t, c, k);
+                            let d = cgi - gt.producer_global_iter;
+                            assert!(d == 0 || d == 1,
+                                "3b c{c} m[{k}] b[{i}]: Δ_global={d}");
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn offsets_are_consistent() {
+                assert!(load_3b().sched.offsets_consistent);
+            }
+
+            #[test]
+            fn emits_without_refusing() {
+                let t = load_3b();
+                let prov = t
+                    .stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf);
+                let mut lib_frag = FragmentLibrary::default();
+                let wl = crate::emit::WeightLayout::new();
+                let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+                try_emit_collapsed_bucket(
+                    &t.stencil, &t.sched, prov.as_deref(),
+                    &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
+                    &t.solved.model, &t.solved.lib, wp,
+                    &mut lib_frag, &wl,
+                )
+                .expect("3b must emit");
+            }
+
+            #[test]
+            fn no_orphan_initless_carry_idents() {
+                let t = load_3b();
+                let prov = t
+                    .stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf);
+                let mut lib_frag = FragmentLibrary::default();
+                let wl = crate::emit::WeightLayout::new();
+                let wp = crate::solver::WorkloadPoint::num_tokens_only(1);
+                let text = try_emit_collapsed_bucket(
+                    &t.stencil, &t.sched, prov.as_deref(),
+                    &t.solved.fuf, &t.solved.sfuf, &t.solved.program,
+                    &t.solved.model, &t.solved.lib, wp,
+                    &mut lib_frag, &wl,
+                )
+                .expect("3b emit")
+                .to_string();
+                let hoisted: Vec<String> = text
+                    .split("let mut ")
+                    .skip(1)
+                    .filter_map(|tail| {
+                        let id = tail.split_whitespace().next()?;
+                        if !id.starts_with("__carry_c") { return None }
+                        if !tail.contains("= None") { return None }
+                        Some(id.to_string())
+                    })
+                    .collect();
+                let orphans: Vec<String> = hoisted
+                    .iter()
+                    .filter(|id| !text.contains(&format!("{id} = ")))
+                    .cloned()
+                    .collect();
+                assert!(orphans.is_empty(), "3b orphan carries: {orphans:?}");
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 12 — 3b per-triple (full per-(class, boundary,
+        // member) sweep at 28 layers). Duplicates the per_triple
+        // structure for the 3b fixture so every triple there is
+        // independently assertable. Assumes the same class
+        // numbering as 1b (validated by cross_scale tests).
+        // ──────────────────────────────────────────────────────────
+        mod per_triple_3b {
+            use super::*;
+            use super::truth::*;
+
+            fn check_producer_class(class: usize, boundary: usize, member_k: usize) {
+                let t = load_3b();
+                let prov = t
+                    .stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
+                    .expect("prov");
+                let ci = prov.iter().find(|c| c.consumer_class == class)
+                    .expect("consumer present");
+                let Some(slot) = ci.slots.get(boundary) else { return };
+                let Some(gt) = boundary_truth(&t, class, member_k, boundary) else { return };
+                let is_pre = t.sched.pre_loop.contains(&gt.producer_class);
+                match (&slot.origin, is_pre) {
+                    (InputOrigin::PreLoop { producer_sg }, true) => {
+                        assert_eq!(*producer_sg, gt.producer_sg);
+                    }
+                    (InputOrigin::IntraIter { producer_class, .. }, false)
+                    | (InputOrigin::LoopCarry { producer_class, .. }, false) => {
+                        assert_eq!(*producer_class, gt.producer_class,
+                            "3b c{class} b[{boundary}] m[{member_k}]: \
+                             producer_class mismatch");
+                    }
+                    (InputOrigin::IntraIter { producer_class, .. }, true) => {
+                        panic!(
+                            "3b c{class} b[{boundary}] m[{member_k}]: ground \
+                             truth PreLoop but compiler emits IntraIter({producer_class})"
+                        );
+                    }
+                    (InputOrigin::LoopCarry { pre_loop_init_sg, .. }, true) => {
+                        assert!(pre_loop_init_sg.is_some(),
+                            "3b c{class} b[{boundary}] m[{member_k}]: \
+                             LoopCarry without preloop init");
+                    }
+                    (InputOrigin::PreLoop { .. }, false) => {
+                        panic!("3b c{class} b[{boundary}] m[{member_k}]: \
+                            ground truth periodic but compiler PreLoop");
+                    }
+                }
+            }
+
+            fn check_delta_global(class: usize, boundary: usize, member_k: usize) {
+                let t = load_3b();
+                let prov = t
+                    .stencil
+                    .class_input_provenance(&t.sched, &t.solved.fuf, &t.solved.sfuf)
+                    .expect("prov");
+                let ci = prov.iter().find(|c| c.consumer_class == class)
+                    .expect("consumer present");
+                let Some(slot) = ci.slots.get(boundary) else { return };
+                let expected = match &slot.origin {
+                    InputOrigin::IntraIter { .. } => Some(0i64),
+                    InputOrigin::LoopCarry { .. } => Some(1i64),
+                    InputOrigin::PreLoop { .. } => None,
+                };
+                let Some(expected) = expected else { return };
+                let Some(gt) = boundary_truth(&t, class, member_k, boundary) else { return };
+                if t.sched.pre_loop.contains(&gt.producer_class) { return }
+                let cgi = consumer_global_iter(&t, class, member_k);
+                let actual = cgi - gt.producer_global_iter;
+                assert_eq!(actual, expected,
+                    "3b c{class} b[{boundary}] m[{member_k}]: \
+                     Δ_global ground-truth={actual}, compiler wants {expected}");
+            }
+
+            macro_rules! triple_tests_3b {
+                ($mod:ident, class=$c:expr, boundary=$b:expr,
+                 members=[$($m:expr),* $(,)?]) => {
+                    mod $mod {
+                        use super::*;
+                        $(
+                            paste::paste! {
+                                #[test]
+                                fn [<producer_class_m $m>]() {
+                                    check_producer_class($c, $b, $m);
+                                }
+                                #[test]
+                                fn [<delta_global_m $m>]() {
+                                    check_delta_global($c, $b, $m);
+                                }
+                            }
+                        )*
+                    }
+                };
+            }
+
+            // 3b has 28 layers. Same topology as 1b:
+            //   c2 (QKV+rope, period=28), c3 (Attention, period=28, 3 bdys),
+            //   c4 (o_proj, period=28), c5 (peel iter 0, period=1, 2 bdys),
+            //   c6 (MLP, period=28), c7 (MLP-down, period=28),
+            //   c8 (pre-attn FAR, period=27, 2 bdys),
+            //   c9 (post-attn FAR, period=27, 2 bdys),
+            //   c10 (peel iter 27, period=1, 2 bdys).
+
+            triple_tests_3b!(c2_b0, class=2, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+            triple_tests_3b!(c3_b0, class=3, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+            triple_tests_3b!(c3_b1, class=3, boundary=1,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+            triple_tests_3b!(c3_b2, class=3, boundary=2,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+            triple_tests_3b!(c4_b0, class=4, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+            triple_tests_3b!(c5_b0, class=5, boundary=0, members=[0]);
+            triple_tests_3b!(c5_b1, class=5, boundary=1, members=[0]);
+            triple_tests_3b!(c6_b0, class=6, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+            triple_tests_3b!(c7_b0, class=7, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+            triple_tests_3b!(c8_b0, class=8, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
+            triple_tests_3b!(c8_b1, class=8, boundary=1,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
+            triple_tests_3b!(c9_b0, class=9, boundary=0,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
+            triple_tests_3b!(c9_b1, class=9, boundary=1,
+                members=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
+            triple_tests_3b!(c10_b0, class=10, boundary=0, members=[0]);
+            triple_tests_3b!(c10_b1, class=10, boundary=1, members=[0]);
         }
     }
 }

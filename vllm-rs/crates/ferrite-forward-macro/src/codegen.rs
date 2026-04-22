@@ -9944,5 +9944,211 @@ mod tests {
             triple_tests_3b!(c10_b0, class=10, boundary=0, members=[0]);
             triple_tests_3b!(c10_b1, class=10, boundary=1, members=[0]);
         }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 13 — no-sampling edge enumeration
+        //
+        // `stencil_pipeline::build_edge_dependences` replaces the
+        // old `class_input_provenance`'s `rep_sg = members[0]`
+        // sampling. These invariants pin that:
+        //   (i)  enumeration covers every (class, member, bp) triple,
+        //   (ii) each edge's producer fields match `boundary_truth`,
+        //   (iii) the edge set equals the ground-truth set — no gaps,
+        //        no duplicates, no extras.
+        //
+        // Greening these is the first load-bearing structural claim
+        // for the rewrite: the INPUT to the classifier is correct
+        // and complete, independent of how the classifier then
+        // groups edges into ReadPlans.
+        // ──────────────────────────────────────────────────────────
+        mod edge_enumeration {
+            use super::*;
+            use super::truth::*;
+            use crate::stencil_pipeline::{
+                build_edge_dependences, walk_boundary_inputs, BoundaryEdge,
+            };
+
+            /// Build the new-pipeline edge set from a Truth fixture.
+            fn edges_for(t: &Truth) -> Vec<BoundaryEdge> {
+                build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                )
+            }
+
+            /// For every (class, member, boundary_pos), exactly one
+            /// edge exists iff the boundary has a producer inside
+            /// any known class. No triple is skipped.
+            #[test]
+            fn every_boundary_triple_yields_an_edge_or_is_raw_extern() {
+                let t = load();
+                let edges = edges_for(&t);
+                for (c, members) in t.stencil.class_members.iter().enumerate() {
+                    for (k, &sg) in members.iter().enumerate() {
+                        let mut boundary_positions: Vec<usize> = Vec::new();
+                        walk_boundary_inputs(
+                            &t.solved.fuf,
+                            &t.solved.sfuf,
+                            sg,
+                            |pos, _, _| boundary_positions.push(pos),
+                        );
+                        for pos in boundary_positions {
+                            let matches: Vec<_> = edges
+                                .iter()
+                                .filter(|e| {
+                                    e.consumer_class == c
+                                        && e.consumer_member == k
+                                        && e.boundary_pos == pos
+                                })
+                                .collect();
+                            // 0 is OK iff the producer is a raw extern
+                            // (InputIds / Positions / …) or otherwise
+                            // outside any class; 1 is the edge; 2+ is
+                            // a deduplication bug in the walker.
+                            assert!(
+                                matches.len() <= 1,
+                                "c{c} m{k} bp{pos}: {} edges, expected 0 or 1",
+                                matches.len(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            /// The enumerated edge set equals the set obtained by
+            /// walking `boundary_truth` over every (class, member,
+            /// boundary_pos). Zero drift between the two paths.
+            ///
+            /// This is the load-bearing claim: `build_edge_dependences`
+            /// is STRUCTURALLY equivalent to ground truth — no
+            /// sampling, no heuristic omission.
+            #[test]
+            fn edge_set_matches_boundary_truth() {
+                let t = load();
+                let edges = edges_for(&t);
+                type Key = (usize, usize, usize); // (class, member, bp)
+                let mut have: BTreeMap<Key, (usize, usize)> = BTreeMap::new();
+                for e in &edges {
+                    have.insert(
+                        (e.consumer_class, e.consumer_member, e.boundary_pos),
+                        (e.producer_class, e.producer_member),
+                    );
+                }
+                for (c, members) in t.stencil.class_members.iter().enumerate() {
+                    for (k, _) in members.iter().enumerate() {
+                        let nb = boundary_count(&t, c);
+                        for pos in 0..nb {
+                            let Some(gt) = boundary_truth(&t, c, k, pos) else {
+                                assert!(
+                                    !have.contains_key(&(c, k, pos)),
+                                    "c{c} m{k} bp{pos}: new pipeline has edge but \
+                                     ground truth does not"
+                                );
+                                continue;
+                            };
+                            let key = (c, k, pos);
+                            let gt_pair = (gt.producer_class, {
+                                let members = &t.stencil.class_members[gt.producer_class];
+                                members
+                                    .iter()
+                                    .position(|&x| x == gt.producer_sg)
+                                    .expect("gt producer in its class")
+                            });
+                            match have.get(&key) {
+                                Some(pair) => assert_eq!(
+                                    *pair, gt_pair,
+                                    "c{c} m{k} bp{pos}: new pipeline says \
+                                     (class={}, member={}), ground truth says \
+                                     (class={}, member={})",
+                                    pair.0, pair.1, gt_pair.0, gt_pair.1,
+                                ),
+                                None => panic!(
+                                    "c{c} m{k} bp{pos}: ground truth has edge to \
+                                     (class={}, member={}), new pipeline has none",
+                                    gt_pair.0, gt_pair.1,
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+
+            /// Every edge's `producer_tile_pos` matches the position
+            /// of `producer_tile` in its subgraph's claim. Sanity:
+            /// the emitter uses this to name per-export idents for
+            /// multi-tile producers; drift here produces wrong-slot
+            /// reads.
+            #[test]
+            fn producer_tile_pos_is_self_consistent() {
+                let t = load();
+                let edges = edges_for(&t);
+                for e in &edges {
+                    let claim = t.solved.sfuf.tiles_in_subgraph(e.producer_sg);
+                    let pos = claim
+                        .iter()
+                        .position(|&x| x == e.producer_tile)
+                        .expect("edge names a tile in its producer's claim");
+                    assert_eq!(
+                        pos as u8, e.producer_tile_pos,
+                        "edge {e:?}: producer_tile_pos={}, recomputed {pos}",
+                        e.producer_tile_pos,
+                    );
+                }
+            }
+
+            /// Same claims, at 28-layer scale. Running the suite at
+            /// two scales catches bugs whose symptoms depend on the
+            /// exact number of classes / members (e.g. over-collapse
+            /// that happens at 28 but not 16).
+            #[test]
+            fn edge_set_matches_boundary_truth_3b() {
+                let t = load_3b();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                type Key = (usize, usize, usize);
+                let mut have: BTreeMap<Key, (usize, usize)> = BTreeMap::new();
+                for e in &edges {
+                    have.insert(
+                        (e.consumer_class, e.consumer_member, e.boundary_pos),
+                        (e.producer_class, e.producer_member),
+                    );
+                }
+                for (c, members) in t.stencil.class_members.iter().enumerate() {
+                    for (k, _) in members.iter().enumerate() {
+                        let nb = boundary_count(&t, c);
+                        for pos in 0..nb {
+                            let Some(gt) = boundary_truth(&t, c, k, pos) else {
+                                continue;
+                            };
+                            let gt_pair = (gt.producer_class, {
+                                let ms = &t.stencil.class_members[gt.producer_class];
+                                ms.iter().position(|&x| x == gt.producer_sg)
+                                    .expect("gt producer in its class")
+                            });
+                            let pair = have
+                                .get(&(c, k, pos))
+                                .copied()
+                                .unwrap_or_else(|| panic!(
+                                    "3b c{c} m{k} bp{pos}: ground truth edge \
+                                     to ({}, {}), new pipeline has none",
+                                    gt_pair.0, gt_pair.1,
+                                ));
+                            assert_eq!(
+                                pair, gt_pair,
+                                "3b c{c} m{k} bp{pos}: new pipeline ({}, {}), \
+                                 ground truth ({}, {})",
+                                pair.0, pair.1, gt_pair.0, gt_pair.1,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

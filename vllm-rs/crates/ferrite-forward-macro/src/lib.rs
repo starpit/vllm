@@ -44,6 +44,7 @@ mod region_formation;
 mod schedule;
 mod shape;
 mod solver;
+mod stencil_pipeline;
 mod subtile;
 mod target;
 mod viz_dump;

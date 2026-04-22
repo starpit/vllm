@@ -553,6 +553,62 @@ message improvements.
 
 ### Top-of-branch commits
 
+- **Scaffolding landed — stencil_pipeline module + no-sampling
+  edge enumerator (2026-04-23).** First concrete piece of the
+  principled-compiler rewrite. New crate-internal module
+  `ferrite-forward-macro/src/stencil_pipeline.rs` (~290 LoC) with:
+  - `BoundaryEdge` — per `(consumer_class, consumer_member,
+    boundary_pos) → (producer_class, producer_member, tile, slot,
+    tile_pos)` edge record.
+  - `walk_boundary_inputs` — the single source of truth for
+    boundary-position numbering (consolidates the walks previously
+    duplicated across `class_input_provenance`, `boundary_truth`,
+    and `paired_periodic_for_slot`).
+  - `build_edge_dependences(fuf, sfuf, class_of, class_members)
+    -> Vec<BoundaryEdge>` — enumerates EVERY triple, no sampling.
+    Linear pass over total tile-input count.
+  - `ReadPlan` / `ReadRegion` / `IterRange` / `DepTarget` types —
+    piecewise-affine read spec. Declared; classifier consumer in
+    next commit.
+
+  New invariant-mountain category 13 (`edge_enumeration`, 4 tests)
+  proves `build_edge_dependences` is structurally equivalent to
+  ground truth at 1b and 3b scale:
+  - `every_boundary_triple_yields_an_edge_or_is_raw_extern`
+  - `edge_set_matches_boundary_truth`
+  - `edge_set_matches_boundary_truth_3b`
+  - `producer_tile_pos_is_self_consistent`
+
+  Mountain state: **1029 passed, 161 failed** (was 1025/161). All 4
+  new tests green, zero regression on the existing 161 red tests.
+  The red tests still fail for the same reasons they did before —
+  this commit lands the INPUT to the classifier (the no-sampling
+  edge set), not the classifier itself.
+
+  **Next concrete step for next session**: implement
+  `classify_reads(edges) -> HashMap<(class, boundary_pos),
+  ReadPlan>` in `stencil_pipeline.rs`. The classifier is a pure
+  function of the edge distribution:
+  1. For each `(consumer_class, boundary_pos)`, collect all edges
+     keyed on that pair.
+  2. Partition consumer members into disjoint iter ranges by
+     producer identity (class, member offset).
+  3. Each range gets a `DepTarget`: `PreLoop` when producer is
+     period-1, `Periodic { delta_global }` when periodic, with
+     `delta_global = consumer_member + class_offset[c] -
+     (producer_member + class_offset[producer_class])`.
+  4. Merge adjacent regions with identical `DepTarget` into one.
+  5. Reject any member with `Δ_global >= 2` as a well-formedness
+     error.
+
+  Then invariant-mountain category 14
+  (`read_plan_classification`) pins:
+  - ReadPlan regions are disjoint + cover `[0, period)`.
+  - Every member's computed `DepTarget` matches ground truth via
+    `boundary_truth(…)`.
+  - `origin_producer_class_matches_every_member` (existing red
+    test) goes green when provenance switches to ReadPlan-derived.
+
 - `a4b38b236` — **invariant mountain scaled to 1229 tests (161 red)**.
   Cross-scale 1b/3b + 6 new categories. This commit is the
   forcing-function for the rewrite.

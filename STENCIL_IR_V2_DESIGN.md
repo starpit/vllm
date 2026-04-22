@@ -480,6 +480,48 @@ None of these are show-stoppers without investigation, but each is worth measuri
 
 ## 13. Status & handoff (2026-04-24)
 
+### ⛔ READ THIS BEFORE TOUCHING CODE ⛔
+
+**WE ARE BUILDING A STENCIL COMPILER. NO HACKS.**
+
+Every commit from here forward is either:
+
+- **(A) Adding pipeline-driven analysis** — new piecewise-affine
+  structure in `stencil_pipeline.rs`, new invariant categories
+  that pin a structural property, new `ReadPlan`/`DepTarget`
+  consumers in the emitter.
+- **(B) Deleting legacy** — removing code from
+  `class_input_provenance`, `InputOrigin`, `alias_carry_redirect`,
+  `alias_through_carries`, `alias_preloop_inits`, the offset-sort
+  schedule, the ad-hoc classifier branches. Net lines go DOWN.
+
+**Anything else is a hack. This includes:**
+
+- ❌ Adding a new `*_redirect: BTreeMap<...>` or `*_set: BTreeSet<...>`
+  that patches the output of a legacy classifier. Even if the
+  predicate is derived from `pipeline.domain.periods`, the *shape*
+  of "legacy says X, I'll map it to Y at the read site" is the
+  sidecar anti-pattern §0 forbids. The principled move is always
+  to have the emitter read `pipe.target_for` directly and match on
+  `DepTarget` — zero redirect.
+- ❌ Adding an `InputOrigin::NewVariantForSomeShape`. `InputOrigin`
+  is legacy; its replacement is `DepTarget`.
+- ❌ Patching a single fixture's shape (the c6 offset-gap, the c2
+  offset-gap, a new arch's shape) with a predicate check. Fixtures
+  expose structure; the fix is to have the emitter consume the
+  existing `ReadRegion[]` that `classify_reads` already computes.
+- ❌ Any commit whose justification is "this works on llama" or
+  "this passes the fleet check." The fleet check is the last
+  filter, not the spec. Structural invariants are the spec.
+
+**Halide and TVM do not have `alias_carry_redirect`. They have a
+piecewise-affine dependence analyser and an emitter that consumes
+it.** That is the only target. When in doubt: read §0. When still
+in doubt: read the Halide paper or the TVM `IterVar`/`Stage`
+source. These are solved problems. We copy the solutions.
+
+**If the next commit adds a sidecar, push back. Do not merge it.**
+
 ### Mountain at 1261/0/3 — step 6b period-1 LoopCarry redirect landed (2026-04-25)
 
 **First 30 seconds of next session:**
@@ -490,24 +532,78 @@ cargo test -p ferrite-forward-macro --lib codegen::tests
 # dumps).
 ```
 
-Latest commit (`d7035e6ae`) threaded `StencilPipeline` into
-`emit_fragment_call_expr` + `emit_aliased_class_inline` for the
-period-1 LoopCarry case — the exact shape the prior 2 orphan-
-carry reds pinned. Pipeline says `target_for` = `PreLoop` for
-period-1 producers; the rewire maps that to the existing
-`__cC_out_P_S: Option<GpuTensor>` hoist the in-loop-short
-aliased emission already assigns at `iter == offset`.
-**This is the first commit where emission is driven by
-`pipe.target_for` for any case, not just classifier-side
-verification.** Legacy `class_input_provenance` still drives all
-other boundary arg resolution — the next step(s) generalise the
-rewire across the rest of the LoopCarry + IntraIter surface.
+**⚠️ Reality check on the latest commit (`d7035e6ae`).** It is
+NOT structural progress. It adds `period_one_carry_redirects` —
+a new sidecar — to patch the output of the legacy LoopCarry
+classifier for the c5 shape. It landed under §13 step 3's
+"sidecars stay for one commit for A/B" license. That license has
+now been used. **The very next commit must be a DELETION of this
+sidecar (and `alias_carry_redirect`) as part of a proper
+`target_for`-driven rewrite of the LoopCarry arm. Not another
+redirect. Not another shape-specific predicate. A rewrite.**
+
+The rewrite looks like this (target shape — this is the commit
+that has to land next):
+
+```rust
+// emit_fragment_call_expr: LoopCarry arm DELETED.
+// All three arms (IntraIter, LoopCarry, PreLoop) replaced by:
+let plan = pipe.boundary_plan(consumer_class, bp)
+    .ok_or_else(|| format!("no ReadPlan for c{consumer_class} b{bp}"))?;
+let region = plan.region_at(member_k)
+    .ok_or_else(|| format!("member {member_k} out of range"))?;
+let arg = match region.target {
+    DepTarget::PreLoop { producer_sg, .. } => {
+        let tile = sfuf.tiles_in_subgraph(producer_sg).last().copied()...;
+        let local = locals.get(&(tile, slot)).ok_or(...)?;
+        quote! { (*#local).as_view() }
+    }
+    DepTarget::Periodic { producer_class, delta_global: 0, .. } => {
+        let c_out = class_out_ident(producer_class, ...);
+        if short_classes.contains(&producer_class) {
+            quote! { (*#c_out.as_ref().expect(..)).as_view() }
+        } else {
+            quote! { (*#c_out).as_view() }
+        }
+    }
+    DepTarget::Periodic { producer_class, delta_global: 1, .. } => {
+        let carry = carry_var_ident(producer_class, ...);
+        quote! { (*#carry).as_view() }  // or .as_ref() for init-less
+    }
+    DepTarget::Periodic { delta_global, .. } => return Err(
+        format!("|Δ|={delta_global} unsupported — cat 14 violation")),
+};
+```
+
+Zero `InputOrigin` reads. Zero `alias_carry_redirect` consults.
+Zero `period_one_carry_redirects` consults. The `ReadPlan` +
+`DepTarget` ARE the classifier. `class_input_provenance` gets
+deleted in the follow-up commit once every emission call site
+uses the plan. **`period_one_carry_redirects` gets deleted in
+this same commit — it only existed because the LoopCarry arm
+read legacy provenance.**
 
 Three commits landed this session:
 
 0. **`d7035e6ae` — step 6b period-1 LoopCarry redirect (2026-04-25).**
-   The pipeline-driven half of step 6b lands for the period-1
-   producer case. Three scoped changes in `try_emit_collapsed_bucket`:
+   **⚠️ Transitional sidecar patch, not structural progress.**
+   This commit adds a NEW sidecar (`period_one_carry_redirects`)
+   that reads `pipeline.domain.periods` and rewrites the output
+   of the legacy `class_input_provenance`'s LoopCarry tagging.
+   The derivation is principled (period-1 is a structural
+   property of the iteration domain), but the *shape* of the
+   commit — "legacy classifier produces X, map it to Y at the
+   read site" — is exactly the `alias_*_redirect` pattern §0
+   calls out as the anti-path. It lands under §13 step 3's
+   "sidecars stay in place for one commit so the flip can be
+   A/B'd." That license is a stopwatch, not a blank cheque.
+   **The next commit's job is to delete this sidecar (and the
+   pre-existing `alias_carry_redirect`) as part of a proper
+   `target_for`-driven rewrite of the LoopCarry arm — not to
+   add siblings.** See "Step 6b remaining" below for the
+   principled replacement.
+
+   Three scoped changes in `try_emit_collapsed_bucket`:
    - Derive `period_one_carry_redirects` from `pipeline.domain.periods`
      — set of `(producer_class, pos, slot)` keys where the class
      has period 1. Filter `carry_inits` on this set so the orphan
@@ -591,68 +687,70 @@ Three commits landed this session:
    the emitter's boundary-arg resolution starts consulting
    `target_for`.
 
-### Step 6b remaining — generalise the rewire beyond period-1
+### The next commit — LoopCarry/IntraIter/PreLoop arms → `boundary_plan`
 
-The period-1 LoopCarry case landed (commit `d7035e6ae`). The
-remaining rewire surface, in rough escalation order:
+Exactly one commit. Scope:
 
-1. **Non-uniform offset-gap LoopCarry (c6 shape).** FAR_DECODER's
-   c6 reads c5 at member m=0 and c9 at m>0. Pipeline's
-   `classify_reads` emits a `ReadPlan` with two `ReadRegion`s —
-   one targeting `PreLoop(c5_sg)` for the m=0 region, one
-   targeting `Periodic { producer_class: 9, delta_global: 0 }`
-   (or 1) for m≥1. The emitter needs to handle this either by:
-   a) emitting a per-iter `if __repeat == 0 { arg = c5_binding }
-      else { arg = c9_binding }` at the fragment call site, or
-   b) splitting the fragment call into two guarded sub-calls
-      (one per region), each passing a uniform arg set.
-   Option (a) requires fragment fn params to accept a
-   `TensorView` bound from a match-expression (already legal
-   Rust). Option (b) is a larger codegen restructure; not
-   preferred. The invariant mountain's cat 14
-   `regions_cover_and_partition_range` + cat 17
-   `target_for_matches_truth` already pin the data the emitter
-   needs. No test today fires on the c6 shape's emission
-   correctness because provenance's legacy LoopCarry
-   classification happens to produce valid (if suboptimal)
-   emission — a latent correctness question worth pinning
-   before the rewire.
+**Add (principled):**
+- A helper `region_at(member_k)` on `ReadPlan` that returns the
+  `ReadRegion` covering `member_k` (or `None` if out of range).
+  Already structurally supported by cat 14
+  `regions_cover_and_partition_range`; just exposes it.
+- The match-on-`DepTarget` emission block sketched above, used by
+  all three arms of `emit_fragment_call_expr` AND
+  `emit_aliased_class_inline`.
+- Non-uniform `ReadPlan`s (c6 offset-gap shape: m=0 reads
+  `PreLoop(c5)`, m≥1 reads `Periodic(c9)`) emit a per-iter match:
+  ```rust
+  let arg = match __repeat {
+      0 => (*c5_binding.as_ref().expect(..)).as_view(),
+      _ => (*c9_binding).as_view(),
+  };
+  ```
+  Same codegen kernel as the uniform case, just a runtime match
+  instead of a single expression. No shape-specific branch — the
+  `ReadRegion[]` walk generates the arms mechanically.
 
-2. **IntraIter + PreLoop resolution via target_for.** Today the
-   emitter resolves IntraIter reads via `class_out_ident` and
-   PreLoop reads via a `locals` map keyed on `(tile, slot)`.
-   Both work today because the provenance walk is consistent
-   with the pipeline on these cases — but the pipeline is
-   authoritative and the provenance is legacy. Migrate the
-   IntraIter arm in `emit_fragment_call_expr` +
-   `emit_aliased_class_inline` to consult
-   `pipe.target_for(consumer_class, bp, member_k=0)` and
-   assert `Periodic { delta_global: 0 }` — any divergence from
-   legacy is a structural bug worth surfacing.
+**Delete (legacy):**
+- `period_one_carry_redirects` (landed last commit, transitional).
+- `alias_carry_redirect` + its construction.
+- `alias_through_carries` (can go once LoopCarry arm is dead).
+- `alias_preloop_inits` (same).
+- The `InputOrigin` match in both emitter helpers — replaced by
+  the `DepTarget` match. Keep the `InputOrigin` enum for one more
+  commit so `class_input_provenance` still typechecks; the final
+  commit deletes the enum + the function.
 
-3. **Class ordering via `pipe.partition.flat_order()`.** Replace
-   today's `sched.pre_loop / sched.periodic / sched.post_loop`
-   iteration with `pipe.partition.flat_order()`, routing
-   `in_loop_short` classes via one-iter `if __repeat == offset`
-   guards inside the loop body (analogous to the legacy
-   aliased-emittable reroute but driven by the `in_loop_short`
-   bucket, no `is_aliased_emittable` sampling). Cat 16 pins that
-   flat_order + schedule.order agree; the ordering change should
-   be token-identical on the uniform case.
+**Acceptance:**
+- Mountain stays at 1261/0/3 (or better — some currently-passing
+  tests may have been vacuous under legacy; those are found,
+  strengthened, and kept green).
+- `cargo expand -p ferrite-model-llama --features cuda` on
+  `FERRITE_STENCIL_CODEGEN=1` shows emission that's
+  byte-identical to today on the uniform case and emits a
+  `match __repeat` on the c6 non-uniform boundary.
+- Fleet check `FERRITE_STENCIL_CODEGEN=1 cargo check -p
+  ferrite-models --features cuda` clean across 218 variants.
+- The diff line-count is NET NEGATIVE. If the commit grows the
+  codebase, it's adding another sidecar somewhere. Stop.
 
-4. **Delete the sidecars.** Once every boundary arg resolution
-   is driven by `pipe.target_for`, delete `InputOrigin`,
-   `class_input_provenance`, `alias_carry_redirect`,
-   `alias_through_carries`, and `alias_preloop_inits`. Cat 0
-   in the mountain (the 1229-test structural property set) is
-   the proof that the pipeline alone suffices.
+**What this commit is NOT:**
+- NOT splitting into "uniform first, non-uniform follow-up." The
+  whole point of `ReadPlan` is that uniform is the degenerate
+  case (one-region plan) of non-uniform (multi-region plan). One
+  codegen path handles both.
+- NOT preserving `class_input_provenance` "for comparison." The
+  old enum becomes dead code the moment the emitter stops
+  reading it; leaving it live invites drift. Delete in the
+  follow-up commit (the one that retires the enum + function).
+- NOT routing through "temporary" wrapper types like
+  `DepTargetOrLegacyOrigin`. No adapter layers. `DepTarget` is
+  the API.
 
-**Recommended next session starting point**: step 2 (migrate the
-IntraIter + PreLoop arms). It's the smallest-scope change and
-the structural claim is directly pinned by cat 14/17. Step 1 is
-larger and benefits from step 2's scaffolding. Step 3 follows
-step 2 once every boundary arg resolution goes through
-`target_for`.
+Class ordering via `pipe.partition.flat_order()` is a separate
+commit AFTER the arms are migrated — trivial once the emission
+no longer reads legacy provenance, but out of scope for the
+"delete the sidecars" commit.
 
 ### Big-picture reset (2026-04-23)
 

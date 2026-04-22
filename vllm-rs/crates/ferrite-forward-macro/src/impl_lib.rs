@@ -2680,7 +2680,7 @@ impl Implementation for ScalarMulImpl {
                 ::ferrite_kernels::kernels::scale_inplace(
                     *#upstream,
                     #scale,
-                    get_cublas_for_scale!(device),
+                    
                 );
                 #upstream
             };
@@ -7661,7 +7661,7 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
 
     fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
         // Mirror of `FusedQkvRopeCacheImpl::emit_call` with the
-        // cuBLAS-shaped `(#w).forward(#x, &mut device.cublas, ...)`
+        // cuBLAS-shaped `(#w).forward(#x,  ...)`
         // replaced by `(#w).forward(#x, &mut device.caching, stream)`
         // (MarlinLinear owns the matmul internally). The FP8 KV
         // branch stays — it's orthogonal to the weight format.
@@ -7941,7 +7941,7 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
 // are (a) the storage gate (`is_bnb4_gemm` instead of
 // `is_marlin_gemm`), (b) the declared accessor `rust_type`
 // (`Bnb4bitLinear`), and (c) the `emit_call` binding
-// (`(#w).forward(x, &mut device.cublas, &mut device.caching,
+// (`(#w).forward(x,  &mut device.caching,
 // stream)` — BNB4's forward takes cuBLAS because the kernel does
 // a dequant-then-cuBLAS-matmul, unlike Marlin's fused-matmul path).
 //

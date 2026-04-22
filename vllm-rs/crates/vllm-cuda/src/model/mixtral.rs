@@ -756,7 +756,7 @@ impl MixtralForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            device.cublas.as_mut(),
+            
             &mut device.caching,
         )
     }

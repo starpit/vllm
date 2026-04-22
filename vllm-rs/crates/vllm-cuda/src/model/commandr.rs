@@ -85,19 +85,19 @@ impl CommandRAttention {
             // Quantized: separate Q, K, V GEMMs → concat
             let q_out = attn.qkv_proj.forward(
                 hidden_states,
-                device.cublas.as_mut(),
+                
                 &mut device.caching,
                 device.compute_stream,
             );
             let k_out = k_proj.forward(
                 hidden_states,
-                device.cublas.as_mut(),
+                
                 &mut device.caching,
                 device.compute_stream,
             );
             let v_out = v_proj.forward(
                 hidden_states,
-                device.cublas.as_mut(),
+                
                 &mut device.caching,
                 device.compute_stream,
             );
@@ -122,7 +122,7 @@ impl CommandRAttention {
             // Dense: single fused QKV GEMM
             attn.qkv_proj.forward(
                 hidden_states,
-                device.cublas.as_mut(),
+                
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -246,7 +246,7 @@ impl CommandRAttention {
                 let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
                 let result = attn.o_proj.forward(
                     attn_flat,
-                    device.cublas.as_mut(),
+                    
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -317,7 +317,7 @@ impl CommandRAttention {
                 let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
                 let result = attn.o_proj.forward(
                     attn_flat,
-                    device.cublas.as_mut(),
+                    
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -364,7 +364,7 @@ impl CommandRAttention {
         let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
         let result = attn.o_proj.forward(
             attn_flat,
-            device.cublas.as_mut(),
+            
             &mut device.caching,
             device.compute_stream,
         );
@@ -587,13 +587,13 @@ impl CommandRForCausalLM {
         // lm_head: logits = hidden_states @ lm_head_weight^T
         let logits = self.lm_head.forward(
             hidden_states.view(),
-            device.cublas.as_mut(),
+            
             &mut device.caching,
         );
 
         // Apply logit scaling.
         if self.logit_scale != 1.0 {
-            kernels::scale_inplace(*logits.view(), self.logit_scale, device.cublas.as_ref().expect("cuBLAS required for scale_inplace"));
+            kernels::scale_inplace(*logits.view(), self.logit_scale);
         }
 
         logits

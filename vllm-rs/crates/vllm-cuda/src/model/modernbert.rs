@@ -131,7 +131,7 @@ impl ModernBertAttention {
         // QKV projection: [num_tokens, 3 * hidden_size]
         let qkv = self
             .wqkv
-            .forward(hidden_states, &mut device.cublas, &mut device.caching);
+            .forward(hidden_states, &mut device.caching);
 
         // Split QKV → [num_tokens, num_heads, head_dim] each.
         let (q, k, v) = kernels::split_qkv(
@@ -199,7 +199,7 @@ impl ModernBertAttention {
         // Output projection.
         let out = self
             .wo
-            .forward(attn_flat.view(), &mut device.cublas, &mut device.caching);
+            .forward(attn_flat.view(), &mut device.caching);
         drop(attn_flat);
         out
     }
@@ -240,7 +240,7 @@ impl ModernBertMlp {
         // Wi: [num_tokens, 2 * intermediate_size]
         let gate_up = self
             .wi
-            .forward(hidden_states, &mut device.cublas, &mut device.caching);
+            .forward(hidden_states, &mut device.caching);
 
         // GeGLU activation: chunks gate_up into gate and input halves,
         // applies GELU to gate, multiplies.
@@ -255,7 +255,7 @@ impl ModernBertMlp {
         // Wo: [num_tokens, hidden_size]
         let out = self
             .wo
-            .forward(activated.view(), &mut device.cublas, &mut device.caching);
+            .forward(activated.view(), &mut device.caching);
         drop(activated);
         out
     }

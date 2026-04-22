@@ -473,10 +473,10 @@ impl GdnWeights {
         // 1. Input projections on GPU.
         let qkvz =
             self.in_proj_qkvz
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching);
         let ba = self
             .in_proj_ba
-            .forward(hidden_states, &mut device.cublas, &mut device.caching);
+            .forward(hidden_states, &mut device.caching);
 
         // 2. Split QKVZ and BA on GPU using fused kernel (no CPU round-trip).
         let key_dim = self.key_dim;
@@ -688,7 +688,7 @@ impl GdnWeights {
         // 7. Output projection on GPU.
         let result = self.out_proj.forward(
             proj_input.view().reshape(&[num_tokens, value_dim]),
-            device.cublas.as_mut(),
+            
             &mut device.caching,
         );
         drop(proj_input);
@@ -852,7 +852,7 @@ impl Qwen3NextFullAttention {
         //    Where q_size = 2*true_q_size if attn_output_gate.
         let qkv = self.inner.qkv_proj.forward(
             hidden_states,
-            device.cublas.as_mut(),
+            
             &mut device.caching,
             stream,
         );
@@ -1016,7 +1016,7 @@ impl Qwen3NextFullAttention {
         let result =
             self.inner
                 .o_proj
-                .forward(attn_flat, &mut device.cublas, &mut device.caching, stream);
+                .forward(attn_flat, &mut device.caching, stream);
         drop(attn_output);
 
         // TP all-reduce.
@@ -1464,7 +1464,7 @@ impl Qwen3NextForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            device.cublas.as_mut(),
+            
             &mut device.caching,
             device.compute_stream,
         )

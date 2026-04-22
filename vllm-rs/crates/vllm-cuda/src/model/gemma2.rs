@@ -183,7 +183,7 @@ impl Gemma2MLP {
     pub unsafe fn forward(&self, x: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
         let gate_up = self.gate_up_proj.forward(
             x,
-            device.cublas.as_mut(),
+            
             &mut device.caching,
             device.compute_stream,
         );
@@ -196,7 +196,7 @@ impl Gemma2MLP {
         drop(gate_up);
         let result = self.down_proj.forward(
             activated.view(),
-            device.cublas.as_mut(),
+            
             &mut device.caching,
             device.compute_stream,
         );
@@ -459,7 +459,7 @@ impl Gemma2Attention {
 
         let qkv = self.qkv_proj.forward(
             hidden_states,
-            device.cublas.as_mut(),
+            
             &mut device.caching,
             device.compute_stream,
         );
@@ -537,7 +537,7 @@ impl Gemma2Attention {
             let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
             let result = self.o_proj.forward(
                 attn_flat,
-                device.cublas.as_mut(),
+                
                 &mut device.caching,
                 device.compute_stream,
             );
@@ -616,7 +616,7 @@ impl Gemma2Attention {
         let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
         let result = self.o_proj.forward(
             attn_flat,
-            device.cublas.as_mut(),
+            
             &mut device.caching,
             device.compute_stream,
         );
@@ -1421,7 +1421,7 @@ impl Gemma2Model {
             &mut device.caching,
             device.compute_stream,
         );
-        kernels::scale_inplace(*hidden_states.view(), self.embed_scale, device.cublas.as_ref().expect("cuBLAS required for scale_inplace"));
+        kernels::scale_inplace(*hidden_states.view(), self.embed_scale);
 
         let mut hidden_states: OwnedTensor = hidden_states;
         let mut residual: Option<OwnedTensor> = None;
@@ -1823,7 +1823,7 @@ impl Gemma2ForCausalLM {
 
         let logits = self.lm_head.forward(
             hidden_states.view(),
-            device.cublas.as_mut(),
+            
             &mut device.caching,
         );
 
@@ -2322,7 +2322,7 @@ impl Gemma2Model {
                     &mut device.caching,
                     device.compute_stream,
                 );
-                kernels::scale_inplace(*hs.view(), self.embed_scale, device.cublas.as_ref().expect("cuBLAS required for scale_inplace"));
+                kernels::scale_inplace(*hs.view(), self.embed_scale);
                 (hs, None)
             } else {
                 let (hs, res) = intermediate.expect("non-first PP stage requires intermediate");
@@ -2510,7 +2510,7 @@ impl Gemma2ForCausalLM {
                 #[allow(unused_mut)]
                 let mut logits =
                     self.lm_head
-                        .forward(hs_view, &mut device.cublas, &mut device.caching);
+                        .forward(hs_view, &mut device.caching);
                 // hidden_states can be freed now.
                 drop(gathered);
                 drop(hidden_states);

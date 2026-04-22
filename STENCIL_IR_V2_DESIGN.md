@@ -478,7 +478,146 @@ Red flags that would tell us this refactor is the wrong move:
 
 None of these are show-stoppers without investigation, but each is worth measuring at the relevant staging step rather than discovering at integration.
 
-## 13. Status & handoff (2026-04-23)
+## 13. Status & handoff (2026-04-24)
+
+### Mountain at 1259/2/3 — step 6b test-retarget landed (2026-04-24)
+
+**First 30 seconds of next session:**
+```bash
+cd /home/moosevan/vllm/.claude/worktrees/ff3/vllm-rs
+cargo test -p ferrite-forward-macro --lib codegen::tests
+# Expected: 1259 passed / 2 failed / 3 ignored.
+# The 2 reds are `emission::no_orphan_initless_carry_idents` +
+# `scale_3b::no_orphan_initless_carry_idents` — they flip green
+# only when the emitter itself consumes pipe.target_for.
+```
+
+Two commits landed this session:
+
+1. **`7bbf61af8` — invariant test retarget to pipe.target_for.**
+   The 161 invariant reds that pinned `class_input_provenance`'s
+   per-member correctness now query `StencilPipeline::target_for(
+   class, bp, member_k)` — the structurally-correct piecewise-
+   affine lookup. **159 of 161 reds flipped green without a
+   single line of production-code change**, because the pipeline
+   is already correct (cat 17 proves it; cat 14 ties plan targets
+   to ground truth). The remaining 2 are emission-token checks on
+   `try_emit_collapsed_bucket`'s output — those need the emitter
+   itself rewired.
+
+   Retargeted helpers + tests:
+   - `per_triple::{check_producer_class, check_delta_global,
+     check_member_consistent_with_rep}` + the `per_triple_3b`
+     parallels — 1144 tests green (was 153 red).
+   - `provenance::origin_{producer_class,delta_global}_matches_every_member`
+     — iterate every periodic class's (member, boundary), assert
+     target_for matches ground truth.
+   - `class_formation::all_members_share_uniform_producer_{class,position}_per_boundary`
+     — restated per §0: the legacy "uniform producer class across
+     members" invariant forbade well-formed offset-gap shapes; the
+     principled-compiler replacement checks that target_for
+     matches ground truth per-member. Over-collapse is fine iff
+     ReadPlan resolves it.
+   - `scale_3b::all_members_share_uniform_producer_class_per_boundary`
+     — same at 3b scale.
+   - `layer_semantics::delta_0_edges_have_producer_before_consumer`
+     — retargeted to `pipe.schedule.order` (Kahn topo sort) from
+     `t.sched.periodic`'s offset-sort.
+   - `truth::pipeline(t)` helper — one-liner wrapper building
+     `StencilPipeline::build` over the fixture; panics on Δ=0
+     cycle (structural fixture bug, not a test condition).
+
+   The "period-1 producer" predicate is now
+   `stencil.class_members[pc].len() == 1` (principled), not
+   `t.sched.pre_loop.contains(pc)` (legacy-routing-dependent;
+   false on aliased-emittable period-1 classes the old schedule
+   rerouted into `periodic`).
+
+2. **`2e30902ac` — StencilPipeline threaded through emission.**
+   `emit_forward_collapsed_bucket` builds `StencilPipeline::build`
+   alongside the legacy `class_input_provenance`; passes it into
+   `try_emit_collapsed_bucket` as `_pipeline: Option<&StencilPipeline>`.
+   Zero emission change; pure scaffolding so follow-up call-site
+   swaps have the contract available. Every test call site (14
+   total) passes `None` today — they become `Some(&pipe)` when
+   the emitter's boundary-arg resolution starts consulting
+   `target_for`.
+
+### Remaining red: the `__carry_c5_p0_s0` orphan
+
+**Both remaining reds surface the same failing ident on the
+FAR_DECODER fixtures.** `emission::no_orphan_initless_carry_idents`
+reports `orphan init-less carries: ["__carry_c5_p0_s0"]`. c5 is
+period-1 and rerouted into `sched.periodic` by legacy's
+aliased-emittable path (fires inside the loop at `__repeat ==
+offset(c5)`). Today's `class_input_provenance` tags a consumer's
+c5-boundary as `LoopCarry { producer_class: 5, pre_loop_init_sg:
+None }` via the shifted-carry branch (`observed == carry_expected`).
+That hoists `let mut __carry_c5_p0_s0: Option<OwnedTensor> = None`,
+but nothing ever assigns it because c5 is not a true carry
+producer — it's a period-1 class whose single output is bound to
+`__c5_out_p0_s0` by `emit_aliased_class_inline` inside the loop
+body.
+
+Pipeline says `target_for(consumer, bp, 0)` = `DepTarget::PreLoop(c5_sg)`
+(period 1 → PreLoop, correct). The fix requires:
+- `carry_inits` filtered to exclude entries where the producer
+  has period 1 (use pipeline instead of provenance).
+- `emit_fragment_call_expr` + `emit_aliased_class_inline` to
+  resolve period-1 periodic producers to the in-loop-short
+  binding (`__c5_out_p0_s0`) — which may need hoisting to a
+  scope visible across iters (5i.4's machinery exists for this
+  exact shape on the post-loop side; reuse for in-loop readers
+  at iter > 0).
+
+This is the natural coupling between step 6b (emitter rewire)
+and step 4 (route class ordering through `pipe.partition`) in
+the task list: resolving a period-1-in-loop-short producer
+needs the partition bucket to know where its output lives.
+
+### Step 6b remaining — emitter rewire to target_for
+
+The handoff-era plan (preserved verbatim below) is sound; the
+retarget half is done, emitter half is queued. The two pieces
+land together in the next session:
+
+1. Replace `class_input_provenance` reads in
+   `emit_fragment_call_expr` + `emit_aliased_class_inline` with
+   `pipe.target_for(class, bp, member_k)` lookups. The
+   `PreLoop` variant maps to the pre-loop subgraph's local; the
+   `Periodic { delta_global: 0 }` variant maps to
+   `__cC_out_P_S`; `Periodic { delta_global: 1 }` maps to
+   `__carry_cC_P_S`. Any `|delta_global| ≥ 2` returned by the
+   lookup is a structural refusal (cat 14 already pins `≤ 1`
+   on the fixture).
+2. Replace class ordering throughout `try_emit_collapsed_bucket`
+   with `pipe.partition.flat_order()`, routing
+   `in_loop_short` classes via one-iter `if __repeat == offset`
+   guards inside the loop body (analogous to the legacy
+   aliased-emittable reroute but driven by the `in_loop_short`
+   bucket, no `is_aliased_emittable` sampling).
+3. The old `InputOrigin` enum + `alias_carry_redirect` sidecar
+   stay in place for one commit so the flip can be A/B'd; they
+   are deleted in the follow-up once every provenance-red test
+   clears.
+4. Watch the 2 invariant reds flip green as the rewire lands;
+   every remaining red after step 6b is a structural gap the
+   next piece of the pipeline needs to cover.
+
+**Open design question surfaced by the retarget:** offset-gap
+shapes (c6 reads c5 at m=0 and c9 at m>0) have non-uniform
+target_for across members. The simple 3-way DepTarget → emit
+mapping above handles uniform targets; non-uniform targets need
+either per-member conditional arg binding or a refusal with a
+clear structural message. For the shipping fleet
+(llama-2-7b / mistral / phi3 / qwen2) the uniform case is the
+norm — the `FAR_DECODER_BODY` fixture at 1b/3b exposes the
+non-uniform case via c5 + c6. **A useful intermediate stopping
+point for the next session**: land the rewire for the uniform
+case + refuse non-uniform with a clear message. The refusal
+still flips the orphan-carry test if the uniform-case rewire
+correctly resolves period-1 producers (c5) to the
+`__c5_out_p0_s0` binding instead of the spurious carry.
 
 ### Big-picture reset (2026-04-23)
 

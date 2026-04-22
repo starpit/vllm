@@ -60,6 +60,10 @@ struct ForwardArgs {
     /// spans — e.g. FlashInfer decode wins on long sk, FA2 wins at
     /// small prefill.
     sk_buckets: Vec<u64>,
+    /// When true, do not register dense cuBLAS fallback GEMM impls in
+    /// the starter library. Unsupported shapes then fail during solve
+    /// instead of silently routing to cuBLAS.
+    cublas_free: bool,
     /// Span used for error reporting when a required arg is
     /// missing.
     span: Span,
@@ -71,6 +75,7 @@ impl Parse for ForwardArgs {
         let mut target: Option<LitStr> = None;
         let mut workloads: Option<Vec<u64>> = None;
         let mut sk_buckets: Option<Vec<u64>> = None;
+        let mut cublas_free: Option<bool> = None;
 
         fn parse_u64_list(input: ParseStream) -> syn::Result<Vec<u64>> {
             let list;
@@ -94,6 +99,7 @@ impl Parse for ForwardArgs {
                 "target" => target = Some(input.parse()?),
                 "workloads" => workloads = Some(parse_u64_list(input)?),
                 "sk_buckets" => sk_buckets = Some(parse_u64_list(input)?),
+                "cublas_free" => cublas_free = Some(input.parse::<syn::LitBool>()?.value),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -119,11 +125,13 @@ impl Parse for ForwardArgs {
         // so they can't be picked unless the model declares a real
         // sk_buckets list.
         let sk_buckets = sk_buckets.unwrap_or_default();
+        let cublas_free = cublas_free.unwrap_or(false);
 
         Ok(Self {
             target,
             workloads,
             sk_buckets,
+            cublas_free,
             span,
         })
     }
@@ -328,7 +336,9 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         )
     })?;
 
-    let library = impl_lib::starter_library();
+    let library = impl_lib::starter_library_with_options(impl_lib::StarterLibraryOptions {
+        allow_cublas_fallbacks: !args.cublas_free,
+    });
 
     // Stable rebuild-on-JSON-change: emit `const _: &str =
     // include_str!("<abs path>");` for every file the macro read.

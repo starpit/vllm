@@ -1303,12 +1303,26 @@ fn eval_dim_usize(d: &crate::shape::Dim, ctx: &EmitCtx) -> Option<usize> {
 /// multi-tile fusions the `ferrite-kernels` shape requires.
 /// Replaced / augmented by calibrated target-specific impls as
 /// they're ported.
-pub fn starter_library() -> ImplementationLibrary {
+pub struct StarterLibraryOptions {
+    pub allow_cublas_fallbacks: bool,
+}
+
+impl Default for StarterLibraryOptions {
+    fn default() -> Self {
+        Self {
+            allow_cublas_fallbacks: true,
+        }
+    }
+}
+
+pub fn starter_library_with_options(options: StarterLibraryOptions) -> ImplementationLibrary {
     let mut lib = ImplementationLibrary::new();
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
     lib.push(Box::new(LayerNormRefImpl));
-    lib.push(Box::new(GemmRefImpl));
+    if options.allow_cublas_fallbacks {
+        lib.push(Box::new(GemmRefImpl));
+    }
     lib.push(Box::new(AttentionViaCacheImpl));
     // Reshape is a metadata-only view op synthesized by shape
     // inference to bridge axis-factor mismatches (e.g. per-head QK-
@@ -1324,7 +1338,9 @@ pub fn starter_library() -> ImplementationLibrary {
     // `(Gemm, BiasAdd)` pairs not absorbed by a larger fusion (e.g.
     // a lone affine-transform gemm that's not a QKV-pre-rope or
     // gate/up-pre-MLP). Emits cuBLAS gemm_bias via `LinearLayer::forward`.
-    lib.push(Box::new(FusedGemmBiasImpl));
+    if options.allow_cublas_fallbacks {
+        lib.push(Box::new(FusedGemmBiasImpl));
+    }
     // CUTLASS EVT peer to FusedGemmBiasImpl; bias folded into the
     // GEMM epilogue via row-broadcast visitor. `target_compatible`
     // gates on the `cutlass_fused_gemm_bias` CSV row.
@@ -1487,6 +1503,10 @@ pub fn starter_library() -> ImplementationLibrary {
         }
     }
     lib
+}
+
+pub fn starter_library() -> ImplementationLibrary {
+    starter_library_with_options(StarterLibraryOptions::default())
 }
 
 // ── FusedGemmBiasImpl ────────────────────────────────────────────
@@ -7917,7 +7937,6 @@ impl Implementation for Bnb4GemmImpl {
             let #out = unsafe {
                 (#w).forward(
                     #x,
-                    &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 )
@@ -8022,12 +8041,7 @@ impl Implementation for Fp8GemmImpl {
         let w = ctx.input_expr(tile, 1);
         quote! {
             let #out = unsafe {
-                (#w).forward(
-                    #x,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
+                (#w).forward(#x, None, &mut device.caching, device.compute_stream)
             };
         }
     }
@@ -8174,7 +8188,7 @@ impl Implementation for Fp8FusedGemmBiasImpl {
             let #out = unsafe {
                 (#weight_expr).forward(
                     #activation,
-                    &mut device.cublas,
+                    None,
                     &mut device.caching,
                     device.compute_stream,
                 )
@@ -8331,12 +8345,8 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
 
         quote! {
             let #mul_out = unsafe {
-                let gate_up = (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
+                let gate_up =
+                    (#weight_expr).forward(#activation, None, &mut device.caching, device.compute_stream);
                 ::ferrite_kernels::kernels::silu_and_mul_fused(
                     *gate_up,
                     #intermediate,
@@ -8493,7 +8503,6 @@ impl Implementation for Bnb4FusedGateUpSiluMulImpl {
             let #mul_out = unsafe {
                 let gate_up = (#weight_expr).forward(
                     #activation,
-                    &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -8650,7 +8659,6 @@ impl Implementation for Bnb4FusedGateUpGeluMulImpl {
             let #mul_out = unsafe {
                 let gate_up = (#weight_expr).forward(
                     #activation,
-                    &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -9477,7 +9485,6 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
             let #q_out = unsafe {
                 let qkv_packed = (#weight_expr).forward(
                     #activation,
-                    &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -9638,7 +9645,6 @@ impl Implementation for Bnb4FusedQkvRopePrefillImpl {
             let (#q_out, #k_out, #v_out) = unsafe {
                 let qkv_packed = (#weight_expr).forward(
                     #activation,
-                    &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 );

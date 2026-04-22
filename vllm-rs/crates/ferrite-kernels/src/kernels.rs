@@ -3861,6 +3861,7 @@ pub unsafe fn flash_attn_paged_ext(
 // Scalar multiply (in-place via cuBLAS)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "cublas")]
 unsafe extern "C" {
     fn cublasScalEx(
         handle: cudarc::cublas::sys::cublasHandle_t,
@@ -3879,6 +3880,7 @@ unsafe extern "C" {
 /// * `x`: any contiguous tensor (F16, BF16, or F32)
 /// * `scale`: the scalar multiplier (always f32)
 /// * `cublas`: cuBLAS handle on the compute stream
+#[cfg(feature = "cublas")]
 pub unsafe fn scale_inplace(
     x: GpuTensor,
     scale: f32,
@@ -3942,6 +3944,7 @@ pub unsafe fn pool_select_row(
 /// # Safety
 /// `hidden_states` must be a valid 2D GPU tensor with dtype F32.
 /// For bf16/f16 inputs, caller must cast to f32 first.
+#[cfg(feature = "cublas")]
 pub unsafe fn pool_mean_f32(
     hidden_states: GpuTensor,
     cublas: &ferrite_cuda_core::cublas::CublasHandle,

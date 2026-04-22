@@ -8,9 +8,11 @@
 use anyhow::Result;
 
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
-use ferrite_cuda_core::cublas::CublasHandle;
 use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
 use ferrite_cuda_core::weights::GpuWeights;
+
+#[cfg(feature = "cublas")]
+use ferrite_cuda_core::cublas::CublasHandle;
 
 #[cfg(feature = "nccl")]
 use ferrite_cuda_core::nccl::NcclGroup;
@@ -101,19 +103,34 @@ impl Linear {
     ///
     /// # Safety
     /// All tensors must be valid GPU memory. cuBLAS handle must be on the correct stream.
+    ///
+    /// # Panics
+    /// Panics if the `cublas` feature is not enabled (cuBLAS is required for dense linear layers).
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
+        #[cfg(feature = "cublas")]
         cublas: &mut CublasHandle,
+        #[cfg(not(feature = "cublas"))]
+        _cublas: &mut (),
         alloc: &mut CachingAllocator,
     ) -> OwnedTensor {
-        debug_assert_eq!(x.ndim(), 2);
-        debug_assert_eq!(x.dim(1), self.weight.dim(1), "Linear: input dim mismatch");
+        #[cfg(not(feature = "cublas"))]
+        {
+            let _ = (x, alloc);
+            panic!("Linear::forward requires the 'cublas' feature to be enabled");
+        }
+        
+        #[cfg(feature = "cublas")]
+        {
+            debug_assert_eq!(x.ndim(), 2);
+            debug_assert_eq!(x.dim(1), self.weight.dim(1), "Linear: input dim mismatch");
 
-        if let Some(bias) = self.bias {
-            cublas.gemm_bias(*x, self.weight, bias, alloc)
-        } else {
-            cublas.gemm(*x, self.weight, alloc)
+            if let Some(bias) = self.bias {
+                cublas.gemm_bias(*x, self.weight, bias, alloc)
+            } else {
+                cublas.gemm(*x, self.weight, alloc)
+            }
         }
     }
 
@@ -532,12 +549,22 @@ impl LinearLayer {
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: Option<&mut CublasHandle>,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
         match self {
-            Self::Dense(l) => l.forward(x, cublas.expect("LinearLayer::Dense requires cuBLAS"), alloc),
+            Self::Dense(_l) => {
+                #[cfg(feature = "cublas")]
+                {
+                    // This should not be reachable in cublas-free builds
+                    panic!("LinearLayer::Dense should not be used without cublas feature");
+                }
+                #[cfg(not(feature = "cublas"))]
+                {
+                    let _ = (x, alloc, stream);
+                    panic!("LinearLayer::Dense requires the 'cublas' feature");
+                }
+            }
             Self::Marlin(l) => l.forward(x, alloc, stream),
             Self::Ggml(l) => l.forward(x, alloc, stream),
             Self::Bnb4bit(l) => l.forward(x, alloc, stream),
@@ -1020,11 +1047,10 @@ impl ColumnParallelLinear {
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: Option<&mut CublasHandle>,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
-        let out = self.inner.forward(x, cublas, alloc, stream);
+        let out = self.inner.forward(x, alloc, stream);
 
         #[cfg(feature = "nccl")]
         if self.gather_output
@@ -1078,11 +1104,10 @@ impl RowParallelLinear {
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: Option<&mut CublasHandle>,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
-        let out = self.inner.forward(x, cublas, alloc, stream);
+        let out = self.inner.forward(x, alloc, stream);
 
         #[cfg(feature = "nccl")]
         if let Some(ref group) = self.tp_group {

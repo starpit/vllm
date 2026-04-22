@@ -21,6 +21,24 @@ use ferrite_cuda_core::device::GpuDevice;
 use ferrite_cuda_core::nccl::NcclGroup;
 use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
 
+/// Helper macro to get cublas handle from device, handling feature-gated field access.
+/// Returns `&mut CublasHandle` when cublas feature is enabled, `&mut ()` otherwise.
+macro_rules! get_cublas {
+    ($device:expr) => {{
+        #[cfg(feature = "cublas")]
+        {
+            $device.cublas.as_mut().expect("cublas handle required")
+        }
+        #[cfg(not(feature = "cublas"))]
+        {
+            // Create a static unit value to avoid temporary lifetime issues
+            // Use addr_of_mut! to avoid creating a mutable reference (Rust 2024 compatibility)
+            static mut DUMMY_CUBLAS: () = ();
+            unsafe { &mut *std::ptr::addr_of_mut!(DUMMY_CUBLAS) }
+        }
+    }};
+}
+
 /// Dynamic BLOCK_M selection for fused MoE GEMM tiling.
 ///
 /// Matches Python vLLM's `get_default_config` heuristic: select the smallest
@@ -97,9 +115,7 @@ impl FusedMoELayer {
 
         let block_m = select_moe_block_m(num_tokens, self.top_k, self.num_experts);
 
-        let router_logits =
-            self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+        let router_logits = self.gate.forward(hidden_states, get_cublas!(device), &mut device.caching);
 
         let (topk_weights, topk_ids) = kernels::topk_softmax(
             router_logits.as_gpu_tensor(),
@@ -224,7 +240,7 @@ impl SharedFusedMoELayer {
         ) {
             // shared_gate_up(hidden_states) → [num_tokens, 2*intermediate]
             let shared_gu =
-                shared_gate_up.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate_up.forward(hidden_states, get_cublas!(device), &mut device.caching);
             // SiLU-and-mul → [num_tokens, intermediate]
             let shared_activated = kernels::silu_and_mul_fused(
                 shared_gu.as_gpu_tensor(),
@@ -237,14 +253,14 @@ impl SharedFusedMoELayer {
             // down_proj → [num_tokens, hidden]
             let shared_out = shared_down.forward(
                 shared_activated.view(),
-                device.cublas.as_mut(),
+                get_cublas!(device),
                 &mut device.caching,
             );
             drop(shared_activated);
 
             // Gate: sigmoid(shared_expert_gate(hidden_states)) * shared_out
             let gate_logits =
-                shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate.forward(hidden_states, get_cublas!(device), &mut device.caching);
 
             // Fused: out = moe_out + sigmoid(gate_logits) * shared_out
             let result = kernels::sigmoid_mul_add(
@@ -317,7 +333,7 @@ impl Fp8FusedMoELayer {
         // 1. Gate: router_logits = hidden_states @ gate_weight^T
         let router_logits =
             self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, get_cublas!(device), &mut device.caching);
 
         // 2. Top-K softmax
         let (topk_weights, topk_ids) = kernels::topk_softmax(
@@ -472,7 +488,7 @@ impl Fp8BlockFusedMoELayer {
         // 1. Gate
         let router_logits =
             self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, get_cublas!(device), &mut device.caching);
 
         // 2. Top-K softmax
         let (topk_weights, topk_ids) = kernels::topk_softmax(
@@ -614,7 +630,7 @@ impl Fp8SharedFusedMoELayer {
             &self.shared_expert_gate,
         ) {
             let shared_gu =
-                shared_gate_up.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate_up.forward(hidden_states, get_cublas!(device), &mut device.caching);
             let shared_activated = kernels::silu_and_mul_fused(
                 shared_gu.as_gpu_tensor(),
                 self.intermediate_size,
@@ -625,13 +641,13 @@ impl Fp8SharedFusedMoELayer {
 
             let shared_out = shared_down.forward(
                 shared_activated.view(),
-                device.cublas.as_mut(),
+                get_cublas!(device),
                 &mut device.caching,
             );
             drop(shared_activated);
 
             let gate_logits =
-                shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate.forward(hidden_states, get_cublas!(device), &mut device.caching);
 
             let result = kernels::sigmoid_mul_add(
                 moe_out.as_gpu_tensor(),
@@ -710,7 +726,7 @@ impl GgmlFusedMoELayer {
         // 1. Gate: router_logits = hidden_states @ gate_weight^T
         let router_logits =
             self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, get_cublas!(device), &mut device.caching);
 
         // 2. Top-K softmax
         let (topk_weights, topk_ids) = kernels::topk_softmax(
@@ -986,7 +1002,7 @@ impl MarlinFusedMoELayer {
         // 1. Gate: router_logits = hidden_states @ gate_weight^T
         let router_logits =
             self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, get_cublas!(device), &mut device.caching);
 
         // 2. Top-K softmax
         let (topk_weights, topk_ids) = kernels::topk_softmax(
@@ -1157,7 +1173,6 @@ impl MarlinSharedFusedMoELayer {
         ) {
             let shared_gu = shared_gate_up.forward(
                 hidden_states,
-                device.cublas.as_mut(),
                 &mut device.caching,
                 stream,
             );
@@ -1171,14 +1186,13 @@ impl MarlinSharedFusedMoELayer {
 
             let shared_out = shared_down.forward(
                 shared_activated.view(),
-                device.cublas.as_mut(),
                 &mut device.caching,
                 stream,
             );
             drop(shared_activated);
 
             let gate_logits =
-                shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate.forward(hidden_states, get_cublas!(device), &mut device.caching);
 
             let result = kernels::sigmoid_mul_add(
                 moe_out.as_gpu_tensor(),

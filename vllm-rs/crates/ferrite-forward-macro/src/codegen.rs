@@ -10471,5 +10471,219 @@ mod tests {
                 }
             }
         }
+
+        // ──────────────────────────────────────────────────────────
+        // CATEGORY 15 — schedule topology (Kahn over Δ=0 edges)
+        //
+        // `stencil_pipeline::schedule_from_edges` replaces today's
+        // `ClassSchedule` offset-sort with a structural Kahn
+        // topological sort over the intra-iteration (Δ_global=0)
+        // sub-graph. Tie-break by ascending class index gives
+        // determinism across runs.
+        //
+        // Invariants pinned here:
+        //  (a) For every enumerated edge with Δ_global = 0, the
+        //      producer class appears strictly before the consumer
+        //      class in `schedule.order`. This is the defining
+        //      correctness claim: the schedule is a valid topo order.
+        //  (b) `order` is a permutation of `0..n_classes` — every
+        //      class index appears exactly once. No class is silently
+        //      dropped; no class is duplicated.
+        //  (c) The fixture has no Δ=0 cycle — `schedule_from_edges`
+        //      returns `Ok`, not a `ScheduleCycle`. A real cycle in
+        //      the Δ=0 sub-graph would mean class formation produced
+        //      a structurally-infeasible set of Regions; the rewrite
+        //      surfaces that loudly instead of emitting a partial
+        //      schedule.
+        //
+        // All three claims are repeated at 3b (28-layer) scale:
+        // period-dependent cycles or coverage gaps that only appear
+        // at one scale are a sign the schedule is scale-sensitive
+        // (i.e. a hidden heuristic).
+        // ──────────────────────────────────────────────────────────
+        mod pipeline_schedule {
+            use super::*;
+            use super::truth::*;
+            use crate::stencil_pipeline::{
+                build_edge_dependences, class_domain, schedule_from_edges,
+            };
+
+            /// (a) Every Δ=0 edge has its producer class strictly
+            /// before its consumer class in the emitted order.
+            #[test]
+            fn delta_zero_edges_are_topologically_satisfied() {
+                let t = load();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain)
+                    .expect("1b fixture schedule_from_edges must not report a Δ=0 cycle");
+                for e in &edges {
+                    let cg = domain.offsets[e.consumer_class] as i64 + e.consumer_member as i64;
+                    let pg = domain.offsets[e.producer_class] as i64 + e.producer_member as i64;
+                    if cg - pg != 0 {
+                        continue;
+                    }
+                    if e.producer_class == e.consumer_class {
+                        continue;
+                    }
+                    let pp = sched
+                        .position_of(e.producer_class)
+                        .expect("producer class in schedule");
+                    let cp = sched
+                        .position_of(e.consumer_class)
+                        .expect("consumer class in schedule");
+                    assert!(
+                        pp < cp,
+                        "Δ=0 edge c{} ← c{} (member {} ← {}) violates \
+                         topology: producer at pos {pp}, consumer at pos {cp}",
+                        e.consumer_class,
+                        e.producer_class,
+                        e.consumer_member,
+                        e.producer_member,
+                    );
+                }
+            }
+
+            /// (b) Every class index appears exactly once.
+            #[test]
+            fn order_is_a_permutation_of_all_classes() {
+                let t = load();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain)
+                    .expect("1b fixture: no Δ=0 cycle");
+                let n = t.stencil.class_members.len();
+                assert_eq!(
+                    sched.order.len(),
+                    n,
+                    "schedule length {} != n_classes {n}",
+                    sched.order.len(),
+                );
+                let mut seen: BTreeSet<usize> = BTreeSet::new();
+                for &c in &sched.order {
+                    assert!(c < n, "schedule class index {c} out of range");
+                    assert!(
+                        seen.insert(c),
+                        "class {c} appears more than once in schedule order",
+                    );
+                }
+                assert_eq!(
+                    seen.len(),
+                    n,
+                    "schedule covers {} classes, expected {n}",
+                    seen.len(),
+                );
+            }
+
+            /// (c) No Δ=0 cycle — schedule_from_edges returns Ok on
+            /// the real fixture. A `ScheduleCycle` here would name
+            /// the structurally-infeasible classes.
+            #[test]
+            fn no_delta_zero_cycle() {
+                let t = load();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                match schedule_from_edges(&edges, &domain) {
+                    Ok(_) => {}
+                    Err(cycle) => panic!(
+                        "1b fixture has Δ=0 cycle involving classes {:?}",
+                        cycle.unscheduled_classes,
+                    ),
+                }
+            }
+
+            /// (a) at 3b scale.
+            #[test]
+            fn delta_zero_edges_are_topologically_satisfied_3b() {
+                let t = load_3b();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain)
+                    .expect("3b fixture: no Δ=0 cycle");
+                for e in &edges {
+                    let cg = domain.offsets[e.consumer_class] as i64 + e.consumer_member as i64;
+                    let pg = domain.offsets[e.producer_class] as i64 + e.producer_member as i64;
+                    if cg - pg != 0 {
+                        continue;
+                    }
+                    if e.producer_class == e.consumer_class {
+                        continue;
+                    }
+                    let pp = sched
+                        .position_of(e.producer_class)
+                        .expect("3b producer class in schedule");
+                    let cp = sched
+                        .position_of(e.consumer_class)
+                        .expect("3b consumer class in schedule");
+                    assert!(
+                        pp < cp,
+                        "3b Δ=0 edge c{} ← c{}: producer pos {pp}, consumer pos {cp}",
+                        e.consumer_class, e.producer_class,
+                    );
+                }
+            }
+
+            /// (b) at 3b scale.
+            #[test]
+            fn order_is_a_permutation_of_all_classes_3b() {
+                let t = load_3b();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                let sched = schedule_from_edges(&edges, &domain)
+                    .expect("3b fixture: no Δ=0 cycle");
+                let n = t.stencil.class_members.len();
+                assert_eq!(sched.order.len(), n, "3b schedule len {} != {n}", sched.order.len());
+                let mut seen: BTreeSet<usize> = BTreeSet::new();
+                for &c in &sched.order {
+                    assert!(c < n, "3b class {c} out of range");
+                    assert!(seen.insert(c), "3b class {c} appears twice");
+                }
+            }
+
+            /// (c) at 3b scale.
+            #[test]
+            fn no_delta_zero_cycle_3b() {
+                let t = load_3b();
+                let edges = build_edge_dependences(
+                    &t.solved.fuf,
+                    &t.solved.sfuf,
+                    &t.stencil.class_of,
+                    &t.stencil.class_members,
+                );
+                let domain = class_domain(&t.stencil.class_members, &t.sched.class_offsets);
+                match schedule_from_edges(&edges, &domain) {
+                    Ok(_) => {}
+                    Err(cycle) => panic!(
+                        "3b fixture has Δ=0 cycle involving classes {:?}",
+                        cycle.unscheduled_classes,
+                    ),
+                }
+            }
+        }
     }
 }

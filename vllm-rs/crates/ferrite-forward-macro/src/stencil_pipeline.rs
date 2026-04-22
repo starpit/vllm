@@ -466,6 +466,127 @@ fn resolve_dep_target(
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Schedule — topological order over Δ_global=0 edges.
+//
+// `schedule_from_edges` is a pure function of (edges, domain). It
+// builds the class-level dependence graph restricted to intra-
+// iteration edges (Δ_global = 0) and returns a Kahn topological
+// order over all classes, tie-breaking by ascending class index for
+// determinism. Carry edges (Δ_global ≥ 1) are ignored — they do not
+// constrain intra-iteration firing order.
+//
+// Cycle detection is structural: any class whose in-degree never
+// reaches zero is reported in `ScheduleCycle::unscheduled_classes`.
+// "No class with a Δ=0 cycle silently emitted" — per invariant
+// category 15 (c), the caller treats an `Err` as a refusal gate;
+// the rewrite never inserts a class into the emission order whose
+// intra-iter deps are not satisfied.
+//
+// This replaces today's `ClassSchedule` offset-sort. The offset-
+// sort happened to produce a topologically-valid order on shipping
+// fleets because offsets were derived from periods, but it could
+// not catch structural cycles — a bug the old pipeline masked by
+// never tripping it. Kahn makes the contract explicit.
+// ─────────────────────────────────────────────────────────────────
+
+/// Linear topological order over classes, respecting every
+/// `Δ_global = 0` dependence edge. Every class index `0..n` appears
+/// exactly once.
+#[derive(Debug, Clone)]
+pub(crate) struct Schedule {
+    pub order: Vec<usize>,
+}
+
+impl Schedule {
+    #[allow(dead_code)]
+    pub fn position_of(&self, class: usize) -> Option<usize> {
+        self.order.iter().position(|&c| c == class)
+    }
+}
+
+/// Error returned by [`schedule_from_edges`] when the Δ=0 dependence
+/// graph contains a cycle. Lists every class that could not be placed
+/// — at least one of them is in the cycle; the rest are transitively
+/// downstream. Callers surface this as a structural refusal rather
+/// than silently emitting a partial order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScheduleCycle {
+    pub unscheduled_classes: Vec<usize>,
+}
+
+/// Kahn topological sort over the Δ_global=0 sub-graph.
+///
+/// Edges with `Δ_global ≠ 0` (carries) are ignored — they do not
+/// constrain intra-iteration firing order. Ties broken by ascending
+/// class index (min-first via `BTreeSet`) so the order is
+/// deterministic across invocations and implementations.
+///
+/// A class with no incoming Δ=0 edges is ready immediately; classes
+/// with no outgoing Δ=0 edges just appear in the order without
+/// further constraint. Filler classes (not present as either end of
+/// any edge) appear in ascending index order at the front.
+///
+/// Complexity: O(|edges| + n_classes · log n_classes) — the log
+/// factor is the `BTreeSet` ready-queue operations.
+#[allow(dead_code)]
+pub(crate) fn schedule_from_edges(
+    edges: &[BoundaryEdge],
+    domain: &ClassDomain,
+) -> Result<Schedule, ScheduleCycle> {
+    let n = domain.periods.len();
+
+    // Class-level successor / predecessor sets, deduped. An edge
+    // is included iff `delta_global = (O_c + m_c) - (O_p + m_p) = 0`.
+    let mut succ: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    for e in edges {
+        if e.consumer_class >= n || e.producer_class >= n {
+            continue;
+        }
+        let consumer_global = domain.offsets[e.consumer_class] as i64 + e.consumer_member as i64;
+        let producer_global = domain.offsets[e.producer_class] as i64 + e.producer_member as i64;
+        if consumer_global - producer_global != 0 {
+            continue;
+        }
+        if e.producer_class == e.consumer_class {
+            // Self-intra-iter (producer_sg != consumer_sg but same
+            // class, same global iter) would require two distinct
+            // members at the same offset+member — impossible by
+            // construction. Guarded here defensively; a real
+            // occurrence would indicate an upstream invariant break.
+            continue;
+        }
+        if succ[e.producer_class].insert(e.consumer_class) {
+            preds[e.consumer_class].insert(e.producer_class);
+        }
+    }
+
+    let mut indeg: Vec<usize> = preds.iter().map(|s| s.len()).collect();
+    let mut ready: BTreeSet<usize> = (0..n).filter(|&c| indeg[c] == 0).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while let Some(&c) = ready.iter().next() {
+        ready.remove(&c);
+        order.push(c);
+        for &s in &succ[c] {
+            indeg[s] = indeg[s].saturating_sub(1);
+            if indeg[s] == 0 {
+                ready.insert(s);
+            }
+        }
+    }
+
+    if order.len() == n {
+        Ok(Schedule { order })
+    } else {
+        let placed: BTreeSet<usize> = order.iter().copied().collect();
+        let unscheduled: Vec<usize> = (0..n).filter(|c| !placed.contains(c)).collect();
+        Err(ScheduleCycle {
+            unscheduled_classes: unscheduled,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Unit tests — narrow, self-contained. Cross-cutting invariant
 // tests against fixtures live in `codegen::tests::invariants`.
 // ─────────────────────────────────────────────────────────────────
@@ -658,6 +779,95 @@ mod tests {
             !plans.contains_key(&(0, 0)),
             "partial boundary coverage produces no ReadPlan",
         );
+    }
+
+    #[test]
+    fn schedule_ignores_carry_edges() {
+        // c0 period-3 carries from itself (Δ=1). No intra-iter edges.
+        // Expect linear order [0] — carry does not constrain class
+        // ordering.
+        let class_members = vec![vec![SubgraphId(10), SubgraphId(11), SubgraphId(12)]];
+        let offsets = vec![0];
+        let domain = class_domain(&class_members, &offsets);
+        let edges = vec![
+            // m1 ← m0 (Δ=1, carry), m2 ← m1 (Δ=1, carry).
+            edge(0, 1, 0, 0, 0, 10, 100, 0, 0),
+            edge(0, 2, 0, 0, 1, 11, 110, 0, 0),
+        ];
+        let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
+        assert_eq!(sched.order, vec![0]);
+    }
+
+    #[test]
+    fn schedule_respects_intra_iter_edge() {
+        // c0 feeds c1 at Δ=0 on every iter. c1 must appear after c0.
+        let class_members = vec![
+            vec![SubgraphId(10), SubgraphId(11)],
+            vec![SubgraphId(20), SubgraphId(21)],
+        ];
+        let offsets = vec![0, 0];
+        let domain = class_domain(&class_members, &offsets);
+        let edges = vec![
+            edge(1, 0, 0, 0, 0, 10, 100, 0, 0),
+            edge(1, 1, 0, 0, 1, 11, 110, 0, 0),
+        ];
+        let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
+        assert_eq!(sched.order, vec![0, 1]);
+        assert!(sched.position_of(0).unwrap() < sched.position_of(1).unwrap());
+    }
+
+    #[test]
+    fn schedule_ties_break_by_class_index() {
+        // No edges at all — all classes ready. Order must be ascending
+        // class index so the output is deterministic across runs.
+        let class_members = vec![
+            vec![SubgraphId(10)],
+            vec![SubgraphId(20)],
+            vec![SubgraphId(30)],
+        ];
+        let offsets = vec![0, 0, 0];
+        let domain = class_domain(&class_members, &offsets);
+        let sched = schedule_from_edges(&[], &domain).expect("no cycle");
+        assert_eq!(sched.order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn schedule_detects_cycle() {
+        // c0 ←→ c1 at Δ=0. Both classes stay unscheduled.
+        let class_members = vec![
+            vec![SubgraphId(10), SubgraphId(11)],
+            vec![SubgraphId(20), SubgraphId(21)],
+        ];
+        let offsets = vec![0, 0];
+        let domain = class_domain(&class_members, &offsets);
+        let edges = vec![
+            // c1 ← c0 (Δ=0)
+            edge(1, 0, 0, 0, 0, 10, 100, 0, 0),
+            edge(1, 1, 0, 0, 1, 11, 110, 0, 0),
+            // c0 ← c1 (Δ=0) — cycle
+            edge(0, 0, 0, 1, 0, 20, 200, 0, 0),
+            edge(0, 1, 0, 1, 1, 21, 210, 0, 0),
+        ];
+        let err = schedule_from_edges(&edges, &domain).unwrap_err();
+        assert_eq!(err.unscheduled_classes, vec![0, 1]);
+    }
+
+    #[test]
+    fn schedule_mixes_ready_and_constrained_classes() {
+        // c2 depends on c0 at Δ=0; c1 is unconstrained. Expect c0, c1
+        // ready immediately (index tie-break), c2 released by c0.
+        let class_members = vec![
+            vec![SubgraphId(10)],
+            vec![SubgraphId(20)],
+            vec![SubgraphId(30)],
+        ];
+        let offsets = vec![0, 0, 0];
+        let domain = class_domain(&class_members, &offsets);
+        let edges = vec![edge(2, 0, 0, 0, 0, 10, 100, 0, 0)];
+        let sched = schedule_from_edges(&edges, &domain).expect("no cycle");
+        // c0 and c1 both ready at start; tie-break index chooses 0 then 1.
+        // c2 released by c0 so appears at index 2.
+        assert_eq!(sched.order, vec![0, 1, 2]);
     }
 
     #[test]

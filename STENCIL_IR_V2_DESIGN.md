@@ -645,24 +645,76 @@ message improvements.
   coverage anchor is what separates "classifier correct" from
   "tests asserted nothing."
 
-  **Next concrete step for next session**: topological schedule
-  over intra-iter edges (`Schedule` / `Kahn(edges_with_Δ=0)`),
-  then the ReadPlan-consuming emitter. Outline:
-  1. Add `schedule_from_edges(edges: &[BoundaryEdge], n_classes)
-     -> Schedule` that returns a Kahn topo order over the Δ=0
-     sub-graph (ignoring carries). Tie-break by class index for
-     determinism, matching today's `ClassSchedule::schedule` where
-     observable.
-  2. Category 15 (`schedule_topology`) pins: (a) for every Δ=0
-     edge the producer class appears strictly before the consumer
-     in the schedule; (b) every class index appears exactly once;
-     (c) no class with a Δ=0 cycle is silently emitted.
-  3. The ReadPlan-consuming emitter replaces `class_input_provenance`
-     reads in `emit_fragment_call_expr` + `emit_aliased_class_inline`
-     with lookups keyed on `(class, bp)`. The old `InputOrigin`
-     enum + `alias_carry_redirect` sidecar stay in place for one
-     commit so the flip can be A/B'd; they are deleted in the
-     follow-up once every provenance-red test clears.
+- **Schedule landed — `schedule_from_edges` + category 15
+  (2026-04-23).** Third stage of the rewrite lands. Kahn
+  topological sort over the Δ_global=0 sub-graph replaces
+  `ClassSchedule`'s offset-sort; carry edges (Δ=1) are ignored as
+  they don't constrain intra-iteration firing order.
+  - `Schedule { order: Vec<usize> }` — linear topo order covering
+    every class `0..n_classes`.
+  - `ScheduleCycle { unscheduled_classes: Vec<usize> }` —
+    structured error when the Δ=0 sub-graph contains a cycle; the
+    caller treats this as a refusal gate (no class silently
+    emitted in a partial order).
+  - `schedule_from_edges(edges, domain) -> Result<Schedule,
+    ScheduleCycle>` — pure function. Builds class-level predecessor
+    sets restricted to Δ=0 edges, runs Kahn with a `BTreeSet`
+    ready-queue so ties break by ascending class index for
+    determinism. O(|edges| + n · log n).
+
+  New invariant-mountain category 15 (`pipeline_schedule`, 6 tests)
+  pins the three structural claims at 1b + 3b scale:
+  - (a) `delta_zero_edges_are_topologically_satisfied` — for every
+    enumerated edge with Δ_global=0, producer class appears
+    strictly before consumer in `order`.
+  - (b) `order_is_a_permutation_of_all_classes` — every class
+    index 0..n appears exactly once, no duplicates, no drops.
+  - (c) `no_delta_zero_cycle` — `schedule_from_edges` returns
+    `Ok` on the real fixture; an `Err` would name structurally-
+    infeasible classes.
+
+  Plus five unit tests in `stencil_pipeline::tests` covering the
+  function in isolation (carry-only fixture / intra-iter ordering
+  / tie-break determinism / cycle detection / mixed ready +
+  constrained).
+
+  Mountain state: **1043 passed, 161 failed** (was 1037/161). All
+  6 new category 15 tests green, zero regression on the 161 red
+  tests — the schedule stage is upstream of the emitter rewrite,
+  so provenance-driven reds stay red as expected. Full crate:
+  1253/164 (161 invariants + 3 pre-existing unrelated solver/config
+  failures per handoff, unchanged).
+
+  Red→green proof (three targeted stubs on the function body):
+  - Replace final `Ok(Schedule { order })` with reversed order →
+    (a) fires on both 1b + 3b with the exact violating class pair
+    (e.g. `Δ=0 edge c1 ← c0: producer pos 11, consumer pos 10`).
+    (b) + (c) stay green (reverse is still a permutation).
+  - Replace with `order.pop(); Ok(...)` → (b) fires with
+    `3b schedule len 11 != 12`. (c) stays green.
+  - Replace with `Err(ScheduleCycle { unscheduled_classes:
+    (0..n).collect() })` → (c) fires with the full class list;
+    (a) and (b) also fail via `.expect(...)` panic, as expected.
+  Restoring the real Kahn body makes all 6 green.
+
+  **Next concrete step for next session**: ReadPlan-consuming
+  emitter. Outline:
+  1. Replace `class_input_provenance` reads in
+     `emit_fragment_call_expr` + `emit_aliased_class_inline` with
+     lookups keyed on `(class, bp)` into the `classify_reads`
+     output. The iter-local region `region_at(member_k)` gives the
+     `DepTarget` for that iter; the emitter maps `PreLoop` to the
+     pre-loop subgraph's local and `Periodic { delta_global }` to
+     either `__cC_out_P_S` (Δ=0) or `__carry_cC_P_S` (Δ=1).
+  2. Replace class ordering throughout `try_emit_collapsed_bucket`
+     with `schedule_from_edges`'s `order`. Project onto pre_loop /
+     periodic / post_loop partitions using the `ClassDomain`
+     periods (period-1 classes → pre_loop or post_loop per
+     position in `order`; period > 1 → periodic).
+  3. The old `InputOrigin` enum + `alias_carry_redirect` sidecar
+     stay in place for one commit so the flip can be A/B'd; they
+     are deleted in the follow-up once every provenance-red test
+     clears.
 
 - `a4b38b236` — **invariant mountain scaled to 1229 tests (161 red)**.
   Cross-scale 1b/3b + 6 new categories. This commit is the

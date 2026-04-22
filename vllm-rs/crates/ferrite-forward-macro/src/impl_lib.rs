@@ -1423,6 +1423,8 @@ pub fn starter_library_with_options(options: StarterLibraryOptions) -> Implement
             tile_n: tile.1,
             stages: tile.2,
         }));
+    // Fallback CUTLASS GEMM for shapes not covered by calibrated tile zoo
+    lib.push(Box::new(CutlassGemmFallbackImpl));
     }
     // CUTLASS GEMM + residual-add peer: beta=1.0 epilogue, in-place
     // on residual. 2-tile claim over `(Gemm, Add)`; DP picks over
@@ -6266,6 +6268,96 @@ impl Implementation for CutlassGemmImpl {
         }
     }
 }
+// ── CutlassGemmFallbackImpl ──────────────────────────────────────────
+/// Fallback CUTLASS GEMM implementation that accepts any shape without
+/// requiring CSV calibration data. Uses default tile size (128x128x3).
+#[derive(Debug, Clone)]
+pub struct CutlassGemmFallbackImpl;
+
+impl Implementation for CutlassGemmFallbackImpl {
+    fn name(&self) -> &'static str {
+        "cutlass_gemm_fallback"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        // Always compatible - fallback when calibrated variants don't match
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        // M=1 is GEMV territory
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        // Dense kernel: reject AWQ storage
+        if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        // Reject if output flows into fusion
+        if gemm_is_fusion_partner(fuf, seed) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        cost_gemm(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::RegularLaunch
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
+        let tile = ctx.primary();
+        let out = ctx.output_ident(tile, 0);
+        let x = ctx.input_expr(tile, 0);
+        let w = ctx.input_expr(tile, 1);
+        quote! {
+            let #out = unsafe {
+                ::ferrite_kernels::cutlass::cutlass_gemm(
+                    *(#x),
+                    (#w).dense_weight(),
+                    ::ferrite_kernels::cutlass::CutlassTile::new(128, 128, 3),
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            };
+        }
+    }
+}
+
 
 // ── CutlassGemmSplitKImpl ────────────────────────────────────────
 //

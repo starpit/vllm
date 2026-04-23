@@ -42,6 +42,7 @@ impl GgufDType {
     pub const Q8K: Self = Self(15);
     pub const IQ4_NL: Self = Self(20);
     pub const IQ4_XS: Self = Self(23);
+    pub const IQ1_M:  Self = Self(29);
     pub const BF16: Self = Self(30);
 
     /// Size in bytes of one quantization block (type_size in GGML).
@@ -63,6 +64,7 @@ impl GgufDType {
             15 => 292,   // Q8K
             20 => 18,    // IQ4_NL
             23 => 136,   // IQ4_XS
+            29 => 56,    // IQ1_M
             _ => 0,
         }
     }
@@ -75,6 +77,7 @@ impl GgufDType {
             10..=15 => 256,      // Q2K..Q8K
             20 => 32,            // IQ4_NL
             23 => 256,           // IQ4_XS
+            29 => 256,           // IQ1_M
             _ => 1,
         }
     }

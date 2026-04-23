@@ -262,6 +262,8 @@ impl TestModels {
     pub const QWEN2_0_5B_GGUF: &str = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
     pub const QWEN3_0_6B_GGUF: &str = "unsloth/Qwen3-0.6B-GGUF";
     pub const QWEN3_NEXT_0_8B_GGUF: &str = "unsloth/Qwen3.5-0.8B-GGUF";
+    pub const LLAMA_3_2_1B_IQ1M_GGUF: &str = "unsloth/Llama-3.2-1B-Instruct-GGUF";
+    pub const LLAMA_3_2_1B_IQ1M_FILE: &str = "Llama-3.2-1B-Instruct-UD-IQ1_M.gguf";
 
     // -----------------------------------------------------------------------
     // CUDA-only models (safetensors BF16)

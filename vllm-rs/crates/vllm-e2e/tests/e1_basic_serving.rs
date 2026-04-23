@@ -1260,6 +1260,30 @@ async fn test_cuda_gguf_qwen3_next_chat() {
     );
 }
 */
+
+// Llama-3.2-1B UD-IQ1_M — IQ1_M quantized GGUF (1.75 bpw)
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_llama_iq1m_chat() {
+    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_IQ1M_GGUF)
+        .with_args(&["--gguf-file", TestModels::LLAMA_3_2_1B_IQ1M_FILE])
+        .start()
+        .await
+        .expect("IQ1_M GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        resp.usage.completion_tokens.unwrap_or(0) > 0,
+        "IQ1_M model should generate at least one token"
+    );
+}
+
 // end GGUF tests
 
 // ---------------------------------------------------------------------------

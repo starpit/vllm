@@ -2049,6 +2049,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-model-deepseek-v3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
 name = "ferrite-model-gemma2"
 version = "0.1.0"
 dependencies = [
@@ -2142,6 +2153,7 @@ version = "0.1.0"
 dependencies = [
  "ferrite-model-commandr",
  "ferrite-model-deepseek-v2",
+ "ferrite-model-deepseek-v3",
  "ferrite-model-gemma2",
  "ferrite-model-gemma3",
  "ferrite-model-granite",

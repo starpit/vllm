@@ -42,6 +42,7 @@ fn cuda_build() {
         "../../crates/vllm-cuda/csrc/cache_kernels.cu",
         "../../crates/vllm-cuda/csrc/qk_norm_rope_kernels.cu",
         "../../crates/vllm-cuda/csrc/moe_topk_kernels.cu",
+        "../../crates/vllm-cuda/csrc/grouped_topk_noaux.cu",
         "../../crates/vllm-cuda/csrc/moe_align_kernels.cu",
         "../../crates/vllm-cuda/csrc/moe_align_block_size_kernels.cu",
         "../../crates/vllm-cuda/csrc/fused_moe_gemm_kernels.cu",
@@ -64,6 +65,7 @@ fn cuda_build() {
         "../../crates/vllm-cuda/csrc/gather_last_dim_kernel.cu",
     ];
     let vllm_watch = [
+        "../../crates/vllm-cuda/csrc/moeTopKFuncs.cuh",
         "../../crates/vllm-cuda/csrc/vec_utils.cuh",
         "../../crates/vllm-cuda/csrc/fp8_utils.cuh",
     ];

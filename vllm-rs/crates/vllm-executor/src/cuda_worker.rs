@@ -1373,6 +1373,22 @@ fn deepseek_v2_config_from_hf(
         .get("routed_scaling_factor")
         .and_then(|v| v.as_f64())
         .unwrap_or(1.0);
+    let n_expert_group = hf
+        .extra
+        .get("n_group")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let topk_group = hf
+        .extra
+        .get("topk_group")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let scoring_func = hf
+        .extra
+        .get("scoring_func")
+        .and_then(|v| v.as_str())
+        .unwrap_or("softmax")
+        .to_string();
 
     // YaRN rope_scaling (optional)
     let yarn_rope_scaling = hf.extra.get("rope_scaling").and_then(|rs| {
@@ -1421,6 +1437,9 @@ fn deepseek_v2_config_from_hf(
         moe_intermediate_size,
         norm_topk_prob,
         routed_scaling_factor,
+        n_expert_group,
+        topk_group,
+        scoring_func,
         yarn_rope_scaling,
     })
 }
@@ -5733,7 +5752,7 @@ impl Worker for CudaWorker {
                     self.qwen3_next_config = Some(config);
                     CudaModel::Qwen3Next(m)
                 }
-                "DeepseekV2ForCausalLM" | "DeepSeekV3ForCausalLM" => {
+                "DeepseekV2ForCausalLM" | "DeepSeekV3ForCausalLM" | "DeepseekV3ForCausalLM" => {
                     let config = deepseek_v2_config_from_hf(&hf_config)?;
                     let m = if use_tp {
                         vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM::load_tp(
@@ -5805,7 +5824,7 @@ impl Worker for CudaWorker {
                      Gemma3ForConditionalGeneration, GraniteForCausalLM, MixtralForCausalLM, \
                      Qwen2MoeForCausalLM, Qwen3MoeForCausalLM, CohereForCausalLM, \
                      Qwen3NextForCausalLM, DeepseekV2ForCausalLM, DeepSeekV3ForCausalLM, \
-                     ModernBertModel"
+                     DeepseekV3ForCausalLM, ModernBertModel"
                     )));
                 }
             }

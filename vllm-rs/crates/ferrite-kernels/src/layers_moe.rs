@@ -59,6 +59,16 @@ pub struct FusedMoELayer {
     pub intermediate_size: usize,
     pub hidden_size: usize,
     pub renormalize: bool,
+    /// `[num_experts]` F32 e_score_correction_bias for sigmoid routing (DeepSeek V3 / Kimi K2).
+    /// When `Some`, uses sigmoid top-k with bias instead of softmax top-k.
+    pub e_score_correction_bias: Option<GpuTensor>,
+    /// Number of expert groups for `noaux_tc` grouped routing (DeepSeek V3).
+    /// 0 = no group selection (flat top-k).
+    pub n_expert_group: usize,
+    /// Number of groups to select in grouped routing. 0 = disabled.
+    pub topk_group: usize,
+    /// Scaling factor applied to routing weights (default 1.0).
+    pub routed_scaling_factor: f64,
     /// NCCL group for tensor-parallel all-reduce after MoE output.
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
@@ -101,13 +111,40 @@ impl FusedMoELayer {
             self.gate
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
-        let (topk_weights, topk_ids) = kernels::topk_softmax(
-            router_logits.as_gpu_tensor(),
-            self.top_k,
-            self.renormalize,
-            &mut device.caching,
-            stream,
-        );
+        let (topk_weights, topk_ids) = if let Some(bias) = &self.e_score_correction_bias {
+            if self.n_expert_group > 0 && self.topk_group > 0 {
+                // noaux_tc grouped routing (DeepSeek V3 / Kimi K2)
+                kernels::topk_noaux_tc(
+                    router_logits.as_gpu_tensor(),
+                    *bias,
+                    self.top_k,
+                    self.n_expert_group,
+                    self.topk_group,
+                    self.renormalize,
+                    self.routed_scaling_factor,
+                    &mut device.caching,
+                    stream,
+                )
+            } else {
+                // Flat sigmoid top-k with bias (no group selection)
+                kernels::topk_sigmoid_with_bias(
+                    router_logits.as_gpu_tensor(),
+                    *bias,
+                    self.top_k,
+                    self.renormalize,
+                    &mut device.caching,
+                    stream,
+                )
+            }
+        } else {
+            kernels::topk_softmax(
+                router_logits.as_gpu_tensor(),
+                self.top_k,
+                self.renormalize,
+                &mut device.caching,
+                stream,
+            )
+        };
         drop(router_logits);
 
         let (sorted_token_ids, expert_ids, num_tokens_post_padded) = kernels::moe_align_block_size(
@@ -325,6 +362,9 @@ impl DeepSeekV2MoELayer {
 
     /// Load from safetensors. `prefix` is the MLP prefix for this layer
     /// (e.g. `model.layers.3.mlp`).
+    ///
+    /// `use_sigmoid`: if true, loads `{prefix}.gate.e_score_correction_bias`
+    /// and uses sigmoid routing (DeepSeek V3 / Kimi K2 `topk_method="noaux_tc"`).
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         gw: &mut ferrite_cuda_core::weights::GpuWeights,
@@ -336,6 +376,9 @@ impl DeepSeekV2MoELayer {
         hidden_size: usize,
         norm_topk_prob: bool,
         routed_scaling_factor: f32,
+        use_sigmoid: bool,
+        n_expert_group: usize,
+        topk_group: usize,
         stream: ferrite_cuda_core::CUstream,
     ) -> anyhow::Result<Self> {
         use ferrite_cuda_core::driver;
@@ -374,6 +417,27 @@ impl DeepSeekV2MoELayer {
             unsafe { GpuTensor::new(w1_ptr, &[n_routed_experts, 2 * inter, hidden_size], dtype) };
         let w2 = unsafe { GpuTensor::new(w2_ptr, &[n_routed_experts, hidden_size, inter], dtype) };
 
+        // Load e_score_correction_bias for sigmoid routing (DeepSeek V3 / Kimi K2).
+        // Python vLLM always casts this to F32 before the routing kernel; we match.
+        let e_score_correction_bias = if use_sigmoid {
+            let bias_name = format!("{prefix}.gate.e_score_correction_bias");
+            let bias_raw = gw.take(&bias_name)?;
+            let bias_f32 = if bias_raw.dtype() == ferrite_cuda_core::dtype::DType::F32 {
+                bias_raw
+            } else {
+                // Cast BF16/F16 → F32 (happens when checkpoint is in BF16)
+                let n = bias_raw.numel();
+                let f32_ptr = unsafe { driver::mem_alloc(n * 4)? };
+                let f32_bias =
+                    unsafe { GpuTensor::new(f32_ptr, &[n], ferrite_cuda_core::dtype::DType::F32) };
+                unsafe { kernels::cast_bias_to_f32(bias_raw, f32_bias, stream) };
+                f32_bias
+            };
+            Some(bias_f32)
+        } else {
+            None
+        };
+
         let moe = FusedMoELayer {
             gate,
             w1,
@@ -383,6 +447,10 @@ impl DeepSeekV2MoELayer {
             intermediate_size: inter,
             hidden_size,
             renormalize: norm_topk_prob,
+            e_score_correction_bias,
+            n_expert_group,
+            topk_group,
+            routed_scaling_factor: routed_scaling_factor as f64,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };
@@ -1372,6 +1440,7 @@ mod tests {
             intermediate_size: 14336,
             hidden_size: 4096,
             renormalize: false,
+            e_score_correction_bias: None,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };

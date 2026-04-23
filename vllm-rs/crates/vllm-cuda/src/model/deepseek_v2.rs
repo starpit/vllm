@@ -72,6 +72,12 @@ pub struct DeepSeekV2Config {
     pub moe_intermediate_size: usize,
     pub norm_topk_prob: bool,
     pub routed_scaling_factor: f64,
+    /// Number of expert groups for grouped top-k (V3/Kimi K2). 0 = flat top-k.
+    pub n_expert_group: usize,
+    /// Number of groups to select in grouped top-k. 0 = disabled.
+    pub topk_group: usize,
+    /// Routing score function: "sigmoid" for V3 noaux_tc, "softmax" for V2.
+    pub scoring_func: String,
     // YaRN RoPE
     pub yarn_rope_scaling: Option<YarnRopeScaling>,
 }
@@ -1048,6 +1054,14 @@ impl DeepSeekV2DecoderLayer {
         let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * ipp, hidden], dtype) };
         let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden, ipp], dtype) };
 
+        let use_sigmoid = config.scoring_func == "sigmoid";
+        let e_score_correction_bias = if use_sigmoid {
+            let bias_name = format!("{prefix}.gate.e_score_correction_bias");
+            Some(weights.take(&bias_name)?)
+        } else {
+            None
+        };
+
         let moe = FusedMoELayer {
             gate,
             w1,
@@ -1057,6 +1071,10 @@ impl DeepSeekV2DecoderLayer {
             intermediate_size: ipp,
             hidden_size: hidden,
             renormalize: config.norm_topk_prob,
+            e_score_correction_bias,
+            n_expert_group: config.n_expert_group,
+            topk_group: config.topk_group,
+            routed_scaling_factor: config.routed_scaling_factor,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };

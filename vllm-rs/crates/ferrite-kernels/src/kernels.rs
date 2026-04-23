@@ -746,6 +746,89 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // MoE sigmoid top-k with e_score_correction_bias (DeepSeek V3 / Kimi K2)
+    // Same workspace convention as topk_softmax_*; bias may be null.
+    fn topk_sigmoid_f32(
+        topk_weights: *mut f32,
+        topk_ids: *mut i32,
+        workspace: *mut f32,
+        bias: *const f32,
+        gating_output: *const f32,
+        num_tokens: c_int,
+        num_experts: c_int,
+        topk: c_int,
+        renormalize: c_int,
+        stream: CUstream,
+    );
+    fn topk_sigmoid_bf16(
+        topk_weights: *mut f32,
+        topk_ids: *mut i32,
+        workspace: *mut f32,
+        bias: *const f32,
+        gating_output: *const c_void,
+        num_tokens: c_int,
+        num_experts: c_int,
+        topk: c_int,
+        renormalize: c_int,
+        stream: CUstream,
+    );
+    fn topk_sigmoid_f16(
+        topk_weights: *mut f32,
+        topk_ids: *mut i32,
+        workspace: *mut f32,
+        bias: *const f32,
+        gating_output: *const c_void,
+        num_tokens: c_int,
+        num_experts: c_int,
+        topk: c_int,
+        renormalize: c_int,
+        stream: CUstream,
+    );
+
+    // Grouped noaux_tc top-k (DeepSeek V3 / Kimi K2): sigmoid + group selection
+    fn topk_noaux_tc_f32_f32(
+        scores: *mut c_void,
+        topk_values: *mut f32,
+        topk_indices: *mut i32,
+        bias: *const c_void,
+        num_tokens: i64,
+        num_experts: i64,
+        n_group: i64,
+        topk_group: i64,
+        topk: i64,
+        renormalize: c_int,
+        routed_scaling_factor: f64,
+        stream: CUstream,
+    );
+    fn topk_noaux_tc_bf16_f32(
+        scores: *mut c_void,
+        topk_values: *mut f32,
+        topk_indices: *mut i32,
+        bias: *const c_void,
+        num_tokens: i64,
+        num_experts: i64,
+        n_group: i64,
+        topk_group: i64,
+        topk: i64,
+        renormalize: c_int,
+        routed_scaling_factor: f64,
+        stream: CUstream,
+    );
+    fn topk_noaux_tc_f16_f32(
+        scores: *mut c_void,
+        topk_values: *mut f32,
+        topk_indices: *mut i32,
+        bias: *const c_void,
+        num_tokens: i64,
+        num_experts: i64,
+        n_group: i64,
+        topk_group: i64,
+        topk: i64,
+        renormalize: c_int,
+        routed_scaling_factor: f64,
+        stream: CUstream,
+    );
+
     // MoE sum reduction
     fn moe_sum_f32(
         out: *mut f32,
@@ -5028,6 +5111,35 @@ pub unsafe fn cast_logits_to_f32(
     out
 }
 
+/// Cast a bias tensor in-place into a pre-allocated F32 GpuTensor.
+/// `src` may be F16, BF16, or F32; `dst` must be F32 with the same numel.
+/// Used by `DeepSeekV2MoELayer::load` to normalize the checkpoint dtype.
+pub unsafe fn cast_bias_to_f32(src: GpuTensor, dst: GpuTensor, stream: CUstream) {
+    let n = src.numel() as c_int;
+    match src.dtype() {
+        DType::F32 => ferrite_cuda_core::driver::memcpy_dtod_async(
+            dst.raw_ptr(),
+            src.as_ptr::<u8>(),
+            src.size_bytes(),
+            stream,
+        )
+        .expect("cast_bias_to_f32: D2D copy failed"),
+        DType::F16 => cast_to_f32_f16(
+            dst.as_ptr::<u8>() as *mut f32,
+            src.as_ptr::<u16>(),
+            n,
+            stream,
+        ),
+        DType::BF16 => cast_to_f32_bf16(
+            dst.as_ptr::<u8>() as *mut f32,
+            src.as_ptr::<u16>(),
+            n,
+            stream,
+        ),
+        _ => panic!("cast_bias_to_f32: unsupported dtype {:?}", src.dtype()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cast from f32 (for GGML matmul output → model dtype)
 // ---------------------------------------------------------------------------
@@ -5173,6 +5285,178 @@ pub unsafe fn topk_softmax(
         ),
     }
     drop(workspace);
+    (weights_out, ids_out)
+}
+
+/// Sigmoid top-k with e_score_correction_bias — DeepSeek V3 / Kimi K2 routing.
+///
+/// Selection: `argmax(sigmoid(logit[e]) + bias[e])` (biased)
+/// Output weight: `sigmoid(logit[e])` (unbiased), optionally renormalized.
+///
+/// * `gating_output`: `[num_tokens, num_experts]`
+/// * `bias`: `[num_experts]` F32 correction bias
+/// * `topk`, `renormalize`: same as `topk_softmax`
+///
+/// Returns `(topk_weights, topk_ids)`:
+/// * `topk_weights`: `[num_tokens, topk]` F32 — unbiased sigmoid scores
+/// * `topk_ids`: `[num_tokens, topk]` I32
+pub unsafe fn topk_sigmoid_with_bias(
+    gating_output: GpuTensor,
+    bias: GpuTensor,
+    topk: usize,
+    renormalize: bool,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> (OwnedTensor, OwnedTensor) {
+    let num_tokens = gating_output.dim(0);
+    let num_experts = gating_output.dim(1);
+
+    let weights_out = alloc.alloc_tensor(&[num_tokens, topk], DType::F32);
+    let ids_out = alloc.alloc_tensor(&[num_tokens, topk], DType::I32);
+    let workspace = alloc.alloc_tensor(&[num_tokens, num_experts], DType::F32);
+
+    let bias_ptr = bias.as_ptr() as *const f32;
+    match gating_output.dtype() {
+        DType::F32 => topk_sigmoid_f32(
+            weights_out.as_mut_ptr() as *mut f32,
+            ids_out.as_mut_ptr() as *mut i32,
+            workspace.as_mut_ptr() as *mut f32,
+            bias_ptr,
+            gating_output.as_ptr() as *const f32,
+            num_tokens as c_int,
+            num_experts as c_int,
+            topk as c_int,
+            renormalize as c_int,
+            stream,
+        ),
+        DType::BF16 => topk_sigmoid_bf16(
+            weights_out.as_mut_ptr() as *mut f32,
+            ids_out.as_mut_ptr() as *mut i32,
+            workspace.as_mut_ptr() as *mut f32,
+            bias_ptr,
+            gating_output.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            num_experts as c_int,
+            topk as c_int,
+            renormalize as c_int,
+            stream,
+        ),
+        DType::F16 => topk_sigmoid_f16(
+            weights_out.as_mut_ptr() as *mut f32,
+            ids_out.as_mut_ptr() as *mut i32,
+            workspace.as_mut_ptr() as *mut f32,
+            bias_ptr,
+            gating_output.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            num_experts as c_int,
+            topk as c_int,
+            renormalize as c_int,
+            stream,
+        ),
+        _ => panic!(
+            "topk_sigmoid_with_bias: unsupported dtype {:?}",
+            gating_output.dtype()
+        ),
+    }
+    drop(workspace);
+    (weights_out, ids_out)
+}
+
+// ---------------------------------------------------------------------------
+// Grouped noaux_tc top-k (DeepSeek V3 / Kimi K2)
+// ---------------------------------------------------------------------------
+
+/// Grouped sigmoid top-k with `noaux_tc` algorithm (DeepSeek V3 / Kimi K2).
+///
+/// Implements group-based expert selection:
+///   1. Apply sigmoid to gating logits.
+///   2. Per group: compute group score = sum of top-2 (sigmoid + bias) values.
+///   3. Select top `topk_group` groups.
+///   4. Within selected groups, select top `topk` experts by (sigmoid + bias).
+///   5. Output weights = unbiased sigmoid scores, optionally renormalized and
+///      scaled by `routed_scaling_factor`.
+///
+/// * `gating_output`: `[num_tokens, num_experts]` BF16/F16/F32
+/// * `bias`: `[num_experts]` F32 e_score_correction_bias
+/// * `n_expert_group`: number of expert groups (e.g. 8 for V3)
+/// * `topk_group`: number of groups to select (e.g. 4 for V3)
+///
+/// Returns `(topk_weights [num_tokens, topk] F32, topk_ids [num_tokens, topk] I32)`.
+pub unsafe fn topk_noaux_tc(
+    gating_output: GpuTensor,
+    bias: GpuTensor,
+    topk: usize,
+    n_expert_group: usize,
+    topk_group: usize,
+    renormalize: bool,
+    routed_scaling_factor: f64,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> (OwnedTensor, OwnedTensor) {
+    let num_tokens = gating_output.dim(0);
+    let num_experts = gating_output.dim(1);
+
+    let weights_out = alloc.alloc_tensor(&[num_tokens, topk], DType::F32);
+    let ids_out = alloc.alloc_tensor(&[num_tokens, topk], DType::I32);
+
+    // Bias must be F32 (trained parameter)
+    assert_eq!(bias.dtype(), DType::F32, "noaux_tc bias must be F32");
+
+    let scores_ptr = gating_output.as_ptr::<u8>() as *mut c_void;
+    let bias_ptr = bias.as_ptr::<u8>() as *const c_void;
+
+    let weights_ptr = weights_out.as_mut_ptr::<f32>();
+    let ids_ptr = ids_out.as_mut_ptr::<i32>();
+
+    match gating_output.dtype() {
+        DType::F32 => topk_noaux_tc_f32_f32(
+            scores_ptr,
+            weights_ptr,
+            ids_ptr,
+            bias_ptr,
+            num_tokens as i64,
+            num_experts as i64,
+            n_expert_group as i64,
+            topk_group as i64,
+            topk as i64,
+            renormalize as c_int,
+            routed_scaling_factor,
+            stream,
+        ),
+        DType::BF16 => topk_noaux_tc_bf16_f32(
+            scores_ptr,
+            weights_ptr,
+            ids_ptr,
+            bias_ptr,
+            num_tokens as i64,
+            num_experts as i64,
+            n_expert_group as i64,
+            topk_group as i64,
+            topk as i64,
+            renormalize as c_int,
+            routed_scaling_factor,
+            stream,
+        ),
+        DType::F16 => topk_noaux_tc_f16_f32(
+            scores_ptr,
+            weights_ptr,
+            ids_ptr,
+            bias_ptr,
+            num_tokens as i64,
+            num_experts as i64,
+            n_expert_group as i64,
+            topk_group as i64,
+            topk as i64,
+            renormalize as c_int,
+            routed_scaling_factor,
+            stream,
+        ),
+        _ => panic!(
+            "topk_noaux_tc: unsupported dtype {:?}",
+            gating_output.dtype()
+        ),
+    }
+
     (weights_out, ids_out)
 }
 

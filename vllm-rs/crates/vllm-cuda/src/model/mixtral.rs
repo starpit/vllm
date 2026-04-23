@@ -249,6 +249,10 @@ impl MixtralDecoderLayer {
             intermediate_size: ipp,
             hidden_size: hidden,
             renormalize: false, // Mixtral does NOT renormalize
+            e_score_correction_bias: None,
+            n_expert_group: 0,
+            topk_group: 0,
+            routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
         })

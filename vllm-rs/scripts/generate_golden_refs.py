@@ -97,6 +97,22 @@ MODELS = {
     # (64 routed experts + 2 shared, top-6). 15.7B total params,
     # ~31 GB bf16. Fits single A100/L40S. max_model_len=2048.
     "deepseek_v2_lite": "deepseek-ai/DeepSeek-V2-Lite",
+    # DeepSeek V3 — synthetic 4-layer tiny model (see scripts/make_tiny_deepseek_v3.py).
+    # Uses q_lora_rank Q path + sigmoid routing with e_score_correction_bias.
+    # Local path; run make_tiny_deepseek_v3.py first to generate weights.
+    "deepseek_v3_tiny": "/tmp/deepseek-v3-tiny",
+    # DeepSeek V3 — ByteDance-Seed/academic-ds-9B: real trained 9B MoE model using
+    # full V3 architecture (hidden=2048, heads=16, q_lora_rank=1024, 16 layers,
+    # 64 routed experts + 2 shared, topk=8, sigmoid/noaux_tc routing). Trained from
+    # scratch on 350B+ English tokens; produces coherent output → meaningful golden.
+    "deepseek_v3_academic_9b": "ByteDance-Seed/academic-ds-9B",
+    # DeepSeek V3 — bzantium/tiny-deepseek-v3: real trained 6-layer model with
+    # full V3 dims (hidden=7168, heads=128, q_lora_rank=1536, vocab=129280,
+    # n_routed_experts=8, num_experts_per_tok=8 so all experts always activated
+    # → deterministic routing). 10.7 GB bf16 across 3 safetensors shards.
+    # Meaningful golden: real weights produce coherent output, verifies both
+    # the ferrite fingerprint (q_a_proj path) and the V3 MoE forward pass.
+    "deepseek_v3_bzantium": "bzantium/tiny-deepseek-v3",
     # CommandR (CohereForCausalLM) — 1-layer trim of real v01 by
     # Citaman (mergekit). Full v01 dims (hidden=8192, head_dim=128,
     # vocab=256000), single decoder layer → ~5GB bf16, fits L4.

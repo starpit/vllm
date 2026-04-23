@@ -148,6 +148,12 @@ enum FieldLoad {
         hidden_size: usize,
         norm_topk_prob: bool,
         routed_scaling_factor: f32,
+        /// True when `scoring_func="sigmoid"` + `topk_method="noaux_tc"` (DeepSeek V3 / Kimi K2).
+        use_sigmoid: bool,
+        /// Number of expert groups for grouped top-k (V3/Kimi K2). 0 = flat top-k.
+        n_expert_group: usize,
+        /// Number of groups to select in the first-stage grouped top-k. 0 = disabled.
+        topk_group: usize,
     },
 }
 
@@ -521,6 +527,27 @@ fn plan_field_load(
                     .copied()
                     .unwrap_or(1.0) as f32
             });
+        // sigmoid routing when scoring_func="sigmoid" AND topk_method="noaux_tc"
+        // (DeepSeek V3 / Kimi K2). Matches Python vLLM's condition.
+        let use_sigmoid = v
+            .get("scoring_func")
+            .and_then(|x| x.as_str())
+            .map(|s| s == "sigmoid")
+            .unwrap_or(false)
+            && v.get("topk_method")
+                .and_then(|x| x.as_str())
+                .map(|s| s == "noaux_tc")
+                .unwrap_or(false);
+        let n_expert_group = v
+            .get("n_group")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(0);
+        let topk_group = v
+            .get("topk_group")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(0);
         return FieldLoad::DeepSeekV2Moe {
             prefix,
             n_routed_experts,
@@ -530,6 +557,9 @@ fn plan_field_load(
             hidden_size,
             norm_topk_prob,
             routed_scaling_factor,
+            use_sigmoid,
+            n_expert_group,
+            topk_group,
         };
     }
 
@@ -760,8 +790,12 @@ fn emit_fingerprint_check(
     // instead — without this, the fingerprint misses and ferrite
     // falls back to the hand-written path even when it has a
     // compiled variant for this arch.
+    // MLA archs (DeepSeek V3) have `q_a_proj` instead of `q_proj`
+    // on disk — use that as the fingerprint leaf for these archs.
     let fp_leaf: &str = if manifest.packed_splits.contains_key("self_attn.qkv_proj") {
         "self_attn.qkv_proj"
+    } else if manifest.entries.contains_key("self_attn.q_a_proj") {
+        "self_attn.q_a_proj"
     } else {
         "self_attn.q_proj"
     };
@@ -778,7 +812,8 @@ fn emit_fingerprint_check(
         model.quantization.as_ref().map(|qc| &qc.method),
         Some(crate::quantization::QuantMethod::Bnb4 { .. })
     );
-    let bnb4_marker_tensor = "model.layers.0.self_attn.q_proj.weight.absmax";
+    let bnb4_marker_tensor = format!("model.layers.0.{fp_leaf}.weight.absmax");
+    let bnb4_marker_tensor = bnb4_marker_tensor.as_str();
     // FP8 checkpoints ship `.weight` (FP8E4M3 bytes — same suffix
     // as dense bf16) alongside a sibling `.weight_scale`. Dense /
     // AWQ / native-GPTQ / BNB4 variants must reject when
@@ -797,7 +832,8 @@ fn emit_fingerprint_check(
                 ..
             })
     );
-    let fp8_marker_tensor = "model.layers.0.self_attn.q_proj.weight_scale";
+    let fp8_marker_tensor = format!("model.layers.0.{fp_leaf}.weight_scale");
+    let fp8_marker_tensor = fp8_marker_tensor.as_str();
 
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
     let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size as usize);
@@ -1468,6 +1504,9 @@ fn emit_weights_struct(
                     hidden_size,
                     norm_topk_prob,
                     routed_scaling_factor,
+                    use_sigmoid,
+                    n_expert_group,
+                    topk_group,
                 } => {
                     let n_routed_experts = *n_routed_experts;
                     let n_shared_experts = *n_shared_experts;
@@ -1476,6 +1515,9 @@ fn emit_weights_struct(
                     let hidden_size = *hidden_size;
                     let norm_topk_prob = *norm_topk_prob;
                     let routed_scaling_factor = *routed_scaling_factor;
+                    let use_sigmoid = *use_sigmoid;
+                    let n_expert_group = *n_expert_group;
+                    let topk_group = *topk_group;
                     quote! {
                         let #name = ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer::load(
                             gw,
@@ -1487,6 +1529,9 @@ fn emit_weights_struct(
                             #hidden_size,
                             #norm_topk_prob,
                             #routed_scaling_factor,
+                            #use_sigmoid,
+                            #n_expert_group,
+                            #topk_group,
                             stream,
                         )?;
                     }

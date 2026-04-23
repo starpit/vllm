@@ -91,6 +91,11 @@ const ITERS: u32 = 5;
 /// — guaranteeing cuBLAS wins on small arches regardless of kernel
 /// reality. Every Gemm tile the test goldens exercise needs a row
 /// here.
+///
+/// The GQA blocks at the end cover Granite 3.x, Gemma3, Qwen3, and
+/// Command-R — their K-proj and V-proj outputs sit at N = num_kv_heads
+/// × head_dim, which for 1–16 kv heads produces small N columns
+/// {256, 512, 768, 1024} that the original grid never probed.
 const NK_SHAPES: &[(u32, u32)] = &[
     // ── Tiny models (hidden < 1k) ──
     // SmolLM-135M: hidden=576, intermediate=1536, qkv_size=(576+2*192)=960.
@@ -118,6 +123,7 @@ const NK_SHAPES: &[(u32, u32)] = &[
     (3072, 1024),
     (1024, 3072),
     (6144, 1024),
+    (2048, 1024), // qwen3-0.6b q_proj: num_q=16, head_dim=128
     // Granite 3.1-2B / gemma2-2b-ish: hidden=2048 already below.
     // ── Medium-small (1B–3B, hidden=2048–3072) ──
     (2048, 2048),
@@ -142,6 +148,71 @@ const NK_SHAPES: &[(u32, u32)] = &[
     (10240, 8192),
     (28672, 8192),
     (8192, 28672),
+    // ── Gemma3 (head_dim=256 for 1b/4b/12b, 128 for 27b) ──
+    // gemma3-1b: hidden=1152, q=4×256=1024, kv=1×256=256, inter=6912.
+    (1152, 1024), // o_proj
+    (6912, 1152), // gate|up
+    (1152, 6912), // down
+    // gemma3-4b: hidden=2560, q=8×256=2048, kv=4×256=1024, inter=10240.
+    (2048, 2560),  // q_proj
+    (2560, 2048),  // o_proj
+    (10240, 2560), // gate|up
+    (2560, 10240), // down
+    // gemma3-12b: hidden=3840, q=16×256=4096, kv=8×256=2048, inter=15360.
+    (4096, 3840),  // q_proj
+    (2048, 3840),  // k_proj / v_proj
+    (3840, 4096),  // o_proj
+    (15360, 3840), // gate|up
+    (3840, 15360), // down
+    // gemma3-27b: hidden=5376, q=32×128=4096, kv=16×128=2048, inter=21504.
+    (4096, 5376),  // q_proj
+    (2048, 5376),  // k_proj / v_proj
+    (5376, 4096),  // o_proj
+    (21504, 5376), // gate|up
+    (5376, 21504), // down
+    // ── Granite 3.1-8B (hidden=4096, q=32×128, kv=8×128=1024, inter=12800) ──
+    (12800, 4096), // gate|up
+    (4096, 12800), // down
+    // Granite 3.1/3.3-2B (hidden=2048, kv=8×64=512, inter=8192) —
+    // QKV/O/MLP shapes already covered by the medium-small block.
+    // ── Qwen3 (GQA, 8 kv heads, head_dim=128) ──
+    // qwen3-1.7b: hidden=2048, q=2048, kv=1024, inter=6144.
+    (6144, 2048), // gate|up
+    (2048, 6144), // down
+    // qwen3-4b: hidden=2560, q=4096, kv=1024, inter=9728.
+    (4096, 2560), // q_proj
+    (2560, 4096), // o_proj
+    (9728, 2560), // gate|up
+    (2560, 9728), // down
+    // qwen3-8b: hidden=4096, q=4096, kv=1024, inter=12288.
+    (12288, 4096), // gate|up
+    (4096, 12288), // down
+    // ── Command-R 35B (hidden=8192, MHA non-GQA, inter=22528) ──
+    (24576, 8192), // fused QKV (q+k+v each 8192)
+    (22528, 8192), // gate|up
+    (8192, 22528), // down
+    // ── GQA K/V-proj small-N block (N = num_kv_heads × head_dim) ──
+    //
+    // The four N columns {256, 512, 768, 1024} cover num_kv_heads ∈ 1..16
+    // across head_dim ∈ {64, 128, 256}. K rows span target-arch hidden
+    // sizes {1152, 2048, 2560, 4096}. N=768 is probed for future
+    // num_kv_heads ∈ {3, 6} arches; no current target uses it.
+    (256, 1152), // gemma3-1b k/v: num_kv=1, head_dim=256
+    (256, 2048),
+    (256, 2560),
+    (256, 4096),
+    (512, 1152),
+    (512, 2048), // granite-3.1/3.3-2b k/v: num_kv=8, head_dim=64
+    (512, 2560),
+    (512, 4096),
+    (768, 1152),
+    (768, 2048),
+    (768, 2560),
+    (768, 4096),
+    (1024, 1152),
+    (1024, 2048), // qwen3-1.7b k/v: num_kv=8, head_dim=128
+    (1024, 2560), // qwen3-4b / gemma3-4b k/v
+    (1024, 4096), // granite-3.1-8b / qwen3-8b k/v
 ];
 
 /// `num_tokens` grid — matches the solver's default workload sweep.

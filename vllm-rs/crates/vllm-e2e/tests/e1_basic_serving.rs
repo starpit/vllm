@@ -1282,6 +1282,10 @@ async fn test_cuda_gguf_llama_iq1m_chat() {
         resp.usage.completion_tokens.unwrap_or(0) > 0,
         "IQ1_M model should generate at least one token"
     );
+
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[IQ1_M output] {:?}", text);
+    assert_coherent_text(text, 5);
 }
 
 // end GGUF tests

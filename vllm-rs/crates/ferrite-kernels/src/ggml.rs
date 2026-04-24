@@ -11,8 +11,22 @@
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
 use ferrite_cuda_core::dtype::DType;
 use ferrite_cuda_core::tensor::GpuTensor;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type CUstream = cudarc::driver::sys::CUstream;
+
+// One flag per IQ type — set on first dispatch, so the log line prints exactly once.
+static IQ1M_SEEN:   AtomicBool = AtomicBool::new(false);
+static IQ1S_SEEN:   AtomicBool = AtomicBool::new(false);
+static IQ2XXS_SEEN: AtomicBool = AtomicBool::new(false);
+static IQ2S_SEEN:   AtomicBool = AtomicBool::new(false);
+static IQ3S_SEEN:   AtomicBool = AtomicBool::new(false);
+
+fn note_iq(flag: &AtomicBool, name: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        eprintln!("[ggml dispatch] first matmul via {name}");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // GgmlDType
@@ -38,9 +52,13 @@ pub enum GgmlDType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
-    IQ4NL = 20,
-    IQ4XS = 23,
-    IQ1M  = 29,
+    IQ2XXS = 16,
+    IQ1S   = 19,
+    IQ4NL  = 20,
+    IQ3S   = 21,
+    IQ2S   = 22,
+    IQ4XS  = 23,
+    IQ1M   = 29,
 }
 
 impl GgmlDType {
@@ -59,7 +77,11 @@ impl GgmlDType {
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
+            16 => Some(Self::IQ2XXS),
+            19 => Some(Self::IQ1S),
             20 => Some(Self::IQ4NL),
+            21 => Some(Self::IQ3S),
+            22 => Some(Self::IQ2S),
             23 => Some(Self::IQ4XS),
             29 => Some(Self::IQ1M),
             _ => None,
@@ -88,9 +110,13 @@ impl GgmlDType {
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q8K => 292,
-            Self::IQ4NL => 18,
-            Self::IQ4XS => 136,
-            Self::IQ1M  => 56,
+            Self::IQ2XXS => 66,
+            Self::IQ1S   => 50,
+            Self::IQ4NL  => 18,
+            Self::IQ3S   => 110,
+            Self::IQ2S   => 82,
+            Self::IQ4XS  => 136,
+            Self::IQ1M   => 56,
         }
     }
 
@@ -104,9 +130,18 @@ impl GgmlDType {
             | Self::Q8_0
             | Self::Q8_1
             | Self::IQ4NL => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::IQ4XS | Self::IQ1M => {
-                256
-            }
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::IQ2XXS
+            | Self::IQ1S
+            | Self::IQ3S
+            | Self::IQ2S
+            | Self::IQ4XS
+            | Self::IQ1M => 256,
         }
     }
 
@@ -123,7 +158,10 @@ impl GgmlDType {
     /// IQ types lack the fused dequant+dot BS=1 kernel — they must always go
     /// through the Q8_1 intermediate quantization path.
     pub const fn is_iq_quant(self) -> bool {
-        matches!(self, Self::IQ4NL | Self::IQ4XS | Self::IQ1M)
+        matches!(
+            self,
+            Self::IQ4NL | Self::IQ4XS | Self::IQ1M | Self::IQ2XXS | Self::IQ1S | Self::IQ3S | Self::IQ2S
+        )
     }
 }
 
@@ -142,9 +180,13 @@ impl std::fmt::Display for GgmlDType {
             Self::Q5K => write!(f, "Q5K"),
             Self::Q6K => write!(f, "Q6K"),
             Self::Q8K => write!(f, "Q8K"),
-            Self::IQ4NL => write!(f, "IQ4_NL"),
-            Self::IQ4XS => write!(f, "IQ4_XS"),
-            Self::IQ1M  => write!(f, "IQ1_M"),
+            Self::IQ2XXS => write!(f, "IQ2_XXS"),
+            Self::IQ1S   => write!(f, "IQ1_S"),
+            Self::IQ4NL  => write!(f, "IQ4_NL"),
+            Self::IQ3S   => write!(f, "IQ3_S"),
+            Self::IQ2S   => write!(f, "IQ2_S"),
+            Self::IQ4XS  => write!(f, "IQ4_XS"),
+            Self::IQ1M   => write!(f, "IQ1_M"),
         }
     }
 }
@@ -617,6 +659,102 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // --- IQ1_S mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq1_s_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq1_s_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq1_s_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ2_XXS mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq2_xxs_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_xxs_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_xxs_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ2_S mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq2_s_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_s_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_s_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ3_S mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq3_s_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq3_s_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq3_s_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
     // --- indexed_moe_forward wrappers ---
     fn launch_indexed_moe_forward_q2k_q8_1(
         all_weights: *const u8,
@@ -817,9 +955,13 @@ pub unsafe fn ggml_dequantize_f32(
         GgmlDType::Q5K => launch_dequantize_block_q5_K_f32(src, dst, n, stream),
         GgmlDType::Q6K => launch_dequantize_block_q6_K_f32(src, dst, n, stream),
         GgmlDType::Q8K => launch_dequantize_block_q8_K_f32(src, dst, n, stream),
-        GgmlDType::IQ4NL => launch_dequantize_block_iq4_nl_f32(src, dst, n, stream),
-        GgmlDType::IQ4XS => launch_dequantize_block_iq4_xs_f32(src, dst, n, stream),
-        GgmlDType::IQ1M  => launch_dequantize_block_iq1_m_f32(src, dst, n, stream),
+        GgmlDType::IQ4NL  => launch_dequantize_block_iq4_nl_f32(src, dst, n, stream),
+        GgmlDType::IQ4XS  => launch_dequantize_block_iq4_xs_f32(src, dst, n, stream),
+        GgmlDType::IQ1M   => launch_dequantize_block_iq1_m_f32(src, dst, n, stream),
+        GgmlDType::IQ1S   => launch_dequantize_block_iq1_s_f32(src, dst, n, stream),
+        GgmlDType::IQ2XXS => launch_dequantize_block_iq2_xxs_f32(src, dst, n, stream),
+        GgmlDType::IQ2S   => launch_dequantize_block_iq2_s_f32(src, dst, n, stream),
+        GgmlDType::IQ3S   => launch_dequantize_block_iq3_s_f32(src, dst, n, stream),
         _ => panic!("unsupported dtype for dequantize_f32: {}", dtype),
     }
 }
@@ -848,9 +990,13 @@ pub unsafe fn ggml_dequantize_f16(
         GgmlDType::Q5K => launch_dequantize_block_q5_K_f16(src, dst, n, stream),
         GgmlDType::Q6K => launch_dequantize_block_q6_K_f16(src, dst, n, stream),
         GgmlDType::Q8K => launch_dequantize_block_q8_K_f16(src, dst, n, stream),
-        GgmlDType::IQ4NL => launch_dequantize_block_iq4_nl_f16(src, dst, n, stream),
-        GgmlDType::IQ4XS => launch_dequantize_block_iq4_xs_f16(src, dst, n, stream),
-        GgmlDType::IQ1M  => launch_dequantize_block_iq1_m_f16(src, dst, n, stream),
+        GgmlDType::IQ4NL  => launch_dequantize_block_iq4_nl_f16(src, dst, n, stream),
+        GgmlDType::IQ4XS  => launch_dequantize_block_iq4_xs_f16(src, dst, n, stream),
+        GgmlDType::IQ1M   => launch_dequantize_block_iq1_m_f16(src, dst, n, stream),
+        GgmlDType::IQ1S   => launch_dequantize_block_iq1_s_f16(src, dst, n, stream),
+        GgmlDType::IQ2XXS => launch_dequantize_block_iq2_xxs_f16(src, dst, n, stream),
+        GgmlDType::IQ2S   => launch_dequantize_block_iq2_s_f16(src, dst, n, stream),
+        GgmlDType::IQ3S   => launch_dequantize_block_iq3_s_f16(src, dst, n, stream),
         _ => panic!("unsupported dtype for dequantize_f16: {}", dtype),
     }
 }
@@ -1010,15 +1156,27 @@ pub unsafe fn ggml_mul_mat_vec_q8_1(
             GgmlDType::Q6K => launch_mul_mat_vec_q6_K_q8_1(
                 vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
             ),
-            GgmlDType::IQ4NL => launch_mul_mat_vec_iq4_nl_q8_1(
+            GgmlDType::IQ4NL  => launch_mul_mat_vec_iq4_nl_q8_1(
                 vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
             ),
-            GgmlDType::IQ4XS => launch_mul_mat_vec_iq4_xs_q8_1(
+            GgmlDType::IQ4XS  => launch_mul_mat_vec_iq4_xs_q8_1(
                 vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
             ),
-            GgmlDType::IQ1M => launch_mul_mat_vec_iq1_m_q8_1(
+            GgmlDType::IQ1M   => { note_iq(&IQ1M_SEEN, "IQ1_M"); launch_mul_mat_vec_iq1_m_q8_1(
                 vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
-            ),
+            )},
+            GgmlDType::IQ1S   => { note_iq(&IQ1S_SEEN, "IQ1_S"); launch_mul_mat_vec_iq1_s_q8_1(
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+            )},
+            GgmlDType::IQ2XXS => { note_iq(&IQ2XXS_SEEN, "IQ2_XXS"); launch_mul_mat_vec_iq2_xxs_q8_1(
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+            )},
+            GgmlDType::IQ2S   => { note_iq(&IQ2S_SEEN, "IQ2_S"); launch_mul_mat_vec_iq2_s_q8_1(
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+            )},
+            GgmlDType::IQ3S   => { note_iq(&IQ3S_SEEN, "IQ3_S"); launch_mul_mat_vec_iq3_s_q8_1(
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+            )},
             _ => panic!("unsupported dtype for mul_mat_vec_q8_1: {}", storage.dtype),
         }
     }

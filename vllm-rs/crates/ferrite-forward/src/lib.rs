@@ -8,6 +8,13 @@
 pub use ferrite_forward_macro::forward;
 
 pub mod cpu_golden;
+pub mod instruction;
+#[cfg(feature = "cuda")]
+pub mod tile_table;
+
+pub use instruction::{INTS_PER_INSTRUCTION, Instruction, Layout, opcode};
+#[cfg(feature = "cuda")]
+pub use tile_table::{TileEntry, tile_ref};
 
 /// Deterministic hash of a `serde_json::Value` for `HfFingerprint`
 /// content discrimination. Canonicalizes object key order and

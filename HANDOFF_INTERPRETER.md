@@ -145,6 +145,19 @@ This is a single refactor, not a migration loop:
    --release --test e_correctness -- --ignored
    --test-threads=1`, llama subset). Match must be exact.
 
+## Transitional flag — to delete on completion
+
+A boolean `interpreter` arg on `#[forward(...)]` (default false)
+selects the new instruction-list emission path. Arches migrate
+one at a time by setting `interpreter = true`; old path stays
+the default until every arch flips. **Final commit of this
+refactor removes the flag and the old emit_call path.** This is
+the "minor architectural decision easy to fix later" the user
+authorized in the kickoff message.
+
+While the flag exists, `emit_call` and `fan_out` coexist on the
+trait. After flag removal, `emit_call` is deleted.
+
 ## Decisions locked in this session (2026-04-25)
 
 - **Granularity**: One instruction list per (variant × workload-point).

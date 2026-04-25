@@ -608,6 +608,7 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         _fuf: &Fuf,
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
+        _slots: &SlotMap,
     ) -> Option<Vec<InstrEmit>> {
         None
     }
@@ -629,6 +630,64 @@ pub trait Implementation: fmt::Debug + Send + Sync {
             "Implementation `{name}` returned Some from fan_out but has no interpreter_arm body"
         );
         quote! { compile_error!(#msg); }
+    }
+}
+
+/// Compile-time mapping from `(TileId, output_slot)` → flat slot
+/// index in the runtime tile table. Built once per (variant ×
+/// workload-point) FUF by codegen and consumed by `fan_out` so it
+/// can render `i32` slot ids into `Instruction` fields.
+///
+/// Indices are dense in `0..total()`. The runtime tile table is
+/// allocated as `Vec<Option<TileEntry>>` of size `total()` and
+/// indexed directly by these values.
+///
+/// Lives in the macro crate (not in `ferrite-forward`) because
+/// it's a *compile-time* artifact: by the time a forward fn runs,
+/// every i32 in the const `Instruction` array is already a flat
+/// slot index. The runtime never sees a `(TileId, slot)` pair.
+#[derive(Clone, Debug, Default)]
+pub struct SlotMap {
+    map: BTreeMap<(TileId, u8), u32>,
+    total: u32,
+}
+
+impl SlotMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert `(tile, output_slot)` and assign the next dense
+    /// index. Idempotent on repeats — same `(tile, output_slot)`
+    /// keeps its first-assigned index.
+    pub fn insert(&mut self, tile: TileId, output_slot: u8) -> u32 {
+        let key = (tile, output_slot);
+        if let Some(&existing) = self.map.get(&key) {
+            return existing;
+        }
+        let idx = self.total;
+        self.map.insert(key, idx);
+        self.total += 1;
+        idx
+    }
+
+    /// Resolve `(tile, output_slot)` → flat slot index. Panics
+    /// when the pair was never inserted — codegen invariant.
+    #[inline]
+    pub fn of(&self, tile: TileId, output_slot: u8) -> u32 {
+        match self.map.get(&(tile, output_slot)) {
+            Some(&v) => v,
+            None => panic!(
+                "SlotMap::of: tile {tile:?} slot {output_slot} not registered \
+                 — codegen forgot to insert this tile output before fan_out"
+            ),
+        }
+    }
+
+    /// Total number of slots allocated. Size of the runtime tile table.
+    #[inline]
+    pub fn total(&self) -> u32 {
+        self.total
     }
 }
 
@@ -10691,6 +10750,25 @@ mod tests {
         assert!(ts.contains("42i32"), "field 0 literal: {ts}");
         assert!(ts.contains("- 3i32"), "field 1 literal: {ts}");
         assert!(ts.contains("99i32"), "field 30 literal: {ts}");
+    }
+
+    #[test]
+    fn slot_map_assigns_dense_indices_in_insert_order() {
+        let mut sm = SlotMap::new();
+        assert_eq!(sm.insert(TileId(7), 0), 0);
+        assert_eq!(sm.insert(TileId(7), 1), 1);
+        assert_eq!(sm.insert(TileId(3), 0), 2);
+        // Repeat returns the original index.
+        assert_eq!(sm.insert(TileId(7), 0), 0);
+        assert_eq!(sm.total(), 3);
+        assert_eq!(sm.of(TileId(3), 0), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "not registered")]
+    fn slot_map_of_unregistered_panics() {
+        let sm = SlotMap::new();
+        let _ = sm.of(TileId(1), 0);
     }
 
     #[test]

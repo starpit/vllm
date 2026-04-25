@@ -246,6 +246,94 @@ pub mod opcode {
     /// 0xFF range reserved for runtime-only opcodes that have no
     /// corresponding compute. Compute opcodes stay in 0..127.
     pub const FREE: u16 = 0xFF;
+
+    // ── Ferrite extensions (no KVM tp_throughput counterpart) ────────
+    //
+    // These opcodes name kernels ferrite has but tp_throughput does
+    // not — typically because ferrite-kernels fuses what KVM splits.
+    // When the on-GPU megakernel backend lands and needs the KVM
+    // split, these are reconciled (some lower to a pair of KVM
+    // opcodes; others stay as "ferrite-native" with a dedicated
+    // megakernel arm). Numbering picks up after `LM_HEAD = 11` and
+    // before `INC_BARRIER = 12` in the KVM space — extensions live
+    // at `0x40..` so they can't collide with any KVM addition.
+
+    /// `embedding_gather(weight, input_ids, …) -> hidden_states`.
+    /// Always one instruction (covers the full token batch in one
+    /// kernel). Fields: `[out_slot]` — input is `ctx.input_ids`,
+    /// the embed weight is read off `wm.embed_tokens` at runtime.
+    pub const EMBED: u16 = 0x40;
+
+    /// Pointer-only reshape (logical view change, no copy). Today
+    /// only used to reshape attention output back to a 2-D flat
+    /// (m × hidden) before o_proj. Fields: `[out_slot, in_slot]`
+    /// — the interpreter rebinds `tiles[out_slot] = tiles[in_slot]`
+    /// (View aliasing).
+    pub const RESHAPE: u16 = 0x41;
+
+    /// Standalone elementwise add. In llama every Add is fused into
+    /// `FUSED_ADD_RMSNORM`; this opcode covers the residual tails
+    /// (e.g. the deepseek MoE residual). Fields:
+    /// `[out_slot, a_slot, b_slot]`.
+    pub const ADD: u16 = 0x42;
+
+    /// `fused_add_rms_norm_inplace(x, residual, weight, eps, …)`.
+    /// Adds the residual into x in-place, then writes rms_norm(x)
+    /// to a fresh tile. Replaces what tp_throughput splits across
+    /// `O_PROJ_RESIDUAL` (or `DOWN_PROJ_RESIDUAL`) and `ATTN_NORM`
+    /// (or `MLP_NORM`). Fields:
+    /// `[layer_idx, out_slot, x_slot, residual_slot, weight_handle_kind]`
+    /// — `weight_handle_kind` is per-arch (input layernorm vs
+    /// post-attention layernorm) encoded as 0/1.
+    pub const FUSED_ADD_RMSNORM: u16 = 0x43;
+
+    /// `fused_qkv_rope_cache(x, qkv_packed, …) -> (q,)` plus K/V
+    /// appended to paged cache. One instruction per layer (covers
+    /// the whole token batch in one launch). Fields:
+    /// `[layer_idx, out_q_slot, in_x_slot]`.
+    pub const FUSED_QKV_ROPE_APPEND: u16 = 0x44;
+
+    /// `flash_attn_paged(q, k_cache, v_cache, block_table, …)` for
+    /// the decode path (M ≤ 1). Fields: `[layer_idx, out_slot, q_slot]`.
+    pub const ATTENTION_PAGED_DECODE: u16 = 0x45;
+
+    /// `fused_qkv_rope_prefill_inplace(...)`. Same shape as
+    /// `FUSED_QKV_ROPE_APPEND` but for the prefill path — writes
+    /// rope'd Q/K to contiguous activations and skips the paged
+    /// cache append (prefill writes K/V via a separate copy).
+    /// Fields: `[layer_idx, out_q_slot, out_k_slot, out_v_slot, in_x_slot]`.
+    pub const FUSED_QKV_ROPE_PREFILL: u16 = 0x46;
+
+    /// `flash_attn_varlen(q, k, v, …)` — contiguous-prefill flash
+    /// attention. Fields: `[layer_idx, out_slot, q_slot, k_slot, v_slot]`.
+    pub const ATTENTION_PREFILL_CONTIGUOUS: u16 = 0x47;
+
+    /// `cublas.gemm` then `add_inplace(residual)`. Fused o_proj /
+    /// down_proj. Fields:
+    /// `[layer_idx, out_slot, x_slot, residual_slot, weight_handle_kind]`.
+    /// `weight_handle_kind` selects o_proj vs down_proj on the
+    /// per-arch `Weights`.
+    pub const FUSED_GEMM_ADD_RESIDUAL: u16 = 0x48;
+
+    /// `fused_gate_up_silu_mul(x, gate_weight, up_weight, …)` —
+    /// gate gemm + silu + up gemm + mul, all in one kernel. Fields:
+    /// `[layer_idx, out_slot, in_x_slot]`.
+    pub const FUSED_GATE_UP_SILU_MUL: u16 = 0x49;
+
+    /// `cublas.gemm(x, weight)` — plain matmul. Used for the
+    /// terminal `lm_head` gemm and any other non-fused gemm a
+    /// solver picks. Fields:
+    /// `[out_slot, in_x_slot, weight_handle_kind]`. No `layer_idx`
+    /// — non-layered weights only.
+    pub const GEMM: u16 = 0x4A;
+
+    /// `rms_norm(x, weight, eps, …)`. Used only for layer 0's
+    /// pre-attention norm and the final pre-lm_head norm — every
+    /// other rms_norm fuses into `FUSED_ADD_RMSNORM`. Fields:
+    /// `[layer_idx, out_slot, in_x_slot, weight_handle_kind]`.
+    /// Layer 0 norm carries `layer_idx = 0`; the final norm uses
+    /// `weight_handle_kind` to select the unlayered `norm` weight.
+    pub const RMS_NORM: u16 = 0x4B;
 }
 
 #[cfg(test)]
@@ -289,12 +377,13 @@ mod tests {
         assert!(n.0.iter().all(|&w| w == 0));
     }
 
-    /// All llama opcode constants are distinct. Trivial check, but
+    /// All opcode constants are distinct. Trivial check, but
     /// guards against copy-paste collisions when new ones are
-    /// added.
+    /// added — including the ferrite-extension range at 0x40+.
     #[test]
     fn opcodes_are_distinct() {
         let codes = [
+            // KVM tp_throughput vocabulary.
             opcode::NOOP,
             opcode::ATTN_NORM,
             opcode::QKV_ROPE_APPEND,
@@ -311,10 +400,51 @@ mod tests {
             opcode::DIE,
             opcode::ALL_DEVICE_BARRIER,
             opcode::FREE,
+            // Ferrite extensions (0x40+).
+            opcode::EMBED,
+            opcode::RESHAPE,
+            opcode::ADD,
+            opcode::FUSED_ADD_RMSNORM,
+            opcode::FUSED_QKV_ROPE_APPEND,
+            opcode::ATTENTION_PAGED_DECODE,
+            opcode::FUSED_QKV_ROPE_PREFILL,
+            opcode::ATTENTION_PREFILL_CONTIGUOUS,
+            opcode::FUSED_GEMM_ADD_RESIDUAL,
+            opcode::FUSED_GATE_UP_SILU_MUL,
+            opcode::GEMM,
+            opcode::RMS_NORM,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in codes {
             assert!(seen.insert(c), "duplicate opcode {c}");
+        }
+    }
+
+    /// Ferrite extensions live at 0x40+ — outside KVM's 0..15
+    /// compute range and below FREE's 0xFF runtime range. Locks
+    /// the convention so a new KVM opcode addition can't collide
+    /// silently.
+    #[test]
+    fn extension_opcodes_in_dedicated_range() {
+        let exts = [
+            opcode::EMBED,
+            opcode::RESHAPE,
+            opcode::ADD,
+            opcode::FUSED_ADD_RMSNORM,
+            opcode::FUSED_QKV_ROPE_APPEND,
+            opcode::ATTENTION_PAGED_DECODE,
+            opcode::FUSED_QKV_ROPE_PREFILL,
+            opcode::ATTENTION_PREFILL_CONTIGUOUS,
+            opcode::FUSED_GEMM_ADD_RESIDUAL,
+            opcode::FUSED_GATE_UP_SILU_MUL,
+            opcode::GEMM,
+            opcode::RMS_NORM,
+        ];
+        for c in exts {
+            assert!(
+                (0x40..0xFF).contains(&c),
+                "extension opcode {c:#x} out of range"
+            );
         }
     }
 

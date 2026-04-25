@@ -2022,6 +2022,63 @@ fn emit_weights_struct(
     // and ignores the layer arg.
     let accessor_methods = emit_weights_accessor_methods(&accessors);
 
+    // Rotary cos_sin accessors for the host-interpreter path. Both
+    // `wm.rotary` and `wm.rotary_local` are conditionally-emitted
+    // fields — the interpreter arm body is a single token stream
+    // shared across every claim of an Impl on this arch, so it
+    // can't directly write `wm.rotary_local.cos_sin_cache` (Llama
+    // would fail to type-check). Per-claim selection rides on a
+    // `cos_sin_fn: for<'a> fn(&'a Weights, u32) -> ferrite_cuda_core::tensor::GpuTensor`
+    // OpInstance field; `fan_out` resolves it to one of these
+    // accessor names. Llama's interpreter never sees `Weights::rotary_local_cos_sin`
+    // because `RotaryLocal` extern doesn't appear in its FUF.
+    let rotary_cos_sin_methods: TokenStream = match &mode {
+        WeightsEmitMode::Canonical => {
+            let main = if uses_rotary {
+                quote! {
+                    #[cfg(feature = "cuda")]
+                    #[inline]
+                    #[allow(dead_code)]
+                    pub fn rotary_cos_sin(&self, _layer: u32)
+                        -> ::ferrite_cuda_core::tensor::GpuTensor
+                    {
+                        self.rotary.cos_sin_cache
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            let local = if uses_rotary_local {
+                quote! {
+                    #[cfg(feature = "cuda")]
+                    #[inline]
+                    #[allow(dead_code)]
+                    pub fn rotary_local_cos_sin(&self, _layer: u32)
+                        -> ::ferrite_cuda_core::tensor::GpuTensor
+                    {
+                        self.rotary_local.cos_sin_cache
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            if uses_rotary || uses_rotary_local {
+                quote! {
+                    #[cfg(feature = "cuda")]
+                    impl Weights {
+                        #main
+                        #local
+                    }
+                }
+            } else {
+                quote! {}
+            }
+        }
+        // Shims share the canonical's Weights via type alias, so
+        // they inherit these methods automatically.
+        WeightsEmitMode::Shim { .. } => quote! {},
+    };
+
     // Struct definition vs type alias per emit mode.
     let weights_def: TokenStream = match &mode {
         WeightsEmitMode::Canonical => quote! {
@@ -2069,6 +2126,8 @@ fn emit_weights_struct(
             #weights_def
 
             #accessor_methods
+
+            #rotary_cos_sin_methods
 
             #fingerprint_method
 
@@ -2153,7 +2212,7 @@ fn emit_weights_struct(
 /// will silently group them as non-layered. (Mixed bases —
 /// e.g. one `input_layernorm` and one `input_layernorm_0` under
 /// the same name root — panic at codegen time.)
-fn split_base_layer(field_name: &str) -> (String, Option<u64>) {
+pub(crate) fn split_base_layer(field_name: &str) -> (String, Option<u64>) {
     if let Some((base, suffix)) = field_name.rsplit_once('_')
         && !suffix.is_empty()
         && suffix.chars().all(|c| c.is_ascii_digit())

@@ -69,6 +69,14 @@ pub enum TileEntry {
     /// drop-pass guarantees `ref_slot` is still live (i.e.
     /// `Some(_)`) for as long as this entry is.
     View { ref_slot: u32 },
+
+    /// Metadata-only reshape result — equivalent to today's
+    /// `let tile_X = (input).reshape(&[..])` binding. `tensor`
+    /// holds the new shape/ndim with the upstream's ptr; `ref_slot`
+    /// pins the slot whose `OwnedTensor` actually owns the storage,
+    /// so the drop-pass keeps the underlying memory alive across
+    /// every consumer of the reshape. No GPU memory is copied.
+    Reshaped { ref_slot: u32, tensor: GpuTensor },
 }
 
 impl TileEntry {
@@ -97,12 +105,19 @@ impl TileEntry {
                 // termination guarantee shifts.
                 match owner {
                     Self::Owned(t) => t.as_gpu_tensor(),
+                    Self::Reshaped { tensor, .. } => *tensor,
                     Self::View { .. } => panic!(
                         "view chain not supported: alias-resolution should always point at the \
                          owning slot directly"
                     ),
                 }
             }
+            // Reshape carries its own `GpuTensor` metadata (new
+            // shape/ndim, same ptr as `ref_slot`'s owner). The
+            // ref_slot lives only to keep the storage owner from
+            // being freed; reads return the reshaped metadata
+            // directly.
+            Self::Reshaped { tensor, .. } => *tensor,
         }
     }
 
@@ -150,15 +165,15 @@ pub fn tile_ref(tiles: &[Option<TileEntry>], idx: u32) -> &TileEntry {
 pub fn take_owned(tiles: &mut [Option<TileEntry>], idx: u32) -> OwnedTensor {
     match tiles[idx as usize].take() {
         Some(TileEntry::Owned(t)) => t,
-        Some(TileEntry::View { ref_slot }) => {
+        Some(entry @ TileEntry::View { .. }) | Some(entry @ TileEntry::Reshaped { .. }) => {
             // Put it back so the panic message can reflect the
             // pre-take state — the slot must be Owned for
             // consume to be sound.
-            tiles[idx as usize] = Some(TileEntry::View { ref_slot });
+            tiles[idx as usize] = Some(entry);
             panic!(
-                "tile slot {idx} is a View (ref_slot={ref_slot}) but consume \
-                 requires Owned — Impl::consumes_input_tiles must only point \
-                 at slots whose producer wrote `TileEntry::Owned`"
+                "tile slot {idx} is a non-owning entry but consume requires Owned — \
+                 Impl::consumes_input_tiles must only point at slots whose producer \
+                 wrote `TileEntry::Owned`"
             );
         }
         None => panic!(

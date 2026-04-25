@@ -1,572 +1,427 @@
 # ff-interpreter — handoff
 
-> Read this first. This branch (`ff-interpreter`) is a **pivot off
-> `ferrite-forward`** at commit `961188f5c`. ff4 (the stencil
-> rewrite) is dead. The existing `HANDOFF.md` next to this file is
-> the inherited ferrite-forward handoff; keep it for context, but
-> the work happening *now* is what's described below.
-
-## Scope of this refactor — host interpreter ONLY
-
-This refactor is the **host-based interpreter** code generator.
-Megakernel codegen is a separate code generator that we will
-write later. Do not let megakernel concerns leak into the host
-design — no `[i32; 32]` packed wire format, no KVM tp_throughput
-opcode-numbering compatibility, no per-SM padding (`Noop`), no
-shared opcode registry. Those belong in the megakernel codegen
-when we build it.
-
-The host interpreter is allowed to use whatever shape Rust makes
-natural: typed enums with destructured payload, exhaustive
-matches, no unsafe transmutes, no wire numbers in user-visible
-code.
-
-## The actual work
-
-ferrite-forward already codegens the entire forward pass for every
-(variant × workload-point): solver picks Impls, codegen walks
-them, each Impl's `emit_call` produces a `let tile_X =
-kernel_call(…)` Rust statement, and the macro stitches them into
-a fully-unrolled forward fn. **Replace that codegen wholesale.**
-Same solver. Same Impl set. Same kernel calls. The macro now emits:
-
-1. **One per-arch enum**, codegened from the FUF the solver
-   actually solved for that arch. Variants = exactly the kernel
-   calls this arch's picked Impls produce, plus `Free` (drop-pass).
-   Each variant carries typed payload fields (slot indices,
-   layer index, etc.) — no `[i32; 32]` packing.
-2. **One `static FORWARD_M_<N>: &[<Arch>Op] = &[…];` per (variant ×
-   workload-point)** — each element is a per-arch enum value. No
-   wire conversion at runtime; the slice is the program.
-3. **One per-arch interpreter** — `for op in slice { match op { … }
-   }`. The match is **closed and exhaustive** over the per-arch
-   enum the macro just codegened. No `_` arm. No `unsafe`
-   transmute. No `from_wire_unchecked` shenanigans.
-
-Solver, Impl library, library invariants, fingerprinting, weights
-loading, dispatcher — all unchanged. Only the *backend* of the
-macro changes.
-
-## Failure pattern this handoff explicitly rejects
-
-> "Migrate one Impl as proof-of-concept. Then the next Impl. Then
-> the next."
-
-That is **the wrong shape**. There is no PoC layer to prove. The
-existing codegen already proves every kernel call works. The work
-is one wholesale change to the macro: every Impl that participates
-in a real arch's forward gets its emission shape changed at the
-same time. Half-migrated trait defaults that `compile_error!` at
-codegen are scaffolding — they exist so the new methods can land
-before the refactor is done, not so we ship a half-migrated tree.
-**No transitional flag.** No "interpreter = true" opt-in. No
-auto-detect-fallback. No coexistence of `emit_call` with the new
-path. Wholesale or not at all.
-
-## Locked design
-
-### Opcodes are owned by Impls, not by a registry
-
-There is **no universal opcode enum, no central registry, no
-string lookup**. Each Impl declares its own opcode shape: the
-variant name (PascalCase ident) + the typed payload fields. The
-macro, processing one arch's solved FUF, collects the shapes from
-the Impls the solver picked for that arch. From those shapes it
-codegens a per-arch enum:
-
-```rust
-enum LlamaOp {
-    AttnNorm { layer: u32, in_slot: u32, out_slot: u32 },
-    QkvRopeAppend { layer: u32, in_slot: u32, out_q_slot: u32 },
-    // … only the variants Llama's picked Impls declared
-    Free { slot: u32 },
-}
-```
-
-Two arches that happen to share an Impl get the same variant in
-their respective enums (the Impl's `opcode_shape()` is one
-function call, deterministic). Two arches that diverge get
-disjoint variants. There is no need to reconcile across arches —
-each arch has its own enum.
-
-### Per-arch interpreter is a closed exhaustive match
-
-```rust
-for op in FORWARD_M_64 {
-    match op {
-        LlamaOp::AttnNorm { layer, in_slot, out_slot } => { /* arm body */ }
-        LlamaOp::QkvRopeAppend { layer, in_slot, out_q_slot } => { /* arm body */ }
-        // … one arm per variant in LlamaOp …
-        LlamaOp::Free { slot } => { __tiles[*slot as usize] = None; }
-    }
-}
-```
-
-No `_` arm. No catch-all. No unsafe. The compiler enforces
-exhaustiveness over `LlamaOp`. The const slice is `&[LlamaOp]`,
-so by construction every element is a valid variant.
-
-### `Free` is the only memory-management opcode
-
-The drop-pass already computes last-reader per (tile, slot).
-Where the old codegen would emit a `drop(local)`, the new codegen
-emits `<Arch>Op::Free { slot }` at that point in the slice. The
-arm body clears `__tiles[slot] = None`, dropping the
-`OwnedTensor` (or the `View` indirection) and returning GPU
-memory to the caching allocator.
-
-`Free` is universal — every arch's enum has it, codegened by the
-macro itself, not by any Impl.
-
-### View aliasing is a fn-entry prelude, not a runtime opcode
-
-When a claim aliases an upstream tile (today's `as_view()`
-borrow), the macro emits
-
-```rust
-__tiles[dst as usize] = Some(TileEntry::View { ref_slot: src });
-```
-
-at fn entry, before the interpreter loop. Setting it before the
-owner is written is fine: reads through `tile_ref` resolve the
-View only when the variant arm runs, by which time the schedule's
-owner-before-reader invariant has placed the owner.
-
-No `View` variant. No runtime "alias setup" opcode.
-
-### Tile-table is `Vec<Option<TileEntry>>` indexed by u32 slot
-
-The runtime tile table replaces the let-bindings the old codegen
-emitted. Codegen builds a dense `(TileId, output_slot) → u32`
-map (call it `SlotMap`) per (variant × workload-point); slot
-indices appear in the per-arch enum's payload fields and as the
-table index at runtime. `TileEntry::{Owned, View { ref_slot:
-u32 }}` and `tile_ref(tiles, idx) -> &TileEntry` live in
-`ferrite-forward` as runtime types.
-
-### Granularity: one slice per (variant × workload-point)
-
-Matches today's `forward_m_<N>[_sk_<SK>]` granularity. Elevating
-to one slice per variant (with workload-point selecting a
-subrange or parameterizing fields at runtime) is a real
-possibility for the megakernel codegen but **not in scope here**.
-
-### Implementation trait shape
-
-```rust
-trait Implementation {
-    /// Shape of this Impl's opcode — variant name + typed fields.
-    /// Macro collects these from picked Impls to mint per-arch enum.
-    fn opcode_shape(&self) -> OpcodeShape;
-
-    /// One opcode-instance per kernel call this Impl makes at this
-    /// (variant × workload-point). Field values resolved against
-    /// the SlotMap (and bounds, ctx hints, …). Returns None if
-    /// unmigrated — codegen errors with the Impl name.
-    fn fan_out(
-        &self,
-        m: &MatchInfo,
-        fuf: &Fuf,
-        program: &Program,
-        bounds: &BTreeMap<String, u64>,
-        slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>>;
-
-    /// The body of this Impl's match arm. Macro wraps as
-    ///     <Arch>Op::<Variant> { #(field_idents),* } => { #body }
-    /// using the field names declared in `opcode_shape`. The body
-    /// references those idents, plus the ambient bindings
-    /// `__tiles`, `wm`, `ctx`, `device`. `model` lets the body bake
-    /// arch-wide config-derived literals (`hidden_size`, `head_dim`,
-    /// `attention_multiplier`, `attn_logit_softcapping`, …) at
-    /// codegen time; per-claim values that vary across instances of
-    /// the same variant ride in `OpInstance` fields instead.
-    fn interpreter_arm(&self, model: &ModelParams) -> TokenStream;
-}
-```
-
-`OpcodeShape`: variant ident + ordered list of `(field_ident,
-field_type: syn::Type)`. `OpInstance`: variant ident + ordered
-list of field-value `TokenStream`s, in the same order as the
-shape. The macro asserts shape stability (two Impls returning the
-same variant ident must declare identical fields).
-
-### What `ferrite-forward` runtime keeps / drops
-
-**Keeps** (real runtime types the emitted interpreter uses):
-- `TileEntry::{Owned(OwnedTensor), View { ref_slot: u32 }}`.
-- `tile_ref(tiles, idx) -> &TileEntry`.
-- `ForwardCtx`, the dispatcher, fingerprint plumbing.
-
-**Drops** (megakernel concerns we shoehorned in earlier — not
-needed by the host):
-- `Instruction([i32; 32])` packed wire type.
-- `INTS_PER_INSTRUCTION` constant.
-- `Layout` (matmul block sizes etc. — megakernel fan-out info).
-- `pub mod opcode` runtime constants — emitted code references
-  per-arch enums, never wire numbers.
-
-These deletions land in the same commit that introduces the
-per-arch enum codegen, so the runtime crate never carries dead
-megakernel scaffolding.
-
-## Per-claim weight selection: fn-pointer fields
-
-One Impl emits one variant. But two RmsNorm tiles in the same arch
-claim *different* accessors (`input_layernorm` vs
-`post_attention_layernorm`). The variant body can't hardcode an
-accessor name; it has to be told which weight to read at this
-instance. The encoding:
-
-- Per-arch `Weights` codegen (now landed) emits
-  `pub fn input_layernorm(&self, layer: u32) -> &RmsNorm { match
-  layer { 0 => &self.input_layernorm_0, … } }` per accessor base
-  (trailing `_<digits>` stripped). Non-layered accessors take the
-  same `(&self, layer: u32) -> &Ty` signature for caller
-  uniformity; their body is `&self.<field>` and ignores the layer.
-- `OpInstance` carries a `weight_fn` field of type
-  `for<'a> fn(&'a Weights, u32) -> &'a Ty` (or whatever return
-  type fits the Impl). `fan_out` resolves it as
-  `Weights::input_layernorm` (a function reference, valid in
-  `const` context). The interpreter arm body calls
-  `(weight_fn)(wm, layer)`.
-- Multiple-weight Impls (e.g. fused QKV with separate qkv +
-  rotary accessors) carry one fn-pointer field per accessor.
-
-Codegen-time invariants the helper enforces (see
-`emit_weights_accessor_methods` + its tests):
-
-- Mixed layered + un-layered fields under one base panic at
-  expansion time. There's no sensible single body for the mix and
-  silently picking one would mask a solver / Impl bug.
-- Two layers under the same base with different `rust_type`s
-  panic at expansion time.
-- Out-of-range layer at runtime panics with the accessor name
-  baked in (no `_ => &self.<layer 0>` catch-all that would silently
-  pick layer 0).
-
-## Current branch state (2026-04-25 end-of-session)
-
-Branch `ff-interpreter` is at `34c2d8d97` (forked from
-ferrite-forward `961cb8c8`). Nine commits ahead of fork (two
-of them reverted in-tree):
-
-```
-34c2d8d97  ff-interpreter: add take_owned for in-place consume kernels
-4eb00680c  ff-interpreter: handoff captures scaffolding refinements + migration recipe
-833ddcb61  ff-interpreter: Weights accessor methods for runtime layer dispatch
-318949840  ff-interpreter: interpreter_arm takes &ModelParams
-e7fcae89a  ff-interpreter: handoff captures end-of-session state
-b2c08c8e7  ff-interpreter: per-arch enum + closed-match codegen module
-f5f62f675  ff-interpreter: add OpcodeShape/OpInstance + new trait methods
-afb6a804f  ff-interpreter: drop megakernel scaffolding, rewrite handoff
-084828c3f  ff-interpreter: add SlotMap + ferrite-extension opcodes      ← reverted by afb6a804f
-4e5174d02  ff-interpreter: scaffold Instruction IR + tile table + InstrEmit  ← reverted by afb6a804f
-```
-
-The two reverted commits were wrong-design scaffolding (universal
-opcode registry + `Instruction([i32;32])` wire format), undone
-by `afb6a804f`. The active scaffolding is the seven most recent
-commits — four pre-today (`afb6a804f`, `f5f62f675`, `b2c08c8e7`,
-`e7fcae89a`) plus today's four (`318949840`, `833ddcb61`,
-`4eb00680c`, `34c2d8d97`).
-
-### What's landed and verified
-
-- `ferrite-forward-macro/src/impl_lib.rs`:
-  - `OpcodeShape { name: Ident, fields: Vec<(Ident, Type)> }`
-  - `OpInstance { name: Ident, field_values: Vec<TokenStream> }`
-  - `SlotMap` (compile-time `(TileId, slot) → u32` allocator)
-  - Trait `Implementation` gains `opcode_shape` / `fan_out` /
-    `interpreter_arm(model)` with unmigrated defaults.
-    **`emit_call` is still the active codegen path.** Both
-    methods live on the trait simultaneously *as scaffolding*
-    (handoff explicitly permits this so the new methods can
-    land before the wholesale switch).
-  - Tests: `opcode_shape_carries_typed_fields_in_declaration_order`,
-    `unmigrated_shape_carries_distinctive_placeholder_name`,
-    `op_instance_field_values_match_shape_field_count`,
-    `slot_map_assigns_dense_indices_in_insert_order`,
-    `slot_map_of_unregistered_panics`.
-
-- `ferrite-forward-macro/src/interpreter_codegen.rs` (NEW):
-  - `build_slot_map(fuf) -> SlotMap`.
-  - `ArchOpcodes`: collects `(OpcodeShape, interpreter_arm)`
-    across an arch's buckets; emits the per-arch Rust enum and
-    the per-arch interpreter helper.
-  - `LoweredBucket` + `lower_bucket(...)`: walks waves, calls
-    `fan_out`, interleaves `Free` instances at drop-pass points,
-    builds the alias prelude. Takes `&ModelParams` and threads
-    it through to each Impl's `interpreter_arm`.
-  - `emit_bucket_static_slice(...)`: lowers `Vec<OpInstance>` to
-    `static FORWARD_<TAG>: &[<Arch>Op] = &[…];`.
-  - `free_variant_shape()` / `free_instance(slot)` helpers — the
-    universal `Free { slot: u32 }` variant codegen always emits.
-  - Tests: 6, including `arch_interpreter_match_has_no_catchall`
-    that asserts the emitted match has neither a `_` arm nor any
-    `transmute` / `from_wire`.
-  - **NOT WIRED** into the active codegen path. `lower_bucket`
-    has zero callers in `codegen.rs`. The active path is still
-    `emit_subgraph → emit_call`.
-
-- `ferrite-forward-macro/src/codegen.rs`:
-  - `split_base_layer(field_name) -> (base, Option<layer>)` —
-    parses trailing `_<digits>` suffix.
-  - `emit_weights_accessor_methods(accessors) -> TokenStream` —
-    emits `impl Weights { pub fn <base>(&self, layer: u32) ->
-    &<Ty> { match layer { … } } }` per accessor base. Spliced
-    into `emit_weights_struct`'s Canonical-mode output between
-    `#weights_def` and `#fingerprint_method`. (Shim mode aliases
-    the canonical struct, so its accessor methods come for free
-    via `pub type Weights = super::<canonical>::Weights;`.)
-  - Tests: 6 (`split_base_layer_recognizes_layered_and_unlayered_names`,
-    `accessor_methods_collapse_per_layer_fields_into_one_method`,
-    `accessor_methods_emit_unit_arm_for_unlayered_fields`,
-    `accessor_methods_panic_on_mixed_layered_and_unlayered`,
-    `accessor_methods_panic_on_type_disagreement_within_a_base`,
-    `accessor_methods_empty_input_yields_empty_tokens`).
-  - Verified: `cargo build -p ferrite-models --features cuda`
-    completes cleanly; `codegen-profile` line counts unchanged
-    from before today (additive Weights change only).
-
-- `ferrite-forward/src/`:
-  - `instruction.rs` deleted (megakernel wire format).
-  - `tile_table.rs` exposes `TileEntry`, `tile_ref(tiles, idx)`,
-    `take_owned(tiles, idx) -> OwnedTensor`. The take helper
-    is for in-place consume kernels (the upstream's
-    `consumes_input_tiles` declaration tells the drop pass to
-    skip a `Free` for that slot; the runtime mirror is take-mutate-
-    reinsert via this helper).
-  - `lib.rs` re-exports `TileEntry`, `tile_ref`, `take_owned`.
-
-- 3 macro-crate test failures predate this branch (config variant
-  counts, `add_rmsnorm_pairs_*`); not introduced here. Currently
-  150 of 153 macro-crate tests pass.
-
-## What's next — the wholesale switch (one commit)
-
-Scaffolding (steps 1–4 below) is done. The remaining work is one
-wholesale commit. Per the rules: no piecemeal Impl migration, no
-intermediate "some Impls migrated" tree state.
-
-1. ~~Drop megakernel scaffolding~~ — done in `afb6a804f`.
-2. ~~Define `OpcodeShape` / `OpInstance` + new trait methods~~ —
-   done in `f5f62f675`. `emit_call` still active alongside the
-   defaulted-`None` `fan_out`.
-3. ~~`interpreter_arm` takes `&ModelParams`~~ — done in
-   `318949840`. Body bakes config-derived literals
-   (`hidden_size`, `head_dim`, attention scale / softcap, …) the
-   same way today's `emit_call` does via `EmitCtx::bound` /
-   `EmitCtx::scalar`.
-4. ~~Per-arch `Weights` accessor methods~~ — done in `833ddcb61`.
-   `pub fn input_layernorm(&self, layer: u32) -> &RmsNorm` etc.
-   emitted alongside the per-(field × layer) fields. `OpInstance`
-   `weight_fn` fields will resolve to `Weights::<base>` (`const`
-   fn-pointer).
-5. **Migrate every Impl in `impl_lib.rs`.** Each Impl: write
-   `opcode_shape()` (variant ident + typed fields), `fan_out(...)`
-   (one `OpInstance` per kernel call this Impl makes; resolves
-   slot ids via `SlotMap::of`, weight selectors via
-   `Weights::<base>` fn-pointer), and `interpreter_arm(model)`
-   (body that references the shape's field idents + ambient
-   `__tiles`, `wm`, `ctx`, `device`). Delete the Impl's
-   `emit_call`.
-6. **Rewrite `emit_subgraph` / `emit_forward_for_bucket` /
-   `emit_forward_backbone_for_bucket` / `emit_model`** to use
-   `interpreter_codegen::lower_bucket` + `ArchOpcodes::emit_enum`
-   + `ArchOpcodes::emit_interpreter` + `emit_bucket_static_slice`.
-   Per-arch: emit ONE enum and ONE interpreter helper; per-bucket:
-   emit one static slice + a thin fn that runs the alias prelude
-   and calls the helper.
-7. **Delete `EmitMode::Abstract` / `FragmentLibrary` /
-   Concrete-mode `EmitCtx` machinery** — all unused after the
-   seam swap. `emit.rs` shrinks substantially or goes away.
-8. **Delete `Implementation::emit_call` from the trait.** The
-   final shape: trait has `opcode_shape` / `fan_out` /
-   `interpreter_arm` + the layout/cost/handoff/etc. methods that
-   were never about emission.
-9. **Run llama golden** (`vllm-e2e --features e2e,cuda --release
-   --test e_correctness -- --ignored --test-threads=1`, llama
-   subset). Match must be exact.
-10. **Run sibling-arch goldens** (qwen2/qwen3/mistral/phi3/gemma2/
-    gemma3/granite/command-r/deepseek-v2/deepseek-v3). Same bar.
-
-### Per-Impl migration recipe
-
-For each `impl Implementation for <Foo>`:
-
-1. Read `emit_call` carefully. Identify:
-   - **Inputs** read via `ctx.input_expr(tile, slot)` → become
-     `<name>_slot: u32` fields. Resolution: `slots.of(producer_tile,
-     producer_slot)` for tile inputs; `ctx.input_ids` /
-     `ctx.positions` etc. stay as ambient `ctx.<field>` references
-     in the body (no field needed); `wm.rotary` /
-     `wm.rotary_local` become `rotary_fn: fn(&Weights) -> &Rotary`
-     fields when the choice is per-claim (Gemma3 mixes both).
-   - **Weights** read via `ctx.weight_accessor(name)` → become
-     `weight_fn: fn(&Weights, u32) -> &<Ty>` fields, value
-     `Weights::<base>` where `<base>` is the accessor name with
-     trailing `_<digits>` stripped. The body calls
-     `(weight_fn)(wm, layer)`.
-   - **Outputs** bound via `ctx.output_ident(tile, slot)` →
-     become `<name>_slot: u32` fields (one per claimed output).
-     Body writes `__tiles[<name>_slot as usize] =
-     Some(::ferrite_forward::TileEntry::Owned(...))`.
-   - **Per-claim compile-time constants** that vary across
-     instances of the same variant (layer index, scalar offsets,
-     interleaved-vs-NeoX flag, fp8 flag) → fields of the
-     appropriate type.
-   - **Arch-wide compile-time constants** (every `ctx.bound("...")`
-     and `ctx.scalar("...")` call) → bake into the body via
-     `model.bounds["..."]` / `model.scalars.get("...")` reads in
-     `interpreter_arm(model)`. Same as today.
-2. Write `opcode_shape()` returning the variant ident + ordered
-   `(field_ident, field_type)` pairs.
-3. Write `fan_out(m, fuf, program, bounds, slots)` returning one
-   `OpInstance` per kernel call. Field-value tokens are positional,
-   matching shape declaration order.
-4. Write `interpreter_arm(model)`. Body destructures fields and
-   calls the kernel. **Never** transmute or use `unsafe { … }`
-   wrappers larger than the existing `unsafe` blocks today's
-   `emit_call` already wraps. Read tile inputs via `tile_ref(__tiles,
-   slot)`; for `as_view()` style use `(*entry).as_view(__tiles)`.
-5. Delete `emit_call`. (This breaks compilation while the seam
-   still runs the old path; the wholesale commit's last move is
-   the seam swap, which makes `emit_call` an unused-method dead
-   trait member, then this step deletes the trait method itself.)
-
-### Impl inventory (47 to migrate)
-
-Run `grep -n '^impl Implementation for' impl_lib.rs` to enumerate.
-As of `833ddcb61`, ordered by location:
-
-```
-trivial_impl! → EmbedRefImpl, RmsNormRefImpl, LayerNormRefImpl,
-                GemmRefImpl  (4 entries via the `trivial_impl!`
-                macro at impl_lib.rs:929; the macro expands to a
-                full `impl` block — convert the macro to also
-                accept opcode_shape/fan_out/interpreter_arm
-                callbacks, OR hand-write each as a regular impl
-                so the new methods are visible.)
-ReshapeRefImpl              FusedAddRmsNormImpl
-FusedGemmBiasImpl           FusedAddRmsNormWithOffsetImpl
-CutlassFusedGemmBiasImpl    ScalarOffsetRmsNormImpl
-FusedGateUpSiluMulImpl      FusedQkvRopeCacheImpl
-CutlassFusedGateUpSiluMulImpl  FusedQkvQkNormRopeCacheImpl
-FusedGateUpGeluMulImpl      AttentionViaCacheImpl
-ScalarMulImpl               RopeAppendRefImpl
-TanhSoftCapImpl             FusedQkvRopePrefillImpl
-AddRefImpl                  AttentionPrefillContiguousImpl
-                            SlidingAttentionViaCacheImpl
-                            SlidingAttentionPrefillContiguousImpl
-CutlassGemmImpl             CutlassGemmSplitKImpl
-CutlassGemmAddImpl          CutlassGemvImpl
-MarlinGemmImpl              MarlinFusedGateUpSiluMulImpl
-MarlinFusedGateUpGeluMulImpl  MarlinFusedQkvRopeCacheImpl
-MarlinFusedQkvRopePrefillImpl
-Bnb4GemmImpl                Fp8GemmImpl
-Fp8FusedGemmBiasImpl        Fp8FusedGateUpSiluMulImpl
-Bnb4FusedGateUpSiluMulImpl  Bnb4FusedGateUpGeluMulImpl
-Fp8FusedGateUpGeluMulImpl   Fp8FusedQkvRopeCacheImpl
-Fp8FusedQkvRopePrefillImpl  Bnb4FusedQkvRopeCacheImpl
-Bnb4FusedQkvRopePrefillImpl
-FlashInferAttentionDecodeImpl  FlashInferAttentionPrefillImpl
-MlaSplitRefImpl             MlaAttentionImpl
-DeepSeekMoeRefImpl
-```
-
-Within the wholesale commit, work in the same locality order as
-`grep` output — keeps the diff readable. After every batch (say,
-every 5 Impls), run `cargo build -p ferrite-forward-macro` to
-verify the trait's still satisfied; the macro crate builds even
-while `lower_bucket` is still unwired, because `emit_call` lives
-alongside the new methods until step 7 fires.
-
-### Scope estimate for the wholesale commit
-
-- ~47 Impls in `impl_lib.rs`. Per-Impl change ~80–150 lines net.
-  ≈ 5 kloc.
-- `emit_subgraph` / `emit_forward_*` / `emit_model` rewrite: ~500
-  lines.
-- Deletions of `emit.rs::EmitMode::Abstract` /
-  `FragmentLibrary` / etc.: ~500 lines removed.
-
-This is one focused multi-day push, not a single sitting. Plan
-the session for it.
-
-## Pre-commit checklist (every commit on this branch)
-
-Before each commit on `ff-interpreter`, re-read this handoff and
-verify:
-
-- [ ] No universal opcode enum. No central registry. No string
-      opcode lookup. Each Impl owns its opcode shape.
-- [ ] No `_` arm or unsafe transmute in any emitted match. The
-      per-arch enum is closed; the match is exhaustive.
-- [ ] No megakernel wire-format types in `ferrite-forward`
-      runtime (`Instruction([i32; 32])`, `Layout`,
-      `pub mod opcode`).
-- [ ] No transitional `interpreter` flag. No `emit_call` /
-      `fan_out` coexistence.
-- [ ] The diff doesn't reach `form_regions.rs`,
-      `library_invariants.rs`, `solver/`, or any loader. This is
-      a backend change.
-- [ ] Every migrated Impl has `opcode_shape` / `fan_out` /
-      `interpreter_arm`; `emit_call` is gone from migrated Impls.
-
-If any box is unchecked, **stop and wait** — do not commit.
+> Branch `ff-interpreter`, off `ferrite-forward@961188f5c`. ff4
+> stencil rewrite is dead. Read this whole file before making
+> changes.
+
+## Goal
+
+Replace ferrite-forward's per-(variant × workload-point) inlined
+forward fns with **one per-arch interpreter** walking a
+`&[<Arch>Op]` slice. Same solver, same Impl set, same kernel
+calls, same outputs — only the macro's *backend* changes. **Host
+interpreter ONLY**; megakernel codegen is a separate code
+generator we will write later. No `[i32;32]` wire format, no KVM
+opcode numbering, no shared opcode registry, no `Noop` SM
+padding.
+
+## Architecture invariants — non-negotiable
+
+1. **Only one piece of executable code is generated per arch — the
+   interpreter fn** (`for op in slice { match op { … } }`).
+   Everything else the macro emits is *data*: the `Weights`
+   struct + accessor methods, the per-arch `<Arch>Op` enum, the
+   `static FORWARD_M_<N>: &[<Arch>Op] = &[…]` slices. Per-Impl
+   `interpreter_arm(model)` produces the body of one arm of the
+   interpreter's match.
+2. **Each Impl owns its opcode shape.** No universal opcode enum,
+   no central registry, no string lookup. The macro collects
+   `OpcodeShape`s from the Impls the solver picked for one arch
+   and mints that arch's enum from them. Two arches that share
+   an Impl share its variant; two arches that diverge get
+   disjoint variants.
+3. **The match is closed and exhaustive over the per-arch enum.**
+   No `_` arm. No `unsafe { unreachable_unchecked() }`. No
+   `transmute<u16, Op>`, no `from_wire_unchecked`. The slice is
+   `&[<Arch>Op]`, not `&[Instruction]`.
+4. **Identical behavior is preserved.** Reshape stays metadata-
+   only zero-copy. In-place consume kernels stay in-place.
+   Aliasing stays aliasing. The only change is *how* the macro
+   spells the same operations.
+5. **The work isn't writing new impls.** Every existing `impl
+   Implementation for <Foo>` already wires its kernel call
+   through `emit_call`. Migration adds three methods —
+   `opcode_shape` / `fan_out` / `interpreter_arm` — that move
+   the same call into the data + interpreter form. `emit_call`
+   stays alive until the seam swap, then dies.
+
+## Wholesale rule
+
+No piecemeal Impl migration, no transitional `interpreter` flag,
+no `emit_call` / `fan_out` coexistence at the seam. The
+wholesale commit migrates every Impl that participates in a
+real arch's forward, swaps the seam, deletes the dead emission
+machinery, and runs goldens — all in one commit. Half-migrated
+trait defaults that `compile_error!` are scaffolding so the new
+methods land before the switch.
 
 ## Things that must not happen
 
-- **No universal opcode enum / registry / mirror.** The Impl owns
-  the opcode shape. The macro collects shapes per arch. End.
-- **No `_` arm or `unsafe { unreachable_unchecked() }` in the
-  generated match.** Exhaustive over the per-arch enum or it's
-  wrong.
-- **No unsafe `transmute<u16, Op>` or `from_wire_unchecked`.**
-  The slice is `&[<Arch>Op]`, not `&[Instruction]`.
-- **No KVM wire-format leakage.** Megakernel will lower per-arch
-  enum to KVM `[i32; 32]` when megakernel codegen lands. Until
-  then, the host enum is the program.
-- **No piecemeal Impl migration.** Wholesale or not at all.
-- **No solver / loader / fingerprint edits.** Backend change only.
-- **No megakernel work before the host interpreter lands one
-  full llama forward.** The IR isn't proven until the host
-  backend matches the golden.
+- Universal opcode enum / registry / mirror.
+- `_` arm or `unsafe { unreachable_unchecked() }` in the
+  generated match.
+- `transmute<u16, Op>` / `from_wire_unchecked`.
+- KVM `[i32;32]` wire format leaking into `ferrite-forward`.
+- Piecemeal Impl migration. Wholesale or not at all.
+- Solver / loader / fingerprint / region-former edits. Backend
+  change only.
+- Megakernel work before the host interpreter lands one full
+  llama forward and matches its golden.
+
+## Runtime types in `ferrite-forward`
+
+**Keeps:**
+- `TileEntry::{ Owned(OwnedTensor), View { ref_slot: u32 },
+  Reshaped { ref_slot: u32, tensor: GpuTensor } }` —
+  three variants, no more.
+- `tile_ref(tiles, idx) -> &TileEntry`,
+  `take_owned(tiles, idx) -> OwnedTensor`.
+- `ForwardCtx`, the dispatcher, fingerprint plumbing.
+
+**Already deleted (in `afb6a804f`):**
+- `Instruction([i32;32])`, `INTS_PER_INSTRUCTION`, `Layout`,
+  `pub mod opcode`. No megakernel scaffolding in-tree.
+
+`TileEntry::Reshaped` is the only runtime-types extension this
+pivot adds. See "Reshape encoding" below for why.
+
+## Locked Implementation trait shape
+
+```rust
+trait Implementation {
+    fn opcode_shape(&self) -> OpcodeShape;
+    fn fan_out(
+        &self, m: &MatchInfo, fuf: &Fuf, program: &Program,
+        bounds: &BTreeMap<String, u64>, slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>>;
+    fn interpreter_arm(&self, model: &ModelParams) -> TokenStream;
+    // … plus the existing layout/cost/handoff/etc. methods.
+    // emit_call survives until the seam swap, then is removed.
+}
+```
+
+- `OpcodeShape`: variant ident + ordered `(field_ident,
+  field_type: syn::Type)`. The macro asserts shape stability
+  (two Impls with the same variant ident must declare identical
+  fields).
+- `OpInstance`: variant ident + ordered `Vec<TokenStream>` of
+  field-value tokens (positional, in shape declaration order).
+  Tokens must be const-eval-friendly (they end up in a `static`
+  initializer).
+- `interpreter_arm(model)` body: kernel call wrapped as
+  `<Arch>Op::<Variant> { #(field_idents),* } => { #body }`.
+  Body sees the variant's field idents plus ambient bindings
+  `__tiles`, `wm`, `ctx`, `device`. Use `model` to bake
+  arch-wide config-derived literals (`hidden_size`, `head_dim`,
+  attention scale/softcap, …); per-claim values ride in
+  `OpInstance` fields.
+
+## Per-claim weight selection — fn-pointer fields
+
+Two RmsNorm tiles in one arch claim different accessors
+(`input_layernorm` vs `post_attention_layernorm`). The variant
+body can't hardcode an accessor name; it gets told which weight
+to read at this instance via a `weight_fn` field of type
+`for<'a> fn(&'a Weights, u32) -> &'a Ty`. `fan_out` resolves
+the value as `Weights::<base>` (a function-item reference,
+const-eval-friendly); the arm calls `(weight_fn)(wm, layer)`.
+
+Per-arch `Weights` codegen (already landed in `833ddcb61`)
+emits `pub fn input_layernorm(&self, layer: u32) -> &RmsNorm`
+per accessor base (trailing `_<digits>` stripped). Un-layered
+accessors take the same signature for caller uniformity; their
+body is `&self.<field>` and ignores `layer`.
+
+`split_base_layer(name) -> (base, Option<u32>)` (in
+`codegen.rs`, `pub(crate)`) is what `fan_out` calls to derive
+the variant's `weight_fn` ident + `layer` value from a
+`WeightAccessor.name`.
+
+## Reshape encoding — instructions are data
+
+Today's `emit_call` for Reshape produces
+`(input).reshape(&[d0, d1, …])` — a `TensorView`/`GpuTensor`
+with new shape metadata sharing storage with upstream. Zero
+copies. The interpreter must reproduce this exactly, but
+`View { ref_slot }` alone carries no shape override, so we
+needed:
+
+- New runtime variant `TileEntry::Reshaped { ref_slot: u32,
+  tensor: GpuTensor }`. `tensor` carries new shape/ndim with
+  the same ptr; `ref_slot` keeps the storage owner alive
+  (drop-pass already aliases Reshape's output to its upstream
+  via `output_alias`).
+- Opcode fields `dims_lit: [u32; MAX_DIMS]`, `dims_nt_pow:
+  [u8; MAX_DIMS]`, `ndim: u8`. Each axis's final dim is
+  `dims_lit[i] * num_tokens.pow(dims_nt_pow[i])`.
+- `decompose_reshape_dim(dim, bounds) -> (lit, nt_pow)`:
+  evaluates each Dim at codegen time, folding `Lit` and every
+  non-`num_tokens` `Bound` into the literal factor and counting
+  `Bound("num_tokens")` occurrences into `nt_pow`. `Mul`
+  recurses; `Var` panics.
+- The arm reads `(*ctx.input_ids).dim(0)` for `num_tokens`,
+  composes the shape, calls `upstream.reshape(&shape[..ndim])`,
+  and writes `TileEntry::Reshaped { ref_slot: in_slot, tensor:
+  __reshaped }`.
+
+This is the template for any future Impl whose runtime
+behavior depends on a closed-form expression over the bound
+table plus `num_tokens`.
+
+The proc-macro crate doesn't depend on `ferrite-cuda-core`, so
+host-side array allocation in `fan_out` hardcodes `4` with a
+comment; emitted tokens reference
+`::ferrite_cuda_core::tensor::MAX_DIMS` symbolically (visible
+in consumer crates).
+
+## What's done (uncommitted, working tree)
+
+**43 of 49 Impls migrated.** 6 Fp8 Impls deferred (see "Fp8
+deferral" below). Macro crate builds clean; existing 5 + 11
+new round-trip tests pass; codegen-profile line counts
+unchanged in `ferrite-models` (active `emit_call` path
+unperturbed).
+
+### Migrated (43):
+
+Singletons + simple fusions:
+EmbedRef, RmsNormRef, LayerNormRef, GemmRef, ReshapeRef,
+ScalarMul, TanhSoftCap, AddRef, ScalarOffsetRmsNorm.
+
+Two-tile + multi-tile fusions:
+FusedGemmBias, CutlassFusedGemmBias, FusedGateUpSiluMul,
+CutlassFusedGateUpSiluMul, FusedGateUpGeluMul,
+FusedAddRmsNorm, FusedAddRmsNormWithOffset.
+
+QKV/rope/attention cluster:
+FusedQkvRopeCache, FusedQkvQkNormRopeCache,
+AttentionViaCache, RopeAppendRef, FusedQkvRopePrefill,
+AttentionPrefillContiguous, SlidingAttentionViaCache,
+SlidingAttentionPrefillContiguous.
+
+Cutlass GEMM tile zoo (one variant per family — `tile_m`,
+`tile_n`, `stages`, `split_k` ride as runtime fields):
+CutlassGemm, CutlassGemmSplitK, CutlassGemmAdd, CutlassGemv.
+
+Marlin (AWQ/GPTQ) family:
+MarlinGemm, MarlinFusedGateUpSiluMul, MarlinFusedGateUpGeluMul,
+MarlinFusedQkvRopeCache, MarlinFusedQkvRopePrefill.
+
+Bnb4 family:
+Bnb4Gemm, Bnb4FusedGateUpSiluMul, Bnb4FusedGateUpGeluMul,
+Bnb4FusedQkvRopeCache, Bnb4FusedQkvRopePrefill.
+
+FlashInfer + DeepSeek-V2:
+FlashInferAttentionDecode, FlashInferAttentionPrefill,
+MlaSplitRef, MlaAttention, DeepSeekMoeRef.
+
+### Fp8 deferral (6):
+
+Fp8Gemm, Fp8FusedGemmBias, Fp8FusedGateUpSiluMul,
+Fp8FusedGateUpGeluMul, Fp8FusedQkvRopeCache,
+Fp8FusedQkvRopePrefill.
+
+**Why deferred:** `fp8_accessor_type_for(fuf, tile)` returns
+either `Fp8Linear` or `Fp8BlockLinear` per claim depending on
+storage block_size. The interpreter trait gives
+`opcode_shape(&self)` no model/FUF context, so a single Impl
+can't choose its variant's `weight_fn` field type per claim.
+
+**Unblocker:** introduce `pub enum Fp8AnyLinear { Std(Fp8Linear),
+Block(Fp8BlockLinear) }` in `ferrite-kernels::layers` with a
+unified `unsafe fn forward(&self, x, cublas, alloc, stream)
+-> OwnedTensor` that dispatches on the variant. Update
+`fp8_accessor_type_for` to always return
+`::ferrite_kernels::layers::Fp8AnyLinear`. Update the kernels'
+loaders (`Fp8Linear::load*`, `Fp8BlockLinear::load*`) to wrap
+their result in `Fp8AnyLinear::Std` / `::Block` so the
+auto-generated `<arch>::Weights::load_with` body still type-
+checks. With one concrete `weight_fn` type, the six Fp8 Impls
+migrate identically to their Bnb4 siblings (`Bnb4bitLinear`
+template). No interpreter trait changes needed.
+
+**Active-path impact:** today's `emit_call` still produces the
+right code for Fp8 because `fp8_accessor_type_for`'s decision
+flows through into the emitted Weights field type. The
+deferral is purely about the new interpreter path.
+
+**Wholesale-commit gating:** the seam-swap commit cannot land
+while Fp8 Impls are unmigrated AND any registered arch picks
+one. None of the goldens we gate on (Llama/Qwen2/Qwen3/Mistral/
+Phi3/Gemma2/Gemma3/Granite/CommandR/DeepSeek-V2/DeepSeek-V3)
+use Fp8 weights, so the seam swap can land WITHOUT migrating
+Fp8 — `lower_bucket` panics on `fan_out → None` only when an
+Impl is actually picked. The Fp8 Impls stay registered in
+`starter_library` and remain reachable through the legacy
+emit path until the wrapper-enum commit lands.
+
+Both `trivial_impl!` callsites are gone (Embed, RmsNorm,
+LayerNorm, Gemm rewritten longhand) and the macro definition
+itself is now deleted — the wholesale cleanup pass only has to
+remove the `Implementation::emit_call` trait method, the
+per-Impl `emit_call` bodies, `EmitMode::Abstract`,
+`FragmentLibrary`, and Concrete-mode `EmitCtx`.
+
+`SlotMap`, `OpcodeShape`, `OpInstance`, and the new trait
+methods are in `impl_lib.rs`. `interpreter_codegen.rs` has
+`build_slot_map`, `ArchOpcodes`, `lower_bucket`,
+`emit_bucket_static_slice`, `free_variant_shape`,
+`free_instance` — fully unit-tested but **not wired** into the
+active codegen path. The active path is still
+`emit_subgraph → emit_call`.
+
+`codegen.rs` was extended with one helper: per-arch `Weights`
+now exposes accessor methods `rotary_cos_sin(&self, _layer:
+u32) -> GpuTensor` and (when applicable) `rotary_local_cos_sin`,
+emitted alongside `accessor_methods` in canonical mode only.
+Interpreter arms reference these via a `cos_sin_fn` fn-pointer
+field instead of `wm.rotary_local.cos_sin_cache` — the latter
+fails to type-check on Llama (no `rotary_local` field).
+
+171/174 macro-crate tests pass. The 3 failures
+(`load_real_llama_configs`, `load_real_qwen2_configs`,
+`add_rmsnorm_pairs_claimed_as_fused_subgraph`) predate this
+branch and are out of scope.
+
+## Per-Impl migration recipe
+
+For each `impl Implementation for <Foo>`:
+
+1. Read `emit_call`. Identify:
+   - **Tile inputs** (read via `ctx.input_expr(tile, slot)`) →
+     `<name>_slot: u32` field. Resolve via
+     `slots.of(producer_tile, producer_slot)` from
+     `node.inputs[i]` (read directly off the FUF —
+     `MatchInfo.boundary_inputs` loses producer-slot info).
+   - **Weights** (read via `ctx.weight_accessor(name)`) →
+     `weight_fn: for<'a> fn(&'a Weights, u32) -> &'a <Ty>`
+     field, value `Weights::<base>` from
+     `split_base_layer(acc.name)`. Add a sibling `layer: u32`
+     field for the layer index. Multiple-weight Impls carry
+     one fn-pointer + layer pair per accessor.
+   - **Outputs** (bound via `ctx.output_ident(tile, slot)`) →
+     `<name>_slot: u32` field. Body writes
+     `__tiles[<name>_slot as usize] =
+     Some(::ferrite_forward::TileEntry::Owned(...))` (or
+     `::Reshaped{…}` for reshape-shaped Impls; `take_owned` +
+     reinsert for in-place consume).
+   - **Per-claim compile-time constants** that vary across
+     instances of the same variant (layer, scalar offsets,
+     interleaved-vs-NeoX flag, fp8 flag) → fields of the
+     appropriate type.
+   - **Arch-wide compile-time constants** (every `ctx.bound`,
+     `ctx.scalar`) → bake into the body via
+     `model.bounds["…"]` / `model.scalars.get("…")` reads in
+     `interpreter_arm(model)`. Same as today.
+2. Write `opcode_shape()` returning the variant ident + ordered
+   `(field_ident, field_type)` pairs.
+3. Write `fan_out(m, fuf, program, bounds, slots)` returning
+   one `OpInstance` per kernel call. Field-value tokens are
+   positional, matching declaration order.
+4. Write `interpreter_arm(model)`. Body destructures the
+   variant's fields and calls the kernel. Read tile inputs via
+   `tile_ref(__tiles, slot).as_view(__tiles)` (or
+   `as_gpu_tensor` for kernels that take `GpuTensor`).
+5. Leave `emit_call` in place (it's still the active path).
+6. Add a `<impl>_opcode_shape_…` round-trip test in
+   `impl_lib::tests` mirroring the five existing ones —
+   variant name + field names + arm body assertions + parse
+   through syn + `ArchOpcodes::emit_enum` /
+   `emit_interpreter` round-trip.
+
+After every batch of 5–10, run `cargo build -p
+ferrite-forward-macro`. After all migrations, run `cargo build
+-p ferrite-models --features cuda`.
+
+## Impl inventory
+
+49 total. **Migrated (43)** — all live arch goldens covered.
+**Deferred (6)** — Fp8 family, see "Fp8 deferral" above.
+
+## What's left for the wholesale commit
+
+1. **0 Impls remaining** for live-arch goldens. (Fp8 family
+   skipped — not picked by any Llama/Qwen/Mistral/Phi3/Gemma/
+   Granite/CommandR/DeepSeek arch; lands in a follow-up that
+   introduces `Fp8AnyLinear`.)
+2. **Seam swap** in `codegen.rs`: rewrite `emit_subgraph` /
+   `emit_forward_for_bucket` /
+   `emit_forward_backbone_for_bucket` / `emit_model` to use
+   `interpreter_codegen::lower_bucket` +
+   `ArchOpcodes::emit_enum` + `ArchOpcodes::emit_interpreter` +
+   `emit_bucket_static_slice`. Per-arch: ONE enum + ONE
+   interpreter helper. Per-bucket: one static slice + a thin
+   fn that runs the alias prelude and calls the helper.
+3. **Delete dead emission machinery**: `EmitMode::Abstract`,
+   `FragmentLibrary`, Concrete-mode `EmitCtx`, the per-Impl
+   `emit_call` bodies, and the `Implementation::emit_call`
+   trait method. (`trivial_impl!` is already gone.)
+4. **Run goldens**: llama first (`vllm-e2e --features e2e,cuda
+   --release --test e_correctness -- --ignored
+   --test-threads=1`, llama subset). Match must be exact. Then
+   sibling-arch goldens
+   (qwen2/qwen3/mistral/phi3/gemma2/gemma3/granite/command-r/
+   deepseek-v2/deepseek-v3). Same bar.
+
+Per the wholesale rule, none of this commits until the seam
+swap + golden runs are in the same commit as the Impl
+migrations.
+
+## Fp8 follow-up commit (after wholesale)
+
+A separate commit lands the Fp8AnyLinear unblocker:
+
+1. Add `pub enum Fp8AnyLinear { Std(Fp8Linear),
+   Block(Fp8BlockLinear) }` to `ferrite-kernels::layers` with
+   `unsafe fn forward(&self, x, cublas, alloc, stream)` that
+   dispatches on the variant.
+2. Update Fp8 loaders to wrap into `Fp8AnyLinear`.
+3. Change `fp8_accessor_type_for` to always return
+   `::ferrite_kernels::layers::Fp8AnyLinear`.
+4. Migrate the 6 Fp8 Impls following the Bnb4 family template
+   (one variant per family, fixed `weight_fn` type
+   `&Fp8AnyLinear`).
+5. Run the Fp8 golden subset.
+
+Constraint: between the wholesale commit and the Fp8 follow-up,
+any consumer model that picks an Fp8 Impl will hit
+`lower_bucket`'s "Impl X has no fan_out" panic — the seam-swap
+commit moves through the same panic site. Confirm the active
+goldens don't pick Fp8 before landing the wholesale commit.
+
+## Pre-commit checklist
+
+Re-read this file. Verify:
+
+- [ ] No universal opcode enum / registry / string lookup.
+- [ ] No `_` arm or `unsafe { unreachable_unchecked() }` in
+      any emitted match.
+- [ ] No megakernel wire-format types in `ferrite-forward`.
+- [ ] No `interpreter` flag, no `emit_call` / `fan_out`
+      coexistence at the seam.
+- [ ] The diff doesn't reach `form_regions.rs`,
+      `library_invariants.rs`, `solver/`, or any loader.
+- [ ] Every migrated Impl has a `<impl>_opcode_shape_…` test.
+- [ ] `cargo build -p ferrite-forward-macro` and `cargo build
+      -p ferrite-models --features cuda` both green.
+
+If any box is unchecked, **stop and wait** — do not commit.
 
 ## Reference points
 
 - `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs::emit_subgraph`
-  — today's per-tile inlined `emit_call` site. **This is what the
-  refactor rewrites.** (The handoff previously called this
+  — the seam to rewrite. (Earlier handoffs called this
   `emit_workload.rs`; that file does not exist.)
-- `vllm-rs/crates/ferrite-forward-macro/src/impl_lib.rs` — the
-  `Implementation` trait. `emit_call` lives at line ~504 today
-  (and at ~998 inside the `trivial_impl!` macro expansion); the
-  new methods replace it. `opcode_shape` / `fan_out` /
-  `interpreter_arm` are at ~598 / ~611 / ~642 with unmigrated
-  defaults.
-- `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs::emit_weights_struct`
-  — emits `Weights` struct, `impl Weights { fn <base>(&self,
-  layer: u32) }` accessor methods (via
-  `emit_weights_accessor_methods`), and `load_with` / `load`
-  loaders. Spliced together inside the `WeightsEmitMode::Canonical`
-  arm.
-- `vllm-rs/crates/ferrite-forward/src/lib.rs` — runtime types the
-  emitted interpreter consumes. `TileEntry`, `tile_ref`,
-  `take_owned` stay; `Instruction` / `Layout` / `opcode` already
-  deleted (`afb6a804f`).
-
-## Pre-existing baseline failures (not introduced by this work)
-
-These were red on `ferrite-forward` at the fork point and remain
-red here. Not blockers:
-
-- `vllm-e2e` ignored quant variants (per inherited `HANDOFF.md`
-  "Real gap inventory" section).
-- `cargo check --workspace` in the top-level vllm dir trips on
-  `mlx-sys` BLAS (per memory `feedback_build_flags.md`); use the
-  documented `-p` builds instead.
-- 3 macro-crate test-only failures (config variant counts drifted
-  from earlier llama / qwen2 expansions; `add_rmsnorm_pairs_*` solver
-  count). Not introduced here, not in scope to fix.
+- `vllm-rs/crates/ferrite-forward-macro/src/impl_lib.rs` — 43
+  migrated Impls live here. Embed, RmsNorm, LayerNorm, Gemm,
+  Reshape are the original templates; ScalarMul/TanhSoftCap
+  show in-place consume; AddRef/FusedAddRmsNorm show
+  alias-prelude outputs (no `__tiles[...] = ...` write);
+  Reshape/RopeAppend show `Reshaped` entries that overwrite
+  the alias prelude. The `Implementation` trait + `OpcodeShape`
+  / `OpInstance` / `SlotMap` types live at the top of the file.
+- `vllm-rs/crates/ferrite-forward-macro/src/interpreter_codegen.rs`
+  — `lower_bucket`, `ArchOpcodes`, `emit_bucket_static_slice`,
+  `free_variant_shape`. Unwired until the seam swap.
+- `vllm-rs/crates/ferrite-forward/src/tile_table.rs` — the
+  three `TileEntry` variants and their accessors.

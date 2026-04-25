@@ -1226,12 +1226,38 @@ fn emit_weights_struct(
         for (wid, _idx) in &a.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
             let ok = matches!(
-                (&fmt, accessor_is_marlin, accessor_is_bnb4, accessor_is_fp8_any),
-                (crate::quantization::StorageFormat::Dense, false, false, false)
-                    | (crate::quantization::StorageFormat::Awq { .. }, true, false, false)
-                    | (crate::quantization::StorageFormat::Gptq { .. }, true, false, false)
-                    | (crate::quantization::StorageFormat::Bnb4 { .. }, false, true, false)
-                    | (crate::quantization::StorageFormat::Fp8 { .. }, false, false, true),
+                (
+                    &fmt,
+                    accessor_is_marlin,
+                    accessor_is_bnb4,
+                    accessor_is_fp8_any
+                ),
+                (
+                    crate::quantization::StorageFormat::Dense,
+                    false,
+                    false,
+                    false
+                ) | (
+                    crate::quantization::StorageFormat::Awq { .. },
+                    true,
+                    false,
+                    false
+                ) | (
+                    crate::quantization::StorageFormat::Gptq { .. },
+                    true,
+                    false,
+                    false
+                ) | (
+                    crate::quantization::StorageFormat::Bnb4 { .. },
+                    false,
+                    true,
+                    false
+                ) | (
+                    crate::quantization::StorageFormat::Fp8 { .. },
+                    false,
+                    false,
+                    true
+                ),
             );
             if !ok {
                 let dotted = program.weights.path(*wid).join(".");
@@ -1247,19 +1273,41 @@ fn emit_weights_struct(
         }
     }
 
-    let fields = accessors.iter().map(|a| {
-        let name = &a.name;
-        let ty = &a.rust_type;
-        quote! { pub #name: #ty, }
-    });
+    // Group accessors by base for the Vec<T> compression. Layered
+    // groups collapse to one `pub <base>: Vec<T>` field + one
+    // `(0..N).map(|layer| …).collect::<Result<Vec<_>>>()?` Vec-build
+    // in `load_with`; unindexed groups keep the per-accessor field
+    // and per-FieldLoad let. The same group list also drives
+    // `emit_weights_accessor_methods`, so all three sites stay in
+    // sync — adding a new accessor only changes the inputs here.
+    let groups = group_accessors_by_base(&accessors);
 
-    // Emit each field as its own let-binding in the load body.
-    // This lets later loaders reference earlier ones (e.g. a tied
-    // `lm_head` reads `embed_tokens.weight`). Field order inside
-    // Self { .. } is irrelevant to Rust; let-binding order is what
-    // matters. `accessors` iterates BTreeMap-sorted — which puts
-    // `embed_tokens` before `lm_head` alphabetically, so the tied
-    // case works without a special sort.
+    let fields: Vec<TokenStream> = groups
+        .iter()
+        .map(|g| {
+            let name = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
+            let ty = &g.rust_type;
+            if g.layered {
+                quote! { pub #name: ::std::vec::Vec<#ty>, }
+            } else {
+                quote! { pub #name: #ty, }
+            }
+        })
+        .collect();
+
+    // Emit each group as its own let-binding in the load body.
+    // Layered groups become `let <base>: Vec<T> = (0..N).map(…)
+    // .collect()?;`. Unindexed groups keep the existing per-FieldLoad
+    // let (computed by `plan_field_load` from the single accessor).
+    // Order matters: a tied `lm_head` reads `embed_tokens.weight`,
+    // and `groups` iterates BTreeMap-sorted by base, which puts
+    // `embed_tokens` before `lm_head` alphabetically.
+    //
+    // Scan plans for the prelude-needed flags (any_marlin / any_bnb4
+    // / any_fp8) over the FULL accessor list — keeps the prelude
+    // logic identical to the pre-grouping version. The prelude
+    // bindings (`__marlin_ws`, `__bnb_code`, `__fp8_dtype`, …) are
+    // captured by the layered closures via lexical scope.
     let plans: Vec<FieldLoad> = accessors
         .iter()
         .map(|a| plan_field_load(a, program, fuf, model, manifest))
@@ -1295,211 +1343,19 @@ fn emit_weights_struct(
         })
         .max()
         .unwrap_or(0);
-    let lets: Vec<TokenStream> = accessors
+    // Map each accessor to its FieldLoad once so the unindexed-let
+    // arm and the layered Vec-build arm can both look it up by
+    // accessor identity. (`accessors` is sorted, plans was built in
+    // the same order, so a name → plan lookup is fine.)
+    let plan_by_name: std::collections::BTreeMap<String, &FieldLoad> = accessors
         .iter()
         .zip(plans.iter())
-        .map(|(a, plan)| {
-            let name = &a.name;
-            match plan {
-                FieldLoad::Embedding(prefix) => quote! {
-                    let #name = ::ferrite_kernels::layers::Embedding::load(gw, #prefix)?;
-                },
-                FieldLoad::RmsNorm(prefix, eps) => quote! {
-                    let #name = ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?;
-                },
-                FieldLoad::CohereLayerNorm(prefix, eps) => quote! {
-                    let #name = ::ferrite_kernels::layers::CohereLayerNorm::load(
-                        gw, #prefix, #eps,
-                    )?;
-                },
-                FieldLoad::LinearDense(prefix) => quote! {
-                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense(gw, #prefix)?;
-                },
-                FieldLoad::LinearConcat(prefixes) => quote! {
-                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat(
-                        gw,
-                        &[ #(#prefixes),* ],
-                        stream,
-                    )?;
-                },
-                FieldLoad::LinearTiedToEmbedding(embed_ident) => quote! {
-                    // Tied embedding: lm_head reuses the
-                    // `#embed_ident` field's weight tensor. Shape
-                    // [vocab_size, hidden_size] works for both
-                    // Embedding (gather rows) and LinearLayer
-                    // (matmul against hidden_size). No bias.
-                    let #name = ::ferrite_kernels::layers::LinearLayer::Dense(
-                        ::ferrite_kernels::layers::Linear::new(
-                            #embed_ident.weight,
-                            None,
-                        )
-                    );
-                },
-                FieldLoad::MarlinLinear { prefixes, .. } => {
-                    // Every Marlin accessor emits the SAME call
-                    // shape regardless of AWQ/GPTQ/CT: the runtime
-                    // `MarlinFormat` discriminator is threaded in
-                    // from `load_with`'s `marlin_storage` param.
-                    // That's what lets cross-variant load-body
-                    // dedup collapse AWQ/GPTQ/CT variants of the
-                    // same (arch, size) to one canonical `load_with`
-                    // body — only the `marlin_storage` const each
-                    // variant's one-line `load` passes differs.
-                    let single = prefixes.len() == 1;
-                    if single {
-                        let prefix = &prefixes[0];
-                        quote! {
-                            let #name = ::ferrite_kernels::layers::MarlinLinear::load(
-                                gw,
-                                #prefix,
-                                marlin_storage,
-                                __marlin_ws,
-                                __device_id,
-                            )?;
-                        }
-                    } else {
-                        quote! {
-                            let #name = ::ferrite_kernels::layers::MarlinLinear::load_concat(
-                                gw,
-                                &[ #(#prefixes),* ],
-                                marlin_storage,
-                                __marlin_ws,
-                                __device_id,
-                            )?;
-                        }
-                    }
-                }
-                FieldLoad::Fp8Linear { prefixes } => {
-                    if prefixes.len() == 1 {
-                        let prefix = &prefixes[0];
-                        quote! {
-                            let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
-                                ::ferrite_kernels::layers::Fp8Linear::load(
-                                    gw,
-                                    #prefix,
-                                    __fp8_dtype,
-                                )?
-                            );
-                        }
-                    } else {
-                        quote! {
-                            let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
-                                ::ferrite_kernels::layers::Fp8Linear::load_concat(
-                                    gw,
-                                    &[ #(#prefixes),* ],
-                                    __fp8_dtype,
-                                )?
-                            );
-                        }
-                    }
-                }
-                FieldLoad::Fp8BlockLinear { prefixes } => {
-                    if prefixes.len() == 1 {
-                        let prefix = &prefixes[0];
-                        quote! {
-                            let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Block(
-                                ::ferrite_kernels::layers::Fp8BlockLinear::load(
-                                    gw,
-                                    #prefix,
-                                    __fp8_dtype,
-                                )?
-                            );
-                        }
-                    } else {
-                        quote! {
-                            let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Block(
-                                ::ferrite_kernels::layers::Fp8BlockLinear::load_concat(
-                                    gw,
-                                    &[ #(#prefixes),* ],
-                                    __fp8_dtype,
-                                )?
-                            );
-                        }
-                    }
-                }
-                FieldLoad::Bnb4Linear {
-                    prefixes,
-                    out_features_per_shard,
-                    in_features,
-                    blocksize,
-                } => {
-                    let in_features = *in_features as usize;
-                    let blocksize = *blocksize as usize;
-                    let outs: Vec<proc_macro2::Literal> = out_features_per_shard
-                        .iter()
-                        .map(|o| proc_macro2::Literal::usize_unsuffixed(*o as usize))
-                        .collect();
-                    if prefixes.len() == 1 {
-                        let prefix = &prefixes[0];
-                        let out = &outs[0];
-                        quote! {
-                            let #name = ::ferrite_kernels::layers::Bnb4bitLinear::load(
-                                gw,
-                                #prefix,
-                                __bnb_code,
-                                __bnb_scratch,
-                                #out,
-                                #in_features,
-                                #blocksize,
-                            )?;
-                        }
-                    } else {
-                        quote! {
-                            let #name = ::ferrite_kernels::layers::Bnb4bitLinear::load_concat(
-                                gw,
-                                &[ #(#prefixes),* ],
-                                __bnb_code,
-                                __bnb_scratch,
-                                &[ #(#outs),* ],
-                                #in_features,
-                                #blocksize,
-                            )?;
-                        }
-                    }
-                }
-                FieldLoad::DeepSeekV2Moe {
-                    prefix,
-                    n_routed_experts,
-                    n_shared_experts,
-                    top_k,
-                    moe_intermediate_size,
-                    hidden_size,
-                    norm_topk_prob,
-                    routed_scaling_factor,
-                    use_sigmoid,
-                    n_expert_group,
-                    topk_group,
-                } => {
-                    let n_routed_experts = *n_routed_experts;
-                    let n_shared_experts = *n_shared_experts;
-                    let top_k = *top_k;
-                    let moe_intermediate_size = *moe_intermediate_size;
-                    let hidden_size = *hidden_size;
-                    let norm_topk_prob = *norm_topk_prob;
-                    let routed_scaling_factor = *routed_scaling_factor;
-                    let use_sigmoid = *use_sigmoid;
-                    let n_expert_group = *n_expert_group;
-                    let topk_group = *topk_group;
-                    quote! {
-                        let #name = ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer::load(
-                            gw,
-                            #prefix,
-                            #n_routed_experts,
-                            #n_shared_experts,
-                            #top_k,
-                            #moe_intermediate_size,
-                            #hidden_size,
-                            #norm_topk_prob,
-                            #routed_scaling_factor,
-                            #use_sigmoid,
-                            #n_expert_group,
-                            #topk_group,
-                            stream,
-                        )?;
-                    }
-                }
-            }
-        })
+        .map(|(a, p)| (a.name.to_string(), p))
+        .collect();
+
+    let lets: Vec<TokenStream> = groups
+        .iter()
+        .map(|g| emit_group_let(g, &plan_by_name, model))
         .collect();
 
     // Shared-per-model Marlin prelude: one workspace allocation
@@ -1660,8 +1516,11 @@ fn emit_weights_struct(
     };
 
     // `Self { a, b, c }` shorthand — fields are the just-bound
-    // locals, in the same order we declared the struct fields.
-    let field_shorthand: Vec<&syn::Ident> = accessors.iter().map(|a| &a.name).collect();
+    // locals (one per group, layered groups bound as `Vec<T>`).
+    let field_shorthand: Vec<syn::Ident> = groups
+        .iter()
+        .map(|g| syn::Ident::new(&g.base, proc_macro2::Span::call_site()))
+        .collect();
     let fingerprint_method = emit_fingerprint_check(model, manifest);
 
     // Detect whether this arch uses `rotary_local` (dual-rotary,
@@ -2185,36 +2044,68 @@ pub(crate) fn split_base_layer(field_name: &str) -> (String, Option<u64>) {
     (field_name.to_string(), None)
 }
 
-/// Emit one accessor method per base name on the per-arch `Weights`
-/// struct. Layered bases (`input_layernorm_0`, `input_layernorm_1`,
-/// …) collapse into one `pub fn input_layernorm(&self, layer: u32) ->
-/// &RmsNorm` whose body matches on `layer` and returns `&self.<field>`
-/// for the corresponding generated field. Non-layered bases get the
-/// same signature for caller uniformity; the body returns
-/// `&self.<field>` and ignores the layer arg.
+/// One row in the per-arch `Weights` shape: either a single
+/// arch-wide field (`embed_tokens`, `lm_head`, the final norm) or a
+/// per-layer family compressed into a single `Vec<T>` field. The
+/// field/struct emit, the `impl Weights` accessor methods, and the
+/// `load_with` body all walk the same group list so they stay in
+/// sync — one Vec field, one slice-indexing accessor, one Vec-build
+/// per layered base.
+pub(crate) struct AccessorGroup<'a> {
+    /// Field name on `Weights` — the accessor's stem with the
+    /// `_<layer>` suffix stripped. Stays a plain `String` because
+    /// callers also need it as a runtime format-string fragment.
+    pub base: String,
+    /// Shared element type. For layered groups this is the `T` in
+    /// `Vec<T>`; for unindexed it's the field type as-is.
+    pub rust_type: TokenStream,
+    /// `true` ⇒ field is `Vec<T>`, accessor method is
+    /// `&self.<base>[layer as usize]`, load body emits a Vec-build.
+    /// `false` ⇒ field is `T`, accessor method ignores its `layer`
+    /// arg, load body keeps the existing per-FieldLoad let.
+    pub layered: bool,
+    /// `entries[i].0`: layer index. `Some(i)` for layered groups,
+    /// always `None` for unindexed. Layered groups are guaranteed
+    /// to occupy layers `0..entries.len()` contiguously — the load
+    /// body relies on this so `(0..N).map(...).collect()` rebuilds
+    /// the same per-layer entries the prior per-layer-let codegen
+    /// produced.
+    pub entries: Vec<(Option<u64>, &'a WeightAccessor)>,
+}
+
+/// Group `accessors` by their `(base, layer)` split. Layered
+/// groups (every entry's name ends in `_<digits>` under the same
+/// stem) collapse into one `AccessorGroup { layered: true }` whose
+/// `entries` are sorted by layer index and required to be
+/// contiguous from 0 to N-1. Unindexed accessors (no trailing
+/// `_<digits>`) become single-entry layered=false groups.
 ///
-/// Returns an `impl Weights { ... }` block. Empty (zero accessors)
-/// is fine — the impl block is then empty.
-fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
+/// Panics on:
+/// - a base mixing layered and unindexed entries;
+/// - a base whose entries declare conflicting `rust_type`s;
+/// - a base whose layered entries skip an index (e.g. only
+///   layers 0/1/3 — codegen has no defined behavior for sparse
+///   per-layer fields).
+pub(crate) fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<AccessorGroup<'_>> {
     use std::collections::BTreeMap;
 
-    struct Spec {
+    struct Bucket<'a> {
         rust_type: TokenStream,
         rust_type_str: String,
-        by_layer: BTreeMap<u64, syn::Ident>,
-        nonlayered: Option<syn::Ident>,
+        layered_entries: BTreeMap<u64, &'a WeightAccessor>,
+        unindexed: Option<&'a WeightAccessor>,
     }
 
-    let mut by_base: BTreeMap<String, Spec> = BTreeMap::new();
+    let mut by_base: BTreeMap<String, Bucket<'_>> = BTreeMap::new();
     for acc in accessors {
         let full = acc.name.to_string();
         let (base, layer) = split_base_layer(&full);
         let ty_str = acc.rust_type.to_string();
-        let entry = by_base.entry(base.clone()).or_insert_with(|| Spec {
+        let entry = by_base.entry(base.clone()).or_insert_with(|| Bucket {
             rust_type: acc.rust_type.clone(),
             rust_type_str: ty_str.clone(),
-            by_layer: BTreeMap::new(),
-            nonlayered: None,
+            layered_entries: BTreeMap::new(),
+            unindexed: None,
         });
         if entry.rust_type_str != ty_str {
             panic!(
@@ -2225,62 +2116,652 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
         }
         match layer {
             Some(n) => {
-                entry.by_layer.insert(n, acc.name.clone());
+                if entry.layered_entries.insert(n, acc).is_some() {
+                    panic!("Weights accessor base `{base}` has duplicate layer index {n}",);
+                }
             }
             None => {
-                entry.nonlayered = Some(acc.name.clone());
+                if entry.unindexed.is_some() {
+                    panic!("Weights accessor base `{base}` has multiple unindexed entries",);
+                }
+                entry.unindexed = Some(acc);
             }
         }
     }
 
-    let methods: Vec<TokenStream> = by_base
+    by_base
+        .into_iter()
+        .map(|(base, bucket)| {
+            match (bucket.unindexed, bucket.layered_entries.is_empty()) {
+                (Some(acc), true) => AccessorGroup {
+                    base,
+                    rust_type: bucket.rust_type,
+                    layered: false,
+                    entries: vec![(None, acc)],
+                },
+                (None, false) => {
+                    // Contiguity check: layered entries must occupy
+                    // layers 0..N. Sparse layered groups have no
+                    // defined Vec-build shape; reject at codegen.
+                    let n = bucket.layered_entries.len() as u64;
+                    let layers: Vec<u64> = bucket.layered_entries.keys().copied().collect();
+                    if layers.first().copied() != Some(0) {
+                        panic!(
+                            "Weights accessor base `{base}` layered entries don't start at \
+                             layer 0 (first layer = {:?})",
+                            layers.first(),
+                        );
+                    }
+                    for (i, l) in layers.iter().enumerate() {
+                        if *l != i as u64 {
+                            panic!(
+                                "Weights accessor base `{base}` layered entries are not \
+                                 contiguous: expected layer {i}, found {l}",
+                            );
+                        }
+                    }
+                    let entries: Vec<(Option<u64>, &WeightAccessor)> = (0..n)
+                        .map(|l| (Some(l), bucket.layered_entries[&l]))
+                        .collect();
+                    AccessorGroup {
+                        base,
+                        rust_type: bucket.rust_type,
+                        layered: true,
+                        entries,
+                    }
+                }
+                _ => panic!("Weights accessor base `{base}` mixes layered and non-layered fields",),
+            }
+        })
+        .collect()
+}
+
+/// Convert an L=0-baked safetensors prefix (e.g.
+/// `"model.layers.0.input_layernorm"`) into a TokenStream that
+/// evaluates to a runtime `String` for the layer in scope. The
+/// emitted tokens reference a local `layer: u32` binding the
+/// caller plants in scope (the closure arg of the Vec-build).
+///
+/// Panics if the prefix doesn't carry a `model.layers.0.` prefix
+/// — every layered accessor's L=0 prefix does (see
+/// [`safetensors_prefix`]); reaching the panic means a fused
+/// accessor's source weight wasn't actually layered, which would
+/// be a bug in `default_required_weights` / the impl's
+/// `required_weights`.
+fn layer_templated_prefix_expr(layer0_prefix: &str) -> TokenStream {
+    if let Some(tail) = layer0_prefix.strip_prefix("model.layers.0.") {
+        let template = format!("model.layers.{{}}.{tail}");
+        quote! { ::std::format!(#template, layer) }
+    } else if layer0_prefix == "model.layers.0" {
+        quote! { ::std::format!("model.layers.{}", layer) }
+    } else {
+        panic!(
+            "layered accessor's L=0 prefix `{layer0_prefix}` doesn't \
+             start with `model.layers.0` — codegen invariant violated"
+        );
+    }
+}
+
+/// Helper for the multi-prefix `*_concat` load arms in
+/// [`emit_layered_load_body`]. Returns `(binds, refs)` where
+/// `binds` is a list of `let __p_<i>: String = format!(…);`
+/// statements and `refs` is the matching list of `__p_<i>.as_str()`
+/// expressions. Caller wraps `binds` + the kernel call in a `{ … }`
+/// block so the bindings outlive the `&[&str]` borrow.
+///
+/// Why bind-then-borrow: `&format!()` is `&String`, and a literal
+/// `&[&format!(...), …]` builds `[&String; N]`, which does NOT
+/// coerce to `&[&str]`. Threading through a named local lets the
+/// Rust compiler do `String → &str` deref-coercion at the call
+/// site.
+fn layer_templated_prefix_array(
+    layer0_prefixes: &[String],
+) -> (Vec<TokenStream>, Vec<TokenStream>) {
+    let mut binds = Vec::with_capacity(layer0_prefixes.len());
+    let mut refs = Vec::with_capacity(layer0_prefixes.len());
+    for (i, p0) in layer0_prefixes.iter().enumerate() {
+        let p = layer_templated_prefix_expr(p0);
+        let local = format_ident!("__p_{}", i);
+        binds.push(quote! {
+            let #local: ::std::string::String = #p;
+        });
+        refs.push(quote! { #local.as_str() });
+    }
+    (binds, refs)
+}
+
+/// Emit the unindexed accessor's let-binding (kept as the
+/// existing per-FieldLoad shape — the prefix is a baked `&str`
+/// literal, so no runtime `format!` machinery is needed). The
+/// returned tokens include the trailing `;` and the leading
+/// `let #name = …`.
+fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad) -> TokenStream {
+    match plan {
+        FieldLoad::Embedding(prefix) => quote! {
+            let #name = ::ferrite_kernels::layers::Embedding::load(gw, #prefix)?;
+        },
+        FieldLoad::RmsNorm(prefix, eps) => quote! {
+            let #name = ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?;
+        },
+        FieldLoad::CohereLayerNorm(prefix, eps) => quote! {
+            let #name = ::ferrite_kernels::layers::CohereLayerNorm::load(
+                gw, #prefix, #eps,
+            )?;
+        },
+        FieldLoad::LinearDense(prefix) => quote! {
+            let #name = ::ferrite_kernels::layers::LinearLayer::load_dense(gw, #prefix)?;
+        },
+        FieldLoad::LinearConcat(prefixes) => quote! {
+            let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat(
+                gw,
+                &[ #(#prefixes),* ],
+                stream,
+            )?;
+        },
+        FieldLoad::LinearTiedToEmbedding(embed_ident) => quote! {
+            // Tied embedding: lm_head reuses the
+            // `#embed_ident` field's weight tensor. Shape
+            // [vocab_size, hidden_size] works for both
+            // Embedding (gather rows) and LinearLayer
+            // (matmul against hidden_size). No bias.
+            let #name = ::ferrite_kernels::layers::LinearLayer::Dense(
+                ::ferrite_kernels::layers::Linear::new(
+                    #embed_ident.weight,
+                    None,
+                )
+            );
+        },
+        FieldLoad::MarlinLinear { prefixes, .. } => {
+            // Every Marlin accessor emits the SAME call shape
+            // regardless of AWQ/GPTQ/CT: the runtime
+            // `MarlinFormat` discriminator is threaded in from
+            // `load_with`'s `marlin_storage` param. That's what
+            // lets cross-variant load-body dedup collapse
+            // AWQ/GPTQ/CT variants of the same (arch, size) to
+            // one canonical `load_with` body.
+            if prefixes.len() == 1 {
+                let prefix = &prefixes[0];
+                quote! {
+                    let #name = ::ferrite_kernels::layers::MarlinLinear::load(
+                        gw,
+                        #prefix,
+                        marlin_storage,
+                        __marlin_ws,
+                        __device_id,
+                    )?;
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::MarlinLinear::load_concat(
+                        gw,
+                        &[ #(#prefixes),* ],
+                        marlin_storage,
+                        __marlin_ws,
+                        __device_id,
+                    )?;
+                }
+            }
+        }
+        FieldLoad::Fp8Linear { prefixes } => {
+            if prefixes.len() == 1 {
+                let prefix = &prefixes[0];
+                quote! {
+                    let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
+                        ::ferrite_kernels::layers::Fp8Linear::load(
+                            gw,
+                            #prefix,
+                            __fp8_dtype,
+                        )?
+                    );
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
+                        ::ferrite_kernels::layers::Fp8Linear::load_concat(
+                            gw,
+                            &[ #(#prefixes),* ],
+                            __fp8_dtype,
+                        )?
+                    );
+                }
+            }
+        }
+        FieldLoad::Fp8BlockLinear { prefixes } => {
+            if prefixes.len() == 1 {
+                let prefix = &prefixes[0];
+                quote! {
+                    let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Block(
+                        ::ferrite_kernels::layers::Fp8BlockLinear::load(
+                            gw,
+                            #prefix,
+                            __fp8_dtype,
+                        )?
+                    );
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Block(
+                        ::ferrite_kernels::layers::Fp8BlockLinear::load_concat(
+                            gw,
+                            &[ #(#prefixes),* ],
+                            __fp8_dtype,
+                        )?
+                    );
+                }
+            }
+        }
+        FieldLoad::Bnb4Linear {
+            prefixes,
+            out_features_per_shard,
+            in_features,
+            blocksize,
+        } => {
+            let in_features = *in_features as usize;
+            let blocksize = *blocksize as usize;
+            let outs: Vec<proc_macro2::Literal> = out_features_per_shard
+                .iter()
+                .map(|o| proc_macro2::Literal::usize_unsuffixed(*o as usize))
+                .collect();
+            if prefixes.len() == 1 {
+                let prefix = &prefixes[0];
+                let out = &outs[0];
+                quote! {
+                    let #name = ::ferrite_kernels::layers::Bnb4bitLinear::load(
+                        gw,
+                        #prefix,
+                        __bnb_code,
+                        __bnb_scratch,
+                        #out,
+                        #in_features,
+                        #blocksize,
+                    )?;
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::Bnb4bitLinear::load_concat(
+                        gw,
+                        &[ #(#prefixes),* ],
+                        __bnb_code,
+                        __bnb_scratch,
+                        &[ #(#outs),* ],
+                        #in_features,
+                        #blocksize,
+                    )?;
+                }
+            }
+        }
+        FieldLoad::DeepSeekV2Moe {
+            prefix,
+            n_routed_experts,
+            n_shared_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+            routed_scaling_factor,
+            use_sigmoid,
+            n_expert_group,
+            topk_group,
+        } => {
+            let n_routed_experts = *n_routed_experts;
+            let n_shared_experts = *n_shared_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            let routed_scaling_factor = *routed_scaling_factor;
+            let use_sigmoid = *use_sigmoid;
+            let n_expert_group = *n_expert_group;
+            let topk_group = *topk_group;
+            quote! {
+                let #name = ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer::load(
+                    gw,
+                    #prefix,
+                    #n_routed_experts,
+                    #n_shared_experts,
+                    #top_k,
+                    #moe_intermediate_size,
+                    #hidden_size,
+                    #norm_topk_prob,
+                    #routed_scaling_factor,
+                    #use_sigmoid,
+                    #n_expert_group,
+                    #topk_group,
+                    stream,
+                )?;
+            }
+        }
+    }
+}
+
+/// Emit the let-binding for one [`AccessorGroup`]. Layered
+/// groups become a single `let <base>: Vec<T> = (0..N).map(|layer|
+/// { … }).collect()?;`. Unindexed groups defer to
+/// [`emit_unindexed_let`].
+///
+/// All entries in a layered group share the same `FieldLoad`
+/// shape (modulo the layer-substituted prefixes), so we plan
+/// from the layer-0 accessor and derive the per-iteration body
+/// via [`emit_layered_load_body`]. `plans` is the lookup the
+/// caller passed in; reading the FieldLoad here keeps `model` /
+/// `manifest` plumbing local to `emit_weights_struct`.
+fn emit_group_let(
+    group: &AccessorGroup<'_>,
+    plans: &std::collections::BTreeMap<String, &FieldLoad>,
+    model: &ModelParams,
+) -> TokenStream {
+    let base_ident = syn::Ident::new(&group.base, proc_macro2::Span::call_site());
+    if !group.layered {
+        let acc = group.entries[0].1;
+        let plan = plans
+            .get(&acc.name.to_string())
+            .copied()
+            .expect("unindexed accessor missing from plan map");
+        return emit_unindexed_let(&base_ident, plan);
+    }
+
+    // Plan from the first entry (layer 0). All layered entries
+    // share this plan modulo prefix; emit_layered_load_body
+    // rewrites the baked layer-0 prefix(es) into runtime
+    // format!() calls that reference the closure's `layer: u32`.
+    let l0 = group.entries[0].1;
+    let plan = plans
+        .get(&l0.name.to_string())
+        .copied()
+        .expect("layered group's layer-0 accessor missing from plan map");
+    let body = emit_layered_load_body(plan);
+    let ty = &group.rust_type;
+    let n_layers = group.entries.len();
+    let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers as u32);
+    // `num_hidden_layers` from model.bounds is the source of truth
+    // for the layered-group length on transformer archs; we assert
+    // they agree so a stale group (e.g. accessor that fell out of
+    // a kernel migration) fails loudly at codegen time rather than
+    // silently producing the wrong-shaped Vec.
+    if let Some(declared) = model.bounds.get("num_hidden_layers")
+        && (*declared as usize) != n_layers
+    {
+        panic!(
+            "model `{}`: layered accessor base `{}` has {} entries but \
+             num_hidden_layers = {} — accessor + config disagree",
+            model.source_stem, group.base, n_layers, declared,
+        );
+    }
+    quote! {
+        let #base_ident: ::std::vec::Vec<#ty> = (0u32..#n_lit)
+            .map(|layer: u32| -> ::anyhow::Result<#ty> { #body })
+            .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?;
+    }
+}
+
+/// Emit the per-iteration kernel-call expression for a layered
+/// accessor's Vec build. `plan` is the `FieldLoad` computed at
+/// layer 0; this rewrites its baked prefix(es) into runtime
+/// `format!()` calls that reference the closure's `layer: u32`
+/// binding. Returns a `Result<#ty>` expression; the caller wraps
+/// it in `(0..N).map(|layer| { … }).collect::<Result<Vec<_>>>()?`.
+///
+/// `LinearTiedToEmbedding` is unreachable here — tied embedding
+/// only attaches to the `lm_head` accessor, which is unindexed.
+fn emit_layered_load_body(plan: &FieldLoad) -> TokenStream {
+    match plan {
+        FieldLoad::Embedding(prefix) => {
+            let p = layer_templated_prefix_expr(prefix);
+            quote! {
+                ::ferrite_kernels::layers::Embedding::load(gw, &#p)
+            }
+        }
+        FieldLoad::RmsNorm(prefix, eps) => {
+            let p = layer_templated_prefix_expr(prefix);
+            quote! {
+                ::ferrite_kernels::layers::RmsNorm::load(gw, &#p, #eps)
+            }
+        }
+        FieldLoad::CohereLayerNorm(prefix, eps) => {
+            let p = layer_templated_prefix_expr(prefix);
+            quote! {
+                ::ferrite_kernels::layers::CohereLayerNorm::load(gw, &#p, #eps)
+            }
+        }
+        FieldLoad::LinearDense(prefix) => {
+            let p = layer_templated_prefix_expr(prefix);
+            quote! {
+                ::ferrite_kernels::layers::LinearLayer::load_dense(gw, &#p)
+            }
+        }
+        FieldLoad::LinearConcat(prefixes) => {
+            let (binds, refs) = layer_templated_prefix_array(prefixes);
+            quote! {
+                {
+                    #(#binds)*
+                    ::ferrite_kernels::layers::LinearLayer::load_dense_concat(
+                        gw,
+                        &[ #(#refs),* ],
+                        stream,
+                    )
+                }
+            }
+        }
+        FieldLoad::LinearTiedToEmbedding(_) => panic!(
+            "LinearTiedToEmbedding is only ever used for the unindexed \
+             `lm_head` accessor — should never appear in a layered group"
+        ),
+        FieldLoad::MarlinLinear { prefixes, .. } => {
+            if prefixes.len() == 1 {
+                let p = layer_templated_prefix_expr(&prefixes[0]);
+                quote! {
+                    ::ferrite_kernels::layers::MarlinLinear::load(
+                        gw,
+                        &#p,
+                        marlin_storage,
+                        __marlin_ws,
+                        __device_id,
+                    )
+                }
+            } else {
+                let (binds, refs) = layer_templated_prefix_array(prefixes);
+                quote! {
+                    {
+                        #(#binds)*
+                        ::ferrite_kernels::layers::MarlinLinear::load_concat(
+                            gw,
+                            &[ #(#refs),* ],
+                            marlin_storage,
+                            __marlin_ws,
+                            __device_id,
+                        )
+                    }
+                }
+            }
+        }
+        FieldLoad::Fp8Linear { prefixes } => {
+            if prefixes.len() == 1 {
+                let p = layer_templated_prefix_expr(&prefixes[0]);
+                quote! {
+                    ::ferrite_kernels::layers::Fp8Linear::load(
+                        gw,
+                        &#p,
+                        __fp8_dtype,
+                    ).map(::ferrite_kernels::layers::Fp8AnyLinear::Std)
+                }
+            } else {
+                let (binds, refs) = layer_templated_prefix_array(prefixes);
+                quote! {
+                    {
+                        #(#binds)*
+                        ::ferrite_kernels::layers::Fp8Linear::load_concat(
+                            gw,
+                            &[ #(#refs),* ],
+                            __fp8_dtype,
+                        ).map(::ferrite_kernels::layers::Fp8AnyLinear::Std)
+                    }
+                }
+            }
+        }
+        FieldLoad::Fp8BlockLinear { prefixes } => {
+            if prefixes.len() == 1 {
+                let p = layer_templated_prefix_expr(&prefixes[0]);
+                quote! {
+                    ::ferrite_kernels::layers::Fp8BlockLinear::load(
+                        gw,
+                        &#p,
+                        __fp8_dtype,
+                    ).map(::ferrite_kernels::layers::Fp8AnyLinear::Block)
+                }
+            } else {
+                let (binds, refs) = layer_templated_prefix_array(prefixes);
+                quote! {
+                    {
+                        #(#binds)*
+                        ::ferrite_kernels::layers::Fp8BlockLinear::load_concat(
+                            gw,
+                            &[ #(#refs),* ],
+                            __fp8_dtype,
+                        ).map(::ferrite_kernels::layers::Fp8AnyLinear::Block)
+                    }
+                }
+            }
+        }
+        FieldLoad::Bnb4Linear {
+            prefixes,
+            out_features_per_shard,
+            in_features,
+            blocksize,
+        } => {
+            let in_features = *in_features as usize;
+            let blocksize = *blocksize as usize;
+            let outs: Vec<proc_macro2::Literal> = out_features_per_shard
+                .iter()
+                .map(|o| proc_macro2::Literal::usize_unsuffixed(*o as usize))
+                .collect();
+            if prefixes.len() == 1 {
+                let p = layer_templated_prefix_expr(&prefixes[0]);
+                let out = &outs[0];
+                quote! {
+                    ::ferrite_kernels::layers::Bnb4bitLinear::load(
+                        gw,
+                        &#p,
+                        __bnb_code,
+                        __bnb_scratch,
+                        #out,
+                        #in_features,
+                        #blocksize,
+                    )
+                }
+            } else {
+                let (binds, refs) = layer_templated_prefix_array(prefixes);
+                quote! {
+                    {
+                        #(#binds)*
+                        ::ferrite_kernels::layers::Bnb4bitLinear::load_concat(
+                            gw,
+                            &[ #(#refs),* ],
+                            __bnb_code,
+                            __bnb_scratch,
+                            &[ #(#outs),* ],
+                            #in_features,
+                            #blocksize,
+                        )
+                    }
+                }
+            }
+        }
+        FieldLoad::DeepSeekV2Moe {
+            prefix,
+            n_routed_experts,
+            n_shared_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+            routed_scaling_factor,
+            use_sigmoid,
+            n_expert_group,
+            topk_group,
+        } => {
+            let p = layer_templated_prefix_expr(prefix);
+            let n_routed_experts = *n_routed_experts;
+            let n_shared_experts = *n_shared_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            let routed_scaling_factor = *routed_scaling_factor;
+            let use_sigmoid = *use_sigmoid;
+            let n_expert_group = *n_expert_group;
+            let topk_group = *topk_group;
+            quote! {
+                ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer::load(
+                    gw,
+                    &#p,
+                    #n_routed_experts,
+                    #n_shared_experts,
+                    #top_k,
+                    #moe_intermediate_size,
+                    #hidden_size,
+                    #norm_topk_prob,
+                    #routed_scaling_factor,
+                    #use_sigmoid,
+                    #n_expert_group,
+                    #topk_group,
+                    stream,
+                )
+            }
+        }
+    }
+}
+
+/// Emit one accessor method per base name on the per-arch `Weights`
+/// struct. Layered bases (`input_layernorm_0`, `input_layernorm_1`,
+/// …) — backed by a single `Vec<T>` field — produce
+/// `pub fn input_layernorm(&self, layer: u32) -> &RmsNorm { &self.input_layernorm[layer as usize] }`.
+/// Non-layered bases get the same signature for caller uniformity;
+/// the body returns `&self.<base>` and ignores the layer arg.
+///
+/// Compresses what used to be a 40-arm `match layer` per accessor
+/// into a single slice index — the 578-line `impl Weights { … }`
+/// block on commandr collapses to ~50 lines, and llama's 28k-line
+/// equivalent collapses by the same proportion.
+///
+/// Returns an `impl Weights { ... }` block. Empty (zero accessors)
+/// is fine — the impl block is then elided entirely.
+fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
+    let groups = group_accessors_by_base(accessors);
+    if groups.is_empty() {
+        return quote! {};
+    }
+    let methods: Vec<TokenStream> = groups
         .iter()
-        .map(|(base, spec)| {
-            let base_ident = syn::Ident::new(base, proc_macro2::Span::call_site());
-            let ty = &spec.rust_type;
-            match (&spec.nonlayered, spec.by_layer.is_empty()) {
-                (Some(field), true) => quote! {
+        .map(|g| {
+            let base_ident = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
+            let ty = &g.rust_type;
+            if g.layered {
+                quote! {
+                    #[cfg(feature = "cuda")]
+                    #[inline]
+                    #[allow(dead_code)]
+                    pub fn #base_ident(&self, layer: u32) -> &#ty {
+                        // Slice index, no bounds check — codegen
+                        // guarantees `layer < N` because every
+                        // static-slice row carries a literal
+                        // `layer:` field minted from the same
+                        // per-arch fan_out pass and Op::Loop only
+                        // iterates 0..num_hidden_layers.
+                        unsafe { self.#base_ident.get_unchecked(layer as usize) }
+                    }
+                }
+            } else {
+                quote! {
                     #[cfg(feature = "cuda")]
                     #[inline]
                     #[allow(dead_code)]
                     pub fn #base_ident(&self, _layer: u32) -> &#ty {
-                        &self.#field
-                    }
-                },
-                (None, false) => {
-                    let arms: Vec<TokenStream> = spec
-                        .by_layer
-                        .iter()
-                        .map(|(layer, fname)| {
-                            let lit = proc_macro2::Literal::u32_unsuffixed(*layer as u32);
-                            quote! { #lit => &self.#fname, }
-                        })
-                        .collect();
-                    quote! {
-                        #[cfg(feature = "cuda")]
-                        #[inline]
-                        #[allow(dead_code)]
-                        pub fn #base_ident(&self, layer: u32) -> &#ty {
-                            match layer {
-                                #(#arms)*
-                                // Codegen guarantees `layer` is one of the
-                                // emitted indices — every static-slice row
-                                // carries a literal `layer:` field minted
-                                // from the same per-arch fan_out pass.
-                                _ => unsafe { ::core::hint::unreachable_unchecked() },
-                            }
-                        }
+                        &self.#base_ident
                     }
                 }
-                _ => panic!("Weights accessor base `{base}` mixes layered and non-layered fields"),
             }
         })
         .collect();
-
-    if methods.is_empty() {
-        return quote! {};
-    }
-
     quote! {
         #[cfg(feature = "cuda")]
         impl Weights {
@@ -3058,10 +3539,13 @@ mod tests {
     }
 
     #[test]
-    fn accessor_methods_collapse_per_layer_fields_into_one_method() {
-        // Three layers' worth of `input_layernorm_<n>` fields should
-        // produce one `pub fn input_layernorm(&self, layer: u32) ->
-        // &RmsNorm` with three match arms.
+    fn accessor_methods_compress_layered_fields_to_slice_index() {
+        // Three layers' worth of `input_layernorm_<n>` fields collapse
+        // into ONE `pub fn input_layernorm(&self, layer: u32) ->
+        // &RmsNorm` whose body is a single slice index — no per-layer
+        // arms, no 40-arm match. This is the load-bearing invariant
+        // for the impl Weights compression: 40 arms × 5+ accessors
+        // worth of Rust tokens disappear.
         let ty: TokenStream = quote! { ::ferrite_kernels::layers::RmsNorm };
         let accessors = (0u64..3)
             .map(|n| WeightAccessor {
@@ -3071,17 +3555,21 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let ts = emit_weights_accessor_methods(&accessors).to_string();
-        // One impl, one fn, three arms (0/1/2 → &self.input_layernorm_<n>).
         assert!(ts.contains("impl Weights"));
         assert!(ts.contains("fn input_layernorm"));
         assert!(ts.contains("layer : u32"));
-        assert!(ts.contains("& self . input_layernorm_0"));
-        assert!(ts.contains("& self . input_layernorm_1"));
-        assert!(ts.contains("& self . input_layernorm_2"));
-        // The catch-all is `unreachable_unchecked()` — codegen
-        // guarantees `layer` is one of the registered indices, so no
-        // runtime panic, no format-args bloat in the expanded crate.
-        assert!(ts.contains("unreachable_unchecked"));
+        // Single slice index — no match arm bloat. The body is
+        // `unsafe { self.input_layernorm.get_unchecked(layer as usize) }`.
+        assert!(ts.contains("self . input_layernorm . get_unchecked"));
+        assert!(ts.contains("layer as usize"));
+        // No 40-arm match anymore — the per-layer arms are gone.
+        assert!(!ts.contains("match layer"));
+        // No per-layer field references — the data lives in a single
+        // `Vec<T>` field with the base name.
+        assert!(!ts.contains("input_layernorm_0"));
+        assert!(!ts.contains("input_layernorm_1"));
+        assert!(!ts.contains("input_layernorm_2"));
+        // No format-args bloat.
         assert!(!ts.contains("out of range"));
         assert!(!ts.contains("panic"));
     }
@@ -3089,7 +3577,9 @@ mod tests {
     #[test]
     fn accessor_methods_emit_unit_arm_for_unlayered_fields() {
         // `embed_tokens` has no trailing layer index; the method
-        // ignores its layer arg and returns the field directly.
+        // ignores its layer arg and returns the field directly. Same
+        // shape as before the Vec compression — unindexed accessors
+        // never had a match.
         let accessors = vec![WeightAccessor {
             name: format_ident!("embed_tokens"),
             rust_type: quote! { ::ferrite_kernels::layers::Embedding },
@@ -3100,8 +3590,9 @@ mod tests {
         assert!(ts.contains("_layer : u32"));
         assert!(ts.contains("& self . embed_tokens"));
         // No `match` block for non-layered accessors — the body is
-        // a direct field reference, branchless.
+        // a direct field reference, branchless. No slice index either.
         assert!(!ts.contains("match layer"));
+        assert!(!ts.contains("get_unchecked"));
     }
 
     #[test]
@@ -3153,5 +3644,176 @@ mod tests {
         // would be valid Rust but pointless; the codegen elides it.)
         let ts = emit_weights_accessor_methods(&[]).to_string();
         assert!(ts.is_empty());
+    }
+
+    // ── group_accessors_by_base / Vec compression invariants ────────
+
+    fn ln_acc(layer: Option<u64>) -> WeightAccessor {
+        let name = match layer {
+            Some(n) => format_ident!("input_layernorm_{}", n),
+            None => format_ident!("input_layernorm"),
+        };
+        WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
+            source_weights: vec![],
+        }
+    }
+
+    #[test]
+    fn group_accessors_layered_collapses_to_one_group() {
+        let accs: Vec<_> = (0u64..4).map(|n| ln_acc(Some(n))).collect();
+        let groups = group_accessors_by_base(&accs);
+        assert_eq!(groups.len(), 1, "all 4 layers share one base group");
+        let g = &groups[0];
+        assert_eq!(g.base, "input_layernorm");
+        assert!(g.layered, "all entries are indexed → layered=true");
+        assert_eq!(g.entries.len(), 4);
+        for (i, (layer_opt, _acc)) in g.entries.iter().enumerate() {
+            assert_eq!(*layer_opt, Some(i as u64), "contiguous layers 0..N");
+        }
+    }
+
+    #[test]
+    fn group_accessors_unindexed_is_one_entry_with_none() {
+        let accs = vec![WeightAccessor {
+            name: format_ident!("embed_tokens"),
+            rust_type: quote! { ::ferrite_kernels::layers::Embedding },
+            source_weights: vec![],
+        }];
+        let groups = group_accessors_by_base(&accs);
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!(g.base, "embed_tokens");
+        assert!(!g.layered);
+        assert_eq!(g.entries.len(), 1);
+        assert_eq!(g.entries[0].0, None);
+    }
+
+    #[test]
+    fn group_accessors_orders_groups_alphabetically() {
+        // Order matters: a tied `lm_head` references `embed_tokens`,
+        // so `embed_tokens`'s let-binding must precede `lm_head`'s in
+        // the load body. Alphabetical ordering preserves that without
+        // a special sort.
+        let accs = vec![
+            WeightAccessor {
+                name: format_ident!("lm_head"),
+                rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+                source_weights: vec![],
+            },
+            WeightAccessor {
+                name: format_ident!("embed_tokens"),
+                rust_type: quote! { ::ferrite_kernels::layers::Embedding },
+                source_weights: vec![],
+            },
+            ln_acc(Some(0)),
+            ln_acc(Some(1)),
+        ];
+        let groups = group_accessors_by_base(&accs);
+        let bases: Vec<_> = groups.iter().map(|g| g.base.as_str()).collect();
+        assert_eq!(bases, vec!["embed_tokens", "input_layernorm", "lm_head"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "mixes layered and non-layered")]
+    fn group_accessors_panics_on_mixed_layered_unindexed() {
+        let accs = vec![ln_acc(None), ln_acc(Some(0))];
+        let _ = group_accessors_by_base(&accs);
+    }
+
+    #[test]
+    #[should_panic(expected = "mismatched types")]
+    fn group_accessors_panics_on_type_disagreement() {
+        let accs = vec![
+            WeightAccessor {
+                name: format_ident!("input_layernorm_0"),
+                rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
+                source_weights: vec![],
+            },
+            WeightAccessor {
+                name: format_ident!("input_layernorm_1"),
+                rust_type: quote! { ::ferrite_kernels::layers::CohereLayerNorm },
+                source_weights: vec![],
+            },
+        ];
+        let _ = group_accessors_by_base(&accs);
+    }
+
+    #[test]
+    #[should_panic(expected = "not contiguous")]
+    fn group_accessors_panics_on_sparse_layered_group() {
+        // Sparse layered groups (skipping a layer index) have no
+        // defined Vec-build shape — slot `i` of the Vec needs
+        // entry `i`. Codegen must reject at expansion time.
+        let accs = vec![ln_acc(Some(0)), ln_acc(Some(2))];
+        let _ = group_accessors_by_base(&accs);
+    }
+
+    #[test]
+    #[should_panic(expected = "don't start at layer 0")]
+    fn group_accessors_panics_when_first_layer_is_not_zero() {
+        // A layered group whose lowest index is N>0 doesn't fill
+        // Vec slots 0..N — the slice index would be off by N at every
+        // accessor call. Reject at codegen.
+        let accs = vec![ln_acc(Some(1)), ln_acc(Some(2))];
+        let _ = group_accessors_by_base(&accs);
+    }
+
+    // ── Vec compression: layered prefix templating ──────────────────
+
+    #[test]
+    fn layer_template_replaces_layers_dot_zero_with_runtime_format() {
+        let ts = layer_templated_prefix_expr("model.layers.0.input_layernorm").to_string();
+        assert!(
+            ts.contains("\"model.layers.{}.input_layernorm\""),
+            "expected templated string literal, got: {ts}"
+        );
+        assert!(ts.contains("layer"));
+    }
+
+    #[test]
+    #[should_panic(expected = "doesn't start with `model.layers.0`")]
+    fn layer_template_rejects_unindexed_prefix() {
+        // `lm_head` and `model.embed_tokens` are unindexed prefixes;
+        // they must never reach the layered template helper. A panic
+        // here surfaces a `default_required_weights` bug instead of
+        // silently emitting a malformed Vec build.
+        let _ = layer_templated_prefix_expr("model.embed_tokens");
+    }
+
+    #[test]
+    fn emit_layered_load_body_uses_layer_template_for_rmsnorm() {
+        let plan = FieldLoad::RmsNorm("model.layers.0.input_layernorm".to_string(), 1e-5);
+        let ts = emit_layered_load_body(&plan).to_string();
+        // Calls the kernel layer's load fn,
+        assert!(ts.contains("RmsNorm :: load"));
+        // threads gw + the layer-templated prefix,
+        assert!(ts.contains("\"model.layers.{}.input_layernorm\""));
+        assert!(ts.contains("layer"));
+        // and bakes the static eps literal.
+        assert!(ts.contains("0.00001"));
+    }
+
+    #[test]
+    fn emit_layered_load_body_binds_locals_for_concat_prefixes() {
+        // load_dense_concat takes &[&str], not &[&String]; the helper
+        // must bind each format!() to a String local first and pass
+        // `__p_<i>.as_str()` to materialize the &str slice. Without
+        // the bind step, the generated code wouldn't typecheck.
+        let plan = FieldLoad::LinearConcat(vec![
+            "model.layers.0.self_attn.q_proj".to_string(),
+            "model.layers.0.self_attn.k_proj".to_string(),
+            "model.layers.0.self_attn.v_proj".to_string(),
+        ]);
+        let ts = emit_layered_load_body(&plan).to_string();
+        assert!(ts.contains("load_dense_concat"));
+        assert!(ts.contains("__p_0"));
+        assert!(ts.contains("__p_1"));
+        assert!(ts.contains("__p_2"));
+        assert!(ts.contains(". as_str ()"));
+        assert!(ts.contains("\"model.layers.{}.self_attn.q_proj\""));
+        assert!(ts.contains("\"model.layers.{}.self_attn.k_proj\""));
+        assert!(ts.contains("\"model.layers.{}.self_attn.v_proj\""));
     }
 }

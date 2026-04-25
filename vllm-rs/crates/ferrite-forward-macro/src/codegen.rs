@@ -2010,6 +2010,18 @@ fn emit_weights_struct(
         quote! {}
     };
 
+    // Per-arch accessor methods on `Weights`. Group accessor field
+    // names by stripping any trailing `_<digits>` suffix; for each
+    // base, emit `pub fn <base>(&self, layer: u32) -> &<Ty>` that
+    // matches on the layer index. The host-interpreter's per-arch
+    // enum variants carry `weight_fn: fn(&Weights, u32) -> &Ty`
+    // pointing at one of these methods, so per-claim weight selection
+    // is a const fn-pointer field rather than a baked-in `wm.<field>`
+    // path. Non-layered accessors (no `_<digits>` suffix) get the
+    // same signature for uniformity; their body is `&self.<field>`
+    // and ignores the layer arg.
+    let accessor_methods = emit_weights_accessor_methods(&accessors);
+
     // Struct definition vs type alias per emit mode.
     let weights_def: TokenStream = match &mode {
         WeightsEmitMode::Canonical => quote! {
@@ -2055,6 +2067,8 @@ fn emit_weights_struct(
     match &mode {
         WeightsEmitMode::Canonical => quote! {
             #weights_def
+
+            #accessor_methods
 
             #fingerprint_method
 
@@ -2124,6 +2138,133 @@ fn emit_weights_struct(
                 super::#canonical::load_with(gw, stream, max_model_len, #marlin_fmt)
             }
         },
+    }
+}
+
+/// Split a Weights field name into `(base, layer)` where `layer`
+/// is `Some(n)` if the name ends in `_<digits>` (e.g.
+/// `input_layernorm_3` → `("input_layernorm", Some(3))`) and
+/// `None` for un-suffixed names like `embed_tokens` or `lm_head`.
+///
+/// The trailing-digits rule is the convention `weight_field_name`
+/// has used since the start: `(stem)_(layer_index)` for per-layer
+/// accessors, bare `stem` for arch-wide ones. New accessors must
+/// follow the same rule or the per-arch accessor method codegen
+/// will silently group them as non-layered. (Mixed bases —
+/// e.g. one `input_layernorm` and one `input_layernorm_0` under
+/// the same name root — panic at codegen time.)
+fn split_base_layer(field_name: &str) -> (String, Option<u64>) {
+    if let Some((base, suffix)) = field_name.rsplit_once('_')
+        && !suffix.is_empty()
+        && suffix.chars().all(|c| c.is_ascii_digit())
+        && let Ok(n) = suffix.parse::<u64>()
+    {
+        return (base.to_string(), Some(n));
+    }
+    (field_name.to_string(), None)
+}
+
+/// Emit one accessor method per base name on the per-arch `Weights`
+/// struct. Layered bases (`input_layernorm_0`, `input_layernorm_1`,
+/// …) collapse into one `pub fn input_layernorm(&self, layer: u32) ->
+/// &RmsNorm` whose body matches on `layer` and returns `&self.<field>`
+/// for the corresponding generated field. Non-layered bases get the
+/// same signature for caller uniformity; the body returns
+/// `&self.<field>` and ignores the layer arg.
+///
+/// Returns an `impl Weights { ... }` block. Empty (zero accessors)
+/// is fine — the impl block is then empty.
+fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
+    use std::collections::BTreeMap;
+
+    struct Spec {
+        rust_type: TokenStream,
+        rust_type_str: String,
+        by_layer: BTreeMap<u64, syn::Ident>,
+        nonlayered: Option<syn::Ident>,
+    }
+
+    let mut by_base: BTreeMap<String, Spec> = BTreeMap::new();
+    for acc in accessors {
+        let full = acc.name.to_string();
+        let (base, layer) = split_base_layer(&full);
+        let ty_str = acc.rust_type.to_string();
+        let entry = by_base.entry(base.clone()).or_insert_with(|| Spec {
+            rust_type: acc.rust_type.clone(),
+            rust_type_str: ty_str.clone(),
+            by_layer: BTreeMap::new(),
+            nonlayered: None,
+        });
+        if entry.rust_type_str != ty_str {
+            panic!(
+                "Weights accessor base `{base}` has mismatched types across layers: \
+                 `{}` vs `{ty_str}`",
+                entry.rust_type_str,
+            );
+        }
+        match layer {
+            Some(n) => {
+                entry.by_layer.insert(n, acc.name.clone());
+            }
+            None => {
+                entry.nonlayered = Some(acc.name.clone());
+            }
+        }
+    }
+
+    let methods: Vec<TokenStream> = by_base
+        .iter()
+        .map(|(base, spec)| {
+            let base_ident = syn::Ident::new(base, proc_macro2::Span::call_site());
+            let ty = &spec.rust_type;
+            match (&spec.nonlayered, spec.by_layer.is_empty()) {
+                (Some(field), true) => quote! {
+                    #[cfg(feature = "cuda")]
+                    #[inline]
+                    #[allow(dead_code)]
+                    pub fn #base_ident(&self, _layer: u32) -> &#ty {
+                        &self.#field
+                    }
+                },
+                (None, false) => {
+                    let arms: Vec<TokenStream> = spec
+                        .by_layer
+                        .iter()
+                        .map(|(layer, fname)| {
+                            let lit = proc_macro2::Literal::u32_unsuffixed(*layer as u32);
+                            quote! { #lit => &self.#fname, }
+                        })
+                        .collect();
+                    let base_str = base.clone();
+                    quote! {
+                        #[cfg(feature = "cuda")]
+                        #[inline]
+                        #[allow(dead_code)]
+                        pub fn #base_ident(&self, layer: u32) -> &#ty {
+                            match layer {
+                                #(#arms)*
+                                _ => panic!(
+                                    "Weights::{}: layer index {} out of range",
+                                    #base_str, layer,
+                                ),
+                            }
+                        }
+                    }
+                }
+                _ => panic!("Weights accessor base `{base}` mixes layered and non-layered fields"),
+            }
+        })
+        .collect();
+
+    if methods.is_empty() {
+        return quote! {};
+    }
+
+    quote! {
+        #[cfg(feature = "cuda")]
+        impl Weights {
+            #(#methods)*
+        }
     }
 }
 
@@ -3279,5 +3420,137 @@ fn emit_shim_model(
         pub use super::#canonical::{forward, forward_backbone};
         #[cfg(feature = "cuda")]
         pub use super::#canonical::{#(#bucket_names),*};
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::impl_lib::WeightAccessor;
+    use quote::format_ident;
+
+    #[test]
+    fn split_base_layer_recognizes_layered_and_unlayered_names() {
+        // Layered: trailing _<digits> peels off as the layer index.
+        assert_eq!(
+            split_base_layer("input_layernorm_3"),
+            ("input_layernorm".to_string(), Some(3))
+        );
+        assert_eq!(
+            split_base_layer("self_attn_q_proj_31"),
+            ("self_attn_q_proj".to_string(), Some(31))
+        );
+        // Non-layered: no trailing _<digits>.
+        assert_eq!(
+            split_base_layer("embed_tokens"),
+            ("embed_tokens".to_string(), None)
+        );
+        assert_eq!(split_base_layer("lm_head"), ("lm_head".to_string(), None));
+        // Trailing-non-digit suffix isn't a layer — the whole name
+        // stays as the base.
+        assert_eq!(
+            split_base_layer("rotary_local"),
+            ("rotary_local".to_string(), None)
+        );
+        // Empty trailing chunk after `_` is not a layer either.
+        assert_eq!(
+            split_base_layer("trailing_"),
+            ("trailing_".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn accessor_methods_collapse_per_layer_fields_into_one_method() {
+        // Three layers' worth of `input_layernorm_<n>` fields should
+        // produce one `pub fn input_layernorm(&self, layer: u32) ->
+        // &RmsNorm` with three match arms.
+        let ty: TokenStream = quote! { ::ferrite_kernels::layers::RmsNorm };
+        let accessors = (0u64..3)
+            .map(|n| WeightAccessor {
+                name: format_ident!("input_layernorm_{}", n),
+                rust_type: ty.clone(),
+                source_weights: vec![],
+            })
+            .collect::<Vec<_>>();
+        let ts = emit_weights_accessor_methods(&accessors).to_string();
+        // One impl, one fn, three arms (0/1/2 → &self.input_layernorm_<n>).
+        assert!(ts.contains("impl Weights"));
+        assert!(ts.contains("fn input_layernorm"));
+        assert!(ts.contains("layer : u32"));
+        assert!(ts.contains("& self . input_layernorm_0"));
+        assert!(ts.contains("& self . input_layernorm_1"));
+        assert!(ts.contains("& self . input_layernorm_2"));
+        // No catch-all that silently picks layer 0 — we panic on
+        // out-of-range to surface drop-pass / solver bugs early.
+        assert!(ts.contains("out of range"));
+    }
+
+    #[test]
+    fn accessor_methods_emit_unit_arm_for_unlayered_fields() {
+        // `embed_tokens` has no trailing layer index; the method
+        // ignores its layer arg and returns the field directly.
+        let accessors = vec![WeightAccessor {
+            name: format_ident!("embed_tokens"),
+            rust_type: quote! { ::ferrite_kernels::layers::Embedding },
+            source_weights: vec![],
+        }];
+        let ts = emit_weights_accessor_methods(&accessors).to_string();
+        assert!(ts.contains("fn embed_tokens"));
+        assert!(ts.contains("_layer : u32"));
+        assert!(ts.contains("& self . embed_tokens"));
+        // No `match` block for non-layered accessors — the body is
+        // a direct field reference, branchless.
+        assert!(!ts.contains("match layer"));
+    }
+
+    #[test]
+    #[should_panic(expected = "mixes layered and non-layered")]
+    fn accessor_methods_panic_on_mixed_layered_and_unlayered() {
+        // Pathological: an accessor base with both an indexed and
+        // an un-indexed field. Codegen must refuse — there's no
+        // sensible single method body for the mix, and silently
+        // picking one would mask a solver / Impl bug.
+        let ty: TokenStream = quote! { ::ferrite_kernels::layers::RmsNorm };
+        let accessors = vec![
+            WeightAccessor {
+                name: format_ident!("norm"),
+                rust_type: ty.clone(),
+                source_weights: vec![],
+            },
+            WeightAccessor {
+                name: format_ident!("norm_0"),
+                rust_type: ty.clone(),
+                source_weights: vec![],
+            },
+        ];
+        let _ = emit_weights_accessor_methods(&accessors);
+    }
+
+    #[test]
+    #[should_panic(expected = "mismatched types")]
+    fn accessor_methods_panic_on_type_disagreement_within_a_base() {
+        // Two layers under the same base claim different `rust_type`s
+        // — codegen invariant violation, not a recoverable case.
+        let accessors = vec![
+            WeightAccessor {
+                name: format_ident!("input_layernorm_0"),
+                rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
+                source_weights: vec![],
+            },
+            WeightAccessor {
+                name: format_ident!("input_layernorm_1"),
+                rust_type: quote! { ::ferrite_kernels::layers::CohereLayerNorm },
+                source_weights: vec![],
+            },
+        ];
+        let _ = emit_weights_accessor_methods(&accessors);
+    }
+
+    #[test]
+    fn accessor_methods_empty_input_yields_empty_tokens() {
+        // No accessors → no impl block. (Empty `impl Weights {}`
+        // would be valid Rust but pointless; the codegen elides it.)
+        let ts = emit_weights_accessor_methods(&[]).to_string();
+        assert!(ts.is_empty());
     }
 }

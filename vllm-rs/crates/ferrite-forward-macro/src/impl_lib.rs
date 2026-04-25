@@ -23,7 +23,7 @@ use quote::quote;
 use crate::classified::{ExternKind, OpKind, Program, WeightId};
 use crate::codegen::split_base_layer;
 use crate::config::ModelParams;
-use crate::emit::{EmitCtx, weight_field_name};
+use crate::emit::weight_field_name;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
 use crate::shape::{Dim, Shape};
@@ -488,26 +488,6 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         false
     }
 
-    /// Emit the Rust token stream that invokes this impl's kernel
-    /// for the given subgraph. Called by codegen once per subgraph
-    /// after the solver has bound the subgraph to this impl.
-    ///
-    /// The emitted tokens must:
-    /// - Read inputs via [`EmitCtx::input_expr`] or
-    ///   [`EmitCtx::all_input_exprs`] for the relevant claimed tile.
-    /// - Produce a `let` binding for every output slot of every
-    ///   claimed tile, using [`EmitCtx::output_ident`] as the ident.
-    /// - Assume ambient `wm: &impl WeightBundle`, `ctx: &ForwardCtx`,
-    ///   and `device: &mut GpuDevice` bindings are in scope.
-    ///
-    /// Default implementation is a `compile_error!` so forgetting
-    /// to implement it fails loudly at macro expansion.
-    fn emit_call(&self, _ctx: &EmitCtx) -> TokenStream {
-        let name = self.name();
-        let msg = format!("Implementation `{name}` has no emit_call body");
-        quote! { compile_error!(#msg); }
-    }
-
     /// Declare the `WeightBundle` trait methods this impl's
     /// `emit_call` will invoke for the given claim. Codegen
     /// aggregates declarations across all picked impls in an SFUF
@@ -577,20 +557,17 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         Vec::new()
     }
 
-    // ── Host-interpreter codegen (NEW path; replaces emit_call) ──────
+    // ── Host-interpreter codegen ────────────────────────────────────
     //
     // Each Impl owns the shape of its own opcode — variant ident
     // and typed payload fields. The proc-macro, processing one
     // arch's solved FUF, collects shapes from the picked Impls and
     // codegens a per-arch enum. There is no universal opcode
-    // registry. There is no shared opcode list. Adding a kernel is
-    // overriding three methods on a new Impl.
-    //
-    // Until every Impl is migrated, these default to "unmigrated"
-    // markers the new emission path detects and panics on with the
-    // Impl's name. `emit_call` stays the active path during the
-    // scaffolding window; the wholesale-switch commit migrates
-    // every Impl, swaps the codegen seam, and deletes `emit_call`.
+    // registry. Adding a kernel is overriding three methods on a
+    // new Impl: `opcode_shape`, `fan_out`, `interpreter_arm`. A new
+    // Impl that forgets to override these fails at codegen time —
+    // `fan_out` returns `None` and `lower_bucket` panics with the
+    // Impl's name.
 
     /// Variant declaration this Impl contributes to the per-arch
     /// enum. Variant ident + ordered `(field_ident, field_type)`
@@ -636,11 +613,11 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// `model` is the per-arch [`ModelParams`] — the body bakes
     /// model-wide constants (`hidden_size`, `head_dim`,
     /// `attention_multiplier`, `attn_logit_softcapping`, …) as
-    /// literal tokens at codegen time, exactly the way today's
-    /// `emit_call` does via `EmitCtx::bound` / `EmitCtx::scalar`.
-    /// Per-instance values that vary across claims of the same
-    /// variant (layer index, weight-accessor selectors, scalar
-    /// offsets) ride in `OpInstance` fields instead.
+    /// literal tokens at codegen time, read directly from
+    /// `model.bounds` / `model.scalars`. Per-instance values that
+    /// vary across claims of the same variant (layer index,
+    /// weight-accessor selectors, scalar offsets) ride in
+    /// `OpInstance` fields instead.
     fn interpreter_arm(&self, _model: &ModelParams) -> TokenStream {
         let name = self.name();
         let msg = format!("Implementation `{name}` has no interpreter_arm body");
@@ -772,6 +749,19 @@ impl SlotMap {
         self.map.insert(key, idx);
         self.total += 1;
         idx
+    }
+
+    /// Insert `(tile, output_slot)` at a specific color. The colored
+    /// slot map (linear-scan register allocation) walks tiles in
+    /// def order and picks a color from the free pool, so two
+    /// non-overlapping tiles can share an index. Use this instead of
+    /// `insert` when the caller has already decided the color.
+    /// `total()` ends up = 1 + max color seen.
+    pub fn insert_at(&mut self, tile: TileId, output_slot: u8, color: u32) {
+        self.map.insert((tile, output_slot), color);
+        if color + 1 > self.total {
+            self.total = color + 1;
+        }
     }
 
     /// Resolve `(tile, output_slot)` → flat slot index. Panics
@@ -944,97 +934,6 @@ fn elementwise_cost(m: &MatchInfo, ctx: &CostCtx) -> f64 {
 // and cuda-gated; real ferrite-kernels bindings land as calibrated
 // impls replace these reference entries.
 
-fn emit_embed(ctx: &EmitCtx) -> TokenStream {
-    // kernels::embedding_gather(weight: GpuTensor, input_ids:
-    // GpuTensor, alloc, stream) -> OwnedTensor. Weight comes from
-    // the bundle as `&Embedding` (struct with .weight: GpuTensor);
-    // input_ids comes from ctx as TensorView, deref'd to GpuTensor
-    // via the Copy impl on GpuTensor.
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let ids = ctx.input_expr(tile, 0);
-    let weight = ctx.input_expr(tile, 1);
-    quote! {
-        let #out = unsafe {
-            ::ferrite_kernels::kernels::embedding_gather(
-                (#weight).weight,
-                *(#ids),
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
-    }
-}
-
-fn emit_rmsnorm(ctx: &EmitCtx) -> TokenStream {
-    // kernels::rms_norm(input, weight, eps, weight_offset, alloc, stream) -> OwnedTensor.
-    // Singleton RmsNorm tiles pass weight_offset=0.0 (Llama/Qwen2 math).
-    // Scalar-offset rmsnorms like Gemma's `(1+w)` flow through a
-    // distinct Impl that consumes the upstream Add(weight, scalar)
-    // tile and passes the scalar as weight_offset.
-    //
-    // Input is a TensorView borrowed via input_expr; the codegen-level
-    // drop pass frees the upstream OwnedTensor after this subgraph
-    // (or after a later subgraph if the upstream has further consumers).
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let x = ctx.input_expr(tile, 0);
-    let w = ctx.input_expr(tile, 1);
-    quote! {
-        let #out = unsafe {
-            ::ferrite_kernels::kernels::rms_norm(
-                *(#x),
-                (#w).weight,
-                (#w).eps,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
-    }
-}
-
-fn emit_layernorm(ctx: &EmitCtx) -> TokenStream {
-    // kernels::cohere_layer_norm(input, weight, eps, alloc, stream) -> OwnedTensor.
-    // Cohere's LayerNorm subtracts the mean (unlike RmsNorm) and has
-    // weight only (no bias). Same call shape as `emit_rmsnorm`,
-    // different kernel.
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let x = ctx.input_expr(tile, 0);
-    let w = ctx.input_expr(tile, 1);
-    quote! {
-        let #out = unsafe {
-            ::ferrite_kernels::kernels::cohere_layer_norm(
-                *(#x),
-                (#w).weight,
-                (#w).eps,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
-    }
-}
-
-fn emit_gemm(ctx: &EmitCtx) -> TokenStream {
-    // `gemm()` in the DSL is strict matmul. Bias is a separate
-    // `bias_add` tile and is claimed by its own Impl (e.g.
-    // `FusedGemmBiasImpl` fuses an adjacent `(Gemm, BiasAdd)` into
-    // cuBLAS's gemm_bias epilog). If the user passes a `LinearLayer`
-    // that carries a bias but the DSL doesn't say `bias_add`, the
-    // bias is silently ignored here — the stray bias_add, if it
-    // exists, surfaces elsewhere as `UnclaimedTile`. This mirrors
-    // cutlass's `.dense_weight()` emit path.
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let x = ctx.input_expr(tile, 0);
-    let w = ctx.input_expr(tile, 1);
-    quote! {
-        let #out = unsafe {
-            device.cublas.gemm(*(#x), (#w).dense_weight(), &mut device.caching)
-        };
-    }
-}
-
 // No standalone `emit_rope_append`. The only ferrite-kernels path for
 // "apply rotary + write KV to paged cache" is `fused_qkv_rope_cache`,
 // which expects the QKV projections already fused into one packed
@@ -1152,16 +1051,6 @@ pub(crate) fn attention_softcap_for(model: &crate::config::ModelParams) -> f32 {
         .unwrap_or(0.0) as f32
 }
 
-fn attention_scale_tokens(ctx: &EmitCtx) -> TokenStream {
-    let scale = attention_scale_for(ctx.model);
-    quote! { #scale }
-}
-
-fn attention_softcap_tokens(ctx: &EmitCtx) -> TokenStream {
-    let cap = attention_softcap_for(ctx.model);
-    quote! { #cap }
-}
-
 /// `window_size_left` argument for sliding-window attention. Reads
 /// `sliding_window` from the model config (HF convention).
 /// The flash-attn kernel takes `-1` to mean "disabled" and a
@@ -1183,11 +1072,6 @@ pub(crate) fn sliding_window_left_for(model: &crate::config::ModelParams) -> i32
             model.source_stem,
         ),
     }
-}
-
-fn sliding_window_left_tokens(ctx: &EmitCtx) -> TokenStream {
-    let w = sliding_window_left_for(ctx.model);
-    quote! { #w }
 }
 
 /// Build the `fa2_attn_bf16_h{h}` kernel name for calibrated FA2 cost
@@ -1296,9 +1180,6 @@ impl Implementation for EmbedRefImpl {
     }
     fn is_compute_bound(&self) -> bool {
         false
-    }
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        emit_embed(ctx)
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -1412,9 +1293,6 @@ impl Implementation for RmsNormRefImpl {
     }
     fn is_compute_bound(&self) -> bool {
         false
-    }
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        emit_rmsnorm(ctx)
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -1552,9 +1430,6 @@ impl Implementation for LayerNormRefImpl {
     }
     fn is_compute_bound(&self) -> bool {
         false
-    }
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        emit_layernorm(ctx)
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -1695,9 +1570,6 @@ impl Implementation for GemmRefImpl {
     }
     fn is_compute_bound(&self) -> bool {
         true
-    }
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        emit_gemm(ctx)
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -1860,26 +1732,6 @@ impl Implementation for ReshapeRefImpl {
         vec![((reshape_id, 0), upstream)]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let input = ctx.input_expr(tile, 0);
-        // Build per-dim expressions for the target shape. Each Dim is
-        // one of Lit / Bound / Mul. Config.json bounds fold to integer
-        // literals at emit time; the lone runtime bound `num_tokens`
-        // emits as `(input).dim(0)` since the reshape preserves the
-        // input's leading axis. Vars are a compiler bug at this point
-        // (shape inference closed every dim).
-        let shape = &ctx.fuf.get(tile).outputs[0];
-        let dim_tokens: Vec<proc_macro2::TokenStream> = shape
-            .iter()
-            .map(|d| reshape_dim_token(d, ctx, &input))
-            .collect();
-        quote! {
-            let #out = unsafe { (#input).reshape(&[ #( #dim_tokens ),* ]) };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `Reshape { in_slot, out_slot, dims_lit, dims_nt_pow,
@@ -2027,59 +1879,6 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
         Dim::Var(_) => {
             panic!("Reshape target dim must be closed (no Var) — compiler bug")
         }
-    }
-}
-
-/// Emit a `usize`-typed Rust expression for one Dim of a reshape
-/// target shape. Config bounds fold to literals; `num_tokens` reads
-/// off `ctx.input_ids.dim(0)` (the authoritative runtime source —
-/// the immediate reshape input's `dim(0)` isn't stable once a prior
-/// reshape has merged axes, e.g. `[T, heads*head_dim]` → `[T*heads,
-/// head_dim]`); Mul recurses with `*`.
-fn reshape_dim_token(
-    d: &crate::shape::Dim,
-    ctx: &EmitCtx,
-    input: &TokenStream,
-) -> proc_macro2::TokenStream {
-    use crate::shape::Dim;
-    let _ = input;
-    match d {
-        Dim::Lit(n) => {
-            let v = *n as usize;
-            quote! { #v }
-        }
-        Dim::Bound(name) if name == "num_tokens" => {
-            quote! { (*ctx.input_ids).dim(0) }
-        }
-        Dim::Bound(name) => {
-            let v = ctx.bound(name) as usize;
-            quote! { #v }
-        }
-        Dim::Mul(factors) => {
-            let mut parts = factors.iter().map(|f| reshape_dim_token(f, ctx, input));
-            let first = parts.next().unwrap_or_else(|| quote! { 1usize });
-            let folded = parts.fold(first, |acc, p| quote! { (#acc) * (#p) });
-            quote! { (#folded) }
-        }
-        Dim::Var(_) => {
-            panic!("reshape target dim must be closed (no Var) — compiler bug")
-        }
-    }
-}
-
-/// Evaluate a symbolic `Dim` to a concrete `usize` via the bound
-/// table embedded in the emit context. Panics if a `Var` is reached
-/// (shape inference should have closed every dim) or a bound is
-/// missing (the model config is incomplete).
-fn eval_dim_usize(d: &crate::shape::Dim, ctx: &EmitCtx) -> Option<usize> {
-    use crate::shape::Dim;
-    match d {
-        Dim::Lit(n) => Some(*n as usize),
-        Dim::Bound(name) => Some(ctx.bound(name) as usize),
-        Dim::Mul(factors) => factors
-            .iter()
-            .try_fold(1usize, |acc, f| eval_dim_usize(f, ctx).map(|v| acc * v)),
-        Dim::Var(_) => None,
     }
 }
 
@@ -2460,41 +2259,6 @@ impl Implementation for FusedGemmBiasImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let gemm_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
-            .expect("claim contains Gemm");
-        let bias_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::BiasAdd)
-            .expect("claim contains BiasAdd");
-
-        let activation = ctx.input_expr(gemm_id, 0);
-        let gemm_weight = first_weight_ref(ctx.fuf.get(gemm_id)).expect("gemm weight ref");
-        let fused_name = fused_accessor_name(ctx.program, &[gemm_weight]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let out = ctx.output_ident(bias_id, 0);
-        quote! {
-            let #out = unsafe {
-                debug_assert!(
-                    (#weight_expr).dense_bias().is_some(),
-                    "FusedGemmBiasImpl: DSL `bias_add` claimed but \
-                     LinearLayer has no bias — check safetensors path"
-                );
-                (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `FusedGemmBias { in_slot, out_slot, layer, weight_fn }`.
@@ -2672,41 +2436,6 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         FusedGemmBiasImpl.required_weights(claimed_tiles, fuf, program)
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let gemm_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
-            .expect("claim contains Gemm");
-        let bias_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::BiasAdd)
-            .expect("claim contains BiasAdd");
-
-        let activation = ctx.input_expr(gemm_id, 0);
-        let gemm_weight = first_weight_ref(ctx.fuf.get(gemm_id)).expect("gemm weight ref");
-        let fused_name = fused_accessor_name(ctx.program, &[gemm_weight]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let out = ctx.output_ident(bias_id, 0);
-        quote! {
-            let #out = unsafe {
-                let bias = (#weight_expr).dense_bias().expect(
-                    "CutlassFusedGemmBiasImpl: LinearLayer has no bias \
-                     — check safetensors path"
-                );
-                ::ferrite_kernels::cutlass::cutlass_gemm_bias(
-                    *(#activation),
-                    (#weight_expr).dense_weight(),
-                    bias,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `CutlassFusedGemmBias { in_slot, out_slot, layer, weight_fn }`.
@@ -2861,13 +2590,31 @@ fn first_weight_ref(node: &crate::fuf::FufNode) -> Option<(WeightId, Option<u64>
 /// [`weight_field_name`] with `"__fused__"`, sorted for
 /// order-independence. Two impls that declare the same source set
 /// produce the same name.
+///
+/// All sources of one fused accessor share the same layer index
+/// (or all are unindexed) — this is structural: a layer-N gate_proj
+/// can't fuse with a layer-M up_proj. So we strip the per-component
+/// `_<layer>` suffix before joining and append it once at the end.
+/// Result: `mlp_gate_proj__fused__mlp_up_proj_28` rather than
+/// `mlp_gate_proj_28__fused__mlp_up_proj_28`. The accessor-method
+/// codegen sees a single base across all layers and collapses 40
+/// per-layer methods into one method with 40 match arms.
 pub fn fused_accessor_name(program: &Program, sources: &[(WeightId, Option<u64>)]) -> syn::Ident {
+    debug_assert!(!sources.is_empty(), "fused_accessor_name: empty sources");
+    let layer = sources[0].1;
+    debug_assert!(
+        sources.iter().all(|(_, idx)| *idx == layer),
+        "fused_accessor_name: sources span multiple layer indices ({sources:?})"
+    );
     let mut parts: Vec<String> = sources
         .iter()
-        .map(|(id, idx)| weight_field_name(program, *id, *idx).to_string())
+        .map(|(id, _idx)| weight_field_name(program, *id, None).to_string())
         .collect();
     parts.sort();
-    let joined = parts.join("__fused__");
+    let mut joined = parts.join("__fused__");
+    if let Some(l) = layer {
+        joined = format!("{joined}_{l}");
+    }
     syn::Ident::new(&joined, proc_macro2::Span::call_site())
 }
 
@@ -3025,65 +2772,6 @@ impl Implementation for FusedGateUpSiluMulImpl {
             rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
             source_weights: sources,
         }]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Identify the four tiles by op kind. The claim is sorted by
-        // TileId (see `matches`); emission is independent of order.
-        let silu_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Silu)
-            .expect("fused gate/up/silu/mul claim must contain Silu");
-        let mul_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-            .expect("fused gate/up/silu/mul claim must contain Mul");
-        // Gate gemm = Silu's Tile input; up gemm = the other claimed Gemm.
-        let (gate_id, _) =
-            first_tile_input(ctx.fuf.get(silu_id)).expect("silu has a tile input — the gate gemm");
-        let up_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-            .expect("claim contains a second Gemm — the up gemm");
-
-        // The shared activation — same Tile-input on both Gemms.
-        let activation = ctx.input_expr(gate_id, 0);
-
-        // Fused-weight accessor. Recompute the name from the claim
-        // (matches `required_weights`), so user-provided trait impl
-        // and emit are kept in lockstep.
-        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
-        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let mul_out = ctx.output_ident(mul_id, 0);
-        let intermediate = ctx.bound("intermediate_size") as usize;
-
-        quote! {
-            // Fused gate+up GEMM produces a [num_tokens, 2*intermediate]
-            // packed buffer that's only consumed by `silu_and_mul_fused`
-            // on the next line. Bind it in an inner scope so its
-            // OwnedTensor drops as soon as the kernel returns.
-            let #mul_out = unsafe {
-                let gate_up = (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                ::ferrite_kernels::kernels::silu_and_mul_fused(
-                    *gate_up,
-                    #intermediate,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -3314,66 +3002,6 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
         // Share the packed `[gate|up]` accessor with the cuBLAS peer
         // so accessor emission is deduplicated by `collect_accessors`.
         FusedGateUpSiluMulImpl.required_weights(claimed_tiles, fuf, program)
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let silu_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Silu)
-            .expect("fused gate/up/silu/mul claim must contain Silu");
-        let mul_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-            .expect("fused gate/up/silu/mul claim must contain Mul");
-        let (gate_id, _) =
-            first_tile_input(ctx.fuf.get(silu_id)).expect("silu has a tile input — the gate gemm");
-        let up_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-            .expect("claim contains a second Gemm — the up gemm");
-
-        let activation = ctx.input_expr(gate_id, 0);
-
-        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
-        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let mul_out = ctx.output_ident(mul_id, 0);
-        let intermediate = ctx.bound("intermediate_size") as usize;
-
-        // Slice the packed `[2I, K]` weight into contiguous gate/up
-        // halves. Row-major storage → `narrow_dim0(0, I)` is gate,
-        // `narrow_dim0(I, I)` is up. No copy; same backing buffer.
-        //
-        // Kernel shape:
-        //   up_out  = a @ up_w^T             [M, I]
-        //   mul_out = silu(a @ gate_w^T) * up_out  [M, I]  (EVT epilogue)
-        quote! {
-            let #mul_out = unsafe {
-                let packed = (#weight_expr).dense_weight();
-                let gate_w = packed.narrow_dim0(0, #intermediate);
-                let up_w = packed.narrow_dim0(#intermediate, #intermediate);
-                let up_out = ::ferrite_kernels::cutlass::cutlass_gemm(
-                    *(#activation),
-                    up_w,
-                    ::ferrite_kernels::cutlass::CutlassTile::new(128, 128, 3),
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                ::ferrite_kernels::cutlass::cutlass_gemm_silu_mul(
-                    *(#activation),
-                    gate_w,
-                    up_out,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -3662,53 +3290,6 @@ impl Implementation for FusedGateUpGeluMulImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let gelu_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Gelu)
-            .expect("fused gate/up/gelu/mul claim must contain Gelu");
-        let mul_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-            .expect("fused gate/up/gelu/mul claim must contain Mul");
-        let (gate_id, _) =
-            first_tile_input(ctx.fuf.get(gelu_id)).expect("gelu has a tile input — the gate gemm");
-        let up_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-            .expect("claim contains a second Gemm — the up gemm");
-        let activation = ctx.input_expr(gate_id, 0);
-        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
-        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-        let mul_out = ctx.output_ident(mul_id, 0);
-        let gate_up_ident = quote::format_ident!("__fused_gate_up_{}", mul_id.0);
-        let intermediate = ctx.bound("intermediate_size") as usize;
-        quote! {
-            let #gate_up_ident = unsafe {
-                (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-            let #mul_out = unsafe {
-                ::ferrite_kernels::kernels::gelu_and_mul_fused(
-                    *#gate_up_ident,
-                    #intermediate,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `FusedGateUpGeluMul { in_slot, out_slot, layer, weight_fn }`.
@@ -3931,43 +3512,6 @@ impl Implementation for ScalarMulImpl {
         vec![src]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let node = ctx.fuf.get(tile);
-        // The Tile input (the tensor to scale) and the Scalar.
-        let upstream_slot = node
-            .inputs
-            .iter()
-            .position(|i| matches!(i, FufInput::Tile { .. }))
-            .expect("ScalarMul claim has a Tile input");
-        let upstream = ctx
-            .input_tile_ident(tile, upstream_slot)
-            .expect("ScalarMul's Tile input has an ident");
-        let scale: f32 = node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Scalar(v) => Some(*v as f32),
-                _ => None,
-            })
-            .expect("ScalarMul claim has a Scalar input");
-
-        // `scale_inplace` uses cuBLAS S-axpy-like scalEx — mutates
-        // the upstream buffer. Move-consume the OwnedTensor so the
-        // output binding owns the mutated buffer.
-        quote! {
-            let #out = unsafe {
-                ::ferrite_kernels::kernels::scale_inplace(
-                    *#upstream,
-                    #scale,
-                    &device.cublas,
-                );
-                #upstream
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `ScalarMul { in_slot, out_slot, scale }`. In-place
@@ -4130,39 +3674,6 @@ impl Implementation for TanhSoftCapImpl {
             })
             .expect("tanh_softcap input is a tile");
         vec![src]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let upstream = ctx
-            .input_tile_ident(tile, 0)
-            .expect("tanh_softcap input must be a tile-sourced tensor");
-
-        // The cap is a config convention. Missing → the DSL body
-        // shouldn't have emitted this tile on this model.
-        let cap: f32 = ctx.scalar("final_logit_softcapping").unwrap_or_else(|| {
-            panic!(
-                "tanh_softcap tile emitted, but model `{}` has no \
-                     `final_logit_softcapping` in its config.json",
-                ctx.model.source_stem,
-            )
-        }) as f32;
-
-        // Mutate the upstream buffer in place, then move it into
-        // the binding as an OwnedTensor so the emitted forward fn
-        // can return it. `tanh_softcap` is terminal (post-lm_head,
-        // final logits) — no later tile reads the upstream ident.
-        quote! {
-            let #out = unsafe {
-                ::ferrite_kernels::kernels::tanh_softcap_inplace(
-                    *#upstream,
-                    #cap,
-                    device.compute_stream,
-                );
-                #upstream
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -4351,31 +3862,6 @@ impl Implementation for AddRefImpl {
             _ => None,
         };
         vec![((add_id, 0), residual_src)]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let add_id = ctx.primary();
-        let out = ctx.output_ident(add_id, 0);
-        // slot 0 = delta (new contribution), slot 1 = residual (mutated).
-        let delta_upstream = ctx
-            .input_tile_ident(add_id, 0)
-            .expect("Add input 0 (delta) is a Tile");
-        let residual_upstream = ctx
-            .input_tile_ident(add_id, 1)
-            .expect("Add input 1 (residual) is a Tile");
-        quote! {
-            unsafe {
-                ::ferrite_kernels::kernels::add_inplace(
-                    *#residual_upstream,
-                    *#delta_upstream,
-                    device.compute_stream,
-                );
-            }
-            // The Add's logical output is the post-mutation residual
-            // buffer — bind as a TensorView alias so downstream tiles
-            // read it without an extra copy.
-            let #out = unsafe { (*#residual_upstream).as_view() };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -4604,72 +4090,6 @@ impl Implementation for FusedAddRmsNormImpl {
             ((rmsnorm_id, 0), Some(delta_src)),
             ((add_id, 0), Some(residual_src)),
         ]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Identify Add + RmsNorm tiles from the claim.
-        let add_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Add)
-            .expect("fused add/rmsnorm claim must contain Add");
-        let rmsnorm_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
-            .expect("fused add/rmsnorm claim must contain RmsNorm");
-
-        // Add's inputs: delta (slot 0), residual (slot 1). Reach past
-        // `input_expr`'s `(*_).as_view()` wrapper to get the raw
-        // upstream idents so we can (a) feed GpuTensor to the kernel
-        // and (b) bind TensorView aliases to the same storage.
-        //
-        // Aliasing (rather than moving) is necessary because the
-        // residual stream's first iteration sees an upstream tile
-        // (the embed output) with multiple consumers — the codegen
-        // drop pass handles cleanup of those upstream OwnedTensors
-        // after their last cross-subgraph use.
-        let delta_upstream = ctx
-            .input_tile_ident(add_id, 0)
-            .expect("Add input 0 (delta) is a Tile");
-        let residual_upstream = ctx
-            .input_tile_ident(add_id, 1)
-            .expect("Add input 1 (residual) is a Tile");
-
-        // RmsNorm's weight accessor — uses the default
-        // `required_weights` declaration name.
-        let node = ctx.fuf.get(rmsnorm_id);
-        let (weight_id, weight_idx) = node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Weight { id, index, .. } => Some((*id, *index)),
-                _ => None,
-            })
-            .expect("RmsNorm has a weight input");
-        let weight_name = weight_field_name(ctx.program, weight_id, weight_idx);
-        let weight_expr = ctx.weight_accessor(&weight_name);
-
-        let add_out = ctx.output_ident(add_id, 0);
-        let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
-
-        quote! {
-            // Fused `residual += delta; normed = norm(residual) * w`.
-            // Both buffers are mutated in place; the upstream
-            // OwnedTensors stay the owners and the alias bindings
-            // below let downstream tiles read them as views.
-            unsafe {
-                let _ = ::ferrite_kernels::kernels::fused_add_rms_norm_inplace(
-                    *#delta_upstream,
-                    *#residual_upstream,
-                    (#weight_expr).weight,
-                    (#weight_expr).eps,
-                    device.compute_stream,
-                );
-            }
-            let #rmsnorm_out = unsafe { (*#delta_upstream).as_view() };
-            let #add_out = unsafe { (*#residual_upstream).as_view() };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -4990,79 +4410,6 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
         ]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Identify tiles by op kind + inputs.
-        let residual_add_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| {
-                let n = ctx.fuf.get(**t);
-                n.op == OpKind::Add && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
-            })
-            .expect("claim contains a residual-stream Add");
-        let scalar_add_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| {
-                let n = ctx.fuf.get(**t);
-                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
-            })
-            .expect("claim contains a scalar-offset Add");
-        let rmsnorm_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
-            .expect("claim contains a RmsNorm");
-
-        // Residual-Add inputs: delta (slot 0), residual (slot 1).
-        let delta_upstream = ctx
-            .input_tile_ident(residual_add_id, 0)
-            .expect("residual Add input 0 (delta) is a Tile");
-        let residual_upstream = ctx
-            .input_tile_ident(residual_add_id, 1)
-            .expect("residual Add input 1 (residual) is a Tile");
-
-        // Scalar-Add: extract the Weight and the Scalar.
-        let scalar_add_node = ctx.fuf.get(scalar_add_id);
-        let offset: f32 = scalar_add_node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Scalar(v) => Some(*v as f32),
-                _ => None,
-            })
-            .expect("scalar-offset Add has a Scalar input");
-        let (weight_id, weight_idx) = scalar_add_node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Weight { id, index, .. } => Some((*id, *index)),
-                _ => None,
-            })
-            .expect("scalar-offset Add has a Weight input");
-        let weight_name = weight_field_name(ctx.program, weight_id, weight_idx);
-        let weight_expr = ctx.weight_accessor(&weight_name);
-
-        // Output aliases for downstream tiles.
-        let residual_out = ctx.output_ident(residual_add_id, 0);
-        let rmsnorm_out = ctx.output_ident(rmsnorm_id, 0);
-
-        quote! {
-            unsafe {
-                let _ = ::ferrite_kernels::kernels::fused_add_rms_norm_inplace_with_offset(
-                    *#delta_upstream,
-                    *#residual_upstream,
-                    (#weight_expr).weight,
-                    (#weight_expr).eps,
-                    #offset,
-                    device.compute_stream,
-                );
-            }
-            let #rmsnorm_out = unsafe { (*#delta_upstream).as_view() };
-            let #residual_out = unsafe { (*#residual_upstream).as_view() };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `FusedAddRmsNormWithOffset { delta_slot, residual_slot,
@@ -5341,61 +4688,6 @@ impl Implementation for ScalarOffsetRmsNormImpl {
             rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
             source_weights: vec![(weight_id, weight_idx)],
         }]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let add_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Add)
-            .expect("claim contains an Add");
-        let rmsnorm_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
-            .expect("claim contains a RmsNorm");
-
-        let add_node = ctx.fuf.get(add_id);
-        // The scalar literal rides on the Add's inputs.
-        let offset: f32 = add_node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Scalar(v) => Some(*v as f32),
-                _ => None,
-            })
-            .expect("ScalarOffsetRmsNorm's Add has a Scalar input");
-
-        // The RmsNorm consumes the Add at slot 1 (the weight position).
-        // Slot 0 is the input tensor — we pass that straight through.
-        let x = ctx.input_expr(rmsnorm_id, 0);
-        // Build a weight accessor expression using the same name the
-        // `required_weights` declaration emitted.
-        let (weight_id, weight_idx) = add_node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Weight { id, index, .. } => Some((*id, *index)),
-                _ => None,
-            })
-            .expect("ScalarOffsetRmsNorm's Add has a Weight input");
-        let name = weight_field_name(ctx.program, weight_id, weight_idx);
-        let weight_expr = ctx.weight_accessor(&name);
-
-        let out = ctx.output_ident(rmsnorm_id, 0);
-
-        quote! {
-            let #out = unsafe {
-                ::ferrite_kernels::kernels::rms_norm_with_offset(
-                    *(#x),
-                    (#weight_expr).weight,
-                    (#weight_expr).eps,
-                    #offset,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -5854,181 +5146,6 @@ impl Implementation for FusedQkvRopeCacheImpl {
             rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
             source_weights: sources,
         }]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Identify the rope tile (NeoX or interleaved). The three Gemm
-        // tiles come via `unwrap_gemm_through_bias` on the rope's first
-        // three tile inputs — which strips an optional BiasAdd wrapper.
-        let rope_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| is_rope_append_op(ctx.fuf.get(**t).op))
-            .expect("claim must contain a RopeAppend");
-        let rope_node = ctx.fuf.get(rope_id);
-        let interleaved = rope_node.op == OpKind::RopeAppendInterleaved;
-
-        let qkv_raw: Vec<TileId> = rope_node
-            .inputs
-            .iter()
-            .take(3)
-            .filter_map(|i| match i {
-                FufInput::Tile { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
-        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
-            .iter()
-            .map(|t| {
-                unwrap_gemm_through_bias(ctx.fuf, *t)
-                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
-            })
-            .collect();
-        let biased = resolved[0].1.is_some();
-        let qkv_ids: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
-        // Use first Gemm (q_gemm) as the "representative" for activation.
-        let q_gemm_id = qkv_ids[0];
-        let activation = ctx.input_expr(q_gemm_id, 0);
-
-        // Fused weight accessor — source_weights is the three Gemm
-        // weights. The accessor's `LinearLayer` carries an optional
-        // bias auto-populated by `load_dense_concat`; we assert its
-        // presence below when the DSL claimed BiasAdd tiles.
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = qkv_ids
-            .iter()
-            .map(|t| first_weight_ref(ctx.fuf.get(*t)).expect("gemm weight"))
-            .collect();
-        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        // Config-derived kernel args.
-        let hidden = ctx.bound("hidden_size") as usize;
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-        let head_dim = ctx.bound("head_dim") as usize;
-        let q_size = num_q_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-        let _ = hidden; // reserved for future checks
-
-        // Layer index — captured by the DSL's `kv_cache[layer]`.
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
-
-        // Output idents:
-        //   q_out = rope.slot 0 (rotated Q, OwnedTensor returned by kernel)
-        //   k_out = rope.slot 1 (written to cache)
-        //   v_out = rope.slot 2 (written to cache)
-        // Downstream Attention reads K/V from the paged cache directly,
-        // so the k_out/v_out bindings are paged-cache `TensorView`
-        // aliases — no allocation.
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
-        // If the DSL's rope chain includes BiasAdd tiles, require the
-        // packed LinearLayer to actually carry a bias — otherwise
-        // `.forward()` would silently call `cublas.gemm` (no bias)
-        // and the bias_add math in the DSL would be dropped.
-        let bias_assert = if biased {
-            quote! {
-                debug_assert!(
-                    (#weight_expr).dense_bias().is_some(),
-                    "FusedQkvRopeCacheImpl: DSL `bias_add` on QKV claimed but \
-                     packed LinearLayer has no bias — check safetensors path"
-                );
-            }
-        } else {
-            quote! {}
-        };
-
-        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-
-        // Pick the rope-flavor kernel at emit time. Cohere's interleaved
-        // pairing has its own fused-cache kernel; the FP8 path doesn't
-        // currently have an interleaved variant, so an interleaved arch
-        // with FP8 KV would need that kernel added (no live arch hits
-        // this combo today).
-        let cache_call = if interleaved {
-            quote! {
-                ::ferrite_kernels::kernels::fused_qkv_interleaved_rope_cache(
-                    *qkv_packed,
-                    *ctx.positions,
-                    #rotary_cos_sin,
-                    *ctx.slot_mapping,
-                    *ctx.kv_cache.k_cache(#layer),
-                    *ctx.kv_cache.v_cache(#layer),
-                    #q_size,
-                    #kv_size,
-                    #num_q_heads,
-                    #head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            }
-        } else {
-            quote! {
-                if ctx.kv_cache.is_fp8() {
-                    ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
-                        *qkv_packed,
-                        *ctx.positions,
-                        #rotary_cos_sin,
-                        *ctx.slot_mapping,
-                        *ctx.kv_cache.k_cache(#layer),
-                        *ctx.kv_cache.v_cache(#layer),
-                        ctx.kv_cache.k_scale_ptr(#layer),
-                        ctx.kv_cache.v_scale_ptr(#layer),
-                        #q_size,
-                        #kv_size,
-                        #num_q_heads,
-                        #head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                } else {
-                    ::ferrite_kernels::kernels::fused_qkv_rope_cache(
-                        *qkv_packed,
-                        *ctx.positions,
-                        #rotary_cos_sin,
-                        *ctx.slot_mapping,
-                        *ctx.kv_cache.k_cache(#layer),
-                        *ctx.kv_cache.v_cache(#layer),
-                        #q_size,
-                        #kv_size,
-                        #num_q_heads,
-                        #head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                }
-            }
-        };
-
-        quote! {
-            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
-            // then fused RoPE + paged-cache write. The packed QKV
-            // buffer drops as soon as the rope-cache kernel returns.
-            //
-            // FP8 KV-cache path branches at runtime: the cache dtype
-            // is a per-model property known only at load time.
-            let #q_out = unsafe {
-                #bias_assert
-                let qkv_packed = (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                #cache_call
-            };
-            // K/V aliases: the paged-cache layer slices. Bound for
-            // symmetry with the FUF's tuple output shape; not read by
-            // any downstream tile once `AttentionViaCacheImpl` takes
-            // its input from the cache directly.
-            let #k_out = ctx.kv_cache.k_cache(#layer);
-            let #v_out = ctx.kv_cache.v_cache(#layer);
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -6752,250 +5869,6 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
         accessors
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Identify the RopeAppend tile.
-        let rope_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
-            .expect("claim must contain a RopeAppend");
-        let rope_node = ctx.fuf.get(rope_id);
-
-        // Find the three Gemms and identify Q/K/V roles.
-        let qkv_raw: Vec<TileId> = rope_node
-            .inputs
-            .iter()
-            .take(3)
-            .filter_map(|i| match i {
-                FufInput::Tile { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
-
-        let v_id = qkv_raw[2];
-        let q_gemm = find_gemm_root_of_norm_chain(ctx.fuf, qkv_raw[0])
-            .expect("Q norm chain validated at match time");
-        let k_gemm = find_gemm_root_of_norm_chain(ctx.fuf, qkv_raw[1])
-            .expect("K norm chain validated at match time");
-
-        // Walk Q and K chains to get Add tiles (for weight offsets).
-        let (_, _, q_add) = walk_qk_norm_chain(ctx.fuf, q_gemm).expect("Q chain valid");
-        let (_, _, k_add) = walk_qk_norm_chain(ctx.fuf, k_gemm).expect("K chain valid");
-
-        // Determine weight offsets from Add tiles.
-        let q_weight_offset: f32 = q_add
-            .map(|add_id| {
-                ctx.fuf
-                    .get(add_id)
-                    .inputs
-                    .iter()
-                    .find_map(|i| match i {
-                        FufInput::Scalar(v) => Some(*v as f32),
-                        _ => None,
-                    })
-                    .unwrap_or(0.0)
-            })
-            .unwrap_or(0.0);
-        let k_weight_offset: f32 = k_add
-            .map(|add_id| {
-                ctx.fuf
-                    .get(add_id)
-                    .inputs
-                    .iter()
-                    .find_map(|i| match i {
-                        FufInput::Scalar(v) => Some(*v as f32),
-                        _ => None,
-                    })
-                    .unwrap_or(0.0)
-            })
-            .unwrap_or(0.0);
-
-        let activation = ctx.input_expr(q_gemm, 0);
-
-        // Three separate LinearLayer accessors (Q, K, V) — matching
-        // the accessors declared in `required_weights`. A packed
-        // QKV gemm produces strided Q/K/V views that the
-        // `qk_norm_rope_inplace` kernel can't consume; three
-        // separate gemms each produce contiguous outputs.
-        let (q_wid, q_widx) = first_weight_ref(ctx.fuf.get(q_gemm)).expect("Q gemm has a weight");
-        let (k_wid, k_widx) = first_weight_ref(ctx.fuf.get(k_gemm)).expect("K gemm has a weight");
-        let (v_wid, v_widx) = first_weight_ref(ctx.fuf.get(v_id)).expect("V gemm has a weight");
-        let q_weight_name = weight_field_name(ctx.program, q_wid, q_widx);
-        let k_weight_name = weight_field_name(ctx.program, k_wid, k_widx);
-        let v_weight_name = weight_field_name(ctx.program, v_wid, v_widx);
-        let q_weight_expr = ctx.weight_accessor(&q_weight_name);
-        let k_weight_expr = ctx.weight_accessor(&k_weight_name);
-        let v_weight_expr = ctx.weight_accessor(&v_weight_name);
-
-        // RmsNorm weight accessors — ordered Q then K by topo order
-        // of their RmsNorm tiles within the claim.
-        let rmsnorm_ids: Vec<TileId> = ctx
-            .claimed_tiles
-            .iter()
-            .filter(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
-            .copied()
-            .collect();
-        assert_eq!(rmsnorm_ids.len(), 2);
-
-        // Determine which RmsNorm is Q's and which is K's by checking
-        // which chain each belongs to.
-        let q_rmsnorm = rmsnorm_ids
-            .iter()
-            .find(|&&id| {
-                let (_, q_chain, _) = walk_qk_norm_chain(ctx.fuf, q_gemm).unwrap();
-                q_chain.contains(&id)
-            })
-            .expect("Q rmsnorm in claim");
-        let k_rmsnorm = rmsnorm_ids
-            .iter()
-            .find(|&&id| {
-                let (_, k_chain, _) = walk_qk_norm_chain(ctx.fuf, k_gemm).unwrap();
-                k_chain.contains(&id)
-            })
-            .expect("K rmsnorm in claim");
-
-        // Build accessor expressions for the two norm weights.
-        let q_norm_weight_ref = {
-            let rmsnorm_node = ctx.fuf.get(*q_rmsnorm);
-            match &rmsnorm_node.inputs[1] {
-                FufInput::Tile { id, .. } => {
-                    let add_node = ctx.fuf.get(*id);
-                    let (wid, widx) = add_node
-                        .inputs
-                        .iter()
-                        .find_map(|i| match i {
-                            FufInput::Weight { id, index, .. } => Some((*id, *index)),
-                            _ => None,
-                        })
-                        .expect("Add has Weight input");
-                    weight_field_name(ctx.program, wid, widx)
-                }
-                FufInput::Weight { id, index, .. } => weight_field_name(ctx.program, *id, *index),
-                _ => panic!("RmsNorm slot 1 must be Tile or Weight"),
-            }
-        };
-        let k_norm_weight_ref = {
-            let rmsnorm_node = ctx.fuf.get(*k_rmsnorm);
-            match &rmsnorm_node.inputs[1] {
-                FufInput::Tile { id, .. } => {
-                    let add_node = ctx.fuf.get(*id);
-                    let (wid, widx) = add_node
-                        .inputs
-                        .iter()
-                        .find_map(|i| match i {
-                            FufInput::Weight { id, index, .. } => Some((*id, *index)),
-                            _ => None,
-                        })
-                        .expect("Add has Weight input");
-                    weight_field_name(ctx.program, wid, widx)
-                }
-                FufInput::Weight { id, index, .. } => weight_field_name(ctx.program, *id, *index),
-                _ => panic!("RmsNorm slot 1 must be Tile or Weight"),
-            }
-        };
-        let q_norm_expr = ctx.weight_accessor(&q_norm_weight_ref);
-        let k_norm_expr = ctx.weight_accessor(&k_norm_weight_ref);
-
-        // Config-derived kernel args.
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-        let head_dim = ctx.bound("head_dim") as usize;
-
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
-
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
-        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-
-        quote! {
-            // Three separate cuBLAS GEMMs producing contiguous Q, K, V
-            // OwnedTensors (shape [num_tokens, *_size]). The
-            // `qk_norm_rope_inplace` kernel requires contiguous Q/K
-            // at [T, num_heads, head_dim]; slicing a packed QKV
-            // output would leave Q/K strided across tokens.
-            let mut #q_out = unsafe {
-                let nt = (*ctx.input_ids).dim(0) as usize;
-                let q = (#q_weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                let k = (#k_weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                let v = (#v_weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-
-                // 3D views on the contiguous OwnedTensors: the
-                // `qk_norm_rope_inplace` and `reshape_and_cache`
-                // kernels read dim(0)/dim(1)/dim(2) as
-                // `[num_tokens, num_heads, head_dim]`.
-                let q_view = (*q).reshape(&[nt, #num_q_heads, #head_dim]);
-                let k_view = (*k).reshape(&[nt, #num_kv_heads, #head_dim]);
-                let v_view = (*v).reshape(&[nt, #num_kv_heads, #head_dim]);
-
-                // Fused QK-norm + RoPE in one kernel launch —
-                // operates in-place on the Q and K storage.
-                ::ferrite_kernels::kernels::qk_norm_rope_inplace(
-                    q_view,
-                    k_view,
-                    (#q_norm_expr).weight,
-                    (#k_norm_expr).weight,
-                    #rotary_cos_sin,
-                    *ctx.positions,
-                    #num_q_heads,
-                    #num_kv_heads,
-                    #head_dim,
-                    (#q_norm_expr).eps,
-                    #q_weight_offset,
-                    #k_weight_offset,
-                    device.compute_stream,
-                );
-
-                // Write K/V to the paged cache. K and V storage is
-                // freed when the OwnedTensors drop at end of scope.
-                ::ferrite_kernels::kernels::reshape_and_cache(
-                    k_view,
-                    v_view,
-                    *ctx.kv_cache.k_cache(#layer),
-                    *ctx.kv_cache.v_cache(#layer),
-                    *ctx.slot_mapping,
-                    ctx.kv_cache.block_size,
-                    device.compute_stream,
-                );
-
-                q
-            };
-            // Reshape Q's OwnedTensor in-place to [T, num_q_heads,
-            // head_dim] — the layout AttentionViaCacheImpl /
-            // AttentionPrefillContiguousImpl expect downstream.
-            unsafe {
-                let nt = (*#q_out).dim(0);
-                let dt = (*#q_out).dtype();
-                #q_out.reshape(&[nt, #num_q_heads, #head_dim], dt);
-            }
-            // K/V aliases: paged-cache layer slices. The contiguous
-            // K/V OwnedTensors produced above have already been
-            // committed to the cache and dropped at end of the unsafe
-            // block; downstream attention reads from the paged cache.
-            let #k_out = ctx.kv_cache.k_cache(#layer);
-            let #v_out = ctx.kv_cache.v_cache(#layer);
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `FusedQkvQkNormRopeCache { in_slot, out_slot, layer,
@@ -7366,96 +6239,6 @@ impl Implementation for AttentionViaCacheImpl {
     // consumes no weights. The paged cache and per-call metadata live
     // on `ForwardCtx`, not `WeightBundle`.
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let node = ctx.fuf.get(tile);
-
-        // Q input: slot 0 of the DSL's attention call. K and V (slots
-        // 1, 2) are ignored — the kernel reads them from the paged
-        // cache written by the upstream FusedQkvRopeCache.
-        let q_expr = ctx.input_expr(tile, 0);
-
-        // Layer index — from the `kv_cache[layer]` extern input.
-        let layer = node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Extern {
-                    kind: crate::classified::ExternKind::KvCache,
-                    index: Some(layer),
-                } => Some(*layer),
-                _ => None,
-            })
-            .expect("Attention has a kv_cache extern with a concrete layer index")
-            as usize;
-
-        // Softmax scale: config-driven. Gemma2 sets
-        // `query_pre_attn_scalar` (softmax scale = that^-0.5); Llama/
-        // Qwen2 have no such field, so we fall back to the standard
-        // `1/sqrt(head_dim)`. Both computed at emit time; the emitted
-        // tokens are a plain `f32` literal either way.
-        let scale_tokens = attention_scale_tokens(ctx);
-        let softcap_tokens = attention_softcap_tokens(ctx);
-        // q_size for the [num_tokens, q_size] reshape o_proj needs.
-        let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
-
-        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-        // Discover the rope flavor used at this layer so FA-2's
-        // span-rotation path uses the right element pairing on
-        // unrotated KV blocks. Determined statically from the layer's
-        // rope tile in the FUF.
-        let interleaved_lit = layer_rope_is_interleaved(ctx.fuf, layer as u64);
-
-        quote! {
-            // Decode paged attention. Delegates to the
-            // `attention_decode_from_cache` helper which:
-            //  - routes to `fp8_decode_attention` when kv_cache is fp8,
-            //  - else calls `flash_attn_paged_ext` with span-rotation
-            //    args derived from `kv_cache.block_unrotated_gpu()` so
-            //    relocatable/unrotated KV blocks get their RoPE applied
-            //    by FA2 in shared memory.
-            let mut #out = unsafe {
-                let has_spans = !ctx.kv_cache.block_unrotated_gpu().is_null();
-                let (cos_sin_ptr, rotary_dim) = if has_spans {
-                    (
-                        #rotary_cos_sin.raw_ptr() as *const u8,
-                        #rotary_cos_sin.dim(1),
-                    )
-                } else {
-                    (::std::ptr::null::<u8>(), 0)
-                };
-                ::ferrite_kernels::attention_helpers::attention_decode_from_cache(
-                    #q_expr,
-                    ctx.cu_seqlens_q,
-                    ctx.seqused_k,
-                    ctx.block_table,
-                    ctx.max_seqlen_q,
-                    ctx.max_seqlen_k,
-                    #scale_tokens,
-                    #softcap_tokens,
-                    -1,   // window_size_left (-1 = disabled; sliding variant covers non-(-1))
-                    ctx.kv_cache,
-                    #layer,
-                    device.num_sm,
-                    &mut device.caching,
-                    device.compute_stream,
-                    cos_sin_ptr,
-                    rotary_dim,
-                    #interleaved_lit, // is_rotary_interleaved (rope flavor at this layer)
-                )
-            };
-            // Flatten [num_tokens, num_q_heads, head_dim] → [num_tokens, q_size]
-            // so the downstream o_proj gemm sees a 2D [M, K] input with the
-            // right K dimension.
-            unsafe {
-                let nt = (*#out).dim(0);
-                let dt = (*#out).dtype();
-                #out.reshape(&[nt, #q_size], dt);
-            }
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `AttentionViaCache { in_slot, out_slot, layer,
@@ -7764,119 +6547,6 @@ impl Implementation for RopeAppendRefImpl {
         ]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let rope_id = ctx.primary();
-        let node = ctx.fuf.get(rope_id);
-        let interleaved = node.op == OpKind::RopeAppendInterleaved;
-
-        let q_upstream = ctx
-            .input_tile_ident(rope_id, 0)
-            .expect("RopeAppend input 0 (q) must be a Tile");
-        let k_upstream = ctx
-            .input_tile_ident(rope_id, 1)
-            .expect("RopeAppend input 1 (k) must be a Tile");
-        let v_upstream = ctx
-            .input_tile_ident(rope_id, 2)
-            .expect("RopeAppend input 2 (v) must be a Tile");
-
-        let layer = node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Extern {
-                    kind: crate::classified::ExternKind::KvCache,
-                    index: Some(layer),
-                } => Some(*layer),
-                _ => None,
-            })
-            .expect("RopeAppend has a kv_cache extern with a concrete layer index")
-            as usize;
-
-        let head_dim = ctx.bound("head_dim") as usize;
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
-        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-
-        // Interleaved arches (Cohere) pair adjacent (2i, 2i+1) elements
-        // for rotation; NeoX arches pair (i, i + half_dim). Same kernel
-        // signature, different math — branch at emit time.
-        let rope_call = if interleaved {
-            quote! {
-                ::ferrite_kernels::kernels::rotary_embedding_interleaved_inplace(
-                    *#q_upstream,
-                    *#k_upstream,
-                    *ctx.positions,
-                    #rotary_cos_sin,
-                    #head_dim,
-                    device.compute_stream,
-                );
-            }
-        } else {
-            quote! {
-                ::ferrite_kernels::kernels::rotary_embedding_inplace(
-                    *#q_upstream,
-                    *#k_upstream,
-                    *ctx.positions,
-                    #rotary_cos_sin,
-                    #head_dim,
-                    device.compute_stream,
-                );
-            }
-        };
-
-        quote! {
-            unsafe {
-                // RoPE runs against the flat 2D `[T, heads*head_dim]`
-                // layout — rotary_embedding_*_inplace reads dim(0)/dim(1)
-                // to derive tokens × total dim.
-                #rope_call
-                let nt = (*#k_upstream).dim(0);
-                let k_3d = (*#k_upstream)
-                    .as_view()
-                    .reshape(&[nt, #num_kv_heads, #head_dim]);
-                let v_3d = (*#v_upstream)
-                    .as_view()
-                    .reshape(&[nt, #num_kv_heads, #head_dim]);
-                ::ferrite_kernels::kernels::reshape_and_cache(
-                    *k_3d,
-                    *v_3d,
-                    *ctx.kv_cache.k_cache(#layer),
-                    *ctx.kv_cache.v_cache(#layer),
-                    *ctx.slot_mapping,
-                    ctx.kv_cache.block_size,
-                    device.compute_stream,
-                );
-            }
-            // Expose Q/K/V as 3D TensorViews so the downstream
-            // attention impls (which read `q.dim(0,1,2)` as
-            // `[total_q, num_heads, head_dim]`) match the layout
-            // produced by the fused `FusedQkvRope*` impls.
-            let #q_out = unsafe {
-                let nt = (*#q_upstream).dim(0);
-                (*#q_upstream)
-                    .as_view()
-                    .reshape(&[nt, #num_q_heads, #head_dim])
-            };
-            let #k_out = unsafe {
-                let nt = (*#k_upstream).dim(0);
-                (*#k_upstream)
-                    .as_view()
-                    .reshape(&[nt, #num_kv_heads, #head_dim])
-            };
-            let #v_out = unsafe {
-                let nt = (*#v_upstream).dim(0);
-                (*#v_upstream)
-                    .as_view()
-                    .reshape(&[nt, #num_kv_heads, #head_dim])
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `RopeAppend { q_slot, k_slot, v_slot, q_out_slot,
@@ -8145,143 +6815,6 @@ impl Implementation for FusedQkvRopePrefillImpl {
     ) -> Vec<WeightAccessor> {
         // Same packed QKV weight as the decode variant.
         FusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let rope_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| is_rope_append_op(ctx.fuf.get(**t).op))
-            .expect("claim must contain a RopeAppend");
-        let rope_node = ctx.fuf.get(rope_id);
-        let interleaved = rope_node.op == OpKind::RopeAppendInterleaved;
-
-        // Resolve rope's three tile inputs to underlying Gemms, stripping
-        // optional BiasAdd wrappers (matches `FusedQkvRopeCacheImpl`).
-        let qkv_raw: Vec<TileId> = rope_node
-            .inputs
-            .iter()
-            .take(3)
-            .filter_map(|i| match i {
-                FufInput::Tile { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
-        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
-            .iter()
-            .map(|t| {
-                unwrap_gemm_through_bias(ctx.fuf, *t)
-                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
-            })
-            .collect();
-        let biased = resolved[0].1.is_some();
-        let q_gemm_id = resolved[0].0;
-        let activation = ctx.input_expr(q_gemm_id, 0);
-
-        // Source weights: 3 Gemm weights (biases auto-ride through
-        // the packed LinearLayer). Must match `required_weights` so
-        // `fused_accessor_name` resolves identically.
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
-            .iter()
-            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm weight"))
-            .collect();
-        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-        let head_dim = ctx.bound("head_dim") as usize;
-        let q_size = num_q_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
-
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
-        let bias_assert = if biased {
-            quote! {
-                debug_assert!(
-                    (#weight_expr).dense_bias().is_some(),
-                    "FusedQkvRopePrefillImpl: DSL `bias_add` on QKV claimed but \
-                     packed LinearLayer has no bias — check safetensors path"
-                );
-            }
-        } else {
-            quote! {}
-        };
-
-        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-
-        // Cohere-style interleaved pairing has its own split-rope kernel.
-        let split_call = if interleaved {
-            quote! {
-                ::ferrite_kernels::kernels::fused_qkv_interleaved_rope(
-                    *qkv_packed,
-                    *ctx.positions,
-                    #rotary_cos_sin,
-                    #q_size,
-                    #kv_size,
-                    #num_q_heads,
-                    #num_kv_heads,
-                    #head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            }
-        } else {
-            quote! {
-                ::ferrite_kernels::kernels::fused_qkv_rope(
-                    *qkv_packed,
-                    *ctx.positions,
-                    #rotary_cos_sin,
-                    #q_size,
-                    #kv_size,
-                    #num_q_heads,
-                    #num_kv_heads,
-                    #head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            }
-        };
-
-        quote! {
-            // Fused QKV GEMM → packed [num_tokens, q + 2*kv] tensor,
-            // then RoPE-split into contiguous Q/K/V. The packed QKV
-            // buffer drops as soon as the rope-split kernel returns.
-            //
-            // Unlike `fused_qkv_rope_cache` this does NOT write to the
-            // paged cache — the cache write is a separate step below
-            // so the K/V OwnedTensors remain available for contiguous
-            // prefill attention.
-            let (#q_out, #k_out, #v_out) = unsafe {
-                #bias_assert
-                let qkv_packed = (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                #split_call
-            };
-            // Commit rotated K/V into the paged cache at slot_mapping
-            // so subsequent decode steps read the correct values.
-            unsafe {
-                ::ferrite_kernels::attention_helpers::write_kv_cache(
-                    (#k_out).view(),
-                    (#v_out).view(),
-                    ctx.slot_mapping,
-                    ctx.kv_cache,
-                    #layer,
-                    device.compute_stream,
-                );
-            }
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -8568,75 +7101,6 @@ impl Implementation for AttentionPrefillContiguousImpl {
         true
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let node = ctx.fuf.get(tile);
-
-        // Q, K, V from the DSL's `attention(q, k, v, ...)` — slots
-        // 0/1/2 are the upstream rope-append tile's three outputs.
-        let q_expr = ctx.input_expr(tile, 0);
-        let k_expr = ctx.input_expr(tile, 1);
-        let v_expr = ctx.input_expr(tile, 2);
-
-        // Config-driven attention scale + softcap (see
-        // `AttentionViaCacheImpl::emit_call` for the rationale).
-        let scale_tokens = attention_scale_tokens(ctx);
-        let softcap_tokens = attention_softcap_tokens(ctx);
-        let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
-        // Flag is harmless when rotary_dim=0 (no fused RoPE in FA2 on
-        // the prefill path), but pass the right value for consistency
-        // and for any future prefill path that does fused RoPE.
-        let layer = node.inputs.iter().find_map(|i| match i {
-            FufInput::Extern {
-                kind: crate::classified::ExternKind::KvCache,
-                index: Some(layer),
-            } => Some(*layer),
-            _ => None,
-        });
-        let interleaved_lit = layer
-            .map(|l| layer_rope_is_interleaved(ctx.fuf, l))
-            .unwrap_or(false);
-
-        quote! {
-            let mut #out = unsafe {
-                // Fresh-prefill flash attention reads K/V directly
-                // from the contiguous tensors produced by
-                // `fused_qkv_rope`. K is already rotated, so the
-                // cos_sin_cache pointer is null (no fused RoPE
-                // inside FA2). `cu_seqlens_k = cu_seqlens_q` for
-                // fresh prefill — each sequence's K length equals
-                // its Q length.
-                ::ferrite_kernels::kernels::flash_attn_contiguous(
-                    *#q_expr,
-                    *#k_expr,
-                    *#v_expr,
-                    *ctx.cu_seqlens_q,
-                    *ctx.cu_seqlens_q,
-                    ctx.max_seqlen_q,
-                    ctx.max_seqlen_k,
-                    #scale_tokens,
-                    true, // is_causal
-                    #softcap_tokens,
-                    -1,   // window_size_left (-1 = disabled; sliding variant covers non-(-1))
-                    &mut device.caching,
-                    device.compute_stream,
-                    ::std::ptr::null::<u8>(),
-                    0,     // rotary_dim
-                    #interleaved_lit, // is_rotary_interleaved (rope flavor at this layer)
-                )
-            };
-            // Flatten [num_tokens, num_q_heads, head_dim] → [num_tokens, q_size]
-            // so the downstream o_proj gemm sees a 2D [M, K] input with the
-            // right K dimension.
-            unsafe {
-                let nt = (*#out).dim(0);
-                let dt = (*#out).dtype();
-                #out.reshape(&[nt, #q_size], dt);
-            }
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `AttentionPrefillContiguous { q_slot, k_slot, v_slot,
@@ -8821,71 +7285,6 @@ impl Implementation for SlidingAttentionViaCacheImpl {
 
     fn is_compute_bound(&self) -> bool {
         true
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let node = ctx.fuf.get(tile);
-        let q_expr = ctx.input_expr(tile, 0);
-        let layer = node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Extern {
-                    kind: crate::classified::ExternKind::KvCache,
-                    index: Some(layer),
-                } => Some(*layer),
-                _ => None,
-            })
-            .expect("SlidingAttention has a kv_cache extern with a concrete layer index")
-            as usize;
-
-        let scale_tokens = attention_scale_tokens(ctx);
-        let softcap_tokens = attention_softcap_tokens(ctx);
-        let window_tokens = sliding_window_left_tokens(ctx);
-        let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
-
-        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-        let interleaved_lit = layer_rope_is_interleaved(ctx.fuf, layer as u64);
-
-        quote! {
-            let mut #out = unsafe {
-                let has_spans = !ctx.kv_cache.block_unrotated_gpu().is_null();
-                let (cos_sin_ptr, rotary_dim) = if has_spans {
-                    (
-                        #rotary_cos_sin.raw_ptr() as *const u8,
-                        #rotary_cos_sin.dim(1),
-                    )
-                } else {
-                    (::std::ptr::null::<u8>(), 0)
-                };
-                ::ferrite_kernels::attention_helpers::attention_decode_from_cache(
-                    #q_expr,
-                    ctx.cu_seqlens_q,
-                    ctx.seqused_k,
-                    ctx.block_table,
-                    ctx.max_seqlen_q,
-                    ctx.max_seqlen_k,
-                    #scale_tokens,
-                    #softcap_tokens,
-                    #window_tokens,
-                    ctx.kv_cache,
-                    #layer,
-                    device.num_sm,
-                    &mut device.caching,
-                    device.compute_stream,
-                    cos_sin_ptr,
-                    rotary_dim,
-                    #interleaved_lit, // is_rotary_interleaved (rope flavor at this layer)
-                )
-            };
-            unsafe {
-                let nt = (*#out).dim(0);
-                let dt = (*#out).dtype();
-                #out.reshape(&[nt, #q_size], dt);
-            }
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -9087,60 +7486,6 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
 
     fn is_compute_bound(&self) -> bool {
         true
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let node = ctx.fuf.get(tile);
-
-        let q_expr = ctx.input_expr(tile, 0);
-        let k_expr = ctx.input_expr(tile, 1);
-        let v_expr = ctx.input_expr(tile, 2);
-
-        let scale_tokens = attention_scale_tokens(ctx);
-        let softcap_tokens = attention_softcap_tokens(ctx);
-        let window_tokens = sliding_window_left_tokens(ctx);
-        let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
-        // Flag is moot here (rotary_dim=0); pass for consistency.
-        let layer = node.inputs.iter().find_map(|i| match i {
-            FufInput::Extern {
-                kind: crate::classified::ExternKind::KvCache,
-                index: Some(layer),
-            } => Some(*layer),
-            _ => None,
-        });
-        let interleaved_lit = layer
-            .map(|l| layer_rope_is_interleaved(ctx.fuf, l))
-            .unwrap_or(false);
-
-        quote! {
-            let mut #out = unsafe {
-                ::ferrite_kernels::kernels::flash_attn_contiguous(
-                    *#q_expr,
-                    *#k_expr,
-                    *#v_expr,
-                    *ctx.cu_seqlens_q,
-                    *ctx.cu_seqlens_q,
-                    ctx.max_seqlen_q,
-                    ctx.max_seqlen_k,
-                    #scale_tokens,
-                    true, // is_causal
-                    #softcap_tokens,
-                    #window_tokens,
-                    &mut device.caching,
-                    device.compute_stream,
-                    ::std::ptr::null::<u8>(),
-                    0,     // rotary_dim
-                    #interleaved_lit, // is_rotary_interleaved (rope flavor at this layer)
-                )
-            };
-            unsafe {
-                let nt = (*#out).dim(0);
-                let dt = (*#out).dtype();
-                #out.reshape(&[nt, #q_size], dt);
-            }
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -9479,27 +7824,6 @@ impl Implementation for CutlassGemmImpl {
         true
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let x = ctx.input_expr(tile, 0);
-        let w = ctx.input_expr(tile, 1);
-        let tile_m = self.tile_m;
-        let tile_n = self.tile_n;
-        let stages = self.stages;
-        quote! {
-            let #out = unsafe {
-                ::ferrite_kernels::cutlass::cutlass_gemm(
-                    *(#x),
-                    (#w).dense_weight(),
-                    ::ferrite_kernels::cutlass::CutlassTile::new(#tile_m, #tile_n, #stages),
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `CutlassGemm { in_slot, out_slot, layer, weight_fn,
@@ -9720,30 +8044,6 @@ impl Implementation for CutlassGemmSplitKImpl {
 
     fn is_compute_bound(&self) -> bool {
         true
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let x = ctx.input_expr(tile, 0);
-        let w = ctx.input_expr(tile, 1);
-        let tile_m = self.tile_m;
-        let tile_n = self.tile_n;
-        let stages = self.stages;
-        let split_k = self.split_k;
-        quote! {
-            let #out = unsafe {
-                ::ferrite_kernels::cutlass::cutlass_gemm_splitk(
-                    *(#x),
-                    (#w).dense_weight(),
-                    ::ferrite_kernels::cutlass::CutlassSplitKTile::new(
-                        #tile_m, #tile_n, #stages, #split_k,
-                    ),
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -10029,65 +8329,6 @@ impl Implementation for CutlassGemmAddImpl {
         vec![((add_id, 0), residual_src)]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let gemm_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm)
-            .expect("cutlass gemm+add claim contains a Gemm");
-        let add_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Add)
-            .expect("cutlass gemm+add claim contains an Add");
-
-        let x = ctx.input_expr(gemm_id, 0);
-        let w = ctx.input_expr(gemm_id, 1);
-        // Identify the residual-side upstream of the Add: whichever
-        // Tile input of Add isn't the Gemm's output.
-        let residual_slot = {
-            let add_node = ctx.fuf.get(add_id);
-            add_node
-                .inputs
-                .iter()
-                .enumerate()
-                .find_map(|(idx, i)| match i {
-                    FufInput::Tile { id, .. } if *id != gemm_id => Some(idx),
-                    _ => None,
-                })
-                .expect("cutlass gemm+add claim: Add has residual tile input")
-        };
-        let residual_ident = ctx
-            .input_tile_ident(add_id, residual_slot)
-            .expect("residual tile input resolves to an upstream OwnedTensor");
-        let out = ctx.output_ident(add_id, 0);
-
-        let tile_m = self.tile_m;
-        let tile_n = self.tile_n;
-        let stages = self.stages;
-        // Mirror `AddRefImpl`'s buffer-aliasing pattern: kernel
-        // mutates the residual buffer in place via raw pointer, then
-        // downstream tiles read through an `as_view()` of the same
-        // buffer. Avoids moving the residual `OwnedTensor` through
-        // the wrapper — the upstream binding is preserved, so any
-        // other scheduled op retaining a reference to the same tile
-        // still compiles.
-        quote! {
-            unsafe {
-                ::ferrite_kernels::cutlass::cutlass_gemm_add(
-                    *(#x),
-                    (#w).dense_weight(),
-                    *(#residual_ident),
-                    ::ferrite_kernels::cutlass::CutlassTile::new(#tile_m, #tile_n, #stages),
-                    device.compute_stream,
-                );
-            }
-            let #out = unsafe { (*(#residual_ident)).as_view() };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `CutlassGemmAdd { in_slot, residual_slot, layer,
@@ -10270,23 +8511,6 @@ impl Implementation for CutlassGemvImpl {
         false
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let x = ctx.input_expr(tile, 0);
-        let w = ctx.input_expr(tile, 1);
-        quote! {
-            let #out = unsafe {
-                ::ferrite_kernels::cutlass::cutlass_gemv(
-                    *(#x),
-                    (#w).dense_weight(),
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
 
     fn opcode_shape(&self) -> OpcodeShape {
@@ -10410,20 +8634,12 @@ fn is_fp8_gemm(fuf: &Fuf, tile: TileId) -> bool {
     node.op == OpKind::Gemm && matches!(weight_storage_of(node), Some(StorageFormat::Fp8 { .. }))
 }
 
-/// Pick the accessor Rust type for an FP8 GEMM — `Fp8BlockLinear`
-/// for blockwise (DeepSeek-style 128×128), `Fp8Linear` for per-tensor
-/// / per-channel. Both expose the same `forward(x, cublas, alloc,
-/// stream) -> OwnedTensor` signature, so every `emit_call` body above
-/// stays identical; only the `required_weights` rust_type and the
-/// generated `Weights::load` call differ between the two storages.
-fn fp8_accessor_type_for(fuf: &Fuf, gemm_tile: TileId) -> TokenStream {
-    match weight_storage_of(fuf.get(gemm_tile)) {
-        Some(StorageFormat::Fp8 {
-            block_size: Some(_),
-            ..
-        }) => quote! { ::ferrite_kernels::layers::Fp8BlockLinear },
-        _ => quote! { ::ferrite_kernels::layers::Fp8Linear },
-    }
+/// Accessor Rust type for an FP8 GEMM. Always `Fp8AnyLinear` — the
+/// loader picks `Std` vs `Block` per claim based on the weight's
+/// on-disk storage, but the per-arch Weights field type is uniform so
+/// the host-interpreter `weight_fn` can have one concrete signature.
+fn fp8_accessor_type_for(_fuf: &Fuf, _gemm_tile: TileId) -> TokenStream {
+    quote! { ::ferrite_kernels::layers::Fp8AnyLinear }
 }
 
 /// True if a `MarlinFusedQkvRope*Impl` would accept `seed` as one of
@@ -10620,22 +8836,6 @@ impl Implementation for MarlinGemmImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let x = ctx.input_expr(tile, 0);
-        let w = ctx.input_expr(tile, 1);
-        quote! {
-            let #out = unsafe {
-                (#w).forward(
-                    #x,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
 
     fn opcode_shape(&self) -> OpcodeShape {
@@ -10817,56 +9017,6 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
             rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
             source_weights: sources,
         }]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Structurally identical to `FusedGateUpSiluMulImpl::emit_call`
-        // but the fused MarlinLinear's `.forward` takes `(x, alloc,
-        // stream)` — no cublas handle.
-        let silu_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Silu)
-            .expect("fused gate/up/silu/mul claim must contain Silu");
-        let mul_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-            .expect("fused gate/up/silu/mul claim must contain Mul");
-        let (gate_id, _) =
-            first_tile_input(ctx.fuf.get(silu_id)).expect("silu has a tile input — the gate gemm");
-        let up_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-            .expect("claim contains a second Gemm — the up gemm");
-
-        let activation = ctx.input_expr(gate_id, 0);
-
-        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
-        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let mul_out = ctx.output_ident(mul_id, 0);
-        let intermediate = ctx.bound("intermediate_size") as usize;
-
-        quote! {
-            let #mul_out = unsafe {
-                let gate_up = (#weight_expr).forward(
-                    #activation,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                ::ferrite_kernels::kernels::silu_and_mul_fused(
-                    *gate_up,
-                    #intermediate,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -11083,56 +9233,6 @@ impl Implementation for MarlinFusedGateUpGeluMulImpl {
             rust_type: quote! { ::ferrite_kernels::layers::MarlinLinear },
             source_weights: sources,
         }]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Structurally identical to `FusedGateUpGeluMulImpl::emit_call`
-        // and to the Silu Marlin variant; only the activation kernel
-        // name changes.
-        let gelu_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Gelu)
-            .expect("fused gate/up/gelu/mul claim must contain Gelu");
-        let mul_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-            .expect("fused gate/up/gelu/mul claim must contain Mul");
-        let (gate_id, _) =
-            first_tile_input(ctx.fuf.get(gelu_id)).expect("gelu has a tile input — the gate gemm");
-        let up_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-            .expect("claim contains a second Gemm — the up gemm");
-
-        let activation = ctx.input_expr(gate_id, 0);
-
-        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
-        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let mul_out = ctx.output_ident(mul_id, 0);
-        let intermediate = ctx.bound("intermediate_size") as usize;
-
-        quote! {
-            let #mul_out = unsafe {
-                let gate_up = (#weight_expr).forward(
-                    #activation,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                ::ferrite_kernels::kernels::gelu_and_mul_fused(
-                    *gate_up,
-                    #intermediate,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -11414,115 +9514,6 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Mirror of `FusedQkvRopeCacheImpl::emit_call` with the
-        // cuBLAS-shaped `(#w).forward(#x, &mut device.cublas, ...)`
-        // replaced by `(#w).forward(#x, &mut device.caching, stream)`
-        // (MarlinLinear owns the matmul internally). The FP8 KV
-        // branch stays — it's orthogonal to the weight format.
-        //
-        // BiasAdd-aware: rope's three tile inputs are unwrapped
-        // through an optional BiasAdd wrapper to find the underlying
-        // Gemms. Bias is still applied — `MarlinLinear::forward`
-        // does `bias_add_inplace` after `marlin_gemm` when its
-        // packed bias is present (auto-detected by
-        // `MarlinLinear::load_awq_concat`).
-        let rope_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
-            .expect("claim must contain a RopeAppend");
-        let rope_node = ctx.fuf.get(rope_id);
-
-        let qkv_raw: Vec<TileId> = rope_node
-            .inputs
-            .iter()
-            .take(3)
-            .filter_map(|i| match i {
-                FufInput::Tile { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
-        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
-            .iter()
-            .map(|t| {
-                unwrap_gemm_through_bias(ctx.fuf, *t)
-                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
-            })
-            .collect();
-        let q_gemm_id = resolved[0].0;
-        let activation = ctx.input_expr(q_gemm_id, 0);
-
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
-            .iter()
-            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
-            .collect();
-        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-        let head_dim = ctx.bound("head_dim") as usize;
-        let q_size = num_q_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
-
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
-        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-
-        quote! {
-            let #q_out = unsafe {
-                let qkv_packed = (#weight_expr).forward(
-                    #activation,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                if ctx.kv_cache.is_fp8() {
-                    ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
-                        *qkv_packed,
-                        *ctx.positions,
-                        #rotary_cos_sin,
-                        *ctx.slot_mapping,
-                        *ctx.kv_cache.k_cache(#layer),
-                        *ctx.kv_cache.v_cache(#layer),
-                        ctx.kv_cache.k_scale_ptr(#layer),
-                        ctx.kv_cache.v_scale_ptr(#layer),
-                        #q_size,
-                        #kv_size,
-                        #num_q_heads,
-                        #head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                } else {
-                    ::ferrite_kernels::kernels::fused_qkv_rope_cache(
-                        *qkv_packed,
-                        *ctx.positions,
-                        #rotary_cos_sin,
-                        *ctx.slot_mapping,
-                        *ctx.kv_cache.k_cache(#layer),
-                        *ctx.kv_cache.v_cache(#layer),
-                        #q_size,
-                        #kv_size,
-                        #num_q_heads,
-                        #head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                }
-            };
-            let #k_out = ctx.kv_cache.k_cache(#layer);
-            let #v_out = ctx.kv_cache.v_cache(#layer);
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `MarlinFusedQkvRopeCache { in_slot, out_slot, layer,
@@ -11772,98 +9763,6 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         MarlinFusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        // Mirror of `FusedQkvRopePrefillImpl::emit_call` with
-        // `MarlinLinear::forward(x, alloc, stream)` replacing the
-        // cuBLAS call. BiasAdd-aware: rope's three tile inputs are
-        // unwrapped through an optional BiasAdd wrapper so the
-        // packed `MarlinLinear` (carrying the concat of the three
-        // source .bias tensors) is still the authoritative bias
-        // applicator — `MarlinLinear::forward` runs
-        // `bias_add_inplace` after `marlin_gemm`.
-        let rope_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
-            .expect("claim must contain a RopeAppend");
-        let rope_node = ctx.fuf.get(rope_id);
-
-        let qkv_raw: Vec<TileId> = rope_node
-            .inputs
-            .iter()
-            .take(3)
-            .filter_map(|i| match i {
-                FufInput::Tile { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
-        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
-            .iter()
-            .map(|t| {
-                unwrap_gemm_through_bias(ctx.fuf, *t)
-                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
-            })
-            .collect();
-        let q_gemm_id = resolved[0].0;
-        let activation = ctx.input_expr(q_gemm_id, 0);
-
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
-            .iter()
-            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
-            .collect();
-        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-        let head_dim = ctx.bound("head_dim") as usize;
-        let q_size = num_q_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
-
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
-        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-
-        quote! {
-            let (#q_out, #k_out, #v_out) = unsafe {
-                let qkv_packed = (#weight_expr).forward(
-                    #activation,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                ::ferrite_kernels::kernels::fused_qkv_rope(
-                    *qkv_packed,
-                    *ctx.positions,
-                    #rotary_cos_sin,
-                    #q_size,
-                    #kv_size,
-                    #num_q_heads,
-                    #num_kv_heads,
-                    #head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-            unsafe {
-                ::ferrite_kernels::attention_helpers::write_kv_cache(
-                    (#k_out).view(),
-                    (#v_out).view(),
-                    ctx.slot_mapping,
-                    ctx.kv_cache,
-                    #layer,
-                    device.compute_stream,
-                );
-            }
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -12139,23 +10038,6 @@ impl Implementation for Bnb4GemmImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let x = ctx.input_expr(tile, 0);
-        let w = ctx.input_expr(tile, 1);
-        quote! {
-            let #out = unsafe {
-                (#w).forward(
-                    #x,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
 
     fn opcode_shape(&self) -> OpcodeShape {
@@ -12321,20 +10203,74 @@ impl Implementation for Fp8GemmImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let x = ctx.input_expr(tile, 0);
-        let w = ctx.input_expr(tile, 1);
+    // ── Host-interpreter codegen ────────────────────────────────
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Fp8Gemm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("Fp8Gemm: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("Fp8Gemm: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Fp8Gemm", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+
+    fn interpreter_arm(&self, _model: &ModelParams) -> TokenStream {
         quote! {
-            let #out = unsafe {
-                (#w).forward(
-                    #x,
+            let __out = unsafe {
+                let __view = ::ferrite_forward::tile_ref(__tiles, in_slot)
+                    .as_view(__tiles);
+                let __w = (weight_fn)(wm, layer);
+                __w.forward(
+                    __view,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 )
             };
+            __tiles[out_slot as usize] =
+                Some(::ferrite_forward::TileEntry::Owned(__out));
         }
     }
 }
@@ -12460,31 +10396,86 @@ impl Implementation for Fp8FusedGemmBiasImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let gemm_id = *ctx
+    // ── Host-interpreter codegen ────────────────────────────────
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Fp8GemmBias",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let gemm_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
-            .expect("claim contains Gemm");
-        let bias_id = *ctx
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("Fp8FusedGemmBias: claim contains Gemm");
+        let bias_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::BiasAdd)
-            .expect("claim contains BiasAdd");
-        let activation = ctx.input_expr(gemm_id, 0);
-        let (wid, index) = first_weight_ref(ctx.fuf.get(gemm_id)).expect("gemm weight ref");
-        let name = weight_field_name(ctx.program, wid, index);
-        let weight_expr = ctx.weight_accessor(&name);
-        let out = ctx.output_ident(bias_id, 0);
+            .find(|t| fuf.get(**t).op == OpKind::BiasAdd)
+            .expect("Fp8FusedGemmBias: claim contains BiasAdd");
+        let gemm_node = fuf.get(gemm_id);
+        let (in_id, in_slot) = match gemm_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("Fp8FusedGemmBias: gemm's first input must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(bias_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("Fp8FusedGemmBias: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Fp8GemmBias", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+
+    fn interpreter_arm(&self, _model: &ModelParams) -> TokenStream {
+        // Bias rides on the inner Fp8Linear / Fp8BlockLinear's
+        // `.bias` field; the wrapped `forward` applies it in the
+        // FP8 GEMM epilog. No separate add kernel.
         quote! {
-            let #out = unsafe {
-                (#weight_expr).forward(
-                    #activation,
+            let __out = unsafe {
+                let __view = ::ferrite_forward::tile_ref(__tiles, in_slot)
+                    .as_view(__tiles);
+                let __w = (weight_fn)(wm, layer);
+                __w.forward(
+                    __view,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 )
             };
+            __tiles[out_slot as usize] =
+                Some(::ferrite_forward::TileEntry::Owned(__out));
         }
     }
 }
@@ -12605,51 +10596,100 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let silu_id = *ctx
+    // ── Host-interpreter codegen ────────────────────────────────
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Fp8FusedGateUpSiluMul",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let silu_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Silu)
-            .expect("fused gate/up/silu/mul claim must contain Silu");
-        let mul_id = *ctx
+            .find(|t| fuf.get(**t).op == OpKind::Silu)
+            .expect("Fp8FusedGateUpSiluMul: claim contains Silu");
+        let mul_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-            .expect("fused gate/up/silu/mul claim must contain Mul");
-        let (gate_id, _) =
-            first_tile_input(ctx.fuf.get(silu_id)).expect("silu has a tile input — the gate gemm");
-        let up_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-            .expect("claim contains a second Gemm — the up gemm");
+            .find(|t| fuf.get(**t).op == OpKind::Mul)
+            .expect("Fp8FusedGateUpSiluMul: claim contains Mul");
+        let gate_id = match fuf.get(silu_id).inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            other => panic!("Fp8FusedGateUpSiluMul: Silu input 0 must be a Tile (got {other:?})"),
+        };
+        let gate_node = fuf.get(gate_id);
+        let (in_id, in_slot) = match gate_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("Fp8FusedGateUpSiluMul: gate gemm input 0 must be a Tile (got {other:?})")
+            }
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(mul_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("Fp8FusedGateUpSiluMul: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Fp8FusedGateUpSiluMul", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
 
-        let activation = ctx.input_expr(gate_id, 0);
-
-        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
-        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let mul_out = ctx.output_ident(mul_id, 0);
-        let intermediate = ctx.bound("intermediate_size") as usize;
-
+    fn interpreter_arm(&self, model: &ModelParams) -> TokenStream {
+        let intermediate = *model
+            .bounds
+            .get("intermediate_size")
+            .expect("Fp8FusedGateUpSiluMul: model has no intermediate_size")
+            as usize;
         quote! {
-            let #mul_out = unsafe {
-                let gate_up = (#weight_expr).forward(
-                    #activation,
+            let __out = unsafe {
+                let __view = ::ferrite_forward::tile_ref(__tiles, in_slot)
+                    .as_view(__tiles);
+                let __w = (weight_fn)(wm, layer);
+                let __gate_up = __w.forward(
+                    __view,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 );
                 ::ferrite_kernels::kernels::silu_and_mul_fused(
-                    *gate_up,
+                    *__gate_up,
                     #intermediate,
                     &mut device.caching,
                     device.compute_stream,
                 )
             };
+            __tiles[out_slot as usize] =
+                Some(::ferrite_forward::TileEntry::Owned(__out));
         }
     }
 }
@@ -12763,54 +10803,6 @@ impl Implementation for Bnb4FusedGateUpSiluMulImpl {
             rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
             source_weights: sources,
         }]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let silu_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Silu)
-            .expect("fused gate/up/silu/mul claim must contain Silu");
-        let mul_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-            .expect("fused gate/up/silu/mul claim must contain Mul");
-        let (gate_id, _) =
-            first_tile_input(ctx.fuf.get(silu_id)).expect("silu has a tile input — the gate gemm");
-        let up_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-            .expect("claim contains a second Gemm — the up gemm");
-
-        let activation = ctx.input_expr(gate_id, 0);
-
-        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
-        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let mul_out = ctx.output_ident(mul_id, 0);
-        let intermediate = ctx.bound("intermediate_size") as usize;
-
-        quote! {
-            let #mul_out = unsafe {
-                let gate_up = (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                ::ferrite_kernels::kernels::silu_and_mul_fused(
-                    *gate_up,
-                    #intermediate,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -13021,54 +11013,6 @@ impl Implementation for Bnb4FusedGateUpGeluMulImpl {
             rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
             source_weights: sources,
         }]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let gelu_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Gelu)
-            .expect("fused gate/up/gelu/mul claim must contain Gelu");
-        let mul_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-            .expect("fused gate/up/gelu/mul claim must contain Mul");
-        let (gate_id, _) =
-            first_tile_input(ctx.fuf.get(gelu_id)).expect("gelu has a tile input — the gate gemm");
-        let up_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-            .expect("claim contains a second Gemm — the up gemm");
-
-        let activation = ctx.input_expr(gate_id, 0);
-
-        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
-        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let mul_out = ctx.output_ident(mul_id, 0);
-        let intermediate = ctx.bound("intermediate_size") as usize;
-
-        quote! {
-            let #mul_out = unsafe {
-                let gate_up = (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                ::ferrite_kernels::kernels::gelu_and_mul_fused(
-                    *gate_up,
-                    #intermediate,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -13287,51 +11231,100 @@ impl Implementation for Fp8FusedGateUpGeluMulImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let gelu_id = *ctx
+    // ── Host-interpreter codegen ────────────────────────────────
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Fp8FusedGateUpGeluMul",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let gelu_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Gelu)
-            .expect("fused gate/up/gelu/mul claim must contain Gelu");
-        let mul_id = *ctx
+            .find(|t| fuf.get(**t).op == OpKind::Gelu)
+            .expect("Fp8FusedGateUpGeluMul: claim contains Gelu");
+        let mul_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::Mul)
-            .expect("fused gate/up/gelu/mul claim must contain Mul");
-        let (gate_id, _) =
-            first_tile_input(ctx.fuf.get(gelu_id)).expect("gelu has a tile input — the gate gemm");
-        let up_id = ctx
-            .claimed_tiles
-            .iter()
-            .copied()
-            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm && *t != gate_id)
-            .expect("claim contains a second Gemm — the up gemm");
+            .find(|t| fuf.get(**t).op == OpKind::Mul)
+            .expect("Fp8FusedGateUpGeluMul: claim contains Mul");
+        let gate_id = match fuf.get(gelu_id).inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            other => panic!("Fp8FusedGateUpGeluMul: Gelu input 0 must be a Tile (got {other:?})"),
+        };
+        let gate_node = fuf.get(gate_id);
+        let (in_id, in_slot) = match gate_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("Fp8FusedGateUpGeluMul: gate gemm input 0 must be a Tile (got {other:?})")
+            }
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(mul_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("Fp8FusedGateUpGeluMul: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Fp8FusedGateUpGeluMul", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
 
-        let activation = ctx.input_expr(gate_id, 0);
-
-        let gate_w = first_weight_ref(ctx.fuf.get(gate_id)).expect("gate gemm has a weight");
-        let up_w = first_weight_ref(ctx.fuf.get(up_id)).expect("up gemm has a weight");
-        let fused_name = fused_accessor_name(ctx.program, &[gate_w, up_w]);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let mul_out = ctx.output_ident(mul_id, 0);
-        let intermediate = ctx.bound("intermediate_size") as usize;
-
+    fn interpreter_arm(&self, model: &ModelParams) -> TokenStream {
+        let intermediate = *model
+            .bounds
+            .get("intermediate_size")
+            .expect("Fp8FusedGateUpGeluMul: model has no intermediate_size")
+            as usize;
         quote! {
-            let #mul_out = unsafe {
-                let gate_up = (#weight_expr).forward(
-                    #activation,
+            let __out = unsafe {
+                let __view = ::ferrite_forward::tile_ref(__tiles, in_slot)
+                    .as_view(__tiles);
+                let __w = (weight_fn)(wm, layer);
+                let __gate_up = __w.forward(
+                    __view,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 );
                 ::ferrite_kernels::kernels::gelu_and_mul_fused(
-                    *gate_up,
+                    *__gate_up,
                     #intermediate,
                     &mut device.caching,
                     device.compute_stream,
                 )
             };
+            __tiles[out_slot as usize] =
+                Some(::ferrite_forward::TileEntry::Owned(__out));
         }
     }
 }
@@ -13519,14 +11512,48 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
         }]
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let rope_id = *ctx
+    // ── Host-interpreter codegen ────────────────────────────────
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Fp8FusedQkvRopeCache",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
+                    ),
+                ),
+                (
+                    "cos_sin_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let rope_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
-            .expect("claim must contain a RopeAppend");
-        let rope_node = ctx.fuf.get(rope_id);
-
+            .find(|t| fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("Fp8FusedQkvRopeCache: claim contains a RopeAppend");
+        let rope_node = fuf.get(rope_id);
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("Fp8FusedQkvRopeCache: RopeAppend has KvCache extern with layer index")
+            as u32;
         let qkv_raw: Vec<TileId> = rope_node
             .inputs
             .iter()
@@ -13536,56 +11563,99 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
                 _ => None,
             })
             .collect();
-        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
         let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
             .iter()
             .map(|t| {
-                unwrap_gemm_through_bias(ctx.fuf, *t)
-                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
+                unwrap_gemm_through_bias(fuf, *t)
+                    .expect("Fp8FusedQkvRopeCache: Gemm-or-BiasAdd(Gemm)")
             })
             .collect();
         let q_gemm_id = resolved[0].0;
-        let activation = ctx.input_expr(q_gemm_id, 0);
+        let q_node = fuf.get(q_gemm_id);
+        let (in_id, in_slot) = match q_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("Fp8FusedQkvRopeCache: q_gemm input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(rope_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("Fp8FusedQkvRopeCache: required_weights returned empty");
+        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
+        assert_eq!(
+            weight_layer, layer,
+            "Fp8FusedQkvRopeCache: weight_layer disagrees with kv_cache layer"
+        );
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        let uses_local = m.claimed_tiles.iter().any(|&tid| {
+            fuf.get(tid).inputs.iter().any(|i| {
+                matches!(
+                    i,
+                    FufInput::Extern {
+                        kind: ExternKind::RotaryLocal,
+                        ..
+                    }
+                )
+            })
+        });
+        let cos_sin_ident = if uses_local {
+            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
+        } else {
+            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
+        };
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Fp8FusedQkvRopeCache", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { Weights::#cos_sin_ident },
+            ],
+        )])
+    }
 
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
-            .iter()
-            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
-            .collect();
-        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-        let head_dim = ctx.bound("head_dim") as usize;
+    fn interpreter_arm(&self, model: &ModelParams) -> TokenStream {
+        let num_q_heads = *model
+            .bounds
+            .get("num_attention_heads")
+            .expect("Fp8FusedQkvRopeCache: model has no num_attention_heads")
+            as usize;
+        let num_kv_heads = *model
+            .bounds
+            .get("num_key_value_heads")
+            .expect("Fp8FusedQkvRopeCache: model has no num_key_value_heads")
+            as usize;
+        let head_dim = *model
+            .bounds
+            .get("head_dim")
+            .expect("Fp8FusedQkvRopeCache: model has no head_dim") as usize;
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
-
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
-
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
         quote! {
-            let #q_out = unsafe {
-                let qkv_packed = (#weight_expr).forward(
-                    #activation,
+            let __out = unsafe {
+                let __view = ::ferrite_forward::tile_ref(__tiles, in_slot)
+                    .as_view(__tiles);
+                let __w = (weight_fn)(wm, layer);
+                let qkv_packed = __w.forward(
+                    __view,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 );
+                let __cos_sin = (cos_sin_fn)(wm, layer);
                 if ctx.kv_cache.is_fp8() {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
                         *ctx.positions,
-                        wm.rotary.cos_sin_cache,
+                        __cos_sin,
                         *ctx.slot_mapping,
-                        *ctx.kv_cache.k_cache(#layer),
-                        *ctx.kv_cache.v_cache(#layer),
-                        ctx.kv_cache.k_scale_ptr(#layer),
-                        ctx.kv_cache.v_scale_ptr(#layer),
+                        *ctx.kv_cache.k_cache(layer as usize),
+                        *ctx.kv_cache.v_cache(layer as usize),
+                        ctx.kv_cache.k_scale_ptr(layer as usize),
+                        ctx.kv_cache.v_scale_ptr(layer as usize),
                         #q_size,
                         #kv_size,
                         #num_q_heads,
@@ -13597,10 +11667,10 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
                     ::ferrite_kernels::kernels::fused_qkv_rope_cache(
                         *qkv_packed,
                         *ctx.positions,
-                        wm.rotary.cos_sin_cache,
+                        __cos_sin,
                         *ctx.slot_mapping,
-                        *ctx.kv_cache.k_cache(#layer),
-                        *ctx.kv_cache.v_cache(#layer),
+                        *ctx.kv_cache.k_cache(layer as usize),
+                        *ctx.kv_cache.v_cache(layer as usize),
                         #q_size,
                         #kv_size,
                         #num_q_heads,
@@ -13610,8 +11680,8 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
                     )
                 }
             };
-            let #k_out = ctx.kv_cache.k_cache(#layer);
-            let #v_out = ctx.kv_cache.v_cache(#layer);
+            __tiles[out_slot as usize] =
+                Some(::ferrite_forward::TileEntry::Owned(__out));
         }
     }
 }
@@ -13683,14 +11753,50 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
         Fp8FusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let rope_id = *ctx
+    // ── Host-interpreter codegen ────────────────────────────────
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Fp8FusedQkvRopePrefill",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("q_out_slot", syn::parse_quote!(u32)),
+                ("k_out_slot", syn::parse_quote!(u32)),
+                ("v_out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
+                    ),
+                ),
+                (
+                    "cos_sin_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let rope_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
-            .expect("claim must contain a RopeAppend");
-        let rope_node = ctx.fuf.get(rope_id);
-
+            .find(|t| fuf.get(**t).op == OpKind::RopeAppend)
+            .expect("Fp8FusedQkvRopePrefill: claim contains a RopeAppend");
+        let rope_node = fuf.get(rope_id);
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("Fp8FusedQkvRopePrefill: RopeAppend has KvCache extern with layer index")
+            as u32;
         let qkv_raw: Vec<TileId> = rope_node
             .inputs
             .iter()
@@ -13700,47 +11806,100 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
                 _ => None,
             })
             .collect();
-        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
         let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
             .iter()
-            .map(|t| unwrap_gemm_through_bias(ctx.fuf, *t).expect("claim-time validated"))
+            .map(|t| {
+                unwrap_gemm_through_bias(fuf, *t)
+                    .expect("Fp8FusedQkvRopePrefill: Gemm-or-BiasAdd(Gemm)")
+            })
             .collect();
         let q_gemm_id = resolved[0].0;
-        let activation = ctx.input_expr(q_gemm_id, 0);
+        let q_node = fuf.get(q_gemm_id);
+        let (in_id, in_slot) = match q_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("Fp8FusedQkvRopePrefill: q_gemm input 0 must be a Tile (got {other:?})")
+            }
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let q_out = slots.of(rope_id, 0);
+        let k_out = slots.of(rope_id, 1);
+        let v_out = slots.of(rope_id, 2);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("Fp8FusedQkvRopePrefill: required_weights returned empty");
+        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
+        assert_eq!(
+            weight_layer, layer,
+            "Fp8FusedQkvRopePrefill: weight_layer disagrees with kv_cache layer"
+        );
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        let uses_local = m.claimed_tiles.iter().any(|&tid| {
+            fuf.get(tid).inputs.iter().any(|i| {
+                matches!(
+                    i,
+                    FufInput::Extern {
+                        kind: ExternKind::RotaryLocal,
+                        ..
+                    }
+                )
+            })
+        });
+        let cos_sin_ident = if uses_local {
+            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
+        } else {
+            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
+        };
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Fp8FusedQkvRopePrefill", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #q_out },
+                quote! { #k_out },
+                quote! { #v_out },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { Weights::#cos_sin_ident },
+            ],
+        )])
+    }
 
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
-            .iter()
-            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
-            .collect();
-        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-        let head_dim = ctx.bound("head_dim") as usize;
+    fn interpreter_arm(&self, model: &ModelParams) -> TokenStream {
+        let num_q_heads = *model
+            .bounds
+            .get("num_attention_heads")
+            .expect("Fp8FusedQkvRopePrefill: model has no num_attention_heads")
+            as usize;
+        let num_kv_heads = *model
+            .bounds
+            .get("num_key_value_heads")
+            .expect("Fp8FusedQkvRopePrefill: model has no num_key_value_heads")
+            as usize;
+        let head_dim = *model
+            .bounds
+            .get("head_dim")
+            .expect("Fp8FusedQkvRopePrefill: model has no head_dim")
+            as usize;
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
-
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
-
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
         quote! {
-            let (#q_out, #k_out, #v_out) = unsafe {
-                let qkv_packed = (#weight_expr).forward(
-                    #activation,
+            let (__q, __k, __v) = unsafe {
+                let __view = ::ferrite_forward::tile_ref(__tiles, in_slot)
+                    .as_view(__tiles);
+                let __w = (weight_fn)(wm, layer);
+                let qkv_packed = __w.forward(
+                    __view,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 );
+                let __cos_sin = (cos_sin_fn)(wm, layer);
                 ::ferrite_kernels::kernels::fused_qkv_rope(
                     *qkv_packed,
                     *ctx.positions,
-                    wm.rotary.cos_sin_cache,
+                    __cos_sin,
                     #q_size,
                     #kv_size,
                     #num_q_heads,
@@ -13752,14 +11911,20 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
             };
             unsafe {
                 ::ferrite_kernels::attention_helpers::write_kv_cache(
-                    (#k_out).view(),
-                    (#v_out).view(),
+                    __k.view(),
+                    __v.view(),
                     ctx.slot_mapping,
                     ctx.kv_cache,
-                    #layer,
+                    layer as usize,
                     device.compute_stream,
                 );
             }
+            __tiles[q_out_slot as usize] =
+                Some(::ferrite_forward::TileEntry::Owned(__q));
+            __tiles[k_out_slot as usize] =
+                Some(::ferrite_forward::TileEntry::Owned(__k));
+            __tiles[v_out_slot as usize] =
+                Some(::ferrite_forward::TileEntry::Owned(__v));
         }
     }
 }
@@ -13930,102 +12095,6 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
             rust_type: quote! { ::ferrite_kernels::layers::Bnb4bitLinear },
             source_weights: sources,
         }]
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let rope_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
-            .expect("claim must contain a RopeAppend");
-        let rope_node = ctx.fuf.get(rope_id);
-
-        let qkv_raw: Vec<TileId> = rope_node
-            .inputs
-            .iter()
-            .take(3)
-            .filter_map(|i| match i {
-                FufInput::Tile { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
-        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
-            .iter()
-            .map(|t| {
-                unwrap_gemm_through_bias(ctx.fuf, *t)
-                    .expect("claim-time check guarantees Gemm-or-BiasAdd(Gemm)")
-            })
-            .collect();
-        let q_gemm_id = resolved[0].0;
-        let activation = ctx.input_expr(q_gemm_id, 0);
-
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
-            .iter()
-            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
-            .collect();
-        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-        let head_dim = ctx.bound("head_dim") as usize;
-        let q_size = num_q_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
-
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
-        quote! {
-            let #q_out = unsafe {
-                let qkv_packed = (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                if ctx.kv_cache.is_fp8() {
-                    ::ferrite_kernels::kernels::fused_qkv_rope_cache_fp8(
-                        *qkv_packed,
-                        *ctx.positions,
-                        wm.rotary.cos_sin_cache,
-                        *ctx.slot_mapping,
-                        *ctx.kv_cache.k_cache(#layer),
-                        *ctx.kv_cache.v_cache(#layer),
-                        ctx.kv_cache.k_scale_ptr(#layer),
-                        ctx.kv_cache.v_scale_ptr(#layer),
-                        #q_size,
-                        #kv_size,
-                        #num_q_heads,
-                        #head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                } else {
-                    ::ferrite_kernels::kernels::fused_qkv_rope_cache(
-                        *qkv_packed,
-                        *ctx.positions,
-                        wm.rotary.cos_sin_cache,
-                        *ctx.slot_mapping,
-                        *ctx.kv_cache.k_cache(#layer),
-                        *ctx.kv_cache.v_cache(#layer),
-                        #q_size,
-                        #kv_size,
-                        #num_q_heads,
-                        #head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                }
-            };
-            let #k_out = ctx.kv_cache.k_cache(#layer);
-            let #v_out = ctx.kv_cache.v_cache(#layer);
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -14273,86 +12342,6 @@ impl Implementation for Bnb4FusedQkvRopePrefillImpl {
         Bnb4FusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let rope_id = *ctx
-            .claimed_tiles
-            .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::RopeAppend)
-            .expect("claim must contain a RopeAppend");
-        let rope_node = ctx.fuf.get(rope_id);
-
-        let qkv_raw: Vec<TileId> = rope_node
-            .inputs
-            .iter()
-            .take(3)
-            .filter_map(|i| match i {
-                FufInput::Tile { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(qkv_raw.len(), 3, "rope has three tile inputs (q, k, v)");
-        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
-            .iter()
-            .map(|t| unwrap_gemm_through_bias(ctx.fuf, *t).expect("claim-time validated"))
-            .collect();
-        let q_gemm_id = resolved[0].0;
-        let activation = ctx.input_expr(q_gemm_id, 0);
-
-        let qkv_weights: Vec<(WeightId, Option<u64>)> = resolved
-            .iter()
-            .map(|(g, _)| first_weight_ref(ctx.fuf.get(*g)).expect("gemm has a weight"))
-            .collect();
-        let fused_name = fused_accessor_name(ctx.program, &qkv_weights);
-        let weight_expr = ctx.weight_accessor(&fused_name);
-
-        let num_q_heads = ctx.bound("num_attention_heads") as usize;
-        let num_kv_heads = ctx.bound("num_key_value_heads") as usize;
-        let head_dim = ctx.bound("head_dim") as usize;
-        let q_size = num_q_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-
-        let layer = rope_kv_cache_layer(rope_node)
-            .expect("RopeAppend has a KvCache extern input with a concrete layer index")
-            as usize;
-
-        let q_out = ctx.output_ident(rope_id, 0);
-        let k_out = ctx.output_ident(rope_id, 1);
-        let v_out = ctx.output_ident(rope_id, 2);
-
-        quote! {
-            let (#q_out, #k_out, #v_out) = unsafe {
-                let qkv_packed = (#weight_expr).forward(
-                    #activation,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                ::ferrite_kernels::kernels::fused_qkv_rope(
-                    *qkv_packed,
-                    *ctx.positions,
-                    wm.rotary.cos_sin_cache,
-                    #q_size,
-                    #kv_size,
-                    #num_q_heads,
-                    #num_kv_heads,
-                    #head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-            unsafe {
-                ::ferrite_kernels::attention_helpers::write_kv_cache(
-                    (#k_out).view(),
-                    (#v_out).view(),
-                    ctx.slot_mapping,
-                    ctx.kv_cache,
-                    #layer,
-                    device.compute_stream,
-                );
-            }
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
 
     fn opcode_shape(&self) -> OpcodeShape {
@@ -14597,195 +12586,6 @@ fn fi_cost_us(head_dim: u32, use_logits_soft_cap: bool, ctx: &CostCtx) -> f64 {
         .unwrap_or(UNCALIBRATED_COST_US)
 }
 
-/// Emit the FlashInfer call + its FA2 fallback for the decode path.
-/// Factored so both the Decode Impl's `emit_call` and any future
-/// sliding-window FI variant can share the body.
-fn emit_fi_decode_body(ctx: &EmitCtx, head_dim: u32, use_logits_soft_cap: bool) -> TokenStream {
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let node = ctx.fuf.get(tile);
-
-    let q_expr = ctx.input_expr(tile, 0);
-    let layer =
-        node.inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Extern {
-                    kind: crate::classified::ExternKind::KvCache,
-                    index: Some(layer),
-                } => Some(*layer),
-                _ => None,
-            })
-            .expect("Attention has a kv_cache extern with a concrete layer index") as usize;
-
-    let scale_tokens = attention_scale_tokens(ctx);
-    let softcap_tokens = attention_softcap_tokens(ctx);
-    let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
-
-    // FlashInferConfig literal baked from the Impl's state. The
-    // emitted `dtype` is always `Bf16` — the only dtype currently in
-    // FLASHINFER_CONFIG_SET (Fp16 is a placeholder; see
-    // `ferrite-cuda-builder::flashinfer_config`).
-    quote! {
-        let mut #out = unsafe {
-            let fi_cfg = ::ferrite_kernels::flashinfer::FlashInferConfig {
-                dtype: ::ferrite_kernels::flashinfer::FiDType::Bf16,
-                head_dim: #head_dim,
-                use_logits_soft_cap: #use_logits_soft_cap,
-            };
-            let sk_bucket = ::ferrite_kernels::attention_helpers::sk_bucket_for(
-                ctx.max_seqlen_k,
-            );
-            let fi = ::ferrite_kernels::attention_helpers::flashinfer_attention(
-                #q_expr,
-                ctx.cu_seqlens_q,
-                ctx.seqused_k,
-                ctx.block_table,
-                ctx.max_seqlen_q,
-                ctx.max_seqlen_k,
-                #scale_tokens,
-                #softcap_tokens,
-                ctx.kv_cache,
-                #layer,
-                device.num_sm,
-                fi_cfg,
-                sk_bucket,
-                &mut device.caching,
-                device.compute_stream,
-            );
-            match fi {
-                Some(t) => t,
-                None => {
-                    // FA2 fallback — mirrors `AttentionViaCacheImpl`.
-                    let has_spans = !ctx.kv_cache.block_unrotated_gpu().is_null();
-                    let (cos_sin_ptr, rotary_dim) = if has_spans {
-                        (
-                            wm.rotary.cos_sin_cache.raw_ptr() as *const u8,
-                            wm.rotary.cos_sin_cache.dim(1),
-                        )
-                    } else {
-                        (::std::ptr::null::<u8>(), 0)
-                    };
-                    ::ferrite_kernels::attention_helpers::attention_decode_from_cache(
-                        #q_expr,
-                        ctx.cu_seqlens_q,
-                        ctx.seqused_k,
-                        ctx.block_table,
-                        ctx.max_seqlen_q,
-                        ctx.max_seqlen_k,
-                        #scale_tokens,
-                        #softcap_tokens,
-                        -1,
-                        ctx.kv_cache,
-                        #layer,
-                        device.num_sm,
-                        &mut device.caching,
-                        device.compute_stream,
-                        cos_sin_ptr,
-                        rotary_dim,
-                        false,
-                    )
-                }
-            }
-        };
-        unsafe {
-            let nt = (*#out).dim(0);
-            let dt = (*#out).dtype();
-            #out.reshape(&[nt, #q_size], dt);
-        }
-    }
-}
-
-/// Prefill counterpart. Differs from the decode body in the FA2
-/// fallback path: reads K/V from the DSL tile's slots 1/2 (the
-/// contiguous outputs of `FusedQkvRopePrefillImpl`) and calls
-/// `flash_attn_contiguous` instead of the paged decode helper. The
-/// FlashInfer call is identical — the shim is paged-only and reads
-/// the same cache `FusedQkvRopePrefillImpl` writes.
-fn emit_fi_prefill_body(ctx: &EmitCtx, head_dim: u32, use_logits_soft_cap: bool) -> TokenStream {
-    let tile = ctx.primary();
-    let out = ctx.output_ident(tile, 0);
-    let node = ctx.fuf.get(tile);
-
-    let q_expr = ctx.input_expr(tile, 0);
-    let k_expr = ctx.input_expr(tile, 1);
-    let v_expr = ctx.input_expr(tile, 2);
-    let layer =
-        node.inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Extern {
-                    kind: crate::classified::ExternKind::KvCache,
-                    index: Some(layer),
-                } => Some(*layer),
-                _ => None,
-            })
-            .expect("Attention has a kv_cache extern with a concrete layer index") as usize;
-
-    let scale_tokens = attention_scale_tokens(ctx);
-    let softcap_tokens = attention_softcap_tokens(ctx);
-    let q_size = (ctx.bound("num_attention_heads") * ctx.bound("head_dim")) as usize;
-
-    quote! {
-        let mut #out = unsafe {
-            let fi_cfg = ::ferrite_kernels::flashinfer::FlashInferConfig {
-                dtype: ::ferrite_kernels::flashinfer::FiDType::Bf16,
-                head_dim: #head_dim,
-                use_logits_soft_cap: #use_logits_soft_cap,
-            };
-            let sk_bucket = ::ferrite_kernels::attention_helpers::sk_bucket_for(
-                ctx.max_seqlen_k,
-            );
-            let fi = ::ferrite_kernels::attention_helpers::flashinfer_attention(
-                #q_expr,
-                ctx.cu_seqlens_q,
-                ctx.seqused_k,
-                ctx.block_table,
-                ctx.max_seqlen_q,
-                ctx.max_seqlen_k,
-                #scale_tokens,
-                #softcap_tokens,
-                ctx.kv_cache,
-                #layer,
-                device.num_sm,
-                fi_cfg,
-                sk_bucket,
-                &mut device.caching,
-                device.compute_stream,
-            );
-            match fi {
-                Some(t) => t,
-                None => {
-                    // FA2 fallback — mirrors `AttentionPrefillContiguousImpl`.
-                    ::ferrite_kernels::kernels::flash_attn_contiguous(
-                        *#q_expr,
-                        *#k_expr,
-                        *#v_expr,
-                        *ctx.cu_seqlens_q,
-                        *ctx.cu_seqlens_q,
-                        ctx.max_seqlen_q,
-                        ctx.max_seqlen_k,
-                        #scale_tokens,
-                        true,
-                        #softcap_tokens,
-                        -1,
-                        &mut device.caching,
-                        device.compute_stream,
-                        ::std::ptr::null::<u8>(),
-                        0,
-                        false,
-                    )
-                }
-            }
-        };
-        unsafe {
-            let nt = (*#out).dim(0);
-            let dt = (*#out).dtype();
-            #out.reshape(&[nt, #q_size], dt);
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct FlashInferAttentionDecodeImpl {
     pub head_dim: u32,
@@ -14851,10 +12651,6 @@ impl Implementation for FlashInferAttentionDecodeImpl {
 
     fn is_compute_bound(&self) -> bool {
         true
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        emit_fi_decode_body(ctx, self.head_dim, self.use_logits_soft_cap)
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -15093,10 +12889,6 @@ impl Implementation for FlashInferAttentionPrefillImpl {
         true
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        emit_fi_prefill_body(ctx, self.head_dim, self.use_logits_soft_cap)
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
 
     fn opcode_shape(&self) -> OpcodeShape {
@@ -15315,37 +13107,6 @@ impl Implementation for MlaSplitRefImpl {
         false
     }
 
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let kv_a = ctx.input_expr(tile, 0);
-
-        let kv_lora_rank = ctx.bound("kv_lora_rank") as usize;
-        let rope_dim = ctx.bound("qk_rope_head_dim") as usize;
-
-        // MlaSplit has two outputs: (kv_latent, k_pe)
-        let kv_latent_out = ctx.output_ident(tile, 0);
-        let k_pe_out = ctx.output_ident(tile, 1);
-
-        quote! {
-            let (#kv_latent_out, #k_pe_out) = unsafe {
-                let kv_a_tv = #kv_a;
-                let nt = (*kv_a_tv).dim(0);
-                let dt = (*kv_a_tv).dtype();
-                let mut kv_latent = device.caching.alloc_tensor(&[nt, #kv_lora_rank], dt);
-                let mut k_pe = device.caching.alloc_tensor(&[nt, #rope_dim], dt);
-                ::ferrite_kernels::kernels::mla_split_kv_a(
-                    *kv_a_tv,
-                    *kv_latent.view(),
-                    *k_pe.view(),
-                    #kv_lora_rank,
-                    #rope_dim,
-                    device.compute_stream,
-                );
-                (kv_latent, k_pe)
-            };
-        }
-    }
-
     // ── Host-interpreter codegen ────────────────────────────────
     //
     // Variant `MlaSplit { in_slot, kv_latent_slot, k_pe_slot }`.
@@ -15493,201 +13254,6 @@ impl Implementation for MlaAttentionImpl {
 
     fn is_compute_bound(&self) -> bool {
         true
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        let node = ctx.fuf.get(tile);
-
-        // DSL slots: 0=q, 1=kv_b, 2=k_pe
-        let q_expr = ctx.input_expr(tile, 0);
-        let kv_b_expr = ctx.input_expr(tile, 1);
-        let k_pe_expr = ctx.input_expr(tile, 2);
-
-        let layer = node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Extern {
-                    kind: crate::classified::ExternKind::KvCache,
-                    index: Some(layer),
-                } => Some(*layer),
-                _ => None,
-            })
-            .expect("MlaAttention has a kv_cache extern with a concrete layer index")
-            as usize;
-
-        let num_heads = ctx.bound("num_attention_heads") as usize;
-        let qk_nope_head_dim = ctx.bound("qk_nope_head_dim") as usize;
-        let qk_rope_head_dim = ctx.bound("qk_rope_head_dim") as usize;
-        let v_head_dim = ctx.bound("v_head_dim") as usize;
-        let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
-        // MLA softmax scale: 1/sqrt(qk_head_dim) * mscale_all_dim^2 for YaRN.
-        // Python's `DeepseekV2Attention.__init__` multiplies softmax_scale by
-        // yarn_get_mscale(factor, mscale_all_dim)^2 when mscale_all_dim != 0.
-        let base_scale: f32 = 1.0 / (qk_head_dim as f32).sqrt();
-        let scale: f32 = match &ctx.model.rope_scaling {
-            Some(crate::config::RopeScaling::Yarn {
-                factor,
-                mscale_all_dim,
-                ..
-            }) if *mscale_all_dim != 0.0 => {
-                let m = if *factor <= 1.0 {
-                    1.0_f64
-                } else {
-                    0.1 * mscale_all_dim * factor.ln() + 1.0
-                };
-                base_scale * (m * m) as f32
-            }
-            _ => base_scale,
-        };
-        // Rotary cos/sin cache lives on wm.rotary or wm.rotary_local —
-        // never on ctx. Use the same helper as all other rope impls.
-        let rotary_cos_sin = rotary_cos_sin_tokens(ctx.fuf, ctx.claimed_tiles);
-
-        quote! {
-            let mut #out = unsafe {
-                let q_tv = #q_expr;
-                let kv_b_tv = #kv_b_expr;
-                let k_pe_tv = #k_pe_expr;
-                let nt = (*q_tv).dim(0);
-                let dt = (*q_tv).dtype();
-
-                // 1. Extract q_pe: [T, num_heads * rope_dim]
-                let q_pe = device.caching.alloc_tensor(
-                    &[nt, #num_heads * #qk_rope_head_dim], dt,
-                );
-                ::ferrite_kernels::kernels::mla_extract_q_pe(
-                    *q_tv,
-                    *q_pe.view().reshape(&[nt, #num_heads * #qk_rope_head_dim]),
-                    #num_heads,
-                    #qk_head_dim,
-                    #qk_nope_head_dim,
-                    #qk_rope_head_dim,
-                    device.compute_stream,
-                );
-
-                // 2. Interleaved RoPE on q_pe + k_pe
-                ::ferrite_kernels::kernels::rotary_embedding_interleaved_inplace(
-                    *q_pe.view().reshape(&[nt, #num_heads * #qk_rope_head_dim]),
-                    *k_pe_tv,
-                    *ctx.positions,
-                    #rotary_cos_sin,
-                    #qk_rope_head_dim,
-                    device.compute_stream,
-                );
-
-                // 3. Write rotated q_pe back into q
-                ::ferrite_kernels::kernels::mla_write_q_pe(
-                    *q_pe.view().reshape(&[nt, #num_heads * #qk_rope_head_dim]),
-                    *q_tv,
-                    #num_heads,
-                    #qk_head_dim,
-                    #qk_nope_head_dim,
-                    #qk_rope_head_dim,
-                    device.compute_stream,
-                );
-                drop(q_pe);
-
-                // 4. Assemble K: [T, num_heads * qk_head_dim]
-                let k = device.caching.alloc_tensor(
-                    &[nt, #num_heads * #qk_head_dim], dt,
-                );
-                ::ferrite_kernels::kernels::mla_assemble_k(
-                    *kv_b_tv,
-                    *k_pe_tv,
-                    *k.view().reshape(&[nt, #num_heads * #qk_head_dim]),
-                    #num_heads,
-                    #qk_nope_head_dim,
-                    #qk_rope_head_dim,
-                    #v_head_dim,
-                    #qk_head_dim,
-                    device.compute_stream,
-                );
-
-                // 5. Assemble V (zero-padded): [T, num_heads * qk_head_dim]
-                let v = device.caching.alloc_tensor(
-                    &[nt, #num_heads * #qk_head_dim], dt,
-                );
-                ::ferrite_cuda_core::driver::memset_d8(
-                    (*v.view()).raw_ptr(),
-                    0,
-                    (*v.view()).size_bytes(),
-                    device.compute_stream,
-                ).expect("MLA: memset V");
-                ::ferrite_kernels::kernels::mla_assemble_v(
-                    *kv_b_tv,
-                    *v.view().reshape(&[nt, #num_heads * #qk_head_dim]),
-                    #num_heads,
-                    #qk_nope_head_dim,
-                    #v_head_dim,
-                    #qk_head_dim,
-                    device.compute_stream,
-                );
-
-                // 6. Write K, V to paged cache.
-                // Use view().reshape() — preserves the borrow lifetime of the
-                // OwnedTensor rather than the unsound (*x.view()).as_view() pattern.
-                // write_kv_cache takes TensorView<'_>, so pass the views directly.
-                let k_tv = k.view();
-                let k_3d = k_tv.reshape(&[nt, #num_heads, #qk_head_dim]);
-                let v_tv = v.view();
-                let v_3d = v_tv.reshape(&[nt, #num_heads, #qk_head_dim]);
-                ::ferrite_kernels::attention_helpers::write_kv_cache(
-                    k_3d,
-                    v_3d,
-                    ctx.slot_mapping,
-                    ctx.kv_cache,
-                    #layer,
-                    device.compute_stream,
-                );
-
-                // 7. attention_standard — all positional args are TensorView<'_>.
-                // q_tv is already TensorView, so reshape() directly.
-                let q_3d = q_tv.reshape(&[nt, #num_heads, #qk_head_dim]);
-                let attn = ::ferrite_kernels::attention_helpers::attention_standard(
-                    q_3d,
-                    k_3d,
-                    v_3d,
-                    ctx.cu_seqlens_q,
-                    ctx.seqused_k,
-                    ctx.block_table,
-                    ctx.max_seqlen_q,
-                    ctx.max_seqlen_k,
-                    #scale,
-                    ctx.kv_cache,
-                    #layer,
-                    device.num_sm,
-                    &mut device.caching,
-                    device.compute_stream,
-                    ::std::ptr::null(), // DeepSeek: no FA2 in-kernel RoPE
-                    0,
-                    false,
-                );
-                // NLL: k_tv/v_tv/k_3d/v_3d borrows of k/v end at last use above.
-                drop(k);
-                drop(v);
-
-                // 8. Slice attn output from qk_head_dim → v_head_dim.
-                // mla_slice_attn_output takes GpuTensor, so deref views with *.
-                let sliced = device.caching.alloc_tensor(
-                    &[nt, #num_heads * #v_head_dim], dt,
-                );
-                let attn_tv = attn.view();
-                let attn_flat = attn_tv.reshape(&[nt, #num_heads * #qk_head_dim]);
-                ::ferrite_kernels::kernels::mla_slice_attn_output(
-                    *attn_flat,
-                    *sliced.view(),
-                    #num_heads,
-                    #qk_head_dim,
-                    #v_head_dim,
-                    device.compute_stream,
-                );
-                drop(attn);
-                sliced
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -16045,21 +13611,6 @@ impl Implementation for DeepSeekMoeRefImpl {
             }
         }
         out
-    }
-
-    fn emit_call(&self, ctx: &EmitCtx) -> TokenStream {
-        let tile = ctx.primary();
-        let out = ctx.output_ident(tile, 0);
-        // slot 0 = hidden_states (Tile), slot 1 = moe[layer] (Weight)
-        let x_expr = ctx.input_expr(tile, 0);
-        let moe_expr = ctx.input_expr(tile, 1);
-
-        quote! {
-            let mut #out = unsafe {
-                // forward takes TensorView<'_>; x_expr is already TensorView.
-                (#moe_expr).forward(#x_expr, device)
-            };
-        }
     }
 
     // ── Host-interpreter codegen ────────────────────────────────

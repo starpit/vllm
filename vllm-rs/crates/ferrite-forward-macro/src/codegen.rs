@@ -38,11 +38,11 @@ use syn::Ident;
 
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
-use crate::emit::{EmitCtx, EmitMode, LocalMap};
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplId, ImplementationLibrary, WeightAccessor};
-use crate::schedule::{Loop, WorkloadLoops};
-use crate::solver::{Assignment, SubgraphId, WorkloadAssignments};
+use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
+use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
+use crate::schedule::WorkloadLoops;
+use crate::solver::WorkloadAssignments;
 
 // ── Weights struct + loader emission ─────────────────────────────
 
@@ -226,11 +226,13 @@ fn plan_field_load(
     let is_bnb4 = ty.ends_with("::Bnb4bitLinear")
         || ty == "Bnb4bitLinear"
         || ty.ends_with("layers::Bnb4bitLinear");
-    let is_fp8 =
-        ty.ends_with("::Fp8Linear") || ty == "Fp8Linear" || ty.ends_with("layers::Fp8Linear");
-    let is_fp8_block = ty.ends_with("::Fp8BlockLinear")
-        || ty == "Fp8BlockLinear"
-        || ty.ends_with("layers::Fp8BlockLinear");
+    // Post-Fp8AnyLinear: the macro-emitted field type is always
+    // `Fp8AnyLinear` (the wrapper enum). Whether to load as `Std`
+    // or `Block` is decided per-weight from the on-disk storage
+    // format below.
+    let is_fp8_any = ty.ends_with("::Fp8AnyLinear")
+        || ty == "Fp8AnyLinear"
+        || ty.ends_with("layers::Fp8AnyLinear");
 
     let prefixes: Vec<String> = accessor
         .source_weights
@@ -415,54 +417,45 @@ fn plan_field_load(
         };
     }
 
-    if is_fp8 {
-        // FP8 per-tensor / per-channel. Sources must all resolve to
-        // `StorageFormat::Fp8 { block_size: None, .. }`. Shapes +
-        // scale layout are sniffed by the loader at runtime
-        // (per-tensor scalar vs per-channel [N,1] vs online BF16→FP8
-        // quant), so no macro-time dim math needed.
+    if is_fp8_any {
+        // The accessor's emitted field type is `Fp8AnyLinear`. We
+        // pick `FieldLoad::Fp8Linear` (per-tensor / per-channel,
+        // wraps as `Fp8AnyLinear::Std`) or `FieldLoad::Fp8BlockLinear`
+        // (blockwise, wraps as `Fp8AnyLinear::Block`) by reading the
+        // source weight's on-disk storage format. All source weights
+        // of one fused accessor share a format — HF never mixes
+        // per-tensor and blockwise scales within a single
+        // MergedColumnParallelLinear — so we read the FIRST source's
+        // format and assert the rest agree.
+        let mut block_size: Option<bool> = None;
         for (wid, _idx) in &accessor.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
-            if !matches!(
-                fmt,
-                crate::quantization::StorageFormat::Fp8 {
-                    block_size: None,
-                    ..
-                }
-            ) {
-                panic!(
-                    "accessor `{}` declared `Fp8Linear` but source weight resolves to \
-                     non-per-tensor-FP8 storage ({fmt:?}) — matcher bug",
+            let is_block = match fmt {
+                crate::quantization::StorageFormat::Fp8 { block_size, .. } => block_size.is_some(),
+                other => panic!(
+                    "accessor `{}` declared `Fp8AnyLinear` but source weight resolves to \
+                     non-FP8 storage ({other:?}) — matcher bug",
                     accessor.name,
-                );
+                ),
+            };
+            match block_size {
+                None => block_size = Some(is_block),
+                Some(prev) => {
+                    if prev != is_block {
+                        panic!(
+                            "accessor `{}` fuses sources with mismatched FP8 layout \
+                             (one block-quant, the other per-tensor/per-channel)",
+                            accessor.name,
+                        );
+                    }
+                }
             }
         }
-        return FieldLoad::Fp8Linear { prefixes };
-    }
-
-    if is_fp8_block {
-        // FP8 blockwise (DeepSeek-V3 128×128). Sources must all
-        // resolve to `StorageFormat::Fp8 { block_size: Some(_), .. }`.
-        // `Fp8BlockLinear::load` derives the per-shard block size
-        // from the ratio of weight shape to scale shape at runtime;
-        // no macro-time dim math needed.
-        for (wid, _idx) in &accessor.source_weights {
-            let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
-            if !matches!(
-                fmt,
-                crate::quantization::StorageFormat::Fp8 {
-                    block_size: Some(_),
-                    ..
-                }
-            ) {
-                panic!(
-                    "accessor `{}` declared `Fp8BlockLinear` but source weight resolves to \
-                     non-block-FP8 storage ({fmt:?}) — matcher bug",
-                    accessor.name,
-                );
-            }
-        }
-        return FieldLoad::Fp8BlockLinear { prefixes };
+        return if block_size == Some(true) {
+            FieldLoad::Fp8BlockLinear { prefixes }
+        } else {
+            FieldLoad::Fp8Linear { prefixes }
+        };
     }
 
     if is_deepseek_v2_moe {
@@ -1220,64 +1213,25 @@ fn emit_weights_struct(
         let accessor_is_bnb4 = ty.ends_with("::Bnb4bitLinear")
             || ty == "Bnb4bitLinear"
             || ty.ends_with("layers::Bnb4bitLinear");
-        let accessor_is_fp8 =
-            ty.ends_with("::Fp8Linear") || ty == "Fp8Linear" || ty.ends_with("layers::Fp8Linear");
-        let accessor_is_fp8_block = ty.ends_with("::Fp8BlockLinear")
-            || ty == "Fp8BlockLinear"
-            || ty.ends_with("layers::Fp8BlockLinear");
+        // FP8 accessors come through `fp8_accessor_type_for`, which
+        // post-Fp8AnyLinear-unblocker always returns `Fp8AnyLinear`.
+        // The storage-format guard accepts that type for both
+        // per-tensor / per-channel (`block_size: None`) and
+        // blockwise (`block_size: Some(_)`) FP8 storage — the
+        // Fp8AnyLinear enum dispatches at runtime on the loaded
+        // variant.
+        let accessor_is_fp8_any = ty.ends_with("::Fp8AnyLinear")
+            || ty == "Fp8AnyLinear"
+            || ty.ends_with("layers::Fp8AnyLinear");
         for (wid, _idx) in &a.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
             let ok = matches!(
-                (
-                    &fmt,
-                    accessor_is_marlin,
-                    accessor_is_bnb4,
-                    accessor_is_fp8,
-                    accessor_is_fp8_block,
-                ),
-                (
-                    crate::quantization::StorageFormat::Dense,
-                    false,
-                    false,
-                    false,
-                    false,
-                ) | (
-                    crate::quantization::StorageFormat::Awq { .. },
-                    true,
-                    false,
-                    false,
-                    false,
-                ) | (
-                    crate::quantization::StorageFormat::Gptq { .. },
-                    true,
-                    false,
-                    false,
-                    false,
-                ) | (
-                    crate::quantization::StorageFormat::Bnb4 { .. },
-                    false,
-                    true,
-                    false,
-                    false,
-                ) | (
-                    crate::quantization::StorageFormat::Fp8 {
-                        block_size: None,
-                        ..
-                    },
-                    false,
-                    false,
-                    true,
-                    false,
-                ) | (
-                    crate::quantization::StorageFormat::Fp8 {
-                        block_size: Some(_),
-                        ..
-                    },
-                    false,
-                    false,
-                    false,
-                    true,
-                ),
+                (&fmt, accessor_is_marlin, accessor_is_bnb4, accessor_is_fp8_any),
+                (crate::quantization::StorageFormat::Dense, false, false, false)
+                    | (crate::quantization::StorageFormat::Awq { .. }, true, false, false)
+                    | (crate::quantization::StorageFormat::Gptq { .. }, true, false, false)
+                    | (crate::quantization::StorageFormat::Bnb4 { .. }, false, true, false)
+                    | (crate::quantization::StorageFormat::Fp8 { .. }, false, false, true),
             );
             if !ok {
                 let dotted = program.weights.path(*wid).join(".");
@@ -1419,19 +1373,23 @@ fn emit_weights_struct(
                     if prefixes.len() == 1 {
                         let prefix = &prefixes[0];
                         quote! {
-                            let #name = ::ferrite_kernels::layers::Fp8Linear::load(
-                                gw,
-                                #prefix,
-                                __fp8_dtype,
-                            )?;
+                            let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
+                                ::ferrite_kernels::layers::Fp8Linear::load(
+                                    gw,
+                                    #prefix,
+                                    __fp8_dtype,
+                                )?
+                            );
                         }
                     } else {
                         quote! {
-                            let #name = ::ferrite_kernels::layers::Fp8Linear::load_concat(
-                                gw,
-                                &[ #(#prefixes),* ],
-                                __fp8_dtype,
-                            )?;
+                            let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
+                                ::ferrite_kernels::layers::Fp8Linear::load_concat(
+                                    gw,
+                                    &[ #(#prefixes),* ],
+                                    __fp8_dtype,
+                                )?
+                            );
                         }
                     }
                 }
@@ -1439,19 +1397,23 @@ fn emit_weights_struct(
                     if prefixes.len() == 1 {
                         let prefix = &prefixes[0];
                         quote! {
-                            let #name = ::ferrite_kernels::layers::Fp8BlockLinear::load(
-                                gw,
-                                #prefix,
-                                __fp8_dtype,
-                            )?;
+                            let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Block(
+                                ::ferrite_kernels::layers::Fp8BlockLinear::load(
+                                    gw,
+                                    #prefix,
+                                    __fp8_dtype,
+                                )?
+                            );
                         }
                     } else {
                         quote! {
-                            let #name = ::ferrite_kernels::layers::Fp8BlockLinear::load_concat(
-                                gw,
-                                &[ #(#prefixes),* ],
-                                __fp8_dtype,
-                            )?;
+                            let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Block(
+                                ::ferrite_kernels::layers::Fp8BlockLinear::load_concat(
+                                    gw,
+                                    &[ #(#prefixes),* ],
+                                    __fp8_dtype,
+                                )?
+                            );
                         }
                     }
                 }
@@ -2294,7 +2256,6 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
                             quote! { #lit => &self.#fname, }
                         })
                         .collect();
-                    let base_str = base.clone();
                     quote! {
                         #[cfg(feature = "cuda")]
                         #[inline]
@@ -2302,10 +2263,11 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
                         pub fn #base_ident(&self, layer: u32) -> &#ty {
                             match layer {
                                 #(#arms)*
-                                _ => panic!(
-                                    "Weights::{}: layer index {} out of range",
-                                    #base_str, layer,
-                                ),
+                                // Codegen guarantees `layer` is one of the
+                                // emitted indices — every static-slice row
+                                // carries a literal `layer:` field minted
+                                // from the same per-arch fan_out pass.
+                                _ => unsafe { ::core::hint::unreachable_unchecked() },
                             }
                         }
                     }
@@ -2369,727 +2331,20 @@ fn marlin_format_literal(model: &ModelParams) -> TokenStream {
 }
 
 // ── Forward fn emission ──────────────────────────────────────────
-
-/// For each `OwnedTensor` tile-local that the forward fn binds, the
-/// subgraph after which it can safely be dropped (its last
-/// cross-subgraph use, with alias chains followed back to the
-/// underlying owner). Produced by `compute_drops_after`, consumed by
-/// the per-bucket emitters to inject `drop(t_X_Y);` in the right spot.
-type DropPlan = HashMap<SubgraphId, Vec<(TileId, u8)>>;
-
-/// Compute when each owning `OwnedTensor` tile-local can be dropped.
-///
-/// Walks every subgraph's `output_alias` declaration to build the
-/// alias map: `(tile, slot) → Some(upstream)` (alias) or
-/// `(tile, slot) → None` (owner). Outputs absent from the map are
-/// treated as untracked (e.g. paged-cache views) and ignored.
-///
-/// For each cross-subgraph tile-input, resolves the consumed tile
-/// through the alias chain to its underlying owner, and records the
-/// latest subgraph that touches it. Returns a map keyed by that
-/// subgraph: after emitting it, drop the listed tile-locals.
-///
-/// `skip_subgraph` is the terminal subgraph excluded from the
-/// backbone forward (`forward_backbone`); its consumptions are
-/// ignored so we don't keep tile-locals alive past the backbone's
-/// real last use. `protected` are owners that must NEVER be dropped
-/// (the function's return tile, and for backbone, the backbone-output
-/// tile that the caller clones out).
-fn compute_drops_after(
-    fuf: &Fuf,
-    sfuf: &Assignment,
-    loop_ir: &Loop,
-    lib: &ImplementationLibrary,
-    skip_subgraph: Option<SubgraphId>,
-    protected: &HashSet<(TileId, u8)>,
-) -> DropPlan {
-    // Per-subgraph topological order (subgraphs within the same wave
-    // are unordered relative to each other in the LOOP, but for
-    // single-wave-per-subgraph graphs that doesn't matter; for the
-    // general case we treat their order in `wave.subgraphs` as
-    // authoritative).
-    let mut order: HashMap<SubgraphId, usize> = HashMap::new();
-    let mut next = 0;
-    for wave in &loop_ir.waves {
-        for (sg, _) in &wave.subgraphs {
-            order.insert(*sg, next);
-            next += 1;
-        }
-    }
-
-    // alias: (tile, slot) → Some(upstream) means this output is a
-    // TensorView aliasing upstream's OwnedTensor; None means this
-    // output IS the owner. Outputs absent are untracked.
-    //
-    // consumed: upstream (tile, slot)s that some impl moves into its
-    // own output binding — the upstream local is no longer accessible
-    // after that subgraph, so we must never emit a `drop()` for it.
-    let mut alias: HashMap<(TileId, u8), Option<(TileId, u8)>> = HashMap::new();
-    let mut consumed: HashSet<(TileId, u8)> = HashSet::new();
-    for wave in &loop_ir.waves {
-        for (sg, imp_id) in &wave.subgraphs {
-            if Some(*sg) == skip_subgraph {
-                continue;
-            }
-            let claimed = sfuf.tiles_in_subgraph(*sg);
-            let imp = lib.get(*imp_id);
-            for (k, v) in imp.output_alias(&claimed, fuf) {
-                alias.insert(k, v);
-            }
-            for upstream in imp.consumes_input_tiles(&claimed, fuf) {
-                consumed.insert(upstream);
-            }
-        }
-    }
-
-    // Resolve a (tile, slot) to its underlying owner, or `None` if
-    // untracked / aliases extern memory. Cycle-safe via a small set.
-    let resolve = |start: (TileId, u8)| -> Option<(TileId, u8)> {
-        let mut cur = start;
-        let mut seen = HashSet::new();
-        loop {
-            if !seen.insert(cur) {
-                return None;
-            }
-            match alias.get(&cur) {
-                Some(None) => return Some(cur),
-                Some(Some(up)) => cur = *up,
-                None => return None,
-            }
-        }
-    };
-
-    // For each owner, the latest subgraph that touches it (directly
-    // or via an alias).
-    let mut last_use: HashMap<(TileId, u8), SubgraphId> = HashMap::new();
-    for wave in &loop_ir.waves {
-        for (sg, _) in &wave.subgraphs {
-            if Some(*sg) == skip_subgraph {
-                continue;
-            }
-            let claimed: HashSet<TileId> = sfuf.tiles_in_subgraph(*sg).into_iter().collect();
-            for tile in &claimed {
-                for input in &fuf.get(*tile).inputs {
-                    if let FufInput::Tile { id, slot } = input {
-                        // Intra-subgraph consumption is invisible at
-                        // codegen — handled inside emit_call.
-                        if claimed.contains(id) {
-                            continue;
-                        }
-                        if let Some(owner) = resolve((*id, *slot)) {
-                            let new_pos = order[sg];
-                            let keep = match last_use.get(&owner) {
-                                Some(prev) => order[prev] < new_pos,
-                                None => true,
-                            };
-                            if keep {
-                                last_use.insert(owner, *sg);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut plan: DropPlan = HashMap::new();
-    for (owner, sg) in last_use {
-        if protected.contains(&owner) {
-            continue;
-        }
-        // If some impl moves this owner into its own output, the
-        // owner local is gone after that subgraph — don't drop it.
-        if consumed.contains(&owner) {
-            continue;
-        }
-        plan.entry(sg).or_default().push(owner);
-    }
-    // Determinism — owners within a subgraph drop in stable order.
-    for v in plan.values_mut() {
-        v.sort();
-    }
-    plan
-}
-
-/// Allocate the stable local-binding ident per tile-output slot
-/// used by every per-bucket emission.
-fn build_local_map(fuf: &Fuf) -> LocalMap {
-    let mut locals: LocalMap = HashMap::new();
-    for node in &fuf.nodes {
-        for slot in 0..node.outputs.len().max(1) as u8 {
-            locals.insert((node.id, slot), format_ident!("t_{}_{}", node.id.0, slot));
-        }
-    }
-    locals
-}
-
-/// Per-model library of deduplicated kernel-call fragments.
-///
-/// Each entry is a private `unsafe fn __frag_<N>(...)` emitted
-/// inside the model's module. The forward body (and the backbone
-/// body) replaces its inline kernel calls with one-line
-/// `let (t_a, t_b) = unsafe { __frag_N(tile_inputs, weight_refs,
-/// wm, ctx, device) };` dispatches against this library. Two
-/// subgraphs whose abstract-mode emit_call output stringifies
-/// identically share a fragment — the critical win is layer-level
-/// sharing inside a single model (one rmsnorm body emitted once,
-/// called N times for an N-layer transformer).
-///
-/// Fragment fn body = `emit_call` output in `EmitMode::Abstract`
-/// mode, where tile/weight references are replaced by fn-param
-/// idents (`input_<i>`, `w_<i>`). Extern references like
-/// `wm.rotary_local` / `ctx.input_ids` stay verbatim and are
-/// resolved via the `wm` / `ctx` params the fragment takes;
-/// they're consistent across call sites within a model, so they
-/// don't defeat dedup.
-#[derive(Default)]
-struct FragmentLibrary {
-    /// Stringified abstract-body signature → fragment index.
-    by_sig: HashMap<String, usize>,
-    /// Fragment fn tokens, in insertion order. Index matches the
-    /// N in `__frag_N`.
-    fns: Vec<TokenStream>,
-}
-
-/// Diagnostic counters for dedup effectiveness. Reset after each
-/// per-model emit_model print so the output shows per-model stats.
-static CALL_SITE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static INLINE_FALLBACK_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-impl FragmentLibrary {
-    fn into_fns(self) -> Vec<TokenStream> {
-        self.fns
-    }
-}
-
-/// Decide whether a subgraph's emit can be pulled out into a
-/// reusable fragment fn.
-///
-/// Inlineable-only cases (returns `false`):
-/// - `output_alias` reports any output that borrows from an
-///   upstream tile — the fragment would need to return a
-///   `TensorView<'a>` tied to a caller-owned OwnedTensor, and
-///   lifting that through a fn boundary adds lifetime noise with
-///   no win.
-/// - `consumes_input_tiles` is non-empty — the fragment would
-///   need to take the upstream tile by value, changing ownership
-///   in the call site in ways the drop-pass already assumes. Easier
-///   to leave these inline.
-fn can_fragmentize(
-    imp: &dyn crate::impl_lib::Implementation,
-    claimed: &[TileId],
-    fuf: &Fuf,
-) -> bool {
-    // Output aliasing stays inline. An aliasing output is a
-    // `TensorView<'a>` that borrows an upstream OwnedTensor;
-    // returning that through a fn boundary means the fragment fn
-    // declares a lifetime tied to a consumed input, and the outer
-    // bucket body must preserve that borrow across downstream
-    // subgraph calls. Tractable but deferred.
-    if !imp
-        .output_alias(claimed, fuf)
-        .iter()
-        .all(|(_, src)| src.is_none())
-    {
-        return false;
-    }
-    // Multi-output tiles (e.g. rope_append producing q/k/v) need a
-    // tuple return + multi-binding call site; handle later. For now
-    // leave them inline.
-    for &t in claimed {
-        if fuf.get(t).outputs.len() > 1 {
-            return false;
-        }
-    }
-    // Multi-tile subgraphs (fused kernels claiming > 1 tile) need
-    // the fragment to emit bindings for every internal tile's
-    // output, then return the subgraph's last tile's output.
-    // Supported, but check claimed.len() is at least 1.
-    //
-    // Note: `consumes_input_tiles()` is NOT a bar to fragmentizing.
-    // Consumed boundary inputs are lifted to fragment fn params
-    // typed `OwnedTensor` (by value) vs `TensorView<'_>` (by view)
-    // — see `emit_subgraph`.
-    !claimed.is_empty()
-}
-
-/// Emit one subgraph. Uses the fragment library when the subgraph's
-/// impl is "clean" (no aliased / consumed outputs); falls back to
-/// inline emission otherwise.
-#[allow(clippy::too_many_arguments)]
-fn emit_subgraph(
-    fuf: &Fuf,
-    sfuf: &Assignment,
-    program: &Program,
-    model: &ModelParams,
-    lib: &ImplementationLibrary,
-    sg: SubgraphId,
-    imp_id: ImplId,
-    locals: &LocalMap,
-    library: &mut FragmentLibrary,
-) -> TokenStream {
-    let imp = lib.get(imp_id);
-    let claimed = sfuf.tiles_in_subgraph(sg);
-
-    if !can_fragmentize(imp, &claimed, fuf) {
-        INLINE_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let ctx = EmitCtx {
-            fuf,
-            program,
-            model,
-            claimed_tiles: &claimed,
-            locals,
-            mode: EmitMode::Concrete,
-        };
-        return imp.emit_call(&ctx);
-    }
-    CALL_SITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    // Collect boundary tile inputs (inputs whose producer is not
-    // in claimed_tiles), in the order they appear across claimed
-    // tiles' input lists. Dedupe — the same boundary output can
-    // feed multiple claimed tiles but only one fn param.
-    //
-    // Split into VIEWED (kernel only reads) vs CONSUMED (impl's
-    // `consumes_input_tiles()` moves the upstream owner into its
-    // own output — in-place kernels like add_rmsnorm). Viewed
-    // become `TensorView<'_>` fn params; consumed become
-    // `OwnedTensor` fn params (by value).
-    let consumed_set: HashSet<(TileId, u8)> = imp
-        .consumes_input_tiles(&claimed, fuf)
-        .into_iter()
-        .collect();
-    let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
-    let mut tile_params_ordered: Vec<(TileId, u8)> = Vec::new();
-    let mut consumed_params_ordered: Vec<(TileId, u8)> = Vec::new();
-    let mut seen_boundary: HashSet<(TileId, u8)> = HashSet::new();
-    for &t in &claimed {
-        let node = fuf.get(t);
-        for input in &node.inputs {
-            if let FufInput::Tile { id, slot } = input
-                && !claimed_set.contains(id)
-                && seen_boundary.insert((*id, *slot))
-            {
-                if consumed_set.contains(&(*id, *slot)) {
-                    consumed_params_ordered.push((*id, *slot));
-                } else {
-                    tile_params_ordered.push((*id, *slot));
-                }
-            }
-        }
-    }
-
-    // Weight accessors as declared by the impl. Each becomes one
-    // fragment param of the accessor's `rust_type`.
-    let accessors: Vec<WeightAccessor> = imp.required_weights(&claimed, fuf, program);
-
-    // Build the abstract EmitCtx: tile/weight params replace
-    // concrete `locals[..]` / `wm.<field>` references.
-    let mut tile_params: HashMap<(TileId, u8), syn::Ident> = HashMap::new();
-    let mut tile_param_idents: Vec<syn::Ident> = Vec::with_capacity(tile_params_ordered.len());
-    for (i, &(id, slot)) in tile_params_ordered.iter().enumerate() {
-        let p = format_ident!("input_{}", i);
-        tile_params.insert((id, slot), p.clone());
-        tile_param_idents.push(p);
-    }
-    let mut consumed_params: HashMap<(TileId, u8), syn::Ident> = HashMap::new();
-    let mut consumed_param_idents: Vec<syn::Ident> =
-        Vec::with_capacity(consumed_params_ordered.len());
-    for (i, &(id, slot)) in consumed_params_ordered.iter().enumerate() {
-        let p = format_ident!("consumed_{}", i);
-        consumed_params.insert((id, slot), p.clone());
-        consumed_param_idents.push(p);
-    }
-    let mut weight_params: HashMap<(WeightId, Option<u64>), syn::Ident> = HashMap::new();
-    let mut weight_params_by_name: HashMap<String, syn::Ident> = HashMap::new();
-    let mut weight_param_idents: Vec<syn::Ident> = Vec::with_capacity(accessors.len());
-    for (i, acc) in accessors.iter().enumerate() {
-        let p = format_ident!("w_{}", i);
-        for &(wid, idx) in &acc.source_weights {
-            weight_params.insert((wid, idx), p.clone());
-        }
-        weight_params_by_name.insert(acc.name.to_string(), p.clone());
-        weight_param_idents.push(p);
-    }
-
-    let abstract_ctx = EmitCtx {
-        fuf,
-        program,
-        model,
-        claimed_tiles: &claimed,
-        locals,
-        mode: EmitMode::Abstract {
-            tile_params,
-            consumed_params,
-            weight_params,
-            weight_params_by_name,
-        },
-    };
-    let abstract_body = imp.emit_call(&abstract_ctx);
-
-    // Fragment return value: the LAST claimed tile's slot-0
-    // output. `output_ident` in Abstract mode returns
-    // `__out_<claimed_pos>_<slot>`, so the return ident is
-    // `__out_<claimed.len()-1>_0`. Multi-output subgraphs are
-    // filtered out by `can_fragmentize`; fused multi-tile subgraphs
-    // return the last tile's output (matches how the solver
-    // committed the subgraph — topological final).
-    let out_tile = *claimed.last().expect("non-empty claimed");
-    let out_slot: u8 = 0;
-    let out_claimed_pos = claimed.len() - 1;
-
-    // Signature. The abstract body string captures the kernel call
-    // shape; adding input/weight/output counts distinguishes
-    // fragments that happen to stringify the same but differ in
-    // param arity (defensive).
-    let weight_types_str: String = accessors
-        .iter()
-        .map(|a| a.rust_type.to_string())
-        .collect::<Vec<_>>()
-        .join("|");
-    let sig = format!(
-        "ti={}|ci={}|wt={}|body={}",
-        tile_params_ordered.len(),
-        consumed_params_ordered.len(),
-        weight_types_str,
-        abstract_body,
-    );
-
-    // Intern the fragment. On miss, build and push the fn tokens.
-    let frag_idx = if let Some(&idx) = library.by_sig.get(&sig) {
-        idx
-    } else {
-        let idx = library.fns.len();
-        let frag_name = format_ident!("__frag_{}", idx);
-
-        let tile_param_decls: Vec<TokenStream> = tile_param_idents
-            .iter()
-            .map(|p| {
-                quote! {
-                    #p: ::ferrite_cuda_core::TensorView<'_>
-                }
-            })
-            .collect();
-        let consumed_param_decls: Vec<TokenStream> = consumed_param_idents
-            .iter()
-            .map(|p| {
-                quote! {
-                    #p: ::ferrite_cuda_core::alloc::OwnedTensor
-                }
-            })
-            .collect();
-        let weight_param_decls: Vec<TokenStream> = accessors
-            .iter()
-            .zip(weight_param_idents.iter())
-            .map(|(acc, p)| {
-                let ty = &acc.rust_type;
-                quote! { #p: & #ty }
-            })
-            .collect();
-
-        let return_ident = format_ident!("__out_{}_{}", out_claimed_pos, out_slot);
-        let fn_tokens = quote! {
-            #[cfg(feature = "cuda")]
-            #[allow(clippy::too_many_arguments, unused_mut, unused_variables, non_snake_case)]
-            unsafe fn #frag_name(
-                #(#tile_param_decls,)*
-                #(#consumed_param_decls,)*
-                #(#weight_param_decls,)*
-                wm: &Weights,
-                ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                #abstract_body
-                #return_ident
-            }
-        };
-        library.by_sig.insert(sig, idx);
-        library.fns.push(fn_tokens);
-        idx
-    };
-
-    // Call site. Viewed tile args are wrapped `(*local).as_view()`
-    // (TensorView, Copy); consumed tile args are passed by move
-    // (the upstream local becomes inaccessible, which the drop
-    // pass already accounts for via `consumes_input_tiles`).
-    // Weight args go through the accessor's field name on `wm` —
-    // for fused accessors that's the fused field, for singletons
-    // it's the per-weight field.
-    let frag_name = format_ident!("__frag_{}", frag_idx);
-    let input_args: Vec<TokenStream> = tile_params_ordered
-        .iter()
-        .map(|&(id, slot)| {
-            let local = &locals[&(id, slot)];
-            quote! { (*#local).as_view() }
-        })
-        .collect();
-    let consumed_args: Vec<TokenStream> = consumed_params_ordered
-        .iter()
-        .map(|&(id, slot)| {
-            let local = &locals[&(id, slot)];
-            quote! { #local }
-        })
-        .collect();
-    let weight_args: Vec<TokenStream> = accessors
-        .iter()
-        .map(|acc| {
-            let name = &acc.name;
-            quote! { &wm.#name }
-        })
-        .collect();
-
-    let out_local = locals
-        .get(&(out_tile, out_slot))
-        .cloned()
-        .expect("output local for claimed tile must exist");
-
-    quote! {
-        let #out_local = unsafe {
-            #frag_name(
-                #(#input_args,)*
-                #(#consumed_args,)*
-                #(#weight_args,)*
-                wm,
-                ctx,
-                device,
-            )
-        };
-    }
-}
-
-/// Emit the wave walk for one bucket, optionally skipping a single
-/// subgraph (the terminal lm_head) and with a caller-chosen
-/// `protected` set for drop analysis. Shared by:
-/// - the `forward_m_<N>` full-body emission (skip=None, protect
-///   last tile),
-/// - the `__body_m_<N>` helper emission (skip=terminal, protect
-///   backbone tile).
-#[allow(clippy::too_many_arguments)]
-fn emit_wave_walk(
-    fuf: &Fuf,
-    sfuf: &Assignment,
-    loop_ir: &Loop,
-    program: &Program,
-    model: &ModelParams,
-    lib: &ImplementationLibrary,
-    locals: &LocalMap,
-    skip_subgraph: Option<SubgraphId>,
-    protected: &HashSet<(TileId, u8)>,
-    library: &mut FragmentLibrary,
-) -> Vec<TokenStream> {
-    let drops = compute_drops_after(fuf, sfuf, loop_ir, lib, skip_subgraph, protected);
-    let mut body: Vec<TokenStream> = Vec::new();
-    for wave in &loop_ir.waves {
-        for (sg, imp_id) in &wave.subgraphs {
-            if Some(*sg) == skip_subgraph {
-                continue;
-            }
-            body.push(emit_subgraph(
-                fuf, sfuf, program, model, lib, *sg, *imp_id, locals, library,
-            ));
-            if let Some(owners) = drops.get(sg) {
-                for (t, s) in owners {
-                    let ident = &locals[&(*t, *s)];
-                    body.push(quote! { drop(#ident); });
-                }
-            }
-        }
-    }
-    body
-}
-
-/// Emit a backbone-only per-bucket forward that runs every subgraph
-/// EXCEPT the terminal one (assumed to be the `logits = gemm(normed,
-/// lm_head)` call at the end of every causal-LM DSL body). Returns a
-/// fresh-allocated clone of the subgraph output that would have been
-/// the lm_head's input — typically the final rmsnorm's output.
-///
-/// Used by pipeline-parallelism intermediate ranks, which consume
-/// backbone hidden-states from one rank and hand them to the next
-/// without ever running lm_head.
-///
-/// The emitted fn's signature mirrors `forward_m_<N>` exactly except
-/// for the name and semantic return value.
-#[allow(clippy::too_many_arguments)]
-fn emit_forward_for_bucket(
-    fuf: &Fuf,
-    sfuf: &Assignment,
-    loop_ir: &Loop,
-    program: &Program,
-    model: &ModelParams,
-    lib: &ImplementationLibrary,
-    wp: crate::solver::WorkloadPoint,
-    library: &mut FragmentLibrary,
-) -> TokenStream {
-    let locals = build_local_map(fuf);
-
-    // Forward returns the last tile's slot-0 output — its owner must
-    // not be dropped before the function returns.
-    let mut protected: HashSet<(TileId, u8)> = HashSet::new();
-    if let Some(last) = fuf.nodes.last() {
-        protected.insert((last.id, 0));
-    }
-    let body = emit_wave_walk(
-        fuf, sfuf, loop_ir, program, model, lib, &locals, None, &protected, library,
-    );
-
-    // The forward's return value: the last tile's output.
-    let last_output = fuf
-        .nodes
-        .last()
-        .map(|n| {
-            let id = locals[&(n.id, 0)].clone();
-            quote! { #id }
-        })
-        .unwrap_or_else(|| quote! { unreachable!("empty FUF") });
-
-    let fn_name = bucket_fn_ident("forward_m", wp);
-
-    let impl_names: String = loop_ir
-        .waves
-        .iter()
-        .flat_map(|w| w.subgraphs.iter())
-        .map(|(_, imp_id)| lib.get(*imp_id).name())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let impl_names_lit = proc_macro2::Literal::string(&impl_names);
-
-    quote! {
-        /// Forward pass for this model × workload bucket. Walks
-        /// the solver-picked kernels in wavefront order.
-        ///
-        /// # Safety
-        /// All tensors in `ctx` must be valid GPU memory; `device`
-        /// must be the live CUDA device.
-        #[cfg(feature = "cuda")]
-        #[allow(clippy::too_many_arguments, unused_mut, unused_variables)]
-        pub unsafe fn #fn_name(
-            wm: &Weights,
-            ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            ::tracing::debug!(
-                m = ctx.input_ids.shape()[0],
-                sk = ctx.max_seqlen_k,
-                impls = #impl_names_lit,
-                "ferrite forward"
-            );
-            #(#body)*
-            #last_output
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_forward_backbone_for_bucket(
-    fuf: &Fuf,
-    sfuf: &Assignment,
-    loop_ir: &Loop,
-    program: &Program,
-    model: &ModelParams,
-    lib: &ImplementationLibrary,
-    wp: crate::solver::WorkloadPoint,
-    library: &mut FragmentLibrary,
-) -> TokenStream {
-    let locals = build_local_map(fuf);
-
-    let Some(last_node) = fuf.nodes.last() else {
-        // Empty FUF: degenerate, emit a stub that panics.
-        let fn_name = bucket_fn_ident("forward_backbone_m", wp);
-        return quote! {
-            #[cfg(feature = "cuda")]
-            #[allow(clippy::too_many_arguments)]
-            pub unsafe fn #fn_name(
-                wm: &Weights,
-                ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                unreachable!("forward_backbone: empty FUF")
-            }
-        };
-    };
-    let terminal_sg = sfuf
-        .subgraph_of(last_node.id)
-        .expect("terminal tile must be in a subgraph");
-
-    let backbone_out: (crate::fuf::TileId, u8) = match last_node.inputs.first() {
-        Some(FufInput::Tile { id, slot }) => (*id, *slot),
-        _ => panic!(
-            "forward_backbone: terminal tile's first input is not a Tile \
-             (DSL must end in `gemm(<tile>, lm_head)`)"
-        ),
-    };
-    let backbone_ident = locals[&backbone_out].clone();
-
-    let mut protected: HashSet<(TileId, u8)> = HashSet::new();
-    protected.insert(backbone_out);
-    let body = emit_wave_walk(
-        fuf,
-        sfuf,
-        loop_ir,
-        program,
-        model,
-        lib,
-        &locals,
-        Some(terminal_sg),
-        &protected,
-        library,
-    );
-
-    let fn_name = bucket_fn_ident("forward_backbone_m", wp);
-
-    let bb_impl_names: String = loop_ir
-        .waves
-        .iter()
-        .flat_map(|w| w.subgraphs.iter())
-        .filter(|(sg, _)| Some(*sg) != Some(terminal_sg))
-        .map(|(_, imp_id)| lib.get(*imp_id).name())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let bb_impl_names_lit = proc_macro2::Literal::string(&bb_impl_names);
-
-    quote! {
-        /// Backbone-only forward (no lm_head). Returns the output
-        /// that would have been the final gemm's input — a freshly-
-        /// allocated `OwnedTensor` so the caller owns the buffer
-        /// independent of any in-fn alias.
-        ///
-        /// # Safety
-        /// All tensors in `ctx` must be valid GPU memory; `device`
-        /// must be the live CUDA device.
-        #[cfg(feature = "cuda")]
-        #[allow(clippy::too_many_arguments, unused_mut, unused_variables)]
-        pub unsafe fn #fn_name(
-            wm: &Weights,
-            ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            ::tracing::debug!(
-                m = ctx.input_ids.shape()[0],
-                sk = ctx.max_seqlen_k,
-                impls = #bb_impl_names_lit,
-                "ferrite forward_backbone"
-            );
-            #(#body)*
-            let __bb_view = unsafe { (*#backbone_ident).as_view() };
-            let __bb_shape_u32: &[u32] = __bb_view.shape();
-            let __bb_shape: ::std::vec::Vec<usize> =
-                __bb_shape_u32.iter().map(|&d| d as usize).collect();
-            let __bb_out = device
-                .caching
-                .alloc_tensor(&__bb_shape, __bb_view.dtype());
-            ::ferrite_cuda_core::driver::memcpy_dtod_async(
-                __bb_out.raw_ptr(),
-                __bb_view.raw_ptr() as *const u8,
-                __bb_view.size_bytes(),
-                device.compute_stream,
-            )
-            .expect("forward_backbone: DtoD memcpy of output");
-            __bb_out
-        }
-    }
-}
+//
+// The macro lowers each canonical bucket's solved FUF into a flat
+// instruction list (a `&[Op]` static slice), emits one per-arch
+// `Op` enum + one per-arch `__interpret` helper, then emits one
+// thin per-bucket fn per (forward, backbone) × workload-point that:
+// 1. allocates the runtime tile table,
+// 2. runs the alias prelude (zero-copy `View` aliases the lowering
+//    surfaced via `output_alias`),
+// 3. calls `__interpret(&FORWARD_M_<N>, &mut __tiles, …)`,
+// 4. takes ownership of the slot the lowering tagged as final.
+//
+// Buckets in the same SFUF equivalence class as a canonical share
+// the canonical's body via thin `#[inline(always)]` wrappers — same
+// dedup the previous codegen path used.
 
 /// Ident for a per-workload-bucket forward fn. Name is
 /// `<prefix>_<m>` when `sk_bucket == 0` (legacy 1-D sweep) and
@@ -3101,6 +2356,100 @@ fn bucket_fn_ident(prefix: &str, wp: crate::solver::WorkloadPoint) -> proc_macro
     } else {
         format_ident!("{}_{}_sk_{}", prefix, wp.num_tokens, wp.sk_bucket)
     }
+}
+
+/// Ident for a per-workload-bucket `static <PREFIX>_<m>: &[Op]`.
+/// Mirrors [`bucket_fn_ident`] in shape but uses upper-case so the
+/// emitted module reads naturally — `FORWARD_M_64` /
+/// `BACKBONE_M_64_SK_2048`.
+fn bucket_static_ident(prefix: &str, wp: crate::solver::WorkloadPoint) -> proc_macro2::Ident {
+    if wp.sk_bucket == 0 {
+        format_ident!("{}_{}", prefix, wp.num_tokens)
+    } else {
+        format_ident!("{}_{}_SK_{}", prefix, wp.num_tokens, wp.sk_bucket)
+    }
+}
+
+/// Per-canonical-bucket lowering products. The `backbone` slice
+/// carries everything the forward pass needs except the terminal
+/// `lm_head` gemm; the `lm_head` slice carries that single row.
+/// `forward` runs both, `forward_backbone` runs only the backbone
+/// and DtoD-copies the backbone-output slot.
+struct CanonicalLowered {
+    backbone: crate::interpreter_codegen::LoweredBucket,
+    lm_head: crate::interpreter_codegen::LoweredBucket,
+}
+
+/// Resolve the `(TileId, u8)` whose `OwnedTensor` is the backbone's
+/// "return value" — the input the terminal `gemm(<tile>, lm_head)`
+/// would have read. Panics if the FUF doesn't end in a tile-input
+/// terminal, since `forward_backbone` has no defined behavior for
+/// architectures whose terminal is anything other than `gemm(...,
+/// lm_head)`.
+fn backbone_output_for(fuf: &Fuf) -> (TileId, u8) {
+    let last_node = fuf
+        .nodes
+        .last()
+        .expect("FUF must be non-empty to emit a forward fn");
+    match last_node.inputs.first() {
+        Some(FufInput::Tile { id, slot }) => (*id, *slot),
+        _ => panic!(
+            "forward_backbone: terminal tile's first input is not a Tile \
+             (DSL must end in `gemm(<tile>, lm_head)`)"
+        ),
+    }
+}
+
+/// Build the workload-point bounds map `lower_bucket` and Impls
+/// consume — model.bounds + the workload-specific `num_tokens` and
+/// `sk_bucket` overrides. Mirrors what `solve_workloads` does before
+/// each per-point solve.
+fn bounds_for_wp(model: &ModelParams, wp: crate::solver::WorkloadPoint) -> BTreeMap<String, u64> {
+    let mut bounds = model.bounds.clone();
+    bounds.insert("num_tokens".to_string(), wp.num_tokens);
+    bounds.insert("sk_bucket".to_string(), wp.sk_bucket);
+    bounds
+}
+
+/// Render the alias-prelude statements for one [`LoweredBucket`].
+/// Each `(dst, src)` becomes `__tiles[dst as usize] =
+/// Some(TileEntry::View { ref_slot: src });`. Aliases are dropped
+/// in the lowering when `dst == src`, so callers don't need a
+/// guard.
+fn emit_alias_prelude(aliases: &[(u32, u32)]) -> Vec<TokenStream> {
+    // Each row: `__tiles[dst] = Some(view(src));` — 1 line.
+    // `view()` is a tiny helper on `ferrite_forward` that wraps
+    // `TileEntry::View { ref_slot }`; using it instead of inlining
+    // the struct literal keeps prettyplease from breaking each
+    // alias onto three lines, which matters because there are
+    // hundreds of aliases per bucket on the deeper models.
+    aliases
+        .iter()
+        .map(|(dst, src)| {
+            let dst = proc_macro2::Literal::u32_unsuffixed(*dst);
+            let src = proc_macro2::Literal::u32_unsuffixed(*src);
+            quote! { __tiles[#dst as usize] = Some(::ferrite_forward::view(#src)); }
+        })
+        .collect()
+}
+
+/// Render the comma-separated impl-name list (`"rmsnorm_ref,
+/// fused_qkv_rope_cache, …"`) the per-bucket fn passes to
+/// `tracing::debug!`. `filter_terminal` drops the terminal subgraph
+/// for the backbone fn's listing.
+fn impl_names_for(
+    loop_ir: &crate::schedule::Loop,
+    lib: &ImplementationLibrary,
+    skip_terminal: Option<crate::solver::SubgraphId>,
+) -> String {
+    loop_ir
+        .waves
+        .iter()
+        .flat_map(|w| w.subgraphs.iter())
+        .filter(|(sg, _)| Some(*sg) != skip_terminal)
+        .map(|(_, imp_id)| lib.get(*imp_id).name())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Emit the full per-model module body: Weights struct + loader,
@@ -3141,16 +2490,13 @@ pub fn emit_model(
 
     // Group workload points by SFUF signature (sorted subgraph → impl).
     // Buckets with identical impl picks produce byte-identical fn
-    // bodies, so we emit the full body ONCE at the canonical point and
-    // emit the duplicates as thin `#[inline(always)]` shims that
-    // delegate to the canonical fn. Public API (every
-    // `forward_m_<M>[_sk_<SK>]` / `forward_backbone_m_<M>[_sk_<SK>]`
-    // name a user might take a fn-pointer to) is preserved. Measured:
-    // most models collapse 5 buckets → 2 unique SFUFs, cutting the
-    // `quote!` work and the rustc-visible emitted body volume roughly
-    // in half on those models. Extended to 2-D here: dedup runs over
-    // `(num_tokens, sk_bucket)` points too, so models with `sk_buckets`
-    // declared get the same compile-time win.
+    // bodies, so we lower the canonical ONCE and emit duplicates as
+    // thin `#[inline(always)]` shims that delegate to the canonical
+    // fn. Public API (every `forward_m_<M>[_sk_<SK>]` /
+    // `forward_backbone_m_<M>[_sk_<SK>]` name a user might take a
+    // fn-pointer to) is preserved. Dedup runs over `(num_tokens,
+    // sk_bucket)` 2-D points so models with `sk_buckets` declared get
+    // the same compile-time win.
     let bucket_points: Vec<crate::solver::WorkloadPoint> =
         sfufs.per_workload.keys().copied().collect();
     let mut sfuf_to_canonical: HashMap<Vec<(u32, u32)>, crate::solver::WorkloadPoint> =
@@ -3165,42 +2511,247 @@ pub fn emit_model(
         bucket_canonical.push(canonical);
     }
 
-    // Per-model fragment library. `emit_forward_for_bucket` and
-    // `emit_forward_backbone_for_bucket` both feed into it; the
-    // resulting unique fn bodies get spliced into the emitted
-    // module alongside the forward dispatchers.
-    let mut fragment_library = FragmentLibrary::default();
+    // Lower every canonical bucket once, backbone-shaped: skip the
+    // terminal subgraph (the `gemm(<final_norm>, lm_head)` row) and
+    // emit it separately as a tiny LM_HEAD slice. forward and
+    // forward_backbone share the backbone slice; forward additionally
+    // runs LM_HEAD; forward_backbone DtoD-copies the backbone-output
+    // slot. No more pair of near-identical full slices per bucket.
+    let mut arch_opcodes = ArchOpcodes::new();
+    let mut canonical_lowered: BTreeMap<
+        crate::solver::WorkloadPoint,
+        (
+            CanonicalLowered,
+            /* num_slots */ u32,
+            /* backbone_slot */ u32,
+            /* terminal_slot */ u32,
+        ),
+    > = BTreeMap::new();
+    let last_node_id = fuf.nodes.last().expect("non-empty FUF expected").id;
+    let backbone_out = backbone_output_for(fuf);
+    for (i, wp) in bucket_points.iter().enumerate() {
+        if bucket_canonical[i] != *wp {
+            continue;
+        }
+        let sfuf = &sfufs.per_workload[wp];
+        let loop_ir = loops
+            .per_workload
+            .get(wp)
+            .expect("schedule populated every key");
+        let bounds = bounds_for_wp(model, *wp);
+        let terminal_sg = sfuf
+            .subgraph_of(last_node_id)
+            .expect("terminal tile must be in a subgraph");
 
+        // Backbone — protect backbone_out (carries through to lm_head
+        // OR the DtoD copy) AND the terminal slot (so backbone's drop
+        // pass leaves it for lm_head to write).
+        let mut protected_bb: HashSet<(TileId, u8)> = HashSet::new();
+        protected_bb.insert(backbone_out);
+        protected_bb.insert((last_node_id, 0));
+
+        // Per-bucket colored slot map. Computed once and shared
+        // between backbone lowering and the lm_head fan_out so they
+        // agree on slot indices.
+        let slots = crate::interpreter_codegen::colored_slot_map(
+            fuf,
+            sfuf,
+            loop_ir,
+            lib,
+            None,
+            &protected_bb,
+        );
+        let backbone_slot = slots.of(backbone_out.0, backbone_out.1);
+        let terminal_slot = slots.of(last_node_id, 0);
+        let num_slots = slots.total();
+
+        let lowered_bb = lower_bucket(
+            fuf,
+            sfuf,
+            loop_ir,
+            program,
+            model,
+            lib,
+            &bounds,
+            Some(terminal_sg),
+            &protected_bb,
+            &mut arch_opcodes,
+            backbone_out,
+            &slots,
+        );
+
+        // LM_HEAD — one row, computed by directly invoking the
+        // terminal subgraph's `fan_out` against the same slot map.
+        // No aliases, no drops, no recursion — terminal is the last
+        // subgraph in topological order.
+        let term_imp_id = sfuf
+            .impl_of(terminal_sg)
+            .expect("terminal subgraph has an Impl assignment");
+        let term_imp = lib.get(term_imp_id);
+        let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
+        let term_match = crate::impl_lib::MatchInfo {
+            claimed_tiles: term_claimed.clone(),
+            boundary_inputs: crate::interpreter_codegen::collect_boundary_inputs(
+                fuf,
+                &term_claimed,
+            ),
+            boundary_outputs: term_claimed,
+        };
+        let term_emits = term_imp
+            .fan_out(&term_match, fuf, program, &bounds, &slots)
+            .expect("terminal subgraph's Impl must implement fan_out");
+        arch_opcodes.register(term_imp.opcode_shape(), term_imp.interpreter_arm(model));
+        let lowered_lm = crate::interpreter_codegen::LoweredBucket {
+            instances: term_emits,
+            num_slots,
+            final_slot: terminal_slot,
+        };
+
+        canonical_lowered.insert(
+            *wp,
+            (
+                CanonicalLowered {
+                    backbone: lowered_bb,
+                    lm_head: lowered_lm,
+                },
+                num_slots,
+                backbone_slot,
+                terminal_slot,
+            ),
+        );
+    }
+
+    // Arch-wide constant extraction: any field on a variant whose
+    // value is byte-identical across every instance (across every
+    // canonical bucket's forward + backbone slice) gets dropped from
+    // the variant + the rows, and rebound to its constant value at
+    // the top of the variant's match-arm body. This is what stops
+    // commandr's QkvRopeCache rows from carrying `interleaved: true`,
+    // `biased: false`, `cos_sin_fn: Weights::rotary_cos_sin`, and
+    // (for Impls picked for a single accessor) `weight_fn:
+    // Weights::self_attn_qkv` on every single row.
+    {
+        let mut refs: Vec<&mut crate::interpreter_codegen::LoweredBucket> = Vec::new();
+        for (cl, _, _, _) in canonical_lowered.values_mut() {
+            refs.push(&mut cl.backbone);
+            refs.push(&mut cl.lm_head);
+        }
+        crate::interpreter_codegen::extract_arch_wide_constants(&mut arch_opcodes, &mut refs);
+    }
+
+    // Layer-template detection: collapse the contiguous repeating
+    // sub-sequence of the slice (the per-layer transformer body)
+    // into one `Op::Loop(N, body_len)` row + one iteration's body.
+    // Fused boundary effects (e.g., FusedAddRmsNorm absorbing layer
+    // L's final add into layer L+1's first norm) leave layer 0 / the
+    // last layer structurally distinct, so the detection picks the
+    // largest CONTIGUOUS run that genuinely repeats — middle layers
+    // — and keeps the boundary residues as straight-line code in
+    // prelude/suffix.
+    for (cl, _, _, _) in canonical_lowered.values_mut() {
+        crate::interpreter_codegen::apply_loop_compression(
+            &arch_opcodes,
+            &mut cl.backbone,
+            "layer",
+        );
+        crate::interpreter_codegen::apply_loop_compression(&arch_opcodes, &mut cl.lm_head, "layer");
+    }
+
+    // One per-arch opcode enum + one per-arch interpreter helper
+    // for the module. Both private to the module.
+    let enum_ident = format_ident!("Op");
+    let helper_ident = format_ident!("__interpret");
+    let arch_enum_ts = arch_opcodes.emit_enum(&enum_ident);
+    let arch_interpreter_ts = arch_opcodes.emit_interpreter(&helper_ident, &enum_ident);
+    let shapes_by_name = arch_opcodes.shapes_by_name();
+
+    // Per-bucket statics + per-bucket fns. Canonical buckets get a
+    // freshly-emitted body; non-canonical buckets get a thin shim
+    // delegating to the canonical's forward fn.
+    let mut static_slices: Vec<TokenStream> = Vec::new();
     let mut bucket_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
     let mut backbone_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
     for (i, wp) in bucket_points.iter().enumerate() {
-        let sfuf = &sfufs.per_workload[wp];
         let canonical = bucket_canonical[i];
         if canonical == *wp {
-            let loop_ir = loops
-                .per_workload
-                .get(wp)
-                .expect("schedule populated every key");
-            bucket_fns.push(emit_forward_for_bucket(
-                fuf,
-                sfuf,
-                loop_ir,
-                program,
-                model,
-                lib,
-                *wp,
-                &mut fragment_library,
+            let (lowered, num_slots_val, backbone_slot_val, terminal_slot_val) =
+                &canonical_lowered[wp];
+
+            let backbone_static_ident = bucket_static_ident("BACKBONE_M", *wp);
+            let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
+            static_slices.push(emit_bucket_static_slice(
+                &backbone_static_ident,
+                &enum_ident,
+                &shapes_by_name,
+                &lowered.backbone.instances,
             ));
-            backbone_fns.push(emit_forward_backbone_for_bucket(
-                fuf,
-                sfuf,
-                loop_ir,
-                program,
-                model,
-                lib,
-                *wp,
-                &mut fragment_library,
+            static_slices.push(emit_bucket_static_slice(
+                &lm_head_static_ident,
+                &enum_ident,
+                &shapes_by_name,
+                &lowered.lm_head.instances,
             ));
+
+            let num_slots = proc_macro2::Literal::u32_unsuffixed(*num_slots_val);
+            let bb_final_slot = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_val);
+            let fwd_final_slot = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_val);
+
+            // forward = backbone + one lm_head step.
+            let fwd_fn_name = bucket_fn_ident("forward_m", *wp);
+            bucket_fns.push(quote! {
+                #[cfg(feature = "cuda")]
+                #[allow(clippy::too_many_arguments, unused_mut, unused_variables)]
+                pub unsafe fn #fwd_fn_name(
+                    wm: &Weights,
+                    ctx: &::ferrite_forward::ForwardCtx,
+                    device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                    let mut __tiles: ::std::vec::Vec<Option<::ferrite_forward::TileEntry>> =
+                        (0u32..#num_slots).map(|_| None).collect();
+                    unsafe {
+                        #helper_ident(#backbone_static_ident, &mut __tiles, wm, ctx, device);
+                        #helper_ident(#lm_head_static_ident, &mut __tiles, wm, ctx, device);
+                    }
+                    ::ferrite_forward::take_owned(&mut __tiles, #fwd_final_slot)
+                }
+            });
+
+            // forward_backbone = backbone, then DtoD-copy the
+            // backbone-output slot into a freshly-allocated
+            // OwnedTensor so the caller owns the buffer.
+            let bb_fn_name = bucket_fn_ident("forward_backbone_m", *wp);
+            backbone_fns.push(quote! {
+                #[cfg(feature = "cuda")]
+                #[allow(clippy::too_many_arguments, unused_mut, unused_variables)]
+                pub unsafe fn #bb_fn_name(
+                    wm: &Weights,
+                    ctx: &::ferrite_forward::ForwardCtx,
+                    device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                    let mut __tiles: ::std::vec::Vec<Option<::ferrite_forward::TileEntry>> =
+                        (0u32..#num_slots).map(|_| None).collect();
+                    unsafe {
+                        #helper_ident(#backbone_static_ident, &mut __tiles, wm, ctx, device);
+                    }
+                    let __bb_view = unsafe {
+                        ::ferrite_forward::tile_ref(&__tiles, #bb_final_slot).as_view(&__tiles)
+                    };
+                    let __bb_shape_u32: &[u32] = __bb_view.shape();
+                    let __bb_shape: ::std::vec::Vec<usize> =
+                        __bb_shape_u32.iter().map(|&d| d as usize).collect();
+                    let __bb_out = device
+                        .caching
+                        .alloc_tensor(&__bb_shape, __bb_view.dtype());
+                    ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                        __bb_out.raw_ptr(),
+                        __bb_view.raw_ptr() as *const u8,
+                        __bb_view.size_bytes(),
+                        device.compute_stream,
+                    )
+                    .expect("forward_backbone: DtoD memcpy of output");
+                    __bb_out
+                }
+            });
         } else {
             let fwd_name = bucket_fn_ident("forward_m", *wp);
             let fwd_target = bucket_fn_ident("forward_m", canonical);
@@ -3343,26 +2894,14 @@ pub fn emit_model(
     let (match_arms, fallback_arm) = build_match_arms("forward_m");
     let (backbone_match_arms, backbone_fallback_arm) = build_match_arms("forward_backbone_m");
 
-    // Per-model fragment library: each unique kernel-call body
-    // emitted once as `__frag_<N>`. Forward/backbone bodies are a
-    // sequence of one-line `let t_X = unsafe { __frag_N(...) };`
-    // dispatches against this library, so multi-layer transformers
-    // stop emitting the same rmsnorm / gemm / silu etc body once
-    // per layer.
-    let fragment_fns = fragment_library.into_fns();
-    eprintln!(
-        "    codegen-profile: {} fragments emitted, {} call sites, {} inline-fallback sites",
-        fragment_fns.len(),
-        CALL_SITE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-        INLINE_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-    );
-    CALL_SITE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-    INLINE_FALLBACK_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-
     quote! {
         #weights
 
-        #(#fragment_fns)*
+        #arch_enum_ts
+
+        #arch_interpreter_ts
+
+        #(#static_slices)*
 
         #(#bucket_fns)*
         #(#backbone_fns)*
@@ -3539,9 +3078,12 @@ mod tests {
         assert!(ts.contains("& self . input_layernorm_0"));
         assert!(ts.contains("& self . input_layernorm_1"));
         assert!(ts.contains("& self . input_layernorm_2"));
-        // No catch-all that silently picks layer 0 — we panic on
-        // out-of-range to surface drop-pass / solver bugs early.
-        assert!(ts.contains("out of range"));
+        // The catch-all is `unreachable_unchecked()` — codegen
+        // guarantees `layer` is one of the registered indices, so no
+        // runtime panic, no format-args bloat in the expanded crate.
+        assert!(ts.contains("unreachable_unchecked"));
+        assert!(!ts.contains("out of range"));
+        assert!(!ts.contains("panic"));
     }
 
     #[test]

@@ -133,6 +133,16 @@ impl TileEntry {
     }
 }
 
+/// One-shot constructor for the alias-prelude rows the codegen emits
+/// at the top of every per-bucket forward fn. Lets the macro write
+/// `__tiles[dst] = Some(view(src));` on a single line, instead of
+/// `Some(TileEntry::View { ref_slot: src })` which prettyplease
+/// wraps onto three lines for every alias.
+#[inline]
+pub fn view(ref_slot: u32) -> TileEntry {
+    TileEntry::View { ref_slot }
+}
+
 /// Convenience accessor used by generated interpreter arms.
 ///
 /// Reads slot `idx` from `tiles`, panics with a clear message if

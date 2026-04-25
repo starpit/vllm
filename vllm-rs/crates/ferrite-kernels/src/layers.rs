@@ -838,6 +838,61 @@ impl Fp8BlockLinear {
 }
 
 // ---------------------------------------------------------------------------
+// Fp8AnyLinear (per-tensor / per-channel `Fp8Linear` ⨁ blockwise `Fp8BlockLinear`)
+// ---------------------------------------------------------------------------
+
+/// Storage-uniform wrapper around the two FP8 linear variants. Lets
+/// the codegen pick a single `weight_fn` Rust type for FP8 GEMM Impls
+/// — every claim of an FP8 Impl in a model's Weights struct holds an
+/// `Fp8AnyLinear`, regardless of whether that specific tile's
+/// `quantization_config` declared per-tensor / per-channel scales
+/// (`Std`) or per-block scales (`Block`).
+///
+/// `forward` matches both inner `forward`s' signature, so the
+/// per-arch interpreter arm calls `(weight_fn)(wm, layer).forward(x,
+/// cublas, alloc, stream)` without caring which variant is inside.
+pub enum Fp8AnyLinear {
+    Std(Fp8Linear),
+    Block(Fp8BlockLinear),
+}
+
+impl Fp8AnyLinear {
+    /// Forward: dispatches to whichever inner FP8 layer is wrapped.
+    /// Both variants take the same arguments and return `OwnedTensor`.
+    ///
+    /// # Safety
+    /// All tensors must be valid GPU memory; `cublas` / `alloc` /
+    /// `stream` must be live. Inner `forward`s carry the same
+    /// invariants.
+    pub unsafe fn forward(
+        &self,
+        x: TensorView<'_>,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        match self {
+            Self::Std(l) => unsafe { l.forward(x, cublas, alloc, stream) },
+            Self::Block(l) => unsafe { l.forward(x, cublas, alloc, stream) },
+        }
+    }
+
+    pub fn out_features(&self) -> usize {
+        match self {
+            Self::Std(l) => l.out_features(),
+            Self::Block(l) => l.out_features(),
+        }
+    }
+
+    pub fn in_features(&self) -> usize {
+        match self {
+            Self::Std(l) => l.in_features(),
+            Self::Block(l) => l.in_features(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Embedding
 // ---------------------------------------------------------------------------
 

@@ -12,7 +12,7 @@ pub mod cpu_golden;
 pub mod tile_table;
 
 #[cfg(feature = "cuda")]
-pub use tile_table::{TileEntry, take_owned, tile_ref};
+pub use tile_table::{TileEntry, take_owned, tile_ref, view};
 
 /// Deterministic hash of a `serde_json::Value` for `HfFingerprint`
 /// content discrimination. Canonicalizes object key order and

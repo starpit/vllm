@@ -574,63 +574,6 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     fn consumes_input_tiles(&self, _claimed_tiles: &[TileId], _fuf: &Fuf) -> Vec<(TileId, u8)> {
         Vec::new()
     }
-
-    // ── Instruction-list IR (interpreter / megakernel target) ────────
-
-    /// Stable opcode for this Impl when targeting the instruction-list
-    /// IR. Required iff this Impl returns `Some` from [`fan_out`].
-    /// See `ferrite_forward::instruction::opcode` for the canonical
-    /// llama-family vocabulary.
-    fn opcode(&self) -> u16 {
-        0 // NOOP — the default flags this Impl as not migrated yet.
-    }
-
-    /// Materialize this Impl's claim as a sequence of compile-time
-    /// instruction emits, one per kernel-call this claim turns into
-    /// at this workload point. Mirrors what [`emit_call`] inlines as
-    /// Rust code, but as DATA: the codegen will emit each entry as a
-    /// row in a `&'static [::ferrite_forward::Instruction]` const
-    /// array, and the generated interpreter will dispatch on
-    /// [`opcode`] to a kernel call site.
-    ///
-    /// Default: `None` — Impl has not been migrated to the
-    /// instruction-list IR. Solver filters such Impls out when the
-    /// target profile picks the interpreter backend.
-    ///
-    /// `bounds` carries the model-wide integer config (hidden_size,
-    /// intermediate_size, num_attention_heads, …) plus the current
-    /// workload point's `num_tokens` and `sk_bucket`. Avoids
-    /// threading a full ModelParams through here; the entries Impls
-    /// actually need are bounds.
-    fn fan_out(
-        &self,
-        _m: &MatchInfo,
-        _fuf: &Fuf,
-        _program: &Program,
-        _bounds: &BTreeMap<String, u64>,
-        _slots: &SlotMap,
-    ) -> Option<Vec<InstrEmit>> {
-        None
-    }
-
-    /// Emit the body of one match-arm in the generated per-arch
-    /// interpreter for this Impl's [`opcode`]. The arm receives the
-    /// in-scope identifier `instr` of type
-    /// `::ferrite_forward::Instruction` and ambient `wm: &Weights`,
-    /// `ctx: &ForwardCtx`, `device: &mut GpuDevice` bindings. Body
-    /// should decode fields off `instr` (via `instr.field(N)` or
-    /// `instr.fields_slice(start, len)`) and emit a kernel call.
-    ///
-    /// Required iff this Impl returns `Some` from [`fan_out`].
-    /// Default emits a `compile_error!` so a half-migrated Impl
-    /// fails loudly at codegen.
-    fn interpreter_arm(&self, _instr_ident: &syn::Ident) -> TokenStream {
-        let name = self.name();
-        let msg = format!(
-            "Implementation `{name}` returned Some from fan_out but has no interpreter_arm body"
-        );
-        quote! { compile_error!(#msg); }
-    }
 }
 
 /// Compile-time mapping from `(TileId, output_slot)` → flat slot
@@ -688,70 +631,6 @@ impl SlotMap {
     #[inline]
     pub fn total(&self) -> u32 {
         self.total
-    }
-}
-
-/// Compile-time representation of one row in an instruction list.
-///
-/// Codegen turns each `InstrEmit` into a single
-/// `::ferrite_forward::Instruction` literal inside the per-(variant ×
-/// workload-point) const array. At runtime that array is a
-/// `&'static [Instruction]`; the generated interpreter walks it,
-/// dispatches on opcode, and calls per-Impl kernel call sites.
-///
-/// Field layout per opcode lives on the Impl (its [`fan_out`]
-/// populates the slots; its [`interpreter_arm`] decodes them).
-/// The two MUST agree on slot semantics — the trait's contract.
-#[derive(Clone, Copy, Debug)]
-pub struct InstrEmit {
-    pub opcode: u16,
-    pub fields: [i32; 31],
-}
-
-impl InstrEmit {
-    /// Construct an empty (all-zero-fields) instruction emit with
-    /// the given opcode.
-    #[inline]
-    pub fn new(opcode: u16) -> Self {
-        Self {
-            opcode,
-            fields: [0; 31],
-        }
-    }
-
-    /// Set field `idx` to `val` and return self for chaining. `idx`
-    /// is 0-indexed within the 31 opcode-defined slots.
-    #[inline]
-    pub fn with(mut self, idx: usize, val: i32) -> Self {
-        self.fields[idx] = val;
-        self
-    }
-
-    /// Bulk-set a contiguous span of fields starting at `start`.
-    /// Used by variable-length opcodes (e.g. AttnNorm's
-    /// `local_batch_indices`, AttentionDecode's `data`).
-    #[inline]
-    pub fn with_slice(mut self, start: usize, vals: &[i32]) -> Self {
-        for (i, v) in vals.iter().enumerate() {
-            self.fields[start + i] = *v;
-        }
-        self
-    }
-
-    /// Render as a literal `::ferrite_forward::Instruction` token
-    /// stream for embedding in a generated `const` array.
-    pub fn to_tokens(self) -> TokenStream {
-        let opcode = self.opcode as i32;
-        let fields = &self.fields;
-        let field_lits = fields.iter().map(|f| {
-            let lit = proc_macro2::Literal::i32_suffixed(*f);
-            quote! { #lit }
-        });
-        quote! {
-            ::ferrite_forward::Instruction([
-                #opcode #(, #field_lits)*
-            ])
-        }
     }
 }
 
@@ -10735,24 +10614,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instr_emit_to_tokens_lays_out_opcode_then_31_fields() {
-        // Locks the wire layout: codegen emits one
-        // `::ferrite_forward::Instruction([opcode, f0, f1, …, f30])`
-        // literal per fan_out entry. If this changes, every emitted
-        // const array silently shifts and every interpreter arm's
-        // field decoding desynchronizes.
-        let emit = InstrEmit::new(7).with(0, 42).with(1, -3).with(30, 99);
-        let ts = emit.to_tokens().to_string();
-        // Spot-check: the literal contains exactly one `Instruction([…])`
-        // wrapping a 32-element array starting with the opcode.
-        assert!(ts.contains(":: ferrite_forward :: Instruction"));
-        assert!(ts.contains("7i32"), "opcode literal: {ts}");
-        assert!(ts.contains("42i32"), "field 0 literal: {ts}");
-        assert!(ts.contains("- 3i32"), "field 1 literal: {ts}");
-        assert!(ts.contains("99i32"), "field 30 literal: {ts}");
-    }
-
-    #[test]
     fn slot_map_assigns_dense_indices_in_insert_order() {
         let mut sm = SlotMap::new();
         assert_eq!(sm.insert(TileId(7), 0), 0);
@@ -10769,18 +10630,6 @@ mod tests {
     fn slot_map_of_unregistered_panics() {
         let sm = SlotMap::new();
         let _ = sm.of(TileId(1), 0);
-    }
-
-    #[test]
-    fn instr_emit_with_slice_writes_contiguous_span() {
-        let emit = InstrEmit::new(1).with_slice(2, &[10, 11, 12, 13]);
-        assert_eq!(emit.fields[2], 10);
-        assert_eq!(emit.fields[3], 11);
-        assert_eq!(emit.fields[4], 12);
-        assert_eq!(emit.fields[5], 13);
-        // Slots before/after untouched.
-        assert_eq!(emit.fields[1], 0);
-        assert_eq!(emit.fields[6], 0);
     }
 
     #[test]

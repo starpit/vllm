@@ -304,7 +304,7 @@ pub fn lower_bucket(
     sfuf: &Assignment,
     loop_ir: &Loop,
     program: &Program,
-    _model: &ModelParams,
+    model: &ModelParams,
     lib: &ImplementationLibrary,
     bounds: &BTreeMap<String, u64>,
     skip_subgraph: Option<SubgraphId>,
@@ -387,7 +387,7 @@ pub fn lower_bucket(
                         id = imp_id.0,
                     )
                 });
-            arch_opcodes.register(imp.opcode_shape(), imp.interpreter_arm());
+            arch_opcodes.register(imp.opcode_shape(), imp.interpreter_arm(model));
             instances.extend(emits);
 
             if let Some(slots_to_free) = drops.get(sg) {

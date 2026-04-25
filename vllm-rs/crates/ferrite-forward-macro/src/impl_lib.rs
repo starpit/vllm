@@ -21,6 +21,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::classified::{ExternKind, OpKind, Program, WeightId};
+use crate::config::ModelParams;
 use crate::emit::{EmitCtx, weight_field_name};
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
@@ -630,7 +631,16 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// references those idents by name, plus the ambient bindings
     /// `__tiles: &mut Vec<Option<TileEntry>>`, `wm: &Weights`,
     /// `ctx: &ForwardCtx`, `device: &mut GpuDevice`.
-    fn interpreter_arm(&self) -> TokenStream {
+    ///
+    /// `model` is the per-arch [`ModelParams`] — the body bakes
+    /// model-wide constants (`hidden_size`, `head_dim`,
+    /// `attention_multiplier`, `attn_logit_softcapping`, …) as
+    /// literal tokens at codegen time, exactly the way today's
+    /// `emit_call` does via `EmitCtx::bound` / `EmitCtx::scalar`.
+    /// Per-instance values that vary across claims of the same
+    /// variant (layer index, weight-accessor selectors, scalar
+    /// offsets) ride in `OpInstance` fields instead.
+    fn interpreter_arm(&self, _model: &ModelParams) -> TokenStream {
         let name = self.name();
         let msg = format!("Implementation `{name}` has no interpreter_arm body");
         quote! { compile_error!(#msg); }

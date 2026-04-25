@@ -206,29 +206,124 @@ These deletions land in the same commit that introduces the
 per-arch enum codegen, so the runtime crate never carries dead
 megakernel scaffolding.
 
-## What's next — concretely
+## Current branch state (2026-04-25 end-of-session)
 
-This is a single refactor, not a migration loop:
+Branch `ff-interpreter` is at `b2c08c8e7` (forked from
+ferrite-forward `961cb8c8`). Five commits ahead of fork:
 
-1. **Drop the megakernel scaffolding** I committed prematurely
-   (`Instruction`, `Layout`, runtime opcode constants, the
-   duplicated opcode mirror in `impl_lib.rs`). They'll come back
-   in the megakernel codegen later, in their proper home.
-2. **Define `OpcodeShape` / `OpInstance`** in the macro crate.
-   Update the `Implementation` trait: replace `emit_call` with
-   `opcode_shape` / `fan_out` / `interpreter_arm`.
-3. **Rewrite `emit_subgraph` (and friends)** to walk waves, call
-   `fan_out`, collect `OpInstance`s into the per-bucket slice,
-   collect `OpcodeShape`s into the per-arch enum-builder, and
-   emit the alias prelude + slice + match.
-4. **Migrate every Impl in `impl_lib.rs`** in one pass. Each gets
-   its `opcode_shape` / `fan_out` / `interpreter_arm`. `emit_call`
-   is deleted from the trait.
-5. **Run llama golden** (`vllm-e2e --features e2e,cuda --release
+```
+b2c08c8e7  ff-interpreter: per-arch enum + closed-match codegen module
+f5f62f675  ff-interpreter: add OpcodeShape/OpInstance + new trait methods
+afb6a804f  ff-interpreter: drop megakernel scaffolding, rewrite handoff
+084828c3f  ff-interpreter: add SlotMap + ferrite-extension opcodes      ← reverted by afb6a804f
+4e5174d02  ff-interpreter: scaffold Instruction IR + tile table + InstrEmit  ← reverted by afb6a804f
+```
+
+The first two were wrong-design scaffolding (universal opcode
+registry + `Instruction([i32;32])` wire format) and were undone
+by `afb6a804f`. The active state is the three most recent.
+
+### What's landed and verified
+
+- `ferrite-forward-macro/src/impl_lib.rs`:
+  - `OpcodeShape { name: Ident, fields: Vec<(Ident, Type)> }`
+  - `OpInstance { name: Ident, field_values: Vec<TokenStream> }`
+  - `SlotMap` (compile-time `(TileId, slot) → u32` allocator)
+  - Trait `Implementation` gains `opcode_shape` / `fan_out` /
+    `interpreter_arm` with unmigrated defaults. **`emit_call` is
+    still the active codegen path.** Both methods live on the
+    trait simultaneously *as scaffolding* (handoff explicitly
+    permits this so the new methods can land before the
+    wholesale switch).
+  - Tests: `opcode_shape_carries_typed_fields_in_declaration_order`,
+    `unmigrated_shape_carries_distinctive_placeholder_name`,
+    `op_instance_field_values_match_shape_field_count`,
+    `slot_map_assigns_dense_indices_in_insert_order`,
+    `slot_map_of_unregistered_panics`.
+
+- `ferrite-forward-macro/src/interpreter_codegen.rs` (NEW):
+  - `build_slot_map(fuf) -> SlotMap`.
+  - `ArchOpcodes`: collects `(OpcodeShape, interpreter_arm)`
+    across an arch's buckets; emits the per-arch Rust enum and
+    the per-arch interpreter helper.
+  - `LoweredBucket` + `lower_bucket(...)`: walks waves, calls
+    `fan_out`, interleaves `Free` instances at drop-pass points,
+    builds the alias prelude.
+  - `emit_bucket_static_slice(...)`: lowers `Vec<OpInstance>` to
+    `static FORWARD_<TAG>: &[<Arch>Op] = &[…];`.
+  - `free_variant_shape()` / `free_instance(slot)` helpers — the
+    universal `Free { slot: u32 }` variant codegen always emits.
+  - Tests: 6, including `arch_interpreter_match_has_no_catchall`
+    that asserts the emitted match has neither a `_` arm nor any
+    `transmute` / `from_wire`.
+  - **NOT WIRED** into the active codegen path. `lower_bucket`
+    has zero callers in `codegen.rs`. The active path is still
+    `emit_subgraph → emit_call`.
+
+- `ferrite-forward/src/`:
+  - `instruction.rs` deleted (megakernel wire format).
+  - `tile_table.rs` (TileEntry + tile_ref) intact — runtime types
+    the future emitted interpreter will consume.
+  - `lib.rs` re-exports `TileEntry` + `tile_ref` only.
+
+- 3 macro-crate test failures predate this branch (config variant
+  counts, `add_rmsnorm_pairs_*`); not introduced here.
+
+## What's next — the wholesale switch (one commit)
+
+Scaffolding (steps 1-2 below) is done. The remaining work is one
+wholesale commit. Per the rules: no piecemeal Impl migration, no
+intermediate "some Impls migrated" tree state.
+
+1. ~~Drop megakernel scaffolding~~ — done in `afb6a804f`.
+2. ~~Define `OpcodeShape` / `OpInstance` + new trait methods~~ —
+   done in `f5f62f675`. `emit_call` still active alongside the
+   defaulted-`None` `fan_out`.
+3. **Migrate every Impl in `impl_lib.rs`.** Each Impl: write
+   `opcode_shape()` (variant ident + typed fields), `fan_out(...)`
+   (one `OpInstance` per kernel call this Impl makes; resolves
+   slot ids via `SlotMap::of`), and `interpreter_arm()` (body
+   that references the shape's field idents + ambient `__tiles`,
+   `wm`, `ctx`, `device`). Delete the Impl's `emit_call`.
+4. **Emit per-layer accessor methods on the per-arch `Weights`
+   struct** — needed so `interpreter_arm` bodies can do
+   `wm.input_layernorm(layer)` against a runtime `layer: u32`.
+   Today's emitted `Weights` has one field per (accessor × layer)
+   like `input_layernorm_3`. The codegen needs to add accessor
+   methods that match on `layer: usize` and return `&FieldType`.
+   Lives in `codegen.rs` alongside `emit_weights_struct`.
+5. **Rewrite `emit_subgraph` / `emit_forward_for_bucket` /
+   `emit_forward_backbone_for_bucket` / `emit_model`** to use
+   `interpreter_codegen::lower_bucket` + `ArchOpcodes::emit_enum`
+   + `ArchOpcodes::emit_interpreter` + `emit_bucket_static_slice`.
+   Per-arch: emit ONE enum and ONE interpreter helper; per-bucket:
+   emit one static slice + a thin fn that runs the alias prelude
+   and calls the helper.
+6. **Delete `EmitMode::Abstract` / `FragmentLibrary` /
+   Concrete-mode `EmitCtx` machinery** — all unused after the
+   seam swap. `emit.rs` shrinks substantially or goes away.
+7. **Delete `Implementation::emit_call` from the trait.** The
+   final shape: trait has `opcode_shape` / `fan_out` /
+   `interpreter_arm` + the layout/cost/handoff/etc. methods that
+   were never about emission.
+8. **Run llama golden** (`vllm-e2e --features e2e,cuda --release
    --test e_correctness -- --ignored --test-threads=1`, llama
    subset). Match must be exact.
-6. **Run sibling-arch goldens** (qwen2/qwen3/mistral/phi3/gemma2/
+9. **Run sibling-arch goldens** (qwen2/qwen3/mistral/phi3/gemma2/
    gemma3/granite/command-r/deepseek-v2/deepseek-v3). Same bar.
+
+### Scope estimate for the wholesale commit
+
+- ~50 Impls in `impl_lib.rs`. Per-Impl change ~80-150 lines net.
+  ≈ 5 kloc.
+- `emit_subgraph` / `emit_forward_*` / `emit_model` rewrite: ~500
+  lines.
+- Per-arch Weights accessor methods: ~200 lines (codegen).
+- Deletions of `emit.rs::EmitMode::Abstract` /
+  `FragmentLibrary` / etc.: ~500 lines removed.
+
+This is one focused multi-day push, not a single sitting. Plan
+the session for it.
 
 ## Pre-commit checklist (every commit on this branch)
 

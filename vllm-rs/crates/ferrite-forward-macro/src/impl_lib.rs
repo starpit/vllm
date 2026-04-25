@@ -574,6 +574,155 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     fn consumes_input_tiles(&self, _claimed_tiles: &[TileId], _fuf: &Fuf) -> Vec<(TileId, u8)> {
         Vec::new()
     }
+
+    // ── Host-interpreter codegen (NEW path; replaces emit_call) ──────
+    //
+    // Each Impl owns the shape of its own opcode — variant ident
+    // and typed payload fields. The proc-macro, processing one
+    // arch's solved FUF, collects shapes from the picked Impls and
+    // codegens a per-arch enum. There is no universal opcode
+    // registry. There is no shared opcode list. Adding a kernel is
+    // overriding three methods on a new Impl.
+    //
+    // Until every Impl is migrated, these default to "unmigrated"
+    // markers the new emission path detects and panics on with the
+    // Impl's name. `emit_call` stays the active path during the
+    // scaffolding window; the wholesale-switch commit migrates
+    // every Impl, swaps the codegen seam, and deletes `emit_call`.
+
+    /// Variant declaration this Impl contributes to the per-arch
+    /// enum. Variant ident + ordered `(field_ident, field_type)`
+    /// pairs. Two Impls returning the same variant ident must
+    /// declare structurally identical fields — codegen verifies and
+    /// panics on mismatch.
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::unmigrated(self.name())
+    }
+
+    /// One [`OpInstance`] per kernel call this Impl makes at this
+    /// (variant × workload-point). Field-value tokens are positional,
+    /// matching the order of fields in `opcode_shape().fields`.
+    /// `slots` resolves boundary-tile `(TileId, output_slot)` pairs
+    /// to `u32` slot indices in the runtime tile table.
+    ///
+    /// Default `None` flags the Impl as not yet migrated. The
+    /// codegen seam panics with the Impl's `name()` when it sees
+    /// `None`.
+    fn fan_out(
+        &self,
+        _m: &MatchInfo,
+        _fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        _slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        None
+    }
+
+    /// The body of this Impl's match arm in the per-arch interpreter.
+    /// The codegen wraps it as
+    ///
+    /// ```ignore
+    /// <Arch>Op::<Variant> { #(#field_idents),* } => { #body }
+    /// ```
+    ///
+    /// using the field idents from [`opcode_shape`]. The body
+    /// references those idents by name, plus the ambient bindings
+    /// `__tiles: &mut Vec<Option<TileEntry>>`, `wm: &Weights`,
+    /// `ctx: &ForwardCtx`, `device: &mut GpuDevice`.
+    fn interpreter_arm(&self) -> TokenStream {
+        let name = self.name();
+        let msg = format!("Implementation `{name}` has no interpreter_arm body");
+        quote! { compile_error!(#msg); }
+    }
+}
+
+/// Variant declaration an Impl contributes to its arch's
+/// macro-emitted opcode enum.
+///
+/// The codegen, processing one arch's solved FUF, collects
+/// `OpcodeShape`s from the Impls the solver picked for that arch.
+/// From the union of shapes it emits one Rust enum per arch:
+///
+/// ```ignore
+/// enum LlamaOp {
+///     AttnNorm { layer: u32, in_slot: u32, out_slot: u32 },
+///     QkvRopeAppend { layer: u32, in_slot: u32, out_q_slot: u32 },
+///     // … only the variants Llama's picked Impls declared
+///     Free { slot: u32 },  // injected by codegen, not by any Impl
+/// }
+/// ```
+///
+/// `Free` is added unconditionally by codegen for the drop pass.
+/// Every Impl-driven variant is named here, by exactly one Impl.
+/// Two Impls declaring the same variant ident must agree on field
+/// shape — codegen panics on mismatch.
+#[derive(Clone, Debug)]
+pub struct OpcodeShape {
+    /// PascalCase ident the per-arch enum uses for this variant.
+    pub name: syn::Ident,
+    /// Ordered field declarations. The codegen renders them as
+    /// `name: type` inside the variant's struct-style payload.
+    pub fields: Vec<(syn::Ident, syn::Type)>,
+}
+
+impl OpcodeShape {
+    /// Build from a variant name and a list of (field_ident, type)
+    /// pairs. Used inside Impls' `opcode_shape()` overrides.
+    pub fn new(name: &str, fields: Vec<(&str, syn::Type)>) -> Self {
+        let name_ident = syn::Ident::new(name, proc_macro2::Span::call_site());
+        let fields = fields
+            .into_iter()
+            .map(|(f, ty)| {
+                let f_ident = syn::Ident::new(f, proc_macro2::Span::call_site());
+                (f_ident, ty)
+            })
+            .collect();
+        Self {
+            name: name_ident,
+            fields,
+        }
+    }
+
+    /// Sentinel shape returned by the trait default. The codegen
+    /// checks for this and panics with the Impl's `name()` so a
+    /// newly-added Impl can't silently bypass migration.
+    pub(crate) fn unmigrated(impl_name: &str) -> Self {
+        // The variant ident here is never actually used — codegen
+        // detects the unmigrated state via `fan_out → None` long
+        // before it would consume the shape. Pick a placeholder that
+        // wouldn't collide with a real variant name by accident.
+        let _ = impl_name;
+        Self {
+            name: syn::Ident::new("__Unmigrated", proc_macro2::Span::call_site()),
+            fields: Vec::new(),
+        }
+    }
+}
+
+/// One concrete kernel-call instance an Impl emits at a given
+/// (variant × workload-point). The codegen lowers this to
+/// `<Arch>Op::<name> { #(field_n: <field_value>),* }` inside the
+/// per-bucket static slice.
+///
+/// `field_values` is positional in the same order as
+/// [`OpcodeShape::fields`]. Each entry is a `TokenStream` the
+/// codegen drops verbatim into the constructor expression — useful
+/// when a value is e.g. `slots.of(tile, slot) as u32` or a
+/// pre-resolved literal.
+#[derive(Clone, Debug)]
+pub struct OpInstance {
+    pub name: syn::Ident,
+    pub field_values: Vec<TokenStream>,
+}
+
+impl OpInstance {
+    /// Build with the variant ident matching `opcode_shape().name`
+    /// and a vector of field-value token streams in declaration
+    /// order.
+    pub fn new(name: syn::Ident, field_values: Vec<TokenStream>) -> Self {
+        Self { name, field_values }
+    }
 }
 
 /// Compile-time mapping from `(TileId, output_slot)` → flat slot
@@ -10612,6 +10761,52 @@ impl Implementation for DeepSeekMoeRefImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opcode_shape_carries_typed_fields_in_declaration_order() {
+        // Locks the contract that `opcode_shape` is structural —
+        // the codegen relies on (name, fields[]) being enough to
+        // emit the per-arch enum's variant declaration. Drift here
+        // means the emitted enum can't match the
+        // `interpreter_arm`'s field idents.
+        let shape = OpcodeShape::new(
+            "AttnNorm",
+            vec![
+                ("layer", syn::parse_quote!(u32)),
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        );
+        assert_eq!(shape.name.to_string(), "AttnNorm");
+        let names: Vec<String> = shape.fields.iter().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(names, vec!["layer", "in_slot", "out_slot"]);
+    }
+
+    #[test]
+    fn unmigrated_shape_carries_distinctive_placeholder_name() {
+        // A shape returned from the trait default must be marked
+        // distinctively enough that codegen can refuse it without a
+        // false positive against a real Impl. We don't rely on
+        // matching the placeholder by string in production codegen
+        // — the `fan_out` → `None` check is authoritative — but if
+        // the placeholder ever leaks into emitted code, it should
+        // fail compilation loudly with a recognisable identifier.
+        let s = OpcodeShape::unmigrated("AddRefImpl");
+        assert_eq!(s.name.to_string(), "__Unmigrated");
+        assert!(s.fields.is_empty());
+    }
+
+    #[test]
+    fn op_instance_field_values_match_shape_field_count() {
+        // Soft contract: `OpInstance::field_values.len()` should
+        // equal `OpcodeShape::fields.len()` for the same variant.
+        // The codegen will assert this at lower-time; the type
+        // doesn't enforce it, so this test pins the convention
+        // alongside a reference Impl-style call.
+        let shape = OpcodeShape::new("Free", vec![("slot", syn::parse_quote!(u32))]);
+        let inst = OpInstance::new(shape.name.clone(), vec![quote! { 7u32 }]);
+        assert_eq!(inst.field_values.len(), shape.fields.len());
+    }
 
     #[test]
     fn slot_map_assigns_dense_indices_in_insert_order() {

@@ -1069,8 +1069,13 @@ fn emit_fingerprint_check(
             block_size: Some(_),
             ..
         }) => {
-            let inv_tensor = "model.layers.0.self_attn.q_proj.weight_scale_inv";
-            let scale_tensor = "model.layers.0.self_attn.q_proj.weight_scale";
+            // MLA archs ship `q_a_proj` instead of `q_proj` — match
+            // the leaf the fingerprint already chose above so V3 / K2
+            // FP8-block fixtures aren't silently rejected.
+            let inv_tensor = format!("model.layers.0.{fp_leaf}.weight_scale_inv");
+            let scale_tensor = format!("model.layers.0.{fp_leaf}.weight_scale");
+            let inv_tensor = inv_tensor.as_str();
+            let scale_tensor = scale_tensor.as_str();
             quote! {
                 // Block variant: accept if `.weight_scale_inv` exists,
                 // or if `.weight_scale` is 2-D with more than one
@@ -1089,8 +1094,10 @@ fn emit_fingerprint_check(
         Some(crate::quantization::QuantMethod::Fp8 {
             block_size: None, ..
         }) => {
-            let inv_tensor = "model.layers.0.self_attn.q_proj.weight_scale_inv";
-            let scale_tensor = "model.layers.0.self_attn.q_proj.weight_scale";
+            let inv_tensor = format!("model.layers.0.{fp_leaf}.weight_scale_inv");
+            let scale_tensor = format!("model.layers.0.{fp_leaf}.weight_scale");
+            let inv_tensor = inv_tensor.as_str();
+            let scale_tensor = scale_tensor.as_str();
             quote! {
                 // Per-tensor variant: reject block checkpoints.
                 if gw.contains(#inv_tensor) {
@@ -4335,6 +4342,90 @@ mod tests {
         assert!(
             ts.contains("4 as usize"),
             "expected `4 as usize` for baked tp_world_size literal (got: {ts})",
+        );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn repo_model_archs() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("model_architectures")
+    }
+
+    /// MLA archs (DeepSeek V3 / Kimi K2) ship `q_a_proj` rather than
+    /// `q_proj`, so the FP8-block disambiguation tensor names must
+    /// follow the same `fp_leaf` selection the rest of the
+    /// fingerprint already uses. Regression for the bug where the
+    /// V3 FP8-block fingerprint hardcoded `q_proj.weight_scale_inv`
+    /// and silently rejected every V3 FP8-block checkpoint.
+    #[test]
+    fn fp8_block_disambiguation_uses_q_a_proj_for_mla_archs() {
+        let dir = repo_model_archs().join("deepseek_v3");
+        let configs = crate::config::load_dir(&dir).expect("load deepseek_v3 configs");
+        let manifest = crate::weights_manifest::load_or_empty(&dir)
+            .expect("load deepseek_v3 weights manifest");
+        // Pick a V3 variant with FP8-block quantization (block_size: Some).
+        let model = configs
+            .iter()
+            .find(|c| {
+                matches!(
+                    c.quantization.as_ref().map(|qc| &qc.method),
+                    Some(crate::quantization::QuantMethod::Fp8 {
+                        block_size: Some(_),
+                        ..
+                    })
+                )
+            })
+            .expect("at least one V3 FP8-block variant");
+        let ts = emit_fingerprint_check(model, &manifest).to_string();
+        assert!(
+            ts.contains("q_a_proj.weight_scale_inv"),
+            "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale_inv, got:\n{ts}",
+        );
+        assert!(
+            !ts.contains("q_proj.weight_scale_inv"),
+            "MLA arch FP8-block fingerprint must not reference q_proj.weight_scale_inv \
+             (V3/K2 ship q_a_proj on disk; q_proj presence would silently reject every \
+             real checkpoint), got:\n{ts}",
+        );
+        assert!(
+            ts.contains("q_a_proj.weight_scale"),
+            "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale, got:\n{ts}",
+        );
+    }
+
+    /// Non-MLA arches (Llama / Qwen / etc.) keep the historical
+    /// `q_proj` leaf — the fp_leaf selection is purely opt-in for
+    /// archs whose manifest declares `q_a_proj`.
+    #[test]
+    fn fp8_block_disambiguation_uses_q_proj_for_non_mla_archs() {
+        let dir = repo_model_archs().join("qwen3");
+        let configs = crate::config::load_dir(&dir).expect("load qwen3 configs");
+        let manifest =
+            crate::weights_manifest::load_or_empty(&dir).expect("load qwen3 weights manifest");
+        let model = configs
+            .iter()
+            .find(|c| {
+                matches!(
+                    c.quantization.as_ref().map(|qc| &qc.method),
+                    Some(crate::quantization::QuantMethod::Fp8 {
+                        block_size: Some(_),
+                        ..
+                    })
+                )
+            })
+            .expect("at least one Qwen3 FP8-block variant");
+        let ts = emit_fingerprint_check(model, &manifest).to_string();
+        assert!(
+            ts.contains("q_proj.weight_scale_inv"),
+            "non-MLA FP8-block fingerprint should still use q_proj, got:\n{ts}",
         );
     }
 }

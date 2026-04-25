@@ -160,6 +160,19 @@ MODELS = {
     # nondeterministic across runs) — the factory override below
     # keys off the `_fp8` suffix which matches block too.
     "qwen3_0_6b_fp8_block": "RedHatAI/Qwen3-0.6B-FP8-BLOCK",
+    # NOTE: `deepseek_v3_academic_9b_fp8_block` is intentionally NOT in
+    # this map. Python vLLM's `validate_fp8_block_shape` rejects V3
+    # academic-9B's `intermediate_size = 10944` (not divisible by 128)
+    # plus the fused `q_a_proj + kv_a_proj_with_mqa` output partition
+    # of 1600 (also non-divisible). Architectural dim choices, not
+    # something we can fix on the fixture side. Ferrite's
+    # `Fp8BlockLinear::load` handles `ceil`-rounded partial last
+    # blocks; Python's loader does not. The Rust correctness test
+    # therefore uses ferrite-self-golden (same convention the BF16
+    # `deepseek_v3_academic_9b` test already uses for the FA2-vs-
+    # TritonMLA divergence reason). See
+    # `test_cuda_correctness_deepseek_v3_academic_9b_fp8_block` and
+    # the bootstrap procedure documented there.
     # Phi-3-mini-4k-instruct — `Phi3ForCausalLM`, dense bf16, MHA,
     # no LongRoPE. Matches `TestModels::PHI3_MINI_4K_CUDA`. First
     # ferrite arch with packed on-disk weights (`qkv_proj`,
@@ -224,13 +237,20 @@ def generate_for_model(model_id: str, output_key: str):
     # path — their numerics are already stable enough that graph
     # nondeterminism stays below the top-N tolerance.
     is_fp8 = "fp8" in output_key.lower()
+    is_mla = output_key.startswith(("deepseek_", "kimi_"))
     kwargs = {"model": model_id, "max_model_len": 2048}
     if is_fp8:
         kwargs["enforce_eager"] = True
         # Ferrite defaults to FlashInfer for FP8; match that in the
         # golden so the top-N comparison isn't backend-skewed.
         # Replaces the retired `VLLM_ATTENTION_BACKEND` env var.
-        kwargs["attention_backend"] = "FLASHINFER"
+        # MLA arches (DeepSeek V3 / Kimi K2) skip the override —
+        # FlashInfer rejects MLA head shapes; Python vLLM auto-picks
+        # TritonMLA. The Rust correctness test threshold already
+        # accounts for the resulting FA2-vs-TritonMLA late-position
+        # drift (same convention as the BF16 V3 golden).
+        if not is_mla:
+            kwargs["attention_backend"] = "FLASHINFER"
     llm = LLM(**kwargs)
     tokenizer = llm.get_tokenizer()
 

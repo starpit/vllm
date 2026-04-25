@@ -366,6 +366,14 @@ impl TestModels {
     // `Fp8BlockLinear::forward` (dequant to BF16 then cuBLAS GEMM —
     // a native block-scaled FP8 GEMM kernel is a perf follow-up).
     pub const QWEN3_0_6B_FP8_BLOCK: &str = "RedHatAI/Qwen3-0.6B-FP8-BLOCK";
+    // DeepSeek V3 academic-9B re-quantized to FP8-block-128×128 (the
+    // canonical V3/K2 storage layout). Same MLA topology as
+    // `DEEPSEEK_V3_ACADEMIC_9B_CUDA` BF16 with `q_a_proj`/`q_b_proj`/
+    // `kv_a_proj_with_mqa`/`kv_b_proj`/`o_proj` carrying FP8 E4M3
+    // weights + 2-D `[N/128, K/128]` scales, and the 64-routed +
+    // 2-shared MoE storing block-scaled experts. Routes through
+    // `Fp8GemmImpl` (dense Linears) + `DeepSeekFp8BlockMoeImpl` (MoE).
+    pub const DEEPSEEK_V3_ACADEMIC_9B_FP8_BLOCK_CUDA: &str = "starpit/academic-ds-9b-fp8-block";
 
     // FP8 MoE models (CUDA-backend, SM89+)
     // 2-layer Mixtral 8x7B FP8 (~3GB) — small enough for single L40S

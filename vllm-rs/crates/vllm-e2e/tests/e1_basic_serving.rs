@@ -1152,10 +1152,9 @@ async fn test_cuda_gguf_qwen2_0_5b_chat() {
     let resp = client.chat_completion(&request).await.unwrap();
 
     assert_valid_chat_response(&resp);
-    assert!(
-        resp.usage.completion_tokens.unwrap_or(0) > 0,
-        "should generate at least one token"
-    );
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[Qwen2 0.5B GGUF output] {:?}", text);
+    assert_coherent_text(text, 5);
 }
 
 // Qwen3 GGUF (qwen2 architecture in GGUF, LLaMA-compatible)
@@ -1260,6 +1259,212 @@ async fn test_cuda_gguf_qwen3_next_chat() {
     );
 }
 */
+
+// Llama-3.2-1B Q4_K_M — standard 4-bit K-quant GGUF. Exercises Q4_K
+// (Q/K/attn_output/gate/up) and Q6_K (token_embd/V/down_proj) kernels
+// end-to-end. Coherence check is load-bearing — a kernel regression
+// typically collapses output to a single repeated token, which
+// `assert_coherent_text` catches.
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_llama_q4km_completion() {
+    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_Q4KM_GGUF)
+        .with_args(&["--gguf-file", TestModels::LLAMA_3_2_1B_Q4KM_FILE])
+        .start()
+        .await
+        .expect("Q4_K_M GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    eprintln!("[Q4_K_M completion output] {:?}", text);
+    assert_coherent_text(text, 10);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_llama_q4km_chat() {
+    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_Q4KM_GGUF)
+        .with_args(&["--gguf-file", TestModels::LLAMA_3_2_1B_Q4KM_FILE])
+        .start()
+        .await
+        .expect("Q4_K_M GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[Q4_K_M chat output] {:?}", text);
+    assert_coherent_text(text, 10);
+}
+
+// Llama-3.2-1B UD-IQ1_M — IQ1_M quantized GGUF (1.75 bpw)
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_llama_iq1m_chat() {
+    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_IQ1M_GGUF)
+        .with_args(&["--gguf-file", TestModels::LLAMA_3_2_1B_IQ1M_FILE])
+        .start()
+        .await
+        .expect("IQ1_M GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        resp.usage.completion_tokens.unwrap_or(0) > 0,
+        "IQ1_M model should generate at least one token"
+    );
+
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[IQ1_M output] {:?}", text);
+    assert_coherent_text(text, 5);
+}
+
+// Additional IQ quants on Llama-3.2-1B — IQ1_S, IQ2_XXS, IQ4_NL, IQ4_XS.
+// Each test mirrors the IQ1_M pattern and exercises one MMVQ kernel variant.
+// IQ1_S/IQ2_XXS are extreme (<2 bpw) — coherence threshold is low (3) because
+// at those bitrates the output is marginal even with a correct kernel; the
+// test's job is to catch *regressions*, not assert quality.
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_llama_iq1s_chat() {
+    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_IQ1M_GGUF)
+        .with_args(&["--gguf-file", TestModels::LLAMA_3_2_1B_IQ1S_FILE])
+        .start()
+        .await
+        .expect("IQ1_S GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        resp.usage.completion_tokens.unwrap_or(0) > 0,
+        "IQ1_S model should generate at least one token"
+    );
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[IQ1_S output] {:?}", text);
+    assert_coherent_text(text, 3);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_llama_iq2xxs_chat() {
+    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_IQ1M_GGUF)
+        .with_args(&["--gguf-file", TestModels::LLAMA_3_2_1B_IQ2XXS_FILE])
+        .start()
+        .await
+        .expect("IQ2_XXS GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[IQ2_XXS output] {:?}", text);
+    assert_coherent_text(text, 3);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_llama_iq4nl_chat() {
+    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_IQ1M_GGUF)
+        .with_args(&["--gguf-file", TestModels::LLAMA_3_2_1B_IQ4NL_FILE])
+        .start()
+        .await
+        .expect("IQ4_NL GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[IQ4_NL output] {:?}", text);
+    assert_coherent_text(text, 5);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_llama_iq4xs_chat() {
+    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_IQ1M_GGUF)
+        .with_args(&["--gguf-file", TestModels::LLAMA_3_2_1B_IQ4XS_FILE])
+        .start()
+        .await
+        .expect("IQ4_XS GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[IQ4_XS output] {:?}", text);
+    assert_coherent_text(text, 5);
+}
+
+// IQ2_S and IQ3_S — only available on Mistral-7B-Instruct-v0.3 at unsloth /
+// bartowski / etc. at the time these were added. Larger model → slower test.
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_mistral_iq2s_chat() {
+    let server = TestServer::builder(TestModels::MISTRAL_7B_V03_GGUF)
+        .with_args(&["--gguf-file", TestModels::MISTRAL_7B_V03_IQ2S_FILE])
+        .start()
+        .await
+        .expect("IQ2_S GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[IQ2_S output] {:?}", text);
+    assert_coherent_text(text, 3);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_mistral_iq3s_chat() {
+    let server = TestServer::builder(TestModels::MISTRAL_7B_V03_GGUF)
+        .with_args(&["--gguf-file", TestModels::MISTRAL_7B_V03_IQ3S_FILE])
+        .start()
+        .await
+        .expect("IQ3_S GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    eprintln!("[IQ3_S output] {:?}", text);
+    assert_coherent_text(text, 5);
+}
+
 // end GGUF tests
 
 // ---------------------------------------------------------------------------

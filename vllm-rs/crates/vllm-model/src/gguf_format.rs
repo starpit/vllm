@@ -40,8 +40,14 @@ impl GgufDType {
     pub const Q5K: Self = Self(13);
     pub const Q6K: Self = Self(14);
     pub const Q8K: Self = Self(15);
+    pub const IQ2_XXS: Self = Self(16);
+    pub const IQ2_XS: Self = Self(17);
+    pub const IQ1_S: Self = Self(19);
     pub const IQ4_NL: Self = Self(20);
+    pub const IQ3_S: Self = Self(21);
+    pub const IQ2_S: Self = Self(22);
     pub const IQ4_XS: Self = Self(23);
+    pub const IQ1_M: Self = Self(29);
     pub const BF16: Self = Self(30);
 
     /// Size in bytes of one quantization block (type_size in GGML).
@@ -61,8 +67,14 @@ impl GgufDType {
             13 => 176,   // Q5K
             14 => 210,   // Q6K
             15 => 292,   // Q8K
+            16 => 66,    // IQ2_XXS
+            17 => 74,    // IQ2_XS
+            19 => 50,    // IQ1_S
             20 => 18,    // IQ4_NL
+            21 => 110,   // IQ3_S
+            22 => 82,    // IQ2_S
             23 => 136,   // IQ4_XS
+            29 => 56,    // IQ1_M
             _ => 0,
         }
     }
@@ -70,11 +82,13 @@ impl GgufDType {
     /// Number of elements per quantization block (block_size in GGML).
     pub const fn block_size(self) -> usize {
         match self.0 {
-            0 | 1 | 30 => 1,     // F32, F16, BF16
-            2..=3 | 6..=9 => 32, // Q4_0..Q8_1
-            10..=15 => 256,      // Q2K..Q8K
-            20 => 32,            // IQ4_NL
-            23 => 256,           // IQ4_XS
+            0 | 1 | 30 => 1,               // F32, F16, BF16
+            2..=3 | 6..=9 => 32,           // Q4_0..Q8_1
+            10..=15 => 256,                // Q2K..Q8K
+            16 | 17 | 19 | 21 | 22 => 256, // IQ2_XXS, IQ2_XS, IQ1_S, IQ3_S, IQ2_S
+            20 => 32,                      // IQ4_NL
+            23 => 256,                     // IQ4_XS
+            29 => 256,                     // IQ1_M
             _ => 1,
         }
     }

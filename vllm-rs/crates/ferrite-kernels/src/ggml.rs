@@ -11,8 +11,23 @@
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
 use ferrite_cuda_core::dtype::DType;
 use ferrite_cuda_core::tensor::GpuTensor;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type CUstream = cudarc::driver::sys::CUstream;
+
+// One flag per IQ type — set on first dispatch, so the log line prints exactly once.
+static IQ1M_SEEN: AtomicBool = AtomicBool::new(false);
+static IQ1S_SEEN: AtomicBool = AtomicBool::new(false);
+static IQ2XXS_SEEN: AtomicBool = AtomicBool::new(false);
+static IQ2XS_SEEN: AtomicBool = AtomicBool::new(false);
+static IQ2S_SEEN: AtomicBool = AtomicBool::new(false);
+static IQ3S_SEEN: AtomicBool = AtomicBool::new(false);
+
+fn note_iq(flag: &AtomicBool, name: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        eprintln!("[ggml dispatch] first matmul via {name}");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // GgmlDType
@@ -38,8 +53,14 @@ pub enum GgmlDType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    IQ2XXS = 16,
+    IQ2XS = 17,
+    IQ1S = 19,
     IQ4NL = 20,
+    IQ3S = 21,
+    IQ2S = 22,
     IQ4XS = 23,
+    IQ1M = 29,
 }
 
 impl GgmlDType {
@@ -58,8 +79,14 @@ impl GgmlDType {
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
+            16 => Some(Self::IQ2XXS),
+            17 => Some(Self::IQ2XS),
+            19 => Some(Self::IQ1S),
             20 => Some(Self::IQ4NL),
+            21 => Some(Self::IQ3S),
+            22 => Some(Self::IQ2S),
             23 => Some(Self::IQ4XS),
+            29 => Some(Self::IQ1M),
             _ => None,
         }
     }
@@ -79,15 +106,21 @@ impl GgmlDType {
             Self::Q5_0 => 22,
             Self::Q5_1 => 24,
             Self::Q8_0 => 34,
-            Self::Q8_1 => 40,
+            Self::Q8_1 => 36, // 2*sizeof(ggml_half) + QK8_1 = 4 + 32 = 36 (see static_assert in quantized.cu)
             Self::Q2K => 84,
             Self::Q3K => 110,
             Self::Q4K => 144,
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q8K => 292,
+            Self::IQ2XXS => 66,
+            Self::IQ2XS => 74,
+            Self::IQ1S => 50,
             Self::IQ4NL => 18,
+            Self::IQ3S => 110,
+            Self::IQ2S => 82,
             Self::IQ4XS => 136,
+            Self::IQ1M => 56,
         }
     }
 
@@ -101,9 +134,19 @@ impl GgmlDType {
             | Self::Q8_0
             | Self::Q8_1
             | Self::IQ4NL => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::IQ4XS => {
-                256
-            }
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ1S
+            | Self::IQ3S
+            | Self::IQ2S
+            | Self::IQ4XS
+            | Self::IQ1M => 256,
         }
     }
 
@@ -120,7 +163,17 @@ impl GgmlDType {
     /// IQ types lack the fused dequant+dot BS=1 kernel — they must always go
     /// through the Q8_1 intermediate quantization path.
     pub const fn is_iq_quant(self) -> bool {
-        matches!(self, Self::IQ4NL | Self::IQ4XS)
+        matches!(
+            self,
+            Self::IQ4NL
+                | Self::IQ4XS
+                | Self::IQ1M
+                | Self::IQ2XXS
+                | Self::IQ2XS
+                | Self::IQ1S
+                | Self::IQ3S
+                | Self::IQ2S
+        )
     }
 }
 
@@ -139,8 +192,14 @@ impl std::fmt::Display for GgmlDType {
             Self::Q5K => write!(f, "Q5K"),
             Self::Q6K => write!(f, "Q6K"),
             Self::Q8K => write!(f, "Q8K"),
+            Self::IQ2XXS => write!(f, "IQ2_XXS"),
+            Self::IQ2XS => write!(f, "IQ2_XS"),
+            Self::IQ1S => write!(f, "IQ1_S"),
             Self::IQ4NL => write!(f, "IQ4_NL"),
+            Self::IQ3S => write!(f, "IQ3_S"),
+            Self::IQ2S => write!(f, "IQ2_S"),
             Self::IQ4XS => write!(f, "IQ4_XS"),
+            Self::IQ1M => write!(f, "IQ1_M"),
         }
     }
 }
@@ -300,6 +359,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_q4_1_q8_1(
@@ -310,6 +370,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_q5_0_q8_1(
@@ -320,6 +381,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_q5_1_q8_1(
@@ -330,6 +392,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_q8_0_q8_1(
@@ -340,6 +403,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_q2_K_q8_1(
@@ -350,6 +414,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_q3_K_q8_1(
@@ -360,6 +425,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_q4_K_q8_1(
@@ -370,6 +436,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_q5_K_q8_1(
@@ -380,6 +447,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_q6_K_q8_1(
@@ -390,6 +458,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
 
@@ -548,6 +617,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
     fn launch_mul_mat_vec_iq4_xs_q8_1(
@@ -558,6 +628,7 @@ unsafe extern "C" {
         nrows_x: i32,
         nrows_y: i32,
         nrows_dst: i32,
+        ncols_y: i32,
         stream: CUstream,
     );
 
@@ -583,6 +654,156 @@ unsafe extern "C" {
         stream: CUstream,
     );
     fn launch_dequantize_block_iq4_xs_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ1_M mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq1_m_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        ncols_y: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq1_m_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq1_m_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ1_S mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq1_s_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        ncols_y: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq1_s_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq1_s_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ2_XXS mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq2_xxs_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        ncols_y: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_xxs_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_xxs_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ2_XS mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq2_xs_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        ncols_y: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_xs_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_xs_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ2_S mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq2_s_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        ncols_y: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_s_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq2_s_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ3_S mul_mat_vec + dequantize wrappers ---
+    fn launch_mul_mat_vec_iq3_s_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        ncols_y: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq3_s_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq3_s_f16(
         vx: *const u8,
         dst: *mut u16,
         elem_count: i32,
@@ -791,6 +1012,12 @@ pub unsafe fn ggml_dequantize_f32(
         GgmlDType::Q8K => launch_dequantize_block_q8_K_f32(src, dst, n, stream),
         GgmlDType::IQ4NL => launch_dequantize_block_iq4_nl_f32(src, dst, n, stream),
         GgmlDType::IQ4XS => launch_dequantize_block_iq4_xs_f32(src, dst, n, stream),
+        GgmlDType::IQ1M => launch_dequantize_block_iq1_m_f32(src, dst, n, stream),
+        GgmlDType::IQ1S => launch_dequantize_block_iq1_s_f32(src, dst, n, stream),
+        GgmlDType::IQ2XXS => launch_dequantize_block_iq2_xxs_f32(src, dst, n, stream),
+        GgmlDType::IQ2XS => launch_dequantize_block_iq2_xs_f32(src, dst, n, stream),
+        GgmlDType::IQ2S => launch_dequantize_block_iq2_s_f32(src, dst, n, stream),
+        GgmlDType::IQ3S => launch_dequantize_block_iq3_s_f32(src, dst, n, stream),
         _ => panic!("unsupported dtype for dequantize_f32: {}", dtype),
     }
 }
@@ -821,6 +1048,12 @@ pub unsafe fn ggml_dequantize_f16(
         GgmlDType::Q8K => launch_dequantize_block_q8_K_f16(src, dst, n, stream),
         GgmlDType::IQ4NL => launch_dequantize_block_iq4_nl_f16(src, dst, n, stream),
         GgmlDType::IQ4XS => launch_dequantize_block_iq4_xs_f16(src, dst, n, stream),
+        GgmlDType::IQ1M => launch_dequantize_block_iq1_m_f16(src, dst, n, stream),
+        GgmlDType::IQ1S => launch_dequantize_block_iq1_s_f16(src, dst, n, stream),
+        GgmlDType::IQ2XXS => launch_dequantize_block_iq2_xxs_f16(src, dst, n, stream),
+        GgmlDType::IQ2XS => launch_dequantize_block_iq2_xs_f16(src, dst, n, stream),
+        GgmlDType::IQ2S => launch_dequantize_block_iq2_s_f16(src, dst, n, stream),
+        GgmlDType::IQ3S => launch_dequantize_block_iq3_s_f16(src, dst, n, stream),
         _ => panic!("unsupported dtype for dequantize_f16: {}", dtype),
     }
 }
@@ -941,53 +1174,94 @@ pub unsafe fn ggml_mul_mat_vec_q8_1(
     let nrows_dst = nrows_x;
     let vx = storage.ptr as *const u8;
 
-    // Loop over each batch row (using BS=1 kernel).
+    // Batched: call the kernel once with ncols_y = min(batch_size, MAX), then loop for the rest.
+    // All wired Q and IQ types now have cuda1..cuda8 variants.
     let q8_1_row_bytes =
         (ncols_padded / GgmlDType::Q8_1.block_size()) * GgmlDType::Q8_1.type_size();
     let dst_row_elems = storage.nrows;
-
-    for b in 0..batch_size {
+    let max_ncols_y: usize = 8;
+    let mut b = 0;
+    while b < batch_size {
+        let chunk = (batch_size - b).min(max_ncols_y);
         let y_offset = y_q8_1.add(b * q8_1_row_bytes);
         let dst_offset = dst.add(b * dst_row_elems);
+        let n = chunk as i32;
         match storage.dtype {
             GgmlDType::Q4_0 => launch_mul_mat_vec_q4_0_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::Q4_1 => launch_mul_mat_vec_q4_1_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::Q5_0 => launch_mul_mat_vec_q5_0_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::Q5_1 => launch_mul_mat_vec_q5_1_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::Q8_0 => launch_mul_mat_vec_q8_0_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::Q2K => launch_mul_mat_vec_q2_K_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::Q3K => launch_mul_mat_vec_q3_K_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::Q4K => launch_mul_mat_vec_q4_K_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::Q5K => launch_mul_mat_vec_q5_K_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::Q6K => launch_mul_mat_vec_q6_K_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::IQ4NL => launch_mul_mat_vec_iq4_nl_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
             GgmlDType::IQ4XS => launch_mul_mat_vec_iq4_xs_q8_1(
-                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
             ),
+            GgmlDType::IQ1M => {
+                note_iq(&IQ1M_SEEN, "IQ1_M");
+                launch_mul_mat_vec_iq1_m_q8_1(
+                    vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
+                );
+            }
+            GgmlDType::IQ1S => {
+                note_iq(&IQ1S_SEEN, "IQ1_S");
+                launch_mul_mat_vec_iq1_s_q8_1(
+                    vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
+                );
+            }
+            GgmlDType::IQ2XXS => {
+                note_iq(&IQ2XXS_SEEN, "IQ2_XXS");
+                launch_mul_mat_vec_iq2_xxs_q8_1(
+                    vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
+                );
+            }
+            GgmlDType::IQ2XS => {
+                note_iq(&IQ2XS_SEEN, "IQ2_XS");
+                launch_mul_mat_vec_iq2_xs_q8_1(
+                    vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
+                );
+            }
+            GgmlDType::IQ2S => {
+                note_iq(&IQ2S_SEEN, "IQ2_S");
+                launch_mul_mat_vec_iq2_s_q8_1(
+                    vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
+                );
+            }
+            GgmlDType::IQ3S => {
+                note_iq(&IQ3S_SEEN, "IQ3_S");
+                launch_mul_mat_vec_iq3_s_q8_1(
+                    vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, n, stream,
+                );
+            }
             _ => panic!("unsupported dtype for mul_mat_vec_q8_1: {}", storage.dtype),
         }
+        b += chunk;
     }
 }
 
@@ -1319,15 +1593,10 @@ impl GgufGpuWeights {
                     } else {
                         DType::F16
                     };
-                    // QK norms must match model dtype; layer norms stay f32 (fused_add_rms_norm expects f32).
-                    // Embeddings/lm_head stay in model dtype.
-                    let target_dtype = if is_qk_norm {
-                        model_dtype
-                    } else if is_layer_norm {
-                        DType::F32
-                    } else {
-                        source_dtype
-                    };
+                    // All norm weights (layer + QK) and linear weights must match the model
+                    // dtype so the downstream kernels read the right bits (rms_norm_bf16
+                    // expects __nv_bfloat16* weight; reinterpreting f32 as bf16 bytes → NaN).
+                    let target_dtype = model_dtype;
 
                     if source_dtype == target_dtype
                         || (source_dtype == DType::F32 && target_dtype == DType::F32)
@@ -1380,13 +1649,29 @@ impl GgufGpuWeights {
                             let tensor = GpuTensor::new(gpu_ptr, dims, target_dtype);
                             weights.insert(hf_name, GgufWeight::Dense(tensor));
                         } else {
-                            // Non-f32 source needing conversion — just store as-is for now.
-                            let gpu_ptr = ferrite_cuda_core::driver::mem_alloc(size_bytes)?;
+                            // Non-f32 source needing conversion (f16↔bf16): upload raw,
+                            // cast src → f32 → target via existing kernels.
+                            let src_ptr = ferrite_cuda_core::driver::mem_alloc(size_bytes)?;
                             ferrite_cuda_core::driver::memcpy_htod_async(
-                                gpu_ptr, host_buf, size_bytes, stream,
+                                src_ptr, host_buf, size_bytes, stream,
                             )?;
-                            let tensor = GpuTensor::new(gpu_ptr, dims, source_dtype);
-                            weights.insert(hf_name, GgufWeight::Dense(tensor));
+                            let src_tensor = GpuTensor::new(src_ptr, dims, source_dtype);
+                            let f32_tmp =
+                                crate::kernels::cast_logits_to_f32(src_tensor, alloc, stream);
+                            let out_bytes = elem_count * target_dtype.size_bytes();
+                            let out_ptr = ferrite_cuda_core::driver::mem_alloc(out_bytes)?;
+                            crate::kernels::cast_from_f32_into(
+                                f32_tmp.as_gpu_tensor().raw_ptr() as *const f32,
+                                out_ptr,
+                                target_dtype,
+                                elem_count,
+                                stream,
+                            );
+                            ferrite_cuda_core::driver::stream_synchronize(stream)?;
+                            ferrite_cuda_core::driver::mem_free(src_ptr)?;
+                            drop(f32_tmp);
+                            let gpu_tensor = GpuTensor::new(out_ptr, dims, target_dtype);
+                            weights.insert(hf_name, GgufWeight::Dense(gpu_tensor));
                         }
                     }
                 } else if let Some(our_dt) = our_dtype {
@@ -1405,11 +1690,7 @@ impl GgufGpuWeights {
                         ncols: if dims.len() >= 2 { dims[1] } else { dims[0] },
                     };
 
-                    let target = if is_layer_norm {
-                        DType::F32
-                    } else {
-                        model_dtype
-                    };
+                    let target = model_dtype;
                     let tensor = ggml_dequantize_to_tensor(&storage, target, dims, alloc, stream);
                     ferrite_cuda_core::driver::stream_synchronize(stream)?;
                     // Free the raw quantized buffer since we dequantized.
@@ -1447,7 +1728,27 @@ impl GgufGpuWeights {
                     nrows,
                     ncols,
                 };
-                weights.insert(hf_name, GgufWeight::Quantized(storage));
+                // Default: keep GGUF weights quantized on GPU (saves ~2× weight memory
+                // vs dequant-to-BF16). FERRITE_DEQUANT_AT_LOAD=1 is an escape hatch that
+                // forces the legacy dense-BF16 path — kept for debugging and because
+                // dense cuBLAS is the correctness reference if a quantized-path
+                // regression is ever suspected.
+                let force_dequant = std::env::var("FERRITE_DEQUANT_AT_LOAD").is_ok();
+                if force_dequant {
+                    let tensor =
+                        ggml_dequantize_to_tensor(&storage, model_dtype, dims, alloc, stream);
+                    ferrite_cuda_core::driver::stream_synchronize(stream)?;
+                    ferrite_cuda_core::driver::mem_free(gpu_ptr)?;
+                    let gpu_tensor = tensor.into_gpu_tensor();
+                    weights.insert(hf_name, GgufWeight::Dense(gpu_tensor));
+                } else {
+                    // Force the async H2D to finish before we loop and reuse host_buf
+                    // for the next tensor — otherwise the next reader.read_exact
+                    // overwrites pinned memory that DMA is still reading from, and
+                    // every subsequent quantized weight lands on GPU corrupted.
+                    ferrite_cuda_core::driver::stream_synchronize(stream)?;
+                    weights.insert(hf_name, GgufWeight::Quantized(storage));
+                }
             } else {
                 anyhow::bail!(
                     "unsupported GGUF dtype {:?} for tensor {}",
@@ -1568,6 +1869,7 @@ mod tests {
     fn test_ggml_dtype_is_iq_quant() {
         assert!(GgmlDType::IQ4NL.is_iq_quant());
         assert!(GgmlDType::IQ4XS.is_iq_quant());
+        assert!(GgmlDType::IQ1M.is_iq_quant());
         assert!(!GgmlDType::Q4_0.is_iq_quant());
         assert!(!GgmlDType::Q4K.is_iq_quant());
     }
@@ -1576,6 +1878,26 @@ mod tests {
     fn test_ggml_dtype_iq4_display() {
         assert_eq!(format!("{}", GgmlDType::IQ4NL), "IQ4_NL");
         assert_eq!(format!("{}", GgmlDType::IQ4XS), "IQ4_XS");
+    }
+
+    #[test]
+    fn test_ggml_dtype_iq1m_from_u32() {
+        assert_eq!(GgmlDType::from_u32(29), Some(GgmlDType::IQ1M));
+    }
+
+    #[test]
+    fn test_ggml_dtype_iq1m_type_size() {
+        assert_eq!(GgmlDType::IQ1M.type_size(), 56);
+    }
+
+    #[test]
+    fn test_ggml_dtype_iq1m_block_size() {
+        assert_eq!(GgmlDType::IQ1M.block_size(), 256);
+    }
+
+    #[test]
+    fn test_ggml_dtype_iq1m_display() {
+        assert_eq!(format!("{}", GgmlDType::IQ1M), "IQ1_M");
     }
 
     #[test]

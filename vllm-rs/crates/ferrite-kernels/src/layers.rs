@@ -517,7 +517,21 @@ impl LinearLayer {
         match self {
             Self::Dense(l) => l.forward(x, cublas, alloc),
             Self::Marlin(l) => l.forward(x, alloc, stream),
-            Self::Ggml(l) => l.forward(x, alloc, stream),
+            Self::Ggml(l) => {
+                if ggml_probe::use_reference() {
+                    // FERRITE_USE_REFERENCE=1: bypass ggml_matmul entirely, use
+                    // dequant-to-f32 + cuBLAS F32 GEMM + optional bias. If this
+                    // produces coherent inference, the MMVQ/DMMV kernels are the
+                    // bug; if garbage, the problem is upstream (weight bytes).
+                    return ggml_probe::reference_forward(
+                        &l.storage, x, l.bias, cublas, alloc, stream,
+                    );
+                }
+                if ggml_probe::is_enabled() {
+                    ggml_probe::compare(&l.storage, x, cublas, alloc, stream);
+                }
+                l.forward(x, alloc, stream)
+            }
             Self::Bnb4bit(l) => l.forward(x, cublas, alloc, stream),
             Self::Fp8(l) => l.forward(x, cublas, alloc, stream),
             Self::Fp8Block(l) => l.forward(x, cublas, alloc, stream),
@@ -1132,6 +1146,221 @@ impl CohereLayerNorm {
 
     pub fn hidden_size(&self) -> usize {
         self.weight.dim(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GGML quantized-storage dual-path probe (FERRITE_PROBE_MMVQ=1)
+//
+// Runs the broken MMVQ/DMMV path AND a cuBLAS-on-dequant reference on every
+// GgmlLinear call, prints max_abs_diff to stderr. Use to locate the first
+// layer where the quantized path diverges from dense. Off by default.
+// ---------------------------------------------------------------------------
+
+mod ggml_probe {
+    use super::*;
+    use ferrite_cuda_core::dtype::DType;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static USE_REF: AtomicBool = AtomicBool::new(false);
+    static INIT: std::sync::Once = std::sync::Once::new();
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn init() {
+        INIT.call_once(|| {
+            let on = std::env::var("FERRITE_PROBE_MMVQ")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false);
+            ENABLED.store(on, Ordering::Relaxed);
+            let use_ref = std::env::var("FERRITE_USE_REFERENCE")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false);
+            USE_REF.store(use_ref, Ordering::Relaxed);
+            if on {
+                eprintln!("[probe] FERRITE_PROBE_MMVQ=1 — dual-path GgmlLinear probe active");
+            }
+            if use_ref {
+                eprintln!(
+                    "[probe] FERRITE_USE_REFERENCE=1 — GgmlLinear routes through dequant+cublas"
+                );
+            }
+        });
+    }
+
+    pub fn is_enabled() -> bool {
+        init();
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    pub fn use_reference() -> bool {
+        init();
+        USE_REF.load(Ordering::Relaxed)
+    }
+
+    /// Pure dequant-on-the-fly + cuBLAS F32 GEMM inference (no MMVQ/DMMV).
+    /// Output is returned in x's original dtype to match GgmlLinear::forward.
+    pub unsafe fn reference_forward(
+        storage: &crate::ggml::GgmlStorage,
+        x: TensorView<'_>,
+        bias: Option<GpuTensor>,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        let input_dtype = x.dtype();
+        let x_cast = if input_dtype != DType::F32 {
+            Some(crate::kernels::cast_logits_to_f32(*x, alloc, stream))
+        } else {
+            None
+        };
+        let x_f32 = x_cast.as_ref().map(|o| o.as_gpu_tensor()).unwrap_or(*x);
+        let n = storage.nrows;
+        let k = storage.ncols;
+
+        let w_f32 =
+            crate::ggml::ggml_dequantize_to_tensor(storage, DType::F32, &[n, k], alloc, stream);
+        let out_f32 = cublas.gemm(x_f32, w_f32.as_gpu_tensor(), alloc);
+        drop(w_f32);
+        drop(x_cast);
+
+        if let Some(bias) = bias {
+            // bias is in model dtype; for F32 out, cast the bias to F32 once per call.
+            // Keep simple: use bias_add if dtypes match, else convert on the fly.
+            if bias.dtype() == DType::F32 {
+                crate::kernels::bias_add_inplace(out_f32.as_gpu_tensor(), bias, stream);
+            } else {
+                let bias_f32 = crate::kernels::cast_logits_to_f32(bias, alloc, stream);
+                crate::kernels::bias_add_inplace(
+                    out_f32.as_gpu_tensor(),
+                    bias_f32.as_gpu_tensor(),
+                    stream,
+                );
+                drop(bias_f32);
+            }
+        }
+
+        if input_dtype != DType::F32 {
+            let out_f32_gpu = out_f32.as_gpu_tensor();
+            let result = crate::kernels::cast_from_f32(out_f32_gpu, input_dtype, alloc, stream);
+            drop(out_f32);
+            result
+        } else {
+            out_f32
+        }
+    }
+
+    /// Run ggml_matmul (quantized path) and a cuBLAS dequant reference on the
+    /// same (storage, x), log per-call max_abs_diff to stderr. Allocations are
+    /// dropped before return. Result is discarded — the real forward still runs.
+    pub unsafe fn compare(
+        storage: &crate::ggml::GgmlStorage,
+        x: TensorView<'_>,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) {
+        // 1. Cast activation to F32 (ggml_matmul requires f32).
+        let input_dtype = x.dtype();
+        let x_cast = if input_dtype != DType::F32 {
+            Some(crate::kernels::cast_logits_to_f32(*x, alloc, stream))
+        } else {
+            None
+        };
+        let x_f32 = x_cast.as_ref().map(|o| o.as_gpu_tensor()).unwrap_or(*x);
+        let num_tokens = x_f32.dim(0);
+        let k = x_f32.dim(1);
+        let n = storage.nrows;
+        debug_assert_eq!(k, storage.ncols);
+
+        // 1b. Measure input magnitude (over first min(N_tokens, 4) * min(K, 256) elements
+        // of x_f32) so we can tell if divergence is in input or output.
+        let x_peek = (num_tokens * k).min(2048);
+        let mut host_x = vec![0f32; x_peek];
+        ferrite_cuda_core::driver::memcpy_dtoh_async(
+            host_x.as_mut_ptr() as *mut u8,
+            x_f32.raw_ptr(),
+            x_peek * 4,
+            stream,
+        )
+        .expect("probe: dtoh x");
+        ferrite_cuda_core::driver::stream_synchronize(stream).expect("probe: sync x");
+        let x_max = host_x
+            .iter()
+            .fold(0.0f32, |m, &v| if v.is_nan() { m } else { m.max(v.abs()) });
+        let x_nan = host_x.iter().filter(|v| v.is_nan()).count();
+
+        // 2. Path A: current quantized kernel (MMVQ or DMMV).
+        let out_a = crate::ggml::ggml_matmul(storage, x_f32, alloc, stream);
+
+        // 3. Path B: dequant weight to F32, cuBLAS F32 GEMM.
+        let w_f32 =
+            crate::ggml::ggml_dequantize_to_tensor(storage, DType::F32, &[n, k], alloc, stream);
+        let out_b = cublas.gemm(x_f32, w_f32.as_gpu_tensor(), alloc);
+
+        // 4. Copy both outputs to host, compute diff.
+        let nelem = num_tokens * n;
+        let mut host_a = vec![0f32; nelem];
+        let mut host_b = vec![0f32; nelem];
+        ferrite_cuda_core::driver::memcpy_dtoh_async(
+            host_a.as_mut_ptr() as *mut u8,
+            out_a.as_gpu_tensor().raw_ptr(),
+            nelem * 4,
+            stream,
+        )
+        .expect("probe: dtoh A");
+        ferrite_cuda_core::driver::memcpy_dtoh_async(
+            host_b.as_mut_ptr() as *mut u8,
+            out_b.as_gpu_tensor().raw_ptr(),
+            nelem * 4,
+            stream,
+        )
+        .expect("probe: dtoh B");
+        ferrite_cuda_core::driver::stream_synchronize(stream).expect("probe: sync");
+
+        let mut max_diff = 0.0f32;
+        let mut first_diff_idx = usize::MAX;
+        let mut first_diff_a = 0.0f32;
+        let mut first_diff_b = 0.0f32;
+        let mut nan_count_a = 0usize;
+        let mut nan_count_b = 0usize;
+        for i in 0..nelem {
+            let a = host_a[i];
+            let b = host_b[i];
+            if a.is_nan() {
+                nan_count_a += 1;
+            }
+            if b.is_nan() {
+                nan_count_b += 1;
+            }
+            let d = (a - b).abs();
+            if d.is_finite() && d > max_diff {
+                max_diff = d;
+                if first_diff_idx == usize::MAX && d > 1e-2 {
+                    first_diff_idx = i;
+                    first_diff_a = a;
+                    first_diff_b = b;
+                }
+            }
+        }
+
+        let b_norm = host_b.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let call = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        let rel = if b_norm > 0.0 { max_diff / b_norm } else { 0.0 };
+
+        eprintln!(
+            "[probe #{call:04}] dtype={:?} M={num_tokens} N={n} K={k} \
+             x_max={x_max:.4e} x_nan={x_nan} \
+             max_abs={max_diff:.4e} ref_max={b_norm:.4e} rel={rel:.4e} \
+             nan_a={nan_count_a} nan_b={nan_count_b} \
+             first_div_idx={first_diff_idx} a={first_diff_a:.4e} b={first_diff_b:.4e}",
+            storage.dtype,
+        );
+
+        drop(out_b);
+        drop(w_f32);
+        drop(out_a);
+        drop(x_cast);
     }
 }
 

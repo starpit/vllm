@@ -262,6 +262,24 @@ impl TestModels {
     pub const QWEN2_0_5B_GGUF: &str = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
     pub const QWEN3_0_6B_GGUF: &str = "unsloth/Qwen3-0.6B-GGUF";
     pub const QWEN3_NEXT_0_8B_GGUF: &str = "unsloth/Qwen3.5-0.8B-GGUF";
+    pub const LLAMA_3_2_1B_IQ1M_GGUF: &str = "unsloth/Llama-3.2-1B-Instruct-GGUF";
+    pub const LLAMA_3_2_1B_IQ1M_FILE: &str = "Llama-3.2-1B-Instruct-UD-IQ1_M.gguf";
+    // Q4_K_M variant of the same unsloth repo; file co-located with IQ1_M above.
+    pub const LLAMA_3_2_1B_Q4KM_GGUF: &str = "unsloth/Llama-3.2-1B-Instruct-GGUF";
+    pub const LLAMA_3_2_1B_Q4KM_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+    // Remaining IQ quants of the same unsloth repo. Together with IQ1_M above,
+    // these cover 5 of the 7 IQ types wired in `GgmlDType::from_gguf`.
+    // IQ2_S and IQ3_S aren't shipped by unsloth — tested separately on Mistral.
+    pub const LLAMA_3_2_1B_IQ1S_FILE: &str = "Llama-3.2-1B-Instruct-UD-IQ1_S.gguf";
+    pub const LLAMA_3_2_1B_IQ2XXS_FILE: &str = "Llama-3.2-1B-Instruct-UD-IQ2_XXS.gguf";
+    pub const LLAMA_3_2_1B_IQ4NL_FILE: &str = "Llama-3.2-1B-Instruct-IQ4_NL.gguf";
+    pub const LLAMA_3_2_1B_IQ4XS_FILE: &str = "Llama-3.2-1B-Instruct-IQ4_XS.gguf";
+    // Mistral-7B-Instruct-v0.3 — only bartowski repo found to ship IQ2_S / IQ3_S
+    // as a Llama/Mistral/Qwen2-compatible GGUF. 7B is larger than ideal but
+    // these two IQ types aren't available at 1B scale anywhere we checked.
+    pub const MISTRAL_7B_V03_GGUF: &str = "bartowski/Mistral-7B-Instruct-v0.3-GGUF";
+    pub const MISTRAL_7B_V03_IQ2S_FILE: &str = "Mistral-7B-Instruct-v0.3-IQ2_S.gguf";
+    pub const MISTRAL_7B_V03_IQ3S_FILE: &str = "Mistral-7B-Instruct-v0.3-IQ3_S.gguf";
 
     // -----------------------------------------------------------------------
     // CUDA-only models (safetensors BF16)

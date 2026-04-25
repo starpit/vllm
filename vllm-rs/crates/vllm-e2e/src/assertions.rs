@@ -78,6 +78,31 @@ pub fn collect_stream_text(chunks: &[ChatCompletionStreamResponse]) -> String {
     text
 }
 
+/// Strip `<token_N>` fallbacks (numeric ids printed by the API when the tokenizer
+/// can't decode an out-of-vocab id) from the input text and return what's left.
+fn strip_token_id_fallbacks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for `<token_` followed by digits then `>`.
+        if bytes[i..].starts_with(b"<token_") {
+            let start = i + b"<token_".len();
+            let mut j = start;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start && j < bytes.len() && bytes[j] == b'>' {
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Assert that text output is coherent (not empty, not garbled, not just special tokens).
 pub fn assert_coherent_text(text: &str, min_len: usize) {
     let trimmed = text.trim();
@@ -96,11 +121,37 @@ pub fn assert_coherent_text(text: &str, min_len: usize) {
         .is_empty();
     assert!(!unk_only, "text should not be only <unk>/<pad> tokens");
 
+    // Reject `<token_N>` patterns — when the tokenizer can't decode the id,
+    // the API falls back to printing the numeric token id. A full response
+    // of these means inference produced out-of-vocab ids (kernel/numerical bug).
+    let stripped_token_ids = strip_token_id_fallbacks(trimmed);
+    assert!(
+        !stripped_token_ids.trim().is_empty(),
+        "text is only <token_N> fallbacks — model produced out-of-vocab ids. Text: {:?}",
+        &trimmed[..trimmed.len().min(200)]
+    );
+
+    // Reject output with too few unique characters. `!!!!!!!!` and `AAAAAAAA`
+    // are classic kernel-bug signatures: the model converges on a single
+    // high-probability token and emits it forever. Real English output has
+    // many unique characters in the first 20 chars.
+    let total_chars = trimmed.chars().count();
+    if total_chars >= 8 {
+        let unique_chars: std::collections::HashSet<char> = trimmed.chars().collect();
+        assert!(
+            unique_chars.len() >= 4,
+            "text has only {} unique characters across {} chars — classic kernel-bug \
+             signature (repeated single token). Text: {:?}",
+            unique_chars.len(),
+            total_chars,
+            &trimmed[..trimmed.len().min(200)]
+        );
+    }
+
     // Detect garbled output: if the majority of characters are non-ASCII,
     // CJK, or unusual Unicode, the model is likely producing garbage.
     // Real model output (even multilingual) has mostly ASCII when prompted
     // in English with English-centric test prompts.
-    let total_chars = trimmed.chars().count();
     if total_chars >= 10 {
         let ascii_chars = trimmed.chars().filter(|c| c.is_ascii()).count();
         let ascii_ratio = ascii_chars as f64 / total_chars as f64;
@@ -112,6 +163,31 @@ pub fn assert_coherent_text(text: &str, min_len: usize) {
             ascii_chars,
             total_chars,
             &trimmed[..trimmed.len().min(200)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "repeated single token")]
+    fn coherent_rejects_exclamation_spam() {
+        assert_coherent_text("!!!!!!!!!!!!!!!!!!!!", 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "<token_N> fallbacks")]
+    fn coherent_rejects_token_id_fallbacks() {
+        assert_coherent_text("<token_0><token_0><token_0><token_0>", 2);
+    }
+
+    #[test]
+    fn coherent_accepts_real_english() {
+        assert_coherent_text(
+            " home to which country\nFrance\nThe capital of which is",
+            10,
         );
     }
 }

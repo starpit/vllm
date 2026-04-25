@@ -1,13 +1,13 @@
 # vLLM Feature Parity: Python vs Rust
 
-> Last updated: 2026-04-04
+> Last updated: 2026-04-25
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
 | ✅ 🟦 | Implemented | 163 |
-| ⚠️ 🟨 | Partial | 11 |
-| ❌ 🟥 | Not implemented | 99 |
-| 🚫 | Won't fix | 4 |
+| ⚠️ 🟨 | Partial | 12 |
+| ❌ 🟥 | Not implemented | 100 |
+| 🚫 | Won't fix | 5 |
 
 ---
 
@@ -40,10 +40,10 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 🟦🟦🟦🟦🟦🟥🟥🟥 | 5 | 0 | 3 |
 | [Serving Features](#serving-features) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 10 | 0 | 3 |
 | [Performance Optimizations](#performance-optimizations) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥 | 9 | 1 | 3 |
-| [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥 | 22 | 1 | 3 |
+| [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟥🟥🟥 | 22 | 2 | 3 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
-| [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟦 | 8 | 0 | 0 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **163** | **11** | **99** |
+| [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟦🟥 | 8 | 0 | 1 |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **163** | **12** | **100** |
 
 ---
 
@@ -224,7 +224,7 @@
 | Method | Python | Rust | Notes |
 |---|:---:|:---:|---|
 | GGUF (all k-quant variants) | ✅ | ✅ | llama.cpp-derived dequant kernels; BS=1 fused dequant-matvec + BS>1 Q8_1 dot products; archs: LLaMA/Qwen2/Qwen3/DeepSeekV2; quantized MoE via indexed_moe_forward kernels (expert weights stay compressed); E2E: Qwen2.5-0.5B + Qwen3-0.6B + DeepSeek-V2-Lite GGUF; CUDA graphs disabled (incompatible with dynamic allocs) |
-| GGUF IQ quants (importance-matrix) | ✅ | ⚠️ | IQ4_NL + IQ4_XS done (Phase 1); remaining: IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S; llama.cpp-derived lookup-table dequant kernels |
+| GGUF IQ quants (importance-matrix) | ✅ | ⚠️ | Wired: IQ4_NL/IQ4_XS/IQ1_M/IQ1_S/IQ2_XXS/IQ2_XS (tag 17)/IQ2_S/IQ3_S — GgmlDType + dequant_block + mul_mat_vec_q8_1 + dispatch + load-time dequant_to_tensor (for embeddings/lm_head). Numerical validation via FERRITE_PROBE_MMVQ=1 vs F32 cuBLAS reference: IQ4_NL rel<=0.82% IQ4_XS<=1.1% IQ1_M<=0.81% IQ1_S<=2.9% IQ2_XXS<=1.3% (all at M=42 prefill on Llama-3.2-1B). Prefill is batched cuda1..cuda8 (56 template instantiations across 8 IQ types) with the same launcher pattern as Q4_K. Decode uses cuda1 only (DMMV path n/a — see IQ decode DMMV row in CUDA Compute Kernels). E2E coherence verified via Llama-3.2-1B chat for IQ4_NL/IQ4_XS + UD-IQ1_M/UD-IQ1_S/UD-IQ2_XXS (Unsloth Dynamic mixed-precision quants). Default load is keep-quantized (FERRITE_DEQUANT_AT_LOAD=1 opts back into BF16 for debugging). TODO: IQ3_XXS (tag 18 — only standard IQ type not wired); IQ2_XS/IQ2_S/IQ3_S coherence still blocked on tokenizer-from-GGUF fallback (their only test files are bartowski Mistral-7B GGUFs with no tokenizer.json — see Tokenizers section). |
 | GPTQ | ✅ | ✅ | Marlin W4A16 on SM80+; symmetric + desc_act (activation ordering); fused QKV/gate_up at load; post-GEMM bias_add_inplace for linear bias; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; note: asymmetric zero-points not passed (uint4b8 bakes in zp like Python vLLM) |
 | AWQ | ✅ | ✅ | Marlin W4A16 on SM80+; fused QKV/gate_up at load; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; E2E verified Qwen2.5-0.5B |
 | BitsAndBytes NF4 (4-bit) | ✅ | ✅ | Dequant-then-cuBLAS GEMM; double quantization supported; per-shard matmuls for QKV and gate/up; archs: LLaMA/Qwen2/Gemma2 (+ aliases Mistral/Qwen3/Phi-3/Granite); E2E verified unsloth/Qwen3-0.6B-bnb-4bit |
@@ -475,6 +475,8 @@
 | Fused MoE GEMM | ✅ | ✅ | WMMA tensor-core kernel; BF16/F16/FP8-dequant: variable BLOCK_M (16/32/64/128) selected per-batch via tokens-per-expert heuristic (matches Python vLLM get_default_config) with warp redistribution across M×N to keep all 8 warps active; GROUP_SIZE_M=8 L2 locality swizzle (matches Python vLLM); FP8 per-tensor: dequant-to-BF16 compute with per-token a_scale × per-expert w_scale epilogue; FP8 block-quantized: fused_moe_fp8_block_dequant_wmma applies 3D per-block weight scales [E ceil(N/bn) ceil(K/bk)] during B-tile FP8→BF16 dequant in shared memory (w_scale folded into dequant; epilogue only applies a_scale); perf gaps vs Triton: WMMA vs native mma PTX (10-30%) + no chunked processing (OOM risk large batches); FP8 gap: SM89 native mma.m16n8k32.e4m3 PTX parked (0.5x output bug) |
 | Marlin (INT4 GEMM) | ✅ | ✅ | W4A16 fused dequant+GEMM; 270 kernel instantiations (FP16/BF16 × GPTQ/AWQ); use_fp32_reduce=true |
 | GGUF dequant kernels (k-quants) | ✅ | ✅ | llama.cpp-derived; BS=1 fused dequant-matvec + BS>1 Q8_1 dot products; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q8K |
+| GGUF dequant kernels (IQ types) | ✅ | ⚠️ | llama.cpp-derived codebook-lookup dequant + MMVQ kernels for IQ4_NL/IQ4_XS/IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_S. Per-type codebook tables (kvalues_iq4nl 16xi8 / iq1s_grid_gpu 2048xu32 / iq2xxs_grid 256xu64 / iq2xs_grid 512xu64 / iq2s_grid 1024xu64 / iq3s_grid 512xu32) + sign-bit machinery (kmask_iq2xs / ksigns_iq2xs / unpack_ksigns / __vcmpne4 / __vsub4 / ggml_cuda_dp4a). Both dequant_block_*_{f32+f16} and mul_mat_vec_*_q8_1_cuda1..cuda8 (56 batched instantiations added 2026-04-25). Decode: MMVQ via Q8_1 quantization of activations (no fused DMMV path for IQ — upstream llama.cpp deleted dmmv.cu entirely; ik_llama.cpp only ports DMMV for its custom IQ*_KT types not the standard ones). Prefill: cuda2..cuda8 batched same as Q4_K. TODO: IQ3_XXS (tag 18) kernels. |
+| ~~IQ decode DMMV (fused dequant+dot at BS=1)~~ | ✅ | ❌ | 🚫 Won't fix — Reclassified do-not-port 2026-04-25: upstream llama.cpp deleted ggml/src/ggml-cuda/dmmv.cu entirely (modern llama.cpp routes both decode and prefill through MMVQ); ik_llama.cpp only ports DMMV for its custom IQ2_KT/IQ3_KT/IQ4_KT types not the standard IQ1_S/IQ1_M/IQ2_*/IQ3_S/IQ4_*. The MMVQ-via-Q8_1 path is what current llama.cpp uses everywhere for IQ types and is wired here. |
 | GGUF quantized MoE (indexed_moe_forward) | ❌ | ✅ | Expert routing via index array (blockIdx.y=batch blockIdx.z=topk); Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q6K × Q8_1 input; avoids dequantizing expert weights to dense |
 | BitsAndBytes NF4 dequant | ✅ | ✅ | Dequant-then-cuBLAS; double quantization supported; shared dequant scratch buffer |
 | Embedding gather | ❌ | ✅ | Vectorized CUDA kernel |
@@ -529,6 +531,7 @@
 | PyO3 scheduler bridge | N/A | ✅ | Rust scheduler usable from Python |
 | Offline `LLM` API (programmatic) | ✅ | ✅ | Python: `LLM` class; Rust: `LLM` struct |
 | HuggingFace tokenizers | ✅ | ✅ | Same `tokenizers` library |
+| Tokenizer from GGUF metadata | ✅ | ❌ | vllm-serve currently loads tokenizer.json from model_dir only. When absent (e.g. bartowski/Mistral-7B-Instruct-v0.3-GGUF and other GGUF-only HF repos that ship just .gguf files) `tokenize_text` in vllm-serve/src/llm.rs falls back to `text.as_bytes().iter().map(|&b| b as u32).collect()` — every ASCII byte becomes a u32 token ID. Symptom: chat output is `<token_0>` x N for any prompt because byte values land on Mistral's reserved/byte-fallback vocab rows (which are correctly zero-encoded in the file). Python vLLM constructs a tokenizer from the GGUF's tokenizer.ggml.* metadata (model='llama' SentencePiece + tokens + scores + bos/eos/unk IDs). Blocks all IQ2_S/IQ2_XS/IQ3_S coherence tests (their only GGUF source is bartowski Mistral). Fix: build a tokenizer from the GGUF KV when tokenizer.json is missing. |
 | HuggingFace Hub model download | ✅ | ✅ |  |
 | Standalone binary (no Python) | N/A | ✅ | Rust-only |
 

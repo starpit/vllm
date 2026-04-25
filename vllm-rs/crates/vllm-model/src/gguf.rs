@@ -188,6 +188,80 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
         .get_metadata_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))
         .map(|v| v as f64);
 
+    // rope_scaling: parse if the GGUF records it, otherwise infer llama3 defaults
+    // for Llama-3.x files (unsloth GGUFs omit the scaling keys entirely).
+    // Keys follow llama.cpp convention: {arch}.rope.scaling.type and friends.
+    let rope_scaling_type = gguf.get_metadata_string(&format!("{arch}.rope.scaling.type"));
+    let has_scaling_keys = rope_scaling_type.is_some()
+        || gguf
+            .get_metadata_f32(&format!("{arch}.rope.scaling.factor"))
+            .is_some();
+    if has_scaling_keys {
+        let rope_type = rope_scaling_type.unwrap_or("linear").to_string();
+        let factor = gguf
+            .get_metadata_f32(&format!("{arch}.rope.scaling.factor"))
+            .unwrap_or(1.0) as f64;
+        let mut scaling = serde_json::Map::new();
+        scaling.insert(
+            "rope_type".to_string(),
+            serde_json::Value::String(rope_type.clone()),
+        );
+        scaling.insert("factor".to_string(), serde_json::Value::from(factor));
+        if let Some(orig) =
+            gguf.get_metadata_u32(&format!("{arch}.rope.scaling.original_context_length"))
+        {
+            scaling.insert(
+                "original_max_position_embeddings".to_string(),
+                serde_json::Value::from(orig as u64),
+            );
+        }
+        if rope_type == "llama3" {
+            if let Some(lo) = gguf.get_metadata_f32(&format!("{arch}.rope.scaling.low_freq_factor"))
+            {
+                scaling.insert(
+                    "low_freq_factor".to_string(),
+                    serde_json::Value::from(lo as f64),
+                );
+            }
+            if let Some(hi) =
+                gguf.get_metadata_f32(&format!("{arch}.rope.scaling.high_freq_factor"))
+            {
+                scaling.insert(
+                    "high_freq_factor".to_string(),
+                    serde_json::Value::from(hi as f64),
+                );
+            }
+        }
+        config.extra.insert(
+            "rope_scaling".to_string(),
+            serde_json::Value::Object(scaling),
+        );
+    } else if arch == "llama" {
+        // Infer Llama-3.x llama3 rope_scaling when the GGUF omits the scaling keys.
+        // Signature: rope_theta == 500000 (Llama 3 base) AND context_length > 8192 (extended).
+        // Values match HF config for Llama-3.1 / 3.2 / 3.3 (all use identical defaults).
+        let theta = config.rope_theta.unwrap_or(10000.0);
+        let ctx = config.max_position_embeddings.unwrap_or(0);
+        if (theta - 500000.0).abs() < 1.0 && ctx > 8192 {
+            let mut scaling = serde_json::Map::new();
+            scaling.insert(
+                "rope_type".to_string(),
+                serde_json::Value::String("llama3".to_string()),
+            );
+            scaling.insert("factor".to_string(), serde_json::Value::from(32.0));
+            scaling.insert("low_freq_factor".to_string(), serde_json::Value::from(1.0));
+            scaling.insert("high_freq_factor".to_string(), serde_json::Value::from(4.0));
+            scaling.insert(
+                "original_max_position_embeddings".to_string(),
+                serde_json::Value::from(8192u64),
+            );
+            config.extra.insert(
+                "rope_scaling".to_string(),
+                serde_json::Value::Object(scaling),
+            );
+        }
+    }
+
     // Compute head_dim: try arch-specific key_length first, fall back to hidden/heads.
     if let Some(key_len) = gguf.get_metadata_u32(&format!("{arch}.attention.key_length")) {
         config.head_dim = Some(key_len as usize);

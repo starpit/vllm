@@ -176,8 +176,12 @@ trait Implementation {
     ///     <Arch>Op::<Variant> { #(field_idents),* } => { #body }
     /// using the field names declared in `opcode_shape`. The body
     /// references those idents, plus the ambient bindings
-    /// `__tiles`, `wm`, `ctx`, `device`.
-    fn interpreter_arm(&self) -> TokenStream;
+    /// `__tiles`, `wm`, `ctx`, `device`. `model` lets the body bake
+    /// arch-wide config-derived literals (`hidden_size`, `head_dim`,
+    /// `attention_multiplier`, `attn_logit_softcapping`, …) at
+    /// codegen time; per-claim values that vary across instances of
+    /// the same variant ride in `OpInstance` fields instead.
+    fn interpreter_arm(&self, model: &ModelParams) -> TokenStream;
 }
 ```
 
@@ -206,12 +210,50 @@ These deletions land in the same commit that introduces the
 per-arch enum codegen, so the runtime crate never carries dead
 megakernel scaffolding.
 
-## Current branch state (2026-04-25 end-of-session)
+## Per-claim weight selection: fn-pointer fields
 
-Branch `ff-interpreter` is at `b2c08c8e7` (forked from
-ferrite-forward `961cb8c8`). Five commits ahead of fork:
+One Impl emits one variant. But two RmsNorm tiles in the same arch
+claim *different* accessors (`input_layernorm` vs
+`post_attention_layernorm`). The variant body can't hardcode an
+accessor name; it has to be told which weight to read at this
+instance. The encoding:
+
+- Per-arch `Weights` codegen (now landed) emits
+  `pub fn input_layernorm(&self, layer: u32) -> &RmsNorm { match
+  layer { 0 => &self.input_layernorm_0, … } }` per accessor base
+  (trailing `_<digits>` stripped). Non-layered accessors take the
+  same `(&self, layer: u32) -> &Ty` signature for caller
+  uniformity; their body is `&self.<field>` and ignores the layer.
+- `OpInstance` carries a `weight_fn` field of type
+  `for<'a> fn(&'a Weights, u32) -> &'a Ty` (or whatever return
+  type fits the Impl). `fan_out` resolves it as
+  `Weights::input_layernorm` (a function reference, valid in
+  `const` context). The interpreter arm body calls
+  `(weight_fn)(wm, layer)`.
+- Multiple-weight Impls (e.g. fused QKV with separate qkv +
+  rotary accessors) carry one fn-pointer field per accessor.
+
+Codegen-time invariants the helper enforces (see
+`emit_weights_accessor_methods` + its tests):
+
+- Mixed layered + un-layered fields under one base panic at
+  expansion time. There's no sensible single body for the mix and
+  silently picking one would mask a solver / Impl bug.
+- Two layers under the same base with different `rust_type`s
+  panic at expansion time.
+- Out-of-range layer at runtime panics with the accessor name
+  baked in (no `_ => &self.<layer 0>` catch-all that would silently
+  pick layer 0).
+
+## Current branch state (2026-04-25 mid-session)
+
+Branch `ff-interpreter` is at `833ddcb61` (forked from
+ferrite-forward `961cb8c8`). Seven commits ahead of fork:
 
 ```
+833ddcb61  ff-interpreter: Weights accessor methods for runtime layer dispatch
+318949840  ff-interpreter: interpreter_arm takes &ModelParams
+e7fcae89a  ff-interpreter: handoff captures end-of-session state
 b2c08c8e7  ff-interpreter: per-arch enum + closed-match codegen module
 f5f62f675  ff-interpreter: add OpcodeShape/OpInstance + new trait methods
 afb6a804f  ff-interpreter: drop megakernel scaffolding, rewrite handoff
@@ -219,9 +261,10 @@ afb6a804f  ff-interpreter: drop megakernel scaffolding, rewrite handoff
 4e5174d02  ff-interpreter: scaffold Instruction IR + tile table + InstrEmit  ← reverted by afb6a804f
 ```
 
-The first two were wrong-design scaffolding (universal opcode
-registry + `Instruction([i32;32])` wire format) and were undone
-by `afb6a804f`. The active state is the three most recent.
+The two reverted commits were wrong-design scaffolding (universal
+opcode registry + `Instruction([i32;32])` wire format), undone
+by `afb6a804f`. The active scaffolding is the four most recent
+commits before today plus today's two scaffolding refinements.
 
 ### What's landed and verified
 
@@ -271,7 +314,7 @@ by `afb6a804f`. The active state is the three most recent.
 
 ## What's next — the wholesale switch (one commit)
 
-Scaffolding (steps 1-2 below) is done. The remaining work is one
+Scaffolding (steps 1–4 below) is done. The remaining work is one
 wholesale commit. Per the rules: no piecemeal Impl migration, no
 intermediate "some Impls migrated" tree state.
 
@@ -279,46 +322,141 @@ intermediate "some Impls migrated" tree state.
 2. ~~Define `OpcodeShape` / `OpInstance` + new trait methods~~ —
    done in `f5f62f675`. `emit_call` still active alongside the
    defaulted-`None` `fan_out`.
-3. **Migrate every Impl in `impl_lib.rs`.** Each Impl: write
+3. ~~`interpreter_arm` takes `&ModelParams`~~ — done in
+   `318949840`. Body bakes config-derived literals
+   (`hidden_size`, `head_dim`, attention scale / softcap, …) the
+   same way today's `emit_call` does via `EmitCtx::bound` /
+   `EmitCtx::scalar`.
+4. ~~Per-arch `Weights` accessor methods~~ — done in `833ddcb61`.
+   `pub fn input_layernorm(&self, layer: u32) -> &RmsNorm` etc.
+   emitted alongside the per-(field × layer) fields. `OpInstance`
+   `weight_fn` fields will resolve to `Weights::<base>` (`const`
+   fn-pointer).
+5. **Migrate every Impl in `impl_lib.rs`.** Each Impl: write
    `opcode_shape()` (variant ident + typed fields), `fan_out(...)`
    (one `OpInstance` per kernel call this Impl makes; resolves
-   slot ids via `SlotMap::of`), and `interpreter_arm()` (body
-   that references the shape's field idents + ambient `__tiles`,
-   `wm`, `ctx`, `device`). Delete the Impl's `emit_call`.
-4. **Emit per-layer accessor methods on the per-arch `Weights`
-   struct** — needed so `interpreter_arm` bodies can do
-   `wm.input_layernorm(layer)` against a runtime `layer: u32`.
-   Today's emitted `Weights` has one field per (accessor × layer)
-   like `input_layernorm_3`. The codegen needs to add accessor
-   methods that match on `layer: usize` and return `&FieldType`.
-   Lives in `codegen.rs` alongside `emit_weights_struct`.
-5. **Rewrite `emit_subgraph` / `emit_forward_for_bucket` /
+   slot ids via `SlotMap::of`, weight selectors via
+   `Weights::<base>` fn-pointer), and `interpreter_arm(model)`
+   (body that references the shape's field idents + ambient
+   `__tiles`, `wm`, `ctx`, `device`). Delete the Impl's
+   `emit_call`.
+6. **Rewrite `emit_subgraph` / `emit_forward_for_bucket` /
    `emit_forward_backbone_for_bucket` / `emit_model`** to use
    `interpreter_codegen::lower_bucket` + `ArchOpcodes::emit_enum`
    + `ArchOpcodes::emit_interpreter` + `emit_bucket_static_slice`.
    Per-arch: emit ONE enum and ONE interpreter helper; per-bucket:
    emit one static slice + a thin fn that runs the alias prelude
    and calls the helper.
-6. **Delete `EmitMode::Abstract` / `FragmentLibrary` /
+7. **Delete `EmitMode::Abstract` / `FragmentLibrary` /
    Concrete-mode `EmitCtx` machinery** — all unused after the
    seam swap. `emit.rs` shrinks substantially or goes away.
-7. **Delete `Implementation::emit_call` from the trait.** The
+8. **Delete `Implementation::emit_call` from the trait.** The
    final shape: trait has `opcode_shape` / `fan_out` /
    `interpreter_arm` + the layout/cost/handoff/etc. methods that
    were never about emission.
-8. **Run llama golden** (`vllm-e2e --features e2e,cuda --release
+9. **Run llama golden** (`vllm-e2e --features e2e,cuda --release
    --test e_correctness -- --ignored --test-threads=1`, llama
    subset). Match must be exact.
-9. **Run sibling-arch goldens** (qwen2/qwen3/mistral/phi3/gemma2/
-   gemma3/granite/command-r/deepseek-v2/deepseek-v3). Same bar.
+10. **Run sibling-arch goldens** (qwen2/qwen3/mistral/phi3/gemma2/
+    gemma3/granite/command-r/deepseek-v2/deepseek-v3). Same bar.
+
+### Per-Impl migration recipe
+
+For each `impl Implementation for <Foo>`:
+
+1. Read `emit_call` carefully. Identify:
+   - **Inputs** read via `ctx.input_expr(tile, slot)` → become
+     `<name>_slot: u32` fields. Resolution: `slots.of(producer_tile,
+     producer_slot)` for tile inputs; `ctx.input_ids` /
+     `ctx.positions` etc. stay as ambient `ctx.<field>` references
+     in the body (no field needed); `wm.rotary` /
+     `wm.rotary_local` become `rotary_fn: fn(&Weights) -> &Rotary`
+     fields when the choice is per-claim (Gemma3 mixes both).
+   - **Weights** read via `ctx.weight_accessor(name)` → become
+     `weight_fn: fn(&Weights, u32) -> &<Ty>` fields, value
+     `Weights::<base>` where `<base>` is the accessor name with
+     trailing `_<digits>` stripped. The body calls
+     `(weight_fn)(wm, layer)`.
+   - **Outputs** bound via `ctx.output_ident(tile, slot)` →
+     become `<name>_slot: u32` fields (one per claimed output).
+     Body writes `__tiles[<name>_slot as usize] =
+     Some(::ferrite_forward::TileEntry::Owned(...))`.
+   - **Per-claim compile-time constants** that vary across
+     instances of the same variant (layer index, scalar offsets,
+     interleaved-vs-NeoX flag, fp8 flag) → fields of the
+     appropriate type.
+   - **Arch-wide compile-time constants** (every `ctx.bound("...")`
+     and `ctx.scalar("...")` call) → bake into the body via
+     `model.bounds["..."]` / `model.scalars.get("...")` reads in
+     `interpreter_arm(model)`. Same as today.
+2. Write `opcode_shape()` returning the variant ident + ordered
+   `(field_ident, field_type)` pairs.
+3. Write `fan_out(m, fuf, program, bounds, slots)` returning one
+   `OpInstance` per kernel call. Field-value tokens are positional,
+   matching shape declaration order.
+4. Write `interpreter_arm(model)`. Body destructures fields and
+   calls the kernel. **Never** transmute or use `unsafe { … }`
+   wrappers larger than the existing `unsafe` blocks today's
+   `emit_call` already wraps. Read tile inputs via `tile_ref(__tiles,
+   slot)`; for `as_view()` style use `(*entry).as_view(__tiles)`.
+5. Delete `emit_call`. (This breaks compilation while the seam
+   still runs the old path; the wholesale commit's last move is
+   the seam swap, which makes `emit_call` an unused-method dead
+   trait member, then this step deletes the trait method itself.)
+
+### Impl inventory (47 to migrate)
+
+Run `grep -n '^impl Implementation for' impl_lib.rs` to enumerate.
+As of `833ddcb61`, ordered by location:
+
+```
+trivial_impl! → EmbedRefImpl, RmsNormRefImpl, LayerNormRefImpl,
+                GemmRefImpl  (4 entries via the `trivial_impl!`
+                macro at impl_lib.rs:929; the macro expands to a
+                full `impl` block — convert the macro to also
+                accept opcode_shape/fan_out/interpreter_arm
+                callbacks, OR hand-write each as a regular impl
+                so the new methods are visible.)
+ReshapeRefImpl              FusedAddRmsNormImpl
+FusedGemmBiasImpl           FusedAddRmsNormWithOffsetImpl
+CutlassFusedGemmBiasImpl    ScalarOffsetRmsNormImpl
+FusedGateUpSiluMulImpl      FusedQkvRopeCacheImpl
+CutlassFusedGateUpSiluMulImpl  FusedQkvQkNormRopeCacheImpl
+FusedGateUpGeluMulImpl      AttentionViaCacheImpl
+ScalarMulImpl               RopeAppendRefImpl
+TanhSoftCapImpl             FusedQkvRopePrefillImpl
+AddRefImpl                  AttentionPrefillContiguousImpl
+                            SlidingAttentionViaCacheImpl
+                            SlidingAttentionPrefillContiguousImpl
+CutlassGemmImpl             CutlassGemmSplitKImpl
+CutlassGemmAddImpl          CutlassGemvImpl
+MarlinGemmImpl              MarlinFusedGateUpSiluMulImpl
+MarlinFusedGateUpGeluMulImpl  MarlinFusedQkvRopeCacheImpl
+MarlinFusedQkvRopePrefillImpl
+Bnb4GemmImpl                Fp8GemmImpl
+Fp8FusedGemmBiasImpl        Fp8FusedGateUpSiluMulImpl
+Bnb4FusedGateUpSiluMulImpl  Bnb4FusedGateUpGeluMulImpl
+Fp8FusedGateUpGeluMulImpl   Fp8FusedQkvRopeCacheImpl
+Fp8FusedQkvRopePrefillImpl  Bnb4FusedQkvRopeCacheImpl
+Bnb4FusedQkvRopePrefillImpl
+FlashInferAttentionDecodeImpl  FlashInferAttentionPrefillImpl
+MlaSplitRefImpl             MlaAttentionImpl
+DeepSeekMoeRefImpl
+```
+
+Within the wholesale commit, work in the same locality order as
+`grep` output — keeps the diff readable. After every batch (say,
+every 5 Impls), run `cargo build -p ferrite-forward-macro` to
+verify the trait's still satisfied; the macro crate builds even
+while `lower_bucket` is still unwired, because `emit_call` lives
+alongside the new methods until step 7 fires.
 
 ### Scope estimate for the wholesale commit
 
-- ~50 Impls in `impl_lib.rs`. Per-Impl change ~80-150 lines net.
+- ~47 Impls in `impl_lib.rs`. Per-Impl change ~80–150 lines net.
   ≈ 5 kloc.
 - `emit_subgraph` / `emit_forward_*` / `emit_model` rewrite: ~500
   lines.
-- Per-arch Weights accessor methods: ~200 lines (codegen).
 - Deletions of `emit.rs::EmitMode::Abstract` /
   `FragmentLibrary` / etc.: ~500 lines removed.
 

@@ -1,58 +1,75 @@
 # ff-interpreter — handoff
 
 > Branch `ff-interpreter`. Read this whole file before changing
-> anything. ff4 stencil rewrite is dead. The seam swap + the
-> first round of codegen-size compression are in. End-to-end build
-> and goldens still need to run.
+> anything. ff4 stencil rewrite is dead. The seam swap + a first
+> round of codegen-size compression + downstream-build verification
+> are in. **Goldens still hit a CUDA runtime failure on Llama 3.2
+> 3B — see §5 (CURRENT BLOCKER)**, that's the next thing to chase.
 
 ## Where we are
 
-Five commits on top of the seam-swap checkpoint focus on cargo-
-expand size:
+Eight commits on top of the seam-swap checkpoint:
 
-1. `Vec<T> Weights compression` — layered accessors collapse from
-   N per-layer fields + 40-arm `match layer` accessor methods + N
-   per-layer load lets into one `Vec<T>` field, one
+1. **`Vec<T>` Weights compression** (3313f8fdd) — layered accessors
+   collapse from N per-layer fields + 40-arm `match layer` accessor
+   methods + N per-layer load lets into one `Vec<T>` field, one
    `&self.<base>.get_unchecked(layer as usize)` accessor, one
    `(0..N).map(|layer| { format!(..., layer); …::load(…) }).collect()`
-   Vec-build per layered base. `pub struct Weights`: 217→30 lines on
-   commandr (-86%); `impl Weights { … }`: 578→240 (-58%);
+   Vec-build per layered base. `pub struct Weights`: 217→30 lines
+   on commandr (-86%); `impl Weights { … }`: 578→240 (-58%);
    `pub fn load_with`: 1380→278 (-80%).
-2. `__dispatch_one` redundant `let _ = layer;` lines dropped (the
-   fn's `unused_variables` allow already suppresses warnings); the
-   fn-top redundant `let layer = __layer;` setup is gone too. Per-
+2. **Drop redundant `let _ = layer`** (58ba9b2cc) — the fn-level
+   `#[allow(unused_variables)]` already suppresses warnings; the
+   fn-top redundant `let layer = __layer;` setup is also gone. Per-
    arm `let layer: u32 = __layer;` shadow stays — load-bearing for
-   Op::Loop iteration semantics.
-3. Per-bucket forward fns collapse to 1-line shims passing the
-   bucket's static-slice idents + slot indices to a single
-   `__forward_inner` / `__forward_backbone_inner` helper emitted
-   once per arch module. `forward_backbone_m_<N>`: 30→11 lines per
-   bucket. Op enum's `derive(Clone)` replaced with manual
-   `*self` impl to skip the verbose `AssertParamIsClone` expansion.
-4. Shared arm-prelude lift: `extract_arch_wide_constants` records
-   dropped (fname, ty, value) tuples in a sibling `extracted_prelude`
-   side map on `ArchOpcodes`; `emit_interpreter` partitions by
-   string-form (key = (fname, ty, value)). Tuples present in 2+
-   variants lift to ONE fn-scope `let` at the top of `__dispatch_one`;
-   per-variant residuals stay at the top of the arm. `cos_sin_fn`,
-   `interleaved`, `biased` lift on commandr.
-5. Type annotations dropped on extracted prelude lets — Rust infers
-   the type from the value, and arm-body call sites only need the
-   binding's NAME. Collapses 4-line `for<'a> fn(&'a Weights, u32)
-   -> &'a LinearLayer` types to one line per `weight_fn` /
-   `cos_sin_fn` declaration.
+   `Op::Loop` iteration semantics.
+3. **Per-bucket fn shim + manual Op Clone** (5275d036a) — per-bucket
+   forward fns collapse to 1-line shims passing the bucket's static-
+   slice idents + slot indices to a single `__forward_inner` /
+   `__forward_backbone_inner` helper emitted once per arch module.
+   `forward_backbone_m_<N>`: 30→11 lines per bucket. `Op` enum's
+   `derive(Clone)` replaced with manual `*self` to skip the verbose
+   `AssertParamIsClone` expansion.
+4. **Shared arm-prelude lift** (2b35dca2a) —
+   `extract_arch_wide_constants` records dropped `(fname, ty,
+   value)` tuples in a sibling `extracted_prelude` side map on
+   `ArchOpcodes`; `emit_interpreter` partitions by string-form key.
+   Tuples present in 2+ variants lift to ONE fn-scope `let` at the
+   top of `__dispatch_one`; per-variant residuals stay at the top
+   of the arm. On commandr this lifts `cos_sin_fn`, `interleaved`,
+   `biased`.
+5. **Drop type annotations on extracted prelude lets** (8d96ea8d5)
+   — Rust infers the type from the value, and arm-body call sites
+   only need the binding's NAME. Collapses 4-line
+   `for<'a> fn(&'a Weights, u32) -> &'a LinearLayer` types to one
+   line per `weight_fn` / `cos_sin_fn` declaration.
+6. **Trim verbose macro doc comments** (f84b116c8) — multi-paragraph
+   `///` comments shortened to 1–2 line summaries (Op enum: 17→2,
+   load_with: 8→2, fingerprint: 7→2, dispatcher: 8→1, etc.).
+   Detailed rationale stays in macro source via `//` comments
+   (prettyplease drops those from cargo expand).
+7. **Three downstream-build bug fixes** (579d0644d) — surfaced when
+   `cargo build -p ferrite-model-*` was run for the first time
+   since the seam swap. All 11 model crates now compile clean. See
+   §3 below for the bugs.
 
 `cargo expand -p ferrite-model-commandr --lib --features cuda`:
-**4244 → 2417 lines (-43% beyond the seam-swap baseline).**
-Llama: **263k → 111k lines (-58%)**, with `pub fn load_with`
+**4244 → 2339 lines (-45% beyond the seam-swap baseline,
+~ -90% from the original ~23k pre-pivot baseline).**
+Llama: **263k → ~108k lines (-59%)**, with `pub fn load_with`
 dropping from 118400 to 9842 lines (-92%) — the Vec compression's
 single biggest win.
 
+Macro test count: **177 pass / 23 fail** (same 23 pre-existing
+failures from before the size pass). All 11 model crates build
+clean: llama, qwen2, qwen3, gemma2, gemma3, mistral, phi3,
+granite, commandr, deepseek-v2, deepseek-v3.
+
 The user's stretch target is <1000 lines for commandr. Cumulative
-progress is in good shape but not at goal yet. The major remaining
-levers (cross-canonical __dispatch_one dedup, per-arm body
-compression via a Ctx struct + helper methods) are bigger refactors
-— see "What's left" §1 below.
+progress is in good shape but not at goal. The two remaining big
+levers (cross-canonical `__dispatch_one` dedup, per-arm `Ctx`
+struct refactor) are wholesale refactors — see "What's left" §1+§2
+below.
 
 ## Original (pre-compression) state
 
@@ -188,42 +205,130 @@ under 1000.
 Refactor scope: similar to #1 (touch every Impl's
 `interpreter_arm`). Land wholesale, commit-by-commit forbidden.
 
-### 3. Past-but-completed: Vec / shared-prelude / per-bucket dedup
+### 3. Past-but-completed: downstream-build bug fixes
 
-Already in main on this branch as the five commits described in
-"Where we are". No further action needed.
+Three bugs surfaced when `cargo build -p ferrite-model-*` was run
+end-to-end for the first time since the seam swap. All three were
+pre-existing (from commit `692d24603`); none came from this
+session's compression work. Fixed in commit `579d0644d`:
+
+- **`ReshapeRefImpl` body**: `*ndim as usize` was dereferencing a
+  u8 value (`ndim: u8`). Whether the field was destructured by-
+  value from the variant or extracted as a `let ndim: u8 = 2u8;`
+  prelude, `*ndim` was always invalid. Fixed to `ndim as usize`.
+  Affected: gemma3, qwen3, deepseek-v2, deepseek-v3 (every arch
+  that emits `Op::Reshape`).
+- **`TensorView` lifetime**: `as_view<'a>(&'a self, tiles: &'a
+  [TileEntry]) -> TensorView<'a>` tied the returned view's
+  PhantomData to `tiles`'s borrow. `TensorView` is a `Copy`
+  wrapper around a raw GPU pointer — the lifetime is purely a
+  marker, not a real borrow. But the borrow checker treated
+  `__tiles` as immutably borrowed for the view's full scope, so
+  arms that produced `Reshaped` slots from view metadata
+  (`RopeAppendRefImpl`, `FusedQkvQkNormRopeCacheImpl`, …) hit
+  E0502 the moment they tried to write back into `__tiles`.
+  Relaxed to return `TensorView<'static>`; safety story unchanged
+  (`as_view` is already `unsafe`, the drop-pass invariant keeps
+  the upstream `OwnedTensor` alive).
+- **`AccessorGroup` contiguity check**: my `group_accessors_by_base`
+  panicked on layered families that didn't fill `0..N`
+  contiguously, e.g. DeepSeek-V2's `moe` accessor (layers 1..N —
+  layer 0 is dense FFN) and `mlp_down_proj` (layer 0 only —
+  layers 1..N use `moe`). Replaced the `layered: bool` flag with
+  an `AccessorGroupKind` enum:
+  - `Unindexed` — single field, no layer arg.
+  - `LayeredContiguous` — `Vec<T>`, slice-index accessor (only
+    fires for layered groups starting at layer 0 with no gaps).
+  - `LayeredSparse` — per-layer fields + match-arm accessor
+    (legacy fallback for non-zero-start or has-gaps families).
+  Also dropped the `entries.len() == num_hidden_layers`
+  assertion — a contiguous-from-zero group can be a partial
+  cover (e.g. `mlp_down_proj` is layer 0 only).
 
 ### 4. End-to-end build verification
 
-The macro crate builds + tests pass. **`cargo build -p
-ferrite-models --features cuda` has not been verified end-to-end
-since the seam swap.** Earlier attempts hit two issues that are
-now fixed (`Fp8AnyLinear` accessor type guard rejection, panic in
-`plan_field_load` on `Fp8AnyLinear`). After landing the Weights
-refactor, run a full ferrite-models build and confirm:
+**Done** (commit `579d0644d`). `cargo build -p ferrite-model-*
+--features cuda` passes for all 11 arches: llama, qwen2, qwen3,
+gemma2, gemma3, mistral, phi3, granite, commandr, deepseek-v2,
+deepseek-v3.
 
-- Macro expansion succeeds for every model variant on disk.
-- rustc can compile the emitted code (no missing `load` /
-  `Weights` symbols downstream).
+### 5. CURRENT BLOCKER — Llama 3.2 3B runtime failure
 
-There are integration tests under `crates/ferrite-forward/tests/`
-(phase7_end_to_end, gemma2_end_to_end) that compile every variant
-through the macro — those serve as the smoke test.
-
-### 5. Goldens
-
-After the build is green, run:
+`vllm chat unsloth/Llama3.2-3B-Instruct --prompt "why is the sky
+blue" --enforce-eager` fails. Symptom:
 
 ```
-cargo test --release --test e_correctness -p vllm-e2e \
-    --features e2e,cuda -- --ignored --test-threads=1
+Error: engine step failed: executor error: worker execution failed:
+async D2H token ids: CUDA driver error: CUDA_ERROR_ILLEGAL_ADDRESS
 ```
 
-Llama subset first; match must be exact. Then Qwen2 / Qwen3 /
-Mistral / Phi3 / Gemma2 / Gemma3 / Granite / CommandR / DeepSeek-V2
-/ DeepSeek-V3.
+With `CUDA_LAUNCH_BLOCKING=1` the actual panic surfaces:
 
-The interpreter design changes runtime behavior in subtle ways:
+```
+panicked at crates/ferrite-cuda-core/src/cublas.rs:532:13:
+cublasGemmEx failed for GEMM [M=41, K=8192, N=5120] BF16 status=13 trans=true
+   1: …CublasHandle::gemm_ex
+   2: …CublasHandle::run_matmul_with_fallback
+   3: …CublasHandle::run_gemm
+   4: …LinearLayer::forward
+   5: ferrite_model_llama::llama_3_2_3b::__dispatch_one
+   6: …forward_inner → forward → FerriteWeights::forward
+   7: vllm_executor::cuda_worker::CudaModel::forward
+```
+
+Status 13 = `CUBLAS_STATUS_EXECUTION_FAILED`. M=41 is the
+chat-templated prompt length. The shape `[41, 8192] @
+[8192, 5120]ᵀ` doesn't match Llama 3.2 3B's documented dims
+(hidden=3072, intermediate=8192, qkv=q+k+v=24·128+8·128+8·128=5120) —
+so K=8192 is unexpected unless this `LinearLayer::forward` call
+is the QKV proj loaded with the wrong size. Possible causes:
+
+- `Vec<T>` weights compression loaded the wrong layer's weights —
+  the `(0..N).map(|layer| { format!("model.layers.{}.…", layer);
+  …::load(…) }).collect()` body is new in this branch. If the
+  format-template + `safetensors_prefix` agreement is off-by-one,
+  layer L's slot would hold layer L+1's weights or vice-versa.
+- `as_view`'s relaxed lifetime (now `'static`) lets a stale view
+  survive an `__tiles[X]` overwrite somewhere. Color reuse +
+  `set_owned` in the same arm sequence might expose this where
+  the tighter lifetime would have caught it.
+- Op::Loop's `__layer` shadow is wrong. If a row in the loop body
+  destructures a `layer` field that should be `__layer`-driven
+  but isn't — e.g. an `Impl::interpreter_arm` body that
+  references `layer` AFTER the `let layer: u32 = __layer;`
+  shadow but ALSO has its own destructure-shadow inside an inner
+  scope — the iteration counter would be ignored.
+- Coloring puts two live tensors on the same slot. If a kernel
+  reads its input AFTER the runtime starts writing its output,
+  the new write would clobber the read. Most kernels read
+  fully-then-write but some may not.
+
+Reproduce / triage steps:
+1. `cargo expand -p ferrite-model-llama --lib --features cuda
+   > /tmp/llama.rs` and find the `llama_3_2_3b` module's
+   `__dispatch_one`. Inspect the `Op::Gemm` / `Op::CutlassGemv`
+   arm bodies for `K=8192, N=5120` — that should NOT be a Llama
+   3.2 3B GEMM. If it appears, the Vec accessor lookup is wrong.
+2. Diff `Weights::load_with` for `llama_3_2_3b` between this
+   branch and `ferrite-forward` (the pre-pivot branch) — focus
+   on the `(0..N).map(|layer| …)` Vec builds. The format-string
+   templates are computed by `layer_templated_prefix_expr` (in
+   `crates/ferrite-forward-macro/src/codegen.rs`); ensure
+   `model.layers.{}.<joined>` substitutes the closure's
+   `layer: u32` and not some captured loop variable.
+3. Add `print-weight-layout` instrumentation: at the top of
+   `LinearLayer::forward`, log `(in.shape, weight.shape)` to a
+   trace stream. Run `vllm chat` and compare against the
+   hand-written `vllm-cuda` reference's log for the same prompt
+   step.
+4. Bisect: revert this branch's commits one at a time and re-run
+   `vllm chat`. The Vec compression commit (`3313f8fdd`) is the
+   most likely culprit; the per-bucket helper commit
+   (`5275d036a`) and the `as_view` relaxation (`579d0644d`)
+   are the next-likeliest.
+
+The interpreter design changes runtime behavior in subtle ways
+and any of these is a plausible source:
 
 - Slot reuse via coloring. If any kernel reads its input AFTER
   starting to write its output (atypical), color sharing could
@@ -243,8 +348,27 @@ The interpreter design changes runtime behavior in subtle ways:
   the alias prelude in the expanded output runs before any Op
   that reads the aliased slot. (Should be fine — aliases are
   prepended in `lower_bucket`.)
+- Vec compression (new on this branch) — `Weights::input_layernorm`
+  is now `Vec<RmsNorm>` indexed by `layer as usize`. The
+  `(0..N).map` builder runs at load time; off-by-one in the
+  format-string template would mis-load layer weights. Verify
+  `safetensors_prefix(program, id, Some(L))` for L=0..N-1
+  produces the same on-disk paths the runtime reads.
 
-### 6. Open warnings / cleanup
+### 6. Goldens
+
+After §5 is fixed, run:
+
+```
+cargo test --release --test e_correctness -p vllm-e2e \
+    --features e2e,cuda -- --ignored --test-threads=1
+```
+
+Llama subset first; match must be exact. Then Qwen2 / Qwen3 /
+Mistral / Phi3 / Gemma2 / Gemma3 / Granite / CommandR / DeepSeek-V2
+/ DeepSeek-V3.
+
+### 7. Open warnings / cleanup
 
 - `_protected: &HashSet<(TileId, u8)>` unused arg in `lower_bucket`
   signature. Either remove (callers update) or keep as
@@ -257,7 +381,7 @@ The interpreter design changes runtime behavior in subtle ways:
   `add_rmsnorm_pairs_claimed_as_fused_subgraph`) unchanged. Not in
   scope.
 
-### 7. Optional follow-ups
+### 8. Optional follow-ups
 
 - **Arena-backed `__tiles`.** With coloring, slot count is small
   (~10–20 for commandr) and bounded per arch. Replace `Vec<Option<

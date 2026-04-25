@@ -741,23 +741,18 @@ impl ArchOpcodes {
         let arms = self.by_name.values().map(|(shape, body)| {
             let var = &shape.name;
             let pat = variant_pattern(shape);
-            // After the destructure pattern binds the variant's
-            // fields, re-bind `layer` to the interpreter's
-            // `__layer` argument. Inside `Op::Loop` body, `__layer`
-            // is the iteration counter (0..count), and arm bodies
-            // expect `layer` to mean "current iteration index" so
-            // expressions like `(weight_fn)(wm, layer)` and
-            // `ctx.kv_cache.k_cache(layer as usize)` resolve to the
-            // right per-iteration weight / cache slot. Outside the
-            // loop, `__layer = 0` and any variant that doesn't
-            // carry a `layer` field gets a `layer = 0` binding for
-            // body code that references it. The destructured
-            // `_layer_unused` is intentional: prevents the row's
-            // literal layer value from shadowing `__layer`.
+            // Per-arm `let layer: u32 = __layer;` is the bridge
+            // from `Op::Loop`'s iteration counter to arm bodies.
+            // For variants whose `OpcodeShape` has a `layer:`
+            // field, the destructure pattern would otherwise bind
+            // `layer` to the (zeroed-by-apply_loop_compression)
+            // row literal; this shadow overrides with the runtime
+            // iteration index. Variants without a `layer:` field
+            // are unaffected — the binding is just unused
+            // (suppressed by the fn's `unused_variables` allow).
             quote! {
                 #enum_ident::#var #pat => {
                     let layer: u32 = __layer;
-                    let _ = layer;
                     #body
                 }
             }
@@ -777,15 +772,6 @@ impl ArchOpcodes {
                 ctx: &::ferrite_forward::ForwardCtx,
                 device: &mut ::ferrite_cuda_core::device::GpuDevice,
             ) {
-                // `layer` is the universal binding any arm body can
-                // refer to. For Impl-driven variants that carry a
-                // `layer:` field, the destructure pattern shadows
-                // this with the per-row literal; for variants where
-                // arch-wide-extraction or `Op::Loop` made `layer`
-                // come from the iteration index, the body sees
-                // `__layer`.
-                let layer: u32 = __layer;
-                let _ = layer;
                 match __op {
                     #(#arms,)*
                     #enum_ident::Alias(dst, src) => {
@@ -1780,7 +1766,7 @@ mod tests {
         let mut ops = ArchOpcodes::new();
         ops.register(
             OpcodeShape::new("AttnNorm", vec![("layer", syn::parse_quote!(u32))]),
-            quote! { let _ = layer; },
+            quote! {},
         );
         let enum_ident = format_ident!("LlamaOp");
         let helper_ident = format_ident!("__llama_interpret");
@@ -1797,6 +1783,60 @@ mod tests {
         // No unsafe transmute / from_wire.
         assert!(!ts.contains("transmute"));
         assert!(!ts.contains("from_wire"));
+    }
+
+    /// `__dispatch_one` emits exactly ONE `let layer: u32 = __layer;`
+    /// per arm and ZERO `let _ = layer;` lines. The unused-warning
+    /// suppression is handled by the fn-level
+    /// `#[allow(unused_variables)]`, so the `let _ = layer;` line
+    /// the prior emit added per-arm + once at the fn top is pure
+    /// expansion bloat (~3 lines × N arms × N model variants on
+    /// llama).
+    #[test]
+    fn arch_interpreter_drops_layer_drop_lines() {
+        let mut ops = ArchOpcodes::new();
+        ops.register(
+            OpcodeShape::new("AttnNorm", vec![("layer", syn::parse_quote!(u32))]),
+            quote! {},
+        );
+        ops.register(
+            OpcodeShape::new("Add", vec![("a_slot", syn::parse_quote!(u32))]),
+            quote! {},
+        );
+        let enum_ident = format_ident!("LlamaOp");
+        let helper_ident = format_ident!("__llama_interpret");
+        let ts = ops.emit_interpreter(&helper_ident, &enum_ident).to_string();
+        // Per-arm `let layer: u32 = __layer;` shadow MUST stay —
+        // it's the bridge from Op::Loop's iteration counter to arm
+        // bodies. 2 registered variants → at least 2 occurrences.
+        let shadow_count = ts.matches("let layer : u32 = __layer ;").count();
+        assert!(
+            shadow_count >= 2,
+            "expected one `let layer = __layer;` shadow per arm, got {shadow_count}"
+        );
+        // No `let _ = layer;` lines anywhere — the fn's
+        // `#[allow(unused_variables)]` already suppresses warnings.
+        assert!(
+            !ts.contains("let _ = layer ;"),
+            "expansion contains redundant `let _ = layer;` lines"
+        );
+        // The fn-top redundant `let layer = __layer; let _ = layer;`
+        // is gone — match opens directly. Approximate by checking the
+        // fn body opens `match __op`.
+        assert!(ts.contains("__layer : u32 , __tiles"));
+        // Find what comes immediately after the fn signature's
+        // closing brace + opening body brace `{`. Should be
+        // `match __op {` not `let layer ...`.
+        let after_open = ts
+            .split_once(", ) { ")
+            .or_else(|| ts.split_once(") { "))
+            .map(|(_, rhs)| rhs)
+            .unwrap_or(&ts);
+        assert!(
+            after_open.starts_with("match __op {"),
+            "fn body must open with `match __op`, got: {}",
+            &after_open[..after_open.len().min(80)],
+        );
     }
 
     /// Registering the same variant ident with structurally

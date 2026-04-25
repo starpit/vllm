@@ -131,6 +131,43 @@ pub fn tile_ref(tiles: &[Option<TileEntry>], idx: u32) -> &TileEntry {
         .unwrap_or_else(|| panic!("tile slot {idx} read before write or after free"))
 }
 
+/// Move the `OwnedTensor` out of slot `idx`, leaving the slot
+/// empty. Used by interpreter arms whose kernel consumes its
+/// upstream — in-place mutators like `scale_inplace`,
+/// `tanh_softcap_inplace`, `fused_add_rms_norm_inplace` mutate
+/// the upstream buffer and rebind it as the kernel's output.
+/// The codegen drop-pass already excludes consumed upstreams
+/// from `Free` instructions (see
+/// `Implementation::consumes_input_tiles`), so this is the
+/// runtime mirror: the consume pattern is "take, mutate,
+/// reinsert".
+///
+/// Panics if the slot is empty (programming error: the consume
+/// declaration should have ensured the upstream is alive at
+/// this point) or holds a `View` (an aliased entry doesn't own
+/// its storage; in-place consume requires actual ownership).
+#[inline]
+pub fn take_owned(tiles: &mut [Option<TileEntry>], idx: u32) -> OwnedTensor {
+    match tiles[idx as usize].take() {
+        Some(TileEntry::Owned(t)) => t,
+        Some(TileEntry::View { ref_slot }) => {
+            // Put it back so the panic message can reflect the
+            // pre-take state — the slot must be Owned for
+            // consume to be sound.
+            tiles[idx as usize] = Some(TileEntry::View { ref_slot });
+            panic!(
+                "tile slot {idx} is a View (ref_slot={ref_slot}) but consume \
+                 requires Owned — Impl::consumes_input_tiles must only point \
+                 at slots whose producer wrote `TileEntry::Owned`"
+            );
+        }
+        None => panic!(
+            "tile slot {idx} consumed but empty — drop-pass invariant \
+             violated (consumed slot must outlive its consumer)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Tests for the table semantics belong with a real OwnedTensor

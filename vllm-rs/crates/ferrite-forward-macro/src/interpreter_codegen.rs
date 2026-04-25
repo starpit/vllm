@@ -725,22 +725,8 @@ impl ArchOpcodes {
         let free_variant = variant_decl(&free_variant_shape());
         let loop_variant = variant_decl(&loop_variant_shape());
         quote! {
-            /// Macro-codegened opcode enum. Variants come from the
-            /// Impls the solver picked for this arch. `Free` is
-            /// always present — emitted by the drop pass.
-            ///
-            /// The match in the per-arch interpreter is closed and
-            /// exhaustive over this enum. Only `Copy` is derived —
-            /// the interpreter matches by value (`match *__op`); we
-            /// don't print or clone Op values, and dropping Debug
-            /// avoids per-arch `impl ::core::fmt::Debug for Op {…}`
-            /// boilerplate from cargo-expand.
-            ///
-            /// `Clone` is hand-impl'd as `*self` (Copy types have a
-            /// trivial Clone). The `#[derive(Clone)]` expansion
-            /// would otherwise be ~60 lines of `let _:
-            /// AssertParamIsClone<…>;` per variant — pure
-            /// cargo-expand bloat with no runtime effect.
+            /// Per-arch opcode enum. Variants from solver-picked Impls;
+            /// `Alias` / `Free` / `Loop` always present.
             #[derive(Copy)]
             #[allow(non_camel_case_types, dead_code)]
             pub enum #enum_ident {
@@ -873,9 +859,7 @@ impl ArchOpcodes {
             }
         });
         quote! {
-            /// Dispatch a single op. Reads the per-arm body the
-            /// Impl declared via `interpreter_arm`. `__layer` is
-            /// the loop iteration index when called from inside an
+            /// Dispatch one op. `__layer` = loop iter index inside
             /// `Op::Loop`, else 0.
             #[cfg(feature = "cuda")]
             #[allow(clippy::too_many_arguments, unused_unsafe, unused_variables)]
@@ -887,12 +871,6 @@ impl ArchOpcodes {
                 ctx: &::ferrite_forward::ForwardCtx,
                 device: &mut ::ferrite_cuda_core::device::GpuDevice,
             ) {
-                // Fn-scope shared prelude: extracted constants that
-                // appear (with identical type + value) in 2+ arms.
-                // Lifted ONCE here so each arm just references the
-                // binding by name; without this lift, every arm
-                // re-emits the same `let cos_sin_fn = …;`-style
-                // line and cargo expand picks up the duplicates.
                 #(#shared_lets)*
                 match __op {
                     #(#arms,)*
@@ -903,16 +881,13 @@ impl ArchOpcodes {
                         __tiles[slot as usize] = None;
                     }
                     #enum_ident::Loop(_, _) => {
-                        // Loop is driver-handled — never reaches dispatch.
                         unsafe { ::core::hint::unreachable_unchecked() }
                     }
                 }
             }
 
-            /// Driver loop. Walks `__ops` linearly except for
-            /// `Op::Loop(count, body_len)` which re-runs the next
-            /// `body_len` ops `count` times with `__layer` set to
-            /// the iteration index.
+            /// Driver. `Op::Loop(count, body_len)` re-runs the next
+            /// `body_len` ops `count` times via `__dispatch_one`.
             #[cfg(feature = "cuda")]
             #[allow(clippy::too_many_arguments)]
             unsafe fn #helper_ident(

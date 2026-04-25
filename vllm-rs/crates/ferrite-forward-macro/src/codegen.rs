@@ -1108,13 +1108,8 @@ fn emit_fingerprint_check(
     };
 
     quote! {
-        /// Return `true` iff the tensors in `gw` match this
-        /// variant's compile-time fingerprint. See
-        /// `emit_fingerprint_check` in the macro for the rules.
-        /// Emitted as a free fn (not `Weights::fingerprint_matches`
-        /// method) so shim variants can alias `Weights` to a
-        /// canonical sibling while still carrying a variant-
-        /// specific fingerprint check.
+        /// Per-variant compile-time fingerprint check. See
+        /// macro's `emit_fingerprint_check` for the rules.
         #[cfg(feature = "cuda")]
         pub fn fingerprint_matches(
             gw: &::ferrite_cuda_core::weights::GpuWeights,
@@ -1903,9 +1898,8 @@ fn emit_weights_struct(
     // Struct definition vs type alias per emit mode.
     let weights_def: TokenStream = match &mode {
         WeightsEmitMode::Canonical => quote! {
-            /// Every weight the emitted forward needs, already
-            /// packed exactly how the solver-picked Impls want to
-            /// see it. Construct via the sibling free `load` fn.
+            /// Every weight the forward needs, packed for the
+            /// solver-picked Impls. Construct via `load`.
             #[cfg(feature = "cuda")]
             pub struct Weights {
                 #(#fields)*
@@ -1914,15 +1908,7 @@ fn emit_weights_struct(
             }
         },
         WeightsEmitMode::Shim { canonical } => quote! {
-            /// This variant's emitted forward + load bodies are
-            /// byte-identical to the canonical sibling's (same
-            /// solver-picked `Impl` set → same emit, and Marlin
-            /// quant format threads through at runtime via
-            /// `load_with`'s `marlin_storage` param). We share
-            /// the canonical's `Weights` via type alias; per-
-            /// variant state is just `load` (a one-liner
-            /// calling `canonical::load_with(MY_MARLIN_FORMAT)`)
-            /// and `fingerprint_matches`.
+            /// Shim — shares canonical sibling's `Weights`.
             #[cfg(feature = "cuda")]
             pub type Weights = super::#canonical::Weights;
         },
@@ -1952,13 +1938,8 @@ fn emit_weights_struct(
 
             #fingerprint_method
 
-            /// Read every field from an open `GpuWeights` (a
-            /// safetensors view). The canonical per-equivalence-
-            /// class load body, parameterized on
-            /// `marlin_storage` so AWQ/GPTQ/CT variants share
-            /// one compiled copy. Non-Marlin equivalence classes
-            /// ignore the param; it's still threaded for uniform
-            /// signature across `load_with` across archs.
+            /// Canonical load body. `marlin_storage` lets AWQ/GPTQ/CT
+            /// variants share one compiled copy; ignored elsewhere.
             #[cfg(feature = "cuda")]
             #[allow(clippy::too_many_lines, clippy::not_unsafe_ptr_arg_deref, unused_variables)]
             pub fn load_with(
@@ -1981,10 +1962,7 @@ fn emit_weights_struct(
                 })
             }
 
-            /// Variant-facing entry point. Threads this compiled
-            /// variant's `MarlinFormat` into the shared
-            /// `load_with` body. rustc inlines this wrapper
-            /// trivially; no codegen overhead.
+            /// Variant entry — threads this variant's MarlinFormat.
             #[cfg(feature = "cuda")]
             #[inline]
             #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -2001,12 +1979,7 @@ fn emit_weights_struct(
 
             #fingerprint_method
 
-            /// Shim loader — single-line call-through to the
-            /// canonical sibling's `load_with` with this
-            /// variant's `MarlinFormat` threaded in. No body
-            /// emit; rustc compiles the canonical's `load_with`
-            /// once and every shim in the equivalence class
-            /// shares it.
+            /// Shim — delegates to canonical's `load_with`.
             #[cfg(feature = "cuda")]
             #[inline]
             #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -3444,13 +3417,7 @@ pub fn emit_model(
         #(#bucket_fns)*
         #(#backbone_fns)*
 
-        /// Dispatch on `(num_tokens, sk_bucket)`. Outer match is on
-        /// `num_tokens`; inner match (when the model's `#[forward]`
-        /// declared `sk_buckets`) picks the kernel specialized for
-        /// the current KV-cache span. Runtime points that don't
-        /// exactly equal a compiled point get the specialization for
-        /// the largest compiled bucket ≤ runtime — correct (kernels
-        /// work at any value) if potentially suboptimal for cost.
+        /// Dispatch on (num_tokens, sk_bucket) → bucket fn.
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
@@ -3465,8 +3432,7 @@ pub fn emit_model(
             }
         }
 
-        /// Backbone-only dispatch (no lm_head). Same 2-axis
-        /// dispatch structure as [`forward`].
+        /// Backbone-only dispatch (no lm_head).
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_backbone(

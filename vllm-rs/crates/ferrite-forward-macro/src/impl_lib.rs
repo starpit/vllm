@@ -1823,12 +1823,17 @@ impl Implementation for ReshapeRefImpl {
     }
 
     fn interpreter_arm(&self, _model: &ModelParams) -> TokenStream {
+        // `ndim: u8`, `dims_nt_pow: [u8; MAX_DIMS]`, `dims_lit: [u32;
+        // MAX_DIMS]` are all by-value primitives (the variant is
+        // `#[derive(Copy)]`, the destructure pattern binds by value,
+        // and the extracted-prelude path also lands them as values).
+        // No `*` deref — `as usize` directly.
         quote! {
             let __upstream = ::ferrite_forward::tile_ref(__tiles, in_slot)
                 .as_gpu_tensor(__tiles);
             let __nt = (*ctx.input_ids).dim(0);
             let mut __shape = [0usize; ::ferrite_cuda_core::tensor::MAX_DIMS];
-            let __ndim = *ndim as usize;
+            let __ndim = ndim as usize;
             for __i in 0..__ndim {
                 let mut __d = dims_lit[__i] as usize;
                 for _ in 0..(dims_nt_pow[__i] as usize) {

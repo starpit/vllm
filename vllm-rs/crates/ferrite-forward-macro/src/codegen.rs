@@ -1279,13 +1279,25 @@ fn emit_weights_struct(
 
     let fields: Vec<TokenStream> = groups
         .iter()
-        .map(|g| {
-            let name = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
+        .flat_map(|g| {
             let ty = &g.rust_type;
-            if g.layered {
-                quote! { pub #name: ::std::vec::Vec<#ty>, }
-            } else {
-                quote! { pub #name: #ty, }
+            match g.kind {
+                AccessorGroupKind::Unindexed => {
+                    let name = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
+                    vec![quote! { pub #name: #ty, }]
+                }
+                AccessorGroupKind::LayeredContiguous => {
+                    let name = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
+                    vec![quote! { pub #name: ::std::vec::Vec<#ty>, }]
+                }
+                AccessorGroupKind::LayeredSparse => g
+                    .entries
+                    .iter()
+                    .map(|(_, acc)| {
+                        let n = &acc.name;
+                        quote! { pub #n: #ty, }
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -1511,10 +1523,20 @@ fn emit_weights_struct(
     };
 
     // `Self { a, b, c }` shorthand — fields are the just-bound
-    // locals (one per group, layered groups bound as `Vec<T>`).
+    // locals. Unindexed and Vec-compressed groups contribute one
+    // ident (the base name); sparse-layered groups contribute one
+    // ident per per-layer accessor (matching the per-layer fields
+    // in the struct + the per-layer let bindings in the body).
     let field_shorthand: Vec<syn::Ident> = groups
         .iter()
-        .map(|g| syn::Ident::new(&g.base, proc_macro2::Span::call_site()))
+        .flat_map(|g| match g.kind {
+            AccessorGroupKind::Unindexed | AccessorGroupKind::LayeredContiguous => {
+                vec![syn::Ident::new(&g.base, proc_macro2::Span::call_site())]
+            }
+            AccessorGroupKind::LayeredSparse => {
+                g.entries.iter().map(|(_, acc)| acc.name.clone()).collect()
+            }
+        })
         .collect();
     let fingerprint_method = emit_fingerprint_check(model, manifest);
 
@@ -2017,48 +2039,62 @@ pub(crate) fn split_base_layer(field_name: &str) -> (String, Option<u64>) {
     (field_name.to_string(), None)
 }
 
-/// One row in the per-arch `Weights` shape: either a single
-/// arch-wide field (`embed_tokens`, `lm_head`, the final norm) or a
-/// per-layer family compressed into a single `Vec<T>` field. The
-/// field/struct emit, the `impl Weights` accessor methods, and the
-/// `load_with` body all walk the same group list so they stay in
-/// sync — one Vec field, one slice-indexing accessor, one Vec-build
-/// per layered base.
+/// One row in the per-arch `Weights` shape. The field/struct emit,
+/// the `impl Weights` accessor methods, and the `load_with` body
+/// all walk the same group list so they stay in sync.
 pub(crate) struct AccessorGroup<'a> {
     /// Field name on `Weights` — the accessor's stem with the
     /// `_<layer>` suffix stripped. Stays a plain `String` because
     /// callers also need it as a runtime format-string fragment.
     pub base: String,
-    /// Shared element type. For layered groups this is the `T` in
-    /// `Vec<T>`; for unindexed it's the field type as-is.
+    /// Shared element type. For Vec-compressed layered groups this
+    /// is the `T` in `Vec<T>`; for unindexed and sparse-layered
+    /// groups it's the field type as-is.
     pub rust_type: TokenStream,
-    /// `true` ⇒ field is `Vec<T>`, accessor method is
-    /// `&self.<base>[layer as usize]`, load body emits a Vec-build.
-    /// `false` ⇒ field is `T`, accessor method ignores its `layer`
-    /// arg, load body keeps the existing per-FieldLoad let.
-    pub layered: bool,
-    /// `entries[i].0`: layer index. `Some(i)` for layered groups,
-    /// always `None` for unindexed. Layered groups are guaranteed
-    /// to occupy layers `0..entries.len()` contiguously — the load
-    /// body relies on this so `(0..N).map(...).collect()` rebuilds
-    /// the same per-layer entries the prior per-layer-let codegen
-    /// produced.
+    /// What shape this group lowers to.
+    pub kind: AccessorGroupKind,
+    /// `entries[i].0`: layer index. For `LayeredContiguous`,
+    /// entries are sorted by layer and occupy `0..entries.len()`
+    /// contiguously (the Vec-build relies on this). For
+    /// `Unindexed`, a single entry with `None`. For `LayeredSparse`,
+    /// entries are sorted by layer but may have gaps or start at
+    /// `layer > 0` — the per-layer fallback handles either case.
     pub entries: Vec<(Option<u64>, &'a WeightAccessor)>,
 }
 
-/// Group `accessors` by their `(base, layer)` split. Layered
-/// groups (every entry's name ends in `_<digits>` under the same
-/// stem) collapse into one `AccessorGroup { layered: true }` whose
-/// `entries` are sorted by layer index and required to be
-/// contiguous from 0 to N-1. Unindexed accessors (no trailing
-/// `_<digits>`) become single-entry layered=false groups.
+/// How an [`AccessorGroup`] is lowered. The Vec-compressed path is
+/// only safe when the layered group fills `Vec[0..N]` contiguously;
+/// real-world archs with conditional-per-layer accessors (e.g.
+/// DeepSeek-V2's `moe` is layers 1..N — layer 0 is dense FFN) take
+/// the legacy per-layer-fields fallback.
+pub(crate) enum AccessorGroupKind {
+    /// Single field, no layer arg. Field type is `T`. Accessor
+    /// method ignores its `layer` arg and returns `&self.<base>`.
+    Unindexed,
+    /// Layered family that occupies `Vec[0..N]` contiguously.
+    /// Field type is `Vec<T>`. Accessor method is
+    /// `&self.<base>[layer as usize]`. Load body emits one
+    /// `(0..N).map(|layer| …).collect()`.
+    LayeredContiguous,
+    /// Layered family with gaps or non-zero start (e.g. layers
+    /// 1..N only). Per-layer fields `pub <base>_<L>: T` are
+    /// emitted; accessor method is a `match layer { L => &self.<base>_<L>, … }`.
+    /// Load body emits one `let <base>_<L> = …;` per entry.
+    LayeredSparse,
+}
+
+/// Group `accessors` by their `(base, layer)` split.
+///
+/// Outcomes:
+/// - Single unindexed accessor → `AccessorGroup { kind: Unindexed }`.
+/// - Layered family covering `0..N` contiguously →
+///   `AccessorGroup { kind: LayeredContiguous }` (Vec compression).
+/// - Layered family with gaps or non-zero start →
+///   `AccessorGroup { kind: LayeredSparse }` (per-layer fallback).
 ///
 /// Panics on:
 /// - a base mixing layered and unindexed entries;
-/// - a base whose entries declare conflicting `rust_type`s;
-/// - a base whose layered entries skip an index (e.g. only
-///   layers 0/1/3 — codegen has no defined behavior for sparse
-///   per-layer fields).
+/// - a base whose entries declare conflicting `rust_type`s.
 pub(crate) fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<AccessorGroup<'_>> {
     use std::collections::BTreeMap;
 
@@ -2109,37 +2145,32 @@ pub(crate) fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<Acces
                 (Some(acc), true) => AccessorGroup {
                     base,
                     rust_type: bucket.rust_type,
-                    layered: false,
+                    kind: AccessorGroupKind::Unindexed,
                     entries: vec![(None, acc)],
                 },
                 (None, false) => {
-                    // Contiguity check: layered entries must occupy
-                    // layers 0..N. Sparse layered groups have no
-                    // defined Vec-build shape; reject at codegen.
-                    let n = bucket.layered_entries.len() as u64;
                     let layers: Vec<u64> = bucket.layered_entries.keys().copied().collect();
-                    if layers.first().copied() != Some(0) {
-                        panic!(
-                            "Weights accessor base `{base}` layered entries don't start at \
-                             layer 0 (first layer = {:?})",
-                            layers.first(),
-                        );
-                    }
-                    for (i, l) in layers.iter().enumerate() {
-                        if *l != i as u64 {
-                            panic!(
-                                "Weights accessor base `{base}` layered entries are not \
-                                 contiguous: expected layer {i}, found {l}",
-                            );
-                        }
-                    }
-                    let entries: Vec<(Option<u64>, &WeightAccessor)> = (0..n)
-                        .map(|l| (Some(l), bucket.layered_entries[&l]))
+                    let starts_at_zero = layers.first().copied() == Some(0);
+                    let contiguous = layers.iter().enumerate().all(|(i, l)| *l == i as u64);
+                    let kind = if starts_at_zero && contiguous {
+                        AccessorGroupKind::LayeredContiguous
+                    } else {
+                        // Real-world examples: DeepSeek MoE (layers
+                        // 1..N), per-window-size attention overrides,
+                        // any future per-layer-conditional accessor.
+                        // Keep the legacy `match layer { … }` shape so
+                        // these compile without forcing a Vec
+                        // representation that doesn't fit.
+                        AccessorGroupKind::LayeredSparse
+                    };
+                    let entries: Vec<(Option<u64>, &WeightAccessor)> = layers
+                        .iter()
+                        .map(|l| (Some(*l), bucket.layered_entries[l]))
                         .collect();
                     AccessorGroup {
                         base,
                         rust_type: bucket.rust_type,
-                        layered: true,
+                        kind,
                         entries,
                     }
                 }
@@ -2407,63 +2438,79 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad) -> TokenStream {
     }
 }
 
-/// Emit the let-binding for one [`AccessorGroup`]. Layered
-/// groups become a single `let <base>: Vec<T> = (0..N).map(|layer|
-/// { … }).collect()?;`. Unindexed groups defer to
-/// [`emit_unindexed_let`].
+/// Emit the let-binding(s) for one [`AccessorGroup`].
 ///
-/// All entries in a layered group share the same `FieldLoad`
-/// shape (modulo the layer-substituted prefixes), so we plan
-/// from the layer-0 accessor and derive the per-iteration body
-/// via [`emit_layered_load_body`]. `plans` is the lookup the
-/// caller passed in; reading the FieldLoad here keeps `model` /
-/// `manifest` plumbing local to `emit_weights_struct`.
+/// - `Unindexed` → one `let <base> = <load_call>;` (delegates to
+///   [`emit_unindexed_let`]).
+/// - `LayeredContiguous` → one `let <base>: Vec<T> = (0..N).map(|layer|
+///   { … }).collect()?;`. The per-iteration body comes from
+///   [`emit_layered_load_body`], which rewrites the layer-0-baked
+///   prefix(es) into runtime `format!()` calls.
+/// - `LayeredSparse` → one `let <base>_<L> = …;` per entry — same
+///   shape as the legacy pre-Vec-compression let chain. Used when
+///   the layered family has gaps or doesn't start at layer 0
+///   (e.g. DeepSeek MoE on layers 1..N), since `Vec[layer as usize]`
+///   would be off-by-one without an offset.
 fn emit_group_let(
     group: &AccessorGroup<'_>,
     plans: &std::collections::BTreeMap<String, &FieldLoad>,
     model: &ModelParams,
 ) -> TokenStream {
-    let base_ident = syn::Ident::new(&group.base, proc_macro2::Span::call_site());
-    if !group.layered {
-        let acc = group.entries[0].1;
-        let plan = plans
-            .get(&acc.name.to_string())
-            .copied()
-            .expect("unindexed accessor missing from plan map");
-        return emit_unindexed_let(&base_ident, plan);
-    }
-
-    // Plan from the first entry (layer 0). All layered entries
-    // share this plan modulo prefix; emit_layered_load_body
-    // rewrites the baked layer-0 prefix(es) into runtime
-    // format!() calls that reference the closure's `layer: u32`.
-    let l0 = group.entries[0].1;
-    let plan = plans
-        .get(&l0.name.to_string())
-        .copied()
-        .expect("layered group's layer-0 accessor missing from plan map");
-    let body = emit_layered_load_body(plan);
-    let ty = &group.rust_type;
-    let n_layers = group.entries.len();
-    let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers as u32);
-    // `num_hidden_layers` from model.bounds is the source of truth
-    // for the layered-group length on transformer archs; we assert
-    // they agree so a stale group (e.g. accessor that fell out of
-    // a kernel migration) fails loudly at codegen time rather than
-    // silently producing the wrong-shaped Vec.
-    if let Some(declared) = model.bounds.get("num_hidden_layers")
-        && (*declared as usize) != n_layers
-    {
-        panic!(
-            "model `{}`: layered accessor base `{}` has {} entries but \
-             num_hidden_layers = {} — accessor + config disagree",
-            model.source_stem, group.base, n_layers, declared,
-        );
-    }
-    quote! {
-        let #base_ident: ::std::vec::Vec<#ty> = (0u32..#n_lit)
-            .map(|layer: u32| -> ::anyhow::Result<#ty> { #body })
-            .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?;
+    match group.kind {
+        AccessorGroupKind::Unindexed => {
+            let base_ident = syn::Ident::new(&group.base, proc_macro2::Span::call_site());
+            let acc = group.entries[0].1;
+            let plan = plans
+                .get(&acc.name.to_string())
+                .copied()
+                .expect("unindexed accessor missing from plan map");
+            emit_unindexed_let(&base_ident, plan)
+        }
+        AccessorGroupKind::LayeredSparse => {
+            // Each entry keeps its per-layer field name and gets
+            // its own per-FieldLoad let — same as the pre-grouping
+            // codegen. Order follows `entries`'s sort by layer
+            // index.
+            let lets: Vec<TokenStream> = group
+                .entries
+                .iter()
+                .map(|(_, acc)| {
+                    let plan = plans
+                        .get(&acc.name.to_string())
+                        .copied()
+                        .expect("sparse-layered accessor missing from plan map");
+                    emit_unindexed_let(&acc.name, plan)
+                })
+                .collect();
+            quote! { #(#lets)* }
+        }
+        AccessorGroupKind::LayeredContiguous => {
+            let base_ident = syn::Ident::new(&group.base, proc_macro2::Span::call_site());
+            // Plan from the first entry (layer 0). All entries share
+            // this plan modulo prefix; emit_layered_load_body rewrites
+            // the layer-0-baked prefix(es) into runtime format!() calls.
+            let l0 = group.entries[0].1;
+            let plan = plans
+                .get(&l0.name.to_string())
+                .copied()
+                .expect("layered group's layer-0 accessor missing from plan map");
+            let body = emit_layered_load_body(plan);
+            let ty = &group.rust_type;
+            let n_layers = group.entries.len();
+            let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers as u32);
+            // `n_layers` may be less than `num_hidden_layers` — a
+            // contiguous-from-zero group can be partial (e.g.
+            // DeepSeek's `mlp_down_proj` is layer 0 only; layers 1..N
+            // use `moe` instead). The Vec is sized to entries.len(),
+            // and the static-slice rows only ever index 0..n_layers,
+            // so partial coverage is fine.
+            let _ = model;
+            quote! {
+                let #base_ident: ::std::vec::Vec<#ty> = (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<#ty> { #body })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?;
+            }
+        }
     }
 }
 
@@ -2708,8 +2755,8 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
         .map(|g| {
             let base_ident = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
             let ty = &g.rust_type;
-            if g.layered {
-                quote! {
+            match g.kind {
+                AccessorGroupKind::LayeredContiguous => quote! {
                     #[cfg(feature = "cuda")]
                     #[inline]
                     #[allow(dead_code)]
@@ -2722,14 +2769,43 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
                         // iterates 0..num_hidden_layers.
                         unsafe { self.#base_ident.get_unchecked(layer as usize) }
                     }
-                }
-            } else {
-                quote! {
+                },
+                AccessorGroupKind::Unindexed => quote! {
                     #[cfg(feature = "cuda")]
                     #[inline]
                     #[allow(dead_code)]
                     pub fn #base_ident(&self, _layer: u32) -> &#ty {
                         &self.#base_ident
+                    }
+                },
+                AccessorGroupKind::LayeredSparse => {
+                    // Per-layer fields → match arms. Same shape as
+                    // the legacy emit; codegen-issued static rows
+                    // only ever pass layers that exist (guaranteed
+                    // by fan_out's per-claim layer plumbing), so
+                    // `unreachable_unchecked()` on non-emitted
+                    // layers is safe.
+                    let arms: Vec<TokenStream> = g
+                        .entries
+                        .iter()
+                        .map(|(layer, acc)| {
+                            let layer_lit = proc_macro2::Literal::u32_unsuffixed(
+                                layer.expect("LayeredSparse entry has Some(layer)") as u32,
+                            );
+                            let fname = &acc.name;
+                            quote! { #layer_lit => &self.#fname, }
+                        })
+                        .collect();
+                    quote! {
+                        #[cfg(feature = "cuda")]
+                        #[inline]
+                        #[allow(dead_code)]
+                        pub fn #base_ident(&self, layer: u32) -> &#ty {
+                            match layer {
+                                #(#arms)*
+                                _ => unsafe { ::core::hint::unreachable_unchecked() },
+                            }
+                        }
                     }
                 }
             }
@@ -3690,7 +3766,10 @@ mod tests {
         assert_eq!(groups.len(), 1, "all 4 layers share one base group");
         let g = &groups[0];
         assert_eq!(g.base, "input_layernorm");
-        assert!(g.layered, "all entries are indexed → layered=true");
+        assert!(
+            matches!(g.kind, AccessorGroupKind::LayeredContiguous),
+            "all entries are indexed and start at layer 0 → LayeredContiguous"
+        );
         assert_eq!(g.entries.len(), 4);
         for (i, (layer_opt, _acc)) in g.entries.iter().enumerate() {
             assert_eq!(*layer_opt, Some(i as u64), "contiguous layers 0..N");
@@ -3708,7 +3787,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         let g = &groups[0];
         assert_eq!(g.base, "embed_tokens");
-        assert!(!g.layered);
+        assert!(matches!(g.kind, AccessorGroupKind::Unindexed));
         assert_eq!(g.entries.len(), 1);
         assert_eq!(g.entries[0].0, None);
     }
@@ -3764,23 +3843,68 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not contiguous")]
-    fn group_accessors_panics_on_sparse_layered_group() {
-        // Sparse layered groups (skipping a layer index) have no
-        // defined Vec-build shape — slot `i` of the Vec needs
-        // entry `i`. Codegen must reject at expansion time.
+    fn group_accessors_sparse_layered_falls_back_to_per_layer_fields() {
+        // Layered group with a gap (layers 0 and 2, missing 1) →
+        // LayeredSparse, not a Vec. Real-world archs hit sparse
+        // layouts (DeepSeek MoE on layers 1..N, future per-window-
+        // size attention overrides), so codegen must accept them
+        // and emit per-layer fields + match-arm accessors.
         let accs = vec![ln_acc(Some(0)), ln_acc(Some(2))];
-        let _ = group_accessors_by_base(&accs);
+        let groups = group_accessors_by_base(&accs);
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert!(matches!(g.kind, AccessorGroupKind::LayeredSparse));
+        // Entries preserve the layer indices the group originally
+        // had — no padding/None at the gap.
+        assert_eq!(
+            g.entries.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![Some(0u64), Some(2u64)]
+        );
     }
 
     #[test]
-    #[should_panic(expected = "don't start at layer 0")]
-    fn group_accessors_panics_when_first_layer_is_not_zero() {
-        // A layered group whose lowest index is N>0 doesn't fill
-        // Vec slots 0..N — the slice index would be off by N at every
-        // accessor call. Reject at codegen.
+    fn group_accessors_layered_starting_above_zero_is_sparse() {
+        // DeepSeek-V2's `moe` accessor: layer 0 is dense FFN, layers
+        // 1..N are MoE — `moe` only exists for 1..N. The Vec-compressed
+        // path would be off-by-one (Vec[layer as usize] reads layer
+        // L from index L instead of L-1), so non-zero-starting groups
+        // also take the sparse fallback.
         let accs = vec![ln_acc(Some(1)), ln_acc(Some(2))];
-        let _ = group_accessors_by_base(&accs);
+        let groups = group_accessors_by_base(&accs);
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert!(matches!(g.kind, AccessorGroupKind::LayeredSparse));
+    }
+
+    #[test]
+    fn accessor_methods_emit_match_for_sparse_layered_groups() {
+        // The sparse path emits per-layer fields and a match-arm
+        // accessor that's identical in shape to the legacy
+        // pre-Vec-compression emit. Codegen-issued static rows only
+        // pass layers that exist, so the catch-all is
+        // `unreachable_unchecked`.
+        let accs = vec![
+            WeightAccessor {
+                name: format_ident!("moe_1"),
+                rust_type: quote! { ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer },
+                source_weights: vec![],
+            },
+            WeightAccessor {
+                name: format_ident!("moe_2"),
+                rust_type: quote! { ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer },
+                source_weights: vec![],
+            },
+        ];
+        let ts = emit_weights_accessor_methods(&accs).to_string();
+        assert!(ts.contains("fn moe"));
+        assert!(ts.contains("match layer"));
+        // `Literal::u32_unsuffixed` emits the bare integer; the
+        // arm body resolves to it via the inferred match-arm type.
+        assert!(ts.contains("1 => & self . moe_1"));
+        assert!(ts.contains("2 => & self . moe_2"));
+        assert!(ts.contains("unreachable_unchecked"));
+        // Sparse groups don't take the Vec path.
+        assert!(!ts.contains("get_unchecked"));
     }
 
     // ── Vec compression: layered prefix templating ──────────────────

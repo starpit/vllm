@@ -123,12 +123,24 @@ impl TileEntry {
 
     /// Borrow as a `TensorView` for kernels that take views.
     ///
+    /// Returns `TensorView<'static>` so the view doesn't carry a
+    /// borrow on `tiles`. `TensorView` is a Copy wrapper around a
+    /// raw GPU pointer (`GpuTensor`); the lifetime parameter on
+    /// `TensorView` is a marker, not a real borrow. Tying the view
+    /// to `tiles`'s lifetime would block any arm that wants to
+    /// write back into `__tiles` after a kernel call (E0502 in
+    /// every interpreter arm that produces a `Reshaped` slot
+    /// from view-derived metadata, e.g. `RopeAppendRefImpl`).
+    ///
     /// # Safety
     ///
     /// Same as [`as_gpu_tensor`] — caller guarantees the entry is
-    /// still live and any indirection resolves cleanly.
+    /// still live (the drop-pass invariant: every alias's upstream
+    /// `OwnedTensor` outlives every consumer) and any indirection
+    /// resolves cleanly. The `'static` return is unsafe; a caller
+    /// holding the view past the upstream's drop is a bug.
     #[inline]
-    pub unsafe fn as_view<'a>(&'a self, tiles: &'a [Option<TileEntry>]) -> TensorView<'a> {
+    pub unsafe fn as_view(&self, tiles: &[Option<TileEntry>]) -> TensorView<'static> {
         unsafe { TensorView::from_raw(self.as_gpu_tensor(tiles)) }
     }
 }

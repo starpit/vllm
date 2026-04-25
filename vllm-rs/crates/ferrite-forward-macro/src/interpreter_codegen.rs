@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{ToTokens, quote};
 
 use crate::classified::Program;
 use crate::config::ModelParams;
@@ -344,6 +344,18 @@ pub struct ArchOpcodes {
     /// expected to declare the variant identically across arches,
     /// so duplicates with the same `interpreter_arm` are accepted.
     by_name: BTreeMap<String, (OpcodeShape, TokenStream)>,
+    /// Variant ident → prelude `let <fname>: <fty> = <value>;` rows
+    /// extracted from the per-row instruction stream by
+    /// [`extract_arch_wide_constants`] (every instance of this
+    /// variant carried the same byte-identical value, so we drop the
+    /// field from the row and rebind it in the arm body).
+    /// [`emit_interpreter`] partitions the entries: tuples that
+    /// appear in 2+ variants lift to ONE fn-scope let in
+    /// `__dispatch_one`; per-variant residuals stay at the top of
+    /// their arm. Avoids ~`N variants × shared lines` of duplicate
+    /// `let cos_sin_fn = Weights::rotary_cos_sin;` boilerplate in
+    /// the expanded source.
+    extracted_prelude: BTreeMap<String, Vec<(syn::Ident, syn::Type, TokenStream)>>,
 }
 
 impl ArchOpcodes {
@@ -614,8 +626,12 @@ pub fn extract_arch_wide_constants(
         if variant_name == "Free" {
             continue;
         }
-        let Some((shape, arm_body)) = arch_opcodes.get(variant_name) else {
-            continue;
+        // Snapshot the registered shape + arm body up-front so we
+        // can mutate `extracted_prelude` (a sibling field on
+        // `arch_opcodes`) without holding an immutable borrow.
+        let (shape, arm_body) = match arch_opcodes.get(variant_name) {
+            Some((s, b)) => (s.clone(), b.clone()),
+            None => continue,
         };
         let n_fields = shape.fields.len();
         if n_fields == 0 || locs.is_empty() {
@@ -647,20 +663,26 @@ pub fn extract_arch_wide_constants(
             drop.iter().map(|(i, _, _, _)| *i).collect();
         keep.retain(|i| !drop_idxs.contains(i));
 
-        // Rewrite the arm body: prepend `let fname: fty = value;` for
-        // each dropped field, then the original body. The match-arm
-        // pattern only binds the surviving fields; the let-prelude
-        // binds the dropped ones to the (now constant) value.
-        let prelude: Vec<TokenStream> = drop
+        // Record the dropped (fname, fty, value) tuples in the
+        // arch-level side map. `emit_interpreter` reads this map to
+        // partition: tuples that appear (with byte-identical type +
+        // value) in 2+ variants lift to ONE fn-scope let in
+        // `__dispatch_one`; per-variant residuals stay at the top
+        // of the arm. The arm body in `arch_opcodes.by_name` is
+        // intentionally the ORIGINAL kernel call here — no prelude
+        // folding — so the partition step has clean inputs.
+        let extracted: Vec<(syn::Ident, syn::Type, TokenStream)> = drop
             .iter()
-            .map(|(_, fname, fty, val)| {
-                quote! { let #fname: #fty = #val; }
-            })
+            .map(|(_, fname, fty, val)| (fname.clone(), fty.clone(), val.clone()))
             .collect();
-        let new_body = {
-            let original = arm_body.clone();
-            quote! { #(#prelude)* #original }
-        };
+        // Append in case multiple extraction passes contribute to
+        // the same variant (today it's called once per arch, but
+        // the API doesn't forbid repeats).
+        arch_opcodes
+            .extracted_prelude
+            .entry(variant_name.clone())
+            .or_default()
+            .extend(extracted);
 
         // Strip dropped fields from the shape.
         let new_fields: Vec<(syn::Ident, syn::Type)> = shape
@@ -675,7 +697,9 @@ pub fn extract_arch_wide_constants(
             fields: new_fields,
         };
 
-        arch_opcodes.replace(variant_name, new_shape, new_body);
+        // Body unchanged — emit_interpreter folds the prelude back
+        // (either fn-scope for shared, arm-scope for residual).
+        arch_opcodes.replace(variant_name, new_shape, arm_body);
 
         // Strip dropped fields from every instance of this variant.
         for &(b, i) in locs.iter() {
@@ -749,9 +773,78 @@ impl ArchOpcodes {
         enum_ident: &syn::Ident,
     ) -> TokenStream {
         let dispatch_ident = quote::format_ident!("__dispatch_one");
-        let arms = self.by_name.values().map(|(shape, body)| {
+        // Partition `extracted_prelude` into (shared, per-variant
+        // residual). A tuple (fname, fty, value) is "shared" when
+        // it appears in 2+ variants with byte-identical fty AND
+        // value — those lift to ONE fn-scope let, dedup'd by
+        // (fname, fty.to_string(), value.to_string()). The rest
+        // stay at the top of their owning arm.
+        //
+        // Why dedup by string: `syn::Type` and `TokenStream` don't
+        // implement Eq; their `to_string()` form is stable for the
+        // simple literal-or-path tokens these prelude lets carry.
+        let mut occurrences: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+        for entries in self.extracted_prelude.values() {
+            // Within one variant, count each (key) at most once
+            // (multiple instances of the variant get extracted into
+            // a single shared row; we don't want the dedup to read
+            // the same row twice here either).
+            let mut seen_in_variant: std::collections::HashSet<(String, String, String)> =
+                std::collections::HashSet::new();
+            for (fname, fty, val) in entries {
+                let key = (
+                    fname.to_string(),
+                    fty.to_token_stream().to_string(),
+                    val.to_string(),
+                );
+                if seen_in_variant.insert(key.clone()) {
+                    *occurrences.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+        // Walk one canonical (fname, fty, val) representative per
+        // shared key — a key shared across N variants will be hit
+        // N times, so we dedup the actual emit by inserting into
+        // `shared_lets` at the FIRST occurrence only.
+        let mut shared_lets: Vec<TokenStream> = Vec::new();
+        let mut emitted_shared: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        for entries in self.extracted_prelude.values() {
+            for (fname, fty, val) in entries {
+                let key = (
+                    fname.to_string(),
+                    fty.to_token_stream().to_string(),
+                    val.to_string(),
+                );
+                if occurrences.get(&key).copied().unwrap_or(0) >= 2 && emitted_shared.insert(key) {
+                    shared_lets.push(quote! { let #fname: #fty = #val; });
+                }
+            }
+        }
+        let arms = self.by_name.iter().map(|(name, (shape, body))| {
             let var = &shape.name;
             let pat = variant_pattern(shape);
+            // Per-variant residual prelude: dropped lets that aren't
+            // shared with another variant. These stay at the top of
+            // the arm because they only matter to this body.
+            let residual: Vec<TokenStream> = self
+                .extracted_prelude
+                .get(name)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|(fname, fty, val)| {
+                            let key = (
+                                fname.to_string(),
+                                fty.to_token_stream().to_string(),
+                                val.to_string(),
+                            );
+                            occurrences.get(&key).copied().unwrap_or(0) < 2
+                        })
+                        .map(|(fname, fty, val)| quote! { let #fname: #fty = #val; })
+                        .collect()
+                })
+                .unwrap_or_default();
             // Per-arm `let layer: u32 = __layer;` is the bridge
             // from `Op::Loop`'s iteration counter to arm bodies.
             // For variants whose `OpcodeShape` has a `layer:`
@@ -764,6 +857,7 @@ impl ArchOpcodes {
             quote! {
                 #enum_ident::#var #pat => {
                     let layer: u32 = __layer;
+                    #(#residual)*
                     #body
                 }
             }
@@ -783,6 +877,13 @@ impl ArchOpcodes {
                 ctx: &::ferrite_forward::ForwardCtx,
                 device: &mut ::ferrite_cuda_core::device::GpuDevice,
             ) {
+                // Fn-scope shared prelude: extracted constants that
+                // appear (with identical type + value) in 2+ arms.
+                // Lifted ONCE here so each arm just references the
+                // binding by name; without this lift, every arm
+                // re-emits the same `let cos_sin_fn = …;`-style
+                // line and cargo expand picks up the duplicates.
+                #(#shared_lets)*
                 match __op {
                     #(#arms,)*
                     #enum_ident::Alias(dst, src) => {
@@ -1939,6 +2040,120 @@ mod tests {
         assert!(ts.contains("(1)"));
         // No struct-style field labels in the row text.
         assert!(!ts.contains("layer :"));
+    }
+
+    /// `extract_arch_wide_constants` records dropped (fname, fty,
+    /// value) tuples in `arch_opcodes.extracted_prelude`, and
+    /// `emit_interpreter` partitions them: tuples present in 2+
+    /// variants lift to ONE fn-scope `let` at the top of
+    /// `__dispatch_one`; tuples in only one variant stay at the
+    /// top of that variant's arm body. Without partitioning, every
+    /// arm re-emits identical `let cos_sin_fn = …;` lines and the
+    /// expand picks up N copies of the same Rust source.
+    #[test]
+    fn shared_extracted_prelude_lifts_to_fn_scope_in_dispatch_one() {
+        let mut ops = ArchOpcodes::new();
+        ops.register(
+            OpcodeShape::new(
+                "AttnA",
+                vec![
+                    ("layer", syn::parse_quote!(u32)),
+                    ("interleaved", syn::parse_quote!(bool)),
+                ],
+            ),
+            quote! {},
+        );
+        ops.register(
+            OpcodeShape::new(
+                "AttnB",
+                vec![
+                    ("layer", syn::parse_quote!(u32)),
+                    ("interleaved", syn::parse_quote!(bool)),
+                ],
+            ),
+            quote! {},
+        );
+        ops.register(
+            OpcodeShape::new(
+                "Solo",
+                vec![
+                    ("layer", syn::parse_quote!(u32)),
+                    ("private_flag", syn::parse_quote!(bool)),
+                ],
+            ),
+            quote! {},
+        );
+
+        // `interleaved = true` is shared across AttnA + AttnB → must
+        // lift to fn scope. `private_flag = false` only appears on
+        // Solo → must stay as a per-arm residual.
+        ops.extracted_prelude.insert(
+            "AttnA".to_string(),
+            vec![(
+                format_ident!("interleaved"),
+                syn::parse_quote!(bool),
+                quote! { true },
+            )],
+        );
+        ops.extracted_prelude.insert(
+            "AttnB".to_string(),
+            vec![(
+                format_ident!("interleaved"),
+                syn::parse_quote!(bool),
+                quote! { true },
+            )],
+        );
+        ops.extracted_prelude.insert(
+            "Solo".to_string(),
+            vec![(
+                format_ident!("private_flag"),
+                syn::parse_quote!(bool),
+                quote! { false },
+            )],
+        );
+
+        let enum_ident = format_ident!("LlamaOp");
+        let helper_ident = format_ident!("__llama_interpret");
+        let ts = ops.emit_interpreter(&helper_ident, &enum_ident).to_string();
+
+        // Shared `interleaved = true` lifts to ONE fn-scope let.
+        // The fn-scope let lives between the open-brace of the fn
+        // body and the `match __op {` line.
+        let dispatch_open = ts
+            .split_once("__layer : u32 ,")
+            .and_then(|(_, rhs)| rhs.split_once("match __op {"))
+            .map(|(prelude, _)| prelude)
+            .expect("__dispatch_one signature must be present");
+        assert!(
+            dispatch_open.contains("let interleaved : bool = true ;"),
+            "shared `interleaved = true` should lift to fn-scope, \
+             got prelude: {dispatch_open}"
+        );
+        // Solo's `private_flag` is NOT shared → stays in its arm.
+        assert!(
+            !dispatch_open.contains("let private_flag"),
+            "private_flag should NOT lift to fn-scope, got: {dispatch_open}"
+        );
+        let solo_arm = ts
+            .split_once("LlamaOp :: Solo")
+            .map(|(_, rhs)| rhs)
+            .expect("Solo arm must be present");
+        // Slice the Solo arm body up to the next variant arm.
+        let solo_body_end = solo_arm.find("LlamaOp ::").unwrap_or(solo_arm.len());
+        let solo_body = &solo_arm[..solo_body_end];
+        assert!(
+            solo_body.contains("let private_flag : bool = false ;"),
+            "Solo's private_flag should stay in its arm, got: {solo_body}"
+        );
+
+        // The shared `interleaved` should appear EXACTLY once at
+        // fn-scope (and zero times in each arm's body — the lifted
+        // binding is in lexical scope already).
+        let interleaved_count = ts.matches("let interleaved : bool = true ;").count();
+        assert_eq!(
+            interleaved_count, 1,
+            "shared `interleaved` should appear once (fn-scope), got {interleaved_count}"
+        );
     }
 
     /// `OpInstance.field_values.len()` mismatching `shape.fields.len()`

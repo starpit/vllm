@@ -245,12 +245,15 @@ Codegen-time invariants the helper enforces (see
   baked in (no `_ => &self.<layer 0>` catch-all that would silently
   pick layer 0).
 
-## Current branch state (2026-04-25 mid-session)
+## Current branch state (2026-04-25 end-of-session)
 
-Branch `ff-interpreter` is at `833ddcb61` (forked from
-ferrite-forward `961cb8c8`). Seven commits ahead of fork:
+Branch `ff-interpreter` is at `34c2d8d97` (forked from
+ferrite-forward `961cb8c8`). Nine commits ahead of fork (two
+of them reverted in-tree):
 
 ```
+34c2d8d97  ff-interpreter: add take_owned for in-place consume kernels
+4eb00680c  ff-interpreter: handoff captures scaffolding refinements + migration recipe
 833ddcb61  ff-interpreter: Weights accessor methods for runtime layer dispatch
 318949840  ff-interpreter: interpreter_arm takes &ModelParams
 e7fcae89a  ff-interpreter: handoff captures end-of-session state
@@ -263,8 +266,10 @@ afb6a804f  ff-interpreter: drop megakernel scaffolding, rewrite handoff
 
 The two reverted commits were wrong-design scaffolding (universal
 opcode registry + `Instruction([i32;32])` wire format), undone
-by `afb6a804f`. The active scaffolding is the four most recent
-commits before today plus today's two scaffolding refinements.
+by `afb6a804f`. The active scaffolding is the seven most recent
+commits — four pre-today (`afb6a804f`, `f5f62f675`, `b2c08c8e7`,
+`e7fcae89a`) plus today's four (`318949840`, `833ddcb61`,
+`4eb00680c`, `34c2d8d97`).
 
 ### What's landed and verified
 
@@ -273,11 +278,11 @@ commits before today plus today's two scaffolding refinements.
   - `OpInstance { name: Ident, field_values: Vec<TokenStream> }`
   - `SlotMap` (compile-time `(TileId, slot) → u32` allocator)
   - Trait `Implementation` gains `opcode_shape` / `fan_out` /
-    `interpreter_arm` with unmigrated defaults. **`emit_call` is
-    still the active codegen path.** Both methods live on the
-    trait simultaneously *as scaffolding* (handoff explicitly
-    permits this so the new methods can land before the
-    wholesale switch).
+    `interpreter_arm(model)` with unmigrated defaults.
+    **`emit_call` is still the active codegen path.** Both
+    methods live on the trait simultaneously *as scaffolding*
+    (handoff explicitly permits this so the new methods can
+    land before the wholesale switch).
   - Tests: `opcode_shape_carries_typed_fields_in_declaration_order`,
     `unmigrated_shape_carries_distinctive_placeholder_name`,
     `op_instance_field_values_match_shape_field_count`,
@@ -291,7 +296,8 @@ commits before today plus today's two scaffolding refinements.
     the per-arch interpreter helper.
   - `LoweredBucket` + `lower_bucket(...)`: walks waves, calls
     `fan_out`, interleaves `Free` instances at drop-pass points,
-    builds the alias prelude.
+    builds the alias prelude. Takes `&ModelParams` and threads
+    it through to each Impl's `interpreter_arm`.
   - `emit_bucket_static_slice(...)`: lowers `Vec<OpInstance>` to
     `static FORWARD_<TAG>: &[<Arch>Op] = &[…];`.
   - `free_variant_shape()` / `free_instance(slot)` helpers — the
@@ -303,14 +309,39 @@ commits before today plus today's two scaffolding refinements.
     has zero callers in `codegen.rs`. The active path is still
     `emit_subgraph → emit_call`.
 
+- `ferrite-forward-macro/src/codegen.rs`:
+  - `split_base_layer(field_name) -> (base, Option<layer>)` —
+    parses trailing `_<digits>` suffix.
+  - `emit_weights_accessor_methods(accessors) -> TokenStream` —
+    emits `impl Weights { pub fn <base>(&self, layer: u32) ->
+    &<Ty> { match layer { … } } }` per accessor base. Spliced
+    into `emit_weights_struct`'s Canonical-mode output between
+    `#weights_def` and `#fingerprint_method`. (Shim mode aliases
+    the canonical struct, so its accessor methods come for free
+    via `pub type Weights = super::<canonical>::Weights;`.)
+  - Tests: 6 (`split_base_layer_recognizes_layered_and_unlayered_names`,
+    `accessor_methods_collapse_per_layer_fields_into_one_method`,
+    `accessor_methods_emit_unit_arm_for_unlayered_fields`,
+    `accessor_methods_panic_on_mixed_layered_and_unlayered`,
+    `accessor_methods_panic_on_type_disagreement_within_a_base`,
+    `accessor_methods_empty_input_yields_empty_tokens`).
+  - Verified: `cargo build -p ferrite-models --features cuda`
+    completes cleanly; `codegen-profile` line counts unchanged
+    from before today (additive Weights change only).
+
 - `ferrite-forward/src/`:
   - `instruction.rs` deleted (megakernel wire format).
-  - `tile_table.rs` (TileEntry + tile_ref) intact — runtime types
-    the future emitted interpreter will consume.
-  - `lib.rs` re-exports `TileEntry` + `tile_ref` only.
+  - `tile_table.rs` exposes `TileEntry`, `tile_ref(tiles, idx)`,
+    `take_owned(tiles, idx) -> OwnedTensor`. The take helper
+    is for in-place consume kernels (the upstream's
+    `consumes_input_tiles` declaration tells the drop pass to
+    skip a `Free` for that slot; the runtime mirror is take-mutate-
+    reinsert via this helper).
+  - `lib.rs` re-exports `TileEntry`, `tile_ref`, `take_owned`.
 
 - 3 macro-crate test failures predate this branch (config variant
-  counts, `add_rmsnorm_pairs_*`); not introduced here.
+  counts, `add_rmsnorm_pairs_*`); not introduced here. Currently
+  150 of 153 macro-crate tests pass.
 
 ## What's next — the wholesale switch (one commit)
 

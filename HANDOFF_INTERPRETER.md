@@ -1,14 +1,62 @@
 # ff-interpreter — handoff
 
 > Branch `ff-interpreter`. Read this whole file before changing
-> anything. ff4 stencil rewrite is dead. Most of the original
-> seam-swap migration is in place; what's left is **codegen-size
-> compression** (the per-arch `Weights` struct + accessors + load
-> body, plus residual cleanup) and end-to-end golden verification.
+> anything. ff4 stencil rewrite is dead. The seam swap + the
+> first round of codegen-size compression are in. End-to-end build
+> and goldens still need to run.
 
 ## Where we are
 
-Last commit on `ff-interpreter`: **seam swap + coloring + Op::Loop
+Five commits on top of the seam-swap checkpoint focus on cargo-
+expand size:
+
+1. `Vec<T> Weights compression` — layered accessors collapse from
+   N per-layer fields + 40-arm `match layer` accessor methods + N
+   per-layer load lets into one `Vec<T>` field, one
+   `&self.<base>.get_unchecked(layer as usize)` accessor, one
+   `(0..N).map(|layer| { format!(..., layer); …::load(…) }).collect()`
+   Vec-build per layered base. `pub struct Weights`: 217→30 lines on
+   commandr (-86%); `impl Weights { … }`: 578→240 (-58%);
+   `pub fn load_with`: 1380→278 (-80%).
+2. `__dispatch_one` redundant `let _ = layer;` lines dropped (the
+   fn's `unused_variables` allow already suppresses warnings); the
+   fn-top redundant `let layer = __layer;` setup is gone too. Per-
+   arm `let layer: u32 = __layer;` shadow stays — load-bearing for
+   Op::Loop iteration semantics.
+3. Per-bucket forward fns collapse to 1-line shims passing the
+   bucket's static-slice idents + slot indices to a single
+   `__forward_inner` / `__forward_backbone_inner` helper emitted
+   once per arch module. `forward_backbone_m_<N>`: 30→11 lines per
+   bucket. Op enum's `derive(Clone)` replaced with manual
+   `*self` impl to skip the verbose `AssertParamIsClone` expansion.
+4. Shared arm-prelude lift: `extract_arch_wide_constants` records
+   dropped (fname, ty, value) tuples in a sibling `extracted_prelude`
+   side map on `ArchOpcodes`; `emit_interpreter` partitions by
+   string-form (key = (fname, ty, value)). Tuples present in 2+
+   variants lift to ONE fn-scope `let` at the top of `__dispatch_one`;
+   per-variant residuals stay at the top of the arm. `cos_sin_fn`,
+   `interleaved`, `biased` lift on commandr.
+5. Type annotations dropped on extracted prelude lets — Rust infers
+   the type from the value, and arm-body call sites only need the
+   binding's NAME. Collapses 4-line `for<'a> fn(&'a Weights, u32)
+   -> &'a LinearLayer` types to one line per `weight_fn` /
+   `cos_sin_fn` declaration.
+
+`cargo expand -p ferrite-model-commandr --lib --features cuda`:
+**4244 → 2417 lines (-43% beyond the seam-swap baseline).**
+Llama: **263k → 111k lines (-58%)**, with `pub fn load_with`
+dropping from 118400 to 9842 lines (-92%) — the Vec compression's
+single biggest win.
+
+The user's stretch target is <1000 lines for commandr. Cumulative
+progress is in good shape but not at goal yet. The major remaining
+levers (cross-canonical __dispatch_one dedup, per-arm body
+compression via a Ctx struct + helper methods) are bigger refactors
+— see "What's left" §1 below.
+
+## Original (pre-compression) state
+
+Last commit before the size pass: **seam swap + coloring + Op::Loop
 checkpoint**. The interpreter pivot's *core mechanism* is done:
 
 - All 49 Impls go through `opcode_shape` / `fan_out` /
@@ -41,69 +89,111 @@ went from 22,883 → 4,196 lines.** Macro crate builds in ~5s.
 
 ## What's left
 
-### 1. Weights / load_with compression — biggest remaining lever
+### 1. Cross-canonical `__dispatch_one` / `Op` / `Weights` dedup
 
-~50% of the post-Op::Loop expansion is the per-arch Weights struct
-+ accessor methods + `load_with` body, none of which is layer-
-compressed yet. Specifically for commandr:
+Current breakdown for commandr (cargo expand, 2417 total lines):
 
-- `pub struct Weights`: 217 lines (40 per-layer fields × 5+ bases).
-- `impl Weights { pub fn input_layernorm(&self, layer: u32) … }`:
-  578 lines (40-arm `match layer` per layered accessor).
-- `pub fn load_with`: ~1320 lines (one `let input_layernorm_<L> =
-  …::load(gw, "model.layers.<L>.input_layernorm", eps)?;` per
-  layer, per accessor).
+| Section | Lines | Notes |
+|---|---|---|
+| `fn __dispatch_one` | 810 | per-canonical, ~25 arms × ~16 lines/arm |
+| `(blank lines / use / misc)` | 322 | doc comments + module wrappers + m_<N> consts |
+| `pub fn load_with` | 278 | bounds-baked literals — must stay per-canonical |
+| `impl Weights { … }` | 240 | accessor methods (Vec-compressed) |
+| `static BACKBONE_M_<N>` | 111 | static slice rows |
+| `__forward_inner` helpers | 100 | per-arch shared (already lifted) |
+| `pub enum Op` | 78 | per-arch enum |
+| (others smaller) | 478 | |
 
-The compression: per-layer fields → `Vec<T>` per base. Accessor
-methods become `&self.<base>[layer as usize]` (one line). `load_with`
-emits one `(0..NUM_HIDDEN_LAYERS).map(|layer| { format!(prefix);
-…::load(…) }).collect::<Result<Vec<_>>>()?` per layered accessor
-group instead of N per-layer lets.
+Commandr ships TWO canonicals (c4ai_command_r_v01 + command_r_1_layer)
+because `dedup_signature` includes bounds (40 layers vs 1 layer).
+Both modules emit a near-byte-identical `__dispatch_one`, `Op` enum,
+`__interpret`, accessor methods, and forward helpers — just with
+different bounds-baked literals in `load_with` + the static slices.
 
-User asked for this explicitly: "shouldn't [the layered fields]
-just be slices, so that there are fewer variable declarations, and
-no match garbage like this?"
+To get under 1000 lines, the bounds-INDEPENDENT parts need to lift
+above the per-model `pub mod` boundary. Concretely:
 
-Implementation outline (substantial — ~200 lines of macro-side
-code):
-- Add a helper `group_accessors_by_base(accessors)` that returns
-  `Vec<AccessorGroup>` where `AccessorGroup { base, rust_type,
-  layered: bool, entries: Vec<(Option<u64>, WeightAccessor)> }`.
-- In `emit_weights_struct`:
-  - Replace the per-accessor field decl loop with a per-group loop
-    that emits `pub <base>: Vec<<T>>` for layered groups, `pub
-    <base>: <T>` for unindexed.
-  - Replace the per-accessor `lets` loop with a per-group loop. For
-    layered: emit a Vec-build expression. For unindexed: keep the
-    existing `let <name> = <load_call>(…)?;`.
-  - The Vec-build needs to call the same `Fp8Linear::load` /
-    `MarlinLinear::load` / etc., but with a runtime-formatted
-    prefix string. Add a helper `emit_layered_load_expr(plan:
-    &FieldLoad, source_weights: &[(WeightId, Option<u64>)],
-    program: &Program) -> TokenStream` that returns a
-    `TokenStream` of the form `(0..N).map(|layer| { let prefix = …;
-    SomeKernel::load(gw, &prefix, …) }).collect::<Result<…>>()?`.
-- In `emit_weights_accessor_methods`: drop the 40-arm match;
-  layered methods become `&self.<base>[layer as usize]`,
-  unindexed become `&self.<base>`.
+- `Weights` struct + accessor methods are TYPE-IDENTICAL across
+  same-arch canonicals (layered fields are `Vec<T>` regardless of
+  N). One Weights definition could be shared via `pub type Weights
+  = super::__shared::Weights;` — same trick as the existing shim
+  mechanism.
+- `Op` enum + `__dispatch_one` + `__interpret` + `__forward_inner`
+  helpers reference Weights but otherwise contain no bounds-baked
+  literals (the kernel-call bodies use `ctx.<...>` runtime values,
+  not baked literals — except for one outlier per Impl, see below).
+- `load_with` + `fingerprint_matches` + per-bucket statics +
+  per-bucket forward shims STAY per-canonical (they're where bounds
+  bake into literals).
 
-The trickiest piece is `emit_layered_load_expr` — every FieldLoad
-variant has a slightly different signature (different params,
-different source-weight count semantics). Best path: factor a helper
-that returns `TokenStream` for the per-iteration load call given a
-`layer` ident in scope, and lift the existing per-FieldLoad arms
-to use it.
+The wrinkle: a few Impls bake a constant from model bounds into
+their `interpreter_arm` body. E.g., `AttentionViaCacheImpl` bakes
+`scale = 1/sqrt(head_dim)` as a literal `0.088388346f32` (commandr,
+head_dim=128). Since the literal differs between two canonicals
+with different head_dim, their `__dispatch_one` bodies aren't
+byte-identical and can't be shared.
 
-The test suite should grow with this — invariants to add:
-- "layered fields appear as `pub <base>: Vec<T>`, not as
-  `pub <base>_0..<N>: T`."
-- "load body has exactly ONE expression per layered base, not N."
-- "accessor method body is `&self.<base>[layer as usize]`, not a
-  match."
+Path to fix: convert these baked constants into `OpcodeShape`
+fields. `extract_arch_wide_constants` then lifts them as fn-scope
+lets in `__dispatch_one`. Two canonicals with different `head_dim`
+get different fn-scope `let scale = 0.0884f32;` rows, but the
+arm body is byte-identical. They can share `__dispatch_one`.
 
-Estimated savings: ~2000 lines on commandr (4.2K → ~2.2K).
+Refactor scope:
+- Audit every `Impl::interpreter_arm` for baked literals derived
+  from model bounds/scalars. Add corresponding `OpcodeShape`
+  fields. (Memory rule `feedback_no_piecemeal_codegen_migration`:
+  do all Impls in one wholesale commit.)
+- Add a new shim mode: `WeightsEmitMode::SharedWithCanonical` that
+  emits `pub type Weights = super::<canonical>::Weights;` AND
+  `pub use super::<canonical>::{Op, __dispatch_one, __interpret,
+  __forward_inner, __forward_backbone_inner};` while keeping the
+  variant's own `load_with` + `fingerprint_matches` + per-bucket
+  statics.
+- New canonicalization tier in `compute_canonical_variants`:
+  partition by (impls picked + tie + rope_scaling_kind) only —
+  drop bounds + scalars from this signature. Variants in the same
+  partition share the bounds-independent items.
 
-### 2. End-to-end build verification
+Estimated savings: commandr ~600 lines (one __dispatch_one + Op +
+helpers instead of two), llama ~25k lines (57 canonicals → some
+smaller number, depending on how many distinct (impl_set,
+tie, rope_kind) triples exist).
+
+### 2. Per-arm body compression via a Ctx struct (user's idea)
+
+Each arm body is ~10-15 lines:
+```
+let __out = unsafe {
+    let __view = ::ferrite_forward::tile_ref(__tiles, in_slot).as_view(__tiles);
+    let __w = (weight_fn)(wm, layer);
+    ::ferrite_kernels::kernels::xyz(*__view, __w.weight, ..., device.compute_stream)
+};
+__tiles[out_slot as usize] = Some(::ferrite_forward::TileEntry::Owned(__out));
+```
+
+User suggested in this session: pack the per-call state into a
+`Ctx` struct with helper methods (`ctx.view(slot)`,
+`ctx.write_owned(slot, t)`). Each arm body shrinks to:
+```
+let __view = ctx.view(in_slot);
+let __w = (weight_fn)(ctx.wm, layer);
+ctx.write_owned(out_slot, ::ferrite_kernels::kernels::xyz(*__view, __w.weight, ..., ctx.stream()));
+```
+
+Roughly 3-4 lines per arm × 25 arms × N canonicals = 75-100 lines
+saved per canonical. Combined with #1, this would bring commandr
+under 1000.
+
+Refactor scope: similar to #1 (touch every Impl's
+`interpreter_arm`). Land wholesale, commit-by-commit forbidden.
+
+### 3. Past-but-completed: Vec / shared-prelude / per-bucket dedup
+
+Already in main on this branch as the five commits described in
+"Where we are". No further action needed.
+
+### 4. End-to-end build verification
 
 The macro crate builds + tests pass. **`cargo build -p
 ferrite-models --features cuda` has not been verified end-to-end
@@ -120,7 +210,7 @@ There are integration tests under `crates/ferrite-forward/tests/`
 (phase7_end_to_end, gemma2_end_to_end) that compile every variant
 through the macro — those serve as the smoke test.
 
-### 3. Goldens
+### 5. Goldens
 
 After the build is green, run:
 
@@ -154,7 +244,7 @@ The interpreter design changes runtime behavior in subtle ways:
   that reads the aliased slot. (Should be fine — aliases are
   prepended in `lower_bucket`.)
 
-### 4. Open warnings / cleanup
+### 6. Open warnings / cleanup
 
 - `_protected: &HashSet<(TileId, u8)>` unused arg in `lower_bucket`
   signature. Either remove (callers update) or keep as
@@ -167,7 +257,7 @@ The interpreter design changes runtime behavior in subtle ways:
   `add_rmsnorm_pairs_claimed_as_fused_subgraph`) unchanged. Not in
   scope.
 
-### 5. Optional follow-ups
+### 7. Optional follow-ups
 
 - **Arena-backed `__tiles`.** With coloring, slot count is small
   (~10–20 for commandr) and bounded per arch. Replace `Vec<Option<

@@ -541,11 +541,21 @@ If any box is unchecked, **stop and wait** — do not commit.
   refactor rewrites.** (The handoff previously called this
   `emit_workload.rs`; that file does not exist.)
 - `vllm-rs/crates/ferrite-forward-macro/src/impl_lib.rs` — the
-  `Implementation` trait. `emit_call` lives at line ~503 today;
-  the new methods replace it.
+  `Implementation` trait. `emit_call` lives at line ~504 today
+  (and at ~998 inside the `trivial_impl!` macro expansion); the
+  new methods replace it. `opcode_shape` / `fan_out` /
+  `interpreter_arm` are at ~598 / ~611 / ~642 with unmigrated
+  defaults.
+- `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs::emit_weights_struct`
+  — emits `Weights` struct, `impl Weights { fn <base>(&self,
+  layer: u32) }` accessor methods (via
+  `emit_weights_accessor_methods`), and `load_with` / `load`
+  loaders. Spliced together inside the `WeightsEmitMode::Canonical`
+  arm.
 - `vllm-rs/crates/ferrite-forward/src/lib.rs` — runtime types the
-  emitted interpreter consumes. `TileEntry` and `tile_ref` stay;
-  `Instruction` / `Layout` / `opcode` get deleted in this refactor.
+  emitted interpreter consumes. `TileEntry`, `tile_ref`,
+  `take_owned` stay; `Instruction` / `Layout` / `opcode` already
+  deleted (`afb6a804f`).
 
 ## Pre-existing baseline failures (not introduced by this work)
 

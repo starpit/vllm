@@ -711,13 +711,24 @@ impl ArchOpcodes {
             /// don't print or clone Op values, and dropping Debug
             /// avoids per-arch `impl ::core::fmt::Debug for Op {…}`
             /// boilerplate from cargo-expand.
-            #[derive(Copy, Clone)]
+            ///
+            /// `Clone` is hand-impl'd as `*self` (Copy types have a
+            /// trivial Clone). The `#[derive(Clone)]` expansion
+            /// would otherwise be ~60 lines of `let _:
+            /// AssertParamIsClone<…>;` per variant — pure
+            /// cargo-expand bloat with no runtime effect.
+            #[derive(Copy)]
             #[allow(non_camel_case_types, dead_code)]
             pub enum #enum_ident {
                 #(#variants,)*
                 #alias_variant,
                 #free_variant,
                 #loop_variant,
+            }
+
+            impl ::core::clone::Clone for #enum_ident {
+                #[inline]
+                fn clone(&self) -> Self { *self }
             }
         }
     }
@@ -1783,6 +1794,34 @@ mod tests {
         // No unsafe transmute / from_wire.
         assert!(!ts.contains("transmute"));
         assert!(!ts.contains("from_wire"));
+    }
+
+    /// `emit_enum` derives `Copy` automatically and impls `Clone`
+    /// manually as `*self`. The default `#[derive(Clone)]` macro
+    /// expands to a verbose AssertParamIsClone bound check per
+    /// variant — ~60 lines for an arch with ~25 variants — that
+    /// shows up in cargo expand and per-monomorphization compile
+    /// work without any runtime benefit (Op is a plain Copy enum;
+    /// Clone IS *self for any Copy type).
+    #[test]
+    fn arch_enum_uses_manual_clone_impl_to_skip_assertparamisclone() {
+        let mut ops = ArchOpcodes::new();
+        ops.register(
+            OpcodeShape::new("AttnNorm", vec![("layer", syn::parse_quote!(u32))]),
+            quote! {},
+        );
+        let enum_ident = format_ident!("LlamaOp");
+        let ts = ops.emit_enum(&enum_ident).to_string();
+        // Hand-rolled Clone present with `*self` body.
+        assert!(
+            ts.contains("impl :: core :: clone :: Clone for LlamaOp"),
+            "expected manual Clone impl, got: {ts}"
+        );
+        assert!(ts.contains("fn clone (& self) -> Self { * self }"));
+        // Derive list is just Copy, not Copy+Clone — that's how we
+        // dodge the AssertParamIsClone expansion.
+        assert!(ts.contains("# [derive (Copy)]"));
+        assert!(!ts.contains("# [derive (Copy , Clone)]"));
     }
 
     /// `__dispatch_one` emits exactly ONE `let layer: u32 = __layer;`

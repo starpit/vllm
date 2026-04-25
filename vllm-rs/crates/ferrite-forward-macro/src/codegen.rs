@@ -3147,8 +3147,11 @@ pub fn emit_model(
     let shapes_by_name = arch_opcodes.shapes_by_name();
 
     // Per-bucket statics + per-bucket fns. Canonical buckets get a
-    // freshly-emitted body; non-canonical buckets get a thin shim
-    // delegating to the canonical's forward fn.
+    // 1-line shim that hands the static slices + slot indices to a
+    // shared `__forward_inner` / `__forward_backbone_inner` helper
+    // (emitted once per arch module). Non-canonical buckets keep
+    // delegating to their canonical sibling's per-bucket fn (rustc
+    // dedup at the public-API surface).
     let mut static_slices: Vec<TokenStream> = Vec::new();
     let mut bucket_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
     let mut backbone_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
@@ -3177,60 +3180,48 @@ pub fn emit_model(
             let bb_final_slot = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_val);
             let fwd_final_slot = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_val);
 
-            // forward = backbone + one lm_head step.
+            // forward = backbone + lm_head + take_owned(terminal).
             let fwd_fn_name = bucket_fn_ident("forward_m", *wp);
             bucket_fns.push(quote! {
                 #[cfg(feature = "cuda")]
-                #[allow(clippy::too_many_arguments, unused_mut, unused_variables)]
+                #[allow(clippy::too_many_arguments)]
+                #[inline]
                 pub unsafe fn #fwd_fn_name(
                     wm: &Weights,
                     ctx: &::ferrite_forward::ForwardCtx,
                     device: &mut ::ferrite_cuda_core::device::GpuDevice,
                 ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                    let mut __tiles: ::std::vec::Vec<Option<::ferrite_forward::TileEntry>> =
-                        (0u32..#num_slots).map(|_| None).collect();
                     unsafe {
-                        #helper_ident(#backbone_static_ident, &mut __tiles, wm, ctx, device);
-                        #helper_ident(#lm_head_static_ident, &mut __tiles, wm, ctx, device);
+                        __forward_inner(
+                            #backbone_static_ident,
+                            #lm_head_static_ident,
+                            #num_slots,
+                            #fwd_final_slot,
+                            wm, ctx, device,
+                        )
                     }
-                    ::ferrite_forward::take_owned(&mut __tiles, #fwd_final_slot)
                 }
             });
 
-            // forward_backbone = backbone, then DtoD-copy the
-            // backbone-output slot into a freshly-allocated
-            // OwnedTensor so the caller owns the buffer.
+            // forward_backbone = backbone + DtoD-copy backbone slot.
             let bb_fn_name = bucket_fn_ident("forward_backbone_m", *wp);
             backbone_fns.push(quote! {
                 #[cfg(feature = "cuda")]
-                #[allow(clippy::too_many_arguments, unused_mut, unused_variables)]
+                #[allow(clippy::too_many_arguments)]
+                #[inline]
                 pub unsafe fn #bb_fn_name(
                     wm: &Weights,
                     ctx: &::ferrite_forward::ForwardCtx,
                     device: &mut ::ferrite_cuda_core::device::GpuDevice,
                 ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                    let mut __tiles: ::std::vec::Vec<Option<::ferrite_forward::TileEntry>> =
-                        (0u32..#num_slots).map(|_| None).collect();
                     unsafe {
-                        #helper_ident(#backbone_static_ident, &mut __tiles, wm, ctx, device);
+                        __forward_backbone_inner(
+                            #backbone_static_ident,
+                            #num_slots,
+                            #bb_final_slot,
+                            wm, ctx, device,
+                        )
                     }
-                    let __bb_view = unsafe {
-                        ::ferrite_forward::tile_ref(&__tiles, #bb_final_slot).as_view(&__tiles)
-                    };
-                    let __bb_shape_u32: &[u32] = __bb_view.shape();
-                    let __bb_shape: ::std::vec::Vec<usize> =
-                        __bb_shape_u32.iter().map(|&d| d as usize).collect();
-                    let __bb_out = device
-                        .caching
-                        .alloc_tensor(&__bb_shape, __bb_view.dtype());
-                    ::ferrite_cuda_core::driver::memcpy_dtod_async(
-                        __bb_out.raw_ptr(),
-                        __bb_view.raw_ptr() as *const u8,
-                        __bb_view.size_bytes(),
-                        device.compute_stream,
-                    )
-                    .expect("forward_backbone: DtoD memcpy of output");
-                    __bb_out
                 }
             });
         } else {
@@ -3375,6 +3366,70 @@ pub fn emit_model(
     let (match_arms, fallback_arm) = build_match_arms("forward_m");
     let (backbone_match_arms, backbone_fallback_arm) = build_match_arms("forward_backbone_m");
 
+    // Shared per-bucket fn body. Hoisting it here means each
+    // canonical bucket fn collapses to a 1-line shim — passing the
+    // bucket's static-slice idents + slot indices to one of these
+    // two helpers. The helpers reference `__interpret`, `Op`, and
+    // `Weights` from the surrounding module. They're `#[inline]`
+    // so optimized builds still see the work as if it had been
+    // emitted per-bucket; the saving is purely in expanded source
+    // size + per-bucket compile work for debug builds.
+    let forward_inner_helpers = quote! {
+        #[cfg(feature = "cuda")]
+        #[inline]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn __forward_inner(
+            backbone: &[#enum_ident],
+            lm_head: &[#enum_ident],
+            num_slots: u32,
+            terminal_slot: u32,
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            let mut __tiles: ::std::vec::Vec<Option<::ferrite_forward::TileEntry>> =
+                (0u32..num_slots).map(|_| None).collect();
+            unsafe {
+                #helper_ident(backbone, &mut __tiles, wm, ctx, device);
+                #helper_ident(lm_head, &mut __tiles, wm, ctx, device);
+            }
+            ::ferrite_forward::take_owned(&mut __tiles, terminal_slot)
+        }
+
+        #[cfg(feature = "cuda")]
+        #[inline]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn __forward_backbone_inner(
+            backbone: &[#enum_ident],
+            num_slots: u32,
+            backbone_slot: u32,
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            let mut __tiles: ::std::vec::Vec<Option<::ferrite_forward::TileEntry>> =
+                (0u32..num_slots).map(|_| None).collect();
+            unsafe {
+                #helper_ident(backbone, &mut __tiles, wm, ctx, device);
+            }
+            let __bb_view = unsafe {
+                ::ferrite_forward::tile_ref(&__tiles, backbone_slot).as_view(&__tiles)
+            };
+            let __bb_shape_u32: &[u32] = __bb_view.shape();
+            let __bb_shape: ::std::vec::Vec<usize> =
+                __bb_shape_u32.iter().map(|&d| d as usize).collect();
+            let __bb_out = device.caching.alloc_tensor(&__bb_shape, __bb_view.dtype());
+            ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                __bb_out.raw_ptr(),
+                __bb_view.raw_ptr() as *const u8,
+                __bb_view.size_bytes(),
+                device.compute_stream,
+            )
+            .expect("forward_backbone: DtoD memcpy of output");
+            __bb_out
+        }
+    };
+
     quote! {
         #weights
 
@@ -3383,6 +3438,8 @@ pub fn emit_model(
         #arch_interpreter_ts
 
         #(#static_slices)*
+
+        #forward_inner_helpers
 
         #(#bucket_fns)*
         #(#backbone_fns)*

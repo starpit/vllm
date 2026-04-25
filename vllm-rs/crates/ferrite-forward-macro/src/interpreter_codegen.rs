@@ -806,18 +806,26 @@ impl ArchOpcodes {
         // shared key — a key shared across N variants will be hit
         // N times, so we dedup the actual emit by inserting into
         // `shared_lets` at the FIRST occurrence only.
+        //
+        // Drop the type annotation on the emitted let — Rust infers
+        // the type from `val` (fn-item path → fn item, bool / u32
+        // literal → respective primitive, etc.) and arm-body call
+        // sites only need the binding's NAME. Keeping the annotation
+        // would expand multi-line `for<'a> fn(&'a Weights, u32) ->
+        // &'a LinearLayer` types verbatim per binding (~4 lines per
+        // weight_fn / cos_sin_fn declaration).
         let mut shared_lets: Vec<TokenStream> = Vec::new();
         let mut emitted_shared: std::collections::HashSet<(String, String, String)> =
             std::collections::HashSet::new();
         for entries in self.extracted_prelude.values() {
-            for (fname, fty, val) in entries {
+            for (fname, _fty, val) in entries {
                 let key = (
                     fname.to_string(),
-                    fty.to_token_stream().to_string(),
+                    _fty.to_token_stream().to_string(),
                     val.to_string(),
                 );
                 if occurrences.get(&key).copied().unwrap_or(0) >= 2 && emitted_shared.insert(key) {
-                    shared_lets.push(quote! { let #fname: #fty = #val; });
+                    shared_lets.push(quote! { let #fname = #val; });
                 }
             }
         }
@@ -826,7 +834,9 @@ impl ArchOpcodes {
             let pat = variant_pattern(shape);
             // Per-variant residual prelude: dropped lets that aren't
             // shared with another variant. These stay at the top of
-            // the arm because they only matter to this body.
+            // the arm because they only matter to this body. Same
+            // annotation-drop trick — body call sites use the
+            // binding's name, not its annotated type.
             let residual: Vec<TokenStream> = self
                 .extracted_prelude
                 .get(name)
@@ -841,7 +851,7 @@ impl ArchOpcodes {
                             );
                             occurrences.get(&key).copied().unwrap_or(0) < 2
                         })
-                        .map(|(fname, fty, val)| quote! { let #fname: #fty = #val; })
+                        .map(|(fname, _fty, val)| quote! { let #fname = #val; })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -2118,14 +2128,15 @@ mod tests {
 
         // Shared `interleaved = true` lifts to ONE fn-scope let.
         // The fn-scope let lives between the open-brace of the fn
-        // body and the `match __op {` line.
+        // body and the `match __op {` line. Type annotation is
+        // dropped — Rust infers `bool` from the literal `true`.
         let dispatch_open = ts
             .split_once("__layer : u32 ,")
             .and_then(|(_, rhs)| rhs.split_once("match __op {"))
             .map(|(prelude, _)| prelude)
             .expect("__dispatch_one signature must be present");
         assert!(
-            dispatch_open.contains("let interleaved : bool = true ;"),
+            dispatch_open.contains("let interleaved = true ;"),
             "shared `interleaved = true` should lift to fn-scope, \
              got prelude: {dispatch_open}"
         );
@@ -2142,14 +2153,14 @@ mod tests {
         let solo_body_end = solo_arm.find("LlamaOp ::").unwrap_or(solo_arm.len());
         let solo_body = &solo_arm[..solo_body_end];
         assert!(
-            solo_body.contains("let private_flag : bool = false ;"),
+            solo_body.contains("let private_flag = false ;"),
             "Solo's private_flag should stay in its arm, got: {solo_body}"
         );
 
         // The shared `interleaved` should appear EXACTLY once at
         // fn-scope (and zero times in each arm's body — the lifted
         // binding is in lexical scope already).
-        let interleaved_count = ts.matches("let interleaved : bool = true ;").count();
+        let interleaved_count = ts.matches("let interleaved = true ;").count();
         assert_eq!(
             interleaved_count, 1,
             "shared `interleaved` should appear once (fn-scope), got {interleaved_count}"

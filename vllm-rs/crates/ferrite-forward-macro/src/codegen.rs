@@ -2213,32 +2213,23 @@ fn layer_templated_prefix_expr(layer0_prefix: &str) -> TokenStream {
     }
 }
 
-/// Helper for the multi-prefix `*_concat` load arms in
-/// [`emit_layered_load_body`]. Returns `(binds, refs)` where
-/// `binds` is a list of `let __p_<i>: String = format!(…);`
-/// statements and `refs` is the matching list of `__p_<i>.as_str()`
-/// expressions. Caller wraps `binds` + the kernel call in a `{ … }`
-/// block so the bindings outlive the `&[&str]` borrow.
-///
-/// Why bind-then-borrow: `&format!()` is `&String`, and a literal
-/// `&[&format!(...), …]` builds `[&String; N]`, which does NOT
-/// coerce to `&[&str]`. Threading through a named local lets the
-/// Rust compiler do `String → &str` deref-coercion at the call
-/// site.
-fn layer_templated_prefix_array(
-    layer0_prefixes: &[String],
-) -> (Vec<TokenStream>, Vec<TokenStream>) {
-    let mut binds = Vec::with_capacity(layer0_prefixes.len());
-    let mut refs = Vec::with_capacity(layer0_prefixes.len());
-    for (i, p0) in layer0_prefixes.iter().enumerate() {
-        let p = layer_templated_prefix_expr(p0);
-        let local = format_ident!("__p_{}", i);
-        binds.push(quote! {
-            let #local: ::std::string::String = #p;
-        });
-        refs.push(quote! { #local.as_str() });
-    }
-    (binds, refs)
+/// Strip the `model.layers.0.` prefix to recover the per-layer
+/// suffix string the `load_layered_*` helpers in
+/// [`ferrite_forward::loaders`] take. E.g. `"model.layers.0.input_layernorm"`
+/// → `"input_layernorm"`. Panics on prefixes that don't start with
+/// `model.layers.0.` — every layered accessor's L=0 prefix carries
+/// that prefix by construction (see [`safetensors_prefix`]); a
+/// mismatch surfaces a `default_required_weights` bug instead of
+/// silently emitting a malformed helper call.
+fn layered_suffix(layer0_prefix: &str) -> &str {
+    layer0_prefix
+        .strip_prefix("model.layers.0.")
+        .unwrap_or_else(|| {
+            panic!(
+                "layered accessor's L=0 prefix `{layer0_prefix}` doesn't \
+                 start with `model.layers.0.` — codegen invariant violated"
+            )
+        })
 }
 
 /// Emit the unindexed accessor's let-binding (kept as the
@@ -2494,79 +2485,79 @@ fn emit_group_let(
         AccessorGroupKind::LayeredContiguous => {
             let base_ident = syn::Ident::new(&group.base, proc_macro2::Span::call_site());
             // Plan from the first entry (layer 0). All entries share
-            // this plan modulo prefix; emit_layered_load_body rewrites
-            // the layer-0-baked prefix(es) into runtime format!() calls.
+            // this plan modulo prefix; emit_layered_load_body
+            // delegates to a `::ferrite_forward::load_layered_*`
+            // helper that owns the (0..N).map().collect() loop. The
+            // call site collapses to one line of expanded source.
             let l0 = group.entries[0].1;
             let plan = plans
                 .get(&l0.name.to_string())
                 .copied()
                 .expect("layered group's layer-0 accessor missing from plan map");
-            let body = emit_layered_load_body(plan);
-            let ty = &group.rust_type;
-            let n_layers = group.entries.len();
-            let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers as u32);
             // `n_layers` may be less than `num_hidden_layers` — a
             // contiguous-from-zero group can be partial (e.g.
             // DeepSeek's `mlp_down_proj` is layer 0 only; layers 1..N
-            // use `moe` instead). The Vec is sized to entries.len(),
-            // and the static-slice rows only ever index 0..n_layers,
-            // so partial coverage is fine.
+            // use `moe` instead). The helper is parameterized by
+            // `entries.len()`, and the static-slice rows only ever
+            // index 0..n_layers, so partial coverage is fine.
+            let n_layers = group.entries.len() as u32;
+            let call = emit_layered_load_body(plan, n_layers);
             let _ = model;
             quote! {
-                let #base_ident: ::std::vec::Vec<#ty> = (0u32..#n_lit)
-                    .map(|layer: u32| -> ::anyhow::Result<#ty> { #body })
-                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?;
+                let #base_ident = #call;
             }
         }
     }
 }
 
-/// Emit the per-iteration kernel-call expression for a layered
-/// accessor's Vec build. `plan` is the `FieldLoad` computed at
-/// layer 0; this rewrites its baked prefix(es) into runtime
-/// `format!()` calls that reference the closure's `layer: u32`
-/// binding. Returns a `Result<#ty>` expression; the caller wraps
-/// it in `(0..N).map(|layer| { … }).collect::<Result<Vec<_>>>()?`.
+/// Emit the full `Result<Vec<T>>` expression for a layered
+/// accessor's load. Delegates to a `::ferrite_forward::load_layered_*`
+/// helper that owns the `(0..N).map(|layer| Type::load(…)).collect()`
+/// loop, replacing the previous emit-the-closure-body shape. Each
+/// call site collapses from ~4 lines (typed Vec annotation, range,
+/// closure, collect) to one.
 ///
 /// `LinearTiedToEmbedding` is unreachable here — tied embedding
 /// only attaches to the `lm_head` accessor, which is unindexed.
-fn emit_layered_load_body(plan: &FieldLoad) -> TokenStream {
+/// `DeepSeekV2Moe` falls through to a layered-MoE helper still
+/// emitted inline (only DeepSeek arches use it; not worth a helper
+/// crossing the ferrite-forward / ferrite-kernels seam).
+fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32) -> TokenStream {
+    let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers);
     match plan {
         FieldLoad::Embedding(prefix) => {
-            let p = layer_templated_prefix_expr(prefix);
+            let suffix = layered_suffix(prefix);
             quote! {
-                ::ferrite_kernels::layers::Embedding::load(gw, &#p)
+                ::ferrite_forward::load_layered_embedding(gw, #n_lit, #suffix)?
             }
         }
         FieldLoad::RmsNorm(prefix, eps) => {
-            let p = layer_templated_prefix_expr(prefix);
+            let suffix = layered_suffix(prefix);
             quote! {
-                ::ferrite_kernels::layers::RmsNorm::load(gw, &#p, #eps)
+                ::ferrite_forward::load_layered_rms_norm(gw, #n_lit, #suffix, #eps)?
             }
         }
         FieldLoad::CohereLayerNorm(prefix, eps) => {
-            let p = layer_templated_prefix_expr(prefix);
+            let suffix = layered_suffix(prefix);
             quote! {
-                ::ferrite_kernels::layers::CohereLayerNorm::load(gw, &#p, #eps)
+                ::ferrite_forward::load_layered_cohere_layer_norm(gw, #n_lit, #suffix, #eps)?
             }
         }
         FieldLoad::LinearDense(prefix) => {
-            let p = layer_templated_prefix_expr(prefix);
+            let suffix = layered_suffix(prefix);
             quote! {
-                ::ferrite_kernels::layers::LinearLayer::load_dense(gw, &#p)
+                ::ferrite_forward::load_layered_linear_dense(gw, #n_lit, #suffix)?
             }
         }
         FieldLoad::LinearConcat(prefixes) => {
-            let (binds, refs) = layer_templated_prefix_array(prefixes);
+            let suffixes: Vec<&str> = prefixes.iter().map(|p| layered_suffix(p)).collect();
             quote! {
-                {
-                    #(#binds)*
-                    ::ferrite_kernels::layers::LinearLayer::load_dense_concat(
-                        gw,
-                        &[ #(#refs),* ],
-                        stream,
-                    )
-                }
+                ::ferrite_forward::load_layered_linear_dense_concat(
+                    gw,
+                    #n_lit,
+                    &[ #(#suffixes),* ],
+                    stream,
+                )?
             }
         }
         FieldLoad::LinearTiedToEmbedding(_) => panic!(
@@ -2575,77 +2566,58 @@ fn emit_layered_load_body(plan: &FieldLoad) -> TokenStream {
         ),
         FieldLoad::MarlinLinear { prefixes, .. } => {
             if prefixes.len() == 1 {
-                let p = layer_templated_prefix_expr(&prefixes[0]);
+                let suffix = layered_suffix(&prefixes[0]);
                 quote! {
-                    ::ferrite_kernels::layers::MarlinLinear::load(
-                        gw,
-                        &#p,
-                        marlin_storage,
-                        __marlin_ws,
-                        __device_id,
-                    )
+                    ::ferrite_forward::load_layered_marlin_linear(
+                        gw, #n_lit, #suffix, marlin_storage, __marlin_ws, __device_id,
+                    )?
                 }
             } else {
-                let (binds, refs) = layer_templated_prefix_array(prefixes);
+                let suffixes: Vec<&str> = prefixes.iter().map(|p| layered_suffix(p)).collect();
                 quote! {
-                    {
-                        #(#binds)*
-                        ::ferrite_kernels::layers::MarlinLinear::load_concat(
-                            gw,
-                            &[ #(#refs),* ],
-                            marlin_storage,
-                            __marlin_ws,
-                            __device_id,
-                        )
-                    }
+                    ::ferrite_forward::load_layered_marlin_linear_concat(
+                        gw, #n_lit,
+                        &[ #(#suffixes),* ],
+                        marlin_storage, __marlin_ws, __device_id,
+                    )?
                 }
             }
         }
         FieldLoad::Fp8Linear { prefixes } => {
             if prefixes.len() == 1 {
-                let p = layer_templated_prefix_expr(&prefixes[0]);
+                let suffix = layered_suffix(&prefixes[0]);
                 quote! {
-                    ::ferrite_kernels::layers::Fp8Linear::load(
-                        gw,
-                        &#p,
-                        __fp8_dtype,
-                    ).map(::ferrite_kernels::layers::Fp8AnyLinear::Std)
+                    ::ferrite_forward::load_layered_fp8_linear(
+                        gw, #n_lit, #suffix, __fp8_dtype,
+                    )?
                 }
             } else {
-                let (binds, refs) = layer_templated_prefix_array(prefixes);
+                let suffixes: Vec<&str> = prefixes.iter().map(|p| layered_suffix(p)).collect();
                 quote! {
-                    {
-                        #(#binds)*
-                        ::ferrite_kernels::layers::Fp8Linear::load_concat(
-                            gw,
-                            &[ #(#refs),* ],
-                            __fp8_dtype,
-                        ).map(::ferrite_kernels::layers::Fp8AnyLinear::Std)
-                    }
+                    ::ferrite_forward::load_layered_fp8_linear_concat(
+                        gw, #n_lit,
+                        &[ #(#suffixes),* ],
+                        __fp8_dtype,
+                    )?
                 }
             }
         }
         FieldLoad::Fp8BlockLinear { prefixes } => {
             if prefixes.len() == 1 {
-                let p = layer_templated_prefix_expr(&prefixes[0]);
+                let suffix = layered_suffix(&prefixes[0]);
                 quote! {
-                    ::ferrite_kernels::layers::Fp8BlockLinear::load(
-                        gw,
-                        &#p,
-                        __fp8_dtype,
-                    ).map(::ferrite_kernels::layers::Fp8AnyLinear::Block)
+                    ::ferrite_forward::load_layered_fp8_block_linear(
+                        gw, #n_lit, #suffix, __fp8_dtype,
+                    )?
                 }
             } else {
-                let (binds, refs) = layer_templated_prefix_array(prefixes);
+                let suffixes: Vec<&str> = prefixes.iter().map(|p| layered_suffix(p)).collect();
                 quote! {
-                    {
-                        #(#binds)*
-                        ::ferrite_kernels::layers::Fp8BlockLinear::load_concat(
-                            gw,
-                            &[ #(#refs),* ],
-                            __fp8_dtype,
-                        ).map(::ferrite_kernels::layers::Fp8AnyLinear::Block)
-                    }
+                    ::ferrite_forward::load_layered_fp8_block_linear_concat(
+                        gw, #n_lit,
+                        &[ #(#suffixes),* ],
+                        __fp8_dtype,
+                    )?
                 }
             }
         }
@@ -2662,34 +2634,25 @@ fn emit_layered_load_body(plan: &FieldLoad) -> TokenStream {
                 .map(|o| proc_macro2::Literal::usize_unsuffixed(*o as usize))
                 .collect();
             if prefixes.len() == 1 {
-                let p = layer_templated_prefix_expr(&prefixes[0]);
+                let suffix = layered_suffix(&prefixes[0]);
                 let out = &outs[0];
                 quote! {
-                    ::ferrite_kernels::layers::Bnb4bitLinear::load(
-                        gw,
-                        &#p,
-                        __bnb_code,
-                        __bnb_scratch,
-                        #out,
-                        #in_features,
-                        #blocksize,
-                    )
+                    ::ferrite_forward::load_layered_bnb4(
+                        gw, #n_lit, #suffix,
+                        __bnb_code, __bnb_scratch,
+                        #out, #in_features, #blocksize,
+                    )?
                 }
             } else {
-                let (binds, refs) = layer_templated_prefix_array(prefixes);
+                let suffixes: Vec<&str> = prefixes.iter().map(|p| layered_suffix(p)).collect();
                 quote! {
-                    {
-                        #(#binds)*
-                        ::ferrite_kernels::layers::Bnb4bitLinear::load_concat(
-                            gw,
-                            &[ #(#refs),* ],
-                            __bnb_code,
-                            __bnb_scratch,
-                            &[ #(#outs),* ],
-                            #in_features,
-                            #blocksize,
-                        )
-                    }
+                    ::ferrite_forward::load_layered_bnb4_concat(
+                        gw, #n_lit,
+                        &[ #(#suffixes),* ],
+                        __bnb_code, __bnb_scratch,
+                        &[ #(#outs),* ],
+                        #in_features, #blocksize,
+                    )?
                 }
             }
         }
@@ -2718,21 +2681,25 @@ fn emit_layered_load_body(plan: &FieldLoad) -> TokenStream {
             let n_expert_group = *n_expert_group;
             let topk_group = *topk_group;
             quote! {
-                ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer::load(
-                    gw,
-                    &#p,
-                    #n_routed_experts,
-                    #n_shared_experts,
-                    #top_k,
-                    #moe_intermediate_size,
-                    #hidden_size,
-                    #norm_topk_prob,
-                    #routed_scaling_factor,
-                    #use_sigmoid,
-                    #n_expert_group,
-                    #topk_group,
-                    stream,
-                )
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer::load(
+                            gw,
+                            &#p,
+                            #n_routed_experts,
+                            #n_shared_experts,
+                            #top_k,
+                            #moe_intermediate_size,
+                            #hidden_size,
+                            #norm_topk_prob,
+                            #routed_scaling_factor,
+                            #use_sigmoid,
+                            #n_expert_group,
+                            #topk_group,
+                            stream,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
             }
         }
     }
@@ -3904,39 +3871,49 @@ mod tests {
     #[test]
     fn emit_layered_load_body_uses_layer_template_for_rmsnorm() {
         let plan = FieldLoad::RmsNorm("model.layers.0.input_layernorm".to_string(), 1e-5);
-        let ts = emit_layered_load_body(&plan).to_string();
-        // Calls the kernel layer's load fn,
-        assert!(ts.contains("RmsNorm :: load"));
-        // threads gw + the layer-templated prefix via the
-        // `layer_weight_path` helper (suffix passed as a bare
-        // `&str`, fn-call expansion replaces the 5-line `format!`),
-        assert!(ts.contains("layer_weight_path"));
+        let ts = emit_layered_load_body(&plan, 32).to_string();
+        // Delegates to the load_layered_rms_norm helper in
+        // ferrite-forward. The closure / collect / Vec annotation
+        // the loop used to emit per accessor are now owned by the
+        // helper — call sites collapse to one line.
+        assert!(
+            ts.contains("load_layered_rms_norm"),
+            "expected helper call, got: {ts}"
+        );
+        // Threads (gw, n_layers, suffix, eps) — the suffix is the
+        // post-`model.layers.0.` tail, n_layers is the count.
         assert!(ts.contains("\"input_layernorm\""));
+        assert!(ts.contains("32"));
         // and bakes the static eps literal.
         assert!(ts.contains("0.00001"));
+        // No closure / collect machinery on the call site.
+        assert!(!ts.contains(". collect"));
+        assert!(!ts.contains("| layer :"));
     }
 
     #[test]
     fn emit_layered_load_body_binds_locals_for_concat_prefixes() {
-        // load_dense_concat takes &[&str], not &[&String]; the helper
-        // must bind each `layer_weight_path()` call to a String local
-        // first and pass `__p_<i>.as_str()` to materialize the &str
-        // slice. Without the bind step, the generated code wouldn't
-        // typecheck.
+        // The `_concat` helpers take `&[&str]` of suffixes; the
+        // emitter strips each `model.layers.0.` prefix down to the
+        // tail and bakes them as a static `&[…]`. The per-iteration
+        // String binds + as_str refs the previous shape needed are
+        // now owned by `load_layered_linear_dense_concat`.
         let plan = FieldLoad::LinearConcat(vec![
             "model.layers.0.self_attn.q_proj".to_string(),
             "model.layers.0.self_attn.k_proj".to_string(),
             "model.layers.0.self_attn.v_proj".to_string(),
         ]);
-        let ts = emit_layered_load_body(&plan).to_string();
-        assert!(ts.contains("load_dense_concat"));
-        assert!(ts.contains("__p_0"));
-        assert!(ts.contains("__p_1"));
-        assert!(ts.contains("__p_2"));
-        assert!(ts.contains(". as_str ()"));
-        assert!(ts.contains("layer_weight_path"));
+        let ts = emit_layered_load_body(&plan, 32).to_string();
+        assert!(
+            ts.contains("load_layered_linear_dense_concat"),
+            "expected helper call, got: {ts}"
+        );
         assert!(ts.contains("\"self_attn.q_proj\""));
         assert!(ts.contains("\"self_attn.k_proj\""));
         assert!(ts.contains("\"self_attn.v_proj\""));
+        // No per-iteration String bind / .as_str() / closure tokens.
+        assert!(!ts.contains("__p_0"));
+        assert!(!ts.contains(". as_str ()"));
+        assert!(!ts.contains("| layer :"));
     }
 }

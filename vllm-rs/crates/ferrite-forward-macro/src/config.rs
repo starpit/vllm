@@ -207,9 +207,8 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
     // per-arch crate's build.rs declares
     // `cargo:rerun-if-env-changed=FERRITE_MODELS` so cargo's
     // incremental cache invalidates when this changes.
-    let enabled: Option<std::collections::HashSet<String>> = std::env::var("FERRITE_MODELS")
-        .ok()
-        .map(|s| {
+    let enabled: Option<std::collections::HashSet<String>> =
+        std::env::var("FERRITE_MODELS").ok().map(|s| {
             s.split(',')
                 .map(|x| x.trim().to_string())
                 .filter(|x| !x.is_empty())
@@ -362,10 +361,8 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
         // whether the requested stem matches any available stem
         // after dot→dash normalization.
         if !available.is_empty() && out.is_empty() {
-            let normalized: std::collections::HashMap<String, &String> = available
-                .iter()
-                .map(|s| (s.replace('.', "-"), s))
-                .collect();
+            let normalized: std::collections::HashMap<String, &String> =
+                available.iter().map(|s| (s.replace('.', "-"), s)).collect();
             let suggestions: Vec<&String> = set
                 .iter()
                 .filter_map(|req| {

@@ -193,6 +193,39 @@ trait HasSolvedSig {
     fn model_name(&self) -> &str;
 }
 
+/// One stable string per QuantMethod *FieldLoad arm* the codegen
+/// will emit. AWQ/GPTQ/CT collapse to `q:awq` / `q:gptq` because
+/// they all share the `MarlinLinear` arm (the runtime
+/// `marlin_storage` discriminator covers their on-disk split).
+/// FP8 splits on `block_size`: per-tensor / per-channel goes to
+/// `Fp8Linear` (1D scale), blockwise goes to `Fp8BlockLinear`
+/// (2D scale) — different `load_with` bodies, so they cannot
+/// share a canonical.
+///
+/// Threaded into `dedup_signature` so equivalence-class hashing
+/// keeps FP8 block / std variants in separate canonicals. Without
+/// this discriminator, qwen3's `fp8-block-128x128` and
+/// `fp8-dynamic-per-tensor` hash identical (Impl picks match,
+/// bounds match), `block` wins canonical alphabetically, the
+/// `dynamic` shim calls `Fp8BlockLinear::load` on a 1D scale, and
+/// the kernel panics during graph capture with `FP8 block scale
+/// must be 2D, got 1D`.
+fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String {
+    match method {
+        None => "q:dense".to_string(),
+        Some(crate::quantization::QuantMethod::Awq { .. }) => "q:awq".to_string(),
+        Some(crate::quantization::QuantMethod::Gptq { .. }) => "q:gptq".to_string(),
+        Some(crate::quantization::QuantMethod::Bnb4 { .. }) => "q:bnb4".to_string(),
+        Some(crate::quantization::QuantMethod::Fp8 { block_size, .. }) => {
+            if block_size.is_some() {
+                "q:fp8-block".to_string()
+            } else {
+                "q:fp8-std".to_string()
+            }
+        }
+    }
+}
+
 fn fmt_us(us: f64) -> String {
     if us < 1000.0 {
         format!("{us:.0}µs")
@@ -418,6 +451,9 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             // non-trivial vector) MUST NOT share a canonical — the
             // shim would bake the canonical's rotary for both.
             parts.push(format!("r:{}", self.model.rope_scaling_hash.unwrap_or(0)));
+            parts.push(dedup_quant_sig(
+                self.model.quantization.as_ref().map(|qc| &qc.method),
+            ));
             // SFUF per (num_tokens, sk_bucket) point: which Impl runs
             // at each subgraph. Identical SFUFs → each impl's
             // `emit_call` produces identical output at identical
@@ -939,5 +975,143 @@ fn emit_model_stub_items(
     let num_tiles = fuf.len();
     quote! {
         pub const NUM_TILES: usize = #num_tiles;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quantization::{BnbQuantType, Fp8ActivationScheme, GptqLayout, QuantMethod};
+
+    /// `dedup_quant_sig` must keep FP8 block and per-tensor / per-
+    /// channel variants on separate canonicals — the load_with body
+    /// emits `Fp8BlockLinear::load` for one and `Fp8Linear::load` for
+    /// the other, and the runtime kernels can't share a path
+    /// (`Fp8BlockLinear::load` panics on a 1D scale tensor).
+    #[test]
+    fn dedup_quant_sig_separates_fp8_block_from_fp8_std() {
+        let block = QuantMethod::Fp8 {
+            scheme: Fp8ActivationScheme::Dynamic,
+            block_size: Some([128, 128]),
+        };
+        let std_dyn = QuantMethod::Fp8 {
+            scheme: Fp8ActivationScheme::Dynamic,
+            block_size: None,
+        };
+        let std_static = QuantMethod::Fp8 {
+            scheme: Fp8ActivationScheme::Static,
+            block_size: None,
+        };
+        // Block vs std must differ — that's the load-arm split.
+        assert_ne!(
+            dedup_quant_sig(Some(&block)),
+            dedup_quant_sig(Some(&std_dyn))
+        );
+        // Within `std`, dynamic vs static can share a canonical:
+        // both go through `Fp8Linear::load`, the activation_scheme
+        // is a runtime Impl detail (Fp8GemmImpl handles both).
+        assert_eq!(
+            dedup_quant_sig(Some(&std_dyn)),
+            dedup_quant_sig(Some(&std_static))
+        );
+    }
+
+    /// AWQ and GPTQ all collapse to one Marlin discriminator —
+    /// AWQ/GPTQ/CT variants of the same dense base SHOULD share
+    /// a canonical (the runtime `marlin_storage` param threads in
+    /// the on-disk format). Compressed-tensors INT4 routes through
+    /// `QuantMethod::Gptq`, so it lands on `q:gptq` alongside
+    /// AutoGPTQ.
+    #[test]
+    fn dedup_quant_sig_collapses_awq_and_gptq_internally() {
+        let awq_a = QuantMethod::Awq {
+            bits: 4,
+            group_size: 128,
+            zero_point: true,
+            version: crate::quantization::AwqVersion::Gemm,
+        };
+        let awq_b = QuantMethod::Awq {
+            bits: 4,
+            group_size: 64,
+            zero_point: true,
+            version: crate::quantization::AwqVersion::Gemm,
+        };
+        // Same arm, regardless of group_size.
+        assert_eq!(dedup_quant_sig(Some(&awq_a)), dedup_quant_sig(Some(&awq_b)));
+        let gptq = QuantMethod::Gptq {
+            bits: 4,
+            group_size: 128,
+            desc_act: true,
+            sym: true,
+            layout: GptqLayout::Qweight,
+        };
+        // AWQ and GPTQ must NOT collapse — different MarlinFormat
+        // discriminator threaded at load time, but more importantly
+        // their `marlin_storage` literal differs in the prelude.
+        assert_ne!(dedup_quant_sig(Some(&awq_a)), dedup_quant_sig(Some(&gptq)));
+    }
+
+    /// BNB4 has its own FieldLoad arm (`Bnb4bitLinear::load`),
+    /// distinct from FP8 / Marlin / Dense.
+    #[test]
+    fn dedup_quant_sig_keeps_bnb4_separate() {
+        let bnb = QuantMethod::Bnb4 {
+            quant_type: BnbQuantType::NF4,
+            blocksize: 64,
+        };
+        let dense = None;
+        assert_ne!(dedup_quant_sig(Some(&bnb)), dedup_quant_sig(dense));
+    }
+
+    /// `compute_canonical_variants` end-to-end: with the q-sig
+    /// discriminator in `dedup_signature`, FP8 block stays its own
+    /// canonical while dynamic+static fold together (alphabetically
+    /// `dynamic` wins). This is the regression test for the
+    /// qwen3-fp8-dynamic graph-capture panic.
+    #[test]
+    fn fp8_block_and_std_pick_separate_canonicals() {
+        struct Fake {
+            sig: String,
+            stem: String,
+            name: String,
+        }
+        impl HasSolvedSig for Fake {
+            fn dedup_signature(&self) -> String {
+                self.sig.clone()
+            }
+            fn source_stem(&self) -> &str {
+                &self.stem
+            }
+            fn model_name(&self) -> &str {
+                &self.name
+            }
+        }
+        // All four share every other dedup key (bounds, scalars,
+        // rope, SFUF) and differ only in the q-sig — exactly the
+        // qwen3 case the bug surfaced on.
+        let solved = vec![
+            Fake {
+                sig: "x|q:fp8-block".into(),
+                stem: "qwen3-0.6b-fp8-block-128x128".into(),
+                name: "qwen3_0_6b_fp8_block_128x128".into(),
+            },
+            Fake {
+                sig: "x|q:fp8-std".into(),
+                stem: "qwen3-0.6b-fp8-dynamic-per-tensor".into(),
+                name: "qwen3_0_6b_fp8_dynamic_per_tensor".into(),
+            },
+            Fake {
+                sig: "x|q:fp8-std".into(),
+                stem: "qwen3-0.6b-fp8-static-per-tensor".into(),
+                name: "qwen3_0_6b_fp8_static_per_tensor".into(),
+            },
+        ];
+        let map = compute_canonical_variants(&solved);
+        // Block stays its own canonical.
+        assert_eq!(map[&0].to_string(), "qwen3_0_6b_fp8_block_128x128");
+        // Dynamic + static collapse to dynamic (alphabetically
+        // earliest stem in the {dynamic, static} pair).
+        assert_eq!(map[&1].to_string(), "qwen3_0_6b_fp8_dynamic_per_tensor");
+        assert_eq!(map[&2].to_string(), "qwen3_0_6b_fp8_dynamic_per_tensor");
     }
 }

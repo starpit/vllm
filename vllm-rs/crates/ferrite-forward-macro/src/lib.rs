@@ -213,26 +213,18 @@ fn fmt_us(us: f64) -> String {
     }
 }
 
-fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path::PathBuf, String> {
-    let mut checked: Vec<std::path::PathBuf> = Vec::new();
-    let mut cur: Option<&std::path::Path> = Some(start);
-    while let Some(dir) = cur {
-        let candidate = dir.join("model_architectures").join(arch);
-        if candidate.is_dir() {
-            return Ok(candidate);
-        }
-        checked.push(candidate);
-        cur = dir.parent();
+fn discover_models_dir(start: &std::path::Path, _arch: &str) -> Result<std::path::PathBuf, String> {
+    // Configs now live next to the per-arch crate's `Cargo.toml`,
+    // under `configs/`. Each per-arch crate owns its model JSONs so
+    // cargo features can gate them — `model_architectures/<arch>/`
+    // at repo root is gone.
+    let candidate = start.join("configs");
+    if candidate.is_dir() {
+        return Ok(candidate);
     }
     Err(format!(
-        "no `model_architectures/{arch}` directory found walking up from {}. \
-         Searched: {}",
-        start.display(),
-        checked
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", "),
+        "no `configs/` directory found at {}",
+        candidate.display(),
     ))
 }
 
@@ -286,6 +278,14 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         )
     })?;
     if models.is_empty() {
+        // FERRITE_MODELS filter that excludes every model in this
+        // arch is OK — emit an empty crate so cross-arch builds
+        // (e.g. `FERRITE_MODELS=llama-3.2-3b cargo build -p
+        // ferrite-models`) succeed for arches that don't match.
+        // load_dir already warned to stderr with did-you-mean.
+        if std::env::var_os("FERRITE_MODELS").is_some() {
+            return Ok(quote! {});
+        }
         return Err(syn::Error::new(
             carrier.sig.ident.span(),
             format!("no *.json configs in {}", models_dir.display()),
@@ -690,7 +690,7 @@ fn emit_arch_dispatcher(
     // agree on every bound AND quant flag — today only rope params
     // would differ) resolve to the earliest declared — a known
     // limitation; authors with that collision should drop one of
-    // the colliding configs from `model_architectures/`.
+    // the colliding configs.
     let try_fingerprint_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
         .map(|(model_ident, _)| {

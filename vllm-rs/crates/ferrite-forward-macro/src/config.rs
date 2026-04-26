@@ -200,6 +200,22 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
         return Err(ConfigError::NotADirectory(dir.to_path_buf()));
     }
 
+    // Optional dev-iteration filter. `FERRITE_MODELS=stem1,stem2,...`
+    // restricts the macro to those exact model stems (matching base
+    // file stems and synthesized `<base>-<preset>` variants); unset
+    // means no filter — every model in the directory compiles. The
+    // per-arch crate's build.rs declares
+    // `cargo:rerun-if-env-changed=FERRITE_MODELS` so cargo's
+    // incremental cache invalidates when this changes.
+    let enabled: Option<std::collections::HashSet<String>> = std::env::var("FERRITE_MODELS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        });
+
     let all_json: Vec<PathBuf> = fs::read_dir(dir)
         .map_err(|source| ConfigError::Io {
             path: dir.to_path_buf(),
@@ -274,11 +290,32 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
 
-        // Presets live at `<arch_parent>/quantizations/<preset>.json`.
-        let preset_root = dir
-            .parent()
-            .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?
-            .join("quantizations");
+        // Presets live in the shared `ferrite-quantizations` crate.
+        // Walk up from `dir` (which is `<crate>/configs/`) to find
+        // the workspace root (first ancestor with a `Cargo.toml`
+        // containing `[workspace]`), then descend to
+        // `crates/ferrite-quantizations/presets/`.
+        let preset_root = {
+            let mut cur: Option<&Path> = Some(dir);
+            let mut found: Option<PathBuf> = None;
+            while let Some(d) = cur {
+                let cargo_toml = d.join("Cargo.toml");
+                if cargo_toml.exists() {
+                    if let Ok(s) = fs::read_to_string(&cargo_toml) {
+                        if s.contains("[workspace]") {
+                            found = Some(
+                                d.join("crates")
+                                    .join("ferrite-quantizations")
+                                    .join("presets"),
+                            );
+                            break;
+                        }
+                    }
+                }
+                cur = d.parent();
+            }
+            found.ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?
+        };
 
         for preset_name in &presets {
             let preset_path = preset_root.join(format!("{preset_name}.json"));
@@ -308,6 +345,60 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
     // arch-dispatcher arm order stays deterministic across
     // `quantizations.json` edits.
     out.sort_by(|a, b| a.source_stem.cmp(&b.source_stem));
+
+    if let Some(set) = &enabled {
+        // Empty result is OK — when FERRITE_MODELS filters every
+        // model out of one arch (e.g. user is iterating on llama
+        // and all arches are enabled), this arch's dispatcher emits
+        // an empty Weights enum and no inventory registration. The
+        // downstream emit_arch_dispatcher already handles empty
+        // arms by producing nothing.
+        let available: Vec<String> = out.iter().map(|m| m.source_stem.clone()).collect();
+        out.retain(|m| set.contains(&m.source_stem));
+
+        // Typo detection: warn (don't fail) when the filter was
+        // non-empty AND this arch had models AND none matched. The
+        // most common gotcha is dot-vs-dash on stems like
+        // `llama-3.2-3b` — surface the right spelling by checking
+        // whether the requested stem matches any available stem
+        // after dot→dash normalization.
+        if !available.is_empty() && out.is_empty() {
+            let normalized: std::collections::HashMap<String, &String> = available
+                .iter()
+                .map(|s| (s.replace('.', "-"), s))
+                .collect();
+            let suggestions: Vec<&String> = set
+                .iter()
+                .filter_map(|req| {
+                    normalized
+                        .get(&req.replace('.', "-"))
+                        .copied()
+                        .filter(|orig| *orig != req)
+                })
+                .collect();
+            let mut req_sorted: Vec<&String> = set.iter().collect();
+            req_sorted.sort();
+            eprintln!(
+                "ferrite · warn: FERRITE_MODELS={:?} matched 0 of {} models in {}",
+                req_sorted,
+                available.len(),
+                dir.display(),
+            );
+            if !suggestions.is_empty() {
+                let mut sug_sorted: Vec<&&String> = suggestions.iter().collect();
+                sug_sorted.sort();
+                eprintln!(
+                    "           did you mean: {}",
+                    sug_sorted
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+        }
+    }
+
     Ok(out)
 }
 

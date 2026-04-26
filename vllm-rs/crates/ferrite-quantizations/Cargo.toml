@@ -1,0 +1,6 @@
+[package]
+name = "ferrite-quantizations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared quantization preset definitions used by every ferrite-model-<arch> crate"

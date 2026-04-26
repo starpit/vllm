@@ -35,6 +35,7 @@ members = [
     "crates/ferrite-model-qwen3",
     "crates/ferrite-model-deepseek-v2",
     "crates/ferrite-model-deepseek-v3",
+    "crates/ferrite-quantizations",
     "crates/ferrite-cuda-builder",
     "crates/ferrite-forward",
     "crates/ferrite-forward-macro",

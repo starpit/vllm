@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! probe-weights — bootstrap a new model architecture's
-//! `model_architectures/<arch>/` directory by downloading `config.json`
-//! for each listed HuggingFace repo and extracting a per-arch
-//! `weights.json` manifest from one representative checkpoint's
-//! safetensors header.
+//! `crates/ferrite-model-<arch>/configs/` directory by downloading
+//! `config.json` for each listed HuggingFace repo and extracting a
+//! per-arch `weights.json` manifest from one representative
+//! checkpoint's safetensors header.
 //!
 //! Usage:
 //! ```text
@@ -12,13 +12,13 @@
 //!     Qwen/Qwen3-0.6B Qwen/Qwen3-1.7B Qwen/Qwen3-4B Qwen/Qwen3-8B
 //! ```
 //!
-//! Output for the above command (relative to repo root):
+//! Output for the above command (under workspace root):
 //! ```text
-//! model_architectures/qwen3/qwen3-0.6b.json
-//! model_architectures/qwen3/qwen3-1.7b.json
-//! model_architectures/qwen3/qwen3-4b.json
-//! model_architectures/qwen3/qwen3-8b.json
-//! model_architectures/qwen3/weights.json
+//! crates/ferrite-model-qwen3/configs/qwen3-0.6b.json
+//! crates/ferrite-model-qwen3/configs/qwen3-1.7b.json
+//! crates/ferrite-model-qwen3/configs/qwen3-4b.json
+//! crates/ferrite-model-qwen3/configs/qwen3-8b.json
+//! crates/ferrite-model-qwen3/configs/weights.json
 //! ```
 //!
 //! TODO (future): add a `--hf-family Qwen/Qwen3` auto-discovery mode
@@ -40,9 +40,12 @@ use serde_json::{Map, Value};
 #[derive(Parser, Debug)]
 #[command(about = "Bootstrap a ferrite-forward model architecture directory from HF")]
 struct Args {
-    /// Architecture name — determines the output subdirectory under
-    /// `model_architectures/`. Use the arch's standard HF
-    /// `model_type` value (e.g. `qwen3`, `gemma3`, `llama`).
+    /// Architecture name — used to locate
+    /// `crates/ferrite-model-<arch>/configs/` under the workspace
+    /// root. Use the arch's standard HF `model_type` value (e.g.
+    /// `qwen3`, `gemma3`, `llama`). Underscores in the arch name
+    /// (e.g. `deepseek_v2`) are converted to dashes when locating
+    /// the crate directory.
     #[arg(long)]
     arch: String,
 
@@ -53,10 +56,14 @@ struct Args {
     #[arg(required = true)]
     repos: Vec<String>,
 
-    /// Root output directory. Defaults to `model_architectures` in
-    /// the current working directory (run from the repo root).
-    #[arg(long, default_value = "model_architectures")]
-    out_dir: PathBuf,
+    /// Override for the output directory. When omitted, the prober
+    /// walks up from the current working directory to find the
+    /// workspace root, then writes to
+    /// `<workspace>/crates/ferrite-model-<arch>/configs/`. The crate
+    /// must already exist (see `vllm-rs/docs/MODELS.md` for the
+    /// new-arch recipe).
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
 
     /// Overwrite existing size configs and weights.json. Without
     /// this flag, the prober refuses to clobber a committed
@@ -65,10 +72,50 @@ struct Args {
     force: bool,
 }
 
+/// Walk up from `start` to find the workspace root — the nearest
+/// ancestor whose `Cargo.toml` contains `[workspace]`.
+fn find_workspace_root(start: &Path) -> Result<PathBuf> {
+    let mut cur: Option<&Path> = Some(start);
+    while let Some(d) = cur {
+        let cargo_toml = d.join("Cargo.toml");
+        if cargo_toml.exists()
+            && fs::read_to_string(&cargo_toml)
+                .ok()
+                .is_some_and(|s| s.contains("[workspace]"))
+        {
+            return Ok(d.to_path_buf());
+        }
+        cur = d.parent();
+    }
+    Err(anyhow!(
+        "no workspace `Cargo.toml` (with `[workspace]`) found walking up from {}",
+        start.display(),
+    ))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let arch_dir = args.out_dir.join(&args.arch);
-    fs::create_dir_all(&arch_dir).with_context(|| format!("creating {}", arch_dir.display()))?;
+
+    // Resolve the configs/ directory: explicit override or inferred
+    // from arch + workspace root. Crate names use dashes, arch DSL
+    // idents may use underscores (e.g. `deepseek_v2` →
+    // `ferrite-model-deepseek-v2`).
+    let arch_dir = match args.out_dir.clone() {
+        Some(p) => p,
+        None => {
+            let cwd = std::env::current_dir().context("reading current directory")?;
+            let workspace = find_workspace_root(&cwd)?;
+            let crate_name = format!("ferrite-model-{}", args.arch.replace('_', "-"));
+            workspace.join("crates").join(crate_name).join("configs")
+        }
+    };
+    if !arch_dir.is_dir() {
+        bail!(
+            "configs directory does not exist: {}\n\
+             Create the per-arch crate first (see vllm-rs/docs/MODELS.md).",
+            arch_dir.display(),
+        );
+    }
 
     let api = Api::new().context("initializing HuggingFace Hub API")?;
 

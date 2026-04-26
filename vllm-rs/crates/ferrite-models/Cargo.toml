@@ -6,30 +6,59 @@ license.workspace = true
 description = "Ferrite model architectures using #[forward] macro"
 
 [features]
-default = []
+default = ["all-arches"]
+
+# Per-arch flags. Each one pulls in the corresponding ferrite-model-<arch>
+# crate. The umbrella `all-arches` enables every arch.
+arch-commandr      = ["dep:ferrite-model-commandr"]
+arch-deepseek-v2   = ["dep:ferrite-model-deepseek-v2"]
+arch-deepseek-v3   = ["dep:ferrite-model-deepseek-v3"]
+arch-gemma2        = ["dep:ferrite-model-gemma2"]
+arch-gemma3        = ["dep:ferrite-model-gemma3"]
+arch-granite       = ["dep:ferrite-model-granite"]
+arch-llama         = ["dep:ferrite-model-llama"]
+arch-mistral       = ["dep:ferrite-model-mistral"]
+arch-phi3          = ["dep:ferrite-model-phi3"]
+arch-qwen2         = ["dep:ferrite-model-qwen2"]
+arch-qwen3         = ["dep:ferrite-model-qwen3"]
+
+all-arches = [
+    "arch-commandr",
+    "arch-deepseek-v2",
+    "arch-deepseek-v3",
+    "arch-gemma2",
+    "arch-gemma3",
+    "arch-granite",
+    "arch-llama",
+    "arch-mistral",
+    "arch-phi3",
+    "arch-qwen2",
+    "arch-qwen3",
+]
+
 cuda = [
-    "ferrite-model-commandr/cuda",
-    "ferrite-model-gemma2/cuda",
-    "ferrite-model-gemma3/cuda",
-    "ferrite-model-granite/cuda",
-    "ferrite-model-llama/cuda",
-    "ferrite-model-mistral/cuda",
-    "ferrite-model-phi3/cuda",
-    "ferrite-model-qwen2/cuda",
-    "ferrite-model-qwen3/cuda",
-    "ferrite-model-deepseek-v2/cuda",
-    "ferrite-model-deepseek-v3/cuda",
+    "ferrite-model-commandr?/cuda",
+    "ferrite-model-gemma2?/cuda",
+    "ferrite-model-gemma3?/cuda",
+    "ferrite-model-granite?/cuda",
+    "ferrite-model-llama?/cuda",
+    "ferrite-model-mistral?/cuda",
+    "ferrite-model-phi3?/cuda",
+    "ferrite-model-qwen2?/cuda",
+    "ferrite-model-qwen3?/cuda",
+    "ferrite-model-deepseek-v2?/cuda",
+    "ferrite-model-deepseek-v3?/cuda",
 ]
 
 [dependencies]
-ferrite-model-commandr = { path = "../ferrite-model-commandr" }
-ferrite-model-deepseek-v2 = { path = "../ferrite-model-deepseek-v2" }
-ferrite-model-deepseek-v3 = { path = "../ferrite-model-deepseek-v3" }
-ferrite-model-gemma2 = { path = "../ferrite-model-gemma2" }
-ferrite-model-gemma3 = { path = "../ferrite-model-gemma3" }
-ferrite-model-granite = { path = "../ferrite-model-granite" }
-ferrite-model-llama = { path = "../ferrite-model-llama" }
-ferrite-model-mistral = { path = "../ferrite-model-mistral" }
-ferrite-model-phi3 = { path = "../ferrite-model-phi3" }
-ferrite-model-qwen2 = { path = "../ferrite-model-qwen2" }
-ferrite-model-qwen3 = { path = "../ferrite-model-qwen3" }
+ferrite-model-commandr     = { path = "../ferrite-model-commandr",     optional = true }
+ferrite-model-deepseek-v2  = { path = "../ferrite-model-deepseek-v2",  optional = true }
+ferrite-model-deepseek-v3  = { path = "../ferrite-model-deepseek-v3",  optional = true }
+ferrite-model-gemma2       = { path = "../ferrite-model-gemma2",       optional = true }
+ferrite-model-gemma3       = { path = "../ferrite-model-gemma3",       optional = true }
+ferrite-model-granite      = { path = "../ferrite-model-granite",      optional = true }
+ferrite-model-llama        = { path = "../ferrite-model-llama",        optional = true }
+ferrite-model-mistral      = { path = "../ferrite-model-mistral",      optional = true }
+ferrite-model-phi3         = { path = "../ferrite-model-phi3",         optional = true }
+ferrite-model-qwen2        = { path = "../ferrite-model-qwen2",        optional = true }
+ferrite-model-qwen3        = { path = "../ferrite-model-qwen3",        optional = true }

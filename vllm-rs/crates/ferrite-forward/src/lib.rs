@@ -34,9 +34,13 @@ pub use tile_table::{TileEntry, take_owned, tile_ref, view};
 /// generated code used to emit. Each canonical's
 /// `static FORWARD_TABLE: &[BucketEntry<Instruction<Weights>>]`
 /// describes the workload-bucket boundaries
-/// (`m_min` / `m_max_excl` / `sk_min` / `sk_max_excl`) and the
-/// static `Instruction` slices (backbone + lm_head) that bucket
-/// runs.
+/// (`m_min` / `m_max_excl` / `sk_min` / `sk_max_excl`), the static
+/// `Instruction` slices (backbone + lm_head), and the slot-map
+/// metadata that varies per bucket because the solver picks
+/// different Impls per workload point (e.g. `CutlassGemmAdd` fuses
+/// the residual add into the GEMM at prefill, saving a slot vs the
+/// decode-bucket's separate-Add path; that shifts the terminal
+/// output's slot index).
 ///
 /// Tuple-struct so prettyplease can collapse each entry to one
 /// line in expanded source. Field order:
@@ -47,10 +51,9 @@ pub use tile_table::{TileEntry, take_owned, tile_ref, view};
 ///   3 = sk_max_excl    (exclusive; `u64::MAX` when no sk axis)
 ///   4 = backbone       — static `Op` slice for this bucket's body
 ///   5 = lm_head        — static `Op` slice for this bucket's tail
-///
-/// `num_slots`, `terminal_slot`, `backbone_slot` are canonical-
-/// invariant — they live as per-canonical `const`s in the emitted
-/// module instead of riding on every entry.
+///   6 = num_slots      — tile-table size for `run`/`run_backbone`
+///   7 = backbone_slot  — slot `forward_backbone` returns
+///   8 = terminal_slot  — slot `forward` returns (after lm_head)
 #[cfg(feature = "cuda")]
 pub struct BucketEntry<Op: 'static>(
     pub u64,
@@ -59,6 +62,9 @@ pub struct BucketEntry<Op: 'static>(
     pub u64,
     pub &'static [Op],
     pub &'static [Op],
+    pub u32,
+    pub u32,
+    pub u32,
 );
 
 /// Linear-scan bucket lookup. Falls back to `table[0]` when no row

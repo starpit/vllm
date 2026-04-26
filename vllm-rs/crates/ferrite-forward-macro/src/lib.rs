@@ -225,10 +225,7 @@ fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path:
     let crate_dir_name = format!("ferrite-model-{}", arch.replace('_', "-"));
     let mut cur: Option<&std::path::Path> = Some(start);
     while let Some(d) = cur {
-        let candidate = d
-            .join("crates")
-            .join(&crate_dir_name)
-            .join("configs");
+        let candidate = d.join("crates").join(&crate_dir_name).join("configs");
         if candidate.is_dir() {
             return Ok(candidate);
         }

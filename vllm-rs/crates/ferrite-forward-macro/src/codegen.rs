@@ -3330,6 +3330,17 @@ pub fn emit_model(
         let canonical = bucket_canonical[i];
         let bb_static = bucket_static_ident("BACKBONE_M", canonical);
         let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
+        // Per-bucket slot metadata. The colored slot map is built
+        // per workload point (the solver may pick Impls that need
+        // different intermediate-tile counts per bucket — e.g.
+        // CutlassGemmAdd fuses the residual into the GEMM at
+        // prefill, freeing a slot vs the decode-bucket's separate
+        // Add). The non-canonical buckets share their canonical's
+        // slot metadata since they share its static slices.
+        let (_, num_slots_b, backbone_slot_b, terminal_slot_b) = &canonical_lowered[&canonical];
+        let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
+        let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_b);
+        let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
         let m_idx = m_idx_of[&wp.num_tokens];
         let m_min = if wp.num_tokens == 1 {
             1
@@ -3379,28 +3390,13 @@ pub fn emit_model(
             quote! { #v }
         };
         bucket_table_entries.push(quote! {
-            __B(#m_min_lit, #m_max_lit, #sk_min_lit, #sk_max_lit, #bb_static, #lm_static),
+            __B(
+                #m_min_lit, #m_max_lit, #sk_min_lit, #sk_max_lit,
+                #bb_static, #lm_static,
+                #num_slots_lit, #backbone_slot_lit, #terminal_slot_lit,
+            ),
         });
     }
-
-    // Per-canonical-invariant slot consts: every entry in this
-    // canonical's FORWARD_TABLE shares the same values (the slot
-    // map is built once per canonical, not per wp). Pulled out to
-    // const-scope to save 3 lines per entry in the expanded source.
-    let first_canonical = bucket_canonical[0];
-    let (_, num_slots_first, backbone_slot_first, terminal_slot_first) =
-        &canonical_lowered[&first_canonical];
-    let num_slots_const = proc_macro2::Literal::u32_unsuffixed(*num_slots_first);
-    let backbone_slot_const = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_first);
-    let terminal_slot_const = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_first);
-    let dispatch_consts = quote! {
-        #[cfg(feature = "cuda")]
-        const NUM_SLOTS: u32 = #num_slots_const;
-        #[cfg(feature = "cuda")]
-        const TERMINAL_SLOT: u32 = #terminal_slot_const;
-        #[cfg(feature = "cuda")]
-        const BACKBONE_SLOT: u32 = #backbone_slot_const;
-    };
 
     // FORWARD_TABLE — one row per bucket. `__B` aliases the
     // `BucketEntry` tuple-struct constructor so each row stays on a
@@ -3426,8 +3422,6 @@ pub fn emit_model(
 
         #forward_table
 
-        #dispatch_consts
-
         /// Dispatch on (num_tokens, sk_bucket) → bucket entry, then
         /// run the universal interpreter.
         #[cfg(feature = "cuda")]
@@ -3442,9 +3436,7 @@ pub fn emit_model(
                 FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
             );
             unsafe {
-                ::ferrite_forward::run(
-                    e.4, e.5, wm, ctx, device, NUM_SLOTS, TERMINAL_SLOT,
-                )
+                ::ferrite_forward::run(e.4, e.5, wm, ctx, device, e.6, e.8)
             }
         }
 
@@ -3462,9 +3454,7 @@ pub fn emit_model(
                 FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
             );
             unsafe {
-                ::ferrite_forward::run_backbone(
-                    e.4, wm, ctx, device, NUM_SLOTS, BACKBONE_SLOT,
-                )
+                ::ferrite_forward::run_backbone(e.4, wm, ctx, device, e.6, e.7)
             }
         }
     }

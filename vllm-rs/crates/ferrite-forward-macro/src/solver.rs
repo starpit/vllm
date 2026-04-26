@@ -1018,43 +1018,62 @@ mod tests {
 
         for (wp, sfuf) in workloads.per_workload.iter() {
             let m = wp.num_tokens;
-            let mut fused_pair_count = 0;
+            let mut fused_add_rms_norm_count = 0;
             let mut singleton_rmsnorm_count = 0;
+            let mut singleton_add_count = 0;
+            let mut gemm_add_count = 0;
             for sg in sfuf.subgraphs() {
                 let tiles = sfuf.tiles_in_subgraph(sg);
                 let ops: Vec<OpKind> = tiles.iter().map(|t| fuf.get(*t).op).collect();
+                let imp_id = sfuf.impl_of(sg).unwrap();
+                let name = lib.get(imp_id).name();
                 if tiles.len() == 2 && ops.contains(&OpKind::Add) && ops.contains(&OpKind::RmsNorm)
                 {
-                    fused_pair_count += 1;
-                    let imp_id = sfuf.impl_of(sg).unwrap();
+                    fused_add_rms_norm_count += 1;
                     assert_eq!(
-                        lib.get(imp_id).name(),
-                        "fused_add_rms_norm",
+                        name, "fused_add_rms_norm",
                         "subgraph at m={m} has Add+RmsNorm topology but wrong impl",
                     );
                 } else if tiles.len() == 1 && ops[0] == OpKind::RmsNorm {
                     singleton_rmsnorm_count += 1;
-                    let imp_id = sfuf.impl_of(sg).unwrap();
                     assert_eq!(
-                        lib.get(imp_id).name(),
-                        "rmsnorm_ref",
+                        name, "rmsnorm_ref",
                         "singleton RmsNorm at m={m} bound to wrong impl",
                     );
+                } else if tiles.len() == 1 && ops[0] == OpKind::Add {
+                    singleton_add_count += 1;
+                } else if tiles.len() == 2
+                    && ops.contains(&OpKind::Gemm)
+                    && ops.contains(&OpKind::Add)
+                {
+                    gemm_add_count += 1;
                 }
             }
-            // 2 Adds per layer, each fuses with a following RmsNorm
-            // (post_attn or next input_layernorm / final norm) → 2*NL
-            // fused pairs.
+            // Every Add fuses into something — `fused_add_rms_norm`
+            // (always wins at decode m=1, where the upstream is a
+            // GEMV) or `cutlass_gemm_add` (wins at prefill m≥512
+            // via the beta=1.0 epilogue that amortizes the aux-read).
+            // No Add stays unfused.
             assert_eq!(
-                fused_pair_count,
-                2 * nl,
-                "expected 2*NL fused Add+RmsNorm pairs at m={m}",
+                singleton_add_count, 0,
+                "expected zero unfused Add subgraphs at m={m}",
             );
-            // Only the first layer's input_layernorm escapes fusion
-            // (upstream = embed, not Add). One singleton RmsNorm.
+            // 2 Adds per layer, each absorbed either by FusedAddRmsNorm
+            // or by CutlassGemmAdd. Sum equals 2*NL regardless of
+            // which fusion the solver chose.
             assert_eq!(
-                singleton_rmsnorm_count, 1,
-                "expected exactly one singleton RmsNorm (first input_layernorm) at m={m}",
+                fused_add_rms_norm_count + gemm_add_count,
+                2 * nl,
+                "expected fused_add_rms_norm + gemm_add to equal 2*NL at m={m}",
+            );
+            // Each `cutlass_gemm_add` fusion strands the downstream
+            // RmsNorm as a singleton. Plus the first layer's
+            // input_layernorm always escapes (upstream is Embed, not
+            // Add). So singleton RmsNorm count = 1 + gemm_add_count.
+            assert_eq!(
+                singleton_rmsnorm_count,
+                1 + gemm_add_count,
+                "expected 1 + gemm_add_count singleton RmsNorm at m={m}",
             );
         }
     }

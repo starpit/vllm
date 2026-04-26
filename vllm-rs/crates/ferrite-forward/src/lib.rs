@@ -9,8 +9,12 @@ pub use ferrite_forward_macro::forward;
 
 pub mod cpu_golden;
 #[cfg(feature = "cuda")]
+pub mod instr;
+#[cfg(feature = "cuda")]
 pub mod tile_table;
 
+#[cfg(feature = "cuda")]
+pub use instr::{CanonicalParams, Instruction, InterpreterCtx, run, run_backbone};
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};
 

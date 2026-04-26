@@ -14252,11 +14252,11 @@ mod tests {
         let enum_ident = quote::format_ident!("LlamaOp");
         let helper_ident = quote::format_ident!("__llama_interpret");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _enum_item: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _enum_item: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts = ops.emit_interpreter(&helper_ident, &enum_ident);
         // The helper is `unsafe fn` with attrs — parse as ItemFn.
-        let _helper_item: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _helper_item: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
     }
 
@@ -14316,11 +14316,11 @@ mod tests {
         ops.register(imp.opcode_shape(), imp.interpreter_arm(&model));
         let enum_ident = quote::format_ident!("LlamaOp");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__llama_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
 
         // Two synthetic OpInstances under one variant.
@@ -14352,7 +14352,6 @@ mod tests {
         ];
         let static_ts = crate::interpreter_codegen::emit_bucket_static_slice(
             &quote::format_ident!("FORWARD_M_1"),
-            &enum_ident,
             &shapes_by_name,
             &inputs,
         );
@@ -14409,11 +14408,11 @@ mod tests {
         ops.register(imp.opcode_shape(), imp.interpreter_arm(&model));
         let enum_ident = quote::format_ident!("CommandROp");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__cmdr_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
     }
 
@@ -14473,11 +14472,11 @@ mod tests {
         ops.register(imp.opcode_shape(), imp.interpreter_arm(&model));
         let enum_ident = quote::format_ident!("LlamaOp");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__llama_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
     }
 
@@ -14583,11 +14582,11 @@ mod tests {
         ops.register(imp.opcode_shape(), imp.interpreter_arm(&model));
         let enum_ident = quote::format_ident!("LlamaOp");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__llama_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
 
         // Two synthetic OpInstances under one variant — q_proj at
@@ -14622,7 +14621,6 @@ mod tests {
         ];
         let static_ts = crate::interpreter_codegen::emit_bucket_static_slice(
             &quote::format_ident!("FORWARD_M_1"),
-            &enum_ident,
             &shapes_by_name,
             &inputs,
         );
@@ -14684,11 +14682,11 @@ mod tests {
         ops.register(imp.opcode_shape(), imp.interpreter_arm(&model));
         let enum_ident = quote::format_ident!("LlamaOp");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__llama_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
 
         let mut shapes_by_name = std::collections::BTreeMap::new();
@@ -14708,7 +14706,6 @@ mod tests {
         )];
         let static_ts = crate::interpreter_codegen::emit_bucket_static_slice(
             &quote::format_ident!("FORWARD_M_1"),
-            &enum_ident,
             &shapes_by_name,
             &inputs,
         );
@@ -14767,11 +14764,11 @@ mod tests {
         ops.register(imp.opcode_shape(), imp.interpreter_arm(&model));
         let enum_ident = quote::format_ident!("LlamaOp");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__llama_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
 
         let mut shapes_by_name = std::collections::BTreeMap::new();
@@ -14791,7 +14788,6 @@ mod tests {
         )];
         let static_ts = crate::interpreter_codegen::emit_bucket_static_slice(
             &quote::format_ident!("FORWARD_M_1"),
-            &enum_ident,
             &shapes_by_name,
             &inputs,
         );
@@ -14846,11 +14842,11 @@ mod tests {
         ops.register(imp.opcode_shape(), imp.interpreter_arm(&model));
         let enum_ident = quote::format_ident!("LlamaOp");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__llama_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
 
         let mut shapes_by_name = std::collections::BTreeMap::new();
@@ -14870,7 +14866,6 @@ mod tests {
         )];
         let static_ts = crate::interpreter_codegen::emit_bucket_static_slice(
             &quote::format_ident!("FORWARD_M_1"),
-            &enum_ident,
             &shapes_by_name,
             &inputs,
         );
@@ -14904,12 +14899,20 @@ mod tests {
         let mut ops = crate::interpreter_codegen::ArchOpcodes::new();
         ops.register(shape.clone(), arm);
         let enum_ident = quote::format_ident!("LlamaOp");
+        // `emit_enum` returns enum + manual Clone impl as one
+        // TokenStream — parse as `syn::File` (multi-item) rather
+        // than `syn::ItemEnum`. `emit_interpreter` likewise returns
+        // dispatcher + driver fns; parse as `syn::File`. (The
+        // production codegen no longer calls these — the universal
+        // `Instruction::eval` lives in `ferrite-forward` — but the
+        // round-trip tests preserve the emit-side parse contract so
+        // a future regression in the emitters is caught here.)
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("{variant} emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__llama_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone()).unwrap_or_else(|e| {
+        let _: syn::File = syn::parse2(helper_ts.clone()).unwrap_or_else(|e| {
             panic!("{variant} emitted interpreter must parse: {e}\n{helper_ts}")
         });
     }
@@ -15215,11 +15218,11 @@ mod tests {
         ops.register(imp.opcode_shape(), imp.interpreter_arm(&model));
         let enum_ident = quote::format_ident!("LlamaOp");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__llama_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
     }
 
@@ -15265,11 +15268,11 @@ mod tests {
         ops.register(imp.opcode_shape(), imp.interpreter_arm(&model));
         let enum_ident = quote::format_ident!("LlamaOp");
         let enum_ts = ops.emit_enum(&enum_ident);
-        let _: syn::ItemEnum = syn::parse2(enum_ts.clone())
+        let _: syn::File = syn::parse2(enum_ts.clone())
             .unwrap_or_else(|e| panic!("emitted enum must parse: {e}\n{enum_ts}"));
         let helper_ts =
             ops.emit_interpreter(&quote::format_ident!("__llama_interpret"), &enum_ident);
-        let _: syn::ItemFn = syn::parse2(helper_ts.clone())
+        let _: syn::File = syn::parse2(helper_ts.clone())
             .unwrap_or_else(|e| panic!("emitted interpreter must parse: {e}\n{helper_ts}"));
     }
 }

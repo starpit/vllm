@@ -2995,6 +2995,115 @@ fn impl_names_for(
 /// re-monomorphize `pub use` re-exports, so the canonical fn body
 /// is optimized ONCE regardless of how many variants share it.
 #[allow(clippy::too_many_arguments)]
+/// Emit `impl ::ferrite_forward::CanonicalParams for Weights { … }` —
+/// per-canonical model constants the universal `Instruction::eval`
+/// reads as `W::HEAD_DIM`, `W::INTERMEDIATE_SIZE`, etc. Replaces
+/// what `extract_arch_wide_constants` used to lift to per-canonical
+/// fn-scope lets inside `__dispatch_one`. Default 0 / 0.0 / -1 for
+/// fields the canonical doesn't carry.
+fn emit_canonical_params_impl(model: &ModelParams) -> TokenStream {
+    let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
+    let num_q_heads = *model.bounds.get("num_attention_heads").unwrap_or(&0) as u32;
+    let num_kv_heads = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32;
+    let intermediate_size = *model.bounds.get("intermediate_size").unwrap_or(&0) as usize;
+    let q_size = (num_q_heads as usize) * (head_dim as usize);
+    let kv_size = (num_kv_heads as usize) * (head_dim as usize);
+    let kv_lora_rank = *model.bounds.get("kv_lora_rank").unwrap_or(&0) as usize;
+    let qk_nope_head_dim = *model.bounds.get("qk_nope_head_dim").unwrap_or(&0) as usize;
+    let qk_rope_head_dim = *model.bounds.get("qk_rope_head_dim").unwrap_or(&0) as usize;
+    let v_head_dim = *model.bounds.get("v_head_dim").unwrap_or(&0) as usize;
+    let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+
+    // attention_multiplier (Granite override) → query_pre_attn_scalar
+    // (Gemma2) → 1/sqrt(head_dim). Default 0.0 if no attention path.
+    let attn_scale: f32 = if let Some(s) = model.scalars.get("attention_multiplier") {
+        *s as f32
+    } else if let Some(q) = model.scalars.get("query_pre_attn_scalar") {
+        (*q as f32).powf(-0.5)
+    } else if head_dim > 0 {
+        1.0_f32 / (head_dim as f32).sqrt()
+    } else {
+        0.0
+    };
+    let attn_softcap: f32 = model
+        .scalars
+        .get("attn_logit_softcapping")
+        .copied()
+        .unwrap_or(0.0) as f32;
+    let sliding_window: i32 = model
+        .bounds
+        .get("sliding_window")
+        .map(|w| *w as i32)
+        .unwrap_or(-1);
+    let final_logit_softcapping: f32 = model
+        .scalars
+        .get("final_logit_softcapping")
+        .copied()
+        .unwrap_or(0.0) as f32;
+    // MLA scale: 1/sqrt(qk_head_dim) with YaRN mscale_all_dim
+    // correction. Mirrors MlaAttentionImpl's previous bake.
+    let mla_attn_scale: f32 = if qk_head_dim > 0 {
+        let base = 1.0_f32 / (qk_head_dim as f32).sqrt();
+        match &model.rope_scaling {
+            Some(crate::config::RopeScaling::Yarn {
+                factor,
+                mscale_all_dim,
+                ..
+            }) if *mscale_all_dim != 0.0 => {
+                let mm = if *factor <= 1.0 {
+                    1.0_f64
+                } else {
+                    0.1 * mscale_all_dim * factor.ln() + 1.0
+                };
+                base * (mm * mm) as f32
+            }
+            _ => base,
+        }
+    } else {
+        0.0
+    };
+
+    let head_dim_lit = proc_macro2::Literal::u32_unsuffixed(head_dim);
+    let num_q_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_q_heads);
+    let num_kv_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_kv_heads);
+    let q_size_lit = proc_macro2::Literal::usize_unsuffixed(q_size);
+    let kv_size_lit = proc_macro2::Literal::usize_unsuffixed(kv_size);
+    let intermediate_size_lit = proc_macro2::Literal::usize_unsuffixed(intermediate_size);
+    let kv_lora_rank_lit = proc_macro2::Literal::usize_unsuffixed(kv_lora_rank);
+    let qk_nope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_nope_head_dim);
+    let qk_rope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_rope_head_dim);
+    let v_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(v_head_dim);
+    let qk_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_head_dim);
+    let attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(attn_scale);
+    let attn_softcap_lit = proc_macro2::Literal::f32_unsuffixed(attn_softcap);
+    let sliding_window_lit = proc_macro2::Literal::i32_unsuffixed(sliding_window);
+    let final_logit_softcapping_lit = proc_macro2::Literal::f32_unsuffixed(final_logit_softcapping);
+    let mla_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(mla_attn_scale);
+
+    quote! {
+        #[cfg(feature = "cuda")]
+        impl ::ferrite_forward::CanonicalParams for Weights {
+            const HEAD_DIM: u32 = #head_dim_lit;
+            const NUM_Q_HEADS: u32 = #num_q_heads_lit;
+            const NUM_KV_HEADS: u32 = #num_kv_heads_lit;
+            const Q_SIZE: usize = #q_size_lit;
+            const KV_SIZE: usize = #kv_size_lit;
+            const INTERMEDIATE_SIZE: usize = #intermediate_size_lit;
+            const ATTN_SCALE: f32 = #attn_scale_lit;
+            const ATTN_SOFTCAP: f32 = #attn_softcap_lit;
+            const SLIDING_WINDOW: i32 = #sliding_window_lit;
+            const KV_LORA_RANK: usize = #kv_lora_rank_lit;
+            const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;
+            const QK_ROPE_HEAD_DIM: usize = #qk_rope_head_dim_lit;
+            const V_HEAD_DIM: usize = #v_head_dim_lit;
+            const FINAL_LOGIT_SOFTCAPPING: f32 = #final_logit_softcapping_lit;
+            const QK_HEAD_DIM: usize = #qk_head_dim_lit;
+            const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn emit_model(
     program: &Program,
     model: &ModelParams,
@@ -3130,7 +3239,10 @@ pub fn emit_model(
         let term_emits = term_imp
             .fan_out(&term_match, fuf, program, &bounds, &slots)
             .expect("terminal subgraph's Impl must implement fan_out");
-        arch_opcodes.register(term_imp.opcode_shape(), term_imp.interpreter_arm(model));
+        // The eval body now lives in `ferrite_forward::Instruction::eval`
+        // — `arch_opcodes` keeps the shape registration for the
+        // static-slice emission path; the arm-body slot is unused.
+        arch_opcodes.register(term_imp.opcode_shape(), TokenStream::new());
         let lowered_lm = crate::interpreter_codegen::LoweredBucket {
             instances: term_emits,
             num_slots,
@@ -3151,33 +3263,15 @@ pub fn emit_model(
         );
     }
 
-    // Arch-wide constant extraction: any field on a variant whose
-    // value is byte-identical across every instance (across every
-    // canonical bucket's forward + backbone slice) gets dropped from
-    // the variant + the rows, and rebound to its constant value at
-    // the top of the variant's match-arm body. This is what stops
-    // commandr's QkvRopeCache rows from carrying `interleaved: true`,
-    // `biased: false`, `cos_sin_fn: Weights::rotary_cos_sin`, and
-    // (for Impls picked for a single accessor) `weight_fn:
-    // Weights::self_attn_qkv` on every single row.
-    {
-        let mut refs: Vec<&mut crate::interpreter_codegen::LoweredBucket> = Vec::new();
-        for (cl, _, _, _) in canonical_lowered.values_mut() {
-            refs.push(&mut cl.backbone);
-            refs.push(&mut cl.lm_head);
-        }
-        crate::interpreter_codegen::extract_arch_wide_constants(&mut arch_opcodes, &mut refs);
-    }
-
     // Layer-template detection: collapse the contiguous repeating
     // sub-sequence of the slice (the per-layer transformer body)
-    // into one `Op::Loop(N, body_len)` row + one iteration's body.
-    // Fused boundary effects (e.g., FusedAddRmsNorm absorbing layer
-    // L's final add into layer L+1's first norm) leave layer 0 / the
-    // last layer structurally distinct, so the detection picks the
-    // largest CONTIGUOUS run that genuinely repeats — middle layers
-    // — and keeps the boundary residues as straight-line code in
-    // prelude/suffix.
+    // into one `Instruction::Loop(N, body_len)` row + one
+    // iteration's body. Fused boundary effects (e.g., FusedAddRmsNorm
+    // absorbing layer L's final add into layer L+1's first norm)
+    // leave layer 0 / the last layer structurally distinct, so the
+    // detection picks the largest CONTIGUOUS run that genuinely
+    // repeats — middle layers — and keeps the boundary residues as
+    // straight-line code in prelude/suffix.
     for (cl, _, _, _) in canonical_lowered.values_mut() {
         crate::interpreter_codegen::apply_loop_compression(
             &arch_opcodes,
@@ -3187,12 +3281,25 @@ pub fn emit_model(
         crate::interpreter_codegen::apply_loop_compression(&arch_opcodes, &mut cl.lm_head, "layer");
     }
 
-    // One per-arch opcode enum + one per-arch interpreter helper
-    // for the module. Both private to the module.
-    let enum_ident = format_ident!("Op");
-    let helper_ident = format_ident!("__interpret");
-    let arch_enum_ts = arch_opcodes.emit_enum(&enum_ident);
-    let arch_interpreter_ts = arch_opcodes.emit_interpreter(&helper_ident, &enum_ident);
+    // Per-canonical CanonicalParams impl + Instruction type alias.
+    // The alias keeps every static-slice row on a single line of
+    // expanded source (without it prettyplease wraps
+    // `::ferrite_forward::Instruction::<Weights>::Variant(…)` over
+    // 3-4 lines per row).
+    let canonical_params_impl = emit_canonical_params_impl(model);
+    // Per-canonical: alias the generic `Instruction<Weights>` for
+    // the slice element type AND glob-import the variant
+    // constructors so each static-slice row reads `Embed(...)` /
+    // `RmsNorm(...)` instead of
+    // `::ferrite_forward::Instruction::<Weights>::Embed(...)`
+    // (which prettyplease wraps over 3-4 lines per row).
+    let instruction_alias = quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(non_camel_case_types, dead_code)]
+        type __I = ::ferrite_forward::Instruction<Weights>;
+        #[cfg(feature = "cuda")]
+        use ::ferrite_forward::Instruction::*;
+    };
     let shapes_by_name = arch_opcodes.shapes_by_name();
 
     // Per-bucket statics + per-bucket fns. Canonical buckets get a
@@ -3214,13 +3321,11 @@ pub fn emit_model(
             let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
             static_slices.push(emit_bucket_static_slice(
                 &backbone_static_ident,
-                &enum_ident,
                 &shapes_by_name,
                 &lowered.backbone.instances,
             ));
             static_slices.push(emit_bucket_static_slice(
                 &lm_head_static_ident,
-                &enum_ident,
                 &shapes_by_name,
                 &lowered.lm_head.instances,
             ));
@@ -3229,7 +3334,7 @@ pub fn emit_model(
             let bb_final_slot = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_val);
             let fwd_final_slot = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_val);
 
-            // forward = backbone + lm_head + take_owned(terminal).
+            // forward = backbone + lm_head, then take_owned(terminal).
             let fwd_fn_name = bucket_fn_ident("forward_m", *wp);
             bucket_fns.push(quote! {
                 #[cfg(feature = "cuda")]
@@ -3241,12 +3346,12 @@ pub fn emit_model(
                     device: &mut ::ferrite_cuda_core::device::GpuDevice,
                 ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
                     unsafe {
-                        __forward_inner(
+                        ::ferrite_forward::run(
                             #backbone_static_ident,
                             #lm_head_static_ident,
+                            wm, ctx, device,
                             #num_slots,
                             #fwd_final_slot,
-                            wm, ctx, device,
                         )
                     }
                 }
@@ -3264,11 +3369,11 @@ pub fn emit_model(
                     device: &mut ::ferrite_cuda_core::device::GpuDevice,
                 ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
                     unsafe {
-                        __forward_backbone_inner(
+                        ::ferrite_forward::run_backbone(
                             #backbone_static_ident,
+                            wm, ctx, device,
                             #num_slots,
                             #bb_final_slot,
-                            wm, ctx, device,
                         )
                     }
                 }
@@ -3415,80 +3520,19 @@ pub fn emit_model(
     let (match_arms, fallback_arm) = build_match_arms("forward_m");
     let (backbone_match_arms, backbone_fallback_arm) = build_match_arms("forward_backbone_m");
 
-    // Shared per-bucket fn body. Hoisting it here means each
-    // canonical bucket fn collapses to a 1-line shim — passing the
-    // bucket's static-slice idents + slot indices to one of these
-    // two helpers. The helpers reference `__interpret`, `Op`, and
-    // `Weights` from the surrounding module. They're `#[inline]`
-    // so optimized builds still see the work as if it had been
-    // emitted per-bucket; the saving is purely in expanded source
-    // size + per-bucket compile work for debug builds.
-    let forward_inner_helpers = quote! {
-        #[cfg(feature = "cuda")]
-        #[inline]
-        #[allow(clippy::too_many_arguments)]
-        unsafe fn __forward_inner(
-            backbone: &[#enum_ident],
-            lm_head: &[#enum_ident],
-            num_slots: u32,
-            terminal_slot: u32,
-            wm: &Weights,
-            ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            let mut __tiles: ::std::vec::Vec<Option<::ferrite_forward::TileEntry>> =
-                (0u32..num_slots).map(|_| None).collect();
-            unsafe {
-                #helper_ident(backbone, &mut __tiles, wm, ctx, device);
-                #helper_ident(lm_head, &mut __tiles, wm, ctx, device);
-            }
-            ::ferrite_forward::take_owned(&mut __tiles, terminal_slot)
-        }
-
-        #[cfg(feature = "cuda")]
-        #[inline]
-        #[allow(clippy::too_many_arguments)]
-        unsafe fn __forward_backbone_inner(
-            backbone: &[#enum_ident],
-            num_slots: u32,
-            backbone_slot: u32,
-            wm: &Weights,
-            ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            let mut __tiles: ::std::vec::Vec<Option<::ferrite_forward::TileEntry>> =
-                (0u32..num_slots).map(|_| None).collect();
-            unsafe {
-                #helper_ident(backbone, &mut __tiles, wm, ctx, device);
-            }
-            let __bb_view = unsafe {
-                ::ferrite_forward::tile_ref(&__tiles, backbone_slot).as_view(&__tiles)
-            };
-            let __bb_shape_u32: &[u32] = __bb_view.shape();
-            let __bb_shape: ::std::vec::Vec<usize> =
-                __bb_shape_u32.iter().map(|&d| d as usize).collect();
-            let __bb_out = device.caching.alloc_tensor(&__bb_shape, __bb_view.dtype());
-            ::ferrite_cuda_core::driver::memcpy_dtod_async(
-                __bb_out.raw_ptr(),
-                __bb_view.raw_ptr() as *const u8,
-                __bb_view.size_bytes(),
-                device.compute_stream,
-            )
-            .expect("forward_backbone: DtoD memcpy of output");
-            __bb_out
-        }
-    };
+    // The dispatch + interpreter loop now lives in
+    // `ferrite_forward::run` / `run_backbone`. No per-canonical
+    // `__forward_inner` / `__interpret` / `Op` enum — replaced by
+    // the universal `Instruction<Weights>` and shared driver.
 
     quote! {
         #weights
 
-        #arch_enum_ts
+        #canonical_params_impl
 
-        #arch_interpreter_ts
+        #instruction_alias
 
         #(#static_slices)*
-
-        #forward_inner_helpers
 
         #(#bucket_fns)*
         #(#backbone_fns)*

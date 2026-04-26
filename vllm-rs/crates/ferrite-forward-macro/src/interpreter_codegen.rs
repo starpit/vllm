@@ -1045,27 +1045,27 @@ impl ArchOpcodes {
     }
 }
 
-/// Emit one per-bucket `static FORWARD_<TAG>: &[<EnumName>] = &[…];`
-/// using `OpInstance::field_values` (positional, in
-/// `OpcodeShape::fields` order) wrapped in
-/// `<EnumName>::<Variant> { … }` constructors. Free instances are
-/// recognized by their variant ident `"Free"` and wrapped as
-/// `<EnumName>::Free { slot: <expr> }`.
+/// Emit one per-bucket
+/// `static <ident>: &[__I] = &[…];` where `__I` is the per-canonical
+/// alias for `::ferrite_forward::Instruction<Weights>`. Each row is
+/// `__I::<Variant>(v0, v1, …)` — tuple-style construction matching
+/// the variant declaration order in `Instruction<W>`. The match
+/// between `OpInstance::field_values` order and `Instruction`
+/// variant tuple order is enforced by the per-Impl
+/// `OpcodeShape::fields` declaration (the codegen contract).
 pub fn emit_bucket_static_slice(
     static_ident: &syn::Ident,
-    enum_ident: &syn::Ident,
     shapes_by_name: &BTreeMap<String, OpcodeShape>,
     instances: &[OpInstance],
 ) -> TokenStream {
     let elements = instances.iter().map(|inst| {
         let var = &inst.name;
-        // Free is always present; look up its shape from the standard helper.
         let shape: &OpcodeShape = shapes_by_name
             .get(&inst.name.to_string())
             .unwrap_or_else(|| {
                 panic!(
                     "OpInstance variant `{}` has no registered OpcodeShape — \
-                 codegen invariant violated",
+                     codegen invariant violated",
                     inst.name
                 )
             });
@@ -1077,21 +1077,62 @@ pub fn emit_bucket_static_slice(
             inst.field_values.len(),
             shape.fields.len()
         );
-        // Tuple-style row: `<Enum>::<Variant>(v0, v1, …)`. Field
-        // declaration order from `shape.fields` matches the order of
-        // `inst.field_values` (the asserts above pin this), so we
-        // can drop the field-name binding here — the order alone
-        // re-positions each value into the right tuple slot. The
-        // single-line emission keeps a 1000-row slice at 1000 lines
-        // instead of N × (fields + 2).
-        let exprs = inst.field_values.iter();
+        let exprs = inst
+            .field_values
+            .iter()
+            .map(|e| strip_int_suffixes(e.clone()));
         quote! {
-            #enum_ident::#var ( #(#exprs),* )
+            #var ( #(#exprs),* )
         }
     });
     quote! {
-        static #static_ident: &[#enum_ident] = &[ #(#elements),* ];
+        static #static_ident: &[__I] = &[ #(#elements),* ];
     }
+}
+
+/// Strip integer-type suffixes (`u32`, `usize`, `u8`, `i32`, …)
+/// from numeric literals in `ts`. The variant declaration in
+/// `Instruction<W>` already pins the type; the suffix is redundant
+/// and costs ~3-5 chars per slot/layer/flag field × thousands of
+/// rows in cargo expand.
+fn strip_int_suffixes(ts: TokenStream) -> TokenStream {
+    use proc_macro2::{Group, Literal, TokenTree};
+    let mut out = TokenStream::new();
+    for tt in ts {
+        match tt {
+            TokenTree::Group(g) => {
+                let inner = strip_int_suffixes(g.stream());
+                let mut new_group = Group::new(g.delimiter(), inner);
+                new_group.set_span(g.span());
+                out.extend(std::iter::once(TokenTree::Group(new_group)));
+            }
+            TokenTree::Literal(lit) => {
+                let s = lit.to_string();
+                if let Some(stripped) = strip_int_suffix_str(&s)
+                    && let Ok(u) = stripped.parse::<u64>()
+                {
+                    let mut new_lit = Literal::u64_unsuffixed(u);
+                    new_lit.set_span(lit.span());
+                    out.extend(std::iter::once(TokenTree::Literal(new_lit)));
+                    continue;
+                }
+                out.extend(std::iter::once(TokenTree::Literal(lit)));
+            }
+            other => out.extend(std::iter::once(other)),
+        }
+    }
+    out
+}
+
+fn strip_int_suffix_str(s: &str) -> Option<&str> {
+    for suf in &[
+        "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+    ] {
+        if let Some(rest) = s.strip_suffix(suf) {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -1255,7 +1296,7 @@ pub fn lower_bucket(
     sfuf: &Assignment,
     loop_ir: &Loop,
     program: &Program,
-    model: &ModelParams,
+    _model: &ModelParams,
     lib: &ImplementationLibrary,
     bounds: &BTreeMap<String, u64>,
     skip_subgraph: Option<SubgraphId>,
@@ -1352,7 +1393,10 @@ pub fn lower_bucket(
                         id = imp_id.0,
                     )
                 });
-            arch_opcodes.register(imp.opcode_shape(), imp.interpreter_arm(model));
+            // Eval bodies live in `ferrite_forward::Instruction::eval`
+            // — register only the shape (used for static-slice
+            // emission); the arm-body slot stays empty.
+            arch_opcodes.register(imp.opcode_shape(), TokenStream::new());
             instances.extend(emits);
         }
     }
@@ -2291,14 +2335,17 @@ mod tests {
             free_instance(1),
         ];
         let static_ident = format_ident!("FORWARD_M_1");
-        let enum_ident = format_ident!("LlamaOp");
-        let ts = emit_bucket_static_slice(&static_ident, &enum_ident, &shapes_by_name, &instances)
-            .to_string();
-        // Rows are tuple-style: `LlamaOp :: AttnNorm (0u32, 1u32, 2u32)`.
+        let ts = emit_bucket_static_slice(&static_ident, &shapes_by_name, &instances).to_string();
+        // Rows reference the per-canonical glob-imported variant
+        // constructor. Numeric suffixes are stripped — `0u32` →
+        // `0` — since the variant declaration in
+        // `Instruction<W>` already pins the type. Slice element
+        // type is `__I` (per-canonical alias for
+        // `::ferrite_forward::Instruction<Weights>`).
         assert!(ts.contains("FORWARD_M_1"));
-        assert!(ts.contains("LlamaOp :: AttnNorm"));
-        assert!(ts.contains("0u32 , 1u32 , 2u32"));
-        assert!(ts.contains("LlamaOp :: Free"));
+        assert!(ts.contains("AttnNorm ("));
+        assert!(ts.contains("0 , 1 , 2"));
+        assert!(ts.contains("Free ("));
         assert!(ts.contains("(1)"));
         // No struct-style field labels in the row text.
         assert!(!ts.contains("layer :"));
@@ -2433,11 +2480,6 @@ mod tests {
             ),
         );
         let instances = vec![OpInstance::new(format_ident!("Bad"), vec![quote! { 1u32 }])];
-        let _ = emit_bucket_static_slice(
-            &format_ident!("X"),
-            &format_ident!("Y"),
-            &shapes_by_name,
-            &instances,
-        );
+        let _ = emit_bucket_static_slice(&format_ident!("X"), &shapes_by_name, &instances);
     }
 }

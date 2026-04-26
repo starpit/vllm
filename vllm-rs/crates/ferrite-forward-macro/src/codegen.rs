@@ -3302,125 +3302,34 @@ pub fn emit_model(
     };
     let shapes_by_name = arch_opcodes.shapes_by_name();
 
-    // Per-bucket statics + per-bucket fns. Canonical buckets get a
-    // 1-line shim that hands the static slices + slot indices to a
-    // shared `__forward_inner` / `__forward_backbone_inner` helper
-    // (emitted once per arch module). Non-canonical buckets keep
-    // delegating to their canonical sibling's per-bucket fn (rustc
-    // dedup at the public-API surface).
+    // Static slices: BACKBONE_M_<wp> + LM_HEAD_M_<wp> per CANONICAL
+    // bucket only. Non-canonical buckets share their canonical
+    // sibling's slices via the FORWARD_TABLE entries below.
     let mut static_slices: Vec<TokenStream> = Vec::new();
-    let mut bucket_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
-    let mut backbone_fns: Vec<TokenStream> = Vec::with_capacity(bucket_points.len());
     for (i, wp) in bucket_points.iter().enumerate() {
-        let canonical = bucket_canonical[i];
-        if canonical == *wp {
-            let (lowered, num_slots_val, backbone_slot_val, terminal_slot_val) =
-                &canonical_lowered[wp];
-
-            let backbone_static_ident = bucket_static_ident("BACKBONE_M", *wp);
-            let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
-            static_slices.push(emit_bucket_static_slice(
-                &backbone_static_ident,
-                &shapes_by_name,
-                &lowered.backbone.instances,
-            ));
-            static_slices.push(emit_bucket_static_slice(
-                &lm_head_static_ident,
-                &shapes_by_name,
-                &lowered.lm_head.instances,
-            ));
-
-            let num_slots = proc_macro2::Literal::u32_unsuffixed(*num_slots_val);
-            let bb_final_slot = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_val);
-            let fwd_final_slot = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_val);
-
-            // forward = backbone + lm_head, then take_owned(terminal).
-            let fwd_fn_name = bucket_fn_ident("forward_m", *wp);
-            bucket_fns.push(quote! {
-                #[cfg(feature = "cuda")]
-                #[allow(clippy::too_many_arguments)]
-                #[inline]
-                pub unsafe fn #fwd_fn_name(
-                    wm: &Weights,
-                    ctx: &::ferrite_forward::ForwardCtx,
-                    device: &mut ::ferrite_cuda_core::device::GpuDevice,
-                ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                    unsafe {
-                        ::ferrite_forward::run(
-                            #backbone_static_ident,
-                            #lm_head_static_ident,
-                            wm, ctx, device,
-                            #num_slots,
-                            #fwd_final_slot,
-                        )
-                    }
-                }
-            });
-
-            // forward_backbone = backbone + DtoD-copy backbone slot.
-            let bb_fn_name = bucket_fn_ident("forward_backbone_m", *wp);
-            backbone_fns.push(quote! {
-                #[cfg(feature = "cuda")]
-                #[allow(clippy::too_many_arguments)]
-                #[inline]
-                pub unsafe fn #bb_fn_name(
-                    wm: &Weights,
-                    ctx: &::ferrite_forward::ForwardCtx,
-                    device: &mut ::ferrite_cuda_core::device::GpuDevice,
-                ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                    unsafe {
-                        ::ferrite_forward::run_backbone(
-                            #backbone_static_ident,
-                            wm, ctx, device,
-                            #num_slots,
-                            #bb_final_slot,
-                        )
-                    }
-                }
-            });
-        } else {
-            let fwd_name = bucket_fn_ident("forward_m", *wp);
-            let fwd_target = bucket_fn_ident("forward_m", canonical);
-            bucket_fns.push(quote! {
-                #[cfg(feature = "cuda")]
-                #[allow(clippy::too_many_arguments)]
-                #[inline(always)]
-                pub unsafe fn #fwd_name(
-                    wm: &Weights,
-                    ctx: &::ferrite_forward::ForwardCtx,
-                    device: &mut ::ferrite_cuda_core::device::GpuDevice,
-                ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                    unsafe { #fwd_target(wm, ctx, device) }
-                }
-            });
-            let bb_name = bucket_fn_ident("forward_backbone_m", *wp);
-            let bb_target = bucket_fn_ident("forward_backbone_m", canonical);
-            backbone_fns.push(quote! {
-                #[cfg(feature = "cuda")]
-                #[allow(clippy::too_many_arguments)]
-                #[inline(always)]
-                pub unsafe fn #bb_name(
-                    wm: &Weights,
-                    ctx: &::ferrite_forward::ForwardCtx,
-                    device: &mut ::ferrite_cuda_core::device::GpuDevice,
-                ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                    unsafe { #bb_target(wm, ctx, device) }
-                }
-            });
+        if bucket_canonical[i] != *wp {
+            continue;
         }
+        let (lowered, _, _, _) = &canonical_lowered[wp];
+        let backbone_static_ident = bucket_static_ident("BACKBONE_M", *wp);
+        let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
+        static_slices.push(emit_bucket_static_slice(
+            &backbone_static_ident,
+            &shapes_by_name,
+            &lowered.backbone.instances,
+        ));
+        static_slices.push(emit_bucket_static_slice(
+            &lm_head_static_ident,
+            &shapes_by_name,
+            &lowered.lm_head.instances,
+        ));
     }
 
-    // `sk_axis_active` is true when the model declared `sk_buckets`;
-    // otherwise all workload points have `sk_bucket == 0` and we
-    // emit the pre-sk 1-D dispatch verbatim (no nested match, no
-    // runtime `ctx.max_seqlen_k` lookup).
+    // `sk_axis_active`: true when the model declared `sk_buckets`;
+    // otherwise every wp has sk_bucket==0 and the table emits
+    // `[0, u64::MAX)` for sk on every entry.
     let sk_axis_active = sfufs.per_workload.keys().any(|wp| wp.sk_bucket != 0);
-
     let num_tokens_points: Vec<u64> = sfufs.num_tokens_points();
-
-    // Per-num_tokens set of sk buckets (sorted). Used to build both
-    // the per-m inner match (sk → bucket fn) and the outer match
-    // arm ranges.
     let mut sk_by_m: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for wp in sfufs.per_workload.keys() {
         sk_by_m.entry(wp.num_tokens).or_default().push(wp.sk_bucket);
@@ -3430,100 +3339,118 @@ pub fn emit_model(
         v.dedup();
     }
 
-    // Build one outer match arm per compiled num_tokens. For
-    // `sk_axis_active == false`, the arm is `lo..=hi => unsafe {
-    // forward_m_<m>(...) }`. For `sk_axis_active == true`, the arm
-    // is `lo..=hi => match sk_bucket { lo..=hi => forward_m_<m>_sk_<sk>(...), ... }`.
-    let build_match_arms = |prefix: &str| -> (Vec<TokenStream>, Option<TokenStream>) {
-        let arms: Vec<TokenStream> = num_tokens_points
-            .iter()
-            .enumerate()
-            .map(|(i, &m)| {
-                // M=1 must be an exclusive range: the solver may pick
-                // M=1-only kernels (cutlass_gemv) that fail at M>1.
-                // Start the *next* bucket at 2 so M=2..next routes there.
-                let lo = if i > 0 && num_tokens_points[0] == 1 && num_tokens_points[i - 1] == 1 {
-                    proc_macro2::Literal::u64_unsuffixed(2)
-                } else {
-                    proc_macro2::Literal::u64_unsuffixed(m)
-                };
-                let range_tokens = if m == 1 {
-                    let one = proc_macro2::Literal::u64_unsuffixed(1);
-                    quote! { #one..=#one }
-                } else if i + 1 == num_tokens_points.len() {
-                    quote! { #lo.. }
-                } else {
-                    let next = num_tokens_points[i + 1];
-                    let hi = proc_macro2::Literal::u64_unsuffixed(next - 1);
-                    quote! { #lo..=#hi }
-                };
-                if sk_axis_active {
-                    let sk_buckets = &sk_by_m[&m];
-                    let sk_arms: Vec<TokenStream> = sk_buckets
-                        .iter()
-                        .enumerate()
-                        .map(|(j, &sk)| {
-                            let wp = crate::solver::WorkloadPoint {
-                                num_tokens: m,
-                                sk_bucket: sk,
-                            };
-                            let fn_name = bucket_fn_ident(prefix, wp);
-                            let sk_lo = proc_macro2::Literal::u64_unsuffixed(sk);
-                            if j + 1 == sk_buckets.len() {
-                                quote! { #sk_lo.. => unsafe { #fn_name(wm, ctx, device) }, }
-                            } else {
-                                let next_sk = sk_buckets[j + 1];
-                                let sk_hi = proc_macro2::Literal::u64_unsuffixed(next_sk - 1);
-                                quote! { #sk_lo..=#sk_hi => unsafe { #fn_name(wm, ctx, device) }, }
-                            }
-                        })
-                        .collect();
-                    let fallback_wp = crate::solver::WorkloadPoint {
-                        num_tokens: m,
-                        sk_bucket: sk_buckets[0],
-                    };
-                    let fallback_name = bucket_fn_ident(prefix, fallback_wp);
-                    quote! {
-                        #range_tokens => {
-                            let sk_bucket_runtime = ctx.max_seqlen_k as u64;
-                            match sk_bucket_runtime {
-                                #(#sk_arms)*
-                                _ => unsafe { #fallback_name(wm, ctx, device) },
-                            }
-                        },
-                    }
-                } else {
-                    let wp = crate::solver::WorkloadPoint::num_tokens_only(m);
-                    let fn_name = bucket_fn_ident(prefix, wp);
-                    quote! { #range_tokens => unsafe { #fn_name(wm, ctx, device) }, }
-                }
-            })
-            .collect();
-        let fallback_arm = num_tokens_points.first().map(|&m| {
-            if sk_axis_active {
-                let sk_buckets = &sk_by_m[&m];
-                let wp = crate::solver::WorkloadPoint {
-                    num_tokens: m,
-                    sk_bucket: sk_buckets[0],
-                };
-                let fn_name = bucket_fn_ident(prefix, wp);
-                quote! { _ => unsafe { #fn_name(wm, ctx, device) }, }
+    // (m_min, m_max_excl, sk_min, sk_max_excl) for each workload.
+    // M=1 is special-cased: the solver may pick M=1-only kernels
+    // (cutlass_gemv) that fail at M>1, so the next bucket starts at
+    // M=2 even if the configured points list `[1, 8, ...]`.
+    let m_max_excl_for = |m_idx: usize| -> u64 {
+        if m_idx + 1 == num_tokens_points.len() {
+            u64::MAX
+        } else {
+            num_tokens_points[m_idx + 1]
+        }
+    };
+    let m_min_for = |m_idx: usize, m: u64| -> u64 {
+        if m_idx > 0 && num_tokens_points[0] == 1 && num_tokens_points[m_idx - 1] == 1 {
+            2
+        } else {
+            m
+        }
+    };
+    let m_idx_of: HashMap<u64, usize> = num_tokens_points
+        .iter()
+        .enumerate()
+        .map(|(i, &m)| (m, i))
+        .collect();
+    let mut bucket_table_entries: Vec<TokenStream> = Vec::new();
+    for (i, wp) in bucket_points.iter().enumerate() {
+        let canonical = bucket_canonical[i];
+        let bb_static = bucket_static_ident("BACKBONE_M", canonical);
+        let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
+        let m_idx = m_idx_of[&wp.num_tokens];
+        let m_min = if wp.num_tokens == 1 {
+            1
+        } else {
+            m_min_for(m_idx, wp.num_tokens)
+        };
+        let m_max_excl = if wp.num_tokens == 1 {
+            2
+        } else {
+            m_max_excl_for(m_idx)
+        };
+        let (sk_min, sk_max_excl) = if sk_axis_active {
+            let sk_buckets = &sk_by_m[&wp.num_tokens];
+            let j = sk_buckets
+                .iter()
+                .position(|&sk| sk == wp.sk_bucket)
+                .unwrap();
+            // The first sk bucket per m group must accept sk < its
+            // own configured value — old codegen routed this via a
+            // `_ =>` fallback arm onto the smallest sk fn. So emit
+            // sk_min=0 for j==0 instead of wp.sk_bucket; without
+            // this, find_bucket misses on small max_seqlen_k (the
+            // prefill case for short prompts) and the fallback to
+            // table[0] silently picks an m=1 row.
+            let sk_min = if j == 0 { 0 } else { wp.sk_bucket };
+            let sk_max_excl = if j + 1 == sk_buckets.len() {
+                u64::MAX
             } else {
-                let wp = crate::solver::WorkloadPoint::num_tokens_only(m);
-                let fn_name = bucket_fn_ident(prefix, wp);
-                quote! { _ => unsafe { #fn_name(wm, ctx, device) }, }
-            }
+                sk_buckets[j + 1]
+            };
+            (sk_min, sk_max_excl)
+        } else {
+            (0u64, u64::MAX)
+        };
+        let m_min_lit = proc_macro2::Literal::u64_unsuffixed(m_min);
+        let m_max_lit = if m_max_excl == u64::MAX {
+            quote! { u64::MAX }
+        } else {
+            let v = proc_macro2::Literal::u64_unsuffixed(m_max_excl);
+            quote! { #v }
+        };
+        let sk_min_lit = proc_macro2::Literal::u64_unsuffixed(sk_min);
+        let sk_max_lit = if sk_max_excl == u64::MAX {
+            quote! { u64::MAX }
+        } else {
+            let v = proc_macro2::Literal::u64_unsuffixed(sk_max_excl);
+            quote! { #v }
+        };
+        bucket_table_entries.push(quote! {
+            __B(#m_min_lit, #m_max_lit, #sk_min_lit, #sk_max_lit, #bb_static, #lm_static),
         });
-        (arms, fallback_arm)
+    }
+
+    // Per-canonical-invariant slot consts: every entry in this
+    // canonical's FORWARD_TABLE shares the same values (the slot
+    // map is built once per canonical, not per wp). Pulled out to
+    // const-scope to save 3 lines per entry in the expanded source.
+    let first_canonical = bucket_canonical[0];
+    let (_, num_slots_first, backbone_slot_first, terminal_slot_first) =
+        &canonical_lowered[&first_canonical];
+    let num_slots_const = proc_macro2::Literal::u32_unsuffixed(*num_slots_first);
+    let backbone_slot_const = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_first);
+    let terminal_slot_const = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_first);
+    let dispatch_consts = quote! {
+        #[cfg(feature = "cuda")]
+        const NUM_SLOTS: u32 = #num_slots_const;
+        #[cfg(feature = "cuda")]
+        const TERMINAL_SLOT: u32 = #terminal_slot_const;
+        #[cfg(feature = "cuda")]
+        const BACKBONE_SLOT: u32 = #backbone_slot_const;
     };
 
-    let (match_arms, fallback_arm) = build_match_arms("forward_m");
-    let (backbone_match_arms, backbone_fallback_arm) = build_match_arms("forward_backbone_m");
-
-    // The dispatch + interpreter loop now lives in
-    // `ferrite_forward::run` / `run_backbone`. No per-canonical
-    // `__forward_inner` / `__interpret` / `Op` enum — replaced by
-    // the universal `Instruction<Weights>` and shared driver.
+    // FORWARD_TABLE — one row per bucket. `__B` aliases the
+    // `BucketEntry` tuple-struct constructor so each row stays on a
+    // single line in expanded source.
+    let forward_table = quote! {
+        #[cfg(feature = "cuda")]
+        static FORWARD_TABLE: &[::ferrite_forward::BucketEntry<__I>] = {
+            use ::ferrite_forward::BucketEntry as __B;
+            &[
+                #(#bucket_table_entries)*
+            ]
+        };
+    };
 
     quote! {
         #weights
@@ -3534,10 +3461,12 @@ pub fn emit_model(
 
         #(#static_slices)*
 
-        #(#bucket_fns)*
-        #(#backbone_fns)*
+        #forward_table
 
-        /// Dispatch on (num_tokens, sk_bucket) → bucket fn.
+        #dispatch_consts
+
+        /// Dispatch on (num_tokens, sk_bucket) → bucket entry, then
+        /// run the universal interpreter.
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
@@ -3546,13 +3475,18 @@ pub fn emit_model(
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
             num_tokens: u64,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            match num_tokens {
-                #(#match_arms)*
-                #fallback_arm
+            let e = ::ferrite_forward::find_bucket(
+                FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
+            );
+            unsafe {
+                ::ferrite_forward::run(
+                    e.4, e.5, wm, ctx, device, NUM_SLOTS, TERMINAL_SLOT,
+                )
             }
         }
 
-        /// Backbone-only dispatch (no lm_head).
+        /// Backbone-only dispatch (no lm_head). Returns a fresh
+        /// OwnedTensor (memcpy of the backbone tile).
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_backbone(
@@ -3561,9 +3495,13 @@ pub fn emit_model(
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
             num_tokens: u64,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            match num_tokens {
-                #(#backbone_match_arms)*
-                #backbone_fallback_arm
+            let e = ::ferrite_forward::find_bucket(
+                FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
+            );
+            unsafe {
+                ::ferrite_forward::run_backbone(
+                    e.4, wm, ctx, device, NUM_SLOTS, BACKBONE_SLOT,
+                )
             }
         }
     }
@@ -3618,30 +3556,15 @@ fn emit_shim_model(
         WeightsEmitMode::Shim { canonical },
     );
 
-    // Per-bucket fn names the canonical emits. We re-export each
-    // by name so downstream code that takes a fn pointer to
-    // `<shim>::forward_m_64` resolves through to the canonical's
-    // compiled body without any additional fn-pointer indirection.
-    let mut bucket_names: Vec<Ident> = Vec::new();
-    for wp in sfufs.per_workload.keys() {
-        bucket_names.push(bucket_fn_ident("forward_m", *wp));
-        bucket_names.push(bucket_fn_ident("forward_backbone_m", *wp));
-    }
-    // Deterministic order for build reproducibility.
-    bucket_names.sort_by_key(|a| a.to_string());
-    bucket_names.dedup_by(|a, b| a == b);
-
+    // Per-bucket fn surfaces are gone — dispatch lives on the
+    // canonical's `FORWARD_TABLE` + `find_bucket`. Re-export the
+    // arch-level dispatchers only.
+    let _ = sfufs;
     quote! {
         #weights
 
-        // Top-level dispatchers + per-bucket fns all live on the
-        // canonical sibling; re-export by name so `<shim>::forward`
-        // and `<shim>::forward_m_64` both resolve transparently to
-        // the canonical's compiled body.
         #[cfg(feature = "cuda")]
         pub use super::#canonical::{forward, forward_backbone};
-        #[cfg(feature = "cuda")]
-        pub use super::#canonical::{#(#bucket_names),*};
     }
 }
 

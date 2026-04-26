@@ -18,6 +18,57 @@ pub use instr::{CanonicalParams, Instruction, InterpreterCtx, run, run_backbone}
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};
 
+/// One row in a per-canonical forward dispatch table. Replaces the
+/// O(N×M) nested-match `pub fn forward()` + per-bucket
+/// `forward_m_<N>` / `forward_backbone_m_<N>` shim fns the
+/// generated code used to emit. Each canonical's
+/// `static FORWARD_TABLE: &[BucketEntry<Instruction<Weights>>]`
+/// describes the workload-bucket boundaries
+/// (`m_min` / `m_max_excl` / `sk_min` / `sk_max_excl`) and the
+/// static `Instruction` slices (backbone + lm_head) that bucket
+/// runs.
+///
+/// Tuple-struct so prettyplease can collapse each entry to one
+/// line in expanded source. Field order:
+///
+///   0 = m_min          (inclusive)
+///   1 = m_max_excl     (exclusive; `u64::MAX` for the final bucket)
+///   2 = sk_min         (inclusive; `0` when the model has no sk axis)
+///   3 = sk_max_excl    (exclusive; `u64::MAX` when no sk axis)
+///   4 = backbone       — static `Op` slice for this bucket's body
+///   5 = lm_head        — static `Op` slice for this bucket's tail
+///
+/// `num_slots`, `terminal_slot`, `backbone_slot` are canonical-
+/// invariant — they live as per-canonical `const`s in the emitted
+/// module instead of riding on every entry.
+#[cfg(feature = "cuda")]
+pub struct BucketEntry<Op: 'static>(
+    pub u64,
+    pub u64,
+    pub u64,
+    pub u64,
+    pub &'static [Op],
+    pub &'static [Op],
+);
+
+/// Linear-scan bucket lookup. Falls back to `table[0]` when no row
+/// matches — the smallest bucket comes first by convention, so out-
+/// of-range inputs route there (matches the old
+/// `_ => unsafe { forward_m_<smallest>(...) }` arm).
+#[cfg(feature = "cuda")]
+pub fn find_bucket<Op: 'static>(
+    table: &'static [BucketEntry<Op>],
+    num_tokens: u64,
+    sk: u64,
+) -> &'static BucketEntry<Op> {
+    for e in table {
+        if e.0 <= num_tokens && num_tokens < e.1 && e.2 <= sk && sk < e.3 {
+            return e;
+        }
+    }
+    &table[0]
+}
+
 /// Runtime gate for the per-op trace the macro emits inside every
 /// `__dispatch_one`. Reads `FERRITE_TRACE` from the environment on
 /// the first call and caches the result. Set `FERRITE_TRACE=1`

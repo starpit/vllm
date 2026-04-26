@@ -105,35 +105,15 @@ fn every_gemma2_config_was_compiled() {
     let _: usize = gemma2_27b::NUM_TILES;
 }
 
-#[test]
-fn every_workload_bucket_solved_for_gemma2_2b() {
-    // The solver reached every workload point without
-    // UnclaimedTile — SlidingAttention / Gelu / TanhSoftCap all
-    // have matching Impls in the library.
-    let _: f64 = gemma2_2b::m_1::PREDICTED_US;
-    let _: f64 = gemma2_2b::m_8::PREDICTED_US;
-    let _: f64 = gemma2_2b::m_64::PREDICTED_US;
-    let _: f64 = gemma2_2b::m_512::PREDICTED_US;
-    let _: f64 = gemma2_2b::m_4096::PREDICTED_US;
-}
-
-#[test]
-fn gemma2_predicted_us_is_finite_and_monotonic_in_m() {
-    // Regression guard on the "silent drop-to-zero cost" class of
-    // bug. Predicted microseconds must be finite positive and rise
-    // with M (prefill should dwarf decode).
-    let decode: f64 = gemma2_2b::m_1::PREDICTED_US;
-    let prefill: f64 = gemma2_2b::m_4096::PREDICTED_US;
-    assert!(decode.is_finite() && decode > 0.0, "decode us = {decode}");
-    assert!(
-        prefill.is_finite() && prefill > 0.0,
-        "prefill us = {prefill}"
-    );
-    assert!(
-        prefill > decode * 10.0,
-        "prefill {prefill} ≯ 10× decode {decode}"
-    );
-}
+// `every_workload_bucket_solved_for_gemma2_2b` and
+// `gemma2_predicted_us_is_finite_and_monotonic_in_m` used to read
+// per-bucket `m_<N>::PREDICTED_US`. The cost-monotonicity invariant
+// (prefill ≫ decode) lives in `solver::tests::
+// prefill_cost_dwarfs_decode_cost`, which calls `solve()` directly
+// for `llama-3.2-1b` — gemma2 shares the same cost model, so the
+// llama-side check is a sufficient regression guard for the silent-
+// drop-to-zero bug class. The per-bucket `m_X[_sk_Y]` stub modules
+// are no longer emitted (~9k lines saved workspace-wide).
 
 #[test]
 fn arch_level_weights_enum_and_dispatch_exist_for_gemma2() {

@@ -920,47 +920,25 @@ fn pascal_case(ident: &Ident) -> Ident {
     Ident::new(&out, Span::call_site())
 }
 
-/// Emit pipeline-observation constants (NUM_TILES /
-/// NUM_SUBGRAPHS / NUM_WAVES / PREDICTED_US per workload) as
-/// items inside the per-model module. Useful for integration
-/// tests that observe the pipeline ran. Lives alongside the
-/// codegen-emitted forward fns in the same module.
+/// Emit `pub const NUM_TILES: usize = …` per canonical. The only
+/// observability surface that catches a real regression — if the
+/// FUF lowering or fusion logic changes the tile count, the test
+/// `assert_eq!(llama_3_2_1b::NUM_TILES, 243)` fires.
+///
+/// Per-bucket `m_X[_sk_Y]::{NUM_SUBGRAPHS, NUM_WAVES, PREDICTED_US}`
+/// modules used to live here too — they were brittle (PREDICTED_US
+/// drifts every time `target_profiles/*.csv` is regenerated; the
+/// other two were probed without an assertion). The test invariant
+/// they really cared about (prefill cost ≫ decode cost) lives in
+/// `solver::tests` now, calling `solve()` directly. ~9k lines off
+/// cargo expand workspace-wide.
 fn emit_model_stub_items(
     fuf: &fuf::Fuf,
-    sfufs: &solver::WorkloadAssignments,
-    loops: &schedule::WorkloadLoops,
+    _sfufs: &solver::WorkloadAssignments,
+    _loops: &schedule::WorkloadLoops,
 ) -> proc_macro2::TokenStream {
     let num_tiles = fuf.len();
-    let mut workload_ts: Vec<proc_macro2::TokenStream> = Vec::new();
-    for (wp, sfuf) in &sfufs.per_workload {
-        let loop_ir = loops
-            .per_workload
-            .get(wp)
-            .expect("schedule_workloads populates every key");
-        // Module name: `m_{m}` in the legacy 1-D sweep (sk_bucket=0),
-        // `m_{m}_sk_{sk}` in a 2-D sweep. Integration tests can look
-        // up either by name.
-        let wl_mod = if wp.sk_bucket == 0 {
-            Ident::new(&format!("m_{}", wp.num_tokens), Span::call_site())
-        } else {
-            Ident::new(
-                &format!("m_{}_sk_{}", wp.num_tokens, wp.sk_bucket),
-                Span::call_site(),
-            )
-        };
-        let num_subgraphs = sfuf.num_subgraphs();
-        let num_waves = loop_ir.num_waves();
-        let predicted_us = sfuf.predicted_us;
-        workload_ts.push(quote! {
-            pub mod #wl_mod {
-                pub const NUM_SUBGRAPHS: usize = #num_subgraphs;
-                pub const NUM_WAVES: usize = #num_waves;
-                pub const PREDICTED_US: f64 = #predicted_us;
-            }
-        });
-    }
     quote! {
         pub const NUM_TILES: usize = #num_tiles;
-        #(#workload_ts)*
     }
 }

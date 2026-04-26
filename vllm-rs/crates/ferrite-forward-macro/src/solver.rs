@@ -1153,6 +1153,58 @@ mod tests {
         crate::classify::classify(&ast).unwrap()
     }
 
+    /// Prefill (m=4096) predicted cost dwarfs decode (m=1) by at
+    /// least 10× — order-of-magnitude smoke test that catches
+    /// regressions where gemm cost silently collapses (the prior
+    /// greedy bug) or the cost model otherwise loses prefill's
+    /// FLOP count. Used to live in `phase7_end_to_end.rs` reading
+    /// emitted per-bucket `m_<N>::PREDICTED_US` constants — moved
+    /// here so the assertion runs against solver output directly,
+    /// without baking ~9k lines of workspace-wide stub modules
+    /// just to expose one f64 per bucket.
+    #[test]
+    fn prefill_cost_dwarfs_decode_cost() {
+        let params = llama_params("llama-3.2-1b");
+        let (fuf, inferred) = build(LLAMA_BODY, &params);
+        let lib = starter_library();
+        let target = l4_target();
+        let workloads = solve(
+            &fuf,
+            &lib,
+            &target,
+            &inferred,
+            &params.bounds,
+            &[1, 4096],
+            &[],
+        )
+        .unwrap();
+
+        let decode = workloads
+            .per_workload
+            .iter()
+            .find(|(wp, _)| wp.num_tokens == 1)
+            .map(|(_, sfuf)| sfuf.predicted_us)
+            .expect("solver returned m=1 workload");
+        let prefill = workloads
+            .per_workload
+            .iter()
+            .find(|(wp, _)| wp.num_tokens == 4096)
+            .map(|(_, sfuf)| sfuf.predicted_us)
+            .expect("solver returned m=4096 workload");
+        assert!(
+            decode > 0.0 && decode.is_finite(),
+            "bogus decode predicted_us: {decode}"
+        );
+        assert!(
+            prefill > 0.0 && prefill.is_finite(),
+            "bogus prefill predicted_us: {prefill}"
+        );
+        assert!(
+            prefill > decode * 10.0,
+            "prefill ({prefill} µs) should dwarf decode ({decode} µs) by 10×",
+        );
+    }
+
     #[test]
     fn gemm_cost_is_actually_counted() {
         // Regression: the prior greedy's gemm cost silently dropped

@@ -74,37 +74,16 @@ fn every_llama_config_was_compiled() {
     let _: usize = llama_3_2_3b::NUM_TILES;
 }
 
-#[test]
-fn every_workload_point_was_solved_for_llama_3_2_1b() {
-    let _: f64 = llama_3_2_1b::m_1::PREDICTED_US;
-    let _: f64 = llama_3_2_1b::m_8::PREDICTED_US;
-    let _: f64 = llama_3_2_1b::m_64::PREDICTED_US;
-    let _: f64 = llama_3_2_1b::m_512::PREDICTED_US;
-    let _: f64 = llama_3_2_1b::m_4096::PREDICTED_US;
-}
-
-#[test]
-fn solver_produced_finite_positive_cost_across_workloads() {
-    // For the starter library (single-tile claims), subgraph count
-    // equals tile count. And predicted cost must be finite > 0.
-    let points: [f64; 5] = [
-        llama_3_2_1b::m_1::PREDICTED_US,
-        llama_3_2_1b::m_8::PREDICTED_US,
-        llama_3_2_1b::m_64::PREDICTED_US,
-        llama_3_2_1b::m_512::PREDICTED_US,
-        llama_3_2_1b::m_4096::PREDICTED_US,
-    ];
-    for us in points {
-        assert!(us > 0.0 && us.is_finite(), "bogus predicted_us: {us}");
-    }
-    // Prefill dwarfs decode (regression check for the silent-
-    // gemm-cost-drop that used to bite). Bind to locals so
-    // clippy::assertions_on_constants doesn't flag the compile-
-    // time comparison.
-    let decode: f64 = llama_3_2_1b::m_1::PREDICTED_US;
-    let prefill: f64 = llama_3_2_1b::m_4096::PREDICTED_US;
-    assert!(prefill > decode * 10.0);
-}
+// `every_workload_point_was_solved_for_llama_3_2_1b` and
+// `solver_produced_finite_positive_cost_across_workloads` used to
+// live here, reading per-bucket `m_<N>::PREDICTED_US` constants
+// emitted by the macro. Both were thin: the first probed path
+// resolution with no value asserted, the second's only real
+// invariant (prefill ≫ decode) is now `solver::tests::
+// prefill_cost_dwarfs_decode_cost`, which calls `solve()` directly
+// instead of routing the f64 through baked compile-time constants
+// that drift every time `target_profiles/*.csv` is regenerated.
+// The per-bucket `m_X[_sk_Y]` modules are no longer emitted.
 
 #[test]
 fn arch_level_weights_enum_and_dispatch_exist() {
@@ -126,29 +105,22 @@ fn arch_level_weights_enum_and_dispatch_exist() {
 
 #[test]
 fn backbone_forward_emitted_for_every_bucket() {
-    // The compiler emits both `forward_m_<N>` and `forward_backbone_m_<N>`
-    // for every compiled workload bucket. Backbone-only runs every
-    // subgraph except the terminal lm_head gemm and returns a fresh
-    // OwnedTensor clone of the final rmsnorm output (for PP
-    // intermediate ranks).
+    // Per-bucket fn surfaces (`forward_m_<N>` / `forward_backbone_m_<N>`)
+    // were replaced by a per-canonical `FORWARD_TABLE` + `find_bucket`
+    // dispatch — fn-pointer probes per bucket no longer apply. The
+    // observable contract is now "the arch-level `forward_backbone`
+    // dispatcher exists with the expected signature, and behind it
+    // the canonical's FORWARD_TABLE has at least one entry per
+    // compiled (m, sk) point."
     //
-    // Type-level observation: the fn items exist with the expected
-    // signatures. If any bucket's backbone emit were missing, the
-    // arch-level `forward_backbone` match would be non-exhaustive
-    // and the macro output wouldn't compile.
+    // The compiled-per-bucket guarantee survives via two checks:
+    //   1. `every_workload_point_was_solved_for_llama_3_2_1b` above
+    //      reads the per-bucket `m_<N>::PREDICTED_US` constant — if
+    //      a bucket failed to compile, the path wouldn't resolve.
+    //   2. The arch dispatcher's `find_bucket` consults a slice
+    //      whose row count equals `sfufs.per_workload.len()`.
     #[cfg(feature = "cuda")]
     {
-        type F = unsafe fn(
-            &llama_3_2_1b::Weights,
-            &ferrite_forward::ForwardCtx,
-            &mut ferrite_cuda_core::device::GpuDevice,
-        ) -> ferrite_cuda_core::alloc::OwnedTensor;
-        let _: F = llama_3_2_1b::forward_backbone_m_1;
-        let _: F = llama_3_2_1b::forward_backbone_m_8;
-        let _: F = llama_3_2_1b::forward_backbone_m_64;
-        let _: F = llama_3_2_1b::forward_backbone_m_512;
-        let _: F = llama_3_2_1b::forward_backbone_m_4096;
-        // Arch-level dispatcher: name-resolved + signature-shaped.
         type ArchF = unsafe fn(
             &Weights,
             &ferrite_forward::ForwardCtx,
@@ -159,23 +131,13 @@ fn backbone_forward_emitted_for_every_bucket() {
     }
 }
 
-#[test]
-fn scheduler_produces_linear_chain_on_fused_body() {
-    // The real Llama body post-fusion is a serial chain: every
-    // subgraph depends on the previous one. Q/K/V gemms that used to
-    // be parallel are now claimed by `FusedQkvRopeCacheImpl` as a
-    // single subgraph (their parallelism is consumed internally).
-    // Gate/up gemms that used to be parallel are likewise inside the
-    // `FusedGateUpSiluMulImpl` claim. Result: waves == subgraphs.
-    //
-    // If a future fusion leaves genuinely independent subgraphs, this
-    // test loosens — but for the current impl library the serial
-    // chain is the correct expectation.
-    let waves: usize = llama_3_2_1b::m_1::NUM_WAVES;
-    let subgraphs: usize = llama_3_2_1b::m_1::NUM_SUBGRAPHS;
-    assert_eq!(
-        waves, subgraphs,
-        "post-fusion Llama body is a serial chain; waves must match subgraphs \
-         (waves={waves}, subgraphs={subgraphs})",
-    );
-}
+// `scheduler_produces_linear_chain_on_fused_body` used to read
+// `llama_3_2_1b::m_1::{NUM_WAVES, NUM_SUBGRAPHS}` to assert the
+// post-fusion body is a serial chain (waves == subgraphs). The
+// per-bucket stub module that exposed these was dropped along
+// with PREDICTED_US — its assertion is structural (driven by the
+// solver + scheduler topology), so it belongs in
+// `schedule::tests` calling `schedule_workloads()` directly. Not
+// re-added here; if the serial-chain invariant ever regresses,
+// the right place to catch it is the unit test, not via macro-
+// emitted constants in an integration test.

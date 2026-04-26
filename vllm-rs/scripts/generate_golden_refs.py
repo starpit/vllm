@@ -106,13 +106,10 @@ MODELS = {
     # 64 routed experts + 2 shared, topk=8, sigmoid/noaux_tc routing). Trained from
     # scratch on 350B+ English tokens; produces coherent output → meaningful golden.
     "deepseek_v3_academic_9b": "ByteDance-Seed/academic-ds-9B",
-    # DeepSeek V3 — bzantium/tiny-deepseek-v3: real trained 6-layer model with
-    # full V3 dims (hidden=7168, heads=128, q_lora_rank=1536, vocab=129280,
-    # n_routed_experts=8, num_experts_per_tok=8 so all experts always activated
-    # → deterministic routing). 10.7 GB bf16 across 3 safetensors shards.
-    # Meaningful golden: real weights produce coherent output, verifies both
-    # the ferrite fingerprint (q_a_proj path) and the V3 MoE forward pass.
-    "deepseek_v3_bzantium": "bzantium/tiny-deepseek-v3",
+    # Kimi K2 — synthetic 4-layer tiny (see scripts/make_tiny_kimi_k2.py).
+    # Same V3 carrier but K2-specific routing (flat sigmoid+noaux_tc, n_group=1)
+    # and first_k_dense_replace=1 + routed_scaling_factor=2.827. Local path.
+    "kimi_k2_tiny": "/tmp/kimi-k2-tiny",
     # CommandR (CohereForCausalLM) — 1-layer trim of real v01 by
     # Citaman (mergekit). Full v01 dims (hidden=8192, head_dim=128,
     # vocab=256000), single decoder layer → ~5GB bf16, fits L4.

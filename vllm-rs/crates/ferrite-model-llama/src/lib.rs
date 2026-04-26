@@ -5,7 +5,7 @@
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::too_many_arguments)]
 //! LLaMA — the math. The `#[forward]` attribute macro reads the
-//! body below, finds `model_architectures/llama/` by walking up
+//! body below, finds `crates/ferrite-model-llama/configs/` by walking up
 //! from this crate, and for every config JSON in it emits
 //! specialized `Weights` + `forward` under `ferrite_models::llama`.
 

@@ -2,7 +2,7 @@
 //! End-to-end for the Gemma2 DSL body. Proves:
 //!
 //! 1. The `#[forward]` proc-macro accepts `if`/`else` in the body.
-//! 2. Every Gemma2 config in `model_architectures/gemma2/` compiles
+//! 2. Every Gemma2 config in `crates/ferrite-model-gemma2/configs/` compiles
 //!    through parse → classify → shape-infer → CFG → unroll → solve
 //!    × workloads → schedule × workloads → codegen.
 //! 3. The solver finds an Impl for every tile (no UnclaimedTile on

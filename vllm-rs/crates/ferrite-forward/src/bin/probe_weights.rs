@@ -199,7 +199,7 @@ fn main() -> Result<()> {
             // config so the macro reads `true` from disk.
             //
             // Locate the matching saved config and rewrite it. This is
-            // the *committed* JSON in `model_architectures/<arch>/`,
+            // the *committed* JSON in `crates/ferrite-model-<arch>/configs/`,
             // not just an in-memory edit — the macro reads from disk
             // at expansion time.
             let saved_path = configs

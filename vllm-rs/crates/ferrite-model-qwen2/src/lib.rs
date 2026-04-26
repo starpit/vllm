@@ -12,7 +12,7 @@
 //! bias rides through one fused kernel launch, not a separate add.
 //!
 //! One `#[forward]` body per architecture; per-model configs fan out
-//! via `model_architectures/qwen2/*.json`.
+//! via `crates/ferrite-model-qwen2/configs/*.json`.
 
 use ferrite_forward::forward;
 

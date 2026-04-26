@@ -221,7 +221,7 @@ impl TestModels {
     // AWQ Llama-3.2-1B — exercises ferrite-forward's MarlinGemm +
     // MarlinFusedQkvRope* + MarlinFusedGateUpSiluMul impls. The repo's
     // `quantization_config` matches the `llama-3.2-1b` + `awq-gemm`
-    // overlay variant synthesized from `model_architectures/llama/`.
+    // overlay variant synthesized from `crates/ferrite-model-llama/configs/`.
     pub const LLAMA_3_2_1B_AWQ: &str = "AMead10/Llama-3.2-1B-Instruct-AWQ";
 
     // Gemma2 GPTQ quantized models (ungated)

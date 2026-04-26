@@ -13771,10 +13771,8 @@ mod tests {
         // previously hardcoded emission byte-for-byte.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("..")
-            .join("..")
-            .join("model_architectures")
-            .join("llama")
+            .join("ferrite-model-llama")
+            .join("configs")
             .join("llama-3.2-1b.json");
         let model = crate::config::load_file(&path).expect("load llama-3.2-1b");
 

@@ -7,7 +7,7 @@
 //! Qwen3 — Llama math plus per-head RMS norm on Q and K (between the
 //! QKV projections and RoPE). No QKV bias (unlike Qwen2). The per-head
 //! norm weights `self_attn.q_norm` / `self_attn.k_norm` are declared
-//! in `model_architectures/qwen3/weights.json` at shape `[head_dim]`;
+//! in `crates/ferrite-model-qwen3/configs/weights.json` at shape `[head_dim]`;
 //! shape inference sees the inferred `[T, heads*head_dim]` activation
 //! vs. the declared `[head_dim]` weight and synthesizes the view
 //! reshape tiles to bridge them.

@@ -16,7 +16,7 @@ use ferrite_forward::forward;
 // The real Llama body — SwiGLU MLP (`silu(gate) * up`), exercising
 // the Expr::Mul path that used to emit OpKind::Add by mistake.
 // `models_dir` is discovered from the carrier fn name `llama` by
-// walking up looking for `model_architectures/llama/`.
+// walking up looking for `crates/ferrite-model-llama/configs/`.
 #[forward(
     target = "../../../target_profiles/l4_sm89.json",
     workloads = [1, 8, 64, 512, 4096],

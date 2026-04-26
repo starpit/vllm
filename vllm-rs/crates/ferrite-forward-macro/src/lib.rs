@@ -130,15 +130,12 @@ impl Parse for ForwardArgs {
     }
 }
 
-/// Discover `model_architectures/<arch>` for the given arch
-/// identifier by walking up from `start` (the invoking crate's
-/// manifest dir) looking for a parent that contains a
-/// `model_architectures` directory with a `<arch>` child.
-///
-/// This is how `#[forward] fn llama() { ... }` knows to read
-/// `model_architectures/llama/*.json` without the user spelling
-/// out `models_dir`. Walk-up stops at the first match, or returns
-/// an error naming every directory it checked.
+/// Discover the configs directory for `arch`. Standard layout:
+/// the invoking crate IS `ferrite-model-<arch>`, so configs live
+/// at `<MANIFEST_DIR>/configs/`. Fallback for #[forward] usages
+/// outside a per-arch crate (e.g. integration tests in
+/// `ferrite-forward/tests/`): walk up to the workspace root and
+/// look in `crates/ferrite-model-<arch>/configs/`.
 /// Format a microsecond value adaptively for human scanning:
 /// `<1000µs` as `Nµs`, `<100ms` as `N.Xms`, else `Nms`.
 /// Cross-variant forward-fn dedup. Returns a map `variant_idx →
@@ -213,18 +210,34 @@ fn fmt_us(us: f64) -> String {
     }
 }
 
-fn discover_models_dir(start: &std::path::Path, _arch: &str) -> Result<std::path::PathBuf, String> {
-    // Configs now live next to the per-arch crate's `Cargo.toml`,
-    // under `configs/`. Each per-arch crate owns its model JSONs so
-    // cargo features can gate them — `model_architectures/<arch>/`
-    // at repo root is gone.
-    let candidate = start.join("configs");
-    if candidate.is_dir() {
-        return Ok(candidate);
+fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path::PathBuf, String> {
+    // Per-arch crates own their JSONs under `configs/` next to
+    // `Cargo.toml` — fast path for the standard layout.
+    let local = start.join("configs");
+    if local.is_dir() {
+        return Ok(local);
+    }
+    // Fallback for #[forward] invocations that live OUTSIDE a
+    // `ferrite-model-<arch>` crate (e.g. integration tests in
+    // `ferrite-forward/tests/`). Walk up to the workspace root and
+    // look in `crates/ferrite-model-<arch>/configs/`. The `_` → `-`
+    // conversion mirrors probe-weights' arch-name handling.
+    let crate_dir_name = format!("ferrite-model-{}", arch.replace('_', "-"));
+    let mut cur: Option<&std::path::Path> = Some(start);
+    while let Some(d) = cur {
+        let candidate = d
+            .join("crates")
+            .join(&crate_dir_name)
+            .join("configs");
+        if candidate.is_dir() {
+            return Ok(candidate);
+        }
+        cur = d.parent();
     }
     Err(format!(
-        "no `configs/` directory found at {}",
-        candidate.display(),
+        "no `configs/` at {} and no `crates/{}/configs/` walking up to the workspace root",
+        local.display(),
+        crate_dir_name,
     ))
 }
 
@@ -243,9 +256,9 @@ pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
 
 fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     // CARGO_MANIFEST_DIR at macro-expansion time is the invoking
-    // crate's root. Target path resolves against it; the arch
-    // `model_architectures/<arch>` directory is discovered by
-    // walking up from here, using the carrier's fn name as <arch>.
+    // crate's root. Target path resolves against it; the configs
+    // directory is `<MANIFEST_DIR>/configs/` for per-arch crates,
+    // with a workspace-walk fallback for tests outside model crates.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
         syn::Error::new(
             args.span,

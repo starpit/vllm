@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Per-architecture weights.json manifest.
 //!
-//! `model_architectures/<arch>/weights.json` declares the shape of
+//! `crates/ferrite-model-<arch>/configs/weights.json` declares the shape of
 //! every weight tensor the forward pass consumes, expressed in bound
 //! names from the arch's config.json (e.g. `"hidden_size"`,
 //! `"head_dim * num_attention_heads"`). The file is produced by the

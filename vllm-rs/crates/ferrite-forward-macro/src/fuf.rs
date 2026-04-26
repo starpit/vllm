@@ -569,10 +569,8 @@ mod tests {
     fn llama_3_2_1b_params() -> ModelParams {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("..")
-            .join("..")
-            .join("model_architectures")
-            .join("llama")
+            .join("ferrite-model-llama")
+            .join("configs")
             .join("llama-3.2-1b.json");
         config::load_file(&path).expect("load config")
     }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Phase 3: read `config.json` files from an `model_architectures/<arch>/`
+//! Phase 3: read `config.json` files from an `crates/ferrite-model-<arch>/configs/`
 //! directory into a `Vec<ModelParams>`.
 //!
 //! Each `ModelParams` has:
@@ -300,17 +300,16 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
             let mut found: Option<PathBuf> = None;
             while let Some(d) = cur {
                 let cargo_toml = d.join("Cargo.toml");
-                if cargo_toml.exists() {
-                    if let Ok(s) = fs::read_to_string(&cargo_toml) {
-                        if s.contains("[workspace]") {
-                            found = Some(
-                                d.join("crates")
-                                    .join("ferrite-quantizations")
-                                    .join("presets"),
-                            );
-                            break;
-                        }
-                    }
+                if cargo_toml.exists()
+                    && let Ok(s) = fs::read_to_string(&cargo_toml)
+                    && s.contains("[workspace]")
+                {
+                    found = Some(
+                        d.join("crates")
+                            .join("ferrite-quantizations")
+                            .join("presets"),
+                    );
+                    break;
                 }
                 cur = d.parent();
             }
@@ -784,13 +783,13 @@ fn stem_to_ident(stem: &str) -> Result<String, &'static str> {
 mod tests {
     use super::*;
 
-    /// Absolute path to `<repo>/model_architectures` from this crate's manifest dir.
-    fn repo_model_archs() -> PathBuf {
+    /// Absolute path to `crates/ferrite-model-<arch>/configs/` from
+    /// this crate's manifest dir, for tests that load real configs.
+    fn repo_model_archs(arch: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("..")
-            .join("..")
-            .join("model_architectures")
+            .join(format!("ferrite-model-{arch}"))
+            .join("configs")
     }
 
     #[test]
@@ -813,7 +812,7 @@ mod tests {
 
     #[test]
     fn load_real_llama_configs() {
-        let dir = repo_model_archs().join("llama");
+        let dir = repo_model_archs("llama");
         let configs = load_dir(&dir).expect("load llama configs");
 
         // 12 dense bases (9 Llama + 2 smollm2 + 1 tinyllama) ×
@@ -856,7 +855,7 @@ mod tests {
 
     #[test]
     fn load_real_qwen2_configs() {
-        let dir = repo_model_archs().join("qwen2");
+        let dir = repo_model_archs("qwen2");
         let configs = load_dir(&dir).expect("load qwen2 configs");
         // 11 dense × (1 dense + 6 presets: awq-gemm, bnb-nf4-dq,
         // ct-int4-sym, gptq-sym, fp8-dynamic-per-tensor,
@@ -889,7 +888,7 @@ mod tests {
 
     #[test]
     fn bounds_are_sorted_by_stem_for_determinism() {
-        let dir = repo_model_archs().join("llama");
+        let dir = repo_model_archs("llama");
         let configs = load_dir(&dir).unwrap();
         let stems: Vec<&str> = configs.iter().map(|c| c.source_stem.as_str()).collect();
         let mut sorted = stems.clone();
@@ -943,7 +942,7 @@ mod tests {
         // to a Llama config, that would silently change the
         // hardcoded softmax scale in `AttentionViaCacheImpl`. The
         // Llama path has no such field today; lock that in.
-        let dir = repo_model_archs().join("llama");
+        let dir = repo_model_archs("llama");
         let configs = load_dir(&dir).expect("load llama configs");
         for cfg in &configs {
             assert!(

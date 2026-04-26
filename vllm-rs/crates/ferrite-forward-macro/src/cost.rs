@@ -123,10 +123,8 @@ mod tests {
     fn llama_params(stem: &str) -> ModelParams {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("..")
-            .join("..")
-            .join("model_architectures")
-            .join("llama")
+            .join("ferrite-model-llama")
+            .join("configs")
             .join(format!("{stem}.json"));
         config::load_file(&path).unwrap()
     }

@@ -24,7 +24,7 @@
 //!    output, which routes through `ScalarMulImpl`.
 //!
 //! The hand-written reference is `vllm-cuda/src/model/commandr.rs`;
-//! `model_architectures/commandr/weights.json` declares the on-disk
+//! `crates/ferrite-model-commandr/configs/weights.json` declares the on-disk
 //! tensor names. Probed against `adalbertojunior/c4ai-command-r-v01`
 //! (the only confirmed non-gated mirror of the original Cohere
 //! arch). `tie_word_embeddings: true` for v01, so the codegen's

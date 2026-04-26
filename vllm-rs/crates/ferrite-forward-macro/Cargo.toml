@@ -14,6 +14,7 @@ proc-macro2 = "1"
 prettyplease = "0.2"
 serde_json = { workspace = true }
 rayon = { workspace = true }
+ferrite-cuda-targets = { path = "../ferrite-cuda-targets" }
 
 [dev-dependencies]
 trybuild = "1"

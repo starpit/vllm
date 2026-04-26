@@ -22,7 +22,6 @@
 use ferrite_forward::forward;
 
 #[forward(
-    target = "../../../target_profiles/l4_sm89.json",
     workloads = [1, 8, 64, 512, 4096],
 )]
 fn deepseek_v3() {

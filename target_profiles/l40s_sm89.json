@@ -1,8 +1,0 @@
-{
-  "name": "l40s_sm89",
-  "compute_capability": 89,
-  "num_sms": 142,
-  "peak_tflops_fp16": 362.0,
-  "memory_bandwidth_gbps": 864.0,
-  "shared_memory_per_sm_kb": 100
-}

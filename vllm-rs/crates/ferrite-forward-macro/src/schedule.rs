@@ -179,7 +179,7 @@ mod tests {
     use crate::shape::infer;
     use crate::solver::solve;
     use crate::target::TargetProfile;
-    use crate::target::load_file as load_target;
+    use crate::target::from_profile_def;
     use std::path::PathBuf;
 
     fn llama_3_2_1b_params() -> ModelParams {
@@ -192,13 +192,7 @@ mod tests {
     }
 
     fn l4_target() -> TargetProfile {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("target_profiles")
-            .join("l4_sm89.json");
-        load_target(&path).unwrap()
+        from_profile_def(&ferrite_cuda_targets::L4_SM89)
     }
 
     fn solved_body(src: &str, params: &ModelParams) -> (Fuf, Assignment) {

@@ -708,7 +708,7 @@ mod tests {
     };
     use crate::parse::parse_block;
     use crate::shape::infer;
-    use crate::target::load_file as load_target;
+    use crate::target::from_profile_def;
     use std::path::PathBuf;
 
     fn llama_params(stem: &str) -> ModelParams {
@@ -721,13 +721,7 @@ mod tests {
     }
 
     fn l4_target() -> TargetProfile {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("target_profiles")
-            .join("l4_sm89.json");
-        load_target(&path).unwrap()
+        from_profile_def(&ferrite_cuda_targets::L4_SM89)
     }
 
     fn build(src: &str, params: &ModelParams) -> (Fuf, Inferred) {

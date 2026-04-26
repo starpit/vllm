@@ -1,0 +1,6 @@
+[package]
+name = "ferrite-cuda-targets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU target profiles (hardware specs + empirical cost tables) consumed by the ferrite-forward proc-macro at expansion time"

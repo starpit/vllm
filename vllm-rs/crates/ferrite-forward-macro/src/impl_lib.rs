@@ -13834,16 +13834,7 @@ mod tests {
 
     #[test]
     fn handoff_variants_have_finite_nonneg_cost_on_any_profile() {
-        let profile = crate::target::load_file(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("..")
-                .join("target_profiles")
-                .join("l4_sm89.json")
-                .as_path(),
-        )
-        .unwrap();
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         for h in [
             Handoff::StreamOrder,
             Handoff::StreamEvent,
@@ -13921,16 +13912,7 @@ mod tests {
         // correspond to a real kernel string in the L4 cost table
         // (byte-for-byte), otherwise `target_compatible` rejects every
         // tile and the solver silently falls back to cuBLAS.
-        let profile = crate::target::load_file(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("..")
-                .join("target_profiles")
-                .join("l4_sm89.json")
-                .as_path(),
-        )
-        .expect("l4_sm89 loads");
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         let csv_kernels = profile.cost_table.kernel_names();
         for (tm, tn, st) in CUTLASS_TILE_ZOO {
             let name = format!("cutlass_{tm}x{tn}_s{st}");
@@ -13992,16 +13974,7 @@ mod tests {
             tile_n: 128,
             stages: 4,
         };
-        let profile = crate::target::load_file(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("..")
-                .join("target_profiles")
-                .join("l4_sm89.json")
-                .as_path(),
-        )
-        .expect("l4_sm89 loads");
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(
             imp.matches(&fuf, t1, &profile).is_none(),
             "cutlass must not match a Gemm whose output feeds RopeAppend",

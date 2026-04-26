@@ -132,16 +132,9 @@ mod tests {
     use crate::classified::OpKind;
     use crate::fuf::{Fuf, TileId};
     use crate::impl_lib::{CostCtx, Handoff, Layout, MatchInfo, Resources};
-    use std::path::PathBuf;
 
     fn l4_target() -> TargetProfile {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("target_profiles")
-            .join("l4_sm89.json");
-        crate::target::load_file(&path).unwrap()
+        crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89)
     }
 
     /// Minimal Impl for exercising ConcurrencyModel rules in isolation.

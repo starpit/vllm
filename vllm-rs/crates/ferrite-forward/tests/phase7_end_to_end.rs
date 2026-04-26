@@ -18,7 +18,6 @@ use ferrite_forward::forward;
 // `models_dir` is discovered from the carrier fn name `llama` by
 // walking up looking for `crates/ferrite-model-llama/configs/`.
 #[forward(
-    target = "../../../target_profiles/l4_sm89.json",
     workloads = [1, 8, 64, 512, 4096],
 )]
 fn llama() {

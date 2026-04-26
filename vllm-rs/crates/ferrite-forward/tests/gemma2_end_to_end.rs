@@ -18,7 +18,6 @@ use ferrite_forward::forward;
 // can only annotate items declared in the crate being compiled, not
 // re-exported from another crate.
 #[forward(
-    target = "../../../target_profiles/l4_sm89.json",
     workloads = [1, 8, 64, 512, 4096],
 )]
 fn gemma2() {

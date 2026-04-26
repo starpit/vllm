@@ -22,7 +22,7 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{Ident, ItemFn, LitInt, LitStr, Token, parse_macro_input};
+use syn::{Ident, ItemFn, LitInt, Token, parse_macro_input};
 
 mod ast;
 mod cfg;
@@ -48,9 +48,6 @@ mod weights_manifest;
 // ── Attribute argument parsing ────────────────────────────────────
 
 struct ForwardArgs {
-    /// Path to the target profile JSON, relative to
-    /// CARGO_MANIFEST_DIR of the invoking crate.
-    target: LitStr,
     /// Discrete `num_tokens` points to solve at. Non-empty.
     workloads: Vec<u64>,
     /// Discrete `sk_bucket` (KV-cache span in tokens) points to solve
@@ -69,7 +66,6 @@ struct ForwardArgs {
 impl Parse for ForwardArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let span = input.span();
-        let mut target: Option<LitStr> = None;
         let mut workloads: Option<Vec<u64>> = None;
         let mut sk_buckets: Option<Vec<u64>> = None;
 
@@ -92,7 +88,6 @@ impl Parse for ForwardArgs {
             input.parse::<Token![=]>()?;
 
             match key.to_string().as_str() {
-                "target" => target = Some(input.parse()?),
                 "workloads" => workloads = Some(parse_u64_list(input)?),
                 "sk_buckets" => sk_buckets = Some(parse_u64_list(input)?),
                 other => {
@@ -108,7 +103,6 @@ impl Parse for ForwardArgs {
             }
         }
 
-        let target = target.ok_or_else(|| syn::Error::new(span, "#[forward] missing `target`"))?;
         let workloads =
             workloads.ok_or_else(|| syn::Error::new(span, "#[forward] missing `workloads`"))?;
         if workloads.is_empty() {
@@ -122,7 +116,6 @@ impl Parse for ForwardArgs {
         let sk_buckets = sk_buckets.unwrap_or_default();
 
         Ok(Self {
-            target,
             workloads,
             sk_buckets,
             span,
@@ -266,7 +259,6 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     let arch_name = carrier.sig.ident.to_string();
     let models_dir = discover_models_dir(&base, &arch_name)
         .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
-    let target_path = base.join(args.target.value());
 
     // ── Front end: parse + classify ───────────────────────────────
     let ast = parse::parse_block(&carrier.block)
@@ -332,12 +324,9 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         }
     };
 
-    let target_profile = target::load_file(&target_path).map_err(|e| {
-        syn::Error::new(
-            args.target.span(),
-            format!("target `{}`: {e}", target_path.display()),
-        )
-    })?;
+    let target_def =
+        ferrite_cuda_targets::detect().map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
+    let target_profile = target::from_profile_def(target_def);
 
     let library = impl_lib::starter_library();
 
@@ -364,9 +353,9 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         tracked_paths.insert(quantizations_path);
     }
     // De-dupe before emitting; multiple variants share preset /
-    // override paths and the target profile belongs to every
-    // variant.
-    tracked_paths.insert(target_path.clone());
+    // override paths. Target profile is no longer a separate file —
+    // it's compiled into ferrite-cuda-targets, so cargo's normal
+    // dep edge invalidates this crate when the profile changes.
     for p in &tracked_paths {
         let s = p.to_string_lossy().into_owned();
         let lit = syn::LitStr::new(&s, proc_macro2::Span::call_site());

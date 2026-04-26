@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Target profiles — hardware metadata the cost model consumes.
 //!
-//! Mirrors [`config`](crate::config): JSON files in a `target_profiles/`
-//! directory, one per hardware target. Separate from model configs
-//! because targets describe hardware (what the code runs on) while
-//! configs describe models (what the model's dimensions are).
+//! Profile data lives in the `ferrite-cuda-targets` crate as `pub
+//! const ProfileDef` values; this module bridges from those to the
+//! `TargetProfile` shape `impl_lib.rs` consumes (`CostTable` parsed
+//! from the embedded CSV, plus the analytic spec fields).
 
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use serde_json::Value;
+use ferrite_cuda_targets::ProfileDef;
 
 /// Empirical GPU cost table: `(kernel_name, M, N, K) -> cost_us`.
 ///
@@ -111,118 +110,34 @@ impl TargetProfile {
     }
 }
 
-#[derive(Debug)]
-pub enum TargetError {
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    Json {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-    NotADirectory(PathBuf),
-    MissingField {
-        path: PathBuf,
-        field: &'static str,
-    },
-    BadField {
-        path: PathBuf,
-        field: &'static str,
-        reason: &'static str,
-    },
-}
-
-impl std::fmt::Display for TargetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io { path, source } => write!(f, "reading {}: {source}", path.display()),
-            Self::Json { path, source } => write!(f, "parsing {}: {source}", path.display()),
-            Self::NotADirectory(p) => write!(f, "not a directory: {}", p.display()),
-            Self::MissingField { path, field } => {
-                write!(f, "{}: missing field `{field}`", path.display())
-            }
-            Self::BadField {
-                path,
-                field,
-                reason,
-            } => write!(f, "{}: bad field `{field}`: {reason}", path.display()),
-        }
+/// Build a `TargetProfile` from a `ferrite-cuda-targets` profile
+/// const, parsing the embedded CSV bytes into a `CostTable`. The
+/// proc-macro calls this once per `#[forward]` invocation after
+/// resolving the active GPU (`ferrite_cuda_targets::detect()`).
+pub fn from_profile_def(def: &ProfileDef) -> TargetProfile {
+    TargetProfile {
+        name: def.name.to_string(),
+        source_path: PathBuf::new(),
+        compute_capability: def.compute_capability,
+        num_sms: def.num_sms,
+        peak_tflops_fp16: def.peak_tflops_fp16,
+        memory_bandwidth_gbps: def.memory_bandwidth_gbps,
+        shared_memory_per_sm_kb: def.shared_memory_per_sm_kb,
+        cost_table: parse_cost_csv(def.cost_csv),
     }
 }
 
-impl std::error::Error for TargetError {}
-
-pub fn load_dir(dir: &Path) -> Result<Vec<TargetProfile>, TargetError> {
-    if !dir.is_dir() {
-        return Err(TargetError::NotADirectory(dir.to_path_buf()));
-    }
-    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
-        .map_err(|source| TargetError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
-    paths.iter().map(|p| load_file(p)).collect()
-}
-
-pub fn load_file(path: &Path) -> Result<TargetProfile, TargetError> {
-    let contents = fs::read_to_string(path).map_err(|source| TargetError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let json: Value = serde_json::from_str(&contents).map_err(|source| TargetError::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let name = get_str(&json, "name", path)?.to_string();
-
-    // Look for `cost_<name>.csv` alongside the JSON. Missing CSV is
-    // not an error — the solver falls back to analytic formulas.
-    let cost_table = if let Some(parent) = path.parent() {
-        let csv_path = parent.join(format!("cost_{name}.csv"));
-        if csv_path.is_file() {
-            load_cost_csv(&csv_path)?
-        } else {
-            CostTable::new()
-        }
-    } else {
-        CostTable::new()
-    };
-
-    Ok(TargetProfile {
-        name,
-        source_path: path.to_path_buf(),
-        compute_capability: get_u64(&json, "compute_capability", path)? as u32,
-        num_sms: get_u64(&json, "num_sms", path)? as u32,
-        peak_tflops_fp16: get_f64(&json, "peak_tflops_fp16", path)?,
-        memory_bandwidth_gbps: get_f64(&json, "memory_bandwidth_gbps", path)?,
-        shared_memory_per_sm_kb: get_u64(&json, "shared_memory_per_sm_kb", path)? as u32,
-        cost_table,
-    })
-}
-
-/// Parse a GPU cost CSV produced by the prior ferrite's
-/// `gpu_cost_sweep`. Skips comment lines starting with `#` and a
-/// `kernel,M,N,K,cost_us` header line. Silently skips malformed
-/// rows rather than aborting the whole load.
-fn load_cost_csv(path: &Path) -> Result<CostTable, TargetError> {
-    let contents = fs::read_to_string(path).map_err(|source| TargetError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+/// Parse the embedded `cost_<gpu>.csv` bytes into a `CostTable`.
+/// Format: `kernel,M,N,K,cost_us` rows. Comment lines (`#`-prefixed)
+/// and the header are skipped; malformed rows are silently dropped
+/// rather than aborting the whole parse.
+pub fn parse_cost_csv(csv: &str) -> CostTable {
     let mut table = CostTable::new();
-    for raw in contents.lines() {
+    for raw in csv.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Header row starts with "kernel,".
         if line.starts_with("kernel,") {
             continue;
         }
@@ -246,72 +161,32 @@ fn load_cost_csv(path: &Path) -> Result<CostTable, TargetError> {
         };
         table.insert(kernel.trim(), m, n, k, cost_us);
     }
-    Ok(table)
-}
-
-fn get_str<'a>(json: &'a Value, field: &'static str, path: &Path) -> Result<&'a str, TargetError> {
-    json.get(field)
-        .and_then(Value::as_str)
-        .ok_or(TargetError::MissingField {
-            path: path.to_path_buf(),
-            field,
-        })
-}
-
-fn get_u64(json: &Value, field: &'static str, path: &Path) -> Result<u64, TargetError> {
-    json.get(field)
-        .and_then(Value::as_u64)
-        .ok_or(TargetError::MissingField {
-            path: path.to_path_buf(),
-            field,
-        })
-}
-
-fn get_f64(json: &Value, field: &'static str, path: &Path) -> Result<f64, TargetError> {
-    json.get(field)
-        .and_then(Value::as_f64)
-        .ok_or(TargetError::MissingField {
-            path: path.to_path_buf(),
-            field,
-        })
+    table
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn repo_target_profiles() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("target_profiles")
-    }
+    use ferrite_cuda_targets::{H100_SM90, L4_SM89};
 
     #[test]
-    fn load_real_target_profiles() {
-        let dir = repo_target_profiles();
-        let profiles = load_dir(&dir).expect("load target profiles");
-        assert!(profiles.len() >= 2, "at least l4_sm89 + h100_sm90");
-
-        let l4 = profiles.iter().find(|p| p.name == "l4_sm89").unwrap();
+    fn from_profile_def_carries_spec_fields() {
+        let l4 = from_profile_def(&L4_SM89);
         assert_eq!(l4.compute_capability, 89);
         assert_eq!(l4.num_sms, 58);
         assert!(l4.peak_tflops_fp16 > 100.0);
 
-        let h100 = profiles.iter().find(|p| p.name == "h100_sm90").unwrap();
+        let h100 = from_profile_def(&H100_SM90);
         assert_eq!(h100.compute_capability, 90);
         assert!(h100.peak_tflops_fp16 > l4.peak_tflops_fp16);
     }
 
     #[test]
-    fn cost_csv_loaded_alongside_target_profile() {
-        let dir = repo_target_profiles();
-        let profiles = load_dir(&dir).expect("load target profiles");
-        let l4 = profiles.iter().find(|p| p.name == "l4_sm89").unwrap();
-        // CSV must have loaded — prior ferrite's GPU cost sweep
-        // produced thousands of rows across kernel × (M, N, K).
-        assert!(!l4.cost_table.is_empty(), "expected cost_l4_sm89.csv");
+    fn cost_csv_parses_into_table() {
+        let l4 = from_profile_def(&L4_SM89);
+        // gpu_cost_sweep produces thousands of rows across kernel ×
+        // (M, N, K). The embedded CSV survives the parse.
+        assert!(!l4.cost_table.is_empty(), "expected cost_l4_sm89 rows");
         assert!(l4.cost_table.len() > 1000);
         let kinds = l4.cost_table.kernel_names();
         assert!(kinds.iter().any(|k| k == "cublas"), "cublas baseline");
@@ -327,9 +202,7 @@ mod tests {
 
     #[test]
     fn cost_lookup_round_trips() {
-        let dir = repo_target_profiles();
-        let profiles = load_dir(&dir).expect("load target profiles");
-        let l4 = profiles.iter().find(|p| p.name == "l4_sm89").unwrap();
+        let l4 = from_profile_def(&L4_SM89);
         // The first data row in cost_l4_sm89.csv is
         // `cublas,1,2048,2048,9.7`. Use it as a canary.
         let c = l4.cost_us_for("cublas", 1, 2048, 2048);
@@ -339,22 +212,18 @@ mod tests {
     }
 
     #[test]
-    fn missing_dir_errors() {
-        assert!(matches!(
-            load_dir(Path::new("/nonexistent")),
-            Err(TargetError::NotADirectory(_))
-        ));
-    }
-
-    #[test]
-    fn missing_field_errors() {
-        let tmp = std::env::temp_dir().join("ferrite_forward_target_test");
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-        let bad = tmp.join("bad.json");
-        fs::write(&bad, r#"{"name": "bad"}"#).unwrap();
-        let err = load_file(&bad).unwrap_err();
-        assert!(matches!(err, TargetError::MissingField { .. }));
-        fs::remove_dir_all(&tmp).ok();
+    fn parse_cost_csv_skips_garbage() {
+        let csv = "\
+            # comment line\n\
+            kernel,M,N,K,cost_us\n\
+            \n\
+            cublas,1,2,3,4.5\n\
+            malformed_row\n\
+            cutlass_128x128_s3,8,16,32,7.0\n\
+            cublas,not_a_number,2,3,4.5\n";
+        let table = parse_cost_csv(csv);
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.get("cublas", 1, 2, 3), Some(4.5));
+        assert_eq!(table.get("cutlass_128x128_s3", 8, 16, 32), Some(7.0));
     }
 }

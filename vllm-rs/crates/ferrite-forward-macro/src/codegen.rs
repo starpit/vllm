@@ -2194,8 +2194,15 @@ pub(crate) fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<Acces
 /// `required_weights`.
 fn layer_templated_prefix_expr(layer0_prefix: &str) -> TokenStream {
     if let Some(tail) = layer0_prefix.strip_prefix("model.layers.0.") {
-        let template = format!("model.layers.{{}}.{tail}");
-        quote! { ::std::format!(#template, layer) }
+        // Route through `ferrite_forward::layer_weight_path(layer,
+        // suffix)` instead of inlining `format!()`. The post-macro
+        // expansion of `format!("model.layers.{}.X", layer)` is a
+        // 5-line `::alloc::__export::must_use({
+        //     ::alloc::fmt::format(format_args!(...))
+        // })` block; the helper fn collapses every call site to
+        // one line of expanded source. Fires per-layer per-accessor
+        // per-canonical — thousands of times on llama.
+        quote! { ::ferrite_forward::layer_weight_path(layer, #tail) }
     } else if layer0_prefix == "model.layers.0" {
         quote! { ::std::format!("model.layers.{}", layer) }
     } else {
@@ -2750,6 +2757,12 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
     if groups.is_empty() {
         return quote! {};
     }
+    // Per-method `#[cfg]` / `#[inline]` / `#[allow(dead_code)]` are
+    // redundant — the impl block carries the cfg, the methods are
+    // trivial enough that LLVM inlines them in release without the
+    // hint, and the unused-warning is suppressed at the impl level.
+    // Dropping per-method attrs collapses each accessor from ~7
+    // lines to ~3.
     let methods: Vec<TokenStream> = groups
         .iter()
         .map(|g| {
@@ -2757,34 +2770,19 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
             let ty = &g.rust_type;
             match g.kind {
                 AccessorGroupKind::LayeredContiguous => quote! {
-                    #[cfg(feature = "cuda")]
-                    #[inline]
-                    #[allow(dead_code)]
                     pub fn #base_ident(&self, layer: u32) -> &#ty {
-                        // Slice index, no bounds check — codegen
-                        // guarantees `layer < N` because every
-                        // static-slice row carries a literal
-                        // `layer:` field minted from the same
-                        // per-arch fan_out pass and Op::Loop only
-                        // iterates 0..num_hidden_layers.
                         unsafe { self.#base_ident.get_unchecked(layer as usize) }
                     }
                 },
                 AccessorGroupKind::Unindexed => quote! {
-                    #[cfg(feature = "cuda")]
-                    #[inline]
-                    #[allow(dead_code)]
-                    pub fn #base_ident(&self, _layer: u32) -> &#ty {
-                        &self.#base_ident
-                    }
+                    pub fn #base_ident(&self, _: u32) -> &#ty { &self.#base_ident }
                 },
                 AccessorGroupKind::LayeredSparse => {
-                    // Per-layer fields → match arms. Same shape as
-                    // the legacy emit; codegen-issued static rows
-                    // only ever pass layers that exist (guaranteed
-                    // by fan_out's per-claim layer plumbing), so
-                    // `unreachable_unchecked()` on non-emitted
-                    // layers is safe.
+                    // Per-layer fields → match arms. Codegen-issued
+                    // static rows only ever pass layers that exist
+                    // (guaranteed by fan_out's per-claim layer
+                    // plumbing), so `unreachable_unchecked()` on non-
+                    // emitted layers is safe.
                     let arms: Vec<TokenStream> = g
                         .entries
                         .iter()
@@ -2797,9 +2795,6 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
                         })
                         .collect();
                     quote! {
-                        #[cfg(feature = "cuda")]
-                        #[inline]
-                        #[allow(dead_code)]
                         pub fn #base_ident(&self, layer: u32) -> &#ty {
                             match layer {
                                 #(#arms)*
@@ -2813,6 +2808,7 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
         .collect();
     quote! {
         #[cfg(feature = "cuda")]
+        #[allow(dead_code)]
         impl Weights {
             #(#methods)*
         }
@@ -3653,7 +3649,10 @@ mod tests {
         }];
         let ts = emit_weights_accessor_methods(&accessors).to_string();
         assert!(ts.contains("fn embed_tokens"));
-        assert!(ts.contains("_layer : u32"));
+        // Unindexed accessor's layer arg is `_: u32` — the underscore
+        // prefix on `_layer` was unnecessary chars, dropped along
+        // with per-method `#[cfg]` / `#[inline]` / `#[allow]` attrs.
+        assert!(ts.contains("_ : u32"));
         assert!(ts.contains("& self . embed_tokens"));
         // No `match` block for non-layered accessors — the body is
         // a direct field reference, branchless. No slice index either.
@@ -3879,11 +3878,17 @@ mod tests {
     #[test]
     fn layer_template_replaces_layers_dot_zero_with_runtime_format() {
         let ts = layer_templated_prefix_expr("model.layers.0.input_layernorm").to_string();
+        // Routes through the `layer_weight_path` helper so the
+        // emitted load_with body has one fn-call per accessor per
+        // layer instead of the 5-line `format!()` macro expansion.
         assert!(
-            ts.contains("\"model.layers.{}.input_layernorm\""),
-            "expected templated string literal, got: {ts}"
+            ts.contains("layer_weight_path"),
+            "expected layer_weight_path call, got: {ts}"
         );
-        assert!(ts.contains("layer"));
+        assert!(
+            ts.contains("\"input_layernorm\""),
+            "expected suffix string literal, got: {ts}"
+        );
     }
 
     #[test]
@@ -3902,9 +3907,11 @@ mod tests {
         let ts = emit_layered_load_body(&plan).to_string();
         // Calls the kernel layer's load fn,
         assert!(ts.contains("RmsNorm :: load"));
-        // threads gw + the layer-templated prefix,
-        assert!(ts.contains("\"model.layers.{}.input_layernorm\""));
-        assert!(ts.contains("layer"));
+        // threads gw + the layer-templated prefix via the
+        // `layer_weight_path` helper (suffix passed as a bare
+        // `&str`, fn-call expansion replaces the 5-line `format!`),
+        assert!(ts.contains("layer_weight_path"));
+        assert!(ts.contains("\"input_layernorm\""));
         // and bakes the static eps literal.
         assert!(ts.contains("0.00001"));
     }
@@ -3912,9 +3919,10 @@ mod tests {
     #[test]
     fn emit_layered_load_body_binds_locals_for_concat_prefixes() {
         // load_dense_concat takes &[&str], not &[&String]; the helper
-        // must bind each format!() to a String local first and pass
-        // `__p_<i>.as_str()` to materialize the &str slice. Without
-        // the bind step, the generated code wouldn't typecheck.
+        // must bind each `layer_weight_path()` call to a String local
+        // first and pass `__p_<i>.as_str()` to materialize the &str
+        // slice. Without the bind step, the generated code wouldn't
+        // typecheck.
         let plan = FieldLoad::LinearConcat(vec![
             "model.layers.0.self_attn.q_proj".to_string(),
             "model.layers.0.self_attn.k_proj".to_string(),
@@ -3926,8 +3934,9 @@ mod tests {
         assert!(ts.contains("__p_1"));
         assert!(ts.contains("__p_2"));
         assert!(ts.contains(". as_str ()"));
-        assert!(ts.contains("\"model.layers.{}.self_attn.q_proj\""));
-        assert!(ts.contains("\"model.layers.{}.self_attn.k_proj\""));
-        assert!(ts.contains("\"model.layers.{}.self_attn.v_proj\""));
+        assert!(ts.contains("layer_weight_path"));
+        assert!(ts.contains("\"self_attn.q_proj\""));
+        assert!(ts.contains("\"self_attn.k_proj\""));
+        assert!(ts.contains("\"self_attn.v_proj\""));
     }
 }

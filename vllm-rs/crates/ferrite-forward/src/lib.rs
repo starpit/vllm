@@ -90,6 +90,22 @@ pub fn trace_enabled() -> bool {
     })
 }
 
+/// Build a `model.layers.<layer>.<suffix>` weight-name string. The
+/// emitted `Weights::load_with` body fires one of these per layered
+/// accessor, per layer, per canonical (~9 accessors × 32 layers ×
+/// 57 canonicals on llama). Routing through a helper fn instead
+/// of inlining `format!("model.layers.{}.{suffix}", layer)` keeps
+/// the expanded source one line per call site (a fn call) instead
+/// of five (the post-expansion `format!` →
+/// `::alloc::__export::must_use({ ::alloc::fmt::format(...) })`
+/// pipeline). Returns a `String` because
+/// `LinearLayer::load`/`RmsNorm::load`/etc. take `&str` and the
+/// binding outlives the `&str` borrow.
+#[inline]
+pub fn layer_weight_path(layer: u32, suffix: &str) -> String {
+    format!("model.layers.{layer}.{suffix}")
+}
+
 /// Deterministic hash of a `serde_json::Value` for `HfFingerprint`
 /// content discrimination. Canonicalizes object key order and
 /// hashes numbers as f64 bits so manifest-time and runtime produce

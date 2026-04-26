@@ -4351,12 +4351,14 @@ mod fingerprint_tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn repo_model_archs() -> PathBuf {
+    /// Per-arch config dir, in ff-interpreter's per-crate layout
+    /// (`crates/ferrite-model-<arch>/configs/`). Pass the arch slug
+    /// using hyphens, e.g. `"deepseek-v3"`, `"qwen3"`.
+    fn arch_configs(arch: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("..")
-            .join("..")
-            .join("model_architectures")
+            .join(format!("ferrite-model-{arch}"))
+            .join("configs")
     }
 
     /// MLA archs (DeepSeek V3 / Kimi K2) ship `q_a_proj` rather than
@@ -4367,10 +4369,10 @@ mod fingerprint_tests {
     /// and silently rejected every V3 FP8-block checkpoint.
     #[test]
     fn fp8_block_disambiguation_uses_q_a_proj_for_mla_archs() {
-        let dir = repo_model_archs().join("deepseek_v3");
-        let configs = crate::config::load_dir(&dir).expect("load deepseek_v3 configs");
+        let dir = arch_configs("deepseek-v3");
+        let configs = crate::config::load_dir(&dir).expect("load deepseek-v3 configs");
         let manifest = crate::weights_manifest::load_or_empty(&dir)
-            .expect("load deepseek_v3 weights manifest");
+            .expect("load deepseek-v3 weights manifest");
         // Pick a V3 variant with FP8-block quantization (block_size: Some).
         let model = configs
             .iter()
@@ -4406,7 +4408,7 @@ mod fingerprint_tests {
     /// archs whose manifest declares `q_a_proj`.
     #[test]
     fn fp8_block_disambiguation_uses_q_proj_for_non_mla_archs() {
-        let dir = repo_model_archs().join("qwen3");
+        let dir = arch_configs("qwen3");
         let configs = crate::config::load_dir(&dir).expect("load qwen3 configs");
         let manifest =
             crate::weights_manifest::load_or_empty(&dir).expect("load qwen3 weights manifest");
